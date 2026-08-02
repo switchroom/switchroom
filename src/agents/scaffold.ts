@@ -4502,10 +4502,22 @@ export function resolveGdriveMcpEntry(
   const tier =
     agentConfig.google_workspace?.tier ??
     switchroomConfig?.google_workspace?.tier;
-  const entry = getGdriveMcpSettingsEntry(
-    DOCKER_SWITCHROOM_CLI_PATH,
-    tier ? { tier } : {},
-  );
+  // Per-account selection (v1 read-only scope model): thread the
+  // persisted `google_accounts.<email>.{readonly,services}` record to
+  // the launcher alongside --tier. The launcher re-reads the record
+  // from config and is authoritative; threading makes the resolved
+  // choice visible in settings.json — and the SAME record minted the
+  // account's OAuth scopes, so tool exposure and token scope agree.
+  const accountRecord = account
+    ? googleAccounts?.[account.trim().toLowerCase()]
+    : undefined;
+  const entry = getGdriveMcpSettingsEntry(DOCKER_SWITCHROOM_CLI_PATH, {
+    ...(tier ? { tier } : {}),
+    ...(accountRecord?.services && accountRecord.services.length > 0
+      ? { services: accountRecord.services }
+      : {}),
+    ...(accountRecord?.readonly ? { readOnly: true } : {}),
+  });
   // Claude Code spawns MCP servers with a SANITIZED env (not the
   // parent/container env), so the drive-mcp-launcher gets none of the
   // compose-emitted SWITCHROOM_* / HOME vars unless we thread them onto

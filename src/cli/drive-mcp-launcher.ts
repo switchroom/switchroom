@@ -175,6 +175,7 @@ export function buildSeedCredentials(
  *
  *   uvx --from git+https://github.com/taylorwilsdon/google_workspace_mcp.git@<sha> \
  *       workspace-mcp --single-user [--tool-tier <tier>]
+ *       [--tools <svc>...] [--read-only]
  *
  * NB: the executable is `workspace-mcp`, NOT `google-workspace-mcp`.
  * The upstream package is named `workspace-mcp` and provides exactly
@@ -278,6 +279,148 @@ const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 export const CALENDAR_READONLY_SCOPE =
   "https://www.googleapis.com/auth/calendar.readonly";
 
+// ─── Per-account selection (v1 read-only scope model) ─────────────────────
+//
+// Mirrors `GOOGLE_SERVICES` + the readonly-aware service→scope map in
+// src/cli/drive.ts — duplicated here (not imported) for the same reason
+// as {@link requiredWorkspaceScopesForTier}: the launcher's hot path
+// stays free of the heavier drive.ts import tree. Launcher unit tests
+// assert equivalence against the drive.ts source of truth.
+
+/** Short service tokens (config/CLI vocabulary), canonical order. */
+export const LAUNCHER_GOOGLE_SERVICES = [
+  "drive",
+  "docs",
+  "sheets",
+  "slides",
+  "cal",
+] as const;
+export type LauncherGoogleService =
+  (typeof LAUNCHER_GOOGLE_SERVICES)[number];
+
+/**
+ * Short token → upstream `workspace-mcp --tools` service name. Upstream's
+ * VALID_SERVICES vocabulary at the pinned SHA (`main.py` SERVICE_MODULES)
+ * uses `calendar`, not `cal`; the rest map 1:1. Verified against SHA
+ * 9d69115b — `--tools` is argparse `nargs="*"` with these choices, so
+ * each service is its OWN argv token (never comma-joined).
+ */
+export const UPSTREAM_SERVICE_NAMES: Record<LauncherGoogleService, string> = {
+  drive: "drive",
+  docs: "docs",
+  sheets: "sheets",
+  slides: "slides",
+  cal: "calendar",
+};
+
+/** The persisted per-account selection as the launcher consumes it. */
+export interface LauncherScopeSelection {
+  /** Upstream `--read-only` + readonly scope expectations. */
+  readonly: boolean;
+  /** Selected services (short tokens; canonical order applied). */
+  services: LauncherGoogleService[];
+}
+
+/**
+ * Parse the `--services` CSV the scaffold threads onto the launcher
+ * entry. Tolerant of `calendar` as an alias for `cal`; unknown tokens
+ * are REJECTED loudly (a typo silently dropping a service would surface
+ * as tools 403ing much later). Pure + exported for unit-pinning.
+ */
+export function parseLauncherServices(
+  raw: string,
+): LauncherGoogleService[] {
+  const tokens = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0)
+    .map((s) => (s === "calendar" ? "cal" : s));
+  for (const t of tokens) {
+    if (!(LAUNCHER_GOOGLE_SERVICES as readonly string[]).includes(t)) {
+      throw new Error(
+        `drive-mcp-launcher: unknown service '${t}' in --services ` +
+          `(valid: ${LAUNCHER_GOOGLE_SERVICES.join(", ")})`,
+      );
+    }
+  }
+  const set = new Set(tokens as LauncherGoogleService[]);
+  return LAUNCHER_GOOGLE_SERVICES.filter((s) => set.has(s));
+}
+
+/**
+ * The scopes a persisted selection expects the seed token to carry —
+ * i.e. exactly what `account add` mints for that selection, minus the
+ * Drive base scopes (the broker has always minted those; the preflight
+ * has never checked them, and keeps not checking them) and minus
+ * `drive.file` (a capability opt-in, not a selection requirement).
+ *
+ * This is the selection-aware replacement for
+ * {@link requiredWorkspaceScopesForTier}: derived from the SAME
+ * persisted `{readonly, services}` record the argv is derived from, so
+ * a valid read-only token can never trip the missing-scope warning
+ * (the pre-v1 behaviour hard-coded the RW doc scopes as required and
+ * would have warned on EVERY boot of a read-only account).
+ */
+export function requiredScopesForSelection(
+  selection: LauncherScopeSelection,
+): string[] {
+  const ro = selection.readonly;
+  const out: string[] = [];
+  for (const s of selection.services) {
+    switch (s) {
+      case "docs":
+        out.push(
+          ro
+            ? "https://www.googleapis.com/auth/documents.readonly"
+            : "https://www.googleapis.com/auth/documents",
+        );
+        break;
+      case "sheets":
+        out.push(
+          ro
+            ? "https://www.googleapis.com/auth/spreadsheets.readonly"
+            : "https://www.googleapis.com/auth/spreadsheets",
+        );
+        break;
+      case "slides":
+        out.push(
+          ro
+            ? "https://www.googleapis.com/auth/presentations.readonly"
+            : "https://www.googleapis.com/auth/presentations",
+        );
+        break;
+      case "cal":
+        out.push(CALENDAR_READONLY_SCOPE);
+        break;
+      case "drive":
+        // Drive base scopes are always minted by the broker; never
+        // preflight-checked (pre-existing contract).
+        break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Selection-aware missing-scope preflight. With a persisted selection,
+ * required scopes derive from `{readonly, services}`; without one, the
+ * legacy tier-derived requirement applies unchanged.
+ */
+export function findMissingScopesForSelection(
+  seedScope: string,
+  tier: string | undefined,
+  selection: LauncherScopeSelection | undefined,
+): string[] {
+  if (!selection) return findMissingWorkspaceScopes(seedScope, tier);
+  const have = new Set(
+    seedScope
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+  return requiredScopesForSelection(selection).filter((s) => !have.has(s));
+}
+
 /** Opt-in capabilities an already-minted seed token may carry. */
 export interface SeedOptInCapabilities {
   /** `--write` → `drive.file`. */
@@ -334,36 +477,61 @@ export function buildMissingScopeWarning(
   tier: string | undefined,
   accountEmail: string,
   granted: SeedOptInCapabilities,
+  selection?: LauncherScopeSelection,
 ): string {
   const short = missing
     .map((s) => s.replace(/^https:\/\/www\.googleapis\.com\/auth\//, ""))
     .join(", ");
-  const suffix =
-    (granted.write ? " --write" : "") + (granted.calendar ? " --calendar" : "");
+  // The recovery command must carry the FULL selection, not just the
+  // legacy opt-ins: a read-only / service-narrowed account whose
+  // operator runs the printed command verbatim must re-mint the SAME
+  // selection — never silently re-widen to the tier default.
+  const suffix = selection
+    ? (selection.readonly ? " --readonly" : granted.write ? " --write" : "") +
+      ` --services ${selection.services.join(",")}`
+    : (granted.write ? " --write" : "") +
+      (granted.calendar ? " --calendar" : "");
   const preserved = [
-    granted.write
+    selection
+      ? `--services ${selection.services.join(",")}` +
+        `${selection.readonly ? " --readonly" : ""} preserves the persisted per-account selection`
+      : "",
+    !selection && granted.write
       ? "--write preserves the existing Drive write capability"
       : "",
-    granted.calendar
+    !selection && granted.calendar
       ? "--calendar preserves the existing Calendar read capability"
       : "",
   ].filter((s) => s.length > 0);
+  const scopeSource = selection
+    ? `for its persisted selection (services: ${selection.services.join(",")}` +
+      `${selection.readonly ? ", read-only" : ""})`
+    : `for tier '${tier ?? "core"}'`;
   return (
     `drive-mcp-launcher: WARNING — the Google account '${accountEmail}' was ` +
-    `consented WITHOUT the scope(s) needed for tier '${tier ?? "core"}': ` +
+    `consented WITHOUT the scope(s) needed ${scopeSource}: ` +
     `${short}.\n` +
-    `  The matching MCP tools (Docs / Sheets / Slides create+edit) will FAIL ` +
+    `  The matching MCP tools will FAIL ` +
     `to authenticate. OAuth scopes are fixed at consent time — re-run on the ` +
     `host to re-mint the token with the correct scopes:\n` +
     `    switchroom auth google account add ${accountEmail} --replace` +
     `${suffix}\n` +
-    `  (scopes are derived from \`google_workspace.tier\` — set the tier ` +
-    `before re-running${preserved.length > 0 ? "; " + preserved.join("; ") : ""}` +
-    `). Drive read/file tools are unaffected.\n`
+    `  (${
+      selection
+        ? ""
+        : "scopes are derived from `google_workspace.tier` — set the tier before re-running"
+    }${
+      preserved.length > 0
+        ? (selection ? "" : "; ") + preserved.join("; ")
+        : ""
+    }). Drive read/file tools are unaffected.\n`
   );
 }
 
-export function buildUvxArgs(tier?: string): string[] {
+export function buildUvxArgs(
+  tier?: string,
+  selection?: LauncherScopeSelection,
+): string[] {
   const args = [
     "--from",
     `git+https://github.com/taylorwilsdon/google_workspace_mcp.git@${GOOGLE_WORKSPACE_MCP_PINNED_SHA}`,
@@ -385,6 +553,23 @@ export function buildUvxArgs(tier?: string): string[] {
   ];
   if (tier && tier.length > 0) {
     args.push("--tool-tier", tier);
+  }
+  // Per-account selection → upstream tool gating. `--tools` narrows
+  // registration to the selected services (upstream argparse nargs="*":
+  // one argv token per service, upstream names — `cal` → `calendar`);
+  // `--read-only` makes upstream request only readonly scopes and skip
+  // registering write tools. Combined with `--tool-tier`, upstream
+  // filters the tier's tools to the selected services (verified at the
+  // pinned SHA). Same persisted record mints the OAuth scopes, so tool
+  // exposure and token scope cannot disagree.
+  if (selection && selection.services.length > 0) {
+    args.push(
+      "--tools",
+      ...selection.services.map((s) => UPSTREAM_SERVICE_NAMES[s]),
+    );
+  }
+  if (selection?.readonly) {
+    args.push("--read-only");
   }
   return args;
 }
@@ -765,6 +950,44 @@ interface ConfigSecrets {
   clientId: string | undefined;
   clientSecret: string | undefined;
   tier: string | undefined;
+  /**
+   * Per-account selection records from `google_accounts:` (keyed by
+   * normalized email). The launcher looks up the broker-selected
+   * account's record to derive `--tools` / `--read-only` and the
+   * scope preflight — same persisted record `account add` minted the
+   * scopes from.
+   */
+  googleAccounts: Record<
+    string,
+    { readonly?: boolean; services?: string[] }
+  >;
+}
+
+/**
+ * Resolve the effective launcher selection for one account record.
+ * Returns `undefined` for a legacy record (neither `readonly` nor
+ * `services` set) — legacy accounts keep the exact pre-v1 behaviour
+ * (tier-gated tools, tier-derived scope preflight, no `--tools`).
+ * A partial record fills the missing axis deterministically: absent
+ * `services` → the tier's default services; absent `readonly` → false.
+ *
+ * Pure + exported so the legacy-passthrough contract is unit-pinned.
+ */
+export function resolveLauncherSelection(
+  record: { readonly?: boolean; services?: string[] } | undefined,
+  tier: string | undefined,
+): LauncherScopeSelection | undefined {
+  if (!record) return undefined;
+  if (record.readonly === undefined && record.services === undefined) {
+    return undefined;
+  }
+  const services =
+    record.services && record.services.length > 0
+      ? parseLauncherServices(record.services.join(","))
+      : tier === "extended" || tier === "complete"
+        ? (["drive", "docs", "sheets", "slides"] as LauncherGoogleService[])
+        : (["drive", "docs", "sheets"] as LauncherGoogleService[]);
+  return { readonly: record.readonly ?? false, services };
 }
 
 /**
@@ -790,7 +1013,17 @@ async function loadConfigSecrets(): Promise<ConfigSecrets> {
     gw.google_client_secret,
     "google_client_secret",
   );
-  return { clientId, clientSecret, tier: gw.tier };
+  const googleAccounts: ConfigSecrets["googleAccounts"] = {};
+  for (const [email, record] of Object.entries(
+    config.google_accounts ?? {},
+  )) {
+    if (!record) continue;
+    googleAccounts[email.toLowerCase()] = {
+      readonly: record.readonly,
+      services: record.services,
+    };
+  }
+  return { clientId, clientSecret, tier: gw.tier, googleAccounts };
 }
 
 // ─── Entry ────────────────────────────────────────────────────────────────
@@ -803,6 +1036,10 @@ async function loadConfigSecrets(): Promise<ConfigSecrets> {
  */
 export async function runDriveMcpLauncher(opts: {
   tier?: string;
+  /** `--services` CSV override (scaffold-threaded); wins over config. */
+  services?: string;
+  /** `--read-only` override (scaffold-threaded); wins over config. */
+  readOnly?: boolean;
 }): Promise<never> {
   let brokerCreds: BrokerGoogleCreds;
   let configSecrets: ConfigSecrets;
@@ -867,6 +1104,38 @@ export async function runDriveMcpLauncher(opts: {
   // wins over the config top-level tier.
   const tier = opts.tier ?? configSecrets.tier;
 
+  // Per-account selection (v1 read-only scope model). Scaffold-threaded
+  // flags win (mirroring --tier); otherwise the persisted
+  // `google_accounts.<email>.{readonly,services}` record for the
+  // broker-selected account. Legacy accounts (no record) → undefined →
+  // byte-identical pre-v1 behaviour.
+  let selection: LauncherScopeSelection | undefined;
+  try {
+    const configSelection = resolveLauncherSelection(
+      configSecrets.googleAccounts[brokerCreds.accountEmail.toLowerCase()],
+      tier,
+    );
+    if (opts.services !== undefined || opts.readOnly) {
+      selection = {
+        readonly: opts.readOnly ?? configSelection?.readonly ?? false,
+        services:
+          opts.services !== undefined
+            ? parseLauncherServices(opts.services)
+            : (configSelection?.services ??
+              // No config record and no --services: readonly-only
+              // override applies to the tier's default services.
+              resolveLauncherSelection({ readonly: false }, tier)!.services),
+      };
+    } else {
+      selection = configSelection;
+    }
+  } catch (err) {
+    process.stderr.write(
+      `drive-mcp-launcher: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  }
+
   // Scope ↔ tier preflight (issue #1663). The broker's seed token was
   // minted by `auth google account add` at whatever tier was configured
   // THEN. If the operator later raised the tier (e.g. core → extended
@@ -877,24 +1146,30 @@ export async function runDriveMcpLauncher(opts: {
   // the first Docs/Sheets/Slides call. We warn (not exit): Drive tools
   // and any in-scope Workspace tools still work, so degrading is better
   // than refusing to start.
-  const missingScopes = findMissingWorkspaceScopes(brokerCreds.scope, tier);
+  const missingScopes = findMissingScopesForSelection(
+    brokerCreds.scope,
+    tier,
+    selection,
+  );
   if (missingScopes.length > 0) {
     // Decide the recovery command's opt-in suffixes from the EXISTING
     // token's scopes — NOT from `missingScopes` (which never contains
     // drive.file or calendar.readonly). A token that already carries
     // those was minted with them; the printed `account add --replace`
-    // must keep the matching flags or the operator silently downgrades.
+    // must keep the matching flags (and the persisted selection) or the
+    // operator silently downgrades / re-widens.
     process.stderr.write(
       buildMissingScopeWarning(
         missingScopes,
         tier,
         brokerCreds.accountEmail,
         seedOptInCapabilities(brokerCreds.scope),
+        selection,
       ),
     );
   }
 
-  const args = buildUvxArgs(tier);
+  const args = buildUvxArgs(tier, selection);
   const env = buildChildEnv(
     process.env,
     credentialsDir,
@@ -964,7 +1239,25 @@ export function registerDriveMcpLauncherCommand(program: Command): void {
       "--tier <tier>",
       "Upstream --tool-tier (core|extended|complete). Overrides config.",
     )
-    .action(async (opts: { tier?: string }) => {
-      await runDriveMcpLauncher({ tier: opts.tier });
-    });
+    .option(
+      "--services <list>",
+      "Comma-separated per-account service selection (cal,drive,docs,sheets,slides) → upstream --tools. Overrides the persisted google_accounts.<email>.services record.",
+    )
+    .option(
+      "--read-only",
+      "Run upstream in --read-only mode (readonly scopes, write tools not registered). Overrides the persisted google_accounts.<email>.readonly record.",
+    )
+    .action(
+      async (opts: {
+        tier?: string;
+        services?: string;
+        readOnly?: boolean;
+      }) => {
+        await runDriveMcpLauncher({
+          tier: opts.tier,
+          services: opts.services,
+          readOnly: opts.readOnly,
+        });
+      },
+    );
 }

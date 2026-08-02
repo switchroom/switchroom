@@ -152,6 +152,161 @@ export const GOOGLE_SLIDES_SCOPE =
 export const GOOGLE_CALENDAR_READONLY_SCOPE =
   "https://www.googleapis.com/auth/calendar.readonly";
 
+// ── Read-only Workspace document scopes (per-account selection v1) ───────
+//
+// The read-only counterparts of GOOGLE_DOCS/SHEETS/SLIDES_SCOPE. Minted
+// when the account's persisted selection says `readonly: true` — a
+// read-only account carries ZERO write scopes (RFC D §12 taken to its
+// conclusion: the narrowest grant that still lets every selected tool
+// authenticate for reads).
+export const GOOGLE_DOCS_READONLY_SCOPE =
+  "https://www.googleapis.com/auth/documents.readonly";
+export const GOOGLE_SHEETS_READONLY_SCOPE =
+  "https://www.googleapis.com/auth/spreadsheets.readonly";
+export const GOOGLE_SLIDES_READONLY_SCOPE =
+  "https://www.googleapis.com/auth/presentations.readonly";
+
+// ── Per-account service selection (v1) ───────────────────────────────────
+//
+// The services an operator can select per Google account via
+// `auth google account add --services <csv>`. Short tokens (config +
+// CLI vocabulary); the MCP launcher maps them to upstream
+// `workspace-mcp --tools` service names (`cal` → `calendar`).
+//
+// v1 deliberately stops here: Gmail (`gmail.readonly`), per-service
+// write levels, and `calendar.events.readonly` are follow-ups — each is
+// a new grant surface with its own approval shape.
+//
+// Order is load-bearing: it is the canonical emission order for minted
+// scope sets (Drive base first, then Docs/Sheets/Slides, Calendar
+// last), which keeps `selectGoogleWorkspaceScopes` byte-stable with the
+// pre-selection behaviour for the default selection.
+export const GOOGLE_SERVICES = [
+  "drive",
+  "docs",
+  "sheets",
+  "slides",
+  "cal",
+] as const;
+export type GoogleService = (typeof GOOGLE_SERVICES)[number];
+
+/**
+ * Parse the `--services` comma-selector into validated service tokens.
+ * Accepts the canonical short tokens plus `calendar` as an alias for
+ * `cal` (operators will type it). De-dups, preserves nothing of input
+ * order (canonical GOOGLE_SERVICES order is applied downstream). Throws
+ * with the full valid vocabulary on an unknown token or an empty list.
+ *
+ * Pure + exported so the CSV contract is unit-pinned.
+ */
+export function parseServicesOption(raw: string): GoogleService[] {
+  const tokens = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0)
+    .map((s) => (s === "calendar" ? "cal" : s));
+  if (tokens.length === 0) {
+    throw new Error(
+      `--services requires at least one service (valid: ${GOOGLE_SERVICES.join(", ")})`,
+    );
+  }
+  for (const t of tokens) {
+    if (!(GOOGLE_SERVICES as readonly string[]).includes(t)) {
+      throw new Error(
+        `--services: unknown service '${t}' (valid: ${GOOGLE_SERVICES.join(", ")}; ` +
+          `'calendar' is accepted as an alias for 'cal')`,
+      );
+    }
+  }
+  const set = new Set(tokens as GoogleService[]);
+  return GOOGLE_SERVICES.filter((s) => set.has(s));
+}
+
+/**
+ * The default service set a tier mints when no explicit `--services`
+ * selection exists — exactly the pre-selection behaviour: Drive + Docs +
+ * Sheets at every tier, Slides added at extended/complete. Calendar is
+ * NEVER a tier default (see GOOGLE_CALENDAR_READONLY_SCOPE — a tier bump
+ * must not silently widen into a new product surface).
+ *
+ * Pure + exported so the tier→services contract is unit-pinned.
+ */
+export function tierDefaultServices(
+  tier: "core" | "extended" | "complete",
+): GoogleService[] {
+  if (tier === "extended" || tier === "complete") {
+    return ["drive", "docs", "sheets", "slides"];
+  }
+  return ["drive", "docs", "sheets"];
+}
+
+/**
+ * A fully-resolved per-account scope selection — the single value both
+ * halves of the grant derive from: `scopesForSelection` mints the OAuth
+ * scope set, and the MCP launcher emits the matching upstream
+ * `--tools` / `--read-only` argv. Same input ⇒ tool exposure and token
+ * scope can never disagree.
+ */
+export interface GoogleScopeSelection {
+  /**
+   * true → every selected service mints ONLY its `.readonly` scope
+   * variant, and `driveWrite` is ignored (a read-only selection carries
+   * zero write scopes, deterministically).
+   */
+  readonly: boolean;
+  /** Selected services (canonical GOOGLE_SERVICES order applied). */
+  services: GoogleService[];
+  /**
+   * `--write` → `drive.file`. Only meaningful when `readonly` is false
+   * and `drive` is selected. Kept as its own axis (not folded into
+   * `readonly`) because the pre-selection default is docs-write WITHOUT
+   * drive-write — collapsing them would change existing grants.
+   */
+  driveWrite: boolean;
+}
+
+/**
+ * The readonly-aware service→scope map. Mint the exact OAuth scope set
+ * for a resolved selection:
+ *
+ *   drive  → Drive read base (+ `drive.file` when driveWrite && !readonly)
+ *   docs   → `documents` | `documents.readonly`
+ *   sheets → `spreadsheets` | `spreadsheets.readonly`
+ *   slides → `presentations` | `presentations.readonly`
+ *   cal    → `calendar.readonly` (always read-only — calendar write is
+ *            deliberately never offered, see GOOGLE_CALENDAR_READONLY_SCOPE)
+ *
+ * Pure + exported so the selection→scope contract is unit-pinned (this
+ * is the "readonly mints ZERO write scopes" invariant's home).
+ */
+export function scopesForSelection(sel: GoogleScopeSelection): string[] {
+  const selected = new Set(sel.services);
+  const out: string[] = [];
+  if (selected.has("drive")) {
+    out.push(...DRIVE_READONLY_SCOPES);
+    if (sel.driveWrite && !sel.readonly) {
+      out.push("https://www.googleapis.com/auth/drive.file");
+    }
+  }
+  if (selected.has("docs")) {
+    out.push(sel.readonly ? GOOGLE_DOCS_READONLY_SCOPE : GOOGLE_DOCS_SCOPE);
+  }
+  if (selected.has("sheets")) {
+    out.push(
+      sel.readonly ? GOOGLE_SHEETS_READONLY_SCOPE : GOOGLE_SHEETS_SCOPE,
+    );
+  }
+  if (selected.has("slides")) {
+    out.push(
+      sel.readonly ? GOOGLE_SLIDES_READONLY_SCOPE : GOOGLE_SLIDES_SCOPE,
+    );
+  }
+  if (selected.has("cal")) {
+    out.push(GOOGLE_CALENDAR_READONLY_SCOPE);
+  }
+  return [...new Set(out)];
+}
+
 /**
  * The Google Workspace document scopes available at each tier. Tied to
  * the tier→tool mapping in `GoogleWorkspaceTierSchema`:
@@ -165,11 +320,15 @@ export const GOOGLE_CALENDAR_READONLY_SCOPE =
 export function workspaceScopesForTier(
   tier: "core" | "extended" | "complete",
 ): string[] {
-  const docScopes = [GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE];
-  if (tier === "extended" || tier === "complete") {
-    return [...docScopes, GOOGLE_SLIDES_SCOPE];
-  }
-  return docScopes;
+  // Derived from the readonly-aware service→scope map so there is one
+  // source of truth: a tier's document scopes are exactly the RW scopes
+  // of its default services minus the Drive base (Drive scopes are the
+  // always-minted base handled by selectDriveAccountScopes).
+  return scopesForSelection({
+    readonly: false,
+    driveWrite: false,
+    services: tierDefaultServices(tier).filter((s) => s !== "drive"),
+  });
 }
 
 /**
@@ -208,17 +367,45 @@ export function selectGoogleWorkspaceScopes(opts: {
   /**
    * Opt-in Calendar READ. Adds {@link GOOGLE_CALENDAR_READONLY_SCOPE} and
    * nothing else. Never implied by a tier — see that constant's comment.
+   * Equivalent to including `cal` in `services`.
    */
   calendar?: boolean;
   tier?: "core" | "extended" | "complete";
+  /**
+   * `--readonly` — mint ONLY `.readonly` scope variants for every
+   * selected service (zero write scopes). Mutually exclusive with
+   * `write` (enforced here as a hard error, belt-and-braces with the
+   * CLI-level check).
+   */
+  readonly?: boolean;
+  /**
+   * Explicit per-account service selection (`--services`, or the
+   * persisted `google_accounts.<email>.services` record). Omitted →
+   * the tier's default services (pre-selection behaviour, byte-stable).
+   */
+  services?: GoogleService[];
 }): string[] {
-  const base = selectDriveAccountScopes(opts.write);
-  const workspace = workspaceScopesForTier(opts.tier ?? "core");
-  const calendar = opts.calendar ? [GOOGLE_CALENDAR_READONLY_SCOPE] : [];
-  // De-dup defensively — base and workspace sets are disjoint today but
-  // a future scope move shouldn't silently produce a doubled scope
-  // string in the consent URL.
-  return [...new Set([...base, ...workspace, ...calendar])];
+  if (opts.readonly && opts.write) {
+    throw new Error(
+      "--readonly and --write are mutually exclusive: a read-only " +
+        "selection mints zero write scopes by definition.",
+    );
+  }
+  const services = opts.services ?? tierDefaultServices(opts.tier ?? "core");
+  const withCal =
+    opts.calendar && !services.includes("cal")
+      ? [...services, "cal" as const]
+      : services;
+  // Canonical order (GOOGLE_SERVICES) keeps the emitted set byte-stable
+  // regardless of input order; scopesForSelection de-dups defensively so
+  // a future scope move can't produce a doubled scope string in the
+  // consent URL.
+  const set = new Set(withCal);
+  return scopesForSelection({
+    readonly: opts.readonly ?? false,
+    driveWrite: opts.write,
+    services: GOOGLE_SERVICES.filter((s) => set.has(s)),
+  });
 }
 
 // ── Opt-in capability carry-forward (re-consent safety) ──────────────────
@@ -314,6 +501,174 @@ export function resolveReconsentCapabilities(
     },
     carried: keys.filter((k) => existing[k] && !requested[k]),
     added: keys.filter((k) => requested[k] && !existing[k]),
+  };
+}
+
+// ── Per-account selection resolution (v1 read-only scope model) ──────────
+
+/**
+ * The selection persisted in `google_accounts.<email>` — written by
+ * `account add` when the operator uses the new-style flags, re-read on
+ * `--replace` so a re-consent mints the SAME selection instead of
+ * silently re-widening to the tier default. This persisted record is the
+ * deterministic carry-forward: OAuth scope strings can't distinguish
+ * "operator chose readonly" from "operator chose these services" in
+ * every case, the YAML record can.
+ */
+export interface PersistedGoogleSelection {
+  readonly?: boolean;
+  services?: GoogleService[];
+}
+
+/** Outcome of {@link resolveScopeSelection}. */
+export interface ScopeSelectionPlan {
+  /** The fully-resolved selection to mint scopes from. */
+  selection: GoogleScopeSelection;
+  /**
+   * The record to persist into `google_accounts.<email>` after a
+   * successful mint — or `null` to leave the YAML untouched (legacy
+   * flag-free adds stay tier-driven, so a later tier bump keeps its
+   * pre-selection semantics).
+   */
+  persist: PersistedGoogleSelection | null;
+  /**
+   * Capabilities the existing token/record held that this invocation
+   * explicitly DROPPED (e.g. `--readonly` on a token that carried
+   * `drive.file`). Never silent — the caller must announce each.
+   */
+  dropped: string[];
+}
+
+/**
+ * Resolve the effective per-account scope selection for
+ * `auth google account add`, folding together (highest precedence
+ * first):
+ *
+ *   1. Explicit flags (`--services`, `--readonly` / `--write`) — an
+ *      explicit flag is authoritative for its axis, including explicit
+ *      NARROWING (announced via `dropped`, never silent).
+ *   2. The persisted `google_accounts.<email>` selection — the
+ *      deterministic `--replace` carry-forward.
+ *   3. The existing token's capabilities (#4190's scope-string union) —
+ *      covers pre-selection accounts with no persisted record.
+ *   4. The tier default (pre-selection behaviour, byte-stable).
+ *
+ * Invariants:
+ *   - `--readonly` + `--write` is a hard error (checked by the caller
+ *      at flag level AND by selectGoogleWorkspaceScopes).
+ *   - Nothing widens silently: a capability neither requested nor held
+ *     is never minted (tier defaults aside, which are pre-existing
+ *     behaviour).
+ *   - Nothing narrows silently: every drop comes from an explicit flag
+ *     and is surfaced in `dropped`.
+ *
+ * Pure + exported so all of the above is unit-pinned.
+ */
+export function resolveScopeSelection(args: {
+  flags: {
+    readonly: boolean;
+    write: boolean;
+    calendar: boolean;
+    services?: GoogleService[];
+  };
+  persisted?: PersistedGoogleSelection;
+  /** Existing-token capabilities, already unioned per #4190 (or fresh-add defaults). */
+  existing: GoogleOptInCapabilities;
+  tier: "core" | "extended" | "complete";
+}): ScopeSelectionPlan {
+  const { flags, persisted, existing, tier } = args;
+  if (flags.readonly && flags.write) {
+    throw new Error(
+      "--readonly and --write are mutually exclusive. A read-only account " +
+        "mints zero write scopes; use --write (without --readonly) for the " +
+        "drive.file write grant.",
+    );
+  }
+
+  const dropped: string[] = [];
+
+  // readonly axis: explicit flag wins; else the persisted record; else
+  // false (pre-selection default — docs/sheets mint their RW scopes).
+  const readonly = flags.readonly
+    ? true
+    : flags.write
+      ? false
+      : (persisted?.readonly ?? false);
+  if (flags.write && persisted?.readonly) {
+    dropped.push(
+      "read-only mode (persisted `readonly: true`) — dropped because --write was passed",
+    );
+  }
+
+  // drive.file axis: the #4190 union (explicit --write OR carried from
+  // the token), except an explicit --readonly drops it.
+  let driveWrite = existing.write;
+  if (readonly && existing.write) {
+    driveWrite = false;
+    dropped.push(
+      "Drive write (drive.file) — the existing token carries it, but --readonly was passed",
+    );
+  }
+
+  // services axis: explicit --services wins; else persisted; else tier
+  // default. `--calendar` (and the carried calendar capability) union
+  // `cal` in — except into an explicit --services list that deliberately
+  // omits it without a `--calendar` alongside (an explicit narrowing,
+  // announced below).
+  const explicitServices = !!(flags.services && flags.services.length > 0);
+  let services: GoogleService[];
+  let persistServices: boolean;
+  if (explicitServices) {
+    services = [...flags.services!];
+    persistServices = true;
+    if (flags.calendar && !services.includes("cal")) services.push("cal");
+  } else if (persisted?.services && persisted.services.length > 0) {
+    services = [...persisted.services];
+    persistServices = true;
+    if ((flags.calendar || existing.calendar) && !services.includes("cal")) {
+      services.push("cal");
+    }
+  } else {
+    services = [...tierDefaultServices(tier)];
+    persistServices = false;
+    if ((flags.calendar || existing.calendar) && !services.includes("cal")) {
+      services.push("cal");
+    }
+  }
+  const set = new Set(services);
+  const canonical = GOOGLE_SERVICES.filter((s) => set.has(s));
+
+  if (explicitServices) {
+    // Announce every previously-granted service the explicit list drops.
+    const prior =
+      persisted?.services ??
+      (existing.calendar
+        ? [...tierDefaultServices(tier), "cal" as const]
+        : tierDefaultServices(tier));
+    for (const s of prior) {
+      if (!set.has(s)) {
+        dropped.push(
+          `service '${s}' — previously granted, not in the --services list passed`,
+        );
+      }
+    }
+  }
+
+  // Persist when the new-style selection is active — an explicit
+  // --services/--readonly flag on this invocation, or a persisted record
+  // being carried forward. Legacy flag-free adds persist nothing.
+  const persist =
+    flags.readonly || persistServices || persisted !== undefined
+      ? {
+          readonly,
+          services: canonical,
+        }
+      : null;
+
+  return {
+    selection: { readonly, services: canonical, driveWrite },
+    persist,
+    dropped,
   };
 }
 

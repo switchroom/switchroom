@@ -40,6 +40,7 @@ import {
   enableAgentsOnGoogleAccount,
   getEnabledAgentsForGoogleAccount,
   listGoogleAccounts,
+  setGoogleAccountSelection,
 } from "./google-accounts-yaml.js";
 import type { PutResult, GetResult } from "../vault/broker/client.js";
 import { withConfigError, getConfig, getConfigPath } from "./helpers.js";
@@ -82,7 +83,7 @@ export function registerAuthGoogleSubcommands(
     .description(
       "Manage Google account credentials in the auth-broker (add / remove / list).",
     );
-  registerAccountAdd(account);
+  registerAccountAdd(account, program);
   registerAccountRemove(account);
   registerAccountList(account);
 }
@@ -598,7 +599,7 @@ function pad(s: string, width: number): string {
 // a `list-google-accounts` broker op (tracked follow-up).
 // ────────────────────────────────────────────────────────────────────────
 
-function registerAccountAdd(accountParent: Command): void {
+function registerAccountAdd(accountParent: Command, program: Command): void {
   accountParent
     .command("add <account>")
     .description(
@@ -619,11 +620,26 @@ function registerAccountAdd(accountParent: Command): void {
       "Request READ-ONLY Calendar scope (calendar.readonly) so the gdrive MCP's list_calendars / get_events tools authenticate. Opt-in — no tier grants it by default, and switchroom never requests a Calendar WRITE scope. Re-consent an existing account with `--replace --calendar`.",
       false,
     )
+    .option(
+      "--readonly",
+      "Mint ONLY read-only scope variants for every selected service (zero write scopes), and run the gdrive MCP in upstream --read-only mode. Mutually exclusive with --write. Persisted per account and carried forward on --replace — a read-only account cannot silently re-widen.",
+      false,
+    )
+    .option(
+      "--services <list>",
+      "Comma-separated per-account service selection: cal,drive,docs,sheets,slides ('calendar' accepted for 'cal'). Selects BOTH the OAuth scopes minted AND the tools the gdrive MCP exposes (upstream --tools). Omitted = the tier's default services (drive,docs,sheets; +slides at extended/complete). Persisted per account and carried forward on --replace.",
+    )
     .action(
       withConfigError(
         async (
           account: string,
-          opts: { replace?: boolean; write?: boolean; calendar?: boolean },
+          opts: {
+            replace?: boolean;
+            write?: boolean;
+            calendar?: boolean;
+            readonly?: boolean;
+            services?: string;
+          },
         ) => {
         const normalizedAccount = validateAndNormalizeAccountEmail(account);
 
@@ -636,6 +652,8 @@ function registerAccountAdd(accountParent: Command): void {
             selectGoogleWorkspaceScopes,
             capabilitiesFromScopeString,
             resolveReconsentCapabilities,
+            parseServicesOption,
+            resolveScopeSelection,
           },
           { selectInitialTier },
           { brokerCall },
@@ -771,6 +789,33 @@ function registerAccountAdd(accountParent: Command): void {
         // trigger upstream's doomed port-8000 OAuth fallback).
         const tier = gw.tier ?? "core";
 
+        // ── v1 per-account selection flags ─────────────────────────────
+        // Hard error BEFORE any broker/OAuth work: a read-only account
+        // minting write scopes is a contradiction, not a preference.
+        if (opts.readonly && opts.write) {
+          throw new Error(
+            "--readonly and --write are mutually exclusive. A read-only " +
+              "account mints zero write scopes; drop one of the flags.",
+          );
+        }
+        const requestedServices = opts.services
+          ? parseServicesOption(opts.services)
+          : undefined;
+        // The persisted selection is the deterministic `--replace`
+        // carry-forward: without it, re-consenting a read-only /
+        // service-narrowed account for an unrelated reason would
+        // silently re-widen to the tier default.
+        const persistedRecord = config.google_accounts?.[normalizedAccount];
+        const persistedSelection =
+          persistedRecord &&
+          (persistedRecord.readonly !== undefined ||
+            persistedRecord.services !== undefined)
+            ? {
+                readonly: persistedRecord.readonly,
+                services: persistedRecord.services,
+              }
+            : undefined;
+
         // Re-consent safety — opt-in capability carry-forward. OAuth
         // scopes are fixed at consent time, so `--replace` mints EXACTLY
         // the set the flags describe: re-consenting for an unrelated
@@ -803,10 +848,37 @@ function registerAccountAdd(accountParent: Command): void {
             buildScopeReconsentRequiredError(normalizedAccount, plan.added),
           );
         }
+        // Same shape for the v1 selection flags: changing readonly/
+        // services on an existing account is a scope change, and scopes
+        // are fixed at consent time.
+        if (
+          existingEntry &&
+          !opts.replace &&
+          (opts.readonly || requestedServices)
+        ) {
+          throw new Error(
+            buildSelectionReconsentRequiredError(normalizedAccount, {
+              readonly: opts.readonly ?? false,
+              services: opts.services,
+            }),
+          );
+        }
 
+        const selPlan = resolveScopeSelection({
+          flags: {
+            readonly: opts.readonly ?? false,
+            write: opts.write ?? false,
+            calendar: opts.calendar ?? false,
+            services: requestedServices,
+          },
+          persisted: persistedSelection,
+          existing: plan.effective,
+          tier,
+        });
         const accountScopes = selectGoogleWorkspaceScopes({
-          write: plan.effective.write,
-          calendar: plan.effective.calendar,
+          write: selPlan.selection.driveWrite,
+          readonly: selPlan.selection.readonly,
+          services: selPlan.selection.services,
           tier,
         });
         const oauthCfg = {
@@ -814,32 +886,62 @@ function registerAccountAdd(accountParent: Command): void {
           client_secret: clientSecretRaw,
           scopes: accountScopes,
         };
-        if (plan.effective.write) {
+        if (selPlan.selection.readonly) {
+          console.log(
+            chalk.yellow(
+              "  READ-ONLY selection: minting only .readonly scope variants — zero write scopes.",
+            ),
+          );
+        }
+        if (selPlan.selection.driveWrite && !selPlan.selection.readonly) {
           console.log(
             chalk.yellow(
               "  Requesting Drive WRITE scope (drive.file — create/edit app-created files).",
             ),
           );
         }
-        if (plan.effective.calendar) {
+        if (selPlan.selection.services.includes("cal")) {
           console.log(
             chalk.yellow(
               "  Requesting Calendar READ-ONLY scope (calendar.readonly — list calendars, read events).",
             ),
           );
         }
-        for (const line of buildCarryForwardNotices(plan.carried)) {
+        for (const d of selPlan.dropped) {
+          console.log(chalk.yellow(`  NOT carried forward: ${d}.`));
+        }
+        // Suppress a #4190 carry-forward notice when the v1 selection
+        // just dropped that capability (the dropped notice above is the
+        // truthful one).
+        const carried = plan.carried.filter(
+          (k) =>
+            !(k === "write" && selPlan.selection.readonly) &&
+            !(
+              k === "calendar" && !selPlan.selection.services.includes("cal")
+            ),
+        );
+        for (const line of buildCarryForwardNotices(carried)) {
           console.log(chalk.gray(line));
         }
-        console.log(
-          chalk.gray(
-            `  Workspace tier: ${tier} — requesting Docs + Sheets` +
-              (tier === "extended" || tier === "complete"
-                ? " + Slides"
-                : "") +
-              " API scopes so the tier's tools can authenticate.",
-          ),
-        );
+        if (selPlan.persist) {
+          console.log(
+            chalk.gray(
+              `  Service selection: ${selPlan.selection.services.join(", ")}` +
+                (selPlan.selection.readonly ? " (read-only)" : "") +
+                " — persisted per account and carried forward on --replace.",
+            ),
+          );
+        } else {
+          console.log(
+            chalk.gray(
+              `  Workspace tier: ${tier} — requesting Docs + Sheets` +
+                (tier === "extended" || tier === "complete"
+                  ? " + Slides"
+                  : "") +
+                " API scopes so the tier's tools can authenticate.",
+            ),
+          );
+        }
         console.log(
           chalk.gray(
             "  Changing the tier later requires re-running this command\n" +
@@ -919,6 +1021,31 @@ function registerAccountAdd(accountParent: Command): void {
             `  ✓ Registered Google account ${chalk.bold(normalizedAccount)} with auth-broker.`,
           ),
         );
+
+        // Persist the v1 selection into google_accounts.<email> AFTER
+        // the broker accepted the new token — the YAML record must
+        // describe a token that actually exists. This record is what
+        // `--replace` re-reads (deterministic carry-forward) and what
+        // the scaffold/launcher derive `--tools`/`--read-only` from.
+        if (selPlan.persist) {
+          const configPath = getConfigPath(program);
+          const raw = readFileSync(configPath, "utf-8");
+          const patched = setGoogleAccountSelection(raw, normalizedAccount, {
+            readonly: selPlan.persist.readonly ?? false,
+            services: selPlan.persist.services ?? [],
+          });
+          if (patched !== raw) {
+            writeGoogleYaml(configPath, patched);
+            console.log(
+              chalk.gray(
+                `  Persisted selection to google_accounts.${normalizedAccount} ` +
+                  `(readonly: ${selPlan.persist.readonly ?? false}, services: ` +
+                  `${(selPlan.persist.services ?? []).join(",")}). Agents pick ` +
+                  `it up on their next restart.`,
+              ),
+            );
+          }
+        }
         console.log();
         console.log(`  Next: enable on one or more agents:`);
         console.log(
@@ -979,6 +1106,39 @@ export function buildScopeReconsentRequiredError(
     "",
     "Scopes the account already holds are carried forward automatically,",
     "so re-consenting will not drop existing capabilities.",
+  ].join("\n");
+}
+
+/**
+ * Error text for "you asked for a different readonly/services selection
+ * on an already-registered account, but did not pass `--replace`".
+ * The v1-selection sibling of {@link buildScopeReconsentRequiredError}:
+ * without it the broker's generic already-registered refusal reads as
+ * success while the stored token keeps its old scope set.
+ *
+ * Exported so the wording contract is unit-pinned.
+ */
+export function buildSelectionReconsentRequiredError(
+  account: string,
+  requested: { readonly: boolean; services?: string },
+): string {
+  const flags = [
+    requested.readonly ? "--readonly" : "",
+    requested.services ? `--services ${requested.services}` : "",
+  ]
+    .filter((s) => s.length > 0)
+    .join(" ");
+  return [
+    `'${account}' is already registered with the auth-broker, and changing ` +
+      `its readonly/services selection changes the OAuth scope set.`,
+    "",
+    "OAuth scopes are fixed at consent time — a stored token cannot be",
+    "reshaped in place. Re-consent to mint a token with the new selection:",
+    "",
+    `  switchroom auth google account add ${account} --replace ${flags}`,
+    "",
+    "The persisted selection (and any capabilities the flags don't",
+    "explicitly change) is carried forward, never silently widened.",
   ].join("\n");
 }
 
@@ -1426,6 +1586,7 @@ export const _testing = {
   buildGoogleCredentials,
   oauthClientSetupGuidance,
   buildScopeReconsentRequiredError,
+  buildSelectionReconsentRequiredError,
   buildCarryForwardNotices,
   interpretConnectPutResult,
   interpretRefGetResult,

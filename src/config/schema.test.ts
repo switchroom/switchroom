@@ -1570,3 +1570,66 @@ describe("AgentSchema — memory.recall query shaping (#3757)", () => {
     expect(() => AgentSchema.parse(agent({ request_timeout_seconds: 0 }))).toThrow();
   });
 });
+
+// ── v1 per-account selection: google_accounts.{readonly,services} ────────
+
+describe("google_accounts per-account selection (v1 read-only scope model)", () => {
+  const base = {
+    switchroom: { version: 1 },
+    telegram: { bot_token: "x", forum_chat_id: "1" },
+    agents: {},
+  };
+
+  it("accepts readonly + services on an account record", () => {
+    const result = SwitchroomConfigSchema.parse({
+      ...base,
+      google_accounts: {
+        "alice@example.com": {
+          enabled_for: ["klanker"],
+          readonly: true,
+          services: ["cal", "drive"],
+        },
+      },
+    });
+    const rec = result.google_accounts?.["alice@example.com"];
+    expect(rec?.readonly).toBe(true);
+    expect(rec?.services).toEqual(["cal", "drive"]);
+  });
+
+  it("both are optional (legacy records keep parsing, undefined selection)", () => {
+    const result = SwitchroomConfigSchema.parse({
+      ...base,
+      google_accounts: {
+        "alice@example.com": { enabled_for: ["klanker"] },
+      },
+    });
+    const rec = result.google_accounts?.["alice@example.com"];
+    expect(rec?.readonly).toBeUndefined();
+    expect(rec?.services).toBeUndefined();
+  });
+
+  it("rejects an unknown service token (closed enum — a typo must not be inert)", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...base,
+        google_accounts: {
+          "alice@example.com": {
+            enabled_for: ["klanker"],
+            services: ["gmail"],
+          },
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects an empty services list (min 1 — empty means 'remove the key')", () => {
+    expect(() =>
+      SwitchroomConfigSchema.parse({
+        ...base,
+        google_accounts: {
+          "alice@example.com": { enabled_for: ["klanker"], services: [] },
+        },
+      }),
+    ).toThrow();
+  });
+});
