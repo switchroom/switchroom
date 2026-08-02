@@ -526,6 +526,34 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     heartbeatTimeoutMs = 30_000,
   } = options;
 
+  // Hub-side dedup ring for Buzz injects (fable MAJOR-2). The Buzz sidecar's
+  // durable journal covers the normal case, but a crash AFTER the gateway
+  // injects but BEFORE the sidecar records dedup would re-fire the turn on
+  // restart. This bounded in-memory ring drops a re-injected duplicate at the
+  // hub, keyed on the stable Buzz event id.
+  //
+  // SCOPE — buzz ONLY. This is the shared inject hot path (cron, reactions,
+  // resume, etc.). The check below fires exclusively for injects whose
+  // `inbound.meta.source === "buzz"` AND that carry a `buzz_event_id`; every
+  // other inject source flows through untouched, byte-identical to before. A
+  // buzz inject without a stable id (should not happen — inbound-map always
+  // stamps one) also flows through untouched rather than being dropped blind.
+  const BUZZ_INJECT_RING_MAX = 1024;
+  const buzzInjectSeen = new Set<string>();
+  const buzzInjectOrder: string[] = [];
+  /** Return true if this buzz event id was already injected (drop it); else
+   *  record it and return false. Bounded FIFO eviction at RING_MAX entries. */
+  const buzzInjectIsDuplicate = (eventId: string): boolean => {
+    if (buzzInjectSeen.has(eventId)) return true;
+    buzzInjectSeen.add(eventId);
+    buzzInjectOrder.push(eventId);
+    if (buzzInjectOrder.length > BUZZ_INJECT_RING_MAX) {
+      const evicted = buzzInjectOrder.shift();
+      if (evicted !== undefined) buzzInjectSeen.delete(evicted);
+    }
+    return false;
+  };
+
   // Race-safe cleanup: rename the live socket to a .bak sidecar rather than
   // unlinking it. If the old gateway's delayed shutdown-cleanup later tries to
   // rename again, it targets .bak (already-moved) not the freshly-bound file.
@@ -623,9 +651,22 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
       case "pty_partial":
         if (onPtyPartial) onPtyPartial(client, msg as PtyPartialForward);
         break;
-      case "inject_inbound":
-        if (onInjectInbound) onInjectInbound(client, msg as InjectInboundMessage);
+      case "inject_inbound": {
+        const injectMsg = msg as InjectInboundMessage;
+        // Hub-side Buzz dedup ring (fable MAJOR-2) — scoped strictly to
+        // meta.source==="buzz". A duplicate buzz event id (a re-inject after a
+        // crash between inject and the sidecar's dedup record) is dropped here;
+        // every non-buzz inject is unaffected.
+        const injMeta = (injectMsg.inbound as { meta?: Record<string, unknown> } | undefined)?.meta;
+        if (injMeta && injMeta.source === "buzz" && typeof injMeta.buzz_event_id === "string") {
+          if (buzzInjectIsDuplicate(injMeta.buzz_event_id)) {
+            log(`inject_inbound: dropped duplicate buzz event ${injMeta.buzz_event_id.slice(0, 12)} (hub dedup ring)`);
+            break;
+          }
+        }
+        if (onInjectInbound) onInjectInbound(client, injectMsg);
         break;
+      }
       case "send_outbound":
         if (onSendOutbound) onSendOutbound(client, msg as SendOutboundMessage);
         break;

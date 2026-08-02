@@ -2236,9 +2236,150 @@ export const TelegramChannelSchema = z
     return tg;
   });
 
+/**
+ * Buzz (Nostr) co-channel — Phase 1 inbound fan-in.
+ *
+ * A per-agent sidecar (`src/buzz-gateway/`) opens a WebSocket Nostr
+ * subscription to a closed Buzz relay, NIP-42-authenticates, and injects
+ * allowlisted messages onto the agent's gateway socket as synthesized turns
+ * (`meta.source="buzz"`), exactly like the cron sidecar. Phase 1 is
+ * INBOUND-ONLY — replies land on Telegram (the authoritative surface).
+ *
+ * Default OFF: an absent `channels.buzz` block, or `enabled: false`, means
+ * start.sh never forks the sidecar and the fleet behaviour is byte-identical
+ * to pre-Buzz. Nothing here self-deploys.
+ *
+ * Security model (fail-closed): every inbound event must pass BOTH signature
+ * verification (`verifyEvent`) AND membership of the effective allowlist
+ * (`authorized_pubkeys` ∪ `{operator_pubkey}`, hex-normalized) before it can
+ * become a turn. The default allowlist is operator-only.
+ */
+export const BuzzChannelSchema = z
+  .object({
+    enabled: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Master switch for the per-agent Buzz sidecar. Default false — the " +
+        "channel ships dark; start.sh forks the sidecar only when true.",
+      ),
+    relay_url: z
+      .string()
+      .regex(/^wss?:\/\//, "relay_url must be a ws:// or wss:// URL")
+      .describe(
+        "CANONICAL WebSocket URL of the closed Buzz relay — the exact string " +
+        "the relay expects in the NIP-42 `relay` auth tag (e.g. " +
+        "'ws://127.0.0.1:3000'). A live probe proved the relay validates this " +
+        "tag as an exact string match against its own URL BEFORE the " +
+        "membership check, so it is the relay's advertised identity, NOT " +
+        "necessarily the address the sidecar dials. Set relay_dial_url when " +
+        "the reachable address differs (a docker-network IP).",
+      ),
+    // The sidecar's container cannot reach the relay's own 127.0.0.1 loopback,
+    // so when the relay's canonical identity (relay_url) is a loopback/host
+    // address, the sidecar must DIAL a docker-network address instead while
+    // still TAGGING the canonical relay_url. relay_dial_url carries that dial
+    // address; absent → the sidecar dials relay_url directly (correct when the
+    // canonical URL is itself reachable from the sidecar).
+    relay_dial_url: z
+      .string()
+      .regex(/^wss?:\/\//, "relay_dial_url must be a ws:// or wss:// URL")
+      .optional()
+      .describe(
+        "Reachable ws:// / wss:// address the sidecar DIALS when it differs " +
+        "from the canonical relay_url (e.g. a docker-network IP the relay's " +
+        "own 127.0.0.1 can't stand in for). The NIP-42 auth tag still uses " +
+        "relay_url. Defaults to relay_url when unset.",
+      ),
+    // Phase 0 blocker #2: the relay resolves its community from the HTTP Host
+    // header on the WS upgrade. When the sidecar dials the relay by a docker
+    // network IP (relay_url host = 10.x), the Host header must still carry the
+    // relay's CONFIGURED authority or the relay returns a blind 404. Absent →
+    // the sidecar uses the authority parsed from relay_url (correct when the
+    // URL host already matches the community authority).
+    relay_host: z
+      .string()
+      .optional()
+      .describe(
+        "HTTP Host header authority sent on the WS upgrade (e.g. " +
+        "'127.0.0.1:3000'). The relay resolves its community from this. " +
+        "Defaults to the authority parsed from relay_url.",
+      ),
+    nsec_vault_key: z
+      .string()
+      .default("buzz/{agent}-nsec")
+      .describe(
+        "Vault KEY NAME for the agent's Nostr secret key. Broker-fetched " +
+        "in-process at sidecar boot; NEVER resolved into env or logged. " +
+        "'{agent}' is substituted with the agent name.",
+      ),
+    operator_pubkey: z
+      .string()
+      .regex(
+        /^(npub1[02-9ac-hj-np-z]{58}|[0-9a-f]{64})$/,
+        "operator_pubkey must be a bech32 npub or 64-char hex pubkey",
+      )
+      .describe(
+        "The operator's Nostr pubkey (npub or hex). Always in the effective " +
+        "inbound allowlist — the fail-closed default is operator-only.",
+      ),
+    authorized_pubkeys: z
+      .array(z.string())
+      .default([])
+      .describe(
+        "Additional pubkeys (npub or hex) whose signed events may become " +
+        "turns. Effective allowlist = this ∪ {operator_pubkey}. Empty by " +
+        "default (operator-only).",
+      ),
+    mirror: z
+      .enum(["both", "origin", "off"])
+      .default("both")
+      .describe(
+        "Cross-surface mirror mode (Phase 2 placeholder). 'off' is a true " +
+        "kill-switch that disables the channel in BOTH directions — the " +
+        "inbound sidecar exits idle. Phase 1 only reads 'off' vs not-off.",
+      ),
+    chat_id: z
+      .string()
+      .min(1, "chat_id must be a non-empty Telegram chat id")
+      .describe(
+        "Telegram chat id an injected Buzz turn is routed to. Phase 1 is " +
+        "inbound-only, so the agent's reply lands here on Telegram (the " +
+        "authoritative surface); in later phases this is the chat the Buzz " +
+        "turn's Telegram copy maps to. Required — the sidecar refuses to run " +
+        "live without it (BUZZ_CHAT_ID).",
+      ),
+    default_channel_id: z
+      .string()
+      .describe(
+        "Relay-minted group UUID (the NIP-29 `h` tag) the sidecar subscribes " +
+        "to and stamps on injected turns.",
+      ),
+    channel_map: z
+      .record(z.string(), z.string())
+      .default({})
+      .describe("Optional map of extra group UUIDs → friendly labels."),
+    pubkey_names: z
+      .record(z.string(), z.string())
+      .default({})
+      .describe(
+        "Optional petnames: hex/npub pubkey → display name, used to label " +
+        "the sender on injected turns.",
+      ),
+    pinned_relay_digest: z
+      .string()
+      .optional()
+      .describe(
+        "Pinned relay image digest (M4). The compat-check warns on mismatch; " +
+        "advisory in Phase 1.",
+      ),
+  })
+  .strict();
+
 export const ChannelsSchema = z
   .object({
     telegram: TelegramChannelSchema,
+    buzz: BuzzChannelSchema.optional(),
   })
   .optional();
 
@@ -5433,6 +5574,7 @@ export type AgentHooks = z.infer<typeof AgentHooksSchema>;
 export type HookEntry = z.infer<typeof HookEntrySchema>;
 export type Channels = z.infer<typeof ChannelsSchema>;
 export type TelegramChannel = z.infer<typeof TelegramChannelSchema>;
+export type BuzzChannel = z.infer<typeof BuzzChannelSchema>;
 export type AgentSoul = z.infer<typeof AgentSoulSchema>;
 export type AgentTools = z.infer<typeof AgentToolsSchema>;
 export type AgentMemory = z.infer<typeof AgentMemorySchema>;

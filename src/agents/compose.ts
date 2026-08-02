@@ -712,6 +712,40 @@ function emitVoiceSidecarService(
   lines.push(``);
 }
 
+/**
+ * Projected `channels.buzz` values for the compose `environment:` block —
+ * present iff the agent declares a `channels.buzz` block at all. The Buzz
+ * sidecar (`src/buzz-gateway/`) reads its config from these BUZZ_* env vars
+ * (it has no access to the config cascade), exactly like the scheduler reads
+ * SWITCHROOM_* vars. The keystone default-off invariant lives in
+ * `emitAgentService`: `BUZZ_ENABLED=1` is projected ONLY when `enabled` is
+ * true here, so an `enabled:false`/absent block never forks the sidecar, and
+ * an agent WITHOUT a `channels.buzz` block projects NOTHING (byte-identical to
+ * pre-Buzz compose). The one secret (the agent nsec) is NEVER projected — the
+ * sidecar broker-fetches it in-process at boot from `nsecVaultKey`.
+ */
+interface BuzzServiceData {
+  /** Whether `channels.buzz.enabled === true`. Gates BUZZ_ENABLED projection. */
+  enabled: boolean;
+  mirror: "both" | "origin" | "off";
+  /** Telegram chat id an injected turn routes to (BUZZ_CHAT_ID). */
+  chatId: string;
+  /** Canonical relay URL used VERBATIM as the NIP-42 auth tag (BUZZ_RELAY_URL). */
+  relayUrl: string;
+  /** Distinct docker-network dial address, when it differs from relayUrl
+   *  (BUZZ_RELAY_DIAL_URL). Undefined ⇒ dial relayUrl. */
+  relayDialUrl: string | undefined;
+  /** HTTP Host header authority for the WS upgrade (BUZZ_RELAY_HOST). */
+  relayHost: string | undefined;
+  /** Subscribed group UUID / NIP-29 `h` tag (BUZZ_CHANNEL_IDS). */
+  channelIds: string;
+  operatorPubkey: string;
+  authorizedPubkeys: string[];
+  /** Vault KEY NAME for the nsec, `{agent}`-substituted (BUZZ_NSEC_VAULT_KEY). */
+  nsecVaultKey: string;
+  pubkeyNames: Record<string, string>;
+}
+
 interface AgentServiceData {
   name: string;
   uid: number;
@@ -854,6 +888,14 @@ interface AgentServiceData {
    * when an operator adds a conflicting `env:` override.
    */
   tmuxSupervisor: boolean;
+  /**
+   * Projected `channels.buzz` config, or `undefined` when the agent declares no
+   * `channels.buzz` block. `emitAgentService` projects the BUZZ_* env from this
+   * (with BUZZ_ENABLED gated on `enabled`). Undefined ⇒ NO BUZZ_* env at all, so
+   * an agent without the block renders byte-identical to pre-Buzz. See
+   * BuzzServiceData.
+   */
+  buzz: BuzzServiceData | undefined;
 }
 
 /**
@@ -982,6 +1024,32 @@ export function describeAgents(
       // the SWITCHROOM_TMUX_SUPERVISOR env can never disagree with the
       // supervisor the agent actually boots under.
       tmuxSupervisor: resolved.experimental?.legacy_pty !== true,
+      // Buzz co-channel projection (deploy switch, default-off keystone). Built
+      // ONLY when the agent declares a `channels.buzz` block; absent ⇒ undefined
+      // ⇒ emitAgentService projects NO BUZZ_* env (byte-identical to pre-Buzz).
+      // Schema defaults are re-applied here because `resolved` is the merged raw
+      // cascade (not Zod-parsed), matching how telegramEnabledFlag reads raw
+      // channels.telegram. `{agent}` is substituted in the nsec key name.
+      buzz: ((): BuzzServiceData | undefined => {
+        const raw = resolved.channels?.buzz;
+        if (!raw) return undefined;
+        return {
+          enabled: raw.enabled === true,
+          mirror: raw.mirror ?? "both",
+          chatId: raw.chat_id ?? "",
+          relayUrl: raw.relay_url ?? "",
+          relayDialUrl: raw.relay_dial_url,
+          relayHost: raw.relay_host,
+          channelIds: raw.default_channel_id ?? "",
+          operatorPubkey: raw.operator_pubkey ?? "",
+          authorizedPubkeys: raw.authorized_pubkeys ?? [],
+          nsecVaultKey: (raw.nsec_vault_key ?? "buzz/{agent}-nsec").replace(
+            /\{agent\}/g,
+            name,
+          ),
+          pubkeyNames: raw.pubkey_names ?? {},
+        };
+      })(),
       timezone: resolveTimezone(config, resolved, {
         onUtcFallback: () => {
           console.warn(
@@ -2535,6 +2603,37 @@ function emitAgentService(
   // from yaml in EITHER direction, which is what makes the flag and the
   // runtime it guards genuinely unable to disagree.
   env.SWITCHROOM_TMUX_SUPERVISOR = a.tmuxSupervisor ? "1" : "0";
+  // Buzz co-channel env projection (channels.buzz → BUZZ_* container env). This
+  // is the Phase-1 deploy switch and the default-off keystone. The whole block
+  // is emitted ONLY when the agent declares a `channels.buzz` block (a.buzz set)
+  // — an agent WITHOUT the block projects NOTHING here, so its compose is
+  // byte-identical to pre-Buzz. Within the block, BUZZ_ENABLED=1 is projected
+  // ONLY when enabled === true; an enabled:false/absent block leaves BUZZ_ENABLED
+  // unset, so start.sh's `[ "$BUZZ_ENABLED" = "1" ]` guard never forks the
+  // sidecar and the channel stays dark by construction. The nsec is deliberately
+  // NOT projected — only its vault KEY NAME (the sidecar broker-fetches the
+  // secret in-process at boot). Emitted BEFORE the userEnv merge below so these
+  // system keys are authoritative (the merge only fills undefined keys).
+  if (a.buzz) {
+    const b = a.buzz;
+    // The keystone gate: BUZZ_ENABLED lands ONLY for an explicitly-enabled block.
+    if (b.enabled) env.BUZZ_ENABLED = "1";
+    env.BUZZ_MIRROR = b.mirror;
+    env.BUZZ_CHAT_ID = b.chatId;
+    env.BUZZ_RELAY_URL = b.relayUrl;
+    if (b.relayDialUrl) env.BUZZ_RELAY_DIAL_URL = b.relayDialUrl;
+    if (b.relayHost) env.BUZZ_RELAY_HOST = b.relayHost;
+    env.BUZZ_CHANNEL_IDS = b.channelIds;
+    env.BUZZ_OPERATOR_PUBKEY = b.operatorPubkey;
+    if (b.authorizedPubkeys.length > 0) {
+      env.BUZZ_AUTHORIZED_PUBKEYS = b.authorizedPubkeys.join(",");
+    }
+    env.BUZZ_NSEC_VAULT_KEY = b.nsecVaultKey;
+    const petnames = Object.entries(b.pubkeyNames);
+    if (petnames.length > 0) {
+      env.BUZZ_PUBKEY_NAMES = petnames.map(([k, v]) => `${k}=${v}`).join(",");
+    }
+  }
   // Merge operator-declared env vars from the agent's `env:` block.
   // System-managed keys (HOME, NPM_*, SWITCHROOM_*) win on collision —
   // an operator can't override the runtime contract from yaml. A

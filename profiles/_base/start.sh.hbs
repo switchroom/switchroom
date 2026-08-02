@@ -455,6 +455,34 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
       bun /opt/switchroom/agent-scheduler/index.js &
   fi
 
+  # 3b) Buzz co-channel inbound sidecar (Phase 1, channels.buzz).
+  #     A supervised sibling that opens a WebSocket Nostr subscription to a
+  #     closed Buzz relay, NIP-42-authenticates, and injects allowlisted
+  #     messages onto the gateway socket as synthesized turns
+  #     (meta.source="buzz") — exactly like the cron sidecar above. INBOUND
+  #     ONLY in Phase 1; replies land on Telegram (the authoritative surface).
+  #
+  #     Default OFF and deterministic: the block is present for every agent
+  #     (start.sh stays byte-identical fleet-wide) but forks the sidecar ONLY
+  #     when BUZZ_ENABLED=1 is set in the container env. NOTE: nothing in this
+  #     branch sets BUZZ_ENABLED (or the other BUZZ_* vars) — projecting an
+  #     ENABLED channels.buzz block into container env is DEFERRED to the
+  #     deploy-wiring phase. Until then the env is unset for every agent and
+  #     this block is a no-op, so the channel is dark by construction. The
+  #     sidecar itself also fails closed if its env is incomplete, and fetches
+  #     the nsec in-process from the vault broker (never an env var, never
+  #     logged).
+  if [ "$BUZZ_ENABLED" = "1" ] \
+     && [ -f /opt/switchroom/buzz-gateway/index.js ] \
+     && command -v bun >/dev/null 2>&1; then
+    # --oneshot-ok: the sidecar exits 0 when the channel resolves not-live
+    # (e.g. mirror:off, or a not-live env). A clean exit 0 = "nothing to do",
+    # so DON'T respawn it every 60s (that is the documented churn pattern
+    # above). A non-zero crash while live still respawns.
+    _switchroom_supervise buzz-gateway /var/log/switchroom/buzz-gateway.log --oneshot-ok \
+      bun /opt/switchroom/buzz-gateway/index.js &
+  fi
+
 {{#if cronSessionEnabled}}
   # 4) cheap cron SESSION (Tier 1, reference/rfcs/cheap-cron-sessions.md §2.2).
   #    A SECOND interactive claude (no -p) dedicated to context:fresh cron
