@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.19.48 — reflect defaults to `mid` fleet-wide, with per-agent `reflect_budget` / `reflect_max_tokens` yaml knobs
+
+### Hindsight: default reflect budget `mid`, exposed to yaml (#4202)
+
+The hindsight MCP shim injected `budget: "low"` for a bare `reflect`, which
+bounded depth but made slightly-off queries return empty. The fleet default is
+now **`mid`** (the shim constant `DEFAULT_REFLECT_BUDGET`), and the reflect
+depth/token-cap knobs are exposed to `switchroom.yaml`.
+
+- **Reflect injected default `low` → `mid`** for every stdio agent on image
+  update — no reconcile required, the default lives in the shim constant.
+  Explicit per-call `budget` and both yaml tiers (`defaults.memory` /
+  per-agent) override it.
+- **Recall is unchanged at `low`** (`DEFAULT_RECALL_BUDGET`) — it fires on
+  every inbound turn, so it stays fast and shallow.
+- **`memory.reflect_budget`** (`low` | `mid` | `high`) and
+  **`memory.reflect_max_tokens`** (≤8192) are settable per-agent and at the
+  `defaults` / profile tier, mirror-parity enforced. `reflect_max_tokens`
+  exposes the pre-existing `HINDSIGHT_SHIM_REFLECT_MAX_TOKENS` clamp; the shim
+  is untouched for that half.
+- **`mid` cannot resurrect the old overflow hazard** — that was driven by
+  `max_tokens` (still clamped to 1024), not budget. The only cost of `mid` is
+  added reflect latency / backend compute.
+- **Opt-down:** set `defaults.memory.reflect_budget: low` to restore the prior
+  fleet behavior. **http-transport caveat:** these are stdio-shim concepts;
+  under `memory.config.mcp_transport: http` they bypass the shim, the generator
+  logs a one-line warning and emits no env (does not throw).
+- **`switchroom apply` required** for the yaml overrides to reach existing
+  agents (they land in `settings.json` at scaffold time). The default flip
+  itself needs only the image update.
+
 ## v0.19.47 — per-account read-only Google scopes, the quiescence flush stops double-sending, and consolidation stops re-refreshing every mental model
 
 ### Google: per-account read-only and service scope selection (#4195)
