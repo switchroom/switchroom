@@ -418,6 +418,13 @@ const serverEntries = [
   // The host-side singleton scheduler bundle (`dist/scheduler/index.js`)
   // and Dockerfile.scheduler were removed in Phase 4.
   { src: "src/agent-scheduler/index.ts", out: "dist/agent-scheduler/index.js" },
+  // Buzz co-channel Phase 1: inbound fan-in sidecar. Baked into the agent
+  // image at /opt/switchroom/buzz-gateway/index.js and started by start.sh
+  // as a gateway sibling ONLY when BUZZ_ENABLED=1 (default off). Runs under
+  // `bun` (uses Bun.spawn for the in-process vault fetch and Bun's WebSocket
+  // with a Host header override for the closed relay). nostr-tools is pure JS
+  // and bundles clean under --target node.
+  { src: "src/buzz-gateway/index.ts", out: "dist/buzz-gateway/index.js" },
   // RFC H: switchroom-auth-broker singleton. Bundled into the image as
   // /opt/switchroom/dist/auth-broker/index.js; Dockerfile.auth-broker
   // sets CMD to `bun` on the bundle. No native deps.

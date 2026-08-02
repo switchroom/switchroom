@@ -376,6 +376,11 @@ COPY telegram-plugin/dist /opt/switchroom/telegram-plugin/dist
 # only drops the (frequently-changing) bundle into the existing dir.
 COPY dist/agent-scheduler/index.js /opt/switchroom/agent-scheduler/index.js
 
+# Buzz co-channel Phase 1 inbound sidecar bundle. Self-contained (nostr-tools
+# is pure JS and is bundled in — no npm install layer needed). start.sh only
+# forks it when BUZZ_ENABLED=1, so this COPY is inert for every current agent.
+COPY dist/buzz-gateway/index.js /opt/switchroom/buzz-gateway/index.js
+
 # sec WS6-F5 (#1419): non-root image default. Pre-#1419 the agent
 # image had NO `USER`, so its effective default was root — all agent
 # privilege-reduction was compose-emitted only (the four root
