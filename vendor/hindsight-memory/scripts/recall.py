@@ -1442,8 +1442,13 @@ _DIRECTIVE_CAPTURE_NUDGE = (
     "(verbatim, in the user’s own words) BEFORE you answer, so the "
     "correction survives future sessions. UNLESS an equivalent active "
     "directive already exists (see any <active_directives> block above) — "
-    "in that case it is already saved; do NOT create a duplicate. If it’s "
-    "only a one-off instruction, ignore this note and just answer.\n"
+    "in that case it is already saved; do NOT create a duplicate. If the "
+    "rule can be enforced deterministically — a settings.json hook, a "
+    "permission rule, a skill/script edit, or a config change — prefer "
+    "that (instead of, or in addition to, the directive) and say which "
+    "you did; reserve a directive for judgment rules code can’t enforce. "
+    "If it’s only a one-off instruction, ignore this note and just "
+    "answer.\n"
     "</directive_capture_check>"
 )
 
