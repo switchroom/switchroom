@@ -2901,11 +2901,22 @@ PYEOF
 # post-condition asserts below fail the build if the admission mod (or the reranking
 # boost-damping mod) is lost to an upstream reshuffle.
 #
-# LOW latent risk (dual-signal): reranker priority keys off RequestContext.internal, while
-# switchroom admission keys off the explicit `_background` recall param. On every current
-# v0.19.48 call path they agree (background recalls carry the internal context). A future
-# caller hand-rolling `_background=True` with `.internal=False` (or vice-versa) would give a
-# recall disagreeing admission vs rerank priority classes — latent coupling, not a bug today.
+# DUAL-SIGNAL RECONCILIATION (switchroom #4212): a recall carries TWO priority signals.
+# `_background` (the admission param on recall_async / _search_with_retries, the switchroom
+# recall-admission split) sets DB-admission priority; `request_context.internal` sets the
+# reranker-pool priority. They are DISTINCT axes on purpose — a REFLECT sub-recall
+# (reflect/tools.py `replace(request_context, internal=True)` with no `_background`) is
+# admission-FOREGROUND (a user is waiting on the reflect answer) yet rerank-BACKGROUND (it
+# fans out a wall of reranks that must not starve single interactive reranks). So
+# internal=True with _background=False is a LIVE, CORRECT path today — NOT a divergence to
+# assert away; a "the two must agree" guard would fire on every reflect. The ONLY harmful
+# direction is the converse: _background=True with .internal=False, where a background-
+# admitted recall would rerank as FOREGROUND and jump the queue ahead of interactive
+# recall, defeating the very starvation fix #3142 exists for. The call-site patch below
+# threads `_background` down to the rerank site and derives the rerank class as
+# (_background OR internal) so that invariant holds BY CONSTRUCTION (a future diverging
+# caller cannot silently slip past it), and log-warns on the harmful direction so the bug
+# is fixed at its source rather than merely masked.
 #
 # Self-verifying (anchor-assert / replace / post-condition + ast.parse). Guarded by
 # tests/docker/dockerfile-hindsight-bakes.test.ts and
@@ -3136,6 +3147,26 @@ apply(CE, (
     "                ex = cls._executor\n"
     "        return ex\n"
     "\n"
+    "    @classmethod\n"
+    "    def shutdown_executor(cls, wait: bool = True) -> None:\n"
+    "        \"\"\"Tear down the shared priority reranker pool (idempotent).\n"
+    "\n"
+    "        switchroom #4213: MemoryEngine.close() — the engine teardown hook the\n"
+    "        API lifespan (create_app) and the worker main loop both call — shuts\n"
+    "        down every other long-lived worker/pool (task backend, db pools, LLM\n"
+    "        providers); the reranker pool was the one omission. Workers are daemon\n"
+    "        threads so the process can still exit without this, but draining them\n"
+    "        here completes in-flight reranks cleanly and lets a re-created engine\n"
+    "        (tests, mounted sub-apps) start a fresh pool via the lazy\n"
+    "        _get_executor() path instead of inheriting a torn-down one. Nulling the\n"
+    "        class ref under the lock keeps it consistent with _get_executor().\n"
+    "        \"\"\"\n"
+    "        with cls._executor_lock:\n"
+    "            ex = cls._executor\n"
+    "            cls._executor = None\n"
+    "        if ex is not None:\n"
+    "            ex.shutdown(wait=wait)\n"
+    "\n"
     "    def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:\n"
 ), count=1)
 
@@ -3221,24 +3252,123 @@ apply(RR, (
     "        scores = await self.cross_encoder.predict(pairs, background=background)\n"
 ), count=1)
 
-# ---- memory_engine.py: recall call site derives background from RequestContext.internal ----
+# ---- memory_engine.py: module-level dual-signal reconciliation helper (switchroom #4212) ----
+# A recall carries TWO priority signals that must not silently diverge: `_background` (the
+# admission param, sets DB-admission priority) and request_context.internal (sets rerank-pool
+# priority). They are distinct axes — a reflect sub-recall is admission-foreground yet
+# rerank-background, so internal-without-_background is CORRECT. The harmful direction is the
+# converse: _background without internal, where a background-admitted recall would rerank as
+# FOREGROUND and jump the queue ahead of interactive recall, defeating #3142. This helper is
+# the single point that derives the rerank class as (_background OR internal) — so that
+# invariant holds by construction — and log-warns on the harmful direction so a diverging
+# caller is fixed at its source. Extracted to module scope so it is independently unit/probe
+# testable (drive it with a deliberately-mismatched call and observe the warning + return).
+apply(ME, (
+    "from .db_utils import acquire_with_retry, retry_with_backoff\n"
+    "\n"
+    "\n"
+    "def _get_tiktoken_encoding():\n"
+), (
+    "from .db_utils import acquire_with_retry, retry_with_backoff\n"
+    "\n"
+    "\n"
+    "def _reconcile_rerank_priority(_background: bool, request_context) -> bool:\n"
+    "    \"\"\"switchroom #4212: fold a recall's two priority signals into the reranker-pool class.\n"
+    "\n"
+    "    ``_background`` (DB-admission priority, the switchroom recall-admission split) and\n"
+    "    ``request_context.internal`` (reranker-pool priority) are DISTINCT axes: a reflect\n"
+    "    sub-recall is admission-foreground (a user waits on the answer) yet rerank-background\n"
+    "    (a fan-out that must not starve single interactive reranks), so internal=True with\n"
+    "    _background=False is correct and expected. The one invariant that must always hold is\n"
+    "    the other direction — anything admitted as pure background maintenance\n"
+    "    (_background=True) MUST also rerank as background, or a background fan-out would jump\n"
+    "    the rerank queue ahead of interactive recall, defeating #3142. Return\n"
+    "    (_background OR internal) so that holds by construction, and warn on the harmful\n"
+    "    direction so a diverging caller is fixed at its source rather than silently repaired.\n"
+    "\n"
+    "    Returns True when the rerank should run at BACKGROUND (lower) priority.\n"
+    "    \"\"\"\n"
+    "    internal = bool(request_context is not None and request_context.internal)\n"
+    "    if _background and not internal:\n"
+    "        logger.warning(\n"
+    "            \"recall: _background=True but request_context.internal is not set; a \"\n"
+    "            \"background-admitted recall would rerank as foreground and can starve \"\n"
+    "            \"interactive reranks (switchroom #4212). Forcing background rerank priority.\"\n"
+    "        )\n"
+    "    return bool(_background or internal)\n"
+    "\n"
+    "\n"
+    "def _get_tiktoken_encoding():\n"
+), count=1)
+
+# ---- memory_engine.py: recall call site reconciles admission + internal into rerank priority ----
 apply(ME, (
     "                    await reranker_instance.ensure_initialized()\n"
     "                    scored_results = await reranker_instance.rerank(query, merged_candidates)\n"
 ), (
     "                    await reranker_instance.ensure_initialized()\n"
-    "                    # Foreground vs background priority for the reranker pool.\n"
-    "                    # Internal/background operations — consolidation and reflect\n"
-    "                    # sub-recalls (RequestContext.internal=True) — fan out a wall of\n"
-    "                    # reranks; marking them background lets a local reranker keep\n"
-    "                    # interactive (foreground) recall reranks from being starved\n"
-    "                    # behind that queue. This is the reranker-thread-pool layer; it\n"
-    "                    # is orthogonal to the switchroom recall-admission split\n"
-    "                    # (_background_search_semaphore), which gates a step earlier.\n"
-    "                    background_rerank = bool(request_context is not None and request_context.internal)\n"
+    "                    # switchroom #4212: reconcile the recall's two priority signals\n"
+    "                    # (admission `_background`, threaded down from recall_async, and\n"
+    "                    # request_context.internal) into the reranker-pool priority class.\n"
+    "                    # See _reconcile_rerank_priority — the rerank class is\n"
+    "                    # (_background OR internal) so a background-admitted recall can\n"
+    "                    # never rerank as foreground and starve interactive reranks (#3142).\n"
+    "                    background_rerank = _reconcile_rerank_priority(_background, request_context)\n"
     "                    scored_results = await reranker_instance.rerank(\n"
     "                        query, merged_candidates, background=background_rerank\n"
     "                    )\n"
+), count=1)
+
+# ---- memory_engine.py: thread `_background` down to the rerank site (switchroom #4212) ----
+# The admission signal `_background` lives on recall_async; the rerank site lives one frame
+# down in _search_with_retries, which only saw `request_context`. Thread `_background`
+# through so the rerank class can be derived as (_background OR internal). The preceding
+# `max_source_facts_tokens_per_observation: int = -1,` line disambiguates this signature
+# from recall_async's (which has the same `reranking=` default but a different prior line).
+apply(ME, (
+    "        max_source_facts_tokens_per_observation: int = -1,\n"
+    "        reranking: RecallReranking = \"cross_encoder\",\n"
+    "    ) -> RecallResultModel:\n"
+), (
+    "        max_source_facts_tokens_per_observation: int = -1,\n"
+    "        reranking: RecallReranking = \"cross_encoder\",\n"
+    "        # switchroom #4212: mirrors recall_async's admission `_background` so the\n"
+    "        # rerank priority class is derived as (_background OR internal), keeping the\n"
+    "        # DB-admission and reranker-pool priority signals from silently diverging.\n"
+    "        _background: bool = False,\n"
+    "    ) -> RecallResultModel:\n"
+), count=1)
+apply(ME, (
+    "                            max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,\n"
+    "                            reranking=reranking,\n"
+    "                        )\n"
+), (
+    "                            max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,\n"
+    "                            reranking=reranking,\n"
+    "                            _background=_background,  # switchroom #4212\n"
+    "                        )\n"
+), count=1)
+
+# ---- memory_engine.py: wire the reranker-pool teardown into close() (switchroom #4213) ----
+# close() is the engine teardown hook (create_app lifespan + worker main both await it) and
+# already shuts down every other long-lived worker/pool; the priority reranker pool was the
+# omission. Offload the (bounded) join to a thread so it never blocks the event loop during
+# graceful shutdown. Anchored on the existing task-backend teardown so it sits among the
+# other worker shutdowns.
+apply(ME, (
+    "        # Shutdown task backend\n"
+    "        await self._task_backend.shutdown()\n"
+), (
+    "        # Shutdown task backend\n"
+    "        await self._task_backend.shutdown()\n"
+    "\n"
+    "        # switchroom #4213: tear down the shared priority reranker pool. Every\n"
+    "        # other long-lived pool is shut down here; this one was omitted. Daemon\n"
+    "        # threads mean the process can exit without it, but draining lets in-flight\n"
+    "        # reranks finish and a re-created engine start a fresh pool. Offloaded so\n"
+    "        # the join never blocks the event loop during graceful shutdown.\n"
+    "        from .cross_encoder import LocalSTCrossEncoder\n"
+    "        await asyncio.to_thread(LocalSTCrossEncoder.shutdown_executor)\n"
 ), count=1)
 
 # ---- post-conditions: full surface present, parses, switchroom-local mods survive ----
@@ -3246,6 +3376,8 @@ ce = pathlib.Path(CE).read_text()
 assert "class _PriorityRerankExecutor:" in ce, "switchroom #3142: executor class missing post-patch"
 assert ce.count("*, background: bool = False) -> list[float]:") == 14, "switchroom #3142: predict-sig count drift"
 assert "LocalSTCrossEncoder._get_executor().submit(self._predict_sync, pairs, background=background)" in ce, "switchroom #3142: local predict body not rewired"
+# switchroom #4213: the reranker-pool teardown classmethod must exist for close() to wire.
+assert "def shutdown_executor(cls, wait: bool = True) -> None:" in ce, "switchroom #4213: shutdown_executor classmethod missing after patch"
 ast.parse(ce)
 rr = pathlib.Path(RR).read_text()
 assert "self.cross_encoder.predict(pairs, background=background)" in rr, "switchroom #3142: rerank call site not forwarding background"
@@ -3253,12 +3385,26 @@ assert "self.cross_encoder.predict(pairs, background=background)" in rr, "switch
 assert "_boost_authority(" in rr and "measured cross-encoder saturation" in rr, "switchroom CE-saturation mod lost — patch ordering broke"
 ast.parse(rr)
 me = pathlib.Path(ME).read_text()
-assert "background_rerank = bool(request_context is not None and request_context.internal)" in me, "switchroom #3142: recall call site not patched"
+# switchroom #4212: the reconciliation helper exists, returns (_background OR internal),
+# carries the harmful-direction warning, and is the single derivation point at the call site.
+assert "def _reconcile_rerank_priority(_background: bool, request_context) -> bool:" in me, "switchroom #4212: reconciliation helper missing after patch"
+assert "return bool(_background or internal)" in me, "switchroom #4212: helper does not return (_background OR internal)"
+assert "background-admitted recall would rerank as foreground" in me, "switchroom #4212: dual-signal divergence warning missing"
+assert "background_rerank = _reconcile_rerank_priority(_background, request_context)" in me, "switchroom #4212: rerank call site does not route through the reconciliation helper"
+# The old #3142 single-signal derivation must be GONE — its survival means the #4212
+# reconciliation did not land and admission/rerank priority can still silently diverge.
+assert "background_rerank = bool(request_context is not None and request_context.internal)" not in me, "switchroom #4212: pre-reconciliation single-signal rerank derivation still present"
+# `_background` must be threaded into _search_with_retries and forwarded at its call site.
+assert "_background=_background,  # switchroom #4212" in me, "switchroom #4212: _background not forwarded to _search_with_retries"
+# switchroom #4213: close() tears down the reranker pool via the classmethod.
+assert "await asyncio.to_thread(LocalSTCrossEncoder.shutdown_executor)" in me, "switchroom #4213: reranker pool teardown not wired into close()"
 # switchroom-local recall-admission split MUST survive (orthogonal layer):
 assert "_background_search_semaphore" in me, "switchroom recall-admission-split mod lost — patch ordering broke"
 ast.parse(me)
 print("switchroom #3142: reranker foreground-priority lane baked "
       "(14 predict sigs, _PriorityRerankExecutor, rerank + call-site background flag); "
+      "#4212 dual-signal reconciliation (rerank = _background OR internal, threaded + guarded); "
+      "#4213 shutdown_executor wired into close(); "
       "_background_search_semaphore + CE-saturation mods preserved")
 PYEOF
 

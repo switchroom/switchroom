@@ -1164,9 +1164,42 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /async def predict\(self, pairs: list\[tuple\[str, str\]\], \*, background: bool = False\) -> list\[float\]:/,
     );
-    // The recall call site derives priority from RequestContext.internal.
+    // #4212 dual-signal reconciliation: the rerank call site no longer derives
+    // priority from RequestContext.internal ALONE. It routes through a module-level
+    // helper that folds in the admission `_background` signal (threaded down from
+    // recall_async) so a background-admitted recall can never rerank as foreground.
     expect(dockerfile).toContain(
-      "background_rerank = bool(request_context is not None and request_context.internal)",
+      "def _reconcile_rerank_priority(_background: bool, request_context) -> bool:",
+    );
+    expect(dockerfile).toContain("return bool(_background or internal)");
+    expect(dockerfile).toContain(
+      "background_rerank = _reconcile_rerank_priority(_background, request_context)",
+    );
+    // `_background` is threaded into _search_with_retries and forwarded at the call site.
+    expect(dockerfile).toContain("_background=_background,  # switchroom #4212");
+    // The harmful-direction warning must be baked (fires when _background is set
+    // without the internal context — the one divergence that starves interactive reranks).
+    expect(dockerfile).toContain(
+      "background-admitted recall would rerank as foreground",
+    );
+    // The pre-reconciliation single-signal derivation must be GONE as an injection —
+    // the build's own post-condition asserts its absence in the patched source.
+    expect(dockerfile).toContain(
+      'assert "background_rerank = bool(request_context is not None and request_context.internal)" not in me',
+    );
+    // #4213: the reranker pool teardown classmethod + its wiring into close().
+    expect(dockerfile).toContain(
+      "def shutdown_executor(cls, wait: bool = True) -> None:",
+    );
+    expect(dockerfile).toContain(
+      "await asyncio.to_thread(LocalSTCrossEncoder.shutdown_executor)",
+    );
+    // Build-time post-conditions gate #4212/#4213 presence in the patched source.
+    expect(dockerfile).toMatch(
+      /_reconcile_rerank_priority\(_background, request_context\)" in me, "switchroom #4212/,
+    );
+    expect(dockerfile).toMatch(
+      /asyncio\.to_thread\(LocalSTCrossEncoder\.shutdown_executor\)" in me, "switchroom #4213/,
     );
     // Post-replace verification-on-build: full surface present, exact-14, and
     // both orthogonal switchroom-local mods asserted to SURVIVE the patch

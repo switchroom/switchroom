@@ -37,6 +37,16 @@
  *  - The `background` param reaches CrossEncoderModel.predict (abstract),
  *    LocalSTCrossEncoder.predict, and CrossEncoderReranker.rerank — keyword-
  *    only, default False — so the recall call site can steer priority.
+ *  - #4212 dual-signal reconciliation: `_reconcile_rerank_priority` folds the
+ *    admission `_background` and `request_context.internal` signals as
+ *    (_background OR internal), REPAIRS + WARNS on the harmful mismatch
+ *    (_background set without internal), and is background-but-silent on the
+ *    legitimate reflect divergence; `_background` is threaded into
+ *    `_search_with_retries` and the rerank site routes through the helper.
+ *  - #4213 `LocalSTCrossEncoder.shutdown_executor` exists, is idempotent, and
+ *    `MemoryEngine.close()` wires it (the engine teardown hook the API lifespan
+ *    and worker both call), so the reranker pool is no longer the one long-lived
+ *    pool close() forgets.
  *
  * Why the GREEN arm probes the through-built image rather than re-patching
  * upstream in-container: #3142's anchors and post-conditions depend on THREE
@@ -249,6 +259,108 @@ if Executor is not None:
     if not rejected:
         failures.append("max_workers=0 was not rejected")
 
+# ---- #4212: the dual-signal reconciliation helper ----
+# recall carries TWO priority signals: _background (DB admission) and
+# request_context.internal (reranker pool). They are distinct axes — a reflect
+# sub-recall is admission-foreground yet rerank-background — so the helper folds
+# them as (_background OR internal), and WARNS only on the harmful direction
+# (_background set without internal), the one case that would let a background
+# fan-out rerank as foreground and starve interactive reranks (#3142). This arm
+# proves the helper FIRES on a deliberately-mismatched call and stays silent on
+# the legitimate reflect divergence.
+import logging
+
+try:
+    import hindsight_api.engine.memory_engine as me
+    reconcile = getattr(me, "_reconcile_rerank_priority", None)
+    ME = getattr(me, "MemoryEngine", None)
+except Exception as e:  # noqa: BLE001
+    me = None
+    reconcile = None
+    ME = None
+    print("MEMORY_ENGINE_IMPORT_ERROR", repr(e))
+
+print("RECONCILE_PRESENT", reconcile is not None)
+if reconcile is None:
+    failures.append("no _reconcile_rerank_priority - #4212 not applied")
+else:
+    class _RC:
+        def __init__(self, internal):
+            self.internal = internal
+
+    _recs = []
+
+    class _H(logging.Handler):
+        def emit(self, r):
+            _recs.append(r.getMessage())
+
+    me.logger.addHandler(_H())
+    me.logger.setLevel(logging.WARNING)
+
+    # Harmful mismatch: _background=True, internal=False -> repair to background + WARN.
+    _recs.clear()
+    harmful = reconcile(True, _RC(False))
+    harmful_warned = any("#4212" in m for m in _recs)
+    print("RECONCILE_HARMFUL_REPAIR", harmful, "WARN", harmful_warned)
+    if harmful is not True:
+        failures.append("#4212 harmful mismatch (_background without internal) did not repair to background priority")
+    if not harmful_warned:
+        failures.append("#4212 harmful mismatch did not warn")
+
+    # Legitimate reflect divergence: internal=True, _background=False -> background, SILENT.
+    _recs.clear()
+    reflect_bg = reconcile(False, _RC(True))
+    reflect_silent = not _recs
+    print("RECONCILE_REFLECT", reflect_bg, "SILENT", reflect_silent)
+    if reflect_bg is not True or not reflect_silent:
+        failures.append("#4212 reflect divergence (internal without _background) must be background AND silent")
+
+    # Normal user recall: neither -> foreground, silent.
+    _recs.clear()
+    if reconcile(False, _RC(False)) is not False or _recs:
+        failures.append("#4212 normal recall must be foreground and silent")
+    # None context with _background set -> still repaired + warned.
+    _recs.clear()
+    if reconcile(True, None) is not True or not any("#4212" in m for m in _recs):
+        failures.append("#4212 _background with request_context=None must repair + warn")
+
+# The rerank site (in _search_with_retries) must route through the helper, and
+# _background must be threaded from recall_async's admission param down to it.
+if ME is not None:
+    sw_bg = inspect.signature(ME._search_with_retries).parameters.get("_background")
+    print("SEARCH_WITH_RETRIES_BG_PARAM", sw_bg is not None)
+    if sw_bg is None:
+        failures.append("#4212 _search_with_retries lost the _background kwarg")
+    elif sw_bg.default is not False:
+        failures.append("#4212 _search_with_retries _background default is not False")
+    sw_src = inspect.getsource(ME._search_with_retries)
+    routes = "_reconcile_rerank_priority(_background, request_context)" in sw_src
+    print("RERANK_ROUTES_THROUGH_HELPER", routes)
+    if not routes:
+        failures.append("#4212 rerank site does not route through _reconcile_rerank_priority")
+    if "_background=_background,  # switchroom #4212" not in inspect.getsource(ME.recall_async):
+        failures.append("#4212 recall_async does not forward _background to _search_with_retries")
+
+# ---- #4213: reranker pool teardown wired into MemoryEngine.close() ----
+shutdown_executor = getattr(getattr(ce, "LocalSTCrossEncoder", None), "shutdown_executor", None)
+print("SHUTDOWN_EXECUTOR_PRESENT", shutdown_executor is not None)
+if shutdown_executor is None:
+    failures.append("#4213 LocalSTCrossEncoder.shutdown_executor missing")
+else:
+    ce.LocalSTCrossEncoder._get_executor()
+    ce.LocalSTCrossEncoder.shutdown_executor()
+    reset = ce.LocalSTCrossEncoder._executor is None
+    ce.LocalSTCrossEncoder.shutdown_executor()  # idempotent second call must not raise
+    print("SHUTDOWN_EXECUTOR_RESETS", reset)
+    if not reset:
+        failures.append("#4213 shutdown_executor did not reset _executor to None")
+if ME is not None:
+    close_src = inspect.getsource(ME.close)
+    wired = "asyncio.to_thread(LocalSTCrossEncoder.shutdown_executor)" in close_src
+    print("CLOSE_WIRES_SHUTDOWN", wired)
+    if not wired:
+        failures.append("#4213 MemoryEngine.close() does not wire shutdown_executor")
+
 print("FAILURES", failures)
 # Sentinel: proves the probe ran to completion.
 print("PROBE_EXECUTED")
@@ -425,6 +537,9 @@ describe.skipIf(!dockerOk || !upstreamOk)(
       // The background kwarg is absent from every layer upstream.
       expect(stdout).toContain("BG_PARAM CrossEncoderModel.predict False");
       expect(stdout).toContain("BG_PARAM CrossEncoderReranker.rerank False");
+      // #4212 / #4213 surfaces are absent upstream.
+      expect(stdout).toContain("RECONCILE_PRESENT False");
+      expect(stdout).toContain("SHUTDOWN_EXECUTOR_PRESENT False");
     }, 240_000);
   }
 );
@@ -456,6 +571,17 @@ describe.skipIf(!dockerOk || !builtOk)(
       expect(stdout).toContain("CANCELLED_QUEUED_SKIPPED True");
       expect(stdout).toContain("SHUTDOWN_JOINED True");
       expect(stdout).toContain("REJECTS_ZERO_WORKERS True");
+      // #4212 dual-signal reconciliation: the helper repairs + WARNS on the
+      // harmful mismatch, and is background-but-SILENT on the reflect divergence.
+      expect(stdout).toContain("RECONCILE_PRESENT True");
+      expect(stdout).toContain("RECONCILE_HARMFUL_REPAIR True WARN True");
+      expect(stdout).toContain("RECONCILE_REFLECT True SILENT True");
+      expect(stdout).toContain("SEARCH_WITH_RETRIES_BG_PARAM True");
+      expect(stdout).toContain("RERANK_ROUTES_THROUGH_HELPER True");
+      // #4213 reranker pool teardown exists, is idempotent, and close() wires it.
+      expect(stdout).toContain("SHUTDOWN_EXECUTOR_PRESENT True");
+      expect(stdout).toContain("SHUTDOWN_EXECUTOR_RESETS True");
+      expect(stdout).toContain("CLOSE_WIRES_SHUTDOWN True");
     }, 240_000);
   }
 );
