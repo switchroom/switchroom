@@ -116,6 +116,34 @@ describe("loadConfigFromEnv", () => {
     if (!res.ok) return;
     expect(isChannelLive(res.config)).toBe(false);
   });
+
+  it("degrades a DEFERRED mirror:origin to dark (not-live)", () => {
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_MIRROR: "origin" }));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.mirror).toBe("off");
+    expect(isChannelLive(res.config)).toBe(false);
+  });
+
+  it("LOW-1: an UNRECOGNIZED BUZZ_MIRROR value fails DARK (not-live), never live", () => {
+    // A typo like BUZZ_MIRROR=of set directly in env (unreachable via the schema
+    // enum) must degrade to dark rather than silently mirroring live. A bare env
+    // with a garbage mirror value loads (not-live) instead of demanding the
+    // operational fields a live channel needs.
+    const res = loadConfigFromEnv({ SWITCHROOM_AGENT_NAME: "klanker", BUZZ_ENABLED: "1", BUZZ_MIRROR: "of" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.mirror).toBe("off");
+    expect(isChannelLive(res.config)).toBe(false);
+  });
+
+  it("keeps an explicit mirror:both live (control for LOW-1)", () => {
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_MIRROR: "both" }));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.mirror).toBe("both");
+    expect(isChannelLive(res.config)).toBe(true);
+  });
 });
 
 describe("resolveRelayHost", () => {

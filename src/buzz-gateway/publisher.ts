@@ -167,6 +167,55 @@ export interface PublishResult {
 }
 
 /**
+ * Fail-CLOSED outbound validator (MAJOR-2, design §3.1 / G-4). The peer-client
+ * casts an inbound `outbound_to_buzz` frame straight to `OutboundToBuzzMessage`
+ * without runtime narrowing, so an unknown or malformed `payload.kind` would
+ * otherwise fall through `publishOutbound`'s `kind === "correction" ? … : …`
+ * branch and be SIGNED + PUBLISHED as a plain message. This validator gates
+ * ahead of any sign/publish: it accepts EXACTLY the two kinds the hub emits
+ * (`message`, `correction` — see buzz-mirror.ts `mirrorReplyDelivered` /
+ * `mirrorCorrection`) with their required fields present and non-empty, and
+ * REJECTS everything else with no sign and no publish. Empty/missing required
+ * fields are an explicit reject here — we do NOT rely on the accidental
+ * `detectSecrets(undefined)` throw downstream.
+ */
+export function validateOutboundToBuzz(req: {
+  channelId?: unknown;
+  payload?: unknown;
+}): { ok: true } | { ok: false; reason: string } {
+  if (typeof req.channelId !== "string" || req.channelId.length === 0) {
+    return { ok: false, reason: "refused outbound_to_buzz: missing/empty channelId (fail-closed: no sign, no publish)" };
+  }
+  const payload = req.payload as
+    | { kind?: unknown; text?: unknown; targetEventId?: unknown }
+    | null
+    | undefined;
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, reason: "refused outbound_to_buzz: missing/invalid payload (fail-closed: no sign, no publish)" };
+  }
+  const kind = payload.kind;
+  if (kind === "message") {
+    if (typeof payload.text !== "string" || payload.text.length === 0) {
+      return { ok: false, reason: "refused outbound_to_buzz: message payload missing non-empty text (fail-closed)" };
+    }
+    return { ok: true };
+  }
+  if (kind === "correction") {
+    if (typeof payload.text !== "string" || payload.text.length === 0) {
+      return { ok: false, reason: "refused outbound_to_buzz: correction payload missing non-empty text (fail-closed)" };
+    }
+    if (typeof payload.targetEventId !== "string" || payload.targetEventId.length === 0) {
+      return { ok: false, reason: "refused outbound_to_buzz: correction payload missing non-empty targetEventId (fail-closed)" };
+    }
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason: `refused outbound_to_buzz: unknown payload kind ${JSON.stringify(kind)} — only message|correction ship in Phase 2b (fail-closed: no sign, no publish)`,
+  };
+}
+
+/**
  * Sign + publish a hub `outbound_to_buzz` request. Returns the result the
  * sidecar forwards back to the hub as `buzz_publish_result`. Under `both` mode
  * this is advisory (the Telegram copy already delivered), so a relay failure is
@@ -178,6 +227,13 @@ export async function publishOutbound(
   transport: PublishTransport,
   nowSec?: number,
 ): Promise<PublishResult> {
+  // Fail-closed gate (MAJOR-2 / G-4): reject unknown kinds and missing required
+  // fields BEFORE any sign or publish. `req` is typed to the narrowed union, but
+  // the wire frame is untyped at runtime (peer-client casts without narrowing),
+  // so validate the raw shape here.
+  const valid = validateOutboundToBuzz(req as { channelId?: unknown; payload?: unknown });
+  if (!valid.ok) return { ok: false, error: valid.reason };
+
   const threading: Nip10Threading =
     req.payload.kind === "correction"
       ? { threadRootId: req.payload.targetEventId, replyToEventId: req.payload.targetEventId }

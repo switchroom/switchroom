@@ -105,8 +105,13 @@ export function loadConfigFromEnv(
   // it. Only `both` and `off` ship live. See channel-route.ts parseConfiguredMirrorMode.
   const mirror = ((): "both" | "origin" | "off" => {
     const m = env.BUZZ_MIRROR;
-    if (m === "off" || m === "origin") return "off";
-    return "both";
+    // Absent ⇒ schema default (`both`). Only an explicit `both` ships live;
+    // `off`/`origin` (S2 deferred) go dark. LOW-1: ANY unrecognized value (a
+    // typo like `of` set directly in env) fails DARK rather than silently going
+    // live — fail-safe, symmetric with channel-route.ts parseConfiguredMirrorMode.
+    if (m === undefined) return "both";
+    if (m === "both") return "both";
+    return "off";
   })();
 
   const agentName = env.SWITCHROOM_AGENT_NAME?.trim() ?? "";

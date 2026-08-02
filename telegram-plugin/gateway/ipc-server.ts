@@ -936,6 +936,22 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         handleHelloBuzzPeer(client, msg as HelloBuzzPeerMessage);
         break;
       case "buzz_publish_result":
+        // Confused-deputy close (MAJOR-1a): ONLY the registered duplex Buzz peer
+        // may report a publish outcome. Without this gate any client (an agent
+        // MCP bridge, or a fresh anonymous connection) could forge a
+        // `buzz_publish_result` carrying a valid-looking correlationId and a
+        // foreign eventId, poisoning the hub's correlation map so a later
+        // correction signs against an arbitrary Nostr event. The peer→agent
+        // direction is already fenced (register-after-hello refused above); this
+        // mirrors that rigor on the agent→peer surface.
+        if (!client.isBuzzPeer) {
+          log(
+            `SECURITY: rejecting buzz_publish_result from non-peer connection ` +
+            `(agent=${client.agentName ?? "anonymous"} id=${client.id}) — only the ` +
+            `registered Buzz publish peer may report publish outcomes; dropped`,
+          );
+          break;
+        }
         if (onBuzzPublishResult) onBuzzPublishResult(client, msg as BuzzPublishResultMessage);
         break;
       case "update_placeholder":
@@ -973,9 +989,32 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
       try { client.close(); } catch { /* nothing to do */ }
       return;
     }
-    // Replace a prior stale peer connection (e.g. a sidecar reconnect) cleanly.
+    // Impersonation guard (MAJOR-1b): a fresh connection must NOT be able to
+    // DISPLACE a LIVE Buzz peer. Without this an anonymous client could send
+    // `hello_buzz_peer`, replace the real sidecar in the buzzPeerClient slot,
+    // then receive every `outbound_to_buzz` and answer with forged
+    // `{ok:true, eventId:<foreign>}` results — poisoning `msgToBuzz` so a later
+    // edit_message signs a correction targeting an arbitrary foreign event.
+    //
+    // A legitimate sidecar reconnect is still honored: it only ever happens
+    // AFTER the prior socket dropped, at which point the socket `close` handler
+    // has run removeClient (nulling buzzPeerClient), OR — in the brief window
+    // before that fires — the prior client is already `close()`d so isAlive()
+    // is false. So we refuse displacement ONLY while the existing peer
+    // connection is still alive; a dead/closed prior peer is freely replaceable.
+    if (buzzPeerClient && buzzPeerClient !== client && buzzPeerClient.isAlive()) {
+      log(
+        `SECURITY: rejecting hello_buzz_peer — a LIVE Buzz peer is already ` +
+        `connected (live_id=${buzzPeerClient.id} rejected_id=${client.id}); ` +
+        `refusing displacement, close+drop`,
+      );
+      try { client.close(); } catch { /* nothing to do */ }
+      return;
+    }
+    // Replace a dead/closed prior peer connection (e.g. a sidecar reconnect
+    // whose predecessor's socket already dropped) cleanly.
     if (buzzPeerClient && buzzPeerClient !== client) {
-      log(`hello_buzz_peer: replacing prior buzz peer (prior_id=${buzzPeerClient.id} new_id=${client.id})`);
+      log(`hello_buzz_peer: replacing prior (dead) buzz peer (prior_id=${buzzPeerClient.id} new_id=${client.id})`);
       try { buzzPeerClient.close(); } catch { /* nothing to do */ }
     }
     client.isBuzzPeer = true;

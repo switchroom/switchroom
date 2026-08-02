@@ -4,6 +4,8 @@ import {
   signChunkedMessage,
   publishOutbound,
   contentHasUnsuppressedSecret,
+  validateOutboundToBuzz,
+  type OutboundPayload,
   type PublishTransport,
   type SignedNostrEvent,
 } from "./publisher.js";
@@ -80,6 +82,74 @@ describe("layer-2 scrub gate (G-1…G-4) — refuse to sign leaked secrets", () 
     // Layer 2 caught what the broken layer 1 missed: no sign, no publish.
     expect(res.ok).toBe(false);
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("fail-CLOSED outbound-kind validator (design §3.1) — unknown kinds never sign or publish", () => {
+  it("REJECTS an unknown payload kind BEFORE any sign or publish (transport never called)", async () => {
+    const { transport, spy } = okTransport();
+    // A forged/unknown kind carrying real text: WITHOUT the validator this falls
+    // through publishOutbound's `kind === "correction" ? … : …` branch and is
+    // signed + published AS A MESSAGE. The validator must fail closed instead.
+    const res = await publishOutbound(
+      { channelId: "chan", payload: { kind: "reaction", text: "thumbs up" } as unknown as OutboundPayload["payload"] },
+      SK,
+      transport,
+      1_700_000_000,
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/unknown payload kind/);
+    expect(spy).not.toHaveBeenCalled(); // nothing signed, nothing on the wire
+  });
+
+  it("REJECTS a message payload with EMPTY text explicitly (not via the accidental detectSecrets throw)", async () => {
+    const { transport, spy } = okTransport();
+    const res = await publishOutbound(
+      { channelId: "chan", payload: { kind: "message", text: "" } },
+      SK,
+      transport,
+      1_700_000_000,
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/non-empty text/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("REJECTS a correction payload missing targetEventId", async () => {
+    const { transport, spy } = okTransport();
+    const res = await publishOutbound(
+      { channelId: "chan", payload: { kind: "correction", text: "fix" } as unknown as OutboundPayload["payload"] },
+      SK,
+      transport,
+      1_700_000_000,
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/targetEventId/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("REJECTS a missing/empty channelId", async () => {
+    const { transport, spy } = okTransport();
+    const res = await publishOutbound(
+      { channelId: "", payload: { kind: "message", text: "hi" } },
+      SK,
+      transport,
+      1_700_000_000,
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/channelId/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("ACCEPTS exactly the two hub-emitted kinds (unit): message + correction", () => {
+    expect(validateOutboundToBuzz({ channelId: "chan", payload: { kind: "message", text: "hi" } })).toEqual({ ok: true });
+    expect(
+      validateOutboundToBuzz({ channelId: "chan", payload: { kind: "correction", text: "fix", targetEventId: "e" } }),
+    ).toEqual({ ok: true });
+    // Everything else fails closed.
+    expect(validateOutboundToBuzz({ channelId: "chan", payload: { kind: "approval", text: "x" } }).ok).toBe(false);
+    expect(validateOutboundToBuzz({ channelId: "chan", payload: undefined }).ok).toBe(false);
+    expect(validateOutboundToBuzz({ channelId: "chan", payload: { kind: "message" } }).ok).toBe(false);
   });
 });
 

@@ -163,6 +163,45 @@ describe('BuzzMirror.mirrorCorrection — debounced, only for mirrored messages'
     expect(corr.payload).toEqual({ kind: 'correction', text: 'corrected', targetEventId: 'published-evt' })
     vi.useRealTimers()
   })
+
+  it('S4/F6: two rapid edits COALESCE to a SINGLE published correction (last-write-wins)', () => {
+    const sender = vi.fn(() => true)
+    const m = mirrorWith(sender)
+    // Record a mirrored message so there is a Buzz event to correct.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'answer',
+      ownerOriginChannel: 'buzz',
+      ownerBuzzCoords: BUZZ_COORDS,
+      ownerEchoed: true,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:1001'],
+    })
+    const correlationId = sender.mock.calls[0][0].correlationId
+    m.onPublishResult({ correlationId, ok: true, eventId: 'published-evt' })
+    sender.mockClear()
+
+    // Edit #1 at t=0 arms a timer for t=DEBOUNCE. Edit #2 arrives INSIDE the
+    // window and must CLEAR edit #1's timer (buzz-mirror.ts:192-193) so only the
+    // latest text is ever published, and only once.
+    m.mirrorCorrection({ telegramMessageKey: '555:1001', scrubbedText: 'first edit' })
+    vi.advanceTimersByTime(CORRECTION_DEBOUNCE_MS - 5_000) // still inside the window
+    m.mirrorCorrection({ telegramMessageKey: '555:1001', scrubbedText: 'second edit' })
+
+    // Step PAST edit #1's original deadline. If coalescing were broken, edit #1's
+    // timer would fire here — it must NOT (it was cleared).
+    vi.advanceTimersByTime(6_000)
+    expect(sender).not.toHaveBeenCalled()
+
+    // Reach edit #2's deadline: EXACTLY ONE correction, carrying the LATEST text.
+    vi.advanceTimersByTime(CORRECTION_DEBOUNCE_MS)
+    expect(sender).toHaveBeenCalledTimes(1)
+    expect(sender.mock.calls[0][0].payload).toEqual({
+      kind: 'correction',
+      text: 'second edit',
+      targetEventId: 'published-evt',
+    })
+    vi.useRealTimers()
+  })
 })
 
 describe('maybeBootBuzzMirror — dark by default (S2)', () => {

@@ -261,8 +261,19 @@ describe('parseConfiguredMirrorMode — Phase 2b S2 (origin DEFERRED)', () => {
     expect(parseConfiguredMirrorMode('off')).toBe('off')
     // The load-bearing S2 assertion: 'origin' is DEFERRED, degraded to dark.
     expect(parseConfiguredMirrorMode('origin')).toBe('off')
-    // Anything unrecognised falls back to the documented default.
-    expect(parseConfiguredMirrorMode('sometimes')).toBe('both')
+  })
+
+  it('LOW-1: an UNRECOGNIZED value fails DARK (off), not live (both)', () => {
+    // A typo like BUZZ_MIRROR=of — unreachable via the schema enum, but possible
+    // via a raw env-set — must fail safe to dark rather than silently going live.
+    expect(parseConfiguredMirrorMode('of')).toBe('off')
+    expect(parseConfiguredMirrorMode('sometimes')).toBe('off')
+    expect(parseConfiguredMirrorMode('BOTH')).toBe('off') // case-sensitive: only exact 'both' is live
+    expect(parseConfiguredMirrorMode('')).toBe('off')
+    expect(parseConfiguredMirrorMode('garbage')).toBe('off')
+    // Only an explicit 'both' (or absence, = schema default) stays live.
+    expect(parseConfiguredMirrorMode('both')).toBe('both')
+    expect(parseConfiguredMirrorMode(undefined)).toBe('both')
   })
 
   it('never returns "origin" for any input (2b cannot honor it)', () => {

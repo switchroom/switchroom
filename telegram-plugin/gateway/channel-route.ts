@@ -210,8 +210,14 @@ export function resolveRoute(
  * assumption. Absent/`both` ⇒ `both`; `off`/`origin` ⇒ `off`.
  */
 export function parseConfiguredMirrorMode(raw: string | undefined): 'both' | 'off' {
-  if (raw === 'off' || raw === 'origin') return 'off'
-  return 'both'
+  // Absent ⇒ the schema default (`both`). The ONLY value that ships live is an
+  // explicit `both`; `off`/`origin` (S2 deferred) go dark. LOW-1: ANY other
+  // value — a typo like `BUZZ_MIRROR=of` set directly in env, unreachable via
+  // the schema enum but possible via raw env — fails DARK rather than silently
+  // going live. Only an explicit `both` (or absence) is live.
+  if (raw === undefined) return 'both'
+  if (raw === 'both') return 'both'
+  return 'off'
 }
 
 /**

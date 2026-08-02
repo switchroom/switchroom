@@ -177,4 +177,93 @@ describe("ipc-server — Buzz peer role-disjointness (S7)", () => {
     expect(onBuzzPublishResult).toHaveBeenCalledTimes(1);
     expect(onBuzzPublishResult.mock.calls[0][1]).toMatchObject({ correlationId: "c1", ok: true, eventId: "evt-x" });
   });
+
+  // ── MAJOR-1a: confused-deputy close on the agent→peer surface ─────────────
+  it("IGNORES buzz_publish_result from a NON-peer connection (MAJOR-1a)", async () => {
+    const path = tmpSocket();
+    const onBuzzPublishResult = vi.fn();
+    makeServer({ socketPath: path, onBuzzPublishResult });
+
+    // (1) A fresh anonymous client that never announced hello_buzz_peer forges a
+    // publish result carrying a valid-looking correlationId + a foreign eventId.
+    const impostor = rawClient(path);
+    await impostor.ready;
+    impostor.send({ type: "buzz_publish_result", correlationId: "forged-1", ok: true, eventId: "attacker-evt" });
+    await wait(80);
+    expect(onBuzzPublishResult).not.toHaveBeenCalled();
+
+    // (2) A registered AGENT bridge (also not the peer) is likewise refused.
+    const bridge = rawClient(path);
+    await bridge.ready;
+    bridge.send({ type: "register", agentName: "klanker" });
+    await wait(40);
+    bridge.send({ type: "buzz_publish_result", correlationId: "forged-2", ok: true, eventId: "attacker-evt-2" });
+    await wait(80);
+    expect(onBuzzPublishResult).not.toHaveBeenCalled();
+
+    // (3) Contrast — the REAL peer's result DOES reach the handler, proving the
+    // guard blocks impostors specifically, not the mechanism wholesale.
+    const peer = rawClient(path);
+    await peer.ready;
+    peer.send({ type: "hello_buzz_peer", agentName: "klanker" });
+    await wait(40);
+    peer.send({ type: "buzz_publish_result", correlationId: "real-1", ok: true, eventId: "evt-real" });
+    await wait(80);
+    expect(onBuzzPublishResult).toHaveBeenCalledTimes(1);
+    expect(onBuzzPublishResult.mock.calls[0][1]).toMatchObject({ correlationId: "real-1" });
+  });
+
+  // ── MAJOR-1b: a fresh hello cannot displace a LIVE peer ───────────────────
+  it("REFUSES a second hello_buzz_peer while a LIVE peer is connected (MAJOR-1b)", async () => {
+    const path = tmpSocket();
+    const onBuzzPublishResult = vi.fn();
+    const { server } = makeServer({ socketPath: path, onBuzzPublishResult });
+
+    const peer1 = rawClient(path);
+    await peer1.ready;
+    peer1.send({ type: "hello_buzz_peer", agentName: "klanker" });
+    await wait(60);
+    expect(server.sendToBuzzPeer(OUTBOUND)).toBe(true);
+
+    // An impostor tries to seize the peer slot with a fresh hello, then forge a
+    // publish result — the attack that would poison msgToBuzz.
+    const impostor = rawClient(path);
+    await impostor.ready;
+    impostor.send({ type: "hello_buzz_peer", agentName: "klanker" });
+    await wait(60);
+    impostor.send({ type: "buzz_publish_result", correlationId: "forged", ok: true, eventId: "attacker-evt" });
+    await wait(80);
+
+    // The impostor was refused (close+drop); the real peer is UNDISTURBED and
+    // still the addressed peer; the forged result never reached the handler.
+    expect(impostor.wasClosed()).toBe(true);
+    expect(peer1.wasClosed()).toBe(false);
+    expect(server.sendToBuzzPeer(OUTBOUND)).toBe(true);
+    expect(onBuzzPublishResult).not.toHaveBeenCalled();
+  });
+
+  it("ALLOWS a legitimate reconnect after the prior peer connection CLOSES (MAJOR-1b)", async () => {
+    const path = tmpSocket();
+    const { server } = makeServer({ socketPath: path });
+
+    const peer1 = rawClient(path);
+    await peer1.ready;
+    peer1.send({ type: "hello_buzz_peer", agentName: "klanker" });
+    await wait(60);
+    expect(server.sendToBuzzPeer(OUTBOUND)).toBe(true);
+
+    // The sidecar's socket drops (crash/restart); removeClient nulls the slot.
+    peer1.sock.destroy();
+    await wait(120);
+    expect(server.sendToBuzzPeer(OUTBOUND)).toBe(false);
+
+    // A fresh reconnect + hello must succeed — the refuse-only-while-alive rule
+    // must not brick a real reconnect.
+    const peer2 = rawClient(path);
+    await peer2.ready;
+    peer2.send({ type: "hello_buzz_peer", agentName: "klanker" });
+    await wait(60);
+    expect(peer2.wasClosed()).toBe(false);
+    expect(server.sendToBuzzPeer(OUTBOUND)).toBe(true);
+  });
 });

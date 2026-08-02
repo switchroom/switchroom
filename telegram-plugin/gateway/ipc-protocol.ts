@@ -186,7 +186,14 @@ export interface OutboundToBuzzMessage {
   type: "outbound_to_buzz";
   /** Caller-generated id, echoed back in `buzz_publish_result`. */
   correlationId: string;
-  /** The publishing agent (checked against the gateway's own name hub-side). */
+  /**
+   * The publishing agent. Validated for wire SHAPE only (AGENT_NAME_RE in
+   * `isValidClientToGateway`) and stamped by the hub itself (buzz-mirror sets it
+   * from its own `agentName`), so it is diagnostic here — the gateway does NOT
+   * cross-check it against a configured own-name (createIpcServer holds no such
+   * name). Impersonation is prevented structurally instead: only the registered
+   * duplex peer connection receives `outbound_to_buzz` and may answer it.
+   */
   agentName: string;
   /** Target NIP-29 channel (group) id, `["h", …]`. */
   channelId: string;
@@ -711,7 +718,11 @@ export interface CheckPreApprovedMessage {
  * (and, conversely, refuses `hello_buzz_peer` on a client that already
  * `register`ed) — the peer role and the agent-bridge role are mutually
  * exclusive per design §3.2 / S7. `agentName` here is the fleet agent whose
- * outbound this peer publishes, used only for the hub-side name check.
+ * outbound this peer publishes; it is validated for wire SHAPE only
+ * (AGENT_NAME_RE) and used for logging — the gateway does NOT cross-check it
+ * against a configured own-name (it holds none). The peer role is secured
+ * structurally: a live peer cannot be displaced by a fresh hello, and only the
+ * peer connection may send `buzz_publish_result`.
  */
 export interface HelloBuzzPeerMessage {
   type: "hello_buzz_peer";

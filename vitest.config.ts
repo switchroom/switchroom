@@ -211,6 +211,11 @@ export default defineConfig({
       // createIpcServer (Bun.listen) over a tmp UDS to exercise the hub-side
       // Buzz dedup ring — Bun.listen is a bun built-in, so run via bun.
       "**/telegram-plugin/tests/ipc-server-buzz-dedup.test.ts",
+      // ipc-server-buzz-peer.test.ts (Buzz Phase 2b, S7 role-disjointness)
+      // drives a real Unix socket through createIpcServer → Bun.listen, a bun
+      // built-in — run via bun (tests/ substring in bun-test-ci.sh), never under
+      // vitest where `Bun` is undefined.
+      "**/telegram-plugin/tests/ipc-server-buzz-peer.test.ts",
       // ipc-server-query-pending-permission.test.ts (#2971) drives a real
       // createIpcServer (Bun.listen) over a tmp UDS — run via test:bun.
       "**/telegram-plugin/tests/ipc-server-query-pending-permission.test.ts",
