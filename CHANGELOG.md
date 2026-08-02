@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.19.47 — per-account read-only Google scopes, the quiescence flush stops double-sending, and consolidation stops re-refreshing every mental model
+
+### Google: per-account read-only and service scope selection (#4195)
+
+A Google grant minted every service's write scope at the account's tier, and
+the gdrive MCP exposed the matching write tools, with no way to narrow either
+per account. `switchroom auth google account add` now takes `--readonly` and
+`--services cal,drive,docs,sheets,slides`, and one persisted per-account
+selection (`google_accounts.<email>.{readonly,services}`) drives both halves
+of the grant: the OAuth scopes the add mints and the tools the gdrive MCP
+exposes (upstream `--read-only` / `--tools`), so token scope and tool exposure
+can never disagree.
+
+- `--readonly` mints only each selected service's `.readonly` scope variant
+  and zero write scopes, and is mutually exclusive with `--write`.
+- `--services` narrows the account to the named services (the `calendar`
+  alias is accepted), minting only those services' scopes and passing the
+  upstream service names to the launcher.
+- The selection is persisted and re-read on `--replace`, so a read-only or
+  narrowed account re-consented for an unrelated reason mints the same
+  selection and cannot silently re-widen. Explicit narrowing is announced,
+  never silent. An empty selection reproduces today's scopes and launcher
+  argv byte-for-byte, so accounts without a persisted record keep the exact
+  pre-v1 path.
+
+### Telegram: stage the quiescence flush, and stop re-injecting consumed handbacks (#4197)
+
+Two live delivery races surfaced on 2026-08-02. First, the answer-ready
+quiescence flush sent the composed terminal answer provisionally, then the
+model's canonical `reply` landed seconds later as a reworded duplicate that
+the supersede path could not claw back (a live background sub-agent held the
+content-gate bypass). Second, the orphan reap re-injected a handback the
+session had already answered, because the session consumed the delivered
+handback without any gateway turn minting, so the reap's turn-state gates
+never saw the consumption.
+
+- The quiescence expiry now stages the composed answer on the still-live turn
+  instead of sending it: a reply landing in the completion window discards the
+  stage (one message, the canonical reply), a real `turn_end` promotes it, and
+  only a turn whose `turn_end` never lands promotes after `ANSWER_STAGE_MS`
+  (30 s, env `SWITCHROOM_ANSWER_STAGE_MS`, `0` restores the immediate flush).
+  The provisional send, and the supersede claw-back it forced downstream,
+  never happen.
+- A new invisible-consumption gate (`gateway/session-consume-signal.ts`) has
+  the reap consult gateway-observed consumption proxies (a turn mint at the
+  enqueue seam, or any main-session IPC tool call after delivery) before
+  declaring an orphan. When either proves the handback entered the model's
+  context, the reap cleans up without re-injecting. A genuinely dead-session
+  orphan still re-injects up to the cap as before.
+
+### Hindsight: debounce consolidation-triggered mental-model refreshes (#4196)
+
+Upstream re-runs every `refresh_after_consolidation` mental model at the end
+of every completed consolidation, gated only by "any in-scope memory ingested
+since the last refresh". Under sustained ingestion that gate is always true,
+so every round regenerates every model. During the 2026-08-01 backlog drain
+one bank logged 1,902 refresh calls for 4 models in a day (20.77M tokens
+re-deriving near-identical content), and the fleet logged 3,003 calls that
+day.
+
+- A `Dockerfile.hindsight` build-time patch floors the interval between
+  consolidation-triggered refreshes of one model at
+  `HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S` seconds (default 3600, `0` restores
+  upstream behaviour exactly). Explicit refreshes (MCP tool, HTTP, user-profile
+  Stop hook) and the cron-scheduled maintenance path are untouched.
+- A skipped model's `last_refreshed_at` is left untouched, so the first
+  consolidation after the floor elapses still refreshes it (deferred, never
+  dropped); a never-refreshed model is never debounced; and bad env values
+  degrade to the default rather than raising out of the consolidation path.
+  The knob is an override-only key, so rollback is a container restart, not a
+  rebuild.
+
 ## v0.19.46 — start.sh stops clobbering the compose-set SWITCHROOM_CONFIG, and Calendar becomes an opt-in read-only scope
 
 ### Agents: stop start.sh clobbering the compose-set `SWITCHROOM_CONFIG` (#4193)
