@@ -434,7 +434,7 @@ map): `vision.md` (four outcomes: standing team / on the leash /
 subscription-honest / always available), `principles.md` (three checks —
 docs test, defaults test, consistency test; a "no" is a redesign),
 `invariants.md` (hard gates: claude-native, no-self-escalation, on-leash,
-single-tenant, telegram-only, chat-is-source-of-truth), `product-spec.md`
+single-tenant, telegram-and-buzz-only, chat-is-source-of-truth), `product-spec.md`
 (job index), `jobs/*.md` (outcome-focused job specs — survey with
 `head -7 reference/jobs/*.md`), `rfcs/` (the "how" layer + standing design
 records).

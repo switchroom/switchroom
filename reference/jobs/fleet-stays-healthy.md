@@ -132,7 +132,7 @@ not just the happy path, and the sensor stays model-free across it.
   stale "fixed" issues that never actually recovered.
 - *Surface discipline:* the ranked view lives on the operator admin page, not
   in a principal's Telegram thread and not as a parallel pinned status mirror.
-  It is operator tooling (like the fleet dashboard), so `telegram-only` and
+  It is operator tooling (like the fleet dashboard), so `telegram-and-buzz-only` and
   `chat-is-the-single-source-of-truth` hold.
 
 ## Related

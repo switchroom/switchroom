@@ -3,7 +3,7 @@ job: see and manage my whole fleet from one operator screen
 outcome: The operator can open one management console and see every agent's live state, health, quota, history, sessions, memory, workspace, and approval/audit trail, run fleet ops (restart, config edits), and drive an agent with a turn from the console, without any secret reaching the client, without approvals ever leaving Telegram, and without the surface becoming the principal's source of truth or a separate conversation record (operator turns mirror into the agent's Telegram thread).
 stakes: An operator running a standing fleet 24/7 needs a place to glance across all of it at once. The chat is per-agent and per-topic, so a fleet-wide problem (a stuck agent, a quota wall, a drifted config, a failing memory backend) is invisible until a principal complains. Without a fleet view the operator debugs blind, one `docker exec` at a time. But a dashboard is also the easiest place to accidentally rebuild the retired progress card, leak a token, or grow a second approval path, so the screen earns its place only by staying an operator tool, never a principal one.
 serves: hold-the-leash
-invariants: [chat-is-the-single-source-of-truth, telegram-only, no-self-escalation, single-tenant, claude-native]
+invariants: [chat-is-the-single-source-of-truth, telegram-and-buzz-only, no-self-escalation, single-tenant, claude-native]
 ---
 
 # Job Spec: see and manage my whole fleet from one operator screen
@@ -93,10 +93,10 @@ channel or a second approval path.
   history; the decision never happens here.
 - A **principal-facing** way in from the console, or an operator turn that
   does **not** mirror into the Telegram thread (a hidden side-channel
-  conversation). The admin console stays out of `telegram-only`'s scope only
+  conversation). The admin console stays out of `telegram-and-buzz-only`'s scope only
   while it is operator-only and every turn surfaces in the one Telegram
   record. A prompt box the principal uses, or a bridge to WhatsApp/Signal,
-  crosses `telegram-only`.
+  crosses `telegram-and-buzz-only`.
 - Any secret reaching the browser, an API response, or a log
   (`credentials.json`, vault values, OAuth/bot tokens).
 - A mutating path that lets the web grant access the operator's config
@@ -130,7 +130,7 @@ principal's chat jobs). Pin:
 - **Operator turn = one record** — a turn sent from the console produces a
   real turn in the target agent's Telegram thread (turn and reply observable
   there). *Invariant:* the console never opens a conversation the Telegram
-  thread can't see; the admin console stays out of telegram-only's scope.
+  thread can't see; the admin console stays out of telegram-and-buzz-only's scope.
 - **Exposure floor** — off by default; loopback bind default; unauthenticated
   non-loopback bind is refused. *Invariant:* a network-accessible bind
   without auth never serves.
@@ -179,6 +179,6 @@ principal's chat jobs). Pin:
 > artifact, `serves:` this job): the Hermes-Desktop adapter served from
 > `src/web/` (`switchroom-web`), with unmodified Hermes Desktop run in remote
 > mode as the client. `reference/invariants.md` records why the admin console
-> is out of `telegram-only`'s scope (it governs principal channels, not admin
+> is out of `telegram-and-buzz-only`'s scope (it governs principal channels, not admin
 > tooling) and the conditions that keep it so. Those churn; this job outlives
 > them.

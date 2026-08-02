@@ -3,7 +3,7 @@ job: operate the fleet from Telegram and see what a fleet operation is doing
 outcome: When the operator drives a fleet-wide operation from Telegram (a rollout, an update), they can see it progress and land — phase by phase, in the chat and in a durable record — without host-side grep, and without a live pinned surface running parallel to the conversation.
 stakes: A fleet rollout is the single riskiest thing the operator does, and today it goes dark: the roll writes one terminal row to a host-side log, `get_status` is blind to its phases, and nothing reaches Telegram. When a real roll (v0.16.35) half-failed, the only way to learn the outcome was to SSH in and grep. An operator who can't see a rollout land can't trust it, and can't catch a half-rolled fleet before a principal does. But the fix is one step from re-creating the retired pinned progress card — so the operability this job asks for must live in durable artifacts plus in-chat narration, never a parallel pinned mirror.
 serves: hold-the-leash
-invariants: [chat-is-the-single-source-of-truth, telegram-only, no-self-escalation, single-tenant]
+invariants: [chat-is-the-single-source-of-truth, telegram-and-buzz-only, no-self-escalation, single-tenant]
 ---
 
 # Job Spec: operate the fleet from Telegram and see what a fleet operation is doing

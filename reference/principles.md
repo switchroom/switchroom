@@ -18,7 +18,7 @@ coherence bar (docs / defaults / consistency). The other half, the
 non-functional trust and safety bar, is **not** a principle you trade
 off on a gradient. It's enforced as hard lines in
 [`invariants.md`](invariants.md): claude-native, no-self-escalation,
-on-leash, single-tenant, telegram-only,
+on-leash, single-tenant, telegram-and-buzz-only,
 chat-is-the-single-source-of-truth. Security, the on-leash stakes, and
 the subscription-honest stakes live there as binary pass/fail gates. A
 feature can ace all three principle checks and still be out of scope
@@ -247,7 +247,7 @@ non-functional trust bar (security, the on-leash stakes, the
 subscription-honest stakes) is owned as binary lines in
 [`invariants.md`](invariants.md), not as anything you weigh here:
 claude-native, no-self-escalation, on-leash, single-tenant,
-telegram-only, chat-is-the-single-source-of-truth. Before you open the
+telegram-and-buzz-only, chat-is-the-single-source-of-truth. Before you open the
 PR, confirm the change crosses none of them. A "yes" on all three
 principle checks plus a crossed invariant is still out of scope.
 

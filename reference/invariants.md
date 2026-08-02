@@ -127,25 +127,55 @@ isolation is *between the users they configured*, never from the operator.
   it is out. Multiple trusted **users** inside one tenant (including
   per-user memory isolation) is in scope, not a violation.
 
-## `telegram-only`
+## `telegram-and-buzz-only`
 
-One channel, Telegram, done properly. Not a multi-channel bridge across
-Slack, Discord, or Teams. Auxiliary services (e.g. voice transcription) are
-opt-in helpers, not second channels.
+Two sanctioned channels, each done properly: **Telegram**, the pocket
+channel and the authoritative surface, and **Buzz**, the desktop
+co-channel. Exactly these two, never a third. The rejection of the open
+multi-channel bridge stands unchanged — not Slack, not Discord, not Teams,
+not a channel SDK; what changed (deliberately, 2026-08) is that the leash
+holds two first-class surfaces instead of one. Auxiliary services (e.g.
+voice transcription) are opt-in helpers, not channels.
 
-- **By-construction test:** does this add a second human-facing chat
+Buzz is a co-channel **on Telegram's terms**, fail-closed by construction:
+
+- **Dark by default.** `channels.buzz.enabled` defaults to `false`
+  (`src/config/schema.ts`, `BuzzChannelSchema`); absent or false means the
+  sidecar never forks and fleet behaviour is byte-identical to pre-Buzz.
+- **Inbound fail-closed.** An event becomes a turn only after signature
+  verification AND membership of the operator-pinned allowlist
+  (`authorized_pubkeys ∪ {operator_pubkey}`, default operator-only) on a
+  closed, NIP-42-authenticated NIP-29 relay
+  (`src/buzz-gateway/auth-gate.ts`).
+- **Outbound is a mirror, not a second voice.** The only way a Buzz event
+  is emitted is as a mirror of an already-delivered Telegram message
+  (`telegram-plugin/gateway/buzz-mirror.ts`); there is no agent-facing
+  Buzz-only send path, and a Buzz failure never fails, delays, or retries
+  the Telegram answer. Approvals, liveness, and consent stay on Telegram.
+- **One session, one voice.** A Buzz turn is injected into the same single
+  agent session, exactly like a cron fire (`src/buzz-gateway/pump.ts`);
+  its answer lands on Telegram first and mirrors back to Buzz. There is no
+  second agent loop and no conversation the one session doesn't hold.
+- **Routing fail-safes to Telegram.** Any ambiguity in a turn's origin
+  resolves to Telegram (`telegram-plugin/gateway/channel-route.ts`).
+
+- **By-construction test:** does this add a **third** human-facing chat
   channel **for the people the team serves**, a bridge to WhatsApp, Signal,
-  Slack, Discord, Teams, or the like? If yes, it is out. This invariant is
-  about the *principal's* channel: there is exactly one, Telegram, done
-  properly. It is **not** a ban on operator/admin tooling.
+  Slack, Discord, Teams, or the like — or give Buzz an approval surface, an
+  unmirrored send path, or a conversation the one agent session doesn't
+  hold? If yes,
+  it is out. Adding any further channel is a change to *this contract*, not
+  a feature. This invariant is about the *principal's* channels: there are
+  exactly two, deliberately chosen, each done properly. It is **not** a ban
+  on operator/admin tooling.
 
 ### Scope: the admin console is not a channel
 
 An **operator/admin** management console (e.g. a Hermes-Desktop client pointed
 at a Switchroom adapter) is **out of this invariant's scope**: it is admin
 tooling for the person who runs the box, not a chat channel for the people the
-team serves. `telegram-only` stays strictly true: it governs *principal*
-channels, and the admin console is not one.
+team serves. `telegram-and-buzz-only` stays strictly true: it governs
+*principal* channels, and the admin console is not one.
 
 The console MAY let the operator send a turn to one of their own agents from
 outside Telegram. To stay admin tooling (and not quietly become a second
@@ -170,10 +200,11 @@ channel or a hidden conversation), it must hold all four:
    sole approval surface (`no-self-escalation`). A console that wires
    approvals is out.
 
-The line that *would* cross `telegram-only` is a **principal-facing** bridge:
-giving the people the team serves a second way to chat (WhatsApp, Signal, a
-public web chat). That is still out. The detail contract for the admin console
-is [`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).
+The line that *would* cross `telegram-and-buzz-only` is a
+**principal-facing** bridge: giving the people the team serves a third way to
+chat (WhatsApp, Signal, a public web chat). That is still out. The detail
+contract for the admin console is
+[`rfcs/fleet-dashboard.md`](rfcs/fleet-dashboard.md).
 
 ## `chat-is-the-single-source-of-truth`
 
