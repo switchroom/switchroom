@@ -2699,6 +2699,188 @@ print(
 )
 PYEOF
 
+# ── MM-refresh-debounce: floor the interval between consolidation-triggered ──
+# ── mental-model refreshes ───────────────────────────────────────────────────
+#
+# Upstream re-runs every `refresh_after_consolidation: true` mental model at
+# the end of EVERY completed consolidation operation, gated only by a
+# staleness check ("any in-scope memory ingested since last_refreshed_at",
+# memory_engine.py `compute_mental_model_is_stale`). Under sustained
+# ingestion that gate is ALWAYS true: each round consolidates freshly
+# retained memories, so each round finds every model stale and regenerates
+# it, and the next round a minute later does it again. Measured on this
+# fleet during the 2026-08-01 backlog drain (llm_requests table): the
+# `finn` bank refreshed its FOUR mental models 1,902 times in one day —
+# roughly one full regeneration per model per minute for ~9 hours — burning
+# 20.77M LLM tokens re-deriving near-identical content; fleet-wide the
+# refresh_mental_model operation cost 3,003 calls / 36.6M tokens that day.
+#
+# Upstream has no debounce (verified against vectorize-io/hindsight main
+# @ 2026-08-02: no merged or open PR adds one; #2866 fixed only the no-op
+# watermark advance, which this base already ships, and #3078 only widened
+# the candidate scope). So switchroom floors the interval here: a model
+# whose `last_refreshed_at` is younger than
+# HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S (default 3600) is skipped by the
+# consolidation trigger. The NEXT consolidation after the floor elapses
+# still sees the model stale (staleness compares against last_refreshed_at,
+# which the skip leaves untouched) and refreshes it then — content is
+# delayed by at most the floor, never lost.
+#
+# Deliberately scoped to `_trigger_mental_model_refreshes` (the
+# consolidation side-effect) ONLY. Explicit refreshes — the MCP
+# refresh_mental_model tool, the HTTP endpoint, the user-profile Stop hook —
+# and the maintenance loop's cron-scheduled path are untouched, so an agent
+# or operator who wants freshness NOW still gets it.
+#
+# Rollback hatch (no rebuild): HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S=0
+# restores upstream behaviour exactly. The var is a switchroom-patch knob
+# (no HINDSIGHT_API_ prefix — upstream's config parser never sees it), read
+# once at import like HINDSIGHT_CE_DECISIVE_RELATIVE_GAP, and reachable
+# declaratively via `hindsight.env` (HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS in
+# src/setup/hindsight-perf-defaults.ts). Unparseable / negative / NaN
+# values degrade to the default rather than raising out of the
+# consolidation path.
+#
+# Outcome proof: tests/docker/hindsight-mm-refresh-debounce-patch.test.ts
+# runs the REAL patched `_trigger_mental_model_refreshes` from the image
+# and asserts recently-refreshed models are skipped, elapsed ones are
+# submitted, never-refreshed ones always submit, and interval 0 is
+# byte-for-byte upstream. Shape pinned in dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+TAG = "switchroom hindsight MM-refresh-debounce patch"
+
+f = pathlib.Path("/app/api/hindsight_api/engine/consolidation/consolidator.py")
+s = f.read_text()
+
+# 1. Module-level knob + helper, inserted immediately above the trigger
+#    function. `datetime`/`timezone` are already module imports here.
+DEF_ANCHOR = "async def _trigger_mental_model_refreshes(\n"
+HELPER = (
+    "# switchroom hindsight MM-refresh-debounce patch: floor the interval between\n"
+    "# consolidation-triggered refreshes of one mental model. 0 disables (exact\n"
+    "# upstream behaviour). Read once at import; container restart applies changes.\n"
+    '_MM_REFRESH_MIN_INTERVAL_ENV: str = "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S"\n'
+    "_MM_REFRESH_MIN_INTERVAL_DEFAULT_S: float = 3600.0\n"
+    "\n"
+    "\n"
+    "def _mm_refresh_min_interval_s() -> float:\n"
+    "    import math\n"
+    "    import os\n"
+    "\n"
+    "    raw = os.environ.get(_MM_REFRESH_MIN_INTERVAL_ENV)\n"
+    "    if raw is None or not str(raw).strip():\n"
+    "        return _MM_REFRESH_MIN_INTERVAL_DEFAULT_S\n"
+    "    try:\n"
+    "        value = float(raw)\n"
+    "    except (TypeError, ValueError):\n"
+    "        return _MM_REFRESH_MIN_INTERVAL_DEFAULT_S\n"
+    "    if not math.isfinite(value) or value < 0.0:\n"
+    "        return _MM_REFRESH_MIN_INTERVAL_DEFAULT_S\n"
+    "    return value\n"
+    "\n"
+    "\n"
+    "_MM_REFRESH_MIN_INTERVAL_S: float = _mm_refresh_min_interval_s()\n"
+    "\n"
+    "\n"
+    "def _mm_refresh_debounced(candidate) -> bool:\n"
+    '    """True when this model refreshed more recently than the floor allows.\n'
+    "\n"
+    "    A skipped model's last_refreshed_at is untouched, so the staleness gate\n"
+    "    still fires on the first consolidation after the floor elapses — the\n"
+    "    refresh is deferred, never dropped. Never-refreshed models (NULL) and\n"
+    "    rows whose timestamp cannot be compared are never debounced.\n"
+    '    """\n'
+    "    if _MM_REFRESH_MIN_INTERVAL_S <= 0.0:\n"
+    "        return False\n"
+    "    try:\n"
+    '        last = candidate["last_refreshed_at"]\n'
+    "    except (KeyError, TypeError):\n"
+    "        last = None\n"
+    "    if not last:\n"
+    "        return False\n"
+    "    try:\n"
+    "        age_s = (datetime.now(timezone.utc) - last).total_seconds()\n"
+    "    except TypeError:\n"
+    "        return False\n"
+    "    return age_s < _MM_REFRESH_MIN_INTERVAL_S\n"
+    "\n"
+    "\n"
+    "async def _trigger_mental_model_refreshes(\n"
+)
+
+n = s.count(DEF_ANCHOR)
+assert n == 1, (
+    f"{TAG}: _trigger_mental_model_refreshes def anchor found {n}x (expected 1) in "
+    "engine/consolidation/consolidator.py — upstream renamed or split the trigger "
+    "function; re-author this patch in docker/Dockerfile.hindsight."
+)
+assert "from datetime import datetime, timezone" in s, (
+    f"{TAG}: consolidator.py no longer imports datetime/timezone at module level — "
+    "the helper relies on them; re-author this patch."
+)
+
+# 2. The staleness loop: consult the debounce BEFORE the per-candidate
+#    staleness query (a debounced model skips that round-trip too).
+LOOP_ANCHOR = (
+    "        rows = []\n"
+    "        for candidate in candidates:\n"
+    "            if await memory_engine.compute_mental_model_is_stale(conn, bank_id, candidate):\n"
+    "                rows.append(candidate)\n"
+)
+LOOP_REPL = (
+    "        rows = []\n"
+    "        _debounced = 0\n"
+    "        for candidate in candidates:\n"
+    "            # switchroom MM-refresh-debounce: refreshed within the floor -> skip\n"
+    "            # this round; the first consolidation after the floor elapses still\n"
+    "            # sees it stale and refreshes it.\n"
+    "            if _mm_refresh_debounced(candidate):\n"
+    "                _debounced += 1\n"
+    "                continue\n"
+    "            if await memory_engine.compute_mental_model_is_stale(conn, bank_id, candidate):\n"
+    "                rows.append(candidate)\n"
+    "        if _debounced:\n"
+    "            logger.info(\n"
+    '                f"[CONSOLIDATION] bank={bank_id} debounced {_debounced} mental model "\n'
+    '                f"refresh(es) (last refresh < {_MM_REFRESH_MIN_INTERVAL_S:.0f}s ago)"\n'
+    "            )\n"
+)
+
+n = s.count(LOOP_ANCHOR)
+assert n == 1, (
+    f"{TAG}: staleness-loop anchor found {n}x (expected 1) in "
+    "engine/consolidation/consolidator.py — upstream reworked the candidate loop; "
+    "re-author this patch in docker/Dockerfile.hindsight."
+)
+
+s = s.replace(DEF_ANCHOR, HELPER, 1)
+s = s.replace(LOOP_ANCHOR, LOOP_REPL, 1)
+f.write_text(s)
+
+t = f.read_text()
+assert t.count("def _mm_refresh_debounced(") == 1, f"{TAG}: helper missing after patch"
+assert t.count('_MM_REFRESH_MIN_INTERVAL_ENV: str = "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S"') == 1, (
+    f"{TAG}: env knob missing after patch"
+)
+assert t.count("_MM_REFRESH_MIN_INTERVAL_DEFAULT_S: float = 3600.0") == 1, (
+    f"{TAG}: 3600s default missing after patch"
+)
+assert t.count("if _mm_refresh_debounced(candidate):") == 1, (
+    f"{TAG}: debounce consult missing from the staleness loop after patch"
+)
+assert t.count(LOOP_ANCHOR) == 0, f"{TAG}: unpatched staleness loop still present"
+assert t.count("async def _trigger_mental_model_refreshes(") == 1, (
+    f"{TAG}: trigger function duplicated or lost by the patch"
+)
+import ast
+ast.parse(t)
+print(f"{TAG}: consolidation-triggered mental-model refreshes floored at "
+      "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S (default 3600s); explicit and cron "
+      "refresh paths untouched; 0 restores upstream behaviour")
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

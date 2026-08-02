@@ -2735,7 +2735,13 @@ export const HindsightConfigSchema = z.object({
       "than RECALL_MAX_CONCURRENT or the engine refuses to boot; unset " +
       "means the image's derived default min(2, RECALL_MAX_CONCURRENT - 1); " +
       "1 biases hard toward the interactive lane while a consolidation " +
-      "backlog drains), plus the " +
+      "backlog drains; and " +
+      "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S — the rollback/tuning knob for " +
+      "switchroom's MM-refresh-debounce image patch: the minimum seconds " +
+      "between consolidation-triggered refreshes of one mental model; unset " +
+      "means the image's baked 3600, 0 restores upstream's " +
+      "refresh-every-round behaviour; explicit and cron-scheduled refreshes " +
+      "are never debounced), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
