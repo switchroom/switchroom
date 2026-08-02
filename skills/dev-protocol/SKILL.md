@@ -18,6 +18,32 @@ judgement criteria. This skill carries the parts that are *this fleet's
 specific opinion* — the ones you would get wrong by defaulting to generic
 good practice, because our answer differs from the obvious one.
 
+## 0. The design contract binds first (repos that declare one)
+
+Switchroom declares its design contract in `reference/` (`reference/README.md`
+is the map; the repo CLAUDE.md "Design contract" section binds it to every
+PR). When the repo you are changing carries one, the whole protocol below
+runs *inside* that contract:
+
+- **Before non-trivial work, place the change in the contract:** which of the
+  four outcomes it advances, and which job spec it satisfies —
+  `reference/product-spec.md` owns the job index; survey specs cheaply with
+  `head -7 reference/jobs/*.md`. A change that maps to no outcome and no job
+  is a scoping question, not a coding task.
+- **The ship gate is the verdict rule, not just CI green:** a change ships
+  only when it (a) advances one of the four outcomes, (b) satisfies its job
+  spec — proven by that job's outcome UAT, (c) passes all three principle
+  checks in `reference/principles.md` (docs / defaults / consistency; a "no"
+  is a redesign, not a ship-and-patch), and (d) crosses no invariant in
+  `reference/invariants.md`. Cite the job spec in the PR body.
+- **Design lives in `reference/`, not `docs/`.** A design decision worth
+  recording is an RFC or design record in `reference/rfcs/` (`serves:` a job
+  or `backs:` an invariant), never a new doc under `docs/`.
+
+This does not add ceremony to small changes: §1's fast path stands, and on a
+single-concern change the verdict check is a one-line sanity pass, not a
+report.
+
 ## 1. Is this a "larger" task? (decides whether you design-align first)
 
 Treat it as larger — design report before implementing — when ANY of these hold:
@@ -37,7 +63,10 @@ Design-aligning a one-liner is its own failure mode.
 
 The report states what exists today **with citations**, what will change, the
 chosen approach, the alternatives you rejected and why, and the PR staging
-plan. Get alignment before implementing.
+plan. In a contract-carrying repo (§0) it opens with the verdict-rule
+mapping: the outcome advanced, the job spec satisfied, and any principle
+check or invariant the design brushes against. Get alignment before
+implementing.
 
 Then red-team your own plan item by item. Each item gets a verdict —
 `SOUND`, `RISK`, or `WRONG` — backed by evidence you can point at (a file you
