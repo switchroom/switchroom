@@ -509,6 +509,30 @@ export const AgentMemorySchema = z
         "'who am I / what matters' framing applied during recall). The " +
         "engine-accurate name for what `bank_mission` sets. Cascade: override."
       ),
+    reflect_budget: z
+      .enum(["low", "mid", "high"])
+      .optional()
+      .describe(
+        "Thinking/retrieval budget injected into reflect MCP calls when the " +
+        "caller omits budget. Unset ⇒ shim default (mid). Explicit per-call " +
+        "budget always wins. Higher = better recall on fuzzy queries, more " +
+        "backend latency/compute. stdio-shim transport only (ignored under " +
+        "memory.config.mcp_transport: http). Cascade: override (per-agent " +
+        "wins over default)."
+      ),
+    reflect_max_tokens: z
+      .number()
+      .int()
+      .positive()
+      .max(8192)
+      .optional()
+      .describe(
+        "Token cap injected into reflect MCP calls when caller omits " +
+        "max_tokens. Unset ⇒ shim default 1024. Values much above ~2048 risk " +
+        "exceeding Claude Code's MCP output cap, silently dropping the " +
+        "payload — raise deliberately. Explicit per-call values always win. " +
+        "stdio-shim transport only. Cascade: override."
+      ),
     retain_mission: z
       .string()
       .optional()
@@ -3575,14 +3599,19 @@ const profileFields = {
         })
         .optional(),
       // Mirrors of AgentMemorySchema.{bank_mission,reflect_mission,
-      // retain_mission,observations_mission,disposition} — accepted at the
-      // defaults/profile tier too so a bank's mission framing and disposition
-      // cascade fleet-wide (per-key merge for `disposition`, override for the
-      // missions). mental_models is DELIBERATELY not mirrored: it is per-agent
-      // only by design (see AgentMemorySchema.mental_models) so a model can
-      // never be fleet-seeded. Descriptions live on AgentMemorySchema.
+      // reflect_budget,reflect_max_tokens,retain_mission,observations_mission,
+      // disposition} — accepted at the defaults/profile tier too so a bank's
+      // mission framing, reflect budget/token caps and disposition cascade
+      // fleet-wide (per-key merge for `disposition`, override for the scalars).
+      // Without the reflect_budget/reflect_max_tokens mirror the keys were
+      // stripped at parse (the #3773 silent-no-op class). mental_models is
+      // DELIBERATELY not mirrored: it is per-agent only by design (see
+      // AgentMemorySchema.mental_models) so a model can never be fleet-seeded.
+      // Descriptions live on AgentMemorySchema.
       bank_mission: z.string().optional(),
       reflect_mission: z.string().optional(),
+      reflect_budget: z.enum(["low", "mid", "high"]).optional(),
+      reflect_max_tokens: z.number().int().positive().max(8192).optional(),
       retain_mission: z.string().optional(),
       observations_mission: z.string().optional(),
       disposition: z

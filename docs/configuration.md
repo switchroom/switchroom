@@ -485,6 +485,8 @@ A persona without its own memory is cosplay: banks should be *specialized*, not 
 | --- | --- | --- | --- |
 | `reflect_mission` | string | override | The bank's "who am I / what matters" framing applied during recall/reflect. Engine-accurate name for what `bank_mission` sets. |
 | `bank_mission` | string | override | **Alias** for `reflect_mission` (retained for back-compat — switchroom's `bank_mission` lands in the engine's `reflect_mission`). If both are set, `reflect_mission` wins. |
+| `reflect_budget` | `low`\|`mid`\|`high` | override | Budget injected into reflect MCP calls when the caller omits it. Shim default `mid`; explicit per-call `budget` always wins. stdio-shim transport only. Needs `switchroom apply` to reach existing agents. |
+| `reflect_max_tokens` | number (≤8192) | override | Token cap injected into reflect MCP calls when the caller omits it. Shim default `1024`; explicit per-call `max_tokens` always wins. stdio-shim transport only. Needs `switchroom apply` to reach existing agents. |
 | `retain_mission` | string | override | What the fact-extraction LLM keeps during auto-retain. Defaults to a curated mission on fresh agents. |
 | `observations_mission` | string | override | What the observation-consolidation LLM synthesizes from raw facts (the higher-order "what patterns matter" lens). |
 | `disposition` | object | **per-key merge** | Personality traits (`skepticism` / `literalism` / `empathy`, each `1`–`5`, engine default `3`) shaping recall/reflect/observation framing. |

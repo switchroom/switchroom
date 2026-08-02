@@ -1,3 +1,4 @@
+import { resolveAgentConfig } from "../config/merge.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import {
   generateHindsightMcpConfig,
@@ -31,7 +32,17 @@ export function getHindsightSettingsEntry(
   }
 
   const collection = getCollectionForAgent(agentName, config);
-  const mcpConfig = generateHindsightMcpConfig(collection, memoryConfig);
+  // Resolve the per-agent memory cascade (defaults → profile → agent) so the
+  // reflect_budget / reflect_max_tokens overrides thread into the shim env.
+  const resolved = resolveAgentConfig(
+    config.defaults,
+    config.profiles,
+    config.agents[agentName] ?? {},
+  );
+  const mcpConfig = generateHindsightMcpConfig(collection, memoryConfig, {
+    reflectBudget: resolved.memory?.reflect_budget,
+    reflectMaxTokens: resolved.memory?.reflect_max_tokens,
+  });
 
   // Defer hindsight's 32 MCP tools via tool search. Auto-recall (recall.py
   // via UserPromptSubmit hook) and auto-retain (retain.py via Stop hook) call

@@ -11,6 +11,7 @@ import {
   DOCKER_SWITCHROOM_CLI_PATH,
   DOCKER_AGENT_HOME,
 } from "../src/agents/scaffold.js";
+import { getHindsightSettingsEntry } from "../src/memory/scaffold-integration.js";
 import { reflectAcrossAgents } from "../src/memory/search.js";
 import {
   getHindsightMcpUrl,
@@ -89,6 +90,109 @@ describe("generateHindsightMcpConfig", () => {
     // this pin is the drift guard the comment in hindsight.ts promises.
     expect(HINDSIGHT_SHIM_CLI_PATH).toBe(DOCKER_SWITCHROOM_CLI_PATH);
     expect(HINDSIGHT_SHIM_AGENT_HOME).toBe(DOCKER_AGENT_HOME);
+  });
+
+  it("threads reflect budget/max_tokens opts into the shim env (max_tokens as STRING)", () => {
+    const memConfig = makeMemoryConfig();
+    const result = generateHindsightMcpConfig("my-collection", memConfig, {
+      reflectBudget: "high",
+      reflectMaxTokens: 2048,
+    });
+    expect(result.env?.HINDSIGHT_SHIM_REFLECT_BUDGET).toBe("high");
+    expect(result.env?.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS).toBe("2048");
+  });
+
+  it("omits the reflect env vars when the opts are unconfigured (minimal 4-key env)", () => {
+    const memConfig = makeMemoryConfig();
+    const result = generateHindsightMcpConfig("my-collection", memConfig, {});
+    // The fleet default lives in the shim constant; an unconfigured agent
+    // emits exactly the 4-key env, so the image-baked default reaches it with
+    // no reconcile. This mirrors the toEqual contract above.
+    expect(result.env).toEqual({
+      HINDSIGHT_MCP_URL: "http://127.0.0.1:18888/mcp/",
+      HINDSIGHT_BANK_ID: "my-collection",
+      HINDSIGHT_SHIM_CACHE_DIR: "/state/agent/home/.hindsight-shim",
+      HOME: "/state/agent/home",
+    });
+  });
+
+  it("under mcp_transport: http, opts produce no env and leave headers unchanged", () => {
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    const memConfig = makeMemoryConfig({
+      config: { provider: "ollama", docker_service: true, mcp_transport: "http" },
+    });
+    const result = generateHindsightMcpConfig("my-collection", memConfig, {
+      reflectBudget: "high",
+      reflectMaxTokens: 2048,
+    });
+    expect(result.type).toBe("http");
+    expect(result.env).toBeUndefined();
+    expect(result.headers).toEqual({ "X-Bank-Id": "my-collection" });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
+describe("getHindsightSettingsEntry reflect cascade", () => {
+  function configWith(opts: {
+    defaults?: Record<string, unknown>;
+    agents?: Record<string, any>;
+  }): SwitchroomConfig {
+    return {
+      switchroom: { version: 1, agents_dir: "~/.switchroom/agents" },
+      telegram: { bot_token: "test-token", forum_chat_id: "-100123" },
+      memory: makeMemoryConfig(),
+      defaults: opts.defaults,
+      agents: opts.agents ?? {},
+    } as unknown as SwitchroomConfig;
+  }
+
+  function envOf(config: SwitchroomConfig, agent: string) {
+    const entry = getHindsightSettingsEntry(agent, config);
+    if (!entry) throw new Error("expected a hindsight entry");
+    return (entry.value as { env?: Record<string, string> }).env;
+  }
+
+  it("cascades defaults.memory.reflect_budget to an agent with no override", () => {
+    const config = configWith({
+      defaults: { memory: { reflect_budget: "high" } },
+      agents: { foo: {} },
+    });
+    // FAILS on origin/main: reflect_budget is stripped at parse and never
+    // threaded into the shim env.
+    expect(envOf(config, "foo")?.HINDSIGHT_SHIM_REFLECT_BUDGET).toBe("high");
+  });
+
+  it("lets a per-agent reflect_budget beat the fleet default", () => {
+    const config = configWith({
+      defaults: { memory: { reflect_budget: "high" } },
+      agents: { foo: { memory: { reflect_budget: "low" } } },
+    });
+    expect(envOf(config, "foo")?.HINDSIGHT_SHIM_REFLECT_BUDGET).toBe("low");
+  });
+
+  it("omits the reflect env when nothing is configured", () => {
+    const config = configWith({ agents: { foo: {} } });
+    const env = envOf(config, "foo");
+    expect(env?.HINDSIGHT_SHIM_REFLECT_BUDGET).toBeUndefined();
+    expect(env?.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS).toBeUndefined();
+  });
+
+  it("cascades reflect_max_tokens (default, override, and absent)", () => {
+    const inherited = configWith({
+      defaults: { memory: { reflect_max_tokens: 2048 } },
+      agents: { foo: {} },
+    });
+    expect(envOf(inherited, "foo")?.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS).toBe("2048");
+
+    const overridden = configWith({
+      defaults: { memory: { reflect_max_tokens: 2048 } },
+      agents: { foo: { memory: { reflect_max_tokens: 512 } } },
+    });
+    expect(envOf(overridden, "foo")?.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS).toBe("512");
+
+    const absent = configWith({ agents: { foo: {} } });
+    expect(envOf(absent, "foo")?.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS).toBeUndefined();
   });
 });
 

@@ -61,14 +61,30 @@ export const HINDSIGHT_SHIM_AGENT_HOME = "/state/agent/home";
  *
  * Escape hatch: `memory.config.mcp_transport: "http"` restores the old
  * direct HTTP entry.
+ *
+ * `opts.reflectBudget` / `opts.reflectMaxTokens` (from the per-agent
+ * memory.reflect_budget / memory.reflect_max_tokens cascade) are threaded
+ * into the shim's env as HINDSIGHT_SHIM_REFLECT_BUDGET / _MAX_TOKENS ONLY
+ * when set — the fleet default (reflect budget:mid, max_tokens:1024) lives in
+ * the shim constants, so an unconfigured agent emits the minimal 4-key env
+ * and picks up the default from the image with no reconcile. Both are shim
+ * (stdio) concepts; under mcp_transport:"http" they bypass the shim entirely,
+ * so a set value there is a no-op and we warn.
  */
 export function generateHindsightMcpConfig(
   collection: string,
   memoryConfig: MemoryBackendConfig,
+  opts: { reflectBudget?: "low" | "mid" | "high"; reflectMaxTokens?: number } = {},
 ): McpServerConfig {
   const url = (memoryConfig.config?.url as string | undefined)
     ?? HINDSIGHT_DEFAULT_MCP_URL;
   if (memoryConfig.config?.mcp_transport === "http") {
+    if (opts.reflectBudget !== undefined || opts.reflectMaxTokens !== undefined) {
+      console.error(
+        "memory.reflect_budget/reflect_max_tokens have no effect under " +
+        "mcp_transport: http — bypasses the shim",
+      );
+    }
     return {
       type: "http",
       url,
@@ -89,6 +105,12 @@ export function generateHindsightMcpConfig(
       HINDSIGHT_BANK_ID: collection,
       HINDSIGHT_SHIM_CACHE_DIR: `${HINDSIGHT_SHIM_AGENT_HOME}/.hindsight-shim`,
       HOME: HINDSIGHT_SHIM_AGENT_HOME,
+      ...(opts.reflectBudget
+        ? { HINDSIGHT_SHIM_REFLECT_BUDGET: opts.reflectBudget }
+        : {}),
+      ...(opts.reflectMaxTokens
+        ? { HINDSIGHT_SHIM_REFLECT_MAX_TOKENS: String(opts.reflectMaxTokens) }
+        : {}),
     },
   };
 }
