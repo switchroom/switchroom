@@ -283,6 +283,7 @@ import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrati
 import { createTypingWrapper } from '../typing-wrap.js'
 import { createTurnTypingLoop } from './turn-typing-loop.js'
 import { createHandbackPreturnSignal } from './handback-preturn-signal.js'
+import { sessionConsumeSignal } from './session-consume-signal.js'
 import { createHandbackOrphanRecovery } from './handback-orphan-recovery.js'
 import { deriveTurnId } from './derive-turn-id.js'
 import { createTypingEmitter, TYPING_REFRESH_MS } from '../typing-emitter.js'
@@ -495,10 +496,7 @@ import {
 } from '../reply-owner-resolve.js'
 import { SubagentHandbackMarker } from './subagent-handback-marker.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
-import {
-  AnswerReadyFlushController,
-  resolveAnswerReadyFlushMs,
-} from '../answer-ready-flush.js'
+import { AnswerReadyFlushController, resolveAnswerReadyFlushMs, resolveAnswerStageMs } from '../answer-ready-flush.js'
 // #1667 — pure decision core for the turn_end answer-delivery gate (#1664).
 import { decideTurnEndGate } from './turn-end-gate.js'
 // #1122 PR3: turn-flush-prose-recovery removed with the progress card.
@@ -10748,6 +10746,7 @@ if (isGatewayMain) ipcServer = createIpcServer({
 
   async onToolCall(client: IpcClient, msg: ToolCallMessage): Promise<ToolCallResult> {
     process.stderr.write(`telegram gateway: ipc: tool_call tool=${msg.tool} agent=${client.agentName ?? '-'} clientId=${client.id ?? '-'} callId=${msg.id}\n`)
+    if (!isCronIdentity(client.agentName)) sessionConsumeSignal.noteMainToolCall() // consumption proxy (session-consume-signal.ts)
     try {
       // #4172 — the calling client's identity gates reply supersede authority
       // (see replyCallerIsForeignSession, cron-session.ts).
@@ -13547,29 +13546,29 @@ function resetOrphanedReplyTimeout(): void {
  * PR A — DETERMINISTIC answer-ready quiescence flush controller.
  *
  * The orchestration (arm / debounce / rollover-guard / fire-time re-verify /
- * disarm) lives in the extracted, unit-tested `AnswerReadyFlushController`
- * (answer-ready-flush.ts) — the gateway only supplies the thin deps below and
- * calls `.reset()` / `.clear(turn)`. Behaviour:
+ * stage-don't-send / disarm) lives in the extracted, unit-tested
+ * `AnswerReadyFlushController` (answer-ready-flush.ts) — the gateway only
+ * supplies the thin deps below and calls `.reset()` / `.clear(turn)`.
  *
  * - `reset()` (from `case 'text'`): (re)arm iff the turn has a genuine composed
  *   terminal answer (the SAME `decideTurnFlush` classifier the turn-flush branch
  *   uses) AND is quiescent. Each text chunk re-arms → the debounce.
  * - `clear(turn)` (from tool activity + `endCurrentTurnAtomic`): the DISARM.
- * - on fire: re-pin `currentTurn === turn`, re-verify quiescence, then dispatch
- *   a positive `answer-ready-quiescence` synthetic turn_end that routes through
- *   the IDENTICAL turn-flush send path (endCurrentTurnAtomic → send-gated IIFE →
- *   honest PR-B record). Replaces the ~150 s dead wait with ~1 s, in code.
+ * - on fire: re-pin `currentTurn === turn`, re-verify quiescence, then STAGE the
+ *   answer on the still-live turn (`stageWindowMs` — see ANSWER_STAGE_MS) and
+ *   promote only when the completion window closes with no reply, dispatching
+ *   the positive `answer-ready-quiescence` synthetic turn_end through the
+ *   IDENTICAL turn-flush send path. A reply landing in the window discards the
+ *   stage (msgs 25843/25844); a real turn_end delivers via the turn-flush branch.
  *
  * Exactly-once: the synthetic turn_end's `endCurrentTurnAtomic` nulls the atom,
  * so a later REAL turn_end (or the orphaned backstop) short-circuits at its
  * `turn != null` guard; `endCurrentTurnAtomic` also calls `.clear(turn)` so a
- * real turn_end that lands FIRST cancels a pending flush. `outboundDedup` is the
- * second layer.
+ * real turn_end that lands FIRST cancels a pending flush/stage.
  *
  * The `answer-ready-quiescence` reason bypasses the `durationMs===-1`
- * recently-streaming SUPPRESSION guard (the terminal answer text itself stamps
- * recentlyStreaming): quiescence IS the positive "streaming has settled" signal,
- * the opposite of the hung-turn backstop that guard protects.
+ * recently-streaming SUPPRESSION guard: quiescence IS the positive "streaming
+ * has settled" signal, the opposite of the hung-turn backstop that guard covers.
  */
 const answerReadyFlush = new AnswerReadyFlushController<CurrentTurn>({
   getCurrentTurn: () => currentTurn,
@@ -13593,6 +13592,7 @@ const answerReadyFlush = new AnswerReadyFlushController<CurrentTurn>({
   },
   onFlush: () =>
     handleSessionEvent({ kind: 'turn_end', durationMs: -1, reason: 'answer-ready-quiescence' }),
+  stageWindowMs: resolveAnswerStageMs(process.env), // stage-don't-send — see ANSWER_STAGE_MS
   log: (msg) => process.stderr.write(`telegram gateway: ${msg}\n`),
 })
 
@@ -13831,9 +13831,10 @@ const handbackPreturnSignal = createHandbackPreturnSignal({
     return statusKey(live.sessionChatId, live.sessionThreadId) === key
   },
   // Queue-state gate for the orphan reap (see the signal's `isClaudeBusy` doc):
-  // while a turn is in flight the handback is enqueued behind it, not orphaned.
-  // False for both `bridge_alive_idle` and `bridge_dead` → genuine orphan reaps.
+  // a handback queued behind an in-flight turn is not orphaned.
   isClaudeBusy: () => isMachineInTurn(),
+  // 2026-08-02 invisible-consumption gate — see session-consume-signal.ts.
+  sessionActivitySince: (sinceTs) => sessionConsumeSignal.activitySince(sinceTs),
 })
 
 /**

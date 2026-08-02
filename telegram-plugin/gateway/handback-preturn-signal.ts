@@ -238,6 +238,18 @@ export interface HandbackPreturnSignalDeps {
    *  is the GLOBAL busy signal because the handback queues behind whatever turn
    *  is running, regardless of topic. Optional; defaults to "not busy". */
   isClaudeBusy?: () => boolean
+  /** True IFF the gateway observed the SESSION consume input after `sinceTs` —
+   *  a turn minting at the enqueue seam, or a main-session MCP tool call over
+   *  the IPC bridge (`session-consume-signal.ts`). Consulted at the moment the
+   *  reap would otherwise declare a genuine orphan: claude holds ONE FIFO input
+   *  queue, so post-delivery consumption evidence means the delivered handback
+   *  entered the model's context even though no adopting turn was ever minted
+   *  (the 2026-08-02 invisible-consumption incident — the session answered the
+   *  handback via a `reply` from idle with zero session-tail events, then the
+   *  reap re-injected the already-answered report twice). When true the reap
+   *  CLEANS UP (card + typing + entry) without re-injecting and without
+   *  escalating. Optional; defaults to "no evidence" (legacy re-inject). */
+  sessionActivitySince?: (sinceTs: number) => boolean
   now?: () => number
   /** Debounce before painting the pre-turn card (kills sub-second flicker). */
   debounceMs?: number
@@ -487,13 +499,27 @@ export function createHandbackPreturnSignal(
       entry.reapTimer = setTimer(() => reap(entry), adoptTimeoutMs)
       return
     }
+    // INVISIBLE-CONSUMPTION GATE (2026-08-02 klanker incident). We are at the
+    // point the reap would declare a genuine orphan: claude is idle, the
+    // delivered TTL elapsed, and no adopting turn ever minted. But "no adopting
+    // turn" is NOT proof the handback went un-consumed — the session can
+    // consume injected input WITHOUT the gateway minting a turn (zero
+    // session-tail events; the only trace was a `reply` tool call from idle).
+    // If the gateway observed the session consume input after this handback
+    // was delivered (a later turn minting, or a main-session tool call —
+    // claude's single FIFO queue means either proves the earlier delivery
+    // entered the model's context), the handback was already processed:
+    // re-injecting it re-runs an answered report (observed: the same worker
+    // report processed three times). Clean up WITHOUT re-injection.
+    const consumedElsewhere = deps.sessionActivitySince?.(entry.deliveredAt) === true
     entry.consumed = true
-    // GENUINE ORPHAN. Recover DETERMINISTICALLY — never ask the operator to
-    // nudge. Stop the forever-running typing loop, DELETE the frozen card (do
-    // not leave a stale "needs a nudge" message), then re-inject the handback so
-    // the machine re-processes it itself. Cap the re-injections; past the cap
-    // escalate to fleet-health telemetry (NOT a chat card).
-    stopTypingUnlessTurnLive(entry, 'orphan reap')
+    // GENUINE ORPHAN (or consumed-elsewhere cleanup). Recover DETERMINISTICALLY
+    // — never ask the operator to nudge. Stop the forever-running typing loop,
+    // DELETE the frozen card (do not leave a stale "needs a nudge" message),
+    // then — for a genuine orphan only — re-inject the handback so the machine
+    // re-processes it itself. Cap the re-injections; past the cap escalate to
+    // fleet-health telemetry (NOT a chat card).
+    stopTypingUnlessTurnLive(entry, consumedElsewhere ? 'consumed reap' : 'orphan reap')
     if (entry.activityMessageId != null) {
       const record: PreTurnCardRecord = {
         turnKey: entry.syntheticTurnKey,
@@ -518,6 +544,18 @@ export function createHandbackPreturnSignal(
     // synchronously) is not swallowed by the per-topic dedupe guard. The entry
     // object stays valid for the captured re-inject below.
     dropEntry(entry)
+    if (consumedElsewhere) {
+      // Distinct structured line so fleet-health can track how often the
+      // session consumes a handback without a gateway-visible adopting turn
+      // (the underlying session-tail anomaly stays observable even though the
+      // false re-injection is gone).
+      log(
+        `handback-preturn-signal: reap resolved key=${entry.statusKey} ` +
+          `turnId=${entry.adoptTurnId} — session consumed input after delivery ` +
+          `(no adopting turn observed); cleaned up without re-injection\n`,
+      )
+      return
+    }
     if (entry.reinjectCount < maxReinjects) {
       const nextCount = entry.reinjectCount + 1
       // Stamp the counter on the inbound so it survives the buffer round trip
