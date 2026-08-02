@@ -5,9 +5,10 @@
  * `dockerfile-hindsight-bakes.test.ts` pins the SHAPE of the patch block
  * (grep-on-file, runs everywhere). This file proves the OUTCOME: it runs the
  * same probe against unpatched upstream (must be RED — no priority pool, no
- * `background` kwarg) and against upstream + the patch block applied (must be
- * GREEN — foreground work is dispatched ahead of queued background work, and
- * the `background` flag is threaded through the reranker surface).
+ * `background` kwarg) and against the THROUGH-BUILT `switchroom-hindsight`
+ * image (must be GREEN — foreground work is dispatched ahead of queued
+ * background work, and the `background` flag is threaded through the reranker
+ * surface).
  *
  * Upstream PR: vectorize-io/hindsight #3142 (OPEN — a source fork patch, not an
  * adopted-upstream retire). The defect it fixes: reranking is CPU-bound in a
@@ -37,18 +38,32 @@
  *    LocalSTCrossEncoder.predict, and CrossEncoderReranker.rerank — keyword-
  *    only, default False — so the recall call site can steer priority.
  *
- * The block is extracted from the Dockerfile itself (never duplicated here), so
- * this test cannot drift from what ships. It applies the block by `docker exec`
- * (not `docker build`) so it runs on daemons without buildx, and it never
- * touches the production `switchroom-hindsight` container.
+ * Why the GREEN arm probes the through-built image rather than re-patching
+ * upstream in-container: #3142's anchors and post-conditions depend on THREE
+ * earlier switchroom patches (the cross-encoder import block, the CE-saturation
+ * `_boost_authority` block, and the recall-admission-split
+ * `_background_search_semaphore` block). Applying the #3142 block alone to raw
+ * upstream aborts — its own `apply()` count-assert and its
+ * `assert "_boost_authority(" in rr` / `_background_search_semaphore` post-
+ * conditions fail, because raw upstream has none of those prerequisites. The
+ * only correct base is the source tree with every prior patch already applied,
+ * in Dockerfile order — which is exactly what the shipping image IS. So the
+ * GREEN arm runs the probe against the real `switchroom-hindsight` image built
+ * from `docker/Dockerfile.hindsight` (no in-test re-patching), exercising the
+ * exact bytes that ship and keeping all patch-sequencing knowledge out of this
+ * test. The #3142 block is still extracted from the Dockerfile for the presence
+ * assertion, so the test cannot drift from what ships. It never touches the
+ * production `switchroom-hindsight` container.
  *
  * SKIP DISCIPLINE mirrors hindsight-search-patches.test.ts: locally, no docker
- * or no cached image skips (never pull a 6.4GB third-party image onto a dev
- * box); in CI, `.github/workflows/docker-e2e.yml`'s `hindsight-probe` job pulls
- * the pinned digest and sets `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1`, under which
- * an unavailable docker/image is a HARD FAILURE, never a green skip. Both runs
- * assert a `PROBE_EXECUTED` sentinel so a probe that dies early can never be
- * mistaken for a pass.
+ * or no built image skips (never build a 16GB image on a dev box); in CI,
+ * `.github/workflows/docker-e2e.yml`'s `hindsight-probe` job pulls the pinned
+ * digest (RED), `docker build`s the through-built image and exports its tag as
+ * `SWITCHROOM_HINDSIGHT_BUILT_IMAGE` (GREEN), and sets
+ * `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1`, under which an unavailable
+ * docker/upstream-image/built-image is a HARD FAILURE, never a green skip. Both
+ * runs assert a `PROBE_EXECUTED` sentinel so a probe that dies early can never
+ * be mistaken for a pass.
  */
 
 import { describe, it, expect, afterAll } from "vitest";
@@ -261,23 +276,38 @@ function hasImage(ref: string): boolean {
 }
 
 /**
- * CI marker. When set, this suite MUST really execute — an absent docker or an
- * absent upstream image becomes a hard failure instead of a green skip.
- * `.github/workflows/docker-e2e.yml` sets it after pulling the pinned digest.
+ * CI marker. When set, this suite MUST really execute — an absent docker, an
+ * absent upstream image (RED) or an absent through-built image (GREEN) becomes
+ * a hard failure instead of a green skip. `.github/workflows/docker-e2e.yml`
+ * sets it after pulling the pinned digest and building the through-built image.
  */
 const REQUIRED = process.env.SWITCHROOM_REQUIRE_HINDSIGHT_PROBE === "1";
 
+/**
+ * The THROUGH-BUILT image the GREEN arm probes: the real `switchroom-hindsight`
+ * image produced by `docker build -f docker/Dockerfile.hindsight`, which
+ * already carries #3142 baked on top of every prerequisite switchroom patch,
+ * in Dockerfile order. CI's `hindsight-probe` job builds it and exports the tag
+ * here. There is NO in-test re-patching — the GREEN arm exercises the exact
+ * bytes that ship.
+ */
+const BUILT_IMAGE = (process.env.SWITCHROOM_HINDSIGHT_BUILT_IMAGE ?? "").trim();
+
 const dockerOk = hasDocker();
-const imageOk = dockerOk && hasImage(UPSTREAM_IMAGE);
+const upstreamOk = dockerOk && hasImage(UPSTREAM_IMAGE);
+const builtOk = dockerOk && BUILT_IMAGE !== "" && hasImage(BUILT_IMAGE);
 
 type ProbeResult = { status: number; stdout: string };
 
-/** Run the probe in a throwaway container, optionally patching first. */
-function runProbe(patched: boolean): ProbeResult {
-  const name = `sr-hs-rerank-${patched ? "patched" : "upstream"}-${RUN_ID.slice(
-    0,
-    8
-  )}`;
+/**
+ * Run the probe in a throwaway container built from `image`, verbatim — no
+ * in-container patching. RED passes the RAW upstream image (no priority pool);
+ * GREEN passes the THROUGH-BUILT `switchroom-hindsight` image, which already
+ * has #3142 baked on top of every prerequisite switchroom patch exactly as it
+ * ships. `role` only names the container for debuggability.
+ */
+function runProbe(image: string, role: string): ProbeResult {
+  const name = `sr-hs-rerank-${role}-${RUN_ID.slice(0, 8)}`;
   try {
     execFileSync(
       "docker",
@@ -294,23 +324,12 @@ function runProbe(patched: boolean): ProbeResult {
         "root",
         "--network",
         "none",
-        UPSTREAM_IMAGE,
+        image,
         "sleep",
         "300",
       ],
       { stdio: ["ignore", "ignore", "pipe"] }
     );
-
-    if (patched) {
-      // The block is self-verifying: it asserts its upstream anchors exist
-      // exactly the expected number of times and re-asserts the result, so a
-      // non-zero exit here means upstream drifted and the patch must be
-      // re-authored.
-      execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
-        input: patchBlock(),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    }
 
     const res = execFileSync(
       "docker",
@@ -330,6 +349,23 @@ function runProbe(patched: boolean): ProbeResult {
     } catch {
       /* already gone */
     }
+  }
+}
+
+/** Label-scoped teardown belt (never an unlabelled bulk removal). */
+function teardownRun(): void {
+  try {
+    const ids = execSync(
+      `docker ps -aq --filter label=switchroom.test.run=${RUN_ID}`,
+      { encoding: "utf8" }
+    )
+      .split("\n")
+      .filter(Boolean);
+    if (ids.length) {
+      execFileSync("docker", ["rm", "-f", ...ids], { stdio: "ignore" });
+    }
+  } catch {
+    /* nothing to clean */
   }
 }
 
@@ -357,35 +393,27 @@ describe("Dockerfile.hindsight reranker-priority probe is real, not a silent ski
       "SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1 but the docker daemon is unreachable"
     ).toBe(true);
     expect(
-      imageOk,
+      upstreamOk,
       `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1 but ${UPSTREAM_IMAGE} is not present ` +
-        "locally — the workflow must pull the pinned digest before running this suite"
+        "locally — the workflow must pull the pinned digest (RED arm) before running this suite"
+    ).toBe(true);
+    expect(
+      builtOk,
+      "SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1 but no through-built hindsight image is " +
+        `present (SWITCHROOM_HINDSIGHT_BUILT_IMAGE=${JSON.stringify(BUILT_IMAGE)}) — ` +
+        "the workflow must `docker build -f docker/Dockerfile.hindsight` and export " +
+        "its tag as SWITCHROOM_HINDSIGHT_BUILT_IMAGE (GREEN arm) before running this suite"
     ).toBe(true);
   });
 });
 
-describe.skipIf(!dockerOk || !imageOk)(
-  "Dockerfile.hindsight reranker-priority patch changes real behaviour",
+describe.skipIf(!dockerOk || !upstreamOk)(
+  "Dockerfile.hindsight reranker-priority — unpatched upstream is RED",
   () => {
-    afterAll(() => {
-      // Label-scoped teardown belt (never an unlabelled bulk removal).
-      try {
-        const ids = execSync(
-          `docker ps -aq --filter label=switchroom.test.run=${RUN_ID}`,
-          { encoding: "utf8" }
-        )
-          .split("\n")
-          .filter(Boolean);
-        if (ids.length) {
-          execFileSync("docker", ["rm", "-f", ...ids], { stdio: "ignore" });
-        }
-      } catch {
-        /* nothing to clean */
-      }
-    });
+    afterAll(teardownRun);
 
     it("unpatched upstream is RED (no priority pool, no background kwarg)", () => {
-      const { status, stdout } = runProbe(false);
+      const { status, stdout } = runProbe(UPSTREAM_IMAGE, "upstream");
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
@@ -398,9 +426,16 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("BG_PARAM CrossEncoderModel.predict False");
       expect(stdout).toContain("BG_PARAM CrossEncoderReranker.rerank False");
     }, 240_000);
+  }
+);
 
-    it("upstream + the baked #3142 block is GREEN, priority ordering and all", () => {
-      const { status, stdout } = runProbe(true);
+describe.skipIf(!dockerOk || !builtOk)(
+  "Dockerfile.hindsight reranker-priority — through-built image is GREEN",
+  () => {
+    afterAll(teardownRun);
+
+    it("through-built #3142 image is GREEN, priority ordering and all", () => {
+      const { status, stdout } = runProbe(BUILT_IMAGE, "built");
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
