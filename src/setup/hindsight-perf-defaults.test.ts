@@ -351,7 +351,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-five keys, by name", () => {
+  it("is overridable on exactly these forty-six keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -405,11 +405,12 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS",
-      // Not HINDSIGHT_API_* — switchroom-patch knobs (the CE-damping and MCP
-      // recall-budget rollback hatches), read by the patched modules, never
-      // by upstream's config parser. Sort last.
+      // Not HINDSIGHT_API_* — switchroom-patch knobs (the CE-damping, MCP
+      // recall-budget, and MM-refresh-debounce rollback hatches), read by the
+      // patched modules, never by upstream's config parser. Sort last.
       "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
       "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
+      "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
     ]);
   });
 
@@ -908,6 +909,75 @@ describe("HINDSIGHT_MCP_RECALL_BUDGET_MODE (override-only, patch rollback hatch)
     const perf = { env: { [KEY]: OFF }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+  });
+});
+
+// ── the MM-refresh-debounce rollback hatch ────────────────────────────────
+describe("HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S (override-only, patch rollback hatch)", () => {
+  const KEY = "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+  /** The documented full back-out value: upstream's refresh-every-round. */
+  const OFF = "0";
+
+  it("is managed, so a hindsight.env line for it is not silently discarded", () => {
+    // docker/Dockerfile.hindsight's MM-refresh-debounce patch documents this
+    // var as its restart-level rollback (0 = upstream behaviour), and the
+    // patch reads it ONCE at import — an unreached value has no runtime
+    // fallback, so absence from HINDSIGHT_PERF_ENV_KEYS would make the
+    // documented escape hatch not exist (the CE-gap defect, re-run).
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    // Override-only, not defaulted: the 3600s floor is baked into the image
+    // where the patch lives; emitting it here too would be a second copy of
+    // the same opinion to drift.
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: OFF }).get(KEY)).toBe(OFF);
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: OFF }).get(KEY)).toBe(OFF);
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted on any host when unset (gpu=$gpu localLlm=$localLlm)",
+    (caps) => {
+      // Unset ⇒ the image's baked 3600s floor. A host that sets nothing must
+      // keep exactly the shipped behaviour.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches the docker-run argv AND the compose snippet with the operator's value", () => {
+    // The outcome that matters: the value an operator writes in
+    // switchroom.yaml is actually in the argv that launches the container.
+    // Without the key in the managed set both of these are undefined.
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([OFF]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+      ).get(KEY),
+    ).toEqual([OFF]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // Cloud endpoint + no GPU: the harshest gating case. A rollback hatch that
+    // works only on GPU boxes is not a rollback hatch.
+    const perf = { env: { [KEY]: "7200" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["7200"]);
   });
 });
 

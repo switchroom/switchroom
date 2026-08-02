@@ -133,6 +133,7 @@ jobs:
               - 'tests/docker/hindsight-search-patches.test.ts'
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
+              - 'tests/docker/hindsight-mm-refresh-debounce-patch.test.ts'
               - 'tests/docker/hindsight-graph-seed-retirement.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'src/setup/hindsight-perf-defaults.ts'
@@ -354,6 +355,19 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-retry-perturbation-patches.test.ts
 
+      - name: Run the hindsight MM-refresh-debounce probe (RED/GREEN, must not skip)
+        # Same contract again, for the MM-refresh-debounce patch. The bakes
+        # test cannot cover the failure that matters here: its assertions are
+        # unanchored substring matches, so a helper that exists but is never
+        # consulted by the trigger loop (the #3660-class indent-under-a-falsy-
+        # guard revert) stays green there while every consolidation round goes
+        # back to regenerating every mental model — the measured 1,902
+        # refreshes/day loop. Only running the shipping trigger loop and
+        # observing which candidates it actually submits catches it.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-mm-refresh-debounce-patch.test.ts
+
       - name: Run the hindsight graph-seed RETIREMENT probe (RED/GREEN, must not skip)
         # The v0.8.5 upstream #2968 carry was retired in the v0.8.6 base bump —
         # upstream ships the behaviour natively and exposes
@@ -434,7 +448,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

@@ -1295,6 +1295,37 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *                                                            # a backlog drains
  * ```
  *
+ * ### `HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S`
+ *
+ * The documented rollback/tuning knob for switchroom's MM-refresh-debounce
+ * patch (`docker/Dockerfile.hindsight`, the `consolidation/consolidator.py`
+ * block). Upstream refreshes every `refresh_after_consolidation: true`
+ * mental model at the end of EVERY completed consolidation operation, gated
+ * only by "any in-scope memory since last_refreshed_at" — under sustained
+ * ingestion that is every round, i.e. roughly once a minute per model
+ * (measured 2026-08-01: the `finn` bank's 4 models refreshed 1,902 times in
+ * one day, 20.77M tokens; fleet-wide 3,003 refresh calls / 36.6M tokens).
+ * The patch floors the interval between consolidation-triggered refreshes
+ * of one model at this many seconds, default 3600 baked into the image.
+ * A skipped model's `last_refreshed_at` is untouched, so the first
+ * consolidation after the floor elapses still refreshes it — deferred,
+ * never dropped. Explicit refreshes (MCP tool, HTTP, the user-profile Stop
+ * hook) and the cron-scheduled maintenance path are not debounced.
+ *
+ * Not an upstream var (no `HINDSIGHT_API_` prefix — upstream's config
+ * parser never sees it; verified 2026-08-02 that upstream main has no
+ * debounce, merged or open). Read once at import, like
+ * `HINDSIGHT_CE_DECISIVE_RELATIVE_GAP` above, so changing it is a container
+ * restart, not a rebuild. Override-only rather than defaulted: the 3600s
+ * default is baked into the image where the patch lives, and emitting it
+ * here too would create a second copy of the same opinion to drift.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S: "0"   # upstream behaviour, patch inert
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1320,6 +1351,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
   "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
   "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
+  "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
 ]);
 
 /**

@@ -1070,6 +1070,60 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the MM-refresh-debounce fix (assert-guarded, fail-loud)", () => {
+    // Upstream refreshes every `refresh_after_consolidation: true` mental
+    // model at the end of EVERY completed consolidation operation, gated only
+    // by "any in-scope memory since last_refreshed_at" — always true under
+    // sustained ingestion. Measured 2026-08-01 (llm_requests): finn's 4
+    // models refreshed 1,902x in one day (20.77M tokens); fleet-wide 3,003
+    // refresh calls / 36.6M tokens. The patch floors the interval between
+    // consolidation-triggered refreshes of one model.
+    //
+    // SCOPE: structural, not behavioural. The behavioural gate is
+    // tests/docker/hindsight-mm-refresh-debounce-patch.test.ts, which runs
+    // the shipping `_trigger_mental_model_refreshes` and asserts which
+    // candidates are actually submitted. Do not treat this file as
+    // sufficient.
+    expect(dockerfile).toMatch(/switchroom hindsight MM-refresh-debounce patch/);
+    // Exact-once anchor guards for both halves (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: _trigger_mental_model_refreshes def anchor found \{n\}x \(expected 1\) in "/,
+    );
+    expect(dockerfile).toMatch(
+      /f"\{TAG\}: staleness-loop anchor found \{n\}x \(expected 1\) in "/,
+    );
+    // The helper's safety shape: NULL last_refreshed_at is never debounced,
+    // and interval <= 0 short-circuits to exact upstream behaviour.
+    expect(dockerfile).toMatch(/if _MM_REFRESH_MIN_INTERVAL_S <= 0\.0:/);
+    expect(dockerfile).toMatch(/if not last:/);
+    // A bad value degrades to the default, never raises out of consolidation.
+    expect(dockerfile).toMatch(/except \(TypeError, ValueError\):/);
+    expect(dockerfile).toMatch(/if not math\.isfinite\(value\) or value < 0\.0:/);
+    // The debounce is consulted BEFORE the staleness round-trip.
+    expect(dockerfile).toMatch(/if _mm_refresh_debounced\(candidate\):/);
+    // Post-replace re-assertions (verification-on-build).
+    expect(dockerfile).toMatch(
+      /assert t\.count\("if _mm_refresh_debounced\(candidate\):"\) == 1,/,
+    );
+    expect(dockerfile).toMatch(/assert t\.count\(LOOP_ANCHOR\) == 0,/);
+
+    // …and the knob the image reads must be one switchroom can actually set.
+    // `resolveHindsightPerfOverrides` drops any key outside
+    // HINDSIGHT_PERF_ENV_KEYS silently, and the patch reads this var once at
+    // import, so an unmanaged name here is a documented escape hatch that
+    // cannot be reached from switchroom.yaml at all. Derive the name from the
+    // Dockerfile rather than restating it, so the two cannot drift apart.
+    const envName = dockerfile.match(
+      /_MM_REFRESH_MIN_INTERVAL_ENV: str = "([A-Z0-9_]+)"/,
+    )?.[1];
+    expect(envName, "the patch must name its env knob").toBeDefined();
+    expect(
+      HINDSIGHT_PERF_ENV_KEYS.has(envName!),
+      `${envName} is read by the baked patch but is not in HINDSIGHT_PERF_ENV_KEYS, ` +
+        "so a hindsight.env line for it is discarded before it reaches the container",
+    ).toBe(true);
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
