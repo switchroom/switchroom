@@ -117,11 +117,40 @@ const DEFAULT_SCOPES = DRIVE_READONLY_SCOPES;
 // surfaces explicitly broken today. Calendar/Forms/Tasks/Chat/Gmail are
 // a separate, larger scope-expansion decision (Gmail in particular has
 // an unresolved per-thread-approval shape — RFC G §5 out-of-scope).
+//
+// Calendar has since been un-deferred, but ONLY as read-only and ONLY as
+// an explicit opt-in — see GOOGLE_CALENDAR_READONLY_SCOPE below. It is
+// still not part of any tier's default scope set, so the invariant this
+// comment protects (a tier bump never silently widens the grant into a
+// new product surface) is intact.
 export const GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents";
 export const GOOGLE_SHEETS_SCOPE =
   "https://www.googleapis.com/auth/spreadsheets";
 export const GOOGLE_SLIDES_SCOPE =
   "https://www.googleapis.com/auth/presentations";
+
+// ── Calendar (read-only, opt-in) ─────────────────────────────────────────
+//
+// Upstream's `list_calendars` / `get_events` tools are exposed at EVERY
+// tier (`core` already advertises Calendar — see GoogleWorkspaceTierSchema
+// in src/config/schema.ts), but the token switchroom mints carries no
+// calendar scope, so those tools 403 and upstream falls back to its own
+// port-8000 browser OAuth — unrecoverable inside a container. Requesting
+// this scope is what makes the already-exposed tools actually work.
+//
+// Two deliberate narrowings:
+//   1. **Read-only only.** `calendar.readonly` grants list/read of
+//      calendars and events. The read/write `calendar` and
+//      `calendar.events` scopes are NOT offered — creating/moving events
+//      is a write surface with its own approval shape, exactly the
+//      argument RFC G §5 makes about Gmail.
+//   2. **Opt-in, never tier-default.** Folding it into a tier's default
+//      set would mean an operator who re-mints after a tier bump
+//      silently hands over their whole calendar. A read grant must never
+//      silently widen (RFC D §12) — the same invariant `--write` exists
+//      to protect. Hence the separate `--calendar` flag on `account add`.
+export const GOOGLE_CALENDAR_READONLY_SCOPE =
+  "https://www.googleapis.com/auth/calendar.readonly";
 
 /**
  * The Google Workspace document scopes available at each tier. Tied to
@@ -176,14 +205,116 @@ export function selectDriveAccountScopes(write: boolean): string[] {
  */
 export function selectGoogleWorkspaceScopes(opts: {
   write: boolean;
+  /**
+   * Opt-in Calendar READ. Adds {@link GOOGLE_CALENDAR_READONLY_SCOPE} and
+   * nothing else. Never implied by a tier — see that constant's comment.
+   */
+  calendar?: boolean;
   tier?: "core" | "extended" | "complete";
 }): string[] {
   const base = selectDriveAccountScopes(opts.write);
   const workspace = workspaceScopesForTier(opts.tier ?? "core");
+  const calendar = opts.calendar ? [GOOGLE_CALENDAR_READONLY_SCOPE] : [];
   // De-dup defensively — base and workspace sets are disjoint today but
   // a future scope move shouldn't silently produce a doubled scope
   // string in the consent URL.
-  return [...new Set([...base, ...workspace])];
+  return [...new Set([...base, ...workspace, ...calendar])];
+}
+
+// ── Opt-in capability carry-forward (re-consent safety) ──────────────────
+
+/**
+ * The opt-in capabilities an `account add` token can carry beyond the
+ * always-minted Drive read baseline. One boolean per `account add` flag.
+ */
+export interface GoogleOptInCapabilities {
+  /** `--write` → `drive.file`. */
+  write: boolean;
+  /** `--calendar` → `calendar.readonly`. */
+  calendar: boolean;
+}
+
+/**
+ * Derive the opt-in capabilities a stored token actually carries, from
+ * the space-separated scope string the broker holds
+ * (`list-google-accounts` → `scope`).
+ *
+ * Pure + exported: this is the input to the re-consent carry-forward, so
+ * it has to be independently pinnable.
+ */
+export function capabilitiesFromScopeString(
+  scope: string,
+): GoogleOptInCapabilities {
+  const have = new Set(
+    scope
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+  return {
+    write: have.has("https://www.googleapis.com/auth/drive.file"),
+    calendar: have.has(GOOGLE_CALENDAR_READONLY_SCOPE),
+  };
+}
+
+/** Outcome of {@link resolveReconsentCapabilities}. */
+export interface ReconsentCapabilityPlan {
+  /** The capability set the new consent should actually request. */
+  effective: GoogleOptInCapabilities;
+  /**
+   * Capabilities the existing token already held that the operator did
+   * NOT re-request on this invocation — carried forward rather than
+   * dropped. Surfaced to the operator so the carry-forward is never
+   * silent.
+   */
+  carried: (keyof GoogleOptInCapabilities)[];
+  /**
+   * Capabilities newly requested on this invocation that the existing
+   * token does not hold. Empty for a fresh account (nothing to widen
+   * FROM). Drives the "this needs re-consent" guidance.
+   */
+  added: (keyof GoogleOptInCapabilities)[];
+}
+
+/**
+ * Reconcile the flags passed to `account add` against the capabilities
+ * an already-registered token holds.
+ *
+ * Two failure modes this closes, both previously silent:
+ *
+ *  1. **Silent DOWNGRADE on re-consent.** OAuth scopes are fixed at
+ *     consent time, so `account add --replace` mints exactly the scope
+ *     set the flags describe. Re-consenting for an unrelated reason (a
+ *     tier bump) without re-passing `--write` used to quietly strip
+ *     `drive.file` and break every doc the agent could previously
+ *     create. Existing capabilities are therefore UNIONed in, not
+ *     replaced, and reported via `carried`.
+ *  2. **Silent WIDENING.** The union only ever flows old → new. A
+ *     capability the operator did not ask for and the token does not
+ *     already hold is never requested — `--calendar` alone cannot pull
+ *     in `--write`, and no tier implies either.
+ *
+ * `existing` is `undefined` for an account the broker does not hold yet
+ * (a fresh add), in which case the requested flags are used verbatim.
+ *
+ * Pure + exported so both invariants are unit-pinned.
+ */
+export function resolveReconsentCapabilities(
+  requested: GoogleOptInCapabilities,
+  existing?: GoogleOptInCapabilities,
+): ReconsentCapabilityPlan {
+  const keys: (keyof GoogleOptInCapabilities)[] = ["write", "calendar"];
+  if (!existing) {
+    return { effective: { ...requested }, carried: [], added: [] };
+  }
+  return {
+    effective: {
+      write: requested.write || existing.write,
+      calendar: requested.calendar || existing.calendar,
+    },
+    carried: keys.filter((k) => existing[k] && !requested[k]),
+    added: keys.filter((k) => requested[k] && !existing[k]),
+  };
 }
 
 export interface DriveCliDeps {

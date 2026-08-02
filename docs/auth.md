@@ -405,7 +405,7 @@ it, and unblock the fleet — entirely from chat:
 Drive/Graph loopback OAuth flow is fully relayable — no SSH port-forward,
 no keyboard:
 
-- `/auth google add <email> [--replace] [--write]`
+- `/auth google add <email> [--replace] [--write] [--calendar]`
 - `/auth microsoft add <email> [--replace] [--org-mode]`
 
 The agent runs the loopback flow in its own container, relays the consent

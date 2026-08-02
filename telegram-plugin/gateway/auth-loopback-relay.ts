@@ -84,6 +84,8 @@ export interface SpawnRelayOpts {
   replace?: boolean
   /** Google `--write` (Drive write scope). */
   write?: boolean
+  /** Google `--calendar` (read-only Calendar scope). */
+  calendar?: boolean
   /** Microsoft `--org-mode`. */
   orgMode?: boolean
   /** Override the CLI binary (tests / non-default install). */
@@ -95,6 +97,42 @@ export type SpawnRelay = (
   email: string,
   opts: SpawnRelayOpts,
 ) => RelayChild
+
+/**
+ * Build the `switchroom auth <provider> account add` argv the relay spawns.
+ *
+ * Pure + exported so the flag plumbing is unit-pinned: every opt-in flag
+ * the chat command accepts has to actually reach the CLI, and a flag that
+ * was NOT requested must never appear (the relay is the only path most
+ * operators use, so a dropped `--calendar` here is indistinguishable from
+ * the feature not existing, and a spurious one silently widens a grant).
+ */
+export function buildRelayArgs(
+  provider: LoopbackProvider,
+  email: string,
+  opts: SpawnRelayOpts,
+): string[] {
+  return provider === 'google'
+    ? [
+        'auth',
+        'google',
+        'account',
+        'add',
+        email,
+        ...(opts.replace ? ['--replace'] : []),
+        ...(opts.write ? ['--write'] : []),
+        ...(opts.calendar ? ['--calendar'] : []),
+      ]
+    : [
+        'auth',
+        'microsoft',
+        'account',
+        'add',
+        email,
+        ...(opts.replace ? ['--replace'] : []),
+        ...(opts.orgMode ? ['--org-mode'] : []),
+      ]
+}
 
 /**
  * Default spawn: the real `switchroom` CLI, stdout+stderr piped, stdin
@@ -109,26 +147,7 @@ export function defaultSpawnRelay(
   opts: SpawnRelayOpts,
 ): RelayChild {
   const binary = opts.binary ?? 'switchroom'
-  const args =
-    provider === 'google'
-      ? [
-          'auth',
-          'google',
-          'account',
-          'add',
-          email,
-          ...(opts.replace ? ['--replace'] : []),
-          ...(opts.write ? ['--write'] : []),
-        ]
-      : [
-          'auth',
-          'microsoft',
-          'account',
-          'add',
-          email,
-          ...(opts.replace ? ['--replace'] : []),
-          ...(opts.orgMode ? ['--org-mode'] : []),
-        ]
+  const args = buildRelayArgs(provider, email, opts)
   const child: ChildProcess = spawn(binary, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {

@@ -253,3 +253,61 @@ describe("interpretRefGetResult", () => {
     expect(v.message).toContain("scope excludes operator");
   });
 });
+
+
+describe("buildScopeReconsentRequiredError — never a silent no-op", () => {
+  const { buildScopeReconsentRequiredError } = _testing;
+
+  it("names the missing scope and prints the exact --replace command", () => {
+    const msg = buildScopeReconsentRequiredError("you@example.com", [
+      "calendar",
+    ]);
+    expect(msg).toContain("you@example.com");
+    expect(msg).toContain("calendar.readonly");
+    expect(msg).toContain("already registered");
+    expect(msg).toContain(
+      "switchroom auth google account add you@example.com --replace --calendar",
+    );
+  });
+
+  it("explains WHY (scopes fixed at consent time) so the operator can recover", () => {
+    const msg = buildScopeReconsentRequiredError("a@b.com", ["calendar"]);
+    expect(msg).toContain("fixed at consent time");
+  });
+
+  it("reassures that existing scopes are carried forward, not dropped", () => {
+    const msg = buildScopeReconsentRequiredError("a@b.com", ["calendar"]);
+    expect(msg).toMatch(/carried forward/i);
+  });
+
+  it("lists every newly-requested capability in one command", () => {
+    const msg = buildScopeReconsentRequiredError("a@b.com", [
+      "write",
+      "calendar",
+    ]);
+    expect(msg).toContain("drive.file, calendar.readonly");
+    expect(msg).toContain("--replace --write --calendar");
+  });
+});
+
+describe("buildCarryForwardNotices — carry-forward is announced, not silent", () => {
+  const { buildCarryForwardNotices } = _testing;
+
+  it("nothing carried → no notices", () => {
+    expect(buildCarryForwardNotices([])).toEqual([]);
+  });
+
+  it("names the scope, the flag that was omitted, and the consequence", () => {
+    const [line] = buildCarryForwardNotices(["write"]);
+    expect(line).toContain("drive.file");
+    expect(line).toContain("--write");
+    expect(line).toMatch(/revoke/i);
+  });
+
+  it("emits one notice per carried capability", () => {
+    const lines = buildCarryForwardNotices(["write", "calendar"]);
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain("calendar.readonly");
+    expect(lines[1]).toContain("--calendar");
+  });
+});

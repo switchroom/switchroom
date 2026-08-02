@@ -602,7 +602,7 @@ function registerAccountAdd(accountParent: Command): void {
   accountParent
     .command("add <account>")
     .description(
-      "Mint a Google OAuth refresh token for <account> and register it with the auth-broker. For Drive scopes the effective flow is desktop-loopback (device-code returns invalid_scope for Drive; OOB is retired) — use a Desktop OAuth client; on a headless host complete the browser step over an SSH port-forward. Add --write for create/edit (drive.file); default is read-only.",
+      "Mint a Google OAuth refresh token for <account> and register it with the auth-broker. For Drive scopes the effective flow is desktop-loopback (device-code returns invalid_scope for Drive; OOB is retired) — use a Desktop OAuth client; on a headless host complete the browser step over an SSH port-forward. Add --write for create/edit (drive.file) and --calendar for read-only Calendar; default is Drive read-only.",
     )
     .option(
       "--replace",
@@ -614,16 +614,29 @@ function registerAccountAdd(accountParent: Command): void {
       "Request Drive WRITE scope (drive.file: create + edit app-created files) in addition to read. Default is read-only — a read grant never silently becomes a write grant. Re-consent an existing account with `--replace --write`.",
       false,
     )
+    .option(
+      "--calendar",
+      "Request READ-ONLY Calendar scope (calendar.readonly) so the gdrive MCP's list_calendars / get_events tools authenticate. Opt-in — no tier grants it by default, and switchroom never requests a Calendar WRITE scope. Re-consent an existing account with `--replace --calendar`.",
+      false,
+    )
     .action(
       withConfigError(
-        async (account: string, opts: { replace?: boolean; write?: boolean }) => {
+        async (
+          account: string,
+          opts: { replace?: boolean; write?: boolean; calendar?: boolean },
+        ) => {
         const normalizedAccount = validateAndNormalizeAccountEmail(account);
 
         // Lazy-import the OAuth flow + vault resolver — they pull in
         // sizeable trees (Drive scaffolding, AES vault) that the
         // sibling enable/disable/list verbs don't need.
         const [
-          { runDriveOAuthFlow, selectGoogleWorkspaceScopes },
+          {
+            runDriveOAuthFlow,
+            selectGoogleWorkspaceScopes,
+            capabilitiesFromScopeString,
+            resolveReconsentCapabilities,
+          },
           { selectInitialTier },
           { brokerCall },
           { loadConfig, resolvePath },
@@ -757,8 +770,43 @@ function registerAccountAdd(accountParent: Command): void {
         // (instead of advertising Slides/Docs/Sheets tools that 403 and
         // trigger upstream's doomed port-8000 OAuth fallback).
         const tier = gw.tier ?? "core";
+
+        // Re-consent safety — opt-in capability carry-forward. OAuth
+        // scopes are fixed at consent time, so `--replace` mints EXACTLY
+        // the set the flags describe: re-consenting for an unrelated
+        // reason without re-passing `--write` used to silently strip
+        // `drive.file`. Read what the broker already holds and union the
+        // opt-in capabilities forward, reporting the carry-forward out
+        // loud. The union only flows old → new, so nothing widens.
+        //
+        // The broker is already a hard dependency of this command (the
+        // final `addAccount` goes through it), so reading it up front
+        // costs nothing and fails BEFORE a consent is burned rather than
+        // after.
+        const existingEntry = (
+          await brokerCall(async (client) => client.listGoogleAccounts())
+        ).accounts.find((a) => a.account === normalizedAccount);
+        const plan = resolveReconsentCapabilities(
+          { write: opts.write ?? false, calendar: opts.calendar ?? false },
+          existingEntry
+            ? capabilitiesFromScopeString(existingEntry.scope)
+            : undefined,
+        );
+
+        // Asking for a NEW capability on an already-registered account
+        // WITHOUT `--replace` cannot do anything: the broker refuses the
+        // overwrite and the stored token keeps its old, narrower scopes.
+        // Say that plainly instead of letting it surface as a generic
+        // "already registered" collision the operator reads as success.
+        if (existingEntry && !opts.replace && plan.added.length > 0) {
+          throw new Error(
+            buildScopeReconsentRequiredError(normalizedAccount, plan.added),
+          );
+        }
+
         const accountScopes = selectGoogleWorkspaceScopes({
-          write: opts.write ?? false,
+          write: plan.effective.write,
+          calendar: plan.effective.calendar,
           tier,
         });
         const oauthCfg = {
@@ -766,12 +814,22 @@ function registerAccountAdd(accountParent: Command): void {
           client_secret: clientSecretRaw,
           scopes: accountScopes,
         };
-        if (opts.write) {
+        if (plan.effective.write) {
           console.log(
             chalk.yellow(
               "  Requesting Drive WRITE scope (drive.file — create/edit app-created files).",
             ),
           );
+        }
+        if (plan.effective.calendar) {
+          console.log(
+            chalk.yellow(
+              "  Requesting Calendar READ-ONLY scope (calendar.readonly — list calendars, read events).",
+            ),
+          );
+        }
+        for (const line of buildCarryForwardNotices(plan.carried)) {
+          console.log(chalk.gray(line));
         }
         console.log(
           chalk.gray(
@@ -871,6 +929,81 @@ function registerAccountAdd(accountParent: Command): void {
         console.log();
       }),
     );
+}
+
+// ── Opt-in capability messaging (pure, unit-pinned) ─────────────────────
+
+/** CLI flag / scope / prose for each opt-in capability. */
+const CAPABILITY_LABELS: Record<
+  "write" | "calendar",
+  { flag: string; scope: string; summary: string }
+> = {
+  write: {
+    flag: "--write",
+    scope: "drive.file",
+    summary: "Drive write (create + edit app-created files)",
+  },
+  calendar: {
+    flag: "--calendar",
+    scope: "calendar.readonly",
+    summary: "Calendar read-only (list calendars, read events)",
+  },
+};
+
+/**
+ * Error text for "you asked for a new scope on an account that is
+ * already registered, but did not pass `--replace`".
+ *
+ * Without this the command hits the broker's generic already-registered
+ * refusal, which says nothing about scopes — and the operator reasonably
+ * concludes the flag was applied. OAuth scopes are fixed at consent
+ * time: the ONLY way an existing account gains a scope is a fresh
+ * consent.
+ *
+ * Exported so the wording contract is unit-pinned.
+ */
+export function buildScopeReconsentRequiredError(
+  account: string,
+  added: ("write" | "calendar")[],
+): string {
+  const flags = added.map((k) => CAPABILITY_LABELS[k].flag);
+  const scopes = added.map((k) => CAPABILITY_LABELS[k].scope).join(", ");
+  return [
+    `'${account}' is already registered with the auth-broker, and its stored ` +
+      `token does not carry ${scopes}.`,
+    "",
+    "OAuth scopes are fixed at consent time — a stored token cannot be",
+    "widened in place. Re-consent to mint a new token that includes it:",
+    "",
+    `  switchroom auth google account add ${account} --replace ${flags.join(" ")}`,
+    "",
+    "Scopes the account already holds are carried forward automatically,",
+    "so re-consenting will not drop existing capabilities.",
+  ].join("\n");
+}
+
+/**
+ * Operator-facing notices for capabilities carried forward from the
+ * existing token because the operator did not re-pass their flag.
+ *
+ * The carry-forward is deliberately never silent: it changes the scope
+ * set actually sent to Google relative to the flags typed, so the
+ * operator has to be able to see it before the consent screen and know
+ * why.
+ *
+ * Exported so the wording contract is unit-pinned.
+ */
+export function buildCarryForwardNotices(
+  carried: ("write" | "calendar")[],
+): string[] {
+  return carried.map((k) => {
+    const { flag, scope, summary } = CAPABILITY_LABELS[k];
+    return (
+      `  Carrying forward ${summary} — the existing token holds ${scope}, ` +
+      `so it is re-requested even though ${flag} was not passed ` +
+      `(re-consent would otherwise silently revoke it).`
+    );
+  });
 }
 
 /**
@@ -1292,6 +1425,8 @@ export const _testing = {
   expandAllAgents,
   buildGoogleCredentials,
   oauthClientSetupGuidance,
+  buildScopeReconsentRequiredError,
+  buildCarryForwardNotices,
   interpretConnectPutResult,
   interpretRefGetResult,
 };

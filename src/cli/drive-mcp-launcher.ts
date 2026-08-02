@@ -268,6 +268,48 @@ export function findMissingWorkspaceScopes(
 const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
 
 /**
+ * The Calendar READ scope minted by `auth google account add --calendar`.
+ * Mirrors `GOOGLE_CALENDAR_READONLY_SCOPE` in src/cli/drive.ts —
+ * duplicated here for the same reason as
+ * {@link requiredWorkspaceScopesForTier} (keep the launcher's hot path
+ * free of the drive.ts import tree). A launcher unit test asserts the
+ * two literals are identical.
+ */
+export const CALENDAR_READONLY_SCOPE =
+  "https://www.googleapis.com/auth/calendar.readonly";
+
+/** Opt-in capabilities an already-minted seed token may carry. */
+export interface SeedOptInCapabilities {
+  /** `--write` → `drive.file`. */
+  write: boolean;
+  /** `--calendar` → `calendar.readonly`. */
+  calendar: boolean;
+}
+
+/**
+ * Read the opt-in capabilities out of a seed token's scope string, so
+ * {@link buildMissingScopeWarning} can carry every one of them into the
+ * recovery command it prints.
+ *
+ * Pure + exported — this is the "never print a command that downgrades
+ * the operator" guard, so it is unit-pinned separately.
+ */
+export function seedOptInCapabilities(
+  seedScope: string,
+): SeedOptInCapabilities {
+  const have = new Set(
+    seedScope
+      .split(/\s+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+  return {
+    write: have.has(DRIVE_FILE_SCOPE),
+    calendar: have.has(CALENDAR_READONLY_SCOPE),
+  };
+}
+
+/**
  * Build the operator-facing warning shown when the seed token is
  * missing scopes the requested tier needs (issue #1663). The launcher
  * still spawns upstream — Drive tools and any in-scope Workspace tools
@@ -275,24 +317,37 @@ const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file";
  * loud and tells the operator exactly how to fix it, instead of the
  * silent doomed port-8000 fallback.
  *
- * `hasWriteScope` MUST reflect the EXISTING token's scopes (whether the
- * current credential already carries `drive.file`), NOT the `missing`
+ * `granted` MUST reflect the EXISTING token's scopes, NOT the `missing`
  * set. `missing` only ever holds Docs/Sheets/Slides scopes — never
- * `drive.file` — so deriving the recovery command's `--write` suffix
- * from `missing` would always drop it, and an operator with a
- * write-capable token who runs the printed command verbatim would
- * silently downgrade to a read-only token and lose Drive file creation
- * that previously worked. Carry the existing write capability forward.
+ * `drive.file` or `calendar.readonly` — so deriving the recovery
+ * command's opt-in suffixes from `missing` would always drop them, and
+ * an operator with a write-capable (or calendar-enabled) token who runs
+ * the printed command verbatim would silently downgrade and lose
+ * capability that previously worked. Carry them forward.
+ *
+ * (`account add` also unions existing capabilities forward on its own
+ * now, so this is belt-and-braces — but the printed command still has to
+ * read correctly on its own.)
  */
 export function buildMissingScopeWarning(
   missing: string[],
   tier: string | undefined,
   accountEmail: string,
-  hasWriteScope: boolean,
+  granted: SeedOptInCapabilities,
 ): string {
   const short = missing
     .map((s) => s.replace(/^https:\/\/www\.googleapis\.com\/auth\//, ""))
     .join(", ");
+  const suffix =
+    (granted.write ? " --write" : "") + (granted.calendar ? " --calendar" : "");
+  const preserved = [
+    granted.write
+      ? "--write preserves the existing Drive write capability"
+      : "",
+    granted.calendar
+      ? "--calendar preserves the existing Calendar read capability"
+      : "",
+  ].filter((s) => s.length > 0);
   return (
     `drive-mcp-launcher: WARNING — the Google account '${accountEmail}' was ` +
     `consented WITHOUT the scope(s) needed for tier '${tier ?? "core"}': ` +
@@ -301,10 +356,10 @@ export function buildMissingScopeWarning(
     `to authenticate. OAuth scopes are fixed at consent time — re-run on the ` +
     `host to re-mint the token with the correct scopes:\n` +
     `    switchroom auth google account add ${accountEmail} --replace` +
-    `${hasWriteScope ? " --write" : ""}\n` +
+    `${suffix}\n` +
     `  (scopes are derived from \`google_workspace.tier\` — set the tier ` +
-    `before re-running${hasWriteScope ? "; --write preserves the existing " +
-    "Drive write capability" : ""}). Drive read/file tools are unaffected.\n`
+    `before re-running${preserved.length > 0 ? "; " + preserved.join("; ") : ""}` +
+    `). Drive read/file tools are unaffected.\n`
   );
 }
 
@@ -824,21 +879,17 @@ export async function runDriveMcpLauncher(opts: {
   // than refusing to start.
   const missingScopes = findMissingWorkspaceScopes(brokerCreds.scope, tier);
   if (missingScopes.length > 0) {
-    // Decide the recovery command's --write suffix from the EXISTING
+    // Decide the recovery command's opt-in suffixes from the EXISTING
     // token's scopes — NOT from `missingScopes` (which never contains
-    // drive.file). A token that already carries drive.file was minted
-    // write-capable; the printed `account add --replace` must keep
-    // --write or the operator silently downgrades to read-only.
-    const hasWriteScope = brokerCreds.scope
-      .split(/\s+/)
-      .map((s) => s.trim())
-      .includes(DRIVE_FILE_SCOPE);
+    // drive.file or calendar.readonly). A token that already carries
+    // those was minted with them; the printed `account add --replace`
+    // must keep the matching flags or the operator silently downgrades.
     process.stderr.write(
       buildMissingScopeWarning(
         missingScopes,
         tier,
         brokerCreds.accountEmail,
-        hasWriteScope,
+        seedOptInCapabilities(brokerCreds.scope),
       ),
     );
   }

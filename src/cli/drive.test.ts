@@ -46,6 +46,9 @@ import {
   GOOGLE_DOCS_SCOPE,
   GOOGLE_SHEETS_SCOPE,
   GOOGLE_SLIDES_SCOPE,
+  GOOGLE_CALENDAR_READONLY_SCOPE,
+  capabilitiesFromScopeString,
+  resolveReconsentCapabilities,
   type DriveCliDeps,
 } from "./drive.js";
 import type { WaitForApprovalResult } from "../vault/approvals/wait.js";
@@ -546,5 +549,239 @@ describe("selectGoogleWorkspaceScopes (issue #1663)", () => {
       const s = selectGoogleWorkspaceScopes({ write: true, tier });
       expect(s).not.toContain("https://www.googleapis.com/auth/drive");
     }
+  });
+});
+
+
+// ── Calendar read-only, opt-in (gdrive list_calendars / get_events) ──────
+
+describe("GOOGLE_CALENDAR_READONLY_SCOPE", () => {
+  it("is the READ-ONLY calendar scope, never the read/write ones", () => {
+    expect(GOOGLE_CALENDAR_READONLY_SCOPE).toBe(
+      "https://www.googleapis.com/auth/calendar.readonly",
+    );
+    // Guards against a careless "just drop .readonly" edit: the
+    // read/write `calendar` and `calendar.events` scopes are deliberately
+    // never offered by any switchroom code path.
+    expect(GOOGLE_CALENDAR_READONLY_SCOPE).not.toBe(
+      "https://www.googleapis.com/auth/calendar",
+    );
+    expect(GOOGLE_CALENDAR_READONLY_SCOPE).toMatch(/\.readonly$/);
+  });
+});
+
+describe("selectGoogleWorkspaceScopes — --calendar is opt-in", () => {
+  const cal = GOOGLE_CALENDAR_READONLY_SCOPE;
+
+  // The full flag matrix, asserting the EXACT emitted scope set — not
+  // just "contains", so an accidental extra scope fails too.
+  const drive = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+  ];
+  const driveFile = "https://www.googleapis.com/auth/drive.file";
+  const docs = [GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE];
+
+  it("write=false calendar=false → Drive read + Docs/Sheets only", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: false, calendar: false, tier: "core" }),
+    ).toEqual([...drive, ...docs]);
+  });
+
+  it("write=false calendar=true → adds ONLY calendar.readonly", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: false, calendar: true, tier: "core" }),
+    ).toEqual([...drive, ...docs, cal]);
+  });
+
+  it("write=true calendar=false → adds ONLY drive.file", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: true, calendar: false, tier: "core" }),
+    ).toEqual([...drive, driveFile, ...docs]);
+  });
+
+  it("write=true calendar=true → both opt-ins, nothing else", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: true, calendar: true, tier: "core" }),
+    ).toEqual([...drive, driveFile, ...docs, cal]);
+  });
+
+  it("omitting `calendar` behaves exactly as calendar:false (no silent widening)", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      for (const write of [false, true]) {
+        expect(selectGoogleWorkspaceScopes({ write, tier })).toEqual(
+          selectGoogleWorkspaceScopes({ write, calendar: false, tier }),
+        );
+      }
+    }
+  });
+
+  it("NO tier grants calendar by default — the whole point of opt-in", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      for (const write of [false, true]) {
+        expect(
+          selectGoogleWorkspaceScopes({ write, calendar: false, tier }),
+        ).not.toContain(cal);
+      }
+    }
+  });
+
+  it("--calendar never implies --write, and vice versa", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: false, calendar: true, tier: "complete" }),
+    ).not.toContain(driveFile);
+    expect(
+      selectGoogleWorkspaceScopes({ write: true, calendar: false, tier: "complete" }),
+    ).not.toContain(cal);
+  });
+
+  it("--calendar never pulls in a calendar WRITE scope", () => {
+    const s = selectGoogleWorkspaceScopes({
+      write: true,
+      calendar: true,
+      tier: "complete",
+    });
+    expect(s).not.toContain("https://www.googleapis.com/auth/calendar");
+    expect(s).not.toContain("https://www.googleapis.com/auth/calendar.events");
+    expect(s.filter((x) => x.includes("calendar"))).toEqual([cal]);
+  });
+
+  it("emits no duplicates with every flag on", () => {
+    const s = selectGoogleWorkspaceScopes({
+      write: true,
+      calendar: true,
+      tier: "extended",
+    });
+    expect(new Set(s).size).toBe(s.length);
+  });
+});
+
+describe("capabilitiesFromScopeString", () => {
+  const cal = GOOGLE_CALENDAR_READONLY_SCOPE;
+  const driveFile = "https://www.googleapis.com/auth/drive.file";
+
+  it("reads both opt-ins off a real broker scope string", () => {
+    expect(
+      capabilitiesFromScopeString(
+        `https://www.googleapis.com/auth/drive.readonly ${driveFile} ${cal}`,
+      ),
+    ).toEqual({ write: true, calendar: true });
+  });
+
+  it("read-only token → no capabilities", () => {
+    expect(
+      capabilitiesFromScopeString(
+        "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/documents",
+      ),
+    ).toEqual({ write: false, calendar: false });
+  });
+
+  it("empty / whitespace scope string → no capabilities (no crash)", () => {
+    expect(capabilitiesFromScopeString("")).toEqual({
+      write: false,
+      calendar: false,
+    });
+    expect(capabilitiesFromScopeString("   \n  ")).toEqual({
+      write: false,
+      calendar: false,
+    });
+  });
+
+  it("a calendar WRITE scope does not count as calendar read capability", () => {
+    expect(
+      capabilitiesFromScopeString("https://www.googleapis.com/auth/calendar"),
+    ).toEqual({ write: false, calendar: false });
+  });
+});
+
+describe("resolveReconsentCapabilities — no drop, no silent widening", () => {
+  const cal = GOOGLE_CALENDAR_READONLY_SCOPE;
+  const driveFile = "https://www.googleapis.com/auth/drive.file";
+  const READ_ONLY = "https://www.googleapis.com/auth/drive.readonly";
+
+  it("fresh account (no existing token) → flags used verbatim", () => {
+    expect(
+      resolveReconsentCapabilities({ write: false, calendar: true }),
+    ).toEqual({
+      effective: { write: false, calendar: true },
+      carried: [],
+      added: [],
+    });
+  });
+
+  it("re-consent with --calendar keeps an existing write grant (no drop)", () => {
+    // The regression this guards: `--replace --calendar` on a
+    // write-capable account used to mint a token WITHOUT drive.file,
+    // silently revoking doc creation that previously worked.
+    const plan = resolveReconsentCapabilities(
+      { write: false, calendar: true },
+      capabilitiesFromScopeString(`${READ_ONLY} ${driveFile}`),
+    );
+    expect(plan.effective).toEqual({ write: true, calendar: true });
+    expect(plan.carried).toEqual(["write"]);
+    expect(plan.added).toEqual(["calendar"]);
+  });
+
+  it("carried capability reaches the emitted scope set, not just the plan", () => {
+    // End-to-end on the two pure functions the CLI actually composes —
+    // a plan that says "write" but a scope set that omits drive.file
+    // would still ship the bug.
+    const plan = resolveReconsentCapabilities(
+      { write: false, calendar: true },
+      capabilitiesFromScopeString(`${READ_ONLY} ${driveFile}`),
+    );
+    const scopes = selectGoogleWorkspaceScopes({
+      write: plan.effective.write,
+      calendar: plan.effective.calendar,
+      tier: "core",
+    });
+    expect(scopes).toContain(driveFile);
+    expect(scopes).toContain(cal);
+  });
+
+  it("re-consent with NO flags on a fully-capable token drops nothing", () => {
+    const plan = resolveReconsentCapabilities(
+      { write: false, calendar: false },
+      capabilitiesFromScopeString(`${driveFile} ${cal}`),
+    );
+    expect(plan.effective).toEqual({ write: true, calendar: true });
+    expect(plan.carried).toEqual(["write", "calendar"]);
+    expect(plan.added).toEqual([]);
+  });
+
+  it("does NOT widen: a read-only token re-consented with no flags stays read-only", () => {
+    const plan = resolveReconsentCapabilities(
+      { write: false, calendar: false },
+      capabilitiesFromScopeString(READ_ONLY),
+    );
+    expect(plan.effective).toEqual({ write: false, calendar: false });
+    expect(plan.carried).toEqual([]);
+    expect(plan.added).toEqual([]);
+    expect(
+      selectGoogleWorkspaceScopes({ ...plan.effective, tier: "complete" }),
+    ).not.toContain(cal);
+  });
+
+  it("does NOT widen: --calendar on a read-only token adds calendar only", () => {
+    const plan = resolveReconsentCapabilities(
+      { write: false, calendar: true },
+      capabilitiesFromScopeString(READ_ONLY),
+    );
+    expect(plan.effective).toEqual({ write: false, calendar: true });
+    expect(plan.added).toEqual(["calendar"]);
+    expect(
+      selectGoogleWorkspaceScopes({ ...plan.effective, tier: "core" }),
+    ).not.toContain(driveFile);
+  });
+
+  it("re-requesting a capability already held is not reported as added", () => {
+    // `added` drives the "you need --replace" error; an operator who
+    // re-passes a flag they already hold must not be told to re-consent.
+    const plan = resolveReconsentCapabilities(
+      { write: true, calendar: true },
+      capabilitiesFromScopeString(`${driveFile} ${cal}`),
+    );
+    expect(plan.added).toEqual([]);
+    expect(plan.carried).toEqual([]);
   });
 });

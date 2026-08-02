@@ -22,6 +22,7 @@ import { describe, it, expect } from 'vitest'
 import { EventEmitter } from 'node:events'
 
 import {
+  buildRelayArgs,
   parseLoopbackRedirect,
   extractConsentUrl,
   parseConsentUrl,
@@ -492,6 +493,7 @@ describe('parseAuthCommand — provider verbs (#2582)', () => {
       email: 'user@example.com',
       replace: false,
       write: false,
+      calendar: false,
       orgMode: false,
     })
   })
@@ -499,6 +501,26 @@ describe('parseAuthCommand — provider verbs (#2582)', () => {
   it('parses google flags --replace --write', () => {
     const p = parseAuthCommand('/auth google add user@example.com --replace --write')
     expect(p).toMatchObject({ kind: 'provider-add', replace: true, write: true })
+  })
+
+  it('parses google --calendar, and it does not imply --write', () => {
+    const p = parseAuthCommand('/auth google add user@example.com --replace --calendar')
+    expect(p).toMatchObject({
+      kind: 'provider-add',
+      replace: true,
+      calendar: true,
+      write: false,
+    })
+  })
+
+  it('parses --write and --calendar together', () => {
+    const p = parseAuthCommand('/auth google add user@example.com --write --calendar')
+    expect(p).toMatchObject({ kind: 'provider-add', write: true, calendar: true })
+  })
+
+  it('--calendar is google-only — microsoft rejects it as an unknown flag', () => {
+    const p = parseAuthCommand('/auth microsoft add user@corp.com --calendar')
+    expect(p).toMatchObject({ kind: 'help' })
   })
 
   it('parses /auth microsoft add with --org-mode', () => {
@@ -529,5 +551,41 @@ describe('parseAuthCommand — provider verbs (#2582)', () => {
   it('does not treat --write as a Microsoft flag', () => {
     const p = parseAuthCommand('/auth microsoft add user@corp.com --write')
     expect(p).toMatchObject({ kind: 'help' })
+  })
+})
+
+
+describe('buildRelayArgs — chat flags actually reach the CLI', () => {
+  it('bare google add: no opt-in flags', () => {
+    expect(buildRelayArgs('google', 'a@b.com', {})).toEqual([
+      'auth', 'google', 'account', 'add', 'a@b.com',
+    ])
+  })
+
+  it('forwards --calendar', () => {
+    expect(buildRelayArgs('google', 'a@b.com', { calendar: true })).toEqual([
+      'auth', 'google', 'account', 'add', 'a@b.com', '--calendar',
+    ])
+  })
+
+  it('forwards --replace --write --calendar together, in order', () => {
+    expect(
+      buildRelayArgs('google', 'a@b.com', {
+        replace: true,
+        write: true,
+        calendar: true,
+      }),
+    ).toEqual([
+      'auth', 'google', 'account', 'add', 'a@b.com',
+      '--replace', '--write', '--calendar',
+    ])
+  })
+
+  it('--calendar never leaks into the microsoft argv', () => {
+    expect(
+      buildRelayArgs('microsoft', 'a@corp.com', { calendar: true, orgMode: true }),
+    ).toEqual([
+      'auth', 'microsoft', 'account', 'add', 'a@corp.com', '--org-mode',
+    ])
   })
 })

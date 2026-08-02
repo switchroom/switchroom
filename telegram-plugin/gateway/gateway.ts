@@ -20738,7 +20738,7 @@ bot.command("auth", async ctx => {
       const { consentUrl, state, port, child } = await startLoopbackFlow(
         parsed.provider,
         parsed.email,
-        { replace: parsed.replace, write: parsed.write, orgMode: parsed.orgMode },
+        { replace: parsed.replace, write: parsed.write, calendar: parsed.calendar, orgMode: parsed.orgMode },
       )
       const newFlow = {
         provider: parsed.provider,

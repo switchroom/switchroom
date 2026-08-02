@@ -202,6 +202,7 @@ holds (or will hold) the grant:
 /auth google add you@gmail.com            # add or re-auth
 /auth google add you@gmail.com --replace  # re-consent an existing account
 /auth google add you@gmail.com --write    # request Drive write scope
+/auth google add you@gmail.com --calendar # request read-only Calendar scope
 ```
 
 The agent runs the loopback flow **in its own container**, relays the
@@ -242,6 +243,49 @@ unrelated Drive files (that would be the full `drive` scope, which
 switchroom deliberately does not request). It does **not** change
 behaviour for read-only accounts.
 
+#### Calendar is read-only and opt-in
+
+The `gdrive` MCP exposes Calendar tools (`list_calendars`, `get_events`)
+at **every** tier, but the token switchroom mints carries no Calendar
+scope by default, so those tools 403 — and the upstream MCP then falls
+back to its own browser OAuth, which cannot complete inside a container.
+
+Pass `--calendar` to mint `calendar.readonly` alongside the Drive scopes:
+
+```bash
+switchroom auth google account add you@gmail.com --calendar
+# add Calendar read to an already-connected account (re-consent):
+switchroom auth google account add you@gmail.com --replace --calendar
+```
+
+Two deliberate limits:
+
+- **Read-only only.** `calendar.readonly` lists calendars and reads
+  events. switchroom never requests the read/write `calendar` or
+  `calendar.events` scopes — creating or moving events is a write
+  surface with its own approval shape (same argument RFC G §5 makes
+  about Gmail).
+- **Never a tier default.** No tier grants Calendar. Folding it into a
+  tier's default set would mean an operator re-minting after an
+  unrelated tier bump silently hands over their whole calendar — a read
+  grant must never silently widen (RFC D §12), which is exactly why
+  `--write` is a flag too.
+
+#### Re-consent carries existing scopes forward
+
+OAuth scopes are fixed at consent time, so `--replace` mints exactly the
+set the flags describe. To stop an unrelated re-consent from silently
+revoking capability, `account add` reads the scopes the broker already
+holds for the account and **unions the opt-ins forward**: re-running
+with `--replace --calendar` on a write-capable account keeps
+`drive.file`, and prints a line saying so. The union only flows one way
+— a capability you did not ask for and the token does not already hold
+is never requested.
+
+Asking for a scope the stored token lacks *without* `--replace` is
+refused with an explicit "scopes are fixed at consent time, re-consent
+like this" error rather than appearing to succeed.
+
 #### Workspace API scopes are tied to the tier
 
 Creating or editing **native Google Docs / Sheets / Slides** needs
@@ -258,10 +302,11 @@ the `tier`** in your `google_workspace:` block:
 | `complete` | `documents`, `spreadsheets`, `presentations` |
 
 `presentations` (Slides) is added at `extended`/`complete` because
-Slides tools first appear at the `extended` tier. Calendar / Forms /
-Tasks / Chat / Gmail scopes are **not** minted — that is a separate,
-larger decision (Gmail in particular has an unresolved approval shape;
-see RFC G §5).
+Slides tools first appear at the `extended` tier. Forms / Tasks / Chat /
+Gmail scopes are **not** minted — that is a separate, larger decision
+(Gmail in particular has an unresolved approval shape; see RFC G §5).
+Calendar is available, but only read-only and only via the explicit
+`--calendar` flag — never as a tier default (see above).
 
 **Changing the tier requires re-running `account add`.** OAuth scopes
 are fixed at consent time — raising `tier: core` → `tier: extended`
@@ -269,7 +314,7 @@ does **not** retroactively widen an already-minted token. After a tier
 change, re-mint:
 
 ```bash
-switchroom auth google account add you@gmail.com --replace [--write]
+switchroom auth google account add you@gmail.com --replace [--write] [--calendar]
 ```
 
 If you skip the re-mint, the `gdrive` MCP launcher prints a loud
