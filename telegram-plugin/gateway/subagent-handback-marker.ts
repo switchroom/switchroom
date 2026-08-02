@@ -176,6 +176,11 @@ export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion
   mental_model_proposal_failed: { decoupledCompletion: false },
   webhook: { decoupledCompletion: false },
   linear: { decoupledCompletion: false },
+  // Buzz co-channel (Phase 1): a Nostr kind:9 group message the buzz sidecar
+  // injects onto the gateway IPC queue as its OWN live inbound turn (anonymous
+  // inject, `meta.source="buzz"`) — never a decoupled completion resolving a
+  // different ended turn, so it must NOT stamp.
+  buzz: { decoupledCompletion: false },
 }
 
 /**
