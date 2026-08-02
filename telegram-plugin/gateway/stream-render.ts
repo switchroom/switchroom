@@ -77,6 +77,7 @@ import { FlushCompletionTracker } from '../flushed-turn-supersede.js'
 import { subagentReplyAuthority } from './subagent-reply-authority.js'
 import { sessionConsumeSignal } from './session-consume-signal.js'
 import { decideTerminalReason, deriveTurnRole } from '../turn-liveness-floor.js'
+import { parseChannelOrigin, isBuzzTurnRoutingEnabled } from './channel-route.js'
 import { chatKey, chatKeyWithSuffix } from './chat-key.js'
 import { deriveTurnId } from './derive-turn-id.js'
 import { EMISSION_AUTHORITY_ENABLED, EmissionAuthority } from './emission-authority.js'
@@ -150,6 +151,17 @@ const QUEUED_CARD_ENABLED = process.env.SWITCHROOM_QUEUED_CARD !== '0'
 const QUEUED_CARD_HTML = '⏳ Queued — waiting for the current task to finish…'
 const QUEUED_CARD_FOLDED_HTML = '✅ Folded into the current task.'
 const QUEUED_CARD_EXPIRED_HTML = '⚠️ This queued message timed out before it could start.'
+
+// Buzz co-channel — Phase 2a origin stamp gate (Finding 10). The per-turn
+// `parseChannelOrigin` call is invoked ONLY when BOTH hold:
+//   · BUZZ_ENABLED — the per-agent projection `src/agents/compose.ts` sets in
+//     the container env ONLY when `channels.buzz.enabled === true`; absent for
+//     every Telegram-only agent.
+//   · SWITCHROOM_BUZZ_TURN_ROUTING !== '0' — the Phase 2a kill switch.
+// When either is off, the ctor stamps a plain Telegram origin without ever
+// calling the parser, so the Telegram-only hot path is byte-for-byte unchanged.
+const BUZZ_ENABLED = process.env.BUZZ_ENABLED === '1' || process.env.BUZZ_ENABLED === 'true'
+const BUZZ_ORIGIN_STAMP_ACTIVE = BUZZ_ENABLED && isBuzzTurnRoutingEnabled()
 
 /** The `enqueue` envelope fields `beginTurn` needs — the SessionEvent minus its
  *  discriminant. A parked entry additionally carries `parkedAt` for the TTL. */
@@ -576,6 +588,15 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
       gatewayReceiveAt: startedAt,
       // #2527 — stamp the loop role once, from the enqueue envelope.
       role: deriveTurnRole(ev.rawContent),
+      // Buzz co-channel — Phase 2a. Stamp the immutable origin provenance once,
+      // from the same enqueue envelope. Gated (Finding 10): when Buzz is off for
+      // this agent (or the kill switch is set) the parser is never called and
+      // the turn defaults to a plain Telegram origin — no coords, hot path
+      // untouched. When active, `parseChannelOrigin` reads the outer channel
+      // tag's meta-hoisted `source="buzz"` + coords (see `channel-route.ts`).
+      ...(BUZZ_ORIGIN_STAMP_ACTIVE
+        ? parseChannelOrigin(ev.rawContent)
+        : { originChannel: 'telegram' as const }),
       // PR1 (cross-turn stale-card guard, §9 lever 4 / race C/D). Only a
       // synthetic represent/owed-reply turn carries this; a foreground turn
       // leaves it undefined and the cross-turn card-OPEN gate is inert.

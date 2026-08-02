@@ -3690,7 +3690,7 @@ export type CurrentTurn = {
   // registry's older entries (and any hand-built test turn) tolerate its
   // absence; `emissionAuthorityFor` lazily backfills one when missing.
   emissionAuthority?: EmissionAuthority
-}
+  originChannel: 'telegram' | 'buzz'; buzzCoords?: { channelId: string; eventId: string; threadRoot: string } } // Buzz Phase 2a: origin provenance stamped ONCE at the turn ctor via parseChannelOrigin(ev.rawContent) (channel-route.ts); buzzCoords present IFF originChannel==='buzz'. Types inlined + closing brace merged onto this line to hold gateway.ts at its zero-headroom anti-inflation ratchet (switchroom#2996); structurally identical to channel-route.ts Channel/BuzzCoords.
 
 // PR-4e — the singleton `currentTurn` is RETAINED as (a) the flag-OFF store and
 // (b) the flag-ON "most-recent-set" MIRROR. Every GLOBAL-liveness read in this
