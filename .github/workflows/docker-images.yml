@@ -224,7 +224,7 @@ jobs:
         # merge_group excluded: a queue run is validation-only and pushes
         # nothing, so it needs no registry credential.
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -340,7 +340,7 @@ jobs:
       # future edit from silently re-adding the action and reintroducing
       # a post-merge-only red.
       - name: Log in to GHCR
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -464,7 +464,7 @@ jobs:
         # merge_group excluded: a queue run is validation-only and pushes
         # nothing, so it needs no registry credential.
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -541,7 +541,7 @@ jobs:
       # job; see the full rationale on merge-base above. Enforced by
       # tests/docker/manifest-jobs-no-buildx.test.ts.
       - name: Log in to GHCR
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -629,7 +629,7 @@ jobs:
         # merge_group excluded: a queue run is validation-only and pushes
         # nothing, so it needs no registry credential.
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -741,7 +741,7 @@ jobs:
         # merge_group excluded: a queue run is validation-only and pushes
         # nothing, so it needs no registry credential.
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -832,7 +832,7 @@ jobs:
       # job; see the full rationale on merge-base above. Enforced by
       # tests/docker/manifest-jobs-no-buildx.test.ts.
       - name: Log in to GHCR
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -897,7 +897,7 @@ jobs:
         uses: ./.github/actions/setup-switchroom
 
       - name: Log in to GHCR (smoke pulls private images)
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -966,7 +966,7 @@ jobs:
       # job; see the full rationale on merge-base above. Enforced by
       # tests/docker/manifest-jobs-no-buildx.test.ts.
       - name: Log in to GHCR
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7  # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
