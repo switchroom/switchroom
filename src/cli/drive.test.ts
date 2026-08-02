@@ -47,6 +47,14 @@ import {
   GOOGLE_SHEETS_SCOPE,
   GOOGLE_SLIDES_SCOPE,
   GOOGLE_CALENDAR_READONLY_SCOPE,
+  GOOGLE_DOCS_READONLY_SCOPE,
+  GOOGLE_SHEETS_READONLY_SCOPE,
+  GOOGLE_SLIDES_READONLY_SCOPE,
+  GOOGLE_SERVICES,
+  parseServicesOption,
+  tierDefaultServices,
+  scopesForSelection,
+  resolveScopeSelection,
   capabilitiesFromScopeString,
   resolveReconsentCapabilities,
   type DriveCliDeps,
@@ -783,5 +791,354 @@ describe("resolveReconsentCapabilities — no drop, no silent widening", () => {
     );
     expect(plan.added).toEqual([]);
     expect(plan.carried).toEqual([]);
+  });
+});
+
+// ── v1 per-account READ-ONLY scope selection ─────────────────────────────
+
+const DRIVE_RO = [
+  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/drive.metadata.readonly",
+];
+const DRIVE_FILE = "https://www.googleapis.com/auth/drive.file";
+const CAL_RO = GOOGLE_CALENDAR_READONLY_SCOPE;
+
+describe("read-only Workspace scope constants", () => {
+  it("every readonly constant ends in .readonly and is not a write scope", () => {
+    for (const s of [
+      GOOGLE_DOCS_READONLY_SCOPE,
+      GOOGLE_SHEETS_READONLY_SCOPE,
+      GOOGLE_SLIDES_READONLY_SCOPE,
+    ]) {
+      expect(s).toMatch(/\.readonly$/);
+    }
+    expect(GOOGLE_DOCS_READONLY_SCOPE).toBe(
+      "https://www.googleapis.com/auth/documents.readonly",
+    );
+    expect(GOOGLE_SHEETS_READONLY_SCOPE).toBe(
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
+    );
+    expect(GOOGLE_SLIDES_READONLY_SCOPE).toBe(
+      "https://www.googleapis.com/auth/presentations.readonly",
+    );
+  });
+});
+
+describe("parseServicesOption", () => {
+  it("parses, de-dups, and canonicalizes order", () => {
+    expect(parseServicesOption("cal,drive,cal")).toEqual(["drive", "cal"]);
+    expect(parseServicesOption("slides, docs")).toEqual(["docs", "slides"]);
+  });
+
+  it("accepts 'calendar' as an alias for 'cal'", () => {
+    expect(parseServicesOption("calendar")).toEqual(["cal"]);
+  });
+
+  it("rejects an unknown service naming the full vocabulary", () => {
+    expect(() => parseServicesOption("gmail")).toThrow(/unknown service 'gmail'/);
+    expect(() => parseServicesOption("gmail")).toThrow(/cal, drive, docs, sheets, slides|drive, docs, sheets, slides, cal/);
+  });
+
+  it("rejects an empty list", () => {
+    expect(() => parseServicesOption(" , ")).toThrow(/at least one service/);
+  });
+});
+
+describe("tierDefaultServices", () => {
+  it("core → drive,docs,sheets; extended/complete add slides; cal NEVER default", () => {
+    expect(tierDefaultServices("core")).toEqual(["drive", "docs", "sheets"]);
+    expect(tierDefaultServices("extended")).toEqual([
+      "drive",
+      "docs",
+      "sheets",
+      "slides",
+    ]);
+    expect(tierDefaultServices("complete")).toEqual([
+      "drive",
+      "docs",
+      "sheets",
+      "slides",
+    ]);
+    for (const tier of ["core", "extended", "complete"] as const) {
+      expect(tierDefaultServices(tier)).not.toContain("cal");
+    }
+  });
+});
+
+describe("scopesForSelection — the readonly-aware service→scope map", () => {
+  it("readonly=true mints ZERO write scopes (exact set, full selection)", () => {
+    expect(
+      scopesForSelection({
+        readonly: true,
+        driveWrite: false,
+        services: ["drive", "docs", "sheets", "slides", "cal"],
+      }),
+    ).toEqual([
+      ...DRIVE_RO,
+      GOOGLE_DOCS_READONLY_SCOPE,
+      GOOGLE_SHEETS_READONLY_SCOPE,
+      GOOGLE_SLIDES_READONLY_SCOPE,
+      CAL_RO,
+    ]);
+  });
+
+  it("readonly=true ignores driveWrite — drive.file cannot leak into a read-only grant", () => {
+    const s = scopesForSelection({
+      readonly: true,
+      driveWrite: true,
+      services: ["drive", "docs"],
+    });
+    expect(s).toEqual([...DRIVE_RO, GOOGLE_DOCS_READONLY_SCOPE]);
+    expect(s).not.toContain(DRIVE_FILE);
+  });
+
+  it("readonly=false default selection reproduces today's scopes exactly", () => {
+    expect(
+      scopesForSelection({
+        readonly: false,
+        driveWrite: false,
+        services: ["drive", "docs", "sheets"],
+      }),
+    ).toEqual([...DRIVE_RO, GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE]);
+  });
+
+  it("cal alone mints ONLY calendar.readonly", () => {
+    expect(
+      scopesForSelection({ readonly: false, driveWrite: false, services: ["cal"] }),
+    ).toEqual([CAL_RO]);
+    // Even asking for write mints nothing extra — cal has no write scope.
+    expect(
+      scopesForSelection({ readonly: false, driveWrite: true, services: ["cal"] }),
+    ).toEqual([CAL_RO]);
+  });
+
+  it("no readonly selection ever contains a write scope, for every service subset", () => {
+    const writeScopes = [
+      DRIVE_FILE,
+      GOOGLE_DOCS_SCOPE,
+      GOOGLE_SHEETS_SCOPE,
+      GOOGLE_SLIDES_SCOPE,
+      "https://www.googleapis.com/auth/drive",
+      "https://www.googleapis.com/auth/calendar",
+      "https://www.googleapis.com/auth/calendar.events",
+    ];
+    // All 31 non-empty subsets of the 5 services.
+    for (let mask = 1; mask < 1 << GOOGLE_SERVICES.length; mask++) {
+      const services = GOOGLE_SERVICES.filter((_, i) => mask & (1 << i));
+      const s = scopesForSelection({
+        readonly: true,
+        driveWrite: true,
+        services,
+      });
+      for (const w of writeScopes) expect(s).not.toContain(w);
+    }
+  });
+});
+
+describe("selectGoogleWorkspaceScopes — readonly + services (v1)", () => {
+  it("readonly + write is a hard error", () => {
+    expect(() =>
+      selectGoogleWorkspaceScopes({ write: true, readonly: true, tier: "core" }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it("services: ['cal'] mints ONLY calendar.readonly", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: false, services: ["cal"], tier: "core" }),
+    ).toEqual([CAL_RO]);
+  });
+
+  it("readonly core default mints exactly the readonly variants", () => {
+    expect(
+      selectGoogleWorkspaceScopes({ write: false, readonly: true, tier: "core" }),
+    ).toEqual([
+      ...DRIVE_RO,
+      GOOGLE_DOCS_READONLY_SCOPE,
+      GOOGLE_SHEETS_READONLY_SCOPE,
+    ]);
+  });
+
+  it("omitting readonly/services is byte-identical to the pre-v1 behaviour", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      for (const write of [false, true]) {
+        for (const calendar of [false, true]) {
+          expect(
+            selectGoogleWorkspaceScopes({ write, calendar, tier }),
+          ).toEqual(
+            selectGoogleWorkspaceScopes({
+              write,
+              calendar,
+              tier,
+              readonly: false,
+              services: calendar
+                ? [...tierDefaultServices(tier), "cal"]
+                : tierDefaultServices(tier),
+            }),
+          );
+        }
+      }
+    }
+  });
+
+  it("input service order does not change the emitted set (canonical order)", () => {
+    expect(
+      selectGoogleWorkspaceScopes({
+        write: false,
+        services: ["cal", "sheets", "drive"],
+        tier: "core",
+      }),
+    ).toEqual(
+      selectGoogleWorkspaceScopes({
+        write: false,
+        services: ["drive", "sheets", "cal"],
+        tier: "core",
+      }),
+    );
+  });
+});
+
+describe("resolveScopeSelection — deterministic carry-forward (v1)", () => {
+  const NONE = { write: false, calendar: false };
+  const noFlags = {
+    readonly: false,
+    write: false,
+    calendar: false,
+    services: undefined,
+  };
+
+  it("readonly + write flags are a hard error", () => {
+    expect(() =>
+      resolveScopeSelection({
+        flags: { ...noFlags, readonly: true, write: true },
+        existing: NONE,
+        tier: "core",
+      }),
+    ).toThrow(/mutually exclusive/);
+  });
+
+  it("fresh add, no flags → tier default selection, nothing persisted", () => {
+    const plan = resolveScopeSelection({
+      flags: noFlags,
+      existing: NONE,
+      tier: "core",
+    });
+    expect(plan.selection).toEqual({
+      readonly: false,
+      services: ["drive", "docs", "sheets"],
+      driveWrite: false,
+    });
+    expect(plan.persist).toBeNull();
+    expect(plan.dropped).toEqual([]);
+  });
+
+  it("--replace with NO flags re-reads the persisted selection and does NOT re-widen", () => {
+    // The design's headline outcome: a read-only, service-narrowed
+    // account re-consented for an unrelated reason keeps its exact
+    // selection — the minted scope set carries zero write scopes.
+    const plan = resolveScopeSelection({
+      flags: noFlags,
+      persisted: { readonly: true, services: ["drive", "cal"] },
+      existing: NONE,
+      tier: "extended", // tier bump must NOT re-widen the selection
+      });
+    expect(plan.selection).toEqual({
+      readonly: true,
+      services: ["drive", "cal"],
+      driveWrite: false,
+    });
+    expect(plan.persist).toEqual({ readonly: true, services: ["drive", "cal"] });
+    expect(scopesForSelection(plan.selection)).toEqual([...DRIVE_RO, CAL_RO]);
+  });
+
+  it("--readonly on a token that carries drive.file DROPS write, loudly", () => {
+    const plan = resolveScopeSelection({
+      flags: { ...noFlags, readonly: true },
+      existing: { write: true, calendar: false },
+      tier: "core",
+    });
+    expect(plan.selection.readonly).toBe(true);
+    expect(plan.selection.driveWrite).toBe(false);
+    expect(plan.dropped.some((d) => d.includes("drive.file"))).toBe(true);
+    expect(scopesForSelection(plan.selection)).not.toContain(DRIVE_FILE);
+  });
+
+  it("--write on a persisted read-only record flips readonly off, loudly", () => {
+    const plan = resolveScopeSelection({
+      flags: { ...noFlags, write: true },
+      persisted: { readonly: true, services: ["drive", "docs"] },
+      existing: { write: true, calendar: false },
+      tier: "core",
+    });
+    expect(plan.selection.readonly).toBe(false);
+    expect(plan.selection.driveWrite).toBe(true);
+    expect(plan.dropped.some((d) => d.includes("read-only"))).toBe(true);
+  });
+
+  it("explicit --services narrows and announces every dropped service", () => {
+    const plan = resolveScopeSelection({
+      flags: { ...noFlags, services: ["drive"] },
+      persisted: { readonly: false, services: ["drive", "docs", "cal"] },
+      existing: NONE,
+      tier: "core",
+    });
+    expect(plan.selection.services).toEqual(["drive"]);
+    expect(plan.dropped.some((d) => d.includes("'docs'"))).toBe(true);
+    expect(plan.dropped.some((d) => d.includes("'cal'"))).toBe(true);
+  });
+
+  it("legacy token with calendar capability, no persisted record → cal carried, nothing persisted... unless flags say otherwise", () => {
+    const plan = resolveScopeSelection({
+      flags: noFlags,
+      existing: { write: false, calendar: true },
+      tier: "core",
+    });
+    expect(plan.selection.services).toEqual(["drive", "docs", "sheets", "cal"]);
+    expect(plan.persist).toBeNull();
+  });
+
+  it("--calendar alongside explicit --services unions cal in (no drop notice)", () => {
+    const plan = resolveScopeSelection({
+      flags: { ...noFlags, calendar: true, services: ["drive"] },
+      existing: NONE,
+      tier: "core",
+    });
+    expect(plan.selection.services).toEqual(["drive", "cal"]);
+    expect(plan.dropped.filter((d) => d.includes("'cal'"))).toEqual([]);
+  });
+
+  it("--services on a fresh add persists the selection", () => {
+    const plan = resolveScopeSelection({
+      flags: { ...noFlags, readonly: true, services: ["cal"] },
+      existing: NONE,
+      tier: "core",
+    });
+    expect(plan.selection).toEqual({
+      readonly: true,
+      services: ["cal"],
+      driveWrite: false,
+    });
+    expect(plan.persist).toEqual({ readonly: true, services: ["cal"] });
+  });
+
+  it("nothing widens: no flags + no persisted + no existing capability never mints cal or drive.file", () => {
+    for (const tier of ["core", "extended", "complete"] as const) {
+      const plan = resolveScopeSelection({
+        flags: noFlags,
+        existing: NONE,
+        tier,
+      });
+      const scopes = scopesForSelection(plan.selection);
+      expect(scopes).not.toContain(CAL_RO);
+      expect(scopes).not.toContain(DRIVE_FILE);
+    }
+  });
+});
+
+describe("GOOGLE_SERVICES ↔ GoogleServiceTokenSchema sync pin", () => {
+  it("the config enum and the CLI vocabulary are the same set", async () => {
+    const { GoogleServiceTokenSchema } = await import("../config/schema.js");
+    expect([...GoogleServiceTokenSchema.options].sort()).toEqual(
+      [...GOOGLE_SERVICES].sort(),
+    );
   });
 });

@@ -25,9 +25,18 @@ import {
   seedOptInCapabilities,
   CALENDAR_READONLY_SCOPE,
   sanitizeToolsListMessage,
+  LAUNCHER_GOOGLE_SERVICES,
+  UPSTREAM_SERVICE_NAMES,
+  parseLauncherServices,
+  requiredScopesForSelection,
+  findMissingScopesForSelection,
+  resolveLauncherSelection,
 } from "./drive-mcp-launcher.js";
 import {
   GOOGLE_CALENDAR_READONLY_SCOPE,
+  GOOGLE_SERVICES,
+  parseServicesOption,
+  scopesForSelection,
   workspaceScopesForTier,
 } from "./drive.js";
 import { GOOGLE_WORKSPACE_MCP_PINNED_SHA } from "../memory/scaffold-integration.js";
@@ -570,5 +579,209 @@ describe("resolveCredentialsDir — per-agent, env override honoured", () => {
     expect(resolveCredentialsDir({ HOME: "/home/dev" })).toBe(
       "/home/dev/google-workspace-mcp/credentials",
     );
+  });
+});
+
+// ── v1 per-account READ-ONLY scope selection (launcher half) ─────────────
+
+const RO_DOCS = "https://www.googleapis.com/auth/documents.readonly";
+const RO_SHEETS = "https://www.googleapis.com/auth/spreadsheets.readonly";
+const RO_SLIDES = "https://www.googleapis.com/auth/presentations.readonly";
+const RW_DOCS = "https://www.googleapis.com/auth/documents";
+const RW_SHEETS = "https://www.googleapis.com/auth/spreadsheets";
+
+describe("launcher service vocabulary — stays in sync with drive.ts", () => {
+  it("mirrors GOOGLE_SERVICES exactly (no drift)", () => {
+    expect([...LAUNCHER_GOOGLE_SERVICES]).toEqual([...GOOGLE_SERVICES]);
+  });
+
+  it("parseLauncherServices agrees with drive.ts parseServicesOption", () => {
+    for (const input of ["cal", "calendar,drive", "slides,docs,sheets", "drive,cal"]) {
+      expect(parseLauncherServices(input)).toEqual(parseServicesOption(input));
+    }
+  });
+
+  it("rejects unknown services loudly (a typo must not silently drop a service)", () => {
+    expect(() => parseLauncherServices("gmail")).toThrow(/unknown service 'gmail'/);
+  });
+
+  it("maps cal → upstream 'calendar', everything else 1:1", () => {
+    expect(UPSTREAM_SERVICE_NAMES.cal).toBe("calendar");
+    for (const s of ["drive", "docs", "sheets", "slides"] as const) {
+      expect(UPSTREAM_SERVICE_NAMES[s]).toBe(s);
+    }
+  });
+});
+
+describe("buildUvxArgs — per-account selection → upstream --tools/--read-only", () => {
+  it("selection {services:[cal], readonly:true} emits '--tools calendar --read-only'", () => {
+    const args = buildUvxArgs("core", { readonly: true, services: ["cal"] });
+    expect(args.slice(-5)).toEqual([
+      "--tool-tier",
+      "core",
+      "--tools",
+      "calendar",
+      "--read-only",
+    ]);
+  });
+
+  it("each service is its OWN argv token (upstream nargs='*'), upstream names", () => {
+    const args = buildUvxArgs(undefined, {
+      readonly: false,
+      services: ["drive", "docs", "sheets", "slides", "cal"],
+    });
+    expect(args.slice(-6)).toEqual([
+      "--tools",
+      "drive",
+      "docs",
+      "sheets",
+      "slides",
+      "calendar",
+    ]);
+    expect(args).not.toContain("--read-only");
+    expect(args.some((a) => a.includes(","))).toBe(false);
+  });
+
+  it("no selection → argv is byte-identical to the pre-v1 launcher", () => {
+    expect(buildUvxArgs("extended")).toEqual(buildUvxArgs("extended", undefined));
+    expect(buildUvxArgs("extended")).not.toContain("--tools");
+    expect(buildUvxArgs("extended")).not.toContain("--read-only");
+  });
+
+  it("readonly without services still emits --read-only (and no --tools)", () => {
+    const args = buildUvxArgs("core", { readonly: true, services: [] });
+    expect(args.slice(-1)).toEqual(["--read-only"]);
+    expect(args).not.toContain("--tools");
+  });
+});
+
+describe("requiredScopesForSelection — preflight derives from the selection", () => {
+  it("read-only selection requires exactly the readonly variants", () => {
+    expect(
+      requiredScopesForSelection({
+        readonly: true,
+        services: ["drive", "docs", "sheets", "slides", "cal"],
+      }),
+    ).toEqual([RO_DOCS, RO_SHEETS, RO_SLIDES, CALENDAR_READONLY_SCOPE]);
+  });
+
+  it("RW selection matches the drive.ts mint for the same selection (minus Drive base)", () => {
+    const sel = { readonly: false, services: ["docs", "sheets"] as ("docs" | "sheets")[] };
+    expect(requiredScopesForSelection(sel)).toEqual(
+      scopesForSelection({ readonly: false, driveWrite: false, services: sel.services }),
+    );
+    expect(requiredScopesForSelection(sel)).toEqual([RW_DOCS, RW_SHEETS]);
+  });
+
+  it("drive is never preflight-checked (broker always mints the base)", () => {
+    expect(
+      requiredScopesForSelection({ readonly: false, services: ["drive"] }),
+    ).toEqual([]);
+  });
+});
+
+describe("findMissingScopesForSelection — a valid read-only token does NOT warn", () => {
+  const RO_SEED =
+    "https://www.googleapis.com/auth/drive.readonly " +
+    "https://www.googleapis.com/auth/drive.metadata.readonly " +
+    `${RO_DOCS} ${RO_SHEETS}`;
+
+  it("read-only seed + read-only selection → nothing missing (the v1 fix)", () => {
+    expect(
+      findMissingScopesForSelection(RO_SEED, "core", {
+        readonly: true,
+        services: ["drive", "docs", "sheets"],
+      }),
+    ).toEqual([]);
+  });
+
+  it("the SAME read-only seed under the legacy tier path WOULD warn — the coupling this replaces", () => {
+    // Pre-v1, required scopes were hard-coded to the RW doc scopes, so a
+    // read-only token warned on EVERY boot. Pin the contrast so the fix
+    // is visible: legacy path missing = RW docs+sheets, selection path = [].
+    expect(findMissingScopesForSelection(RO_SEED, "core", undefined)).toEqual([
+      RW_DOCS,
+      RW_SHEETS,
+    ]);
+  });
+
+  it("read-only seed missing a selected service's scope IS reported", () => {
+    expect(
+      findMissingScopesForSelection(RO_SEED, "core", {
+        readonly: true,
+        services: ["drive", "docs", "sheets", "cal"],
+      }),
+    ).toEqual([CALENDAR_READONLY_SCOPE]);
+  });
+
+  it("no selection → identical to the legacy tier-derived preflight", () => {
+    for (const tier of ["core", "extended", "complete", undefined] as const) {
+      expect(findMissingScopesForSelection("", tier, undefined)).toEqual(
+        findMissingWorkspaceScopes("", tier),
+      );
+    }
+  });
+});
+
+describe("resolveLauncherSelection — legacy passthrough + partial records", () => {
+  it("no record / empty record → undefined (legacy behaviour preserved)", () => {
+    expect(resolveLauncherSelection(undefined, "core")).toBeUndefined();
+    expect(resolveLauncherSelection({}, "core")).toBeUndefined();
+  });
+
+  it("services-only record → readonly defaults false", () => {
+    expect(resolveLauncherSelection({ services: ["cal", "drive"] }, "core")).toEqual({
+      readonly: false,
+      services: ["drive", "cal"],
+    });
+  });
+
+  it("readonly-only record → services default to the tier's services", () => {
+    expect(resolveLauncherSelection({ readonly: true }, "core")).toEqual({
+      readonly: true,
+      services: ["drive", "docs", "sheets"],
+    });
+    expect(resolveLauncherSelection({ readonly: true }, "extended")).toEqual({
+      readonly: true,
+      services: ["drive", "docs", "sheets", "slides"],
+    });
+  });
+});
+
+describe("buildMissingScopeWarning — recovery command carries the selection", () => {
+  it("prints --readonly and --services so a verbatim re-run cannot re-widen", () => {
+    const msg = buildMissingScopeWarning(
+      [CALENDAR_READONLY_SCOPE],
+      "core",
+      "ops@example.com",
+      seedOptInCapabilities(""),
+      { readonly: true, services: ["drive", "cal"] },
+    );
+    expect(msg).toContain(
+      "switchroom auth google account add ops@example.com --replace --readonly --services drive,cal",
+    );
+    expect(msg).not.toContain("--write");
+  });
+
+  it("selection without readonly keeps --write when the token carries drive.file", () => {
+    const msg = buildMissingScopeWarning(
+      [RW_DOCS],
+      "core",
+      "ops@example.com",
+      seedOptInCapabilities("https://www.googleapis.com/auth/drive.file"),
+      { readonly: false, services: ["drive", "docs"] },
+    );
+    expect(msg).toContain("--replace --write --services drive,docs");
+  });
+
+  it("no selection → legacy wording unchanged (tier-derived guidance)", () => {
+    const msg = buildMissingScopeWarning(
+      [RW_DOCS],
+      "core",
+      "ops@example.com",
+      seedOptInCapabilities(""),
+    );
+    expect(msg).toContain("for tier 'core'");
+    expect(msg).toContain("--replace\n");
   });
 });

@@ -164,3 +164,76 @@ describe("resolveGdriveMcpEntry — does NOT emit", () => {
     ).toBeNull();
   });
 });
+
+// ── v1 per-account selection threading (readonly/services) ───────────────
+
+describe("resolveGdriveMcpEntry — per-account selection threading (v1)", () => {
+  it("threads the persisted services + readonly record as --services/--read-only", () => {
+    const entry = resolveGdriveMcpEntry(
+      "carrie",
+      agent({ google_workspace: { account: "you@example.com", tier: "core" } }),
+      cfg({
+        "you@example.com": {
+          enabled_for: ["carrie"],
+          readonly: true,
+          services: ["cal", "drive"],
+        },
+      }),
+    );
+    const args = entry?.value.args ?? [];
+    const i = args.indexOf("--services");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe("cal,drive");
+    expect(args).toContain("--read-only");
+  });
+
+  it("services without readonly threads --services only", () => {
+    const entry = resolveGdriveMcpEntry(
+      "carrie",
+      agent({ google_workspace: { account: "you@example.com" } }),
+      cfg({
+        "you@example.com": { enabled_for: ["carrie"], services: ["docs"] },
+      }),
+    );
+    const args = entry?.value.args ?? [];
+    expect(args).toContain("--services");
+    expect(args[args.indexOf("--services") + 1]).toBe("docs");
+    expect(args).not.toContain("--read-only");
+  });
+
+  it("readonly: false is NOT threaded (legacy arg shape preserved)", () => {
+    const entry = resolveGdriveMcpEntry(
+      "carrie",
+      agent({ google_workspace: { account: "you@example.com" } }),
+      cfg({
+        "you@example.com": { enabled_for: ["carrie"], readonly: false },
+      }),
+    );
+    expect(entry?.value.args).not.toContain("--read-only");
+  });
+
+  it("a legacy record (no selection) emits byte-identical pre-v1 args", () => {
+    const entry = resolveGdriveMcpEntry(
+      "carrie",
+      agent({ google_workspace: { account: "you@example.com", tier: "core" } }),
+      cfg({ "you@example.com": { enabled_for: ["carrie"] } }),
+    );
+    expect(entry?.value.args).toEqual(["drive-mcp-launcher", "--tier", "core"]);
+  });
+
+  it("account key lookup is case-insensitive (schema normalizes to lowercase)", () => {
+    const entry = resolveGdriveMcpEntry(
+      "carrie",
+      agent({ google_workspace: { account: "You@Example.com" } }),
+      cfg({
+        "you@example.com": {
+          enabled_for: ["carrie"],
+          readonly: true,
+          services: ["cal"],
+        },
+      }),
+    );
+    const args = entry?.value.args ?? [];
+    expect(args).toContain("--read-only");
+  });
+});

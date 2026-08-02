@@ -167,6 +167,23 @@ export interface GdriveMcpEntryOptions {
    * change, not Phase 1's job.
    */
   tier?: GdriveMcpTier;
+  /**
+   * Per-account service selection (v1 read-only scope model) from the
+   * persisted `google_accounts.<email>.services` record. When set,
+   * threaded as `--services a,b,c` so the launcher narrows upstream to
+   * those services (upstream `--tools`). Short tokens: cal, drive,
+   * docs, sheets, slides. The launcher re-reads the record from config
+   * and is authoritative; threading makes the resolved choice visible
+   * in settings.json (mirrors `tier`).
+   */
+  services?: string[];
+  /**
+   * Per-account read-only selection from the persisted
+   * `google_accounts.<email>.readonly` record. When true, threaded as
+   * `--read-only` (upstream requests readonly scopes and does not
+   * register write tools). Same visibility rationale as `services`.
+   */
+  readOnly?: boolean;
 }
 
 /**
@@ -219,11 +236,21 @@ export function getGdriveMcpSettingsEntry(
   // (doctor/debug surfaces) and so a future caller without config in
   // scope can pin it explicitly.
   const tierArgs = options.tier ? ["--tier", options.tier] : [];
+  const servicesArgs =
+    options.services && options.services.length > 0
+      ? ["--services", options.services.join(",")]
+      : [];
+  const readOnlyArgs = options.readOnly ? ["--read-only"] : [];
   return {
     key: "gdrive",
     value: {
       command: switchroomCliPath,
-      args: ["drive-mcp-launcher", ...tierArgs],
+      args: [
+        "drive-mcp-launcher",
+        ...tierArgs,
+        ...servicesArgs,
+        ...readOnlyArgs,
+      ],
     },
   };
 }

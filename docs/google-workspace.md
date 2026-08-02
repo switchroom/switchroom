@@ -271,6 +271,46 @@ Two deliberate limits:
   grant must never silently widen (RFC D §12), which is exactly why
   `--write` is a flag too.
 
+#### Read-only accounts and per-service selection
+
+For an account that should never hold a write scope at all, pass
+`--readonly`. Every selected service then mints only its `.readonly`
+scope variant — `documents.readonly`, `spreadsheets.readonly`,
+`presentations.readonly`, `calendar.readonly` — and the `gdrive` MCP
+runs upstream in `--read-only` mode, so write tools are not even
+registered. `--readonly` and `--write` are mutually exclusive.
+
+You can also narrow *which* services the account covers with
+`--services` (comma-separated: `cal`, `drive`, `docs`, `sheets`,
+`slides`; `calendar` is accepted for `cal`):
+
+```bash
+# a calendar-only, read-only account:
+switchroom auth google account add you@gmail.com --readonly --services cal
+# read-only Drive + Docs + Sheets (no Slides, no Calendar):
+switchroom auth google account add you@gmail.com --readonly --services drive,docs,sheets
+```
+
+The selection controls **both halves** of the grant from one record:
+the OAuth scopes minted at consent, and the tools the MCP exposes
+(upstream `--tools` / `--read-only`) — so the tools an agent sees are
+exactly the tools its token can authenticate.
+
+The selection is **persisted** into
+`google_accounts.<email>.{readonly,services}` in switchroom.yaml and
+**re-read on `--replace`**: re-consenting a read-only account for an
+unrelated reason (say, a tier bump) mints the same read-only selection
+again — it cannot silently re-widen. Changing the selection is always
+an explicit flag, and any capability a change drops is announced before
+the consent screen.
+
+Omitting both flags keeps today's behaviour exactly: tier-tied
+read-write document scopes, Drive read-only base, `--write` /
+`--calendar` opt-ins.
+
+v1 limits (deliberate follow-ups): no `gmail` service, no per-service
+write levels, no `calendar.events.readonly`.
+
 #### Re-consent carries existing scopes forward
 
 OAuth scopes are fixed at consent time, so `--replace` mints exactly the

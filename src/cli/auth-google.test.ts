@@ -311,3 +311,26 @@ describe("buildCarryForwardNotices — carry-forward is announced, not silent", 
     expect(lines[1]).toContain("--calendar");
   });
 });
+
+// ── buildSelectionReconsentRequiredError (v1 selection flags) ────────────
+
+describe("buildSelectionReconsentRequiredError", () => {
+  it("names the exact --replace command carrying the requested selection", () => {
+    const msg = _testing.buildSelectionReconsentRequiredError("a@b.com", {
+      readonly: true,
+      services: "cal,drive",
+    });
+    expect(msg).toContain(
+      "switchroom auth google account add a@b.com --replace --readonly --services cal,drive",
+    );
+    expect(msg).toContain("fixed at consent time");
+  });
+
+  it("readonly-only request omits --services from the recovery command", () => {
+    const msg = _testing.buildSelectionReconsentRequiredError("a@b.com", {
+      readonly: true,
+    });
+    expect(msg).toContain("--replace --readonly");
+    expect(msg).not.toContain("--services");
+  });
+});

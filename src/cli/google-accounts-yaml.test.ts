@@ -197,3 +197,70 @@ describe("removeGoogleAccountEntry", () => {
     expect(removeGoogleAccountEntry(baseYaml, "alice@example.com")).toBe(baseYaml);
   });
 });
+
+// ── setGoogleAccountSelection (v1 read-only scope model) ─────────────────
+
+import { setGoogleAccountSelection } from "./google-accounts-yaml.js";
+
+describe("setGoogleAccountSelection", () => {
+  const withAccount = `${baseYaml}google_accounts:
+  alice@example.com:
+    enabled_for: [klanker]
+`;
+
+  it("writes readonly + services under an existing account, preserving the rest", () => {
+    const out = setGoogleAccountSelection(withAccount, "alice@example.com", {
+      readonly: true,
+      services: ["drive", "cal"],
+    });
+    expect(out).toContain("# top of file"); // comments preserved
+    expect(out).toContain("readonly: true");
+    expect(out).toMatch(/services:\s*\n?\s*(\[\s*drive,\s*cal\s*\]|- drive\s*\n\s*- cal)/);
+    // enabled_for untouched (allow either flow or block sequence style)
+    expect(out).toMatch(/enabled_for:\s*(\[\s*klanker\s*\]|\n\s*- klanker)/);
+  });
+
+  it("creates the account entry (empty enabled_for) when absent", () => {
+    const out = setGoogleAccountSelection(baseYaml, "new@example.com", {
+      readonly: false,
+      services: ["docs"],
+    });
+    expect(out).toContain("new@example.com");
+    expect(out).toContain("readonly: false");
+    expect(out).toContain("docs");
+  });
+
+  it("writes readonly: false explicitly (self-describing record, never pruned)", () => {
+    const out = setGoogleAccountSelection(withAccount, "alice@example.com", {
+      readonly: false,
+      services: ["drive"],
+    });
+    expect(out).toContain("readonly: false");
+  });
+
+  it("is byte-identical when the stored selection already matches", () => {
+    const once = setGoogleAccountSelection(withAccount, "alice@example.com", {
+      readonly: true,
+      services: ["drive", "cal"],
+    });
+    const twice = setGoogleAccountSelection(once, "alice@example.com", {
+      readonly: true,
+      services: ["drive", "cal"],
+    });
+    expect(twice).toBe(once);
+  });
+
+  it("round-trips: a written selection is re-read identically (the --replace carry-forward)", () => {
+    const written = setGoogleAccountSelection(withAccount, "alice@example.com", {
+      readonly: true,
+      services: ["cal"],
+    });
+    // Re-write with a different selection and confirm it replaces cleanly.
+    const rewritten = setGoogleAccountSelection(written, "alice@example.com", {
+      readonly: false,
+      services: ["drive", "docs"],
+    });
+    expect(rewritten).toContain("readonly: false");
+    expect(rewritten).not.toMatch(/services:.*\bcal\b/s);
+  });
+});

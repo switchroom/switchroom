@@ -2290,6 +2290,14 @@ const ApproverIdSchema = z.union([z.number(), z.string().regex(/^\d+$/)]);
  *   - complete ~60+ tools: + Gmail (note: Gmail's per-thread approval
  *     shape is unsuitable here today — see RFC G §5 out-of-scope)
  *
+ * NOTE the tier governs which TOOLS upstream exposes, not which scopes
+ * the minted token carries. Calendar tools in particular are exposed at
+ * every tier but only authenticate when the account was consented with
+ * the calendar scope (`account add --calendar`, or `cal` in the
+ * per-account `services` selection) — no tier mints it by default. The
+ * per-account `google_accounts.<email>.{readonly,services}` selection
+ * is what keeps tool exposure and token scope in agreement.
+ *
  * RFC D shipped without this knob (hardcoded to upstream's full surface
  * via the no-flag default). Phase 1 makes the tier explicit at the
  * config level; Phase 3 wires it through the MCP launcher.
@@ -2300,6 +2308,30 @@ export const GoogleWorkspaceTierSchema = z.enum([
   "complete",
 ]);
 export type GoogleWorkspaceTier = z.infer<typeof GoogleWorkspaceTierSchema>;
+
+/**
+ * One selectable Google service in the per-account scope selection
+ * (v1 read-only scope model). Short tokens are the config + CLI
+ * vocabulary; the gdrive MCP launcher maps them to upstream
+ * `workspace-mcp --tools` service names (`cal` → `calendar`).
+ *
+ * A closed enum (unlike `MicrosoftToolTokenSchema`'s regex): Microsoft
+ * tokens feed a runtime-built regex where the charset is the guard,
+ * these feed a fixed service→scope map where an unknown token would be
+ * silently inert — reject it at parse time instead. MUST stay in sync
+ * with `GOOGLE_SERVICES` in src/cli/drive.ts (unit-pinned there).
+ *
+ * v1 is READ-surface-selection only: gmail, per-service write levels,
+ * and `calendar.events.readonly` are deliberate follow-ups.
+ */
+export const GoogleServiceTokenSchema = z.enum([
+  "cal",
+  "drive",
+  "docs",
+  "sheets",
+  "slides",
+]);
+export type GoogleServiceToken = z.infer<typeof GoogleServiceTokenSchema>;
 
 /**
  * Top-level drive / google_workspace config block. Centralizes Google OAuth
@@ -2342,7 +2374,9 @@ export const GoogleWorkspaceConfigSchema = z
       ),
     tier: GoogleWorkspaceTierSchema.optional().describe(
       "RFC G Phase 1: which upstream MCP tier to expose. " +
-      "core (default) = ~16 tools (Drive+Docs+Sheets+Calendar). " +
+      "core (default) = ~16 tools (Drive+Docs+Sheets+Calendar tools; the " +
+      "Calendar tools only authenticate when the account holds the opt-in " +
+      "calendar scope — no tier mints it). " +
       "extended = ~40 tools (+Slides, Forms, Tasks, Chat). " +
       "complete = ~60+ tools (+Gmail; not recommended yet — see RFC G §5)."
     ),
@@ -5183,6 +5217,30 @@ export const SwitchroomConfigSchema = z.object({
             "enforced at the broker, not at the agent identity layer — " +
             "the agent still authenticates via socket-path-as-identity " +
             "per RFC D §4.1, broker just gates the cross-agent token share."
+          ),
+        readonly: z
+          .boolean()
+          .optional()
+          .describe(
+            "Per-account read-only selection (v1 scope model). true → the " +
+            "token minted by `auth google account add` carries ONLY " +
+            ".readonly scope variants (zero write scopes), and the gdrive " +
+            "MCP launcher passes upstream `--read-only` so write tools are " +
+            "not exposed. Written by `account add --readonly`; re-read on " +
+            "`--replace` so a re-consent cannot silently re-widen. Omitted " +
+            "= legacy behaviour (tier-tied read-write document scopes)."
+          ),
+        services: z
+          .array(GoogleServiceTokenSchema)
+          .min(1)
+          .optional()
+          .describe(
+            "Per-account service selection (v1 scope model). Which Google " +
+            "services the minted token covers AND the gdrive MCP exposes " +
+            "(upstream `--tools`): cal, drive, docs, sheets, slides. " +
+            "Written by `account add --services`; re-read on `--replace`. " +
+            "Omitted = the tier's default services (drive,docs,sheets; " +
+            "+slides at extended/complete)."
           ),
       }),
     )

@@ -136,6 +136,45 @@ export function listGoogleAccounts(
 }
 
 /**
+ * Persist the per-account scope selection (v1 read-only scope model)
+ * into `google_accounts.<account>.{readonly,services}`. Written by
+ * `auth google account add` after a successful mint so `--replace` can
+ * re-read the SAME selection instead of silently re-widening to the
+ * tier default. Creates the account entry (with an empty `enabled_for`)
+ * if absent — mirrors `enableAgentsOnGoogleAccount`'s create-on-demand.
+ *
+ * `readonly: false` is written explicitly (not pruned): once an account
+ * is on the new-style selection, the record must be self-describing —
+ * an absent key means "legacy tier-driven", never "false".
+ *
+ * Pass-through (byte-identical return) when the stored selection
+ * already matches.
+ */
+export function setGoogleAccountSelection(
+  yamlText: string,
+  account: string,
+  selection: { readonly: boolean; services: string[] },
+): string {
+  const doc = parseDocument(yamlText);
+  ensureGoogleAccountEntry(doc, account);
+  const currentReadonly = doc.getIn([
+    "google_accounts",
+    account,
+    "readonly",
+  ]);
+  const currentServices = doc.getIn(["google_accounts", account, "services"]);
+  const currentServicesArr = readEnabledFor(currentServices);
+  const unchanged =
+    currentReadonly === selection.readonly &&
+    currentServicesArr.length === selection.services.length &&
+    currentServicesArr.every((s, i) => s === selection.services[i]);
+  if (unchanged) return yamlText;
+  doc.setIn(["google_accounts", account, "readonly"], selection.readonly);
+  doc.setIn(["google_accounts", account, "services"], [...selection.services]);
+  return String(doc);
+}
+
+/**
  * Remove the entire `google_accounts.<account>` entry from the YAML.
  * Used by `auth google account remove`. The CLI verb is responsible for
  * checking that `enabled_for` is empty first (so we don't strand any
