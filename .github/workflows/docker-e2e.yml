@@ -139,6 +139,7 @@ jobs:
               - 'src/setup/hindsight-perf-defaults.ts'
               - 'tests/docker/hindsight-reflect-directives-patch.test.ts'
               - 'tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts'
+              - 'tests/docker/hindsight-reranker-priority-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -429,6 +430,20 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts
 
+      - name: Run the hindsight reranker-foreground-priority probe (RED/GREEN, must not skip)
+        # Same contract, for the #3142 reranker-foreground-priority patch (OPEN
+        # upstream). The bakes test cannot cover the failure that matters here:
+        # its assertions are grep-on-file, so a _PriorityRerankExecutor that
+        # exists but orders its queue FIFO (a reverted (priority, seq) key, or a
+        # background flag threaded but never consulted) stays green there while
+        # interactive reranks are once again starved behind the background
+        # fan-out. Only constructing the real pool, occupying its single worker,
+        # and observing that queued foreground jobs run before an
+        # earlier-submitted background one catches it.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-reranker-priority-patch.test.ts
+
       - name: Run the embedded-postgres fsync probe (RED/GREEN, must not skip)
         # NOT a patch probe: this one boots the REAL docker/hindsight-entrypoint.sh
         # inside the pinned image and reads `SHOW fsync` off the server it
@@ -448,7 +463,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

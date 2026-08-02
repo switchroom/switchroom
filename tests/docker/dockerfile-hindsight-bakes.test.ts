@@ -1124,6 +1124,75 @@ describe("Dockerfile.hindsight shape", () => {
     ).toBe(true);
   });
 
+  it("keeps the reranker-foreground-priority fix #3142 (assert-guarded, fail-loud)", () => {
+    // Carries upstream vectorize-io/hindsight PR #3142 (OPEN — a source fork
+    // patch, not an adopted-upstream retire). Reranking is CPU-bound in a fixed
+    // thread pool; upstream drains ONE FIFO queue, so an interactive
+    // (foreground) rerank waits behind the wall of background reranks
+    // consolidation/reflect fan out. The patch swaps ThreadPoolExecutor for a
+    // _PriorityRerankExecutor (PriorityQueue ordered (priority, seq);
+    // foreground jumps ahead of queued background, never preempts a running
+    // one) and threads a `background` flag from the recall call site through
+    // rerank() to every provider's predict().
+    //
+    // SCOPE: structural, not behavioural. The behavioural gate is
+    // tests/docker/hindsight-search-patches.test.ts, which applies the block to
+    // the real image and probes _PriorityRerankExecutor ordering + that a
+    // background rerank still resolves. Do not treat this file as sufficient.
+    expect(dockerfile).toMatch(
+      /switchroom #3142: foreground-priority lane for the local cross-encoder pool/,
+    );
+    // The fail-loud anchor-drift message names the re-author path.
+    expect(dockerfile).toMatch(
+      /switchroom #3142 reranker-foreground-priority patch: anchor found \{n\}x/,
+    );
+    expect(dockerfile).toMatch(
+      /re-author this patch in docker\/Dockerfile\.hindsight/,
+    );
+    // The three files it patches, by their in-image paths.
+    expect(dockerfile).toContain(
+      "/app/api/hindsight_api/engine/cross_encoder.py",
+    );
+    expect(dockerfile).toContain(
+      "/app/api/hindsight_api/engine/search/reranking.py",
+    );
+    expect(dockerfile).toContain(
+      "/app/api/hindsight_api/engine/memory_engine.py",
+    );
+    // The new executor class + the 14-way count-asserted predict-signature edit.
+    expect(dockerfile).toContain("class _PriorityRerankExecutor:");
+    expect(dockerfile).toMatch(
+      /async def predict\(self, pairs: list\[tuple\[str, str\]\], \*, background: bool = False\) -> list\[float\]:/,
+    );
+    // The recall call site derives priority from RequestContext.internal.
+    expect(dockerfile).toContain(
+      "background_rerank = bool(request_context is not None and request_context.internal)",
+    );
+    // Post-replace verification-on-build: full surface present, exact-14, and
+    // both orthogonal switchroom-local mods asserted to SURVIVE the patch
+    // (a re-ordered future patch that drops either fails the build here).
+    expect(dockerfile).toContain(
+      'assert ce.count("*, background: bool = False) -> list[float]:") == 14',
+    );
+    expect(dockerfile).toMatch(
+      /_background_search_semaphore" in me, "switchroom recall-admission-split mod lost/,
+    );
+    expect(dockerfile).toMatch(
+      /_boost_authority\(" in rr and "measured cross-encoder saturation" in rr/,
+    );
+    // The patch reads NO env var (nothing to reconcile against
+    // HINDSIGHT_PERF_ENV_KEYS): the behaviour is unconditional, so assert the
+    // absence of a knob rather than leaving a silent gap.
+    const blockStart = dockerfile.indexOf(
+      "# --- switchroom #3142: foreground-priority lane",
+    );
+    const blockEnd = dockerfile.indexOf("\nPYEOF", blockStart);
+    expect(blockStart).toBeGreaterThan(-1);
+    expect(dockerfile.slice(blockStart, blockEnd)).not.toMatch(
+      /os\.environ|getenv|HINDSIGHT_[A-Z0-9_]+_ENV/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
