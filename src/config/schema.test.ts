@@ -225,7 +225,7 @@ describe("BuzzChannelSchema (Buzz co-channel Phase 1)", () => {
   const OP = "npub1zsqv9jvpdurxu2y7vxen8w22mk3wkntsu5vsard00je59x5mmhlqgyjfll";
   const OP_HEX = "1400c2c9816f066e289e61b333b94adda2eb4d70e5190e8daf7cb3429a9bddfe";
 
-  const minimal = { operator_pubkey: OP, relay_url: "wss://relay.buzz", default_channel_id: "grp", chat_id: "555" };
+  const minimal = { operator_pubkey: OP, relay_url: "wss://relay.buzz", relay_host: "relay.buzz", default_channel_id: "grp", chat_id: "555" };
 
   it("defaults enabled to false — the channel ships dark", () => {
     const r = BuzzChannelSchema.parse(minimal);
@@ -255,12 +255,25 @@ describe("BuzzChannelSchema (Buzz co-channel Phase 1)", () => {
     expect(() => BuzzChannelSchema.parse({ ...minimal, relay_url: "https://relay.buzz" })).toThrow();
   });
 
-  it("requires operator_pubkey, relay_url, default_channel_id, and chat_id", () => {
-    expect(() => BuzzChannelSchema.parse({ relay_url: "wss://r", default_channel_id: "g", chat_id: "1" })).toThrow();
-    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, default_channel_id: "g", chat_id: "1" })).toThrow();
-    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", chat_id: "1" })).toThrow();
+  it("requires operator_pubkey, relay_url, relay_host, default_channel_id, and chat_id", () => {
+    expect(() => BuzzChannelSchema.parse({ relay_url: "wss://r", relay_host: "r", default_channel_id: "g", chat_id: "1" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_host: "r", default_channel_id: "g", chat_id: "1" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", relay_host: "r", chat_id: "1" })).toThrow();
     // chat_id is now required too — config.ts demands BUZZ_CHAT_ID when live.
-    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", default_channel_id: "g" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", relay_host: "r", default_channel_id: "g" })).toThrow();
+    // relay_host is REQUIRED (coordinator 2026-08-03): the relay resolves its
+    // community from the HTTP Host header and 404s without it, so an omitted
+    // Host must be a hard config error, not a silent 404 loop.
+    expect(() => BuzzChannelSchema.parse({ operator_pubkey: OP, relay_url: "wss://r", default_channel_id: "g", chat_id: "1" })).toThrow();
+  });
+
+  it("validates relay_host as a bare host[:port] authority (no scheme/path)", () => {
+    expect(BuzzChannelSchema.parse({ ...minimal, relay_host: "127.0.0.1:3000" }).relay_host).toBe("127.0.0.1:3000");
+    expect(BuzzChannelSchema.parse({ ...minimal, relay_host: "relay.buzz" }).relay_host).toBe("relay.buzz");
+    // A scheme, a path, or whitespace is rejected — the Host must be sent verbatim.
+    expect(() => BuzzChannelSchema.parse({ ...minimal, relay_host: "ws://127.0.0.1:3000" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ ...minimal, relay_host: "127.0.0.1:3000/path" })).toThrow();
+    expect(() => BuzzChannelSchema.parse({ ...minimal, relay_host: "" })).toThrow();
   });
 
   it("accepts and preserves chat_id, and rejects an empty one", () => {

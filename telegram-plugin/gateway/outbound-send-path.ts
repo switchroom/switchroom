@@ -69,6 +69,7 @@ import {
 } from '../hooks/audience-classify.mjs'
 import { queueFloodBlockedReply } from './flood-reply-queue.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
+import { getBuzzMirror } from './buzz-mirror.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
 import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
 import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
@@ -834,6 +835,10 @@ export interface SendReplyGatewayDeps {
   resolveReplyOwnerTurn(liveTurn: CurrentTurn | null, chatId: string, args: Record<string, unknown>): { turn: CurrentTurn | null; tier: ReplyOwnerTier; candidates: ReplyOwnerCandidates }
   findTurnByOriginId(originTurnId: string | null | undefined): CurrentTurn | null
   findTurnByQuotedMessageId(chatId: string, replyTo: unknown): CurrentTurn | null
+  /** Buzz co-channel Phase 2b (S1) — the same chat-wide latest-ended lookup the
+   *  owner-resolution wiring uses. Read here ONLY to compute the S1 owner-guard
+   *  input `hasRecentDifferentOriginTurn`; a no-op when Buzz mirroring is off. */
+  findLatestTurnForChat(chatId: string, opts: { endedOnly: boolean }): CurrentTurn | null
   resolveAnswerThreadWithLog(
     chatId: string,
     explicitThreadId: number | undefined,
@@ -913,7 +918,7 @@ export async function sendReply(
     lockedBot, robustApiCall, swallowingApiCall,
     loadAccess, redactOutboundText, assertAllowedChat, assertSendable,
     statusKey, streamKey,
-    resolveReplyOwnerTurn, findTurnByOriginId, findTurnByQuotedMessageId,
+    resolveReplyOwnerTurn, findTurnByOriginId, findTurnByQuotedMessageId, findLatestTurnForChat,
     resolveAnswerThreadWithLog, resolveThreadId,
     getLatestInboundMessageId, getLastSubagentHandbackAt, subagentReplyAuthority, recordOutbound,
     emissionAuthorityFor, clearActivitySummary,
@@ -2584,6 +2589,37 @@ export async function sendReply(
     // genuinely-undelivered final answer is delivered by the sweep).
     if (shouldJournalReplySiteDelivery({ text: rawText, disableNotification: modelDisableNotification })) {
       journalExternalDelivery({ turnNonce: t?.turnId ?? null, text, tgMessageId: sentIds[sentIds.length - 1], replyAlreadyDeliveredThisTurn: true })
+    }
+    // ── Buzz co-channel Phase 2b mirror hook (S1/S4) ─────────────────────────
+    // STRICTLY downstream of the guaranteed Telegram delivery above: this runs
+    // only inside `sentIds.length > 0` (a Telegram copy landed) and is a
+    // byte-identical no-op when Buzz is disabled (`getBuzzMirror()` is null).
+    // Never throws — the hub swallows its own errors — so a Buzz mirror can
+    // never fail, delay, or alter the Telegram answer (the core invariant), and
+    // the tool result the model sees reflects the Telegram copy only (S4).
+    const buzzMirror = getBuzzMirror()
+    if (buzzMirror !== null) {
+      const { turn: mOwnerTurn, tier: mOwnerTier } = resolveReplyOwnerTurn(turn, chat_id, args)
+      const ownerOrigin = mOwnerTurn?.originChannel ?? 'telegram'
+      const ownerTurnId = mOwnerTurn?.turnId ?? null
+      // S1 inputs. ownerEchoed: the reply positively echoed the owner turn's id
+      // (the `origin` tier is the only one that binds by `origin_turn_id`).
+      const ownerEchoed = mOwnerTier === 'origin'
+      // hasRecentDifferentOriginTurn: is there a recent turn of a DIFFERENT
+      // origin than the resolved owner (the live turn, or the chat's latest
+      // ended turn) that this reply could otherwise have belonged to? Deterministic.
+      const latestEnded = findLatestTurnForChat(chat_id, { endedOnly: true })
+      const hasRecentDifferentOriginTurn = [turn, latestEnded].some(
+        (c) => c != null && c.turnId !== ownerTurnId && c.originChannel !== ownerOrigin,
+      )
+      buzzMirror.mirrorReplyDelivered({
+        scrubbedText: text,
+        ownerOriginChannel: ownerOrigin,
+        ownerBuzzCoords: mOwnerTurn?.buzzCoords,
+        ownerEchoed,
+        hasRecentDifferentOriginTurn,
+        telegramMessageKeys: sentIds.map((id) => `${chat_id}:${id}`),
+      })
     }
   }
   return { content: [{ type: 'text', text: result }] }

@@ -2291,19 +2291,26 @@ export const BuzzChannelSchema = z
         "own 127.0.0.1 can't stand in for). The NIP-42 auth tag still uses " +
         "relay_url. Defaults to relay_url when unset.",
       ),
-    // Phase 0 blocker #2: the relay resolves its community from the HTTP Host
-    // header on the WS upgrade. When the sidecar dials the relay by a docker
-    // network IP (relay_url host = 10.x), the Host header must still carry the
-    // relay's CONFIGURED authority or the relay returns a blind 404. Absent →
-    // the sidecar uses the authority parsed from relay_url (correct when the
-    // URL host already matches the community authority).
+    // Phase 0 blocker #2 / coordinator directive (2026-08-03, verified live):
+    // the relay resolves its community from the HTTP Host header BEFORE the WS
+    // upgrade and fail-closes — a missing/wrong Host returns HTTP 404 "relay: no
+    // community is configured for this host" and the socket never upgrades.
+    // Community host is server-internal (resolved from RELAY_URL) and therefore
+    // effectively immutable, so the Host is deployment config, NOT derived at
+    // runtime: it is a REQUIRED, validated authority field. `normalize_host`
+    // strips only :443/:80, so the value is sent verbatim (port included).
     relay_host: z
       .string()
-      .optional()
+      .regex(
+        /^(\[[0-9a-fA-F:]+\]|[^\s/?#:@]+)(:\d+)?$/,
+        "relay_host must be a bare host[:port] authority — no scheme, path, or userinfo (e.g. '127.0.0.1:3000')",
+      )
       .describe(
-        "HTTP Host header authority sent on the WS upgrade (e.g. " +
-        "'127.0.0.1:3000'). The relay resolves its community from this. " +
-        "Defaults to the authority parsed from relay_url.",
+        "REQUIRED HTTP Host header authority sent verbatim on the WS upgrade " +
+        "(e.g. '127.0.0.1:3000', port included). The relay resolves its " +
+        "community from this header before the upgrade and returns HTTP 404 if " +
+        "it is missing/wrong, so it must match the relay's configured " +
+        "authority and is deployment config, never derived from the dial URL.",
       ),
     nsec_vault_key: z
       .string()
@@ -2335,9 +2342,14 @@ export const BuzzChannelSchema = z
       .enum(["both", "origin", "off"])
       .default("both")
       .describe(
-        "Cross-surface mirror mode (Phase 2 placeholder). 'off' is a true " +
-        "kill-switch that disables the channel in BOTH directions — the " +
-        "inbound sidecar exits idle. Phase 1 only reads 'off' vs not-off.",
+        "Cross-surface mirror mode. 'both' answers on the origin channel AND " +
+        "mirrors a copy to the other; 'off' is a true kill-switch that disables " +
+        "the channel in BOTH directions (the inbound sidecar exits idle). " +
+        "Phase 2b (S2): 'origin' is DEFERRED — the hub's mirror hook lives only " +
+        "in sendReply, so 'origin' cannot be honored soundly; a configured " +
+        "'origin' is degraded to 'off' (dark) at runtime by both the sidecar " +
+        "config loader and the hub (channel-route.ts parseConfiguredMirrorMode). " +
+        "Only 'both' and 'off' ship live in 2b.",
       ),
     chat_id: z
       .string()

@@ -169,6 +169,43 @@ export interface PreApprovedResultEvent {
   preApproved: boolean;
 }
 
+/**
+ * Buzz co-channel — Phase 2b. Gateway → Buzz-sidecar peer: a request to
+ * publish (or correct) a Nostr channel message. Sent ONLY to the single
+ * duplex peer client that announced itself via `hello_buzz_peer`, never to a
+ * registered agent bridge. The sidecar's `publisher.ts` is the sole content-
+ * signer: it re-scrubs `payload.text` through `detectSecrets` before signing
+ * and answers with a `buzz_publish_result` carrying the same `correlationId`.
+ *
+ * `payload.kind` is restricted to `message` | `correction` in Phase 2b
+ * (reaction / approval / patch are deferred per design §3.1 / F4 — the Buzz
+ * desktop renders only a fixed content-kind allowlist). A `correction`
+ * carries the `targetEventId` of the already-published event it supersedes.
+ */
+export interface OutboundToBuzzMessage {
+  type: "outbound_to_buzz";
+  /** Caller-generated id, echoed back in `buzz_publish_result`. */
+  correlationId: string;
+  /**
+   * The publishing agent. Validated for wire SHAPE only (AGENT_NAME_RE in
+   * `isValidClientToGateway`) and stamped by the hub itself (buzz-mirror sets it
+   * from its own `agentName`), so it is diagnostic here — the gateway does NOT
+   * cross-check it against a configured own-name (createIpcServer holds no such
+   * name). Impersonation is prevented structurally instead: only the registered
+   * duplex peer connection receives `outbound_to_buzz` and may answer it.
+   */
+  agentName: string;
+  /** Target NIP-29 channel (group) id, `["h", …]`. */
+  channelId: string;
+  /** NIP-10 reply target (the Buzz event being answered), when threading. */
+  replyToEventId?: string;
+  /** NIP-10 thread root, when threading into an existing conversation. */
+  threadRootId?: string;
+  payload:
+    | { kind: "message"; text: string }
+    | { kind: "correction"; text: string; targetEventId: string };
+}
+
 export type GatewayToClient =
   | InboundMessage
   | PermissionEvent
@@ -181,7 +218,8 @@ export type GatewayToClient =
   | RolloutStatusPostedEvent
   | RolloutStatusEditedEvent
   | PendingPermissionStatusEvent
-  | PreApprovedResultEvent;
+  | PreApprovedResultEvent
+  | OutboundToBuzzMessage;
 
 // === Bridge (Client) -> Gateway messages ===
 
@@ -671,6 +709,45 @@ export interface CheckPreApprovedMessage {
   unifiedDiff: string;
 }
 
+/**
+ * Buzz co-channel — Phase 2b. The Buzz sidecar's one-time announcement that
+ * this connection is the DUPLEX publish peer, not an agent bridge. It carries
+ * NO `agentIndex` claim and NEVER registers a topic: the gateway parks it in a
+ * dedicated `buzzPeerClient` slot, marks it watchdog-exempt (it has no live
+ * `agentName`), and refuses a subsequent `register` on the same connection
+ * (and, conversely, refuses `hello_buzz_peer` on a client that already
+ * `register`ed) — the peer role and the agent-bridge role are mutually
+ * exclusive per design §3.2 / S7. `agentName` here is the fleet agent whose
+ * outbound this peer publishes; it is validated for wire SHAPE only
+ * (AGENT_NAME_RE) and used for logging — the gateway does NOT cross-check it
+ * against a configured own-name (it holds none). The peer role is secured
+ * structurally: a live peer cannot be displaced by a fresh hello, and only the
+ * peer connection may send `buzz_publish_result`.
+ */
+export interface HelloBuzzPeerMessage {
+  type: "hello_buzz_peer";
+  agentName: string;
+}
+
+/**
+ * Buzz co-channel — Phase 2b. The sidecar's reply to an `outbound_to_buzz`:
+ * the outcome of the publish attempt. Advisory ONLY under `both` mode — the
+ * Telegram copy is the guaranteed delivery, so a `buzz_publish_result` with
+ * `ok: false` never fails or retries the answer, it only feeds the hub's
+ * correlation map (freeing the pending slot, logging, and — on success —
+ * recording the published `eventId` so a later `correction` can target it).
+ */
+export interface BuzzPublishResultMessage {
+  type: "buzz_publish_result";
+  /** Echoes the `correlationId` from the originating `outbound_to_buzz`. */
+  correlationId: string;
+  ok: boolean;
+  /** The locally-computed (`getEventHash`) id of the signed event, on success. */
+  eventId?: string;
+  /** Diagnostic detail on failure (never carries scrubbed content). */
+  error?: string;
+}
+
 export type ClientToGateway =
   | RegisterMessage
   | ToolCallMessage
@@ -692,4 +769,6 @@ export type ClientToGateway =
   | RolloutStatusPostMessage
   | RolloutStatusEditMessage
   | QueryPendingPermissionMessage
-  | CheckPreApprovedMessage;
+  | CheckPreApprovedMessage
+  | HelloBuzzPeerMessage
+  | BuzzPublishResultMessage;

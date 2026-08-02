@@ -10,6 +10,7 @@ function liveEnv(over: EnvMap = {}): EnvMap {
     SWITCHROOM_AGENT_NAME: "klanker",
     BUZZ_CHAT_ID: "555",
     BUZZ_RELAY_URL: "ws://10.0.10.5:8080",
+    BUZZ_RELAY_HOST: "127.0.0.1:3000",
     BUZZ_CHANNEL_IDS: "group-uuid",
     BUZZ_OPERATOR_PUBKEY: OP,
     ...over,
@@ -57,6 +58,33 @@ describe("loadConfigFromEnv", () => {
     expect(res.reason).toMatch(/BUZZ_RELAY_URL/);
   });
 
+  it("HARD-ERRORS a LIVE config missing BUZZ_RELAY_HOST (not a silent 404 loop)", () => {
+    // Coordinator directive (2026-08-03, verified live): the relay resolves its
+    // community from the HTTP Host header BEFORE the WS upgrade and fail-closes
+    // to HTTP 404 without it. So a missing Host must be a hard config error the
+    // supervisor surfaces, never a silent reconnect loop against a 404.
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_RELAY_HOST: undefined }));
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toMatch(/BUZZ_RELAY_HOST/);
+  });
+
+  it("does NOT demand BUZZ_RELAY_HOST when the channel is not live", () => {
+    // A disabled sidecar must still load (and no-op) with a bare env — the Host
+    // is only required on the live path that actually dials the relay.
+    const res = loadConfigFromEnv({ SWITCHROOM_AGENT_NAME: "klanker", BUZZ_ENABLED: "0" });
+    expect(res.ok).toBe(true);
+  });
+
+  it("carries BUZZ_RELAY_HOST through to the runtime config verbatim", () => {
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_RELAY_HOST: "127.0.0.1:3000" }));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.relayHost).toBe("127.0.0.1:3000");
+    // resolveRelayHost prefers the explicit Host, so the exact string reaches the dial.
+    expect(resolveRelayHost(res.config)).toBe("127.0.0.1:3000");
+  });
+
   it("uses BUZZ_RELAY_URL as the canonical auth tag and dials it when no dial URL is set", () => {
     const res = loadConfigFromEnv(liveEnv({ BUZZ_RELAY_URL: "ws://127.0.0.1:3000" }));
     expect(res.ok).toBe(true);
@@ -87,6 +115,34 @@ describe("loadConfigFromEnv", () => {
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(isChannelLive(res.config)).toBe(false);
+  });
+
+  it("degrades a DEFERRED mirror:origin to dark (not-live)", () => {
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_MIRROR: "origin" }));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.mirror).toBe("off");
+    expect(isChannelLive(res.config)).toBe(false);
+  });
+
+  it("LOW-1: an UNRECOGNIZED BUZZ_MIRROR value fails DARK (not-live), never live", () => {
+    // A typo like BUZZ_MIRROR=of set directly in env (unreachable via the schema
+    // enum) must degrade to dark rather than silently mirroring live. A bare env
+    // with a garbage mirror value loads (not-live) instead of demanding the
+    // operational fields a live channel needs.
+    const res = loadConfigFromEnv({ SWITCHROOM_AGENT_NAME: "klanker", BUZZ_ENABLED: "1", BUZZ_MIRROR: "of" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.mirror).toBe("off");
+    expect(isChannelLive(res.config)).toBe(false);
+  });
+
+  it("keeps an explicit mirror:both live (control for LOW-1)", () => {
+    const res = loadConfigFromEnv(liveEnv({ BUZZ_MIRROR: "both" }));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.config.mirror).toBe("both");
+    expect(isChannelLive(res.config)).toBe(true);
   });
 });
 

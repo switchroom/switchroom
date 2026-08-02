@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { finalizeEvent, generateSecretKey, getPublicKey, verifyEvent } from "nostr-tools";
 import {
   buildAuthEvent,
@@ -213,6 +213,121 @@ describe("createNostrClient NIP-42 handshake", () => {
     expect(authEvent.tags).toContainEqual(["relay", "ws://127.0.0.1:3000"]);
     expect(authEvent.tags).not.toContainEqual(["relay", "ws://10.0.10.5:3000"]);
     expect(verifyEvent(authEvent as unknown as Parameters<typeof verifyEvent>[0])).toBe(true);
+    client.stop();
+  });
+});
+
+describe("createNostrClient.publish — Phase 2b outbound over the authed socket", () => {
+  const sk = generateSecretKey();
+
+  /** Bring a client to the live/subscribed state (open → REQ → EOSE). */
+  function liveClient() {
+    const fs = fakeSocket();
+    const client = createNostrClient({
+      relayUrl: "ws://relay",
+      relayTagUrl: "ws://relay",
+      relayHost: "127.0.0.1:3000",
+      groupId: "g",
+      secretKey: sk,
+      onEvent: () => {},
+      socketFactory: fs.factory,
+      nowSec: () => 1_700_000_000,
+    });
+    client.start();
+    fs.open();
+    fs.message(JSON.stringify(["EOSE", "buzz-in"])); // → subscribed=true
+    return { fs, client };
+  }
+
+  it("resolves the relay OK verdict for a matching event id", async () => {
+    const { fs, client } = liveClient();
+    const p = client.publish({ id: "evt-1" }, 10_000);
+    // The client put an EVENT frame on the wire.
+    const frame = JSON.parse(fs.sent[fs.sent.length - 1]);
+    expect(frame[0]).toBe("EVENT");
+    expect(frame[1].id).toBe("evt-1");
+    // Relay accepts it.
+    fs.message(JSON.stringify(["OK", "evt-1", true, "accepted"]));
+    await expect(p).resolves.toEqual({ ok: true, message: "accepted" });
+    client.stop();
+  });
+
+  it("resolves ok:false for a relay rejection (never throws)", async () => {
+    const { fs, client } = liveClient();
+    const p = client.publish({ id: "evt-2" }, 10_000);
+    fs.message(JSON.stringify(["OK", "evt-2", false, "blocked: rate-limited"]));
+    await expect(p).resolves.toEqual({ ok: false, message: "blocked: rate-limited" });
+    client.stop();
+  });
+
+  it("resolves ok:false when NOT connected/subscribed (a dropped mirror never throws)", async () => {
+    const fs = fakeSocket();
+    const client = createNostrClient({
+      relayUrl: "ws://relay",
+      relayTagUrl: "ws://relay",
+      relayHost: "127.0.0.1:3000",
+      groupId: "g",
+      secretKey: sk,
+      onEvent: () => {},
+      socketFactory: fs.factory,
+    });
+    client.start();
+    fs.open(); // connected but NOT yet subscribed (no EOSE)
+    await expect(client.publish({ id: "evt-3" }, 10_000)).resolves.toMatchObject({ ok: false });
+    client.stop();
+  });
+
+  it("resolves ok:false on OK timeout without a matching relay reply", async () => {
+    vi.useFakeTimers();
+    try {
+      const { client } = liveClient();
+      const p = client.publish({ id: "evt-4" }, 5_000);
+      vi.advanceTimersByTime(5_001);
+      await expect(p).resolves.toMatchObject({ ok: false });
+      client.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails every in-flight publish on stop() so no caller hangs at shutdown", async () => {
+    const { client } = liveClient();
+    const p = client.publish({ id: "evt-5" }, 10_000);
+    client.stop();
+    await expect(p).resolves.toEqual({ ok: false, message: "sidecar shutting down" });
+  });
+
+  it("does NOT resolve a publish on the AUTH event's own OK (id disambiguation)", async () => {
+    const fs = fakeSocket();
+    const client = createNostrClient({
+      relayUrl: "ws://relay",
+      relayTagUrl: "ws://relay",
+      relayHost: "127.0.0.1:3000",
+      groupId: "g",
+      secretKey: sk,
+      onEvent: () => {},
+      socketFactory: fs.factory,
+      nowSec: () => 1_700_000_000,
+    });
+    client.start();
+    fs.open();
+    // Drive the AUTH handshake so authEventId is set.
+    fs.message(JSON.stringify(["AUTH", "chal"]));
+    const authFrame = JSON.parse(fs.sent[fs.sent.length - 1]);
+    const authId = authFrame[1].id as string;
+    fs.message(JSON.stringify(["OK", authId, true, ""])); // → subscribed via resubscribe
+    fs.message(JSON.stringify(["EOSE", "buzz-in"]));
+
+    const p = client.publish({ id: "evt-6" }, 10_000);
+    let settled = false;
+    void p.then(() => { settled = true; });
+    // An OK for the AUTH id must NOT settle the pending publish.
+    fs.message(JSON.stringify(["OK", authId, true, ""]));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    // The publish's own OK settles it.
+    fs.message(JSON.stringify(["OK", "evt-6", true, ""]));
+    await expect(p).resolves.toEqual({ ok: true, message: "" });
     client.stop();
   });
 });
