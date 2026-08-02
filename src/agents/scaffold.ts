@@ -4356,6 +4356,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // gateway process as SWITCHROOM_BOOT_RESUME (exported before the gateway
     // fork in start.sh — the gateway reads it at boot-resume time).
     bootResumeMode: agentConfig.session_continuity?.boot_resume ?? "in-flight",
+    // Boot-briefing transport flag (session_continuity.briefing; default
+    // 'legacy'). Threaded to both the gateway (SWITCHROOM_SESSION_BRIEFING,
+    // exported before the gateway fork) and the inner handoff block (which
+    // skips handoff-briefing.sh when 'gateway' owns the briefing).
+    sessionBriefingMode: agentConfig.session_continuity?.briefing ?? "legacy",
     // True only when the generated start.sh can actually set CONTINUE_FLAG="--continue"
     // at runtime (i.e. resume_mode is 'auto' or 'continue'). In handoff/none mode the
     // case branches for auto/continue are omitted entirely so the literal string
@@ -7993,6 +7998,9 @@ function reconcileAgentInner(
       // 'in-flight'). Threaded to the gateway as SWITCHROOM_BOOT_RESUME.
       // Mirror of buildWorkspaceContext — reconcile must keep parity.
       bootResumeMode: agentConfig.session_continuity?.boot_resume ?? "in-flight",
+      // Boot-briefing transport flag (session_continuity.briefing; default
+      // 'legacy'). Mirror of buildWorkspaceContext — reconcile must keep parity.
+      sessionBriefingMode: agentConfig.session_continuity?.briefing ?? "legacy",
     };
     const beforeStartSh = existsSync(startShPath)
       ? readFileSync(startShPath, "utf-8")
