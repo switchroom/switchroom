@@ -43,7 +43,10 @@ export interface BuzzRuntimeConfig {
    *  from the canonical BUZZ_RELAY_URL, never from the dial address. */
   relayTagUrl: string;
   /** HTTP Host header authority for the WS upgrade (Phase 0 blocker #2).
-   *  Empty string ⇒ derive from relayUrl. */
+   *  REQUIRED when the channel is live (loadConfigFromEnv hard-errors on a
+   *  missing BUZZ_RELAY_HOST): the relay resolves its community from this header
+   *  before the upgrade and fail-closes to HTTP 404 otherwise. Empty only on a
+   *  non-live (disabled/'off') load, where the sidecar never dials. */
   relayHost: string;
   /** Relay-minted group UUID (NIP-29 `h` tag) subscribed to. */
   groupId: string;
@@ -95,9 +98,15 @@ export function loadConfigFromEnv(
   env: EnvMap,
 ): { ok: true; config: BuzzRuntimeConfig } | { ok: false; reason: string } {
   const enabled = env.BUZZ_ENABLED === "1" || env.BUZZ_ENABLED === "true";
+  // Phase 2b (S2): `origin` mode is DEFERRED — the hub's mirror hook lives only
+  // in sendReply (stream_reply / turn-flush bypass it), so `origin`'s "answer
+  // only on the origin channel" contract cannot be honored soundly. Degrade a
+  // configured `origin` to `off` (dark) deterministically rather than half-honor
+  // it. Only `both` and `off` ship live. See channel-route.ts parseConfiguredMirrorMode.
   const mirror = ((): "both" | "origin" | "off" => {
     const m = env.BUZZ_MIRROR;
-    return m === "origin" || m === "off" ? m : "both";
+    if (m === "off" || m === "origin") return "off";
+    return "both";
   })();
 
   const agentName = env.SWITCHROOM_AGENT_NAME?.trim() ?? "";
@@ -123,6 +132,17 @@ export function loadConfigFromEnv(
     if (!groupId) return { ok: false, reason: "BUZZ_CHANNEL_IDS missing" };
     if (!operatorPubkey) {
       return { ok: false, reason: "BUZZ_OPERATOR_PUBKEY missing" };
+    }
+    // Coordinator directive (2026-08-03), verified live against the relay: the
+    // relay resolves its tenant/community from the HTTP `Host` header BEFORE the
+    // WS upgrade and fail-closes — a missing/wrong Host returns HTTP 404
+    // "relay: no community is configured for this host" and the socket never
+    // upgrades. So the Host is REQUIRED, deployment config (not derived at
+    // runtime): a missing one must be a hard config error here, not a silent
+    // 404 reconnect loop. `normalize_host` strips only :443/:80, so the value
+    // is sent VERBATIM (port included, e.g. 127.0.0.1:3000).
+    if (!env.BUZZ_RELAY_HOST?.trim()) {
+      return { ok: false, reason: "BUZZ_RELAY_HOST missing (the relay resolves its community from the HTTP Host header before the WS upgrade; without it the relay fail-closes to HTTP 404 and the socket never upgrades — the Host is required deployment config, not derived)" };
     }
   }
 

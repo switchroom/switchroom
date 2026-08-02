@@ -23,6 +23,9 @@ import type {
   SessionEventForward,
   ToolCallMessage,
   ToolCallResult,
+  HelloBuzzPeerMessage,
+  OutboundToBuzzMessage,
+  BuzzPublishResultMessage,
 } from "./ipc-protocol.js";
 import { RICH_MESSAGE_MAX_CHARS } from "../format.js";
 import { OPERATOR_EVENT_KINDS } from "../operator-events.js";
@@ -160,6 +163,16 @@ export interface IpcServerOptions {
     client: IpcClient,
     msg: RolloutStatusEditMessage,
   ) => void | Promise<void>;
+  /**
+   * Buzz co-channel Phase 2b — the duplex Buzz peer's advisory publish outcome
+   * (`buzz_publish_result`). Handler feeds the buzz-mirror hub's correlation
+   * map: it frees the pending slot and, on success, records the published
+   * eventId so a later `correction` can target it. Fire-and-forget — under
+   * `both` mode the Telegram copy is the guaranteed delivery, so a failed
+   * publish never fails or retries the answer. Optional; a gateway without Buzz
+   * wired simply drops the message.
+   */
+  onBuzzPublishResult?: (client: IpcClient, msg: BuzzPublishResultMessage) => void;
   log?: (msg: string) => void;
   /**
    * How long (in ms) to wait without a heartbeat before force-closing the
@@ -178,6 +191,15 @@ export interface IpcClient {
   id: string;
   agentName: string | null;
   topicId: number | null;
+  /**
+   * Buzz co-channel Phase 2b (S7). True IFF this connection announced itself
+   * as the duplex Buzz publish peer via `hello_buzz_peer`. A peer NEVER holds
+   * an `agentName`/`agentIndex` slot; the flag makes the peer and agent-bridge
+   * roles mutually exclusive (a `register` is refused on a peer connection and
+   * vice-versa) and is what keeps the peer connection watchdog-exempt (it rides
+   * the existing `agentName === null` exemption — the peer has no heartbeat).
+   */
+  isBuzzPeer: boolean;
   send(msg: GatewayToClient): void;
   close(): void;
   isAlive(): boolean;
@@ -190,6 +212,14 @@ export interface IpcServer {
   broadcast(msg: GatewayToClient): void;
   getClient(agentName: string): IpcClient | undefined;
   clientCount(): number;
+  /**
+   * Buzz co-channel Phase 2b. Send an `outbound_to_buzz` request to the single
+   * duplex Buzz peer, if one is currently connected. Returns false (no send)
+   * when no peer has announced itself — the caller (buzz-mirror hub) treats a
+   * false return as "Buzz unreachable" and simply drops the mirror; the
+   * guaranteed Telegram copy already went out, so nothing fails or retries.
+   */
+  sendToBuzzPeer(msg: OutboundToBuzzMessage): boolean;
   close(): Promise<void>;
 }
 
@@ -493,6 +523,25 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         || (m.text as string).length > RICH_MESSAGE_MAX_CHARS) return false;
       return true;
     }
+    case "hello_buzz_peer": {
+      // Buzz co-channel Phase 2b — the sidecar's one-time duplex-peer
+      // announcement. Wire shape only; the handler parks it in the dedicated
+      // buzzPeerClient slot and enforces role-disjointness with `register`.
+      return typeof m.agentName === "string"
+        && AGENT_NAME_RE.test(m.agentName as string);
+    }
+    case "buzz_publish_result": {
+      // Buzz co-channel Phase 2b — the sidecar's advisory publish outcome.
+      if (typeof m.correlationId !== "string"
+        || (m.correlationId as string).length === 0
+        || (m.correlationId as string).length > 64) return false;
+      if (typeof m.ok !== "boolean") return false;
+      if (m.eventId !== undefined
+        && (typeof m.eventId !== "string" || (m.eventId as string).length > 128)) return false;
+      if (m.error !== undefined
+        && (typeof m.error !== "string" || (m.error as string).length > 500)) return false;
+      return true;
+    }
     default:
       return false;
   }
@@ -522,9 +571,16 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onRequestConfigFinalize,
     onRolloutStatusPost,
     onRolloutStatusEdit,
+    onBuzzPublishResult,
     log = () => {},
     heartbeatTimeoutMs = 30_000,
   } = options;
+
+  // Buzz co-channel Phase 2b (S7) — the single duplex Buzz publish peer's
+  // connection, or null when none is connected. Parked here (never in
+  // agentIndex) so `outbound_to_buzz` addresses exactly one peer and the peer
+  // never shadows an agent-bridge slot. Nulled in removeClient on disconnect.
+  let buzzPeerClient: IpcClientImpl | null = null;
 
   // Hub-side dedup ring for Buzz injects (fable MAJOR-2). The Buzz sidecar's
   // durable journal covers the normal case, but a crash AFTER the gateway
@@ -593,6 +649,10 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     if (client.topicId != null && topicIndex.get(client.topicId) === client) {
       topicIndex.delete(client.topicId);
     }
+    // Buzz co-channel Phase 2b — release the duplex peer slot if this was it,
+    // identity-checked (a fast peer reconnect may have already installed a new
+    // peer before this old connection's close runs).
+    if (buzzPeerClient === client) buzzPeerClient = null;
     loggedLegacyUpdatePlaceholder.delete(client.id);
     onClientDisconnected(client);
     log(`client disconnected: ${client.id} (agent=${client.agentName})`);
@@ -872,6 +932,12 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         // The handler replies `rollout_status_edited` (#4065) when it can; an
         // unwired gateway sends nothing and hostd's bounded wait expires.
         break;
+      case "hello_buzz_peer":
+        handleHelloBuzzPeer(client, msg as HelloBuzzPeerMessage);
+        break;
+      case "buzz_publish_result":
+        if (onBuzzPublishResult) onBuzzPublishResult(client, msg as BuzzPublishResultMessage);
+        break;
       case "update_placeholder":
         // Legacy recall.py IPC — placeholder UX was removed in #553 PR 5.
         // Soft-accepted so recall.py keeps working without modifying
@@ -887,7 +953,49 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     }
   }
 
+  /**
+   * Buzz co-channel Phase 2b (S7). Accept a `hello_buzz_peer` announcement,
+   * parking the connection as the single duplex Buzz publish peer. Enforces
+   * role-disjointness as a CODE mechanism, not sidecar self-discipline:
+   *   - a connection that already `register`ed (agentName set) or already
+   *     announced as a peer is refused (close+drop);
+   *   - the reciprocal refusal — a `register` on a peer connection — lives in
+   *     handleRegister below.
+   * The peer NEVER touches agentIndex/topicIndex and carries no heartbeat, so
+   * it rides the watchdog's existing `agentName === null` exemption untouched.
+   */
+  function handleHelloBuzzPeer(client: IpcClientImpl, msg: HelloBuzzPeerMessage) {
+    if (client.agentName !== null || client.isBuzzPeer) {
+      log(
+        `rejecting hello_buzz_peer: connection already has a role ` +
+        `(agent=${client.agentName ?? "none"} isBuzzPeer=${client.isBuzzPeer}) — close+drop client=${client.id}`,
+      );
+      try { client.close(); } catch { /* nothing to do */ }
+      return;
+    }
+    // Replace a prior stale peer connection (e.g. a sidecar reconnect) cleanly.
+    if (buzzPeerClient && buzzPeerClient !== client) {
+      log(`hello_buzz_peer: replacing prior buzz peer (prior_id=${buzzPeerClient.id} new_id=${client.id})`);
+      try { buzzPeerClient.close(); } catch { /* nothing to do */ }
+    }
+    client.isBuzzPeer = true;
+    buzzPeerClient = client;
+    log(`registered buzz publish peer for agent=${msg.agentName} id=${client.id}`);
+  }
+
   function handleRegister(client: IpcClientImpl, msg: RegisterMessage) {
+    // Buzz co-channel Phase 2b (S7) — reciprocal role-disjointness: a
+    // connection that announced itself as the duplex Buzz peer must never be
+    // allowed to claim an agentIndex slot. Refuse server-side (a code check,
+    // not sidecar self-discipline).
+    if (client.isBuzzPeer) {
+      log(
+        `rejecting register: connection is the Buzz publish peer, not an agent bridge ` +
+        `(close+drop client=${client.id})`,
+      );
+      try { client.close(); } catch { /* nothing to do */ }
+      return;
+    }
     // Defence in depth for #430. The bridge refuses to register
     // without SWITCHROOM_AGENT_NAME (set in start.sh per agent), but
     // an older bridge or a third-party caller could still send the
@@ -960,6 +1068,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     id: string;
     agentName: string | null = null;
     topicId: number | null = null;
+    isBuzzPeer = false;
     lastHeartbeat: number = Date.now();
     _socket: import("bun").Socket<SocketData>;
     private _closed = false;
@@ -1094,6 +1203,12 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
 
     clientCount(): number {
       return clients.size;
+    },
+
+    sendToBuzzPeer(msg: OutboundToBuzzMessage): boolean {
+      if (!buzzPeerClient || !buzzPeerClient.isAlive()) return false;
+      buzzPeerClient.send(msg);
+      return true;
     },
 
     async close(): Promise<void> {

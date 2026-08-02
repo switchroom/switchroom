@@ -62,6 +62,15 @@ export function buildAuthFrame(authEvent: NostrEventLike): unknown[] {
   return ["AUTH", authEvent];
 }
 
+/**
+ * Build the `["EVENT", <signed event>]` client PUBLISH frame (Phase 2b). The
+ * relay answers with `["OK", <event.id>, <accepted>, <message>]`, which
+ * `parseRelayFrame` surfaces as an `OK` frame keyed on the event id.
+ */
+export function buildEventPublishFrame(event: NostrEventLike): unknown[] {
+  return ["EVENT", event];
+}
+
 export type RelayFrame =
   | { type: "EVENT"; subId: string; event: NostrEventLike }
   | { type: "EOSE"; subId: string }

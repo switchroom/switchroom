@@ -87,6 +87,7 @@ import {
 import { OutboundDedupCache } from '../recent-outbound-dedup.js'
 import { FlushedTurnSupersedeRegistry } from '../flushed-turn-supersede.js'
 import { resolveReplyOwnerTurnWith, SUPERSEDE_OPEN_CAP_MS, SUPERSEDE_GRACE_MS } from './reply-owner-wiring.js'
+import { getBuzzMirror, maybeBootBuzzMirror } from './buzz-mirror.js'
 import { subagentReplyAuthority } from './subagent-reply-authority.js'
 import { createInboundCoalescer, inboundCoalesceKey } from './inbound-coalesce.js'
 import {
@@ -3690,7 +3691,7 @@ export type CurrentTurn = {
   // registry's older entries (and any hand-built test turn) tolerate its
   // absence; `emissionAuthorityFor` lazily backfills one when missing.
   emissionAuthority?: EmissionAuthority
-  originChannel: 'telegram' | 'buzz'; buzzCoords?: { channelId: string; eventId: string; threadRoot: string } } // Buzz Phase 2a: origin provenance stamped ONCE at the turn ctor via parseChannelOrigin(ev.rawContent) (channel-route.ts); buzzCoords present IFF originChannel==='buzz'. Types inlined + closing brace merged onto this line to hold gateway.ts at its zero-headroom anti-inflation ratchet (switchroom#2996); structurally identical to channel-route.ts Channel/BuzzCoords.
+  readonly originChannel: 'telegram' | 'buzz'; readonly buzzCoords?: { channelId: string; eventId: string; threadRoot: string } } // Buzz Phase 2a/2b: origin provenance stamped ONCE at the turn ctor via parseChannelOrigin(ev.rawContent) (channel-route.ts); buzzCoords present IFF originChannel==='buzz'. `readonly` enforces single-writer immutability (MINOR-2) — no `.originChannel=`/`.buzzCoords=` reassignment compiles. Types inlined + brace merged to hold gateway.ts at its zero-headroom ratchet (switchroom#2996); structurally identical to channel-route.ts Channel/BuzzCoords (type-identity asserted in channel-route.ts, MINOR-3).
 
 // PR-4e — the singleton `currentTurn` is RETAINED as (a) the flag-OFF store and
 // (b) the flag-ON "most-recent-set" MIRROR. Every GLOBAL-liveness read in this
@@ -11760,8 +11761,12 @@ if (isGatewayMain) ipcServer = createIpcServer({
     )
   },
 
+  // Buzz Phase 2b: the duplex peer's advisory publish outcome — no-op unless the hub mirror booted.
+  onBuzzPublishResult: (_c, m) => getBuzzMirror()?.onPublishResult(m),
   log: (msg) => process.stderr.write(`telegram gateway: ipc — ${msg}\n`),
 })
+// Buzz Phase 2b: boot the hub mirror (dark unless channels.buzz.enabled + mode both); wires the peer transport, else a no-op.
+if (isGatewayMain) maybeBootBuzzMirror((msg) => ipcServer.sendToBuzzPeer(msg))
 
 // ─── Webhook ingest server (RFC webhook-via-gateway-socket) ───────────────
 // Under the Docker runtime the host-side web receiver runs as the operator
@@ -12504,21 +12509,15 @@ async function executeReply(
 function gatewaySendReplyDeps(): SendReplyGatewayDeps {
   return {
     // the ONE live instances (Amendment 1/9 — never re-new in a module)
-    outboundDedup,
-    flushedTurnSupersede,
-    firstTextReplyLogged,
-    suppressPtyPreview,
-    activeDraftStreams,
-    lastPtyPreviewByChat,
-    voiceOnDemandCache,
-    voicePreSynthQueue,
-    pendingProgress,
-    signalTracker,
+    outboundDedup, flushedTurnSupersede,
+    firstTextReplyLogged, suppressPtyPreview,
+    activeDraftStreams, lastPtyPreviewByChat,
+    voiceOnDemandCache, voicePreSynthQueue,
+    pendingProgress, signalTracker,
     silencePoke,
     getCurrentTurn: () => currentTurn,
     getLastActiveTurnChatId: () => lastActiveTurnChatId,
-    HISTORY_ENABLED,
-    TURN_ORIGIN_ROUTING_ENABLED,
+    HISTORY_ENABLED, TURN_ORIGIN_ROUTING_ENABLED,
     AUTOCLASSIFY_MIDTURN_SHADOW,
     MAX_ATTACHMENT_BYTES,
     MAX_CHUNK_LIMIT,
@@ -12533,8 +12532,7 @@ function gatewaySendReplyDeps(): SendReplyGatewayDeps {
     statusKey,
     streamKey,
     resolveReplyOwnerTurn,
-    findTurnByOriginId,
-    findTurnByQuotedMessageId,
+    findTurnByOriginId, findTurnByQuotedMessageId, findLatestTurnForChat,
     resolveAnswerThreadWithLog,
     resolveThreadId,
     getLatestInboundMessageId,
@@ -13282,6 +13280,8 @@ async function executeEditMessage(args: Record<string, unknown>): Promise<unknow
       process.stderr.write(`telegram gateway: history recordEdit failed: ${err}\n`)
     }
   }
+  // Buzz Phase 2b: mirror the edit as a debounced Buzz correction keyed on the edited id — no-op when Buzz is dark or the message was never published; post-delivery, never throws.
+  getBuzzMirror()?.mirrorCorrection({ telegramMessageKey: `${String(args.chat_id ?? '')}:${Number(args.message_id)}`, scrubbedText: editRawText })
   return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
 }
 

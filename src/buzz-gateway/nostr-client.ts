@@ -17,6 +17,7 @@ import type { NostrEventLike } from "./auth-gate.js";
 import {
   buildAuthEvent,
   buildAuthFrame,
+  buildEventPublishFrame,
   buildReqFrame,
   parseRelayFrame,
   type NostrFilter,
@@ -87,10 +88,24 @@ export interface NostrClientOptions {
   clearTimer?: (t: ReturnType<typeof setTimeout>) => void;
 }
 
+/** Relay verdict for a PUBLISH: the `["OK", id, accepted, message]` reply. */
+export interface PublishVerdict {
+  ok: boolean;
+  message?: string;
+}
+
 export interface NostrClient {
   start(): void;
   stop(): void;
   isSubscribed(): boolean;
+  /**
+   * Phase 2b — publish one already-signed event over the SAME NIP-42
+   * authenticated socket and resolve with the relay's OK verdict. Resolves
+   * `{ ok:false }` (never rejects) when the socket is down or the relay does not
+   * answer within `timeoutMs`, so a failed mirror never throws into the caller.
+   * The event id MUST be its true `getEventHash` id (the relay keys OK on it).
+   */
+  publish(event: { id: string }, timeoutMs: number): Promise<PublishVerdict>;
 }
 
 const SUB_ID = "buzz-in";
@@ -110,6 +125,12 @@ export function createNostrClient(opts: NostrClientOptions): NostrClient {
   let stopped = false;
   let subscribed = false;
   let authEventId: string | null = null;
+  // Phase 2b — in-flight PUBLISHes awaiting their `["OK", id, …]`, keyed on the
+  // event id. Resolved by the OK handler or a per-publish timeout.
+  const pendingPublishes = new Map<
+    string,
+    { resolve: (v: PublishVerdict) => void; timer: ReturnType<typeof setTimeout> }
+  >();
   let delay = minMs;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   // Highest created_at we have delivered — the resubscribe watermark. Start one
@@ -146,6 +167,14 @@ export function createNostrClient(opts: NostrClientOptions): NostrClient {
           } else {
             log(`buzz nostr: AUTH rejected: ${frame.message}`);
           }
+          break;
+        }
+        // Phase 2b — a PUBLISH verdict. Resolve the matching in-flight publish.
+        const pend = pendingPublishes.get(frame.eventId);
+        if (pend) {
+          clearTimeout(pend.timer);
+          pendingPublishes.delete(frame.eventId);
+          pend.resolve({ ok: frame.accepted, message: frame.message });
         }
         break;
       }
@@ -242,9 +271,39 @@ export function createNostrClient(opts: NostrClientOptions): NostrClient {
         try { socket.close(); } catch { /* nothing to do */ }
         socket = null;
       }
+      // Fail any in-flight publishes so no caller hangs on shutdown.
+      for (const [, p] of pendingPublishes) {
+        clearTimeout(p.timer);
+        p.resolve({ ok: false, message: "sidecar shutting down" });
+      }
+      pendingPublishes.clear();
     },
     isSubscribed(): boolean {
       return subscribed;
+    },
+    publish(event, timeoutMs): Promise<PublishVerdict> {
+      if (!socket || !subscribed) {
+        // Not connected/authed — the answer already delivered on Telegram, so a
+        // dropped mirror is reported honestly, never thrown.
+        return Promise.resolve({ ok: false, message: "relay socket not connected" });
+      }
+      return new Promise<PublishVerdict>((resolve) => {
+        const timer = setTimeout(() => {
+          pendingPublishes.delete(event.id);
+          resolve({ ok: false, message: `relay OK timeout after ${timeoutMs}ms` });
+        }, timeoutMs);
+        if (typeof (timer as { unref?: () => void }).unref === "function") {
+          (timer as { unref: () => void }).unref();
+        }
+        pendingPublishes.set(event.id, { resolve, timer });
+        try {
+          socket!.send(JSON.stringify(buildEventPublishFrame(event as unknown as NostrEventLike)));
+        } catch (err) {
+          clearTimeout(timer);
+          pendingPublishes.delete(event.id);
+          resolve({ ok: false, message: `publish send failed: ${(err as Error).message}` });
+        }
+      });
     },
   };
 }

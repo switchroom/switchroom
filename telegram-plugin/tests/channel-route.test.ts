@@ -6,6 +6,8 @@ import {
   parseChannelOrigin,
   resolveRoute,
   isBuzzTurnRoutingEnabled,
+  parseConfiguredMirrorMode,
+  isBuzzThreadedPublishSafe,
   type Channel,
   type MirrorMode,
 } from '../gateway/channel-route.js'
@@ -246,5 +248,48 @@ describe('isBuzzTurnRoutingEnabled — Phase 2a feature flag', () => {
     expect(isBuzzTurnRoutingEnabled({ SWITCHROOM_BUZZ_TURN_ROUTING: '1' })).toBe(true)
     expect(isBuzzTurnRoutingEnabled({ SWITCHROOM_BUZZ_TURN_ROUTING: 'false' })).toBe(true) // only "0" is the kill switch
     expect(isBuzzTurnRoutingEnabled({ SWITCHROOM_BUZZ_TURN_ROUTING: '0' })).toBe(false)
+  })
+})
+
+describe('parseConfiguredMirrorMode — Phase 2b S2 (origin DEFERRED)', () => {
+  // S2: 'origin' cannot be honored soundly in 2b (the mirror hook lives only in
+  // sendReply), so a configured 'origin' MUST degrade to 'off' — never ship a
+  // half-live 'origin'. Only 'both' and 'off' are valid live modes.
+  it('narrows to both|off and degrades origin → off', () => {
+    expect(parseConfiguredMirrorMode('both')).toBe('both')
+    expect(parseConfiguredMirrorMode(undefined)).toBe('both') // default
+    expect(parseConfiguredMirrorMode('off')).toBe('off')
+    // The load-bearing S2 assertion: 'origin' is DEFERRED, degraded to dark.
+    expect(parseConfiguredMirrorMode('origin')).toBe('off')
+    // Anything unrecognised falls back to the documented default.
+    expect(parseConfiguredMirrorMode('sometimes')).toBe('both')
+  })
+
+  it('never returns "origin" for any input (2b cannot honor it)', () => {
+    for (const raw of ['origin', 'both', 'off', '', 'ORIGIN', undefined, 'garbage']) {
+      expect(parseConfiguredMirrorMode(raw as string | undefined)).not.toBe('origin')
+    }
+  })
+})
+
+describe('isBuzzThreadedPublishSafe — Phase 2b S1 owner-guard', () => {
+  // S1: the deterministic pre-publish buzz-owner guard. It gates ONLY the
+  // buzz-origin THREADED/signed publish. Safe IFF the reply positively echoed
+  // the owner turn's id (ownerEchoed) OR there is NO recent different-origin
+  // turn the reply could otherwise have belonged to.
+  it('is safe when the reply echoed the owner id (regardless of other turns)', () => {
+    expect(isBuzzThreadedPublishSafe({ ownerEchoed: true, hasRecentDifferentOriginTurn: false })).toBe(true)
+    expect(isBuzzThreadedPublishSafe({ ownerEchoed: true, hasRecentDifferentOriginTurn: true })).toBe(true)
+  })
+
+  it('is safe when un-echoed but NO recent different-origin turn exists', () => {
+    expect(isBuzzThreadedPublishSafe({ ownerEchoed: false, hasRecentDifferentOriginTurn: false })).toBe(true)
+  })
+
+  it('T-6b: BLOCKS an un-echoed reply when a recent different-origin turn exists (misroute guard)', () => {
+    // The exact S1 misroute scenario: a live buzz turn plus an un-echoed reply
+    // that actually belonged to a prior Telegram DM turn. The guard must refuse
+    // the threaded buzz publish (fail safe to Telegram-only).
+    expect(isBuzzThreadedPublishSafe({ ownerEchoed: false, hasRecentDifferentOriginTurn: true })).toBe(false)
   })
 })

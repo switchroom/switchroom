@@ -199,6 +199,61 @@ export function resolveRoute(
 }
 
 /**
+ * Buzz co-channel — Phase 2b, safety correction S2. The ONLY mirror modes that
+ * ship live in 2b are `both` and `off`. `origin` is DEFERRED: the mirror hook
+ * lives exclusively in `sendReply`, so the `stream_reply` / turn-flush answer
+ * paths bypass it — `origin`'s "answer only on the origin channel" contract
+ * cannot be honored soundly (a buzz-origin turn under `origin` would still get
+ * a Telegram copy from those bypassing paths, and could NOT get a reliable
+ * buzz-only answer). Rather than half-honor it, degrade a configured `origin`
+ * to `off` (dark) deterministically here — a code mechanism, not a runtime
+ * assumption. Absent/`both` ⇒ `both`; `off`/`origin` ⇒ `off`.
+ */
+export function parseConfiguredMirrorMode(raw: string | undefined): 'both' | 'off' {
+  if (raw === 'off' || raw === 'origin') return 'off'
+  return 'both'
+}
+
+/**
+ * Buzz co-channel — Phase 2b, safety correction S1 (the misroute fix).
+ *
+ * DETERMINISTIC pre-publish owner guard for the ONE dangerous path: a THREADED
+ * publish into an existing Buzz conversation (a reply whose resolved owner turn
+ * originated on Buzz, so the answer would be signed and posted using that turn's
+ * Buzz coordinates). This is a code mechanism, never prompt discipline.
+ *
+ * The hazard (S1): in a Telegram DM the reply tool omits `origin_turn_id`, so
+ * reply-owner resolution falls through to the live-turn tier. Without a guard, a
+ * late or extra reply that actually belonged to an EARLIER Telegram DM turn can
+ * bind to a concurrently-live Buzz turn and be published as a signed public
+ * Nostr event addressed into a stranger's thread — a cross-channel misroute.
+ *
+ * The guard is consulted ONLY on the buzz-origin threaded-publish decision (the
+ * buzz-mirror hub gates its call on `ownerOriginChannel === 'buzz'`). It is NOT
+ * applied to the telegram-origin→Buzz top-level mirror under `both` mode: that
+ * path binds to no Buzz owner turn and no Buzz coordinates (it is a fresh
+ * top-level post the operator consented to by enabling `both`), so there is no
+ * owner binding to misresolve. See design §3.3 for why the two paths are
+ * separated (and the reconciliation note recorded there against S1's wording).
+ *
+ * Safe to publish the threaded Buzz reply IFF EITHER:
+ *   - the reply POSITIVELY echoed the owner turn's id (`origin_turn_id`
+ *     round-tripped and matched) — an explicit, forge-checked binding; OR
+ *   - there is NO live/recent turn of a DIFFERENT origin within the supersede
+ *     window that the reply could otherwise have belonged to — so the live-tier
+ *     binding to the Buzz turn is unambiguous.
+ * Otherwise fail safe: the buzz-mirror hub drops the Buzz publish entirely and
+ * the answer is delivered Telegram-only. The guarantee is never to sign+publish
+ * a Buzz event on an ambiguous owner binding.
+ */
+export function isBuzzThreadedPublishSafe(input: {
+  ownerEchoed: boolean
+  hasRecentDifferentOriginTurn: boolean
+}): boolean {
+  return input.ownerEchoed || !input.hasRecentDifferentOriginTurn
+}
+
+/**
  * Phase 2a feature flag. Default ON (escape-hatch convention, mirroring the
  * fleet's other `SWITCHROOM_*` module flags): only an explicit `'0'` disables.
  * Reads from an injected env map so the flag is unit-testable without mutating

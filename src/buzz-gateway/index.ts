@@ -27,6 +27,8 @@ import { isChannelLive, loadConfigFromEnv, resolveRelayHost } from "./config.js"
 import { createDedupStore } from "./dedup.js";
 import { makeInject } from "./ipc-peer.js";
 import { createNostrClient, type SocketFactory, type WsLike } from "./nostr-client.js";
+import { createBuzzPeerClient } from "./peer-client.js";
+import { publishOutbound, type PublishTransport } from "./publisher.js";
 import { createInboundPump } from "./pump.js";
 import { createRetryQueue } from "./retry-queue.js";
 
@@ -167,9 +169,44 @@ async function main(): Promise<void> {
     log,
   });
 
+  // ── Phase 2b OUTBOUND: the duplex publish peer ──────────────────────────
+  // A SECOND gateway connection (distinct from the send-only inject client)
+  // that receives `outbound_to_buzz` publish requests from the hub and signs +
+  // publishes each over the SAME NIP-42 authenticated relay socket. Signing is
+  // the sole content-signer (publisher.ts, S3); the relay transport is the
+  // nostr client's `publish`. A publish failure is reported honestly back to
+  // the hub — never retried into a duplicate (the answer already landed on
+  // Telegram under `both`).
+  const publishTransport: PublishTransport = (event, timeoutMs) => nostr.publish(event, timeoutMs);
+  const buzzPeer = createBuzzPeerClient({
+    socketPath,
+    agentName: config.agentName,
+    onOutbound: async (req) => {
+      const result = await publishOutbound(
+        {
+          channelId: req.channelId,
+          replyToEventId: req.replyToEventId,
+          threadRootId: req.threadRootId,
+          payload: req.payload,
+        },
+        secretKey,
+        publishTransport,
+      );
+      return {
+        type: "buzz_publish_result",
+        correlationId: req.correlationId,
+        ok: result.ok,
+        ...(result.eventId ? { eventId: result.eventId } : {}),
+        ...(result.error ? { error: result.error } : {}),
+      };
+    },
+    log,
+  });
+
   const shutdown = () => {
     log("shutting down");
     try { nostr.stop(); } catch { /* nothing to do */ }
+    try { buzzPeer.close(); } catch { /* nothing to do */ }
     try { retryQueue.stop(); } catch { /* nothing to do */ }
     try { ipcClient.close(); } catch { /* nothing to do */ }
     try { dedup.close(); } catch { /* nothing to do */ }
