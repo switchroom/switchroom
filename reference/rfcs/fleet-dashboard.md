@@ -36,7 +36,7 @@ The connection is **observe + operator-chat, approvals stay on Telegram**:
   methods/events; per the desktop's graceful-degradation behaviour that panel
   just stays empty. The Telegram tap remains the sole approval surface.
 
-**`telegram-only` is not crossed.** That invariant governs the *principal's*
+**`telegram-and-buzz-only` is not crossed.** That invariant governs the *principal's*
 channel. It bars a second chat channel for the people the team serves
 (WhatsApp, Signal, Slack). The dashboard is an **admin component** of
 switchroom, not a principal channel, so it is out of that invariant's scope.
@@ -48,7 +48,7 @@ desktop fork is maintained. We track upstream by implementing its contract.
 ## Decisions (owner-ratified)
 
 These were settled with the owner before this draft (see the admin-console
-scope note under `telegram-only` in `invariants.md`):
+scope note under `telegram-and-buzz-only` in `invariants.md`):
 
 1. **No return of the progress card.** This is not the retired #1122 card
    rebuilt anywhere. The live desktop activity stream is an **operator**
@@ -119,7 +119,7 @@ Model/provider/env endpoints return Switchroom's claude-native truth
    `message.delta` so the desktop is live too.
 
 Result: exactly one record (Telegram), the desktop is an input + live view,
-nothing is hidden. This is what keeps the admin console out of `telegram-only`'s scope (an input that feeds the one thread, not a second channel).
+nothing is hidden. This is what keeps the admin console out of `telegram-and-buzz-only`'s scope (an input that feeds the one thread, not a second channel).
 
 ## Alignment review of the original external plan (still valid)
 
@@ -183,7 +183,7 @@ embedded-terminal path; Hermes's own messaging-platform gateway; deprecating
 | `claude-native` | Pass — adapter emits events + answers RPCs over Switchroom's own data/IPC; no API/SDK/token; the agent runtime is still the unmodified CLI. |
 | `no-self-escalation` | Pass — approval methods are not implemented; the Telegram tap stays the sole approval surface. |
 | `chat-is-the-single-source-of-truth` | Pass — operator-audience surface; chat prompt untouched (no crutch); turns + replies mirror into the one Telegram thread. |
-| `telegram-only` | Pass — **not crossed.** The invariant governs *principal* channels; the dashboard is an admin component, out of scope. The admin-console conditions (operator audience, mirrored to the one Telegram thread, approvals on Telegram) keep it from becoming a second channel. A principal-facing bridge (WhatsApp/Signal/web chat) would still be out. |
+| `telegram-and-buzz-only` | Pass — **not crossed.** The invariant governs *principal* channels; the dashboard is an admin component, out of scope. The admin-console conditions (operator audience, mirrored to the one Telegram thread, approvals on Telegram) keep it from becoming a second channel. A principal-facing bridge (WhatsApp/Signal/web chat) would still be out. |
 | `single-tenant` | Pass — one operator, auth-gated, single deployment. |
 
 ## Testing

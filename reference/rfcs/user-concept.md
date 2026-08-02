@@ -161,7 +161,10 @@ with no `users:` block generates empty maps and behaves exactly as today.
   the speaker's profile is a natural follow-on, now that `user` exists.
 - **Identity-keyed approvals / scheduling / quotas** — the `user` entity is
   the anchor; those are separate RFCs.
-- **A user driving from a non-Telegram channel** — out by `telegram-only`.
+- **A user driving from outside the two sanctioned channels** — out by
+  `telegram-and-buzz-only`. (Buzz identity is a separate question: its
+  inbound allowlist is operator-pinned pubkeys, and this RFC's `user`
+  entity is Telegram-keyed.)
 
 ## Open questions
 

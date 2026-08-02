@@ -110,7 +110,9 @@ cron you created. Median ack within seconds.
 
 One agent per specialist, each a long-running service in its own Docker
 container, running the unmodified `claude` CLI authenticated with the
-operator's Pro/Max OAuth. The operator talks to the fleet from Telegram. A
+operator's Pro/Max OAuth. The operator talks to the fleet from Telegram —
+authoritative — plus an optional desktop co-channel, Buzz (dark by default,
+mirror of the Telegram record). A
 shared broker holds secrets; an approval kernel gates access an agent does
 not already have. Schedules and beck-and-call only, never a loop of its own.
 (Runtime detail lives in `CLAUDE.md` and `docs/`; this doc stays at the
@@ -149,5 +151,6 @@ Each links its job spec in `jobs/`.
 - [`survive-reboots-and-real-life.md`](jobs/survive-reboots-and-real-life.md) — turns silently dropped across reboots/network drops, target zero
 - [`idempotent-update-and-restart.md`](jobs/idempotent-update-and-restart.md) — update/restart operations completing cleanly and idempotently, target ~100%
 - [`talk-to-agents-from-anywhere.md`](jobs/talk-to-agents-from-anywhere.md) — median ack latency from Telegram message to acknowledgement
+- [`use-my-team-from-the-desktop.md`](jobs/use-my-team-from-the-desktop.md) — share of desk-origin turns whose full exchange also lands in the Telegram thread, target 100%
 - [`act-in-my-tools-with-an-identity.md`](jobs/act-in-my-tools-with-an-identity.md) — share of external-tool actions attributable to a named agent identity
 - [`fleet-stays-healthy.md`](jobs/fleet-stays-healthy.md) — share of recurring per-job failures the fleet surfaces and tracks itself vs found by a principal complaining

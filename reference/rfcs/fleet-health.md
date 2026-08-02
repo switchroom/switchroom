@@ -319,7 +319,7 @@ It shows:
 It is an **operator surface** — same posture as the fleet dashboard
 (`see-my-whole-fleet-from-one-screen`): authenticated, single-tenant, never a
 principal channel, and it renders no parallel status mirror into a Telegram
-thread. `telegram-only` and `chat-is-the-single-source-of-truth` hold.
+thread. `telegram-and-buzz-only` and `chat-is-the-single-source-of-truth` hold.
 
 ## Evidence tiers + failure-mode taxonomy (the sensor's classification)
 

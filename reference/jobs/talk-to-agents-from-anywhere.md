@@ -3,7 +3,7 @@ job: talk to my agents from anywhere
 outcome: The user can drive their fleet from a phone on the train as naturally as from a laptop at a desk. The interaction surface is where the user already is.
 stakes: If the product requires the user to be at a machine, it's a dev tool, not an assistant. Most of the user's life happens away from the keyboard.
 serves: always-available
-invariants: [telegram-only]
+invariants: [telegram-and-buzz-only]
 ---
 
 # Job Spec: talk to my agents from anywhere
@@ -24,7 +24,10 @@ or pause their agents must be reachable from where they already are.
 
 This is not porting a CLI to mobile. It's accepting
 the phone as the primary surface and designing back from there. The desktop
-benefits from that discipline rather than being diminished by it.
+benefits from that discipline rather than being diminished by it — and it
+has its own first-class surface, Buzz
+([`use-my-team-from-the-desktop`](use-my-team-from-the-desktop.md)); this
+job owns the phone.
 
 ## Good / bad
 
@@ -59,8 +62,9 @@ benefits from that discipline rather than being diminished by it.
   Silence on mobile reads as "dead," not "working."
 - Requiring the user to be in a specific view, or tap through a settings
   panel, to steer a task that's already running.
-- A second human-facing chat channel bolted on beside the one. One channel,
-  done properly, not a multi-channel bridge.
+- A third human-facing chat channel bolted on beside the two. Telegram in
+  the pocket, Buzz at the desk, each done properly — never an open
+  multi-channel bridge.
 
 ## Prove it
 
@@ -96,15 +100,16 @@ Named by job × surface, pointing at real scenarios.
 - **One fleet, addressable across surfaces (DM + channel)** —
   `jtbd-supergroup-reply-channel`, `fuzz-multitopic-routing-channel`.
   *Watch:* multiple agents are addressed naturally in DM and forum channel
-  alike. *Invariant:* the fleet stays one coherent surface, the single
-  Telegram channel, never a second one.
+  alike. *Invariant:* the fleet stays one coherent conversation on the two
+  sanctioned surfaces — Telegram authoritative, Buzz mirroring it — never a
+  third.
 
 **Fuzz corpus:** vary input type (text × photo × voice × location × album)
 × message timing (idle × mid-turn × rapid follow-up) × turn length (trivial
 × long-running with screen off) × surface (DM vs forum channel) ×
 connectivity (steady vs dead-zone reconnect). The invariants must hold
 across the corpus: reachable from chat alone, instant ack, never a silent
-walk-away, one channel only.
+walk-away, the two sanctioned channels only.
 
 ## Verdict
 
@@ -141,3 +146,5 @@ walk-away, one channel only.
   correction of a running turn.
 - [`deliver-files-i-can-open`](deliver-files-i-can-open.md) — files and
   attachments as first-class input and output on a phone.
+- [`use-my-team-from-the-desktop`](use-my-team-from-the-desktop.md) — the
+  desk half of the same loop: Buzz as co-channel, Telegram authoritative.

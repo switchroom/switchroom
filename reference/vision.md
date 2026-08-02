@@ -18,8 +18,8 @@ It asks first on anything that matters.
 
 Not a general-purpose orchestrator. Not a multi-channel bridge. Not a
 hosted service. Not multi-tenant. Not an agent that roams on its own.
-One idea, done properly: a personal team that lives in Telegram and
-stays on your leash.
+One idea, done properly: a personal team that lives in Telegram — with
+Buzz as its desktop co-channel — and stays on your leash.
 
 ---
 
@@ -38,8 +38,11 @@ being the one I needed, and nothing else fixed them.
 - **On the leash.** Give an assistant broad standing access and one day
   it helpfully does something irreversible. Credentials, tools, skills:
   granted deliberately, approved by a human, no way around it.
-- **Telegram, done properly.** Not a bridge spread thin across Slack,
-  Discord, Teams. One channel. Opinionated. Excellent.
+- **The channel, done properly.** Not a bridge spread thin across Slack,
+  Discord, Teams. One channel — Telegram — done excellently. (In 2026-08
+  a second was sanctioned, once, deliberately: Buzz, the desktop
+  co-channel, on Telegram's terms. Two chosen surfaces, never a third,
+  still no bridge.)
 
 So I built it.
 
@@ -64,11 +67,12 @@ functions to deliver them, and the jobs that ladder up to each live in
    guardrails: still the unmodified CLI on the same OAuth, forwarded
    unchanged, fail-open. See the claude-native gateway carve-out in
    [`invariants.md`](invariants.md).
-4. **Always available, in Telegram, done properly** — there when you want it.
+4. **Always available, in Telegram and Buzz, done properly** — there when
+   you want it: Telegram in your pocket, Buzz at your desk.
 
 The hard constraints under these (claude-native, no-self-escalation,
-on-leash, single-tenant, telegram-only) are the lines we won't cross by
-construction: [`invariants.md`](invariants.md).
+on-leash, single-tenant, telegram-and-buzz-only) are the lines we won't
+cross by construction: [`invariants.md`](invariants.md).
 
 ---
 
@@ -94,7 +98,7 @@ hidden.
 |---|---|
 | A harness or wrapper | Switchroom never intercepts auth or inference. The `claude` CLI is the runtime. |
 | A multi-provider orchestrator | No OpenAI, Gemini, Llama, or model swapping for inference. Auxiliary services (e.g. voice transcription via Whisper) are opt-in helpers, not Claude replacements. |
-| A multi-channel bridge | Not Slack, not Discord, not Teams. Telegram, done properly. |
+| A multi-channel bridge | Not Slack, not Discord, not Teams. Two deliberate surfaces — Telegram (pocket) and Buzz (desktop) — never a third. |
 | An autonomous agent | No heartbeats. Beck-and-call plus explicit schedules, on your leash. |
 | Multi-tenant | Single-tenant by design — one operator's deployment. Multiple *trusted* users within that one tenant are supported; serving *separate* tenants is not. |
 | A hosted service | Self-hosted only. Your box, your tokens, your data. |

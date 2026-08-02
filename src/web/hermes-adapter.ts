@@ -10,7 +10,7 @@
  * Not implemented (panels degrade gracefully in Hermes Desktop):
  *   approval.*, sudo.*, secret.*, pet.*, billing.*, voice.*
  *
- * Operator-console invariants (invariants.md §telegram-only admin-console scope):
+ * Operator-console invariants (invariants.md §telegram-and-buzz-only admin-console scope):
  *   1. Operator-only audience — token-gated, same auth as the dashboard.
  *   2. prompt.submit mirrors into the agent's Telegram thread via inject_inbound.
  *   3. Same inject_inbound path as cron (synthesized turn, not a new channel).
