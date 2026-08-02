@@ -45,6 +45,8 @@ import {
   type RolloutResult,
   type RolloutStep,
   VERIFY_COMPONENTS_STEP,
+  ENSURE_BANKS_ATTEMPTS,
+  ENSURE_BANKS_BACKOFF_MS,
   evaluateRolloutDrift,
   createRolloutDeps,
   isSpawnTimeout,
@@ -281,6 +283,7 @@ function harness(opts: {
   persisted: string[];
   phases: RolloutPhase[];
   ensureBankCalls: string[];
+  sleeps: number[];
 } {
   const runs: string[][] = [];
   const runEnvs: Array<Record<string, string> | undefined> = [];
@@ -288,6 +291,7 @@ function harness(opts: {
   const persisted: string[] = [];
   const phases: RolloutPhase[] = [];
   const ensureBankCalls: string[] = [];
+  const sleeps: number[] = [];
   const deps: RolloutDeps = {
     run: (args, runOpts) => {
       runs.push(args);
@@ -304,6 +308,12 @@ function harness(opts: {
     hindsightExists: () => opts.hindsightExists ?? false,
     webImageTag: () => opts.webImageTag ?? null,
     collectComponents: () => opts.components ?? [],
+    // Instant fake so the ensure-banks retry backoff is exercised without
+    // wall-clock delay; the requested waits are recorded for assertions.
+    sleepMs: (ms: number) => {
+      sleeps.push(ms);
+      return Promise.resolve();
+    },
     // Wired unless the test explicitly passes `ensureBank: null`. The default
     // reports every bank present; a custom verdict drives the backstop's
     // degrade/fail branches.
@@ -316,7 +326,7 @@ function harness(opts: {
           },
         }),
   };
-  return { deps, runs, runEnvs, logs, persisted, phases, ensureBankCalls };
+  return { deps, runs, runEnvs, logs, persisted, phases, ensureBankCalls, sleeps };
 }
 
 describe("executeRollout", () => {
@@ -590,25 +600,35 @@ describe("executeRollout — ensure-banks backstop", () => {
     expect(r.rolled).toEqual(["clerk", "marko"]);
   });
 
-  it("an UNREACHABLE probe degrades to a warning, not a roll failure", async () => {
+  it("an UNREACHABLE probe is retried with backoff, then degrades to a quiet log line — NOT a per-agent warning", async () => {
     const steps = planRollout(["clerk"]);
-    const { deps } = harness({
+    const { deps, ensureBankCalls, sleeps, logs } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: true,
       ensureBank: () => ({ ok: false as const, reason: "Unreachable" }),
     });
     const r = await executeRollout(steps, TARGET, deps);
-    // A transient probe miss is not proof the bank is absent — each agent's own
-    // reconcile already had its chance — so the roll still SUCCEEDS with a
-    // named warning rather than a false-negative structural failure.
+    // A probe that can't get through is an environment limitation, not proof
+    // any bank is absent (#2781 philosophy) — the roll still SUCCEEDS.
     expect(r.ok).toBe(true);
     expect(r.drifted).toBeUndefined();
-    expect(r.warnings.join(" ")).toMatch(/could not reach Hindsight/);
+    // Retried before concluding unreachable, with the documented backoff.
+    expect(ensureBankCalls).toEqual(Array(ENSURE_BANKS_ATTEMPTS).fill("clerk"));
+    expect(sleeps).toEqual([...ENSURE_BANKS_BACKOFF_MS]);
+    // NO operator-facing alarm: the v0.19.46 roll emitted the per-agent
+    // "restart it to recreate the bank" warning 12 times while every bank
+    // sat healthy. That text must not reappear on this path.
+    expect(r.warnings).toEqual([]);
+    // The degrade is still visible — ONE informational log line that says
+    // there is nothing to do, not a data-loss implication.
+    const note = logs.filter((l) => /existing banks are unaffected/.test(l));
+    expect(note).toHaveLength(1);
+    expect(note[0]).toContain("clerk");
   });
 
-  it("a TIMEOUT probe also degrades to a warning (couldn't verify, not a rejection)", async () => {
+  it("a TIMEOUT probe also degrades quietly after retries (couldn't verify, not a rejection)", async () => {
     const steps = planRollout(["clerk"]);
-    const { deps } = harness({
+    const { deps, ensureBankCalls, logs } = harness({
       versions: { clerk: "0.15.18" },
       hindsightExists: true,
       // createBank normalizes an aborted probe to reason "Timeout".
@@ -617,7 +637,74 @@ describe("executeRollout — ensure-banks backstop", () => {
     const r = await executeRollout(steps, TARGET, deps);
     expect(r.ok).toBe(true);
     expect(r.drifted).toBeUndefined();
-    expect(r.warnings.join(" ")).toMatch(/could not reach Hindsight/);
+    expect(ensureBankCalls).toEqual(Array(ENSURE_BANKS_ATTEMPTS).fill("clerk"));
+    expect(r.warnings).toEqual([]);
+    expect(logs.filter((l) => /existing banks are unaffected/.test(l))).toHaveLength(1);
+  });
+
+  it("a consolidation blip that clears on retry is a clean pass — no note, no warning", async () => {
+    const steps = planRollout(["clerk"]);
+    let calls = 0;
+    const { deps, sleeps, logs } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      // First probe times out (hindsight busy), second succeeds.
+      ensureBank: () =>
+        ++calls === 1 ? { ok: false as const, reason: "Timeout" } : { ok: true as const },
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([ENSURE_BANKS_BACKOFF_MS[0]]);
+    expect(r.warnings).toEqual([]);
+    expect(logs.filter((l) => /existing banks are unaffected/.test(l))).toHaveLength(0);
+    expect(logs.some((l) => /clerk: bank present/.test(l))).toBe(true);
+  });
+
+  it("MANY unreachable agents produce ONE consolidated note, never a per-agent alarm", async () => {
+    const steps = planRollout(["clerk", "marko", "nadia"]);
+    const { deps, logs, ensureBankCalls, sleeps } = harness({
+      versions: { clerk: "0.15.18", marko: "0.15.18", nadia: "0.15.18" },
+      hindsightExists: true,
+      ensureBank: () => ({ ok: false as const, reason: "Unreachable" }),
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(true);
+    expect(r.warnings).toEqual([]);
+    const note = logs.filter((l) => /existing banks are unaffected/.test(l));
+    expect(note).toHaveLength(1);
+    expect(note[0]).toContain("3 bank(s)");
+    expect(note[0]).toContain("clerk, marko, nadia");
+    // Only the FIRST agent burns the full retry budget; once that concludes
+    // Hindsight is unreachable, later agents get a single probe each so a
+    // 12-agent fleet does not stall the roll for minutes of backoff.
+    expect(ensureBankCalls).toEqual([
+      ...Array(ENSURE_BANKS_ATTEMPTS).fill("clerk"),
+      "marko",
+      "nadia",
+    ]);
+    expect(sleeps).toEqual([...ENSURE_BANKS_BACKOFF_MS]);
+  });
+
+  it("Hindsight REACHABLE but the create definitively rejected still fails the roll (no retry — a real answer)", async () => {
+    const steps = planRollout(["clerk"]);
+    const { deps, ensureBankCalls, sleeps } = harness({
+      versions: { clerk: "0.15.18" },
+      hindsightExists: true,
+      ensureBank: () => ({
+        ok: false as const,
+        reason: "create_bank returned error: bank rejected",
+      }),
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    // The real brand-new-bank signal is PRESERVED: a definitive rejection
+    // from a reachable Hindsight is structural, and it is answered on the
+    // first probe — retrying a real answer would only slow the roll.
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("ensure-banks");
+    expect(r.drifted).toEqual(["clerk"]);
+    expect(ensureBankCalls).toEqual(["clerk"]);
+    expect(sleeps).toEqual([]);
   });
 
   it("no-ops (never calls ensureBank) when no hindsight container exists", async () => {
