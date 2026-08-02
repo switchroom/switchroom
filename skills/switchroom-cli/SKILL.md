@@ -290,7 +290,7 @@ config-plus-recreate operation with three known traps. **Follow the runbook:
 
 ## Telegram plugin reference — "what MCP tools", "how does reply work"
 
-The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MCP plugin and is the default for all switchroom agents. It exposes **9 MCP tools** (all prefixed `mcp__switchroom-telegram__`):
+The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MCP plugin and is the default for all switchroom agents. It exposes **20+ MCP tools** (all prefixed `mcp__switchroom-telegram__`; the authoritative list is the tool declarations in `telegram-plugin/bridge/bridge.ts`). The core messaging set:
 
 | Tool | Purpose |
 |---|---|

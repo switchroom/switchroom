@@ -1,6 +1,6 @@
 ---
 title: Switchroom product vision
-source: switchroom.ai (canonical), README.md, reference/*.md JTBDs
+source: switchroom.ai (canonical), README.md, reference/jobs/*.md JTBDs
 audience: anyone deciding whether a feature, PR, or release belongs in switchroom
 ---
 
@@ -112,7 +112,7 @@ specific PR or design:
 - [`invariants.md`](invariants.md) — the lines we won't cross by
   construction.
 - [`product-spec.md`](product-spec.md) — the four outcomes (in full) and the
-  job index. The per-job **job specs** (`reference/*.md` with `job:`
+  job index. The per-job **job specs** (`reference/jobs/*.md` with `job:`
   frontmatter) each `serves:` one outcome.
 
 > [!IMPORTANT]

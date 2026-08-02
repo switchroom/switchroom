@@ -59,3 +59,8 @@ Switchroom is a multi-agent orchestrator built on Claude Code. It manages multip
 - [cascade.md](cascade.md) — three-layer config cascade semantics
 - [sub-agents.md](sub-agents.md) — delegation patterns and model routing
 - [telegram.md](telegram.md) — enhanced Telegram plugin features
+
+**Why it's built this way** lives in the repo's `reference/` directory — the
+design contract (`reference/README.md` is the map: vision, principles,
+invariants, product spec, job specs, RFCs). For "why does switchroom do X"
+questions, that is the source of truth; `docs/` is usage/operation only.
