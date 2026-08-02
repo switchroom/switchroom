@@ -805,7 +805,26 @@ export SWITCHROOM_AGENT_START_CWD="{{agentDir}}"
 # already gets this via .mcp.json env, but the Claude Code process
 # doesn't inherit that — so without this export, `switchroom auth status`
 # from Bash inside the agent fails with "No switchroom.yaml found".
-export SWITCHROOM_CONFIG={{{switchroomConfigPathQ}}}
+#
+# DEFER to a pre-set value: in Docker, compose.ts already sets
+# SWITCHROOM_CONFIG to the in-container mount (/state/config/
+# switchroom.yaml). The value baked here is the HOST path — resolve()d on
+# the machine that ran the scaffold — which does not exist inside the
+# container. Unconditionally exporting it clobbered the correct compose
+# value and silently killed the live model/effort resolvers below (their
+# [ -f "$SWITCHROOM_CONFIG" ] guard failed and fell into the quiet
+# no-config-mount branch), so `model:` edits + bare restart did nothing.
+# The bake stays as the fallback for host-run (non-Docker) agents, where
+# nothing else sets the var. ${VAR:-} also treats a set-but-EMPTY var as
+# unset, so an empty compose env can never blank the fallback.
+#
+# NB the baked path is pre-single-quoted by the scaffold, so it is
+# assigned BARE to a temp var first — embedding it directly inside
+# "${SWITCHROOM_CONFIG:-...}" would keep the literal quote characters in
+# the value.
+_SR_CONFIG_BAKED={{{switchroomConfigPathQ}}}
+export SWITCHROOM_CONFIG="${SWITCHROOM_CONFIG:-$_SR_CONFIG_BAKED}"
+unset _SR_CONFIG_BAKED
 {{/if}}
 {{#if hindsightEnabled}}
 # Hindsight memory plugin (vendored at .claude/plugins/hindsight-memory/).
@@ -1722,9 +1741,11 @@ fi
 #      launcher recorded on every prior boot (read BEFORE it is overwritten);
 #   3. the apply-time bake.
 # Steps 2/3 append to `.session-model-alert` so the gateway tells the
-# operator once at boot. No SWITCHROOM_CONFIG mount at all means there is
-# nothing to read live — the bake IS the truth there (stderr note only; an
-# operator alert every boot forever would be noise with no action).
+# operator once at boot. No SWITCHROOM_CONFIG at all means there is
+# nothing to read live — the bake IS the truth there and the fallback is
+# silent. But SWITCHROOM_CONFIG set with the FILE MISSING is a
+# misconfiguration that kills live resolution outright, so that case is
+# loud (stderr + operator alert) — see the else branch below.
 #
 # The yaml file bind mount re-resolves by PATH at container start, so a
 # host-side atomic-rename write is always picked up by the NEXT boot — the
@@ -1785,6 +1806,23 @@ if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v swit
   unset _lm_live _lm_try _lm_baked_class _lm_live_class
 else
   _EFFECTIVE_MODEL="$_BAKED_MODEL"
+  # No live read possible. Distinguish the legitimately quiet case — no
+  # SWITCHROOM_CONFIG at all (host-run agent scaffolded without a config
+  # path; the bake IS the truth) — from a broken resolver hiding behind
+  # it. SWITCHROOM_CONFIG set but pointing at a file that does not exist
+  # is a misconfiguration (e.g. a host path leaking into a container env)
+  # that silently disables live `model:`/`thinking_effort:` resolution:
+  # exactly the defect that let the start.sh host-path clobber of the
+  # compose-set env go unnoticed. That case is LOUD — stderr + a one-boot
+  # operator alert. A set config whose file exists but with no
+  # `switchroom` CLI on PATH is equally dead, stderr-only (nothing the
+  # operator can act on from chat).
+  if [ -n "$SWITCHROOM_CONFIG" ] && [ ! -f "$SWITCHROOM_CONFIG" ]; then
+    echo "session-model: SWITCHROOM_CONFIG='$SWITCHROOM_CONFIG' is set but the file does not exist — live config resolution is DISABLED; using apply-time baked model '$_BAKED_MODEL'" >&2
+    printf '`SWITCHROOM_CONFIG` points at `%s`, which does not exist in this environment, so live `model:`/`thinking_effort:` resolution is disabled and the agent booted on the apply-time default `%s`. Edits to switchroom.yaml will NOT take effect on a bare restart until this is fixed.\n' "$SWITCHROOM_CONFIG" "$_BAKED_MODEL" >> "{{agentDir}}/.session-model-alert" 2>/dev/null || true
+  elif [ -n "$SWITCHROOM_CONFIG" ]; then
+    echo "session-model: SWITCHROOM_CONFIG is set but no 'switchroom' CLI is on PATH — live config resolution is DISABLED; using apply-time baked model '$_BAKED_MODEL'" >&2
+  fi
 fi
 unset _BAKED_MODEL _LKG_MODEL
 # Record the RESOLVED configured default (raw, unquoted) every boot, before
@@ -2078,6 +2116,12 @@ if [ -n "$SWITCHROOM_CONFIG" ] && [ -f "$SWITCHROOM_CONFIG" ] && command -v swit
   unset _le_live _le_try
 else
   _EFFECTIVE_EFFORT="$_BAKED_EFFORT"
+  # Misconfig visibility, parity with the model sibling above — which
+  # owns the operator alert for this shared root cause; a second alert
+  # here would double-post for the same broken env. stderr only.
+  if [ -n "$SWITCHROOM_CONFIG" ] && [ ! -f "$SWITCHROOM_CONFIG" ]; then
+    echo "session-effort: SWITCHROOM_CONFIG='$SWITCHROOM_CONFIG' is set but the file does not exist — live config resolution is DISABLED; using apply-time baked thinking_effort '${_BAKED_EFFORT:-<unset>}'" >&2
+  fi
 fi
 unset _BAKED_EFFORT _LKG_EFFORT
 # Record the LIVE-RESOLVED configured default, BEFORE the carrier below can

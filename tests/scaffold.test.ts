@@ -16,6 +16,7 @@ function expectRelativePoolLink(linkPath: string, expectedPoolTarget: string): v
   expect(resolve(dirname(linkPath), stored)).toBe(resolve(expectedPoolTarget));
 }
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { scaffoldAgent, reconcileAgent, installHindsightPlugin, installSwitchroomSkills, renderFleetInvariants, computeDesiredPermissionAllow, HINDSIGHT_RECALL_QUERY_MAX_TOKENS_DEFAULT, HINDSIGHT_RECALL_REQUEST_TIMEOUT_SECONDS_DEFAULT } from "../src/agents/scaffold.js";
 import { resolveHindsightRecallTunables } from "../src/setup/hindsight-recall-tunables.js";
 import { createVault, setStringSecret } from "../src/vault/vault.js";
@@ -216,13 +217,23 @@ describe("scaffoldAgent", () => {
     expect(startSh).not.toContain(".oauth-token");
   });
 
-  it("start.sh exports SWITCHROOM_CONFIG when a config path is passed", () => {
+  it("start.sh exports SWITCHROOM_CONFIG when a config path is passed, DEFERRING to a pre-set env", () => {
     // Without this export, `switchroom <anything>` from the agent's own
     // Bash tool fails with "No switchroom.yaml found" because the CLI's
     // search paths (cwd + ~/.switchroom) don't cover where the user
     // actually keeps their config. The telegram plugin already gets the
     // var via .mcp.json, but the Claude Code process itself doesn't
     // inherit that — start.sh has to export it.
+    //
+    // CRITICAL (silent model-drift bug): the baked value is the HOST path,
+    // but in Docker compose.ts already set SWITCHROOM_CONFIG to the
+    // in-container mount (/state/config/switchroom.yaml). An unconditional
+    // `export SWITCHROOM_CONFIG=<host path>` clobbered that with a path
+    // that does not exist in the container, so the live model/effort
+    // resolvers' [ -f ] guard failed and every `model:` edit + bare
+    // restart silently booted the stale bake. The export must be the
+    // ${VAR:-bake} defer form, and these are OUTCOME assertions: the
+    // rendered snippet is executed both ways.
     const config = makeAgentConfig();
     const configPath = join(tmpDir, "switchroom.yaml");
     writeFileSync(configPath, "switchroom: { agents_dir: . }\n");
@@ -237,11 +248,41 @@ describe("scaffoldAgent", () => {
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
 
-    expect(startSh).toContain(`export SWITCHROOM_CONFIG='${configPath}'`);
+    // Rendered form: bake assigned bare (pre-quoted), export defers to a
+    // pre-set env var.
+    expect(startSh).toContain(`_SR_CONFIG_BAKED='${configPath}'`);
+    expect(startSh).toContain('export SWITCHROOM_CONFIG="${SWITCHROOM_CONFIG:-$_SR_CONFIG_BAKED}"');
     const exportIdx = startSh.indexOf("export SWITCHROOM_CONFIG=");
     const execIdx = startSh.indexOf("exec claude");
     expect(exportIdx).toBeGreaterThanOrEqual(0);
     expect(exportIdx).toBeLessThan(execIdx);
+
+    // Execute the rendered snippet. Extract exactly the assignment + export
+    // lines so the outcome (which value wins) is tested, not the spelling.
+    const snippet = startSh
+      .split("\n")
+      .filter(
+        (l) =>
+          l.startsWith("_SR_CONFIG_BAKED=") ||
+          l.startsWith("export SWITCHROOM_CONFIG=") ||
+          l === "unset _SR_CONFIG_BAKED",
+      )
+      .join("\n");
+    expect(snippet).not.toBe("");
+    const runSnippet = (pre: string): string =>
+      execFileSync("bash", ["-c", `${pre}\n${snippet}\necho "CFG=$SWITCHROOM_CONFIG"`], {
+        encoding: "utf-8",
+      })
+        .match(/CFG=(.*)/)![1]
+        .trim();
+    // Docker case: compose already set the container path — it must WIN.
+    expect(runSnippet("export SWITCHROOM_CONFIG=/state/config/switchroom.yaml")).toBe(
+      "/state/config/switchroom.yaml",
+    );
+    // Host-run case: nothing pre-set — the bake is the fallback.
+    expect(runSnippet("unset SWITCHROOM_CONFIG")).toBe(configPath);
+    // Set-but-empty degenerates to the bake, never to an empty config path.
+    expect(runSnippet('export SWITCHROOM_CONFIG=""')).toBe(configPath);
   });
 
   it("start.sh omits SWITCHROOM_CONFIG export when no config path is passed", () => {
@@ -249,6 +290,7 @@ describe("scaffoldAgent", () => {
     const result = scaffoldAgent("no-cfg-agent", config, tmpDir, telegramConfig);
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
     expect(startSh).not.toContain("export SWITCHROOM_CONFIG=");
+    expect(startSh).not.toContain("_SR_CONFIG_BAKED=");
   });
 
   it("start.sh symlinks $HOME/.switchroom to host home (#910 tilde-path fix)", () => {

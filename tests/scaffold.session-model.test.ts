@@ -864,13 +864,50 @@ if [ -f "$marker" ]; then echo claude-opus-4-8; else touch "$marker"; echo "mang
       `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
       "unset SWITCHROOM_CONFIG ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
       '_LITELLM_OK="1"',
+      "{",
       block,
+      "} 2>&1", // merge stderr so "silently" is actually asserted
       'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
     ].join("\n");
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
     expect(out).toContain(`EFFECTIVE=${DEFAULT_MODEL}`);
+    // The unset case must stay QUIET even with the missing-file hardening:
+    // there is nothing to read and nothing actionable.
+    expect(out).not.toContain("DISABLED");
     expect(alertText()).toBe("");
     expect(fakeArgs()).toBe(""); // CLI never invoked
+  });
+
+  // The hardening that would have caught the start.sh host-path clobber the
+  // day it shipped: SWITCHROOM_CONFIG SET but pointing at a file that does
+  // not exist (a host path leaking into a container env) is a broken live
+  // resolver, not a "no config mount" — it must be LOUD, not silent.
+  it("SWITCHROOM_CONFIG set but file MISSING → bake with stderr + operator alert (misconfiguration, not silence)", () => {
+    fakeSwitchroom("echo fable");
+    const missingPath = join(tmpDir, "does-not-exist", "switchroom.yaml");
+    const script = [
+      "set -e",
+      `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
+      `export SWITCHROOM_CONFIG=${JSON.stringify(missingPath)}`,
+      "unset ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
+      '_LITELLM_OK="1"',
+      "{",
+      block,
+      "} 2>&1", // stderr carries the loud warning — assert it
+      'echo "EFFECTIVE=$_EFFECTIVE_MODEL"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    // Outcome: still boots the bake (nothing live to read)…
+    expect(out).toContain(`EFFECTIVE=${DEFAULT_MODEL}`);
+    expect(fakeArgs()).toBe(""); // CLI never invoked against a missing file
+    // …but LOUDLY: stderr names the env var and the missing path…
+    expect(out).toContain("SWITCHROOM_CONFIG=");
+    expect(out).toContain("does not exist");
+    expect(out).toContain("DISABLED");
+    // …and the operator gets a one-boot alert saying yaml edits won't apply.
+    expect(alertText()).toContain(missingPath);
+    expect(alertText()).toContain("does not exist");
+    expect(alertText()).toContain("will NOT take effect");
   });
 
   // SE-3 ordering: the live value must land before the carrier compare, so a
@@ -1096,14 +1133,53 @@ describe("scaffoldAgent: live configured-default effort resolution (start.sh)", 
       `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
       "unset SWITCHROOM_CONFIG ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
       '_LITELLM_OK="1"',
+      "{",
       block,
+      "} 2>&1", // merge stderr so "silently" is actually asserted
       'echo "EFFORT=$_EFFECTIVE_EFFORT"',
     ].join("\n");
     const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
     expect(out).toContain("EFFORT=low");
+    expect(out).not.toContain("DISABLED"); // hardening must not fire when unset
     expect(alertText()).toBe("");
     expect(fakeArgs()).toBe(""); // CLI never invoked
     expect(lkg()).toBe(""); // nothing was live-read → nothing recorded
+  });
+
+  // Effort sibling of the model suite's missing-file hardening. The
+  // extracted block spans BOTH resolvers (model first, then effort), and one
+  // broken env kills both — so the outcome contract is: each resolver warns
+  // on stderr in its own name, but the operator alert for the shared root
+  // cause is posted exactly ONCE (by the model block, whose text covers
+  // `thinking_effort:` too; an effort-side alert would double-post one
+  // misconfiguration to the operator).
+  it("SWITCHROOM_CONFIG set but file MISSING → effort bakes with its own stderr warning; ONE shared operator alert", () => {
+    fakeSwitchroom("    echo high");
+    const missingPath = join(tmpDir, "does-not-exist", "switchroom.yaml");
+    const script = [
+      "set -e",
+      `export PATH=${JSON.stringify(fakeBin)}:"$PATH"`,
+      `export SWITCHROOM_CONFIG=${JSON.stringify(missingPath)}`,
+      "unset ANTHROPIC_BASE_URL SWITCHROOM_LITELLM_DECLARED",
+      '_LITELLM_OK="1"',
+      "{",
+      block,
+      "} 2>&1",
+      'echo "EFFORT=$_EFFECTIVE_EFFORT"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script], { encoding: "utf-8" });
+    expect(out).toContain("EFFORT=low"); // the bake
+    // Each resolver names itself on stderr — a dead effort resolver must
+    // not hide behind the model warning.
+    expect(out).toContain("session-model: SWITCHROOM_CONFIG=");
+    expect(out).toContain("session-effort: SWITCHROOM_CONFIG=");
+    expect(fakeArgs()).toBe(""); // CLI never invoked against a missing file
+    // Exactly ONE operator alert for the one root cause, and it covers both
+    // settings the dead resolver disables.
+    expect(alertText()).toContain(missingPath);
+    expect(alertText()).toContain("`thinking_effort:`");
+    expect(alertText().match(/does not exist/g)).toHaveLength(1);
+    expect(lkg()).toBe("");
   });
 
   // Ordering: the live effort must land BEFORE the .session-effort carrier
