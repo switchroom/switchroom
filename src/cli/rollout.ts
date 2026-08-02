@@ -115,6 +115,23 @@ export const VERIFY_COMPONENTS_STEP = "verify-components";
  */
 export const ENSURE_BANKS_STEP = "ensure-banks";
 
+/**
+ * How many times the ensure-banks backstop probes a bank whose check came
+ * back Unreachable/Timeout before concluding Hindsight is genuinely down
+ * (total attempts, including the first), and how long it waits between
+ * attempts.
+ *
+ * Why retry at all: the roll's ensure-banks step runs while Hindsight is
+ * routinely busy (post-restart warm-up, consolidation load), and a single
+ * 5s probe timing out is far more often "Hindsight is busy" than "Hindsight
+ * is down". Before this retry existed, one busy blip during a fleet roll
+ * emitted a scary per-agent "could not verify <agent>'s bank … restart it
+ * to recreate the bank" warning for EVERY agent — 12 false alarms on the
+ * v0.19.46 roll while every bank sat healthy on the persistent pg volume.
+ */
+export const ENSURE_BANKS_ATTEMPTS = 3;
+export const ENSURE_BANKS_BACKOFF_MS: readonly number[] = [2_000, 5_000];
+
 export interface RolloutPlanOpts {
   /** Skip the web + hostd + hindsight refresh (step 3). */
   skipWeb?: boolean;
@@ -608,15 +625,27 @@ export interface RolloutDeps {
    * Production wires this to `createBank(apiUrl, bankIdFor(agent))` — needs
    * only a bank id + api url, no container reconcile — and it is idempotent.
    * Tests inject a fake that reports a bank present or missing. A false result
-   * whose `reason` is "Unreachable" degrades to a warning (each agent's own
-   * restart-reconcile already had its chance); any other failure is a
-   * structural, roll-failing residue (verify-components-class), NOT an
-   * operator instruction to run a host command.
+   * whose `reason` is "Unreachable"/"Timeout" is retried with backoff
+   * ({@link ENSURE_BANKS_ATTEMPTS} / {@link ENSURE_BANKS_BACKOFF_MS}) and, if
+   * it persists, degrades to a single quiet log line — NOT a warning: the
+   * probe not getting through is an environment limitation, not evidence any
+   * bank is absent, and each agent's own restart-reconcile already had its
+   * chance (#2781 philosophy). Any other failure is a structural,
+   * roll-failing residue (verify-components-class), NOT an operator
+   * instruction to run a host command.
    *
    * Optional — when unwired (no hindsight, or a test that never reaches the
    * step) the `ensure-banks` step is a clean no-op.
    */
   ensureBank?(agent: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * Sleep between `ensureBank` retry attempts (the ensure-banks backstop
+   * retries an Unreachable/Timeout probe with backoff before concluding
+   * Hindsight is down — a consolidation blip must not read as an outage).
+   * Defaults to a real `setTimeout` wait; tests inject an instant fake so
+   * the retry loop is exercised without wall-clock delay.
+   */
+  sleepMs?(ms: number): Promise<void>;
   /**
    * Probe whether the standalone `switchroom-hindsight` container exists on
    * this host (the `refresh-hindsight` step no-ops cleanly when it doesn't).
@@ -1403,38 +1432,86 @@ export async function executeRollout(
           deps.log(
             `ROLL_STEP ensure-banks — creating any missing agent bank (idempotent) for ${rolled.length} agent(s)`,
           );
+          const sleep =
+            deps.sleepMs ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+          const bankUnverified: string[] = [];
+          let lastUnreachableReason = "";
+          // Once ONE agent's full retry budget concludes unreachable, later
+          // agents get a single probe each (they'd almost certainly hit the
+          // same wall, and 12 agents × full backoff would stall the roll for
+          // minutes) — but still one probe, since Hindsight may come back
+          // mid-loop.
+          let concludedUnreachable = false;
           for (const a of rolled) {
-            let res: { ok: true } | { ok: false; reason: string };
-            try {
-              res = await deps.ensureBank(a);
-            } catch (e) {
-              res = { ok: false, reason: (e as Error).message };
+            let res: { ok: true } | { ok: false; reason: string } = {
+              ok: false,
+              reason: "not probed",
+            };
+            // Retry an Unreachable/Timeout probe with backoff before
+            // concluding anything: Hindsight is routinely busy during a roll
+            // (post-restart warm-up, consolidation load) and a single 5s
+            // probe miss is usually "busy", not "down". A DEFINITIVE create
+            // rejection is never retried — it is a real answer.
+            const maxAttempts = concludedUnreachable ? 1 : ENSURE_BANKS_ATTEMPTS;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+              try {
+                res = await deps.ensureBank(a);
+              } catch (e) {
+                res = { ok: false, reason: (e as Error).message };
+              }
+              if (res.ok || !/unreachable|timeout/i.test(res.reason)) break;
+              if (attempt < maxAttempts) {
+                const backoff =
+                  ENSURE_BANKS_BACKOFF_MS[attempt - 1] ??
+                  ENSURE_BANKS_BACKOFF_MS[ENSURE_BANKS_BACKOFF_MS.length - 1] ??
+                  0;
+                deps.log(
+                  `  ${a}: bank check ${res.reason.toLowerCase()} — retrying in ${backoff}ms ` +
+                    `(attempt ${attempt}/${maxAttempts})`,
+                );
+                await sleep(backoff);
+              }
             }
             if (res.ok) {
               deps.log(`  ${a}: bank present`);
               continue;
             }
             if (/unreachable|timeout/i.test(res.reason)) {
-              // Degrade, do NOT fail: the hindsight endpoint was momentarily
-              // unreachable from the roll process, or the probe timed out
-              // (createBank normalizes ECONNREFUSED/undici-connect to
-              // "Unreachable" and an abort to "Timeout"). Neither is proof the
-              // bank is absent — each agent's own restart-reconcile already had
-              // its chance to create it (and did, for every existing agent, off
-              // the persistent pg volume). Only a DEFINITIVE create rejection
-              // (an HTTP error or an MCP isError envelope) fails the roll;
-              // "couldn't reach it to check" is a warning, not a false-negative
-              // residue that drags a converged fleet backwards.
-              deps.log(`  ${a}: bank check ${res.reason.toLowerCase()} (degraded to warning)`);
-              warnings.push(
-                `ensure-banks could not reach Hindsight to verify ${a}'s bank ` +
-                  `(${res.reason}). If ${a} is brand-new and its first \`retain\` ` +
-                  `fails with a foreign-key error, restart it to recreate the bank.`,
+              // Still unreachable after the retries. Degrade QUIETLY, do NOT
+              // warn per-agent: "couldn't reach Hindsight to check" is an
+              // environment limitation of THIS probe, not evidence any bank
+              // is absent (same philosophy as apply's vault-broker-unreachable
+              // degrade, #2781). Every existing agent's bank persists on the
+              // pg volume and its own restart-reconcile already had its
+              // chance to create a missing one — so there is nothing for the
+              // operator to do, and a per-agent "restart it to recreate the
+              // bank" alarm here cried wolf 12 times on the v0.19.46 roll
+              // while every bank sat healthy. A truly brand-new agent whose
+              // bank never got created self-heals on its next
+              // restart-reconcile. The genuinely-broken case — Hindsight
+              // REACHABLE and the create definitively rejected — still falls
+              // through to `bankEnsureFailed` below and fails the roll.
+              deps.log(
+                `  ${a}: bank check ${res.reason.toLowerCase()} after ` +
+                  `${maxAttempts} attempt(s) (transient — not treated as a missing bank)`,
               );
+              bankUnverified.push(a);
+              lastUnreachableReason = res.reason;
+              concludedUnreachable = true;
               continue;
             }
             deps.log(`  ✗ ${a}: bank could NOT be created — ${res.reason}`);
             bankEnsureFailed.push(a);
+          }
+          if (bankUnverified.length > 0) {
+            // ONE informational line for the whole roll, in the log — not in
+            // `warnings`, which renders as an operator-facing alarm.
+            deps.log(
+              `ensure-banks: Hindsight was busy/unreachable (${lastUnreachableReason}) while ` +
+                `verifying ${bankUnverified.length} bank(s) (${bankUnverified.join(", ")}) — ` +
+                `existing banks are unaffected and nothing needs doing; a brand-new agent's ` +
+                `bank is created automatically on its next restart-reconcile.`,
+            );
           }
           break;
         }
