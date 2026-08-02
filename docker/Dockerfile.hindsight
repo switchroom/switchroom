@@ -2881,6 +2881,387 @@ print(f"{TAG}: consolidation-triggered mental-model refreshes floored at "
       "refresh paths untouched; 0 restores upstream behaviour")
 PYEOF
 
+# --- switchroom #3142: foreground-priority lane for the local cross-encoder pool ---
+#
+# Carries upstream vectorize-io/hindsight PR #3142 (OPEN as of 2026-08 — this is a
+# source-level fork patch, NOT an adopted-upstream retire). Reranking is CPU-bound and
+# runs in a fixed thread pool. Upstream drains ONE FIFO queue, so an interactive
+# (foreground) rerank submitted while consolidation/reflect have already queued a wall
+# of background reranks waits behind every one of them, spiking recall latency. This
+# swaps the plain ThreadPoolExecutor for a _PriorityRerankExecutor: a fixed pool over a
+# PriorityQueue ordered (priority, seq) — foreground=0 jumps ahead of queued
+# background=1, but never preempts a background job already running, so background
+# keeps draining. `background` threads: rerank() -> CrossEncoderModel.predict() on every
+# provider (remote providers accept-and-ignore it); the recall call site derives it from
+# RequestContext.internal.
+#
+# ORTHOGONALITY (load-bearing): this is the reranker THREAD-POOL layer. It is independent
+# of the switchroom recall-ADMISSION split (`_background_search_semaphore`, memory_engine),
+# which gates whether a recall even starts, a step earlier. Both are preserved; the
+# post-condition asserts below fail the build if the admission mod (or the reranking
+# boost-damping mod) is lost to an upstream reshuffle.
+#
+# LOW latent risk (dual-signal): reranker priority keys off RequestContext.internal, while
+# switchroom admission keys off the explicit `_background` recall param. On every current
+# v0.19.48 call path they agree (background recalls carry the internal context). A future
+# caller hand-rolling `_background=True` with `.internal=False` (or vice-versa) would give a
+# recall disagreeing admission vs rerank priority classes — latent coupling, not a bug today.
+#
+# Self-verifying (anchor-assert / replace / post-condition + ast.parse). Guarded by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and
+# tests/docker/hindsight-search-patches.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+CE = "/app/api/hindsight_api/engine/cross_encoder.py"
+RR = "/app/api/hindsight_api/engine/search/reranking.py"
+ME = "/app/api/hindsight_api/engine/memory_engine.py"
+
+
+def apply(path, anchor, repl, *, count=1):
+    f = pathlib.Path(path)
+    s = f.read_text()
+    n = s.count(anchor)
+    assert n == count, (
+        f"switchroom #3142 reranker-foreground-priority patch: anchor found {n}x "
+        f"(expected {count}) in {path} — upstream reformatted the reranker; re-author "
+        f"this patch in docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+    )
+    f.write_text(s.replace(anchor, repl, count))
+
+
+# ---- cross_encoder.py: new stdlib imports for the priority pool ----
+apply(CE, (
+    "import asyncio\n"
+    "import logging\n"
+    "import os\n"
+    "import warnings\n"
+    "from abc import ABC, abstractmethod\n"
+    "from concurrent.futures import ThreadPoolExecutor\n"
+    "from typing import Any\n"
+), (
+    "import asyncio\n"
+    "import itertools\n"
+    "import logging\n"
+    "import os\n"
+    "import queue\n"
+    "import threading\n"
+    "import warnings\n"
+    "from abc import ABC, abstractmethod\n"
+    "from concurrent.futures import Future, ThreadPoolExecutor\n"
+    "from typing import Any\n"
+), count=1)
+
+# ---- cross_encoder.py: the _PriorityRerankExecutor class ----
+apply(CE, (
+    "logger = logging.getLogger(__name__)\n"
+    "\n"
+    "\n"
+    "class CrossEncoderModel(ABC):\n"
+), (
+    "logger = logging.getLogger(__name__)\n"
+    "\n"
+    "\n"
+    "class _PriorityRerankExecutor:\n"
+    "    \"\"\"Fixed-size thread pool that dispatches foreground work ahead of queued background work.\n"
+    "\n"
+    "    Reranking is CPU-bound and runs in worker threads. A plain\n"
+    "    ``ThreadPoolExecutor`` drains a single FIFO queue, so an interactive\n"
+    "    (foreground) rerank submitted while a large fan-out of background reranks is\n"
+    "    already queued must wait behind every one of them. Consolidation/reflect\n"
+    "    issue exactly that background fan-out (each internal sub-recall runs a\n"
+    "    rerank), which spikes foreground recall latency.\n"
+    "\n"
+    "    This pool keeps foreground reranks responsive by ordering the shared work\n"
+    "    queue foreground-first. A foreground job jumps ahead of any *queued*\n"
+    "    background jobs, but it does not preempt a background job already running in\n"
+    "    a worker — so background always keeps making progress between foreground\n"
+    "    arrivals. This is foreground *priority*, not background exclusion.\n"
+    "\n"
+    "    Note on starvation: a sustained, saturating stream of foreground jobs could\n"
+    "    in principle keep background jobs queued indefinitely. In this system that\n"
+    "    cannot happen in practice — foreground reranks are driven by per-user recall\n"
+    "    turns (bounded, bursty), while background reranks are the bulk fan-out.\n"
+    "    Foreground volume cannot saturate the pool, so background continues to drain.\n"
+    "    \"\"\"\n"
+    "\n"
+    "    # Lower number == higher priority in the PriorityQueue.\n"
+    "    _FOREGROUND = 0\n"
+    "    _BACKGROUND = 1\n"
+    "    _SHUTDOWN_PRIORITY = -1\n"
+    "\n"
+    "    _SHUTDOWN = object()\n"
+    "\n"
+    "    def __init__(self, max_workers: int, thread_name_prefix: str = \"reranker\"):\n"
+    "        if max_workers < 1:\n"
+    "            raise ValueError(\"max_workers must be >= 1\")\n"
+    "        self._max_workers = max_workers\n"
+    "        # Items are (priority, seq, fn, args, future). ``seq`` is a strictly\n"
+    "        # increasing tie-breaker so the payload (fn/future) is never compared —\n"
+    "        # PriorityQueue only ever orders by (priority, seq), both integers.\n"
+    "        self._queue: \"queue.PriorityQueue\" = queue.PriorityQueue()\n"
+    "        self._seq = itertools.count()\n"
+    "        self._seq_lock = threading.Lock()\n"
+    "        self._threads: list[threading.Thread] = []\n"
+    "        for i in range(max_workers):\n"
+    "            t = threading.Thread(\n"
+    "                target=self._worker,\n"
+    "                name=f\"{thread_name_prefix}-{i}\",\n"
+    "                daemon=True,\n"
+    "            )\n"
+    "            t.start()\n"
+    "            self._threads.append(t)\n"
+    "\n"
+    "    def _next_seq(self) -> int:\n"
+    "        # itertools.count() is not documented thread-safe under free-threading;\n"
+    "        # guard it so ties never collide (a collision would compare payloads).\n"
+    "        with self._seq_lock:\n"
+    "            return next(self._seq)\n"
+    "\n"
+    "    def submit(self, fn, /, *args, background: bool = False) -> Future:\n"
+    "        \"\"\"Schedule ``fn(*args)``; foreground jobs jump ahead of queued background jobs.\"\"\"\n"
+    "        fut: Future = Future()\n"
+    "        priority = self._BACKGROUND if background else self._FOREGROUND\n"
+    "        self._queue.put((priority, self._next_seq(), fn, args, fut))\n"
+    "        return fut\n"
+    "\n"
+    "    def _worker(self) -> None:\n"
+    "        while True:\n"
+    "            _priority, _seq, fn, args, fut = self._queue.get()\n"
+    "            try:\n"
+    "                if fn is self._SHUTDOWN:\n"
+    "                    return\n"
+    "                if not fut.set_running_or_notify_cancel():\n"
+    "                    # Caller cancelled before we started — skip.\n"
+    "                    continue\n"
+    "                try:\n"
+    "                    fut.set_result(fn(*args))\n"
+    "                except BaseException as exc:  # noqa: BLE001 — propagate to the awaiting caller\n"
+    "                    fut.set_exception(exc)\n"
+    "            finally:\n"
+    "                self._queue.task_done()\n"
+    "\n"
+    "    def shutdown(self, wait: bool = True) -> None:\n"
+    "        \"\"\"Stop all workers. Sentinels preempt queued work so shutdown is prompt.\"\"\"\n"
+    "        for _ in self._threads:\n"
+    "            self._queue.put((self._SHUTDOWN_PRIORITY, self._next_seq(), self._SHUTDOWN, (), Future()))\n"
+    "        if wait:\n"
+    "            for t in self._threads:\n"
+    "                t.join()\n"
+    "\n"
+    "\n"
+    "class CrossEncoderModel(ABC):\n"
+), count=1)
+
+# ---- cross_encoder.py: abstract predict() docstring gains `background` ----
+apply(CE, (
+    "        Score query-document pairs for relevance.\n"
+    "\n"
+    "        Args:\n"
+    "            pairs: List of (query, document) tuples to score\n"
+    "\n"
+    "        Returns:\n"
+    "            List of relevance scores (higher = more relevant)\n"
+), (
+    "        Score query-document pairs for relevance.\n"
+    "\n"
+    "        Args:\n"
+    "            pairs: List of (query, document) tuples to score\n"
+    "            background: True for internal/background reranks (e.g. consolidation\n"
+    "                and reflect sub-recalls). Providers with a local worker pool use\n"
+    "                this to give interactive (foreground) reranks queue priority so\n"
+    "                they are not starved behind a background fan-out. Remote providers\n"
+    "                have their own concurrency controls and may ignore it.\n"
+    "\n"
+    "        Returns:\n"
+    "            List of relevance scores (higher = more relevant)\n"
+), count=1)
+
+# ---- cross_encoder.py: retype shared executor + add its lock ----
+apply(CE, (
+    "    # Shared executor across all instances (one model loaded anyway)\n"
+    "    _executor: ThreadPoolExecutor | None = None\n"
+    "    _max_concurrent: int = 4  # Limit concurrent CPU-bound reranking calls\n"
+), (
+    "    # Shared executor across all instances (one model loaded anyway).\n"
+    "    # Priority-aware: foreground reranks are dispatched ahead of queued\n"
+    "    # background ones so interactive recall latency is not starved by the\n"
+    "    # consolidation/reflect background fan-out.\n"
+    "    _executor: \"_PriorityRerankExecutor | None\" = None\n"
+    "    _executor_lock: threading.Lock = threading.Lock()\n"
+    "    _max_concurrent: int = 4  # Limit concurrent CPU-bound reranking calls\n"
+), count=1)
+
+# ---- cross_encoder.py: initialize() routes through _get_executor(); add classmethod ----
+apply(CE, (
+    "        # Initialize shared executor (limited workers naturally limits concurrency)\n"
+    "        if LocalSTCrossEncoder._executor is None:\n"
+    "            LocalSTCrossEncoder._executor = ThreadPoolExecutor(\n"
+    "                max_workers=LocalSTCrossEncoder._max_concurrent,\n"
+    "                thread_name_prefix=\"reranker\",\n"
+    "            )\n"
+    "            logger.info(f\"Reranker: local provider initialized (max_concurrent={LocalSTCrossEncoder._max_concurrent})\")\n"
+    "        else:\n"
+    "            logger.info(\"Reranker: local provider initialized (using existing executor)\")\n"
+    "\n"
+    "    def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:\n"
+), (
+    "        # Initialize the shared priority-aware executor (limited workers naturally\n"
+    "        # limits concurrency; foreground reranks jump ahead of queued background ones).\n"
+    "        created = LocalSTCrossEncoder._executor is None\n"
+    "        LocalSTCrossEncoder._get_executor()\n"
+    "        if created:\n"
+    "            logger.info(f\"Reranker: local provider initialized (max_concurrent={LocalSTCrossEncoder._max_concurrent})\")\n"
+    "        else:\n"
+    "            logger.info(\"Reranker: local provider initialized (using existing executor)\")\n"
+    "\n"
+    "    @classmethod\n"
+    "    def _get_executor(cls) -> \"_PriorityRerankExecutor\":\n"
+    "        \"\"\"Return the shared priority executor, creating it on first use.\n"
+    "\n"
+    "        Lazy creation keeps predict() usable when a caller skips initialize()\n"
+    "        (the model is injected directly), mirroring the previous\n"
+    "        ``run_in_executor(None, ...)`` fallback while now routing through the\n"
+    "        foreground-priority pool.\n"
+    "        \"\"\"\n"
+    "        ex = cls._executor\n"
+    "        if ex is None:\n"
+    "            with cls._executor_lock:\n"
+    "                if cls._executor is None:\n"
+    "                    cls._executor = _PriorityRerankExecutor(\n"
+    "                        max_workers=cls._max_concurrent,\n"
+    "                        thread_name_prefix=\"reranker\",\n"
+    "                    )\n"
+    "                ex = cls._executor\n"
+    "        return ex\n"
+    "\n"
+    "    def _predict_sync(self, pairs: list[tuple[str, str]]) -> list[float]:\n"
+), count=1)
+
+# ---- cross_encoder.py: LocalSTCrossEncoder.predict() docstring ----
+apply(CE, (
+    "        Uses a dedicated thread pool with limited workers to prevent CPU thrashing.\n"
+    "\n"
+    "        Args:\n"
+    "            pairs: List of (query, document) tuples to score\n"
+    "\n"
+    "        Returns:\n"
+    "            List of relevance scores (raw logits from the model)\n"
+), (
+    "        Uses a dedicated priority-aware thread pool with limited workers to\n"
+    "        prevent CPU thrashing. Foreground reranks (``background=False``) are\n"
+    "        dispatched ahead of queued background reranks so interactive recall is\n"
+    "        not starved behind a consolidation/reflect background fan-out.\n"
+    "\n"
+    "        Args:\n"
+    "            pairs: List of (query, document) tuples to score\n"
+    "            background: True for internal/background reranks (lower queue priority)\n"
+    "\n"
+    "        Returns:\n"
+    "            List of relevance scores (raw logits from the model)\n"
+), count=1)
+
+# ---- cross_encoder.py: LocalSTCrossEncoder.predict() body -> priority pool ----
+apply(CE, (
+    "        # Use dedicated executor - limited workers naturally limits concurrency\n"
+    "        loop = asyncio.get_event_loop()\n"
+    "        return await loop.run_in_executor(\n"
+    "            LocalSTCrossEncoder._executor,\n"
+    "            self._predict_sync,\n"
+    "            pairs,\n"
+    "        )\n"
+), (
+    "        # Priority-aware executor: limited workers limit concurrency, and\n"
+    "        # foreground work jumps ahead of queued background work.\n"
+    "        fut = LocalSTCrossEncoder._get_executor().submit(self._predict_sync, pairs, background=background)\n"
+    "        return await asyncio.wrap_future(fut)\n"
+), count=1)
+
+# ---- cross_encoder.py: `*, background: bool = False` on EVERY provider's predict() ----
+# Abstract base + all concrete providers share one identical signature line (remote
+# providers accept-and-ignore the flag). Count-asserted so a dropped/added provider
+# fails the build loudly rather than silently under-patching.
+apply(CE, (
+    "    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:\n"
+), (
+    "    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:\n"
+), count=14)
+
+# ---- reranking.py: CrossEncoderReranker.rerank() gains `background` + forwards it ----
+apply(RR, (
+    "    async def rerank(self, query: str, candidates: list[MergedCandidate]) -> list[ScoredResult]:\n"
+    "        \"\"\"\n"
+    "        Rerank candidates using cross-encoder scores.\n"
+    "\n"
+    "        Args:\n"
+    "            query: Search query\n"
+    "            candidates: Merged candidates from RRF\n"
+    "\n"
+    "        Returns:\n"
+), (
+    "    async def rerank(\n"
+    "        self, query: str, candidates: list[MergedCandidate], *, background: bool = False\n"
+    "    ) -> list[ScoredResult]:\n"
+    "        \"\"\"\n"
+    "        Rerank candidates using cross-encoder scores.\n"
+    "\n"
+    "        Args:\n"
+    "            query: Search query\n"
+    "            candidates: Merged candidates from RRF\n"
+    "            background: True for internal/background recalls (consolidation, reflect\n"
+    "                sub-recalls). Forwarded to the cross-encoder so a local reranker can\n"
+    "                give foreground (interactive) reranks queue priority.\n"
+    "\n"
+    "        Returns:\n"
+), count=1)
+apply(RR, (
+    "        scores = await self.cross_encoder.predict(pairs)\n"
+), (
+    "        scores = await self.cross_encoder.predict(pairs, background=background)\n"
+), count=1)
+
+# ---- memory_engine.py: recall call site derives background from RequestContext.internal ----
+apply(ME, (
+    "                    await reranker_instance.ensure_initialized()\n"
+    "                    scored_results = await reranker_instance.rerank(query, merged_candidates)\n"
+), (
+    "                    await reranker_instance.ensure_initialized()\n"
+    "                    # Foreground vs background priority for the reranker pool.\n"
+    "                    # Internal/background operations — consolidation and reflect\n"
+    "                    # sub-recalls (RequestContext.internal=True) — fan out a wall of\n"
+    "                    # reranks; marking them background lets a local reranker keep\n"
+    "                    # interactive (foreground) recall reranks from being starved\n"
+    "                    # behind that queue. This is the reranker-thread-pool layer; it\n"
+    "                    # is orthogonal to the switchroom recall-admission split\n"
+    "                    # (_background_search_semaphore), which gates a step earlier.\n"
+    "                    background_rerank = bool(request_context is not None and request_context.internal)\n"
+    "                    scored_results = await reranker_instance.rerank(\n"
+    "                        query, merged_candidates, background=background_rerank\n"
+    "                    )\n"
+), count=1)
+
+# ---- post-conditions: full surface present, parses, switchroom-local mods survive ----
+ce = pathlib.Path(CE).read_text()
+assert "class _PriorityRerankExecutor:" in ce, "switchroom #3142: executor class missing post-patch"
+assert ce.count("*, background: bool = False) -> list[float]:") == 14, "switchroom #3142: predict-sig count drift"
+assert "LocalSTCrossEncoder._get_executor().submit(self._predict_sync, pairs, background=background)" in ce, "switchroom #3142: local predict body not rewired"
+ast.parse(ce)
+rr = pathlib.Path(RR).read_text()
+assert "self.cross_encoder.predict(pairs, background=background)" in rr, "switchroom #3142: rerank call site not forwarding background"
+# switchroom-local CE-saturation / boost-damping mod MUST survive (orthogonal region):
+assert "_boost_authority(" in rr and "measured cross-encoder saturation" in rr, "switchroom CE-saturation mod lost — patch ordering broke"
+ast.parse(rr)
+me = pathlib.Path(ME).read_text()
+assert "background_rerank = bool(request_context is not None and request_context.internal)" in me, "switchroom #3142: recall call site not patched"
+# switchroom-local recall-admission split MUST survive (orthogonal layer):
+assert "_background_search_semaphore" in me, "switchroom recall-admission-split mod lost — patch ordering broke"
+ast.parse(me)
+print("switchroom #3142: reranker foreground-priority lane baked "
+      "(14 predict sigs, _PriorityRerankExecutor, rerank + call-site background flag); "
+      "_background_search_semaphore + CE-saturation mods preserved")
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in
