@@ -50,7 +50,7 @@ Creating, updating, or refreshing a mental model is **operator-approved** — do
 ### Directives (replaces feedback rules)
 Hard rules the agent must follow during reflect — guardrails that are always applied.
 
-- `mcp__hindsight__create_directive(text)` — e.g., `create_directive("Always prefer TypeScript over JavaScript for this user's projects")`. When the user gives you a correction or "always do X" rule, create a directive instead of writing a feedback `.md` file.
+- `mcp__hindsight__create_directive(text)` — e.g., `create_directive("Always prefer TypeScript over JavaScript for this user's projects")`. When the user gives you a correction or "always do X" rule, create a directive instead of writing a feedback `.md` file. If the rule can be enforced deterministically — a settings.json hook, a permission rule, a skill/script edit, or a config change — prefer that (instead of, or in addition to, the directive) and say which you did; reserve directives for judgment rules code can't enforce.
 
 (Read-only inspection tools like `list_memories`, `list_mental_models`, `get_mental_model`, `list_directives` are available under the `mcp__hindsight__*` namespace if you ever need them, but you rarely should — Hindsight's own auto-recall surfaces what matters and the operator handles bank curation out-of-band. The mental-model WRITE tools — `create`/`update`/`refresh`/`delete_mental_model` — are gated: propose via `mcp__switchroom-telegram__mental_model_propose`, don't call them directly.)
 
