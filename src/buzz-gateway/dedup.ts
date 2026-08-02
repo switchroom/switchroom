@@ -8,10 +8,14 @@
  * each record so a sidecar restart replays zero already-injected events.
  *
  * Contract with the pump: check `has(id)` BEFORE injecting; call `record(id)`
- * (which appends+fsyncs) AFTER a successful inject. A crash between inject and
- * record can re-inject exactly one event — that residual is closed by the
- * hub-side ring (M2 layer 2). Never the reverse ordering: recording before the
- * inject lands would silently drop an event on a crash.
+ * (which appends+fsyncs) AFTER a successful inject. This durable journal closes
+ * the normal case (relay resend, reconnect replay, sidecar restart). One
+ * residual remains and is NOT closed in this branch: a crash in the narrow
+ * window between the inject landing and `record` completing can re-inject
+ * exactly one event. Closing that residual needs a hub-side dedup ring in the
+ * gateway's inject path, which is deferred to a later phase (M2 layer 2 — not
+ * present here). Never the reverse ordering: recording before the inject lands
+ * would silently drop an event on a crash.
  *
  * The filesystem is injected so the pure LRU/journal logic is unit-testable
  * with an in-memory fake.
@@ -127,7 +131,10 @@ export function createDedupStore(opts: DedupOptions): DedupStore {
     }
   } catch (err) {
     // A journal we cannot read must not crash the sidecar — degrade to an
-    // empty in-memory LRU (the hub ring still guards duplicates this session).
+    // empty in-memory LRU. Same-session duplicates are still guarded by the LRU
+    // as it refills; note the cross-restart guarantee is degraded until the
+    // journal is writable again (the deferred hub-side dedup ring would add a
+    // second layer here, but is not present in this branch).
     log(`buzz dedup: journal load failed, starting empty: ${(err as Error).message}`);
     lru.clear();
   }

@@ -1,11 +1,20 @@
 /**
  * Buzz sidecar runtime config (Phase 1).
  *
- * The sidecar is a supervised sibling of the gateway. It receives its config
- * as ENV VARS from start.sh (the cascade-resolved `channels.buzz` block is
- * projected into env at scaffold time), NOT by parsing switchroom.yaml — the
- * sidecar has no access to the config cascade. The one secret (the agent nsec)
- * is NEVER an env var; it is broker-fetched in-process at boot (see index.ts).
+ * The sidecar is a supervised sibling of the gateway. It reads its config from
+ * ENV VARS (BUZZ_ENABLED / BUZZ_RELAY_URL / BUZZ_CHAT_ID / BUZZ_CHANNEL_IDS /
+ * BUZZ_OPERATOR_PUBKEY / …), NOT by parsing switchroom.yaml — the sidecar has
+ * no access to the config cascade. The one secret (the agent nsec) is NEVER an
+ * env var; it is broker-fetched in-process at boot (see index.ts).
+ *
+ * IMPORTANT — these env vars are NOT populated by any config path in this
+ * branch. The projection of the cascade-resolved `channels.buzz` block into
+ * these env vars (at scaffold/compose time) is DEFERRED to the deploy-wiring
+ * phase. Until that lands, `BUZZ_ENABLED` is unset everywhere, so the channel
+ * is inert by construction and this sidecar never runs live. (Also deferred to
+ * that phase: BuzzChannelSchema currently has no chat-id field, yet this loader
+ * requires BUZZ_CHAT_ID when live — the schema→env mapping is part of the
+ * env-projection work, not added here.)
  *
  * `loadConfigFromEnv` is pure w.r.t. a supplied env map so it is unit-testable.
  */

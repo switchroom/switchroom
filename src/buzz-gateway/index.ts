@@ -28,6 +28,7 @@ import { createDedupStore } from "./dedup.js";
 import { makeInject } from "./ipc-peer.js";
 import { createNostrClient, type SocketFactory, type WsLike } from "./nostr-client.js";
 import { createInboundPump } from "./pump.js";
+import { createRetryQueue } from "./retry-queue.js";
 
 function log(msg: string): void {
   process.stderr.write(`buzz-gateway: ${msg}\n`);
@@ -129,10 +130,21 @@ async function main(): Promise<void> {
   const ipcClient = createInjectIpcClient({ socketPath, log });
   const inject = makeInject(ipcClient, config.agentName);
 
+  // MAJOR-1: an inject that fails because the gateway is momentarily down is
+  // held here and re-attempted against the IPC client's reconnect, recording
+  // dedup only once it lands — so a Buzz event is never lost to a brief gateway
+  // outage, and never double-fired.
+  const retryQueue = createRetryQueue({
+    inject,
+    onInjected: (id) => dedup.record(id),
+    log,
+  });
+
   const pump = createInboundPump({
     config,
     dedup,
     inject,
+    retryQueue,
     verify: (ev: NostrEventLike) => verifyEvent(ev as unknown as Parameters<typeof verifyEvent>[0]),
     agentPubkey,
     log,
@@ -146,6 +158,9 @@ async function main(): Promise<void> {
     onEvent: (ev) => {
       const outcome = pump.handleEvent(ev);
       if (outcome === "injected") log(`injected buzz event ${ev.id.slice(0, 12)}`);
+      // A "queued" outcome is not durably handled — signal the client to hold
+      // the resubscribe watermark so a resubscribe re-covers it if we crash.
+      return outcome !== "queued";
     },
     socketFactory: bunSocketFactory,
     log,
@@ -154,6 +169,7 @@ async function main(): Promise<void> {
   const shutdown = () => {
     log("shutting down");
     try { nostr.stop(); } catch { /* nothing to do */ }
+    try { retryQueue.stop(); } catch { /* nothing to do */ }
     try { ipcClient.close(); } catch { /* nothing to do */ }
     try { dedup.close(); } catch { /* nothing to do */ }
     process.exit(0);

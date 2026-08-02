@@ -57,8 +57,13 @@ export interface NostrClientOptions {
   kinds?: number[];
   /** 32-byte Nostr secret key for the NIP-42 AUTH answer. */
   secretKey: Uint8Array;
-  /** Delivered for each admitted-by-the-relay EVENT on our subscription. */
-  onEvent: (event: NostrEventLike) => void;
+  /** Delivered for each admitted-by-the-relay EVENT on our subscription.
+   *  Returns `false` to signal the event was NOT durably handled (its inject
+   *  failed and it is only in the volatile retry queue) — the resubscribe
+   *  watermark then does NOT advance past it, so a resubscribe re-covers it
+   *  (MAJOR-1 backstop for a sidecar crash before the retry lands). Any other
+   *  return (a truthy value or void) advances the watermark as before. */
+  onEvent: (event: NostrEventLike) => boolean | void;
   socketFactory: SocketFactory;
   log?: (msg: string) => void;
   reconnectMinMs?: number;
@@ -140,10 +145,14 @@ export function createNostrClient(opts: NostrClientOptions): NostrClient {
       case "EVENT": {
         if (frame.subId !== SUB_ID) break;
         const ev = frame.event;
-        if (typeof ev?.created_at === "number" && ev.created_at > watermark) {
+        // Advance the watermark AFTER handling, and only when the event was
+        // durably handled (onEvent did not return false). An inject that failed
+        // and is merely queued in memory must NOT move the watermark past this
+        // event, so a resubscribe re-covers it if the sidecar dies first.
+        const durable = opts.onEvent(ev) !== false;
+        if (durable && typeof ev?.created_at === "number" && ev.created_at > watermark) {
           watermark = ev.created_at;
         }
-        opts.onEvent(ev);
         break;
       }
       case "CLOSED":

@@ -6,11 +6,14 @@
  *
  * Ordering is load-bearing and asserted by tests:
  *   1. auth gate (signature + allowlist + self-echo)  — fail-closed
- *   2. dedup                                           — never double-fire
+ *   2. dedup — never double-fire. An id is "already accounted for" if it is in
+ *      the durable dedup journal OR pending in the in-memory retry queue.
  *   3. map (kind:9 → InboundMessage, else drop)
  *   4. inject onto the gateway socket
- *   5. record in the dedup journal — ONLY after a successful inject, so a
- *      failed inject can be re-attempted on the next redelivery.
+ *   5. on success: record in the dedup journal. On failure: hand the mapped
+ *      inbound to the retry queue, which re-attempts inject against the IPC
+ *      client's reconnect and records dedup only once the inject lands. Nothing
+ *      is dropped just because the gateway was momentarily down (MAJOR-1).
  */
 
 import type { InboundMessage } from "../../telegram-plugin/gateway/ipc-protocol.js";
@@ -19,10 +22,12 @@ import type { BuzzRuntimeConfig } from "./config.js";
 import { isChannelLive } from "./config.js";
 import type { DedupStore } from "./dedup.js";
 import { mapBuzzEvent } from "./inbound-map.js";
+import type { RetryQueue } from "./retry-queue.js";
 
 export type PumpOutcome =
   | "injected"
   | "duplicate"
+  | "queued"
   | "unmapped"
   | "inject_failed"
   | "channel_off"
@@ -34,6 +39,11 @@ export interface PumpDeps {
   /** Deliver the inbound onto the gateway socket. Returns true iff the bytes
    *  were accepted (the strongest signal a fire-and-forget client gets). */
   inject: (inbound: InboundMessage) => boolean;
+  /** Redelivery queue for injects that fail because the gateway is momentarily
+   *  down (MAJOR-1). When present, a failed inject is enqueued here rather than
+   *  dropped, and a queued id counts as already-accounted-for by dedup. When
+   *  absent, a failed inject is dropped and relies on relay resubscribe. */
+  retryQueue?: Pick<RetryQueue, "has" | "enqueue">;
   /** Signature verifier (nostr-tools `verifyEvent` in production). */
   verify: (ev: NostrEventLike) => boolean;
   /** This agent's own pubkey (hex, lowercase), to drop self-echoes. */
@@ -81,7 +91,9 @@ export function createInboundPump(deps: PumpDeps): InboundPump {
       // Admitted ⇒ structurally valid, so this cast is safe.
       const event = ev as NostrEventLike;
 
-      if (deps.dedup.has(event.id)) {
+      // Already accounted for if it is in the durable journal OR pending a
+      // retry inject (in which case injecting again here would double-fire).
+      if (deps.dedup.has(event.id) || deps.retryQueue?.has(event.id)) {
         bump("duplicate");
         return "duplicate";
       }
@@ -98,10 +110,18 @@ export function createInboundPump(deps: PumpDeps): InboundPump {
 
       const sent = deps.inject(inbound);
       if (!sent) {
-        // Do NOT record — a redelivery must be able to inject once the socket
-        // recovers. The relay resends on resubscribe/reconnect.
+        // Do NOT record in dedup — the inject has not landed. Hand the mapped
+        // inbound to the retry queue, which re-attempts against the IPC client's
+        // reconnect and records dedup only once the inject succeeds (MAJOR-1).
+        // While it sits there, a relay redelivery of this id dedups above.
+        if (deps.retryQueue) {
+          deps.retryQueue.enqueue(event.id, inbound);
+          bump("queued");
+          log(`buzz pump: inject failed id=${event.id.slice(0, 12)} (queued for redelivery)`);
+          return "queued";
+        }
         bump("inject_failed");
-        log(`buzz pump: inject failed id=${event.id.slice(0, 12)} (not recording; will retry on redelivery)`);
+        log(`buzz pump: inject failed id=${event.id.slice(0, 12)} (no retry queue; relying on relay resubscribe)`);
         return "inject_failed";
       }
 

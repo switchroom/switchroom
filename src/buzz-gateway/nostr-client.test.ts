@@ -56,7 +56,7 @@ describe("createNostrClient NIP-42 handshake", () => {
       relayHost: "127.0.0.1:3000",
       groupId: "group-uuid",
       secretKey: sk,
-      onEvent: (ev) => received.push(ev),
+      onEvent: (ev) => { received.push(ev); },
       socketFactory: fs.factory,
       nowSec: () => 1_700_000_000,
       random: () => 0.5,
@@ -99,7 +99,7 @@ describe("createNostrClient NIP-42 handshake", () => {
       relayHost: "",
       groupId: "group-uuid",
       secretKey: sk,
-      onEvent: (ev) => received.push(ev),
+      onEvent: (ev) => { received.push(ev); },
       socketFactory: fs.factory,
     });
     client.start();
@@ -118,6 +118,49 @@ describe("createNostrClient NIP-42 handshake", () => {
     expect(received.length).toBe(1);
 
     client.stop();
+  });
+
+  it("does NOT advance the resubscribe watermark when onEvent returns false (MAJOR-1 backstop)", () => {
+    const sk = generateSecretKey();
+    const senderSk = generateSecretKey();
+
+    // Helper: run one client, deliver one EVENT with the given onEvent return,
+    // force a resubscribe, and read the `since` the client would re-request.
+    function sinceAfterEvent(durable: boolean | void): number {
+      const fs = fakeSocket();
+      const client = createNostrClient({
+        relayUrl: "ws://relay",
+        relayHost: "",
+        groupId: "group-uuid",
+        secretKey: sk,
+        onEvent: () => durable,
+        socketFactory: fs.factory,
+        nowSec: () => 1_700_000_000,
+      });
+      client.start();
+      fs.open();
+      const ev = finalizeEvent(
+        { kind: 9, created_at: 1_800_000_000, tags: [["h", "group-uuid"]], content: "hi" },
+        senderSk,
+      ) as NostrEventLike;
+      fs.message(JSON.stringify(["EVENT", "buzz-in", ev]));
+      // Force a resubscribe via the AUTH→OK path and read the new REQ's since.
+      fs.message(JSON.stringify(["AUTH", "chal"]));
+      const authFrame = JSON.parse(fs.sent[fs.sent.length - 1]);
+      const authId = (authFrame[1] as NostrEventLike).id;
+      fs.message(JSON.stringify(["OK", authId, true, ""]));
+      const resub = JSON.parse(fs.sent[fs.sent.length - 1]);
+      expect(resub[0]).toBe("REQ");
+      client.stop();
+      return resub[2].since as number;
+    }
+
+    // Durable (void/true): watermark jumps to the event's created_at, so the
+    // resubscribe `since` is anchored near it (created_at - lookback).
+    expect(sinceAfterEvent(undefined)).toBe(1_800_000_000 - 300);
+    // Not durable (false, e.g. a queued inject_failed): watermark is held at its
+    // initial (now - lookback), so `since` stays low and re-covers the event.
+    expect(sinceAfterEvent(false)).toBe(1_700_000_000 - 300 - 300);
   });
 
   it("passes the Host header authority to the socket factory", () => {
