@@ -79,13 +79,78 @@ RUN apt-get update \
 # Installing onnxruntime-gpu AFTER kokoro-onnx replaces the transitively-pulled
 # CPU onnxruntime with the GPU build (same import name, so kokoro-onnx picks it
 # up unchanged). Dependabot bumps all four pins.
+# misaki is the POS-aware grapheme→phoneme engine that fixes English
+# heteronyms Kokoro's built-in espeak phonemizer mispronounces (espeak is not
+# part-of-speech aware): the verb "live" /lˈɪv/ vs the adjective "live"
+# /lˈaɪv/, "read" present /ɹˈid/ vs past /ɹˈɛd/, etc. server.py runs it
+# in-process and feeds the phoneme string to Kokoro via is_phonemes=True.
+#
+# Deliberately NOT `misaki[en]`: that extra pulls spacy-curated-transformers,
+# which drags in torch — undoing the whole no-torch design of the kokoro-onnx
+# path above (lines ~64-69). We install BASE misaki + spaCy (tok2vec + tagger
+# only; misaki runs with trf=False so no transformer pipeline is needed) +
+# num2words. espeakng-loader / phonemizer-fork are already pinned transitively
+# by kokoro-onnx and stay — misaki's OOV EspeakFallback (and the non-English
+# path) use them.
+#
+# en_core_web_sm is baked as a WHEEL rather than fetched at runtime because
+# misaki.en.G2P.__init__ otherwise calls spacy.cli.download() on first use — a
+# network fetch AND a site-packages write that fails under the non-root runtime
+# UID (65532) and breaks offline boots. Its major.minor (3.8) MUST match the
+# spacy pin (3.8.x); a mismatch makes spaCy refuse to load the model.
+#
+# `click` is an UNDECLARED runtime dependency of spaCy's CLI here: spacy/cli/
+# _util.py does `from click import NoSuchOption`, but the transitive chain
+# (typer 0.27 no longer hard-depends on click) leaves it uninstalled on a clean
+# image, so `import spacy` — which misaki does at module load — dies with
+# `ModuleNotFoundError: No module named 'click'`. Same class of bug as the
+# `requests`/faster-whisper pin above. Pin it explicitly.
+#
+# numpy floor: spaCy 3.8 + kokoro-onnx 0.5.0 both build against numpy 2; the
+# resolver lands 2.2.x. Pin the >=2.0.2 floor so a resolver wobble can never
+# drag the image back to numpy 1.x (which the Kokoro ONNX path can't use).
+#
+# DEPENDABOT: keep misaki pinned at 0.9.4. misaki's `main` branch imports
+# torch/transformers at the TOP of en.py; 0.9.4 does not. Any bump MUST re-check
+# misaki/en.py's module-level imports stay torch-free, or the no-torch design
+# regresses silently.
 RUN pip3 install --no-cache-dir \
         "faster-whisper==1.0.3" \
         "huggingface_hub==0.25.2" \
         "requests==2.32.3" \
         "kokoro-onnx==0.5.0" \
+        "misaki==0.9.4" \
+        "num2words==0.5.14" \
+        "spacy==3.8.7" \
+        "click==8.1.7" \
+        "numpy>=2.0.2" \
+        "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
     && pip3 uninstall -y onnxruntime \
     && pip3 install --no-cache-dir "onnxruntime-gpu==1.20.2"
+
+# Build-time OUTCOME guard (fail-loud) — proves misaki's POS-aware G2P actually
+# emits DIFFERENT phonemes for the two senses of each heteronym, which is the
+# entire point of this dependency. A bare `import misaki` check would stay green
+# even if spaCy silently failed to load the tagger and every word collapsed to
+# the espeak fallback, so we assert the exact phoneme substrings, verified
+# empirically against misaki 0.9.4 in a python:3.10 container:
+#   verb "live"  → lˈɪv   vs  adjective "live" → lˈIv   (capital I = /aɪ/)
+#   base "read"  → ɹˈid   vs  past      "read" → ɹˈɛd
+# Two independent pairs so one lexicon change can't quietly vacate the guard.
+# This also transitively proves the two load-bearing assumptions: (a) misaki's
+# English path is torch-free with trf=False (torch is never installed here, so
+# an import of it would ImportError), and (b) the baked en_core_web_sm wheel
+# loads offline under spaCy. If any of that regresses, THIS build turns red.
+RUN python3 -c "\
+from misaki import en, espeak; \
+g2p = en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False)); \
+lv, _ = g2p('They live in Sydney.'); \
+la, _ = g2p('It was a live show.'); \
+rp, _ = g2p('Please read this book.'); \
+rd, _ = g2p('He read it yesterday.'); \
+assert 'lˈɪv' in lv and 'lˈIv' in la, ('live sense collapsed', lv, la); \
+assert 'ɹˈid' in rp and 'ɹˈɛd' in rd, ('read sense collapsed', rp, rd); \
+print('misaki G2P heteronym guard OK:', lv, '|', la, '|', rp, '|', rd)"
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 

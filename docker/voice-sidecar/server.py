@@ -13,6 +13,25 @@ GPU (the PR-B1 `engine='local'` verdict).
 One sidecar, two endpoints, one port (8126). STT and TTS each get their
 OWN concurrency lane so a synth never serializes behind a transcribe.
 
+English G2P (heteronyms)
+------------------------
+By default (VOICE_TTS_G2P=misaki) the TTS path runs misaki's POS-aware
+English grapheme→phoneme conversion in-process and feeds the resulting
+phoneme string to Kokoro with is_phonemes=True. This fixes English
+heteronyms Kokoro's built-in espeak phonemizer mispronounces because
+espeak is not part-of-speech aware — e.g. the verb "live" /lˈɪv/ vs the
+adjective "live" /lˈaɪv/, or "read" present /ɹˈid/ vs past /ɹˈɛd/. It is
+a strict ENHANCEMENT: misaki is loaded in its own try/except beside the
+Kokoro model, and any failure (or VOICE_TTS_G2P=espeak, or a non-English
+locale) leaves _g2p None so synthesis degrades to today's espeak path
+with the sidecar fully healthy. VOICE_TTS_G2P=espeak is the rollback
+lever — no image rebuild. See _load_tts / _phonemize_piece / _run_synthesis.
+FUTURE (not built): misaki also accepts a per-word phoneme override via
+`[word](/phoneme/)` markup — a hook for a caller-supplied pronunciation
+override, but normalizeForSpeech (telegram-plugin/voice-normalize-text.ts)
+currently strips `[text](...)` link markup, so wiring it end-to-end would
+need that pass to pass the `/…/` form through first.
+
 HTTP contract
 -------------
   POST /stt   multipart: audio=<bytes>, optional language=<iso-639-1>
@@ -109,6 +128,16 @@ TTS_VOICES_SHA256 = os.environ.get("VOICE_TTS_VOICES_SHA256", "").strip()
 # af_heart is a clear, natural Kokoro US-English voice — a sensible default.
 TTS_VOICE = os.environ.get("VOICE_TTS_VOICE", "af_heart")
 TTS_LANG = os.environ.get("VOICE_TTS_LANG", "en-us")
+# ── G2P engine selection (grapheme→phoneme) ────────────────────────────
+# "misaki" (default) runs misaki's POS-aware English G2P in-process and hands
+# the resulting phoneme string to Kokoro with is_phonemes=True. That fixes
+# English heteronyms Kokoro's built-in espeak phonemizer gets wrong because
+# espeak is NOT part-of-speech aware — e.g. the verb "live" /lˈɪv/ vs the
+# adjective "live" /lˈaɪv/, or "read" present /ɹˈid/ vs past /ɹˈɛd/. misaki is
+# applied ONLY to the English locales (en-us / en-gb); every other TTS_LANG
+# keeps the espeak path. Set VOICE_TTS_G2P=espeak to restore the espeak-only
+# path fleet-wide — the rollback lever, no image rebuild required.
+TTS_G2P = os.environ.get("VOICE_TTS_G2P", "misaki").lower()
 # Only OGG/Opus is wired (Telegram sendVoice requires it); the env exists so
 # a future format can be added without a contract change.
 TTS_FORMAT = os.environ.get("VOICE_TTS_FORMAT", "ogg").lower()
@@ -197,6 +226,14 @@ _tts_lock = threading.Lock()
 _tts_error: str | None = None
 _tts_sem = threading.Semaphore(TTS_CONCURRENCY)
 _tts_pool = ThreadPoolExecutor(max_workers=TTS_CONCURRENCY + 2)
+# misaki English G2P handle (POS-aware phonemizer), loaded alongside _tts in
+# _load_tts when TTS_G2P == "misaki" and TTS_LANG is English. None otherwise or
+# if its (optional) load fails — synthesis then degrades to Kokoro's espeak
+# phonemization. Guarded by _tts_lock (same lane as _tts).
+_g2p = None
+# A phonemize failure is logged ONCE (not per request) so a persistent misaki
+# fault degrades quietly to the espeak path instead of flooding the log.
+_g2p_warned = False
 
 
 def _log(msg: str) -> None:
@@ -396,7 +433,7 @@ def _load_tts() -> None:
     """Fetch-once + load the Kokoro ONNX model. Runs in a background thread
     (like _load_model) so /healthz reports 'not ready' during the cold load
     and the server doesn't block on boot."""
-    global _tts, _tts_error
+    global _tts, _tts_error, _g2p
     try:
         os.makedirs(MODEL_CACHE, exist_ok=True)
         model_path = os.path.join(MODEL_CACHE, TTS_MODEL)
@@ -417,6 +454,32 @@ def _load_tts() -> None:
     except Exception as exc:  # noqa: BLE001 — fail closed, report on /healthz
         _tts_error = f"{type(exc).__name__}: {exc}"
         _log(f"TTS model load FAILED: {_tts_error}")
+        return
+
+    # Build the misaki English G2P in its OWN try/except: it is an ENHANCEMENT
+    # (heteronym-correct phonemes), NOT a requirement. If anything here fails —
+    # misaki not installed, spaCy model missing, espeak fallback init error —
+    # the sidecar stays fully healthy (_tts is already set, /healthz untouched)
+    # and synthesis degrades to Kokoro's built-in espeak phonemizer, i.e.
+    # exactly today's behavior. Only the English locales use it.
+    if TTS_G2P == "misaki" and TTS_LANG in ("en-us", "en-gb"):
+        try:
+            from misaki import en, espeak  # heavy import, deferred
+
+            british = TTS_LANG == "en-gb"
+            g2p = en.G2P(
+                trf=False,  # torch-free path (no spacy-curated-transformers)
+                british=british,
+                fallback=espeak.EspeakFallback(british=british),
+            )
+            with _tts_lock:
+                _g2p = g2p
+            _log(f"misaki G2P ready (lang={TTS_LANG}, british={british})")
+        except Exception as exc:  # noqa: BLE001 — enhancement; degrade gracefully
+            _log(
+                f"misaki G2P load FAILED ({type(exc).__name__}: {exc}); "
+                "falling back to espeak phonemization"
+            )
 
 
 def _pcm_to_wav_bytes(samples, sample_rate: int) -> bytes:
@@ -532,6 +595,41 @@ def _clamp_speed(value: object) -> float:
     return max(TTS_SPEED_MIN, min(TTS_SPEED_MAX, speed))
 
 
+def _phonemize_piece(piece: str) -> tuple[str, bool]:
+    """Convert one text piece to a Kokoro phoneme string via misaki's POS-aware
+    English G2P.
+
+    Returns (phonemes, True) on success — the caller then hands `phonemes` to
+    Kokoro with is_phonemes=True, which is what makes heteronyms come out right.
+    Returns (piece, False) — the raw TEXT, unchanged — when misaki is not in
+    play (VOICE_TTS_G2P=espeak, a non-English locale, or a failed G2P load left
+    _g2p None) OR when the misaki call itself raises / yields nothing; the
+    caller then passes the text to Kokoro and gets today's espeak
+    phonemization. A phonemize failure is logged ONCE, never per request.
+
+    Pure and stub-testable WITHOUT misaki installed: the G2P handle is read from
+    the module global, so a test can inject a fake (or None) and exercise both
+    branches. Never raises — a phoneme miss must never fail a synthesis."""
+    global _g2p_warned
+    with _tts_lock:
+        g2p = _g2p
+    if g2p is None:
+        return piece, False
+    try:
+        phonemes, _tokens = g2p(piece)
+        if not phonemes:
+            return piece, False
+        return phonemes, True
+    except Exception as exc:  # noqa: BLE001 — degrade to the espeak text path
+        if not _g2p_warned:
+            _g2p_warned = True
+            _log(
+                f"misaki phonemize failed ({type(exc).__name__}: {exc}); "
+                "falling back to espeak text path (logged once)"
+            )
+        return piece, False
+
+
 def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> tuple[bytes, dict]:
     """The TTS-serialized synthesis. Acquires the TTS semaphore so only
     TTS_CONCURRENCY synths run at once — a separate lane from STT.
@@ -556,9 +654,23 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
         chunks: list[np.ndarray] = []
         sample_rate = TTS_SAMPLE_RATE
         for i, piece in enumerate(pieces):
-            samples, sample_rate = _tts.create(  # type: ignore[union-attr]
-                piece, voice=voice, speed=speed, lang=TTS_LANG
-            )
+            # misaki's POS-aware G2P runs here, INSIDE _tts_sem — so with
+            # VOICE_TTS_CONCURRENCY defaulting to 1, spaCy is never called
+            # concurrently. On a hit we hand Kokoro the phoneme string
+            # (is_phonemes=True — the heteronym fix); on any miss we hand it the
+            # raw TEXT and Kokoro phonemizes via espeak (today's path). A
+            # regression must never route a phoneme string through the espeak
+            # text path, so the two branches are kept explicit. See
+            # _phonemize_piece / VOICE_TTS_G2P=espeak (rollback lever).
+            content, is_phonemes = _phonemize_piece(piece)
+            if is_phonemes:
+                samples, sample_rate = _tts.create(  # type: ignore[union-attr]
+                    content, voice=voice, speed=speed, is_phonemes=True
+                )
+            else:
+                samples, sample_rate = _tts.create(  # type: ignore[union-attr]
+                    piece, voice=voice, speed=speed, lang=TTS_LANG
+                )
             arr = np.asarray(samples, dtype=np.float32)
             if i > 0:
                 chunks.append(pad)
