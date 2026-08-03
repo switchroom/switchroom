@@ -177,8 +177,10 @@ evals:
     question: "List all cron schedules"
     primary_skill: "switchroom-cli"
     expected_contains:
-      - "cron|schedule|list"
-    tags: ["schedule", "cron"]
+      - "agent-scheduler|switchroom\\.yaml|schedule:|docker logs"
+    expected_not_contains:
+      - "crontab -e|/etc/cron|/var/spool/cron"
+    tags: ["schedule", "cron", "runtime"]
 
   - id: "schedule-005"
     question: "Delete the weekly report schedule"
@@ -359,10 +361,10 @@ evals:
     question: "How does switchroom work?"
     primary_skill: "switchroom-architecture"
     expected_contains:
-      - "switchroom|agent|config|architecture|how"
+      - "container|Docker|compose|gateway|supervis|scaffold|Hindsight"
     expected_not_contains:
-      - "I don't know"
-    tags: ["architecture"]
+      - "I don't know|I'm not sure how switchroom"
+    tags: ["architecture", "runtime"]
 
   - id: "arch-002"
     question: "Explain the config cascade in switchroom"
@@ -404,10 +406,10 @@ evals:
     question: "How do I install switchroom on a fresh Ubuntu box?"
     primary_skill: "switchroom-install"
     expected_contains:
-      - "bun|git clone|switchroom setup|apt install"
+      - "docker|switchroom setup|GHCR|static binary|claude"
     expected_not_contains:
-      - "I don't know|I cannot help"
-    tags: ["install"]
+      - "I don't know|I cannot help|npm install -g switchroom"
+    tags: ["install", "runtime"]
 
   - id: "install-002"
     question: "Set up switchroom for me"

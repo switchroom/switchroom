@@ -1,0 +1,21 @@
+# Skills intentionally exempt from the eval-coverage gate.
+#
+# The coverage gate (evals/validate_datasets.py --coverage) WARNs on any skill
+# under skills/ that has neither a quality (primary_skill) nor a trigger
+# (expected_skill) eval. Once the gate flips to its HARD phase, a NEWLY-ADDED
+# skill dir with no evals fails CI unless it is listed here.
+#
+# Exempt only skills that genuinely cannot carry a meaningful forced-choice
+# routing / quality eval — library skills invoked by other skills, or internal
+# calibration companions with no direct user-facing trigger surface. Everything
+# else (office, writing, builder, release, runtime, testing families) is
+# expected to gain evals in buckets 2–5 and must NOT be parked here.
+
+exempt:
+  # Library skill — never user-routed; invoked by other skills that need a
+  # short-lived Google/Graph access token. No standalone trigger surface.
+  - token-helpers
+  # Internal calibration companion to `humanizer`; runs as a maintenance pass,
+  # not a user-facing routing target. The user-facing writing surface is
+  # covered by the `humanizer` evals (bucket 2, writing family).
+  - humanizer-calibrate

@@ -1,24 +1,26 @@
 name: ci-evals
 
-# Skills evals — trigger routing + quality.
+# Skills evals — dataset validation + trigger routing + quality.
 #
-# Auth precedence:
+# Auth precedence (model-cost jobs only):
 #   1. ANTHROPIC_API_KEY (separate billing pool)
 #   2. CLAUDE_CODE_OAUTH_TOKEN (subscription, weekly cap)
 #   3. neither → step exits 0 (clean no-op)
 #
-# Quota protection: GHA concurrency group serialises eval runs across
-# parallel builds on the same workflow file. `cancel-in-progress: false`
-# is LOAD-BEARING — a fresh push must NOT kill an in-flight eval (it
-# already burned the quota; the result is what we want). Subsequent
-# pushes queue behind it. BK's `concurrency: 1` + `concurrency_group`
-# is the same idea.
+# The `evals-validate` job runs UNCONDITIONALLY with zero model cost, so fork
+# PRs (which have no Anthropic credential) still get schema + lint + coverage
+# protection. The model-cost jobs gate on it via `needs`.
 #
-# PR-from-fork: secrets are intentionally unavailable for fork PRs on
-# public repos (GitHub policy — no cross-repo token escape). The auth
-# block detects the empty-string case and exits 0 with a clear log line.
-# Maintainers running the workflow via push-to-branch or workflow_dispatch
-# get the full eval run.
+# Quota protection: a CONSTANT global concurrency group serialises eval runs
+# across every build (any ref) so parallel pushes/PRs share the weekly cap
+# fairly. `cancel-in-progress: false` is LOAD-BEARING — a fresh push must NOT
+# kill an in-flight eval (it already burned the quota; the result is what we
+# want). Subsequent runs queue behind it.
+#
+# PR-from-fork: secrets are intentionally unavailable for fork PRs on public
+# repos (GitHub policy). The auth block detects the empty-string case and exits
+# 0 with a clear log line. Maintainers running via push-to-branch or
+# workflow_dispatch get the full eval run.
 
 on:
   pull_request:
@@ -26,30 +28,19 @@ on:
     paths:
       # Skill text changes can flip routing decisions
       - "skills/**/SKILL.md"
-      # Eval framework + datasets
-      - "evals/run_trigger.py"
-      - "evals/run_quality.py"
-      - "evals/trigger_dataset.yaml"
-      - "evals/dataset.yaml"
+      # Eval framework + datasets (whole dir — runners, validator, datasets)
+      - "evals/**"
       # Profile CLAUDE.md influences how the model interprets queries
       - "profiles/**/CLAUDE.md*"
       - ".github/workflows/ci-evals.yml"
   push:
     branches: [main]
-    # Same eval-relevant scope as the PR trigger. Pre-fix the push
-    # trigger had NO paths filter, so EVERY main merge (refactors, docs,
-    # unrelated src/) ran both eval jobs — each a real claude-model
-    # spend (API pool or subscription weekly cap). Evals are not a
-    # required check and ci-infra-watchdog doesn't observe them, so
-    # path-scoping the push trigger is safe; workflow_dispatch remains
-    # the on-demand full-run lever. Mirrors the quota-driven
-    # path-scoping already on ci-uat's push trigger.
+    # Same eval-relevant scope as the PR trigger. Path-scoped so unrelated
+    # main merges don't burn model quota; workflow_dispatch is the on-demand
+    # full-run lever.
     paths:
       - "skills/**/SKILL.md"
-      - "evals/run_trigger.py"
-      - "evals/run_quality.py"
-      - "evals/trigger_dataset.yaml"
-      - "evals/dataset.yaml"
+      - "evals/**"
       - "profiles/**/CLAUDE.md*"
       - ".github/workflows/ci-evals.yml"
   workflow_dispatch:
@@ -57,16 +48,47 @@ on:
 permissions:
   contents: read
 
-# Serialise eval runs across builds — share quota fairly with concurrent
-# pushes/PRs. NOT cancel-in-progress.
+# Constant global group — serialise ALL eval runs to protect the shared quota.
+# NOT cancel-in-progress.
 concurrency:
-  group: ci-evals-${{ github.ref }}
+  group: ci-evals-global
   cancel-in-progress: false
 
 jobs:
+  # ─── Dataset validation (zero model cost, runs on fork PRs) ──────────
+  evals-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # coverage gate diffs against the base ref
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install python deps
+        run: pip install -q pyyaml
+
+      - name: Lint self-check (fixtures must fail their lints)
+        run: python3 evals/validate_datasets.py --selftest
+
+      - name: Validate datasets (schema + lints)
+        run: python3 evals/validate_datasets.py
+
+      - name: Coverage gate (SOFT — report only until buckets 2–5 merge)
+        # PHASE 1: soft-report uncovered skills. Flip to hard once the office /
+        # writing / builder / release / runtime / testing families land their
+        # evals: replace with `--coverage --hard --base-ref origin/main`.
+        run: python3 evals/validate_datasets.py --coverage
+
   # ─── Trigger routing eval ────────────────────────────────────────
   evals-trigger:
     runs-on: ubuntu-latest
+    needs: evals-validate
     timeout-minutes: 30
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -131,9 +153,9 @@ jobs:
         run: pip install -q pyyaml
 
       - name: Run trigger-routing eval
+        # NO continue-on-error: a failing routing eval must fail the job.
         if: steps.auth.outputs.auth != 'none'
-        continue-on-error: true
-        run: python3 evals/run_trigger.py --parallel 5
+        run: python3 evals/run_trigger.py --parallel 5 --runs 3
 
       - name: Upload eval results
         if: always() && steps.auth.outputs.auth != 'none'
@@ -147,6 +169,7 @@ jobs:
   # ─── Quality eval ────────────────────────────────────────────────
   evals-quality:
     runs-on: ubuntu-latest
+    needs: evals-validate
     timeout-minutes: 30
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -205,8 +228,8 @@ jobs:
         run: pip install -q pyyaml
 
       - name: Run quality eval
+        # NO continue-on-error: a failing quality eval must fail the job.
         if: steps.auth.outputs.auth != 'none'
-        continue-on-error: true
         run: python3 evals/run_quality.py --parallel 5
 
       - name: Upload eval results
@@ -221,7 +244,7 @@ jobs:
   # ─── Summary ─────────────────────────────────────────────────────
   evals-summary:
     runs-on: ubuntu-latest
-    needs: [evals-trigger, evals-quality]
+    needs: [evals-validate, evals-trigger, evals-quality]
     if: always()
     timeout-minutes: 5
     permissions:
@@ -231,11 +254,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+
       - name: Download eval artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: evals/results
           merge-multiple: true
+
+      - name: Hard gate on result JSONs
+        # Belt-and-suspenders over the (now non-continue-on-error) run steps:
+        # parse every result artifact and fail if any eval regressed
+        # (passed < total) or reported an error row. Absence of ALL artifacts
+        # is tolerated ONLY when the eval jobs were skipped/no-auth — a job
+        # that actually ran and crashed already failed above and shows here as
+        # `needs` failure. This step never masks a red eval job.
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          files = list(Path("evals/results").rglob("*.json"))
+          if not files:
+              print("No result artifacts (eval jobs skipped / no-auth) — nothing to gate.")
+              sys.exit(0)
+          bad = False
+          for f in files:
+              try:
+                  d = json.loads(f.read_text())
+              except Exception as e:
+                  print(f"::error::unparseable result artifact {f}: {e}")
+                  bad = True
+                  continue
+              s = d.get("summary", {})
+              passed, total = s.get("passed", 0), s.get("total", 0)
+              errored = s.get("errored", 0)
+              status = "OK" if (passed >= total and not errored) else "FAIL"
+              print(f"{f.name}: {passed}/{total} passed, errored={errored} [{status}]")
+              if passed < total or errored:
+                  bad = True
+          sys.exit(1 if bad else 0)
+          PY
 
       - name: Annotate evals
         # Best-effort — same posture as BK's annotate-evals.sh step.

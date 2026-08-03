@@ -1,12 +1,15 @@
 #!/bin/bash
-# Run the full eval suite in an isolated process (via systemd-run).
-# Results written to evals/results/. Run from the switchroom repo root.
+# Run the full eval suite. Results written to evals/results/.
+# Run from anywhere — the script resolves the repo root from its own path.
 
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.switchroom/agents/assistant/.claude}"
+# CLAUDE_CONFIG_DIR selects which OAuth/config profile `claude -p` uses. Do NOT
+# hard-code a specific agent — honour whatever the caller exported, and fall
+# back to the CLI default (~/.claude) so this runs on a plain dev box or in CI.
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 PARALLEL="${1:-3}"
 LOG="/tmp/switchroom-evals-$(date +%Y%m%d_%H%M%S).log"
 
@@ -16,8 +19,13 @@ echo "Parallel: $PARALLEL" | tee -a "$LOG"
 echo "Log: $LOG" | tee -a "$LOG"
 echo "" | tee -a "$LOG"
 
+echo "--- Dataset validation (no model cost) ---" | tee -a "$LOG"
+python3 evals/validate_datasets.py 2>&1 | tee -a "$LOG"
+VALIDATE_EXIT=${PIPESTATUS[0]}
+echo "" | tee -a "$LOG"
+
 echo "--- Trigger evals (routing) ---" | tee -a "$LOG"
-python3 evals/run_trigger.py --parallel "$PARALLEL" 2>&1 | tee -a "$LOG"
+python3 evals/run_trigger.py --parallel "$PARALLEL" --runs 3 2>&1 | tee -a "$LOG"
 TRIGGER_EXIT=${PIPESTATUS[0]}
 echo "" | tee -a "$LOG"
 
@@ -27,9 +35,15 @@ QUALITY_EXIT=${PIPESTATUS[0]}
 echo "" | tee -a "$LOG"
 
 echo "=== Summary ===" | tee -a "$LOG"
-echo "Trigger: $([ $TRIGGER_EXIT -eq 0 ] && echo PASS || echo FAIL) (exit $TRIGGER_EXIT)" | tee -a "$LOG"
-echo "Quality: $([ $QUALITY_EXIT -eq 0 ] && echo PASS || echo FAIL) (exit $QUALITY_EXIT)" | tee -a "$LOG"
+echo "Validate: $([ $VALIDATE_EXIT -eq 0 ] && echo PASS || echo FAIL) (exit $VALIDATE_EXIT)" | tee -a "$LOG"
+echo "Trigger:  $([ $TRIGGER_EXIT -eq 0 ] && echo PASS || echo FAIL) (exit $TRIGGER_EXIT)" | tee -a "$LOG"
+echo "Quality:  $([ $QUALITY_EXIT -eq 0 ] && echo PASS || echo FAIL) (exit $QUALITY_EXIT)" | tee -a "$LOG"
 echo "Results: $(ls -t evals/results/*.json 2>/dev/null | head -2)" | tee -a "$LOG"
 echo "Log: $LOG" | tee -a "$LOG"
 
-exit $(( TRIGGER_EXIT + QUALITY_EXIT ))
+# Overall status is the WORST of the three (max), not a mod-256 sum of exit
+# codes — summing could wrap to 0 and mask a failure.
+OVERALL=$VALIDATE_EXIT
+[ $TRIGGER_EXIT -gt $OVERALL ] && OVERALL=$TRIGGER_EXIT
+[ $QUALITY_EXIT -gt $OVERALL ] && OVERALL=$QUALITY_EXIT
+exit $OVERALL
