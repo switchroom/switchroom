@@ -82,6 +82,41 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
 | `google_workspace` | deep merge | Google Drive/Docs/Sheets/Calendar integration. `google_client_id` / `google_client_secret` are install-wide (top level only); `tier` + `approvers` cascade per-agent. See § Google Workspace below. |
 | `notion_workspace` | deep merge top-level; per-agent `databases:` list REPLACES (does not concatenate) | Notion integration. Top-level `vault_key` + `databases:` map cascade via deep merge so a profile can add a DB without clobbering top-level entries. The per-agent `databases:` allowlist is **override** — an agent's list replaces the parent's, so a specialist agent inheriting a profile can narrow to fewer DBs. See § Notion Workspace below and [notion-integration.md](notion-integration.md). |
+| `channels.buzz` | override | Buzz desktop co-channel (a closed NIP-29 Nostr relay + one per-agent sidecar). **Dark by default** — omit the block or set `enabled: false` and nothing projects a live channel. See § Buzz co-channel below and [reference/jobs/use-my-team-from-the-desktop.md](../reference/jobs/use-my-team-from-the-desktop.md). |
+
+## Buzz co-channel — `channels.buzz`
+
+Buzz is the desktop door into the same fleet: a per-agent sidecar subscribes
+to a closed [NIP-29](https://github.com/nostr-protocol/nips/blob/master/29.md)
+Nostr relay, NIP-42-authenticates, and injects allowlisted messages onto the
+gateway socket as synthesized turns (`meta.source="buzz"`). Telegram stays the
+authoritative surface — every agent answer lands on Telegram first and Buzz
+only ever mirrors it (Phase 1 is inbound-only; the reply lands on Telegram).
+
+The block is **dark by default and fail-closed by construction**. Omitting
+`channels.buzz` projects **no** `BUZZ_*` container env at all — that agent's
+compose is byte-identical to pre-Buzz. When the block is present,
+`src/agents/compose.ts` maps it into `BUZZ_*` env, but `BUZZ_ENABLED=1` is
+projected **only** when `enabled: true`; an `enabled: false` (or absent) block
+leaves `BUZZ_ENABLED` unset, so `start.sh`'s `[ "$BUZZ_ENABLED" = "1" ]` guard
+never forks the sidecar. The nsec is never projected — only its vault **key
+name**; the sidecar broker-fetches the secret in-process at boot.
+
+| Field | Cascade | Required | Description |
+|-------|---------|----------|-------------|
+| `channels.buzz.enabled` | override | no (default `false`) | Master switch for the per-agent Buzz sidecar. Ships dark; `start.sh` forks the sidecar only when `true`. Projects `BUZZ_ENABLED=1`. |
+| `channels.buzz.mirror` | override | no (default `both`) | Cross-surface mirror mode. `both` answers on the origin channel and mirrors a copy to the other; `off` is a true kill-switch that disables the channel in both directions. `origin` is **deferred** in Phase 2b and degraded to `off` (dark) at runtime — only `both` and `off` ship live. Projects `BUZZ_MIRROR`. |
+| `channels.buzz.relay_url` | override | **yes** | Canonical `ws://`/`wss://` URL of the closed relay — the exact string the relay expects in the NIP-42 `relay` auth tag (e.g. `ws://127.0.0.1:3000`). The relay validates this tag as an exact string match before the membership check, so it is the relay's advertised identity, not necessarily the dial address. Projects `BUZZ_RELAY_URL`. |
+| `channels.buzz.relay_dial_url` | override | no | Reachable `ws://`/`wss://` address the sidecar actually **dials** when it differs from `relay_url` (e.g. a docker-network IP the relay's own `127.0.0.1` can't stand in for). The NIP-42 auth tag still uses `relay_url`. Defaults to `relay_url` when unset. Projects `BUZZ_RELAY_DIAL_URL`. |
+| `channels.buzz.relay_host` | override | **yes** | HTTP `Host` header authority sent verbatim on the WS upgrade (e.g. `127.0.0.1:3000`, port included). The relay resolves its community from this header before the upgrade and returns HTTP 404 if it is missing or wrong, so it must match the relay's configured authority and is deployment config, never derived from the dial URL. Projects `BUZZ_RELAY_HOST`. |
+| `channels.buzz.chat_id` | override | **yes** | Telegram chat id an injected Buzz turn is routed to — the agent's reply lands here on Telegram (the authoritative surface). The sidecar refuses to run live without it. Projects `BUZZ_CHAT_ID`. |
+| `channels.buzz.default_channel_id` | override | **yes** | Relay-minted group UUID (the NIP-29 `h` tag) the sidecar subscribes to and stamps on injected turns. Projects `BUZZ_CHANNEL_IDS`. |
+| `channels.buzz.operator_pubkey` | override | **yes** | The operator's Nostr pubkey (bech32 `npub1…` or 64-char hex). Always in the effective inbound allowlist — the fail-closed default is operator-only. Projects `BUZZ_OPERATOR_PUBKEY`. |
+| `channels.buzz.nsec_vault_key` | override | no (default `buzz/{agent}-nsec`) | Vault **key name** for the agent's Nostr secret key. `{agent}` is substituted with the agent name. Broker-fetched in-process at boot — never resolved into env or logged. Projects `BUZZ_NSEC_VAULT_KEY` (the key name, not the secret). |
+| `channels.buzz.authorized_pubkeys` | override | no (default `[]`) | Additional pubkeys (`npub` or hex) whose signed events may become turns. Effective allowlist = this ∪ `{operator_pubkey}`. Empty by default (operator-only). Projects `BUZZ_AUTHORIZED_PUBKEYS` (comma-joined) when non-empty. |
+| `channels.buzz.pubkey_names` | override | no (default `{}`) | Optional petnames: hex/`npub` pubkey → display name, used to label the sender on injected turns. Projects `BUZZ_PUBKEY_NAMES` (comma-joined `key=value`) when non-empty. |
+| `channels.buzz.channel_map` | override | no (default `{}`) | Optional map of extra group UUIDs → friendly labels. Not projected to env today. |
+| `channels.buzz.pinned_relay_digest` | override | no | **Reserved — not yet consumed.** Intended pinned relay image digest (M4); nothing projects or reads it today. Kept in the schema so the digest-pin can be wired later without a config-shape change. |
 
 ## Permission mode & auto-accept
 

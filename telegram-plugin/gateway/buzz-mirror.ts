@@ -300,8 +300,10 @@ export function getBuzzMirror(): BuzzMirror | null {
  *   (1) `BUZZ_ENABLED` is truthy, AND
  *   (2) the S2-narrowed mode (`parseConfiguredMirrorMode`) is `both`;
  *       a configured `origin`/`off` degrades to dark, never a half-live mirror.
- * The Buzz env vars are UNSET everywhere in this branch (projection deferred),
- * so in practice this is inert. `sender` is the transport to the duplex peer
+ * The Buzz env vars are projected at compose time from `channels.buzz`
+ * (src/agents/compose.ts), with BUZZ_ENABLED=1 gated on `enabled === true`;
+ * an enabled:false/absent block leaves them unset, so for those agents this
+ * is inert by construction. `sender` is the transport to the duplex peer
  * (`ipcServer.sendToBuzzPeer`). Returns the booted instance for tests.
  */
 export function maybeBootBuzzMirror(
