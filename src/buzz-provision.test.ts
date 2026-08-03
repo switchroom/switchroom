@@ -11,26 +11,30 @@ import {
   runBuzzProvision,
   provisionBuzzIdentity,
   computeBuzzStatus,
+  isBuzzFullyLive,
   buzzNsecKey,
   buzzAddMemberCommand,
   type BuzzProvisionStore,
   type BuzzGrantOutcome,
+  type BuzzExistingGrantKeys,
 } from "./buzz-provision.js";
 
 /** In-memory store recording every write + grant. Never touches real state. */
 function makeStore(
   seed: Record<string, string> = {},
   grantResult: BuzzGrantOutcome = { ok: true },
+  existing: BuzzExistingGrantKeys = { read: [], write: [] },
 ) {
   const keys = new Map<string, string>(Object.entries(seed));
-  const grants: { agent: string; key: string }[] = [];
+  const grants: { agent: string; readKeys: string[]; writeKeys: string[] }[] = [];
   const store: BuzzProvisionStore = {
     hasNsec: (key) => keys.has(key),
     writeNsec: (key, nsec) => {
       keys.set(key, nsec);
     },
-    grantRead: async (agent, key) => {
-      grants.push({ agent, key });
+    existingGrantKeys: async () => existing,
+    grantRead: async (agent, readKeys, writeKeys) => {
+      grants.push({ agent, readKeys, writeKeys });
       return grantResult;
     },
   };
@@ -96,8 +100,42 @@ describe("provisionBuzzIdentity", () => {
   it("grants read for the correct agent + key by default", async () => {
     const { store, grants } = makeStore();
     const res = await provisionBuzzIdentity("robby", store);
-    expect(grants).toEqual([{ agent: "robby", key: "buzz/robby-nsec" }]);
+    expect(grants).toEqual([
+      { agent: "robby", readKeys: ["buzz/robby-nsec"], writeKeys: [] },
+    ]);
     if (res.kind === "ok") expect(res.grant).toBe("granted");
+  });
+
+  it("MAJOR-1: unions the nsec key with the agent's existing grant keys so a prior capability survives", async () => {
+    // Agent already holds an unrelated read grant (e.g. a coolify token) plus
+    // a write grant. Provisioning must NOT clobber those — the mint has to
+    // carry them forward alongside the new nsec key.
+    const { store, grants } = makeStore({}, { ok: true }, {
+      read: ["coolify/api-token"],
+      write: ["OPENAI_*"],
+    });
+    const res = await provisionBuzzIdentity("robby", store);
+    expect(grants).toHaveLength(1);
+    // The unrelated read key survives AND the nsec key is added.
+    expect(grants[0]!.readKeys.sort()).toEqual(
+      ["buzz/robby-nsec", "coolify/api-token"].sort(),
+    );
+    // The existing write capability is preserved too.
+    expect(grants[0]!.writeKeys).toEqual(["OPENAI_*"]);
+    if (res.kind === "ok") {
+      expect(res.grant).toBe("granted");
+      expect(res.grantUnion).toEqual({ kind: "unioned", priorKeys: 2 });
+    }
+  });
+
+  it("MAJOR-1: mints nsec-only and flags `unknown` when existing grants can't be read", async () => {
+    // Broker unreadable → existingGrantKeys returns null. Fail open: still
+    // mint the nsec key, but flag that the token was REPLACED so the run path
+    // can warn.
+    const { store, grants } = makeStore({}, { ok: true }, null);
+    const res = await provisionBuzzIdentity("robby", store);
+    expect(grants[0]!.readKeys).toEqual(["buzz/robby-nsec"]);
+    if (res.kind === "ok") expect(res.grantUnion).toEqual({ kind: "unknown" });
   });
 
   it("skips the grant with noGrant", async () => {
@@ -144,6 +182,52 @@ describe("runBuzzProvision — nsec is never printed", () => {
         expect(output).toContain(buzzAddMemberCommand(result.npub));
         expect(output).toContain("nsec_vault_key");
       }
+    } finally {
+      restore();
+    }
+  });
+
+  it("MAJOR-3: on rotate, reminds the operator to remove the agent's PRIOR npub from the relay", async () => {
+    const { store } = makeStore({ [buzzNsecKey("klanker")]: "nsec1old" });
+    const { lines, io, restore } = captureOutput();
+    try {
+      const { exitCode, result } = await runBuzzProvision(
+        "klanker",
+        store,
+        { rotate: true },
+        io,
+      );
+      expect(exitCode).toBe(0);
+      expect(result.kind === "ok" && result.rotated).toBe(true);
+      const output = lines.join("\n");
+      // The load-bearing reminder: rotating does NOT drop the old relay member.
+      expect(output).toMatch(/PREVIOUS npub/);
+      expect(output).toMatch(/remove/i);
+      expect(output).toContain("buzz-admin --help");
+    } finally {
+      restore();
+    }
+  });
+
+  it("MAJOR-3: does NOT print the relay-removal reminder on a first-time provision", async () => {
+    const { store } = makeStore();
+    const { lines, io, restore } = captureOutput();
+    try {
+      await runBuzzProvision("klanker", store, {}, io);
+      const output = lines.join("\n");
+      expect(output).not.toMatch(/PREVIOUS npub/);
+    } finally {
+      restore();
+    }
+  });
+
+  it("MAJOR-1: warns the mint replaced the token when existing grants are unreadable", async () => {
+    const { store } = makeStore({}, { ok: true }, null);
+    const { lines, io, restore } = captureOutput();
+    try {
+      await runBuzzProvision("klanker", store, {}, io);
+      const output = lines.join("\n");
+      expect(output).toMatch(/REPLACED the agent's vault token/);
     } finally {
       restore();
     }
@@ -241,6 +325,44 @@ describe("computeBuzzStatus", () => {
     expect(r.grant.status).toBe("unknown");
     expect(r.composeEnv.status).toBe("unknown");
     expect(r.sidecar.status).toBe("unknown");
+  });
+
+  it("MAJOR-2: an EXPIRED grant is red (not a false green) and fails isBuzzFullyLive", () => {
+    const now = 1_000_000;
+    const r = computeBuzzStatus(agent, {
+      vaultKeys: [key],
+      // Right agent, right key, but the grant expired an hour ago.
+      grants: [{ agent_slug: agent, key_allow: [key], expires_at: now - 3600 }],
+      composeYaml: composeWithBuzz,
+      logTail: "buzz nostr: AUTH accepted\nbuzz nostr: EOSE (live)",
+      now,
+    });
+    expect(r.grant.status).toBe("red");
+    expect(r.grant.detail).toMatch(/EXPIRED/);
+    // The exit-code gate the CLI uses (process.exitCode = 2) keys off this.
+    expect(isBuzzFullyLive(r)).toBe(false);
+  });
+
+  it("MAJOR-2: a future-dated (unexpired) grant stays green", () => {
+    const now = 1_000_000;
+    const r = computeBuzzStatus(agent, {
+      vaultKeys: [key],
+      grants: [{ agent_slug: agent, key_allow: [key], expires_at: now + 3600 }],
+      composeYaml: composeWithBuzz,
+      logTail: "EOSE (live)",
+      now,
+    });
+    expect(r.grant.status).toBe("green");
+  });
+
+  it("MAJOR-2: a non-expiring grant (expires_at null/absent) stays green", () => {
+    const r = computeBuzzStatus(agent, {
+      vaultKeys: [key],
+      grants: [{ agent_slug: agent, key_allow: [key], expires_at: null }],
+      composeYaml: composeWithBuzz,
+      logTail: "EOSE (live)",
+    });
+    expect(r.grant.status).toBe("green");
   });
 
   it("sidecar green on AUTH accepted alone", () => {
