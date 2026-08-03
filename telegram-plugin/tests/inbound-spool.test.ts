@@ -264,6 +264,53 @@ describe('inbound-spool — put / ack / dedup', () => {
   })
 })
 
+describe('inbound-spool — boot_briefing refresh-on-reput (#4246)', () => {
+  function briefing(text: string, over: Partial<InboundMessage> = {}): InboundMessage {
+    // boot_briefing spoolId is `s:boot-briefing:<chatId>` — keyed per chat,
+    // not per boot — so successive boots share one id but carry fresh text.
+    return msg({
+      chatId: 'c1',
+      messageId: 0, // synthetics have no real Telegram messageId
+      text,
+      meta: { source: 'boot_briefing' },
+      ...over,
+    })
+  }
+
+  it('a later boot refreshes the spooled briefing text instead of keeping the stale one', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs })
+    expect(s.put('klanker', briefing('boot-1 briefing'))).toBe(true)
+    // boot-2: same chat, same spool id, FRESHER text. Must win.
+    expect(s.put('klanker', briefing('boot-2 briefing'))).toBe(true)
+    // Still exactly one live entry (no stacking, no double-delivery)...
+    expect(s.liveCount()).toBe(1)
+    expect(s.liveEntries()).toHaveLength(1)
+    // ...and it carries boot-2's text, not boot-1's stale text.
+    expect(s.liveEntries()[0].msg.text).toBe('boot-2 briefing')
+  })
+
+  it('the refreshed briefing survives a crash/rebuild (durable last-put-wins)', () => {
+    const fs = fakeFs()
+    const s1 = createInboundSpool({ path: PATH, fs })
+    s1.put('klanker', briefing('boot-1 briefing'))
+    s1.put('klanker', briefing('boot-2 briefing'))
+    // Rebuild from the on-disk log (simulates a gateway restart).
+    const s2 = createInboundSpool({ path: PATH, fs })
+    expect(s2.liveCount()).toBe(1)
+    expect(s2.liveEntries()[0].msg.text).toBe('boot-2 briefing')
+  })
+
+  it('non-briefing sources keep strict dedup (re-put drops, old entry retained)', () => {
+    const fs = fakeFs()
+    const s = createInboundSpool({ path: PATH, fs })
+    expect(s.put('a', msg({ messageId: 7, text: 'first' }))).toBe(true)
+    expect(s.put('a', msg({ messageId: 7, text: 'second' }))).toBe(false) // dedup
+    expect(s.liveCount()).toBe(1)
+    expect(s.liveEntries()[0].msg.text).toBe('first') // original retained
+  })
+})
+
 describe('inbound-spool — crash-survivable replay (the core guarantee)', () => {
   it('a fresh spool over an existing file rebuilds live state (survives restart)', () => {
     const fs = fakeFs()

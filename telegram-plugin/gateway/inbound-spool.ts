@@ -497,7 +497,30 @@ export function createInboundSpool(opts: InboundSpoolOptions): InboundSpool {
   return {
     put(agent, msg) {
       const id = spoolId(msg)
-      if (live.has(id)) return false // dedup: already spooled & un-acked
+      const existing = live.get(id)
+      if (existing != null) {
+        // Dedup: the same logical event is already spooled and un-acked, so
+        // by default drop the duplicate (retried synthetics of one event).
+        //
+        // Exception (#4246): a boot_briefing is keyed per chat, NOT per boot
+        // (spoolId `s:boot-briefing:<chatId>`), so a LATER boot re-puts a
+        // FRESHER briefing under the same id. The strict-dedup path kept
+        // boot-1's now-stale text, so a boot-2 delivery carried boot-1's
+        // briefing (only self-corrected by the 60-min TTL). Refresh the
+        // entry's payload in place so the newest briefing wins, keeping the
+        // original firstAt so escalation timing isn't reset by repeated
+        // restarts. The refreshed put is re-appended durably (hydrate's
+        // "last put for an id wins" restores it across a crash). No new live
+        // entry is created, so this can never double-deliver.
+        if (msg.meta?.source === 'boot_briefing') {
+          existing.agent = agent
+          existing.msg = msg
+          appendRecord({ t: 'put', id, agent, msg, firstAt: existing.firstAt })
+          maybeCompact()
+          return true
+        }
+        return false
+      }
       const firstAt = now()
       live.set(id, { agent, msg, firstAt })
       appendRecord({ t: 'put', id, agent, msg, firstAt })
