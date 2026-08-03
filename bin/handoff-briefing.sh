@@ -104,6 +104,18 @@ try:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
+    # Probe ONCE whether this history DB carries the native-reply columns
+    # (reply_to_message_id / reply_to_text, added with issue #119). A DB
+    # predating them would raise OperationalError on the extended SELECT and,
+    # via the outer `except → sys.exit(0)`, silently drop the ENTIRE
+    # Telegram-history section. Detect the columns explicitly here and degrade
+    # to the legacy column list (skipping the antecedent render) rather than
+    # swallowing a real query failure. The outer try/except still catches
+    # genuine errors — this only distinguishes "columns absent" from those.
+    cur.execute("PRAGMA table_info(messages)")
+    _msg_cols = {r[1] for r in cur.fetchall()}
+    has_reply_cols = "reply_to_message_id" in _msg_cols and "reply_to_text" in _msg_cols
+
     # Resolve the surface to scope to.
     #  - explicit env target (pending-turn chat/thread) wins — UNLESS that chat
     #    has zero rows (rotated/fresh DB), in which case we fall through to
@@ -191,8 +203,11 @@ try:
         % (scope_chat, "NULL" if scope_thread_is_null else (scope_thread if scope_thread_known else "any"), scope_source)
     )
 
+    select_cols = "role, user, ts, text"
+    if has_reply_cols:
+        select_cols += ", reply_to_message_id, reply_to_text"
     cur.execute(
-        "SELECT role, user, ts, text, reply_to_message_id, reply_to_text FROM messages WHERE "
+        "SELECT " + select_cols + " FROM messages WHERE "
         + " AND ".join(where)
         + " ORDER BY ts DESC LIMIT ?",
         params,
@@ -218,6 +233,11 @@ try:
         # knows what "this"/"that" in the reply refers to instead of guessing.
         # Without it the flat dump loses the thread of any native reply.
         print(f"[{ts_str}] {label}: {text}")
+        if not has_reply_cols:
+            # Legacy DB (pre-#119): no reply columns were selected, so the
+            # antecedent render is skipped entirely. The history section still
+            # renders every message above — just without "↪ replying to" lines.
+            continue
         reply_id = row["reply_to_message_id"]
         reply_text = row["reply_to_text"]
         if reply_text is not None and reply_text != "":
