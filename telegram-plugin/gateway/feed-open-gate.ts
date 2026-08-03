@@ -184,6 +184,21 @@ export interface FeedOpenInput {
    * this see no behaviour change.
    */
   postAnswerSubagentActivity?: boolean
+  /**
+   * Post-substantive feed reopen (long multi-phase MAIN-agent turns). True when
+   * the turn delivered a substantive final answer EARLY and then kept doing real
+   * tool work — `>= SUBSTANTIVE_REOPEN_MIN_LABELS` post-answer tool labels have
+   * arrived (`feed-reopen-gate.ts` → `decideFeedReopen().liftLeverOne`). The
+   * sibling of `postAnswerSubagentActivity`, but for the foreground agent's own
+   * post-answer tool labels rather than a sub-agent watcher.
+   *
+   * When true AND `producer === 'tool'`, Lever 1's blanket post-answer block is
+   * lifted so a fresh activity card may open below the delivered reply to show
+   * the still-working agent. Idle producers (`liveness`, `narrative`) stay
+   * blocked. Defaults to `false` (Lever 1 fully active) — callers that don't
+   * pass it see no behaviour change.
+   */
+  postAnswerMainActivity?: boolean
 }
 
 /**
@@ -194,13 +209,15 @@ export interface FeedOpenInput {
  *  - crossTurnAnswerDelivered → false: lever 4. A cross-turn synthetic surface
  *    whose exchange already delivered a substantive answer in an EARLIER turn;
  *    no card may open below it (any producer). Checked FIRST.
- *  - finalAnswerEverDelivered && !postAnswerSubagentActivity → false: lever 1.
- *    A substantive final already landed THIS turn; no card may open below it.
- *    Exception: when `postAnswerSubagentActivity === true` AND `producer ===
- *    'tool'`, Lever 1 is lifted so the background-agent liveness heartbeat can
- *    surface a card below the reply showing the watcher's real new activity.
- *    Idle producers ('liveness', 'narrative') stay blocked — no card opens from
- *    wall-clock alone after the final answer.
+ *  - finalAnswerEverDelivered && !(postAnswerSubagentActivity ||
+ *    postAnswerMainActivity) → false: lever 1. A substantive final already
+ *    landed THIS turn; no card may open below it. Exception: when EITHER
+ *    post-answer activity signal is true AND `producer === 'tool'`, Lever 1 is
+ *    lifted so a card can surface below the reply — the background-agent
+ *    liveness heartbeat (`postAnswerSubagentActivity`) OR the foreground
+ *    agent's own still-working post-answer tool labels (`postAnswerMainActivity`,
+ *    the post-substantive feed reopen). Idle producers ('liveness', 'narrative')
+ *    stay blocked — no card opens from wall-clock alone after the final answer.
  *  - producer 'narrative': always allowed when pre-answer (lever 5 is INERT —
  *    Lever 2 / clearActivitySummary guarantees reply-is-last ordering instead).
  *  - producer 'tool' or 'liveness' → true (unless lever 1/4).
@@ -216,7 +233,10 @@ export function mayOpenActivityCard(input: FeedOpenInput): boolean {
   // (Fix 2 / #2587 supersede). Only 'tool' is exempted so idle liveness and
   // narrative producers remain blocked after the final answer.
   if (input.finalAnswerEverDelivered) {
-    if (input.postAnswerSubagentActivity && input.producer === 'tool') return true
+    if (
+      (input.postAnswerSubagentActivity || input.postAnswerMainActivity)
+      && input.producer === 'tool'
+    ) return true
     return false
   }
   // Lever 5 — INERT (see module comment above). Pre-answer narrative may now

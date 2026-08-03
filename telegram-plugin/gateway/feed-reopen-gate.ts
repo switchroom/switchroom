@@ -66,6 +66,37 @@
  *     (correct — the user got only an ack, no answer).
  *  3. the feed gate itself — this module.
  *
+ * ## Post-SUBSTANTIVE reopen (long multi-phase turns)
+ *
+ * The ACK-only refinement above deliberately keeps the feed dark after a
+ * GENUINE final answer — routine post-answer housekeeping (a memory write /
+ * TodoWrite) should not resurrect the card. But that same gate blanks the
+ * feed for a legitimately DIFFERENT shape: a turn that delivers a substantive
+ * reply EARLY ("Here's the plan — starting now") and then keeps doing real
+ * tool work for 10+ minutes. The user sees the reply, then goes completely
+ * dark for the rest of the turn even though the agent is visibly working.
+ *
+ * The post-substantive reopen closes that gap WITHOUT reintroducing the
+ * duplicate-answer hazard the ACK-only refinement fixed:
+ *  - It fires only after `SUBSTANTIVE_REOPEN_MIN_LABELS` (>= 2) post-answer
+ *    tool labels have arrived, so a genuinely-final single-reply turn (0-1
+ *    housekeeping tools) never flaps the card.
+ *  - Crucially it does NOT clear `finalAnswerDelivered` (the ack path does):
+ *    clearing it would trip the turn-end silent-end re-prompt (`turn-end-
+ *    gate.ts`: `finalAnswerDelivered === false → reprompt`) → the exact
+ *    duplicate-answer failure the ACK-only guard exists to prevent. The
+ *    substantive answer STAYS delivered; only the visual feed reopens.
+ *  - Because the sticky lever-1 latch stays true (it is never cleared by a
+ *    reopen), the caller must LIFT lever 1 for this drain so the fresh card opens
+ *    BELOW the delivered reply — exactly the exemption the post-answer
+ *    sub-agent liveness path already uses (`feed-open-gate.ts`,
+ *    `postAnswerSubagentActivity`). The outcome flags this via `liftLeverOne`.
+ *
+ * Gated by its own flag `SWITCHROOM_FEED_REOPEN_AFTER_SUBSTANTIVE` (default
+ * ON), passed by the caller as `reopenAfterSubstantiveEnabled`. When that flag
+ * is off (or omitted), the substantive branch returns `false` exactly as
+ * before — byte-identical legacy behaviour.
+ *
  * ## Kill switch
  *
  * `SWITCHROOM_FEED_REOPEN_AFTER_ACK=0` reverts to the legacy behaviour: a
@@ -73,6 +104,12 @@
  * post-ack feed stays dark. The kill switch is read by the CALLER, which
  * passes `enabled` here.
  */
+
+/** Number of post-substantive-answer tool labels that must arrive before the
+ *  activity feed re-opens for a still-working turn. Two (not one) so a
+ *  genuinely-final single-reply turn with a stray bit of post-answer
+ *  housekeeping (0-1 tools) never flaps the card. */
+export const SUBSTANTIVE_REOPEN_MIN_LABELS = 2
 
 export interface FeedReopenInput {
   /** Whether the turn has already been classified as having delivered its
@@ -90,6 +127,19 @@ export interface FeedReopenInput {
   /** Kill-switch state. When false the reopen behaviour is OFF and a tool
    *  label after `finalAnswerDelivered` is dropped (legacy). */
   enabled: boolean
+  /** Post-SUBSTANTIVE reopen flag (`SWITCHROOM_FEED_REOPEN_AFTER_SUBSTANTIVE`,
+   *  default ON). When true, a turn that delivered a substantive final answer
+   *  and then kept doing tool work may RE-OPEN the feed once
+   *  `postSubstantiveToolLabelCount >= SUBSTANTIVE_REOPEN_MIN_LABELS`. Omitted
+   *  / false → the substantive branch returns false exactly as before (legacy).
+   *  Distinct from `enabled` (the ack-first kill switch) so the two behaviours
+   *  can be toggled independently. */
+  reopenAfterSubstantiveEnabled?: boolean
+  /** Count of tool labels that have arrived SINCE the substantive final answer
+   *  was delivered this turn (`turn.postSubstantiveToolLabelCount`). Only
+   *  consulted on the substantive branch; the reopen fires at
+   *  `>= SUBSTANTIVE_REOPEN_MIN_LABELS`. Omitted → treated as 0 (no reopen). */
+  postSubstantiveToolLabelCount?: number
 }
 
 /**
@@ -99,10 +149,12 @@ export interface FeedReopenInput {
  *
  * - !finalAnswerDelivered → false: the feed was never gated off; the normal
  *   append/drain path applies (no reopen needed).
- * - finalAnswerDelivered && finalAnswerSubstantive → false: the prior final
- *   was a genuine answer (not an ack). Post-answer housekeeping tool work
- *   must NOT reopen — keep the legacy gate so the silent-end re-prompt and
- *   the #2137 drain see the delivered final correctly.
+ * - finalAnswerDelivered && finalAnswerSubstantive: the prior final was a
+ *   genuine answer (not an ack). Reopen ONLY under the post-substantive path —
+ *   `reopenAfterSubstantiveEnabled` AND `>= SUBSTANTIVE_REOPEN_MIN_LABELS`
+ *   post-answer tool labels (a still-working multi-phase turn). Otherwise keep
+ *   the legacy gate so post-answer housekeeping does not flap the card and the
+ *   silent-end re-prompt / #2137 drain see the delivered final correctly.
  * - finalAnswerDelivered && !enabled (kill switch off) → false: legacy
  *   behaviour, the label is dropped by the caller.
  * - finalAnswerDelivered && !finalAnswerSubstantive && enabled → true: the
@@ -110,7 +162,14 @@ export interface FeedReopenInput {
  */
 export function shouldReopenFeedAfterAck(input: FeedReopenInput): boolean {
   if (!input.finalAnswerDelivered) return false
-  if (input.finalAnswerSubstantive) return false
+  if (input.finalAnswerSubstantive) {
+    // Post-substantive reopen: a genuine answer landed, then the model kept
+    // doing tool work. Reopen only under the dedicated flag AND once enough
+    // post-answer labels have arrived that this is plainly a still-working
+    // turn, not a single-reply turn with a stray housekeeping tool.
+    if (input.reopenAfterSubstantiveEnabled !== true) return false
+    return (input.postSubstantiveToolLabelCount ?? 0) >= SUBSTANTIVE_REOPEN_MIN_LABELS
+  }
   return input.enabled === true
 }
 
@@ -128,8 +187,20 @@ export interface FeedReopenOutcome {
   /** True → the handler returns early (legacy: label dropped, feed dark). */
   dropLabel: boolean
   /** When dropLabel is false, the new feed-state fields to write on `turn`
-   *  before the normal append/drain proceeds. */
+   *  before the normal append/drain proceeds. Present on the ACK-reopen path
+   *  (which reclassifies the interim ack). ABSENT on the post-substantive
+   *  reopen path: there `finalAnswerDelivered` MUST stay true (clearing it
+   *  trips the turn-end re-prompt → duplicate answer) and `activityMessageId`
+   *  is already null (the substantive answer's `clearActivitySummary` nulled
+   *  it), so the drain opens a fresh card then edits it — no reset needed. */
   reset?: FeedReopenState
+  /** Post-substantive reopen only. True → the caller must lift lever 1 for
+   *  this drain (`drainActivitySummary(..., { postAnswerMainActivity: true })`)
+   *  so the fresh card may OPEN below the already-delivered substantive reply.
+   *  The sticky lever-1 latch stays set, so without this lift
+   *  `mayOpenActivityCard` would refuse the OPEN. Absent/false on the ack path
+   *  (an ack never sets the sticky latch, so lever 1 is inert there). */
+  liftLeverOne?: boolean
 }
 
 /**
@@ -151,6 +222,17 @@ export function decideFeedReopen(input: FeedReopenInput): FeedReopenOutcome {
   if (!shouldReopenFeedAfterAck(input)) {
     return { dropLabel: true }
   }
+  // Post-substantive reopen: KEEP finalAnswerDelivered true (clearing it would
+  // trip the turn-end silent-end re-prompt → duplicate answer) and do NOT
+  // reset activityMessageId (the substantive answer's clearActivitySummary
+  // already nulled it; the drain OPENs once then EDITs). Only signal the
+  // caller to lift lever 1 so the fresh card may open below the reply.
+  if (input.finalAnswerSubstantive) {
+    return { dropLabel: false, liftLeverOne: true }
+  }
+  // ACK reopen (legacy): reclassify the interim ack — finalAnswerDelivered
+  // back to false, a FRESH feed message (activityMessageId null), last-sent
+  // render cleared so the drain re-sends.
   return {
     dropLabel: false,
     reset: {

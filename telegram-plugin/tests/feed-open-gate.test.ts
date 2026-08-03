@@ -179,6 +179,48 @@ describe('mayOpenActivityCard — lever 1 exception: post-answer sub-agent liven
   })
 })
 
+describe('mayOpenActivityCard — lever 1 exception: post-substantive MAIN-agent reopen', () => {
+  // The foreground sibling of the sub-agent exemption above: a turn that
+  // delivered a substantive answer early and kept doing tool work sets
+  // `postAnswerMainActivity=true` (via decideFeedReopen().liftLeverOne) so a
+  // fresh activity card can open below the reply. Same 'tool'-only scoping.
+
+  it('post-answer MAIN-agent tool activity DOES open a card (tool + postAnswerMainActivity)', () => {
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 4,
+        postAnswerMainActivity: true,
+      }),
+    ).toBe(true)
+  })
+
+  it('without the signal Lever 1 stays active (no postAnswerMainActivity → blocked)', () => {
+    expect(
+      mayOpenActivityCard({
+        producer: 'tool',
+        finalAnswerEverDelivered: true,
+        labeledToolCount: 4,
+        postAnswerMainActivity: false,
+      }),
+    ).toBe(false)
+  })
+
+  it('only the tool producer is exempted (liveness/narrative stay blocked with the signal)', () => {
+    for (const producer of ['liveness', 'narrative'] as const) {
+      expect(
+        mayOpenActivityCard({
+          producer,
+          finalAnswerEverDelivered: true,
+          labeledToolCount: 4,
+          postAnswerMainActivity: true,
+        }),
+      ).toBe(false)
+    }
+  })
+})
+
 describe('shouldEarlyOpenLiveness — the early-open WHEN gate (enqueue + heartbeat)', () => {
   // The minimal "Working…" placeholder is due to open for a 0-label turn once it
   // has been alive past the threshold and NO card is open yet. Both the
