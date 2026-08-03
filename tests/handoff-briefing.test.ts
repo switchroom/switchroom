@@ -850,6 +850,121 @@ describe("handoff-briefing.sh recent-conversation reply-antecedent rendering", (
   });
 });
 
+// ── Legacy (pre-reply-column) history DB compatibility (#4316) ───────────────────
+//
+// The reply-antecedent SELECT lists reply_to_message_id / reply_to_text. On a
+// history.db that predates those columns (a DB written before the #119 schema
+// bump), that extended SELECT raises sqlite3.OperationalError, which the Python
+// block's outer `except → sys.exit(0)` swallows — silently dropping the ENTIRE
+// Telegram-history section. The fix probes PRAGMA table_info(messages) once and
+// falls back to the legacy column list (skipping the antecedent render) when the
+// reply columns are absent, so the history still renders. This test seeds a DB
+// WITHOUT the reply columns and asserts the section STILL appears; reverting the
+// fix (restoring the unconditional extended SELECT) turns it red.
+
+/**
+ * Create a history.db whose `messages` table LACKS the reply_to_message_id /
+ * reply_to_text columns — the pre-#119 gateway schema. Mirrors seedHistoryDb but
+ * with the legacy column set only.
+ */
+function seedLegacyHistoryDb(stateDir: string, rows: SeedRow[]): string {
+  mkdirSync(stateDir, { recursive: true });
+  const dbPath = join(stateDir, "history.db");
+  const py = `
+import sys, json, sqlite3
+db = sys.argv[1]
+rows = json.loads(sys.argv[2])
+c = sqlite3.connect(db)
+c.execute(
+    "CREATE TABLE IF NOT EXISTS messages ("
+    "chat_id TEXT NOT NULL, thread_id INTEGER, message_id INTEGER NOT NULL, "
+    "role TEXT NOT NULL, user TEXT, user_id TEXT, ts INTEGER NOT NULL, "
+    "text TEXT NOT NULL, attachment_kind TEXT, group_id INTEGER, "
+    "PRIMARY KEY (chat_id, thread_id, message_id))"
+)
+for r in rows:
+    c.execute(
+        "INSERT INTO messages(chat_id,thread_id,message_id,role,user,user_id,ts,text) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (r["chat_id"], r.get("thread_id"), r["message_id"], r["role"],
+         r.get("user"), None, r["ts"], r["text"]),
+    )
+c.commit()
+c.close()
+`;
+  const res = spawnSync("python3", ["-c", py, dbPath, JSON.stringify(rows)], {
+    timeout: 10_000,
+  });
+  if (res.status !== 0) {
+    throw new Error(`seedLegacyHistoryDb failed: ${res.stderr?.toString() ?? ""}`);
+  }
+  // Guard the fixture itself: the columns really must be absent, else the test
+  // would pass vacuously against a modern DB.
+  const check = spawnSync(
+    "python3",
+    [
+      "-c",
+      "import sys,sqlite3;c=sqlite3.connect(sys.argv[1]);cols={r[1] for r in c.execute('PRAGMA table_info(messages)')};sys.exit(0 if 'reply_to_text' not in cols and 'reply_to_message_id' not in cols else 1)",
+      dbPath,
+    ],
+    { timeout: 10_000 },
+  );
+  if (check.status !== 0) {
+    throw new Error("seedLegacyHistoryDb fixture unexpectedly has reply columns");
+  }
+  return dbPath;
+}
+
+describe("handoff-briefing.sh recent-conversation legacy-DB compatibility (#4316)", () => {
+  let tmpDir: string;
+  let stateDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "handoff-legacy-"));
+    stateDir = join(tmpDir, "telegram");
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runBriefing(
+    scopeEnv: Record<string, string> = {},
+  ): { status: number | null; output: string } {
+    const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
+      env: {
+        ...process.env,
+        AGENT_DIR: tmpDir,
+        TELEGRAM_STATE_DIR: stateDir,
+        HINDSIGHT_API_URL: "",
+        HINDSIGHT_BANK_ID: "",
+        WORKSPACE_DIR: tmpDir,
+        ...scopeEnv,
+      },
+      timeout: 10_000,
+    });
+    return { status: result.status, output: result.stdout.toString() };
+  }
+
+  it("renders the Telegram-history section on a pre-reply-column DB (no soft-fail, no antecedent lines)", () => {
+    seedLegacyHistoryDb(stateDir, [
+      { chat_id: "c1", thread_id: null, message_id: 1, role: "user", user: "ken", ts: 1000, text: "LEGACY-MSG-user" },
+      { chat_id: "c1", thread_id: null, message_id: 2, role: "assistant", ts: 1001, text: "LEGACY-MSG-bot" },
+    ]);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "c1",
+      SWITCHROOM_PENDING_THREAD_ID: "NULL",
+    });
+    expect(status).toBe(0);
+    // The whole section must survive — the pre-fix bug dropped it entirely.
+    expect(output).toContain("Recent conversation");
+    expect(output).toContain("LEGACY-MSG-user");
+    expect(output).toContain("LEGACY-MSG-bot");
+    // No reply columns exist, so no antecedent render is attempted.
+    expect(output).not.toContain("↪ replying to");
+  });
+});
+
 // ── Migration warning ───────────────────────────────────────────────────────────
 
 describe("reconcileAgent: migration warning for auto → handoff default change", () => {

@@ -32,11 +32,13 @@
  *    "fr"]`, whitespace/empties dropped) with an `["en"]` floor when it
  *    resolves empty — so the loop-starving no-languages call is unreachable by
  *    construction;
- *  - the real `search_dates` a recall issues RECEIVES `languages=["en"]` —
- *    the assertion that reds the instant the pin is reverted — driven through
- *    a query that reaches dateparser (the relative-period fast-path in
- *    `extract_period` short-circuits "last week"/"yesterday" BEFORE dateparser,
- *    so the probe uses an explicit-date query that provably reaches it);
+ *  - the real `search_dates` a recall issues RECEIVES `languages=["en"]` AND
+ *    still RETURNS a non-empty temporal parse under that pin (#4318) — the
+ *    assertions that red the instant the pin is reverted or the pin narrows the
+ *    locale set so far it stops parsing — driven through a query that reaches
+ *    dateparser (the relative-period fast-path in `extract_period`
+ *    short-circuits "last week"/"yesterday" BEFORE dateparser, so the probe
+ *    uses an explicit-date query that provably reaches it);
  *  - English temporal extraction still works end to end through the real
  *    `extract_temporal_constraint` ("last week", "yesterday", "3 days ago" all
  *    resolve to a constraint), so pinning the language did not break the
@@ -165,7 +167,9 @@ captured = {}
 
 def _spy(q, **kw):
     captured["languages"] = kw.get("languages", "__ABSENT__")
-    return _orig(q, **kw)
+    result = _orig(q, **kw)
+    captured["result"] = result
+    return result
 
 
 an._search_dates = _spy
@@ -174,6 +178,19 @@ cap = captured.get("languages", "__NOT_CALLED__")
 print("CAPTURED_LANGUAGES", cap)
 if cap != ["en"]:
     failures.append("search_dates did NOT receive languages=['en']: %r" % (cap,))
+
+# ---- and the pinned ['en'] parse still RETURNS a temporal result ----
+# The pin only earns its keep if the explicit-date query still parses under
+# ['en']: a "fast" pin that returned nothing would be a silent regression.
+# Assert the REAL search_dates return value (captured from _orig, not a stub)
+# is non-empty — dateparser yields a list of (matched_text, datetime) tuples
+# for a date it recognises, and None/[] when it parses nothing.
+parsed = captured.get("result", "__NOT_CALLED__")
+print("CAPTURED_RESULT_NONEMPTY", bool(parsed) and parsed != "__NOT_CALLED__")
+if not (bool(parsed) and parsed != "__NOT_CALLED__"):
+    failures.append(
+        "explicit-date query parsed to EMPTY temporal result under ['en']: %r" % (parsed,)
+    )
 
 # ---- English temporal extraction still works end to end ----
 from hindsight_api.engine.search.temporal_extraction import extract_temporal_constraint
@@ -365,6 +382,9 @@ describe.skipIf(!dockerOk || !imageOk)(
       // The load-bearing outcome: the real recall search_dates is pinned.
       expect(stdout).toContain("ANALYZER_LANGS ['en']");
       expect(stdout).toContain("CAPTURED_LANGUAGES ['en']");
+      // …and the pin did not neuter the parse: the explicit-date query still
+      // yields a non-empty temporal result under ['en'] (#4318).
+      expect(stdout).toContain("CAPTURED_RESULT_NONEMPTY True");
       // English temporal extraction survived the pin, all three phrases.
       expect(stdout).toMatch(/EXTRACT 'last week' \(datetime/);
       expect(stdout).toMatch(/EXTRACT 'yesterday' \(datetime/);
