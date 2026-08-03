@@ -244,15 +244,37 @@ export function collectBriefingSurfaces(
   }
 }
 
-/** Codepoint-safe truncation (mirrors resume-inbound-builder's
- *  `truncatePrompt` — a naive .slice can split a surrogate pair). Also
- *  collapses whitespace runs so each message renders as one line. */
+/**
+ * Slice `s` to AT MOST `maxUnits` UTF-16 code units without ever bisecting a
+ * surrogate pair. `max` in this module is a UTF-16 `.length` budget (that is
+ * what Telegram / the char-budget invariant measure), so truncation MUST be
+ * expressed in UTF-16 units — measuring codepoints against a UTF-16 budget
+ * lets astral-plane input (each 😀 is 1 codepoint but 2 UTF-16 units) blow the
+ * bound. If the cut would land between a high and low surrogate we step back
+ * one unit, dropping the lone high surrogate rather than emitting a broken
+ * pair. Guarantees `result.length <= maxUnits`.
+ */
+function sliceUtf16Safe(s: string, maxUnits: number): string {
+  if (maxUnits <= 0) return ''
+  if (s.length <= maxUnits) return s
+  let end = maxUnits
+  // A high surrogate (0xD800–0xDBFF) at the last kept position means its low
+  // half sits at index `end` and would be severed — drop the high surrogate.
+  const code = s.charCodeAt(end - 1)
+  if (code >= 0xd800 && code <= 0xdbff) end -= 1
+  return s.slice(0, end)
+}
+
+/** UTF-16-safe truncation (a naive .slice can split a surrogate pair, and
+ *  measuring codepoints against a UTF-16 `max` can overflow it for astral
+ *  input). Also collapses whitespace runs so each message renders as one
+ *  line. Guarantees `result.length <= max`. */
 function truncateOneLine(s: string, max: number): string {
   const t = s.replace(/\s+/g, ' ').trim()
   if (t.length <= max) return t
-  const points = Array.from(t)
-  if (points.length <= max) return t
-  return points.slice(0, max - 1).join('').trimEnd() + '…'
+  if (max <= 0) return ''
+  // Reserve one UTF-16 unit for the ellipsis ('…' is a single BMP unit).
+  return sliceUtf16Safe(t, max - 1).trimEnd() + '…'
 }
 
 function surfaceLabel(s: { chatId: string; threadId: number | null }): string {
@@ -269,6 +291,35 @@ function renderMessageLine(
   return `- [${age} ago] ${label}: ${truncateOneLine(m.text, perMessageMax)}`
 }
 
+/**
+ * One Hindsight recall result, as folded into the briefing's Hindsight
+ * section. Mirrors the `.results[]` shape `bin/handoff-briefing.sh` reads:
+ * a `text` body and an optional `timestamp` string. `text` may be empty —
+ * rendered as `(no text)` to match the shell's `.text // "(no text)"`.
+ */
+export interface HindsightRecallResult {
+  text: string
+  timestamp?: string | null
+}
+
+/**
+ * Today's daily-memory input for the briefing — the `date` (agent-local
+ * `YYYY-MM-DD`, used only in the section header) and the file `content`.
+ * Absent/empty content renders no section (no empty header).
+ */
+export interface BriefingDailyMemory {
+  date: string
+  content: string
+}
+
+/** Section title for the Hindsight-recall block (mirrors the shell). */
+const HINDSIGHT_SECTION_TITLE = '## Hindsight recall (recent context)'
+
+/** Minimum chars of room a trailing (Hindsight / daily-memory) section
+ *  needs before it is worth appending at all — below this, a truncated
+ *  section would be just a header + a sliver, so skip it whole. */
+const TRAILING_SECTION_MIN_ROOM = 64
+
 export interface RenderBriefingOptions {
   nowMs: number
   /** Restart-reason breadcrumb (`.restart-reason` / SWITCHROOM_PENDING_*),
@@ -276,6 +327,64 @@ export interface RenderBriefingOptions {
   restartReason?: string | null
   charBudget?: number
   perMessageMax?: number
+  /** Hindsight recall results (source 2 of the legacy handoff contract).
+   *  Empty / absent → no Hindsight section. */
+  hindsight?: HindsightRecallResult[] | null
+  /** Today's daily memory (source 3). Absent / empty content → no section. */
+  dailyMemory?: BriefingDailyMemory | null
+}
+
+/** Render the Hindsight recall body (the lines under the section header).
+ *  Mirrors the shell's jq: `- <text> (<timestamp>)`, `(no text)` when the
+ *  text is blank, and no trailing ` (…)` when there is no timestamp.
+ *  Returns '' when there are no results (caller then emits no header). */
+function renderHindsightBody(results: HindsightRecallResult[]): string {
+  const lines: string[] = []
+  for (const r of results) {
+    const text = (r.text ?? '').replace(/\s+/g, ' ').trim() || '(no text)'
+    const ts = r.timestamp && String(r.timestamp).trim() ? ` (${String(r.timestamp).trim()})` : ''
+    lines.push(`- ${text}${ts}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Append a `## title` + body section to `base`, but only within the char
+ * budget. If the whole section fits, append it. If not, append the header
+ * plus as much body as fits (so an over-long daily memory truncates rather
+ * than vanishing) — unless there isn't even `TRAILING_SECTION_MIN_ROOM`
+ * left, in which case the section is skipped whole. Guarantees the result
+ * is always <= budget. A blank body is a no-op (no empty header).
+ */
+function appendSectionWithinBudget(
+  base: string,
+  title: string,
+  body: string,
+  budget: number,
+): string {
+  const trimmedBody = body.trimEnd()
+  if (!trimmedBody) return base
+  const sep = '\n\n'
+  const full = `${base}${sep}${title}${sep}${trimmedBody}`
+  if (full.length <= budget) return full
+  // Room left for the body after the base + separators + title.
+  const room = budget - base.length - sep.length - title.length - sep.length
+  if (room < TRAILING_SECTION_MIN_ROOM) return base
+  const truncated = truncateOneLineOrBlock(trimmedBody, room)
+  return `${base}${sep}${title}${sep}${truncated}`
+}
+
+/** UTF-16-safe hard truncation preserving newlines (unlike `truncateOneLine`,
+ *  which collapses whitespace to one line). Used for block sections (daily
+ *  memory / Hindsight) where line structure matters. Bounds the result in
+ *  UTF-16 units — measuring codepoints against a UTF-16 `max` overflows the
+ *  budget for astral input (each 😀 is 2 UTF-16 units). Guarantees
+ *  `result.length <= max`. */
+function truncateOneLineOrBlock(s: string, max: number): string {
+  if (s.length <= max) return s
+  if (max <= 0) return ''
+  // Reserve one UTF-16 unit for the ellipsis ('…' is a single BMP unit).
+  return sliceUtf16Safe(s, max - 1).trimEnd() + '…'
 }
 
 /**
@@ -351,7 +460,26 @@ export function renderBootBriefing(
     if (assemble(kept, [...secondaries, block]).length > charBudget) break
     secondaries.push(block)
   }
-  return assemble(kept, secondaries)
+
+  // Sources 2 + 3 of the legacy handoff contract, appended after the durable
+  // Telegram slice and within the SAME char budget (Telegram history is the
+  // freshest context, so it keeps priority; Hindsight then daily memory fill
+  // the remaining room, truncating rather than blowing the budget). Order
+  // mirrors bin/handoff-briefing.sh: telegram → hindsight → daily memory.
+  let out = assemble(kept, secondaries)
+  const hindsightBody = opts.hindsight && opts.hindsight.length > 0
+    ? renderHindsightBody(opts.hindsight)
+    : ''
+  out = appendSectionWithinBudget(out, HINDSIGHT_SECTION_TITLE, hindsightBody, charBudget)
+  if (opts.dailyMemory && opts.dailyMemory.content.trim()) {
+    out = appendSectionWithinBudget(
+      out,
+      `## Today's memory (${opts.dailyMemory.date})`,
+      opts.dailyMemory.content,
+      charBudget,
+    )
+  }
+  return out
 }
 
 /**

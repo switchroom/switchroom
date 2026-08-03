@@ -166,3 +166,57 @@ describe("start.sh: gateway-consumed env exported before the gateway fork", () =
     expect(second).toBeGreaterThan(forkIdx);
   });
 });
+
+describe("start.sh: Hindsight endpoint hoisted before the gateway fork (#4243 boot-briefing parity)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "switchroom-gw-hindsight-order-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function renderStartShWithHindsight(): string {
+    const config = {
+      extends: "default",
+      topic_name: "Test Topic",
+      schedule: [],
+    } as AgentConfig;
+    const sw = makeSwitchroomConfig("test-agent", config);
+    // Turn on the Hindsight backend so the scaffold renders the endpoint exports.
+    sw.memory = { backend: "hindsight" };
+    const result = scaffoldAgent("test-agent", config, tmpDir, telegramConfig, sw);
+    return readFileSync(join(result.agentDir, "start.sh"), "utf-8");
+  }
+
+  it("hoists HINDSIGHT_API_URL and HINDSIGHT_BANK_ID AHEAD of the gateway fork so the daemon can recall for the boot briefing", () => {
+    const startSh = renderStartShWithHindsight();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    expect(forkIdx).toBeGreaterThan(-1);
+
+    const apiIdx = startSh.indexOf("export HINDSIGHT_API_URL=");
+    const bankIdx = startSh.indexOf("export HINDSIGHT_BANK_ID=");
+    expect(apiIdx).toBeGreaterThan(-1);
+    expect(bankIdx).toBeGreaterThan(-1);
+    // The FIRST occurrence (outer-pass hoist) must precede the fork, or the
+    // gateway daemon's Hindsight recall in the boot briefing silently no-ops
+    // (the authoritative exports live in the inner pass, after the fork).
+    expect(apiIdx).toBeLessThan(forkIdx);
+    expect(bankIdx).toBeLessThan(forkIdx);
+  });
+
+  it("still re-exports the endpoint in the inner pass (after the fork) for the claude-side plugin", () => {
+    const startSh = renderStartShWithHindsight();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+
+    const firstApi = startSh.indexOf("export HINDSIGHT_API_URL=");
+    const secondApi = startSh.indexOf("export HINDSIGHT_API_URL=", firstApi + 1);
+    // Hoisted copy before the fork (gateway boot briefing), authoritative copy
+    // after it (the hindsight-memory plugin's hooks read it in the inner pass).
+    expect(firstApi).toBeGreaterThan(-1);
+    expect(firstApi).toBeLessThan(forkIdx);
+    expect(secondApi).toBeGreaterThan(forkIdx);
+  });
+});

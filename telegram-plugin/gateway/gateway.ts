@@ -10181,7 +10181,7 @@ if (isGatewayMain && !STATIC && OBLIGATION_LEDGER_ENABLED) {
 // --continue suppression, resume-window dedup, budget) lives in
 // boot-briefing-wiring.ts / boot-briefing-builder.ts; never throws.
 if (isGatewayMain && HISTORY_ENABLED) {
-  maybeQueueBootBriefing({
+  await maybeQueueBootBriefing({
     env: process.env,
     stateDir: STATE_DIR,
     resumeMsg: bootResumeInbound?.msg ?? null,
