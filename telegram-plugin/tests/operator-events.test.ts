@@ -142,13 +142,44 @@ describe('classifyClaudeError — safety: must never throw', () => {
   }
 })
 
-describe('classifyClaudeError — unknown-4xx is the default fallback', () => {
-  it('unknown object with no status defaults to unknown-4xx', () => {
-    expect(classifyClaudeError({ totally: 'unrecognised' })).toBe('unknown-4xx')
+describe('classifyClaudeError — no-status default is the neutral 5xx (never a fabricated 4xx)', () => {
+  it('unknown object with no status defaults to unknown-5xx, NOT unknown-4xx', () => {
+    // Regression: an unrecognized shape with no HTTP status used to fabricate
+    // `unknown-4xx`, whose card carried a wrong Reauth remedy broadcast to every
+    // chat. With no status the honest neutral default is unknown-5xx.
+    expect(classifyClaudeError({ totally: 'unrecognised' })).toBe('unknown-5xx')
+    expect(classifyClaudeError({ totally: 'unrecognised' })).not.toBe('unknown-4xx')
   })
 
-  it('empty string → unknown-4xx', () => {
-    expect(classifyClaudeError('')).toBe('unknown-4xx')
+  it('empty string → unknown-5xx', () => {
+    expect(classifyClaudeError('')).toBe('unknown-5xx')
+  })
+
+  it('still honors an explicit 4xx status', () => {
+    expect(classifyClaudeError({ status: 404 })).toBe('unknown-4xx')
+  })
+})
+
+describe('classifyClaudeError — transport-transient (mid-response stream abort)', () => {
+  it('classifies a bare server_error type as transport-transient', () => {
+    expect(classifyClaudeError({ type: 'server_error' })).toBe('transport-transient')
+  })
+
+  it('classifies server_error via error_code / code / nested error.type', () => {
+    expect(classifyClaudeError({ error_code: 'server_error' })).toBe('transport-transient')
+    expect(classifyClaudeError({ code: 'server_error' })).toBe('transport-transient')
+    expect(classifyClaudeError({ error: { type: 'server_error' } })).toBe('transport-transient')
+  })
+
+  it('classifies api_error (Anthropic HTTP 500) as transport-transient', () => {
+    expect(classifyClaudeError({ type: 'api_error' })).toBe('transport-transient')
+  })
+
+  it('does NOT fire on an unrelated error that merely mentions "server error" in prose', () => {
+    // Exact type/code equality only — never a message substring — so a genuine
+    // auth fault mislabeled with server-error prose still classifies as auth.
+    expect(classifyClaudeError({ type: 'authentication_error', message: 'server error while validating' }))
+      .toBe('credentials-invalid')
   })
 })
 
@@ -238,10 +269,25 @@ describe('renderOperatorEvent — agent-restarted-unexpectedly', () => {
 })
 
 describe('renderOperatorEvent — unknown-4xx', () => {
-  it('surfaces "API error (4xx)" with dismiss button', () => {
+  it('surfaces "API error (4xx)" with a Dismiss button and NO Reauth button', () => {
     const { text, keyboard } = renderOperatorEvent(makeEvent('unknown-4xx'))
     expect(text).toContain('4xx')
-    expect(keyboard.inline_keyboard.flat().some(b => b.callback_data?.includes('dismiss'))).toBe(true)
+    const buttons = keyboard.inline_keyboard.flat()
+    expect(buttons.some(b => b.callback_data?.includes('dismiss'))).toBe(true)
+    // Reauth was REMOVED — it is the wrong remedy for a catch-all client error,
+    // and Reauth buttons now live ONLY on credentials-* cards. Assert the OUTCOME.
+    expect(buttons.some(b => b.callback_data?.includes('op:reauth'))).toBe(false)
+    expect(buttons.some(b => b.callback_data?.includes('reauth'))).toBe(false)
+  })
+})
+
+describe('renderOperatorEvent — transport-transient (defensive fallback)', () => {
+  it('is calm and Dismiss-only — NEVER a Reauth button', () => {
+    const { text, keyboard } = renderOperatorEvent(makeEvent('transport-transient'))
+    expect(text).toContain('transport')
+    const buttons = keyboard.inline_keyboard.flat()
+    expect(buttons.some(b => b.callback_data?.includes('dismiss'))).toBe(true)
+    expect(buttons.some(b => b.callback_data?.includes('reauth'))).toBe(false)
   })
 })
 
@@ -289,6 +335,7 @@ describe('renderOperatorEvent — all kinds produce valid keyboard structure', (
     'rate-limited',
     'agent-crashed',
     'agent-restarted-unexpectedly',
+    'transport-transient',
     'unknown-4xx',
     'unknown-5xx',
     'config-warning',

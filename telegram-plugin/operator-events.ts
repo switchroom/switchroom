@@ -73,6 +73,17 @@ export const OPERATOR_EVENT_KINDS = [
   'mcp-dependency-blocked',
   'quota-exhausted',
   'rate-limited',
+  /**
+   * A TRANSPORT / network failure reaching Anthropic — Claude Code emits
+   * `error: "server_error"` (or `api_error`, which Anthropic documents as an
+   * HTTP 500) with NO `apiErrorStatus` on a mid-response stream abort. It is a
+   * pipe/transport failure, NOT an account, auth, or quota fault: retryable, and
+   * recovered by Claude's own internal retry. Handled by the gateway's dedicated
+   * calm path (no broadcast card; record for /status + a turn-end-gated plain
+   * user notice; a burst escalates to ONE operator-only card) — deliberately
+   * NEVER a Reauth card. See `gateway/user-failure-notices.ts`.
+   */
+  'transport-transient',
   'agent-crashed',
   'agent-restarted-unexpectedly',
   'unknown-4xx',
@@ -110,19 +121,21 @@ export interface InlineKeyboardMarkup {
  * Classify an error value from any source (Anthropic SDK throw, JSONL error
  * field, etc.) into an OperatorEventKind.
  *
- * CONTRACT: never throws. Unfamiliar shapes fall through to unknown-4xx or
- * unknown-5xx based on HTTP status, defaulting to unknown-4xx.
+ * CONTRACT: never throws. Unfamiliar shapes fall through to unknown-5xx or
+ * unknown-4xx based on HTTP status. With NO status the neutral default is
+ * unknown-5xx — an unrecognized shape with no HTTP status must NOT fabricate a
+ * "4xx" label (whose card historically carried a wrong Reauth remedy).
  */
 export function classifyClaudeError(raw: unknown): OperatorEventKind {
   try {
     return classifyInner(raw)
   } catch {
-    return 'unknown-4xx'
+    return 'unknown-5xx'
   }
 }
 
 function classifyInner(raw: unknown): OperatorEventKind {
-  if (raw == null) return 'unknown-4xx'
+  if (raw == null) return 'unknown-5xx'
 
   // Extract common fields defensively — never throw on bad shapes.
   const obj = typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
@@ -258,13 +271,39 @@ function classifyInner(raw: unknown): OperatorEventKind {
     return 'agent-restarted-unexpectedly'
   }
 
+  // TRANSPORT / network failure reaching Anthropic. Claude Code emits
+  // `error: "server_error"` (and `api_error`, documented as HTTP 500) with NO
+  // `apiErrorStatus` on a mid-response stream abort — a pipe/transport failure,
+  // not an account/auth/quota fault. Without this branch it fell through to the
+  // status fallback below and FABRICATED `unknown-4xx`, whose card carried a
+  // wrong Reauth remedy and broadcast to every chat. It is retryable (Claude
+  // retries internally), so it maps to the calm `transport-transient` kind.
+  //
+  // Placed AFTER the auth-wording matches above ON PURPOSE: a genuine auth
+  // failure that upstream mislabels `server_error` still classifies as a
+  // credential fault. Matched only on EXACT type/code equality (never a message
+  // substring) so an unrelated error whose text merely mentions "server error"
+  // is untouched.
+  if (
+    errorType === 'server_error' ||
+    errorCode === 'server_error' ||
+    sdkCode === 'server_error' ||
+    errorType === 'api_error' ||
+    errorCode === 'api_error' ||
+    sdkCode === 'api_error'
+  ) {
+    return 'transport-transient'
+  }
+
   // Fallback: HTTP status-based.
   if (status != null) {
     if (status >= 400 && status < 500) return 'unknown-4xx'
     if (status >= 500 && status < 600) return 'unknown-5xx'
   }
 
-  return 'unknown-4xx'
+  // No recognized shape and NO status: neutral 5xx default. Do NOT claim 4xx —
+  // a fabricated client-error label mis-routed a Reauth card (the bug this fixes).
+  return 'unknown-5xx'
 }
 
 function extractString(obj: Record<string, unknown>, key: string): string | null {
@@ -508,6 +547,12 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
         },
       }
 
+    // Dismiss-only, matching unknown-5xx / proxy-misconfig. The Reauth button
+    // was REMOVED: unknown-4xx is a catch-all for unrecognized client-error
+    // shapes, and re-auth is the wrong remedy for almost all of them. Post-RFC-H
+    // the auth-broker is the SOLE writer of `.credentials.json`, so a per-agent
+    // reauth is re-mirrored over anyway. Reauth buttons now live ONLY on the
+    // credentials-* cards, where the diagnosis IS a login fault.
     case 'unknown-4xx':
       return {
         text: [
@@ -518,10 +563,28 @@ export function renderOperatorEvent(ev: OperatorEvent): RenderResult {
           .join('\n'),
         keyboard: {
           inline_keyboard: [
-            [
-              { text: '🔐 Reauth', callback_data: `op:reauth:${encodeURIComponent(ev.agent)}` },
-              { text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` },
-            ],
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
+          ],
+        },
+      }
+
+    // transport-transient is normally handled by the gateway's dedicated calm
+    // path (no broadcast card; a burst escalates via renderTransportEscalationCard
+    // in gateway/user-failure-notices.ts). This case exists so the switch stays
+    // exhaustive and any incidental render is calm + Dismiss-only — NEVER a
+    // Reauth button (a dropped stream is not a credential fault).
+    case 'transport-transient':
+      return {
+        text: [
+          `🔌 **Transient transport error** for **${agent}**.`,
+          detail ? `\`${detail}\`` : '',
+          `A mid-response stream to Anthropic dropped. Will retry automatically.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        keyboard: {
+          inline_keyboard: [
+            [{ text: '❌ Dismiss', callback_data: `op:dismiss:${encodeURIComponent(ev.agent)}` }],
           ],
         },
       }

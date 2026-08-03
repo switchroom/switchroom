@@ -252,10 +252,15 @@ function classifyKindAndSource(text: string): { kind: LlmErrorKind; source: LlmE
   if (claudeKind === 'rate-limited') {
     return { kind: 'rate_limit', source: 'anthropic' }
   }
-  if (claudeKind === 'unknown-5xx') {
-    return { kind: 'overload_529', source: 'anthropic' }
-  }
-
+  // NOTE: we deliberately do NOT map the taxonomy's `unknown-5xx` to
+  // `overload_529` here. `classifyClaudeError` is called above with only
+  // {message, type} (no HTTP status), so `unknown-5xx` at this point is the
+  // taxonomy's neutral no-status DEFAULT — not evidence of a genuine 529/5xx.
+  // A real Anthropic overload/5xx always carries recognizable wording and is
+  // resolved earlier by detectModelUnavailable (step 3). Fabricating
+  // "Anthropic is overloaded (529) — retrying automatically" for an
+  // unrecognized error would be a false diagnosis, so it falls through to the
+  // honest `unknown` kind.
   return { kind: 'unknown', source: 'anthropic' }
 }
 

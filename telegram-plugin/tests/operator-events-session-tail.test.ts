@@ -156,6 +156,33 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     expect(result!.detail).toContain('hit your limit')
   })
 
+  // Regression — the transport-abort bug this PR fixes. On a mid-response stream
+  // abort Claude Code emits `isApiErrorMessage:true` with `error:"server_error"`
+  // and NO `apiErrorStatus`. Pre-fix that had no transport branch and fell
+  // through to the status fallback, FABRICATING `unknown-4xx` — a card carrying a
+  // wrong Reauth button, broadcast to every chat. It must classify
+  // transport-transient (terminal, non-transient) instead.
+  it('classifies the verbatim server_error mid-stream abort as transport-transient (not unknown-4xx)', () => {
+    // The exact on-disk shape: isApiErrorMessage, error "server_error", NO status.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [{ type: 'text', text: 'API Error: Connection closed mid-response' }],
+      },
+      error: 'server_error',
+      isApiErrorMessage: true,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result).not.toBeNull()
+    expect(result!.kind).toBe('transport-transient')
+    expect(result!.kind).not.toBe('unknown-4xx')
+    // Claude writes this shape only after its own retries are exhausted → terminal.
+    expect(result!.terminal).toBe(true)
+    expect(result!.transient).toBe(false)
+  })
+
   // Regression — the carrie incident (2026-07-12). Anthropic also emits a
   // 429 for a TRANSIENT per-account burst / RPM throttle whose wording
   // explicitly negates the account-quota reading ("would exceed your
