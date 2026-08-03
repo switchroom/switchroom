@@ -19,6 +19,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   evaluateHostdTemplateGuard,
+  optionCoverageFailures,
+  unexercisedOptionKeys,
   renderCanonicalTemplate,
   normalizeTemplate,
   templateHash,
@@ -26,6 +28,7 @@ import {
   type HostdTemplateBaseline,
 } from "../scripts/check-hostd-template-guard.js";
 import { HOSTD_TEMPLATE_LAST_CHANGED } from "../src/config/hostd-template-version.js";
+import { renderHostdComposeFile } from "../src/cli/hostd.js";
 
 const REPO = resolve(import.meta.dirname, "..");
 
@@ -123,6 +126,46 @@ describe("check-hostd-template-guard (#4269)", () => {
     expect(templateHash(rendered + "\n# a new comment line")).toBe(
       templateHash(rendered),
     );
+  });
+
+  it("every render option is exercised by the fixture at HEAD (#4274)", () => {
+    // The real repo: no optional knob renders as a no-op, so a shape change
+    // gated on any of them moves the canonical hash.
+    expect(optionCoverageFailures()).toEqual([]);
+  });
+
+  it("coverage check FAILS loudly when a newly-added knob is not exercised (#4274)", () => {
+    // Simulate an optional knob that was added to the render input but whose
+    // fixture value doesn't trigger its conditional block — the exact bug
+    // #4274 guards. A fake renderer ignores `newKnob`, so omitting it does not
+    // change the output and the check must flag it.
+    const probe = {
+      hostHome: "/home/probe",
+      newKnob: "unused",
+    };
+    const render = (o: typeof probe | Partial<typeof probe>): string =>
+      `home=${o.hostHome}`; // newKnob deliberately never read
+    const unexercised = unexercisedOptionKeys(probe, render as (o: typeof probe) => string);
+    expect(unexercised).toContain("newKnob");
+    expect(unexercised).not.toContain("hostHome");
+  });
+
+  it("the fully-optioned fixture actually differs from the minimal render (#4274)", () => {
+    // Belt-and-braces: the FULL fixture's optional block collectively fires,
+    // so `renderCanonicalTemplate` genuinely hashes two distinct shapes.
+    const minimal = renderHostdComposeFile({
+      hostHome: "/home/operator",
+      imageTag: "v0.0.0-guard",
+    });
+    const full = renderHostdComposeFile({
+      hostHome: "/home/operator",
+      imageTag: "v0.0.0-guard",
+      operatorUid: 1000,
+      hostTz: "Etc/UTC",
+      skillsTarget: "/home/operator/.switchroom-config/skills",
+      dockerSocketPath: "/var/run/docker.sock",
+    });
+    expect(full).not.toBe(minimal);
   });
 
   it("origin/main baseline unreadable ⇒ the lockstep + hash rules still bind", () => {
