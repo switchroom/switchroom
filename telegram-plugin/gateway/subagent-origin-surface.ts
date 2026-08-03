@@ -140,6 +140,28 @@ export function noteWorkerRecentTurnFloor(
 }
 
 /**
+ * The full ladder resolved into the SHAPE the handback/progress deciders
+ * take (`decideSubagentHandback` / `decideSubagentProgress`): the resolved
+ * surface chat in their `fleetChatId` slot ('' on owner-dm/none so each
+ * decider's own `ownerChatId` floor stays the last resort) and the resolved
+ * topic in `originThreadId` (omitted when none). Audits the recent-turn
+ * floor when it fires. One helper so the gateway call sites are a spread,
+ * not a third and fourth hand-rolled copy of the precedence.
+ */
+export function resolveWorkerSurfaceForDecider(
+  db: SqliteDatabase | null,
+  jsonlAgentId: string,
+  opts: { fleetChatId: string; ownerDm: string },
+): { fleetChatId: string; originThreadId?: number } {
+  const dest = resolveWorkerSurfaceChat(db, jsonlAgentId, opts)
+  if (dest.via === 'recent-turn') noteWorkerRecentTurnFloor(jsonlAgentId, dest)
+  return {
+    fleetChatId: dest.via === 'owner-dm' || dest.via === 'none' ? '' : dest.chatId,
+    ...(dest.threadId != null ? { originThreadId: dest.threadId } : {}),
+  }
+}
+
+/**
  * Full surface-chat precedence for a worker's card/handback/progress
  * destination. `db` may be null (turn registry disabled) — resolution then
  * degrades to fleet → owner DM exactly as before the recent-turn floor.
