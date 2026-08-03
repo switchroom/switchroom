@@ -85,7 +85,7 @@ RUN pip3 install --no-cache-dir \
         "requests==2.32.3" \
         "kokoro-onnx==0.5.0" \
     && pip3 uninstall -y onnxruntime \
-    && pip3 install --no-cache-dir "onnxruntime-gpu==1.20.1"
+    && pip3 install --no-cache-dir "onnxruntime-gpu==1.20.2"
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 
