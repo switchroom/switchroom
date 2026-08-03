@@ -3408,6 +3408,407 @@ print("switchroom #3142: reranker foreground-priority lane baked "
       "_background_search_semaphore + CE-saturation mods preserved")
 PYEOF
 
+# --- switchroom work-conserving recall-admission gate (v2 of the recall-admission split) ---
+#
+# The recall-admission-split block above fixed foreground starvation with a
+# STRICT reservation: background (consolidation) recalls are hard-capped at
+# consolidation_recall_max_concurrent (2) of the recall_max_concurrent (8)
+# admission slots — even when ZERO foreground recalls are waiting. That is not
+# work-conserving: a large consolidation drain crawls at 2/8 of the admission
+# budget while 6 slots sit idle (measured on this host as a ~23h drain whose
+# prolonged DB load also degrades the foreground recall it was meant to
+# protect). Foreground itself is NOT starved today (sem=0.000s) — the point of
+# this block is to keep that property while letting background use idle
+# capacity.
+#
+# This replaces the two-semaphore reservation with ONE work-conserving
+# PRIORITY gate (`_RecallAdmissionGate`):
+#
+#   * total in-flight recalls stay capped at recall_max_concurrent — the gate
+#     is still the single admission boundary, so the DB never sees more
+#     concurrency than before;
+#   * FOREGROUND admits whenever a slot is free, ahead of any background
+#     borrowing beyond the floor — a waiting foreground caller latches NEW
+#     background borrowing off;
+#   * BACKGROUND borrows every idle slot when no foreground recall is
+#     waiting, and keeps the old reservation as a guaranteed FLOOR that is
+#     honoured FIRST in the grant pass (consolidation_recall_max_concurrent)
+#     — a LIVE guarantee even under sustained foreground saturation, so
+#     background cannot be permanently starved either;
+#   * no preemption: a borrowed slot is returned at recall completion.
+#     Recalls run 1–3s and background cannot take NEW slots beyond its floor
+#     while a foreground caller waits, so foreground head-of-line wait is
+#     bounded by (floor deficit + 1) recall completions — at most
+#     consolidation_recall_max_concurrent + 1, and exactly one completion
+#     whenever background already holds its floor (the steady state under
+#     mixed load).
+#
+# Deadlock-free and cancellation-safe by construction, asyncio.Semaphore
+# style: no lock object at all (the event loop is the mutual exclusion),
+# waiters are granted futures, and RELEASE IS FULLY SYNCHRONOUS — no await
+# sits between "recall finished" and "slot returned", so a cancellation
+# delivered during teardown (recall handlers are cancelled on client
+# disconnect) can never leak a slot. A waiter granted and cancelled in the
+# same tick hands the slot back; a departing foreground waiter re-runs the
+# grant pass so background borrowing cannot stay latched off.
+#
+# ORTHOGONALITY: this is the DB-ADMISSION layer only. The #3142 reranker
+# priority lane and the #4212 dual-signal reconciliation
+# (`_reconcile_rerank_priority`) sit downstream of admission and are
+# untouched — `_background` still reaches `_search_with_retries` and the
+# rerank site exactly as before; the preservation check below fails the build
+# if any #4212 string this file carried before the edit is lost by it.
+#
+# config.py is untouched: HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT
+# keeps its name and boot validation; its meaning shifts from background's
+# hard CAP to background's guaranteed FLOOR (plus idle borrowing).
+#
+# ORDER-COUPLED: must run AFTER the recall-admission-split block (every
+# anchor below is that block's output) and AFTER the #3142/#4212 block
+# (whose post-condition asserts still expect `_background_search_semaphore`,
+# which this block retires).
+#
+# SUPERSEDES the admission-level half of the drain-latency problem that
+# upstream vectorize-io/hindsight#3142 (rerank-pool-only, now closed) could
+# not reach.
+#
+# Self-verifying (anchor-assert / replace / post-condition + ast.parse).
+# Guarded structurally by tests/docker/dockerfile-hindsight-bakes.test.ts and
+# behaviourally (RED on the strict reservation AND on unpatched upstream /
+# GREEN patched) by
+# tests/docker/hindsight-work-conserving-admission-patch.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+ME = pathlib.Path("/app/api/hindsight_api/engine/memory_engine.py")
+
+
+def apply(f, edits):
+    s = f.read_text()
+    for anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == 1, (
+            f"switchroom hindsight work-conserving-admission patch: anchor found {n}x "
+            f"(expected 1) in {f} — the recall-admission-split block above must have "
+            f"run first and upstream must not have reformatted; re-author this patch "
+            f"in docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+        )
+        s = s.replace(anchor, repl, 1)
+    f.write_text(s)
+    return s
+
+
+me_before = ME.read_text()
+
+me = apply(ME, [
+    # ---- 1. retire the strict two-semaphore helper; install the priority gate ----
+    # The anchor is the recall-admission-split block's own output, verbatim —
+    # comment and helper both, so no stale "strict RESERVATION" prose survives
+    # above code that no longer behaves that way.
+    (
+        "# switchroom recall-admission split. Background consolidation and the\n"
+        "# latency-critical per-turn foreground recall contended on ONE admission\n"
+        "# semaphore (MemoryEngine._search_semaphore), because consolidation reaches\n"
+        "# recall through the very same recall_async() entry point\n"
+        "# (engine/consolidation/consolidator.py). A consolidation burst could therefore\n"
+        "# hold every slot and starve the foreground hook.\n"
+        "#\n"
+        "# This is a strict RESERVATION, not a second independent budget. A background\n"
+        "# recall must take a slot in the small background semaphore FIRST and only then\n"
+        "# the shared one, so:\n"
+        "#   * total concurrency against the database is unchanged at\n"
+        "#     recall_max_concurrent (the shared semaphore is still the only gate on\n"
+        "#     entering the pipeline), and\n"
+        "#   * background can never hold more than consolidation_recall_max_concurrent of\n"
+        "#     those slots, so foreground always has at least\n"
+        "#     (recall_max_concurrent - consolidation_recall_max_concurrent) slots\n"
+        "#     available to it.\n"
+        "#\n"
+        "# Deadlock-free by construction: foreground NEVER acquires the background\n"
+        "# semaphore, so the acquisition order (background -> shared) is total and no\n"
+        "# cycle exists. A background caller blocked on the shared semaphore delays only\n"
+        "# other background callers.\n"
+        "@contextlib.asynccontextmanager\n"
+        "async def _recall_admission(shared, background_reservation, is_background):\n"
+        '    """Admit one recall; background callers pass the background cap first."""\n'
+        "    if is_background:\n"
+        "        async with background_reservation:\n"
+        "            async with shared:\n"
+        "                yield\n"
+        "    else:\n"
+        "        async with shared:\n"
+        "            yield\n",
+
+        "# switchroom work-conserving recall admission (v2 of the recall-admission\n"
+        "# split). Background consolidation and the latency-critical per-turn\n"
+        "# foreground recall reach the DB through the same recall_async() entry point,\n"
+        "# so admission must both (a) keep foreground ahead of a consolidation burst\n"
+        "# and (b) not waste idle capacity when nothing foreground is running. The\n"
+        "# original split was a strict reservation — background hard-capped at\n"
+        "# consolidation_recall_max_concurrent slots even with every other slot idle —\n"
+        "# which made a large consolidation drain crawl at a fraction of the admission\n"
+        "# budget. This gate is work-conserving instead:\n"
+        "#\n"
+        "#   * at most `total` (recall_max_concurrent) recalls are in flight, ever —\n"
+        "#     the DB never sees more concurrency than before;\n"
+        "#   * a FOREGROUND caller admits whenever a slot is free;\n"
+        "#   * a BACKGROUND caller admits when a slot is free AND either no foreground\n"
+        "#     caller is waiting (idle borrowing) or background currently holds fewer\n"
+        "#     than its reserved floor (background_reservation) — and the grant pass\n"
+        "#     honours that floor FIRST, so it stays a LIVE guarantee under sustained\n"
+        "#     foreground saturation: background can use the whole budget when\n"
+        "#     foreground is quiet, and is never starved below its floor when it is\n"
+        "#     not;\n"
+        "#   * a waiting foreground caller latches background borrowing beyond the\n"
+        "#     floor off, and in-flight recalls finish in seconds, so foreground\n"
+        "#     head-of-line wait is bounded by (floor deficit + 1) recall completions\n"
+        "#     — exactly one whenever background already holds its floor — without\n"
+        "#     preempting anything.\n"
+        "#\n"
+        "# Deadlock-free and cancellation-safe by construction, asyncio.Semaphore\n"
+        "# style: the event loop is the only mutual exclusion (no lock object at\n"
+        "# all), waiters are granted futures, and RELEASE IS FULLY SYNCHRONOUS —\n"
+        "# no await sits between 'recall finished' and 'slot returned', so a task\n"
+        "# cancellation delivered during teardown (recall handlers ARE cancelled on\n"
+        "# client disconnect) can never leak a slot. A waiter cancelled after its\n"
+        "# grant hands the slot straight back; a departing foreground waiter\n"
+        "# re-wakes background so borrowing cannot stay latched off.\n"
+        "class _RecallAdmissionGate:\n"
+        '    """Work-conserving priority admission: foreground first, background borrows idle slots."""\n'
+        "\n"
+        "    def __init__(self, total: int, background_reservation: int) -> None:\n"
+        "        self._total = int(total)\n"
+        "        self._background_reservation = int(background_reservation)\n"
+        "        self._active = 0\n"
+        "        self._background_active = 0\n"
+        "        # Futures, granted in FIFO order by _wake(); a waiter removes itself\n"
+        "        # on resume (or cancellation), never _wake, so iteration stays safe.\n"
+        "        self._fg_waiters: list = []\n"
+        "        self._bg_waiters: list = []\n"
+        "\n"
+        "    def _fg_may_admit(self) -> bool:\n"
+        "        return self._active < self._total\n"
+        "\n"
+        "    def _bg_may_admit(self) -> bool:\n"
+        "        if self._active >= self._total:\n"
+        "            return False\n"
+        "        # NOTE: this counts granted/cancelled done-futures still awaiting\n"
+        "        # their self-removal — a transiently conservative denial that\n"
+        "        # self-heals at the owner's next resumption (never over-admission).\n"
+        "        if not self._fg_waiters:\n"
+        "            return True\n"
+        "        return self._background_active < self._background_reservation\n"
+        "\n"
+        "    def _take(self, is_background: bool) -> None:\n"
+        "        self._active += 1\n"
+        "        if is_background:\n"
+        "            self._background_active += 1\n"
+        "\n"
+        "    def _wake(self) -> None:\n"
+        "        # Slots are taken AT GRANT time, so a granted-but-not-yet-resumed\n"
+        "        # waiter already holds its slot and nothing can be double-admitted.\n"
+        "        #\n"
+        "        # 1. The background FLOOR outranks even waiting foreground: while\n"
+        "        #    background holds fewer than its reservation and a slot is\n"
+        "        #    free, grant background. Without this pass the floor is DEAD\n"
+        "        #    CODE under contention — an ungranted foreground waiter implies\n"
+        "        #    active == total at all times (every freed slot re-taken by\n"
+        "        #    foreground inside this same call), so sustained foreground\n"
+        "        #    pressure would starve consolidation to zero indefinitely,\n"
+        "        #    WORSE than the strict reservation this gate replaced. Cost:\n"
+        "        #    foreground's head-of-line bound loosens from one completion\n"
+        "        #    to (floor deficit + 1) completions — still bounded.\n"
+        "        for fut in self._bg_waiters:\n"
+        "            if self._active >= self._total:\n"
+        "                break\n"
+        "            if self._background_active >= self._background_reservation:\n"
+        "                break\n"
+        "            if not fut.done():\n"
+        "                self._take(True)\n"
+        "                fut.set_result(None)\n"
+        "        # 2. Foreground takes everything else, ahead of any background\n"
+        "        #    borrowing beyond the floor.\n"
+        "        for fut in self._fg_waiters:\n"
+        "            if self._active >= self._total:\n"
+        "                break\n"
+        "            if not fut.done():\n"
+        "                self._take(False)\n"
+        "                fut.set_result(None)\n"
+        "        # 3. Idle borrowing: whatever remains goes to background only when\n"
+        "        #    no foreground waiter is left (see _bg_may_admit).\n"
+        "        for fut in self._bg_waiters:\n"
+        "            if not self._bg_may_admit():\n"
+        "                break\n"
+        "            if not fut.done():\n"
+        "                self._take(True)\n"
+        "                fut.set_result(None)\n"
+        "\n"
+        "    def _release(self, is_background: bool) -> None:\n"
+        "        self._active -= 1\n"
+        "        if is_background:\n"
+        "            self._background_active -= 1\n"
+        "        self._wake()\n"
+        "\n"
+        "    async def _wait_for_slot(self, is_background: bool) -> None:\n"
+        "        waiters = self._bg_waiters if is_background else self._fg_waiters\n"
+        "        fut = asyncio.get_running_loop().create_future()\n"
+        "        waiters.append(fut)\n"
+        "        try:\n"
+        "            try:\n"
+        "                await fut\n"
+        "            finally:\n"
+        "                waiters.remove(fut)\n"
+        "        except asyncio.CancelledError:\n"
+        "            if fut.done() and not fut.cancelled():\n"
+        "                # Granted and cancelled in the same tick: the slot was\n"
+        "                # already counted for us — hand it straight back.\n"
+        "                self._release(is_background)\n"
+        "            else:\n"
+        "                # A departing FOREGROUND waiter can be exactly what was\n"
+        "                # blocking background borrowing; re-run the grant pass.\n"
+        "                self._wake()\n"
+        "            raise\n"
+        "\n"
+        "    @contextlib.asynccontextmanager\n"
+        "    async def admit(self, is_background):\n"
+        '        """Admit one recall; foreground ahead of background borrowing beyond its floor."""\n'
+        "        # Fast path only when the predicate truly holds: an UNGRANTED\n"
+        "        # foreground waiter can only exist while active >= total, so a\n"
+        "        # fast-path admit can never queue-jump a starving waiter.\n"
+        "        may = self._bg_may_admit if is_background else self._fg_may_admit\n"
+        "        if may():\n"
+        "            self._take(is_background)\n"
+        "        else:\n"
+        "            await self._wait_for_slot(is_background)\n"
+        "        try:\n"
+        "            yield\n"
+        "        finally:\n"
+        "            self._release(is_background)\n",
+    ),
+    # ---- 2. engine init: one gate replaces the two semaphores ----
+    (
+        "        # Backpressure mechanism: limit concurrent searches to prevent overwhelming the database\n"
+        "        # Configurable via HINDSIGHT_API_RECALL_MAX_CONCURRENT (switchroom: the code\n"
+        "        # default is DEFAULT_RECALL_MAX_CONCURRENT = 32; the '50' this comment used to\n"
+        "        # claim never existed in config.py)\n"
+        "        self._search_semaphore = asyncio.Semaphore(get_config().recall_max_concurrent)\n"
+        "\n"
+        "        # switchroom: background (consolidation) recalls must hold one of THESE before\n"
+        "        # they may take a _search_semaphore slot, which caps background at\n"
+        "        # consolidation_recall_max_concurrent of the shared budget and leaves the\n"
+        "        # remainder permanently available to foreground per-turn recall.\n"
+        "        # Configurable via HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT (default: 2).\n"
+        "        self._background_search_semaphore = asyncio.Semaphore(\n"
+        "            get_config().consolidation_recall_max_concurrent\n"
+        "        )\n",
+
+        "        # Backpressure mechanism: limit concurrent recalls to prevent overwhelming\n"
+        "        # the database. switchroom: ONE work-conserving priority gate (see\n"
+        "        # _RecallAdmissionGate) replaces the old two-semaphore strict-reservation\n"
+        "        # pair. Total in-flight recalls stay capped at recall_max_concurrent\n"
+        "        # (HINDSIGHT_API_RECALL_MAX_CONCURRENT); background (consolidation)\n"
+        "        # borrows every idle slot when no foreground recall is waiting and keeps\n"
+        "        # consolidation_recall_max_concurrent\n"
+        "        # (HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT) as a guaranteed\n"
+        "        # floor under foreground pressure; foreground is admitted ahead of\n"
+        "        # queued background work.\n"
+        "        self._recall_admission_gate = _RecallAdmissionGate(\n"
+        "            get_config().recall_max_concurrent,\n"
+        "            get_config().consolidation_recall_max_concurrent,\n"
+        "        )\n",
+    ),
+    # ---- 3. recall_async admits through the gate ----
+    (
+        "            async with _recall_admission(\n"
+        "                self._search_semaphore, self._background_search_semaphore, _background\n"
+        "            ):\n",
+        "            async with self._recall_admission_gate.admit(_background):\n",
+    ),
+])
+
+# ---- verification ----
+assert "class _RecallAdmissionGate:" in me, (
+    "switchroom hindsight work-conserving-admission patch: gate class missing after patch"
+)
+# The borrow predicate IS the fix — its two clauses are the work-conserving
+# borrow and the background floor. Pin both.
+assert "if not self._fg_waiters:\n            return True" in me, (
+    "switchroom hindsight work-conserving-admission patch: idle-borrow clause missing — "
+    "background would stay hard-capped and the drain crawls again"
+)
+assert "return self._background_active < self._background_reservation" in me, (
+    "switchroom hindsight work-conserving-admission patch: background floor clause missing "
+    "from the borrow predicate — background could not keep its guaranteed share"
+)
+# The FLOOR-FIRST grant pass in _wake is what makes that floor a LIVE guarantee
+# rather than dead code: an ungranted foreground waiter implies active == total
+# at all times, so a foreground-first _wake re-takes every freed slot inside
+# the same call and sustained foreground pressure starves consolidation to
+# zero indefinitely (worse than the strict reservation this gate replaced).
+assert (
+    "        for fut in self._bg_waiters:\n"
+    "            if self._active >= self._total:\n"
+    "                break\n"
+    "            if self._background_active >= self._background_reservation:\n"
+    "                break\n"
+) in me, (
+    "switchroom hindsight work-conserving-admission patch: the floor-first grant pass is "
+    "missing from _wake — sustained foreground pressure would starve consolidation "
+    "permanently (the floor clause alone is unreachable under contention)"
+)
+# Release must stay SYNCHRONOUS — an await between 'recall finished' and 'slot
+# returned' reintroduces the cancellation slot-leak this design exists to
+# exclude (recall handlers are cancelled on client disconnect).
+assert "    def _release(self, is_background: bool) -> None:" in me, (
+    "switchroom hindsight work-conserving-admission patch: synchronous _release missing"
+)
+assert "async def _release" not in me, (
+    "switchroom hindsight work-conserving-admission patch: _release became async — a "
+    "cancellation delivered during teardown could leak an admission slot"
+)
+# The old strict helper and BOTH old semaphores must be fully retired. NOTE
+# "_background_search_semaphore" contains "_search_semaphore", so one negative
+# covers both; _put_semaphore (retain) is a different string and survives.
+assert "async def _recall_admission(" not in me, (
+    "switchroom hindsight work-conserving-admission patch: the strict reservation helper "
+    "survived — two admission mechanisms would coexist"
+)
+assert "_search_semaphore" not in me, (
+    "switchroom hindsight work-conserving-admission patch: an old admission semaphore "
+    "survived — a caller could bypass the gate"
+)
+# The call-site ARGUMENT, pinned. `admit(False)` would silently send every
+# background recall down the foreground path while the gate class, the init and
+# every other assert here stay green.
+assert "            async with self._recall_admission_gate.admit(_background):\n" in me, (
+    "switchroom hindsight work-conserving-admission patch: recall_async does not admit "
+    "through self._recall_admission_gate.admit(_background) — a hard-coded argument "
+    "silently reverts the priority split"
+)
+# #4212 preservation: every dual-signal string this file carried BEFORE the
+# edit must survive it (in the real build these are all present, so this is a
+# hard invariant; applied to a tree without #4212 it is vacuous by design so
+# the behavioural test can drive this block on top of the split block alone).
+for token in (
+    "def _reconcile_rerank_priority(_background: bool, request_context) -> bool:",
+    "background_rerank = _reconcile_rerank_priority(_background, request_context)",
+    "_background=_background,  # switchroom #4212",
+    "await asyncio.to_thread(LocalSTCrossEncoder.shutdown_executor)",
+):
+    assert (token in me) == (token in me_before), (
+        f"switchroom hindsight work-conserving-admission patch: this edit changed the "
+        f"presence of #4212/#4213 material it must not touch: {token!r}"
+    )
+ast.parse(me)
+print(
+    "switchroom hindsight work-conserving-admission patch: recall admission is now a "
+    "single work-conserving priority gate — background floor granted first "
+    "(consolidation_recall_max_concurrent, live even under sustained foreground "
+    "pressure), then foreground, then idle borrowing up to recall_max_concurrent"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

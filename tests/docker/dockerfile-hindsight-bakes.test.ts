@@ -644,6 +644,96 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the work-conserving recall-admission gate (assert-guarded, fail-loud)", () => {
+    // v2 of the admission split: the strict reservation above fixed foreground
+    // starvation but capped background at consolidation_recall_max_concurrent
+    // even with ZERO foreground waiters, so a large consolidation drain crawled
+    // at 2/8 of the admission budget (~23h measured). The gate block replaces
+    // the two-semaphore reservation with ONE work-conserving priority gate:
+    // foreground first, background borrows every idle slot, old reservation
+    // kept as background's guaranteed floor. Behaviour (RED on the strict
+    // reservation AND on upstream, GREEN patched) is proven in
+    // tests/docker/hindsight-work-conserving-admission-patch.test.ts.
+
+    // The exact-once anchor guard (fail-loud on drift of the split block's
+    // output, which is this block's anchor set).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight work-conserving-admission patch: anchor found \{n\}x/,
+    );
+    // The gate class and its borrow predicate — the two clauses ARE the fix:
+    // idle borrowing (work-conserving) and the background floor (no
+    // starvation in either direction).
+    expect(dockerfile).toMatch(/"class _RecallAdmissionGate:\\n"/);
+    expect(dockerfile).toMatch(/"    def _bg_may_admit\(self\) -> bool:\\n"/);
+    expect(dockerfile).toMatch(/"        if not self\._fg_waiters:\\n"/);
+    expect(dockerfile).toMatch(
+      /"        return self\._background_active < self\._background_reservation\\n"/,
+    );
+    // The floor-first grant pass in _wake — without it the floor clause above
+    // is dead code under contention (an ungranted foreground waiter implies
+    // active == total at all times, so a foreground-first pass re-takes every
+    // freed slot and background starves to zero under sustained foreground
+    // pressure). Pinned as code AND as a build assert.
+    expect(dockerfile).toMatch(
+      /"            if self\._background_active >= self\._background_reservation:\\n"/,
+    );
+    expect(dockerfile).toMatch(
+      /the floor-first grant pass is /,
+    );
+    expect(dockerfile).toMatch(
+      /the floor clause alone is unreachable under contention/,
+    );
+    // Cancellation safety, asyncio.Semaphore style: a waiter granted and
+    // cancelled in the same tick hands its slot back, a departing foreground
+    // waiter re-runs the grant pass so background borrowing cannot stay
+    // latched off, and release is fully SYNCHRONOUS (no await between
+    // "recall finished" and "slot returned", so a cancellation delivered
+    // during teardown cannot leak a slot).
+    expect(dockerfile).toMatch(/"                self\._release\(is_background\)\\n"/);
+    expect(dockerfile).toMatch(/"                self\._wake\(\)\\n"/);
+    expect(dockerfile).toMatch(
+      /assert "    def _release\(self, is_background: bool\) -> None:" in me,/,
+    );
+    expect(dockerfile).toMatch(/assert "async def _release" not in me,/);
+    // The call site, ARGUMENT pinned: admit(False) would silently revert the
+    // priority split while every other check stays green.
+    expect(dockerfile).toContain(
+      '"            async with self._recall_admission_gate.admit(_background):\\n"',
+    );
+    // Post-replace re-assertions: the strict helper and BOTH old semaphores
+    // are fully retired (no bypass path), the borrow + floor clauses exist,
+    // and every #4212/#4213 string present before the edit survives it.
+    expect(dockerfile).toMatch(
+      /assert "async def _recall_admission\(" not in me,/,
+    );
+    expect(dockerfile).toMatch(/assert "_search_semaphore" not in me,/);
+    expect(dockerfile).toMatch(
+      /assert "class _RecallAdmissionGate:" in me,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert \(token in me\) == \(token in me_before\),/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight work-conserving-admission patch: recall admission is now a/,
+    );
+    // Order coupling: the gate block must follow BOTH the split block (its
+    // anchors are that block's output) and the #3142\/#4212 block (whose
+    // post-conditions still expect the semaphore this block retires).
+    const splitAt = dockerfile.indexOf(
+      "switchroom hindsight recall-admission-split patch",
+    );
+    const rerankAt = dockerfile.indexOf(
+      "switchroom #3142: foreground-priority lane",
+    );
+    const gateAt = dockerfile.indexOf(
+      "switchroom hindsight work-conserving-admission patch",
+    );
+    expect(splitAt).toBeGreaterThan(-1);
+    expect(rerankAt).toBeGreaterThan(-1);
+    expect(gateAt).toBeGreaterThan(splitAt);
+    expect(gateAt).toBeGreaterThan(rerankAt);
+  });
+
   it("keeps the worker-slot-ceiling fix (assert-guarded, fail-loud)", () => {
     // HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS is a reservation, i.e. a FLOOR:
     // WorkerPoller._get_available_slots documents that in-flight beyond the
