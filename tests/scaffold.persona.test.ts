@@ -199,11 +199,30 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // 3. No claim that a full `switchroom apply` runs from the container
     //    (compose dir isn't mounted) — it's flagged as a host operation.
     expect(claudeMd).toContain("hand the `apply` to the operator");
+    // 4. The "test before you claim a limit" reflex renders for a root
+    //    agent: the fleet Sandbox primer tells EVERY agent "read-only /
+    //    not root / operator action", but compose.ts emits `user: "0:0"`
+    //    and skips read_only/cap_drop for root agents, so that framing is
+    //    factually wrong for THIS tier. The reflex tells the root agent to
+    //    TEST via its root shell before asserting a limit.
+    expect(claudeMd).toContain("Test before you claim a limit");
+    // 5. The no-exfil carve-out explicitly covers a peer's env via
+    //    `docker exec`/`docker inspect` — the reflex sends the agent to
+    //    inspect peers, and `docker inspect` PRINTS injected secret values,
+    //    so "just testing" must not become a secret-exfil loophole.
+    expect(claudeMd).toContain('"just testing" is no exception');
+    expect(claudeMd).toContain("docker inspect");
+    expect(claudeMd).toContain("credentials/*.env");
   });
 
-  it("a non-root agent never renders the root-tier block", () => {
+  it("a non-root agent never renders the root-tier block (reflex must not leak)", () => {
     const result = scaffoldAgent("plain", makeAgentConfig(), tmpDir, telegramConfig);
     const claudeMd = readFileSync(join(result.agentDir, "CLAUDE.md"), "utf-8");
     expect(claudeMd).not.toContain("Root-tier host access");
+    // The "try docker / /host" reflex would be actively wrong for a
+    // non-root agent (no host socket, read-only rootfs), so it must be
+    // gated to the root block and never reach a non-root agent.
+    expect(claudeMd).not.toContain("Test before you claim a limit");
+    expect(claudeMd).not.toContain('"just testing" is no exception');
   });
 });
