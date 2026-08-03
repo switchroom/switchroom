@@ -25,6 +25,12 @@
 // (#3928). cli/rollout.js does not import host-control, so no cycle; both
 // runtime consumers of this renderer already load it.
 import { VERIFY_COMPONENTS_STEP as VERIFY_COMPONENTS_FAILED_STEP } from "../cli/rollout.js";
+// #4269 — the definite "hostd template regen required / not needed" verdict.
+// The constant is kept honest by scripts/check-hostd-template-guard.mjs.
+import {
+  HOSTD_TEMPLATE_LAST_CHANGED,
+  hostdTemplateRegenVerdict,
+} from "../config/hostd-template-version.js";
 
 /** Per-agent progress an accumulator (the narrator) feeds the renderer. */
 export type AgentRollStatus = "pending" | "running" | "done" | "failed";
@@ -311,13 +317,42 @@ function etaLine(s: RolloutRenderState): string | null {
  * host CLI (`npm i -g`, nothing in the plan touches it), and a hostd
  * TEMPLATE regen, which matters only when a release changes hostd's
  * mounts/env — the image tag itself is advanced by the self-bump.
+ *
+ * #4269 — the template-regen line is DEFINITE, not hedged. The repo
+ * records the release in which the hostd template last changed shape
+ * (HOSTD_TEMPLATE_LAST_CHANGED, kept honest by the
+ * check-hostd-template-guard lint), so when both endpoints of the roll
+ * are clean tags the card says "REQUIRED" or "not needed" outright —
+ * the operator never guesses. Only when an endpoint is unknown or not
+ * a clean vX.Y.Z (channel/sha) does the old hedged wording remain.
+ * When the regen IS required, both residual commands collapse into one
+ * copy-paste line.
  */
-function deferredLines(target: string): string[] {
+function deferredLines(target: string, fromVersion?: string): string[] {
   const bare = target.trim().replace(/^v/, "");
-  return [
+  const head = [
     `**Verified on ${target}** — every component this roll owned passed \`verify-components\`, so this is host convergence, not just the agents. Anything the roll was told to skip is named in its warnings.`,
     `**Still host-side (nothing in a roll can do these):**`,
-    `- host operator CLI — \`sudo npm i -g switchroom@${bare}\``,
+  ];
+  const verdict = hostdTemplateRegenVerdict(target, fromVersion);
+  if (verdict === "required") {
+    return [
+      ...head,
+      `- host operator CLI + hostd template regen — regen is **REQUIRED** for this roll (hostd mounts/env changed in ${HOSTD_TEMPLATE_LAST_CHANGED}). One copy-paste:`,
+      `  \`sudo npm i -g switchroom@${bare} && switchroom hostd install --tag ${target}\``,
+    ];
+  }
+  const cliLine = `- host operator CLI — \`sudo npm i -g switchroom@${bare}\``;
+  if (verdict === "not-needed") {
+    return [
+      ...head,
+      cliLine,
+      `- hostd template regen: **not needed** for this release — hostd mounts/env unchanged since ${HOSTD_TEMPLATE_LAST_CHANGED}.`,
+    ];
+  }
+  return [
+    ...head,
+    cliLine,
     `- hostd template regen (only if the release changed hostd mounts/env) — \`switchroom hostd install --tag ${target}\``,
   ];
 }
@@ -377,7 +412,7 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     if (checklist.length > 0) parts.push("", ...checklist);
     if (singletons.length > 0) parts.push("", ...singletons);
     if (warnings.length > 0) parts.push("", ...warnings);
-    if (s.deferred !== false) parts.push("", ...deferredLines(s.target));
+    if (s.deferred !== false) parts.push("", ...deferredLines(s.target, s.fromVersion));
     return parts.join("\n");
   }
 

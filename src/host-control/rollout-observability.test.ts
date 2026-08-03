@@ -14,6 +14,7 @@ import {
   renderRolloutStatus,
   formatDurationMs,
 } from "./render-rollout-status.js";
+import { HOSTD_TEMPLATE_LAST_CHANGED } from "../config/hostd-template-version.js";
 
 /** Build one JSONL audit row (the shape hostd writes, chain fields elided —
  *  parseAuditLine ignores `_seq`/`_prev`/`_hash`). */
@@ -229,6 +230,59 @@ describe("renderRolloutStatus", () => {
     expect(out).not.toContain("switchroom webd install");
     expect(out).not.toContain("still on the prior version");
     expect(out).toContain("Verified on v1.2.3");
+  });
+
+  // #4269 — the hostd-template-regen residual is DEFINITE when both roll
+  // endpoints are clean tags. Tags are derived relative to
+  // HOSTD_TEMPLATE_LAST_CHANGED so these stay true across constant bumps.
+  const LC_MAJOR = Number(HOSTD_TEMPLATE_LAST_CHANGED.slice(1).split(".")[0]);
+  const PRE_TEMPLATE_CHANGE = "v0.0.1"; // strictly before any plausible constant
+  const POST_A = `v${LC_MAJOR + 1}.0.0`;
+  const POST_B = `v${LC_MAJOR + 1}.0.1`;
+
+  it("✅ card says regen NOT needed when the roll doesn't cross the template change (#4269 — the v0.19.48→v0.20.0 case)", () => {
+    const out = renderRolloutStatus({
+      target: POST_B,
+      fromVersion: POST_A,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+    });
+    expect(out).toContain("not needed");
+    expect(out).toContain(`unchanged since ${HOSTD_TEMPLATE_LAST_CHANGED}`);
+    // No hedge, and no regen command the operator doesn't need.
+    expect(out).not.toContain("only if the release changed");
+    expect(out).not.toContain("switchroom hostd install");
+    // The CLI residual is still named.
+    expect(out).toContain(`sudo npm i -g switchroom@${POST_B.slice(1)}`);
+  });
+
+  it("✅ card says regen REQUIRED, as one copy-paste block, when the roll crosses the template change (#4269)", () => {
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: PRE_TEMPLATE_CHANGE,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+    });
+    expect(out).toContain("REQUIRED");
+    expect(out).toContain(`changed in ${HOSTD_TEMPLATE_LAST_CHANGED}`);
+    expect(out).not.toContain("only if the release changed");
+    // Both residuals collapse into a single copy-paste command line.
+    expect(out).toContain(
+      `\`sudo npm i -g switchroom@${POST_A.slice(1)} && switchroom hostd install --tag ${POST_A}\``,
+    );
+  });
+
+  it("✅ card keeps the hedged wording only when the from version is unknown (#4269)", () => {
+    const out = renderRolloutStatus({
+      target: POST_A,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+    });
+    expect(out).toContain("only if the release changed hostd mounts/env");
+    expect(out).toContain(`switchroom hostd install --tag ${POST_A}`);
   });
 
   it("renders the ❌ terminal-error summary with the failed step + agent", () => {

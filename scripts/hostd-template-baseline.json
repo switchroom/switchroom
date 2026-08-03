@@ -1,0 +1,5 @@
+{
+  "//": "check-hostd-template-guard.ts baseline (#4269). templateSha256 = sha256 of the normalized canonical renderHostdComposeFile() output; lastChanged = the release tag in which the hostd compose template last changed shape, and MUST equal HOSTD_TEMPLATE_LAST_CHANGED in src/config/hostd-template-version.ts. When the template's shape changes, update BOTH fields (the guard's failure output prints the new hash) and bump the constant to the release that will ship the change.",
+  "templateSha256": "7b85714af5bea90ca71486bb4c0f5ef9b5232346c2ecc9868c6a60e13e57362a",
+  "lastChanged": "v0.19.43"
+}
