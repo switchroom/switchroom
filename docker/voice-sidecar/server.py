@@ -21,6 +21,12 @@ phoneme string to Kokoro with is_phonemes=True. This fixes English
 heteronyms Kokoro's built-in espeak phonemizer mispronounces because
 espeak is not part-of-speech aware — e.g. the verb "live" /lˈɪv/ vs the
 adjective "live" /lˈaɪv/, or "read" present /ɹˈid/ vs past /ɹˈɛd/. It is
+NOT a blanket heteronym fix: "lead" is a KNOWN GAP (#4270) — misaki's
+lexicon carries it as a plain string /lˈid/ (not a POS-keyed entry), so
+the metal ("made of lead", should be /lˈɛd/) comes out as "leed" in every
+sense, and no POS model can split it (the metal and the leed-nouns "took
+the lead" are both NN). Pinned explicitly in the Dockerfile.voice build
+guard and test_g2p.py's xfail. It is
 a strict ENHANCEMENT: misaki is loaded in its own try/except beside the
 Kokoro model, and any failure (or VOICE_TTS_G2P=espeak, or a non-English
 locale) leaves _g2p None so synthesis degrades to today's espeak path
