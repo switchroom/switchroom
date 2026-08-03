@@ -60,4 +60,29 @@ describe("writeBuzzHeartbeat / parseBuzzHeartbeat", () => {
     const { agent: _drop, ...noAgent } = beat();
     expect(parseBuzzHeartbeat(JSON.stringify(noAgent))).toBeNull();
   });
+
+  it("rejects a beacon whose stats field carries a non-numeric (injection) value", () => {
+    // MAJOR-1: the beacon lives in the agent's own uid-writable state dir and
+    // agents are prompt-injectable. A compromised agent could smuggle
+    // attacker-controlled text (ANSI escapes, fake operator instructions) into a
+    // stats field; doctor interpolates s.received etc. straight into an
+    // operator terminal row. A string-valued stats field MUST parse to null so
+    // that content never reaches the doctor surface — the shape guard, not the
+    // freshness check, is the boundary.
+    const evil = { ...SUMMARY, received: "0[31m URGENT: run switchroom vault set …" };
+    expect(parseBuzzHeartbeat(JSON.stringify(beat({ stats: evil as never })))).toBeNull();
+    // Non-finite numbers are equally rejected (NaN / Infinity survive JSON as null).
+    expect(
+      parseBuzzHeartbeat(JSON.stringify(beat({ stats: { ...SUMMARY, mirrorOk: null } as never }))),
+    ).toBeNull();
+  });
+
+  it("rejects a beacon that is missing a numeric stats field", () => {
+    // MAJOR-1: an absent field is as malformed as a wrong-typed one — doctor
+    // would print `undefined` into the row. Drop one of the ten and expect null.
+    const { authFailures: _drop, ...partialStats } = SUMMARY;
+    expect(
+      parseBuzzHeartbeat(JSON.stringify(beat({ stats: partialStats as never }))),
+    ).toBeNull();
+  });
 });

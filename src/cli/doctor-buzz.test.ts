@@ -113,6 +113,18 @@ describe("runBuzzChecks — channel state", () => {
     const results = await runBuzzChecks(config, deps({ heartbeatContent: null }));
     expect(row(results, "buzz:channel:alpha")?.status).toBe("warn");
   });
+
+  it("mirror:origin is NOT live, so the liveness probe SKIPs (no false-red)", async () => {
+    // LOW-1: `origin` degrades to dark at runtime (config.ts loadConfigFromEnv),
+    // so the sidecar never writes a beacon. Running the liveness probe would emit
+    // a false-red "sidecar not running" warn whose restart fix can't help and
+    // that contradicts the channel-state warn. It must SKIP, exactly like off.
+    const config = cfg({ alpha: { enabled: true, mirror: "origin", ...FULL_RELAY } });
+    const agents = computeBuzzAgents(config);
+    expect(agents[0].live).toBe(false);
+    const results = await runBuzzChecks(config, deps({ heartbeatContent: null }));
+    expect(row(results, "buzz:sidecar-live:alpha")?.status).toBe("skip");
+  });
 });
 
 describe("runBuzzChecks — relay config", () => {

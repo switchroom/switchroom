@@ -131,7 +131,12 @@ export function computeBuzzAgents(config: SwitchroomConfig): EffectiveBuzz[] {
       agent: name,
       enabled,
       mirror,
-      live: enabled && mirror !== "off",
+      // `origin` is degraded to dark at runtime (config.ts loadConfigFromEnv:
+      // an explicit `origin` returns `off`), so the sidecar exits idle and never
+      // writes a beacon. Treating it as live would run the liveness probe and
+      // produce a false-red "sidecar not running" warn whose restart fix can't
+      // help — so `origin` is NOT live here, matching `off`.
+      live: enabled && mirror !== "off" && mirror !== "origin",
       relayUrl: raw.relay_url ?? "",
       relayHost: raw.relay_host ?? "",
       operatorPubkey: raw.operator_pubkey ?? "",

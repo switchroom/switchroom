@@ -85,7 +85,47 @@ export function writeBuzzHeartbeat(
   write(path, JSON.stringify(hb));
 }
 
-/** Parse + shape-guard a beacon's text. Returns null on junk / wrong version. */
+/** Every numeric field of BuzzPipelineSummary — the exhaustive key list the
+ *  stats guard below validates. Kept in sync with the interface in stats.ts;
+ *  a `Record<keyof BuzzPipelineSummary, true>` forces a compile error here if a
+ *  field is added or renamed there without updating this guard. */
+const BUZZ_SUMMARY_FIELDS = [
+  "received",
+  "injected",
+  "duplicate",
+  "queued",
+  "injectFailed",
+  "droppedByKind",
+  "channelOff",
+  "authFailures",
+  "mirrorOk",
+  "mirrorFailed",
+] as const;
+const _BUZZ_SUMMARY_FIELDS_EXHAUSTIVE: Record<keyof BuzzPipelineSummary, true> = {
+  received: true,
+  injected: true,
+  duplicate: true,
+  queued: true,
+  injectFailed: true,
+  droppedByKind: true,
+  channelOff: true,
+  authFailures: true,
+  mirrorOk: true,
+  mirrorFailed: true,
+};
+void _BUZZ_SUMMARY_FIELDS_EXHAUSTIVE;
+
+/**
+ * Parse + shape-guard a beacon's text. Returns null on junk / wrong version.
+ *
+ * The beacon file lives in the agent's own uid-writable state dir, and this
+ * fleet treats agents as prompt-injectable — so a compromised agent could write
+ * a `stats` object whose fields carry attacker-controlled strings (including
+ * ANSI escapes) that doctor would then interpolate into an operator-facing
+ * terminal row. Every BuzzPipelineSummary field is therefore validated as a
+ * FINITE number; a missing or non-numeric field makes the whole beacon
+ * malformed (→ null), same as any other failed envelope check.
+ */
 export function parseBuzzHeartbeat(text: string): BuzzHeartbeat | null {
   let raw: unknown;
   try {
@@ -101,5 +141,9 @@ export function parseBuzzHeartbeat(text: string): BuzzHeartbeat | null {
   if (typeof h.bootTs !== "number") return null;
   if (typeof h.subscribed !== "boolean") return null;
   if (h.stats == null || typeof h.stats !== "object") return null;
+  const stats = h.stats as Record<string, unknown>;
+  for (const field of BUZZ_SUMMARY_FIELDS) {
+    if (!Number.isFinite(stats[field])) return null;
+  }
   return raw as BuzzHeartbeat;
 }
