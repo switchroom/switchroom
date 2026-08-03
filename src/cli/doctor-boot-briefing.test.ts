@@ -5,11 +5,20 @@
  * multiple dead reasons collapse into one warn row listing all; a `legacy`
  * (or unset) agent produces no result. WARN never FAILs (exit-code contract).
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { SwitchroomConfig } from "../config/schema.js";
+
+// Spy on the real docker-mode detector so the DEFAULT-deps path (no isDocker
+// override) can be exercised and its composePath argument pinned. The tests
+// below inject their own isDocker via deps, so this mock never touches them.
+vi.mock("./doctor-docker.js", () => ({ isDockerMode: vi.fn(() => true) }));
+import { isDockerMode } from "./doctor-docker.js";
+
 import {
   runBootBriefingChecks,
   historyExplicitlyDisabled,
+  HOST_COMPOSE_PATH,
+  defaultIsDocker,
   type BootBriefingProbeDeps,
 } from "./doctor-boot-briefing.js";
 
@@ -151,5 +160,44 @@ describe("historyExplicitlyDisabled", () => {
   });
   it("false when the file is corrupt JSON", () => {
     expect(historyExplicitlyDisabled(() => "{not json", "/a")).toBe(false);
+  });
+});
+
+describe("default deps — host-mode docker detection (#4244 MAJOR regression)", () => {
+  const wired = {
+    topic_name: "W",
+    session_continuity: { briefing: "gateway" },
+    channels: { telegram: { enabled: true, plugin: "switchroom" } },
+  };
+
+  it("HOST_COMPOSE_PATH points at the generated fleet compose file", () => {
+    // isDockerMode() with NO args only sees SWITCHROOM_RUNTIME (unset on the
+    // operator host where `doctor` runs) — so the default MUST pass a real
+    // compose path or the probe false-negatives docker mode everywhere.
+    expect(HOST_COMPOSE_PATH).toMatch(/[/\\]\.switchroom[/\\]compose[/\\]docker-compose\.yml$/);
+  });
+
+  it("defaultIsDocker passes the compose path to isDockerMode (not a bare call)", () => {
+    (isDockerMode as unknown as ReturnType<typeof vi.fn>).mockClear();
+    defaultIsDocker();
+    expect(isDockerMode).toHaveBeenCalledWith({ composePath: HOST_COMPOSE_PATH });
+    // Crucially, NOT called with undefined args (the shipped bug).
+    expect(isDockerMode).not.toHaveBeenCalledWith();
+  });
+
+  it("with REAL default deps a fully-wired agent gets the ok row (happy path fires on the host)", () => {
+    (isDockerMode as unknown as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    const config = {
+      switchroom: { version: 1, agents_dir: "/agents", skills_dir: "/skills" },
+      telegram: { bot_token: "x", forum_chat_id: "-1001234567890" },
+      vault: { path: "/v.enc" },
+      defaults: {},
+      agents: { clerk: wired },
+    } as unknown as SwitchroomConfig;
+    // No deps override → exercises defaultDeps.isDocker (mocked docker=true) and
+    // the real readAccess (access.json absent → history not disabled).
+    const r = runBootBriefingChecks(config);
+    expect(r).toHaveLength(1);
+    expect(r[0]).toMatchObject({ name: "boot-briefing: clerk", status: "ok" });
   });
 });

@@ -77,10 +77,33 @@ export interface BootBriefingProbeDeps {
   agentsDir?: string;
 }
 
+/**
+ * Compose path the host-side `switchroom doctor` uses to detect docker mode.
+ *
+ * `isDockerMode()` with no args is true ONLY when `SWITCHROOM_RUNTIME==="docker"`
+ * — an env var set INSIDE agent containers, never in the operator's host shell
+ * where `doctor` runs. Passing the compose path lets it detect a docker fleet
+ * from the host by the presence of the generated compose file, exactly as
+ * `runDockerSection` (doctor.ts) does. Without it the probe reads a healthy
+ * docker fleet as "not docker" and false-WARNs on every gateway-briefing agent.
+ */
+export const HOST_COMPOSE_PATH = resolve(
+  process.env.HOME ?? "",
+  ".switchroom",
+  "compose",
+  "docker-compose.yml",
+);
+
 const defaultDeps: BootBriefingProbeDeps = {
-  isDocker: () => isDockerMode(),
+  isDocker: () => isDockerMode({ composePath: HOST_COMPOSE_PATH }),
   readAccess: (p) => readFileSync(p, "utf-8"),
 };
+
+/**
+ * The default `isDocker` dep, exported for the regression test that pins the
+ * host-mode detection (composePath passthrough) without stubbing it away.
+ */
+export const defaultIsDocker = defaultDeps.isDocker;
 
 /**
  * Read `historyEnabled` from an agent's access.json.
