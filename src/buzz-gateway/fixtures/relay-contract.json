@@ -1,6 +1,6 @@
 {
   "_comment": "PINNED Phase-0 Buzz relay wire contract. This is the shape the closed relay validates against BEFORE membership: the NIP-42 AUTH event kind, the NIP-29 channel-message kind the subscription REQ asks for, and the exact tag names the AUTH event must carry. The sidecar's live constants are checked against this fixture at build/boot by compat-check.ts, which WARNS (never fails) on drift so a relay upgrade that moves a kind or renames a tag surfaces loudly instead of silently breaking AUTH in production. The `digest` is a sha256 over the canonical (sorted-key) JSON of the contract fields below it and is what compat-check recomputes; a digest mismatch means SOME field drifted even if a hand-diff missed it. Regenerate with compat-check.computeContractDigest() when a relay contract change is intentional.",
-  "source": "docs/phase0-findings.md (F2 NIP-42 AUTH, F5 NIP-29 kind:9) + src/buzz-gateway/nostr-protocol.ts",
+  "source": "Buzz Phase-0 findings F2 (NIP-42 AUTH) + F5 (NIP-29 kind:9) — never committed as a doc; recorded only in PR #4208 body and src/buzz-gateway/nostr-protocol.ts. NOTE: docs/phase0-findings.md is the tmux/broker socket-identity spike, NOT Nostr. Scope + provenance: reference/rfcs/buzz-phase3.md.",
   "nip42_auth_kind": 22242,
   "message_kind": 9,
   "auth_tags": ["challenge", "relay"],
