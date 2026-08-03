@@ -140,6 +140,7 @@ jobs:
               - 'tests/docker/hindsight-reflect-directives-patch.test.ts'
               - 'tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts'
               - 'tests/docker/hindsight-reranker-priority-patch.test.ts'
+              - 'tests/docker/hindsight-work-conserving-admission-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -482,6 +483,24 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
           SWITCHROOM_HINDSIGHT_BUILT_IMAGE: switchroom-hindsight:probe
         run: npx vitest run tests/docker/hindsight-reranker-priority-patch.test.ts
+
+      - name: Run the hindsight work-conserving-admission probe (RED/GREEN, must not skip)
+        # Same contract, for the work-conserving recall-admission gate (v2 of
+        # the admission split). The bakes test cannot cover the failure that
+        # matters here: its assertions are grep-on-file, so a gate whose borrow
+        # predicate is inverted, or an admit() call hard-coded to False, stays
+        # green there while either the drain crawls at 2/8 of the budget again
+        # or background recalls jump the foreground queue. Only saturating a
+        # real gate with queued background recalls and timing a foreground
+        # admission catches it. TWO RED arms against the raw pinned upstream —
+        # bare (no priority) and split-only (not work-conserving, today's
+        # shipping behaviour) — plus a patched GREEN arm; the through-built arm
+        # (SWITCHROOM_HINDSIGHT_BUILT_IMAGE) additionally asserts the #4212
+        # rerank-lane invariants survive the gate.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+          SWITCHROOM_HINDSIGHT_BUILT_IMAGE: switchroom-hindsight:probe
+        run: npx vitest run tests/docker/hindsight-work-conserving-admission-patch.test.ts
 
       - name: Run the embedded-postgres fsync probe (RED/GREEN, must not skip)
         # NOT a patch probe: this one boots the REAL docker/hindsight-entrypoint.sh
