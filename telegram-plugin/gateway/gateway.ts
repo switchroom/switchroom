@@ -433,7 +433,7 @@ import { parseLitellmNoticeWindowMs } from '../litellm-local-notice.js'
 import { createLitellmLocalNoticeRunner, decideRateLimitedSurface } from './litellm-local-notice-wiring.js'
 import { runFleetAutoFallback, renderFallbackFailureNotice, evaluateFallbackFailureNotice, evaluateAllBlockedNotice, type FallbackFailureNoticeState, type FallbackAllBlockedNoticeState } from '../auto-fallback-fleet.js'
 import { startRestartWatchdog } from './restart-watchdog.js'
-import { validateStringArray } from './access-validator.js'
+import { createAccessStore } from './access-store.js'
 
 /**
  * Truncation cap for the `reply_to_text` channel-meta attribute (issue #119).
@@ -1536,10 +1536,6 @@ export type Access = {
   }
 }
 
-function defaultAccess(): Access {
-  return { dmPolicy: 'pairing', allowFrom: [], groups: {}, pending: {} }
-}
-
 // Rich-message wire cap (#2669): the rich path allows 32768 UTF-8 chars.
 const MAX_CHUNK_LIMIT = RICH_MESSAGE_MAX_CHARS
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -1580,90 +1576,18 @@ function assertSendable(f: string): void {
   }
 }
 
-function readAccessFile(): Access {
-  try {
-    const raw = readFileSync(ACCESS_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as Partial<Access>
-    const allowFrom = validateStringArray('allowFrom', parsed.allowFrom ?? [])
-    const groups: Record<string, GroupPolicy> = {}
-    for (const [chatId, policy] of Object.entries(parsed.groups ?? {})) {
-      groups[chatId] = {
-        ...policy,
-        allowFrom: validateStringArray(`groups.${chatId}.allowFrom`, policy.allowFrom ?? []),
-      }
-    }
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom,
-      groups,
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-      parseMode: parsed.parseMode,
-      disableLinkPreview: parsed.disableLinkPreview,
-      coalescingGapMs: parsed.coalescingGapMs,
-      litellmNoticeWindowMs: parsed.litellmNoticeWindowMs,
-      coalesceMaxAttachments: parsed.coalesceMaxAttachments,
-      interruptSafeBoundary: parsed.interruptSafeBoundary,
-      interruptMaxWaitMs: parsed.interruptMaxWaitMs,
-      statusReactions: parsed.statusReactions,
-      historyEnabled: parsed.historyEnabled,
-      historyRetentionDays: parsed.historyRetentionDays,
-      // #596: telegram features projected into access.json by scaffold.
-      // Without these passthroughs, gateway readers (`access.voice_in`,
-      // `access.telegraph`, `access.stickers`) silently see undefined.
-      stickers: parsed.stickers,
-      voice_in: parsed.voice_in,
-      voice_out: parsed.voice_out,
-      telegraph: parsed.telegraph,
-      // #789: button-choice-confirmation config projected by scaffold.
-      button_choice_confirmation: parsed.button_choice_confirmation,
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
-    try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
-    process.stderr.write(`telegram gateway: access.json is corrupt, moved aside. Starting fresh.\n`)
-    return defaultAccess()
-  }
-}
-
-const BOOT_ACCESS: Access | null = STATIC
-  ? (() => {
-      const a = readAccessFile()
-      if (a.dmPolicy === 'pairing') {
-        process.stderr.write('telegram gateway: static mode — dmPolicy "pairing" downgraded to "allowlist"\n')
-        a.dmPolicy = 'allowlist'
-      }
-      a.pending = {}
-      return a
-    })()
-  : null
-
-function loadAccess(): Access {
-  return BOOT_ACCESS ?? readAccessFile()
-}
-
-/**
- * Read `people.json` (the scaffold's plain projection of `users:` entries
- * that carry a `person_id`). Fail-open: ENOENT or corrupt/malformed JSON
- * returns an empty array rather than throwing — this feature must never
- * block startup. Unlike `access.json` this file is never gateway-mutated,
- * so there's no "move corrupt file aside" concern; the scaffold owns and
- * regenerates it on every reconcile.
- */
-function readPeopleFile(): RawPersonEntry[] {
-  try {
-    const raw = readFileSync(PEOPLE_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as { entries?: unknown }
-    if (!Array.isArray(parsed.entries)) return []
-    return parsed.entries as RawPersonEntry[]
-  } catch {
-    return []
-  }
-}
+// Access/allowlist file layer (access.json + people.json). Extracted to
+// ./access-store.ts (switchroom#4248) to relieve the gateway line-ratchet;
+// behavior is byte-identical. The factory runs the static-mode BOOT_ACCESS
+// snapshot eagerly at THIS point in startup — same timing as the inline
+// version — so the frozen-allowlist semantics are unchanged.
+const { loadAccess, readPeopleFile, assertAllowedChat, saveAccess, pruneExpired } =
+  createAccessStore({
+    accessFile: ACCESS_FILE,
+    peopleFile: PEOPLE_FILE,
+    stateDir: STATE_DIR,
+    isStatic: STATIC,
+  })
 
 /**
  * Boot-time-only person-name directory (see resolve-person.ts module doc).
@@ -1672,34 +1596,6 @@ function readPeopleFile(): RawPersonEntry[] {
  * this process — a config change requires an agent restart.
  */
 let PERSON_DIRECTORY: PersonDirectory = { byTelegramKey: {} }
-
-function assertAllowedChat(chat_id: string | number): void {
-  const id = String(chat_id)
-  const access = loadAccess()
-  if (access.allowFrom.includes(id)) return
-  if (id in access.groups) return
-  throw new Error(`chat ${id} is not allowlisted — add via /telegram:access`)
-}
-
-function saveAccess(a: Access): void {
-  if (STATIC) return
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, ACCESS_FILE)
-}
-
-function pruneExpired(a: Access): boolean {
-  const now = Date.now()
-  let changed = false
-  for (const [code, p] of Object.entries(a.pending)) {
-    if (p.expiresAt < now) {
-      delete a.pending[code]
-      changed = true
-    }
-  }
-  return changed
-}
 
 // ─── History ──────────────────────────────────────────────────────────────
 const HISTORY_ACCESS = loadAccess()
