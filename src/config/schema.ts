@@ -2399,8 +2399,10 @@ export const BuzzChannelSchema = z
       .string()
       .optional()
       .describe(
-        "Pinned relay image digest (M4). The compat-check warns on mismatch; " +
-        "advisory in Phase 1.",
+        "Pinned relay image digest (M4). RESERVED — not yet consumed: nothing " +
+        "projects or reads this field today (no compat-check exists yet). Kept " +
+        "in the schema so the intended digest-pin can be wired without a config " +
+        "shape change.",
       ),
   })
   .strict();

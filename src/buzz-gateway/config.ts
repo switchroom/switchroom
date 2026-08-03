@@ -7,14 +7,14 @@
  * no access to the config cascade. The one secret (the agent nsec) is NEVER an
  * env var; it is broker-fetched in-process at boot (see index.ts).
  *
- * IMPORTANT — these env vars are NOT populated by any config path in this
- * branch. The projection of the cascade-resolved `channels.buzz` block into
- * these env vars (at scaffold/compose time) is DEFERRED to the deploy-wiring
- * phase. Until that lands, `BUZZ_ENABLED` is unset everywhere, so the channel
- * is inert by construction and this sidecar never runs live. (Also deferred to
- * that phase: BuzzChannelSchema currently has no chat-id field, yet this loader
- * requires BUZZ_CHAT_ID when live — the schema→env mapping is part of the
- * env-projection work, not added here.)
+ * These env vars are projected at compose time from the cascade-resolved
+ * `channels.buzz` block: `src/agents/compose.ts` maps the block into BUZZ_*
+ * container env, gating `BUZZ_ENABLED=1` on `enabled === true`. An
+ * enabled:false/absent block leaves `BUZZ_ENABLED` unset, so start.sh's
+ * `[ "$BUZZ_ENABLED" = "1" ]` guard never forks the sidecar and the channel
+ * stays dark by construction — the default. `BuzzChannelSchema`
+ * (`src/config/schema.ts`) carries a REQUIRED `chat_id`, projected as
+ * `BUZZ_CHAT_ID`, which this loader requires when live.
  *
  * `loadConfigFromEnv` is pure w.r.t. a supplied env map so it is unit-testable.
  */
