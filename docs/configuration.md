@@ -82,7 +82,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
 | `google_workspace` | deep merge | Google Drive/Docs/Sheets/Calendar integration. `google_client_id` / `google_client_secret` are install-wide (top level only); `tier` + `approvers` cascade per-agent. See § Google Workspace below. |
 | `notion_workspace` | deep merge top-level; per-agent `databases:` list REPLACES (does not concatenate) | Notion integration. Top-level `vault_key` + `databases:` map cascade via deep merge so a profile can add a DB without clobbering top-level entries. The per-agent `databases:` allowlist is **override** — an agent's list replaces the parent's, so a specialist agent inheriting a profile can narrow to fewer DBs. See § Notion Workspace below and [notion-integration.md](notion-integration.md). |
-| `channels.buzz` | override | Buzz desktop co-channel (a closed NIP-29 Nostr relay + one per-agent sidecar). **Dark by default** — omit the block or set `enabled: false` and nothing projects a live channel. See § Buzz co-channel below and [reference/jobs/use-my-team-from-the-desktop.md](../reference/jobs/use-my-team-from-the-desktop.md). |
+| `channels.buzz` | per-field merge (agent wins) | Buzz desktop co-channel (a closed NIP-29 Nostr relay + one per-agent sidecar). **Dark by default** — omit the block or set `enabled: false` and nothing projects a live channel. See § Buzz co-channel below and [reference/jobs/use-my-team-from-the-desktop.md](../reference/jobs/use-my-team-from-the-desktop.md). |
 
 ## Buzz co-channel — `channels.buzz`
 
@@ -116,7 +116,7 @@ name**; the sidecar broker-fetches the secret in-process at boot.
 | `channels.buzz.authorized_pubkeys` | override | no (default `[]`) | Additional pubkeys (`npub` or hex) whose signed events may become turns. Effective allowlist = this ∪ `{operator_pubkey}`. Empty by default (operator-only). Projects `BUZZ_AUTHORIZED_PUBKEYS` (comma-joined) when non-empty. |
 | `channels.buzz.pubkey_names` | override | no (default `{}`) | Optional petnames: hex/`npub` pubkey → display name, used to label the sender on injected turns. Projects `BUZZ_PUBKEY_NAMES` (comma-joined `key=value`) when non-empty. |
 | `channels.buzz.channel_map` | override | no (default `{}`) | Optional map of extra group UUIDs → friendly labels. Not projected to env today. |
-| `channels.buzz.pinned_relay_digest` | override | no | **Reserved — not yet consumed.** Intended pinned relay image digest (M4); nothing projects or reads it today. Kept in the schema so the digest-pin can be wired later without a config-shape change. |
+| `channels.buzz.pinned_relay_digest` | override | no | **Reserved — no consumer.** Intended pinned relay image digest (M4); the existing compat-check (`compat-check.ts`) validates only the wire contract and never reads this field. Kept in the schema so the digest-pin can be wired later without a config-shape change. |
 
 ## Permission mode & auto-accept
 

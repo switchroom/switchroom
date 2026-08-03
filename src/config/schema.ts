@@ -2399,10 +2399,11 @@ export const BuzzChannelSchema = z
       .string()
       .optional()
       .describe(
-        "Pinned relay image digest (M4). RESERVED — not yet consumed: nothing " +
-        "projects or reads this field today (no compat-check exists yet). Kept " +
-        "in the schema so the intended digest-pin can be wired without a config " +
-        "shape change.",
+        "Pinned relay image digest (M4). RESERVED — no consumer of this field " +
+        "exists; the existing compat-check (compat-check.ts) validates only " +
+        "the wire contract (AUTH kind, message kind, tag names) and does not " +
+        "read this field. Kept in the schema so the intended digest-pin can " +
+        "be wired without a config shape change.",
       ),
   })
   .strict();
