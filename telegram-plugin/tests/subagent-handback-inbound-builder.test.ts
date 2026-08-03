@@ -165,3 +165,49 @@ describe('buildSubagentHandbackInbound', () => {
     expect(inbound.meta.message_thread_id).toBeUndefined()
   })
 })
+
+// ─── msg-6897 misroute regression (2026-08-04): meta.chat_id is LOAD-BEARING ──
+// The gateway's enqueue handler (`beginTurn`, stream-render.ts) gates the
+// ENTIRE turn-atom mint — `recordTurnStart` (the `turns` row) AND
+// `writeTurnActiveMarker` (the #2085 dispatch-time stamp source) — on
+// `ev.chatId`, which is parsed from the channel XML's `chat_id` attribute,
+// rendered ONLY from meta (bridge.ts onInbound → mcp.notification meta).
+// Without meta.chat_id a handback turn registers NO surface, so a worker
+// dispatched from inside it has a NULL parent_turn_key (no marker to stamp
+// from, no turn window for the backfill) and its card/handback misroutes to
+// the owner DM with the thread stripped. Mirrors the real-inbound shape
+// (inbound-router.ts buildInboundEnvelope meta.chat_id) and the
+// resume_interrupted builder's identical fix.
+describe('buildSubagentHandbackInbound — meta.chat_id turn registration (msg-6897)', () => {
+  it('carries the origin chat as meta.chat_id so the handback turn mints a turn atom', () => {
+    const inbound = buildSubagentHandbackInbound({
+      ctx: {
+        chatId: '-1004223464247',
+        threadId: 77,
+        taskDescription: 'Topic-dispatched work',
+        resultText: 'done',
+        outcome: 'completed',
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.meta.chat_id).toBe('-1004223464247')
+    // The thread carrier must still ride alongside — chat_id + thread_id is
+    // the full origin surface the minted turn (and any worker dispatched
+    // inside it) inherits.
+    expect(inbound.meta.message_thread_id).toBe('77')
+  })
+
+  it('carries meta.chat_id for DM-shaped chats too (no thread)', () => {
+    const inbound = buildSubagentHandbackInbound({
+      ctx: {
+        chatId: '12345',
+        taskDescription: 'x',
+        resultText: 'y',
+        outcome: 'failed',
+      },
+      nowMs: FIXED_NOW,
+    })
+    expect(inbound.meta.chat_id).toBe('12345')
+    expect(inbound.meta.message_thread_id).toBeUndefined()
+  })
+})

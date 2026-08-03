@@ -115,6 +115,19 @@ export function buildSubagentHandbackInbound(opts: {
     meta: {
       source: 'subagent_handback',
       outcome: opts.ctx.outcome,
+      // Carry the originating chat as a model-visible channel attribute
+      // (mirrors the real-inbound + resume_interrupted shapes — see
+      // inbound-router.ts:buildInboundEnvelope and resume-inbound-builder.ts).
+      // LOAD-BEARING for turn registration: the gateway's enqueue handler
+      // (`beginTurn`, stream-render.ts) gates the ENTIRE turn-atom mint on
+      // `ev.chatId`, which is parsed from the channel XML's `chat_id`
+      // attribute — rendered ONLY from meta. Without it a handback turn gets
+      // NO `turns` row and NO `turn-active.json` marker, so a worker
+      // dispatched from inside that turn cannot be stamped with a
+      // `parent_turn_key` at dispatch (#2085) nor attributed by the
+      // started_at window backfill — its card + handback then misroute to
+      // the owner DM (Telegram msg 6897 incident, 2026-08-04).
+      chat_id: opts.ctx.chatId,
       // #3268 — round-trip the fabricated `ts` through `meta.message_id` so it
       // survives to enqueue. `ev.messageId` at enqueue is parsed from the
       // channel envelope's `message_id` attribute, which is rendered ONLY from

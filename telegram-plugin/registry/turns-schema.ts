@@ -674,6 +674,23 @@ export function findRecentTurnsForChat(
 }
 
 /**
+ * Return the most recent turn across ALL chats (any state — running or
+ * ended), or null when the table is empty. The last-resort routing floor for
+ * an unattributable sub-agent's surfaces (worker card / handback): when
+ * origin resolution misses (parent_turn_key never stamped), the most recent
+ * turn's chat+topic is where the operator was last working — a strictly
+ * better landing spot than the owner DM with the thread stripped.
+ */
+export function findMostRecentTurn(db: SqliteDatabase): Turn | null {
+  const row = db.prepare(`
+    SELECT * FROM turns
+    ORDER BY started_at DESC
+    LIMIT 1
+  `).get() as RawTurnRow | undefined
+  return row ? mapRow(row) : null
+}
+
+/**
  * Return the most recent N turns across all chats for an agent, ordered by
  * started_at DESC. Intended for the REST API endpoint
  * `GET /api/agents/:name/turns?limit=20`.

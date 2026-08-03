@@ -972,7 +972,8 @@ import {
   DEFAULT_BRIDGE_DEAD_GRACE_MS,
 } from './bridge-dead-watchdog.js'
 import { findAgentProcessInContainer } from './boot-probes.js'
-import { applySubagentsSchema, getSubagentByJsonlId, resolveSubagentOriginTurnKey, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
+import { applySubagentsSchema, getSubagentByJsonlId, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
+import { resolveSubagentOriginChatDb, resolveRecentTurnFallbackChat } from './subagent-origin-surface.js'
 import type { InterruptedSubagent } from './resume-inbound-builder.js'
 import { resolveWorkerFeedDispatch, decideWorkerFeedDestination, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
@@ -1960,28 +1961,22 @@ function resolveSubagentOriginChat(
   agentId: string,
 ): { chatId: string; threadId?: number } | null {
   if (turnsDb == null) return null
-  try {
-    // Transitive walk: a NESTED (depth-2+) worker's own parent_turn_key is
-    // NULL by construction (its dispatching context is another sub-agent,
-    // not a gateway turn) — resolveSubagentOriginTurnKey follows the
-    // parent_agent_id chain to the ancestor row that WAS stamped at
-    // main-turn dispatch time, so nested cards + handbacks route to the
-    // originating chat/topic instead of falling back to the owner DM.
-    const originKey = resolveSubagentOriginTurnKey(turnsDb, agentId)
-    if (originKey == null) return null
-    const turn = getTurnByKey(turnsDb, originKey)
-    if (turn == null || turn.chat_id.length === 0) return null
-    const threadNum =
-      turn.thread_id != null && turn.thread_id.length > 0
-        ? Number(turn.thread_id)
-        : NaN
-    return {
-      chatId: turn.chat_id,
-      threadId: Number.isFinite(threadNum) ? threadNum : undefined,
-    }
-  } catch {
-    return null
-  }
+  // Transitive walk (jsonl stem → parent_turn_key chain → turns row) —
+  // extracted to subagent-origin-surface.ts so the resolution precedence is
+  // unit-testable against a real registry DB. Null on any miss; the callers
+  // keep their fallback ladders (now with the recent-turn floor).
+  return resolveSubagentOriginChatDb(turnsDb, agentId)
+}
+
+/**
+ * Most-recent-turn routing floor (msg-6897 misroute fix): where the operator
+ * last drove a turn. Used ONLY after origin resolution has missed — a
+ * gap-dispatched worker's card/handback lands in the topic of the newest
+ * turn instead of the owner DM with the thread stripped. Null-safe.
+ */
+function recentTurnFallbackChat(): { chatId: string; threadId?: number } | null {
+  if (turnsDb == null) return null
+  return resolveRecentTurnFallbackChat(turnsDb)
 }
 
 /**
@@ -2091,6 +2086,11 @@ function resolveWorkerFeedChat(
   const origin = resolveSubagentOriginChat(agentId)
   if (origin != null && origin.chatId.length > 0) return origin
   if (fleetChatId.length > 0) return { chatId: fleetChatId, threadId: fallbackThreadId }
+  // msg-6897 misroute fix — most-recent-turn floor BEFORE the owner DM: a
+  // worker whose origin never stamped (gap dispatch) lands in the topic the
+  // operator last drove, not the DM with the thread stripped.
+  const recent = recentTurnFallbackChat()
+  if (recent != null) return recent
   const ownerDm = loadAccess().allowFrom[0] ?? ''
   if (origin == null && fleetChatId.length === 0 && ownerDm.length > 0) {
     // Origin unresolved and no fleet chat — the card lands in the owner DM.
@@ -24335,7 +24335,12 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   // when this group's LAST worker finishes; no per-worker unpin.
                 }
 
-                const handbackOrigin = resolveSubagentOriginChat(agentId)
+                // Origin first; when it missed (gap dispatch — parent_turn_key
+                // never stamped), the most-recent-turn floor keeps the handback
+                // in the topic the operator last drove instead of the owner DM
+                // with the thread stripped (msg-6897 misroute fix).
+                const handbackOrigin =
+                  resolveSubagentOriginChat(agentId) ?? recentTurnFallbackChat()
                 const decision = decideSubagentHandback({
                   handbackEnvValue: process.env.SWITCHROOM_SUBAGENT_HANDBACK,
                   outcome,
@@ -24650,14 +24655,26 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   // chat/thread resolution `resolveWorkerFeedChat` did) is now one
                   // pure, unit-tested function; the gateway keeps only the defer-map
                   // bookkeeping, the two audit logs, and the feed.update.
+                  const wfOrigin = resolveSubagentOriginChat(agentId)
+                  // msg-6897 misroute fix: with origin unresolved AND no live
+                  // turn to stamp from, the exhausted-defer paint previously
+                  // fell to the owner DM. Feed the most-recent turn's
+                  // chat/topic through the SAME stamp-fallback slot (#3458)
+                  // so the paint lands near the work instead.
+                  const wfStamp =
+                    stampTurn != null
+                      ? { chatId: stampTurn.sessionChatId, threadId: stampTurn.sessionThreadId }
+                      : wfOrigin == null
+                        ? recentTurnFallbackChat()
+                        : null
                   const dest = decideWorkerFeedDestination({
-                    origin: resolveSubagentOriginChat(agentId),
+                    origin: wfOrigin,
                     cardExists: workerActivityFeed?.has(agentId) === true,
                     priorDeferrals: workerFeedOriginDeferrals.get(agentId) ?? 0,
                     maxDeferrals: WORKER_FEED_ORIGIN_DEFER_MAX,
                     fleetChatId,
-                    stampChatId: stampTurn?.sessionChatId,
-                    stampThreadId: stampTurn?.sessionThreadId,
+                    stampChatId: wfStamp?.chatId,
+                    stampThreadId: wfStamp?.threadId,
                     ownerDm: loadAccess().allowFrom[0] ?? '',
                   })
                   if (dest.action === 'defer') {
@@ -24710,7 +24727,10 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // the pure decision (gate 1b → 'skeleton-liveness'), which drops
                 // it deterministically (controls-in-code, unit-tested) rather
                 // than an opaque inline return here.
-                const progressOrigin = resolveSubagentOriginChat(agentId)
+                // Same origin → recent-turn floor ladder as the handback above
+                // (msg-6897 misroute fix).
+                const progressOrigin =
+                  resolveSubagentOriginChat(agentId) ?? recentTurnFallbackChat()
                 const decision = decideSubagentProgress({
                   skeleton: skeleton === true,
                   disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
