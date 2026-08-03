@@ -89,6 +89,49 @@ describe("mapBuzzEvent", () => {
     expect(inbound!.meta.buzz_thread_root).toBe(root);
   });
 
+  it("prefers the NIP-10 reply marker over positional order when the reply tag is not last", () => {
+    const parent = "parentid".padEnd(64, "1");
+    const root = "rootid".padEnd(64, "0");
+    const e = ev({
+      tags: [
+        ["h", "group-uuid"],
+        ["e", parent, "", "reply"], // reply marker in FIRST position
+        ["e", root, "", "root"], // root marker last
+      ],
+    });
+    const inbound = mapBuzzEvent(e, ctx);
+    expect(inbound!.meta.buzz_reply_to).toBe(parent);
+    expect(inbound!.meta.buzz_thread_root).toBe(root);
+    expect(inbound!.text).toContain(`buzz_reply_to="${parent}"`);
+  });
+
+  it("omits buzz_reply_to when the only marked e-tag is a mention", () => {
+    const mention = "mentionid".padEnd(64, "2");
+    const e = ev({
+      tags: [["h", "group-uuid"], ["e", mention, "", "mention"]],
+    });
+    const inbound = mapBuzzEvent(e, ctx);
+    expect(inbound!.meta.buzz_reply_to).toBeUndefined();
+    expect("buzz_reply_to" in inbound!.meta).toBe(false);
+    expect(inbound!.text).not.toContain("buzz_reply_to=");
+  });
+
+  it("resolves buzz_reply_to to the root when a trailing mention marker follows the root", () => {
+    const root = "rootid".padEnd(64, "0");
+    const mention = "quoteid".padEnd(64, "3");
+    const e = ev({
+      tags: [
+        ["h", "group-uuid"],
+        ["e", root, "", "root"],
+        ["e", mention, "", "mention"], // mention marker LAST
+      ],
+    });
+    const inbound = mapBuzzEvent(e, ctx);
+    expect(inbound!.meta.buzz_reply_to).toBe(root);
+    expect(inbound!.meta.buzz_thread_root).toBe(root);
+    expect(inbound!.text).toContain(`buzz_reply_to="${root}"`);
+  });
+
   it("sets buzz_reply_to equal to the root when only a root e-tag exists", () => {
     const root = "onlyroot".padEnd(64, "0");
     const e = ev({
