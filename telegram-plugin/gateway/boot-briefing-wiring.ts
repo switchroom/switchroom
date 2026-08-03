@@ -13,7 +13,7 @@
  * never blocks: every failure path degrades to "no briefing".
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getHistoryDbForBriefing } from '../history.js'
 import type { InboundMessage } from './ipc-protocol.js'
@@ -54,6 +54,47 @@ export function maybeQueueBootBriefing(
     const agentDir = opts.stateDir.endsWith('/telegram')
       ? opts.stateDir.slice(0, -'/telegram'.length)
       : opts.stateDir
+    // Session-generation guard (#4242). This module re-evaluates on EVERY
+    // gateway process start, including a supervisor respawn after the
+    // gateway crashes — but a respawn does NOT restart the inner Claude
+    // session, so re-queuing a boot briefing would inject a "you just
+    // rebooted" reorientation into a live, mid-conversation session. The
+    // spool's dedup can't catch it: by respawn time boot-1's briefing has
+    // been delivered AND acked, so its spool entry is already gone.
+    //
+    // start.sh's OUTER pass stamps SWITCHROOM_GATEWAY_BOOT_ID once per REAL
+    // boot, before forking the gateway; `_switchroom_supervise` respawns
+    // `bun` in a loop within that same shell, so every respawn inherits the
+    // identical id, while the next real boot re-derives a fresh one. We
+    // persist the id the first time a generation actually queues (or
+    // determines it has nothing to queue) and skip when the persisted id
+    // matches — that is a respawn. Absent env (non-docker / pre-upgrade
+    // start.sh) leaves the guard inert: legacy best-effort behaviour.
+    const bootId = opts.env.SWITCHROOM_GATEWAY_BOOT_ID
+    const genMarkerPath = join(agentDir, '.boot-briefing-generation')
+    if (bootId) {
+      let prevGen: string | null = null
+      try {
+        prevGen = readFileSync(genMarkerPath, 'utf8').trim()
+      } catch {
+        prevGen = null
+      }
+      if (prevGen === bootId) {
+        log(
+          'telegram gateway: boot-briefing suppressed (supervisor respawn — this boot generation already briefed)\n',
+        )
+        return null
+      }
+    }
+    const markGeneration = (): void => {
+      if (!bootId) return
+      try {
+        writeFileSync(genMarkerPath, `${bootId}\n`)
+      } catch {
+        // Best-effort: a failed persist only risks one redundant re-queue on
+        // respawn, which the spool still dedups; never block boot.
+      }
+    }
     // Force-fresh suppression is keyed on env, NOT on existsSync at this
     // module-eval time. start.sh's OUTER pass snapshots the
     // `.force-fresh-session` marker into SWITCHROOM_FORCE_FRESH *before*
@@ -96,6 +137,10 @@ export function maybeQueueBootBriefing(
     })
     const text = renderBootBriefing(surfaces, { nowMs, restartReason })
     if (!text) {
+      // Consume the generation even when empty: had there been nothing to
+      // brief at boot, a later respawn must not suddenly brief mid-session
+      // just because fresh messages arrived after the session came up.
+      markGeneration()
       log('telegram gateway: boot-briefing empty (no recent surfaces) — nothing queued\n')
       return null
     }
@@ -107,6 +152,7 @@ export function maybeQueueBootBriefing(
       nowMs,
     })
     opts.put(selfAgent, msg)
+    markGeneration()
     log(
       `telegram gateway: boot-briefing queued chat=${primary.chatId}` +
         `${primary.threadId != null ? ` thread=${primary.threadId}` : ''} ` +

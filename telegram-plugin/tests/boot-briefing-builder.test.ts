@@ -473,3 +473,82 @@ describe('maybeQueueBootBriefing — end-to-end wiring', () => {
     ).not.toThrow()
   })
 })
+
+describe('maybeQueueBootBriefing — session-generation guard (#4242)', () => {
+  function envGen(bootId?: string): Record<string, string | undefined> {
+    return {
+      SWITCHROOM_SESSION_BRIEFING: 'gateway',
+      SWITCHROOM_RESUME_MODE: 'handoff',
+      SWITCHROOM_AGENT_NAME: 'testagent',
+      ...(bootId != null ? { SWITCHROOM_GATEWAY_BOOT_ID: bootId } : {}),
+    }
+  }
+
+  const call = (
+    env: Record<string, string | undefined>,
+    puts: Array<{ agent: string; msg: InboundMessage }>,
+  ) =>
+    maybeQueueBootBriefing({
+      env,
+      stateDir: join(stateDir, 'telegram'),
+      resumeMsg: null,
+      put: (agent, msg) => puts.push({ agent, msg }),
+      log: () => {},
+      nowMs: NOW_MS,
+    })
+
+  it('re-mints ONCE per boot generation: a supervisor respawn (same boot id) queues nothing', () => {
+    seedUser('321', null, 30 * 60, 'the deploy is half-done')
+    const puts: Array<{ agent: string; msg: InboundMessage }> = []
+
+    // Boot-1: first gateway process of this generation briefs.
+    const first = call(envGen('gen-1'), puts)
+    expect(first).not.toBeNull()
+    expect(puts.length).toBe(1)
+    // Generation persisted for the respawn check.
+    expect(existsSync(join(stateDir, '.boot-briefing-generation'))).toBe(true)
+
+    // Respawn: same shell → same SWITCHROOM_GATEWAY_BOOT_ID. The gateway
+    // module re-evaluates, but the inner Claude session is still live from
+    // boot-1 — re-injecting a "you just rebooted" briefing would be wrong.
+    const respawn = call(envGen('gen-1'), puts)
+    expect(respawn).toBeNull()
+    expect(puts.length).toBe(1) // no second put
+  })
+
+  it('a GENUINE new boot (fresh boot id) briefs again', () => {
+    seedUser('321', null, 30 * 60, 'still pending your call')
+    const puts: Array<{ agent: string; msg: InboundMessage }> = []
+
+    expect(call(envGen('gen-1'), puts)).not.toBeNull()
+    expect(puts.length).toBe(1)
+    // Next real container boot re-derives a different id → not a respawn.
+    expect(call(envGen('gen-2'), puts)).not.toBeNull()
+    expect(puts.length).toBe(2)
+  })
+
+  it('consumes the generation even when the first boot had nothing to brief (no mid-session brief on respawn)', () => {
+    const puts: Array<{ agent: string; msg: InboundMessage }> = []
+    // Boot-1: empty history → nothing queued, but the generation is consumed.
+    expect(call(envGen('gen-1'), puts)).toBeNull()
+    expect(puts.length).toBe(0)
+    expect(existsSync(join(stateDir, '.boot-briefing-generation'))).toBe(true)
+
+    // Messages arrive AFTER the session is live, then the gateway respawns.
+    seedUser('321', null, 5 * 60, 'a message that landed mid-session')
+    const respawn = call(envGen('gen-1'), puts)
+    expect(respawn).toBeNull()
+    expect(puts.length).toBe(0) // must NOT brief into the live session
+  })
+
+  it('guard is inert when SWITCHROOM_GATEWAY_BOOT_ID is absent (non-docker / pre-upgrade start.sh keeps legacy behaviour)', () => {
+    seedUser('321', null, 30 * 60, 'legacy path message')
+    const puts: Array<{ agent: string; msg: InboundMessage }> = []
+    // With no boot id, every gateway start briefs as before — no marker
+    // written, no suppression.
+    expect(call(envGen(undefined), puts)).not.toBeNull()
+    expect(call(envGen(undefined), puts)).not.toBeNull()
+    expect(puts.length).toBe(2)
+    expect(existsSync(join(stateDir, '.boot-briefing-generation'))).toBe(false)
+  })
+})

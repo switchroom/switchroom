@@ -129,6 +129,27 @@ describe("start.sh: gateway-consumed env exported before the gateway fork", () =
     expect(startSh).toContain('rm -f "');
   });
 
+  it("hoists the SWITCHROOM_GATEWAY_BOOT_ID stamp AHEAD of the gateway fork (#4242: respawn-stable session generation)", () => {
+    const startSh = renderStartSh();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    expect(forkIdx).toBeGreaterThan(-1);
+
+    // The outer pass stamps a per-boot session-generation id BEFORE forking
+    // the gateway. _switchroom_supervise respawns the gateway `bun` in a loop
+    // within this same shell (no re-run of start.sh), so a crash-respawn
+    // inherits the identical id and the gateway skips re-minting the briefing
+    // into the still-live Claude session; a genuine new boot re-derives a
+    // fresh id. If this slid after the fork, the daemon would never see it and
+    // the guard would be inert on docker — exactly where the respawn race
+    // lives.
+    const bootIdIdx = startSh.indexOf("export SWITCHROOM_GATEWAY_BOOT_ID=");
+    expect(bootIdIdx).toBeGreaterThan(-1);
+    expect(bootIdIdx).toBeLessThan(forkIdx);
+    // The value must be derived per boot (not a fixed literal), so distinct
+    // container boots never collide on the same generation.
+    expect(startSh).toContain('export SWITCHROOM_GATEWAY_BOOT_ID="$(date +%s)-$$-${RANDOM}"');
+  });
+
   it("still re-exports the same vars in the inner pass (after the fork) for claude", () => {
     const startSh = renderStartSh();
     const forkIdx = startSh.indexOf(GATEWAY_FORK);
