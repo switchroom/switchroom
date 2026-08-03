@@ -3833,6 +3833,14 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(out).toContain("/tmp");
     expect(out).toContain("read-only file system");
     expect(out).toContain("Operator action");
+    // The fleet-wide primer's "read-only / not root / operator action"
+    // framing is factually wrong for root-tier agents (compose.ts emits
+    // `user: "0:0"` and skips read_only/cap_drop for them). The invariant
+    // file has no per-agent variant to `{{#if root}}`-gate, so the
+    // contradiction is neutralised at source with CONDITIONAL PHRASING —
+    // the house pattern (cf. the context7 opt-out in LIBRARY_DOCS_GUIDANCE).
+    expect(out).toContain("Root-tier exception");
+    expect(out).toContain("this sandbox framing does NOT describe");
   });
 
   it("renderFleetInvariants() tells agents to discover vault keys, not guess", async () => {

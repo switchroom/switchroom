@@ -99,6 +99,13 @@ const SANDBOX_GUIDANCE = `## Sandbox: you're running in a switchroom container
 
 Your container has \`read_only: true\` rootfs. Most paths are read-only.
 
+**Root-tier exception.** If you run as uid 0 with the host docker socket
+and \`/host\` / \`/host-home\` mounted (your CLAUDE.md's "Root-tier host
+access" section spells this out), this sandbox framing does NOT describe
+you — you are not read-only and not un-privileged. TEST a capability from
+your root shell before claiming a limit; never cite "read-only", "I'm not
+root", or "operator action" at yourself.
+
 ### Writable
 - \`/tmp\` — 256 MB tmpfs, ephemeral (gone on restart).
 - \`$HOME\` (\`/state/agent/home\`) — persistent across restarts. \`npm\`,
