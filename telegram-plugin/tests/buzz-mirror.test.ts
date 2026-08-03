@@ -234,6 +234,84 @@ describe('BuzzMirror.mirrorReplyDelivered — NIP-10 OUTBOUND thread continuity'
     expect(buildThreadTags({ threadRootId: msg.threadRootId, replyToEventId: msg.replyToEventId })).toEqual([])
     expect(logs.some((l) => /outbound thread MISS/.test(l))).toBe(true)
   })
+
+  it('#4299: a FOREIGN-CHANNEL antecedent mirrors FLAT (no cross-group e-tag)', () => {
+    const logs: string[] = []
+    __resetBuzzMirrorForTests()
+    const sender = vi.fn(() => true)
+    // Telegram-origin mirrors post into 'grp'; the antecedent below was mirrored
+    // into a DIFFERENT (buzz-origin) channel 'chan-A'.
+    const m = initBuzzMirror({ mode: 'both', agentName: 'klanker', defaultChannelId: 'grp', log: (l) => logs.push(l) })
+    m.attachSender(sender)
+
+    // Record '555:100' → an event published into buzz channel 'chan-A' (its
+    // channelId comes from ownerBuzzCoords, NOT defaultChannelId). This is the
+    // exact shape #4299 warns about: a parent recorded via a buzz-origin
+    // threaded reply whose channelId came from the inbound event's own h-tag.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'buzz answer',
+      ownerOriginChannel: 'buzz',
+      ownerBuzzCoords: { channelId: 'chan-A', eventId: 'evt-buzz', threadRoot: 'root-buzz' },
+      ownerEchoed: true,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:100'],
+    })
+    const buzzCall = sender.mock.calls[sender.mock.calls.length - 1][0] as OutboundToBuzzMessage
+    expect(buzzCall.channelId).toBe('chan-A')
+    m.onPublishResult({ correlationId: buzzCall.correlationId, ok: true, eventId: 'evt-buzz' })
+
+    // A later TELEGRAM-origin answer replies to '555:100'. Its target channel is
+    // 'grp' ≠ 'chan-A' — threading under evt-buzz would carry e-tags into the
+    // foreign 'chan-A' group. It MUST mirror flat instead.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'tele follow-up',
+      ownerOriginChannel: 'telegram',
+      ownerEchoed: false,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:200'],
+      antecedentTelegramMessageKey: '555:100',
+    })
+
+    const msg = sender.mock.calls[sender.mock.calls.length - 1][0] as OutboundToBuzzMessage
+    expect(msg.channelId).toBe('grp')
+    // FLAT: no thread tags at all — crucially NOT evt-buzz / root-buzz.
+    expect(msg.replyToEventId).toBeUndefined()
+    expect(msg.threadRootId).toBeUndefined()
+    expect(buildThreadTags({ threadRootId: msg.threadRootId, replyToEventId: msg.replyToEventId })).toEqual([])
+    // Logged distinctly as a cross-channel guard, NOT as an eviction MISS.
+    expect(logs.some((l) => /outbound thread CROSS-CHANNEL/.test(l))).toBe(true)
+    expect(logs.some((l) => /outbound thread MISS/.test(l))).toBe(false)
+  })
+
+  it('#4301: a quote-opt-in DEFAULT antecedent miss is NOT logged as an eviction MISS', () => {
+    const logs: string[] = []
+    __resetBuzzMirrorForTests()
+    const sender = vi.fn(() => true)
+    const m = initBuzzMirror({ mode: 'both', agentName: 'klanker', defaultChannelId: 'grp', log: (l) => logs.push(l) })
+    m.attachSender(sender)
+
+    // The antecedent is the latest INBOUND user message (quote-opt-in default),
+    // which is never in the correlation store — an EXPECTED miss, not eviction.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'answer',
+      ownerOriginChannel: 'telegram',
+      ownerEchoed: false,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:200'],
+      antecedentTelegramMessageKey: '555:100', // latest inbound, never mirrored
+      antecedentIsQuoteOptInDefault: true,
+    })
+
+    expect(sender).toHaveBeenCalledTimes(1)
+    const msg = sender.mock.calls[0][0] as OutboundToBuzzMessage
+    // Still a flat top-level post.
+    expect(msg.replyToEventId).toBeUndefined()
+    expect(msg.threadRootId).toBeUndefined()
+    // The expected default-quote miss must NOT masquerade as an eviction MISS,
+    // so a genuine eviction miss stays distinguishable in the logs.
+    expect(logs.some((l) => /outbound thread MISS/.test(l))).toBe(false)
+    expect(logs.some((l) => /default-quote/.test(l))).toBe(true)
+  })
 })
 
 describe('BuzzMirror.mirrorCorrection — debounced, only for mirrored messages', () => {

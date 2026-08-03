@@ -93,6 +93,15 @@ export interface MirrorReplyInput {
    * bound by `ownerBuzzCoords`, not a Telegram antecedent).
    */
   antecedentTelegramMessageKey?: string;
+  /**
+   * True IFF `antecedentTelegramMessageKey` is the quote-opt-in DEFAULT — i.e.
+   * the caller had no explicit/model-supplied `reply_to` and defaulted it to the
+   * latest INBOUND user message (#4301). That message is never in the
+   * correlation store, so its lookup ALWAYS misses; distinguishing it lets the
+   * mirror log the expected flat fallback quietly with a distinct reason instead
+   * of as an "outbound thread MISS", so a genuine eviction miss stays visible.
+   */
+  antecedentIsQuoteOptInDefault?: boolean;
 }
 
 export interface MirrorCorrectionInput {
@@ -236,12 +245,36 @@ class BuzzMirror {
         // the post flat rather than emitting a wrong/guessed tag.
         if (input.antecedentTelegramMessageKey) {
           const parent = this.msgToBuzz.get(input.antecedentTelegramMessageKey);
-          if (parent) {
+          if (parent && parent.channelId === channelId) {
             replyToEventId = parent.eventId; // immediate parent → NIP-10 `reply`
             // Thread root → NIP-10 `root`. Fall back to the parent's own id when
             // the parent has no recorded root (it was itself top-level, or was
             // journaled before threadRoot was tracked): then parent IS the root.
             threadRootId = parent.threadRoot ?? parent.eventId;
+          } else if (parent) {
+            // #4299 CROSS-CHANNEL GUARD: the antecedent WAS mirrored, but into a
+            // DIFFERENT Buzz channel than this event's target (e.g. it was
+            // recorded via a buzz-origin threaded reply whose channelId came from
+            // the inbound event's own `h`-tag). This event publishes into
+            // `defaultChannelId`; threading it under a foreign-channel parent
+            // would carry e-tags that point into another group. Mirror FLAT
+            // instead — same fallback as a MISS, no cross-group e-tag.
+            this.log(
+              `buzz-mirror: outbound thread CROSS-CHANNEL — antecedent ` +
+                `${input.antecedentTelegramMessageKey} was mirrored into channel ` +
+                `${parent.channelId} != target ${channelId}; mirroring flat ` +
+                `(no cross-group e-tag)`,
+            );
+          } else if (input.antecedentIsQuoteOptInDefault) {
+            // #4301: quote-opt-in defaulted `reply_to` to the latest INBOUND user
+            // message, which is never in the correlation store — so this "miss"
+            // is EXPECTED, not an eviction. Log it quietly with a distinct reason
+            // (no "MISS") so genuine eviction misses stay visible in the logs.
+            this.log(
+              `buzz-mirror: outbound thread default-quote — antecedent ` +
+                `${input.antecedentTelegramMessageKey} is the latest inbound user ` +
+                `message (never mirrored); mirroring flat (expected, not an eviction)`,
+            );
           } else {
             this.log(
               `buzz-mirror: outbound thread MISS — no Buzz correlation for ` +
