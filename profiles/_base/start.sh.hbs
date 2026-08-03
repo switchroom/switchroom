@@ -1483,7 +1483,25 @@ if [ "$_HANDOFF_STALE" = "1" ]; then
      && { [ "{{#if sessionBriefingMode}}{{{sessionBriefingMode}}}{{else}}legacy{{/if}}" != "gateway" ] || [ -f "{{agentDir}}/.gateway-briefing-unavailable" ]; } \
      && command -v handoff-briefing.sh >/dev/null 2>&1; then
     export AGENT_DIR="{{agentDir}}"
-    timeout 5 handoff-briefing.sh 2>/dev/null || true
+    # Clear any prior-boot briefing BEFORE rebuilding (#continuity). The
+    # sidecar rm below (post-injection) is skipped if a boot crashes between
+    # the rebuild and injection, leaving last boot's .handoff-briefing.md on
+    # disk. If this boot's rebuild is then killed by the outer `timeout`
+    # (SIGTERM — `timeout 10` sends SIGTERM by default, not SIGKILL) before
+    # handoff-briefing.sh's atomic write, the injection would re-serve that
+    # STALE prior-boot briefing. Deleting the target up front makes a killed
+    # rebuild yield a MISSING file (injection skips) rather than a stale one.
+    # handoff-briefing.sh recreates it via tmp+mv on success.
+    rm -f "$HANDOFF_BRIEFING_FILE" 2>/dev/null || true
+    # Outer kill budget (10s) must strictly exceed the inner Hindsight cap
+    # (3s, HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT) with margin, so the SIGTERM
+    # (`timeout 10`'s default signal) lands only on a genuinely wedged run —
+    # never mid-write of a recall that was about to return. The local SQLite
+    # (Telegram) and daily-memory reads are sub-second; Hindsight is the only
+    # network hop and is self-capped, so 10s leaves ~7s of headroom over the
+    # worst-case source.
+    export HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT="${HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT:-3}"
+    timeout 10 handoff-briefing.sh 2>/dev/null || true
   fi
 fi
 APPEND_PROMPT={{#if systemPromptAppendShellQuoted}}{{{systemPromptAppendShellQuoted}}}{{else}}""{{/if}}

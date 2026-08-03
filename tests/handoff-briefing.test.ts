@@ -554,6 +554,219 @@ describe("handoff-briefing.sh assembler", () => {
   });
 });
 
+// ── Recent-conversation chat/thread scoping ─────────────────────────────────────
+//
+// The scope resolver in bin/handoff-briefing.sh picks a SINGLE surface for the
+// "Recent conversation" section so a forum/group agent's multi-topic history.db
+// doesn't pollute reorientation with unrelated threads. These tests seed a real
+// history.db — the EXACT gateway schema (telegram-plugin/history.ts `messages`
+// table) — via python3's stdlib sqlite3 (the same engine the script reads it
+// back with, so no bun:sqlite → the suite stays in the vitest pass) and assert
+// which messages land in the output. Each asserts the OUTCOME (which texts
+// appear), so a regression in the scoping SQL would fail them.
+
+interface SeedRow {
+  chat_id: string;
+  thread_id: number | null;
+  message_id: number;
+  role: "user" | "assistant";
+  user?: string | null;
+  ts: number;
+  text: string;
+}
+
+/**
+ * Create + populate a history.db matching the gateway's `messages` schema
+ * (chat_id TEXT, thread_id INTEGER NULL, message_id INTEGER, role, user, ts,
+ * text, …) under `<stateDir>/history.db`, using python3 stdlib sqlite3. Pass
+ * an empty `rows` array to create the table with zero rows (the "empty DB but
+ * file exists" case).
+ */
+function seedHistoryDb(stateDir: string, rows: SeedRow[]): string {
+  mkdirSync(stateDir, { recursive: true });
+  const dbPath = join(stateDir, "history.db");
+  const py = `
+import sys, json, sqlite3
+db = sys.argv[1]
+rows = json.loads(sys.argv[2])
+c = sqlite3.connect(db)
+c.execute(
+    "CREATE TABLE IF NOT EXISTS messages ("
+    "chat_id TEXT NOT NULL, thread_id INTEGER, message_id INTEGER NOT NULL, "
+    "role TEXT NOT NULL, user TEXT, user_id TEXT, ts INTEGER NOT NULL, "
+    "text TEXT NOT NULL, attachment_kind TEXT, group_id INTEGER, "
+    "reply_to_message_id INTEGER, reply_to_text TEXT, "
+    "PRIMARY KEY (chat_id, thread_id, message_id))"
+)
+for r in rows:
+    c.execute(
+        "INSERT INTO messages(chat_id,thread_id,message_id,role,user,user_id,ts,text) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (r["chat_id"], r.get("thread_id"), r["message_id"], r["role"],
+         r.get("user"), None, r["ts"], r["text"]),
+    )
+c.commit()
+c.close()
+`;
+  const res = spawnSync("python3", ["-c", py, dbPath, JSON.stringify(rows)], {
+    timeout: 10_000,
+  });
+  if (res.status !== 0) {
+    throw new Error(`seedHistoryDb failed: ${res.stderr?.toString() ?? ""}`);
+  }
+  return dbPath;
+}
+
+describe("handoff-briefing.sh recent-conversation scoping", () => {
+  let tmpDir: string;
+  let stateDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "handoff-scope-"));
+    stateDir = join(tmpDir, "telegram");
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Run the assembler in --stdout mode with the given scope env, return stdout. */
+  function runBriefing(
+    scopeEnv: Record<string, string> = {},
+  ): { status: number | null; output: string } {
+    const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
+      env: {
+        ...process.env,
+        AGENT_DIR: tmpDir,
+        TELEGRAM_STATE_DIR: stateDir,
+        HINDSIGHT_API_URL: "",
+        HINDSIGHT_BANK_ID: "",
+        WORKSPACE_DIR: tmpDir,
+        ...scopeEnv,
+      },
+      timeout: 10_000,
+    });
+    return { status: result.status, output: result.stdout.toString() };
+  }
+
+  // A fixture spanning two chats and, within chatA, two numbered threads plus a
+  // NULL-thread (general/DM) row. ts values make chatB the most-recently-active
+  // surface overall, and chatA/thread5 the most recent WITHIN chatA.
+  const FIXTURE: SeedRow[] = [
+    { chat_id: "chatA", thread_id: 5, message_id: 1, role: "user", user: "alice", ts: 1000, text: "MSG-A-T5-user" },
+    { chat_id: "chatA", thread_id: 5, message_id: 2, role: "assistant", ts: 1001, text: "MSG-A-T5-bot" },
+    { chat_id: "chatA", thread_id: 9, message_id: 3, role: "user", user: "alice", ts: 900, text: "MSG-A-T9-user" },
+    { chat_id: "chatA", thread_id: null, message_id: 4, role: "user", user: "alice", ts: 950, text: "MSG-A-NULL-user" },
+    { chat_id: "chatB", thread_id: null, message_id: 5, role: "user", user: "bob", ts: 2000, text: "MSG-B-NULL-user" },
+  ];
+
+  const ALL_MARKERS = [
+    "MSG-A-T5-user",
+    "MSG-A-T5-bot",
+    "MSG-A-T9-user",
+    "MSG-A-NULL-user",
+    "MSG-B-NULL-user",
+  ];
+
+  /** Assert ONLY the expected markers appear in the recent-conversation output. */
+  function expectOnly(output: string, expected: string[]): void {
+    for (const m of expected) expect(output).toContain(m);
+    for (const m of ALL_MARKERS) {
+      if (!expected.includes(m)) expect(output).not.toContain(m);
+    }
+  }
+
+  it("env-target scoping: PENDING_CHAT_ID + numbered PENDING_THREAD_ID selects only that chat+thread", () => {
+    seedHistoryDb(stateDir, FIXTURE);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "chatA",
+      SWITCHROOM_PENDING_THREAD_ID: "5",
+    });
+    expect(status).toBe(0);
+    expect(output).toContain("Recent conversation");
+    // Only chatA/thread5 rows — never thread9, the NULL thread, or chatB.
+    expectOnly(output, ["MSG-A-T5-user", "MSG-A-T5-bot"]);
+  });
+
+  it("db-latest derivation: with no env target, the single most-recently-active (chat,thread) surface wins", () => {
+    seedHistoryDb(stateDir, FIXTURE);
+    // No SWITCHROOM_PENDING_* → python derives db-latest. chatB/NULL (ts=2000)
+    // is the most recent surface, so only its rows appear.
+    const { status, output } = runBriefing();
+    expect(status).toBe(0);
+    expectOnly(output, ["MSG-B-NULL-user"]);
+  });
+
+  it("db-latest derivation scopes to the exact thread, excluding other threads of the SAME chat", () => {
+    // Drop chatB so the most-recently-active surface is chatA/thread5 (ts=1001).
+    // db-latest must scope to thread5 only — not chatA/thread9 or chatA/NULL.
+    const noB = FIXTURE.filter((r) => r.chat_id !== "chatB");
+    seedHistoryDb(stateDir, noB);
+    const { status, output } = runBriefing();
+    expect(status).toBe(0);
+    expectOnly(output, ["MSG-A-T5-user", "MSG-A-T5-bot"]);
+  });
+
+  it("tri-state thread: PENDING_THREAD_ID='NULL' scopes to thread_id IS NULL (excludes numbered threads)", () => {
+    seedHistoryDb(stateDir, FIXTURE);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "chatA",
+      SWITCHROOM_PENDING_THREAD_ID: "NULL",
+    });
+    expect(status).toBe(0);
+    // Only the NULL-thread row of chatA — NOT the numbered-thread rows.
+    expectOnly(output, ["MSG-A-NULL-user"]);
+  });
+
+  it("tri-state thread: numbered PENDING_THREAD_ID scopes to that thread (excludes the NULL-thread rows)", () => {
+    seedHistoryDb(stateDir, FIXTURE);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "chatA",
+      SWITCHROOM_PENDING_THREAD_ID: "9",
+    });
+    expect(status).toBe(0);
+    expectOnly(output, ["MSG-A-T9-user"]);
+  });
+
+  it("empty PENDING_THREAD_ID (unknown) falls back to chat-only scope (all threads of the chat)", () => {
+    // The backward-compatible fallback: an OLD gateway (or genuinely-unknown
+    // thread) emits an empty thread var → chat-only scope pulls every thread of
+    // chatA (thread5, thread9, NULL) but never chatB.
+    seedHistoryDb(stateDir, FIXTURE);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "chatA",
+      SWITCHROOM_PENDING_THREAD_ID: "",
+    });
+    expect(status).toBe(0);
+    expectOnly(output, ["MSG-A-T5-user", "MSG-A-T5-bot", "MSG-A-T9-user", "MSG-A-NULL-user"]);
+  });
+
+  it("env-target-with-zero-rows fallback: a stale env chat absent from the DB falls back to db-latest", () => {
+    // Rotated/fresh DB: the pending-turn chat has no rows. Instead of silently
+    // emitting an empty section, the resolver falls through to db-latest
+    // (chatB/NULL, ts=2000).
+    seedHistoryDb(stateDir, FIXTURE);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "chatGONE",
+      SWITCHROOM_PENDING_THREAD_ID: "3",
+    });
+    expect(status).toBe(0);
+    expect(output).toContain("Recent conversation");
+    expectOnly(output, ["MSG-B-NULL-user"]);
+  });
+
+  it("empty DB (table exists, zero rows): no crash, no recent-conversation section, exit 0", () => {
+    seedHistoryDb(stateDir, []);
+    const { status, output } = runBriefing({
+      SWITCHROOM_PENDING_CHAT_ID: "chatA",
+      SWITCHROOM_PENDING_THREAD_ID: "5",
+    });
+    expect(status).toBe(0);
+    expect(output).not.toContain("Recent conversation");
+    expect(output.trim()).toBe("");
+  });
+});
+
 // ── Migration warning ───────────────────────────────────────────────────────────
 
 describe("reconcileAgent: migration warning for auto → handoff default change", () => {
