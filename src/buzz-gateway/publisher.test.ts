@@ -3,8 +3,10 @@ import { generateSecretKey } from "nostr-tools";
 import {
   signChunkedMessage,
   publishOutbound,
+  publishOutboundTallied,
   contentHasUnsuppressedSecret,
   validateOutboundToBuzz,
+  type MirrorTally,
   type OutboundPayload,
   type PublishTransport,
   type SignedNostrEvent,
@@ -235,5 +237,57 @@ describe("publishOutbound relay-failure handling", () => {
     expect(res.ok).toBe(true);
     const eTags = seen[0].tags.filter((t) => t[0] === "e").map((t) => t[1]);
     expect(eTags).toContain("target-evt");
+  });
+});
+
+describe("publishOutboundTallied — mirror tally counts a THROWN publish (#4305)", () => {
+  const MSG: OutboundPayload = {
+    channelId: "chan",
+    payload: { kind: "message", text: "clean answer" },
+  };
+
+  it("counts a transport-layer THROWN rejection as mirror.failed and returns ok:false", async () => {
+    // The bug: the bare call site only bumped mirror.failed on a RESOLVED
+    // {ok:false}. A transport that THROWS (a WS/socket error, a publish-timeout
+    // throw) bumped neither counter and escaped out of onOutbound. The tally
+    // must count it as failed, and the caller must still get a well-formed
+    // result to report back to the hub.
+    const throwing = vi.fn(async () => {
+      throw new Error("ws error");
+    });
+    const tally: MirrorTally = { ok: 0, failed: 0 };
+    const res = await publishOutboundTallied(
+      MSG,
+      SK,
+      throwing as unknown as PublishTransport,
+      tally,
+      1_700_000_000,
+    );
+    expect(res.ok).toBe(false);
+    expect(tally).toEqual({ ok: 0, failed: 1 });
+    // Content-free error string — no thrown message text interpolated.
+    expect(res.error).toBe("publish failed: transport threw");
+  });
+
+  it("counts a RESOLVED {ok:false} relay rejection as mirror.failed too", async () => {
+    const rejecting = vi.fn(async () => ({ ok: false as const, message: "blocked" }));
+    const tally: MirrorTally = { ok: 0, failed: 0 };
+    const res = await publishOutboundTallied(
+      MSG,
+      SK,
+      rejecting as unknown as PublishTransport,
+      tally,
+      1_700_000_000,
+    );
+    expect(res.ok).toBe(false);
+    expect(tally).toEqual({ ok: 0, failed: 1 });
+  });
+
+  it("counts a successful publish as mirror.ok", async () => {
+    const { transport } = okTransport();
+    const tally: MirrorTally = { ok: 0, failed: 0 };
+    const res = await publishOutboundTallied(MSG, SK, transport, tally, 1_700_000_000);
+    expect(res.ok).toBe(true);
+    expect(tally).toEqual({ ok: 1, failed: 0 });
   });
 });

@@ -28,10 +28,14 @@ import { createDedupStore } from "./dedup.js";
 import { makeInject } from "./ipc-peer.js";
 import { createNostrClient, type SocketFactory, type WsLike } from "./nostr-client.js";
 import { createBuzzPeerClient } from "./peer-client.js";
-import { publishOutbound, type PublishTransport } from "./publisher.js";
+import { publishOutboundTallied, type PublishTransport } from "./publisher.js";
 import { createInboundPump } from "./pump.js";
 import { createRetryQueue } from "./retry-queue.js";
-import { buzzHeartbeatStatePath, writeBuzzHeartbeat } from "./heartbeat.js";
+import {
+  buzzHeartbeatStatePath,
+  resolveStatsIntervalMs,
+  writeBuzzHeartbeat,
+} from "./heartbeat.js";
 import { createStatsReporter, summarizePipeline } from "./stats.js";
 
 function log(msg: string): void {
@@ -188,7 +192,11 @@ async function main(): Promise<void> {
     socketPath,
     agentName: config.agentName,
     onOutbound: async (req) => {
-      const result = await publishOutbound(
+      // publishOutboundTallied owns the mirror.ok/mirror.failed bookkeeping AND
+      // never throws: a transport-layer thrown rejection is counted as a
+      // mirror.failed too (#4305), so the tally is the true count of
+      // non-delivered mirrors, not just the resolved {ok:false} ones.
+      const result = await publishOutboundTallied(
         {
           channelId: req.channelId,
           replyToEventId: req.replyToEventId,
@@ -197,9 +205,8 @@ async function main(): Promise<void> {
         },
         secretKey,
         publishTransport,
+        mirror,
       );
-      if (result.ok) mirror.ok += 1;
-      else mirror.failed += 1;
       return {
         type: "buzz_publish_result",
         correlationId: req.correlationId,
@@ -218,7 +225,11 @@ async function main(): Promise<void> {
   // interval is overridable for tests/tuning (BUZZ_STATS_INTERVAL_MS).
   const bootTs = Date.now();
   const heartbeatPath = buzzHeartbeatStatePath(stateDir);
-  const statsIntervalMs = Number(process.env.BUZZ_STATS_INTERVAL_MS) || 60_000;
+  // Clamp the env-tunable beat interval so it can never outrun doctor's stale
+  // threshold (#4302): a value above the stale window would false-red every
+  // healthy sidecar. resolveStatsIntervalMs derives the cap from the same
+  // constants doctor's stale check uses.
+  const statsIntervalMs = resolveStatsIntervalMs(process.env.BUZZ_STATS_INTERVAL_MS);
   const statsReporter = createStatsReporter({
     intervalMs: statsIntervalMs,
     sample: () => ({
