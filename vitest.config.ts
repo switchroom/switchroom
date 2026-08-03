@@ -286,6 +286,9 @@ export default defineConfig({
       "**/telegram-plugin/tests/subagent-watcher-parent-turn-key.test.ts",
       // subagent-nested-dispatch.test.ts uses bun:sqlite + bun:test — run via test:bun.
       "**/telegram-plugin/tests/subagent-nested-dispatch.test.ts",
+      // worker-origin-gap-dispatch.test.ts (msg-6897 misroute regression) uses
+      // bun:sqlite + bun:test — run via test:bun.
+      "**/telegram-plugin/tests/worker-origin-gap-dispatch.test.ts",
       // nested-worker-visibility-harness.test.ts uses bun:sqlite + bun:test — run via test:bun.
       "**/telegram-plugin/tests/nested-worker-visibility-harness.test.ts",
       // subagents-bugs.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.

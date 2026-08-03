@@ -353,3 +353,29 @@ describe('decideSubagentProgress', () => {
     }
   })
 })
+
+// ─── msg-6897 misroute regression (2026-08-04): meta.chat_id is LOAD-BEARING ──
+// Same turn-registration contract as the handback builder (see
+// subagent-handback-inbound-builder.test.ts): without meta.chat_id the
+// progress turn's channel XML has no chat_id, the gateway mints no turn atom
+// (no `turns` row, no `turn-active.json`), and a worker dispatched from
+// inside the progress turn can never be attributed to its chat/topic.
+describe('buildSubagentProgressInbound — meta.chat_id turn registration (msg-6897)', () => {
+  it('carries the origin chat as meta.chat_id', () => {
+    const inbound = buildSubagentProgressInbound({
+      ctx: {
+        chatId: '-1004223464247',
+        threadId: 77,
+        subagentJsonlId: 'stem1',
+        taskDescription: 'Topic work',
+        latestSummary: 'still going',
+        elapsedMs: 6 * 60_000,
+        bucketIdx: 1,
+        progressIntervalMs: 5 * 60_000,
+      },
+      nowMs: 1_700_000_000_000,
+    })
+    expect(inbound.meta.chat_id).toBe('-1004223464247')
+    expect(inbound.meta.message_thread_id).toBe('77')
+  })
+})

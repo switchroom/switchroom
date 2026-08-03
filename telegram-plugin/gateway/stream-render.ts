@@ -64,6 +64,7 @@ import { backstopAlreadyDelivered } from '../outbox.js'
 import { journalExternalDelivery } from './outbox-sweep.js'
 import { NarrativeFlushController } from '../narrative-flush.js'
 import { recordTurnEnd, recordTurnStart } from '../registry/turns-schema.js'
+import { stampSubagentDispatchTurn } from '../registry/subagents-schema.js'
 import { retryWithThreadFallback } from '../retry-api-call.js'
 import { richMessage } from '../rich-send.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
@@ -1255,6 +1256,35 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // failure mode #116 originally tracked) emit no more tool_use
       // events, so the marker mtime stops advancing → watchdog acts.
       touchTurnActiveMarker(STATE_DIR)
+      // Dispatch-time parent_turn_key stamp from the GATEWAY's live turn
+      // context (Telegram msg 6897 misroute, 2026-08-04). The pretool hook's
+      // #2085 stamp reads the turn-active marker FILE, and the watcher's
+      // backfill needs a turns row whose window contains the dispatch — both
+      // can miss at once (marker swept, hook write lost to SQLITE_BUSY, a
+      // turn whose surface registration failed). The gateway observing this
+      // Agent/Task tool_use inside a live turn KNOWS the turn key directly:
+      // stamp it marker-free. COALESCE inside the helper — a hook-stamped
+      // value is never overwritten, so normal in-turn dispatch is unchanged.
+      if (
+        (ev.toolName === 'Agent' || ev.toolName === 'Task') &&
+        ev.toolUseId != null && ev.toolUseId.length > 0 &&
+        turn.registryKey != null && turnsDb != null
+      ) {
+        try {
+          stampSubagentDispatchTurn(turnsDb, {
+            toolUseId: ev.toolUseId,
+            parentTurnKey: turn.registryKey,
+            agentType: typeof ev.input?.subagent_type === 'string' ? ev.input.subagent_type : null,
+            description: typeof ev.input?.description === 'string' ? ev.input.description : null,
+            background: ev.input?.run_in_background === true,
+            now: Date.now(),
+          })
+        } catch (err) {
+          process.stderr.write(
+            `telegram gateway: dispatch-time parent_turn_key stamp failed toolUseId=${ev.toolUseId}: ${(err as Error).message}\n`,
+          )
+        }
+      }
       // #549 fix: a tool_use immediately following text events makes
       // those texts "preamble" — the progress card already captured
       // them as a narrative for this tool. Drop the pending answer-

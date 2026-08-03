@@ -137,6 +137,13 @@ export function buildSubagentProgressInbound(opts: {
     text,
     meta: {
       source: 'subagent_progress',
+      // Originating chat as a model-visible channel attribute — same
+      // load-bearing turn-registration role as the handback builder's
+      // meta.chat_id (see subagent-handback-inbound-builder.ts): without it
+      // the progress turn mints no turn atom (no `turns` row, no
+      // `turn-active.json`), so a worker dispatched from inside it can never
+      // be attributed to this chat/topic and its surfaces fall to the DM.
+      chat_id: opts.ctx.chatId,
       ...(opts.ctx.threadId != null ? { message_thread_id: String(opts.ctx.threadId) } : {}),
       subagent_jsonl_id: opts.ctx.subagentJsonlId,
       bucket_idx: String(opts.ctx.bucketIdx),

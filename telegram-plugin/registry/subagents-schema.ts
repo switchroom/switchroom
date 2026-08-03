@@ -784,6 +784,67 @@ export function recordNestedSubagentDispatch(
   `).run(args.parentJsonlAgentId, args.parentJsonlAgentId, args.toolUseId)
 }
 
+export interface StampSubagentDispatchTurnArgs {
+  /** tool_use id of the Agent/Task dispatch — the subagents PK the pretool
+   *  hook inserts (or will insert) the row under. */
+  toolUseId: string
+  /** The live turn's registry key (`turns.turn_key`) at dispatch time. */
+  parentTurnKey: string
+  agentType?: string | null
+  description?: string | null
+  /** `run_in_background` from the dispatch's tool_input. */
+  background: boolean
+  now: number
+}
+
+/**
+ * Stamp `parent_turn_key` on a depth-1 sub-agent row at DISPATCH time, from
+ * the gateway's own live turn context (the `tool_use` session event for an
+ * Agent/Task dispatch observed while a turn atom is open).
+ *
+ * Why this exists (Telegram msg 6897 misroute, 2026-08-04): the pretool
+ * hook's dispatch-time stamp (#2085) sources the turn key from the
+ * `turn-active.json` marker file, and the watcher's backfill
+ * (subagent-watcher.ts) sources it from a `turns` row whose
+ * [started_at, ended_at] window contains the dispatch. Both sources can be
+ * missing at once — a synthesized turn that never registered its surface, a
+ * swept/corrupted marker, a hook write lost to SQLITE_BUSY — leaving
+ * `parent_turn_key` NULL and the worker's card + handback falling back to
+ * the owner DM with the thread stripped. The gateway, however, KNOWS the
+ * live turn key when it observes the dispatch: this helper writes it
+ * directly, marker-free and window-free.
+ *
+ * Behaviour (idempotent, mirrors recordNestedSubagentDispatch):
+ *   - INSERT OR IGNORE a row keyed on the dispatch tool_use_id (harmless
+ *     no-op when the pretool hook's row already landed — the common case).
+ *   - UPDATE `parent_turn_key` only when NULL (COALESCE), so a value the
+ *     hook already stamped from the live marker is never overwritten.
+ */
+export function stampSubagentDispatchTurn(
+  db: SqliteDatabase,
+  args: StampSubagentDispatchTurnArgs,
+): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO subagents
+      (id, parent_session_id, parent_turn_key, agent_type, description,
+       background, started_at, last_activity_at, status)
+    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'running')
+  `).run(
+    args.toolUseId,
+    args.parentTurnKey,
+    args.agentType ?? null,
+    args.description ?? null,
+    args.background ? 1 : 0,
+    args.now,
+    args.now,
+  )
+  db.prepare(`
+    UPDATE subagents
+    SET parent_turn_key = COALESCE(parent_turn_key, ?)
+    WHERE id = ?
+  `).run(args.parentTurnKey, args.toolUseId)
+}
+
 /**
  * Resolve the ORIGIN turn key for a worker, walking the nested-parent chain.
  *
