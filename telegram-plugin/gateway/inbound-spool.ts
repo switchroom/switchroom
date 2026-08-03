@@ -96,6 +96,15 @@ export function spoolId(msg: InboundMessage): string {
   ) {
     return `s:resume:${msg.meta.resume_turn_key}`
   }
+  // Gateway boot briefing (session_continuity.briefing: gateway): keyed
+  // per chat, NOT per boot — the synthetic messageId is the boot's ts, so
+  // without this a multi-restart sequence would stack one briefing per
+  // boot. One live briefing per chat at a time; once delivered (acked) a
+  // later boot can mint a fresh one. Staleness is separately bounded by
+  // the entry's meta.expiresAt TTL (see liveEntries).
+  if (msg.meta?.source === 'boot_briefing') {
+    return `s:boot-briefing:${msg.chatId}`
+  }
   // Cron BOOT-REPLAY (#2793 part B): a scheduled fire that the boot
   // replay re-injects because it was missed across a restart. Keyed on
   // the minute-aligned fire it is replaying (`replay_fire_ms`) plus the

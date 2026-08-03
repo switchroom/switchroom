@@ -57,6 +57,36 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   # `claude` --continue path, not the gateway), so this needs its own hoist.
   export SWITCHROOM_BOOT_RESUME="{{#if bootResumeMode}}{{{bootResumeMode}}}{{else}}in-flight{{/if}}"
 
+  # Boot-briefing transport flag (session_continuity.briefing; default
+  # 'legacy'). When 'gateway', the gateway daemon assembles the fresh-session
+  # reorientation briefing at boot from the durable history.db and injects it
+  # as a spooled synthetic inbound (<channel source="boot_briefing">) instead
+  # of the handoff-briefing.sh --append-system-prompt path. MUST be exported
+  # here, before the gateway fork below (same env-fork landmine as
+  # SWITCHROOM_BOOT_RESUME). The gateway also needs the resume MODE to
+  # suppress the briefing when 'continue'/'auto' may replay the transcript —
+  # hoist that too (the inner-pass SWITCHROOM_RESUME_MODE assignment below
+  # renders the same template value, so the two can never disagree).
+  export SWITCHROOM_SESSION_BRIEFING="{{#if sessionBriefingMode}}{{{sessionBriefingMode}}}{{else}}legacy{{/if}}"
+  export SWITCHROOM_RESUME_MODE="{{#if resumeMode}}{{{resumeMode}}}{{else}}handoff{{/if}}"
+
+  # Force-fresh suppression signal for the gateway boot briefing. The gateway
+  # suppresses the briefing when this boot is a /reset·/new fresh start —
+  # re-feeding the just-reset conversation into the fresh session would defeat
+  # the reset. It MUST NOT rely on existsSync(.force-fresh-session) at its own
+  # module-eval time: this OUTER pass forks the gateway with `&` (below) then
+  # execs the inner tmux pass, whose CONTINUE_FLAG block `rm`s the marker (see
+  # ~line 1262). The fork and the `rm` race with no ordering, and under boot
+  # CPU contention the `rm` can win before the gateway bundle evaluates its
+  # briefing check — the marker vanishes and the reset session gets re-fed the
+  # conversation it just reset. Snapshot the marker into env HERE, before the
+  # fork, so the gateway reads a value fixed at fork time and immune to the
+  # later `rm`. The inner pass still consumes the marker for the claude
+  # --continue / session-mode logic; this only mirrors it for the fork race.
+  if [ -f "{{agentDir}}/.force-fresh-session" ]; then
+    export SWITCHROOM_FORCE_FRESH=1
+  fi
+
   # Gateway-consumed env MUST be exported HERE, before the gateway fork
   # below. The gateway daemon reads channels.telegram.* knobs (and any
   # agent env) from process.env at startup — e.g. SWITCHROOM_TG_STREAM_
@@ -1381,7 +1411,14 @@ if [ "$_HANDOFF_STALE" = "1" ]; then
   # daily memory into a compact context brief. Requires python3 (stdlib
   # sqlite3) for the Telegram history section; other sections only need
   # curl + jq (both optional — each source degrades gracefully).
-  if [ "$SWITCHROOM_RESUME_MODE" = "handoff" ] && command -v handoff-briefing.sh >/dev/null 2>&1; then
+  #
+  # SKIPPED when session_continuity.briefing='gateway': the gateway daemon
+  # then owns the reorientation briefing (built from the durable history.db
+  # and injected as a spooled <channel source="boot_briefing"> inbound), so
+  # running the shell assembler here would double-inject the same recent
+  # conversation. The Stop-hook .handoff.md path below is left untouched in
+  # this stage of the migration.
+  if [ "$SWITCHROOM_RESUME_MODE" = "handoff" ] && [ "{{#if sessionBriefingMode}}{{{sessionBriefingMode}}}{{else}}legacy{{/if}}" != "gateway" ] && command -v handoff-briefing.sh >/dev/null 2>&1; then
     export AGENT_DIR="{{agentDir}}"
     timeout 5 handoff-briefing.sh 2>/dev/null || true
   fi

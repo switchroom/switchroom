@@ -1377,6 +1377,23 @@ export const SessionContinuitySchema = z
         "can blow out the context window even with prefix caching, and " +
         "--continue replay is known-fragile at scale.",
       ),
+    briefing: z
+      .enum(["gateway", "legacy"])
+      .optional()
+      .describe(
+        "Which mechanism assembles the fresh-session reorientation briefing " +
+        "(default 'legacy'). 'legacy' keeps today's behaviour: the Stop-hook " +
+        ".handoff.md and/or bin/handoff-briefing.sh, injected via " +
+        "--append-system-prompt. 'gateway' moves it to a gateway boot-time " +
+        "builder sourced from the durable history.db (crash-independent, " +
+        "surface-scoped, token-budgeted) and injects it as a synthetic " +
+        "<channel source=\"boot_briefing\"> inbound over the durable spool — " +
+        "keeping the system-prompt prefix stable for cross-session prompt " +
+        "caching. Suppressed automatically when resume_mode is " +
+        "'continue'/'auto' (the transcript may be replayed) and on a /reset " +
+        "force-fresh boot. Threaded to the gateway as " +
+        "SWITCHROOM_SESSION_BRIEFING.",
+      ),
     boot_resume: z
       .enum(["always", "in-flight", "never"])
       .optional()

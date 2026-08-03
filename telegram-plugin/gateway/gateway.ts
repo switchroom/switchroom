@@ -962,6 +962,8 @@ import {
   buildResumeDeferredReportInbound,
   decideBootResumeKind,
 } from './resume-inbound-builder.js'
+import { maybeQueueBootBriefing } from './boot-briefing-wiring.js'
+import { writePendingTurnEnv } from './pending-turn-env.js'
 import {
   createBridgeDeadWatchdog,
   consumeBridgeDeadEscalationMarker,
@@ -2036,35 +2038,9 @@ if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqlite + writes .pen
 
   // Diagnostic env file (one-shot, sourced by start.sh) — kept for the
   // wake-audit context. The injected inbound above is the real wake signal;
-  // these vars are passive context only.
-  const pendingEnvPath = join(agentDir, '.pending-turn.env')
-  try {
-    if (pending != null) {
-      const lines = [
-        `SWITCHROOM_PENDING_TURN=true`,
-        `SWITCHROOM_PENDING_TURN_KEY=${pending.turn_key}`,
-        `SWITCHROOM_PENDING_CHAT_ID=${pending.chat_id}`,
-        pending.thread_id != null ? `SWITCHROOM_PENDING_THREAD_ID=${pending.thread_id}` : `SWITCHROOM_PENDING_THREAD_ID=`,
-        pending.last_user_msg_id != null ? `SWITCHROOM_PENDING_USER_MSG_ID=${pending.last_user_msg_id}` : `SWITCHROOM_PENDING_USER_MSG_ID=`,
-        `SWITCHROOM_PENDING_ENDED_VIA=${pending.ended_via ?? 'unknown'}`,
-        `SWITCHROOM_PENDING_STARTED_AT=${pending.started_at}`,
-        pending.interrupt_reason != null ? `SWITCHROOM_PENDING_INTERRUPT_REASON=${pending.interrupt_reason}` : `SWITCHROOM_PENDING_INTERRUPT_REASON=`,
-      ]
-      // Atomic write: tmp + rename. Without this, a crash mid-write
-      // (power loss, OOM, panic) leaves a truncated `.pending-turn.env`
-      // that start.sh `source`s — partial SWITCHROOM_PENDING_* vars
-      // or a malformed line break shell parsing inside the source.
-      const pendingEnvTmp = `${pendingEnvPath}.tmp-${process.pid}`
-      writeFileSync(pendingEnvTmp, lines.join('\n') + '\n', { mode: 0o600 })
-      renameSync(pendingEnvTmp, pendingEnvPath)
-      process.stderr.write(`telegram gateway: pending-turn env written to ${pendingEnvPath} turnKey=${pending.turn_key} endedVia=${pending.ended_via ?? 'open'}\n`)
-    } else if (existsSync(pendingEnvPath)) {
-      rmSync(pendingEnvPath, { force: true })
-      process.stderr.write(`telegram gateway: pending-turn env cleared (clean previous shutdown)\n`)
-    }
-  } catch (err) {
-    process.stderr.write(`telegram gateway: pending-turn env write failed (${(err as Error).message})\n`)
-  }
+  // these vars are passive context only. Extracted to pending-turn-env.ts
+  // (atomic tmp+rename writer; never throws).
+  writePendingTurnEnv(agentDir, pending)
 } catch (err) {
   process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)
   turnsDb = null
@@ -10197,6 +10173,22 @@ if (isGatewayMain && !STATIC && OBLIGATION_LEDGER_ENABLED) {
   setInterval(obligationSweep, OBLIGATION_SWEEP_MS).unref()
 }
 
+// Gateway boot briefing (session_continuity.briefing: gateway — default
+// legacy/off): a surface-scoped reorientation turn assembled from the durable
+// history DB and delivered as <channel source="boot_briefing"> over the spool
+// transport. Queued BEFORE the resume inbound below so a session that has
+// both reorients first, then resumes. All decision/build logic (flag,
+// --continue suppression, resume-window dedup, budget) lives in
+// boot-briefing-wiring.ts / boot-briefing-builder.ts; never throws.
+if (isGatewayMain && HISTORY_ENABLED) {
+  maybeQueueBootBriefing({
+    env: process.env,
+    stateDir: STATE_DIR,
+    resumeMsg: bootResumeInbound?.msg ?? null,
+    put: (agent, msg) =>
+      inboundSpool != null ? inboundSpool.put(agent, msg) : pendingInboundBuffer.push(agent, msg),
+  })
+}
 // Honest-restart-resume: inject the boot resume/report inbound built by the
 // registry classifier above. When the spool exists we only PUT it (the
 // boot-replay loop below pulls it into the in-memory buffer exactly once via

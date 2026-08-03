@@ -374,6 +374,21 @@ export function verifyHistoryWritable(): { ok: boolean; error?: string } {
 }
 
 /**
+ * Read-only handle for the gateway boot-briefing builder
+ * (`gateway/boot-briefing-wiring.ts`). Exposes only the `prepare(...).all`
+ * subset the builder's `BriefingDb` seam needs; returns null before
+ * `initHistory` (or when history is disabled) so the briefing degrades to
+ * empty instead of throwing. Do NOT use for writes — every write path goes
+ * through the record* functions above so redaction and validity checks
+ * cannot be bypassed.
+ */
+export function getHistoryDbForBriefing(): {
+  prepare(sql: string): { all(...params: unknown[]): unknown[] }
+} | null {
+  return db
+}
+
+/**
  * For tests — close the singleton and forget it. Production code never
  * needs this; the DB is held open for the lifetime of the process.
  */
