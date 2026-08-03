@@ -82,7 +82,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
 | `google_workspace` | deep merge | Google Drive/Docs/Sheets/Calendar integration. `google_client_id` / `google_client_secret` are install-wide (top level only); `tier` + `approvers` cascade per-agent. See § Google Workspace below. |
 | `notion_workspace` | deep merge top-level; per-agent `databases:` list REPLACES (does not concatenate) | Notion integration. Top-level `vault_key` + `databases:` map cascade via deep merge so a profile can add a DB without clobbering top-level entries. The per-agent `databases:` allowlist is **override** — an agent's list replaces the parent's, so a specialist agent inheriting a profile can narrow to fewer DBs. See § Notion Workspace below and [notion-integration.md](notion-integration.md). |
-| `channels.buzz` | override | Buzz desktop co-channel (a closed NIP-29 Nostr relay + one per-agent sidecar). **Dark by default** — omit the block or set `enabled: false` and nothing projects a live channel. See § Buzz co-channel below and [reference/jobs/use-my-team-from-the-desktop.md](../reference/jobs/use-my-team-from-the-desktop.md). |
+| `channels.buzz` | per-field merge (agent wins) | Buzz desktop co-channel (a closed NIP-29 Nostr relay + one per-agent sidecar). **Dark by default** — omit the block or set `enabled: false` and nothing projects a live channel. See § Buzz co-channel below and [reference/jobs/use-my-team-from-the-desktop.md](../reference/jobs/use-my-team-from-the-desktop.md). |
 
 ## Buzz co-channel — `channels.buzz`
 
