@@ -23,7 +23,7 @@
 #
 # sec: pinned by digest — a CUDA `:runtime` tag from nvidia is mutable.
 # Dependabot tracks bumps. (Replace the digest when bumping the tag.)
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04@sha256:2fcc4280646484290cc50dce5e65f388dd04352b07cbe89a635703bd1f9aedb6
+FROM nvidia/cuda:13.3.1-cudnn-runtime-ubuntu22.04@sha256:d613b00c36d11fc3acc8923ef5d7672d30f469c1a9049906fbd993dd2ba8155f
 
 LABEL org.opencontainers.image.title="switchroom-voice" \
       org.opencontainers.image.description="Local GPU speech sidecar (faster-whisper STT + Kokoro TTS)"
