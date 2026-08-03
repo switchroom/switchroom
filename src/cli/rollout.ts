@@ -58,6 +58,10 @@ import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveSelfInvocation } from "./self-invoke.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
+import {
+  HOSTD_TEMPLATE_LAST_CHANGED,
+  hostdTemplateRegenVerdict,
+} from "../config/hostd-template-version.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
 import {
   readAndFilter,
@@ -2445,13 +2449,35 @@ export function registerRolloutCommand(program: Command): void {
         // before spawning this child); the host-installed operator CLI
         // never is. switchroom-web was refreshed in-plan (or its failure/
         // skip already produced its own actionable warning above).
+        // #4269 — say definitively whether a hostd template regen is needed,
+        // instead of hedging "only if the release changed hostd's mounts/env".
+        // HOSTD_TEMPLATE_LAST_CHANGED records the release the template last
+        // changed shape in (kept honest by check-hostd-template-guard). The
+        // in-memory config still holds the PRE-persist pin, so it is a
+        // trustworthy "from" only when this roll brought its OWN pin
+        // (otherwise target === config pin and the from is unknown).
+        const priorPinForTemplate =
+          resolvedPin != null ? config.release?.pin : undefined;
+        const regenVerdict = hostdTemplateRegenVerdict(target, priorPinForTemplate);
+        const regenClause =
+          regenVerdict === "required"
+            ? `hostd's compose was tag-bumped by the self-bump when one ran, but ` +
+              `a template regen is REQUIRED for this roll (hostd's mounts/env ` +
+              `changed in ${HOSTD_TEMPLATE_LAST_CHANGED}): run ` +
+              `\`switchroom hostd install --tag ${target}\` host-side. `
+            : regenVerdict === "not-needed"
+              ? `hostd's compose was tag-bumped by the self-bump when one ran; NO ` +
+                `template regen is needed for this release — hostd's mounts/env ` +
+                `are unchanged since ${HOSTD_TEMPLATE_LAST_CHANGED}. `
+              : `hostd's compose was tag-bumped by the self-bump when one ran; a ` +
+                `full hostd template regen (only needed when a release changes ` +
+                `hostd's mounts/env) is \`switchroom hostd install --tag ${target}\` ` +
+                `host-side. `;
         result.warnings.push(
           `still on the PRIOR version after this roll: the host operator ` +
             `CLI (\`sudo npm i -g switchroom@${normalizeVersion(target)}\`). ` +
-            `hostd's compose was tag-bumped by the self-bump when one ran; a ` +
-            `full hostd template regen (only needed when a release changes ` +
-            `hostd's mounts/env) is \`switchroom hostd install --tag ${target}\` ` +
-            `host-side. An agent-invoked rollout cannot recreate its own hostd ` +
+            regenClause +
+            `An agent-invoked rollout cannot recreate its own hostd ` +
             `container mid-roll without killing itself.` +
             (opts.skipWeb
               ? ` --skip-web was set, so switchroom-web is ALSO still on the ` +
