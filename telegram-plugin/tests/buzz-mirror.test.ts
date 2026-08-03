@@ -11,6 +11,7 @@ import {
   CORRECTION_DEBOUNCE_MS,
 } from '../gateway/buzz-mirror.js'
 import type { OutboundToBuzzMessage } from '../gateway/ipc-protocol.js'
+import { buildThreadTags } from '../../src/buzz-gateway/transform.js'
 
 // Hub-side mirror behaviour (Phase 2b). The mirror is DOWNSTREAM of a delivered
 // Telegram copy; a publish is emitted via the attached peer sender. These tests
@@ -123,6 +124,115 @@ describe('BuzzMirror.mirrorReplyDelivered — routing + S1 owner guard', () => {
         telegramMessageKeys: ['555:4004'],
       }),
     ).not.toThrow()
+  })
+})
+
+describe('BuzzMirror.mirrorReplyDelivered — NIP-10 OUTBOUND thread continuity', () => {
+  beforeEach(() => __resetBuzzMirrorForTests())
+
+  // Helper: mirror a telegram-origin answer, complete its publish so the
+  // correlation store learns its event id, and return the published event id.
+  function mirrorTelegramAndComplete(
+    m: ReturnType<typeof mirrorWith>,
+    sender: ReturnType<typeof vi.fn>,
+    opts: { telegramKey: string; antecedentKey?: string; eventId: string },
+  ): OutboundToBuzzMessage {
+    m.mirrorReplyDelivered({
+      scrubbedText: 'answer',
+      ownerOriginChannel: 'telegram',
+      ownerEchoed: false,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: [opts.telegramKey],
+      antecedentTelegramMessageKey: opts.antecedentKey,
+    })
+    const call = sender.mock.calls[sender.mock.calls.length - 1][0] as OutboundToBuzzMessage
+    m.onPublishResult({ correlationId: call.correlationId, ok: true, eventId: opts.eventId })
+    return call
+  }
+
+  it('threads a telegram-origin reply UNDER its antecedent`s mirrored event (root === parent for a top-level antecedent)', () => {
+    const sender = vi.fn(() => true)
+    const m = mirrorWith(sender, { defaultChannelId: 'grp' })
+
+    // A1: a top-level telegram-origin answer, published as evt-A.
+    mirrorTelegramAndComplete(m, sender, { telegramKey: '555:100', eventId: 'evt-A' })
+    // A2: a telegram-origin answer that REPLIES to A1's Telegram message.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'follow-up',
+      ownerOriginChannel: 'telegram',
+      ownerEchoed: false,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:200'],
+      antecedentTelegramMessageKey: '555:100',
+    })
+
+    const msg = sender.mock.calls[sender.mock.calls.length - 1][0] as OutboundToBuzzMessage
+    // The immediate parent is A1's event; A1 was top-level so IT is the root.
+    expect(msg.replyToEventId).toBe('evt-A')
+    expect(msg.threadRootId).toBe('evt-A')
+    // NIP-10: root === parent collapses to a single reply-to-root e-tag.
+    expect(buildThreadTags({ threadRootId: msg.threadRootId, replyToEventId: msg.replyToEventId })).toEqual([
+      ['e', 'evt-A', '', 'root'],
+    ])
+  })
+
+  it('emits DISTINCT root + reply markers for a reply into a DEEPER thread', () => {
+    const sender = vi.fn(() => true)
+    const m = mirrorWith(sender, { defaultChannelId: 'grp' })
+
+    // A0 top-level → evt-root.
+    mirrorTelegramAndComplete(m, sender, { telegramKey: '555:100', eventId: 'evt-root' })
+    // A1 replies to A0 → threads under evt-root; published as evt-mid. Its
+    // recorded threadRoot must stay evt-root (NOT evt-mid).
+    mirrorTelegramAndComplete(m, sender, {
+      telegramKey: '555:200',
+      antecedentKey: '555:100',
+      eventId: 'evt-mid',
+    })
+    // A2 replies to A1 → parent is evt-mid, but the thread root is still evt-root.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'deep',
+      ownerOriginChannel: 'telegram',
+      ownerEchoed: false,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:300'],
+      antecedentTelegramMessageKey: '555:200',
+    })
+
+    const msg = sender.mock.calls[sender.mock.calls.length - 1][0] as OutboundToBuzzMessage
+    expect(msg.replyToEventId).toBe('evt-mid') // immediate parent
+    expect(msg.threadRootId).toBe('evt-root') // thread root, NOT the parent
+    expect(buildThreadTags({ threadRootId: msg.threadRootId, replyToEventId: msg.replyToEventId })).toEqual([
+      ['e', 'evt-root', '', 'root'],
+      ['e', 'evt-mid', '', 'reply'],
+    ])
+  })
+
+  it('a reply whose antecedent is a correlation-store MISS mirrors FLAT (no wrong/guessed tag)', () => {
+    const logs: string[] = []
+    __resetBuzzMirrorForTests()
+    const sender = vi.fn(() => true)
+    const m = initBuzzMirror({ mode: 'both', agentName: 'klanker', defaultChannelId: 'grp', log: (l) => logs.push(l) })
+    m.attachSender(sender)
+
+    // The antecedent key was NEVER mirrored (e.g. it is the user's own inbound
+    // message) — the lookup misses. The mirror must NOT invent a thread tag.
+    m.mirrorReplyDelivered({
+      scrubbedText: 'answer',
+      ownerOriginChannel: 'telegram',
+      ownerEchoed: false,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:200'],
+      antecedentTelegramMessageKey: '555:100', // not in the store
+    })
+
+    expect(sender).toHaveBeenCalledTimes(1)
+    const msg = sender.mock.calls[0][0] as OutboundToBuzzMessage
+    expect(msg.replyToEventId).toBeUndefined()
+    expect(msg.threadRootId).toBeUndefined()
+    // The flat fallback still PUBLISHES (top-level), just with no thread tags.
+    expect(buildThreadTags({ threadRootId: msg.threadRootId, replyToEventId: msg.replyToEventId })).toEqual([])
+    expect(logs.some((l) => /outbound thread MISS/.test(l))).toBe(true)
   })
 })
 

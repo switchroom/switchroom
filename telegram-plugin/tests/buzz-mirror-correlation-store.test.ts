@@ -70,6 +70,33 @@ describe('createCorrelationStore — durable msg→Buzz correlation (#4222)', ()
     expect(b.size()).toBe(1)
   })
 
+  it('persists + replays the NIP-10 threadRoot (outbound thread continuity)', () => {
+    const fs = makeFakeFs()
+    const a = createCorrelationStore({ journalPath: JP, fs })
+    // A mirror that threaded under a deeper parent records a root distinct from
+    // its own event id — that root must survive a restart so a later reply can
+    // emit the correct NIP-10 `root` marker.
+    a.set('555:200', { eventId: 'evt-mid', channelId: 'chan-A', threadRoot: 'evt-root' })
+    a.close()
+
+    const b = createCorrelationStore({ journalPath: JP, fs })
+    expect(b.get('555:200')).toEqual({ eventId: 'evt-mid', channelId: 'chan-A', threadRoot: 'evt-root' })
+    // The record on disk actually carries the field (not just an in-memory echo).
+    expect(fs.files.get(JP) ?? '').toContain('"threadRoot":"evt-root"')
+  })
+
+  it('a pre-threadRoot journal record replays with threadRoot undefined (backward compat)', () => {
+    const fs = makeFakeFs()
+    fs.dirs.add('/state/buzz')
+    // A record written before threadRoot existed — no threadRoot key.
+    fs.files.set(JP, JSON.stringify({ key: '555:1', eventId: 'evt-A', channelId: 'chan-A' }) + '\n')
+    const s = createCorrelationStore({ journalPath: JP, fs })
+    const v = s.get('555:1')
+    expect(v?.eventId).toBe('evt-A')
+    expect(v?.channelId).toBe('chan-A')
+    expect(v?.threadRoot).toBeUndefined()
+  })
+
   it('in-memory-only mode (no journalPath) never touches the fs but still bounds', () => {
     const fs = makeFakeFs()
     const s = createCorrelationStore({ capacity: 2, fs })

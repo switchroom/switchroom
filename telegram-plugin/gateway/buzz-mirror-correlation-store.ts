@@ -43,6 +43,18 @@ import { dirname } from "node:path";
 export interface CorrelationValue {
   eventId: string;
   channelId: string;
+  /**
+   * The NIP-10 thread ROOT of `eventId` (#4280 follow-up — outbound thread
+   * continuity). For a top-level mirror this equals `eventId` itself; for a
+   * mirror that threaded under a parent it is that parent's thread root. Lets a
+   * LATER outbound reply whose Telegram antecedent is THIS message emit a correct
+   * NIP-10 `root` marker (thread root) alongside the `reply` marker (this
+   * `eventId`, the immediate parent), instead of collapsing a deep thread to a
+   * single mislabelled root. Optional for backward compatibility: a journal
+   * record written before this field existed replays with `threadRoot`
+   * undefined, degrading to a `reply`-only tag (still valid NIP-10).
+   */
+  threadRoot?: string;
 }
 
 export interface CorrelationFsLike {
@@ -100,6 +112,7 @@ interface JournalRecord {
   key?: unknown;
   eventId?: unknown;
   channelId?: unknown;
+  threadRoot?: unknown;
 }
 
 /**
@@ -129,10 +142,22 @@ export function createCorrelationStore(
     }
   }
 
+  function encodeRecord(key: string, v: CorrelationValue): string {
+    // Omit threadRoot when absent so pre-existing (pre-threadRoot) journals round-
+    // trip byte-identically and a value that never carried a root stays compact.
+    const record: { key: string; eventId: string; channelId: string; threadRoot?: string } = {
+      key,
+      eventId: v.eventId,
+      channelId: v.channelId,
+    };
+    if (v.threadRoot) record.threadRoot = v.threadRoot;
+    return JSON.stringify(record);
+  }
+
   function serialize(): string {
     let out = "";
     for (const [key, v] of map) {
-      out += JSON.stringify({ key, eventId: v.eventId, channelId: v.channelId }) + "\n";
+      out += encodeRecord(key, v) + "\n";
     }
     return out;
   }
@@ -162,7 +187,14 @@ export function createCorrelationStore(
               parsed.channelId
             ) {
               // Replay in order — put() enforces last-write-wins + FIFO bound.
-              put(parsed.key, { eventId: parsed.eventId, channelId: parsed.channelId });
+              // threadRoot is optional (added post-#4280): accept a non-empty
+              // string, otherwise leave undefined so an older record degrades to
+              // a reply-only tag rather than corrupting the map.
+              const threadRoot =
+                typeof parsed.threadRoot === "string" && parsed.threadRoot
+                  ? parsed.threadRoot
+                  : undefined;
+              put(parsed.key, { eventId: parsed.eventId, channelId: parsed.channelId, threadRoot });
             }
           } catch {
             // Tolerate a torn final line (crash mid-write) — skip it.
@@ -227,10 +259,7 @@ export function createCorrelationStore(
       put(key, value);
       if (fd !== null && journalPath) {
         try {
-          fs.writeSync(
-            fd,
-            JSON.stringify({ key, eventId: value.eventId, channelId: value.channelId }) + "\n",
-          );
+          fs.writeSync(fd, encodeRecord(key, value) + "\n");
           fs.fsyncSync(fd);
           journalLines++;
           if (journalLines > capacity * COMPACTION_FACTOR) compactInPlace();
