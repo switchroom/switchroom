@@ -374,6 +374,10 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
             labeledToolCount: turn.labeledToolCount,
             crossTurnAnswerDelivered,
             postAnswerSubagentActivity: openFlags?.postAnswerSubagentActivity,
+            // Post-SUBSTANTIVE reopen: the tool_label handler latches this sticky
+            // on `turn` when the long-turn reopen fires, so the drain lifts lever 1
+            // and the fresh card opens BELOW the already-delivered substantive reply.
+            postAnswerMainActivity: turn.postAnswerMainActivity,
           })
         ) {
           break
