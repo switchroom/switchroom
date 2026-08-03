@@ -15,6 +15,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { GATEWAY_BOOT_BRIEFING_CAPABILITY } from './boot-briefing-capability.js'
 import { getHistoryDbForBriefing } from '../history.js'
 import type { InboundMessage } from './ipc-protocol.js'
 import {
@@ -110,7 +111,8 @@ export function maybeQueueBootBriefing(
     log(
       `telegram gateway: boot-briefing queued chat=${primary.chatId}` +
         `${primary.threadId != null ? ` thread=${primary.threadId}` : ''} ` +
-        `surfaces=${surfaces.length} chars=${text.length}\n`,
+        `surfaces=${surfaces.length} chars=${text.length} ` +
+        `cap=${GATEWAY_BOOT_BRIEFING_CAPABILITY}\n`,
     )
     return msg
   } catch (err) {

@@ -745,6 +745,7 @@ export function maybeWriteCronMcp(
 }
 import { resolveUsers, resolvePersonEntries } from "../config/users.js";
 import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
+import { GATEWAY_BOOT_BRIEFING_CAPABILITY } from "../../telegram-plugin/gateway/boot-briefing-capability.js";
 import {
   resolveAgentConfig,
   translateHooksToClaudeShape,
@@ -4361,6 +4362,11 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     // exported before the gateway fork) and the inner handoff block (which
     // skips handoff-briefing.sh when 'gateway' owns the briefing).
     sessionBriefingMode: agentConfig.session_continuity?.briefing ?? "legacy",
+    // Capability sentinel for the start.sh ↔ gateway-bundle version handshake
+    // (#4245). Templated into start.sh's outer pass, which greps the deployed
+    // gateway bundle for this literal before trusting `briefing: gateway`.
+    // Single source of truth in telegram-plugin/gateway/boot-briefing-capability.ts.
+    gatewayBriefingCapability: GATEWAY_BOOT_BRIEFING_CAPABILITY,
     // True only when the generated start.sh can actually set CONTINUE_FLAG="--continue"
     // at runtime (i.e. resume_mode is 'auto' or 'continue'). In handoff/none mode the
     // case branches for auto/continue are omitted entirely so the literal string
@@ -8001,6 +8007,9 @@ function reconcileAgentInner(
       // Boot-briefing transport flag (session_continuity.briefing; default
       // 'legacy'). Mirror of buildWorkspaceContext — reconcile must keep parity.
       sessionBriefingMode: agentConfig.session_continuity?.briefing ?? "legacy",
+      // Capability sentinel for the #4245 start.sh ↔ gateway-bundle handshake.
+      // Mirror of buildWorkspaceContext — reconcile must keep parity.
+      gatewayBriefingCapability: GATEWAY_BOOT_BRIEFING_CAPABILITY,
     };
     const beforeStartSh = existsSync(startShPath)
       ? readFileSync(startShPath, "utf-8")
