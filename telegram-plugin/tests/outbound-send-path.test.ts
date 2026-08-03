@@ -18,6 +18,7 @@ import {
   computeReplyChunks,
   resplitOversizeChunk,
   chunkText,
+  resolveMirrorAntecedentKey,
 } from '../gateway/outbound-send-path.js'
 
 /**
@@ -411,5 +412,28 @@ describe('outbound-send-path — temporal pass wiring (#3501)', () => {
     }).text
     const viaModule = normalizeTemporal(raw, TZ_MEL, NOW_THU)
     expect(viaSeam).toBe(viaModule)
+  })
+})
+
+// ── Buzz-mirror antecedent gating (#4300 / #4301) ──────────────────────────
+describe('resolveMirrorAntecedentKey — Buzz-mirror antecedent gating', () => {
+  it('#4300: replyMode "off" stamps NO antecedent → Buzz mirror stays flat', () => {
+    // With reply-mode off the Telegram copy renders no reply, so the Buzz copy
+    // must not thread either — otherwise the surfaces diverge.
+    expect(resolveMirrorAntecedentKey('555', 100, 'off')).toBeUndefined()
+  })
+
+  it('stamps the antecedent for reply-rendering modes (first / all)', () => {
+    expect(resolveMirrorAntecedentKey('555', 100, 'first')).toBe('555:100')
+    expect(resolveMirrorAntecedentKey('555', 100, 'all')).toBe('555:100')
+  })
+
+  it('#4301: a non-numeric reply_to (NaN) stamps NO antecedent (no chat:NaN key)', () => {
+    expect(resolveMirrorAntecedentKey('555', Number('not-a-number'), 'first')).toBeUndefined()
+    expect(resolveMirrorAntecedentKey('555', NaN, 'all')).toBeUndefined()
+  })
+
+  it('stamps NO antecedent when there is no reply_to', () => {
+    expect(resolveMirrorAntecedentKey('555', undefined, 'first')).toBeUndefined()
   })
 })

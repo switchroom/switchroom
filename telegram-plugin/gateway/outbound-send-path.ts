@@ -757,6 +757,30 @@ export interface VoiceOutPlan {
   ttsChunks: string[]
 }
 
+/**
+ * Resolve the Buzz-mirror NIP-10 antecedent key for an outbound answer, or
+ * `undefined` to mirror FLAT. Pure + deterministic so the gating is testable
+ * without the full send harness. Returns `${chatId}:${replyTo}` only when a
+ * genuine, renderable reply antecedent exists; `undefined` when:
+ *  - there is no antecedent (`replyTo == null`), or
+ *  - `replyTo` is not a finite number (a non-numeric model `reply_to` coerces to
+ *    `NaN`; #4301 — never build a bogus `chat:NaN` key the mirror logs as a
+ *    real miss), or
+ *  - `replyMode === 'off'` (#4300 — the Telegram copy renders NO reply, so the
+ *    Buzz mirror must stay flat too; without this the Buzz copy visibly threads
+ *    while the Telegram copy does not — a surface divergence).
+ */
+export function resolveMirrorAntecedentKey(
+  chatId: string,
+  replyTo: number | undefined,
+  replyMode: string,
+): string | undefined {
+  if (replyTo == null || !Number.isFinite(replyTo) || replyMode === 'off') {
+    return undefined
+  }
+  return `${chatId}:${replyTo}`
+}
+
 export interface SendReplyRequest {
   /** Raw `reply` tool args, exactly as the MCP dispatch received them. */
   args: Record<string, unknown>
@@ -1545,10 +1569,19 @@ export async function sendReply(
     )
   }
 
+  // #4301: track whether `reply_to` came from the quote-opt-in DEFAULT (the
+  // latest inbound user message) rather than an explicit/model-supplied value.
+  // The default antecedent is never in the Buzz correlation store, so its mirror
+  // lookup always misses — passing this flag lets the mirror log that expected
+  // flat fallback quietly instead of as an eviction "MISS".
+  let antecedentFromQuoteOptInDefault = false
   if (reply_to == null && quoteOptIn && HISTORY_ENABLED) {
     try {
       const latest = getLatestInboundMessageId(chat_id, threadId ?? null)
-      if (latest != null) reply_to = latest
+      if (latest != null) {
+        reply_to = latest
+        antecedentFromQuoteOptInDefault = true
+      }
     } catch (err) {
       process.stderr.write(`telegram gateway: quote-reply lookup failed: ${(err as Error).message}\n`)
     }
@@ -2624,7 +2657,15 @@ export async function sendReply(
         // quote-opt-in default). The mirror resolves it against the durable
         // correlation store and threads under it only on a HIT (a previously-
         // mirrored answer); a user inbound / evicted key misses → flat.
-        antecedentTelegramMessageKey: reply_to != null ? `${chat_id}:${reply_to}` : undefined,
+        //
+        // Guards:
+        //  - #4300: when `replyMode === 'off'` the Telegram copy renders NO
+        //    reply, so DON'T stamp the antecedent — keep the Buzz copy flat too
+        //    (surface parity; no threading the Buzz copy visibly threads on).
+        //  - #4301: `Number.isFinite` drops a non-numeric `reply_to` (→ `NaN`)
+        //    so it never becomes a bogus `chat:NaN` key that logs as a real miss.
+        antecedentTelegramMessageKey: resolveMirrorAntecedentKey(chat_id, reply_to, replyMode),
+        antecedentIsQuoteOptInDefault: antecedentFromQuoteOptInDefault,
       })
     }
   }
