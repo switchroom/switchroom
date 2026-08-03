@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.21.0 — Buzz goes live (Nostr identity + threaded mirror), work-conserving recall admission, boot-briefing parity
+
+### Buzz co-channel — Nostr identity, NIP-10 threading, operator audit surface
+
+Buzz moves from dark groundwork toward a usable second channel: per-agent Nostr
+identity, threaded mirroring, and an operator-visible audit surface.
+
+- **Per-agent Nostr identity (#4277):** `switchroom buzz provision|status` CLI
+  mints and inspects a per-agent identity, with a provisioning token-union,
+  status expiry, and relay-removal guidance (#4296).
+- **NIP-10 thread continuity (#4278, #4297):** reply-parent is surfaced on
+  inbound events and carried through to a threaded outbound mirror, so a Buzz
+  conversation keeps its shape.
+- **Durable msg→event correlation (#4222, #4280):** the message→event mapping
+  survives a restart, so corrections still land on the right event.
+- **Operator audit surface (#4295):** Buzz sidecar stats plus a dedicated
+  `doctor` Buzz section.
+- **Review follow-ups + tests + docs (#4289, #4290, #4299, #4300, #4301,
+  #4302, #4303, #4304, #4305, #4307, #4309):** thread-continuity and
+  audit-surface hardening, NIP-10 marker-resolution tests, config-cascade docs.
+
+### Hindsight: work-conserving recall admission (#4298)
+
+Recalls stay fast even while consolidation drains. A work-conserving
+priority admission gate lets foreground recalls jump the queue while
+background (consolidation) recalls borrow idle slots — with a guaranteed
+background floor so neither lane can starve the other. Complements the
+foreground-priority reranker pool shipped in v0.20.0; the admission layer was
+the actual bottleneck.
+
+### Gateway: boot-briefing parity + robustness (#4254, #4255, #4260, #4265, #4306)
+
+- **Hindsight + daily-memory parity for the boot briefing (#4243, #4265):** a
+  restarted session reorients from the same sources a live one would.
+- **Version-skew handshake (#4245, #4255)** and a **doctor check for the dead
+  `session_continuity.briefing:gateway` combo (#4244, #4254).**
+- **Reply-to-bot antecedent resolution (#4306):** native replies to the bot
+  resolve their antecedent from the history buffer; also fixes a
+  handoff-briefing staleness race.
+- **Access/allowlist store extracted from `gateway.ts` (#4248, #4260).**
+
+### Hostd / rollout hardening (#4268, #4272, #4275)
+
+- **Unfrozen rollout narration (#4268):** the rollout card no longer freezes
+  after the pre-canary Hindsight refresh.
+- **Template-regen residual on the Done card (#4269, #4272).**
+- **Guard doc-drift fix + fixture covers every optional knob (#4273, #4274).**
+
+### Voice (#4271)
+
+- **`lead` heteronym pinned as an explicit known gap (#4270):** a build guard
+  now covers `lead` (misaki's gold lexicon stores it as a flat string, so even
+  the POS/transformer path can't disambiguate it — closing it needs an upstream
+  lexicon fix). The correct pronunciation is pinned as an expected-failure so a
+  future misaki fix trips loudly.
+
 ## v0.20.0 — Buzz co-channel (Phases 1–2, dark), misaki heteronym TTS, boot-time briefing
 
 ### Buzz co-channel — Phases 1, 2a, 2 (dark by default) (#4208, #4209, #4217, #4224)
