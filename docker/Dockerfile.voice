@@ -21,15 +21,26 @@
 # VOICE_STT_MODEL and (optionally) checksum-verified fail-closed via
 # VOICE_STT_MODEL_SHA256. See server.py:_load_model.
 #
+# Base: nvidia/cuda 12.8.1 cudnn *runtime* on ubuntu24.04 (Python 3.12).
+# ubuntu22.04/py3.10 is EOL-track for this image line; 24.04/3.12 is the
+# maintained base. CUDA is kept on the 12.x / cuDNN 9 line deliberately —
+# BOTH GPU libs here are CUDA-12-only: ctranslate2 (via faster-whisper, STT)
+# and onnxruntime-gpu (Kokoro TTS) ship CUDA-12/cuDNN-9 wheels and do NOT
+# support CUDA 13 (which is why the CUDA-13 attempt in #4225 was wrong and
+# is closed). 12.8 keeps both on supported ground.
+#
 # sec: pinned by digest — a CUDA `:runtime` tag from nvidia is mutable.
 # Dependabot tracks bumps. (Replace the digest when bumping the tag.)
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04@sha256:2fcc4280646484290cc50dce5e65f388dd04352b07cbe89a635703bd1f9aedb6
+# Pinned to the linux/amd64 manifest digest (CI builds amd64-only); resolved
+# live via `docker manifest inspect nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9
 
 LABEL org.opencontainers.image.title="switchroom-voice" \
       org.opencontainers.image.description="Local GPU speech sidecar (faster-whisper STT + Kokoro TTS)"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     PYTHONUNBUFFERED=1 \
     VOICE_MODEL_CACHE=/models \
     HF_HOME=/models/hf
@@ -74,11 +85,21 @@ RUN apt-get update \
 # CUDAExecutionProvider (server.py builds the InferenceSession with an
 # explicit CUDA->CPU provider list + graceful fallback). onnxruntime-gpu 1.20.x
 # is built for CUDA 12.x + cuDNN 9, matching this image's
-# nvidia/cuda:12.4.1-cudnn-runtime base — no extra CUDA libs are needed
-# (STT/CTranslate2 already proves CUDA 12 + cuDNN 9 runtime are present).
+# nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 base — no extra CUDA libs are
+# needed (STT/CTranslate2 already proves CUDA 12 + cuDNN 9 runtime are present).
+# NB: keep the base on CUDA 12 / cuDNN 9 — onnxruntime-gpu (and ctranslate2 for
+# STT) have no CUDA-13 wheels, so a CUDA-13 base would silently drop TTS+STT to
+# CPU (server.py's graceful fallback hides it) or fail to load the provider.
 # Installing onnxruntime-gpu AFTER kokoro-onnx replaces the transitively-pulled
 # CPU onnxruntime with the GPU build (same import name, so kokoro-onnx picks it
 # up unchanged). Dependabot bumps all four pins.
+#
+# PEP 668: ubuntu24.04's system python3 is externally-managed, so a bare
+# `pip3 install` (and the onnxruntime uninstall/reinstall below) would abort
+# with `error: externally-managed-environment`. The container IS the
+# environment, so a global install is correct here — PIP_BREAK_SYSTEM_PACKAGES
+# (set in the ENV block above) opts in for all three pip3 calls, matching the
+# `--break-system-packages` precedent in Dockerfile.agent.
 # misaki is the POS-aware grapheme→phoneme engine that fixes English
 # heteronyms Kokoro's built-in espeak phonemizer mispronounces (espeak is not
 # part-of-speech aware): the verb "live" /lˈɪv/ vs the adjective "live"
