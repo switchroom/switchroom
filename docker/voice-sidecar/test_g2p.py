@@ -211,6 +211,30 @@ class RealMisakiHeteronymTests(unittest.TestCase):
         self.assertIn("ɹˈid", base)
         self.assertIn("ɹˈɛd", past)
 
+    def test_lead_verb_sense(self) -> None:
+        # The verb sense IS correct today — pin it so a fix attempt for the
+        # metal sense can't regress the common verb reading.
+        verb, _ = self.g2p("Lead the way.")
+        self.assertIn("lˈid", verb)
+
+    @unittest.expectedFailure
+    def test_lead_metal_vs_verb_KNOWN_GAP_4270(self) -> None:
+        """xfail (#4270): asserts the CORRECT behaviour — metal "lead" should
+        be lˈɛd — which misaki 0.9.4 cannot produce: us_gold.json has "lead"
+        as a plain string ("lˈid"), not a POS-keyed dict like live/read, so
+        Lexicon.lookup never consults the tag (a forced perfect NN tag still
+        returns lˈid; upstream main has the same entry, and the metal vs the
+        leed-nouns "took the lead"/"dog on a lead" are all NN anyway, so no
+        POS model at any cost can split them). If a misaki bump ever fixes
+        the lexicon, this becomes an UNEXPECTED SUCCESS (a test failure):
+        remove this decorator and flip the Dockerfile.voice known-gap guard
+        to a real assertion in the same PR."""
+        metal, _ = self.g2p("The pipe is made of lead.")
+        verb, _ = self.g2p("Lead the way.")
+        self.assertIn("lˈɛd", metal)
+        self.assertIn("lˈid", verb)
+        self.assertNotEqual(metal, verb)
+
 
 if __name__ == "__main__":
     unittest.main()

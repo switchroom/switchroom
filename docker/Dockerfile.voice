@@ -162,6 +162,20 @@ RUN pip3 install --no-cache-dir \
 # English path is torch-free with trf=False (torch is never installed here, so
 # an import of it would ImportError), and (b) the baked en_core_web_sm wheel
 # loads offline under spaCy. If any of that regresses, THIS build turns red.
+#
+# KNOWN GAP (#4270) — "lead" is NOT fixed, and CANNOT be fixed by misaki 0.9.4
+# (nor by enabling the trf/transformer POS pipeline): misaki's us_gold.json has
+# `"lead": "lˈid"` as a PLAIN STRING, not a POS-keyed dict like live/read, and
+# Lexicon.lookup only consults the POS tag when the entry is a dict — a forced
+# perfect tag (NN/VB/JJ/…) still returns lˈid for every sense. Upstream misaki
+# `main` has the same plain-string entry, so a version bump doesn't close it
+# either. It is also not purely POS-reducible: the metal ("made of lead",
+# lˈɛd) and the leed-nouns ("took the lead", "dog on a lead", lˈid) are BOTH
+# tagged NN, so a naive {NN: lˈɛd} override would regress common phrases —
+# closing it needs a lexicon-level word-sense fix upstream. Until then we PIN
+# the wrong-but-current behaviour below so the gap is explicit: if a misaki
+# bump ever starts emitting lˈɛd for the metal, THIS build turns red and
+# forces the guard + test_g2p.py xfail + docs to flip to a real assertion.
 RUN python3 -c "\
 from misaki import en, espeak; \
 g2p = en.G2P(trf=False, british=False, fallback=espeak.EspeakFallback(british=False)); \
@@ -171,7 +185,12 @@ rp, _ = g2p('Please read this book.'); \
 rd, _ = g2p('He read it yesterday.'); \
 assert 'lˈɪv' in lv and 'lˈIv' in la, ('live sense collapsed', lv, la); \
 assert 'ɹˈid' in rp and 'ɹˈɛd' in rd, ('read sense collapsed', rp, rd); \
-print('misaki G2P heteronym guard OK:', lv, '|', la, '|', rp, '|', rd)"
+lm, _ = g2p('The pipe is made of lead.'); \
+lw, _ = g2p('Lead the way.'); \
+assert 'lˈid' in lw, ('lead verb sense broke', lw); \
+assert 'lˈid' in lm and 'lˈɛd' not in lm, ('lead KNOWN GAP (#4270) closed? metal sense changed - flip this guard, the test_g2p.py xfail, and the docs to real assertions', lm); \
+print('misaki G2P heteronym guard OK:', lv, '|', la, '|', rp, '|', rd); \
+print('KNOWN GAP (#4270): lead metal sense still lˈid (should be lˈɛd) — misaki lexicon lacks a POS-keyed entry:', lm)"
 
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
 
