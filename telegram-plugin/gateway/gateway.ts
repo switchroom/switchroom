@@ -411,6 +411,7 @@ import {
 import { createMcpFailureHook } from './mcp-failure-hook.js'
 import { pendingUserNoticeGate } from '../pending-user-notice.js'
 import { recordOperatorEvent } from '../operator-events-history.js'
+import { emitTransportTransientEvent, flushDeferredUserNotices, type UserFailureNoticeDeps } from './user-failure-notices.js'
 import {
   parseLlmError,
   renderLlmErrorSafe,
@@ -7887,6 +7888,14 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
   // 429 metrics — defense in depth, no secret survives in ANY downstream sink.
   event = { ...event, detail: redactOutboundText(event.detail, 'operator_event') }
 
+  // transport-transient (mid-response stream abort — `server_error`/`api_error`
+  // with no HTTP status): no broadcast card, no Reauth; record + deferred user
+  // notice, burst escalates. Orchestration in user-failure-notices.ts.
+  if (kind === 'transport-transient') {
+    emitTransportTransientEvent(event, userFailureNoticeDeps())
+    return
+  }
+
   // ── 429 throttle tier (operator spec: "retry in place under 5 min, else
   // mark + failover, honest reset messaging") ────────────────────────────
   // A terminal TRANSIENT ACCOUNT-scoped 429 — kind `rate-limited` carrying
@@ -8270,20 +8279,35 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
     // liveness only THAT topic's turn end resolves it (full rationale on
     // `PendingUserNotice.key`). `undefined` (no live turn — the event is
     // agent-level, empty wire chatId) keeps the legacy agent-wide resolution.
-    const liveTurn = currentTurn
-    const noticeKey =
-      liveTurn != null ? statusKey(liveTurn.sessionChatId, liveTurn.sessionThreadId) : undefined
-    pendingUserNoticeGate.schedule({
-      chatIds: userNoticeChats,
-      text: renderUserFacingFailureNotice(),
-      agent,
-      kind,
-      atMs: Date.now(),
-      key: noticeKey,
-    })
+    const noticeDeps = userFailureNoticeDeps()
+    const noticeKey = noticeDeps.liveTurnKey()
+    noticeDeps.scheduleUserNotice({ chatIds: userNoticeChats, agent, kind, key: noticeKey, atMs: Date.now() })
     process.stderr.write(
       `telegram gateway: operator-event user-notice deferred to turn-end agent=${agent} kind=${kind} chats=${userNoticeChats.length} topic=${noticeKey ?? '-'}\n`,
     )
+  }
+}
+
+/**
+ * Live gateway deps for the plain user-failure-notice subsystem
+ * (`user-failure-notices.ts`): transport-transient handling AND the turn-end
+ * flush share this one wiring. Every side effect is a closure over live state.
+ */
+function userFailureNoticeDeps(): UserFailureNoticeDeps {
+  return {
+    now: () => Date.now(),
+    allowFrom: () => loadAccess().allowFrom,
+    liveTurnKey: () => currentTurn != null ? statusKey(currentTurn.sessionChatId, currentTurn.sessionThreadId) : undefined,
+    record: (e) => { try { recordOperatorEvent(e) } catch { /* history best-effort */ } },
+    scheduleUserNotice: (i) => pendingUserNoticeGate.schedule({ ...i, text: renderUserFacingFailureNotice() }),
+    resolveNotices: (delivered, key) => pendingUserNoticeGate.resolveTurnEnd(key, delivered),
+    send: (chat_id, text, keyboard) => {
+      const thread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: resolveAgentOutboundTopic({ kind: 'compact-watchdog' }), supergroupChatId: resolveAgentSupergroupChatId() })
+      const opts = { ...(keyboard ? { reply_markup: keyboard } : {}), ...(thread != null ? { message_thread_id: thread } : {}) }
+      // allow-raw-bot-api: user-failure-notice / transport escalation send; topic-aware opts
+      void bot.api.sendRichMessage(chat_id, richMessage(text), opts as never).catch((e) => process.stderr.write(`telegram gateway: user-failure-notice send to ${chat_id} failed: ${e}\n`))
+    },
+    log: (m) => process.stderr.write(`telegram gateway: ${m}\n`),
   }
 }
 
@@ -8292,34 +8316,10 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
  * Called from `endCurrentTurnAtomic` — the ONE funnel every turn-end path
  * passes through. `turnDeliveredReply` is `finalAnswerDelivered || replyCalled`
  * (the model explicitly replied → the turn recovered → notices are dropped by
- * the gate). Only a reply-less turn end flushes the pending notices to the
- * non-operator chats, so the user notice fires IFF the turn genuinely died.
- * `turnKey` (#3294) scopes resolution to the ending turn's topic — a concurrent
- * topic's pending notice is left for its own turn end under keyed liveness.
+ * the gate). The send loop lives in `user-failure-notices.ts`.
  */
 function flushPendingUserFailureNotices(turnDeliveredReply: boolean, turnKey: string): void {
-  const notices = pendingUserNoticeGate.resolveTurnEnd(turnKey, turnDeliveredReply)
-  if (notices.length === 0) return
-  const noticeTopic = resolveAgentOutboundTopic({ kind: 'compact-watchdog' })
-  const noticeSupergroup = resolveAgentSupergroupChatId()
-  for (const notice of notices) {
-    process.stderr.write(
-      `telegram gateway: user-notice flush (turn died reply-less) agent=${notice.agent} kind=${notice.kind} chats=${notice.chatIds.length}\n`,
-    )
-    for (const chat_id of notice.chatIds) {
-      const thread = topicForRecipient({ recipientChatId: chat_id, resolvedTopic: noticeTopic, supergroupChatId: noticeSupergroup })
-      const opts = {
-        ...(thread != null ? { message_thread_id: thread } : {}),
-      }
-      // allow-raw-bot-api: deferred user-notice flush loop; topic-aware opts
-      void bot.api.sendRichMessage(chat_id, richMessage(notice.text), opts as never)
-        .catch(e => {
-          process.stderr.write(
-            `telegram gateway: user-notice send to ${chat_id} failed agent=${notice.agent} kind=${notice.kind}: ${e}\n`,
-          )
-        })
-    }
-  }
+  flushDeferredUserNotices(turnDeliveredReply, turnKey, userFailureNoticeDeps())
 }
 
 /**

@@ -107,6 +107,42 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     expect(result!.terminal).toBe(true)
   })
 
+  it('marks an in-flight transport-transient retry NOT terminal (does not count toward escalation)', () => {
+    // A flaky request Claude Code is internally retrying (retryAttempt <
+    // maxRetries), surfaced as a bare `server_error` with no status. Pre-fix
+    // `transient` was false for transport-transient, so it was UNCONDITIONALLY
+    // terminal → a single recoverable request retried 3x could cross the ≥3
+    // escalation threshold and fire the operator "Repeated stream failures"
+    // card. It must be transient + in-flight (suppressed), counting nothing.
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      error: { type: 'server_error', message: 'Connection closed mid-response' },
+      retryAttempt: 2,
+      maxRetries: 10,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.kind).toBe('transport-transient')
+    expect(result!.transient).toBe(true)
+    // 2 < 10 — still retrying → in-flight → the caller suppresses it (not counted).
+    expect(result!.terminal).toBe(false)
+  })
+
+  it('marks an exhausted transport-transient retry terminal (counts toward escalation)', () => {
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      error: { type: 'server_error', message: 'Connection closed mid-response' },
+      retryAttempt: 10,
+      maxRetries: 10,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.kind).toBe('transport-transient')
+    expect(result!.transient).toBe(true)
+    // retries exhausted → terminal → escalates.
+    expect(result!.terminal).toBe(true)
+  })
+
   it('marks non-transient errors terminal (always escalate)', () => {
     const line = JSON.stringify({
       type: 'api_error',
@@ -154,6 +190,33 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     // The user-facing text must survive into `detail` (the model-
     // unavailable card + the text-pattern path both rely on it).
     expect(result!.detail).toContain('hit your limit')
+  })
+
+  // Regression — the transport-abort bug this PR fixes. On a mid-response stream
+  // abort Claude Code emits `isApiErrorMessage:true` with `error:"server_error"`
+  // and NO `apiErrorStatus`. Pre-fix that had no transport branch and fell
+  // through to the status fallback, FABRICATING `unknown-4xx` — a card carrying a
+  // wrong Reauth button, broadcast to every chat. It must classify
+  // transport-transient (terminal, non-transient) instead.
+  it('classifies the verbatim server_error mid-stream abort as transport-transient (not unknown-4xx)', () => {
+    // The exact on-disk shape: isApiErrorMessage, error "server_error", NO status.
+    const line = JSON.stringify({
+      type: 'assistant',
+      message: {
+        role: 'assistant',
+        model: '<synthetic>',
+        content: [{ type: 'text', text: 'API Error: Connection closed mid-response' }],
+      },
+      error: 'server_error',
+      isApiErrorMessage: true,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result).not.toBeNull()
+    expect(result!.kind).toBe('transport-transient')
+    expect(result!.kind).not.toBe('unknown-4xx')
+    // Claude writes this shape only after its own retries are exhausted → terminal.
+    expect(result!.terminal).toBe(true)
+    expect(result!.transient).toBe(false)
   })
 
   // Regression — the carrie incident (2026-07-12). Anthropic also emits a

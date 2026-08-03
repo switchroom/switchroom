@@ -119,18 +119,6 @@
       "_source": "Bare 403 with no recognised type",
       "status": 403,
       "message": "Forbidden"
-    },
-    {
-      "_source": "null input — always unknown-4xx",
-      "_value": null
-    },
-    {
-      "_source": "Completely empty object",
-      "_value": {}
-    },
-    {
-      "_source": "Non-object string",
-      "_value": "something went wrong"
     }
   ],
   "unknown-5xx": [
@@ -146,6 +134,18 @@
         "type": "service_unavailable",
         "message": "Service temporarily unavailable"
       }
+    },
+    {
+      "_source": "null input — no status, neutral 5xx default (never a fabricated 4xx)",
+      "_value": null
+    },
+    {
+      "_source": "Completely empty object — no status → unknown-5xx",
+      "_value": {}
+    },
+    {
+      "_source": "Non-object string — no status → unknown-5xx",
+      "_value": "something went wrong"
     }
   ]
 }

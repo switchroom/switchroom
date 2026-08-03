@@ -1075,7 +1075,13 @@ export function detectErrorInTranscriptLine(
   // with no retry state is ambiguous → treat as in-flight and suppress
   // (the silence-poke covers a genuinely stuck turn; a false card is
   // the bug we are fixing, a missed ambiguous card costs nothing).
-  const transient = kind === 'rate-limited'
+  // `transport-transient` joins the transient family so Claude's retry
+  // annotations gate `terminal`: a mid-response abort Claude is still retrying
+  // (retryAttempt < maxRetries) is in-flight, not terminal, and must NOT count
+  // toward the operator escalation counter (which is bounded to ≥3 TERMINAL
+  // events). The primary bug shape (`isApiErrorMessage`) returns earlier with
+  // terminal:true by construction, so it is unaffected by this.
+  const transient = kind === 'rate-limited' || kind === 'transport-transient'
   const retry = extractRetryState(obj)
   const terminal = !transient
     ? true

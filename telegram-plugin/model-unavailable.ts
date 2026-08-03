@@ -474,6 +474,10 @@ export function detectModelUnavailable(
     'socket hang up',
     'request timed out',
     'connection refused',
+    // Mid-response stream aborts reaching Anthropic surface these markers
+    // (a transport failure, not an account/quota fault) — treat as network.
+    'connection closed',
+    'mid-response',
     'getaddrinfo',
   ]
   if (networkSignals.some(s => lower.includes(s))) {
