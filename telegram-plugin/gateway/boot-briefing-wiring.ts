@@ -54,10 +54,22 @@ export function maybeQueueBootBriefing(
     const agentDir = opts.stateDir.endsWith('/telegram')
       ? opts.stateDir.slice(0, -'/telegram'.length)
       : opts.stateDir
+    // Force-fresh suppression is keyed on env, NOT on existsSync at this
+    // module-eval time. start.sh's OUTER pass snapshots the
+    // `.force-fresh-session` marker into SWITCHROOM_FORCE_FRESH *before*
+    // forking this gateway, so the value is fixed at fork time and immune to
+    // the inner tmux pass's later `rm` of the marker (the two race with no
+    // ordering — the old existsSync could lose that race and resurrect the
+    // briefing on a /reset boot). The existsSync is retained only as a
+    // fallback for runtimes where start.sh doesn't hoist the env (non-docker),
+    // where there is no such fork race.
+    const forceFresh =
+      opts.env.SWITCHROOM_FORCE_FRESH === '1' ||
+      existsSync(join(agentDir, '.force-fresh-session'))
     const decision = decideBootBriefing({
       briefingMode: opts.env.SWITCHROOM_SESSION_BRIEFING,
       resumeMode: opts.env.SWITCHROOM_RESUME_MODE,
-      forceFreshMarker: existsSync(join(agentDir, '.force-fresh-session')),
+      forceFreshMarker: forceFresh,
     })
     if (!decision.build) {
       if (decision.reason !== 'flag-legacy') {

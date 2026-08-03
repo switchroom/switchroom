@@ -419,6 +419,44 @@ describe('maybeQueueBootBriefing — end-to-end wiring', () => {
     expect(queued).toBeNull()
   })
 
+  it('suppresses on SWITCHROOM_FORCE_FRESH=1 even when NO marker file exists (env-keyed, race-proof)', () => {
+    // The M1 fix: the decision keys on the env snapshot start.sh takes
+    // BEFORE forking the gateway, not on fs state at gateway check time. So
+    // the /reset boot is suppressed even after the inner pass has already
+    // `rm`ed the marker — the exact race the old existsSync check lost.
+    seedUser('321', null, 30 * 60, 'recent message')
+    expect(existsSync(join(stateDir, '.force-fresh-session'))).toBe(false)
+    const queued = maybeQueueBootBriefing({
+      env: { ...envFor('gateway'), SWITCHROOM_FORCE_FRESH: '1' },
+      stateDir: join(stateDir, 'telegram'),
+      resumeMsg: null,
+      put: () => {
+        throw new Error('must not be called')
+      },
+      log: () => {},
+      nowMs: NOW_MS,
+    })
+    expect(queued).toBeNull()
+  })
+
+  it('suppresses on SWITCHROOM_FORCE_FRESH=1 regardless of whether the marker is present', () => {
+    // Outcome does not depend on fs state at check time: with the env set,
+    // the briefing is suppressed whether or not the marker file is on disk.
+    seedUser('321', null, 30 * 60, 'recent message')
+    writeFileSync(join(stateDir, '.force-fresh-session'), '')
+    const queued = maybeQueueBootBriefing({
+      env: { ...envFor('gateway'), SWITCHROOM_FORCE_FRESH: '1' },
+      stateDir: join(stateDir, 'telegram'),
+      resumeMsg: null,
+      put: () => {
+        throw new Error('must not be called')
+      },
+      log: () => {},
+      nowMs: NOW_MS,
+    })
+    expect(queued).toBeNull()
+  })
+
   it('never throws even when put itself throws', () => {
     seedUser('321', null, 30 * 60, 'recent message')
     expect(() =>
