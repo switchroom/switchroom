@@ -116,7 +116,7 @@ name**; the sidecar broker-fetches the secret in-process at boot.
 | `channels.buzz.authorized_pubkeys` | override | no (default `[]`) | Additional pubkeys (`npub` or hex) whose signed events may become turns. Effective allowlist = this ∪ `{operator_pubkey}`. Empty by default (operator-only). Projects `BUZZ_AUTHORIZED_PUBKEYS` (comma-joined) when non-empty. |
 | `channels.buzz.pubkey_names` | override | no (default `{}`) | Optional petnames: hex/`npub` pubkey → display name, used to label the sender on injected turns. Projects `BUZZ_PUBKEY_NAMES` (comma-joined `key=value`) when non-empty. |
 | `channels.buzz.channel_map` | override | no (default `{}`) | Optional map of extra group UUIDs → friendly labels. Not projected to env today. |
-| `channels.buzz.pinned_relay_digest` | override | no | **Reserved — not yet consumed.** Intended pinned relay image digest (M4); nothing projects or reads it today. Kept in the schema so the digest-pin can be wired later without a config-shape change. |
+| `channels.buzz.pinned_relay_digest` | override | no | **Reserved — no consumer.** Intended pinned relay image digest (M4); the existing compat-check (`compat-check.ts`) validates only the wire contract and never reads this field. Kept in the schema so the digest-pin can be wired later without a config-shape change. |
 
 ## Permission mode & auto-accept
 
