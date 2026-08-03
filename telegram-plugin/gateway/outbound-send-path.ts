@@ -2619,6 +2619,12 @@ export async function sendReply(
         ownerEchoed,
         hasRecentDifferentOriginTurn,
         telegramMessageKeys: sentIds.map((id) => `${chat_id}:${id}`),
+        // NIP-10 outbound thread continuity: the Telegram message THIS answer
+        // replied to (its finalized `reply_to`, whether model-supplied or the
+        // quote-opt-in default). The mirror resolves it against the durable
+        // correlation store and threads under it only on a HIT (a previously-
+        // mirrored answer); a user inbound / evicted key misses → flat.
+        antecedentTelegramMessageKey: reply_to != null ? `${chat_id}:${reply_to}` : undefined,
       })
     }
   }

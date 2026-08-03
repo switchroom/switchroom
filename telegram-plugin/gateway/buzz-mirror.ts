@@ -81,6 +81,18 @@ export interface MirrorReplyInput {
    * the published Buzz event to correct.
    */
   telegramMessageKeys: string[];
+  /**
+   * `${chatId}:${messageId}` of the Telegram message this outbound answer is
+   * itself a reply to (its Telegram `reply_to` antecedent), when it has one.
+   * Used ONLY on the telegram-origin path to thread the mirrored Buzz event
+   * under the antecedent's previously-published Buzz event (NIP-10 outbound
+   * continuity). When the antecedent was never mirrored (e.g. it is a user's
+   * inbound message, or it aged past the correlation bound) the lookup misses
+   * and the mirror stays a flat top-level post — no wrong/guessed tag. Absent
+   * for a non-reply answer. Ignored on the buzz-origin path (that thread is
+   * bound by `ownerBuzzCoords`, not a Telegram antecedent).
+   */
+  antecedentTelegramMessageKey?: string;
 }
 
 export interface MirrorCorrectionInput {
@@ -99,6 +111,14 @@ const MAX_TRACKED = 4096;
 interface PendingPublish {
   channelId: string;
   telegramMessageKeys: string[];
+  /**
+   * The NIP-10 thread root this in-flight event belongs to, when it threaded
+   * under a parent. Undefined for a fresh top-level post — in which case the
+   * event's OWN id (learned in `onPublishResult`) becomes the thread root. Stored
+   * so the correlation record carries the root a LATER reply's `root` marker
+   * needs.
+   */
+  threadRootId?: string;
 }
 
 class BuzzMirror {
@@ -199,10 +219,37 @@ class BuzzMirror {
         replyToEventId = input.ownerBuzzCoords.eventId;
         threadRootId = input.ownerBuzzCoords.threadRoot;
       } else {
-        // TELEGRAM-origin → fresh top-level post to the configured channel. Not
-        // an owner-bound thread, so the S1 guard does not apply (design §3.3).
+        // TELEGRAM-origin → post to the configured channel. Not an owner-bound
+        // thread, so the S1 guard does not apply (design §3.3).
         if (!this.cfg.defaultChannelId) return; // no channel to post into
         channelId = this.cfg.defaultChannelId;
+
+        // NIP-10 OUTBOUND thread continuity: if this answer is itself a reply to
+        // a Telegram message that was ALREADY mirrored to Buzz, thread the new
+        // event under that antecedent's published event — a `reply` marker for
+        // the immediate parent and a `root` marker for the thread root — so a
+        // Telegram-origin reply chain renders threaded on the Buzz desktop
+        // instead of flat. The antecedent→event resolution reuses the SAME
+        // durable msg→event correlation store (#4280) the correction path uses;
+        // no new lookup surface. A MISS (antecedent never mirrored — e.g. it is
+        // the user's own inbound message — or evicted past MAX_TRACKED) leaves
+        // the post flat rather than emitting a wrong/guessed tag.
+        if (input.antecedentTelegramMessageKey) {
+          const parent = this.msgToBuzz.get(input.antecedentTelegramMessageKey);
+          if (parent) {
+            replyToEventId = parent.eventId; // immediate parent → NIP-10 `reply`
+            // Thread root → NIP-10 `root`. Fall back to the parent's own id when
+            // the parent has no recorded root (it was itself top-level, or was
+            // journaled before threadRoot was tracked): then parent IS the root.
+            threadRootId = parent.threadRoot ?? parent.eventId;
+          } else {
+            this.log(
+              `buzz-mirror: outbound thread MISS — no Buzz correlation for ` +
+                `Telegram antecedent ${input.antecedentTelegramMessageKey}; ` +
+                `mirroring flat (never mirrored, or evicted past the bound)`,
+            );
+          }
+        }
       }
 
       this.publish(
@@ -295,10 +342,16 @@ class BuzzMirror {
       return;
     }
     // Record the published event against each Telegram message it mirrored, so
-    // a later edit_message on any of them can target it for a correction. The
-    // store persists (durable journal) + enforces the MAX_TRACKED FIFO bound.
+    // a later edit_message on any of them can target it for a correction AND a
+    // later reply whose antecedent is one of these messages can thread under it.
+    // The store persists (durable journal) + enforces the MAX_TRACKED FIFO bound.
+    //
+    // threadRoot: the root this event belongs to. If it threaded under a parent
+    // (`p.threadRootId` set) that parent's root IS this event's root; otherwise
+    // this is a fresh top-level post and its OWN id is the thread root.
+    const threadRoot = p.threadRootId ?? msg.eventId;
     for (const key of p.telegramMessageKeys) {
-      this.msgToBuzz.set(key, { eventId: msg.eventId, channelId: p.channelId });
+      this.msgToBuzz.set(key, { eventId: msg.eventId, channelId: p.channelId, threadRoot });
     }
   }
 
@@ -325,6 +378,7 @@ class BuzzMirror {
     this.pending.set(correlationId, {
       channelId: fields.channelId,
       telegramMessageKeys,
+      threadRootId: fields.threadRootId,
     });
     this.pendingOrder.push(correlationId);
     this.evict(this.pending, this.pendingOrder);
