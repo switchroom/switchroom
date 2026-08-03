@@ -2972,7 +2972,13 @@ export const HindsightConfigSchema = z.object({
       "between consolidation-triggered refreshes of one mental model; unset " +
       "means the image's baked 3600, 0 restores upstream's " +
       "refresh-every-round behaviour; explicit and cron-scheduled refreshes " +
-      "are never debounced), plus the " +
+      "are never debounced; and " +
+      "HINDSIGHT_API_TEMPORAL_LANGUAGES — the language set dateparser is " +
+      "restricted to during temporal query analysis, made live by switchroom's " +
+      "temporal-language image patch (which ended a 200+-locale auto-detection " +
+      "pass that blocked the shared asyncio loop on every recall); " +
+      "comma-separated, unset means the image's baked `en`, set e.g. `en,es` to " +
+      "restore i18n parsing), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
