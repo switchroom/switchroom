@@ -669,6 +669,20 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /"        return self\._background_active < self\._background_reservation\\n"/,
     );
+    // The floor-first grant pass in _wake — without it the floor clause above
+    // is dead code under contention (an ungranted foreground waiter implies
+    // active == total at all times, so a foreground-first pass re-takes every
+    // freed slot and background starves to zero under sustained foreground
+    // pressure). Pinned as code AND as a build assert.
+    expect(dockerfile).toMatch(
+      /"            if self\._background_active >= self\._background_reservation:\\n"/,
+    );
+    expect(dockerfile).toMatch(
+      /the floor-first grant pass is /,
+    );
+    expect(dockerfile).toMatch(
+      /the floor clause alone is unreachable under contention/,
+    );
     // Cancellation safety, asyncio.Semaphore style: a waiter granted and
     // cancelled in the same tick hands its slot back, a departing foreground
     // waiter re-runs the grant pass so background borrowing cannot stay

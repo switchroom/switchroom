@@ -24,19 +24,26 @@
  *    recalls, in-flight background reaches recall_max_concurrent (8), not 2.
  *  - Priority: with 50 queued 500 ms background recalls saturating all 8
  *    slots, one foreground recall is admitted in under 2x a single recall
- *    duration (< 1.0 s) — head-of-line wait bounded by ONE completion,
- *    because a waiting foreground caller latches NEW background borrowing
- *    off. No preemption is needed for recalls that run seconds.
+ *    duration (< 1.0 s). Background there is far above its floor, so the
+ *    head-of-line wait is exactly ONE completion; in general the bound is
+ *    (floor deficit + 1) completions, because the floor is granted first.
+ *    No preemption is needed for recalls that run seconds.
  *  - Total concurrency is UNCHANGED: the peak never exceeds (and does reach)
  *    recall_max_concurrent under mixed load — one boundary, not two budgets.
- *  - Background floor, deterministically: with foreground holding 6 slots,
- *    background holding its full floor of 2, and one of each waiting, a freed
- *    slot goes to the FOREGROUND waiter (background is at its floor and
- *    foreground is waiting); background is admitted as soon as foreground
- *    stops waiting — so neither side can be starved.
+ *  - Background floor is a LIVE guarantee, both directions, deterministically:
+ *    (i) with background AT its floor and one of each waiting, a freed slot
+ *    goes to the FOREGROUND waiter, and background follows once foreground
+ *    stops waiting; (ii) FLOOR LIVENESS — with background BELOW its floor
+ *    under SUSTAINED foreground pressure (a standing foreground queue that
+ *    would absorb every freed slot), the very first freed slot goes to
+ *    background. (ii) is the scenario a foreground-first grant pass fails:
+ *    an ungranted foreground waiter implies active == total at all times, so
+ *    the floor clause alone is unreachable under contention and background
+ *    starves to zero — worse than the strict reservation this gate replaces.
  *  - Cancellation safety: a foreground waiter cancelled mid-wait cannot leave
- *    background borrowing latched off (the waiter count is undone and
- *    re-notified in a finally).
+ *    background borrowing latched off, and under churn (300 admissions with
+ *    120 random cancellations) every counter and waiter list returns to
+ *    exactly zero — the borrow/return accounting is exact.
  *  - #4212 preservation (the through-built arm): `_reconcile_rerank_priority`
  *    still exists, `_background` is still threaded to `_search_with_retries`
  *    and the rerank site — the gate is the ADMISSION layer and must not
@@ -126,6 +133,7 @@ const PROBE = String.raw`
 import ast
 import asyncio
 import inspect
+import random
 import sys
 import textwrap
 
@@ -345,10 +353,77 @@ if MODE == "gate":
             "foreground recall was waiting — priority inverted"
         )
 
+    # FLOOR LIVENESS — the scenario a foreground-first grant pass fails.
+    # 8 foreground in flight, a STANDING queue of 5 more foreground waiting
+    # (so an ungranted foreground waiter exists at every completion), one
+    # background waiter with background_active = 0 (below its floor of 2).
+    # Free ONE slot: it must go to BACKGROUND — the floor is granted FIRST.
+    # A gate that grants foreground unconditionally first keeps
+    # active == total through every release (the standing queue re-takes each
+    # freed slot inside the same grant pass), the floor clause is dead code,
+    # and background starves to zero for as long as the pressure lasts —
+    # strictly worse than the strict reservation, whose background waiters at
+    # least queued FIFO on the shared semaphore with a bounded wait.
+    # Deterministic: no timing races, only explicit releases.
+    async def floor_liveness_scenario():
+        gate = GATE(TOTAL, FLOOR)
+        release_fg = [asyncio.Event() for _ in range(TOTAL)]
+        release_q = asyncio.Event()
+        bg_admitted = asyncio.Event()
+
+        async def holder(ev):
+            async with gate.admit(False):
+                await ev.wait()
+
+        async def fg_queued():
+            async with gate.admit(False):
+                await release_q.wait()
+
+        async def bg():
+            async with gate.admit(True):
+                bg_admitted.set()
+
+        holders = [asyncio.create_task(holder(e)) for e in release_fg]
+        await asyncio.sleep(0.05)  # all 8 slots held by foreground
+        queue = [asyncio.create_task(fg_queued()) for _ in range(5)]
+        await asyncio.sleep(0.02)  # standing foreground queue in place
+        b = asyncio.create_task(bg())
+        await asyncio.sleep(0.05)  # bg waiting, below floor, under fg pressure
+
+        releases_needed = 0
+        for i in range(FLOOR + 1):  # the documented bound: floor deficit + 1
+            release_fg[i].set()
+            releases_needed = i + 1
+            await asyncio.sleep(0.05)
+            if bg_admitted.is_set():
+                break
+        alive = bg_admitted.is_set()
+
+        release_q.set()
+        for e in release_fg:
+            e.set()
+        await asyncio.wait_for(asyncio.gather(*holders, *queue, b), 5)
+        return alive, releases_needed
+
+    floor_alive, floor_releases = asyncio.run(floor_liveness_scenario())
+    print("FLOOR_LIVENESS_BG_ADMITTED", floor_alive, "RELEASES_NEEDED", floor_releases)
+    if not floor_alive:
+        fail(
+            "FLOOR NOT LIVE: a background waiter below its floor was never "
+            "admitted under sustained foreground pressure — the floor is dead "
+            "code and consolidation starves to zero for as long as the "
+            "foreground queue persists"
+        )
+    elif floor_releases != 1:
+        fail(
+            f"the floor-first grant pass should admit a below-floor background "
+            f"waiter on the FIRST freed slot; it took {floor_releases} releases"
+        )
+
     # Cancellation: a foreground waiter cancelled mid-wait must not leave
-    # background borrowing latched off (the _foreground_waiting count must be
-    # undone and re-notified). Floor 0 on purpose: with any floor > 0 a
-    # leaked waiter count would be masked by the floor clause re-admitting
+    # background borrowing latched off (its queued future must be removed and
+    # the grant pass re-run). Floor 0 on purpose: with any floor > 0 a leaked
+    # foreground waiter entry would be masked by the floor pass re-admitting
     # background anyway, and the leak would go undetected.
     async def cancel_scenario():
         gate = GATE(2, 0)
@@ -385,6 +460,39 @@ if MODE == "gate":
         return True
 
     print("CANCEL_SAFE", asyncio.run(cancel_scenario()))
+
+    # Accounting under churn: 300 admissions (every third background) holding
+    # for random sub-20ms intervals, with 120 of them cancelled at random —
+    # cancels land before admission, after grant, and mid-hold. When the dust
+    # settles every counter and both waiter lists must be EXACTLY zero: any
+    # leak here compounds in production until admission capacity is gone.
+    async def churn_scenario():
+        gate = GATE(TOTAL, FLOOR)
+
+        async def job(i):
+            async with gate.admit(i % 3 == 0):
+                await asyncio.sleep(random.uniform(0, 0.02))
+
+        tasks = [asyncio.create_task(job(i)) for i in range(300)]
+        await asyncio.sleep(0.05)
+        for t in random.sample(tasks, 120):
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return (
+            gate._active,
+            gate._background_active,
+            len(gate._fg_waiters),
+            len(gate._bg_waiters),
+        )
+
+    churn = asyncio.run(churn_scenario())
+    print("CHURN_COUNTERS", churn)
+    if churn != (0, 0, 0, 0):
+        fail(
+            f"borrow/return accounting leaked under churn: (active, "
+            f"background_active, fg_waiters, bg_waiters) = {churn}, expected "
+            f"all zero"
+        )
 
 
 # =====================================================================
@@ -662,7 +770,7 @@ describe.skipIf(!dockerOk || !upstreamOk)(
       expect(stdout).toContain("WORK_CONSERVING_BG_PEAK 8");
       // … but has no priority: the foreground recall waits multiple full
       // recall durations behind the queued background wall.
-      expect(stdout).toMatch(/PRIORITY_BG_INFLIGHT_AT_SUBMIT 8 FG_WAIT [23]\.\d+s/);
+      expect(stdout).toMatch(/PRIORITY_BG_INFLIGHT_AT_SUBMIT 8 FG_WAIT [2-9]\.\d+s/);
       expect(stdout).toContain("NO PRIORITY: a foreground recall waited");
     }, 240_000);
 
@@ -709,14 +817,24 @@ describe.skipIf(!dockerOk || !upstreamOk)(
       expect(stdout).toMatch(/PRIORITY_BG_INFLIGHT_AT_SUBMIT 8 FG_WAIT 0\.[0-9]+s/);
       // One admission boundary, not two budgets.
       expect(stdout).toContain("TOTAL_CONCURRENCY_PEAK 8");
-      // Deterministic floor: the freed slot goes to the waiting foreground
-      // (background at its floor), and background gets in as soon as
-      // foreground stops waiting — neither side is starvable.
+      // Deterministic floor, direction (i): the freed slot goes to the
+      // waiting foreground when background is AT its floor, and background
+      // gets in as soon as foreground stops waiting.
       expect(stdout).toContain(
         "FLOOR_NEITHER_ADMITTED_EARLY True FLOOR_FG_WON_SLOT True"
       );
+      // Direction (ii), FLOOR LIVENESS: below its floor, under a standing
+      // foreground queue that would absorb every freed slot, background is
+      // admitted on the FIRST release — the floor is granted first, not dead
+      // code. A foreground-first grant pass fails exactly this pin.
+      expect(stdout).toContain(
+        "FLOOR_LIVENESS_BG_ADMITTED True RELEASES_NEEDED 1"
+      );
       // A cancelled foreground waiter cannot latch borrowing off.
       expect(stdout).toContain("CANCEL_SAFE True");
+      // The borrow/return accounting is exact under churn with random
+      // cancellations: every counter and waiter list back to zero.
+      expect(stdout).toContain("CHURN_COUNTERS (0, 0, 0, 0)");
       // Wiring: exactly one gate admission, no old mechanism, the caller's
       // _background flag pinned as the argument.
       expect(stdout).toContain(

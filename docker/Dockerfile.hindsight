@@ -3427,17 +3427,21 @@ PYEOF
 #   * total in-flight recalls stay capped at recall_max_concurrent — the gate
 #     is still the single admission boundary, so the DB never sees more
 #     concurrency than before;
-#   * FOREGROUND admits whenever a slot is free, always ahead of queued
-#     background borrowers — a waiting foreground caller latches NEW
+#   * FOREGROUND admits whenever a slot is free, ahead of any background
+#     borrowing beyond the floor — a waiting foreground caller latches NEW
 #     background borrowing off;
 #   * BACKGROUND borrows every idle slot when no foreground recall is
-#     waiting, and keeps the old reservation as a guaranteed FLOOR
-#     (consolidation_recall_max_concurrent), so background cannot be
-#     permanently starved by sustained foreground pressure either;
+#     waiting, and keeps the old reservation as a guaranteed FLOOR that is
+#     honoured FIRST in the grant pass (consolidation_recall_max_concurrent)
+#     — a LIVE guarantee even under sustained foreground saturation, so
+#     background cannot be permanently starved either;
 #   * no preemption: a borrowed slot is returned at recall completion.
 #     Recalls run 1–3s and background cannot take NEW slots beyond its floor
 #     while a foreground caller waits, so foreground head-of-line wait is
-#     bounded by ONE recall duration (the time to the next completion).
+#     bounded by (floor deficit + 1) recall completions — at most
+#     consolidation_recall_max_concurrent + 1, and exactly one completion
+#     whenever background already holds its floor (the steady state under
+#     mixed load).
 #
 # Deadlock-free and cancellation-safe by construction, asyncio.Semaphore
 # style: no lock object at all (the event loop is the mutual exclusion),
@@ -3551,12 +3555,16 @@ me = apply(ME, [
         "#   * a FOREGROUND caller admits whenever a slot is free;\n"
         "#   * a BACKGROUND caller admits when a slot is free AND either no foreground\n"
         "#     caller is waiting (idle borrowing) or background currently holds fewer\n"
-        "#     than its reserved floor (background_reservation) — so background can\n"
-        "#     use the whole budget when foreground is quiet, yet keeps its old\n"
-        "#     guaranteed share under foreground pressure and is never starved;\n"
-        "#   * a waiting foreground caller latches NEW background borrowing off, and\n"
-        "#     in-flight recalls finish in seconds, so foreground head-of-line wait is\n"
-        "#     bounded by one recall duration without preempting anything.\n"
+        "#     than its reserved floor (background_reservation) — and the grant pass\n"
+        "#     honours that floor FIRST, so it stays a LIVE guarantee under sustained\n"
+        "#     foreground saturation: background can use the whole budget when\n"
+        "#     foreground is quiet, and is never starved below its floor when it is\n"
+        "#     not;\n"
+        "#   * a waiting foreground caller latches background borrowing beyond the\n"
+        "#     floor off, and in-flight recalls finish in seconds, so foreground\n"
+        "#     head-of-line wait is bounded by (floor deficit + 1) recall completions\n"
+        "#     — exactly one whenever background already holds its floor — without\n"
+        "#     preempting anything.\n"
         "#\n"
         "# Deadlock-free and cancellation-safe by construction, asyncio.Semaphore\n"
         "# style: the event loop is the only mutual exclusion (no lock object at\n"
@@ -3585,6 +3593,9 @@ me = apply(ME, [
         "    def _bg_may_admit(self) -> bool:\n"
         "        if self._active >= self._total:\n"
         "            return False\n"
+        "        # NOTE: this counts granted/cancelled done-futures still awaiting\n"
+        "        # their self-removal — a transiently conservative denial that\n"
+        "        # self-heals at the owner's next resumption (never over-admission).\n"
         "        if not self._fg_waiters:\n"
         "            return True\n"
         "        return self._background_active < self._background_reservation\n"
@@ -3595,16 +3606,37 @@ me = apply(ME, [
         "            self._background_active += 1\n"
         "\n"
         "    def _wake(self) -> None:\n"
-        "        # Foreground first, always; then background for whatever headroom\n"
-        "        # its predicate still allows. Slots are taken AT GRANT time, so a\n"
-        "        # granted-but-not-yet-resumed waiter already holds its slot and\n"
-        "        # nothing can be double-admitted.\n"
+        "        # Slots are taken AT GRANT time, so a granted-but-not-yet-resumed\n"
+        "        # waiter already holds its slot and nothing can be double-admitted.\n"
+        "        #\n"
+        "        # 1. The background FLOOR outranks even waiting foreground: while\n"
+        "        #    background holds fewer than its reservation and a slot is\n"
+        "        #    free, grant background. Without this pass the floor is DEAD\n"
+        "        #    CODE under contention — an ungranted foreground waiter implies\n"
+        "        #    active == total at all times (every freed slot re-taken by\n"
+        "        #    foreground inside this same call), so sustained foreground\n"
+        "        #    pressure would starve consolidation to zero indefinitely,\n"
+        "        #    WORSE than the strict reservation this gate replaced. Cost:\n"
+        "        #    foreground's head-of-line bound loosens from one completion\n"
+        "        #    to (floor deficit + 1) completions — still bounded.\n"
+        "        for fut in self._bg_waiters:\n"
+        "            if self._active >= self._total:\n"
+        "                break\n"
+        "            if self._background_active >= self._background_reservation:\n"
+        "                break\n"
+        "            if not fut.done():\n"
+        "                self._take(True)\n"
+        "                fut.set_result(None)\n"
+        "        # 2. Foreground takes everything else, ahead of any background\n"
+        "        #    borrowing beyond the floor.\n"
         "        for fut in self._fg_waiters:\n"
         "            if self._active >= self._total:\n"
         "                break\n"
         "            if not fut.done():\n"
         "                self._take(False)\n"
         "                fut.set_result(None)\n"
+        "        # 3. Idle borrowing: whatever remains goes to background only when\n"
+        "        #    no foreground waiter is left (see _bg_may_admit).\n"
         "        for fut in self._bg_waiters:\n"
         "            if not self._bg_may_admit():\n"
         "                break\n"
@@ -3640,7 +3672,7 @@ me = apply(ME, [
         "\n"
         "    @contextlib.asynccontextmanager\n"
         "    async def admit(self, is_background):\n"
-        '        """Admit one recall; foreground is admitted ahead of queued background."""\n'
+        '        """Admit one recall; foreground ahead of background borrowing beyond its floor."""\n'
         "        # Fast path only when the predicate truly holds: an UNGRANTED\n"
         "        # foreground waiter can only exist while active >= total, so a\n"
         "        # fast-path admit can never queue-jump a starving waiter.\n"
@@ -3706,8 +3738,24 @@ assert "if not self._fg_waiters:\n            return True" in me, (
     "background would stay hard-capped and the drain crawls again"
 )
 assert "return self._background_active < self._background_reservation" in me, (
-    "switchroom hindsight work-conserving-admission patch: background floor clause missing — "
-    "sustained foreground pressure could starve consolidation permanently"
+    "switchroom hindsight work-conserving-admission patch: background floor clause missing "
+    "from the borrow predicate — background could not keep its guaranteed share"
+)
+# The FLOOR-FIRST grant pass in _wake is what makes that floor a LIVE guarantee
+# rather than dead code: an ungranted foreground waiter implies active == total
+# at all times, so a foreground-first _wake re-takes every freed slot inside
+# the same call and sustained foreground pressure starves consolidation to
+# zero indefinitely (worse than the strict reservation this gate replaced).
+assert (
+    "        for fut in self._bg_waiters:\n"
+    "            if self._active >= self._total:\n"
+    "                break\n"
+    "            if self._background_active >= self._background_reservation:\n"
+    "                break\n"
+) in me, (
+    "switchroom hindsight work-conserving-admission patch: the floor-first grant pass is "
+    "missing from _wake — sustained foreground pressure would starve consolidation "
+    "permanently (the floor clause alone is unreachable under contention)"
 )
 # Release must stay SYNCHRONOUS — an await between 'recall finished' and 'slot
 # returned' reintroduces the cancellation slot-leak this design exists to
@@ -3755,8 +3803,9 @@ for token in (
 ast.parse(me)
 print(
     "switchroom hindsight work-conserving-admission patch: recall admission is now a "
-    "single work-conserving priority gate — foreground first, background borrows every "
-    "idle slot (floor consolidation_recall_max_concurrent, ceiling recall_max_concurrent)"
+    "single work-conserving priority gate — background floor granted first "
+    "(consolidation_recall_max_concurrent, live even under sustained foreground "
+    "pressure), then foreground, then idle borrowing up to recall_max_concurrent"
 )
 PYEOF
 
