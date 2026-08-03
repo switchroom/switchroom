@@ -61,6 +61,7 @@ import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
 import { runRoutingModeChecks } from "./doctor-routing-mode.js";
+import { runBootBriefingChecks } from "./doctor-boot-briefing.js";
 import { isVaultReference, parseVaultReference } from "../vault/resolver.js";
 import { isDockerMode, runDockerChecks } from "./doctor-docker.js";
 import { runAuthBrokerChecks } from "./doctor-auth-broker.js";
@@ -4221,6 +4222,15 @@ export function registerDoctorCommand(program: Command): void {
           // the fleet today — only agents the value-gate routes to a cron
           // session produce a line.
           { title: "Cron Session", results: runCronSessionChecks(config) },
+          {
+            // #4244: `session_continuity.briefing: gateway` silently does
+            // nothing when its prerequisites (telegram gateway on, switchroom
+            // plugin, docker runtime, history enabled) are unmet — the legacy
+            // handoff path is disabled for that mode AND the gateway path is
+            // unreachable. Give that dead combination a standing signal.
+            title: "Boot briefing",
+            results: runBootBriefingChecks(config),
+          },
           {
             // #3919: is every switchroom component — the host CLI included —
             // on the same release? Three components drifted across three
