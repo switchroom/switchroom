@@ -1,8 +1,12 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   initBuzzMirror,
   getBuzzMirror,
   maybeBootBuzzMirror,
+  resolveCorrelationJournalPath,
   __resetBuzzMirrorForTests,
   CORRECTION_DEBOUNCE_MS,
 } from '../gateway/buzz-mirror.js'
@@ -201,6 +205,110 @@ describe('BuzzMirror.mirrorCorrection — debounced, only for mirrored messages'
       targetEventId: 'published-evt',
     })
     vi.useRealTimers()
+  })
+})
+
+describe('BuzzMirror correction correlation SURVIVES a gateway restart (#4222)', () => {
+  let dir: string
+  let journalPath: string
+
+  beforeEach(() => {
+    __resetBuzzMirrorForTests()
+    vi.useFakeTimers()
+    dir = mkdtempSync(join(tmpdir(), 'buzz-mirror-corr-'))
+    journalPath = join(dir, 'buzz', 'mirror-correlation.jsonl')
+  })
+  afterEach(() => {
+    __resetBuzzMirrorForTests()
+    vi.useRealTimers()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function bootMirror(sender: (m: OutboundToBuzzMessage) => boolean) {
+    const m = initBuzzMirror({
+      mode: 'both',
+      agentName: 'klanker',
+      defaultChannelId: 'default-chan',
+      correlationJournalPath: journalPath,
+    })
+    m.attachSender(sender)
+    return m
+  }
+
+  it('an edit_message on a pre-restart-mirrored answer STILL emits the superseding correction', () => {
+    // --- Session 1: mirror an answer and record its published Buzz event. ---
+    const sender1 = vi.fn(() => true)
+    const m1 = bootMirror(sender1)
+    m1.mirrorReplyDelivered({
+      scrubbedText: 'answer',
+      ownerOriginChannel: 'buzz',
+      ownerBuzzCoords: BUZZ_COORDS,
+      ownerEchoed: true,
+      hasRecentDifferentOriginTurn: false,
+      telegramMessageKeys: ['555:1001'],
+    })
+    const correlationId = sender1.mock.calls[0][0].correlationId
+    m1.onPublishResult({ correlationId, ok: true, eventId: 'published-evt' })
+
+    // --- Restart: a NEW BuzzMirror over the SAME journal (map reloads from disk).
+    __resetBuzzMirrorForTests() // closes m1's journal fd
+    const sender2 = vi.fn(() => true)
+    const m2 = bootMirror(sender2)
+
+    // An edit lands AFTER the restart on a message mirrored BEFORE it. On today's
+    // in-memory-only code the reloaded map is empty and this is silently skipped;
+    // with the durable journal the correction still fires.
+    m2.mirrorCorrection({ telegramMessageKey: '555:1001', scrubbedText: 'corrected' })
+    vi.advanceTimersByTime(CORRECTION_DEBOUNCE_MS + 1000)
+
+    expect(sender2).toHaveBeenCalledTimes(1)
+    const corr = sender2.mock.calls[0][0]
+    expect(corr.payload).toEqual({
+      kind: 'correction',
+      text: 'corrected',
+      targetEventId: 'published-evt',
+    })
+    expect(m2.getCorrectionMisses()).toBe(0)
+  })
+
+  it('a correction on a truly-unknown key logs a LOUD miss (never silent) and never publishes', () => {
+    const logs: string[] = []
+    __resetBuzzMirrorForTests()
+    const sender = vi.fn(() => true)
+    const m = initBuzzMirror({
+      mode: 'both',
+      agentName: 'klanker',
+      defaultChannelId: 'default-chan',
+      correlationJournalPath: journalPath,
+      log: (msg) => logs.push(msg),
+    })
+    m.attachSender(sender)
+
+    m.mirrorCorrection({ telegramMessageKey: '555:404', scrubbedText: 'fixed' })
+    vi.advanceTimersByTime(CORRECTION_DEBOUNCE_MS + 1000)
+
+    expect(sender).not.toHaveBeenCalled()
+    expect(m.getCorrectionMisses()).toBe(1)
+    expect(logs.some((l) => /CORRECTION MISS/.test(l))).toBe(true)
+  })
+})
+
+describe('resolveCorrelationJournalPath — distinct from the sidecar dedup journal', () => {
+  it('derives mirror-correlation.jsonl under $TELEGRAM_STATE_DIR/buzz (NOT journal.jsonl)', () => {
+    const p = resolveCorrelationJournalPath({ TELEGRAM_STATE_DIR: '/state/agent/telegram' })
+    expect(p).toBe('/state/agent/telegram/buzz/mirror-correlation.jsonl')
+    // Must not collide with the sidecar's journal.jsonl on the shared buzz dir.
+    expect(p).not.toContain('journal.jsonl')
+  })
+
+  it('honours the BUZZ_MIRROR_CORRELATION_PATH override', () => {
+    expect(
+      resolveCorrelationJournalPath({ BUZZ_MIRROR_CORRELATION_PATH: '/custom/corr.jsonl' }),
+    ).toBe('/custom/corr.jsonl')
+  })
+
+  it('returns undefined (in-memory only) when TELEGRAM_STATE_DIR is unset', () => {
+    expect(resolveCorrelationJournalPath({})).toBeUndefined()
   })
 })
 
