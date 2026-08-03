@@ -87,6 +87,18 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
     export SWITCHROOM_FORCE_FRESH=1
   fi
 
+  # Session-generation stamp for the gateway boot briefing (#4242). Set ONCE
+  # here, per real boot, before the gateway fork below. `_switchroom_supervise`
+  # respawns the gateway `bun` process in a `while` loop inside this same shell
+  # (it does NOT re-run start.sh), so every crash-respawn inherits this exact
+  # value, while the next real container boot re-derives a fresh one. The
+  # gateway persists it the first time it briefs and skips re-minting when the
+  # persisted stamp matches — that distinguishes "supervisor respawned me into
+  # a still-live Claude session" (skip) from "genuine new boot" (brief). The
+  # epoch second keeps it monotonic across boots; $$ (this outer pass's PID)
+  # plus ${RANDOM} guarantee uniqueness even for two boots within one second.
+  export SWITCHROOM_GATEWAY_BOOT_ID="$(date +%s)-$$-${RANDOM}"
+
   # Gateway-consumed env MUST be exported HERE, before the gateway fork
   # below. The gateway daemon reads channels.telegram.* knobs (and any
   # agent env) from process.env at startup — e.g. SWITCHROOM_TG_STREAM_
