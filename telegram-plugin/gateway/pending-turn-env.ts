@@ -32,9 +32,18 @@ export function writePendingTurnEnv(
         `SWITCHROOM_PENDING_TURN=true`,
         `SWITCHROOM_PENDING_TURN_KEY=${pending.turn_key}`,
         `SWITCHROOM_PENDING_CHAT_ID=${pending.chat_id}`,
+        // Tri-state thread signal for the handoff-briefing scope resolver.
+        // A pending Turn ALWAYS knows its thread: a numbered forum topic, or
+        // NULL (a DM / forum General topic). Emit the numeric id for a topic,
+        // and the literal sentinel `NULL` when the thread is genuinely null —
+        // so bin/handoff-briefing.sh scopes the reorientation to `thread_id IS
+        // NULL` instead of falling back to chat-only (all-threads) scope. An
+        // empty value is reserved for "thread unknown"; the writer never emits
+        // it, but an older gateway would, and the resolver treats empty as the
+        // safe chat-only fallback.
         pending.thread_id != null
           ? `SWITCHROOM_PENDING_THREAD_ID=${pending.thread_id}`
-          : `SWITCHROOM_PENDING_THREAD_ID=`,
+          : `SWITCHROOM_PENDING_THREAD_ID=NULL`,
         pending.last_user_msg_id != null
           ? `SWITCHROOM_PENDING_USER_MSG_ID=${pending.last_user_msg_id}`
           : `SWITCHROOM_PENDING_USER_MSG_ID=`,

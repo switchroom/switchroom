@@ -49,7 +49,7 @@ WORKSPACE_DIR="${WORKSPACE_DIR:-$AGENT_DIR}"
 MAX_MESSAGES="${HANDOFF_BRIEFING_MAX_MESSAGES:-20}"
 # Hindsight is the only network hop; cap it at 3s so it finishes well inside
 # start.sh's outer `timeout 10` kill budget (was 4s under a 5s outer, which
-# left almost no margin — a slow recall could be SIGKILLed mid-write). Local
+# left almost no margin — a slow recall could be killed mid-write). Local
 # SQLite + daily-memory reads are sub-second, so 3s is the whole network cost.
 HINDSIGHT_TIMEOUT="${HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT:-3}"
 
@@ -59,7 +59,15 @@ HINDSIGHT_TIMEOUT="${HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT:-3}"
 # the surface that was mid-turn when the prior session ended (exported by
 # start.sh from the pending-turn env on an interrupted boot); otherwise the
 # python fallback derives the single most-recently-active (chat_id, thread_id)
-# surface straight from the DB. Empty ⇒ let python derive it.
+# surface straight from the DB. Empty chat ⇒ let python derive it.
+#
+# TARGET_THREAD_ID is tri-state: a numbered thread scopes to that topic; the
+# literal sentinel `NULL` means the surface's thread is genuinely NULL (a DM /
+# forum General topic) and scopes with `thread_id IS NULL`; empty means the
+# thread is UNKNOWN and falls back to chat-only scope (all threads). The
+# pending-turn env writer emits `NULL` when it knows the interrupted turn's
+# thread was null, so a General-topic interrupt reboots correctly scoped
+# instead of pulling in every other topic's messages.
 TARGET_CHAT_ID="${SWITCHROOM_PENDING_CHAT_ID:-}"
 TARGET_THREAD_ID="${SWITCHROOM_PENDING_THREAD_ID:-}"
 
@@ -97,26 +105,32 @@ try:
     cur = conn.cursor()
 
     # Resolve the surface to scope to.
-    #  - explicit env target (pending-turn chat/thread) wins;
+    #  - explicit env target (pending-turn chat/thread) wins — UNLESS that chat
+    #    has zero rows (rotated/fresh DB), in which case we fall through to
+    #    db-latest so a stale env target doesn't yield an empty section;
     #  - else derive the single most-recently-active (chat_id, thread_id).
     # thread is tri-state: a real value, NULL (DM / general), or unknown.
+    #  - target_thread == "NULL" (sentinel from start.sh / pending-turn-env)
+    #    means the surface's thread is GENUINELY NULL (DM / general topic) —
+    #    scope with `thread_id IS NULL`, do NOT pull in numbered-thread rows.
+    #  - target_thread == "" (empty) means UNKNOWN — chat-only scope (all
+    #    threads), the safe backward-compatible fallback.
     scope_chat = None
     scope_thread = None          # int thread id
     scope_thread_known = False   # True once we know the exact thread (incl. NULL)
     scope_thread_is_null = False # True when the surface's thread is NULL
     scope_source = "unscoped"
 
-    if target_chat:
-        scope_chat = target_chat
-        scope_source = "env"
-        if target_thread != "":
-            try:
-                scope_thread = int(target_thread)
-                scope_thread_known = True
-            except ValueError:
-                scope_thread = None  # unparseable → chat-only scope
-        # else: chat-only scope (all threads of the chat)
-    else:
+    def _chat_has_rows(chat_id):
+        cur.execute(
+            "SELECT 1 FROM messages WHERE role IN ('user', 'assistant') "
+            "AND chat_id = ? LIMIT 1",
+            [chat_id],
+        )
+        return cur.fetchone() is not None
+
+    def _derive_db_latest():
+        # The single most-recently-active (chat_id, thread_id) surface.
         cur.execute(
             """
             SELECT chat_id, thread_id
@@ -126,7 +140,28 @@ try:
             LIMIT 1
             """
         )
-        latest = cur.fetchone()
+        return cur.fetchone()
+
+    # Env target — accept it only when its chat actually has rows (2b). A
+    # rotated/fresh DB can leave a pending-turn chat with no persisted
+    # messages; scoping to it would silently emit an empty section, so we
+    # fall through to db-latest instead.
+    if target_chat and _chat_has_rows(target_chat):
+        scope_chat = target_chat
+        scope_source = "env"
+        if target_thread == "NULL":
+            scope_thread_is_null = True
+            scope_thread_known = True
+        elif target_thread != "":
+            try:
+                scope_thread = int(target_thread)
+                scope_thread_known = True
+            except ValueError:
+                scope_thread = None  # unparseable → chat-only scope
+        # else: unknown thread → chat-only scope (all threads of the chat)
+
+    if scope_chat is None:
+        latest = _derive_db_latest()
         if latest is not None:
             scope_chat = latest["chat_id"]
             scope_source = "db-latest"
@@ -216,7 +251,7 @@ fi
 # Incremental emit (#continuity). Sections are flushed to the output file as
 # each source resolves — the recent-conversation section (the highest-value,
 # always-local part) is written BEFORE the network-bound Hindsight hop. So a
-# late-stage SIGKILL (e.g. start.sh's outer `timeout`) mid-Hindsight still
+# late-stage kill (e.g. start.sh's outer `timeout`, SIGTERM by default) mid-Hindsight still
 # leaves the recent conversation on disk instead of nothing. The first flush
 # writes header+section atomically via tmp+mv; later sections append. In
 # stdout/no-AGENT_DIR mode we buffer and print once at the end instead.
