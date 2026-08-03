@@ -472,4 +472,54 @@ describe('maybeQueueBootBriefing — end-to-end wiring', () => {
       }),
     ).not.toThrow()
   })
+
+  it('threads a real resumeMsg end-to-end: elides the interrupted-turn window from the queued briefing on that surface', () => {
+    // #4247: every other wiring test passes resumeMsg: null, so the
+    // resume-dedup path (interrupted-turn window elided so the boot-resume
+    // synthetic and the briefing never double-inject the same messages) was
+    // only ever proven at the pure-function level. This drives a real non-null
+    // resumeMsg all the way through maybeQueueBootBriefing and asserts the
+    // OUTCOME on the queued inbound's text.
+    const startedAtMs = NOW_MS - 10 * 60 * 1000 // interrupted turn began 10m ago
+    // Surface 321 (the resumed chat): one message BEFORE the interrupted turn
+    // (must survive) and one AT/AFTER it (the resume synthetic already covers
+    // it — must be elided).
+    seedUser('321', null, 30 * 60, 'context from before the interrupted turn')
+    seedUser('321', null, 5 * 60, 'the interrupted request itself')
+    // Surface 654 (a different chat): same recency window, NOT the resumed
+    // surface, so its message must be untouched by the dedup.
+    seedUser('654', null, 5 * 60, 'unrelated chat, must remain')
+    const resumeMsg = {
+      type: 'inbound',
+      chatId: '321',
+      messageId: 1,
+      user: 'switchroom',
+      userId: 0,
+      ts: NOW_MS,
+      text: 'You just restarted — resuming the interrupted turn.',
+      meta: {
+        source: 'resume_interrupted',
+        chat_id: '321',
+        started_at: String(startedAtMs),
+      },
+    } as InboundMessage
+    const puts: Array<{ agent: string; msg: InboundMessage }> = []
+    const queued = maybeQueueBootBriefing({
+      env: envFor('gateway'),
+      stateDir: join(stateDir, 'telegram'),
+      resumeMsg,
+      put: (agent, msg) => puts.push({ agent, msg }),
+      log: () => {},
+      nowMs: NOW_MS,
+    })
+    expect(queued).not.toBeNull()
+    expect(puts.length).toBe(1)
+    const text = puts[0]!.msg.text
+    // The pre-interruption message survives; the interrupted request itself is
+    // elided (the resume synthetic already re-injects it).
+    expect(text).toContain('context from before the interrupted turn')
+    expect(text).not.toContain('the interrupted request itself')
+    // Dedup is surface-scoped: the unrelated chat is untouched.
+    expect(text).toContain('unrelated chat, must remain')
+  })
 })
