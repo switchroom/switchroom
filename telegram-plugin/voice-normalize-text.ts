@@ -431,6 +431,11 @@ export function normalizeForSpeech(input: string): string {
   s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
 
   // 3. Links [text](url) → text ; drop the URL entirely.
+  // FUTURE (not built): the Kokoro sidecar's misaki G2P (docker/voice-sidecar/
+  // server.py) accepts a per-word phoneme override via `[word](/phoneme/)`
+  // markup. Wiring a caller-supplied pronunciation override end-to-end would
+  // mean detecting that `/…/` form HERE and passing it through instead of
+  // collapsing it to the link text below. Deliberately left as a hook.
   s = s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
 
   // 4. Autolinks <https://…> and bare URLs → "a link" (never spell a URL).
