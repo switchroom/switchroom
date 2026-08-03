@@ -110,6 +110,25 @@ describe("start.sh: gateway-consumed env exported before the gateway fork", () =
     expect(startSh).toContain('export SWITCHROOM_BOOT_RESUME="in-flight"');
   });
 
+  it("hoists the SWITCHROOM_FORCE_FRESH marker snapshot AHEAD of the gateway fork (M1: env-keyed briefing suppression, race-proof)", () => {
+    const startSh = renderStartSh();
+    const forkIdx = startSh.indexOf(GATEWAY_FORK);
+    expect(forkIdx).toBeGreaterThan(-1);
+
+    // The outer pass snapshots the .force-fresh-session marker into
+    // SWITCHROOM_FORCE_FRESH BEFORE forking the gateway, so the gateway's
+    // briefing-suppression decision is fixed at fork time and immune to the
+    // inner tmux pass's later `rm` of the marker (the fork and the rm race
+    // with no ordering). If this export slid after the fork, a /reset boot
+    // could resurrect the briefing and re-feed the just-reset conversation.
+    const forceFreshIdx = startSh.indexOf("export SWITCHROOM_FORCE_FRESH=1");
+    expect(forceFreshIdx).toBeGreaterThan(-1);
+    expect(forceFreshIdx).toBeLessThan(forkIdx);
+    // And the inner pass still consumes the marker for the claude session's
+    // --continue / session-mode logic — the snapshot only mirrors it.
+    expect(startSh).toContain('rm -f "');
+  });
+
   it("still re-exports the same vars in the inner pass (after the fork) for claude", () => {
     const startSh = renderStartSh();
     const forkIdx = startSh.indexOf(GATEWAY_FORK);

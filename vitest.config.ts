@@ -166,6 +166,9 @@ export default defineConfig({
       // PR #994.
       "**/telegram-plugin/uat/**",
       "**/telegram-plugin/tests/history.test.ts",
+      // boot-briefing-builder.test.ts seeds a real history.db via bun:sqlite
+      // (gateway boot briefing) — excluded here, run via test:bun.
+      "**/telegram-plugin/tests/boot-briefing-builder.test.ts",
       // cross-turn-card-gate.test.ts imports history.ts (bun:sqlite) to seed a
       // real outbound row — must run under bun, not vitest. (#PR1 lever 4)
       "**/telegram-plugin/tests/cross-turn-card-gate.test.ts",

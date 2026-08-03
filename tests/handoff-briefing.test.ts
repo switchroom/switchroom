@@ -161,9 +161,16 @@ describe("scaffold: start.sh resume mode behaviours", () => {
       telegramConfig,
     );
     const startSh = readFileSync(join(result.agentDir, "start.sh"), "utf-8");
-    // The force-fresh block appears AFTER the resume mode case block
+    // The CONTINUE_FLAG-clearing force-fresh CONSUME block (inner pass)
+    // appears AFTER the resume-mode case block. Anchor on its unique
+    // `_FORCE_FRESH=0` sentinel rather than the first `.force-fresh-session`
+    // string: the OUTER pass now ALSO references `.force-fresh-session`
+    // earlier, where it snapshots the marker into SWITCHROOM_FORCE_FRESH
+    // before the gateway fork (env-keyed briefing suppression — see
+    // scaffold.gateway-env-order.test.ts). That outer reference does NOT
+    // clear CONTINUE_FLAG, so it must not be what this structure check finds.
     const caseIdx = startSh.indexOf('case "$SWITCHROOM_RESUME_MODE" in');
-    const forceFreshIdx = startSh.indexOf(".force-fresh-session");
+    const forceFreshIdx = startSh.indexOf("_FORCE_FRESH=0");
     expect(caseIdx).toBeGreaterThan(-1);
     expect(forceFreshIdx).toBeGreaterThan(caseIdx);
     // Force-fresh clears CONTINUE_FLAG unconditionally

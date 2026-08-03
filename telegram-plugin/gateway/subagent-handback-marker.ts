@@ -181,6 +181,13 @@ export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion
   // inject, `meta.source="buzz"`) — never a decoupled completion resolving a
   // different ended turn, so it must NOT stamp.
   buzz: { decoupledCompletion: false },
+  // Gateway boot briefing (session_continuity.briefing: gateway): a synthetic
+  // FIRST user turn the gateway assembles from durable history and injects over
+  // the spool (`<channel source="boot_briefing">`, boot-briefing-builder.ts).
+  // Like the resume_* synthetics it lands as its OWN live inbound turn — its
+  // briefing reply resolves the live tier for its own turnId and cannot
+  // supersede a different ended turn's record — so it must NOT stamp.
+  boot_briefing: { decoupledCompletion: false },
 }
 
 /**
