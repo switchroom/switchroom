@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.20.0 — Buzz co-channel (Phases 1–2, dark), misaki heteronym TTS, boot-time briefing
+
+### Buzz co-channel — Phases 1, 2a, 2 (dark by default) (#4208, #4209, #4217, #4224)
+
+Groundwork for a second channel alongside Telegram, shipped dark (flag-gated,
+default off) across three phases so nothing changes for the fleet until it is
+explicitly enabled.
+
+- **Phase 1 (#4208):** inbound fan-in sidecar + auth gate + config schema,
+  default off.
+- **Phase 2a (#4209):** origin stamping + a pure routing table + the flag — no
+  sends yet.
+- **Phase 2 (#4217):** inbound routing, mirror, and sidecar wired.
+- **Spec (#4224):** Telegram + Buzz sanctioned as the two channels
+  (co-channel contract reconciliation).
+
+### Voice: heteronym-correct TTS + image fixes (#4250, #4235, #4249)
+
+- **misaki G2P (#4250):** the Kokoro TTS path now runs misaki's POS-aware
+  grapheme→phoneme conversion for English and feeds phonemes to Kokoro with
+  `is_phonemes=True`, fixing heteronyms espeak mispronounces (verb *live*
+  /lɪv/ vs adjective *live* /laɪv/, *read* present vs past, etc.). Torch-free;
+  a build-time guard asserts the two senses emit different phonemes.
+  `VOICE_TTS_G2P=espeak` is the rollback lever (no rebuild).
+- **onnxruntime-gpu pin (#4235):** corrected a nonexistent `1.20.1` pin to the
+  real `1.20.2` — a clean voice-image rebuild no longer fails at pip.
+- **Base image (#4249):** upgraded to CUDA-12.8 / ubuntu24.04 (py3.12), GPU
+  libs kept on CUDA-12.
+
+### Gateway: boot-time briefing (#4214)
+
+Behind `session_continuity.briefing` (dark by default): on boot the gateway can
+assemble a briefing from durable history so a restarted session reorients
+without the prior transcript.
+
+### Hindsight (#4210, #4211, #4216)
+
+- **Foreground-priority reranker pool (#4210):** carries upstream #3142 — an
+  interactive recall's rerank no longer waits behind a wall of queued
+  background reranks.
+- **Rerank priority reconciliation + pool teardown (#4216):** reconciles the
+  dual-signal rerank priority (#4212) and wires reranker-pool teardown (#4213).
+- **Directive-capture triage (#4211):** deterministic-first triage added to the
+  directive-capture prompts.
+
+### Evals & CI (#4234)
+
+- Trigger-routing evals now **derive the full 23-skill routable roster**
+  (was a hard-coded 6) via `discover_routable_skills()`, plus a new offline
+  dataset validator (`validate_datasets.py`) with hard lints and coverage
+  reporting; the CI routing gate is report-only while the roster settles.
+
+### Fixes & deps (#4228, #4215, #4226, #4227)
+
+- **Stream-abort classification (#4228):** mid-response stream aborts are now
+  classified as transport-transient rather than a fabricated Reauth 4xx.
+- **Docs (#4215):** dev guidance aligned with the ProductOS contract; release/
+  spec drift fixed.
+- **Deps:** bump node base image (#4226); bump `docker/login-action`
+  4.5.1 → 4.6.0 (#4227).
+
 ## v0.19.48 — reflect defaults to `mid` fleet-wide, with per-agent `reflect_budget` / `reflect_max_tokens` yaml knobs
 
 ### Hindsight: default reflect budget `mid`, exposed to yaml (#4202)
