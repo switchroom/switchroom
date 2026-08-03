@@ -26,7 +26,7 @@
 // runtime consumers of this renderer already load it.
 import { VERIFY_COMPONENTS_STEP as VERIFY_COMPONENTS_FAILED_STEP } from "../cli/rollout.js";
 // #4269 — the definite "hostd template regen required / not needed" verdict.
-// The constant is kept honest by scripts/check-hostd-template-guard.mjs.
+// The constant is kept honest by scripts/check-hostd-template-guard.ts.
 import {
   HOSTD_TEMPLATE_LAST_CHANGED,
   hostdTemplateRegenVerdict,

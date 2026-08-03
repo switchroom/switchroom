@@ -140,7 +140,14 @@ export const DOCKER_SOCKET_PROXY_IMAGE =
  * variable is the host home directory (for the bind mounts that map
  * `~/.switchroom` and `/var/run/docker.sock` into the daemon).
  */
-export function renderHostdComposeFile(opts: {
+/**
+ * Inputs to {@link renderHostdComposeFile}. The optional knobs each gate a
+ * conditional block in the rendered compose file; the hostd-template guard
+ * (`scripts/check-hostd-template-guard.ts`) types its fully-optioned fixture
+ * as `Required<RenderHostdComposeOptions>`, so adding an optional knob here
+ * without extending the fixture fails `tsc --noEmit` (part of `npm run lint`).
+ */
+export interface RenderHostdComposeOptions {
   hostHome: string;
   imageTag: string;
   /** Host operator UID — hostd chowns its operator socket to this so
@@ -183,7 +190,9 @@ export function renderHostdComposeFile(opts: {
    * conventional default.
    */
   dockerSocketPath?: string;
-}): string {
+}
+
+export function renderHostdComposeFile(opts: RenderHostdComposeOptions): string {
   const { hostHome, imageTag, operatorUid, hostTz, skillsTarget } = opts;
   // KEPT PURE: default to the conventional socket constant rather than
   // shelling out to `docker context inspect` here, so this renderer stays

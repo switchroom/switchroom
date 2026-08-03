@@ -18,7 +18,7 @@
  * required.
  *
  * KEEPING IT HONEST is not left to reviewer memory: the lint guard
- * `scripts/check-hostd-template-guard.mjs` hashes the template region of
+ * `scripts/check-hostd-template-guard.ts` hashes the template region of
  * src/cli/hostd.ts against `scripts/hostd-template-baseline.json` and FAILS
  * when the region changes without this constant (and the baseline) being
  * bumped in the same PR. When you change the hostd template:
