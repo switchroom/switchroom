@@ -107,6 +107,42 @@ describe('detectErrorInTranscriptLine — error detection', () => {
     expect(result!.terminal).toBe(true)
   })
 
+  it('marks an in-flight transport-transient retry NOT terminal (does not count toward escalation)', () => {
+    // A flaky request Claude Code is internally retrying (retryAttempt <
+    // maxRetries), surfaced as a bare `server_error` with no status. Pre-fix
+    // `transient` was false for transport-transient, so it was UNCONDITIONALLY
+    // terminal → a single recoverable request retried 3x could cross the ≥3
+    // escalation threshold and fire the operator "Repeated stream failures"
+    // card. It must be transient + in-flight (suppressed), counting nothing.
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      error: { type: 'server_error', message: 'Connection closed mid-response' },
+      retryAttempt: 2,
+      maxRetries: 10,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.kind).toBe('transport-transient')
+    expect(result!.transient).toBe(true)
+    // 2 < 10 — still retrying → in-flight → the caller suppresses it (not counted).
+    expect(result!.terminal).toBe(false)
+  })
+
+  it('marks an exhausted transport-transient retry terminal (counts toward escalation)', () => {
+    const line = JSON.stringify({
+      type: 'system',
+      subtype: 'api_error',
+      error: { type: 'server_error', message: 'Connection closed mid-response' },
+      retryAttempt: 10,
+      maxRetries: 10,
+    })
+    const result = detectErrorInTranscriptLine(line)
+    expect(result!.kind).toBe('transport-transient')
+    expect(result!.transient).toBe(true)
+    // retries exhausted → terminal → escalates.
+    expect(result!.terminal).toBe(true)
+  })
+
   it('marks non-transient errors terminal (always escalate)', () => {
     const line = JSON.stringify({
       type: 'api_error',

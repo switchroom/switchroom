@@ -284,13 +284,22 @@ function classifyInner(raw: unknown): OperatorEventKind {
   // credential fault. Matched only on EXACT type/code equality (never a message
   // substring) so an unrelated error whose text merely mentions "server error"
   // is untouched.
+  //
+  // GUARDED to status-less OR 5xx shapes (`status == null || status >= 500`): a
+  // mid-response abort carries NO status, and a genuine 500 is server-side. But
+  // LiteLLM stamps a generic `type: "api_error"` onto WRAPPED upstream faults
+  // that DO carry a 4xx status (e.g. a 401), and session-tail threads that
+  // `apiErrorStatus` through as `status`. Without this guard such a 401 would be
+  // swallowed as transport-transient (silent, no card) when it must reach the
+  // status fallback below and surface an operator card. The status wins.
   if (
-    errorType === 'server_error' ||
-    errorCode === 'server_error' ||
-    sdkCode === 'server_error' ||
-    errorType === 'api_error' ||
-    errorCode === 'api_error' ||
-    sdkCode === 'api_error'
+    (status == null || status >= 500) &&
+    (errorType === 'server_error' ||
+      errorCode === 'server_error' ||
+      sdkCode === 'server_error' ||
+      errorType === 'api_error' ||
+      errorCode === 'api_error' ||
+      sdkCode === 'api_error')
   ) {
     return 'transport-transient'
   }

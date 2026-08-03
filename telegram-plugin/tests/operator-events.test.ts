@@ -175,6 +175,23 @@ describe('classifyClaudeError — transport-transient (mid-response stream abort
     expect(classifyClaudeError({ type: 'api_error' })).toBe('transport-transient')
   })
 
+  it('classifies api_error/server_error carrying a 5xx status as transport-transient', () => {
+    expect(classifyClaudeError({ type: 'api_error', status: 500 })).toBe('transport-transient')
+    expect(classifyClaudeError({ type: 'server_error', status: 503 })).toBe('transport-transient')
+  })
+
+  it('does NOT swallow a status-bearing 4xx api_error (LiteLLM-wrapped 401) as transport-transient', () => {
+    // LiteLLM stamps a generic `type: "api_error"` on WRAPPED upstream faults
+    // that carry a 4xx status; session-tail threads that status through. The
+    // transport branch is guarded to status-less/5xx shapes, so the HTTP status
+    // wins and this surfaces an operator card (unknown-4xx) — NOT the silent
+    // transport-transient path. Branch-order regression guard: unlike the bare
+    // `{status:404}` test above, this exercises a TYPED api_error + 4xx status.
+    expect(classifyClaudeError({ type: 'api_error', status: 401 })).toBe('unknown-4xx')
+    expect(classifyClaudeError({ type: 'api_error', status: 401 })).not.toBe('transport-transient')
+    expect(classifyClaudeError({ type: 'server_error', status: 429 })).toBe('unknown-4xx')
+  })
+
   it('does NOT fire on an unrelated error that merely mentions "server error" in prose', () => {
     // Exact type/code equality only — never a message substring — so a genuine
     // auth fault mislabeled with server-error prose still classifies as auth.
