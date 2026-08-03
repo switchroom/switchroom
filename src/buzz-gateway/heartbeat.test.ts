@@ -5,6 +5,10 @@ import {
   parseBuzzHeartbeat,
   buzzHeartbeatStatePath,
   buzzHeartbeatOperatorPath,
+  resolveStatsIntervalMs,
+  BUZZ_HEARTBEAT_INTERVAL_MS,
+  BUZZ_HEARTBEAT_STALE_MS,
+  BUZZ_HEARTBEAT_MAX_INTERVAL_MS,
   type BuzzHeartbeat,
 } from "./heartbeat.js";
 import type { BuzzPipelineSummary } from "./stats.js";
@@ -84,5 +88,36 @@ describe("writeBuzzHeartbeat / parseBuzzHeartbeat", () => {
     expect(
       parseBuzzHeartbeat(JSON.stringify(beat({ stats: partialStats as never }))),
     ).toBeNull();
+  });
+});
+
+describe("resolveStatsIntervalMs — stale-threshold coupling (#4302)", () => {
+  it("keeps the timing contract self-consistent: stale = interval × tolerance", () => {
+    // The whole fix rests on the stale threshold being DERIVED from the beat
+    // interval, not a hand-synced constant. Pin the relationship so a future
+    // edit to one without the other fails here.
+    expect(BUZZ_HEARTBEAT_STALE_MS).toBeGreaterThan(BUZZ_HEARTBEAT_INTERVAL_MS);
+    expect(BUZZ_HEARTBEAT_MAX_INTERVAL_MS * 3).toBe(BUZZ_HEARTBEAT_STALE_MS);
+  });
+
+  it("clamps an interval set ABOVE the stale threshold so a healthy sidecar can't false-red", () => {
+    // The exact bug: BUZZ_STATS_INTERVAL_MS set above ~180s made every healthy
+    // sidecar beat slower than doctor's stale window, so doctor false-redded it
+    // as stale on every run. The resolved interval must stay strictly inside
+    // the stale window, leaving room for at least a couple of missed beats.
+    const wayAboveStale = String(BUZZ_HEARTBEAT_STALE_MS * 5); // e.g. 900s
+    const resolved = resolveStatsIntervalMs(wayAboveStale);
+    expect(resolved).toBeLessThanOrEqual(BUZZ_HEARTBEAT_MAX_INTERVAL_MS);
+    // A sidecar beating at `resolved` beats at least 3× before the stale window
+    // elapses — the false-red is structurally impossible.
+    expect(resolved * 3).toBeLessThanOrEqual(BUZZ_HEARTBEAT_STALE_MS);
+  });
+
+  it("passes a faster-than-default interval through unchanged and floors junk to the default", () => {
+    expect(resolveStatsIntervalMs("15000")).toBe(15000); // faster beats are fine
+    expect(resolveStatsIntervalMs(undefined)).toBe(BUZZ_HEARTBEAT_INTERVAL_MS);
+    expect(resolveStatsIntervalMs("not-a-number")).toBe(BUZZ_HEARTBEAT_INTERVAL_MS);
+    expect(resolveStatsIntervalMs("0")).toBe(BUZZ_HEARTBEAT_INTERVAL_MS);
+    expect(resolveStatsIntervalMs("-5000")).toBe(BUZZ_HEARTBEAT_INTERVAL_MS);
   });
 });

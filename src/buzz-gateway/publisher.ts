@@ -258,3 +258,45 @@ export async function publishOutbound(
   }
   return { ok: true, eventId: signed.eventId };
 }
+
+/** The mutable outbound-mirror tally the sidecar owns (index.ts). */
+export interface MirrorTally {
+  ok: number;
+  failed: number;
+}
+
+/**
+ * Run `publishOutbound` and record its outcome in the sidecar's mirror tally,
+ * counting a THROWN transport/sign rejection as a `failed` too (#4305).
+ *
+ * The bare tally at the call site only bumped `mirror.failed` on a RESOLVED
+ * `{ok:false}` — a transport-layer *thrown* rejection (a WS/socket error, a
+ * publish-timeout throw) bumped neither counter and also escaped as an
+ * unhandled rejection out of the `onOutbound` handler, so the hub never got a
+ * result frame. This wrapper owns the try/catch so:
+ *   - `mirror.failed` is the true count of non-delivered mirrors, and
+ *   - the caller ALWAYS gets a well-formed `PublishResult` to report back (this
+ *     function never throws).
+ *
+ * The `error` on the thrown path is a FIXED, content-free string — the thrown
+ * value could carry attacker-influenced text, and this row is operator-facing,
+ * so no exception message is interpolated.
+ */
+export async function publishOutboundTallied(
+  req: OutboundPayload,
+  secretKey: Uint8Array,
+  transport: PublishTransport,
+  tally: MirrorTally,
+  nowSec?: number,
+): Promise<PublishResult> {
+  let result: PublishResult;
+  try {
+    result = await publishOutbound(req, secretKey, transport, nowSec);
+  } catch {
+    tally.failed += 1;
+    return { ok: false, error: "publish failed: transport threw" };
+  }
+  if (result.ok) tally.ok += 1;
+  else tally.failed += 1;
+  return result;
+}

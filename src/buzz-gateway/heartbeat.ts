@@ -35,6 +35,50 @@ export const BUZZ_HEARTBEAT_FILE = "buzz-sidecar.heartbeat.json";
  *  this to reach the beacon from the operator-side agent home. */
 export const AGENT_STATE_SUBDIR = "telegram";
 
+// ────────────────────────────────────────────────────────────────────────
+// Heartbeat timing contract (single source of truth — #4302)
+//
+// The sidecar refreshes the beacon every `BUZZ_HEARTBEAT_INTERVAL_MS`; doctor
+// flags a beacon older than `BUZZ_HEARTBEAT_STALE_MS` as stale. Those two knobs
+// were decoupled: the beat interval is env-tunable (BUZZ_STATS_INTERVAL_MS in
+// index.ts) while the stale threshold was a fixed 180s, so setting the interval
+// above ~180s made every healthy sidecar false-red as stale. They now share
+// this module: the stale threshold is DERIVED (interval × tolerance) and the
+// runtime interval is CLAMPED so it can never exceed what the threshold
+// tolerates — a deterministic coupling rather than two hand-synced numbers.
+// ────────────────────────────────────────────────────────────────────────
+
+/** Default beat cadence: the sidecar refreshes the beacon this often. */
+export const BUZZ_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+/** Missed-beat tolerance before doctor flags stale — 3 tolerates a couple of
+ *  dropped beats before warning. */
+export const BUZZ_HEARTBEAT_STALE_MULTIPLIER = 3;
+/** A beacon older than this reads as stale. DERIVED from the beat interval so
+ *  the two can't drift apart (interval × missed-beat tolerance). */
+export const BUZZ_HEARTBEAT_STALE_MS =
+  BUZZ_HEARTBEAT_INTERVAL_MS * BUZZ_HEARTBEAT_STALE_MULTIPLIER;
+/** The slowest the beat interval may be configured without the sidecar
+ *  false-reddening doctor: keeping interval ≤ stale ÷ tolerance guarantees the
+ *  stale window always spans at least `BUZZ_HEARTBEAT_STALE_MULTIPLIER` beats. */
+export const BUZZ_HEARTBEAT_MAX_INTERVAL_MS =
+  BUZZ_HEARTBEAT_STALE_MS / BUZZ_HEARTBEAT_STALE_MULTIPLIER;
+
+/**
+ * Resolve the sidecar's stats/heartbeat beat interval from its raw env value
+ * (BUZZ_STATS_INTERVAL_MS), clamped so it can never outrun doctor's stale
+ * threshold (#4302). A non-numeric / non-positive value falls back to the
+ * default; an over-large value is capped at `BUZZ_HEARTBEAT_MAX_INTERVAL_MS` so
+ * a healthy sidecar always beats inside the stale window. Faster-than-default
+ * intervals pass through unchanged.
+ */
+export function resolveStatsIntervalMs(raw: string | undefined): number {
+  const requested = Number(raw);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return BUZZ_HEARTBEAT_INTERVAL_MS;
+  }
+  return Math.min(requested, BUZZ_HEARTBEAT_MAX_INTERVAL_MS);
+}
+
 /** Content-free liveness + stats snapshot. */
 export interface BuzzHeartbeat {
   /** Schema version — bump on shape change so an old reader can reject cleanly. */

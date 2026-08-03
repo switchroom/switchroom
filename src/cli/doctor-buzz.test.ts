@@ -35,9 +35,14 @@ function heartbeat(over: Partial<BuzzHeartbeat> = {}): string {
   });
 }
 
-/** A deps bundle where the ONE agent 'alpha' has a heartbeat file. */
+/** A deps bundle where the ONE agent 'alpha' has a heartbeat file.
+ *
+ * `heartbeatReads`, when given, returns its entries on SUCCESSIVE readFileSync
+ * calls (then sticks on the last) — used to simulate a torn read that heals on
+ * the retry (#4303). `sleep` is a no-op so the retry back-off is instant. */
 function deps(opts: {
   heartbeatContent?: string | null;
+  heartbeatReads?: string[];
   heartbeatMtimeMs?: number;
   now?: number;
   acl?:
@@ -46,10 +51,12 @@ function deps(opts: {
     | { kind: "not_found" };
 }) {
   const path = buzzHeartbeatOperatorPath(`${AGENTS_DIR}/alpha`);
-  const has = opts.heartbeatContent != null;
+  const has = opts.heartbeatContent != null || (opts.heartbeatReads?.length ?? 0) > 0;
+  let readIdx = 0;
   return {
     homeDir: () => HOME,
     now: () => opts.now ?? 2_000_000,
+    sleep: async () => {},
     existsSync: (p: string) => p === path && has,
     statSync: (p: string) => {
       if (p !== path || !has) throw new Error("ENOENT");
@@ -57,6 +64,11 @@ function deps(opts: {
     },
     readFileSync: (p: string) => {
       if (p !== path || !has) throw new Error("ENOENT");
+      if (opts.heartbeatReads) {
+        const i = Math.min(readIdx, opts.heartbeatReads.length - 1);
+        readIdx += 1;
+        return opts.heartbeatReads[i];
+      }
       return opts.heartbeatContent as string;
     },
     vaultAclReader: async () => opts.acl ?? { kind: "ok" as const, allow: ["alpha"] },
@@ -222,5 +234,58 @@ describe("runBuzzChecks — sidecar liveness", () => {
     const r = row(results, "buzz:sidecar-live:alpha");
     expect(r?.status).toBe("warn");
     expect(r?.detail).toContain("malformed");
+  });
+
+  it("SELF-HEALS a torn read: retries once and reports OK when the re-read parses (#4303)", async () => {
+    // The beacon is written in place (non-atomic, to keep agent-uid ownership),
+    // so doctor can catch a half-written file mid-beat. The first read returns
+    // a truncated/torn payload that fails to parse; the retry read returns the
+    // complete beacon. Doctor must heal within the same run — NOT false-warn
+    // "malformed".
+    const results = await runBuzzChecks(
+      liveCfg,
+      deps({
+        heartbeatReads: ['{ "v": 1, "agent": "alpha", "ts": 1000, "boot', heartbeat()],
+        heartbeatMtimeMs: 2_000_000,
+        now: 2_030_000,
+      }),
+    );
+    const r = row(results, "buzz:sidecar-live:alpha");
+    expect(r?.status).toBe("ok");
+    expect(r?.detail).toContain("injected=6");
+    expect(r?.detail).not.toContain("malformed");
+  });
+
+  it("still WARNs malformed when BOTH the read and its retry fail to parse (#4303)", async () => {
+    const results = await runBuzzChecks(
+      liveCfg,
+      deps({
+        heartbeatReads: ["{ torn once", "{ torn twice"],
+        heartbeatMtimeMs: 2_000_000,
+        now: 2_010_000,
+      }),
+    );
+    const r = row(results, "buzz:sidecar-live:alpha");
+    expect(r?.status).toBe("warn");
+    expect(r?.detail).toContain("malformed");
+  });
+
+  it("WARNs not-live when the beacon's agent field does not match this agent (#4304)", async () => {
+    // A fresh, well-formed, subscribed beacon — but copied from a DIFFERENT
+    // agent's state dir (agent:'intruder'). The agent-name cross-check must
+    // reject it as a foreign/copied beacon rather than reporting the channel
+    // live. The foreign agent value is NOT echoed into the row (untrusted).
+    const results = await runBuzzChecks(
+      liveCfg,
+      deps({
+        heartbeatContent: heartbeat({ agent: "intruder" }),
+        heartbeatMtimeMs: 2_000_000,
+        now: 2_010_000,
+      }),
+    );
+    const r = row(results, "buzz:sidecar-live:alpha");
+    expect(r?.status).toBe("warn");
+    expect(r?.detail).toContain("different agent");
+    expect(r?.detail).not.toContain("intruder");
   });
 });

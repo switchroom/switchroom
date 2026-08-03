@@ -40,7 +40,11 @@ import { homedir } from "node:os";
 
 import type { SwitchroomConfig } from "../config/schema.js";
 import { resolveAgentConfig } from "../config/merge.js";
-import { buzzHeartbeatOperatorPath, parseBuzzHeartbeat } from "../buzz-gateway/heartbeat.js";
+import {
+  BUZZ_HEARTBEAT_STALE_MS as HEARTBEAT_STALE_MS,
+  buzzHeartbeatOperatorPath,
+  parseBuzzHeartbeat,
+} from "../buzz-gateway/heartbeat.js";
 
 import type { CheckStatus } from "./doctor-status.js";
 
@@ -51,9 +55,18 @@ export interface CheckResult {
   fix?: string;
 }
 
-/** A heartbeat older than this reads as stale. The sidecar beats every 60s by
- *  default; 3× that tolerates a couple of missed beats before flagging. */
-export const BUZZ_HEARTBEAT_STALE_MS = 180 * 1000;
+/** A heartbeat older than this reads as stale. Re-exported from the heartbeat
+ *  module so the stale threshold and the sidecar's beat interval share ONE
+ *  timing contract (#4302): the sidecar clamps its (env-tunable) beat interval
+ *  to stay inside this window, so a healthy sidecar never false-reds. The
+ *  threshold is DERIVED there as interval × missed-beat tolerance, not a fixed
+ *  180s decoupled from the interval. */
+export const BUZZ_HEARTBEAT_STALE_MS = HEARTBEAT_STALE_MS;
+
+/** Small back-off before doctor re-reads a heartbeat that failed to parse, so a
+ *  transient torn read of the in-place (non-atomic) beacon write self-heals
+ *  within one doctor run instead of false-warning "malformed" (#4303). */
+export const BUZZ_HEARTBEAT_REREAD_DELAY_MS = 50;
 
 export interface BuzzProbeDeps {
   existsSync?: (path: string) => boolean;
@@ -62,6 +75,9 @@ export interface BuzzProbeDeps {
   homeDir?: () => string;
   /** Override clock for tests (default Date.now). */
   now?: () => number;
+  /** Injected async delay for the torn-read retry (#4303); default a real
+   *  setTimeout-backed sleep. Tests inject an instant no-op. */
+  sleep?: (ms: number) => Promise<void>;
   /** Inject the vault ACL reader for tests. Returns the agents allowed to read
    *  the key, or an unreachable/not-found signal. */
   vaultAclReader?: (
@@ -79,6 +95,7 @@ interface ResolvedDeps {
   statSync: (path: string) => { mtimeMs: number };
   agentsDir: string;
   now: () => number;
+  sleep: (ms: number) => Promise<void>;
   vaultAclReader: NonNullable<BuzzProbeDeps["vaultAclReader"]>;
 }
 
@@ -90,6 +107,7 @@ function resolveDeps(deps: BuzzProbeDeps): ResolvedDeps {
     statSync: deps.statSync ?? realStatSync,
     agentsDir: join(home, ".switchroom", "agents"),
     now: deps.now ?? Date.now,
+    sleep: deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     vaultAclReader:
       deps.vaultAclReader ??
       (async () => ({ kind: "unreachable", msg: "no default reader wired" })),
@@ -247,7 +265,7 @@ async function checkKeypairGrant(b: EffectiveBuzz, d: ResolvedDeps): Promise<Che
 // Probe 4: sidecar liveness (heartbeat beacon)
 // ────────────────────────────────────────────────────────────────────────
 
-function checkSidecarLive(b: EffectiveBuzz, d: ResolvedDeps): CheckResult {
+async function checkSidecarLive(b: EffectiveBuzz, d: ResolvedDeps): Promise<CheckResult> {
   if (!b.live) {
     return {
       name: `buzz:sidecar-live:${b.agent}`,
@@ -285,17 +303,45 @@ function checkSidecarLive(b: EffectiveBuzz, d: ResolvedDeps): CheckResult {
   }
 
   // Fresh beat — surface the last-sampled stats + subscription state.
-  let hb = null as ReturnType<typeof parseBuzzHeartbeat>;
-  try {
-    hb = parseBuzzHeartbeat(d.readFileSync(path, "utf-8"));
-  } catch {
-    hb = null;
+  //
+  // The beacon is written in place, non-atomically, to preserve the sidecar's
+  // agent-uid file ownership (repo #3168 landmine — a tmp+rename would re-own
+  // it). That leaves a narrow torn-read window where doctor can read a
+  // half-written file that fails to parse. Rather than change the write side,
+  // retry the READ once after a small delay (#4303): a genuine mid-write
+  // self-heals on the second read within the same doctor run, while a durably
+  // malformed beacon still fails both reads and warns.
+  const readOnce = (): ReturnType<typeof parseBuzzHeartbeat> => {
+    try {
+      return parseBuzzHeartbeat(d.readFileSync(path, "utf-8"));
+    } catch {
+      return null;
+    }
+  };
+  let hb = readOnce();
+  if (!hb) {
+    await d.sleep(BUZZ_HEARTBEAT_REREAD_DELAY_MS);
+    hb = readOnce();
   }
   if (!hb) {
     return {
       name: `buzz:sidecar-live:${b.agent}`,
       status: "warn",
       detail: `heartbeat ${Math.round(age / 1000)}s old but unreadable/malformed at ${path}`,
+    };
+  }
+  // Cross-check the beacon's own agent field against the agent this row is for
+  // (#4304). The beacon lives in the agent's uid-writable state dir and this
+  // fleet treats agents as prompt-injectable, so a beacon copied from another
+  // agent's dir (or a stale/foreign one) must NOT pass this liveness probe.
+  // A mismatch is treated as not-live/malformed. The beacon's agent value is
+  // NOT echoed into the row — it is untrusted, agent-controlled content.
+  if (hb.agent !== b.agent) {
+    return {
+      name: `buzz:sidecar-live:${b.agent}`,
+      status: "warn",
+      detail: `heartbeat ${Math.round(age / 1000)}s old at ${path} belongs to a different agent than '${b.agent}' — foreign/copied beacon, treating as not live`,
+      fix: `Confirm the sidecar for '${b.agent}' owns this beacon: \`switchroom agent restart ${b.agent} --wait\` and check /var/log/switchroom/buzz-gateway.log.`,
     };
   }
   const s = hb.stats;
@@ -336,7 +382,7 @@ export async function runBuzzChecks(
     results.push(checkChannelState(b));
     results.push(checkRelayConfig(b));
     results.push(await checkKeypairGrant(b, d));
-    results.push(checkSidecarLive(b, d));
+    results.push(await checkSidecarLive(b, d));
   }
   return results;
 }
