@@ -63,6 +63,44 @@ function resolveThreadRoot(ev: NostrEventLike): string {
 }
 
 /**
+ * NIP-10 reply-parent resolution — the DIRECT antecedent of this event, as
+ * distinct from the thread root. Marker semantics take precedence:
+ *
+ *   - An explicit `["e", <id>, <relay?>, "reply"]` marked tag is the reply
+ *     parent.
+ *   - When e-tags carry NIP-10 markers but no `reply` marker (a root-only
+ *     reply, per NIP-10), the reply parent IS the `root` marker — a direct
+ *     reply to the thread's opening post. Falls back to the `root` marker id.
+ *   - When NO markers are present, legacy positional convention applies: the
+ *     LAST positional `e` tag is the reply parent (the FIRST is the root); a
+ *     lone positional e-tag is both root and reply.
+ *   - No `e` tags ⇒ this event replies to nothing; returns `undefined` and the
+ *     `buzz_reply_to` attribute is omitted entirely.
+ *
+ * A marker set carrying only `mention` (no `root`/`reply`) also yields
+ * `undefined`: a mention is not a thread antecedent.
+ */
+function resolveReplyParent(ev: NostrEventLike): string | undefined {
+  const eTags = ev.tags.filter((t) => t[0] === "e" && typeof t[1] === "string");
+  if (eTags.length === 0) return undefined;
+
+  const hasMarkers = eTags.some(
+    (t) => t[3] === "root" || t[3] === "reply" || t[3] === "mention",
+  );
+  if (hasMarkers) {
+    const reply = eTags.find((t) => t[3] === "reply");
+    if (reply) return reply[1];
+    const root = eTags.find((t) => t[3] === "root");
+    if (root) return root[1];
+    // Marked, but neither root nor reply (mention-only) — no antecedent.
+    return undefined;
+  }
+
+  // Legacy positional (no markers): last e-tag is the reply parent.
+  return eTags[eTags.length - 1][1];
+}
+
+/**
  * Resolve the group id an event belongs to: its own `h` tag (NIP-29 scoping)
  * if present, else the subscribed groupId from context.
  */
@@ -83,6 +121,7 @@ export function mapBuzzEvent(
 
   const channelId = resolveChannelId(ev, ctx.groupId);
   const threadRoot = resolveThreadRoot(ev);
+  const replyTo = resolveReplyParent(ev);
   const user = senderLabel(ev.pubkey, ctx.pubkeyNames);
 
   const text =
@@ -91,6 +130,9 @@ export function mapBuzzEvent(
     `buzz_event_id="${escapeAttr(ev.id)}" ` +
     `buzz_pubkey="${escapeAttr(ev.pubkey)}" ` +
     `buzz_thread_root="${escapeAttr(threadRoot)}" ` +
+    (replyTo !== undefined
+      ? `buzz_reply_to="${escapeAttr(replyTo)}" `
+      : "") +
     `user="${escapeAttr(user)}">` +
     escapeBody(ev.content) +
     `</channel>`;
@@ -101,6 +143,7 @@ export function mapBuzzEvent(
     buzz_event_id: ev.id,
     buzz_pubkey: ev.pubkey,
     buzz_thread_root: threadRoot,
+    ...(replyTo !== undefined ? { buzz_reply_to: replyTo } : {}),
     user,
   };
 
