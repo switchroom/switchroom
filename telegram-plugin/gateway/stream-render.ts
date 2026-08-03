@@ -605,6 +605,10 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
       replyCalled: false,
       finalAnswerDelivered: false,
       finalAnswerSubstantive: false,
+      // Post-substantive feed-reopen counter — reset each turn.
+      postSubstantiveToolLabelCount: 0,
+      // Post-substantive lever-1 lift latch — reset each turn.
+      postAnswerMainActivity: false,
       // Sticky latch — reset ONLY here (turn start), never by reopen.
       finalAnswerEverDelivered: false,
       // 2026-07 double-reply-on-DM fix (Part 2) — answer-delivered race
@@ -880,6 +884,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
     CONTEXT_EXHAUSTION_COOLDOWN_MS,
     DELIVERY_CONFIRM_ENABLED,
     FEED_REOPEN_AFTER_ACK_ENABLED,
+    FEED_REOPEN_AFTER_SUBSTANTIVE_ENABLED,
     HANDBACK_PRETURN_ENABLED,
     HISTORY_ENABLED,
     LIVENESS_TERMINAL_HONESTY,
@@ -1407,25 +1412,45 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       // liveness is the bounded no-reply timer's job) and lets the silent-end
       // re-prompt fire if the turn ends on only an ack.
       // Kill switch SWITCHROOM_FEED_REOPEN_AFTER_ACK=0 → legacy `return`.
+      //
+      // POST-SUBSTANTIVE reopen: a turn that delivered a real answer and then
+      // kept doing tool work reopens the feed once >= SUBSTANTIVE_REOPEN_MIN_
+      // LABELS post-answer labels arrive — WITHOUT clearing finalAnswerDelivered
+      // (that would trip the turn-end re-prompt → duplicate answer). Instead the
+      // decision returns liftLeverOne, and the drain below opens the fresh card
+      // below the reply via `postAnswerMainActivity` (the foreground sibling of
+      // the sub-agent post-answer liveness exemption). Kill switch
+      // SWITCHROOM_FEED_REOPEN_AFTER_SUBSTANTIVE=0 → post-substantive labels stay
+      // dropped (legacy).
       if (turn.finalAnswerDelivered) {
-        // decideFeedReopen returns dropLabel (legacy return) or the reset
-        // deltas: finalAnswerDelivered→false (the turn has NOT delivered its
-        // final answer while still doing tool work), activityMessageId→null
-        // (a FRESH feed message opens below the ack), activityLastSentRender
-        // →null (so the drain loop's `pending !== lastSent` guard never
-        // mistakes the fresh render for the ack's finalized one and skips it).
+        // Count post-substantive-answer labels so the reopen fires only once the
+        // turn is plainly still working (>=2), not on a stray housekeeping tool.
+        if (turn.finalAnswerSubstantive) turn.postSubstantiveToolLabelCount++
+        // decideFeedReopen returns dropLabel (legacy return), or — on the ACK
+        // path — the reset deltas (finalAnswerDelivered→false, a FRESH feed
+        // message, last-sent cleared), or — on the SUBSTANTIVE path — no reset
+        // but liftLeverOne=true (keep finalAnswerDelivered true, open the card
+        // below the reply).
         const reopen = decideFeedReopen({
           finalAnswerDelivered: turn.finalAnswerDelivered,
-          // ACK-ONLY: reopen only when the prior final was a short ack, not a
-          // substantive answer — otherwise post-answer housekeeping would
-          // reset finalAnswerDelivered and trip the silent-end re-prompt.
           finalAnswerSubstantive: turn.finalAnswerSubstantive,
           enabled: FEED_REOPEN_AFTER_ACK_ENABLED,
+          reopenAfterSubstantiveEnabled: FEED_REOPEN_AFTER_SUBSTANTIVE_ENABLED,
+          postSubstantiveToolLabelCount: turn.postSubstantiveToolLabelCount,
         })
         if (reopen.dropLabel) return
-        turn.finalAnswerDelivered = reopen.reset!.finalAnswerDelivered
-        turn.activityMessageId = reopen.reset!.activityMessageId
-        turn.activityLastSentRender = reopen.reset!.activityLastSentRender
+        // ACK reopen carries a reset; the substantive reopen deliberately does
+        // not (finalAnswerDelivered stays true, activityMessageId is already
+        // null from the answer's clearActivitySummary).
+        if (reopen.reset != null) {
+          turn.finalAnswerDelivered = reopen.reset.finalAnswerDelivered
+          turn.activityMessageId = reopen.reset.activityMessageId
+          turn.activityLastSentRender = reopen.reset.activityLastSentRender
+        }
+        // Post-substantive reopen: latch the lever-1 lift so the drain (which
+        // reads this off `turn`) opens the fresh card below the delivered reply.
+        // Sticky for the rest of the turn — the model stays "still working".
+        if (reopen.liftLeverOne) turn.postAnswerMainActivity = true
       }
       const rendered = appendActivityLabel(turn.mirrorLines, ev.label)
       if (rendered != null) {

@@ -2789,6 +2789,13 @@ const MIDFLIGHT_BUSY_ACK_ENABLED =
 // the finalAnswerDelivered-consumer interactions.
 const FEED_REOPEN_AFTER_ACK_ENABLED =
   process.env.SWITCHROOM_FEED_REOPEN_AFTER_ACK !== '0'
+// Feed-reopen-after-SUBSTANTIVE. Distinct from the ack kill switch above: a
+// turn that delivered a real answer EARLY and then kept doing tool work had
+// its feed go dark for the rest of the turn. Lets the feed RE-OPEN after >=2
+// post-answer labels WITHOUT clearing finalAnswerDelivered. Off (=0) → legacy.
+// See `feed-reopen-gate.ts` for the full rationale.
+const FEED_REOPEN_AFTER_SUBSTANTIVE_ENABLED =
+  process.env.SWITCHROOM_FEED_REOPEN_AFTER_SUBSTANTIVE !== '0'
 
 // Activity-feed heartbeat (PR1). The feed is pull-only — it only re-renders on
 // a tool_label event, so a long single step that emits no new label leaves the
@@ -3282,6 +3289,18 @@ export type CurrentTurn = {
   // Reset to false on every fresh-turn enqueue alongside
   // `finalAnswerDelivered`.
   finalAnswerSubstantive: boolean
+  // Post-SUBSTANTIVE feed-reopen counter — incremented on each tool label that
+  // arrives while `finalAnswerDelivered && finalAnswerSubstantive` (a real
+  // answer landed early, model still working). At `SUBSTANTIVE_REOPEN_MIN_LABELS`
+  // (>=2) the tool_label handler reopens the feed (see `feed-reopen-gate.ts`).
+  // Reset to 0 on every fresh-turn enqueue.
+  postSubstantiveToolLabelCount: number
+  // Post-SUBSTANTIVE feed-reopen lever-1 lift latch. Set true by the tool_label
+  // handler when the long-turn reopen fires (>=2 post-answer labels). The drain
+  // reads it as `mayOpenActivityCard`'s `postAnswerMainActivity` so the fresh
+  // card may OPEN below the already-delivered reply despite the sticky lever-1
+  // latch. Sticky for the rest of the turn; reset to false on fresh-turn enqueue.
+  postAnswerMainActivity: boolean
   // Sticky "a substantive final answer has been delivered this turn" latch
   // (design `docs/message-emission-determinism.md` §9 preamble / R0). Distinct
   // from the MUTABLE `finalAnswerDelivered`, which the ack-reopen path clears
@@ -13912,6 +13931,7 @@ function gatewayStreamRenderDeps() {
     CONTEXT_EXHAUSTION_COOLDOWN_MS,
     DELIVERY_CONFIRM_ENABLED,
     FEED_REOPEN_AFTER_ACK_ENABLED,
+    FEED_REOPEN_AFTER_SUBSTANTIVE_ENABLED,
     HANDBACK_PRETURN_ENABLED,
     HISTORY_ENABLED,
     LIVENESS_TERMINAL_HONESTY,
