@@ -351,7 +351,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-six keys, by name", () => {
+  it("is overridable on exactly these forty-seven keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -387,6 +387,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
+      "HINDSIGHT_API_TEMPORAL_LANGUAGES",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       // Both spellings of every per-type slot reservation are ACCEPTED as
       // input (see HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES); only the
@@ -780,6 +781,74 @@ describe("HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT (override-only)", ()
     const perf = { env: { [KEY]: "1" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["1"]);
+  });
+});
+
+// ── the temporal-language pin ─────────────────────────────────────────────
+describe("HINDSIGHT_API_TEMPORAL_LANGUAGES (override-only, i18n restore hatch)", () => {
+  const KEY = "HINDSIGHT_API_TEMPORAL_LANGUAGES";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group", () => {
+    // switchroom's temporal-language image patch pins dateparser to this list
+    // (default "en", baked in config.py) to end the 200+-locale auto-detection
+    // pass that blocked the shared asyncio loop. Managed so an operator's
+    // hindsight.env line restoring i18n is not silently dropped by
+    // resolveHindsightPerfOverrides; override-only because the default lives in
+    // the image, so emitting one here would only create a second copy to drift.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: "en,es" }).get(KEY)).toBe("en,es");
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: "en,es" }).get(KEY)).toBe("en,es");
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — the image's baked English default stands",
+    (caps) => {
+      // Override-only means REACHABLE, not changed: a host that sets nothing
+      // keeps the image's baked default "en". Emitting a value here would pin
+      // every install to switchroom's copy of that opinion.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    // The outcome that matters: an operator re-enabling i18n from declarative
+    // yaml must actually reach the container. Before the key entered the managed
+    // set, the line read as durable config yet was dropped and the pin stayed
+    // English-only regardless.
+    const perf = { env: { [KEY]: "en,es" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get(KEY)).toEqual(["en,es"]);
+    expect(fromCompose.get(KEY)).toEqual(["en,es"]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // It belongs to no capability group, so a gate-shaped regression that only
+    // emits grouped keys would drop it. Cloud endpoint + no GPU is the harshest
+    // gating case.
+    const perf = { env: { [KEY]: "en,es" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["en,es"]);
   });
 });
 

@@ -1326,6 +1326,32 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S: "0"   # upstream behaviour, patch inert
  * ```
  *
+ * ### `HINDSIGHT_API_TEMPORAL_LANGUAGES`
+ *
+ * The language set `dateparser.search_dates()` is restricted to during temporal
+ * query analysis, comma-separated. Unpatched, `search_dates()` was called with
+ * NO `languages=`, so it auto-detected across 200+ locales INLINE on the shared
+ * asyncio loop on every recall that reached it — the loop watchdog logged 128
+ * `EVENT LOOP BLOCKED >=1s` events in 20 minutes with dateparser's per-locale
+ * language-split frames appearing 1383× in the blocked stacks (99.8 ms/call vs
+ * 0.6 ms/call once pinned, ~165×). switchroom's temporal-language image patch
+ * (`docker/Dockerfile.hindsight`, the `config.py` + `engine/query_analyzer.py`
+ * block) pins it, defaulting to `"en"` — the fleet is English.
+ *
+ * Unlike the CE-gap / MM-refresh knobs above, this IS a real `HINDSIGHT_API_`
+ * config.py field: the patch adds `ENV_TEMPORAL_LANGUAGES` and a
+ * `temporal_languages: list[str]` field that `from_env()` parses (CSV → stripped
+ * non-empty list, `["en"]` floor). Override-only here because that default lives
+ * in the image, not in switchroom's TS layer — emitting a second copy would only
+ * create drift. Restore i18n with e.g. `"en,es"`; an all-empty value floors back
+ * to English, so the loop-starving no-languages call is unreachable.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_TEMPORAL_LANGUAGES: "en,es"   # re-enable Spanish parsing
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1352,6 +1378,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
   "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
   "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
+  "HINDSIGHT_API_TEMPORAL_LANGUAGES",
 ]);
 
 /**

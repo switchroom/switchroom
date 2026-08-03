@@ -1316,6 +1316,55 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the temporal-language fix (assert-guarded, fail-loud)", () => {
+    // dateparser.search_dates() with no `languages=` auto-detected across 200+
+    // locales inline on the shared asyncio loop on every recall — 128 loop
+    // blocks/20min, 1383 language-split frames in the blocked stacks. The patch
+    // pins `languages=` to a config knob (default en) on both search_dates
+    // call sites, eliminating the auto-detection pass.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight temporal-language patch: anchor found \{n\}x/,
+    );
+
+    // The config.py knob, wired end to end: env name, default, dataclass
+    // field, and the CSV-with-["en"]-floor parse in from_env.
+    expect(dockerfile).toContain(
+      'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"',
+    );
+    expect(dockerfile).toContain('DEFAULT_TEMPORAL_LANGUAGES = "en"');
+    expect(dockerfile).toContain("    temporal_languages: list[str]");
+    expect(dockerfile).toContain("temporal_languages=_parse_str_list(");
+    expect(dockerfile).toMatch(
+      /os\.getenv\(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES\)/,
+    );
+    expect(dockerfile).toMatch(/\) or \["en"\],/);
+
+    // Both search_dates call sites pinned — the load() warm-up and the
+    // analyze() call.
+    expect(dockerfile).toContain(
+      'self._search_dates("today", languages=self._languages)',
+    );
+    expect(dockerfile).toContain(
+      "results = self._search_dates(query, settings=settings, languages=self._languages)",
+    );
+    // The analyzer resolves its pin from config, defaulting to English.
+    expect(dockerfile).toContain(
+      "self._languages = _resolve_temporal_languages()",
+    );
+
+    // The post-replace assertion that would RED if the pin were reverted: the
+    // no-languages call must be GONE from analyze(). This is the guard that
+    // makes the fix's absence a build failure, not a silent regression.
+    expect(dockerfile).toContain(
+      'assert qa.count("self._search_dates(query, settings=settings)") == 0,',
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight temporal-language patch: dateparser pinned to/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

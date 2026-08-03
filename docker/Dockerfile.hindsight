@@ -3809,6 +3809,184 @@ print(
 )
 PYEOF
 
+# --- switchroom: pin temporal dateparser to a configurable language set ---
+#
+# dateparser.search_dates() with NO `languages=` auto-detects across 200+
+# locales on EVERY recall. That auto-detection runs INLINE on the single shared
+# asyncio loop (recall + consolidation + reranker all share one process), and
+# under consolidation recall fan-out it blocked the loop for 1-2.6s at a time —
+# the loop watchdog logged 128 `EVENT LOOP BLOCKED >=1s` events in 20 minutes,
+# with dateparser's per-locale language-split frames
+# (dateparser/languages/locale.py:_split, dictionary.py:_split_by_known_words /
+# _should_capture) appearing 1383x in the blocked stacks.
+#
+# Pinning `languages=` to a fixed list eliminates the auto-detection pass
+# entirely — those language-split frames stop executing by construction, not
+# merely run faster. Measured in this image's venv on a representative recall
+# query: auto-detect 99.8 ms/call vs languages=["en"] 0.6 ms/call (~165x).
+#
+# The list is a real config.py knob, HINDSIGHT_API_TEMPORAL_LANGUAGES
+# (comma-separated, default "en"), so the fleet runs English-only by default and
+# future i18n is a pure config change with no image edit. The default is baked
+# here in config.py; the knob is exposed to operators as an override-only key in
+# src/setup/hindsight-perf-defaults.ts (HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS).
+#
+# Self-verifying; guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
+# unpatched upstream / GREEN patched) by
+# tests/docker/hindsight-temporal-language-patch.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+BASE = pathlib.Path("/app/api/hindsight_api")
+
+
+def apply(rel, edits):
+    f = BASE / rel
+    s = f.read_text()
+    for anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == 1, (
+            f"switchroom hindsight temporal-language patch: anchor found {n}x "
+            f"(expected 1) in {rel} — upstream reformatted; re-author this patch in "
+            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+        )
+        s = s.replace(anchor, repl, 1)
+    f.write_text(s)
+    return s
+
+
+# ---- 1. config.py: the HINDSIGHT_API_TEMPORAL_LANGUAGES knob (default "en") ----
+cfg = apply("config.py", [
+    (
+        'ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"\n',
+        'ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"\n'
+        "# switchroom: languages dateparser.search_dates() is restricted to during temporal\n"
+        '# query analysis. Comma-separated; default "en". Pinning this eliminates the\n'
+        "# 200+-locale auto-detection pass that blocked the shared asyncio loop.\n"
+        'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"\n',
+    ),
+    (
+        "DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1\n",
+        "DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1\n"
+        "# switchroom: English-only by default (the fleet is English); operators restore\n"
+        '# i18n with e.g. HINDSIGHT_API_TEMPORAL_LANGUAGES="en,es".\n'
+        'DEFAULT_TEMPORAL_LANGUAGES = "en"\n',
+    ),
+    (
+        "    temporal_semantic_min_similarity: float\n",
+        "    temporal_semantic_min_similarity: float\n"
+        "    temporal_languages: list[str]  # switchroom: dateparser language pin (default ['en'])\n",
+    ),
+    (
+        "            temporal_semantic_min_similarity=float(\n"
+        "                os.getenv(ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY))\n"
+        "            ),\n",
+        "            temporal_semantic_min_similarity=float(\n"
+        "                os.getenv(ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY))\n"
+        "            ),\n"
+        "            # switchroom: CSV -> stripped non-empty list; falls back to ['en'] if it\n"
+        "            # resolves empty, so the loop-starving no-languages call is unreachable.\n"
+        "            temporal_languages=_parse_str_list(\n"
+        "                os.getenv(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES)\n"
+        '            ) or ["en"],\n',
+    ),
+])
+
+# ---- 2. query_analyzer.py: pin languages= on BOTH search_dates call sites ----
+qa = apply("engine/query_analyzer.py", [
+    (
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "\n"
+        "def _resolve_temporal_languages() -> list[str]:\n"
+        '    """switchroom: the dateparser language pin, read from config (default ["en"]).\n'
+        "\n"
+        "    Read from HindsightConfig.temporal_languages, itself parsed from\n"
+        "    HINDSIGHT_API_TEMPORAL_LANGUAGES. Defensive: if config is not yet loaded\n"
+        "    (e.g. the analyzer is constructed in isolation), fall back to English so a\n"
+        "    bare search_dates(query) with no languages= -- the 200+-locale auto-detect\n"
+        "    that starves the shared asyncio loop -- can never be reached.\n"
+        '    """\n'
+        "    try:\n"
+        "        from hindsight_api.config import get_config\n"
+        "\n"
+        "        langs = [str(x).strip() for x in (get_config().temporal_languages or []) if str(x).strip()]\n"
+        "        if langs:\n"
+        "            return langs\n"
+        "    except Exception:\n"
+        "        pass\n"
+        '    return ["en"]\n',
+    ),
+    (
+        "    def __init__(self):\n"
+        '        """Initialize dateparser query analyzer."""\n'
+        "        self._search_dates = None\n",
+        "    def __init__(self):\n"
+        '        """Initialize dateparser query analyzer."""\n'
+        "        self._search_dates = None\n"
+        "        # switchroom: restrict dateparser to these languages on every call so it\n"
+        "        # never runs the 200+-locale auto-detection pass inline on the loop.\n"
+        "        self._languages = _resolve_temporal_languages()\n",
+    ),
+    (
+        "            self._search_dates = search_dates\n"
+        "            # Warm up: fire a dummy call to trigger lazy-loaded internal tables.\n"
+        '            self._search_dates("today")\n',
+        "            self._search_dates = search_dates\n"
+        "            # Warm up: fire a dummy call to trigger lazy-loaded internal tables.\n"
+        '            self._search_dates("today", languages=self._languages)\n',
+    ),
+    (
+        "            results = self._search_dates(query, settings=settings)\n",
+        "            results = self._search_dates(query, settings=settings, languages=self._languages)\n",
+    ),
+])
+
+# ---- verification ----
+# The knob is wired end to end: env name, default, dataclass field, and the
+# from_env parse that turns the CSV into a list with an ["en"] floor.
+assert 'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"' in cfg, (
+    "switchroom hindsight temporal-language patch: ENV name missing after patch"
+)
+assert 'DEFAULT_TEMPORAL_LANGUAGES = "en"' in cfg, (
+    "switchroom hindsight temporal-language patch: default missing after patch"
+)
+assert "    temporal_languages: list[str]" in cfg, (
+    "switchroom hindsight temporal-language patch: dataclass field missing after patch"
+)
+assert "temporal_languages=_parse_str_list(" in cfg, (
+    "switchroom hindsight temporal-language patch: from_env wiring missing after patch"
+)
+# Neither search_dates call may remain WITHOUT languages=. This is the assertion
+# that would RED if the pin were reverted -- the whole point of the patch.
+assert qa.count("self._search_dates(query, settings=settings)") == 0, (
+    "switchroom hindsight temporal-language patch: analyze() still calls search_dates "
+    "WITHOUT languages= -- the loop-starving auto-detection pass survives"
+)
+assert "self._search_dates(query, settings=settings, languages=self._languages)" in qa, (
+    "switchroom hindsight temporal-language patch: analyze() search_dates is not pinned"
+)
+assert 'self._search_dates("today")' not in qa, (
+    "switchroom hindsight temporal-language patch: load() warm-up still auto-detects"
+)
+assert 'self._search_dates("today", languages=self._languages)' in qa, (
+    "switchroom hindsight temporal-language patch: load() warm-up is not pinned"
+)
+assert "self._languages = _resolve_temporal_languages()" in qa, (
+    "switchroom hindsight temporal-language patch: analyzer does not resolve its language pin"
+)
+ast.parse(cfg)
+ast.parse(qa)
+print(
+    "switchroom hindsight temporal-language patch: dateparser pinned to "
+    "HINDSIGHT_API_TEMPORAL_LANGUAGES (default en) on both search_dates call sites; "
+    "the 200+-locale auto-detection pass that starved the shared asyncio loop is gone"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in
