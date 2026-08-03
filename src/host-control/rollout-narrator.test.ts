@@ -513,6 +513,14 @@ describe("LogTailRolloutNarrator", () => {
     expect(first).toContain("- ⧗ `hostd` — host-side");
     expect(first).toContain("self-heal with the first agent restart");
 
+    // hindsight skip renders as an honest ○, not a ✓. Fed in REAL plan order:
+    // refresh-hindsight runs BEFORE the canary on both plan paths (#4047).
+    n.onPhase(entry, phase("hindsight-skipped"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(relay.edits.at(-1)!.text).toContain(
+      "- ○ `hindsight` — no hindsight container on this host",
+    );
+
     // First agent done → the shared singletons' self-heal ran (⏳, verified
     // at end — never a bare ✓ mid-roll).
     n.onPhase(entry, phase("canary-start", { agent: "test-harness", n: 1, m: 2 }));
@@ -529,12 +537,6 @@ describe("LogTailRolloutNarrator", () => {
     n.onPhase(entry, phase("web-refresh-done"));
     await vi.advanceTimersByTimeAsync(500);
     expect(relay.edits.at(-1)!.text).toContain("- ✓ `switchroom-web`");
-
-    // hindsight skip renders as an honest ○, not a ✓.
-    n.onPhase(entry, phase("hindsight-skipped"));
-    await vi.advanceTimersByTimeAsync(500);
-    const t = relay.edits.at(-1)!.text;
-    expect(t).toContain("- ○ `hindsight` — no hindsight container on this host");
   });
 
   it("terminal ✅ reconciles the singleton rows from the verify-components outcome", async () => {
@@ -754,5 +756,65 @@ describe("LogTailRolloutNarrator", () => {
       relay.edits.at(-1)?.text ?? relay.posts.at(-1)?.text ?? "";
     expect(finalText).toContain("❌");
     expect(finalText).toContain("test-harness");
+  });
+
+  // ── Regression: #4047 plan order vs the monotonic seq gate ─────────────────
+  // #4047 moved refresh-hindsight BEFORE the canary restart; the narrator's
+  // seq table still anchored the hindsight phases at their pre-#4047
+  // end-of-roll position (MAX_SAFE_INTEGER - 3). So the first
+  // hindsight-refresh phase pushed lastAppliedSeq near the ceiling and the
+  // monotonic gate DROPPED every later canary/agent/web phase — the
+  // operator's card froze at "hindsight refreshed" for the rest of the roll
+  // (observed on the v0.19.48 → v0.20.0 prod roll, request
+  // mcp-rollout-1785727512601: zero card edits for the entire 16-minute
+  // canary + 12-agent window). Drive the REAL executor over the REAL hostd
+  // plan so this test re-fails if the plan order and the seq table ever
+  // drift apart again.
+  it("keeps editing through canary + agents when hindsight refreshes BEFORE the canary (real hostd plan order)", async () => {
+    const TARGET = "v1.2.3";
+    const relay = makeRelay(100);
+    const n = new LogTailRolloutNarrator(relay, { debounceMs: 200 });
+
+    const steps = planRollout(["clerk", "overlord", "test-harness"], {
+      pinToPersist: TARGET,
+      hostdContext: true,
+      skipWeb: true, // web probes shell out; the frozen window under test is canary+agents
+    });
+    // Tether to the real plan: refresh-hindsight precedes the first
+    // restart-agent. If this ever flips back, the seq table must move with it.
+    expect(steps.findIndex((s) => s.kind === "refresh-hindsight")).toBeLessThan(
+      steps.findIndex((s) => s.kind === "restart-agent"),
+    );
+
+    const entry = makeEntry();
+    const deps: RolloutDeps = {
+      run: () => ({ status: 0 }),
+      probeVersion: () => "1.2.3", // every restart converges on the target
+      log: () => {},
+      emitPhase: (p) => n.onPhase(entry, p),
+      persistPin: () => true,
+      // Hermetic AND on the prod path: hindsight exists, so the executor
+      // emits hindsight-refresh → hindsight-refresh-done before the canary.
+      hindsightExists: () => true,
+      sleepMs: async () => {},
+    };
+
+    const result = await executeRollout(steps, TARGET, deps, {
+      hostdContext: true,
+    });
+    expect(result.ok).toBe(true);
+    await vi.runAllTimersAsync();
+
+    // The card kept editing THROUGH the agent window after the pre-canary
+    // hindsight refresh: the canary and every agent appear on the final
+    // mid-roll render, and hindsight kept its observed ✓. Before the fix the
+    // canary/agent phases were dropped by the seq gate, so no agent row ever
+    // reached the card.
+    expect(relay.edits.length).toBeGreaterThanOrEqual(1);
+    const last = relay.edits.at(-1)!.text;
+    expect(last).toContain("`test-harness` (canary)");
+    expect(last).toContain("- ✓ `clerk`");
+    expect(last).toContain("- ✓ `overlord`");
+    expect(last).toContain("- ✓ `hindsight`");
   });
 });
