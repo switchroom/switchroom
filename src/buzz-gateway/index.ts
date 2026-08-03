@@ -31,6 +31,8 @@ import { createBuzzPeerClient } from "./peer-client.js";
 import { publishOutbound, type PublishTransport } from "./publisher.js";
 import { createInboundPump } from "./pump.js";
 import { createRetryQueue } from "./retry-queue.js";
+import { buzzHeartbeatStatePath, writeBuzzHeartbeat } from "./heartbeat.js";
+import { createStatsReporter, summarizePipeline } from "./stats.js";
 
 function log(msg: string): void {
   process.stderr.write(`buzz-gateway: ${msg}\n`);
@@ -178,6 +180,10 @@ async function main(): Promise<void> {
   // the hub — never retried into a duplicate (the answer already landed on
   // Telegram under `both`).
   const publishTransport: PublishTransport = (event, timeoutMs) => nostr.publish(event, timeoutMs);
+  // Outbound-mirror counters the sidecar owns (the hub-side correlation store is
+  // separate). Incremented around each publish; surfaced in the periodic stats
+  // + heartbeat below. Content-free — just the ok/failed tallies.
+  const mirror = { ok: 0, failed: 0 };
   const buzzPeer = createBuzzPeerClient({
     socketPath,
     agentName: config.agentName,
@@ -192,6 +198,8 @@ async function main(): Promise<void> {
         secretKey,
         publishTransport,
       );
+      if (result.ok) mirror.ok += 1;
+      else mirror.failed += 1;
       return {
         type: "buzz_publish_result",
         correlationId: req.correlationId,
@@ -203,8 +211,35 @@ async function main(): Promise<void> {
     log,
   });
 
+  // ── Operator observability: periodic pipeline stats + liveness heartbeat ──
+  // The reporter derives its numbers from the pump's own outcome counters (plus
+  // the mirror tally above) — it invents no parallel counting — and beats a
+  // content-free heartbeat file `switchroom doctor` reads for liveness. The
+  // interval is overridable for tests/tuning (BUZZ_STATS_INTERVAL_MS).
+  const bootTs = Date.now();
+  const heartbeatPath = buzzHeartbeatStatePath(stateDir);
+  const statsIntervalMs = Number(process.env.BUZZ_STATS_INTERVAL_MS) || 60_000;
+  const statsReporter = createStatsReporter({
+    intervalMs: statsIntervalMs,
+    sample: () => ({
+      summary: summarizePipeline(pump.stats, mirror),
+      subscribed: nostr.isSubscribed(),
+    }),
+    emit: (line) => log(line),
+    persist: (sample) =>
+      writeBuzzHeartbeat(heartbeatPath, {
+        v: 1,
+        agent: config.agentName,
+        ts: Date.now(),
+        bootTs,
+        subscribed: sample.subscribed,
+        stats: sample.summary,
+      }),
+  });
+
   const shutdown = () => {
     log("shutting down");
+    try { statsReporter.stop(); } catch { /* nothing to do */ }
     try { nostr.stop(); } catch { /* nothing to do */ }
     try { buzzPeer.close(); } catch { /* nothing to do */ }
     try { retryQueue.stop(); } catch { /* nothing to do */ }
@@ -216,6 +251,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown);
 
   nostr.start();
+  statsReporter.start();
 }
 
 main().catch((err) => {
