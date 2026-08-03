@@ -172,6 +172,32 @@ describe('gap dispatch — safe-degradation floor (msg-6897)', () => {
     expect(dest.threadId).toBe(4)
   })
 
+  it('floor is bounded by the dispatch time — a NEWER unrelated chat turn never captures the surface', () => {
+    seedIncident()
+    // The operator later drives a turn in a DIFFERENT (possibly shared) group
+    // B, AFTER the worker's dispatch. The floor must resolve to the last turn
+    // BEFORE the dispatch (topic A) — never leak the worker's surface into B.
+    insertTurn({
+      turnKey: '-1009999999999:_:9000000',
+      chatId: '-1009999999999',
+      threadId: null,
+      startedAt: 9_000_000,
+      endedAt: 9_100_000,
+    })
+    const dest = resolveWorkerSurfaceChat(db, 'wkr_gap', { fleetChatId: '', ownerDm: OWNER_DM })
+    expect(dest.chatId).toBe(TOPIC_CHAT)
+    expect(dest.threadId).toBe(Number(TOPIC_THREAD))
+    expect(dest.via).toBe('recent-turn')
+  })
+
+  it('only post-dispatch turns exist — floor declines and falls to the owner DM, not the newer chat', () => {
+    insertGapDispatchedWorker({ id: 'toolu_late', jsonlAgentId: 'wkr_late', startedAt: 1000 })
+    insertTurn({ turnKey: '-1008888888888:_:5000', chatId: '-1008888888888', threadId: null, startedAt: 5000, endedAt: 6000 })
+    const dest = resolveWorkerSurfaceChat(db, 'wkr_late', { fleetChatId: '', ownerDm: OWNER_DM })
+    expect(dest.chatId).toBe(OWNER_DM)
+    expect(dest.via).toBe('owner-dm')
+  })
+
   it('empty turns table still floors to the owner DM (durable last resort)', () => {
     insertGapDispatchedWorker({ id: 'toolu_bare', jsonlAgentId: 'wkr_bare', startedAt: 1000 })
     const dest = resolveWorkerSurfaceChat(db, 'wkr_bare', { fleetChatId: '', ownerDm: OWNER_DM })
@@ -255,15 +281,24 @@ describe('gateway dispatch-time stamp — stampSubagentDispatchTurn (msg-6897)',
 })
 
 describe('recent-turn floor internals', () => {
-  it('resolveRecentTurnFallbackChat picks the newest turn and parses its thread', () => {
+  it('resolveRecentTurnFallbackChat picks the newest PRE-DISPATCH turn and parses its thread', () => {
     insertTurn({ turnKey: 'a:_:100', chatId: '111', threadId: null, startedAt: 100, endedAt: 200 })
     insertTurn({ turnKey: `b:${TOPIC_THREAD}:300`, chatId: TOPIC_CHAT, threadId: TOPIC_THREAD, startedAt: 300, endedAt: null })
-    const recent = resolveRecentTurnFallbackChat(db)
+    // A turn STARTED AFTER the worker's dispatch must never win the floor.
+    insertTurn({ turnKey: 'c:_:900', chatId: '-1007777777777', threadId: null, startedAt: 900, endedAt: 950 })
+    insertGapDispatchedWorker({ id: 'toolu_f', jsonlAgentId: 'wkr_f', startedAt: 500 })
+    const recent = resolveRecentTurnFallbackChat(db, 'wkr_f')
     expect(recent?.chatId).toBe(TOPIC_CHAT)
     expect(recent?.threadId).toBe(Number(TOPIC_THREAD))
   })
 
-  it('returns null on an empty table', () => {
-    expect(resolveRecentTurnFallbackChat(db)).toBeNull()
+  it('returns null on an empty turns table', () => {
+    insertGapDispatchedWorker({ id: 'toolu_g', jsonlAgentId: 'wkr_g', startedAt: 500 })
+    expect(resolveRecentTurnFallbackChat(db, 'wkr_g')).toBeNull()
+  })
+
+  it('returns null when the worker has no subagents row (no dispatch time to bound by)', () => {
+    insertTurn({ turnKey: 'a:_:100', chatId: '111', threadId: null, startedAt: 100, endedAt: 200 })
+    expect(resolveRecentTurnFallbackChat(db, 'wkr_unknown')).toBeNull()
   })
 })

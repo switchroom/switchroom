@@ -675,18 +675,27 @@ export function findRecentTurnsForChat(
 
 /**
  * Return the most recent turn across ALL chats (any state — running or
- * ended), or null when the table is empty. The last-resort routing floor for
- * an unattributable sub-agent's surfaces (worker card / handback): when
- * origin resolution misses (parent_turn_key never stamped), the most recent
- * turn's chat+topic is where the operator was last working — a strictly
- * better landing spot than the owner DM with the thread stripped.
+ * ended) whose `started_at` is at or before `beforeOrAtMs`, or null when no
+ * such turn exists. The last-resort routing floor for an unattributable
+ * sub-agent's surfaces (worker card / handback): when origin resolution
+ * misses (parent_turn_key never stamped), the last turn BEFORE the worker's
+ * dispatch is where the operator dispatched it from — a strictly better
+ * landing spot than the owner DM with the thread stripped.
+ *
+ * The bound is load-bearing, not an optimisation: an UNBOUNDED "newest turn"
+ * floor routes a worker's private result to wherever the operator chatted
+ * LAST — possibly an unrelated, shared group entered after the dispatch. A
+ * turn newer than the dispatch can never be the dispatching context, so it
+ * is never a valid floor; callers with no pre-dispatch turn fall through to
+ * the owner-DM last resort instead.
  */
-export function findMostRecentTurn(db: SqliteDatabase): Turn | null {
+export function findMostRecentTurn(db: SqliteDatabase, beforeOrAtMs: number): Turn | null {
   const row = db.prepare(`
     SELECT * FROM turns
+    WHERE started_at <= ?
     ORDER BY started_at DESC
     LIMIT 1
-  `).get() as RawTurnRow | undefined
+  `).get(beforeOrAtMs) as RawTurnRow | undefined
   return row ? mapRow(row) : null
 }
 

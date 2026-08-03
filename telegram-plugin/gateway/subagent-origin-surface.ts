@@ -15,11 +15,16 @@
  *      stamped (pretool-hook marker stamp #2085, gateway dispatch stamp, or
  *      the watcher's started_at window backfill).
  *   2. `fleet`        — the configured fleet chat (permanently '' today).
- *   3. `recent-turn`  — NEW safe-degradation floor: the most recent turn's
- *      chat+topic. A gap-dispatched worker (no turns row open at its
- *      started_at, stamp missed) lands NEAR the work — in the topic the
- *      operator last drove — instead of the owner DM with the thread
- *      stripped.
+ *   3. `recent-turn`  — NEW safe-degradation floor: the chat+topic of the
+ *      most recent turn AT OR BEFORE the worker's dispatch time. A
+ *      gap-dispatched worker (no turns row open at its started_at, stamp
+ *      missed) lands NEAR the work — in the topic the operator drove last
+ *      before dispatching — instead of the owner DM with the thread
+ *      stripped. Bounded by the dispatch time so a turn the operator drives
+ *      LATER in an unrelated (possibly shared) chat can never capture the
+ *      worker's surface; with no pre-dispatch turn (or no subagents row to
+ *      date the dispatch from) the floor declines and resolution falls to
+ *      the owner DM.
  *   4. `owner-dm`     — the durable last resort ("wrong chat" beats
  *      "no card").
  */
@@ -29,7 +34,10 @@ import {
   findMostRecentTurn,
   type Turn,
 } from '../registry/turns-schema.js'
-import { resolveSubagentOriginTurnKey } from '../registry/subagents-schema.js'
+import {
+  resolveSubagentOriginTurnKey,
+  getSubagentByJsonlId,
+} from '../registry/subagents-schema.js'
 
 /** Structural sqlite shape — byte-matches the registry modules' own
  *  bun:sqlite structural type, so handles flow both ways without casts. */
@@ -82,17 +90,53 @@ export function resolveSubagentOriginChatDb(
 }
 
 /**
- * The most-recent-turn routing floor: chat+topic of the newest turns row
- * (running or ended). Null on empty table / unusable row; never throws.
+ * The recent-turn routing floor: chat+topic of the newest turns row
+ * (running or ended) started AT OR BEFORE the worker's own dispatch time
+ * (`subagents.started_at`, looked up by jsonl stem). The bound is
+ * load-bearing (see `findMostRecentTurn`): a turn newer than the dispatch
+ * can never be the dispatching context, so flooring to it would leak the
+ * worker's surface into whatever unrelated chat the operator drove LAST.
+ * Null when the worker has no subagents row (no dispatch time to bound by —
+ * declining beats guessing), no pre-dispatch turn exists, or the row is
+ * unusable; never throws.
  */
 export function resolveRecentTurnFallbackChat(
   db: SqliteDatabase,
+  jsonlAgentId: string,
 ): SubagentSurfaceChat | null {
   try {
-    return turnToSurfaceChat(findMostRecentTurn(db))
+    const worker = getSubagentByJsonlId(db, jsonlAgentId)
+    if (worker == null) return null
+    return turnToSurfaceChat(findMostRecentTurn(db, worker.started_at))
   } catch {
     return null
   }
+}
+
+/**
+ * Once-per-agent recent-turn-floor audit line (msg-6897 hardening). The floor
+ * firing is deliberate safe degradation, but it must never be silent — an
+ * operator diagnosing a mis-landed worker surface needs the routing decision
+ * on stderr, exactly like the gateway's owner-DM fallback log. Bounded FIFO
+ * set (a late duplicate line is harmless; the cap bounds a long gateway
+ * lifetime); a gateway restart clears it. `log` injectable for tests.
+ */
+const RECENT_TURN_FLOOR_LOG_CAP = 256
+const recentTurnFloorLogged = new Set<string>()
+export function noteWorkerRecentTurnFloor(
+  agentId: string,
+  dest: SubagentSurfaceChat,
+  log: (line: string) => void = (line) => process.stderr.write(line),
+): void {
+  if (recentTurnFloorLogged.has(agentId)) return
+  recentTurnFloorLogged.add(agentId)
+  if (recentTurnFloorLogged.size > RECENT_TURN_FLOOR_LOG_CAP) {
+    const oldest = recentTurnFloorLogged.values().next().value
+    if (oldest != null) recentTurnFloorLogged.delete(oldest)
+  }
+  log(
+    `telegram gateway: worker origin unresolved agent=${agentId} — flooring to pre-dispatch recent turn chat=${dest.chatId}${dest.threadId != null ? ` thread=${dest.threadId}` : ''}\n`,
+  )
 }
 
 /**
@@ -108,7 +152,7 @@ export function resolveWorkerSurfaceChat(
   const origin = db != null ? resolveSubagentOriginChatDb(db, jsonlAgentId) : null
   if (origin != null && origin.chatId.length > 0) return { ...origin, via: 'origin' }
   if (opts.fleetChatId.length > 0) return { chatId: opts.fleetChatId, via: 'fleet' }
-  const recent = db != null ? resolveRecentTurnFallbackChat(db) : null
+  const recent = db != null ? resolveRecentTurnFallbackChat(db, jsonlAgentId) : null
   if (recent != null) return { ...recent, via: 'recent-turn' }
   if (opts.ownerDm.length > 0) return { chatId: opts.ownerDm, via: 'owner-dm' }
   return { chatId: '', via: 'none' }

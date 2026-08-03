@@ -973,7 +973,7 @@ import {
 } from './bridge-dead-watchdog.js'
 import { findAgentProcessInContainer } from './boot-probes.js'
 import { applySubagentsSchema, getSubagentByJsonlId, listNonTerminalSubagentsForTurn } from '../registry/subagents-schema.js'
-import { resolveSubagentOriginChatDb, resolveRecentTurnFallbackChat } from './subagent-origin-surface.js'
+import { resolveSubagentOriginChatDb, resolveRecentTurnFallbackChat, resolveWorkerSurfaceChat, noteWorkerRecentTurnFloor } from './subagent-origin-surface.js'
 import type { InterruptedSubagent } from './resume-inbound-builder.js'
 import { resolveWorkerFeedDispatch, decideWorkerFeedDestination, handleWorkerResume, type WorkerFeedDispatch } from './worker-feed-dispatch.js'
 import {
@@ -1969,14 +1969,15 @@ function resolveSubagentOriginChat(
 }
 
 /**
- * Most-recent-turn routing floor (msg-6897 misroute fix): where the operator
- * last drove a turn. Used ONLY after origin resolution has missed — a
- * gap-dispatched worker's card/handback lands in the topic of the newest
- * turn instead of the owner DM with the thread stripped. Null-safe.
+ * Recent-turn routing floor (msg-6897 misroute fix): the newest turn AT OR
+ * BEFORE the worker's dispatch time — where the operator dispatched it from.
+ * Used ONLY after origin resolution has missed; bounded by the dispatch time
+ * so a later turn in an unrelated (possibly shared) chat can never capture
+ * the worker's surface. Null-safe (no pre-dispatch turn → owner-DM fallback).
  */
-function recentTurnFallbackChat(): { chatId: string; threadId?: number } | null {
+function recentTurnFallbackChat(agentId: string): { chatId: string; threadId?: number } | null {
   if (turnsDb == null) return null
-  return resolveRecentTurnFallbackChat(turnsDb)
+  return resolveRecentTurnFallbackChat(turnsDb, agentId)
 }
 
 /**
@@ -2057,46 +2058,36 @@ const workerFeedOriginDeferrals = new Map<string, number>()
 const WORKER_FEED_ORIGIN_DEFER_MAX = 10
 
 /**
- * Resolve a worker-feed destination chat with a guaranteed last resort.
+ * Resolve a worker-feed destination chat with a guaranteed last resort
+ * (universal-liveness: "any active work has a card" — the owner DM is the
+ * durable floor, "wrong chat" beats "no card").
  *
- * The universal-liveness contract is "any active work has a card, at any
- * nesting depth, with or without a parent turn open." Origin resolution
- * (`resolveSubagentOriginChat`) only succeeds when the ancestor turn row is
- * in `turnsDb` and history is enabled; a depth-2+ worker whose chain can't
- * be walked (history disabled, row reaped, ancestor never stamped) would
- * otherwise fall through `fleetChatId || allowFrom[0]` and, if those are
- * empty too, hit the `chatId.length === 0` skip in `workerActivityFeed.update`
- * — painting NOTHING, silently. That is the one path most likely to violate
- * "any and all active work has a card."
- *
- * This never returns `''`: the precedence is origin chat → fleet chat →
- * first allowed chat (the owner DM). The owner DM is the durable floor —
- * "wrong chat" beats "no card." A one-line routing-decision log flags the
- * fallback so an operator can see the misroute without it reading as an
- * error (it isn't one — the card surfaced).
+ * The ladder itself (origin → fleet → recent-turn → owner DM) lives in
+ * `resolveWorkerSurfaceChat` (subagent-origin-surface.ts) — the ONE tested
+ * implementation, shared with the handback/progress deciders below so the
+ * precedence cannot diverge per call site again. This wrapper adds only the
+ * gateway's audit logs and the #3458 fallback-topic carry.
  */
 function resolveWorkerFeedChat(
   agentId: string,
   fleetChatId: string,
-  // Origin sources threadId; when origin is null the caller can pass the
-  // fallback chat's sibling forum-topic id so a misrouted card still lands
-  // in the origin topic instead of General (#3458 exhausted-defer paint).
+  // Origin/floor source threadId; otherwise the caller can pass the fallback
+  // chat's sibling forum-topic id so a misrouted card still lands in the
+  // origin topic instead of General (#3458 exhausted-defer paint).
   fallbackThreadId?: number,
 ): { chatId: string; threadId?: number } {
-  const origin = resolveSubagentOriginChat(agentId)
-  if (origin != null && origin.chatId.length > 0) return origin
-  if (fleetChatId.length > 0) return { chatId: fleetChatId, threadId: fallbackThreadId }
-  // msg-6897 misroute fix — most-recent-turn floor BEFORE the owner DM: a
-  // worker whose origin never stamped (gap dispatch) lands in the topic the
-  // operator last drove, not the DM with the thread stripped.
-  const recent = recentTurnFallbackChat()
-  if (recent != null) return recent
-  const ownerDm = loadAccess().allowFrom[0] ?? ''
-  if (origin == null && fleetChatId.length === 0 && ownerDm.length > 0) {
-    // Origin unresolved and no fleet chat — the card lands in the owner DM.
-    noteWorkerFeedOwnerDmFallback(agentId)
+  const dest = resolveWorkerSurfaceChat(turnsDb, agentId, {
+    fleetChatId,
+    ownerDm: loadAccess().allowFrom[0] ?? '',
+  })
+  if (dest.via === 'recent-turn') noteWorkerRecentTurnFloor(agentId, dest)
+  if (dest.via === 'owner-dm') noteWorkerFeedOwnerDmFallback(agentId)
+  return {
+    chatId: dest.chatId,
+    threadId:
+      dest.threadId ??
+      (dest.via === 'origin' || dest.via === 'recent-turn' ? undefined : fallbackThreadId),
   }
-  return { chatId: ownerDm, threadId: origin?.threadId ?? fallbackThreadId }
 }
 
 // ─── Periodic history reaper (#1073) ──────────────────────────────────────
@@ -24335,33 +24326,34 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   // when this group's LAST worker finishes; no per-worker unpin.
                 }
 
-                // Origin first; when it missed (gap dispatch — parent_turn_key
-                // never stamped), the most-recent-turn floor keeps the handback
-                // in the topic the operator last drove instead of the owner DM
-                // with the thread stripped (msg-6897 misroute fix).
-                const handbackOrigin =
-                  resolveSubagentOriginChat(agentId) ?? recentTurnFallbackChat()
+                // ONE ladder — origin → fleet → recent-turn floor → owner DM
+                // (resolveWorkerSurfaceChat, the tested precedence, shared with
+                // resolveWorkerFeedChat — msg-6897 misroute fix).
+                const hbOwnerDm = loadAccess().allowFrom[0] ?? ''
+                const handbackSurface = resolveWorkerSurfaceChat(turnsDb, agentId, {
+                  fleetChatId,
+                  ownerDm: hbOwnerDm,
+                })
+                if (handbackSurface.via === 'recent-turn') noteWorkerRecentTurnFloor(agentId, handbackSurface)
                 const decision = decideSubagentHandback({
                   handbackEnvValue: process.env.SWITCHROOM_SUBAGENT_HANDBACK,
                   outcome,
                   isBackground,
-                  // Route the handback (the worker's result → a synthesized
-                  // turn) back to the conversation the Task was dispatched
-                  // from, so the result lands where the user asked — not the
-                  // agent's DM. Falls back to fleetChatId/ownerChatId.
-                  fleetChatId: handbackOrigin?.chatId || fleetChatId,
-                  // Supergroup topic the Task was dispatched from. Plumbed
-                  // through so the handback turn (and the model's in-voice
-                  // "here's what the worker found" reply) land in the
+                  // The resolved surface chat (empty on owner-dm/none so the
+                  // decider's own ownerChatId floor stays the last resort).
+                  fleetChatId:
+                    handbackSurface.via === 'owner-dm' || handbackSurface.via === 'none'
+                      ? ''
+                      : handbackSurface.chatId,
+                  // Supergroup topic the surface resolved to, so the handback
+                  // turn (and the model's in-voice reply) land in the
                   // originating topic — not the chat's last-seen topic.
-                  // Applied only when the origin chat resolved (DM fallback
-                  // is topic-less).
-                  ...(handbackOrigin?.threadId != null
-                    ? { originThreadId: handbackOrigin.threadId }
+                  ...(handbackSurface.threadId != null
+                    ? { originThreadId: handbackSurface.threadId }
                     : {}),
                   // Owner-chat fallback: if the parent-turn chat can't be
                   // resolved, route to the owner chat.
-                  ownerChatId: loadAccess().allowFrom[0] ?? '',
+                  ownerChatId: hbOwnerDm,
                   taskDescription: description,
                   resultText,
                   // Plumb the JSONL agent id so the spool can mint a
@@ -24665,7 +24657,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                     stampTurn != null
                       ? { chatId: stampTurn.sessionChatId, threadId: stampTurn.sessionThreadId }
                       : wfOrigin == null
-                        ? recentTurnFallbackChat()
+                        ? recentTurnFallbackChat(agentId)
                         : null
                   const dest = decideWorkerFeedDestination({
                     origin: wfOrigin,
@@ -24695,6 +24687,10 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   }
                   // Card fell to the owner DM — log the misroute once per agent.
                   if (dest.ownerDmFallback) noteWorkerFeedOwnerDmFallback(agentId)
+                  // Recent-turn floor fed the stamp slot and won — audit once (msg-6897).
+                  if (stampTurn == null && wfOrigin == null && wfStamp != null && dest.chatId === wfStamp.chatId) {
+                    noteWorkerRecentTurnFloor(agentId, wfStamp)
+                  }
                   void workerActivityFeed?.update(
                     agentId,
                     dest.chatId,
@@ -24727,23 +24723,30 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // the pure decision (gate 1b → 'skeleton-liveness'), which drops
                 // it deterministically (controls-in-code, unit-tested) rather
                 // than an opaque inline return here.
-                // Same origin → recent-turn floor ladder as the handback above
-                // (msg-6897 misroute fix).
-                const progressOrigin =
-                  resolveSubagentOriginChat(agentId) ?? recentTurnFallbackChat()
+                // Same single ladder as the handback above — origin → fleet →
+                // recent-turn floor → owner DM (resolveWorkerSurfaceChat,
+                // msg-6897 misroute fix).
+                const pgOwnerDm = loadAccess().allowFrom[0] ?? ''
+                const progressSurface = resolveWorkerSurfaceChat(turnsDb, agentId, {
+                  fleetChatId,
+                  ownerDm: pgOwnerDm,
+                })
+                if (progressSurface.via === 'recent-turn') noteWorkerRecentTurnFloor(agentId, progressSurface)
                 const decision = decideSubagentProgress({
                   skeleton: skeleton === true,
                   disableEnvValue: process.env.SWITCHROOM_DISABLE_SUBAGENT_PROGRESS,
                   isBackground,
-                  // Prefer the conversation the Task was dispatched from over
-                  // the owner DM (see resolveSubagentOriginChat).
-                  fleetChatId: progressOrigin?.chatId || fleetChatId,
-                  // Carry the dispatching topic so the progress wake lands in
-                  // it (applied only when the origin chat resolved).
-                  ...(progressOrigin?.threadId != null
-                    ? { originThreadId: progressOrigin.threadId }
+                  // The resolved surface chat (empty on owner-dm/none so the
+                  // decider's own ownerChatId floor stays the last resort).
+                  fleetChatId:
+                    progressSurface.via === 'owner-dm' || progressSurface.via === 'none'
+                      ? ''
+                      : progressSurface.chatId,
+                  // Carry the resolved topic so the progress wake lands in it.
+                  ...(progressSurface.threadId != null
+                    ? { originThreadId: progressSurface.threadId }
                     : {}),
-                  ownerChatId: loadAccess().allowFrom[0] ?? '',
+                  ownerChatId: pgOwnerDm,
                   subagentJsonlId: agentId,
                   taskDescription: description,
                   latestSummary,
@@ -24764,7 +24767,7 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                 // in (origin thread) so the right lane is yielded in a
                 // supergroup; chat-level for DM-shaped agents.
                 pendingProgress.clearPending(
-                  statusKey(decision.chatId, progressOrigin?.threadId),
+                  statusKey(decision.chatId, progressSurface.threadId),
                   'progress',
                 )
                 process.stderr.write(
