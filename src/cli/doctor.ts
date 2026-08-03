@@ -77,6 +77,7 @@ import { runComponentVersionChecks } from "./doctor-component-versions.js";
 import { runAssetPayloadChecks } from "./doctor-asset-payload.js";
 import { runMicrosoftChecks } from "./doctor-microsoft.js";
 import { runNotionChecks } from "./doctor-notion.js";
+import { runBuzzChecks } from "./doctor-buzz.js";
 import { runMcpSecretChecks } from "./doctor-mcp-secrets.js";
 import { runContextChecks } from "./doctor-context.js";
 import { runCredentialsMigrationChecks } from "./doctor-credentials-migration.js";
@@ -4159,6 +4160,10 @@ export function registerDoctorCommand(program: Command): void {
           {
             title: "Notion (RFC notion-integration)",
             results: await runNotionChecks(config, { vaultAclReader }),
+          },
+          {
+            title: "Buzz (Nostr co-channel)",
+            results: await runBuzzChecks(config, { vaultAclReader }),
           },
           {
             title: "MCP Connections (auth)",
