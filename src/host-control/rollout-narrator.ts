@@ -413,16 +413,26 @@ export class LogTailRolloutNarrator implements RolloutNarrator {
         return 2 * (phase.n ?? 1) + 1;
       case "web-refresh":
       case "web-refresh-done":
-        // In-plan web singleton refresh — after every agent restart, before
-        // the hindsight refresh. Equal-seq: -done REFINES -start (the
+        // In-plan web singleton refresh — after every agent restart, near
+        // the end of the roll. Equal-seq: -done REFINES -start (the
         // executor emits them strictly in order on one stdout).
         return Number.MAX_SAFE_INTEGER - 4;
       case "hindsight-refresh":
       case "hindsight-refresh-done":
       case "hindsight-skipped":
-        // After the web refresh, before the deferral note. Same equal-seq
-        // refine-only shape as web above.
-        return Number.MAX_SAFE_INTEGER - 3;
+        // Since #4047 the hindsight refresh runs BEFORE the canary on BOTH
+        // plan paths (planRollout pushes refresh-hindsight right after
+        // apply), so it slots between apply (0) and the n=1 canary window
+        // (2). The previous anchor here (MAX_SAFE_INTEGER - 3) encoded the
+        // pre-#4047 end-of-roll position and FROZE the narration card for
+        // the rest of the roll: once hindsight-refresh applied, every later
+        // canary/agent/web phase compared strictly lower and was dropped by
+        // the monotonic gate (observed on the v0.19.48 → v0.20.0 prod roll,
+        // request mcp-rollout-1785727512601: zero card edits between
+        // hindsight-refresh-done and hostd-web-deferred, 16 minutes). Same
+        // equal-seq refine-only shape as web (-done/-skipped refine
+        // -refresh).
+        return 1;
       case "hostd-web-deferred":
         return Number.MAX_SAFE_INTEGER - 1; // near the end, before terminal
       default:
