@@ -573,6 +573,8 @@ interface SeedRow {
   user?: string | null;
   ts: number;
   text: string;
+  reply_to_message_id?: number | null;
+  reply_to_text?: string | null;
 }
 
 /**
@@ -600,10 +602,11 @@ c.execute(
 )
 for r in rows:
     c.execute(
-        "INSERT INTO messages(chat_id,thread_id,message_id,role,user,user_id,ts,text) "
-        "VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages(chat_id,thread_id,message_id,role,user,user_id,ts,text,reply_to_message_id,reply_to_text) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (r["chat_id"], r.get("thread_id"), r["message_id"], r["role"],
-         r.get("user"), None, r["ts"], r["text"]),
+         r.get("user"), None, r["ts"], r["text"],
+         r.get("reply_to_message_id"), r.get("reply_to_text")),
     )
 c.commit()
 c.close()
@@ -764,6 +767,86 @@ describe("handoff-briefing.sh recent-conversation scoping", () => {
     expect(status).toBe(0);
     expect(output).not.toContain("Recent conversation");
     expect(output.trim()).toBe("");
+  });
+});
+
+// ── Recent-conversation reply-antecedent rendering ──────────────────────────────
+//
+// recordInbound persists reply_to_message_id / reply_to_text on a native reply
+// (issue #119); for a reply to the BOT's OWN message the buffer fallback
+// (resolveReplyToFromBuffer, #4306) recovers the text Telegram omits from the
+// live update and persists it too. The briefing used to SELECT only
+// role/user/ts/text and flat-dump the transcript, dropping that antecedent
+// structure — so a post-reset session reading the reply had no idea what it
+// referred to. These tests seed the reply columns and assert the "↪ replying
+// to" annotation lands (text when present, id-only fallback otherwise). A
+// regression back to the columnless SELECT fails all three.
+describe("handoff-briefing.sh recent-conversation reply-antecedent rendering", () => {
+  let tmpDir: string;
+  let stateDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "handoff-reply-"));
+    stateDir = join(tmpDir, "telegram");
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function runBriefing(
+    scopeEnv: Record<string, string> = {},
+  ): { status: number | null; output: string } {
+    const result = spawnSync("bash", [HANDOFF_BRIEFING_SCRIPT, "--stdout"], {
+      env: {
+        ...process.env,
+        AGENT_DIR: tmpDir,
+        TELEGRAM_STATE_DIR: stateDir,
+        HINDSIGHT_API_URL: "",
+        HINDSIGHT_BANK_ID: "",
+        WORKSPACE_DIR: tmpDir,
+        ...scopeEnv,
+      },
+      timeout: 10_000,
+    });
+    return { status: result.status, output: result.stdout.toString() };
+  }
+
+  it("renders the reply antecedent TEXT under a native reply (the reply-to-bot recovery case)", () => {
+    // The bot answered (message 1), then the user native-replied to that bot
+    // message (message 2). Telegram omitted the bot message's .text on the
+    // live update, but resolveReplyToFromBuffer recovered it and recordInbound
+    // persisted it as reply_to_text on the inbound row.
+    seedHistoryDb(stateDir, [
+      { chat_id: "c1", thread_id: null, message_id: 1, role: "assistant", ts: 1000, text: "Added the dentist appointment for Tuesday 3pm." },
+      { chat_id: "c1", thread_id: null, message_id: 2, role: "user", user: "ken", ts: 1001, text: "is this on my calendar yet?", reply_to_message_id: 1, reply_to_text: "Added the dentist appointment for Tuesday 3pm." },
+    ]);
+    const { status, output } = runBriefing({ SWITCHROOM_PENDING_CHAT_ID: "c1", SWITCHROOM_PENDING_THREAD_ID: "NULL" });
+    expect(status).toBe(0);
+    expect(output).toContain("is this on my calendar yet?");
+    // The antecedent structure the flat dump used to lose.
+    expect(output).toContain("↪ replying to: Added the dentist appointment for Tuesday 3pm.");
+  });
+
+  it("falls back to the message id when the antecedent id is known but its text is NULL", () => {
+    seedHistoryDb(stateDir, [
+      { chat_id: "c1", thread_id: null, message_id: 1, role: "assistant", ts: 1000, text: "(a photo)" },
+      { chat_id: "c1", thread_id: null, message_id: 2, role: "user", user: "ken", ts: 1001, text: "what is that?", reply_to_message_id: 1, reply_to_text: null },
+    ]);
+    const { status, output } = runBriefing({ SWITCHROOM_PENDING_CHAT_ID: "c1", SWITCHROOM_PENDING_THREAD_ID: "NULL" });
+    expect(status).toBe(0);
+    expect(output).toContain("what is that?");
+    expect(output).toContain("↪ replying to message #1");
+  });
+
+  it("emits no antecedent line for a plain (non-reply) message", () => {
+    seedHistoryDb(stateDir, [
+      { chat_id: "c1", thread_id: null, message_id: 1, role: "user", user: "ken", ts: 1000, text: "just a normal message" },
+    ]);
+    const { status, output } = runBriefing({ SWITCHROOM_PENDING_CHAT_ID: "c1", SWITCHROOM_PENDING_THREAD_ID: "NULL" });
+    expect(status).toBe(0);
+    expect(output).toContain("just a normal message");
+    expect(output).not.toContain("↪ replying to");
   });
 });
 

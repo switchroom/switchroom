@@ -192,7 +192,7 @@ try:
     )
 
     cur.execute(
-        "SELECT role, user, ts, text FROM messages WHERE "
+        "SELECT role, user, ts, text, reply_to_message_id, reply_to_text FROM messages WHERE "
         + " AND ".join(where)
         + " ORDER BY ts DESC LIMIT ?",
         params,
@@ -209,7 +209,27 @@ try:
             text = text[:600] + "… [truncated]"
         # Escape any literal backslash to keep the shell echo safe
         text = text.replace("\\", "\\\\")
+        # Reply antecedent (issue #119 native reply). recordInbound persists
+        # reply_to_message_id/reply_to_text — the latter recovered from the
+        # history buffer even when the reply target was the bot's OWN message
+        # (Telegram omits its text on the live update). Surfacing it as an
+        # indented "↪ replying to" line carries the antecedent STRUCTURE into
+        # the post-reset briefing, so a fresh session reading this transcript
+        # knows what "this"/"that" in the reply refers to instead of guessing.
+        # Without it the flat dump loses the thread of any native reply.
         print(f"[{ts_str}] {label}: {text}")
+        reply_id = row["reply_to_message_id"]
+        reply_text = row["reply_to_text"]
+        if reply_text is not None and reply_text != "":
+            rt = reply_text
+            if len(rt) > 200:
+                rt = rt[:200] + "…"
+            rt = rt.replace("\\", "\\\\").replace("\n", " ")
+            print(f"       ↪ replying to: {rt}")
+        elif reply_id is not None:
+            # Antecedent known by id only (text unavailable — reply target had
+            # no text, or predates the reply_to_text buffer backfill).
+            print(f"       ↪ replying to message #{reply_id}")
 except Exception as e:
     sys.stderr.write(f"handoff-briefing: sqlite query failed: {e}\n")
     sys.exit(0)
