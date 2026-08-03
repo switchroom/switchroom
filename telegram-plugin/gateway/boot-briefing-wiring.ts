@@ -25,7 +25,16 @@ import {
   excludeWindowFromResumeInbound,
   readRestartBreadcrumb,
   renderBootBriefing,
+  type BriefingDailyMemory,
+  type HindsightRecallResult,
 } from './boot-briefing-builder.js'
+
+/** Recall query the legacy handoff-briefing.sh sends verbatim. */
+const HINDSIGHT_RECALL_QUERY = 'what was happening recently in our conversation?'
+/** `max_tokens` the shell script sends (jq `--argjson m 800`). */
+const HINDSIGHT_RECALL_MAX_TOKENS = 800
+/** Recall HTTP budget — the shell's `curl -m 4`. */
+const HINDSIGHT_TIMEOUT_MS = 4000
 
 export interface MaybeQueueBootBriefingOptions {
   env: Record<string, string | undefined>
@@ -40,16 +49,139 @@ export interface MaybeQueueBootBriefingOptions {
   put: (agent: string, msg: InboundMessage) => unknown
   log?: (line: string) => void
   nowMs?: number
+  /** Test seam: injected `fetch` for the Hindsight recall. Defaults to the
+   *  runtime global `fetch`. Never used in production wiring. */
+  fetchImpl?: typeof fetch
+}
+
+/**
+ * Fetch the Hindsight recall slice (source 2 of the legacy handoff
+ * contract). Mirrors `bin/handoff-briefing.sh`'s request EXACTLY:
+ * `POST ${HINDSIGHT_API_URL}/v1/default/banks/${HINDSIGHT_BANK_ID}/memories/recall`
+ * with body `{query, max_tokens: 800}` and a 4s timeout.
+ *
+ * Graceful-skip on ANY failure — missing env, timeout, non-200, malformed
+ * JSON — returns `[]` so the briefing degrades to its other sources rather
+ * than crashing or blocking boot. Never throws.
+ */
+export async function fetchHindsightRecall(
+  env: Record<string, string | undefined>,
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number; log?: (line: string) => void } = {},
+): Promise<HindsightRecallResult[]> {
+  const base = (env.HINDSIGHT_API_URL ?? '').replace(/\/+$/, '')
+  const bank = env.HINDSIGHT_BANK_ID ?? ''
+  if (!base || !bank) return []
+  const doFetch = opts.fetchImpl ?? (globalThis.fetch as typeof fetch | undefined)
+  if (typeof doFetch !== 'function') return []
+  const log = opts.log
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? HINDSIGHT_TIMEOUT_MS)
+  try {
+    const url = `${base}/v1/default/banks/${encodeURIComponent(bank)}/memories/recall`
+    const resp = await doFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: HINDSIGHT_RECALL_QUERY,
+        max_tokens: HINDSIGHT_RECALL_MAX_TOKENS,
+      }),
+      signal: controller.signal,
+    })
+    if (!resp.ok) {
+      // Never log the URL/host — keep the deny reason generic (defence in
+      // depth even though the recall URL carries no token).
+      log?.(`telegram gateway: boot-briefing hindsight recall non-200 (${resp.status}) — skipping section\n`)
+      return []
+    }
+    const body = (await resp.json()) as { results?: Array<{ text?: unknown; timestamp?: unknown }> }
+    const results = Array.isArray(body?.results) ? body.results : []
+    return results.map((r) => ({
+      text: typeof r?.text === 'string' ? r.text : '',
+      timestamp: typeof r?.timestamp === 'string' ? r.timestamp : null,
+    }))
+  } catch {
+    // Timeout (abort), DNS/connection failure, malformed JSON — all graceful.
+    log?.('telegram gateway: boot-briefing hindsight recall unavailable — skipping section\n')
+    return []
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Read today's daily-memory file (source 3 of the legacy handoff contract):
+ * `<workspaceDir>/memory/<YYYY-MM-DD>.md`, with the date derived in the
+ * agent's LOCAL timezone (SWITCHROOM_TIMEZONE → TZ → system-local), exactly
+ * as `bin/workspace-dynamic-hook.sh` reads it.
+ *
+ * NOTE — deliberate divergence from bin/handoff-briefing.sh: that script
+ * reads `${WORKSPACE_DIR:-$AGENT_DIR}/memory/...`, but WORKSPACE_DIR is never
+ * set in the agent env, so it resolves to `<agentDir>/memory/...` — the WRONG
+ * path. Daily notes actually live at `<agentDir>/workspace/memory/...` (see
+ * `resolveAgentWorkspaceDir` and `bin/workspace-dynamic-hook.sh`, the
+ * authoritative reader). We mirror the correct path here (honouring an
+ * explicit WORKSPACE_DIR override if one is ever set), not the shell's bug.
+ * Returns null on a missing/empty file or any read error. Never throws.
+ */
+export function readDailyMemory(
+  agentDir: string,
+  env: Record<string, string | undefined>,
+  nowMs: number,
+  readFile: (path: string) => string = (p) => readFileSync(p, 'utf8'),
+): BriefingDailyMemory | null {
+  const date = agentLocalDate(nowMs, env.SWITCHROOM_TIMEZONE || env.TZ || undefined)
+  if (!date) return null
+  const workspaceDir = env.WORKSPACE_DIR && env.WORKSPACE_DIR.trim()
+    ? env.WORKSPACE_DIR
+    : join(agentDir, 'workspace')
+  const file = join(workspaceDir, 'memory', `${date}.md`)
+  try {
+    const content = readFile(file)
+    if (!content || !content.trim()) return null
+    return { date, content }
+  } catch {
+    return null // ENOENT / unreadable — no section, no crash.
+  }
+}
+
+/** Format `nowMs` as `YYYY-MM-DD` in `tz` (SWITCHROOM_TIMEZONE → TZ →
+ *  system-local). Uses `en-CA` which renders ISO `YYYY-MM-DD`. Returns ''
+ *  if the timezone is invalid (Intl throws) so the caller skips the
+ *  section rather than looking up the wrong day. */
+function agentLocalDate(nowMs: number, tz: string | undefined): string {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    })
+    // en-CA yields YYYY-MM-DD; guard against locale/impl drift anyway.
+    const s = fmt.format(new Date(nowMs))
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : ''
+  } catch {
+    return ''
+  }
 }
 
 /**
  * Build + enqueue the boot briefing when the feature flag and suppression
  * rules allow. Returns the queued inbound (for observability/tests) or
  * null when nothing was queued.
+ *
+ * ASYNC because source 2 (Hindsight recall) is an HTTP fetch. The fetch is
+ * AWAITED to completion-or-timeout BEFORE `put` runs, so the briefing is
+ * only ever enqueued with its Hindsight section already assembled — it can
+ * never be delivered with the section racing in late. The 4s ceiling bounds
+ * the added boot latency, and (like every other path here) any failure
+ * degrades to "no Hindsight section", never a blocked or crashed boot. The
+ * caller must AWAIT this before the resume inbound is spooled / the
+ * boot-replay loop pulls live entries, to preserve briefing-before-resume
+ * delivery order.
  */
-export function maybeQueueBootBriefing(
+export async function maybeQueueBootBriefing(
   opts: MaybeQueueBootBriefingOptions,
-): InboundMessage | null {
+): Promise<InboundMessage | null> {
   const log = opts.log ?? ((l: string) => process.stderr.write(l))
   try {
     const agentDir = opts.stateDir.endsWith('/telegram')
@@ -131,12 +263,37 @@ export function maybeQueueBootBriefing(
       nowMs,
       exclude: excludeWindowFromResumeInbound(opts.resumeMsg),
     })
+    // No active Telegram surface = no delivery target for the synthetic
+    // briefing inbound (it routes to the primary surface's chat). Short-circuit
+    // BEFORE the Hindsight fetch so a zero-history boot never pays the 4s
+    // recall timeout. (Deliberate narrowing vs the file-writing legacy path,
+    // which has no routing target and can emit a Hindsight/daily-only
+    // briefing — documented in the PR.)
+    if (surfaces.length === 0) {
+      // Consume the generation even when empty (parity with the !text path
+      // below, and with main's pre-short-circuit behaviour where zero
+      // surfaces rendered to '' and hit markGeneration()). Had there been
+      // nothing to brief at boot, a later respawn on the same generation must
+      // not suddenly brief mid-session just because fresh messages arrived
+      // after the session came up.
+      markGeneration()
+      log('telegram gateway: boot-briefing empty (no recent surfaces) — nothing queued\n')
+      return null
+    }
     const restartReason = readRestartBreadcrumb({
       restartReasonPath: join(agentDir, '.restart-reason'),
       env: opts.env,
       readFile: (p) => readFileSync(p, 'utf8'),
     })
-    const text = renderBootBriefing(surfaces, { nowMs, restartReason })
+    // Sources 2 + 3 of the legacy handoff contract. The Hindsight fetch is
+    // AWAITED here (4s ceiling) so the section is present before `put` — the
+    // briefing is never enqueued mid-fetch.
+    const hindsight = await fetchHindsightRecall(opts.env, {
+      fetchImpl: opts.fetchImpl,
+      log,
+    })
+    const dailyMemory = readDailyMemory(agentDir, opts.env, nowMs)
+    const text = renderBootBriefing(surfaces, { nowMs, restartReason, hindsight, dailyMemory })
     if (!text) {
       // Consume the generation even when empty: had there been nothing to
       // brief at boot, a later respawn must not suddenly brief mid-session
@@ -157,7 +314,8 @@ export function maybeQueueBootBriefing(
     log(
       `telegram gateway: boot-briefing queued chat=${primary.chatId}` +
         `${primary.threadId != null ? ` thread=${primary.threadId}` : ''} ` +
-        `surfaces=${surfaces.length} chars=${text.length} ` +
+        `surfaces=${surfaces.length} hindsight=${hindsight.length} ` +
+        `daily=${dailyMemory != null ? 'yes' : 'no'} chars=${text.length} ` +
         `cap=${GATEWAY_BOOT_BRIEFING_CAPABILITY}\n`,
     )
     return msg

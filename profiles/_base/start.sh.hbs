@@ -70,6 +70,21 @@ if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" 
   export SWITCHROOM_SESSION_BRIEFING="{{#if sessionBriefingMode}}{{{sessionBriefingMode}}}{{else}}legacy{{/if}}"
   export SWITCHROOM_RESUME_MODE="{{#if resumeMode}}{{{resumeMode}}}{{else}}handoff{{/if}}"
 
+{{#if hindsightEnabled}}
+  # Hindsight endpoint for the gateway boot briefing (session_continuity.briefing:
+  # gateway). When assembling the fresh-session reorientation briefing the gateway
+  # daemon does its OWN Hindsight recall — mirroring bin/handoff-briefing.sh — to
+  # fold recent memory into the briefing alongside the durable Telegram history.
+  # The authoritative exports live in the inner pass (~line 893), AFTER the
+  # gateway fork below, so without this hoist the forked daemon never sees the
+  # endpoint and the Hindsight section silently no-ops for every boot (same
+  # start.sh env-fork landmine as SWITCHROOM_SESSION_BRIEFING above). Hoist both
+  # here, before the fork; idempotent with the inner-pass exports (same rendered
+  # template values). Pinned by tests/scaffold.gateway-env-order.test.ts.
+  export HINDSIGHT_API_URL={{{hindsightApiBaseUrlQ}}}
+  export HINDSIGHT_BANK_ID={{{hindsightBankIdQ}}}
+{{/if}}
+
   # Force-fresh suppression signal for the gateway boot briefing. The gateway
   # suppresses the briefing when this boot is a /reset·/new fresh start —
   # re-feeding the just-reset conversation into the fresh session would defeat
