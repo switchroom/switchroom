@@ -24,6 +24,7 @@
  */
 
 import { randomUUID } from "crypto";
+import { join } from "path";
 import type { OutboundToBuzzMessage } from "./ipc-protocol.js";
 import {
   resolveRoute,
@@ -32,6 +33,10 @@ import {
   type BuzzCoords,
   type Channel,
 } from "./channel-route.js";
+import {
+  createCorrelationStore,
+  type CorrelationStore,
+} from "./buzz-mirror-correlation-store.js";
 
 export type BuzzPeerSender = (msg: OutboundToBuzzMessage) => boolean;
 
@@ -47,6 +52,14 @@ export interface BuzzMirrorConfig {
    * threaded replies still work (they carry their own channelId).
    */
   defaultChannelId: string;
+  /**
+   * Absolute path to the durable msg→Buzz correlation journal (#4222). When
+   * set, the `${chatId}:${messageId}` → published-event map is persisted and
+   * reloaded on construction, so an `edit_message` correction survives a gateway
+   * restart. Omit (dev/one-shot/tests) to keep the map in-memory only — same
+   * bound, no durability. See `buzz-mirror-correlation-store.ts`.
+   */
+  correlationJournalPath?: string;
   /** Optional log sink (defaults to a no-op). */
   log?: (msg: string) => void;
 }
@@ -97,9 +110,20 @@ class BuzzMirror {
   private readonly pending = new Map<string, PendingPublish>();
   private readonly pendingOrder: string[] = [];
 
-  /** `${chatId}:${messageId}` → the published Buzz event it maps to. */
-  private readonly msgToBuzz = new Map<string, { eventId: string; channelId: string }>();
-  private readonly msgOrder: string[] = [];
+  /**
+   * `${chatId}:${messageId}` → the published Buzz event it maps to. Durable
+   * (JSONL journal) when `correlationJournalPath` is configured, so a correction
+   * survives a gateway restart (#4222); the store enforces the same MAX_TRACKED
+   * FIFO bound in memory and on disk.
+   */
+  private readonly msgToBuzz: CorrelationStore;
+
+  /**
+   * Count of `mirrorCorrection` calls whose key was genuinely absent from the
+   * correlation store (never mirrored, or evicted past the bound) — surfaced for
+   * the loud-miss regression assertion, not just the log line.
+   */
+  private correctionMisses = 0;
 
   /** `${chatId}:${messageId}` → live correction debounce timer. */
   private readonly correctionTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -107,11 +131,28 @@ class BuzzMirror {
   constructor(cfg: BuzzMirrorConfig) {
     this.cfg = cfg;
     this.log = cfg.log ?? (() => {});
+    this.msgToBuzz = createCorrelationStore({
+      journalPath: cfg.correlationJournalPath,
+      capacity: MAX_TRACKED,
+      log: this.log,
+    });
+  }
+
+  /** Test/introspection: number of corrections that missed the correlation store. */
+  getCorrectionMisses(): number {
+    return this.correctionMisses;
   }
 
   /** Register the transport to the duplex Buzz peer (ipcServer.sendToBuzzPeer). */
   attachSender(sender: BuzzPeerSender): void {
     this.sender = sender;
+  }
+
+  /** Release the correlation journal fd and cancel any pending correction timers. */
+  close(): void {
+    for (const timer of this.correctionTimers.values()) clearTimeout(timer);
+    this.correctionTimers.clear();
+    this.msgToBuzz.close();
   }
 
   private evict<T>(map: Map<string, T>, order: string[]): void {
@@ -187,7 +228,22 @@ class BuzzMirror {
   mirrorCorrection(input: MirrorCorrectionInput): void {
     try {
       const target = this.msgToBuzz.get(input.telegramMessageKey);
-      if (!target) return; // this Telegram message was never mirrored to Buzz
+      if (!target) {
+        // No mapping for this key — either it was genuinely never mirrored, or
+        // it aged out past MAX_TRACKED (memory AND journal). Either way the
+        // correction cannot land, so DON'T fail silently: emit a loud log and
+        // bump the miss counter so the gap is observable (#4222, audit "at
+        // minimum" ask). Pre-#4222 a restart also landed here (empty map) — the
+        // durable journal is what keeps that from being the common case.
+        this.correctionMisses++;
+        this.log(
+          `buzz-mirror: CORRECTION MISS — no Buzz correlation for Telegram ` +
+            `message ${input.telegramMessageKey}; the edit could NOT be mirrored ` +
+            `(never mirrored, or evicted past MAX_TRACKED=${MAX_TRACKED}). ` +
+            `Buzz copy may be stale. total_misses=${this.correctionMisses}`,
+        );
+        return;
+      }
 
       const existing = this.correctionTimers.get(input.telegramMessageKey);
       if (existing) clearTimeout(existing);
@@ -239,12 +295,11 @@ class BuzzMirror {
       return;
     }
     // Record the published event against each Telegram message it mirrored, so
-    // a later edit_message on any of them can target it for a correction.
+    // a later edit_message on any of them can target it for a correction. The
+    // store persists (durable journal) + enforces the MAX_TRACKED FIFO bound.
     for (const key of p.telegramMessageKeys) {
       this.msgToBuzz.set(key, { eventId: msg.eventId, channelId: p.channelId });
-      this.msgOrder.push(key);
     }
-    this.evict(this.msgToBuzz, this.msgOrder);
   }
 
   private publish(
@@ -285,12 +340,31 @@ let singleton: BuzzMirror | null = null;
  * every hook site is a no-op.
  */
 export function initBuzzMirror(cfg: BuzzMirrorConfig): BuzzMirror {
+  singleton?.close(); // release any prior instance's journal fd + timers
   singleton = new BuzzMirror(cfg);
   return singleton;
 }
 
 export function getBuzzMirror(): BuzzMirror | null {
   return singleton;
+}
+
+/**
+ * Resolve the durable msg→Buzz correlation journal path from env (#4222). Lives
+ * under the same `$TELEGRAM_STATE_DIR/buzz/` dir as the sidecar's dedup journal
+ * but at a DISTINCT filename — a collision on `journal.jsonl` would corrupt
+ * both. `BUZZ_MIRROR_CORRELATION_PATH` overrides. When `TELEGRAM_STATE_DIR` is
+ * unset (dev/one-shot), returns undefined so the store degrades to in-memory
+ * only rather than scattering a journal under the home dir.
+ */
+export function resolveCorrelationJournalPath(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  const override = env.BUZZ_MIRROR_CORRELATION_PATH?.trim();
+  if (override) return override;
+  const stateDir = env.TELEGRAM_STATE_DIR?.trim();
+  if (!stateDir) return undefined;
+  return join(stateDir, "buzz", "mirror-correlation.jsonl");
 }
 
 /**
@@ -315,6 +389,7 @@ export function maybeBootBuzzMirror(
     mode,
     agentName: env.SWITCHROOM_AGENT_NAME?.trim() ?? "",
     defaultChannelId: env.BUZZ_CHANNEL_IDS?.trim() ?? "",
+    correlationJournalPath: resolveCorrelationJournalPath(env),
     log: (m) => process.stderr.write(`telegram gateway: buzz-mirror — ${m}\n`),
   });
   bm.attachSender(sender);
@@ -323,6 +398,7 @@ export function maybeBootBuzzMirror(
 
 /** Test-only: tear down the singleton so cases don't leak state into each other. */
 export function __resetBuzzMirrorForTests(): void {
+  singleton?.close();
   singleton = null;
 }
 
