@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.20.3 — Handoff hardening + root-tier host-access honesty
+
+> **Version note:** an anomalous lightweight `v0.20.2` tag was pushed straight
+> onto the #4313 commit as an urgent event-loop-starvation hotfix and never got
+> its own CHANGELOG entry. That fix is folded into this release below so the
+> record is complete; there is no separate v0.20.2 section.
+
+### Handoff / boot-briefing — reply antecedents survive a restart
+
+A post-reset session now reads a native reply with its antecedent structure
+intact instead of guessing what "this"/"that" refers to.
+
+- **Render the persisted reply antecedent in the boot briefing (#4312):** the
+  briefing previously flat-dumped the last N messages and ignored the persisted
+  `reply_to_message_id` / `reply_to_text` columns `recordInbound` writes on a
+  native reply (#119). `bin/handoff-briefing.sh` now selects those columns and
+  renders an indented `↪ replying to: <text>` line under each reply (id-only
+  fallback `↪ replying to message #<id>` when the antecedent text is NULL). This
+  closes the last consumer left unrendered by the live-inbound 3-tier antecedent
+  resolver that shipped in #4306 — the reactions path is deliberately untouched.
+- **Harden the legacy-DB render (#4320, closes #4316):** on a history `messages`
+  table predating the reply columns (pre-#119 schema), the extended SELECT
+  raised `sqlite3.OperationalError`, which the outer `except → sys.exit(0)`
+  silently swallowed — dropping the **entire** Telegram-history section from the
+  briefing. The Python block now probes `PRAGMA table_info(messages)` once up
+  front and selects the extended column list only when both reply columns exist,
+  else the legacy `role,user,ts,text` list, guarding the antecedent render on
+  the same flag. A seeded pre-column DB test proves the section still renders;
+  mutation-confirmed red.
+
+### Hindsight — temporal dateparser no longer starves the event loop
+
+- **Pin the temporal dateparser to configurable languages (#4313, shipped as
+  the `v0.20.2` hotfix tag):** `DateparserQueryAnalyzer.analyze()` called
+  `dateparser.search_dates()` with **no `languages=`**, so it auto-detected
+  across 200+ locales inline on the single shared asyncio loop (recall,
+  consolidation, and the reranker share one process). Under consolidation recall
+  fan-out this blocked the loop for 1–2.6s — a live 20-minute watchdog window
+  caught **128** `EVENT LOOP BLOCKED ≥1s` events with dateparser's per-locale
+  language-split frames appearing 1383×. Pinning `languages=` removes the
+  auto-detection pass by construction and drops each call from ~99.8ms to ~0.6ms
+  (~165× faster). The list is a real `config.py` knob,
+  **`HINDSIGHT_API_TEMPORAL_LANGUAGES`** (comma-separated, default `"en"`), so
+  future i18n is a pure config change, not an image edit. Ships as an anchored,
+  self-verifying Python patch in `docker/Dockerfile.hindsight` with a live
+  RED/GREEN docker test.
+- **Assert the temporal parse stays non-empty (#4320, closes #4318):** the GREEN
+  probe captured the `languages=` kwarg but discarded the real return value, so
+  nothing proved an explicit-date query (`"what happened on june 10 2025"`)
+  still parses non-empty under the `["en"]` pin — a pin that narrowed the locale
+  set until it stopped parsing would have been "fast" and green. The probe now
+  captures the spy's real return value and asserts it is non-empty end to end;
+  mutation-confirmed red.
+
+### Profiles / root-tier — test before you claim a limit
+
+- **Root-tier agents test via the root shell before claiming a limit (#4321):** a
+  fleet-wide prompt fragment told **every** agent it was sandboxed (`read_only:
+  true` rootfs, "I'm not root", "operator action"), but `compose.ts` gives
+  root-tier agents `user: "0:0"` and skips `read_only`/`cap_drop`/
+  `no-new-privileges` — so a root agent genuinely IS uid 0 with the host docker
+  socket and `/host`,`/host-home` mounted while a fleet-wide file told it the
+  opposite, and it wrongly concluded "I can't / that's operator-only". This adds
+  a root-only reflex to test a capability via the root shell before claiming a
+  limit, kills the `SANDBOX_GUIDANCE` ↔ `compose.ts` contradiction at its source
+  via a conditional-phrasing "Root-tier exception" note (no per-agent variant of
+  the shared fleet-invariants file exists to `{{#if root}}`-gate), and broadens
+  the no-exfil carve-out so the reflex can't become a secret-leak loophole:
+  "Never exfiltrate" now explicitly covers secret VALUES wherever they surface,
+  the vault dir, `credentials/*.env`, AND a peer's env via `docker
+  exec`/`docker inspect`. Render tests assert the reflex and carve-out appear
+  only for a `root: true` agent (a leak regression test, not just a presence
+  check); the CLAUDE.md byte ratchet stays green and unchanged.
+
 ## v0.20.1 — Buzz goes live (Nostr identity + threaded mirror), work-conserving recall admission, boot-briefing parity
 
 ### Buzz co-channel — Nostr identity, NIP-10 threading, operator audit surface
