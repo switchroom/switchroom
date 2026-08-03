@@ -450,6 +450,32 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
 
   _gateway_bundle=/opt/switchroom/telegram-plugin/dist/gateway/gateway.js
   _telegram_enabled={{#if telegramEnabledFlag}}{{telegramEnabledFlag}}{{else}}true{{/if}}
+
+  # Version-skew handshake for the gateway boot briefing (#4245). This start.sh
+  # is fresh; the deployed /opt/switchroom gateway bundle may NOT be. When it
+  # sets briefing=gateway it also skips the legacy shell handoff-briefing
+  # assembler (inner pass, below) — so if the bundle PREDATES the boot-briefing
+  # builder, BOTH paths are dead and the agent gets a SILENT no-briefing until
+  # the image is updated. The stale bundle cannot self-report a feature it lacks,
+  # so this fresh start.sh does the handshake: grep the bundle for the capability
+  # sentinel the builder exports (GATEWAY_BOOT_BRIEFING_CAPABILITY in
+  # telegram-plugin/gateway/boot-briefing-capability.ts; the bundle is built
+  # un-minified so the literal survives verbatim). On a miss, warn LOUDLY and
+  # drop a marker so the inner pass runs the legacy handoff assembler as a
+  # fallback instead of leaving this boot with nothing. Resolve the marker afresh
+  # every boot (rm, then re-touch only on a confirmed miss) so a later image
+  # update self-heals with no leftover state.
+  _briefing_skew_marker="{{agentDir}}/.gateway-briefing-unavailable"
+  rm -f "$_briefing_skew_marker"
+  if [ "$SWITCHROOM_SESSION_BRIEFING" = "gateway" ]; then
+    if [ -f "$_gateway_bundle" ] && grep -q '{{gatewayBriefingCapability}}' "$_gateway_bundle" 2>/dev/null; then
+      : # bundle carries the boot-briefing builder — gateway path is live
+    else
+      echo "[start.sh] WARNING: session_continuity.briefing=gateway is configured, but the deployed gateway bundle ($_gateway_bundle) PREDATES the boot-briefing builder (capability sentinel '{{gatewayBriefingCapability}}' absent from the bundle). The gateway cannot assemble the reorientation briefing, and the legacy shell handoff path is skipped for 'gateway' mode — so this boot would otherwise get NO briefing at all. FALLING BACK to the legacy handoff-briefing assembler for this boot. Update the agent image (/opt/switchroom) to a build that includes the boot-briefing feature to use the gateway path." >&2
+      touch "$_briefing_skew_marker" 2>/dev/null || true
+    fi
+  fi
+
   if [ "$_telegram_enabled" = "true" ] && [ -f "$_gateway_bundle" ] && command -v bun >/dev/null 2>&1; then
     _switchroom_supervise gateway /var/log/switchroom/gateway-supervisor.log \
       bun "$_gateway_bundle" &
@@ -1430,7 +1456,18 @@ if [ "$_HANDOFF_STALE" = "1" ]; then
   # running the shell assembler here would double-inject the same recent
   # conversation. The Stop-hook .handoff.md path below is left untouched in
   # this stage of the migration.
-  if [ "$SWITCHROOM_RESUME_MODE" = "handoff" ] && [ "{{#if sessionBriefingMode}}{{{sessionBriefingMode}}}{{else}}legacy{{/if}}" != "gateway" ] && command -v handoff-briefing.sh >/dev/null 2>&1; then
+  #
+  # EXCEPTION (#4245): when the outer pass detected a bundle version skew
+  # (briefing=gateway requested but the deployed gateway bundle predates the
+  # boot-briefing builder), it dropped the .gateway-briefing-unavailable marker.
+  # In that case the gateway path is dead, so run the legacy assembler here as a
+  # fallback even in 'gateway' mode — the double-inject risk does not apply
+  # because the stale gateway never queues a briefing. This is a file-based
+  # handshake on purpose: the marker survives the outer→inner tmux re-exec
+  # deterministically (written before the exec, read after), unlike env.
+  if [ "$SWITCHROOM_RESUME_MODE" = "handoff" ] \
+     && { [ "{{#if sessionBriefingMode}}{{{sessionBriefingMode}}}{{else}}legacy{{/if}}" != "gateway" ] || [ -f "{{agentDir}}/.gateway-briefing-unavailable" ]; } \
+     && command -v handoff-briefing.sh >/dev/null 2>&1; then
     export AGENT_DIR="{{agentDir}}"
     timeout 5 handoff-briefing.sh 2>/dev/null || true
   fi
