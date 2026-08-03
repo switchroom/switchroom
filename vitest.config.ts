@@ -166,6 +166,9 @@ export default defineConfig({
       // PR #994.
       "**/telegram-plugin/uat/**",
       "**/telegram-plugin/tests/history.test.ts",
+      // reply-to-buffer-history.test.ts seeds a real history.db via bun:sqlite
+      // (recordOutbound → lookup → recordInbound) — excluded here, run via bun.
+      "**/telegram-plugin/tests/reply-to-buffer-history.test.ts",
       // boot-briefing-builder.test.ts seeds a real history.db via bun:sqlite
       // (gateway boot briefing) — excluded here, run via test:bun.
       "**/telegram-plugin/tests/boot-briefing-builder.test.ts",

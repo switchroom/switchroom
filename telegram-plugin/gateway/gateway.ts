@@ -127,6 +127,7 @@ import {
   routeInbound,
   admitInbound,
   buildReplyForwardContext,
+  resolveReplyToFromBuffer,
   buildInboundEnvelope,
   INBOUND_ROUTER_V2,
   runPreTurnIntercepts,
@@ -15078,17 +15079,39 @@ export async function handleInbound(
 
   // Reply-to + forward-origin context — moved to buildReplyForwardContext
   // (#2996 P7 PR-10, pure builder).
-  const {
-    replyToMessageId,
-    replyToText,
-    replyToTextEscaped,
-    forwardOrigins,
-    forwardOriginMeta,
-    primaryForwardOrigin,
-  } = buildReplyForwardContext({
+  const replyForwardCtx = buildReplyForwardContext({
     ctx,
     coalescedForwardOrigins,
     replyToTextMax: REPLY_TO_TEXT_MAX,
+  })
+  const {
+    replyToMessageId,
+    forwardOrigins,
+    forwardOriginMeta,
+    primaryForwardOrigin,
+  } = replyForwardCtx
+
+  // Reply-to buffer fallback (post-reset continuity, resolveReplyToFromBuffer).
+  // On a native reply to the BOT's OWN message, Telegram delivers
+  // reply_to_message.message_id but NOT its .text — so the live reply text is
+  // empty even though we authored (and, via recordOutbound, persisted) that
+  // message to history.db (role='assistant', 30-day retention). Recover it so
+  // the antecedent survives a session reset. Fills replyToText (raw, so the
+  // recordInbound write below persists it — envelope-only would leave the row
+  // NULL and starve future briefings), replyToTextEscaped (channel meta), and
+  // replyToRole (the reply_to_role attribute). Only when the live text is
+  // empty; degrades silently when history is off / the row is missing.
+  const {
+    replyToText,
+    replyToTextEscaped,
+    replyToRole,
+  } = resolveReplyToFromBuffer({
+    replyToMessageId,
+    replyToText: replyForwardCtx.replyToText,
+    replyToTextEscaped: replyForwardCtx.replyToTextEscaped,
+    historyEnabled: HISTORY_ENABLED,
+    replyToTextMax: REPLY_TO_TEXT_MAX,
+    lookup: (messageId) => lookupMessageRoleAndText(chat_id, messageId),
   })
 
   if (HISTORY_ENABLED) {
@@ -15165,6 +15188,7 @@ export async function handleInbound(
     priorAssistantPreview,
     replyToMessageId,
     replyToTextEscaped,
+    replyToRole,
     forwardOriginMeta,
     topicFramingEnabled: TOPIC_FRAMING_ENABLED,
     personDirectory: PERSON_DIRECTORY,

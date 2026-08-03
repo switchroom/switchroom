@@ -151,9 +151,20 @@ export function buildReplyForwardContext(p: ReplyForwardContextParams): {
   // (for channel meta).
   const replyToMsg = p.ctx.message?.reply_to_message
   const replyToMessageId = replyToMsg?.message_id
-  const replyToTextRaw = replyToMsg
-    ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
-    : undefined
+  // Native partial-quote preference (Bot API 7.0+ `message.quote`, issue #119
+  // follow-up). When the user long-presses a message and drag-selects a
+  // substring before choosing Reply, Telegram delivers only that quoted span
+  // on `message.quote.text` — the user is pointing at that exact slice, so it
+  // is a stronger antecedent than the full parent message. Prefer it over the
+  // parent `.text`/`.caption`, and over the history-buffer fallback the
+  // gateway runs when neither is present. Accessed defensively in case the
+  // installed grammy/@grammyjs/types predate `TextQuote`.
+  const quoteText = p.ctx.message?.quote?.text
+  const replyToTextRaw = (quoteText != null && quoteText.length > 0)
+    ? quoteText
+    : replyToMsg
+      ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
+      : undefined
   const replyToText = replyToTextRaw != null
     ? (replyToTextRaw.length > p.replyToTextMax
         ? replyToTextRaw.slice(0, p.replyToTextMax - 1) + '…'
@@ -183,6 +194,73 @@ export function buildReplyForwardContext(p: ReplyForwardContextParams): {
   }
 }
 
+/** Inputs for {@link resolveReplyToFromBuffer}. */
+export interface ReplyToBufferFallbackParams {
+  /** From {@link buildReplyForwardContext}. */
+  replyToMessageId: number | undefined
+  /** Raw reply text off the live update (for the SQLite write); empty when the
+   *  reply target is the bot's own message (Telegram omits its text). */
+  replyToText: string | undefined
+  /** XML-escaped reply text for the channel meta; empty in the same case. */
+  replyToTextEscaped: string | undefined
+  /** HISTORY_ENABLED — the DB is only present when history is on. */
+  historyEnabled: boolean
+  /** REPLY_TO_TEXT_MAX. */
+  replyToTextMax: number
+  /** `lookupMessageRoleAndText` bound to the chat, or any equivalent. May
+   *  throw (e.g. requireDb when history disabled mid-run) — this is caught. */
+  lookup: (messageId: number) => { role: 'user' | 'assistant'; text: string } | null
+}
+
+/**
+ * Reply-to buffer fallback (post-reset continuity). On a native reply to the
+ * BOT's OWN message, Telegram delivers `reply_to_message.message_id` but NOT
+ * its `.text` — so the live reply text is empty even though the gateway
+ * authored (and, via `recordOutbound`, persisted) that message. This recovers
+ * the antecedent from the local history buffer so it survives a session reset
+ * (`resume_mode: handoff`), where the transcript is gone.
+ *
+ * Returns updated `replyToText` (raw, for the SQLite `recordInbound` write —
+ * envelope-only would leave the row NULL and starve future handoff briefings),
+ * `replyToTextEscaped` (for the channel-meta `reply_to_text`), and the
+ * recovered `replyToRole` ('assistant' = the bot's own message, disambiguating
+ * the "you're replying to yourself" case). Pure except for the injected
+ * `lookup`. Only fills in when the live reply text is empty — never overwrites
+ * a non-empty live value (a partial-quote or a reply to a person's message).
+ * Degrades silently to the id-only inputs on any lookup failure.
+ */
+export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
+  replyToText: string | undefined
+  replyToTextEscaped: string | undefined
+  replyToRole: 'user' | 'assistant' | undefined
+} {
+  let replyToText = p.replyToText
+  let replyToTextEscaped = p.replyToTextEscaped
+  let replyToRole: 'user' | 'assistant' | undefined
+  const liveTextEmpty = replyToTextEscaped == null || replyToTextEscaped.length === 0
+  if (p.historyEnabled && p.replyToMessageId != null && liveTextEmpty) {
+    try {
+      const recovered = p.lookup(p.replyToMessageId)
+      if (recovered && recovered.text.length > 0) {
+        replyToText =
+          recovered.text.length > p.replyToTextMax
+            ? recovered.text.slice(0, p.replyToTextMax - 1) + '…'
+            : recovered.text
+        replyToTextEscaped = formatReplyToText(recovered.text, p.replyToTextMax)
+        replyToRole = recovered.role
+      } else if (recovered) {
+        // Row exists (authorship known) but text is empty/redacted — still
+        // surface the role so the model knows whose message it is replying to.
+        replyToRole = recovered.role
+      }
+    } catch {
+      // History disabled mid-run / requireDb throws / row missing — degrade
+      // silently to the id-only inputs (current behavior).
+    }
+  }
+  return { replyToText, replyToTextEscaped, replyToRole }
+}
+
 /** Inputs for {@link buildInboundEnvelope} — every field is an at-call
  * captured value (steering meta, at-receipt snapshots, resolved attachments),
  * never a live getter. */
@@ -206,6 +284,11 @@ export interface EnvelopeBuildParams {
   priorAssistantPreview: string | undefined
   replyToMessageId: number | undefined
   replyToTextEscaped: string | undefined
+  /** Authorship of the replied-to message ('assistant' = the bot's own
+   * message, 'user' = a person's), when known — recovered from the history
+   * buffer by handleInbound's reply-to fallback. Undefined when the role
+   * can't be determined (e.g. text came live off the update, not the DB). */
+  replyToRole: 'user' | 'assistant' | undefined
   forwardOriginMeta: Record<string, string>
   /** TOPIC_FRAMING_ENABLED — fixed constant. */
   topicFramingEnabled: boolean
@@ -300,6 +383,13 @@ export function buildInboundEnvelope(p: EnvelopeBuildParams): InboundMessage {
       // Use the XML-escaped form for the meta — the raw form is in the
       // SQLite buffer for verbatim retrieval via get_recent_messages.
       ...(p.replyToTextEscaped != null && p.replyToTextEscaped.length > 0 ? { reply_to_text: p.replyToTextEscaped } : {}),
+      // Authorship of the replied-to message. Disambiguates "you are replying
+      // to the BOT's own message" (assistant) from "…to a person's message"
+      // (user) — the incident where a native reply to one of the bot's own
+      // messages ("is this added as a calendar invite yet?") left the agent
+      // guessing the antecedent. Free: the history-buffer lookup that recovers
+      // reply_to_text already returns the role. Emitted only when known.
+      ...(p.replyToRole != null ? { reply_to_role: p.replyToRole } : {}),
       // Forwarded-message origin (server-stamped, attrs-only — see above).
       // forwarded_from / forwarded_from_type / forwarded_from_id /
       // forwarded_date, plus numbered _2.. siblings for a multi-origin

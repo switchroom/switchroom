@@ -56,9 +56,11 @@ export interface MaybeQueueBootBriefingOptions {
 
 /**
  * Fetch the Hindsight recall slice (source 2 of the legacy handoff
- * contract). Mirrors `bin/handoff-briefing.sh`'s request EXACTLY:
+ * contract). Mirrors `bin/handoff-briefing.sh`'s request shape:
  * `POST ${HINDSIGHT_API_URL}/v1/default/banks/${HINDSIGHT_BANK_ID}/memories/recall`
- * with body `{query, max_tokens: 800}` and a 4s timeout.
+ * with body `{query, max_tokens: 800}`. This gateway path uses a 4s abort
+ * timeout; the shell script caps its curl at 3s (it runs under start.sh's
+ * outer `timeout`, which the async gateway daemon is not subject to).
  *
  * Graceful-skip on ANY failure — missing env, timeout, non-200, malformed
  * JSON — returns `[]` so the briefing degrades to its other sources rather
