@@ -10,8 +10,9 @@
  * lives in `src/buzz-provision.ts`, which imports no vault/broker/commander
  * code. This file is the thin host wiring: it builds the real vault-backed
  * store and broker-backed grant, reads the compose file + sidecar log for
- * status, and delegates. The nsec never transits this file — it is generated
- * inside the core and written straight to the vault by the injected store.
+ * status, and delegates. The nsec transits this file only INTO the vault
+ * writer (the `writeNsec` closure hands it straight to `setStringSecret`); it
+ * is never logged, printed, or returned upward — the core never hands it back.
  */
 
 import type { Command } from "commander";
@@ -173,6 +174,7 @@ export function registerBuzzCommand(program: Command): void {
         const parentOpts = program.opts();
         const vaultPath = getVaultPath(parentOpts.config);
         const brokerOpts = getBrokerOpts(parentOpts.config);
+        const nsecKey = buzzNsecKey(agent);
 
         let ttlSeconds: number | null;
         try {
@@ -197,13 +199,42 @@ export function registerBuzzCommand(program: Command): void {
           async writeNsec(key, nsec) {
             setStringSecret(await pass(), vaultPath, key, nsec);
           },
-          async grantRead(agentName, key) {
+          async existingGrantKeys(agentName) {
+            // Read the agent's CURRENT active grant key sets so the mint below
+            // UNIONs the nsec key in rather than clobbering the agent's single
+            // .vault-token with an nsec-only grant. Mirrors the gateway's
+            // grant-union flow (callback-query-handlers.ts, #1051): pick the
+            // most-recent non-revoked, non-expired grant. `null` on any broker
+            // failure so the core fails open (nsec-only mint) with a warning.
+            try {
+              const r = await listGrantsViaBroker(agentName, brokerOpts);
+              if (r.kind !== "ok") return null;
+              const now = Math.floor(Date.now() / 1000);
+              // listGrants filters revoked_at only; drop expired locally.
+              const active = r.grants
+                .filter((g) => g.expires_at === null || g.expires_at > now)
+                .sort((a, b) => {
+                  const dt = (b.created_at ?? 0) - (a.created_at ?? 0);
+                  if (dt !== 0) return dt;
+                  return b.id.localeCompare(a.id);
+                });
+              if (active.length === 0) return { read: [], write: [] };
+              return {
+                read: active[0]!.key_allow ?? [],
+                write: active[0]!.write_allow ?? [],
+              };
+            } catch {
+              return null;
+            }
+          },
+          async grantRead(agentName, readKeys, writeKeys) {
             const r = await mintGrantViaBroker({
               ...brokerOpts,
               agent: agentName,
-              keys: [key],
+              keys: readKeys,
+              ...(writeKeys.length > 0 ? { write_keys: writeKeys } : {}),
               ttl_seconds: ttlSeconds,
-              description: `buzz nsec read (${key})`,
+              description: `buzz nsec read (${nsecKey})`,
             });
             return r.kind === "ok" ? { ok: true } : { ok: false, error: r.msg };
           },
@@ -260,14 +291,20 @@ export function registerBuzzCommand(program: Command): void {
         }
       }
 
-      // 2. Grants for this agent.
-      let grants: { agent_slug: string; key_allow: string[] }[] | null = null;
+      // 2. Grants for this agent. Carry expires_at through — the broker's
+      //    listGrants filters revoked_at only, so an EXPIRED grant still
+      //    arrives here; computeBuzzStatus must see the expiry to avoid
+      //    false-greening a channel the sidecar gets `grant-expired` on.
+      let grants:
+        | { agent_slug: string; key_allow: string[]; expires_at: number | null }[]
+        | null = null;
       try {
         const r = await listGrantsViaBroker(agent, brokerOpts);
         if (r.kind === "ok") {
           grants = r.grants.map((g) => ({
             agent_slug: g.agent_slug,
             key_allow: g.key_allow,
+            expires_at: g.expires_at,
           }));
         }
       } catch {
