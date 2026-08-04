@@ -8,6 +8,11 @@
  * (failed 9/1931) for the original symptom.
  */
 import { describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test'
+import {
+  progressFallbackAtCap,
+  recordProgressFallbackSend,
+  _resetProgressFallbackCap,
+} from '../gateway/progress-fallback-cap.js'
 
 // Mock state shared across tests (simulates the module-level state in server.ts / gateway.ts)
 const progressUpdateLastSent = new Map<string, number>()
@@ -25,17 +30,24 @@ type ProgressUpdateResult =
 
 /**
  * Simplified progress_update implementation for testing.
- * Returns the same shape as the real tool handler.
+ * Mirrors the real tool handler's ORDERING (gateway.ts `executeProgressUpdate`):
+ * check caps → send (may throw) → count the delivery only AFTER it lands. The
+ * turn-less fallback path calls the REAL cap module, not a copy.
+ *
+ * `send` is an injectable seam so a test can make the send throw and assert no
+ * slot is consumed (Fix 2). It defaults to a successful send.
  */
 function executeProgressUpdate(args: {
   chat_id: string
   text: string
   message_thread_id?: number
+  send?: () => number
 }): ProgressUpdateResult {
   const { chat_id, message_thread_id } = args
   let { text } = args
   const threadId = message_thread_id
   const key = statusKey(chat_id, threadId)
+  const send = args.send ?? (() => Math.floor(Math.random() * 100000))
 
   // Truncate to 300 chars
   if (text.length > 300) {
@@ -53,20 +65,30 @@ function executeProgressUpdate(args: {
     }
   }
 
-  // Turn cap: max 5 calls per turn
+  // Attention cap: max 5 deliveries per turn atom, else a rolling fallback
+  // window when no turn atom exists. Checked BEFORE the send; the count is
+  // advanced only after a successful send (below).
   const turnStart = activeTurnStartedAt.get(key)
-  if (turnStart != null) {
-    const currentCount = progressUpdateTurnCount.get(key) ?? 0
-    if (currentCount >= 5) {
-      return { ok: false, reason: 'turn_limit' }
-    }
-    progressUpdateTurnCount.set(key, currentCount + 1)
+  const atCap =
+    turnStart != null
+      ? (progressUpdateTurnCount.get(key) ?? 0) >= 5
+      : progressFallbackAtCap(key, now)
+  if (atCap) {
+    return { ok: false, reason: 'turn_limit' }
   }
 
-  progressUpdateLastSent.set(key, now)
+  // Send. A throw here must NOT consume a slot — it propagates before any
+  // bookkeeping runs.
+  const message_id = send()
 
-  // Mock message_id
-  return { ok: true, message_id: Math.floor(Math.random() * 100000) }
+  progressUpdateLastSent.set(key, now)
+  if (turnStart != null) {
+    progressUpdateTurnCount.set(key, (progressUpdateTurnCount.get(key) ?? 0) + 1)
+  } else {
+    recordProgressFallbackSend(key, now)
+  }
+
+  return { ok: true, message_id }
 }
 
 // Manual time mocking — bun:test compatible (bun lacks vi.setSystemTime).
@@ -81,6 +103,7 @@ describe('progress_update tool', () => {
     progressUpdateLastSent.clear()
     progressUpdateTurnCount.clear()
     activeTurnStartedAt.clear()
+    _resetProgressFallbackCap()
     mockNow = 1000
     dateSpy = spyOn(Date, 'now').mockImplementation(() => mockNow)
   })
@@ -220,7 +243,7 @@ describe('progress_update tool', () => {
     expect(progressUpdateTurnCount.get(key2)).toBe(1)
   })
 
-  it('when no active turn, still rate-limits but does not increment counter', () => {
+  it('when no active turn, still rate-limits but does not increment the turn counter', () => {
     // No activeTurnStartedAt entry for this chat
     const r1 = executeProgressUpdate({ chat_id: '999', text: 'First' })
     expect(r1.ok).toBe(true)
@@ -229,8 +252,81 @@ describe('progress_update tool', () => {
     const r2 = executeProgressUpdate({ chat_id: '999', text: 'Second' })
     expect(r2.ok).toBe(false)
 
-    // Counter should not have been incremented (no active turn)
+    // The per-turn counter is untouched on the turn-less path (the fallback
+    // window carries the count instead).
     const key = statusKey('999')
     expect(progressUpdateTurnCount.get(key)).toBeUndefined()
+  })
+
+  // Fix 1: with NO turn atom, the fallback rolling window still caps at 5.
+  it('null-turn-atom context caps at 5 sends per window (Fix 1)', () => {
+    // No activeTurnStartedAt entry — the pre-fix code applied no cap here at
+    // all, so this loop would let a 6th (and every subsequent) send through.
+    for (let i = 1; i <= 5; i++) {
+      advance(25_000) // clear the 20s floor each time
+      const r = executeProgressUpdate({ chat_id: '888', text: `Update ${i}` })
+      expect(r.ok).toBe(true)
+    }
+    advance(25_000)
+    const r6 = executeProgressUpdate({ chat_id: '888', text: 'Update 6' })
+    expect(r6.ok).toBe(false)
+    if (!r6.ok) {
+      expect(r6.reason).toBe('turn_limit')
+    }
+  })
+
+  // Fix 2: a thrown send must NOT consume a cap slot (turn-scoped path).
+  it('a thrown send does not consume a turn-cap slot (Fix 2)', () => {
+    const key = statusKey('777')
+    activeTurnStartedAt.set(key, 1000)
+    progressUpdateTurnCount.set(key, 0)
+
+    // A send that throws: the cap was checked, but nothing was delivered.
+    expect(() =>
+      executeProgressUpdate({
+        chat_id: '777',
+        text: 'boom',
+        send: () => {
+          throw new Error('telegram 500')
+        },
+      }),
+    ).toThrow('telegram 500')
+
+    // Slot NOT consumed — pre-fix the counter incremented before the send.
+    expect(progressUpdateTurnCount.get(key)).toBe(0)
+
+    // A subsequent successful send still has its full budget and counts once.
+    advance(25_000)
+    const r = executeProgressUpdate({ chat_id: '777', text: 'real' })
+    expect(r.ok).toBe(true)
+    expect(progressUpdateTurnCount.get(key)).toBe(1)
+  })
+
+  // Fix 2 composed with Fix 1: a thrown send on the turn-less path records
+  // nothing in the fallback window either.
+  it('a thrown send does not consume a fallback-window slot (Fix 2 × Fix 1)', () => {
+    // Five throwing sends on the turn-less path.
+    for (let i = 0; i < 5; i++) {
+      advance(25_000)
+      expect(() =>
+        executeProgressUpdate({
+          chat_id: '666',
+          text: 'boom',
+          send: () => {
+            throw new Error('telegram 500')
+          },
+        }),
+      ).toThrow('telegram 500')
+    }
+    // The window is still empty — five throws consumed no slots, so five real
+    // sends are still allowed.
+    for (let i = 1; i <= 5; i++) {
+      advance(25_000)
+      const r = executeProgressUpdate({ chat_id: '666', text: `real ${i}` })
+      expect(r.ok).toBe(true)
+    }
+    advance(25_000)
+    const capped = executeProgressUpdate({ chat_id: '666', text: 'over' })
+    expect(capped.ok).toBe(false)
   })
 })

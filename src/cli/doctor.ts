@@ -72,6 +72,7 @@ import { runCascadeChecks } from "./doctor-cascade.js";
 import { runOpenRouterCreditChecks, usesOpenRouter } from "./doctor-openrouter-credit.js";
 import { runCronSessionChecks } from "./doctor-cron-session.js";
 import { runFloodPressureChecks } from "./doctor-flood-pressure.js";
+import { runEditFuseChecks } from "./doctor-edit-fuse.js";
 import { runGeneratedSurfaceDriftChecks } from "./doctor-drift.js";
 import { runComponentVersionChecks } from "./doctor-component-versions.js";
 import { runAssetPayloadChecks } from "./doctor-asset-payload.js";
@@ -4110,6 +4111,13 @@ export function registerDoctorCommand(program: Command): void {
             // pressure ledger the gateway's flood breaker now keeps.
             title: "Telegram flood pressure (429)",
             results: runFloodPressureChecks(config),
+          },
+          {
+            // SWITCHROOM_EDIT_FUSE=0 disables the only outbound layer whose
+            // ceilings sit below Telegram's flood-ban threshold. Meant for
+            // short debugging; forgotten, it re-exposes ban-capable cadence.
+            title: "Telegram edit-flood fuse",
+            results: runEditFuseChecks(config),
           },
           { title: "Agents", results: checkAgents(config, configPath) },
           {
