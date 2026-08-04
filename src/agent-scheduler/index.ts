@@ -568,13 +568,20 @@ function formatReadFailures(failures: OverlayReadFailure[]): string {
  *
  * Content failures (malformed YAML, schema rejection) do NOT throw:
  * those files were read fine and their entries are legitimately excluded.
+ *
+ * Scope is `schedule.d` ONLY (#4373): the strict loader is agent-wide over
+ * the config object, but an unreadable `skills.d` overlay is unrelated to
+ * the schedule and must not freeze cron reloads. `skills.d` read failures
+ * still warn (the loader's per-file `console.warn`); they just don't throw
+ * here. Filtering on `source: "schedule"` keeps the freeze targeted at the
+ * only class that can silently unregister a live cron.
  */
 export function loadAgentEntriesStrict(
   configPath: string,
   agentName: string,
 ): SchedulerEntry[] {
   const config = loadConfig(configPath);
-  const failures = overlayReadFailures(config, agentName);
+  const failures = overlayReadFailures(config, agentName, "schedule");
   if (failures.length > 0) {
     throw new Error(
       `schedule.d overlay unreadable — refusing a reload that may be ` +
@@ -666,7 +673,10 @@ export async function main(): Promise<void> {
   // and actionably instead of the loader's per-file console.warn only.
   // (The hot-reload path below is strict: it refuses to swap the live
   // schedule against a load that is missing unreadable files.)
-  const bootReadFailures = overlayReadFailures(config, agentName);
+  // Scoped to schedule.d (#4373): this warning is specifically about
+  // unregistered cron entries — an unreadable skills.d overlay is a
+  // different concern and still surfaces via the loader's console.warn.
+  const bootReadFailures = overlayReadFailures(config, agentName, "schedule");
   if (bootReadFailures.length > 0) {
     process.stderr.write(
       `agent-scheduler: ${agentName} WARNING: ${bootReadFailures.length} ` +

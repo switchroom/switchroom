@@ -389,7 +389,7 @@ describe.skipIf(runningAsRoot)(
       expect(warnings[0].reason).toMatch(/read error/);
       const failures = overlayReadFailures(cfg, "foo");
       expect(failures).toHaveLength(1);
-      expect(failures[0]).toMatchObject({ file: locked, code: "EACCES" });
+      expect(failures[0]).toMatchObject({ file: locked, code: "EACCES", source: "schedule" });
     });
 
     it("still loads readable sibling files (per-file isolation preserved)", () => {
@@ -425,7 +425,33 @@ describe.skipIf(runningAsRoot)(
       const cfg = makeConfig({ foo: { skills: [] } });
       const { warnings } = applyAgentOverlays(cfg);
       expect(warnings.some((w) => w.code === "EACCES" && w.file === locked)).toBe(true);
-      expect(overlayReadFailures(cfg, "foo")).toContainEqual({ file: locked, code: "EACCES" });
+      expect(overlayReadFailures(cfg, "foo")).toContainEqual({ file: locked, code: "EACCES", source: "skills" });
+    });
+
+    it("scopes overlayReadFailures by source — a skills.d failure is EXCLUDED from the schedule scope (#4373)", () => {
+      // Both classes unreadable in the same pass.
+      const schedDir = scheduleDir("foo");
+      const lockedSchedule = join(schedDir, "cron-eeeeeeeeeeee.yaml");
+      writeFileSync(lockedSchedule, "schedule:\n  - cron: '0 1 * * *'\n    prompt: hidden\n");
+      chmodSync(lockedSchedule, 0o000);
+      const skillsD = join(tmpHome, ".switchroom", "agents", "foo", "skills.d");
+      mkdirSync(skillsD, { recursive: true });
+      const lockedSkill = join(skillsD, "ws.yaml");
+      writeFileSync(lockedSkill, "skills:\n  - webapp-testing\n");
+      chmodSync(lockedSkill, 0o000);
+
+      const cfg = makeConfig({ foo: { schedule: [], skills: [] } });
+      applyAgentOverlays(cfg);
+
+      // Unfiltered: both failures present.
+      expect(overlayReadFailures(cfg, "foo")).toHaveLength(2);
+      // schedule scope: only the schedule.d failure — the freeze must NOT be
+      // triggered by an unrelated skills.d permission problem.
+      const scheduleFailures = overlayReadFailures(cfg, "foo", "schedule");
+      expect(scheduleFailures.map((f) => f.file)).toEqual([lockedSchedule]);
+      // skills scope: only the skills.d failure.
+      const skillsFailures = overlayReadFailures(cfg, "foo", "skills");
+      expect(skillsFailures.map((f) => f.file)).toEqual([lockedSkill]);
     });
 
     it("reports an unreadable schedule.d DIRECTORY as a read failure (dir-level variant)", () => {
@@ -436,7 +462,7 @@ describe.skipIf(runningAsRoot)(
         const cfg = makeConfig({ foo: { schedule: [] } });
         const { warnings } = applyAgentOverlays(cfg);
         expect(warnings.some((w) => w.file === dir && w.code === "EACCES")).toBe(true);
-        expect(overlayReadFailures(cfg, "foo")).toContainEqual({ file: dir, code: "EACCES" });
+        expect(overlayReadFailures(cfg, "foo")).toContainEqual({ file: dir, code: "EACCES", source: "schedule" });
       } finally {
         chmodSync(dir, 0o755); // so afterEach rmSync can clean up
       }

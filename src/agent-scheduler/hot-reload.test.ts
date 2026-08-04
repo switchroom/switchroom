@@ -302,6 +302,57 @@ describe.skipIf(runningAsRoot)(
       expect(reloader.currentTasks().map((t) => t.entry.prompt)).toEqual(["overlay-cron"]);
     });
 
+    it("an unreadable skills.d overlay does NOT freeze schedule reloads (#4373)", () => {
+      // schedule.d is fine; only a skills.d overlay is unreadable. On main,
+      // loadAgentEntriesStrict throws on ANY overlay read failure (incl.
+      // skills.d), routing the reloader into its keep-current onError path —
+      // so a legitimate schedule.d edit made in the same window never lands.
+      // Post-fix, the strict guard is schedule-scoped: the skills.d failure
+      // is ignored and the new cron registers.
+      const { configPath } = writeFixture();
+      const skillsDir = join(tmpHome, ".switchroom", "agents", AGENT, "skills.d");
+      mkdirSync(skillsDir, { recursive: true });
+      const skillPath = join(skillsDir, "ws.yaml");
+      writeFileSync(skillPath, "skills:\n  - webapp-testing\n");
+
+      const boot = loadAgentEntriesStrict(configPath, AGENT);
+      expect(boot.map((e) => e.prompt)).toEqual(["overlay-cron"]);
+
+      const registrations: SchedulerEntry[][] = [];
+      const errors: string[] = [];
+      let stops = 0;
+      const register = (es: SchedulerEntry[]): RegisteredTask[] => {
+        registrations.push(es);
+        return es.map((e) => ({ entry: e, task: { stop: () => { stops += 1; } } }));
+      };
+      const initialTasks = register(boot);
+      registrations.length = 0;
+
+      const reloader = createScheduleReloader({
+        loadEntries: () => loadAgentEntriesStrict(configPath, AGENT),
+        register,
+        initialTasks,
+        initialEntries: boot,
+        log: () => {},
+        onError: (e) => errors.push(e.message),
+      });
+
+      // skills.d overlay turns unreadable (foreign-owner 0600 ≙ chmod 000)…
+      chmodSync(skillPath, 0o000);
+      // …and a NEW schedule.d cron is added in the same window.
+      const newCronPath = join(tmpHome, ".switchroom", "agents", AGENT, "schedule.d", "cron-bbbbbbbbbbbb.yaml");
+      writeFileSync(newCronPath, "schedule:\n  - cron: '0 9 * * *'\n    prompt: new-cron\n");
+      reloader.tick();
+
+      // OUTCOME: the schedule reload applied — the new cron registered — and
+      // the skills.d failure did NOT freeze it or surface as a reload error.
+      expect(errors).toEqual([]);
+      expect(reloader.currentTasks().map((t) => t.entry.prompt).sort())
+        .toEqual(["new-cron", "overlay-cron"]);
+
+      chmodSync(skillPath, 0o600);
+    });
+
     it("a genuinely REMOVED overlay file still unregisters (no false retention)", () => {
       const { configPath, overlayPath } = writeFixture();
       const boot = loadAgentEntriesStrict(configPath, AGENT);
