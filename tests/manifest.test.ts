@@ -9,6 +9,7 @@ import {
   type DriftProbers,
 } from "../src/manifest.js";
 import { checkManifestDrift } from "../src/cli/doctor.js";
+import { SWITCHROOM_VERSION } from "../src/cli/resolve-version.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -16,7 +17,6 @@ import { checkManifestDrift } from "../src/cli/doctor.js";
 
 function validManifestData() {
   return {
-    switchroom_version: "0.4.0",
     tested_at: "2026-04-29T20:30:00+10:00",
     runtime: { bun: "1.3.11", node: "22.22.2" },
     claude: { cli: "2.1.123" },
@@ -60,7 +60,6 @@ describe("loadManifest", () => {
     const path = join(tempDir, "dependencies.json");
     writeFileSync(path, validManifestJson());
     const manifest = loadManifest(path);
-    expect(manifest.switchroom_version).toBe("0.4.0");
     expect(manifest.runtime.bun).toBe("1.3.11");
     expect(manifest.runtime.node).toBe("22.22.2");
     expect(manifest.claude.cli).toBe("2.1.123");
@@ -83,14 +82,24 @@ describe("loadManifest", () => {
 
   it("throws a clear error when required fields are missing", () => {
     const path = join(tempDir, "dependencies.json");
-    writeFileSync(path, JSON.stringify({ switchroom_version: "0.4.0" }));
+    writeFileSync(path, JSON.stringify({ tested_at: "2026-04-29T20:30:00+10:00" }));
     expect(() => loadManifest(path)).toThrowError(/schema validation failed/);
+  });
+
+  it("ignores a legacy switchroom_version key — an old on-disk manifest still parses (key stripped, not required)", () => {
+    const path = join(tempDir, "dependencies.json");
+    // Older manifests hand-recorded (and drifted) switchroom_version. The schema
+    // no longer carries it; z.object() strips the unknown key rather than
+    // failing, so a pre-existing manifest still loads.
+    writeFileSync(path, validManifestJson({ switchroom_version: "0.7.3" }));
+    const manifest = loadManifest(path);
+    expect((manifest as Record<string, unknown>).switchroom_version).toBeUndefined();
+    expect(manifest.tested_at).toBe("2026-04-29T20:30:00+10:00");
   });
 
   it("throws a clear error when runtime.bun is the wrong type", () => {
     const path = join(tempDir, "dependencies.json");
     const bad = {
-      switchroom_version: "0.4.0",
       tested_at: "2026-04-29T20:30:00+10:00",
       runtime: { bun: 123, node: "22.22.2" }, // bun should be string
       claude: { cli: "2.1.123" },
@@ -236,6 +245,10 @@ describe("checkManifestDrift (doctor integration)", () => {
     expect(results).toHaveLength(1);
     expect(results[0].status).toBe("ok");
     expect(results[0].name).toBe("dependency manifest");
+    // The clean-drift detail reports the REAL switchroom version
+    // (SWITCHROOM_VERSION), not a hand-maintained manifest field that drifts.
+    expect(results[0].detail).toContain(SWITCHROOM_VERSION);
+    expect(results[0].detail).not.toContain("0.7.3");
   });
 
   it("surfaces bun drift as a check result with fail status on major mismatch", async () => {

@@ -20,7 +20,14 @@ import { execSync } from "node:child_process";
 // ─── Schema ────────────────────────────────────────────────────────────────
 
 export const ManifestSchema = z.object({
-  switchroom_version: z.string().min(1),
+  // NOTE: no `switchroom_version` field. The BOM's switchroom version is not
+  // hand-recorded here — it drifted for ~13 minors (frozen at 0.7.3 while
+  // `tested_at` and the pinned deps were kept fresh). The self-reported version
+  // in `switchroom versions` / `doctor` comes from `SWITCHROOM_VERSION`
+  // (resolve-version.ts — the git-tag-stamped build-info, the same
+  // source-of-truth as `--version`), so it can never drift from the release
+  // tag. An old on-disk manifest that still carries the key parses fine —
+  // z.object() strips unknown keys.
   tested_at: z.string().min(1),
   runtime: z.object({
     bun: z.string().min(1),

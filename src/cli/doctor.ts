@@ -34,6 +34,7 @@ import { getSlotInfos, type SlotInfo } from "../auth/accounts.js";
 import type { AgentConfig, SwitchroomConfig } from "../config/schema.js";
 import { resolveMemoryProfile } from "../config/schema.js";
 import { loadManifest, detectDrift, type DriftProbers } from "../manifest.js";
+import { SWITCHROOM_VERSION } from "./resolve-version.js";
 import {
   probeHindsight,
   isHindsightEnabled,
@@ -3812,7 +3813,7 @@ export async function checkManifestDrift(probers?: DriftProbers): Promise<CheckR
       {
         name: "dependency manifest",
         status: "ok",
-        detail: `all versions match (manifest ${manifest.switchroom_version})`,
+        detail: `all versions match (switchroom ${SWITCHROOM_VERSION})`,
       },
     ];
   }

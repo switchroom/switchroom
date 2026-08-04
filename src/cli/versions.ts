@@ -11,6 +11,7 @@ import type { Command } from "commander";
 import chalk from "chalk";
 import { loadManifest, detectDrift } from "../manifest.js";
 import type { DriftItem } from "../manifest.js";
+import { SWITCHROOM_VERSION } from "./resolve-version.js";
 
 function formatRow(
   component: string,
@@ -74,7 +75,10 @@ export function registerVersionsCommand(program: Command): void {
       );
 
       console.log(chalk.bold("\nDependency manifest"));
-      console.log(chalk.gray(`  switchroom ${manifest.switchroom_version}  ·  tested ${manifest.tested_at}`));
+      // Version comes from SWITCHROOM_VERSION (the git-tag-stamped build-info,
+      // same source as `--version`), not a hand-maintained manifest field that
+      // drifts; `tested_at` still reports when the pinned deps were validated.
+      console.log(chalk.gray(`  switchroom ${SWITCHROOM_VERSION}  ·  tested ${manifest.tested_at}`));
       console.log();
 
       // --- runtime ---
