@@ -12573,9 +12573,7 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   try {
     signalTracker.noteSignal(key, Date.now())
   } catch { /* best-effort signal */ }
-  // #4330: a progress_update is a MODEL-driven fresh user-visible outbound —
-  // reset the 300s silence clock like a reply send (outbound-send-path.ts).
-  // A hung turn can't forge this call, so a full reset (not a defer) is safe.
+  // #4330: model-driven user-visible outbound — reset the silence clock like a reply send.
   try { silencePoke.noteOutbound(key, Date.now()) } catch { /* best-effort */ }
 
   return {
