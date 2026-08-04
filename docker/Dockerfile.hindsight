@@ -3987,6 +3987,330 @@ print(
 )
 PYEOF
 
+# --- switchroom: run temporal extraction off the event loop and bound its input ---
+#
+# The #4313 language pin above cut dateparser's PER-LOCALE cost, but it cannot
+# bound the PER-CALL cost on unbounded input. `dateparser.search_dates()` is
+# synchronous, pure-Python CPU work whose cost is linear in input length x date
+# density, and it ran INLINE on the single shared asyncio loop:
+#
+#   retrieval.py retrieve_all_fact_types_parallel() (an async def) called
+#   extract_temporal_constraint() -> temporal_extraction.py ->
+#   query_analyzer.py analyze() -> search_dates(...) synchronously, BEFORE any
+#   await. The consolidation caller (consolidator.py, query=m["text"]) passes
+#   full multi-KB memory text, so one extraction blocked recall + consolidation
+#   + reranker together for seconds: 186 `EVENT LOOP BLOCKED` events in 4.5h,
+#   p50 1.36s, max 14.95s (measured: 16KB date-dense text ~988ms).
+#
+# This patch does two things:
+#
+#  (a) OFF-LOOP. temporal_extraction.py gains a module-level
+#      ThreadPoolExecutor(max_workers=1) and an async
+#      extract_temporal_constraint_async() that runs the existing sync function
+#      via loop.run_in_executor; retrieval.py's single async call site awaits it.
+#      Deliberately ONE worker: dateparser's module-level caches are not
+#      documented thread-safe, so serialising extractions removes that concern
+#      and bounds temporal CPU to a single core. HONEST CAVEAT: dateparser is
+#      pure-Python + `re`, so the worker holds the GIL during matching -- this
+#      does NOT fully free the loop, it collapses a multi-second uninterruptible
+#      stall into ~5ms scheduler slices (sys.setswitchinterval granularity).
+#
+#  (b) BOUND THE INPUT. A new config knob, HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS
+#      (default 2000, 0 = unlimited), wired exactly like the #4313 language knob,
+#      truncates the query fed to search_dates in analyze(). Correctness: the
+#      temporal constraint gates only ONE of four retrieval arms
+#      (retrieve_temporal_combined); semantic/BM25/graph see the full query.
+#      Live recall-hook queries are short and never hit the cap; only multi-KB
+#      consolidation queries lose date matches past char 2000.
+#
+# The #4313 language pin (`languages=self._languages` on the search_dates call)
+# MUST survive this patch -- a verification assert below pins it. Runs AFTER the
+# #4313 block, so its anchors are the post-#4313 file state.
+#
+# Self-verifying; guarded structurally by
+# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
+# the sync path / GREEN off-loop + bounded) by
+# tests/docker/hindsight-temporal-offload-patch.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+BASE = pathlib.Path("/app/api/hindsight_api")
+
+
+def apply(rel, edits):
+    f = BASE / rel
+    s = f.read_text()
+    for anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == 1, (
+            f"switchroom hindsight temporal-offload patch: anchor found {n}x "
+            f"(expected 1) in {rel} — upstream reformatted; re-author this patch in "
+            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
+        )
+        s = s.replace(anchor, repl, 1)
+    f.write_text(s)
+    return s
+
+
+# ---- 1. config.py: the HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS knob (default 2000) ----
+cfg = apply("config.py", [
+    (
+        'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"\n',
+        'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"\n'
+        "# switchroom: max chars of query text fed to dateparser.search_dates()\n"
+        "# during temporal analysis (0 = unlimited). Bounds the per-call cost of\n"
+        "# the (now off-loop) extraction on multi-KB consolidation queries.\n"
+        'ENV_TEMPORAL_MAX_QUERY_CHARS = "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS"\n',
+    ),
+    (
+        'DEFAULT_TEMPORAL_LANGUAGES = "en"\n',
+        'DEFAULT_TEMPORAL_LANGUAGES = "en"\n'
+        "# switchroom: 2000 chars is far above any live recall-hook query yet well\n"
+        "# below the multi-KB consolidation text that made search_dates block for\n"
+        "# seconds. 0 disables the cap (full-scan).\n"
+        "DEFAULT_TEMPORAL_MAX_QUERY_CHARS = 2000\n",
+    ),
+    (
+        "    temporal_languages: list[str]  # switchroom: dateparser language pin (default ['en'])\n",
+        "    temporal_languages: list[str]  # switchroom: dateparser language pin (default ['en'])\n"
+        "    temporal_max_query_chars: int  # switchroom: cap on search_dates input (0 = unlimited)\n",
+    ),
+    (
+        "            temporal_languages=_parse_str_list(\n"
+        "                os.getenv(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES)\n"
+        '            ) or ["en"],\n',
+        "            temporal_languages=_parse_str_list(\n"
+        "                os.getenv(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES)\n"
+        '            ) or ["en"],\n'
+        "            # switchroom: non-negative int (0 = unlimited); reuses upstream's\n"
+        "            # fail-fast parser so a malformed value stops boot rather than\n"
+        "            # silently disabling the cap.\n"
+        "            temporal_max_query_chars=_parse_non_negative_int(\n"
+        "                ENV_TEMPORAL_MAX_QUERY_CHARS,\n"
+        "                os.getenv(ENV_TEMPORAL_MAX_QUERY_CHARS),\n"
+        "                DEFAULT_TEMPORAL_MAX_QUERY_CHARS,\n"
+        "            ),\n",
+    ),
+])
+
+# ---- 2. query_analyzer.py: resolve the cap and truncate the search_dates input ----
+qa = apply("engine/query_analyzer.py", [
+    (
+        "        if langs:\n"
+        "            return langs\n"
+        "    except Exception:\n"
+        "        pass\n"
+        '    return ["en"]\n',
+        "        if langs:\n"
+        "            return langs\n"
+        "    except Exception:\n"
+        "        pass\n"
+        '    return ["en"]\n'
+        "\n"
+        "\n"
+        "def _resolve_temporal_max_query_chars() -> int:\n"
+        '    """switchroom: max chars fed to dateparser.search_dates (0 = unlimited).\n'
+        "\n"
+        "    Read from HindsightConfig.temporal_max_query_chars\n"
+        "    (HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS, default 2000). Defensive: if config\n"
+        "    is not yet loaded (analyzer constructed in isolation), fall back to 2000 so\n"
+        "    an unbounded multi-KB consolidation query can never reach search_dates\n"
+        "    unclamped.\n"
+        '    """\n'
+        "    try:\n"
+        "        from hindsight_api.config import get_config\n"
+        "\n"
+        "        n = int(get_config().temporal_max_query_chars)\n"
+        "        if n >= 0:\n"
+        "            return n\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    return 2000\n",
+    ),
+    (
+        "        self._languages = _resolve_temporal_languages()\n",
+        "        self._languages = _resolve_temporal_languages()\n"
+        "        # switchroom: cap the chars handed to dateparser.search_dates (0 = off).\n"
+        "        self._max_query_chars = _resolve_temporal_max_query_chars()\n",
+    ),
+    (
+        "        try:\n"
+        "            results = self._search_dates(query, settings=settings, languages=self._languages)\n",
+        "        # switchroom: bound the text handed to dateparser.search_dates. Its cost\n"
+        "        # is linear in input length x date density; a multi-KB consolidation query\n"
+        "        # could otherwise block the (now off-loop) worker for seconds. Live recall\n"
+        "        # queries are short and never hit the cap. 0 = unlimited (full-scan). Only\n"
+        "        # the temporal retrieval arm sees this truncation; semantic/BM25/graph get\n"
+        "        # the full query text upstream.\n"
+        "        search_query = query\n"
+        "        if self._max_query_chars and len(search_query) > self._max_query_chars:\n"
+        "            search_query = search_query[: self._max_query_chars]\n"
+        "\n"
+        "        try:\n"
+        "            results = self._search_dates(search_query, settings=settings, languages=self._languages)\n",
+    ),
+])
+
+# ---- 3. temporal_extraction.py: single-worker executor + async wrapper ----
+te = apply("engine/search/temporal_extraction.py", [
+    (
+        "import logging\n"
+        "from datetime import datetime\n"
+        "\n"
+        "from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer, QueryAnalyzer\n"
+        "\n"
+        "logger = logging.getLogger(__name__)\n",
+        "import asyncio\n"
+        "import functools\n"
+        "import logging\n"
+        "from concurrent.futures import ThreadPoolExecutor\n"
+        "from datetime import datetime\n"
+        "\n"
+        "from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer, QueryAnalyzer\n"
+        "\n"
+        "logger = logging.getLogger(__name__)\n"
+        "\n"
+        "# switchroom: dateparser.search_dates() is synchronous, pure-Python CPU work.\n"
+        "# It historically ran INLINE on the single shared asyncio loop from\n"
+        "# retrieve_all_fact_types_parallel() (retrieval.py), blocking recall +\n"
+        "# consolidation + reranker together: 186 `EVENT LOOP BLOCKED` events in 4.5h\n"
+        "# (p50 1.36s, max 14.95s). Offload it to a dedicated worker thread so the\n"
+        "# loop keeps ticking while an extraction runs.\n"
+        "#\n"
+        "# Deliberately max_workers=1: dateparser's module-level caches are not\n"
+        "# documented thread-safe, so serialising every extraction removes that\n"
+        "# concern and bounds temporal CPU to a single core. HONEST CAVEAT: dateparser\n"
+        "# is pure-Python + `re`, so the worker holds the GIL during matching -- this\n"
+        "# does NOT fully free the loop, it collapses a multi-second uninterruptible\n"
+        "# stall into ~5ms scheduler slices (sys.setswitchinterval granularity). The\n"
+        "# HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS input cap bounds the residual.\n"
+        '_temporal_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hindsight-temporal")\n',
+    ),
+    (
+        "    if analysis.temporal_constraint:\n"
+        "        result = (analysis.temporal_constraint.start_date, analysis.temporal_constraint.end_date)\n"
+        "        return result\n"
+        "\n"
+        "    return None\n",
+        "    if analysis.temporal_constraint:\n"
+        "        result = (analysis.temporal_constraint.start_date, analysis.temporal_constraint.end_date)\n"
+        "        return result\n"
+        "\n"
+        "    return None\n"
+        "\n"
+        "\n"
+        "async def extract_temporal_constraint_async(\n"
+        "    query: str,\n"
+        "    reference_date: datetime | None = None,\n"
+        "    analyzer: QueryAnalyzer | None = None,\n"
+        ") -> tuple[datetime, datetime] | None:\n"
+        '    """switchroom: off-loop wrapper for extract_temporal_constraint().\n'
+        "\n"
+        "    Runs the synchronous dateparser extraction on the dedicated single-worker\n"
+        "    _temporal_executor via loop.run_in_executor, so the shared asyncio loop is\n"
+        "    not blocked for the full parse duration. Identical return contract to the\n"
+        "    sync function: (start_date, end_date) or None.\n"
+        '    """\n'
+        "    loop = asyncio.get_running_loop()\n"
+        "    return await loop.run_in_executor(\n"
+        "        _temporal_executor,\n"
+        "        functools.partial(\n"
+        "            extract_temporal_constraint,\n"
+        "            query,\n"
+        "            reference_date=reference_date,\n"
+        "            analyzer=analyzer,\n"
+        "        ),\n"
+        "    )\n",
+    ),
+])
+
+# ---- 4. retrieval.py: await the off-loop wrapper at the single async call site ----
+rt = apply("engine/search/retrieval.py", [
+    (
+        "    from .temporal_extraction import extract_temporal_constraint\n",
+        "    from .temporal_extraction import extract_temporal_constraint_async\n",
+    ),
+    (
+        "    temporal_constraint = extract_temporal_constraint(query_text, reference_date=question_date, analyzer=query_analyzer)\n",
+        "    temporal_constraint = await extract_temporal_constraint_async(query_text, reference_date=question_date, analyzer=query_analyzer)\n",
+    ),
+])
+
+# ---- verification ----
+# (a) config knob wired end to end: env name, default, dataclass field, from_env.
+assert 'ENV_TEMPORAL_MAX_QUERY_CHARS = "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS"' in cfg, (
+    "switchroom hindsight temporal-offload patch: ENV name missing after patch"
+)
+assert "DEFAULT_TEMPORAL_MAX_QUERY_CHARS = 2000" in cfg, (
+    "switchroom hindsight temporal-offload patch: default missing after patch"
+)
+assert "    temporal_max_query_chars: int" in cfg, (
+    "switchroom hindsight temporal-offload patch: dataclass field missing after patch"
+)
+assert "temporal_max_query_chars=_parse_non_negative_int(" in cfg, (
+    "switchroom hindsight temporal-offload patch: from_env wiring missing after patch"
+)
+
+# (b) analyzer resolves the cap and truncates BEFORE search_dates.
+assert "def _resolve_temporal_max_query_chars() -> int:" in qa, (
+    "switchroom hindsight temporal-offload patch: cap resolver missing after patch"
+)
+assert "self._max_query_chars = _resolve_temporal_max_query_chars()" in qa, (
+    "switchroom hindsight temporal-offload patch: analyzer does not resolve its char cap"
+)
+assert "search_query = search_query[: self._max_query_chars]" in qa, (
+    "switchroom hindsight temporal-offload patch: analyze() does not truncate the input"
+)
+# The RED guard: the untruncated call must be GONE from analyze() — this is what
+# would fail if the cap were not actually wired into the search_dates call.
+assert qa.count("self._search_dates(query, settings=settings, languages=self._languages)") == 0, (
+    "switchroom hindsight temporal-offload patch: analyze() still passes the FULL "
+    "query to search_dates — the char cap is not wired in"
+)
+# …and the #4313 language pin MUST survive: the truncated call still carries it.
+assert "self._search_dates(search_query, settings=settings, languages=self._languages)" in qa, (
+    "switchroom hindsight temporal-offload patch: #4313 language pin lost — the "
+    "search_dates call no longer carries languages=self._languages"
+)
+
+# (c) off-loop machinery present.
+assert 'ThreadPoolExecutor(max_workers=1, thread_name_prefix="hindsight-temporal")' in te, (
+    "switchroom hindsight temporal-offload patch: single-worker executor missing"
+)
+assert "async def extract_temporal_constraint_async(" in te, (
+    "switchroom hindsight temporal-offload patch: async wrapper missing"
+)
+assert "loop.run_in_executor(" in te, (
+    "switchroom hindsight temporal-offload patch: wrapper does not offload via run_in_executor"
+)
+# The sync entry point must still exist — the wrapper delegates to it.
+assert "def extract_temporal_constraint(" in te, (
+    "switchroom hindsight temporal-offload patch: sync extract_temporal_constraint removed"
+)
+
+# (d) the single async call site now awaits the off-loop wrapper; the inline
+# sync call must be GONE (the RED guard for the off-loop change).
+assert "await extract_temporal_constraint_async(query_text" in rt, (
+    "switchroom hindsight temporal-offload patch: retrieval call site not awaited off-loop"
+)
+assert rt.count("temporal_constraint = extract_temporal_constraint(query_text") == 0, (
+    "switchroom hindsight temporal-offload patch: retrieval still calls extract_temporal_constraint "
+    "synchronously on the loop"
+)
+
+ast.parse(cfg)
+ast.parse(qa)
+ast.parse(te)
+ast.parse(rt)
+print(
+    "switchroom hindsight temporal-offload patch: temporal extraction runs on a "
+    "single-worker ThreadPoolExecutor off the shared asyncio loop, its input bounded "
+    "by HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS (default 2000); the #4313 language pin "
+    "is preserved"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

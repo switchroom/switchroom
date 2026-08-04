@@ -141,6 +141,8 @@ jobs:
               - 'tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts'
               - 'tests/docker/hindsight-reranker-priority-patch.test.ts'
               - 'tests/docker/hindsight-work-conserving-admission-patch.test.ts'
+              - 'tests/docker/hindsight-temporal-language-patch.test.ts'
+              - 'tests/docker/hindsight-temporal-offload-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -502,6 +504,34 @@ jobs:
           SWITCHROOM_HINDSIGHT_BUILT_IMAGE: switchroom-hindsight:probe
         run: npx vitest run tests/docker/hindsight-work-conserving-admission-patch.test.ts
 
+      - name: Run the hindsight temporal-language probe (RED/GREEN, must not skip)
+        # Same contract, for the #4313 dateparser language-pin patch. The bakes
+        # test cannot cover the failure that matters here: its assertions are
+        # grep-on-file, so reverting the `languages=` pin on the search_dates
+        # call stays green there while every recall again auto-detects across
+        # 200+ locales inline on the shared asyncio loop. Only capturing the
+        # real search_dates call's kwargs (and confirming English extraction
+        # still parses under the pin) catches it. Runs against the raw pinned
+        # upstream image, applying the patch block by `docker exec`.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-temporal-language-patch.test.ts
+
+      - name: Run the hindsight temporal-offload probe (RED/GREEN, must not skip)
+        # Same contract, for the temporal-offload patch (this PR). The bakes
+        # test cannot cover the outcome that matters here: its assertions are
+        # grep-on-file, so a `run_in_executor` wrapper that exists but is never
+        # awaited at the call site — or a char cap wired but never applied —
+        # stays green there while temporal extraction again blocks the shared
+        # asyncio loop for seconds. Only an asyncio loop-lag probe (max
+        # inter-tick gap while a real ≥150ms extraction runs off-loop) catches
+        # it. RED applies only #4313 (sync-inline blocks the loop ≈ full parse);
+        # GREEN applies #4313 + this block (gap stays tiny, cap bounds cost).
+        # Both arms run against the raw pinned upstream image via `docker exec`.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-temporal-offload-patch.test.ts
+
       - name: Run the embedded-postgres fsync probe (RED/GREEN, must not skip)
         # NOT a patch probe: this one boots the REAL docker/hindsight-entrypoint.sh
         # inside the pinned image and reads `SHOW fsync` off the server it
@@ -521,7 +551,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

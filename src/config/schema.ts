@@ -2978,7 +2978,14 @@ export const HindsightConfigSchema = z.object({
       "temporal-language image patch (which ended a 200+-locale auto-detection " +
       "pass that blocked the shared asyncio loop on every recall); " +
       "comma-separated, unset means the image's baked `en`, set e.g. `en,es` to " +
-      "restore i18n parsing), plus the " +
+      "restore i18n parsing; and " +
+      "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS — the max chars of query text " +
+      "dateparser.search_dates() is handed during temporal analysis (0 = " +
+      "unlimited), made live by switchroom's temporal-offload image patch " +
+      "(which moved the synchronous extraction off the shared asyncio loop onto " +
+      "a single-worker thread and bounds its input, ending multi-second loop " +
+      "stalls on multi-KB consolidation queries); unset means the image's baked " +
+      "2000, set 0 to restore an unbounded full scan), plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
