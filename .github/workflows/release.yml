@@ -463,11 +463,15 @@ jobs:
   #      `curl | sh` install, from ~25 minutes (the native macOS build legs)
   #      to ~1. The operator is supposed to pass `--draft`; this is what
   #      makes the invariant hold when they don't.
-  #   2. It fails the whole pipeline in ~3 minutes, not ~25, when no release
-  #      exists for the tag at all — the single most common release-run
-  #      failure before this (#3633).
+  #   2. It AUTO-CREATES the release (as a draft, from the CHANGELOG.md
+  #      section for the tag) when none exists — so a tag push is sufficient
+  #      and the operator forgetting `gh release create` can no longer
+  #      silently skip the irreversible npm publish (#4331; v0.20.3/v0.20.4
+  #      shipped that way and stranded npm at 0.20.2). If CHANGELOG.md has no
+  #      section for the tag it still FAILS LOUDLY in ~3 minutes, not ~25 —
+  #      loud-and-blocked, never silent-and-skipped (#3633).
   guard:
-    name: hold an incomplete release out of `latest`
+    name: ensure a draft release exists and hold an incomplete one out of `latest`
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' &&
@@ -481,7 +485,7 @@ jobs:
       - name: Checkout (for the release-completeness script)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Locate the release, and hold an incomplete one back from `latest`
+      - name: Locate or auto-create the release, and hold an incomplete one back from `latest`
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EXPECT_TAG: ${{ github.ref_name }}
@@ -490,9 +494,15 @@ jobs:
           # The release object is created by the operator with
           # `gh release create vX.Y.Z --draft` (switchroom-release skill,
           # step 2) BEFORE the tag is pushed, so it normally already exists.
-          # Poll briefly for the API to catch up, then FAIL LOUDLY rather
-          # than inventing a release with auto-notes that would collide with
-          # the operator's CHANGELOG notes.
+          # Poll briefly for the API to catch up. If it still does not exist,
+          # AUTO-CREATE it as a DRAFT from the CHANGELOG.md section for this
+          # tag (#4331) rather than failing — the manual `gh release create`
+          # must NOT be a load-bearing gate whose omission silently skips the
+          # irreversible npm publish (that is exactly how v0.20.3/v0.20.4
+          # shipped with npm stranded at 0.20.2). There is no note-collision
+          # risk: the operator's release notes ARE the CHANGELOG section, the
+          # release commit is CHANGELOG-only, and this branch only runs when
+          # no release object exists at all.
           #
           # The LIST endpoint, not `gh release view`: a draft has no
           # published-release representation to view, and the draft is the
@@ -517,8 +527,48 @@ jobs:
             sleep 15
           done
           if [ -z "$found" ]; then
-            echo "::error::no GitHub Release exists for $EXPECT_TAG after ~150s. Create it as a DRAFT (gh release create $EXPECT_TAG --draft --notes-file …) then re-run this workflow via workflow_dispatch on the tag with dry_run=false."
-            exit 1
+            # AUTO-HEAL (#4331). No release exists for the tag — the operator
+            # skipped `gh release create`. Instead of failing (which strands
+            # npm, because `publish`/`npm`/`finalize` all `needs:` this job),
+            # create the DRAFT release from the CHANGELOG.md section.
+            #
+            # FAIL-LOUD FALLBACK: if CHANGELOG.md has no section for this tag,
+            # the extractor exits non-zero and we stop here with an actionable
+            # error. An empty GitHub Release is NEVER invented — loud-and-
+            # blocked beats silent-and-skipped, which is the whole lesson.
+            echo "::warning title=auto-creating release::no GitHub Release exists for $EXPECT_TAG after ~150s — auto-creating it as a DRAFT from CHANGELOG.md (the manual \`gh release create\` was skipped)."
+            set +e
+            title="$(node scripts/ci/extract-changelog-section.mjs --tag "$EXPECT_TAG" --notes-out /tmp/release-notes.md)"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::cannot auto-create $EXPECT_TAG: no usable CHANGELOG.md section (exit $rc; see above). Add the release notes under \`## $EXPECT_TAG — <summary>\` on the tagged commit, or create the release by hand (gh release create $EXPECT_TAG --draft --notes-file …), then re-run this workflow via workflow_dispatch on the tag with dry_run=false."
+              exit 1
+            fi
+            # --draft is mandatory: `finalize` is the only thing that un-drafts,
+            # so /releases/latest keeps serving the PREVIOUS complete release
+            # until every leg is green. --target pins the release to THIS
+            # commit — harmless when the tag ref already exists (the push case),
+            # correct if gh has to materialise it.
+            gh release create "$EXPECT_TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --target "$GITHUB_SHA" \
+              --title "$title" --notes-file /tmp/release-notes.md
+            echo "auto-created draft release $EXPECT_TAG from CHANGELOG.md"
+
+            # Re-verify it now exists and repopulate the summary the half-ship
+            # guard below reads. A freshly-created draft carries no assets yet
+            # (missing>0, draft=true) — exactly the state `publish` fills and
+            # `finalize` completes. A still-notFound here (exit 4) means the
+            # create did not take; abort rather than proceed unverifiable.
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > /tmp/releases.json
+            set +e
+            node scripts/ci/assert-release-assets-complete.mjs < /tmp/releases.json > /tmp/release-summary.json
+            rc=$?
+            set -e
+            if [ "$rc" -eq 4 ] || [ "$rc" -eq 1 ]; then
+              echo "::error::auto-created $EXPECT_TAG but the completeness check still cannot see it (exit $rc). Refusing to proceed on an unverifiable release."
+              exit 1
+            fi
           fi
           cat /tmp/release-summary.json
 

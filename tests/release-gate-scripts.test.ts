@@ -35,9 +35,16 @@ import {
   expectedAssets,
   EXIT as REL_EXIT,
 } from "../scripts/ci/assert-release-assets-complete.mjs";
+import {
+  extractSection,
+  normalizeVersion,
+  parseHeading,
+  EXIT as CL_EXIT,
+} from "../scripts/ci/extract-changelog-section.mjs";
 
 const REPO = resolve(import.meta.dirname, "..");
 const CLASSIFY = resolve(REPO, "scripts/ci/classify-workflow-run.mjs");
+const EXTRACT_CHANGELOG = resolve(REPO, "scripts/ci/extract-changelog-section.mjs");
 const ASSERT_RELEASE = resolve(REPO, "scripts/ci/assert-release-assets-complete.mjs");
 
 const TAG = "v9.9.9";
@@ -321,5 +328,134 @@ describe("assert-release-assets-complete — CLI exit codes drive the draft gate
     expect(run(ASSERT_RELEASE, JSON.stringify([mkRelease(REAL_EXPECTED)]), { EXPECT_TAG: "" }).code).toBe(
       REL_EXIT.badInput,
     );
+  });
+});
+
+// ───────────────────── extract-changelog-section ─────────────────────────
+//
+// The auto-heal (#4331): guard turns a tag push into a DRAFT GitHub Release
+// from CHANGELOG.md when `gh release create` was skipped (v0.20.3/v0.20.4).
+// The one property that keeps that safe is that it NEVER invents notes — a
+// missing or empty section must FAIL LOUDLY (non-zero) so guard blocks the
+// release instead of shipping an empty one. Every case here asserts an
+// OUTCOME (extracted text / exit code), never that a branch ran.
+
+const SAMPLE_CHANGELOG = [
+  "# Changelog",
+  "",
+  "## v0.20.4 — Card fairness and vault forwarding",
+  "",
+  "- **Reopen the activity feed (#4323):** the card stops going dark.",
+  "- Second bullet with a `## not a heading` inside a code span.",
+  "",
+  "### A sub-heading stays in the body",
+  "",
+  "- still v0.20.4 notes.",
+  "",
+  "## v0.20.3 — Older release",
+  "",
+  "- older notes that must not leak into v0.20.4.",
+  "",
+  "## Unreleased",
+  "",
+  "- staged, not yet a version.",
+  "",
+].join("\n");
+
+describe("extract-changelog-section — parsing (pure)", () => {
+  it("strips a single leading v so a v-tag and a bare version agree", () => {
+    expect(normalizeVersion("v0.20.4")).toBe("0.20.4");
+    expect(normalizeVersion("0.20.4")).toBe("0.20.4");
+    expect(normalizeVersion(" v1.2.3 ")).toBe("1.2.3");
+  });
+
+  it("parses a version heading and ignores prose / Unreleased headings", () => {
+    expect(parseHeading("## v0.20.4 — Card fairness")).toEqual({
+      version: "v0.20.4",
+      title: "v0.20.4 — Card fairness",
+    });
+    expect(parseHeading("## 1.2.3")).toEqual({ version: "1.2.3", title: "1.2.3" });
+    expect(parseHeading("## Unreleased")).toBeNull();
+    expect(parseHeading("### v0.20.4 — sub")).toBeNull();
+    expect(parseHeading("some prose")).toBeNull();
+  });
+
+  it("extracts exactly the section for the tag, sub-headings included", () => {
+    const r = extractSection(SAMPLE_CHANGELOG, "v0.20.4");
+    expect(r.found).toBe(true);
+    if (!r.found) return;
+    expect(r.title).toBe("v0.20.4 — Card fairness and vault forwarding");
+    expect(r.notes).toContain("Reopen the activity feed");
+    expect(r.notes).toContain("A sub-heading stays in the body");
+    // The next version's notes must never leak in.
+    expect(r.notes).not.toContain("older notes");
+    expect(r.notes).not.toContain("staged, not yet a version");
+  });
+
+  it("matches on the WHOLE version token, so v0.20.4 never matches v0.20.40", () => {
+    expect(extractSection(SAMPLE_CHANGELOG, "v0.20.40").found).toBe(false);
+    // and a bare (no-v) tag still resolves the v-prefixed heading
+    expect(extractSection(SAMPLE_CHANGELOG, "0.20.3").found).toBe(true);
+  });
+
+  it("reports not-found for a tag with no section", () => {
+    expect(extractSection(SAMPLE_CHANGELOG, "v9.9.9").found).toBe(false);
+  });
+});
+
+describe("extract-changelog-section — CLI never invents an empty release", () => {
+  function runExtract(args: string[]) {
+    const r = spawnSync("node", [EXTRACT_CHANGELOG, ...args], { cwd: REPO, encoding: "utf8" });
+    return { code: r.status, out: `${r.stdout ?? ""}`, err: `${r.stderr ?? ""}` };
+  }
+  function writeChangelog(body: string): string {
+    const d = tmp();
+    const p = join(d, "CHANGELOG.md");
+    writeFileSync(p, body);
+    return p;
+  }
+
+  it("exits 0 and writes notes + prints the title for a real section", () => {
+    const d = tmp();
+    const cl = join(d, "CHANGELOG.md");
+    writeFileSync(cl, SAMPLE_CHANGELOG);
+    const notes = join(d, "notes.md");
+    const r = runExtract(["--tag", "v0.20.4", "--changelog", cl, "--notes-out", notes]);
+    expect(r.code).toBe(CL_EXIT.ok);
+    expect(r.out.trim()).toBe("v0.20.4 — Card fairness and vault forwarding");
+    expect(readFileSync(notes, "utf8")).toContain("Reopen the activity feed");
+  });
+
+  it("exits non-zero (notFound) when the section is absent — FAIL LOUD, never a silent empty release", () => {
+    const cl = writeChangelog(SAMPLE_CHANGELOG);
+    const r = runExtract(["--tag", "v9.9.9", "--changelog", cl]);
+    expect(r.code).toBe(CL_EXIT.notFound);
+    expect(r.code).not.toBe(0);
+    expect(r.err).toMatch(/no CHANGELOG\.md section for v9\.9\.9/);
+  });
+
+  it("exits non-zero (empty) when the heading exists but the body is blank", () => {
+    const cl = writeChangelog(["# Changelog", "", "## v0.20.5 — Empty", "", "## v0.20.4 — Prev", "", "- prev.", ""].join("\n"));
+    const r = runExtract(["--tag", "v0.20.5", "--changelog", cl]);
+    expect(r.code).toBe(CL_EXIT.empty);
+    expect(r.code).not.toBe(0);
+  });
+
+  it("never exits 0 on unusable input (no tag, or unreadable CHANGELOG)", () => {
+    expect(runExtract(["--changelog", "/nonexistent/CHANGELOG.md"]).code).toBe(CL_EXIT.badInput);
+    const cl = writeChangelog(SAMPLE_CHANGELOG);
+    expect(runExtract(["--tag", "v0.20.4", "--changelog", "/nope/CHANGELOG.md"]).code).toBe(CL_EXIT.badInput);
+    expect(runExtract(["--changelog", cl]).code).toBe(CL_EXIT.badInput);
+  });
+
+  it("resolves the section for the repo's own CHANGELOG.md latest tag", () => {
+    // Ground-truth guard: whatever the newest `## vX.Y.Z` heading is, the
+    // extractor must find it — this is the exact call guard makes.
+    const real = readFileSync(resolve(REPO, "CHANGELOG.md"), "utf8");
+    const firstVersion = real.split("\n").map(parseHeading).find((h) => h)?.version;
+    expect(firstVersion).toBeDefined();
+    const r = extractSection(real, firstVersion!);
+    expect(r.found).toBe(true);
+    if (r.found) expect(r.notes.trim().length).toBeGreaterThan(0);
   });
 });
