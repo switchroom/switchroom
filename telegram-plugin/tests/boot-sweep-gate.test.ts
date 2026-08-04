@@ -161,6 +161,7 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
         order.push('queued-cards')
       },
       enableSweep: () => order.push('enable-sweep'),
+      seedPruneSweepCursors: () => order.push('seed-prune'),
       sweepTarget: async (t) => {
         order.push(`sweep:${t.chatId}:${t.threadId ?? '-'}`)
       },
@@ -177,6 +178,7 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
       'status-pins',
       'activity-cards',
       'queued-cards',
+      'seed-prune',
       'enable-sweep',
       'sweep:900000001:-',
     ])
@@ -194,6 +196,7 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
       'scan',
       'status-pins',
       'queued-cards',
+      'seed-prune',
       'enable-sweep',
       'sweep:900000001:-',
     ])
@@ -210,7 +213,7 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
       queuedCardReaper: boom,
     })
     await runBootPinSweepSteps(d.deps)
-    expect(d.order).toEqual(['scan', 'enable-sweep', 'sweep:900000001:-'])
+    expect(d.order).toEqual(['scan', 'seed-prune', 'enable-sweep', 'sweep:900000001:-'])
   })
 
   it('a failing store scan still lets the reapers and the DM enable run', async () => {
@@ -221,7 +224,13 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
     })
     await runBootPinSweepSteps(d.deps)
     // No targets to sweep, but nothing behind the scan is stranded.
-    expect(d.order).toEqual(['status-pins', 'activity-cards', 'queued-cards', 'enable-sweep'])
+    expect(d.order).toEqual([
+      'status-pins',
+      'activity-cards',
+      'queued-cards',
+      'seed-prune',
+      'enable-sweep',
+    ])
     expect(d.logs.join('')).toContain("step 'sweep-target-scan' failed: ENOENT")
   })
 
@@ -272,6 +281,7 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
           order.push('queued-cards')
         },
         enableSweep: () => order.push('enable-sweep'),
+        seedPruneSweepCursors: () => {},
         sweepTarget: async () => {},
         log: () => {
           throw new Error('EPIPE')
@@ -294,6 +304,9 @@ describe('runBootPinSweepSteps (#3664 salvage S2)', () => {
         activityCardReaper: boom,
         queuedCardReaper: boom,
         enableSweep: () => {
+          throw new Error('boom')
+        },
+        seedPruneSweepCursors: () => {
           throw new Error('boom')
         },
         sweepTarget: boom,

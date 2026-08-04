@@ -648,6 +648,7 @@ import { withDeadline } from './with-deadline.js'
 import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './status-pin-api.js'
 import { collectSweepTargets, type StalePinSweeper, type SweepTarget } from './stale-pin-sweep.js'
 import { createGatewayStalePinSweeper } from './stale-pin-sweep-wiring.js'
+import { reseedSweepLedger } from './stale-pin-sweep-store.js'
 import { atomicWriteFileSync } from '../../src/util/atomic.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
 import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
@@ -9041,6 +9042,11 @@ let stalePinSweepEligible = false
 // the previous complete ledger or the new one — never a truncated file that
 // forgets an in-flight drain.
 const STALE_PIN_SWEEP_STORE_PATH = join(STATE_DIR, 'stale-pin-sweep.json')
+const sweepStoreFs = {
+  readFileSync: (p: string) => readFileSync(p, 'utf-8'),
+  writeFileSync: (p: string, data: string) => atomicWriteFileSync(p, data, 0o600),
+  existsSync: (p: string) => existsSync(p),
+}
 const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
   telegram: { handle: () => lockedBot, call: robustApiCall },
   claims: () => statusPinClaims.values(),
@@ -9049,14 +9055,7 @@ const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
       ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
       : [],
   eligible: () => stalePinSweepEligible,
-  store: {
-    path: STALE_PIN_SWEEP_STORE_PATH,
-    fs: {
-      readFileSync: (p) => readFileSync(p, 'utf-8'),
-      writeFileSync: (p, data) => atomicWriteFileSync(p, data, 0o600),
-      existsSync: (p) => existsSync(p),
-    },
-  },
+  store: { path: STALE_PIN_SWEEP_STORE_PATH, fs: sweepStoreFs },
   // Per-deployment override only. UNSET (the normal case) means "take the
   // standing policy" — UNPIN_ALL_FORUM_TOPIC_ENABLED in stale-pin-sweep.ts,
   // i.e. the WHOLESALE topic drain stays off because it also removes pins this
@@ -9099,6 +9098,7 @@ function runBootPinCleanupAndStalePinSweep(): Promise<void> {
     enableSweep: () => {
       stalePinSweepEligible = true
     },
+    seedPruneSweepCursors: () => reseedSweepLedger(STALE_PIN_SWEEP_STORE_PATH, sweepStoreFs),
     sweepTarget: (t: SweepTarget) => stalePinSweeper.sweepTarget(t),
     log: (line) => process.stderr.write(line),
   })

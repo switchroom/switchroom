@@ -221,7 +221,44 @@ export function pendingSweepCursors(cursors: readonly SweepCursor[]): SweepCurso
   return cursors.filter((c) => !c.done && c.attempts < SWEEP_MAX_ATTEMPTS)
 }
 
-/** Drop discharged and forfeited rows — called once the ledger is reseeded. */
+/**
+ * Boot seed pass: drop DISCHARGED (`done: true`) rows ONLY, so a chat that
+ * drained in a prior session is re-evaluated LIVE on the next sweep instead of
+ * short-circuiting forever on a stale `done` (#3953 regression — the seed pass
+ * was never wired, so `done` was effectively permanent).
+ *
+ * FORFEITED rows (`attempts >= SWEEP_MAX_ATTEMPTS`, still `!done`) are
+ * deliberately RETAINED. Their whole purpose is to remember that a chat's
+ * attempt budget is spent (bot kicked, pin rights revoked, a chat that
+ * flood-waits forever). Pruning one would let the next boot re-seed it from the
+ * pin stores and re-burn the full 8-attempt budget on every boot for the rest
+ * of time — precisely the Telegram flood the attempt cap exists to prevent. So
+ * this filters on `done` ALONE; it must NOT also gate on `attempts`.
+ */
 export function pruneSweepCursors(cursors: readonly SweepCursor[]): SweepCursor[] {
-  return cursors.filter((c) => !c.done && c.attempts < SWEEP_MAX_ATTEMPTS)
+  return cursors.filter((c) => !c.done)
+}
+
+/**
+ * BOOT-SEED reseed of the durable ledger (#3953): drop discharged (`done:true`)
+ * rows so a `(chat, thread)` that drained in a prior session is re-evaluated
+ * LIVE on the next sweep instead of short-circuiting forever on a stale `done`.
+ * Forfeited rows are retained (see {@link pruneSweepCursors}).
+ *
+ * Writes ONLY when the prune changed the ledger, so a no-op boot never churns
+ * the durable file. Never throws — a reseed failure degrades to the pre-fix
+ * behaviour (the stale `done` survives one more boot), it must not break boot.
+ *
+ * BOOT-SCOPED BY CONTRACT: the caller must invoke this once at boot, never on
+ * the per-inbound path (which fires on every message — re-arming a full re-drain
+ * per message is a Telegram flood).
+ */
+export function reseedSweepLedger(
+  path: string,
+  fs: SweepStoreFsSeam,
+  log: (line: string) => void = (l) => process.stderr.write(l),
+): void {
+  const rows = loadSweepCursors(path, fs)
+  const pruned = pruneSweepCursors(rows)
+  if (pruned.length !== rows.length) persistSweepCursors(path, fs, pruned, log)
 }
