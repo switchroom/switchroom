@@ -1,5 +1,100 @@
 # Changelog
 
+## v0.20.4 — Activity-card fairness, progress-cap hardening, and vault token forwarding
+
+Telegram/gateway delivery-surface reliability (2026-08-04): the card the user
+is actually watching stops going dark or being starved, the `progress_update`
+attention cap holds under turn-less inbounds and concurrency, and three
+in-process vault resolvers stop silently denying themselves.
+
+### Activity card & worker feed — the watched card stops going dark
+
+- **Reopen the activity feed after a substantive early reply (#4323):** the
+  Telegram activity card retired on a turn's first substantive reply and could
+  not reopen while that same turn kept doing tool work, so a turn that answers
+  early ("here's the plan, starting now") then works 10+ minutes went dark —
+  `shouldReopenFeedAfterAck` hard-returned false whenever `finalAnswerSubstantive`
+  was true, and Lever 1 (`finalAnswerEverDelivered`) blocked any fresh card
+  OPEN below the delivered reply. New `SWITCHROOM_FEED_REOPEN_AFTER_SUBSTANTIVE`
+  (default ON) reopens the feed after ≥ `SUBSTANTIVE_REOPEN_MIN_LABELS` (2)
+  post-answer tool labels, so a genuinely-final single-reply turn with 0–1
+  housekeeping tools never flaps the card. The substantive reopen does NOT clear
+  `finalAnswerDelivered` (unlike the ack path) — clearing it would trip the
+  turn-end silent-end re-prompt and duplicate the answer; instead `decideFeedReopen`
+  signals `liftLeverOne`. Flag off is byte-identical to today.
+- **Per-`message_id` cosmetic fair-share so a watched card is not starved
+  (#4325):** the per-chat cosmetic budget (`cosmeticPerChatMaxPerWindow`, 6/60s)
+  was ONE bucket shared across every cosmetic surface in a chat — the primary
+  activity card, a worker/sub-agent card, and answer-stream draft edits — so
+  under intra-cosmetic contention (two live cards), especially once a 429
+  tightened the bucket via AIMD, the surface the user watches could go well
+  past 60s between frames while another surface kept repainting (the 60–90s
+  mid-turn stall). Confined to `edit-flood-fuse.ts` and drawn from the same pool
+  (no new wire rate), the shared pool now splits into a FLOOR lane — each
+  distinct cosmetic `message_id` gets a guaranteed `cosmeticFloorPerWindow`
+  (default 2/60s ≈ 1 edit/30s), up to `cosmeticFloorSlots` (2) ids — and a
+  shared, AIMD-reduced REMAINDER lane; the two caps sum to the pool. The floor
+  lane is AIMD-immune, so a 429 backoff slows a watched card without freezing
+  it, and an edit deferred past `throttleNoticeMs` (45s) raises a `'throttled'`
+  signal so the lag is observable. Kill-switch `SWITCHROOM_FEED_FAIR_SHARE=0`
+  restores the pre-fix single shared bucket byte-for-byte.
+- **Stamp sub-agent origin at dispatch; floor misses to the recent turn
+  (#4324):** a background worker dispatched from inside a synthesized handback
+  turn misrouted its card + handback to the owner DM with the forum thread
+  stripped — the handback/progress inbound builders never put `chat_id` in
+  meta, so `beginTurn` minted no turn atom, the #2085 dispatch-time stamp read
+  no marker, and origin resolution fell through `fleetChatId || allowFrom[0]`
+  to the owner DM. Fixed in three layers: a dispatch-time stamp from the
+  gateway's own live turn context (`stampSubagentDispatchTurn`, marker-free and
+  window-free); `meta.chat_id` added to both synthesized-turn builders so they
+  mint a turn atom and the existing hook stamp fires; and a safe-degrade floor
+  to the most-recent turn's chat+topic **bounded to turns before the worker's
+  own dispatch time** — never a newer unrelated chat — before the owner-DM last
+  resort, with a once-per-agent audit line when it fires. A follow-up refactor
+  unified the worker-surface ladder into one implementation (fleet beats the
+  recent-turn floor everywhere) and kept `gateway.ts` under the anti-inflation
+  ratchet.
+
+### `progress_update` attention cap — flood-safe on turn-less inbounds and under concurrency
+
+- **Restore the attention cap on turn-less inbounds; doctor WARN on a disabled
+  edit-flood fuse (#4328):** the documented 5-per-turn `progress_update` cap
+  only applied when the inbound minted a turn atom, so from a handback /
+  progress-inbound turn a worker could send at the 20s floor indefinitely
+  (~180/hr into one chat). A new `progress-fallback-cap.ts` applies a rolling
+  15-min/chat fallback cap when there is no turn atom; the per-turn counter now
+  increments only AFTER a successful send (a thrown send burns no slot); and
+  `switchroom doctor` WARNs when `SWITCHROOM_EDIT_FUSE` is disabled for any
+  agent — the only outbound layer whose ceilings sit below Telegram's flood-ban
+  threshold — routed through the runtime's own env parser so doctor and gateway
+  cannot disagree.
+- **Make the cap race-safe (reserve-then-confirm) + a real-handler test
+  (#4329):** both the turn-counter path and the turn-less fallback window
+  checked `atCap`, then awaited the send, then recorded it — so two concurrent
+  same-key calls could both pass the check and push the count past 5. The slot
+  is now RESERVED synchronously before the await (a concurrent caller sees it
+  and cannot overshoot) and RELEASED if the send throws (a thrown send still
+  burns no slot under concurrency), with both paths sharing one
+  `sendWithProgressCap` orchestrator and the 20s min-interval floor untouched.
+  An integration test now drives the real `reserveProgressSlot` /
+  `sendWithProgressCap` seam the handler calls, and an orphaned test excluded
+  from both bun runners in #4328 is added back to the suite.
+
+### Vault — in-process resolvers forward the agent capability token
+
+- **Forward the agent capability token from in-process env resolvers (#4326):**
+  three in-process env resolvers called the vault broker WITHOUT the agent's
+  capability token, so the broker denied on the peercred ACL and the
+  `.catch(() => null)` swallowed it — `memory setup --recreate` could not derive
+  `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` (LiteLLM routing) or
+  `HINDSIGHT_CP_ACCESS_KEY`, and `--strict-env` refused. Mirroring the canonical
+  `switchroom vault get` path (#1053), each resolver now reads the token via
+  `readVaultTokenFile` and threads `{ token }` into the broker opts —
+  `resolveLiteLLMForHindsight` in `src/cli/memory.ts` and `src/cli/setup.ts`,
+  and `resolveHindsightCpAccessKey` in `src/setup/hindsight.ts`. When
+  `SWITCHROOM_AGENT_NAME` is unset the token stays undefined and the call is
+  wire-identical to before, so the host-operator peercred path is unaffected.
+
 ## v0.20.3 — Handoff hardening + root-tier host-access honesty
 
 > **Version note:** an anomalous lightweight `v0.20.2` tag was pushed straight
