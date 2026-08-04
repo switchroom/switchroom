@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.20.5 — Release-pipeline auto-heal, fleet Bash/checklist pre-approval, and activity-card silence fix
+
+Release plumbing and fleet-wide defaults (2026-08-04): a skipped
+`gh release create` can no longer silently strand npm at the old version (the
+first release to exercise the #4331 auto-heal), `Bash` and the two native
+checklist Telegram MCP tools are pre-approved fleet-wide, and a healthy turn
+whose only motion is a live-updating activity card is no longer torn down as
+"silent".
 
 ### Release pipeline — a skipped `gh release create` can no longer silently strand npm
 
@@ -27,6 +34,57 @@
   LOUDLY — an empty release is never invented. Guarded by rule R15 (proved by
   mutation) in `tests/release-pipeline-gating.test.ts` plus extractor unit +
   CLI tests in `tests/release-gate-scripts.test.ts`.
+
+### Scaffold defaults — `Bash` and the native checklist tools pre-approved fleet-wide
+
+- **Pre-approve `Bash` and the two checklist Telegram MCP tools via the scaffold
+  default (#4334):** `Bash` prompted on nearly every fleet agent's first shell
+  call of a task, storming the operator with an approval card for no real
+  containment — Claude Code permission precedence is a UNION (`--allowedTools`
+  merges with `settings.json` `permissions.allow`, `deny` always wins), each
+  agent runs in its own Docker container, so a shell command's blast radius is
+  already that agent's sandbox (the same boundary that makes the pre-approved
+  `Read`/`Grep`/`Glob` safe). `"Bash"` now joins
+  `DEFAULT_READ_ONLY_PREAPPROVED_TOOLS` (`src/agents/scaffold.ts`), seeded
+  **only** for default agents (empty `tools.allow`, non-dangerous) through the
+  shared `computeDesiredPermissionAllow` so scaffold and `reconcileAgent` stay
+  in lockstep — an agent with an explicit `tools.allow` is unchanged, and
+  `Edit`/`Write` stay OFF the list (still covered by `defaultMode: acceptEdits`).
+  In practice only **kdogg**'s runtime behavior actually changes — root-tier
+  agents already carry `Bash` via `all`, so no new exposure. `tools.deny:
+  ["Bash"]` is the lever to keep any agent shell-free (deny wins). The two
+  native-checklist tools `send_checklist` + `update_checklist`
+  (`telegram-plugin/bridge/bridge.ts`) are added to
+  `SWITCHROOM_TELEGRAM_MCP_TOOLS`, so the first checklist call no longer wedges
+  on a per-call prompt — the same drift class the parity test already guards for
+  `progress_update`. Keep-gated tools (`mcp__hostd__*` mutators, the vault verb,
+  mental-model writes, `Write`/`Edit`, `AskUserQuestion`) remain excluded from
+  the default allow, asserted by new scaffold tests.
+
+### Telegram/gateway — a live-updating activity card is not silence
+
+- **Stop the 300s silence-unwedge false-positive on a healthy turn (#4330):**
+  the framework fired its 300s terminal unwedge ("no output for 5 min — the
+  framework ended that stalled turn") on a HEALTHY turn whose pinned
+  "→ Working… · Nm · N tools" activity card was visibly updating the whole time,
+  tearing down the very card the user was watching and re-asking their message.
+  The card is edited exclusively through `drainActivitySummary`
+  (`telegram-plugin/gateway/narrative-lane.ts`), whose highest-frequency driver
+  is the framework heartbeat — a wall-clock climb deliberately excluded from the
+  `noteProduction` reset sites (counting it as production would keep a genuinely
+  hung turn alive forever, #1556). So a turn whose only visible motion for 300s
+  was the heartbeat-climbing card read as silent and `tick()`
+  (`silence-poke.ts`) fired the fallback. Fix: card renders now take a **bounded
+  defer** (`noteCardRender` + `CARD_RENDER_FRESH_MS = 30s`, stamped from
+  `drainActivitySummary` after a landed open / non-shed edit) — while the last
+  render is younger than 30s the terminal fallback defers, bounded by
+  `fallbackHardCeiling` (900s), so a truly wedged turn still unwedges at the
+  ceiling and a card that stops moving lapses out of the fresh window within
+  30s. A second gap found while tracing: the `progress_update` MCP tool sends a
+  fresh user-visible message but never called `silencePoke.noteOutbound`; it now
+  does a **full reset** (it is the reply-send class — a hung model cannot forge
+  it). Guarded by new `telegram-plugin/tests/silence-poke-card-render.test.ts`
+  (5 of 7 fail pre-fix; the safety-net guards pass both sides).
 
 ## v0.20.4 — Activity-card fairness, progress-cap hardening, and vault token forwarding
 
