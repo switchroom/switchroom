@@ -1138,8 +1138,17 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       }
       if (QUEUED_CARD_ENABLED && !handbackOwnsSurface) {
         const cardChatId = ev.chatId
-        const replyToRaw = ev.messageId != null ? Number(ev.messageId) : null
-        const replyTo = replyToRaw != null && Number.isFinite(replyToRaw) ? replyToRaw : null
+        // Reply-anchor ONLY to a plausible real Telegram message id. Synthetic
+        // enqueues (subagent handback, boot resume, cron) fabricate `messageId`
+        // from `Date.now()` (~1.78e13) — finite, so a bare `Number.isFinite`
+        // guard passes it, but `reply_parameters.message_id` hard-rejects
+        // anything beyond signed int32 with 400 `field "message_id" must be a
+        // valid Number` (`allow_sending_without_reply` does NOT bypass the
+        // range check), killing the whole card send (overlord
+        // gateway-supervisor.log 2026-08-04, e.g. msg=1785846295635). Same bug
+        // class as the resume-dark-feed incident — reuse its guard, don't
+        // re-derive a weaker one. An unanchored card is fine; no card is not.
+        const replyTo = parseSourceMessageId(ev.messageId)
         void openQueuedCard(deps, cardChatId, enqThreadIdNum ?? null, replyTo).then((cardId) => {
           if (cardId == null) return
           // Still parked → adopt on the next dequeue. Otherwise the entry already
