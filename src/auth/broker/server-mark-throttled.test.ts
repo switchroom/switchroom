@@ -402,8 +402,9 @@ describe("mark-throttled — first-hit corroboration + probe rate-bound", () => 
     clock.set(late);
     const r3 = await markThrottled(b, late + 60_000, "3");
     expect(r3.data.escalated).toBe(false);
-    // The window is pruned to just the fresh hit — THROTTLE_ESCALATION_HITS /
-    // _WINDOW are bookkeeping now, they no longer gate escalation.
+    // The window is pruned to just the fresh hit — the hit list is
+    // bookkeeping now (THROTTLE_ESCALATION_WINDOW_MS), it no longer gates
+    // escalation.
     expect(b.quota["alice"].throttle_hits).toEqual([late]);
   });
 });
