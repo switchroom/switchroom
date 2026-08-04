@@ -20,6 +20,7 @@ import {
   planGc,
   applyGc,
   defaultRoots,
+  defaultTaskTreeRoots,
   trashRoot,
   listTrashEntries,
   selectPurgeTargets,
@@ -236,16 +237,31 @@ export function registerWorktreeCommand(program: Command): void {
   worktree
     .command("gc")
     .description(
-      "Reclaim dev worktrees that outlived their PR.\n" +
+      "Reclaim dev worktrees that outlived their PR, and per-agent task trees.\n" +
         "Dry-run by default; pass --yes to act. Quarantines orphaned worktree\n" +
         "directories (move, not delete) and removes registered worktrees whose\n" +
-        "PR is MERGED and whose tree is clean.",
+        "PR is MERGED and whose tree is clean. Also sweeps per-agent home/work\n" +
+        "task trees (all shapes) that are clean + pushed + idle + merged/closed;\n" +
+        "dead-but-dirty/unpushed trees are surfaced and reclaimed only with\n" +
+        "--reclaim-dirty (reversible quarantine).",
     )
     .option(
       "--root <dir>",
-      "Scan root (repeatable). Default: ~/code",
+      "Dev-worktree scan root (repeatable). Default: ~/code",
       (val: string, acc: string[]) => [...acc, val],
       [] as string[],
+    )
+    .option(
+      "--task-root <dir>",
+      "Task-tree scan root (repeatable). Default: every agent's home/work + home/workspace",
+      (val: string, acc: string[]) => [...acc, val],
+      [] as string[],
+    )
+    .option("--no-task-roots", "Skip the per-agent task-tree sweep entirely")
+    .option("--idle-days <days>", "Idle threshold for task trees (default 14)", "14")
+    .option(
+      "--reclaim-dirty",
+      "Operator escape hatch: quarantine IDLE dirty/unpushed task trees (reversible)",
     )
     .option("--yes", "Actually act (default is dry-run)")
     .option("--json", "Output raw JSON")
@@ -254,6 +270,10 @@ export function registerWorktreeCommand(program: Command): void {
     .action(
       (opts: {
         root: string[];
+        taskRoot: string[];
+        taskRoots?: boolean;
+        idleDays: string;
+        reclaimDirty?: boolean;
         yes?: boolean;
         json?: boolean;
         purgeTrash?: boolean;
@@ -287,9 +307,27 @@ export function registerWorktreeCommand(program: Command): void {
         }
 
         const roots = opts.root.length > 0 ? opts.root : defaultRoots();
+        const taskTreeRoots =
+          opts.taskRoots === false
+            ? []
+            : opts.taskRoot.length > 0
+              ? opts.taskRoot
+              : defaultTaskTreeRoots();
+        const parsedIdle = Number(opts.idleDays);
+        const idleDays = Number.isFinite(parsedIdle) && parsedIdle >= 0 ? parsedIdle : 14;
         const dateStamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-        const plan = planGc(roots, { dateStamp });
+        const plan = planGc(
+          roots,
+          { dateStamp, idleDays, escapeHatch: opts.reclaimDirty },
+          taskTreeRoots,
+        );
         const toRemove = plan.registered.filter((r) => r.verdict === "remove");
+        const taskReap = plan.taskTrees.filter((t) => t.willAct);
+        // Surfaced-but-untouched: dead-but-dirty/unpushed trees the escape hatch
+        // would reclaim (RFC §4). Shown so the consequence is operator-visible.
+        const taskEscape = plan.taskTrees.filter(
+          (t) => !t.willAct && t.idle && (t.verdict === "skip-dirty" || t.verdict === "skip-unpushed"),
+        );
 
         if (!opts.yes) {
           if (opts.json) {
@@ -306,10 +344,33 @@ export function registerWorktreeCommand(program: Command): void {
             console.log(chalk.dim(`\nKept (${skips.length}):`));
             for (const r of skips) console.log(chalk.dim(`  ${r.verdict.replace("skip-", "")}: ${r.path} [${r.branch}] (pr=${r.prSignal})`));
           }
+          if (taskTreeRoots.length) {
+            const label = opts.reclaimDirty ? "reclaim (reap + escape-hatch)" : "reap (clean + pushed + idle + merged/closed)";
+            console.log(`\nTask trees to ${label}: ${chalk.bold(taskReap.length)}`);
+            for (const t of taskReap)
+              console.log(`  ${t.dir}  ${chalk.dim(`[${t.branch ?? "detached"}] ${t.shape} ${t.verdict} → ${t.dest}`)}`);
+            if (taskEscape.length) {
+              console.log(
+                chalk.yellow(
+                  `\nDead-but-dirty/unpushed task trees kept (${taskEscape.length}) — reclaim with --reclaim-dirty:`,
+                ),
+              );
+              for (const t of taskEscape)
+                console.log(chalk.dim(`  ${t.verdict.replace("skip-", "")}: ${t.dir} [${t.branch ?? "detached"}] ${t.shape}`));
+            }
+            const taskKept = plan.taskTrees.filter(
+              (t) => !t.willAct && !(t.idle && (t.verdict === "skip-dirty" || t.verdict === "skip-unpushed")) && t.verdict !== "skip-protected",
+            );
+            if (taskKept.length) {
+              console.log(chalk.dim(`\nOther task trees kept (${taskKept.length}):`));
+              for (const t of taskKept)
+                console.log(chalk.dim(`  ${t.verdict.replace("skip-", "")}: ${t.dir} [${t.branch ?? "detached"}] (pr=${t.prSignal})`));
+            }
+          }
           if (plan.skipped.length) {
             console.log(chalk.dim(`\nIgnored non-switchroom dirs: ${plan.skipped.length}`));
           }
-          console.log(chalk.dim("\nRe-run with --yes to act. Orphans are MOVED to the trash dir, not deleted."));
+          console.log(chalk.dim("\nRe-run with --yes to act. Reclaimed trees are MOVED to the trash dir, not deleted."));
           return;
         }
 
@@ -317,9 +378,16 @@ export function registerWorktreeCommand(program: Command): void {
         if (opts.json) {
           console.log(JSON.stringify(result));
         } else {
-          console.log(chalk.green(`Quarantined ${result.quarantined.length} orphan(s) → ${plan.trashDir}`));
+          console.log(chalk.green(`Quarantined ${result.quarantined.length} dir(s) → ${plan.trashDir}`));
           console.log(chalk.green(`Removed ${result.removed.length} merged worktree(s); deleted ${result.branchesDeleted.length} branch(es).`));
           console.log(chalk.dim(`Pruned metadata in ${result.pruned.length} repo(s).`));
+          if (taskEscape.length && !opts.reclaimDirty) {
+            console.log(
+              chalk.yellow(
+                `\n${taskEscape.length} dead-but-dirty/unpushed task tree(s) were kept. Reclaim reversibly with --reclaim-dirty.`,
+              ),
+            );
+          }
           for (const e of result.errors) console.warn(chalk.yellow(e));
           console.log(chalk.dim(`\nQuarantined dirs are recoverable until \`switchroom worktree gc --purge-trash --yes\`.`));
         }
