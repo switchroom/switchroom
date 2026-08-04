@@ -17,6 +17,10 @@
  * target via `cronIdentity()`. Pure string fns — pinned in cron-session.test.ts.
  */
 
+import type { InboundMessage, GatewayToClient } from './ipc-protocol.js'
+import type { InboundSpool } from './inbound-spool.js'
+import { redeliverBufferedInbound, type PendingInboundBuffer } from './pending-inbound-buffer.js'
+
 /** Suffix that distinguishes a cron-session bridge from the main agent bridge. */
 export const CRON_IDENTITY_SUFFIX = "-cron";
 
@@ -139,4 +143,66 @@ export function deliverInjectWithFallback(
     return { target: agentName, delivered: true, fellBackToMain: true };
   }
   return { target, delivered: false, fellBackToMain: false };
+}
+
+/** Minimal view of the IPC client the cron-bridge register handler needs.
+ *  A structural subset of `IpcClient` so this stays unit-testable without the
+ *  gateway's module-load side effects. */
+export interface CronBridgeRegisterClient {
+  agentName: string | null | undefined;
+  send: (msg: GatewayToClient) => void;
+}
+
+/**
+ * Drain a cheap-cron (`<agent>-cron`) bridge's buffered fires when it
+ * registers — the Tier-1 §2.4/§3.3 status-silent path (#4348).
+ *
+ * The cron bridge is STATUS-SILENT: it must NOT drive the gateway's singleton
+ * machinery (shadow bridge-state, warmup, boot card). But it MUST still flush
+ * any cron fire buffered+spooled during the boot window — a due tick that
+ * arrived before the cron bridge registered.
+ *
+ * THE BUG (#4348): the pre-fix path did a raw `pendingInboundBuffer.drain()` +
+ * `client.send()` loop and returned early WITHOUT ever reaching `spool.ack`.
+ * `spool.ack` lives ONLY inside `redeliverBufferedInbound` — the one chokepoint
+ * every other drain path (bridgeUp, idle-drain, silence-poke, turn-end) routes
+ * through. So the durable spool entry stayed live, boot-replay re-pushed it on
+ * the next restart, and the SAME cron fire re-fired: a duplicate delivery
+ * bounded only by the 15-min escalation sweep. This was the ONLY drain that
+ * bypassed the chokepoint.
+ *
+ * THE FIX: route the drain through `redeliverBufferedInbound` too, so each
+ * delivered fire is spool-acked exactly once and cannot re-fire after a
+ * restart. `beforeRedeliver` (the represent-veto) rides along by construction;
+ * it self-gates and is a no-op for cron-sourced fires. A `send` throw now
+ * re-buffers the fire (lossless) instead of dropping it — strictly safer than
+ * the pre-fix best-effort drop and identical to every sibling drain path.
+ *
+ * Returns the `redeliverBufferedInbound` counts for observability.
+ */
+export function drainCronBridgeOnRegister(
+  client: CronBridgeRegisterClient,
+  buffer: PendingInboundBuffer,
+  spool?: InboundSpool,
+  log?: (line: string) => void,
+): { drained: number; redelivered: number; rebuffered: number; retracted: number } {
+  // Status-silent handshake ack (unchanged from the pre-fix path).
+  client.send({ type: "status", status: "agent_connected" });
+  const send = (msg: InboundMessage): boolean => {
+    try {
+      client.send(msg);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const result = redeliverBufferedInbound(buffer, client.agentName ?? "", send, spool);
+  if (result.drained > 0 && log != null) {
+    log(
+      `telegram gateway: cron-bridge drain agent=${client.agentName} ` +
+        `drained=${result.drained} redelivered=${result.redelivered} ` +
+        `rebuffered=${result.rebuffered}\n`,
+    );
+  }
+  return result;
 }
