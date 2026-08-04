@@ -121,6 +121,32 @@ export function classify429Detail(text: string): RateLimit429Classification {
 }
 
 /**
+ * #failover-429-corroborate — does this terminal 429 classification warrant a
+ * fire-and-forget broker corroboration probe (throttle-tier runner) IN ADDITION
+ * to the calm rate-limited card?
+ *
+ * TRUE for `generic-transient` ONLY. That family (a bare `rate_limit_error`
+ * body / novel wording that matches neither the account-scoped negation
+ * strings nor litellm-local) used to drop on the calm-card floor with NO broker
+ * contact — so a genuine 5h/7d wall hiding behind transient wording was never
+ * probed, and the turn died with no failover. Routing it through the runner
+ * lets the broker take ONE live quota probe (rate-bounded) and convert a real
+ * wall into failover; a healthy probe leaves the calm path unchanged.
+ *
+ * FALSE (never corroborate) for:
+ *   - `litellm-local` — INVARIANT: the request never reached Anthropic (the
+ *     proxy's own tpm/rpm limiter tripped), so account state must not be
+ *     touched. This mechanism, not discipline, keeps that path account-inert.
+ *   - `account-scoped` — already runs its own throttle tier / failover path.
+ *   - `null` — not a rate-limited event.
+ */
+export function classification429WarrantsCorroboration(
+  classification: RateLimit429Classification | null,
+): boolean {
+  return classification === 'generic-transient'
+}
+
+/**
  * Build the `rate_limit_429_classified` runtime metric for one terminal
  * rate-limited operator event — the instrumentation that lets an operator
  * correlate Anthropic ACCOUNT 429s with fleet TPM (the prerequisite for

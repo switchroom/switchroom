@@ -425,8 +425,10 @@ import {
 } from '../model-unavailable.js'
 import {
   build429ClassifiedMetric,
+  classification429WarrantsCorroboration,
   classify429Detail,
   decideThrottleTier,
+  THROTTLE_DEFAULT_WAIT_MS,
   throttleRetryInPlaceMaxMs,
 } from '../throttle-tier.js'
 import { createThrottleTierRunner } from './throttle-tier-wiring.js'
@@ -7827,6 +7829,8 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       agent,
       shouldEmitCard: (a) => shouldEmitOperatorEvent(a, 'rate-limited'),
     })
+    // #failover-429-corroborate — a generic-transient 429 used to drop on the calm-card floor with NO broker contact; route it to the runner for a rate-bounded first-hit escalation probe (NEVER litellm-local — the predicate's docstring owns that account-inert invariant).
+    if (classification429WarrantsCorroboration(rateLimit429Classification)) void throttleTierRunner.fire(agent, Date.now() + THROTTLE_DEFAULT_WAIT_MS, false)
     if (surface === 'litellm-local-notice') {
       process.stderr.write(
         `telegram gateway: 429 classified litellm-proxy-local agent=${agent} — ` +
