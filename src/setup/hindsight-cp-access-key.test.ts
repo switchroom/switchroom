@@ -22,6 +22,9 @@
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import { join } from "node:path";
 
 const { execFileSyncMock } = vi.hoisted(() => ({ execFileSyncMock: vi.fn() }));
 vi.mock("node:child_process", async (importOriginal) => {
@@ -388,6 +391,25 @@ describe("resolveHindsightCpAccessKey", () => {
   const brokerOk = (value: string) =>
     vi.fn().mockResolvedValue({ kind: "ok", entry: { kind: "string", value } });
 
+  // These tests reason about the exact opts object handed to the broker, which
+  // depends on SWITCHROOM_AGENT_NAME / SWITCHROOM_AGENTS_DIR. The harness may
+  // itself run inside an agent container where those are set, so pin them for
+  // determinism and restore afterwards.
+  let savedName: string | undefined;
+  let savedDir: string | undefined;
+  beforeEach(() => {
+    savedName = process.env.SWITCHROOM_AGENT_NAME;
+    savedDir = process.env.SWITCHROOM_AGENTS_DIR;
+    delete process.env.SWITCHROOM_AGENT_NAME;
+    delete process.env.SWITCHROOM_AGENTS_DIR;
+  });
+  afterEach(() => {
+    if (savedName === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+    else process.env.SWITCHROOM_AGENT_NAME = savedName;
+    if (savedDir === undefined) delete process.env.SWITCHROOM_AGENTS_DIR;
+    else process.env.SWITCHROOM_AGENTS_DIR = savedDir;
+  });
+
   it("returns undefined when nothing is configured", async () => {
     await expect(resolveHindsightCpAccessKey({})).resolves.toBeUndefined();
     await expect(
@@ -414,7 +436,11 @@ describe("resolveHindsightCpAccessKey", () => {
         { getViaBrokerStructured: get as never },
       ),
     ).resolves.toBe(ACCESS_KEY);
-    expect(get).toHaveBeenCalledWith("hindsight_cp_access_key");
+    // No SWITCHROOM_AGENT_NAME in this test's env ⇒ token stays undefined ⇒
+    // the opts object is empty. The empty-opts call is wire-identical to the
+    // pre-fix bare-key call (getViaBrokerStructured omits `token` from the
+    // payload when absent), so the host-operator peercred path is unaffected.
+    expect(get).toHaveBeenCalledWith("hindsight_cp_access_key", {});
   });
 
   it("fails CLOSED on a denied/missing/erroring vault reference", async () => {
@@ -432,6 +458,38 @@ describe("resolveHindsightCpAccessKey", () => {
           { getViaBrokerStructured: get as never },
         ),
       ).resolves.toBeUndefined();
+    }
+  });
+
+  it("forwards the agent capability token to the broker when a token file exists", async () => {
+    // The bug: in-process resolvers called the broker WITHOUT the agent's
+    // capability token, so the broker denied on the peercred ACL and the
+    // `.catch(() => null)` swallowed it — HINDSIGHT_CP_ACCESS_KEY never
+    // resolved under `memory setup --recreate`. The fix mirrors the working
+    // `vault get` path: read the token file and thread `{ token }` into the
+    // broker opts. This asserts the forwarding actually happens; it FAILS
+    // against the unpatched resolver, which passes only the bare key.
+    const dir = fs.mkdtempSync(join(os.tmpdir(), "sr-vault-token-"));
+    const slug = "test-agent";
+    const token = "vault-cap-" + "token-not-real";
+    fs.mkdirSync(join(dir, slug), { recursive: true });
+    const tokenPath = join(dir, slug, ".vault-token");
+    fs.writeFileSync(tokenPath, token + "\n");
+    fs.chmodSync(tokenPath, 0o600); // readVaultTokenFile refuses non-0600 files
+    process.env.SWITCHROOM_AGENTS_DIR = dir;
+    process.env.SWITCHROOM_AGENT_NAME = slug;
+
+    try {
+      const get = brokerOk(ACCESS_KEY);
+      await expect(
+        resolveHindsightCpAccessKey(
+          { hindsight: { cp_access_key: "vault:hindsight_cp_access_key" } },
+          { getViaBrokerStructured: get as never },
+        ),
+      ).resolves.toBe(ACCESS_KEY);
+      expect(get).toHaveBeenCalledWith("hindsight_cp_access_key", { token });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

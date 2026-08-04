@@ -1497,10 +1497,19 @@ export async function resolveHindsightCpAccessKey(
   if (!ref) return undefined;
   const { isVaultReference, parseVaultReference } = await import("../vault/resolver.js");
   if (!isVaultReference(ref)) return ref;
-  const get =
-    deps.getViaBrokerStructured ??
-    (await import("../vault/broker/client.js")).getViaBrokerStructured;
-  const resolved = await get(parseVaultReference(ref)).catch(() => null);
+  const brokerClient = await import("../vault/broker/client.js");
+  const get = deps.getViaBrokerStructured ?? brokerClient.getViaBrokerStructured;
+  // Issue #1053: forward the agent's capability token so the broker's grant
+  // path bypasses the peercred ACL. Without it a freshly-minted grant is
+  // ignored and the `.catch(() => null)` silently swallows the DENIED,
+  // leaving HINDSIGHT_CP_ACCESS_KEY underived. Mirrors the working `vault get`
+  // path in src/cli/vault.ts. Token stays undefined when SWITCHROOM_AGENT_NAME
+  // is unset — identical to prior host-operator peercred behavior.
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME;
+  const token = agentSlug ? brokerClient.readVaultTokenFile(agentSlug) ?? undefined : undefined;
+  const resolved = await get(parseVaultReference(ref), {
+    ...(token ? { token } : {}),
+  }).catch(() => null);
   if (!resolved || resolved.kind !== "ok" || resolved.entry.kind !== "string") {
     return undefined;
   }
