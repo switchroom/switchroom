@@ -23,6 +23,7 @@ import { buildObligationRepresentInbound, type Obligation } from './obligation-l
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
 import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
+import { parkedTurnStartCount } from './stream-render.js'
 
 export function createObligationWiring(deps: ObligationWiringDeps) {
   const {
@@ -161,13 +162,26 @@ function obligationSweep(): void {
   if (turnInFlightForGate()) return // a turn is running — let it finish/answer
   const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
   const now = Date.now()
+  // Session-busy signal (F2, decision half). A ~5-min silence poke can clear the
+  // machine turn (`turnInFlightForGate()` above → false) while the CLI session is
+  // STILL producing the answer — stream-render's live-turn mirror (`currentTurn`
+  // whose endedAt is null, or a parked turn-start) still knows it is busy. Without
+  // this, the sweep decides + buffers a represent mid-answer; the real reply lands
+  // seconds later and the model consumes the queued represent → a duplicate answer
+  // (the two-authorities-disagree defect). We treat a busy mirror the SAME as
+  // in-flight background work: defer the represent, BOUNDED by the same grace, so a
+  // wedged/hung session cannot silence a genuinely-unanswered turn forever.
+  const liveTurn = getCurrentTurn()
+  const sessionBusy = (liveTurn != null && liveTurn.endedAt == null) || parkedTurnStartCount() > 0
   // Background-work grace: while genuine autonomous sub-agent work is in flight
   // (a running worker, or an orphaned foreground sub-agent — neither visible to
-  // the turn machine), an obligation younger than the ceiling is NOT re-presented
-  // /escalated. Bounded by OBLIGATION_BACKGROUND_WORK_GRACE_MS so escalation
-  // always eventually fires. =0 disables it.
+  // the turn machine), OR the CLI session is still busy behind a poke-cleared
+  // machine turn, an obligation younger than the ceiling is NOT re-presented
+  // /escalated. Bounded by OBLIGATION_BACKGROUND_WORK_GRACE_MS (measured from
+  // openedAt in decideAtIdle) so escalation always eventually fires. =0 disables it.
   const backgroundWorkActive =
-    OBLIGATION_BACKGROUND_WORK_GRACE_MS > 0 && agentHasInFlightBackgroundWork(now)
+    OBLIGATION_BACKGROUND_WORK_GRACE_MS > 0 &&
+    (agentHasInFlightBackgroundWork(now) || sessionBusy)
   // Grace window: skip an obligation whose handling turn ended < grace ago — its
   // trailing slow/worker answer may still be landing (over-escalation fix).
   // Per-represent grace: skip an obligation re-presented < grace ago — prevents
@@ -189,6 +203,7 @@ function obligationSweep(): void {
       lastBgWorkDeferLogMs = now
       process.stderr.write(
         `telegram gateway: obligation sweep deferred — in-flight autonomous sub-agent work ` +
+          `or busy CLI session behind a poke-cleared turn ` +
           `(${obligationLedger.size()} open, bounded ${Math.round(OBLIGATION_BACKGROUND_WORK_GRACE_MS / 60_000)}m from receipt)\n`,
       )
     }

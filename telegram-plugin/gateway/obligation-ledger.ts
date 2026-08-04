@@ -178,6 +178,15 @@ export class ObligationLedger {
     return this.open.has(originTurnId)
   }
 
+  /** The open obligation for `originTurnId`, or undefined if none is open. Read-
+   *  only accessor for the delivery-time represent re-check (represent-delivery-
+   *  guard.ts): a represent buffered while the obligation was open must be re-
+   *  evaluated against the obligation's CURRENT cutoff at the moment it is handed
+   *  to the CLI bridge, since a reply may have landed between decision and drain. */
+  get(originTurnId: string): Obligation | undefined {
+    return this.open.get(originTurnId)
+  }
+
   hasOpen(): boolean {
     return this.open.size > 0
   }

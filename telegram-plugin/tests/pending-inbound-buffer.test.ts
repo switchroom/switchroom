@@ -9,6 +9,8 @@
 import { describe, it, expect } from 'vitest'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick, planBufferedRedelivery, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
+import { ObligationLedger } from '../gateway/obligation-ledger.js'
+import { makeRepresentRedeliveryGuard } from '../gateway/represent-delivery-guard.js'
 
 function inbound(source: string, ts = Date.now()): InboundMessage {
   return {
@@ -223,7 +225,7 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
       seen.push(m.messageId as number)
       return true
     })
-    expect(r).toEqual({ drained: 2, redelivered: 2, rebuffered: 0 })
+    expect(r).toEqual({ drained: 2, redelivered: 2, rebuffered: 0, retracted: 0 })
     expect(seen).toEqual([1, 2]) // FIFO preserved
     expect(buf.depth('klanker')).toBe(0)
   })
@@ -233,7 +235,7 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
     buf.push('klanker', inbound('user', 1))
     buf.push('klanker', inbound('cron', 2))
     const r = redeliverBufferedInbound(buf, 'klanker', () => false)
-    expect(r).toEqual({ drained: 2, redelivered: 0, rebuffered: 2 })
+    expect(r).toEqual({ drained: 2, redelivered: 0, rebuffered: 2, retracted: 0 })
     expect(buf.depth('klanker')).toBe(2) // still there, nothing lost
     expect(buf.drain('klanker').map((m) => m.meta?.source)).toEqual(['user', 'cron'])
   })
@@ -244,7 +246,7 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
     const r = redeliverBufferedInbound(buf, 'klanker', () => {
       throw new Error('bridge write failed')
     })
-    expect(r).toEqual({ drained: 1, redelivered: 0, rebuffered: 1 })
+    expect(r).toEqual({ drained: 1, redelivered: 0, rebuffered: 1, retracted: 0 })
     expect(buf.depth('klanker')).toBe(1)
   })
 
@@ -258,7 +260,7 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
       n++
       return n !== 2 // 2nd send fails
     })
-    expect(r).toEqual({ drained: 3, redelivered: 2, rebuffered: 1 })
+    expect(r).toEqual({ drained: 3, redelivered: 2, rebuffered: 1, retracted: 0 })
     expect(buf.drain('klanker').map((m) => m.meta?.source)).toEqual(['b'])
   })
 
@@ -269,7 +271,7 @@ describe('redeliverBufferedInbound — wedge-clear self-heal (fleet-update incid
       calls++
       return true
     })
-    expect(r).toEqual({ drained: 0, redelivered: 0, rebuffered: 0 })
+    expect(r).toEqual({ drained: 0, redelivered: 0, rebuffered: 0, retracted: 0 })
     expect(calls).toBe(0)
   })
 
@@ -334,7 +336,7 @@ describe('idleDrainTick — the 3rd drain trigger (finn orphan gap, 2026-05-19)'
     buf.push('finn', inbound('user', 2013)) // the orphaned "verify with mff-query.py" class
     const seen: number[] = []
     const r = idleDrainTick(buf, 'finn', () => true, (m) => { seen.push(m.messageId as number); return true })
-    expect(r).toEqual({ drained: 1, redelivered: 1, rebuffered: 0 })
+    expect(r).toEqual({ drained: 1, redelivered: 1, rebuffered: 0, retracted: 0 })
     expect(seen).toEqual([2013])
     expect(buf.depth('finn')).toBe(0)
   })
@@ -343,7 +345,7 @@ describe('idleDrainTick — the 3rd drain trigger (finn orphan gap, 2026-05-19)'
     const buf = createPendingInboundBuffer({ log: () => {} })
     buf.push('finn', inbound('user', 1))
     const r = idleDrainTick(buf, 'finn', () => true, () => false)
-    expect(r).toEqual({ drained: 1, redelivered: 0, rebuffered: 1 })
+    expect(r).toEqual({ drained: 1, redelivered: 0, rebuffered: 1, retracted: 0 })
     expect(buf.depth('finn')).toBe(1) // nothing lost
     expect(idleDrainTick(buf, '', () => true, () => true)).toBeNull() // empty agent guard
   })
@@ -419,6 +421,7 @@ describe('durable-spool integration (finn/carrie lost-on-restart fix)', () => {
       drained: 1,
       redelivered: 1,
       rebuffered: 0,
+      retracted: 0,
     })
   })
 })
@@ -589,7 +592,7 @@ describe('planBufferedRedelivery — merge-on-drain (forwarded-burst across a tu
       return true
     })
     expect(sent).toEqual(['part 1\npart 2\npart 3']) // ONE turn, not three
-    expect(r).toEqual({ drained: 3, redelivered: 3, rebuffered: 0 })
+    expect(r).toEqual({ drained: 3, redelivered: 3, rebuffered: 0, retracted: 0 })
     expect(buf.depth('ziggy')).toBe(0)
   })
 
@@ -598,7 +601,7 @@ describe('planBufferedRedelivery — merge-on-drain (forwarded-burst across a tu
     buf.push('ziggy', userMsg({ text: 'part 1', ts: 1 }))
     buf.push('ziggy', userMsg({ text: 'part 2', ts: 2 }))
     const r = redeliverBufferedInbound(buf, 'ziggy', () => false)
-    expect(r).toEqual({ drained: 2, redelivered: 0, rebuffered: 2 })
+    expect(r).toEqual({ drained: 2, redelivered: 0, rebuffered: 2, retracted: 0 })
     expect(buf.depth('ziggy')).toBe(2) // both originals back, nothing lost
     expect(buf.drain('ziggy').map((m) => m.text)).toEqual(['part 1', 'part 2'])
   })
@@ -711,5 +714,138 @@ describe('planBufferedRedelivery — seeded fuzz over random burst schedules', (
       // Whatever didn't deliver is still buffered (nothing lost).
       expect(buf.depth('fuzz')).toBe(r.rebuffered)
     }
+  })
+})
+
+/**
+ * F1 end-to-end: the delivery-time represent re-check wired into
+ * redeliverBufferedInbound via `beforeRedeliver`. These exercise the WHOLE
+ * drain path (buffer → plan → guard → send) against a real ObligationLedger,
+ * asserting OUTCOMES: a stale represent is dropped and the ledger closed; a
+ * truly-unanswered obligation fires exactly one represent.
+ */
+describe('redeliverBufferedInbound + F1 delivery-time represent re-check', () => {
+  const CHAT = 'c1'
+  const ORIGIN = 'turn-abc'
+  const OPENED_AT = 1_000
+
+  function representInbound(): InboundMessage {
+    return {
+      type: 'inbound',
+      chatId: CHAT,
+      messageId: 5_000,
+      user: 'obligation-ledger',
+      userId: 0,
+      ts: 5_000,
+      text: 'You asked earlier and I want to make sure I did not miss it…',
+      meta: { source: 'obligation_represent', origin_turn_id: ORIGIN },
+    }
+  }
+
+  function openLedger(): ObligationLedger {
+    const l = new ObligationLedger()
+    l.openIfAbsent({
+      originTurnId: ORIGIN,
+      chatId: CHAT,
+      messageId: 42,
+      text: 'original question',
+      openedAt: OPENED_AT,
+    })
+    return l
+  }
+
+  function guardFor(
+    ledger: ObligationLedger,
+    hasOutboundDeliveredSince: (chatId: string, sinceMs: number) => boolean,
+  ) {
+    return makeRepresentRedeliveryGuard({
+      enabled: true,
+      historyEnabled: true,
+      ledger,
+      hasOutboundDeliveredSince: (chatId, sinceMs) => hasOutboundDeliveredSince(chatId, sinceMs),
+      minReplyChars: 1,
+      log: () => {},
+    })
+  }
+
+  it('drops a buffered represent whose reply landed since decision, and closes the ledger', () => {
+    const ledger = openLedger()
+    // A real answer was delivered AT/AFTER the obligation's cutoff (openedAt).
+    const buf = createPendingInboundBuffer({
+      log: () => {},
+      beforeRedeliver: guardFor(ledger, (_chat, sinceMs) => sinceMs <= 2_000),
+    })
+    buf.push('a', representInbound())
+
+    let sends = 0
+    const r = redeliverBufferedInbound(buf, 'a', () => {
+      sends++
+      return true
+    })
+
+    expect(sends).toBe(0) // never handed to the CLI bridge
+    expect(r.drained).toBe(1)
+    expect(r.retracted).toBe(1)
+    expect(r.redelivered).toBe(0)
+    expect(r.rebuffered).toBe(0)
+    expect(ledger.isOpen(ORIGIN)).toBe(false) // F1 closed the stale obligation
+    expect(buf.depth('a')).toBe(0) // dropped, not re-buffered
+  })
+
+  it('delivers exactly one represent for a truly-unanswered obligation (no outbound row)', () => {
+    const ledger = openLedger()
+    // Plain-text-no-reply / genuinely unanswered: no outbound recorded since cutoff.
+    const buf = createPendingInboundBuffer({
+      log: () => {},
+      beforeRedeliver: guardFor(ledger, () => false),
+    })
+    buf.push('a', representInbound())
+
+    let sends = 0
+    const r = redeliverBufferedInbound(buf, 'a', () => {
+      sends++
+      return true
+    })
+
+    expect(sends).toBe(1)
+    expect(r.drained).toBe(1)
+    expect(r.redelivered).toBe(1)
+    expect(r.retracted).toBe(0)
+    expect(r.rebuffered).toBe(0)
+    expect(ledger.isOpen(ORIGIN)).toBe(true) // still open — the represent will be answered
+  })
+})
+
+/**
+ * FAIL-OPEN safety: a `beforeRedeliver` predicate that THROWS must never silence
+ * or lose a real message, nor abort the drain loop. The throw is swallowed, the
+ * message is treated as "deliver", and every following buffered message in the
+ * same drain is still delivered. This test fails if the try/catch around the
+ * predicate is removed (the throw would propagate out of redeliverBufferedInbound).
+ */
+describe('redeliverBufferedInbound — beforeRedeliver fail-open on throw', () => {
+  it('delivers the message and the rest of the drain when the predicate throws', () => {
+    const buf = createPendingInboundBuffer({
+      log: () => {},
+      beforeRedeliver: () => {
+        throw new Error('guard boom')
+      },
+    })
+    buf.push('a', inbound('cron', 1))
+    buf.push('a', inbound('vault_grant_approved', 2))
+
+    const seen: number[] = []
+    // Must not throw — the loop completes past a throwing predicate.
+    const r = redeliverBufferedInbound(buf, 'a', (m) => {
+      seen.push(m.messageId as number)
+      return true
+    })
+
+    expect(seen).toEqual([1, 2]) // both delivered, loop not aborted
+    expect(r.drained).toBe(2)
+    expect(r.redelivered).toBe(2) // failed open → delivered, not dropped
+    expect(r.retracted).toBe(0) // a throw is NOT a retract
+    expect(r.rebuffered).toBe(0)
+    expect(buf.depth('a')).toBe(0) // nothing stranded
   })
 })

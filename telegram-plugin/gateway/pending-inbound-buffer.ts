@@ -49,6 +49,16 @@ export interface PendingInboundBuffer {
   depth: (agent: string) => number
   /** Test-only: total depth across all agents. */
   totalDepth: () => number
+  /**
+   * Delivery-time gate consulted by `redeliverBufferedInbound` for EVERY message
+   * it is about to hand to the bridge. Returns TRUE to proceed, FALSE to RETRACT
+   * (drop) the message (the spool entry is acked so it is not boot-replayed, and
+   * it is NOT re-buffered). The gateway wires this to the represent delivery
+   * re-check (represent-delivery-guard.ts): a represent buffered while its
+   * obligation was open must be re-evaluated at drain time, since a reply may have
+   * landed between the sweep's decision and this drain. Undefined ⇒ never retract.
+   */
+  beforeRedeliver?: (msg: InboundMessage) => boolean
 }
 
 export interface PendingInboundBufferOptions {
@@ -94,6 +104,13 @@ export interface PendingInboundBufferOptions {
    * breaks the push hot path.
    */
   onHandbackEnqueue?: (chatId: string, threadId: number | undefined, ts: number) => void
+  /**
+   * Delivery-time retract gate — see `PendingInboundBuffer.beforeRedeliver`. The
+   * gateway supplies the represent delivery re-check here so EVERY drain path
+   * (idle-drain, bridge re-register, silence-poke fallback, turn-end) inherits it
+   * by construction rather than by per-call-site discipline.
+   */
+  beforeRedeliver?: (msg: InboundMessage) => boolean
 }
 
 /**
@@ -123,16 +140,38 @@ export function redeliverBufferedInbound(
   // silently dropped (clerk 2026-06-03). `send` returning true only means
   // the bytes reached the bridge, NOT that claude consumed them.
   onDelivered?: (merged: InboundMessage, originals: InboundMessage[]) => void,
-): { drained: number; redelivered: number; rebuffered: number } {
+): { drained: number; redelivered: number; rebuffered: number; retracted: number } {
   const pending = buffer.drain(agent)
   let redelivered = 0
   let rebuffered = 0
+  let retracted = 0
   // Collapse consecutive same-sender Telegram user messages into one turn
   // (see planBufferedRedelivery) so a forwarded burst that spanned a turn
   // boundary doesn't fan out into N sequential replies. System inbounds
   // (vault grants, approvals, cron, handbacks — anything with meta.source)
   // are never merged and are delivered individually exactly as before.
   for (const { merged, originals } of planBufferedRedelivery(pending)) {
+    // Delivery-time retract (F1): a buffered `obligation_represent` whose reply
+    // has landed since the sweep decided it is stale — drop it rather than hand
+    // a duplicate to the CLI queue. Ack the spool so it is not boot-replayed and
+    // do NOT re-buffer. The gateway closure closes the ledger + logs the retract.
+    // FAIL-OPEN: a throwing predicate must never silence or lose a real message,
+    // nor abort the drain loop (which would strand every following message and
+    // crash the setInterval tick). On throw we treat it as "deliver".
+    let proceed = true
+    if (buffer.beforeRedeliver != null) {
+      try {
+        proceed = buffer.beforeRedeliver(merged)
+      } catch (e) {
+        proceed = true
+        process.stderr.write(`redeliver beforeRedeliver threw — failing open (deliver): ${String(e)}\n`)
+      }
+    }
+    if (!proceed) {
+      for (const o of originals) spool?.ack(o)
+      retracted += originals.length
+      continue
+    }
     let delivered = false
     try {
       delivered = send(merged)
@@ -157,7 +196,7 @@ export function redeliverBufferedInbound(
       rebuffered += originals.length
     }
   }
-  return { drained: pending.length, redelivered, rebuffered }
+  return { drained: pending.length, redelivered, rebuffered, retracted }
 }
 
 /** True when `msg` is an ordinary Telegram user message eligible to be
@@ -312,7 +351,7 @@ export function idleDrainTick(
   // enrols redelivered inbounds in the deliver-until-acked queue (parity with
   // the bridgeUp drain — clerk lost-message incident, 2026-06-03).
   onDelivered?: (merged: InboundMessage, originals: InboundMessage[]) => void,
-): { drained: number; redelivered: number; rebuffered: number } | null {
+): { drained: number; redelivered: number; rebuffered: number; retracted: number } | null {
   if (!agent) return null
   if (buffer.depth(agent) === 0) return null
   if (!isBridgeAlive()) return null
@@ -412,5 +451,6 @@ export function createPendingInboundBuffer(
       for (const q of queues.values()) n += q.length
       return n
     },
+    beforeRedeliver: opts.beforeRedeliver,
   }
 }
