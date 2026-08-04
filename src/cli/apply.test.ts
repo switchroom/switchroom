@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
@@ -16,6 +16,31 @@ import {
 import * as scaffoldModule from "../agents/scaffold.js";
 import * as profilesModule from "../agents/profiles.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+
+/**
+ * RFC §3 test-directory leak fix: every temp home/agent dir created via
+ * `mkdtemp` used to be left on disk after the test run, so repeated suite
+ * runs bled `switchroom-apply-*` / `switchroom-dryrun-*` dirs onto the
+ * durable agent-home tree. Route every `mkdtemp` in this file through
+ * `makeTmpDir`, which registers the path for teardown; the file-level
+ * `afterEach` below removes them after each test regardless of which
+ * `describe` block created them. (The `mkdtempSync` sites in the
+ * self-elevate block already clean up via their own `try/finally`.)
+ */
+const _tmpDirs: string[] = [];
+async function makeTmpDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  _tmpDirs.push(dir);
+  return dir;
+}
+async function cleanupTmpDirs(): Promise<void> {
+  const dirs = _tmpDirs.splice(0);
+  await Promise.all(
+    dirs.map((d) => rm(d, { recursive: true, force: true })),
+  );
+}
+// File-level teardown: applies to every test in every describe below.
+afterEach(cleanupTmpDirs);
 
 /**
  * Test seam: bypass the `docker compose` v2 preflight check so these
@@ -61,7 +86,7 @@ describe("runApply", () => {
   let _homeSandbox: string | undefined;
   beforeEach(async () => {
     _origHome = process.env.HOME;
-    _homeSandbox = await mkdtemp(join(tmpdir(), "switchroom-apply-home-"));
+    _homeSandbox = await makeTmpDir("switchroom-apply-home-");
     process.env.HOME = _homeSandbox;
   });
   afterEach(() => {
@@ -73,7 +98,7 @@ describe("runApply", () => {
   });
 
   it("writes the compose YAML to the requested path", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-test-"));
+    const dir = await makeTmpDir("switchroom-apply-test-");
     const outPath = join(dir, "nested", "docker-compose.yml");
 
     // Drain stdout/stderr through dummy writers so the test doesn't
@@ -145,7 +170,7 @@ describe("runApply", () => {
     });
 
     it("fails hard by default when chown fails", async () => {
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-fail-"));
+      const dir = await makeTmpDir("switchroom-apply-fail-");
       const sink: string[] = [];
       await expect(
         runApply(
@@ -160,7 +185,7 @@ describe("runApply", () => {
     });
 
     it("warns and continues when --allow-unaligned is passed", async () => {
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-allow-"));
+      const dir = await makeTmpDir("switchroom-apply-allow-");
       const sink: string[] = [];
       const res = await runApply(
         makeStubConfig(join(dir, "agents")),
@@ -263,7 +288,7 @@ describe("runApply", () => {
   });
 
   it("returns the count of agents scaffolded", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-test-"));
+    const dir = await makeTmpDir("switchroom-apply-test-");
     const outPath = join(dir, "docker-compose.yml");
 
     const res = await runApply(
@@ -320,7 +345,7 @@ describe("runApply", () => {
     });
 
     it("scaffolds + aligns only the named agent (siblings untouched)", async () => {
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-only-"));
+      const dir = await makeTmpDir("switchroom-apply-only-");
       const outPath = join(dir, "docker-compose.yml");
 
       await runApply(
@@ -348,7 +373,7 @@ describe("runApply", () => {
       // per-agent socket volumes to be emitted. Otherwise --only=alice
       // would silently strip bob/carol from the compose and break their
       // post-cutover sockets.
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-only-"));
+      const dir = await makeTmpDir("switchroom-apply-only-");
       const outPath = join(dir, "docker-compose.yml");
 
       const res = await runApply(
@@ -367,7 +392,7 @@ describe("runApply", () => {
     });
 
     it("rejects --only=<unknown-name> with an actionable error", async () => {
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-only-"));
+      const dir = await makeTmpDir("switchroom-apply-only-");
       const outPath = join(dir, "docker-compose.yml");
 
       await expect(
@@ -425,7 +450,7 @@ describe("runApply", () => {
         .spyOn(scaffoldModule, "alignAgentUid")
         .mockImplementation(() => ({ chowned: true, paths: [] }));
 
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-fail-"));
+      const dir = await makeTmpDir("switchroom-apply-fail-");
       const sink: string[] = [];
       const res = await runApply(
         multiAgentConfig(join(dir, "agents")),
@@ -466,7 +491,7 @@ describe("runApply", () => {
           throw new Error("should not be called when composeOnly is set");
         });
 
-      const dir = await mkdtemp(join(tmpdir(), "switchroom-apply-co-"));
+      const dir = await makeTmpDir("switchroom-apply-co-");
       const outPath = join(dir, "docker-compose.yml");
       const sink: string[] = [];
 
@@ -595,7 +620,7 @@ describe("runApply", () => {
     });
 
     it("runApply writes ~/.switchroom/install-type.json on every call", async () => {
-      const sandbox = await mkdtemp(join(tmpdir(), "switchroom-apply-itc-"));
+      const sandbox = await makeTmpDir("switchroom-apply-itc-");
       const agentsDir = join(sandbox, "agents");
       const composePath = join(sandbox, "compose.yml");
       // Sandbox HOME so the write lands inside the test dir.
@@ -622,7 +647,7 @@ describe("runApply", () => {
     });
 
     it("runApply with releaseOverride={channel:'dev'} emits compose with :dev image tags", async () => {
-      const sandbox = await mkdtemp(join(tmpdir(), "switchroom-relov-"));
+      const sandbox = await makeTmpDir("switchroom-relov-");
       const agentsDir = join(sandbox, "agents");
       const composePath = join(sandbox, "compose.yml");
       const config = makeStubConfig(agentsDir);
@@ -647,7 +672,7 @@ describe("runApply", () => {
     });
 
     it("runApply with releaseOverride={pin:'sha-abc1234'} emits compose with :sha-abc1234 image tags", async () => {
-      const sandbox = await mkdtemp(join(tmpdir(), "switchroom-relov2-"));
+      const sandbox = await makeTmpDir("switchroom-relov2-");
       const agentsDir = join(sandbox, "agents");
       const composePath = join(sandbox, "compose.yml");
       const config = makeStubConfig(agentsDir);
@@ -696,7 +721,7 @@ describe("apply --dry-run", () => {
   let _homeSandbox: string | undefined;
   beforeEach(async () => {
     _origHome = process.env.HOME;
-    _homeSandbox = await mkdtemp(join(tmpdir(), "switchroom-dryrun-home-"));
+    _homeSandbox = await makeTmpDir("switchroom-dryrun-home-");
     process.env.HOME = _homeSandbox;
   });
   afterEach(() => {
@@ -714,7 +739,7 @@ describe("apply --dry-run", () => {
   });
 
   it("a clean dry-run reports 'would succeed' and writes NOTHING", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "switchroom-dryrun-clean-"));
+    const dir = await makeTmpDir("switchroom-dryrun-clean-");
     const outPath = join(dir, "nested", "docker-compose.yml");
     const sink: string[] = [];
 
@@ -735,7 +760,7 @@ describe("apply --dry-run", () => {
   });
 
   it("computes the would-be compose in memory (imageTag + services)", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "switchroom-dryrun-compose-"));
+    const dir = await makeTmpDir("switchroom-dryrun-compose-");
     const outPath = join(dir, "docker-compose.yml");
     const sink: string[] = [];
 
@@ -753,7 +778,7 @@ describe("apply --dry-run", () => {
   });
 
   it("exits non-zero (wouldSucceed=false) when a profile fails to resolve", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "switchroom-dryrun-badprofile-"));
+    const dir = await makeTmpDir("switchroom-dryrun-badprofile-");
     const outPath = join(dir, "docker-compose.yml");
     const sink: string[] = [];
 
@@ -794,5 +819,28 @@ describe("apply --dry-run", () => {
       "  klanker-state:",
     ].join("\n");
     expect(parseComposeServiceNames(compose)).toEqual(["klanker", "vault-broker"]);
+  });
+});
+
+describe("temp-dir hygiene (RFC §3 leak fix)", () => {
+  // Regression guard for the leaked test-home dirs: `makeTmpDir` must
+  // register every path so `cleanupTmpDirs` (wired to the file-level
+  // `afterEach`) actually removes it. This asserts the OUTCOME — the
+  // registered dirs are gone from disk after cleanup — not merely that
+  // the code path ran. A future refactor that creates a temp dir via a
+  // raw `mkdtemp` (bypassing the registry) would re-leak, but every
+  // in-file site now routes through `makeTmpDir`.
+  it("cleanupTmpDirs removes every dir created via makeTmpDir", async () => {
+    const a = await makeTmpDir("switchroom-apply-hygiene-");
+    const b = await makeTmpDir("switchroom-apply-hygiene-");
+    expect(existsSync(a)).toBe(true);
+    expect(existsSync(b)).toBe(true);
+
+    await cleanupTmpDirs();
+
+    expect(existsSync(a)).toBe(false);
+    expect(existsSync(b)).toBe(false);
+    // Registry drained, so a later cleanup (e.g. the afterEach) is a no-op.
+    expect(_tmpDirs).toHaveLength(0);
   });
 });
