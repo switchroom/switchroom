@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Release pipeline — a skipped `gh release create` can no longer silently strand npm
+
+- **Auto-heal a missing GitHub Release from `CHANGELOG.md` on tag push (#4331):**
+  v0.20.3 and v0.20.4 were tagged, image-built and rolled to the fleet, but no
+  GitHub Release object was ever created for them — the operator skipped
+  `gh release create`. `release.yml`'s `guard` job gated the whole pipeline on
+  a Release existing, so `publish`/`npm`/`finalize` were skipped, npm `latest`
+  silently stayed at `0.20.2`, and users got `ETARGET` on
+  `npm i -g switchroom@0.20.4` until it was recovered by hand. The manual
+  `gh release create` was a load-bearing gate whose omission failed the
+  release quietly (the failure was in `release.yml`, a separate workflow from
+  the `docker-images` build that the fleet rolls off, so nobody noticed).
+  `guard` now AUTO-CREATES the release as a **draft** from the matching
+  `## vX.Y.Z` section of `CHANGELOG.md` (the release commit is CHANGELOG-only,
+  so the notes are already authored) and proceeds — a tag push is sufficient,
+  and the manual step is belt-and-suspenders. Every existing safety property is
+  preserved: the auto-created release is a draft (`finalize` is still the only
+  thing that un-drafts it, so `/releases/latest` keeps serving the previous
+  complete release until every leg is green); the `dry_run` lever, the
+  npm-publish self-gate, the images-gate ordering and the half-ship re-draft
+  guard are untouched. If `CHANGELOG.md` has no section for the tag, the new
+  `scripts/ci/extract-changelog-section.mjs` exits non-zero and `guard` FAILS
+  LOUDLY — an empty release is never invented. Guarded by rule R15 (proved by
+  mutation) in `tests/release-pipeline-gating.test.ts` plus extractor unit +
+  CLI tests in `tests/release-gate-scripts.test.ts`.
+
 ## v0.20.4 — Activity-card fairness, progress-cap hardening, and vault token forwarding
 
 Telegram/gateway delivery-surface reliability (2026-08-04): the card the user

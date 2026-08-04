@@ -251,6 +251,63 @@ export function auditGating(
     problems.push(`R5: the un-draft job (${undraftEntry[0]}) does not \`needs: ${gateEntry[0]}\`.`);
   }
 
+  // R15 — a tag push with NO GitHub Release must AUTO-HEAL, not skip (#4331).
+  // v0.20.3/v0.20.4 were tagged, image-built and rolled, but the operator
+  // skipped `gh release create`; `publish`/`npm`/`finalize` all `needs:` the
+  // guard, so a guard that merely fails on "no release" silently strands the
+  // irreversible npm publish (npm `latest` stuck at 0.20.2, users ETARGET).
+  // The fix: guard auto-creates the release from CHANGELOG.md. This rule pins
+  // the three properties that keep that safe:
+  //   1. the auto-create EXISTS (`gh release create`),
+  //   2. it is always a DRAFT (finalize is still the only publisher — never
+  //      an early `/releases/latest` flip), and
+  //   3. its notes come from the CHANGELOG extractor, never invented — a
+  //      missing section makes the extractor exit non-zero and guard FAIL
+  //      LOUDLY instead of shipping an empty release.
+  // It must also live in the guard job itself (same job as the re-draft),
+  // so it inherits guard's no-`needs:` early slot and the `upload needs
+  // guard` edge R9 already asserts — i.e. it runs before any asset upload.
+  const createEntry = jobDoing(release, "gh release create");
+  if (!createEntry) {
+    problems.push(
+      "R15: release.yml has no job that auto-creates the GitHub Release when none exists — a tag push with the " +
+        "manual `gh release create` skipped would fail the guard and silently skip npm (the v0.20.3/v0.20.4 defect).",
+    );
+  } else {
+    const createStep = stepsOf(createEntry[1]).find((s) => (s.run ?? "").includes("gh release create"))!;
+    // Strip shell comment lines before locating the invocation: the step's
+    // prose (and the skill it cites) mentions `gh release create` too, and a
+    // rule that read a comment would misfire on the real, correct command.
+    const body = (createStep.run ?? "")
+      .split("\n")
+      .filter((l) => !/^\s*#/.test(l))
+      .join("\n");
+    // Scope the `--draft` check to the create INVOCATION itself — a line that
+    // STARTS with `gh release create` (through its backslash line-
+    // continuations), not the same command quoted inside an `echo` error
+    // string or the `gh release edit --draft=true` re-draft in the same step.
+    const createCmd = /^\s*gh release create(?:[^\n]*\\\n)*[^\n]*/m.exec(body)?.[0] ?? "";
+    if (!/(^|\s)--draft(\s|$)/.test(createCmd)) {
+      problems.push(
+        `R15: the auto-create job (${createEntry[0]}) runs \`gh release create\` without \`--draft\` — an auto-created ` +
+          "release would become /releases/latest immediately, breaking every `curl | sh` install until finalize.",
+      );
+    }
+    if (!body.includes("extract-changelog-section.mjs")) {
+      problems.push(
+        `R15: the auto-create job (${createEntry[0]}) does not derive its notes from extract-changelog-section.mjs — ` +
+          "an auto-created release must come from CHANGELOG.md (and FAIL LOUDLY when the section is absent), never be " +
+          "invented with empty/auto notes.",
+      );
+    }
+    if (redraftEntry && createEntry[0] !== redraftEntry[0]) {
+      problems.push(
+        `R15: the auto-create lives in job ${createEntry[0]}, not in the guard job (${redraftEntry[0]}) — it must run ` +
+          "in the guard so it inherits the no-`needs:` early slot and the `upload needs guard` ordering R9 asserts.",
+      );
+    }
+  }
+
   // R6 — nothing on the chain may swallow an upstream failure. `always()`
   // and `cancelled()` override the default all-needs-succeeded semantics;
   // `continue-on-error` turns a red step green.
@@ -750,6 +807,56 @@ describe("release pipeline gating — every rule is proved by mutation", () => {
       delete r.jobs![id];
     });
     expect(p.join("\n")).toMatch(/R9: release\.yml has no job that pulls an incomplete published release back/);
+  });
+
+  // ── R15: the v0.20.3/v0.20.4 regression, reproduced ────────────────────
+  //
+  // Those tags shipped with no GitHub Release because `gh release create` was
+  // skipped, and the pre-#4331 guard FAILED on that instead of healing it —
+  // so `publish`/`npm`/`finalize` were skipped and npm `latest` silently
+  // stayed at 0.20.2. Each mutation removes one property of the auto-heal.
+  const guardCreateStep = (r: Workflow): Step =>
+    stepsOf(jobDoing(r, "gh release create")![1]).find((s) => (s.run ?? "").includes("gh release create"))!;
+
+  it("R15: removing the auto-create so a missing release fails instead of healing is caught", () => {
+    const p = mutate((r) => {
+      const s = guardCreateStep(r);
+      // Neuter only the create invocation; the `--draft=true` re-draft in the
+      // same step stays, so this is the "guard no longer heals" regression and
+      // NOT an R9 re-draft-guard removal.
+      s.run = s.run!.replace(/gh release create/g, "gh release SKIP");
+    });
+    expect(p.join("\n")).toMatch(/R15: release\.yml has no job that auto-creates the GitHub Release/);
+  });
+
+  it("R15: auto-creating WITHOUT --draft (an instant /releases/latest flip) is caught", () => {
+    const p = mutate((r) => {
+      const s = guardCreateStep(r);
+      s.run = s.run!.replace("--draft --target", "--target");
+    });
+    expect(p.join("\n")).toMatch(/R15: the auto-create job .* without `--draft`/);
+  });
+
+  it("R15: inventing notes instead of deriving them from CHANGELOG.md is caught", () => {
+    const p = mutate((r) => {
+      const s = guardCreateStep(r);
+      s.run = s.run!.replace(/extract-changelog-section\.mjs/g, "invent-notes.mjs");
+    });
+    expect(p.join("\n")).toMatch(/R15: the auto-create job .* extract-changelog-section\.mjs/);
+  });
+
+  it("R15: moving the auto-create out of the guard job is caught", () => {
+    const p = mutate((r) => {
+      // Splice the create invocation into `publish` (which runs AFTER guard,
+      // so a missing release would already have failed the guard) — the heal
+      // must live in the guard itself.
+      const guardStep = guardCreateStep(r);
+      const createCmd = /gh release create(?:[^\n]*\\\n)*[^\n]*/.exec(guardStep.run!)![0];
+      guardStep.run = guardStep.run!.replace(/gh release create/g, "gh release SKIP");
+      const [, upload] = jobDoing(r, "gh release upload")!;
+      stepsOf(upload)[0]!.run = `${createCmd}\nnode scripts/ci/extract-changelog-section.mjs --tag x\n${stepsOf(upload)[0]!.run ?? ""}`;
+    });
+    expect(p.join("\n")).toMatch(/R15: the auto-create lives in job .*, not in the guard job/);
   });
 
   it("R8: interpolating a secret into a run body is caught", () => {
