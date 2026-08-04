@@ -103,6 +103,21 @@ export interface BootPinSweepSteps {
   /** Flips the flag authorising the stale-pin drain — for this sweep AND for
    *  later lazy first-inbound sweeps. */
   enableSweep: () => void
+  /**
+   * BOOT-SEED PRUNE (#3953 regression fix). Drops discharged (`done: true`)
+   * cursor rows from the sweep ledger so a `(chat, thread)` that drained in a
+   * PRIOR session is re-evaluated live this boot, instead of short-circuiting
+   * forever on a stale `done`. Kind-agnostic — clears DM, forum-topic and
+   * supergroup rows alike. Forfeited rows (`attempts >= SWEEP_MAX_ATTEMPTS`)
+   * are RETAINED by the underlying `pruneSweepCursors`, so a chat the bot
+   * cannot pin does not re-burn its attempt budget every boot.
+   *
+   * MUST stay BOOT-scoped. The lazy first-inbound sweep fires on EVERY message;
+   * pruning there would re-arm a full re-drain per message = a Telegram flood.
+   * Runs once here, before the `sweepTarget` loop, so the loop re-evaluates the
+   * freshly-reseeded ledger.
+   */
+  seedPruneSweepCursors: () => void
   sweepTarget: (target: SweepTarget) => Promise<unknown>
   log?: (line: string) => void
 }
@@ -160,6 +175,15 @@ export async function runBootPinSweepSteps(deps: BootPinSweepSteps): Promise<voi
   await step('status-pin-cleanup', deps.statusPinCleanup, log)
   await step('activity-card-reaper', deps.activityCardReaper, log)
   await step('queued-card-reaper', deps.queuedCardReaper, log)
+
+  // Boot-seed prune (#3953): reseed the cursor ledger so a chat that drained in
+  // a prior session is re-evaluated live below, rather than short-circuiting on
+  // a stale `done`. Boot-scoped ONLY — never on the per-inbound path. Runs
+  // BEFORE enableSweep so eligibility (which also gates the lazy first-inbound
+  // sweep) is granted only once the ledger is reseeded — no window where an
+  // inbound observes a stale `done`. Isolated: a throw here must not strand the
+  // drain, and enableSweep below still runs regardless.
+  await step('seed-prune-sweep-cursors', async () => deps.seedPruneSweepCursors(), log)
 
   // Unconditional: reached even when every step above threw. See the docblock.
   await step('enable-sweep', async () => deps.enableSweep(), log)

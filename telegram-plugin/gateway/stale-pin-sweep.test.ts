@@ -32,6 +32,8 @@ import {
 import {
   SWEEP_MAX_ATTEMPTS,
   loadSweepCursors,
+  pruneSweepCursors,
+  reseedSweepLedger,
   upsertSweepCursor,
   type SweepCursor,
   type SweepStoreFsSeam,
@@ -905,5 +907,165 @@ describe('stale-pin sweep — classification and seeding', () => {
       true,
     )
     expect(isNothingToUnpinError(new Error('something else'))).toBe(false)
+  })
+})
+
+// ─── #3953: the boot-seed prune reseeds a discharged obligation ───────────────
+//
+// Regression #3953 replaced the per-boot DM self-heal with a cursor-gated stack
+// drain, but the boot "seed pass" that clears discharged cursors was never
+// wired — so `done:true` was effectively PERMANENT and every later boot /
+// first-inbound sweep short-circuited on `already-drained`, orphaning any pin
+// that leaked AFTER the first drain. These tests pin the reseed contract:
+//   1. `pruneSweepCursors` drops `done` rows ONLY and RETAINS forfeited
+//      (attempts-exhausted) rows — a store-level test that FAILS on the pre-fix
+//      filter (which also dropped forfeited rows, re-burning the attempt budget
+//      every boot = flood risk).
+//   2. Running that prune between two fresh-process sweeps re-arms the drain, so
+//      a pin leaked after a prior discharge is reaped — for a DM AND a
+//      supergroup (channel-class) target alike.
+
+/** The boot-seed reseed exactly as the gateway wires it (`gateway.ts`
+ *  `seedPruneSweepCursors` → `reseedSweepLedger`). */
+function bootSeedPrune(fs: SweepStoreFsSeam, path: string): void {
+  reseedSweepLedger(path, fs, () => {})
+}
+
+/** A sweeper over a SHARED durable store — a distinct instance models a fresh
+ *  process (reboot), so the only state carried across is the on-disk ledger. */
+function sweeperOver(
+  fs: SweepStoreFsSeam,
+  path: string,
+  fake: ReturnType<typeof fakeChat>,
+  opts: { recordedPinIds?: number[] } = {},
+) {
+  let clock = 1_000_000
+  const deps: StalePinSweepDeps = {
+    getTopPinnedMessageId: fake.getTopPinnedMessageId,
+    pinSilent: fake.pinSilent,
+    unpin: fake.unpin,
+    unpinAllForumTopicMessages: fake.unpinAllForumTopicMessages,
+    canPinInChat: fake.canPinInChat,
+    protectedMessageIds: () => [],
+    recordedPinIds: () => opts.recordedPinIds ?? [],
+    eligible: () => true,
+    sleep: async (ms) => {
+      clock += ms
+    },
+    now: () => clock,
+    store: { path, fs },
+    log: () => {},
+  }
+  return createStalePinSweeper(deps)
+}
+
+describe('pruneSweepCursors — boot-seed reseed (#3953)', () => {
+  const now = 1_000_000
+
+  it('drops discharged rows but RETAINS forfeited (attempts-exhausted) rows', () => {
+    const discharged: SweepCursor = {
+      chatId: DM,
+      kind: 'dm',
+      popped: 3,
+      done: true,
+      attempts: 1,
+      updatedAt: now,
+    }
+    // A no-rights group that spent its whole attempt budget: `done` is false,
+    // but re-seeding it would re-burn all 8 attempts on the NEXT boot, and every
+    // boot after — the exact Telegram flood the attempt cap exists to stop.
+    const forfeited: SweepCursor = {
+      chatId: GROUP,
+      kind: 'supergroup',
+      popped: 0,
+      done: false,
+      attempts: SWEEP_MAX_ATTEMPTS,
+      lastStatus: 'skipped-no-rights',
+      updatedAt: now,
+    }
+    const stillOwed: SweepCursor = {
+      chatId: '900000002',
+      kind: 'dm',
+      popped: 0,
+      done: false,
+      attempts: 2,
+      updatedAt: now,
+    }
+
+    const keys = pruneSweepCursors([discharged, forfeited, stillOwed]).map((c) => c.chatId)
+
+    expect(keys).not.toContain(DM) // discharged → reseeded (dropped)
+    expect(keys).toContain(GROUP) // forfeited no-rights → RETAINED (no re-burn)
+    expect(keys).toContain('900000002') // still owed → retained untouched
+  })
+
+  it('clears discharged rows for EVERY surface — dm, forum-topic, supergroup', () => {
+    // The prune must be kind-agnostic: a stuck `done` on a topic or a channel is
+    // the same regression as on a DM, so none may be left short-circuiting.
+    const rows: SweepCursor[] = [
+      { chatId: '1', kind: 'dm', popped: 1, done: true, attempts: 1, updatedAt: now },
+      { chatId: '2', kind: 'forum-topic', threadId: 5, popped: 1, done: true, attempts: 1, updatedAt: now },
+      { chatId: '3', kind: 'supergroup', popped: 1, done: true, attempts: 1, updatedAt: now },
+    ]
+    expect(pruneSweepCursors(rows)).toEqual([])
+  })
+})
+
+describe('stale-pin sweep — re-drain after the boot-seed prune (#3953)', () => {
+  it('re-drains a DM whose obligation was discharged in a prior session', async () => {
+    const fs = memFs()
+    const path = '/state/stale-pin-sweep.json'
+
+    // Session 1: an orphan bot pin is drained and the obligation discharged.
+    const s1 = await sweeperOver(fs, path, fakeChat({ stack: [11] })).sweepTarget({ chatId: DM })
+    expect(s1.status).toBe('drained')
+    expect(loadSweepCursors(path, fs).find((c) => c.chatId === DM)?.done).toBe(true)
+
+    // A NEW orphan pin leaks in after that drain.
+    // Fresh process, no prune: the sweep short-circuits on the stale `done` —
+    // the #3953 regression, verbatim. The orphan is left pinned.
+    const stuckChat = fakeChat({ stack: [99] })
+    const stuck = await sweeperOver(fs, path, stuckChat).sweepTarget({ chatId: DM })
+    expect(stuck.status).toBe('already-drained')
+    expect(stuck.popped).toBe(0)
+    expect(stuckChat.stack).toEqual([99])
+
+    // Reboot WITH the boot-seed prune: the discharged row is reseeded, so the
+    // next sweep re-evaluates the chat LIVE and reaps the orphan.
+    bootSeedPrune(fs, path)
+    const rebootChat = fakeChat({ stack: [99] })
+    const redrain = await sweeperOver(fs, path, rebootChat).sweepTarget({ chatId: DM })
+    expect(redrain.status).toBe('drained')
+    expect(redrain.popped).toBe(1)
+    expect(rebootChat.stack).toEqual([])
+  })
+
+  it('re-drains a supergroup (channel-class) discharged in a prior session', async () => {
+    const fs = memFs()
+    const path = '/state/stale-pin-sweep.json'
+
+    // Session 1: the one recorded orphan is reaped, obligation discharged.
+    const s1 = await sweeperOver(fs, path, fakeChat({ stack: [77], canPin: true }), {
+      recordedPinIds: [77],
+    }).sweepTarget({ chatId: GROUP })
+    expect(s1.status).toBe('drained')
+    expect(loadSweepCursors(path, fs).find((c) => c.chatId === GROUP)?.done).toBe(true)
+
+    // A fresh recorded orphan leaks in; a fresh process short-circuits on `done`.
+    const stuckChat = fakeChat({ stack: [88], canPin: true })
+    const stuck = await sweeperOver(fs, path, stuckChat, { recordedPinIds: [88] }).sweepTarget({
+      chatId: GROUP,
+    })
+    expect(stuck.status).toBe('already-drained')
+    expect(stuckChat.stack).toEqual([88])
+
+    // Reboot + prune: the supergroup row is reseeded and re-swept.
+    bootSeedPrune(fs, path)
+    const rebootChat = fakeChat({ stack: [88], canPin: true })
+    const redrain = await sweeperOver(fs, path, rebootChat, { recordedPinIds: [88] }).sweepTarget({
+      chatId: GROUP,
+    })
+    expect(redrain.status).toBe('drained')
+    expect(rebootChat.stack).toEqual([])
   })
 })
