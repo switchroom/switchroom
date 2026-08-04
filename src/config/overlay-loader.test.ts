@@ -16,10 +16,15 @@
  *     (non-enumerable so JSON.stringify ignores them)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { applyAgentOverlays, OVERLAY_SOURCE, OVERLAY_TITLE } from "./overlay-loader.js";
+import {
+  applyAgentOverlays,
+  overlayReadFailures,
+  OVERLAY_SOURCE,
+  OVERLAY_TITLE,
+} from "./overlay-loader.js";
 import type { SwitchroomConfig } from "./schema.js";
 
 /**
@@ -330,6 +335,132 @@ describe("applyAgentOverlays", () => {
     expect(warnings).toEqual([]);
   });
 });
+
+// chmod 0o000 does not stop root from reading — the unreadable-file
+// simulation only works for an unprivileged test uid.
+const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+describe.skipIf(runningAsRoot)(
+  "applyAgentOverlays — unreadable overlay files (EACCES drop incident)",
+  () => {
+    // Regression guards for the clerk incident: a root-euid writer left
+    // schedule.d/cron-*.yaml root-owned 0600; the in-container loader
+    // EACCESed, logged "parse error: EACCES", and SILENTLY excluded the
+    // file's entries — indistinguishable (to callers) from the file having
+    // been deleted, so the scheduler's hot-reload unregistered live crons.
+    // The fix classifies READ failures separately from content failures
+    // and surfaces them via overlayReadFailures().
+
+    let tmpHome: string;
+    let prevHome: string | undefined;
+    let warnSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      tmpHome = mkdtempSync(join(tmpdir(), "overlay-loader-eacces-"));
+      prevHome = process.env.HOME;
+      process.env.HOME = tmpHome;
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      warnSpy.mockRestore();
+      try {
+        rmSync(tmpHome, { recursive: true, force: true });
+      } catch { /* best-effort */ }
+    });
+
+    function scheduleDir(agentName: string): string {
+      const dir = join(tmpHome, ".switchroom", "agents", agentName, "schedule.d");
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+
+    it("classifies an unreadable file as a READ failure (code=EACCES), not a content failure", () => {
+      const dir = scheduleDir("foo");
+      const locked = join(dir, "cron-aaaaaaaaaaaa.yaml");
+      writeFileSync(locked, "schedule:\n  - cron: '0 1 * * *'\n    prompt: hidden\n");
+      chmodSync(locked, 0o000);
+      const cfg = makeConfig({ foo: { schedule: [] } });
+      const { warnings } = applyAgentOverlays(cfg);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].code).toBe("EACCES");
+      expect(warnings[0].reason).toMatch(/read error/);
+      const failures = overlayReadFailures(cfg, "foo");
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ file: locked, code: "EACCES" });
+    });
+
+    it("still loads readable sibling files (per-file isolation preserved)", () => {
+      const dir = scheduleDir("foo");
+      const locked = join(dir, "cron-bbbbbbbbbbbb.yaml");
+      writeFileSync(locked, "schedule:\n  - cron: '0 1 * * *'\n    prompt: hidden\n");
+      chmodSync(locked, 0o000);
+      writeFileSync(join(dir, "good.yaml"), "schedule:\n  - cron: '0 2 * * *'\n    prompt: ok\n");
+      const cfg = makeConfig({
+        foo: { schedule: [{ cron: "0 0 * * *", prompt: "main", secrets: [] }] },
+      });
+      applyAgentOverlays(cfg);
+      const sched = cfg.agents.foo.schedule as Array<{ prompt: string }>;
+      expect(sched.map((e) => e.prompt)).toEqual(["main", "ok"]);
+    });
+
+    it("does NOT report content failures (malformed YAML) as read failures", () => {
+      const dir = scheduleDir("foo");
+      writeFileSync(join(dir, "broken.yaml"), "schedule: [unterminated\n");
+      const cfg = makeConfig({ foo: { schedule: [] } });
+      const { warnings } = applyAgentOverlays(cfg);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].code).toBeUndefined();
+      expect(overlayReadFailures(cfg, "foo")).toEqual([]);
+    });
+
+    it("reports an unreadable skills.d file too", () => {
+      const dir = join(tmpHome, ".switchroom", "agents", "foo", "skills.d");
+      mkdirSync(dir, { recursive: true });
+      const locked = join(dir, "ws.yaml");
+      writeFileSync(locked, "skills:\n  - webapp-testing\n");
+      chmodSync(locked, 0o000);
+      const cfg = makeConfig({ foo: { skills: [] } });
+      const { warnings } = applyAgentOverlays(cfg);
+      expect(warnings.some((w) => w.code === "EACCES" && w.file === locked)).toBe(true);
+      expect(overlayReadFailures(cfg, "foo")).toContainEqual({ file: locked, code: "EACCES" });
+    });
+
+    it("reports an unreadable schedule.d DIRECTORY as a read failure (dir-level variant)", () => {
+      const dir = scheduleDir("foo");
+      writeFileSync(join(dir, "cron-dddddddddddd.yaml"), "schedule: []\n");
+      chmodSync(dir, 0o000);
+      try {
+        const cfg = makeConfig({ foo: { schedule: [] } });
+        const { warnings } = applyAgentOverlays(cfg);
+        expect(warnings.some((w) => w.file === dir && w.code === "EACCES")).toBe(true);
+        expect(overlayReadFailures(cfg, "foo")).toContainEqual({ file: dir, code: "EACCES" });
+      } finally {
+        chmodSync(dir, 0o755); // so afterEach rmSync can clean up
+      }
+    });
+
+    it("returns [] for an agent with no read failures / unknown agent", () => {
+      const cfg = makeConfig({ foo: { schedule: [] } });
+      applyAgentOverlays(cfg);
+      expect(overlayReadFailures(cfg, "foo")).toEqual([]);
+      expect(overlayReadFailures(cfg, "nope")).toEqual([]);
+    });
+
+    it("keeps the read-failure marker non-enumerable (invisible to JSON paths)", () => {
+      const dir = scheduleDir("foo");
+      const locked = join(dir, "cron-cccccccccccc.yaml");
+      writeFileSync(locked, "schedule: []\n");
+      chmodSync(locked, 0o000);
+      const cfg = makeConfig({ foo: { schedule: [] } });
+      applyAgentOverlays(cfg);
+      expect(overlayReadFailures(cfg, "foo")).toHaveLength(1);
+      expect(JSON.stringify(cfg.agents.foo)).not.toMatch(/read-failures|EACCES/i);
+    });
+  },
+);
 
 describe("applyAgentOverlays — skills.d pass (#1163 Phase 2)", () => {
   // Regression guard for the #1209 review finding: pre-fix the

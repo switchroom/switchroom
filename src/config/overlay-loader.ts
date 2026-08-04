@@ -70,6 +70,70 @@ export const OVERLAY_SOURCE = Symbol.for("switchroom.config.overlay-source");
 export const OVERLAY_TITLE = Symbol.for("switchroom.config.overlay-title");
 
 /**
+ * Marker stamped on an agent's config node listing overlay files that
+ * EXIST but could not be READ (EACCES/EPERM/EIO — anything except the
+ * benign ENOENT delete race). A read failure is fundamentally different
+ * from a content failure (malformed YAML, schema rejection): the file's
+ * entries are unknown, not invalid, so consumers must not treat the load
+ * as authoritative "these entries no longer exist".
+ *
+ * The concrete incident (clerk, 2,298 log hits): a root-euid writer left
+ * `schedule.d/cron-*.yaml` owned root:root 0600; the in-container
+ * agent-scheduler (agent uid) EACCESed on every hot-reload tick, the
+ * loader skipped the file with only a console.warn, and the reloader
+ * silently unregistered the cron ("schedule reloaded: 11 → 10") for
+ * weeks — cron fires lost until an apply-time chown sweep healed the
+ * ownership. The scheduler reads this marker (via
+ * {@link overlayReadFailures}) to refuse such a reload instead.
+ *
+ * Symbol-keyed and non-enumerable for the same reason as
+ * {@link OVERLAY_SOURCE}: invisible to JSON-serialisation paths.
+ */
+export const OVERLAY_READ_FAILURES = Symbol.for(
+  "switchroom.config.overlay-read-failures",
+);
+
+/** One unreadable overlay file: absolute path + fs errno code. */
+export interface OverlayReadFailure {
+  file: string;
+  code: string;
+}
+
+/** Record a read failure on the agent's config node (non-enumerable). */
+function recordReadFailure(agentCfg: object, failure: OverlayReadFailure): void {
+  const node = agentCfg as Record<symbol, unknown>;
+  const existing = node[OVERLAY_READ_FAILURES] as OverlayReadFailure[] | undefined;
+  if (Array.isArray(existing)) {
+    existing.push(failure);
+    return;
+  }
+  Object.defineProperty(agentCfg, OVERLAY_READ_FAILURES, {
+    value: [failure],
+    enumerable: false,
+    configurable: true,
+    writable: false,
+  });
+}
+
+/**
+ * Overlay files for `agent` that existed but could not be read during the
+ * last {@link applyAgentOverlays} pass over this config object. Empty when
+ * every overlay file was readable (content errors do NOT count — those
+ * files were read fine and are legitimately excluded).
+ */
+export function overlayReadFailures(
+  config: SwitchroomConfig,
+  agent: string,
+): OverlayReadFailure[] {
+  const agentCfg = config.agents?.[agent];
+  if (!agentCfg) return [];
+  const list = (agentCfg as unknown as Record<symbol, unknown>)[
+    OVERLAY_READ_FAILURES
+  ] as OverlayReadFailure[] | undefined;
+  return Array.isArray(list) ? list : [];
+}
+
+/**
  * Derive a human title for the cron(s) declared in an overlay file.
  *
  *   1. A top-of-file `# name: <title>` comment wins (authoritative even
@@ -99,11 +163,54 @@ export interface OverlayWarning {
   agent: string;
   file: string;
   reason: string;
+  /** fs errno code (e.g. "EACCES") when the file existed but could not be
+   *  READ. Absent for content failures (malformed YAML, schema rejection). */
+  code?: string;
 }
 
 export interface ApplyOverlaysResult {
   config: SwitchroomConfig;
   warnings: OverlayWarning[];
+}
+
+/**
+ * Read one overlay file, classifying READ failures separately from the
+ * content failures the callers' parse/schema catch handles.
+ *
+ *   - success → the raw text.
+ *   - ENOENT → undefined, silently: the file was deleted between the
+ *     directory listing and the read — a removed overlay legitimately
+ *     unregisters its entries.
+ *   - any other errno (EACCES/EPERM/EIO/…) → undefined, after recording
+ *     an {@link OverlayReadFailure} on the agent's config node and a
+ *     warning. The file EXISTS and its entries are unknown — consumers
+ *     (the agent-scheduler's hot-reload) must not treat this load as
+ *     proof the entries are gone.
+ */
+function readOverlayFile(
+  agentName: string,
+  file: string,
+  agentCfg: object,
+  warnings: OverlayWarning[],
+): string | undefined {
+  try {
+    return readFileSync(file, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return undefined;
+    const w: OverlayWarning = {
+      agent: agentName,
+      file,
+      reason: `read error: ${(err as Error).message}`,
+      code: code ?? "EUNKNOWN",
+    };
+    recordReadFailure(agentCfg, { file, code: w.code! });
+    warnings.push(w);
+    console.warn(
+      `[switchroom] overlay-loader: agent='${agentName}' file='${file}': ${w.reason}`,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -117,12 +224,21 @@ function overlayDirFor(agentName: string, subdir: string): string {
   return resolve(base);
 }
 
-function listYamlFiles(dir: string): string[] {
+function listYamlFiles(
+  dir: string,
+  /** Invoked when the directory EXISTS but cannot be listed (EACCES on
+   *  the dir itself — the dir-level variant of the unreadable-file
+   *  incident). ENOENT (deleted between existsSync and readdir) stays
+   *  silent. */
+  onUnreadableDir?: (code: string) => void,
+): string[] {
   if (!existsSync(dir)) return [];
   let entries: string[];
   try {
     entries = readdirSync(dir);
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") onUnreadableDir?.(code ?? "EUNKNOWN");
     return [];
   }
   const out: string[] = [];
@@ -179,7 +295,19 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
   for (const [agentName, agentCfg] of Object.entries(agents)) {
     try {
       const scheduleDir = overlayDirFor(agentName, "schedule.d");
-      const files = listYamlFiles(scheduleDir);
+      const files = listYamlFiles(scheduleDir, (code) => {
+        const w: OverlayWarning = {
+          agent: agentName,
+          file: scheduleDir,
+          reason: `read error: cannot list overlay directory (${code})`,
+          code,
+        };
+        recordReadFailure(agentCfg, { file: scheduleDir, code });
+        warnings.push(w);
+        console.warn(
+          `[switchroom] overlay-loader: agent='${agentName}' file='${scheduleDir}': ${w.reason}`,
+        );
+      });
       // #1209 review fix: don't `continue` past the skills.d pass when
       // an agent has no schedule.d files. Pre-fix the early-return
       // made the skills.d branch dead code for newly-scaffolded agents
@@ -198,8 +326,9 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
       const merged: ScheduleEntry[] = [...(agentCfg.schedule ?? [])];
 
       for (const file of files) {
+        const raw = readOverlayFile(agentName, file, agentCfg, warnings);
+        if (raw === undefined) continue;
         try {
-          const raw = readFileSync(file, "utf-8");
           const parsed = parseYaml(raw);
           const doc = OverlayDocSchema.parse(parsed);
 
@@ -262,7 +391,19 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
     // ── Skills overlay pass (#1163 Phase 2) ─────────────────────────
     try {
       const skillsDir = overlayDirFor(agentName, "skills.d");
-      const skillFiles = listYamlFiles(skillsDir);
+      const skillFiles = listYamlFiles(skillsDir, (code) => {
+        const w: OverlayWarning = {
+          agent: agentName,
+          file: skillsDir,
+          reason: `read error: cannot list overlay directory (${code})`,
+          code,
+        };
+        recordReadFailure(agentCfg, { file: skillsDir, code });
+        warnings.push(w);
+        console.warn(
+          `[switchroom] overlay-loader: agent='${agentName}' file='${skillsDir}': ${w.reason}`,
+        );
+      });
       // No early continue — this is the LAST pass in the for-agent loop,
       // but using `continue` here would still skip any future passes
       // added below. Gate the merge work on file presence instead, same
@@ -275,8 +416,9 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
       const seen = new Set(merged);
 
       for (const file of skillFiles) {
+        const raw = readOverlayFile(agentName, file, agentCfg, warnings);
+        if (raw === undefined) continue;
         try {
-          const raw = readFileSync(file, "utf-8");
           const parsed = parseYaml(raw);
           const doc = OverlayDocSchema.parse(parsed);
           for (const skillName of doc.skills ?? []) {

@@ -29,6 +29,7 @@
  */
 
 import {
+  chownSync,
   closeSync,
   existsSync,
   fsyncSync,
@@ -157,6 +158,47 @@ function withAgentLock<T>(paths: OverlayPaths, fn: () => T): T {
 }
 
 /**
+ * Process/syscall seams, injectable for tests (unit tests run as an
+ * unprivileged UID and cannot chown to a foreign uid; they stub these to
+ * record calls and simulate a root euid). Same pattern as
+ * `ownershipRuntime` in `src/agents/agent-owned-tree.ts`.
+ */
+export const overlayWriterRuntime = {
+  geteuid: (): number | undefined => process.geteuid?.(),
+  chown: (path: string, uid: number, gid: number): void => chownSync(path, uid, gid),
+};
+
+/**
+ * Align a staged overlay file's ownership to its TARGET directory's owner
+ * before the rename publishes it.
+ *
+ * Why (CLAUDE.md "Root-context editing" rule; #3168 class): the overlay
+ * dirs are chowned to the agent's container uid, but the WRITER may run
+ * with a different euid — hostd verbs and sudo'd CLIs run as root, the
+ * operator's host CLI as uid 1000. A tmp+rename atomic write creates a NEW
+ * inode owned by the writer's euid with mode 0600, so the agent (dir
+ * owner) gets EACCES on its own cron overlay, the loader skips the file,
+ * and its crons silently stop firing until an ownership sweep runs — on
+ * the live fleet that window was write→next-`apply`, i.e. weeks (clerk:
+ * 2,298 EACCES loader hits, entries dropped throughout).
+ *
+ * Root writers are fixed here deterministically. An unprivileged foreign
+ * writer (operator uid, no CAP_CHOWN) gets EPERM — swallowed; the
+ * reconcile/apply ownership sweeps remain the backstop for that case.
+ */
+function alignStagedOwnerToDir(stagingPath: string, targetDir: string): void {
+  try {
+    const euid = overlayWriterRuntime.geteuid();
+    if (euid === undefined) return; // e.g. Windows — no uid semantics
+    const dirStat = statSync(targetDir);
+    if (dirStat.uid === euid) return; // same-owner write — already correct
+    overlayWriterRuntime.chown(stagingPath, dirStat.uid, dirStat.gid);
+  } catch {
+    /* best-effort — the reconcile/apply ownership sweeps are the backstop */
+  }
+}
+
+/**
  * Atomically write a YAML document to <slug>.yaml. Returns the absolute
  * path of the final on-disk file.
  */
@@ -178,6 +220,7 @@ export function writeOverlayEntry(
     } finally {
       closeSync(fd);
     }
+    alignStagedOwnerToDir(stagingPath, paths.scheduleDir);
     renameSync(stagingPath, finalPath);
     return finalPath;
   });
@@ -206,6 +249,7 @@ export function writeSkillsOverlayEntry(
     } finally {
       closeSync(fd);
     }
+    alignStagedOwnerToDir(stagingPath, paths.skillsDir);
     renameSync(stagingPath, finalPath);
     return finalPath;
   });

@@ -11,10 +11,14 @@
  * node-cron, no container.
  */
 
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SchedulerEntry } from "../scheduler/dispatch.js";
 import {
   createScheduleReloader,
+  loadAgentEntriesStrict,
   scheduleSignature,
   resolveReloadPollMs,
   isHotReloadEnabled,
@@ -181,6 +185,147 @@ describe("createScheduleReloader", () => {
     expect(registrations).toEqual([e2]); // exactly one re-register
   });
 });
+
+// chmod 0o000 does not stop root from reading — the unreadable-file
+// simulation below only works for an unprivileged test uid.
+const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+describe.skipIf(runningAsRoot)(
+  "hot-reload × unreadable schedule.d overlay — OUTCOME (clerk EACCES incident)",
+  () => {
+    // End-to-end through the REAL loader stack (loadConfig →
+    // applyAgentOverlays → collectScheduleEntries) with a real tmp
+    // filesystem — only node-cron is faked. Pre-fix, the reloader's
+    // loadEntries used the non-strict pipeline: an EACCES'd overlay file
+    // yielded a config silently missing that file's entries, the reload
+    // diff saw "entry removed", and the live cron was UNREGISTERED
+    // ("schedule reloaded: 11 → 10") — every fire lost until the file's
+    // ownership was fixed (weeks, on the live fleet). This test asserts
+    // the outcome: a cron file that turns unreadable NEVER costs the
+    // registration.
+
+    let tmpHome: string;
+    let prevHome: string | undefined;
+    let warnSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      tmpHome = mkdtempSync(join(tmpdir(), "hot-reload-eacces-"));
+      prevHome = process.env.HOME;
+      process.env.HOME = tmpHome;
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+      warnSpy.mockRestore();
+      try {
+        rmSync(tmpHome, { recursive: true, force: true });
+      } catch { /* best-effort */ }
+    });
+
+    const AGENT = "relay";
+
+    function writeFixture(): { configPath: string; overlayPath: string } {
+      const configPath = join(tmpHome, "switchroom.yaml");
+      writeFileSync(
+        configPath,
+        [
+          "switchroom:",
+          "  version: 1",
+          "telegram:",
+          '  bot_token: "x"',
+          '  forum_chat_id: "1"',
+          "agents:",
+          `  ${AGENT}:`,
+          '    bot_token: "vault:relay-bot"',
+          "    forum_chat_id: 1",
+          `    topic_name: "${AGENT}"`,
+          "",
+        ].join("\n"),
+      );
+      const dir = join(tmpHome, ".switchroom", "agents", AGENT, "schedule.d");
+      mkdirSync(dir, { recursive: true });
+      const overlayPath = join(dir, "cron-abcdefabcdef.yaml");
+      writeFileSync(
+        overlayPath,
+        "schedule:\n  - cron: '*/30 * * * *'\n    prompt: overlay-cron\n",
+      );
+      return { configPath, overlayPath };
+    }
+
+    it("a schedule.d file that turns unreadable never unregisters its live cron", () => {
+      const { configPath, overlayPath } = writeFixture();
+
+      // Boot: overlay readable → entry loads and registers.
+      const boot = loadAgentEntriesStrict(configPath, AGENT);
+      expect(boot.map((e) => e.prompt)).toEqual(["overlay-cron"]);
+
+      const registrations: SchedulerEntry[][] = [];
+      const errors: string[] = [];
+      let stops = 0;
+      const register = (es: SchedulerEntry[]): RegisteredTask[] => {
+        registrations.push(es);
+        return es.map((e) => ({ entry: e, task: { stop: () => { stops += 1; } } }));
+      };
+      const initialTasks = register(boot);
+      registrations.length = 0; // boot registration isn't a reload
+
+      // Wired exactly as main() wires it post-fix.
+      const reloader = createScheduleReloader({
+        loadEntries: () => loadAgentEntriesStrict(configPath, AGENT),
+        register,
+        initialTasks,
+        initialEntries: boot,
+        log: () => {},
+        onError: (e) => errors.push(e.message),
+      });
+
+      // The incident: file becomes unreadable (foreign-owner 0600 ≙ chmod 000).
+      chmodSync(overlayPath, 0o000);
+      reloader.tick();
+      reloader.tick();
+
+      // OUTCOME: the live cron is still registered — no stop, no shrink.
+      expect(stops).toBe(0);
+      expect(registrations).toHaveLength(0);
+      expect(reloader.currentTasks().map((t) => t.entry.prompt)).toEqual(["overlay-cron"]);
+      // And the refusal is surfaced, naming the file and errno.
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0]).toContain("EACCES");
+      expect(errors[0]).toContain(overlayPath);
+
+      // Heal the perms: schedule matches the live one → still no churn.
+      chmodSync(overlayPath, 0o600);
+      reloader.tick();
+      expect(stops).toBe(0);
+      expect(reloader.currentTasks().map((t) => t.entry.prompt)).toEqual(["overlay-cron"]);
+    });
+
+    it("a genuinely REMOVED overlay file still unregisters (no false retention)", () => {
+      const { configPath, overlayPath } = writeFixture();
+      const boot = loadAgentEntriesStrict(configPath, AGENT);
+      const registrations: SchedulerEntry[][] = [];
+      const register = (es: SchedulerEntry[]): RegisteredTask[] =>
+        (registrations.push(es), es.map((e) => ({ entry: e, task: { stop: () => {} } })));
+      const initialTasks = register(boot);
+      registrations.length = 0;
+      const reloader = createScheduleReloader({
+        loadEntries: () => loadAgentEntriesStrict(configPath, AGENT),
+        register,
+        initialTasks,
+        initialEntries: boot,
+        log: () => {},
+        onError: () => {},
+      });
+      rmSync(overlayPath);
+      reloader.tick();
+      // The zombie-cron fix stays intact: deletion really unregisters.
+      expect(registrations).toEqual([[]]);
+      expect(reloader.currentTasks()).toEqual([]);
+    });
+  },
+);
 
 describe("resolveReloadPollMs", () => {
   it("defaults to 30s and floors sub-1s overrides", () => {

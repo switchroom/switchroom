@@ -151,6 +151,33 @@ describe("chownScopedTree — call shape (#3333 stage 2)", () => {
     }
   });
 
+  it("recurses into schedule.d/ and skills.d/ so root-written cron overlays are re-owned", () => {
+    // Clerk incident: root-owned 0600 schedule.d/cron-*.yaml → the agent's
+    // scheduler EACCESed on every hot-reload and the crons silently
+    // stopped firing. The FULL sweep always healed these; the scoped sweep
+    // must cover them too or flipping the #3333 flag on reopens the window.
+    const dir = makeTree();
+    try {
+      mkdirSync(join(dir, "schedule.d"), { recursive: true });
+      writeFileSync(join(dir, "schedule.d", "cron-abc123.yaml"), "schedule: []\n");
+      mkdirSync(join(dir, "skills.d"), { recursive: true });
+
+      const recursed: string[] = [];
+      ownershipRuntime.chownShallow = () => {};
+      ownershipRuntime.chownTree = (_u, _g, root) => recursed.push(root);
+
+      const uid = allocateAgentUid(AGENT);
+      chownScopedTree(uid, uid, dir);
+
+      expect(recursed).toContain(join(dir, "schedule.d"));
+      expect(recursed).toContain(join(dir, "skills.d"));
+      // Cache exclusions unchanged.
+      expect(recursed).not.toContain(join(dir, "home"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("skips a scoped subdir that does not exist", () => {
     const dir = mkdtempSync(join(tmpdir(), "switchroom-scoped-"));
     try {
