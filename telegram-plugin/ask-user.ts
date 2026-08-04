@@ -21,6 +21,7 @@
  */
 
 import { randomBytes } from 'crypto'
+import { parseSourceMessageId } from './gateway/source-message-id.js'
 
 /** Default TTL when caller doesn't pass timeout_ms. 5 min. */
 export const ASK_USER_DEFAULT_TIMEOUT_MS = 300_000
@@ -99,13 +100,11 @@ export function validateAskUserArgs(args: AskUserArgs): ValidatedAskUserArgs {
       throw new Error('ask_user: message_thread_id must be a positive integer string')
     }
   }
-  let replyTo: number | undefined
-  if (args.reply_to != null) {
-    replyTo = Number(args.reply_to)
-    if (!Number.isFinite(replyTo) || replyTo <= 0) {
-      throw new Error('ask_user: reply_to must be a positive integer string')
-    }
-  }
+  // #4368 — route the agent-supplied reply anchor through the canonical
+  // guard. A fabricated (synthetic / out-of-int32) message id yields null so
+  // the ask_user prompt sends UNANCHORED rather than 400ing the whole send on
+  // `reply_parameters.message_id` (Telegram hard-rejects an out-of-range id).
+  const replyTo = parseSourceMessageId(args.reply_to) ?? undefined
   // Clamp timeout: floor to 5s, ceiling to 30min, default 5min.
   let timeoutMs = args.timeout_ms ?? ASK_USER_DEFAULT_TIMEOUT_MS
   if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs)) {

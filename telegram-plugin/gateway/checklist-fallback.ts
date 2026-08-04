@@ -33,6 +33,8 @@
  * (same pattern as checklist-message-handler.ts).
  */
 
+import { parseSourceMessageId } from './source-message-id.js'
+
 export interface ChecklistTaskState {
   /** 1-based sequential id assigned at send time (mirrors the native API's
    *  required per-task integer id; doubles as the patch handle in text mode). */
@@ -130,6 +132,11 @@ export function buildNativeChecklistPayload(p: {
   replyToMessageId?: number
   protectContent?: boolean
 }): Record<string, unknown> {
+  // #4368 — defense at the payload boundary: a fabricated / out-of-int32
+  // reply anchor is dropped here so the native checklist sends UNANCHORED
+  // rather than Telegram 400ing on `reply_parameters.message_id`. Independent
+  // of any caller-side guard so this builder can never emit a bad anchor.
+  const replyAnchor = parseSourceMessageId(p.replyToMessageId)
   return {
     business_connection_id: p.businessConnectionId,
     chat_id: p.chatId,
@@ -137,7 +144,7 @@ export function buildNativeChecklistPayload(p: {
       title: p.title,
       tasks: p.tasks.map((t) => ({ id: t.id, text: t.text })),
     },
-    ...(p.replyToMessageId != null ? { reply_parameters: { message_id: p.replyToMessageId } } : {}),
+    ...(replyAnchor != null ? { reply_parameters: { message_id: replyAnchor } } : {}),
     ...(p.protectContent === true ? { protect_content: true } : {}),
   }
 }

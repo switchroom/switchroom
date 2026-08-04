@@ -146,6 +146,27 @@ describe('native payloads — correct Bot API 9.1 shape', () => {
     expect(JSON.stringify(payload)).not.toContain('is_completed')
   })
 
+  // #4368 — a fabricated reply anchor (a synthetic boot-resume/handback/cron
+  // inbound id at `Date.now()` scale) is out of the signed-int32 range Telegram
+  // accepts for `reply_parameters.message_id`. The builder must DROP it so the
+  // native checklist sends UNANCHORED rather than 400ing the whole send. Before
+  // the fix the builder emitted `reply_parameters.message_id` verbatim.
+  it('drops an out-of-int32 replyToMessageId — no reply_parameters (#4368)', () => {
+    const payload = buildNativeChecklistPayload({
+      businessConnectionId: 'bc1',
+      chatId: 42,
+      title: 'T',
+      tasks: buildChecklistTasks([{ text: 'a' }]),
+      replyToMessageId: 1_785_000_000_000,
+    })
+    expect(payload.reply_parameters).toBeUndefined()
+    expect(payload).toEqual({
+      business_connection_id: 'bc1',
+      chat_id: 42,
+      checklist: { title: 'T', tasks: [{ id: 1, text: 'a' }] },
+    })
+  })
+
   it('editMessageChecklist sends the FULL checklist (native edits replace it)', () => {
     const payload = buildNativeEditChecklistPayload({
       businessConnectionId: 'bc1',

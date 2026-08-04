@@ -18,6 +18,8 @@
  * surface uses: trust-by-explicit-listing.
  */
 
+import { parseSourceMessageId } from './gateway/source-message-id.js'
+
 export interface StickerAliasMap {
   /** alias name → Telegram file_id. Both validated on read. */
   [alias: string]: string
@@ -132,13 +134,12 @@ export function resolveStickerSendArgs(
       throw new Error('send_sticker: message_thread_id must be a positive integer string')
     }
   }
-  let replyTo: number | undefined
-  if (raw.reply_to != null) {
-    replyTo = Number(raw.reply_to)
-    if (!Number.isFinite(replyTo) || replyTo <= 0) {
-      throw new Error('send_sticker: reply_to must be a positive integer string')
-    }
-  }
+  // #4368 — route the agent-supplied reply anchor through the canonical
+  // guard. A fabricated (synthetic / out-of-int32) message id — e.g. an agent
+  // echoing a boot-resume/handback inbound's `Date.now()`-scale id — yields
+  // null, so the sticker sends UNANCHORED rather than 400ing the whole send on
+  // `reply_parameters.message_id` (which Telegram hard-rejects out of range).
+  const replyTo = parseSourceMessageId(raw.reply_to) ?? undefined
 
   return {
     chatId: raw.chat_id,
@@ -230,13 +231,10 @@ export function resolveGifSendArgs(raw: GifSendArgs): ValidatedGifSendArgs {
       throw new Error('send_gif: message_thread_id must be a positive integer string')
     }
   }
-  let replyTo: number | undefined
-  if (raw.reply_to != null) {
-    replyTo = Number(raw.reply_to)
-    if (!Number.isFinite(replyTo) || replyTo <= 0) {
-      throw new Error('send_gif: reply_to must be a positive integer string')
-    }
-  }
+  // #4368 — route the agent-supplied reply anchor through the canonical guard
+  // (see resolveStickerSendArgs). A fabricated / out-of-int32 id sends the GIF
+  // UNANCHORED instead of 400ing on `reply_parameters.message_id`.
+  const replyTo = parseSourceMessageId(raw.reply_to) ?? undefined
 
   return {
     chatId: raw.chat_id,
