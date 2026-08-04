@@ -247,6 +247,8 @@ export default defineConfig({
       "**/telegram-plugin/tests/progress-update.test.ts",
       // progress-fallback-cap.test.ts imports bun:test — run via test:bun.
       "**/telegram-plugin/tests/progress-fallback-cap.test.ts",
+      // progress-cap.test.ts imports bun:test — run via test:bun.
+      "**/telegram-plugin/tests/progress-cap.test.ts",
       "**/telegram-plugin/tests/quota-cache.test.ts",
       "**/telegram-plugin/tests/unhandled-rejection-policy.test.ts",
       // The following tests transitively import bun:sqlite (via grants-db.ts

@@ -754,7 +754,7 @@ import { shadowEmit, isMachineInTurn } from './inbound-delivery-machine-shadow.j
 // #2996 P8 PR-B — the extracted turn-end funnel (state stays here; logic moved).
 import { createTurnEndFunnel, type TurnEndReason } from './turn-end.js'
 import { createTurnStartSurfaces } from './turn-start-surfaces.js'
-import { progressFallbackAtCap, recordProgressFallbackSend } from './progress-fallback-cap.js'
+import { sendWithProgressCap } from './progress-fallback-cap.js'
 // #2996 P8 PR-C1 — the extracted delivery-confirm sweep wiring.
 import { createDeliveryConfirmWiring } from './delivery-confirm-wiring.js'
 // #2996 P8 PR-C2 — the extracted obligation wiring.
@@ -12495,24 +12495,12 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   // Attention cap: max 5 DELIVERIES per turn when a turn atom exists, else a
   // rolling 15-min/chat fallback when the inbound minted none (handback /
   // progress-inbound turns) so a worker can't send at the 20s floor forever
-  // and defeat the documented per-turn cap. Both count deliveries only — the
-  // counter/window is advanced AFTER a successful send below, so a thrown send
-  // never burns a slot.
+  // and defeat the documented per-turn cap. Both count deliveries only. The
+  // slot is RESERVED before the send (via sendWithProgressCap below) so two
+  // truly-concurrent same-key calls can't both pass the check and overshoot
+  // the cap, and it is RELEASED if the send throws — so a thrown send never
+  // burns a slot even under concurrency (#4328 Fix 2 preserved).
   const turnStart = activeTurnStartedAt.get(key)
-  const atCap =
-    turnStart != null
-      ? (progressUpdateTurnCount.get(key) ?? 0) >= 5
-      : progressFallbackAtCap(key, now)
-  if (atCap) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({ ok: false, reason: 'turn_limit' }),
-        },
-      ],
-    }
-  }
 
   // Issue #305 Option A — the card-injection path (route a sub-agent's
   // `progress_update` narrative into its row on the parent's pinned card)
@@ -12533,14 +12521,33 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
     ...(threadId != null ? { message_thread_id: threadId } : {}),
   }
 
-  const sent = await robustApiCall(
+  // Reserve the attention-cap slot, send, and release the slot on a throw. A
+  // successful send KEEPS the reservation (it IS the delivery record), so no
+  // extra counting runs after the send. `capped` short-circuits when the
+  // reservation is refused.
+  const capped = await sendWithProgressCap(
+    { key, now, turnStart, turnCount: progressUpdateTurnCount },
     (): Promise<{ message_id: number }> =>
-      literalText
-        // allow-raw-bot-api: literal progress-update send routed through robustApiCall
-        ? lockedBot.api.sendMessage(chat_id, text, sendOpts as never)
-        : lockedBot.api.sendRichMessage(chat_id, richMessage(text), sendOpts as never),
-    { verb: 'sendMessage', chat_id, threadId },
+      robustApiCall(
+        (): Promise<{ message_id: number }> =>
+          literalText
+            // allow-raw-bot-api: literal progress-update send routed through robustApiCall
+            ? lockedBot.api.sendMessage(chat_id, text, sendOpts as never)
+            : lockedBot.api.sendRichMessage(chat_id, richMessage(text), sendOpts as never),
+        { verb: 'sendMessage', chat_id, threadId },
+      ),
   )
+  if (capped.capped) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ ok: false, reason: 'turn_limit' }),
+        },
+      ],
+    }
+  }
+  const sent = capped.result
 
   // Record in sent-message history. RecordOutboundArgs uses `texts`
   // (parallel array to message_ids), not `text` — the singular-name
@@ -12557,14 +12564,9 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
 
   progressUpdateLastSent.set(key, now)
 
-  // Count the delivery AFTER the send lands (never on a throw). Turn-scoped
-  // path ticks the per-turn counter; turn-less path records into the rolling
-  // fallback window.
-  if (turnStart != null) {
-    progressUpdateTurnCount.set(key, (progressUpdateTurnCount.get(key) ?? 0) + 1)
-  } else {
-    recordProgressFallbackSend(key, now)
-  }
+  // The delivery slot was already reserved before the send (sendWithProgressCap
+  // above), so there is nothing to count here — a successful send keeps its
+  // reservation and a thrown send released it.
 
   // Issue #203: progress_update is a user-visible signal — tick the
   // silent-gap tracker so it doesn't count as silent time.
