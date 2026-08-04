@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Claude CLI pinned 2.1.219 → 2.1.221
+
+The base image and the hindsight memory-provider image now pin claude-code
+**2.1.221** (up from 2.1.219), and `dependencies.json` records the same set as
+tested together at delivery time. All three pins move in lockstep (#1978): the
+agent/scheduler containers, the hindsight reflection sidecar, and the manifest
+that `switchroom doctor`/`switchroom versions` compares installed versions
+against.
+
+The motivating upstream fixes across 2.1.220 (bug-fixes-only) and 2.1.221:
+
+- **Bash-tool permission-check bypass closed (security).** A crafted command
+  could execute hidden commands inside a zsh `[[ ]]` regex conditional without
+  going through the permission check; the tool now prompts on them. This is the
+  security-relevant one for a prompt-injectable, always-on agent fleet, where
+  the permission boundary is load-bearing.
+- **Auto-mode permission checks made prompt-cache-efficient.** Lower token spend
+  on the auto-accept path the fleet runs by default.
+- **MCP `--mcp-config` servers now connect before the first turn in `-p` print
+  mode**, so a print-mode invocation no longer races its own MCP servers.
+- **Crash fix for SDK MCP tools named after built-ins** (e.g. a tool named
+  `constructor`), which previously threw on prototype-key collisions.
+
+### Obligation represent re-checked at delivery time (duplicate-answer fix)
+
+An `obligation_represent` decided and queued to the live session at decision
+time could be consumed by the model after a real reply had already landed,
+producing a duplicate answer. The trigger was a silence poke clearing a turn
+that was in fact still working: the represent was authored against the state at
+decision time and then delivered into a session where the answer had since
+arrived. The guard is now re-checked at delivery time and folds a bounded
+session-busy signal into the idle decision, so a represent whose antecedent
+answer has already been delivered is dropped rather than replayed. The
+redeliver predicate fails open — if the busy/idle signal can't be resolved,
+delivery still proceeds — so the fix removes the duplicate without introducing
+a new silent-drop path. (Covers PR #4341, which merged without its own
+changelog entry.)
+
 ## v0.20.6 — Telegram pin cleanup self-heals again: the boot sweep reseeds its discharged cursor
 
 Reliability fix (2026-08-04): pinned-message cleanup that silently stopped
