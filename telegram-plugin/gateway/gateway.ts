@@ -11760,7 +11760,9 @@ const IDLE_DRAIN_INTERVAL_MS = 5000
 // while the CLI is still producing the answer; draining a represent into that busy
 // session re-queues it BEHIND the real reply → a duplicate. Defer while busy,
 // bounded so a wedged session still drains (F1 then retracts it post-reply).
-const idleDrainBusyDefer = makeSessionBusyDrainDeferral(OBLIGATION_BACKGROUND_WORK_GRACE_MS)
+// staleGap = 3 poll intervals: a longer gap between busy consultations means the
+// buffer drained via a non-idle path so the next one is a NEW episode (#4341 f/u).
+const idleDrainBusyDefer = makeSessionBusyDrainDeferral(OBLIGATION_BACKGROUND_WORK_GRACE_MS, IDLE_DRAIN_INTERVAL_MS * 3)
 if (isGatewayMain && !STATIC) {
   setInterval(() => {
     const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''

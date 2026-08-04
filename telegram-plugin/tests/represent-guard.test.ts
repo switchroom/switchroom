@@ -336,6 +336,51 @@ describe("makeSessionBusyDrainDeferral — F2 bounded busy-defer for the idle dr
     expect(off(true, 0)).toBe(false);
     expect(off(true, 10_000)).toBe(false);
   });
+
+  it("starts a FRESH bound for a new deferral episode after a call gap — a buffer emptied by bridge re-register (no busy=false call) must not pin a stale t0 (#4341 follow-up)", () => {
+    const BOUND = 20_000; // small bound so a realistic 5s poll cadence spans it
+    const defer = makeSessionBusyDrainDeferral(BOUND); // default staleGap = 15s
+
+    // Episode A: a represent is buffered while the session is busy. The idle
+    // drain gate polls it every ~5s (< staleGap) and defers each time.
+    expect(defer(true, 0)).toBe(true); // t0 = 0
+    expect(defer(true, 5_000)).toBe(true);
+    expect(defer(true, 10_000)).toBe(true);
+
+    // The buffer is now emptied by a bridge re-register (onClientRegistered)
+    // while the session is STILL busy. That drain path does NOT consult this
+    // predicate, so there is no busy=false call — deferringSince stays at 0 on
+    // the buggy code. Time then advances well past the bound with the buffer
+    // empty (predicate not called).
+
+    // Episode B: a brand-new represent is buffered while the session is busy,
+    // long after t0. This is a NEW mid-answer session — the represent MUST stay
+    // deferred (its own bound has not elapsed), NOT be drained immediately.
+    // Buggy code: now - stalePinnedT0 (2_000_000 - 0) >= BOUND → false → the
+    // represent is drained into the mid-answer session, reopening the duplicate
+    // window. Fixed code: the >15s call gap starts a fresh episode clock at
+    // t=2_000_000, so it defers.
+    const B0 = 2_000_000;
+    expect(defer(true, B0)).toBe(true);
+    // ...and the fresh episode is still bounded from ITS OWN start, polled at the
+    // real ~5s cadence (each gap < staleGap, so no further reset).
+    expect(defer(true, B0 + 5_000)).toBe(true);
+    expect(defer(true, B0 + 10_000)).toBe(true);
+    expect(defer(true, B0 + 15_000)).toBe(true);
+    expect(defer(true, B0 + BOUND)).toBe(false); // fresh bound elapsed → drains
+  });
+
+  it("does NOT reset the clock on the normal poll cadence — a genuinely wedged busy session still drains at the bound (wedge budget preserved)", () => {
+    const BOUND = 20_000;
+    const defer = makeSessionBusyDrainDeferral(BOUND); // default staleGap = 15s
+    // Polls arrive every 5s (< staleGap) throughout one continuous episode, so
+    // the clock is never reset and the bound elapses on schedule.
+    expect(defer(true, 0)).toBe(true);
+    expect(defer(true, 5_000)).toBe(true);
+    expect(defer(true, 10_000)).toBe(true);
+    expect(defer(true, 15_000)).toBe(true);
+    expect(defer(true, 20_000)).toBe(false); // bound reached — drains, not silenced forever
+  });
 });
 
 describe("obligationSweep — F2 decision half: a poke-cleared-but-busy session defers, then re-asks (bounded)", () => {
