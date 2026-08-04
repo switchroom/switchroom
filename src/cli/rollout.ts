@@ -1223,6 +1223,38 @@ export async function executeRollout(
               timedOut: true,
             });
           }
+
+          // The spawned `switchroom agent restart` exited on its own (not a
+          // timeout) but with a NON-ZERO status: reconcile or the restart
+          // itself failed — e.g. the ownership sweep threw before the container
+          // was ever recreated. Do NOT fall through to the version probe: the
+          // container is likely still on the OLD image, and even if the probe
+          // happened to read the target tag a non-zero restart means the
+          // post-reconcile invariant did not hold. Make the exit status a
+          // first-class gate so the halt is causal, not a lucky version
+          // mismatch.
+          if (restartRes.status !== 0) {
+            const gotAfterExit = deps.probeVersion(step.agent);
+            deps.log(
+              `  ✗ ${step.agent} → restart exited ${restartRes.status} ` +
+                `(probe says ${gotAfterExit ?? "<unreachable>"}) — STOPPING`,
+            );
+            emit(
+              isCanary
+                ? { phase: "canary-fail", target, agent: step.agent, n: agentIndex, m: totalAgents }
+                : { phase: "agent-done", target, agent: step.agent, n: agentIndex, m: totalAgents },
+            );
+            // Same failure shape as the version-mismatch fail below (no
+            // `timedOut`): the child ran to completion and exited non-zero, so
+            // there are no live SIGKILL-orphaned grandchildren to warn about —
+            // hostd/get_status recovery matches the "ran, wrong outcome" case.
+            return fail({
+              failedStep: "restart-agent",
+              failedAgent: step.agent,
+              got: gotAfterExit,
+            });
+          }
+
           const got = deps.probeVersion(step.agent);
           if (got === null || normalizeVersion(got) !== targetNorm) {
             deps.log(`  ✗ ${step.agent} → ${got ?? "<unreachable>"} (expected ${target}) — STOPPING`);

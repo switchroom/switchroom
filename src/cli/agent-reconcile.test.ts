@@ -253,4 +253,33 @@ describe("reconcileAndRestartAgent — compose regen before recreate (pin self-h
     expect(deps.writeComposeFile).toHaveBeenCalledTimes(1);
     expect(deps.gracefulRestartAgent).toHaveBeenCalledTimes(1);
   });
+
+  it("a reconcile THROW propagates and NEVER recreates the container", async () => {
+    // The incident seam: the ownership sweep runs at the END of
+    // reconcileAgent; if it throws (e.g. a real, non-ENOENT chown failure)
+    // the throw must abort reconcileAndRestartAgent BEFORE compose regen and
+    // recreate — "never restart on top of a broken reconcile". The existing
+    // tests only cover reconcileAgent RETURNING; this pins the THROW path.
+    const deps = mkDeps({
+      reconcileAgent: vi.fn(() => {
+        throw new Error("ownership sweep failed: could not restore agent ownership");
+      }) as never,
+    });
+
+    await expect(
+      reconcileAndRestartAgent(
+        "foo",
+        mkConfig("foo"),
+        "/state/agents",
+        undefined,
+        { silent: true, force: true },
+        deps,
+      ),
+    ).rejects.toThrow(/ownership sweep/);
+
+    // The container was never touched: no compose regen, no restart.
+    expect(deps.writeComposeFile).not.toHaveBeenCalled();
+    expect(deps.restartAgent).not.toHaveBeenCalled();
+    expect(deps.gracefulRestartAgent).not.toHaveBeenCalled();
+  });
 });
