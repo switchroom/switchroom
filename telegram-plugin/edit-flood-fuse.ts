@@ -204,6 +204,45 @@
  *      on the persisted path exactly the "a nudge and a 4.4h ban are the same
  *      signal" defect that #3856 had just fixed on the in-memory path.
  *
+ * ── 2026-08 (#4300): one shared cosmetic bucket starved the watched card ──
+ * Point 2's `cosmeticPerChatMaxPerWindow` (6/60s) is ONE bucket shared across
+ * every cosmetic surface in a chat — the primary activity card, the worker /
+ * sub-agent card, and answer-stream draft edits. With two live cards plus a
+ * draft contending, the surface a user actually watches — the primary activity
+ * card — worst-cased well past 60s between permitted frames, purely from
+ * intra-cosmetic contention (not event starvation: the 6s heartbeat is trying
+ * to repaint). AIMD tightening halves the bucket and makes it worse. Two
+ * changes, both confined to this file, restore fairness WITHOUT raising the
+ * wire rate (so 429 risk is unchanged) and WITHOUT touching the reply reserve:
+ *
+ *   9.  **Per-`message_id` fair-share of the cosmetic pool.** The shared bucket
+ *       is split into a FLOOR lane — each distinct cosmetic `message_id` gets a
+ *       guaranteed `cosmeticFloorPerWindow` edits/window (default 1/30s), up to
+ *       `cosmeticFloorSlots` ids at once — and a REMAINDER lane (the rest of the
+ *       pool), still shared and AIMD-reduced. The two caps SUM to
+ *       `cosmeticPerChatMaxPerWindow`, so nothing new reaches the wire; a lone
+ *       card still bursts to `cosmeticPerMessageMaxPerWindow` (its floor + the
+ *       whole remainder). No surface can starve another, and no primary-vs-not
+ *       discriminator is needed — the floor is symmetric per message id. Stale
+ *       ids self-evict through the existing window LRU. See
+ *       {@link createEditFloodFuse}'s `awaitCosmeticChatFair`.
+ *   10. **An AIMD tighten floor on the watched card.** The per-message cosmetic
+ *       ceiling and the floor lane are both held at `cosmeticFloorPerWindow`
+ *       (1/30s) no matter how many 429s tighten the pool — the same "floor the
+ *       thing users watch" pattern as `perChatCriticalMinPerWindow`, so a flood
+ *       backoff slows a card without freezing it. The aggregate cosmetic floor
+ *       under maximum tightening is `cosmeticFloorPerWindow * cosmeticFloorSlots`
+ *       (4/60s by default), which sits at the BOTTOM of the 4-6/min band the
+ *       2026-07-27 chat provably survived for hours — a deliberate, bounded
+ *       relaxation of "cosmetic sheds to zero", reversible via the kill-switch
+ *       `SWITCHROOM_FEED_FAIR_SHARE=0` (flag OFF is byte-identical to the old
+ *       single shared bucket). The reply-starvation guarantee is UNTOUCHED: a
+ *       floored cosmetic edit still charges `perChatTotalMaxPerWindow` and still
+ *       yields to a real reply at that tier — the floor governs cosmetic-vs-
+ *       cosmetic only. When the fuse defers a cosmetic edit past
+ *       `throttleNoticeMs` (45s) it raises a `'throttled'` `onTrip` signal so the
+ *       lag is observable rather than a silent freeze.
+ *
  * Every ceiling is operator-overridable via env — see
  * {@link editFloodFuseConfigFromEnv}. Previously none of them were, and until
  * #3885 the tightening CURVE (`maxTightenLevel`, `tightenFactor`) still was
@@ -333,6 +372,55 @@ export interface EditFloodFuseConfig {
    */
   cosmeticPerChatMaxPerWindow?: number
   /**
+   * PER-`message_id` FAIRNESS inside the shared cosmetic per-chat pool. Default
+   * true. When true, `cosmeticPerChatMaxPerWindow` is not a single contended
+   * bucket every cosmetic surface races for — instead each distinct cosmetic
+   * `message_id` is guaranteed a small floor of the pool (see
+   * `cosmeticFloorPerWindow` / `cosmeticFloorSlots`) that the OTHER cosmetic
+   * surfaces cannot consume, and only the REMAINDER stays shared/contended as
+   * before. This is the anti-starvation fix (#4300): with two live cosmetic
+   * cards (the primary activity card + a worker/sub-agent card) plus answer
+   * draft edits all charging one 6/60s bucket, the primary card worst-cased
+   * well past 60s between permitted frames purely from intra-cosmetic
+   * contention. Flag OFF is byte-identical to the pre-fix single shared bucket.
+   *
+   * SAFETY: the floor is carved FROM `cosmeticPerChatMaxPerWindow`, never added
+   * on top, so the wire rate is unchanged (429 risk does not rise) and the 40%
+   * per-chat reply reserve (`perChatReplyReserve`, on `perChatTotalMaxPerWindow`)
+   * is untouched — a floored cosmetic edit STILL yields to a real reply at the
+   * shared total tier. This governs cosmetic-vs-cosmetic only.
+   */
+  cosmeticFairShareEnabled?: boolean
+  /**
+   * The per-`message_id` guaranteed floor, in edits per `perChatWindowMs`,
+   * carved from `cosmeticPerChatMaxPerWindow`. Default 2 = 1 edit / 30s. This is
+   * ALSO the AIMD tighten floor: a floored cosmetic message never drops below
+   * this rate no matter how many 429s tighten the pool (mirrors
+   * `perChatCriticalMinPerWindow` — "floor the thing users watch"), so a flood
+   * backoff can slow a watched card but not freeze it. Set 0 to disable the
+   * floor while leaving fair-share keying on.
+   */
+  cosmeticFloorPerWindow?: number
+  /**
+   * How many DISTINCT cosmetic `message_id`s may each hold a guaranteed floor
+   * concurrently. Default 2 — the two sustained mid-turn cards (primary
+   * activity + worker feed). `cosmeticFloorPerWindow * cosmeticFloorSlots` is
+   * the slice reserved from the pool; the rest is the shared remainder, so this
+   * is clamped so the reserve can never exceed the pool. Additional concurrent
+   * cosmetic surfaces (e.g. an answer draft) contend the remainder exactly as
+   * today. Stale ids self-evict via the existing window LRU, so the tracked set
+   * cannot grow unbounded.
+   */
+  cosmeticFloorSlots?: number
+  /**
+   * How long a COSMETIC edit may sit deferred before the fuse emits a
+   * `'throttled'` `onTrip` signal, so the lag is observable (and a card can
+   * render a "updates throttled (flood backoff)" line) rather than freezing
+   * silently. Default 45000ms. The render itself is a gateway concern; the fuse
+   * only raises the signal.
+   */
+  throttleNoticeMs?: number
+  /**
    * Shared per-chat allowance counting EVERY admitted call — edits and sends,
    * every class. Default 20 per 60s, matching Telegram's own per-chat/group
    * metering (which does not separate the two). Sends and non-cosmetic edits
@@ -431,7 +519,7 @@ export interface EditFloodFuseConfig {
   onTrip?: (info: {
     method: string
     key: string
-    action: 'deferred' | 'dropped' | 'superseded'
+    action: 'deferred' | 'dropped' | 'superseded' | 'throttled'
     cls: OutboundClass
   }) => void
 }
@@ -444,6 +532,14 @@ export interface EditFloodFuseStats {
   dropped: number
   /** Edits dropped because a NEWER edit to the same message arrived. */
   superseded: number
+  /**
+   * COSMETIC edits that crossed `throttleNoticeMs` while deferred — the direct
+   * measure of a card the flood backoff is visibly slowing. Non-zero here is
+   * the signal a "throttled" indicator should render for.
+   */
+  throttled: number
+  /** Whether per-`message_id` cosmetic fair-share is in force (the #4300 fix). */
+  cosmeticFairShareEnabled: boolean
   /** 429s observed (each one tightens the ceilings). */
   floodObserved: number
   /** Whether a tightened ceiling is in force right now. */
@@ -504,6 +600,23 @@ export const EDIT_FLOOD_FUSE_DEFAULTS = {
    * sits at the top of the survived band and less than half the banned rate.
    */
   cosmeticPerChatMaxPerWindow: 6,
+  /**
+   * 2/60s = 1 edit / 30s per distinct cosmetic message_id, guaranteed and
+   * AIMD-immune. Sized so a LONE card still bursts to the full
+   * `cosmeticPerMessageMaxPerWindow` (4): its 2 floor slots + the 2-slot
+   * remainder (6 - 2*2) = 4. Two live cards each keep 1/30s and share the
+   * remaining 2; a third cosmetic surface contends the remainder as before.
+   * The aggregate cosmetic floor under maximum tightening is therefore
+   * `cosmeticFloorPerWindow * cosmeticFloorSlots` = 4/60s, which sits at the
+   * bottom of the 4-6/min band the incident chat provably survived for hours
+   * (see this file's 2026-07-27 note) — enough to keep a watched card from
+   * freezing, low enough not to re-earn a ban. Disable via the kill-switch to
+   * restore shed-cosmetic-to-zero under pressure.
+   */
+  cosmeticFloorPerWindow: 2,
+  cosmeticFloorSlots: 2,
+  /** A cosmetic edit deferred longer than this raises a `'throttled'` signal. */
+  throttleNoticeMs: 45_000,
   /**
    * 20/60s. Telegram's documented per-group ceiling, and it meters sends and
    * edits together — so this is the only window that reflects the real budget.
@@ -579,6 +692,13 @@ export function editFloodFuseConfigFromEnv(
   }
   assign('cosmeticPerMessageMaxPerWindow', envInt(env.SWITCHROOM_FEED_EDIT_MAX_PER_MSG_PER_MIN))
   assign('cosmeticPerChatMaxPerWindow', envInt(env.SWITCHROOM_FEED_EDIT_MAX_PER_CHAT_PER_MIN))
+  // #4300 — per-message_id cosmetic fair-share. Kill-switch OFF restores the
+  // pre-fix single shared cosmetic bucket byte-for-byte; the floor/slots/notice
+  // knobs let an operator retune the reserved slice without a redeploy.
+  if (env.SWITCHROOM_FEED_FAIR_SHARE === '0') cfg.cosmeticFairShareEnabled = false
+  assign('cosmeticFloorPerWindow', envInt(env.SWITCHROOM_FEED_EDIT_FLOOR_PER_MSG_PER_MIN))
+  assign('cosmeticFloorSlots', envInt(env.SWITCHROOM_FEED_EDIT_FLOOR_SLOTS))
+  assign('throttleNoticeMs', envInt(env.SWITCHROOM_FEED_THROTTLE_NOTICE_MS))
   assign('perChatTotalMaxPerWindow', envInt(env.SWITCHROOM_CHAT_TOTAL_MAX_PER_MIN))
   assign('perChatReplyReserve', envInt(env.SWITCHROOM_CHAT_REPLY_RESERVE))
   assign('perChatCriticalMinPerWindow', envInt(env.SWITCHROOM_CHAT_CRITICAL_MIN_PER_MIN))
@@ -665,6 +785,23 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     perMessageMax, config.cosmeticPerMessageMaxPerWindow ?? D.cosmeticPerMessageMaxPerWindow)
   const cosmeticPerChatMax = Math.min(
     perChatEditMax, config.cosmeticPerChatMaxPerWindow ?? D.cosmeticPerChatMaxPerWindow)
+  // #4300 — per-message_id fair-share of the cosmetic per-chat pool.
+  const cosmeticFairShareEnabled = config.cosmeticFairShareEnabled ?? true
+  // The per-message guaranteed floor, capped by the per-message cosmetic
+  // ceiling (a floor above the message's own max would be incoherent).
+  const cosmeticFloorPerWindow = Math.min(
+    cosmeticPerMessageMax,
+    Math.max(0, config.cosmeticFloorPerWindow ?? D.cosmeticFloorPerWindow))
+  // The reserved slice = floor * slots, clamped so it can never exceed the pool
+  // (a reserve larger than the pool would leave a negative remainder). This is
+  // the aggregate cap that bounds how many distinct ids hold a floor at once.
+  const cosmeticFloorAggMax = Math.min(
+    cosmeticPerChatMax,
+    cosmeticFloorPerWindow * Math.max(0, config.cosmeticFloorSlots ?? D.cosmeticFloorSlots))
+  // What is left of the pool after the reserve — the still-shared, still-AIMD
+  // remainder. Cosmetic edits beyond a message's floor contend here as before.
+  const cosmeticRemainderMax = Math.max(0, cosmeticPerChatMax - cosmeticFloorAggMax)
+  const throttleNoticeMs = Math.max(0, config.throttleNoticeMs ?? D.throttleNoticeMs)
   const perChatTotalMax = config.perChatTotalMaxPerWindow ?? D.perChatTotalMaxPerWindow
   const perChatWindowMs = config.perChatWindowMs ?? D.perChatWindowMs
   // Clamped so a misconfigured reserve can never eat more than the whole
@@ -704,6 +841,8 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     meteredByDefault: 0,
     /** Calls with no `chat_id`, charged to the token window only. */
     chatless: 0,
+    /** Cosmetic edits that crossed `throttleNoticeMs` while deferred (#4300). */
+    throttled: 0,
   }
   /**
    * Compounding 429 backoff. `tightenLevel` is the number of multiplicative
@@ -805,6 +944,25 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
     const eff = ceiling(base, now)
     if (cls !== 'critical') return eff
     return Math.max(eff, Math.min(base, perChatCriticalMin))
+  }
+
+  /**
+   * The PER-MESSAGE cosmetic ceiling, with the #4300 AIMD tighten floor. Same
+   * shape as the `critical` floor in `classCeiling`: no amount of 429 tightening
+   * may drop a cosmetic card below `cosmeticFloorPerWindow` (default 1 edit/30s)
+   * on its own message tier, so the flood backoff slows a watched card without
+   * freezing it. Capped by `base` so it only ever raises a tightened ceiling
+   * back towards the configured max, never above it. Flag OFF ⇒ plain `ceiling`,
+   * i.e. byte-identical to the pre-fix behaviour.
+   *
+   * This floors ONLY cosmetic-vs-AIMD; the reply-starvation guarantee is on a
+   * different tier (`cosmeticTotalMax` / `perChatTotalMax`) and is untouched, so
+   * a floored cosmetic edit still yields to a real reply.
+   */
+  function cosmeticMessageCeiling(now: number): number {
+    const eff = ceiling(cosmeticPerMessageMax, now)
+    if (!cosmeticFairShareEnabled) return eff
+    return Math.max(eff, Math.min(cosmeticPerMessageMax, cosmeticFloorPerWindow))
   }
 
   /**
@@ -972,6 +1130,144 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   }
 
   /**
+   * A per-wait tracker that raises the `'throttled'` signal once (#4300) when a
+   * COSMETIC call has been continuously deferred longer than `throttleNoticeMs`.
+   * The first `tick(now)` records the defer start; each subsequent `tick` fires
+   * the signal exactly once on crossing the threshold. `sleepCap(now)` returns
+   * the ms until that threshold so the wait loop can clamp its sleep and wake to
+   * fire the notice — WITHOUT this, a single wait that runs straight to the defer
+   * deadline (`sleep(deadline - now)`) would skip past the threshold and never
+   * signal. Once fired, `sleepCap` returns Infinity (no more clamping). Both are
+   * no-ops for non-cosmetic calls and a zero/disabled threshold. Rendering the
+   * visible indicator is a gateway concern reading `onTrip`/`stats().throttled`;
+   * the fuse only signals.
+   */
+  function makeThrottleNotice(
+    method: string, key: string, cls: OutboundClass,
+  ): { tick: (now: number) => void; sleepCap: (now: number) => number } {
+    // The 'throttled' marker is part of the #4300 fair-share feature, so the
+    // kill-switch also disables it — leaving flag-OFF byte-identical to the
+    // pre-fix behaviour (no new signal, no extra threshold wakeup).
+    if (!cosmeticFairShareEnabled || cls !== 'cosmetic' || throttleNoticeMs <= 0) {
+      return { tick: () => {}, sleepCap: () => Number.POSITIVE_INFINITY }
+    }
+    let firstAt = Number.NaN
+    let fired = false
+    return {
+      tick: (now: number): void => {
+        if (Number.isNaN(firstAt)) firstAt = now
+        if (fired || now - firstAt < throttleNoticeMs) return
+        fired = true
+        counters.throttled++
+        onTrip?.({ method, key, action: 'throttled', cls })
+      },
+      sleepCap: (now: number): number => {
+        if (fired || Number.isNaN(firstAt)) return Number.POSITIVE_INFINITY
+        return Math.max(1, firstAt + throttleNoticeMs - now)
+      },
+    }
+  }
+
+  /**
+   * Fair admission to the per-chat COSMETIC pool, keyed per `message_id` (#4300).
+   *
+   * The single shared `ce:${chat}` bucket every cosmetic surface raced for is
+   * replaced (when `cosmeticFairShareEnabled`) by two lanes drawn from the SAME
+   * `cosmeticPerChatMax` budget — so the wire rate, the 429 risk, and the reply
+   * reserve are all unchanged:
+   *
+   *   - a FLOOR lane: each distinct cosmetic `message_id` is guaranteed up to
+   *     `cosmeticFloorPerWindow` edits/window (`cmf:${chat}:${msg}`), bounded in
+   *     aggregate to `cosmeticFloorAggMax` = floor*slots (`cfa:${chat}`) so only
+   *     that many distinct ids hold a floor at once. This lane is AIMD-IMMUNE —
+   *     it is the anti-starvation + anti-freeze guarantee, and 429 tightening
+   *     cannot take a watched card below it.
+   *   - a REMAINDER lane (`cer:${chat}`, cap `cosmeticRemainderMax`, AIMD-reduced)
+   *     — the still-shared, still-contended part. A lone card uses its floor AND
+   *     the whole remainder, so it still bursts to `cosmeticPerMessageMax`.
+   *
+   * The two caps sum to `cosmeticPerChatMax`, so a floor edit and a remainder
+   * edit can never both be admitted beyond the pool. Stale message windows
+   * self-evict via the existing `evict` LRU, so the distinct-id set is bounded.
+   *
+   * Returns the reserved [key, ts] pairs (to hand to the caller's give-back on a
+   * later-tier denial), or null when the edit is dropped. Same drop/late-release
+   * semantics as the `'drop'` mode of {@link awaitRoom}: an over-budget frame is
+   * dropped unless it is the LONE frame for its message, in which case it is
+   * released late against the bounded overshoot budget.
+   */
+  async function awaitCosmeticChatFair(
+    chat: string, msg: string, method: string, cls: OutboundClass,
+    dropGuard: () => boolean, deadline: number, lateReleaseKey: string,
+  ): Promise<Array<[string, number]> | null> {
+    const fMsgKey = `cmf:${chat}:${msg}`
+    const fAggKey = `cfa:${chat}`
+    const remKey = `cer:${chat}`
+    const fw = win(fMsgKey)
+    const aw = win(fAggKey)
+    const rw = win(remKey)
+    let counted = false
+    const throttle = makeThrottleNotice(method, remKey, cls)
+    for (;;) {
+      const now = clock.now()
+      // Floor lane is free only when BOTH the per-message and the aggregate
+      // floor windows have room; those caps are constants (AIMD-immune).
+      const wFloor = Math.max(
+        waitFor(fw, now, perChatWindowMs, cosmeticFloorPerWindow),
+        waitFor(aw, now, perChatWindowMs, cosmeticFloorAggMax),
+      )
+      const remCap = cosmeticRemainderMax <= 0 ? 0 : ceiling(cosmeticRemainderMax, now)
+      const wRem = waitFor(rw, now, perChatWindowMs, remCap)
+      if (wFloor === 0) {
+        fw.ts.push(now); aw.ts.push(now)
+        return [[fMsgKey, now], [fAggKey, now]]
+      }
+      if (remCap > 0 && wRem === 0) {
+        rw.ts.push(now)
+        return [[remKey, now]]
+      }
+      if (now >= deadline) {
+        // Over budget at the deadline: drop, unless this is the LONE frame for
+        // its message (nothing newer will repaint it), which is released late
+        // against the shared overshoot budget — identical to `awaitRoom`'s
+        // per-chat drop mode, so a card's terminal frame never freezes it.
+        if (dropGuard()) {
+          counters.dropped++
+          onTrip?.({ method, key: remKey, action: 'dropped', cls })
+          return null
+        }
+        const lw = win(lateReleaseKey)
+        prune(lw, now, perChatWindowMs)
+        if (lw.ts.length >= ceiling(lateReleaseMax, now)) {
+          counters.dropped++
+          onTrip?.({ method, key: remKey, action: 'dropped', cls })
+          return null
+        }
+        lw.ts.push(now)
+        // Release into the remainder lane when it exists, else the floor lane —
+        // either way the slot is recorded so the window reflects the wire.
+        if (cosmeticRemainderMax > 0) {
+          rw.ts.push(now)
+          return [[remKey, now]]
+        }
+        fw.ts.push(now); aw.ts.push(now)
+        return [[fMsgKey, now], [fAggKey, now]]
+      }
+      if (!counted) {
+        counters.deferred++
+        counted = true
+        onTrip?.({ method, key: remKey, action: 'deferred', cls })
+      }
+      throttle.tick(now)
+      // Both lanes are per-chat keys (a "newer" frame is usually a DIFFERENT
+      // message), so this tier never supersedes — it waits for the sooner of the
+      // two lanes to open, bounded by the shared deadline and clamped so the
+      // loop wakes to raise the 'throttled' notice at its threshold.
+      await clock.sleep(Math.min(Math.min(wFloor, wRem), deadline - now, throttle.sleepCap(now)))
+    }
+  }
+
+  /**
    * Wait for room on `key` and RESERVE the slot on success. Reserving inside
    * the same synchronous step as the check is what makes the ceiling hold
    * under concurrency: N producers that all pass a check-then-act test in the
@@ -1027,6 +1323,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
   ): Promise<number | null> {
     const w = win(key)
     let counted = false
+    const throttle = makeThrottleNotice(method, key, cls)
     for (;;) {
       const now = clock.now()
       const wait = waitFor(w, now, windowMs, maxFor(now))
@@ -1067,6 +1364,10 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         counted = true
         onTrip?.({ method, key, action: 'deferred', cls })
       }
+      throttle.tick(now)
+      // Clamp the sleep so a single long wait wakes to raise the 'throttled'
+      // notice at its threshold rather than sleeping straight to the deadline.
+      const nap = Math.min(wait, deadline - now, throttle.sleepCap(now))
       // Last-write-wins: a newer edit to the same message kills this one. Only
       // valid on the per-MESSAGE tier — on a per-chat key the "newer" edit is
       // usually to a DIFFERENT message, and killing an unrelated card's edit is
@@ -1077,7 +1378,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         const superseded = new Promise<void>((resolve) => {
           w.waiter = { kill: () => { killed = true; resolve() } }
         })
-        await Promise.race([clock.sleep(Math.min(wait, deadline - now)), superseded])
+        await Promise.race([clock.sleep(nap), superseded])
         if (killed) {
           counters.superseded++
           onTrip?.({ method, key, action: 'superseded', cls })
@@ -1085,7 +1386,7 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         }
         w.waiter = null
       } else {
-        await clock.sleep(Math.min(wait, deadline - now))
+        await clock.sleep(nap)
       }
     }
   }
@@ -1178,7 +1479,9 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         const msgSlot = await awaitRoom(
           msgKey, perMessageWindowMs,
           cls === 'cosmetic'
-            ? (t) => ceiling(cosmeticPerMessageMax, t)
+            // #4300: cosmetic per-message tier carries the AIMD tighten floor
+            // (1 edit/30s) so a 429 cannot freeze a watched card at this tier.
+            ? (t) => cosmeticMessageCeiling(t)
             : (t) => classCeiling(perMessageMax, cls, t),
           method, 'supersede', cls, dropGuard, deadline, lateKey,
         )
@@ -1186,16 +1489,29 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
         const reserved: Array<[string, number]> = [[msgKey, msgSlot]]
         const giveBack = (): void => { for (const [k, at] of reserved) unreserve(k, at) }
 
-        const chatKey = `ce:${chat}`
-        const chatSlot = await awaitRoom(
-          chatKey, perChatWindowMs,
-          cls === 'cosmetic'
-            ? (t) => ceiling(cosmeticPerChatMax, t)
-            : (t) => classCeiling(perChatEditMax, cls, t),
-          method, 'drop', cls, dropGuard, deadline, lateKey,
-        )
-        if (chatSlot === null) { giveBack(); return DROPPED_RESULT as unknown as R }
-        reserved.push([chatKey, chatSlot])
+        // Per-chat COSMETIC pool. #4300: when fair-share is on, admit through the
+        // per-`message_id` floor/remainder lanes so one cosmetic surface cannot
+        // starve another; the two lanes sum to `cosmeticPerChatMax`, so the wire
+        // rate is unchanged. Flag OFF (or a non-cosmetic edit) keeps the single
+        // shared `ce:${chat}` bucket byte-for-byte.
+        if (cls === 'cosmetic' && cosmeticFairShareEnabled) {
+          const fairSlots = await awaitCosmeticChatFair(
+            chat, msg, method, cls, dropGuard, deadline, lateKey!,
+          )
+          if (fairSlots === null) { giveBack(); return DROPPED_RESULT as unknown as R }
+          reserved.push(...fairSlots)
+        } else {
+          const chatKey = `ce:${chat}`
+          const chatSlot = await awaitRoom(
+            chatKey, perChatWindowMs,
+            cls === 'cosmetic'
+              ? (t) => ceiling(cosmeticPerChatMax, t)
+              : (t) => classCeiling(perChatEditMax, cls, t),
+            method, 'drop', cls, dropGuard, deadline, lateKey,
+          )
+          if (chatSlot === null) { giveBack(); return DROPPED_RESULT as unknown as R }
+          reserved.push([chatKey, chatSlot])
+        }
 
         // Shared per-chat budget — the one that mirrors Telegram's real
         // metering. A non-cosmetic edit is RELEASED late rather than dropped:
@@ -1271,6 +1587,8 @@ export function createEditFloodFuse(config: EditFloodFuseConfig = {}) {
       deferred: counters.deferred,
       dropped: counters.dropped,
       superseded: counters.superseded,
+      throttled: counters.throttled,
+      cosmeticFairShareEnabled,
       floodObserved: counters.floodObserved,
       tightened: isTightened(now),
       tightenLevel: levelAt(now),
