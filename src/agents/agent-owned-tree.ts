@@ -62,6 +62,27 @@ import { join } from "node:path";
 import { allocateAgentUid } from "./agent-uid.js";
 
 /**
+ * Classify a failed `chown -h -R` (execFileSync throw) as a benign
+ * vanished-file race vs a real ownership failure. Returns true ONLY when
+ * chown exited non-zero AND every stderr line is a "No such file or
+ * directory" (ENOENT) error — i.e. an inode disappeared mid-walk, which is
+ * safe to ignore because a gone file has no ownership to restore. Any other
+ * error line (Operation not permitted, Permission denied, Read-only file
+ * system, …) or empty/uninterpretable stderr → false → caller re-throws.
+ * Assumes LC_ALL=C wording (chownTree pins it).
+ */
+export function isChownVanishedRaceOnly(err: unknown): boolean {
+  const e = err as { stderr?: Buffer | string | null } | null | undefined;
+  const raw = e?.stderr == null ? "" : e.stderr.toString();
+  const lines = raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return false; // fail-closed: no evidence it was a race
+  return lines.every((l) => /: No such file or directory$/.test(l));
+}
+
+/**
  * The agent-dir SUBDIRECTORIES the scoped sweep recurses into (#3333
  * amendment A). Root reconcile writers land inside these state dirs
  * (`.claude/` — settings.json + subagents + backups; `.claude-cron/` —
@@ -137,9 +158,23 @@ export const ownershipRuntime = {
    * `-h` is load-bearing on busybox hosts — see "Symlink safety" above.
    */
   chownTree: (uid: number, gid: number, rootDir: string): void => {
-    execFileSync("chown", ["-h", "-R", `${uid}:${gid}`, rootDir], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
+    try {
+      execFileSync("chown", ["-h", "-R", "--", `${uid}:${gid}`, rootDir], {
+        stdio: ["ignore", "ignore", "pipe"],
+        // LC_ALL=C pins chown's stderr wording so the race classifier below
+        // is deterministic across hosts/locales (busybox + GNU both honour it).
+        env: { ...process.env, LC_ALL: "C" },
+      });
+    } catch (err) {
+      // chown -R exits non-zero if ANY entry failed. During a live rollout the
+      // agent's own workspace may be churning (a mid-test Postgres data dir,
+      // a git checkout, node_modules) so inodes vanish between chown's readdir
+      // and its lchown — a benign ENOENT race, NOT an ownership failure. Swallow
+      // the exit ONLY when EVERY stderr line is such a vanished-file error, and
+      // re-throw on any real failure (EPERM/EACCES/EROFS): a still-present,
+      // still-mis-owned file is the #3168 invariant we must fail loudly on.
+      if (!isChownVanishedRaceOnly(err)) throw err;
+    }
   },
   /**
    * SHALLOW chown (no `-R`) of the given paths — the top-level pass of the

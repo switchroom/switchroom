@@ -129,6 +129,9 @@ export function registerRestartCommand(program: Command): void {
             }
           } catch (err) {
             console.error(chalk.red(`  ${name}: restart failed: ${(err as Error).message}`));
+            // Surface the failure as a non-zero process exit (see agent.ts
+            // sibling): a restart throw must not be swallowed to exit 0.
+            process.exitCode = 1;
           }
         }
 

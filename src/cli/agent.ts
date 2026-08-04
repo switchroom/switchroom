@@ -1586,6 +1586,13 @@ export function registerAgentCommand(program: Command): void {
               console.error(
                 chalk.red(`Failed to restart ${n}: ${(err as Error).message}`)
               );
+              // A reconcile/restart throw must surface as a non-zero exit so a
+              // caller (the rollout driver spawning `agent restart --wait
+              // --force`) can detect it via the child's status, not only by a
+              // downstream version probe. Without this the CLI exits 0 despite
+              // never recreating the container. Loop continues for other agents;
+              // exitCode is process-global and set once.
+              process.exitCode = 1;
             }
           }
 

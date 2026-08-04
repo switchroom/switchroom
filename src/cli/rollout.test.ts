@@ -427,6 +427,36 @@ describe("executeRollout", () => {
     expect(runs).not.toContainEqual(["webd", "install", "--tag", TARGET]);
   });
 
+  it("STOPS on a non-zero restart status EVEN WHEN the version probe reads the target", async () => {
+    // The masking-bug regression. Incident: the child `agent restart`
+    // reconcile threw before recreating the container, but a lucky probe
+    // (matching the target) let the roll report success over a broken agent.
+    // Here the second agent's restart exits status:1 while its probe pretends
+    // the container DID come up on the target — the driver must STILL halt on
+    // the exit status, not fall through to the (passing) version gate.
+    // On pre-fix `main` the driver ignores `status` and reports success → this
+    // test fails; with the status gate it stops. Outcome, not code path.
+    const steps = planRollout(["clerk", "marko", "quill"]);
+    const { deps, runs } = harness({
+      // ALL agents probe as the target — no version mismatch to catch it.
+      versions: { clerk: "0.15.18", marko: "0.15.18", quill: "0.15.18" },
+      // marko's restart exits non-zero (reconcile/restart failure); all else 0.
+      runStatus: (args) =>
+        args[0] === "agent" && args[1] === "restart" && args[2] === "marko" ? 1 : 0,
+    });
+    const r = await executeRollout(steps, TARGET, deps);
+    expect(r.ok).toBe(false);
+    expect(r.failedStep).toBe("restart-agent");
+    expect(r.failedAgent).toBe("marko");
+    // Disjoint from the timeout shape: the child ran to completion, so no
+    // `timedOut` flag on this failure.
+    expect(r.timedOut).toBeUndefined();
+    expect(r.rolled).toEqual(["clerk"]); // only the one before the failure
+    // quill was never restarted; web/hostd never refreshed.
+    expect(runs).not.toContainEqual(["agent", "restart", "quill", "--wait", "--force"]);
+    expect(runs).not.toContainEqual(["webd", "install", "--tag", TARGET]);
+  });
+
   it("STOPS when an agent is unreachable (probe returns null)", async () => {
     const steps = planRollout(["clerk"]);
     const { deps } = harness({ versions: { clerk: null } });
