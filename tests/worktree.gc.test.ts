@@ -22,7 +22,11 @@ import {
   planGc,
   applyGc,
   selectPurgeTargets,
+  pushStateFrom,
+  isStablePerRepoBranch,
+  classifyTaskTree,
   type GcDeps,
+  type TaskTreeClassifyInput,
 } from "../src/worktree/gc.js";
 
 // ── pure helpers ──────────────────────────────────────────────────────────
@@ -284,6 +288,257 @@ describe("planGc — orphan attribution + merged sweep", () => {
   });
 });
 
+// ── task-tree coverage (RFC §4) ──────────────────────────────────────────────
+
+describe("pushStateFrom", () => {
+  it("pushed only when an upstream exists and HEAD is not ahead", () => {
+    expect(pushStateFrom({ detached: false, upstream: "origin/feat/x", aheadCount: 0 })).toBe("pushed");
+  });
+  it("detached HEAD ⇒ detached (fail toward keep)", () => {
+    expect(pushStateFrom({ detached: true, upstream: null, aheadCount: 0 })).toBe("detached");
+  });
+  it("no upstream ⇒ no-upstream (never-pushed abandoned branch)", () => {
+    expect(pushStateFrom({ detached: false, upstream: null, aheadCount: 0 })).toBe("no-upstream");
+  });
+  it("commits ahead of upstream ⇒ unpushed", () => {
+    expect(pushStateFrom({ detached: false, upstream: "origin/feat/x", aheadCount: 3 })).toBe("unpushed");
+  });
+  it("negative count (git failed) ⇒ error (fail toward keep)", () => {
+    expect(pushStateFrom({ detached: false, upstream: "origin/feat/x", aheadCount: -1 })).toBe("error");
+  });
+});
+
+describe("isStablePerRepoBranch", () => {
+  it("matches agent/<name>/main only", () => {
+    expect(isStablePerRepoBranch("agent/klanker/main")).toBe(true);
+    expect(isStablePerRepoBranch("agent/overlord/main")).toBe(true);
+    expect(isStablePerRepoBranch("feat/fix-3019")).toBe(false);
+    expect(isStablePerRepoBranch("agent/klanker/feature")).toBe(false);
+    expect(isStablePerRepoBranch(null)).toBe(false);
+  });
+});
+
+describe("classifyTaskTree — safety-first decision order", () => {
+  const clean: TaskTreeClassifyInput = {
+    isRegistryClaimed: false,
+    isStablePerRepoTree: false,
+    isEphemeralPath: false,
+    clean: true,
+    pushed: "pushed",
+    prSignal: "merged",
+    idle: true,
+    inUse: "free",
+  };
+  it("REAPS a clean + pushed + idle + merged + free tree", () => {
+    expect(classifyTaskTree(clean)).toBe("reap");
+  });
+  it("REAPS a closed-PR (abandoned) task tree — closed is eligible here", () => {
+    expect(classifyTaskTree({ ...clean, prSignal: "closed" })).toBe("reap");
+  });
+  it("protects registry-claimed / stable per-repo tree / ephemeral", () => {
+    expect(classifyTaskTree({ ...clean, isRegistryClaimed: true })).toBe("skip-protected");
+    expect(classifyTaskTree({ ...clean, isStablePerRepoTree: true })).toBe("skip-protected");
+    expect(classifyTaskTree({ ...clean, isEphemeralPath: true })).toBe("skip-protected");
+  });
+  it("NEVER reaps a dirty tree", () => {
+    expect(classifyTaskTree({ ...clean, clean: false })).toBe("skip-dirty");
+  });
+  it("NEVER reaps an in-use tree, even when otherwise reapable", () => {
+    expect(classifyTaskTree({ ...clean, inUse: "in-use" })).toBe("skip-in-use");
+  });
+  it("keeps when the in-use probe is unavailable (cannot prove idle)", () => {
+    expect(classifyTaskTree({ ...clean, inUse: "unavailable" })).toBe("skip-probe-unavailable");
+  });
+  it("in-use OUTRANKS dirty — a live dirty tree is skip-in-use, not escape-hatch eligible", () => {
+    expect(classifyTaskTree({ ...clean, inUse: "in-use", clean: false })).toBe("skip-in-use");
+  });
+  it("NEVER reaps an unpushed / detached / no-upstream tree", () => {
+    expect(classifyTaskTree({ ...clean, pushed: "unpushed" })).toBe("skip-unpushed");
+    expect(classifyTaskTree({ ...clean, pushed: "detached" })).toBe("skip-unpushed");
+    expect(classifyTaskTree({ ...clean, pushed: "no-upstream" })).toBe("skip-unpushed");
+    expect(classifyTaskTree({ ...clean, pushed: "error" })).toBe("skip-unpushed");
+  });
+  it("NEVER reaps a non-idle (recently active) tree", () => {
+    expect(classifyTaskTree({ ...clean, idle: false })).toBe("skip-active");
+  });
+  it("keeps open / no PR and gh errors", () => {
+    expect(classifyTaskTree({ ...clean, prSignal: "open" })).toBe("skip-unmerged");
+    expect(classifyTaskTree({ ...clean, prSignal: "none" })).toBe("skip-unmerged");
+    expect(classifyTaskTree({ ...clean, prSignal: "error" })).toBe("skip-unknown");
+  });
+});
+
+describe("planGc — task-tree sweep across all three tree shapes (RFC §4)", () => {
+  const NOW = 1_700_000_000_000;
+  const DAY = 86_400_000;
+  const root = "/agents/a1/home/work";
+  const OWNER = "/agents/a1/work/switchroom";
+  const SR = "https://github.com/switchroom/switchroom.git\n";
+
+  interface TreeSpec {
+    shape: "clone" | "worktree";
+    remote?: string;
+    branch?: string | null; // null ⇒ detached HEAD
+    status?: string[]; // porcelain lines (default clean)
+    upstream?: string | null; // default present
+    ahead?: number; // default 0
+    mtimeDaysAgo?: number; // default 30 (idle)
+    pr?: string; // default merged
+    inUse?: "free" | "in-use" | "unavailable"; // default free
+  }
+
+  function makeDeps(trees: Record<string, TreeSpec>, escapeHatch = false): GcDeps {
+    const names = Object.keys(trees);
+    const dirOf = (name: string) => `${root}/${name}`;
+    const specByDir = new Map<string, TreeSpec>();
+    for (const n of names) specByDir.set(dirOf(n), trees[n]);
+
+    return {
+      dateStamp: "2026-08-04",
+      idleDays: 14,
+      nowMs: NOW,
+      escapeHatch,
+      existsSync: (p: string) => p === root || p.endsWith("/.git") === true && specByDir.has(p.slice(0, -5)),
+      readDir: (p: string) => {
+        if (p === root) return names;
+        throw new Error("unexpected readDir " + p);
+      },
+      stat: (p: string) => {
+        const dir = p.slice(0, -5); // strip "/.git"
+        const spec = specByDir.get(dir);
+        return { isDirectory: () => spec?.shape === "clone" };
+      },
+      readFile: (p: string) => {
+        // only worktree shapes read the .git pointer
+        const dir = p.slice(0, -5);
+        return `gitdir: ${OWNER}/.git/worktrees/${dir.split("/").pop()}\n`;
+      },
+      probeInUse: (p: string) => specByDir.get(p)?.inUse ?? "free",
+      newestTrackedMtimeMs: (dir: string) => NOW - (specByDir.get(dir)?.mtimeDaysAgo ?? 30) * DAY,
+      exec: (file: string, args: string[]) => {
+        const dir = args[args.indexOf("-C") + 1];
+        const spec = specByDir.get(dir);
+        if (!spec) throw new Error("unexpected exec dir " + dir);
+        if (args.includes("remote")) return spec.remote ?? SR;
+        if (args.includes("status")) return (spec.status ?? []).join("\n");
+        if (args.includes("rev-parse") && args.includes("HEAD") && !args.includes("@{upstream}")) {
+          return spec.branch === null ? "HEAD\n" : `${spec.branch ?? "feat/x"}\n`;
+        }
+        if (args.includes("@{upstream}") && args.includes("rev-parse")) {
+          if (spec.upstream === null) throw new Error("no upstream");
+          return `${spec.upstream ?? "origin/feat/x"}\n`;
+        }
+        if (args.includes("rev-list")) return `${spec.ahead ?? 0}\n`;
+        throw new Error("unexpected exec " + file + " " + args.join(" "));
+      },
+      prSignal: (_repo: string, _branch: string) => {
+        const spec = specByDir.get(_repo);
+        return (spec?.pr ?? "merged") as any;
+      },
+    };
+  }
+
+  function verdictOf(trees: Record<string, TreeSpec>, name: string, escapeHatch = false) {
+    const plan = planGc([], makeDeps(trees, escapeHatch), [root]);
+    return plan.taskTrees.find((t) => t.dir === `${root}/${name}`);
+  }
+
+  it("a clean + pushed + idle + merged CLONE IS eligible (willAct)", () => {
+    const t = verdictOf({ "clone-x": { shape: "clone" } }, "clone-x");
+    expect(t?.verdict).toBe("reap");
+    expect(t?.willAct).toBe(true);
+    expect(t?.shape).toBe("clone");
+  });
+
+  it("a clean + pushed + idle + merged WORKTREE IS eligible, with its owner repo captured for prune", () => {
+    const t = verdictOf({ "wt-x": { shape: "worktree" } }, "wt-x");
+    expect(t?.verdict).toBe("reap");
+    expect(t?.willAct).toBe(true);
+    expect(t?.shape).toBe("worktree");
+    expect(t?.ownerRepo).toBe(OWNER);
+  });
+
+  it("a nested-repo-shaped (clone) closed-PR tree IS eligible", () => {
+    const t = verdictOf({ "nested-x": { shape: "clone", pr: "closed" } }, "nested-x");
+    expect(t?.verdict).toBe("reap");
+    expect(t?.willAct).toBe(true);
+  });
+
+  it("a DIRTY tree is NOT reaped (skip-dirty, willAct false)", () => {
+    const t = verdictOf({ dirty: { shape: "clone", status: ["A  docs/new.md"] } }, "dirty");
+    expect(t?.verdict).toBe("skip-dirty");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("an IN-USE tree is NOT reaped (skip-in-use), even under the escape hatch", () => {
+    const t = verdictOf(
+      { live: { shape: "clone", inUse: "in-use", status: ["A  docs/new.md"] } },
+      "live",
+      /* escapeHatch */ true,
+    );
+    expect(t?.verdict).toBe("skip-in-use");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("an UNPUSHED (ahead-of-upstream) tree is NOT reaped", () => {
+    const t = verdictOf({ ahead: { shape: "clone", ahead: 2 } }, "ahead");
+    expect(t?.verdict).toBe("skip-unpushed");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("a NO-UPSTREAM (never-pushed) tree is NOT reaped", () => {
+    const t = verdictOf({ orphanbr: { shape: "clone", upstream: null } }, "orphanbr");
+    expect(t?.verdict).toBe("skip-unpushed");
+  });
+
+  it("a DETACHED-HEAD tree is NOT reaped", () => {
+    const t = verdictOf({ det: { shape: "clone", branch: null } }, "det");
+    expect(t?.verdict).toBe("skip-unpushed");
+  });
+
+  it("a recently-active (non-idle) tree is NOT reaped", () => {
+    const t = verdictOf({ active: { shape: "clone", mtimeDaysAgo: 1 } }, "active");
+    expect(t?.verdict).toBe("skip-active");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("an OPEN-PR tree is NOT reaped", () => {
+    const t = verdictOf({ openpr: { shape: "clone", pr: "open" } }, "openpr");
+    expect(t?.verdict).toBe("skip-unmerged");
+  });
+
+  it("a NON-switchroom tree is ignored (recorded in skipped, never actioned)", () => {
+    const deps = makeDeps({ foreign: { shape: "clone", remote: "https://github.com/x/y.git\n" } });
+    const plan = planGc([], deps, [root]);
+    expect(plan.taskTrees.find((t) => t.dir === `${root}/foreign`)).toBeUndefined();
+    expect(plan.skipped.some((s) => s.dir === `${root}/foreign`)).toBe(true);
+  });
+
+  it("the stable per-repo tree (agent/<name>/main) is protected", () => {
+    const t = verdictOf({ stable: { shape: "worktree", branch: "agent/a1/main" } }, "stable");
+    expect(t?.verdict).toBe("skip-protected");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("escape hatch quarantines an IDLE dirty tree (willAct), but leaves auto behaviour off by default", () => {
+    const spec = { dirtyidle: { shape: "clone" as const, status: ["A  docs/new.md"] } };
+    expect(verdictOf(spec, "dirtyidle", false)?.willAct).toBe(false);
+    const withHatch = verdictOf(spec, "dirtyidle", true);
+    expect(withHatch?.verdict).toBe("skip-dirty");
+    expect(withHatch?.willAct).toBe(true);
+  });
+
+  it("escape hatch does NOT quarantine a non-idle dirty tree (recently active)", () => {
+    const t = verdictOf(
+      { dirtyactive: { shape: "clone", status: ["A  docs/new.md"], mtimeDaysAgo: 1 } },
+      "dirtyactive",
+      true,
+    );
+    expect(t?.verdict).toBe("skip-dirty");
+    expect(t?.willAct).toBe(false);
+  });
+});
+
 // ── applyGc quarantine (real temp dir) ───────────────────────────────────────
 
 describe("applyGc — quarantine move (real fs)", () => {
@@ -304,9 +559,11 @@ describe("applyGc — quarantine move (real fs)", () => {
 
     const result = applyGc({
       roots: [code],
+      taskTreeRoots: [],
       trashDir: trash,
       orphans: [{ dir: orphan, owner: "/x/switchroom", dest: join(trash, "sr-old") }],
       registered: [],
+      taskTrees: [],
       reposToPrune: [],
       skipped: [],
     });
@@ -320,13 +577,125 @@ describe("applyGc — quarantine move (real fs)", () => {
   it("does nothing destructive for a dry-run-shaped (empty) plan", () => {
     const result = applyGc({
       roots: [tmp],
+      taskTreeRoots: [],
       trashDir: join(tmp, "trash"),
       orphans: [],
       registered: [{ path: "/x", branch: "feat/x", verdict: "skip-dirty", prSignal: "merged", repo: "/r" }],
+      taskTrees: [],
       reposToPrune: [],
       skipped: [],
     });
     expect(result.quarantined).toHaveLength(0);
     expect(result.removed).toHaveLength(0);
+  });
+
+  it("quarantines an actioned task tree (recoverable move, not delete)", () => {
+    const work = join(tmp, "home", "work");
+    const tree = join(work, "fix-3019");
+    mkdirSync(tree, { recursive: true });
+    writeFileSync(join(tree, "src.ts"), "content");
+    const trash = join(tmp, "trash", "2026-08-04");
+
+    const result = applyGc({
+      roots: [],
+      taskTreeRoots: [work],
+      trashDir: trash,
+      orphans: [],
+      registered: [],
+      taskTrees: [
+        {
+          dir: tree,
+          shape: "clone",
+          ownerRepo: null,
+          branch: "feat/fix-3019",
+          verdict: "reap",
+          prSignal: "merged",
+          idle: true,
+          dest: join(trash, "fix-3019"),
+          willAct: true,
+        },
+      ],
+      reposToPrune: [],
+      skipped: [],
+    });
+
+    expect(result.quarantined).toEqual([tree]);
+    expect(existsSync(tree)).toBe(false); // moved out of home/work
+    expect(existsSync(join(trash, "fix-3019", "src.ts"))).toBe(true); // recoverable
+  });
+
+  it("does NOT move a task tree whose willAct is false (surfaced-only)", () => {
+    const work = join(tmp, "home", "work");
+    const tree = join(work, "dirty-tree");
+    mkdirSync(tree, { recursive: true });
+    writeFileSync(join(tree, "wip.ts"), "uncommitted");
+    const trash = join(tmp, "trash", "2026-08-04");
+
+    const result = applyGc({
+      roots: [],
+      taskTreeRoots: [work],
+      trashDir: trash,
+      orphans: [],
+      registered: [],
+      taskTrees: [
+        {
+          dir: tree,
+          shape: "clone",
+          ownerRepo: null,
+          branch: "feat/wip",
+          verdict: "skip-dirty",
+          prSignal: "error",
+          idle: true,
+          dest: join(trash, "dirty-tree"),
+          willAct: false,
+        },
+      ],
+      reposToPrune: [],
+      skipped: [],
+    });
+
+    expect(result.quarantined).toHaveLength(0);
+    expect(existsSync(join(tree, "wip.ts"))).toBe(true); // untouched
+  });
+
+  it("prunes the owner repo after quarantining a worktree-shaped task tree", () => {
+    const work = join(tmp, "home", "work");
+    const tree = join(work, "review-3022");
+    mkdirSync(tree, { recursive: true });
+    writeFileSync(join(tree, "a.ts"), "x");
+    const trash = join(tmp, "trash", "2026-08-04");
+    const owner = "/agents/a1/work/switchroom";
+    const execCalls: string[][] = [];
+
+    const result = applyGc(
+      {
+        roots: [],
+        taskTreeRoots: [work],
+        trashDir: trash,
+        orphans: [],
+        registered: [],
+        taskTrees: [
+          {
+            dir: tree,
+            shape: "worktree",
+            ownerRepo: owner,
+            branch: "feat/review-3022",
+            verdict: "reap",
+            prSignal: "merged",
+            idle: true,
+            dest: join(trash, "review-3022"),
+            willAct: true,
+          },
+        ],
+        reposToPrune: [owner],
+        skipped: [],
+      },
+      { exec: (file, args) => { execCalls.push([file, ...args]); return ""; } },
+    );
+
+    expect(result.quarantined).toEqual([tree]);
+    expect(existsSync(tree)).toBe(false);
+    expect(result.pruned).toEqual([owner]);
+    expect(execCalls).toContainEqual(["git", "-C", owner, "worktree", "prune"]);
   });
 });

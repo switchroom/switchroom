@@ -44,6 +44,7 @@ import {
 import { homedir } from "node:os";
 import { join, resolve, basename } from "node:path";
 import { listRecords } from "./registry.js";
+import { probePathInUse, type PathUseState } from "./reaper.js";
 
 // ── pure helpers ────────────────────────────────────────────────────────────
 
@@ -177,6 +178,116 @@ export function isEphemeralPath(path: string): boolean {
   return false;
 }
 
+// ── task-tree (home/work) coverage — RFC §4 ─────────────────────────────────
+//
+// The dev-worktree sweep above (Phase A/B) roots at ~/code and, via
+// `looksLikeAgentWorktree`, deliberately SKIP-protects anything under a
+// `work/` path — so per-task trees an agent/harness drops at
+// `~/.switchroom/agents/<name>/home/work/<slug>` are never touched, and grow
+// without bound (the ~25G+ overhang). RFC §4 closes that gap with a dedicated,
+// guard-gated sweep of the task-tree roots.
+//
+// Task trees are NOT uniformly git worktrees. A live census found three shapes:
+//   - "worktree" — `.git` is a FILE pointing at an owner repo's admin dir.
+//   - "clone"    — `.git` is a DIRECTORY (a full standalone clone, or a repo
+//                  nested inside another checkout). Same handling: it responds
+//                  to `git -C <dir> …` identically, and is quarantined as a
+//                  self-contained directory.
+// A naive coverage that keyed off worktree detection (as the old `work/` skip
+// does) would miss the majority of the overhang (the clones + nested repos).
+// Both shapes go through the SAME guard gauntlet below; only the post-reclaim
+// bookkeeping differs (a reaped worktree also prunes its owner repo's admin
+// metadata).
+
+/** Physical shape of a task-tree candidate directory. */
+export type TaskTreeShape = "worktree" | "clone";
+
+/**
+ * Push state of a task tree's branch. Everything other than `pushed` fails
+ * toward preservation (the tree is kept, or only the operator escape hatch
+ * may quarantine it).
+ */
+export type PushState = "pushed" | "unpushed" | "no-upstream" | "detached" | "error";
+
+/** Derive the push state from raw git facts. Pure, for unit testing. */
+export function pushStateFrom(opts: {
+  detached: boolean;
+  upstream: string | null;
+  /** commit count of `@{upstream}..HEAD`; negative ⇒ the count command failed. */
+  aheadCount: number;
+}): PushState {
+  if (opts.detached) return "detached";
+  if (!opts.upstream) return "no-upstream";
+  if (opts.aheadCount < 0) return "error";
+  if (opts.aheadCount > 0) return "unpushed";
+  return "pushed";
+}
+
+/**
+ * True for the agent's STABLE per-repo tree branch (`agent/<name>/main`,
+ * `agent-worktree.ts`). That tree is durable identity, not a disposable task
+ * tree, and must never be reaped even if it somehow lands under a task root.
+ */
+export function isStablePerRepoBranch(branch: string | null): boolean {
+  return !!branch && /^agent\/[^/]+\/main$/.test(branch);
+}
+
+export type TaskTreeVerdict =
+  /** clean + pushed + idle + (merged|closed) PR + provably free → reclaim. */
+  | "reap"
+  /** registry-claimed / stable per-repo tree / ephemeral mount → never touch. */
+  | "skip-protected"
+  /** no fuser/lsof to prove it idle → treat as live, keep (fail-safe). */
+  | "skip-probe-unavailable"
+  /** a live process holds the path open → keep. */
+  | "skip-in-use"
+  /** uncommitted effective changes → keep (escape-hatch eligible). */
+  | "skip-dirty"
+  /** detached / no upstream / commits ahead of upstream → keep (escape-hatch eligible). */
+  | "skip-unpushed"
+  /** newest tracked mtime within the idle window → keep. */
+  | "skip-active"
+  /** couldn't determine the PR state → keep. */
+  | "skip-unknown"
+  /** PR still open / no PR → keep. */
+  | "skip-unmerged";
+
+export interface TaskTreeClassifyInput {
+  isRegistryClaimed: boolean;
+  isStablePerRepoTree: boolean;
+  isEphemeralPath: boolean;
+  clean: boolean;
+  pushed: PushState;
+  prSignal: PrSignal;
+  idle: boolean;
+  inUse: PathUseState;
+}
+
+/**
+ * Decide the fate of ONE task tree. Order is safety-first — every guard that
+ * can preserve fires before the single `reap` outcome, and the two data-loss
+ * guards (in-use, dirty) come before anything the escape hatch can act on, so a
+ * live or dirty-and-in-use tree can never be quarantined.
+ */
+export function classifyTaskTree(i: TaskTreeClassifyInput): TaskTreeVerdict {
+  if (i.isRegistryClaimed || i.isStablePerRepoTree || i.isEphemeralPath) {
+    return "skip-protected";
+  }
+  // In-use guards come first: a tree a live process holds is never eligible for
+  // reap OR for the escape hatch, even if it is also dirty.
+  if (i.inUse === "unavailable") return "skip-probe-unavailable";
+  if (i.inUse === "in-use") return "skip-in-use";
+  // Data-loss guards. Both are escape-hatch eligible (operator quarantines,
+  // reversibly) but never auto-reaped.
+  if (!i.clean) return "skip-dirty";
+  if (i.pushed !== "pushed") return "skip-unpushed";
+  // Freshness before the PR signal so an active tree never spends a `gh` call.
+  if (!i.idle) return "skip-active";
+  if (i.prSignal === "error") return "skip-unknown";
+  if (i.prSignal !== "merged" && i.prSignal !== "closed") return "skip-unmerged";
+  return "reap";
+}
+
 // ── plan types ──────────────────────────────────────────────────────────────
 
 export interface OrphanAction {
@@ -193,11 +304,32 @@ export interface RegisteredAction {
   repo: string;
 }
 
+export interface TaskTreeAction {
+  dir: string;
+  shape: TaskTreeShape;
+  /** owner repo (worktree shape only) — pruned after reclaim; null for a clone. */
+  ownerRepo: string | null;
+  branch: string | null;
+  verdict: TaskTreeVerdict;
+  prSignal: PrSignal;
+  idle: boolean;
+  /** quarantine destination when this tree is actioned. */
+  dest: string;
+  /**
+   * True iff this run will move the tree to trash: an automatic `reap`, or —
+   * when the operator escape hatch (`escapeHatch`) is on — an IDLE
+   * dirty/unpushed tree. Everything else is surfaced but untouched.
+   */
+  willAct: boolean;
+}
+
 export interface GcPlan {
   roots: string[];
+  taskTreeRoots: string[];
   trashDir: string;
   orphans: OrphanAction[];
   registered: RegisteredAction[];
+  taskTrees: TaskTreeAction[];
   reposToPrune: string[];
   skipped: { dir: string; reason: string }[];
 }
@@ -214,6 +346,21 @@ export interface GcDeps {
   prSignal?: (repo: string, branch: string) => PrSignal;
   /** ISO-ish date stamp for the quarantine subdir (no Date.now in tests). */
   dateStamp?: string;
+
+  // ── task-tree (home/work) sweep seams (RFC §4) ──
+  /** Probe whether a path is held open by a live process. Default: reaper's. */
+  probeInUse?: (path: string) => PathUseState;
+  /** Newest tracked-file mtime (ms) under a task tree. Default: `git ls-files`. */
+  newestTrackedMtimeMs?: (dir: string) => number;
+  /** Idle threshold in days for a task tree (default 14). */
+  idleDays?: number;
+  /** "now" in ms for the idle comparison (default Date.now). */
+  nowMs?: number;
+  /**
+   * Operator escape hatch: when true, IDLE dirty/unpushed task trees are
+   * quarantined (reversibly) rather than merely surfaced. Default false.
+   */
+  escapeHatch?: boolean;
 }
 
 const defaultExec = (file: string, args: string[], cwd?: string): string =>
@@ -245,6 +392,36 @@ function defaultPrSignal(repo: string, branch: string, exec: GcDeps["exec"]): Pr
   }
 }
 
+/**
+ * Newest mtime (ms) across a task tree's git-TRACKED files — the RFC §2 idle
+ * signal. `git ls-files` excludes `node_modules` and other untracked/ignored
+ * churn, so a `bun install` does not reset the clock. On ANY error we return
+ * `Date.now()` (age 0 ⇒ not idle ⇒ keep) — fail toward preservation.
+ */
+function defaultNewestTrackedMtimeMs(
+  dir: string,
+  exec: NonNullable<GcDeps["exec"]>,
+): number {
+  let out: string;
+  try {
+    out = exec("git", ["-C", dir, "ls-files", "-z"]);
+  } catch {
+    return Date.now();
+  }
+  const files = out.split("\0").filter(Boolean);
+  let newest = 0;
+  for (const f of files) {
+    try {
+      const m = statSync(join(dir, f)).mtimeMs;
+      if (m > newest) newest = m;
+    } catch {
+      /* file vanished mid-scan — ignore */
+    }
+  }
+  // Empty/unreadable tree → treat as active (keep), never as ancient.
+  return newest || Date.now();
+}
+
 /** Default trash root. Override via SWITCHROOM_WORKTREE_TRASH for tests. */
 export function trashRoot(): string {
   return resolve(
@@ -258,9 +435,20 @@ export function trashRoot(): string {
 /**
  * Build a GC plan for the given roots without mutating anything.
  *
- * @param roots   directories whose IMMEDIATE subdirs are candidate worktrees.
+ * @param roots          directories whose IMMEDIATE subdirs are candidate dev
+ *                       worktrees (Phase A/B — the ~/code sweep).
+ * @param taskTreeRoots  per-agent `home/work` roots whose IMMEDIATE subdirs are
+ *                       candidate task trees (Phase C — RFC §4). These are a
+ *                       SEPARATE input, not folded into `roots`, because they
+ *                       carry different semantics (all tree shapes, the
+ *                       `work/` carve-out, the pushed + idle guards, and
+ *                       merged-OR-closed eligibility).
  */
-export function planGc(roots: string[], deps: GcDeps = {}): GcPlan {
+export function planGc(
+  roots: string[],
+  deps: GcDeps = {},
+  taskTreeRoots: string[] = [],
+): GcPlan {
   const exists = deps.existsSync ?? existsSync;
   const readDir = deps.readDir ?? ((p: string) => readdirSync(p));
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, "utf8"));
@@ -269,6 +457,11 @@ export function planGc(roots: string[], deps: GcDeps = {}): GcPlan {
   const prSignal = deps.prSignal ?? ((repo: string, branch: string) => defaultPrSignal(repo, branch, exec));
   const stamp = deps.dateStamp ?? "undated";
   const trash = join(trashRoot(), stamp);
+  const probeInUse = deps.probeInUse ?? probePathInUse;
+  const newestMtime = deps.newestTrackedMtimeMs ?? ((dir: string) => defaultNewestTrackedMtimeMs(dir, exec));
+  const idleDays = deps.idleDays ?? 14;
+  const nowMs = deps.nowMs ?? Date.now();
+  const escapeHatch = deps.escapeHatch ?? false;
 
   // registry-claimed worktree paths (excluded from the registered sweep).
   let claimed: Set<string>;
@@ -385,11 +578,163 @@ export function planGc(roots: string[], deps: GcDeps = {}): GcPlan {
     }
   }
 
+  // ── Phase C: per-agent task-tree sweep (home/work — RFC §4) ──
+  // A dedicated path, NOT routed through classifyRegistered, so the `work/`
+  // carve-out is achieved structurally (these roots never reach the blanket
+  // `looksLikeAgentWorktree` skip) and all three tree shapes are covered.
+  const taskTrees: TaskTreeAction[] = [];
+  for (const root of taskTreeRoots) {
+    if (!exists(root)) continue;
+    let entries: string[];
+    try {
+      entries = readDir(root);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      const dir = join(root, name);
+      if (isEphemeralPath(dir)) continue;
+      const dotGit = join(dir, ".git");
+      if (!exists(dotGit)) continue; // not a git tree — leave it
+      let shape: TaskTreeShape;
+      try {
+        shape = stat(dotGit).isDirectory() ? "clone" : "worktree";
+      } catch {
+        continue;
+      }
+
+      // Safety gate: only ever touch a checkout of the canonical switchroom
+      // repo. `git -C <dir> remote get-url origin` works for worktree AND clone.
+      let remoteOk = false;
+      try {
+        remoteOk = isSwitchroomRemote(exec("git", ["-C", dir, "remote", "get-url", "origin"]));
+      } catch {
+        remoteOk = false;
+      }
+      if (!remoteOk) {
+        skipped.push({ dir, reason: "not a switchroom task tree" });
+        continue;
+      }
+
+      // Owner repo (for post-reclaim `worktree prune`) — worktree shape only.
+      let ownerRepo: string | null = null;
+      if (shape === "worktree") {
+        try {
+          const ptr = parseGitdirPointer(readFile(dotGit));
+          if (ptr) ownerRepo = repoRootFromWorktreeGitdir(ptr);
+        } catch {
+          ownerRepo = null;
+        }
+      }
+
+      // Branch / detached HEAD.
+      let branch: string | null = null;
+      let detached = false;
+      try {
+        const b = exec("git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"]).trim();
+        if (b === "HEAD") detached = true;
+        else branch = b;
+      } catch {
+        detached = true; // can't read HEAD ⇒ treat as detached ⇒ unpushed ⇒ keep
+      }
+
+      const claimedWt = claimed.has(resolve(dir));
+      const stableTree = isStablePerRepoBranch(branch);
+      const ephemeral = isEphemeralPath(dir);
+      const protectedTree = claimedWt || stableTree || ephemeral;
+
+      // Effective cleanliness (build noise tolerated; anything else ⇒ dirty).
+      let clean = false;
+      try {
+        clean = isEffectivelyClean(exec("git", ["-C", dir, "status", "--porcelain"]).split("\n"));
+      } catch {
+        clean = false; // can't inspect ⇒ assume dirty ⇒ keep
+      }
+
+      // Push state: uncommitted-clean does NOT imply pushed.
+      let upstream: string | null = null;
+      let aheadCount = 0;
+      if (!detached) {
+        try {
+          upstream =
+            exec("git", ["-C", dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).trim() ||
+            null;
+        } catch {
+          upstream = null;
+        }
+        if (upstream) {
+          try {
+            aheadCount = parseInt(exec("git", ["-C", dir, "rev-list", "--count", "@{upstream}..HEAD"]).trim(), 10);
+            if (!Number.isFinite(aheadCount)) aheadCount = -1;
+          } catch {
+            aheadCount = -1; // count failed ⇒ error ⇒ keep
+          }
+        }
+      }
+      const pushed = pushStateFrom({ detached, upstream, aheadCount });
+
+      // Idle: newest tracked mtime older than the idle window.
+      let idle = false;
+      try {
+        idle = (nowMs - newestMtime(dir)) / 86_400_000 >= idleDays;
+      } catch {
+        idle = false; // can't tell ⇒ treat as active ⇒ keep
+      }
+
+      // Spend the probe + `gh` call only when every cheaper guard has passed
+      // (mirrors Phase B). classifyTaskTree checks in-use/clean/pushed/idle
+      // before the PR signal, so an uncalled `error`/`unavailable` is only ever
+      // consulted when an earlier guard has already decided the verdict.
+      let inUse: PathUseState = "unavailable";
+      let sig: PrSignal = "error";
+      if (!protectedTree) {
+        inUse = probeInUse(dir);
+        if (inUse === "free" && clean && pushed === "pushed" && idle && branch) {
+          sig = prSignal(dir, branch);
+        }
+      }
+
+      const verdict = classifyTaskTree({
+        isRegistryClaimed: claimedWt,
+        isStablePerRepoTree: stableTree,
+        isEphemeralPath: ephemeral,
+        clean,
+        pushed,
+        prSignal: sig,
+        idle,
+        inUse,
+      });
+
+      // Automatic reap, OR — under the operator escape hatch — an IDLE
+      // dirty/unpushed tree (reversible quarantine; never a live/in-use one,
+      // since those resolve to skip-in-use before skip-dirty/skip-unpushed).
+      const willAct =
+        verdict === "reap" ||
+        (escapeHatch && idle && (verdict === "skip-dirty" || verdict === "skip-unpushed"));
+
+      if (willAct && ownerRepo) reposToPrune.add(ownerRepo);
+
+      taskTrees.push({
+        dir,
+        shape,
+        ownerRepo,
+        branch,
+        verdict,
+        prSignal: sig,
+        idle,
+        dest: join(trash, name),
+        willAct,
+      });
+    }
+  }
+
   return {
     roots,
+    taskTreeRoots,
     trashDir: trash,
     orphans,
     registered,
+    taskTrees,
     reposToPrune: [...reposToPrune],
     skipped,
   };
@@ -429,13 +774,28 @@ export function applyGc(plan: GcPlan, deps: ApplyDeps = {}): GcApplyResult {
 
   const res: GcApplyResult = { quarantined: [], removed: [], branchesDeleted: [], pruned: [], errors: [] };
 
-  if (plan.orphans.length) mkdirp(plan.trashDir);
+  const taskTreeActions = (plan.taskTrees ?? []).filter((t) => t.willAct);
+  if (plan.orphans.length || taskTreeActions.length) mkdirp(plan.trashDir);
   for (const o of plan.orphans) {
     try {
       move(o.dir, o.dest);
       res.quarantined.push(o.dir);
     } catch (e) {
       res.errors.push(`quarantine ${o.dir}: ${(e as Error).message}`);
+    }
+  }
+
+  // Task trees (RFC §4): quarantine to trash (recoverable) for BOTH automatic
+  // reaps and operator escape-hatch dirty/unpushed reclaims — "trash over rm".
+  // A worktree-shaped tree's owner repo is pruned afterward (it is already in
+  // plan.reposToPrune, handled by the prune loop below) to clear the now-dangling
+  // admin entry.
+  for (const t of taskTreeActions) {
+    try {
+      move(t.dir, t.dest);
+      res.quarantined.push(t.dir);
+    } catch (e) {
+      res.errors.push(`quarantine ${t.dir}: ${(e as Error).message}`);
     }
   }
 
@@ -531,4 +891,33 @@ export function purgeTrash(paths: string[]): { deleted: string[]; errors: string
 /** Default scan roots: ~/code (where dev worktrees live). */
 export function defaultRoots(): string[] {
   return [join(homedir(), "code")];
+}
+
+/**
+ * Default per-agent task-tree roots for the RFC §4 sweep. `planGc` reads the
+ * IMMEDIATE subdirs of each LITERAL root, so the per-agent
+ * `agents/<name>/home/{work,workspace}` glob must be expanded to concrete
+ * per-agent paths here — a bare glob string
+ * would be read as a literal directory name and match nothing. Only existing
+ * roots are returned. Container HOME (`/state/agent/home`) maps to
+ * `<agentDir>/home` on the host, so per-task trees land under
+ * `<agentDir>/home/work/<slug>`; the bounded stable per-repo tree
+ * (`<agentDir>/work/<slug>`) is deliberately NOT scanned.
+ */
+export function defaultTaskTreeRoots(): string[] {
+  const agentsDir = join(homedir(), ".switchroom", "agents");
+  let names: string[];
+  try {
+    names = readdirSync(agentsDir);
+  } catch {
+    return [];
+  }
+  const roots: string[] = [];
+  for (const name of names.sort()) {
+    for (const sub of ["home/work", "home/workspace"]) {
+      const r = join(agentsDir, name, sub);
+      if (existsSync(r)) roots.push(r);
+    }
+  }
+  return roots;
 }
