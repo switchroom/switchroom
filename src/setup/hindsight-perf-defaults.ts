@@ -1352,6 +1352,34 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_API_TEMPORAL_LANGUAGES: "en,es"   # re-enable Spanish parsing
  * ```
  *
+ * ### `HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS`
+ *
+ * The max chars of query text `dateparser.search_dates()` is handed during
+ * temporal analysis (0 = unlimited). The #4313 language pin cut dateparser's
+ * per-locale cost but could not bound the per-CALL cost, which is linear in
+ * input length × date density: multi-KB consolidation queries
+ * (`consolidator.py`, `query=m["text"]`) blocked the shared asyncio loop for up
+ * to ~15s. switchroom's temporal-offload image patch
+ * (`docker/Dockerfile.hindsight`, the `config.py` + `engine/query_analyzer.py` +
+ * `engine/search/{temporal_extraction,retrieval}.py` block) runs the extraction
+ * off the loop on a single-worker thread AND caps its input here, defaulting to
+ * 2000 — far above any live recall-hook query yet well below the consolidation
+ * text that caused the stalls. Only the temporal retrieval arm sees the
+ * truncation; semantic/BM25/graph get the full query.
+ *
+ * Like the language knob, this IS a real `HINDSIGHT_API_` config.py field the
+ * patch adds. Override-only here because the 2000 default lives in the image,
+ * not switchroom's TS layer — emitting a second copy would only create drift.
+ * Set to `0` to restore an unbounded full scan; raise it if you genuinely want
+ * dates matched deeper into long consolidation text (at the loop-time cost the
+ * patch exists to bound).
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS: "0"   # unbounded full scan
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1379,6 +1407,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
   "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
   "HINDSIGHT_API_TEMPORAL_LANGUAGES",
+  "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
 ]);
 
 /**

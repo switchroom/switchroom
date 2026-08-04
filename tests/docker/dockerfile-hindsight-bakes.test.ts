@@ -1365,6 +1365,66 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the temporal-offload fix (assert-guarded, fail-loud)", () => {
+    // dateparser.search_dates() ran synchronously on the shared asyncio loop
+    // from retrieve_all_fact_types_parallel() — 186 EVENT LOOP BLOCKED events in
+    // 4.5h, max 14.95s, driven by multi-KB consolidation queries. The patch
+    // offloads it to a single-worker ThreadPoolExecutor and bounds its input
+    // with HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS (default 2000).
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /switchroom hindsight temporal-offload patch: anchor found \{n\}x/,
+    );
+
+    // The config.py char-cap knob, wired end to end.
+    expect(dockerfile).toContain(
+      'ENV_TEMPORAL_MAX_QUERY_CHARS = "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS"',
+    );
+    expect(dockerfile).toContain("DEFAULT_TEMPORAL_MAX_QUERY_CHARS = 2000");
+    expect(dockerfile).toContain("    temporal_max_query_chars: int");
+    expect(dockerfile).toContain(
+      "temporal_max_query_chars=_parse_non_negative_int(",
+    );
+
+    // The off-loop machinery: a DELIBERATELY single-worker executor and an
+    // async wrapper that offloads via run_in_executor.
+    expect(dockerfile).toContain(
+      'ThreadPoolExecutor(max_workers=1, thread_name_prefix="hindsight-temporal")',
+    );
+    expect(dockerfile).toContain(
+      "async def extract_temporal_constraint_async(",
+    );
+    expect(dockerfile).toContain("loop.run_in_executor(");
+    // The single async call site now awaits the off-loop wrapper.
+    expect(dockerfile).toContain(
+      "await extract_temporal_constraint_async(query_text",
+    );
+
+    // The analyzer truncates its input before search_dates.
+    expect(dockerfile).toContain(
+      "search_query = search_query[: self._max_query_chars]",
+    );
+
+    // The #4313 language pin MUST survive: the (now truncated) call still
+    // carries languages=self._languages. This is the in-patch guard that reds
+    // if this fix ever regresses #4313.
+    expect(dockerfile).toContain(
+      "self._search_dates(search_query, settings=settings, languages=self._languages)",
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight temporal-offload patch: #4313 language pin lost/,
+    );
+
+    // The RED guard: the untruncated on-loop call must be GONE from analyze().
+    expect(dockerfile).toContain(
+      'assert qa.count("self._search_dates(query, settings=settings, languages=self._languages)") == 0,',
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight temporal-offload patch: temporal extraction runs on a/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

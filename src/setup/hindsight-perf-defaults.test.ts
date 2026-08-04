@@ -351,7 +351,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-seven keys, by name", () => {
+  it("is overridable on exactly these forty-eight keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -388,6 +388,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
       "HINDSIGHT_API_TEMPORAL_LANGUAGES",
+      "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       // Both spellings of every per-type slot reservation are ACCEPTED as
       // input (see HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES); only the
@@ -849,6 +850,72 @@ describe("HINDSIGHT_API_TEMPORAL_LANGUAGES (override-only, i18n restore hatch)",
     const perf = { env: { [KEY]: "en,es" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
     expect(runEnv(runArgs()).get(KEY)).toEqual(["en,es"]);
+  });
+});
+
+describe("HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS (override-only, temporal-offload input cap)", () => {
+  const KEY = "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+  /** The documented full back-out value: unbounded full scan (upstream shape). */
+  const OFF = "0";
+
+  it("is in the managed set but in NO defaults group", () => {
+    // switchroom's temporal-offload image patch caps the query fed to
+    // dateparser.search_dates (default 2000, baked in config.py) to bound the
+    // per-call cost that blocked the shared asyncio loop on multi-KB
+    // consolidation queries. Managed so an operator's hindsight.env line is not
+    // silently dropped; override-only because the default lives in the image.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
+    expect(resolveHindsightPerfOverrides({ [KEY]: OFF }).get(KEY)).toBe(OFF);
+    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: OFF }).get(KEY)).toBe(OFF);
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — the image's baked 2000 stands",
+    (caps) => {
+      // Override-only means REACHABLE, not changed: a host that sets nothing
+      // keeps the image's baked default 2000. Emitting a value here would pin
+      // every install to switchroom's copy of that opinion.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    // The outcome that matters: an operator restoring an unbounded scan from
+    // declarative yaml must actually reach the container.
+    const perf = { env: { [KEY]: OFF }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get(KEY)).toEqual([OFF]);
+    expect(fromCompose.get(KEY)).toEqual([OFF]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    // It belongs to no capability group, so a gate-shaped regression that only
+    // emits grouped keys would drop it. Cloud endpoint + no GPU is the harshest
+    // gating case.
+    const perf = { env: { [KEY]: "4000" }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["4000"]);
   });
 });
 
