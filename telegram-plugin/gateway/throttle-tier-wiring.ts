@@ -35,6 +35,18 @@
  * (`LastFleetRoll` docstring in src/auth/broker/server.ts), which also
  * covers PINNED (non-fleet-active) account rolls — then nudges the resume
  * immediately through the same turn-safety guards.
+ *
+ * Two entrypoints (#failover-429-corroborate):
+ *   - `fire` — the FULL path above, for an ACCOUNT-SCOPED 429 (wording that
+ *     names the account's own usage limit). Records `throttled_until`, notices,
+ *     nudges, escalates.
+ *   - `fireProbeOnly` — for a GENERIC-TRANSIENT 429 (bare `rate_limit_error`
+ *     wording that neither names the account nor is proxy-local). Runs ONLY the
+ *     broker's rate-bounded escalation probe: a corroborated wall escalates
+ *     exactly like `fire`, but a HEALTHY probe is account-inert — no notice, no
+ *     nudge, no `throttled_until`, no second card. The gateway's calm
+ *     rate-limited card stays the only user-visible output. The two share the
+ *     escalation announce/resume via `announceEscalation`.
  */
 
 import {
@@ -56,7 +68,7 @@ export const THROTTLE_RETRY_NUDGE_JITTER_MAX_MS = 30_000
 /** The narrow broker surface the runner needs (structurally satisfied by
  *  the gateway's AuthBrokerClient). */
 export interface ThrottleBrokerClient {
-  markThrottled(until: number): Promise<{
+  markThrottled(until: number, probeOnly?: boolean): Promise<{
     account: string
     throttled_until: number
     escalated: boolean
@@ -92,10 +104,21 @@ export interface ThrottleTierRunnerDeps {
 
 export interface ThrottleTierRunner {
   /**
-   * Run the throttle path for one terminal transient 429. Fire-and-forget
-   * from the caller's perspective — never throws.
+   * Run the FULL throttle path for one terminal account-scoped 429: record
+   * `throttled_until`, post one deduped notice, arm the retry nudge, and
+   * escalate to failover when the first-hit probe corroborates a wall.
+   * Fire-and-forget from the caller's perspective — never throws.
    */
   fire(triggerAgent: string, throttledUntilMs: number, resetParsed: boolean): Promise<void>
+  /**
+   * PROBE-ONLY path for a generic-transient 429 (#failover-429-corroborate).
+   * Runs ONLY the broker's rate-bounded escalation probe: a corroborated wall
+   * escalates (announce + resume nudge) exactly like `fire`; a HEALTHY probe is
+   * account-inert — NO notice, NO nudge, NO `throttled_until` soft-defer, NO
+   * second card. The calm rate-limited card the gateway already emitted stays
+   * the only user-visible output. Fire-and-forget; never throws.
+   */
+  fireProbeOnly(triggerAgent: string): Promise<void>
   /** Test/debug view of internal state. */
   inspect(): { noticeState: ThrottleNoticeState; nudgePending: boolean }
 }
@@ -180,6 +203,33 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     }
   }
 
+  /**
+   * The escalated outcome, shared by `fire` and `fireProbeOnly`: the broker
+   * corroborated a genuine wall via a live probe and already ran mark-exhausted
+   * + roll (fleet active AND pinned accounts alike). The RAISING gateway
+   * announces — reactive-path doctrine — fleet-deduped so N gateways sharing
+   * the account produce one copy per chat, then nudges the resume.
+   */
+  async function announceEscalation(
+    client: ThrottleBrokerClient | null,
+    account: string | null,
+    rolledTo: string | null,
+    triggerAgent: string,
+    armedAtMs: number,
+  ): Promise<void> {
+    deps.log(
+      `[throttle-tier] escalated to wall account=${account ?? '?'} ` +
+        `rolledTo=${rolledTo ?? 'none (all blocked)'}`,
+    )
+    await broadcastDeduped(
+      client,
+      'throttle-escalation',
+      account,
+      renderThrottleEscalationNotice({ account, agent: triggerAgent, rolledTo }),
+    )
+    if (rolledTo) nudgeResume('throttle-escalation-resume', armedAtMs)
+  }
+
   async function fire(
     triggerAgent: string,
     throttledUntilMs: number,
@@ -209,21 +259,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     }
 
     if (escalated) {
-      // The broker corroborated a genuine wall via a live probe and already
-      // ran mark-exhausted + roll (fleet active AND pinned accounts alike).
-      // The RAISING gateway announces — reactive-path doctrine — fleet-
-      // deduped so N gateways sharing the account produce one copy per chat.
-      deps.log(
-        `[throttle-tier] escalated to wall account=${account ?? '?'} ` +
-          `rolledTo=${rolledTo ?? 'none (all blocked)'}`,
-      )
-      await broadcastDeduped(
-        client,
-        'throttle-escalation',
-        account,
-        renderThrottleEscalationNotice({ account, agent: triggerAgent, rolledTo }),
-      )
-      if (rolledTo) nudgeResume('throttle-escalation-resume', armedAtMs)
+      await announceEscalation(client, account, rolledTo, triggerAgent, armedAtMs)
       return
     }
 
@@ -261,8 +297,47 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     }, delayMs)
   }
 
+  async function fireProbeOnly(triggerAgent: string): Promise<void> {
+    const armedAtMs = now()
+    let client: ThrottleBrokerClient | null = null
+    let account: string | null = null
+    let escalated = false
+    let rolledTo: string | null = null
+    try {
+      client = await deps.getBrokerClient()
+      if (client) {
+        // `until` is ignored by the broker in probeOnly mode (nothing is
+        // recorded) but the protocol requires a positive int — pass a nominal.
+        const r = await client.markThrottled(now() + 1, true)
+        account = r.account
+        escalated = r.escalated
+        rolledTo = r.rolledTo ?? null
+      } else {
+        deps.log(
+          `[throttle-tier] broker unreachable — probe-only skipped agent=${triggerAgent}`,
+        )
+      }
+    } catch (err) {
+      deps.log(
+        `[throttle-tier] probe-only markThrottled failed agent=${triggerAgent}: ${(err as Error)?.message ?? err}`,
+      )
+    }
+
+    if (escalated) {
+      await announceEscalation(client, account, rolledTo, triggerAgent, armedAtMs)
+      return
+    }
+
+    // HEALTHY / rate-bounded / broker-down: account-inert. NOTHING else — no
+    // notice, no retry nudge, no throttled_until soft-defer. The calm
+    // rate-limited card the gateway already emitted is the only user-visible
+    // output, exactly as before the escalation probe was wired.
+    deps.log(`[throttle-tier] generic-transient probe-only inert (no wall) agent=${triggerAgent}`)
+  }
+
   return {
     fire,
+    fireProbeOnly,
     inspect: () => ({ noticeState, nudgePending: pendingNudge != null }),
   }
 }

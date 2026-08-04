@@ -174,11 +174,10 @@ const MARK_EXHAUSTED_DEFAULT_MS = 5 * 60 * 60 * 1000;
  * bogus long throttle is clamped rather than lingering in the ledger. */
 const MARK_THROTTLED_MAX_MS = 30 * 60 * 1000;
 
-/** Escalation guard (429 throttle tier): this many transient-429 hits on the
- * same account inside the window trigger a live quota probe; a probe that
- * corroborates a genuine wall converts the throttle into the standard
- * mark-exhausted + fleet roll. */
-const THROTTLE_ESCALATION_HITS = 3;
+/** Escalation window (429 throttle tier): `throttle_hits` older than this are
+ * pruned from the observability ledger on each mark. Bookkeeping only since
+ * #failover-429-corroborate — it no longer gates escalation (the live probe
+ * runs on the FIRST hit, rate-bounded), it just bounds the recorded window. */
 const THROTTLE_ESCALATION_WINDOW_MS = 10 * 60 * 1000;
 
 /** First-hit corroboration rate bound (#failover-429-corroborate): a terminal
@@ -1245,7 +1244,7 @@ export class AuthBroker {
           await this.opMarkExhausted(socket, reqId, identity, req.until);
           break;
         case "mark-throttled":
-          await this.opMarkThrottled(socket, reqId, identity, req.until);
+          await this.opMarkThrottled(socket, reqId, identity, req.until, req.probeOnly);
           break;
         case "refresh-account": {
           const provider: ProviderName = req.provider ?? "anthropic";
@@ -2968,9 +2967,19 @@ export class AuthBroker {
    * so a 429 burst costs ≤1 haiku token/min. Marks within
    * MARK_THROTTLED_MIN_INTERVAL_MS of the previous hit only refresh
    * `throttled_until` (no hit, no probe) — a simultaneous multi-agent burst
-   * counts once and cannot flood probes. THROTTLE_ESCALATION_HITS /
-   * THROTTLE_ESCALATION_WINDOW_MS are retained for window bookkeeping /
-   * observability only; they no longer gate escalation.
+   * counts once and cannot flood probes. THROTTLE_ESCALATION_WINDOW_MS is
+   * retained for window bookkeeping / observability only; it no longer gates
+   * escalation.
+   *
+   * PROBE-ONLY mode (`probeOnly` — #failover-429-corroborate, generic-transient
+   * origin): run ONLY the rate-bounded escalation probe and, iff it corroborates
+   * a wall, the mark-exhausted + roll. Record NOTHING otherwise — no
+   * `throttled_until`, no hit, no soft-defer. A generic-transient 429 (bare
+   * `rate_limit_error` wording that neither names the account nor is proxy-local)
+   * must stay account-inert on a HEALTHY probe: the calm rate-limited card the
+   * gateway already emitted is the only user-visible output, exactly as before
+   * the escalation was ever wired. The shared escalation semantics live in
+   * `maybeEscalateThrottle` so the two entrypoints cannot diverge.
    *
    * Announcement doctrine: an escalated roll is NOT recorded in
    * `last_fleet_roll` — this is a REACTIVE path (see the LastFleetRoll
@@ -2983,6 +2992,7 @@ export class AuthBroker {
     id: string,
     identity: Identity,
     until: number,
+    probeOnly = false,
   ): Promise<void> {
     const account = this.callerAccount(identity);
     if (!account) {
@@ -2991,6 +3001,27 @@ export class AuthBroker {
       return;
     }
     const now = this.now();
+
+    // PROBE-ONLY (generic-transient origin): corroborate WITHOUT recording a
+    // throttle. No throttled_until, no hit, no soft-defer — a healthy probe is
+    // account-inert (its only effect is the silent quota self-heal inside the
+    // probe). Only a corroborated wall converts to mark-exhausted + roll.
+    if (probeOnly) {
+      const { escalated, rolledTo } = await this.maybeEscalateThrottle(account, identity, now);
+      this.audit({ op: "mark-throttled", identity, account, accountKind: "claude", ok: true });
+      socket.write(
+        encodeSuccess(id, {
+          account,
+          // Nothing recorded — echo any pre-existing expiry (else 0) so the
+          // response shape holds; the probe-only caller ignores this field.
+          throttled_until: this.quota[account]?.throttled_until ?? 0,
+          escalated,
+          rolledTo: escalated ? rolledTo : null,
+        }),
+      );
+      return;
+    }
+
     // Clamp: a throttle is minutes, never days. Past/short values still get
     // a floor of now+1s so the entry is observably "throttled right now".
     const throttledUntil = Math.min(
@@ -3025,21 +3056,6 @@ export class AuthBroker {
 
     const hits = priorHits.filter((t) => now - t < THROTTLE_ESCALATION_WINDOW_MS);
     hits.push(now);
-    // #failover-429-corroborate — corroborate on the FIRST hit, not the 3rd.
-    // A terminal transient 429 can be a genuine 5h/7d wall hiding behind
-    // generic/transient wording (the outage-class miss: the old 3-hit
-    // threshold left a dead turn stranded, or never escalated at all when the
-    // retries stopped). So run the live probe on every hit that clears the 5s
-    // re-mark dedup — but RATE-BOUNDED to at most one probe per account per
-    // THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS (plus the single-flight wrapper
-    // in probeThrottleEscalation) so a 429 burst costs ≤1 haiku token/min.
-    // A healthy probe means the 429 really was transient → today's stay-put
-    // behavior is then correct. THROTTLE_ESCALATION_HITS is retained for the
-    // ledger's window bookkeeping / observability only.
-    const lastProbeAt = this.lastEscalationProbeAt[account];
-    const probeAllowed =
-      lastProbeAt === undefined ||
-      now - lastProbeAt >= THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS;
     this.quota[account] = {
       ...entry,
       throttled_until: throttledUntil,
@@ -3050,35 +3066,15 @@ export class AuthBroker {
     this.audit({ op: "mark-throttled", identity, account, accountKind: "claude", ok: true });
     process.stdout.write(
       `auth-broker: mark-throttled ${account} until ${new Date(throttledUntil).toISOString()} ` +
-        `(hit ${hits.length} in window, probe ${probeAllowed ? "allowed" : "rate-bounded"})\n`,
+        `(hit ${hits.length} in window)\n`,
     );
 
-    let escalated = false;
-    let rolledTo: string | null = null;
-    if (probeAllowed) {
-      this.lastEscalationProbeAt[account] = now;
-      const probe = await this.probeThrottleEscalation(account);
-      if (probe.exhausted) {
-        escalated = true;
-        // Clear the hit window — the throttle converted to a durable
-        // exhaustion mark, so the escalation counter starts fresh.
-        this.quota[account] = { ...this.quota[account], throttle_hits: [] };
-        this.persistQuota();
-        process.stdout.write(
-          `auth-broker: throttle-escalation probe corroborates wall on ${account} — mark-exhausted + roll\n`,
-        );
-        this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true, reason: "throttle-escalation" });
-        const roll = await this.markExhaustedAndRoll(account, probe.until ?? undefined, identity);
-        rolledTo = roll.rolledTo;
-        // Deliberately NO recordFleetRoll here — reactive-path doctrine (see
-        // op docstring): the raising gateway announces from this response,
-        // covering pinned-account rolls the fleet channel would skip and
-        // avoiding a double announcement for fleet-active rolls.
-      } else {
-        process.stdout.write(
-          `auth-broker: throttle-escalation probe on ${account} did NOT corroborate a wall — staying throttled\n`,
-        );
-      }
+    const { escalated, rolledTo } = await this.maybeEscalateThrottle(account, identity, now);
+    if (escalated) {
+      // Clear the hit window — the throttle converted to a durable exhaustion
+      // mark, so the escalation counter starts fresh.
+      this.quota[account] = { ...this.quota[account], throttle_hits: [] };
+      this.persistQuota();
     }
     socket.write(
       encodeSuccess(id, {
@@ -3088,6 +3084,55 @@ export class AuthBroker {
         rolledTo: escalated ? rolledTo : null,
       }),
     );
+  }
+
+  /**
+   * #failover-429-corroborate — the shared FIRST-hit corroboration probe, used
+   * by both mark-throttled entrypoints (the account-scoped throttle write and
+   * the generic-transient probe-only path) so they cannot diverge in
+   * escalation semantics.
+   *
+   * A terminal transient 429 can be a genuine 5h/7d wall hiding behind
+   * generic/transient wording. So the live quota probe runs on the FIRST hit
+   * (not the 3rd) — but RATE-BOUNDED to at most one probe per account per
+   * THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS (plus the single-flight wrapper in
+   * probeThrottleEscalation) so a 429 burst costs ≤1 haiku token/min. A healthy
+   * probe means the 429 really was transient → stay put (the caller records or
+   * omits the throttle as appropriate). A corroborated wall converts to the
+   * standard mark-exhausted + fleet roll here; the caller owns any hit-window
+   * bookkeeping around it. Deliberately NO recordFleetRoll — reactive-path
+   * doctrine (see opMarkThrottled docstring): the raising gateway announces
+   * from the response.
+   */
+  private async maybeEscalateThrottle(
+    account: string,
+    identity: Identity,
+    now: number,
+  ): Promise<{ escalated: boolean; rolledTo: string | null }> {
+    const lastProbeAt = this.lastEscalationProbeAt[account];
+    const probeAllowed =
+      lastProbeAt === undefined ||
+      now - lastProbeAt >= THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS;
+    if (!probeAllowed) {
+      process.stdout.write(
+        `auth-broker: throttle-escalation probe on ${account} rate-bounded — skipped\n`,
+      );
+      return { escalated: false, rolledTo: null };
+    }
+    this.lastEscalationProbeAt[account] = now;
+    const probe = await this.probeThrottleEscalation(account);
+    if (!probe.exhausted) {
+      process.stdout.write(
+        `auth-broker: throttle-escalation probe on ${account} did NOT corroborate a wall — staying put\n`,
+      );
+      return { escalated: false, rolledTo: null };
+    }
+    process.stdout.write(
+      `auth-broker: throttle-escalation probe corroborates wall on ${account} — mark-exhausted + roll\n`,
+    );
+    this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true, reason: "throttle-escalation" });
+    const roll = await this.markExhaustedAndRoll(account, probe.until ?? undefined, identity);
+    return { escalated: true, rolledTo: roll.rolledTo };
   }
 
   /**

@@ -690,16 +690,22 @@ export class AuthBrokerClient {
    * 429 throttle tier — record a transient per-account rate limit on the
    * caller's bound account (`throttled_until` in the quota ledger). Never
    * rolls the fleet and never blocks eligibility; the broker's escalation
-   * guard may corroborate repeated hits into a real mark-exhausted (see
+   * guard may corroborate a hit into a real mark-exhausted (see
    * `MarkThrottledData.escalated`). Non-admin, same posture as
    * `markExhausted`.
+   *
+   * `probeOnly` (#failover-429-corroborate, generic-transient origin): run ONLY
+   * the rate-bounded escalation probe — a corroborated wall still escalates
+   * (mark-exhausted + roll), but a healthy probe records NOTHING (no
+   * `throttled_until`, no hit, no soft-defer), keeping the account inert.
    */
-  async markThrottled(until: number): Promise<MarkThrottledData> {
+  async markThrottled(until: number, probeOnly = false): Promise<MarkThrottledData> {
     const data = await this.send({
       v: PROTOCOL_VERSION,
       id: randomUUID(),
       op: "mark-throttled",
       until,
+      ...(probeOnly ? { probeOnly: true } : {}),
     });
     return data as MarkThrottledData;
   }
