@@ -282,6 +282,92 @@ describe('narrative-lane golden — clearActivitySummary finalize', () => {
   })
 })
 
+// ── #4348 — silent-sentinel activity card is SUPPRESSED (deleted, not finalized) ─
+// A turn whose entire user-facing outcome is a bare NO_REPLY / HEARTBEAT_OK
+// (the sentinel-reply-guard dropped the sentinel-only reply, or the flush net
+// classified the captured text as silent) must leave NO visible telemetry card
+// in the chat — most visibly on the forced-synthesis handback turns a
+// background sub-agent injects. A real reply's card must still finalize.
+describe('narrative-lane golden — silent-sentinel card suppression (#4348)', () => {
+  // Open the feed card on a fresh (working) turn FIRST — the card-open gate
+  // (mayOpenActivityCard) won't open one once the answer is already delivered —
+  // then stamp the turn's terminal outcome, exactly as the real turn does:
+  // the card opens mid-work, and lastReplyText / finalAnswerEverDelivered are
+  // only known at turn end.
+  async function openThenClear(over: Partial<CurrentTurn>) {
+    const { lane, calls } = makeLane()
+    const turn = makeLaneTurn(lane)
+    lane.showNarrativeStep(turn, 'Doing the work now')
+    await turn.activityInFlight
+    const cardId = turn.activityMessageId
+    expect(cardId).not.toBeNull()
+    Object.assign(turn, over)
+    lane.clearActivitySummary(turn)
+    await settle()
+    return { calls, cardId, turn }
+  }
+
+  it('reply("NO_REPLY") turn: DELETES the card, never edits a done record', async () => {
+    // The guard drops the sentinel-only reply before chat, but the blocked
+    // tool_use still stamps lastReplyText — the exact `✓ NO_REPLY` noise card.
+    const { calls, cardId, turn } = await openThenClear({
+      replyCalled: true,
+      lastReplyText: 'NO_REPLY',
+      finalAnswerEverDelivered: false,
+    })
+    expect(calls.filter((c) => c.method === 'deleteMessage' && c.message_id === cardId)).toHaveLength(1)
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId)).toHaveLength(0)
+    expect(turn.activityMessageId).toBeNull()
+  })
+
+  it('HEARTBEAT_OK. (trailing punctuation, case-insensitive) is also suppressed', async () => {
+    const { calls, cardId } = await openThenClear({
+      replyCalled: true,
+      lastReplyText: 'heartbeat_ok.',
+      finalAnswerEverDelivered: false,
+    })
+    expect(calls.filter((c) => c.method === 'deleteMessage' && c.message_id === cardId)).toHaveLength(1)
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId)).toHaveLength(0)
+  })
+
+  it('flush path (no reply): prose + trailing NO_REPLY (H6/#2053) is suppressed', async () => {
+    const { calls, cardId } = await openThenClear({
+      replyCalled: false,
+      lastReplyText: '',
+      capturedText: ["Nothing actionable in today's digest.", 'NO_REPLY'],
+      finalAnswerEverDelivered: false,
+    })
+    expect(calls.filter((c) => c.method === 'deleteMessage' && c.message_id === cardId)).toHaveLength(1)
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId)).toHaveLength(0)
+  })
+
+  it('normal reply turn: still FINALIZES the card (edit, no delete)', async () => {
+    // The guarantee the fix must not break: a real answer keeps its record.
+    const { calls, cardId, turn } = await openThenClear({
+      replyCalled: true,
+      lastReplyText: 'The fix is deployed and the tests are green.',
+      finalAnswerEverDelivered: true,
+    })
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId).length)
+      .toBeGreaterThanOrEqual(1)
+    expect(calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+    expect(turn.activityMessageId).toBeNull()
+  })
+
+  it('reply "prose\\nNO_REPLY" that WAS delivered (finalAnswerEverDelivered) keeps its card', async () => {
+    // The guard does NOT drop a reply with non-marker content, so its prose
+    // reached chat — endsWithSilentMarker must NOT suppress a delivered reply.
+    const { calls, cardId } = await openThenClear({
+      replyCalled: true,
+      lastReplyText: 'Here is the full answer to your question.\nNO_REPLY',
+      finalAnswerEverDelivered: true,
+    })
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId).length)
+      .toBeGreaterThanOrEqual(1)
+    expect(calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+  })
+})
+
 // ── THREE-MODULE cross-surface dedup (Amendment 1) ────────────────────────
 // The REAL P4-A handleSessionEvent turn-flush, with the REAL P4-B lane wired
 // into its deps, records the delivered answer into ONE OutboundDedupCache;

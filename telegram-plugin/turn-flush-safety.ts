@@ -136,6 +136,85 @@ export function endsWithSilentMarker(text: string | undefined): boolean {
 }
 
 /**
+ * Inputs for {@link isSilentSentinelCardOutcome} — the fields of the ending
+ * turn the card-suppression gate reads. All are already tracked on the
+ * gateway's `CurrentTurn`; passed as a plain struct so the decision is a pure,
+ * unit-testable core (`gateway.ts` / `narrative-lane.ts` are not importable in
+ * tests).
+ */
+export interface SilentSentinelCardInput {
+  /** True when the model called `reply` / `stream_reply` at least once. */
+  replyCalled: boolean
+  /**
+   * The most-recent `reply` / `stream_reply` `input.text` this turn — empty
+   * string when the reply tool was never called (`CurrentTurn.lastReplyText`).
+   */
+  lastReplyText: string
+  /**
+   * Raw assistant text blocks accumulated across the turn — the same source
+   * `decideTurnFlush` classifies (`CurrentTurn.capturedText`). Only consulted
+   * on the reply-never-called (flush) path.
+   */
+  capturedText: string[]
+  /**
+   * A SUBSTANTIVE final answer reached the user at some point this turn
+   * (`CurrentTurn.finalAnswerEverDelivered`). When true the card is a
+   * legitimate record beside a delivered answer and is NEVER suppressed.
+   */
+  finalAnswerEverDelivered: boolean
+}
+
+/**
+ * Decide whether an ending turn's user-facing outcome was an INTENTIONAL silent
+ * sentinel (NO_REPLY / HEARTBEAT_OK) — the deterministic gate that suppresses
+ * the per-turn activity/telemetry card for a turn that said nothing to the user.
+ *
+ * The symptom (#4348): a background sub-agent handback injects a forced-synthesis
+ * turn, the parent legitimately answers `NO_REPLY`, and the gateway still
+ * finalizes a `🤖 Agent · done · 0 tools · … · ✓ NO_REPLY` card in the chat.
+ * `sentinel-reply-guard-pretool.mjs` already drops the sentinel-only reply so
+ * nothing reaches chat, but the blocked `tool_use` still stamps `lastReplyText`,
+ * and the activity card finalizes as pure noise.
+ *
+ * This reuses the SAME silent-turn predicates the flush safety net and the Stop
+ * hook use — it invents no second notion of "silent":
+ *   - Reply path (`replyCalled`): the model called `reply` with a sentinel-ONLY
+ *     payload, which `sentinel-reply-guard-pretool.mjs` drops before chat, so the
+ *     card's whole outcome is a silence signal that never became a message. Only
+ *     `isSilentFlushMarker` / `isCompositeSilentNoise` count here — a
+ *     `prose\nNO_REPLY` reply is NOT dropped by that guard (it has non-marker
+ *     content), so its prose WAS delivered and its card must stay. `endsWithSilentMarker`
+ *     is deliberately NOT applied to a delivered reply.
+ *   - Flush path (reply never called): the turn's captured terminal text is its
+ *     outcome, so match every shape `decideTurnFlush` treats as `silent-marker` —
+ *     bare marker, composite noise, and prose+trailing-`NO_REPLY` (#2053 / H6).
+ *
+ * The `finalAnswerEverDelivered` short-circuit is the normal-case guarantee: a
+ * turn that actually delivered a substantive answer keeps its card, so a real
+ * reply (even one a later stray `NO_REPLY` follows) is never suppressed.
+ */
+export function isSilentSentinelCardOutcome(input: SilentSentinelCardInput): boolean {
+  // A substantive answer reached the user — the card is a legitimate record.
+  if (input.finalAnswerEverDelivered) return false
+  // Reply-tool outcome: a sentinel-ONLY payload the guard dropped before chat.
+  if (isSilentFlushMarker(input.lastReplyText) || isCompositeSilentNoise(input.lastReplyText)) {
+    return true
+  }
+  // Flush outcome: reply never called; classify the captured terminal text with
+  // the exact predicates decideTurnFlush's `silent-marker` skip uses.
+  if (!input.replyCalled) {
+    const joined = input.capturedText.join('\n\n').trim()
+    if (
+      joined.length > 0 &&
+      (isSilentFlushMarker(joined) || isCompositeSilentNoise(joined) || endsWithSilentMarker(joined))
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
  * Substantive-answer floor (chars, trimmed). Mirrors
  * `final-answer-detect.ts` `FINAL_ANSWER_MIN_CHARS` and
  * `hooks/silent-end-scan.mjs` — the same bar the codebase uses everywhere to
