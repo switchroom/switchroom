@@ -433,3 +433,50 @@ describe('quote_text lands on the wire as ReplyParameters.quote (a String)', () 
     expect(long.startsWith(quote)).toBe(true)
   })
 })
+
+/**
+ * #4368 — a fabricated reply anchor on the wire.
+ *
+ * The model's `reply` tool can quote a SYNTHETIC inbound: a boot-resume /
+ * subagent-handback / cron turn fabricates a `message_id` from `Date.now()`
+ * (~1.78e13). Telegram's `reply_parameters.message_id` HARD-rejects anything
+ * out of the signed-int32 range (400 `field "message_id" must be a valid
+ * Number`), and `allow_sending_without_reply` does NOT bypass that — so quoting
+ * a synthetic id used to 400 EVERY chunk of the reply, losing the answer.
+ *
+ * `executeReply` (whose body is `sendReply`) must route `args.reply_to` through
+ * `parseSourceMessageId` so an out-of-range anchor is DROPPED and the reply
+ * lands UNANCHORED. This reads what actually goes over the wire — a builder-
+ * level assertion would not catch a future opts transform re-introducing it.
+ */
+describe('synthetic reply anchor is dropped on the wire (#4368)', () => {
+  it('quoting an out-of-int32 reply_to sends UNANCHORED and still delivers', async () => {
+    const h = makeHarness()
+    const res = await sendReply(h.deps, {
+      args: {
+        chat_id: CHAT,
+        text: 'The answer must land even when the quoted inbound was synthetic.',
+        reply_to: 1_785_000_000_000,
+      },
+      turn: null,
+    })
+
+    const sends = h.sends()
+    expect(sends.length).toBeGreaterThan(0)
+    // The fabricated id never reaches the wire: no reply_parameters at all …
+    expect(h.replyParams(sends[0])).toBeUndefined()
+    // … and specifically no out-of-range message_id anywhere in the payload.
+    expect(JSON.stringify(sends[0].payload)).not.toContain('1785000000000')
+    // … and the answer actually delivered (not a failure notice).
+    expect(res.content[0]?.text ?? '').toMatch(/sent/i)
+  })
+
+  it('a real (in-range) reply_to is still honored as a quote anchor', async () => {
+    const h = makeHarness()
+    await sendReply(h.deps, {
+      args: { chat_id: CHAT, text: 'ok', reply_to: 4242 },
+      turn: null,
+    })
+    expect(h.replyParams(h.sends()[0])!).toEqual({ message_id: 4242 })
+  })
+})

@@ -11917,7 +11917,7 @@ async function executeSendChecklist(args: Record<string, unknown>): Promise<{ co
   const tasks = args.tasks as Array<{ text: string; done?: boolean }> | undefined
   if (!Array.isArray(tasks) || tasks.length === 0) throw new Error('send_checklist: tasks must be a non-empty array')
   const threadId = args.message_thread_id != null ? Number(args.message_thread_id) : undefined
-  const replyTo = args.reply_to != null ? Number(args.reply_to) : undefined
+  const replyTo = parseSourceMessageId(args.reply_to as string | number | null | undefined) ?? undefined // #4368: drop a fabricated/out-of-int32 anchor so the send lands unanchored, not 400
   const protectContent = args.protect_content === true
 
   assertAllowedChat(chat_id)

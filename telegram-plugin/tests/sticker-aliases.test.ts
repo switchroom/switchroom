@@ -230,3 +230,46 @@ describe('resolveGifSendArgs', () => {
     expect(r.replyTo).toBe(88)
   })
 })
+
+// #4368 — a fabricated reply anchor (a synthetic boot-resume/handback/cron
+// inbound id at `Date.now()` scale, ~1.78e13) is out of the signed-int32 range
+// Telegram accepts for `reply_parameters.message_id`. It must be DROPPED at the
+// resolver boundary so the sticker/GIF still sends (unanchored) rather than the
+// agent's echoed synthetic id 400ing the whole send. Before the fix these
+// resolvers ran `Number(raw.reply_to)`, which is finite and > 0 for a 13-digit
+// timestamp, so the fabricated id passed straight through onto the wire.
+const SYNTHETIC_MESSAGE_ID = String(1_785_000_000_000)
+
+describe('resolveStickerSendArgs — synthetic reply anchor (#4368)', () => {
+  it('drops an out-of-int32 reply_to so the sticker sends unanchored', () => {
+    const r = resolveStickerSendArgs(
+      { chat_id: '1', sticker: SAMPLE_FILE_ID, reply_to: SYNTHETIC_MESSAGE_ID },
+      {},
+    )
+    expect(r.replyTo).toBeUndefined()
+  })
+
+  it('still preserves a real (in-range) reply_to', () => {
+    const r = resolveStickerSendArgs(
+      { chat_id: '1', sticker: SAMPLE_FILE_ID, reply_to: '4242' },
+      {},
+    )
+    expect(r.replyTo).toBe(4242)
+  })
+})
+
+describe('resolveGifSendArgs — synthetic reply anchor (#4368)', () => {
+  it('drops an out-of-int32 reply_to so the GIF sends unanchored', () => {
+    const r = resolveGifSendArgs({
+      chat_id: '1',
+      gif: SAMPLE_FILE_ID,
+      reply_to: SYNTHETIC_MESSAGE_ID,
+    })
+    expect(r.replyTo).toBeUndefined()
+  })
+
+  it('still preserves a real (in-range) reply_to', () => {
+    const r = resolveGifSendArgs({ chat_id: '1', gif: SAMPLE_FILE_ID, reply_to: '4242' })
+    expect(r.replyTo).toBe(4242)
+  })
+})

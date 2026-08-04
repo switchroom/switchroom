@@ -106,6 +106,21 @@ describe('validateAskUserArgs — optional fields', () => {
     const r = validateAskUserArgs({ chat_id: '1', question: 'q', options: ['a', 'b'], reply_to: '99' })
     expect(r.replyTo).toBe(99)
   })
+
+  // #4368 — a fabricated reply anchor (a synthetic boot-resume/handback/cron
+  // inbound id at `Date.now()` scale) is out of the signed-int32 range Telegram
+  // accepts for `reply_parameters.message_id`. It must be DROPPED so the
+  // ask_user prompt still sends (unanchored) rather than 400ing the whole send.
+  // Before the fix `Number(args.reply_to)` let a 13-digit id through unchanged.
+  it('drops an out-of-int32 reply_to so the prompt sends unanchored (#4368)', () => {
+    const r = validateAskUserArgs({
+      chat_id: '1',
+      question: 'q',
+      options: ['a', 'b'],
+      reply_to: String(1_785_000_000_000),
+    })
+    expect(r.replyTo).toBeUndefined()
+  })
 })
 
 describe('validateAskUserArgs — timeout clamping', () => {

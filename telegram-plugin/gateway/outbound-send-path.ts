@@ -73,6 +73,7 @@ import { getBuzzMirror } from './buzz-mirror.js'
 import { isFinalAnswerReply, isSubstantiveFinalReply, shouldJournalReplySiteDelivery } from '../final-answer-detect.js'
 import { decideOverPing, type OverPingDecision } from '../over-ping-safety-net.js'
 import { decideSilentReplyAnchor } from '../silent-reply-anchor.js'
+import { parseSourceMessageId } from './source-message-id.js'
 import {
   decideSupersedeCorrection,
   flushedAnswerMatchesReply,
@@ -1343,7 +1344,14 @@ export async function sendReply(
 
   const files = (args.files as string[] | undefined) ?? []
   const quoteOptIn = args.quote !== false
-  let reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+  // #4368 — the model's reply tool can quote a synthetic inbound (a boot-
+  // resume/handback/cron fabricated id at `Date.now()` scale). Route it through
+  // the canonical guard so an out-of-int32 anchor is DROPPED (send lands
+  // unanchored) rather than 400ing every chunk on `reply_parameters.message_id`.
+  // A later `reply_to = latest` (quote-opt-in default) is a Telegram-returned
+  // id and needs no re-check. Also closes the pre-existing NaN hole: a non-
+  // numeric `reply_to` used to coerce to NaN and still build the anchor.
+  let reply_to = parseSourceMessageId(args.reply_to as string | number | null | undefined) ?? undefined
   const protectContent = args.protect_content === true
   const quoteText = args.quote_text as string | undefined
   const access = loadAccess()
