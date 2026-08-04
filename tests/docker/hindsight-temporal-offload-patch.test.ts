@@ -52,11 +52,12 @@
  *
  * SKIP DISCIPLINE: identical to `hindsight-temporal-language-patch.test.ts`.
  * Locally, with no docker or no cached image, this skips (never pull a 6.4GB
- * third-party image onto a dev box). In CI the `hindsight-probe` job pulls the
- * pinned digest and sets `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1`, under which an
- * unavailable docker/image is a HARD FAILURE, never a green skip. Both runs
- * assert a `PROBE_EXECUTED` sentinel so a probe that dies early can never be
- * mistaken for a pass.
+ * third-party image onto a dev box). In CI the `hindsight-probe` job
+ * (`.github/workflows/docker-e2e.yml`) pulls the pinned digest and runs this
+ * suite in its own dedicated step under `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1`,
+ * under which an unavailable docker/image is a HARD FAILURE, never a green skip.
+ * Both runs assert a `PROBE_EXECUTED` sentinel so a probe that dies early can
+ * never be mistaken for a pass.
  */
 
 import { describe, it, expect, afterAll } from "vitest";
