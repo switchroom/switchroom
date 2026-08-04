@@ -164,8 +164,25 @@ export const ownershipRuntime = {
         // LC_ALL=C pins chown's stderr wording so the race classifier below
         // is deterministic across hosts/locales (busybox + GNU both honour it).
         env: { ...process.env, LC_ALL: "C" },
+        // Generous maxBuffer (#4365). A churning tree can emit MANY per-file
+        // ENOENT lines; the default 1 MB cap makes execFileSync SIGTERM-KILL
+        // chown mid-walk (status===null, signal set) and TRUNCATE stderr. A
+        // truncated all-ENOENT tail is not evidence a real EPERM didn't follow,
+        // so overflow would defeat the fail-closed classifier below. 64 MB is
+        // far past any realistic churn so normal races never truncate.
+        maxBuffer: 64 * 1024 * 1024,
       });
     } catch (err) {
+      // Fail CLOSED on abnormal termination (#4365). execFileSync reports a
+      // clean non-zero EXIT as a numeric `.status` with no `.signal`; a
+      // maxBuffer overflow (or any kill) instead sets `.signal` and leaves
+      // `.status` null — and its captured stderr is TRUNCATED. An all-ENOENT
+      // tail of truncated stderr is NOT proof the run was a pure vanished-file
+      // race (a real EPERM could have been emitted past the cutoff), so the
+      // ENOENT-swallow is valid ONLY for a normal exited-non-zero chown with
+      // complete stderr. Re-throw anything else before classifying.
+      const e = err as { status?: number | null; signal?: string | null } | null | undefined;
+      if (e?.signal != null || typeof e?.status !== "number") throw err;
       // chown -R exits non-zero if ANY entry failed. During a live rollout the
       // agent's own workspace may be churning (a mid-test Postgres data dir,
       // a git checkout, node_modules) so inodes vanish between chown's readdir
@@ -186,8 +203,13 @@ export const ownershipRuntime = {
    */
   chownShallow: (uid: number, gid: number, paths: string[]): void => {
     if (paths.length === 0) return;
-    execFileSync("chown", ["-h", `${uid}:${gid}`, ...paths], {
+    // `--` end-of-options guard + LC_ALL=C mirror chownTree's hardening
+    // (#4366): a path beginning with `-` must not be parsed as a flag, and the
+    // pinned locale keeps chown's stderr wording stable across hosts. This
+    // helper has no race classifier and deliberately doesn't grow one here.
+    execFileSync("chown", ["-h", "--", `${uid}:${gid}`, ...paths], {
       stdio: ["ignore", "ignore", "pipe"],
+      env: { ...process.env, LC_ALL: "C" },
     });
   },
   /**
