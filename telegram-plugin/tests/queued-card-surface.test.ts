@@ -260,3 +260,69 @@ describe('Part B — handback-while-busy: exactly one card, never a frozen "Queu
     expect(rec.edits).toHaveLength(0)
   })
 })
+
+describe('Part B — synthetic (fabricated) message ids never 400 the queued card', () => {
+  /** Recording bot that enforces the REAL Telegram Bot API contract on
+   *  `reply_parameters.message_id`: anything non-integer or beyond signed int32
+   *  is hard-rejected with the exact 400 the live gateway hit
+   *  (gateway-supervisor.log 2026-08-04, msg=1785846295635) — BEFORE recording,
+   *  exactly like the wire call. `allow_sending_without_reply` does not bypass
+   *  the range check, only the message-not-found case. */
+  function withTelegramStrictBot(h: Harness) {
+    const sends: SendRec[] = []
+    let nextId = 9001
+    ;(h.deps as unknown as { bot: unknown }).bot = {
+      api: {
+        sendRichMessage: async (chatId: string, msg: { markdown: string }, opts: Record<string, unknown>) => {
+          const rp = opts.reply_parameters as { message_id?: unknown } | undefined
+          if (rp != null) {
+            const mid = rp.message_id
+            if (typeof mid !== 'number' || !Number.isInteger(mid) || mid <= 0 || mid >= 2 ** 31) {
+              throw new Error(
+                `Call to 'sendRichMessage' failed! (400: Bad Request: field "message_id" must be a valid Number)`,
+              )
+            }
+          }
+          const id = nextId++
+          sends.push({ chatId, markdown: msg.markdown, opts, id })
+          return { message_id: id }
+        },
+        editMessageText: async () => true,
+        deleteMessage: async () => true,
+      },
+    }
+    return { sends }
+  }
+
+  it('sends the queued card UNANCHORED (no 400) when the parked message id is a fabricated Date.now() timestamp', async () => {
+    const h = makeHarness()
+    const rec = withTelegramStrictBot(h)
+
+    // Turn A mints on an idle session.
+    handleSessionEvent(h.deps, enqueue('501'))
+    expect(rec.sends).toHaveLength(0)
+
+    // A synthetic enqueue (subagent handback / boot resume) parks mid-turn with
+    // a fabricated ms-timestamp message id — finite, but NOT a Telegram id.
+    handleSessionEvent(h.deps, enqueue('1785846295635', 'handback: worker done'))
+    await settle()
+    expect(__parkedTurnStartCountForTest()).toBe(1)
+
+    // The card SENT (no 400 — RED on the pre-fix guard, which forwarded the
+    // 13-digit id into reply_parameters and lost the whole card)…
+    expect(rec.sends).toHaveLength(1)
+    // …and it sent WITHOUT reply-linkage: no reply_parameters at all.
+    expect(rec.sends[0]!.opts.reply_parameters).toBeUndefined()
+  })
+
+  it('still reply-anchors when the parked message id is a real Telegram id', async () => {
+    const h = makeHarness()
+    const rec = withTelegramStrictBot(h)
+
+    handleSessionEvent(h.deps, enqueue('501'))
+    handleSessionEvent(h.deps, enqueue('502', 'real mid-turn message'))
+    await settle()
+    expect(rec.sends).toHaveLength(1)
+    expect((rec.sends[0]!.opts.reply_parameters as { message_id: number }).message_id).toBe(502)
+  })
+})
