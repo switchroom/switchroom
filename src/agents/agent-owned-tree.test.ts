@@ -40,6 +40,27 @@ function chownError(stderr: string): Error & { status: number; stderr: Buffer } 
   return err;
 }
 
+/**
+ * Fabricate the shape execFileSync throws when it SIGTERM-kills the child for
+ * exceeding maxBuffer (#4365): `status === null`, `.signal` set, and the
+ * captured stderr TRUNCATED (here, an all-ENOENT tail — the trap the classifier
+ * must not be fooled by).
+ */
+function chownKilledError(
+  stderr: string,
+  signal: string = "SIGTERM",
+): Error & { status: null; signal: string; stderr: Buffer } {
+  const err = new Error("stderr maxBuffer length exceeded") as Error & {
+    status: null;
+    signal: string;
+    stderr: Buffer;
+  };
+  err.status = null;
+  err.signal = signal;
+  err.stderr = Buffer.from(stderr);
+  return err;
+}
+
 describe("isChownVanishedRaceOnly", () => {
   it("returns true when EVERY stderr line is a vanished-file (ENOENT) error", () => {
     const stderr =
@@ -137,5 +158,66 @@ describe("ownershipRuntime.chownTree ENOENT-race tolerance", () => {
     expect(cmd).toBe("chown");
     expect(args).toEqual(["-h", "-R", "--", "10001:10001", "/a"]);
     expect((opts as { env: Record<string, string> }).env.LC_ALL).toBe("C");
+  });
+
+  it("passes a generous maxBuffer so churn stderr never truncates (#4365 part 1)", () => {
+    execFileSyncMock.mockReturnValue(Buffer.from(""));
+    ownershipRuntime.chownTree(10001, 10001, "/a");
+    const [, , opts] = execFileSyncMock.mock.calls[0];
+    // Explicit and far above the 1 MB default that let a churning tree
+    // SIGTERM-kill chown mid-walk.
+    expect((opts as { maxBuffer?: number }).maxBuffer).toBeGreaterThanOrEqual(
+      64 * 1024 * 1024,
+    );
+  });
+
+  it("RE-THROWS a maxBuffer-kill even when the TRUNCATED stderr is all-ENOENT (#4365 part 2, fail-closed)", () => {
+    // The incident's poison shape: >1 MB of churn ENOENT stderr overflows
+    // maxBuffer, execFileSync SIGTERM-kills chown (status===null, signal set),
+    // and the stderr we could classify is TRUNCATED — a real EPERM may have
+    // followed past the cutoff. Swallowing on the all-ENOENT tail would wrongly
+    // declare a benign race. Pre-fix (no signal/null-status guard) this stderr
+    // classifies as a pure race and the throw is SWALLOWED — the test goes red.
+    execFileSyncMock.mockImplementation(() => {
+      throw chownKilledError(
+        "chown: cannot access '/a/workspace/pgdata/16384': No such file or directory\n" +
+          "chown: cannot access '/a/workspace/pgdata/pg_wal/x': No such file or directory\n",
+      );
+    });
+    let caught: (Error & { signal?: string }) | undefined;
+    try {
+      ownershipRuntime.chownTree(10001, 10001, "/a");
+    } catch (e) {
+      caught = e as Error & { signal?: string };
+    }
+    expect(caught).toBeDefined();
+    // The ORIGINAL kill error is re-thrown intact (signal preserved) so the
+    // upstack #3168 "could not restore ownership" wrap fires loudly.
+    expect(caught?.signal).toBe("SIGTERM");
+  });
+});
+
+describe("ownershipRuntime.chownShallow hardening (#4366)", () => {
+  beforeEach(() => {
+    execFileSyncMock.mockReset();
+    execFileSyncMock.mockReturnValue(Buffer.from(""));
+  });
+
+  it("passes the `--` end-of-options guard before the owner spec", () => {
+    ownershipRuntime.chownShallow(10001, 10001, ["/a/-weird", "/a/start.sh"]);
+    const [cmd, args] = execFileSyncMock.mock.calls[0];
+    expect(cmd).toBe("chown");
+    expect(args).toEqual(["-h", "--", "10001:10001", "/a/-weird", "/a/start.sh"]);
+  });
+
+  it("pins LC_ALL=C on the invocation, mirroring chownTree", () => {
+    ownershipRuntime.chownShallow(10001, 10001, ["/a/start.sh"]);
+    const [, , opts] = execFileSyncMock.mock.calls[0];
+    expect((opts as { env: Record<string, string> }).env.LC_ALL).toBe("C");
+  });
+
+  it("is a no-op with no paths (never shells chown)", () => {
+    ownershipRuntime.chownShallow(10001, 10001, []);
+    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 });
