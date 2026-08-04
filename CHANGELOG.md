@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.20.7 — Claude CLI 2.1.221 (closes a zsh permission-bypass) and a delivery-time represent re-check that stops duplicate answers
+
+Security + reliability (2026-08-04): the fleet's pinned claude-code moves to
+2.1.221, closing a Bash-tool permission-check bypass, and the
+obligation-represent net no longer replays an answer that already landed.
 
 ### Claude CLI pinned 2.1.219 → 2.1.221
 
@@ -39,6 +43,35 @@ redeliver predicate fails open — if the busy/idle signal can't be resolved,
 delivery still proceeds — so the fix removes the duplicate without introducing
 a new silent-drop path. (Covers PR #4341, which merged without its own
 changelog entry.)
+
+### Hindsight temporal extraction moved off the shared event loop and bounded (#4344)
+
+`dateparser.search_dates()` ran synchronously on the single asyncio loop that
+recall, consolidation, and the reranker all share, so one extraction blocked
+every other in-flight operation — 186 `EVENT LOOP BLOCKED` events in 4.5h (p50
+1.36s, max 14.95s), driven by consolidation feeding multi-KB memory text (cost
+is linear in input length × date density). The blocking code lives in the
+upstream `vectorize-io/hindsight` image, so the fix is a new anchored patch
+block in `docker/Dockerfile.hindsight` (same shape as the existing patches —
+`count==1` anchors that fail the build on upstream reformat, plus RED/GREEN
+behavioral tests):
+
+- **Temporal extraction now runs off the loop.** It executes in a dedicated
+  single-worker `ThreadPoolExecutor` awaited via `run_in_executor` at the one
+  async call site, collapsing a multi-second uninterruptible stall into ~5ms
+  scheduler slices. dateparser holds the GIL during matching, so this bounds
+  rather than eliminates loop pressure — the loop-lag probe asserts that
+  outcome, not a code grep.
+- **Input to `search_dates` is bounded.** A new override-only knob
+  `HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS` (default 2000) caps the query fed to
+  `search_dates`, gating only the temporal retrieval arm — semantic, BM25, and
+  graph retrieval still see the full query. The v0.20.3 #4313 language pin is
+  preserved.
+
+A CI step in the `hindsight-probe` job runs the loop-lag probe under
+`SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1` so it can't green-skip. Requires an image
+rebuild + a `switchroom-hindsight` restart; rollback via
+`HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS=0`.
 
 ## v0.20.6 — Telegram pin cleanup self-heals again: the boot sweep reseeds its discharged cursor
 
