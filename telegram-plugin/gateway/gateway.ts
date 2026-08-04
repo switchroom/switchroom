@@ -497,7 +497,7 @@ import {
   type ReplyOwnerTier, type ReplyOwnerCandidates,
   type AnswerDeliveredLatch,
 } from '../reply-owner-resolve.js'
-import { SubagentHandbackMarker } from './subagent-handback-marker.js'
+import { SubagentHandbackMarker, cliTaskNotifLedger } from './subagent-handback-marker.js'
 // PR A — deterministic answer-ready quiescence flush (late-delivery fix).
 import { AnswerReadyFlushController, resolveAnswerReadyFlushMs, resolveAnswerStageMs } from '../answer-ready-flush.js'
 // #1667 — pure decision core for the turn_end answer-delivery gate (#1664).
@@ -10693,6 +10693,7 @@ if (isGatewayMain) ipcServer = createIpcServer({
       }
     }
     const ev = msg.event as unknown as SessionEvent
+    if (ev.kind === 'task_notification') cliTaskNotifLedger.record(ev.taskId, ev.status, Date.now()) // double-wake dedup — ledger doc in subagent-handback-marker.ts
     // #1122/#1126: session events used to be ingested into the pinned progress
     // card here (`progressDriver.ingest`). The card is retired and the driver
     // is permanently null, so that call was a dead no-op — removed. Session
@@ -24372,11 +24373,12 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
                   // deterministic dedup key — closes the #1719
                   // re-fire-on-restart class.
                   jsonlAgentId: agentId,
+                  cliTaskNotificationSeen: cliTaskNotifLedger.seenRecently(agentId, Date.now()), // double-wake dedup, fail-open — ledger doc in subagent-handback-marker.ts
                 })
                 if (!decision.deliver) {
-                  if (decision.reason === 'no-chat') {
+                  if (decision.reason === 'no-chat' || decision.reason === 'cli-task-notification') {
                     process.stderr.write(
-                      `telegram gateway: subagent-handback ${agentId} — no chat to deliver to; skipped\n`,
+                      `telegram gateway: subagent-handback ${agentId} skipped — ${decision.reason === 'no-chat' ? 'no chat to deliver to' : 'CLI task-notification already woke the parent for this completion (double-wake dedup)'}\n`,
                     )
                   }
                   return

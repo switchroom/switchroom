@@ -220,6 +220,100 @@ export function stampsHandbackMarker(source: string | null | undefined): boolean
  */
 export const HANDBACK_RECENCY_WINDOW_MS = 60_000
 
+// ───────────────────────────────────────────────────────────────────────────
+// CLI task-notification dedup ledger (double-wake fix, v0.20.8 candidate)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// One background sub-agent completion used to produce TWO independent wakes of
+// the parent session:
+//   1. The claude CLI's OWN `<task-notification>` — the CLI proactively
+//      enqueues it into the parent session when a backgrounded task/agent
+//      completes (projected as a `task_notification` SessionEvent at the
+//      queue-operation enqueue line, session-tail.ts). The parent wakes,
+//      sees the notification + summary, and typically reports to the user.
+//   2. The gateway-synthesized `subagent_handback` inbound (subagent-watcher
+//      `onFinish` → pendingInboundBuffer.push) — switchroom's deliberate
+//      beat-4 wake, added because older CLIs surfaced a background result
+//      only on the parent's NEXT user turn.
+// Nothing linked them, so a single completion fanned out to two turns and two
+// user-visible replies. The CLI-native wake cannot be suppressed (it is the
+// CLI's internal queue); the ONE lever switchroom holds is the handback
+// enqueue. This ledger records every terminal `<task-notification>` the
+// session tail observes, keyed by its `<task-id>` — which is EXACTLY the
+// sub-agent watcher's `agentId` (both are the `agent-<id>.jsonl` stem;
+// verified against live transcripts: `<task-id>a204deeaedb27b580</task-id>`
+// ↔ `subagents/agent-a204deeaedb27b580.jsonl`). `decideSubagentHandback`
+// then skips the redundant handback ONLY on an exact-id hit inside a short
+// TTL.
+//
+// FAIL-OPEN by construction — every uncertain path DELIVERS the handback:
+//   - no notification seen for this exact id → deliver (a dropped real wake
+//     means a silent worker and a user waiting forever; an occasional double
+//     is strictly better);
+//   - notification older than the TTL → deliver (a resumed worker's second
+//     completion must not be swallowed by its first completion's entry);
+//   - non-terminal notification status → never recorded, so → deliver;
+//   - gateway restart (ledger is in-memory) → boot-replayed handbacks
+//     deliver;
+//   - the CLI notification landing AFTER the handback enqueue (lost race) →
+//     deliver (the residual occasional double, accepted).
+// The liveness consumer (background-shell-liveness.ts) is untouched: the same
+// `task_notification` event still drives noteBackgroundShellDead —
+// recording here is an independent, additive read of the event.
+
+/**
+ * How long a recorded terminal `<task-notification>` suppresses the matching
+ * `subagent_handback`. The real gap between the CLI's notification enqueue
+ * and the watcher's `onFinish` (its ~1s jsonl rescan) is a few seconds; 30s
+ * covers scheduler jitter with a wide margin while staying far below any
+ * plausible resume-and-complete-again cycle for the same agent id, so a
+ * resumed worker's second completion falls outside the window → fail-open.
+ */
+export const TASK_NOTIFICATION_DEDUP_TTL_MS = 30_000
+
+/** `<task-notification>` statuses that mean the task genuinely ended and the
+ *  CLI woke (or will wake) the parent with the completion. Mirrors the
+ *  liveness consumer's terminal set (background-shell-liveness.ts). */
+const NOTIF_TERMINAL_STATUSES = new Set(['completed', 'failed', 'killed'])
+
+/**
+ * In-memory seen-set of terminal CLI `<task-notification>` task ids.
+ * Deliberately process-local: absence after a restart fails open (deliver).
+ */
+export class CliTaskNotificationLedger {
+  private readonly seen = new Map<string, number>()
+
+  /** Record a parsed `task_notification` session event. Non-terminal
+   *  statuses and empty ids are ignored (they must never suppress). */
+  record(taskId: string, status: string, now: number): void {
+    if (taskId.length === 0 || !NOTIF_TERMINAL_STATUSES.has(status)) return
+    this.seen.set(taskId, now)
+    // Bounded: prune expired entries on write so the map tracks only the
+    // live window (a handful of ids), never the process lifetime.
+    for (const [id, ts] of this.seen) {
+      if (now - ts > TASK_NOTIFICATION_DEDUP_TTL_MS) this.seen.delete(id)
+    }
+  }
+
+  /** True iff a terminal notification for EXACTLY `taskId` was recorded
+   *  within the TTL. Anything else → false → the handback delivers. */
+  seenRecently(taskId: string, now: number): boolean {
+    const ts = this.seen.get(taskId)
+    return ts != null && now - ts <= TASK_NOTIFICATION_DEDUP_TTL_MS
+  }
+}
+
+/**
+ * The gateway's process-wide ledger instance (one gateway process per agent,
+ * one main session — a module singleton keeps the gateway.ts wiring to two
+ * lines under the anti-inflation ratchet, #2996). Written at the gateway's
+ * `onSessionEvent` (OUTSIDE the currentTurn guard — the CLI enqueues the
+ * notification while the parent is typically idle with no live gateway turn);
+ * read at the `onFinish` handback decide site. Tests construct their own
+ * `CliTaskNotificationLedger` instances.
+ */
+export const cliTaskNotifLedger = new CliTaskNotificationLedger()
+
 /** Sentinel thread key for the no-thread (DM / bare-chat) lane. */
 const MAIN_THREAD_KEY = '<main>'
 

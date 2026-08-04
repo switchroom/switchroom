@@ -183,6 +183,17 @@ export interface SubagentHandbackDecisionInput {
    *  the built inbound's `meta.subagent_jsonl_id`. See
    *  `SubagentHandbackContext.jsonlAgentId` for the dedup rationale. */
   jsonlAgentId?: string
+  /**
+   * Double-wake dedup (v0.20.8 candidate): true iff the session tail already
+   * observed a TERMINAL CLI `<task-notification>` for EXACTLY this sub-agent's
+   * task id within `TASK_NOTIFICATION_DEDUP_TTL_MS` — i.e. the CLI itself has
+   * already woken (or queued the wake of) the parent with this completion, so
+   * a second gateway-synthesized wake would duplicate it. The caller resolves
+   * this from `CliTaskNotificationLedger.seenRecently(agentId, now)`
+   * (subagent-handback-marker.ts). FAIL-OPEN: omitted/false → deliver; only a
+   * confirmed exact-id in-window hit suppresses.
+   */
+  cliTaskNotificationSeen?: boolean
   /** Deterministic clock for tests. */
   nowMs?: number
 }
@@ -192,6 +203,7 @@ export type SubagentHandbackSkipReason =
   | 'env-disabled'
   | 'outcome-not-terminal'
   | 'foreground'
+  | 'cli-task-notification'
   | 'no-chat'
 
 export type SubagentHandbackDecision =
@@ -208,7 +220,12 @@ export type SubagentHandbackDecision =
  *      stale historical-at-boot row, not a fresh completion.
  *   3. foreground — a foreground sub-agent already handed its result
  *      back as the Task tool result in the parent's own turn.
- *   4. no-chat — neither the fleet entry nor the owner chat resolved,
+ *   4. cli-task-notification — the claude CLI's OWN `<task-notification>`
+ *      for exactly this task id was already observed in-window, so the CLI
+ *      has already woken the parent with this completion; a second
+ *      gateway-synthesized wake would double it (the double-message bug).
+ *      Fail-open: only a confirmed exact-id hit skips.
+ *   5. no-chat — neither the fleet entry nor the owner chat resolved,
  *      so there is nowhere to deliver.
  */
 export function decideSubagentHandback(
@@ -222,6 +239,9 @@ export function decideSubagentHandback(
   }
   if (!input.isBackground) {
     return { deliver: false, reason: 'foreground' }
+  }
+  if (input.cliTaskNotificationSeen === true) {
+    return { deliver: false, reason: 'cli-task-notification' }
   }
   const chatId = input.fleetChatId || input.ownerChatId
   if (!chatId) {
