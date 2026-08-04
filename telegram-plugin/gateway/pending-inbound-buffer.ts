@@ -155,7 +155,19 @@ export function redeliverBufferedInbound(
     // has landed since the sweep decided it is stale — drop it rather than hand
     // a duplicate to the CLI queue. Ack the spool so it is not boot-replayed and
     // do NOT re-buffer. The gateway closure closes the ledger + logs the retract.
-    if (buffer.beforeRedeliver != null && !buffer.beforeRedeliver(merged)) {
+    // FAIL-OPEN: a throwing predicate must never silence or lose a real message,
+    // nor abort the drain loop (which would strand every following message and
+    // crash the setInterval tick). On throw we treat it as "deliver".
+    let proceed = true
+    if (buffer.beforeRedeliver != null) {
+      try {
+        proceed = buffer.beforeRedeliver(merged)
+      } catch (e) {
+        proceed = true
+        process.stderr.write(`redeliver beforeRedeliver threw — failing open (deliver): ${String(e)}\n`)
+      }
+    }
+    if (!proceed) {
       for (const o of originals) spool?.ack(o)
       retracted += originals.length
       continue

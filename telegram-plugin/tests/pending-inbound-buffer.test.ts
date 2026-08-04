@@ -815,3 +815,37 @@ describe('redeliverBufferedInbound + F1 delivery-time represent re-check', () =>
     expect(ledger.isOpen(ORIGIN)).toBe(true) // still open — the represent will be answered
   })
 })
+
+/**
+ * FAIL-OPEN safety: a `beforeRedeliver` predicate that THROWS must never silence
+ * or lose a real message, nor abort the drain loop. The throw is swallowed, the
+ * message is treated as "deliver", and every following buffered message in the
+ * same drain is still delivered. This test fails if the try/catch around the
+ * predicate is removed (the throw would propagate out of redeliverBufferedInbound).
+ */
+describe('redeliverBufferedInbound — beforeRedeliver fail-open on throw', () => {
+  it('delivers the message and the rest of the drain when the predicate throws', () => {
+    const buf = createPendingInboundBuffer({
+      log: () => {},
+      beforeRedeliver: () => {
+        throw new Error('guard boom')
+      },
+    })
+    buf.push('a', inbound('cron', 1))
+    buf.push('a', inbound('vault_grant_approved', 2))
+
+    const seen: number[] = []
+    // Must not throw — the loop completes past a throwing predicate.
+    const r = redeliverBufferedInbound(buf, 'a', (m) => {
+      seen.push(m.messageId as number)
+      return true
+    })
+
+    expect(seen).toEqual([1, 2]) // both delivered, loop not aborted
+    expect(r.drained).toBe(2)
+    expect(r.redelivered).toBe(2) // failed open → delivered, not dropped
+    expect(r.retracted).toBe(0) // a throw is NOT a retract
+    expect(r.rebuffered).toBe(0)
+    expect(buf.depth('a')).toBe(0) // nothing stranded
+  })
+})
