@@ -461,7 +461,7 @@ import {
   type SendReplyGatewayDeps,
   type DeliverCapturedProseDeps,
 } from './outbound-send-path.js'
-import { handleSessionEvent as handleSessionEventCore, drainParkedTurnStartsForChat, closeFlushCompletionWindows } from './stream-render.js'
+import { handleSessionEvent as handleSessionEventCore, drainParkedTurnStartsForChat, closeFlushCompletionWindows, parkedTurnStartCount } from './stream-render.js'
 import { createNarrativeLane } from './narrative-lane.js'
 import {
   parseAgentCallback,
@@ -659,6 +659,7 @@ import { handleRequestDriveApproval } from './drive-write-approval.js'
 import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
+import { makeRepresentRedeliveryGuard, makeSessionBusyDrainDeferral } from './represent-delivery-guard.js'
 import { isCronIdentity, isCronInjectFire, deliverInjectWithFallback, replyCallerIsForeignSession } from './cron-session.js'
 import {
   ObligationLedger,
@@ -9788,6 +9789,11 @@ const pendingInboundBuffer = createPendingInboundBuffer({
   // enqueue chokepoint so a boot-replayed handback (not just the live synthesis
   // push) populates it. Every `subagent_handback` push funnels through here.
   onHandbackEnqueue: (chatId, threadId, ts) => subagentHandbackMarker.record(chatId, threadId, ts),
+  // F1 (fix/represent-double-send-delivery-recheck) — delivery-time represent
+  // retract. Every drain path hands its buffered inbounds through this gate; a
+  // stale `obligation_represent` (its reply landed since the sweep decided it) is
+  // dropped here rather than duplicated into the CLI queue. See represent-delivery-guard.ts.
+  beforeRedeliver: makeRepresentRedeliveryGuard({ enabled: OBLIGATION_LEDGER_ENABLED, historyEnabled: HISTORY_ENABLED, ledger: obligationLedger, hasOutboundDeliveredSince, minReplyChars: OBLIGATION_REPRESENT_GUARD_MIN_REPLY_CHARS, log: (l) => process.stderr.write(l) }),
 })
 
 // PR2 obligation-ledger idle sweep. Re-present an OPEN obligation only at a
@@ -11742,30 +11748,19 @@ if (isGatewayMain) (() => {  // #2996 P0c: gated — starts webhook-ingest UDS s
 })()
 
 // ─── Opportunistic idle-drain of pendingInboundBuffer ─────────────────────
-// pendingInboundBuffer otherwise drains only on (a) bridge re-register
-// (onClientRegistered) or (b) the silence-poke framework fallback
-// clearing a wedged turn (#1546). NEITHER fires when a message is
-// buffered during a bridge-IPC flap that then settles with no
-// subsequent clean re-register AND claude is idle (no active turn →
-// silence-poke never arms). The message orphans until a manual restart
-// (finn, 2026-05-19 — buffered "verify with mff-query.py cashflow"
-// while idle; last `bridge registered` predated the buffer push, so
-// onClientRegistered's drain never ran for it).
-//
-// This is the third drain trigger. It's gated to be zero-cost and
-// zero-churn: skip entirely when nothing is buffered (one Map.get, no
-// log), when the bridge isn't alive (exactly sendToAgent's own guard —
-// so we never drain into a dead bridge and re-buffer/log-spin), OR
-// when a turn is in flight. The turn gate is #1556: a message
-// delivered while a turn is active is NOT safely queued by the bridge
-// — claude types it into its TUI composer and the auto-submit races
-// turn-completion, stranding it (the lawgpt wedge). Draining only at
-// `activeTurnStartedAt.size === 0` guarantees the channel notification
-// lands at an idle prompt and submits as a fresh turn. Only when there
-// IS a buffered message AND a live bridge AND no active turn do we
-// reuse the #1546 `redeliverBufferedInbound` (lossless: re-buffers any
-// per-message miss).
+// The THIRD drain trigger, beside bridge re-register (onClientRegistered) and
+// the silence-poke framework fallback (#1546): neither fires when a message is
+// buffered during a bridge-IPC flap that settles with no clean re-register while
+// claude is idle, so it orphans until a manual restart (finn, 2026-05-19). Gated
+// zero-cost/zero-churn: skip when nothing is buffered, when the bridge is dead,
+// or when a turn is in flight (#1556 — a message delivered mid-turn is typed into
+// claude's TUI composer and the auto-submit races turn-completion, stranding it).
 const IDLE_DRAIN_INTERVAL_MS = 5000
+// F2 (drain half) — bounded busy-defer. A ~5-min poke can clear the machine turn
+// while the CLI is still producing the answer; draining a represent into that busy
+// session re-queues it BEHIND the real reply → a duplicate. Defer while busy,
+// bounded so a wedged session still drains (F1 then retracts it post-reply).
+const idleDrainBusyDefer = makeSessionBusyDrainDeferral(OBLIGATION_BACKGROUND_WORK_GRACE_MS)
 if (isGatewayMain && !STATIC) {
   setInterval(() => {
     const selfAgent = process.env.SWITCHROOM_AGENT_NAME ?? ''
@@ -11775,8 +11770,11 @@ if (isGatewayMain && !STATIC) {
       () => {
         // #1556: never drain mid-turn — that re-creates the composer
         // wedge this buffer exists to prevent. Gate reads the delivery
-        // machine (turnInFlightForGate).
+        // machine (turnInFlightForGate) AND, per F2, stream-render's live-turn
+        // mirror (a poke can clear the former while the latter is still busy).
         if (turnInFlightForGate()) return false
+        const sessionBusy = (currentTurn != null && currentTurn.endedAt == null) || parkedTurnStartCount() > 0
+        if (idleDrainBusyDefer(sessionBusy, Date.now())) return false
         const c = ipcServer.getClient(selfAgent)
         return c != null && c.isAlive()
       },

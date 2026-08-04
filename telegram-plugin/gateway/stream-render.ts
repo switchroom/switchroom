@@ -279,6 +279,19 @@ export function __resetParkedTurnStartsForTest(): void {
 export function __parkedTurnStartCountForTest(): number {
   return parkedTurnStarts.length
 }
+/**
+ * Production accessor for the parked-turn-start count — the second half of the
+ * stream-render "session busy" signal (the first being a live `currentTurn`
+ * whose `endedAt == null`). A parked turn-start means the CLI has an enqueued
+ * message it is about to turn on, so the session is NOT idle even when the
+ * gateway's machine-turn gate (`turnInFlightForGate`) reads clear — the exact
+ * disagreement a ~5-min silence poke opens (it clears the machine turn while the
+ * CLI is still producing the answer). The obligation sweep and the idle-drain
+ * consult this so they do not treat a poke-cleared-but-busy session as idle.
+ */
+export function parkedTurnStartCount(): number {
+  return parkedTurnStarts.length
+}
 
 /**
  * Silence-fallback unwedge for the parked store (the two-state desync fix).
