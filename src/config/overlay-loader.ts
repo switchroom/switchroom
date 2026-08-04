@@ -93,10 +93,20 @@ export const OVERLAY_READ_FAILURES = Symbol.for(
   "switchroom.config.overlay-read-failures",
 );
 
-/** One unreadable overlay file: absolute path + fs errno code. */
+/** One unreadable overlay file: absolute path + fs errno code + which
+ *  overlay class it belongs to.
+ *
+ *  `source` matters because the two overlay classes have DIFFERENT
+ *  fail-safes (#4373): an unreadable `schedule.d` overlay must freeze cron
+ *  hot-reloads (a silently-unregistered live cron is worse than a delayed
+ *  edit — the clerk EACCES incident #4371), but an unreadable `skills.d`
+ *  overlay must NOT freeze schedule reloads — a skills permission problem is
+ *  unrelated to the schedule and only warrants a warn-and-skip. Consumers
+ *  filter on this via {@link overlayReadFailures}'s `source` argument. */
 export interface OverlayReadFailure {
   file: string;
   code: string;
+  source: "schedule" | "skills";
 }
 
 /** Record a read failure on the agent's config node (non-enumerable). */
@@ -120,17 +130,24 @@ function recordReadFailure(agentCfg: object, failure: OverlayReadFailure): void 
  * last {@link applyAgentOverlays} pass over this config object. Empty when
  * every overlay file was readable (content errors do NOT count — those
  * files were read fine and are legitimately excluded).
+ *
+ * `source` scopes the result to one overlay class (`"schedule"` or
+ * `"skills"`); omit it to get every read failure. The scheduler's strict
+ * hot-reload guard passes `"schedule"` so an unreadable `skills.d` overlay
+ * can no longer freeze cron reloads (#4373).
  */
 export function overlayReadFailures(
   config: SwitchroomConfig,
   agent: string,
+  source?: "schedule" | "skills",
 ): OverlayReadFailure[] {
   const agentCfg = config.agents?.[agent];
   if (!agentCfg) return [];
   const list = (agentCfg as unknown as Record<symbol, unknown>)[
     OVERLAY_READ_FAILURES
   ] as OverlayReadFailure[] | undefined;
-  return Array.isArray(list) ? list : [];
+  const all = Array.isArray(list) ? list : [];
+  return source ? all.filter((f) => f.source === source) : all;
 }
 
 /**
@@ -192,6 +209,7 @@ function readOverlayFile(
   file: string,
   agentCfg: object,
   warnings: OverlayWarning[],
+  source: "schedule" | "skills",
 ): string | undefined {
   try {
     return readFileSync(file, "utf-8");
@@ -204,7 +222,7 @@ function readOverlayFile(
       reason: `read error: ${(err as Error).message}`,
       code: code ?? "EUNKNOWN",
     };
-    recordReadFailure(agentCfg, { file, code: w.code! });
+    recordReadFailure(agentCfg, { file, code: w.code!, source });
     warnings.push(w);
     console.warn(
       `[switchroom] overlay-loader: agent='${agentName}' file='${file}': ${w.reason}`,
@@ -302,7 +320,7 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
           reason: `read error: cannot list overlay directory (${code})`,
           code,
         };
-        recordReadFailure(agentCfg, { file: scheduleDir, code });
+        recordReadFailure(agentCfg, { file: scheduleDir, code, source: "schedule" });
         warnings.push(w);
         console.warn(
           `[switchroom] overlay-loader: agent='${agentName}' file='${scheduleDir}': ${w.reason}`,
@@ -326,7 +344,7 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
       const merged: ScheduleEntry[] = [...(agentCfg.schedule ?? [])];
 
       for (const file of files) {
-        const raw = readOverlayFile(agentName, file, agentCfg, warnings);
+        const raw = readOverlayFile(agentName, file, agentCfg, warnings, "schedule");
         if (raw === undefined) continue;
         try {
           const parsed = parseYaml(raw);
@@ -398,7 +416,7 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
           reason: `read error: cannot list overlay directory (${code})`,
           code,
         };
-        recordReadFailure(agentCfg, { file: skillsDir, code });
+        recordReadFailure(agentCfg, { file: skillsDir, code, source: "skills" });
         warnings.push(w);
         console.warn(
           `[switchroom] overlay-loader: agent='${agentName}' file='${skillsDir}': ${w.reason}`,
@@ -416,7 +434,7 @@ export function applyAgentOverlays(config: SwitchroomConfig): ApplyOverlaysResul
       const seen = new Set(merged);
 
       for (const file of skillFiles) {
-        const raw = readOverlayFile(agentName, file, agentCfg, warnings);
+        const raw = readOverlayFile(agentName, file, agentCfg, warnings, "skills");
         if (raw === undefined) continue;
         try {
           const parsed = parseYaml(raw);
