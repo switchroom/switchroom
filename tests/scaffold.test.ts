@@ -1299,6 +1299,8 @@ describe("scaffoldAgent", () => {
       "mcp__switchroom-telegram__download_attachment",
       "mcp__switchroom-telegram__get_recent_messages",
       "mcp__switchroom-telegram__progress_update",
+      "mcp__switchroom-telegram__send_checklist",
+      "mcp__switchroom-telegram__update_checklist",
     ];
     for (const tool of expectedTools) {
       expect(settings.permissions.allow).toContain(tool);
@@ -1946,7 +1948,7 @@ describe("scaffoldAgent", () => {
     expect(customScript).toContain('SWITCHROOM_RESUME_MAX_BYTES="500000"');
   });
 
-  it("seeds safe read-only tool defaults when tools.allow is empty and dangerous_mode is off", () => {
+  it("seeds safe default tools (incl. Bash) when tools.allow is empty and dangerous_mode is off", () => {
     const config = makeAgentConfig(); // no tools, no dangerous_mode
     const result = scaffoldAgent("readonly-agent", config, tmpDir, telegramConfig);
     const settings = JSON.parse(
@@ -1954,11 +1956,59 @@ describe("scaffoldAgent", () => {
     );
     const allow: string[] = settings.permissions.allow;
     expect(allow).toEqual(expect.arrayContaining(["Read", "Grep", "Glob"]));
-    // Risky tools must NOT be auto-allowed.
-    expect(allow).not.toContain("Bash");
+    // Bash is pre-approved for default agents: ordinary fleet agents are
+    // per-container isolated, so a shell command's blast radius is the
+    // sandbox. Gating it only stormed the approval UI on the first routine
+    // shell call of nearly every task. This assertion fails on pre-change
+    // code (Bash was deliberately excluded).
+    expect(allow).toContain("Bash");
+    // Edit/Write still gated by defaultMode: acceptEdits — not pre-approved.
     expect(allow).not.toContain("Edit");
     expect(allow).not.toContain("Write");
+    // Network-reaching / gated tools must NOT be auto-allowed.
     expect(allow).not.toContain("WebFetch");
+  });
+
+  it("does NOT pre-approve any keep-gated tool via the default set", () => {
+    // The default read-only seed must not smuggle in a hostd mutator, a
+    // vault verb, a mental-model write, or Write/Edit. Guards against a
+    // future careless addition to DEFAULT_READ_ONLY_PREAPPROVED_TOOLS.
+    const config = makeAgentConfig(); // plain default agent
+    const result = scaffoldAgent("gated-check-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    const allow: string[] = settings.permissions.allow;
+    for (const forbidden of [
+      "Write",
+      "Edit",
+      "mcp__hostd__agent_restart",
+      "mcp__hostd__agent_exec",
+      "mcp__hostd__update_apply",
+      "mcp__switchroom-telegram__vault_request_access",
+      "mcp__hindsight__create_mental_model",
+      "mcp__hindsight__update_mental_model",
+    ]) {
+      expect(allow).not.toContain(forbidden);
+    }
+    // The fleet deny entries must survive on the deny list.
+    expect(settings.permissions.deny).toContain("AskUserQuestion");
+  });
+
+  it("tools.deny: [Bash] surfaces Bash on the deny list (deny wins in Claude Code)", () => {
+    // Bash is seeded into the default allow set, but an operator who wants a
+    // shell-free agent sets tools.deny: ["Bash"]. Claude Code resolves the
+    // union with deny-always-wins, so the effective capability excludes Bash.
+    // The scaffold's job is to faithfully emit the deny entry; we assert at
+    // that layer (CC enforces precedence itself).
+    const config = makeAgentConfig({
+      tools: { allow: [], deny: ["Bash"] },
+    } as Partial<AgentConfig>);
+    const result = scaffoldAgent("shell-free-agent", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.deny).toContain("Bash");
   });
 
   it("does not inject read-only defaults when user set explicit tools.allow", () => {
@@ -2305,8 +2355,10 @@ describe("reconcileAgent", () => {
     expect(settingsAfter.permissions.allow).toEqual(
       expect.arrayContaining(["Read", "Grep", "Glob"]),
     );
-    // Risky tools still must NOT be auto-allowed.
-    expect(settingsAfter.permissions.allow).not.toContain("Bash");
+    // Bash is part of the default seed (per-container isolation) and must
+    // survive reconcile via the same shared computeDesiredPermissionAllow.
+    expect(settingsAfter.permissions.allow).toContain("Bash");
+    // Edit/Write stay gated by defaultMode: acceptEdits — not pre-approved.
     expect(settingsAfter.permissions.allow).not.toContain("Edit");
     expect(settingsAfter.permissions.allow).not.toContain("Write");
   });
@@ -2336,8 +2388,9 @@ describe("reconcileAgent", () => {
     expect(settings.permissions.allow).toEqual(
       expect.arrayContaining(["Read", "Grep", "Glob"]),
     );
-    // Risky tools must still NOT be auto-allowed with dangerous_mode=off.
-    expect(settings.permissions.allow).not.toContain("Bash");
+    // Bash is part of the default seed and must be present via reconcile.
+    // Edit/Write stay gated by defaultMode: acceptEdits with dangerous_mode=off.
+    expect(settings.permissions.allow).toContain("Bash");
     expect(settings.permissions.allow).not.toContain("Edit");
     expect(settings.permissions.allow).not.toContain("Write");
   });
