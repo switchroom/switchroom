@@ -1189,6 +1189,13 @@ const SWITCHROOM_TELEGRAM_MCP_TOOLS = [
   "mcp__switchroom-telegram__download_attachment",
   "mcp__switchroom-telegram__get_recent_messages",
   "mcp__switchroom-telegram__progress_update",
+  // Native Telegram checklists (#272). The plugin registers both
+  // send_checklist and update_checklist (telegram-plugin/bridge/bridge.ts);
+  // they were missing here, so the first checklist call wedged on a
+  // per-call permission prompt. Same drift class as the progress_update
+  // omission the parity test below guards against.
+  "mcp__switchroom-telegram__send_checklist",
+  "mcp__switchroom-telegram__update_checklist",
 ];
 
 /**
@@ -1465,16 +1472,32 @@ const LEGACY_SWITCHROOM_MCP_TOKENS = ["mcp__switchroom", "mcp__switchroom__*"];
 const LEGACY_HOSTD_BLANKET_TOKENS = ["mcp__hostd", "mcp__hostd__*"];
 
 /**
- * Read-only built-in tools that are safe to pre-approve for every agent,
- * regardless of dangerous_mode. Discovering files, searching content, and
- * reading back data don't mutate host state, so gating them just adds
- * latency for no safety benefit.
+ * Built-in tools that are safe to pre-approve for every agent, regardless
+ * of dangerous_mode. Discovering files, searching content, and reading back
+ * data don't mutate host state, so gating them just adds latency for no
+ * safety benefit.
  *
- * Risky tools (Bash, Edit, Write, WebFetch, WebSearch, NotebookEdit, and
- * anything that reaches the network or writes to disk) are deliberately
- * NOT in this list — they go through the standard permission prompt,
- * which in switchroom becomes the Telegram inline-button approval flow
- * via the plugin's permission_request notification handler.
+ * `Bash` is included deliberately. An ordinary fleet agent runs in its own
+ * Docker container (one per agent), so the blast radius of a shell command
+ * is that agent's sandbox — the same isolation boundary that already makes
+ * Read/Grep/Glob safe. Gating Bash bought no real containment (the agent
+ * could already script the host it can't reach via other pre-approved
+ * tools); it only stormed the operator with an approval card on the first,
+ * routine shell call of nearly every task. Bash STAYS operator-controllable:
+ * an agent that should be kept shell-free sets `tools.deny: ["Bash"]`
+ * (deny wins in Claude Code), and adding it here — rather than as an
+ * unconditional spread in computeDesiredPermissionAllow — means it is only
+ * seeded for default agents and never becomes an always-on grant that only
+ * tools.deny could remove. (Root-tier agents whose Bash reaches the host run
+ * with tools.allow: [all] already, so this default-set change adds them no
+ * new exposure; their coverage is the deliberate root-debug tier, not
+ * container isolation.)
+ *
+ * Edit and Write are NOT here — they remain covered by the `acceptEdits`
+ * defaultMode gate. WebFetch/WebSearch/NotebookEdit and anything that
+ * reaches the network stay off this list too and go through the standard
+ * permission prompt, which in switchroom becomes the Telegram inline-button
+ * approval flow via the plugin's permission_request notification handler.
  *
  * Used when the agent's tools.allow is empty AND dangerous_mode is
  * off/unset — otherwise explicit user config wins.
@@ -1487,6 +1510,9 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
   "Task",
   "TodoWrite",
   "ExitPlanMode",
+  // Safe because ordinary agents are per-container isolated — see the
+  // block comment above for the full rationale and the tools.deny lever.
+  "Bash",
   // Skill itself just loads instruction context — the side-effecting
   // tools the skill body invokes (Bash, Write, etc) retain their own
   // approval gates. Pre-approving Skill lets routine "/loop", "/init",
