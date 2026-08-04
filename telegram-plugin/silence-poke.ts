@@ -28,6 +28,14 @@
  * is visibly running; nulling `currentTurn` there would darken the very feed the
  * user is watching. A turn with no in-flight tool is unaffected.
  *
+ * #4330 caveat: an activity-card render that LANDED on Telegram within
+ * `CARD_RENDER_FRESH_MS` (stamped via `noteCardRender` from the card-drain
+ * transport) likewise DEFERS the terminal unwedge, bounded by the same hard
+ * ceiling — a visibly-updating pinned "→ Working…" card is user-visible
+ * activity, and killing the turn under it is a false positive. It never
+ * resets the clock: the framework heartbeat climbs the card on pure wall
+ * clock even on a hung turn, so a reset would pin a dead turn forever.
+ *
  * Terminal action, once per turn:
  *
  *   t=0       startTurn() — silence clock starts at turnStartedAt
@@ -111,6 +119,21 @@ export interface SilencePokeState {
    * gates the terminal teardown. */
   sawBashThisTurn: boolean
   /**
+   * #4330: wall-clock ms of the last activity-card render (open or in-place
+   * edit) that actually LANDED on Telegram for this turn — the pinned
+   * "→ Working… · Nm · N tools" status card the user is watching. Stamped by
+   * `noteCardRender` from the card-drain transport site
+   * (`gateway/narrative-lane.ts` drainActivitySummary), which covers every
+   * producer: tool labels, narrative SHOWs, the liveness open, and the
+   * framework heartbeat climb. Deliberately NOT a clock reset — the heartbeat
+   * climb re-renders on pure wall clock, so a hung turn's card keeps
+   * "updating" and an unbounded reset would pin a dead turn forever (the
+   * #1556 class). Instead the tick() DEFERS the terminal fallback while the
+   * card moved within `CARD_RENDER_FRESH_MS`, bounded by
+   * `fallbackHardCeiling` exactly like the in-flight-tool / compaction
+   * defers. null until the first card render of the turn. */
+  lastCardRenderAt: number | null
+  /**
    * #3519 sharpen: claude-CLI background shells PROVEN alive right now. A
    * shell is added on its launch marker (structured `backgroundTaskId`, via
    * `noteBackgroundShellAlive`) and removed when the CLI proactively reports
@@ -152,6 +175,16 @@ export const DEFAULT_THRESHOLDS: ThresholdsMs = {
 }
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
+
+/**
+ * #4330 — how recent the last landed activity-card render must be for the
+ * card to count as "actively updating in front of the user". The framework
+ * heartbeat edits the card every ~6s (FEED_HEARTBEAT_MIN_STALE_MS); 30s
+ * tolerates several shed/coalesced cosmetic edits under flood-control
+ * backoff while still lapsing quickly once the card genuinely stops moving
+ * (turn ended → card cleared, or the drain wedged).
+ */
+export const CARD_RENDER_FRESH_MS = 30_000
 
 export interface FrameworkFallbackContext {
   key: string
@@ -326,6 +359,7 @@ export function startTurn(key: string, now: number): void {
     fallbackFired: false,
     floorFired: false,
     inFlightTools: new Map(),
+    lastCardRenderAt: null,
     sawBashThisTurn: false,
     aliveShells: new Set(),
   })
@@ -395,6 +429,36 @@ export function noteProduction(key: string, now: number): void {
   if (s == null) return
   s.lastOutboundAt = now
   s.fallbackFired = false
+}
+
+/**
+ * #4330: record an activity-card render (open or in-place edit) that actually
+ * LANDED on Telegram for `key` — the pinned "→ Working…" status card visibly
+ * moved. Called from the card-drain transport site
+ * (`gateway/narrative-lane.ts` drainActivitySummary) after a successful
+ * sendRichMessage / non-shed editMessageText, so it covers every card
+ * producer — tool labels, narrative SHOWs, the liveness open, AND the
+ * framework heartbeat climb (`feedHeartbeatTick`), which is exactly the path
+ * that has no `noteProduction` site.
+ *
+ * Deliberately does NOT reset the silence clock (`lastOutboundAt` untouched,
+ * `fallbackFired` untouched): the heartbeat climb renders on pure wall clock
+ * (`now - turn.startedAt`), so a genuinely hung turn's card keeps climbing
+ * forever — counting that as production would keep a dead turn alive
+ * indefinitely (the #1556 dangling-turn class the stream-render tool-label
+ * comment warns about). Instead, tick() DEFERS the terminal fallback while
+ * `now - lastCardRenderAt < CARD_RENDER_FRESH_MS`, bounded by
+ * `fallbackHardCeiling` — same semantics as the #1292/#3519/#4058 defers.
+ * Model-driven card progress (a NEW tool label, a foreground sub-agent nested
+ * render, a draft update) additionally resets the clock via the existing
+ * `noteProduction` sites; this stamp is the floor beneath them.
+ *
+ * No-op when the kill switch is on or the key has no live turn.
+ */
+export function noteCardRender(key: string, now: number): void {
+  const s = state.get(key)
+  if (s == null) return
+  s.lastCardRenderAt = now
 }
 
 /**
@@ -801,6 +865,22 @@ function tick(now: number): void {
         // gated by SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 — that flag
         // scopes the TOOL defers; compaction has no tool in flight.
         if (activeDeps.isCompactionInFlight?.(key) === true) continue
+        // #4330 — the pinned activity card is visibly updating. A card render
+        // (open or edit) landed on Telegram within CARD_RENDER_FRESH_MS, so
+        // the user is watching a live "→ Working… · Nm · N tools" surface —
+        // the "silent to the user" premise does not hold, and tearing the
+        // turn down would kill the very card they are watching, then re-ask
+        // their message under it. DEFER (clock untouched, fallbackFired
+        // unset, re-checked next tick), bounded by the enclosing
+        // `underCeiling` guard: the heartbeat climb keeps a hung turn's card
+        // moving on pure wall clock, so a truly wedged turn still unwedges at
+        // the hard ceiling. Like the #4058 compaction defer, deliberately NOT
+        // gated by SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 — that flag
+        // scopes the TOOL defers; a card render is not a tool signal.
+        if (
+          s.lastCardRenderAt != null &&
+          now - s.lastCardRenderAt < CARD_RENDER_FRESH_MS
+        ) continue
         const forceDisable = process.env.SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS === '0'
         if (!forceDisable && activeDeps.isLegitimatelyWorking != null) {
           if (activeDeps.isLegitimatelyWorking(key)) continue

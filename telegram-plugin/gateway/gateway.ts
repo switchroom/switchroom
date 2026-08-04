@@ -12573,6 +12573,8 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   try {
     signalTracker.noteSignal(key, Date.now())
   } catch { /* best-effort signal */ }
+  // #4330: model-driven user-visible outbound — reset the silence clock like a reply send.
+  try { silencePoke.noteOutbound(key, Date.now()) } catch { /* best-effort */ }
 
   return {
     content: [

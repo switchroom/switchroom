@@ -47,6 +47,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 import { runSilentTurnHeartbeatTick } from '../feed-heartbeat-climb.js'
+import * as silencePoke from '../silence-poke.js'
 import { NarrativeFlushController, PENDING_NARRATIVE_FLUSH_MS } from '../narrative-flush.js'
 import { richMessage } from '../rich-send.js'
 import { isSendGateShed } from '../send-gate.js'
@@ -496,6 +497,20 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
             // payload IS on screen, so it advances normally below.
             if (isSendGateShed(editRes)) break
           }
+          // #4330 — a card render LANDED (fresh open above, or a non-shed
+          // edit): the pinned "→ Working…" status card the user watches just
+          // visibly moved. Stamp silence-poke's card-render clock so the 300s
+          // terminal fallback is DEFERRED (bounded by the hard ceiling) while
+          // the card keeps updating — a visibly-live card must not be torn
+          // down as "silence". This is the single transport chokepoint for
+          // every card producer (tool label, narrative SHOW, liveness open,
+          // heartbeat climb), and it is a DEFER-stamp only — it never touches
+          // `lastOutboundAt`, so the silence CLOCK still resets only at the
+          // model-driven production sites (stream-render tool-label / draft,
+          // foreground sub-agent render). That keeps the #1556 heartbeat-
+          // safety guard intact: a hung turn's climbing card defers the
+          // teardown at most to `fallbackHardCeiling`, never forever.
+          silencePoke.noteCardRender(statusKey(chat, thread), Date.now())
           turn.activityLastSentRender = target
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
