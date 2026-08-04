@@ -137,19 +137,50 @@ export function makeRepresentRedeliveryGuard(
  * ordinary busy turn (which ends well within the bound) defers cleanly and never
  * consumes the wedge budget.
  *
+ * Episode isolation (#4341 follow-up): `deferringSince` used to reset ONLY on a
+ * `busy=false` call, but the predicate is not consulted on every drain path. When
+ * a buffer is emptied by a bridge re-register (`onClientRegistered`) while the
+ * session is still busy, the idle-drain gate is never invoked with `busy=false`,
+ * so `deferringSince` stays pinned at the old t0. A later, UNRELATED deferral
+ * episode then computes `now - t0 >= boundMs` immediately and drains a represent
+ * into a mid-answer session — reopening the duplicate window this guard closes.
+ * Fix: a fresh deferral episode also starts the clock at `now` when the predicate
+ * has not been consulted within `staleGapMs`. The idle-drain gate polls on a
+ * fixed short interval while (and only while) the buffer is non-empty, so a gap
+ * between consecutive consultations longer than a few poll intervals means the
+ * prior episode's buffer drained via a non-idle path and this is a new episode.
+ *
  * `boundMs <= 0` disables the busy-defer entirely (kill switch / parity with the
- * background-work grace being disabled).
+ * background-work grace being disabled). `staleGapMs <= 0` disables the
+ * gap-based episode reset (leaving only the `busy=false` reset).
  */
+export const DEFAULT_DRAIN_DEFER_STALE_GAP_MS = 15_000
+
 export function makeSessionBusyDrainDeferral(
   boundMs: number,
+  staleGapMs: number = DEFAULT_DRAIN_DEFER_STALE_GAP_MS,
 ): (busy: boolean, now: number) => boolean {
   let deferringSince: number | null = null
+  let lastCallAt: number | null = null
   return (busy, now) => {
+    const gapSinceLastCall = lastCallAt == null ? null : now - lastCallAt
+    lastCallAt = now
     if (!busy || boundMs <= 0) {
       deferringSince = null
       return false
     }
-    if (deferringSince == null) deferringSince = now
+    // Start (or restart) the clock at the top of a NEW deferral episode:
+    //   - we were not deferring (deferringSince cleared by a busy=false call), OR
+    //   - the predicate has not been consulted within staleGapMs, which means the
+    //     prior episode's buffer drained via a path that never calls us with
+    //     busy=false (bridge re-register) and left deferringSince pinned at a
+    //     stale t0. Either way a fresh episode's bound must run from `now`.
+    if (
+      deferringSince == null ||
+      (staleGapMs > 0 && gapSinceLastCall != null && gapSinceLastCall > staleGapMs)
+    ) {
+      deferringSince = now
+    }
     // Bounded: stop deferring once we have been busy past the ceiling, so a
     // wedged/hung session still eventually drains the buffered represent.
     return now - deferringSince < boundMs
