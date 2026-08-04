@@ -101,6 +101,15 @@ export const SCOPED_RECURSIVE_SUBDIRS = [
   ".claude",
   ".claude-cron",
   "telegram",
+  // Cron/skill overlay dirs (overlay-writer.ts). Their *.yaml files are
+  // 0600 and MUST be agent-owned or the in-container agent-scheduler
+  // EACCESes on every hot-reload and the loader drops the cron entries
+  // (clerk incident: root-owned cron overlays, 2,298 EACCES ticks, fires
+  // lost for weeks until an apply-time full sweep healed them). The full
+  // sweep always covered these; the scoped sweep must too, or flipping
+  // the #3333 flag on would reopen that window for root-written overlays.
+  "schedule.d",
+  "skills.d",
 ] as const;
 
 /**

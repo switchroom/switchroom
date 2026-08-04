@@ -28,6 +28,7 @@
 
 import { resolve, join } from "node:path";
 import { loadConfig } from "../config/loader.js";
+import { overlayReadFailures, type OverlayReadFailure } from "../config/overlay-loader.js";
 import {
   collectScheduleEntries,
   dispatchAsInbound,
@@ -540,6 +541,49 @@ export function createScheduleReloader(opts: {
   };
 }
 
+/** Human-readable remedy appended to unreadable-overlay diagnostics. */
+function formatReadFailures(failures: OverlayReadFailure[]): string {
+  return (
+    failures.map((f) => `${f.file} (${f.code})`).join(", ") +
+    " — fix ownership/mode so the agent uid can read the file " +
+    "(a root-euid writer leaves cron overlays root-owned 0600; " +
+    "`switchroom apply` / a reconcile ownership sweep heals this)"
+  );
+}
+
+/**
+ * Load THIS agent's schedule entries, refusing (throwing) when any of its
+ * `schedule.d/*.yaml` overlay files exists but cannot be READ.
+ *
+ * Why strict: the overlay loader isolates per-file failures, so an
+ * EACCES'd cron file yields a config that simply LACKS that file's
+ * entries. For the boot path that is the best we can do (warn loudly —
+ * see main()), but for the hot-reload path it is poison: the reloader
+ * would diff the shrunken schedule against the live one and silently
+ * UNREGISTER a healthy cron ("schedule reloaded: 11 → 10"), losing every
+ * fire until the ownership is fixed (observed on clerk: 2,298 EACCES
+ * ticks over weeks, entries dropped the whole time). Throwing routes
+ * into createScheduleReloader's onError path, which keeps the current
+ * schedule — the same fail-safe already used for a config parse error.
+ *
+ * Content failures (malformed YAML, schema rejection) do NOT throw:
+ * those files were read fine and their entries are legitimately excluded.
+ */
+export function loadAgentEntriesStrict(
+  configPath: string,
+  agentName: string,
+): SchedulerEntry[] {
+  const config = loadConfig(configPath);
+  const failures = overlayReadFailures(config, agentName);
+  if (failures.length > 0) {
+    throw new Error(
+      `schedule.d overlay unreadable — refusing a reload that may be ` +
+        `missing entries: ${formatReadFailures(failures)}`,
+    );
+  }
+  return collectScheduleEntries(config).filter((e) => e.agent === agentName);
+}
+
 /** Reload poll cadence (ms). Overlay edits are rare and detection within
  *  ~30s is plenty; the poll is a yaml re-parse + a few overlay file reads,
  *  negligible CPU. Floored at 1s. */
@@ -616,6 +660,20 @@ export async function main(): Promise<void> {
   const config = loadConfig(configPath);
   const allEntries = collectScheduleEntries(config);
   const entries = allEntries.filter((e) => e.agent === agentName);
+
+  // Unreadable overlay files at BOOT: we cannot register entries we
+  // cannot read, so boot proceeds with what loaded — but say so loudly
+  // and actionably instead of the loader's per-file console.warn only.
+  // (The hot-reload path below is strict: it refuses to swap the live
+  // schedule against a load that is missing unreadable files.)
+  const bootReadFailures = overlayReadFailures(config, agentName);
+  if (bootReadFailures.length > 0) {
+    process.stderr.write(
+      `agent-scheduler: ${agentName} WARNING: ${bootReadFailures.length} ` +
+        `schedule.d overlay file(s) unreadable at boot — their cron entries ` +
+        `are NOT registered: ${formatReadFailures(bootReadFailures)}\n`,
+    );
+  }
 
   const channel = resolveChannelTarget(config, agentName);
   if (channel === null) {
@@ -988,17 +1046,31 @@ export async function main(): Promise<void> {
   let reloader: ScheduleReloader | undefined;
   let reloadTimer: ReturnType<typeof setInterval> | undefined;
   if (isHotReloadEnabled(process.env)) {
+    // Dedupe the per-tick error line: a persistently-unreadable overlay
+    // would otherwise emit an identical line every poll (~30s) — the
+    // 2,298-line log flood that buried the original clerk incident.
+    // A reload that actually lands resets the memo so a recurrence of
+    // the same error is reported again.
+    let lastReloadError: string | undefined;
     reloader = createScheduleReloader({
-      loadEntries: () =>
-        collectScheduleEntries(loadConfig(configPath)).filter((e) => e.agent === agentName),
+      // Strict on purpose: an unreadable schedule.d file throws, landing
+      // in onError (keep current schedule) instead of silently
+      // unregistering the file's crons. See loadAgentEntriesStrict.
+      loadEntries: () => loadAgentEntriesStrict(configPath, agentName),
       register: registerForEntries,
       initialTasks: tasks,
       initialEntries: entries,
-      log: (m) => process.stdout.write(`agent-scheduler: ${agentName} ${m}\n`),
-      onError: (e) =>
+      log: (m) => {
+        lastReloadError = undefined;
+        process.stdout.write(`agent-scheduler: ${agentName} ${m}\n`);
+      },
+      onError: (e) => {
+        if (e.message === lastReloadError) return;
+        lastReloadError = e.message;
         process.stderr.write(
           `agent-scheduler: ${agentName} reload skipped (config error, keeping current schedule): ${e.message}\n`,
-        ),
+        );
+      },
     });
     reloadTimer = setInterval(() => reloader!.tick(), resolveReloadPollMs(process.env));
   }
