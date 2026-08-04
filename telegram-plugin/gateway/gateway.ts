@@ -754,6 +754,7 @@ import { shadowEmit, isMachineInTurn } from './inbound-delivery-machine-shadow.j
 // #2996 P8 PR-B — the extracted turn-end funnel (state stays here; logic moved).
 import { createTurnEndFunnel, type TurnEndReason } from './turn-end.js'
 import { createTurnStartSurfaces } from './turn-start-surfaces.js'
+import { progressFallbackAtCap, recordProgressFallbackSend } from './progress-fallback-cap.js'
 // #2996 P8 PR-C1 — the extracted delivery-confirm sweep wiring.
 import { createDeliveryConfirmWiring } from './delivery-confirm-wiring.js'
 // #2996 P8 PR-C2 — the extracted obligation wiring.
@@ -12491,21 +12492,26 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
     }
   }
 
-  // Turn cap: max 5 calls per turn
+  // Attention cap: max 5 DELIVERIES per turn when a turn atom exists, else a
+  // rolling 15-min/chat fallback when the inbound minted none (handback /
+  // progress-inbound turns) so a worker can't send at the 20s floor forever
+  // and defeat the documented per-turn cap. Both count deliveries only — the
+  // counter/window is advanced AFTER a successful send below, so a thrown send
+  // never burns a slot.
   const turnStart = activeTurnStartedAt.get(key)
-  if (turnStart != null) {
-    const currentCount = progressUpdateTurnCount.get(key) ?? 0
-    if (currentCount >= 5) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ ok: false, reason: 'turn_limit' }),
-          },
-        ],
-      }
+  const atCap =
+    turnStart != null
+      ? (progressUpdateTurnCount.get(key) ?? 0) >= 5
+      : progressFallbackAtCap(key, now)
+  if (atCap) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ ok: false, reason: 'turn_limit' }),
+        },
+      ],
     }
-    progressUpdateTurnCount.set(key, currentCount + 1)
   }
 
   // Issue #305 Option A — the card-injection path (route a sub-agent's
@@ -12550,6 +12556,15 @@ async function executeProgressUpdate(args: Record<string, unknown>): Promise<unk
   }
 
   progressUpdateLastSent.set(key, now)
+
+  // Count the delivery AFTER the send lands (never on a throw). Turn-scoped
+  // path ticks the per-turn counter; turn-less path records into the rolling
+  // fallback window.
+  if (turnStart != null) {
+    progressUpdateTurnCount.set(key, (progressUpdateTurnCount.get(key) ?? 0) + 1)
+  } else {
+    recordProgressFallbackSend(key, now)
+  }
 
   // Issue #203: progress_update is a user-visible signal — tick the
   // silent-gap tracker so it doesn't count as silent time.
