@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.20.6 — Telegram pin cleanup self-heals again: the boot sweep reseeds its discharged cursor
+
+Reliability fix (2026-08-04): pinned-message cleanup that silently stopped
+working after the first boot is restored, across DMs, forum topics, and
+supergroups/channels alike.
+
+### Pins — the boot sweep's discharged cursor now reseeds so orphaned pins get reaped again (#4339, regression from #3953)
+
+- **Root cause:** #3953 replaced the old per-boot DM pin sweep with a
+  cursor-gated stack drain, but the boot "seed pass" that was meant to clear a
+  discharged cursor was never wired. `sweepTarget` short-circuits on
+  `if (cursor.done) return 'already-drained'`, so once a chat drained once,
+  `done:true` persisted forever and every later boot/first-inbound sweep
+  short-circuited — orphaned pins leaked after the first drain were never
+  reaped (a targeted `unpinChatMessage` on a non-top DM pin is a silent no-op
+  that returns `ok:true`, and the driver dropped the durable claim on that false
+  ok, hiding the still-pinned message from every reaper).
+- **Fix:** a boot-scoped `reseedSweepLedger` step (`seedPruneSweepCursors`) runs
+  before sweep eligibility is granted and clears only `done:true` cursor rows —
+  kind-agnostic, so DM, forum-topic and supergroup/channel all re-evaluate each
+  boot. Forfeited `skipped-no-rights` rows (`attempts >= SWEEP_MAX_ATTEMPTS`)
+  are retained so a no-rights chat never re-burns its attempt budget (flood
+  guard). `pruneSweepCursors` now filters on `done` alone. Every existing
+  flood guard (per-process at-most-once, DM write throttle + pop cap +
+  per-minute budget, circuit breaker, forfeit cap, assertLanded/critical-class)
+  is preserved. Covered by store + DM + supergroup re-drain tests and
+  boot-step-order tests in `telegram-plugin/gateway/stale-pin-sweep.test.ts`
+  and `telegram-plugin/tests/boot-sweep-gate.test.ts`.
+
 ## v0.20.5 — Release-pipeline auto-heal, fleet Bash/checklist pre-approval, and activity-card silence fix
 
 Release plumbing and fleet-wide defaults (2026-08-04): a skipped
