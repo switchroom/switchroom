@@ -660,7 +660,7 @@ import { handleRequestMs365Approval } from './ms365-write-approval.js'
 import { buildDiffPreviewCard } from './diff-preview-card.js'
 import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick } from './pending-inbound-buffer.js'
 import { makeRepresentRedeliveryGuard, makeSessionBusyDrainDeferral } from './represent-delivery-guard.js'
-import { isCronIdentity, isCronInjectFire, deliverInjectWithFallback, replyCallerIsForeignSession } from './cron-session.js'
+import { isCronIdentity, isCronInjectFire, deliverInjectWithFallback, replyCallerIsForeignSession, drainCronBridgeOnRegister } from './cron-session.js'
 import {
   ObligationLedger,
   obligationEscalationText,
@@ -10366,17 +10366,13 @@ if (isGatewayMain) ipcServer = createIpcServer({
 
   onClientRegistered(client: IpcClient) {
     process.stderr.write(`telegram gateway: bridge registered — agent=${client.agentName}\n`)
-    // Cheap-cron (§2.4/§3.3): a `<agent>-cron` bridge is the Tier-1 cheap
-    // session. It is STATUS-SILENT — it must NOT drive the gateway's
-    // singleton machinery (shadow bridge-state, warmup, boot card, which all
-    // track the MAIN agent's liveness). Drain any buffered cron fire to it
-    // (so a fire that triggered a lazy spawn lands), then return early.
+    // Cheap-cron (§2.4/§3.3): a `<agent>-cron` bridge is the Tier-1 cheap,
+    // STATUS-SILENT session — it must NOT drive the gateway's singleton
+    // machinery. Drain any boot-window cron fire to it, then return early.
+    // #4348: the drain routes through `redeliverBufferedInbound` (the shared
+    // ack chokepoint) so a spooled fire is acked and never re-fires on restart.
     if (isCronIdentity(client.agentName)) {
-      client.send({ type: 'status', status: 'agent_connected' })
-      const pending = pendingInboundBuffer.drain(client.agentName ?? '')
-      for (const m of pending) {
-        try { client.send(m) } catch { /* cron fire drop — best-effort, like today's cron */ }
-      }
+      drainCronBridgeOnRegister(client, pendingInboundBuffer, inboundSpool ?? undefined, (l) => process.stderr.write(l))
       return
     }
     // Phase 2b shadow: ONLY emit bridgeUp for the REAL bridge sidecar
