@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.20.8 — three fleet-audit reliability fixes: synthetic-id queued cards, bridge disconnect churn, and cron-drop on unreadable overlays
+
+Reliability (2026-08-05): three fleet-audit fixes land together — the gateway
+no longer loses a queued card when the parked inbound is synthetic, a planned
+gateway restart no longer churns the surviving bridge or mislabels itself a
+crash, and an unreadable `schedule.d` overlay can no longer silently unregister
+a live cron.
+
+### Queued card no longer 400s on a synthetic parked message id (#4367)
+
+The gateway's queued-card path 400d on every mid-turn park of a **synthetic**
+inbound (subagent handback, boot resume, cron). Synthetic enqueues fabricate
+`messageId` from `Date.now()` (~1.78e13), and the park-time reply-anchor guard
+in `stream-render.ts` was a bare `Number.isFinite` that passes the fabricated
+13-digit id — but Telegram hard-rejects `reply_parameters.message_id` beyond
+signed int32 with exactly that 400, and `allow_sending_without_reply` does not
+bypass the range check, so the whole card was lost, not just the anchor. This
+is the same bug class as the 2026-06-05 resume-dark-feed incident that
+`parseSourceMessageId` was written for; the queued-card path had re-derived a
+weaker guard instead of reusing the one already imported in the same file. The
+anchor now goes through `parseSourceMessageId`, so a synthetic / out-of-range
+id yields an **unanchored** card (still sent, still adopted on dequeue) instead
+of no card, and real ids still reply-anchor exactly as before.
+
+### Bridge disconnect → re-register churn stopped (#4369)
+
+A planned gateway restart while the bridge survives in the separate claude
+process drove two symptoms fleet-wide: process-level unhandled rejections and
+bogus `reason=crash` boot cards (with `RestartCount=0` everywhere — nothing had
+crashed). Two defects: `bridge/ipc-client.ts`'s retry timer called `doConnect()`
+bare, so every failed background reconnect (exactly what happens while the
+gateway is down) escaped as an `unhandledRejection` — which pre-#3033 killed the
+bridge process outright (mute agent) and post-#3033 wrote pseudo-crash
+breadcrumbs; and `scheduleReconnect` had no single-flight guard, so the connect
+catch and the socket `close` handler could both schedule a retry. Separately,
+the bridge-reconnect path re-derived the restart reason from on-disk markers the
+gateway boot had already read-and-cleared, falling through to `'crash'` for a
+graceful restart. The retry path now swallows the already-logged reconnect
+failure and reconnect is single-flight, and a new `determineBridgeReconnectReason`
+reuses the boot-time reason for marker-less re-registers within 5 min of gateway
+boot (late re-registers still classify conservatively as `'crash'`).
+
+### Scheduler never drops a cron on an unreadable schedule.d overlay (#4371)
+
+An EACCES incident silently unregistered live crons for the whole window (2,298
+`overlay-loader … parse error: EACCES` lines in one agent's scheduler log,
+`schedule reloaded: 11 → 10`). Root cause: a foreign-euid writer created a
+`schedule.d/*.yaml` inode owned by the writer at mode 0600 (the #3168 tmp+rename
+re-own class), the in-container agent-scheduler then EACCESed on every
+hot-reload tick, `applyAgentOverlays` skipped the file with only a `console.warn`,
+and the reloader diffed the shrunken schedule and unregistered the healthy cron —
+heal came only weeks later from an apply-time chown sweep. Fixed in three
+deterministic legs: the overlay loader now classifies read failures (EACCES/EPERM)
+distinctly from content failures (malformed YAML stays a legitimate exclusion,
+ENOENT stays a legitimate unregister); the scheduler hot-reload loads strictly
+and throws on a read failure into its existing keep-current-schedule path, so an
+unreadable overlay can no longer unregister a live cron (per-tick errors deduped,
+boot warns loudly with the exact chown remedy); and the overlay writer chowns the
+staged inode to the target dir's owner before rename when euids differ, with the
+scoped ownership sweep now recursing `schedule.d/` + `skills.d/`.
+
 ## v0.20.7 — Claude CLI 2.1.221 (closes a zsh permission-bypass) and a delivery-time represent re-check that stops duplicate answers
 
 Security + reliability (2026-08-04): the fleet's pinned claude-code moves to
