@@ -55,7 +55,7 @@ import {
   HINDSIGHT_CONTAINER_NAME,
   REPAIR_FAILED_EXIT,
 } from "../memory/hindsight-repair.js";
-import { getViaBrokerStructured } from "../vault/broker/client.js";
+import { getViaBrokerStructured, readVaultTokenFile } from "../vault/broker/client.js";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { writeConfigFileSync } from "../util/atomic.js";
@@ -165,7 +165,18 @@ async function resolveLiteLLMForHindsight(
 ): Promise<LiteLLMHindsightConfig | undefined> {
   const topLiteLLM = (config as { litellm?: { enabled?: boolean; base_url?: string } }).litellm;
   if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
-  const result = await getViaBrokerStructured("litellm/hindsight/api-key").catch(() => null);
+  // Issue #1053: forward the agent's capability token so the broker's grant
+  // path bypasses the peercred ACL. Without it a freshly-minted grant is
+  // ignored and the `.catch(() => null)` silently swallows the DENIED,
+  // leaving LiteLLM routing (ANTHROPIC_BASE_URL/headers) underived. Mirrors
+  // the working `vault get` path in src/cli/vault.ts. Token stays undefined
+  // when SWITCHROOM_AGENT_NAME is unset — identical to prior host-operator
+  // peercred behavior.
+  const agentSlug = process.env.SWITCHROOM_AGENT_NAME;
+  const token = agentSlug ? readVaultTokenFile(agentSlug) ?? undefined : undefined;
+  const result = await getViaBrokerStructured("litellm/hindsight/api-key", {
+    ...(token ? { token } : {}),
+  }).catch(() => null);
   if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
   return {
     baseUrl: topLiteLLM.base_url,
