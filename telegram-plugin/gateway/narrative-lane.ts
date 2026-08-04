@@ -56,6 +56,7 @@ import {
   appendActivityLabel, clipNarrative, formatStepSuffix, renderActivityFeedWithNested,
 } from '../tool-activity-summary.js'
 import { evaluatePostAnswerLiveness } from '../turn-liveness-floor.js'
+import { isSilentSentinelCardOutcome } from '../turn-flush-safety.js'
 import { clearActivityCardRecord, writeActivityCardRecord } from './activity-card-store.js'
 import { chatKeyWithSuffix } from './chat-key.js'
 import {
@@ -880,7 +881,26 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
       // before the delete. turn-end stays the idempotent backstop: it no-ops
       // once nothing is claimed for the key.
       await reconcileStatusPin(`fg:${statusKey(chat, thread)}`, chat, { pinned: false })
-      if (CLEAR_STATUS_ON_COMPLETION) {
+      // #4348 — silent-sentinel suppression. A turn whose entire user-facing
+      // outcome is a bare NO_REPLY / HEARTBEAT_OK (the sentinel-reply-guard
+      // dropped a sentinel-only reply, or the flush safety net classified the
+      // captured text as silent) said nothing to the user, so its activity/
+      // telemetry card is pure noise — most visibly on the forced-synthesis
+      // handback turns a background sub-agent injects. DELETE the card rather
+      // than finalizing a visible `done · … · ✓ NO_REPLY` record. Deterministic
+      // (reuses the shared `turn-flush-safety` silent predicates, no model
+      // behaviour) and normal-case-safe (`finalAnswerEverDelivered` keeps every
+      // card for a turn that actually delivered a substantive answer). The
+      // `finalHtmlOverride` finalize path is only taken by the foreground
+      // handoff-clear, which fires on a delivered final answer — so this gate
+      // never contends with it.
+      const silentSentinelTurn = isSilentSentinelCardOutcome({
+        replyCalled: turn.replyCalled,
+        lastReplyText: turn.lastReplyText,
+        capturedText: turn.capturedText,
+        finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
+      })
+      if (CLEAR_STATUS_ON_COMPLETION || silentSentinelTurn) {
         try {
           await robustApiCall(
             () => bot.api.deleteMessage(chat, id),

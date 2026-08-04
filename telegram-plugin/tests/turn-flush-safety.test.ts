@@ -20,6 +20,7 @@ import {
   isSilentFlushMarker,
   isCompositeSilentNoise,
   endsWithSilentMarker,
+  isSilentSentinelCardOutcome,
   isTurnFlushSafetyEnabled,
   selectFlushDeliveryText,
   FLUSH_SUBSTANTIVE_MIN_CHARS,
@@ -891,5 +892,87 @@ describe('selectFlushDeliveryText — structural provenance (followedByToolUse) 
     const out = selectFlushDeliveryText([shortPreamble, realAnswer], [true, false])
     expect(out).toBe(realAnswer)
     expect(out).not.toContain('Here are the figures')
+  })
+})
+
+// #4348 — the pure gate that suppresses the per-turn activity/telemetry card
+// when the turn's whole user-facing outcome was an intentional silent sentinel.
+describe('isSilentSentinelCardOutcome (#4348)', () => {
+  const base = { replyCalled: false, lastReplyText: '', capturedText: [] as string[], finalAnswerEverDelivered: false }
+
+  it('reply("NO_REPLY") — the blocked sentinel-only reply is a silent outcome', () => {
+    expect(isSilentSentinelCardOutcome({ ...base, replyCalled: true, lastReplyText: 'NO_REPLY' })).toBe(true)
+  })
+
+  it('trailing punctuation and case variants still count as silent', () => {
+    for (const t of ['NO_REPLY.', 'no_reply', 'HEARTBEAT_OK', 'heartbeat_ok!', ' NO_REPLY ']) {
+      expect(isSilentSentinelCardOutcome({ ...base, replyCalled: true, lastReplyText: t })).toBe(true)
+    }
+  })
+
+  it('composite silent noise ("Sent.\\nNO_REPLY\\nNO_REPLY") via the reply payload is silent', () => {
+    expect(
+      isSilentSentinelCardOutcome({ ...base, replyCalled: true, lastReplyText: 'Sent.\nNO_REPLY\nNO_REPLY' }),
+    ).toBe(true)
+  })
+
+  it('flush path (no reply): prose + trailing NO_REPLY (H6/#2053) is silent', () => {
+    expect(
+      isSilentSentinelCardOutcome({
+        ...base,
+        replyCalled: false,
+        capturedText: ["Nothing actionable in today's digest.", 'NO_REPLY'],
+      }),
+    ).toBe(true)
+  })
+
+  it('a real reply is NOT silent — the card is a legitimate record', () => {
+    expect(
+      isSilentSentinelCardOutcome({
+        ...base,
+        replyCalled: true,
+        lastReplyText: 'The three services are all green.',
+        finalAnswerEverDelivered: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('finalAnswerEverDelivered short-circuits even when a stray NO_REPLY is the last reply text', () => {
+    // An interim answer landed, then a trailing sentinel — the delivered answer wins.
+    expect(
+      isSilentSentinelCardOutcome({
+        ...base,
+        replyCalled: true,
+        lastReplyText: 'NO_REPLY',
+        finalAnswerEverDelivered: true,
+      }),
+    ).toBe(false)
+  })
+
+  it('a delivered reply that merely mentions the sentinel in prose is NOT silent', () => {
+    // Non-marker content ⇒ the sentinel-reply-guard would not drop it ⇒ delivered.
+    expect(
+      isSilentSentinelCardOutcome({
+        ...base,
+        replyCalled: true,
+        lastReplyText: 'Reply with exactly NO_REPLY if there is nothing to add.',
+      }),
+    ).toBe(false)
+  })
+
+  it('endsWithSilentMarker does NOT suppress a DELIVERED reply of "prose\\nNO_REPLY"', () => {
+    // The guard lets prose+trailing-NO_REPLY through the reply tool, so its
+    // prose reached chat; the card must stay even though it ends with a marker.
+    expect(
+      isSilentSentinelCardOutcome({
+        ...base,
+        replyCalled: true,
+        lastReplyText: 'Here is the full answer.\nNO_REPLY',
+      }),
+    ).toBe(false)
+  })
+
+  it('a genuinely empty dark turn (no reply, no text) is NOT a sentinel', () => {
+    expect(isSilentSentinelCardOutcome({ ...base })).toBe(false)
   })
 })
