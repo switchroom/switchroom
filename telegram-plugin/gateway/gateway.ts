@@ -857,7 +857,7 @@ import {
   resolvePersonaName, shouldSkipDuplicateBootCard,
   type BootCardHandle, type RestartReason,
 } from './boot-card.js'
-import { determineRestartReason } from './boot-reason.js'
+import { determineRestartReason, determineBridgeReconnectReason } from './boot-reason.js'
 import { maybeRenderUpdateAnnouncement } from './update-announce.js'
 import { createIssuesCardHandle, type IssuesCardHandle } from '../issues-card.js'
 import { startIssuesWatcher, type IssuesWatcherHandle } from '../issues-watcher.js'
@@ -9163,6 +9163,8 @@ let activeBootCard: BootCardHandle | null = null
 // dedupe checks this so it can't race against the boot path's await.
 // See issue #489 (klanker msgId 4715 + 4716, 2026-05-01 10:13:15).
 let bootCardPending = false
+// Boot-determined restart reason — see determineBridgeReconnectReason (B2).
+let bootReasonAtStartup: RestartReason | null = null
 
 // Issues card (#428) — pinned per-agent surface listing current
 // unresolved entries from the issue sink (#425). Idempotent across
@@ -10446,15 +10448,12 @@ if (isGatewayMain) ipcServer = createIpcServer({
       })
     }
 
-    // If the agent reconnected after a /restart (or any restart), post a boot
-    // card. The restart-marker carries the ack chat; if absent we fall back to
-    // resolveBootChatId so crash-recovery reconnects also get a card.
-    //
-    // Skip if the boot path already posted a card OR is currently in-flight
-    // on its sendMessage await (issue #489 — klanker msgId 4715+4716,
-    // 2026-05-01). The original dedupe (msgId 2245+2248, 2026-04-26) only
-    // covered the post-resolution case; bootCardPending closes the in-flight
-    // race window. See `shouldSkipDuplicateBootCard`.
+    // If the agent reconnected after a restart, post a boot card. The
+    // restart-marker carries the ack chat; else fall back to resolveBootChatId
+    // so crash-recovery reconnects also get a card. Skip if the boot path
+    // already posted a card OR its sendMessage is in-flight (issue #489,
+    // klanker 2026-05-01; earlier dedupe 2026-04-26 only covered the
+    // post-resolution case). See `shouldSkipDuplicateBootCard`.
     const dedupeDecision = shouldSkipDuplicateBootCard({ activeBootCard, bootCardPending }, 'bridge-reconnect')
     if (dedupeDecision.skip) {
       process.stderr.write(`telegram gateway: bridge-reconnect: skipping boot card (${dedupeDecision.reason})\n`)
@@ -10471,7 +10470,9 @@ if (isGatewayMain) ipcServer = createIpcServer({
         clearRestartMarker()
       }
 
-      const reason = determineRestartReason({ marker, cleanMarker, sessionMarker: storedSession, now: nowMs })
+      // B2: boot path cleared the markers — reuse its reason (boot-reason.ts).
+      const reason = determineBridgeReconnectReason({ marker, cleanMarker, sessionMarker: storedSession,
+        now: nowMs, gatewayStartedAtMs: GATEWAY_STARTED_AT_MS, bootReason: bootReasonAtStartup })
       const target = resolveBootChatId(marker, markerAgeMs)
 
       if (target) {
@@ -23488,15 +23489,14 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
           } else {
             const markerAgeMs = marker ? nowMs - marker.ts : undefined
             const reason = determineRestartReason({ marker, cleanMarker, sessionMarker: storedSession, now: nowMs })
+            // Markers were cleared above — stash for bridge re-register (B2).
+            bootReasonAtStartup = reason
             const target = resolveBootChatId(marker, markerAgeMs)
 
-            // Issue #92: when reason='crash' AND no chat is resolvable,
-            // the gateway used to silently skip — the only signal a user
-            // got was their next message landing on a fresh process. Now
-            // we always surface unplanned crashes via the operator-events
-            // pipeline, which broadcasts to access.allowFrom (same path
-            // permission requests use). The pipeline's per-agent per-kind
-            // cooldown protects against crash loops spamming the chat.
+            // Issue #92: when reason='crash' AND no chat is resolvable, the
+            // gateway used to silently skip. Always surface unplanned crashes
+            // via the operator-events pipeline (broadcasts to access.allowFrom;
+            // its per-agent per-kind cooldown absorbs crash loops).
             if (reason === 'crash') {
               const cleanMarkerStale = cleanMarker
                 ? !shouldSuppressRecoveryBanner(cleanMarker, nowMs, CLEAN_SHUTDOWN_MAX_AGE_MS)

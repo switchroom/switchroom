@@ -164,3 +164,91 @@ describe('determineRestartReason', () => {
     expect(result).toBe('crash')
   })
 })
+
+// ── determineBridgeReconnectReason (fleet-audit B2) ────────────────────────
+//
+// Live trace this pins (kdogg gateway-supervisor.log, 2026-08-02):
+//   06:27:43  shutdown.clean_marker_written reason="cli: restart"
+//   06:27:46  boot.clean_shutdown_detected → boot path logs reason=graceful
+//             …and CLEARS the clean-shutdown marker (2026-05-25 GC)
+//   06:27:55  surviving bridge re-registers → old code re-derived from the
+//             now-empty disk and logged reason=crash for a graceful restart.
+// Fleet-wide: lawgpt 310 / reggie 179 / ziggy 175 / kdogg 174 such lines.
+
+import { determineBridgeReconnectReason } from '../gateway/boot-reason.js'
+
+describe('determineBridgeReconnectReason', () => {
+  it('reuses the boot-determined reason when the boot path consumed the markers (kdogg 2026-08-02 trace)', () => {
+    const result = determineBridgeReconnectReason({
+      marker: null,               // cleared by the boot path
+      cleanMarker: null,          // cleared by the boot path
+      sessionMarker: sessionMarker(),
+      now: NOW,
+      gatewayStartedAtMs: NOW - 10_000, // bridge re-registered 10s after boot
+      bootReason: 'graceful',
+    })
+    // Old behavior (plain determineRestartReason on the empty disk state)
+    // returned 'crash' here — the B2 mislabel.
+    expect(result).toBe('graceful')
+  })
+
+  it('a still-present fresh restart marker wins over the cached boot reason', () => {
+    const result = determineBridgeReconnectReason({
+      marker: recentMarker(10_000),
+      cleanMarker: null,
+      sessionMarker: sessionMarker(),
+      now: NOW,
+      gatewayStartedAtMs: NOW - 10_000,
+      bootReason: 'graceful',
+    })
+    expect(result).toBe('planned')
+  })
+
+  it('a still-present fresh clean-shutdown marker wins over the cached boot reason', () => {
+    const result = determineBridgeReconnectReason({
+      marker: null,
+      cleanMarker: recentCleanMarker(5_000),
+      sessionMarker: sessionMarker(),
+      now: NOW,
+      gatewayStartedAtMs: NOW - 10_000,
+      bootReason: 'crash',
+    })
+    expect(result).toBe('graceful')
+  })
+
+  it('late re-register (gateway up past the reuse window) still classifies as crash', () => {
+    const result = determineBridgeReconnectReason({
+      marker: null,
+      cleanMarker: null,
+      sessionMarker: sessionMarker(),
+      now: NOW,
+      gatewayStartedAtMs: NOW - 6 * 60_000, // gateway alive 6 min — bridge side died
+      bootReason: 'graceful',
+    })
+    expect(result).toBe('crash')
+  })
+
+  it('no recorded boot reason falls back to the plain derivation', () => {
+    const result = determineBridgeReconnectReason({
+      marker: null,
+      cleanMarker: null,
+      sessionMarker: sessionMarker(),
+      now: NOW,
+      gatewayStartedAtMs: NOW - 10_000,
+      bootReason: null,
+    })
+    expect(result).toBe('crash')
+  })
+
+  it('fresh first boot (no session marker) reuses bootReason fresh', () => {
+    const result = determineBridgeReconnectReason({
+      marker: null,
+      cleanMarker: null,
+      sessionMarker: null,
+      now: NOW,
+      gatewayStartedAtMs: NOW - 3_000,
+      bootReason: 'fresh',
+    })
+    expect(result).toBe('fresh')
+  })
+})

@@ -83,3 +83,64 @@ export function determineRestartReason(opts: {
   if (sessionMarker != null) return 'crash'
   return 'fresh'
 }
+
+/**
+ * Boot-reason window during which a bridge re-register reuses the reason
+ * the boot path already determined. Matches the restart-marker and
+ * operator-marker freshness windows (5 min) — a bridge that survived a
+ * gateway restart reconnects within seconds of the new gateway's boot,
+ * comfortably inside it.
+ */
+export const BOOT_REASON_REUSE_WINDOW_MS = 5 * 60_000
+
+/**
+ * Determine the restart reason for a BRIDGE RE-REGISTER (gateway.ts
+ * `onClientRegistered`, the `bridge-reconnect` path) — as opposed to the
+ * gateway's own boot path.
+ *
+ * Why this exists (fleet-audit B2, kdogg 2026-08-02 06:27 trace): on a
+ * planned gateway restart (`cli: restart` SIGTERM), the bridge — living
+ * inside the separate claude process — survives and reconnects a few
+ * seconds after the new gateway boots. By then the boot path has already
+ * READ AND CLEARED the restart / clean-shutdown markers (the 2026-05-25
+ * GC, gateway.ts boot path), so re-deriving the reason from disk falls
+ * through to the sessionMarker branch and every such re-register logs —
+ * and, when a chat is resolvable, POSTS a boot card claiming —
+ * `reason=crash` for a perfectly graceful restart. Hundreds of these per
+ * agent fleet-wide (lawgpt 310, reggie 179, ziggy 175, kdogg 174).
+ *
+ * Decision:
+ *   1. Any on-disk marker still present → normal `determineRestartReason`
+ *      (in-gateway /restart flows where the gateway never went down write
+ *      a marker the boot path never consumed — keep honoring it).
+ *   2. No markers, but the gateway booted recently (<5 min) and recorded
+ *      the reason it determined at boot → reuse that reason. The bridge
+ *      is re-registering into the SAME restart episode the boot path
+ *      already classified.
+ *   3. Otherwise (gateway long-lived, markers absent) → fall through to
+ *      `determineRestartReason` — a marker-less bridge re-register hours
+ *      into a gateway's life still classifies conservatively as 'crash'
+ *      (the claude/bridge side genuinely died and came back).
+ */
+export function determineBridgeReconnectReason(opts: {
+  marker: { ts: number } | null
+  cleanMarker: CleanShutdownMarker | null
+  sessionMarker: SessionMarker | null
+  now: number
+  /** `GATEWAY_STARTED_AT_MS` of the running gateway process. */
+  gatewayStartedAtMs: number
+  /** Reason the gateway's own boot path determined (null if it never ran). */
+  bootReason: RestartReason | null
+  bootReasonReuseWindowMs?: number
+  cleanMaxAgeMs?: number
+  markerMaxAgeMs?: number
+  operatorMaxAgeMs?: number
+}): RestartReason {
+  const { gatewayStartedAtMs, bootReason, bootReasonReuseWindowMs = BOOT_REASON_REUSE_WINDOW_MS } = opts
+  if (opts.marker == null && opts.cleanMarker == null
+    && bootReason != null
+    && opts.now - gatewayStartedAtMs < bootReasonReuseWindowMs) {
+    return bootReason
+  }
+  return determineRestartReason(opts)
+}

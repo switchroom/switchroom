@@ -215,10 +215,26 @@ export function createIpcClient(options: IpcClientOptions): Promise<IpcClientHan
 
   function scheduleReconnect(): void {
     if (closed) return;
+    // Single-flight: a broken connection can reach here twice (the
+    // Bun.connect failure catch AND the socket close handler both fire
+    // for the same attempt). Two live timers mean two parallel
+    // doConnect() calls and a spare socket — observed in gateway logs
+    // as an instant anonymous connect+disconnect (agent=null) right
+    // before the real re-register.
+    if (reconnectTimer) return;
     log(`reconnecting in ${currentDelay}ms`);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (!closed) doConnect();
+      if (!closed) {
+        // Swallow the rejection: doConnect's own catch has already
+        // logged the failure and scheduled the next retry. Without this,
+        // every failed BACKGROUND reconnect (e.g. the gateway restarting
+        // out from under a long-lived bridge) surfaced as a process-level
+        // unhandledRejection — "Error: Failed to connect" in
+        // bridge-crash.log — and pre-#3033 killed the bridge process
+        // outright (Claude Code never respawns a dead MCP server).
+        doConnect().catch(() => {});
+      }
     }, currentDelay);
     currentDelay = Math.min(currentDelay * 2, maxReconnectDelayMs);
   }
