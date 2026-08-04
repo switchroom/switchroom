@@ -28,7 +28,7 @@
  * is visibly running; nulling `currentTurn` there would darken the very feed the
  * user is watching. A turn with no in-flight tool is unaffected.
  *
- * #4331 caveat: an activity-card render that LANDED on Telegram within
+ * #4330 caveat: an activity-card render that LANDED on Telegram within
  * `CARD_RENDER_FRESH_MS` (stamped via `noteCardRender` from the card-drain
  * transport) likewise DEFERS the terminal unwedge, bounded by the same hard
  * ceiling — a visibly-updating pinned "→ Working…" card is user-visible
@@ -119,7 +119,7 @@ export interface SilencePokeState {
    * gates the terminal teardown. */
   sawBashThisTurn: boolean
   /**
-   * #4331: wall-clock ms of the last activity-card render (open or in-place
+   * #4330: wall-clock ms of the last activity-card render (open or in-place
    * edit) that actually LANDED on Telegram for this turn — the pinned
    * "→ Working… · Nm · N tools" status card the user is watching. Stamped by
    * `noteCardRender` from the card-drain transport site
@@ -177,7 +177,7 @@ export const DEFAULT_THRESHOLDS: ThresholdsMs = {
 export const DEFAULT_POLL_INTERVAL_MS = 5_000
 
 /**
- * #4331 — how recent the last landed activity-card render must be for the
+ * #4330 — how recent the last landed activity-card render must be for the
  * card to count as "actively updating in front of the user". The framework
  * heartbeat edits the card every ~6s (FEED_HEARTBEAT_MIN_STALE_MS); 30s
  * tolerates several shed/coalesced cosmetic edits under flood-control
@@ -432,7 +432,7 @@ export function noteProduction(key: string, now: number): void {
 }
 
 /**
- * #4331: record an activity-card render (open or in-place edit) that actually
+ * #4330: record an activity-card render (open or in-place edit) that actually
  * LANDED on Telegram for `key` — the pinned "→ Working…" status card visibly
  * moved. Called from the card-drain transport site
  * (`gateway/narrative-lane.ts` drainActivitySummary) after a successful
@@ -865,7 +865,7 @@ function tick(now: number): void {
         // gated by SWITCHROOM_SILENCE_DEFER_INFLIGHT_TOOLS=0 — that flag
         // scopes the TOOL defers; compaction has no tool in flight.
         if (activeDeps.isCompactionInFlight?.(key) === true) continue
-        // #4331 — the pinned activity card is visibly updating. A card render
+        // #4330 — the pinned activity card is visibly updating. A card render
         // (open or edit) landed on Telegram within CARD_RENDER_FRESH_MS, so
         // the user is watching a live "→ Working… · Nm · N tools" surface —
         // the "silent to the user" premise does not hold, and tearing the

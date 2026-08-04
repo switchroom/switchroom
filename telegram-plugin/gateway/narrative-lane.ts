@@ -497,7 +497,7 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
             // payload IS on screen, so it advances normally below.
             if (isSendGateShed(editRes)) break
           }
-          // #4331 — a card render LANDED (fresh open above, or a non-shed
+          // #4330 — a card render LANDED (fresh open above, or a non-shed
           // edit): the pinned "→ Working…" status card the user watches just
           // visibly moved. Stamp silence-poke's card-render clock so the 300s
           // terminal fallback is DEFERRED (bounded by the hard ceiling) while

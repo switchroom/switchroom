@@ -1,5 +1,5 @@
 /**
- * #4331 — a visibly-updating pinned activity card must not be treated as
+ * #4330 — a visibly-updating pinned activity card must not be treated as
  * silence by the 300s terminal fallback.
  *
  * The bug (user-reported, with screenshot): the framework fired the terminal
@@ -83,7 +83,7 @@ afterEach(() => {
   __resetAllForTests()
 })
 
-describe('silence-poke — #4331 card-render defer (outcome)', () => {
+describe('silence-poke — #4330 card-render defer (outcome)', () => {
   it('a turn whose ONLY output is card renders faster than the fresh window is NOT torn down past 300s', () => {
     const fx = setupDeps()
     startTurn('chat:1', 0)
@@ -239,7 +239,7 @@ function makeLaneTurn(lane: ReturnType<typeof createNarrativeLane>): CurrentTurn
   return turn
 }
 
-describe('silence-poke — #4331 wiring: the REAL card drain defers the fallback', () => {
+describe('silence-poke — #4330 wiring: the REAL card drain defers the fallback', () => {
   it('a card render landed through drainActivitySummary defers a due fallback; without it the fallback fires', async () => {
     const key = `${CHAT}:`
     const now = Date.now()
@@ -284,7 +284,7 @@ describe('silence-poke — #4331 wiring: the REAL card drain defers the fallback
 //    gateway IIFE, not instantiable in-process — same pattern as
 //    silence-liveness-wiring.test.ts) must reset the silence clock ──────────
 
-describe('silence-poke — #4331 progress_update liveness wiring (structural)', () => {
+describe('silence-poke — #4330 progress_update liveness wiring (structural)', () => {
   it('the progress_update handler calls silencePoke.noteOutbound after the send lands', () => {
     const gatewaySrc = readFileSync(resolve(__dirname, '..', 'gateway', 'gateway.ts'), 'utf-8')
     const start = "if (!args.chat_id) throw new Error('progress_update: chat_id is required')"
@@ -293,7 +293,7 @@ describe('silence-poke — #4331 progress_update liveness wiring (structural)', 
     expect(block.length).toBeGreaterThan(100) // sanity: slice found the handler
     // A progress_update is a fresh user-visible outbound the model authored —
     // it must reset the 300s silence clock exactly like a reply send does
-    // (outbound-send-path.ts). Pre-#4331 only signalTracker was ticked, so a
+    // (outbound-send-path.ts). Pre-#4330 only signalTracker was ticked, so a
     // turn narrating solely via progress_update was torn down as "silent".
     expect(block).toMatch(/silencePoke\.noteOutbound\(key, Date\.now\(\)\)/)
   })
