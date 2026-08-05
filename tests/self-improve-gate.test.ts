@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import { runGate } from "../src/self-improve/gate.js";
 import type { TurnMessage } from "../src/self-improve/types.js";
 
-const cfg = { repetitionThreshold: 2, t1MaxChangedLines: 30, maxAutoAppliesPerDay: 3, maxOutstandingPending: 5 };
+const cfg = { repetitionThreshold: 2, t1MaxChangedLines: 30, t1MaxGrowthBytes: 4096, maxAutoAppliesPerDay: 3, maxOutstandingPending: 5 };
 
 function user(text: string): TurnMessage {
   return { role: "user", text };
