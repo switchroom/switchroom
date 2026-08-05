@@ -41,7 +41,10 @@ import {
   writeReviewContext,
   clearReviewContext,
 } from "../self-improve/review-context.js";
-import { sweepEvalIntegrity } from "../self-improve/eval-cases.js";
+import {
+  sweepEvalIntegrity,
+  surfaceSweepTamper,
+} from "../self-improve/eval-cases.js";
 import { writeCorrectionPending } from "../memory/hindsight-retain-provenance.js";
 import type { TurnMessage } from "../self-improve/types.js";
 
@@ -270,7 +273,14 @@ function main(): void {
   // OFF). Best-effort and never throws; the Stop hook is fail-open. Cheap when
   // no skill ships evals (a single readdir that finds nothing).
   try {
-    sweepEvalIntegrity(resolveSkillsRoot(), resolveStateDir());
+    const stateDir = resolveStateDir();
+    const report = sweepEvalIntegrity(resolveSkillsRoot(), stateDir);
+    // RFC invariant 3(b): a heal/quarantine must surface a T2 pending note so
+    // the operator SEES the tamper. R2 (#4426) BLOCKS a tampered skill's auto-
+    // apply but silently; this is the visibility half — a prerequisite for the
+    // SWITCHROOM_SELF_IMPROVE_T1_LIVE flip. Idempotent per slug+kind, never
+    // throws (fail-open).
+    surfaceSweepTamper(stateDir, report);
   } catch {
     /* fail-open: a sweep error must never fail the turn */
   }

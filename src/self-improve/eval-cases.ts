@@ -45,6 +45,11 @@ import { createHash } from "node:crypto";
 
 import { evalsJsonPath } from "./eval-gate.js";
 import { scanForPII } from "./pii-scan.js";
+import {
+  enqueuePending,
+  readPending,
+  type PendingSuggestion,
+} from "./pending-queue.js";
 
 // ── Schema ───────────────────────────────────────────────────────────
 
@@ -447,4 +452,122 @@ export function sweepEvalIntegrity(
     }
   }
   return report;
+}
+
+/** triggered_by marker every sweep-tamper pending note carries — the stable
+ *  key a doctor/one-tap surface (and our own per-turn dedup) filters on. */
+export const SWEEP_TAMPER_SIGNAL = "eval-integrity-sweep";
+/** Per-kind markers, so a healed note and a quarantined note for the same
+ *  slug are distinct events and dedup independently. */
+export const SWEEP_HEALED_SIGNAL = "drift-reverted";
+export const SWEEP_QUARANTINED_SIGNAL = "quarantined";
+
+/** True when an outstanding (un-actioned) pending note already surfaces this
+ *  exact slug+kind — so a persistent tamper (a quarantined evals.json that
+ *  reappears every turn, or the same drift being re-reverted) is surfaced
+ *  ONCE, not spammed onto the queue every Stop hook. */
+function hasOutstandingSweepNote(
+  pending: PendingSuggestion[],
+  slug: string,
+  kindSignal: string,
+): boolean {
+  return pending.some(
+    (p) =>
+      p.actioned !== true &&
+      p.skill_slug === slug &&
+      Array.isArray(p.triggered_by) &&
+      p.triggered_by.includes(SWEEP_TAMPER_SIGNAL) &&
+      p.triggered_by.includes(kindSignal),
+  );
+}
+
+/**
+ * RFC invariant 3(b) — "the per-turn Stop hook … enqueues a T2 pending note
+ * surfacing the tamper." Consume a {@link SweepReport} and, for every slug the
+ * sweep HEALED (out-of-band drift reverted) or QUARANTINED (un-sanctioned
+ * evals.json that failed the PII/secret scan), enqueue a T2 pending note so
+ * the operator gets a visible signal in the same store every other self-
+ * improve proposal lands in.
+ *
+ * WHY this is load-bearing before the T1-live flip: R2 (issue #4426) makes the
+ * integrity gate BLOCK a tampered skill's auto-apply, but blocking is silent.
+ * Without this surface the operator would get NO signal that tamper was
+ * detected/healed/quarantined — exactly the visibility 3(b) mandates before
+ * silent T1 apply can be turned on.
+ *
+ * Deterministic and idempotent: a note is enqueued only when no outstanding
+ * (un-actioned) note already surfaces that slug+kind, so a persistent tamper
+ * is reported once rather than every turn. Best-effort and never throws — the
+ * Stop hook is fail-open; a surfacing error must never fail the turn.
+ *
+ * Returns the slugs actually enqueued (for observability + tests).
+ */
+export function surfaceSweepTamper(
+  stateDir: string,
+  report: SweepReport,
+  opts: { now?: () => number } = {},
+): { healed: string[]; quarantined: string[] } {
+  const enqueued = { healed: [] as string[], quarantined: [] as string[] };
+  if (report.healed.length === 0 && report.quarantined.length === 0) {
+    return enqueued; // nothing tampered — the common, cheap path.
+  }
+  let pending: PendingSuggestion[];
+  try {
+    pending = readPending(stateDir);
+  } catch {
+    pending = [];
+  }
+  const tryEnqueue = (
+    slug: string,
+    kindSignal: string,
+    lesson: string,
+    proposed_change: string,
+    tier_reason: string,
+    bucket: string[],
+  ): void => {
+    if (hasOutstandingSweepNote(pending, slug, kindSignal)) return;
+    try {
+      const q = enqueuePending(
+        stateDir,
+        {
+          tier: "T2",
+          lesson,
+          proposed_change,
+          tier_reason,
+          skill_slug: slug,
+          triggered_by: [SWEEP_TAMPER_SIGNAL, kindSignal],
+        },
+        { now: opts.now },
+      );
+      if (q.ok) {
+        // Keep the local view current so a healed+quarantined pair in one
+        // sweep can't both be blocked/allowed on a stale read.
+        pending.push(q.suggestion);
+        bucket.push(slug);
+      }
+    } catch {
+      /* queue best-effort — a surfacing error must not fail the turn */
+    }
+  };
+  for (const slug of report.healed) {
+    tryEnqueue(
+      slug,
+      SWEEP_HEALED_SIGNAL,
+      `Eval-integrity sweep reverted out-of-band drift in skill "${slug}" (evals/evals.json) to the sanctioned baseline.`,
+      `Confirm the change to ${slug}/evals/evals.json was intended. A Bash/Write edit that bypasses the applier is auto-reverted every turn; re-add the case via \`switchroom self-improve add-eval-case\` so it becomes a sanctioned baseline.`,
+      `eval-integrity sweep detected + healed out-of-band tamper (RFC invariant 3(b))`,
+      enqueued.healed,
+    );
+  }
+  for (const slug of report.quarantined) {
+    tryEnqueue(
+      slug,
+      SWEEP_QUARANTINED_SIGNAL,
+      `Eval-integrity sweep QUARANTINED skill "${slug}": an un-sanctioned evals.json failed the PII/secret scan and was NOT adopted as a baseline.`,
+      `Review ${slug}/evals/evals.json for PII/secrets or corruption — the sweep refuses to trust it. Re-add clean cases via \`switchroom self-improve add-eval-case\`.`,
+      `eval-integrity sweep quarantined un-sanctioned evals.json (RFC invariant 3(b), MAJOR 2)`,
+      enqueued.quarantined,
+    );
+  }
+  return enqueued;
 }
