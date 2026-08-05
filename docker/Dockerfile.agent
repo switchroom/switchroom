@@ -109,7 +109,12 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.13 /uv /uvx /usr/local/bin/
 # newest was 1.61.0) — pick the newest that exists on both, or the pip
 # install fails "No matching distribution".
 ARG PLAYWRIGHT_VERSION=1.61.0
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers
+# Where the fleet-default browser build is BAKED (an immutable, root-owned
+# image layer — and the whole root fs is `read_only: true` under compose
+# anyway). Build-time installs below target it via an inline env override;
+# the RUNTIME PLAYWRIGHT_BROWSERS_PATH is deliberately NOT this path — see
+# the ENV further down.
+ARG PLAYWRIGHT_BAKED_BROWSERS=/opt/playwright/browsers
 
 # JS binding + chromium browser + system libs. The `npx playwright` here is
 # safe (and NOT the unpinned-npx trap): the pinned global was just installed
@@ -118,7 +123,8 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright/browsers
 # with no local install — guarded by scripts/check-no-unpinned-npx-playwright.mjs.
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g playwright@${PLAYWRIGHT_VERSION} \
- && npx playwright install --with-deps chromium
+ && PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BAKED_BROWSERS} \
+    npx playwright install --with-deps chromium
 
 # Python binding — same pinned version, so it resolves the SAME
 # chromium revision already baked above (no second ~150MB download).
@@ -129,7 +135,52 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # bake, a safety net if a future bump ever desyncs the revision.
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     pip3 install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
- && python3 -m playwright install chromium
+ && PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BAKED_BROWSERS} \
+    python3 -m playwright install chromium
+
+# Runtime browsers path = the PERSISTENT, AGENT-WRITABLE per-agent HOME
+# cache (Playwright's own default location given HOME=/state/agent/home,
+# a host bind mount — see compose.ts), NOT the read-only bake above.
+#
+# Why not point it at the bake (the pre-#playwright-skew behaviour):
+# Playwright resolves browsers from ONE directory, keyed by revision
+# subdir (chromium-1228/ etc), and each Playwright version demands one
+# exact revision. A project whose package.json pins a DIFFERENT
+# Playwright version than PLAYWRIGHT_VERSION needs a revision the bake
+# doesn't carry, so `playwright install` tries to write into the env
+# path — and the bake is root-owned inside a `read_only: true` root fs,
+# so the install hard-fails with EACCES and the project's tests can
+# never run. Pointing the env at the HOME cache makes version-skewed
+# installs land in a writable dir that also SURVIVES container recreate.
+#
+# The bake still serves the fleet default with zero downloads:
+# start.sh.hbs symlinks each baked revision dir into this cache at boot
+# (revision dirs are immutable + version-keyed, so links and real
+# agent-installed dirs coexist side by side). Keep this in lockstep
+# with compose.ts's HOME env and the seeding block in
+# profiles/_base/start.sh.hbs.
+ENV PLAYWRIGHT_BROWSERS_PATH=/state/agent/home/.cache/ms-playwright
+
+# Protect the boot-seeded baked revisions from Playwright's browser GC.
+# Every `playwright install` runs registry.install(), which — before
+# downloading — GC-sweeps the browsers dir: any revision NOT referenced by
+# a `.links/<sha1(pkg)>` entry is deleted with `fs.rm(dir,{recursive,force})`
+# (playwright-core registry index.ts `_validateInstallationCache` /
+# `_deleteStaleBrowsers`; the marker/skip check itself is INSTALLATION_COMPLETE
+# inside each revision dir, browserFetcher.ts). The seed links we plant in the
+# HOME cache have NO matching `.links` entry there — the baked packages
+# registered their reference in /opt/playwright/browsers/.links at build time
+# (build-time registryDirectory), which the boot seeding deliberately does not
+# copy. So a project that pins a DIFFERENT Playwright version and runs
+# `playwright install` would GC-delete the fleet-default seed symlinks (rm on a
+# symlink removes only the link, leaving the read-only /opt bake intact), and
+# the next fleet-default use would re-download ~150MB — silently breaking the
+# zero-download guarantee for exactly the skew workflow this change enables.
+# Skipping GC keeps the seeds (and any project's own installs) untouched;
+# revisions are immutable + version-keyed so they safely coexist, and the only
+# cost is that a superseded project browser is not auto-reclaimed (rare;
+# per-agent HOME; operator-prunable).
+ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
 
 # Cloakbrowser — the local stealth Chromium driver used by webkite's
 # `webkite mcp` MCP server to fetch bot-gated sites. The webkite binary

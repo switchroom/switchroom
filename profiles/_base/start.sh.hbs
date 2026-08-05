@@ -1692,6 +1692,55 @@ if ! ls -d "$sr_cb_dir"/chromium-*/ >/dev/null 2>&1; then
 fi
 unset sr_cb_dir
 
+# Playwright browsers cache seeding. The agent image bakes the fleet-default
+# Playwright version's chromium at /opt/playwright/browsers (immutable:
+# root-owned inside a `read_only: true` root fs), but PLAYWRIGHT_BROWSERS_PATH
+# points at the persistent per-agent HOME cache (Dockerfile.agent ENV) so a
+# project pinning a DIFFERENT Playwright version can `playwright install` its
+# matching browser revision — revision-keyed dirs coexist side by side, and
+# the install survives container recreate via the HOME bind mount. Symlink
+# each baked revision into the cache so the fleet default (@playwright/mcp,
+# webapp-testing skill) still resolves with ZERO download; a real
+# agent-installed dir with the same name always wins over the link. Dangling
+# links into the bake (stale after an image bump changed the default
+# revision) are swept first. Dot-entries (.links) are untouched by the glob —
+# they must stay real + writable so project installs can register there.
+#
+# Zero-download depends on TWO things, not just this seeding. (1) Playwright
+# decides "already installed / skip download" purely by the INSTALLATION_COMPLETE
+# marker inside each revision dir (playwright-core browserFetcher.ts) — which
+# resolves fine through these symlinks, so the seed alone is enough at launch.
+# (2) BUT `playwright install` first GC-sweeps the browsers dir, deleting any
+# revision not referenced by a `.links/<sha1>` entry. The baked packages
+# registered their reference in /opt/.../.links at build time, not here, so a
+# skewed-version project install would otherwise GC these seed links and force a
+# re-download. Dockerfile.agent sets PLAYWRIGHT_SKIP_BROWSER_GC=1 in the runtime
+# env to disable that sweep — keep the two in lockstep. (`.links` is still
+# written by every install; we just never run the removal pass.)
+if [ -d /opt/playwright/browsers ]; then
+  sr_pw_cache="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+  mkdir -p "$sr_pw_cache" 2>/dev/null || true
+  if [ -d "$sr_pw_cache" ] && [ -w "$sr_pw_cache" ]; then
+    for sr_pw_link in "$sr_pw_cache"/*; do
+      if [ -L "$sr_pw_link" ] && [ ! -e "$sr_pw_link" ]; then
+        case "$(readlink "$sr_pw_link")" in
+          /opt/playwright/browsers/*) rm -f "$sr_pw_link" ;;
+        esac
+      fi
+    done
+    for sr_pw_rev in /opt/playwright/browsers/*/; do
+      [ -d "$sr_pw_rev" ] || continue
+      sr_pw_name="$(basename "$sr_pw_rev")"
+      if [ ! -e "$sr_pw_cache/$sr_pw_name" ]; then
+        ln -s "${sr_pw_rev%/}" "$sr_pw_cache/$sr_pw_name" 2>/dev/null || true
+      fi
+    done
+  else
+    echo "WARNING (playwright cache): $sr_pw_cache missing or not writable — baked browsers not linked; playwright-based skills may attempt a fresh ~150MB download" >&2
+  fi
+  unset sr_pw_cache sr_pw_rev sr_pw_name sr_pw_link
+fi
+
 # LiteLLM routing (opt-in, #litellm). When SWITCHROOM_LITELLM is set (compose
 # env, gated on litellm.enabled && keyConfirmed), route the unmodified `claude`
 # CLI through the operator's LiteLLM proxy at ANTHROPIC_BASE_URL: fetch the

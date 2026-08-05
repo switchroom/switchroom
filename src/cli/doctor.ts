@@ -406,19 +406,23 @@ function checkNodeVersion(): CheckResult {
  * browser cache. Returns the path to the first match, or null.
  *
  * Search order for the Playwright cache:
- *   1. $PLAYWRIGHT_BROWSERS_PATH (set in v0.7.13+ agent images at
- *      `/opt/playwright/browsers/`; placed in an image layer so the
- *      browser binary is shared across the fleet rather than
- *      per-agent in HOME).
- *   2. $HOME/.cache/ms-playwright (legacy on-demand cache from
- *      pre-v0.7.13 hosts where every agent ran `npx playwright`
- *      and downloaded chromium into its own home dir).
+ *   1. $PLAYWRIGHT_BROWSERS_PATH — since #playwright-skew this points at
+ *      the persistent per-agent HOME cache (agent-writable, holds any
+ *      project-pinned extra revisions); on v0.7.13..pre-skew images it
+ *      pointed at the /opt bake directly.
+ *   2. $HOME/.cache/ms-playwright (Playwright's own default — also the
+ *      legacy on-demand cache from pre-v0.7.13 hosts).
+ *   3. /opt/playwright/browsers — the image-baked fleet-default layout
+ *      (read-only image layer; start.sh symlinks it into the HOME cache
+ *      at boot, but probe it directly so doctor still finds the bake on
+ *      a container where the seeding hasn't run).
  *
  * @internal exported for testing
  */
 export function findChromium(
   homeDir: string = process.env.HOME ?? "",
   envBrowsersPath: string | undefined = process.env.PLAYWRIGHT_BROWSERS_PATH,
+  bakedBrowsersPath = "/opt/playwright/browsers",
 ): string | null {
   const candidates = [
     "chromium",
@@ -432,12 +436,15 @@ export function findChromium(
   }
 
   // Search Playwright cache locations in priority order: env-set
-  // location first (v0.7.13+ baked layout), then legacy ~/.cache/.
+  // location first, then the HOME default, then the image bake.
   const cacheLocations: string[] = [];
   if (envBrowsersPath && envBrowsersPath.length > 0) {
     cacheLocations.push(envBrowsersPath);
   }
   cacheLocations.push(join(homeDir, ".cache", "ms-playwright"));
+  if (bakedBrowsersPath && bakedBrowsersPath.length > 0) {
+    cacheLocations.push(bakedBrowsersPath);
+  }
 
   for (const cacheDir of cacheLocations) {
     if (!existsSync(cacheDir)) continue;
