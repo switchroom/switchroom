@@ -1,8 +1,105 @@
 # Changelog
 
-## unreleased — Playwright version-skew: project-pinned browser installs now work
+## v0.20.10 — compaction-boundary continuity, hindsight durability, an OAuth-disabled-org block fix, and Playwright version-skew
 
-### Runtime PLAYWRIGHT_BROWSERS_PATH moves off the read-only bake
+### Working state re-seats into context after compaction (#4390)
+
+Claude Code auto-compacts late in the context window, and the native
+summarizer flattens exactly the fast-moving working state an agent is juggling
+mid-task — an active checklist, the current plan, in-flight IDs, the "where
+was I" scratch — that isn't yet persisted to Hindsight or a file. A new
+default `SessionStart` hook (matcher `compact`) `cat`s the agent's
+`$TELEGRAM_STATE_DIR/.working-state.md` back into context right after the
+compaction boundary, wrapped in a `<working-state>` delimiter that marks it as
+reloaded post-compaction state. `SessionStart` stdout (unlike `PreCompact`,
+whose stdout is not injected) is added to the model's context, and the
+`compact` matcher plus a defensive stdin `source` re-check scope the hook to
+compaction only so it never re-injects on every boot. It is a bounded ~4ms
+`cat` that no-ops when the file is absent or empty (the common case — nothing
+in switchroom creates the file; the agent maintains it as its own durable
+scratch), emitted from `buildSettingsHooksBlock` so it survives `apply`/
+`update` through the same single-source-of-truth path reconcile and the drift
+check use. (`bin/working-state-reload-hook.sh`, `src/agents/scaffold.ts`,
+`docs/session-optimization.md`.)
+
+### Compaction also re-injects a lean re-seat briefing (#4392)
+
+Building on the working-state reload, the `SessionStart(compact)` hook now
+also re-injects a **lean briefing** — a scoped recent Telegram tail plus a
+Hindsight recall — so a compacted session reaches parity with a fresh boot.
+This closes the gap where a planned restart or crash re-seated richly but a
+compaction (the most frequent continuity event) re-seated only the static
+recovery block from #4390. The briefing is delegated to a new
+`handoff-briefing.sh --lean` mode — the single briefing assembler, with no
+copy of the sqlite/recall logic living in the hook — and emits only the tail +
+recall, skipping daily-memory and the boot header because the native
+compaction summary already preserves recent turns. Correctness over staleness:
+lean mode zeroes the previous boot's `SWITCHROOM_PENDING_*` surface and derives
+the most-recently-active `(chat_id, thread_id)` straight from `history.db`, so
+a compaction hours into a session briefs the currently-active chat. An absent
+`history.db` or unreachable Hindsight degrades to whatever it can emit and
+never fails the hook; the hook timeout rises 3s→8s to cover the one Hindsight
+hop. (`bin/handoff-briefing.sh`, `bin/working-state-reload-hook.sh`,
+`src/agents/scaffold.ts`.)
+
+### hindsight SessionStart durability hook runs async so drain/reconcile finish (#4393)
+
+The hindsight-memory `SessionStart` hook does the durability recovery a prior
+session's abrupt death skipped — **drain** the SessionEnd-queued retains and
+**reconcile** un-committed transcript turns — but its two independent 4s
+wall-clock budgets plus a Mode-1 server's ~2s health probe stacked past the
+synchronous 5s hook timeout, so Claude Code SIGKILLed the hook part-way
+through and truncated exactly the durability work it exists to do, letting the
+pending-retains backlog grow. The hook is now `async: true` — the same
+non-blocking pattern the Stop-event `retain.py` already uses — and because it
+injects no context, nothing in the session depends on it finishing before the
+first prompt. Its `timeout` rises 5→30 purely as a background-lifetime ceiling
+above the ~10s summed sub-budgets; drain and reconcile self-cap at their own
+budgets regardless, so the worst case is a self-terminating background run,
+not a startup block. The vendored copy is switchroom's own fork (upstream's
+`session_start.py` has no drain/reconcile), so the fix lands here with no
+upstream counterpart to patch. (`vendor/hindsight-memory/scripts/session_start.py`,
+`vendor/hindsight-memory/hooks/hooks.json`.)
+
+### Bounded dead-letter auto-requeue safety net enabled (#4395)
+
+Flips **ON** the already-built, already-tested FK-race dead-letter recovery
+sweep by durably pinning its two enable knobs
+(`SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS=1`,
+`SWITCHROOM_HINDSIGHT_REQUEUE_MAX=25`) onto the `switchroom-hindsight`
+container's environment on both the docker-run and compose paths — previously
+these were read only from the maintenance script's process environment and
+defaulted OFF, so the sweep never ran on the fleet. The sweep re-POSTs each
+`retain` op the `unit_entities` `ForeignKeyViolation` race misclassified as a
+deterministic failure — scoped exactly to that signature (`status='failed'`,
+intact `task_payload`, `retry_count=0`, `next_retry_at IS NULL`) — back to the
+engine's own retry endpoint, so the **stalled**, not lost, memory finally
+lands. Recovery half only: the classifier prevention fix (#3797,
+`memory_engine.py`) stays explicitly out of scope. Bounded at 25/tick because
+each requeue re-runs LLM fact extraction — a safe ceiling over the historical
+~14-23 backlog that clears a realistic burst without risking a large
+unexpected spend if the classifier regresses. Env is baked at container-
+creation time, so it needs a **recreate** (`switchroom memory --restart` or
+the next `switchroom apply`), not a plain `docker restart`; the first sweep
+lands ~30min after recreate. (`src/setup/hindsight.ts`.)
+
+### OAuth-disabled-org 403 now classifies as entitlement_blocked (#4391)
+
+A deactivated / OAuth-disabled Claude account returned a 403 whose body
+(`oauth_not_allowed_for_organization`) matched none of `fetchQuota`'s prose
+entitlement matcher, so it fell through to `failureKind: "other"`, cached no
+snapshot, and left eligibility at `unknown` instead of `blocked` — the account
+stayed selectable and failed at request time. Classification is now keyed on
+the **structured** `error.details.error_code` via a narrow allowlist
+(`ENTITLEMENT_BLOCKED_ERROR_CODES`), with the legacy prose matcher kept as a
+fallback: a 403 marks `entitlement_blocked` when the code is on the allowlist
+OR the prose matcher fires. Deliberately narrow — an unrelated/transient 403
+(bad scope, edge 403) and any 5xx stay `"other"` and never bench a healthy
+account — and self-healing via the existing `markEntitlementBlocked` →
+`clearEntitlementBlocked`-on-next-successful-probe path, so no eligibility or
+broker change was needed. (`src/auth/quota.ts`.)
+
+### Runtime PLAYWRIGHT_BROWSERS_PATH moves off the read-only bake (#4394)
 
 The agent image bakes one pinned Playwright (`ARG PLAYWRIGHT_VERSION`) and its
 matching chromium revision at `/opt/playwright/browsers`, and used to point
