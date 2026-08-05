@@ -10,13 +10,17 @@
  *  - NO roll and NO ineligibility: agent mirrors untouched, `auth.active`
  *    untouched, the account still reads eligible / not exhausted;
  *  - the clamp: a bogus long throttle is bounded to the short ceiling;
- *  - the escalation guard: 3 hits inside the window trigger ONE live probe;
- *    a probe that corroborates a wall converts to the standard
+ *  - first-hit corroboration (#failover-429-corroborate): a SINGLE mark runs
+ *    ONE live probe; a probe that corroborates a wall converts to the standard
  *    mark-exhausted + fleet roll (mirror fanout, durable promote, audit
- *    reason "throttle-escalation") — announced by the RAISING gateway from
- *    the response, NOT via `last_fleet_roll` (reactive-path doctrine, which
- *    also covers pinned-account rolls); a healthy probe leaves the account
- *    merely throttled and re-arms the counter;
+ *    reason "throttle-escalation", hit window cleared) — announced by the
+ *    RAISING gateway from the response, NOT via `last_fleet_roll`
+ *    (reactive-path doctrine, which also covers pinned-account rolls); a
+ *    healthy probe leaves the account merely throttled with the hit window
+ *    CARRIED FORWARD (not cleared);
+ *  - the probe rate-bound: after a probe, a second hit >5s later but WITHIN
+ *    THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS runs NO second probe; a hit past
+ *    that interval probes again (≤1 probe/min/account);
  *  - the re-mark dedup: a mark within 5s of the previous hit refreshes the
  *    expiry but adds NO hit and can trigger NO probe (probe-flood bound);
  *  - a later mark-exhausted PRESERVES the throttle fields in the entry.
@@ -27,7 +31,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AuthBroker } from "./server.js";
+import { AuthBroker, THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS } from "./server.js";
 import type { Identity } from "./peercred.js";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { writeAccountCredentials } from "../account-store.js";
@@ -80,14 +84,36 @@ function quotaFor(table: QuotaTable, accessToken: string): QuotaResult {
   const label = accessToken.replace(/^at-/, "");
   const q = table[label];
   if (!q) return { ok: false, reason: "no fixture for " + label };
+  const fiveWalled = q.fiveHour >= 99.5;
+  const sevenWalled = q.sevenDay >= 99.5;
   return {
     ok: true,
     data: {
       fiveHourUtilizationPct: q.fiveHour,
       sevenDayUtilizationPct: q.sevenDay,
+      // A walled 5h window resets in 3h; a walled 7d window in 3d — so a test
+      // can assert the mark took the maxed window's real reset.
+      fiveHourResetAt: fiveWalled ? new Date(NOW + 3 * 3_600_000) : null,
+      sevenDayResetAt: sevenWalled ? new Date(NOW + 3 * 86_400_000) : null,
+      representativeClaim: sevenWalled ? "seven_day" : fiveWalled ? "five_hour" : null,
+      overageStatus: null,
+      overageDisabledReason: null,
+    },
+  };
+}
+
+/** A minimal always-healthy probe result — for tests that only want to COUNT
+ *  probe calls (spy on `fetchQuotaImpl`) without threading the quota table.
+ *  Healthy so the first-hit corroboration stays put (no escalation). */
+function healthyProbe(): QuotaResult {
+  return {
+    ok: true,
+    data: {
+      fiveHourUtilizationPct: 10,
+      sevenDayUtilizationPct: 20,
       fiveHourResetAt: null,
-      sevenDayResetAt: q.sevenDay >= 99.5 ? new Date(NOW + 3 * 86_400_000) : null,
-      representativeClaim: q.sevenDay >= 99.5 ? "seven_day" : null,
+      sevenDayResetAt: null,
+      representativeClaim: null,
       overageStatus: null,
       overageDisabledReason: null,
     },
@@ -226,62 +252,67 @@ describe("mark-throttled — ledger round-trip, no roll, no ineligibility", () =
 });
 
 describe("mark-throttled — re-mark dedup (probe-flood bound)", () => {
-  it("a re-mark within 5s refreshes the expiry but adds NO escalation hit", async () => {
-    const { b } = makeBroker({
-      accounts: ["alice", "bob"],
-      quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
-    });
-    const r1 = await markThrottled(b, NOW + 60_000, "1");
-    expect(r1.data.throttled_until).toBe(NOW + 60_000);
-    // Simultaneous second agent marks a slightly later reset.
-    const r2 = await markThrottled(b, NOW + 90_000, "2");
-    expect(r2.data.escalated).toBe(false);
-    // Expiry keeps the LATER value; hit count stays 1.
-    expect(r2.data.throttled_until).toBe(NOW + 90_000);
-    expect(b.quota["alice"].throttle_hits).toEqual([NOW]);
-  });
-
-  it("a simultaneous 3-agent burst counts once and cannot trigger the probe", async () => {
+  it("a re-mark within 5s refreshes the expiry, adds NO hit, and runs NO extra probe", async () => {
     let probes = 0;
     const { b } = makeBroker({
       accounts: ["alice", "bob"],
-      quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
+      // Healthy account: the first-hit probe stays put, so this isolates the
+      // 5s dedup from escalation.
+      quotas: { alice: { fiveHour: 10, sevenDay: 20 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
     (b as any).fetchQuotaImpl = async () => {
       probes += 1;
-      return { ok: false as const, reason: "should not be probed" };
+      return healthyProbe();
+    };
+    const r1 = await markThrottled(b, NOW + 60_000, "1");
+    expect(r1.data.throttled_until).toBe(NOW + 60_000);
+    // First hit corroborates (healthy → stay put): exactly one probe.
+    expect(probes).toBe(1);
+    // Simultaneous second agent marks a slightly later reset, within 5s.
+    const r2 = await markThrottled(b, NOW + 90_000, "2");
+    expect(r2.data.escalated).toBe(false);
+    // Expiry keeps the LATER value; hit count stays 1; NO second probe.
+    expect(r2.data.throttled_until).toBe(NOW + 90_000);
+    expect(b.quota["alice"].throttle_hits).toEqual([NOW]);
+    expect(probes).toBe(1);
+  });
+
+  it("a simultaneous 3-agent burst shares ONE hit and ONE probe (the first)", async () => {
+    let probes = 0;
+    const { b } = makeBroker({
+      accounts: ["alice", "bob"],
+      quotas: { alice: { fiveHour: 10, sevenDay: 20 }, bob: { fiveHour: 5, sevenDay: 10 } },
+    });
+    (b as any).fetchQuotaImpl = async () => {
+      probes += 1;
+      return healthyProbe();
     };
     await markThrottled(b, NOW + 60_000, "1");
     await markThrottled(b, NOW + 60_000, "2");
     const r3 = await markThrottled(b, NOW + 60_000, "3");
     expect(r3.data.escalated).toBe(false);
-    expect(probes).toBe(0);
+    // The first hit probes; the 2nd/3rd land within 5s and dedup — one probe,
+    // one recorded hit, for the whole burst.
+    expect(probes).toBe(1);
     expect(b.quota["alice"].throttle_hits).toEqual([NOW]);
   });
 });
 
-describe("mark-throttled — escalation guard (3 hits / 10 min)", () => {
-  it("escalates to mark-exhausted + fleet roll when the live probe corroborates a wall", async () => {
-    const { b, h, clock } = makeBroker({
+describe("mark-throttled — first-hit corroboration + probe rate-bound", () => {
+  it("escalates on a SINGLE hit when the live probe corroborates a wall", async () => {
+    const { b, h } = makeBroker({
       accounts: ["alice", "bob"],
-      // alice is genuinely weekly-walled — the probe corroborates.
-      quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
+      // alice is genuinely 5h-walled — the FIRST-hit probe corroborates it,
+      // no 3-hit staging required.
+      quotas: { alice: { fiveHour: 100, sevenDay: 20 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
     const r1 = await markThrottled(b, NOW + 60_000, "1");
-    clock.set(NOW + HIT_SPACING_MS);
-    const r2 = await markThrottled(b, NOW + 60_000, "2");
-    expect(r1.data.escalated).toBe(false);
-    expect(r2.data.escalated).toBe(false);
-    expect(mirrorToken(h, "ziggy")).toBe(null); // still no roll after 2 hits
+    expect(r1.data.escalated).toBe(true);
+    expect(r1.data.rolledTo).toBe("bob");
 
-    clock.set(NOW + 2 * HIT_SPACING_MS);
-    const r3 = await markThrottled(b, NOW + 60_000 + 2 * HIT_SPACING_MS, "3");
-    expect(r3.data.escalated).toBe(true);
-    expect(r3.data.rolledTo).toBe("bob");
-
-    // Standard exhaustion mechanics ran: mark with the probe's weekly reset,
-    // fleet mirror fanout, durable promote.
-    expect(b.quota["alice"].exhausted_until).toBe(NOW + 3 * 86_400_000);
+    // Standard exhaustion mechanics ran off the probe's 5h reset (NOW + 3h):
+    // mark, fleet mirror fanout, durable promote.
+    expect(b.quota["alice"].exhausted_until).toBe(NOW + 3 * 3_600_000);
     expect(mirrorToken(h, "ziggy")).toBe("at-bob");
     expect(b.config.auth?.active).toBe("bob");
     expect(b.isAccountExhausted("alice")).toBe(true);
@@ -298,46 +329,82 @@ describe("mark-throttled — escalation guard (3 hits / 10 min)", () => {
     // covers pinned (non-fleet-active) rolls the fleet channel would skip.
     expect(b.lastFleetRoll).toBe(null);
 
-    // Counter cleared after the escalation probe.
+    // Hit window cleared after the corroborated escalation.
     expect(b.quota["alice"].throttle_hits).toEqual([]);
   });
 
-  it("does NOT escalate when the live probe shows the account healthy — counter re-arms", async () => {
-    const { b, h, clock } = makeBroker({
+  it("a healthy first-hit probe stays throttled and CARRIES the hit window forward", async () => {
+    const { b, h } = makeBroker({
       accounts: ["alice", "bob"],
       quotas: { alice: { fiveHour: 40, sevenDay: 30 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
-    await markThrottled(b, NOW + 60_000, "1");
-    clock.set(NOW + HIT_SPACING_MS);
-    await markThrottled(b, NOW + 60_000, "2");
-    clock.set(NOW + 2 * HIT_SPACING_MS);
-    const until3 = NOW + 60_000 + 2 * HIT_SPACING_MS;
-    const r3 = await markThrottled(b, until3, "3");
-    expect(r3.data.escalated).toBe(false);
-    expect(r3.data.rolledTo).toBe(null);
+    const until = NOW + 60_000;
+    const r1 = await markThrottled(b, until, "1");
+    expect(r1.data.escalated).toBe(false);
+    expect(r1.data.rolledTo).toBe(null);
 
-    // Still merely throttled: no mark, no roll, counter cleared (one probe
-    // per burst, not one per subsequent hit).
+    // Still merely throttled: throttle recorded, no exhaustion mark, no roll.
+    expect(b.quota["alice"].throttled_until).toBe(until);
     expect(b.quota["alice"].exhausted_until).toBeUndefined();
-    expect(b.quota["alice"].throttled_until).toBe(until3);
-    expect(b.quota["alice"].throttle_hits).toEqual([]);
     expect(mirrorToken(h, "ziggy")).toBe(null);
+    expect(b.config.auth?.active).toBe("alice");
+    expect(b.isAccountExhausted("alice")).toBe(false);
     expect(auditRows(h).some((r) => r.op === "mark-exhausted")).toBe(false);
+
+    // The pruned window is CARRIED FORWARD (not cleared) — a healthy probe does
+    // not reset the observability ledger. This is the core NEW-model contrast
+    // with an escalation, which clears it to [].
+    expect(b.quota["alice"].throttle_hits).toEqual([NOW]);
   });
 
-  it("hits OUTSIDE the 10-min window do not count toward escalation", async () => {
+  it("rate-bounds the probe to at most one per THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS", async () => {
+    let probes = 0;
     const { b, clock } = makeBroker({
       accounts: ["alice", "bob"],
-      quotas: { alice: { fiveHour: 10, sevenDay: 100 }, bob: { fiveHour: 5, sevenDay: 10 } },
+      quotas: { alice: { fiveHour: 40, sevenDay: 30 }, bob: { fiveHour: 5, sevenDay: 10 } },
     });
-    // Two old hits, spaced past the dedup, then aged past the window.
+    (b as any).fetchQuotaImpl = async () => {
+      probes += 1;
+      return healthyProbe();
+    };
+
+    // First hit probes.
+    await markThrottled(b, NOW + 60_000, "1");
+    expect(probes).toBe(1);
+
+    // Second hit >5s later (clears the re-mark dedup) but WITHIN the rate-bound
+    // interval of the last probe → NO second probe; account stays throttled.
+    const t2 = NOW + HIT_SPACING_MS; // +30s: past the 5s dedup, inside 60s
+    clock.set(t2);
+    const r2 = await markThrottled(b, t2 + 60_000, "2");
+    expect(probes).toBe(1);
+    expect(r2.data.escalated).toBe(false);
+    expect(b.quota["alice"].throttled_until).toBe(t2 + 60_000);
+
+    // Advance PAST the rate-bound interval → the next hit probes again.
+    const t3 = NOW + THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS + 1;
+    clock.set(t3);
+    await markThrottled(b, t3 + 60_000, "3");
+    expect(probes).toBe(2);
+  });
+
+  it("prunes hits aged past the 10-min window from the observability ledger", async () => {
+    const { b, clock } = makeBroker({
+      accounts: ["alice", "bob"],
+      // Healthy — no escalation; this test is about window pruning only.
+      quotas: { alice: { fiveHour: 10, sevenDay: 20 }, bob: { fiveHour: 5, sevenDay: 10 } },
+    });
+    // Two hits, spaced past the dedup, then a third after both age out.
     await markThrottled(b, NOW + 60_000, "1");
     clock.set(NOW + HIT_SPACING_MS);
     await markThrottled(b, NOW + 60_000, "2");
-    const late = NOW + 12 * 60_000; // both prior hits now outside the window
+    const late = NOW + 12 * 60_000; // both prior hits now outside the 10-min window
     clock.set(late);
     const r3 = await markThrottled(b, late + 60_000, "3");
     expect(r3.data.escalated).toBe(false);
+    // The window is pruned to just the fresh hit — the hit list is
+    // bookkeeping now (THROTTLE_ESCALATION_WINDOW_MS), it no longer gates
+    // escalation.
     expect(b.quota["alice"].throttle_hits).toEqual([late]);
   });
 });

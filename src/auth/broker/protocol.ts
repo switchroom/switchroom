@@ -148,8 +148,13 @@ export const MarkThrottledRequestSchema = z.object({
   op: z.literal("mark-throttled"),
   id: z.string().min(1),
   /** Unix ms when the throttle clears. Server-side clamped to a short
-   *  ceiling (throttles are minutes, never days). */
+   *  ceiling (throttles are minutes, never days). Ignored when probeOnly. */
   until: z.number().int().positive(),
+  /** #failover-429-corroborate — probe-only mode (generic-transient 429
+   *  origin). Run ONLY the rate-bounded escalation probe: on a corroborated
+   *  wall, mark-exhausted + roll; on a healthy probe, record NOTHING (no
+   *  throttled_until, no hit, no soft-defer) so the account stays inert. */
+  probeOnly: z.boolean().optional(),
 });
 
 export const RefreshAccountRequestSchema = z.object({

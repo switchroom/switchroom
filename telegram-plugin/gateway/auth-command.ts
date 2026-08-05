@@ -334,10 +334,12 @@ export interface AuthBrokerClient {
    * per-account rate limit on the CALLER's own account — `throttled_until`
    * in the quota ledger — WITHOUT rolling the fleet and WITHOUT touching
    * eligibility. `escalated` is true when the broker's escalation guard
-   * (repeated hits corroborated by a live probe) converted it into the
+   * (a first-hit live probe corroborating a wall) converted it into the
    * standard mark-exhausted + roll; `rolledTo` names the roll target then.
+   * `probeOnly` (#failover-429-corroborate, generic-transient origin): run ONLY
+   * the escalation probe — a healthy probe records nothing (account stays inert).
    */
-  markThrottled(until: number): Promise<{
+  markThrottled(until: number, probeOnly?: boolean): Promise<{
     account: string
     throttled_until: number
     escalated: boolean
