@@ -7430,6 +7430,38 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
     },
   ];
 
+  // --- Switchroom-owned SessionStart hooks ---
+  //
+  // Reload the agent's working-state file into context immediately after
+  // context compaction. Wired with matcher "compact" so it fires ONLY on
+  // auto/manual compaction — NOT on the "startup"/"resume"/"clear"/"fork"
+  // SessionStart sources (which would re-inject the file on every boot).
+  // Per Claude Code's hook contract, SessionStart stdout IS added to the
+  // model's context (unlike PreCompact stdout, which is not injected), so a
+  // plain `cat` of the working-state file re-seats fast-moving in-flight
+  // task state the instant the native summarizer replaces the transcript.
+  //
+  // NOT plugin-gated: it's a fail-safe `cat` of a small file
+  // ($TELEGRAM_STATE_DIR/.working-state.md) that no-ops when the file is
+  // absent, so every agent gets the same default. The hook itself re-checks
+  // the `source` field from stdin as belt-and-braces against a matcher
+  // regression. See bin/working-state-reload-hook.sh.
+  const switchroomSessionStart: Array<Record<string, unknown>> = [
+    {
+      matcher: "compact",
+      hooks: [
+        {
+          type: "command",
+          command: wrap(
+            "hook:working-state-reload",
+            `bash "${join(DOCKER_BIN_PATH, "working-state-reload-hook.sh")}"`,
+          ),
+          timeout: 3,
+        },
+      ],
+    },
+  ];
+
   // Combine user hooks + switchroom-owned hooks
   if (userHooks) {
     return {
@@ -7437,6 +7469,10 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       UserPromptSubmit: [
         ...((userHooks.UserPromptSubmit as unknown[]) ?? []),
         ...switchroomUserPromptSubmit,
+      ],
+      SessionStart: [
+        ...((userHooks.SessionStart as unknown[]) ?? []),
+        ...switchroomSessionStart,
       ],
       ...(switchroomPreToolUse.length > 0
         ? {
@@ -7467,6 +7503,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   return {
     UserPromptSubmit: switchroomUserPromptSubmit,
+    SessionStart: switchroomSessionStart,
     ...(switchroomPreToolUse.length > 0 ? { PreToolUse: switchroomPreToolUse } : {}),
     ...(switchroomPostToolUse.length > 0 ? { PostToolUse: switchroomPostToolUse } : {}),
     ...(switchroomStop.length > 0 ? { Stop: switchroomStop } : {}),
