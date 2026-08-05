@@ -1,5 +1,121 @@
 # Changelog
 
+## v0.20.9 — first-hit 429 corroboration, plus three duplicate-/dropped-message reliability fixes
+
+Reliability (2026-08-05): the broker's 429 throttle tier now corroborates a
+suspected account wall on the **first** hit via a rate-bounded quota probe
+instead of waiting for a 3-hit window, and three delivery fixes stop a
+sub-agent handback from double-replying, keep a caller-supplied synthetic
+reply anchor from 400ing a send, and stop an unreadable `skills.d` overlay
+from freezing cron hot-reloads.
+
+### 429 throttle corroborates on the first hit, rate-bounded (#4375)
+
+The broker's 429 throttle tier used to escalate only after 3 hits in a 10-min
+window, which stranded turns two ways: a genuine 5h/7d wall hiding behind
+generic/transient 429 wording either burned a dead turn waiting for the
+threshold, or — if the retries stopped before three hits — never escalated at
+all, so failover never fired. The tier now corroborates on the **first** 429
+by running a live account-quota probe: a probe that confirms a real wall
+converts the throttle into the standard mark-exhausted + fleet roll (announce
++ resume) in one round-trip, while a healthy probe leaves the account merely
+throttled and carries the pruned hit window forward. A healthy or transient
+429 stays fully account-inert — no `throttled_until` write, no throttle
+notice, no self-restart nudge, no second card, no failover — so the calm
+rate-limited card the gateway already emitted stays the only user-visible
+output. Bare `generic-transient` 429s, which previously dropped on the
+calm-card floor with no broker contact at all, are now routed through the
+throttle-tier runner's new probe-only entrypoint (`fireProbeOnly`) so the
+broker gets its corroboration probe; `litellm-proxy-local` cap trips remain
+account-inert by classification and never probe. The probe is rate-bounded to
+at most one per account per `THROTTLE_ESCALATION_PROBE_MIN_INTERVAL_MS` (60s)
+and combined with the single-flight wrapper and the 5s re-mark dedup, so a
+429 storm — even across several agents sharing an account — costs at most one
+probe per minute per account. The cost bound is enforced by mechanism, not
+prompt discipline. (`src/auth/broker/server.ts`,
+`telegram-plugin/throttle-tier.ts`.)
+
+### Sub-agent handback no longer double-replies against the CLI task-notification wake (#4352)
+
+One background sub-agent completion produced two independent wakes of the
+parent session — and two user-visible replies. The claude CLI proactively
+enqueues its own `<task-notification>` into the parent session when a
+backgrounded task/agent completes (switchroom had read that event only as a
+background-shell liveness signal), and the gateway separately synthesizes a
+`subagent_handback` inbound from the subagent-watcher's `onFinish`. Nothing
+linked the two, so both landed. The CLI-native wake can't be suppressed (it's
+the CLI's internal queue), so the fix gates the one lever switchroom holds —
+the handback enqueue — on a recently-seen terminal `<task-notification>` for
+exactly the same task id. The match is exact, not heuristic: the
+`<task-id>` is the `agent-<id>.jsonl` stem, i.e. precisely the watcher's
+`agentId`. The gate is fail-open by construction — no notification for the id,
+a notification past the 30s TTL, a non-terminal status, an in-memory ledger
+lost to a gateway restart, or a notification that lands after the enqueue all
+still deliver the handback, since a dropped real wake means a silent worker
+and a waiting user while an occasional double is strictly better. The liveness
+consumer is untouched: the same event still drives `noteBackgroundShellDead`.
+
+### Caller-supplied reply anchors routed through parseSourceMessageId (#4378)
+
+Follow-up audit from #4367. `parseSourceMessageId` is the canonical guard for
+reply anchors — Telegram's `reply_parameters.message_id` hard-rejects any
+value outside the signed-int32 range with a 400 (`field "message_id" must be a
+valid Number`), and `allow_sending_without_reply` does not bypass it. An agent
+that quoted a **synthetic** inbound — a boot-resume, sub-agent-handback, or
+cron turn fabricates a `message_id` from `Date.now()` (~1.78e13) — used to 400
+the whole send at every remaining caller-supplied `reply_to` site. Each of
+those sites now routes its anchor through `parseSourceMessageId` at the
+boundary where it enters send-opts (`sticker-aliases.ts`, `ask-user.ts`, the
+checklist entry/fallback paths, and `outbound-send-path.ts`'s
+`executeReply`/`sendReply`), so an out-of-range id is dropped and the message
+sends unanchored (the anchor is a nicety, not a requirement) instead of
+failing entirely. This replaces the old `Number(reply_to)` +
+`Number.isFinite && > 0` checks, which accepted a 13-digit synthetic id as
+finite and positive, and also closes a pre-existing NaN hole where a
+non-numeric `reply_to` still built an anchor.
+
+### Strict overlay freeze scoped to schedule.d, not skills.d (#4376)
+
+Follow-up to the #4371 fail-safe. The strict scheduler loader
+(`loadAgentEntriesStrict`) throws on any overlay read failure so a mid-write
+or unreadable `schedule.d` overlay freezes the live schedule instead of
+silently unregistering a live cron. But the underlying `overlayReadFailures`
+was agent-wide, so an unreadable `skills.d` overlay — entirely unrelated to
+the schedule — also tripped the throw and froze all cron hot-reloads. Each
+read failure is now tagged with its overlay class via a new
+`source: "schedule" | "skills"` field on `OverlayReadFailure`, and
+`overlayReadFailures` filters by it. The scheduler's strict guard and boot
+warning pass `"schedule"`, so a `skills.d` permission problem still warns (via
+the loader's per-file `console.warn`) but no longer freezes cron reloads; the
+`schedule.d` fail-safe is unchanged.
+
+### Docs
+
+- **#4377** — added a root-tier chown-overlay discipline rule to the default
+  CLAUDE.md agent template: a root agent that hand-edits a peer's `schedule.d`
+  / `skills.d` overlay must chown it back to the agent's uid, since a
+  root-owned overlay file EACCESes the in-container overlay loader every
+  hot-reload tick and silently drops the affected cron/skill until the next
+  apply-time uid sweep. Follow-up to #4371 (the failure mode that dropped a
+  peer's crons); the bullet is offset by same-section compressions to stay
+  under the CLAUDE.md byte ratchet.
+
+### Internal
+
+- **#4382** — made the `check-agent-attribution-trailers` lint guard robust to
+  GitHub's squash-merge trailer reparagraphing. The guard parsed trailers from
+  only the final commit paragraph, but a squash re-emits `Co-authored-by:`
+  lines as a separate final paragraph, splitting the `Switchroom-*` trailers
+  into the block above — so agent-authored PRs whose squash ended with a Claude
+  co-author were silently reported as unattributed and evicted from the merge
+  queue. The parse now folds consecutive trailer-only paragraphs into one
+  logical block, stopping at the first prose line. This unblocks the
+  release/merge pipeline itself.
+- **#4381** — added outcome-test coverage pinning the 429 classify→route
+  gateway wiring: `generic-transient` routes to the probe, while
+  `litellm-local` and `account-scoped` stay inert. Extracts the decision into a
+  pure injectable `routeRateLimit429` seam; no runtime change.
+
 ## v0.20.8 — three fleet-audit reliability fixes: synthetic-id queued cards, bridge disconnect churn, and cron-drop on unreadable overlays
 
 Reliability (2026-08-05): three fleet-audit fixes land together — the gateway
