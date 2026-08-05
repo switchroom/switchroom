@@ -121,9 +121,10 @@ describe("propose-skill --origin (R1: origin threaded CLI → IPC → store)", (
     runHandler(msg as unknown as PostSkillProposalMessage);
     const stored = readProposals(stateDir);
     expect(stored).toHaveLength(1);
-    // Absence ⇒ skill-synthesis (the documented back-compat default) — the
-    // record carries no explicit origin field.
-    expect(stored[0]!.origin).toBeUndefined();
+    // Absence ⇒ skill-synthesis (the documented back-compat default),
+    // materialized on read by the shared normalizer (#4428) so a consumer
+    // branching on `origin === "skill-synthesis"` never misses it.
+    expect(stored[0]!.origin).toBe("skill-synthesis");
   });
 
   it("rejects an invalid --origin before any IPC (commander-level validation)", () => {

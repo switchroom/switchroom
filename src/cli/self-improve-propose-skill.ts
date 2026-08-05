@@ -24,6 +24,11 @@ import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import type { Command } from "commander";
 
+import {
+  PROPOSAL_ORIGINS,
+  type ProposalOrigin,
+} from "../self-improve/skill-proposals";
+
 const IPC_CONNECT_TIMEOUT_MS = 5000;
 
 function gatewaySocketPath(): string {
@@ -34,10 +39,6 @@ function gatewaySocketPath(): string {
       : join(homedir(), ".claude", "channels", "telegram", "gateway.sock"))
   );
 }
-
-/** Allowed proposal-provenance values (mirrors `ProposalOrigin`). */
-const ALLOWED_ORIGINS = ["skill-synthesis", "failure-synthesis"] as const;
-type ProposalOrigin = (typeof ALLOWED_ORIGINS)[number];
 
 interface ProposeOpts {
   slug: string;
@@ -102,7 +103,7 @@ export function registerSelfImproveProposeSkillCommand(program: Command): void {
     .option("--agent <name>", "agent name (defaults to $SWITCHROOM_AGENT_NAME)")
     .option(
       "--origin <origin>",
-      `proposal provenance (${ALLOWED_ORIGINS.join(" | ")}); absent ⇒ skill-synthesis`,
+      `proposal provenance (${PROPOSAL_ORIGINS.join(" | ")}); absent ⇒ skill-synthesis`,
     )
     .action((opts: ProposeOpts) => {
       const agent = opts.agent ?? process.env.SWITCHROOM_AGENT_NAME;
@@ -110,9 +111,9 @@ export function registerSelfImproveProposeSkillCommand(program: Command): void {
 
       let origin: ProposalOrigin | undefined;
       if (opts.origin != null) {
-        if (!ALLOWED_ORIGINS.includes(opts.origin as ProposalOrigin)) {
+        if (!PROPOSAL_ORIGINS.includes(opts.origin as ProposalOrigin)) {
           fail(
-            `--origin must be one of: ${ALLOWED_ORIGINS.join(", ")} (got "${opts.origin}")`,
+            `--origin must be one of: ${PROPOSAL_ORIGINS.join(", ")} (got "${opts.origin}")`,
           );
         }
         origin = opts.origin as ProposalOrigin;

@@ -136,7 +136,8 @@ describe("skill-proposals store", () => {
   it("reads a legacy record lacking benchmark/origin (back-compat)", () => {
     // A record written before PR2 — no `origin`, no `benchmark`. It must
     // still parse, and absence of `origin` MUST read as skill-synthesis
-    // (the documented default), never as undefined-is-an-error.
+    // (the documented default), materialized on read (#4428) so a consumer
+    // branching on `origin === "skill-synthesis"` can never miss it.
     const legacy = {
       id: "legacy-1",
       created_at: "2026-01-01T00:00:00.000Z",
@@ -150,9 +151,36 @@ describe("skill-proposals store", () => {
     appendFileSync(join(dir, "skill-proposals.jsonl"), JSON.stringify(legacy) + "\n");
     const fetched = getProposal(dir, "legacy-1");
     expect(fetched).toBeTruthy();
-    expect(fetched?.origin).toBeUndefined(); // absence ⇒ skill-synthesis
+    expect(fetched?.origin).toBe("skill-synthesis"); // absence ⇒ default, materialized
     expect(fetched?.benchmark).toBeUndefined();
     expect(fetched?.is_new).toBe(true);
+  });
+
+  it("normalizes an un-normalized stored origin on read (#4428)", () => {
+    // A hand-written / tampered JSONL line carrying an origin that is NOT one
+    // of the valid provenance values. readProposals must collapse it to the
+    // skill-synthesis default via the shared normalizer — the origin check a
+    // consumer runs on the loaded record must never see the raw junk value.
+    const tampered = {
+      id: "tampered-1",
+      created_at: "2026-01-01T00:00:00.000Z",
+      status: "pending",
+      skill_slug: "deploy-checklist",
+      is_new: true,
+      lesson: baseInput.lesson,
+      draft: baseInput.draft,
+      evidence: baseInput.evidence,
+      origin: "hand-written-bogus-origin",
+    };
+    appendFileSync(
+      join(dir, "skill-proposals.jsonl"),
+      JSON.stringify(tampered) + "\n",
+    );
+    const fetched = getProposal(dir, "tampered-1");
+    expect(fetched).toBeTruthy();
+    // Without read-normalization this would surface the raw "hand-written-
+    // bogus-origin" string and bypass the origin check.
+    expect(fetched?.origin).toBe("skill-synthesis");
   });
 
   it("matches reworded proposals via content-word jaccard", () => {
