@@ -56,3 +56,20 @@ export function resolveSelfImproveConfig(): SelfImproveConfig {
 export function selfImproveEnabled(): boolean {
   return process.env.SWITCHROOM_SELF_IMPROVE !== "0";
 }
+
+/**
+ * Whether T1 SILENT auto-apply is live (opt-IN, OFF by default).
+ *
+ * Distinct from `selfImproveEnabled` (opt-OUT, the whole subsystem): this is
+ * the hard backstop for the eval-case work (RFC amendment §"corrections as
+ * eval cases", MJ1). Even with the subsystem on, a verified T1 does NOT land
+ * silently unless the operator explicitly opts in with
+ * `SWITCHROOM_SELF_IMPROVE_T1_LIVE=1`. Until then every apply-guard "allow"
+ * is downgraded to a T2 one-tap proposal. This is what makes a tampered eval
+ * unable to cause a silent auto-apply — the integrity manifest is only
+ * tamper-EVIDENT, this gate is the boundary. Flipping it ON is NOT part of
+ * the eval-case PR.
+ */
+export function t1LiveEnabled(): boolean {
+  return process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE === "1";
+}

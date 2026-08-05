@@ -16,7 +16,10 @@ import { join } from "node:path";
 const bunOk = spawnSync("which", ["bun"], { encoding: "utf-8" }).status === 0;
 const HOOK = join(process.cwd(), "src", "cli", "skill-validate-pretool.ts");
 
-function run(payload: unknown): {
+function run(
+  payload: unknown,
+  env: Record<string, string> = {},
+): {
   status: number;
   stdout: string;
   stderr: string;
@@ -25,6 +28,7 @@ function run(payload: unknown): {
     input: typeof payload === "string" ? payload : JSON.stringify(payload),
     encoding: "utf-8",
     timeout: 30000,
+    env: { ...process.env, ...env },
   });
   return {
     status: r.status ?? 1,
@@ -214,6 +218,179 @@ describe("skill-validate-pretool hook", () => {
     });
     expect(shrink.status).toBe(0);
     expect(shrink.stdout).toBe("");
+  });
+
+  // BL1 (RFC amendment §"corrections as eval cases"): evals/evals.json is
+  // machine-managed. A raw model Write/Edit to it must be BLOCKED on EVERY
+  // turn by this always-on hook (not only the review-scoped apply-guard),
+  // because a direct write bypasses the PII/secret scan AND the operator's
+  // one-tap approval. The sanctioned path is `add-eval-case`.
+  it("BL1: blocks a raw Write to evals/evals.json (always-on, no marker needed)", () => {
+    if (!bunOk) return;
+    const r = run(
+      {
+        tool_name: "Write",
+        tool_input: {
+          file_path: join(skillsRoot, "demo", "evals", "evals.json"),
+          content: '{"skill_name":"demo","evals":[{"name":"x","prompt":"p"}]}',
+        },
+      },
+      { SWITCHROOM_SELF_IMPROVE: "1" }, // hermetic: force self-improvement ON
+    );
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.decision).toBe("block");
+    expect(out.reason).toMatch(/add-eval-case/);
+    expect(out.reason).toMatch(/machine-managed|PII\/secret scan/i);
+  });
+
+  it("BL1: blocks a raw Edit to evals/evals.json too", () => {
+    if (!bunOk) return;
+    const r = run(
+      {
+        tool_name: "Edit",
+        tool_input: {
+          file_path: join(skillsRoot, "demo", "evals", "evals.json"),
+          old_string: "p",
+          new_string: "p2",
+          content: '{"skill_name":"demo","evals":[]}',
+        },
+      },
+      { SWITCHROOM_SELF_IMPROVE: "1" },
+    );
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.decision).toBe("block");
+    expect(out.reason).toMatch(/add-eval-case/);
+  });
+
+  it("BL1: SWITCHROOM_SELF_IMPROVE=0 escape hatch allows the raw evals.json write", () => {
+    if (!bunOk) return;
+    const r = run(
+      {
+        tool_name: "Write",
+        tool_input: {
+          file_path: join(skillsRoot, "demo", "evals", "evals.json"),
+          content: '{"skill_name":"demo","evals":[]}',
+        },
+      },
+      { SWITCHROOM_SELF_IMPROVE: "0" },
+    );
+    expect(r.status).toBe(0);
+    // With self-improvement off, hand-authoring via skill-creator is allowed;
+    // the write is not blocked by BL1 (any residual output must not be a block).
+    if (r.stdout) {
+      expect(JSON.parse(r.stdout).decision).toBeUndefined();
+    }
+  });
+
+  it("BL1: a sibling evals/ file that is NOT evals.json is not BL1-blocked", () => {
+    if (!bunOk) return;
+    // Only evals/evals.json is machine-managed; a held-out or notes file
+    // under evals/ is out of BL1 scope (byte-cap / advisory rules still apply).
+    const r = run(
+      {
+        tool_name: "Write",
+        tool_input: {
+          file_path: join(skillsRoot, "demo", "evals", "notes.md"),
+          content: "scratch notes\n",
+        },
+      },
+      { SWITCHROOM_SELF_IMPROVE: "1" },
+    );
+    expect(r.status).toBe(0);
+    if (r.stdout) {
+      expect(JSON.parse(r.stdout).decision).not.toBe("block");
+    }
+  });
+
+  // MAJOR 1 (PR #4403 review): the always-on write-block canonicalizes the
+  // target before the equality check, so a `..`/`.`-laden path that OS-resolves
+  // to the real evals.json is blocked identically to the plain path. The two
+  // concrete strings below are the validator's confirmed bypasses.
+  it("BL1/MAJOR1: blocks a `../`-laden Write that resolves to evals/evals.json", () => {
+    if (!bunOk) return;
+    for (const rel of [
+      ["demo", "evals", "..", "evals", "evals.json"],
+      ["demo", "sub", "..", "evals", "evals.json"],
+      ["demo", "..", "demo", "evals", "evals.json"],
+    ]) {
+      const r = run(
+        {
+          tool_name: "Write",
+          tool_input: {
+            file_path: join(skillsRoot, ...rel),
+            content: '{"skill_name":"demo","evals":[]}',
+          },
+        },
+        { SWITCHROOM_SELF_IMPROVE: "1" },
+      );
+      expect(r.status).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect(out.decision).toBe("block");
+      expect(out.reason).toMatch(/machine-managed|add-eval-case/);
+    }
+  });
+
+  // MAJOR 2 (PR #4403 review): a Bash tool call carries no file_path, so a
+  // shell redirect / writer verb into a machine-managed evals.json used to slip
+  // past the write-block entirely. The hook now matches Bash and blocks the
+  // demonstrated write vectors while leaving reads and the sanctioned CLI alone.
+  it("BL1/MAJOR2: blocks a Bash redirect/write into evals/evals.json", () => {
+    if (!bunOk) return;
+    const target = join(skillsRoot, "demo", "evals", "evals.json");
+    const traversal = join(skillsRoot, "demo", "evals", "..", "evals", "evals.json");
+    const commands = [
+      `echo poison > ${target}`,
+      `echo poison >> ${target}`,
+      `cat src > ${traversal}`,
+      `tee ${target} < src`,
+      `cp /tmp/p ${target}`,
+      `sed -i s/a/b/ ${target}`,
+      `dd if=/tmp/p of=${target}`,
+    ];
+    for (const command of commands) {
+      const r = run(
+        { tool_name: "Bash", tool_input: { command } },
+        { SWITCHROOM_SELF_IMPROVE: "1" },
+      );
+      expect(r.status).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect(out.decision).toBe("block");
+      expect(out.reason).toMatch(/machine-managed|add-eval-case/);
+    }
+  });
+
+  it("MAJOR2: Bash reads / the sanctioned CLI / unrelated redirects are allowed", () => {
+    if (!bunOk) return;
+    const target = join(skillsRoot, "demo", "evals", "evals.json");
+    const allowed = [
+      `cat ${target}`,
+      `grep foo ${target}`,
+      `jq . ${target}`,
+      `switchroom self-improve add-eval-case --skill demo --prompt 'fix evals'`,
+      `echo done > /tmp/other.log && cat ${target}`,
+      `ls`,
+    ];
+    for (const command of allowed) {
+      const r = run(
+        { tool_name: "Bash", tool_input: { command } },
+        { SWITCHROOM_SELF_IMPROVE: "1" },
+      );
+      expect(r.status).toBe(0);
+      if (r.stdout) expect(JSON.parse(r.stdout).decision).not.toBe("block");
+    }
+  });
+
+  it("MAJOR2: SWITCHROOM_SELF_IMPROVE=0 escape hatch allows the Bash redirect", () => {
+    if (!bunOk) return;
+    const command = `echo x > ${join(skillsRoot, "demo", "evals", "evals.json")}`;
+    const r = run(
+      { tool_name: "Bash", tool_input: { command } },
+      { SWITCHROOM_SELF_IMPROVE: "0" },
+    );
+    expect(r.status).toBe(0);
+    if (r.stdout) expect(JSON.parse(r.stdout).decision).toBeUndefined();
   });
 
   it("a path containing .claude/skills/ twice never wrong-blocks", () => {

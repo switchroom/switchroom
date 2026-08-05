@@ -9,6 +9,7 @@ import type {
   QueryPendingPermissionMessage,
   CheckPreApprovedMessage,
   PostSkillProposalMessage,
+  PostEvalCaseProposalMessage,
   OperatorEventForward,
   PermissionRequestForward,
   PtyPartialForward,
@@ -101,6 +102,12 @@ export interface IpcServerOptions {
    * chat. Optional; gateways that don't surface proposals ignore it.
    */
   onPostSkillProposal?: (client: IpcClient, msg: PostSkillProposalMessage) => void;
+  /**
+   * RFC amendment §"corrections as eval cases" — `add-eval-case` asks the
+   * gateway to persist an eval-case proposal and post its one-tap card.
+   * Optional; gateways that don't surface proposals ignore it.
+   */
+  onPostEvalCaseProposal?: (client: IpcClient, msg: PostEvalCaseProposalMessage) => void;
   /**
    * RFC E §4.2 Cut 2 — Drive-write PreToolUse hook asks the gateway
    * to register a kernel approval request + post a diff-preview
@@ -379,6 +386,23 @@ export function validateClientMessage(msg: unknown): msg is ClientToGateway {
         && (typeof m.threadId !== "number" || !Number.isInteger(m.threadId as number))) return false;
       return true;
     }
+    case "post_eval_case_proposal": {
+      // RFC amendment §"corrections as eval cases" — validate the wire shape;
+      // the gateway handler fences chatId to the agent's own chat.
+      if (typeof m.agentName !== "string"
+        || !AGENT_NAME_RE.test(m.agentName as string)) return false;
+      if (typeof m.chatId !== "string" || (m.chatId as string).length === 0) return false;
+      if (typeof m.skillSlug !== "string" || (m.skillSlug as string).length === 0) return false;
+      if (typeof m.skillDir !== "string" || (m.skillDir as string).length === 0) return false;
+      if (typeof m.fingerprint !== "string" || (m.fingerprint as string).length === 0) return false;
+      if (typeof m.heldOut !== "boolean") return false;
+      if (typeof m.case !== "object" || m.case === null || Array.isArray(m.case)) return false;
+      if (typeof (m.case as Record<string, unknown>).prompt !== "string"
+        || ((m.case as Record<string, unknown>).prompt as string).length === 0) return false;
+      if (m.threadId !== undefined
+        && (typeof m.threadId !== "number" || !Number.isInteger(m.threadId as number))) return false;
+      return true;
+    }
     case "quota_wall_detected": {
       // wedge-watchdog detected the /rate-limit-options weekly-quota menu.
       if (typeof m.agentName !== "string"
@@ -565,6 +589,7 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
     onQueryPendingPermission,
     onCheckPreApproved,
     onPostSkillProposal,
+    onPostEvalCaseProposal,
     onRequestDriveApproval,
     onRequestMs365Approval,
     onRequestConfigApproval,
@@ -732,6 +757,9 @@ export function createIpcServer(options: IpcServerOptions): IpcServer {
         break;
       case "post_skill_proposal":
         if (onPostSkillProposal) onPostSkillProposal(client, msg as PostSkillProposalMessage);
+        break;
+      case "post_eval_case_proposal":
+        if (onPostEvalCaseProposal) onPostEvalCaseProposal(client, msg as PostEvalCaseProposalMessage);
         break;
       case "quota_wall_detected":
         if (onQuotaWallDetected) onQuotaWallDetected(client, msg as QuotaWallDetectedMessage);

@@ -70,6 +70,11 @@ import {
   getProposal as getSkillProposal,
   setProposalStatus as setSkillProposalStatus,
 } from '../../src/self-improve/skill-proposals.js'
+import { parseEvalCaseProposalCallback } from './eval-case-proposal-card.js'
+import {
+  getEvalCaseProposal,
+  setEvalCaseProposalStatus,
+} from '../../src/self-improve/eval-case-proposals.js'
 import { maskToken } from '../secret-detect/mask.js'
 import {
   defaultVaultWrite,
@@ -1325,6 +1330,100 @@ async function handleSkillProposalCallback(ctx: Context, data: string): Promise<
   process.stderr.write(
     `telegram gateway: skill_proposal_apply injection agent=${agent} ` +
     `proposal=${proposal.id} slug=${proposal.skill_slug} delivered=${delivered}\n`,
+  )
+}
+
+/**
+ * Eval-case proposal callback (RFC amendment §"corrections as eval cases").
+ *
+ * On Approve this runs the DETERMINISTIC `apply-eval-case` applier via
+ * execFileSync — NOT a model turn — so the case lands byte-exact as approved
+ * (precedent: the `switchroom vault set` on-tap execFileSync in this file).
+ * The operator's tap IS the authorization; the gateway sets the proposal
+ * `approved` BEFORE invoking the applier (whose own status check is
+ * defense-in-depth, MJ2, since the store is agent-writable).
+ */
+async function handleEvalCaseProposalCallback(ctx: Context, data: string): Promise<void> {
+  const senderId = String(ctx.from?.id ?? '')
+  const access = loadAccess()
+  if (!access.allowFrom.includes(senderId)) {
+    await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+    return
+  }
+  const parsed = parseEvalCaseProposalCallback(data)
+  if (parsed == null) {
+    await ctx.answerCallbackQuery({ text: 'Bad request' }).catch(() => {})
+    return
+  }
+  const stateDir = process.env.TELEGRAM_STATE_DIR
+  const agent = process.env.SWITCHROOM_AGENT_NAME ?? ''
+  if (stateDir == null || stateDir.length === 0) {
+    await ctx.answerCallbackQuery({ text: 'State dir unset — cannot apply.' }).catch(() => {})
+    return
+  }
+  const proposal = getEvalCaseProposal(stateDir, parsed.id)
+  if (proposal == null) {
+    await ctx.answerCallbackQuery({ text: 'Proposal expired or already actioned.' }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    }
+    return
+  }
+  if (proposal.status !== 'pending') {
+    await ctx.answerCallbackQuery({ text: `Already ${proposal.status}.` }).catch(() => {})
+    if (ctx.callbackQuery?.message) {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    }
+    return
+  }
+
+  if (parsed.action === 'deny') {
+    setEvalCaseProposalStatus(stateDir, parsed.id, 'rejected')
+    await ctx.answerCallbackQuery({ text: '🚫 Dismissed.' }).catch(() => {})
+    if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+      await ctx
+        .editMessageText(
+          `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n🚫 <i>Dismissed.</i>`,
+          { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+        )
+        .catch(() => {})
+    }
+    return
+  }
+
+  // Approve — authorize, then run the deterministic applier.
+  setEvalCaseProposalStatus(stateDir, parsed.id, 'approved')
+  await ctx.answerCallbackQuery({ text: '✅ Adding the eval case…' }).catch(() => {})
+
+  const cli = process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
+  let applyOk = true
+  let applyOut = ''
+  try {
+    applyOut = execFileSync(
+      cli,
+      ['self-improve', 'apply-eval-case', '--id', parsed.id],
+      { encoding: 'utf8', timeout: 15000, env: process.env },
+    ).trim()
+  } catch (err) {
+    applyOk = false
+    const e = err as { stdout?: string; stderr?: string; message?: string }
+    applyOut = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim()
+  }
+
+  const footer = applyOk
+    ? '✅ <i>Added as a regression test.</i>'
+    : `⚠️ <i>Apply failed:</i> ${escapeHtmlForTg(applyOut.slice(0, 200))}`
+  if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
+    await ctx
+      .editMessageText(
+        `${escapeHtmlForTg(ctx.callbackQuery.message.text ?? '')}\n\n${footer}`,
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } },
+      )
+      .catch(() => {})
+  }
+  process.stderr.write(
+    `telegram gateway: eval_case_apply agent=${agent} proposal=${proposal.id} ` +
+    `slug=${proposal.skill_slug} ok=${applyOk}\n`,
   )
 }
 
@@ -3233,6 +3332,7 @@ async function handleAuthDashboardCallback(ctx: Context): Promise<void> {
     performVaultAccessApproval,
     resolveAccessApprovalPassphraseMismatch,
     handleSkillProposalCallback,
+    handleEvalCaseProposalCallback,
     handleMentalModelProposeCallback,
     handleVaultRequestAccessCallback,
     handleVaultRequestSaveCallback,

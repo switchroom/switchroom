@@ -114,6 +114,15 @@ export function buildReviewPrompt(signals: LearningSignal[]): string {
       "suggestion (the operator actions it later). Never auto-create a " +
       "cron or a new skill, never edit a shared/other-agent skill.",
   );
+  lines.push(
+    "  5. If this was an operator CORRECTION tied to a skill you own, turn " +
+      "it into a regression test: run `switchroom self-improve add-eval-case " +
+      "--skill <slug> --prompt \"<the correction framed as a test prompt>\"`. " +
+      "This proposes the case as a one-tap card; the operator's tap runs a " +
+      "deterministic applier that writes it (PII/secret-scanned). Do NOT " +
+      "Write or Edit evals/evals.json yourself — a direct write is blocked, " +
+      "bypasses the scan, and skips the operator's approval.",
+  );
   lines.push("");
   lines.push(
     `Rate limits in effect: <= ${cfg.maxAutoAppliesPerDay} auto-applies/day, ` +

@@ -40,6 +40,7 @@ import { registerAgentConfigSkillWriteCommands } from "./agent-config-skill-writ
 import { registerSkillCommand } from "./skill.js";
 import { registerSkillPersonalCommands } from "./skill-personal.js";
 import { registerSelfImproveProposeSkillCommand } from "./self-improve-propose-skill.js";
+import { registerSelfImproveEvalCaseCommands } from "./self-improve-eval-case.js";
 import { registerSkillSearchCommand } from "./skill-search.js";
 import { registerAgentConfigMcpCommand } from "./mcp-agent-config.js";
 import { registerHostdMcpCommand } from "./mcp-hostd.js";
@@ -116,6 +117,7 @@ registerAgentConfigSkillWriteCommands(program);
 registerSkillCommand(program);
 registerSkillPersonalCommands(program);
 registerSelfImproveProposeSkillCommand(program);
+registerSelfImproveEvalCaseCommands(program);
 registerSkillSearchCommand(program);
 registerAgentConfigMcpCommand(program);
 registerHostdMcpCommand(program);

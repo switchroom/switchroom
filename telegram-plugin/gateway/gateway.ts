@@ -769,13 +769,9 @@ import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import { dispatchEffects } from './inbound-delivery-machine-dispatch.js'
 import { maybeFireWarmup } from './prefix-warmup.js'
 import {
-  renderSkillProposalCard,
-  skillProposalKeyboard,
-} from './skill-proposal-card.js'
-import {
-  enqueueProposal as enqueueSkillProposal,
-  isSuppressed as isSkillProposalSuppressed,
-} from '../../src/self-improve/skill-proposals.js'
+  handlePostSkillProposal,
+  handlePostEvalCaseProposal,
+} from './self-improve-proposal-wiring.js'
 import { decideSubagentHandback } from './subagent-handback-inbound-builder.js'
 import {
   decideSubagentProgress,
@@ -803,6 +799,7 @@ import type {
   QueryPendingPermissionMessage,
   CheckPreApprovedMessage,
   PostSkillProposalMessage,
+  PostEvalCaseProposalMessage,
   PermissionEvent,
   RolloutStatusPostMessage,
   RolloutStatusEditMessage,
@@ -11592,69 +11589,19 @@ if (isGatewayMain) ipcServer = createIpcServer({
   // onQuotaWallDetected so it doesn't fall inside the source slice that
   // send-outbound-wiring.test.ts takes between onSendOutbound and
   // onQuotaWallDetected.
+  // Thin delegate — body lives in self-improve-proposal-wiring.ts to keep the
+  // gateway line ratchet flat. Placed AFTER onQuotaWallDetected so it doesn't
+  // fall inside the source slice send-outbound-wiring.test.ts takes between
+  // onSendOutbound and onQuotaWallDetected.
   onPostSkillProposal(_client: IpcClient, msg: PostSkillProposalMessage) {
-    const self = process.env.SWITCHROOM_AGENT_NAME
-    if (self && msg.agentName !== self) {
-      process.stderr.write(
-        `telegram gateway: post_skill_proposal rejected — agent mismatch (${msg.agentName} != ${self})\n`,
-      )
-      return
-    }
-    try {
-      assertAllowedChat(msg.chatId)
-    } catch (err) {
-      process.stderr.write(
-        `telegram gateway: post_skill_proposal rejected — ${(err as Error).message}\n`,
-      )
-      return
-    }
-    const stateDir = process.env.TELEGRAM_STATE_DIR
-    if (stateDir == null || stateDir.length === 0) {
-      process.stderr.write(`telegram gateway: post_skill_proposal: TELEGRAM_STATE_DIR unset, skipping\n`)
-      return
-    }
-    // Dedup against still-live rejection fingerprints — never re-surface a
-    // proposal the operator already dismissed.
-    if (isSkillProposalSuppressed(stateDir, {
-      lesson: msg.lesson,
-      draft: msg.draft,
-      skill_slug: msg.skillSlug,
-    })) {
-      process.stderr.write(
-        `telegram gateway: post_skill_proposal suppressed (rejected before) slug=${msg.skillSlug}\n`,
-      )
-      return
-    }
-    const proposal = enqueueSkillProposal(stateDir, {
-      skill_slug: msg.skillSlug,
-      is_new: msg.isNew,
-      lesson: msg.lesson,
-      draft: msg.draft,
-      evidence: msg.evidence,
-      chat_id: Number(msg.chatId),
-    })
-    const cardText = renderSkillProposalCard({
-      id: proposal.id,
-      skill_slug: proposal.skill_slug,
-      is_new: proposal.is_new,
-      lesson: proposal.lesson,
-      evidence: proposal.evidence,
-      skill_md: proposal.draft['SKILL.md'],
-    })
-    const threadId = msg.threadId
-    void swallowingApiCall(
-      () =>
-        bot.api.sendMessage(msg.chatId, cardText, {
-          parse_mode: 'HTML',
-          reply_markup: skillProposalKeyboard(proposal.id),
-          ...(threadId != null && threadId !== 1 ? { message_thread_id: threadId } : {}),
-        }),
-      { chat_id: msg.chatId, verb: 'skill-proposal-card', ...(threadId != null ? { threadId } : {}) },
-    )
-    process.stderr.write(
-      `telegram gateway: post_skill_proposal agent=${msg.agentName} chat=${msg.chatId} ` +
-      `proposal=${proposal.id} slug=${proposal.skill_slug} new=${proposal.is_new}\n`,
-    )
+    handlePostSkillProposal(msg, { bot, assertAllowedChat, swallowingApiCall })
+  },
+
+  // RFC amendment §"corrections as eval cases" — thin delegate; the
+  // DETERMINISTIC applier runs on Approve in handleEvalCaseProposalCallback,
+  // NOT a model turn. Body in self-improve-proposal-wiring.ts.
+  onPostEvalCaseProposal(_client: IpcClient, msg: PostEvalCaseProposalMessage) {
+    handlePostEvalCaseProposal(msg, { bot, assertAllowedChat, swallowingApiCall })
   },
 
   // Buzz Phase 2b: the duplex peer's advisory publish outcome — no-op unless the hub mirror booted.
@@ -21746,6 +21693,15 @@ bot.on('callback_query:data', async ctx => {
   //                         isn't re-proposed
   if (data.startsWith('skprop:')) {
     await callbackQueryHandlers.handleSkillProposalCallback(ctx, data)
+    return
+  }
+
+  // RFC amendment §"corrections as eval cases": one-tap eval-case card.
+  //   evcase:approve:<id> — run the DETERMINISTIC apply-eval-case applier
+  //                         (byte-exact write; NOT a model turn)
+  //   evcase:deny:<id>    — dismiss + mark the proposal rejected
+  if (data.startsWith('evcase:')) {
+    await callbackQueryHandlers.handleEvalCaseProposalCallback(ctx, data)
     return
   }
 

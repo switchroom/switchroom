@@ -326,6 +326,31 @@ it isn't re-proposed every week. Approval is **T2 one-tap** (a synthesized
 personal skill lives in the agent's own reversible workspace), not a T3
 explicit ask — the operator tap is still required (`no-self-escalation`).
 
+### Corrections become eval cases
+
+The same review loop can turn a **correction** into a durable **regression
+test** rather than a skill edit. When the review decides a past mistake should
+be pinned so a future edit can't silently reintroduce it, it runs:
+
+```
+switchroom self-improve add-eval-case --skill <slug> \
+  --prompt "<the correction, phrased as a test prompt>"
+```
+
+This is **propose-only** — it writes nothing to the skill. It validates and
+dedups the case, runs a deterministic **PII/secret scan fail-closed** (a real
+scanner, not just a prompt instruction), then posts a one-tap Telegram card.
+On Approve the gateway runs the **deterministic `apply-eval-case` applier** (no
+model turn), which re-scans fail-closed and appends the case byte-exact to the
+skill's `evals/evals.json`. A skill's `evals/evals.json` is therefore
+**machine-managed**: an always-on hook hard-blocks a raw model `Write`/`Edit`
+to it on every turn (set `SWITCHROOM_SELF_IMPROVE=0` to hand-author with
+skill-creator instead). Once a case exists, the apply-guard eval gate blocks
+any future skill edit whose pass-rate regresses below the eval floor — the
+correction now defends itself. Silent auto-apply of a verified edit stays OFF
+by default (`SWITCHROOM_SELF_IMPROVE_T1_LIVE` opt-in); until set, every
+otherwise-allowable edit is downgraded to a T2 one-tap proposal.
+
 ## Comparison with Claude Code's native scheduling
 
 | | Switchroom (in-agent scheduler) | Claude Code CronCreate | Claude Code Desktop |

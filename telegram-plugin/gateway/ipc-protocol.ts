@@ -576,6 +576,41 @@ export interface PostSkillProposalMessage {
 }
 
 /**
+ * `switchroom self-improve add-eval-case` asks the caller agent's gateway to
+ * persist an eval-case proposal and post a one-tap Approve/Dismiss card (RFC
+ * amendment §"corrections as eval cases"). Unlike a skill proposal, the
+ * Approve tap does NOT inject a model turn — the gateway runs the
+ * DETERMINISTIC `apply-eval-case` applier so the case lands byte-exact.
+ *
+ * Trust model identical to post_skill_proposal: per-agent socket, agentName
+ * validated, chat fenced to the agent's own chat.
+ */
+export interface PostEvalCaseProposalMessage {
+  type: "post_eval_case_proposal";
+  agentName: string;
+  /** Agent's own chat id (fenced server-side). */
+  chatId: string;
+  threadId?: number;
+  /** Target skill slug. */
+  skillSlug: string;
+  /** Absolute path to the owned skill bundle dir (resolved by the CLI). */
+  skillDir: string;
+  /** The eval case to append (prompt + optional expected/expectations/etc). */
+  case: {
+    prompt: string;
+    expected_output?: string;
+    files?: string[];
+    expectations?: string[];
+    source?: string;
+    id?: string;
+  };
+  /** Prompt fingerprint (dedup + provenance). */
+  fingerprint: string;
+  /** Route the case to the held-out sink instead of evals.json. */
+  heldOut: boolean;
+}
+
+/**
  * #2726 Part 1 — hostd asks the caller agent's gateway to POST one ordinary
  * operator-DM message narrating a rollout's terminal outcome. This is a NORMAL
  * message, NOT a pinned card and NOT a bespoke widget — the framework speaking
@@ -766,6 +801,7 @@ export type ClientToGateway =
   | QuotaWallDetectedMessage
   | SendOutboundMessage
   | PostSkillProposalMessage
+  | PostEvalCaseProposalMessage
   | RolloutStatusPostMessage
   | RolloutStatusEditMessage
   | QueryPendingPermissionMessage

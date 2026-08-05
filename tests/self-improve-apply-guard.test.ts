@@ -136,22 +136,58 @@ describe("apply-guard helpers", () => {
 });
 
 describe("decideApply — the deterministic T1 gate", () => {
-  it("ALLOWS a small, owned, evals-passing edit under the rate cap", () => {
-    makeOwnedSkill(true);
-    writeBenchmark(1.0, 0.9);
-    const d = decideApply({
-      toolName: "Write",
-      input: { content: "line1\nline2\n" },
-      filePath: skillFile(),
-      stateDir,
-      cfg: CFG,
-      now,
-    });
-    expect(d.action).toBe("allow");
-    if (d.action === "allow") {
-      expect(d.tier).toBe("T1");
-      expect(d.candidatePassRate).toBe(1.0);
-      expect(d.changedLines).toBeLessThanOrEqual(CFG.t1MaxChangedLines);
+  it("ALLOWS a small, owned, evals-passing edit under the rate cap (T1_LIVE on)", () => {
+    // The hard backstop (apply-guard step 7) downgrades even a fully-verified
+    // T1 to a one-tap T2 unless the operator has opted into silent apply with
+    // SWITCHROOM_SELF_IMPROVE_T1_LIVE=1 (default OFF). To exercise the "allow"
+    // leg of the deterministic gate we opt in here, then restore.
+    const prev = process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = "1";
+    try {
+      makeOwnedSkill(true);
+      writeBenchmark(1.0, 0.9);
+      const d = decideApply({
+        toolName: "Write",
+        input: { content: "line1\nline2\n" },
+        filePath: skillFile(),
+        stateDir,
+        cfg: CFG,
+        now,
+      });
+      expect(d.action).toBe("allow");
+      if (d.action === "allow") {
+        expect(d.tier).toBe("T1");
+        expect(d.candidatePassRate).toBe(1.0);
+        expect(d.changedLines).toBeLessThanOrEqual(CFG.t1MaxChangedLines);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+      else process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = prev;
+    }
+  });
+
+  it("BLOCKS a verified T1 (downgrade T2) when T1_LIVE is unset — the hard backstop", () => {
+    const prev = process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    try {
+      makeOwnedSkill(true);
+      writeBenchmark(1.0, 0.9);
+      const d = decideApply({
+        toolName: "Write",
+        input: { content: "line1\nline2\n" },
+        filePath: skillFile(),
+        stateDir,
+        cfg: CFG,
+        now,
+      });
+      expect(d.action).toBe("block");
+      if (d.action === "block") {
+        expect(d.downgradeTier).toBe("T2");
+        expect(d.reason).toMatch(/SWITCHROOM_SELF_IMPROVE_T1_LIVE|silent auto-apply is disabled/i);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+      else process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = prev;
     }
   });
 

@@ -35,9 +35,14 @@
 import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 
-import { resolveSelfImproveConfig, type SelfImproveConfig } from "./config.js";
+import {
+  resolveSelfImproveConfig,
+  t1LiveEnabled,
+  type SelfImproveConfig,
+} from "./config.js";
 import { classifyTier } from "./tier-router.js";
 import { skillHasEvals, evalVerdict } from "./eval-gate.js";
+import { verifyEvalIntegrity } from "./eval-cases.js";
 import { appliesToday } from "./rate-limit.js";
 import type { ChangeCandidate, Tier } from "./types.js";
 
@@ -375,6 +380,24 @@ export function decideApply(p: DecideApplyParams): ApplyDecision {
     };
   }
 
+  // (5b) eval-integrity — the verdict above trusts the skill's evals.json,
+  //      so refuse to silent-apply on an eval set that has DRIFTED from its
+  //      last sanctioned state (an out-of-band edit to evals.json).
+  //      HONESTY (RFC amendment MJ1): this is defense-in-depth, tamper-
+  //      EVIDENT — NOT a cryptographic boundary. The manifest lives in the
+  //      agent-writable state dir; a model that also rewrites it defeats the
+  //      check. The HARD backstop is the T1-live gate below (default OFF).
+  //      "missing" (never recorded / first sight) and "no-evals" are not
+  //      drift, so only an explicit "drift" blocks here.
+  if (verifyEvalIntegrity(p.stateDir, target.slug, target.skillDir) === "drift") {
+    return {
+      action: "block",
+      downgradeTier: "T2",
+      reason: `eval set for "${target.slug}" drifted from its recorded baseline (out-of-band edit) — refusing to auto-apply on unverified evals; downgraded to a proposal`,
+      candidate: downgradeCandidate(target, owns, changedLines, lesson),
+    };
+  }
+
   // (6) rate-cap — ≤ N auto-applies/day.
   const used = appliesToday(p.stateDir, now);
   if (used >= cfg.maxAutoAppliesPerDay) {
@@ -386,8 +409,25 @@ export function decideApply(p: DecideApplyParams): ApplyDecision {
     };
   }
 
-  // All checks pass — a verified, small, reversible, eval-passing,
-  // under-cap edit to an owned skill. Let it land.
+  // (7) T1-live gate — THE hard backstop (RFC amendment invariant + MJ1).
+  //     Even a fully-verified T1 does NOT land SILENTLY unless the operator
+  //     has explicitly opted in with SWITCHROOM_SELF_IMPROVE_T1_LIVE=1.
+  //     Default OFF: every otherwise-allowable auto-apply is downgraded to a
+  //     T2 one-tap proposal, so the operator sees and approves it. This is
+  //     what makes a tampered eval (the manifest is only tamper-EVIDENT,
+  //     not a boundary) unable to cause a silent auto-apply. Flipping this
+  //     ON is deliberately NOT part of the eval-case PR.
+  if (!t1LiveEnabled()) {
+    return {
+      action: "block",
+      downgradeTier: "T2",
+      reason: `verified T1 for "${target.slug}", but silent auto-apply is disabled (SWITCHROOM_SELF_IMPROVE_T1_LIVE unset) — surfacing as a one-tap proposal`,
+      candidate: downgradeCandidate(target, owns, changedLines, lesson),
+    };
+  }
+
+  // All checks pass AND silent-apply is opted in — a verified, small,
+  // reversible, eval-passing, under-cap edit to an owned skill. Let it land.
   return {
     action: "allow",
     tier: "T1",

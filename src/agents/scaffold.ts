@@ -6993,15 +6993,20 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
         },
         {
           // RFC native-by-default skill authoring, Phase 1 — advisory
-          // skill-shape linter. Scoped to file-write tools; the hook
-          // itself no-ops unless the target path is under
+          // skill-shape linter. Scoped to file-write tools + Bash; the
+          // hook itself no-ops unless the target path is under
           // `.claude/skills/`. Non-blocking (returns additionalContext)
-          // except the per-skill byte cap, the only hard stop.
+          // except the per-skill byte cap and the machine-managed
+          // evals.json write-block (the hard stops). Bash is in the
+          // matcher so a shell redirect/write into a machine-managed
+          // evals.json (`bash -c '… > …/evals/evals.json'`) is blocked
+          // the same way a Write is — it otherwise never carries a
+          // file_path and slipped past the PII scan and operator tap.
           //
           // DOCKER_BUNDLED_HOOKS_PATH (not DOCKER_HOOKS_PATH): bundled
           // via scripts/build.mjs from src/cli/skill-validate-pretool.ts
           // because it imports the shared validators in skill-common.ts.
-          matcher: "^(Write|Edit|MultiEdit)$",
+          matcher: "^(Write|Edit|MultiEdit|Bash)$",
           hooks: [
             {
               type: "command",

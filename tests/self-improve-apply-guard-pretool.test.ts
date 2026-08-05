@@ -15,6 +15,7 @@ import { evalsJsonPath } from "../src/self-improve/eval-gate.js";
 import { writeReviewContext } from "../src/self-improve/review-context.js";
 import { readPending } from "../src/self-improve/pending-queue.js";
 import { appliesToday } from "../src/self-improve/rate-limit.js";
+import { appendEvalCase } from "../src/self-improve/eval-cases.js";
 
 // Drive the hook through `bun` against source (mirrors the stop-hook test)
 // so it doesn't depend on build order. Skip cleanly if bun is absent.
@@ -110,16 +111,37 @@ describe("self-improve apply-guard PreToolUse hook", () => {
     expect(r.stdout.trim()).toBe("");
   });
 
-  it("marker + owned skill + evals-passing + fresh benchmark → allow, records an apply", () => {
+  it("marker + owned skill + evals-passing + fresh benchmark + T1_LIVE=1 → allow, records an apply", () => {
     if (!bunOk) return;
+    makeOwnedSkill(true);
+    writeBenchmark(1.0, 0.9);
+    putMarker();
+    // Silent auto-apply is opt-IN — the allow path only exists with the flag.
+    const r = run("Write", skillFile(), "small\nedit\n", {
+      SWITCHROOM_SELF_IMPROVE_T1_LIVE: "1",
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.trim()).toBe(""); // allowed
+    expect(appliesToday(stateDir)).toBe(1); // one auto-apply recorded
+    expect(readPending(stateDir)).toEqual([]); // nothing downgraded
+  });
+
+  it("same, but T1_LIVE unset (default OFF) → block + downgrade to a pending proposal", () => {
+    if (!bunOk) return;
+    // Identical to the allow case EXCEPT the T1-live flag is absent. The hard
+    // backstop (RFC amendment invariant) must turn an otherwise-verified T1
+    // into a one-tap T2 proposal — never a silent apply.
     makeOwnedSkill(true);
     writeBenchmark(1.0, 0.9);
     putMarker();
     const r = run("Write", skillFile(), "small\nedit\n");
     expect(r.status).toBe(0);
-    expect(r.stdout.trim()).toBe(""); // allowed
-    expect(appliesToday(stateDir)).toBe(1); // one auto-apply recorded
-    expect(readPending(stateDir)).toEqual([]); // nothing downgraded
+    expect(r.stdout).toContain('"decision":"block"');
+    expect(r.stdout.toLowerCase()).toContain("silent auto-apply is disabled");
+    const pending = readPending(stateDir);
+    expect(pending.length).toBe(1);
+    expect(pending[0]?.skill_slug).toBe(SLUG);
+    expect(appliesToday(stateDir)).toBe(0); // downgraded → no apply recorded
   });
 
   it("marker + owned skill but NO evals → block + downgrade to a pending proposal", () => {
@@ -134,6 +156,33 @@ describe("self-improve apply-guard PreToolUse hook", () => {
     expect(pending.length).toBe(1);
     expect(pending[0]?.skill_slug).toBe(SLUG);
     expect(appliesToday(stateDir)).toBe(0); // blocked → no apply recorded
+  });
+
+  // MJ4 (RFC amendment §"corrections as eval cases"): the whole point of the
+  // sink is that a correction, once captured as an eval case, catches a FUTURE
+  // regression. This is the end-to-end proof on an ephemeral fixture agent:
+  // a real eval case is appended via the sink, then a deliberately-regressing
+  // edit (candidate pass-rate below the eval floor) is BLOCKED — never silently
+  // applied — even with silent-apply opted in.
+  it("MJ4: once a case exists, a regressing edit is blocked (downgraded), not applied", () => {
+    if (!bunOk) return;
+    makeOwnedSkill(false); // create the skill dir; no bare evals.json
+    // Populate evals.json through the REAL add-only sink — "cases exist".
+    const appended = appendEvalCase(skillDir(), SLUG, {
+      prompt: "the correction, captured as a regression test",
+    });
+    expect(appended.ok).toBe(true);
+    // A regression: with-skill 0.5 < without-skill 0.9 (below the eval floor).
+    writeBenchmark(0.5, 0.9);
+    putMarker();
+    const r = run("Write", skillFile(), "regress\n", {
+      SWITCHROOM_SELF_IMPROVE_T1_LIVE: "1", // even with silent-apply ON…
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('"decision":"block"'); // …the regression is caught
+    expect(r.stdout).toContain("eval gate blocked");
+    expect(appliesToday(stateDir)).toBe(0); // never applied
+    expect(readPending(stateDir).length).toBe(1); // surfaced as a proposal
   });
 
   it("marker present but a non-skill write → allow (out of scope)", () => {
