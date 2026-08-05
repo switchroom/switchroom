@@ -640,8 +640,8 @@ describe("renderDevProtocolFragment", () => {
   it("bounds the review loop: lows are filed, not merge-blocking", async () => {
     const { renderDevProtocolFragment } = await import("./profiles.js");
     const fragment = renderDevProtocolFragment();
-    expect(fragment).toContain("lows don't");
-    expect(fragment.toLowerCase()).toContain("file a low as a follow-up issue");
+    expect(fragment.toLowerCase()).toContain("prefer fixing lows before merge too");
+    expect(fragment.toLowerCase()).toContain("only then file it as a tracked follow-up");
     // Tracked, not waived — filing stays mandatory.
     expect(fragment.toLowerCase()).toContain("filing is mandatory");
     // The unbounded phrasing must be gone, not merely reworded around it.
