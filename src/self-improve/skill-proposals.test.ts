@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -114,6 +114,45 @@ describe("skill-proposals store", () => {
         { now: () => afterTtl },
       ),
     ).toBe(false);
+  });
+
+  it("round-trips optional benchmark + origin fields untouched", () => {
+    const p = enqueueProposal(dir, {
+      ...baseInput,
+      origin: "failure-synthesis",
+      benchmark: {
+        candidate_pass_rate: 1.0,
+        baseline_pass_rate: 0.5,
+        computed_at: "2026-08-06T00:00:00.000Z",
+      },
+    });
+    const fetched = getProposal(dir, p.id);
+    expect(fetched?.origin).toBe("failure-synthesis");
+    expect(fetched?.benchmark?.candidate_pass_rate).toBe(1.0);
+    expect(fetched?.benchmark?.baseline_pass_rate).toBe(0.5);
+    expect(fetched?.benchmark?.computed_at).toBe("2026-08-06T00:00:00.000Z");
+  });
+
+  it("reads a legacy record lacking benchmark/origin (back-compat)", () => {
+    // A record written before PR2 — no `origin`, no `benchmark`. It must
+    // still parse, and absence of `origin` MUST read as skill-synthesis
+    // (the documented default), never as undefined-is-an-error.
+    const legacy = {
+      id: "legacy-1",
+      created_at: "2026-01-01T00:00:00.000Z",
+      status: "pending",
+      skill_slug: "deploy-checklist",
+      is_new: true,
+      lesson: baseInput.lesson,
+      draft: baseInput.draft,
+      evidence: baseInput.evidence,
+    };
+    appendFileSync(join(dir, "skill-proposals.jsonl"), JSON.stringify(legacy) + "\n");
+    const fetched = getProposal(dir, "legacy-1");
+    expect(fetched).toBeTruthy();
+    expect(fetched?.origin).toBeUndefined(); // absence ⇒ skill-synthesis
+    expect(fetched?.benchmark).toBeUndefined();
+    expect(fetched?.is_new).toBe(true);
   });
 
   it("matches reworded proposals via content-word jaccard", () => {

@@ -25,7 +25,7 @@
  * the "eval gate blocks a regressing edit" test run without a model.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -94,6 +94,64 @@ export function aggregateBenchmark(
     };
   }
   return { ok: true, benchmarkJson: join(benchmarkDir, "benchmark.json") };
+}
+
+/**
+ * A directory is a runnable benchmark dir iff `aggregate_benchmark.py` can
+ * find grading files under it — i.e. it holds `eval-*` subdirs directly, or
+ * a `runs/` subdir that does (the two layouts the script supports). Pure /
+ * filesystem-only: it does NOT trigger any eval (the claude-native rule —
+ * `bench` only aggregates existing grading files, never runs `run_eval.py`).
+ */
+export function isBenchmarkDir(dir: string): boolean {
+  try {
+    if (!statSync(dir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  const hasEvalDirs = (d: string): boolean => {
+    try {
+      return readdirSync(d, { withFileTypes: true }).some(
+        (e) => e.isDirectory() && e.name.startsWith("eval-"),
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (hasEvalDirs(dir)) return true;
+  const runs = join(dir, "runs");
+  return existsSync(runs) && hasEvalDirs(runs);
+}
+
+/**
+ * Resolve the benchmark dir to aggregate for a skill, without running any
+ * eval. Resolution order:
+ *   1. an explicit `--benchmark-dir` (validated as a benchmark dir);
+ *   2. `baseDir` itself, if it directly holds grading files;
+ *   3. the MOST-RECENT (by mtime) immediate subdir of `baseDir` that is a
+ *      benchmark dir — supports a `<base>/<timestamp>/eval-*` layout.
+ * Returns null when nothing under `baseDir` looks like a benchmark dir.
+ */
+export function resolveBenchmarkDir(
+  baseDir: string,
+  explicit?: string,
+): string | null {
+  if (explicit != null && explicit.length > 0) {
+    return isBenchmarkDir(explicit) ? explicit : null;
+  }
+  if (isBenchmarkDir(baseDir)) return baseDir;
+  let entries: string[];
+  try {
+    entries = readdirSync(baseDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => join(baseDir, e.name))
+      .filter(isBenchmarkDir);
+  } catch {
+    return null;
+  }
+  if (entries.length === 0) return null;
+  entries.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  return entries[0]!;
 }
 
 export type EvalVerdict =

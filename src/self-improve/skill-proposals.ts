@@ -46,6 +46,38 @@ export const PROPOSAL_SIM_THRESHOLD = 0.5;
 
 export type ProposalStatus = "pending" | "approved" | "rejected";
 
+/**
+ * Provenance of a skill proposal.
+ *   - `skill-synthesis`   — the weekly skill-synthesis cron (#2670): the
+ *     original one-tap self-improvement path. This is the DEFAULT: a
+ *     proposal record written before this field existed reads as
+ *     skill-synthesis (see `readProposals` back-compat), so `origin`
+ *     absence ⇒ skill-synthesis.
+ *   - `failure-synthesis` — a NEW skill drafted from an observed FAILURE
+ *     (RFC §"failure synthesis"). Provenance only; it does NOT change the
+ *     tier routing — a failure-origin NEW skill still rides the
+ *     `proposalKind: "synthesized-personal-skill"` carve-out to T2
+ *     (tier-router.ts). The tier hint carries the routing; this field
+ *     carries the why.
+ */
+export type ProposalOrigin = "skill-synthesis" | "failure-synthesis";
+
+/**
+ * A benchmark summary attached to a proposal, precomputed by the
+ * grader-subagent flow at synthesis time (NOT recomputed by the card).
+ * `switchroom self-improve bench` produces the same numbers on demand.
+ * Absent on a legacy record (back-compat) and on any proposal whose skill
+ * had no runnable evals when it was drafted.
+ */
+export interface ProposalBenchmark {
+  /** Candidate ("with_skill") pass-rate mean, 0..1. */
+  candidate_pass_rate: number;
+  /** Baseline ("without_skill") pass-rate mean, 0..1, when a baseline ran. */
+  baseline_pass_rate?: number;
+  /** ISO timestamp the benchmark was computed. */
+  computed_at: string;
+}
+
 export interface SkillProposal {
   /** Stable id; the card's callback_data carries this. */
   id: string;
@@ -65,6 +97,21 @@ export interface SkillProposal {
   evidence: string;
   /** Chat the card should post to (gateway fills/uses this to route). */
   chat_id?: number;
+  /**
+   * Provenance of the proposal. Absent ⇒ `"skill-synthesis"` (back-compat:
+   * every record written before this field existed is a skill-synthesis
+   * proposal). Provenance is orthogonal to tier routing — see
+   * `ProposalOrigin`.
+   */
+  origin?: ProposalOrigin;
+  /**
+   * Precomputed benchmark numbers for the drafted skill, when its evals
+   * were runnable at synthesis time. Carried on the record so the card can
+   * surface pass-rates without re-running anything; `switchroom
+   * self-improve bench` recomputes the same shape. Absent on a legacy
+   * record or an unbenchmarked draft.
+   */
+  benchmark?: ProposalBenchmark;
 }
 
 /** One rejection fingerprint, used to suppress re-proposals. */

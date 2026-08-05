@@ -92,6 +92,14 @@ export interface ChangeCandidate {
    * holds; only the friction (one tap vs ask) changes. Any non-personal
    * blast radius (cron / cross-agent / shared / irreversible) ignores this
    * hint and stays T3 per the hard floors above.
+   *
+   * DELIBERATELY REUSED by failure-synthesis: a NEW skill drafted from an
+   * observed failure (RFC §"failure synthesis") sets the SAME
+   * `synthesized-personal-skill` kind so it rides this exact T2 carve-out
+   * with zero tier-router changes. The tier hint says only "personal, own,
+   * reversible → one-tap"; it carries no provenance. WHERE the draft came
+   * from (skill- vs failure-synthesis) lives on the proposal's `origin`
+   * field (`SkillProposal.origin` in skill-proposals.ts), not here.
    */
   proposalKind?: "synthesized-personal-skill";
   /** True iff the change creates / edits a cron schedule. */
