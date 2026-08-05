@@ -1,7 +1,13 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawnSync } from "node:child_process";
 import { createServer, type Server } from "node:net";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,6 +17,13 @@ import {
   reviewIsPending,
 } from "../src/self-improve/review-context.js";
 import { SELF_IMPROVE_CORRECTION_PENDING_FILE } from "../src/memory/hindsight-retain-provenance.js";
+import { readPending } from "../src/self-improve/pending-queue.js";
+import {
+  SWEEP_TAMPER_SIGNAL,
+  SWEEP_HEALED_SIGNAL,
+  SWEEP_QUARANTINED_SIGNAL,
+} from "../src/self-improve/eval-cases.js";
+import { evalsJsonPath } from "../src/self-improve/eval-gate.js";
 
 // Drive the hook through `bun` against source (mirrors
 // tests/skill-validate-pretool.test.ts) so the test doesn't depend on
@@ -486,6 +499,130 @@ describe("self-improve-stop hook — repeated-manual-fix is content-aware (#2462
       expect(envelope.inbound.text).toContain("repeated-manual-fix");
     } finally {
       await new Promise<void>((res) => server.close(() => res()));
+    }
+  });
+});
+
+// Issue #4425 item 2 — sweep-visibility (T1_LIVE-flip prerequisite). The Stop
+// hook's eval-integrity sweep (self-improve-stop.ts) previously DISCARDED the
+// SweepReport it returned, so RFC invariant 3(b) — "the per-turn Stop hook …
+// enqueues a T2 pending note surfacing the tamper" — never happened: a healed
+// or quarantined skill was invisible to the operator. R2 (#4426) BLOCKS a
+// tampered skill's auto-apply but silently; this is the visibility half. These
+// drive the REAL Stop-hook CLI end to end (the sweep runs before stdin is even
+// read) and assert the operator-visible pending queue actually carries the
+// tamper. They go RED if the surfaceSweepTamper wiring is removed.
+describe("self-improve-stop hook — sweep tamper surfaces a T2 pending note (#4425 item 2)", () => {
+  // A PII value assembled at runtime so no contiguous email literal sits in the
+  // source (which would trip scripts/check-no-pii-secrets.mjs); scanForPII in
+  // the real sweep still sees the joined value and quarantines the bytes.
+  const fakeEmail = ["poison.example", "example.com"].join("@");
+
+  function skillEvalsDir(home: string, slug: string): string {
+    const d = join(home, ".claude", "skills", slug, "evals");
+    mkdirSync(d, { recursive: true });
+    return join(home, ".claude", "skills", slug);
+  }
+
+  it("enqueues a T2 quarantine note (and is idempotent) for a poisoned first-sight evals.json", () => {
+    if (!bunOk) return;
+    const home = mkdtempSync(join(tmpdir(), "sweep-home-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "sweep-state-"));
+    try {
+      const skill = skillEvalsDir(home, "poison");
+      writeFileSync(
+        evalsJsonPath(skill),
+        JSON.stringify({
+          skill_name: "poison",
+          evals: [{ prompt: `email me at ${fakeEmail} then answer` }],
+        }),
+      );
+
+      const env = {
+        HOME: home,
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        TELEGRAM_STATE_DIR: stateDir,
+        SWITCHROOM_GATEWAY_SOCKET: join(stateDir, "no-server.sock"),
+      };
+      // The sweep runs before stdin is consumed, so a bare "{}" is enough.
+      expect(run("{}", env).status).toBe(0);
+
+      const pending = readPending(stateDir);
+      const notes = pending.filter(
+        (p) =>
+          p.skill_slug === "poison" &&
+          p.triggered_by?.includes(SWEEP_TAMPER_SIGNAL) &&
+          p.triggered_by?.includes(SWEEP_QUARANTINED_SIGNAL),
+      );
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.tier).toBe("T2");
+      expect(notes[0]?.lesson).toContain("QUARANTINED");
+      expect(notes[0]?.lesson).toContain("poison");
+
+      // Idempotent: the poisoned bytes stay on disk (never adopted), so a
+      // second turn quarantines again — but the outstanding note dedups it.
+      expect(run("{}", env).status).toBe(0);
+      const after = readPending(stateDir).filter(
+        (p) =>
+          p.skill_slug === "poison" &&
+          p.triggered_by?.includes(SWEEP_QUARANTINED_SIGNAL),
+      );
+      expect(after.length).toBe(1); // still exactly one — no per-turn spam
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("enqueues a T2 healed note when out-of-band drift is reverted", () => {
+    if (!bunOk) return;
+    const home = mkdtempSync(join(tmpdir(), "sweep-heal-home-"));
+    const stateDir = mkdtempSync(join(tmpdir(), "sweep-heal-state-"));
+    try {
+      const skill = skillEvalsDir(home, "drifter");
+      const clean = JSON.stringify({
+        skill_name: "drifter",
+        evals: [{ prompt: "handle an empty input" }],
+      });
+      writeFileSync(evalsJsonPath(skill), clean);
+
+      const env = {
+        HOME: home,
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        TELEGRAM_STATE_DIR: stateDir,
+        SWITCHROOM_GATEWAY_SOCKET: join(stateDir, "no-server.sock"),
+      };
+
+      // First turn: records the sanctioned baseline (first sight is clean →
+      // adopted, not tampered) → NO note yet.
+      expect(run("{}", env).status).toBe(0);
+      expect(
+        readPending(stateDir).filter((p) => p.skill_slug === "drifter").length,
+      ).toBe(0);
+
+      // Tamper out of band (a raw Write, bypassing the applier).
+      writeFileSync(
+        evalsJsonPath(skill),
+        JSON.stringify({
+          skill_name: "drifter",
+          evals: [{ prompt: "SMUGGLED out-of-band case" }],
+        }),
+      );
+
+      // Second turn: sweep reverts the drift AND surfaces a T2 healed note.
+      expect(run("{}", env).status).toBe(0);
+      const healed = readPending(stateDir).filter(
+        (p) =>
+          p.skill_slug === "drifter" &&
+          p.triggered_by?.includes(SWEEP_TAMPER_SIGNAL) &&
+          p.triggered_by?.includes(SWEEP_HEALED_SIGNAL),
+      );
+      expect(healed.length).toBe(1);
+      expect(healed[0]?.tier).toBe("T2");
+      expect(healed[0]?.lesson).toContain("drifter");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });
