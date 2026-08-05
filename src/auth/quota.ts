@@ -137,12 +137,16 @@ export function isProbeThin(q: {
 
 /**
  * Structured probe-failure classification.
- *  - `entitlement_blocked` — a 403 whose body says the org/subscription has
- *    DISABLED Claude Code access ("Your organization has disabled Claude
- *    subscription access for Claude Code"). A hard, account-level block: the
- *    account can NEVER serve, and re-probing won't lift it until the org
- *    re-enables Code access. Distinct from a bad-token-scope 403 (that keeps
- *    `"other"`).
+ *  - `entitlement_blocked` — a 403 that denotes an org/subscription-level
+ *    Claude Code disablement, detected on EITHER the structured
+ *    `error.details.error_code` (see {@link ENTITLEMENT_BLOCKED_ERROR_CODES},
+ *    e.g. a deactivated org's `oauth_not_allowed_for_organization`) OR the
+ *    legacy prose matcher ({@link isEntitlementDisabledMessage}, "Your
+ *    organization has disabled Claude subscription access for Claude Code").
+ *    A hard, account-level block: the account can NEVER serve, and re-probing
+ *    won't lift it until the org re-enables Code access — at which point the
+ *    next successful probe self-heals the mark. Distinct from a bad-token-scope
+ *    403 (that keeps `"other"`).
  *  - `"other"` — any other non-ok HTTP status (bad scope 403, 401, 5xx, …) or
  *    a header-parse miss. Retains the legacy no-op semantics upstream.
  */
@@ -333,6 +337,64 @@ export function extractApiErrorMessage(bodyText: string): string | null {
 }
 
 /**
+ * Extract the STRUCTURED Anthropic error code from an error body. Anthropic
+ * nests a machine-readable code at `error.details.error_code` (e.g.
+ * `"oauth_not_allowed_for_organization"` for an OAuth-disabled org). Returns
+ * null when the body isn't JSON, isn't the error shape, or carries no code.
+ * PURE — no I/O.
+ *
+ * Keying on this stable code — rather than the human-facing `message` prose —
+ * is why {@link isEntitlementBlockedErrorCode} can classify a deactivated
+ * account deterministically even when its message wording differs from the
+ * legacy "organization has disabled…" string the prose matcher targets.
+ */
+export function extractApiErrorCode(bodyText: string): string | null {
+  if (!bodyText || bodyText.trim().length === 0) return null;
+  try {
+    const parsed = JSON.parse(bodyText) as unknown;
+    const code = (parsed as { error?: { details?: { error_code?: unknown } } })
+      ?.error?.details?.error_code;
+    if (typeof code === "string" && code.trim().length > 0) return code.trim();
+  } catch {
+    // Body isn't JSON — no structured code available.
+  }
+  return null;
+}
+
+/**
+ * Structured Anthropic `error.details.error_code` values that mean the account
+ * is DISABLED for Claude Code at the org/subscription level — a hard,
+ * self-healing entitlement block (NOT a transient failure).
+ *
+ *  - `oauth_not_allowed_for_organization` — the observed signature of a
+ *    deactivated / OAuth-disabled organization: a 403 whose message is "OAuth
+ *    authentication is currently not allowed for this organization." The prose
+ *    matcher ({@link isEntitlementDisabledMessage}) does NOT catch this — the
+ *    message carries no "disabled" nor "claude code" — so keying on the code is
+ *    what closes the gap where such an account decayed to `unknown` and could
+ *    still be selected to serve.
+ *
+ * DELIBERATELY NARROW. This is an allowlist, not a "any 403 is a block" rule —
+ * an unrelated/transient 403 (bad token scope, a flaky edge 403) must stay
+ * `"other"` so it never benches a healthy account. Add a new code here only
+ * when it is a confirmed org/subscription-level Claude Code disablement.
+ */
+export const ENTITLEMENT_BLOCKED_ERROR_CODES = new Set<string>([
+  "oauth_not_allowed_for_organization",
+]);
+
+/**
+ * Does this structured `error_code` denote an org/subscription-level Claude
+ * Code disablement (a hard entitlement block)? See
+ * {@link ENTITLEMENT_BLOCKED_ERROR_CODES}. PURE — no I/O.
+ */
+export function isEntitlementBlockedErrorCode(
+  code: string | null | undefined,
+): boolean {
+  return code != null && ENTITLEMENT_BLOCKED_ERROR_CODES.has(code);
+}
+
+/**
  * Does this API error message indicate the org/subscription has DISABLED Claude
  * Code access (the entitlement-403), as opposed to a bad-token-scope 403?
  *
@@ -418,8 +480,19 @@ export async function fetchQuota(opts: FetchQuotaOptions): Promise<QuotaResult> 
     }
     clearTimeout(timeout);
     const apiErrorMessage = extractApiErrorMessage(bodyText);
+    // Classify a 403 as a hard entitlement block on EITHER signal:
+    //  1. the STRUCTURED `error.details.error_code` (preferred — deterministic,
+    //     survives message-wording changes; catches the OAuth-disabled-org
+    //     deactivation whose prose the matcher below misses), or
+    //  2. the legacy prose matcher (fallback for the "organization has disabled
+    //     Claude subscription access…" body that carries no structured code).
+    // Deliberately narrow to an error-code allowlist + the existing matcher — an
+    // unrelated/transient 403 stays "other" and never benches a healthy account.
+    const apiErrorCode = extractApiErrorCode(bodyText);
     const entitlement =
-      resp.status === 403 && isEntitlementDisabledMessage(apiErrorMessage);
+      resp.status === 403 &&
+      (isEntitlementBlockedErrorCode(apiErrorCode) ||
+        isEntitlementDisabledMessage(apiErrorMessage));
     return {
       ok: false,
       reason: `HTTP ${resp.status} from Anthropic (${parsed.reason})`,
