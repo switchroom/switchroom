@@ -34,9 +34,32 @@
 #   - AGENT_DIR               — output destination (if HANDOFF_BRIEFING_STDOUT!=1)
 #
 # Usage:
-#   handoff-briefing.sh [--stdout]
+#   handoff-briefing.sh [--stdout] [--lean]
 #
 # The --stdout flag overrides HANDOFF_BRIEFING_STDOUT=1.
+#
+# LEAN MODE (--lean, alias --mode=compaction)
+# -------------------------------------------
+# The compaction re-seat path (bin/working-state-reload-hook.sh, wired as the
+# SessionStart(compact) hook) invokes this script with --lean so BOTH legacy-
+# and gateway-briefing agents share ONE assembler at the compaction boundary —
+# no copy of the sqlite/recall logic lives in the hook. Lean mode differs from
+# the boot briefing in three deliberate ways:
+#
+#   1. It emits ONLY the recent-Telegram-tail + Hindsight-recall sections.
+#      Daily-memory (Source 3) and the "You just restarted at …" header are
+#      SKIPPED. Rationale is token duplication, not latency: Claude Code's
+#      native compaction summary already preserves the recent turns, so
+#      re-injecting the full boot briefing on every compaction of a long
+#      session partially triples coverage.
+#   2. It IGNORES the SWITCHROOM_PENDING_* env (boot-time pending-turn scope).
+#      Those name the surface that was mid-turn at the PREVIOUS boot; at a
+#      compaction hours into a live session they are stale and would brief the
+#      WRONG chat surface. Lean mode zeroes them so the python scoper derives
+#      the single most-recently-active (chat_id, thread_id) straight from the
+#      DB (scope_source=db-latest).
+#   3. It forces stdout and never touches AGENT_DIR (no output file), so it is
+#      safe to call from the hook regardless of whether AGENT_DIR is exported.
 
 set -u
 
@@ -71,10 +94,30 @@ HINDSIGHT_TIMEOUT="${HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT:-3}"
 TARGET_CHAT_ID="${SWITCHROOM_PENDING_CHAT_ID:-}"
 TARGET_THREAD_ID="${SWITCHROOM_PENDING_THREAD_ID:-}"
 
-# Determine output mode
+# Determine output + lean mode. Parse every arg (order-independent) so
+# `--lean`, `--stdout`, or both, work regardless of position.
 STDOUT_MODE=0
-if [ "${HANDOFF_BRIEFING_STDOUT:-}" = "1" ] || [ "${1:-}" = "--stdout" ]; then
+LEAN_MODE=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --stdout) STDOUT_MODE=1 ;;
+    --lean|--mode=compaction) LEAN_MODE=1 ;;
+    *) : ;;
+  esac
+done
+if [ "${HANDOFF_BRIEFING_STDOUT:-}" = "1" ]; then
   STDOUT_MODE=1
+fi
+
+# Lean (compaction) mode: force stdout, and ZERO the pending-turn env scope so
+# the python scoper falls through to db-latest (see LEAN MODE note in header).
+# This is the load-bearing correctness fix for a mid-session compaction: the
+# SWITCHROOM_PENDING_* surface is the previous boot's, not the currently-active
+# chat. Clearing them here (not in the hook) keeps the single scoping code path.
+if [ "$LEAN_MODE" = "1" ]; then
+  STDOUT_MODE=1
+  TARGET_CHAT_ID=""
+  TARGET_THREAD_ID=""
 fi
 
 # ── Source 1: Recent Telegram messages ─────────────────────────────────────────
@@ -362,7 +405,9 @@ fi
 # dropping today's memory.
 DAILY_SECTION=""
 TODAY=$(TZ="$_TZ_VAL" date +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d 2>/dev/null || true)
-if [ -n "$TODAY" ] && [ -n "$WORKSPACE_DIR" ]; then
+# Lean/compaction mode SKIPS daily memory (token duplication — the native
+# summary already carries recent context; see LEAN MODE note in header).
+if [ "$LEAN_MODE" != "1" ] && [ -n "$TODAY" ] && [ -n "$WORKSPACE_DIR" ]; then
   DAILY_FILE="$WORKSPACE_DIR/memory/${TODAY}.md"
   if [ -f "$DAILY_FILE" ] && [ -s "$DAILY_FILE" ]; then
     DAILY_CONTENT=$(cat "$DAILY_FILE")
@@ -391,7 +436,14 @@ if [ -n "$OUTPUT_FILE" ]; then
 else
   # stdout / no-AGENT_DIR mode — buffered; print the whole briefing once.
   if [ -n "$STDOUT_BUFFER" ]; then
-    printf '%s\n\n---\n\n%s\n' "$BRIEFING_HEADER" "$STDOUT_BUFFER"
+    if [ "$LEAN_MODE" = "1" ]; then
+      # Lean/compaction: no "You just restarted at …" boot header — this is a
+      # mid-conversation compaction, not a restart, and the hook emits its own
+      # <compact-recovery> framing. Print only the assembled sections.
+      printf '%s\n' "$STDOUT_BUFFER"
+    else
+      printf '%s\n\n---\n\n%s\n' "$BRIEFING_HEADER" "$STDOUT_BUFFER"
+    fi
   fi
 fi
 
