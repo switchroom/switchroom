@@ -66,6 +66,14 @@ describe("buildSettingsHooksBlock", () => {
       // MUST carry matcher "compact" — a bare/absent matcher would fire on
       // every SessionStart source and re-inject working state on every boot.
       expect(reloadEntry?.matcher).toBe("compact");
+      // Timeout MUST leave headroom for the lean-briefing network hop (P1):
+      // the hook shells out to handoff-briefing.sh --lean, whose Hindsight
+      // recall is capped at ~3s. A 3s hook timeout (the pre-P1 value) would
+      // race that cap; 8s is the intended budget.
+      const reloadHook = reloadEntry?.hooks.find((h) =>
+        h.command.includes("working-state-reload-hook.sh"),
+      );
+      expect(reloadHook?.timeout).toBe(8);
     }
   });
 
@@ -114,6 +122,175 @@ describe("buildSettingsHooksBlock", () => {
       rmSync(stateDir, { recursive: true, force: true });
     }
   });
+
+  // ── P1: lean post-compaction briefing ─────────────────────────────────────
+  // The hook, on source=compact, additionally emits a LEAN briefing (recent
+  // Telegram tail + Hindsight recall) assembled by handoff-briefing.sh --lean,
+  // giving a compacted session fresh-boot parity. These tests drive the REAL
+  // hook + assembler against a fixture history.db.
+
+  // Build a fixture history.db with two chat surfaces: an OLDER "stale pending"
+  // chat and a NEWER "db-latest" chat. Uses python3 (the same dependency the
+  // hook's assembler already requires) so the fixture matches the real schema.
+  function makeHistoryDb(dir: string): void {
+    const script = `
+import sqlite3, sys, time
+db = sys.argv[1]
+c = sqlite3.connect(db)
+c.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, role TEXT, user TEXT, "
+          "ts INTEGER, text TEXT, chat_id TEXT, thread_id INTEGER, "
+          "reply_to_message_id INTEGER, reply_to_text TEXT)")
+now = int(time.time())
+rows = [
+  ('user', 'alice', now - 9000, 'STALE_PENDING_MARKER old chat', '1111', None, None, None),
+  ('assistant', None, now - 8990, 'stale reply', '1111', None, None, None),
+  ('user', 'bob', now - 120, 'LATEST_DB_MARKER active chat', '2222', None, None, None),
+  ('assistant', None, now - 110, 'latest reply', '2222', None, None, None),
+]
+c.executemany("INSERT INTO messages(role,user,ts,text,chat_id,thread_id,"
+              "reply_to_message_id,reply_to_text) VALUES(?,?,?,?,?,?,?,?)", rows)
+c.commit(); c.close()
+`;
+    execFileSync("python3", ["-c", script, join(dir, "history.db")], {
+      encoding: "utf8",
+    });
+  }
+
+  // Env that isolates the assembler to the Telegram section only: no Hindsight
+  // (empty URL/bank → recall skipped), deterministic output. The caller sets
+  // SWITCHROOM_PENDING_CHAT_ID to the stale surface to exercise the db-latest
+  // override.
+  //
+  // Hermeticity: the tests run inside an agent container whose process.env may
+  // already carry SWITCHROOM_PENDING_* (the pending-turn scope) or
+  // HANDOFF_BRIEFING_* tunables. Those would silently change the assembler's
+  // scoping/limit and flake the startup/degrade assertions, so null them here
+  // and let each test opt back in via `extra`.
+  function hookEnv(stateDir: string, extra: Record<string, string> = {}) {
+    return {
+      ...process.env,
+      TELEGRAM_STATE_DIR: stateDir,
+      HINDSIGHT_API_URL: "",
+      HINDSIGHT_BANK_ID: "",
+      SWITCHROOM_PENDING_CHAT_ID: "",
+      SWITCHROOM_PENDING_THREAD_ID: "",
+      SWITCHROOM_PENDING_ENDED_VIA: "",
+      HANDOFF_BRIEFING_MAX_MESSAGES: "",
+      HANDOFF_BRIEFING_STDOUT: "",
+      HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT: "",
+      ...extra,
+    };
+  }
+
+  it("emits the lean <compact-briefing> on source=compact and follows db-latest, NOT the stale SWITCHROOM_PENDING_* surface", () => {
+    const hookPath = fileURLToPath(
+      new URL("../bin/working-state-reload-hook.sh", import.meta.url),
+    );
+    const stateDir = mkdtempSync(join(tmpdir(), "ws-lean-"));
+    try {
+      makeHistoryDb(stateDir);
+      const stdout = execFileSync("bash", [hookPath], {
+        input: '{"source":"compact"}',
+        encoding: "utf8",
+        // Stale pending scope points at chat 1111; the lean path must IGNORE it
+        // and brief the db-latest surface (chat 2222) instead.
+        env: hookEnv(stateDir, {
+          SWITCHROOM_PENDING_CHAT_ID: "1111",
+          SWITCHROOM_PENDING_THREAD_ID: "NULL",
+        }),
+      });
+      // The recovery block still leads, then the lean briefing.
+      expect(stdout).toContain("<compact-recovery");
+      expect(stdout).toContain("<compact-briefing");
+      // db-latest surface content is present…
+      expect(stdout).toContain("LATEST_DB_MARKER");
+      // …and the stale pending surface's content is NOT — proving the compaction
+      // path derived latest-from-db rather than honouring the stale env scope.
+      expect(stdout).not.toContain("STALE_PENDING_MARKER");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("emits NO lean briefing on source=startup, even with a populated history.db", () => {
+    // The source guard scopes the whole hook (recovery block AND lean briefing)
+    // to compaction only. A startup boot with real history must stay silent.
+    const hookPath = fileURLToPath(
+      new URL("../bin/working-state-reload-hook.sh", import.meta.url),
+    );
+    const stateDir = mkdtempSync(join(tmpdir(), "ws-lean-startup-"));
+    try {
+      makeHistoryDb(stateDir);
+      const stdout = execFileSync("bash", [hookPath], {
+        input: '{"source":"startup"}',
+        encoding: "utf8",
+        env: hookEnv(stateDir),
+      });
+      expect(stdout).toBe("");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades gracefully on source=compact when history.db is absent (recovery block only, exit 0)", () => {
+    // No history.db and no Hindsight → the lean briefing has nothing to emit.
+    // The hook must still print the recovery block and exit 0 (never fail).
+    const hookPath = fileURLToPath(
+      new URL("../bin/working-state-reload-hook.sh", import.meta.url),
+    );
+    const stateDir = mkdtempSync(join(tmpdir(), "ws-lean-empty-"));
+    try {
+      const stdout = execFileSync("bash", [hookPath], {
+        input: '{"source":"compact"}',
+        encoding: "utf8",
+        env: hookEnv(stateDir),
+      });
+      expect(stdout).toContain("<compact-recovery");
+      // No DB, no Hindsight → the lean briefing block is omitted entirely.
+      expect(stdout).not.toContain("<compact-briefing");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the #4390 recovery block when the assembler runs long (inner timeout degrades to recovery-only)", () => {
+    // Low 1: the assembler is capped by an inner `timeout` SHORTER than the 8s
+    // Claude Code hook budget, so a slow assembler (e.g. an operator raising
+    // HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT past the budget) degrades to "recovery
+    // block only" instead of Claude Code killing the WHOLE hook and discarding
+    // every byte of stdout — including the near-unkillable <compact-recovery>
+    // orientation block. Point Hindsight at a black-hole (TEST-NET-1, RFC 5737)
+    // with a long recall timeout; the inner cap must fire and the recovery
+    // block must survive.
+    const hookPath = fileURLToPath(
+      new URL("../bin/working-state-reload-hook.sh", import.meta.url),
+    );
+    const stateDir = mkdtempSync(join(tmpdir(), "ws-lean-slow-"));
+    try {
+      makeHistoryDb(stateDir);
+      const started = Date.now();
+      const stdout = execFileSync("bash", [hookPath], {
+        input: '{"source":"compact"}',
+        encoding: "utf8",
+        env: hookEnv(stateDir, {
+          // Black-hole endpoint → curl hangs; a 30s recall timeout would blow
+          // past the 8s hook budget if the inner `timeout` did not cap it.
+          HINDSIGHT_API_URL: "http://192.0.2.1:9/x",
+          HINDSIGHT_BANK_ID: "bank",
+          HANDOFF_BRIEFING_HINDSIGHT_TIMEOUT: "30",
+        }),
+      });
+      const elapsedMs = Date.now() - started;
+      // Recovery floor intact despite the slow assembler.
+      expect(stdout).toContain("<compact-recovery");
+      // The slow assembler was killed by the inner cap → no lean briefing.
+      expect(stdout).not.toContain("<compact-briefing");
+      // Inner cap (5s) fired well before the 8s hook budget and the 30s recall.
+      expect(elapsedMs).toBeLessThan(8000);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  }, 15000);
 
   it("does NOT wire the retired user-profile-refresh Stop hook, even with hindsight enabled", () => {
     // Per-agent user-profile mental models are retired in favour of dedicated

@@ -7432,20 +7432,34 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
 
   // --- Switchroom-owned SessionStart hooks ---
   //
-  // Reload the agent's working-state file into context immediately after
-  // context compaction. Wired with matcher "compact" so it fires ONLY on
-  // auto/manual compaction — NOT on the "startup"/"resume"/"clear"/"fork"
-  // SessionStart sources (which would re-inject the file on every boot).
-  // Per Claude Code's hook contract, SessionStart stdout IS added to the
-  // model's context (unlike PreCompact stdout, which is not injected), so a
-  // plain `cat` of the working-state file re-seats fast-moving in-flight
-  // task state the instant the native summarizer replaces the transcript.
+  // Re-seat context immediately after context compaction. Wired with matcher
+  // "compact" so it fires ONLY on auto/manual compaction — NOT on the
+  // "startup"/"resume"/"clear"/"fork" SessionStart sources (which would
+  // re-inject on every boot). Per Claude Code's hook contract, SessionStart
+  // stdout IS added to the model's context (unlike PreCompact stdout, which is
+  // not injected), so what this prints re-seats the model the instant the
+  // native summarizer replaces the transcript.
   //
-  // NOT plugin-gated: it's a fail-safe `cat` of a small file
-  // ($TELEGRAM_STATE_DIR/.working-state.md) that no-ops when the file is
-  // absent, so every agent gets the same default. The hook itself re-checks
-  // the `source` field from stdin as belt-and-braces against a matcher
-  // regression. See bin/working-state-reload-hook.sh.
+  // The hook emits three layers (see bin/working-state-reload-hook.sh):
+  //   1. an unconditional static <compact-recovery> orientation block,
+  //   2. the agent's working-state file verbatim, if it keeps one, and
+  //   3. a LEAN briefing (P1): a scoped recent Telegram tail + Hindsight
+  //      recall, assembled by handoff-briefing.sh --lean (the single briefing
+  //      assembler), giving a compacted session fresh-boot parity. This is the
+  //      SHARED compaction re-seat path for EVERY agent regardless of
+  //      session_continuity.briefing mode (legacy vs gateway).
+  //
+  // NOT plugin-gated: every agent gets the same default; the static block and
+  // working-state append no-op gracefully when nothing is present, and the
+  // lean briefing degrades to nothing if history.db / Hindsight are absent.
+  // The hook re-checks the `source` field from stdin as belt-and-braces
+  // against a matcher regression.
+  //
+  // Timeout: the lean briefing adds one local SQLite read plus ONE Hindsight
+  // network hop (capped at ~3s inside handoff-briefing.sh), so the Claude Code
+  // hook timeout is 8s — comfortably above that cap, still bounded. Latency is
+  // a non-issue by design (compaction itself takes far longer; the prompt
+  // cache is already invalidated by the summary replacing the transcript).
   const switchroomSessionStart: Array<Record<string, unknown>> = [
     {
       matcher: "compact",
@@ -7456,7 +7470,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
             "hook:working-state-reload",
             `bash "${join(DOCKER_BIN_PATH, "working-state-reload-hook.sh")}"`,
           ),
-          timeout: 3,
+          timeout: 8,
         },
       ],
     },
