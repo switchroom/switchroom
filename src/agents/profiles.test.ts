@@ -494,6 +494,21 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
     expect(fragment.toLowerCase()).toMatch(/limit you haven't tested|fabricated boundary/);
   });
 
+  it("treats training memory as a lead that needs external validation", async () => {
+    // Ken's rule (2026-08-05): an agent must not answer "I don't
+    // recognize X" from its own parametric/training memory when X is
+    // externally checkable (a repo, a library API, a version, a CLI
+    // flag) — it must fetch the real thing and validate first. This is
+    // distinct from the bank-scoped no-confabulation directive, which
+    // guards Hindsight reflect (where the model has no web tools);
+    // this one guards live turns, where it does.
+    const { renderExecutionDisciplineFragment } = await import("./profiles.js");
+    const fragment = renderExecutionDisciplineFragment();
+    expect(fragment.toLowerCase()).toContain("training memory is a lead, not a source");
+    expect(fragment.toLowerCase()).toContain("i don't recognize x");
+    expect(fragment.toLowerCase()).toMatch(/validate.*against the real thing/);
+  });
+
   it("says a weak or empty result isn't a conclusion", async () => {
     const { renderExecutionDisciplineFragment } = await import("./profiles.js");
     const fragment = renderExecutionDisciplineFragment();
