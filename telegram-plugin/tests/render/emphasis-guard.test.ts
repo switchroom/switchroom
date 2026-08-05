@@ -78,18 +78,117 @@ describe("guardAccidentalEmphasis (#3252) — intended emphasis is LEFT UNTOUCHE
     expect(guardAccidentalEmphasis(s)).toBe(s);
   });
 
-  it("leaves space-flanked operators (`3 * 4`) verbatim — GFM cannot emphasise them", () => {
-    const s = "the product 3 * 4 equals 12";
-    expect(guardAccidentalEmphasis(s)).toBe(s);
-  });
-
-  it("leaves a bare trailing glob (`rm *`) verbatim", () => {
-    const s = "run rm * to clear the dir";
-    expect(guardAccidentalEmphasis(s)).toBe(s);
-  });
-
   it("leaves a lone glob (`*.ts`) verbatim", () => {
     const s = "match *.ts files only";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+});
+
+describe("guardAccidentalEmphasis (#3464) — boundary-flanked `*` (whitespace/boundary on BOTH sides) IS escaped", () => {
+  // A `*` with whitespace or a string boundary on both immediate sides is
+  // neither left- nor right-flanking under GFM — it can never open or close
+  // emphasis, so escaping it is always safe and never touches an intended span.
+  it("escapes a space-flanked operator `3 * 4` (flipped from the old leave-alone pin)", () => {
+    const out = guardAccidentalEmphasis("the product 3 * 4 equals 12");
+    expect(out).toBe("the product 3 \\* 4 equals 12");
+    expect(copyText(out)).toBe("the product 3 * 4 equals 12");
+  });
+
+  it("escapes a bare trailing glob `rm *` (space before, EOL after — boundary both sides)", () => {
+    // `run rm * to clear` — the `*` is whitespace-flanked on both sides.
+    const out = guardAccidentalEmphasis("run rm * to clear the dir");
+    expect(out).toBe("run rm \\* to clear the dir");
+    expect(copyText(out)).toBe("run rm * to clear the dir");
+  });
+
+  it("escapes a single space-flanked `*` in `a * b`", () => {
+    const out = guardAccidentalEmphasis("compute a * b now");
+    expect(out).toBe("compute a \\* b now");
+    expect(copyText(out)).toBe("compute a * b now");
+  });
+
+  it("escapes BOTH space-flanked `*` in `a * b * c`", () => {
+    const out = guardAccidentalEmphasis("compute a * b * c now");
+    expect(out).toBe("compute a \\* b \\* c now");
+    expect(copyText(out)).toBe("compute a * b * c now");
+  });
+
+  it("escapes a `*` at the string end (` *`) — boundary on the trailing side", () => {
+    const out = guardAccidentalEmphasis("clear with rm *");
+    expect(out).toBe("clear with rm \\*");
+  });
+
+  it("PRESERVES a line-leading `* ` — it is a list BULLET, not an operator (#3464 blocker)", () => {
+    // A line-leading `* ` cannot be disambiguated from a `*`-bullet, and Telegram
+    // renders it as a bullet regardless — matching origin/main. Escaping it would
+    // break `*`-bullets on every reply AND (since this arm runs before the
+    // heading guard) disarm the glued-`#` fix for `* #4382`. So it stays verbatim.
+    const s = "* is the multiply op";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("escapes a bare lone `*` (boundary on both sides, no trailing space → not a bullet)", () => {
+    expect(guardAccidentalEmphasis("*")).toBe("\\*");
+  });
+
+  it("leaves `*italic*` untouched (delimiters word-adjacent on the inner side)", () => {
+    const s = "this is *italic* text";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("leaves `**bold**` untouched", () => {
+    const s = "this is **bold** text";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("leaves intra-word `x*y` behaviour to the intra-word arm (single `*`, not boundary-flanked)", () => {
+    // A lone intra-word `*` (one asterisk total) stays byte-identical per the
+    // pair threshold; the boundary arm does not match it (alnum on both sides).
+    const s = "the value x*y here";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("is idempotent on a boundary-flanked escape (double-apply is byte-identical)", () => {
+    const once = guardAccidentalEmphasis("a * b and c * d");
+    expect(guardAccidentalEmphasis(once)).toBe(once);
+    expect(once).not.toContain("\\\\*");
+  });
+
+  it("escapes a `*` alone on its own line (`\\n` counts as whitespace, no bullet)", () => {
+    const out = guardAccidentalEmphasis("line one\n*\nline two");
+    expect(out).toBe("line one\n\\*\nline two");
+  });
+});
+
+describe("guardAccidentalEmphasis (#3464) — line-leading `*` BULLETS are preserved (blocker 2)", () => {
+  it("leaves a multi-line `*`-bullet list unchanged", () => {
+    const s = "* bullet a\n* bullet b";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("leaves a mixed `*`/`-` bullet list unchanged", () => {
+    const s = "* one\n- two\n* three";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("leaves `+ item` and `- item` bullets unchanged (they carry no `*`)", () => {
+    expect(guardAccidentalEmphasis("+ item")).toBe("+ item");
+    expect(guardAccidentalEmphasis("- item")).toBe("- item");
+  });
+
+  it("leaves an indented (≤3 space) `*` bullet unchanged", () => {
+    const s = "  * indented bullet";
+    expect(guardAccidentalEmphasis(s)).toBe(s);
+  });
+
+  it("STILL escapes a non-bullet `*` on a line that ALSO has a `*` bullet", () => {
+    // Line 1 is a bullet (preserved); line 2 has a space-flanked operator (escaped).
+    const out = guardAccidentalEmphasis("* bullet\ncompute a * b");
+    expect(out).toBe("* bullet\ncompute a \\* b");
+  });
+
+  it("is a strict no-op for a pure `*`-bullet list (arm stays disarmed)", () => {
+    const s = "* a\n* b\n* c";
     expect(guardAccidentalEmphasis(s)).toBe(s);
   });
 });

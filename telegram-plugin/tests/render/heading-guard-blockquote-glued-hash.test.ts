@@ -14,49 +14,43 @@ import { guardAccidentalFormatting } from "../../rich-send.js";
 // On the renderer-BYPASS seam (cards / banners / status / approval sends), no
 // such belt runs, so the glued `#` reaches Telegram unescaped.
 //
-// ── Why this test PINS the current behavior instead of changing it ───────────
-// Whether this is a bug depends on a fact we CANNOT determine from the byte
-// stream: does Telegram's non-spec Bot API rich parser actually promote a
-// space-less `#` to a heading when it sits AFTER a `>`/list marker, the way it
-// demonstrably does at a bare line start (`#3460` → giant heading, #3306/#3463)?
+// ── Live UAT confirmed the promotion → these pins are now FLIPPED (#3464) ─────
+// The question was a fact we could NOT determine from the byte stream: does
+// Telegram's non-spec Bot API rich parser actually promote a space-less `#` to a
+// heading when it sits AFTER a `>`/list marker, the way it demonstrably does at
+// a bare line start (`#3460` → giant heading, #3306/#3463)?
 //   - CommonMark treats `> #3460` as a blockquote whose content is the paragraph
 //     `#3460` (no ATX heading — no space after `#`); `> # Heading` (WITH space)
 //     is a real nested heading. Telegram's promotion of the SPACE-LESS form is
-//     the documented non-spec deviation — but only ever OBSERVED at a bare line
-//     start, never confirmed inside a blockquote/list.
-//   - There is no repo evidence (UAT fixture, doc note, or #3306/#3463 UAT
-//     result) establishing that the promotion fires in this nested position.
-//     The render.ts belt escaping it is a GENERIC side effect of a `^…#`
-//     paragraph regex, not a confirmed-behavior signal.
-// Issue #3464 itself says: "Verify against Telegram live-UAT whether the
-// non-spec heading promotion actually fires inside blockquotes/lists before
-// adding escaping (avoid stray backslashes if it does not)." That live UAT
-// cannot run in vitest. Ken's hard constraint on this guard family is that a
-// wrong "fix" adding stray backslashes would itself corrupt legitimate
-// formatting — the exact thing to avoid. So this test DOCUMENTS the current,
-// deliberately-conservative behavior; if live UAT later confirms Telegram DOES
-// promote here, extend the guard and flip these expectations in the same PR.
+//     the documented non-spec deviation.
+// Issue #3464 said: "Verify against Telegram live-UAT whether the non-spec
+// heading promotion actually fires inside blockquotes/lists before adding
+// escaping (avoid stray backslashes if it does not)." That live UAT has now run
+// and CONFIRMED the promotion fires in the nested position — a `#` glued after a
+// `>`/list marker is promoted to a heading exactly as at a bare line start. So
+// `guardAccidentalHeading` now escapes it (via `ACCIDENTAL_HEADING_AFTER_MARKER`
+// in line-start-guard.ts), and the previously-pinned "left untouched"
+// expectations are flipped to assert the escaped outcome. A real nested heading
+// (`> # Heading`, space AFTER the `#`) and a bare `#` remain untouched (below).
 
-describe("guardAccidentalHeading — glued `#` after a blockquote/list marker is NOT escaped (#3464, awaits live-UAT)", () => {
-  it("leaves `> #3460` untouched (glued hash after a blockquote marker)", () => {
-    expect(guardAccidentalHeading("> #3460 done")).toBe("> #3460 done");
+describe("guardAccidentalHeading — glued `#` after a blockquote/list marker IS escaped (#3464, live-UAT confirmed)", () => {
+  it("escapes `> #3460` (glued hash after a blockquote marker)", () => {
+    expect(guardAccidentalHeading("> #3460 done")).toBe("> \\#3460 done");
   });
 
-  it("leaves `- #3460` untouched (glued hash after an unordered-list marker)", () => {
-    expect(guardAccidentalHeading("- #3460 done")).toBe("- #3460 done");
+  it("escapes `- #3460` (glued hash after an unordered-list marker)", () => {
+    expect(guardAccidentalHeading("- #3460 done")).toBe("- \\#3460 done");
   });
 
-  it("leaves `* #3460` untouched (glued hash after a `*` bullet)", () => {
-    expect(guardAccidentalHeading("* #3460 x")).toBe("* #3460 x");
+  it("escapes `* #3460` (glued hash after a `*` bullet)", () => {
+    expect(guardAccidentalHeading("* #3460 x")).toBe("* \\#3460 x");
   });
 
-  it("leaves `1. #3460` untouched (glued hash after an ordered-list marker)", () => {
-    expect(guardAccidentalHeading("1. #3460 x")).toBe("1. #3460 x");
+  it("escapes `1. #3460` (glued hash after an ordered-list marker)", () => {
+    expect(guardAccidentalHeading("1. #3460 x")).toBe("1. \\#3460 x");
   });
 
-  it("still escapes the SAME `#3460` at a bare line start (the confirmed case)", () => {
-    // Proves the untouched results above are the `^`-anchor scope, not the guard
-    // being disabled: at a real line start the accidental heading IS escaped.
+  it("still escapes the SAME `#3460` at a bare line start (the original confirmed case)", () => {
     expect(guardAccidentalHeading("#3460 done")).toBe("\\#3460 done");
   });
 });
@@ -71,16 +65,109 @@ describe("guardAccidentalHeading — a real nested heading (space form) must sta
   });
 });
 
-describe("guardAccidentalFormatting (universal seam) — same conservative behavior end-to-end (#3464)", () => {
-  it("leaves `> #3460` untouched through the full composition", () => {
-    expect(guardAccidentalFormatting("> #3460 done")).toBe("> #3460 done");
+describe("guardAccidentalFormatting (universal seam) — glued `#` after a marker IS escaped end-to-end (#3464)", () => {
+  it("escapes `> #3460` through the full composition", () => {
+    expect(guardAccidentalFormatting("> #3460 done")).toBe("> \\#3460 done");
   });
 
-  it("leaves `- #3460` untouched through the full composition", () => {
-    expect(guardAccidentalFormatting("- #3460 done")).toBe("- #3460 done");
+  it("escapes `- #3460` through the full composition", () => {
+    expect(guardAccidentalFormatting("- #3460 done")).toBe("- \\#3460 done");
   });
 
   it("still escapes a bare line-leading `#3460` at the seam (control)", () => {
     expect(guardAccidentalFormatting("#3460 done")).toBe("\\#3460 done");
   });
+});
+
+describe("guardAccidentalHeading (#3464) — every list/blockquote marker shape + nesting is escaped", () => {
+  it("escapes `- #4382's x` (apostrophe-suffixed hash after a `-` bullet)", () => {
+    expect(guardAccidentalHeading("- #4382's x")).toBe("- \\#4382's x");
+  });
+
+  it("escapes `* #x` (after a `*` bullet)", () => {
+    expect(guardAccidentalHeading("* #x")).toBe("* \\#x");
+  });
+
+  it("escapes `+ #x` (after a `+` bullet)", () => {
+    expect(guardAccidentalHeading("+ #x")).toBe("+ \\#x");
+  });
+
+  it("escapes `1. #x` (after a `.`-delimited ordered marker)", () => {
+    expect(guardAccidentalHeading("1. #x")).toBe("1. \\#x");
+  });
+
+  it("escapes `1) #x` (after a `)`-delimited ordered marker)", () => {
+    expect(guardAccidentalHeading("1) #x")).toBe("1) \\#x");
+  });
+
+  it("escapes `> #x` (after a blockquote marker)", () => {
+    expect(guardAccidentalHeading("> #x")).toBe("> \\#x");
+  });
+
+  it("escapes nested `- > #x` (a bullet then a blockquote marker)", () => {
+    expect(guardAccidentalHeading("- > #x")).toBe("- > \\#x");
+  });
+});
+
+describe("guardAccidentalHeading (#3464) — invariants that must stay untouched", () => {
+  it("leaves `- # Heading` (real nested heading, space after `#`)", () => {
+    expect(guardAccidentalHeading("- # Heading")).toBe("- # Heading");
+  });
+
+  it("leaves `# Heading` (real bare heading, space after `#`)", () => {
+    expect(guardAccidentalHeading("# Heading")).toBe("# Heading");
+  });
+
+  it("still escapes bare `#4382 done` (unchanged from before this PR)", () => {
+    expect(guardAccidentalHeading("#4382 done")).toBe("\\#4382 done");
+  });
+});
+
+describe("guardAccidentalFormatting (#3464) — `*`-bullet marker survives emphasis AND the glued `#` is escaped (blocker 1, end-to-end)", () => {
+  // The composed pipeline (rich-send.ts) runs guardAccidentalEmphasis BEFORE
+  // guardAccidentalHeading. If the emphasis arm escaped the leading `* ` bullet,
+  // the LITERAL `*` marker the heading guard needs would be gone and the glued
+  // `#` would NOT be escaped. These tests exercise the REAL ordering — the unit
+  // tests above call the heading guard in isolation and cannot catch that.
+  it("escapes `* #3460 x` end-to-end (marker preserved, `#` escaped)", () => {
+    expect(guardAccidentalFormatting("* #3460 x")).toBe("* \\#3460 x");
+  });
+
+  it("escapes `* #x` end-to-end", () => {
+    expect(guardAccidentalFormatting("* #x")).toBe("* \\#x");
+  });
+
+  it("escapes `- #3460 x` end-to-end (regression guard — `-` marker never touched)", () => {
+    expect(guardAccidentalFormatting("- #3460 x")).toBe("- \\#3460 x");
+  });
+
+  it("escapes `> #x` end-to-end", () => {
+    expect(guardAccidentalFormatting("> #x")).toBe("> \\#x");
+  });
+
+  it("leaves a plain `*`-bullet list unchanged end-to-end (no glued `#`)", () => {
+    const s = "* bullet a\n* bullet b";
+    expect(guardAccidentalFormatting(s)).toBe(s);
+  });
+
+  it("leaves a mixed `*`/`-` bullet list unchanged end-to-end", () => {
+    const s = "* one\n- two\n* three";
+    expect(guardAccidentalFormatting(s)).toBe(s);
+  });
+});
+
+describe("guardAccidentalHeading (#3464) — idempotence (double-apply is byte-identical)", () => {
+  for (const input of [
+    "- #4382 done",
+    "> #x",
+    "- > #x",
+    "1. #x",
+    "#4382 done",
+  ]) {
+    it(`is idempotent on ${JSON.stringify(input)}`, () => {
+      const once = guardAccidentalHeading(input);
+      expect(guardAccidentalHeading(once)).toBe(once);
+      expect(once).not.toContain("\\\\#");
+    });
+  }
 });

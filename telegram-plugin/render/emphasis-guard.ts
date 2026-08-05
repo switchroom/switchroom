@@ -34,19 +34,38 @@
 // `__x__` double runs are excluded for free: the inner neighbour of each `*`
 // in `a**b` is another `*` (not alphanumeric), so neither half matches.
 //
+// A SECOND, always-safe arm (added for issue #3464 alongside the line-start
+// glued-`#` guard) escapes a `*` that is flanked by WHITESPACE OR A STRING
+// BOUNDARY on BOTH immediate sides (`a * b`, ` * `, a bare `*`, a trailing
+// `rm *`). Under GFM flanking rules such a `*` is neither left- nor right-
+// flanking, so it can NEVER open OR close emphasis; escaping it therefore
+// cannot break an intended `*italic*` / `**bold**` (whose delimiters are
+// word-adjacent on their INNER side, so never whitespace-flanked on both
+// sides). Because this `*` can never pair, the arm fires on a single
+// occurrence — it needs no 2+ threshold. Live Telegram UAT for #3464 confirmed
+// the non-spec Bot API parser can still surface a stray lone `*` in this
+// position, so neutralising it deterministically is the durable fix.
+//
+// The ONE boundary-flanked position this arm must NOT touch is a line-leading
+// `* ` — that is an unordered-list BULLET (`* item`), not an inert operator.
+// Escaping it would break `*`-bullets on every outbound message AND (because
+// this arm runs before `guardAccidentalHeading`) disarm the glued-`#` fix for
+// `* #4382`. See `isLineLeadingBullet`. A lone `*` on its own line has no
+// trailing space, is not a bullet, and is still escaped.
+//
 // What we DELIBERATELY LEAVE ALONE (conservative false-negatives, per the
 // "when in doubt, leave it" doctrine inherited from the dollar guard):
-//   - Space-flanked operators (`3 * 4`): a whitespace-flanked `*`/`_` is
-//     neither left- nor right-flanking under GFM, so it can never open or
-//     close emphasis — there is no bug to fix, and escaping it would be pure
-//     churn.
-//   - Boundary-flanked delimiters (`rm *`, `*.ts`, leading-`_` `_private`):
-//     these are INDISTINGUISHABLE from an intended `*glob*` / `_italic_`
-//     opener (`*.ts is a glob*` is a legitimate italic). Escaping them would
-//     risk breaking intended emphasis — the one thing this guard must never
-//     do — so a glob/leading-underscore that pairs into an accidental span is
-//     accepted as a rare false-negative rather than risked as a false-positive.
-//     (A future arm could target these behind live Telegram UAT; see below.)
+//   - Boundary-flanked delimiters with a NON-whitespace neighbour on the other
+//     side (`*.ts`, leading-`_` `_private`): these are INDISTINGUISHABLE from
+//     an intended `*glob*` / `_italic_` opener (`*.ts is a glob*` is a
+//     legitimate italic). Escaping them would risk breaking intended emphasis —
+//     the one thing this guard must never do — so a glob/leading-underscore
+//     that pairs into an accidental span is accepted as a rare false-negative
+//     rather than risked as a false-positive. (The whitespace-on-BOTH-sides
+//     form `rm *` is NOT in this class — a `*` with whitespace/boundary on both
+//     sides is provably inert, so the new arm above escapes it safely.)
+//     `_` in this position is likewise left alone; the boundary-flanked arm is
+//     `*`-only.
 //
 // Idempotent: the escape is expressed as an intra-word match, so an
 // already-escaped `\_`/`\*` has a backslash (not an alphanumeric) immediately
@@ -91,6 +110,47 @@ const INTRA_WORD_UNDERSCORE = /(?<=[A-Za-z0-9])_(?=[A-Za-z0-9])/g;
  *  neighbour is `*` (not alnum). Idempotent for the same reason as above. */
 const INTRA_WORD_ASTERISK = /(?<=[A-Za-z0-9])\*(?=[A-Za-z0-9])/g;
 
+/** A `*` flanked by WHITESPACE OR A STRING BOUNDARY on BOTH immediate sides
+ *  (`a * b`, ` * `, a bare `*`, `rm *`). Neither left- nor right-flanking under
+ *  GFM, so it can never open or close emphasis — escaping it is always safe and
+ *  can never touch an intended `*italic*` / `**bold**` (word-adjacent on the
+ *  inner side). Idempotent: after escaping, the `*` is preceded by `\` (neither
+ *  whitespace nor `^`), so the lookbehind no longer matches. `\n` is whitespace,
+ *  so a `*` alone on its own line is covered without a multiline flag.
+ *
+ *  CRITICAL EXCLUSION — a line-leading `* ` is an unordered-LIST BULLET, not an
+ *  inert operator, and MUST NOT be escaped (`isLineLeadingBullet` below). Two
+ *  reasons: (a) `*`-bullets are extremely common in replies and escaping the
+ *  marker would break the list on EVERY outbound message (an asymmetric
+ *  regression — `-`/`+` bullets are untouched); (b) this guard runs BEFORE
+ *  `guardAccidentalHeading` in the `guardAccidentalFormatting` pipeline
+ *  (rich-send.ts), and the heading guard's `ACCIDENTAL_HEADING_AFTER_MARKER`
+ *  needs the LITERAL `*` marker to fire — escaping the marker here would silently
+ *  disarm the glued-`#` fix for the `* #4382` case (#3464). A lone `*` on its own
+ *  line (`\n*\n`) is NOT a bullet — no trailing space — so it is still escaped. */
+const BOUNDARY_FLANKED_ASTERISK = /(?<=^|\s)\*(?=\s|$)/g;
+
+/** True iff the `*` at `starIndex` is a line-leading unordered-list bullet: a
+ *  line start (string start or after `\n`) + up to 3 spaces/tabs of indent, then
+ *  the `*`, then a space/tab. This is the ONE boundary-flanked position we leave
+ *  alone (see BOUNDARY_FLANKED_ASTERISK). Note: a segment that begins mid-line
+ *  (right after an inline code span) has its start treated as a line start here,
+ *  which errs toward PRESERVING an ambiguous leading `*` — the safe direction,
+ *  since wrongly escaping a bullet is the failure this exclusion exists to stop. */
+function isLineLeadingBullet(text: string, starIndex: number): boolean {
+  // A bullet requires a space/tab immediately after the marker.
+  const next = text[starIndex + 1];
+  if (next !== " " && next !== "\t") return false;
+  // Walk left over up to 3 indent spaces/tabs; the run must reach a line start.
+  let i = starIndex - 1;
+  let indent = 0;
+  while (i >= 0 && (text[i] === " " || text[i] === "\t")) {
+    if (++indent > 3) return false;
+    i--;
+  }
+  return i < 0 || text[i] === "\n";
+}
+
 /** Every unescaped `_` / `*` in prose (the pair-threshold input). An emphasis
  *  span needs a MATCHING pair of the same delimiter, so a delimiter can only
  *  mis-render when 2+ of it exist. The `(?<!\\)` keeps the count idempotent. */
@@ -129,22 +189,37 @@ export function guardAccidentalEmphasis(text: string): string {
   // 2+ of that delimiter exist (so a pair — hence a mis-render — is possible).
   let hasIntraUnderscore = false;
   let hasIntraAsterisk = false;
+  let hasBoundaryAsterisk = false;
   let underscoreCount = 0;
   let asteriskCount = 0;
   for (const seg of segments) {
     if (seg.code) continue;
     if (INTRA_WORD_UNDERSCORE.test(seg.text)) hasIntraUnderscore = true;
     if (INTRA_WORD_ASTERISK.test(seg.text)) hasIntraAsterisk = true;
+    // Arm only on a boundary-flanked `*` that is NOT a line-leading bullet, so a
+    // segment whose only such `*` is a bullet keeps the guard a strict no-op.
+    if (!hasBoundaryAsterisk) {
+      for (const m of seg.text.matchAll(BOUNDARY_FLANKED_ASTERISK)) {
+        if (!isLineLeadingBullet(seg.text, m.index ?? 0)) {
+          hasBoundaryAsterisk = true;
+          break;
+        }
+      }
+    }
     underscoreCount += seg.text.match(ANY_UNDERSCORE)?.length ?? 0;
     asteriskCount += seg.text.match(ANY_ASTERISK)?.length ?? 0;
   }
   // Reset lastIndex — the /g regexes above are stateful across .test() calls.
   INTRA_WORD_UNDERSCORE.lastIndex = 0;
   INTRA_WORD_ASTERISK.lastIndex = 0;
+  BOUNDARY_FLANKED_ASTERISK.lastIndex = 0;
 
   const armUnderscore = hasIntraUnderscore && underscoreCount >= 2;
   const armAsterisk = hasIntraAsterisk && asteriskCount >= 2;
-  if (!armUnderscore && !armAsterisk) return text;
+  // The boundary-flanked `*` can NEVER pair (neither flanking), so no 2+
+  // threshold: a single occurrence is escaped on its own.
+  const armBoundaryAsterisk = hasBoundaryAsterisk;
+  if (!armUnderscore && !armAsterisk && !armBoundaryAsterisk) return text;
 
   return segments
     .map((seg) => {
@@ -152,6 +227,11 @@ export function guardAccidentalEmphasis(text: string): string {
       let out = seg.text;
       if (armUnderscore) out = out.replace(INTRA_WORD_UNDERSCORE, "\\_");
       if (armAsterisk) out = out.replace(INTRA_WORD_ASTERISK, "\\*");
+      if (armBoundaryAsterisk) {
+        out = out.replace(BOUNDARY_FLANKED_ASTERISK, (m, offset: number, str: string) =>
+          isLineLeadingBullet(str, offset) ? m : "\\*",
+        );
+      }
       return out;
     })
     .join("");
