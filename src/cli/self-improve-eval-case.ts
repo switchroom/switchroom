@@ -74,9 +74,20 @@ function fail(msg: string, code = 1): never {
   process.exit(code);
 }
 
-/** The textual content of a case that must be PII/secret-clean. */
+/** The textual content of a case that must be PII/secret-clean. Every
+ *  free-text field is scanned — including `files[]` fixture content, which is
+ *  a verbatim excerpt just like the prompt and can carry PII/secrets. The
+ *  one-tap CLI does not populate `files[]` yet (see #4404), but the scan must
+ *  still cover it: defense in depth against a `--case` JSON or a future writer
+ *  that does. */
 function caseText(ec: EvalCase): string {
-  return [ec.prompt, ec.expected_output ?? "", ...(ec.expectations ?? []), ec.source ?? ""]
+  return [
+    ec.prompt,
+    ec.expected_output ?? "",
+    ...(ec.expectations ?? []),
+    ...(ec.files ?? []),
+    ec.source ?? "",
+  ]
     .filter(Boolean)
     .join("\n");
 }
@@ -268,12 +279,15 @@ function registerApply(parent: Command): void {
       }
 
       if (proposal.held_out) {
-        appendHeldOutCase(sd, proposal.skill_slug, ec);
+        const hres = appendHeldOutCase(sd, proposal.skill_slug, ec);
         console.log(
           JSON.stringify({
             ok: true,
             action: "apply-eval-case",
-            applied: true,
+            applied: hres.ok,
+            // Idempotent, like the evals.json sink: a duplicate is a no-op, not
+            // an error.
+            ...(hres.ok ? {} : { reason: "duplicate" }),
             held_out: true,
             skill: proposal.skill_slug,
           }),

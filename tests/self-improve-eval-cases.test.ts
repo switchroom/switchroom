@@ -118,18 +118,66 @@ describe("appendEvalCase (add-only, dedup, atomic)", () => {
     expect(r.ok).toBe(false);
     expect(existsSync(evalsJsonPath(d))).toBe(false);
   });
+
+  // #4409 — a present-but-unparseable evals.json must NOT be silently
+  // overwritten from an empty doc (which would clobber recoverable contents).
+  // A MISSING file still creates the skeleton; only present-but-corrupt refuses.
+  it("refuses to overwrite a present-but-unparseable evals.json (no clobber)", () => {
+    const d = makeSkill("s1");
+    const corrupt = '{ "evals": [ this is not valid json';
+    writeFileSync(evalsJsonPath(d), corrupt);
+    const r = appendEvalCase(d, "s1", { prompt: "case one" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/unparseable|malformed|refus/i);
+    // The malformed bytes are preserved verbatim — NOT overwritten.
+    expect(readFileSync(evalsJsonPath(d), "utf8")).toBe(corrupt);
+  });
+
+  // A present file that is valid JSON but structurally wrong (evals not an
+  // array) is also "malformed" → refuse, don't clobber.
+  it("refuses to overwrite a structurally-invalid evals.json (evals not an array)", () => {
+    const d = makeSkill("s1");
+    const bad = JSON.stringify({ skill_name: "s1", evals: "oops" });
+    writeFileSync(evalsJsonPath(d), bad);
+    const r = appendEvalCase(d, "s1", { prompt: "case one" });
+    expect(r.ok).toBe(false);
+    expect(readFileSync(evalsJsonPath(d), "utf8")).toBe(bad);
+  });
 });
 
 describe("held-out sink", () => {
   it("appends jsonl lines to the state-dir sink (never a skill dir)", () => {
-    appendHeldOutCase(stateDir, "s1", { prompt: "held one" });
-    appendHeldOutCase(stateDir, "s1", { prompt: "held two" });
+    expect(appendHeldOutCase(stateDir, "s1", { prompt: "held one" }).ok).toBe(true);
+    expect(appendHeldOutCase(stateDir, "s1", { prompt: "held two" }).ok).toBe(true);
     const lines = readFileSync(heldOutPath(stateDir), "utf8").trim().split("\n");
     expect(lines.length).toBe(2);
     const first = JSON.parse(lines[0]!);
     expect(first.slug).toBe("s1");
     expect(first.case.prompt).toBe("held one");
     expect(typeof first.at).toBe("string");
+  });
+
+  // #4425 item 6 — the held-out sink now dedups on the same normalized-prompt
+  // fingerprint as appendEvalCase, so the second (identical) correction is
+  // refused rather than appended.
+  it("dedups a held-out case with the same normalized prompt (same slug)", () => {
+    const first = appendHeldOutCase(stateDir, "s1", { prompt: "Be terse" });
+    expect(first.ok).toBe(true);
+    const dup = appendHeldOutCase(stateDir, "s1", { prompt: "be   terse" });
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.duplicate).toBe(true);
+    // Only one line on disk — the dup was NOT appended.
+    const lines = readFileSync(heldOutPath(stateDir), "utf8").trim().split("\n");
+    expect(lines.length).toBe(1);
+  });
+
+  // Dedup is scoped to the slug — a different skill may legitimately reuse a
+  // prompt, so that is NOT a duplicate.
+  it("does NOT dedup the same prompt across different slugs", () => {
+    expect(appendHeldOutCase(stateDir, "s1", { prompt: "be terse" }).ok).toBe(true);
+    expect(appendHeldOutCase(stateDir, "s2", { prompt: "be terse" }).ok).toBe(true);
+    const lines = readFileSync(heldOutPath(stateDir), "utf8").trim().split("\n");
+    expect(lines.length).toBe(2);
   });
 });
 
