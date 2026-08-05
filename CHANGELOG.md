@@ -7,7 +7,9 @@ suspected account wall on the **first** hit via a rate-bounded quota probe
 instead of waiting for a 3-hit window, and three delivery fixes stop a
 sub-agent handback from double-replying, keep a caller-supplied synthetic
 reply anchor from 400ing a send, and stop an unreadable `skills.d` overlay
-from freezing cron hot-reloads.
+from freezing cron hot-reloads. A fourth outbound fix escapes two Markdown
+edge cases the reply-tool path was mis-rendering into stray headings and
+emphasis.
 
 ### 429 throttle corroborates on the first hit, rate-bounded (#4375)
 
@@ -89,6 +91,25 @@ warning pass `"schedule"`, so a `skills.d` permission problem still warns (via
 the loader's per-file `console.warn`) but no longer freezes cron reloads; the
 `schedule.d` fail-safe is unchanged.
 
+### Outbound reply formatting: escape glued `#` after list/quote markers and boundary-flanked `*` (#3464)
+
+The reply-tool send path never runs the CommonMark renderer, so its only
+defense against Telegram's non-spec Markdown parser is the
+`guardAccidentalFormatting` pass, and two gaps let agent replies mis-render.
+A space-less `#` glued right after a line-start list or blockquote marker
+(`- #4382`, `> #4382`, `1. #4382`, nested `- > #4382`) slipped past the
+`^`-anchored heading guard and was promoted to a heading; and a `*` flanked by
+whitespace or a string boundary on both sides (`a * b`, `rm *`, a lone `*`),
+which can never open or close GFM emphasis, was left raw and mangled by
+Telegram. The guards now escape both: the heading guard gained a marker-aware
+arm that escapes only the first `#` of the run while re-emitting the marker
+prefix verbatim, and the emphasis guard escapes boundary-flanked `*` while
+EXEMPTING line-leading `* ` bullets so `*`-bullet lists still render. Real
+nested headings (`- # Heading`), bare `#`, `#4382`, `*italic*`, `**bold**`,
+and intra-word `x*y` are all untouched; both passes are idempotent.
+(`telegram-plugin/render/line-start-guard.ts`,
+`telegram-plugin/render/emphasis-guard.ts`.)
+
 ### Docs
 
 - **#4377** — added a root-tier chown-overlay discipline rule to the default
@@ -115,6 +136,13 @@ the loader's per-file `console.warn`) but no longer freezes cron reloads; the
   gateway wiring: `generic-transient` routes to the probe, while
   `litellm-local` and `account-scoped` stay inert. Extracts the decision into a
   pure injectable `routeRateLimit429` seam; no runtime change.
+- **#4384** — added a wiring-guard pinning the 429 route-seam callsite: an
+  isolation test that asserts `gateway.ts`'s calm-429 branch still calls
+  `routeRateLimit429(...)` with the event's classification and the real
+  `throttleTierRunner` (complementing #4381's coverage of the pure seam), so a
+  future refactor that drops the callsite can't silently disable first-hit
+  corroboration while the seam's own unit suite stays green. Test-only,
+  line-neutral against the gateway ratchet; no runtime change.
 
 ## v0.20.8 — three fleet-audit reliability fixes: synthetic-id queued cards, bridge disconnect churn, and cron-drop on unreadable overlays
 
