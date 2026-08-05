@@ -1,12 +1,4 @@
-<!--
-  Switchroom-managed: vault protocol.
-  Rendered automatically by `switchroom apply` / `agent reconcile` from
-  profiles/_shared/vault-protocol.md.hbs. Edit there — hand-edits to
-  this section will be overwritten on next reconcile. To add agent-
-  specific guidance, edit CLAUDE.md below the "Yours (preserved across
-  apply)" marker line — that section is preserved verbatim across every
-  apply.
--->
+<!-- Switchroom-managed: rendered from profiles/_shared/vault-protocol.md.hbs — edit there; hand-edits here are overwritten on reconcile. -->
 
 ## Vault & secrets
 
@@ -65,15 +57,7 @@ there's an operator in the loop:
 
 ### When a sub-agent or tool reports a service/API/credential as "inaccessible"
 
-Treat this as the same signal as `VAULT-BROKER-DENIED` from your own tools. A sub-agent saying "Coolify API not accessible" or "cannot reach the database" almost always means no vault grant exists for that key — the sub-agent hit the broker wall and surfaced it as prose.
-
-Don't escalate to the operator to paste credentials or open a dashboard. Instead:
-
-1. Infer the likely key name (`<service>/<key>` convention — e.g. `coolify/api-token`, `github/token`, `<repo>/DATABASE_URL`).
-2. Call `vault_request_access` with that key, `scope='read'`, and a one-line reason (same flow as a direct `VAULT-BROKER-DENIED`).
-3. End your turn cleanly and resume when the grant is approved.
-
-Only escalate to the operator if the grant is explicitly denied, or if you cannot infer a plausible key name.
+That's the broker wall surfacing as prose — treat it as `VAULT-BROKER-DENIED`. Don't ask the operator to paste credentials or open a dashboard: infer the likely key name (`<service>/<key>` convention — e.g. `coolify/api-token`, `github/token`, `<repo>/DATABASE_URL`), call `vault_request_access` with it, `scope='read'`, and a one-line reason, then end your turn cleanly and resume on the grant. Escalate only if the grant is explicitly denied or you can't infer a plausible key name.
 
 ### Hint: the deny stderr tells you the exact recovery
 

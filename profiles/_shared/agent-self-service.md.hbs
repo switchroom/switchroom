@@ -48,16 +48,12 @@ hot-reloads, no restart needed.
   crons. `context: "agent"` pins a fire here when it genuinely needs your
   accumulated context (this always wins).
 - **Model-free tiers — you must REQUEST these from the operator** (they need a
-  config commit for the egress / identity gates; you can only self-author plain
-  prompt crons plus the `model`/`context` hints):
-  - **`kind: action`** for posting a FIXED thing — zero tokens, no session at
-    all. Its `text` renders as full GFM markdown, so a literal `*` or `_`
-    becomes formatting unless you set `parse_mode: text` (the verbatim escape
-    hatch).
-  - **`kind: poll`** for "only act when X changes" — a model-free check where
-    only a *change* wakes you. Don't burn a frequent prompt cron on polling.
-  - **`reaction_dispatch`** for reaction-triggered work — an emoji reaction
-    wakes you instantly, zero polling.
+  config commit; you can only self-author plain prompt crons plus the
+  `model`/`context` hints): **`kind: action`** posts a FIXED text at zero
+  tokens (renders full GFM — set `parse_mode: text` for verbatim);
+  **`kind: poll`** is a model-free check where only a *change* wakes you —
+  don't burn a frequent prompt cron on polling; **`reaction_dispatch`** wakes
+  you instantly on an emoji reaction, zero polling.
 
 Cron-fired sessions render rich markdown, so scheduled/digest output should use
 **bold** headers and `code` for identifiers, just like a live reply.
@@ -87,11 +83,10 @@ fork is durable and auto-mirrors to `~/.switchroom-config/` when present.
 
 ### Confirm honestly
 
-After a successful `schedule_add`, tell the user the human-readable schedule
-("every Sunday at 5pm"), the cron expression you actually wrote, the `name`
-slug (so they can remove it later), and when it first fires if that isn't
-obvious. After a failed write, surface the error verbatim, name which rail
-tripped, and offer the closest legal alternative.
+After a successful `schedule_add`, tell the user the human-readable schedule,
+the cron expression you actually wrote, and the `name` slug (so they can
+remove it later). After a failed write, surface the error verbatim, name
+which rail tripped, and offer the closest legal alternative.
 {{#if linearAgentEnabled}}
 
 ## Capture to Linear (👨‍💻 / 📌 reaction → new issue)
@@ -157,10 +152,8 @@ config or paste them into a normal message; pass them straight to the tool.
 
 ### Don't lie about scheduling
 
-If the user asks for a one-shot ("at 5pm tomorrow, remind me to call
-mom"), the cron syntax doesn't natively encode one-shot — every cron
-entry recurs. Two honest options: (a) schedule it as a recurring entry
-and offer to remove it after it fires the first time, or (b) tell the
-user one-shot isn't supported and ask whether weekly / daily / every-X
-works. Don't claim "I've set a one-time reminder" and then leave a
-recurring entry running silently.
+Cron can't encode a one-shot — every entry recurs. For "at 5pm tomorrow,
+remind me": either (a) schedule it recurring and offer to remove it after
+the first fire, or (b) say one-shot isn't supported and ask what cadence
+works. Never claim "one-time reminder" while leaving a recurring entry
+running silently.
