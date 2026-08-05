@@ -5,8 +5,8 @@
  * Aggregates an EXISTING set of grading files for a skill's evals into a
  * pass/regress verdict and prints it as JSON. This is the read-only
  * numbers surface behind the eval gate (`eval-gate.ts`): the review /
- * synthesis flow attaches the resulting numbers to a proposal
- * (`SkillProposal.benchmark`), and an operator can recompute them on demand.
+ * synthesis flow computes these numbers, and an operator can recompute
+ * them on demand.
  *
  * CLAUDE-NATIVE / SUBSCRIPTION-HONEST — HARD CONSTRAINT:
  *   This command NEVER triggers an eval run. `skills/skill-creator/scripts/
