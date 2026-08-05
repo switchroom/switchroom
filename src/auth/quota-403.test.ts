@@ -14,8 +14,10 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  extractApiErrorCode,
   extractApiErrorMessage,
   fetchQuota,
+  isEntitlementBlockedErrorCode,
   isEntitlementDisabledMessage,
 } from "./quota.js";
 
@@ -48,6 +50,32 @@ const BAD_SCOPE_BODY = {
   },
 };
 
+/**
+ * The observed DEACTIVATED / OAuth-disabled-org 403 body (verbatim signature).
+ * Its message carries neither "disabled" nor "claude code", so the prose
+ * matcher misses it — the structured `error.details.error_code` is the only
+ * reliable signal. This is the exact gap the fix closes.
+ */
+const OAUTH_DISABLED_ORG_BODY = {
+  type: "error",
+  error: {
+    type: "permission_error",
+    message: "OAuth authentication is currently not allowed for this organization.",
+    details: { error_code: "oauth_not_allowed_for_organization" },
+  },
+  request_id: "req_abc123",
+};
+
+/** A generic 403 carrying an UNRELATED structured error_code (over-block guard). */
+const UNRELATED_CODE_403_BODY = {
+  type: "error",
+  error: {
+    type: "permission_error",
+    message: "Some other permission problem.",
+    details: { error_code: "some_unrelated_permission_error" },
+  },
+};
+
 describe("fetchQuota — structured entitlement-403 classification", () => {
   it("a 403 with a Code-disabled body → structured entitlement_blocked failure", async () => {
     const res = await fetchQuota({
@@ -63,6 +91,36 @@ describe("fetchQuota — structured entitlement-403 classification", () => {
     );
     // The legacy log string is still present for observability.
     expect(res.reason).toContain("HTTP 403");
+  });
+
+  it("a deactivated-org 403 (oauth_not_allowed_for_organization) → entitlement_blocked via the structured error_code", async () => {
+    // This body's message has no "disabled"/"claude code" — the prose matcher
+    // misses it. Classification MUST come from error.details.error_code.
+    const res = await fetchQuota({
+      accessToken: "tok",
+      fetchImpl: stubFetch(403, OAUTH_DISABLED_ORG_BODY),
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.failureKind).toBe("entitlement_blocked");
+    expect(res.httpStatus).toBe(403);
+    expect(res.apiErrorMessage).toBe(
+      "OAuth authentication is currently not allowed for this organization.",
+    );
+    // Sanity: the prose matcher genuinely does NOT catch this message, so the
+    // pass is proving the CODE path, not accidentally the fallback path.
+    expect(isEntitlementDisabledMessage(res.apiErrorMessage)).toBe(false);
+  });
+
+  it("a generic 403 with an UNRELATED error_code stays 'other' (over-block guard)", async () => {
+    const res = await fetchQuota({
+      accessToken: "tok",
+      fetchImpl: stubFetch(403, UNRELATED_CODE_403_BODY),
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.failureKind).toBe("other");
+    expect(res.httpStatus).toBe(403);
   });
 
   it("a bad-token-scope 403 is NOT entitlement_blocked (failureKind 'other')", async () => {
@@ -143,5 +201,35 @@ describe("extractApiErrorMessage", () => {
 
   it("empty body → null", () => {
     expect(extractApiErrorMessage("")).toBeNull();
+  });
+});
+
+describe("extractApiErrorCode", () => {
+  it("pulls error.details.error_code from a deactivated-org body", () => {
+    expect(extractApiErrorCode(JSON.stringify(OAUTH_DISABLED_ORG_BODY))).toBe(
+      "oauth_not_allowed_for_organization",
+    );
+  });
+
+  it("returns null when there is no details.error_code", () => {
+    expect(extractApiErrorCode(JSON.stringify(ENTITLEMENT_BODY))).toBeNull();
+  });
+
+  it("null for non-JSON and empty bodies", () => {
+    expect(extractApiErrorCode("plain text error")).toBeNull();
+    expect(extractApiErrorCode("")).toBeNull();
+  });
+});
+
+describe("isEntitlementBlockedErrorCode", () => {
+  it("matches the deactivated-org code", () => {
+    expect(isEntitlementBlockedErrorCode("oauth_not_allowed_for_organization")).toBe(true);
+  });
+
+  it("does not match an unrelated code, null, or empty", () => {
+    expect(isEntitlementBlockedErrorCode("some_unrelated_permission_error")).toBe(false);
+    expect(isEntitlementBlockedErrorCode(null)).toBe(false);
+    expect(isEntitlementBlockedErrorCode(undefined)).toBe(false);
+    expect(isEntitlementBlockedErrorCode("")).toBe(false);
   });
 });

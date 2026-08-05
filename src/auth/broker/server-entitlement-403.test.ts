@@ -29,6 +29,7 @@ import { AuthBroker } from "./server.js";
 import { decodeResponse, encodeRequest } from "./protocol.js";
 import type { SwitchroomConfig } from "../../config/schema.js";
 import { writeAccountCredentials } from "../account-store.js";
+import { fetchQuota } from "../quota.js";
 import type { FetchQuotaOptions, QuotaResult } from "../quota.js";
 
 interface Harness {
@@ -159,6 +160,32 @@ function entitlement403(): QuotaResult {
   };
 }
 
+/**
+ * The VERBATIM deactivated / OAuth-disabled-org 403 body, run through the REAL
+ * `fetchQuota` classifier (via a stubbed `fetchImpl`) — no hand-authored
+ * QuotaResult. This exercises the actual classification + persistence + skip
+ * chain from the exact production signature, so it fails RED without the
+ * quota.ts fix (the body's prose carries no "disabled"/"claude code", so the
+ * legacy matcher misses it → "other" → no mark → account stays selectable).
+ */
+function deactivatedOrgLiveClassified(): () => Promise<QuotaResult> {
+  const body = JSON.stringify({
+    type: "error",
+    error: {
+      type: "permission_error",
+      message: "OAuth authentication is currently not allowed for this organization.",
+      details: { error_code: "oauth_not_allowed_for_organization" },
+    },
+    request_id: "req_deactivated",
+  });
+  const fetchImpl = (async () =>
+    new Response(body, {
+      status: 403,
+      headers: { "content-type": "application/json" },
+    })) as unknown as typeof fetch;
+  return async () => await fetchQuota({ accessToken: "tok", fetchImpl });
+}
+
 /** A non-entitlement 403 (bad token scope) — 403 but NOT a hard block. */
 function badScope403(): QuotaResult {
   return {
@@ -264,6 +291,35 @@ describe("entitlement-403 — broker persistence + eligibility", () => {
     });
     expect(res.data.results[0].result.ok).toBe(true);
     expect(broker._state().quota["disabled"]?.entitlement_blocked).toBeUndefined();
+    broker.stop();
+  });
+
+  it("the VERBATIM deactivated-org 403 body → classified via real fetchQuota → marked blocked → rolled past", async () => {
+    const h = makeHarness();
+    seedAccount(h, "primary");
+    seedAccount(h, "disabled");
+    seedAccount(h, "healthy2");
+    const classifyDeactivated = deactivatedOrgLiveClassified();
+    const broker = new AuthBroker(makeConfig(h, "primary", ["primary", "disabled", "healthy2"]), {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async (opts: FetchQuotaOptions) => {
+        const label = opts.accessToken.replace(/^at-/, "");
+        if (label === "disabled") return await classifyDeactivated();
+        if (label === "primary") return exhausted();
+        return healthy(1, 2);
+      },
+    });
+    await broker.start();
+    await broker.fleetQuotaProbeTick();
+
+    const st = broker._state();
+    // The exact production body was classified entitlement_blocked end-to-end:
+    // the account is marked (eligibility → blocked) and the fleet rolled past it.
+    expect(st.quota["disabled"]?.entitlement_blocked).toBe(true);
+    expect(st.quota["disabled"]?.entitlement_blocked_reason).toContain(
+      "OAuth authentication is currently not allowed",
+    );
+    expect(st.activeAccount).toBe("healthy2");
     broker.stop();
   });
 
