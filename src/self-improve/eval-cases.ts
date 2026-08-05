@@ -184,7 +184,20 @@ export function appendEvalCase(
   if (!parsed.ok) return { ok: false, reason: parsed.error };
   const ec = parsed.case;
 
-  const doc: EvalsDoc = readEvalsDoc(skillDir) ?? { skill_name: slug, evals: [] };
+  // A MISSING file → create the skeleton (fine). But a file that EXISTS yet
+  // fails to parse/validate must NOT be silently overwritten from an empty
+  // doc — the atomic write below would clobber its (recoverable) contents and
+  // silently lose them. Refuse instead so the operator can fix or remove it.
+  const existingDoc = readEvalsDoc(skillDir);
+  if (existingDoc === null && existsSync(evalsJsonPath(skillDir))) {
+    return {
+      ok: false,
+      reason:
+        "evals.json exists but is unparseable or malformed — refusing to " +
+        "overwrite it (fix or remove the file first)",
+    };
+  }
+  const doc: EvalsDoc = existingDoc ?? { skill_name: slug, evals: [] };
   if (!doc.skill_name) doc.skill_name = slug;
 
   const fp = caseFingerprint(ec.prompt);
@@ -215,17 +228,73 @@ export function heldOutPath(stateDir: string): string {
   return join(stateDir, HELD_OUT_FILE);
 }
 
+export interface HeldOutResult {
+  ok: true;
+}
+export interface HeldOutRejected {
+  ok: false;
+  reason: string;
+  /** True when the reason is a duplicate (caller may report "already covered"). */
+  duplicate?: boolean;
+}
+
+/**
+ * Is a case with `slug` + this prompt fingerprint already in the held-out
+ * sink? Mirrors {@link appendEvalCase}'s normalized-prompt dedup, scoped to
+ * the same slug (a different skill may legitimately reuse a prompt). Any
+ * unparseable jsonl line is skipped, not treated as a match.
+ */
+function heldOutHasFingerprint(stateDir: string, slug: string, fp: string): boolean {
+  const path = heldOutPath(stateDir);
+  if (!existsSync(path)) return false;
+  let text: string;
+  try {
+    text = readFileSync(path, "utf-8");
+  } catch {
+    return false;
+  }
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      const rec = JSON.parse(trimmed) as { slug?: unknown; case?: { prompt?: unknown } };
+      if (
+        rec.slug === slug &&
+        typeof rec.case?.prompt === "string" &&
+        caseFingerprint(rec.case.prompt) === fp
+      ) {
+        return true;
+      }
+    } catch {
+      /* skip a malformed line — never let it mask a real duplicate */
+    }
+  }
+  return false;
+}
+
 /**
  * Append a case to the held-out sink (never into a skill's evals.json), so a
  * skill edit can't be tuned to pass a test it also just authored. Append-only
  * jsonl; each line records the slug, the case, and a timestamp.
+ *
+ * Deduped, like {@link appendEvalCase}: a case whose (slug, normalized-prompt
+ * fingerprint) already exists in the sink is REFUSED — the held-out sink is
+ * idempotent, so the same correction never bloats the file.
  */
 export function appendHeldOutCase(
   stateDir: string,
   slug: string,
   ec: EvalCase,
   opts: { now?: () => number } = {},
-): void {
+): HeldOutResult | HeldOutRejected {
+  const fp = caseFingerprint(ec.prompt);
+  if (heldOutHasFingerprint(stateDir, slug, fp)) {
+    return {
+      ok: false,
+      reason: "duplicate: this correction is already a held-out eval case",
+      duplicate: true,
+    };
+  }
   const now = opts.now ?? Date.now;
   mkdirSync(stateDir, { recursive: true });
   const fd = openSync(heldOutPath(stateDir), "a");
@@ -237,6 +306,7 @@ export function appendHeldOutCase(
   } finally {
     closeSync(fd);
   }
+  return { ok: true };
 }
 
 // ── Tamper-EVIDENT integrity manifest + baseline snapshots ───────────

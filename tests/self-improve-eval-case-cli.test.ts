@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  writeFileSync,
   rmSync,
   existsSync,
 } from "node:fs";
@@ -64,6 +65,40 @@ describe("add-eval-case (propose-only)", () => {
   it("FAIL-CLOSED: rejects a prompt carrying PII before any IPC (invariant I4)", () => {
     if (!bunOk) return;
     const r = cli(["self-improve", "add-eval-case", "--skill", "myskill", "--prompt", "email me at bob@example.com", "--chat", "1"]);
+    expect(r.status).toBe(1);
+    expect(r.err).toMatch(/PII\/secret scan found/);
+    expect(r.err).toMatch(/email/);
+  });
+
+  // #4411 — the PII scan must also cover the `files[]` fixture field, not just
+  // prompt/expected_output/expectations/source. A `--case` JSON carrying PII in
+  // files[] is rejected by the scan BEFORE any IPC. Without the fix the scan
+  // would miss files[] and fail later with an IPC error instead — so we assert
+  // on the PII rejection message, not merely the exit status.
+  it("FAIL-CLOSED: rejects PII carried in the files[] fixture field (#4411)", () => {
+    if (!bunOk) return;
+    // Assemble the email at runtime so no contiguous PII literal sits in the
+    // test source (keeps scripts/check-no-pii-secrets.mjs happy); the scan
+    // still sees the joined value in the fixture.
+    const fakeEmail = ["carol.example", "example.com"].join("@");
+    const casePath = join(stateDir, "case-with-files-pii.json");
+    writeFileSync(
+      casePath,
+      JSON.stringify({
+        prompt: "reproduce the customer record bug",
+        files: [`fixtures/user.txt:\ncontact: ${fakeEmail}`],
+      }),
+    );
+    const r = cli([
+      "self-improve",
+      "add-eval-case",
+      "--skill",
+      "myskill",
+      "--case",
+      casePath,
+      "--chat",
+      "1",
+    ]);
     expect(r.status).toBe(1);
     expect(r.err).toMatch(/PII\/secret scan found/);
     expect(r.err).toMatch(/email/);
