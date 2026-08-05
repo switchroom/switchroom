@@ -425,9 +425,9 @@ import {
 } from '../model-unavailable.js'
 import {
   build429ClassifiedMetric,
-  classification429WarrantsCorroboration,
   classify429Detail,
   decideThrottleTier,
+  routeRateLimit429,
   throttleRetryInPlaceMaxMs,
 } from '../throttle-tier.js'
 import { createThrottleTierRunner } from './throttle-tier-wiring.js'
@@ -7828,7 +7828,7 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       agent,
       shouldEmitCard: (a) => shouldEmitOperatorEvent(a, 'rate-limited'),
     })
-    if (classification429WarrantsCorroboration(rateLimit429Classification)) void throttleTierRunner.fireProbeOnly(agent) // #failover-429-corroborate probe-only; see fireProbeOnly docstring
+    routeRateLimit429(rateLimit429Classification, throttleTierRunner, agent) // #failover-429-corroborate probe-only seam; see routeRateLimit429 docstring
     if (surface === 'litellm-local-notice') {
       process.stderr.write(
         `telegram gateway: 429 classified litellm-proxy-local agent=${agent} — ` +

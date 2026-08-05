@@ -150,6 +150,36 @@ export function classification429WarrantsCorroboration(
 }
 
 /**
+ * Minimal runner shape the classify→route seam needs: just the PROBE-ONLY
+ * entrypoint. The full gateway `ThrottleTierRunner` satisfies it structurally,
+ * and a test can supply a fake that records the call.
+ */
+export interface RateLimit429ProbeRunner {
+  fireProbeOnly(triggerAgent: string): Promise<void>
+}
+
+/**
+ * #failover-429-corroborate — the classify→route WIRING extracted from the
+ * gateway callsite so the routing decision (not just the gate) is unit-testable
+ * without a gateway harness. Fires the runner's PROBE-ONLY entrypoint IFF the
+ * classification warrants corroboration (`generic-transient` only, per
+ * `classification429WarrantsCorroboration`); `litellm-local`, `account-scoped`,
+ * and `null` never fire it. Fire-and-forget: the runner promise is intentionally
+ * not awaited (the gateway must not block the operator-event path on a probe).
+ * Returns `true` when a probe was fired, `false` otherwise — observable in tests
+ * and unused at the gateway callsite.
+ */
+export function routeRateLimit429(
+  classification: RateLimit429Classification | null,
+  runner: RateLimit429ProbeRunner,
+  agent: string,
+): boolean {
+  if (!classification429WarrantsCorroboration(classification)) return false
+  void runner.fireProbeOnly(agent)
+  return true
+}
+
+/**
  * Build the `rate_limit_429_classified` runtime metric for one terminal
  * rate-limited operator event — the instrumentation that lets an operator
  * correlate Anthropic ACCOUNT 429s with fleet TPM (the prerequisite for
