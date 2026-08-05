@@ -163,6 +163,79 @@ describe("Dockerfile.agent Playwright provisioning", () => {
 });
 
 /**
+ * Version-skew provisioning (#playwright-skew). The bake at
+ * /opt/playwright/browsers is an immutable, root-owned image layer — and the
+ * whole agent root fs is `read_only: true` under compose (compose.ts). When
+ * the runtime PLAYWRIGHT_BROWSERS_PATH pointed AT the bake, a project pinning
+ * a different Playwright version could never `playwright install` its
+ * matching browser revision (EACCES/EROFS on the bake), so its tests were
+ * unrunnable. The fix: runtime env points at the persistent, agent-writable
+ * per-agent HOME cache; build-time installs still target the bake via an
+ * inline override; start.sh symlinks the baked revisions into the HOME cache
+ * at boot so the fleet default keeps its zero-download path.
+ */
+describe("Dockerfile.agent Playwright browsers-path split (bake vs runtime)", () => {
+  const startSh = readFileSync(
+    resolve(root, "profiles/_base/start.sh.hbs"),
+    "utf8",
+  );
+
+  it("declares the bake location as a build arg at /opt/playwright/browsers", () => {
+    expect(dockerfile).toMatch(
+      /ARG\s+PLAYWRIGHT_BAKED_BROWSERS=\/opt\/playwright\/browsers\s*$/m,
+    );
+  });
+
+  it("build-time JS + Python browser installs target the bake, not the runtime path", () => {
+    const inlineOverrides =
+      dockerfile.match(
+        /PLAYWRIGHT_BROWSERS_PATH=\$\{PLAYWRIGHT_BAKED_BROWSERS\}/g,
+      ) ?? [];
+    // One per binding install (JS `npx playwright install`, Python
+    // `python3 -m playwright install`).
+    expect(inlineOverrides.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("runtime PLAYWRIGHT_BROWSERS_PATH is the persistent agent-writable HOME cache", () => {
+    expect(dockerfile).toMatch(
+      /ENV\s+PLAYWRIGHT_BROWSERS_PATH=\/state\/agent\/home\/\.cache\/ms-playwright\s*$/m,
+    );
+  });
+
+  it("never points the runtime env back at the read-only bake (the regression)", () => {
+    expect(dockerfile).not.toMatch(
+      /ENV\s+PLAYWRIGHT_BROWSERS_PATH=\/opt\//,
+    );
+  });
+
+  it("start.sh seeds the baked revisions into the runtime cache via symlinks", () => {
+    // The zero-download path for the fleet default depends on this boot
+    // seeding; without it every agent re-downloads ~150MB for the baked
+    // version too.
+    expect(startSh).toMatch(/\/opt\/playwright\/browsers/);
+    expect(startSh).toMatch(
+      /ln\s+-s\s+"\$\{sr_pw_rev%\/\}"\s+"\$sr_pw_cache\/\$sr_pw_name"/,
+    );
+    // Seeding must never clobber a real agent-installed revision dir.
+    expect(startSh).toMatch(/\[\s+!\s+-e\s+"\$sr_pw_cache\/\$sr_pw_name"\s+\]/);
+  });
+
+  it("disables Playwright's browser GC so a skew install can't delete the seeds", () => {
+    // The seed symlinks in the HOME cache carry no `.links/<sha1>` reference
+    // entry (the baked packages registered theirs in /opt/.../.links at build
+    // time, which the boot seeding does not copy). So the GC sweep that every
+    // `playwright install` runs before downloading — deleting any revision not
+    // referenced in `.links` — would remove the fleet-default seed symlinks the
+    // first time a project pins a DIFFERENT Playwright version and installs its
+    // browser, silently breaking the zero-download guarantee. Disabling GC via
+    // this env is what keeps the seeds (and the project's own installs) intact.
+    // Without this line the skew workflow this change enables regresses the
+    // fleet-default zero-download path, so guard it deterministically.
+    expect(dockerfile).toMatch(/ENV\s+PLAYWRIGHT_SKIP_BROWSER_GC=1\s*$/m);
+  });
+});
+
+/**
  * Cloakbrowser — the local stealth Chromium driver used by webkite's
  * `webkite mcp` stdio MCP. The webkite binary itself is operator-
  * mounted (private beta); cloakbrowser's Python tool is baked here

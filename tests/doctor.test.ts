@@ -537,6 +537,31 @@ describe("findChromium", () => {
     }
   });
 
+  it("falls back to the image-baked /opt layout when env + HOME caches are empty (#playwright-skew)", () => {
+    // Since #playwright-skew the runtime PLAYWRIGHT_BROWSERS_PATH points
+    // at the per-agent HOME cache, not the /opt bake — doctor must still
+    // find the baked chromium directly (e.g. before start.sh's boot
+    // seeding has linked it into the HOME cache).
+    const bakedDir = join(tempHome, "opt", "playwright", "browsers");
+    const browserDir = join(bakedDir, "chromium-1228", "chrome-linux64");
+    mkdirSync(browserDir, { recursive: true });
+    const chromePath = join(browserDir, "chrome");
+    writeFileSync(chromePath, "#!/bin/sh\nexit 0\n");
+    chmodSync(chromePath, 0o755);
+
+    const origPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      // env empty ("" — not undefined, which would fall back to the
+      // HOST's real PLAYWRIGHT_BROWSERS_PATH when the suite runs inside
+      // an agent container) + empty HOME cache → only the baked-path
+      // fallback hits.
+      expect(findChromium(tempHome, "", bakedDir)).toBe(chromePath);
+    } finally {
+      process.env.PATH = origPath;
+    }
+  });
+
   it("finds chromium_headless_shell binaries (Playwright >=1.40 layout)", () => {
     // Playwright 1.40+ ships a separate `chromium_headless_shell-*`
     // browser whose binary is `headless_shell`, not `chrome`. v0.7.13's

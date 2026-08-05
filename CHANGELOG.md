@@ -1,5 +1,43 @@
 # Changelog
 
+## unreleased — Playwright version-skew: project-pinned browser installs now work
+
+### Runtime PLAYWRIGHT_BROWSERS_PATH moves off the read-only bake
+
+The agent image bakes one pinned Playwright (`ARG PLAYWRIGHT_VERSION`) and its
+matching chromium revision at `/opt/playwright/browsers`, and used to point
+the global `PLAYWRIGHT_BROWSERS_PATH` at that bake. Playwright resolves
+browsers from exactly ONE directory, keyed by revision subdir, and each
+Playwright version demands one exact revision — so a project whose
+`package.json` pinned a *different* Playwright version (observed live:
+`@playwright/test ^1.58.2` needing `chromium-1208` against the baked 1.61.0 /
+`chromium-1228`) could never provision its browser: `playwright install`
+targeted the bake, which is root-owned inside a compose `read_only: true`
+root fs, and hard-failed — even when a matching build already sat unused in
+`~/.cache/ms-playwright`. The runtime env now points at that persistent,
+agent-writable per-agent HOME cache (`/state/agent/home/.cache/ms-playwright`,
+Playwright's own default under the compose HOME), so skewed-version installs
+land in a writable dir that survives container recreate. The bake keeps its
+zero-download fast path: build-time installs still target `/opt` via an
+inline override, and `start.sh` symlinks each baked revision into the HOME
+cache at boot (real agent-installed dirs always win; stale bake links are
+swept after an image bump). `switchroom doctor` additionally probes the bake
+path directly so chromium detection doesn't depend on the boot seeding.
+
+The zero-download guarantee is also GC-hardened. Every `playwright install`
+GC-sweeps the browsers dir before downloading, deleting any revision not
+referenced by a `.links/<sha1>` entry — and the baked packages registered
+their reference in `/opt/.../.links` at build time, not in the HOME cache. So
+a skewed-version project install would otherwise delete the fleet-default seed
+symlinks (`fs.rm` on a symlink removes only the link, leaving the read-only
+bake intact) and force a silent ~150MB re-download on the next fleet-default
+use — the exact skew workflow this change enables. The runtime env now sets
+`PLAYWRIGHT_SKIP_BROWSER_GC=1` to disable that sweep; immutable version-keyed
+revisions coexist safely, at the cost of not auto-reclaiming a superseded
+project browser (rare, per-agent, operator-prunable).
+(`docker/Dockerfile.agent`, `profiles/_base/start.sh.hbs`,
+`src/cli/doctor.ts`.)
+
 ## v0.20.9 — first-hit 429 corroboration, plus three duplicate-/dropped-message reliability fixes
 
 Reliability (2026-08-05): the broker's 429 throttle tier now corroborates a
