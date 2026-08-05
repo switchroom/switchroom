@@ -2,12 +2,12 @@
 artifact: agents that improve themselves, on the leash
 serves: get-better-the-longer-they-run
 advances-outcome: standing-team
-status: Draft
+status: Draft — slices 1–2 implemented; eval gate built-but-dormant (amended 2026-08-05)
 ---
 
 # RFC: Agents that improve themselves, on the leash
 
-Status: Draft
+Status: Draft — correction gate, tier router, apply-guard, eval gate, pending queue, and weekly skill-synthesis cron are IMPLEMENTED (`src/self-improve/*`, `src/cli/self-improve-*`). The eval gate has never fired: zero `evals/evals.json` exist anywhere in the tree, so every T1 downgrades to T2 in practice. See §"Amendment: corrections as eval cases" below.
 Author: Ken (via Clerk pair-design)
 Date: 2026-06-20
 Serves: [`get-better-the-longer-they-run.md`](../jobs/get-better-the-longer-they-run.md) → outcome `standing-team`
@@ -113,7 +113,11 @@ every turn.
   - **T1 Auto, silent** — only a small, reversible, eval-passing edit to a
     skill the agent already owns. Native `Write`/`Edit` into the agent's
     skills dir (per `skill-authoring-native`); validator hook + git =
-    audit/rollback.
+    audit/rollback. **Silent T1 apply is additionally gated behind an
+    operator-set live-flag (default OFF): until the operator flips
+    `SWITCHROOM_SELF_IMPROVE_T1_LIVE=1` for an agent, a fully verified T1
+    still lands as a T2 one-tap proposal. Building the eval corpus and
+    enabling silent apply are two separately-gated steps — never one.**
   - **T2 Propose, one-tap** — medium / shared-skill changes, **and any edit to
     the agent's own guidance (`CLAUDE.md` / `SOUL.md`)** because guidance
     affects *every* turn, even a small guidance edit is proposed, never silent.
@@ -145,6 +149,131 @@ evidence; `scripts/aggregate_benchmark.py` gives pass-rate + variance (mean ±
 stddev) vs baseline. **An edit lands only if its evals pass and don't
 regress baseline.** New skills ship a starter `evals.json` at creation.
 Objective checks = scripted assertions; subjective = the LLM-judge grader.
+The gate's enforcement code shipped (`src/self-improve/eval-gate.ts`,
+`src/self-improve/apply-guard.ts`) but the corpus did not: no skill in the
+tree carries `evals/evals.json`, so the gate is dormant. The corpus is grown
+from operator corrections — see §"Amendment: corrections as eval cases".
+Note: `skills/skill-creator/scripts/run_eval.py` (trigger-eval) shells
+`claude -p` and is OUT OF SCOPE for the self-improve loop (claude-native
+constraint); the apply path uses only the grader subagent + 
+`aggregate_benchmark.py` over `grading.json` files.
+
+## Amendment: corrections as eval cases (2026-08-05)
+
+### The gap this closes
+
+Every mechanism above is built and live EXCEPT the thing that feeds it:
+`skillHasEvals()` (`src/self-improve/eval-gate.ts:43-54`) is a hard
+precondition on T1 auto-apply (`src/self-improve/apply-guard.ts:328-336`),
+and zero `evals/evals.json` files exist in the tree. The gate has never had
+anything to gate; every review-loop T1 downgrades to T2 today.
+
+The fix is Hermes/GEPA-shaped: **every operator correction is a labeled
+failure case with the fix attached** — exactly the held-out eval seed the
+gate is starving for. The forked review turn, on an `operator-correction`
+signal, also records the correction as an eval case (skill-creator
+`evals/evals.json` schema, `skills/skill-creator/references/schemas.md`)
+targeted at the skill whose behaviour was corrected; corrections with no
+skill home accrue to a per-agent held-out set
+(`<stateDir>/eval-cases.jsonl`).
+
+### Design invariants (adversarial-review hardened — binding on every slice)
+
+These six came out of a skeptical red-team pass; they are invariants, not
+preferences. A slice that violates one does not ship.
+
+1. **Eval-case writes are one-tap (T2), never silent.** A self-authored
+   eval case is the key that later authorizes silent T1 edits — letting the
+   agent mint keys silently is self-escalation (`apply-guard.ts:1-11`,
+   kill-clause `no-self-escalation`). Mechanically: the PreToolUse
+   apply-guard recognises any Write/Edit touching `evals/evals.json` under
+   an own skill and BLOCKS it with a T2 downgrade; the sanctioned path is a
+   propose-only CLI (`switchroom self-improve add-eval-case`) that raises a
+   one-tap card carrying the full case JSON, and the case is appended by
+   deterministic code only after the operator tap.
+
+2. **Growing the corpus and going T1-live are decoupled.** The moment a
+   skill gains `evals.json`, `decideApply()` would otherwise start silently
+   allowing eval-passing edits (`apply-guard.ts:391-399`). Therefore silent
+   allow is gated behind `SWITCHROOM_SELF_IMPROVE_T1_LIVE` (default OFF —
+   unset/`0` means a fully verified T1 still downgrades to a T2 proposal
+   with reason "T1-live not enabled"). The corpus slice's win is strictly
+   restrictive: **the gate can now BLOCK a regression.** "The gate can
+   APPLY silently" is a later, separately-reviewed, operator-flipped step —
+   and flipping it additionally requires the eval-integrity manifest check
+   (invariant 3) to be in place.
+
+3. **Additive-only is enforced at a Bash-proof point — and its guarantee
+   level is stated honestly.** The apply-guard hook fires only on
+   Write/Edit/MultiEdit (`src/cli/self-improve-apply-guard-pretool.ts:59,105`);
+   the review turn retains Bash, so hook-level "existing cases stay
+   byte-identical" checks are best-effort, Write-path-only. The load-bearing
+   enforcement is out-of-band: (a) an **eval-integrity manifest**
+   (`<stateDir>/eval-case-manifest.json`) records the sha256 of each
+   skill's `evals.json` at every operator-approved append, and the T1
+   allow leg of `decideApply()` verifies the on-disk hash against the
+   manifest — any out-of-band mutation (Bash, sed, anything) makes the
+   skill T1-ineligible until re-approved; (b) the per-turn Stop hook
+   compares every own-skill `evals.json` against its manifest snapshot,
+   reverts unauthorized diffs from the snapshot copy, and enqueues a T2
+   pending note surfacing the tamper. Residual honesty: the state dir
+   lives in the agent's own home, so this is tamper-EVIDENT and
+   self-healing, not a cryptographic boundary — the hard backstop is that
+   silent apply defaults OFF (invariant 2) and only an operator can flip it.
+
+4. **Deterministic PII/secret scan on every eval-case write.** An eval case
+   needs the real failing prompt — exactly where PII lives — persisted to a
+   durable file. A prompt clause (as in
+   `reference/prompts/skill-synthesis-cron.md:61-69`) is necessary but not
+   sufficient. A code scan (`src/self-improve/pii-scan.ts`: email / phone /
+   key-shape / private-key-block / high-entropy patterns) runs at propose
+   time (reject with a named reason) AND again at approved-apply time
+   (fail closed). The scan can false-negative; it cannot be skipped.
+
+5. **Integration tests never touch a live agent.** Acceptance tests run
+   hook binaries and CLIs against an ephemeral fixture agent (temp HOME +
+   temp state dir), or a throwaway container agent — never `clerk` or any
+   production agent (the config comments naming `clerk` at
+   `src/self-improve/config.ts:3,37` are tuning notes, not a test target).
+
+6. **Create/update parity (Hermes-shaped).** Failure-driven synthesis emits
+   either a skill-EDIT proposal or a NEW-skill proposal, so a recurring
+   failure with no existing home skill can still bind. New-skill-from-
+   failure reuses the existing `synthesized-personal-skill` T2 carve-out
+   (`src/self-improve/types.ts:87-96`, `src/self-improve/tier-router.ts:63-80`)
+   — one-tap into the agent's own reversible workspace, hard-T3 floors
+   untouched.
+
+### What each correction produces
+
+On an `operator-correction` signal, the forked review's contract
+(`buildReviewPrompt()`, `src/self-improve/review-prompt.ts`) gains a step:
+propose an eval case capturing (prompt ≈ the situation that went wrong,
+expectations ≈ the corrected behaviour), via `add-eval-case` — never via a
+direct write. Cases are deduplicated by normalized-prompt fingerprint.
+The per-turn Stop hook also stamps a `self-improve:correction` tag on the
+turn's Hindsight retain, so the failure-synthesis pass can find correction
+turns without re-mining raw transcripts.
+
+### Slice plan (each a focused single-concern PR)
+
+1. **Slice 1 — the eval-case sink.** CLI + guard + manifest + Stop-hook
+   integrity check + PII scan + review-prompt step. Makes the dormant gate
+   able to BLOCK. Does NOT flip T1-live.
+2. **Slice 2 — measurement surface + parity plumbing.** Optional
+   `benchmark` field on proposals (advisory, rendered on the card,
+   computed on-tap not eagerly), `switchroom self-improve bench <skill>`
+   CLI, and store/type support for failure-origin edit-or-create proposals.
+3. **Slice 3 — net-growth cap.** Env-tunable per-edit growth budget in
+   `decideApply()`; breach downgrades to T2. Purely restrictive.
+4. **Slice 4 — failure synthesis.** `self-improve:correction` retain tag
+   (4a), then the weekly failure-synthesis cron (4b) as a sibling of the
+   #2670 skill-synthesis cron: cluster ≥2-session recurring failures from
+   on-disk transcripts, emit ≤1 edit-or-create proposal + eval cases,
+   never directive-first.
+
+T1-live flip is NOT a slice — it is a separate operator decision after the
+corpus has demonstrably blocked at least one bad edit in the wild.
 
 ## Promotion store (simple + reliable: there isn't one)
 
@@ -221,4 +350,4 @@ propose-only). Guidance, cron, and new-skill changes are never auto-applied.
 - [product-spec.md](../product-spec.md) — outcome `standing-team`
 - [principles.md](../principles.md), [invariants.md](../invariants.md)
 
-**Last Updated:** 2026-06-20
+**Last Updated:** 2026-08-05
