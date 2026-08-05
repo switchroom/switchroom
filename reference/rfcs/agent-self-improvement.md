@@ -260,10 +260,12 @@ turns without re-mining raw transcripts.
 1. **Slice 1 — the eval-case sink.** CLI + guard + manifest + Stop-hook
    integrity check + PII scan + review-prompt step. Makes the dormant gate
    able to BLOCK. Does NOT flip T1-live.
-2. **Slice 2 — measurement surface + parity plumbing.** Optional
-   `benchmark` field on proposals (advisory, rendered on the card,
-   computed on-tap not eagerly), `switchroom self-improve bench <skill>`
-   CLI, and store/type support for failure-origin edit-or-create proposals.
+2. **Slice 2 — measurement surface + parity plumbing.** The
+   `switchroom self-improve bench <skill>` CLI, and store/type support for
+   failure-origin edit-or-create proposals. (Score-carrying proposal cards —
+   a `benchmark` field on proposals, advisory and rendered on the card — are
+   deferred to a future, tracked feature; the dead field was dropped in
+   #4425 item 1 as it was never written or rendered.)
 3. **Slice 3 — net-growth cap.** Env-tunable per-edit growth budget in
    `decideApply()`; breach downgrades to T2. Purely restrictive.
 4. **Slice 4 — failure synthesis.** `self-improve:correction` retain tag

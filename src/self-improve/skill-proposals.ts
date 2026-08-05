@@ -85,22 +85,6 @@ export function normalizeProposalOrigin(value: unknown): ProposalOrigin {
     : DEFAULT_PROPOSAL_ORIGIN;
 }
 
-/**
- * A benchmark summary attached to a proposal, precomputed by the
- * grader-subagent flow at synthesis time (NOT recomputed by the card).
- * `switchroom self-improve bench` produces the same numbers on demand.
- * Absent on a legacy record (back-compat) and on any proposal whose skill
- * had no runnable evals when it was drafted.
- */
-export interface ProposalBenchmark {
-  /** Candidate ("with_skill") pass-rate mean, 0..1. */
-  candidate_pass_rate: number;
-  /** Baseline ("without_skill") pass-rate mean, 0..1, when a baseline ran. */
-  baseline_pass_rate?: number;
-  /** ISO timestamp the benchmark was computed. */
-  computed_at: string;
-}
-
 export interface SkillProposal {
   /** Stable id; the card's callback_data carries this. */
   id: string;
@@ -127,14 +111,6 @@ export interface SkillProposal {
    * `ProposalOrigin`.
    */
   origin?: ProposalOrigin;
-  /**
-   * Precomputed benchmark numbers for the drafted skill, when its evals
-   * were runnable at synthesis time. Carried on the record so the card can
-   * surface pass-rates without re-running anything; `switchroom
-   * self-improve bench` recomputes the same shape. Absent on a legacy
-   * record or an unbenchmarked draft.
-   */
-  benchmark?: ProposalBenchmark;
 }
 
 /** One rejection fingerprint, used to suppress re-proposals. */
