@@ -140,10 +140,14 @@ describe("add-eval-case (propose-only)", () => {
 });
 
 describe("apply-eval-case (deterministic applier)", () => {
-  function seed(caseObj: { prompt: string }, status: "pending" | "approved") {
+  function seed(
+    caseObj: { prompt: string },
+    status: "pending" | "approved",
+    dirOverride?: string,
+  ) {
     const p = enqueueEvalCaseProposal(stateDir, {
       skill_slug: "myskill",
-      skill_dir: skillDir,
+      skill_dir: dirOverride ?? skillDir,
       case: caseObj,
       fingerprint: "fp-" + caseObj.prompt.length,
       held_out: false,
@@ -173,6 +177,43 @@ describe("apply-eval-case (deterministic applier)", () => {
     expect(doc.evals[0].prompt).toBe("be terse");
     // Applier recorded its own write as the baseline → no spurious drift.
     expect(verifyEvalIntegrity(stateDir, "myskill", skillDir)).toBe("ok");
+  });
+
+  it("#4410: refuses at apply when the stored skill_dir escapes the owned skills root", () => {
+    if (!bunOk) return;
+    // The proposal store is agent-writable, so a tampered proposal could set
+    // skill_dir to a real dir OUTSIDE the agent's skills root. existsSync alone
+    // would pass; the apply-time re-check must reject it (the recomputed slug
+    // dir is authoritative, so a persisted path that diverges is refused).
+    const outside = mkdtempSync(join(tmpdir(), "evcase-outside-"));
+    try {
+      const id = seed({ prompt: "be terse" }, "approved", outside);
+      const r = cli(["self-improve", "apply-eval-case", "--id", id]);
+      expect(r.status).toBe(1);
+      expect(r.err).toMatch(
+        /escapes the skills root|not an owned skill dir|does not correspond to slug/i,
+      );
+      // Nothing was written into the out-of-root target.
+      expect(existsSync(evalsJsonPath(outside))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("#4410 (LOW): refuses when skill_dir points at a DIFFERENT owned in-root skill than the slug", () => {
+    if (!bunOk) return;
+    // Subtler tamper: skill_dir is a perfectly valid owned, in-root skill dir —
+    // just not the one the slug names. Without recomputing the target from the
+    // slug the case would land in the WRONG skill's evals. The slug's dir is
+    // authoritative; the persisted path must never be written to.
+    const otherDir = join(home, ".claude", "skills", "otherskill");
+    mkdirSync(otherDir, { recursive: true });
+    const id = seed({ prompt: "be terse" }, "approved", otherDir);
+    const r = cli(["self-improve", "apply-eval-case", "--id", id]);
+    expect(r.status).toBe(1);
+    expect(r.err).toMatch(/does not correspond to slug|not an owned skill dir/i);
+    // The mis-pointed dir was NEVER written to.
+    expect(existsSync(evalsJsonPath(otherDir))).toBe(false);
   });
 
   it("FAIL-CLOSED: re-scans at apply and refuses a stored case carrying PII (I4 both ends)", () => {

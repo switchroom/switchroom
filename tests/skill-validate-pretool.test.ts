@@ -361,6 +361,40 @@ describe("skill-validate-pretool hook", () => {
     }
   });
 
+  // #4414: an fd-prefixed redirect (`1>`, `2>`), an append (`>>`), a
+  // combined-stream redirect in EITHER spelling (`&>` / reversed `>&`), or a
+  // clobber (`>|`) redirect into evals.json bypassed the earlier regex (which
+  // excluded any digit before `>` and knew nothing of `>&` / `>|`). Enumerate
+  // the bypass variants — with and without a space before the target — and
+  // assert each is still blocked.
+  it("#4414: blocks fd-prefixed / append / combined-stream / clobber redirects into evals.json", () => {
+    if (!bunOk) return;
+    const target = join(skillsRoot, "demo", "evals", "evals.json");
+    const commands = [
+      `echo poison 1> ${target}`,
+      `echo poison 2> ${target}`,
+      `echo poison 1>> ${target}`,
+      `echo poison 2>> ${target}`,
+      `echo poison >> ${target}`,
+      `echo poison &> ${target}`,
+      `echo poison &>> ${target}`,
+      `echo poison >& ${target}`,
+      `echo poison >&${target}`,
+      `echo poison >| ${target}`,
+      `echo poison >|${target}`,
+    ];
+    for (const command of commands) {
+      const r = run(
+        { tool_name: "Bash", tool_input: { command } },
+        { SWITCHROOM_SELF_IMPROVE: "1" },
+      );
+      expect(r.status).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect(out.decision, `expected block for: ${command}`).toBe("block");
+      expect(out.reason).toMatch(/machine-managed|add-eval-case/);
+    }
+  });
+
   it("MAJOR2: Bash reads / the sanctioned CLI / unrelated redirects are allowed", () => {
     if (!bunOk) return;
     const target = join(skillsRoot, "demo", "evals", "evals.json");
@@ -370,6 +404,14 @@ describe("skill-validate-pretool hook", () => {
       `jq . ${target}`,
       `switchroom self-improve add-eval-case --skill demo --prompt 'fix evals'`,
       `echo done > /tmp/other.log && cat ${target}`,
+      `cat ${target} 2>&1`,
+      `jq . ${target} > /tmp/copy.json 2>&1`,
+      // fd-DUP regression guards: `>&N` / `2>&1` duplicate a descriptor, they
+      // are NOT a file write and must never be read as one — even when the
+      // command also reads evals.json.
+      `cat ${target} >&1`,
+      `cat ${target} >&2`,
+      `cat ${target} 1>&2`,
       `ls`,
     ];
     for (const command of allowed) {

@@ -29,8 +29,8 @@
 
 import { createConnection } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import type { Command } from "commander";
 
 import { ownsSkill } from "../self-improve/apply-guard.js";
@@ -65,8 +65,86 @@ function gatewaySocketPath(): string {
   );
 }
 
+function skillsRoot(): string {
+  return join(homedir(), ".claude", "skills");
+}
+
 function skillDirFor(slug: string): string {
-  return join(homedir(), ".claude", "skills", slug);
+  return join(skillsRoot(), slug);
+}
+
+/**
+ * #4410 (defense in depth): authorize the APPLY target from the SLUG, not the
+ * persisted path. The proposal store is agent-writable (see
+ * gateway/self-improve-proposal-wiring.ts), so `proposal.skill_dir` is NOT
+ * trustworthy — a tampered proposal could point it outside the owned skills
+ * root, or (more subtly) keep a valid-looking `skill_dir` for one owned skill
+ * while naming a DIFFERENT slug, landing the case in the wrong skill's evals.
+ *
+ * So the applier derives the authoritative write target from the operator-
+ * approved `skill_slug` via `skillDirFor()` and writes ONLY there — the
+ * persisted `skill_dir` is never a write target. It then re-asserts, on that
+ * recomputed dir, that (a) it is a real OWNED skill dir (not a shared/bundled
+ * symlink) and (b) its canonical path resolves within the canonical skills
+ * root, and finally (c) that the persisted `skill_dir` still corresponds to the
+ * slug's dir — a mismatch means the stored proposal was tampered with and is
+ * refused fail-closed. Returns both the authoritative dir (the write target) and
+ * its resolved canonical path (surfaced for audit).
+ */
+function authorizeApplyTarget(
+  persistedDir: string,
+  slug: string,
+): { dir: string; resolvedDir: string } {
+  // Authoritative target: derived from the operator-approved slug, never the
+  // agent-writable persisted path.
+  const dir = skillDirFor(slug);
+
+  // Canonicalize the root; fall back to a lexical resolve if the root dir does
+  // not yet exist (nothing owned → nothing can pass the containment check).
+  let root: string;
+  try {
+    root = realpathSync(skillsRoot());
+  } catch {
+    root = resolve(skillsRoot());
+  }
+
+  // Ownership: a real directory under the agent's own writable skills root,
+  // not a symlink into a read-only shared/bundled pool (also catches a slug
+  // that traverses out via `../`, since the target then isn't a real dir).
+  if (!ownsSkill(dir)) {
+    fail(
+      `apply refused — "${slug}" is not an owned skill dir ` +
+        `(missing, or a shared/bundled symlink) — dir: ${dir}`,
+    );
+  }
+
+  let resolvedDir: string;
+  try {
+    resolvedDir = realpathSync(dir);
+  } catch {
+    fail(`apply refused — skill dir cannot be resolved: ${dir}`);
+  }
+
+  // Containment: the canonical skill dir must live within the canonical root,
+  // so a slug that resolves (via symlink/`..`) outside the root can't escape.
+  if (resolvedDir !== root && !resolvedDir.startsWith(root + sep)) {
+    fail(
+      `apply refused — skill dir escapes the skills root ` +
+        `(resolved: ${resolvedDir}, root: ${root})`,
+    );
+  }
+
+  // Correspondence: the persisted skill_dir must still match the slug's dir.
+  // Under normal operation add-eval-case persists exactly skillDirFor(slug), so
+  // any divergence is a tampered proposal — refuse rather than silently redirect.
+  if (resolve(persistedDir) !== resolve(dir)) {
+    fail(
+      `apply refused — persisted skill_dir does not correspond to slug "${slug}" ` +
+        `(persisted: ${persistedDir}, expected: ${dir})`,
+    );
+  }
+
+  return { dir, resolvedDir };
 }
 
 function fail(msg: string, code = 1): never {
@@ -295,8 +373,16 @@ function registerApply(parent: Command): void {
         process.exit(0);
       }
 
-      const dir = proposal.skill_dir;
-      if (!existsSync(dir)) fail(`skill dir gone: ${dir}`);
+      if (!existsSync(proposal.skill_dir)) {
+        fail(`skill dir gone: ${proposal.skill_dir}`);
+      }
+      // #4410: derive the write target from the slug (not the agent-writable
+      // persisted skill_dir), re-verify ownership + skills-root containment, and
+      // refuse a proposal whose persisted skill_dir no longer matches the slug.
+      const { dir, resolvedDir } = authorizeApplyTarget(
+        proposal.skill_dir,
+        proposal.skill_slug,
+      );
 
       const res = appendEvalCase(dir, proposal.skill_slug, ec);
       if (!res.ok) {
@@ -327,6 +413,7 @@ function registerApply(parent: Command): void {
           action: "apply-eval-case",
           applied: true,
           skill: proposal.skill_slug,
+          skill_dir: resolvedDir,
           case_id: res.ok ? res.case.id : undefined,
           total: res.ok ? res.total : undefined,
         }),
