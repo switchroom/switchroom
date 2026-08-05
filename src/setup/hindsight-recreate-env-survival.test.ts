@@ -22,7 +22,12 @@
 
 import { describe, expect, it } from "vitest";
 
-import { hindsightContainerEnvPairs } from "./hindsight.js";
+import {
+  HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS,
+  HINDSIGHT_DEFAULT_REQUEUE_MAX,
+  generateHindsightComposeSnippet,
+  hindsightContainerEnvPairs,
+} from "./hindsight.js";
 import { diffDroppedHindsightEnv } from "./hindsight-env-drift.js";
 import {
   HINDSIGHT_DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
@@ -103,6 +108,17 @@ describe("reranker defaults survive a recreate with an empty hindsight.env", () 
 const REQUEUE_ON = "SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS";
 const REQUEUE_MAX = "SWITCHROOM_HINDSIGHT_REQUEUE_MAX";
 
+/** `      - KEY=VALUE` environment lines from a compose snippet. */
+const composeEnv = (snippet: string): Map<string, string[]> => {
+  const out = new Map<string, string[]>();
+  for (const line of snippet.split("\n")) {
+    const m = line.match(/^ {6}- ([A-Z0-9_]+)=(.*)$/);
+    if (!m) continue;
+    out.set(m[1], [...(out.get(m[1]) ?? []), m[2]]);
+  }
+  return out;
+};
+
 describe("dead-letter requeue safety net is enabled on the launched container", () => {
   it.each([true, false])(
     "pins REQUEUE_DEAD_LETTERS=1 and REQUEUE_MAX=25 with nothing declared (gpu=%s)",
@@ -120,5 +136,35 @@ describe("dead-letter requeue safety net is enabled on the launched container", 
     const live = next.map(([k, v]) => `${k}=${v}`);
     const dropped = diffDroppedHindsightEnv(live, next, []);
     expect(dropped.some((d) => d.key === REQUEUE_ON || d.key === REQUEUE_MAX)).toBe(false);
+  });
+
+  // The compose snippet is an INDEPENDENT launch path with its own hand-written
+  // `environment` array (src/setup/hindsight.ts, generateHindsightComposeSnippet)
+  // — it does not derive from `hindsightContainerEnvPairs`. The docker-run
+  // assertions above therefore prove nothing about it. Without this, an edit
+  // that dropped ONLY the compose pins would leave the suite green and half the
+  // fleet (compose-launched hosts) would silently run with the recovery sweep
+  // OFF. See issue #4396 (the coverage gap left by PR #4395).
+  it("the compose snippet pins both keys too — the run/compose twin holds", () => {
+    const env = composeEnv(generateHindsightComposeSnippet());
+    expect(env.get(REQUEUE_ON)).toEqual([HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS]);
+    expect(env.get(REQUEUE_MAX)).toEqual([HINDSIGHT_DEFAULT_REQUEUE_MAX]);
+    // Literal values, spelled out so a drive-by retune of the constants has to
+    // come past BOTH launch paths, not just the docker-run one above.
+    expect(env.get(REQUEUE_ON)).toEqual(["1"]);
+    expect(env.get(REQUEUE_MAX)).toEqual(["25"]);
+  });
+
+  it("run and compose paths agree on the two pins, key by key", () => {
+    // Set-equality parity for the launcher-derived pins: whatever value one
+    // path emits, the other must emit the same — so the twin invariant can
+    // never drift on these keys even if the constants change.
+    const fromRun = new Map(hindsightContainerEnvPairs({ apiPort: 18888, gpu: true }));
+    const fromCompose = composeEnv(generateHindsightComposeSnippet());
+    for (const key of [REQUEUE_ON, REQUEUE_MAX]) {
+      expect(fromCompose.get(key), `${key} must match across paths`).toEqual([
+        fromRun.get(key),
+      ]);
+    }
   });
 });
