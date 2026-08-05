@@ -573,6 +573,13 @@ export interface PostSkillProposalMessage {
   evidence: string;
   /** Full drafted skill bundle (SKILL.md + optional files). */
   draft: Record<string, string>;
+  /**
+   * Provenance of the proposal — `"skill-synthesis"` (the weekly cron) or
+   * `"failure-synthesis"` (a skill drafted from an observed failure). Absent
+   * ⇒ the store defaults it to `"skill-synthesis"` (back-compat). Provenance
+   * is orthogonal to tier routing.
+   */
+  origin?: "skill-synthesis" | "failure-synthesis";
 }
 
 /**

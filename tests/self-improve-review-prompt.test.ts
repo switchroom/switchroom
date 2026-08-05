@@ -48,6 +48,21 @@ describe("forked-review prompt", () => {
   it("opens with the shared banner constant (builder/detector single source)", () => {
     expect(buildReviewPrompt(signals).startsWith(REVIEW_BANNER)).toBe(true);
   });
+
+  it("step-5 add-eval-case example passes the REQUIRED --chat flag (R3)", () => {
+    // `switchroom self-improve add-eval-case` has `.requiredOption("--chat")`,
+    // so a review turn running the documented command verbatim WITHOUT --chat
+    // hits a commander error. The example must carry --chat, and must steer
+    // the agent to the real operator chat id (not the review placeholder).
+    const p = buildReviewPrompt(signals);
+    expect(p).toContain("add-eval-case");
+    expect(p).toContain("--chat");
+    // The example command names both required options together.
+    const cmd = p.slice(p.indexOf("add-eval-case"));
+    expect(cmd).toMatch(/--skill[\s\S]*--chat|--chat[\s\S]*--skill/);
+    // Steers to the operator chat id, not the review turn's placeholder.
+    expect(p.toLowerCase()).toContain("operator chat id");
+  });
 });
 
 describe("isReviewTurn — review-turn detector (issue #2462)", () => {

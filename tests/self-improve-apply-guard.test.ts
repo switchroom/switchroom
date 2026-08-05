@@ -20,6 +20,7 @@ import {
   skillTargetEscapes,
 } from "../src/self-improve/apply-guard.js";
 import { evalsJsonPath } from "../src/self-improve/eval-gate.js";
+import { recordEvalBaseline } from "../src/self-improve/eval-cases.js";
 import { recordAutoApply } from "../src/self-improve/rate-limit.js";
 import type { SelfImproveConfig } from "../src/self-improve/config.js";
 
@@ -45,7 +46,11 @@ function skillFile(rel = "SKILL.md"): string {
   return join(skillDir(), rel);
 }
 
-function makeOwnedSkill(withEvals: boolean): void {
+// `recordBaseline` defaults ON so a skill with evals reflects the REAL flow:
+// the sanctioned applier records an integrity baseline as it writes, so the
+// eval set is "ok" (T1-eligible) immediately. Pass `false` to model a skill
+// whose evals never went through a trusted path (integrity "missing").
+function makeOwnedSkill(withEvals: boolean, recordBaseline = true): void {
   mkdirSync(skillDir(), { recursive: true });
   if (withEvals) {
     mkdirSync(dirname(evalsJsonPath(skillDir())), { recursive: true });
@@ -53,6 +58,7 @@ function makeOwnedSkill(withEvals: boolean): void {
       evalsJsonPath(skillDir()),
       JSON.stringify({ skill_name: SLUG, evals: [{ name: "e1", prompt: "p" }] }),
     );
+    if (recordBaseline) recordEvalBaseline(stateDir, SLUG, skillDir());
   }
 }
 
@@ -320,6 +326,58 @@ describe("decideApply — the deterministic T1 gate", () => {
     });
     expect(d.action).toBe("block");
     if (d.action === "block") expect(d.reason).toMatch(/cap reached/i);
+  });
+});
+
+// R2 (reopened-B1): only integrity status "ok" is T1-eligible. Any other
+// status (notably "missing" — evals present but never sanctioned) must be
+// downgraded to a one-tap T2, even with T1_LIVE=1. These two cases differ
+// ONLY in whether a sanctioned baseline was recorded, so the split proves the
+// downgrade fires SPECIFICALLY on non-ok integrity — not on some other gate.
+describe("decideApply — eval-integrity gate (only 'ok' is T1-eligible)", () => {
+  function decideWithLiveOn() {
+    writeBenchmark(1.0, 0.9);
+    return decideApply({
+      toolName: "Write",
+      input: { content: "line1\nline2\n" },
+      filePath: skillFile(),
+      stateDir,
+      cfg: CFG,
+      now,
+    });
+  }
+
+  it("status 'missing' (evals never sanctioned) → DOWNGRADED to T2 even with T1_LIVE=1", () => {
+    const prev = process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = "1";
+    try {
+      makeOwnedSkill(true, /* recordBaseline */ false); // integrity "missing"
+      const d = decideWithLiveOn();
+      expect(d.action).toBe("block");
+      if (d.action === "block") {
+        expect(d.downgradeTier).toBe("T2");
+        expect(d.reason).toMatch(/no sanctioned baseline|integrity: missing|unverified evals/i);
+        // Crucially NOT the T1_LIVE backstop — the integrity gate fired first.
+        expect(d.reason).not.toMatch(/silent auto-apply is disabled/i);
+      }
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+      else process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = prev;
+    }
+  });
+
+  it("status 'ok' (baseline recorded) → still T1-eligible (ALLOWS) with T1_LIVE=1", () => {
+    const prev = process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = "1";
+    try {
+      makeOwnedSkill(true, /* recordBaseline */ true); // integrity "ok"
+      const d = decideWithLiveOn();
+      expect(d.action).toBe("allow");
+      if (d.action === "allow") expect(d.tier).toBe("T1");
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+      else process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = prev;
+    }
   });
 });
 

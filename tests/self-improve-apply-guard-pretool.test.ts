@@ -15,7 +15,7 @@ import { evalsJsonPath } from "../src/self-improve/eval-gate.js";
 import { writeReviewContext } from "../src/self-improve/review-context.js";
 import { readPending } from "../src/self-improve/pending-queue.js";
 import { appliesToday } from "../src/self-improve/rate-limit.js";
-import { appendEvalCase } from "../src/self-improve/eval-cases.js";
+import { appendEvalCase, recordEvalBaseline } from "../src/self-improve/eval-cases.js";
 
 // Drive the hook through `bun` against source (mirrors the stop-hook test)
 // so it doesn't depend on build order. Skip cleanly if bun is absent.
@@ -32,7 +32,11 @@ function skillDir(): string {
 function skillFile(): string {
   return join(skillDir(), "SKILL.md");
 }
-function makeOwnedSkill(withEvals: boolean): void {
+// `recordBaseline` defaults ON so an owned skill with evals reflects the REAL
+// flow: the sanctioned applier records an integrity baseline, so the eval set
+// is "ok" (T1-eligible) and reaches the T1_LIVE backstop. Only "ok" integrity
+// is T1-eligible (R2).
+function makeOwnedSkill(withEvals: boolean, recordBaseline = true): void {
   mkdirSync(skillDir(), { recursive: true });
   if (withEvals) {
     mkdirSync(dirname(evalsJsonPath(skillDir())), { recursive: true });
@@ -40,6 +44,7 @@ function makeOwnedSkill(withEvals: boolean): void {
       evalsJsonPath(skillDir()),
       JSON.stringify({ skill_name: SLUG, evals: [{ name: "e1", prompt: "p" }] }),
     );
+    if (recordBaseline) recordEvalBaseline(stateDir, SLUG, skillDir());
   }
 }
 function writeBenchmark(candidate: number, baseline: number): void {

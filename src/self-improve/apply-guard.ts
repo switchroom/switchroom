@@ -458,19 +458,34 @@ export function decideApply(p: DecideApplyParams): ApplyDecision {
   }
 
   // (5b) eval-integrity — the verdict above trusts the skill's evals.json,
-  //      so refuse to silent-apply on an eval set that has DRIFTED from its
-  //      last sanctioned state (an out-of-band edit to evals.json).
+  //      so a silent T1 auto-apply requires the eval set to be in its last
+  //      SANCTIONED state. Only `"ok"` (current hash matches the recorded
+  //      baseline) is T1-eligible; ANY other status is downgraded to a
+  //      one-tap T2 proposal:
+  //        - "drift"    — an out-of-band edit to evals.json;
+  //        - "missing"  — evals present but never recorded a baseline (the
+  //                       sanctioned applier records its own baseline, so a
+  //                       legit skill is "ok" immediately — a "missing" here
+  //                       means the evals never went through a trusted path);
+  //        - "no-evals" — can't reach here (step 4 already blocked it), but
+  //                       covered for completeness.
   //      HONESTY (RFC amendment MJ1): this is defense-in-depth, tamper-
   //      EVIDENT — NOT a cryptographic boundary. The manifest lives in the
   //      agent-writable state dir; a model that also rewrites it defeats the
   //      check. The HARD backstop is the T1-live gate below (default OFF).
-  //      "missing" (never recorded / first sight) and "no-evals" are not
-  //      drift, so only an explicit "drift" blocks here.
-  if (verifyEvalIntegrity(p.stateDir, target.slug, target.skillDir) === "drift") {
+  //      Purely restrictive: a legit skill is "ok" the moment the sanctioned
+  //      applier records the baseline, so this costs real flows nothing while
+  //      closing the reopened-B1 path for anyone who flips T1_LIVE on.
+  const integrity = verifyEvalIntegrity(p.stateDir, target.slug, target.skillDir);
+  if (integrity !== "ok") {
+    const why =
+      integrity === "drift"
+        ? `eval set for "${target.slug}" drifted from its recorded baseline (out-of-band edit)`
+        : `eval set for "${target.slug}" has no sanctioned baseline (integrity: ${integrity})`;
     return {
       action: "block",
       downgradeTier: "T2",
-      reason: `eval set for "${target.slug}" drifted from its recorded baseline (out-of-band edit) — refusing to auto-apply on unverified evals; downgraded to a proposal`,
+      reason: `${why} — refusing to auto-apply on unverified evals; downgraded to a proposal`,
       candidate: downgradeCandidate(target, owns, changedLines, lesson),
     };
   }

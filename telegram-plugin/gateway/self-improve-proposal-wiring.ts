@@ -86,6 +86,8 @@ export function handlePostSkillProposal(
     draft: msg.draft,
     evidence: msg.evidence,
     chat_id: Number(msg.chatId),
+    // Provenance — absent ⇒ the store's back-compat default (skill-synthesis).
+    ...(msg.origin != null ? { origin: msg.origin } : {}),
   })
   const cardText = renderSkillProposalCard({
     id: proposal.id,

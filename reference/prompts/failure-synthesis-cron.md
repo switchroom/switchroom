@@ -125,6 +125,9 @@ operator sees the gap on the next interactive turn and can grant access then.
 >   --evidence "failed across N sessions" \
 >   --draft /tmp/failure-skill-draft.json \
 >   --chat <your chat id> \
+>   --origin failure-synthesis \  # tags provenance on the stored proposal
+>                                 # (SkillProposal.origin); routing is
+>                                 # unchanged — provenance only
 >   [--edit]            # include ONLY when editing an existing owned skill;
 >                       # omit for a NEW skill (is_new) — it rides the
 >                       # synthesized-personal-skill T2 carve-out
