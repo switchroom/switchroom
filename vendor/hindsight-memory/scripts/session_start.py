@@ -1,12 +1,39 @@
 #!/usr/bin/env python3
-"""SessionStart hook: health check + session logging.
+"""SessionStart hook: health check + durability drain/reconcile.
 
-Fires once when a Claude Code session begins. Uses additionalContext
-(supported on SessionStart) to inject an initial system note if
-Hindsight is available.
+Fires once when a Claude Code session begins (startup / compact / clear).
+This is the Claude Code equivalent of Openclaw's service.start() — verify
+the server is reachable early, then do the durability work that a prior
+session's abrupt death may have skipped: drain SessionEnd-queued retains
+(#1071) and reconcile un-committed transcript turns (#3244).
 
-This is the Claude Code equivalent of Openclaw's service.start() —
-verify the server is reachable early, before the first prompt.
+Runs ASYNC (``"async": true`` in hooks/hooks.json), for a reason specific
+to THIS hook: it injects NO additionalContext — every return path is a
+pure side effect — so nothing in the session depends on it finishing
+before the first prompt, and losing async's dropped context costs us
+nothing here (unlike recall.py, which must stay synchronous to inject).
+
+Why async matters: drain and reconcile each carry an independent
+wall-clock budget (``HINDSIGHT_DRAIN_BUDGET_S`` / ``HINDSIGHT_RECONCILE_BUDGET_S``,
+4s each) plus a Mode-1 health probe (~2s). Those budgets were each sized
+against the old synchronous 5s SessionStart timeout in ISOLATION, but they
+STACK on one hook: drain(4s) + reconcile(4s, added later in #3244) +
+probe(2s) routinely overran 5s, so the hook was SIGKILLed mid-drain on a
+large share of firings (see the fleet-wide ``hook_cancelled`` transcript
+attachments) — truncating exactly the durability work it exists to do,
+and growing the pending-retains backlog it was meant to clear. Async
+detaches it from the SessionStart critical path so the bounded, resumable
+drain/reconcile can run to completion instead of being cut off. Both are
+crash-safe under an eventual reap anyway: drain holds an ``fcntl.flock``
+the kernel releases on death and re-queues unsent entries, and reconcile
+is idempotent and resumes any over-budget remainder on the next boot.
+
+Keeping the drain here (rather than deferring wholly to the hindsight-drain
+sidecar) is deliberate: that sidecar is only CONDITIONALLY started — its
+own "NOT STARTED" branch in start.sh notes that when it is absent the
+memory queue is drained ONLY at session boot — so this hook stays the
+backlog path for agents without the sidecar. reconcile_tail has no sidecar
+equivalent at all and lives only here.
 """
 
 import json
