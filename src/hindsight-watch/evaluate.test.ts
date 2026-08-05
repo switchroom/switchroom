@@ -172,7 +172,51 @@ describe("evaluateQueueGrowth — recalibrated for #3610's split (parts, not mem
   });
 });
 
+describe("evaluateQueueGrowth — a backlog is WARN, never a loss-grade page", () => {
+  it("a high, under-cap backlog fires at most a WARN so it can never read as loss", () => {
+    // The 2026-08-05 false alarm: a ~2,300-part fleet backlog (klanker 1,051 +
+    // overlord 860, both under the 2,000-entry per-agent cap) rising and
+    // draining slowly, with every loss channel at zero. It must alert as 🟠
+    // "degraded" (severity `warn`), NOT the 🔴 red an operator reads as
+    // "memories are being lost", and its wording must disclaim loss.
+    const v = evaluateQueueGrowth([sample(0, { pending: 0 }), sample(4, { pending: 2308 })]);
+    expect(v.state).toBe("breach");
+    expect(v.severity).toBe("warn");
+    expect(v.detail).toContain("NOT loss");
+  });
+});
+
 describe("evaluateRetainLoss — memory that left the queue unpersisted", () => {
+  it("does NOT fire on a high, under-cap backlog with archive-count trims present", () => {
+    // The other half of the 2026-08-05 false alarm: pending-retains climbing
+    // to ~2,300 parts (under the 2,000-entry per-agent cap) while
+    // `pending-evictions.log` fills with `reason=archive-count` trims of the
+    // DURABLE `pending-reconciled/` archive. Those trims are housekeeping of
+    // already-persisted entries; this signal reads `pending-evicted/` (real
+    // undrained eviction), never the archive-count ledger, so a deep-but-
+    // draining spool with flat loss channels must NOT claim memory loss.
+    const v = evaluateRetainLoss([
+      sample(0, { pending: 1900, dead: 0, evicted: 0, drops: 0 }),
+      sample(1, { pending: 2308, dead: 0, evicted: 0, drops: 0 }),
+    ]);
+    expect(v.state).toBe("ok");
+    expect(v.detail).toContain("no new memory loss");
+  });
+
+  it("DOES fire when undrained entries are evicted at the per-agent cap", () => {
+    // The real loss case the false alarm was drowning out: `pending-retains`
+    // hit `HINDSIGHT_PENDING_MAX_ENTRIES` and `_evict_to_fit` shed undrained
+    // (non-durable) entries into `pending-evicted/`. That IS memory leaving
+    // the queue unpersisted and MUST fire the loss alarm.
+    const v = evaluateRetainLoss([
+      sample(0, { pending: 2000, evicted: 0 }),
+      sample(1, { pending: 2000, evicted: 37 }),
+    ]);
+    expect(v.state).toBe("breach");
+    expect(v.measured?.evictedAdded).toBe(37);
+    expect(v.detail).toContain("memory left the queue unpersisted");
+  });
+
   it("FIRES on a single new .dead marker", () => {
     const v = evaluateRetainLoss([sample(0, { dead: 135 }), sample(1, { dead: 136 })]);
     expect(v.state).toBe("breach");

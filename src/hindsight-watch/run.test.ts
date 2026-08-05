@@ -129,6 +129,27 @@ function evicted(n: number): void {
   for (let i = 0; i < n; i++) writeFileSync(join(d, `e${i}.json`), "{}");
 }
 
+/**
+ * The DURABLE `pending-reconciled/` archive — where drained (persisted)
+ * entries are retired, capped at 500 and trimmed by `reason=archive-count`.
+ * A SIBLING of `pending-retains/`, and NOT a loss channel: the watchdog must
+ * never count it as live queue depth or as eviction. Also writes a matching
+ * `pending-evictions.log` full of archive-count trims, exactly as the live
+ * fleet had on 2026-08-05, to prove neither is read as loss.
+ */
+function reconciledArchive(n: number): void {
+  const base = join(agentsDir, "alpha", "home", ".hindsight");
+  const d = join(base, "pending-reconciled");
+  rmSync(d, { recursive: true, force: true });
+  mkdirSync(d, { recursive: true });
+  for (let i = 0; i < n; i++) writeFileSync(join(d, `r${i}.json`), "{}");
+  let log = "";
+  for (let i = 0; i < n; i++) {
+    log += `2026-08-05T11:0${i % 10}:00Z trimmed=r${i}.json bytes=1000 archive=pending-reconciled reason=archive-count archive_depth=500\n`;
+  }
+  writeFileSync(join(base, "pending-evictions.log"), log);
+}
+
 /** #3599's `record_drop` ledger — retains that never reached the queue. */
 function drops(count: number): void {
   writeFileSync(
@@ -343,6 +364,41 @@ describe("tick — end to end over a real state file", () => {
     expect(loss?.verdict.measured).toMatchObject({ evicted: 4, dead: 0, drops: 0 });
     const growth = r.outcomes.find((o) => o.verdict.signal === "retain-queue-growth");
     expect(growth?.verdict.measured?.pending).toBe(10);
+  });
+
+  // The 2026-08-05 false alarm, end to end: a deep-but-under-cap backlog with
+  // a durable `pending-reconciled/` archive being archive-count-trimmed must
+  // (a) never fire `retain-loss`, and (b) surface the backlog as an ORANGE
+  // "degraded" notice, not the RED page an operator reads as "memories are
+  // being lost". Fails against the pre-fix build, where queue-growth paged red.
+  it("a deep under-cap backlog with archive-count trims is WARN, never a loss page", async () => {
+    const sent: Sent = { texts: [] };
+    reconciledArchive(600); // durable, trimmed — must be invisible to the probe
+    spool(400); // under the 2,000-entry per-agent cap
+    const base = {
+      statePath,
+      agentsDir,
+      notify: makeNotify(sent),
+      run: dockerOk(),
+      fetchImpl: fakeFetch(metricsBody(100, 0)),
+    };
+    const t0 = Date.parse("2026-08-05T09:00:00Z");
+    // First breach: spool jumps 400 → 1200 (rising, past the floor). Level
+    // signal — silent on the first breach.
+    await tick({ ...base, nowFn: () => t0 });
+    spool(1200);
+    const r = await tick({ ...base, nowFn: () => t0 + 900_000 });
+
+    // The archive is neither live depth nor loss.
+    const growth = r.outcomes.find((o) => o.verdict.signal === "retain-queue-growth");
+    expect(growth?.verdict.measured?.pending).toBe(1200); // NOT 1200 + 600 archive
+    expect(growth?.verdict.state).toBe("breach");
+    expect(growth?.verdict.severity).toBe("warn");
+    const loss = r.outcomes.find((o) => o.verdict.signal === "retain-loss");
+    expect(loss?.verdict.state).toBe("ok");
+    // No red loss page reached the operator; the second breach would DM orange.
+    expect(sent.texts.some((t) => t.includes("🔴 hindsight: retain-loss"))).toBe(false);
+    expect(sent.texts.some((t) => t.includes("🔴 hindsight: retain-queue-growth"))).toBe(false);
   });
 
   it("fires when a retain never reached the queue at all (record_drop ledger)", async () => {

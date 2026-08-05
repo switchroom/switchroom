@@ -137,6 +137,23 @@ export function evaluateFailureRate(ring: Sample[]): Verdict {
  * not memories — because that is what a queue entry is once oversized
  * retains are split. `QUEUE_FLOOR` and `QUEUE_GROWTH_MIN_ABS` carry the
  * conversion and its measurement.
+ *
+ * Severity is `warn`, NEVER a page — this is the correction to the 2026-08-05
+ * false alarm. A rising spool is a retry backlog draining slowly, NOT memory
+ * loss: the spool is DURABLE, every entry is retried until it persists, and a
+ * memory only leaves it UNpersisted at the per-agent
+ * `HINDSIGHT_PENDING_MAX_ENTRIES` / `MAX_BYTES` cap — which `retain-loss`
+ * watches via the `pending-evicted/` sibling. So this signal must render 🟠
+ * "degraded", not the 🔴 red an operator reads as "memories are being lost".
+ *
+ * Evidence (host `switchroom`, live, read-only, 2026-08-05): a ~2,300-part
+ * fleet backlog (klanker 1,051 + overlord 860, both well under the 2,000-entry
+ * per-agent cap) drained steadily with EVERY loss channel at zero — no
+ * `.dead`, no evicted entry, no drop — while all 5,459 lines of that day's
+ * `pending-evictions.log` were `reason=archive-count` trims of the DURABLE
+ * `pending-reconciled/` archive (housekeeping of already-persisted entries,
+ * capped at 500), not undrained eviction. An under-cap backlog is drain-lag;
+ * only `retain-loss` may claim loss.
  */
 export function evaluateQueueGrowth(ring: Sample[]): Verdict {
   const signal = "retain-queue-growth" as const;
@@ -150,14 +167,16 @@ export function evaluateQueueGrowth(ring: Sample[]): Verdict {
   const need = Math.max(QUEUE_GROWTH_MIN_ABS, Math.ceil(QUEUE_GROWTH_FRACTION * first));
   const breach = last >= QUEUE_FLOOR && growth >= need;
   const trend = growth > 0 ? `+${growth}` : String(growth);
-  return {
-    signal,
-    state: breach ? "breach" : "ok",
-    detail:
-      `pending retains ${first} → ${last} (${trend}) over ${mins}m ` +
-      `— fires at ≥${QUEUE_FLOOR} deep AND +${need} growth`,
-    measured: { pending: last, growth, windowMinutes: mins, growthNeeded: need },
-  };
+  const detail =
+    `pending retains ${first} → ${last} (${trend}) over ${mins}m ` +
+    `— backlog draining slowly, NOT loss (retries persist; memory is only ` +
+    `shed at the per-agent cap, watched by retain-loss). ` +
+    `Fires at ≥${QUEUE_FLOOR} deep AND +${need} growth`;
+  const measured = { pending: last, growth, windowMinutes: mins, growthNeeded: need };
+  if (breach) {
+    return { signal, state: "breach", severity: "warn", detail, measured };
+  }
+  return { signal, state: "ok", detail, measured };
 }
 
 /**
@@ -180,7 +199,12 @@ export function evaluateQueueGrowth(ring: Sample[]): Verdict {
  *    other than 408/425/429), which is close to always a genuine fault.
  *  - `pending-evicted/` — memory shed at the queue's `MAX_ENTRIES` /
  *    `MAX_BYTES` cap. Archived rather than persisted, and under a full disk
- *    `_evict_to_fit` removes outright.
+ *    `_evict_to_fit` removes outright. This is the ONLY eviction channel this
+ *    signal reads. It is NOT the `pending-evictions.log` ledger, whose
+ *    `reason=archive-count` lines are trims of DURABLE archives
+ *    (`pending-reconciled/`, capped at 500) — housekeeping of
+ *    already-persisted entries, not undrained loss. Counting those was the
+ *    root of the 2026-08-05 false alarm; this signal never has.
  *  - `pending-drops.json` — `record_drop`: the retain could not be written
  *    to the queue at all. The rarest and the most final.
  *
