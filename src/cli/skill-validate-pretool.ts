@@ -156,10 +156,17 @@ function tokenIsSkillEvalsJson(token: string): boolean {
   return ABS_SKILL_EVALS_RE.test(resolve("/", t));
 }
 
-/** An output redirect (`>` / `>>`, not a `2>&1`-style fd-dup) whose TARGET is a
- *  skill's evals.json — the primary Bash vector (`echo … > …/evals.json`). */
+/** An output redirect whose TARGET is a skill's evals.json — the primary Bash
+ *  vector (`echo … > …/evals.json`). Catches plain (`>`/`>>`), fd-prefixed
+ *  (`1>`, `2>`, `1>>`, `2>>`), combined-stream in BOTH spellings (`&>`/`&>>`
+ *  and the reversed `>&`), and clobber (`>|`) redirects. A `>&1`/`>&2`/`2>&1`
+ *  fd-DUP is NOT a file write and stays excluded: `(?:&(?![\d-]))?` only
+ *  consumes a combined-stream `>&` when it is NOT followed by a digit/`-`, so a
+ *  fd-dup's `&N` target is left for the char-class to reject (no path captured);
+ *  `\|?` consumes the clobber `|`. */
 function redirectWritesEvals(command: string): boolean {
-  const re = /(?:^|[^0-9<>&])>>?\s*(['"]?)([^\s'"|;&()<>]+)\1/g;
+  const re =
+    /(?:^|[^<>&\d])(?:\d+|&)?>>?(?:&(?![\d-]))?\|?\s*(['"]?)([^\s'"|;&()<>]+)\1/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(command)) !== null) {
     if (m[2] && tokenIsSkillEvalsJson(m[2])) return true;
