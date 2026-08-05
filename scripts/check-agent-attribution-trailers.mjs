@@ -109,29 +109,20 @@ const AGENT_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
 const MODEL_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9._@:+/-]{0,99}$/
 
 /**
- * Pull the trailer block out of a raw commit message.
+ * Parse ONE paragraph (a run of non-blank lines) into trailers.
  *
- * Implemented here rather than shelling to `git interpret-trailers --parse`
- * per commit: this is a hot loop over a PR's commits and the parse is the
- * same well-defined "last paragraph of `Token: value` lines" git uses.
- * Continuation lines (leading whitespace) fold into the previous trailer.
+ * Continuation lines (leading whitespace) fold into the previous trailer, per
+ * git's own rule. Returns `null` — not `[]` — when the paragraph contains any
+ * line that is neither a `Token: value` trailer nor a continuation: that
+ * distinction is load-bearing for the caller, which treats a prose-bearing
+ * paragraph as a hard stop rather than an empty result.
  *
- * @param {string} message raw commit message (subject + body)
- * @returns {{token: string, value: string}[]}
+ * @param {string[]} block lines of a single paragraph
+ * @returns {{token: string, value: string}[] | null}
  */
-export function parseTrailers(message) {
-  const lines = String(message).replace(/\r\n/g, '\n').split('\n')
-  // Drop trailing blank lines, then walk backwards over the final block.
-  let end = lines.length
-  while (end > 0 && lines[end - 1].trim() === '') end--
-  let start = end
-  while (start > 0 && lines[start - 1].trim() !== '') start--
-  const block = lines.slice(start, end)
-  if (block.length === 0) return []
-
+function parseParagraph(block) {
   /** @type {{token: string, value: string}[]} */
   const out = []
-  let valid = true
   for (const line of block) {
     if (/^\s/.test(line) && out.length > 0) {
       // Continuation of the previous trailer.
@@ -139,16 +130,72 @@ export function parseTrailers(message) {
       continue
     }
     const m = /^([A-Za-z0-9][A-Za-z0-9-]*)\s*:\s?(.*)$/.exec(line)
-    if (!m) {
-      valid = false
-      break
-    }
+    if (!m) return null
     out.push({ token: m[1], value: m[2].trim() })
   }
-  // git only treats the final paragraph as trailers when it is entirely
-  // made of trailer lines. A stray prose line means there is no trailer
-  // block at all — which is exactly the "the hook did not run" case.
-  return valid ? out : []
+  return out
+}
+
+/**
+ * Pull the trailer block out of a raw commit message.
+ *
+ * Implemented here rather than shelling to `git interpret-trailers --parse`
+ * per commit: this is a hot loop over a PR's commits and the parse is the
+ * same well-defined "last paragraph of `Token: value` lines" git uses.
+ *
+ * GitHub's squash-merge reparagraphs trailers: it collects the
+ * `Co-authored-by:` lines and re-emits them as a SEPARATE final paragraph,
+ * split from the `Switchroom-*` trailers the source commit carried by a blank
+ * line. Reading only the final paragraph then sees the Claude co-author but
+ * not the attribution that sits one paragraph above it, and the guard reds a
+ * fully-attributed PR (issue seen on #4381's squash `bb793cb`). So when the
+ * final paragraph is entirely trailer lines, fold in each IMMEDIATELY-
+ * PRECEDING paragraph that is ITSELF entirely trailer lines, treating the run
+ * of consecutive trailer-only paragraphs as one logical trailer block.
+ *
+ * Folding STOPS at the first paragraph carrying any non-trailer (prose) line.
+ * That preserves the original "a stray prose line means the hook did not run →
+ * no trailer block" detection: a prose separator (e.g. a `---------` line, or
+ * a PR-description paragraph) between the `Switchroom-*` trailers and a
+ * `Co-authored-by: Claude` final block still isolates them, so such a commit
+ * still fails. Folding only ADDS genuinely-present adjacent trailers into
+ * view; a truly unattributed commit has nothing to fold and still fails.
+ *
+ * @param {string} message raw commit message (subject + body)
+ * @returns {{token: string, value: string}[]}
+ */
+export function parseTrailers(message) {
+  const lines = String(message).replace(/\r\n/g, '\n').split('\n')
+  // Drop trailing blank lines.
+  let end = lines.length
+  while (end > 0 && lines[end - 1].trim() === '') end--
+  if (end === 0) return []
+
+  /** @type {{token: string, value: string}[]} */
+  const folded = []
+  let cursor = end
+  let isFinal = true
+  while (cursor > 0) {
+    // Skip the blank line(s) separating this paragraph from the next.
+    let pEnd = cursor
+    while (pEnd > 0 && lines[pEnd - 1].trim() === '') pEnd--
+    if (pEnd === 0) break
+    let pStart = pEnd
+    while (pStart > 0 && lines[pStart - 1].trim() !== '') pStart--
+
+    const parsed = parseParagraph(lines.slice(pStart, pEnd))
+    if (parsed === null) {
+      // A prose-bearing paragraph. If it IS the final paragraph, git treats
+      // the message as having no trailer block at all — the "hook did not run"
+      // case. If it merely precedes a trailer-only run, it is the stop line.
+      return isFinal ? [] : folded
+    }
+    // This paragraph precedes what we have collected, so prepend it.
+    folded.unshift(...parsed)
+    cursor = pStart
+    isFinal = false
+  }
+  return folded
 }
 
 /** @param {{token: string, value: string}[]} trailers @param {string} token */
