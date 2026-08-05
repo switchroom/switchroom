@@ -54,6 +54,37 @@
 
 ### Changed (switchroom divergence)
 
+- **SessionStart hook runs async so its durability work stops being killed
+  mid-drain** (`hooks/hooks.json`, `scripts/session_start.py`). The hook does
+  the recovery a prior session's abrupt death skipped — drain the
+  SessionEnd-queued retains (#1071) and reconcile un-committed transcript turns
+  (#3244). Those two carry independent 4s wall-clock budgets
+  (`HINDSIGHT_DRAIN_BUDGET_S` / `HINDSIGHT_RECONCILE_BUDGET_S`), each sized in
+  isolation against the old synchronous 5s SessionStart timeout, plus a ~2s
+  Mode-1 external-server health probe. Summed, they routinely overran 5s, so
+  Claude Code SIGKILLed the hook part-way through — truncating exactly the
+  durability work it exists to do and letting the pending-retains backlog grow
+  (fleet transcripts carry 1000+ `hook_cancelled` attachments for
+  `session_start.py`, all `timedOut: true` with `durationMs > 5000`; a
+  successful firing injects no `additionalContext` and so leaves no record,
+  which made the failures look like ~100% of firings when the true rate is
+  unmeasurable from attachments). Setting `"async": true` on the hook (the same
+  non-blocking pattern the Stop-event `retain.py` already uses) detaches it from
+  the SessionStart critical path: it injects no context, so nothing depends on
+  it finishing first and async's dropped context costs nothing. The `timeout`
+  ceiling rises 5s → 30s purely as a background-lifetime bound above the ~10s
+  summed sub-budgets — it never re-introduces a startup block, because drain and
+  reconcile self-cap at their budgets regardless. The drain stays in the hook
+  (not deferred wholly to the `hindsight-drain` sidecar, which `start.sh` only
+  starts conditionally — when it is absent this hook is the sole backlog path)
+  and `reconcile_tail`, which has no sidecar equivalent, stays here and now runs
+  to completion; its over-budget remainder still resumes on the next boot.
+  Concurrent drain with the sidecar stays safe via `drain_pending`'s exclusive
+  `fcntl.flock`. Pinned by `scripts/tests/test_session_start_durability.py`
+  (drain + reconcile are still invoked, in order) and
+  `tests/hindsight-session-start-async.test.ts` (the async flag + budget-clearing
+  ceiling survive the scaffold's hooks-override round-trip).
+
 - **Recall/retain hygiene guard-rail batch** (`scripts/recall.py`,
   `scripts/subagent_retain.py`, `scripts/lib/content.py`, `scripts/tests/**`).
   Closes guard-rail debt in the fork's hook scripts before extending them:
