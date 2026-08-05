@@ -7828,7 +7828,7 @@ function emitGatewayOperatorEvent(event: OperatorEvent): void {
       agent,
       shouldEmitCard: (a) => shouldEmitOperatorEvent(a, 'rate-limited'),
     })
-    routeRateLimit429(rateLimit429Classification, throttleTierRunner, agent) // #failover-429-corroborate probe-only seam; see routeRateLimit429 docstring
+    routeRateLimit429(rateLimit429Classification, throttleTierRunner, agent) // #failover-429-corroborate probe-only seam; boolean return is for test observability (throttle-tier-route-429.test.ts), intentionally discarded here — see docstring
     if (surface === 'litellm-local-notice') {
       process.stderr.write(
         `telegram gateway: 429 classified litellm-proxy-local agent=${agent} — ` +
