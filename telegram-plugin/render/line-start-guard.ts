@@ -187,13 +187,38 @@ export function guardAccidentalBlockConstructs(text: string): string {
  *  `#{1,6}` no longer sits at the (post-indent) line start. */
 const ACCIDENTAL_HEADING = /^([ \t]{0,3})(#{1,6})(?=[^\s#])/;
 
+/** Same accidental-heading run, but sitting AFTER one or more line-start LIST or
+ *  BLOCKQUOTE markers on the SAME line (`- #4382`, `* #4382`, `+ #4382`,
+ *  `1. #4382`, `> #4382`, and nested combinations like `- > #4382`) — issue
+ *  #3464. `guardAccidentalHeading`'s original `^`-anchored pattern only sees a
+ *  `#` at the true (post-indent) line start, so a `#` glued after a marker slips
+ *  through and Telegram's non-spec Bot API parser promotes it to a heading just
+ *  as it does at a bare line start (confirmed by live UAT for #3464). The prefix
+ *  is `([ \t]{0,3}<marker>+)`: up to 3 leading spaces, then one-or-more markers,
+ *  each an unordered bullet (`-`/`*`/`+`) or short ordered marker (`1.`/`1)`,
+ *  1–3 digits) followed by ≥1 space/tab, or a blockquote `>` with optional
+ *  spaces. Group 1 captures the WHOLE prefix so the replacement re-emits it
+ *  verbatim and escapes ONLY the first `#` of group 2. The same `(?=[^\s#])`
+ *  lookahead keeps a real nested heading (`- # Heading`, space AFTER the `#`)
+ *  and a bare `#`/`##` untouched. Idempotent: after escaping, the `#` sits
+ *  behind a `\` (`- \#4382`), so the `(#{1,6})` no longer follows the prefix. */
+const ACCIDENTAL_HEADING_AFTER_MARKER =
+  /^([ \t]{0,3}(?:(?:[-*+]|\d{1,3}[.)])[ \t]+|>[ \t]*)+)(#{1,6})(?=[^\s#])/;
+
 /**
  * Escape the accidental heading trigger at the start of ONE line (the string
  * must NOT contain a newline; the caller guarantees a true line start). A no-op
- * unless the line begins with a `#{1,6}` run glued to a non-space, non-`#` char.
+ * unless the line begins with a `#{1,6}` run glued to a non-space, non-`#` char
+ * — either at the true line start (`#4382`) or immediately after one or more
+ * line-start list/blockquote markers (`- #4382`, `> #4382`, `1. #4382`, #3464).
+ * The two patterns are mutually exclusive on any given line (the bare one needs
+ * a `#` right after the indent; the marker one needs a marker first), so running
+ * both replaces can never double-escape.
  */
 function escapeAccidentalHeadingLine(line: string): string {
-  return line.replace(ACCIDENTAL_HEADING, "$1\\$2");
+  return line
+    .replace(ACCIDENTAL_HEADING, "$1\\$2")
+    .replace(ACCIDENTAL_HEADING_AFTER_MARKER, "$1\\$2");
 }
 
 /**
