@@ -42,6 +42,7 @@ import {
   clearReviewContext,
 } from "../self-improve/review-context.js";
 import { sweepEvalIntegrity } from "../self-improve/eval-cases.js";
+import { writeCorrectionPending } from "../memory/hindsight-retain-provenance.js";
 import type { TurnMessage } from "../self-improve/types.js";
 
 /** Newest-last window of messages to scan. Bounds the gate's cost and
@@ -325,6 +326,21 @@ function main(): void {
 
   // Cost guarantee: no signal → return immediately, zero added work.
   if (!gate.tripped) process.exit(0);
+
+  // Slice 4a: when the gate fired on an operator-correction, drop a per-turn
+  // sentinel so THIS turn's Hindsight auto-retain (a SEPARATE process — the
+  // vendored retain hook reads-and-clears it) carries a `self-improve:correction`
+  // tag, which PR5's failure-synthesis cron recalls against. Runs BEFORE the
+  // agent-name bail below so the marker still lands on a turn where routing the
+  // review is impossible. Best-effort, wrapped: a marker write must never fail
+  // the turn (the Stop hook is fail-open).
+  if (gate.signals.some((s) => s.kind === "operator-correction")) {
+    try {
+      writeCorrectionPending(resolveStateDir());
+    } catch {
+      /* marker best-effort; the retain simply carries no correction tag */
+    }
+  }
 
   const agentName = process.env.SWITCHROOM_AGENT_NAME ?? "";
   if (!agentName) process.exit(0); // can't route without identity — fail-open

@@ -7,6 +7,8 @@ import {
   RETAIN_PROVENANCE_TAG,
   RETAIN_PROVENANCE_TAG_SCOPE_PATTERN,
   RETAIN_TAGS_DEFAULT,
+  SELF_IMPROVE_CORRECTION_TAG,
+  SELF_IMPROVE_CORRECTION_PENDING_FILE,
 } from "../src/memory/hindsight-retain-provenance.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";
 
@@ -117,6 +119,51 @@ describe("hindsight retain — transcript provenance tag", () => {
     expect(new RegExp(RETAIN_PROVENANCE_TAG_SCOPE_PATTERN).test(RETAIN_PROVENANCE_TAG)).toBe(
       true,
     );
+  });
+
+  /**
+   * PR4 slice 4a cross-language pin. The self-improve Stop hook (TS) writes the
+   * correction sentinel by NAME and the vendored retain hook (Python) reads it
+   * by NAME and stamps the tag by VALUE — two separate processes that share only
+   * these two strings. If either copy drifts, correction turns silently stop
+   * being tagged and PR5's synthesis goes blind. This guards both halves against
+   * the TS source of truth.
+   */
+  it("retain.py pins the correction sentinel filename and tag to the TS constants", () => {
+    const retainPy = readFileSync(
+      resolve(
+        __dirname,
+        "..",
+        "vendor",
+        "hindsight-memory",
+        "scripts",
+        "retain.py",
+      ),
+      "utf-8",
+    );
+    expect(retainPy).toContain(
+      `SELF_IMPROVE_CORRECTION_PENDING_FILE = "${SELF_IMPROVE_CORRECTION_PENDING_FILE}"`,
+    );
+    expect(retainPy).toContain(
+      `SELF_IMPROVE_CORRECTION_TAG = "${SELF_IMPROVE_CORRECTION_TAG}"`,
+    );
+  });
+
+  /**
+   * The correction tag is STABLE, by contract — the opposite of the provenance
+   * tag's forced-volatile treatment. It rides only rare correction turns, so it
+   * SHOULD reach the consolidation scope (grouping those turns into their own
+   * `[["self-improve:correction"]]` partition for PR5). It must therefore NOT
+   * match any volatile scope pattern, and in particular not `^source:`.
+   */
+  it("the correction tag is stable — excluded by NO volatile scope pattern", () => {
+    expect(RETAIN_PROVENANCE_TAG_SCOPE_PATTERN).toBe("^source:");
+    expect(new RegExp(RETAIN_PROVENANCE_TAG_SCOPE_PATTERN).test(SELF_IMPROVE_CORRECTION_TAG)).toBe(
+      false,
+    );
+    // Same <kind>:<name> shape as the provenance tag, distinct namespace.
+    expect(SELF_IMPROVE_CORRECTION_TAG).toMatch(/^[a-z-]+:[a-z-]+$/);
+    expect(SELF_IMPROVE_CORRECTION_TAG).not.toBe(RETAIN_PROVENANCE_TAG);
   });
 
   it("the provenance tag is addressable by the existing recall tag-weight surface", () => {
