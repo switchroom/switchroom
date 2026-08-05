@@ -215,6 +215,103 @@ export function isSilentSentinelCardOutcome(input: SilentSentinelCardInput): boo
 }
 
 /**
+ * Inputs for {@link isHollowGhostCardOutcome} — the ending-turn fields the
+ * hollow-card gate reads. A strict superset of the silent-sentinel inputs plus
+ * `labeledToolCount` (the deterministic surfaced-tool total). All are already
+ * tracked on the gateway's `CurrentTurn`; passed as a plain struct so the
+ * decision stays a pure, unit-testable core.
+ */
+export interface HollowGhostCardInput {
+  /** True when the model called `reply` / `stream_reply` at least once. */
+  replyCalled: boolean
+  /**
+   * Count of surfaced (non-suppressed) tool steps this turn
+   * (`CurrentTurn.labeledToolCount`) — the same source that drives the card's
+   * `✓ N steps` total and the `tools=` lifecycle field. Zero means the turn did
+   * no surfaced tool work, so the card has no step body to record.
+   */
+  labeledToolCount: number
+  /**
+   * Rendered narrative/mirror lines surfaced into the activity card this turn
+   * (`CurrentTurn.mirrorLines`) — every `showNarrativeStep` appends one via
+   * `appendActivityLabel`. A NON-EMPTY array means the user saw real narration
+   * content in the card (e.g. "Doing the work now"), so the card is a legitimate
+   * record even with zero tool steps and no reply — it is NOT the empty ghost
+   * card. This is the axis that separates Ken's #45 bug (a card opened by the
+   * liveness timer that stayed contentless — `🤖 Agent · done · 0 tools · 40s`,
+   * `mirrorLines` empty) from a narration-only turn (a rendered step, no tool).
+   */
+  mirrorLines: string[]
+  /**
+   * Raw assistant text blocks accumulated across the turn
+   * (`CurrentTurn.capturedText`) — the turn-flush classifies the same source.
+   */
+  capturedText: string[]
+  /**
+   * The most-recent `reply` / `stream_reply` `input.text` this turn
+   * (`CurrentTurn.lastReplyText`); empty when the reply tool was never called.
+   */
+  lastReplyText: string
+  /**
+   * A SUBSTANTIVE final answer reached the user at some point this turn
+   * (`CurrentTurn.finalAnswerEverDelivered`). When true the card is a legitimate
+   * record beside a delivered answer and is NEVER suppressed.
+   */
+  finalAnswerEverDelivered: boolean
+}
+
+/**
+ * Decide whether an ending turn produced a genuinely HOLLOW activity card — the
+ * `#45` ghost-reply condition — so the gateway can DELETE the card instead of
+ * finalizing it to a contentless `🤖 Agent · done · 0 tools · Ns` record.
+ *
+ * The symptom (#45): a turn injected into the session (typically a duplicate
+ * sub-agent handback beat) adopts a per-turn activity card at turn START, then
+ * ends having done ZERO surfaced tool work, never calling reply, delivering no
+ * final answer, and emitting no captured terminal text. The card was already
+ * posted but never gets any content — the gateway already WARNs on this exact
+ * signature (`ghost-reply detected — turn ended with zero outbound messages …
+ * replyCalled=false capturedText=empty`) but does not suppress the empty card.
+ *
+ * This is the complement of {@link isSilentSentinelCardOutcome}: that gate
+ * handles a turn whose outcome was an INTENTIONAL silent sentinel (a NO_REPLY /
+ * HEARTBEAT_OK the model actually emitted, which reaches `lastReplyText` /
+ * `capturedText`). A hollow ghost turn emitted NOTHING at all — no sentinel text
+ * for the sentinel gate to match — so `decideTurnFlush` classifies it as
+ * `empty-text`, not `silent-marker`, and the sentinel gate returns false (see
+ * the `isSilentSentinelCardOutcome` test "a genuinely empty dark turn … is NOT a
+ * sentinel"). Both gates share the same conservative floor.
+ *
+ * Conservative by construction — every guarantee that keeps a real card is an
+ * early false:
+ *   - `finalAnswerEverDelivered` — a substantive answer reached the user; the
+ *     card is a legitimate record.
+ *   - `replyCalled` — the model called reply (even a dropped sentinel-only reply
+ *     is the SENTINEL gate's job, not this one); never treated as hollow here.
+ *   - `labeledToolCount > 0` — the turn did surfaced tool work, so the card
+ *     carries a real `✓ N steps` body worth keeping.
+ *   - any non-blank `mirrorLines` — the turn surfaced narrative content into the
+ *     card that the user saw (a `showNarrativeStep`), so the card is a real
+ *     record, NOT the contentless ghost card. This is the axis that keeps a
+ *     narration-only turn (rendered step, zero tools/reply/text) from being
+ *     mistaken for Ken's empty `done · 0 tools` card, whose `mirrorLines` is
+ *     empty because the card was opened by the liveness timer, not narration.
+ *   - any non-blank `capturedText` / `lastReplyText` — the turn produced terminal
+ *     text; not hollow (and, if it is silent-sentinel noise, the sentinel gate
+ *     already suppresses it).
+ * Only a turn that is empty on ALL of those axes is hollow.
+ */
+export function isHollowGhostCardOutcome(input: HollowGhostCardInput): boolean {
+  if (input.finalAnswerEverDelivered) return false
+  if (input.replyCalled) return false
+  if (input.labeledToolCount > 0) return false
+  if (Array.isArray(input.mirrorLines) && input.mirrorLines.join('').trim().length > 0) return false
+  if (Array.isArray(input.capturedText) && input.capturedText.join('').trim().length > 0) return false
+  if (typeof input.lastReplyText === 'string' && input.lastReplyText.trim().length > 0) return false
+  return true
+}
+
+/**
  * Substantive-answer floor (chars, trimmed). Mirrors
  * `final-answer-detect.ts` `FINAL_ANSWER_MIN_CHARS` and
  * `hooks/silent-end-scan.mjs` — the same bar the codebase uses everywhere to

@@ -56,7 +56,7 @@ import {
   appendActivityLabel, clipNarrative, formatStepSuffix, renderActivityFeedWithNested,
 } from '../tool-activity-summary.js'
 import { evaluatePostAnswerLiveness } from '../turn-liveness-floor.js'
-import { isSilentSentinelCardOutcome } from '../turn-flush-safety.js'
+import { isHollowGhostCardOutcome, isSilentSentinelCardOutcome } from '../turn-flush-safety.js'
 import { clearActivityCardRecord, writeActivityCardRecord } from './activity-card-store.js'
 import { chatKeyWithSuffix } from './chat-key.js'
 import {
@@ -900,7 +900,30 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
         capturedText: turn.capturedText,
         finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
       })
-      if (CLEAR_STATUS_ON_COMPLETION || silentSentinelTurn) {
+      // #45 — hollow-ghost suppression. The sibling to the #4348 sentinel gate:
+      // a turn that ended having done ZERO surfaced tool work, never called
+      // reply, delivered no final answer, surfaced NO narration, and emitted no
+      // captured/reply text adopted an activity card at turn start that never
+      // got any content — the contentless `🤖 Agent · done · 0 tools · Ns`
+      // record Ken reported (a card opened by the liveness timer that stayed
+      // empty). The sentinel gate can't catch it (there is no NO_REPLY/
+      // HEARTBEAT_OK text to match; the flush classifies it `empty-text`, not
+      // `silent-marker`), so DELETE the empty card here instead of finalizing
+      // it. Deterministic (pure predicate over already-tracked turn fields) and
+      // normal-case-safe: any surfaced tool step, any rendered narrative line
+      // (`mirrorLines` — content the user actually saw), any reply, any captured
+      // text, or a delivered answer keeps the card. The `finalHtmlOverride`
+      // finalize path is only taken by the foreground handoff-clear (which fires
+      // on a delivered final answer), so this gate never contends with it.
+      const hollowGhostTurn = isHollowGhostCardOutcome({
+        replyCalled: turn.replyCalled,
+        labeledToolCount: turn.labeledToolCount,
+        mirrorLines: turn.mirrorLines,
+        capturedText: turn.capturedText,
+        lastReplyText: turn.lastReplyText,
+        finalAnswerEverDelivered: turn.finalAnswerEverDelivered,
+      })
+      if (CLEAR_STATUS_ON_COMPLETION || silentSentinelTurn || hollowGhostTurn) {
         try {
           await robustApiCall(
             () => bot.api.deleteMessage(chat, id),
