@@ -234,6 +234,32 @@ export const HINDSIGHT_DEFAULT_LITELLM_MODEL =
 export const HINDSIGHT_DEFAULT_MCP_STATELESS = true;
 
 /**
+ * Bounded dead-letter auto-requeue safety net (#3795 / #3797).
+ *
+ * `docker/hindsight-maintenance.sh` (Section 7) already implements a recovery
+ * sweep: it POSTs each FK-race dead-letter — a `retain` op the engine
+ * MISclassified as a deterministic failure during the unit_entities
+ * ForeignKeyViolation race (#3794), so it sits `status='failed'` with an
+ * intact `task_payload`, `retry_count=0`, `next_retry_at IS NULL` and is never
+ * revisited — back to the engine's own `/retry` endpoint (failed → pending),
+ * after which the worker's claim loop picks it up and the STALLED memory lands.
+ * The classifier PREVENTION fix is an engine change tracked in #3797 and is
+ * out of scope here; this is the RECOVERY half.
+ *
+ * The script reads these two knobs from its process environment and defaults
+ * them OFF (`REQUEUE_DEAD_LETTERS=0`). Nothing in `src/` surfaced them, so the
+ * sweep never ran on the fleet. Pinning them on the container's env here is the
+ * durable enable — it lands on BOTH launch paths (docker-run + compose).
+ *
+ * The bound matters because each requeued op re-runs LLM fact extraction (real
+ * spend). Steady-state FK-race rate is ~zero and the historical backlog was
+ * ~14-23, so 25/tick is a safe ceiling that clears a realistic burst without
+ * risking a large unexpected spend if the classifier regresses.
+ */
+export const HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS = "1";
+export const HINDSIGHT_DEFAULT_REQUEUE_MAX = "25";
+
+/**
  * DEFER the hindsight MCP tool-surface allowlist (29 advertised tools) — the
  * 2026-06-07 adversarial audit (3 independent host-caller hunts) found it is
  * high-blast-radius for ~no net benefit. Recorded so we don't re-attempt it.
@@ -1985,6 +2011,13 @@ export function hindsightContainerEnvPairs(opts: {
     // fails leaves pg0's own defaults in place rather than blocking boot.
     // See src/setup/hindsight-pg-defaults.ts.
     ...hindsightPgEnvPairs(perf),
+    // Dead-letter auto-requeue safety net, read by the maintenance sidecar
+    // (docker/hindsight-maintenance.sh Section 7). OFF in the script's own
+    // defaults; pinning it ON here is what durably enables the recovery sweep
+    // on the fleet, bounded at 25 requeues/tick to cap LLM re-extraction spend.
+    // See HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS / _MAX (#3795 / #3797).
+    ["SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS", HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS],
+    ["SWITCHROOM_HINDSIGHT_REQUEUE_MAX", HINDSIGHT_DEFAULT_REQUEUE_MAX],
   ];
 
   // The `claude-code` provider drives an underlying claude subprocess; pin
@@ -2687,6 +2720,11 @@ export function generateHindsightComposeSnippet(
     // pg0 sizing — compose twin of the docker-run block, from the SAME
     // resolver (see hindsightPgEnvPairs / hindsight-pg-defaults.ts).
     ...hindsightPgEnvPairs(perf).map(([k, v]) => `      - ${k}=${v}`),
+    // Dead-letter auto-requeue safety net — compose twin of the docker-run
+    // path's pins, so the recovery sweep is enabled identically on both launch
+    // paths (see HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS / _MAX, #3795 / #3797).
+    `      - SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS=${HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS}`,
+    `      - SWITCHROOM_HINDSIGHT_REQUEUE_MAX=${HINDSIGHT_DEFAULT_REQUEUE_MAX}`,
     `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
