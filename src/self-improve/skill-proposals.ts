@@ -62,6 +62,29 @@ export type ProposalStatus = "pending" | "approved" | "rejected";
  */
 export type ProposalOrigin = "skill-synthesis" | "failure-synthesis";
 
+/** The valid provenance values; anything else normalizes to the default. */
+export const PROPOSAL_ORIGINS: readonly ProposalOrigin[] = [
+  "skill-synthesis",
+  "failure-synthesis",
+];
+
+/** Back-compat default: absence (or any unrecognized value) ⇒ skill-synthesis. */
+export const DEFAULT_PROPOSAL_ORIGIN: ProposalOrigin = "skill-synthesis";
+
+/**
+ * Single source of truth for materializing a proposal's `origin`. An absent
+ * field (legacy record, written before `origin` existed) or any value not in
+ * `PROPOSAL_ORIGINS` (a hand-written / tampered JSONL line) collapses to the
+ * `skill-synthesis` default. Applied on BOTH read (`readProposals`) and write
+ * so no consumer branching on `origin === "skill-synthesis"` can silently miss
+ * a legacy/un-normalized record (#4428).
+ */
+export function normalizeProposalOrigin(value: unknown): ProposalOrigin {
+  return PROPOSAL_ORIGINS.includes(value as ProposalOrigin)
+    ? (value as ProposalOrigin)
+    : DEFAULT_PROPOSAL_ORIGIN;
+}
+
 /**
  * A benchmark summary attached to a proposal, precomputed by the
  * grader-subagent flow at synthesis time (NOT recomputed by the card).
@@ -196,7 +219,13 @@ function isRejectionRecord(v: unknown): v is RejectionFingerprint {
 export function readProposals(stateDir: string): SkillProposal[] {
   const all = readLines(proposalsPath(stateDir), isProposalRecord);
   const byId = new Map<string, SkillProposal>();
-  for (const p of all) byId.set(p.id, p); // later lines overwrite
+  // Materialize `origin` on read via the shared normalizer so a legacy record
+  // (no `origin`) or a hand-written line with an un-normalized value reads as
+  // a concrete, valid provenance — a consumer branching on
+  // `origin === "skill-synthesis"` must never silently miss it (#4428).
+  for (const p of all) {
+    byId.set(p.id, { ...p, origin: normalizeProposalOrigin(p.origin) }); // later lines overwrite
+  }
   return [...byId.values()];
 }
 
@@ -260,6 +289,9 @@ export function enqueueProposal(
     created_at: new Date(now()).toISOString(),
     status: "pending",
     ...input,
+    // Same normalizer as readProposals — provenance is always a concrete,
+    // valid value on disk, so read and write agree (#4428).
+    origin: normalizeProposalOrigin(input.origin),
   };
   appendLine(proposalsPath(stateDir), proposal);
   return proposal;

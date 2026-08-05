@@ -204,21 +204,31 @@ export function estimateChangedLines(
  *
  *   - before: the current file size from `statSync` (0 if the file is
  *     absent — a brand-new file).
- *   - after (Write): the new content's length.
- *   - after (Edit): before − old_string.length + new_string.length.
- *   - after (MultiEdit): before + Σ(new_string.length − old_string.length).
+ *   - after (Write): the new content's UTF-8 byte length.
+ *   - after (Edit): before − bytes(old_string) + bytes(new_string), scaled
+ *     by the match count when `replace_all` is set.
+ *   - after (MultiEdit): before + Σ per-edit byte delta (each scaled by its
+ *     own `replace_all` match count).
  *
- * Mirrors `estimateChangedLines`'s reading of the tool input. Skill
- * bundles are text, so a string `.length` (UTF-16 code units) tracks the
- * byte size closely enough for the cap's "is this growing a lot" purpose;
- * `before` is real bytes from `statSync`. A negative/zero delta (shrink or
- * size-neutral edit) is never blocked by the growth cap.
+ * Mirrors `estimateChangedLines`'s reading of the tool input. Measured in
+ * real UTF-8 bytes via `Buffer.byteLength(s, "utf8")` — the SAME axis as
+ * `before` (`statSync().size`) and the outer 2 MiB `MAX_SKILL_BYTES` wall
+ * (`Buffer.byteLength`, src/cli/skill-common.ts). A prior version measured
+ * the `after` side in UTF-16 code units (`.length`), which under/over-counts
+ * multibyte content (e.g. `"😀".repeat(2000)` is `.length=4000` but 8000
+ * real bytes) and could slip a multi-KB write under the cap (#4419). A
+ * `replace_all` Edit applies to EVERY match, so a single old→new delta is
+ * scaled by the occurrence count in the current file; a plain Edit applies
+ * once. A negative/zero delta (shrink or size-neutral edit) is never
+ * blocked by the growth cap.
  */
 export function estimateByteDelta(
   toolName: string,
   input: Record<string, unknown>,
   filePath: string,
 ): { before: number; after: number; delta: number } {
+  const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
+
   let before = 0;
   try {
     before = statSync(filePath).size;
@@ -226,14 +236,40 @@ export function estimateByteDelta(
     before = 0; // absent → brand-new file
   }
 
+  // Read the current file ONCE for any replace_all occurrence counting.
+  // A replace_all with an empty/absent old_string matches nothing, so its
+  // count is 0 (no growth) — mirrors the tool's real no-op behaviour.
+  let currentContent: string | null = null;
+  const occurrences = (needle: string): number => {
+    if (needle.length === 0) return 0;
+    if (currentContent === null) {
+      try {
+        currentContent = readFileSync(filePath, "utf-8");
+      } catch {
+        currentContent = "";
+      }
+    }
+    return currentContent.split(needle).length - 1;
+  };
+
+  const editDelta = (
+    oldS: string,
+    newS: string,
+    replaceAll: boolean,
+  ): number => {
+    const per = byteLen(newS) - byteLen(oldS);
+    const count = replaceAll ? occurrences(oldS) : 1;
+    return per * count;
+  };
+
   let after = before;
   if (toolName === "Write") {
     const content = typeof input.content === "string" ? input.content : "";
-    after = content.length;
+    after = byteLen(content);
   } else if (toolName === "Edit") {
     const oldS = typeof input.old_string === "string" ? input.old_string : "";
     const newS = typeof input.new_string === "string" ? input.new_string : "";
-    after = before - oldS.length + newS.length;
+    after = before + editDelta(oldS, newS, input.replace_all === true);
   } else if (toolName === "MultiEdit") {
     const edits = Array.isArray(input.edits) ? input.edits : [];
     let net = 0;
@@ -242,7 +278,7 @@ export function estimateByteDelta(
       const ed = e as Record<string, unknown>;
       const oldS = typeof ed.old_string === "string" ? ed.old_string : "";
       const newS = typeof ed.new_string === "string" ? ed.new_string : "";
-      net += newS.length - oldS.length;
+      net += editDelta(oldS, newS, ed.replace_all === true);
     }
     after = before + net;
   }

@@ -440,6 +440,76 @@ describe("estimateByteDelta", () => {
     expect(r.after).toBe(3);
     expect(r.delta).toBe(0);
   });
+
+  it("Write: measures multibyte content in real UTF-8 bytes, not UTF-16 units (#4419)", () => {
+    // "😀" is a surrogate pair: .length === 2 (UTF-16 units) but 4 UTF-8 bytes.
+    // 20 copies → .length=40 (the OLD, wrong measure) vs 80 real bytes.
+    const abs = join(agentDir, "emoji.md");
+    const content = "😀".repeat(20);
+    expect(content.length).toBe(40); // UTF-16 code units — what the bug used
+    const r = estimateByteDelta("Write", { content }, abs);
+    expect(r.before).toBe(0);
+    expect(r.after).toBe(80); // Buffer.byteLength(content,"utf8")
+    expect(r.delta).toBe(80);
+  });
+
+  it("Edit: measures old/new in UTF-8 bytes (#4419)", () => {
+    const abs = join(agentDir, "edit-mb.md");
+    writeFileSync(abs, "😀"); // 4 bytes on disk
+    // Replace the emoji (4 bytes) with "abc" (3 bytes) → net −1 byte.
+    const r = estimateByteDelta(
+      "Edit",
+      { old_string: "😀", new_string: "abc" },
+      abs,
+    );
+    expect(r.before).toBe(4);
+    expect(r.after).toBe(3);
+    expect(r.delta).toBe(-1);
+  });
+
+  it("Edit + replace_all: scales the delta by the match count (#4419)", () => {
+    const abs = join(agentDir, "replace-all.md");
+    writeFileSync(abs, "aaa"); // 3 occurrences of "a", before = 3 bytes
+    // replace_all applies to EVERY match: 3 × (bytes("bb") − bytes("a")) = 3×1.
+    const r = estimateByteDelta(
+      "Edit",
+      { old_string: "a", new_string: "bb", replace_all: true },
+      abs,
+    );
+    expect(r.before).toBe(3);
+    expect(r.after).toBe(6); // OLD single-application bug would report 4
+    expect(r.delta).toBe(3);
+  });
+
+  it("Edit without replace_all: still a single application", () => {
+    const abs = join(agentDir, "single.md");
+    writeFileSync(abs, "aaa");
+    const r = estimateByteDelta(
+      "Edit",
+      { old_string: "a", new_string: "bb" }, // no replace_all
+      abs,
+    );
+    expect(r.after).toBe(4); // 3 − 1 + 2, one application only
+    expect(r.delta).toBe(1);
+  });
+
+  it("MultiEdit + per-edit replace_all: each edit scales by its own match count (#4419)", () => {
+    const abs = join(agentDir, "multi-ra.md");
+    writeFileSync(abs, "aabb"); // before = 4 bytes
+    const r = estimateByteDelta(
+      "MultiEdit",
+      {
+        edits: [
+          { old_string: "a", new_string: "xx", replace_all: true }, // 2 × (2−1) = +2
+          { old_string: "b", new_string: "" }, // single: (0−1) = −1
+        ],
+      },
+      abs,
+    );
+    expect(r.before).toBe(4);
+    expect(r.delta).toBe(2 - 1);
+    expect(r.after).toBe(5);
+  });
 });
 
 describe("apply-guard T1 net-growth cap", () => {
@@ -504,6 +574,34 @@ describe("apply-guard T1 net-growth cap", () => {
     } finally {
       if (prev === undefined) delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
       else process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = prev;
+    }
+  });
+
+  it("TRIPS the growth cap on multibyte content that UTF-16 length would slip under (#4419)", () => {
+    makeOwnedSkill(true);
+    writeBenchmark(1.0, 0.9);
+    // 30 emoji: .length === 60 (would be UNDER the 64-byte budget on the old
+    // UTF-16 measure) but 120 real UTF-8 bytes → over by 56. The fix measures
+    // bytes, so the cap must trip; the old code would have silently allowed it.
+    const BUDGET64: SelfImproveConfig = { ...CFG, t1MaxGrowthBytes: 64 };
+    const content = "😀".repeat(30);
+    expect(content.length).toBe(60); // < 64: the bug would NOT block
+    const d = decideApply({
+      toolName: "Write",
+      input: { content },
+      filePath: skillFile(),
+      stateDir,
+      cfg: BUDGET64,
+      now,
+    });
+    expect(d.action).toBe("block");
+    if (d.action === "block") {
+      expect(d.downgradeTier).toBe("T2");
+      expect(d.reason).toMatch(/net-growth cap/i);
+      expect(d.reason).toContain("64-byte budget");
+      expect(d.reason).toContain("56 over"); // 120 − 64
+      expect(d.bytesBefore).toBe(0);
+      expect(d.bytesAfter).toBe(120);
     }
   });
 
