@@ -351,6 +351,43 @@ correction now defends itself. Silent auto-apply of a verified edit stays OFF
 by default (`SWITCHROOM_SELF_IMPROVE_T1_LIVE` opt-in); until set, every
 otherwise-allowable edit is downgraded to a T2 one-tap proposal.
 
+## Weekly failure-synthesis (one-tap self-improvement, RFC §"failure synthesis")
+
+The failure-driven sibling of skill-synthesis. Where skill-synthesis mines
+what **worked** and generalizes it, failure-synthesis mines what **broke** —
+the `self-improve:correction`-tagged memories the self-improve gate distilled
+— and proposes the smallest durable defense: a skill **EDIT** to a skill the
+agent owns, or a **NEW** personal skill where none covers the failure
+(create/update parity, RFC invariant 6). A NEW-skill-from-failure reuses the
+existing `synthesized-personal-skill` T2 carve-out
+(`src/self-improve/tier-router.ts`) — one tap into the agent's own reversible
+workspace, hard-T3 floors untouched — and records `origin: "failure-synthesis"`
+on the proposal. Every proposal ships with 1–3 regression eval cases routed
+through the propose-only `switchroom self-improve add-eval-case` path (never a
+direct `evals.json` write), so the fix defends itself against re-introduction.
+
+```yaml
+- cron: "0 9 * * 4"        # Thursdays 09:00 — OFFSET from skill-synthesis (Mon)
+  name: failure-synthesis
+  context: agent            # full live session (Tier 2)
+  prompt: |
+    <see reference/prompts/failure-synthesis-cron.md for the full prompt>
+```
+
+**Cadence and token budget are an operator decision — this cron is NOT
+auto-enabled fleet-wide.** Ship the prompt + docs; the operator adds and tunes
+the schedule entry. The **recommended default** is **one candidate proposal +
+one grader run per week** — enough to catch a recurring failure without
+burning a full Tier-2 live session more than weekly. Offset the day-of-week
+from the skill-synthesis cron (e.g. skill-synthesis Monday, failure-synthesis
+Thursday) so the two syntheses don't stack their token cost in a single wake.
+The cron mines the cheap `self-improve:correction` memories FIRST and only
+then reads the **implicated** on-disk transcripts, bounded to the N most
+recent sessions (default N=8) — so its cost stays close to skill-synthesis's,
+not a full-history scan. If a step is unavailable on the non-interactive cron
+fire (missing vault grant, PII scan fail-closed), it degrades gracefully and
+skips the candidate rather than card-spamming an empty topic.
+
 ## Comparison with Claude Code's native scheduling
 
 | | Switchroom (in-agent scheduler) | Claude Code CronCreate | Claude Code Desktop |
