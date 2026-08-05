@@ -117,11 +117,15 @@ export function buildReviewPrompt(signals: LearningSignal[]): string {
   lines.push(
     "  5. If this was an operator CORRECTION tied to a skill you own, turn " +
       "it into a regression test: run `switchroom self-improve add-eval-case " +
-      "--skill <slug> --prompt \"<the correction framed as a test prompt>\"`. " +
-      "This proposes the case as a one-tap card; the operator's tap runs a " +
-      "deterministic applier that writes it (PII/secret-scanned). Do NOT " +
-      "Write or Edit evals/evals.json yourself — a direct write is blocked, " +
-      "bypasses the scan, and skips the operator's approval.",
+      "--skill <slug> --chat <operator chat id> " +
+      "--prompt \"<the correction framed as a test prompt>\"`. The `--chat` " +
+      "flag is REQUIRED — pass the real operator chat id from this session's " +
+      "context (the chat the correction arrived in), NOT the review turn's " +
+      "own placeholder chat id, or the command is rejected. This proposes " +
+      "the case as a one-tap card; the operator's tap runs a deterministic " +
+      "applier that writes it (PII/secret-scanned). Do NOT Write or Edit " +
+      "evals/evals.json yourself — a direct write is blocked, bypasses the " +
+      "scan, and skips the operator's approval.",
   );
   lines.push("");
   lines.push(

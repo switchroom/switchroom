@@ -35,6 +35,10 @@ function gatewaySocketPath(): string {
   );
 }
 
+/** Allowed proposal-provenance values (mirrors `ProposalOrigin`). */
+const ALLOWED_ORIGINS = ["skill-synthesis", "failure-synthesis"] as const;
+type ProposalOrigin = (typeof ALLOWED_ORIGINS)[number];
+
 interface ProposeOpts {
   slug: string;
   lesson: string;
@@ -44,6 +48,7 @@ interface ProposeOpts {
   chat: string;
   thread?: string;
   agent?: string;
+  origin?: string;
 }
 
 function fail(msg: string, code = 1): never {
@@ -95,9 +100,23 @@ export function registerSelfImproveProposeSkillCommand(program: Command): void {
     .requiredOption("--chat <id>", "agent's own chat id to post the card to")
     .option("--thread <id>", "forum topic thread id")
     .option("--agent <name>", "agent name (defaults to $SWITCHROOM_AGENT_NAME)")
+    .option(
+      "--origin <origin>",
+      `proposal provenance (${ALLOWED_ORIGINS.join(" | ")}); absent ⇒ skill-synthesis`,
+    )
     .action((opts: ProposeOpts) => {
       const agent = opts.agent ?? process.env.SWITCHROOM_AGENT_NAME;
       if (!agent) fail("agent name required (--agent or $SWITCHROOM_AGENT_NAME)");
+
+      let origin: ProposalOrigin | undefined;
+      if (opts.origin != null) {
+        if (!ALLOWED_ORIGINS.includes(opts.origin as ProposalOrigin)) {
+          fail(
+            `--origin must be one of: ${ALLOWED_ORIGINS.join(", ")} (got "${opts.origin}")`,
+          );
+        }
+        origin = opts.origin as ProposalOrigin;
+      }
 
       let draft: Record<string, string>;
       try {
@@ -122,6 +141,7 @@ export function registerSelfImproveProposeSkillCommand(program: Command): void {
         evidence: opts.evidence ?? "",
         draft,
       };
+      if (origin != null) payload.origin = origin;
       if (opts.thread != null) {
         const n = Number.parseInt(opts.thread, 10);
         if (Number.isInteger(n)) payload.threadId = n;
