@@ -92,3 +92,33 @@ describe("reranker defaults survive a recreate with an empty hindsight.env", () 
     ]);
   });
 });
+
+/**
+ * The dead-letter auto-requeue safety net (#3795 / #3797) is OFF in the
+ * maintenance script's own defaults; it only runs on the fleet if the launcher
+ * PINS it onto the container env. This is the guard that it does — against the
+ * real derivation, on both GPU verdicts (it is unrelated to the GPU gate), with
+ * an empty `hindsight.env`. It goes red the instant the two pins are removed.
+ */
+const REQUEUE_ON = "SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS";
+const REQUEUE_MAX = "SWITCHROOM_HINDSIGHT_REQUEUE_MAX";
+
+describe("dead-letter requeue safety net is enabled on the launched container", () => {
+  it.each([true, false])(
+    "pins REQUEUE_DEAD_LETTERS=1 and REQUEUE_MAX=25 with nothing declared (gpu=%s)",
+    (gpu) => {
+      const env = envMap(gpu);
+      // ON, so the maintenance sidecar's Section-7 recovery sweep actually runs.
+      expect(env.get(REQUEUE_ON)).toBe("1");
+      // The exact bound the fleet runs — a drive-by retune has to come past this.
+      expect(env.get(REQUEUE_MAX)).toBe("25");
+    },
+  );
+
+  it("the pins survive a recreate — the next launch drops neither", () => {
+    const next = [...envMap(true)] as Array<[string, string]>;
+    const live = next.map(([k, v]) => `${k}=${v}`);
+    const dropped = diffDroppedHindsightEnv(live, next, []);
+    expect(dropped.some((d) => d.key === REQUEUE_ON || d.key === REQUEUE_MAX)).toBe(false);
+  });
+});
