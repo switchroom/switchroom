@@ -25,6 +25,17 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Switchroom self-improve PR4 (slice 4a) — per-turn correction tagging.
+# The self-improve Stop hook (a SEPARATE process — src/cli/self-improve-stop.ts)
+# drops SELF_IMPROVE_CORRECTION_PENDING_FILE into the shared agent state dir when
+# the deterministic gate fires on an operator-correction. This hook reads-and-
+# clears it and stamps SELF_IMPROVE_CORRECTION_TAG on that turn's retain so PR5's
+# failure-synthesis cron can recall correction turns cheaply. Both constants are
+# pinned to their TS source (src/memory/hindsight-retain-provenance.ts) by
+# tests/scaffold.retain-provenance.test.ts — they must not drift.
+SELF_IMPROVE_CORRECTION_PENDING_FILE = "self-improve-correction-pending"
+SELF_IMPROVE_CORRECTION_TAG = "self-improve:correction"
+
 from lib import watermark
 from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
@@ -36,6 +47,43 @@ from lib.content import (
 from lib.daemon import get_api_url
 from lib.pacing import inflight_lock
 from lib.state import increment_turn_count, track_retention
+
+
+def _self_improve_state_dir() -> str:
+    """State dir the self-improve Stop hook drops its correction sentinel into.
+
+    Mirrors ``resolveStateDir()`` in ``src/cli/self-improve-stop.ts``:
+    ``TELEGRAM_STATE_DIR`` when set, else ``~/.claude/channels/telegram``. Both
+    hooks run in the same agent process env, so they agree on this path.
+    """
+    env = os.environ.get("TELEGRAM_STATE_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".claude", "channels", "telegram")
+
+
+def read_and_clear_correction_pending(state_dir: str | None = None) -> list:
+    """Read-and-clear the per-turn operator-correction sentinel (PR4 slice 4a).
+
+    Returns ``[SELF_IMPROVE_CORRECTION_TAG]`` when the sentinel is present (and
+    REMOVES it, so exactly one retain carries the tag — read-once), else ``[]``.
+    Called from ``run_retain`` only (the live Stop-hook entry), NOT from the
+    network-free ``build_retain_payload`` seam, so backfill / reconcile /
+    subagent retains never consume a live turn's marker. Best-effort and NEVER
+    raises — a triage marker must not be able to fail a retain.
+    """
+    try:
+        d = state_dir if state_dir is not None else _self_improve_state_dir()
+        path = os.path.join(d, SELF_IMPROVE_CORRECTION_PENDING_FILE)
+        if not os.path.exists(path):
+            return []
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return [SELF_IMPROVE_CORRECTION_TAG]
+    except Exception:
+        return []
 
 
 def read_transcript(transcript_path: str, max_bytes: int | None = None) -> list:
@@ -254,6 +302,7 @@ def build_retain_payload(
     api_token,
     retain_full_window: bool = True,
     document_id=None,
+    extra_tags=None,
 ) -> dict | None:
     """Pure transcript → retain payload + deterministic id (switchroom #3244 §1.4).
 
@@ -322,6 +371,23 @@ def build_retain_payload(
             if lt not in merged:
                 merged.append(lt)
         tags = merged
+
+    # Switchroom self-improve PR4 (slice 4a) — per-turn correction tag. The
+    # caller (``run_retain``) reads-and-clears the operator-correction sentinel
+    # and threads the resulting tag(s) in here; this seam stays network-free and
+    # state-free (no sentinel IO), so it composes with lesson tags and rides the
+    # SAME payload the pending-retains queue persists. ``self-improve:correction``
+    # is STABLE by contract (it must NOT match DEFAULT_VOLATILE_SCOPE_PATTERNS),
+    # so on a correction turn the retain lands in its own
+    # ``[["self-improve:correction"]]`` consolidation scope — exactly the
+    # partition PR5's failure-synthesis cron works over. Absent ⇒ tag absent ⇒
+    # scope stays byte-identical to a normal turn's ``"shared"``.
+    if extra_tags:
+        merged = list(tags) if tags else []
+        for et in extra_tags:
+            if isinstance(et, str) and et and et not in merged:
+                merged.append(et)
+        tags = merged or None
 
     metadata = {
         "retained_at": template_vars["timestamp"],
@@ -564,6 +630,14 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
         # chunk 0 → plain session_id (backwards compatible with existing docs)
         document_id = session_id if chunk_index == 0 else f"{session_id}-c{chunk_index}"
 
+    # Switchroom self-improve PR4 (slice 4a) — read-and-clear the per-turn
+    # operator-correction sentinel here, in the live Stop path only, AFTER the
+    # throttle / re-fire / empty-transcript early-returns above so only a retain
+    # that actually FIRES consumes the marker (a throttled turn leaves it for the
+    # next firing retain, whose overlapping window still contains the correction).
+    # Read-once: the tag rides exactly one retain. Best-effort; never raises.
+    extra_tags = read_and_clear_correction_pending()
+
     # Build the payload via the shared, network-free seam (§1.4). This carries
     # the deterministic id, connection info, formatted transcript, tags and
     # metadata — sufficient to retry from a different process (drain_pending).
@@ -577,6 +651,7 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
         api_token=api_token,
         retain_full_window=retain_full_window,
         document_id=document_id,
+        extra_tags=extra_tags,
     )
     if built is None:
         debug_log(config, "Empty transcript after formatting, skipping retain")

@@ -10,6 +10,7 @@ import {
   writeReviewContext,
   reviewIsPending,
 } from "../src/self-improve/review-context.js";
+import { SELF_IMPROVE_CORRECTION_PENDING_FILE } from "../src/memory/hindsight-retain-provenance.js";
 
 // Drive the hook through `bun` against source (mirrors
 // tests/skill-validate-pretool.test.ts) so the test doesn't depend on
@@ -320,6 +321,86 @@ describe("self-improve-stop hook — fires the forked review on a real signal", 
       });
       expect(r.status).toBe(0);
       expect(reviewIsPending(stateDir)).toBe(false); // marker cleared — no leak
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// PR4 slice 4a: on an operator-correction trip the Stop hook drops a per-turn
+// sentinel into the state dir so the (separate-process) auto-retain hook can
+// tag that turn's retain `self-improve:correction`. The marker is written ONLY
+// for the operator-correction signal — never on other trips, never on a clean
+// turn — so a mutation that wrote it unconditionally would fail these.
+describe("self-improve-stop hook — operator-correction retain sentinel (slice 4a)", () => {
+  function sentinelPresent(stateDir: string): boolean {
+    return existsSync(join(stateDir, SELF_IMPROVE_CORRECTION_PENDING_FILE));
+  }
+
+  it("writes the correction sentinel when the gate trips on operator-correction", () => {
+    if (!bunOk) return;
+    const stateDir = mkdtempSync(join(tmpdir(), "self-improve-correction-"));
+    try {
+      const tp = writeTranscript("correction-trip.jsonl", [
+        { role: "user", text: "Send the digest." },
+        { role: "assistant", text: "Sent." },
+        { role: "user", text: "No, that's wrong — you included drafts again." },
+        { role: "assistant", text: "Fixed." },
+        { role: "user", text: "That's not what I asked, I told you to exclude drafts." },
+      ]);
+      const r = run(JSON.stringify({ session_id: "corr", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        TELEGRAM_STATE_DIR: stateDir,
+        SWITCHROOM_GATEWAY_SOCKET: join(stateDir, "no-server.sock"),
+      });
+      expect(r.status).toBe(0);
+      expect(sentinelPresent(stateDir)).toBe(true);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT write the sentinel on a non-correction trip (repeated-manual-fix only)", () => {
+    if (!bunOk) return;
+    const stateDir = mkdtempSync(join(tmpdir(), "self-improve-nocorr-"));
+    try {
+      // The same Bash remediation twice trips repeated-manual-fix WITHOUT any
+      // operator-correction pattern — so the correction sentinel must stay absent.
+      const cmd = "rm -f /tmp/stale.lock && systemctl restart worker";
+      const tp = writeToolTranscript("fix-only.jsonl", [
+        { role: "user", text: "It's stuck." },
+        { role: "assistant", tools: [{ name: "Bash", input: { command: cmd } }] },
+        { role: "user", text: "still stuck, retry." },
+        { role: "assistant", tools: [{ name: "Bash", input: { command: cmd } }] },
+      ]);
+      const r = run(JSON.stringify({ session_id: "fixonly", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        TELEGRAM_STATE_DIR: stateDir,
+        SWITCHROOM_GATEWAY_SOCKET: join(stateDir, "no-server.sock"),
+      });
+      expect(r.status).toBe(0);
+      expect(sentinelPresent(stateDir)).toBe(false);
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT write the sentinel on a clean turn (no signal)", () => {
+    if (!bunOk) return;
+    const stateDir = mkdtempSync(join(tmpdir(), "self-improve-clean-"));
+    try {
+      const tp = writeTranscript("clean-nocorr.jsonl", [
+        { role: "user", text: "Summarise the logs." },
+        { role: "assistant", text: "Done — all green." },
+        { role: "user", text: "Thanks!" },
+      ]);
+      const r = run(JSON.stringify({ session_id: "clean", transcript_path: tp }), {
+        SWITCHROOM_AGENT_NAME: "test-agent",
+        TELEGRAM_STATE_DIR: stateDir,
+        SWITCHROOM_GATEWAY_SOCKET: join(stateDir, "no-server.sock"),
+      });
+      expect(r.status).toBe(0);
+      expect(sentinelPresent(stateDir)).toBe(false);
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }

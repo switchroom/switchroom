@@ -64,6 +64,9 @@
  * {@link RETAIN_PROVENANCE_TAG_SCOPE_PATTERN} pins the two halves together.
  */
 
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 /**
  * The provenance tag stamped on every auto-retained transcript slice.
  *
@@ -97,3 +100,83 @@ export const RETAIN_TAGS_DEFAULT: readonly string[] = Object.freeze([
   "{session_id}",
   RETAIN_PROVENANCE_TAG,
 ]);
+
+// ---------------------------------------------------------------------------
+// self-improve correction tag (PR4 — slice 4a)
+// ---------------------------------------------------------------------------
+
+/**
+ * The tag stamped on a turn's auto-retain when the deterministic self-improve
+ * gate (`src/self-improve/gate.ts`) fired on an `operator-correction` signal.
+ * PR5's failure-synthesis cron recalls correction turns cheaply by filtering on
+ * it (metadata is not filterable, tags are — same rationale as
+ * {@link RETAIN_PROVENANCE_TAG}).
+ *
+ * `<kind>:<name>` per the docs' tag-naming conventions.
+ *
+ * ## STABLE, by contract — and deliberately NOT excluded from the scope
+ *
+ * Unlike {@link RETAIN_PROVENANCE_TAG} (stamped on EVERY retain, hence forced
+ * volatile so it never re-partitions the whole bank), this tag rides only the
+ * rare correction turns. It MUST NOT match `^source:` — or any entry of the
+ * vendored `DEFAULT_VOLATILE_SCOPE_PATTERNS` — so it stays STABLE and the
+ * correction turns it marks consolidate together in their own
+ * `[["self-improve:correction"]]` scope, which is exactly the partition PR5
+ * synthesises over. Because the tag is absent on every non-correction turn, the
+ * bank-wide `"shared"` scope those turns compute is byte-identical to before
+ * this shipped — the all-volatile → `"shared"` invariant is untouched.
+ *
+ * Pinned to the vendored retain hook's copy (`SELF_IMPROVE_CORRECTION_TAG` in
+ * `vendor/hindsight-memory/scripts/retain.py`) by
+ * `tests/scaffold.retain-provenance.test.ts`.
+ */
+export const SELF_IMPROVE_CORRECTION_TAG = "self-improve:correction";
+
+/**
+ * Per-turn sentinel filename the self-improve Stop hook drops into the agent
+ * state dir when the gate fires on an `operator-correction`. The auto-retain
+ * hook (a SEPARATE process — `retain.py`) reads-and-clears it and, when present,
+ * adds {@link SELF_IMPROVE_CORRECTION_TAG} to that retain's tag set. The Stop
+ * hook and the retain hook cannot share env, so this file in the shared state
+ * dir is the seam between them.
+ *
+ * Pinned to `SELF_IMPROVE_CORRECTION_PENDING_FILE` in
+ * `vendor/hindsight-memory/scripts/retain.py` by
+ * `tests/scaffold.retain-provenance.test.ts`.
+ */
+export const SELF_IMPROVE_CORRECTION_PENDING_FILE = "self-improve-correction-pending";
+
+function correctionPendingPath(stateDir: string): string {
+  return join(stateDir, SELF_IMPROVE_CORRECTION_PENDING_FILE);
+}
+
+/**
+ * Drop the per-turn correction sentinel. Called by the self-improve Stop hook
+ * at gate-trip time (operator-correction signal only). Best-effort — a marker
+ * write must never fail the turn (the Stop hook is fail-open); worst case the
+ * next retain simply carries no correction tag.
+ */
+export function writeCorrectionPending(stateDir: string): void {
+  if (!existsSync(stateDir)) {
+    mkdirSync(stateDir, { recursive: true, mode: 0o755 });
+  }
+  // Content is immaterial — presence is the whole signal. A stamp aids forensics.
+  writeFileSync(correctionPendingPath(stateDir), new Date().toISOString(), "utf-8");
+}
+
+/**
+ * Read-once: true iff the sentinel is present, clearing it as a side effect so
+ * exactly one retain carries the tag. The production reader is the Python
+ * `retain.py`; this mirrors the contract in TS for symmetry and unit tests.
+ * Best-effort; never throws.
+ */
+export function readAndClearCorrectionPending(stateDir: string): boolean {
+  const p = correctionPendingPath(stateDir);
+  if (!existsSync(p)) return false;
+  try {
+    rmSync(p, { force: true });
+  } catch {
+    /* nothing to do */
+  }
+  return true;
+}
