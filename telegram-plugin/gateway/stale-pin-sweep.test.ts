@@ -22,7 +22,6 @@ import {
   createStalePinSweeper,
   isNothingToUnpinError,
   isPeerFloodError,
-  isPinRightsError,
   mayUnpinAllForumTopic,
   retryAfterSeconds,
   unexpiredStoreRepinIds,
@@ -38,6 +37,10 @@ import {
   type SweepCursor,
   type SweepStoreFsSeam,
 } from './stale-pin-sweep-store.js'
+// The sweep now imports its rights detector from the single source of truth
+// (status-pin.ts) — no second copy. The negative cache it shares with the live
+// pin path is that module's `PinRightsCache` (D3).
+import { isPinRightsError, PinRightsCache } from '../status-pin.js'
 
 // Synthetic ids (check-no-pii-secrets): DMs positive, groups negative.
 const DM = '900000001'
@@ -84,7 +87,10 @@ interface FakeOpts {
    * call-counted `popped` and an observation-counted `popped` disagree.
    */
   unpinAllTopicRemoves?: number[]
-  canPin?: boolean
+  /** Errors to throw from `unpinChatMessage`, consumed in order (null = normal).
+   *  The sweep classifies pin rights REACTIVELY from a real Telegram 400 here —
+   *  there is no proactive precheck to model. */
+  unpinErrors?: (unknown | null)[]
   /** Throws from `getChat`, consumed in order (null = normal read). */
   getChatErrors?: (unknown | null)[]
 }
@@ -93,6 +99,7 @@ function fakeChat(o: FakeOpts) {
   const stack = [...o.stack]
   const calls: string[] = []
   const pinErrors = [...(o.pinErrors ?? [])]
+  const unpinErrors = [...(o.unpinErrors ?? [])]
   const unpinAllErrors = [...(o.unpinAllErrors ?? [])]
   const getChatErrors = [...(o.getChatErrors ?? [])]
   return {
@@ -115,6 +122,10 @@ function fakeChat(o: FakeOpts) {
     },
     unpin: async (_chatId: string, messageId: number) => {
       calls.push(`unpin:${messageId}`)
+      // A real Telegram rejection (e.g. `400 not enough rights`) is injected
+      // here so the sweep's REACTIVE rights classifier is what gets exercised.
+      const err = unpinErrors.shift()
+      if (err != null) throw err
       // ALWAYS resolves ok:true — the whole point.
       if (o.unpinIsSilentNoop === true) return { ok: true }
       const at = stack.indexOf(messageId)
@@ -134,10 +145,6 @@ function fakeChat(o: FakeOpts) {
         }
       }
       return { ok: true }
-    },
-    canPinInChat: async () => {
-      calls.push('getChatMember')
-      return o.canPin !== false
     },
   }
 }
@@ -165,6 +172,9 @@ function harness(
     allowUnpinAllForumTopic?: boolean
     /** Ids the gateway is on record as having pinned (the group drain's list). */
     recordedPinIds?: number[]
+    /** D3: shared per-process pin-rights negative cache seam. */
+    rightsBlocked?: (chatId: string) => boolean
+    recordRightsBlock?: (chatId: string) => void
   },
 ): Harness {
   const fake = fakeChat(o)
@@ -183,10 +193,11 @@ function harness(
     pinSilent: costed(fake.pinSilent),
     unpin: costed(fake.unpin),
     unpinAllForumTopicMessages: costed(fake.unpinAllForumTopicMessages),
-    canPinInChat: costed(fake.canPinInChat),
     protectedMessageIds: () => o.protectedMessageIds ?? [],
     recordedPinIds: () => o.recordedPinIds ?? [],
     eligible: () => o.eligible !== false,
+    rightsBlocked: o.rightsBlocked,
+    recordRightsBlock: o.recordRightsBlock,
     sleep: async (ms) => {
       sleeps.push(ms)
       if (o.clockAdvances !== false) clock += ms
@@ -552,8 +563,22 @@ describe('stale-pin sweep — forum topics', () => {
 // ─── group safety: rights + service-message spam ─────────────────────────────
 
 describe('stale-pin sweep — group safety', () => {
-  it('skips a group without pin rights WITHOUT writing anything', async () => {
-    const h = harness({ stack: [151, 152], canPin: false })
+  // The honest Telegram rejection a rights-less bot gets from EVERY pin verb.
+  const RIGHTS_400 = {
+    error_code: 400,
+    description: 'Bad Request: not enough rights to manage pinned messages in the chat',
+  }
+
+  it('ATTEMPTS the drain (no proactive precheck) and classifies a real 400 as rights', async () => {
+    // The pre-fix bug: a proactive getChatMember precheck against the wrapped
+    // (botInfo-less) bot always returned false, so a group forfeited WITHOUT a
+    // single unpin ever going out. The sweep must instead ATTEMPT the unpin and
+    // read Telegram's honest 400 — so `unpin:151` MUST appear in the call log.
+    const h = harness({
+      stack: [151, 152],
+      recordedPinIds: [151],
+      unpinErrors: [RIGHTS_400],
+    })
     const res = await createStalePinSweeper(h.deps).sweepTarget({
       chatId: GROUP,
       threadId: 5,
@@ -561,22 +586,31 @@ describe('stale-pin sweep — group safety', () => {
     })
 
     expect(res.status).toBe('skipped-no-rights')
-    expect(h.fake.calls).toEqual(['getChatMember']) // the precheck and nothing else
-    expect(h.fake.stack).toEqual([151, 152])
+    expect(h.fake.calls).toContain('unpin:151') // the drain was ATTEMPTED
+    expect(h.fake.stack).toEqual([151, 152]) // the rejected unpin popped nothing
   })
 
-  it('treats a throwing rights check as "no rights"', async () => {
-    const h = harness({ stack: [161] })
-    h.deps.canPinInChat = async () => {
-      throw new Error('Bad Request: chat not found')
+  it('increments attempts and eventually FORFEITS a rights-less group via the reactive path (no infinite retry)', async () => {
+    const fs = memFs()
+    const path = '/state/stale-pin-sweep.json'
+    // Every boot: a fresh process attempts the recorded unpin, Telegram answers
+    // 400 not enough rights, the sweep records skipped-no-rights and bumps
+    // attempts. After SWEEP_MAX_ATTEMPTS boots the cursor forfeits and stops
+    // re-burning the pin-op budget — the bounded reactive path, no precheck.
+    let last = ''
+    for (let boot = 0; boot < SWEEP_MAX_ATTEMPTS + 1; boot++) {
+      const chat = fakeChat({ stack: [161], unpinErrors: [RIGHTS_400] })
+      const res = await sweeperOver(fs, path, chat, { recordedPinIds: [161] }).sweepTarget({
+        chatId: GROUP,
+      })
+      last = res.status
     }
-    const res = await createStalePinSweeper(h.deps).sweepTarget({
-      chatId: GROUP,
-      threadId: 5,
-      isForum: true,
-    })
-    expect(res.status).toBe('skipped-no-rights')
-    expect(h.fake.calls).toEqual([])
+    // The final boot is past the attempt budget: it forfeits instead of
+    // attempting yet another doomed unpin.
+    expect(last).toBe('forfeited')
+    const cursor = loadSweepCursors(path, fs).find((c) => c.chatId === GROUP)
+    expect(cursor?.attempts).toBe(SWEEP_MAX_ATTEMPTS)
+    expect(cursor?.done).toBe(false)
   })
 
   it('NEVER pins in a group — a pin is the only op that emits a service message', async () => {
@@ -623,10 +657,74 @@ describe('stale-pin sweep — group safety', () => {
     expect(h.cursors().find((c) => c.chatId === GROUP)?.done).toBe(false)
   })
 
-  it('runs a DM sweep with NO rights precheck (getChatMember is meaningless there)', async () => {
+  it('runs a DM sweep straight into a drain (no rights gating whatsoever)', async () => {
     const h = harness({ stack: [181] })
-    await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
+    // No proactive precheck anywhere: the DM goes straight to the repin+unpin
+    // drain and clears the orphan.
     expect(h.fake.calls).not.toContain('getChatMember')
+    expect(res.status).toBe('drained')
+    expect(h.fake.stack).toEqual([])
+  })
+})
+
+// ─── D3: shared per-process pin-rights negative cache ─────────────────────────
+
+describe('stale-pin sweep — shared PinRightsCache (D3)', () => {
+  const RIGHTS_400 = {
+    error_code: 400,
+    description: 'Bad Request: not enough rights to manage pinned messages in the chat',
+  }
+
+  it('SKIPS a group the live path already blocked, without issuing any unpin', async () => {
+    const cache = new PinRightsCache()
+    cache.block(GROUP) // the live status-pin path already proved this chat rights-less
+    const h = harness({
+      stack: [201],
+      recordedPinIds: [201],
+      rightsBlocked: (c) => cache.isBlocked(c),
+      recordRightsBlock: (c) => {
+        cache.block(c)
+      },
+    })
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: GROUP })
+
+    expect(res.status).toBe('skipped-no-rights')
+    // No doomed traffic: the shared cache short-circuited BEFORE any unpin.
+    expect(h.fake.calls.filter((c) => c.startsWith('unpin'))).toEqual([])
+  })
+
+  it('FEEDS the cache from its own reactive rights discovery so the live path skips too', async () => {
+    const cache = new PinRightsCache()
+    const h = harness({
+      stack: [202],
+      recordedPinIds: [202],
+      unpinErrors: [RIGHTS_400],
+      rightsBlocked: (c) => cache.isBlocked(c),
+      recordRightsBlock: (c) => {
+        cache.block(c)
+      },
+    })
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: GROUP })
+
+    expect(res.status).toBe('skipped-no-rights')
+    expect(h.fake.calls).toContain('unpin:202') // it ATTEMPTED before classifying
+    expect(cache.isBlocked(GROUP)).toBe(true) // and recorded the block for the live path
+  })
+
+  it('does NOT skip a DM even when its chat id is in the cache (DMs are never rights-gated)', async () => {
+    const cache = new PinRightsCache()
+    cache.block(DM)
+    const h = harness({
+      stack: [203],
+      rightsBlocked: (c) => cache.isBlocked(c),
+      recordRightsBlock: (c) => {
+        cache.block(c)
+      },
+    })
+    const res = await createStalePinSweeper(h.deps).sweepTarget({ chatId: DM })
+    expect(res.status).toBe('drained')
+    expect(h.fake.stack).toEqual([])
   })
 })
 
@@ -945,7 +1043,6 @@ function sweeperOver(
     pinSilent: fake.pinSilent,
     unpin: fake.unpin,
     unpinAllForumTopicMessages: fake.unpinAllForumTopicMessages,
-    canPinInChat: fake.canPinInChat,
     protectedMessageIds: () => [],
     recordedPinIds: () => opts.recordedPinIds ?? [],
     eligible: () => true,
@@ -1045,7 +1142,7 @@ describe('stale-pin sweep — re-drain after the boot-seed prune (#3953)', () =>
     const path = '/state/stale-pin-sweep.json'
 
     // Session 1: the one recorded orphan is reaped, obligation discharged.
-    const s1 = await sweeperOver(fs, path, fakeChat({ stack: [77], canPin: true }), {
+    const s1 = await sweeperOver(fs, path, fakeChat({ stack: [77] }), {
       recordedPinIds: [77],
     }).sweepTarget({ chatId: GROUP })
     expect(s1.status).toBe('drained')

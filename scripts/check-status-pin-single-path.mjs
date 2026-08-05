@@ -52,6 +52,19 @@
  *  6. single-wiring    Only one file outside the modules themselves may call
  *                      `runStatusPinReconcile(` / `executePinLeg(` — a second
  *                      composition is a second pin subsystem.
+ *  7. single-rights-detector  The pin-rights error class has ONE definition
+ *                      (`isPinRightsError` in status-pin.ts). A SECOND exported
+ *                      `isPinRightsError` anywhere else is a forked detector that
+ *                      drifts — exactly the stale-pin-sweep duplicate this guard
+ *                      was extended after deleting. No marker escape. (Named
+ *                      folds with OTHER names that check "not enough rights" for
+ *                      their own purpose are deliberately untouched.)
+ *  8. sweep-no-getchatmember  A `getChatMember(` call inside the stale-pin-sweep
+ *                      files is banned: the sweep classifies rights REACTIVELY
+ *                      from a real Telegram 400. A proactive precheck wired
+ *                      against the chat-lock-wrapped (botInfo-less) bot silently
+ *                      forfeited every group cursor. `getChatMember` elsewhere
+ *                      (e.g. the reaction admin lookup) is fine. No marker escape.
  *
  * Markers
  * -------
@@ -232,6 +245,49 @@ export function findViolations({ path, source, allow }) {
           'bug. There is one wiring, in telegram-plugin/gateway/gateway.ts; use ' +
           'its `reconcileStatusPin(...)`. If a genuinely separate subsystem is ' +
           `intended, add the file under \`single-wiring\` in ${ALLOWLIST_PATH}.`,
+      })
+    }
+
+    // 7. single rights-detector — ONE `isPinRightsError` definition, in
+    //    status-pin.ts. A second EXPORTED definition anywhere else is a forked
+    //    detector that drifts (the deleted stale-pin-sweep copy). No escape.
+    if (
+      path !== DECISION &&
+      /\bexport\s+(?:async\s+)?(?:function|const|let|var)\s+isPinRightsError\b/.test(line)
+    ) {
+      out.push({
+        rule: 'single-rights-detector',
+        at,
+        line: line.trim(),
+        fix:
+          'The pin-rights error class has exactly ONE detector: ' +
+          '`isPinRightsError` in telegram-plugin/status-pin.ts. A second exported ' +
+          'copy is a fork that drifts from the source of truth (the reason the ' +
+          'stale-pin-sweep duplicate was deleted). Import it from ' +
+          "'../status-pin.js' instead of re-defining it. A fold with a DIFFERENT " +
+          'name for a different purpose is fine — only a second `isPinRightsError` ' +
+          'symbol is banned.',
+      })
+    }
+
+    // 8. no proactive getChatMember precheck in the stale-pin sweep — rights are
+    //    classified REACTIVELY from a real Telegram 400. A precheck against the
+    //    chat-lock-wrapped (botInfo-less) bot forfeited every group cursor
+    //    without a single unpin. getChatMember elsewhere is legitimate. No escape.
+    if (path.includes('stale-pin-sweep') && /\bgetChatMember\s*\(/.test(line)) {
+      out.push({
+        rule: 'sweep-no-getchatmember',
+        at,
+        line: line.trim(),
+        fix:
+          'The stale-pin sweep must NOT re-introduce a proactive getChatMember ' +
+          'rights precheck. It runs against the chat-lock-wrapped bot, which ' +
+          'carries only `.api` (no `.botInfo`), so a precheck always resolved to ' +
+          '"no rights" and forfeited every group cursor without ever attempting ' +
+          'an unpin. Rights are classified REACTIVELY: attempt the unpin and fold ' +
+          "Telegram's honest `400 not enough rights` via `isPinRightsError`. " +
+          '(getChatMember in non-sweep code — e.g. the reaction admin lookup — is ' +
+          'unaffected by this rule.)',
       })
     }
   }
