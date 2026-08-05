@@ -198,6 +198,58 @@ export function estimateChangedLines(
   return 0;
 }
 
+/**
+ * Estimate the on-disk byte size BEFORE and AFTER a Write/Edit/MultiEdit,
+ * and the net delta (after − before). This drives the T1 net-growth cap.
+ *
+ *   - before: the current file size from `statSync` (0 if the file is
+ *     absent — a brand-new file).
+ *   - after (Write): the new content's length.
+ *   - after (Edit): before − old_string.length + new_string.length.
+ *   - after (MultiEdit): before + Σ(new_string.length − old_string.length).
+ *
+ * Mirrors `estimateChangedLines`'s reading of the tool input. Skill
+ * bundles are text, so a string `.length` (UTF-16 code units) tracks the
+ * byte size closely enough for the cap's "is this growing a lot" purpose;
+ * `before` is real bytes from `statSync`. A negative/zero delta (shrink or
+ * size-neutral edit) is never blocked by the growth cap.
+ */
+export function estimateByteDelta(
+  toolName: string,
+  input: Record<string, unknown>,
+  filePath: string,
+): { before: number; after: number; delta: number } {
+  let before = 0;
+  try {
+    before = statSync(filePath).size;
+  } catch {
+    before = 0; // absent → brand-new file
+  }
+
+  let after = before;
+  if (toolName === "Write") {
+    const content = typeof input.content === "string" ? input.content : "";
+    after = content.length;
+  } else if (toolName === "Edit") {
+    const oldS = typeof input.old_string === "string" ? input.old_string : "";
+    const newS = typeof input.new_string === "string" ? input.new_string : "";
+    after = before - oldS.length + newS.length;
+  } else if (toolName === "MultiEdit") {
+    const edits = Array.isArray(input.edits) ? input.edits : [];
+    let net = 0;
+    for (const e of edits) {
+      if (!e || typeof e !== "object") continue;
+      const ed = e as Record<string, unknown>;
+      const oldS = typeof ed.old_string === "string" ? ed.old_string : "";
+      const newS = typeof ed.new_string === "string" ? ed.new_string : "";
+      net += newS.length - oldS.length;
+    }
+    after = before + net;
+  }
+
+  return { before, after, delta: after - before };
+}
+
 export type ApplyDecision =
   | {
       /** Allow the write to proceed (a verified T1). */
@@ -218,6 +270,11 @@ export type ApplyDecision =
       reason: string;
       /** A change candidate suitable for enqueuePending(). */
       candidate: ChangeCandidate;
+      /** Skill-file size (bytes) BEFORE the edit — for the proposal card.
+       *  Present on the net-growth-cap downgrade; omitted otherwise. */
+      bytesBefore?: number;
+      /** Projected skill-file size (bytes) AFTER the edit — for the card. */
+      bytesAfter?: number;
     };
 
 export interface DecideApplyParams {
@@ -327,6 +384,26 @@ export function decideApply(p: DecideApplyParams): ApplyDecision {
       downgradeTier: routed.tier === "T3" ? "T3" : "T2",
       reason: `not a T1 auto-apply: ${routed.reason}`,
       candidate: downgradeCandidate(target, owns, changedLines, lesson),
+    };
+  }
+
+  // (3b) net-growth cap — a T1-shaped edit that GROWS the owned skill by
+  //      more than the configured budget is NOT a silent T1. Byte-growth is
+  //      the axis a runaway self-edit loop bloats along, and the changed-
+  //      line cap doesn't catch a single very long line. Purely restrictive:
+  //      a shrink or size-neutral edit (delta ≤ 0) always falls through
+  //      untouched. The 2 MiB MAX_SKILL_BYTES ceiling (src/cli/skill-common.ts)
+  //      stays the OUTER wall; this is the INNER T1 cap.
+  const bytes = estimateByteDelta(p.toolName, p.input, p.filePath);
+  if (bytes.delta > cfg.t1MaxGrowthBytes) {
+    const over = bytes.delta - cfg.t1MaxGrowthBytes;
+    return {
+      action: "block",
+      downgradeTier: "T2",
+      reason: `T1 net-growth cap exceeded for "${target.slug}": +${bytes.delta} bytes (${bytes.before}→${bytes.after}) is ${over} over the ${cfg.t1MaxGrowthBytes}-byte budget — downgraded to a proposal`,
+      candidate: downgradeCandidate(target, owns, changedLines, lesson),
+      bytesBefore: bytes.before,
+      bytesAfter: bytes.after,
     };
   }
 

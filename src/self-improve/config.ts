@@ -26,6 +26,18 @@ export interface SelfImproveConfig {
    * is NOT a T1; it downgrades to a T2 proposal.
    */
   t1MaxChangedLines: number;
+  /**
+   * T1 auto-apply NET-GROWTH cap (bytes). A T1-shaped edit that GROWS an
+   * owned skill by more than this many bytes is NOT a silent T1; it
+   * downgrades to a T2 proposal. Byte-growth is the axis a runaway
+   * self-edit loop bloats along, and the changed-line cap doesn't catch a
+   * single very long line. Purely restrictive — a shrink or size-neutral
+   * edit (delta ≤ 0) is unaffected. `0` means "no growth allowed": ANY
+   * net-positive delta downgrades. This is the INNER T1 cap; the 2 MiB
+   * MAX_SKILL_BYTES hard ceiling (src/cli/skill-common.ts) remains the
+   * outer wall for every skill write.
+   */
+  t1MaxGrowthBytes: number;
   /** Max T1 auto-applies per agent per day. */
   maxAutoAppliesPerDay: number;
   /** Max outstanding (un-actioned) pending suggestions before we stop queueing. */
@@ -37,6 +49,7 @@ export interface SelfImproveConfig {
  * `clerk` without a rebuild:
  *   SWITCHROOM_SELF_IMPROVE_THRESHOLD
  *   SWITCHROOM_SELF_IMPROVE_T1_MAX_LINES
+ *   SWITCHROOM_SELF_IMPROVE_T1_MAX_GROWTH_BYTES
  *   SWITCHROOM_SELF_IMPROVE_MAX_AUTO_PER_DAY
  *   SWITCHROOM_SELF_IMPROVE_MAX_PENDING
  */
@@ -47,6 +60,11 @@ export function resolveSelfImproveConfig(): SelfImproveConfig {
       intEnv("SWITCHROOM_SELF_IMPROVE_THRESHOLD", 2),
     ),
     t1MaxChangedLines: intEnv("SWITCHROOM_SELF_IMPROVE_T1_MAX_LINES", 30),
+    // 0 = "no growth allowed" (intEnv accepts 0 as a valid override).
+    t1MaxGrowthBytes: intEnv(
+      "SWITCHROOM_SELF_IMPROVE_T1_MAX_GROWTH_BYTES",
+      4096,
+    ),
     maxAutoAppliesPerDay: intEnv("SWITCHROOM_SELF_IMPROVE_MAX_AUTO_PER_DAY", 3),
     maxOutstandingPending: intEnv("SWITCHROOM_SELF_IMPROVE_MAX_PENDING", 5),
   };

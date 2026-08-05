@@ -15,6 +15,7 @@ import {
   parseSkillTarget,
   ownsSkill,
   estimateChangedLines,
+  estimateByteDelta,
   benchmarkJsonForSkill,
   skillTargetEscapes,
 } from "../src/self-improve/apply-guard.js";
@@ -25,6 +26,7 @@ import type { SelfImproveConfig } from "../src/self-improve/config.js";
 const CFG: SelfImproveConfig = {
   repetitionThreshold: 2,
   t1MaxChangedLines: 30,
+  t1MaxGrowthBytes: 4096,
   maxAutoAppliesPerDay: 3,
   maxOutstandingPending: 5,
 };
@@ -318,5 +320,151 @@ describe("decideApply — the deterministic T1 gate", () => {
     });
     expect(d.action).toBe("block");
     if (d.action === "block") expect(d.reason).toMatch(/cap reached/i);
+  });
+});
+
+describe("estimateByteDelta", () => {
+  it("Write: before=0 for an absent file, after=content.length, delta=after", () => {
+    const abs = join(agentDir, "does-not-exist.md");
+    const content = "x".repeat(500);
+    const r = estimateByteDelta("Write", { content }, abs);
+    expect(r.before).toBe(0);
+    expect(r.after).toBe(500);
+    expect(r.delta).toBe(500);
+  });
+
+  it("Write: shrinking an existing file yields a negative delta", () => {
+    const abs = join(agentDir, "big.md");
+    writeFileSync(abs, "a".repeat(1000)); // 1000 bytes on disk
+    const r = estimateByteDelta("Write", { content: "a".repeat(100) }, abs);
+    expect(r.before).toBe(1000);
+    expect(r.after).toBe(100);
+    expect(r.delta).toBe(-900);
+  });
+
+  it("Edit: after = before - old_string.length + new_string.length", () => {
+    const abs = join(agentDir, "edit.md");
+    writeFileSync(abs, "a".repeat(200)); // before = 200
+    const r = estimateByteDelta(
+      "Edit",
+      { old_string: "a".repeat(10), new_string: "b".repeat(40) },
+      abs,
+    );
+    expect(r.before).toBe(200);
+    expect(r.after).toBe(200 - 10 + 40);
+    expect(r.delta).toBe(30);
+  });
+
+  it("MultiEdit: delta sums (new-old) across edits", () => {
+    const abs = join(agentDir, "multi.md");
+    writeFileSync(abs, "a".repeat(100)); // before = 100
+    const r = estimateByteDelta(
+      "MultiEdit",
+      {
+        edits: [
+          { old_string: "a", new_string: "aaaa" }, // +3
+          { old_string: "aa", new_string: "" }, // -2
+          { old_string: "", new_string: "aaaaa" }, // +5
+        ],
+      },
+      abs,
+    );
+    expect(r.before).toBe(100);
+    expect(r.delta).toBe(3 - 2 + 5);
+    expect(r.after).toBe(106);
+  });
+
+  it("unknown tool: delta is 0 (after == before)", () => {
+    const abs = join(agentDir, "known.md");
+    writeFileSync(abs, "abc");
+    const r = estimateByteDelta("Read", {}, abs);
+    expect(r.before).toBe(3);
+    expect(r.after).toBe(3);
+    expect(r.delta).toBe(0);
+  });
+});
+
+describe("apply-guard T1 net-growth cap", () => {
+  // A small growth budget so a modest edit trips the cap while staying
+  // well under the changed-line cap (proving the two caps are independent).
+  const TIGHT: SelfImproveConfig = { ...CFG, t1MaxGrowthBytes: 50 };
+
+  it("BLOCKS (T2) a net-growth edit over the byte budget, naming the bytes over", () => {
+    makeOwnedSkill(true);
+    writeBenchmark(1.0, 0.9);
+    // One long line: 200 chars → 1 changed line (under the 30-line cap) but
+    // +200 bytes on a new file → over the 50-byte growth budget by 150.
+    const content = "x".repeat(200);
+    const d = decideApply({
+      toolName: "Write",
+      input: { content },
+      filePath: skillFile(),
+      stateDir,
+      cfg: TIGHT,
+      now,
+    });
+    expect(d.action).toBe("block");
+    if (d.action === "block") {
+      expect(d.downgradeTier).toBe("T2");
+      expect(d.reason).toMatch(/net-growth cap/i);
+      // The named budget + the "over" amount must be in the reason.
+      expect(d.reason).toContain("50-byte budget");
+      expect(d.reason).toContain("150 over");
+      // Before/after byte counts ride on the decision for the proposal card.
+      expect(d.bytesBefore).toBe(0);
+      expect(d.bytesAfter).toBe(200);
+    }
+  });
+
+  it("does NOT apply the growth cap to a SHRINK — it falls through untouched", () => {
+    makeOwnedSkill(true);
+    writeBenchmark(1.0, 0.9);
+    // Existing large file; an Edit that replaces a big block with a small one
+    // is a net shrink → the growth cap must NOT be the reason it's blocked.
+    // With T1_LIVE unset it should reach the silent-apply backstop instead,
+    // proving the shrink passed the growth check rather than being caught by it.
+    const prev = process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+    try {
+      writeFileSync(skillFile(), "b".repeat(400)); // before = 400 bytes
+      const d = decideApply({
+        toolName: "Edit",
+        input: { old_string: "b".repeat(400), new_string: "b".repeat(10) },
+        filePath: skillFile(),
+        stateDir,
+        cfg: TIGHT, // tiny growth budget — a shrink must still pass it
+        now,
+      });
+      expect(d.action).toBe("block");
+      if (d.action === "block") {
+        expect(d.reason).not.toMatch(/net-growth cap/i);
+        expect(d.reason).toMatch(/silent auto-apply is disabled/i);
+        // No byte fields on a non-growth downgrade.
+        expect(d.bytesBefore).toBeUndefined();
+        expect(d.bytesAfter).toBeUndefined();
+      }
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE;
+      else process.env.SWITCHROOM_SELF_IMPROVE_T1_LIVE = prev;
+    }
+  });
+
+  it("t1MaxGrowthBytes:0 blocks ANY net-positive growth (no growth allowed)", () => {
+    makeOwnedSkill(true);
+    writeBenchmark(1.0, 0.9);
+    const ZERO: SelfImproveConfig = { ...CFG, t1MaxGrowthBytes: 0 };
+    const d = decideApply({
+      toolName: "Write",
+      input: { content: "tiny\n" }, // +5 bytes on a new file
+      filePath: skillFile(),
+      stateDir,
+      cfg: ZERO,
+      now,
+    });
+    expect(d.action).toBe("block");
+    if (d.action === "block") {
+      expect(d.reason).toMatch(/net-growth cap/i);
+      expect(d.reason).toContain("0-byte budget");
+    }
   });
 });

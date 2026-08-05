@@ -172,6 +172,10 @@ function main(): void {
       tier_reason: decision.reason,
       skill_slug: decision.candidate.skillSlug,
       triggered_by: (ctx.signals ?? []).map((s) => s.kind),
+      // Present only on the net-growth-cap downgrade; the one-tap card
+      // renders the before/after byte counts when they're set.
+      bytes_before: decision.bytesBefore,
+      bytes_after: decision.bytesAfter,
     });
     if (!q.ok) {
       // Queue full — the proposal is dropped; surface it rather than lose

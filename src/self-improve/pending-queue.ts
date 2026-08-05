@@ -52,6 +52,12 @@ export interface PendingSuggestion {
   skill_slug?: string;
   /** The signal kind(s) that triggered the review. */
   triggered_by: string[];
+  /** Skill-file size (bytes) BEFORE the proposed edit. Present when the
+   *  downgrade was the T1 net-growth cap — lets the one-tap card show the
+   *  before/after byte counts. Omitted for other downgrade reasons. */
+  bytes_before?: number;
+  /** Projected skill-file size (bytes) AFTER the proposed edit. */
+  bytes_after?: number;
   /** Set true once the operator actions it (reserved for a later slice). */
   actioned?: boolean;
 }

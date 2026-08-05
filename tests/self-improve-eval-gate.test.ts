@@ -14,6 +14,7 @@ import {
 const cfg = {
   repetitionThreshold: 2,
   t1MaxChangedLines: 30,
+  t1MaxGrowthBytes: 4096,
   maxAutoAppliesPerDay: 3,
   maxOutstandingPending: 5,
 };
