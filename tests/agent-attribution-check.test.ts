@@ -252,6 +252,117 @@ describe("check-agent-attribution-trailers — green on everything it must not b
   });
 });
 
+describe("check-agent-attribution-trailers — robust to GitHub squash reparagraphing", () => {
+  // GitHub's squash-merge collects `Co-authored-by:` trailers and re-emits
+  // them as a separate final paragraph, split by a blank line from the
+  // `Switchroom-*` trailers the source commit carried. See #4381's squash
+  // bb793cb. Reading only the final paragraph misses the attribution.
+  const SQUASH_LAYOUT = [
+    "feat(x): work that got squashed",
+    "",
+    "Closes #4379",
+    "",
+    "Switchroom-Agent: klanker",
+    "Switchroom-Model: claude-opus-4-8",
+    "",
+    "Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+  ].join("\n");
+
+  it("PASSES the GitHub-squash layout — Switchroom-* one paragraph above the Claude co-author", () => {
+    const f = makeFixture("attrchk-squash-pass-");
+    f.commit(SQUASH_LAYOUT);
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("check-agent-attribution-trailers: OK");
+  });
+
+  it("STILL FAILS a genuinely unattributed squash — Claude co-author, no Switchroom-* anywhere", () => {
+    // Nothing to fold: the fix only surfaces attribution that genuinely
+    // exists in an adjacent trailer-only paragraph. A bypassed hook that left
+    // only the Claude co-author still reds, exactly as before.
+    const f = makeFixture("attrchk-squash-fail-");
+    f.commit(
+      [
+        "feat(x): the hook did not run, then got squashed",
+        "",
+        "Closes #4379",
+        "",
+        "Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+      ].join("\n"),
+    );
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("missing `Switchroom-Agent:` trailer");
+    expect(r.out).toContain("missing `Switchroom-Model:` trailer");
+  });
+
+  it("PASSES a human squash — non-Claude co-author, no Switchroom-* — is never machine-authored", () => {
+    const f = makeFixture("attrchk-squash-human-");
+    f.commit(
+      [
+        "fix: human work that got squashed",
+        "",
+        "Closes #4379",
+        "",
+        "Co-authored-by: Some Human <human@example.test>",
+      ].join("\n"),
+    );
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+  });
+
+  it("FAILS when a prose separator isolates the Switchroom-* trailers from the Claude co-author", () => {
+    // A `---------` (or any prose line) between the two trailer paragraphs is
+    // NOT what GitHub's squash normaliser produces — it comes from a PR body
+    // bleeding into the trailers. Folding deliberately stops at prose, so the
+    // Switchroom-* block is isolated and the commit reads as machine-authored
+    // (Claude co-author in the final block) but unattributed. This preserves
+    // the original "a stray prose line means the hook block was disrupted"
+    // detection. Decision recorded in the PR body.
+    const f = makeFixture("attrchk-squash-prose-");
+    f.commit(
+      [
+        "feat(x): prose separator between trailer paragraphs",
+        "",
+        "Switchroom-Agent: klanker",
+        "Switchroom-Model: claude-opus-4-8",
+        "",
+        "---------",
+        "",
+        "Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+      ].join("\n"),
+    );
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("missing `Switchroom-Agent:` trailer");
+    expect(r.out).toContain("missing `Switchroom-Model:` trailer");
+  });
+
+  it("folds across MORE than two consecutive trailer-only paragraphs", () => {
+    // Defensive: the run of trailer-only paragraphs is treated as one block
+    // however many deep, stopping only at the subject prose.
+    const f = makeFixture("attrchk-squash-multi-");
+    f.commit(
+      [
+        "feat(x): deeply reparagraphed",
+        "",
+        "Switchroom-Agent: klanker",
+        "",
+        "Switchroom-Model: claude-opus-4-8",
+        "",
+        "Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+      ].join("\n"),
+    );
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+  });
+});
+
 describe("check-agent-attribution-trailers — wiring", () => {
   it("is part of `npm run lint`", () => {
     const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf-8"));
