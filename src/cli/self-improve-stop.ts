@@ -41,6 +41,7 @@ import {
   writeReviewContext,
   clearReviewContext,
 } from "../self-improve/review-context.js";
+import { sweepEvalIntegrity } from "../self-improve/eval-cases.js";
 import type { TurnMessage } from "../self-improve/types.js";
 
 /** Newest-last window of messages to scan. Bounds the gate's cost and
@@ -249,9 +250,29 @@ function injectReview(agentName: string, text: string, sessionId: string): void 
   sock.on("error", () => done());
 }
 
+/** Agent skills root — where owned skill bundles (and their evals) live. */
+function resolveSkillsRoot(): string {
+  return join(homedir(), ".claude", "skills");
+}
+
 function main(): void {
   // Opt-out kill switch (RFC: ships on by default, per-agent disable).
   if (!selfImproveEnabled()) process.exit(0);
+
+  // Eval-integrity sweep (RFC amendment §"corrections as eval cases", MJ1).
+  // Runs EVERY turn, before anything transcript-dependent: adopt a first-sight
+  // evals.json as the sanctioned baseline ONLY if it passes the fail-closed
+  // PII/secret scan (MAJOR 2 — un-sanctioned bytes from a Bash write are
+  // quarantined, never silently trusted), and REVERT any out-of-band drift
+  // from the baseline snapshot. Tamper-EVIDENT + self-healing, NOT a
+  // cryptographic boundary — the hard backstop is the T1-live gate (default
+  // OFF). Best-effort and never throws; the Stop hook is fail-open. Cheap when
+  // no skill ships evals (a single readdir that finds nothing).
+  try {
+    sweepEvalIntegrity(resolveSkillsRoot(), resolveStateDir());
+  } catch {
+    /* fail-open: a sweep error must never fail the turn */
+  }
 
   const raw = readStdin().trim();
   if (!raw) process.exit(0);

@@ -14,7 +14,7 @@
     "telegram-plugin/gateway/agent-button-callback-handler.ts": 5,
     "telegram-plugin/gateway/approval-callback.ts": 7,
     "telegram-plugin/gateway/ask-callback-handler.ts": 5,
-    "telegram-plugin/gateway/callback-query-handlers.ts": 86,
+    "telegram-plugin/gateway/callback-query-handlers.ts": 95,
     "telegram-plugin/gateway/folder-picker-handler.ts": 11,
     "telegram-plugin/gateway/gateway.ts": 34,
     "telegram-plugin/gateway/voice-ondemand-callback-handler.ts": 4
