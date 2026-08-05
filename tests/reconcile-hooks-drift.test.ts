@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { buildSettingsHooksBlock, detectHooksDrift } from "../src/agents/scaffold.js";
 import type { AgentConfig, SwitchroomConfig } from "../src/config/schema.js";
@@ -37,6 +39,80 @@ describe("buildSettingsHooksBlock", () => {
     // Without telegram plugin: no PreToolUse or PostToolUse
     expect(result.PreToolUse).toBeUndefined();
     expect(result.PostToolUse).toBeUndefined();
+  });
+
+  it("wires the working-state-reload SessionStart hook scoped to matcher 'compact'", () => {
+    // The working-state file is re-injected into context after compaction via
+    // a SessionStart hook. matcher "compact" is load-bearing: it scopes the
+    // hook to compaction ONLY, so the file is NOT re-injected on every
+    // startup/resume/clear/fork boot. SessionStart stdout is added to the
+    // model's context by Claude Code (unlike PreCompact). Default for every
+    // agent — present with or without the telegram plugin.
+    for (const useSwitchroomPlugin of [false, true]) {
+      const result = buildSettingsHooksBlock({
+        agentName: "test-agent",
+        agentConfig: makeAgentConfig(),
+        hindsightEnabled: false,
+        useSwitchroomPlugin,
+      });
+      const sessionStart = (result.SessionStart ?? []) as Array<{
+        matcher?: string;
+        hooks: Array<{ command: string; timeout?: number }>;
+      }>;
+      const reloadEntry = sessionStart.find((e) =>
+        e.hooks.some((h) => h.command.includes("working-state-reload-hook.sh")),
+      );
+      expect(reloadEntry, `plugin=${useSwitchroomPlugin}`).toBeDefined();
+      // MUST carry matcher "compact" — a bare/absent matcher would fire on
+      // every SessionStart source and re-inject working state on every boot.
+      expect(reloadEntry?.matcher).toBe("compact");
+    }
+  });
+
+  it("emits the recovery block on source=compact even with NO working-state file", () => {
+    // The unconditional post-compaction recovery/orientation block is the
+    // load-bearing default: it must fire for EVERY agent, whether or not it
+    // maintains a working-state file. Invoke the real hook script with
+    // {"source":"compact"} on stdin and an empty state dir (no
+    // .working-state.md) and assert the <compact-recovery> delimiter is
+    // present on stdout.
+    const hookPath = fileURLToPath(
+      new URL("../bin/working-state-reload-hook.sh", import.meta.url),
+    );
+    const emptyStateDir = mkdtempSync(join(tmpdir(), "ws-recovery-"));
+    try {
+      const stdout = execFileSync("bash", [hookPath], {
+        input: '{"source":"compact"}',
+        encoding: "utf8",
+        env: { ...process.env, TELEGRAM_STATE_DIR: emptyStateDir },
+      });
+      // Recovery block emitted despite the absent working-state file.
+      expect(stdout).toContain("<compact-recovery");
+      // And no working-state append, since the file is absent.
+      expect(stdout).not.toContain("<working-state");
+    } finally {
+      rmSync(emptyStateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("emits NOTHING on a non-compact source (e.g. startup)", () => {
+    // The source guard scopes the hook to compaction only; a startup boot
+    // must be a silent no-op even when a working-state file exists.
+    const hookPath = fileURLToPath(
+      new URL("../bin/working-state-reload-hook.sh", import.meta.url),
+    );
+    const stateDir = mkdtempSync(join(tmpdir(), "ws-startup-"));
+    try {
+      writeFileSync(join(stateDir, ".working-state.md"), "should not appear\n");
+      const stdout = execFileSync("bash", [hookPath], {
+        input: '{"source":"startup"}',
+        encoding: "utf8",
+        env: { ...process.env, TELEGRAM_STATE_DIR: stateDir },
+      });
+      expect(stdout).toBe("");
+    } finally {
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 
   it("does NOT wire the retired user-profile-refresh Stop hook, even with hindsight enabled", () => {

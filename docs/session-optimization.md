@@ -87,8 +87,19 @@ Claude Code auto-compacts late in the context window (roughly 80–85% full — 
 - **Full compaction** produces a structured summary of intent, changes, and pending work.
 - **CLAUDE.md is sacred** — never compacted, always in the system prompt.
 - **Hindsight is the safety net** — anything compaction loses can be recalled from the memory bank.
+- **Post-compaction recovery** — every compaction re-seats a short recovery/orientation block into context the instant it fires, telling the model it is mid-conversation (not a fresh start) and pointing at the concrete recovery tools. An optional working-state file is appended on top of that. See below.
 
 On the 1M context window (Opus 4.8), most conversations never reach native auto-compaction in a single session.
+
+### Post-compaction recovery (`SessionStart` matcher `compact`)
+
+The native summarizer is good at intent/changes/pending work but it is lossy: it flattens the *fast-moving* scratch an agent is juggling mid-task (in-flight IDs, the exact "where was I", recent phrasing), and a model resuming from a summary can read it as a fresh start and re-greet the user. A default `SessionStart` hook closes that gap deterministically, in two layers:
+
+- **Unconditional recovery block (every agent).** On every compaction the hook emits a short, static `<compact-recovery>` block. It tells the model its context was just compacted mid-conversation — that this is a *continuing* conversation the user experiences as unbroken, that the native summary is lossy, and to not re-greet — then points at the concrete recovery tools in this environment: Telegram chat history via the `get_recent_messages` MCP tool (`mcp__switchroom-telegram__get_recent_messages`), Hindsight memory via `recall`/`reflect` (`mcp__hindsight__*`), and workspace files for durable task state. This fires for **every** agent, whether or not it maintains a working-state file.
+- **Optional working-state append.** An agent may maintain its own durable scratch of "what I'm mid-way through" at `$TELEGRAM_STATE_DIR/.working-state.md` (i.e. `<agentDir>/telegram/.working-state.md`). The agent writes it; nothing in switchroom creates it. When that file is present and non-empty, the hook appends it verbatim inside a `<working-state>` delimiter, with its last-modified time in the header line so a stale/forgotten file reads as stale rather than silently steering. When the file is absent or empty — the common case — only the recovery block is emitted.
+- **Mechanism.** `bin/working-state-reload-hook.sh` is wired into every agent's `.claude/settings.json` as a `SessionStart` hook with **matcher `compact`** (see `buildSettingsHooksBlock` in `src/agents/scaffold.ts`). Claude Code fires `SessionStart` with `source="compact"` on auto **or** manual compaction, mid-turn, right after the compaction boundary — and **SessionStart stdout is added to the model's context** (unlike `PreCompact` stdout, which is not injected). So the hook writes back into context the moment the summary replaces the transcript.
+- **Matcher `compact` is load-bearing.** A bare/matcher-less `SessionStart` also fires on `startup`/`resume`/`clear`/`fork`, which would inject the recovery block on every boot. The hook additionally re-checks the `source` field from its stdin as belt-and-braces against a matcher regression.
+- **Cheap and deterministic.** A heredoc string plus, at most, one `stat` and one `cat` of a small file: no network, no CLI, no heavy interpreter — sub-second by construction.
 
 ### Proactive compaction (`session.max_context_tokens`)
 
