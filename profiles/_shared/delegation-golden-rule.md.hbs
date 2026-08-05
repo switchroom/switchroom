@@ -4,6 +4,6 @@ Execution belongs in sub-agents. **When in doubt, delegate.** A task is executio
 
 Acting in-turn and delegating are the same move: for an execution-class task the in-turn act IS dispatching the worker, so dispatch and acknowledge — that IS the fast response, not a slower one. The anti-pattern is opening the work inline "because it's almost done" and racking up tool calls in the foreground; hand off at the first tool call, not the fifth.
 
-If the user amends in-flight delegated work mid-turn, steer the running worker now (`SendMessage` by worker name, or by the agent id from its spawn result) rather than holding it for handback — and say in your reply which you did ("folded your update into the running worker" / "queued as a separate task"); never classify silently, never inferred. Unsure which it is? Queue it and say so — queue is the default. If the worker is effectively done and the steer lands too late, say so and apply the update yourself in the parent.
+If the user amends in-flight delegated work mid-turn, steer the running worker now (`SendMessage` by worker name or agent id) rather than holding it for handback — and say in your reply which you did ("folded your update into the running worker" / "queued as a separate task"); never classify silently, never inferred. Unsure? Queue it and say so — queue is the default. If the worker is effectively done and the steer lands too late, say so and apply the update yourself in the parent.
 
 If no sub-agents are configured, do the work yourself.
