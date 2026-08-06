@@ -112,6 +112,9 @@ def _parse_iso(value) -> "datetime | None":
         return None
 
 
+PRIVACY_STATE_CORRUPT_KEY = "__corrupt__"
+
+
 def read_privacy_state(state_dir: str | None = None) -> list:
     """Read the shared /private-mode interval list (switchroom privacy PR1).
 
@@ -124,64 +127,137 @@ def read_privacy_state(state_dir: str | None = None) -> list:
             {"start": "<iso>", "end": null}       # the OPEN window = private NOW
         ]}
 
-    Returns the ``intervals`` list (list of ``{"start", "end"}`` dicts). A
-    missing / empty / corrupt file, or any read error, yields ``[]`` (the
-    default = fully public). Best-effort — NEVER raises: a privacy-state read
-    must not be able to fail a retain, and a failure toward "public" is caught
-    by the force-path exclusion and the open-interval early-skip having already
-    read a well-formed file when one exists.
+    Returns the ``intervals`` list (list of ``{"start", "end"}`` dicts).
+
+    ABSENT vs CORRUPT are deliberately DISTINCT (review MAJOR 1 —
+    defense-in-depth, independent of the gateway's write atomicity):
+
+    - A **missing** file, or a valid JSON object with no ``intervals`` key,
+      yields ``[]`` — the default = fully public.
+    - A file that **exists but cannot be parsed** (truncated mid-rewrite,
+      not-a-JSON-object, ``intervals`` not a list) must NOT collapse to the same
+      "public" ``[]`` — that would leak the just-completed private turn if a Stop
+      hook fired during a non-atomic rewrite. It returns a single CORRUPT
+      sentinel interval and logs loudly; downstream this fails TOWARD privacy
+      (``_has_open_interval`` → True, ``exclude_private_ranges`` → drop all).
+
+    Best-effort — NEVER raises: a privacy-state read must not be able to fail a
+    retain.
     """
     try:
         d = state_dir if state_dir is not None else _self_improve_state_dir()
         path = os.path.join(d, PRIVACY_STATE_FILE)
         if not os.path.isfile(path):
-            return []
+            return []  # absent = public (the default)
+    except Exception:
+        # Could not even resolve/stat the path — treat as absent (public).
+        return []
+    # The file EXISTS. From here a parse/read failure fails TOWARD privacy.
+    try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return []
+            raise ValueError("privacy-state.json is not a JSON object")
         intervals = data.get("intervals")
+        if intervals is None:
+            return []  # valid JSON, no intervals declared = public
         if not isinstance(intervals, list):
-            return []
+            raise ValueError("privacy-state.json .intervals is not a list")
         return [iv for iv in intervals if isinstance(iv, dict)]
-    except Exception:
-        return []
+    except Exception as e:
+        print(
+            f"[Hindsight] privacy-state.json present but unreadable ({e!r}); "
+            f"failing TOWARD privacy — treating this session as private-now",
+            file=sys.stderr,
+        )
+        return [{PRIVACY_STATE_CORRUPT_KEY: True}]
+
+
+def _classify_privacy_intervals(intervals: list) -> tuple:
+    """Parse raw intervals into ``(parsed, fail_private)`` — the single source of
+    truth both ``_has_open_interval`` and ``exclude_private_ranges`` use so they
+    can NEVER disagree on what "open" means (review MINOR).
+
+    - ``parsed``: list of ``(start_dt, end_dt_or_None)`` aware-datetime tuples;
+      ``end_dt is None`` means an OPEN ``[start, ∞)`` window.
+    - ``fail_private``: True when the state must be treated as private-now,
+      unbounded — a CORRUPT sentinel, or an interval whose ``start`` is present
+      but unparseable (we cannot place the window, so we refuse to un-redact).
+
+    A malformed (present-but-unparseable) ``end`` degrades to OPEN ``[start, ∞)``
+    in BOTH consumers — and is LOGGED, not silently applied. Best-effort; never
+    raises.
+    """
+    parsed = []
+    fail_private = False
+    for iv in intervals:
+        if not isinstance(iv, dict):
+            continue
+        if iv.get(PRIVACY_STATE_CORRUPT_KEY):
+            fail_private = True
+            continue
+        start_raw = iv.get("start")
+        start_dt = _parse_iso(start_raw)
+        if start_dt is None:
+            if start_raw is not None:
+                # Present but unparseable start: cannot place the window — fail
+                # toward privacy rather than silently ignoring a private range.
+                print(
+                    f"[Hindsight] privacy interval has unparseable start "
+                    f"{start_raw!r}; failing TOWARD privacy (private-now)",
+                    file=sys.stderr,
+                )
+                fail_private = True
+            continue  # start missing entirely = an empty entry, covers nothing
+        end_raw = iv.get("end")
+        if end_raw is None:
+            parsed.append((start_dt, None))
+            continue
+        end_dt = _parse_iso(end_raw)
+        if end_dt is None:
+            # Present but unparseable end: degrade to OPEN [start, ∞) AND surface
+            # it, so the guard and the redactor agree (no silent unbounded wipe).
+            print(
+                f"[Hindsight] privacy interval has unparseable end {end_raw!r}; "
+                f"treating as OPEN [start, ∞) — check the gateway writer",
+                file=sys.stderr,
+            )
+            parsed.append((start_dt, None))
+            continue
+        parsed.append((start_dt, end_dt))
+    return parsed, fail_private
 
 
 def _has_open_interval(intervals: list) -> bool:
-    """True when some interval is OPEN (``end`` is null) — i.e. private right now."""
-    for iv in intervals:
-        if isinstance(iv, dict) and iv.get("end") is None and iv.get("start"):
-            return True
-    return False
+    """True when the state is private-right-now: some OPEN ``[start, ∞)`` window,
+    OR a corrupt/unplaceable state that fails toward privacy. Shares the
+    classifier with ``exclude_private_ranges`` so the two never diverge."""
+    parsed, fail_private = _classify_privacy_intervals(intervals)
+    if fail_private:
+        return True
+    return any(end is None for _, end in parsed)
 
 
 def exclude_private_ranges(messages: list, intervals: list) -> list:
     """Drop any message whose ``timestamp`` falls inside a private interval.
 
     An interval ``{"start": s, "end": e}`` covers ``[s, e]`` (inclusive, toward
-    privacy); an OPEN interval (``end`` is null) covers ``[s, ∞)``. A message
-    whose ``timestamp`` is missing or unparseable is dropped ONLY when some
-    interval is open (conservative — we cannot place it, and private-now is
-    live), otherwise kept. Best-effort and total: unparseable interval bounds
-    are skipped, and the function never raises.
+    privacy); an OPEN interval (``end`` is null, or a malformed ``end``) covers
+    ``[s, ∞)``. A message whose ``timestamp`` is missing or unparseable is
+    dropped ONLY when some interval is open (conservative — we cannot place it,
+    and private-now is live), otherwise kept.
+
+    A CORRUPT state or an unplaceable ``start`` (``fail_private``) drops ALL
+    messages — failing toward privacy rather than leaking on a bad file.
+    Best-effort and total: the function never raises.
     """
     if not intervals:
         return list(messages)
 
-    parsed = []  # list of (start_dt, end_dt_or_None)
-    for iv in intervals:
-        if not isinstance(iv, dict):
-            continue
-        start_dt = _parse_iso(iv.get("start"))
-        if start_dt is None:
-            continue  # an interval with no usable start covers nothing
-        end_raw = iv.get("end")
-        end_dt = None if end_raw is None else _parse_iso(end_raw)
-        # A malformed (unparseable) closed end degrades to an OPEN interval —
-        # conservative toward privacy rather than silently un-redacting.
-        parsed.append((start_dt, end_dt))
-
+    parsed, fail_private = _classify_privacy_intervals(intervals)
+    if fail_private:
+        # Corrupt / unplaceable state: refuse to retain anything this pass.
+        return []
     if not parsed:
         return list(messages)
 
