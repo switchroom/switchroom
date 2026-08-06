@@ -356,11 +356,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     result = runs[-1]
     if args.runs > 1:
-        result["determinism"] = metrics.variance_report(runs)
-        result["determinism"]["budget"] = args.determinism_budget
-        result["determinism"]["within_budget"] = (
-            result["determinism"]["worst_spread"] <= args.determinism_budget
+        det = metrics.variance_report(runs)
+        det["budget"] = args.determinism_budget
+        # A report that compared nothing must not claim determinism. This is the
+        # AC3 analogue of the fail-open scorer: `worst_spread: 0.0` over an empty
+        # comparison set reads as "perfectly deterministic" and means "measured
+        # nothing".
+        det["within_budget"] = bool(det["measured"]) and (
+            det["worst_spread"] <= args.determinism_budget
         )
+        result["determinism"] = det
         # Label-free metrics have their own stability question: the keyword arm
         # returning rows for a query is the thing the headline metric counts, so
         # a run where that set moves is a run whose headline number moved.
@@ -390,12 +395,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(human_summary(result))
     if args.runs > 1:
         det = result["determinism"]
-        print(
-            f"\n  determinism over {det['runs']} runs: worst spread {det['worst_spread']:.6f} "
-            f"on {det['worst_metric']} (budget {args.determinism_budget})"
-        )
+        if not det["measured"]:
+            print(
+                f"\n  determinism over {det['runs']} runs: NOT MEASURED "
+                "(no comparable metrics across runs)"
+            )
+        else:
+            print(
+                f"\n  determinism over {det['runs']} runs: worst spread "
+                f"{det['worst_spread']:.6f} on {det['worst_metric']} "
+                f"across {det['metrics_compared']} metrics "
+                f"(budget {args.determinism_budget})"
+            )
         if not det["within_budget"]:
-            print("  determinism budget EXCEEDED", file=sys.stderr)
+            print("  determinism budget EXCEEDED or unmeasured", file=sys.stderr)
             return EXIT_REGRESSION
     # Across ALL runs, not just the one whose scores are reported: with
     # `--runs N` the reported block is the last run, and failures in an earlier

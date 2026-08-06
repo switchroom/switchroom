@@ -242,6 +242,21 @@ Spread is reported **absolute**, not relative: these metrics are bounded in
 [0, 1], and a relative spread explodes meaninglessly near zero. So
 `worst_spread` is directly comparable to the 0.01 budget.
 
+**A determinism report that compared nothing does not pass.** Graded metrics
+only exist once a qrels file is loaded, so on an unjudged run the graded series
+are all empty. A naive implementation would then take the max of an empty set,
+report `worst_spread: 0.0`, and read as *perfectly deterministic* while
+actually meaning *measured nothing* — the same fail-open shape this suite
+exists to catch in the scorer. The block therefore carries `measured` and
+`metrics_compared`, and `within_budget` requires `measured` to be true. When
+nothing was comparable, `worst_spread` is `null` and the summary prints
+`NOT MEASURED` rather than a number.
+
+That is also why variance covers **label-free series** — the keyword arm's
+zero-result rate, and each case's per-arm row counts normalised by that case's
+max across runs. Those exist without any judgements, so an unjudged run still
+yields a real, falsifiable determinism number instead of an empty one.
+
 Three things drive real nondeterminism, in descending order:
 
 1. **The bank keeps changing.** Live agents retain continuously, so the corpus

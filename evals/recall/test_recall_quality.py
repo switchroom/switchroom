@@ -236,6 +236,7 @@ class Variance(unittest.TestCase):
         run = {"stages": {"final": {"recall@10": 0.5}}}
         report = metrics.variance_report([run, run])
         self.assertEqual(report["worst_spread"], 0.0)
+        self.assertTrue(report["measured"])
 
     def test_spread_is_absolute_and_names_the_worst_metric(self):
         report = metrics.variance_report(
@@ -248,7 +249,53 @@ class Variance(unittest.TestCase):
         self.assertEqual(report["worst_metric"], "final/recall@10")
 
     def test_a_single_run_cannot_claim_determinism(self):
-        self.assertEqual(metrics.variance_report([{"stages": {}}])["runs"], 1)
+        report = metrics.variance_report([{"stages": {}}])
+        self.assertEqual(report["runs"], 1)
+        self.assertFalse(report["measured"])
+        self.assertIsNone(report["worst_spread"])
+
+    def test_comparing_nothing_is_not_perfect_determinism(self):
+        """The AC3 analogue of the fail-open scorer.
+
+        A run with no qrels has no graded metrics. If variance only ever looked
+        at those, it would report a spread of 0.0 and read as 'identical scores
+        across runs' while having compared nothing at all.
+        """
+        report = metrics.variance_report([{"stages": {}}, {"stages": {}}])
+        self.assertFalse(report["measured"])
+        self.assertEqual(report["metrics_compared"], 0)
+        self.assertIsNone(report["worst_spread"])
+
+    def test_label_free_runs_are_still_measured(self):
+        runs = [
+            {
+                "stages": {},
+                "keyword_arm_zero_result_rate": 0.10,
+                "keyword_arm_row_counts": {"q1@b": 300, "q2@b": 0},
+                "semantic_arm_row_counts": {"q1@b": 100, "q2@b": 100},
+            },
+            {
+                "stages": {},
+                "keyword_arm_zero_result_rate": 0.10,
+                "keyword_arm_row_counts": {"q1@b": 240, "q2@b": 0},
+                "semantic_arm_row_counts": {"q1@b": 100, "q2@b": 100},
+            },
+        ]
+        report = metrics.variance_report(runs)
+        self.assertTrue(report["measured"])
+        # 300 -> 240 is a 20% swing in the keyword arm's contribution to fusion,
+        # and it is invisible in every graded metric when nothing is judged.
+        self.assertAlmostEqual(report["worst_spread"], 0.2, places=6)
+        self.assertEqual(report["worst_metric"], "label_free/keyword_rows/q1@b")
+
+    def test_an_unmeasured_report_cannot_pass_the_budget(self):
+        args = runner.build_parser().parse_args(["run", "--banks", "b"])
+        det = metrics.variance_report([{"stages": {}}, {"stages": {}}])
+        within = bool(det["measured"]) and (
+            det["worst_spread"] is not None
+            and det["worst_spread"] <= args.determinism_budget
+        )
+        self.assertFalse(within)
 
 
 class ScoreBlock(unittest.TestCase):

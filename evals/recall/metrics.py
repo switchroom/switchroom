@@ -322,38 +322,100 @@ def compare(
 
 
 def variance_report(runs: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    """Run-to-run spread per (stage, metric), for #4479 AC3.
+    """Run-to-run spread per metric, for #4479 AC3.
 
     Reports the **absolute** spread (max - min) rather than a relative one:
     these metrics are already bounded in [0, 1], and a relative spread explodes
     meaninglessly when a metric sits near zero. ``worst_spread`` is therefore
     directly comparable to the 1 % (0.01) budget the AC states.
+
+    Two families are covered, and covering both is not optional:
+
+    * graded per-stage metrics, which exist only when a qrels file was supplied;
+    * **label-free** per-case retrieval stability, which always exists — the
+      normalised keyword- and semantic-arm row count for every case, plus the
+      keyword-arm zero-result rate.
+
+    Without the second family a run with no judgements would compare *nothing*
+    and report ``worst_spread: 0.0``, i.e. claim perfect determinism because it
+    measured none. ``metrics_compared`` is returned so that claim is always
+    checkable, and ``measured`` is False when it is zero.
     """
     if len(runs) < 2:
-        return {"runs": len(runs), "worst_spread": 0.0, "per_metric": {}}
-    per_metric: dict[str, dict[str, float]] = {}
+        return {
+            "runs": len(runs),
+            "worst_spread": None,
+            "worst_metric": None,
+            "metrics_compared": 0,
+            "measured": False,
+            "per_metric": {},
+        }
+
+    series: dict[str, list[float]] = {}
+
     stages = sorted({s for run in runs for s in (run.get("stages") or {})})
     for stage in stages:
-        metrics = sorted({m for run in runs for m in ((run.get("stages") or {}).get(stage) or {})})
-        for metric in metrics:
-            values = [
+        names = sorted({m for run in runs for m in ((run.get("stages") or {}).get(stage) or {})})
+        for metric in names:
+            if metric == "judged_cases":  # a count, not a [0,1] score
+                continue
+            series[f"{stage}/{metric}"] = [
                 v
                 for run in runs
                 if (v := ((run.get("stages") or {}).get(stage) or {}).get(metric)) is not None
             ]
+
+    series["label_free/keyword_arm_zero_result_rate"] = [
+        float(v)
+        for run in runs
+        if (v := run.get("keyword_arm_zero_result_rate")) is not None
+    ]
+
+    # Per-case arm row counts, normalised by that case's own maximum across the
+    # runs so the spread is comparable to the [0, 1] budget. A case whose
+    # keyword arm returns 300 rows in one run and 258 in the next is a 14 %
+    # swing in the input to fusion, and it is invisible in any graded metric
+    # when there are no judgements.
+    for arm_key, label in (
+        ("keyword_arm_row_counts", "keyword"),
+        ("semantic_arm_row_counts", "semantic"),
+    ):
+        cases = sorted({c for run in runs for c in (run.get(arm_key) or {})})
+        for case in cases:
+            values = [
+                float(v) for run in runs if (v := (run.get(arm_key) or {}).get(case)) is not None
+            ]
             if len(values) < 2:
                 continue
-            per_metric[f"{stage}/{metric}"] = {
-                "min": round(min(values), 6),
-                "max": round(max(values), 6),
-                "spread": round(max(values) - min(values), 6),
-            }
-    worst = max((v["spread"] for v in per_metric.values()), default=0.0)
+            scale = max(values) or 1.0
+            series[f"label_free/{label}_rows/{case}"] = [v / scale for v in values]
+
+    per_metric: dict[str, dict[str, float]] = {}
+    for name, values in series.items():
+        if len(values) < 2:
+            continue
+        per_metric[name] = {
+            "min": round(min(values), 6),
+            "max": round(max(values), 6),
+            "spread": round(max(values) - min(values), 6),
+        }
+
+    if not per_metric:
+        return {
+            "runs": len(runs),
+            "worst_spread": None,
+            "worst_metric": None,
+            "metrics_compared": 0,
+            "measured": False,
+            "per_metric": {},
+        }
+
+    worst_metric = max(per_metric, key=lambda m: per_metric[m]["spread"])
     return {
         "runs": len(runs),
-        "worst_spread": round(worst, 6),
-        "worst_metric": max(per_metric, key=lambda m: per_metric[m]["spread"], default=None)
-        if per_metric
-        else None,
+        "worst_spread": per_metric[worst_metric]["spread"],
+        "worst_metric": worst_metric,
+        "metrics_compared": len(per_metric),
+        "measured": True,
         "per_metric": per_metric,
     }
