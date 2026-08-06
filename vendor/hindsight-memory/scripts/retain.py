@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -86,6 +87,129 @@ def read_and_clear_correction_pending(state_dir: str | None = None) -> list:
         return []
 
 
+PRIVACY_STATE_FILE = "privacy-state.json"
+
+
+def _parse_iso(value) -> "datetime | None":
+    """Best-effort parse of an ISO-8601 timestamp to an aware ``datetime``.
+
+    Accepts the ``...Z`` (UTC) suffix the gateway writes and the offset forms
+    ``datetime.fromisoformat`` understands. Returns ``None`` on anything
+    unparseable — never raises. A naive result (no tz) is coerced to UTC so all
+    comparisons in ``exclude_private_ranges`` are between aware datetimes.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        s = value.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def read_privacy_state(state_dir: str | None = None) -> list:
+    """Read the shared /private-mode interval list (switchroom privacy PR1).
+
+    Contract with the Telegram gateway's ``/private`` / ``/public`` commands:
+    the gateway maintains ``${TELEGRAM_STATE_DIR}/privacy-state.json`` (same dir
+    fallback as ``_self_improve_state_dir``) shaped::
+
+        {"version": 1, "intervals": [
+            {"start": "<iso>", "end": "<iso>"},   # a closed private window
+            {"start": "<iso>", "end": null}       # the OPEN window = private NOW
+        ]}
+
+    Returns the ``intervals`` list (list of ``{"start", "end"}`` dicts). A
+    missing / empty / corrupt file, or any read error, yields ``[]`` (the
+    default = fully public). Best-effort — NEVER raises: a privacy-state read
+    must not be able to fail a retain, and a failure toward "public" is caught
+    by the force-path exclusion and the open-interval early-skip having already
+    read a well-formed file when one exists.
+    """
+    try:
+        d = state_dir if state_dir is not None else _self_improve_state_dir()
+        path = os.path.join(d, PRIVACY_STATE_FILE)
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return []
+        intervals = data.get("intervals")
+        if not isinstance(intervals, list):
+            return []
+        return [iv for iv in intervals if isinstance(iv, dict)]
+    except Exception:
+        return []
+
+
+def _has_open_interval(intervals: list) -> bool:
+    """True when some interval is OPEN (``end`` is null) — i.e. private right now."""
+    for iv in intervals:
+        if isinstance(iv, dict) and iv.get("end") is None and iv.get("start"):
+            return True
+    return False
+
+
+def exclude_private_ranges(messages: list, intervals: list) -> list:
+    """Drop any message whose ``timestamp`` falls inside a private interval.
+
+    An interval ``{"start": s, "end": e}`` covers ``[s, e]`` (inclusive, toward
+    privacy); an OPEN interval (``end`` is null) covers ``[s, ∞)``. A message
+    whose ``timestamp`` is missing or unparseable is dropped ONLY when some
+    interval is open (conservative — we cannot place it, and private-now is
+    live), otherwise kept. Best-effort and total: unparseable interval bounds
+    are skipped, and the function never raises.
+    """
+    if not intervals:
+        return list(messages)
+
+    parsed = []  # list of (start_dt, end_dt_or_None)
+    for iv in intervals:
+        if not isinstance(iv, dict):
+            continue
+        start_dt = _parse_iso(iv.get("start"))
+        if start_dt is None:
+            continue  # an interval with no usable start covers nothing
+        end_raw = iv.get("end")
+        end_dt = None if end_raw is None else _parse_iso(end_raw)
+        # A malformed (unparseable) closed end degrades to an OPEN interval —
+        # conservative toward privacy rather than silently un-redacting.
+        parsed.append((start_dt, end_dt))
+
+    if not parsed:
+        return list(messages)
+
+    any_open = any(end is None for _, end in parsed)
+
+    def _in_any_range(ts_dt) -> bool:
+        for start_dt, end_dt in parsed:
+            if ts_dt < start_dt:
+                continue
+            if end_dt is None or ts_dt <= end_dt:
+                return True
+        return False
+
+    kept = []
+    for m in messages:
+        ts_dt = _parse_iso(m.get("timestamp")) if isinstance(m, dict) else None
+        if ts_dt is None:
+            # No placeable timestamp: drop only if a private window is open now.
+            if any_open:
+                continue
+            kept.append(m)
+            continue
+        if _in_any_range(ts_dt):
+            continue
+        kept.append(m)
+    return kept
+
+
 def read_transcript(transcript_path: str, max_bytes: int | None = None) -> list:
     """Read a JSONL transcript file and return list of message dicts.
 
@@ -140,6 +264,15 @@ def read_transcript(transcript_path: str, max_bytes: int | None = None) -> list:
                             if uid is not None and "uuid" not in msg:
                                 msg = dict(msg)
                                 msg["uuid"] = uid
+                            # Surface the transcript-entry timestamp the same
+                            # way (nested format carries it on the OUTER entry).
+                            # The /private-mode redaction filters on it
+                            # (exclude_private_ranges); without surfacing it here
+                            # every message would look timestamp-less.
+                            ts = entry.get("timestamp")
+                            if ts is not None and "timestamp" not in msg:
+                                msg = dict(msg)
+                                msg["timestamp"] = ts
                             messages.append(msg)
                     # Flat format (testing / future compatibility)
                     elif "role" in entry and "content" in entry:
@@ -504,6 +637,17 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     ``lib/pending.py``). ``status="skipped"`` is the normal early-exit
     cases (auto-retain disabled, empty transcript, throttled chunk).
     """
+    # /private-mode enforcement (switchroom privacy PR1) — FIRST, before
+    # load_config(). An OPEN private interval means the operator is discussing
+    # confidential material right now, so a normal (non-forced) auto-retain must
+    # not fire at all. Placed above load_config() deliberately so a
+    # HINDSIGHT_AUTO_RETAIN=true env pin (the autoRetain gate below) cannot
+    # override the privacy guarantee. A FORCED SessionEnd sweep is EXEMPT here on
+    # purpose — it must still flush the PUBLIC portion of the session — and
+    # relies instead on exclude_private_ranges() dropping the private turns.
+    if not force and _has_open_interval(read_privacy_state()):
+        return {"status": "skipped", "reason": "private-mode"}
+
     config = load_config()
 
     if not config.get("autoRetain"):
@@ -537,6 +681,17 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     if not all_messages:
         debug_log(config, "No messages in transcript, skipping retain")
         return {"status": "skipped", "reason": "empty transcript"}
+
+    # /private-mode redaction (switchroom privacy PR1) — drop any message that
+    # falls inside a private interval BEFORE window selection. This single
+    # insertion covers BOTH the chunked sliding window AND the force/full-session
+    # slice (select_retain_window returns list(all_messages) for force=True), so
+    # a forced SessionEnd sweep flushes only the PUBLIC portion and an
+    # open-at-session-end private range is never force-swept into the bank.
+    all_messages = exclude_private_ranges(all_messages, read_privacy_state())
+    if not all_messages:
+        debug_log(config, "All messages fell inside private ranges, skipping retain")
+        return {"status": "skipped", "reason": "private-mode"}
 
     debug_log(config, f"Read {len(all_messages)} messages from transcript")
 

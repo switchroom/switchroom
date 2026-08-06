@@ -73,7 +73,12 @@ from lib.pacing import inflight_lock
 # retain.py owns the transcript reader, the deterministic-id recipe and the
 # network-free payload builder; reuse them wholesale so the sidechain path
 # stays byte-identical to the main path where it matters (dedup ids, formatting).
-from retain import build_retain_payload, read_transcript
+from retain import (
+    _has_open_interval,
+    build_retain_payload,
+    read_privacy_state,
+    read_transcript,
+)
 
 # Retain the last N human turns of the sidechain. The window is formatted on the
 # TEXT-ONLY path (``retainToolCalls`` is forced False for the sidechain — see
@@ -333,6 +338,15 @@ def run_subagent_retain(hook_input: dict) -> dict:
          "payload": {...},   # only when status == "failed" (for enqueue)
          "error":   Exception}  # only when status == "failed"
     """
+    # /private-mode enforcement (switchroom privacy PR1) — FIRST, before
+    # load_config(). Subagents have no toggle of their own; they honor the
+    # parent session's privacy state file (same env, same path). An OPEN private
+    # interval means confidential material is being discussed right now, so the
+    # sidechain retain must not fire — placed above load_config() so a
+    # HINDSIGHT_AUTO_RETAIN=true env pin cannot override the privacy guarantee.
+    if _has_open_interval(read_privacy_state()):
+        return {"status": "skipped", "reason": "private-mode"}
+
     config = load_config()
 
     if not config.get("autoRetain"):
