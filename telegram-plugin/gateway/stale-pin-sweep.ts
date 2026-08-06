@@ -132,6 +132,12 @@ import {
   upsertSweepCursor,
   SWEEP_MAX_ATTEMPTS,
 } from './stale-pin-sweep-store.js'
+// The single source of truth for the pin-rights concept. The sweep classifies
+// a rights failure REACTIVELY — it attempts the unpin and reads Telegram's
+// honest `400 "not enough rights"` — using the same detector the live status-pin
+// path uses, so the two paths can never disagree on what "no pin rights" means
+// (this file must stay Telegram-import-free; status-pin.ts is dependency-free).
+import { isPinRightsError } from '../status-pin.js'
 
 // ─── Rate gates (operator-mandated; do not inline these numbers) ─────────────
 
@@ -401,17 +407,6 @@ export function isPeerFloodError(err: unknown): boolean {
 }
 
 /**
- * The bot is not allowed to manage pins here. Verified live: a bot without
- * `can_pin_messages` gets `400 "not enough rights to manage pinned messages in
- * the chat"` from EVERY pin method — an honest, stable rejection, unlike the
- * silent-success unpin. So a rights failure is terminal for the chat, not a
- * retry.
- */
-export function isPinRightsError(err: unknown): boolean {
-  return description(err).includes('not enough rights')
-}
-
-/**
  * `unpinChatMessage` with NO `message_id` on an EMPTY stack answers `400
  * "message to unpin not found"`. That is a real, positive termination signal —
  * one of the very few honest answers in this API surface — so we use it as a
@@ -566,10 +561,18 @@ export interface StalePinSweepDeps {
   /** `unpinAllForumTopicMessages(chat, thread)` — the one topic-scoped verb. */
   unpinAllForumTopicMessages: (chatId: string, threadId: number) => Promise<unknown>
   /**
-   * `getChatMember(chat, self)` folded to "is administrator AND can_pin_messages".
-   * Consulted BEFORE any write in a group. A throw is treated as "no rights".
+   * The SHARED per-process pin-rights negative cache (status-pin.ts
+   * `PinRightsCache`), so the sweep and the live status-pin path agree on which
+   * chats are rights-less. `rightsBlocked` is TRUE only when a REAL Telegram
+   * `400 "not enough rights"` was already observed (by the live pin path or an
+   * earlier sweep) — never a proactive network probe — so consulting it cannot
+   * resurrect the deleted `getChatMember` precheck. When it returns true the
+   * sweep skips the doomed group drain; `recordRightsBlock` feeds the cache from
+   * the sweep's OWN reactive rights discoveries. Both optional: undefined ⇒ the
+   * sweep relies purely on its reactive classifier.
    */
-  canPinInChat: (chatId: string) => Promise<boolean>
+  rightsBlocked?: (chatId: string) => boolean
+  recordRightsBlock?: (chatId: string) => void
   /**
    * Message ids in this chat that must be RE-PINNED once the drain finishes:
    * live in-memory claims plus the deliberately-retained store rows (unexpired
@@ -1126,24 +1129,32 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
       }
     }
 
-    // RIGHTS PRECHECK, before ANY write, in every group. A bot without
-    // can_pin_messages is honestly rejected by Telegram, but burning a rejected
-    // write per orphan against the flood ledger is pointless. DMs need no
-    // precheck — getChatMember is not meaningful there.
-    if (kind !== 'dm') {
-      let allowed = false
-      try {
-        allowed = await deps.canPinInChat(target.chatId)
-      } catch {
-        allowed = false
-      }
-      if (!allowed) {
-        cursor.attempts++
-        cursor.lastStatus = 'skipped-no-rights'
-        cursor.updatedAt = deps.now()
-        commit(cursor)
-        return { status: 'skipped-no-rights', popped: 0, issued: 0 }
-      }
+    // NO proactive rights precheck. A `getChatMember`-based precheck was
+    // DELETED (see below): the sweep runs against the chat-lock-wrapped bot,
+    // which carries only `.api` and no `.botInfo`, so `self` was always null,
+    // the precheck always returned false, and every group target forfeited at
+    // SWEEP_MAX_ATTEMPTS without a single unpin ever going out
+    // (`getChatMember` appeared 0× in a 35MB live gateway log). Rights are now
+    // classified REACTIVELY and only from a real Telegram `400 "not enough
+    // rights"`: each drain primitive attempts the unpin and folds that error to
+    // `{ kind: 'rights' }` via `classify`, returning `skipped-no-rights`. The
+    // attempt is counted below BEFORE the drain, so a genuinely rights-less
+    // chat still increments `attempts` on every boot and forfeits at
+    // SWEEP_MAX_ATTEMPTS — no infinite retry — while a chat the bot CAN pin in
+    // is no longer wrongly skipped.
+    //
+    // Same-process negative cache (D3): if the LIVE status-pin path (or an
+    // earlier sweep) already observed a REAL `400 not enough rights` for this
+    // chat, skip the doomed group drain rather than re-attempting it. This is
+    // NOT a network probe — it is fed only by observed rights failures — so it
+    // does not resurrect the deleted precheck. DMs are never rights-gated. The
+    // attempt is still counted so the cursor forfeits at SWEEP_MAX_ATTEMPTS.
+    if (kind !== 'dm' && deps.rightsBlocked?.(target.chatId) === true) {
+      cursor.attempts++
+      cursor.lastStatus = 'skipped-no-rights'
+      cursor.updatedAt = deps.now()
+      commit(cursor)
+      return { status: 'skipped-no-rights', popped: 0, issued: 0 }
     }
 
     cursor.attempts++
@@ -1195,6 +1206,11 @@ export function createStalePinSweeper(deps: StalePinSweepDeps): StalePinSweeper 
     cursor.lastStatus = result.status
     cursor.updatedAt = deps.now()
     commit(cursor)
+
+    // Feed the shared negative cache (D3): a reactive `skipped-no-rights` is a
+    // real observed `400 not enough rights`, so record it so the live pin path
+    // and later sweeps of this chat skip the doomed attempt too.
+    if (result.status === 'skipped-no-rights') deps.recordRightsBlock?.(target.chatId)
 
     // Restore the deliberately-retained pins the blind DM drain cleared.
     // Rate-gated like any other write; a failure is logged and never fatal.

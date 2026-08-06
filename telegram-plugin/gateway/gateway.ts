@@ -626,6 +626,12 @@ import { readTurnUsages } from '../../src/agents/perf.js'
 import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
 import { IdleTracker, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
+import {
+  openPrivateInterval,
+  closePrivateInterval,
+  PRIVATE_ON_REPLY,
+  PUBLIC_REPLY,
+} from './privacy-state.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -9055,6 +9061,11 @@ const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
       ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
       : [],
   eligible: () => stalePinSweepEligible,
+  // Share the live path's per-process pin-rights negative cache so the sweep
+  // and executePinLeg agree on rights-less chats (D3): the sweep skips a chat
+  // the live path already proved rights-less, and feeds its own reactive
+  // discoveries back so the live path skips too.
+  rightsCache: statusPinRightsCache,
   store: { path: STALE_PIN_SWEEP_STORE_PATH, fs: sweepStoreFs },
   // Per-deployment override only. UNSET (the normal case) means "take the
   // standing policy" — UNPIN_ALL_FORUM_TOPIC_ENABLED in stale-pin-sweep.ts,
@@ -17630,6 +17641,10 @@ async function refreshPinnedBanner(reason: string): Promise<void> {
       onError: (phase, err) => {
         process.stderr.write(`telegram gateway: banner ${phase} failed (${reason}): ${err}\n`)
       },
+      // Share the one per-process pin-rights negative cache with the status-pin
+      // path and the stale-pin sweep (D5): the banner skips a chat already known
+      // rights-less and records/clears its own pin-verb discoveries there.
+      rightsCache: statusPinRightsCache,
       // Durable pin persistence into the SHARED status-pin store (distinct
       // `banner:` pinKey). persist-BEFORE-pin ordering: pending() lands before
       // the pinChatMessage call so a crash in that window is recoverable by the
@@ -19822,6 +19837,19 @@ bot.command('compact', async ctx => {
 })
 bot.command('clear', async ctx => {
   await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/clear' }))
+})
+// Per-operator session privacy controls. NOT admin verbs (deliberately kept
+// out of ADMIN_COMMAND_NAMES) — they gate memory writing for THIS session, so
+// they share the plain per-command isAuthorizedSender gate like inject/clear.
+bot.command('private', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  openPrivateInterval()
+  await switchroomReply(ctx, PRIVATE_ON_REPLY)
+})
+bot.command('public', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  closePrivateInterval()
+  await switchroomReply(ctx, PUBLIC_REPLY)
 })
 // /model and /effort extracted to bot-commands-model-effort.ts
 // (switchroom#2996 P6 bot.command drain). Helper registration keeps grammy

@@ -22,6 +22,11 @@
 
 import type { BannerState } from './slot-banner.js';
 import { decideBannerAction } from './slot-banner.js';
+// Shared rights model (D5): the banner adopts the status-pin path's rights
+// detector, terminal-unpin classifier and per-process negative cache, so the two
+// pin owners agree on which chats are rights-less instead of the banner's old
+// drop-on-ANY-unpin. status-pin.ts is dependency-free.
+import { isPinRightsError, isUnpinTerminalError, type PinRightsCache } from './status-pin.js';
 
 /** Minimal subset of grammy's `bot.api` we depend on. Letting tests
  *  swap in `fake-bot-api.ts` without dragging in the full Bot type. */
@@ -72,6 +77,15 @@ export interface RefreshBannerArgs {
   /** Optional API-failure observer. Phase identifies which Bot API
    *  call failed so the caller can log meaningfully. Default: silent. */
   onError?: (phase: 'pin' | 'edit' | 'unpin', err: unknown) => void;
+  /** Shared per-process pin-rights negative cache (status-pin.ts
+   *  `PinRightsCache`), unifying the banner with the status-pin path on
+   *  rights-less chats (D5). When the chat is already known rights-less the pin
+   *  action is skipped so we never emit an un-pinnable notice; a real pin-rights
+   *  400 from the pin/unpin verb records the block and a confirmed pin clears
+   *  it. Fed ONLY from the pin/unpin verbs — a `sendMessage` failure is never
+   *  cached, because a send failure is not a pin-rights signal. Optional;
+   *  omitted in unit tests. */
+  rightsCache?: Pick<PinRightsCache, 'isBlocked' | 'block' | 'clear'>;
   /** Optional durable-persistence hooks so an orphaned banner pin is
    *  recoverable across a gateway crash. The gateway wires these to the
    *  shared status-pin store (a distinct `banner:` pinKey), mirroring the
@@ -127,20 +141,34 @@ export async function refreshBanner(
 
   if (action.kind === 'unpin') {
     try {
+      // allow-raw-pin: the slot banner is a sanctioned separate pin owner (see
+      // scripts/check-status-pin-single-path-allowlist.txt); its unpin is not
+      // routed through reconcileStatusPin.
       await args.bot.api.unpinChatMessage(args.ownerChatId, action.messageId);
     } catch (err) {
       args.onError?.('unpin', err);
+      // Feed the shared negative cache ONLY from a real pin-rights 400 on the
+      // unpin verb — never from any other failure class (D5).
+      if (isPinRightsError(err)) args.rightsCache?.block(String(args.ownerChatId));
+      // Adopt the status-pin terminal-vs-never-confirmed contract (#3664 Defect
+      // B) instead of drop-on-ANY-unpin: retain the claim when the unpin did
+      // NOT terminally land (transient flood/5xx/network), so the next refresh
+      // retries rather than orphaning a still-pinned banner with no record. A
+      // terminal 4xx (rights, message gone, bot kicked) — and a success — fall
+      // through to the drop below, because re-issuing cannot help.
+      if (!isUnpinTerminalError(err)) return args.prevState;
     }
-    // Even if unpin failed, drop our claim — the message may have been
-    // unpinned out-of-band (operator did it manually) and re-pinning
-    // would be more confusing than surfacing it again later. Drop the
-    // persisted record too (unpin-then-clear mirrors the status-pin store:
-    // a crash between unpin and clear just re-unpins next boot, idempotent).
+    // Terminal outcome: drop our claim and the persisted record. A crash
+    // between unpin and clear just re-unpins next boot (idempotent).
     safePersist(args.persist?.clear);
     return null;
   }
 
   if (action.kind === 'pin') {
+    // The banner is a PINNED notice: if this chat is already known rights-less
+    // (proved by the status-pin path or an earlier banner pin), skip the whole
+    // send+pin — an un-pinnable send is pure noise (D5).
+    if (args.rightsCache?.isBlocked(String(args.ownerChatId))) return args.prevState;
     let sent: { message_id: number };
     try {
       // sendRichMessage doesn't accept link_preview_options — omit it.
@@ -150,6 +178,8 @@ export async function refreshBanner(
         disable_notification: true,
       });
     } catch (err) {
+      // SEND failure — deliberately NOT a pin-rights signal, so the cache is
+      // NEVER written here even though the phase tag below is 'pin' (D5).
       args.onError?.('pin', err);
       return args.prevState;
     }
@@ -158,17 +188,24 @@ export async function refreshBanner(
     // unpins next boot — closing the persist-after-pin leak.
     safePersist(() => args.persist?.pending?.(String(args.ownerChatId), sent.message_id));
     try {
+      // allow-raw-pin: sanctioned banner pin owner (see the allowlist).
       await args.bot.api.pinChatMessage(args.ownerChatId, sent.message_id, {
         disable_notification: true,
       });
     } catch (err) {
       args.onError?.('pin', err);
+      // The PIN verb failing with a real pin-rights 400 IS the rights signal —
+      // record it so later refreshes skip the doomed send+pin (D5).
+      if (isPinRightsError(err)) args.rightsCache?.block(String(args.ownerChatId));
       // sendMessage succeeded but pin failed — don't claim the message, and
       // drop the pending record so we don't leave a phantom claim for a pin
       // that never landed.
       safePersist(args.persist?.clear);
       return args.prevState;
     }
+    // Pin confirmed — rights are present, so clear any stale block for this chat
+    // (mirrors the status-pin path clearing on a successful pin).
+    args.rightsCache?.clear(String(args.ownerChatId));
     // Pin confirmed — rewrite the record without the pending flag.
     safePersist(() => args.persist?.confirm?.(String(args.ownerChatId), sent.message_id));
     return { messageId: sent.message_id, slot: action.slot };

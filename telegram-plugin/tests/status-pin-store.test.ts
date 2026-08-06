@@ -569,6 +569,31 @@ describe("status-pin-store — envelope version compat", () => {
     expect(loadStatusPins(PATH, fs)[0].threadId).toBe(77);
   });
 
+  it("D4: a forum-topic foreground pin threads its topic THROUGH the orchestrator into the persisted row", async () => {
+    // The narrative-lane fix passes `thread` as reconcileStatusPin's 4th arg;
+    // this locks the plumbing beneath it — runStatusPinReconcile → the durable
+    // row — so a forum-topic foreground card orphaned by a crash keeps a
+    // threadId the sweep can aim `unpinAllForumTopicMessages` at. Before the
+    // fix the producer dropped `thread`, landing a threadId-less row here.
+    const { fs } = memFs();
+    const claims = new Map<string, StatusPinClaim>();
+    await runStatusPinReconcile({
+      pinKey: "fg:-100123:9",
+      chatId: "-100123",
+      threadId: 9,
+      prev: null,
+      desired: { pinned: true, messageId: 715 },
+      persist: { path: PATH, fs },
+      runPin: async (action) =>
+        action.kind === "pin" ? { messageId: action.messageId } : null,
+      claims,
+    });
+
+    // The durable row AND the in-memory claim both carry the topic.
+    expect(loadStatusPins(PATH, fs)[0]?.threadId).toBe(9);
+    expect(claims.get("fg:-100123:9")?.threadId).toBe(9);
+  });
+
   it("drops a row with a non-numeric threadId", () => {
     const { fs } = memFs({
       [PATH]: JSON.stringify({

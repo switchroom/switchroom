@@ -21,6 +21,7 @@ import {
   isCompositeSilentNoise,
   endsWithSilentMarker,
   isSilentSentinelCardOutcome,
+  isHollowGhostCardOutcome,
   isTurnFlushSafetyEnabled,
   selectFlushDeliveryText,
   FLUSH_SUBSTANTIVE_MIN_CHARS,
@@ -974,5 +975,71 @@ describe('isSilentSentinelCardOutcome (#4348)', () => {
 
   it('a genuinely empty dark turn (no reply, no text) is NOT a sentinel', () => {
     expect(isSilentSentinelCardOutcome({ ...base })).toBe(false)
+  })
+})
+
+describe('isHollowGhostCardOutcome (#45)', () => {
+  const base = {
+    replyCalled: false,
+    labeledToolCount: 0,
+    mirrorLines: [] as string[],
+    capturedText: [] as string[],
+    lastReplyText: '',
+    finalAnswerEverDelivered: false,
+  }
+
+  it('the ghost-reply signature — zero tools, no reply, no text, no narration — IS hollow', () => {
+    // The exact #45 condition the sentinel gate misses (no NO_REPLY text to
+    // match): the card adopted at turn start (liveness timer) never got any
+    // content — mirrorLines empty, no tool, no reply, no text.
+    expect(isHollowGhostCardOutcome({ ...base })).toBe(true)
+  })
+
+  it('a narration-only turn (a rendered mirror line, zero tools/reply/text) is NOT hollow', () => {
+    // The blocker this fix closes: a turn that surfaced a `showNarrativeStep`
+    // ("Doing the work now") but did no labeled tool work, never replied, and
+    // emitted no captured/reply text pushes a line into `mirrorLines`. That is
+    // real content the user saw in the card — the card must be KEPT, not deleted.
+    // This is the exact scenario the pre-existing edit-flood-fuse pin
+    // (activity-drain-fuse-drop-not-failure.test.ts "a terminal card render is
+    // never shed") protects.
+    expect(
+      isHollowGhostCardOutcome({ ...base, mirrorLines: ['Doing the work now'] }),
+    ).toBe(false)
+  })
+
+  it('whitespace-only mirror lines do NOT rescue the card — still hollow', () => {
+    // Symmetric with the capturedText/lastReplyText blank guards: a mirrorLines
+    // array of only blank strings surfaced nothing visible, so it stays hollow.
+    expect(isHollowGhostCardOutcome({ ...base, mirrorLines: ['   ', '\n'] })).toBe(true)
+  })
+
+  it('whitespace-only captured / reply text still counts as hollow', () => {
+    expect(isHollowGhostCardOutcome({ ...base, capturedText: ['   ', '\n'] })).toBe(true)
+    expect(isHollowGhostCardOutcome({ ...base, lastReplyText: '   ' })).toBe(true)
+  })
+
+  it('a delivered final answer keeps the card — never hollow', () => {
+    expect(isHollowGhostCardOutcome({ ...base, finalAnswerEverDelivered: true })).toBe(false)
+  })
+
+  it('any surfaced tool work keeps the card — the ✓ N steps body is real', () => {
+    expect(isHollowGhostCardOutcome({ ...base, labeledToolCount: 1 })).toBe(false)
+  })
+
+  it('a reply-called turn is never hollow (sentinel gate owns dropped sentinels)', () => {
+    expect(isHollowGhostCardOutcome({ ...base, replyCalled: true })).toBe(false)
+  })
+
+  it('captured terminal text keeps the card (not hollow)', () => {
+    expect(
+      isHollowGhostCardOutcome({ ...base, capturedText: ['Here is the answer.'] }),
+    ).toBe(false)
+  })
+
+  it('non-blank last reply text keeps the card (not hollow)', () => {
+    expect(
+      isHollowGhostCardOutcome({ ...base, lastReplyText: 'The three services are green.' }),
+    ).toBe(false)
   })
 })

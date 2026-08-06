@@ -51,9 +51,7 @@ export interface StalePinSweepBotSeam {
       ) => Promise<unknown>
       unpinChatMessage: (chatId: string, messageId: number) => Promise<unknown>
       unpinAllForumTopicMessages: (chatId: string, threadId: number) => Promise<unknown>
-      getChatMember: (chatId: string, userId: number) => Promise<unknown>
     }
-    botInfo?: { id?: number }
   }
   /** The gateway's retry/telemetry envelope (`robustApiCall`). */
   call: <T>(fn: () => Promise<T>, meta: { chat_id: string; verb: string }) => Promise<T>
@@ -68,6 +66,14 @@ export interface StalePinSweepWiring {
   loadPinRows: () => PersistedStatusPin[]
   /** Mutex-won AND bot-constructed. False ⇒ the drain must not write. */
   eligible: () => boolean
+  /**
+   * The SHARED per-process pin-rights negative cache (status-pin.ts
+   * `PinRightsCache`), unifying the sweep and the live status-pin path on which
+   * chats are rights-less. Only `isBlocked`/`block` are used here; the live
+   * path owns `clear` (on a successful explicit pin) and boot owns the reset.
+   * Optional — undefined ⇒ the sweep relies purely on its reactive classifier.
+   */
+  rightsCache?: { isBlocked: (chatId: string) => boolean; block: (chatId: string) => boolean }
   store: { path: string; fs: SweepStoreFsSeam }
   /** Per-deployment override of `UNPIN_ALL_FORUM_TOPIC_ENABLED`; undefined =
    *  take the standing policy (the wholesale topic drain stays OFF). */
@@ -168,18 +174,16 @@ export function createGatewayStalePinSweeper(w: StalePinSweepWiring): StalePinSw
         chat_id: chatId,
         verb: 'stale-pin-sweep.unpin-all-topic',
       }),
-    // Rights are checked before ANY write in a group. Telegram is HONEST about
-    // missing pin rights (400 "not enough rights to manage pinned messages"),
-    // but the precheck keeps a rights-less bot from emitting doomed traffic.
-    canPinInChat: async (chatId) => {
-      const self = bot().botInfo?.id
-      if (self == null) return false
-      const member = (await call(() => bot().api.getChatMember(chatId, self), {
-        chat_id: chatId,
-        verb: 'stale-pin-sweep.get-chat-member',
-      })) as { status?: string; can_pin_messages?: boolean } | undefined
-      return member?.status === 'administrator' && member.can_pin_messages === true
-    },
+    // No proactive rights precheck. The old `getChatMember` precheck read
+    // `bot().botInfo?.id`, but the sweep runs against the chat-lock-wrapped bot
+    // (`wrapBot({ api: bot.api })`), which carries only `.api` — `.botInfo` was
+    // always undefined, so `self` was always null and every group precheck
+    // returned false, forfeiting every group cursor without a single unpin. The
+    // sweep now relies SOLELY on its reactive classifier: it attempts the unpin
+    // and classifies Telegram's honest `400 "not enough rights"` via
+    // `isPinRightsError`. Telegram is authoritative about pin rights; a precheck
+    // could only ever be redundant with (and, wired against the wrong bot,
+    // wrong about) that answer.
     recordedPinIds: (chatId, threadId) => {
       try {
         return recordedPinIdsFor(w.loadPinRows(), chatId, threadId)
@@ -200,6 +204,12 @@ export function createGatewayStalePinSweeper(w: StalePinSweepWiring): StalePinSw
         log,
       }),
     eligible: w.eligible,
+    rightsBlocked: w.rightsCache ? (chatId) => w.rightsCache!.isBlocked(chatId) : undefined,
+    recordRightsBlock: w.rightsCache
+      ? (chatId) => {
+          w.rightsCache!.block(chatId)
+        }
+      : undefined,
     sleep: w.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
     now,
     store: w.store,

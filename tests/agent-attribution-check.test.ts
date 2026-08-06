@@ -63,6 +63,12 @@ function makeFixture(prefix: string): Fixture {
   env.GIT_AUTHOR_EMAIL = "operator@example.test";
   env.GIT_COMMITTER_NAME = "Operator";
   env.GIT_COMMITTER_EMAIL = "operator@example.test";
+  // Hermetic against the ambient CI event. `ci-tests-core.yml` runs this suite
+  // on `merge_group` too, and the guard SKIPs when `GITHUB_EVENT_NAME` is
+  // `merge_group` (the synthetic squash commit is unstampable — see the guard).
+  // Left inherited, that would silently turn every red-case fixture below into a
+  // skip during a queue run. Each test that cares sets the event explicitly.
+  delete env.GITHUB_EVENT_NAME;
 
   const git = (args: string[], extra: Record<string, string> = {}) =>
     execFileSync("git", args, {
@@ -360,6 +366,58 @@ describe("check-agent-attribution-trailers — robust to GitHub squash reparagra
 
     const r = f.check();
     expect(r.code).toBe(0);
+  });
+});
+
+describe("check-agent-attribution-trailers — merge-queue synthetic squash commit", () => {
+  // GitHub's merge queue builds a squash-merge commit SERVER-SIDE and fires the
+  // workflow with GITHUB_EVENT_NAME=merge_group. That commit inherits the PR's
+  // `Co-authored-by: Claude` trailer (so it reads as machine-authored) but the
+  // in-container hook cannot stamp it, and when the PR body puts prose between
+  // the trailer paragraphs the fold cannot recover the Switchroom-* trailers
+  // either. It is a guaranteed false positive: the branch commits were already
+  // enforced at the pull_request event. (Observed on #4446's queue squash.)
+  const MERGE_QUEUE_SQUASH = [
+    "feat(gateway): session-start reset to public + alert (#4446)",
+    "",
+    // Prose body bled in from the PR description, sitting BETWEEN the two
+    // trailer paragraphs — this is what defeats parseTrailers' fold and reds
+    // the commit on a normal (non-merge_group) run.
+    "This reworks the session-start path so that a fresh session resets to",
+    "public and emits an alert. Details in the PR description above.",
+    "",
+    "Switchroom-Agent: carrie",
+    "Switchroom-Model: claude-opus-4-8",
+    "",
+    "More prose that GitHub carried through from the squashed body, which",
+    "isolates the attribution paragraph from the co-author paragraph below.",
+    "",
+    "Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+  ].join("\n");
+
+  it("SKIPs on the merge_group event — the synthetic squash commit is unstampable", () => {
+    const f = makeFixture("attrchk-mq-skip-");
+    f.commit(MERGE_QUEUE_SQUASH);
+
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group" });
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("SKIP — merge_group event");
+  });
+
+  it("STILL FAILS that same commit shape on a normal (non-merge_group) run", () => {
+    // The guard is only relaxed for the merge queue's own synthetic commit.
+    // The identical shape on the branch (pull_request / local) is exactly the
+    // genuine-enforcement path and must still red — otherwise the skip would
+    // blind real unattributed work. GITHUB_EVENT_NAME is set to '' so this
+    // holds even when the suite itself runs under a merge_group CI event.
+    const f = makeFixture("attrchk-mq-fail-");
+    f.commit(MERGE_QUEUE_SQUASH);
+
+    const r = f.check({ GITHUB_EVENT_NAME: "" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-agent-attribution-trailers: FAIL");
+    expect(r.out).toContain("missing `Switchroom-Agent:` trailer");
+    expect(r.out).toContain("missing `Switchroom-Model:` trailer");
   });
 });
 
