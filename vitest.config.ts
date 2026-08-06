@@ -84,6 +84,16 @@ export default defineConfig({
     setupFiles: [
       "./tests/vitest-setup/auth-net-guard.mjs",
       "./tests/vitest-setup/agent-state-dir-guard.mjs",
+      // Hindsight bank hermeticity: the fleet's Hindsight is shared
+      // production state, and it auto-creates a bank on miss — one stray
+      // request from a test process mints a bank in the live instance. On
+      // 2026-07-30 a harness sweep minted 11, one of them named `clerk`,
+      // colliding with a live agent and erasing the annotation that
+      // documented where that agent's memory really lives. This setup file
+      // scrubs the ambient Hindsight URLs and rejects any fetch to a fleet
+      // Hindsight origin. `npm run lint:hindsight-bank-hermeticity` fails if
+      // this entry (or either bunfig preload) is removed.
+      "./tests/vitest-setup/hindsight-bank-guard.mjs",
     ],
     pool: "forks",
     poolOptions: {
@@ -369,6 +379,11 @@ export default defineConfig({
       // under bun by definition. The vitest half is pinned by
       // tests/agent-state-dir-guard.test.ts.
       "**/telegram-plugin/tests/agent-state-dir-preload.test.ts",
+      // hindsight-bank-preload.test.ts is the runtime alarm for the BUN half
+      // of the Hindsight bank guard (bunfig.toml `[test] preload`) — it must
+      // run under bun by definition (same shape as the state-dir alarm
+      // above). The vitest half is pinned by tests/hindsight-bank-guard.test.ts.
+      "**/telegram-plugin/tests/hindsight-bank-preload.test.ts",
     ],
     coverage: {
       provider: "v8",

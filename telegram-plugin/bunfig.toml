@@ -2,9 +2,13 @@
 # `bun-test-run` job (scripts/bun-test-ci.sh) and `bun run --cwd telegram-plugin`.
 #
 # bun reads the bunfig.toml in its CWD only, so this file exists purely to load
-# the same state-dir hermeticity preload as the repo-root bunfig.toml. Keep the
-# two in sync; `npm run lint:agent-state-dir-hermeticity` fails if either stops
-# loading the guard. Rationale for the guard itself lives in
-# tests/vitest-setup/agent-state-dir-guard.mjs.
+# the same shared-state hermeticity preloads as the repo-root bunfig.toml. Keep
+# the two in sync; `npm run lint:agent-state-dir-hermeticity` and
+# `npm run lint:hindsight-bank-hermeticity` fail if either bunfig stops loading
+# either guard. Rationale lives in tests/vitest-setup/agent-state-dir-guard.mjs
+# and tests/vitest-setup/hindsight-bank-guard.mjs.
 [test]
-preload = ["../tests/vitest-setup/agent-state-dir-guard.mjs"]
+preload = [
+  "../tests/vitest-setup/agent-state-dir-guard.mjs",
+  "../tests/vitest-setup/hindsight-bank-guard.mjs",
+]
