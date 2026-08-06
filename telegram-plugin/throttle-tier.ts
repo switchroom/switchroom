@@ -367,8 +367,13 @@ export function renderThrottleNotice(opts: {
 export function renderThrottleEscalationNotice(opts: {
   account: string | null
   agent: string
-  /** The account the fleet/agents rolled to; null = every fallback blocked. */
+  /** The account the fleet/agents rolled to; null = every fallback blocked —
+   *  UNLESS `callerPinnedStrict`, where null just means the caller stayed put. */
   rolledTo: string | null
+  /** True when the triggering agent has a strict pin (`auth.strict`): its
+   *  null `rolledTo` is "riding out the wall on its own account", not a
+   *  fleet-wide all-blocked. Absent from pre-flag brokers → false. */
+  callerPinnedStrict?: boolean
 }): string {
   const acct = opts.account ? `\`${escapeMarkdown(opts.account)}\`` : 'the active account'
   const head =
@@ -376,7 +381,11 @@ export function renderThrottleEscalationNotice(opts: {
     `(trigger: **${escapeMarkdown(opts.agent)}**) were corroborated by a live quota probe.`
   const tail = opts.rolledTo
     ? `Marked exhausted and rolled to \`${escapeMarkdown(opts.rolledTo)}\`.`
-    : `Marked exhausted — no fallback account had quota (all blocked). ` +
-      `Use \`/auth add <label>\` to attach another subscription.`
+    : opts.callerPinnedStrict
+      ? `Marked exhausted — **${escapeMarkdown(opts.agent)}** is strictly pinned to ${acct} ` +
+        `(\`auth.strict\`), so it rides out the wall on its own account. ` +
+        `The rest of the fleet is unaffected.`
+      : `Marked exhausted — no fallback account had quota (all blocked). ` +
+        `Use \`/auth add <label>\` to attach another subscription.`
   return `${head}\n${tail}`
 }

@@ -19,7 +19,7 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as net from "node:net";
@@ -193,7 +193,7 @@ describe("AuthBroker — strict pin (never borrow another account)", () => {
     const broker = await makeStrictPinBroker(h, { strict: true });
     const resp = await rpc(join(h.socketRoot, "pinned", "sock"), {
       v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 60_000,
-    }) as { ok: boolean; data: { account: string; rolled: string[]; rolledTo: string | null } };
+    }) as { ok: boolean; data: { account: string; rolled: string[]; rolledTo: string | null; caller_pinned_strict: boolean } };
     expect(resp.ok).toBe(true);
     // Attribution stays on the pin…
     expect(resp.data.account).toBe("dedicated");
@@ -201,8 +201,10 @@ describe("AuthBroker — strict pin (never borrow another account)", () => {
     expect(resp.data.rolled).not.toContain("pinned");
     // …and the CALLER-visible rolledTo is null: a non-null value makes the
     // gateway announce "switched to X" and resume the turn straight back
-    // into the wall (resume → 429 → mark loop).
+    // into the wall (resume → 429 → mark loop). The paired flag lets
+    // flag-aware gateways render "riding it out" instead of all-blocked.
     expect(resp.data.rolledTo).toBeNull();
+    expect(resp.data.caller_pinned_strict).toBe(true);
     // The mirror FILE itself still carries the pin's credentials — `rolled`
     // omitting the agent is a report, this is the ground truth.
     const mirror = JSON.parse(readFileSync(
@@ -363,6 +365,10 @@ describe("AuthBroker — exclusive pin (account is unroutable to anyone else)", 
       _testFetchQuota: async () => healthyQuota(),
     });
     await broker.start();
+    // The DROP layer specifically: the state file is gone (not merely
+    // out-served by the accountWithFailover base guard, which would also
+    // resolve `other` to primary and mask a drop regression).
+    expect(existsSync(join(h.stateDir, "active-override.json"))).toBe(false);
     // The override-less agent must be served the YAML active, not the
     // persisted (now-exclusive) swap target.
     const resp = await rpc(join(h.socketRoot, "other", "sock"), {

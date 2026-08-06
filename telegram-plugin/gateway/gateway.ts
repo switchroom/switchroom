@@ -18114,7 +18114,11 @@ async function doFireFleetAutoFallback(
         // weekly-capped account is never re-probed (and re-wedged) within the
         // broker's ~5h default.
         const r = await client.markExhausted(untilMs)
-        return { rolledTo: r.rolledTo ?? null, rolled: r.rolled }
+        return {
+          rolledTo: r.rolledTo ?? null,
+          rolled: r.rolled,
+          callerPinnedStrict: r.caller_pinned_strict ?? false,
+        }
       },
       triggerAgent,
       tz,

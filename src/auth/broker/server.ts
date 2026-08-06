@@ -3026,6 +3026,13 @@ export class AuthBroker {
     socket.write(encodeSuccess(id, { active: account, fanned }));
   }
 
+  /** True when the calling identity is an agent with a strict pin. */
+  private callerStrictPinned(identity: Identity): boolean {
+    if (identity.kind !== "agent") return false;
+    const a = (this.config.agents ?? {})[identity.name]?.auth;
+    return Boolean(a?.override && a?.strict);
+  }
+
   /**
    * `rolledTo` as seen by the CALLER. A strict-pinned agent is skipped by
    * `fanoutFailoverTo`, so its mirror kept the pin — but the fleet-level
@@ -3033,12 +3040,13 @@ export class AuthBroker {
    * key "switched to X" announcements AND the resume nudge off a non-null
    * `rolledTo`; advertising a switch that did not happen to this caller
    * re-runs the turn straight back into the wall (resume → 429 → mark loop).
-   * Null for a strict caller; pass-through for everyone else.
+   * Null for a strict caller; pass-through for everyone else. The paired
+   * `caller_pinned_strict` response field lets flag-aware gateways render
+   * "your pin is walled; fleet unaffected" instead of misreading the null
+   * as a fleet-wide all-blocked.
    */
   private callerRolledTo(identity: Identity, rolledTo: string | null): string | null {
-    if (identity.kind !== "agent") return rolledTo;
-    const a = (this.config.agents ?? {})[identity.name]?.auth;
-    return a?.override && a?.strict ? null : rolledTo;
+    return this.callerStrictPinned(identity) ? null : rolledTo;
   }
 
   private async opMarkExhausted(
@@ -3059,6 +3067,7 @@ export class AuthBroker {
       account,
       rolled,
       rolledTo: this.callerRolledTo(identity, rolledTo),
+      caller_pinned_strict: this.callerStrictPinned(identity),
     }));
   }
 
@@ -3135,6 +3144,7 @@ export class AuthBroker {
           throttled_until: this.quota[account]?.throttled_until ?? 0,
           escalated,
           rolledTo: escalated ? this.callerRolledTo(identity, rolledTo) : null,
+          caller_pinned_strict: this.callerStrictPinned(identity),
         }),
       );
       return;
@@ -3200,6 +3210,7 @@ export class AuthBroker {
         throttled_until: throttledUntil,
         escalated,
         rolledTo: escalated ? this.callerRolledTo(identity, rolledTo) : null,
+        caller_pinned_strict: this.callerStrictPinned(identity),
       }),
     );
   }
@@ -4651,9 +4662,12 @@ export class AuthBroker {
       const effective = this.servingAccountForConsumer(consumer.name);
       const isEffective = effective === label;
       if (!isPinned && !isEffective) continue;
-      const toMirror = effective ?? bound;
-      if (toMirror == null) continue;
-      if (this.mirrorAccountToConsumer(toMirror, consumer)) {
+      // A null effective is a DENY from the serving path (the bound account
+      // is exclusive to an agent — escaped-state defense). Falling back to
+      // `bound` here would mirror the very credentials the deny refused, so
+      // skip the push instead; the consumer keeps its last mirror.
+      if (effective == null) continue;
+      if (this.mirrorAccountToConsumer(effective, consumer)) {
         fanned.push(consumer.name);
       }
     }

@@ -412,8 +412,14 @@ export interface MarkExhaustedData {
   rolled: string[];
   /** The account the fleet rolled TO (next non-exhausted in fallback_order),
    *  or null when every fallback is also exhausted. Added so a non-admin
-   *  caller can announce an accurate swap target without an admin set-active. */
+   *  caller can announce an accurate swap target without an admin set-active.
+   *  Always null for a strict-pinned caller (see `caller_pinned_strict`). */
   rolledTo?: string | null;
+  /** True when the CALLER is an agent with a strict pin (`auth.strict`): its
+   *  mirror kept the pin, so a null `rolledTo` means "you ride out the wall;
+   *  fleet unaffected" — NOT fleet-wide all-blocked. Absent on pre-flag
+   *  brokers. */
+  caller_pinned_strict?: boolean;
 }
 
 export interface MarkThrottledData {
@@ -424,8 +430,12 @@ export interface MarkThrottledData {
    *  corroborated by a live probe as a genuine wall, so the broker marked
    *  the account exhausted and rolled the fleet. */
   escalated: boolean;
-  /** Set only when `escalated` — the roll target (null = all blocked). */
+  /** Set only when `escalated` — the roll target (null = all blocked, unless
+   *  `caller_pinned_strict` is true: then the caller simply didn't roll). */
   rolledTo?: string | null;
+  /** True when the CALLER is an agent with a strict pin — see
+   *  `MarkExhaustedData.caller_pinned_strict`. Absent on pre-flag brokers. */
+  caller_pinned_strict?: boolean;
 }
 
 export interface RefreshAccountData {
