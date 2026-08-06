@@ -1,19 +1,31 @@
 # bun test configuration.
 #
-# The ONLY thing here is the state-dir hermeticity preload — bun's counterpart
-# to vitest's `test.setupFiles`. Without it the guard would cover one runner
-# only: a `bun test` file that reaches the gateway's turn-record writer (or
-# runtime-metrics / analytics) with no state-dir env set writes into
-# `/state/agent`, which inside an agent container is a LIVE agent's
-# bind-mounted state dir. That is the exact leak the guard exists to close, so
-# it must not depend on which runner a test happens to use.
+# The ONLY thing here is the shared-state hermeticity preloads — bun's
+# counterpart to vitest's `test.setupFiles`. Without them each guard would
+# cover one runner only, and a defect class that regrows one runner at a time
+# is not closed.
+#
+#   agent-state-dir-guard   a `bun test` file that reaches the gateway's
+#                           turn-record writer (or runtime-metrics /
+#                           analytics) with no state-dir env set writes into
+#                           `/state/agent`, which inside an agent container is
+#                           a LIVE agent's bind-mounted state dir.
+#   hindsight-bank-guard    a `bun test` file that fetches the fleet's
+#                           Hindsight mints a bank in the LIVE instance —
+#                           Hindsight auto-creates on miss. On 2026-07-30 a
+#                           harness sweep minted 11 that way, one named
+#                           `clerk`, colliding with a live agent.
 #
 # bun reads the bunfig.toml in its CWD (not an ancestor's), and this repo runs
 # `bun test` from two directories — the repo root (`npm run test:bun`) and
 # `telegram-plugin/` (CI's `bun-test-run`, via scripts/bun-test-ci.sh). Hence
-# the sibling `telegram-plugin/bunfig.toml`. Both are pinned by
-# `npm run lint:agent-state-dir-hermeticity`.
+# the sibling `telegram-plugin/bunfig.toml`. All four wirings are pinned by
+# `npm run lint:agent-state-dir-hermeticity` and
+# `npm run lint:hindsight-bank-hermeticity`.
 #
 # `preload` paths are resolved relative to this file.
 [test]
-preload = ["./tests/vitest-setup/agent-state-dir-guard.mjs"]
+preload = [
+  "./tests/vitest-setup/agent-state-dir-guard.mjs",
+  "./tests/vitest-setup/hindsight-bank-guard.mjs",
+]

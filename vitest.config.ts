@@ -84,6 +84,16 @@ export default defineConfig({
     setupFiles: [
       "./tests/vitest-setup/auth-net-guard.mjs",
       "./tests/vitest-setup/agent-state-dir-guard.mjs",
+      // Hindsight bank hermeticity: the fleet's Hindsight is shared
+      // production state, and it auto-creates a bank on miss — one stray
+      // request from a test process mints a bank in the live instance. On
+      // 2026-07-30 a harness sweep minted 11, one of them named `clerk`,
+      // colliding with a live agent and erasing the annotation that
+      // documented where that agent's memory really lives. This setup file
+      // scrubs the ambient Hindsight URLs and rejects any fetch to a fleet
+      // Hindsight origin. `npm run lint:hindsight-bank-hermeticity` fails if
+      // this entry (or either bunfig preload) is removed.
+      "./tests/vitest-setup/hindsight-bank-guard.mjs",
     ],
     pool: "forks",
     poolOptions: {
