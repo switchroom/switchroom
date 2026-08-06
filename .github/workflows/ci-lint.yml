@@ -101,6 +101,15 @@ jobs:
       - name: Run lint
         # `bun lint` = tsc --noEmit + plugin-references + bot-api-wrapping +
         # bun-test-imports. Same command path as Buildkite.
+        #
+        # `check-changelog-entry.mjs` (part of `bun lint`) reads the PR body +
+        # labels for its escape hatch (`no-changelog` label / `[skip changelog]`
+        # token). GITHUB_EVENT_NAME / GITHUB_BASE_REF are set by Actions; the
+        # body + labels are not, so surface them here. Empty on push/merge_group
+        # (the check skips merge_group and diffs an empty range on push).
+        env:
+          CHANGELOG_PR_BODY: ${{ github.event.pull_request.body }}
+          CHANGELOG_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
         run: bun lint
 
   # ─── Sentinel ─────────────────────────────────────────────────────
