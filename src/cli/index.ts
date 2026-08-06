@@ -51,6 +51,7 @@ import { registerHostCommand } from "./host-repair.js";
 import { registerFleetHealthCommand } from "./fleet-health.js";
 import { registerHindsightWatchCommand } from "./hindsight-watch.js";
 import { registerOpenRouterWatchCommand } from "./openrouter-watch.js";
+import { registerConfigRepoCommand } from "./config-repo.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
 
 installGlobalErrorHandlers();
@@ -129,3 +130,4 @@ registerHostCommand(program);
 registerFleetHealthCommand(program);
 registerHindsightWatchCommand(program);
 registerOpenRouterWatchCommand(program);
+registerConfigRepoCommand(program);

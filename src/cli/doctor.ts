@@ -59,6 +59,7 @@ import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js";
 import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
+import { checkConfigRepo } from "./doctor-config-repo.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
 import { runRoutingModeChecks } from "./doctor-routing-mode.js";
@@ -608,6 +609,11 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
   // non-strict), so the operator's yaml reads as configured and does nothing.
   // A REMOVED knob is worse — they have evidence they once set it. Surface it.
   results.push(checkMemoryKeysAreKnown(configPath));
+
+  // Config-repo change control (only emits rows when `config_repo:` is set):
+  // repo-is-git, remote-is-private, personal-skills-tracked (GAP A backstop),
+  // and unpushed-commit staleness.
+  results.push(...checkConfigRepo(config));
 
   return results;
 }
