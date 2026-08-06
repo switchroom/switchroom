@@ -150,6 +150,61 @@ describe("hindsight broker-fed mode (#1245)", () => {
     expect(Number(m![1])).toBeGreaterThanOrEqual(1);
   });
 
+  it("emits the reranker oversubscription fix in the docker run argv (2026-08-06)", () => {
+    // Outcome at the REAL launch surface: assert the `-e KEY=VALUE` payloads
+    // the container is actually started with, not just the constants. Recall
+    // latency on a GPU-less box is CPU cross-encoder reranker time — a live
+    // pgvector HNSW EXPLAIN ANALYZE of the recall runs in 5ms, so the DB and
+    // index are not the cost. The fix pins each op's native thread pool so
+    // 4 concurrent rerankers x 4 threads ~= 16 cores (was: OMP unset => each
+    // grabbed all 16, oversubscribing the box while it sat ~85% idle) and
+    // trims the candidate budget 150 -> 100.
+    // Explicit empty processEnv seam so a stray OMP_NUM_THREADS in the runner's
+    // own environment can't be picked up as an "operator override" and skew the
+    // asserted default.
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      undefined, // litellm
+      undefined, // imageTag
+      undefined, // llm
+      undefined, // mirrorDir
+      undefined, // gpu
+      { processEnv: {} }, // perf
+    );
+    const env = runEnvPairs(findRunArgs());
+    for (const v of [
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
+      "MKL_NUM_THREADS",
+      "NUMEXPR_NUM_THREADS",
+    ]) {
+      expect(env, `${v} must reach the container pinned to 4`).toContain(`${v}=4`);
+    }
+    expect(env).toContain("HINDSIGHT_API_RERANKER_MAX_CANDIDATES=100");
+    // Paired knob unchanged from its source default of 4 (concurrency x threads
+    // stays within the core budget).
+    expect(env).toContain("HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=4");
+  });
+
+  it("lets a hindsight.env override retune the native thread caps", () => {
+    // The caps are managed keys, so an operator on a differently-sized box
+    // retunes them declaratively and the value reaches the container — the
+    // silent-drop defect this module exists to prevent.
+    startHindsight(
+      { apiPort: 8888, uiPort: 9999 },
+      undefined, // litellm
+      undefined, // imageTag
+      undefined, // llm
+      undefined, // mirrorDir
+      undefined, // gpu
+      { env: { OMP_NUM_THREADS: "8" } }, // perf
+    );
+    const env = runEnvPairs(findRunArgs());
+    expect(env).toContain("OMP_NUM_THREADS=8");
+    // Exactly once — the override replaces the default rather than appending.
+    expect(env.filter((p) => p.startsWith("OMP_NUM_THREADS=")).length).toBe(1);
+  });
+
   it("sets HINDSIGHT_API_LLM_PROVIDER=claude-code (subscription-honest path)", () => {
     startHindsight({ apiPort: 8888, uiPort: 9999 });
     const args = findRunArgs();

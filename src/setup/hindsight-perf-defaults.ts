@@ -54,9 +54,17 @@
  * speed up — rather than only the background work. It needs a separate
  * worker process first; see the PR body.
  *
- * `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` is deliberately untouched (150).
- * The rejection rationale is recorded at
- * src/setup/hindsight-reranker-budget.test.ts:111-118.
+ * `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` is cut 150 → 100 (2026-08-06). On a
+ * GPU-less box the CPU cross-encoder reranker is the recall bottleneck — a live
+ * `EXPLAIN ANALYZE` of the pgvector HNSW recall runs in 5ms and all 80 indexes
+ * are valid, so the latency is reranker CPU, not the DB or the index. Upstream's
+ * performance guide (hindsight.vectorize.io/developer/performance) names
+ * `RERANKER_MAX_CANDIDATES` as "the biggest single win on CPU". A prior 150 → 50
+ * proposal was rejected because 50 dropped RRF-rank >50 items that were reaching
+ * the prompt (dropped block, hindsight-reranker-budget.test.ts); 100 keeps
+ * ranks 1–100 — only the tail past 100 is trimmed — so it cuts a third of the
+ * per-pair cross-encoder work without the quality cliff 50 hit. Paired with the
+ * native-thread cap below.
  *
  * `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` is NOT a default here and must
  * not become one. It is *derived* from the declared context window by
@@ -101,7 +109,7 @@ export interface HindsightPerfCapabilities {
  * free of a cycle (`hindsight.ts` imports THIS file). The two are pinned
  * equal by a test, so they cannot drift.
  */
-export const HINDSIGHT_RERANKER_MAX_CANDIDATES_FOR_DERIVATION = 150;
+export const HINDSIGHT_RERANKER_MAX_CANDIDATES_FOR_DERIVATION = 100;
 
 /**
  * Retrieval sources whose candidates are fused by RRF before reranking:
@@ -134,7 +142,7 @@ export const HINDSIGHT_RECALL_SOURCE_COUNT = 4;
  * fused pool can still be FILLED to the reranker budget — not that the same
  * items reach it. An item ranked, say, #80 in both the semantic and the BM25
  * arm has strong RRF consensus today and would be dropped from both arms
- * before fusion under a 60 cap, so consensus-but-mid-ranked items are the
+ * before fusion under a 40 cap, so consensus-but-mid-ranked items are the
  * class this trades away. In practice that is small — final k is ~10, and the
  * items that survive fusion are overwhelmingly top-of-arm — but it is a real
  * trade, not a free one.
@@ -142,13 +150,14 @@ export const HINDSIGHT_RECALL_SOURCE_COUNT = 4;
  * Both halves are asserted in hindsight-perf-defaults.test.ts; raising the
  * reranker budget moves this automatically.
  *
- * NOTE the anchor: 150 is SWITCHROOM's reranker budget, not upstream's.
- * Upstream's `DEFAULT_RERANKER_MAX_CANDIDATES` is 300; the 150 here is a
- * prior switchroom tightening (src/setup/hindsight.ts). The 40% ratio is
- * therefore derived against a switchroom value and would want revisiting if
- * switchroom ever moves back toward upstream's 300 — at which point 40%
- * yields 120 per source, still satisfying both halves, but the absolute
- * per-arm truncation point moves with it.
+ * NOTE the anchor: 100 is SWITCHROOM's reranker budget, not upstream's.
+ * Upstream's `DEFAULT_RERANKER_MAX_CANDIDATES` is 300; the 100 here is a
+ * switchroom tightening (150 → 100, 2026-08-06, see the file header). The 40%
+ * ratio is therefore derived against a switchroom value and would want
+ * revisiting if switchroom ever moves back toward upstream's 300 — at which
+ * point 40% yields 120 per source, still satisfying both halves, but the
+ * absolute per-arm truncation point moves with it. At 100 the derived
+ * per-source cap is `ceil(100 * 0.4) = 40`.
  */
 export const HINDSIGHT_DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE = Math.ceil(
   HINDSIGHT_RERANKER_MAX_CANDIDATES_FOR_DERIVATION * 0.4,
@@ -543,14 +552,22 @@ export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
  *   comment promises "36-54% speedup, quality-identical" by sorting
  *   candidate pairs by length to avoid padding waste. Pure win on CPU.
  *
- * - MAX_CANDIDATES: vendor default 300. At our `recallBudget=low`
- *   ~100 candidates feed in and we cap to 12 final memories; scoring
- *   300 wastes ~50% of rerank CPU on candidates that will never make
- *   the top-N.
+ * - MAX_CANDIDATES: vendor default 300, switchroom 150 → 100 (2026-08-06).
+ *   We cap to ~12 final memories, so scoring 100 already covers the RRF
+ *   pool that survives fusion; the tail past 100 is per-pair cross-encoder
+ *   CPU spent on candidates that never make the top-N. On a GPU-less box
+ *   that per-pair CPU is the recall bottleneck (a live pgvector HNSW
+ *   `EXPLAIN ANALYZE` runs in 5ms — the DB and index are not the cost),
+ *   and upstream's performance guide names this knob "the biggest single
+ *   win on CPU". A 150 → 50 cut was rejected earlier for dropping RRF-rank
+ *   >50 items that reach the prompt; 100 keeps ranks 1–100.
  *
  * - LOCAL_MAX_CONCURRENT: vendor default 4. With 9 always-on agents
  *   that's up to 36 simultaneous CPU-bound rerank tasks on a shared
- *   16-core host — thrashes. Cap at 2 leaves headroom for burst.
+ *   16-core host — thrashes. Held at 4 (see the native-thread cap below):
+ *   4 concurrent rerankers × 4 native threads each ≈ the box's 16 cores,
+ *   so the two knobs are paired to stop the oversubscription where each
+ *   reranker otherwise grabbed all 16 cores.
  *
  * - RECALL_MAX_CONCURRENT: vendor default 32. Sized for a dedicated
  *   hindsight box; switchroom is co-tenant with the fleet, hostd,
@@ -570,7 +587,7 @@ export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
  * imperative state the next `switchroom apply` throws away.
  */
 export const HINDSIGHT_DEFAULT_RERANKER_BUCKET_BATCHING = "true";
-export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 150;
+export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 100;
 // Vendor default 4. v0.13.22 dropped this to 2 paired with the now-
 // reverted `--cpus=2.0` CPU cap; with CPU restored, 4-way concurrency
 // is the right knob — lets 4 fleet agents' recalls overlap without
@@ -578,6 +595,56 @@ export const HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES = 150;
 // task-level contention).
 export const HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4;
 export const HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT = 8;
+
+/**
+ * Native BLAS / OpenMP thread cap per reranker op — the root-cause fix for the
+ * recall-latency oversubscription (2026-08-06).
+ *
+ * ## The bug
+ *
+ * The container ran with `OMP_NUM_THREADS` unset. PyTorch/NumPy/OpenBLAS then
+ * default each op's intra-op thread pool to the machine's FULL core count (16
+ * here). With {@link HINDSIGHT_DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT} at 4 (and
+ * the live box briefly at 8 via an operator override), that is 4–8 concurrent
+ * cross-encoder ops each spawning 16 native threads onto 16 physical cores —
+ * 64–128 runnable threads fighting for 16 cores. The result is cache-thrashing
+ * and scheduler churn, NOT saturation: the box sat ~85% idle while recall p90
+ * blew out. This is classic BLAS oversubscription, the exact failure the
+ * `threadpoolctl` / `_thread_limits` machinery exists to prevent, and it is
+ * invisible to a DB-side investigation — a live pgvector HNSW `EXPLAIN ANALYZE`
+ * of the recall runs in 5ms and every one of the 80 HNSW indexes is valid.
+ *
+ * ## The fix, and why it is deterministic
+ *
+ * Pin each op's native pool to 4 threads, so `rerankConcurrency (4) × threads
+ * per op (4) ≈ the 16 cores` — full utilisation with no oversubscription. Four
+ * env vars are set together because the four numeric libraries the reranker can
+ * pull in each read their OWN variable, and leaving any one unset re-opens the
+ * hole for that backend: `OMP_NUM_THREADS` (OpenMP / PyTorch ATen),
+ * `OPENBLAS_NUM_THREADS` (OpenBLAS), `MKL_NUM_THREADS` (Intel MKL),
+ * `NUMEXPR_NUM_THREADS` (NumExpr).
+ *
+ * The image's own `sklearn._thread_limits` sets these with `setdefault`, so it
+ * only fills a var that is UNSET — an explicit value here wins, which is why the
+ * pin has to be emitted rather than left to the image. Emitted unconditionally
+ * (ungated): capping the CPU-side native pool is safe on a GPU host too (the
+ * heavy compute runs on CUDA; these bound only the CPU tokenisation/glue), and
+ * the module's rule is that an unconditional emission must stay unconditional or
+ * it silently changes the default on hosts lacking the gate.
+ *
+ * Operator-overridable through `hindsight.env` like every managed key — a box
+ * with a different core count / concurrency retunes declaratively:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     OMP_NUM_THREADS: 8
+ *     OPENBLAS_NUM_THREADS: 8
+ *     MKL_NUM_THREADS: 8
+ *     NUMEXPR_NUM_THREADS: 8
+ * ```
+ */
+export const HINDSIGHT_DEFAULT_NATIVE_THREAD_LIMIT = 4;
 
 /**
  * Reflect wall-clock timeout. Vendor default is 300s. Mental-model
@@ -905,6 +972,14 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
     "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
     String(HINDSIGHT_DEFAULT_RECALL_MAX_CONCURRENT),
   ],
+  // Native BLAS/OpenMP thread caps — the root-cause fix for reranker
+  // oversubscription. NOT HINDSIGHT_API_* keys: they are the standard numeric
+  // library env vars each reranker backend reads, capped so `concurrency ×
+  // threads/op ≈ cores`. See HINDSIGHT_DEFAULT_NATIVE_THREAD_LIMIT.
+  ["OMP_NUM_THREADS", String(HINDSIGHT_DEFAULT_NATIVE_THREAD_LIMIT)],
+  ["OPENBLAS_NUM_THREADS", String(HINDSIGHT_DEFAULT_NATIVE_THREAD_LIMIT)],
+  ["MKL_NUM_THREADS", String(HINDSIGHT_DEFAULT_NATIVE_THREAD_LIMIT)],
+  ["NUMEXPR_NUM_THREADS", String(HINDSIGHT_DEFAULT_NATIVE_THREAD_LIMIT)],
   [
     "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
     String(HINDSIGHT_DEFAULT_REFLECT_WALL_TIMEOUT_S),

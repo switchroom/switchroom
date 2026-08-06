@@ -2985,8 +2985,13 @@ export const HindsightConfigSchema = z.object({
       "(which moved the synchronous extraction off the shared asyncio loop onto " +
       "a single-worker thread and bounds its input, ending multi-second loop " +
       "stalls on multi-KB consolidation queries); unset means the image's baked " +
-      "2000, set 0 to restore an unbounded full scan), plus the " +
-      "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
+      "2000, set 0 to restore an unbounded full scan; and " +
+      "OMP_NUM_THREADS, OPENBLAS_NUM_THREADS, MKL_NUM_THREADS, " +
+      "NUMEXPR_NUM_THREADS — the standard numeric-library native-thread caps, " +
+      "pinned to 4 so the CPU cross-encoder reranker stops oversubscribing " +
+      "(each op otherwise grabbed all cores, `concurrency x threads/op` >> " +
+      "cores); the one non-HINDSIGHT_* managed set, retunable per host), plus " +
+      "the embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
       "SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS — a postgres size string such " +

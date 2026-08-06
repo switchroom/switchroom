@@ -185,6 +185,10 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
       "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
       "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
+      "MKL_NUM_THREADS",
+      "NUMEXPR_NUM_THREADS",
       "HINDSIGHT_API_REFLECT_WALL_TIMEOUT",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
@@ -221,6 +225,65 @@ describe("hindsightPerfEnv — capability gating", () => {
         "250",
       ]);
     }
+  });
+
+  it("cuts the reranker candidate budget to 100 on every host", () => {
+    // Outcome, not presence: the 2026-08-06 latency fix cut MAX_CANDIDATES
+    // 150 -> 100 because on a GPU-less box the CPU cross-encoder is the recall
+    // bottleneck (a live pgvector HNSW EXPLAIN ANALYZE runs in 5ms — not the
+    // DB). Ungated, so it must hold for both capability extremes. A revert to
+    // 150 or a drift to any other value fails here.
+    for (const caps of [
+      { gpu: false, localLlm: false },
+      { gpu: true, localLlm: true },
+    ] as const) {
+      expect(hindsightPerfEnv(caps)).toContainEqual([
+        "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
+        "100",
+      ]);
+    }
+  });
+
+  it("pins the native BLAS/OpenMP thread caps to 4 on every host (oversubscription fix)", () => {
+    // The root-cause fix: OMP_NUM_THREADS unset let each of 4-8 concurrent
+    // cross-encoder ops grab all 16 cores, oversubscribing the box while it sat
+    // ~85% idle. All four numeric-library vars must be pinned together — leaving
+    // any one unset re-opens the hole for that backend — and each must be 4 so
+    // `rerankConcurrency (4) x threads/op (4) ~= 16 cores`. Ungated: safe on a
+    // GPU host too, where the heavy compute is on CUDA. Assert the emitted VALUE
+    // on both capability extremes.
+    const NATIVE_THREAD_VARS = [
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
+      "MKL_NUM_THREADS",
+      "NUMEXPR_NUM_THREADS",
+    ] as const;
+    for (const caps of [
+      { gpu: false, localLlm: false },
+      { gpu: true, localLlm: true },
+    ] as const) {
+      const pairs = hindsightPerfEnv(caps);
+      for (const v of NATIVE_THREAD_VARS) {
+        expect(pairs, `${v} must be pinned to 4 for caps ${JSON.stringify(caps)}`).toContainEqual([
+          v,
+          "4",
+        ]);
+      }
+    }
+  });
+
+  it("keeps reranker concurrency x native threads within the core budget", () => {
+    // The two knobs are PAIRED: concurrency (RERANKER_LOCAL_MAX_CONCURRENT) times
+    // threads-per-op (the native cap) must not oversubscribe the 16-core host.
+    // This is the invariant the fix restores, asserted so a later bump of either
+    // knob without the other re-introduces the oversubscription loudly.
+    const CORES = 16;
+    const env = new Map(hindsightPerfEnv({ gpu: false, localLlm: true }));
+    const concurrency = Number(env.get("HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT"));
+    const threads = Number(env.get("OMP_NUM_THREADS"));
+    expect(concurrency).toBeGreaterThanOrEqual(1);
+    expect(threads).toBeGreaterThanOrEqual(1);
+    expect(concurrency * threads).toBeLessThanOrEqual(CORES);
   });
 
   it("declares exactly the gated knobs this PR ships, by name", () => {
@@ -351,7 +414,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-eight keys, by name", () => {
+  it("is overridable on exactly these fifty-two keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -413,6 +476,13 @@ describe("operator override wins", () => {
       "HINDSIGHT_CE_DECISIVE_RELATIVE_GAP",
       "HINDSIGHT_MCP_RECALL_BUDGET_MODE",
       "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
+      // Not HINDSIGHT_* at all — the standard numeric-library native-thread
+      // caps (the reranker oversubscription fix). Managed so an operator can
+      // retune them per-host through `hindsight.env`. Sort after everything.
+      "MKL_NUM_THREADS",
+      "NUMEXPR_NUM_THREADS",
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
     ]);
   });
 
@@ -1791,7 +1861,9 @@ describe("startHindsight — performance defaults reach the container", () => {
     const env = runEnv(runArgs());
     expect(env.get("HINDSIGHT_API_RERANKER_LOCAL_FP16")).toEqual(["true"]);
     expect(env.get("HINDSIGHT_API_LLM_MAX_CONCURRENT")).toEqual(["4"]);
-    expect(env.get("HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE")).toEqual(["60"]);
+    // Derived at 40% of the 100 reranker budget: ceil(100 * 0.4) = 40 (was 60
+    // against the old 150 budget; both track the budget by construction).
+    expect(env.get("HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE")).toEqual(["40"]);
   });
 
   it("emits NO GPU/local-LLM knob on a CPU host with a hosted endpoint", () => {
@@ -1818,11 +1890,16 @@ describe("startHindsight — performance defaults reach the container", () => {
     ).toBe(false);
   });
 
-  it("leaves the reranker candidate budget at 150 (documented follow-up)", () => {
-    // src/setup/hindsight-reranker-budget.test.ts:111-118 records why cutting
-    // this needs an answer-quality A/B first. This PR must not move it.
+  it("cuts the reranker candidate budget to 100 (2026-08-06 latency fix)", () => {
+    // On a GPU-less box the CPU cross-encoder reranker is the recall
+    // bottleneck (a live pgvector HNSW EXPLAIN ANALYZE of the recall runs in
+    // 5ms — the DB/index are not the cost), and upstream's performance guide
+    // names this knob the biggest single win on CPU. 100 keeps RRF ranks 1-100
+    // (the ranks the >50 evidence in hindsight-reranker-budget.test.ts showed
+    // reaching the prompt) while trimming the tail; a cut below 100 still needs
+    // an answer-quality A/B first.
     startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, true);
-    expect(runEnv(runArgs()).get("HINDSIGHT_API_RERANKER_MAX_CANDIDATES")).toEqual(["150"]);
+    expect(runEnv(runArgs()).get("HINDSIGHT_API_RERANKER_MAX_CANDIDATES")).toEqual(["100"]);
   });
 
   it("emits an operator override once, with the operator's value", () => {

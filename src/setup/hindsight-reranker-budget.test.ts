@@ -264,5 +264,12 @@ describe("recall budget coherence", () => {
 // of what actually reaches the prompt: the cap is a hard prefix slice of the
 // RRF-sorted pool (engine `memory_engine.py:4744-4754`), and on the live
 // overlord bank 28 of 61 injected memories across 8 queries came from RRF rank
-// >50, including five queries' top result. Latency tuning of this constant is
-// tracked separately and needs an answer-quality A/B first.
+// >50, including five queries' top result.
+//
+// The 2026-08-06 latency fix took the cap to 100 instead (see the file header
+// in src/setup/hindsight-perf-defaults.ts): 100 keeps RRF ranks 1-100 — every
+// rank the >50 evidence above showed reaching the prompt — while still trimming
+// a third of the per-pair cross-encoder CPU that is the recall bottleneck on a
+// GPU-less box. The outcome pin for that value lives with the constant, in
+// hindsight-perf-defaults.test.ts. A cut below 100 still needs an answer-quality
+// A/B first, for the RRF-rank reason above.
