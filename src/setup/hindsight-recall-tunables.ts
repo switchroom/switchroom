@@ -50,8 +50,23 @@
  * `switchroom doctor` can surface it.
  */
 
+import { RECALL_PASSTHROUGH_DEFAULTS } from "./hindsight-recall-passthrough.js";
+
 /** Vendor/shipped default for the UserPromptSubmit hook ceiling (seconds). */
 export const DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS = 12;
+
+/**
+ * switchroom smart-default for `recallMaxMemories` — the count cap on memories
+ * injected per turn. The vendor ships 12 (`vendor/hindsight-memory/settings.json`
+ * / `lib/config.py` DEFAULTS); switchroom tightens it to 8 (less prompt noise at
+ * our `recallBudget: low`, per the 2026-05-24 recall-quality audit). This is the
+ * value stamped into the deployed settings.json when the operator sets no
+ * `memory.recall.max_memories`, so it MUST equal what the fleet ran before this
+ * became a stamped-from-cascade value or turning the stamp on would move
+ * behaviour. Operators re-raise via `memory.recall.max_memories` in
+ * switchroom.yaml, which start.sh also exports as HINDSIGHT_RECALL_MAX_MEMORIES.
+ */
+export const DEFAULT_RECALL_MAX_MEMORIES = 8;
 
 /**
  * Headroom (seconds) reserved between the hook ceiling and the shared parallel
@@ -115,6 +130,68 @@ export interface RecallTunableInput {
   hook_timeout_seconds?: number | undefined;
   parallel_deadline_seconds?: number | undefined;
   request_timeout_seconds?: number | undefined;
+}
+
+/**
+ * The two recall CAPS stamped into the deployed settings.json — the count cap
+ * (`recallMaxMemories`) and the injected-block token budget (`recallMaxTokens`).
+ *
+ * These are NOT part of the latency envelope above; they are a separate pair,
+ * broken out so `applyHindsightSettingsOverrides` (the stamp) and
+ * `detectHindsightRecallTunableDrift` (the doctor check) resolve them from the
+ * SAME cascade input and cannot disagree. Before this, `recallMaxMemories` was a
+ * hardcoded `8` literal in scaffold.ts and `recallMaxTokens` was never stamped
+ * at all — so an operator who set `memory.recall.max_memories`/`.max_tokens` in
+ * switchroom.yaml got the value only via the start.sh env export (which wins at
+ * runtime), while settings.json silently kept 8/1024. Any hindsight invocation
+ * that did NOT inherit that env (a docker-exec'd retain/backfill, or the plugin
+ * before the export ran) then reverted to 8/1024, and `switchroom doctor` was
+ * blind to the split. Stamping from the cascade closes both gaps.
+ */
+export interface HindsightRecallCaps {
+  /** Count cap on injected memories, stamped into settings.json. */
+  maxMemories: number;
+  /** Token budget for the injected block, stamped into settings.json. */
+  maxTokens: number;
+}
+
+/** The `memory.recall.*` subset the caps resolver reads (post-cascade). */
+export interface RecallCapInput {
+  max_memories?: number | undefined;
+  max_tokens?: number | undefined;
+}
+
+/**
+ * Resolve the recall caps from cascaded config, mirroring the start.sh export
+ * source exactly:
+ *
+ *   - `max_memories` → HINDSIGHT_RECALL_MAX_MEMORIES (start.sh.hbs), default
+ *     {@link DEFAULT_RECALL_MAX_MEMORIES} (8) when unset. start.sh exports this
+ *     one CONDITIONALLY (only when the operator set it), so when unset the
+ *     settings.json stamp is the sole authority and MUST carry the switchroom
+ *     smart-default.
+ *   - `max_tokens` → HINDSIGHT_RECALL_MAX_TOKENS, resolved through the recall
+ *     passthrough whose default is {@link RECALL_PASSTHROUGH_DEFAULTS}.maxTokens
+ *     (1024, the vendor settings.json value). Matching that keeps an unset agent
+ *     byte-identical.
+ *
+ * Pure and total like `resolveHindsightRecallTunables`: any absent/NaN/non-positive
+ * input falls back to the default rather than throwing, so a config typo cannot
+ * brick an agent's memory install at scaffold time.
+ */
+export function resolveHindsightRecallCaps(
+  recall: RecallCapInput | undefined,
+): HindsightRecallCaps {
+  // `min` is the smallest value that is meaningful for the key: max_memories
+  // admits 0 (start.sh.hbs documents `0` as "disable the cap entirely", and
+  // start.sh exports it verbatim, so the settings.json stamp must match), while
+  // max_tokens is a token budget with a schema floor of 1.
+  const usable = (v: number | undefined, min: number): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v >= min ? Math.floor(v) : undefined;
+  return {
+    maxMemories: usable(recall?.max_memories, 0) ?? DEFAULT_RECALL_MAX_MEMORIES,
+    maxTokens: usable(recall?.max_tokens, 1) ?? RECALL_PASSTHROUGH_DEFAULTS.maxTokens,
+  };
 }
 
 /**

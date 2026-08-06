@@ -6,13 +6,16 @@ import { installHindsightPlugin } from "../src/agents/scaffold.js";
 import { detectHindsightRecallTunableDrift } from "../src/agents/drift.js";
 import {
   resolveHindsightRecallTunables,
+  resolveHindsightRecallCaps,
   readHooksRecallTimeout,
   renderHindsightHooksOverrides,
   DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS,
   DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS,
+  DEFAULT_RECALL_MAX_MEMORIES,
   RECALL_DEADLINE_HEADROOM_SECONDS,
   MIN_RECALL_HOOK_TIMEOUT_SECONDS,
 } from "../src/setup/hindsight-recall-tunables.js";
+import { RECALL_PASSTHROUGH_DEFAULTS } from "../src/setup/hindsight-recall-passthrough.js";
 import type { SwitchroomConfig, AgentConfig } from "../src/config/schema.js";
 
 /**
@@ -156,6 +159,61 @@ describe("recall latency tunables are declarative and survive apply", () => {
     expect(readSettings().recallRequestTimeoutSeconds).toBeLessThanOrEqual(
       readSettings().recallParallelDeadlineSeconds as number,
     );
+    // Count + token caps with no operator override: the switchroom smart-default
+    // (8, vendor ships 12) and the vendor token budget (1024). Stamping these
+    // from the cascade must be byte-identical to what the fleet ran when
+    // recallMaxMemories was a hardcoded 8 and recallMaxTokens was never stamped.
+    expect(readSettings().recallMaxMemories).toBe(DEFAULT_RECALL_MAX_MEMORIES);
+    expect(readSettings().recallMaxTokens).toBe(RECALL_PASSTHROUGH_DEFAULTS.maxTokens);
+  });
+
+  /**
+   * THE R2 drift regression. The operator sets memory.recall.max_memories /
+   * .max_tokens in switchroom.yaml; start.sh exports them as env (which wins at
+   * runtime), but settings.json used to keep a hardcoded 8 and the vendor's
+   * unstamped 1024. Any hindsight invocation WITHOUT that env (a docker-exec'd
+   * retain/backfill) then silently ran 8/1024. The stamp must now carry the
+   * operator's cascaded values — this test fails on the old 8 / 1024 literals.
+   */
+  it("stamps recallMaxMemories/recallMaxTokens from the cascaded operator values", () => {
+    installHindsightPlugin("probe", tmpDir, configFor({ max_memories: 16, max_tokens: 6144 }));
+    const s = readSettings();
+    expect(s.recallMaxMemories).toBe(16);
+    expect(s.recallMaxTokens).toBe(6144);
+    // Guard the exact pre-fix defect: neither may fall back to the old literals
+    // once the operator has configured them.
+    expect(s.recallMaxMemories).not.toBe(8);
+    expect(s.recallMaxTokens).not.toBe(1024);
+  });
+
+  it("re-asserts the caps when a reinstall has clobbered them back to 8/1024", () => {
+    const config = configFor({ max_memories: 16, max_tokens: 6144 });
+    installHindsightPlugin("probe", tmpDir, config);
+
+    // Clobber the deployed settings.json back to the pre-fix literals, exactly
+    // as a vendor re-copy + the old hardcoded stamp would.
+    const clobbered = readSettings();
+    clobbered.recallMaxMemories = 8;
+    clobbered.recallMaxTokens = 1024;
+    writeFileSync(settingsPath(), JSON.stringify(clobbered, null, 2) + "\n");
+    expect(readSettings().recallMaxMemories).toBe(8);
+
+    // The apply.
+    installHindsightPlugin("probe", tmpDir, config);
+    expect(readSettings().recallMaxMemories).toBe(16);
+    expect(readSettings().recallMaxTokens).toBe(6144);
+  });
+
+  it("honours max_memories/max_tokens set at the `defaults:` tier", () => {
+    const cfg = {
+      defaults: { memory: { recall: { max_memories: 16, max_tokens: 6144 } } },
+      agents: { probe: {} },
+      memory: { backend: "hindsight", config: { url: "http://localhost:18888/mcp/" } },
+      telegram: { bot_token: "t", forum_chat_id: "c" },
+    } as unknown as SwitchroomConfig;
+    installHindsightPlugin("probe", tmpDir, cfg);
+    expect(readSettings().recallMaxMemories).toBe(16);
+    expect(readSettings().recallMaxTokens).toBe(6144);
   });
 
   it("leaves the vendor tree untouched", () => {
@@ -224,6 +282,47 @@ describe("drift row: installed plugin vs switchroom.yaml", () => {
     const f = detectHindsightRecallTunableDrift("probe", agentConfig(), tmpDir, config());
     expect(f).toHaveLength(1);
     expect(f[0].detail).toContain("`recallRequestTimeoutSeconds` is 8, expected 13");
+  });
+
+  it("FAILS when recallMaxMemories has been reverted to the old hardcoded 8", () => {
+    const capRecall = { ...recall, max_memories: 16, max_tokens: 6144 };
+    const capCfg = configFor(capRecall);
+    installHindsightPlugin("probe", tmpDir, capCfg);
+    const p = join(tmpDir, ...PLUGIN_REL, "settings.json");
+    const s = JSON.parse(readFileSync(p, "utf-8"));
+    s.recallMaxMemories = 8; // the pre-fix hardcoded literal
+    writeFileSync(p, JSON.stringify(s, null, 2) + "\n");
+
+    const f = detectHindsightRecallTunableDrift(
+      "probe",
+      { memory: { recall: capRecall } } as unknown as AgentConfig,
+      tmpDir,
+      capCfg,
+    );
+    expect(f).toHaveLength(1);
+    expect(f[0].surface).toBe("memory-tunables");
+    expect(f[0].detail).toContain("`recallMaxMemories` is 8, expected 16");
+    expect(f[0].detail).toContain("memory.recall.max_memories");
+  });
+
+  it("FAILS when recallMaxTokens has been reverted to the vendor 1024", () => {
+    const capRecall = { ...recall, max_memories: 16, max_tokens: 6144 };
+    const capCfg = configFor(capRecall);
+    installHindsightPlugin("probe", tmpDir, capCfg);
+    const p = join(tmpDir, ...PLUGIN_REL, "settings.json");
+    const s = JSON.parse(readFileSync(p, "utf-8"));
+    s.recallMaxTokens = 1024; // the vendor default that used to ride through unstamped
+    writeFileSync(p, JSON.stringify(s, null, 2) + "\n");
+
+    const f = detectHindsightRecallTunableDrift(
+      "probe",
+      { memory: { recall: capRecall } } as unknown as AgentConfig,
+      tmpDir,
+      capCfg,
+    );
+    expect(f).toHaveLength(1);
+    expect(f[0].detail).toContain("`recallMaxTokens` is 1024, expected 6144");
+    expect(f[0].detail).toContain("memory.recall.max_tokens");
   });
 
   it("FAILS when a managed key is missing entirely", () => {
@@ -413,6 +512,40 @@ describe("resolveHindsightRecallTunables", () => {
       expect(resolveHindsightRecallTunables(bad).hookTimeoutSeconds).toBe(
         DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS,
       );
+    }
+  });
+});
+
+describe("resolveHindsightRecallCaps", () => {
+  it("defaults to the switchroom smart-default (8) and vendor token budget (1024)", () => {
+    const c = resolveHindsightRecallCaps(undefined);
+    expect(c.maxMemories).toBe(DEFAULT_RECALL_MAX_MEMORIES);
+    expect(c.maxMemories).toBe(8);
+    expect(c.maxTokens).toBe(RECALL_PASSTHROUGH_DEFAULTS.maxTokens);
+    expect(c.maxTokens).toBe(1024);
+  });
+
+  it("passes through the operator's configured caps", () => {
+    const c = resolveHindsightRecallCaps({ max_memories: 16, max_tokens: 6144 });
+    expect(c.maxMemories).toBe(16);
+    expect(c.maxTokens).toBe(6144);
+  });
+
+  it("preserves max_memories: 0 (the documented `disable the cap` value)", () => {
+    // start.sh exports 0 verbatim, so the settings.json stamp must match it
+    // rather than folding it back to the default 8.
+    expect(resolveHindsightRecallCaps({ max_memories: 0 }).maxMemories).toBe(0);
+  });
+
+  it("falls back rather than throwing on unusable input", () => {
+    for (const bad of [
+      { max_memories: -5, max_tokens: -1 },
+      { max_memories: Number.NaN, max_tokens: Number.NaN },
+      { max_tokens: 0 }, // below the token floor of 1 → default
+    ]) {
+      const c = resolveHindsightRecallCaps(bad);
+      expect(c.maxMemories).toBe(DEFAULT_RECALL_MAX_MEMORIES);
+      expect(c.maxTokens).toBe(RECALL_PASSTHROUGH_DEFAULTS.maxTokens);
     }
   });
 });

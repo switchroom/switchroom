@@ -46,8 +46,10 @@ import {
 import { isHindsightEnabled } from "../memory/hindsight.js";
 import {
   resolveHindsightRecallTunables,
+  resolveHindsightRecallCaps,
   readHooksRecallTimeout,
   type RecallTunableInput,
+  type RecallCapInput,
 } from "../setup/hindsight-recall-tunables.js";
 import { VERSION } from "../build-info.js";
 import { buildSettingsHooksBlock, detectHooksDrift } from "./scaffold.js";
@@ -444,6 +446,14 @@ export function detectHindsightRecallTunableDrift(
   const expected = resolveHindsightRecallTunables(
     resolved.memory?.recall as RecallTunableInput | undefined,
   );
+  // Count + token caps resolved from the SAME cascade as the stamp
+  // (resolveHindsightRecallCaps) — recallMaxMemories drifted silently for months
+  // as a hardcoded 8 while start.sh exported the operator's value, and
+  // recallMaxTokens was never stamped at all, so this row is the doctor-side
+  // guard that a future stamp regression can't hide behind the env export.
+  const expectedCaps = resolveHindsightRecallCaps(
+    resolved.memory?.recall as RecallCapInput | undefined,
+  );
 
   const findings: DriftFinding[] = [];
   const mismatches: string[] = [];
@@ -491,6 +501,16 @@ export function detectHindsightRecallTunableDrift(
           "recallRequestTimeoutSeconds",
           "memory.recall.request_timeout_seconds",
           expected.requestTimeoutSeconds,
+        ],
+        [
+          "recallMaxMemories",
+          "memory.recall.max_memories",
+          expectedCaps.maxMemories,
+        ],
+        [
+          "recallMaxTokens",
+          "memory.recall.max_tokens",
+          expectedCaps.maxTokens,
         ],
       ];
       for (const [key, yamlKey, want] of checks) {
