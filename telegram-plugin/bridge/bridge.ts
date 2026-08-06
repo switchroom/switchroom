@@ -214,18 +214,6 @@ const TOOL_SCHEMAS = [
     },
   },
   {
-    name: 'pin_message',
-    description: 'Pin a message in a Telegram chat. Useful for important outputs the user wants to find later. Requires admin rights in groups.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        chat_id: { type: 'string' },
-        message_id: { type: 'string' },
-      },
-      required: ['chat_id', 'message_id'],
-    },
-  },
-  {
     name: 'delete_message',
     description: 'Delete a message the bot previously sent. Prefer edit_message if you just want to update text — delete_message is for true removal.',
     inputSchema: {

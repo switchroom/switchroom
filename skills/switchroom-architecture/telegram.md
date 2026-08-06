@@ -11,7 +11,6 @@ Switchroom ships an enhanced `switchroom-telegram` MCP plugin that replaces the 
 | `edit_message` | Update a previously sent message. Edits are silent (no push notification). |
 | `delete_message` | Remove a bot-sent message (48h Telegram API limit). |
 | `forward_message` | Quote/resurface earlier messages with thread support. |
-| `pin_message` | Pin important outputs (requires bot admin). |
 | `send_typing` | Show typing indicator (5s auto-expire). Use during long operations. |
 | `download_attachment` | Fetch files attached to inbound messages. |
 | `get_recent_messages` | Query SQLite history buffer with pagination and thread filtering. |

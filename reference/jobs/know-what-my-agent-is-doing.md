@@ -78,12 +78,14 @@ close that gap so the user never has to ask.
   a generous TTL is unpinned without waiting for a restart. A stale pin glued
   to the top of the chat for hours is exactly the "can't tell working from
   stuck" failure this job exists to prevent.
-- **Tool pins are different: no "finished" event, so restart ≠ reset.** A pin
-  the agent placed deliberately via the `pin_message` tool is registered in
-  the same durable store under a `tool:` key with a generous TTL (default 7
-  days). It survives restarts untouched until the TTL lapses, then the boot
-  sweep unpins it — the backstop against deliberate pins accumulating
-  forever, without ever yanking a pin the user still wants.
+- **Agents can no longer hand-pin.** The `pin_message` MCP tool was retired
+  (#4452): the ONE sanctioned pin is the framework's own auto-pin of the
+  status/activity card and the 🛠 Worker card, which the boot sweep reaps as a
+  work-scoped claim on restart. A message the USER deliberately pinned is never
+  recorded in the durable store, so the sweep — which only ever unpins the
+  message ids it recorded — leaves it untouched. Legacy `tool:` rows written by
+  an older build before the tool's removal still carry their TTL and drain on
+  expiry, so no already-placed pin is stranded.
 
 **Bad looks like: never ship this**
 

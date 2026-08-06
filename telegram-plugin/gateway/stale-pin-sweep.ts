@@ -352,9 +352,10 @@ export function collectSweepTargets(input: {
 
 /**
  * The messageIds in `chatId` that must SURVIVE a drain because they belong to
- * deliberately-retained store rows: unexpired time-scoped `tool:` pins (the
- * `pin_message` MCP tool, #3001), which `runStatusPinBootCleanup` intentionally
- * KEEPS across restarts. Work-scoped rows (no `expiresAt`) are stale by
+ * deliberately-retained store rows: unexpired time-scoped `tool:` pins (legacy
+ * rows from the retired `pin_message` MCP tool, #3001 / #4452 — no new ones are
+ * written), which `runStatusPinBootCleanup` intentionally KEEPS across restarts
+ * until they expire. Work-scoped rows (no `expiresAt`) are stale by
  * definition after a restart and are NOT re-pin candidates; expired
  * time-scoped rows are due for sweeping.
  */

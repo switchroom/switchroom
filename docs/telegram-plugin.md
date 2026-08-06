@@ -17,7 +17,6 @@ The official Telegram plugin provides basic message send/receive. Switchroom's f
 | `edit_message` | Update a previously sent message. |
 | `delete_message` | Remove a bot-sent message (48h Telegram limit). |
 | `forward_message` | Quote/resurface earlier messages with thread support. |
-| `pin_message` | Pin important outputs in the chat (requires bot admin). |
 | `send_typing` | Show typing indicator during long operations (5s auto-expire). |
 | `download_attachment` | Fetch files attached to inbound messages. |
 | `get_recent_messages` | Query the local SQLite history buffer with pagination and thread filtering. |

@@ -41,7 +41,7 @@
 // Cross-checked the full tool surface in `telegram-plugin/bridge/bridge.ts`
 // (`TOOL_SCHEMAS`, kept in sync with `gateway/gateway.ts`): `edit_message`
 // explicitly does NOT ping/deliver a fresh answer (its own description says
-// "send a new reply when a long task completes"); `react`, `pin_message`,
+// "send a new reply when a long task completes"); `react`,
 // `delete_message`, `forward_message`, `send_typing`, `download_attachment`,
 // `get_recent_messages` carry no model-authored answer text at all;
 // `send_checklist` / `send_sticker` / `send_gif` / `ask_user` /

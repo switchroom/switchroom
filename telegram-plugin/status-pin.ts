@@ -210,12 +210,9 @@ export function isUnpinTerminalError(err: unknown): boolean {
  * Deliberately IN-MEMORY / per-boot only: pin rights may be granted later, and
  * Telegram surfaces the new permission to the bot only on a fresh chat-member
  * fetch — a gateway restart. Clearing the cache on restart is therefore the
- * correct re-enable trigger. An explicit `pin_message` tool success in a chat
- * also clears its entry (rights were granted mid-session).
+ * correct re-enable trigger.
  *
- * Scope: the AUTO status-pin path only. The explicit `pin_message` MCP tool
- * never consults this cache — it always attempts and surfaces the error to the
- * agent as a normal tool error.
+ * Scope: the AUTO status-pin path only (`pin_status_while_working`).
  */
 export class PinRightsCache {
   private readonly blocked = new Set<string>()
