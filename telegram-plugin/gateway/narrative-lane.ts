@@ -455,10 +455,18 @@ export function createNarrativeLane(deps: NarrativeLaneDeps) {
             // stays in view when the feed scrolls past. Keyed to the same
             // status-key the canonical turn-end (purgeReactionTracking) unpins.
             // Fire-and-forget; the single-owner reconcile keeps state consistent.
+            // Pass `thread` as the 4th arg so the persisted row keeps the forum
+            // topic (D4): without it a forum-topic foreground card orphaned by a
+            // crash lands a threadId-less row, and the sweep cannot aim
+            // `unpinAllForumTopicMessages` at the right topic. Mirrors the worker
+            // feed's `reconcilePin` (gateway.ts). It does NOT change the pinKey —
+            // `statusKey(chat, thread)` already folds the topic into the key; the
+            // 4th arg only threads the topic into the claim + durable row.
             void reconcileStatusPin(
               `fg:${statusKey(chat, thread)}`,
               chat,
               { pinned: true, messageId: sent.message_id },
+              thread,
             )
           } else {
             const id = turn.activityMessageId

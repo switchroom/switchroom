@@ -9055,6 +9055,11 @@ const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
       ? loadStatusPins(STATUS_PIN_STORE_PATH, statusPinStoreFs)
       : [],
   eligible: () => stalePinSweepEligible,
+  // Share the live path's per-process pin-rights negative cache so the sweep
+  // and executePinLeg agree on rights-less chats (D3): the sweep skips a chat
+  // the live path already proved rights-less, and feeds its own reactive
+  // discoveries back so the live path skips too.
+  rightsCache: statusPinRightsCache,
   store: { path: STALE_PIN_SWEEP_STORE_PATH, fs: sweepStoreFs },
   // Per-deployment override only. UNSET (the normal case) means "take the
   // standing policy" — UNPIN_ALL_FORUM_TOPIC_ENABLED in stale-pin-sweep.ts,
@@ -17630,6 +17635,10 @@ async function refreshPinnedBanner(reason: string): Promise<void> {
       onError: (phase, err) => {
         process.stderr.write(`telegram gateway: banner ${phase} failed (${reason}): ${err}\n`)
       },
+      // Share the one per-process pin-rights negative cache with the status-pin
+      // path and the stale-pin sweep (D5): the banner skips a chat already known
+      // rights-less and records/clears its own pin-verb discoveries there.
+      rightsCache: statusPinRightsCache,
       // Durable pin persistence into the SHARED status-pin store (distinct
       // `banner:` pinKey). persist-BEFORE-pin ordering: pending() lands before
       // the pinChatMessage call so a crash in that window is recoverable by the

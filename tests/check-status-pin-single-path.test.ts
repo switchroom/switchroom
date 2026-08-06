@@ -185,6 +185,82 @@ describe('a second wiring of the subsystem', () => {
   })
 })
 
+describe('single rights-detector — one isPinRightsError, no forked copy', () => {
+  it('reds on a SECOND exported isPinRightsError outside status-pin.ts', () => {
+    // The exact fork this PR deleted: the stale-pin-sweep had its own copy that
+    // could drift from the status-pin source of truth.
+    const v = scan(
+      'telegram-plugin/gateway/stale-pin-sweep.ts',
+      `export function isPinRightsError(err: unknown): boolean {\n  return description(err).includes('not enough rights')\n}\n`,
+    )
+    expect(rules(v)).toEqual(['single-rights-detector'])
+    expect(v[0].fix).toContain("'../status-pin.js'")
+  })
+
+  it('also reds on an exported const form', () => {
+    expect(
+      rules(
+        scan(
+          'telegram-plugin/slot-banner-driver.ts',
+          `export const isPinRightsError = (e: unknown) => String(e).includes('rights')\n`,
+        ),
+      ),
+    ).toEqual(['single-rights-detector'])
+  })
+
+  it('leaves the ONE definition in status-pin.ts alone', () => {
+    expect(
+      scan('telegram-plugin/status-pin.ts', `export function isPinRightsError(err: unknown): boolean {\n}\n`),
+    ).toEqual([])
+  })
+
+  it('does NOT red on IMPORTING or CALLING it, or on a differently-named rights fold', () => {
+    // Importing the single source is exactly what the sweep now does.
+    expect(
+      scan('telegram-plugin/gateway/stale-pin-sweep.ts', `import { isPinRightsError } from '../status-pin.js'\n`),
+    ).toEqual([])
+    expect(
+      scan('telegram-plugin/gateway/stale-pin-sweep.ts', `if (isPinRightsError(err)) return { kind: 'rights' }\n`),
+    ).toEqual([])
+    // The seven sanctioned folds have DIFFERENT names; only isPinRightsError is
+    // the guarded symbol.
+    expect(
+      scan(
+        'telegram-plugin/worker-activity-feed.ts',
+        `function isRightsFailure(e: unknown) { return String(e).includes('not enough rights') }\n`,
+      ),
+    ).toEqual([])
+  })
+})
+
+describe('sweep must not re-introduce a proactive getChatMember precheck', () => {
+  it('reds on a getChatMember call inside a stale-pin-sweep file', () => {
+    const v = scan(
+      'telegram-plugin/gateway/stale-pin-sweep-wiring.ts',
+      `const member = await bot().api.getChatMember(chatId, self)\n`,
+    )
+    expect(rules(v)).toEqual(['sweep-no-getchatmember'])
+    expect(v[0].fix).toContain('REACTIVELY')
+  })
+
+  it('leaves getChatMember in NON-sweep code alone (e.g. the reaction admin lookup)', () => {
+    expect(
+      scan('telegram-plugin/gateway/gateway.ts', `await bot.api.getChatMember(update.chat.id, reacter.id)\n`),
+    ).toEqual([])
+  })
+
+  it('has no marker escape — a precheck must not come back with a rubber stamp', () => {
+    expect(
+      rules(
+        scan(
+          'telegram-plugin/gateway/stale-pin-sweep.ts',
+          `await getChatMember(c, s) // allow-raw-pin: I promise it is fine\n`,
+        ),
+      ),
+    ).toEqual(['sweep-no-getchatmember'])
+  })
+})
+
 describe('allowlist parsing', () => {
   it('throws on a malformed entry rather than silently granting nothing', () => {
     expect(() => parseAllowlist('raw-pin-api :: some/file.ts\n')).toThrow(/malformed entry/)
