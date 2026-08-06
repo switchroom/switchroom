@@ -92,10 +92,46 @@ agents:
   klanker:
     auth:
       override: work                    # opt-out (edge case)
+  workbot:
+    auth:
+      override: work                    # pin to the work account…
+      strict: true                      # …never borrow another account
+      exclusive: true                   # …and nobody else may use it
 ```
 
 The schema is intentionally minimal in the common case — most agents
 need no `auth:` block.
+
+## Strict pins and exclusive accounts
+
+A plain `override:` is a **routing preference, not a suicide pact**:
+when the pinned account hard-walls, the broker serves the agent from
+`fallback_order` until the wall clears (see "Quota / 429 handling").
+That is right for load-balancing pins, and wrong for accounts that
+must never cross a billing or compliance boundary — e.g. an
+employer-provided subscription that only one agent may consume, and
+that must never quietly burn your personal quota (or vice versa).
+
+Two opt-in hardening flags close each direction. Both require
+`override:` and are yaml-only (edit `switchroom.yaml`, then restart
+the broker via `switchroom apply` / `agent restart`):
+
+- **`strict: true`** — the agent never borrows. While the pinned
+  account is walled or exhausted, the broker keeps serving the pin;
+  the agent rides out the window surfacing the normal 429/quota
+  cards instead of silently failing over onto fleet accounts. The
+  `mark-exhausted` fleet roll skips strict agents (their mirror
+  keeps the pin's credentials).
+- **`exclusive: true`** — nobody else borrows the account. The
+  loader rejects config that routes it elsewhere (`auth.active`,
+  `fallback_order`, another agent's `override`, a consumer pin), and
+  the broker refuses the hot paths at runtime: `auth use <label>` /
+  `/auth use` onto it, `auth agent override <other> <label>`, and
+  failover candidate selection all skip it for anyone but the owner.
+
+Use both together for full two-way isolation: one agent on the work
+account, the work account on one agent, no leakage in either
+direction.
 
 ## Filename conventions
 

@@ -1185,7 +1185,11 @@ no `CLAUDE_CODE_OAUTH_TOKEN` injection; `start.sh` defensively unsets
 that env var and `claude` reads `.credentials.json` directly.
 
 `switchroom.yaml` carries the fleet-wide `auth.active` (plus an
-optional `fallback_order` and rare per-agent `auth.override`):
+optional `fallback_order` and rare per-agent `auth.override`; an
+override can be hardened with `strict: true` — never serve the agent
+from another account — and `exclusive: true` — never serve the
+account to anyone else. See [`docs/auth.md`](auth.md) § Strict pins
+and exclusive accounts):
 
 ```yaml
 auth:
