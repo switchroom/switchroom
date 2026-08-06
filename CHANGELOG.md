@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
+
+### Web tooling
+
+- **Native WebSearch enabled fleet-wide (#4465)** — Claude's native WebSearch is on for every agent's main loop (subscription-billed, no Perplexity spend); native WebFetch stays denied so page fetches route through webkite.
+- **Pre-approve WebSearch (#4466)** — WebSearch joins the pre-approved allow set fleet-wide, so agents use it with zero permission prompts.
+
+### Latency and hooks
+
+- **Sub-agent card first paint at 4s (#4464)** — the sub-agent activity card's first paint drops from 8s to 4s, env-tunable.
+- **Plugin hooks run under bun (#4456)** — faster hook execution on every turn.
+- **Reply-guard hook scoped to reply tools (#4451)** — the sentinel-reply-guard only fires on reply tools, cutting per-turn overhead.
+- **Recall-hook latency instrumentation (#4453)** — the Hindsight recall hook now records its own latency.
+
+### Hindsight
+
+- **Durable stopword provisioning + PG regconfig fallback (#4463)** — recall stopwords are provisioned durably with a Postgres regconfig fallback.
+- **Recall tunables stamped from cascade (#4455)** — closes settings/env drift by stamping recall tunables from the config cascade.
+- **CPU-only Hindsight alarm (#4460)** — doctor raises a live-state alarm when Hindsight runs CPU-only on a GPU host.
+
+### LiteLLM pacing
+
+- **Token-aware pacing (#4461)** — `PACE_MAX_TPM` adds token-aware request pacing.
+- **Image token accounting (#4462)** — each image counts as ~1600 tokens in the admit estimate.
+
+### Ops and maintenance
+
+- **Config-repo auto-backup cron (#4450)** — scheduled auto-backup cron with doctor and update reconcile.
+- **Retire `pin_message` MCP tool (#4452)** — removed from the agent tool surface.
+- **Metrics duration guard (#4454)** — guards turn `duration_ms` against epoch-as-duration corruption.
+- **gdrive-mcp bump (#4467)** — pinned `google_workspace_mcp` 1.20.4 to 1.23.1.
+- **Docs fix (#4458)** — corrects a stale bun comment in the agent base image.
+
 ## v0.20.11 — the corrections-as-eval-cases self-improvement subsystem, Telegram `/private` memory mode, strict/exclusive per-agent account pins, and a merge-queue CI fix
 
 ### Self-improvement: corrections become regression tests
