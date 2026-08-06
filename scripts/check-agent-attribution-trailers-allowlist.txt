@@ -14,4 +14,15 @@
 # failure message spells out how to re-stamp the commits with
 # `git rebase -i --exec 'git commit --amend --no-edit'`.
 #
-# (empty)
+# PR #4442 (feat: strict + exclusive per-agent account pins). These five
+# commits were authored by the operator personally, at a laptop, pairing with
+# Claude Code (Claude Fable 5) OUTSIDE any switchroom agent container. That is
+# distinct from the "hook did not run" case above: there is no switchroom agent
+# that produced them, so `Switchroom-Agent:` has no truthful value — stamping a
+# fleet agent slug would be a fabricated provenance record. The honest facts
+# (operator + Claude Fable 5, local) are recorded here instead. Approved by Ken.
+a6f18a99d57fbacdff66ae2767fb0918456e9010
+6e560e661bf3b4ca569df80e56abec004e75e939
+52d018155e052716ced3ba59eaa40a868baefe65
+538f48cc19cb56553f9f63b497255d36214cc541
+47e27d5bfbe2d8b292421b180d71b8df3c67e9bb
