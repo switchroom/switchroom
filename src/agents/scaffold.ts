@@ -814,9 +814,12 @@ import {
 import { HINDSIGHT_DEFAULT_MCP_URL, HINDSIGHT_DEFAULT_API_BASE_URL } from "../setup/hindsight.js";
 import {
   resolveHindsightRecallTunables,
+  resolveHindsightRecallCaps,
   renderHindsightHooksOverrides,
   type HindsightRecallTunables,
+  type HindsightRecallCaps,
   type RecallTunableInput,
+  type RecallCapInput,
 } from "../setup/hindsight-recall-tunables.js";
 import {
   resolveHindsightRecallPassthrough,
@@ -3379,9 +3382,20 @@ export function installHindsightPlugin(
   // timeout) from the CASCADED config. Stamped onto the deployed plugin below
   // so `switchroom apply` RE-ASSERTS these values instead of reverting them —
   // see src/setup/hindsight-recall-tunables.ts for the full rationale.
-  const recallTunables = resolveHindsightRecallTunables(
-    resolveHindsightRecallConfig(switchroomConfig, agentName, resolvedAgentConfig),
+  const recallConfig = resolveHindsightRecallConfig(
+    switchroomConfig,
+    agentName,
+    resolvedAgentConfig,
   );
+  const recallTunables = resolveHindsightRecallTunables(recallConfig);
+  // Count + token caps (recallMaxMemories / recallMaxTokens), resolved from the
+  // SAME cascaded recall config as the latency envelope and the start.sh env
+  // exports. Stamping these from the cascade — rather than the old hardcoded 8 /
+  // unstamped 1024 — is what keeps settings.json in agreement with
+  // HINDSIGHT_RECALL_MAX_MEMORIES / HINDSIGHT_RECALL_MAX_TOKENS, so an invocation
+  // that does NOT inherit start.sh's env (a docker-exec'd retain/backfill) no
+  // longer silently reverts to the shipped defaults.
+  const recallCaps = resolveHindsightRecallCaps(recallConfig);
   const contentOverrides: Record<string, string> = {};
   try {
     const vendorSettingsPath = join(sourcePath, "settings.json");
@@ -3391,6 +3405,7 @@ export function installHindsightPlugin(
         additionalBanks,
         retainConfig,
         recallTunables,
+        recallCaps,
         observationScopeSettings,
       );
       if (expectedSettings != null) contentOverrides["settings.json"] = expectedSettings;
@@ -3454,6 +3469,7 @@ export function installHindsightPlugin(
     additionalBanks,
     retainConfig,
     recallTunables,
+    recallCaps,
     observationScopeSettings,
   );
   // Stamp the UserPromptSubmit recall-hook ceiling into the deployed
@@ -3605,9 +3621,11 @@ export function resolveHindsightRecallConfig(
    * caller's raw config is not literally that map entry.
    */
   resolvedAgentConfig?: AgentConfig,
-): RecallTunableInput | undefined {
+): (RecallTunableInput & RecallCapInput) | undefined {
   if (resolvedAgentConfig) {
-    return resolvedAgentConfig.memory?.recall as RecallTunableInput | undefined;
+    return resolvedAgentConfig.memory?.recall as
+      | (RecallTunableInput & RecallCapInput)
+      | undefined;
   }
   if (!switchroomConfig) return undefined;
   // Fallback for callers with no cascaded config (direct unit-test calls).
@@ -3621,7 +3639,7 @@ export function resolveHindsightRecallConfig(
     switchroomConfig.profiles,
     switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
   );
-  return resolved?.memory?.recall as RecallTunableInput | undefined;
+  return resolved?.memory?.recall as (RecallTunableInput & RecallCapInput) | undefined;
 }
 
 /**
@@ -3650,13 +3668,15 @@ function applyHindsightHooksOverrides(
 /**
  * Per-bank recall slot floors, switchroom's shipped defaults.
  *
- * Sized against the cap this fleet actually deploys — 6, from
- * `defaults.memory.recall.max_memories` in switchroom.yaml, which cascades to
- * HINDSIGHT_RECALL_MAX_MEMORIES and wins over the 8 stamped into the plugin's
- * settings.json. recall.py bounds the two floors to half the cap between them
- * (`_reservable_slots`), so 2 + 1 is the largest pair that is fully honoured at
- * cap 6 while still leaving three slots to pure global relevance. Floors that
- * summed to the cap would stop being floors and become a fixed quota.
+ * These are FLOORS inside `recallMaxMemories`, not fixed quotas. The effective
+ * cap is whatever the operator sets in `memory.recall.max_memories` (cascaded to
+ * both HINDSIGHT_RECALL_MAX_MEMORIES and the settings.json stamp — see
+ * resolveHindsightRecallCaps; switchroom's own default is 8, the vendor ships
+ * 12). recall.py bounds the two floors to HALF the cap between them
+ * (`_reservable_slots`), so 2 + 1 stays comfortably within a floor at any cap
+ * the fleet realistically runs (e.g. at cap 8 it reserves 3 of 8 and leaves 5 to
+ * pure global relevance; larger caps only widen that margin). Floors that summed
+ * to the cap would stop being floors and become a fixed quota.
  *
  * These are also the values exported to the environment unconditionally (see
  * `start.sh.hbs`) so a stale `~/.hindsight/claude-code.json` — which loads
@@ -3695,9 +3715,10 @@ const HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT = "degraded";
  *   - `retainMode`: full-session → chunked (Phase 6b: window, not whole
  *     transcript, re-consolidated per fire; paired with the vendor
  *     retain.py divergence)
- *   - `recallMaxMemories`: 12 → 8 (tighter prompt, less model noise)
+ *   - `recallMaxMemories`: 12 → cascade (default 8; `memory.recall.max_memories`)
+ *   - `recallMaxTokens`: cascade (default 1024; `memory.recall.max_tokens`)
  *   - `recallOwnBankMinSlots` / `recallAdditionalBankMinSlots`: 0/0 → 2/1
- *     (neither bank can take every slot of the deployed cap of 6)
+ *     (FLOORS inside recallMaxMemories, bounded to half the cap by recall.py)
  *
  * Future overrides go here, NOT in the vendor file. The vendor is
  * third-party code and must remain untouched for clean upstream
@@ -3709,6 +3730,7 @@ function applyHindsightSettingsOverrides(
   additionalBanks: readonly string[],
   retainConfig: HindsightRetainConfig,
   recallTunables: HindsightRecallTunables,
+  recallCaps: HindsightRecallCaps,
   observationScopeSettings: HindsightObservationScopeSettings,
 ): void {
   const settingsPath = join(pluginDestPath, "settings.json");
@@ -3724,6 +3746,7 @@ function applyHindsightSettingsOverrides(
     additionalBanks,
     retainConfig,
     recallTunables,
+    recallCaps,
     observationScopeSettings,
   );
   if (next == null) return; // malformed settings; don't make it worse
@@ -3743,6 +3766,7 @@ function renderHindsightSettingsOverrides(
   additionalBanks: readonly string[],
   retainConfig: HindsightRetainConfig,
   recallTunables: HindsightRecallTunables,
+  recallCaps: HindsightRecallCaps,
   observationScopeSettings: HindsightObservationScopeSettings,
 ): string | null {
   let settings: Record<string, unknown>;
@@ -3797,12 +3821,24 @@ function renderHindsightSettingsOverrides(
   // why the paired vendor change keeps the new tag OUT of the consolidation
   // scope so this is not a silent scope migration.
   settings.retainTags = [...RETAIN_TAGS_DEFAULT];
-  // v0.13.22 smart defaults: at our recallBudget=low the vendor's 12
-  // memories is generous; 8 keeps prompt noise down without hurting
-  // the substantive recall@N (top-8 carries the same dominant facts
-  // that top-12 does, per the 2026-05-24 audit's recall-quality sample).
-  // Operators can re-raise via memory.recall.max_memories in switchroom.yaml.
-  settings.recallMaxMemories = 8;
+  // Count + token caps, stamped from the CASCADE-RESOLVED operator config, NOT
+  // hardcoded literals. recallMaxMemories used to be a bare `8` here and
+  // recallMaxTokens was never stamped (the vendor's 1024 rode through), while
+  // start.sh exported HINDSIGHT_RECALL_MAX_MEMORIES / HINDSIGHT_RECALL_MAX_TOKENS
+  // from the operator's memory.recall.max_memories / .max_tokens. Env wins at
+  // runtime (DEFAULTS → settings.json → claude-code.json → env), so the live
+  // supervised session was correct — but any invocation WITHOUT that env (a
+  // docker-exec'd retain/backfill, or the plugin before the export ran) silently
+  // reverted to 8/1024, and `switchroom doctor` was blind to the split. Resolving
+  // both from the same cascade as the env export closes the drift.
+  //
+  // Defaults when the operator sets neither: 8 (switchroom's tightened
+  // recallMaxMemories, vendor ships 12) and 1024 (the vendor recallMaxTokens),
+  // i.e. byte-identical to what the fleet ran before this was cascade-stamped.
+  // Operators re-raise via memory.recall.max_memories / .max_tokens in
+  // switchroom.yaml. See resolveHindsightRecallCaps.
+  settings.recallMaxMemories = recallCaps.maxMemories;
+  settings.recallMaxTokens = recallCaps.maxTokens;
   // Recall latency envelope. Both of these were previously UNMANAGED:
   // `recallParallelDeadlineSeconds` was readable from config but nothing in
   // switchroom ever resolved it from switchroom.yaml, and the per-bank timeout
@@ -3851,13 +3887,15 @@ function renderHindsightSettingsOverrides(
   // field that would have caught the own-bank outage, since a fully timed-out
   // own bank still logs a full `result_count`.
   //
-  // 2/1 against the cap this fleet actually deploys — which is 6, not the 8
-  // stamped above: `defaults.memory.recall.max_memories: 6` in switchroom.yaml
-  // cascades to HINDSIGHT_RECALL_MAX_MEMORIES, and env wins over settings.json.
+  // 2/1 against recallMaxMemories, whatever the operator set it to
+  // (`memory.recall.max_memories` cascades to both HINDSIGHT_RECALL_MAX_MEMORIES
+  // and the settings.json stamp above — the two now carry the same value, so the
+  // floors bind against the same cap on every invocation, env-inheriting or not).
   // FLOORS, not quotas, and enforced as such: recall.py bounds the two floors to
-  // HALF the cap between them (`_reservable_slots`), so at least three of six
-  // slots are always won on pure relevance and composition still moves with the
-  // scores. Floors that summed to the cap (4+2 at 6) would be a fixed quota with
+  // HALF the cap between them (`_reservable_slots`), so at least half the slots
+  // are always won on pure relevance and composition still moves with the
+  // scores (at the default cap of 8, that reserves 3 and leaves 5). Floors that
+  // summed to the cap would be a fixed quota with
   // no score influence at all. Each side also gets its floor only if it returned
   // that many, so a silent bank wastes nothing. Operators re-tune via
   // memory.recall.own_bank_min_slots / .additional_bank_min_slots in
