@@ -41,6 +41,8 @@ import {
   ensureHindsightConsumer,
   resolveHindsightCpAccessKey,
   resolveHindsightLlmSecrets,
+  diffDroppedHindsightLlmVaultKeys,
+  hindsightLlmDroppedKeyWarning,
   HINDSIGHT_CONSUMER_NAME,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
@@ -1331,6 +1333,12 @@ export async function stepMemoryBackend(
       config.hindsight?.llm,
       deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
     );
+    // Symmetric to the cp_access_key warning above: a `vault:` LLM api_key ref
+    // that fails to resolve is dropped and the lane silently falls back to the
+    // provider default, so name every drop rather than launch on it quietly.
+    for (const drop of await diffDroppedHindsightLlmVaultKeys(config.hindsight?.llm, resolvedLlm)) {
+      console.log(chalk.yellow(`  ! ${hindsightLlmDroppedKeyWarning(drop)}`));
+    }
     const startContainer = deps.startContainer ?? startHindsight;
     startContainer(
       ports,

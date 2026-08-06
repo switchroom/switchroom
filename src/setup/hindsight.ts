@@ -1620,6 +1620,77 @@ export async function resolveHindsightLlmSecrets(
 }
 
 /**
+ * A hindsight LLM api_key `vault:` reference that FAILED to resolve and was
+ * dropped by {@link resolveHindsightLlmSecrets}. Carries the lane it belonged
+ * to and the reference string ONLY — never the resolved `sk-` secret.
+ */
+export interface DroppedHindsightLlmVaultKey {
+  /** `"global"`, or a per-op name: `retain` / `reflect` / `consolidation`. */
+  lane: string;
+  /** The `vault:<key>` reference that could not be resolved. NEVER a secret. */
+  ref: string;
+}
+
+/**
+ * Diff an LLM config against its {@link resolveHindsightLlmSecrets} output to
+ * find every api_key `vault:` reference that failed to resolve and was dropped.
+ *
+ * A drop means that lane silently falls back to the inherited / provider-default
+ * credential instead of the operator's configured key — invisible otherwise.
+ * The launch paths warn on it exactly as {@link HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}
+ * warns on a dropped CP key (see {@link hindsightLlmDroppedKeyWarning}).
+ *
+ * Only `vault:` references are reported: a literal that resolves to itself is
+ * never "dropped", and an absent field was never configured. The returned `ref`
+ * is the `vault:<key>` reference string only — the whole point of resolving
+ * before launch is that the `sk-` value NEVER reaches an operator-facing surface.
+ */
+export async function diffDroppedHindsightLlmVaultKeys(
+  original: HindsightLlmConfig | undefined,
+  resolved: HindsightLlmConfig | undefined,
+): Promise<DroppedHindsightLlmVaultKey[]> {
+  if (!original) return [];
+  const { isVaultReference } = await import("../vault/resolver.js");
+  const drops: DroppedHindsightLlmVaultKey[] = [];
+  const check = (lane: string, origKey: string | undefined, resolvedKey: string | undefined) => {
+    const ref = origKey?.trim();
+    // A vault ref present in the input but absent from the output is a drop; a
+    // literal (resolves to itself) or an unset field is not.
+    if (ref && isVaultReference(ref) && !resolvedKey) drops.push({ lane, ref });
+  };
+  check("global", original.api_key, resolved?.api_key);
+  for (const op of HINDSIGHT_LLM_OPS) {
+    check(
+      op,
+      original[op as HindsightLlmOp]?.api_key,
+      resolved?.[op as HindsightLlmOp]?.api_key,
+    );
+  }
+  return drops;
+}
+
+/**
+ * Operator-facing warning the launch paths emit when a hindsight LLM api_key
+ * `vault:` reference could not be resolved and was dropped. The symmetric
+ * counterpart to {@link HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}: a dropped LLM key
+ * is otherwise silent, and the lane quietly runs on the inherited / provider
+ * default credential — so fact extraction on that lane can fail with no trace.
+ * Names the lane and the `vault:` reference; NEVER the resolved secret.
+ */
+export function hindsightLlmDroppedKeyWarning(drop: DroppedHindsightLlmVaultKey): string {
+  const where =
+    drop.lane === "global" ? "the global LLM lane" : `the \`${drop.lane}\` LLM op`;
+  const fallback =
+    drop.lane === "global" ? "every op inherits" : "the op inherits";
+  return (
+    `hindsight: ${where} api_key \`${drop.ref}\` did not resolve through the ` +
+    "vault broker (denied, missing, or broker down) — the key was DROPPED, so " +
+    `${fallback} the provider-default credential and fact extraction on that ` +
+    "lane may fail. Check the broker grant for the reference above, then re-run."
+  );
+}
+
+/**
  * Whether hindsight's LLM traffic terminates on a self-hosted endpoint.
  *
  * The capability gate for the LLM concurrency caps (see

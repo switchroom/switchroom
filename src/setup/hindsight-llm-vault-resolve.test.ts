@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 import {
   resolveHindsightLlmSecrets,
+  diffDroppedHindsightLlmVaultKeys,
+  hindsightLlmDroppedKeyWarning,
   hindsightContainerEnvPairs,
   type HindsightLlmConfig,
 } from "./hindsight.js";
@@ -164,5 +166,85 @@ describe("resolveHindsightLlmSecrets", () => {
     for (const value of env.values()) {
       expect(value).not.toContain("vault:");
     }
+  });
+});
+
+/**
+ * Minor-1 (follow-up to the 2026-08-06 outage PR): a `vault:` LLM api_key that
+ * fails to resolve is DROPPED — correct fail-safe, but silent. The launch paths
+ * warn on the drop, symmetric to the cp_access_key warning. These assert the
+ * diff finds the drops and the message names the lane + ref without a secret.
+ */
+describe("diffDroppedHindsightLlmVaultKeys", () => {
+  const VAULT_REF = "vault:litellm/gpt-oss-key";
+  const REAL_KEY = "sk-" + "resolved-oss-key-abc123";
+
+  it("returns no drops when there is no config", async () => {
+    await expect(diffDroppedHindsightLlmVaultKeys(undefined, undefined)).resolves.toEqual([]);
+  });
+
+  it("reports a dropped global `vault:` ref (input ref, output undefined)", async () => {
+    const drops = await diffDroppedHindsightLlmVaultKeys(
+      { api_key: VAULT_REF },
+      { api_key: undefined },
+    );
+    expect(drops).toEqual([{ lane: "global", ref: VAULT_REF }]);
+  });
+
+  it("reports each dropped per-op lane by name", async () => {
+    const drops = await diffDroppedHindsightLlmVaultKeys(
+      {
+        retain: { api_key: VAULT_REF },
+        reflect: { api_key: "vault:litellm/reflect-key" },
+        consolidation: { api_key: VAULT_REF },
+      },
+      {
+        retain: { api_key: undefined },
+        reflect: { api_key: undefined },
+        consolidation: { api_key: undefined },
+      },
+    );
+    expect(drops.map((d) => d.lane).sort()).toEqual(["consolidation", "reflect", "retain"]);
+  });
+
+  it("does NOT report a `vault:` ref that resolved (output has the key)", async () => {
+    const drops = await diffDroppedHindsightLlmVaultKeys(
+      { api_key: VAULT_REF },
+      { api_key: REAL_KEY },
+    );
+    expect(drops).toEqual([]);
+  });
+
+  it("does NOT report a non-`vault:` literal that came back empty", async () => {
+    // A plain literal is never a broker drop — only `vault:` refs are reported.
+    const drops = await diffDroppedHindsightLlmVaultKeys(
+      { api_key: REAL_KEY },
+      { api_key: undefined },
+    );
+    expect(drops).toEqual([]);
+  });
+
+  it("does NOT report an unset field", async () => {
+    const drops = await diffDroppedHindsightLlmVaultKeys({ provider: "openai" }, { provider: "openai" });
+    expect(drops).toEqual([]);
+  });
+});
+
+describe("hindsightLlmDroppedKeyWarning", () => {
+  const VAULT_REF = "vault:litellm/gpt-oss-key";
+
+  it("names the global lane and the `vault:` ref, never a secret", () => {
+    const msg = hindsightLlmDroppedKeyWarning({ lane: "global", ref: VAULT_REF });
+    expect(msg).toContain("global LLM lane");
+    expect(msg).toContain(VAULT_REF);
+    expect(msg).toMatch(/did not resolve/);
+    expect(msg).not.toContain("sk-");
+  });
+
+  it("names a per-op lane", () => {
+    const msg = hindsightLlmDroppedKeyWarning({ lane: "retain", ref: VAULT_REF });
+    expect(msg).toContain("`retain` LLM op");
+    expect(msg).toContain(VAULT_REF);
+    expect(msg).not.toContain("sk-");
   });
 });

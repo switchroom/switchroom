@@ -630,6 +630,57 @@ describe("stepMemoryBackend (Docker absent)", () => {
       else process.env.SWITCHROOM_AGENT_NAME = savedName;
     }
   });
+
+  it("WARNS (naming the lane + ref, no secret) when a `vault:` LLM api_key drops", async () => {
+    // Minor-1 outcome guard: when the broker cannot resolve the `vault:` ref,
+    // the key is dropped and the lane silently inherits the provider default.
+    // The launch path must SAY so — symmetric to the cp_access_key warning —
+    // rather than launch quietly. This asserts the warning fires, names the
+    // lane and the `vault:` reference, and never prints a resolved `sk-` value.
+    const VAULT_REF = "vault:litellm/gpt-oss-key";
+    const savedName = process.env.SWITCHROOM_AGENT_NAME;
+    delete process.env.SWITCHROOM_AGENT_NAME;
+
+    const config = {
+      agents: { alpha: { topic_name: "alpha-topic" } },
+      hindsight: { llm: { provider: "openai", api_key: VAULT_REF } },
+    } as unknown as SwitchroomConfig;
+
+    const probe = (args: string[]) => {
+      if (args[0] === "--version") return "Docker version 27.0.0\n";
+      return "";
+    };
+    const startContainer = vi.fn();
+    // Broker denies the grant → the ref cannot resolve → the key is dropped.
+    const getViaBrokerStructured = vi.fn().mockResolvedValue({ kind: "denied" });
+
+    try {
+      await expect(
+        stepMemoryBackend(config, true, cfgPath, {
+          dockerProbe: probe,
+          startContainer: startContainer as never,
+          getViaBrokerStructured: getViaBrokerStructured as never,
+          sleep: async () => {},
+          readyRetries: 1,
+        }),
+      ).rejects.toThrow(/did not stay running/);
+
+      // The dropped key reached startContainer as undefined (fail-safe), and the
+      // operator was warned about it.
+      const llmArg = startContainer.mock.calls[0][3] as { api_key?: string } | undefined;
+      expect(llmArg?.api_key).toBeUndefined();
+
+      const text = logs.join("\n");
+      expect(text).toMatch(/did not resolve through the/);
+      expect(text).toMatch(/global LLM lane/);
+      expect(text).toContain(VAULT_REF);
+      // Secret hygiene: no resolved `sk-` value on any operator-facing line.
+      expect(text).not.toContain("sk-");
+    } finally {
+      if (savedName === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+      else process.env.SWITCHROOM_AGENT_NAME = savedName;
+    }
+  });
 });
 
 // ─── review M4: a FAIL verdict is sampled, like the OK verdict ───────────────
