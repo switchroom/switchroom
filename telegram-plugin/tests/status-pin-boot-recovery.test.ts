@@ -259,6 +259,44 @@ describe("status-pin boot recovery (gateway wiring)", () => {
     expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
   });
 
+  it("(SAFETY) boot cleanup NEVER unpins a message the framework did not record (a user's manual pin survives)", async () => {
+    // The hard safety constraint of the boot reap: it reaps ONLY the framework's
+    // own pins (the status/activity card, the 🛠 Worker card — the rows this
+    // process itself wrote to status-pins.json). A message the USER deliberately
+    // pinned is never recorded there, so the reap must leave it completely
+    // untouched. A boot that nuked a user's real pin is a regression worse than a
+    // stranded orphan. This test makes that structural guarantee an assertion:
+    // the store never sees the user's id, so the reap can never target it.
+    const { fs } = memFs();
+    const tg = fakeTelegram();
+
+    // Session 1: the framework pins its OWN work-scoped status card (recorded).
+    const gw1 = makeGateway(fs, tg);
+    await gw1.reconcileStatusPin("fg:c:3", "-100123", { pinned: true, messageId: 715 });
+
+    // A user manually pins their own message in the SAME chat. It lives in the
+    // Telegram pin stack but is NOT in status-pins.json — the framework has no
+    // record of it and no business touching it.
+    tg.pinned.add("-100123:999");
+
+    // The framework's pin is the ONLY recorded row; the user's is not present.
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([
+      { pinKey: "fg:c:3", chatId: "-100123", messageId: 715 },
+    ]);
+    expect(loadStatusPins(PATH, fs).some((r) => r.messageId === 999)).toBe(false);
+
+    // ── CRASH, then a fresh boot runs the reap. ──
+    const gw2 = makeGateway(fs, tg);
+    const res = await gw2.bootCleanup();
+
+    // Exactly the framework's OWN pin was cleared …
+    expect(res).toEqual({ cleared: 1, retained: 0, kept: 0, total: 1 });
+    expect(tg.pinned.has("-100123:715")).toBe(false);
+    // … and the user's manual pin is untouched — never unpinned.
+    expect(tg.pinned.has("-100123:999")).toBe(true);
+    expect(idOnly(loadStatusPins(PATH, fs))).toEqual([]);
+  });
+
   it("clean shutdown (sweep DID run) leaves nothing for boot cleanup to do", async () => {
     // Contrast: when the SIGTERM sweep runs (unpin each key), the store is
     // emptied and the pin removed — boot cleanup is a no-op. This guards the

@@ -8370,8 +8370,7 @@ const statusPinClaims = new Map<string, StatusPinClaim>()
 // Rights-aware negative cache (#3024): chats where an auto status-pin attempt
 // failed with the permanent "not enough rights to manage pinned messages" 400.
 // Per-process only — a restart clears it so a later-granted pin right re-enables
-// auto-pin. The explicit `pin_message` MCP tool deliberately does NOT consult
-// this cache (it always attempts and surfaces the error to the agent).
+// auto-pin.
 const statusPinRightsCache = new PinRightsCache()
 
 // Durable snapshot of the pin claim set on the persistent per-agent volume
@@ -8466,21 +8465,16 @@ const BANNER_PIN_KEY = 'banner:owner'
 // run → no-op). The boot-cleanup gate below is widened to cover this.
 const bannerPinPersistEnabled = !STATIC
 
-// `pin_message` MCP-tool pin registration (#3001). Tool pins ride the same
-// shared status-pins.json store under `tool:<chatId>:<messageId>` keys, but
-// with a TTL row (`expiresAt`): a tool pin is a deliberate agent action with
-// no "work finished" event, so a restart does NOT reset it — boot cleanup
-// keeps unexpired tool rows and only unpins them once the TTL lapses (the
-// backstop against agent-pinned messages accumulating forever). Independent
-// of PIN_STATUS_WHILE_WORKING (it gates the auto status pin, not the tool).
+// LEGACY `tool:` pin drain (#3001; the `pin_message` MCP tool was retired in
+// #4452). No new `tool:<chatId>:<messageId>` rows are ever written now that the
+// tool is gone, but rows an earlier build persisted may still sit in the shared
+// status-pins.json with a TTL (`expiresAt`). This flag keeps the boot cleanup /
+// stale-pin sweep aware of those legacy rows so they are still expired and
+// drained correctly on upgrade — an unexpired legacy row is preserved across
+// boots (never reaped as if it were a work-scoped card), then unpinned once its
+// TTL lapses, exactly as before. Independent of PIN_STATUS_WHILE_WORKING.
+// Self-clears within one TTL window since nothing writes new tool rows.
 const toolPinPersistEnabled = !STATIC
-// 7 days: generous — an agent-pinned message the operator still cares about
-// after a week has usually been re-pinned or acted on; anything older is the
-// stale-pin long tail this issue exists to clear. Override for tuning.
-const TOOL_PIN_TTL_MS = (() => {
-  const v = Number(process.env.SWITCHROOM_TOOL_PIN_TTL_MS)
-  return Number.isFinite(v) && v > 0 ? v : 7 * 24 * 60 * 60_000
-})()
 
 // Persist (or drop) the slot-banner's pin row into the shared store. Routes
 // through mutateStatusPinRow: a read-modify-write for ONLY the banner:owner key,
@@ -8950,8 +8944,7 @@ async function reconcileStatusPin(
   // "not enough rights to manage pinned messages" 400 in a supergroup took the
   // whole gateway down (marko, 2026-07-01). Auto status-pin is cosmetic; it
   // must NEVER be able to crash the gateway. Any throw here is logged and
-  // absorbed. (The `pin_message` MCP tool still surfaces failures to the agent
-  // as a normal tool-error — that path is `executePinMessage`, not this one.)
+  // absorbed.
   try {
     // Serialize per pinKey (F2): reconcileStatusPinInner reads `prev` from the
     // in-memory claim map at its top, so overlapping same-key reconciles must
@@ -11808,7 +11801,7 @@ if (isGatewayMain && !STATIC) {
  *  bridge from calling arbitrary functions by name. */
 const ALLOWED_TOOLS = new Set([
   'reply', 'progress_update', 'react', 'download_attachment',
-  'edit_message', 'send_typing', 'pin_message', 'delete_message',
+  'edit_message', 'send_typing', 'delete_message',
   'forward_message', 'get_recent_messages',
   'send_checklist', 'update_checklist',
   'ask_user',
@@ -11844,8 +11837,6 @@ async function executeToolCall(
       return executeEditMessage(args)
     case 'send_typing':
       return executeSendTyping(args)
-    case 'pin_message':
-      return executePinMessage(args)
     case 'delete_message':
       return executeDeleteMessage(args)
     case 'forward_message':
@@ -13193,44 +13184,6 @@ async function executeSendTyping(args: Record<string, unknown>): Promise<unknown
     if (key.startsWith(`${stChatId}:`)) ctrl.setTool()
   }
   return { content: [{ type: 'text', text: `${action} indicator sent (auto-refreshes every 4s, stops after 30s or next reply)` }] }
-}
-
-async function executePinMessage(args: Record<string, unknown>): Promise<unknown> {
-  if (!args.chat_id) throw new Error('pin_message: chat_id is required')
-  if (!args.message_id) throw new Error('pin_message: message_id is required')
-  const pinChatId = String(args.chat_id ?? '')
-  assertAllowedChat(pinChatId)
-  // #1075: wrap through robustApiCall so flood-wait / transient network
-  // errors are retried. THREAD_NOT_FOUND on a stale topic surfaces to the
-  // agent as a tool-error — pinning a vanished message is genuinely a
-  // failure the agent should see.
-  const pinMsgId = Number(args.message_id)
-  await robustApiCall(
-    () => lockedBot.api.pinChatMessage(pinChatId, pinMsgId), // allow-raw-pin: MCP `pin_message` tool — an explicit, agent-requested pin of an arbitrary message, not a progress surface with a claim.
-    { chat_id: pinChatId, verb: 'pin_message' },
-  )
-  // An explicit pin succeeded here, so the bot demonstrably HAS pin rights in
-  // this chat now — clear any auto-pin negative-cache entry (#3024) so the auto
-  // status-pin path resumes immediately rather than waiting for a restart. The
-  // explicit tool itself never consults the cache; a failure above still
-  // surfaces to the agent as a normal tool error (robustApiCall rethrows).
-  statusPinRightsCache.clear(pinChatId)
-  // #3001: register the tool pin in the shared status-pin store under a
-  // `tool:` key so it is no longer fire-and-forget. Unlike work-scoped
-  // fg:/wk: rows a tool pin has no "work finished" event, so a restart does
-  // NOT reset it — boot cleanup keeps the row until its TTL, then unpins the
-  // (likely long-forgotten) message. Best-effort fire-and-forget: a store
-  // failure must never fail the tool call the pin already landed for.
-  if (toolPinPersistEnabled) {
-    const toolPinKey = `tool:${pinChatId}:${pinMsgId}`
-    void mutateStatusPinRow(STATUS_PIN_STORE_PATH, statusPinStoreFs, toolPinKey, { // allow-raw-pin-store: records the TTL-scoped `tool:` row for the explicit pin above so the boot sweep can expire it.
-      pinKey: toolPinKey,
-      chatId: pinChatId,
-      messageId: pinMsgId,
-      expiresAt: Date.now() + TOOL_PIN_TTL_MS,
-    })
-  }
-  return { content: [{ type: 'text', text: `pinned message ${args.message_id}` }] }
 }
 
 async function executeDeleteMessage(args: Record<string, unknown>): Promise<unknown> {

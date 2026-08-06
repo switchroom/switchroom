@@ -2,7 +2,7 @@
  * Per-(chat, thread) FIFO serialization for outbound Telegram API calls.
  *
  * Without this, concurrent MCP tool handlers (reply, stream_reply, react,
- * edit_message, delete_message, pin_message, forward_message) all call
+ * edit_message, delete_message, forward_message) all call
  * `bot.api.*` independently. When two calls race, HTTP latency can flip
  * their delivery order — a later `reply` can land before an earlier
  * `stream_reply` edit, or a `react` can resolve before the `reply` it

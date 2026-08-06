@@ -1,7 +1,8 @@
 # Clearing orphaned bot pins
 
 The gateway pins things: the foreground activity card, worker feeds, the slot
-banner, `pin_message` tool pins. A crash mid-turn can leave one of those pinned
+banner (plus legacy `pin_message` tool pins from builds before that tool was
+retired in #4452). A crash mid-turn can leave one of those pinned
 forever — an **orphan**. The boot sweep
 (`telegram-plugin/gateway/stale-pin-sweep.ts`) exists to drain them, and on a
 current build it does so automatically. This page is for the residue it

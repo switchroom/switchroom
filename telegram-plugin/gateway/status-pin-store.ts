@@ -17,7 +17,8 @@
  * — the turn it represented is over or crashed), dropping rows only after a
  * successful unpin (failed ones are retained with an attempt counter for a
  * next-boot retry — see runStatusPinBootCleanup). Time-scoped `tool:` rows
- * (the `pin_message` MCP tool, #3001) survive boots until their `expiresAt`.
+ * (legacy pins from the retired `pin_message` MCP tool, #3001 / #4452 — no new
+ * ones are written) survive boots until their `expiresAt`.
  * It does NOT re-adopt or re-pin — it only cleans up.
  *
  * Shape choice — SNAPSHOT, not append-log, mirroring obligation-store.ts. The
@@ -78,10 +79,10 @@ export interface PersistedStatusPin {
   /** Wall-clock ms after which this pin is stale and boot cleanup unpins it.
    *  Rows WITHOUT this field are work-scoped (fg:/wk:/banner:) — stale the
    *  moment their owning session dies, so boot cleanup unpins them
-   *  unconditionally. Rows WITH it (the `tool:` pins written by the
-   *  `pin_message` MCP tool, #3001) represent deliberate agent pins that have
-   *  no "work finished" event: they SURVIVE restarts and are only swept once
-   *  expired. */
+   *  unconditionally. Rows WITH it (legacy `tool:` pins from the retired
+   *  `pin_message` MCP tool, #3001 / #4452 — no new ones are written)
+   *  represented deliberate agent pins with no "work finished" event: they
+   *  SURVIVE restarts and are only swept once expired. */
   expiresAt?: number
   /** Boot-cleanup unpin retry counter (#3001). Incremented each boot the
    *  unpin fails (flood-wait exhausted / transient 5xx); the row is retained
@@ -282,10 +283,10 @@ export function pinnedMessageIsOurs(
  * record whose pin MAY have landed in Telegram, so we must treat it exactly
  * like a confirmed one and unpin it.
  *
- * TIME-SCOPED rows (`tool:` pins from the `pin_message` MCP tool, carrying
- * `expiresAt`) have no "work finished" event, so a restart does NOT reset
- * them: an unexpired row is RETAINED untouched across boots and only unpinned
- * once `now >= expiresAt`.
+ * TIME-SCOPED rows (legacy `tool:` pins from the retired `pin_message` MCP
+ * tool, #4452, carrying `expiresAt`) have no "work finished" event, so a
+ * restart does NOT reset them: an unexpired row is RETAINED untouched across
+ * boots and only unpinned once `now >= expiresAt`.
  *
  * RETRY-SAFETY (#3001): a row is dropped only AFTER its unpin resolves. A
  * failing unpin (flood-wait exhausted / transient 5xx) retains the row with an

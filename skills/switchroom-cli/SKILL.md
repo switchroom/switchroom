@@ -299,7 +299,6 @@ The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MC
 | `edit_message` | Modify an earlier bot message's text |
 | `delete_message` | Remove an earlier bot message |
 | `forward_message` | Forward a message from another chat |
-| `pin_message` | Pin a message in the current chat |
 | `send_typing` | Show the "typing…" indicator |
 | `download_attachment` | Save a Telegram file attachment to the agent's inbox |
 | `get_recent_messages` | Fetch recent history for context |

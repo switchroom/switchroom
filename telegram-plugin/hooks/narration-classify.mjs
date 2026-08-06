@@ -108,7 +108,7 @@ export function isStructuralNarration(text, followedByToolUse) {
  * follow-up, MF4). A text block followed ONLY by tools in this set is still the
  * TERMINAL answer for backstop-coalescing purposes — these tools carry no
  * model-authored answer text and are the only ones plausibly fired AFTER a
- * terminal answer (answer, then react / pin / typing / edit). Everything NOT in
+ * terminal answer (answer, then react / typing / edit). Everything NOT in
  * this set — work / deliverable tools (download_attachment, get_recent_messages,
  * send_checklist, ask_user, …) and every non-telegram tool (retain / read /
  * bash / web / …) — is turn-CONTINUING: a text block a real tool followed is
@@ -123,7 +123,6 @@ export function isStructuralNarration(text, followedByToolUse) {
 export const EPHEMERAL_TOOLS = new Set([
   'react',
   'send_typing',
-  'pin_message',
   'delete_message',
   'edit_message',
 ])

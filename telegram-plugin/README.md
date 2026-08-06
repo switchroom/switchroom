@@ -38,8 +38,8 @@ adds the ergonomics and reliability that an always-on agent fleet needs:
 - **Switchroom slash-commands** — `/agents`, `/restart`, `/logs`, `/memory`,
   `/grant`, `/dangerous`, `/permissions`, `/reconcile` etc., handled by the
   plugin without consuming Claude Code tokens.
-- **11 MCP tools** — `reply`, `react`, `edit_message`,
-  `delete_message`, `forward_message`, `pin_message`, `send_typing`,
+- **10 MCP tools** — `reply`, `react`, `edit_message`,
+  `delete_message`, `forward_message`, `send_typing`,
   `download_attachment`, `get_recent_messages`, `send_checklist`,
   `update_checklist` (the latter two ship native Telegram checklists,
   see #272).
@@ -227,15 +227,6 @@ Sends a typing indicator ("Bot is typing...") to a chat. Auto-expires after ~5 s
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `chat_id` | yes | Target chat ID |
-
-### `pin_message` tool
-
-Pins a message in a chat. Requires admin rights in groups.
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `chat_id` | yes | Chat ID |
-| `message_id` | yes | Message to pin |
 
 ### `forward_message` tool
 

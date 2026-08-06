@@ -121,15 +121,21 @@ describe('selectBackstopDelivery — deterministic backstop coalescer (#3513 fol
 // ── isEphemeralTool — MF4 exact set ─────────────────────────────────────────
 
 describe('isEphemeralTool — the exact ephemeral surface set (MF4)', () => {
-  it('recognises exactly {react, send_typing, pin_message, delete_message, edit_message}, MCP-prefixed or bare', () => {
+  it('recognises exactly {react, send_typing, delete_message, edit_message}, MCP-prefixed or bare', () => {
     expect([...EPHEMERAL_TOOLS].sort()).toEqual(
-      ['delete_message', 'edit_message', 'pin_message', 'react', 'send_typing'].sort(),
+      ['delete_message', 'edit_message', 'react', 'send_typing'].sort(),
     )
     for (const t of EPHEMERAL_TOOLS) {
       expect(isEphemeralTool(t)).toBe(true)
       expect(isEphemeralTool(`mcp__switchroom-telegram__${t}`)).toBe(true)
       expect(isEphemeralTool(`mcp__clerk-telegram__${t}`)).toBe(true)
     }
+  })
+
+  it('pin_message is NOT ephemeral — the pin_message MCP tool was retired (#4452)', () => {
+    expect(EPHEMERAL_TOOLS.has('pin_message')).toBe(false)
+    expect(isEphemeralTool('pin_message')).toBe(false)
+    expect(isEphemeralTool('mcp__switchroom-telegram__pin_message')).toBe(false)
   })
 
   it('progress_update is NOT ephemeral (MF4 — dropped from the set)', () => {
