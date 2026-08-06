@@ -1179,6 +1179,351 @@ exit 0
     expect(r.stderr).toMatch(/text-search provisioning skipped/);
   }, 20_000);
 
+  // provision_pg_search() runs BEFORE prestart_pg0(): it stages the pg_search
+  // extension (.so + control + SQL) into the embedded-pg install dir and leaves
+  // pg0 STOPPED so prestart_pg0's start is the one that sets
+  // shared_preload_libraries=pg_search (a PGC_POSTMASTER GUC). These tests drive
+  // it with a baked-artifact tree + a fake pg0 and assert the OUTCOME.
+
+  /** Stage a fake baked pg_search artifact tree (.so + control + version SQL). */
+  function installFakePgSearchBake(root: string, major = "18"): void {
+    const lib = join(root, major, "lib");
+    const ext = join(root, major, "extension");
+    mkdirSync(lib, { recursive: true });
+    mkdirSync(ext, { recursive: true });
+    writeFileSync(join(lib, "pg_search.so"), "\x7fELF fake pg_search .so");
+    writeFileSync(join(ext, "pg_search.control"), "default_version = '0.25.1'\n");
+    writeFileSync(join(ext, "pg_search--0.25.1.sql"), "-- fake base sql\n");
+    writeFileSync(join(ext, "pg_search--0.24.0--0.25.1.sql"), "-- fake upgrade sql\n");
+  }
+
+  it("stages pg_search into the install dir and preloads it via prestart_pg0", async () => {
+    // The core happy path (reboot: the version-scoped install dir already
+    // exists). The .so + control + SQL are copied in, pg0 is STOPPED, and the
+    // authoritative prestart start carries shared_preload_libraries=pg_search.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot);
+    const installLib = join(dir, "inst", "18.1.0", "lib");
+    const installExt = join(dir, "inst", "18.1.0", "share", "extension");
+    mkdirSync(installLib, { recursive: true });
+    mkdirSync(installExt, { recursive: true });
+    const marker = join(dir, "pgs-cmd-ran");
+
+    const r = await runWithEnv(
+      {
+        SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(pg0log),
+        SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+        SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+        SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+        HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "pg_search",
+      },
+      ["sh", "-c", `touch ${marker}`],
+    );
+    expect(r.status).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+
+    // The extension artifacts were materialized into the current install dir.
+    expect(existsSync(join(installLib, "pg_search.so"))).toBe(true);
+    expect(existsSync(join(installExt, "pg_search.control"))).toBe(true);
+    expect(existsSync(join(installExt, "pg_search--0.25.1.sql"))).toBe(true);
+
+    const argv = argvOf(pg0log);
+    // provision_pg_search stops pg0 so the preload can be applied at next start.
+    expect(argv).toContain("stop");
+    // prestart_pg0's authoritative start carries the preload GUC.
+    expect(argv).toContain("shared_preload_libraries=pg_search");
+    expect(r.stderr).toMatch(/pg_search provisioning ok/);
+    expect(r.stderr).toMatch(/pg0 pre-start ok/);
+  }, 20_000);
+
+  it("starts pg0 PLAIN first to extract a fresh-volume install dir, then copies", async () => {
+    // First boot on an empty volume: the install dir does not exist until pg0
+    // extracts it. provision_pg_search must start pg0 WITHOUT a preload it
+    // cannot yet satisfy, let the dir appear, then copy — never hand the very
+    // first start a missing library.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-fresh-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot);
+    const installBase = join(dir, "inst", "18.1.0");
+    // A fake pg0 that materializes the version-scoped install dir on `start`,
+    // exactly as the real pg0 extracts it on first run.
+    const binDir = execTmpDir("swr-fakepg0-mkinstall-");
+    const pg0 = join(binDir, "pg0");
+    writeFileSync(
+      pg0,
+      `#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a" >> "${pg0log}"; done
+if [ "$1" = start ]; then mkdir -p "${join(installBase, "lib")}" "${join(installBase, "share", "extension")}"; fi
+exit 0
+`,
+      { mode: 0o755 },
+    );
+
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: pg0,
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "pg_search",
+    });
+    expect(r.status).toBe(0);
+    // The plain extraction start ran (a `start` appears in the log) …
+    expect(argvOf(pg0log)).toContain("start");
+    // … and the copy landed after the dir appeared.
+    expect(existsSync(join(installBase, "lib", "pg_search.so"))).toBe(true);
+    expect(existsSync(join(installBase, "share", "extension", "pg_search.control"))).toBe(true);
+    expect(r.stderr).toMatch(/pg_search provisioning ok/);
+  }, 20_000);
+
+  it("is a clean no-op (no copy, no preload) when the backend is not pg_search", async () => {
+    // The byte-identical-to-before guarantee: a native-pinned fleet (or an older
+    // switchroom that never emits the selector) must not stage the extension nor
+    // preload it. This is the safety valve for a not-yet-migrated populated DB.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-native-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot);
+    const installLib = join(dir, "inst", "18.1.0", "lib");
+    mkdirSync(installLib, { recursive: true });
+
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(pg0log),
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "native",
+    });
+    expect(r.status).toBe(0);
+    // Not staged …
+    expect(existsSync(join(installLib, "pg_search.so"))).toBe(false);
+    // … and never preloaded.
+    expect(argvOf(pg0log)).not.toContain("shared_preload_libraries=pg_search");
+    expect(r.stderr).not.toMatch(/pg_search provisioning ok/);
+  }, 20_000);
+
+  it("refuses to copy an ABI-mismatched .so when the install major moves ahead of the baked deb", async () => {
+    // A pg0 embedded-pg bump that lands a NEW major before the baked deb is
+    // updated must NOT copy the wrong-major .so (which would crash the postmaster
+    // on preload). It is skipped with a loud warning; bump PG_SEARCH_* to fix.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-mismatch-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot, "18");
+    // The live install is major 19 — ahead of the baked 18.
+    const installLib = join(dir, "inst", "19.0.0", "lib");
+    mkdirSync(installLib, { recursive: true });
+
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(pg0log),
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "pg_search",
+    });
+    expect(r.status).toBe(0);
+    expect(existsSync(join(installLib, "pg_search.so"))).toBe(false);
+    expect(r.stderr).toMatch(/major != baked/);
+    // The load-bearing half: because the copy was SKIPPED, no .so landed in the
+    // version-matched install dir, so prestart_pg0 must NOT hand the postmaster
+    // shared_preload_libraries=pg_search — that would tell pg0 to preload a
+    // library that isn't there and turn a graceful ABI-skip into a boot
+    // crash-loop. The preload gate keys off the LANDED artifact, not the bake.
+    expect(argvOf(pg0log)).not.toContain("shared_preload_libraries=pg_search");
+  }, 20_000);
+
+  it("does NOT adopt an already-running preload-less postmaster: SHOW-verifies, stops, restarts WITH the preload (MAJOR-2)", async () => {
+    // The dangerous adopt path: provision_pg_search()'s best-effort stop left a
+    // plain (preload-less) postmaster up, and prestart_pg0's `start` loses the
+    // race and gets "already running". A naive adopt would strand the box —
+    // shared_preload_libraries is PGC_POSTMASTER, so CREATE EXTENSION pg_search
+    // can never succeed against a server that came up without the preload. The
+    // entrypoint must SHOW-verify the preload, and finding it absent, STOP and
+    // restart WITH shared_preload_libraries=pg_search rather than adopt.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-adopt-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot, "18");
+    // Reboot path: a version-matched install dir already exists, so the .so
+    // lands there and the preload IS intended (landed major 18 == baked 18).
+    mkdirSync(join(dir, "inst", "18.1.0", "lib"), { recursive: true });
+    mkdirSync(join(dir, "inst", "18.1.0", "share", "extension"), { recursive: true });
+
+    // A stateful fake pg0: the FIRST `start` reports "already running" (the
+    // preload-less postmaster provisioning left up); after a `stop`, the next
+    // `start` succeeds — modelling a real stop+restart that applies the preload.
+    // Each invocation is also logged as ONE space-joined line to invLog so the
+    // test can count how many `start`s carried shared_preload_libraries=pg_search
+    // (a later native provision_text_search start carries none, so a raw token
+    // count would be ambiguous — the preload flag is the load-bearing signal).
+    const binDir = execTmpDir("swr-fakepg0-adopt-");
+    const pg0 = join(binDir, "pg0");
+    const startCtr = join(dir, "adopt-startctr");
+    const invLog = join(dir, "adopt-inv.log");
+    writeFileSync(
+      pg0,
+      `#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a" >> "${pg0log}"; done
+printf '%s\\n' "$*" >> "${invLog}"
+if [ "$1" = start ]; then
+  n=$(cat "${startCtr}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "${startCtr}"
+  if [ "$n" = 1 ]; then echo "fake pg0: FATAL: instance is already running" >&2; exit 1; fi
+fi
+exit 0
+`,
+      { mode: 0o755 },
+    );
+
+    const stateDir = join(dir, "adopt-fakestate");
+    const psqlBin = installFakePsql(stateDir); // SHOW ... -> empty (preload-less)
+    const psqlLog = join(dir, "adopt-psql.log");
+    const pgInstance = join(dir, "adopt-instance.json");
+    writePgInstance(pgInstance);
+
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: pg0,
+      PATH: `${psqlBin}:${process.env.PATH}`,
+      FAKE_PSQL_LOG: psqlLog,
+      SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "pg_search",
+    });
+    expect(r.status).toBe(0);
+    // The preload was SHOW-verified against the running postmaster.
+    expect(argvOf(psqlLog)).toContain("SHOW shared_preload_libraries");
+    // It did NOT silently adopt: the preload-less server was stopped and a
+    // SECOND preload-carrying start ran. A silent adopt would show exactly ONE
+    // start carrying shared_preload_libraries=pg_search (the failed first try).
+    const preloadStarts = argvOf(invLog).filter(
+      (l) => l.startsWith("start") && l.includes("shared_preload_libraries=pg_search"),
+    ).length;
+    expect(preloadStarts).toBe(2);
+    expect(argvOf(pg0log)).toContain("stop");
+    expect(r.stderr).toMatch(/already running WITHOUT pg_search preload/);
+    expect(r.stderr).toMatch(/restarted to apply pg_search preload/);
+    // And it did NOT take the silent-adopt branch.
+    expect(r.stderr).not.toMatch(/already running WITH pg_search preload; adopting/);
+  }, 20_000);
+
+  it("loud-fails rather than silently adopting when the preload-less postmaster cannot be stopped (MAJOR-2)", async () => {
+    // The unstoppable variant: prestart_pg0 SHOW-verifies the missing preload but
+    // its stop fails. It must NOT pretend success — it adopts only as a last
+    // resort with a LOUD warning that CREATE EXTENSION pg_search will fail, never
+    // logging the "restarted with preload" success line.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-unstoppable-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot, "18");
+    mkdirSync(join(dir, "inst", "18.1.0", "lib"), { recursive: true });
+    mkdirSync(join(dir, "inst", "18.1.0", "share", "extension"), { recursive: true });
+
+    // Fake pg0: `start` always reports "already running"; the FIRST `stop`
+    // (provision's) succeeds so provisioning stays fast, but the SECOND `stop`
+    // (prestart's) fails — the postmaster cannot be brought down.
+    const binDir = execTmpDir("swr-fakepg0-unstoppable-");
+    const pg0 = join(binDir, "pg0");
+    const stopCtr = join(dir, "unstoppable-stopctr");
+    const invLog = join(dir, "unstoppable-inv.log");
+    writeFileSync(
+      pg0,
+      `#!/bin/sh
+for a in "$@"; do printf '%s\\n' "$a" >> "${pg0log}"; done
+printf '%s\\n' "$*" >> "${invLog}"
+if [ "$1" = stop ]; then
+  n=$(cat "${stopCtr}" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "${stopCtr}"
+  if [ "$n" = 1 ]; then exit 0; fi
+  echo "fake pg0: stop failed: could not remove postmaster.pid" >&2; exit 1
+fi
+if [ "$1" = start ]; then echo "fake pg0: FATAL: instance is already running" >&2; exit 1; fi
+exit 0
+`,
+      { mode: 0o755 },
+    );
+
+    const stateDir = join(dir, "unstoppable-fakestate");
+    const psqlBin = installFakePsql(stateDir);
+    const pgInstance = join(dir, "unstoppable-instance.json");
+    writePgInstance(pgInstance);
+
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: pg0,
+      PATH: `${psqlBin}:${process.env.PATH}`,
+      SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "pg_search",
+    });
+    // Boot still proceeds (best-effort), but the failure is LOUD, not silent.
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/could not stop the already-running instance/);
+    expect(r.stderr).toMatch(/adopting the preload-less postmaster/);
+    // No successful restart happened: only the one (failed) preload-carrying start.
+    const preloadStarts = argvOf(invLog).filter(
+      (l) => l.startsWith("start") && l.includes("shared_preload_libraries=pg_search"),
+    ).length;
+    expect(preloadStarts).toBe(1);
+    expect(r.stderr).not.toMatch(/restarted to apply pg_search preload/);
+  }, 20_000);
+
+  it("skips pg_search provisioning for an external (non-embedded) database", async () => {
+    // Never reach into an operator's external postgres to stage our extension.
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "pgs-extdb-pg0.log");
+    const bakeRoot = join(dir, "bake");
+    installFakePgSearchBake(bakeRoot);
+    const installLib = join(dir, "inst", "18.1.0", "lib");
+    mkdirSync(installLib, { recursive: true });
+
+    const r = await runWithEnv({
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(pg0log),
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT: bakeRoot,
+      SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB: join(dir, "inst", "*"),
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "pg_search",
+      HINDSIGHT_API_DB_URL: "postgresql://user:pw@db.example.com:5432/hindsight",
+    });
+    expect(r.status).toBe(0);
+    expect(existsSync(join(installLib, "pg_search.so"))).toBe(false);
+    expect(r.stderr).toMatch(/pg_search provisioning skipped/);
+  }, 20_000);
+
+  it("bakes the pinned pg_search deb + libopenblas0 into the Dockerfile", () => {
+    // The entrypoint re-materializes what the image bakes; assert the bake is
+    // present, pinned (no floating latest), and provides the runtime prereq.
+    const dockerfilePath = resolve(__dirname, "..", "..", "docker", "Dockerfile.hindsight");
+    const raw = readFileSync(dockerfilePath, "utf-8");
+    // libopenblas0 is a hard DT_NEEDED of pg_search.so.
+    expect(raw).toMatch(/apt-get install -y --no-install-recommends libopenblas0/);
+    // Version + checksums are pinned, not floating.
+    expect(raw).toMatch(/ARG PG_SEARCH_VERSION=0\.25\.1/);
+    expect(raw).toMatch(/ARG PG_SEARCH_SHA256_AMD64=[0-9a-f]{64}/);
+    expect(raw).toMatch(/ARG PG_SEARCH_SHA256_ARM64=[0-9a-f]{64}/);
+    expect(raw).toMatch(/sha256sum -c -/);
+    // Staged at the STABLE path the entrypoint's PG_SEARCH_SRC_ROOT defaults to.
+    expect(raw).toMatch(/\/usr\/local\/lib\/switchroom\/pg_search/);
+    // amd64 + arm64 ARE the shipped arches: each maps to a checksum, not the
+    // fail branch.
+    expect(raw).toMatch(/amd64\) _arch=amd64; _sha="\$\{PG_SEARCH_SHA256_AMD64\}";;/);
+    expect(raw).toMatch(/arm64\) _arch=arm64; _sha="\$\{PG_SEARCH_SHA256_ARM64\}";;/);
+    // The default text-search backend is pg_search, so a build with NO baked deb
+    // would crash-loop on CREATE EXTENSION at first boot. The unsupported-arch
+    // branch must FAIL the build (exit 1), never silently `exit 0` — and must not
+    // carry the old false "installs fall back to native text search" comment,
+    // which no longer holds now that pg_search is the emitted default.
+    const archCase = raw
+      .split("\n")
+      .find((l) => l.includes("no prebuilt deb") || l.includes("artifact not available for TARGETARCH"));
+    expect(archCase, "unsupported-arch case arm not found in Dockerfile").toBeDefined();
+    expect(archCase).toMatch(/exit 1;;/);
+    expect(archCase).not.toMatch(/exit 0/);
+    expect(raw).not.toMatch(/fall back to native text search/);
+  });
+
   it("Dockerfile pins UID 11000 to match HINDSIGHT_DEFAULT_UID", () => {
     // The broker chowns the per-consumer socket to consumer.uid (mode 0600).
     // If the runtime UID inside hindsight didn't match what the operator

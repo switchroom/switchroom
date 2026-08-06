@@ -192,6 +192,7 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
       "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
       "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
+      "HINDSIGHT_API_TEXT_SEARCH_EXTENSION",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -351,7 +352,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-nine keys, by name", () => {
+  it("is overridable on exactly these fifty keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -389,6 +390,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
       "HINDSIGHT_API_TEMPORAL_LANGUAGES",
       "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
+      "HINDSIGHT_API_TEXT_SEARCH_EXTENSION",
       "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       // Both spellings of every per-type slot reservation are ACCEPTED as
