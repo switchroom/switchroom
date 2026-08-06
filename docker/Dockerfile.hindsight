@@ -587,7 +587,8 @@ assert '        return " | ".join(tokens)' in pg, "switchroom hindsight BM25 com
 print("switchroom hindsight BM25 compound-token patch: intact compound tokens appended (strict superset of upstream tokens); native tsquery left as a plain OR join")
 PYEOF
 
-# PG text-search regconfig / stopword-file recall fallback.
+# PG text-search recall fallback: missing regconfig / stopword-file (native)
+# AND absent pg_search BM25 index (ParadeDB) — follow-up to #4470.
 #
 # switchroom runs the native (Postgres) BM25 arms through a CUSTOM text-search
 # regconfig — HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE, set to
@@ -602,10 +603,20 @@ PYEOF
 # only caught Oracle's DRG-10599/ORA-30600/ORA-29902 and re-`raise`d everything
 # else, EVERY recall 500s — a total recall outage, not a degraded one.
 #
+# #4470 made pg_search (ParadeDB BM25) the default text-search backend for new
+# installs. It has the same failure mode on a different signature: whenever the
+# `USING bm25` index is absent — the initial build window, or any REINDEX — the
+# recall query's @@@ / paradedb.score arm raises SQLSTATE XX000 with
+# "<table> does not contain a USING bm25 index". The 42704/stopword predicate
+# below did not recognise that, so pg_search recall still failed CLOSED (500)
+# for the whole build/rebuild window while native degraded gracefully. A dry-run
+# on a full 772k-row clone caught it as a BLOCKER.
+#
 # This widens the existing semantic-only fallback (which the Oracle branch
-# already built, dialect-agnostically) to also trigger on the PG signatures,
-# reusing the very same rebuild. Recall degrades to semantic-only — lossy but
-# serving — until provisioning catches up, instead of failing closed. The
+# already built, dialect-agnostically) to also trigger on the native PG
+# signatures AND the pg_search "no bm25 index" signature, reusing the very same
+# rebuild. Recall degrades to semantic-only — lossy but serving — until
+# provisioning / the index build catches up, instead of failing closed. The
 # index-write path and the backfill migration are NOT touched here (they own
 # their own provisioning contract via the entrypoint); this covers the READ
 # path only, which is where a user-visible 500 would otherwise land.
@@ -633,9 +644,25 @@ NEW = '''        # switchroom: Postgres native BM25 arms run to_tsvector/to_tsqu
         # gap (fresh volume before the entrypoint provisioned the config, or an
         # embedded-pg version bump that orphaned the version-scoped stopfile),
         # never on a normal query.
+        #
+        # The pg_search (ParadeDB BM25) backend has the SAME failure shape on a
+        # DIFFERENT signature: when the `USING bm25` index is absent — the initial
+        # index-build window on a fresh/large volume, or any REINDEX/rebuild — a
+        # recall query that hits the @@@ / paradedb.score arm raises SQLSTATE
+        # XX000 with "<table> does not contain a USING bm25 index" (the table
+        # varies: memory_units, reflections, …). Native degrades gracefully here;
+        # pg_search did not, so recall failed CLOSED (HTTP 500) for the whole
+        # build/rebuild window (found by a dry-run on a full 772k-row clone).
+        # Match XX000 AND the stable, table-name-agnostic
+        # "does not contain a using bm25 index" substring (case-insensitive) —
+        # NOT XX000 alone, which is Postgres internal_error, a catch-all that
+        # would swallow unrelated internal errors and mask real bugs.
         _pg_text_search_unavailable = getattr(e, "sqlstate", None) == "42704" or (
             "could not open stop-word file" in err_str
-        ) or ("text search configuration" in err_str.lower() and "does not exist" in err_str.lower())
+        ) or ("text search configuration" in err_str.lower() and "does not exist" in err_str.lower()) or (
+            getattr(e, "sqlstate", None) == "XX000"
+            and "does not contain a using bm25 index" in err_str.lower()
+        )
         if _include_bm25 and ("DRG-10599" in err_str or "ORA-30600" in err_str or "ORA-29902" in err_str or _pg_text_search_unavailable):
             if _pg_text_search_unavailable:
                 logger.warning("Postgres text-search config unavailable (%s); falling back to semantic-only search", err_str[:160])
@@ -656,10 +683,12 @@ t = f.read_text()
 assert "_pg_text_search_unavailable" in t, "switchroom PG text-search recall-fallback patch: sentinel missing after patch"
 assert 'getattr(e, "sqlstate", None) == "42704"' in t, "switchroom PG text-search recall-fallback patch: 42704 guard missing after patch"
 assert "could not open stop-word file" in t, "switchroom PG text-search recall-fallback patch: stopword-file guard missing after patch"
+assert 'getattr(e, "sqlstate", None) == "XX000"' in t, "switchroom PG text-search recall-fallback patch: pg_search XX000 guard missing after patch"
+assert "does not contain a using bm25 index" in t, "switchroom PG text-search recall-fallback patch: pg_search bm25-index substring missing after patch"
 # The dialect-agnostic semantic-only rebuild the Oracle branch already had must
 # stay the SINGLE fallback path both branches reach — we only widened its trigger.
 assert t.count("rows = await conn.fetch(fb_query, *fb_params)") == 1, "switchroom PG text-search recall-fallback patch: shared semantic-only rebuild changed shape"
-print("switchroom hindsight PG text-search recall-fallback patch: recall degrades to semantic-only on missing regconfig / stopword file (SQLSTATE 42704)")
+print("switchroom hindsight PG text-search recall-fallback patch: recall degrades to semantic-only on missing regconfig / stopword file (SQLSTATE 42704) and on absent pg_search BM25 index (SQLSTATE XX000)")
 PYEOF
 
 # Empty-TimeoutError-message fix: both retry loops in

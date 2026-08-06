@@ -313,6 +313,12 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /"text search configuration" in err_str\.lower\(\) and "does not exist" in err_str\.lower\(\)/,
     );
+    // The pg_search (ParadeDB BM25) "no bm25 index" signature (follow-up to
+    // #4470): SQLSTATE XX000 AND the stable, table-name-agnostic substring —
+    // never XX000 alone (Postgres internal_error is a catch-all).
+    expect(dockerfile).toMatch(
+      /getattr\(e, "sqlstate", None\) == "XX000"\s*\n\s*and "does not contain a using bm25 index" in err_str\.lower\(\)/,
+    );
     // The widened condition must be an OR onto the EXISTING Oracle guard — a
     // separate `if` could double-run the rebuild or diverge. Pin that the
     // Oracle codes and the new sentinel share one branch.
@@ -331,6 +337,12 @@ describe("Dockerfile.hindsight shape", () => {
     );
     expect(dockerfile).toMatch(
       /assert "could not open stop-word file" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert 'getattr\(e, "sqlstate", None\) == "XX000"' in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "does not contain a using bm25 index" in t,/,
     );
     expect(dockerfile).toMatch(
       /assert t\.count\("rows = await conn\.fetch\(fb_query, \*fb_params\)"\) == 1,/,
