@@ -5,6 +5,7 @@ import {
   DEFAULT_TOLERANCE,
   compareContention,
   compareRuns,
+  duplicateCellKeys,
   formatContention,
   formatReproducibility,
   formatSummary,
@@ -176,5 +177,38 @@ describe("rendering", () => {
     const bad = formatReproducibility(compareRuns(r, makeResult([makeCell("big", 228761, 1, 9999)])));
     expect(bad).toContain("FAIL");
     expect(formatContention(compareContention(r, r))).toContain("FAIL");
+  });
+});
+
+describe("duplicateCellKeys", () => {
+  it("returns nothing for a well-formed sweep", () => {
+    const cells = [
+      { bank: "a", concurrency: 1 },
+      { bank: "a", concurrency: 4 },
+      { bank: "b", concurrency: 1 },
+    ];
+    expect(duplicateCellKeys(cells)).toEqual([]);
+  });
+
+  it("names each repeated (bank, concurrency) pair exactly once", () => {
+    // Without this guard the verdict's Map keeps only the LAST occurrence and
+    // still prints a confident PASS/FAIL over a pairing that is not the cell
+    // the operator thinks they are reading.
+    const cells = [
+      { bank: "a", concurrency: 1 },
+      { bank: "a", concurrency: 1 },
+      { bank: "a", concurrency: 1 },
+      { bank: "b", concurrency: 4 },
+    ];
+    expect(duplicateCellKeys(cells)).toEqual(["a@c1"]);
+  });
+
+  it("does not confuse a bank name with a concurrency level", () => {
+    // `${bank}@c${conc}` must not collide for e.g. ("a@c1", 2) vs ("a", 12).
+    const cells = [
+      { bank: "a", concurrency: 12 },
+      { bank: "a@c1", concurrency: 2 },
+    ];
+    expect(duplicateCellKeys(cells)).toEqual([]);
   });
 });

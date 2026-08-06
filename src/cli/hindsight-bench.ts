@@ -31,7 +31,7 @@
  *   --compare   <a.json> <b.json>         AC1 reproducibility verdict
  *   --contention-compare <idle> <loaded>  AC4 contention verdict
  *
- * Exit codes: 0 ok · 1 could not run · 2 a verdict FAILED.
+ * Exit codes: 0 ok · 1 a verdict FAILED · 2 could not run (usage/IO).
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -58,6 +58,7 @@ import { QUERY_SET_ID } from "../hindsight-bench/recall.js";
 import {
   compareContention,
   compareRuns,
+  duplicateCellKeys,
   formatContention,
   formatReproducibility,
   formatSummary,
@@ -97,9 +98,19 @@ interface BenchOpts {
   json: boolean;
 }
 
+/**
+ * Exit-code contract, which callers (CI, a cron) branch on:
+ *   0 — PASS / measurement completed
+ *   1 — a verdict FAILED (the measurement itself was fine)
+ *   2 — usage or IO error; no verdict was reached
+ *
+ * Keeping "a real regression" and "you typo'd the filename" on different codes
+ * is the whole point: a wrapper that treats every non-zero as a regression
+ * would page on a missing file.
+ */
 function fail(msg: string): never {
   process.stderr.write(chalk.red(`hindsight-bench: ${msg}\n`));
-  process.exit(1);
+  process.exit(2);
 }
 
 function readResult(path: string): BenchResult {
@@ -116,6 +127,12 @@ function readResult(path: string): BenchResult {
     // Loud rather than best-effort: silently comparing across schema versions
     // is how a "regression" turns out to be a field rename.
     fail(`${path} is schema v${parsed.schema}, this build reads v${BENCH_SCHEMA_VERSION}`);
+  }
+  const dupes = duplicateCellKeys(parsed.cells);
+  if (dupes.length > 0) {
+    // A verdict keyed on (bank, concurrency) would keep only the last of each
+    // duplicate and still print a confident PASS/FAIL over the wrong pairing.
+    fail(`${path} has duplicate cells (${dupes.join(", ")}) — cannot be graded`);
   }
   return parsed;
 }
@@ -217,14 +234,14 @@ function runCompareMode(opts: BenchOpts): void {
   if (!Number.isFinite(tolerance) || tolerance < 0) fail(`--tolerance must be a non-negative number`);
   const rep = compareRuns(readResult(pa), readResult(pb), tolerance);
   process.stdout.write((opts.json ? JSON.stringify(rep, null, 2) : formatReproducibility(rep)) + "\n");
-  if (!rep.pass) process.exitCode = 2;
+  if (!rep.pass) process.exitCode = 1;
 }
 
 function runContentionCompareMode(opts: BenchOpts): void {
   const [pi, pl] = expectTwo(opts.contentionCompare as string[], "--contention-compare");
   const rep = compareContention(readResult(pi), readResult(pl));
   process.stdout.write((opts.json ? JSON.stringify(rep, null, 2) : formatContention(rep)) + "\n");
-  if (!rep.pass) process.exitCode = 2;
+  if (!rep.pass) process.exitCode = 1;
 }
 
 async function runMeasureMode(opts: BenchOpts): Promise<void> {

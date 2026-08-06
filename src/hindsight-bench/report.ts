@@ -17,6 +17,26 @@ export const DEFAULT_TOLERANCE = 0.1;
 const cellKey = (bank: string, concurrency: number): string => `${bank}@c${concurrency}`;
 
 /**
+ * `(bank, concurrency)` keys that appear more than once in a result file.
+ *
+ * A sweep never produces one — it walks distinct pairs — but a hand-edited or
+ * concatenated file can, and both verdicts key cells by that pair. With
+ * duplicates the lookup silently keeps only the last occurrence, so the verdict
+ * would compare cells that are not the same cell and still print a confident
+ * PASS/FAIL. The CLI refuses such a file rather than grading it.
+ */
+export function duplicateCellKeys(cells: ReadonlyArray<{ bank: string; concurrency: number }>): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const c of cells) {
+    const key = cellKey(c.bank, c.concurrency);
+    if (seen.has(key)) dupes.add(key);
+    seen.add(key);
+  }
+  return [...dupes];
+}
+
+/**
  * Compare two runs' p95 per (bank, concurrency) cell.
  *
  * `relDelta` is measured **against run A**, not against the mean of the two: A
