@@ -24,6 +24,37 @@
  */
 export type DeliveryOutcome = 'delivered' | 'failed' | 'suppressed'
 
+/**
+ * The ONE way a turn's `duration_ms` is computed, shared by every emitter
+ * (`buildTurnRecord` → turns.jsonl, and all three `turn_ended` runtime-metric
+ * sites: the two stream-render turn-end paths + the liveness framework_fallback).
+ *
+ * Why a single helper: the three `turn_ended` emitters each hand-rolled the
+ * subtraction, and one drifted. `stream-render.ts` guarded with
+ * `startedAt > 0 ? now - startedAt : 0`; the framework_fallback path in
+ * `liveness-wiring.ts` did a bare `Date.now() - turnStartedAt` with only a
+ * `!= null` presence check. When `activeTurnStartedAt` held `0` (or any
+ * non-positive / non-finite value), that path emitted `duration_ms = now - 0`,
+ * i.e. the absolute Unix-epoch-ms — a ~56,000-year "duration". This poisoned the
+ * analysed turn_ended dataset (observed: 110 rows where `duration_ms === ts`),
+ * making every latency aggregate unusable.
+ *
+ * The invariant this helper enforces: a `duration_ms` is ALWAYS a non-negative
+ * elapsed-milliseconds value derived from a positive, finite start stamp — never
+ * an absolute epoch value, never negative (clock step back), never NaN. A start
+ * that is missing / zero / bogus yields `0` (a bounded, filterable sentinel)
+ * instead of a value that destroys aggregates.
+ */
+export function computeTurnDurationMs(
+  startedAt: number | null | undefined,
+  now: number,
+): number {
+  if (typeof startedAt !== 'number' || !Number.isFinite(startedAt) || startedAt <= 0) {
+    return 0
+  }
+  return Math.max(0, now - startedAt)
+}
+
 /** The status strings written to turns.jsonl. `send_failed` is new in PR B. */
 export type TurnStatus = 'complete' | 'no_reply' | 'send_failed'
 
@@ -261,7 +292,7 @@ export function buildTurnRecord(
   return {
     ts: Math.floor(endedAt / 1000),
     agent: turn.agent,
-    duration_ms: turn.startedAt > 0 ? endedAt - turn.startedAt : 0,
+    duration_ms: computeTurnDurationMs(turn.startedAt, endedAt),
     tools: turn.toolCallCount ?? 0,
     status: computeTurnStatus(turn),
     turn_id: turn.turnId,
