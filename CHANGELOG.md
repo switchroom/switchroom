@@ -1,5 +1,116 @@
 # Changelog
 
+## v0.20.11 — the corrections-as-eval-cases self-improvement subsystem, Telegram `/private` memory mode, strict/exclusive per-agent account pins, and a merge-queue CI fix
+
+### Self-improvement: corrections become regression tests
+
+The bulk of this release builds out the agent-self-improvement subsystem so
+that operator corrections turn into durable, replayable eval cases and skill
+proposals carry honest provenance — landed as a reviewed wave of
+single-concern PRs, all gated behind `SWITCHROOM_SELF_IMPROVE` with the T1
+live flag still off.
+
+- **Eval-case sink (#4403)** — an add-only sink turns corrections into
+  regression tests. Raw model `Write`/`Edit` to `evals/evals.json` is blocked
+  in the always-on `skill-validate-pretool` hook every turn; the only
+  sanctioned mutation is CLI → one-tap card → deterministic `apply-eval-case`,
+  which re-scans for PII/secrets (fail-closed), appends add-only, and records
+  an integrity baseline. Amends the RFC with the "corrections as eval cases"
+  design (#4401).
+- **Benchmark surface + create/update parity (#4418)** — read-only
+  `switchroom self-improve bench <slug>` shells the real
+  `aggregate_benchmark.py` to print a pass/regress verdict, plus the
+  `origin`/`benchmark` carrier fields on skill proposals.
+- **T1 net-growth byte cap (#4416)** — a T1 edit that grows an owned skill by
+  more than `t1MaxGrowthBytes` (default 4096, operator-tunable) is downgraded
+  to a T2 one-tap proposal instead of landing silently.
+- **Failure-synthesis cron (#4421)** — the failure-driven sibling of the
+  weekly skill-synthesis cron: it mines `self-improve:correction`-tagged
+  memories for what broke and proposes the smallest durable defense
+  (prompt + docs + routing test only).
+- **Tag correction turns for retain (#4422)** — correction turns are tagged so
+  the failure-synthesis path has memories to mine.
+- **Ground the training memory (#4402)** — externally checkable facts are
+  validated before assertion in the training-memory path.
+
+### Self-improvement: integrity, byte-accounting, and origin hardening
+
+- **Wire proposal `origin` end-to-end, close a latent T1 integrity gap, fix the
+  review-prompt eval-case command (#4426)** — `SkillProposal.origin` finally
+  gets a writer (`--origin skill-synthesis|failure-synthesis`) threaded through
+  the IPC and gateway, matching what the docs already advertised.
+- **Surface eval-integrity sweep tamper to the operator (#4429)** and **drop the
+  dead proposal benchmark field (#4435)** — items 1 and 2 of the integrity
+  follow-up (#4425).
+- **Harden eval-case writes (#4433)** — refuse to overwrite a present-but-
+  unparseable `evals.json`, extend the PII/secret scan to the `files[]` fixture
+  field, and dedup held-out cases; each a LOW root-caused at HEAD with a
+  RED-first outcome test.
+- **Measure the diff-cap in UTF-8 bytes + normalize proposal origin on read
+  (#4434)** and **catch the fd-prefixed redirect bypass + re-verify skill
+  ownership at apply (#4432)** — closing byte-accounting and apply-time
+  ownership gaps.
+
+### Telegram `/private` memory mode
+
+A three-PR feature giving operators per-session control over what Hindsight
+stores, split cleanly across the gateway (state writer) and the Python retain
+hooks (enforcement).
+
+- **Retain-side enforcement + watermark (#4444)** — the privacy guarantee: the
+  Hindsight retain hooks honor the shared `privacy-state.json` interval file, so
+  material discussed under `/private` is never stored while the public portion
+  of the session still flushes normally.
+- **`/private` `/public` toggle commands (#4445)** — the gateway side that
+  writes the shared state file; `/private` pauses auto-retain for a stretch,
+  `/public` resumes it, each with an operator-facing confirmation.
+- **Session-start reset to public + alert (#4446)** — the gateway becomes the
+  single owner of resetting privacy back to public at a genuine new session,
+  with a loud alert if the previous session ended still private
+  (`session_start.py` deliberately untouched, so there's no two-owner race).
+
+### Auth: strict + exclusive per-agent account pins
+
+- **Strict + exclusive pins (#4442, closes #4441)** — two opt-in hardening flags
+  on the per-agent account pin. `strict: true` makes the pin a hard binding:
+  the serving path, refresh fanout, and `mark-exhausted` roll all keep the agent
+  on its own account while walled/exhausted, surfacing honest 429/quota cards
+  instead of borrowing fleet quota. `exclusive: true` reserves the account for
+  one agent, enforced at load time (schema `superRefine`), serving, and fanout.
+
+### CI / merge-queue fix
+
+- **Skip the agent-attribution guard on `merge_group` (#4447)** — the
+  attribution-trailer check was failing on GitHub's synthetic single-parent
+  squash commit in the merge queue (which inherits the PR's `Co-authored-by`
+  trailer) and repeatedly bouncing PRs (#4444, #4446) out of the queue. The
+  guard now skips the `merge_group` event, where the real branch commits were
+  already validated on `pull_request`.
+
+### Other fixes
+
+- **Suppress hollow activity cards on zero-content turns (#4437)** — a turn that
+  adopts a per-turn activity card at start but ends with zero surfaced tool
+  work, no reply, and no captured text (the legitimate "answer a duplicate
+  handback with `NO_REPLY`" case) no longer leaves the user a hollow
+  `0 tools` card with no body.
+- **Unify the status-pin rights model (#4438)** — delete the stale-sweep's
+  proactive `canPinInChat` precheck end-to-end (it wedged the sweep under
+  chat-lock, where the bot has no `botInfo` to resolve self-membership) and the
+  duplicate `isPinRightsError`; pin rights are now classified solely reactively
+  against the status-pin source of truth.
+- **hindsight-watch: retain-queue growth is WARN, not a red loss page (#4399)** —
+  a growing retain queue is a warning signal, not a fleet-red loss condition.
+
+### Docs
+
+- **Dev-protocol: present judgment-call lows to the user (#4436)** with choice,
+  impact, and recommendation, and **default to fixing lows before merge rather
+  than deferring them as tech debt (#4431)**.
+- **Broaden the Grounding rule to name real-world facts, not just code (#4427)**.
+- **Dedup rendered `CLAUDE.md` to buy back ratchet headroom (#4412)** —
+  32000 → 30174 bytes.
+
 ## v0.20.10 — compaction-boundary continuity, hindsight durability, an OAuth-disabled-org block fix, and Playwright version-skew
 
 ### Working state re-seats into context after compaction (#4390)
