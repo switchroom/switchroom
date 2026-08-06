@@ -55,12 +55,12 @@ preserved here unchanged:
 
 | Knob                   | Code default | Live deployment override (`docker-compose.yml`) |
 |------------------------|:------------:|:-----------------------------------------------:|
-| `PACE_MAX_CONCURRENCY` |      8       |                       16                        |
+| `PACE_MAX_CONCURRENCY` |      8       |                       64                        |
 | `PACE_MAX_RPM`         |      60      |                       90                        |
 | `PACE_MAX_RPS`         |      4       |                        6                        |
 | `PACE_MAX_WAIT_S`      |      20      |                       12                        |
 | `PACE_MAX_COOLDOWN_S`  |      60      |                       60                        |
-| `PACE_LEASE_TTL_S`     |     300      |                       300                       |
+| `PACE_LEASE_TTL_S`     |     300      |                       60                        |
 
 **Tuning the running fleet is the deployment's job, via env** — set/adjust the
 `PACE_*` vars in `docker-compose.yml` (or live via the same Redis keys). Do NOT
@@ -112,6 +112,69 @@ separate from this repo change):
 
 Until `PACE_COOLDOWN_HOLD=true` is set, the only active change vs. today is the
 absolute cap, which can only ever shorten a pathological (roughly >45s) wait.
+
+## Token-aware pacing (`PACE_MAX_TPM`)
+
+A **4th admission predicate**: a fleet-wide rolling ~60s **token** budget layered
+on top of the concurrency/RPM/RPS gates. Anthropic's per-minute burst ceiling is
+a token ceiling as much as a request ceiling — a handful of huge-context turns
+can 429 an account that the RPM gate would happily admit. `PACE_MAX_TPM` smooths
+that.
+
+**Disabled by default (`0`).** With `PACE_MAX_TPM=0` every bit of token logic is
+inert: the Lua predicate short-circuits, the estimator is never called, and the
+`litellm_pace:tokens` key is never written — so merging + redeploy is
+behaviour-neutral until the env is set at rollout. Production sets `1200000`.
+
+How it works:
+
+- **Admit-time estimate.** A cheap, dependency-free char-count estimator
+  (`_estimate_tokens`) reserves budget: input chars across messages / system /
+  tools divided by `PACE_TPM_CHARS_PER_TOKEN`, plus a bounded output reservation
+  (`min(max_tokens, PACE_TPM_OUTPUT_RESERVE)`), all scaled by `PACE_TPM_EST_MULT`.
+  It deliberately does NOT call `litellm.token_counter` (too slow on the hot
+  path) and NEVER raises — any error estimates 0.
+- **Rolling budget in Redis.** A HASH `litellm_pace:tokens` keyed by 10s bucket
+  (`floor(now/10)*10`); the rolling sum is the buckets newer than `now-60` (~7
+  live buckets). The admit Lua sums them, HDELs stale buckets as it walks, and
+  denies when `sum + est > PACE_MAX_TPM`. The predicate runs AFTER the RPS check
+  and BEFORE the lease/rate writes, so a token denial takes no slot.
+- **Single-oversized-request bypass.** A request whose own estimate already
+  meets/exceeds the whole budget could never satisfy `sum+est<=maxtpm` and would
+  burn the full wait ceiling every attempt — so it is admitted on its first
+  attempt (still recording its tokens) rather than being starved.
+- **Best-effort reconciliation.** Once real usage is known, the non-streaming
+  passthrough success handler and the router success hook HINCRBY the delta
+  (`actual - est`, may be negative; the Lua clamps the rolling sum at ≥0) into
+  the current bucket so the budget converges on real spend. **Streaming requests
+  keep their estimate** — the streaming wrapper is left byte-transparent
+  (no SSE parsing), an accepted, bounded imprecision.
+- **Observability.** `litellm_pace:tpm_denied` is INCR'd inside the Lua on a
+  token-caused denial ONLY (not concurrency/RPM/RPS/cooldown denials), so
+  operators can see whether the token gate is the thing throttling the fleet.
+
+Everything still **fails open**: a token gate that can't reach Redis, or a
+request that waits past the ceiling, proceeds unpaced (and its estimate is
+best-effort booked so the budget stays honest).
+
+| Knob                       | Code default | Rollout value | Meaning |
+|----------------------------|:------------:|:-------------:|---------|
+| `PACE_MAX_TPM`             |      0       |    1200000    | Rolling ~60s fleet-wide token budget. `0` disables the whole predicate (inert). `max(0, …)` so a negative can't invert the gate. |
+| `PACE_TPM_OUTPUT_RESERVE`  |     2048     |     2048      | Output tokens reserved per request in the estimate, and the CAP on a caller's `max_tokens` so one request can't reserve an unbounded slice. |
+| `PACE_TPM_CHARS_PER_TOKEN` |     4.0      |      4.0      | Char/token ratio for the input estimator. |
+| `PACE_TPM_EST_MULT`        |     1.0      |      1.0      | Safety multiplier on the whole per-request estimate. |
+| `PACE_TPM_CACHE_READ_WEIGHT`|    1.0      |      1.0      | Weight applied to cache-READ tokens during reconciliation (a value < 1 discounts them; 1.0 counts at par). |
+
+**Rollout env** (set alongside the existing live overrides in the deployed
+`docker-compose.yml`, then redeploy litellm — a gated ROLLOUT step, separate from
+this repo change):
+
+```yaml
+- 'PACE_MAX_TPM=1200000'
+```
+
+Until `PACE_MAX_TPM` is set to a positive value, the token predicate is fully
+inert and behaviour is identical to today.
 
 ## Sync / redeploy step
 

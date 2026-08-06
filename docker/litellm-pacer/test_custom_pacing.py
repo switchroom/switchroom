@@ -107,6 +107,9 @@ class FakeRedis:
         self.set_calls: list = []
         self.eval_calls = 0
         self.zrem_calls: list = []
+        # Token-budget round trips (reconciliation + fail-open recording).
+        self.hincrby_calls: list = []
+        self.expire_calls: list = []
 
     async def ping(self):
         return True
@@ -130,6 +133,19 @@ class FakeRedis:
         # assert BOTH that a release happened and that it happened once.
         self.zrem_calls.append(args)
         return 0
+
+    async def hincrby(self, key, field, amount):
+        self.hincrby_calls.append((key, field, int(amount)))
+        h = self.store.get(key)
+        if not isinstance(h, dict):
+            h = {}
+            self.store[key] = h
+        h[str(field)] = int(h.get(str(field), 0)) + int(amount)
+        return h[str(field)]
+
+    async def expire(self, key, ttl):
+        self.expire_calls.append((key, ttl))
+        return True
 
 
 # --- Retry-After parsing (pure static method) --------------------------------
@@ -225,6 +241,23 @@ class CodeDefaultTests(unittest.TestCase):
         self.assertEqual(self._default_of("_float_env", "MAX_WAIT_S"), 20.0)
         self.assertEqual(self._default_of("_float_env", "MAX_COOLDOWN_S"), 60.0)
         self.assertEqual(self._default_of("_int_env", "LEASE_TTL_S"), 300)
+
+    def test_token_pacing_code_defaults(self):
+        # PACE_MAX_TPM ships DISABLED (0) so the whole token predicate is inert
+        # until the deployment sets the env at rollout — behaviour-neutral merge.
+        self.assertEqual(self._default_of("_int_env", "MAX_TPM"), 0)
+        self.assertEqual(self._default_of("_int_env", "TPM_OUTPUT_RESERVE"), 2048)
+        self.assertEqual(self._default_of("_float_env", "TPM_CHARS_PER_TOKEN"), 4.0)
+        self.assertEqual(self._default_of("_float_env", "TPM_EST_MULT"), 1.0)
+        self.assertEqual(self._default_of("_float_env", "TPM_CACHE_READ_WEIGHT"), 1.0)
+
+    def test_max_tpm_clamped_non_negative(self):
+        # max(0, …) guards against a negative env inverting the gate; assert the
+        # source actually wraps the env read in max(0, …).
+        src = os.path.join(os.path.dirname(__file__), "custom_pacing.py")
+        with open(src, "r", encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn('max(0, _int_env("PACE_MAX_TPM", 0))', source)
 
     def test_l1_knob_defaults(self):
         # The absolute hard cap ships ACTIVE (45s), but with 45 > MAX_WAIT_S it
@@ -1156,6 +1189,497 @@ class PatchInstallFailOpenTests(unittest.TestCase):
         finally:
             self._restore(saved)
             custom_pacing.verbose_proxy_logger = saved_logger
+
+
+# =============================================================================
+# Token-aware pacing (PACE_MAX_TPM) — estimator, usage accounting, gating,
+# reconciliation, and a real-Redis Lua budget exercise.
+# =============================================================================
+
+
+class _TpmCfgMixin:
+    """Pin the token-estimator knobs to known values (and enable the budget) so
+    the estimate/usage/reconcile tests are deterministic regardless of any PACE_*
+    env set in the runner. Snapshot + restore around each test."""
+
+    _TPM_KNOBS = (
+        "MAX_TPM",
+        "TPM_OUTPUT_RESERVE",
+        "TPM_CHARS_PER_TOKEN",
+        "TPM_EST_MULT",
+        "TPM_CACHE_READ_WEIGHT",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self._saved_tpm = {k: getattr(custom_pacing._Cfg, k) for k in self._TPM_KNOBS}
+        custom_pacing._Cfg.MAX_TPM = 1_200_000
+        custom_pacing._Cfg.TPM_OUTPUT_RESERVE = 2048
+        custom_pacing._Cfg.TPM_CHARS_PER_TOKEN = 4.0
+        custom_pacing._Cfg.TPM_EST_MULT = 1.0
+        custom_pacing._Cfg.TPM_CACHE_READ_WEIGHT = 1.0
+
+    def tearDown(self):
+        for k, v in self._saved_tpm.items():
+            setattr(custom_pacing._Cfg, k, v)
+        super().tearDown()
+
+
+class EstimateTokensTests(_TpmCfgMixin, unittest.TestCase):
+    """Outcome tests for the cheap char-count estimator. With CHARS_PER_TOKEN=4,
+    RESERVE=2048, EST_MULT=1: est = int(chars/4) + min(max_tokens or 2048, 2048)."""
+
+    def _est(self, data):
+        return custom_pacing._estimate_tokens(data)
+
+    def test_string_content(self):
+        # 40 input chars -> 10 input tokens; +2048 output reserve.
+        data = {"messages": [{"role": "user", "content": "x" * 40}]}
+        self.assertEqual(self._est(data), 10 + 2048)
+
+    def test_block_content_text_and_image(self):
+        # text block counts its text length (40); an image block counts a flat
+        # 1600 chars. (40 + 1600) / 4 = 410 input tokens; +2048.
+        data = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "x" * 40},
+                        {"type": "image", "source": {"type": "base64", "data": "zz"}},
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(self._est(data), (40 + 1600) // 4 + 2048)
+
+    def test_system_and_tools_add_to_estimate(self):
+        base = {"messages": [{"role": "user", "content": "x" * 40}]}
+        with_system = {**base, "system": "y" * 400}
+        with_tools = {**base, "tools": [{"name": "t", "description": "d" * 400}]}
+        self.assertGreater(self._est(with_system), self._est(base))
+        self.assertGreater(self._est(with_tools), self._est(base))
+        # System as a block list is also counted.
+        with_system_blocks = {**base, "system": [{"type": "text", "text": "y" * 400}]}
+        self.assertGreater(self._est(with_system_blocks), self._est(base))
+
+    def test_max_tokens_capped_by_reserve(self):
+        small = {"messages": [{"role": "user", "content": "x" * 40}]}
+        # A huge max_tokens is capped at RESERVE (2048), not trusted verbatim.
+        capped = {**small, "max_tokens": 999999}
+        self.assertEqual(self._est(capped), 10 + 2048)
+        # A small max_tokens reserves only that much.
+        tiny = {**small, "max_tokens": 100}
+        self.assertEqual(self._est(tiny), 10 + 100)
+
+    def test_est_mult_scaling(self):
+        data = {"messages": [{"role": "user", "content": "x" * 40}]}
+        base = self._est(data)
+        custom_pacing._Cfg.TPM_EST_MULT = 2.0
+        self.assertEqual(self._est(data), int(base * 2.0))
+
+    def test_garbage_returns_zero_never_raises(self):
+        for junk in (
+            None,
+            42,
+            "not-a-dict",
+            [],
+            {"max_tokens": "abc", "messages": [{"role": "user", "content": "hi"}]},
+        ):
+            self.assertEqual(self._est(junk), 0)
+
+    def test_chars_per_token_zero_does_not_divide_by_zero(self):
+        # A misconfigured 0 ratio must not blow up (would be ZeroDivisionError);
+        # the estimator falls back to 4.0 rather than returning 0/raising.
+        custom_pacing._Cfg.TPM_CHARS_PER_TOKEN = 0.0
+        data = {"messages": [{"role": "user", "content": "x" * 40}]}
+        self.assertEqual(self._est(data), 10 + 2048)
+
+
+class UsageActualTokensTests(_TpmCfgMixin, unittest.TestCase):
+    def _actual(self, usage):
+        return custom_pacing._usage_actual_tokens(usage)
+
+    def test_full_anthropic_usage(self):
+        usage = {
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 4000,
+        }
+        # weight 1.0: 1000 + 200 + 500 + 4000 = 5700
+        self.assertEqual(self._actual(usage), 5700)
+
+    def test_cache_read_weight_zero_vs_one(self):
+        usage = {
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 4000,
+        }
+        custom_pacing._Cfg.TPM_CACHE_READ_WEIGHT = 1.0
+        weighted = self._actual(usage)
+        custom_pacing._Cfg.TPM_CACHE_READ_WEIGHT = 0.0
+        discounted = self._actual(usage)
+        self.assertEqual(weighted, 5700)
+        self.assertEqual(discounted, 1700)  # cache reads no longer counted
+        self.assertLess(discounted, weighted)
+
+    def test_openai_style_keys(self):
+        self.assertEqual(
+            self._actual({"prompt_tokens": 100, "completion_tokens": 50}), 150
+        )
+
+    def test_missing_fields_partial_not_raise(self):
+        # Only some fields present -> partial sum, never a raise.
+        self.assertEqual(self._actual({"input_tokens": 100}), 100)
+        self.assertEqual(self._actual({"output_tokens": 50}), 50)
+
+    def test_no_recognised_field_returns_none(self):
+        self.assertIsNone(self._actual({}))
+        self.assertIsNone(self._actual({"nonsense": 5}))
+
+    def test_non_dict_and_junk_return_none_never_raise(self):
+        for junk in (None, "x", 7, [], {"input_tokens": "not-a-number"}):
+            self.assertIsNone(self._actual(junk))
+
+
+class TokenBucketTests(unittest.TestCase):
+    def test_bucket_floors_to_10s(self):
+        self.assertEqual(custom_pacing._token_bucket(1700000000.0), 1700000000)
+        self.assertEqual(custom_pacing._token_bucket(1700000009.9), 1700000000)
+        self.assertEqual(custom_pacing._token_bucket(1700000010.0), 1700000010)
+
+    def test_bucket_never_raises(self):
+        # NaN and non-numeric input degrade to 0 rather than raising.
+        self.assertEqual(custom_pacing._token_bucket(float("nan")), 0)
+        self.assertEqual(custom_pacing._token_bucket("junk"), 0)
+
+
+class TokenAdmitSignatureTests(unittest.IsolatedAsyncioTestCase):
+    """The admit Lua now takes 5 keys + maxtpm + est. Assert _try_admit threads
+    them, and that the fail-open + verdict contract is unchanged."""
+
+    def setUp(self):
+        self._saved = custom_pacing._Cfg.MAX_TPM
+
+    def tearDown(self):
+        custom_pacing._Cfg.MAX_TPM = self._saved
+
+    async def test_threads_est_and_maxtpm_and_five_keys(self):
+        captured = {}
+
+        class CapRedis(FakeRedis):
+            async def eval(self, *args, **kwargs):
+                captured["args"] = args
+                return 1
+
+        custom_pacing._Cfg.MAX_TPM = 1234
+        pacer = custom_pacing.FleetPacer()
+        self.assertTrue(await pacer._try_admit(CapRedis(), "pace-1", 777))
+        args = captured["args"]
+        # args[0] = LUA source, args[1] = numkeys.
+        self.assertEqual(args[1], 5)
+        self.assertIn(custom_pacing._TOKENS_KEY, args)
+        self.assertIn(custom_pacing._TPM_DENIED_KEY, args)
+        self.assertIn("1234", args)  # maxtpm ARGV
+        self.assertIn("777", args)  # est ARGV
+
+    async def test_default_est_is_zero_and_still_admits(self):
+        # Called with the default est (0) — the disabled path — still admits on a
+        # granting verdict.
+        pacer = custom_pacing.FleetPacer()
+        self.assertTrue(await pacer._try_admit(FakeRedis(eval_result=1), "p"))
+
+    async def test_fail_open_on_redis_error_with_est(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis(eval_raises=RuntimeError("redis down"))
+        self.assertTrue(await pacer._try_admit(r, "p", 5000))
+
+
+class TokenEnvGatingTests(_CfgPatchMixin, unittest.IsolatedAsyncioTestCase):
+    """When PACE_MAX_TPM is disabled the estimator must never be consulted on the
+    admit path, and admission still flows via the stubbed Lua verdict."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_est = custom_pacing._estimate_tokens
+        self._saved_tpm = custom_pacing._Cfg.MAX_TPM
+        self._est_calls = []
+
+        def _recording_est(data):
+            self._est_calls.append(data)
+            return 4242
+
+        custom_pacing._estimate_tokens = _recording_est
+        custom_pacing._Cfg.MAX_WAIT_S = 0.15
+        custom_pacing._Cfg.HARD_MAX_WAIT_S = 0.2
+        custom_pacing._Cfg.COOLDOWN_HOLD = False
+
+    def tearDown(self):
+        custom_pacing._estimate_tokens = self._saved_est
+        custom_pacing._Cfg.MAX_TPM = self._saved_tpm
+        super().tearDown()
+
+    async def test_estimator_not_consulted_when_disabled(self):
+        custom_pacing._Cfg.MAX_TPM = 0
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis(eval_result=1)  # admit immediately
+        pacer._redis = r
+        data = await pacer.async_pre_call_hook(None, None, {}, "pass_through_endpoint")
+        self.assertEqual(self._est_calls, [])  # never called
+        self.assertIsInstance(data, dict)
+        self.assertGreaterEqual(r.eval_calls, 1)  # still admitted via verdict
+
+    async def test_estimator_consulted_when_enabled(self):
+        custom_pacing._Cfg.MAX_TPM = 1_000_000
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis(eval_result=1)
+        pacer._redis = r
+        await pacer.async_pre_call_hook(None, None, {"messages": []}, "pass_through_endpoint")
+        self.assertEqual(len(self._est_calls), 1)
+
+
+class RecordEstFailOpenTests(_TpmCfgMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_books_estimate_when_enabled(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        await pacer._record_est_fail_open(r, 500)
+        self.assertEqual(len(r.hincrby_calls), 1)
+        self.assertEqual(r.hincrby_calls[0][0], custom_pacing._TOKENS_KEY)
+        self.assertEqual(r.hincrby_calls[0][2], 500)
+        self.assertEqual(len(r.expire_calls), 1)
+
+    async def test_noop_when_disabled(self):
+        custom_pacing._Cfg.MAX_TPM = 0
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        await pacer._record_est_fail_open(r, 500)
+        self.assertEqual(r.hincrby_calls, [])
+
+    async def test_noop_when_zero_estimate(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        await pacer._record_est_fail_open(r, 0)
+        self.assertEqual(r.hincrby_calls, [])
+
+    async def test_swallows_raising_redis(self):
+        class Boom(FakeRedis):
+            async def hincrby(self, *a, **k):
+                raise RuntimeError("redis down")
+
+        pacer = custom_pacing.FleetPacer()
+        await pacer._record_est_fail_open(Boom(), 500)  # must not raise
+
+
+class ReconcileTokensTests(_TpmCfgMixin, unittest.IsolatedAsyncioTestCase):
+    def _pacer(self, r):
+        pacer = custom_pacing.FleetPacer()
+        pacer._redis = r  # bypass _get_redis
+        return pacer
+
+    async def test_positive_delta_booked_to_current_bucket(self):
+        r = FakeRedis()
+        pacer = self._pacer(r)
+        await pacer._reconcile_tokens(100, 150)
+        self.assertEqual(len(r.hincrby_calls), 1)
+        self.assertEqual(r.hincrby_calls[0][2], 50)  # actual - est
+
+    async def test_negative_delta_allowed(self):
+        r = FakeRedis()
+        pacer = self._pacer(r)
+        await pacer._reconcile_tokens(200, 50)
+        self.assertEqual(r.hincrby_calls[0][2], -150)
+
+    async def test_noop_when_equal(self):
+        r = FakeRedis()
+        pacer = self._pacer(r)
+        await pacer._reconcile_tokens(100, 100)
+        self.assertEqual(r.hincrby_calls, [])
+
+    async def test_noop_when_disabled(self):
+        custom_pacing._Cfg.MAX_TPM = 0
+        r = FakeRedis()
+        pacer = self._pacer(r)
+        await pacer._reconcile_tokens(100, 200)
+        self.assertEqual(r.hincrby_calls, [])
+
+    async def test_noop_when_either_missing(self):
+        r = FakeRedis()
+        pacer = self._pacer(r)
+        await pacer._reconcile_tokens(None, 200)
+        await pacer._reconcile_tokens(100, None)
+        self.assertEqual(r.hincrby_calls, [])
+
+    async def test_swallows_raising_redis(self):
+        class Boom(FakeRedis):
+            async def hincrby(self, *a, **k):
+                raise RuntimeError("redis down")
+
+        pacer = self._pacer(Boom())
+        await pacer._reconcile_tokens(100, 200)  # must not raise
+
+
+class TokenStashExtractTests(_TpmCfgMixin, unittest.TestCase):
+    def test_stash_pins_est_on_all_carriers(self):
+        lobj = _fake_logging_obj()
+        data = {"litellm_logging_obj": lobj}
+        custom_pacing.FleetPacer._stash_pace_id(data, "pace-1", 4242)
+        self.assertEqual(data["metadata"][custom_pacing._PACE_TOK_ATTR], 4242)
+        self.assertEqual(getattr(lobj, custom_pacing._PACE_TOK_ATTR), 4242)
+        self.assertEqual(lobj.model_call_details[custom_pacing._PACE_TOK_ATTR], 4242)
+
+    def test_stash_without_est_pins_no_token_attr(self):
+        # Back-compat: the 2-arg form (est defaults to 0) pins only the lease id.
+        data = {}
+        custom_pacing.FleetPacer._stash_pace_id(data, "pace-1")
+        self.assertNotIn(custom_pacing._PACE_TOK_ATTR, data.get("metadata", {}))
+
+    def test_extract_est_from_metadata(self):
+        pacer = custom_pacing.FleetPacer()
+        data = {"metadata": {custom_pacing._PACE_TOK_ATTR: 999}}
+        self.assertEqual(pacer._extract_tok_est(data), 999)
+
+    def test_extract_est_from_litellm_params(self):
+        pacer = custom_pacing.FleetPacer()
+        data = {"litellm_params": {"metadata": {custom_pacing._PACE_TOK_ATTR: 777}}}
+        self.assertEqual(pacer._extract_tok_est(data), 777)
+
+    def test_extract_est_recovered_after_metadata_popped(self):
+        lobj = _fake_logging_obj()
+        data = {"litellm_logging_obj": lobj}
+        custom_pacing.FleetPacer._stash_pace_id(data, "pace-1", 4242)
+        data.pop("metadata")  # what _init_kwargs_for_pass_through_endpoint does
+        pacer = custom_pacing.FleetPacer()
+        self.assertEqual(pacer._extract_tok_est(data), 4242)
+
+    def test_extract_est_never_raises_on_junk(self):
+        pacer = custom_pacing.FleetPacer()
+        for junk in (None, "", 42, [], {"metadata": "not-a-dict"}):
+            self.assertIsNone(pacer._extract_tok_est(junk))
+
+
+class SuccessHookReconcileTests(_TpmCfgMixin, unittest.IsolatedAsyncioTestCase):
+    """The router success hook reconciles the budget from estimate to actual."""
+
+    async def test_router_success_reconciles(self):
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        pacer._redis = r
+        data = {"metadata": {custom_pacing._PACE_TOK_ATTR: 1000}}
+        response = types.SimpleNamespace(
+            usage={"input_tokens": 1200, "output_tokens": 300}
+        )
+        await pacer.async_post_call_success_hook(data, None, response)
+        # actual = 1500, est = 1000 -> delta +500
+        self.assertEqual(len(r.hincrby_calls), 1)
+        self.assertEqual(r.hincrby_calls[0][2], 500)
+
+    async def test_router_success_noop_when_disabled(self):
+        custom_pacing._Cfg.MAX_TPM = 0
+        pacer = custom_pacing.FleetPacer()
+        r = FakeRedis()
+        pacer._redis = r
+        data = {"metadata": {custom_pacing._PACE_TOK_ATTR: 1000}}
+        response = types.SimpleNamespace(usage={"input_tokens": 1200})
+        await pacer.async_post_call_success_hook(data, None, response)
+        self.assertEqual(r.hincrby_calls, [])
+
+
+# --- Real-Redis Lua budget exercise (gated; CI's pure-stdlib lane skips it) ---
+# The rest of the suite stubs the eval verdict, so it can NOT catch a broken
+# budget script. This class runs the ACTUAL _ADMIT_LUA against a real Redis to
+# prove the token predicate admits/denies correctly. Run locally with a
+# throwaway redis:  docker run --rm -d -p 6379:6379 redis
+#   PACE_TEST_REDIS_URL=redis://127.0.0.1:6379/15 \
+#     python3 -m unittest discover -s docker/litellm-pacer -p 'test_*.py'
+@unittest.skipUnless(
+    os.getenv("PACE_TEST_REDIS_URL"),
+    "set PACE_TEST_REDIS_URL to a THROWAWAY redis to run the real-Lua budget test",
+)
+class RealRedisTokenBudgetTests(unittest.TestCase):
+    BIG = 10**9  # concurrency/RPM/RPS so high only the TOKEN gate can deny
+
+    @classmethod
+    def setUpClass(cls):
+        import redis  # local-only; never imported on the pure-stdlib CI lane
+
+        cls.client = redis.Redis.from_url(
+            os.environ["PACE_TEST_REDIS_URL"], decode_responses=True
+        )
+        cls.client.ping()
+
+    def setUp(self):
+        # Only ever touch OUR keys — never flushdb a shared instance.
+        self._keys = [
+            custom_pacing._INFLIGHT_KEY,
+            custom_pacing._RECENT_KEY,
+            custom_pacing._COOLDOWN_KEY,
+            custom_pacing._TOKENS_KEY,
+            custom_pacing._TPM_DENIED_KEY,
+        ]
+        self.client.delete(*self._keys)
+
+    def tearDown(self):
+        self.client.delete(*self._keys)
+
+    def _admit(self, est, maxtpm, now=None):
+        now = time.time() if now is None else now
+        res = self.client.eval(
+            custom_pacing._ADMIT_LUA,
+            5,
+            custom_pacing._INFLIGHT_KEY,
+            custom_pacing._RECENT_KEY,
+            custom_pacing._COOLDOWN_KEY,
+            custom_pacing._TOKENS_KEY,
+            custom_pacing._TPM_DENIED_KEY,
+            repr(now),
+            str(self.BIG),
+            str(self.BIG),
+            str(self.BIG),
+            "300",
+            "pid-" + str(random.random()),
+            "ruid-" + str(random.random()),
+            str(maxtpm),
+            str(int(est)),
+        )
+        return int(res)
+
+    def _token_sum(self):
+        h = self.client.hgetall(custom_pacing._TOKENS_KEY)
+        return sum(int(v) for v in h.values())
+
+    def test_burst_admitted_until_budget_then_denied(self):
+        # MAX_TPM=1000, E=300: 3 admits (0,300,600 -> sums 300,600,900), 4th
+        # would be 900+300=1200 > 1000 -> denied.
+        now = time.time()
+        verdicts = [self._admit(300, 1000, now=now) for _ in range(4)]
+        self.assertEqual(verdicts, [1, 1, 1, 0])
+        self.assertEqual(self._token_sum(), 900)  # denied req not recorded
+        # The observability counter caught exactly the one token denial.
+        self.assertEqual(int(self.client.get(custom_pacing._TPM_DENIED_KEY)), 1)
+
+    def test_budget_frees_after_buckets_age(self):
+        now = time.time()
+        for _ in range(3):
+            self.assertEqual(self._admit(300, 1000, now=now), 1)
+        self.assertEqual(self._admit(300, 1000, now=now), 0)  # budget full
+        # Advance >60s: the old bucket ages out (HDEL), budget resets -> admit.
+        later = now + 61
+        self.assertEqual(self._admit(300, 1000, now=later), 1)
+
+    def test_disabled_admits_regardless_and_writes_no_tokens_key(self):
+        # MAX_TPM=0: admits any size and never creates the tokens hash.
+        self.assertEqual(self._admit(999999, 0), 1)
+        self.assertEqual(self.client.exists(custom_pacing._TOKENS_KEY), 0)
+
+    def test_single_oversized_request_admitted(self):
+        # est (5000) >= MAX_TPM (1000): the bypass admits it on the first attempt
+        # rather than starving it, and still records its tokens.
+        self.assertEqual(self._admit(5000, 1000), 1)
+        self.assertEqual(self._token_sum(), 5000)
+        # No token denial was counted for the bypass admit.
+        self.assertIsNone(self.client.get(custom_pacing._TPM_DENIED_KEY))
 
 
 if __name__ == "__main__":
