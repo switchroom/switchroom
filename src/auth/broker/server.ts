@@ -1749,6 +1749,7 @@ export class AuthBroker {
       if (!cand || cand === from) continue;
       if (this.isAccountExhausted(cand)) continue;
       if (this.isAccountPremiumWalled(cand)) continue;
+      if (this.exclusiveOwnerOf(cand)) continue; // never a fleet roll target
       if (!accountExists(cand, this.home)) continue;
       if (!readAccountCredentials(cand, this.home)) continue;
       eligible.push(cand);
@@ -2068,6 +2069,7 @@ export class AuthBroker {
     // null. A candidate that probed `blocked` is never offered here.
     for (const cand of ring) {
       if (cand && cand !== current && accountExists(cand, this.home) &&
+          !this.exclusiveOwnerOf(cand) &&
           this.accountEligibilityOf(cand) === "unknown") {
         return cand;
       }
@@ -4755,8 +4757,18 @@ export class AuthBroker {
   }
 
   private nextHealthyAccount(current: string, order: readonly string[]): string | null {
+    // A fleet-wide roll target serves EVERY rider of the walled account, so an
+    // account exclusive to one agent is never a valid target — regardless of
+    // who triggered the roll. (Yaml validation keeps exclusive accounts out of
+    // fallback_order; this guards hot-mutated / stale persisted state, and the
+    // auto-promote path that would otherwise set auth.active to it.)
     const start = order.indexOf(current);
-    if (start === -1) return order[0] ?? null;
+    if (start === -1) {
+      for (const cand of order) {
+        if (cand && !this.exclusiveOwnerOf(cand)) return cand;
+      }
+      return null;
+    }
     // Soft-avoid (#3031) preference RANKING: the first non-exhausted,
     // non-soft-avoided candidate wins; when every healthy candidate is
     // soft-avoided, fall back to the least-utilized of them (never null when
@@ -4772,6 +4784,7 @@ export class AuthBroker {
       // if its mark expired, and accept one the live probe shows healthy even
       // if a stale/bogus mark says exhausted. (The 2026-06-10 root predicate.)
       if (this.isAccountExhausted(cand) || !accountExists(cand, this.home)) continue;
+      if (this.exclusiveOwnerOf(cand)) continue;
       if (!this.isAccountSoftAvoided(cand)) return cand;
       const score = this.softAvoidUtilScore(cand);
       // `=== null` seed: even when every candidate scores +Infinity (all
