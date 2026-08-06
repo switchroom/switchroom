@@ -1064,6 +1064,13 @@ export interface MemoryBackendDeps {
    * without docker.
    */
   startContainer?: typeof startHindsight;
+  /**
+   * Broker seam for `resolveHindsightLlmSecrets`. Injected so tests can assert
+   * the WIRING outcome — that a `vault:` LLM api_key is resolved BEFORE it
+   * reaches {@link startContainer}, the exact gap that caused the 2026-08-06
+   * outage. Production leaves it undefined ⇒ the real auto-unlocked broker.
+   */
+  getViaBrokerStructured?: typeof import("../vault/broker/client.js").getViaBrokerStructured;
 }
 
 /**
@@ -1320,7 +1327,10 @@ export async function stepMemoryBackend(
     // container bakes the real `sk-` key rather than the literal `vault:…`
     // string (the recreate/refresh-hindsight outage class; apply's passphrase
     // resolver does not run on this path).
-    const resolvedLlm = await resolveHindsightLlmSecrets(config.hindsight?.llm);
+    const resolvedLlm = await resolveHindsightLlmSecrets(
+      config.hindsight?.llm,
+      deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
+    );
     const startContainer = deps.startContainer ?? startHindsight;
     startContainer(
       ports,
