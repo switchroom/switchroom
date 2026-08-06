@@ -416,6 +416,44 @@ c.commit(); c.close()
     expect(fgHogEntry?.matcher).toBe("^Bash$");
   });
 
+  it("runs telegram-plugin .mjs hooks under bun and bundled .mjs hooks under node", () => {
+    // The live hook runtime is settings.json (this block), NOT the plugin's
+    // hooks.json (that mirror is only loaded via --plugin-dir). The telegram-
+    // plugin hooks under /opt/switchroom/telegram-plugin/hooks run under bun
+    // to halve interpreter boot (each proven byte-identical to node). The
+    // bundled hooks under /opt/switchroom/hooks are esbuild output outside
+    // that equivalence proof and deliberately stay on node. Pin both so the
+    // split can't silently drift.
+    const result = buildSettingsHooksBlock({
+      agentName: "runtime-split-agent",
+      agentConfig: makeAgentConfig({ plugin: "switchroom-telegram" }),
+      hindsightEnabled: true,
+      useSwitchroomPlugin: true,
+    });
+    const allCmds: string[] = [];
+    for (const groups of Object.values(result)) {
+      for (const g of (groups as Array<{ hooks: Array<{ command: string }> }>)) {
+        for (const h of g.hooks) allCmds.push(h.command);
+      }
+    }
+    const pluginHookCmds = allCmds.filter((c) =>
+      c.includes("/opt/switchroom/telegram-plugin/hooks/") && c.includes(".mjs"),
+    );
+    const bundledHookCmds = allCmds.filter((c) =>
+      c.includes("/opt/switchroom/hooks/") && c.includes(".mjs"),
+    );
+    expect(pluginHookCmds.length).toBeGreaterThan(0);
+    expect(bundledHookCmds.length).toBeGreaterThan(0);
+    for (const c of pluginHookCmds) {
+      // wrapped: bash run-hook.sh '<source>' bun "<path>.mjs"
+      expect(c).toMatch(/'\s*bun\s+"\/opt\/switchroom\/telegram-plugin\/hooks\//);
+      expect(c).not.toMatch(/\bnode\s+"\/opt\/switchroom\/telegram-plugin\/hooks\//);
+    }
+    for (const c of bundledHookCmds) {
+      expect(c).toMatch(/\bnode\s+"\/opt\/switchroom\/hooks\//);
+    }
+  });
+
   it("with user hooks declared merges them with switchroom-owned hooks", () => {
     const agentConfig = makeAgentConfig({
       hooks: {

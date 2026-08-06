@@ -4464,6 +4464,17 @@ export const DOCKER_TELEGRAM_PLUGIN_PATH = "/opt/switchroom/telegram-plugin";
  * the operator's host repo path here, which doesn't exist inside the
  * container — hooks silently never ran (RFC Phase 3 §Bug 3 in
  * reference/rfcs/sub-agent-visibility.md).
+ *
+ * RUNTIME: these plugin `.mjs` hooks are invoked under `bun`, not `node`.
+ * Hooks run in parallel on every tool call / turn boundary and ~half of a
+ * ~40ms hook is interpreter boot; bun's cold-start is roughly half node's,
+ * so the swap halves that fixed cost per hook. bun ships in the base image
+ * (docker/Dockerfile.base "Phase 1b", pinned + sha-verified) and is already
+ * the runtime for the gateway/scheduler/autoaccept sidecars. Every hook
+ * under this path is proven byte-identical output/behaviour under bun vs
+ * node — including the secret-guard and secret-scrub SECURITY hooks. The
+ * bundled hooks under DOCKER_BUNDLED_HOOKS_PATH deliberately stay on `node`
+ * (esbuild output, not covered by that equivalence proof).
  */
 export const DOCKER_HOOKS_PATH = `${DOCKER_TELEGRAM_PLUGIN_PATH}/hooks`;
 
@@ -6852,7 +6863,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       type: "command",
       command: wrap(
         "hook:secret-scrub-stop",
-        `node "${join(DOCKER_HOOKS_PATH, "secret-scrub-stop.mjs")}"`,
+        `bun "${join(DOCKER_HOOKS_PATH, "secret-scrub-stop.mjs")}"`,
       ),
       timeout: 15,
       async: true,
@@ -6861,7 +6872,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       type: "command",
       command: wrap(
         "hook:silent-end-interrupt-stop",
-        `node "${join(DOCKER_HOOKS_PATH, "silent-end-interrupt-stop.mjs")}"`,
+        `bun "${join(DOCKER_HOOKS_PATH, "silent-end-interrupt-stop.mjs")}"`,
       ),
       timeout: 5,
       async: false,
@@ -6873,7 +6884,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       type: "command",
       command: wrap(
         "hook:dispatch-claim-stop",
-        `node "${join(DOCKER_HOOKS_PATH, "dispatch-claim-stop.mjs")}"`,
+        `bun "${join(DOCKER_HOOKS_PATH, "dispatch-claim-stop.mjs")}"`,
       ),
       timeout: 5,
       async: false,
@@ -6884,7 +6895,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
       type: "command",
       command: wrap(
         "hook:tool-label-stop",
-        `node "${join(DOCKER_HOOKS_PATH, "tool-label-stop.mjs")}"`,
+        `bun "${join(DOCKER_HOOKS_PATH, "tool-label-stop.mjs")}"`,
       ),
       timeout: 5,
       async: true,
@@ -6917,7 +6928,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:secret-guard-pretool",
-                `node "${join(DOCKER_HOOKS_PATH, "secret-guard-pretool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "secret-guard-pretool.mjs")}"`,
               ),
               timeout: 10,
             },
@@ -6934,7 +6945,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:sentinel-reply-guard-pretool",
-                `node "${join(DOCKER_HOOKS_PATH, "sentinel-reply-guard-pretool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "sentinel-reply-guard-pretool.mjs")}"`,
               ),
               timeout: 5,
             },
@@ -6951,7 +6962,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:subagent-tracker-pretool",
-                `node "${join(DOCKER_HOOKS_PATH, "subagent-tracker-pretool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "subagent-tracker-pretool.mjs")}"`,
               ),
               timeout: 10,
             },
@@ -7144,7 +7155,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:tool-label-pretool",
-                `node "${join(DOCKER_HOOKS_PATH, "tool-label-pretool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "tool-label-pretool.mjs")}"`,
               ),
               timeout: 5,
             },
@@ -7175,7 +7186,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:repo-context-pretool",
-                `node "${join(DOCKER_HOOKS_PATH, "repo-context-pretool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "repo-context-pretool.mjs")}"`,
               ),
               timeout: 5,
             },
@@ -7198,7 +7209,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:subagent-tracker-posttool",
-                `node "${join(DOCKER_HOOKS_PATH, "subagent-tracker-posttool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "subagent-tracker-posttool.mjs")}"`,
               ),
               timeout: 10,
             },
@@ -7227,7 +7238,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:sandbox-hint-posttool",
-                `node "${join(DOCKER_HOOKS_PATH, "sandbox-hint-posttool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "sandbox-hint-posttool.mjs")}"`,
               ),
               timeout: 3,
             },
@@ -7262,7 +7273,7 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
               type: "command",
               command: wrap(
                 "hook:wedge-detect-posttool",
-                `node "${join(DOCKER_HOOKS_PATH, "wedge-detect-posttool.mjs")}"`,
+                `bun "${join(DOCKER_HOOKS_PATH, "wedge-detect-posttool.mjs")}"`,
               ),
               timeout: 3,
             },
