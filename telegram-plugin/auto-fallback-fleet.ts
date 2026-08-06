@@ -159,6 +159,18 @@ export type FleetFallbackOutcome =
       oldLabel: string;
       announcement: string;
       oldQuota: QuotaUtilization | null;
+    }
+  | {
+      /** The triggering agent has a strict pin (`auth.strict`) — the broker
+       *  marked its account but deliberately did not roll it. Distinct from
+       *  'no-eligible-target' so the gateway can apply its own notice
+       *  cooldown: like all-blocked, this is a no-op outcome the ~60s
+       *  quota_wall_detected re-trigger would otherwise re-broadcast for
+       *  the life of the wall. */
+      kind: 'strict-pinned';
+      oldLabel: string;
+      announcement: string;
+      oldQuota: QuotaUtilization | null;
     };
 
 export interface FleetFallbackDeps {
@@ -274,7 +286,7 @@ export async function runFleetAutoFallback(
     // here would tell the operator the whole fleet is exhausted while the
     // snapshots in that very card show healthy accounts.
     return {
-      kind: 'no-eligible-target',
+      kind: 'strict-pinned',
       oldLabel: oldSnap.label,
       oldQuota: oldSnap.quota,
       announcement:

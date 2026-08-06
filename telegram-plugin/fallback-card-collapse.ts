@@ -103,6 +103,7 @@ export type FallbackDeliveryOutcomeKind =
   | 'all-blocked'
   | 'no-old-active'
   | 'no-eligible-target'
+  | 'strict-pinned'
   | 'error';
 
 /**

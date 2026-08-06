@@ -17866,6 +17866,16 @@ let fallbackFailureNoticeState: FallbackFailureNoticeState = { lastSentAtMs: 0 }
  */
 let fallbackAllBlockedNoticeState: FallbackAllBlockedNoticeState = { lastSentAtMs: 0 }
 
+/**
+ * Same shape/rationale for the strict-pinned outcome: it is a NO-OP swap
+ * (the strict agent deliberately stays on its walled pin), so the gate's
+ * dedup window never arms and the ~60s quota_wall_detected re-trigger
+ * would re-broadcast the identical "riding it out" card for the life of
+ * the wall. Separate state from the all-blocked window so a strict card
+ * never suppresses a genuine later all-blocked (or vice versa).
+ */
+let fallbackStrictPinnedNoticeState: FallbackAllBlockedNoticeState = { lastSentAtMs: 0 }
+
 function broadcastFleetFallbackFailure(triggerAgent: string, reason: string): void {
   if (process.env.SWITCHROOM_FLEET_FALLBACK_FAILURE_NOTICE === '0') return
   // Notice-level cooldown (30 min, per gateway). The fleetFallbackGate's
@@ -18145,6 +18155,18 @@ async function doFireFleetAutoFallback(
     // all-blocked still emits promptly.
     if (outcome.kind === 'switched') {
       fallbackAllBlockedNoticeState = { lastSentAtMs: 0 }
+      fallbackStrictPinnedNoticeState = { lastSentAtMs: 0 }
+    } else if (outcome.kind === 'strict-pinned') {
+      // Same cooldown pattern as all-blocked (below): a no-op outcome the
+      // ~60s wall re-trigger would otherwise re-broadcast every minute.
+      const verdict = evaluateAllBlockedNotice(fallbackStrictPinnedNoticeState, Date.now())
+      if (!verdict.send) {
+        process.stderr.write(
+          `telegram gateway: [fleet-fallback] strict-pinned card suppressed (cooldown) agent=${triggerAgent}\n`,
+        )
+        return false
+      }
+      fallbackStrictPinnedNoticeState = verdict.next
     } else if (outcome.kind === 'all-blocked') {
       // ── Second recovery tier: MODEL-TIER downgrade (precedence A) ──────────
       // Account-swap just came back all-blocked (no account still serves the
