@@ -35,6 +35,13 @@ LiteLLM v3's per-key reject-based limiter):
     PACE_LEASE_TTL_S — no leaked permanent slots).
   * Bounded global RATE: rolling 60s cap (PACE_MAX_RPM) + rolling 1s burst
     smoother (PACE_MAX_RPS).
+  * Bounded global TOKENS (PACE_MAX_TPM): a rolling ~60s fleet-wide token
+    budget as a 4th admission predicate, because Anthropic's per-minute burst
+    ceiling is a token ceiling as much as a request ceiling — a few huge-context
+    turns can 429 an account the RPM gate would admit. A cheap char-count
+    estimate reserves budget at admit; the non-streaming + router terminal paths
+    reconcile it to real usage. DISABLED by default (0) — fully inert until the
+    env is set at rollout, so the token logic is behaviour-neutral until then.
   * EXPLICIT LEASE RELEASE on the passthrough path. litellm exposes no
     callback that fires on a passthrough stream, and the one
     post_call_success_hook call site on the non-streaming passthrough path is
@@ -227,6 +234,33 @@ class _Cfg:
         "PACE_MODEL_GROUPS_EXCLUDE", "*-openrouter"
     )
 
+    # --- Token-aware pacing (PACE_MAX_TPM) -----------------------------------
+    # A 4th admission predicate: a fleet-wide rolling ~60s TOKEN budget, layered
+    # on top of the concurrency/RPM/RPS gates. Anthropic's per-minute burst
+    # ceiling is a token ceiling as much as a request ceiling — a handful of
+    # huge-context turns can 429 an account the RPM gate would happily admit.
+    # DISABLED BY DEFAULT (0): with MAX_TPM==0 every bit of token logic below is
+    # inert — the Lua predicate short-circuits, the estimator is never called,
+    # and the `litellm_pace:tokens` key is never written — so merging + redeploy
+    # is behaviour-neutral until the env is set at rollout (prod sets 1200000).
+    # max(0, …) so a negative env can't invert the gate.
+    MAX_TPM = max(0, _int_env("PACE_MAX_TPM", 0))
+    # Output tokens reserved per request in the estimate (the response is not yet
+    # known at admit time). Also the CAP on a caller-supplied max_tokens, so one
+    # request can never reserve an unbounded slice of the budget.
+    TPM_OUTPUT_RESERVE = _int_env("PACE_TPM_OUTPUT_RESERVE", 2048)
+    # Char/token ratio for the cheap, dependency-free input estimator. ~4 chars
+    # per token is the standard rough English ratio; conservative is fine because
+    # the estimate reconciles to real usage post-call.
+    TPM_CHARS_PER_TOKEN = _float_env("PACE_TPM_CHARS_PER_TOKEN", 4.0)
+    # Multiplier applied to the whole per-request estimate — safety headroom for
+    # the heuristic's under-count. 1.0 = trust the estimate as-is.
+    TPM_EST_MULT = _float_env("PACE_TPM_EST_MULT", 1.0)
+    # Weight applied to cache-READ tokens when reconciling to actual usage.
+    # Cache reads are far cheaper against the burst ceiling than fresh input; a
+    # weight < 1 discounts them. Default 1.0 = count them at par (conservative).
+    TPM_CACHE_READ_WEIGHT = _float_env("PACE_TPM_CACHE_READ_WEIGHT", 1.0)
+
     REDIS_HOST = os.getenv("REDIS_HOST", "redis")
     REDIS_PORT = _int_env("REDIS_PORT", 6379)
     REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
@@ -236,6 +270,15 @@ class _Cfg:
 _INFLIGHT_KEY = f"{_Cfg.KEY_PREFIX}:inflight"      # ZSET member=pace_id score=deadline
 _RECENT_KEY = f"{_Cfg.KEY_PREFIX}:recent"          # ZSET member=uuid score=ts (rolling window)
 _COOLDOWN_KEY = f"{_Cfg.KEY_PREFIX}:cooldown_until"  # STRING epoch seconds
+# HASH field=10s-bucket-start (floor(now/10)*10 as str) value=int tokens. The
+# rolling ~60s token sum is the fields whose bucket > now-60 (~7 live buckets);
+# the admit Lua HDELs older fields as it walks them and EXPIREs the key 120s so
+# a fully idle fleet drops the key entirely.
+_TOKENS_KEY = f"{_Cfg.KEY_PREFIX}:tokens"
+# Cheap observability counter: INCR'd inside the admit Lua on a token-caused
+# denial only (not concurrency/RPM/RPS/cooldown denials), so operators can see
+# whether the TOKEN gate is the thing throttling the fleet.
+_TPM_DENIED_KEY = f"{_Cfg.KEY_PREFIX}:tpm_denied"
 
 # Atomic admission. Redis runs a script to completion single-threaded, so the
 # trim -> count -> conditional-add sequence is race-free across all 8 proxy
@@ -245,6 +288,8 @@ _ADMIT_LUA = """
 local inflight = KEYS[1]
 local recent = KEYS[2]
 local cd = KEYS[3]
+local tokens = KEYS[4]
+local tpm_denied = KEYS[5]
 local now = tonumber(ARGV[1])
 local maxc = tonumber(ARGV[2])
 local maxrpm = tonumber(ARGV[3])
@@ -252,6 +297,8 @@ local maxrps = tonumber(ARGV[4])
 local lease = tonumber(ARGV[5])
 local pid = ARGV[6]
 local ruid = ARGV[7]
+local maxtpm = tonumber(ARGV[8])
+local est = tonumber(ARGV[9])
 local until_ = redis.call('GET', cd)
 if until_ and tonumber(until_) > now then return 0 end
 redis.call('ZREMRANGEBYSCORE', inflight, '-inf', now)
@@ -259,18 +306,165 @@ if redis.call('ZCARD', inflight) >= maxc then return 0 end
 redis.call('ZREMRANGEBYSCORE', recent, '-inf', now - 60)
 if redis.call('ZCARD', recent) >= maxrpm then return 0 end
 if tonumber(redis.call('ZCOUNT', recent, now - 1, '+inf')) >= maxrps then return 0 end
+-- (4th predicate) rolling ~60s TOKEN budget. Fully inert when maxtpm<=0.
+-- Placed AFTER the RPS check and BEFORE the ZADD writes so a token denial
+-- takes no concurrency/rate slot. Walks the bucket hash once: HDELs fields at
+-- or below now-60 (stale) and sums the rest.
+local cur_bucket = math.floor(now / 10) * 10
+if maxtpm > 0 then
+  local cutoff = now - 60
+  local sum = 0
+  local fields = redis.call('HGETALL', tokens)
+  for i = 1, #fields, 2 do
+    local b = tonumber(fields[i])
+    local v = tonumber(fields[i + 1])
+    if (b == nil) or (b <= cutoff) then
+      redis.call('HDEL', tokens, fields[i])
+    elseif v then
+      sum = sum + v
+    end
+  end
+  if sum < 0 then sum = 0 end
+  -- SINGLE-OVERSIZED-REQUEST BYPASS: a request whose OWN estimate already
+  -- meets/exceeds the whole budget can never satisfy sum+est<=maxtpm and would
+  -- burn the full wait ceiling on every attempt. Skip the sum check for it (it
+  -- still records its tokens + admits) so it is not permanently starved; the
+  -- budget check only gates requests that could plausibly fit.
+  if est < maxtpm then
+    if sum + est > maxtpm then
+      redis.call('INCR', tpm_denied)
+      return 0
+    end
+  end
+end
 redis.call('ZADD', inflight, now + lease, pid)
 redis.call('EXPIRE', inflight, lease + 60)
 redis.call('ZADD', recent, now, ruid)
 redis.call('EXPIRE', recent, 120)
+if maxtpm > 0 then
+  redis.call('HINCRBY', tokens, tostring(cur_bucket), est)
+  redis.call('EXPIRE', tokens, 120)
+end
 return 1
 """
+
+
+# --- Token estimation + accounting helpers (pure, module-level) ------------
+# All three NEVER raise: on ANY error they return 0 / None. They run on the hot
+# admit path, so they are deliberately dependency-free — no litellm.token_counter
+# (which imports a tokenizer and is far too slow here). A char/token heuristic is
+# good enough for a rolling admission budget that reconciles to real usage.
+
+
+def _token_bucket(now: float) -> int:
+    """The 10s bucket start for a timestamp: floor(now/10)*10. Never raises."""
+    try:
+        return int(now // 10) * 10
+    except Exception:
+        return 0
+
+
+def _estimate_tokens(data: Any) -> int:
+    """Cheap per-request token estimate for the admit budget. NEVER raises — any
+    error returns 0 (which simply doesn't contribute to the fleet budget).
+
+    Counts characters across messages (plain-string content AND content-block
+    lists), the system prompt, and the tools spec, divides by CHARS_PER_TOKEN
+    for the input estimate, adds a bounded output reservation, and scales by
+    EST_MULT. Content blocks: text blocks count their `text` length; an image
+    block counts a flat ~1600; any other block counts len(str(block))//4."""
+    try:
+        if not isinstance(data, dict):
+            return 0
+
+        def _block_chars(block: Any) -> int:
+            if isinstance(block, dict):
+                t = block.get("text")
+                if isinstance(t, str):
+                    return len(t)
+                if block.get("type") in ("image", "image_url"):
+                    return 1600
+                return len(str(block)) // 4
+            return len(str(block)) // 4
+
+        def _content_chars(content: Any) -> int:
+            if content is None:
+                return 0
+            if isinstance(content, str):
+                return len(content)
+            if isinstance(content, list):
+                return sum(_block_chars(b) for b in content)
+            return len(str(content))
+
+        chars = 0
+        messages = data.get("messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict):
+                    chars += _content_chars(msg.get("content"))
+                elif isinstance(msg, str):
+                    chars += len(msg)
+
+        system = data.get("system")
+        if system is not None:
+            chars += _content_chars(system)
+
+        tools = data.get("tools")
+        if tools:
+            chars += len(str(tools))
+
+        cpt = _Cfg.TPM_CHARS_PER_TOKEN or 4.0
+        est_in = int(chars / cpt)
+        reserve = _Cfg.TPM_OUTPUT_RESERVE
+        est_out = min(int(data.get("max_tokens") or reserve), reserve)
+        total = int((est_in + est_out) * _Cfg.TPM_EST_MULT)
+        return total if total > 0 else 0
+    except Exception:
+        return 0
+
+
+def _usage_actual_tokens(usage: dict) -> Optional[int]:
+    """Actual token count from an Anthropic/OpenAI-style usage dict:
+    input + cache_creation + output + cache_read*CACHE_READ_WEIGHT. Missing
+    fields contribute 0; a usage carrying NO recognised field returns None (so
+    reconciliation is skipped rather than adjusting by a bogus 0). NEVER raises."""
+    try:
+        if not isinstance(usage, dict):
+            return None
+        seen = False
+        total = 0.0
+
+        def _num(*keys: str) -> float:
+            nonlocal seen
+            for k in keys:
+                v = usage.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    seen = True
+                    return float(v)
+            return 0.0
+
+        total += _num("input_tokens", "prompt_tokens")
+        total += _num("cache_creation_input_tokens", "cache_creation_tokens")
+        total += _num("output_tokens", "completion_tokens")
+        total += (
+            _num("cache_read_input_tokens", "cache_read_tokens")
+            * _Cfg.TPM_CACHE_READ_WEIGHT
+        )
+        if not seen:
+            return None
+        return int(total)
+    except Exception:
+        return None
 
 
 # Attribute/key name the lease id is pinned under, on every carrier that can
 # survive to a terminal path (request metadata, litellm_params.metadata, and
 # the per-request LiteLLMLoggingObj).
 _PACE_ATTR = "_pace_id"
+# Sibling attribute carrying the admit-time token ESTIMATE alongside the lease
+# id on the same carriers, so a terminal path can reconcile the budget against
+# the request's real usage.
+_PACE_TOK_ATTR = "_pace_tok_est"
 # Bound on the per-worker already-released LRU. Purely a Redis-round-trip
 # saver — ZREM is idempotent on its own — so any bound works; this one keeps
 # the dict trivially small for a long-lived proxy worker.
@@ -352,19 +546,23 @@ class FleetPacer(CustomLogger):
             base += random.uniform(0.0, _Cfg.RELEASE_JITTER_S)
         return base
 
-    async def _try_admit(self, r, pace_id: str) -> bool:
+    async def _try_admit(self, r, pace_id: str, est_tokens: int = 0) -> bool:
         """One ATOMIC admission attempt via Lua. Returns True if a
-        concurrency slot + rate window was granted (and the request
-        recorded). Never raises — on any Redis error it fails OPEN
-        (returns True) so the pacer can never wedge the fleet."""
+        concurrency slot + rate window + token budget was granted (and the
+        request recorded). `est_tokens` is the admit-time token estimate; it is
+        only consulted when PACE_MAX_TPM>0 (else the Lua predicate is inert).
+        Never raises — on any Redis error it fails OPEN (returns True) so the
+        pacer can never wedge the fleet."""
         now = time.time()
         try:
             result = await r.eval(
                 _ADMIT_LUA,
-                3,
+                5,
                 _INFLIGHT_KEY,
                 _RECENT_KEY,
                 _COOLDOWN_KEY,
+                _TOKENS_KEY,
+                _TPM_DENIED_KEY,
                 repr(now),
                 str(_Cfg.MAX_CONCURRENCY),
                 str(_Cfg.MAX_RPM),
@@ -372,12 +570,31 @@ class FleetPacer(CustomLogger):
                 str(_Cfg.LEASE_TTL_S),
                 pace_id,
                 uuid.uuid4().hex,
+                str(_Cfg.MAX_TPM),
+                str(int(est_tokens or 0)),
             )
             return int(result) == 1
         except Exception as e:
             verbose_proxy_logger.debug("custom_pacing: admit check error (fail open): %s", e)
             # On redis error, fail open by claiming admission.
             return True
+
+    async def _record_est_fail_open(self, r, est: int) -> None:
+        """When a request FAILS OPEN past the wait ceiling it was never recorded
+        in the token budget by the admit Lua (which only records on admit). Book
+        its estimate into the current bucket here so the fleet budget still
+        accounts for the tokens it is about to spend. Best-effort only: guarded
+        on MAX_TPM>0 and a positive estimate, and swallows every error."""
+        if not (_Cfg.MAX_TPM > 0 and est > 0):
+            return
+        try:
+            bucket = _token_bucket(time.time())
+            await r.hincrby(_TOKENS_KEY, str(bucket), int(est))
+            await r.expire(_TOKENS_KEY, 120)
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "custom_pacing: fail-open token record failed (non-load-bearing): %s", e
+            )
 
     async def _release(self, pace_id: Optional[str]) -> None:
         """Release a concurrency lease. IDEMPOTENT: ZREM of an absent member
@@ -464,6 +681,9 @@ class FleetPacer(CustomLogger):
             return data  # fail open
 
         pace_id = uuid.uuid4().hex
+        # Admit-time token estimate, computed ONCE before the wait loop. Fully
+        # skipped (and the estimator never consulted) when token pacing is off.
+        est = _estimate_tokens(data) if _Cfg.MAX_TPM > 0 else 0
         # Loop deadline math uses a MONOTONIC clock so a backward wall-clock/NTP
         # step can never extend a hold. (Redis cooldown_until stays wall-clock —
         # see _cooldown_remaining — and is never compared against these values.)
@@ -477,7 +697,7 @@ class FleetPacer(CustomLogger):
         admitted = False
         try:
             while True:
-                if await self._try_admit(r, pace_id):
+                if await self._try_admit(r, pace_id, est):
                     admitted = True
                     break
                 now = time.monotonic()
@@ -490,6 +710,9 @@ class FleetPacer(CustomLogger):
                         "custom_pacing: HARD wait cap %.1fs hit, admitting unpaced (fail open)",
                         _Cfg.HARD_MAX_WAIT_S,
                     )
+                    # Book the estimate: this request proceeds unpaced, so the
+                    # admit Lua never recorded it (best-effort, guarded inside).
+                    await self._record_est_fail_open(r, est)
                     break
                 # (2) Pick this iteration's regime ceiling:
                 #   * burst-smoothing (no active cooldown): the short MAX_WAIT_S
@@ -514,6 +737,9 @@ class FleetPacer(CustomLogger):
                         "cooldown-hold" if holding else "burst",
                         ceiling,
                     )
+                    # Book the estimate: this request proceeds unpaced, so the
+                    # admit Lua never recorded it (best-effort, guarded inside).
+                    await self._record_est_fail_open(r, est)
                     break
                 # (3) Bounded jittered backoff; jitter de-synchronizes the fleet
                 # so releases don't thunder (extra release jitter while holding).
@@ -522,13 +748,14 @@ class FleetPacer(CustomLogger):
             verbose_proxy_logger.debug("custom_pacing: pre_call error (fail open): %s", e)
 
         # Stash id so terminal paths can release the concurrency lease. Even
-        # if every carrier is lost, the lease self-heals via LEASE_TTL_S.
+        # if every carrier is lost, the lease self-heals via LEASE_TTL_S. The
+        # token estimate rides along on the same carriers for reconciliation.
         if admitted:
-            self._stash_pace_id(data, pace_id)
+            self._stash_pace_id(data, pace_id, est)
         return data
 
     @staticmethod
-    def _stash_pace_id(data: Any, pace_id: str) -> None:
+    def _stash_pace_id(data: Any, pace_id: str, est_tokens: int = 0) -> None:
         """Pin the lease id on every carrier that can survive to a terminal
         path.
 
@@ -548,15 +775,21 @@ class FleetPacer(CustomLogger):
             meta = data.setdefault("metadata", {})
             if isinstance(meta, dict):
                 meta[_PACE_ATTR] = pace_id
+                if est_tokens:
+                    meta[_PACE_TOK_ATTR] = int(est_tokens)
         except Exception:
             pass
         try:
             lobj = data.get("litellm_logging_obj")
             if lobj is not None:
                 setattr(lobj, _PACE_ATTR, pace_id)
+                if est_tokens:
+                    setattr(lobj, _PACE_TOK_ATTR, int(est_tokens))
                 mcd = getattr(lobj, "model_call_details", None)
                 if isinstance(mcd, dict):
                     mcd[_PACE_ATTR] = pace_id
+                    if est_tokens:
+                        mcd[_PACE_TOK_ATTR] = int(est_tokens)
         except Exception:
             pass
 
@@ -596,8 +829,146 @@ class FleetPacer(CustomLogger):
             pass
         return None
 
+    # ----- token reconciliation (best-effort, never load-bearing) ------
+    @staticmethod
+    def _tok_est_from_logging_obj(lobj: Any) -> Optional[int]:
+        """Sibling of _pace_id_from_logging_obj: recover the admit-time token
+        estimate pinned on the logging object / its model_call_details."""
+        if lobj is None:
+            return None
+        try:
+            v = getattr(lobj, _PACE_TOK_ATTR, None)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return v
+            mcd = getattr(lobj, "model_call_details", None)
+            if isinstance(mcd, dict):
+                v = mcd.get(_PACE_TOK_ATTR)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    return v
+        except Exception:
+            pass
+        return None
+
+    def _extract_tok_est(self, data: Any) -> Optional[int]:
+        """Sibling of _extract_pace_id: recover the admit-time token estimate
+        from whatever payload shape a terminal hook hands us. Never raises."""
+        try:
+            if not isinstance(data, dict):
+                return None
+            meta = data.get("metadata")
+            if isinstance(meta, dict):
+                v = meta.get(_PACE_TOK_ATTR)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    return v
+            lp = data.get("litellm_params")
+            if isinstance(lp, dict):
+                lp_meta = lp.get("metadata")
+                if isinstance(lp_meta, dict):
+                    v = lp_meta.get(_PACE_TOK_ATTR)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        return v
+            return self._tok_est_from_logging_obj(data.get("litellm_logging_obj"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> dict:
+        """Coerce a usage object (dict, pydantic model, or plain attr-carrier)
+        into a flat dict _usage_actual_tokens can read. Never raises."""
+        try:
+            if isinstance(usage, dict):
+                return usage
+            for meth in ("model_dump", "dict"):
+                fn = getattr(usage, meth, None)
+                if callable(fn):
+                    try:
+                        d = fn()
+                        if isinstance(d, dict):
+                            return d
+                    except Exception:
+                        pass
+            d = getattr(usage, "__dict__", None)
+            if isinstance(d, dict) and d:
+                return d
+            out: dict = {}
+            for k in (
+                "input_tokens",
+                "output_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                v = getattr(usage, k, None)
+                if v is not None:
+                    out[k] = v
+            return out
+        except Exception:
+            return {}
+
+    def _actual_tokens_from_response(self, response: Any, data: Any = None) -> Optional[int]:
+        """Best-effort actual token count for the ROUTER success path: reads
+        response.usage, else a dict response's 'usage', else the logging
+        object's model_call_details['usage']. Never raises."""
+        try:
+            usage = getattr(response, "usage", None)
+            if usage is None and isinstance(response, dict):
+                usage = response.get("usage")
+            if usage is None and isinstance(data, dict):
+                lobj = data.get("litellm_logging_obj")
+                mcd = getattr(lobj, "model_call_details", None) if lobj is not None else None
+                if isinstance(mcd, dict):
+                    usage = mcd.get("usage")
+            if usage is None:
+                return None
+            return _usage_actual_tokens(self._usage_to_dict(usage))
+        except Exception:
+            return None
+
+    def _actual_tokens_from_response_body(self, response_body: Any) -> Optional[int]:
+        """Best-effort actual token count for the non-streaming PASSTHROUGH path:
+        the anthropic response_body dict carries `usage`. Never raises."""
+        try:
+            if isinstance(response_body, dict):
+                return _usage_actual_tokens(self._usage_to_dict(response_body.get("usage")))
+            return None
+        except Exception:
+            return None
+
+    async def _reconcile_tokens(self, est: Optional[int], actual: Optional[int]) -> None:
+        """Best-effort convergence of the rolling budget from admit-time ESTIMATE
+        to real USAGE: HINCRBY (actual - est) into the CURRENT bucket once usage
+        is known. NEVER load-bearing — a no-op when token pacing is off or either
+        value is missing, and it swallows every error. The delta may be negative
+        (estimate over-counted); the admit Lua clamps the rolling sum at >= 0."""
+        if _Cfg.MAX_TPM <= 0 or est is None or actual is None:
+            return
+        delta = int(actual) - int(est)
+        if delta == 0:
+            return
+        try:
+            r = await self._get_redis()
+            if r is None:
+                return
+            bucket = _token_bucket(time.time())
+            await r.hincrby(_TOKENS_KEY, str(bucket), delta)
+            await r.expire(_TOKENS_KEY, 120)
+        except Exception as e:
+            verbose_proxy_logger.debug(
+                "custom_pacing: token reconcile failed (non-load-bearing): %s", e
+            )
+
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
         await self._release(self._extract_pace_id(data))
+        # Router-path token reconciliation (best-effort; no-op when MAX_TPM==0).
+        if _Cfg.MAX_TPM > 0:
+            try:
+                await self._reconcile_tokens(
+                    self._extract_tok_est(data),
+                    self._actual_tokens_from_response(response, data),
+                )
+            except Exception:
+                pass
         return response
 
     async def async_post_call_failure_hook(
@@ -690,6 +1061,15 @@ pacer_instance = FleetPacer()
 #
 # The patch is install-once, fails open (any error leaves litellm untouched),
 # and never changes the bytes yielded to the client.
+#
+# TOKEN RECONCILIATION IS DELIBERATELY NOT DONE HERE. The streaming wrapper is
+# left untouched by PACE_MAX_TPM: parsing SSE to recover the terminal usage
+# block would mean buffering/inspecting the client's byte stream, which this
+# wrapper is expressly forbidden from doing (it must be byte-transparent). So a
+# STREAMED request keeps its admit-time ESTIMATE in the budget forever — never
+# reconciled to actuals. That is an accepted, bounded imprecision: the estimate
+# is conservative, the budget is a rolling smoother (not an accountant), and the
+# non-streaming + router paths (which CAN see usage cheaply) do reconcile.
 # ---------------------------------------------------------------------------
 
 _PATCH_FLAG = "_switchroom_pace_patched"
@@ -819,11 +1199,25 @@ def _install_nonstreaming_release_patch() -> bool:
 
     async def _paced_success_handler(self, *args, **kwargs):
         pace_id: Optional[str] = None
+        est: Optional[int] = None
+        actual: Optional[int] = None
         try:
             lobj = kwargs.get("logging_obj")
             pace_id = FleetPacer._pace_id_from_logging_obj(lobj)
             if pace_id is None:
                 pace_id = pacer_instance._extract_pace_id(kwargs.get("request_body"))
+            # Token reconciliation inputs (only when the budget is active). The
+            # non-streaming passthrough success handler is called with keywords
+            # (success_handler.py) but positional is handled defensively, the
+            # same way the streaming wrapper reads its lobj/body.
+            if _Cfg.MAX_TPM > 0:
+                est = FleetPacer._tok_est_from_logging_obj(lobj)
+                if est is None:
+                    est = pacer_instance._extract_tok_est(kwargs.get("request_body"))
+                response_body = kwargs.get("response_body")
+                if response_body is None and len(args) >= 2:
+                    response_body = args[1]
+                actual = pacer_instance._actual_tokens_from_response_body(response_body)
         except Exception as e:
             verbose_proxy_logger.debug(
                 "custom_pacing: non-stream pace_id lookup failed: %s", e
@@ -835,6 +1229,11 @@ def _install_nonstreaming_release_patch() -> bool:
                 await pacer_instance._release(pace_id)
             except Exception:
                 pacer_instance._release_soon(pace_id)
+            if _Cfg.MAX_TPM > 0:
+                try:
+                    await pacer_instance._reconcile_tokens(est, actual)
+                except Exception:
+                    pass
 
     setattr(_paced_success_handler, _PATCH_FLAG, True)
     setattr(_paced_success_handler, "__wrapped__", original)
