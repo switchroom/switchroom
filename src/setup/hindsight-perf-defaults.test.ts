@@ -351,7 +351,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these forty-eight keys, by name", () => {
+  it("is overridable on exactly these forty-nine keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -389,6 +389,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
       "HINDSIGHT_API_TEMPORAL_LANGUAGES",
       "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
+      "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       // Both spellings of every per-type slot reservation are ACCEPTED as
       // input (see HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES); only the
@@ -569,6 +570,65 @@ describe("HINDSIGHT_API_WORKER_MAX_SLOTS (override-only)", () => {
     expect(fromRun.get(KEY)).toEqual(["16"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS")).toEqual(["5"]);
     expect(fromRun.get("HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT")).toEqual(["6"]);
+  });
+});
+
+describe("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE (override-only)", () => {
+  // The durable stopword config's env key. Override-only ON PURPOSE: switchroom
+  // emits NO default, so a stock fleet keeps upstream's always-safe `english`
+  // (guaranteed to exist on any Postgres) and never depends on the entrypoint's
+  // new provisioning path. An operator opts into the junk-stopping index by
+  // setting `hindsight_english` explicitly, and that value must then survive
+  // `switchroom apply` — the exact drop-on-apply regression this file guards.
+  const KEY = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE";
+  const VALUE = "hindsight_english";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group (no emitted default)", () => {
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — upstream's `english` stands",
+    (caps) => {
+      // Unset ⇒ no env emitted ⇒ the image's baked `english`. Critically, this
+      // is what keeps a fresh fleet OFF the provisioning path: without the key
+      // the backfill migration builds search_vector with the guaranteed-present
+      // `english` regconfig, so it can never 42704 on an empty volume.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    const perf = { env: { [KEY]: VALUE }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    // Both paths, or the value dies on whichever recreate the operator uses —
+    // exactly the live-vs-durable gap this whole change closes.
+    expect(fromRun.get(KEY)).toEqual([VALUE]);
+    expect(fromCompose.get(KEY)).toEqual([VALUE]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: VALUE }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([VALUE]);
   });
 });
 

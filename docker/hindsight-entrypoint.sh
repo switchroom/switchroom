@@ -120,6 +120,21 @@ PG0_BIN="${SWITCHROOM_HINDSIGHT_PG0_BIN:-}"
 # hindsight_api resolves from HINDSIGHT_API_DB_URL, or its ensure_running()
 # will not adopt ours.
 PG0_NAME="${SWITCHROOM_HINDSIGHT_PG0_NAME:-hindsight}"
+# --- Text-search provisioning (durable stopword config) ---------------------
+# Baked stopword source (docker/hindsight-extra.stop → COPYd here at build time
+# to a STABLE, version-independent path). Empty/missing DISABLES provisioning
+# entirely, so an older image without the baked file — or an operator who
+# removed it — boots exactly as before. Overridable for host tests.
+TS_STOP_SRC="${SWITCHROOM_HINDSIGHT_TS_STOP_SRC:-/usr/local/lib/switchroom/hindsight_extra.stop}"
+# Glob of the CURRENT embedded-pg install's tsearch_data dir(s). pg0 extracts a
+# fresh, version-scoped install dir on every embedded-pg bump; the stopword file
+# is re-materialized into every match on each boot so a bump can never orphan it
+# (the "could not open stop-word file" landmine). Overridable for host tests.
+TS_STOP_DEST_GLOB="${SWITCHROOM_HINDSIGHT_TS_STOP_DEST_GLOB:-/home/hindsight/.pg0/installation/*/share/tsearch_data}"
+# Bounded readiness retries for the idempotent DDL. `pg0 start` already blocks
+# until the server accepts, so the first psql normally succeeds; this only
+# insures a slow-recovery edge. One `sleep 1` between tries.
+TS_PROVISION_TRIES="${SWITCHROOM_HINDSIGHT_TS_PROVISION_TRIES:-30}"
 
 log() { echo "switchroom-hindsight-entrypoint: $*" >&2; }
 
@@ -402,6 +417,181 @@ EOF
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Text-search provisioning (durable stopword config).
+#
+# switchroom runs hindsight recall through a CUSTOM Postgres text-search
+# regconfig — HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE=hindsight_english,
+# a COPY of `english` whose snowball dictionary (`hindsight_stem`) drops
+# boilerplate lexemes (claude/code/agent/user/switchroom/…) via a stopword file
+# (`hindsight_extra`). Both the index write and the recall query call
+# to_tsvector/to_tsquery against that regconfig. It was first applied by hand on
+# the live volume; nothing re-creates it. Two ways that bites a fresh boot:
+#
+#   L1  Fresh/empty volume + the env set = HARD BOOT FAILURE. The backfill
+#       migration runs to_tsvector('hindsight_english'::regconfig, …); `::regconfig`
+#       resolves at PLAN time, so a missing config is SQLSTATE 42704 and the
+#       migration — hence the whole API — crash-loops. The config must exist
+#       BEFORE hindsight_api runs migrations.
+#   L2  An embedded-pg version bump extracts a NEW install dir WITHOUT the
+#       stopword file, so `stopwords = 'hindsight_extra'` no longer resolves and
+#       to_tsvector fails with "could not open stop-word file".
+#
+# Ordering: hindsight_api (start-all.sh, exec'd below) owns pg0 start + Alembic
+# migrations, so we run BEFORE the exec — (1) drop the stopword file into the
+# current install's tsearch_data (fixes L2), (2) synchronously ensure pg0 is up
+# ourselves (ensure_running() adopts an already-running instance, the same
+# mechanism prestart_pg0 relies on), and (3) run IDEMPOTENT DDL creating the
+# dict + config (fixes L1). No race with hindsight_api: it does not start until
+# we exec.
+#
+# BEST-EFFORT BY CONSTRUCTION. Every failure path returns 0. If provisioning
+# cannot complete AND the operator set native_language=hindsight_english, the
+# migration surfaces the exact 42704 — no worse than L1 today; and switchroom's
+# default leaves native_language at the always-safe upstream `english`, so a
+# stock fleet never depends on this path. The DDL is guarded against the catalog
+# (Postgres has no CREATE ... IF NOT EXISTS for TS objects) and never
+# DROP...CASCADEs, so it is a cheap no-op on every boot after the first.
+#
+# int/uint/number token mappings are LEFT on the default `simple` dictionary so
+# numbers, semvers, ports, and error codes stay searchable — only word tokens
+# are routed through the stopword-bearing stemmer.
+_provision_ddl_once() {
+  # Reads the (effectively global — sh has no locals) connection vars set by
+  # provision_text_search; feeds the idempotent DDL on psql's stdin. The
+  # heredoc delimiter is quoted so nothing inside is shell-expanded ($prov$,
+  # the SQL string literals, etc. are all literal). Echoes psql's combined
+  # stdout+stderr and returns its exit status.
+  PGPASSWORD="${_pp}" "${_psql}" -U "${_pu}" -h /tmp -p "${_pport}" -d "${_pd}" -v ON_ERROR_STOP=1 2>&1 <<'PROVSQL'
+DO $prov$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_ts_dict d JOIN pg_namespace n ON n.oid = d.dictnamespace
+    WHERE d.dictname = 'hindsight_stem' AND n.nspname = 'public'
+  ) THEN
+    EXECUTE 'CREATE TEXT SEARCH DICTIONARY public.hindsight_stem (TEMPLATE = snowball, Language = english, StopWords = hindsight_extra)';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace
+    WHERE c.cfgname = 'hindsight_english' AND n.nspname = 'public'
+  ) THEN
+    EXECUTE 'CREATE TEXT SEARCH CONFIGURATION public.hindsight_english (COPY = pg_catalog.english)';
+  END IF;
+  EXECUTE 'ALTER TEXT SEARCH CONFIGURATION public.hindsight_english ALTER MAPPING FOR asciiword, asciihword, hword_asciipart, word, hword, hword_part WITH public.hindsight_stem';
+END
+$prov$;
+PROVSQL
+}
+
+provision_text_search() {
+  # Disabled unless the stopword source is baked in (older image / removed file,
+  # or a host unit test that has not staged one).
+  [ -r "${TS_STOP_SRC}" ] || return 0
+
+  # Only the embedded pg0 database is ours to provision — never reach into an
+  # operator's external postgres.
+  case "${HINDSIGHT_API_DB_URL:-pg0}" in
+    pg0 | "pg0://${PG0_NAME}") : ;;
+    *)
+      log "text-search provisioning skipped: HINDSIGHT_API_DB_URL=${HINDSIGHT_API_DB_URL:-} is not the default embedded instance"
+      return 0
+      ;;
+  esac
+
+  # (1) Re-materialize the stopword file into the CURRENT install's tsearch_data
+  # (fixes L2). Unquoted glob so `*` expands; guard each match. A miss here is a
+  # warning, not fatal — an existing dict keeps working off the file already on
+  # the volume; only a version bump strictly needs the refresh.
+  _ts_placed=0
+  for _sd in ${TS_STOP_DEST_GLOB}; do
+    [ -d "${_sd}" ] || continue
+    if cp -f "${TS_STOP_SRC}" "${_sd}/hindsight_extra.stop" 2>/dev/null; then
+      _ts_placed=1
+    fi
+  done
+  if [ "${_ts_placed}" != 1 ]; then
+    log "WARNING: text-search provisioning: no tsearch_data dir matched ${TS_STOP_DEST_GLOB} (embedded pg not extracted yet?); stopword file not placed"
+  fi
+
+  # (2) Ensure pg0 is running so the DDL lands before migrations consume it.
+  _pg0="${PG0_BIN}"
+  if [ -z "${_pg0}" ]; then
+    _pg0="$(command -v pg0 2>/dev/null || ls /app/api/.venv/lib/python3.*/site-packages/pg0/bin/pg0 2>/dev/null | head -1)"
+  fi
+  if [ -z "${_pg0}" ] || [ ! -x "${_pg0}" ]; then
+    log "WARNING: text-search provisioning: pg0 binary not found; skipping DDL (migrations will fail if native_language=hindsight_english)"
+    return 0
+  fi
+
+  # Reuse the descriptor's identity when present so we never rewrite creds; on a
+  # first boot use hindsight_api's own defaults + pg0 auto-port (byte-identical
+  # to what hindsight_api would do), exactly like prestart_pg0.
+  _pu="hindsight"; _pp="hindsight"; _pd="hindsight"; _pport=""
+  if [ -r "${PG0_INSTANCE}" ]; then
+    if { read -r _v_u; read -r _v_d; read -r _v_p; read -r _v_pw; } <<EOF
+$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("username","hindsight"));print(d.get("database","hindsight"));print(d.get("port",""));print(d.get("password","hindsight"))' "${PG0_INSTANCE}" 2>/dev/null)
+EOF
+    then
+      if [ -n "${_v_u}" ]; then _pu="${_v_u}"; fi
+      if [ -n "${_v_d}" ]; then _pd="${_v_d}"; fi
+      if [ -n "${_v_pw}" ]; then _pp="${_v_pw}"; fi
+      if [ -n "${_v_p}" ]; then _pport="${_v_p}"; fi
+    fi
+  fi
+
+  # `set --` shadows only THIS function's positional params; the script's "$@"
+  # (the upstream CMD) is restored on return. Every branch is an `if`, never a
+  # bare AND-OR list, so `set -eu` cannot abort the entrypoint mid-provision.
+  set -- start --name "${PG0_NAME}" --username "${_pu}" --password "${_pp}" --database "${_pd}"
+  if [ -n "${_pport}" ]; then set -- "$@" --port "${_pport}"; fi
+  if _sout="$("${_pg0}" "$@" 2>&1)"; then
+    :
+  elif printf '%s' "${_sout}" | grep -qi 'already running'; then
+    :
+  else
+    log "WARNING: text-search provisioning: pg0 start failed; skipping DDL. detail: $(printf '%s' "${_sout}" | tr '\n' ' ' | cut -c1-200)"
+    return 0
+  fi
+
+  # Re-read the descriptor now pg0 is up: on a first boot it was only written
+  # just now (port + password were empty above).
+  if [ -r "${PG0_INSTANCE}" ]; then
+    if { read -r _v_u; read -r _v_d; read -r _v_p; read -r _v_pw; } <<EOF
+$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("username","hindsight"));print(d.get("database","hindsight"));print(d.get("port",""));print(d.get("password","hindsight"))' "${PG0_INSTANCE}" 2>/dev/null)
+EOF
+    then
+      if [ -n "${_v_u}" ]; then _pu="${_v_u}"; fi
+      if [ -n "${_v_d}" ]; then _pd="${_v_d}"; fi
+      if [ -n "${_v_pw}" ]; then _pp="${_v_pw}"; fi
+      if [ -n "${_v_p}" ]; then _pport="${_v_p}"; fi
+    fi
+  fi
+  if [ -z "${_pport}" ]; then
+    log "WARNING: text-search provisioning: no pg0 port after start; skipping DDL"
+    return 0
+  fi
+
+  _psql="$(command -v psql 2>/dev/null || ls /home/hindsight/.pg0/installation/*/bin/psql 2>/dev/null | head -1)"
+  if [ -z "${_psql}" ] || [ ! -x "${_psql}" ]; then
+    log "WARNING: text-search provisioning: psql not found; skipping DDL"
+    return 0
+  fi
+
+  # (3) Idempotent DDL, bounded readiness retries. `if var=$(...)` keeps this
+  # set -e-safe and does not swallow psql's stderr (captured for the warning).
+  _try=0
+  while [ "${_try}" -lt "${TS_PROVISION_TRIES}" ]; do
+    _try=$((_try + 1))
+    if _dout="$(_provision_ddl_once)"; then
+      log "text-search provisioning ok: hindsight_stem dictionary + hindsight_english configuration ensured (idempotent)"
+      return 0
+    fi
+    sleep 1
+  done
+  log "WARNING: text-search provisioning: DDL did not succeed after ${TS_PROVISION_TRIES} tries; if native_language=hindsight_english the backfill migration will surface the exact error. detail: $(printf '%s' "${_dout:-}" | tr '\n' ' ' | cut -c1-200)"
+  return 0
+}
+
 # 1. Wait for the broker socket. The broker may still be starting on
 # the host when this container boots (no cross-project depends_on).
 i=0
@@ -466,6 +656,15 @@ reap_stale_processing_when_ready || true
 # necessity (a background race would let hindsight_api win and start pg0
 # untuned); bounded by pg0's own start, and best-effort — see prestart_pg0().
 prestart_pg0 || true
+
+# 4d. Text-search provisioning (durable stopword config). MUST run before the
+# exec: hindsight_api's Alembic migrations consume the hindsight_english
+# regconfig, so it has to exist first. Runs after prestart_pg0 so a tuned pg0 is
+# already up (adopted via "already running"); if prestart_pg0 opted out, this
+# starts pg0 with pg0's own defaults — byte-identical to what hindsight_api
+# would do. Synchronous + best-effort; no-op unless the stopword source is baked
+# in. See provision_text_search()'s header.
+provision_text_search || true
 
 # 5. Hand off to upstream start-all.sh.
 exec "$@"

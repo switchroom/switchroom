@@ -1380,6 +1380,38 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS: "0"   # unbounded full scan
  * ```
  *
+ * ### `HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE`
+ *
+ * The Postgres text-search regconfig every native BM25 arm and the
+ * search_vector index write run to_tsvector/to_tsquery against. switchroom sets
+ * it to `hindsight_english` — a COPY of `english` whose snowball dictionary
+ * (`hindsight_stem`) carries a stopword file dropping boilerplate lexemes
+ * (claude/code/agent/assistant/user/switchroom/…) that otherwise pollute the
+ * search_vector of ~80% of rows (the `context` tag folded into the index) and
+ * turn `claude`/`code` recalls into full seq-scans. The `hindsight_english`
+ * config, its `hindsight_stem` dictionary, and the `hindsight_extra` stopword
+ * file are provisioned durably by the image itself: the entrypoint
+ * (`docker/hindsight-entrypoint.sh`, `provision_text_search()`) re-materializes
+ * the baked stopword file into the current embedded-pg install and creates the
+ * dict + config idempotently BEFORE hindsight_api runs migrations, and the
+ * recall path degrades to semantic-only if the regconfig is ever missing (the
+ * `docker/Dockerfile.hindsight` retrieval.py fallback bake).
+ *
+ * OVERRIDE-ONLY, deliberately. switchroom does NOT emit a default here, so a
+ * stock fleet keeps upstream's always-safe `english` — the regconfig that is
+ * guaranteed to exist on any Postgres, with zero dependence on the new
+ * provisioning path having run. Operators who want the junk-stopping index (as
+ * the live fleet does) set it explicitly to `hindsight_english`; that value
+ * then survives `switchroom apply` instead of being dropped as an unmanaged
+ * imperative env. Once the provisioning path has proven itself across a fleet
+ * rebuild, this can be promoted to an emitted default in a follow-up.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE: "hindsight_english"
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1408,6 +1440,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
   "HINDSIGHT_API_TEMPORAL_LANGUAGES",
   "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
+  "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
 ]);
 
 /**

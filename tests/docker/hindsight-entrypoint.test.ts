@@ -1015,6 +1015,170 @@ exit ${code}
     expect(r.stderr).toMatch(/pg0 pre-start skipped: pg0 binary not found/);
   }, 20_000);
 
+  // ── Text-search provisioning (durable stopword config) ─────────────────
+  //
+  // switchroom runs hindsight recall through a CUSTOM Postgres text-search
+  // regconfig (HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE =
+  // hindsight_english), whose snowball dictionary carries a stopword file that
+  // drops boilerplate lexemes. It was first applied by hand on the live volume
+  // and nothing re-creates it. Two ways that bites a fresh boot:
+  //   L1  fresh/empty volume + the env set → the backfill migration runs
+  //       to_tsvector('hindsight_english'::regconfig, …); `::regconfig` resolves
+  //       at PLAN time, so a missing config is SQLSTATE 42704 and the whole API
+  //       crash-loops. The config must exist BEFORE migrations.
+  //   L2  an embedded-pg version bump extracts a NEW install dir WITHOUT the
+  //       stopword file → to_tsvector fails "could not open stop-word file".
+  // provision_text_search() runs BEFORE the exec: it materializes the stopword
+  // file into the current install's tsearch_data (L2) and runs IDEMPOTENT DDL
+  // creating the dict + config (L1). These tests drive it with a fake pg0 + a
+  // fake psql that captures the DDL on stdin, and assert the OUTCOME.
+
+  /** Write a fake `psql` that appends whatever it reads on stdin to a log. */
+  function installFakeStdinPsql(stdinLog: string): string {
+    const binDir = execTmpDir("swr-fakepsql-stdin-");
+    const psql = join(binDir, "psql");
+    writeFileSync(
+      psql,
+      `#!/bin/sh
+# Fake psql for text-search provisioning tests: capture the DDL fed on stdin.
+cat >> "${stdinLog}"
+exit 0
+`,
+      { mode: 0o755 },
+    );
+    return binDir;
+  }
+
+  it("provisions the stopword file + idempotent, catalog-guarded DDL before exec", async () => {
+    stopBroker = await startFakeBroker(socketPath);
+    const pg0log = join(dir, "prov-pg0.log");
+    const ddlLog = join(dir, "prov-ddl.sql");
+    const stopSrc = join(dir, "hindsight_extra.stop");
+    const STOP_BYTES = "claude\ncode\nagent\n";
+    writeFileSync(stopSrc, STOP_BYTES);
+    // A tsearch_data dir that matches the glob (the current install).
+    const tsDir = join(dir, "inst", "18.1.0", "share", "tsearch_data");
+    mkdirSync(tsDir, { recursive: true });
+    const pgInstance = join(dir, "instance.json");
+    writePgInstance(pgInstance);
+    const psqlBin = installFakeStdinPsql(ddlLog);
+
+    const r = await runWithEnv({
+      PATH: `${psqlBin}:${process.env.PATH}`,
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(pg0log),
+      SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_TS_STOP_SRC: stopSrc,
+      SWITCHROOM_HINDSIGHT_TS_STOP_DEST_GLOB: join(dir, "inst", "*", "share", "tsearch_data"),
+    });
+    expect(r.status).toBe(0);
+
+    // L2: the stopword file was materialized into the current install, byte-exact.
+    const placed = join(tsDir, "hindsight_extra.stop");
+    expect(existsSync(placed)).toBe(true);
+    expect(readFileSync(placed, "utf-8")).toBe(STOP_BYTES);
+
+    // L1: the idempotent DDL was fed to psql.
+    expect(existsSync(ddlLog)).toBe(true);
+    const ddl = readFileSync(ddlLog, "utf-8");
+    // Guarded against the CATALOG (Postgres has no CREATE ... IF NOT EXISTS for
+    // TS objects) via pg_ts_dict / pg_ts_config, so it is a no-op after boot 1.
+    expect(ddl).toMatch(/IF NOT EXISTS/);
+    expect(ddl).toMatch(/FROM pg_ts_dict\b/);
+    expect(ddl).toMatch(/FROM pg_ts_config\b/);
+    // Creates the dict (with the stopword file) + the config (COPY of english).
+    expect(ddl).toMatch(/CREATE TEXT SEARCH DICTIONARY public\.hindsight_stem/);
+    expect(ddl).toMatch(/StopWords = hindsight_extra/);
+    expect(ddl).toMatch(
+      /CREATE TEXT SEARCH CONFIGURATION public\.hindsight_english \(COPY = pg_catalog\.english\)/,
+    );
+    // Word tokens routed through the stopword-bearing stemmer …
+    expect(ddl).toMatch(
+      /ALTER MAPPING FOR asciiword, asciihword, hword_asciipart, word, hword, hword_part WITH public\.hindsight_stem/,
+    );
+    // … but NUMBER/int tokens are LEFT on the default `simple` dict so numbers,
+    // semvers, ports and error codes stay searchable — they must NOT be remapped.
+    expect(ddl).not.toMatch(/\b(int|uint|numword|numhword|float)\b/);
+    // NEVER destructive: no DROP ... CASCADE that could nuke dependent indexes.
+    expect(ddl).not.toMatch(/DROP\b/i);
+    // It reported success and reached exec.
+    expect(r.stderr).toMatch(/text-search provisioning ok/);
+  }, 20_000);
+
+  it("re-materializes the stopword file into EVERY install dir (survives a pg version bump)", async () => {
+    // L2 durability: pg0 extracts a fresh, version-scoped install dir on an
+    // embedded-pg bump. The glob matches every install; the file is placed into
+    // each, so a bump can never leave the NEW install without the stopword file.
+    stopBroker = await startFakeBroker(socketPath);
+    const ddlLog = join(dir, "prov-ddl2.sql");
+    const stopSrc = join(dir, "hindsight_extra.stop");
+    writeFileSync(stopSrc, "claude\ncode\n");
+    const oldDir = join(dir, "inst", "17.4.0", "share", "tsearch_data");
+    const newDir = join(dir, "inst", "18.1.0", "share", "tsearch_data");
+    mkdirSync(oldDir, { recursive: true });
+    mkdirSync(newDir, { recursive: true });
+    const pgInstance = join(dir, "instance.json");
+    writePgInstance(pgInstance);
+
+    const r = await runWithEnv({
+      PATH: `${installFakeStdinPsql(ddlLog)}:${process.env.PATH}`,
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(join(dir, "prov-pg0-2.log")),
+      SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_TS_STOP_SRC: stopSrc,
+      SWITCHROOM_HINDSIGHT_TS_STOP_DEST_GLOB: join(dir, "inst", "*", "share", "tsearch_data"),
+    });
+    expect(r.status).toBe(0);
+    expect(existsSync(join(oldDir, "hindsight_extra.stop"))).toBe(true);
+    expect(existsSync(join(newDir, "hindsight_extra.stop"))).toBe(true);
+  }, 20_000);
+
+  it("is a clean no-op (no DDL, still boots) when the stopword source is absent", async () => {
+    // An older image without the baked stopword file — or an operator who
+    // removed it — must boot exactly as before: provisioning disables itself.
+    stopBroker = await startFakeBroker(socketPath);
+    const ddlLog = join(dir, "prov-ddl-absent.sql");
+    const marker = join(dir, "prov-absent-ran");
+    const pgInstance = join(dir, "instance.json");
+    writePgInstance(pgInstance);
+
+    const r = await runWithEnv(
+      {
+        PATH: `${installFakeStdinPsql(ddlLog)}:${process.env.PATH}`,
+        SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(join(dir, "prov-pg0-absent.log")),
+        SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+        SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+        SWITCHROOM_HINDSIGHT_TS_STOP_SRC: join(dir, "no-such-stopfile.stop"),
+      },
+      ["sh", "-c", `touch ${marker}`],
+    );
+    expect(r.status).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+    expect(existsSync(ddlLog)).toBe(false);
+    expect(r.stderr).not.toMatch(/text-search provisioning ok/);
+  }, 20_000);
+
+  it("skips text-search provisioning for an external (non-embedded) database", async () => {
+    // Reaching into an operator's external postgres to run our DDL would be
+    // actively wrong — provisioning only ever touches the embedded pg0.
+    stopBroker = await startFakeBroker(socketPath);
+    const ddlLog = join(dir, "prov-ddl-extdb.sql");
+    const stopSrc = join(dir, "hindsight_extra.stop");
+    writeFileSync(stopSrc, "claude\ncode\n");
+
+    const r = await runWithEnv({
+      PATH: `${installFakeStdinPsql(ddlLog)}:${process.env.PATH}`,
+      SWITCHROOM_HINDSIGHT_PG0_BIN: installFakePg0(join(dir, "prov-pg0-extdb.log")),
+      SWITCHROOM_HINDSIGHT_REAP_STALE_S: "0",
+      SWITCHROOM_HINDSIGHT_TS_STOP_SRC: stopSrc,
+      SWITCHROOM_HINDSIGHT_TS_STOP_DEST_GLOB: join(dir, "inst", "*", "share", "tsearch_data"),
+      HINDSIGHT_API_DB_URL: "postgresql://user:pw@db.example.com:5432/hindsight",
+    });
+    expect(r.status).toBe(0);
+    expect(existsSync(ddlLog)).toBe(false);
+    expect(r.stderr).toMatch(/text-search provisioning skipped/);
+  }, 20_000);
+
   it("Dockerfile pins UID 11000 to match HINDSIGHT_DEFAULT_UID", () => {
     // The broker chowns the per-consumer socket to consumer.uid (mode 0600).
     // If the runtime UID inside hindsight didn't match what the operator
