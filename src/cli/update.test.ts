@@ -55,6 +55,7 @@ describe("planUpdate", () => {
         "pull-images",
         "apply-config",
         "reconcile-hindsight-watch-cron",
+        "reconcile-config-repo-cron",
         "install-self-heal-timer",
         "refresh-hostd",
         "refresh-web",
@@ -122,6 +123,71 @@ describe("planUpdate", () => {
         const cronPath = join(tmp, "hindsight-watch");
         // Must not throw and must not create the file — arming stays opt-in.
         expect(() => stepFor({ watchCronPath: cronPath }).run()).not.toThrow();
+        expect(existsSync(cronPath)).toBe(false);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("is deferred (skipReason) in hostd-context — /etc/cron.d is on the host", () => {
+      expect(stepFor({ hostdContext: true }).skipReason).toMatch(/hostd-context/);
+      expect(stepFor({ hostdContext: false }).skipReason).toBeUndefined();
+    });
+  });
+
+  describe("reconcile-config-repo-cron step (auto-backup drift repair)", () => {
+    const OLD_ENV = { ...process.env };
+    function stepFor(opts: Parameters<typeof planUpdate>[0]) {
+      return planUpdate({ composePath: "unused", ...opts }).find(
+        (s) => s.name === "reconcile-config-repo-cron",
+      )!;
+    }
+
+    it("REWRITES the config-sync cron when it differs, then is a NO-OP when identical", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "update-cfgcron-"));
+      try {
+        process.env.SWITCHROOM_BINARY = "/usr/local/bin/switchroom";
+        const cronPath = join(tmp, "switchroom-config-sync");
+        // Armed earlier as `ada` at a STALE binary path.
+        writeFileSync(
+          cronPath,
+          [
+            "# switchroom config-repo auto-backup — scheduled sync of ~/.switchroom-config.",
+            "# Managed by `switchroom config-repo --install-cron`; edits are overwritten.",
+            "# 30-min leg: commit+push live config / workspace / mirrored personal skills.",
+            "# vault backup: daily at 17 3 * * * (config_repo.include_vault_backup: daily).",
+            "SHELL=/bin/sh",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "*/30 * * * * ada /usr/bin/flock -n /run/lock/switchroom-config-sync.lock /opt/old/switchroom config-repo sync >> /var/log/switchroom-config-sync.log 2>&1",
+            "17 3 * * * ada /usr/bin/flock -n /run/lock/switchroom-config-sync.lock /bin/sh -c '/opt/old/switchroom vault backup && /opt/old/switchroom config-repo sync' >> /var/log/switchroom-config-sync.log 2>&1",
+            "",
+          ].join("\n"),
+        );
+        const before = readFileSync(cronPath, "utf8");
+
+        // First run: the stale binary path is corrected → file changes.
+        stepFor({ configSyncCronPath: cronPath }).run();
+        const after = readFileSync(cronPath, "utf8");
+        expect(after).not.toBe(before);
+        expect(after).toContain("/usr/local/bin/switchroom config-repo sync");
+        expect(after).not.toContain("/opt/old/switchroom");
+        // The operator's chosen user is preserved, not overwritten to root.
+        expect(after).toContain("*/30 * * * * ada ");
+
+        // Second run: definition already current → byte-identical no-op.
+        stepFor({ configSyncCronPath: cronPath }).run();
+        expect(readFileSync(cronPath, "utf8")).toBe(after);
+      } finally {
+        process.env = { ...OLD_ENV };
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("is a NO-OP when the host was never armed (no fragment present) — reconcile never ARMS", () => {
+      const tmp = mkdtempSync(join(tmpdir(), "update-cfgcron-absent-"));
+      try {
+        const cronPath = join(tmp, "switchroom-config-sync");
+        expect(() => stepFor({ configSyncCronPath: cronPath }).run()).not.toThrow();
         expect(existsSync(cronPath)).toBe(false);
       } finally {
         rmSync(tmp, { recursive: true, force: true });
@@ -420,6 +486,7 @@ describe("planUpdate", () => {
         "rebuild-source",
         "apply-config",
         "reconcile-hindsight-watch-cron",
+        "reconcile-config-repo-cron",
         "install-self-heal-timer",
         "refresh-hostd",
         "refresh-web",
