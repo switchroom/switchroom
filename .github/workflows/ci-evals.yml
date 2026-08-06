@@ -85,6 +85,24 @@ jobs:
         # evals: replace with `--coverage --hard --base-ref origin/main`.
         run: python3 evals/validate_datasets.py --coverage
 
+      # ── Recall-quality suite (#4479) ──────────────────────────────
+      # Offline half only: schema + lints + unit tests. Scoring a real
+      # configuration needs a live Hindsight instance and a populated bank, so
+      # that is an operator-run command, not a CI job. What CI protects here is
+      # the ASSET and the SCORER — a corrupted query set, or a scorer that
+      # silently returns 1.0 for an unjudged case, would make every future run
+      # vacuous. Both are catchable at zero model cost, on fork PRs.
+      - name: Recall query-set lint self-check (each lint must fire)
+        run: python3 evals/recall/validate_queryset.py --selftest
+
+      - name: Validate recall query set
+        run: python3 evals/recall/validate_queryset.py
+
+      - name: Recall-quality scorer unit tests
+        # Includes the non-vacuity proof (#4479 AC1): an ablated run must score
+        # worse and drive the regression gate red, asserted offline.
+        run: python3 -m unittest discover -s evals/recall -p 'test_*.py' -t .
+
   # ─── Trigger routing eval ────────────────────────────────────────
   evals-trigger:
     runs-on: ubuntu-latest

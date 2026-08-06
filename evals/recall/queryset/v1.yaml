@@ -1,0 +1,444 @@
+# Hindsight recall-quality query set — version 1
+#
+# See ../README.md for the method, the judgement provenance, and how to add a
+# case. Two rules bind every entry in this file:
+#
+#   1. NO REAL USER OR BANK TEXT. This repo is public; the banks are a live
+#      operator's private memory. Every `text` below is authored. Real recall
+#      traffic shaped the FAMILIES and the LENGTH DISTRIBUTION (see
+#      `provenance` below), never the wording.
+#   2. A case is a question about the query, not about an answer. Relevance
+#      judgements live in ../qrels/ as opaque ids, never here.
+
+schema_version: 1
+queryset_version: "v1"
+queryset_id: p6-recall-quality-v1
+
+provenance:
+  method: authored-traffic-shaped
+  shaped_by:
+    # Aggregate statistics only, reproduced by `derive_shape.py`, which reads
+    # the local `recall_log.jsonl` telemetry of the fleet. The source log
+    # records `query_chars` (an integer) and never the query text, so nothing
+    # private can reach this block. Regenerate with:
+    #   python3 evals/recall/derive_shape.py --glob '<path>/recall_log.jsonl'
+    # Captured 2026-08-07 across 12 agents.
+    source: recall_log.jsonl (local, never committed)
+    rows_observed: 23538
+    distinct_banks: 12
+    query_chars_p50: 691
+    query_chars_p90: 800
+    query_chars_max: 800  # HINDSIGHT_RECALL_MAX_QUERY_CHARS
+    query_chars_mean: 577.5
+    result_count_p50: 5
+    capped_rate: 0.4284
+    final_zero_result_rate: 0.3883
+  notes: >-
+    The single most surprising shape fact, and the reason the `context-blob`
+    family is the largest one here: real auto-recall queries are NOT short
+    keyword queries. The median is 691 characters and 43% of calls hit the
+    result cap, i.e. these are multi-sentence transcript slices clipped at the
+    800-char query cap. A query set made only of short natural-language
+    questions would not exercise the arm the fleet actually uses.
+
+    The 0.3883 final zero-result rate is a DIFFERENT quantity from this suite's
+    headline metric and must not be quoted as a baseline for it. It counts
+    recalls where the plugin surfaced no memory at all, after the relevance
+    floor and the demotion/overlap filters, over every bank including new and
+    nearly-empty ones. The headline metric counts KEYWORD-ARM zero rows on a
+    fixed query set against a named bank. This number is here to say the
+    phenomenon is common in the field, not to be compared against a run.
+
+families:
+  natural-question: Short natural-language questions. The shape a human types.
+  identifier: Code identifiers, paths, issue numbers, env vars. Common in fleet traffic.
+  morphological: >-
+    Stemming probes. Each pairs a surface form with a form that only matches
+    under a stemmer. These are the cases that go red if the pg_search tokenizer
+    silently reverts to unstemmed (risk C1 in epic #4474).
+  stopword-heavy: >-
+    Queries dominated by boilerplate. The fleet runs a custom `hindsight_english`
+    regconfig whose stopword file drops boilerplate lexemes; migrating off it
+    changes recall, which is the epic's open decision.
+  rare-term: Low-frequency technical terms. Where a keyword arm earns its place.
+  context-blob: >-
+    Long multi-sentence slices at the real 500-800 char median. The dominant
+    real shape.
+  zero-result-probe: >-
+    Composed entirely of lexemes the deployed regconfig discards, so the query
+    reduces to an empty tsquery and the native keyword arm returns zero rows.
+    This is the measured mechanism, not an assumed one; see the family comment
+    below. These are the headline metric's subject.
+
+cases:
+  # ── natural-question ────────────────────────────────────────────
+  - {id: nq-001, family: natural-question, text: "what did we decide about the recall deadline envelope"}
+  - {id: nq-002, family: natural-question, text: "why does the keyword arm return nothing sometimes"}
+  - {id: nq-003, family: natural-question, text: "how do scheduled tasks fire into a running session"}
+  - {id: nq-004, family: natural-question, text: "what is the difference between a directive and a mental model"}
+  - {id: nq-005, family: natural-question, text: "who approves a vault grant and how long does it take"}
+  - {id: nq-006, family: natural-question, text: "when was the last time the fleet was rolled to a new image"}
+  - {id: nq-007, family: natural-question, text: "what breaks when an agent overlay file is owned by root"}
+  - {id: nq-008, family: natural-question, text: "how is the merge queue configured for this repo"}
+  - {id: nq-009, family: natural-question, text: "what happened during the contention incident"}
+  - {id: nq-010, family: natural-question, text: "which checks are required before a pull request can merge"}
+  - {id: nq-011, family: natural-question, text: "how does an agent recover a session after a restart"}
+  - {id: nq-012, family: natural-question, text: "what is the policy on running claude programmatically"}
+  - {id: nq-013, family: natural-question, text: "where do worker sub-agents write their scratch files"}
+  - {id: nq-014, family: natural-question, text: "how many directives can a bank hold before recall drops some"}
+  - {id: nq-015, family: natural-question, text: "what is the plan for the text search backend"}
+  - {id: nq-016, family: natural-question, text: "why did the cron stop firing for weeks"}
+  - {id: nq-017, family: natural-question, text: "what does a degraded recall look like from the outside"}
+  - {id: nq-018, family: natural-question, text: "how do we prove a test can actually fail"}
+
+  # ── identifier ──────────────────────────────────────────────────
+  - {id: id-001, family: identifier, text: "idx_memory_units_text_search"}
+  - {id: id-002, family: identifier, text: "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"}
+  - {id: id-003, family: identifier, text: "hnsw.ef_search 200 high recall profile"}
+  - {id: id-004, family: identifier, text: "shared_buffers effective_cache_size sizing"}
+  - {id: id-005, family: identifier, text: "reciprocal_rank_fusion k=60"}
+  - {id: id-006, family: identifier, text: "ensure_text_search_extension boot crash loop"}
+  - {id: id-007, family: identifier, text: "pg_search bm25 key_field reloption"}
+  - {id: id-008, family: identifier, text: "hindsight_english regconfig stopword file"}
+  - {id: id-009, family: identifier, text: "recall_log.jsonl injected_score_max"}
+  - {id: id-010, family: identifier, text: "SWITCHROOM_CHEAP_CRON kill switch"}
+  - {id: id-011, family: identifier, text: "check-status-pin-single-path lint guard"}
+  - {id: id-012, family: identifier, text: "profiles/_base/start.sh.hbs boot entry"}
+  - {id: id-013, family: identifier, text: "vault-broker peercred socketPathToAgent"}
+  - {id: id-014, family: identifier, text: "d5e6f7a8b9c0 per bank hnsw migration"}
+  - {id: id-015, family: identifier, text: "pg_total_relation_size memory_units"}
+  - {id: id-016, family: identifier, text: "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"}
+  - {id: id-017, family: identifier, text: "XX000 does not contain a USING bm25 index"}
+  - {id: id-018, family: identifier, text: "issue 4474 epic recall latency"}
+
+  # ── morphological (stemming probes) ─────────────────────────────
+  # `probe` records the morphological relationship the case is testing. It is
+  # documentation, not an assertion: what the suite asserts is that these cases
+  # do not silently lose their keyword arm between two configurations.
+  - {id: mo-001, family: morphological, text: "indexing strategy for the memory units table", probe: "indexing -> index"}
+  - {id: mo-002, family: morphological, text: "indexes we should drop as dead weight", probe: "indexes -> index"}
+  - {id: mo-003, family: morphological, text: "running the benchmark under contention", probe: "running -> run"}
+  - {id: mo-004, family: morphological, text: "ran the sweep twice and compared", probe: "ran -> run (irregular)"}
+  - {id: mo-005, family: morphological, text: "consolidation writes storming the read path", probe: "storming -> storm"}
+  - {id: mo-006, family: morphological, text: "consolidated observations merged into one", probe: "consolidated -> consolidate"}
+  - {id: mo-007, family: morphological, text: "tokenizing the text column without a stemmer", probe: "tokenizing -> token"}
+  - {id: mo-008, family: morphological, text: "tokenizer variants and their stopword handling", probe: "tokenizer -> token"}
+  - {id: mo-009, family: morphological, text: "scheduling a recurring digest", probe: "scheduling -> schedul"}
+  - {id: mo-010, family: morphological, text: "schedules that fire into the live session", probe: "schedules -> schedul"}
+  - {id: mo-011, family: morphological, text: "approving a host mutation from telegram", probe: "approving -> approv"}
+  - {id: mo-012, family: morphological, text: "approvals that timed out are not denials", probe: "approvals -> approv"}
+  - {id: mo-013, family: morphological, text: "retaining a fact after a correction", probe: "retaining -> retain"}
+  - {id: mo-014, family: morphological, text: "retained memories that never surfaced again", probe: "retained -> retain"}
+  - {id: mo-015, family: morphological, text: "measuring latency percentiles not means", probe: "measuring -> measur"}
+  - {id: mo-016, family: morphological, text: "measurement instrument for the epic", probe: "measurement -> measur"}
+  - {id: mo-017, family: morphological, text: "degrading gracefully to semantic only", probe: "degrading -> degrad"}
+  - {id: mo-018, family: morphological, text: "degradation of the candidate pool", probe: "degradation -> degrad"}
+  - {id: mo-019, family: morphological, text: "reranking candidates with the cross encoder", probe: "reranking -> rerank"}
+  - {id: mo-020, family: morphological, text: "reranked results moved up in rank", probe: "reranked -> rerank"}
+
+  # ── stopword-heavy ──────────────────────────────────────────────
+  - {id: sw-001, family: stopword-heavy, text: "can you tell me what it was that we had decided about this"}
+  - {id: sw-002, family: stopword-heavy, text: "is there anything at all that i should know before i do that"}
+  - {id: sw-003, family: stopword-heavy, text: "the user asked the assistant to do the thing with the agent"}
+  - {id: sw-004, family: stopword-heavy, text: "please go ahead and do it the way we normally do"}
+  - {id: sw-005, family: stopword-heavy, text: "claude code agent assistant switchroom sidechain"}
+  - {id: sw-006, family: stopword-heavy, text: "what were the things we said about the other thing"}
+  - {id: sw-007, family: stopword-heavy, text: "i think it might have been something like that but not quite"}
+  - {id: sw-008, family: stopword-heavy, text: "ok so then what should we be doing about all of this now"}
+  - {id: sw-009, family: stopword-heavy, text: "there is a thing that does the thing when the other thing happens"}
+  - {id: sw-010, family: stopword-heavy, text: "just to be clear this is about that other one we talked about"}
+
+  # ── rare-term ───────────────────────────────────────────────────
+  - {id: rt-001, family: rare-term, text: "block-max WAND non competitive document skipping"}
+  - {id: rt-002, family: rare-term, text: "MaxScore top-n retrieval sublinear in matches"}
+  - {id: rt-003, family: rare-term, text: "tantivy segment merge policy"}
+  - {id: rt-004, family: rare-term, text: "snowball dictionary lexeme dropping"}
+  - {id: rt-005, family: rare-term, text: "reciprocal rank fusion versus interleaved fusion for dedup"}
+  - {id: rt-006, family: rare-term, text: "spreading activation entry point selection"}
+  - {id: rt-007, family: rare-term, text: "amcheck extension verifying btree integrity"}
+  - {id: rt-008, family: rare-term, text: "autovacuum dead tuple pruning headroom"}
+  - {id: rt-009, family: rare-term, text: "partial hnsw index per bank and fact type"}
+  - {id: rt-010, family: rare-term, text: "heap filter versus pushed down predicate"}
+  - {id: rt-011, family: rare-term, text: "cross encoder batching nondeterminism"}
+  - {id: rt-012, family: rare-term, text: "peercred based socket authentication"}
+  - {id: rt-013, family: rare-term, text: "idempotent at least once boot replay"}
+  - {id: rt-014, family: rare-term, text: "unified diff proposal applied by the host"}
+  - {id: rt-015, family: rare-term, text: "reciprocal grant scoped to one vault key"}
+
+  # rt-016..rt-035 were the original zero-result-probe population: lexically
+  # narrow, low-frequency phrasings, on the assumption that a rare phrase is
+  # what drives a keyword arm to zero. Measurement said otherwise (see the
+  # zero-result-probe comment below), so they live here instead, where being
+  # rare-but-matching is the point. They stay useful as a hedge: a backend with
+  # conjunctive semantics would drive these to zero even though native does not.
+  - {id: rt-016, family: rare-term, text: "quiescent reindexation window"}
+  - {id: rt-017, family: rare-term, text: "unstemmed lexeme regression guard"}
+  - {id: rt-018, family: rare-term, text: "nondeterministic tie-break in fusion ordering"}
+  - {id: rt-019, family: rare-term, text: "pathological stopword saturation"}
+  - {id: rt-020, family: rare-term, text: "orthogonal ablation of the keyword arm"}
+  - {id: rt-021, family: rare-term, text: "vacuous acceptance criterion"}
+  - {id: rt-022, family: rare-term, text: "circularity in relevance judgements"}
+  - {id: rt-023, family: rare-term, text: "amortised skipping across competitive postings"}
+  - {id: rt-024, family: rare-term, text: "morphological variant coverage shortfall"}
+  - {id: rt-025, family: rare-term, text: "monotonic degradation under arm removal"}
+  - {id: rt-026, family: rare-term, text: "provenance of a graded judgement"}
+  - {id: rt-027, family: rare-term, text: "idempotence of the reconcile sweep"}
+  - {id: rt-028, family: rare-term, text: "sublinearity claim conditional on the index fix"}
+  - {id: rt-029, family: rare-term, text: "unreproducible contention from rotated logs"}
+  - {id: rt-030, family: rare-term, text: "fail closed versus fail open on a missing index"}
+  - {id: rt-031, family: rare-term, text: "counterfactual baseline for a quality budget"}
+  - {id: rt-032, family: rare-term, text: "lexical recall shortfall recovered by bm25"}
+  - {id: rt-033, family: rare-term, text: "denominator per signal rather than shared"}
+  - {id: rt-034, family: rare-term, text: "escalation reason recorded on the render plan"}
+  - {id: rt-035, family: rare-term, text: "attributable delta between two ablations"}
+
+  # ── zero-result-probe ───────────────────────────────────────────
+  # Built to the ONE mechanism that actually drives the native keyword arm to
+  # zero rows, which was measured rather than assumed.
+  #
+  # The native arm ORs its tokens — `to_tsquery(cfg, 'a | b | c')` gated by
+  # `search_vector @@ <query>` (engine/sql/postgresql.py:228-234, v0.8.6) — so
+  # on a large bank a merely rare phrase still matches something. What does not
+  # match is a query that reduces to an EMPTY tsquery. The fleet runs
+  # `hindsight_english`, a COPY of `english` whose snowball dictionary carries
+  # docker/hindsight-extra.stop: standard English stopwords PLUS the corpus
+  # boilerplate claude / code / agent / assistant / user / switchroom /
+  # sidechain. A query made only of those words yields no lexemes at all.
+  #
+  # Measured on the live instance: of ten stopword-heavy cases, the nine using
+  # ordinary function words returned 172-300 keyword rows; sw-005, the one made
+  # of fleet boilerplate, returned 0. Every case below is composed exclusively
+  # of tokens present in that stop file.
+  #
+  # This makes the denominator a function of hindsight-extra.stop. If that file
+  # changes, these cases change meaning — which is itself worth knowing, and is
+  # exactly the kind of regression this family is here to catch.
+  #
+  # Do not delete a case because it currently scores zero. Scoring zero is the
+  # job: the headline metric's denominator is drawn from the cases that do.
+  # Surface forms only, no plurals or inflections, because whether the stopword
+  # check runs before or after stemming is not something this suite asserts.
+  # Inflected probes belong in `morphological`, with a probe note.
+  - {id: zr-001, family: zero-result-probe, text: "what did the user and the assistant do about it"}
+  - {id: zr-002, family: zero-result-probe, text: "the agent involved in this"}
+  - {id: zr-003, family: zero-result-probe, text: "claude code sidechain"}
+  - {id: zr-004, family: zero-result-probe, text: "switchroom agent user"}
+  - {id: zr-005, family: zero-result-probe, text: "is the assistant involving the user"}
+  - {id: zr-006, family: zero-result-probe, text: "should the agent do it now"}
+  - {id: zr-007, family: zero-result-probe, text: "claude-code sidechain user"}
+  - {id: zr-008, family: zero-result-probe, text: "the user who involved the assistant"}
+  - {id: zr-009, family: zero-result-probe, text: "what about claude"}
+  - {id: zr-010, family: zero-result-probe, text: "code and the agent"}
+  - {id: zr-011, family: zero-result-probe, text: "switchroom"}
+  - {id: zr-012, family: zero-result-probe, text: "the assistant"}
+  - {id: zr-013, family: zero-result-probe, text: "how does the agent do this"}
+  - {id: zr-014, family: zero-result-probe, text: "claude-code-sidechain"}
+  - {id: zr-015, family: zero-result-probe, text: "involves the user and the assistant"}
+  - {id: zr-016, family: zero-result-probe, text: "when will claude code do it"}
+  - {id: zr-017, family: zero-result-probe, text: "who is the user here"}
+  - {id: zr-018, family: zero-result-probe, text: "a switchroom agent involved with claude"}
+  - {id: zr-019, family: zero-result-probe, text: "not the assistant but the agent"}
+  - {id: zr-020, family: zero-result-probe, text: "just some code from claude"}
+
+  # ── context-blob (the dominant real shape: 500-800 chars) ───────
+  - id: cb-001
+    family: context-blob
+    text: >-
+      Prior context: we were working through whether the keyword backend is the
+      right lever at all. The conclusion was that consistency under contention
+      is decided by box level resource fit and by isolating the read path from
+      the write storm, not by which text search extension is installed. The
+      keyword index is small and cache resident, so swapping it does not move
+      the decisive axis. What it does move is quality, because the current
+      backend returns nothing at all for some queries and the candidate one
+      returns something. That quality result is the only reason the idea is
+      still on the table, and it needs to become a number before anything is
+      traded against it.
+  - id: cb-002
+    family: context-blob
+    text: >-
+      Prior context: the index we are building omits the bank and fact type
+      columns, so every arm scores across the whole table and the restriction
+      lands as a heap filter instead of being pushed into the scan. At fourteen
+      banks that is a large amplification for the biggest bank and far worse
+      for the small ones. Nothing downstream should be measured until that is
+      fixed, otherwise every number we produce is measuring the bug rather than
+      the backend. The follow up is to rebuild the index with the two columns
+      included and re-run the comparison from scratch.
+  - id: cb-003
+    family: context-blob
+    text: >-
+      Prior context: the boot path raises when the configured backend does not
+      match the column and index layout on disk and the tables already contain
+      data. When that raises, the application never serves, which takes out the
+      semantic arm as well as the keyword one. That is a full memory outage
+      rather than keyword errors, and it is the reason the cutover has to build
+      and validate the index before the configuration flips rather than after.
+      A non concurrent reindex on a live instance is the same hazard in a
+      different wrapper.
+  - id: cb-004
+    family: context-blob
+    text: >-
+      Prior context: cache hit numbers on this box are currently unusable as a
+      signal because the statistics were never reset, so everything reported is
+      cumulative since the database was initialised and says nothing about
+      behaviour under load. Any acceptance criterion that leans on a hit ratio
+      has to reset first or capture a before and after delta. The same applies
+      to any claim about buffer pool residency: the working set currently
+      overshoots the pool, and the cleanest reclaim is an index the upstream
+      source itself describes as dead weight.
+  - id: cb-005
+    family: context-blob
+    text: >-
+      Prior context: we agreed that a suite which cannot go red is worse than
+      no suite, because it manufactures confidence rather than measuring
+      anything. So the acceptance criterion is that a deliberately degraded
+      configuration has to fail it, and both runs get attached. Constructing
+      degraded without touching live state is part of the problem, not a
+      footnote to it. The obvious lever is removing an arm from the fusion and
+      showing that the score moves in the direction it must.
+  - id: cb-006
+    family: context-blob
+    text: >-
+      Prior context: the tokenizer variant we want cannot be expressed through
+      the environment knob at all. The normaliser accepts only a bare tokenizer
+      name from a fixed set, and the column builder emits an unstemmed cast, so
+      there is no stemmer or stopword parameter anywhere in that path. Worse,
+      the mismatch detector distinguishes the two extensions only by the
+      presence of one index option and never inspects the cast, so a hand built
+      index is silently adopted as correct and silently reverts to unstemmed if
+      it is ever rebuilt.
+  - id: cb-007
+    family: context-blob
+    text: >-
+      Prior context: the recall query is a union of per fact type semantic arms
+      and per fact type keyword arms plus graph arms, fused with reciprocal
+      rank fusion and then reranked by a cross encoder with a candidate cap.
+      The semantic arms over fetch and trim in application code, and the vector
+      search parameter is set globally on pool connections at initialisation
+      rather than per query. That matters because a per stage attribution needs
+      to know which of those knobs was in force when the numbers were taken.
+  - id: cb-008
+    family: context-blob
+    text: >-
+      Prior context: the fleet runs a custom text search configuration that is
+      a copy of the standard English one with a stopword file that drops
+      boilerplate. Migrating without preserving that behaviour changes recall
+      everywhere, which makes it a semantic quality tradeoff rather than a pure
+      performance win. That decision belongs to the requester and must not be
+      resolved silently by an implementation phase. The suite exists partly so
+      that the decision can be made against a number instead of an intuition.
+  - id: cb-009
+    family: context-blob
+    text: >-
+      Prior context: a test sweep created ten throwaway banks inside a four
+      minute window and one of them collided with a live agent's bank name,
+      which destroyed an annotation that mattered. The rule that came out of it
+      is that no evaluation may create a bank whose name could collide with a
+      live one, and that any fixture data has to sit behind a reserved prefix
+      and be cleaned up. Read paths are preferred over write paths for exactly
+      this reason.
+  - id: cb-010
+    family: context-blob
+    text: >-
+      Prior context: the auto recall path failed roughly eighty six percent of
+      the time for six weeks and no alert fired, because every armed watchdog
+      watched retain and liveness while every layer of the recall path fails
+      open. The hook exits zero on a bank timeout, the harness swallows the
+      warning, the agent cannot distinguish an empty match from an unreachable
+      fact layer, and the health probe answers fast and empty. The only durable
+      evidence is the telemetry the hook writes itself.
+  - id: cb-011
+    family: context-blob
+    text: >-
+      Prior context: percentiles rather than means, because the goal is a
+      statement about a distribution and about two independent variables, bank
+      size and concurrency. A median only harness cannot grade any of the
+      acceptance criteria. The sweep needs at least five bank size points
+      spanning the real distribution plus one synthetic point above the current
+      maximum so the curve extrapolates, and a contention mode that runs the
+      sweep while a synthetic write and model load runs against the same box.
+  - id: cb-012
+    family: context-blob
+    text: >-
+      Prior context: the judgement question is the one that decides whether the
+      suite means anything. Labels produced by the system being graded are
+      circular, so the method has to be stated along with its limits rather
+      than left implicit. Pooled judgements are the standard compromise, and
+      known item retrieval avoids the judge entirely at the cost of a lexical
+      bias toward whichever arm shares vocabulary with the target. Both are
+      acceptable if written down.
+  - id: cb-013
+    family: context-blob
+    text: >-
+      Prior context: the headline number is how many of the queries that return
+      nothing under the reference configuration are answered by the candidate
+      one. It needs no relevance labels at all, only two runs and a row count,
+      which is why it is the number the suite can report honestly at full scale
+      while the graded metrics wait on judgement coverage. Everything else in
+      the report is secondary to that ratio.
+  - id: cb-014
+    family: context-blob
+    text: >-
+      Prior context: determinism is not free here because the pipeline includes
+      an approximate nearest neighbour index and a model based reranker, and
+      the underlying bank keeps changing as agents write to it. The honest move
+      is to measure the real run to run spread and report it, rather than tune
+      the measurement until it flatters itself. If the spread exceeds the
+      budget, the suite is still a reporting instrument but must not be wired
+      as a hard gate at that budget.
+  - id: cb-015
+    family: context-blob
+    text: >-
+      Prior context: the results file has to stand on its own when pasted into
+      an issue comment, which means it carries the configuration, the banks,
+      the query set version and the engine identity alongside the scores. A
+      result without its configuration is not a result. It also means the file
+      cannot carry memory text, because the repository is public and the banks
+      are private, so identifiers and numbers only.
+  - id: cb-016
+    family: context-blob
+    text: >-
+      Prior context: the arm attribution matters because a regression needs to
+      be localised to the arm that caused it rather than blamed on the whole
+      pipeline. Reporting the raw keyword arm, the raw semantic arm, the fused
+      list and the reranked list separately is what makes that possible. When
+      the keyword arm alone collapses, the fused list often barely moves,
+      which is exactly how a tokenizer regression hides for weeks.
+  - id: cb-017
+    family: context-blob
+    text: >-
+      Prior context: we should not run a large sweep right now because another
+      measurement is in flight on the same box and a third is establishing a
+      baseline. Sequential at concurrency one against a small query set, and
+      anything timing shaped that comes out of it is not a latency measurement
+      and must never be reported as one. The suite should be built so it can
+      run bigger later, with the full run deferred rather than quietly skipped.
+  - id: cb-018
+    family: context-blob
+    text: >-
+      Prior context: the ordering rule that fell out of the fail closed
+      behaviour is that the index is built and validated before the
+      configuration flips, never the other way round, and that a rebuild on a
+      live instance is done concurrently or not at all. The graceful path the
+      other backend has is not shared, so the window between dropping and
+      rebuilding is a fleet wide outage rather than a degraded mode.
+  - id: cb-019
+    family: context-blob
+    text: >-
+      Prior context: every signal carries its own denominator, because a row
+      that does not carry a field should be excluded from that signal rather
+      than counted as healthy. The fail open default where a missing field
+      reads as zero and therefore fine is precisely the bug class the module
+      exists to catch. A signal whose denominator falls under its sample floor
+      reports no data, which neither fires nor resolves.
+  - id: cb-020
+    family: context-blob
+    text: >-
+      Prior context: the thing that made the whole investigation worth doing
+      was noticing that the candidate backend answered queries the incumbent
+      returned nothing for. That observation currently lives in one dry run
+      note, which means it cannot gate a change and cannot be regressed
+      against, and every latency phase is trading against a quality number
+      nobody can compute. Turning it into a score is the entire point of this
+      phase.
