@@ -24,6 +24,11 @@ import { join } from "node:path";
 import { resolvePath } from "../config/loader.js";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { PERSONAL_SKILLS_SUBPATH, type CmdRunner } from "../config-repo/sync.js";
+import {
+  CRON_LOG_PATH,
+  CRON_PATH,
+  DEFAULT_INTERVAL_MINUTES,
+} from "../config-repo/install-cron.js";
 
 export interface CheckResult {
   name: string;
@@ -34,6 +39,114 @@ export interface CheckResult {
 
 /** How old the oldest unpushed commit may be before the row goes red. */
 export const UNPUSHED_STALE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How many missed ticks before the "scheduled sync" row goes red. Three
+ * intervals is past any plausible transient (a slow sync holding the `flock`, a
+ * reboot, one gh probe hanging) and well short of letting a dead schedule look
+ * alive for a working day. Computed from `config_repo.interval_minutes` at read
+ * time; the constant here is the multiplier.
+ */
+export const CONFIG_SYNC_STALE_INTERVALS = 3;
+
+/**
+ * Facts the scheduled-sync classifier turns into a row. Kept separate from
+ * {@link ConfigRepoFacts} so the two rows are independently unit-testable.
+ */
+export interface ConfigSyncCronFacts {
+  /** Is a `config_repo:` block present at all. */
+  configured: boolean;
+  enabled: boolean;
+  /** Does /etc/cron.d/switchroom-config-sync exist. */
+  cronInstalled: boolean;
+  /** mtime (ms) of the sync log — evidence a tick actually ran; null if absent. */
+  logMtimeMs: number | null;
+  /** Cadence in minutes, used to size the staleness window. */
+  intervalMinutes: number;
+}
+
+/**
+ * Classify the scheduled-sync (cron) state. Pure, so every branch is asserted
+ * in a unit test rather than by arranging a real cron file.
+ *
+ * States (the plan's Slice 2 doctor contract, plus a firing/staleness signal):
+ *   - enabled + NOT installed  → FAIL: backups are simply not running.
+ *   - NOT enabled + installed   → WARN: the tick still runs+pushes, but the
+ *     feature is off — enable it or `config-repo uninstall-cron`.
+ *   - enabled + installed, never ticked → WARN: cron may not be running.
+ *   - enabled + installed, stale → FAIL: cron/the tick is failing.
+ *   - enabled + installed, fresh → OK.
+ *   - NOT enabled + NOT installed → null (feature fully off; no row).
+ */
+export function classifyConfigSyncCron(
+  f: ConfigSyncCronFacts,
+  now: number,
+): CheckResult | null {
+  if (!f.configured) return null;
+  const name = "config repo scheduled sync";
+  const staleMs = f.intervalMinutes * CONFIG_SYNC_STALE_INTERVALS * 60_000;
+
+  if (f.enabled && !f.cronInstalled) {
+    return {
+      name,
+      status: "fail",
+      detail:
+        `config_repo.enabled but no cron at ${CRON_PATH} — scheduled backups are NOT running; ` +
+        "the repo only captures changes when someone runs `config-repo sync` by hand",
+      fix: "Arm it: `switchroom config-repo install-cron --cron-user <operator>` (needs root to write /etc/cron.d).",
+    };
+  }
+
+  if (!f.enabled && f.cronInstalled) {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `${CRON_PATH} is installed but config_repo.enabled is false — the tick still commits and pushes`,
+      fix: "Either set `config_repo.enabled: true`, or disarm with `switchroom config-repo uninstall-cron`.",
+    };
+  }
+
+  if (!f.enabled && !f.cronInstalled) return null;
+
+  // enabled && installed — judge firing via the log mtime.
+  if (f.logMtimeMs === null) {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `cron armed but no tick has completed yet (no log at ${CRON_LOG_PATH}) — ` +
+        "cron may not be running, or every tick is failing before it writes",
+      fix: "Check cron is running and dry-run: `switchroom config-repo sync --no-push`.",
+    };
+  }
+
+  const ageMs = now - f.logMtimeMs;
+  const mins = Math.round(ageMs / 60_000);
+  if (ageMs < -staleMs) {
+    return {
+      name,
+      status: "warn",
+      detail: `sync log is dated ${Math.abs(mins)}m in the FUTURE — clock skew or a restored backup`,
+      fix: "Check the host clock.",
+    };
+  }
+  if (ageMs > staleMs) {
+    return {
+      name,
+      status: "fail",
+      detail:
+        `last scheduled sync was ${mins}m ago (stale past ${Math.round(staleMs / 60_000)}m) — ` +
+        "cron itself or the tick is failing",
+      fix: `Inspect ${CRON_LOG_PATH}; dry-run with \`switchroom config-repo sync --no-push\`.`,
+    };
+  }
+  return {
+    name,
+    status: "ok",
+    detail: `armed (*/${f.intervalMinutes} * * * *); last sync ${mins}m ago`,
+  };
+}
 
 /** Host facts the classifier turns into rows. */
 export interface ConfigRepoFacts {
@@ -253,18 +366,35 @@ export function checkConfigRepo(
     ? resolvePath(block.path)
     : join(process.env.SWITCHROOM_HOME ?? process.env.HOME ?? homedir(), ".switchroom-config");
 
-  const isGitRepo = existsSync(join(repoPath, ".git"));
-  if (!isGitRepo) {
-    return classifyConfigRepo({
+  // Scheduled-sync (cron) row — independent of whether the repo is a git repo,
+  // so it is read once and appended to whichever branch returns.
+  const cronRow = classifyConfigSyncCron(
+    {
       configured: true,
       enabled: block.enabled,
-      repoPath,
-      isGitRepo: false,
-      isPrivate: null,
-      untrackedPersonalSkills: 0,
-      unpushedCount: null,
-      oldestUnpushedAgeMs: null,
-    });
+      cronInstalled: existsSync(CRON_PATH),
+      logMtimeMs: safeMtimeMs(CRON_LOG_PATH),
+      intervalMinutes: block.interval_minutes ?? DEFAULT_INTERVAL_MINUTES,
+    },
+    now,
+  );
+  const withCron = (rows: CheckResult[]): CheckResult[] =>
+    cronRow ? [...rows, cronRow] : rows;
+
+  const isGitRepo = existsSync(join(repoPath, ".git"));
+  if (!isGitRepo) {
+    return withCron(
+      classifyConfigRepo({
+        configured: true,
+        enabled: block.enabled,
+        repoPath,
+        isGitRepo: false,
+        isPrivate: null,
+        untrackedPersonalSkills: 0,
+        unpushedCount: null,
+        oldestUnpushedAgeMs: null,
+      }),
+    );
   }
 
   const git = gitRunner(repoPath);
@@ -287,14 +417,25 @@ export function checkConfigRepo(
   const untracked = countUntrackedPersonalSkills(repoPath, git);
   const unpushed = readUnpushed(git, now);
 
-  return classifyConfigRepo({
-    configured: true,
-    enabled: block.enabled,
-    repoPath,
-    isGitRepo: true,
-    isPrivate,
-    untrackedPersonalSkills: untracked,
-    unpushedCount: unpushed.count,
-    oldestUnpushedAgeMs: unpushed.oldestAgeMs,
-  });
+  return withCron(
+    classifyConfigRepo({
+      configured: true,
+      enabled: block.enabled,
+      repoPath,
+      isGitRepo: true,
+      isPrivate,
+      untrackedPersonalSkills: untracked,
+      unpushedCount: unpushed.count,
+      oldestUnpushedAgeMs: unpushed.oldestAgeMs,
+    }),
+  );
+}
+
+/** mtime (ms) of a file, or null when absent/unreadable. */
+function safeMtimeMs(path: string): number | null {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return null;
+  }
 }

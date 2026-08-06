@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { classifyConfigRepo, UNPUSHED_STALE_MS, type ConfigRepoFacts } from "./doctor-config-repo.js";
+import {
+  classifyConfigRepo,
+  classifyConfigSyncCron,
+  CONFIG_SYNC_STALE_INTERVALS,
+  UNPUSHED_STALE_MS,
+  type ConfigRepoFacts,
+  type ConfigSyncCronFacts,
+} from "./doctor-config-repo.js";
 
 const base: ConfigRepoFacts = {
   configured: true,
@@ -52,5 +59,74 @@ describe("classifyConfigRepo", () => {
   it("WARNs when there is no upstream tracking ref", () => {
     const rows = classifyConfigRepo({ ...base, unpushedCount: null });
     expect(row(rows, "config repo unpushed")?.status).toBe("warn");
+  });
+});
+
+describe("classifyConfigSyncCron", () => {
+  const NOW = 1_700_000_000_000;
+  const cronBase: ConfigSyncCronFacts = {
+    configured: true,
+    enabled: true,
+    cronInstalled: true,
+    logMtimeMs: NOW - 5 * 60_000, // 5m ago — fresh
+    intervalMinutes: 30,
+  };
+  const staleMs = 30 * CONFIG_SYNC_STALE_INTERVALS * 60_000;
+
+  it("emits no row when config_repo is not configured", () => {
+    expect(classifyConfigSyncCron({ ...cronBase, configured: false }, NOW)).toBeNull();
+  });
+
+  it("emits no row when the feature is off and no cron is installed", () => {
+    expect(
+      classifyConfigSyncCron({ ...cronBase, enabled: false, cronInstalled: false }, NOW),
+    ).toBeNull();
+  });
+
+  it("FAILs when enabled but the cron is not installed — backups are NOT running", () => {
+    const r = classifyConfigSyncCron({ ...cronBase, cronInstalled: false, logMtimeMs: null }, NOW);
+    expect(r?.status).toBe("fail");
+    expect(r?.detail).toContain("scheduled backups are NOT running");
+  });
+
+  it("WARNs when the cron is installed but the feature is disabled", () => {
+    const r = classifyConfigSyncCron(
+      { ...cronBase, enabled: false, cronInstalled: true },
+      NOW,
+    );
+    expect(r?.status).toBe("warn");
+    expect(r?.fix).toContain("uninstall-cron");
+  });
+
+  it("WARNs when armed but no tick has ever completed (no log)", () => {
+    const r = classifyConfigSyncCron({ ...cronBase, logMtimeMs: null }, NOW);
+    expect(r?.status).toBe("warn");
+    expect(r?.detail).toContain("no tick has completed");
+  });
+
+  it("is OK when armed, enabled, and a tick ran within the staleness window", () => {
+    const r = classifyConfigSyncCron({ ...cronBase, logMtimeMs: NOW - staleMs + 60_000 }, NOW);
+    expect(r?.status).toBe("ok");
+  });
+
+  it("FAILs when the last tick is stale past the window", () => {
+    const r = classifyConfigSyncCron({ ...cronBase, logMtimeMs: NOW - staleMs - 60_000 }, NOW);
+    expect(r?.status).toBe("fail");
+    expect(r?.detail).toContain("stale past");
+  });
+
+  it("WARNs on a future-dated log (clock skew)", () => {
+    const r = classifyConfigSyncCron({ ...cronBase, logMtimeMs: NOW + staleMs + 60_000 }, NOW);
+    expect(r?.status).toBe("warn");
+    expect(r?.detail).toContain("FUTURE");
+  });
+
+  it("scales the staleness window with interval_minutes", () => {
+    // 5-min cadence → window is 15m; a 20m-old tick is stale.
+    const r = classifyConfigSyncCron(
+      { ...cronBase, intervalMinutes: 5, logMtimeMs: NOW - 20 * 60_000 },
+      NOW,
+    );
+    expect(r?.status).toBe("fail");
   });
 });

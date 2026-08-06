@@ -80,6 +80,10 @@ import {
 } from "./component-versions.js";
 import { reconcileCron } from "../hindsight-watch/install-cron.js";
 import {
+  reconcileCron as reconcileConfigSyncCron,
+  DEFAULT_INTERVAL_MINUTES as CONFIG_SYNC_DEFAULT_INTERVAL,
+} from "../config-repo/install-cron.js";
+import {
   installSelfHealTimer,
   type InstallTimerDeps,
 } from "../host-cli-self-heal/install-timer.js";
@@ -240,6 +244,10 @@ interface UpdateOptions {
    *  `reconcile-hindsight-watch-cron` step reconciles (default: the real
    *  `CRON_PATH`). Lets the step be exercised against a temp file. */
   watchCronPath?: string;
+  /** Test seam — override the /etc/cron.d/switchroom-config-sync path the
+   *  `reconcile-config-repo-cron` step reconciles (default: the real
+   *  config-repo `CRON_PATH`). */
+  configSyncCronPath?: string;
   /** Test seam — override the self-heal timer install for the
    *  `install-self-heal-timer` step (systemd/privilege/user/path shims).
    *  Default: the real host detection + `/etc/systemd/system` writes. */
@@ -781,6 +789,79 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         say(chalk.green(`  hindsight-watch cron reconciled at ${res.path}\n`));
       } else {
         say(chalk.gray(`  hindsight-watch cron already current at ${res.path}\n`));
+      }
+    },
+  });
+
+  // reconcile-config-repo-cron: re-assert the config-repo auto-backup cron
+  // definition on every update, so an already-armed host can't drift (stale
+  // binary path, or a changed `config_repo.interval_minutes` /
+  // `include_vault_backup`).
+  //
+  // REPAIR, not ARM — exactly like reconcile-hindsight-watch-cron above:
+  // `reconcileConfigSyncCron` is a no-op when the fragment is absent (arming
+  // stays the explicit, enabled-gated `config-repo install-cron` opt-in, and
+  // `switchroom doctor` FAILs while an ENABLED feature is un-armed), and
+  // idempotent when present and already correct. The operator's chosen
+  // `--cron-user` is preserved; the interval + vault-backup mode are re-read
+  // from config so a switchroom.yaml change is picked up on the next update.
+  //
+  // Deferred in hostd-context: /etc/cron.d is on the host, not in the hostd
+  // container. Never fatal — a failed reconcile warns and continues.
+  steps.push({
+    name: "reconcile-config-repo-cron",
+    description:
+      "Reconcile /etc/cron.d/switchroom-config-sync (binary path / interval / vault-backup mode) on already-armed hosts — idempotent; no-op when unarmed or already current",
+    skipReason: hostdContext
+      ? "deferred (hostd-context): /etc/cron.d is on the host, not in the hostd container — finish host-side with `switchroom config-repo install-cron`"
+      : undefined,
+    isHostdDeferred: hostdContext,
+    run: () => {
+      const say = opts.stdout ?? ((t: string) => process.stdout.write(t));
+      const binary = process.env.SWITCHROOM_BINARY ?? "/usr/local/bin/switchroom";
+      const fallbackUser =
+        process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME;
+      // Re-read the current cadence + vault-backup mode from config so a
+      // switchroom.yaml change reconciles. Tolerate a missing/malformed block.
+      let intervalMinutes = CONFIG_SYNC_DEFAULT_INTERVAL;
+      let includeVaultBackup: "off" | "daily" | "every_tick" = "daily";
+      try {
+        const block = loadConfig(opts.configPath).config_repo;
+        if (block) {
+          intervalMinutes = block.interval_minutes ?? CONFIG_SYNC_DEFAULT_INTERVAL;
+          includeVaultBackup = block.include_vault_backup ?? "daily";
+        }
+      } catch {
+        /* defaults above still reconcile a fragment to a sane definition */
+      }
+      let res: ReturnType<typeof reconcileConfigSyncCron>;
+      try {
+        res = reconcileConfigSyncCron({
+          binary,
+          intervalMinutes,
+          includeVaultBackup,
+          fallbackUser,
+          ...(opts.configSyncCronPath ? { path: opts.configSyncCronPath } : {}),
+        });
+      } catch (e) {
+        say(
+          chalk.yellow(
+            `  config-repo cron not reconciled: ${(e as Error).message}\n`,
+          ),
+        );
+        return;
+      }
+      if (res.status === "absent") {
+        say(
+          chalk.gray(
+            "  config-repo cron not armed — skipping reconcile " +
+              "(arm with `switchroom config-repo install-cron`; doctor FAILs while enabled+unarmed)\n",
+          ),
+        );
+      } else if (res.status === "reconciled") {
+        say(chalk.green(`  config-repo cron reconciled at ${res.path}\n`));
+      } else {
+        say(chalk.gray(`  config-repo cron already current at ${res.path}\n`));
       }
     },
   });

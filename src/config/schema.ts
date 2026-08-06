@@ -5273,6 +5273,31 @@ export const ConfigRepoConfigSchema = z.object({
       "Fail-safe against exfiltrating memory files / workspace state to a " +
       "repo that has been flipped public. Default true.",
     ),
+  interval_minutes: z
+    .number()
+    .int()
+    .min(5)
+    .max(59)
+    .default(30)
+    .describe(
+      "Cadence (minutes) of the scheduled `config-repo sync` tick installed " +
+      "by `switchroom config-repo --install-cron`. Rendered as a cron " +
+      "`*/N * * * *` minute field, so it must be 5..59 (the 5-min floor " +
+      "matches the rest of the fleet's cron floor). Default 30 (Ken's " +
+      "approved cadence). Changing it takes effect on the next " +
+      "`--install-cron` / `switchroom update` reconcile.",
+    ),
+  include_vault_backup: z
+    .enum(["off", "daily", "every_tick"])
+    .default("daily")
+    .describe(
+      "Whether the scheduled tick also runs `switchroom vault backup` " +
+      "(an encrypted vault/memory snapshot into <path>/vault-backups/) " +
+      "before the sync. `off`: sync only. `daily`: an extra once-per-day " +
+      "cron leg runs `vault backup && config-repo sync` (the 30-min legs " +
+      "stay sync-only). `every_tick`: every tick runs the backup first. " +
+      "Default `daily` — the first automated vault backup on this host.",
+    ),
 });
 export type ConfigRepoConfig = z.infer<typeof ConfigRepoConfigSchema>;
 
