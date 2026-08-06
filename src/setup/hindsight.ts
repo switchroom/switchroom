@@ -1515,25 +1515,52 @@ export function hindsightCpAuthEnvPairs(opts: {
  */
 export async function resolveHindsightCpAccessKey(
   config: { hindsight?: { cp_access_key?: string } } | undefined,
-  deps: {
-    getViaBrokerStructured?: typeof import("../vault/broker/client.js").getViaBrokerStructured;
-  } = {},
+  deps: HindsightVaultResolveDeps = {},
 ): Promise<string | undefined> {
-  const ref = config?.hindsight?.cp_access_key?.trim();
-  if (!ref) return undefined;
+  return resolveHindsightVaultString(config?.hindsight?.cp_access_key, deps);
+}
+
+/** Injection seam shared by the module's `vault:`-ref resolvers. */
+type HindsightVaultResolveDeps = {
+  getViaBrokerStructured?: typeof import("../vault/broker/client.js").getViaBrokerStructured;
+};
+
+/**
+ * Resolve a single config value that may be a `vault:<key>` reference to its
+ * string secret, through the auto-unlocked broker. THE non-interactive vault
+ * path this module depends on — no operator passphrase, so it works from the
+ * `memory setup --recreate` launch and hostd's `refresh-hindsight` rollout step
+ * where `switchroom apply`'s passphrase resolver (`resolveConfigSecret`,
+ * src/cli/apply.ts) is unavailable.
+ *
+ * A non-`vault:` literal is returned trimmed as-is (the broker is never
+ * touched). A `vault:` reference that cannot be resolved — denied, missing,
+ * non-string, blank, or broker down — returns `undefined`. That is the
+ * fail-safe every caller here wants: NEVER return the literal `vault:…` string,
+ * which the container would otherwise bake into its env verbatim (LiteLLM then
+ * rejects it: "Virtual Key expected … start with 'sk-'", the 2026-08-06
+ * fleet-wide retain outage).
+ */
+async function resolveHindsightVaultString(
+  ref: string | undefined,
+  deps: HindsightVaultResolveDeps = {},
+): Promise<string | undefined> {
+  const trimmed = ref?.trim();
+  if (!trimmed) return undefined;
   const { isVaultReference, parseVaultReference } = await import("../vault/resolver.js");
-  if (!isVaultReference(ref)) return ref;
+  if (!isVaultReference(trimmed)) return trimmed;
   const brokerClient = await import("../vault/broker/client.js");
   const get = deps.getViaBrokerStructured ?? brokerClient.getViaBrokerStructured;
   // Issue #1053: forward the agent's capability token so the broker's grant
   // path bypasses the peercred ACL. Without it a freshly-minted grant is
-  // ignored and the `.catch(() => null)` silently swallows the DENIED,
-  // leaving HINDSIGHT_CP_ACCESS_KEY underived. Mirrors the working `vault get`
-  // path in src/cli/vault.ts. Token stays undefined when SWITCHROOM_AGENT_NAME
-  // is unset — identical to prior host-operator peercred behavior.
+  // ignored and the `.catch(() => null)` silently swallows the DENIED, leaving
+  // the secret underived under `memory setup --recreate`. Mirrors the working
+  // `vault get` path in src/cli/vault.ts. Token stays undefined when
+  // SWITCHROOM_AGENT_NAME is unset — identical to prior host-operator peercred
+  // behavior.
   const agentSlug = process.env.SWITCHROOM_AGENT_NAME;
   const token = agentSlug ? brokerClient.readVaultTokenFile(agentSlug) ?? undefined : undefined;
-  const resolved = await get(parseVaultReference(ref), {
+  const resolved = await get(parseVaultReference(trimmed), {
     ...(token ? { token } : {}),
   }).catch(() => null);
   if (!resolved || resolved.kind !== "ok" || resolved.entry.kind !== "string") {
@@ -1541,6 +1568,55 @@ export async function resolveHindsightCpAccessKey(
   }
   const value = resolved.entry.value.trim();
   return value.length > 0 ? value : undefined;
+}
+
+/**
+ * Resolve every `vault:<key>` reference in a hindsight LLM config's API-key
+ * fields to its real secret, through the auto-unlocked broker — the SAME
+ * non-interactive path {@link resolveHindsightCpAccessKey} uses.
+ *
+ * WHY this exists (fleet outage 2026-08-06): vault-ref resolution for the
+ * global `hindsight.llm.api_key` and the per-op `hindsight.llm.<op>.api_key`
+ * used to happen ONLY inside `switchroom apply` (`resolveConfigSecret`,
+ * src/cli/apply.ts), behind the operator passphrase. The
+ * `memory setup --recreate` launch path ({@link startHindsight}) and hostd's
+ * `refresh-hindsight` rollout step run WITHOUT that resolver, so they passed the
+ * literal `vault:…` string straight into the container env via the emit paths
+ * ({@link resolveHindsightGlobalLlmExtras} / {@link resolveHindsightPerOpLlm}).
+ * LiteLLM rejected it and ALL fact extraction failed fleet-wide. Resolving here
+ * — before either emit path sees the value — bakes the real `sk-` key instead.
+ *
+ * Returns a shallow clone with only the api_key fields rewritten; every other
+ * field (model / provider / base_url / context_window, and the rest of each
+ * per-op block) is preserved untouched. A non-`vault:` literal passes through.
+ * An unresolvable ref DROPS that api_key (the field is omitted, so the emit path
+ * skips it) — the op then inherits the global / provider default rather than
+ * baking a guaranteed-invalid literal, the same fail-safe shape the CP key
+ * takes. `undefined` in ⇒ `undefined` out (no config, nothing to do).
+ */
+export async function resolveHindsightLlmSecrets(
+  llm: HindsightLlmConfig | undefined,
+  deps: HindsightVaultResolveDeps = {},
+): Promise<HindsightLlmConfig | undefined> {
+  if (!llm) return llm;
+  const out: HindsightLlmConfig = { ...llm };
+  // Global api_key. `api_key` set-but-unresolvable collapses to undefined, which
+  // the emit path treats identically to "absent" (it skips empty values).
+  if (llm.api_key !== undefined) {
+    out.api_key = await resolveHindsightVaultString(llm.api_key, deps);
+  }
+  // Per-op api_keys (retain / reflect / consolidation). Clone each present block
+  // so we never mutate the caller's config object in place.
+  for (const op of HINDSIGHT_LLM_OPS) {
+    const cfg = llm[op as HindsightLlmOp];
+    if (cfg?.api_key !== undefined) {
+      out[op as HindsightLlmOp] = {
+        ...cfg,
+        api_key: await resolveHindsightVaultString(cfg.api_key, deps),
+      };
+    }
+  }
+  return out;
 }
 
 /**

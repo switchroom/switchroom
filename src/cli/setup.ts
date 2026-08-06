@@ -40,6 +40,7 @@ import {
   stopHindsight,
   ensureHindsightConsumer,
   resolveHindsightCpAccessKey,
+  resolveHindsightLlmSecrets,
   HINDSIGHT_CONSUMER_NAME,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
@@ -1063,6 +1064,13 @@ export interface MemoryBackendDeps {
    * without docker.
    */
   startContainer?: typeof startHindsight;
+  /**
+   * Broker seam for `resolveHindsightLlmSecrets`. Injected so tests can assert
+   * the WIRING outcome — that a `vault:` LLM api_key is resolved BEFORE it
+   * reaches {@link startContainer}, the exact gap that caused the 2026-08-06
+   * outage. Production leaves it undefined ⇒ the real auto-unlocked broker.
+   */
+  getViaBrokerStructured?: typeof import("../vault/broker/client.js").getViaBrokerStructured;
 }
 
 /**
@@ -1315,12 +1323,20 @@ export async function stepMemoryBackend(
     if (!cpAccessKey) {
       console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
     }
+    // Resolve `vault:` api_key refs through the broker before launch, so the
+    // container bakes the real `sk-` key rather than the literal `vault:…`
+    // string (the recreate/refresh-hindsight outage class; apply's passphrase
+    // resolver does not run on this path).
+    const resolvedLlm = await resolveHindsightLlmSecrets(
+      config.hindsight?.llm,
+      deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
+    );
     const startContainer = deps.startContainer ?? startHindsight;
     startContainer(
       ports,
       litellmCfg,
       undefined,
-      config.hindsight?.llm,
+      resolvedLlm,
       hindsightConsumerMirrorDir(config),
       // gpu: omitted ⇒ hindsightGpuEnabled() reads the persisted verdict.
       undefined,

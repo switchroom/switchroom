@@ -575,6 +575,61 @@ describe("stepMemoryBackend (Docker absent)", () => {
     expect(startContainer).toHaveBeenCalled();
     expect(logs.join("\n")).not.toMatch(/may still be initializing/);
   });
+
+  it("resolves a `vault:` LLM api_key BEFORE it reaches startContainer (2026-08-06 wiring)", async () => {
+    // The regression guard: the bug was NOT that resolveHindsightLlmSecrets
+    // couldn't resolve — it's that the launch caller never CALLED it, handing
+    // the literal `vault:…` ref straight to the container. This asserts the
+    // wiring outcome: the config reaching startContainer carries the RESOLVED
+    // `sk-` key. Unwire the resolver (pass config.hindsight?.llm verbatim) and
+    // this fails — the spy would see the `vault:` literal.
+    const VAULT_REF = "vault:litellm/gpt-oss-key";
+    const REAL_KEY = "sk-" + "resolved-oss-key-xyz789";
+    const savedName = process.env.SWITCHROOM_AGENT_NAME;
+    delete process.env.SWITCHROOM_AGENT_NAME; // keep the broker call token-free
+
+    const config = {
+      agents: { alpha: { topic_name: "alpha-topic" } },
+      hindsight: { llm: { provider: "openai", api_key: VAULT_REF } },
+    } as unknown as SwitchroomConfig;
+
+    // Probe: docker present, hindsight NOT already running / existing, so the
+    // step proceeds to launch (identical shape to the H2 probe above).
+    const probe = (args: string[]) => {
+      if (args[0] === "--version") return "Docker version 27.0.0\n";
+      return "";
+    };
+    const startContainer = vi.fn();
+    const getViaBrokerStructured = vi
+      .fn()
+      .mockResolvedValue({ kind: "ok", entry: { kind: "string", value: REAL_KEY } });
+
+    try {
+      // Rejects on the post-start "did not stay running" check — irrelevant
+      // here: startContainer was already called with the resolved config.
+      await expect(
+        stepMemoryBackend(config, true, cfgPath, {
+          dockerProbe: probe,
+          startContainer: startContainer as never,
+          getViaBrokerStructured: getViaBrokerStructured as never,
+          sleep: async () => {},
+          readyRetries: 1,
+        }),
+      ).rejects.toThrow(/did not stay running/);
+
+      expect(startContainer).toHaveBeenCalledTimes(1);
+      // startHindsight(ports, litellm, tag, llm, mirrorDir, gpu, perf, cpKey):
+      // the resolved LLM config is the 4th positional arg.
+      const llmArg = startContainer.mock.calls[0][3] as { api_key?: string } | undefined;
+      expect(llmArg?.api_key).toBe(REAL_KEY);
+      expect(llmArg?.api_key).not.toContain("vault:");
+      // The broker WAS consulted, by the bare vault key.
+      expect(getViaBrokerStructured).toHaveBeenCalledWith("litellm/gpt-oss-key", {});
+    } finally {
+      if (savedName === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+      else process.env.SWITCHROOM_AGENT_NAME = savedName;
+    }
+  });
 });
 
 // ─── review M4: a FAIL verdict is sampled, like the OK verdict ───────────────
