@@ -177,8 +177,12 @@ export function registerHindsightBenchCommand(program: Command): void {
     .option("--out <path>", "write the JSON result file (or the SVG in --plot mode)")
     .option("--csv <path>", "also write a flat per-cell CSV")
     .option("--plot <files...>", "render the chart from result files instead of measuring")
-    .option("--compare <a> <b>", "AC1 reproducibility verdict over two result files")
-    .option("--contention-compare <idle> <loaded>", "AC4 contention verdict over two result files")
+    // Variadic, not `<a> <b>`: commander binds exactly ONE value to a
+    // non-variadic option, so `--compare a.json b.json` parsed b.json as a
+    // positional and died with "too many arguments". Verified against the
+    // built CLI, not assumed.
+    .option("--compare <files...>", "AC1 reproducibility verdict over two result files")
+    .option("--contention-compare <files...>", "AC4 contention verdict over two result files")
     .option("--tolerance <fraction>", "AC1 tolerance", String(DEFAULT_TOLERANCE))
     .option("--json", "emit machine-readable JSON for the verdict modes", false)
     .action(async (opts: BenchOpts) => {
@@ -187,6 +191,12 @@ export function registerHindsightBenchCommand(program: Command): void {
       if (opts.contentionCompare !== undefined) return runContentionCompareMode(opts);
       await runMeasureMode(opts);
     });
+}
+
+/** Both verdict modes take exactly two result files; anything else is a typo. */
+function expectTwo(files: string[], flag: string): [string, string] {
+  if (files.length !== 2) fail(`${flag} takes exactly two result files (got ${files.length})`);
+  return [files[0] as string, files[1] as string];
 }
 
 function runPlotMode(opts: BenchOpts): void {
@@ -200,15 +210,19 @@ function runPlotMode(opts: BenchOpts): void {
 }
 
 function runCompareMode(opts: BenchOpts): void {
-  const [pa, pb] = opts.compare as string[];
-  const rep = compareRuns(readResult(pa as string), readResult(pb as string), Number(opts.tolerance));
+  const [pa, pb] = expectTwo(opts.compare as string[], "--compare");
+  const tolerance = Number(opts.tolerance);
+  // An unparseable tolerance would make every `relDelta <= NaN` false and
+  // report a universal FAIL that looks like a real regression.
+  if (!Number.isFinite(tolerance) || tolerance < 0) fail(`--tolerance must be a non-negative number`);
+  const rep = compareRuns(readResult(pa), readResult(pb), tolerance);
   process.stdout.write((opts.json ? JSON.stringify(rep, null, 2) : formatReproducibility(rep)) + "\n");
   if (!rep.pass) process.exitCode = 2;
 }
 
 function runContentionCompareMode(opts: BenchOpts): void {
-  const [pi, pl] = opts.contentionCompare as string[];
-  const rep = compareContention(readResult(pi as string), readResult(pl as string));
+  const [pi, pl] = expectTwo(opts.contentionCompare as string[], "--contention-compare");
+  const rep = compareContention(readResult(pi), readResult(pl));
   process.stdout.write((opts.json ? JSON.stringify(rep, null, 2) : formatContention(rep)) + "\n");
   if (!rep.pass) process.exitCode = 2;
 }
@@ -301,6 +315,15 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
         `${chalk.yellow("!")} contention "${profile}" running with ${load.workers} backend(s) — ` +
           "the live fleet is degraded until this finishes\n",
       );
+      // Ctrl-C does not run a `finally`, and an abandoned churn loop keeps
+      // hammering production until its in-SQL deadline. Wire the signals
+      // explicitly so an interrupted run cleans up like a completed one.
+      const onSignal = (): void => {
+        load.stop();
+        process.exit(130);
+      };
+      process.once("SIGINT", onSignal);
+      process.once("SIGTERM", onSignal);
       // Let the load reach steady state before the first cell is recorded,
       // otherwise cell 1 measures a half-warm box and the sweep's own ordering
       // becomes a confound.
