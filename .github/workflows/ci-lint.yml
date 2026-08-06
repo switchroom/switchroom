@@ -105,11 +105,17 @@ jobs:
         # `check-changelog-entry.mjs` (part of `bun lint`) reads the PR body +
         # labels for its escape hatch (`no-changelog` label / `[skip changelog]`
         # token). GITHUB_EVENT_NAME / GITHUB_BASE_REF are set by Actions; the
-        # body + labels are not, so surface them here. Empty on push/merge_group
-        # (the check skips merge_group and diffs an empty range on push).
+        # body + labels are not, so surface them here.
+        #
+        # `github.event.pull_request.*` is EMPTY on push and merge_group, so the
+        # `!= 'merge_group'` term states that at the interpolation site rather
+        # than leaving it implicit — the same shape docker-images.yml's tag step
+        # uses, and what tests/ci-merge-queue-triggers.test.ts requires of any
+        # step reading PR-only context. On a queue ref both render '' and the
+        # check SKIPs the event outright; on push it diffs an empty range.
         env:
-          CHANGELOG_PR_BODY: ${{ github.event.pull_request.body }}
-          CHANGELOG_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          CHANGELOG_PR_BODY: ${{ github.event_name != 'merge_group' && github.event.pull_request.body || '' }}
+          CHANGELOG_PR_LABELS: ${{ github.event_name != 'merge_group' && join(github.event.pull_request.labels.*.name, ' ') || '' }}
         run: bun lint
 
   # ─── Sentinel ─────────────────────────────────────────────────────
