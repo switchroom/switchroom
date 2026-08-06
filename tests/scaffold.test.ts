@@ -796,6 +796,74 @@ describe("scaffoldAgent", () => {
     expect(s2.permissions.allow).toContain("mcp__webkite__*");
   });
 
+  it("pre-approves native WebSearch fleet-wide even for an explicit-allow (acceptEdits) agent", () => {
+    // The uniformity gap this guards: an agent with an explicit `tools.allow`
+    // (acceptEdits-mode agents like kdogg/marko) SKIPS
+    // DEFAULT_READ_ONLY_PREAPPROVED_TOOLS, so a WebSearch pre-approval seeded
+    // only via the read-only defaults would never reach them. WebSearch is
+    // pre-approved as an UNCONDITIONAL spread instead, so every agent —
+    // explicit-allow or not — gets it. WebFetch stays gated (webkite path).
+    const config = makeAgentConfig({
+      tools: { allow: ["calendar", "notion"], deny: ["bash"] },
+    });
+    const result = scaffoldAgent("websearch-explicit", config, tmpDir, telegramConfig);
+    const settings = JSON.parse(
+      readFileSync(join(result.agentDir, ".claude", "settings.json"), "utf-8"),
+    );
+    // The explicit tools survive AND WebSearch is pre-approved alongside them.
+    expect(settings.permissions.allow).toContain("calendar");
+    expect(settings.permissions.allow).toContain("WebSearch");
+    // WebFetch is NOT pre-approved — page fetches still route through webkite.
+    expect(settings.permissions.allow).not.toContain("WebFetch");
+  });
+
+  it("reconcile pre-approves native WebSearch in permissions.allow", () => {
+    // The live `switchroom apply` path reconciles EXISTING agents
+    // (reconcileAgent) and assigns computeDesiredPermissionAllow's output
+    // wholesale — pin that native WebSearch rides that path too.
+    const config = makeAgentConfig({});
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "websearch-reconcile": config },
+    } as SwitchroomConfig;
+    scaffoldAgent("websearch-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    reconcileAgent("websearch-reconcile", config, tmpDir, telegramConfig, switchroomConfig);
+    const settings = JSON.parse(
+      readFileSync(join(tmpDir, "websearch-reconcile", ".claude", "settings.json"), "utf-8"),
+    );
+    expect(settings.permissions.allow).toContain("WebSearch");
+    expect(settings.permissions.allow).not.toContain("WebFetch");
+  });
+
+  it("re-seeds native WebSearch into an EXISTING agent's allow (merge path)", () => {
+    // Twin of the webkite existing-agent merge test: `switchroom apply` on a
+    // deployed agent hits writeIfMissing (skips the settings.json template),
+    // so the additive MCP-merge block must re-seed native WebSearch or a
+    // pre-WebSearch deployed agent never picks it up until it next reconciles.
+    const config = makeAgentConfig({});
+    const result = scaffoldAgent("ws-existing", config, tmpDir, telegramConfig, {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "ws-existing": config },
+    } as SwitchroomConfig);
+    const settingsPath = join(result.agentDir, ".claude", "settings.json");
+    // Simulate a PRE-WebSearch deployed agent: strip WebSearch from allow.
+    const s1 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    s1.permissions.allow = s1.permissions.allow.filter((x: string) => x !== "WebSearch");
+    writeFileSync(settingsPath, JSON.stringify(s1, null, 2));
+    expect(JSON.parse(readFileSync(settingsPath, "utf-8")).permissions.allow)
+      .not.toContain("WebSearch");
+    // Re-scaffold (existing-agent merge path) must re-seed WebSearch.
+    scaffoldAgent("ws-existing", config, tmpDir, telegramConfig, {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "ws-existing": config },
+    } as SwitchroomConfig);
+    const s2 = JSON.parse(readFileSync(settingsPath, "utf-8"));
+    expect(s2.permissions.allow).toContain("WebSearch");
+  });
+
   it("context7 MCP entry is wired into .mcp.json by default (remote HTTP)", () => {
     // Fleet-default capability, no opt-in gate. Asserts the OUTCOME the
     // operator cares about — the server is reachable from the agent's
