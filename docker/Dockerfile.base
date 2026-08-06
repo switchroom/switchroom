@@ -190,8 +190,10 @@ RUN mkdir -p /etc/claude-code \
 # napi-ffi (a separate slice with its own surface-area review), we ship
 # the bun runtime alongside node in every server image and invoke
 # broker / kernel-server with `bun` instead of `node`. Agent containers
-# don't run bun — they shell out to claude (via tmux) which has its
-# own runtime.
+# ALSO ship and depend on bun: the telegram-plugin `.mjs` hooks —
+# including the secret-guard PreToolUse and secret-scrub Stop security
+# hooks — run under bun. Do NOT strip bun from the agent image, or those
+# hooks fail open (the PreToolUse secret guard silently stops firing).
 # Pin the bun version AND verify the download by sha256 so a
 # `docker build` next month produces the same runtime as today, and
 # a compromised bun.sh / GitHub mirror can't slip a different binary
