@@ -1472,6 +1472,27 @@ export class AuthBroker {
   }
 
   /**
+   * The agent that owns `account` exclusively (`auth.exclusive: true` on its
+   * pin), or null when the account is unrestricted. Load-time schema
+   * validation already rejects yaml that routes an exclusive account
+   * elsewhere; this runtime lookup covers hot-mutated config (set-active /
+   * set-override) and the persisted-active-override boot path.
+   */
+  private exclusiveOwnerOf(account: string): string | null {
+    for (const [name, agent] of Object.entries(this.config.agents ?? {})) {
+      if (agent.auth?.exclusive && agent.auth?.override === account) return name;
+    }
+    return null;
+  }
+
+  /** True when `account` may serve `forAgent` (undefined = consumer/operator
+   *  path — never allowed onto someone's exclusive account). */
+  private isServableBy(account: string, forAgent?: string): boolean {
+    const owner = this.exclusiveOwnerOf(account);
+    return owner === null || owner === forAgent;
+  }
+
+  /**
    * The account to SERVE credentials for. Same as `callerAccount`, except a
    * consumer (e.g. hindsight) whose pinned account is quota-exhausted fails
    * over to the first healthy account in `fallback_order`.
@@ -1486,14 +1507,32 @@ export class AuthBroker {
    * account exhausted.
    */
   private servingAccount(identity: Identity): string | null {
-    const account = this.callerAccount(identity);
     // Operator serving stays attribution-true — the operator CLI owns
     // auth.active explicitly and a forced `auth use` must mirror exactly what
     // it asked for. Consumers (pinned for quota isolation) AND agents (riding
     // the swappable auth.active) both fail a walled account over so neither is
     // ever served exhausted credentials.
-    if (identity.kind === "operator") return account;
-    return this.accountWithFailover(account);
+    if (identity.kind === "operator") return this.callerAccount(identity);
+    if (identity.kind === "agent") return this.servedAccountForAgent(identity.name);
+    return this.accountWithFailover(this.callerAccount(identity));
+  }
+
+  /**
+   * Failover-resolved serving account for one agent — the single resolution
+   * every agent-facing path (serve, fanout, refresh re-mirror) must share.
+   *
+   * A `strict: true` pin short-circuits the failover entirely: the pin is a
+   * hard billing/compliance boundary, so the agent is served its own account
+   * even while that account is walled — it rides out the wall (surfacing the
+   * normal 429/quota cards) instead of silently borrowing fleet quota. The
+   * non-strict pin keeps the #3031 semantics: a routing preference, not a
+   * suicide pact.
+   */
+  private servedAccountForAgent(name: string): string | null {
+    const agent = (this.config.agents ?? {})[name];
+    const override = agent?.auth?.override;
+    if (override && agent?.auth?.strict) return override;
+    return this.accountWithFailover(override ?? this.config.auth?.active ?? null, name);
   }
 
   /**
@@ -1710,6 +1749,7 @@ export class AuthBroker {
       if (!cand || cand === from) continue;
       if (this.isAccountExhausted(cand)) continue;
       if (this.isAccountPremiumWalled(cand)) continue;
+      if (this.exclusiveOwnerOf(cand)) continue; // never a fleet roll target
       if (!accountExists(cand, this.home)) continue;
       if (!readAccountCredentials(cand, this.home)) continue;
       eligible.push(cand);
@@ -2029,6 +2069,7 @@ export class AuthBroker {
     // null. A candidate that probed `blocked` is never offered here.
     for (const cand of ring) {
       if (cand && cand !== current && accountExists(cand, this.home) &&
+          !this.exclusiveOwnerOf(cand) &&
           this.accountEligibilityOf(cand) === "unknown") {
         return cand;
       }
@@ -2056,8 +2097,35 @@ export class AuthBroker {
    * fanout + serving through this read makes the exhaustion window actually
    * hold, and — like the consumer path — auto-reverts once the window passes.
    */
-  private accountWithFailover(account: string | null | undefined): string | null {
+  private accountWithFailover(
+    account: string | null | undefined,
+    forAgent?: string,
+  ): string | null {
     if (!account) return null;
+    // The BASE account can itself be exclusive to someone else — reachable
+    // when hot-mutated or persisted state escaped both the yaml validator and
+    // the applyActiveOverride drop (defense-in-depth). Never serve it: pick
+    // the first healthy servable fallback, else the servable active, else
+    // DENY (null) — an honest ACCOUNT_NOT_FOUND beats leaking the exclusive
+    // account's credentials to a non-owner.
+    if (!this.isServableBy(account, forAgent)) {
+      for (const cand of this.config.auth?.fallback_order ?? []) {
+        if (cand === account || this.isAccountExhausted(cand)) continue;
+        if (!this.isServableBy(cand, forAgent)) continue;
+        if (readAccountCredentials(cand, this.home)) return cand;
+      }
+      const active = this.config.auth?.active;
+      if (
+        active &&
+        active !== account &&
+        !this.isAccountExhausted(active) &&
+        this.isServableBy(active, forAgent) &&
+        readAccountCredentials(active, this.home)
+      ) {
+        return active;
+      }
+      return null;
+    }
     const exhausted = this.isAccountExhausted(account);
     // Soft-avoid (#3031): a non-exhausted account still serves, but when it
     // sits in the soft-avoid tier we PREFER a fully-eligible fallback. With
@@ -2069,9 +2137,17 @@ export class AuthBroker {
     // Track whether soft-avoid actually excluded anyone: if it never fired,
     // pass 2's predicates are identical to this scan, so it can be skipped
     // (no pointless credential re-reads — identical behavior, less I/O).
+    //
+    // Every candidate scan (both passes, the soft-avoid tie-break, and the
+    // last-resort active) also skips accounts exclusive to another agent
+    // (`isServableBy`). Yaml validation keeps exclusive accounts out of
+    // `fallback_order` / `active`, so this is defense-in-depth for
+    // hot-mutated or persisted-override state — a caller must never be
+    // served credentials that belong to someone else's exclusive pin.
     let softAvoidExcludedAny = false;
     for (const cand of this.config.auth?.fallback_order ?? []) {
       if (cand === account || this.isAccountExhausted(cand)) continue;
+      if (!this.isServableBy(cand, forAgent)) continue;
       if (this.isAccountSoftAvoided(cand)) {
         softAvoidExcludedAny = true;
         continue;
@@ -2088,6 +2164,7 @@ export class AuthBroker {
       let bestScore = this.softAvoidUtilScore(account);
       for (const cand of this.config.auth?.fallback_order ?? []) {
         if (cand === account || this.isAccountExhausted(cand)) continue;
+        if (!this.isServableBy(cand, forAgent)) continue;
         if (!readAccountCredentials(cand, this.home)) continue;
         const score = this.softAvoidUtilScore(cand);
         if (score < bestScore) {
@@ -2105,6 +2182,7 @@ export class AuthBroker {
     if (softAvoidExcludedAny) {
       for (const cand of this.config.auth?.fallback_order ?? []) {
         if (cand === account || this.isAccountExhausted(cand)) continue;
+        if (!this.isServableBy(cand, forAgent)) continue;
         if (readAccountCredentials(cand, this.home)) return cand;
       }
     }
@@ -2125,6 +2203,7 @@ export class AuthBroker {
       active &&
       active !== account &&
       !this.isAccountExhausted(active) &&
+      this.isServableBy(active, forAgent) &&
       readAccountCredentials(active, this.home)
     ) {
       return active;
@@ -2213,7 +2292,11 @@ export class AuthBroker {
     const agents = Object.entries(this.config.agents ?? {}).map(([name, agent]) => {
       const override = agent.auth?.override ?? null;
       const account = override ?? auth.active ?? "";
-      return { name, account, override };
+      // Pin posture (additive fields): renderers can flag a hard pin and an
+      // owner-locked account instead of showing them as fleet-poolable.
+      const strict = Boolean(override && agent.auth?.strict);
+      const exclusive = Boolean(override && agent.auth?.exclusive);
+      return { name, account, override, strict, exclusive };
     });
     const consumers = (auth.consumers ?? []).map((c) => ({
       name: c.name,
@@ -2905,6 +2988,22 @@ export class AuthBroker {
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `account '${account}' not found`));
       return;
     }
+    // An exclusive pin must never become the fleet active — that would route
+    // every override-less agent onto one agent's dedicated account. Same
+    // invariant the schema enforces for authored yaml, applied to the
+    // hot-mutation path (/auth use, switch buttons).
+    const exclusiveOwner = this.exclusiveOwnerOf(account);
+    if (exclusiveOwner) {
+      this.audit({ op: "set-active", identity, account, accountKind: "claude", ok: false, error: "exclusive-account" });
+      socket.write(encodeError(
+        id,
+        "FORBIDDEN",
+        `account '${account}' is exclusive to agent '${exclusiveOwner}' ` +
+        `(agents.${exclusiveOwner}.auth.exclusive) — it cannot be the fleet active. ` +
+        `Clear the exclusive flag in switchroom.yaml first if you really mean this.`,
+      ));
+      return;
+    }
     // Mutate in-memory config AND persist the swap to the broker's own
     // state file. Yaml stays the CLI's job (RFC §4.6: CLI writes YAML then
     // calls set-active), but non-CLI callers (Telegram /auth use, the
@@ -2927,6 +3026,29 @@ export class AuthBroker {
     socket.write(encodeSuccess(id, { active: account, fanned }));
   }
 
+  /** True when the calling identity is an agent with a strict pin. */
+  private callerStrictPinned(identity: Identity): boolean {
+    if (identity.kind !== "agent") return false;
+    const a = (this.config.agents ?? {})[identity.name]?.auth;
+    return Boolean(a?.override && a?.strict);
+  }
+
+  /**
+   * `rolledTo` as seen by the CALLER. A strict-pinned agent is skipped by
+   * `fanoutFailoverTo`, so its mirror kept the pin — but the fleet-level
+   * `rolledTo` would still be non-null whenever a target existed. Gateways
+   * key "switched to X" announcements AND the resume nudge off a non-null
+   * `rolledTo`; advertising a switch that did not happen to this caller
+   * re-runs the turn straight back into the wall (resume → 429 → mark loop).
+   * Null for a strict caller; pass-through for everyone else. The paired
+   * `caller_pinned_strict` response field lets flag-aware gateways render
+   * "your pin is walled; fleet unaffected" instead of misreading the null
+   * as a fleet-wide all-blocked.
+   */
+  private callerRolledTo(identity: Identity, rolledTo: string | null): string | null {
+    return this.callerStrictPinned(identity) ? null : rolledTo;
+  }
+
   private async opMarkExhausted(
     socket: net.Socket,
     id: string,
@@ -2941,7 +3063,12 @@ export class AuthBroker {
     }
     const { rolled, rolledTo } = await this.markExhaustedAndRoll(account, until, identity);
     this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true });
-    socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
+    socket.write(encodeSuccess(id, {
+      account,
+      rolled,
+      rolledTo: this.callerRolledTo(identity, rolledTo),
+      caller_pinned_strict: this.callerStrictPinned(identity),
+    }));
   }
 
   /**
@@ -3016,7 +3143,8 @@ export class AuthBroker {
           // response shape holds; the probe-only caller ignores this field.
           throttled_until: this.quota[account]?.throttled_until ?? 0,
           escalated,
-          rolledTo: escalated ? rolledTo : null,
+          rolledTo: escalated ? this.callerRolledTo(identity, rolledTo) : null,
+          caller_pinned_strict: this.callerStrictPinned(identity),
         }),
       );
       return;
@@ -3081,7 +3209,8 @@ export class AuthBroker {
         account,
         throttled_until: throttledUntil,
         escalated,
-        rolledTo: escalated ? rolledTo : null,
+        rolledTo: escalated ? this.callerRolledTo(identity, rolledTo) : null,
+        caller_pinned_strict: this.callerStrictPinned(identity),
       }),
     );
   }
@@ -4137,6 +4266,43 @@ export class AuthBroker {
       socket.write(encodeError(id, "ACCOUNT_NOT_FOUND", `account '${account}' not found`));
       return;
     }
+    // Refuse pinning an agent to an account another agent holds exclusively.
+    // The owner re-pinning to its own account is fine (idempotent).
+    if (account !== null) {
+      const exclusiveOwner = this.exclusiveOwnerOf(account);
+      if (exclusiveOwner && exclusiveOwner !== agentName) {
+        this.audit({ op: "set-override", identity, account, accountKind: "claude", ok: false, error: "exclusive-account" });
+        socket.write(encodeError(
+          id,
+          "FORBIDDEN",
+          `account '${account}' is exclusive to agent '${exclusiveOwner}' ` +
+          `(agents.${exclusiveOwner}.auth.exclusive) — agent '${agentName}' cannot pin it.`,
+        ));
+        return;
+      }
+    }
+    // Refuse MOVING or CLEARING a strict/exclusive pin over the socket. The
+    // flags are yaml-only and bind to the yaml-declared account: a hot move
+    // would either carry `exclusive` onto an account yaml never marked
+    // (locking a fleet fallback out of rotation until restart) or leave the
+    // flag dangling with no pin. Idempotent re-pin to the same account stays
+    // allowed. Edit switchroom.yaml + restart the broker to change these.
+    {
+      const curAuth = (this.config.agents ?? {})[agentName]?.auth;
+      if (
+        (curAuth?.strict || curAuth?.exclusive) &&
+        account !== (curAuth?.override ?? null)
+      ) {
+        this.audit({ op: "set-override", identity, account: account ?? undefined, accountKind: "claude", ok: false, error: "yaml-pinned" });
+        socket.write(encodeError(
+          id,
+          "FORBIDDEN",
+          `agent '${agentName}' has a strict/exclusive pin declared in switchroom.yaml — ` +
+          `edit the yaml (agents.${agentName}.auth) and restart the broker to change it.`,
+        ));
+        return;
+      }
+    }
     const agents = { ...(this.config.agents ?? {}) };
     const cur = agents[agentName];
     const auth = { ...(cur.auth ?? {}) };
@@ -4437,16 +4603,17 @@ export class AuthBroker {
 
   /** Fan out to every agent whose effective (failover-resolved) account == label. */
   private fanoutToAffectedAgents(label: string): string[] {
-    const auth = this.config.auth ?? {};
     const fanned: string[] = [];
-    for (const [name, agent] of Object.entries(this.config.agents ?? {})) {
+    for (const name of Object.keys(this.config.agents ?? {})) {
       // Match on the SERVED account (post exhaustion-failover), not the raw
       // auth.active. When auth.active is walled, an agent's served account is
       // its healthy fallback — so refreshing the fallback re-mirrors it, while
       // refreshing the walled account matches no agent (it serves none) and so
       // can never re-mirror walled creds. With nothing exhausted this is
-      // identical to matching auth.active.
-      const effective = this.accountWithFailover(agent.auth?.override ?? auth.active);
+      // identical to matching auth.active. Strict pins resolve to the pin
+      // itself (servedAccountForAgent) — a strict agent is only ever fanned
+      // its own account's creds.
+      const effective = this.servedAccountForAgent(name);
       if (effective === label) {
         if (this.fanoutForAgent(name)) fanned.push(name);
       }
@@ -4495,9 +4662,12 @@ export class AuthBroker {
       const effective = this.servingAccountForConsumer(consumer.name);
       const isEffective = effective === label;
       if (!isPinned && !isEffective) continue;
-      const toMirror = effective ?? bound;
-      if (toMirror == null) continue;
-      if (this.mirrorAccountToConsumer(toMirror, consumer)) {
+      // A null effective is a DENY from the serving path (the bound account
+      // is exclusive to an agent — escaped-state defense). Falling back to
+      // `bound` here would mirror the very credentials the deny refused, so
+      // skip the push instead; the consumer keeps its last mirror.
+      if (effective == null) continue;
+      if (this.mirrorAccountToConsumer(effective, consumer)) {
         fanned.push(consumer.name);
       }
     }
@@ -4652,6 +4822,13 @@ export class AuthBroker {
     for (const [name, agent] of Object.entries(this.config.agents ?? {})) {
       const effective = agent.auth?.override ?? auth.active;
       if (effective !== label) continue;
+      // A strict pin never rolls: the pin is a hard billing/compliance
+      // boundary, so the agent keeps its own (walled) account's creds and
+      // rides out the window rather than borrowing `next`'s quota.
+      if (agent.auth?.override && agent.auth?.strict) continue;
+      // Never roll an agent onto an account exclusive to someone else —
+      // defense-in-depth; the selector already skips exclusive candidates.
+      if (!this.isServableBy(next, name)) continue;
       // For agents on the fleet active, we don't rewrite YAML — we just
       // mirror the next-account creds. The CLI is expected to persist
       // the swap via set-active when it sees rolled[] in the response.
@@ -4663,8 +4840,18 @@ export class AuthBroker {
   }
 
   private nextHealthyAccount(current: string, order: readonly string[]): string | null {
+    // A fleet-wide roll target serves EVERY rider of the walled account, so an
+    // account exclusive to one agent is never a valid target — regardless of
+    // who triggered the roll. (Yaml validation keeps exclusive accounts out of
+    // fallback_order; this guards hot-mutated / stale persisted state, and the
+    // auto-promote path that would otherwise set auth.active to it.)
     const start = order.indexOf(current);
-    if (start === -1) return order[0] ?? null;
+    if (start === -1) {
+      for (const cand of order) {
+        if (cand && !this.exclusiveOwnerOf(cand)) return cand;
+      }
+      return null;
+    }
     // Soft-avoid (#3031) preference RANKING: the first non-exhausted,
     // non-soft-avoided candidate wins; when every healthy candidate is
     // soft-avoided, fall back to the least-utilized of them (never null when
@@ -4680,6 +4867,7 @@ export class AuthBroker {
       // if its mark expired, and accept one the live probe shows healthy even
       // if a stale/bogus mark says exhausted. (The 2026-06-10 root predicate.)
       if (this.isAccountExhausted(cand) || !accountExists(cand, this.home)) continue;
+      if (this.exclusiveOwnerOf(cand)) continue;
       if (!this.isAccountSoftAvoided(cand)) return cand;
       const score = this.softAvoidUtilScore(cand);
       // `=== null` seed: even when every candidate scores +Infinity (all
@@ -4695,14 +4883,15 @@ export class AuthBroker {
 
   /** Compute an agent's effective account and write its mirror. */
   private fanoutForAgent(name: string): boolean {
-    const auth = this.config.auth ?? {};
     const agent = (this.config.agents ?? {})[name];
     if (!agent) return false;
     // Mirror the effective account THROUGH exhaustion-failover: when the raw
     // effective (override ?? auth.active) is walled, write the healthy fallback
     // instead. Without this, a refresh-tick fanout of the walled account would
     // re-mirror it onto the agent and undo the auto-fallback (#2218 durability).
-    const effective = this.accountWithFailover(agent.auth?.override ?? auth.active);
+    // Strict pins resolve to the pin itself — the mirror never carries another
+    // account's creds onto a strict agent.
+    const effective = this.servedAccountForAgent(name);
     if (!effective) return false;
     return this.mirrorAccountToAgent(effective, name);
   }
@@ -4955,6 +5144,20 @@ export class AuthBroker {
       process.stdout.write(
         `auth-broker: active-override ignored — account '${ov.active}' not found on disk\n`,
       );
+      return;
+    }
+    // A persisted swap can predate an `exclusive` flag added to yaml since:
+    // schema validation only sees yaml's own `auth.active`, so a stale
+    // override naming a now-exclusive account would re-apply at every boot
+    // and serve the account fleet-wide. Drop it (not just ignore) — yaml is
+    // the source of truth for exclusivity and the swap is no longer legal.
+    const exclusiveOwner = this.exclusiveOwnerOf(ov.active);
+    if (exclusiveOwner) {
+      process.stdout.write(
+        `auth-broker: active-override dropped — account '${ov.active}' is now exclusive ` +
+          `to agent '${exclusiveOwner}' (agents.${exclusiveOwner}.auth.exclusive); yaml wins\n`,
+      );
+      try { unlinkSync(join(this.stateDir, "active-override.json")); } catch { /* best-effort */ }
       return;
     }
     if (ov.active === this.config.auth?.active) return;

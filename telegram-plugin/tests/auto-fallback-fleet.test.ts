@@ -190,6 +190,30 @@ describe('runFleetAutoFallback', () => {
     expect(failover).toHaveBeenCalledTimes(1);
   });
 
+  it('strict-pinned caller: null rolledTo yields the strict-pinned outcome, NOT all-blocked', async () => {
+    // agents.<name>.auth.strict — the broker marked the account but
+    // deliberately did not roll the caller. The all-blocked card here would
+    // claim fleet-wide exhaustion while its own snapshots show healthy
+    // accounts.
+    const failover = vi.fn(async () => ({
+      rolledTo: null, rolled: [], callerPinnedStrict: true,
+    }));
+    const out = await runFleetAutoFallback({
+      state: state('work@x', ['work@x']),
+      quotas: [qOk({ fiveHourUtilizationPct: 12, sevenDayUtilizationPct: 30 })],
+      failover,
+      triggerAgent: 'workbot',
+      now: NOW,
+      tz: 'UTC',
+      rateLimitTrigger: true,
+    });
+    expect(out.kind).toBe('strict-pinned');
+    expect(failover).toHaveBeenCalledTimes(1);
+    expect(out.announcement).toContain('strictly pinned');
+    expect(out.announcement).toContain('fleet is unaffected');
+    expect(out.announcement).not.toContain('blocked');
+  });
+
   it('idempotency: skips the swap WITHOUT calling failover when active probes healthy', async () => {
     const failover = vi.fn();
     const out = await runFleetAutoFallback({

@@ -4135,11 +4135,38 @@ export const AgentSchema = z.object({
           "Per-agent override of the fleet-wide `auth.active`. Edge-case use only — " +
           "this agent talks to the named account regardless of fleet active. See RFC H §4.5.",
         ),
+      strict: z
+        .boolean()
+        .optional()
+        .describe(
+          "Requires `override`. When true, the pin is a hard binding, not a " +
+          "routing preference: the broker NEVER serves this agent from any " +
+          "other account — no failover to `auth.fallback_order` while the " +
+          "pinned account is quota-walled or exhausted. The agent rides out " +
+          "the wall on its own account (surfacing the normal 429/quota " +
+          "cards) instead of silently borrowing fleet quota. Use for " +
+          "accounts that must never cross a billing/compliance boundary " +
+          "(e.g. an employer-provided subscription).",
+        ),
+      exclusive: z
+        .boolean()
+        .optional()
+        .describe(
+          "Requires `override`. When true, the pinned account belongs to " +
+          "THIS agent alone: the broker refuses to serve it to any other " +
+          "agent or consumer, refuses `auth use <label>` (set-active) onto " +
+          "it, and refuses pinning another agent to it. Config that routes " +
+          "others to the account (`auth.active`, `auth.fallback_order`, " +
+          "another agent's `override`, a consumer pin) is rejected at load. " +
+          "Usually paired with `strict: true` for full two-way isolation.",
+        ),
     })
     .optional()
     .describe(
       "Account routing for switchroom-auth-broker. RFC H schema uses " +
-      "fleet-wide `auth.active` plus per-agent `override:` for edge cases. " +
+      "fleet-wide `auth.active` plus per-agent `override:` for edge cases, " +
+      "with optional `strict:` (never borrow another account) and " +
+      "`exclusive:` (no one else may use the pinned account) hardening. " +
       "Pre-RFC-H `auth.accounts: [..]` and `auth_label:` are migrated in-place " +
       "on first apply (see src/auth/migrate-schema.ts).",
     ),
@@ -4589,6 +4616,20 @@ export const AgentSchema = z.object({
     })
     .optional(),
 }).superRefine((agent, ctx) => {
+  // `strict` / `exclusive` are modifiers of a pin — without `override`
+  // there is no account for them to bind to, so their presence is an
+  // authoring error (likely a mis-indented yaml block), not a no-op.
+  if (agent.auth && !agent.auth.override) {
+    for (const flag of ["strict", "exclusive"] as const) {
+      if (agent.auth[flag]) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `\`auth.${flag}: true\` requires \`auth.override: <account>\` — there is no pinned account for it to apply to.`,
+          path: ["auth", flag],
+        });
+      }
+    }
+  }
   // Supergroup-mode exclusion: dm_only agents have their own bot+chat
   // and don't participate in forum-topic routing. The three modes
   // (fleet-shared, dm_only, supergroup-owned) are mutually exclusive.
@@ -5585,6 +5626,61 @@ export const SwitchroomConfigSchema = z.object({
   // gate. Per-agent-scoped degradation (load the rest of the fleet, disable
   // just the offending agent's M365) is tracked as a follow-up — it needs
   // loader-level support, not a schema tweak.
+  // Exclusive account pins: an account marked `exclusive` on one agent's
+  // pin must not be routable to anyone else. Every config path that would
+  // serve it elsewhere — fleet active, fallback_order, another agent's
+  // override, a consumer pin — is a load-time error. The broker enforces
+  // the same invariant at runtime for hot-mutated config (set-active /
+  // set-override); this check catches the authored yaml before it loads.
+  for (const [name, a] of Object.entries(cfg.agents ?? {})) {
+    const agentAuth = (a as { auth?: { override?: string; exclusive?: boolean } }).auth;
+    if (!agentAuth?.exclusive || !agentAuth.override) continue;
+    const acct = agentAuth.override;
+    if (cfg.auth?.active === acct) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          `account '${acct}' is exclusive to agent '${name}' ` +
+          `(agents.${name}.auth.exclusive) — it cannot be the fleet \`auth.active\``,
+        path: ["auth", "active"],
+      });
+    }
+    const fbIdx = (cfg.auth?.fallback_order ?? []).indexOf(acct);
+    if (fbIdx !== -1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          `account '${acct}' is exclusive to agent '${name}' ` +
+          `(agents.${name}.auth.exclusive) — it cannot appear in \`auth.fallback_order\``,
+        path: ["auth", "fallback_order", fbIdx],
+      });
+    }
+    for (const [other, oa] of Object.entries(cfg.agents ?? {})) {
+      if (other === name) continue;
+      const otherOverride = (oa as { auth?: { override?: string } }).auth?.override;
+      if (otherOverride === acct) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `account '${acct}' is exclusive to agent '${name}' ` +
+            `(agents.${name}.auth.exclusive) — agent '${other}' cannot pin it`,
+          path: ["agents", other, "auth", "override"],
+        });
+      }
+    }
+    (cfg.auth?.consumers ?? []).forEach((c, i) => {
+      if (c.account === acct) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `account '${acct}' is exclusive to agent '${name}' ` +
+            `(agents.${name}.auth.exclusive) — consumer '${c.name}' cannot pin it`,
+          path: ["auth", "consumers", i, "account"],
+        });
+      }
+    });
+  }
+
   const microsoftAccounts = (cfg as {
     microsoft_accounts?: Record<string, { enabled_for?: string[] } | undefined>;
   }).microsoft_accounts;

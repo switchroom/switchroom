@@ -328,7 +328,15 @@ export interface AuthBrokerClient {
    * `setActive` this needs no admin — the account is derived from the caller's
    * identity — so auto-fallback works from any agent.
    */
-  markExhausted(until?: number): Promise<{ account: string; rolled: string[]; rolledTo?: string | null }>
+  markExhausted(until?: number): Promise<{
+    account: string
+    rolled: string[]
+    rolledTo?: string | null
+    /** True when the caller is a strict-pinned agent (`auth.strict`): its
+     *  null `rolledTo` means "riding out the wall", not fleet all-blocked.
+     *  Absent on pre-flag brokers. */
+    caller_pinned_strict?: boolean
+  }>
   /**
    * 429 throttle tier (broker `mark-throttled`). Records a transient
    * per-account rate limit on the CALLER's own account — `throttled_until`
@@ -344,6 +352,8 @@ export interface AuthBrokerClient {
     throttled_until: number
     escalated: boolean
     rolledTo?: string | null
+    /** See markExhausted.caller_pinned_strict. */
+    caller_pinned_strict?: boolean
   }>
   rmAccount(label: string): Promise<{ label: string }>
   refreshAccount(label: string): Promise<{ account: string; expiresAt?: number }>

@@ -159,6 +159,18 @@ export type FleetFallbackOutcome =
       oldLabel: string;
       announcement: string;
       oldQuota: QuotaUtilization | null;
+    }
+  | {
+      /** The triggering agent has a strict pin (`auth.strict`) — the broker
+       *  marked its account but deliberately did not roll it. Distinct from
+       *  'no-eligible-target' so the gateway can apply its own notice
+       *  cooldown: like all-blocked, this is a no-op outcome the ~60s
+       *  quota_wall_detected re-trigger would otherwise re-broadcast for
+       *  the life of the wall. */
+      kind: 'strict-pinned';
+      oldLabel: string;
+      announcement: string;
+      oldQuota: QuotaUtilization | null;
     };
 
 export interface FleetFallbackDeps {
@@ -177,7 +189,14 @@ export interface FleetFallbackDeps {
    *  /auth button uses) is gated to admin agents, so a non-admin agent that
    *  429'd could never self-heal. mark-exhausted derives the account from the
    *  caller's own identity, so it needs no admin. */
-  failover: () => Promise<{ rolledTo: string | null; rolled: string[] }>;
+  failover: () => Promise<{
+    rolledTo: string | null;
+    rolled: string[];
+    /** True when the triggering agent has a strict pin (`auth.strict`): its
+     *  null `rolledTo` means it rides out the wall on its own account — NOT
+     *  a fleet-wide all-blocked. Absent from pre-flag brokers → false. */
+    callerPinnedStrict?: boolean;
+  }>;
   /** Agent that triggered this fallback (for the announcement byline). */
   triggerAgent: string;
   /** Operator timezone for absolute reset times in the announcement. */
@@ -259,7 +278,23 @@ export async function runFleetAutoFallback(
   // choice (same `nextHealthyAccount` selection /auth rotate uses) rather than
   // picking here, so the announcement matches what actually happened. Caller
   // catches and surfaces failures — we don't double-wrap.
-  const { rolledTo } = await deps.failover();
+  const { rolledTo, callerPinnedStrict } = await deps.failover();
+
+  if (!rolledTo && callerPinnedStrict) {
+    // Strict pin: the broker marked the account but deliberately did not roll
+    // the caller (agents.<name>.auth.strict). Rendering the all-blocked card
+    // here would tell the operator the whole fleet is exhausted while the
+    // snapshots in that very card show healthy accounts.
+    return {
+      kind: 'strict-pinned',
+      oldLabel: oldSnap.label,
+      oldQuota: oldSnap.quota,
+      announcement:
+        `_**${escapeMarkdown(deps.triggerAgent)}** is strictly pinned to ` +
+        `${escapeMarkdown(oldSnap.label)} (\`auth.strict\`) — riding out the wall ` +
+        `on its own account. The rest of the fleet is unaffected._`,
+    };
+  }
 
   if (!rolledTo) {
     // All-blocked path: the broker found no non-exhausted fallback. The active

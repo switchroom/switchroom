@@ -427,6 +427,22 @@ describe('renderThrottleEscalationNotice — corroborated-wall announcement', ()
     expect(text).toContain('all blocked')
     expect(text).toContain('/auth add')
   })
+
+  it('strict-pinned caller: null rolledTo renders the riding-it-out variant, NOT all-blocked', () => {
+    // A strict pin (agents.<name>.auth.strict) deliberately does not roll —
+    // the broker reports caller_pinned_strict so this null is not misread as
+    // a fleet-wide exhaustion while the fleet is healthy.
+    const text = renderThrottleEscalationNotice({
+      account: 'work',
+      agent: 'workbot',
+      rolledTo: null,
+      callerPinnedStrict: true,
+    })
+    expect(text).toContain('strictly pinned')
+    expect(text).toContain('fleet is unaffected')
+    expect(text).not.toContain('all blocked')
+    expect(text).not.toContain('/auth add')
+  })
 })
 
 describe('rate_limited escalation card wording (model-unavailable integration)', () => {

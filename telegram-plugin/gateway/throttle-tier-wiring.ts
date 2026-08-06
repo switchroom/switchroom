@@ -73,6 +73,10 @@ export interface ThrottleBrokerClient {
     throttled_until: number
     escalated: boolean
     rolledTo?: string | null
+    /** True when the caller has a strict pin (`auth.strict`) — its null
+     *  `rolledTo` means "riding out the wall", not fleet all-blocked.
+     *  Absent on pre-flag brokers. */
+    caller_pinned_strict?: boolean
   }>
   claimNotification(key: string, windowMs: number): Promise<{ granted: boolean }>
 }
@@ -214,19 +218,22 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     client: ThrottleBrokerClient | null,
     account: string | null,
     rolledTo: string | null,
+    callerPinnedStrict: boolean,
     triggerAgent: string,
     armedAtMs: number,
   ): Promise<void> {
     deps.log(
       `[throttle-tier] escalated to wall account=${account ?? '?'} ` +
-        `rolledTo=${rolledTo ?? 'none (all blocked)'}`,
+        `rolledTo=${rolledTo ?? (callerPinnedStrict ? 'none (strict pin, riding it out)' : 'none (all blocked)')}`,
     )
     await broadcastDeduped(
       client,
       'throttle-escalation',
       account,
-      renderThrottleEscalationNotice({ account, agent: triggerAgent, rolledTo }),
+      renderThrottleEscalationNotice({ account, agent: triggerAgent, rolledTo, callerPinnedStrict }),
     )
+    // No nudge on a null rolledTo — for a strict pin a resume would replay
+    // the turn straight back into the wall it just hit.
     if (rolledTo) nudgeResume('throttle-escalation-resume', armedAtMs)
   }
 
@@ -240,6 +247,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     let account: string | null = null
     let escalated = false
     let rolledTo: string | null = null
+    let callerPinnedStrict = false
     try {
       client = await deps.getBrokerClient()
       if (client) {
@@ -247,6 +255,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
         account = r.account
         escalated = r.escalated
         rolledTo = r.rolledTo ?? null
+        callerPinnedStrict = r.caller_pinned_strict ?? false
       } else {
         deps.log(
           `[throttle-tier] broker unreachable — notice only, no ledger record agent=${triggerAgent}`,
@@ -259,7 +268,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     }
 
     if (escalated) {
-      await announceEscalation(client, account, rolledTo, triggerAgent, armedAtMs)
+      await announceEscalation(client, account, rolledTo, callerPinnedStrict, triggerAgent, armedAtMs)
       return
     }
 
@@ -303,6 +312,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     let account: string | null = null
     let escalated = false
     let rolledTo: string | null = null
+    let callerPinnedStrict = false
     try {
       client = await deps.getBrokerClient()
       if (client) {
@@ -312,6 +322,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
         account = r.account
         escalated = r.escalated
         rolledTo = r.rolledTo ?? null
+        callerPinnedStrict = r.caller_pinned_strict ?? false
       } else {
         deps.log(
           `[throttle-tier] broker unreachable — probe-only skipped agent=${triggerAgent}`,
@@ -324,7 +335,7 @@ export function createThrottleTierRunner(deps: ThrottleTierRunnerDeps): Throttle
     }
 
     if (escalated) {
-      await announceEscalation(client, account, rolledTo, triggerAgent, armedAtMs)
+      await announceEscalation(client, account, rolledTo, callerPinnedStrict, triggerAgent, armedAtMs)
       return
     }
 
