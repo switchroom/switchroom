@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/secret-guard-pretool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/secret-guard-pretool.mjs\"",
             "timeout": 10
           }
         ]
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/sentinel-reply-guard-pretool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/sentinel-reply-guard-pretool.mjs\"",
             "timeout": 5
           }
         ]
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent-tracker-pretool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent-tracker-pretool.mjs\"",
             "timeout": 10
           }
         ]
@@ -34,7 +34,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/tool-label-pretool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/tool-label-pretool.mjs\"",
             "timeout": 5
           }
         ]
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/repo-context-pretool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/repo-context-pretool.mjs\"",
             "timeout": 5
           }
         ]
@@ -56,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent-tracker-posttool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/subagent-tracker-posttool.mjs\"",
             "timeout": 10
           }
         ]
@@ -66,7 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/sandbox-hint-posttool.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/sandbox-hint-posttool.mjs\"",
             "timeout": 3
           }
         ]
@@ -77,7 +77,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/compaction-marker-precompact.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/compaction-marker-precompact.mjs\"",
             "timeout": 5
           }
         ]
@@ -88,7 +88,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/secret-scrub-stop.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/secret-scrub-stop.mjs\"",
             "timeout": 15,
             "async": true
           }
@@ -98,7 +98,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/silent-end-interrupt-stop.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/silent-end-interrupt-stop.mjs\"",
             "timeout": 5
           }
         ]
@@ -107,7 +107,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch-claim-stop.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch-claim-stop.mjs\"",
             "timeout": 5
           }
         ]
@@ -116,7 +116,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" node \"${CLAUDE_PLUGIN_ROOT}/hooks/tool-label-stop.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.sh\" bun \"${CLAUDE_PLUGIN_ROOT}/hooks/tool-label-stop.mjs\"",
             "timeout": 5,
             "async": true
           }

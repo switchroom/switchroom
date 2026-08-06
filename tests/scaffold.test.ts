@@ -5311,11 +5311,15 @@ describe("secret-detect hook wiring", () => {
     expect(pre).toBeDefined();
     const commands = pre.flatMap((e) => e.hooks).map((h) => h.command);
     expect(commands.some((c) => c.includes("secret-guard-pretool.mjs"))).toBe(true);
-    // Ends in .mjs and the inner command uses node (wrapped via run-hook.sh
-    // so the line begins with `bash <wrapper>` then `<source>` then `node ...`).
+    // Ends in .mjs and the inner command uses bun (wrapped via run-hook.sh
+    // so the line begins with `bash <wrapper>` then `<source>` then `bun ...`).
     const guardCmd = commands.find((c) => c.includes("secret-guard-pretool.mjs"))!;
     expect(guardCmd).toMatch(/run-hook\.sh/);
-    expect(guardCmd).toContain("node ");
+    // Plugin .mjs hooks run under bun (halved interpreter boot); the swap is
+    // proven byte-identical to node, secret-guard included. Bundled hooks
+    // (asserted elsewhere) stay on node.
+    expect(guardCmd).toContain("bun ");
+    expect(guardCmd).not.toContain("node ");
   });
 
   it("wires secret-scrub-stop.mjs into settings.json Stop when plugin is switchroom", () => {

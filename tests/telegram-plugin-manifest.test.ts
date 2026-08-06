@@ -127,6 +127,32 @@ describe("telegram-plugin manifest (#229)", () => {
     }
   });
 
+  it("all hooks.json plugin .mjs hooks run under bun, never node", () => {
+    // The plugin's .mjs hooks are invoked under bun to halve interpreter
+    // boot per hook (proven byte-identical to node, secret-guard included).
+    // hooks.json is the plugin-system mirror of the scaffold-written
+    // settings.json commands (they MUST agree, #1811); pin the runtime so
+    // the mirror can't silently drift back to node.
+    const path = join(REPO_ROOT, "telegram-plugin", "hooks", "hooks.json");
+    const m = JSON.parse(readFileSync(path, "utf-8")) as {
+      hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+    };
+    const allCommands: string[] = [];
+    for (const eventGroups of Object.values(m.hooks)) {
+      for (const group of eventGroups) {
+        for (const h of group.hooks) allCommands.push(h.command);
+      }
+    }
+    // Every command runs a .mjs via run-hook.sh; the interpreter token must
+    // be bun. Match the exact `run-hook.sh" bun "` shape the commands use.
+    expect(allCommands.length).toBeGreaterThan(0);
+    for (const c of allCommands) {
+      expect(c).toContain(".mjs");
+      expect(c).toContain('run-hook.sh" bun "');
+      expect(c).not.toContain('run-hook.sh" node "');
+    }
+  });
+
   it("subagent-tracker hooks gate on Agent or Task (regex matcher)", () => {
     // Pre-#262: matcher was the literal "Agent". Post-fix: regex
     // covering both `Agent` and `Task` for Claude Code version
