@@ -315,6 +315,25 @@ operator's agent names and a committed baseline should not enumerate a private
 fleet. `--no-redact-banks` prints them for local debugging. Memory text never
 enters a result file at any setting: observations carry ids only.
 
+### What is committed under `results/`
+
+Four files, all produced by the commands in this README against hindsight
+`0.8.6`, one bank, a 28-case `--seed 4479` sample, sequential at concurrency 1:
+
+| file | what it is | exit |
+|---|---|---|
+| `p6-baseline-native-v1.json` | the quality baseline; `--runs 3`, carries the determinism block | 0 |
+| `p6-vacuity-check-keyword-ablated.json` | the same sample with `--disable-keyword-arm` | 0 |
+| `p6-vacuity-check-compare.json` | baseline vs ablated — the AC1 red proof | 1 |
+| `p6-vacuity-check-control-self-compare.json` | the ablated file vs **itself** — the control that shows the red above is specific | 3 |
+
+The control is the point of the pair: without it, exit 1 on the ablated compare
+is not evidence, because a gate that is red on everything is red on nothing.
+
+**These are quality numbers. Nothing in them is a latency measurement.** The
+box was running an unrelated latency benchmark throughout, by design, so the
+`timings_not_a_measurement` block is diagnostic only and is never scored.
+
 ## Layout
 
 ```
