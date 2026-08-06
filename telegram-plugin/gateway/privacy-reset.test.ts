@@ -29,7 +29,11 @@ import {
   privacyStatePath,
   SESSION_RESET_ALERT,
 } from './privacy-state.js'
-import { makePrivacyResetForNewSession } from './privacy-reset.js'
+import {
+  makePrivacyResetForNewSession,
+  bootRestoresTranscript,
+  isContinueRestoreBoot,
+} from './privacy-reset.js'
 
 describe('privacy session-start reset', () => {
   let dir: string
@@ -122,6 +126,91 @@ describe('privacy session-start reset', () => {
       expect(send).toHaveBeenCalledTimes(1)
       expect(send).toHaveBeenCalledWith('chat-1', 77, SESSION_RESET_ALERT)
       expect(onDisk()).toEqual(emptyPrivacyState())
+    })
+  })
+
+  describe('boot reset gating on --continue transcript-restore (MAJOR fix)', () => {
+    it('bootRestoresTranscript: continue/auto restore; handoff/none/undefined do not; force-fresh overrides', () => {
+      expect(bootRestoresTranscript({ resumeMode: 'continue', forceFresh: false })).toBe(true)
+      expect(bootRestoresTranscript({ resumeMode: 'auto', forceFresh: false })).toBe(true)
+      expect(bootRestoresTranscript({ resumeMode: 'handoff', forceFresh: false })).toBe(false)
+      expect(bootRestoresTranscript({ resumeMode: 'none', forceFresh: false })).toBe(false)
+      expect(bootRestoresTranscript({ resumeMode: undefined, forceFresh: false })).toBe(false)
+      // A /new /reset force-fresh boot is genuinely fresh even under continue/auto.
+      expect(bootRestoresTranscript({ resumeMode: 'continue', forceFresh: true })).toBe(false)
+      expect(bootRestoresTranscript({ resumeMode: 'auto', forceFresh: true })).toBe(false)
+    })
+
+    it('isContinueRestoreBoot reads SWITCHROOM_RESUME_MODE / SWITCHROOM_FORCE_FRESH', () => {
+      const saved = { ...process.env }
+      try {
+        delete process.env.SWITCHROOM_FORCE_FRESH
+        process.env.SWITCHROOM_RESUME_MODE = 'continue'
+        expect(isContinueRestoreBoot(null)).toBe(true)
+        process.env.SWITCHROOM_RESUME_MODE = 'handoff'
+        expect(isContinueRestoreBoot(null)).toBe(false)
+        // force-fresh env override wins over continue.
+        process.env.SWITCHROOM_RESUME_MODE = 'continue'
+        process.env.SWITCHROOM_FORCE_FRESH = '1'
+        expect(isContinueRestoreBoot(null)).toBe(false)
+      } finally {
+        process.env = saved
+      }
+    })
+
+    // Emulates the guarded boot call site: `if (target && !isContinueRestoreBoot(dir)) reset(...)`.
+    // This is the exact failure scenario the reviewer flagged.
+    function guardedBootReset(reset: (c: string, t: number | undefined) => void): void {
+      if (!isContinueRestoreBoot(null)) reset('boot-chat', undefined)
+    }
+
+    it('continue-restore boot: NO reset, NO alert, open interval PRESERVED', () => {
+      const saved = { ...process.env }
+      try {
+        process.env.TELEGRAM_STATE_DIR = dir
+        delete process.env.SWITCHROOM_FORCE_FRESH
+        process.env.SWITCHROOM_RESUME_MODE = 'continue'
+        openPrivateInterval(new Date('2026-08-06T02:00:00.000Z'))
+        const send = vi.fn<(chatId: string, threadId: number | undefined, text: string) => void>()
+        guardedBootReset(makePrivacyResetForNewSession(send))
+        expect(send).not.toHaveBeenCalled()
+        expect(onDisk().intervals).toEqual([{ start: '2026-08-06T02:00:00.000Z', end: null }])
+      } finally {
+        process.env = saved
+      }
+    })
+
+    it('fresh (handoff) boot: reset FIRES, loud alert emitted, interval cleared', () => {
+      const saved = { ...process.env }
+      try {
+        process.env.TELEGRAM_STATE_DIR = dir
+        delete process.env.SWITCHROOM_FORCE_FRESH
+        process.env.SWITCHROOM_RESUME_MODE = 'handoff'
+        openPrivateInterval(new Date('2026-08-06T02:00:00.000Z'))
+        const send = vi.fn<(chatId: string, threadId: number | undefined, text: string) => void>()
+        guardedBootReset(makePrivacyResetForNewSession(send))
+        expect(send).toHaveBeenCalledTimes(1)
+        expect(send).toHaveBeenCalledWith('boot-chat', undefined, SESSION_RESET_ALERT)
+        expect(onDisk()).toEqual(emptyPrivacyState())
+      } finally {
+        process.env = saved
+      }
+    })
+
+    it('continue-mode /new force-fresh boot: reset FIRES (genuinely fresh)', () => {
+      const saved = { ...process.env }
+      try {
+        process.env.TELEGRAM_STATE_DIR = dir
+        process.env.SWITCHROOM_RESUME_MODE = 'continue'
+        process.env.SWITCHROOM_FORCE_FRESH = '1'
+        openPrivateInterval(new Date('2026-08-06T02:00:00.000Z'))
+        const send = vi.fn<(chatId: string, threadId: number | undefined, text: string) => void>()
+        guardedBootReset(makePrivacyResetForNewSession(send))
+        expect(send).toHaveBeenCalledTimes(1)
+        expect(onDisk()).toEqual(emptyPrivacyState())
+      } finally {
+        process.env = saved
+      }
     })
   })
 })

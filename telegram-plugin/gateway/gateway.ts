@@ -632,7 +632,7 @@ import {
   PRIVATE_ON_REPLY,
   PUBLIC_REPLY,
 } from './privacy-state.js'
-import { makePrivacyResetForNewSession } from './privacy-reset.js'
+import { makePrivacyResetForNewSession, isContinueRestoreBoot } from './privacy-reset.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -23524,8 +23524,8 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
             // Only when we KNOW it was a /model switch (reason) AND we will send the
             // confirmation (marker chat captured); otherwise the boot card fires
             // normally. Version/quota remain available via /status.
-            // Privacy: genuine boot (cold/crash/planned/model-switch) is a new session → reset to public, reusing boot-card's chat. NOT wired to bridge-reconnect (persisting session).
-            if (target) resetPrivacyForNewSession(target.chatId, target.threadId)
+            // Privacy: genuine FRESH boot (cold/crash/planned/model-switch) → reset to public, reusing boot-card's chat. Suppressed on a --continue/auto transcript-restore (state must persist) and never wired to bridge-reconnect.
+            if (target && !isContinueRestoreBoot(resolveAgentDirFromEnv())) resetPrivacyForNewSession(target.chatId, target.threadId)
             const suppressBootCardForModelSwitch =
               modelSwitchReason != null && modelSwitchMarkerChat != null
             if (target && suppressBootCardForModelSwitch) {

@@ -80,6 +80,21 @@ describe('privacy reset call sites (PR3 FIX 2 / FIX 3)', () => {
     expect(contexts).toEqual(['boot', 'command:clear', 'maybeIdleClear'])
   })
 
+  it('the boot reset is GUARDED against a --continue transcript-restore (MAJOR fix)', () => {
+    // The boot-branch call must be gated by !isContinueRestoreBoot(...) so a
+    // continue/auto restart that replays the SAME transcript does NOT flip
+    // privacy to public. The /clear + idle calls are always genuine new
+    // sessions and must NOT carry the guard.
+    const lines = GATEWAY_SRC.split('\n')
+    const bootLine = resetCallLines().find(l => enclosingContext(l) === 'boot')
+    expect(bootLine).toBeDefined()
+    expect(lines[bootLine! - 1]).toContain('isContinueRestoreBoot')
+    for (const l of resetCallLines()) {
+      if (enclosingContext(l) === 'boot') continue
+      expect(lines[l - 1]).not.toContain('isContinueRestoreBoot')
+    }
+  })
+
   it('is NOT wired into the bridge-reconnect boot-card path', () => {
     // Scope tightly to the bridge-reconnect block: from its dedupe tag to the
     // `startBootCard(` it posts. The boot-path reset sits right before ITS

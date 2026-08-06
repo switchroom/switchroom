@@ -21,6 +21,9 @@
  * reset/announce decision lives in `privacy-state.ts` and is unit-tested there.
  */
 
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+
 import { resetPrivacyOnGenuineSessionStart, SESSION_RESET_ALERT } from './privacy-state.js'
 
 /** Posts the loud (notification-ON) reset alert. Provided by the gateway. */
@@ -44,4 +47,41 @@ export function makePrivacyResetForNewSession(
       onOpenIntervalReset: () => send(chatId, threadId, SESSION_RESET_ALERT),
     })
   }
+}
+
+/**
+ * Does this boot RESTORE the previous Claude transcript (via `--continue`)?
+ *
+ * The boot reset must NOT fire when the transcript persists: a `continue`/`auto`
+ * agent whose container restarts mid-`/private` task replays the SAME transcript,
+ * so flipping privacy to public would resume storing that very task (the FIX-3
+ * mid-task-reset shape). Mirrors `decideBootBriefing` (boot-briefing-builder.ts):
+ * `continue` always replays; `auto` MAY replay (only when the JSONL is under
+ * `resume_max_bytes`) — the gateway can't see the inner CONTINUE_FLAG, so `auto`
+ * is treated conservatively as a restore (privacy persists; safe direction — an
+ * over-retained private interval merely excludes more, never leaks). A `/new`
+ * `/reset` force-fresh boot is genuinely fresh even under continue/auto.
+ */
+export function bootRestoresTranscript(opts: {
+  resumeMode: string | undefined
+  forceFresh: boolean
+}): boolean {
+  if (opts.forceFresh) return false
+  return opts.resumeMode === 'continue' || opts.resumeMode === 'auto'
+}
+
+/**
+ * Env/marker-reading convenience over `bootRestoresTranscript` for the gateway
+ * boot site. Reads `SWITCHROOM_RESUME_MODE` and the force-fresh signal
+ * (`SWITCHROOM_FORCE_FRESH`, hoisted by start.sh, with the `.force-fresh-session`
+ * marker as the non-docker fallback — same pair `boot-briefing-wiring.ts` uses).
+ */
+export function isContinueRestoreBoot(agentDir: string | null): boolean {
+  const forceFresh =
+    process.env.SWITCHROOM_FORCE_FRESH === '1' ||
+    (agentDir != null && existsSync(join(agentDir, '.force-fresh-session')))
+  return bootRestoresTranscript({
+    resumeMode: process.env.SWITCHROOM_RESUME_MODE,
+    forceFresh,
+  })
 }
