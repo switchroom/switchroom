@@ -21,7 +21,7 @@
  */
 
 /** Result-file schema version. Bump on any breaking shape change. */
-export const BENCH_SCHEMA_VERSION = 1;
+export const BENCH_SCHEMA_VERSION = 2;
 
 /**
  * How the contention load generator was configured for a run.
@@ -160,6 +160,14 @@ export interface CellStats {
   stddev: number;
   /** coefficient of variation (stddev / mean); the per-cell noise figure */
   cv: number;
+  /**
+   * 95 % bootstrap confidence interval for `p95` — the estimator's OWN
+   * precision at this sample count. Read it before calling a run-to-run p95
+   * difference a regression: if a delta is inside this interval, it is
+   * consistent with having drawn different samples from an unchanged system.
+   */
+  p95CiLow: number;
+  p95CiHigh: number;
 }
 
 /** One (bank, concurrency) measurement. */
@@ -228,6 +236,14 @@ export interface CellComparison {
   /** |b - a| / a, as a fraction. */
   relDelta: number;
   within: boolean;
+  /**
+   * Relative half-width of run A's own bootstrap p95 interval. This is the
+   * smallest disagreement the measurement can distinguish from luck at this
+   * sample count: a `relDelta` below it is not evidence that anything moved.
+   */
+  noiseFloor: number;
+  /** `relDelta <= noiseFloor` — the delta is inside the estimator's own error. */
+  explainedByNoise: boolean;
 }
 
 /** The AC1 reproducibility verdict over two runs. */

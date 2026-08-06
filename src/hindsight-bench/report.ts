@@ -66,6 +66,15 @@ export function compareRuns(a: BenchResult, b: BenchResult, tolerance = DEFAULT_
       continue;
     }
     const relDelta = Math.abs(cb.stats.p95 - ca.stats.p95) / ca.stats.p95;
+    // The estimator's own precision, not the system's stability. Reported
+    // alongside the gate so a reader can tell an unattainable gate from a
+    // genuine regression; it deliberately does NOT relax `within`, because
+    // widening the gate to whatever the noise happens to be is how a
+    // measurement is tuned until it flatters itself.
+    const ciLow = ca.stats.p95CiLow;
+    const ciHigh = ca.stats.p95CiHigh;
+    const noiseFloor =
+      Number.isFinite(ciLow) && Number.isFinite(ciHigh) ? (ciHigh - ciLow) / 2 / ca.stats.p95 : NaN;
     cells.push({
       bank: ca.bank,
       concurrency: ca.concurrency,
@@ -73,6 +82,8 @@ export function compareRuns(a: BenchResult, b: BenchResult, tolerance = DEFAULT_
       p95B: cb.stats.p95,
       relDelta,
       within: relDelta <= tolerance,
+      noiseFloor,
+      explainedByNoise: Number.isFinite(noiseFloor) && relDelta <= noiseFloor,
     });
   }
   for (const key of bByKey.keys()) if (!seen.has(key)) unmatched.push(key);
@@ -239,15 +250,36 @@ export function formatSummary(r: BenchResult): string {
 export function formatReproducibility(rep: ReproducibilityReport): string {
   const L: string[] = [];
   L.push(`reproducibility (AC1) — tolerance ±${round(rep.tolerance * 100, 0)}% on p95 per cell`);
-  L.push(`  ${pad("bank", 16)}${padL("conc", 6)}${padL("p95 A", 10)}${padL("p95 B", 10)}${padL("delta", 9)}   verdict`);
+  L.push(
+    `  ${pad("bank", 16)}${padL("conc", 6)}${padL("p95 A", 10)}${padL("p95 B", 10)}` +
+      `${padL("delta", 9)}${padL("±noise", 9)}   verdict`,
+  );
   for (const c of rep.cells) {
     L.push(
       `  ${pad(c.bank, 16)}${padL(String(c.concurrency), 6)}${padL(c.p95A.toFixed(0), 10)}` +
-        `${padL(c.p95B.toFixed(0), 10)}${padL(`${round(c.relDelta * 100, 1)}%`, 9)}   ${c.within ? "ok" : "OUT"}`,
+        `${padL(c.p95B.toFixed(0), 10)}${padL(`${round(c.relDelta * 100, 1)}%`, 9)}` +
+        `${padL(Number.isFinite(c.noiseFloor) ? `${round(c.noiseFloor * 100, 1)}%` : "-", 9)}   ` +
+        `${c.within ? "ok" : c.explainedByNoise ? "OUT*" : "OUT"}`,
     );
   }
   for (const u of rep.unmatched) L.push(`  ${u}: UNMATCHED (present in only one run, or no usable p95)`);
   L.push(`  worst delta ${round(rep.worstRelDelta * 100, 1)}%  →  ${rep.pass ? "PASS" : "FAIL"}`);
+  const noisy = rep.cells.filter((c) => c.explainedByNoise).length;
+  const floors = rep.cells.map((c) => c.noiseFloor).filter((v) => Number.isFinite(v));
+  if (floors.length > 0) {
+    const median = [...floors].sort((a, b) => a - b)[Math.floor(floors.length / 2)] as number;
+    L.push(
+      `  median ±noise ${round(median * 100, 1)}% — the smallest delta this sample count can ` +
+        `distinguish from luck; ${noisy}/${rep.cells.length} cells (OUT*) are inside it`,
+    );
+    if (median > rep.tolerance) {
+      L.push(
+        `  NOTE: the median noise floor EXCEEDS the ±${round(rep.tolerance * 100, 0)}% gate — ` +
+          `at this sample count the gate is not attainable regardless of how stable the ` +
+          `system is. Raise --samples or grade a lower percentile; do not widen the tolerance to fit.`,
+      );
+    }
+  }
   return L.join("\n");
 }
 
@@ -274,7 +306,7 @@ export function formatContention(rep: ContentionReport): string {
 
 /** Flat CSV of every cell, for pasting into a sheet or diffing across runs. */
 export function toCsv(r: BenchResult): string {
-  const head = "label,bank,rows,concurrency,n,errors,p50_ms,p95_ms,p99_ms,max_ms,mean_ms,stddev_ms,cv,mean_results,zero_result_calls,contention";
+  const head = "label,bank,rows,concurrency,n,errors,p50_ms,p95_ms,p95_ci_low_ms,p95_ci_high_ms,p99_ms,max_ms,mean_ms,stddev_ms,cv,mean_results,zero_result_calls,contention";
   const rows = r.cells.map((c) =>
     [
       JSON.stringify(r.config.label),
@@ -285,6 +317,8 @@ export function toCsv(r: BenchResult): string {
       c.stats.errors,
       round(c.stats.p50, 2),
       round(c.stats.p95, 2),
+      round(c.stats.p95CiLow, 2),
+      round(c.stats.p95CiHigh, 2),
       round(c.stats.p99, 2),
       round(c.stats.max, 2),
       round(c.stats.mean, 2),

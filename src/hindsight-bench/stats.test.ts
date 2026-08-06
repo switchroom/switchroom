@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { percentile, round, summarize } from "./stats.js";
+import { BOOTSTRAP_REPS, bootstrapP95Ci, percentile, round, summarize } from "./stats.js";
 
 describe("percentile", () => {
   it("is nearest-rank, not interpolated", () => {
@@ -82,5 +82,59 @@ describe("round", () => {
 
   it("passes non-finite values through instead of producing 0", () => {
     expect(Number.isNaN(round(NaN, 2))).toBe(true);
+  });
+});
+
+describe("bootstrapP95Ci", () => {
+  const spread = Array.from({ length: 40 }, (_, i) => 100 + i * 50);
+
+  it("is deterministic: the same samples always yield the same interval", () => {
+    // A random interval would make a result file irreproducible and turn
+    // `--compare` into a coin flip on the RNG rather than on the database.
+    expect(bootstrapP95Ci(spread)).toEqual(bootstrapP95Ci([...spread]));
+    expect(bootstrapP95Ci(spread)).toEqual(bootstrapP95Ci(spread.slice().reverse()));
+  });
+
+  it("brackets the point estimate", () => {
+    const [lo, hi] = bootstrapP95Ci(spread);
+    const point = percentile(spread, 0.95);
+    expect(lo).toBeLessThanOrEqual(point);
+    expect(hi).toBeGreaterThanOrEqual(point);
+  });
+
+  it("collapses to zero width when every sample is identical", () => {
+    expect(bootstrapP95Ci(Array(40).fill(700))).toEqual([700, 700]);
+  });
+
+  it("is wider for a heavy-tailed cell than for a tight one", () => {
+    // This is the property the AC1 report leans on: a cell whose p95 is one
+    // lucky order statistic must ANNOUNCE that it cannot resolve 10%.
+    const tight = Array.from({ length: 40 }, (_, i) => 1000 + (i % 3));
+    const heavy = [...Array(38).fill(1000), 9000, 20000];
+    const w = ([lo, hi]: [number, number]): number => hi - lo;
+    expect(w(bootstrapP95Ci(heavy))).toBeGreaterThan(w(bootstrapP95Ci(tight)));
+  });
+
+  it("returns NaN for no data and the sole value for one sample", () => {
+    expect(bootstrapP95Ci([])).toEqual([NaN, NaN]);
+    expect(bootstrapP95Ci([42])).toEqual([42, 42]);
+  });
+
+  it("draws BOOTSTRAP_REPS resamples by default", () => {
+    expect(BOOTSTRAP_REPS).toBe(2000);
+  });
+});
+
+describe("summarize + bootstrap", () => {
+  it("carries the p95 interval into every cell", () => {
+    const st = summarize([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0);
+    expect(st.p95CiLow).toBeLessThanOrEqual(st.p95);
+    expect(st.p95CiHigh).toBeGreaterThanOrEqual(st.p95);
+  });
+
+  it("reports NaN bounds for an all-error cell rather than a clean zero", () => {
+    const st = summarize([], 7);
+    expect(st.p95CiLow).toBeNaN();
+    expect(st.p95CiHigh).toBeNaN();
   });
 });

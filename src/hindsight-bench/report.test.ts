@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { makeCell, makeResult } from "./fixtures.js";
+import { summarize } from "./stats.js";
 import {
   CONTENTION_MIN_REL_DELTA,
   DEFAULT_TOLERANCE,
@@ -11,6 +12,7 @@ import {
   formatSummary,
   toCsv,
 } from "./report.js";
+import type { BenchResult } from "./types.js";
 
 describe("compareRuns (AC1)", () => {
   it("passes when every cell's p95 is within tolerance", () => {
@@ -210,5 +212,54 @@ describe("duplicateCellKeys", () => {
       { bank: "a@c1", concurrency: 2 },
     ];
     expect(duplicateCellKeys(cells)).toEqual([]);
+  });
+});
+
+describe("compareRuns noise floor", () => {
+  /** A one-cell run whose stats are reduced from an explicit sample set. */
+  const runWith = (samples: number[], label: string): BenchResult => {
+    const cell = makeCell("a", 1000, 1, 0);
+    cell.samplesMs = [...samples];
+    cell.stats = summarize(samples, 0);
+    return makeResult([cell], { label });
+  };
+
+  it("reports a wide noise floor for a heavy-tailed cell and flags the delta as luck", () => {
+    // p95 here is one lucky order statistic; a 20% run-to-run move is NOT
+    // evidence the system changed, and the report must say so rather than
+    // printing a bare OUT that reads as a regression.
+    const heavy = [...Array(37).fill(1000), 5000, 9000, 20000];
+    const heavy2 = [...Array(37).fill(1000), 6000, 9000, 15000];
+    const rep = compareRuns(runWith(heavy, "A"), runWith(heavy2, "B"));
+    expect(rep.cells[0]!.noiseFloor).toBeGreaterThan(DEFAULT_TOLERANCE);
+    expect(rep.cells[0]!.explainedByNoise).toBe(true);
+  });
+
+  it("does NOT relax the gate: a cell inside the noise still fails the tolerance", () => {
+    // The tolerance is the acceptance criterion. Widening it to whatever the
+    // noise happens to be is how a measurement gets tuned until it flatters
+    // itself, which is exactly what this harness exists to prevent.
+    const heavy = [...Array(37).fill(1000), 5000, 9000, 20000];
+    const heavy2 = [...Array(37).fill(1000), 6000, 9000, 15000];
+    const rep = compareRuns(runWith(heavy, "A"), runWith(heavy2, "B"));
+    expect(rep.cells[0]!.within).toBe(false);
+    expect(rep.pass).toBe(false);
+  });
+
+  it("reports a near-zero noise floor for a tight cell", () => {
+    const tight = Array.from({ length: 40 }, () => 1000);
+    const rep = compareRuns(runWith(tight, "A"), runWith(tight, "B"));
+    expect(rep.cells[0]!.noiseFloor).toBe(0);
+    expect(rep.cells[0]!.explainedByNoise).toBe(true);
+    expect(rep.pass).toBe(true);
+  });
+
+  it("warns in the printed report when the noise floor exceeds the gate", () => {
+    const heavy = [...Array(37).fill(1000), 5000, 9000, 20000];
+    const heavy2 = [...Array(37).fill(1000), 6000, 9000, 15000];
+    const out = formatReproducibility(compareRuns(runWith(heavy, "A"), runWith(heavy2, "B")));
+    expect(out).toMatch(/median ±noise/);
+    expect(out).toMatch(/NOTE: the median noise floor EXCEEDS/);
+    expect(out).toMatch(/do not widen the tolerance to fit/);
   });
 });
