@@ -26,6 +26,8 @@ import { scanAgent, type Finding, type AgentScanResult } from "./detect.js";
 import { buildLedger } from "./ledger.js";
 import { isTestAgent } from "./test-agents.js";
 import { scanLitellmConfig } from "./litellm-config-sensor.js";
+import { scanHindsightGpuDrift } from "./hindsight-gpu-drift-sensor.js";
+import type { HindsightGpuDriftDeps } from "../setup/hindsight-gpu-drift.js";
 
 /**
  * Resolve the `.switchroom` base dir, matching the read-side
@@ -51,6 +53,11 @@ export interface ScanOptions {
    *  Defaults to `LITELLM_CONFIG_PATH` env → the host-correct default. Exposed
    *  for tests; absent file → the sensor skips with a visible notice. */
   litellmConfigPath?: string;
+  /** I/O seams for the hindsight GPU-drift sensor (host probe / caps read /
+   *  docker inspect). Exposed for tests so the scan never depends on a real
+   *  GPU or a running container; absent → the sensor runs the real probes and
+   *  degrades to a no-op when docker/nvidia are unavailable. */
+  hindsightGpuDeps?: HindsightGpuDriftDeps;
 }
 
 export interface ScanResult {
@@ -151,6 +158,15 @@ export function runScan(opts: ScanOptions = {}): ScanResult {
   // agent finding.
   const litellm = scanLitellmConfig({ path: opts.litellmConfigPath, log });
   findings.push(...litellm.findings);
+
+  // Standalone live-state sensor: the hindsight container running CPU-only on a
+  // GPU host (#4459). Same division of labour as the litellm sensor — it runs
+  // where the scan runs (on-host, where docker + the GPU actually are), reads
+  // the LIVE container's device state, and escalates only a PROVABLE drift into
+  // the ledger. docker/nvidia unavailable → it degrades to a no-op, never a
+  // false finding. The doctor check is the interactive counterpart.
+  const gpuDrift = scanHindsightGpuDrift({ deps: opts.hindsightGpuDeps, log });
+  findings.push(...gpuDrift.findings);
 
   const prior = readLedgerIfPresent(base);
   const ledger = buildLedger(findings, {

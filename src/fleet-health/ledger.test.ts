@@ -133,6 +133,14 @@ describe("runScan (I/O) — defensive over a synthetic fleet tree", () => {
         // dropped. Mirrors how detect.test.ts neutralizes the floor for
         // sub-floor fixtures. (prod CLI keeps the real floor — see fleet-health.ts)
         silentNoopFloorTs: 0,
+        // Hermeticity: fully stub the live-state hindsight GPU sensor so it
+        // neither shells out (docker/nvidia-smi) nor picks up a host-dependent
+        // finding. "could not tell" ⇒ always ok, no finding.
+        hindsightGpuDeps: {
+          probe: () => ({ gpuPresent: false, containerToolkit: false, engine: "cloud", reason: "test stub" }),
+          capsRead: () => ({ status: "absent", path: "/x", caps: null, detail: "" }),
+          deviceRequests: () => null,
+        },
       });
       expect(res.agentsSkipped).toContain("ghost");
       // clerk contributed a silent no-op + a duplicate delivery

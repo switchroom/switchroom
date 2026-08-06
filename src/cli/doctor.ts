@@ -59,6 +59,7 @@ import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js";
 import { checkHindsightWatchArmed } from "./doctor-hindsight-watch.js";
+import { checkHindsightGpuLiveState } from "./doctor-hindsight-gpu.js";
 import { checkConfigRepo } from "./doctor-config-repo.js";
 import { runLitellmModelChecks } from "../litellm/model-validation.js";
 import { runLitellmKeyAllowlistChecks } from "../litellm/key-allowlist-check.js";
@@ -1758,6 +1759,14 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // an unparseable URL) is exactly when an operator is reading doctor output,
   // and the verdict file is a plausible reason the container came back wrong.
   results.push(checkHostCapabilitiesReadable(config));
+
+  // Live-state counterpart to the row above: that one reads the caps FILE (what
+  // a future recreate would decide); this one reads the RUNNING container's
+  // actual device state and FAILs loudly when a usable GPU sits idle while
+  // hindsight serves CPU-only recalls (issue #4459). Also pushed before the URL
+  // parse / reachability early-returns — a CPU-only container is a plausible
+  // reason recalls got slow, which is exactly when doctor is being read.
+  results.push(checkHindsightGpuLiveState(config));
 
   // Parse host and port out of the URL
   const match = url.match(/^https?:\/\/([^:/]+):?(\d+)?/);
