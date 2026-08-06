@@ -134,6 +134,7 @@ jobs:
               - 'tests/docker/hindsight-recall-isolation-patches.test.ts'
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
               - 'tests/docker/hindsight-mm-refresh-debounce-patch.test.ts'
+              - 'tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts'
               - 'tests/docker/hindsight-graph-seed-retirement.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'src/setup/hindsight-perf-defaults.ts'
@@ -408,6 +409,18 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-mm-refresh-debounce-patch.test.ts
 
+      - name: Run the hindsight pg_search tokenizer-drift probe (RED/GREEN, must not skip)
+        # Epic #4474 finding C1. The bakes test can only see that the patch TEXT
+        # is present; it cannot see the outcome that matters — that the shipping
+        # text_signals migration, handed a live STEMMED ParadeDB index, emits a
+        # CREATE INDEX that still carries `stemmer=english`. Upstream emits
+        # `(id, text, context, text_signals)` there, silently unstemmed, on a
+        # POPULATED table, with no error and no log line. Only running the real
+        # `_pg_upgrade()` and reading back the DDL it emits catches that.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts
+
       - name: Run the hindsight graph-seed RETIREMENT probe (RED/GREEN, must not skip)
         # The v0.8.5 upstream #2968 carry was retired in the v0.8.6 base bump —
         # upstream ships the behaviour natively and exposes
@@ -551,7 +564,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done
