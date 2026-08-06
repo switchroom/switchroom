@@ -154,7 +154,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # (`--build-arg CLAUDE_CODE_VERSION=<latest>`) to build a throwaway image on the
 # next version and prove it boots BEFORE the pin is bumped. Keep this default in
 # lockstep with docker/Dockerfile.hindsight's CLAUDE_CODE_VERSION (#1978).
-ARG CLAUDE_CODE_VERSION=2.1.221
+ARG CLAUDE_CODE_VERSION=2.1.223
 # Fail-fast: if the npm install or the resulting binary is broken we
 # want the image build to die here, not produce a base that ships
 # downstream and explodes at agent boot. Previously this had a
