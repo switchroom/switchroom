@@ -632,6 +632,7 @@ import {
   PRIVATE_ON_REPLY,
   PUBLIC_REPLY,
 } from './privacy-state.js'
+import { makePrivacyResetForNewSession, isContinueRestoreBoot } from './privacy-reset.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -5100,6 +5101,10 @@ function maybeIdleClear(): void {
           `telegram gateway: idle /clear suppressed for ${agentName} ` +
             `(activity in check-to-send gap)\n`,
         );
+      } else {
+        // The idle /clear fired → new logical session; reset privacy to public.
+        const idleChat = loadAccess().allowFrom[0];
+        if (idleChat) resetPrivacyForNewSession(String(idleChat), undefined);
       }
     })
     .catch((err: unknown) => {
@@ -5603,6 +5608,11 @@ const swallowingApiCall = createSwallowingRetryApiCall(
   robustApiCall,
   (line) => process.stderr.write(line),
 )
+// Privacy (#private-mode): reset to public on a genuine new session (boot / /clear); loud only on a private→public transition. See privacy-reset.ts.
+const resetPrivacyForNewSession = makePrivacyResetForNewSession((chatId, threadId, text) =>
+  void swallowingApiCall(
+    () => lockedBot.api.sendMessage(chatId, text, threadId != null ? { message_thread_id: threadId, disable_notification: false } : { disable_notification: false }),
+    { chat_id: chatId, verb: 'privacy-reset-alert', priorityClass: 'critical' }))
 
 /**
  * The ONE seam every `setMessageReaction` in this gateway goes through (#3155).
@@ -19811,6 +19821,9 @@ bot.command('compact', async ctx => {
 })
 bot.command('clear', async ctx => {
   await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/clear' }))
+  // A /clear starts a new logical session → reset privacy to public.
+  const clearChatId = String(ctx.chat!.id)
+  resetPrivacyForNewSession(clearChatId, resolveThreadId(clearChatId, ctx.message?.message_thread_id))
 })
 // Per-operator session privacy controls. NOT admin verbs (deliberately kept
 // out of ADMIN_COMMAND_NAMES) — they gate memory writing for THIS session, so
@@ -23511,6 +23524,8 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
             // Only when we KNOW it was a /model switch (reason) AND we will send the
             // confirmation (marker chat captured); otherwise the boot card fires
             // normally. Version/quota remain available via /status.
+            // Privacy: genuine FRESH boot (cold/crash/planned/model-switch) → reset to public, reusing boot-card's chat. Suppressed on a --continue/auto transcript-restore (state must persist) and never wired to bridge-reconnect.
+            if (target && !isContinueRestoreBoot(resolveAgentDirFromEnv())) resetPrivacyForNewSession(target.chatId, target.threadId)
             const suppressBootCardForModelSwitch =
               modelSwitchReason != null && modelSwitchMarkerChat != null
             if (target && suppressBootCardForModelSwitch) {
