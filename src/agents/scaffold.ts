@@ -337,7 +337,7 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
 
 /**
  * The web-fetch contract. One of the fleet invariant blocks. The
- * native WebFetch / WebSearch tools are disabled at the cascade
+ * native WebFetch tool is disabled at the cascade
  * level (`scaffold.ts:WEBKITE_FLEET_DENY_TOOLS`); webkite is wired
  * in via `.mcp.json` and runs as a stdio MCP server with 12 tools.
  *
@@ -348,9 +348,11 @@ Don't wait for a slash command. Don't ask permission. Memory work is table stake
  */
 const WEB_FETCH_GUIDANCE = `## Fetching from the web
 
-The native \`WebFetch\` and \`WebSearch\` tools are disabled in this
-fleet. Use the \`webkite_*\` MCP tools instead — they're already
-wired up and authenticated.
+The native \`WebFetch\` tool is disabled in this fleet — fetch pages
+with the \`webkite_*\` MCP tools instead (they're wired up and
+authenticated). Native \`WebSearch\` IS available; prefer it for quick
+web search, and reach for \`webkite_search\` when you then need to
+fetch a result's page content.
 
 The 12 tools webkite exposes cover what you actually need:
 
@@ -1528,7 +1530,7 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
  * Fleet-baseline deny list seeded into every agent's settings.json
  * `permissions.deny` unless the agent has opted out of webkite. The
  * model still has full web-fetch capability — via the webkite_*
- * MCP tools — but the native WebFetch / WebSearch tools are off so
+ * MCP tools — but the native WebFetch tool is off so
  * the model reaches for webkite by default. Webkite is operator-
  * mounted (private beta binary) and pre-credentialed via the vault-
  * broker; the model doesn't need to know about any of that.
@@ -1537,7 +1539,7 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
  * — the agent gets native WebFetch back. (Documented behavior — if
  * you turn off webkite, you keep WebFetch.)
  */
-const WEBKITE_FLEET_DENY_TOOLS = ["WebFetch", "WebSearch"];
+const WEBKITE_FLEET_DENY_TOOLS = ["WebFetch"];
 
 /**
  * Fleet-baseline deny for blocking interactive TUI tools.
