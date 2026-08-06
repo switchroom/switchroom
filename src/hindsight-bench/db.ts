@@ -19,7 +19,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import type { DbState, IndexFact } from "./types.js";
+import type { DbState, IndexFact, InstanceState } from "./types.js";
 
 /** Default container, matching `hindsight-watch/thresholds.ts`. */
 export const DEFAULT_CONTAINER = "switchroom-hindsight";
@@ -176,6 +176,33 @@ export function resetStats(opts: SqlOptions = {}): void {
   // it is still refused inside a read-only transaction, so this one call runs
   // with the clamp lifted. It is reachable ONLY from `--reset-stats`.
   sql("SELECT pg_stat_reset();", { ...opts, writable: true });
+}
+
+/**
+ * Read the service-side configuration #4475 item 7 names (image tag, reranker
+ * candidate cap).
+ *
+ * Both are read BY NAME. `docker inspect` without a format template, or a bare
+ * `printenv`, prints every injected environment variable — including the
+ * database password and any API keys — so neither is used here.
+ *
+ * Soft-fails to `null` rather than throwing: a missing image label should
+ * annotate the result file as incomplete, not abort a 40-minute sweep. Same
+ * soft-fail discipline as `hindsight-watch/probe.ts`.
+ */
+export function readInstanceState(opts: SqlOptions = {}): InstanceState {
+  const run = opts.run ?? defaultRunner;
+  const container = opts.container ?? DEFAULT_CONTAINER;
+  const one = (args: string[]): string | null => {
+    const r = run("docker", args);
+    if (r.status !== 0) return null;
+    const v = r.stdout.trim();
+    return v === "" ? null : v;
+  };
+  const imageTag = one(["inspect", "--format", "{{.Config.Image}}", container]);
+  const cand = one(["exec", container, "printenv", "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"]);
+  const candNum = cand === null ? NaN : Number(cand);
+  return { imageTag, rerankerMaxCandidates: Number.isFinite(candNum) ? candNum : null };
 }
 
 function num(v: string | undefined): number {

@@ -126,6 +126,23 @@ export interface DbState {
   serverVersion: string;
 }
 
+/**
+ * The Hindsight *service* configuration a result was measured against, as
+ * distinct from the database's (`DbState`).
+ *
+ * #4475 item 7 names the image tag and `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`
+ * specifically: the reranker candidate cap is a first-order latency knob, so a
+ * result file that omits it cannot be compared against one taken after someone
+ * changed it. Each field is read by NAME — the harness never dumps a container's
+ * environment, which would print injected secrets.
+ */
+export interface InstanceState {
+  /** `docker inspect .Config.Image`, or null when it could not be read. */
+  imageTag: string | null;
+  /** `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`, or null when unset. */
+  rerankerMaxCandidates: number | null;
+}
+
 /** Reduction of one cell's samples. Percentiles are nearest-rank on ms. */
 export interface CellStats {
   /** recorded samples (successful calls only) */
@@ -187,6 +204,7 @@ export interface BenchResult {
   schema: typeof BENCH_SCHEMA_VERSION;
   config: BenchConfig;
   db: DbState;
+  instance: InstanceState;
   cells: CellResult[];
   /**
    * Arm attribution, or null when the run did not include a traced pass.

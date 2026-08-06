@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { SqlError, assertReadOnlyOrWritesAllowed, readDbState, resetStats, sql, type Runner } from "./db.js";
+import {
+  SqlError,
+  assertReadOnlyOrWritesAllowed,
+  readDbState,
+  readInstanceState,
+  resetStats,
+  sql,
+  type Runner,
+} from "./db.js";
 
 /** A runner that replies with canned stdout per call, recording every invocation. */
 function fakeRunner(replies: string[]): { run: Runner; calls: Array<{ args: string[]; stdin?: string }> } {
@@ -94,6 +102,33 @@ describe("resetStats", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.stdin).toContain("pg_stat_reset()");
     expect(calls[0]?.args.join(" ")).toContain("default_transaction_read_only=off");
+  });
+});
+
+describe("readInstanceState", () => {
+  it("reads the image tag and reranker cap BY NAME, never dumping the environment", () => {
+    const { run, calls } = fakeRunner(["ghcr.io/switchroom/hindsight:v0.8.6\n", "150\n"]);
+    expect(readInstanceState({ run })).toEqual({
+      imageTag: "ghcr.io/switchroom/hindsight:v0.8.6",
+      rerankerMaxCandidates: 150,
+    });
+    // A bare `docker inspect` or a bare `printenv` would print every injected
+    // secret; both calls must be narrowed to a single named value.
+    expect(calls[0]?.args).toContain("--format");
+    expect(calls[0]?.args).toContain("{{.Config.Image}}");
+    expect(calls[1]?.args).toEqual(["exec", "switchroom-hindsight", "printenv", "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"]);
+  });
+
+  it("soft-fails to null rather than aborting a long sweep", () => {
+    const run: Runner = () => ({ status: 1, stdout: "", stderr: "no such container" });
+    expect(readInstanceState({ run })).toEqual({ imageTag: null, rerankerMaxCandidates: null });
+  });
+
+  it("records an unset or non-numeric reranker cap as null, not NaN", () => {
+    const { run } = fakeRunner(["img", ""]);
+    expect(readInstanceState({ run }).rerankerMaxCandidates).toBeNull();
+    const { run: run2 } = fakeRunner(["img", "unlimited"]);
+    expect(readInstanceState({ run: run2 }).rerankerMaxCandidates).toBeNull();
   });
 });
 

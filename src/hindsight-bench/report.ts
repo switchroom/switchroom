@@ -155,6 +155,11 @@ export function formatSummary(r: BenchResult): string {
       `  stats-reset=${c.statsReset}  allow-writes=${c.allowWrites}`,
   );
   L.push("");
+  L.push(
+    `  instance image=${r.instance.imageTag ?? "unknown"}  ` +
+      `reranker_max_candidates=${r.instance.rerankerMaxCandidates ?? "unset"}`,
+  );
+  L.push("");
   L.push("  db state");
   L.push(
     `    shared_buffers=${mb(r.db.sharedBuffersBytes)}  effective_cache_size=${mb(r.db.effectiveCacheSizeBytes)}` +

@@ -46,7 +46,13 @@ import {
   startContention,
   type ContentionHandle,
 } from "../hindsight-bench/contention.js";
-import { DEFAULT_CONTAINER, assertReadOnlyOrWritesAllowed, readDbState, resetStats } from "../hindsight-bench/db.js";
+import {
+  DEFAULT_CONTAINER,
+  assertReadOnlyOrWritesAllowed,
+  readDbState,
+  readInstanceState,
+  resetStats,
+} from "../hindsight-bench/db.js";
 import { renderPlot } from "../hindsight-bench/plot.js";
 import { QUERY_SET_ID } from "../hindsight-bench/recall.js";
 import {
@@ -230,6 +236,7 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
   } catch (e) {
     fail(`could not read database state: ${(e as Error).message}`);
   }
+  const instance = readInstanceState(sqlOpts);
 
   let banks: string[];
   let concurrency: number[];
@@ -310,7 +317,15 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
       armSamples > 0
         ? await runArmSweep({ config, samples: armSamples, deps: { log: (m) => process.stderr.write(`${m}\n`) } })
         : null;
-    result = { schema: BENCH_SCHEMA_VERSION, config, db, cells, arms, durationS: (Date.now() - t0) / 1000 };
+    result = {
+      schema: BENCH_SCHEMA_VERSION,
+      config,
+      db,
+      instance,
+      cells,
+      arms,
+      durationS: (Date.now() - t0) / 1000,
+    };
   } finally {
     load.stop();
   }

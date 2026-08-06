@@ -71,6 +71,7 @@ export function makeResult(cells: CellResult[], over: Partial<BenchConfig> = {})
     schema: BENCH_SCHEMA_VERSION,
     config: makeConfig(over),
     db: makeDbState(),
+    instance: { imageTag: "ghcr.io/example/hindsight:v0.8.6", rerankerMaxCandidates: 150 },
     cells,
     arms: null,
     durationS: 42,
