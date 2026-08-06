@@ -36,6 +36,7 @@ import {
   hindsightGpuDecision,
   resolveHindsightGpuOverride,
   resolveHindsightCpAccessKey,
+  resolveHindsightLlmSecrets,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
@@ -786,12 +787,17 @@ export function registerMemoryCommand(program: Command): void {
             const driftConfig = getConfig(program);
             const driftLitellm = await resolveLiteLLMForHindsight(driftConfig);
             const driftPerf = { env: driftConfig.hindsight?.env };
+            // Resolve `vault:` api_key refs the SAME way the launch below does,
+            // so the drift compare is against the env we will ACTUALLY bake —
+            // otherwise a resolved live key vs a literal `vault:…` next value
+            // reads as spurious drift on every recreate.
+            const driftLlm = await resolveHindsightLlmSecrets(driftConfig.hindsight?.llm);
             const nextEnv = hindsightContainerEnvPairs({
               // The recreate rebinds the port it is already on (reusePorts);
               // fall back to the default only when it could not be read.
               apiPort: reusePorts?.apiPort ?? HINDSIGHT_DEFAULT_API_PORT,
               litellm: driftLitellm,
-              llm: driftConfig.hindsight?.llm,
+              llm: driftLlm,
               // The SAME GPU answer the launch will use, passed as a value.
               gpu: gpuDecision.enabled,
               perf: driftPerf,
@@ -808,7 +814,7 @@ export function registerMemoryCommand(program: Command): void {
             envDriftLines = formatDroppedHindsightEnvReport(
               dropped,
               hindsightResolvedCapabilities(
-                driftConfig.hindsight?.llm,
+                driftLlm,
                 driftLitellm,
                 gpuDecision.enabled,
                 driftPerf,
@@ -988,11 +994,17 @@ export function registerMemoryCommand(program: Command): void {
         const litellmCfg = await resolveLiteLLMForHindsight(hindsightConfig);
         const cpAccessKey = await resolveHindsightCpAccessKey(hindsightConfig);
         if (!cpAccessKey) console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
+        // Resolve any `vault:` refs in the LLM api_key fields through the
+        // broker BEFORE the container is launched. Without this the literal
+        // `vault:…` string is baked into HINDSIGHT_API_*_LLM_API_KEY and every
+        // retain fails auth (2026-08-06 fleet outage) — `switchroom apply`'s
+        // passphrase resolver never runs on the recreate / refresh-hindsight path.
+        const resolvedLlm = await resolveHindsightLlmSecrets(hindsightConfig.hindsight?.llm);
         startHindsight(
           ports,
           litellmCfg,
           effectiveTag,
-          hindsightConfig.hindsight?.llm,
+          resolvedLlm,
           hindsightConsumerMirrorDir(hindsightConfig),
           // The SAME answer that was printed and drop-guarded above, passed as
           // a value rather than re-derived. Re-deriving would let the launch
@@ -1053,9 +1065,14 @@ export function registerMemoryCommand(program: Command): void {
         if (!cpAccessKey) {
           console.error(chalk.yellow(`# ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
         }
+        // Resolve `vault:` api_key refs so the emitted compose file carries the
+        // real credential — the same reason the docker-run path resolves them,
+        // and the same shape the cp_access_key above already takes. An emitted
+        // literal `vault:…` would break every retain exactly like the recreate bug.
+        const snippetLlm = await resolveHindsightLlmSecrets(snippetConfig.hindsight?.llm);
         console.log(
           generateHindsightComposeSnippet(
-            snippetConfig.hindsight?.llm,
+            snippetLlm,
             hindsightConsumerMirrorDir(snippetConfig),
             // litellm: omitted ⇒ same default the docker-run path uses.
             undefined,
