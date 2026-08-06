@@ -4454,6 +4454,72 @@ COPY --chmod=0755 docker/hindsight-maintenance.sh /usr/local/lib/switchroom/hind
 # regconfig that consumes it is created idempotently by the entrypoint.
 COPY --chmod=0644 docker/hindsight-extra.stop /usr/local/lib/switchroom/hindsight_extra.stop
 
+# ParadeDB pg_search — durable BM25 text-search backend for hindsight recall.
+#
+# The native tsvector/ts_rank arm degenerated to full seq-scans on the highest-
+# frequency lexemes (claude/code/agent, folded into ~80% of rows via the
+# `context` tag). pg_search replaces it with a Tantivy-backed BM25 index. It is
+# now the default text-search backend for NEW installs (see
+# HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION in src/setup/hindsight-perf-defaults.ts).
+#
+# libopenblas0 is a HARD dependency: pg_search.so carries a DT_NEEDED on
+# libopenblas.so.0 (verified with readelf -d), so the embedded-pg postmaster
+# fails to load the preload library at boot without it. --no-install-recommends
+# still pulls libgfortran5 and libopenblas0-pthread transitively (both real
+# Depends of libopenblas0), which the .so also needs. Kept as its own layer:
+# it is stable and must NOT be invalidated by a pg_search version bump.
+RUN set -eu; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libopenblas0; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig; \
+    ldconfig -p | grep -q 'libopenblas\.so\.0' \
+      || { echo 'pg_search prereq FAILED: libopenblas.so.0 not on the loader path after install' >&2; exit 1; }; \
+    echo 'pg_search prereq ok: libopenblas.so.0 present' >&2
+
+# Stage the pg_search extension artifacts (.so + control + version SQL) at a
+# STABLE, embedded-pg-version-independent path. The entrypoint's
+# provision_pg_search() re-materializes them into the CURRENT pg0 install's
+# lib/ + share/extension/ on every boot (the pg0 data dir is a mounted volume,
+# so nothing baked under it survives) and adds pg_search to
+# shared_preload_libraries. Baking under a MAJOR-versioned subdir (18) lets the
+# entrypoint refuse to copy an ABI-mismatched .so if pg0's major ever bumps
+# ahead of this deb — see the per-PG-bump maintenance note in the entrypoint.
+#
+# Pins are DELIBERATE, no floating `latest`: the .so is loaded into the
+# postmaster via shared_preload_libraries, so a silent upstream rebuild must
+# never slip in. sha256s are the PG18/trixie release debs for both arches.
+ARG PG_SEARCH_VERSION=0.25.1
+ARG PG_SEARCH_PG_MAJOR=18
+ARG PG_SEARCH_SHA256_AMD64=7596bc87ea6e8b40df4d42ec4a98669783b7c07684a82cf18dbcfa246dd6460e
+ARG PG_SEARCH_SHA256_ARM64=ee97119251f1e47e4784334374a2bbd7d12e41a7ecb830ce813ca2f21c249d1c
+RUN set -eu; \
+    : "${TARGETARCH:=amd64}"; \
+    case "${TARGETARCH}" in \
+      amd64) _arch=amd64; _sha="${PG_SEARCH_SHA256_AMD64}";; \
+      arm64) _arch=arm64; _sha="${PG_SEARCH_SHA256_ARM64}";; \
+      *) echo "pg_search: artifact not available for TARGETARCH='${TARGETARCH}'; switchroom ships pg_search for amd64/arm64 only. The runtime default text-search backend is pg_search, so a build with no baked deb would crash-loop on CREATE EXTENSION at first boot — failing the build instead." >&2; exit 1;; \
+    esac; \
+    _deb="postgresql-${PG_SEARCH_PG_MAJOR}-pg-search_${PG_SEARCH_VERSION}-1PARADEDB-trixie_${_arch}.deb"; \
+    _url="https://github.com/paradedb/paradedb/releases/download/v${PG_SEARCH_VERSION}/${_deb}"; \
+    _tmp="$(mktemp -d)"; \
+    curl -fsSL --retry 3 -o "${_tmp}/pg_search.deb" "${_url}"; \
+    echo "${_sha}  ${_tmp}/pg_search.deb" | sha256sum -c -; \
+    dpkg-deb -x "${_tmp}/pg_search.deb" "${_tmp}/x"; \
+    _dest="/usr/local/lib/switchroom/pg_search/${PG_SEARCH_PG_MAJOR}"; \
+    mkdir -p "${_dest}/lib" "${_dest}/extension"; \
+    cp -a "${_tmp}/x/usr/lib/postgresql/${PG_SEARCH_PG_MAJOR}/lib/pg_search.so" "${_dest}/lib/"; \
+    cp -a "${_tmp}/x/usr/share/postgresql/${PG_SEARCH_PG_MAJOR}/extension/pg_search"*.control "${_dest}/extension/"; \
+    cp -a "${_tmp}/x/usr/share/postgresql/${PG_SEARCH_PG_MAJOR}/extension/pg_search"*.sql "${_dest}/extension/"; \
+    rm -rf "${_tmp}"; \
+    chmod -R a+rX /usr/local/lib/switchroom/pg_search; \
+    test -f "${_dest}/lib/pg_search.so"; \
+    test -f "${_dest}/extension/pg_search.control"; \
+    test -f "${_dest}/extension/pg_search--${PG_SEARCH_VERSION}.sql"; \
+    grep -q "default_version = '${PG_SEARCH_VERSION}'" "${_dest}/extension/pg_search.control"; \
+    echo "pg_search bake ok: ${_deb} -> ${_dest} (default_version ${PG_SEARCH_VERSION})" >&2
+
 # Backup mount point, owned by the hindsight user (UID 11000). The
 # maintenance script writes rotated pg_dumps to /backups via a named
 # volume (compose `switchroom-hindsight-backups:/backups`). A fresh named

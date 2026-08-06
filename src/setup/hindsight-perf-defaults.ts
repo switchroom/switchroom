@@ -866,6 +866,52 @@ export const HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 30;
  * instead (already on by default; see vendor/hindsight-memory/scripts/recall.py).
  */
 
+/**
+ * The text-search backend hindsight_api uses for the BM25 recall arm.
+ *
+ * switchroom defaults NEW installs to ParadeDB `pg_search` — a Tantivy-backed
+ * BM25 index that replaces the native `tsvector`/`ts_rank` arm, which on this
+ * fleet degenerated to full seq-scans on the highest-frequency lexemes
+ * (`claude`/`code`/`agent`, folded into ~80% of rows via the `context` tag).
+ * The value is one of the strings hindsight_api validates at boot
+ * (`config.py`: `("native", "vchord", "pg_textsearch", "pgroonga",
+ * "pg_search")`); anything else is a hard `ValueError`. The extension itself is
+ * provisioned durably by the image — the baked `.so` + control/sql are copied
+ * into the embedded-pg install and `pg_search` is added to
+ * `shared_preload_libraries` at boot (`docker/hindsight-entrypoint.sh`,
+ * `provision_pg_search()` + `prestart_pg0()`), so a fresh volume comes up with a
+ * working BM25 index and no operator step.
+ *
+ * ## Migration boundary — READ THIS before assuming a live fleet flips
+ *
+ * This default is safe **only for a NEW install (empty memory tables).**
+ * hindsight_api HARD-REFUSES to switch the text-search backend on a non-empty
+ * database: swapping `native` → `pg_search` requires the BM25 index to be
+ * rebuilt with a different operator class, and upstream will not silently drop
+ * and recreate it under live data. So this key going to `pg_search` does NOT
+ * migrate an existing bank on the next `switchroom apply` — the container would
+ * refuse to start against populated tables.
+ *
+ * The data migration is a DELIBERATE, operator-run manual step, NOT encoded
+ * here. An operator on a populated fleet who is not ready to migrate must pin
+ * the prior backend in `hindsight.env`:
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "native"   # stay on tsvector until migrated
+ * ```
+ *
+ * That pin SURVIVES `switchroom apply` precisely because adding the key to
+ * {@link HINDSIGHT_PERF_DEFAULTS_UNGATED} below also places it in
+ * {@link HINDSIGHT_PERF_ENV_KEYS} (the allowlist is the union of the default
+ * groups) and {@link resolveHindsightPerfOverrides} then lets the operator
+ * value replace the emitted default. Absent that allowlist membership the pin
+ * would be silently discarded and the fleet would try to boot on `pg_search`
+ * against live data — which is exactly the trap this pairing avoids.
+ */
+export const HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION = "pg_search";
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -933,6 +979,10 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
     "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
     String(HINDSIGHT_DEFAULT_GRAPH_SEED_MIN_SIMILARITY),
   ],
+  // NEW-install default only; a populated fleet migrates by hand or pins
+  // `native`. See HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION's migration-boundary
+  // note above for why this pairing (default + allowlist membership) is load-bearing.
+  ["HINDSIGHT_API_TEXT_SEARCH_EXTENSION", HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION],
 ];
 
 /** Emitted only when the container can reach a GPU. */

@@ -135,8 +135,79 @@ TS_STOP_DEST_GLOB="${SWITCHROOM_HINDSIGHT_TS_STOP_DEST_GLOB:-/home/hindsight/.pg
 # until the server accepts, so the first psql normally succeeds; this only
 # insures a slow-recovery edge. One `sleep 1` between tries.
 TS_PROVISION_TRIES="${SWITCHROOM_HINDSIGHT_TS_PROVISION_TRIES:-30}"
+# --- ParadeDB pg_search provisioning (durable BM25 backend) ------------------
+# Baked extension artifacts. docker/Dockerfile.hindsight stages pg_search.so +
+# the control + version SQL under a PG-MAJOR subdir here (…/pg_search/18/{lib,
+# extension}). Empty/missing DISABLES pg_search provisioning entirely, so an
+# older image without the bake boots exactly as before. Overridable for tests.
+PG_SEARCH_SRC_ROOT="${SWITCHROOM_HINDSIGHT_PG_SEARCH_SRC_ROOT:-/usr/local/lib/switchroom/pg_search}"
+# Glob of the embedded-pg install dir(s) to provision into. pg0 extracts a
+# fresh, version-scoped install dir on every embedded-pg bump; the .so + control
+# + SQL are re-materialized into each MAJOR-matched match on every boot (the pg0
+# data dir is a mounted volume, so nothing baked into the image survives there).
+# Overridable for host tests.
+PG_SEARCH_INSTALL_GLOB="${SWITCHROOM_HINDSIGHT_PG_SEARCH_INSTALL_GLOB:-/home/hindsight/.pg0/installation/*}"
+# The resolved text-search backend selector, read from the same env switchroom
+# emits (src/setup/hindsight-perf-defaults.ts) and hindsight_api itself reads.
+# pg_search provisioning AND the shared_preload_libraries flag are applied ONLY
+# when this is exactly `pg_search`; any other value — empty (an older switchroom
+# that does not emit it), or an operator pin of `native` on a not-yet-migrated
+# fleet — leaves the box on the native backend, byte-identical to before.
+TEXT_SEARCH_EXTENSION="${HINDSIGHT_API_TEXT_SEARCH_EXTENSION:-}"
 
 log() { echo "switchroom-hindsight-entrypoint: $*" >&2; }
+
+# Echoes the BAKED pg_search MAJOR (e.g. "18") when pg_search is the selected
+# backend AND the extension artifacts are baked into the image; empty otherwise.
+# This is the SOURCE side: provision_pg_search() uses it to locate the artifacts
+# to stage into the embedded-pg install dir. It says nothing about whether the
+# stage SUCCEEDED — see pg_search_landed_major() for the preload gate.
+pg_search_baked_major() {
+  [ "${TEXT_SEARCH_EXTENSION}" = "pg_search" ] || return 0
+  for _sofile in ${PG_SEARCH_SRC_ROOT}/*/lib/pg_search.so; do
+    [ -r "${_sofile}" ] || continue
+    _m="${_sofile%/lib/pg_search.so}"
+    _m="${_m##*/}"
+    printf '%s\n' "${_m}"
+    return 0
+  done
+  return 0
+}
+
+# Echoes the LANDED pg_search MAJOR when pg_search is the selected backend AND
+# pg_search.so has actually been COPIED into a version-scoped embedded-pg install
+# dir whose major matches the baked deb; empty otherwise. This is the DESTINATION
+# side, and it is what prestart_pg0() gates the shared_preload_libraries=pg_search
+# flag on — NOT the bake.
+#
+# WHY NOT the bake (pg_search_baked_major). The two CAN disagree: on a future pg
+# MAJOR bump that lands a new install dir AHEAD of the baked deb,
+# provision_pg_search() correctly SKIPS the copy (ABI mismatch), so the install
+# dir has no .so even though the bake still exists under PG_SEARCH_SRC_ROOT. A
+# postmaster told to preload a library that is not in its install dir REFUSES to
+# start, so gating the preload on the bake would turn that graceful copy-skip
+# into a boot crash-loop — the exact opposite of the "ABI mismatch refused
+# gracefully" contract. Gating on the landed .so degrades a skipped/failed stage
+# to "no preload -> pg0 starts plain -> hindsight_api's CREATE EXTENSION pg_search
+# surfaces the missing library loudly" — the correct, recoverable failure mode.
+#
+# The baked-major match also ignores a STALE .so left in an OLD install dir by a
+# prior boot: only a dir whose major equals the currently-baked deb can have been
+# staged with an ABI-compatible library, so that is the only major we preload.
+pg_search_landed_major() {
+  [ "${TEXT_SEARCH_EXTENSION}" = "pg_search" ] || return 0
+  _baked="$(pg_search_baked_major)"
+  [ -n "${_baked}" ] || return 0
+  for _sofile in ${PG_SEARCH_INSTALL_GLOB}/lib/pg_search.so; do
+    [ -r "${_sofile}" ] || continue
+    _d="${_sofile%/lib/pg_search.so}"
+    _ver="${_d##*/}"
+    case "${_ver%%.*}" in
+      "${_baked}") printf '%s\n' "${_baked}"; return 0 ;;
+    esac
+  done
+  return 0
+}
 
 # Stable worker identity (fix A above). `:=` only sets it when the
 # operator/compose hasn't already pinned HINDSIGHT_API_WORKER_ID, so an
@@ -346,9 +417,20 @@ prestart_pg0() {
     on) PG_FSYNC="on" ;;
     *) PG_FSYNC="" ;;
   esac
+  # pg_search preload. When pg_search is the selected backend and its .so has
+  # actually LANDED in the install dir, THIS start is the authoritative one that
+  # must set shared_preload_libraries=pg_search — a PGC_POSTMASTER GUC that only
+  # applies at server start. provision_pg_search() ran just before us, staged the
+  # .so into the install dir, and left pg0 STOPPED precisely so this start applies
+  # the preload. We gate on pg_search_landed_major() (the COPIED .so whose major
+  # matches the baked deb), not the bake: if provisioning could not stage the
+  # library — e.g. a future pg-major bump moved the install dir ahead of the
+  # baked deb and the ABI-mismatched copy was skipped — this returns empty, we do
+  # NOT preload, pg0 starts plain, and hindsight_api surfaces any real miss loudly.
+  _pg_preload_major="$(pg_search_landed_major)"
   # Nothing to apply ⇒ do not touch pg0 at all (pre-#3706 behaviour).
   [ -n "${PG_EFFECTIVE_CACHE_SIZE}" ] || [ -n "${PG_SHARED_BUFFERS}" ] ||
-    [ -n "${PG_FSYNC}" ] || return 0
+    [ -n "${PG_FSYNC}" ] || [ -n "${_pg_preload_major}" ] || return 0
 
   # Only the embedded-pg0 database is ours to pre-start. An operator pointing
   # hindsight at an external postgres (or a differently-named/ported pg0
@@ -400,16 +482,55 @@ EOF
   if [ -n "${PG_FSYNC}" ]; then
     set -- "$@" -c "fsync=${PG_FSYNC}"
   fi
+  if [ -n "${_pg_preload_major}" ]; then
+    # NOTE: this SETS shared_preload_libraries rather than appending. pg0 does
+    # not set the GUC itself, so `pg_search` is the only preloaded library. If a
+    # second preload-requiring extension is ever added, make this a
+    # comma-joined value — a second `-c shared_preload_libraries=` would NOT
+    # merge, the last one wins.
+    set -- "$@" -c "shared_preload_libraries=pg_search"
+  fi
 
   if _out="$("${_pg0}" "$@" 2>&1)"; then
-    log "pg0 pre-start ok: name=${PG0_NAME} effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-<pg0-default>} shared_buffers=${PG_SHARED_BUFFERS:-<pg0-default>} fsync=${PG_FSYNC:-<pg0-default:off>}"
+    log "pg0 pre-start ok: name=${PG0_NAME} effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-<pg0-default>} shared_buffers=${PG_SHARED_BUFFERS:-<pg0-default>} fsync=${PG_FSYNC:-<pg0-default:off>} shared_preload_libraries=$([ -n "${_pg_preload_major}" ] && echo pg_search || echo '<none>')"
     return 0
   fi
 
-  # `already running` is not a failure — some other path won the race and the
-  # instance is up; hindsight_api adopts it either way.
+  # `already running` — some path won the race and the instance is up. When NO
+  # preload is required, adopting it is fine (hindsight_api would too). But when
+  # the pg_search preload IS required (_pg_preload_major set), a postmaster that
+  # came up WITHOUT shared_preload_libraries=pg_search can never CREATE EXTENSION
+  # pg_search (PGC_POSTMASTER — the GUC only applies at start), so adopting it
+  # silently would strand the box on a boot loop or a broken text-search backend.
+  # Verify via SHOW; if the preload is absent, STOP and restart WITH it rather
+  # than adopt a preload-less postmaster (MAJOR-2). This matters when
+  # provision_pg_search()'s own `pg0 stop` failed and left a plain server up.
   if printf '%s' "${_out}" | grep -qi 'already running'; then
-    log "pg0 pre-start: instance ${PG0_NAME} already running; leaving it alone"
+    if [ -z "${_pg_preload_major}" ]; then
+      log "pg0 pre-start: instance ${PG0_NAME} already running; leaving it alone"
+      return 0
+    fi
+    _cur_preload=""
+    _psqlx="$(command -v psql 2>/dev/null || ls /home/hindsight/.pg0/installation/*/bin/psql 2>/dev/null | head -1)"
+    if [ -n "${_psqlx}" ] && [ -x "${_psqlx}" ] && [ -n "${_pport}" ]; then
+      _cur_preload="$(PGPASSWORD="${_pp}" "${_psqlx}" -U "${_pu}" -h /tmp -p "${_pport}" -d "${_pd}" -tAc 'SHOW shared_preload_libraries' 2>/dev/null || true)"
+    fi
+    case "${_cur_preload}" in
+      *pg_search*)
+        log "pg0 pre-start: instance ${PG0_NAME} already running WITH pg_search preload; adopting"
+        return 0
+        ;;
+    esac
+    log "WARNING: pg0 pre-start: instance ${PG0_NAME} already running WITHOUT pg_search preload; stopping to restart with shared_preload_libraries=pg_search"
+    if _stout="$("${_pg0}" stop --name "${PG0_NAME}" 2>&1)"; then
+      if _out2="$("${_pg0}" "$@" 2>&1)"; then
+        log "pg0 pre-start ok (restarted to apply pg_search preload): name=${PG0_NAME} shared_preload_libraries=pg_search"
+        return 0
+      fi
+      log "WARNING: pg0 pre-start: restart-with-preload failed; hindsight_api's CREATE EXTENSION pg_search will surface it. detail: $(printf '%s' "${_out2}" | tr '\n' ' ' | cut -c1-300)"
+      return 0
+    fi
+    log "WARNING: pg0 pre-start: could not stop the already-running instance to apply the pg_search preload; adopting the preload-less postmaster (CREATE EXTENSION pg_search will fail loudly). detail: $(printf '%s' "${_stout}" | tr '\n' ' ' | cut -c1-300)"
     return 0
   fi
 
@@ -592,6 +713,186 @@ EOF
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# ParadeDB pg_search provisioning (durable BM25 backend).
+#
+# pg_search is a Postgres extension whose LIBRARY (pg_search.so, ~180MB) is
+# loaded into the postmaster via shared_preload_libraries and whose control+SQL
+# live in the embedded-pg install's share/extension. Both are baked into the
+# image at a STABLE path (docker/Dockerfile.hindsight) but must be re-copied
+# into pg0's version-scoped install dir on every boot, because that dir lives on
+# a mounted volume the image content cannot reach — the same durability problem
+# provision_text_search() solves for the stopword file, and the same fix.
+#
+# THE ORDERING PROBLEM this function exists to solve. shared_preload_libraries
+# is PGC_POSTMASTER: it only takes effect at server start, and a server told to
+# preload a library that is not present FAILS to start. On a FRESH volume the
+# install dir does not exist until pg0 first extracts it, so we cannot copy the
+# .so before pg0 has run at least once — but we must not hand the very first
+# start a preload it cannot satisfy. So:
+#   (1) start pg0 PLAIN (no preload) — this extracts the install dir and can
+#       never fail on the not-yet-copied library;
+#   (2) copy the .so + control + SQL into every MAJOR-matched install dir;
+#   (3) STOP pg0, so the NEXT start — prestart_pg0(), which runs immediately
+#       after us — is the authoritative one that sets
+#       shared_preload_libraries=pg_search against a now-present library.
+# On a reboot the install dir already exists, so step (1) is skipped and this is
+# just an idempotent re-copy + a stop of a server that was not running.
+#
+# BEST-EFFORT BY CONSTRUCTION. Every failure path returns 0. Gated entirely on
+# pg_search_baked_major() — a stock native fleet (selector != pg_search, or an
+# older image with no bake) never enters here and is byte-identical to before.
+#
+# ── EXISTING-INSTALL MIGRATION BOUNDARY (read before assuming this migrates) ──
+# This function makes a NEW (empty) database come up on pg_search. It does NOT,
+# and MUST NOT, migrate a POPULATED database from the native tsvector backend:
+# hindsight_api HARD-REFUSES a text-search backend switch on non-empty memory
+# tables (the BM25 index must be rebuilt under a different operator class, which
+# upstream will not silently do under live data). The data migration is a
+# DELIBERATE operator-run step (pg_dump backup → drop the native search index →
+# flip HINDSIGHT_API_TEXT_SEARCH_EXTENSION → restart so this provisioning +
+# prestart_pg0 preload run → let hindsight_api rebuild the BM25 index). An
+# operator not ready to migrate pins `native` in hindsight.env; that pin
+# survives `switchroom apply` (the key is on HINDSIGHT_PERF_ENV_KEYS) and this
+# function no-ops. Nothing here touches operator data.
+provision_pg_search() {
+  _psm="$(pg_search_baked_major)"
+  [ -n "${_psm}" ] || return 0
+
+  # Only the embedded pg0 database is ours to provision — never an operator's
+  # external postgres.
+  case "${HINDSIGHT_API_DB_URL:-pg0}" in
+    pg0 | "pg0://${PG0_NAME}") : ;;
+    *)
+      log "pg_search provisioning skipped: HINDSIGHT_API_DB_URL=${HINDSIGHT_API_DB_URL:-} is not the default embedded instance"
+      return 0
+      ;;
+  esac
+
+  _src_lib="${PG_SEARCH_SRC_ROOT}/${_psm}/lib/pg_search.so"
+  _src_ext="${PG_SEARCH_SRC_ROOT}/${_psm}/extension"
+  if [ ! -r "${_src_lib}" ] || [ ! -d "${_src_ext}" ]; then
+    log "WARNING: pg_search provisioning: baked artifacts missing (${_src_lib}); skipping"
+    return 0
+  fi
+
+  _pg0="${PG0_BIN}"
+  if [ -z "${_pg0}" ]; then
+    _pg0="$(command -v pg0 2>/dev/null || ls /app/api/.venv/lib/python3.*/site-packages/pg0/bin/pg0 2>/dev/null | head -1)"
+  fi
+  if [ -z "${_pg0}" ] || [ ! -x "${_pg0}" ]; then
+    log "WARNING: pg_search provisioning: pg0 binary not found; skipping (CREATE EXTENSION pg_search will fail if the .so is absent)"
+    return 0
+  fi
+
+  # (1) On a FRESH volume the install dir does not exist until pg0 extracts it.
+  # Start pg0 PLAIN so the extraction can never fail on the not-yet-copied
+  # library. Reuse the descriptor's identity when present (never rewrite creds);
+  # on first boot use hindsight_api's own defaults + pg0 auto-port, exactly like
+  # prestart_pg0 / provision_text_search.
+  _have_install=0
+  for _id in ${PG_SEARCH_INSTALL_GLOB}; do
+    [ -d "${_id}/lib" ] || continue
+    _have_install=1
+    break
+  done
+  if [ "${_have_install}" != 1 ]; then
+    _pu="hindsight"; _pp="hindsight"; _pd="hindsight"; _pport=""
+    if [ -r "${PG0_INSTANCE}" ]; then
+      if { read -r _v_u; read -r _v_d; read -r _v_p; read -r _v_pw; } <<EOF
+$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("username","hindsight"));print(d.get("database","hindsight"));print(d.get("port",""));print(d.get("password","hindsight"))' "${PG0_INSTANCE}" 2>/dev/null)
+EOF
+      then
+        if [ -n "${_v_u}" ]; then _pu="${_v_u}"; fi
+        if [ -n "${_v_d}" ]; then _pd="${_v_d}"; fi
+        if [ -n "${_v_pw}" ]; then _pp="${_v_pw}"; fi
+        if [ -n "${_v_p}" ]; then _pport="${_v_p}"; fi
+      fi
+    fi
+    set -- start --name "${PG0_NAME}" --username "${_pu}" --password "${_pp}" --database "${_pd}"
+    if [ -n "${_pport}" ]; then set -- "$@" --port "${_pport}"; fi
+    if _sout="$("${_pg0}" "$@" 2>&1)"; then
+      :
+    elif printf '%s' "${_sout}" | grep -qi 'already running'; then
+      :
+    else
+      log "WARNING: pg_search provisioning: initial pg0 start failed; skipping copy (CREATE EXTENSION pg_search will fail). detail: $(printf '%s' "${_sout}" | tr '\n' ' ' | cut -c1-200)"
+      return 0
+    fi
+  fi
+
+  # (2) Re-materialize the extension into every MAJOR-matched install dir. A
+  # version bump that lands a NEW major ahead of the baked deb is skipped with a
+  # loud warning rather than copying an ABI-mismatched .so (which would crash the
+  # postmaster on preload) — bump PG_SEARCH_* in the Dockerfile to match.
+  _placed=0
+  for _id in ${PG_SEARCH_INSTALL_GLOB}; do
+    [ -d "${_id}/lib" ] || continue
+    _ver="${_id##*/}"
+    case "${_ver}" in
+      "${_psm}" | "${_psm}".*) : ;;
+      *)
+        log "WARNING: pg_search provisioning: install ${_ver} major != baked ${_psm}; NOT copying (ABI mismatch — bump the baked pg_search deb)"
+        continue
+        ;;
+    esac
+    [ -d "${_id}/share/extension" ] || mkdir -p "${_id}/share/extension" 2>/dev/null || true
+    if cp -f "${_src_lib}" "${_id}/lib/pg_search.so" 2>/dev/null &&
+      cp -f "${_src_ext}/"pg_search*.control "${_id}/share/extension/" 2>/dev/null &&
+      cp -f "${_src_ext}/"pg_search*.sql "${_id}/share/extension/" 2>/dev/null; then
+      _placed=1
+    else
+      log "WARNING: pg_search provisioning: copy into ${_id} failed"
+    fi
+  done
+  if [ "${_placed}" != 1 ]; then
+    log "WARNING: pg_search provisioning: no major-matched install dir under ${PG_SEARCH_INSTALL_GLOB}; extension NOT staged (CREATE EXTENSION pg_search will fail)"
+  else
+    log "pg_search provisioning ok: staged pg_search.so + control + sql (major ${_psm}) into embedded-pg install"
+  fi
+
+  # (3) Stop pg0 so prestart_pg0 can (re)start it with
+  # shared_preload_libraries=pg_search — a PGC_POSTMASTER GUC that only applies
+  # at server start. `pg0 stop` blocks until the postmaster has fully exited, so
+  # on success the instance is confirmed DOWN and prestart_pg0's start cannot
+  # race it. But this stop MUST actually take effect: if an up-but-preload-less
+  # postmaster survives here and prestart_pg0 then sees "already running", the
+  # preload never gets applied and CREATE EXTENSION pg_search crash-loops. So on
+  # a non-"already-down" stop failure we do NOT silently proceed — we re-verify
+  # with a bounded, idempotent second stop (a down server reports "not running")
+  # and loud-warn if the instance is still up, leaving prestart_pg0's own
+  # SHOW-verify branch as the backstop rather than a silent adopt.
+  if _stout="$("${_pg0}" stop --name "${PG0_NAME}" 2>&1)"; then
+    :
+  else
+    case "${_stout}" in
+      *"not running"* | *"no server"* | *"not found"* | *"No such"*) : ;;
+      *)
+        log "pg_search provisioning: pg0 stop returned: $(printf '%s' "${_stout}" | tr '\n' ' ' | cut -c1-200)"
+        # Confirm the postmaster is actually down before returning. Re-issue stop
+        # up to a few times; a down instance reports the not-running family.
+        _down=0
+        _try=0
+        while [ "${_try}" -lt 5 ]; do
+          _try=$((_try + 1))
+          if _vout="$("${_pg0}" stop --name "${PG0_NAME}" 2>&1)"; then
+            _down=1
+            break
+          fi
+          case "${_vout}" in
+            *"not running"* | *"no server"* | *"not found"* | *"No such"*) _down=1; break ;;
+          esac
+          sleep 1
+        done
+        if [ "${_down}" != 1 ]; then
+          log "WARNING: pg_search provisioning: pg0 instance ${PG0_NAME} still running after stop; prestart_pg0 will SHOW-verify the preload and restart or fail loudly rather than adopt it"
+        fi
+        ;;
+    esac
+  fi
+  return 0
+}
+
 # 1. Wait for the broker socket. The broker may still be starting on
 # the host when this container boots (no cross-project depends_on).
 i=0
@@ -650,11 +951,21 @@ export CLAUDE_CONFIG_DIR="${CRED_DIR}"
 # 4b. Boot-deferred stale-claim reaper (does not block boot; see fn header).
 reap_stale_processing_when_ready || true
 
+# 4b2. pg_search staging (durable BM25 backend). MUST run before prestart_pg0:
+# it stages the extension .so into pg0's install dir and leaves pg0 STOPPED so
+# prestart_pg0's start is the one that sets shared_preload_libraries=pg_search
+# (a PGC_POSTMASTER GUC). No-op unless pg_search is the selected backend AND the
+# artifacts are baked in. Synchronous + best-effort — see provision_pg_search().
+provision_pg_search || true
+
 # 4c. pg0 sizing pre-start (#3706). MUST run before the exec: hindsight_api's
 # ensure_running() adopts an already-running instance without re-applying
 # config, which is the only reason we can set these at all. Synchronous by
 # necessity (a background race would let hindsight_api win and start pg0
 # untuned); bounded by pg0's own start, and best-effort — see prestart_pg0().
+# When pg_search is the selected backend this is also the start that applies
+# shared_preload_libraries=pg_search against the library provision_pg_search
+# just staged (which is why that ran first and left pg0 stopped).
 prestart_pg0 || true
 
 # 4d. Text-search provisioning (durable stopword config). MUST run before the
