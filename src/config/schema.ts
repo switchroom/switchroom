@@ -5164,6 +5164,77 @@ export const UserSchema = z.object({
 });
 export type User = z.infer<typeof UserSchema>;
 
+/**
+ * Config-repo change control (`config_repo:`) — the operator's private
+ * `~/.switchroom-config` git repo as a first-class, product-managed backup +
+ * change-control target. Sibling of `vault:`.
+ *
+ * Historically the repo was fed by a hand-written `sync.sh` (copy live → repo,
+ * `git commit`, no push, no schedule, no secret scan). `switchroom config-repo
+ * sync` ports that natively and closes the gaps `sync.sh` left open:
+ *   - a `flock` so a manual run and a scheduled tick can never interleave;
+ *   - a symlink-target guard replacing `cp -L` (never follow a workspace
+ *     symlink out to `credentials/*.env` or any path outside the agent tree);
+ *   - a commit-time secret scan (the same `scanBundleForSecrets` engine that
+ *     gates the personal-skill write path) so a secret that arrived by a
+ *     direct rw-mount write — bypassing the in-container scan — is still caught
+ *     before it is committed;
+ *   - force-adding each `agents/<name>/personal-skills/` slice so the 84
+ *     mirrored personal skills that `.gitignore`'s blanket `agents/` leaves
+ *     untracked are finally captured (GAP A);
+ *   - a `require_private` push gate: refuse to auto-push unless the GitHub API
+ *     confirms the remote is private.
+ *
+ * The block is OPTIONAL and OFF by default — nothing changes for operators who
+ * do not set it. Push auth rides the operator's existing `gh` credential
+ * helper; no new secret is created and nothing moves into a container.
+ */
+export const ConfigRepoConfigSchema = z.object({
+  enabled: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Master switch for config-repo change control. Default false (opt-in). " +
+      "When false the `config-repo sync` verb still runs on demand but the " +
+      "doctor check and (later) the scheduled tick treat the feature as off.",
+    ),
+  path: z
+    .string()
+    .regex(
+      /^[a-zA-Z0-9~._\-/]+$/,
+      "config_repo.path must not contain shell-special characters ($, `, \", ', \\, etc.)",
+    )
+    .default("~/.switchroom-config")
+    .describe(
+      "Filesystem path to the operator's private config repo. Must be a git " +
+      "repo (else `switchroom doctor` FAILs). Tilde-expanded at read time.",
+    ),
+  push: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true, `config-repo sync` pushes after committing (subject to the " +
+      "`require_private` gate). When false, it commits locally only — useful " +
+      "for offline hosts or a review-before-push workflow.",
+    ),
+  remote: z
+    .string()
+    .min(1)
+    .default("origin")
+    .describe("Git remote name to push to. Default `origin`."),
+  require_private: z
+    .boolean()
+    .default(true)
+    .describe(
+      "Refuse to PUSH unless the GitHub API confirms the remote repo is " +
+      "private. On a public remote — or when the API is unreachable — the " +
+      "push is skipped (commits still land locally) and a WARN is emitted. " +
+      "Fail-safe against exfiltrating memory files / workspace state to a " +
+      "repo that has been flipped public. Default true.",
+    ),
+});
+export type ConfigRepoConfig = z.infer<typeof ConfigRepoConfigSchema>;
+
 export const SwitchroomConfigSchema = z.object({
   switchroom: z.object({
     version: z.literal(1).describe("Config schema version"),
@@ -5219,6 +5290,12 @@ export const SwitchroomConfigSchema = z.object({
     "the next `switchroom apply` / `memory setup --recreate`.",
   ),
   vault: VaultConfigSchema.optional(),
+  config_repo: ConfigRepoConfigSchema.optional().describe(
+    "Change control for the operator's private ~/.switchroom-config git repo " +
+    "(backup + audit trail of live host config, agent workspace state, and " +
+    "mirrored personal skills). Consumed by `switchroom config-repo sync` and " +
+    "the `config repo` doctor check. Optional and OFF by default.",
+  ),
   auth: z
     .object({
       active: z
