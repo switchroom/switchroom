@@ -369,6 +369,33 @@ function loadAllowlist(root) {
  * @returns {{status: 'pass'|'skip'|'fail', lines: string[]}}
  */
 export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
+  // GitHub's merge queue builds a synthetic squash-merge commit SERVER-SIDE at
+  // merge time and pushes it to a `gh-readonly-queue/main/...` ref, firing this
+  // workflow with `GITHUB_EVENT_NAME=merge_group`. That commit inherits the
+  // PR's `Co-authored-by: Claude ...` trailer — so `isMachineAuthored` is true —
+  // but the in-container `prepare-commit-msg` hook cannot reach it: GitHub, not
+  // an agent container, authored it, so it carries no `Switchroom-*` trailers,
+  // and when the PR body puts prose between the trailer paragraphs the fold in
+  // `parseTrailers` cannot recover them either. Enforcing here reds a PR whose
+  // REAL branch commits were already inspected and passed at the `pull_request`
+  // event — by THIS same script via the required `lint` context, and again by
+  // `agent-attribution.yml`'s always-on `agent-trailers` job. So a merge_group
+  // run is a guaranteed false positive on an unstampable synthetic commit; skip
+  // it. Attribution is NOT weakened: the enforcing pass is the pull_request one,
+  // which still runs on every PR and is what actually gates the branch commits.
+  // (Allowlisting can't fix this — the synthetic SHA changes on every requeue.)
+  if (env.GITHUB_EVENT_NAME === 'merge_group') {
+    return {
+      status: 'skip',
+      lines: [
+        'check-agent-attribution-trailers: SKIP — merge_group event.',
+        '  The merge queue builds a synthetic squash-merge commit server-side that',
+        '  the in-container hook cannot stamp. Attribution was already enforced on',
+        "  the PR's real branch commits at the pull_request event.",
+      ],
+    }
+  }
+
   const range = resolveRange(cwd, env)
   if (!range) {
     return {
