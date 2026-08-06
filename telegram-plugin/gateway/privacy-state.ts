@@ -70,6 +70,10 @@ export const PRIVATE_ON_REPLY =
 export const PUBLIC_REPLY =
   '🔓 Public mode — memory writing resumed. The private stretch was excluded from memory.'
 
+/** Loud alert posted when a genuine session start reset a leftover open interval. */
+export const SESSION_RESET_ALERT =
+  '🔓 New session — memory writing is ON by default. Private mode from the previous session was reset.'
+
 /**
  * Agent state dir — set by start.sh; resolved identically to
  * `self-improve-stop.ts:resolveStateDir()` so the gateway writer and the
@@ -171,4 +175,32 @@ export function closePrivateInterval(
 /** Truncate the state file back to the public default. */
 export function resetToPublic(stateDir: string = resolvePrivacyStateDir()): void {
   writePrivacyState(emptyPrivacyState(), stateDir)
+}
+
+/** Outcome of a session-start reset. */
+export interface SessionResetResult {
+  /** True iff an OPEN interval existed and was reset (a private→public transition). */
+  hadOpenInterval: boolean
+}
+
+/**
+ * Reset privacy to public at a GENUINE session start (cold boot / crash /
+ * planned restart / `/clear`). Always truncates the state file. If — and only
+ * if — an OPEN interval existed (the previous session ended still private),
+ * `onOpenIntervalReset` is invoked so the caller can post the loud alert. When
+ * the previous session was already public there is no transition, so no alert
+ * fires (silent reset).
+ *
+ * The alert is delegated to a callback rather than sent here so this module
+ * stays free of gateway/bot dependencies and unit-testable in isolation.
+ */
+export function resetPrivacyOnGenuineSessionStart(opts: {
+  stateDir?: string
+  onOpenIntervalReset?: () => void
+} = {}): SessionResetResult {
+  const stateDir = opts.stateDir ?? resolvePrivacyStateDir()
+  const hadOpenInterval = isPrivate(readPrivacyState(stateDir))
+  resetToPublic(stateDir)
+  if (hadOpenInterval) opts.onOpenIntervalReset?.()
+  return { hadOpenInterval }
 }
