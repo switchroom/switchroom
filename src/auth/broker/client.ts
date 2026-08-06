@@ -252,6 +252,12 @@ export interface AgentState {
   name: string;
   account: string;
   override: string | null;
+  /** Hard pin: the broker never serves this agent from another account.
+   *  Absent on pre-flag brokers — treat undefined as false. */
+  strict?: boolean;
+  /** Owner-locked: the pinned account is never served to anyone else.
+   *  Absent on pre-flag brokers — treat undefined as false. */
+  exclusive?: boolean;
 }
 
 export interface ConsumerState {

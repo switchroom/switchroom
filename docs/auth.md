@@ -129,6 +129,13 @@ the broker via `switchroom apply` / `agent restart`):
   `/auth use` onto it, `auth agent override <other> <label>`, and
   failover candidate selection all skip it for anyone but the owner.
 
+Because the flags bind to the yaml-declared account,
+`auth agent override` refuses to move or clear a strict/exclusive
+pin over the socket — edit the yaml and restart the broker instead.
+A persisted `/auth use` swap that predates an `exclusive:` flag is
+dropped at broker boot (yaml wins), so marking an account exclusive
+retroactively revokes any earlier fleet-wide swap onto it.
+
 Use both together for full two-way isolation: one agent on the work
 account, the work account on one agent, no leakage in either
 direction.

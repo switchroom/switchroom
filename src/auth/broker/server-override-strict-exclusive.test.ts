@@ -19,7 +19,7 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as net from "node:net";
@@ -193,12 +193,22 @@ describe("AuthBroker — strict pin (never borrow another account)", () => {
     const broker = await makeStrictPinBroker(h, { strict: true });
     const resp = await rpc(join(h.socketRoot, "pinned", "sock"), {
       v: 1, id: "2", op: "mark-exhausted", until: Date.now() + 60_000,
-    }) as { ok: boolean; data: { account: string; rolled: string[] } };
+    }) as { ok: boolean; data: { account: string; rolled: string[]; rolledTo: string | null } };
     expect(resp.ok).toBe(true);
     // Attribution stays on the pin…
     expect(resp.data.account).toBe("dedicated");
-    // …and the strict agent is NOT in the rolled set (its mirror keeps the pin).
+    // …the strict agent is NOT in the rolled set…
     expect(resp.data.rolled).not.toContain("pinned");
+    // …and the CALLER-visible rolledTo is null: a non-null value makes the
+    // gateway announce "switched to X" and resume the turn straight back
+    // into the wall (resume → 429 → mark loop).
+    expect(resp.data.rolledTo).toBeNull();
+    // The mirror FILE itself still carries the pin's credentials — `rolled`
+    // omitting the agent is a report, this is the ground truth.
+    const mirror = JSON.parse(readFileSync(
+      join(h.agentsDir, "pinned", ".claude", ".credentials.json"), "utf-8",
+    )) as { claudeAiOauth: { accessToken: string } };
+    expect(mirror.claudeAiOauth.accessToken).toBe("at-dedicated");
     // Serving path agrees: still the pin, even mid-exhaustion-window.
     const serve = await rpc(join(h.socketRoot, "pinned", "sock"), {
       v: 1, id: "3", op: "get-credentials",
@@ -297,6 +307,69 @@ describe("AuthBroker — exclusive pin (account is unroutable to anyone else)", 
     }) as { ok: boolean; data: { agent: string; account: string } };
     expect(resp.ok).toBe(true);
     expect(resp.data.account).toBe("work");
+    broker.stop();
+  });
+
+  it("set-override MOVING a strict/exclusive owner's pin elsewhere is refused (yaml-only contract)", async () => {
+    const h = makeHarness();
+    const broker = await makeExclusiveBroker(h);
+    // Moving would carry `exclusive` onto `primary` — locking the fleet
+    // active out of its own rotation until restart.
+    const move = await rpc(join(h.socketRoot, "adm", "sock"), {
+      v: 1, id: "1", op: "set-override", agent: "workbot", account: "primary",
+    }) as { ok: boolean; error?: { code: string; message: string } };
+    expect(move.ok).toBe(false);
+    expect(move.error?.code).toBe("FORBIDDEN");
+    expect(move.error?.message).toContain("switchroom.yaml");
+    // Clearing would leave the flag dangling with no pin — also refused.
+    const clear = await rpc(join(h.socketRoot, "adm", "sock"), {
+      v: 1, id: "2", op: "set-override", agent: "workbot", account: null,
+    }) as { ok: boolean; error?: { code: string } };
+    expect(clear.ok).toBe(false);
+    expect(clear.error?.code).toBe("FORBIDDEN");
+    broker.stop();
+  });
+
+  it("a stale persisted active-override naming a now-exclusive account is DROPPED at boot", async () => {
+    // The 2026-08 review's critical finding: `/auth use corp` persists an
+    // active-override; yaml later marks corp exclusive to one agent. Schema
+    // validation only sees yaml's own auth.active, so without the boot-time
+    // drop the override re-applies and serves corp fleet-wide while healthy.
+    const h = makeHarness();
+    seedAccount(h, "work");
+    seedAccount(h, "primary");
+    mkdirSync(h.stateDir, { recursive: true });
+    writeFileSync(
+      join(h.stateDir, "active-override.json"),
+      JSON.stringify({
+        active: "work",
+        yaml_active_at_write: "primary", // matches yaml → would survive pre-fix
+        updated_at: Date.now(),
+      }),
+      { mode: 0o600 },
+    );
+    const config = makeConfig(h, {
+      active: "primary",
+      fallback_order: ["primary"],
+      agents: {
+        workbot: { auth: { override: "work", strict: true, exclusive: true } },
+        other: {},
+      },
+    });
+    mkdirSync(join(h.agentsDir, "workbot"), { recursive: true });
+    mkdirSync(join(h.agentsDir, "other"), { recursive: true });
+    const broker = new AuthBroker(config, {
+      home: h.home, stateDir: h.stateDir, socketRoot: h.socketRoot, disableRefreshLoop: true,
+      _testFetchQuota: async () => healthyQuota(),
+    });
+    await broker.start();
+    // The override-less agent must be served the YAML active, not the
+    // persisted (now-exclusive) swap target.
+    const resp = await rpc(join(h.socketRoot, "other", "sock"), {
+      v: 1, id: "1", op: "get-credentials",
+    }) as { ok: boolean; data: { account: string } };
+    expect(resp.ok).toBe(true);
+    expect(resp.data.account).toBe("primary");
     broker.stop();
   });
 });

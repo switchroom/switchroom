@@ -2102,6 +2102,30 @@ export class AuthBroker {
     forAgent?: string,
   ): string | null {
     if (!account) return null;
+    // The BASE account can itself be exclusive to someone else — reachable
+    // when hot-mutated or persisted state escaped both the yaml validator and
+    // the applyActiveOverride drop (defense-in-depth). Never serve it: pick
+    // the first healthy servable fallback, else the servable active, else
+    // DENY (null) — an honest ACCOUNT_NOT_FOUND beats leaking the exclusive
+    // account's credentials to a non-owner.
+    if (!this.isServableBy(account, forAgent)) {
+      for (const cand of this.config.auth?.fallback_order ?? []) {
+        if (cand === account || this.isAccountExhausted(cand)) continue;
+        if (!this.isServableBy(cand, forAgent)) continue;
+        if (readAccountCredentials(cand, this.home)) return cand;
+      }
+      const active = this.config.auth?.active;
+      if (
+        active &&
+        active !== account &&
+        !this.isAccountExhausted(active) &&
+        this.isServableBy(active, forAgent) &&
+        readAccountCredentials(active, this.home)
+      ) {
+        return active;
+      }
+      return null;
+    }
     const exhausted = this.isAccountExhausted(account);
     // Soft-avoid (#3031): a non-exhausted account still serves, but when it
     // sits in the soft-avoid tier we PREFER a fully-eligible fallback. With
@@ -2268,7 +2292,11 @@ export class AuthBroker {
     const agents = Object.entries(this.config.agents ?? {}).map(([name, agent]) => {
       const override = agent.auth?.override ?? null;
       const account = override ?? auth.active ?? "";
-      return { name, account, override };
+      // Pin posture (additive fields): renderers can flag a hard pin and an
+      // owner-locked account instead of showing them as fleet-poolable.
+      const strict = Boolean(override && agent.auth?.strict);
+      const exclusive = Boolean(override && agent.auth?.exclusive);
+      return { name, account, override, strict, exclusive };
     });
     const consumers = (auth.consumers ?? []).map((c) => ({
       name: c.name,
@@ -2998,6 +3026,21 @@ export class AuthBroker {
     socket.write(encodeSuccess(id, { active: account, fanned }));
   }
 
+  /**
+   * `rolledTo` as seen by the CALLER. A strict-pinned agent is skipped by
+   * `fanoutFailoverTo`, so its mirror kept the pin — but the fleet-level
+   * `rolledTo` would still be non-null whenever a target existed. Gateways
+   * key "switched to X" announcements AND the resume nudge off a non-null
+   * `rolledTo`; advertising a switch that did not happen to this caller
+   * re-runs the turn straight back into the wall (resume → 429 → mark loop).
+   * Null for a strict caller; pass-through for everyone else.
+   */
+  private callerRolledTo(identity: Identity, rolledTo: string | null): string | null {
+    if (identity.kind !== "agent") return rolledTo;
+    const a = (this.config.agents ?? {})[identity.name]?.auth;
+    return a?.override && a?.strict ? null : rolledTo;
+  }
+
   private async opMarkExhausted(
     socket: net.Socket,
     id: string,
@@ -3012,7 +3055,11 @@ export class AuthBroker {
     }
     const { rolled, rolledTo } = await this.markExhaustedAndRoll(account, until, identity);
     this.audit({ op: "mark-exhausted", identity, account, accountKind: "claude", ok: true });
-    socket.write(encodeSuccess(id, { account, rolled, rolledTo }));
+    socket.write(encodeSuccess(id, {
+      account,
+      rolled,
+      rolledTo: this.callerRolledTo(identity, rolledTo),
+    }));
   }
 
   /**
@@ -3087,7 +3134,7 @@ export class AuthBroker {
           // response shape holds; the probe-only caller ignores this field.
           throttled_until: this.quota[account]?.throttled_until ?? 0,
           escalated,
-          rolledTo: escalated ? rolledTo : null,
+          rolledTo: escalated ? this.callerRolledTo(identity, rolledTo) : null,
         }),
       );
       return;
@@ -3152,7 +3199,7 @@ export class AuthBroker {
         account,
         throttled_until: throttledUntil,
         escalated,
-        rolledTo: escalated ? rolledTo : null,
+        rolledTo: escalated ? this.callerRolledTo(identity, rolledTo) : null,
       }),
     );
   }
@@ -4223,6 +4270,28 @@ export class AuthBroker {
         return;
       }
     }
+    // Refuse MOVING or CLEARING a strict/exclusive pin over the socket. The
+    // flags are yaml-only and bind to the yaml-declared account: a hot move
+    // would either carry `exclusive` onto an account yaml never marked
+    // (locking a fleet fallback out of rotation until restart) or leave the
+    // flag dangling with no pin. Idempotent re-pin to the same account stays
+    // allowed. Edit switchroom.yaml + restart the broker to change these.
+    {
+      const curAuth = (this.config.agents ?? {})[agentName]?.auth;
+      if (
+        (curAuth?.strict || curAuth?.exclusive) &&
+        account !== (curAuth?.override ?? null)
+      ) {
+        this.audit({ op: "set-override", identity, account: account ?? undefined, accountKind: "claude", ok: false, error: "yaml-pinned" });
+        socket.write(encodeError(
+          id,
+          "FORBIDDEN",
+          `agent '${agentName}' has a strict/exclusive pin declared in switchroom.yaml — ` +
+          `edit the yaml (agents.${agentName}.auth) and restart the broker to change it.`,
+        ));
+        return;
+      }
+    }
     const agents = { ...(this.config.agents ?? {}) };
     const cur = agents[agentName];
     const auth = { ...(cur.auth ?? {}) };
@@ -5061,6 +5130,20 @@ export class AuthBroker {
       process.stdout.write(
         `auth-broker: active-override ignored — account '${ov.active}' not found on disk\n`,
       );
+      return;
+    }
+    // A persisted swap can predate an `exclusive` flag added to yaml since:
+    // schema validation only sees yaml's own `auth.active`, so a stale
+    // override naming a now-exclusive account would re-apply at every boot
+    // and serve the account fleet-wide. Drop it (not just ignore) — yaml is
+    // the source of truth for exclusivity and the swap is no longer legal.
+    const exclusiveOwner = this.exclusiveOwnerOf(ov.active);
+    if (exclusiveOwner) {
+      process.stdout.write(
+        `auth-broker: active-override dropped — account '${ov.active}' is now exclusive ` +
+          `to agent '${exclusiveOwner}' (agents.${exclusiveOwner}.auth.exclusive); yaml wins\n`,
+      );
+      try { unlinkSync(join(this.stateDir, "active-override.json")); } catch { /* best-effort */ }
       return;
     }
     if (ov.active === this.config.auth?.active) return;
