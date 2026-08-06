@@ -30,6 +30,18 @@ import { resolveSelfImproveConfig } from "./config.js";
 export const REVIEW_SOURCE = "self_improve_review";
 
 /**
+ * The leading title line of a self-improvement CARD — the ONE sanctioned
+ * operator-facing output of a review turn. MUST stay byte-identical to
+ * `SELF_IMPROVEMENT_TITLE` in
+ * `telegram-plugin/hooks/audience-classify.mjs`: the review turn emits a message
+ * opening with this line, and the backstop's card gate (`isSelfImprovementCard`)
+ * delivers it ONLY because it opens with exactly this string. A drift would make
+ * every surfacing card fall through the gate and be suppressed as raw reasoning.
+ * `tests/self-improve-review-audience.test.ts` pins the equality.
+ */
+export const SELF_IMPROVEMENT_CARD_TITLE = "🔧 **Self-improvement**";
+
+/**
  * The banner that opens every review prompt. Single source of truth so the
  * builder (below) and the review-turn DETECTOR (`isReviewTurn`) can never
  * drift apart — a drift there is exactly what let the re-fire loop through
@@ -80,8 +92,7 @@ export function buildReviewPrompt(signals: LearningSignal[]): string {
       "Run a focused, forked review. Use ONLY memory tools (recall/retain/" +
       "directives) and skill read/write tools (Read/Write/Edit under your " +
       "own .claude/skills/, skill_* / skill-personal). Do NOT touch " +
-      "anything else, do NOT reply to the operator, and end the turn when " +
-      "done.",
+      "anything else, and do NOT reply to the operator with tools.",
   );
   lines.push("");
   lines.push("Signals detected this turn:");
@@ -132,6 +143,44 @@ export function buildReviewPrompt(signals: LearningSignal[]): string {
     `Rate limits in effect: <= ${cfg.maxAutoAppliesPerDay} auto-applies/day, ` +
       `<= ${cfg.maxOutstandingPending} outstanding pending suggestions. If a ` +
       "limit is reached, stop and leave a note rather than forcing the change.",
+  );
+
+  // ── The operator-facing output contract (Ken, 2026-08-07) ────────────────
+  // A review turn is OFF the operator reply path (its inbound targets a
+  // placeholder chat). Its ONE operator-facing output is the final text of this
+  // turn, and the backstop only lets it through when it is a well-formed card
+  // (leading `SELF_IMPROVEMENT_CARD_TITLE` — see `isSelfImprovementCard`). Raw
+  // reasoning as trailing text is SUPPRESSED, so it can never leak again. Lock
+  // the exact shape here so the model emits what the gate expects.
+  lines.push("");
+  lines.push(
+    "OPERATOR OUTPUT — READ CAREFULLY. You have exactly ONE operator-facing " +
+      "message this turn, and it is the FINAL TEXT you write (not a tool call).",
+  );
+  lines.push(
+    "  - If you actioned NOTHING this turn (deduped, no-op, already handled, or " +
+      "nothing worth the operator's attention), write NO final text at all — " +
+      "end the turn SILENTLY. Do NOT narrate your reasoning; trailing reasoning " +
+      "prose is suppressed and never reaches the operator.",
+  );
+  lines.push(
+    "  - If you surfaced a REAL outcome (logged a pending suggestion, applied a " +
+      "T1, or proposed an eval case), end the turn with a SINGLE message in " +
+      "EXACTLY this format and nothing else:",
+  );
+  lines.push("");
+  lines.push(`${SELF_IMPROVEMENT_CARD_TITLE} — <one-line outcome>`);
+  lines.push("- **Signal:** <what tripped the gate>");
+  lines.push("- **Suggestion:** <the proposed change>");
+  lines.push(
+    "- **Status:** <tier + whether anything auto-applied, e.g. " +
+      '"T2, logged for your review, nothing auto-applied">',
+  );
+  lines.push("");
+  lines.push(
+    `The leading "${SELF_IMPROVEMENT_CARD_TITLE}" line is REQUIRED verbatim — it ` +
+      "is what marks the message as a self-improvement card. Anything not " +
+      "starting with it is treated as raw reasoning and dropped.",
   );
 
   return lines.join("\n");

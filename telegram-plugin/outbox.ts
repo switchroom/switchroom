@@ -75,6 +75,8 @@ import type { Audience } from './hooks/audience-classify.mjs'
 import {
   applyReplyThrowFraming,
   shouldFrameReplyThrow,
+  applySelfImprovementFraming,
+  shouldFrameSelfImprovement,
 } from './hooks/audience-classify.mjs'
 
 export type { Audience }
@@ -162,6 +164,25 @@ export interface OutboxRecord {
    * exact boolean `true` changes anything — see `shouldFrameReplyThrow`.
    */
   replyToolThrewThisTurn?: boolean
+  /**
+   * Ken 2026-08-07: did the turn that produced this record originate from a
+   * self-improvement review inbound (`source="self_improve_review"`)? Stamped at
+   * capture by `hooks/silent-end-interrupt-stop.mjs` from the enqueue envelope's
+   * source tag.
+   *
+   * `audience` already consumed it once — a review turn classifies `'internal'`
+   * (`decideCaptureAudience`), so by default it is SUPPRESSED at the sweep's
+   * entry gate and never delivered. The sweep consumes this raw flag again, on
+   * its own, only for the residual: a review record that IS delivered (the
+   * audience gate turned off, or a legacy/`user` route) must carry the
+   * self-improvement TITLE so it can never appear as raw, unlabelled agent
+   * reasoning — the leak this closes.
+   *
+   * OPTIONAL: absent on every pre-change record and on non-review turns, which
+   * deliver unframed. Only an exact boolean `true` changes anything — see
+   * `shouldFrameSelfImprovement`.
+   */
+  reviewOriginated?: boolean
 }
 
 /** One line of the delivered-keys journal (`outbox/delivered.jsonl`). */
@@ -204,6 +225,16 @@ export interface DeliveredEntry {
    * framed delivery is a delivery.
    */
   framedProvenance?: 'reply-throw'
+  /**
+   * Ken 2026-08-07: this delivery carried the self-improvement TITLE header
+   * (`SELF_IMPROVEMENT_TITLE`) in front of a review-originated record's prose.
+   * Durable and terminal, for the same reason `framedProvenance` is: framing
+   * changes what a human sees, so the outcome is recorded as an explicit named
+   * state on the journal line rather than being inferable only from a log line
+   * that may have rotated away. `tgMessageId` IS present on these lines — a
+   * framed delivery is a delivery.
+   */
+  framedSelfImprovement?: 'self-improve'
 }
 
 export function sha256Hex(s: string): string {
@@ -519,6 +550,13 @@ export interface OutboxSweepDecision {
    * the rule.
    */
   framedProvenance?: 'reply-throw'
+  /**
+   * Ken 2026-08-07: `text` carries the self-improvement title header. Surfaced
+   * on the decision (rather than left implicit in a string compare) so the
+   * caller can journal the outcome and emit telemetry without re-deriving the
+   * rule — same shape as `framedProvenance`.
+   */
+  framedSelfImprovement?: 'self-improve'
 }
 
 /**
@@ -538,7 +576,7 @@ export interface OutboxSweepDecision {
 export function decideOutboxSweep(input: {
   record: Pick<
     OutboxRecord,
-    'turnNonce' | 'text' | 'createdAt' | 'replyToolThrewThisTurn'
+    'turnNonce' | 'text' | 'createdAt' | 'replyToolThrewThisTurn' | 'reviewOriginated'
   >
   now: number
   deliveredNonces: Set<string>
@@ -566,6 +604,13 @@ export function decideOutboxSweep(input: {
    * revert-check can flip it in-process.
    */
   provenanceFraming?: boolean
+  /**
+   * Ken 2026-08-07 kill switch for the self-improvement TITLE header. `false`
+   * restores the pre-change body byte-for-byte; the default is ON. Passed in
+   * rather than read from env here so this core stays pure and a revert-check
+   * can flip it in-process.
+   */
+  selfImprovementFraming?: boolean
 }): OutboxSweepDecision {
   const {
     record,
@@ -578,6 +623,7 @@ export function decideOutboxSweep(input: {
     maxAgeMs = OUTBOX_MAX_AGE_MS,
     shownLedgerHit = false,
     provenanceFraming = true,
+    selfImprovementFraming = true,
   } = input
   if (deliveredNonces.has(record.turnNonce)) return { action: 'skip-journaled' }
   if (shownLedgerHit) return { action: 'skip-ephemeral-shown' }
@@ -592,11 +638,22 @@ export function decideOutboxSweep(input: {
   // the banner describes the TEXT. It is additive only: it can never turn a
   // send into a skip, so this branch cannot manufacture silence.
   const framed = shouldFrameReplyThrow(record, { frameEnabled: provenanceFraming })
-  const body = framed ? applyReplyThrowFraming(record.text) : record.text
+  const provenanceBody = framed ? applyReplyThrowFraming(record.text) : record.text
+  // Ken 2026-08-07: the self-improvement title is the OUTERMOST content line, so
+  // it is applied AFTER the reply-throw banner — a review record that somehow
+  // also threw reads "🔧 Self-improvement" first, then the provenance note, then
+  // the prose. Additive only: it can never turn a send into a skip.
+  const selfImproveFramed = shouldFrameSelfImprovement(record, {
+    frameEnabled: selfImprovementFraming,
+  })
+  const body = selfImproveFramed ? applySelfImprovementFraming(provenanceBody) : provenanceBody
   return {
     action: delayed ? 'send-delayed' : 'send',
     text: prefix + body,
-    ...(framed && body !== record.text ? { framedProvenance: 'reply-throw' as const } : {}),
+    ...(framed && provenanceBody !== record.text ? { framedProvenance: 'reply-throw' as const } : {}),
+    ...(selfImproveFramed && body !== provenanceBody
+      ? { framedSelfImprovement: 'self-improve' as const }
+      : {}),
   }
 }
 

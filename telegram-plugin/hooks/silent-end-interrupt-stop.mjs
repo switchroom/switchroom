@@ -72,6 +72,8 @@ import {
 import {
   decideCaptureAudience,
   resolveOpenObligation,
+  isReviewOriginatedSource,
+  isSelfImprovementCard,
   AUDIENCE_INTERNAL,
 } from './audience-classify.mjs'
 
@@ -181,7 +183,7 @@ function outboxAlreadyDelivered(outboxDir, nonce) {
  * `'unknown'` → the record delivers exactly as it does today.
  *
  * @param {string} stateDir
- * @param {{ chatId: string|null, originChatId?: string|null, replyToolThrewThisTurn?: boolean }} capture
+ * @param {{ chatId: string|null, originChatId?: string|null, replyToolThrewThisTurn?: boolean, source?: string|null }} capture
  * @returns {'user' | 'internal'}
  */
 function classifyCaptureAudience(stateDir, capture) {
@@ -212,6 +214,14 @@ function classifyCaptureAudience(stateDir, capture) {
     process.env.TELEGRAM_ACCESS_MODE !== 'static'
   return decideCaptureAudience({
     replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
+    // A self-improvement review turn has exactly ONE sanctioned operator-facing
+    // output: a well-formed self-improvement CARD. Deterministic on the enqueue
+    // envelope's `source` tag (the same signal the rest of the self-improve
+    // machinery routes on) plus the EXACT card-shape of the captured text. A
+    // card delivers; any other trailing prose (the raw-reasoning leak) is
+    // suppressed. Independent of the reply-throw / obligation state below.
+    reviewOriginated: isReviewOriginatedSource(capture.source),
+    reviewTextIsCard: isSelfImprovementCard(capture.text),
     openInboundObligation: resolveOpenObligation({
       snapshotRaw,
       snapshotTrusted,
@@ -265,6 +275,13 @@ function writeOutboxRecord(stateDir, capture, audience) {
       // not catch (the foreground case). Stamped here because this is the last
       // point in the pipeline that can still see the transcript.
       replyToolThrewThisTurn: capture.replyToolThrewThisTurn === true,
+      // Ken 2026-08-07: did this turn originate from a self-improvement review
+      // inbound? `audience` already consumed it (with the card-shape signal) to
+      // deliver a well-formed card and suppress raw reasoning by default; the
+      // sweep consumes this raw flag again, on its own, to prepend the
+      // self-improvement TITLE to any review record delivered with the audience
+      // gate OFF, so review reasoning can never appear as raw, unlabelled prose.
+      reviewOriginated: isReviewOriginatedSource(capture.source),
     }
     const tmpPath = join(outboxDir, `.${capture.turnNonce}.${process.pid}.tmp`)
     writeFileSync(tmpPath, JSON.stringify(record), 'utf8')

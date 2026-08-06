@@ -47,6 +47,7 @@ import {
   AUDIENCE_INTERNAL,
   formatInternalSuppression,
   formatReplyThrowFraming,
+  formatSelfImprovementFraming,
   resolveRecordAudience,
   shouldSuppressForAudience,
 } from '../hooks/audience-classify.mjs'
@@ -162,6 +163,19 @@ export interface OutboxSweepDeps {
    * Defaults to `log`.
    */
   logProvenanceFraming?: (line: string) => void
+  /**
+   * Ken 2026-08-07 kill switch for the self-improvement title header. Defaults
+   * to `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING !== '0'` (ON). Same
+   * injected-seam reasoning as {@link provenanceFramingEnabled}: a module-scope
+   * env read would be captured at import and a revert-check could not run.
+   */
+  selfImprovementFramingEnabled?: () => boolean
+  /**
+   * Ken 2026-08-07 telemetry sink for a self-improvement-framed delivery.
+   * Separate from {@link logProvenanceFraming} so the two framings are greppable
+   * apart. Defaults to `log`.
+   */
+  logSelfImprovementFraming?: (line: string) => void
 }
 
 export interface OutboxSweepSummary {
@@ -190,6 +204,12 @@ export interface OutboxSweepSummary {
    * delivery, not a skip.
    */
   provenanceFramed?: number
+  /**
+   * Ken 2026-08-07: deliveries this sweep that carried the self-improvement
+   * title header. These ARE counted in `delivered` — framing is a delivery, not
+   * a skip.
+   */
+  selfImprovementFramed?: number
 }
 
 /**
@@ -246,6 +266,9 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
   const provenanceFramingEnabled = deps.provenanceFramingEnabled?.() ??
     process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING !== '0'
   const logProvenanceFraming = deps.logProvenanceFraming ?? log
+  const selfImprovementFramingEnabled = deps.selfImprovementFramingEnabled?.() ??
+    process.env.SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING !== '0'
+  const logSelfImprovementFraming = deps.logSelfImprovementFraming ?? log
 
   for (const record of records) {
     summary.scanned++
@@ -341,6 +364,11 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
       // exists to prevent. So we state the provenance instead, and the human
       // (who can tell the difference, unlike any classifier here) decides.
       provenanceFraming: provenanceFramingEnabled,
+      // Ken 2026-08-07: label any review-originated record that reaches delivery
+      // (the audience gate's default suppression already withheld it above; this
+      // covers the gate-off / `user`-route residual) with the self-improvement
+      // title, so review reasoning can never appear as raw, unlabelled prose.
+      selfImprovementFraming: selfImprovementFramingEnabled,
     })
 
     if (decision.action !== 'send' && decision.action !== 'send-delayed') {
@@ -423,6 +451,11 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
           ...(decision.framedProvenance != null
             ? { framedProvenance: decision.framedProvenance }
             : {}),
+          // Ken 2026-08-07: durable terminal stamp for a self-improvement-framed
+          // delivery — same reasoning as `framedProvenance`.
+          ...(decision.framedSelfImprovement != null
+            ? { framedSelfImprovement: decision.framedSelfImprovement }
+            : {}),
         },
         deps.stateDir,
       )
@@ -430,6 +463,18 @@ export async function sweepOutbox(deps: OutboxSweepDeps): Promise<OutboxSweepSum
         summary.provenanceFramed = (summary.provenanceFramed ?? 0) + 1
         logProvenanceFraming(
           formatReplyThrowFraming({
+            turnNonce: record.turnNonce,
+            turnId: turnIdFromNonce(record.turnNonce),
+            chatId: resolvedChat.chatId,
+            textSha256: record.textSha256,
+            source: record.source,
+          }),
+        )
+      }
+      if (decision.framedSelfImprovement != null) {
+        summary.selfImprovementFramed = (summary.selfImprovementFramed ?? 0) + 1
+        logSelfImprovementFraming(
+          formatSelfImprovementFraming({
             turnNonce: record.turnNonce,
             turnId: turnIdFromNonce(record.turnNonce),
             chatId: resolvedChat.chatId,
