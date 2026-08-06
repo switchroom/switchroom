@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Self-improvement
+
+- **Label review-turn messages, stop raw-reasoning leaks to the operator** — a silent self-improvement review turn's mid-turn reasoning could be captured by the outbox backstop and delivered into the operator's DM as a raw, unlabelled message. A review turn now has exactly one sanctioned operator-facing output: a well-formed self-improvement card (a message opening with `🔧 **Self-improvement**`). The backstop delivers a review-originated record only when its text is that card; all other trailing prose classifies `internal` and is suppressed. Detection is deterministic on the synthesized inbound's `source="self_improve_review"` tag plus an exact card-title prefix, never a prose-shape heuristic. A residual title-framing layer (behind `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING`) prepends the title if a non-card review record ever reaches delivery with the audience gate off, so review reasoning can never appear unlabelled. The review prompt now locks the exact card shape (Signal / Suggestion / Status) and instructs silence on a no-op turn.
+
 ## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
 
 ### Web tooling
