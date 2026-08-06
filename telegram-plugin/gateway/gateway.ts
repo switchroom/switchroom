@@ -626,6 +626,12 @@ import { readTurnUsages } from '../../src/agents/perf.js'
 import { buildContextOccupancy, writeContextOccupancySnapshot } from './context-occupancy.js'
 import { decideProactiveCompact, initialCompactState, type CompactState } from './proactive-compact.js'
 import { IdleTracker, idleDurationToMs, DEFAULT_IDLE_CLEAR_MS } from './idle-clear.js'
+import {
+  openPrivateInterval,
+  closePrivateInterval,
+  PRIVATE_ON_REPLY,
+  PUBLIC_REPLY,
+} from './privacy-state.js'
 import { nextCompactNotify, idleCompactNotifyState, type CompactNotifyState } from './compact-notify.js'
 import {
   tryHostdDispatch,
@@ -19805,6 +19811,19 @@ bot.command('compact', async ctx => {
 })
 bot.command('clear', async ctx => {
   await handleInjectCommand(ctx, buildInjectDeps({ open: true, fixedVerb: '/clear' }))
+})
+// Per-operator session privacy controls. NOT admin verbs (deliberately kept
+// out of ADMIN_COMMAND_NAMES) — they gate memory writing for THIS session, so
+// they share the plain per-command isAuthorizedSender gate like inject/clear.
+bot.command('private', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  openPrivateInterval()
+  await switchroomReply(ctx, PRIVATE_ON_REPLY)
+})
+bot.command('public', async ctx => {
+  if (!isAuthorizedSender(ctx)) return
+  closePrivateInterval()
+  await switchroomReply(ctx, PUBLIC_REPLY)
 })
 // /model and /effort extracted to bot-commands-model-effort.ts
 // (switchroom#2996 P6 bot.command drain). Helper registration keeps grammy
