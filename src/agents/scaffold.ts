@@ -1525,6 +1525,37 @@ const DEFAULT_READ_ONLY_PREAPPROVED_TOOLS = [
 ];
 
 /**
+ * Native `WebSearch`, pre-approved fleet-wide (operator decision, 2026-08).
+ *
+ * Unlike the other native network-egress tools, WebSearch does NOT go through
+ * the standard permission prompt: it is pre-approved for EVERY agent so a
+ * search lands seamlessly on the first call. The risk profile is the same as
+ * the already-pre-approved `mcp__webkite__webkite_search` (see
+ * WEBKITE_MCP_TOOLS) — read-only egress whose results are untrusted DATA
+ * either way — so gating native WebSearch while pre-approving webkite_search
+ * bought no safety, only a first-use prompt whenever the model reached for the
+ * native tool instead of webkite.
+ *
+ * `WebFetch` is deliberately NOT here — page fetches still route through
+ * webkite (WEBKITE_FLEET_DENY_TOOLS keeps native WebFetch denied), so this is
+ * a WebSearch-only grant.
+ *
+ * This is an UNCONDITIONAL spread in the allow-list assembly (like
+ * WEBKITE_MCP_TOOLS), not a member of DEFAULT_READ_ONLY_PREAPPROVED_TOOLS:
+ * every agent gets it regardless of an explicit `tools.allow` or
+ * `dangerous_mode`, so acceptEdits-mode / explicit-allow agents (which skip
+ * the read-only defaults) are covered uniformly. An agent that must NOT have
+ * WebSearch pre-approved sets `tools.deny: ["WebSearch"]` — deny wins in
+ * Claude Code.
+ *
+ * NOTE — while WebSearch remains in WEBKITE_FLEET_DENY_TOOLS, deny wins and
+ * this allow entry is inert for webkite-enabled agents; it becomes live once
+ * WebSearch is removed from the fleet deny (PR #4465). For webkite-opted-out
+ * agents (no fleet deny) it takes effect immediately.
+ */
+const NATIVE_WEBSEARCH_PREAPPROVED_TOOLS = ["WebSearch"];
+
+/**
  * Fleet-baseline deny list seeded into every agent's settings.json
  * `permissions.deny` unless the agent has opted out of webkite. The
  * model still has full web-fetch capability — via the webkite_*
@@ -5131,6 +5162,12 @@ export function computeDesiredPermissionAllow(
     // (daemon-side gates remain the real security boundary).
     ...AGENT_CONFIG_MCP_TOOLS,
     ...HOSTD_MCP_TOOLS,
+    // Native WebSearch is pre-approved fleet-wide (see
+    // NATIVE_WEBSEARCH_PREAPPROVED_TOOLS). Unconditional — every agent,
+    // regardless of explicit tools.allow / dangerous_mode — so it matches
+    // the webkite_search pre-approval and the model can search seamlessly.
+    // WebFetch stays gated (page fetches route through webkite).
+    ...NATIVE_WEBSEARCH_PREAPPROVED_TOOLS,
     // Webkite is fleet-default (resolveWebkiteMcpEntry) unless the agent
     // opts out. Pre-approve its tools so the first web fetch doesn't
     // wedge on a permission prompt — webkite IS the web-fetch path now
@@ -5554,6 +5591,12 @@ export function scaffoldAgent(
         ...HOSTD_MCP_TOOLS,
         ...webkiteAllowTools,
         ...context7AllowTools,
+        // Existing-agent twin of the permissionAllow WebSearch spread —
+        // writeIfMissing skips the settings.json template for deployed
+        // agents, so `switchroom apply` re-seeds native WebSearch here.
+        // Unconditional (not gated on any opt-out), matching the fresh /
+        // reconcile path.
+        ...NATIVE_WEBSEARCH_PREAPPROVED_TOOLS,
       ]) {
         if (!allow.includes(t)) allow.push(t);
       }
