@@ -71,7 +71,17 @@ describe("runScan excludes test agents from the ledger", () => {
     makeAgent(base, "test-harness", Array(5).fill(ESCALATION_LINE));
     makeAgent(base, "marko", [ESCALATION_LINE]);
 
-    const res = runScan({ base });
+    // Hermeticity: fully stub the live-state hindsight GPU sensor so it neither
+    // shells out (docker/nvidia-smi) nor injects a host-dependent finding into
+    // this fixture scan. "could not tell" ⇒ always ok, no finding.
+    const res = runScan({
+      base,
+      hindsightGpuDeps: {
+        probe: () => ({ gpuPresent: false, containerToolkit: false, engine: "cloud", reason: "test stub" }),
+        capsRead: () => ({ status: "absent", path: "/x", caps: null, detail: "" }),
+        deviceRequests: () => null,
+      },
+    });
 
     expect(res.agentsExcluded).toContain("test-harness");
     expect(res.agentsScanned).toBe(1); // only marko

@@ -136,6 +136,19 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "fleet-stays-healthy",
     signature: "litellm-timeout-budget:tier-drift",
   },
+  "hindsight-gpu-cpu-on-gpu-host": {
+    // The live hindsight container is CPU-only on a host with a PROVABLY usable
+    // GPU. Classic `drift`: nothing errors, the container is "healthy", but the
+    // reranker and local embeddings run on CPU on the interactive recall path —
+    // 5-9s recalls with deadline hits. It ran undetected through a green doctor
+    // for an unknown length of time (#4459), which is exactly why it earns a
+    // standing nightly sensor. severity 3 — a real, measured recall-latency
+    // degradation of the whole memory layer, not an informational drift.
+    failure_mode: "drift",
+    severity: 3,
+    job_spec: "fleet-stays-healthy",
+    signature: "hindsight-gpu:cpu-only-on-gpu-host",
+  },
 };
 
 /** The full set of 23 job-spec slugs the ledger carries a record for. Kept

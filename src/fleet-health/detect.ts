@@ -105,7 +105,13 @@ export type GatewaySignal =
  *  invariant it guards is violated. */
 export type SensorSignal =
   | "litellm-header-passthrough-misconfig"
-  | "litellm-timeout-budget-drift";
+  | "litellm-timeout-budget-drift"
+  // The live `switchroom-hindsight` container is running CPU-only
+  // (`HostConfig.DeviceRequests` empty) while the host has a PROVABLY usable
+  // GPU (nvidia-smi + the nvidia container runtime). Reranker + local
+  // embeddings fall to CPU on the interactive recall path — the 2026-07-28
+  // incident (#4459) that no green doctor caught.
+  | "hindsight-gpu-cpu-on-gpu-host";
 
 export type L0Signal = TurnSignal | GatewaySignal | SensorSignal;
 
