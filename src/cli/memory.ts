@@ -46,6 +46,7 @@ import {
   resolveHindsightLiteLlm,
   hindsightLiteLlmDroppedKeyWarning,
   type HindsightLiteLlmResolution,
+  type HindsightLlmConfig,
 } from "../setup/hindsight.js";
 import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
 import {
@@ -1091,24 +1092,60 @@ export function registerMemoryCommand(program: Command): void {
   memory
     .command("docker-compose")
     .description("Output a docker-compose snippet for Hindsight (broker-fed mode)")
+    .option(
+      "--resolve-secrets",
+      "Resolve `vault:` refs (the LLM api_key fields and cp_access_key) to their " +
+        "live secret values before printing the snippet. Without this flag (the " +
+        "default) the `vault:` refs are printed literally — this is an " +
+        "operator-invoked command whose stdout routinely ends up pasted into " +
+        "terminals, files, and chat, and a live `sk-…` key has no business " +
+        "landing there by accident (#4487). Pass this when you genuinely want a " +
+        "runnable compose file, and treat the output as a secret once you do.",
+    )
     // Async now that the CP access key is resolved through the vault broker;
     // withConfigError keeps a bad switchroom.yaml a friendly message rather
     // than an unhandled rejection (the sibling `memory` subcommands' shape).
-    .action(withConfigError(async () => {
+    .action(withConfigError(async (opts: { resolveSecrets?: boolean }) => {
       console.log(chalk.bold("\n# Add this to your docker-compose.yml:\n"));
       {
         const snippetConfig = getConfig(program);
-        // Same resolve + same warning as the docker-run path: a compose
-        // deployment must not be the one that quietly serves an open dashboard.
-        const cpAccessKey = await resolveHindsightCpAccessKey(snippetConfig);
-        if (!cpAccessKey) {
-          console.error(chalk.yellow(`# ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
+        const resolveSecrets = opts.resolveSecrets === true;
+        let cpAccessKey: string | undefined;
+        let snippetLlm: HindsightLlmConfig | undefined;
+        if (resolveSecrets) {
+          // Same resolve + same warning as the docker-run path: a compose
+          // deployment must not be the one that quietly serves an open dashboard.
+          cpAccessKey = await resolveHindsightCpAccessKey(snippetConfig);
+          if (!cpAccessKey) {
+            console.error(chalk.yellow(`# ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
+          }
+          // Resolve `vault:` api_key refs so the emitted compose file carries the
+          // real credential — the same reason the docker-run path resolves them,
+          // and the same shape the cp_access_key above already takes. An emitted
+          // literal `vault:…` would break every retain exactly like the recreate bug.
+          snippetLlm = await resolveHindsightLlmSecrets(snippetConfig.hindsight?.llm);
+        } else {
+          // DEFAULT: emit the `vault:` refs unresolved. This snippet is not
+          // runnable as-is — that's the point (#4487). Pass --resolve-secrets
+          // for a runnable file with live secret values.
+          cpAccessKey = snippetConfig.hindsight?.cp_access_key;
+          snippetLlm = snippetConfig.hindsight?.llm;
+          console.log(
+            chalk.yellow(
+              "# NOTE: `vault:` references below are left UNRESOLVED (default) — this\n" +
+                "#       snippet is not runnable as-is. Resolve them yourself before use, or\n" +
+                "#       re-run with --resolve-secrets to print the live secret values\n" +
+                "#       instead. If you do, treat this command's output as a secret: don't\n" +
+                "#       paste it into chat, logs, or an unencrypted file.\n",
+            ),
+          );
         }
         // The docker-run path warns from inside startHindsight(); the compose
         // generator is a pure string builder, so its wrapper carries the same
         // check. To stderr with a `#` prefix so a redirected stdout stays a
-        // valid compose file even under `2>&1` (same discipline as the
-        // secrets notice below).
+        // valid compose file even under `2>&1`. Independent of
+        // --resolve-secrets: the memory budget is a property of the config,
+        // not of whether secrets got resolved.
         {
           const memWarning = hindsightMemBudgetWarningFor({
             env: snippetConfig.hindsight?.env,
@@ -1116,24 +1153,6 @@ export function registerMemoryCommand(program: Command): void {
           });
           if (memWarning) console.error(chalk.yellow(`# ! ${memWarning}`));
         }
-        // Resolve `vault:` api_key refs so the emitted compose file carries the
-        // real credential — the same reason the docker-run path resolves them,
-        // and the same shape the cp_access_key above already takes. An emitted
-        // literal `vault:…` would break every retain exactly like the recreate bug.
-        const snippetLlm = await resolveHindsightLlmSecrets(snippetConfig.hindsight?.llm);
-        // The emitted snippet carries REAL resolved credentials in cleartext —
-        // the LLM `sk-` api_key(s) and any `cp_access_key` — because a
-        // paste-ready compose file must. Warn ONCE, to stderr with a `#` prefix,
-        // so a piped/redirected stdout is still a valid compose file (the notice
-        // stays a YAML comment even under `2>&1`) while an interactive operator
-        // is told to handle the output as a secret.
-        console.error(
-          chalk.yellow(
-            "# ! This snippet embeds resolved secrets in cleartext (LLM api_key" +
-              " and cp_access_key). Treat the output as sensitive — do not paste" +
-              " it into shared channels or commit it unredacted.",
-          ),
-        );
         console.log(
           generateHindsightComposeSnippet(
             snippetLlm,

@@ -41,6 +41,11 @@ now an anomaly worth investigating, not the norm.
   trivial rename of this header instead of reconstructing the whole section
   from `git log` at release time (as v0.20.12 had to).
 
+### Memory CLI secret hygiene
+
+- **`memory docker-compose` no longer prints live secrets to stdout by default (#4487)** — the compose snippet now emits `vault:` refs unresolved, plus a note, unless the new `--resolve-secrets` flag is passed; `cp_access_key` follows the same rule. Closes the follow-up from #4471, which correctly wired `vault:` resolution into the snippet emit site but changed the command to print a live `sk-…` key on an operator-invoked command whose stdout is routinely pasted around.
+- **`memory setup --recreate` vault-ref wiring now has a direct test (#4486)** — adds the first `registerMemoryCommand` test harness and a wiring assertion pinning that the `--recreate` launch path (the one that caused the 2026-08-06 outage) resolves `hindsight.llm` `vault:` refs before they reach `startHindsight`.
+
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)
 
 - **New installs default to the `pg_search` BM25 backend (#4470)** — the keyword
