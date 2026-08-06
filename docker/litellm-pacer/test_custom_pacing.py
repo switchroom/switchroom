@@ -1239,7 +1239,8 @@ class EstimateTokensTests(_TpmCfgMixin, unittest.TestCase):
 
     def test_block_content_text_and_image(self):
         # text block counts its text length (40); an image block counts a flat
-        # 1600 chars. (40 + 1600) / 4 = 410 input tokens; +2048.
+        # ~1600 tokens -> int(1600 * 4) = 6400 chars. (40 + 6400) / 4 = 1610
+        # input tokens; +2048 output reserve.
         data = {
             "messages": [
                 {
@@ -1251,7 +1252,10 @@ class EstimateTokensTests(_TpmCfgMixin, unittest.TestCase):
                 }
             ]
         }
-        self.assertEqual(self._est(data), (40 + 1600) // 4 + 2048)
+        img_chars = int(1600 * 4)
+        self.assertEqual(self._est(data), (40 + img_chars) // 4 + 2048)
+        # Guard: the image alone must contribute ~1600 tokens, not the old ~400.
+        self.assertGreater(self._est(data), (40 // 4) + 1500 + 2048)
 
     def test_system_and_tools_add_to_estimate(self):
         base = {"messages": [{"role": "user", "content": "x" * 40}]}

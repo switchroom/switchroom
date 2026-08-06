@@ -372,7 +372,7 @@ def _estimate_tokens(data: Any) -> int:
     lists), the system prompt, and the tools spec, divides by CHARS_PER_TOKEN
     for the input estimate, adds a bounded output reservation, and scales by
     EST_MULT. Content blocks: text blocks count their `text` length; an image
-    block counts a flat ~1600; any other block counts len(str(block))//4."""
+    block counts a flat ~1600 tokens; any other block counts len(str(block))//4."""
     try:
         if not isinstance(data, dict):
             return 0
@@ -383,7 +383,9 @@ def _estimate_tokens(data: Any) -> int:
                 if isinstance(t, str):
                     return len(t)
                 if block.get("type") in ("image", "image_url"):
-                    return 1600
+                    # A real Anthropic image is ~1600 TOKENS; scale to chars so
+                    # dividing by CHARS_PER_TOKEN lands at ~1600 tokens.
+                    return int(1600 * _Cfg.TPM_CHARS_PER_TOKEN)
                 return len(str(block)) // 4
             return len(str(block)) // 4
 
