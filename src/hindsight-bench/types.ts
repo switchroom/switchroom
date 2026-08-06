@@ -152,6 +152,17 @@ export interface CellResult {
   rows: number;
   concurrency: number;
   stats: CellStats;
+  /**
+   * Mean number of memories returned by the successful calls.
+   *
+   * A validity check, not a quality metric: a cell that returns nothing is fast
+   * for an uninteresting reason, and a latency table with no result counts
+   * beside it cannot distinguish "recall got quicker" from "recall stopped
+   * finding anything". Recorded so a reader can rule that out.
+   */
+  meanResults: number;
+  /** Successful calls that returned zero memories. Should be 0 on a real bank. */
+  zeroResultCalls: number;
   /** Every recorded latency in ms, in completion order. Enables re-reduction. */
   samplesMs: number[];
   /** Distinct error strings observed, capped and deduplicated. */

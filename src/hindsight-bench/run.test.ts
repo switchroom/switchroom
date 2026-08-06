@@ -96,6 +96,15 @@ describe("runSweep", () => {
     expect(cells[0]?.errorSamples).toHaveLength(5);
   });
 
+  it("records result counts so an empty-but-fast cell cannot masquerade as a win", async () => {
+    let n = 0;
+    const recall = async (): Promise<RecallSample> => ({ ok: true, ms: 5, results: ++n % 2 === 0 ? 0 : 6 });
+    const config = makeConfig({ banks: ["big"], concurrency: [1], samples: 10, warmup: 0 });
+    const cells = await runSweep({ config, db: makeDbState(), settleMs: 0, deps: deps(recall) });
+    expect(cells[0]?.zeroResultCalls).toBe(5);
+    expect(cells[0]?.meanResults).toBe(3);
+  });
+
   it("issues an identical query multiset for the same cell across runs", async () => {
     const config = makeConfig({ banks: ["big"], concurrency: [4], samples: 12, warmup: 0 });
     const a = recorder(() => 100);

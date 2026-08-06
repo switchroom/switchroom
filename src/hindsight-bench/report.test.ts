@@ -149,6 +149,19 @@ describe("rendering", () => {
     expect(out).toContain("-");
   });
 
+  it("summary calls out a cell whose recalls returned nothing", () => {
+    const empty = makeCell("big", 100, 1, 50);
+    empty.meanResults = 0;
+    empty.zeroResultCalls = 20;
+    const out = formatSummary(makeResult([empty]));
+    expect(out).toContain("zero-result recalls");
+    expect(out).toContain("20/20 empty");
+  });
+
+  it("summary says nothing about zero-result cells when there are none", () => {
+    expect(formatSummary(r)).not.toContain("zero-result recalls");
+  });
+
   it("csv has one header plus one row per cell and is diffable", () => {
     const lines = toCsv(r).split("\n");
     expect(lines).toHaveLength(3);

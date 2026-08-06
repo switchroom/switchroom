@@ -173,7 +173,7 @@ export function formatSummary(r: BenchResult): string {
   L.push("");
   L.push(
     `  ${pad("bank", 16)}${padL("rows", 8)}${padL("conc", 6)}${padL("n", 6)}${padL("err", 5)}` +
-      `${padL("p50", 9)}${padL("p95", 9)}${padL("p99", 9)}${padL("max", 9)}${padL("cv", 7)}`,
+      `${padL("p50", 9)}${padL("p95", 9)}${padL("p99", 9)}${padL("max", 9)}${padL("cv", 7)}${padL("hits", 7)}`,
   );
   for (const cell of r.cells) {
     const s = cell.stats;
@@ -184,8 +184,17 @@ export function formatSummary(r: BenchResult): string {
         `${padL(Number.isFinite(s.p95) ? s.p95.toFixed(0) : "-", 9)}` +
         `${padL(Number.isFinite(s.p99) ? s.p99.toFixed(0) : "-", 9)}` +
         `${padL(Number.isFinite(s.max) ? s.max.toFixed(0) : "-", 9)}` +
-        `${padL(Number.isFinite(s.cv) ? s.cv.toFixed(2) : "-", 7)}`,
+        `${padL(Number.isFinite(s.cv) ? s.cv.toFixed(2) : "-", 7)}` +
+        `${padL(cell.meanResults.toFixed(1), 7)}`,
     );
+  }
+  const empties = r.cells.filter((c) => c.zeroResultCalls > 0);
+  if (empties.length > 0) {
+    // Loud, because a zero-result cell is fast for a reason that has nothing to
+    // do with the thing being measured.
+    L.push("");
+    L.push("  ! cells with zero-result recalls (latency there is not measuring retrieval):");
+    for (const c of empties) L.push(`      ${c.bank} c=${c.concurrency}: ${c.zeroResultCalls}/${c.stats.n} empty`);
   }
   if (r.arms !== null && r.arms.length > 0) {
     L.push("");
@@ -240,7 +249,7 @@ export function formatContention(rep: ContentionReport): string {
 
 /** Flat CSV of every cell, for pasting into a sheet or diffing across runs. */
 export function toCsv(r: BenchResult): string {
-  const head = "label,bank,rows,concurrency,n,errors,p50_ms,p95_ms,p99_ms,max_ms,mean_ms,stddev_ms,cv,contention";
+  const head = "label,bank,rows,concurrency,n,errors,p50_ms,p95_ms,p99_ms,max_ms,mean_ms,stddev_ms,cv,mean_results,zero_result_calls,contention";
   const rows = r.cells.map((c) =>
     [
       JSON.stringify(r.config.label),
@@ -256,6 +265,8 @@ export function toCsv(r: BenchResult): string {
       round(c.stats.mean, 2),
       round(c.stats.stddev, 2),
       round(c.stats.cv, 4),
+      round(c.meanResults, 2),
+      c.zeroResultCalls,
       r.config.contention,
     ].join(","),
   );

@@ -54,7 +54,16 @@ export function makeDbState(over: Partial<DbState> = {}): DbState {
 /** A cell whose p95 is exactly `p95` (all samples identical). */
 export function makeCell(bank: string, rows: number, concurrency: number, p95: number): CellResult {
   const samplesMs = Array.from({ length: 20 }, () => p95);
-  return { bank, rows, concurrency, stats: summarize(samplesMs, 0), samplesMs, errorSamples: [] };
+  return {
+    bank,
+    rows,
+    concurrency,
+    stats: summarize(samplesMs, 0),
+    meanResults: 8,
+    zeroResultCalls: 0,
+    samplesMs,
+    errorSamples: [],
+  };
 }
 
 export function makeResult(cells: CellResult[], over: Partial<BenchConfig> = {}): BenchResult {
