@@ -1037,6 +1037,116 @@ def _write_recall_log(entry: dict) -> None:
         pass
 
 
+# Switchroom recall-latency instrumentation — full-hook wall-time.
+#
+# recall.py is the UserPromptSubmit hook that sits in front of EVERY reply
+# (pre-first-token), yet it was the one hook with no wall-time record: it is a
+# DIRECT Claude Code plugin hook (hooks/hooks.json), NOT wrapped by
+# bin/run-hook.sh, so it never emitted a `hook-timings-<Ddd>.log` row the way
+# every wrapped hook does, and `recall_log.jsonl` measured only the recall
+# critical path (`total_elapsed_ms`, from `recall_start_monotonic`) — never the
+# hook's own import + stdin + cache-check + gate overhead.
+#
+# Routing it through run-hook.sh was rejected as the mechanism: the vendored
+# hooks.json is re-copied verbatim into every agent's plugin dir on `switchroom
+# apply`, and run-hook.sh lives in the switchroom repo's bin/, not under
+# CLAUDE_PLUGIN_ROOT — coupling the vendor snapshot to switchroom's bin layout is
+# fragile, and the os._exit(0) fast-path (which skips atexit / thread-join to
+# return control the instant stdout is flushed) would have to be reconciled with
+# the wrapper. Instead the hook emits the SAME JSON line, into the SAME weekday-
+# ring file, honouring the SAME env knobs, from inside the process at exit — so
+# `grep duration_ms hook-timings-*.log` sees this hook next to every other one.
+HOOK_TIMING_SOURCE = "hook:hindsight-recall"
+HOOK_TIMING_CODE = "recall.py"
+
+
+def _hook_duration_ms() -> int:
+    """Milliseconds since this hook process began doing work.
+
+    Anchored at import start (`_IMPORT_START_MONOTONIC`, taken before any of this
+    hook's own imports ran — recall.py line ~48), so the number spans the WHOLE
+    hook: dependency import, the stdin read, the cache check, the gate
+    short-circuits, and — when it got that far — the recall round-trips. That is
+    deliberately WIDER than `total_elapsed_ms` (the recall critical path only,
+    measured from `recall_start_monotonic`): `duration_ms - total_elapsed_ms` is
+    therefore the pre-recall LOCAL overhead, and the per-bank
+    `bank_timings[].elapsed_ms` remain the Hindsight server round-trips — so the
+    log already separates server time from local overhead without a new field.
+    """
+    return int((time.monotonic() - _IMPORT_START_MONOTONIC) * 1000)
+
+
+def _emit_hook_timing_log(duration_ms: int, status: int) -> None:
+    """Append one timing line to `hook-timings-<Ddd>.log`, matching run-hook.sh.
+
+    STDOUT-SAFE by construction: writes only to a log file, NEVER to the hook's
+    stdout contract that Claude Code consumes. Failure-tolerant — any error is
+    swallowed so instrumentation can never take the hook down. Honours the same
+    env knobs as bin/run-hook.sh (`SWITCHROOM_HOOK_TIMING`,
+    `SWITCHROOM_HOOK_TIMING_DIR`, `SWITCHROOM_HOOK_TIMING_MIN_MS`) and reproduces
+    its 7-day self-truncating weekday ring and JSON line shape exactly, so a
+    consumer cannot tell this row apart from a wrapped hook's.
+
+    NOTE on the 12s ceiling: if Claude Code kills this hook at the
+    UserPromptSubmit timeout, the process is terminated before any exit path runs
+    and NO timing line (nor recall_log row) is written — the MISSING line is the
+    breach signal, consistent with the two-signal baseline documented at the
+    recall_log write. This records every invocation that returns under budget,
+    including a fully-degraded/timed-out recall that still exits cleanly.
+    """
+    try:
+        if os.environ.get("SWITCHROOM_HOOK_TIMING", "1") == "0":
+            return
+        timing_dir = os.environ.get("SWITCHROOM_HOOK_TIMING_DIR") or os.environ.get(
+            "TELEGRAM_STATE_DIR", ""
+        )
+        if not timing_dir or not os.path.isdir(timing_dir):
+            return
+        try:
+            duration_ms = int(duration_ms)
+        except (TypeError, ValueError):
+            return
+        if duration_ms < 0:
+            duration_ms = 0
+        try:
+            min_ms = int(os.environ.get("SWITCHROOM_HOOK_TIMING_MIN_MS", "0"))
+        except (TypeError, ValueError):
+            min_ms = 0
+        if duration_ms < min_ms:
+            return
+        # Local wall clock, matching run-hook.sh's builtin `%(...)T` formatting so
+        # both writers agree on which weekday-ring file today lands in.
+        now = time.localtime()
+        today = time.strftime("%Y-%m-%d", now)
+        dow = time.strftime("%a", now)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z", now)
+        logfile = os.path.join(timing_dir, f"hook-timings-{dow}.log")
+        # 7-day self-truncating ring: the weekday-named file is either today's or
+        # exactly a week stale. If its first line does not carry today's date,
+        # reset it before appending (same rule as run-hook.sh).
+        try:
+            if os.path.getsize(logfile) > 0:
+                with open(logfile, encoding="utf-8") as f:
+                    first = f.readline()
+                if f'"date":"{today}"' not in first:
+                    open(logfile, "w", encoding="utf-8").close()
+        except OSError:
+            pass
+        # HOOK_TIMING_SOURCE / HOOK_TIMING_CODE are fixed constants with no JSON
+        # metacharacters, so no escape pass is needed (unlike run-hook.sh, whose
+        # source/code are caller-supplied).
+        line = (
+            '{"ts":"%s","date":"%s","source":"%s","code":"%s",'
+            '"duration_ms":%d,"status":%d}\n'
+            % (ts, today, HOOK_TIMING_SOURCE, HOOK_TIMING_CODE, duration_ms, status)
+        )
+        with open(logfile, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        # Instrumentation is never load-bearing — swallow everything.
+        pass
+
+
 def _read_transcript_lines(transcript_path: str, tail_bytes: int):
     """Yield the transcript's trailing lines, byte-bounded.
 
@@ -1824,6 +1934,12 @@ def main():
                 # timed out"; `deadline_hit is None` means "no banks ran"
                 # (review finding 3).
                 "total_elapsed_ms": None,
+                # Switchroom recall-latency instrumentation — full-hook wall time
+                # (import + stdin + cache check), measured to this log write. A
+                # cache hit issues no bank HTTP, so `total_elapsed_ms` is None and
+                # this is pure local overhead — the cheap path this cache exists
+                # to create, now visible per-row.
+                "duration_ms": _hook_duration_ms(),
                 "directives_elapsed_ms": None,
                 "bank_timings": [],
                 "deadline_hit": None,
@@ -2542,6 +2658,16 @@ def main():
         # parallelism change measures against; the 17-26% figure it replaces is
         # the stale 2026-05-24 pre-fix audit.
         "total_elapsed_ms": int((time.monotonic() - recall_start_monotonic) * 1000),
+        # Switchroom recall-latency instrumentation — FULL-HOOK wall time to this
+        # log write: dependency import + stdin read + cache check + the gate
+        # short-circuits + the whole recall critical path. `total_elapsed_ms`
+        # above is the recall critical path ONLY, so `duration_ms -
+        # total_elapsed_ms` is the pre-recall LOCAL overhead this row could not
+        # see before, while `bank_timings[].elapsed_ms` stay the server round-
+        # trips — the log now separates server time from local overhead. Written
+        # here (with the rest of the row, before the empty-block return) so even a
+        # fully-timed-out / degraded recall that reaches this line gets a duration.
+        "duration_ms": _hook_duration_ms(),
         "directives_elapsed_ms": directives_elapsed_ms,
         "bank_timings": bank_timings,
         # Switchroom hindsight-leverage A3 — FINALIZED `deadline_hit` semantics
@@ -2795,6 +2921,12 @@ if __name__ == "__main__":
             sys.stdout.flush()
         except Exception:
             pass
+        # Switchroom recall-latency instrumentation — emit the full-hook timing
+        # line AFTER stdout is flushed (Claude Code already has the bytes) and
+        # BEFORE os._exit, which skips atexit and would otherwise drop it. Adds
+        # ~0.5ms (one file append) before the process exits — the same budget
+        # run-hook.sh spends per wrapped hook. Stdout is untouched.
+        _emit_hook_timing_log(_hook_duration_ms(), 0)
         os._exit(0)
     except Exception as e:
         # Switchroom #1070 (redo per #1085 review).
@@ -2844,6 +2976,10 @@ if __name__ == "__main__":
             import traceback
 
             traceback.print_exc(file=sys.stderr)
+            # Instrumentation: record the failed invocation's wall time too
+            # (status 2, the debug-mode block behaviour) so a crash-looping
+            # hook is visible in the timing log, not just a silent gap.
+            _emit_hook_timing_log(_hook_duration_ms(), 2)
             # Debug-mode exit 2 is intentional and unchanged —
             # operators with HINDSIGHT_DEBUG=1 are chasing a broken
             # recall and want the hook to surface its failure.
@@ -2853,4 +2989,8 @@ if __name__ == "__main__":
         # 0 with no stdout (agent's prompt assembly treats absent
         # additionalContext as "no recall this turn").
         _record_issue_safely(_detail, _class)
+        # Instrumentation: the non-debug exit code is 0 (the safe-empty stdout
+        # posture), so log status 0 — the accompanying issue-sink record is where
+        # the failure detail lives; this row just makes the latency observable.
+        _emit_hook_timing_log(_hook_duration_ms(), 0)
         sys.exit(0)
