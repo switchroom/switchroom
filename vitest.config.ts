@@ -379,6 +379,11 @@ export default defineConfig({
       // under bun by definition. The vitest half is pinned by
       // tests/agent-state-dir-guard.test.ts.
       "**/telegram-plugin/tests/agent-state-dir-preload.test.ts",
+      // hindsight-bank-preload.test.ts is the runtime alarm for the BUN half
+      // of the Hindsight bank guard (bunfig.toml `[test] preload`) — it must
+      // run under bun by definition (same shape as the state-dir alarm
+      // above). The vitest half is pinned by tests/hindsight-bank-guard.test.ts.
+      "**/telegram-plugin/tests/hindsight-bank-preload.test.ts",
     ],
     coverage: {
       provider: "v8",
