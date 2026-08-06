@@ -92,25 +92,35 @@ export type GdriveMcpTier = "core" | "extended" | "complete";
  * Specific commit SHA — bump deliberately. Pinning to a 40-char commit
  * SHA (not the moving tag ref) means upstream history rewrites can't
  * change what we run, while still tracking a tagged release. This SHA
- * is the commit annotated tag `v1.20.4` dereferences to
- * (`gh api repos/taylorwilsdon/google_workspace_mcp/git/refs/tags/v1.20.4`
- * → tag obj → `.object.sha`). v1.20.4 (2026-05-07) supersedes the prior
- * pin v1.20.3 (`f3c7dc5…`): it hardens the `--single-user` stdio OAuth
- * callback path switchroom depends on (upstream PR #762, "missing state
- * parameter fallback for single-user stdio OAuth callbacks"). The
- * `workspace-mcp` entrypoint is unchanged at this tag (pyproject
- * `[project.scripts]` still defines `workspace-mcp = "main:main"` —
- * the bug-6 guard). Validated end-to-end in a real agent container at
- * this SHA: MCP starts and a real Drive call authenticates the seeded
- * single-user account. When bumping: re-deref a NEW tag to its commit
- * SHA, confirm the entrypoint, and re-run the docker pin-smoke test.
+ * is the commit annotated tag `v1.23.1` dereferences to
+ * (`gh api repos/taylorwilsdon/google_workspace_mcp/git/refs/tags/v1.23.1`
+ * → tag obj → `.object.sha`, i.e. the `v1.23.1^{}` peel). v1.23.1
+ * (2026-08-02) supersedes the prior pin v1.20.4 (`9d69115…`): it carries
+ * an auth/server refactor (request-scoped auth upstream #992, late-bind
+ * port fallback #768 via the new `auth/port_resolver.py`) plus docs/
+ * sheets/forms bug fixes and new import tools. The `--single-user`
+ * seeded-credentials refresh branch switchroom depends on is unchanged
+ * (upstream still reads `WORKSPACE_MCP_CREDENTIALS_DIR`, preferred, in
+ * `auth/google_auth.py`, and takes the refresh path on a `token:null`
+ * seed — no browser), and the new `--permissions` flag is additive and
+ * mutually exclusive only with `--read-only`/`--tools`, which the
+ * launcher never combines with it. The `workspace-mcp` entrypoint is
+ * unchanged at this tag (pyproject `[project.scripts]` still defines
+ * `workspace-mcp = "main:main"` — the bug-6 guard) and `WORKSPACE_MCP_PORT`
+ * is still honored. Validated at this SHA via the stdio JSON-RPC smoke
+ * test: `initialize` completes and `tools/list` registers the complete
+ * tier (incl. `insert_doc_image` / `batch_update_doc` /
+ * `inspect_doc_structure`); the four launcher flags `--single-user /
+ * --tools / --tool-tier / --read-only` all still parse in `main.py`.
+ * When bumping: re-deref a NEW tag to its commit SHA, confirm the
+ * entrypoint, and re-run the docker pin-smoke test.
  *
  * Exported as the single source of truth: the scaffold MCP entry and
  * the in-container `drive-mcp-launcher` both reference this constant so
  * the spawned upstream revision is identical on both code paths.
  */
 export const GOOGLE_WORKSPACE_MCP_PINNED_SHA =
-  "9d69115b63e6bc2ef0d4b5d7a3b962396382b44c";
+  "db6212992738d4380a94fb6940140bcebf5d861d";
 
 /**
  * Pinned softeria/ms-365-mcp-server version — RFC #1873 PR 3.
