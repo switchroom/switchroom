@@ -90,7 +90,7 @@ import { formatTurnLifecycle } from './status-surface-log.js'
 import { removeTurnActiveMarker, touchTurnActiveMarker, writeTurnActiveMarker } from './turn-active-marker.js'
 import { withTurnEndGateBackstop } from './turn-end-gate-backstop.js'
 import { decideTurnEndGate } from './turn-end-gate.js'
-import { finalizeBackstopSendGated } from './turn-record-status.js'
+import { finalizeBackstopSendGated, computeTurnDurationMs } from './turn-record-status.js'
 import type { SilentEndDeps } from '../silent-end.js'
 import type { ChatKey as _ChatKey } from './inbound-delivery-machine.js'
 import type { SessionEvent } from '../session-tail.js'
@@ -2174,7 +2174,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
             chatId,
             threadId,
             turnId: turn.turnId,
-            turnDurationMs: turn.startedAt > 0 ? Date.now() - turn.startedAt : 0,
+            turnDurationMs: computeTurnDurationMs(turn.startedAt, Date.now()),
             reactionCount: reactionTransitionCounts.get(tKey) ?? 0,
           })
         }
@@ -2214,7 +2214,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
         // still appear in turn-duration graphs.
         {
           const sKey = streamKey(chatId, threadId)
-          const turnDurationMs = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
+          const turnDurationMs = computeTurnDurationMs(turn.startedAt, Date.now())
           logStreamingEvent({
             kind: 'turn_end',
             chatId,
@@ -2799,7 +2799,7 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
       finalizeStatusReaction(chatId, threadId, terminalReason)
       {
         const sKey = streamKey(chatId, threadId)
-        const turnDurationMs = turn.startedAt > 0 ? Date.now() - turn.startedAt : 0
+        const turnDurationMs = computeTurnDurationMs(turn.startedAt, Date.now())
         logStreamingEvent({
           kind: 'turn_end',
           chatId,

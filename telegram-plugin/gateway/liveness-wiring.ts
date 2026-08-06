@@ -21,6 +21,7 @@ import * as silencePoke from '../silence-poke.js'
 import * as signalTracker from '../turn-signal-tracker.js'
 import * as pendingProgress from '../pending-work-progress.js'
 import { emitRuntimeMetric } from '../runtime-metrics.js'
+import { computeTurnDurationMs } from './turn-record-status.js'
 import { logStreamingEvent } from '../streaming-metrics.js'
 import { clearSilentEndState } from '../silent-end.js'
 import { purgeStaleTurnsForChat } from './turn-state-purge.js'
@@ -377,7 +378,11 @@ export function buildSilencePokeOptions(deps: LivenessWiringDeps): Parameters<ty
       turnMatchesFallback && wedgedTurn != null && turnLiveForItsTopic(wedgedTurn)
     const turnStartedAt = activeTurnStartedAt.get(fbKey)
     if (turnStartedAt != null) {
-      const turnDurationMs = Date.now() - turnStartedAt
+      // Guard shared with buildTurnRecord + the stream-render turn_ended paths:
+      // a 0 / bogus start must never emit `Date.now() - 0` (an absolute epoch
+      // value) as a duration. This path previously did a bare subtraction and
+      // poisoned the turn_ended dataset when `activeTurnStartedAt` held 0.
+      const turnDurationMs = computeTurnDurationMs(turnStartedAt, Date.now())
       const outboundMetrics = signalTracker.getOutboundMetrics(fbKey)
       emitRuntimeMetric({
         kind: 'turn_ended',
