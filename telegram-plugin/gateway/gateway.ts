@@ -23827,6 +23827,14 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
               const raw = Number(process.env.SWITCHROOM_TG_WORKER_FEED_MAX_ROWS)
               return Number.isInteger(raw) && raw > 0 ? raw : undefined
             })()
+            // First-paint hold for a prose-silent sub-agent card. Unset /
+            // non-positive → the feed's built-in default (4000ms). Operator
+            // override (SWITCHROOM_TG_WORKER_FEED_FIRST_PAINT_MS) lets first
+            // paint be retuned/reverted (e.g. back to 8000) without a redeploy.
+            const workerFeedFirstPaintMs = (() => {
+              const raw = Number(process.env.SWITCHROOM_TG_WORKER_FEED_FIRST_PAINT_MS)
+              return Number.isInteger(raw) && raw > 0 ? raw : undefined
+            })()
             // Model A — foreground sub-agent nesting in the parent's live
             // activity draft. ON by default; this edits the SAME activity-
             // summary message the tool_label feed already owns (not the
@@ -23900,6 +23908,10 @@ async function startGateway(): Promise<void> {  // #2996 P0c: the boot IIFE, now
               // channels.telegram.worker_feed.max_rows via the config cascade
               // (scaffold emits SWITCHROOM_TG_WORKER_FEED_MAX_ROWS); unset → 8.
               maxRows: workerFeedMaxRows,
+              // First-paint hold for a prose-silent worker's initial card.
+              // Unset → the feed's built-in default (4000ms); the operator
+              // override SWITCHROOM_TG_WORKER_FEED_FIRST_PAINT_MS retunes it.
+              firstPaintMinMs: workerFeedFirstPaintMs,
               // Backstop TTL for the feed's stale-row reaper, DERIVED in code
               // from the watcher's effective in-flight terminal cap (same env /
               // default the watcher itself resolves) plus a margin — NOT a

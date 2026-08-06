@@ -304,6 +304,45 @@ describe('createWorkerActivityFeed', () => {
     expect(feed.has('w1')).toBe(true)
   })
 
+  it('defaults firstPaintMin to 4000ms (no explicit firstPaintMinMs)', async () => {
+    // Guards the module default. A prose-silent worker's first card must paint
+    // once it has run ≥4000ms and NOT before — asserting the actual default so
+    // this fails on the old 8000. #fix/worker-feed-first-paint.
+    const bot = makeFakeBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({ bot, now: () => clock })
+    // Just below the 4000 default: still held.
+    clock = 3999
+    await feed.update('w1', 'chat', view({ elapsedMs: 3999 }))
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.has('w1')).toBe(false)
+    // At/above 4000: paints. (On the old 8000 default this would still be held
+    // and bot.sent would be empty — so this assertion pins the new value.)
+    clock = 4000
+    await feed.update('w1', 'chat', view({ elapsedMs: 4000 }))
+    expect(bot.sent).toHaveLength(1)
+    expect(feed.has('w1')).toBe(true)
+  })
+
+  it('honors an explicit firstPaintMinMs override (env plumbing shape)', async () => {
+    // The gateway threads SWITCHROOM_TG_WORKER_FEED_FIRST_PAINT_MS through as
+    // firstPaintMinMs; an operator override (e.g. reverting to 8000) must hold
+    // first paint until that value, overriding the 4000 default.
+    const bot = makeFakeBot()
+    let clock = 0
+    const feed = createWorkerActivityFeed({ bot, now: () => clock, firstPaintMinMs: 8000 })
+    // Past the 4000 default but below the override: still held.
+    clock = 5000
+    await feed.update('w1', 'chat', view({ elapsedMs: 5000 }))
+    expect(bot.sent).toHaveLength(0)
+    expect(feed.has('w1')).toBe(false)
+    // At the override threshold: paints.
+    clock = 8000
+    await feed.update('w1', 'chat', view({ elapsedMs: 8000 }))
+    expect(bot.sent).toHaveLength(1)
+    expect(feed.has('w1')).toBe(true)
+  })
+
   it('messageIdOf exposes the posted message id (for status-pin) and is null before paint / after finish', async () => {
     const bot = makeFakeBot()
     let clock = 0
@@ -706,7 +745,7 @@ describe('createWorkerActivityFeed — heartbeat', () => {
       setInterval: () => 1,
       clearInterval: () => {},
     })
-    // First paint at elapsed 0 (firstPaintMin default 8000 — use 9000). The
+    // First paint at elapsed 0 (firstPaintMin default 4000 — use 9000). The
     // narrative line 'pulling data' lands here, so the current step starts now.
     clock = 19_000
     await feed.update('w1', 'chat', view({ elapsedMs: 9000, latestSummary: 'pulling data' }))
