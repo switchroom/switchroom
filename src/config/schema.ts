@@ -2985,7 +2985,14 @@ export const HindsightConfigSchema = z.object({
       "(which moved the synchronous extraction off the shared asyncio loop onto " +
       "a single-worker thread and bounds its input, ending multi-second loop " +
       "stalls on multi-KB consolidation queries); unset means the image's baked " +
-      "2000, set 0 to restore an unbounded full scan), plus the " +
+      "2000, set 0 to restore an unbounded full scan); and " +
+      "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE — the Postgres " +
+      "text-search regconfig the native BM25 arms and the search_vector index " +
+      "write run to_tsvector/to_tsquery against; unset means upstream's " +
+      "always-safe `english`, set `hindsight_english` to use switchroom's " +
+      "junk-stopping config (dict + stopword file provisioned durably by the " +
+      "image entrypoint, recall degrading to semantic-only if it is ever " +
+      "missing); plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +

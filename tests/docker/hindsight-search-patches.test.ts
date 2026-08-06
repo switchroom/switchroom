@@ -1,12 +1,13 @@
 /**
- * Behavioural proof for the three search/provider patches
+ * Behavioural proof for the search/provider patches
  * `docker/Dockerfile.hindsight` bakes into the pinned upstream Hindsight
  * image. `dockerfile-hindsight-bakes.test.ts` pins the *shape* of those patch
  * blocks (grep-on-file, runs everywhere). This file proves the *outcome*: it
  * runs the same probe against unpatched upstream (must be RED on every bug)
  * and against upstream + the patch blocks applied (must be GREEN).
  *
- * The three defects, all reproduced live on bank `overlord` before the fix:
+ * The first three defects, all reproduced live on bank `overlord` before the
+ * fix:
  *
  *  1. Cross-encoder saturation. `apply_combined_scoring` makes
  *     `CE * recency_boost * temporal_boost * proof_count_boost` the only final
@@ -21,6 +22,14 @@
  *  3. Both LiteLLM timeout handlers ended in a bare `raise`, re-raising an
  *     `asyncio.TimeoutError` whose `str()` is empty → an operator-facing
  *     "TimeoutError:" with no cause.
+ *
+ * A fourth defect (defect 4, PG text-search recall fallback) is driven the same
+ * way: `retrieve_semantic_bm25_combined` caught only Oracle's DRG/ORA codes and
+ * re-raised everything else, so a missing custom `hindsight_english` regconfig
+ * (SQLSTATE 42704) or an orphaned stopword file 500'd EVERY recall instead of
+ * degrading to semantic-only. The probe drives the real function with a fake
+ * connection and asserts it degrades for each PG signature while an unrelated
+ * error still propagates.
  *
  * (A fourth defect once lived here — `retrieve_all_fact_types_parallel` ran the
  * vector-similarity scan twice per recall, because Step 3 passed
@@ -104,6 +113,7 @@ function patchBlocks(): string[] {
     "CE-saturation patch",
     "BM25 compound-token patch",
     "timeout-message patch",
+    "PG text-search recall-fallback patch",
   ];
   return wanted.map((name) => {
     const b = blocks.find((x) => x.includes(name));
@@ -473,6 +483,91 @@ for label, (how, msg) in sorted(timeouts.items()):
     elif "timed out after" not in msg or "scope=" not in msg:
         failures.append("%s timeout message lost the timeout/scope facts: %r" % (label, msg))
 
+# ------------------------------------------------------------------ fix 4
+# PG text-search recall fallback. switchroom runs the native BM25 arms through a
+# CUSTOM regconfig (config.text_search_extension_native_language, e.g.
+# hindsight_english). When that regconfig is missing on a fresh/empty volume that
+# booted before the entrypoint provisioned it, or its snowball stopword file was
+# orphaned by an embedded-pg version bump, Postgres raises SQLSTATE 42704
+# ("text search configuration ... does not exist") or "could not open stop-word
+# file" from conn.fetch — and upstream's retrieve_semantic_bm25_combined only
+# caught the Oracle DRG/ORA codes and re-raised everything else, so EVERY recall
+# 500s (total outage). The patch widens the existing semantic-only fallback to
+# also trip on the PG signatures, reusing the very same rebuild, so recall
+# degrades to semantic-only instead of failing closed.
+#
+# Behavioural, not a grep: drive the REAL retrieve_semantic_bm25_combined with a
+# fake connection whose first fetch raises the PG error and whose fallback fetch
+# returns semantic rows, and assert it degrades (returns those rows via a 2nd
+# fetch) for each PG signature while an UNRELATED error still propagates.
+import hindsight_api.engine.search.retrieval as _retr
+
+_orig_from_db_row = _retr.RetrievalResult.from_db_row
+# Stub row->result so a bare {source, fact_type, id} dict is enough (the real
+# from_db_row wants a full DB row; we only assert which rows survive the arm).
+_retr.RetrievalResult.from_db_row = classmethod(lambda cls, row: dict(row))
+
+
+class _FallbackFakeConn:
+    def __init__(self, exc, rows_on_fallback):
+        self._exc = exc
+        self._rows = rows_on_fallback
+        self.calls = 0
+
+    async def fetch(self, q, *p):
+        self.calls += 1
+        if self.calls == 1:
+            raise self._exc  # the combined BM25 arm
+        return self._rows  # the semantic-only rebuild
+
+
+_FB_SEM_ROWS = [{"source": "semantic", "fact_type": "observation", "id": "sem-1"}]
+
+
+def _mk_pgerr(msg, sqlstate=None):
+    e = Exception(msg)
+    if sqlstate is not None:
+        e.sqlstate = sqlstate
+    return e
+
+
+async def _drive_fallback(exc):
+    conn = _FallbackFakeConn(exc, _FB_SEM_ROWS)
+    out = await _retr.retrieve_semantic_bm25_combined(
+        conn, "[0.1, 0.2]", "hello world", "bank-x", ["observation"], 5,
+    )
+    return conn, out
+
+
+def _run_fallback(label, exc, expect_fallback):
+    try:
+        conn, out = asyncio.run(_drive_fallback(exc))
+    except Exception as e:
+        # Raised out of the function — no fallback happened.
+        print("PGFALLBACK", label, "RAISED", type(e).__name__, repr(getattr(e, "sqlstate", None)))
+        if expect_fallback:
+            failures.append("%s: recall raised %s instead of degrading to semantic-only" % (label, type(e).__name__))
+        return
+    ids = [r.get("id") for r in out["observation"].semantic]
+    print("PGFALLBACK", label, "RETURNED", conn.calls, ids)
+    if not expect_fallback:
+        failures.append("%s: recall degraded to semantic-only for an UNRELATED error (should have raised)" % label)
+        return
+    if conn.calls != 2:
+        failures.append("%s: expected a semantic-only rebuild (2 fetch calls), got %d" % (label, conn.calls))
+    if ids != ["sem-1"]:
+        failures.append("%s: semantic-only fallback did not return the semantic rows: %r" % (label, ids))
+
+
+# Each PG-unavailable signature degrades; an unrelated error (undefined_table)
+# must still propagate — the fallback is NOT a catch-all.
+_run_fallback("sqlstate_42704", _mk_pgerr('text search configuration "hindsight_english" does not exist', sqlstate="42704"), True)
+_run_fallback("stopword_file", _mk_pgerr('could not open stop-word file "/x/hindsight_extra.stop": No such file or directory'), True)
+_run_fallback("config_msg", _mk_pgerr('text search configuration "public.hindsight_english" does not exist'), True)
+_run_fallback("unrelated_error", _mk_pgerr('relation "memory_units" does not exist', sqlstate="42P01"), False)
+
+_retr.RetrievalResult.from_db_row = _orig_from_db_row
+
 print("FAILURES", failures)
 # Sentinel: proves the probe ran to completion. The harness asserts this, so a
 # probe that dies early or short-circuits can never be mistaken for a pass.
@@ -682,6 +777,18 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toMatch(
         /TIMEOUT call_with_tools CAUGHT_BY_ASYNCIO_TIMEOUTERROR ''/
       );
+
+      // Defect 4 — every PG-unavailable signature RAISES out of recall (total
+      // outage) instead of degrading; the driven fallback proves the bug bites.
+      expect(stdout).toMatch(/PGFALLBACK sqlstate_42704 RAISED /);
+      expect(stdout).toMatch(/PGFALLBACK stopword_file RAISED /);
+      expect(stdout).toMatch(/PGFALLBACK config_msg RAISED /);
+      expect(stdout).toContain(
+        "sqlstate_42704: recall raised Exception instead of degrading to semantic-only"
+      );
+      // …but an unrelated error already propagates on upstream too (so the
+      // patched behaviour for it is unchanged, not a new regression).
+      expect(stdout).toMatch(/PGFALLBACK unrelated_error RAISED Exception '42P01'/);
     }, 240_000);
 
     it("upstream + the baked patch blocks is GREEN, including every safety property", () => {
@@ -761,6 +868,16 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toMatch(
         /TIMEOUT call_with_tools CAUGHT_BY_ASYNCIO_TIMEOUTERROR 'LiteLLM tool call timed out after 0\.05s on 1 attempts \(TimeoutError, scope=tools\)'/
       );
+
+      // Fix 4: each PG text-search signature now degrades to semantic-only —
+      // a second (rebuild) fetch returns the semantic rows instead of the whole
+      // recall 500ing …
+      expect(stdout).toContain("PGFALLBACK sqlstate_42704 RETURNED 2 ['sem-1']");
+      expect(stdout).toContain("PGFALLBACK stopword_file RETURNED 2 ['sem-1']");
+      expect(stdout).toContain("PGFALLBACK config_msg RETURNED 2 ['sem-1']");
+      // … while an UNRELATED error (undefined_table) still propagates, proving
+      // the widened fallback is not a catch-all.
+      expect(stdout).toMatch(/PGFALLBACK unrelated_error RAISED Exception '42P01'/);
     }, 240_000);
   }
 );

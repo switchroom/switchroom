@@ -268,6 +268,78 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("bakes the text-search stopword source at the stable version-independent path", () => {
+    // The entrypoint's provision_text_search() re-materializes this file into
+    // the CURRENT embedded-pg install's share/tsearch_data on every boot. It
+    // MUST live at a version-independent path (not inside a pg0 version dir) so
+    // an embedded-pg version bump — which extracts a fresh install dir — cannot
+    // orphan it and make every to_tsvector('hindsight_english', …) fail with
+    // "could not open stop-word file". A stopword file is world-readable data,
+    // so 0644 (not executable).
+    expect(dockerfile).toMatch(
+      /COPY\s+--chmod=0644\s+docker\/hindsight-extra\.stop\s+\/usr\/local\/lib\/switchroom\/hindsight_extra\.stop/,
+    );
+  });
+
+  it("keeps the PG text-search recall-fallback fix (assert-guarded, fail-loud)", () => {
+    // switchroom runs the native (Postgres) BM25 arms through a CUSTOM
+    // text-search regconfig (HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE
+    // = hindsight_english). When that regconfig is missing — a fresh/empty
+    // volume that booted before the entrypoint provisioned it, or an embedded-pg
+    // version bump that orphaned its stopword file — Postgres raises SQLSTATE
+    // 42704 ("text search configuration ... does not exist") or "could not open
+    // stop-word file". Upstream's retrieve_semantic_bm25_combined caught only
+    // Oracle's DRG-10599/ORA-30600/ORA-29902 and re-`raise`d everything else, so
+    // EVERY recall 500s — a total outage, not a degraded one. The patch widens
+    // the existing dialect-agnostic semantic-only fallback (the Oracle branch
+    // already built it) to also trip on the PG signatures, reusing the very same
+    // rebuild. Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-search-patches.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift), naming the
+    // module and the re-author path.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight PG text-search recall-fallback patch: anchor found \{n\}x/,
+    );
+    expect(dockerfile).toMatch(
+      /\(expected 1\) in search\/retrieval\.py — upstream reformatted the BM25 try\/except/,
+    );
+    // The three trigger signatures, all load-bearing: the asyncpg SQLSTATE, the
+    // stopword-file message, and the config-missing message (case-folded).
+    expect(dockerfile).toMatch(
+      /_pg_text_search_unavailable = getattr\(e, "sqlstate", None\) == "42704"/,
+    );
+    expect(dockerfile).toMatch(/"could not open stop-word file" in err_str/);
+    expect(dockerfile).toMatch(
+      /"text search configuration" in err_str\.lower\(\) and "does not exist" in err_str\.lower\(\)/,
+    );
+    // The widened condition must be an OR onto the EXISTING Oracle guard — a
+    // separate `if` could double-run the rebuild or diverge. Pin that the
+    // Oracle codes and the new sentinel share one branch.
+    expect(dockerfile).toMatch(
+      /if _include_bm25 and \("DRG-10599" in err_str or "ORA-30600" in err_str or "ORA-29902" in err_str or _pg_text_search_unavailable\):/,
+    );
+    // Post-replace re-assertions (verification-on-build), including the
+    // LOAD-BEARING one: the dialect-agnostic semantic-only rebuild the Oracle
+    // branch already had must stay the SINGLE fallback path both branches reach —
+    // the patch only widened its TRIGGER, it did not add a second rebuild.
+    expect(dockerfile).toMatch(
+      /assert "_pg_text_search_unavailable" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert 'getattr\(e, "sqlstate", None\) == "42704"' in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "could not open stop-word file" in t,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert t\.count\("rows = await conn\.fetch\(fb_query, \*fb_params\)"\) == 1,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight PG text-search recall-fallback patch: recall degrades to semantic-only/,
+    );
+  });
+
   it("creates /backups owned by hindsight BEFORE `USER hindsight` (so the named volume is writable)", () => {
     // A root-owned /backups mount point makes the fresh named volume
     // root-owned → the non-root hindsight process EACCESes on pg_dump and
