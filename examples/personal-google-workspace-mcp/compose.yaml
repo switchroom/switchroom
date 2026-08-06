@@ -38,7 +38,7 @@ services:
       # Pinned: bumping is a deliberate operator decision, not a silent
       # surprise. Bump in lockstep with retesting the OAuth flow.
       - --from
-      - workspace-mcp==1.20.4
+      - workspace-mcp==1.23.1
       - workspace-mcp
       # streamable-http (not stdio) is required for OAuth 2.1 PKCE per
       # upstream README.

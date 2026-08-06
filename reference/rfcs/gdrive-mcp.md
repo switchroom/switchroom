@@ -27,7 +27,7 @@ Add a Google Drive MCP server so agents can read and (with explicit approval) wr
 
 ## 2. MCP server choice
 
-**Pinned:** [`taylorwilsdon/google_workspace_mcp`](https://github.com/taylorwilsdon/google_workspace_mcp), MIT-licensed, pinned to an explicit upstream **commit SHA** (a tag's deref'd commit, not a floating ref, so upstream history rewrites can't change what we run). The RFC originally targeted `v0.5.x`, but no such tag exists upstream. The live pin is single-sourced in code as `GOOGLE_WORKSPACE_MCP_PINNED_SHA` (`src/memory/scaffold-integration.ts`). That constant, with its doc comment, is the source of truth (currently the `v1.20.4` commit); do not duplicate the literal here, it only rots. Bump deliberately per the procedure in that comment + the `tests/docker/drive-mcp-pin-smoke.test.ts` guard.
+**Pinned:** [`taylorwilsdon/google_workspace_mcp`](https://github.com/taylorwilsdon/google_workspace_mcp), MIT-licensed, pinned to an explicit upstream **commit SHA** (a tag's deref'd commit, not a floating ref, so upstream history rewrites can't change what we run). The RFC originally targeted `v0.5.x`, but no such tag exists upstream. The live pin is single-sourced in code as `GOOGLE_WORKSPACE_MCP_PINNED_SHA` (`src/memory/scaffold-integration.ts`). That constant, with its doc comment, is the source of truth (currently the `v1.23.1` commit); do not duplicate the literal here, it only rots. Bump deliberately per the procedure in that comment + the `tests/docker/drive-mcp-pin-smoke.test.ts` guard.
 
 - **Runtime:** Python 3.11+, run via `uvx` so no system-wide install is required. Switchroom's existing MCP-subprocess machinery already supports `uvx`-launched servers.
 - **License:** MIT.
