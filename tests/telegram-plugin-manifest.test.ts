@@ -90,6 +90,43 @@ describe("telegram-plugin manifest (#229)", () => {
     expect(all).toContain("dispatch-claim-stop.mjs");
   });
 
+  it("sentinel-reply-guard is scoped to the reply tools only", () => {
+    // The guard no-ops for every non-reply tool (its REPLY_TOOLS set is
+    // {reply, stream_reply}), so firing it — and cold-starting node — on
+    // every Read/Bash/Edit is pure waste. Scope the matcher to the two
+    // reply tools it actually guards. Behaviour is identical; we just stop
+    // spawning node for tool calls it would immediately no-op on.
+    const path = join(REPO_ROOT, "telegram-plugin", "hooks", "hooks.json");
+    const m = JSON.parse(readFileSync(path, "utf-8")) as {
+      hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string }> }>>;
+    };
+    const entry = (m.hooks.PreToolUse ?? []).find((g) =>
+      g.hooks.some((h) => h.command.includes("sentinel-reply-guard-pretool.mjs")),
+    );
+    expect(entry).toBeDefined();
+    expect(entry!.matcher).toBe("^mcp__switchroom-telegram__(reply|stream_reply)$");
+
+    // The matcher MUST match exactly the tool names the hook acts on (its
+    // REPLY_TOOLS set) and nothing else — otherwise scoping it would change
+    // behaviour by skipping a guarded tool or needlessly firing on others.
+    const re = new RegExp(entry!.matcher!);
+    for (const guarded of [
+      "mcp__switchroom-telegram__reply",
+      "mcp__switchroom-telegram__stream_reply",
+    ]) {
+      expect(re.test(guarded)).toBe(true);
+    }
+    for (const other of [
+      "Read",
+      "Bash",
+      "Edit",
+      "mcp__switchroom-telegram__edit_message",
+      "mcp__switchroom-telegram__reply_extra",
+    ]) {
+      expect(re.test(other)).toBe(false);
+    }
+  });
+
   it("subagent-tracker hooks gate on Agent or Task (regex matcher)", () => {
     // Pre-#262: matcher was the literal "Agent". Post-fix: regex
     // covering both `Agent` and `Task` for Claude Code version

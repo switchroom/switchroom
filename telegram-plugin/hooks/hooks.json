@@ -11,6 +11,7 @@
         ]
       },
       {
+        "matcher": "^mcp__switchroom-telegram__(reply|stream_reply)$",
         "hooks": [
           {
             "type": "command",
