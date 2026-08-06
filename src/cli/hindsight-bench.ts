@@ -321,7 +321,7 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
   let result: BenchResult;
   try {
     if (profile !== "off") {
-      load = startContention({
+      load = await startContention({
         profile,
         workers: config.contentionWorkers,
         scanPct: Number(opts.contentionScanPct),
@@ -329,7 +329,8 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
         container,
       });
       process.stderr.write(
-        `${chalk.yellow("!")} contention "${profile}" running with ${load.workers} backend(s) — ` +
+        `${chalk.yellow("!")} contention "${profile}" running: ${load.liveBackends} of ` +
+          `${load.workers} worker(s) confirmed attached to PostgreSQL — ` +
           "the live fleet is degraded until this finishes\n",
       );
       // Ctrl-C does not run a `finally`, and an abandoned churn loop keeps

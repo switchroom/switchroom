@@ -108,7 +108,12 @@ export function contentionSql(profile: ContentionProfile, scanPct: number, maxSe
   // `hindsight-watch/probe.ts` documents for its HNSW canary. An aggregate the
   // planner can satisfy without visiting the tuples churns no pages, and the
   // generator would then silently do nothing while looking busy.
-  const churn = `PERFORM sum(length(m.text)) FROM memory_units TABLESAMPLE SYSTEM (${pct}) m;`;
+  // The alias goes BEFORE `TABLESAMPLE`, not after: `FROM t TABLESAMPLE SYSTEM
+  // (n) alias` is a syntax error, and because every worker's stderr used to be
+  // discarded, the original ordering made this generator a silent no-op — it
+  // reported "N backends" while all N had already died. `contentionSql`'s test
+  // now pins the ordering, and `startContention` proves the backends exist.
+  const churn = `PERFORM sum(length(m.text)) FROM memory_units m TABLESAMPLE SYSTEM (${pct});`;
   const writes =
     profile === "write"
       ? `
@@ -135,12 +140,37 @@ END $$;
 export interface ContentionHandle {
   profile: ContentionProfile;
   workers: number;
+  /**
+   * Backends observed in `pg_stat_activity` carrying `CONTENTION_APP_NAME`
+   * after start — the load that DEMONSTRABLY exists, not the load that was
+   * requested. `off` reports 0.
+   */
+  liveBackends: number;
   stop: () => void;
 }
 
 /** An inert handle, so callers never branch on null. */
 export function noContention(): ContentionHandle {
-  return { profile: "off", workers: 0, stop: () => {} };
+  return { profile: "off", workers: 0, liveBackends: 0, stop: () => {} };
+}
+
+/**
+ * How many load backends are actually attached right now.
+ *
+ * The generator's honesty check. A worker that dies on a SQL error exits
+ * instantly and silently — which is exactly what happened while the churn
+ * statement carried a misplaced `TABLESAMPLE` alias: the harness printed
+ * "contention running with 8 backend(s)" for a run under no load at all, and
+ * the resulting numbers said contention does nothing. Counting the backends is
+ * the only claim about load that is not self-reported.
+ */
+export function countContentionBackends(opts: SqlOptions = {}): number {
+  const rows = sql(
+    `SELECT count(*) FROM pg_stat_activity WHERE application_name = '${CONTENTION_APP_NAME}';`,
+    opts,
+  );
+  const n = Number(rows[0]);
+  return Number.isFinite(n) ? n : 0;
 }
 
 /**
@@ -163,18 +193,33 @@ q=lambda k,dflt: shlex.quote(str(d.get(k) or dflt))
 print("U=%s DB=%s P=%s PW=%s"%(q("username","hindsight"),q("database","hindsight"),q("port",5432),q("password","")))' "$D")"
 PGPASSWORD="$PW" PGAPPNAME='${CONTENTION_APP_NAME}' \\
   PGOPTIONS='-c default_transaction_read_only=${readOnly ? "on" : "off"}' \\
-  "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -q -v ON_ERROR_STOP=1 -f - >/dev/null 2>&1
+  "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -q -v ON_ERROR_STOP=1 -f - >/dev/null
 `;
 }
 
+/** Raised when the load generator cannot be shown to be running. */
+export class ContentionError extends Error {}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 /**
- * Start the load. Returns immediately; the backends run until `stop()` or the
- * in-SQL deadline, whichever comes first.
+ * Start the load and PROVE it started.
+ *
+ * The backends run until `stop()` or the in-SQL deadline, whichever comes
+ * first. Before returning, this polls `pg_stat_activity` until at least one
+ * backend carrying `CONTENTION_APP_NAME` is attached, and throws if none ever
+ * appears — carrying whatever the workers wrote to stderr.
+ *
+ * That check is not defensive padding; it is the difference between a
+ * contention measurement and a fiction. A worker whose SQL fails to parse exits
+ * in milliseconds, so without it the harness reports "running with N
+ * backend(s)", measures an idle system, and produces a table that says
+ * contention has no effect.
  *
  * `write` creates the scratch table up front (and only then) so a `read` run
  * cannot leave a table behind on a production database.
  */
-export function startContention(opts: ContentionOptions): ContentionHandle {
+export async function startContention(opts: ContentionOptions): Promise<ContentionHandle> {
   if (opts.profile === "off") return noContention();
   const container = opts.container ?? DEFAULT_CONTAINER;
   const sqlOpts: SqlOptions = { container, run: opts.run };
@@ -191,33 +236,62 @@ export function startContention(opts: ContentionOptions): ContentionHandle {
 
   const script = contentionSql(opts.profile, opts.scanPct, opts.maxSeconds);
   const children: ChildProcess[] = [];
+  let workerStderr = "";
   for (let i = 0; i < workers; i++) {
     const child = spawn("docker", ["exec", "-i", container, "sh", "-c", workerSh(readOnly)], {
-      stdio: ["pipe", "ignore", "ignore"],
+      // stderr is PIPED, never discarded: it is the only place a worker's SQL
+      // error can surface, and discarding it is what let a broken generator
+      // look healthy.
+      stdio: ["pipe", "ignore", "pipe"],
       detached: false,
     });
     child.stdin?.end(script);
-    // A load generator that dies is a measurement bug, not a crash — the run
-    // still produces a result, and `stop()` reports how many survived.
-    child.on("error", () => {});
+    child.stderr?.on("data", (d: Buffer) => {
+      if (workerStderr.length < 4000) workerStderr += d.toString();
+    });
+    // A worker that dies is a measurement bug, not a crash: the liveness check
+    // below is what turns it into a loud failure.
+    child.on("error", (e) => {
+      workerStderr += `${e.message}\n`;
+    });
     children.push(child);
   }
 
   let stopped = false;
+  const killAll = (): void => {
+    for (const c of children) {
+      try {
+        c.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+
+  // Poll rather than sleep-once: backend registration is not instant, and a
+  // fixed sleep would either be flaky or waste time on every contended run.
+  let liveBackends = 0;
+  for (let attempt = 0; attempt < 10 && liveBackends === 0; attempt++) {
+    await sleep(500);
+    liveBackends = countContentionBackends(sqlOpts);
+  }
+  if (liveBackends === 0) {
+    killAll();
+    throw new ContentionError(
+      `contention profile "${opts.profile}" started ${workers} worker(s) but none attached to ` +
+        `PostgreSQL within 5s — the measurement would be of an IDLE system. ` +
+        `worker stderr: ${workerStderr.trim() || "(none)"}`,
+    );
+  }
+
   return {
     profile: opts.profile,
     workers,
+    liveBackends,
     stop: () => {
       if (stopped) return;
       stopped = true;
-      for (const c of children) {
-        try {
-          c.kill("SIGKILL");
-        } catch {
-          // Already gone. Nothing to do; the terminate sweep below is the
-          // authoritative stop anyway.
-        }
-      }
+      killAll();
       // THE authoritative stop. Killing the `docker exec` client does not
       // reliably kill the server-side backend, so an orphaned churn loop could
       // otherwise keep hammering production after the harness exits. Keyed on

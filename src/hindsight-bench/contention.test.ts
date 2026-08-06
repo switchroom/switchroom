@@ -1,5 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { CONTENTION_APP_NAME, DEFAULT_CONTENTION, SCRATCH_TABLE, contentionSql, noContention } from "./contention.js";
+import {
+  CONTENTION_APP_NAME,
+  ContentionError,
+  DEFAULT_CONTENTION,
+  SCRATCH_TABLE,
+  contentionSql,
+  countContentionBackends,
+  noContention,
+  startContention,
+} from "./contention.js";
+import type { Runner } from "./db.js";
 
 describe("contentionSql", () => {
   it("always carries an absolute deadline (the orphan backstop)", () => {
@@ -76,5 +86,70 @@ describe("defaults", () => {
     expect(DEFAULT_CONTENTION.workers).toBeLessThanOrEqual(2);
     expect(DEFAULT_CONTENTION.scanPct).toBeLessThanOrEqual(5);
     expect(DEFAULT_CONTENTION.maxSeconds).toBeLessThanOrEqual(3600);
+  });
+});
+
+describe("contentionSql — the churn statement must actually parse", () => {
+  it("puts the table alias BEFORE the TABLESAMPLE clause", () => {
+    // `FROM memory_units TABLESAMPLE SYSTEM (n) m` is a PostgreSQL syntax
+    // error. That ordering shipped, every load backend died on connect, the
+    // stderr was discarded, and the harness measured an idle system while
+    // reporting "8 backend(s)". This test pins the ordering that parses.
+    const s = contentionSql("read", 25, 60);
+    expect(s).toMatch(/FROM\s+memory_units\s+m\s+TABLESAMPLE\s+SYSTEM\s*\(25\)/);
+    expect(s).not.toMatch(/TABLESAMPLE\s+SYSTEM\s*\([\d.]+\)\s*m\b/);
+  });
+
+  it("references the aliased relation in the aggregate it forces", () => {
+    // `sum(length(m.text))` only resolves if `m` is bound; a mismatch here is
+    // the same class of silent-death bug.
+    expect(contentionSql("read", 2, 60)).toContain("sum(length(m.text))");
+  });
+});
+
+describe("countContentionBackends", () => {
+  it("counts only backends carrying the harness's application_name", () => {
+    const seen: string[] = [];
+    const run: Runner = (_c, _a, stdin) => {
+      seen.push(stdin ?? "");
+      return { status: 0, stdout: "3\n", stderr: "" };
+    };
+    expect(countContentionBackends({ run })).toBe(3);
+    expect(seen[0]).toContain(`application_name = '${CONTENTION_APP_NAME}'`);
+  });
+
+  it("reads an unparseable answer as zero load, never as success", () => {
+    const run: Runner = () => ({ status: 0, stdout: "", stderr: "" });
+    expect(countContentionBackends({ run })).toBe(0);
+  });
+});
+
+describe("startContention liveness gate", () => {
+  it("REFUSES to return a handle when no backend ever attaches", async () => {
+    // The whole point: a run that silently measures an idle system is worse
+    // than a run that fails, because its table is published as evidence.
+    const run: Runner = () => ({ status: 0, stdout: "0\n", stderr: "" });
+    await expect(
+      startContention({ profile: "read", workers: 2, scanPct: 2, maxSeconds: 30, container: "nope", run }),
+    ).rejects.toThrow(ContentionError);
+  }, 20000);
+
+  it("reports the OBSERVED backend count, not the requested worker count", async () => {
+    const run: Runner = () => ({ status: 0, stdout: "1\n", stderr: "" });
+    const h = await startContention({
+      profile: "read",
+      workers: 8,
+      scanPct: 2,
+      maxSeconds: 30,
+      container: "nope",
+      run,
+    });
+    expect(h.workers).toBe(8);
+    expect(h.liveBackends).toBe(1);
+    h.stop();
+  }, 20000);
+
+  it("an off profile is inert and claims no load", () => {
+    expect(noContention()).toMatchObject({ profile: "off", workers: 0, liveBackends: 0 });
   });
 });
