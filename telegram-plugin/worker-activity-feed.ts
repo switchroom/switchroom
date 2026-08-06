@@ -800,7 +800,7 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
   const floodWaitRemainingMs = opts.floodWaitRemainingMs ?? (() => 0)
   const minEditInterval = opts.minEditIntervalMs ?? 2500
   const elapsedRefreshMs = Math.max(minEditInterval, Math.floor(opts.elapsedRefreshMs ?? 15000))
-  const firstPaintMin = opts.firstPaintMinMs ?? 8000
+  const firstPaintMin = opts.firstPaintMinMs ?? 4000
   const heartbeatTickMs = opts.heartbeatTickMs ?? 6000
   const maxRows = Math.max(1, Math.floor(opts.maxRows ?? 8))
   const staleWorkerTtlMs = Math.max(1, Math.floor(opts.staleWorkerTtlMs ?? 50 * 60_000))
