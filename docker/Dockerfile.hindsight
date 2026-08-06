@@ -94,7 +94,7 @@ USER root
 # claude bundle as the agent containers — a version skew here could reintroduce
 # the thinking-block / thinking-effort class of failures on memory reflection
 # (see #1978). The canary overrides it the same way base does.
-ARG CLAUDE_CODE_VERSION=2.1.221
+ARG CLAUDE_CODE_VERSION=2.1.223
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && claude --version >&2
 
