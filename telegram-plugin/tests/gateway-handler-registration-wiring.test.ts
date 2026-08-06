@@ -57,6 +57,8 @@ const GOLDEN_REGISTRATIONS: readonly string[] = [
   'command:inject',
   'command:compact',
   'command:clear',
+  'command:private',
+  'command:public',
   'helper:registerModelEffortCommands',
   'command:agentstart',
   'command:agentstop',
