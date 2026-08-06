@@ -73,7 +73,13 @@ from lib.pacing import inflight_lock
 # retain.py owns the transcript reader, the deterministic-id recipe and the
 # network-free payload builder; reuse them wholesale so the sidechain path
 # stays byte-identical to the main path where it matters (dedup ids, formatting).
-from retain import build_retain_payload, read_transcript
+from retain import (
+    _has_open_interval,
+    build_retain_payload,
+    exclude_private_ranges,
+    read_privacy_state,
+    read_transcript,
+)
 
 # Retain the last N human turns of the sidechain. The window is formatted on the
 # TEXT-ONLY path (``retainToolCalls`` is forced False for the sidechain — see
@@ -333,6 +339,15 @@ def run_subagent_retain(hook_input: dict) -> dict:
          "payload": {...},   # only when status == "failed" (for enqueue)
          "error":   Exception}  # only when status == "failed"
     """
+    # /private-mode enforcement (switchroom privacy PR1) — FIRST, before
+    # load_config(). Subagents have no toggle of their own; they honor the
+    # parent session's privacy state file (same env, same path). An OPEN private
+    # interval means confidential material is being discussed right now, so the
+    # sidechain retain must not fire — placed above load_config() so a
+    # HINDSIGHT_AUTO_RETAIN=true env pin cannot override the privacy guarantee.
+    if _has_open_interval(read_privacy_state()):
+        return {"status": "skipped", "reason": "private-mode"}
+
     config = load_config()
 
     if not config.get("autoRetain"):
@@ -378,6 +393,19 @@ def run_subagent_retain(hook_input: dict) -> dict:
     if not all_messages:
         debug_log(config, f"SubagentStop: empty sidechain transcript {transcript_path}")
         return {"status": "skipped", "reason": "empty transcript"}
+
+    # /private-mode redaction (review MAJOR 2) — the open-interval early-skip
+    # above only catches a range that is STILL open at SubagentStop. But a
+    # backgrounded sub-agent can be dispatched under /private, carry that
+    # confidential context, and finish AFTER /public closed the interval — no
+    # interval open here, yet its window still holds private-window material.
+    # Apply the same range redaction the parent Stop path uses so a now-CLOSED
+    # private range is excluded from the sidechain retain too. Runs BEFORE the
+    # volume gate so the gate measures the redacted content.
+    all_messages = exclude_private_ranges(all_messages, read_privacy_state())
+    if not all_messages:
+        debug_log(config, "SubagentStop: all sidechain messages fell inside private ranges")
+        return {"status": "skipped", "reason": "private-mode"}
 
     # Volume gate — skip trivial forks, log the skip for coverage auditing.
     passed, turns, chars = passes_volume_gate(all_messages, config)
