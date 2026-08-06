@@ -368,6 +368,103 @@ describe('narrative-lane golden — silent-sentinel card suppression (#4348)', (
   })
 })
 
+// ── #45 — HOLLOW activity card is SUPPRESSED (deleted, not finalized) ──────────
+// A turn injected into the session (typically a duplicate sub-agent handback
+// beat) adopts a per-turn activity card at turn START, then ends having done
+// ZERO surfaced tool work, never calling reply, delivering no final answer, and
+// emitting no captured/reply text. The card was posted but never got content —
+// the contentless `🤖 Agent · done · 0 tools · Ns` record. The #4348 sentinel
+// gate can't catch it (no NO_REPLY/HEARTBEAT_OK text to match), so the hollow
+// gate must DELETE it. A turn with ANY real content keeps its card.
+describe('narrative-lane golden — hollow-ghost card suppression (#45)', () => {
+  // Same open-then-stamp shape as the #4348 suite: open the feed card on a
+  // fresh (working) turn, then set the turn's terminal outcome and clear.
+  async function openThenClear(over: Partial<CurrentTurn>) {
+    const { lane, calls } = makeLane()
+    const turn = makeLaneTurn(lane)
+    lane.showNarrativeStep(turn, 'Doing the work now')
+    await turn.activityInFlight
+    const cardId = turn.activityMessageId
+    expect(cardId).not.toBeNull()
+    Object.assign(turn, over)
+    lane.clearActivitySummary(turn)
+    await settle()
+    return { calls, cardId, turn }
+  }
+
+  it('genuinely hollow turn (0 tools, no reply, no text, no narration): DELETES the card, no done edit', async () => {
+    // The exact #45 ghost-reply signature Ken reported: a card opened by the
+    // liveness timer that stayed contentless — `mirrorLines` EMPTY. FAILS
+    // pre-fix: clearActivitySummary finalizes a contentless `done · 0 tools`
+    // card with an editMessageText instead of deleting it.
+    //
+    // `mirrorLines: []` is set explicitly: `openThenClear` opens the card via
+    // `showNarrativeStep`, which pushes a line into `mirrorLines`; resetting it
+    // to empty here isolates Ken's real signature (card open via the timer, no
+    // surfaced narration) from the narration-only case pinned below.
+    const { calls, cardId, turn } = await openThenClear({
+      replyCalled: false,
+      labeledToolCount: 0,
+      mirrorLines: [],
+      capturedText: [],
+      lastReplyText: '',
+      finalAnswerEverDelivered: false,
+    })
+    expect(calls.filter((c) => c.method === 'deleteMessage' && c.message_id === cardId)).toHaveLength(1)
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId)).toHaveLength(0)
+    // Tracking released so a late render / superseded-prior finalize can't
+    // resurrect the card.
+    expect(turn.activityMessageId).toBeNull()
+  })
+
+  it('a narration-only turn (a rendered mirror line, 0 tools/reply/text) KEEPS its card (edit, no delete)', async () => {
+    // The regression the edit-flood-fuse pin
+    // (activity-drain-fuse-drop-not-failure.test.ts "a terminal card render is
+    // never shed") protects, pinned here in the fix's own suite: a turn that
+    // surfaced a `showNarrativeStep` line the user SAW is legitimate content —
+    // NOT Ken's empty ghost card — so the card must FINALIZE, never be deleted.
+    // `openThenClear` already surfaced "Doing the work now" into `mirrorLines`;
+    // we deliberately do NOT reset it, so the hollow gate must keep the card.
+    const { calls, cardId } = await openThenClear({
+      replyCalled: false,
+      labeledToolCount: 0,
+      capturedText: [],
+      lastReplyText: '',
+      finalAnswerEverDelivered: false,
+    })
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId).length)
+      .toBeGreaterThanOrEqual(1)
+    expect(calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+  })
+
+  it('a turn that did surfaced tool work is NOT hollow — its card FINALIZES (edit, no delete)', async () => {
+    // The guarantee the fix must not break: a card carrying a real `✓ N steps`
+    // body stays as a record even when the turn never replied.
+    const { calls, cardId } = await openThenClear({
+      replyCalled: false,
+      labeledToolCount: 3,
+      capturedText: [],
+      lastReplyText: '',
+      finalAnswerEverDelivered: false,
+    })
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId).length)
+      .toBeGreaterThanOrEqual(1)
+    expect(calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+  })
+
+  it('a turn that delivered a final answer keeps its card (edit, no delete)', async () => {
+    const { calls, cardId } = await openThenClear({
+      replyCalled: true,
+      labeledToolCount: 0,
+      lastReplyText: 'The three services are all green.',
+      finalAnswerEverDelivered: true,
+    })
+    expect(calls.filter((c) => c.method === 'editMessageText' && c.message_id === cardId).length)
+      .toBeGreaterThanOrEqual(1)
+    expect(calls.filter((c) => c.method === 'deleteMessage')).toHaveLength(0)
+  })
+})
+
 // ── THREE-MODULE cross-surface dedup (Amendment 1) ────────────────────────
 // The REAL P4-A handleSessionEvent turn-flush, with the REAL P4-B lane wired
 // into its deps, records the delivered answer into ONE OutboundDedupCache;
