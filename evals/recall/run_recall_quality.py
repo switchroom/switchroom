@@ -53,6 +53,10 @@ DEFAULT_API_URL = os.environ.get("HINDSIGHT_API_URL", "http://127.0.0.1:18888")
 EXIT_OK = 0
 EXIT_REGRESSION = 1
 EXIT_USAGE = 2
+# Distinct from EXIT_REGRESSION on purpose: "the candidate is measurably worse"
+# and "no budget could be evaluated" are different claims, and CI should be able
+# to tell them apart. Both are non-zero -- neither is a pass.
+EXIT_UNGRADED = 3
 
 
 # ────────────────────────── running ──────────────────────────
@@ -489,10 +493,24 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if verdict["ok"]:
         print("  PASS: within budget")
         return EXIT_OK
-    print("  FAIL:")
-    for finding in verdict["findings"]:
+
+    # A measured regression and an un-evaluable budget both block, but they are
+    # not the same claim and must not share an exit code. With no qrels
+    # committed every compare is `ungraded` -- including a file against itself --
+    # so a single non-zero code would be evidence of nothing.
+    if verdict["regressions"]:
+        print("  FAIL (measured regression):")
+        for finding in verdict["regressions"]:
+            print(f"    - {finding}")
+        for finding in verdict["ungraded"]:
+            print(f"    - (also ungraded) {finding}")
+        return EXIT_REGRESSION
+
+    print("  BLOCKED (cannot certify -- nothing was graded):")
+    for finding in verdict["ungraded"]:
         print(f"    - {finding}")
-    return EXIT_REGRESSION
+    print("    no measured regression was found; this is not a pass either")
+    return EXIT_UNGRADED
 
 
 def write_out(out: str | None, payload: Mapping[str, object]) -> None:

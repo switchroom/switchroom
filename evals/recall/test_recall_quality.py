@@ -147,7 +147,33 @@ class RegressionGate(unittest.TestCase):
     def test_a_missing_stage_is_a_failure_not_a_pass(self):
         verdict = metrics.compare(self.BASE, {"stages": {}, "keyword_arm_row_counts": {}})
         self.assertFalse(verdict["ok"])
-        self.assertIn("cannot grade", verdict["findings"][0])
+        self.assertTrue(any("cannot grade" in f for f in verdict["ungraded"]))
+
+    # -- the gate must DISCRIMINATE, not merely go red -------------------------
+    #
+    # With no qrels committed there is no recall@10 on either side, so every
+    # unjudged compare is un-gradeable -- including a run against itself. If
+    # "measurably worse" and "could not be measured" shared one verdict, a red
+    # result on a degraded config would be evidence of nothing at all.
+
+    def test_an_unjudged_run_against_itself_is_ungraded_not_a_regression(self):
+        unjudged = {"stages": {}, "keyword_arm_row_counts": {"q1": 10}}
+        verdict = metrics.compare(unjudged, unjudged)
+        self.assertEqual(verdict["verdict"], "ungraded")
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(verdict["regressions"], [])
+        self.assertTrue(verdict["ungraded"])
+
+    def test_an_unjudged_degraded_run_is_still_a_measured_regression(self):
+        unjudged = {"stages": {}, "keyword_arm_row_counts": {"q1": 10, "q2": 8}}
+        ablated = {"stages": {}, "keyword_arm_row_counts": {"q1": 0, "q2": 0}}
+        verdict = metrics.compare(unjudged, ablated)
+        self.assertEqual(verdict["verdict"], "regression")
+        self.assertEqual(verdict["zero_result_regressions"], ["q1", "q2"])
+
+    def test_the_two_verdicts_do_not_share_an_exit_code(self):
+        self.assertNotEqual(runner.EXIT_UNGRADED, runner.EXIT_REGRESSION)
+        self.assertNotEqual(runner.EXIT_UNGRADED, runner.EXIT_OK)
 
 
 class Ablation(unittest.TestCase):

@@ -230,6 +230,36 @@ instead of passing on a technicality.
 `test_recall_quality.py::Ablation::test_ablated_run_scores_worse_and_the_gate_goes_red`
 pins this offline, with no live instance involved.
 
+### Going red is not enough — the gate has to discriminate
+
+A gate that is red on *everything* proves nothing about a degraded config. That
+is not hypothetical here: until judgements are committed there is no
+`recall@10` on either side, so the recall budget cannot be evaluated at all —
+and a compare of a result file **against itself** was red for exactly that
+reason. Red-on-degraded is only evidence if green-on-identical is reachable.
+
+So failures are split by kind, and they do not share an exit code:
+
+| verdict | meaning | exit |
+|---|---|---|
+| `pass` | every evaluable budget was met | 0 |
+| `regression` | a budget was evaluated and **measurably** breached | 1 |
+| `ungraded` | no regression found, but a budget could not be evaluated | 3 |
+
+`ungraded` still blocks — an uncertifiable run is not a passing run — but it is
+a different claim from "the candidate is worse", and CI can tell them apart.
+
+Live, on the committed artefacts:
+
+- baseline vs `--disable-keyword-arm` → `regression`, exit **1**,
+  23 keyword-zero regressions
+- ablated run vs an identical copy of itself → `ungraded`, exit **3**,
+  0 regressions
+
+The discriminating signal is the keyword-zero regression count, which is
+**label-free** — it needs two runs and a row count, no judgements. That is what
+makes AC1 demonstrable today rather than after a judgement campaign.
+
 ## Determinism
 
 #4479 AC3 asks for identical scores across runs, or a documented bound under

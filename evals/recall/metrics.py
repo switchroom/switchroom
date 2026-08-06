@@ -275,8 +275,19 @@ def compare(
       arm answered that the candidate's does not. This is the guard that a
       tokenizer silently reverting to unstemmed (risk C1 in #4474) trips, and
       it defaults to zero tolerance.
+
+    Failures are split into two kinds, because conflating them makes the gate
+    unfalsifiable. ``regressions`` are *measured* — the candidate is provably
+    worse. ``ungraded`` means a budget could not be evaluated at all (typically
+    no qrels, so ``recall@10`` does not exist on either side). Both block, but
+    only the first discriminates: with no judgements committed, *every* compare
+    is ungraded, including a run against itself, so an exit code that cannot
+    tell the two apart proves nothing about a degraded configuration. ``verdict``
+    is ``pass`` / ``regression`` / ``ungraded`` and the caller maps it to a
+    distinct exit code.
     """
-    findings: list[str] = []
+    regressions: list[str] = []
+    ungraded: list[str] = []
 
     b_stage = (baseline.get("stages") or {}).get(gate_stage) or {}
     c_stage = (candidate.get("stages") or {}).get(gate_stage) or {}
@@ -284,14 +295,14 @@ def compare(
     c_r10 = c_stage.get("recall@10")
     drop = None
     if b_r10 is None or c_r10 is None:
-        findings.append(
+        ungraded.append(
             f"recall@10 missing at stage {gate_stage} "
             f"(baseline={b_r10!r}, candidate={c_r10!r}) — cannot grade"
         )
     else:
         drop = round(b_r10 - c_r10, 6)
         if drop > max_recall10_drop:
-            findings.append(
+            regressions.append(
                 f"recall@10 at {gate_stage} dropped {drop:.4f} > budget {max_recall10_drop:.4f} "
                 f"({b_r10:.4f} -> {c_r10:.4f})"
             )
@@ -300,14 +311,24 @@ def compare(
     c_kw = candidate.get("keyword_arm_row_counts") or {}
     regressed = sorted(q for q, n in b_kw.items() if n > 0 and c_kw.get(q, 0) == 0)
     if len(regressed) > max_zero_result_regressions:
-        findings.append(
+        regressions.append(
             f"{len(regressed)} queries went keyword-zero that the baseline answered "
             f"(budget {max_zero_result_regressions}): {regressed[:10]}"
             + ("..." if len(regressed) > 10 else "")
         )
 
+    if regressions:
+        verdict = "regression"
+    elif ungraded:
+        verdict = "ungraded"
+    else:
+        verdict = "pass"
+
     return {
-        "ok": not findings,
+        "ok": verdict == "pass",
+        "verdict": verdict,
+        "regressions": regressions,
+        "ungraded": ungraded,
         "gate_stage": gate_stage,
         "recall@10_baseline": b_r10,
         "recall@10_candidate": c_r10,
@@ -317,7 +338,7 @@ def compare(
             "max_recall10_drop": max_recall10_drop,
             "max_zero_result_regressions": max_zero_result_regressions,
         },
-        "findings": findings,
+        "findings": regressions + ungraded,
     }
 
 
