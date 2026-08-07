@@ -33,6 +33,164 @@ now an anomaly worth investigating, not the norm.
   trivial rename of this header instead of reconstructing the whole section
   from `git log` at release time (as v0.20.12 had to).
 
+### Hindsight keyword recall moves to ParadeDB pg_search (BM25)
+
+- **New installs default to the `pg_search` BM25 backend (#4470)** — the keyword
+  arm of Hindsight recall switches from native Postgres `tsvector`/`ts_rank` to
+  a Tantivy-backed BM25 index. Native ranked by bitmap-heap-scanning every
+  matching row, which on this fleet degenerated to a seq-scan on the
+  highest-frequency lexemes (`claude`/`code`/`agent`, folded into ~80% of rows
+  through the `context` tag) — ~415ms on a large bank. pg_search returns
+  index-driven top-N: 1.6ms measured on real 86k-row bank data, 18MB index built
+  in 555ms. The extension is provisioned durably by the image rather than by an
+  operator step: `docker/Dockerfile.hindsight` installs `libopenblas0` (which
+  `pg_search.so` hard-links against), pin-fetches and sha256-verifies the
+  ParadeDB PG18 debs and bakes them to a stable path (a missing or mismatched
+  artifact fails the build loudly); `docker/hindsight-entrypoint.sh` copies the
+  baked `.so`/control/SQL into the embedded-pg version-scoped install before
+  start and brings pg0 up with `shared_preload_libraries=pg_search`. A PG-major
+  mismatch is refused with a loud warning instead of a crashed postmaster.
+- **This does NOT migrate an existing populated bank.** `hindsight_api`
+  hard-refuses to switch the text-search backend against non-empty tables, so an
+  operator running a populated fleet must pin
+  `HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "native"` under `hindsight.env` before
+  taking this release, migrate on their own schedule, then unpin. The pin
+  survives `switchroom apply` because the key is on the perf-env allowlist —
+  without that pairing the pin would be silently discarded and the container
+  would come up on `pg_search` against live data.
+- **Recall degrades to semantic-only when the BM25 index is absent (#4472)** —
+  previously it failed closed. Whenever the `USING bm25` index is missing — the
+  initial build window on a fresh or large volume, or any `REINDEX` — a recall
+  query hitting the `@@@`/`paradedb.score` arm raises
+  `XX000: memory_units does not contain a USING bm25 index`, and the engine's
+  unavailability predicate only recognised the *native* tsvector failure
+  signatures, so it re-raised and **every recall 500'd for the whole rebuild
+  window**. Native degraded gracefully; pg_search did not. switchroom's
+  build-time recall-fallback patch now also recognises the pg_search signature,
+  matching on `XX000` **and** the table-name-agnostic substring rather than
+  `XX000` alone (that code is Postgres' catch-all `internal_error`, and a broad
+  match would mask real bugs). A routine reindex is now a lossy-but-serving
+  recall instead of a total memory outage. Read path only; caught by a dry-run
+  against a 772k-row clone.
+- **Index rebuilds no longer silently downgrade a stemmed tokenizer (#4482)** —
+  the stemmed/stopworded ParadeDB variant that recall quality needs
+  (`stemmer=english` + `stopwords_language=english`) is not expressible through
+  the tokenizer config knob at all, so it can only exist as hand-built DDL — and
+  nothing defended it. Every "does the live index match the config" decision
+  keyed on the `key_field` reloption alone and never looked at the tokenizer
+  cast, while an ordinary engine upgrade does an unconditional `DROP INDEX` +
+  `CREATE INDEX` against a **populated** `memory_units` with the column list
+  taken straight from the knob. Stemming disappeared with no error and no log
+  line. A build-time patch now parses the pre-existing index definition before
+  any drop: a tokenizer the knob **cannot** express is preserved, one it **can**
+  express is treated as a deliberate config change and config still wins (at
+  WARN), and the every-boot path compares casts and logs a mismatch at ERROR
+  under the stable marker `pg_search_tokenizer_drift`. The guard deliberately
+  never raises and never changes the upstream match decision — raising on the
+  boot path would take the semantic arm down alongside the keyword one, turning
+  a quality regression into a full memory outage; two build-time asserts pin
+  that property.
+
+### Hindsight `vault:` secrets outside the apply path
+
+- **Resolve `vault:` LLM api_key refs on the recreate and rollout launch paths
+  (#4471)** — root cause of the 2026-08-06 fleet outage where **all fact
+  extraction failed**. `hindsight.llm.api_key` and `hindsight.llm.<op>.api_key`
+  are `vault:` references, but resolution ran only inside `switchroom apply`,
+  behind the operator passphrase. Standalone `switchroom memory setup
+  --recreate` and hostd's `refresh-hindsight` rollout step (which spawns exactly
+  that command) run without the apply-time resolver, so they baked the *literal*
+  string `vault:litellm/...` into the Hindsight container env and LiteLLM
+  rejected it (`Virtual Key expected... expected to start with 'sk-'`). These
+  paths now resolve through the vault broker, which works non-interactively —
+  the same mechanism `cp_access_key` already used on this exact passphrase-less
+  path. An unresolvable ref **drops** the key so the lane falls back to the
+  global/provider default, rather than baking a guaranteed-invalid literal.
+  Wired into `memory setup` (launch and its env-drift compare), `memory
+  docker-compose`, and first-run `setup`. Pure secret resolution; no routing
+  change.
+- **Warn when a `vault:` api_key is dropped, and flag secret-bearing compose
+  output (#4473)** — dropping an unresolvable ref is the right fail-safe but was
+  silent: the lane ran on an inherited credential and fact extraction could fail
+  with no trace. The first-run and recreate launch paths now print an operator
+  warning naming the lane (global / retain / reflect / consolidation) and the
+  `vault:` reference — never the resolved `sk-` value — symmetric to the
+  `cp_access_key` warning they already emitted. Separately, `switchroom memory
+  docker-compose` legitimately emits real secrets in cleartext (a paste-ready
+  compose file must carry them), so it now prints a one-line warning **to
+  stderr** as a `#` comment: a redirected stdout stays a valid compose file even
+  under `2>&1`, while an interactive operator is told the output is
+  secret-bearing.
+
+### Recall quality is now a measurable, gating number
+
+- **Recall-quality regression suite (#4484)** — the strongest datapoint in the
+  pg_search investigation was a quality one (the candidate backend answered
+  queries native returns zero rows for), and it lived only in a dry-run note
+  where it could gate nothing. `evals/recall/` turns it into a score: a
+  read-only, sequential suite with pure scoring (recall@10/@50, nDCG@10, MRR,
+  RRF, judged coverage, a regression gate, a variance report), a transport that
+  raises on anything outside three allowlisted read requests, a strict query-set
+  loader, and 141 authored cases across 7 families, versioned and sha256-stamped
+  into every result. CI gains three zero-cost offline steps (validator selftest,
+  query-set validation, scorer unit tests); scoring a live configuration needs a
+  running instance and stays an operator-run command. The suite is proven
+  non-vacuous by ablating the keyword arm client-side and watching the gate go
+  red. A correction worth knowing: the native arm **ORs** its tokens, so a
+  lexically rare phrase still matches on a populated bank — the arm goes to zero
+  only when the query reduces to an empty tsquery, which on this fleet means a
+  query built purely from `hindsight_english` stopwords plus the corpus
+  boilerplate (`claude`, `code`, `agent`, `assistant`, `user`, `switchroom`,
+  `sidechain`).
+
+### Test isolation and CI
+
+- **Test runs can no longer mint banks in the live fleet Hindsight (#4483)** —
+  on 2026-07-30 a harness sweep created eleven throwaway banks in the **live**
+  fleet Hindsight in four minutes, one of them named `clerk`, which overwrote a
+  decoy bank's warning marker and led a later worker to report a live agent's
+  memory as lost. It was a false alarm that cost real recovery time. The leak
+  path is structural: every agent container exports
+  `HINDSIGHT_API_URL=http://127.0.0.1:18888` and a test process inside a
+  container inherits it, defaulting straight at the live instance. The guard is
+  at the **runner**, not the engine — the engine's auto-create-on-miss is
+  deliberate (an agent's first write must create its bank) and the stray
+  requests were indistinguishable on the wire from a real first write, so any
+  engine-side guard would reduce to name-guessing. Both vitest and bun now
+  preload a guard that scrubs the endpoint env vars to an unroutable sentinel
+  and rejects fleet origins at `fetch`, with a lint gate pinning the wiring
+  (including that the guard's port list still tracks the fleet port) and a
+  runtime alarm so a present-but-not-loading config fails a test instead of
+  silently un-protecting the runner. Opt out per suite with
+  `SWITCHROOM_TEST_HINDSIGHT_ALLOW_ORIGINS`. No production code path, no image,
+  no engine change.
+- **Fix the `history.js` module-mock leak behind the #4488 CI flake (#4494)** —
+  a plugin test module-mocked `../history.js`, which is file-scoped under vitest
+  but maps onto bun's **process-global** `mock.module` in the `bun-test-run` job
+  that sweeps all 651 plugin files in one process. The mock retroactively
+  rebound every other file's import of that specifier, so a sibling suite
+  exercising the real `hasOutboundWithText` was told a row it had just written
+  did not exist — the intermittent `Expected: true / Received: false` that
+  reproduced on identical commits depending on bun's file-discovery order. The
+  oracle is now injected through a dependency seam
+  (`CapturedResumePorts.hasOutboundWithText`, defaulting to the real export) per
+  the repo's documented bun-safe convention, and the module-mock-scope lint gate
+  now **bans** `../history.js` mocks outright instead of carrying an exception
+  that assumed no sibling suite used the real module.
+
+### Dependencies
+
+- **Claude Code CLI pinned 2.1.221 → 2.1.223 (#4481)** — both pins move in
+  lockstep (`docker/Dockerfile.base` and `docker/Dockerfile.hindsight`). The
+  motivating fixes are security: further Bash-tool permission-check bypasses, a
+  workflow dynamic-import sandbox escape, and a PreToolUse hook restriction
+  bypass in background agents — all of which matter for a prompt-injectable,
+  always-on fleet where the permission boundary is load-bearing. Also fixes a
+  stream idle-timeout that triggers when a custom `ANTHROPIC_BASE_URL` is set,
+  which is exactly the fleet's LiteLLM gateway configuration. Two behaviour
+  changes to expect: the **ultraplan** feature is gone, and `/review` is now an
+  alias for `/code-review`.
+
 ## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
 
 ### Web tooling
