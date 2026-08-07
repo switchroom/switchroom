@@ -77,6 +77,11 @@ live fleet. The live database was read only for anonymised aggregates.
 - `repro/bench.py` mirrors `build_bm25_arm` exactly: a `UNION ALL` of one arm
   per `fact_type`, `ORDER BY score DESC LIMIT 50`. Nearest-rank percentiles,
   3s warm-up, 15s per cell, backends **interleaved within each cell**.
+- The generator labels its banks `bank-A`..`bank-N`; every artefact committed
+  here was remapped to the repo's `bank-NN` pseudonym convention (A -> 01 ...
+  N -> 14) before commit, so the plan text below is a pseudonym-for-pseudonym
+  relabel of the captured output, not a byte-for-byte paste. No real bank name
+  existed at any point — the corpus is synthetic.
 
 ### Contention disclosure — read before quoting any latency number
 
@@ -215,14 +220,29 @@ self-applying:
 
 So an existing instance logs the gap loudly on every boot
 (`pg_search_filter_field_drift ... missing=['bank_id', 'fact_type']`) and waits
-for a deliberate, scheduled rebuild:
+for a deliberate, scheduled rebuild.
+
+### Use the build-then-swap form — the degraded window is 9 ms, not 9 seconds
+
+The obvious `DROP INDEX` then `CREATE INDEX` leaves the table with **no BM25
+index for the whole build**, and the keyword arm degrades to semantic-only for
+that entire window (the #4472 fail-closed fallback covers it rather than
+erroring, so recall still answers — it just loses the keyword half). Building
+under a temporary name first and swapping in a transaction collapses that window
+to a catalog rename:
 
 ```sql
-DROP INDEX CONCURRENTLY idx_memory_units_text_search;
-CREATE INDEX CONCURRENTLY idx_memory_units_text_search ON memory_units
+-- 1. build alongside the live index. Nothing is degraded during this step.
+CREATE INDEX CONCURRENTLY idx_memory_units_text_search_new ON memory_units
   USING bm25 (id, text, context, text_signals,
               (bank_id::pdb.literal), (fact_type::pdb.literal))
   WITH (key_field='id');
+
+-- 2. swap. This is the only degraded moment.
+BEGIN;
+DROP INDEX idx_memory_units_text_search;
+ALTER INDEX idx_memory_units_text_search_new RENAME TO idx_memory_units_text_search;
+COMMIT;
 ```
 
 Copy the **text** column casts from the live `pg_indexes.indexdef` verbatim
@@ -231,8 +251,47 @@ rather than from the snippet above — an instance running with
 `(text::pdb.simple('stemmer=english'))`, and retyping them uncast would silently
 downgrade the analyzer. Only the two `pdb.literal` filter columns are new.
 
-Keyword recall degrades to semantic-only between the two statements — the
-fail-closed fallback from #4472 covers that window rather than erroring.
+### Measured cost
+
+Same sandbox, 797,893 rows, heap 1,062 MB (avg 293 text bytes/row), 4 CPUs (only
+**2** parallel maintenance workers available), `maintenance_work_mem=1GB`,
+`shared_buffers=2048MB`, still under P2 contention (host load ~5):
+
+| step | `fsync=off` | `fsync=on`, `synchronous_commit=on` |
+|---|---|---|
+| `CREATE INDEX` | 7.787 s | — |
+| `CREATE INDEX CONCURRENTLY` | 7.763 s | 8.819 s / 8.882 s / 8.880 s / 8.743 s |
+| `DROP INDEX` | 11 ms | 0.3 - 54 ms |
+| `DROP INDEX CONCURRENTLY` | — | 17 ms |
+| **swap txn** (`DROP` + `RENAME` + `COMMIT`) | — | **9.0 ms** |
+
+The swap was verified end to end, not just timed: the real arm shape returned
+**50 rows before the build, 50 rows with both indexes present, and 50 rows after
+the swap**, with no error at any point.
+
+- **Naive `DROP` then `CREATE`: ~8.9 s degraded.**
+- **Build-then-swap: ~9 ms degraded** (0.3 ms `DROP` + 0.1 ms `RENAME` + 8.9 ms
+  `COMMIT`), and nothing is degraded during the 8.9 s build.
+
+### Extrapolation to the live instance — clearly labelled
+
+Read directly off the running `switchroom-hindsight` postgres command line (no
+secrets, just `ps`): `fsync=on`, `shared_buffers=12288MB`,
+`effective_cache_size=14336MB`, `maintenance_work_mem=512MB`,
+`max_parallel_maintenance_workers=4`, 16 cores, no CPU quota.
+
+Versus the sandbox that produced 8.9 s: **2x** the parallel maintenance workers
+and no CPU quota (faster), **half** the `maintenance_work_mem` (slower, more
+merge passes), ~1.5% fewer rows, and — the dominant term — a substantially
+larger text volume per row, since the live `memory_units` heap is several times
+1,062 MB (P2/#4476 measured ~5.2 GB; **that figure is P2's, not re-verified
+here**, which is why this is a band and not a point).
+
+**Extrapolated: tens of seconds for the `CREATE INDEX CONCURRENTLY`, call it
+20-60 s, and budget 2 minutes.** That is *not* a degraded window — with the
+build-then-swap form above the degraded window stays the swap transaction, which
+is milliseconds and does not scale with corpus size. Run it off-peak anyway: the
+build competes for CPU and I/O with live recall.
 
 ## Files
 
