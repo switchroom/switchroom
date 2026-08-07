@@ -69,6 +69,29 @@ now an anomaly worth investigating, not the norm.
   a throwaway container and asserts it is RED unpatched and GREEN patched across
   six scenarios, including the two that must keep failing. Wired into the
   `hindsight-probe` CI job, which hard-fails rather than skipping. (#4506)
+- **A failed `CREATE EXTENSION pg_search` now reports why.** The migration
+  mirrored upstream's `pgroonga` branch verbatim, including an "already exists /
+  no permission" fallback that re-probed `pg_extension` in the `except` arm.
+  With `IF NOT EXISTS` that probe can never suppress anything, and because the
+  whole reconcile runs in ONE transaction it fired on an already-aborted one —
+  so the operator got `current transaction is aborted` instead of the real
+  ParadeDB error. That is precisely the wrong trade here: `prestart_pg0` is
+  best-effort, so an ineffective `shared_preload_libraries=pg_search` is the
+  most likely real-world failure of this migration, and it was exactly the
+  diagnostic being destroyed. The fallback is gone; the statement raises
+  directly. (#4507)
+- **The probe now covers the migration operators actually run.** The six
+  original scenarios each isolate one defect, but none was a populated
+  `memory_units` carrying a `tsvector` under a live GIN index flipped to
+  `pg_search` — the shape the runbook produces. A seventh covers it at the real
+  row count and pins the ORDER of the repair (stale index before its column;
+  `CREATE EXTENSION` before the BM25 build that needs the `pdb` schema), plus
+  that the rebuilt index keeps the #4478 `bank_id`/`fact_type` `pdb.literal`
+  pushdown fast fields — previously asserted nowhere, despite riding on an
+  optional argument a refactor could drop in silence. (#4507)
+- **CI no longer leaks the filter-pushdown probe's containers.** The
+  `hindsight-probe` job's label-scoped teardown loop omitted
+  `hindsight-pg-search-filter-pushdown-patch`. (#4507)
 
 ## v0.20.14 — BM25 filter-field pushdown for Hindsight keyword recall, and a phase-attribution ceiling for database-side proposals
 
