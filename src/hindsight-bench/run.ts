@@ -8,9 +8,10 @@
  * counted wrong" must be a thing a test can catch.
  */
 
+import { extractPhases, reducePhaseCell, type PhaseSample } from "./phases.js";
 import { summarize } from "./stats.js";
 import { QUERY_SET_ID, RECALL_QUERIES, recallOnce, type RecallSample } from "./recall.js";
-import type { ArmTiming, BenchConfig, CellResult, DbState } from "./types.js";
+import type { ArmTiming, BenchConfig, CellResult, DbState, PhaseCell } from "./types.js";
 
 /** Distinct error strings kept per cell. Enough to diagnose, bounded on disk. */
 const MAX_ERROR_SAMPLES = 5;
@@ -206,6 +207,82 @@ export async function runArmSweep(opts: ArmSweepOptions): Promise<ArmTiming[]> {
   }
   rows.sort((a, b) => a.bank.localeCompare(b.bank) || b.p50 - a.p50);
   return rows;
+}
+
+export interface PhaseSweepOptions {
+  config: BenchConfig;
+  db: DbState;
+  /**
+   * Traced calls per cell. Kept small — a traced recall serialises the query
+   * embedding and every arm's full result list.
+   */
+  samples: number;
+  settleMs?: number;
+  deps?: SweepDeps;
+}
+
+/**
+ * The opt-in `--phases` pass: where does a recall's time actually go, and how
+ * does that change with concurrency? (#4476.)
+ *
+ * Unlike `runArmSweep` this sweeps the **full concurrency ladder**, because the
+ * question it answers is a question about contention: the epic's premise is
+ * that concurrency pressure lands on the database, and a c=1 measurement cannot
+ * confirm or refute that. Running it at the same levels as the latency sweep is
+ * what makes `maxDbSideGainFraction` comparable to the latency AC it bounds.
+ *
+ * Traced, so — exactly as with arms — these milliseconds must never be compared
+ * against `cells[]`. What survives the distortion is the SHARE, and tracing
+ * inflates the non-database stages hardest, so the database's share here is if
+ * anything generous.
+ */
+export async function runPhaseSweep(opts: PhaseSweepOptions): Promise<PhaseCell[]> {
+  const { config, db } = opts;
+  const deps = opts.deps ?? {};
+  const sleep = deps.sleep ?? realSleep;
+  const log = deps.log ?? ((): void => {});
+  const settleMs = opts.settleMs ?? 2000;
+  const recall =
+    deps.recall ??
+    ((bank: string, query: string): Promise<RecallSample> =>
+      recallOnce(bank, query, {
+        apiUrl: config.apiUrl,
+        timeoutMs: config.timeoutMs,
+        budget: config.budget,
+        maxTokens: config.maxTokens,
+        trace: true,
+      }));
+
+  const rowsFor = new Map(db.bankRows.map((b) => [b.bank, b.rows]));
+  const out: PhaseCell[] = [];
+
+  for (const bank of config.banks) {
+    for (const concurrency of [...config.concurrency].sort((a, b) => a - b)) {
+      // At least one call per worker. `--phases 5` at c=16 would otherwise put
+      // five calls through a sixteen-worker pool and label the result "c=16",
+      // which is a c=5 measurement wearing the wrong label — and the whole
+      // point of this pass is the concurrency axis.
+      const count = Math.max(opts.samples, concurrency);
+      const raw = await driveCell(bank, concurrency, count, recall);
+      const ok = raw.filter((s) => s.ok);
+      const samples: PhaseSample[] = ok.map((s) => ({
+        clientMs: s.ms,
+        extracted: extractPhases(s.trace),
+      }));
+      const cell = reducePhaseCell(bank, rowsFor.get(bank) ?? 0, concurrency, samples, raw.length - ok.length);
+      if (cell === null) {
+        log(`  phases: ${bank} c=${concurrency}: no successful traced calls`);
+      } else {
+        out.push(cell);
+        log(
+          `  phases: ${bank} c=${concurrency}: n=${cell.n} db=${(cell.dbShareOfServer * 100).toFixed(1)}% of server, ` +
+            `max end-to-end gain from a perfect DB = ${(cell.maxDbSideGainFraction * 100).toFixed(1)}%`,
+        );
+      }
+      if (settleMs > 0) await sleep(settleMs);
+    }
+  }
+  return out;
 }
 
 /** The query-set id this build replays; recorded into every result file. */

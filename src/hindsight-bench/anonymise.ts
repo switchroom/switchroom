@@ -72,6 +72,7 @@ export function buildBankMap(result: BenchResult): Map<string, string> {
   for (const b of result.config?.banks ?? []) push(b);
   for (const c of result.cells ?? []) push(c.bank);
   for (const a of result.arms ?? []) push(a.bank);
+  for (const p of result.phases ?? []) push(p.bank);
 
   const width = Math.max(2, String(ordered.length).length);
   const map = new Map<string, string>();
@@ -90,9 +91,15 @@ export interface AnonymisedResult {
  * Return a deep-ish copy of `result` with every bank identifier replaced.
  *
  * Fields rewritten: `config.banks[]`, `db.bankRows[].bank`, `cells[].bank`,
- * `arms[].bank`. Everything else — row counts, latencies, index names, server
- * version — is carried through untouched, because none of it names a bank and
- * all of it is load-bearing for the measurement.
+ * `arms[].bank`, `phases[].bank`. Everything else — row counts, latencies,
+ * index names, server version — is carried through untouched, because none of
+ * it names a bank and all of it is load-bearing for the measurement.
+ *
+ * Every bank-bearing collection is normalised through `?? null` rather than
+ * compared against `null` directly: `phases` is OPTIONAL (absent on every file
+ * written before #4476), and a `x === null ? null : x.map(...)` on an
+ * `undefined` throws rather than passing through — which would turn "this file
+ * predates the field" into a crash inside the privacy gate.
  *
  * `config.label` is operator free text and is NOT rewritten: there is no way to
  * find a bank name inside arbitrary prose without a name list, and having one
@@ -116,7 +123,8 @@ export function anonymiseResult(result: BenchResult): AnonymisedResult {
         bankRows: (result.db?.bankRows ?? []).map((r) => ({ ...r, bank: sub(r.bank) })),
       },
       cells: (result.cells ?? []).map((c) => ({ ...c, bank: sub(c.bank) })),
-      arms: result.arms === null ? null : result.arms.map((a) => ({ ...a, bank: sub(a.bank) })),
+      arms: (result.arms ?? null)?.map((a) => ({ ...a, bank: sub(a.bank) })) ?? null,
+      phases: (result.phases ?? null)?.map((p) => ({ ...p, bank: sub(p.bank) })) ?? null,
     },
   };
 }

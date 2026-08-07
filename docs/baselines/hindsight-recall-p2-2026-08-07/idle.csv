@@ -1,0 +1,21 @@
+label,bank,rows,concurrency,n,errors,p50_ms,p95_ms,p95_ci_low_ms,p95_ci_high_ms,p99_ms,max_ms,mean_ms,stddev_ms,cv,mean_results,zero_result_calls,contention
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-01,232384,1,40,0,1020.26,2895.24,1998.95,4074.69,4074.69,4074.69,1388.37,747.22,0.5382,62.2,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-01,232384,4,40,0,3283.02,7727.22,7594.13,8223.96,8223.96,8223.96,4282.42,1943.67,0.4539,62.2,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-01,232384,8,40,0,7767.59,10294.12,10046.96,11038.73,11038.73,11038.73,7734.28,1994.22,0.2578,62.2,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-01,232384,16,33,7,15473.24,22686.32,22636.78,22693.76,22693.76,22693.76,15504.64,4210.01,0.2715,62.73,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-07,18145,1,40,0,837.04,2966.71,1761.54,10681.61,10681.61,10681.61,1477.77,1955.05,1.323,58.1,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-07,18145,4,40,0,3460.72,6539.05,4880.72,6921.42,6921.42,6921.42,3750.79,1306.81,0.3484,58.1,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-07,18145,8,40,0,8211.62,11135.06,11133.77,11140.63,11140.63,11140.63,8234.73,2083.15,0.253,58.1,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-07,18145,16,40,0,14589.07,17778.56,17615.11,17798.5,17798.5,17798.5,14383.64,2738.85,0.1904,58.1,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-10,1525,1,40,0,816.48,2110.72,1220.31,3578.2,3578.2,3578.2,1068.53,606.52,0.5676,63.2,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-10,1525,4,40,0,4948.71,8090.38,7809.99,9235.03,9235.03,9235.03,4968.8,2016.06,0.4057,63.2,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-10,1525,8,40,0,6740.75,8167.97,8166.78,8782.98,8782.98,8782.98,6481.15,1456.64,0.2248,63.2,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-10,1525,16,39,1,19123.16,22859.86,21083.06,22881.59,22881.59,22881.59,17082.9,4036.26,0.2363,63.05,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-12,157,1,40,0,860.13,3334.87,1691.91,3755.19,3755.19,3755.19,1283.18,804.8,0.6272,56.9,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-12,157,4,40,0,2788.22,4065.99,3477.26,5407.42,5407.42,5407.42,2887.38,717.21,0.2484,56.9,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-12,157,8,40,0,6250.44,7834.07,7295.69,7835.79,7835.79,7835.79,6307.74,1041.27,0.1651,56.9,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-12,157,16,40,0,11984.12,17238.98,15068.73,17251.15,17251.15,17251.15,13190.38,2334.95,0.177,56.9,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-14,12,1,40,0,638.89,1051.39,955.3,1657.88,1657.88,1657.88,738.85,218.01,0.2951,12,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-14,12,4,40,0,3960.52,6747,6002.46,9262.06,9262.06,9262.06,4421.43,1698.33,0.3841,12,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-14,12,8,40,0,6419.39,7820.07,7546.47,8244.86,8244.86,8244.86,6401.65,1188.63,0.1857,12,0,off
+"P2 post-shared-buffers idle; pg_stat_reset epoch start",bank-14,12,16,40,0,14491.36,19432.52,18066.66,21987.61,21987.61,21987.61,15203.8,2688.87,0.1769,12,0,off

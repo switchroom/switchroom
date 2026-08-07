@@ -9,7 +9,7 @@
  */
 
 import { round } from "./stats.js";
-import type { BenchResult, CellComparison, ReproducibilityReport } from "./types.js";
+import type { BenchResult, CellComparison, PhaseCell, ReproducibilityReport } from "./types.js";
 
 /** AC1's tolerance: p95 within ±10 % per cell across repeated idle runs. */
 export const DEFAULT_TOLERANCE = 0.1;
@@ -310,7 +310,55 @@ export function formatSummary(r: BenchResult): string {
       );
     }
   }
+  L.push(...formatPhases(r.phases ?? null));
   return L.join("\n");
+}
+
+/**
+ * Render the `--phases` pass.
+ *
+ * Split out of {@link formatSummary} and exported so the falsification
+ * arithmetic — the `maxDbSideGainFraction` ceiling line — has a test that reads
+ * the rendered text an operator actually sees, not just the JSON behind it.
+ *
+ * Returns an empty array when the run had no phase pass, so the caller can
+ * splat it unconditionally.
+ */
+export function formatPhases(phases: readonly PhaseCell[] | null): string[] {
+  if (phases === null || phases.length === 0) return [];
+  const L: string[] = [];
+  L.push("");
+  L.push("  phase attribution (SEPARATE traced pass — not comparable to the latency table above)");
+  L.push(
+    `  ${pad("bank", 16)}${padL("conc", 6)}${padL("n", 5)}${padL("client ms", 11)}${padL("server ms", 11)}` +
+      `${padL("db ms", 9)}${padL("db/server", 11)}${padL("max gain", 10)}`,
+  );
+  for (const c of phases) {
+    L.push(
+      `  ${pad(c.bank, 16)}${padL(String(c.concurrency), 6)}${padL(String(c.n), 5)}` +
+        `${padL(c.clientMsMean.toFixed(0), 11)}${padL(c.serverMsMean.toFixed(0), 11)}` +
+        `${padL(c.dbMsMean.toFixed(0), 9)}${padL(`${round(c.dbShareOfServer * 100, 1)}%`, 11)}` +
+        `${padL(`${round(c.maxDbSideGainFraction * 100, 1)}%`, 10)}`,
+    );
+  }
+  const worst = Math.max(...phases.map((c) => c.maxDbSideGainFraction));
+  L.push("");
+  L.push(
+    `  ceiling: a PERFECT database (every PostgreSQL call instantaneous) removes at most ` +
+      `${round(worst * 100, 1)}% of end-to-end recall latency, at the most database-bound cell measured.`,
+  );
+  L.push("  Any database-side proposal claiming more than that is refuted by this number.");
+  // The dominant non-DB phase, named. Without it the ceiling reads as a
+  // dead end; with it the reader is pointed at where the time actually is.
+  const totals = new Map<string, number>();
+  for (const c of phases) {
+    for (const p of c.phases) totals.set(p.name, (totals.get(p.name) ?? 0) + p.meanMs);
+  }
+  const ranked = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4);
+  if (ranked.length > 0) {
+    L.push(`  largest phases by mean time across all cells: ${ranked.map(([n]) => n).join(", ")}`);
+  }
+  return L;
 }
 
 /** The AC1 verdict, rendered. */

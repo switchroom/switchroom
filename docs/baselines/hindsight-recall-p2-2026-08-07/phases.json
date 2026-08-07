@@ -1,0 +1,1050 @@
+{
+  "schema": 2,
+  "config": {
+    "startedAt": "2026-08-07T05:30:29.466Z",
+    "apiUrl": "http://127.0.0.1:18888",
+    "container": "switchroom-hindsight",
+    "banks": [
+      "bank-01",
+      "bank-10",
+      "bank-14"
+    ],
+    "concurrency": [
+      1,
+      8,
+      16
+    ],
+    "samples": 8,
+    "warmup": 2,
+    "timeoutMs": 30000,
+    "contention": "off",
+    "contentionWorkers": 0,
+    "statsReset": false,
+    "allowWrites": false,
+    "querySet": "generic-v1",
+    "budget": "mid",
+    "maxTokens": 4096,
+    "label": "P2 phase attribution (#4476)"
+  },
+  "db": {
+    "sharedBuffersBytes": 12884901888,
+    "effectiveCacheSizeBytes": 15032385536,
+    "hnswEfSearch": null,
+    "memoryUnitsTotalBytes": 5473976320,
+    "memoryUnitsHeapBytes": 3082215424,
+    "memoryUnitsIndexBytes": 2391760896,
+    "bankRows": [
+      {
+        "bank": "bank-01",
+        "rows": 232736
+      },
+      {
+        "bank": "bank-02",
+        "rows": 227623
+      },
+      {
+        "bank": "bank-03",
+        "rows": 86500
+      },
+      {
+        "bank": "bank-04",
+        "rows": 86338
+      },
+      {
+        "bank": "bank-05",
+        "rows": 81969
+      },
+      {
+        "bank": "bank-06",
+        "rows": 43761
+      },
+      {
+        "bank": "bank-07",
+        "rows": 18145
+      },
+      {
+        "bank": "bank-08",
+        "rows": 10716
+      },
+      {
+        "bank": "bank-09",
+        "rows": 8957
+      },
+      {
+        "bank": "bank-10",
+        "rows": 1525
+      },
+      {
+        "bank": "bank-11",
+        "rows": 190
+      },
+      {
+        "bank": "bank-12",
+        "rows": 157
+      },
+      {
+        "bank": "bank-13",
+        "rows": 66
+      },
+      {
+        "bank": "bank-14",
+        "rows": 12
+      }
+    ],
+    "largestIndexes": [
+      {
+        "name": "idx_mu_emb_worl_81cef5f6a42e4b4d",
+        "bytes": 320446464,
+        "scans": 280
+      },
+      {
+        "name": "idx_mu_emb_worl_4f0539ab5e0a49c8",
+        "bytes": 272261120,
+        "scans": 658
+      },
+      {
+        "name": "idx_memory_units_text_search",
+        "bytes": 163880960,
+        "scans": 2529
+      },
+      {
+        "name": "idx_mu_emb_obsv_4f0539ab5e0a49c8",
+        "bytes": 134283264,
+        "scans": 400
+      },
+      {
+        "name": "idx_mu_emb_worl_04a9d55562094f28",
+        "bytes": 112222208,
+        "scans": 9
+      },
+      {
+        "name": "idx_mu_emb_obsv_81cef5f6a42e4b4d",
+        "bytes": 109002752,
+        "scans": 318
+      },
+      {
+        "name": "idx_mu_emb_worl_ce0d84949a914feb",
+        "bytes": 107937792,
+        "scans": 9
+      },
+      {
+        "name": "idx_mu_emb_expr_4f0539ab5e0a49c8",
+        "bytes": 102326272,
+        "scans": 452
+      }
+    ],
+    "statsResetAt": "2026-08-07 04:56:56.942545+00",
+    "heapHitRatio": 1,
+    "serverVersion": "PostgreSQL 18.1 on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"
+  },
+  "instance": {
+    "imageTag": "ghcr.io/switchroom/switchroom-hindsight:v0.20.13",
+    "rerankerMaxCandidates": 150
+  },
+  "cells": [
+    {
+      "bank": "bank-01",
+      "rows": 232736,
+      "concurrency": 1,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 849.996997000002,
+        "p50": 1972.7701580000012,
+        "p95": 3656.77287,
+        "p99": 3656.77287,
+        "max": 3656.77287,
+        "mean": 1946.9540069999998,
+        "stddev": 917.6268061927008,
+        "cv": 0.47131406437620116,
+        "p95CiLow": 2129.2459359999993,
+        "p95CiHigh": 3656.77287
+      },
+      "meanResults": 64.375,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        2406.3074509999997,
+        3656.77287,
+        2129.2459359999993,
+        1972.7701580000012,
+        2616.044017000002,
+        1063.9705159999976,
+        880.5241109999988,
+        849.996997000002
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-01",
+      "rows": 232736,
+      "concurrency": 8,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 3076.211746000001,
+        "p50": 4148.200969000001,
+        "p95": 5707.476934999999,
+        "p99": 5707.476934999999,
+        "max": 5707.476934999999,
+        "mean": 4708.48242775,
+        "stddev": 1035.8910058814797,
+        "cv": 0.22000528233392846,
+        "p95CiLow": 5706.671324999999,
+        "p95CiHigh": 5707.476934999999
+      },
+      "meanResults": 64.375,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        3076.211746000001,
+        3808.1295009999994,
+        3808.5144980000005,
+        4148.200969000001,
+        5705.528848000002,
+        5706.671324999999,
+        5707.125599999999,
+        5707.476934999999
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-01",
+      "rows": 232736,
+      "concurrency": 16,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 3211.650330000004,
+        "p50": 5642.067450000002,
+        "p95": 5643.228261000004,
+        "p99": 5643.228261000004,
+        "max": 5643.228261000004,
+        "mean": 5093.496995000002,
+        "stddev": 958.1215811476063,
+        "cv": 0.18810683153207708,
+        "p95CiLow": 5642.672538999999,
+        "p95CiHigh": 5643.228261000004
+      },
+      "meanResults": 64.375,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        3211.650330000004,
+        3681.332368000003,
+        5641.755548000001,
+        5642.067450000002,
+        5642.340294000001,
+        5642.672538999999,
+        5642.929170000003,
+        5643.228261000004
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-10",
+      "rows": 1525,
+      "concurrency": 1,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 670.8314209999953,
+        "p50": 713.7253129999954,
+        "p95": 1781.4371480000045,
+        "p99": 1781.4371480000045,
+        "max": 1781.4371480000045,
+        "mean": 889.9808859999976,
+        "stddev": 352.6658946949109,
+        "cv": 0.3962623245539139,
+        "p95CiLow": 751.202744999995,
+        "p95CiHigh": 1781.4371480000045
+      },
+      "meanResults": 65.5,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        1781.4371480000045,
+        751.202744999995,
+        784.5640950000015,
+        693.3108359999969,
+        670.8314209999953,
+        703.2885149999929,
+        713.7253129999954,
+        1021.4870149999988
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-10",
+      "rows": 1525,
+      "concurrency": 8,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 4893.260593000006,
+        "p50": 5787.690758000004,
+        "p95": 5804.293310000001,
+        "p99": 5804.293310000001,
+        "max": 5804.293310000001,
+        "mean": 5681.941094625001,
+        "stddev": 298.188776448689,
+        "cv": 0.052480089371354,
+        "p95CiLow": 5788.083012000003,
+        "p95CiHigh": 5804.293310000001
+      },
+      "meanResults": 65.5,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        4893.260593000006,
+        5787.187083000004,
+        5787.546055999999,
+        5787.690758000004,
+        5788.083012000003,
+        5803.470454999995,
+        5803.997489999994,
+        5804.293310000001
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-10",
+      "rows": 1525,
+      "concurrency": 16,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 3851.995195000003,
+        "p50": 6677.967445000009,
+        "p95": 6679.031689999996,
+        "p99": 6679.031689999996,
+        "max": 6679.031689999996,
+        "mean": 6024.685318875001,
+        "stddev": 1137.1175804805603,
+        "cv": 0.18874306628398246,
+        "p95CiLow": 6678.506339,
+        "p95CiHigh": 6679.031689999996
+      },
+      "meanResults": 65.5,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        3851.995195000003,
+        4275.387554000001,
+        6677.649526999994,
+        6677.967445000009,
+        6678.247950999998,
+        6678.506339,
+        6678.6968500000075,
+        6679.031689999996
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-14",
+      "rows": 12,
+      "concurrency": 1,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 635.5436800000025,
+        "p50": 641.2204290000082,
+        "p95": 2169.5969650000043,
+        "p99": 2169.5969650000043,
+        "max": 2169.5969650000043,
+        "mean": 835.3642963750026,
+        "stddev": 504.43339319987905,
+        "cv": 0.6038483993017513,
+        "p95CiLow": 642.1332360000088,
+        "p95CiHigh": 2169.5969650000043
+      },
+      "meanResults": 12,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        2169.5969650000043,
+        675.2657029999973,
+        637.5209370000084,
+        642.1332360000088,
+        635.5436800000025,
+        641.2204290000082,
+        637.8060689999984,
+        643.827351999993
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-14",
+      "rows": 12,
+      "concurrency": 8,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 2795.320240000001,
+        "p50": 4839.079778999992,
+        "p95": 4850.468863000002,
+        "p99": 4850.468863000002,
+        "max": 4850.468863000002,
+        "mean": 4588.777126499997,
+        "stddev": 677.8832505590365,
+        "cv": 0.14772634012758842,
+        "p95CiLow": 4849.402340999994,
+        "p95CiHigh": 4850.468863000002
+      },
+      "meanResults": 12,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        2795.320240000001,
+        4838.0885629999975,
+        4838.453098999991,
+        4839.079778999992,
+        4849.157532000012,
+        4849.402340999994,
+        4850.24659499999,
+        4850.468863000002
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "bank-14",
+      "rows": 12,
+      "concurrency": 16,
+      "stats": {
+        "n": 8,
+        "errors": 0,
+        "min": 2915.5353319999995,
+        "p50": 5010.268640999988,
+        "p95": 5010.610157000003,
+        "p99": 5010.610157000003,
+        "max": 5010.610157000003,
+        "mean": 4747.6936129999995,
+        "stddev": 692.4944703264764,
+        "cv": 0.1458591321963801,
+        "p95CiLow": 5010.525036999999,
+        "p95CiHigh": 5010.610157000003
+      },
+      "meanResults": 12,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        2915.5353319999995,
+        5003.48936800001,
+        5010.152900000001,
+        5010.268640999988,
+        5010.4081679999945,
+        5010.525036999999,
+        5010.559301000001,
+        5010.610157000003
+      ],
+      "errorSamples": []
+    }
+  ],
+  "arms": null,
+  "phases": [
+    {
+      "bank": "bank-01",
+      "rows": 232736,
+      "concurrency": 1,
+      "n": 8,
+      "errors": 0,
+      "clientMsMean": 1153.9884677500013,
+      "serverMsMean": 1108.7367832660675,
+      "dbMsMean": 373.8105297088623,
+      "dbShareOfServer": 0.3371499307596776,
+      "maxDbSideGainFraction": 0.3239291727392237,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 403.7770628929138,
+          "p95Ms": 710.0722789764404,
+          "shareOfServer": 0.3641775658452363
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 373.3236789703369,
+          "p95Ms": 1516.833782196045,
+          "shareOfServer": 0.33671082677587066
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 313.0477964878082,
+          "p95Ms": 336.09676361083984,
+          "shareOfServer": 0.2823463613840302
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 7.431983947753906,
+          "p95Ms": 25.20751953125,
+          "shareOfServer": 0.006703109394333521
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 2.442389726638794,
+          "p95Ms": 3.2949447631835938,
+          "shareOfServer": 0.0022028580304191865
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 1.3972818851470947,
+          "p95Ms": 2.4394989013671875,
+          "shareOfServer": 0.0012602467116054757
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.9492635726928711,
+          "p95Ms": 1.3346672058105469,
+          "shareOfServer": 0.0008561667539310571
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.17455220222473145,
+          "p95Ms": 0.308990478515625,
+          "shareOfServer": 0.00015743340065848933
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0013113021850585938,
+          "p95Ms": 0.0019073486328125,
+          "shareOfServer": 0.0000011826992707825731
+        }
+      ]
+    },
+    {
+      "bank": "bank-01",
+      "rows": 232736,
+      "concurrency": 8,
+      "n": 8,
+      "errors": 0,
+      "clientMsMean": 6300.925444750001,
+      "serverMsMean": 6136.3319754600525,
+      "dbMsMean": 1635.0213289260864,
+      "dbShareOfServer": 0.2664492950291376,
+      "maxDbSideGainFraction": 0.25948907716221337,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 2578.6843597888947,
+          "p95Ms": 3223.1030464172363,
+          "shareOfServer": 0.42023221202851657
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 1596.1261987686157,
+          "p95Ms": 2502.856969833374,
+          "shareOfServer": 0.26011079667001735
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 1517.0668959617615,
+          "p95Ms": 2617.947816848755,
+          "shareOfServer": 0.2472269919601317
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 237.40532994270325,
+          "p95Ms": 1564.8901462554932,
+          "shareOfServer": 0.038688475605967276
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 199.58195090293884,
+          "p95Ms": 576.4451026916504,
+          "shareOfServer": 0.03252463388569778
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 1.0305345058441162,
+          "p95Ms": 1.2350082397460938,
+          "shareOfServer": 0.0001679398230026261
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.8461177349090576,
+          "p95Ms": 0.9739398956298828,
+          "shareOfServer": 0.00013788656452955718
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.155717134475708,
+          "p95Ms": 0.23508071899414062,
+          "shareOfServer": 0.000025376256548446206
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0005960464477539062,
+          "p95Ms": 0.0011920928955078125,
+          "shareOfServer": 9.713399635768883e-8
+        }
+      ]
+    },
+    {
+      "bank": "bank-01",
+      "rows": 232736,
+      "concurrency": 16,
+      "n": 16,
+      "errors": 0,
+      "clientMsMean": 12368.7219310625,
+      "serverMsMean": 11467.349976301193,
+      "dbMsMean": 2320.666804909706,
+      "dbShareOfServer": 0.20237167346472143,
+      "maxDbSideGainFraction": 0.18762381577045897,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 4537.569358944893,
+          "p95Ms": 8403.015613555908,
+          "shareOfServer": 0.3956946782231627
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 3600.6268709897995,
+          "p95Ms": 5298.664569854736,
+          "shareOfServer": 0.3139894464223186
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 2212.4433666467667,
+          "p95Ms": 4672.53041267395,
+          "shareOfServer": 0.19293414530986458
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 880.6630373001099,
+          "p95Ms": 3869.413375854492,
+          "shareOfServer": 0.07679743263440267
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 227.66940295696259,
+          "p95Ms": 1610.3308200836182,
+          "shareOfServer": 0.01985370669138657
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 1.1596530675888062,
+          "p95Ms": 1.9087791442871094,
+          "shareOfServer": 0.00010112650873875688
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.8936673402786255,
+          "p95Ms": 1.3744831085205078,
+          "shareOfServer": 0.00007793146124653979
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.1742243766784668,
+          "p95Ms": 0.34427642822265625,
+          "shareOfServer": 0.000015193080968011326
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0005662441253662109,
+          "p95Ms": 0.00095367431640625,
+          "shareOfServer": 4.937881258847335e-8
+        }
+      ]
+    },
+    {
+      "bank": "bank-10",
+      "rows": 1525,
+      "concurrency": 1,
+      "n": 8,
+      "errors": 0,
+      "clientMsMean": 802.0628536250006,
+      "serverMsMean": 751.9771158695221,
+      "dbMsMean": 49.78254437446594,
+      "dbShareOfServer": 0.06620220658829712,
+      "maxDbSideGainFraction": 0.062068133625025675,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 350.19221901893616,
+          "p95Ms": 389.62769508361816,
+          "shareOfServer": 0.46569531389795527
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 339.8361802101135,
+          "p95Ms": 604.1584014892578,
+          "shareOfServer": 0.4519235666063534
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 49.448221921920776,
+          "p95Ms": 83.22954177856445,
+          "shareOfServer": 0.06575761532948124
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 4.644155502319336,
+          "p95Ms": 8.093595504760742,
+          "shareOfServer": 0.006175926639668059
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 2.024054527282715,
+          "p95Ms": 2.093791961669922,
+          "shareOfServer": 0.0026916437808646226
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 1.0474324226379395,
+          "p95Ms": 1.3012886047363281,
+          "shareOfServer": 0.0013929046516618767
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.8074343204498291,
+          "p95Ms": 0.9362697601318359,
+          "shareOfServer": 0.0010737485269298136
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.16507506370544434,
+          "p95Ms": 0.2956390380859375,
+          "shareOfServer": 0.00021952139263515437
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0011026859283447266,
+          "p95Ms": 0.0016689300537109375,
+          "shareOfServer": 0.0000014663822941868048
+        }
+      ]
+    },
+    {
+      "bank": "bank-10",
+      "rows": 1525,
+      "concurrency": 8,
+      "n": 8,
+      "errors": 0,
+      "clientMsMean": 5232.705907749998,
+      "serverMsMean": 4896.7143297195435,
+      "dbMsMean": 1116.2626147270203,
+      "dbShareOfServer": 0.22796155535398643,
+      "maxDbSideGainFraction": 0.21332416428635104,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 2121.2714314460754,
+          "p95Ms": 2702.009677886963,
+          "shareOfServer": 0.4332030191288635
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 1537.9035472869873,
+          "p95Ms": 2385.220766067505,
+          "shareOfServer": 0.3140684638172613
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 1004.8536956310272,
+          "p95Ms": 1840.3353691101074,
+          "shareOfServer": 0.20520978516804342
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 119.01497840881348,
+          "p95Ms": 620.873212814331,
+          "shareOfServer": 0.024305068745072166
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 105.1100492477417,
+          "p95Ms": 330.92427253723145,
+          "shareOfServer": 0.021465423990490746
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 1.0772645473480225,
+          "p95Ms": 1.2674331665039062,
+          "shareOfServer": 0.00021999742578606218
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.848233699798584,
+          "p95Ms": 1.321554183959961,
+          "shareOfServer": 0.0001732250735254074
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.22605061531066895,
+          "p95Ms": 0.39267539978027344,
+          "shareOfServer": 0.0000461637334934374
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0005960464477539062,
+          "p95Ms": 0.0011920928955078125,
+          "shareOfServer": 1.217237534434737e-7
+        }
+      ]
+    },
+    {
+      "bank": "bank-10",
+      "rows": 1525,
+      "concurrency": 16,
+      "n": 16,
+      "errors": 0,
+      "clientMsMean": 11131.0227405,
+      "serverMsMean": 10302.415907382965,
+      "dbMsMean": 2310.62650680542,
+      "dbShareOfServer": 0.22428006475156648,
+      "maxDbSideGainFraction": 0.2075843847123097,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 3803.5417199134827,
+          "p95Ms": 5792.287111282349,
+          "shareOfServer": 0.3691893002676946
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 3460.5144560337067,
+          "p95Ms": 5092.898607254028,
+          "shareOfServer": 0.3358934920841059
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 2218.060627579689,
+          "p95Ms": 4430.9892654418945,
+          "shareOfServer": 0.21529519362445582
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 741.5022253990173,
+          "p95Ms": 2376.9469261169434,
+          "shareOfServer": 0.07197362561024531
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 70.98084688186646,
+          "p95Ms": 360.87656021118164,
+          "shareOfServer": 0.006889728343329629
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 1.2346506118774414,
+          "p95Ms": 1.8699169158935547,
+          "shareOfServer": 0.00011984088227234744
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.8891820907592773,
+          "p95Ms": 1.3687610626220703,
+          "shareOfServer": 0.00008630811440276523
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.16316771507263184,
+          "p95Ms": 0.2980232238769531,
+          "shareOfServer": 0.000015837810911487452
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0007301568984985352,
+          "p95Ms": 0.0016689300537109375,
+          "shareOfServer": 7.087239585962422e-8
+        }
+      ]
+    },
+    {
+      "bank": "bank-14",
+      "rows": 12,
+      "concurrency": 1,
+      "n": 8,
+      "errors": 0,
+      "clientMsMean": 632.7916413750063,
+      "serverMsMean": 625.4390478134155,
+      "dbMsMean": 13.97794485092163,
+      "dbShareOfServer": 0.022349012105639443,
+      "maxDbSideGainFraction": 0.022089332312526536,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 306.18613958358765,
+          "p95Ms": 321.4609622955322,
+          "shareOfServer": 0.4895539232064878
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 301.281213760376,
+          "p95Ms": 351.4437675476074,
+          "shareOfServer": 0.4817115509715599
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 13.666749000549316,
+          "p95Ms": 17.736434936523438,
+          "shareOfServer": 0.02185144827194489
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 2.6758015155792236,
+          "p95Ms": 3.4563541412353516,
+          "shareOfServer": 0.004278277035842322
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 0.8887648582458496,
+          "p95Ms": 1.2388229370117188,
+          "shareOfServer": 0.001421025536146235
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 0.2326369285583496,
+          "p95Ms": 0.3361701965332031,
+          "shareOfServer": 0.00037195779408347906
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.1983642578125,
+          "p95Ms": 0.26917457580566406,
+          "shareOfServer": 0.0003171600150422286
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.04062056541442871,
+          "p95Ms": 0.06175041198730469,
+          "shareOfServer": 0.00006494728072454291
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0010728836059570312,
+          "p95Ms": 0.0016689300537109375,
+          "shareOfServer": 0.0000017154087352043615
+        }
+      ]
+    },
+    {
+      "bank": "bank-14",
+      "rows": 12,
+      "concurrency": 8,
+      "n": 8,
+      "errors": 0,
+      "clientMsMean": 4915.368058749995,
+      "serverMsMean": 4593.9060151577,
+      "dbMsMean": 974.9169945716858,
+      "dbShareOfServer": 0.21221962124495464,
+      "maxDbSideGainFraction": 0.19834058872482738,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 1803.859293460846,
+          "p95Ms": 2716.3679599761963,
+          "shareOfServer": 0.39266351717013154
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 1506.4005851745605,
+          "p95Ms": 2383.988380432129,
+          "shareOfServer": 0.3279128001757452
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 901.9722044467926,
+          "p95Ms": 1767.148733139038,
+          "shareOfServer": 0.19634102253522698
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 270.94343304634094,
+          "p95Ms": 905.855655670166,
+          "shareOfServer": 0.05897888031499922
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 110.03708839416504,
+          "p95Ms": 295.14455795288086,
+          "shareOfServer": 0.023952838397454174
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 0.21275877952575684,
+          "p95Ms": 0.3552436828613281,
+          "shareOfServer": 0.000046313263445911674
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.16173720359802246,
+          "p95Ms": 0.2491474151611328,
+          "shareOfServer": 0.000035206903028570196
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.03895163536071777,
+          "p95Ms": 0.058650970458984375,
+          "shareOfServer": 0.000008478979594313848
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0009834766387939453,
+          "p95Ms": 0.0019073486328125,
+          "shareOfServer": 2.1408288187632514e-7
+        }
+      ]
+    },
+    {
+      "bank": "bank-14",
+      "rows": 12,
+      "concurrency": 16,
+      "n": 16,
+      "errors": 0,
+      "clientMsMean": 8987.178980812501,
+      "serverMsMean": 8627.239868044853,
+      "dbMsMean": 2239.4646406173706,
+      "dbShareOfServer": 0.2595806625143586,
+      "maxDbSideGainFraction": 0.24918438204008128,
+      "phases": [
+        {
+          "name": "reranking",
+          "meanMs": 3100.993573665619,
+          "p95Ms": 5517.177104949951,
+          "shareOfServer": 0.3594421415302993
+        },
+        {
+          "name": "generate_query_embedding",
+          "meanMs": 3070.215031504631,
+          "p95Ms": 4892.939805984497,
+          "shareOfServer": 0.35587454139030655
+        },
+        {
+          "name": "parallel_retrieval",
+          "meanMs": 2163.9310866594315,
+          "p95Ms": 4171.896457672119,
+          "shareOfServer": 0.2508254227026415
+        },
+        {
+          "name": "entity_build",
+          "meanMs": 196.1415857076645,
+          "p95Ms": 1169.9299812316895,
+          "shareOfServer": 0.02273514921431239
+        },
+        {
+          "name": "token_filtering",
+          "meanMs": 95.18545866012573,
+          "p95Ms": 588.0491733551025,
+          "shareOfServer": 0.011033129959987668
+        },
+        {
+          "name": "result_serialization",
+          "meanMs": 0.20182132720947266,
+          "p95Ms": 0.22792816162109375,
+          "shareOfServer": 0.000023393498998099654
+        },
+        {
+          "name": "combined_scoring",
+          "meanMs": 0.1793205738067627,
+          "p95Ms": 0.32806396484375,
+          "shareOfServer": 0.000020785393306492265
+        },
+        {
+          "name": "rrf_merge",
+          "meanMs": 0.07075071334838867,
+          "p95Ms": 0.4138946533203125,
+          "shareOfServer": 0.000008200851538908532
+        },
+        {
+          "name": "backend_acquisition",
+          "meanMs": 0.0005364418029785156,
+          "p95Ms": 0.0011920928955078125,
+          "shareOfServer": 6.218000324361987e-8
+        }
+      ]
+    }
+  ],
+  "durationS": 193.215
+}

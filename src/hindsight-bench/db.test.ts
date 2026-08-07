@@ -4,6 +4,7 @@ import {
   assertReadOnlyOrWritesAllowed,
   readDbState,
   readInstanceState,
+  readStatsEpoch,
   resetStats,
   sql,
   type Runner,
@@ -172,5 +173,42 @@ describe("readDbState", () => {
   it("throws on a truncated settings row rather than emitting NaN fields", () => {
     const { run } = fakeRunner(["1|2|3"]);
     expect(() => readDbState({ run })).toThrow(/settings row shape/);
+  });
+});
+
+describe("readStatsEpoch", () => {
+  /**
+   * The bug this exists for: `readDbState` runs BEFORE `--reset-stats` fires
+   * (bank selection needs `bankRows` first), so a `--reset-stats` result file
+   * recorded `config.statsReset: true` beside the `statsResetAt` the run had
+   * just destroyed, and a `heapHitRatio` accumulated over that dead epoch —
+   * the field #4476's cache-residency criterion is graded on. Both numbers came
+   * out of the real 2026-08-07 P2 capture, where `idle.json` recorded
+   * 04:56:22Z while the counters it measured were actually reset at 04:56:56Z.
+   */
+  it("returns the post-reset epoch, so a --reset-stats file stops quoting the epoch it destroyed", () => {
+    const row = SETTINGS_ROW.split("|");
+    row[6] = "2026-08-07 04:56:22.400601+00";
+    row[7] = "0.8847";
+    const pre = readDbState({ run: fakeRunner([row.join("|"), "", ""]).run });
+    expect(pre.statsResetAt).toBe("2026-08-07 04:56:22.400601+00");
+    expect(pre.heapHitRatio).toBeCloseTo(0.8847, 6);
+
+    // …then pg_stat_reset() runs, and the re-read sees the new epoch.
+    const after = readStatsEpoch({ run: fakeRunner(["2026-08-07 04:56:56.942545+00|1"]).run });
+    expect(after.statsResetAt).toBe("2026-08-07 04:56:56.942545+00");
+    expect(after.heapHitRatio).toBe(1);
+
+    // The merge the CLI performs: every other field survives, both stale
+    // epoch-relative ones are replaced.
+    const merged = { ...pre, ...after };
+    expect(merged.statsResetAt).toBe("2026-08-07 04:56:56.942545+00");
+    expect(merged.heapHitRatio).toBe(1);
+    expect(merged.sharedBuffersBytes).toBe(pre.sharedBuffersBytes);
+    expect(merged.bankRows).toBe(pre.bankRows);
+  });
+
+  it("reports a never-reset epoch and an untouched relation as null, not 0", () => {
+    expect(readStatsEpoch({ run: fakeRunner(["|"]).run })).toEqual({ statsResetAt: null, heapHitRatio: null });
   });
 });
