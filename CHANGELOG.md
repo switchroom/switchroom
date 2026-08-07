@@ -41,9 +41,14 @@ now an anomaly worth investigating, not the norm.
   parsing rather than duplicating it, skips on `merge_group` and the release PR,
   and honours the same `no-changelog` / `[skip changelog]` hatches as an opt-out
   of both enforcement and generation. #4469's check stays as the deterministic
-  CI backstop. Wired into the fleet dev-protocol fragment, the `dev-protocol`
-  skill, and this repo's PR-hygiene flow; rationale in `.github/MERGE-QUEUE.md`
-  § "Author-side changelog generation".
+  CI backstop. Documented in the `dev-protocol` skill and this repo's PR-hygiene
+  flow; rationale in `.github/MERGE-QUEUE.md` § "Author-side changelog
+  generation". It is deliberately NOT in the always-loaded
+  `profiles/_shared/dev-protocol.md.hbs` fragment: that fragment carries
+  judgement criteria, not procedure, and `scripts/claude-md-byte-ratchet.txt`
+  is the mechanism that keeps the split honest — a 749-byte procedure bullet
+  there breached the rendered-CLAUDE.md ceiling, and the ratchet's own doctrine
+  says the remedy is on-demand skill material, never a higher ceiling.
 
 ## v0.20.15 — migrating a populated Hindsight bank to ParadeDB `pg_search` is a plain env flip, not a trapdoor
 
