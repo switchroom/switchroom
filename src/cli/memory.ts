@@ -37,6 +37,8 @@ import {
   resolveHindsightGpuOverride,
   resolveHindsightCpAccessKey,
   resolveHindsightLlmSecrets,
+  diffDroppedHindsightLlmVaultKeys,
+  hindsightLlmDroppedKeyWarning,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
@@ -1018,6 +1020,17 @@ export function registerMemoryCommand(program: Command): void {
         // path. Memoized (getResolvedLlm) so this reuses the env-drift compare's
         // resolution rather than firing the broker round-trips a second time.
         const resolvedLlm = await getResolvedLlm();
+        // Symmetric to the cp_access_key warning above and to the first-run
+        // path in `switchroom setup`: a dropped `vault:` LLM api_key ref is
+        // otherwise silent here. The env-drift report only fires when the key
+        // was previously baked and only names the env var; this names the lane
+        // and the unresolved reference so the operator can fix the grant.
+        for (const drop of await diffDroppedHindsightLlmVaultKeys(
+          hindsightConfig.hindsight?.llm,
+          resolvedLlm,
+        )) {
+          console.log(chalk.yellow(`  ! ${hindsightLlmDroppedKeyWarning(drop)}`));
+        }
         startHindsight(
           ports,
           litellmCfg,
@@ -1088,6 +1101,19 @@ export function registerMemoryCommand(program: Command): void {
         // and the same shape the cp_access_key above already takes. An emitted
         // literal `vault:…` would break every retain exactly like the recreate bug.
         const snippetLlm = await resolveHindsightLlmSecrets(snippetConfig.hindsight?.llm);
+        // The emitted snippet carries REAL resolved credentials in cleartext —
+        // the LLM `sk-` api_key(s) and any `cp_access_key` — because a
+        // paste-ready compose file must. Warn ONCE, to stderr with a `#` prefix,
+        // so a piped/redirected stdout is still a valid compose file (the notice
+        // stays a YAML comment even under `2>&1`) while an interactive operator
+        // is told to handle the output as a secret.
+        console.error(
+          chalk.yellow(
+            "# ! This snippet embeds resolved secrets in cleartext (LLM api_key" +
+              " and cp_access_key). Treat the output as sensitive — do not paste" +
+              " it into shared channels or commit it unredacted.",
+          ),
+        );
         console.log(
           generateHindsightComposeSnippet(
             snippetLlm,
