@@ -62,10 +62,27 @@ import { journalExternalDelivery } from './outbox-sweep.js'
 import { sha256Hex } from '../outbox.js'
 // #4141: the ONE shared framing implementation, also used by the outbox sweep
 // and (for the classifier half) the unbundled Stop hooks.
+//
+// #4490: previously this import only pulled the reply-throw half. The
+// captured-prose bridge below is the ELECTED path's deliverer — it never
+// writes an outbox record, so without the audience gate / self-improvement
+// framing wired in here too, a review-turn's raw, unlabelled reasoning could
+// reach the operator whenever the single-writer election (in
+// `silent-end-interrupt-stop.mjs`) routes a 'trailing-text-after-reply' case
+// here instead of to the outbox sweep. Wiring the SAME shared predicates in
+// both places (rather than re-deriving a third, parallel implementation)
+// restores the #4141-style symmetry #4485 left one-sided.
 import {
   applyReplyThrowFraming,
   formatReplyThrowFraming,
   shouldFrameReplyThrow,
+  decideCaptureAudience,
+  isSelfImprovementCard,
+  shouldFrameSelfImprovement,
+  applySelfImprovementFraming,
+  formatSelfImprovementFraming,
+  formatInternalSuppression,
+  AUDIENCE_INTERNAL,
 } from '../hooks/audience-classify.mjs'
 import { queueFloodBlockedReply } from './flood-reply-queue.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
@@ -2737,6 +2754,17 @@ export async function deliverCapturedProse(
    * record, so the sweep's framing can never reach the message.
    */
   replyToolThrewThisTurn?: boolean
+  /**
+   * #4490 — this turn originated from a self-improvement review inbound
+   * (`source="self_improve_review"`). Stamped by the Stop hook's
+   * single-writer election onto the `SilentEndState` file (the ONLY way this
+   * path — which never writes an outbox record — can learn a review turn's
+   * provenance) and threaded through `decideCapturedProseDelivery`. Gates the
+   * SAME audience-suppression / title-framing rules the outbox sweep applies
+   * to a review record, restoring the #4141-style symmetry #4485 left
+   * one-sided (card gate + title framing applied at the sweep only).
+   */
+  reviewOriginated?: boolean
   },
 ): Promise<void> {
   const {
@@ -2758,14 +2786,69 @@ export async function deliverCapturedProse(
     { replyToolThrewThisTurn: args.replyToolThrewThisTurn },
     { frameEnabled: process.env.SWITCHROOM_TG_OUTBOX_PROVENANCE_FRAMING !== '0' },
   )
-  // #3228 Finding 1 — the three settlement points (sent / skipped-dedup /
-  // failed) all funnel through the pure `settleCapturedProseDelivery` core so
-  // the failure posture is deterministic and unit-tested. `outcome` is set on
-  // each branch and applied ONCE at the bottom.
+  // #4490 — CARD GATE, primary: same two-layer design the outbox sweep uses
+  // (`audience-classify.mjs`'s module doc). `decideCaptureAudience` checks
+  // `reviewOriginated` independent of the reply-throw path above: a review
+  // turn's prose classifies `internal` UNLESS the text itself is the one
+  // sanctioned card (`isSelfImprovementCard`), in which case it's `user` and
+  // delivered normally. A non-review turn's `reviewOriginated` is `false`/
+  // `undefined`, which never enters this branch — so this can only ever
+  // ADD suppression to a review turn, never touch a normal answer.
+  const audienceGateEnabled = process.env.SWITCHROOM_TG_OUTBOX_AUDIENCE_GATE !== '0'
+  const audience = decideCaptureAudience({
+    reviewOriginated: args.reviewOriginated === true,
+    reviewTextIsCard: isSelfImprovementCard(text),
+  })
+  const suppressed = audienceGateEnabled && audience === AUDIENCE_INTERNAL
+  // #4490 — TITLE FRAMING, residual belt-and-braces: applied OUTERMOST, after
+  // the reply-throw banner, exactly mirroring `decideOutboxSweep`'s ordering
+  // (`outbox.ts`). Only reachable when the card gate is disabled (or a
+  // legacy/`user`-audience route) — a review record that IS delivered here
+  // must still carry the title so it can never appear as raw, unlabelled
+  // agent reasoning even in a degraded config. `!isSelfImprovementCard(text)`
+  // keeps this idempotent against a text that already opens with the title
+  // (#4489's fix, same discipline).
+  const selfImproveFramed =
+    !suppressed &&
+    shouldFrameSelfImprovement(
+      { reviewOriginated: args.reviewOriginated },
+      { frameEnabled: process.env.SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING !== '0' },
+    ) &&
+    !isSelfImprovementCard(text)
+  // #3228 Finding 1 — the settlement points (sent / skipped-dedup / failed /
+  // suppressed-internal) all funnel through the pure
+  // `settleCapturedProseDelivery` core so the failure posture is
+  // deterministic and unit-tested. `outcome` is set on each branch and
+  // applied ONCE at the bottom.
   let outcome: CapturedProseSendOutcome
+  if (suppressed) {
+    // #4490 — the gap this closes: previously this path had NO audience gate
+    // at all, so a non-card review turn's raw reasoning would be sent below
+    // exactly like any other captured prose. Suppress before the dedup check
+    // and before any send attempt — nothing is delivered, so there is nothing
+    // to dedup against.
+    journalExternalDelivery({
+      turnNonce: originTurnId,
+      text,
+      replyAlreadyDeliveredThisTurn: false,
+      audience,
+      suppressedAudience: AUDIENCE_INTERNAL,
+    })
+    process.stderr.write(
+      formatInternalSuppression({
+        turnNonce: originTurnId,
+        turnId: originTurnId,
+        chatId,
+        textSha256: sha256Hex(text),
+        source: 'captured-prose-bridge',
+      }),
+    )
+    outcome = 'suppressed-internal'
+  } else {
   const already = outboundDedup.check(chatId, threadId, text, now, registryKey)
   if (already == null) {
     let out = normalizeParagraphBreaks(repairEscapedWhitespace(framed ? applyReplyThrowFraming(text) : text))
+    out = selfImproveFramed ? applySelfImprovementFraming(out) : out
     out = redactOutboundText(out, 'captured_prose')
     const chunks = splitMarkdownChunks(out, RICH_MESSAGE_MAX_CHARS)
     const sentIds: number[] = []
@@ -2821,6 +2904,14 @@ export async function deliverCapturedProse(
         // `DeliveredEntry.framedProvenance`, so "was this labelled?" is
         // answerable from the journal alone, hours later.
         ...(framed ? { framedProvenance: 'reply-throw' as const } : {}),
+        // #4490 durable terminal stamp — parity with the sweep's
+        // `DeliveredEntry.framedSelfImprovement`.
+        ...(selfImproveFramed ? { framedSelfImprovement: 'self-improve' as const } : {}),
+        // #4490 — stamp the audience decision on every journal line from this
+        // site, not only the suppressed one, so "what audience did this
+        // classify as" is answerable from the journal alone even for a
+        // successful send (parity with the outbox sweep's journal rows).
+        audience,
       })
       process.stderr.write(
         `telegram gateway: captured-prose delivery — sent ${out.length} chars recovered from ` +
@@ -2829,6 +2920,17 @@ export async function deliverCapturedProse(
       if (framed) {
         process.stderr.write(
           formatReplyThrowFraming({
+            turnNonce: originTurnId,
+            turnId: originTurnId,
+            chatId,
+            textSha256: sha256Hex(text),
+            source: 'captured-prose-bridge',
+          }),
+        )
+      }
+      if (selfImproveFramed) {
+        process.stderr.write(
+          formatSelfImprovementFraming({
             turnNonce: originTurnId,
             turnId: originTurnId,
             chatId,
@@ -2861,9 +2963,12 @@ export async function deliverCapturedProse(
     )
     outcome = 'skipped-dedup'
   }
+  }
   // Apply the settlement bookkeeping through the pure core (#3228 Finding 1):
-  //   sent / skipped-dedup → close obligation + clear state (answer is with the
-  //                          user, so represent + exhausted fallback must not fire)
+  //   sent / skipped-dedup / suppressed-internal → close obligation + clear
+  //                          state (either the answer is with the user, or it
+  //                          was never meant to reach them — either way the
+  //                          represent + exhausted fallback must not fire).
   //   failed               → arm the Stop-hook re-prompt net (recordUndelivered),
   //                          do NOT close/clear.
   const settlement = settleCapturedProseDelivery(outcome, {

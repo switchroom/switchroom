@@ -188,6 +188,56 @@ function reviewTranscript(dir: string, trailing: string): string {
   ]);
 }
 
+/**
+ * #4489 shape: the review turn's OWN reply tool call throws (a
+ * `disable_notification: true` interim ack, so it never qualifies as the
+ * final answer — mirrors `foregroundThrowTranscript` in
+ * outbox-provenance-4141.test.ts), and the trailing text is a well-formed
+ * card. This is the ONLY shape that can carry both `replyToolThrewThisTurn`
+ * and a card body on the same record, which is what #4489's duplicated-title
+ * bug required.
+ */
+function reviewThrowTranscript(dir: string, trailing: string): string {
+  return writeTranscript(dir, [
+    {
+      type: "queue-operation",
+      operation: "enqueue",
+      content:
+        `<channel source="self_improve_review" chat_id="${DM_CHAT}" ` +
+        `message_id="${INBOUND_MSG_ID}">[self-improvement review] The turn-end gate ` +
+        `detected a learning signal. Run a focused, forked review.</channel>`,
+      timestamp: 1000,
+    },
+    {
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_review_ack",
+            name: "mcp__switchroom-telegram__reply",
+            input: { text: "Reviewing...", disable_notification: true },
+          },
+        ],
+      },
+    },
+    {
+      type: "user",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_review_ack",
+            is_error: true,
+            content: "Error: FLOOD_WAIT_ACTIVE — send rejected",
+          },
+        ],
+      },
+    },
+    { type: "assistant", message: { content: [{ type: "text", text: trailing }] } },
+  ]);
+}
+
 describe("self-improvement review — the card gate, end to end", () => {
   let dir: string;
   beforeEach(() => {
@@ -305,5 +355,47 @@ describe("self-improvement review — the card gate, end to end", () => {
     // Journal parity: a plain delivery, keyed on the raw text, unframed.
     expect(journalLines(dir)[0].textSha256).toBe(sha256Hex(NORMAL_ANSWER));
     expect(journalLines(dir)[0].framedSelfImprovement).toBeUndefined();
+  });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // #4489 — a review record that is BOTH a card AND `replyToolThrewThisTurn`
+  // must never acquire a second, duplicated title. `decideOutboxSweep`
+  // applies the reply-throw provenance banner BEFORE the self-improvement
+  // title, so by the time the self-improvement framing decision ran on the
+  // COMPOSED body (banner + card), `applySelfImprovementFraming`'s own
+  // idempotency check — which only inspects what it was handed — could no
+  // longer see that the underlying text already opened with the title. Fixed
+  // by gating the framing DECISION on the raw `record.text`, not the
+  // provenance-composed body.
+  // ───────────────────────────────────────────────────────────────────────
+  it("#4489: a review record that is both a CARD and reply-throw gets exactly one title", async () => {
+    const t = reviewThrowTranscript(dir, REVIEW_CARD);
+    expect(runHook(t, dir).status).toBe(0);
+
+    const records = outboxRecords(dir);
+    expect(records).toHaveLength(1);
+    expect(records[0].reviewOriginated).toBe(true);
+    expect(records[0].replyToolThrewThisTurn).toBe(true);
+    // The card routes `user` regardless of the throw (card gate wins).
+    expect(records[0].audience).toBe("user");
+
+    const bot = recordingBot();
+    // Audience gate OFF per the issue's repro shape — makes the self-improve
+    // framing layer the one under test here, isolated from the card gate
+    // (which already suppresses the leak for a non-card body; see (b)/(b')
+    // above). A card's audience is `user` regardless of the gate, so this
+    // does not change which branch delivers it — only removes a confound.
+    const run = await realSweep(dir, bot, { audienceGateEnabled: false });
+
+    expect(bot.chatCalls()).toHaveLength(1);
+    const sent = bot.chatCalls()[0].text;
+    // REGRESSION GUARD: exactly one occurrence of the title, not two. Before
+    // the fix this was 2 — the reply-throw banner is prepended in front of
+    // the card, so the composed body no longer opens with the title even
+    // though the raw card does, and the framing decision (running on the
+    // composed body) could not tell.
+    const titleOccurrences = sent.split(SELF_IMPROVEMENT_TITLE).length - 1;
+    expect(titleOccurrences).toBe(1);
+    expect(sent).toContain("add an `hrv-trend` command");
   });
 });

@@ -9919,6 +9919,7 @@ async function deliverCapturedProse(args: {
   text: string
   /** Turn elapsed for the honest "(waited Ns)" apology clause; optional. */
   turnDurationMs?: number; replyToolThrewThisTurn?: boolean // #4141: label prose recovered from a turn whose reply tool threw (see outbound-send-path.ts)
+  reviewOriginated?: boolean // #4490: review-turn provenance, threaded through to the SAME card-gate / title-framing rules (see outbound-send-path.ts)
 }): Promise<void> {
   // #2996 P2: body moved VERBATIM to outbound-send-path.ts (single tested
   // send module). Injects the ONE `outboundDedup` instance (Amendment 1/9).

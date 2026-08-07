@@ -2941,6 +2941,10 @@ export function handleSessionEvent(deps: StreamRenderDeps, ev: SessionEvent): vo
               // not what it chose to send. Pass the raw signal through so the
               // send states that provenance. It never gates delivery.
               replyToolThrewThisTurn: proseDecision.replyToolThrewThisTurn === true,
+              // #4490 — same pass-through for the review-origin signal, so the
+              // send path can apply the SAME card-gate / title-framing rules the
+              // outbox sweep applies to a review turn's prose.
+              reviewOriginated: proseDecision.reviewOriginated === true,
               // For the honest "(waited Ns)" clause if the exhaustion-boundary
               // apology fallback fires (#3228).
               turnDurationMs,

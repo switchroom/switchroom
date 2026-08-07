@@ -131,6 +131,19 @@ function buildNextState(base, decision, retryCount) {
   } else {
     delete next.replyToolThrewThisTurn
   }
+  // #4490: same carry-through for review-turn provenance. The outbox capture
+  // path (`writeOutboxRecord` above) stamps `reviewOriginated` from the SAME
+  // envelope `source` tag; the ELECTED path ('trailing-text-after-reply') never
+  // writes an outbox record, so the captured-prose bridge (the delivering
+  // machine on this path) has no other way to learn it. Explicitly deleted
+  // when this turn's scan saw no review-source envelope, so a spread of a
+  // prior turn's file can never mislabel a normal turn's prose as a review
+  // turn's (or vice versa).
+  if (isReviewOriginatedSource(decision.source)) {
+    next.reviewOriginated = true
+  } else {
+    delete next.reviewOriginated
+  }
   return next
 }
 
