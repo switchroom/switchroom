@@ -15,6 +15,15 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### CI: faster hindsight image build and e2e probe
+
+- **The `build-hindsight` job builds arm64 natively and the hindsight-probe
+  e2e job overlaps cleanup with the pull.** `docker-images` now builds the
+  arm64 hindsight image on a native arm64 runner instead of emulating it under
+  QEMU, and the hindsight-probe e2e job runs its disk cleanup concurrently with
+  the image pull and reuses the registry buildcache instead of rebuilding. Cuts
+  roughly 4-6 min off release image builds and 2-3 min off e2e runs. (#4513)
+
 ## v0.20.15 — migrating a populated Hindsight bank to ParadeDB `pg_search` is a plain env flip, not a trapdoor
 
 ### Hindsight: a populated bank can migrate to `pg_search` by flipping the env, not by hand
