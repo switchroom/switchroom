@@ -159,6 +159,24 @@ switchroom hindsight-bench --plot idle-a.json contended.json --out chart.svg
 `--json` makes either verdict machine-readable. Exit codes: `0` PASS, `1` FAIL,
 `2` usage/IO error.
 
+### Both verdicts refuse a run they only partly measured
+
+A cell is **ungradeable** when every call errored, or when more than 10 % of
+them did. Ungradeable cells are named in the report and force `FAIL`, and the
+contention verdict says explicitly that the failure is on the measurement
+rather than the generator.
+
+This is not hypothetical tidiness. During the 2026-08-07 baseline the Hindsight
+container was recreated by unrelated fleet work mid-sweep. Two of ten cells lost
+their data; the eight survivors still cleared the contention threshold
+comfortably, so before this gate existed the run would have printed a confident
+PASS over a sweep that had partly failed. One of the damaged cells kept six
+samples out of forty and reported the **lowest** p95 in the run — a percentile
+over whichever calls were fast enough not to time out is not a fast cell, it is
+a broken one.
+
+Neither verdict is graded on whichever cells happened to survive. Re-run.
+
 ## Running it
 
 ```bash
