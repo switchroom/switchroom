@@ -691,6 +691,248 @@ assert t.count("rows = await conn.fetch(fb_query, *fb_params)") == 1, "switchroo
 print("switchroom hindsight PG text-search recall-fallback patch: recall degrades to semantic-only on missing regconfig / stopword file (SQLSTATE 42704) and on absent pg_search BM25 index (SQLSTATE XX000)")
 PYEOF
 
+# pg_search BM25 filter-field pushdown (switchroom epic #4474, phase P4 / #4478).
+#
+# THE DEFECT, in the real shipping source at tag v0.8.6.
+#
+# `_pg_search.py:74-85` builds the ParadeDB column list from the key_field and
+# the TEXT fields only, and `migrations.py:1042-1070` emits
+#   CREATE INDEX ... USING bm25 (id, text, context, text_signals)
+#   WITH (key_field='id')
+# But every recall keyword arm is scoped by bank and fact type —
+# `engine/sql/postgresql.py:232-245` emits
+#   WHERE bank_id = $n AND fact_type = '<literal>'
+# with those two columns OUTSIDE the index. ParadeDB can only push a `=`
+# predicate INTO the BM25 scan when the column is indexed with the `literal`
+# tokenizer (docs.paradedb.com, Filtering / Filter Pushdown / Text Fields);
+# otherwise it degrades the predicate to a post-scoring `heap_filter`. So BM25
+# Top-N skipping — the entire reason pg_search should scale sublinearly — runs
+# over the WHOLE table and the bank restriction is paid for on the heap.
+#
+# MEASURED, not assumed. Isolated pg_search 0.25.1 / PostgreSQL 18.1 instance,
+# 797,893 rows across 14 banks shaped to the fleet's live bank-size
+# distribution, real recall arm shape, EXPLAIN (ANALYZE, BUFFERS, VERBOSE):
+#
+#   uncorrected  Tantivy Query carries
+#                  "field_filters":[{"heap_filter":"(bank_id = 'bank-A'::text)"}]
+#                  "field_filters":[{"heap_filter":"(fact_type = 'world'::text)"}]
+#                Buffers: shared hit=171522     Execution Time 253.923 ms
+#
+#   corrected    Tantivy Query carries
+#                  {"term":{"field":"bank_id","value":"bank-A"}}
+#                  {"term":{"field":"fact_type","value":"world"}}
+#                Buffers: shared hit=416        Execution Time   7.553 ms
+#
+# 412x fewer buffers, 33.6x faster, IDENTICAL result sets (120 queries / 4,362
+# rows: 0 rows added, 0 dropped, 0 score changes, 0 rank changes) — the filter
+# moved, it did not narrow.
+#
+# THE FIX. Only the INDEX changes. `engine/sql/postgresql.py` is deliberately
+# NOT patched: ParadeDB absorbs the plain SQL `WHERE` itself once the columns
+# carry the literal tokenizer, so rewriting the arm into
+# `paradedb.boolean(must => ...)` would be churn that buys nothing and forks a
+# hot code path away from upstream.
+#
+# WHY `pdb.literal` AND NEVER THE CONFIGURED TOKENIZER. Equality pushdown needs
+# the entire column value to be exactly one token. Casting bank_id through the
+# configured text tokenizer (stemmer, ngram, lindera, ...) would tokenize the
+# value and the `=` predicate would stop matching — a silent recall wipeout, not
+# a slowdown. The filter cast is therefore hard-coded, independent of
+# HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER.
+#
+# SCOPE OF THE FIELD MAP. Only `memory_units` gets filter fields: it is the only
+# table with a `@@@` arm anywhere in the engine (grep for `paradedb.` outside
+# _pg_search.py/migrations.py finds exactly one call site,
+# engine/sql/postgresql.py:216-222). `reflections`, `learnings` and
+# `pinned_reflections` have BM25 indexes but no search arm, so filter fields
+# there would be pure index bloat. A build-time assertion below fails the image
+# if upstream ever adds a second arm, so the map cannot silently go stale.
+#
+# WHAT THIS DOES NOT DO. It does not rebuild an EXISTING uncorrected index.
+# Upstream's boot-path detector (`migrations.py:887`) keys on the `key_field`
+# reloption alone and never inspects the column list, so a live uncorrected
+# index is adopted as correct — and rebuilding one on the every-boot path
+# against a populated table is precisely the C2 fail-closed window the epic
+# forbids. The tokenizer-drift block below therefore gains a filter-field arm:
+# the gap is reported LOUDLY, every boot, and never repaired implicitly.
+#
+# Self-verifying at build time; behaviourally guarded by
+# tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts and statically
+# by tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+NAME = "pg_search filter-field pushdown"
+ROOT = pathlib.Path("/app/api/hindsight_api")
+
+
+def patch(rel, old, new, *, count=1):
+    f = ROOT / rel
+    s = f.read_text()
+    n = s.count(old)
+    assert n == count, (
+        f"switchroom hindsight {NAME}: anchor found {n}x (expected {count}) in {rel} — "
+        "upstream reformatted; re-author this patch in docker/Dockerfile.hindsight. "
+        f"Anchor head: {old.strip().splitlines()[0]!r}"
+    )
+    f.write_text(s.replace(old, new, count))
+
+
+# ---------------------------------------------------------------- _pg_search.py
+patch(
+    "_pg_search.py",
+    r'''def pg_search_bm25_columns(
+    key_field: str,
+    text_fields: Sequence[str],
+    tokenizer: str | None,
+) -> str:
+    """Build a ParadeDB BM25 column list for CREATE INDEX."""
+
+    normalized = normalize_pg_search_tokenizer(tokenizer)
+    if not normalized:
+        return ", ".join([key_field, *text_fields])
+
+    return ", ".join([key_field, *(f"({field}::pdb.{normalized})" for field in text_fields)])
+''',
+    r'''# --- switchroom: BM25 filter-field pushdown (epic #4474, P4 / #4478) ---------
+#
+# Columns the recall arm restricts on, per table. ParadeDB pushes a `=`
+# predicate into the BM25 scan only when the column is indexed with the
+# `literal` tokenizer; without this the restriction is a post-scoring
+# heap_filter and Top-N skipping runs over the whole table. Only tables that
+# actually carry a `@@@` arm belong here — an entry costs index size otherwise.
+PG_SEARCH_FILTER_FIELDS: dict[str, tuple[str, ...]] = {
+    "memory_units": ("bank_id", "fact_type"),
+}
+
+# Hard-coded, NEVER the configured text tokenizer: equality pushdown requires
+# the whole column value to be a single token, so a stemmed / ngram / lindera
+# cast here would silently stop the `=` predicate matching at all.
+PG_SEARCH_FILTER_TOKENIZER = "literal"
+
+
+def pg_search_filter_fields(table: str | None) -> tuple[str, ...]:
+    """Filter columns for ``table``, or ``()`` when it has no search arm."""
+
+    if not table:
+        return ()
+    return PG_SEARCH_FILTER_FIELDS.get(table.split(".")[-1].strip('"').lower(), ())
+
+
+def pg_search_filter_columns(filter_fields: Sequence[str]) -> list[str]:
+    """``(field::pdb.literal)`` casts for the pushdown filter columns."""
+
+    return [f"({field}::pdb.{PG_SEARCH_FILTER_TOKENIZER})" for field in filter_fields]
+
+
+def pg_search_bm25_columns(
+    key_field: str,
+    text_fields: Sequence[str],
+    tokenizer: str | None,
+    filter_fields: Sequence[str] = (),
+) -> str:
+    """Build a ParadeDB BM25 column list for CREATE INDEX.
+
+    ``filter_fields`` are appended with the literal tokenizer so their `=`
+    predicates can be pushed into the BM25 scan (switchroom #4478). They are
+    independent of ``tokenizer``, which only ever applies to ``text_fields``.
+    """
+
+    normalized = normalize_pg_search_tokenizer(tokenizer)
+    if not normalized:
+        text_columns = list(text_fields)
+    else:
+        text_columns = [f"({field}::pdb.{normalized})" for field in text_fields]
+
+    return ", ".join([key_field, *text_columns, *pg_search_filter_columns(filter_fields)])
+''',
+)
+
+# --------------------------------------------- 5a366d414dce_initial_schema.py
+# The only memory_units BM25 create-site that the tokenizer-drift block does
+# NOT route through pg_search_rebuild_bm25_columns (it creates the table in the
+# same migration, so there is never a prior index to preserve).
+MIG_INITIAL = "alembic/versions/5a366d414dce_initial_schema.py"
+
+patch(
+    MIG_INITIAL,
+    r'''from hindsight_api._pg_search import (
+    PG_SEARCH_TOKENIZER_ENV,
+    normalize_pg_search_tokenizer,
+    pg_search_bm25_columns,
+)
+''',
+    r'''from hindsight_api._pg_search import (
+    PG_SEARCH_TOKENIZER_ENV,
+    normalize_pg_search_tokenizer,
+    pg_search_bm25_columns,
+    pg_search_filter_fields,
+)
+''',
+)
+
+patch(
+    MIG_INITIAL,
+    r'''        bm25_cols = pg_search_bm25_columns("id", ("text", "context"), _pg_search_tokenizer())
+''',
+    r'''        # switchroom (#4478): bank_id/fact_type as literal fast fields so the
+        # recall arm's WHERE is pushed into the BM25 scan, not applied on the heap.
+        bm25_cols = pg_search_bm25_columns(
+            "id",
+            ("text", "context"),
+            _pg_search_tokenizer(),
+            pg_search_filter_fields("memory_units"),
+        )
+''',
+)
+
+# ----------------------------------------------------------------- verification
+import py_compile
+import re
+
+for rel in ("_pg_search.py", MIG_INITIAL):
+    py_compile.compile(str(ROOT / rel), doraise=True)
+
+t = (ROOT / "_pg_search.py").read_text()
+assert 'PG_SEARCH_FILTER_FIELDS: dict[str, tuple[str, ...]] = {' in t, f"switchroom hindsight {NAME}: field map missing after patch"
+assert '"memory_units": ("bank_id", "fact_type"),' in t, f"switchroom hindsight {NAME}: memory_units filter fields missing after patch"
+assert 'PG_SEARCH_FILTER_TOKENIZER = "literal"' in t, f"switchroom hindsight {NAME}: filter tokenizer must be the literal tokenizer"
+assert "def pg_search_filter_fields(" in t, f"switchroom hindsight {NAME}: table->fields accessor missing after patch"
+assert "def pg_search_filter_columns(" in t, f"switchroom hindsight {NAME}: cast builder missing after patch"
+assert "filter_fields: Sequence[str] = ()," in t, f"switchroom hindsight {NAME}: builder did not gain filter_fields"
+# The filter cast must never be derived from the configured tokenizer.
+assert "f\"({field}::pdb.{PG_SEARCH_FILTER_TOKENIZER})\"" in t, f"switchroom hindsight {NAME}: filter cast is not pinned to PG_SEARCH_FILTER_TOKENIZER"
+_filter_col_body = t.split("def pg_search_filter_columns(")[1].split("\ndef ")[0]
+assert "normalized" not in _filter_col_body, (
+    f"switchroom hindsight {NAME}: pg_search_filter_columns references the configured tokenizer — "
+    "a stemmed/ngram cast on a filter column silently breaks the `=` predicate"
+)
+
+a = (ROOT / MIG_INITIAL).read_text()
+assert 'pg_search_filter_fields("memory_units")' in a, f"switchroom hindsight {NAME}: initial-schema create site does not request filter fields"
+
+# The field map covers every table with a ParadeDB search arm. If upstream adds
+# a second arm, this fails the BUILD rather than shipping an index that silently
+# cannot push that arm's filters down.
+_pg_sql = (ROOT / "engine/sql/postgresql.py").read_text()
+_arm_tables = set(re.findall(r"paradedb\.match\('(\w+)'", _pg_sql))
+assert _arm_tables == {"text", "context", "text_signals"}, (
+    f"switchroom hindsight {NAME}: the ParadeDB arm's matched fields changed to {sorted(_arm_tables)} — "
+    "upstream may have added or moved a search arm; re-check PG_SEARCH_FILTER_FIELDS covers every "
+    "table with a `@@@` arm (docker/Dockerfile.hindsight)"
+)
+assert _pg_sql.count("id @@@ paradedb.boolean(") == 1, (
+    f"switchroom hindsight {NAME}: expected exactly 1 ParadeDB search arm in engine/sql/postgresql.py — "
+    "a new arm needs its table added to PG_SEARCH_FILTER_FIELDS or its filters will not push down"
+)
+assert _pg_sql.count("WHERE bank_id = {bank_id_param}") == 2, (
+    f"switchroom hindsight {NAME}: the arm's bank_id predicate changed shape — the pushdown fix "
+    "targets `bank_id = $n AND fact_type = '<lit>'`; re-verify EXPLAIN before shipping"
+)
+
+print("switchroom hindsight pg_search filter-field pushdown: bank_id/fact_type indexed as pdb.literal fast fields so the recall arm's WHERE is pushed into the BM25 scan instead of a post-scoring heap_filter")
+PYEOF
+
 # pg_search tokenizer-drift guard (switchroom epic #4474, finding C1).
 #
 # THE DEFECT, in the real shipping source at tag v0.8.6.
@@ -741,9 +983,11 @@ PYEOF
 # warning. The signal is a loud, repeated-every-boot structured log plus the
 # in-process `pg_search_tokenizer_drift_state()` accessor.
 #
-# NOT PATCHED, deliberately: `5a366d414dce_initial_schema.py` and
-# `n9i0j1k2l3m4_learnings_and_pinned_reflections.py` CREATE their tables in the
-# same migration, so no pre-existing index can be downgraded there.
+# NOT PATCHED BY THIS BLOCK, deliberately: `5a366d414dce_initial_schema.py`
+# and `n9i0j1k2l3m4_learnings_and_pinned_reflections.py` CREATE their tables in
+# the same migration, so no pre-existing index can be downgraded there. (The
+# #4478 filter-pushdown block above does patch the initial-schema create site,
+# for the unrelated reason that a FRESH index must carry the filter fields.)
 #
 # The cast syntax preserved here is ParadeDB's documented form —
 # `(description::pdb.simple('stemmer=english', 'stopwords_language=english'))`,
@@ -797,10 +1041,12 @@ GUARD = r'''
 # it raises: it runs on the every-boot migration path.
 
 PG_SEARCH_TOKENIZER_DRIFT_MARKER = "pg_search_tokenizer_drift"
+PG_SEARCH_FILTER_FIELD_DRIFT_MARKER = "pg_search_filter_field_drift"
 
 _DRIFT_LOG = logging.getLogger(__name__)
 
 _LAST_TOKENIZER_DRIFT: dict[str, dict[str, object]] = {}
+_LAST_FILTER_FIELD_DRIFT: dict[str, dict[str, object]] = {}
 
 _INDEX_COLUMNS_RE = re.compile(r"\busing\s+(?:bm25|paradedb)\s*\(", re.IGNORECASE)
 
@@ -1036,6 +1282,86 @@ def check_pg_search_tokenizer_drift(
         return None
 
 
+def pg_search_filter_field_drift_state() -> dict[str, dict[str, object]]:
+    """Last recorded filter-field drift per index — for status surfaces and tests."""
+
+    return {key: dict(value) for key, value in _LAST_FILTER_FIELD_DRIFT.items()}
+
+
+def check_pg_search_filter_field_drift(
+    indexdef: str | None,
+    table: str,
+    *,
+    index_name: str = "",
+    log=None,
+) -> dict[str, object] | None:
+    """Report a live ParadeDB index that cannot push the recall arm's WHERE down.
+
+    switchroom (epic #4474, P4 / #4478). Upstream's boot-path detector keys on
+    the ``key_field`` reloption alone and never inspects the column list, so an
+    index built before the filter-pushdown fix is silently adopted as correct —
+    and every recall arm then pays a post-scoring ``heap_filter`` over the whole
+    table instead of a Tantivy term filter over the caller's bank.
+
+    LOG ONLY, and deliberately so. Repairing it means DROP INDEX + CREATE INDEX
+    on a populated table, which is exactly the window where the pg_search arm
+    raises ``XX000 ... does not contain a USING bm25 index`` (epic finding C2).
+    Turning a performance gap into an availability gap on the every-boot path is
+    strictly worse than reporting it. Returns a drift record or ``None``; NEVER
+    raises and NEVER mutates the database.
+    """
+
+    emit = log if log is not None else _DRIFT_LOG
+    try:
+        expected = pg_search_filter_fields(table)
+        if not expected:
+            return None
+        casts = parse_pg_search_index_casts(indexdef)
+        if casts is None:
+            return None
+        missing = [f for f in expected if f.lower() not in casts]
+        wrong = [
+            f
+            for f in expected
+            if f.lower() in casts
+            and casts[f.lower()].strip().lower() != PG_SEARCH_FILTER_TOKENIZER
+        ]
+        if not missing and not wrong:
+            return None
+        record: dict[str, object] = {
+            "table": table,
+            "index": index_name,
+            "expected_filter_fields": list(expected),
+            "missing_filter_fields": missing,
+            "wrongly_tokenized_filter_fields": wrong,
+            "expected_tokenizer": PG_SEARCH_FILTER_TOKENIZER,
+            "observed_casts": dict(casts),
+        }
+        _LAST_FILTER_FIELD_DRIFT[f"{table}.{index_name}"] = record
+        emit.error(
+            "%s table=%s index=%s missing=%r wrongly_tokenized=%r expected_tokenizer=%r - the "
+            "live ParadeDB index cannot push the recall arm's bank_id/fact_type predicates into "
+            "the BM25 scan, so every keyword arm scores the WHOLE table and filters on the heap. "
+            "Rebuild the index (NOT on the boot path - see epic #4474 finding C2) to recover it.",
+            PG_SEARCH_FILTER_FIELD_DRIFT_MARKER,
+            table or "?",
+            index_name or "?",
+            missing,
+            wrong,
+            PG_SEARCH_FILTER_TOKENIZER,
+        )
+        return record
+    except Exception as exc:  # never raise on the boot path
+        emit.warning(
+            "%s check failed on table=%s index=%s: %s",
+            PG_SEARCH_FILTER_FIELD_DRIFT_MARKER,
+            table,
+            index_name,
+            exc,
+        )
+        return None
+
+
 def pg_search_rebuild_bm25_columns(
     indexdef: str | None,
     key_field: str,
@@ -1058,12 +1384,21 @@ def pg_search_rebuild_bm25_columns(
       stopworded index) -> the observed cast is PRESERVED, so the rebuild cannot
       silently downgrade a stemmed index to an unstemmed one.
 
+    The switchroom filter-pushdown columns for ``table`` (#4478) are appended on
+    EVERY branch, including the preserve-observed one: they encode the recall
+    arm's WHERE shape, not a tokenizer choice, so a tokenizer decision must never
+    drop them.
+
     Never raises: any parse or safety failure falls back to the configured
     column list with a log line, i.e. exactly upstream's behaviour.
     """
 
     emit = log if log is not None else _DRIFT_LOG
-    configured_columns = pg_search_bm25_columns(key_field, text_fields, tokenizer)
+    # switchroom (#4478): the pushdown filter columns travel with the TABLE, not
+    # with the tokenizer, so every rebuild branch below must re-emit them or the
+    # rebuild silently un-does the filter-pushdown fix.
+    filter_fields = pg_search_filter_fields(table)
+    configured_columns = pg_search_bm25_columns(key_field, text_fields, tokenizer, filter_fields)
     drift = check_pg_search_tokenizer_drift(
         indexdef, text_fields, tokenizer, table=table, index_name=index_name, log=emit
     )
@@ -1106,7 +1441,13 @@ def pg_search_rebuild_bm25_columns(
         drift["configured_tokenizer"],
         PG_SEARCH_TOKENIZER_ENV,
     )
-    return ", ".join([key_field, *(f"({field}::pdb.{observed})" for field in text_fields)])
+    return ", ".join(
+        [
+            key_field,
+            *(f"({field}::pdb.{observed})" for field in text_fields),
+            *pg_search_filter_columns(filter_fields),
+        ]
+    )
 '''
 
 _pg = ROOT / "_pg_search.py"
@@ -1123,6 +1464,7 @@ patch(
     r'''from ._pg_search import normalize_pg_search_tokenizer, pg_search_bm25_columns
 ''',
     r'''from ._pg_search import (
+    check_pg_search_filter_field_drift,
     check_pg_search_tokenizer_drift,
     normalize_pg_search_tokenizer,
     pg_search_rebuild_bm25_columns,
@@ -1154,6 +1496,16 @@ patch(
                         else ("name", "content"),
                         pg_search_tokenizer,
                         table=table_name,
+                        index_name=f"idx_{table_name.replace('.', '_')}_text_search",
+                        log=logger,
+                    )
+                    # switchroom (#4478): an index can have the right key_field
+                    # AND the right tokenizer and still be wrong — if it omits
+                    # bank_id/fact_type nothing can push the arm's WHERE into the
+                    # BM25 scan. Log only; a boot-path rebuild is the C2 window.
+                    check_pg_search_filter_field_drift(
+                        current_index_def,
+                        table_name,
                         index_name=f"idx_{table_name.replace('.', '_')}_text_search",
                         log=logger,
                     )
@@ -1343,6 +1695,21 @@ assert "def pg_search_tokenizer_is_expressible(" in t, f"switchroom hindsight {N
 assert "def pg_search_rebuild_bm25_columns(" in t, f"switchroom hindsight {NAME}: rebuild builder missing after patch"
 assert "def pg_search_tokenizer_drift_state(" in t, f"switchroom hindsight {NAME}: drift-state accessor missing after patch"
 assert 'PG_SEARCH_TOKENIZER_DRIFT_MARKER = "pg_search_tokenizer_drift"' in t, f"switchroom hindsight {NAME}: log marker missing after patch"
+# switchroom #4478: the filter-pushdown columns ride along on every rebuild
+# branch, and the boot path reports an index that cannot push them down.
+assert "def check_pg_search_filter_field_drift(" in t, f"switchroom hindsight {NAME}: filter-field drift check missing after patch"
+assert "def pg_search_filter_field_drift_state(" in t, f"switchroom hindsight {NAME}: filter-field drift-state accessor missing after patch"
+assert 'PG_SEARCH_FILTER_FIELD_DRIFT_MARKER = "pg_search_filter_field_drift"' in t, f"switchroom hindsight {NAME}: filter-field drift marker missing after patch"
+assert "pg_search_bm25_columns(key_field, text_fields, tokenizer, filter_fields)" in t, (
+    f"switchroom hindsight {NAME}: the configured-columns rebuild branch dropped the #4478 filter fields"
+)
+assert "*pg_search_filter_columns(filter_fields)," in t, (
+    f"switchroom hindsight {NAME}: the preserve-observed rebuild branch dropped the #4478 filter fields — "
+    "a tokenizer decision must never un-do the filter-pushdown fix"
+)
+assert t.count("filter_fields = pg_search_filter_fields(table)") == 1, (
+    f"switchroom hindsight {NAME}: rebuild builder does not resolve filter fields from the table"
+)
 # The guard body must contain no `raise` statement at all: it runs on the
 # every-boot path, where an exception is an availability outage.
 _guard_body = t.split("# --- switchroom: pg_search tokenizer-drift guard")[1]
@@ -1351,6 +1718,7 @@ assert not _raises, f"switchroom hindsight {NAME}: guard body contains a raise s
 
 m = (ROOT / "migrations.py").read_text()
 assert "check_pg_search_tokenizer_drift(" in m, f"switchroom hindsight {NAME}: boot-path drift check missing after patch"
+assert "check_pg_search_filter_field_drift(" in m, f"switchroom hindsight {NAME}: boot-path filter-field drift check missing after patch"
 assert m.count("pg_search_rebuild_bm25_columns(") == 2, f"switchroom hindsight {NAME}: expected 2 rebuild call sites in migrations.py"
 assert m.count("pg_search_bm25_columns(") == 0, f"switchroom hindsight {NAME}: a config-only pg_search rebuild call site survived in migrations.py"
 assert "prior_indexdef" in m, f"switchroom hindsight {NAME}: pre-drop indexdef capture missing after patch"

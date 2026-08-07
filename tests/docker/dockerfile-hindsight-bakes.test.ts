@@ -420,6 +420,92 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /switchroom hindsight pg_search tokenizer-drift guard: rebuilds preserve an inexpressible tokenizer/,
     );
+
+    // #4478: a rebuild must re-emit the pushdown filter columns on BOTH
+    // branches, or the tokenizer fix silently un-does the pushdown fix.
+    expect(dockerfile).toMatch(
+      /filter_fields = pg_search_filter_fields\(table\)/,
+    );
+  });
+
+  it("keeps the pg_search BM25 filter-field pushdown (assert-guarded, fail-loud)", () => {
+    // Epic #4474, phase P4 (#4478). Upstream indexes only (id, text, context
+    // [, text_signals]), so ParadeDB cannot push the recall arm's
+    // `bank_id = $n AND fact_type = '<lit>'` into the Tantivy scan — it
+    // degrades them to a post-scoring heap_filter and every keyword arm scores
+    // the WHOLE table. Measured on an 800k-row corpus: 171,522 shared buffer
+    // hits per arm uncorrected vs 416 corrected (412x), and the uncorrected
+    // index runs 2-10x SLOWER than the native tsvector+GIN comparator.
+    // RESULTS are identical either way, so nothing but a plan or a latency
+    // chart can see the defect — which is why this needs a pinned guard.
+    // Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts.
+
+    // 1. the field map, scoped to the one table with a `@@@` arm.
+    expect(dockerfile).toMatch(
+      /PG_SEARCH_FILTER_FIELDS: dict\[str, tuple\[str, \.\.\.\]\] = \{/,
+    );
+    expect(dockerfile).toMatch(/"memory_units": \("bank_id", "fact_type"\),/);
+
+    // 2. THE LOAD-BEARING CONSTRAINT: the filter cast is the `literal`
+    //    tokenizer, hard-coded, never the configured text tokenizer. Equality
+    //    pushdown needs the whole column value to be one token, so a stemmed /
+    //    ngram / lindera cast here stops the predicate matching AT ALL — i.e.
+    //    empty keyword recall, not merely slow keyword recall.
+    expect(dockerfile).toMatch(/PG_SEARCH_FILTER_TOKENIZER = "literal"/);
+    expect(dockerfile).toMatch(
+      /assert "normalized" not in _filter_col_body, \(/,
+    );
+
+    // 3. both helpers, and the builder's new optional parameter (optional so
+    //    every upstream call site keeps its exact upstream output).
+    expect(dockerfile).toMatch(/def pg_search_filter_fields\(/);
+    expect(dockerfile).toMatch(/def pg_search_filter_columns\(/);
+    expect(dockerfile).toMatch(/filter_fields: Sequence\[str\] = \(\),/);
+
+    // 4. the fresh-install create site actually requests them — the one
+    //    memory_units BM25 create site the tokenizer-drift block does not own.
+    expect(dockerfile).toMatch(/pg_search_filter_fields\("memory_units"\)/);
+
+    // 5. NEGATIVE GUARD, deliberate: the query is NOT rewritten. #4478's
+    //    original plan folded bank_id/fact_type into paradedb.boolean(must =>
+    //    ...), which EXPLAIN showed is unnecessary — ParadeDB absorbs the plain
+    //    SQL WHERE once the columns carry the literal tokenizer. engine/sql/
+    //    postgresql.py stays untouched; if a patch ever starts rewriting the
+    //    arm, that is a re-litigation of a measured decision.
+    //    Comment lines are stripped first: the block's own header EXPLAINS the
+    //    rejected design, and the guard is about emitted code, not prose.
+    const dockerfileCode = dockerfile
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(dockerfileCode).not.toMatch(/paradedb\.boolean\(\s*must\s*=>/);
+
+    // 6. the build FAILS if upstream grows a second search arm the field map
+    //    does not cover, rather than shipping an index that cannot push it down.
+    expect(dockerfile).toMatch(
+      /_arm_tables = set\(re\.findall\(r"paradedb\\\.match\\\('\(\\w\+\)'", _pg_sql\)\)/,
+    );
+    expect(dockerfile).toMatch(
+      /assert _pg_sql\.count\("id @@@ paradedb\.boolean\("\) == 1,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert _pg_sql\.count\("WHERE bank_id = \{bank_id_param\}"\) == 2,/,
+    );
+
+    // 7. the boot-path detector exists and is LOG-ONLY. Repairing a live index
+    //    on the boot path is the #4474/C2 fail-closed window (a DROP/CREATE on
+    //    a populated memory_units), and a raise there would take the semantic
+    //    arm down with the keyword one.
+    expect(dockerfile).toMatch(
+      /PG_SEARCH_FILTER_FIELD_DRIFT_MARKER = "pg_search_filter_field_drift"/,
+    );
+    expect(dockerfile).toMatch(/def check_pg_search_filter_field_drift\(/);
+
+    // 8. the stable operator signal.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight pg_search filter-field pushdown: bank_id\/fact_type indexed as pdb\.literal fast fields/,
+    );
   });
 
   it("creates /backups owned by hindsight BEFORE `USER hindsight` (so the named volume is writable)", () => {

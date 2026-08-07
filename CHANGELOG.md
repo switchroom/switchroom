@@ -50,6 +50,32 @@ now an anomaly worth investigating, not the norm.
   reset. Baselines captured before this fix are annotated in
   `docs/hindsight-bench-p2-residency.md` rather than hand-edited.
 
+### Hindsight keyword recall
+
+- **The pg_search BM25 index now indexes `bank_id` and `fact_type` as
+  `pdb.literal` fast fields (#4478)** — every recall keyword arm filters on
+  `bank_id = $n AND fact_type = '<literal>'`, but those columns were outside the
+  BM25 index, so ParadeDB could not push the equalities into the Tantivy scan and
+  degraded them to a post-scoring `heap_filter`: the arm scored the WHOLE table
+  and then discarded everything outside the caller's bank. Measured on an
+  isolated 797,893-row corpus with the real arm shape: `Buffers: shared hit`
+  171,517 → 405 (423x) and 231.4ms → 7.8ms execution for a byte-identical result
+  set (120 queries / 4,362 rows: 0 rows added, 0 dropped, 0 score or rank
+  changes). Corrected, pg_search is 4-6x faster than native at every measured
+  concurrency and its p95 is flat across bank size (largest/smallest ratio 0.97 /
+  1.04 / 1.06 at concurrency 1 / 8 / 16, versus native's 1.11 / 1.17 / 1.20) —
+  which also explains away the recorded "pg_search is a 124-138ms regression"
+  claim: those numbers measured the missing fast fields, not the backend. The
+  filter cast is hard-coded to `literal` and never follows
+  `HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER`, because a stemmed or
+  ngram cast on a filter column would stop the equality matching at all. Index
+  cost is +0.7%. Fresh databases get the corrected index from the initial-schema
+  migration; an EXISTING index is reported loudly on every boot
+  (`pg_search_filter_field_drift`) and never rebuilt implicitly, because a
+  boot-path `DROP INDEX`/`CREATE INDEX` on a populated table is the fail-closed
+  window from #4472. Evidence and the deliberate rebuild procedure:
+  `docs/baselines/hindsight-pg-search-pushdown-2026-08-07/`.
+
 ## v0.20.13 — ParadeDB pg_search BM25 keyword recall, `vault:` secrets resolved off the apply path, and recall quality as a gating number
 
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)

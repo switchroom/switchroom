@@ -1,0 +1,29 @@
+Pager usage is off.
+SET
+                                                                                                                                                                                                                                                                                                                                                  QUERY PLAN                                                                                                                                                                                                                                                                                                                                                   
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10.00..1424.51 rows=50 width=20) (actual time=7.247..7.678 rows=50.00 loops=1)
+   Output: id, (paradedb.score(id))
+   Buffers: shared hit=405
+   ->  Custom Scan (ParadeDB Base Scan) on public.memory_units  (cost=10.00..1424.51 rows=50 width=20) (actual time=7.246..7.672 rows=50.00 loops=1)
+         Output: id, paradedb.score(id)
+         Table: memory_units
+         Index: idx_memory_units_text_search
+         Segment Count: 4
+         Worker Selection: Cost model
+         Heap Fetches: 50
+         Virtual Tuples: 0
+         Invisible Tuples: 0
+         Exec Method: TopKScanExecState
+         Scores: true
+            TopK Order By: pdb.score() desc
+            TopK Limit: 50
+            Queries: 1
+         Tantivy Query: {"boolean":{"must":[{"with_index":{"query":{"boolean":{"should":[{"match":{"field":"text","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}},{"match":{"field":"context","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}},{"match":{"field":"text_signals","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}}]}}}},{"term":{"field":"bank_id","value":"bank-01"}},{"term":{"field":"fact_type","value":"world"}}]}}
+         Buffers: shared hit=405
+ Planning:
+   Buffers: shared hit=798
+ Planning Time: 3.890 ms
+ Execution Time: 7.807 ms
+(23 rows)
+
