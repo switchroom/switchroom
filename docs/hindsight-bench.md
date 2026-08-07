@@ -133,6 +133,24 @@ The image tag and reranker cap are read **by name** (`docker inspect --format
 '{{.Config.Image}}'`, `printenv <ONE_VAR>`). A bare `docker inspect` or bare
 `printenv` prints every injected secret, so neither is ever run.
 
+### Bank names never reach the file
+
+`--out` and `--csv` write **pseudonymised** bank ids — `bank-01` is the largest
+bank on the instance, `bank-02` the next, and so on. The stdout summary keeps
+the real names, because it is your screen and not a committed artefact; the
+run also prints the real-to-pseudonym mapping to stderr, and that mapping is
+deliberately never written next to the result file.
+
+This is not a courtesy. A result file is captured against the live instance and
+these files get committed to a public repo as regression baselines, so a real
+bank id in one publishes the operator's fleet roster with a row count beside
+each name — which is exactly what happened in #4495 and is tracked as #4499.
+The pseudonym is the bank's **rank by row count**, so it is stable across runs,
+comparable between files, and preserves the size axis the benchmark exists to
+measure. Row counts and latencies are untouched.
+
+Committed baselines are held to this by `npm run lint:bench-baseline-anonymised`.
+
 The result file carries `schema: 1`. Bump it when a field's meaning changes;
 the comparison modes refuse to compare across schema versions.
 

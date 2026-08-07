@@ -5,11 +5,11 @@
     "apiUrl": "http://127.0.0.1:18888",
     "container": "switchroom-hindsight",
     "banks": [
-      "klanker",
-      "gymbro",
-      "ziggy",
-      "lisa-profile",
-      "switchroom-dev"
+      "bank-01",
+      "bank-07",
+      "bank-10",
+      "bank-12",
+      "bank-14"
     ],
     "concurrency": [
       1,
@@ -36,59 +36,59 @@
     "memoryUnitsIndexBytes": 2378129408,
     "bankRows": [
       {
-        "bank": "klanker",
+        "bank": "bank-01",
         "rows": 230123
       },
       {
-        "bank": "overlord",
+        "bank": "bank-02",
         "rows": 223660
       },
       {
-        "bank": "finn",
+        "bank": "bank-03",
         "rows": 86488
       },
       {
-        "bank": "assistant",
+        "bank": "bank-04",
         "rows": 86240
       },
       {
-        "bank": "carrie",
+        "bank": "bank-05",
         "rows": 81844
       },
       {
-        "bank": "marko",
+        "bank": "bank-06",
         "rows": 43716
       },
       {
-        "bank": "gymbro",
+        "bank": "bank-07",
         "rows": 17977
       },
       {
-        "bank": "reggie",
+        "bank": "bank-08",
         "rows": 10688
       },
       {
-        "bank": "lawgpt",
+        "bank": "bank-09",
         "rows": 8957
       },
       {
-        "bank": "ziggy",
+        "bank": "bank-10",
         "rows": 1493
       },
       {
-        "bank": "ken-profile",
+        "bank": "bank-11",
         "rows": 190
       },
       {
-        "bank": "lisa-profile",
+        "bank": "bank-12",
         "rows": 157
       },
       {
-        "bank": "kdogg",
+        "bank": "bank-13",
         "rows": 66
       },
       {
-        "bank": "switchroom-dev",
+        "bank": "bank-14",
         "rows": 12
       }
     ],
@@ -144,7 +144,7 @@
   },
   "cells": [
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "rows": 230123,
       "concurrency": 1,
       "stats": {
@@ -208,7 +208,7 @@
       "errorSamples": []
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "rows": 230123,
       "concurrency": 4,
       "stats": {
@@ -272,7 +272,7 @@
       "errorSamples": []
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "rows": 17977,
       "concurrency": 1,
       "stats": {
@@ -336,7 +336,7 @@
       "errorSamples": []
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "rows": 17977,
       "concurrency": 4,
       "stats": {
@@ -400,7 +400,7 @@
       "errorSamples": []
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "rows": 1493,
       "concurrency": 1,
       "stats": {
@@ -464,7 +464,7 @@
       "errorSamples": []
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "rows": 1493,
       "concurrency": 4,
       "stats": {
@@ -528,7 +528,7 @@
       "errorSamples": []
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "rows": 157,
       "concurrency": 1,
       "stats": {
@@ -592,7 +592,7 @@
       "errorSamples": []
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "rows": 157,
       "concurrency": 4,
       "stats": {
@@ -656,7 +656,7 @@
       "errorSamples": []
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "rows": 12,
       "concurrency": 1,
       "stats": {
@@ -688,7 +688,7 @@
       ]
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "rows": 12,
       "concurrency": 4,
       "stats": {
