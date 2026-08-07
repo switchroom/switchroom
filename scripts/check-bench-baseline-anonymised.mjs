@@ -55,8 +55,30 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const PSEUDONYM_RE = /^bank-\d{2,}$/;
 
 const BASELINE_DIR = "docs/baselines";
-/** Narrative docs that quote the baselines. Missing files are skipped. */
-const PROSE_FILES = ["docs/hindsight-bench-baseline.md", "docs/hindsight-bench.md"];
+const DOCS_DIR = "docs";
+/**
+ * Narrative docs that quote the baselines: every `docs/hindsight-bench*.md`,
+ * ENUMERATED FROM DISK rather than listed.
+ *
+ * A hardcoded list is a gate that a new file opts out of by existing. That is
+ * not hypothetical: `docs/hindsight-bench-p2-residency.md` was written after
+ * the original two-entry list and quoted per-cell bench numbers, so under the
+ * list it was never scanned at all. The glob is the whole scope the docblock
+ * above claims, so a future narrative doc is in scope the moment it is added
+ * and nobody has to remember to widen this.
+ */
+export function proseFiles() {
+  let entries;
+  try {
+    entries = readdirSync(join(repoRoot, DOCS_DIR));
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.startsWith("hindsight-bench") && e.endsWith(".md"))
+    .sort()
+    .map((e) => `${DOCS_DIR}/${e}`);
+}
 
 /** This script documents the shapes it forbids; never scan it. */
 const SELF = "scripts/check-bench-baseline-anonymised.mjs";
@@ -88,6 +110,9 @@ export function bankFields(doc) {
   for (const r of doc?.db?.bankRows ?? []) push("db.bankRows[].bank", r?.bank);
   for (const c of doc?.cells ?? []) push("cells[].bank", c?.bank);
   for (const a of doc?.arms ?? []) push("arms[].bank", a?.bank);
+  // `phases[]` is the --phases sweep (#4476). It carries a bank id exactly the
+  // way cells[] and arms[] do, so it leaks exactly the way they would.
+  for (const p of doc?.phases ?? []) push("phases[].bank", p?.bank);
   return found;
 }
 
@@ -216,7 +241,7 @@ export function collectViolations() {
     else if (rel.endsWith(".csv")) violations.push(...checkCsv(rel, text));
     else if (rel.endsWith(".md")) violations.push(...checkProse(rel, text));
   }
-  for (const rel of PROSE_FILES) {
+  for (const rel of proseFiles()) {
     let text;
     try {
       text = readFileSync(join(repoRoot, rel), "utf8");

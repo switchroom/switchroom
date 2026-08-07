@@ -53,6 +53,7 @@ import {
   readDbState,
   readInstanceState,
   resetStats,
+  readStatsEpoch,
 } from "../hindsight-bench/db.js";
 import { renderPlot } from "../hindsight-bench/plot.js";
 import { QUERY_SET_ID } from "../hindsight-bench/recall.js";
@@ -66,7 +67,7 @@ import {
   toCsv,
   DEFAULT_TOLERANCE,
 } from "../hindsight-bench/report.js";
-import { runArmSweep, runSweep } from "../hindsight-bench/run.js";
+import { runArmSweep, runPhaseSweep, runSweep } from "../hindsight-bench/run.js";
 import { BENCH_SCHEMA_VERSION, type BenchConfig, type BenchResult, type ContentionProfile } from "../hindsight-bench/types.js";
 
 const DEFAULT_API_URL = "http://127.0.0.1:18888";
@@ -89,6 +90,7 @@ interface BenchOpts {
   resetStats: boolean;
   allowWrites: boolean;
   arms?: string | boolean;
+  phases?: string | boolean;
   label: string;
   out?: string;
   csv?: string;
@@ -191,6 +193,11 @@ export function registerHindsightBenchCommand(program: Command): void {
     .option("--reset-stats", "call pg_stat_reset() before the sweep (never implicit)", false)
     .option("--allow-writes", "authorise a writable database session (AC5 gate)", false)
     .option("--arms [n]", "additionally run a traced per-arm attribution pass (n samples/bank, default 5)")
+    .option(
+      "--phases [n]",
+      "additionally run a traced phase-attribution pass over the full concurrency ladder " +
+        "(n samples/cell, default 8); reports how much end-to-end latency a perfect database could remove",
+    )
     .option("--label <text>", "free-form label recorded in the result file", "")
     .option("--out <path>", "write the JSON result file (or the SVG in --plot mode)")
     .option("--csv <path>", "also write a flat per-cell CSV")
@@ -284,6 +291,12 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
     try {
       resetStats(sqlOpts);
       process.stderr.write(`${chalk.yellow("!")} pg_stat_reset() called — cumulative statistics were discarded\n`);
+      // `db` was read BEFORE the reset (bank selection needs `bankRows` to
+      // configure the sweep), so its two epoch-relative fields now describe an
+      // epoch this process just destroyed. Re-read them, or the file claims
+      // `statsReset: true` while quoting the superseded reset time and a
+      // cumulative hit ratio from before it — the exact field #4476 grades.
+      db = { ...db, ...readStatsEpoch(sqlOpts) };
     } catch (e) {
       fail(`--reset-stats failed: ${(e as Error).message}`);
     }
@@ -310,6 +323,10 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
 
   const armSamples = opts.arms === undefined ? 0 : opts.arms === true || opts.arms === "" ? 5 : Number(opts.arms);
   if (!Number.isFinite(armSamples) || armSamples < 0) fail(`--arms must be a non-negative integer`);
+
+  const phaseSamples =
+    opts.phases === undefined ? 0 : opts.phases === true || opts.phases === "" ? 8 : Number(opts.phases);
+  if (!Number.isFinite(phaseSamples) || phaseSamples < 0) fail(`--phases must be a non-negative integer`);
 
   process.stderr.write(
     `sweeping ${banks.length} bank(s) × ${concurrency.length} concurrency level(s) = ` +
@@ -359,6 +376,16 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
       armSamples > 0
         ? await runArmSweep({ config, samples: armSamples, deps: { log: (m) => process.stderr.write(`${m}\n`) } })
         : null;
+    const phases =
+      phaseSamples > 0
+        ? await runPhaseSweep({
+            config,
+            db,
+            samples: phaseSamples,
+            settleMs: intOpt(opts.settleMs, "--settle-ms"),
+            deps: { log: (m) => process.stderr.write(`${m}\n`) },
+          })
+        : null;
     result = {
       schema: BENCH_SCHEMA_VERSION,
       config,
@@ -366,6 +393,7 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
       instance,
       cells,
       arms,
+      phases,
       durationS: (Date.now() - t0) / 1000,
     };
   } finally {

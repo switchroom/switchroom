@@ -207,6 +207,53 @@ export interface ArmTiming {
   max: number;
 }
 
+/** One server-side phase's contribution within a {@link PhaseCell}. */
+export interface PhaseStat {
+  /** `trace.summary.phase_metrics[].phase_name`, verbatim. */
+  name: string;
+  meanMs: number;
+  /** The phase's own p95, carried beside the mean so a heavy tail is visible. */
+  p95Ms: number;
+  /** `meanMs / serverMsMean` — the fraction of handler time this phase holds. */
+  shareOfServer: number;
+}
+
+/**
+ * Where one `(bank, concurrency)` cell's recall time actually goes, server-side.
+ *
+ * Produced by the opt-in `--phases` pass (#4476). Like `arms`, it comes from
+ * TRACED calls, so its absolute milliseconds must never be compared against a
+ * `cells[]` latency — a traced recall serialises megabytes. The shares are the
+ * product; the milliseconds are context.
+ */
+export interface PhaseCell {
+  bank: string;
+  rows: number;
+  concurrency: number;
+  /** traced samples that succeeded */
+  n: number;
+  errors: number;
+  /** Mean client-observed wall clock, ms — includes pre-handler queueing. */
+  clientMsMean: number;
+  /** Mean `trace.summary.total_duration_seconds`, ms. */
+  serverMsMean: number;
+  /** Mean time in PostgreSQL-attributable phases; see `DB_PHASES`. */
+  dbMsMean: number;
+  /** `dbMsMean / serverMsMean`. */
+  dbShareOfServer: number;
+  /**
+   * `dbMsMean / clientMsMean` — the fraction of END-TO-END latency that would
+   * disappear if every PostgreSQL call became instantaneous.
+   *
+   * An upper bound on any database-side optimisation, not an estimate. A
+   * proposal claiming an X % end-to-end reduction from database work is refuted
+   * by arithmetic wherever this bound sits below X.
+   */
+  maxDbSideGainFraction: number;
+  /** Every non-diagnostic phase, descending by `meanMs`. */
+  phases: PhaseStat[];
+}
+
 /** The whole result file. */
 export interface BenchResult {
   schema: typeof BENCH_SCHEMA_VERSION;
@@ -223,6 +270,20 @@ export interface BenchResult {
    * the numbers here must never be compared against `cells`.
    */
   arms: ArmTiming[] | null;
+  /**
+   * Server-side phase attribution, or null/absent when the run did not include
+   * a `--phases` pass.
+   *
+   * **Deliberately additive, and deliberately NOT a schema bump.** The field is
+   * optional because every result file written before #4476 lacks it, and those
+   * files are the P1 baseline every later phase is graded against. Bumping
+   * `BENCH_SCHEMA_VERSION` would make `--compare` refuse them
+   * (`readResult` fails on a version mismatch by design), which would destroy
+   * the baseline to add a field that changes the meaning of nothing already in
+   * it. Bump the version when an EXISTING field's meaning changes; adding a
+   * nullable one is not that.
+   */
+  phases?: PhaseCell[] | null;
   /** Wall-clock seconds the whole sweep took. */
   durationS: number;
 }

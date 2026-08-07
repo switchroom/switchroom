@@ -135,6 +135,8 @@ jobs:
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
               - 'tests/docker/hindsight-mm-refresh-debounce-patch.test.ts'
               - 'tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts'
+              - 'tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts'
+              - 'tests/docker/hindsight-text-search-migration-patch.test.ts'
               - 'tests/docker/hindsight-graph-seed-retirement.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'src/setup/hindsight-perf-defaults.ts'
@@ -310,21 +312,38 @@ jobs:
       - name: Set up workspace
         uses: ./.github/actions/setup-switchroom
 
-      - name: Free disk space for the 6.4GB upstream image
+      - name: Free disk space (overlapping the structural guards) for the 6.4GB pull
+        # The ~101s `sudo rm -rf` of the runner's preinstalled SDK trees used
+        # to run SERIALLY before the 6.4GB image pull. Here it is BACKGROUNDED
+        # so it overlaps the (disk-free, no-docker) Dockerfile structural
+        # guards below instead of blocking: the guards read only
+        # docker/Dockerfile.hindsight via readFileSync and touch none of the
+        # deleted paths (node/npx are system installs, not under
+        # $AGENT_TOOLSDIRECTORY — proven by this deletion already preceding the
+        # guards today), so the two are safe to run concurrently. We `wait`
+        # for the cleanup to finish and re-print `df` at the END of this step,
+        # so disk is provably freed BEFORE the space-hungry pull step that
+        # follows — no disk-full race mid-pull. Kept in ONE step on purpose so
+        # the background job cannot outlive the step boundary: no cross-step
+        # orphan to reap, fully deterministic.
         run: |
           df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          ( sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true ) &
+          CLEAN_PID=$!
+          # Structural guards, deliberately BEFORE the 6.4GB pull so an
+          # anchor/negative-guard regression fails in seconds. These are the
+          # only place the exact-once anchors and the withdrawn-patch negative
+          # guards are checked, and `vitest --changed` cannot select this file
+          # from a Dockerfile edit (readFileSync is not an import) — so if it
+          # does not run here, it does not run at all. Its exit status is the
+          # step's, so a failing guard still fails the job.
+          npx vitest run tests/docker/dockerfile-hindsight-bakes.test.ts
+          # Block until the backgrounded cleanup is done so the pull below sees
+          # the freed disk. `|| true` because the cleanup already tolerates its
+          # own failures (`|| true` inside), and `wait` must not trip `set -e`.
+          wait "$CLEAN_PID" || true
           df -h /
-
-      - name: Run the Dockerfile structural guards
-        # Cheap (no docker), and deliberately BEFORE the 6.4GB pull so an
-        # anchor/negative-guard regression fails in seconds. These are the
-        # only place the exact-once anchors and the withdrawn-patch negative
-        # guards are checked, and `vitest --changed` cannot select this file
-        # from a Dockerfile edit (readFileSync is not an import) — so if it
-        # does not run here, it does not run at all.
-        run: npx vitest run tests/docker/dockerfile-hindsight-bakes.test.ts
 
       - name: Pull the digest-pinned upstream hindsight image
         # Ref is read from the Dockerfile's FROM line so it can never drift
@@ -364,9 +383,20 @@ jobs:
         # image so the GREEN arm reads the exact bytes that ship, with no
         # in-test re-patching or patch-sequence duplication. A failing patch
         # assert here fails the build (same signal as build-hindsight).
+        #
+        # cache-from (read-only) reuses the registry build cache that
+        # docker-images.yml's build-hindsight pushes — the amd64 leg writes
+        # `:buildcache-amd64` (this probe is a single-arch amd64 build), with
+        # the legacy mixed `:buildcache` kept as a fallback for the first run
+        # after the per-arch split. No cache-to here: this job never publishes
+        # cache, it only reads it to skip cold layers (~110s → warm). A miss or
+        # an unauthenticated 401/404 is non-fatal (buildx degrades to a cold
+        # build), so this is safe on PR / fork runs that can't read GHCR.
         run: |
           docker buildx build --load \
             -f docker/Dockerfile.hindsight \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-hindsight:buildcache-amd64 \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-hindsight:buildcache \
             -t switchroom-hindsight:probe \
             .
           docker image inspect switchroom-hindsight:probe >/dev/null
@@ -420,6 +450,39 @@ jobs:
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts
+
+      - name: Run the hindsight pg_search filter-pushdown probe (RED/GREEN, must not skip)
+        # Epic #4474 phase P4 (#4478). The bakes test can only see that the
+        # filter-field map and the literal cast are PRESENT in the patched
+        # source; it cannot see the outcome that matters — that the two real
+        # shipping migrations emit a CREATE INDEX carrying
+        # `(bank_id::pdb.literal), (fact_type::pdb.literal)`, on the fresh-install
+        # path AND on both rebuild branches. The regression this guards is
+        # silent and expensive: without those columns ParadeDB degrades the
+        # recall arm's `bank_id`/`fact_type` equality to a post-scoring
+        # heap_filter, so every keyword arm scores the whole table (measured
+        # 171,517 vs 405 shared buffer hits per arm, 423x) with identical
+        # RESULTS — nothing but a plan or a latency chart can tell.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts
+
+      - name: Run the hindsight text-search migration-path probe (RED/GREEN, must not skip)
+        # #4506. The bakes test can only see that the new guard conditions are
+        # PRESENT in the patched source; it cannot see the outcome that matters
+        # — that the real shipping `ensure_text_search_extension`, handed a
+        # populated table whose text-search INDEX was dropped while
+        # `search_vector` survived, REPAIRS it instead of raising. Upstream
+        # raises there on every backend including the one already configured
+        # ("from pg_textsearch to pg_search" on 801,792 rows, observed), so the
+        # database comes up on none of them. The same probe pins the other half:
+        # a genuinely lossy pg_search → native switch on populated tables must
+        # STILL be refused, and an index-only rebuild must not drop a populated
+        # tsvector column. Only running the real function and reading back the
+        # DDL it emits can tell those four states apart.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-text-search-migration-patch.test.ts
 
       - name: Run the hindsight graph-seed RETIREMENT probe (RED/GREEN, must not skip)
         # The v0.8.5 upstream #2968 carry was retired in the v0.8.6 base bump —
@@ -564,7 +627,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

@@ -743,18 +743,42 @@ EOF
 # pg_search_baked_major() — a stock native fleet (selector != pg_search, or an
 # older image with no bake) never enters here and is byte-identical to before.
 #
-# ── EXISTING-INSTALL MIGRATION BOUNDARY (read before assuming this migrates) ──
-# This function makes a NEW (empty) database come up on pg_search. It does NOT,
-# and MUST NOT, migrate a POPULATED database from the native tsvector backend:
-# hindsight_api HARD-REFUSES a text-search backend switch on non-empty memory
-# tables (the BM25 index must be rebuilt under a different operator class, which
-# upstream will not silently do under live data). The data migration is a
-# DELIBERATE operator-run step (pg_dump backup → drop the native search index →
-# flip HINDSIGHT_API_TEXT_SEARCH_EXTENSION → restart so this provisioning +
-# prestart_pg0 preload run → let hindsight_api rebuild the BM25 index). An
-# operator not ready to migrate pins `native` in hindsight.env; that pin
+# ── EXISTING-INSTALL MIGRATION BOUNDARY (what this function does and does not) ─
+# This function only stages the LIBRARY. It never touches operator data and it
+# never runs DDL: `CREATE EXTENSION pg_search` and the BM25 index are
+# hindsight_api's job, inside the migration that runs after us (see the
+# "text-search backend migration path" patch block in docker/Dockerfile.hindsight).
+#
+# THE MIGRATION IS A PLAIN ENV FLIP + RESTART. Since #4506 an operator moving a
+# POPULATED database from `native` to `pg_search` sets
+# HINDSIGHT_API_TEXT_SEARCH_EXTENSION=pg_search and restarts the container. The
+# ordering below (provision_pg_search → prestart_pg0 → start-all.sh) is what
+# makes that one-shot: we stage the .so and stop pg0, prestart_pg0 brings it up
+# with shared_preload_libraries=pg_search, and only then does hindsight_api
+# create the extension and build the index. NO manual DDL is required — in
+# particular, do NOT "drop the native search index first". That advice used to
+# live here and was wrong: it produced a column-without-index state that the
+# migration guard treated as a backend CHANGE and refused on BOTH backends, so
+# the database came up on neither (fixed in #4506; regression-pinned by
+# tests/docker/hindsight-text-search-migration-patch.test.ts).
+#
+# WHAT IS STILL REFUSED. Recreating `search_vector` under a backend that stores
+# the indexed content IN that column (`native`, `vchord`) is lossy: nothing
+# backfills it, so every existing row would go unsearchable. hindsight_api
+# therefore still hard-refuses pg_search → native on non-empty memory tables and
+# tells the operator to either clear the data or stay put. Migrating FORWARD to
+# pg_search is safe because pg_search indexes the base columns and keeps
+# `search_vector` as an unread dummy.
+#
+# COST, measured on this fleet's 801,792-row memory_units: CREATE EXTENSION
+# 0.06s, BM25 build 12.7s, total container-unavailable window 34s — well under
+# HINDSIGHT_API_STARTUP_WAIT_SECONDS (default 300), which start-all.sh enforces
+# by killing the container. A very large table should raise that ceiling first.
+# Take a pg_dump backup before any backend flip regardless.
+#
+# An operator not ready to migrate pins `native` in hindsight.env; that pin
 # survives `switchroom apply` (the key is on HINDSIGHT_PERF_ENV_KEYS) and this
-# function no-ops. Nothing here touches operator data.
+# function no-ops.
 provision_pg_search() {
   _psm="$(pg_search_baked_major)"
   [ -n "${_psm}" ] || return 0

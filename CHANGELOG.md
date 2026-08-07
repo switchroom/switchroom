@@ -15,32 +15,18 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
-### Benchmarking
+### CI: faster hindsight image build and e2e probe
 
-- **`switchroom hindsight-bench` — a model-free harness that measures Hindsight recall latency against bank size and concurrency (#4475)** — #4474's goal ("consistent latency across any bank size, including under contention") was unfalsifiable: there was no number to move, so every later phase would have shipped on assertion. The new verb sweeps recall across banks and concurrency levels, reports nearest-rank p50/p95/p99 with variance, sample and error counts (errors never fold into percentiles — a timeout is not a fast call), and reduces two runs to a PASS/FAIL verdict (`0` pass · `1` verdict failed · `2` could not run). Every psql session is clamped read-only via `PGOPTIONS` and the clamp is *verified* by requiring Postgres to reject a real `CREATE TEMP TABLE`; cells with no samples or a >10 % error rate are classified ungradeable, named in the report, and block a pass, so a partly-broken run can no longer be graded on whichever cells survived. The opt-in `--contention` generator degrades the live box deliberately (documented blast radius, conservative defaults, load backends bounded by an in-SQL deadline plus a signal-wired terminate sweep) and confirms its own backends attached rather than silently measuring an idle box. Additive: one new CLI verb and its registration, zero model tokens, no change to any existing code path. Baseline captured in `docs/baselines/hindsight-recall-2026-08-07/`, with AC1 (±10 % reproducibility) reported as FAILED — at these sample counts the p95 estimator's own bootstrap interval is wider than the gate — and AC4 (contention moves the tail) PASSED, measured A/B/A.
+- **The `build-hindsight` job builds arm64 natively and the hindsight-probe
+  e2e job overlaps cleanup with the pull.** `docker-images` now builds the
+  arm64 hindsight image on a native arm64 runner instead of emulating it under
+  QEMU, and the hindsight-probe e2e job runs its disk cleanup concurrently with
+  the image pull and reuses the registry buildcache instead of rebuilding. Cuts
+  roughly 4-6 min off release image builds and 2-3 min off e2e runs. (#4513)
 
-### Hindsight / LiteLLM metering
+### Release process: the `## Unreleased` entry is staged author-side
 
-- **A dropped LiteLLM routing key no longer silently unmeters Hindsight, and the routing env has ONE derivation** — `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` (what makes Hindsight's LLM traffic transit the proxy and land in `LiteLLM_SpendLogs` as `end_user=hindsight`) were built from a duplicated literal in `hindsightContainerEnvPairs` (docker-run / `memory setup --recreate`) and again in `generateHindsightComposeSnippet`; both now come from one `hindsightLiteLlmEnvPairs` helper, which also fails closed on a blank key instead of baking an empty `Bearer `. Separately, the resolver behind those launch paths collapsed "LiteLLM is off", "the broker denied the key" and "the broker is down" into one bare `undefined` — and was itself a verbatim copy in both `src/cli/memory.ts` and `src/cli/setup.ts` — so a denied grant launched Hindsight with no routing env, no warning, and unmetered spend (observed 2026-08-07). `resolveHindsightLiteLlm` now distinguishes those cases and returns the dropped `vault:` reference (never the secret), which both launch paths print as a warning alongside the existing `cp_access_key` / LLM-api_key drop warnings — naming it as a broker-grant failure rather than the operator env drift the ENV DRIFT report makes it look like.
-
-### Self-improvement
-
-- **Label review-turn messages, stop raw-reasoning leaks to the operator** — a silent self-improvement review turn's mid-turn reasoning could be captured by the outbox backstop and delivered into the operator's DM as a raw, unlabelled message. A review turn now has exactly one sanctioned operator-facing output: a well-formed self-improvement card (a message opening with `🔧 **Self-improvement**`). The backstop delivers a review-originated record only when its text is that card; all other trailing prose classifies `internal` and is suppressed. Detection is deterministic on the synthesized inbound's `source="self_improve_review"` tag plus an exact card-title prefix, never a prose-shape heuristic. A residual title-framing layer (behind `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING`) prepends the title if a non-card review record ever reaches delivery with the audience gate off, so review reasoning can never appear unlabelled. The review prompt now locks the exact card shape (Signal / Suggestion / Status) and instructs silence on a no-op turn.
-- **Close the same leak on the live send path (#4490)** — the outbox sweep's card gate above never protected the LIVE/elected send path (`deliverCapturedProse`): when a review turn's own reply call threw, the single-writer election deferred to that bridge instead of the outbox, and the bridge had no audience gate or title framing at all, so a non-card review turn's raw reasoning could still reach the operator's DM. `reviewOriginated` provenance is now threaded from the transcript scan through the Stop hook's elected-state file into `deliverCapturedProse`, which applies the SAME shared card-gate / title-framing predicates the sweep uses — no parallel implementation, one shared decision on both delivery paths.
-- **Fix a duplicated title on a review record that is both a card and a reply-throw (#4489)** — `decideOutboxSweep` applied the self-improvement title-framing decision on the ALREADY provenance-banner-composed body, so a real card lost its own idempotency check (which only inspects what it was handed) and picked up a second title. The framing decision now gates on the raw record text.
-
-### Release process
-
-- **Enforce a continuously-staged CHANGELOG `## Unreleased` section:** every PR
-  that changes shippable code (`src`, the Telegram plugin, `bin`, `docker`,
-  `profiles`, `skills`, the vendored hindsight tree, CI workflows) must now add
-  an entry under `## Unreleased`, enforced deterministically by
-  `scripts/check-changelog-entry.mjs` as part of `npm run lint`. Docs/chore/
-  test-only PRs opt out with a `no-changelog` label or a `[skip changelog]`
-  token on its own line in the PR body or a commit message. This makes cutting a release a
-  trivial rename of this header instead of reconstructing the whole section
-  from `git log` at release time (as v0.20.12 had to).
-- **Auto-stage that `## Unreleased` entry author-side, so the check above stops
+- **Auto-stage the `## Unreleased` entry author-side, so #4469's check stops
   costing a round-trip (#4501)** — new `scripts/gen-changelog-entry.mjs`
   (`bun run changelog:generate`) derives an entry from the branch's
   conventional-commit title and appends it under `## Unreleased` in the AUTHOR's
@@ -58,6 +44,167 @@ now an anomaly worth investigating, not the norm.
   CI backstop. Wired into the fleet dev-protocol fragment, the `dev-protocol`
   skill, and this repo's PR-hygiene flow; rationale in `.github/MERGE-QUEUE.md`
   § "Author-side changelog generation".
+
+## v0.20.15 — migrating a populated Hindsight bank to ParadeDB `pg_search` is a plain env flip, not a trapdoor
+
+### Hindsight: a populated bank can migrate to `pg_search` by flipping the env, not by hand
+
+- **`native` → `pg_search` on a POPULATED bank is now a plain env flip +
+  restart.** v0.20.13 shipped `pg_search` as the default for new installs but
+  said an existing bank had to be migrated by a manual operator procedure. That
+  procedure did not work. Following it (drop the native search index, flip
+  `HINDSIGHT_API_TEXT_SEARCH_EXTENSION`, restart) produced a
+  column-without-index state that `ensure_text_search_extension` classified as a
+  backend CHANGE and refused — on **every** backend, including the one already
+  configured. Held constant at `pg_search`, a 801,792-row `memory_units` gave
+  `RuntimeError: Cannot change text search extension from pg_textsearch to
+  pg_search: the following tables contain data: memory_units(801792 rows)`, and
+  the error's own "put it back" advice could not work either. The bank came up
+  on nothing. `docker/Dockerfile.hindsight` now bakes a fix so the guard fires
+  only on a genuinely lossy column recreate; a stale or absent index is rebuilt
+  in place. Measured on that bank: `CREATE EXTENSION` 0.06s, BM25 build 12.7s,
+  34s total unavailable. (#4506)
+- **The `pg_search` migration branch now creates its own extension.**
+  `provision_pg_search()` stages the `.so` and control/SQL but deliberately
+  never touches the database, and nothing else ran `CREATE EXTENSION pg_search`
+  — so the branch went straight to `CREATE INDEX ... USING bm25` and died with
+  `InvalidSchemaName: schema "pdb" does not exist`. It now creates the extension
+  first, mirroring what the `pgroonga` branch already did. (#4506)
+- **The second memory table is reconciled again.** `tables_to_check` still named
+  `reflections`, renamed to `mental_models` by alembic `t5o6p7q8r9s0`, so that
+  table matched nothing and silently kept whatever index it had under any
+  backend. (#4506)
+- **The refusal message no longer guesses a backend or names a dead table.** A
+  `TEXT` `search_vector` with no index carries nothing to identify the live
+  backend from, yet the error asserted `pg_textsearch` and told the operator to
+  `DELETE FROM public.reflections`. It now reports
+  `indeterminate (TEXT search_vector, no text-search index)` in that case, names
+  the tables that actually exist, and only offers the "stay on your current
+  backend" remedy when it could genuinely read what that backend is. (#4506)
+- **The reverse direction is still refused, and an index-only rebuild no longer
+  discards data.** `pg_search` → `native`/`vchord` on non-empty tables stays
+  fatal: those backends store the indexed content IN `search_vector` and only
+  write it on INSERT, so every existing row would go unsearchable. Relatedly,
+  the reconcile loop's unconditional `DROP COLUMN` is now conditional on the
+  column type actually changing, so rebuilding a missing GIN index no longer
+  drops and recreates a populated `tsvector` empty. (#4506)
+- **`docker/hindsight-entrypoint.sh` and
+  `src/setup/hindsight-perf-defaults.ts` documented the old hard refusal as a
+  guarantee.** Both are rewritten: the flip now migrates, so the pin
+  (`HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "native"` under `hindsight.env`) is
+  what an operator who is *not* ready to migrate must set, and the
+  `HINDSIGHT_API_STARTUP_WAIT_SECONDS` ceiling (default 300s) is called out for
+  banks much larger than this one. (#4506)
+- **Regression-pinned behaviourally, not structurally.**
+  `tests/docker/hindsight-text-search-migration-patch.test.ts` runs the real
+  shipping `ensure_text_search_extension` against the pinned upstream digest in
+  a throwaway container and asserts it is RED unpatched and GREEN patched across
+  six scenarios, including the two that must keep failing. Wired into the
+  `hindsight-probe` CI job, which hard-fails rather than skipping. (#4506)
+- **A failed `CREATE EXTENSION pg_search` now reports why.** The migration
+  mirrored upstream's `pgroonga` branch verbatim, including an "already exists /
+  no permission" fallback that re-probed `pg_extension` in the `except` arm.
+  With `IF NOT EXISTS` that probe can never suppress anything, and because the
+  whole reconcile runs in ONE transaction it fired on an already-aborted one —
+  so the operator got `current transaction is aborted` instead of the real
+  ParadeDB error. That is precisely the wrong trade here: `prestart_pg0` is
+  best-effort, so an ineffective `shared_preload_libraries=pg_search` is the
+  most likely real-world failure of this migration, and it was exactly the
+  diagnostic being destroyed. The fallback is gone; the statement raises
+  directly. (#4507)
+- **The probe now covers the migration operators actually run.** The six
+  original scenarios each isolate one defect, but none was a populated
+  `memory_units` carrying a `tsvector` under a live GIN index flipped to
+  `pg_search` — the shape the runbook produces. A seventh covers it at the real
+  row count and pins the ORDER of the repair (stale index before its column;
+  `CREATE EXTENSION` before the BM25 build that needs the `pdb` schema), plus
+  that the rebuilt index keeps the #4478 `bank_id`/`fact_type` `pdb.literal`
+  pushdown fast fields — previously asserted nowhere, despite riding on an
+  optional argument a refactor could drop in silence. (#4507)
+- **CI no longer leaks the filter-pushdown probe's containers.** The
+  `hindsight-probe` job's label-scoped teardown loop omitted
+  `hindsight-pg-search-filter-pushdown-patch`. (#4507)
+
+### Hindsight: `HINDSIGHT_API_BM25_MAX_QUERY_TERMS` is no longer silently discarded
+
+- **The key was inert no matter what an operator wrote.** Upstream parses
+  `HINDSIGHT_API_BM25_MAX_QUERY_TERMS` (`config.py:764`, `:2946`) and threads it
+  to `retrieval.py:240` -> `engine/sql/postgresql.py:258`, where it truncates the
+  token list before the BM25 query is built — the direct lever on a multi-KB
+  consolidation query becoming a disjunction over hundreds of terms. But it was
+  not a member of `HINDSIGHT_PERF_ENV_KEYS`, and `resolveHindsightPerfOverrides`
+  skips every key outside the managed set, so a `hindsight.env` line for it was
+  dropped with no error and never reached the container on either launch path.
+  Added to `HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS` and documented on the
+  `hindsight.env` schema description. Override-only on purpose: switchroom emits
+  no default, so a stock fleet keeps upstream's unbounded `0` — a cap chosen
+  without a measurement silently drops the tail of a long query and degrades
+  recall quality with nothing to notice. (#4506)
+
+## v0.20.14 — BM25 filter-field pushdown for Hindsight keyword recall, and a phase-attribution ceiling for database-side proposals
+
+### Hindsight keyword recall: BM25 filter-field pushdown
+
+- **The pg_search BM25 index now indexes `bank_id` and `fact_type` as
+  `pdb.literal` fast fields (#4478)** — every recall keyword arm filters on
+  `bank_id = $n AND fact_type = '<literal>'`, but those columns were outside the
+  BM25 index, so ParadeDB could not push the equalities into the Tantivy scan and
+  degraded them to a post-scoring `heap_filter`: the arm scored the WHOLE table
+  and then discarded everything outside the caller's bank. Measured on an
+  isolated 797,893-row corpus with the real arm shape: `Buffers: shared hit`
+  171,517 → 405 (423x) and 231.4ms → 7.8ms execution for a byte-identical result
+  set (120 queries / 4,362 rows: 0 rows added, 0 dropped, 0 score or rank
+  changes). Corrected, pg_search is 4-6x faster than native at every measured
+  concurrency and its p95 is flat across bank size (largest/smallest ratio 0.97 /
+  1.04 / 1.06 at concurrency 1 / 8 / 16, versus native's 1.11 / 1.17 / 1.20) —
+  which also explains away the recorded "pg_search is a 124-138ms regression"
+  claim: those numbers measured the missing fast fields, not the backend. The
+  filter cast is hard-coded to `literal` and never follows
+  `HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER`, because a stemmed or
+  ngram cast on a filter column would stop the equality matching at all. Index
+  cost is +0.7%. Fresh databases get the corrected index from the initial-schema
+  migration; an EXISTING index is reported loudly on every boot
+  (`pg_search_filter_field_drift`) and never rebuilt implicitly, because a
+  boot-path `DROP INDEX`/`CREATE INDEX` on a populated table is the fail-closed
+  window from #4472. Evidence and the deliberate rebuild procedure:
+  `docs/baselines/hindsight-pg-search-pushdown-2026-08-07/`.
+
+### `hindsight-bench --phases`: a refutation number for database-side proposals
+
+- **`switchroom hindsight-bench --phases [n]` attributes recall latency to
+  request phases and reports a ceiling (#4476)** — a traced pass over the full
+  concurrency ladder reduces `trace.summary.phase_metrics[]` to one number per
+  cell: the fraction of end-to-end recall latency that would disappear if every
+  PostgreSQL call became *instantaneous*. That is an upper bound assuming a
+  physically impossible database, so any proposal claiming a larger end-to-end
+  reduction from database-side work is refuted before anyone builds it. #4476
+  was graded this way and its own latency target was refuted by it — see
+  `docs/hindsight-bench-p2-residency.md`. The per-arm `retrieval_*` spans are
+  excluded from the share arithmetic because they are `diagnostic: true`
+  overlays nested inside `parallel_retrieval` and summing them roughly triples
+  the database's apparent share; `connection_wait` is counted *in* despite the
+  same marker, because it is genuine database wait and every rounding decision
+  here deliberately inflates the database's share — a refutation built on an
+  under-count is not a refutation.
+- **The bank-anonymisation gate covers the new field and every narrative doc
+  (#4499 follow-up)** — `scripts/check-bench-baseline-anonymised.mjs` now checks
+  `phases[].bank`, which the `--phases` sweep introduced after the gate was
+  written, and enumerates its prose scope as `docs/hindsight-bench*.md` from
+  disk instead of a hardcoded two-file list. Under that list a newly added
+  narrative doc opted out of the gate by existing, which is exactly what
+  `docs/hindsight-bench-p2-residency.md` would have done.
+- **Fixed: `--reset-stats` result files recorded the statistics epoch they had
+  just destroyed** — `readDbState` necessarily runs *before* the reset (bank
+  selection needs `bankRows` to configure the sweep), so a `--reset-stats` run
+  wrote `config.statsReset: true` beside a `db.statsResetAt` naming the previous
+  epoch and a `db.heapHitRatio` accumulated over it. Those two claims contradict
+  each other, and `heapHitRatio` is the field the #4476 cache-residency
+  criterion is graded on — a wrong number in a committed baseline, not a
+  cosmetic one. The new `readStatsEpoch` re-reads both immediately after the
+  reset. Baselines captured before this fix are annotated in
+  `docs/hindsight-bench-p2-residency.md` rather than hand-edited.
+
+## v0.20.13 — ParadeDB pg_search BM25 keyword recall, `vault:` secrets resolved off the apply path, and recall quality as a gating number
 
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)
 
@@ -148,6 +295,20 @@ now an anomaly worth investigating, not the norm.
   under `2>&1`, while an interactive operator is told the output is
   secret-bearing.
 
+### Memory CLI secret hygiene
+
+- **`memory docker-compose` no longer prints live secrets to stdout by default (#4487)** — the compose snippet now emits `vault:` refs unresolved, plus a note, unless the new `--resolve-secrets` flag is passed; `cp_access_key` follows the same rule. Closes the follow-up from #4471, which correctly wired `vault:` resolution into the snippet emit site but changed the command to print a live `sk-…` key on an operator-invoked command whose stdout is routinely pasted around.
+- **`memory setup --recreate` vault-ref wiring now has a direct test (#4486)** — adds the first `registerMemoryCommand` test harness and a wiring assertion pinning that the `--recreate` launch path (the one that caused the 2026-08-06 outage) resolves `hindsight.llm` `vault:` refs before they reach `startHindsight`.
+- **The cleartext-secrets warning now fires on every path that actually emits one** — it is decided ONCE, from the values about to be printed rather than from the flag, so `--resolve-secrets` (the only path that emits a live `sk-…` key) can never warn LESS than the safe default does; a PLAINTEXT api_key written straight into `switchroom.yaml`, which no `vault:` gate ever applied to, is warned about too; and a snippet carrying only unresolved `vault:` refs stays quiet, since a `vault:…` string is not a secret and crying wolf there would devalue the warning where it matters.
+
+### Hindsight / LiteLLM metering
+
+- **A dropped LiteLLM routing key no longer silently unmeters Hindsight, and the routing env has ONE derivation** — `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` (what makes Hindsight's LLM traffic transit the proxy and land in `LiteLLM_SpendLogs` as `end_user=hindsight`) were built from a duplicated literal in `hindsightContainerEnvPairs` (docker-run / `memory setup --recreate`) and again in `generateHindsightComposeSnippet`; both now come from one `hindsightLiteLlmEnvPairs` helper, which also fails closed on a blank key instead of baking an empty `Bearer `. Separately, the resolver behind those launch paths collapsed "LiteLLM is off", "the broker denied the key" and "the broker is down" into one bare `undefined` — and was itself a verbatim copy in both `src/cli/memory.ts` and `src/cli/setup.ts` — so a denied grant launched Hindsight with no routing env, no warning, and unmetered spend (observed 2026-08-07). `resolveHindsightLiteLlm` now distinguishes those cases and returns the dropped `vault:` reference (never the secret), which both launch paths print as a warning alongside the existing `cp_access_key` / LLM-api_key drop warnings — naming it as a broker-grant failure rather than the operator env drift the ENV DRIFT report makes it look like.
+
+### Hindsight container memory cap
+
+- **`hindsight.mem_limit` — the container's memory cap is configurable, and a cap that cannot hold `shared_buffers` now says so** — the cap was a hard-coded `16g` with no config path, while `shared_buffers` (a managed `hindsight.env` key) was configurable. An operator who raised the live container to 24 GiB by hand to fit a 12 GiB buffer pool had it silently reverted to 16 GiB by the next `switchroom memory setup --recreate`, with the 12 GiB `shared_buffers` left standing inside it — Postgres pinning most of its own cgroup as unreclaimable shared memory, warned about nowhere. `hindsight.mem_limit` (a docker size string; absent → the unchanged `16g` default) now reaches docker `--memory` and the compose `mem_limit:` from one resolver, so the two launch paths cannot disagree, and it is honoured on first-run `switchroom setup` as well as on `memory setup`. It is a first-class field rather than an `env:` key because it is a docker `HostConfig.Memory` flag, not a variable emitted into the container. On top of the knob, every launch now checks the resolved cap against the resolved `shared_buffers` and warns — naming both numbers and both keys — when the cap does not clear the buffer pool by the app working set plus the page-cache floor (4608 MiB). Warning, not refusal: the dangerous state is a default re-asserting itself, and hard-failing there would leave the fleet with no memory container at all. A malformed size string is still rejected outright, at `switchroom apply` by the schema and at launch rather than silently falling back to the default.
+
 ### Recall quality is now a measurable, gating number
 
 - **Recall-quality regression suite (#4484)** — the strongest datapoint in the
@@ -168,6 +329,18 @@ now an anomaly worth investigating, not the norm.
   query built purely from `hindsight_english` stopwords plus the corpus
   boilerplate (`claude`, `code`, `agent`, `assistant`, `user`, `switchroom`,
   `sidechain`).
+
+### Benchmarking
+
+- **`switchroom hindsight-bench` — a model-free harness that measures Hindsight recall latency against bank size and concurrency (#4475)** — #4474's goal ("consistent latency across any bank size, including under contention") was unfalsifiable: there was no number to move, so every later phase would have shipped on assertion. The new verb sweeps recall across banks and concurrency levels, reports nearest-rank p50/p95/p99 with variance, sample and error counts (errors never fold into percentiles — a timeout is not a fast call), and reduces two runs to a PASS/FAIL verdict (`0` pass · `1` verdict failed · `2` could not run). Every psql session is clamped read-only via `PGOPTIONS` and the clamp is *verified* by requiring Postgres to reject a real `CREATE TEMP TABLE`; cells with no samples or a >10 % error rate are classified ungradeable, named in the report, and block a pass, so a partly-broken run can no longer be graded on whichever cells survived. The opt-in `--contention` generator degrades the live box deliberately (documented blast radius, conservative defaults, load backends bounded by an in-SQL deadline plus a signal-wired terminate sweep) and confirms its own backends attached rather than silently measuring an idle box. Additive: one new CLI verb and its registration, zero model tokens, no change to any existing code path. Baseline captured in `docs/baselines/hindsight-recall-2026-08-07/`, with AC1 (±10 % reproducibility) reported as FAILED — at these sample counts the p95 estimator's own bootstrap interval is wider than the gate — and AC4 (contention moves the tail) PASSED, measured A/B/A.
+
+- **`hindsight-bench` result files no longer publish the fleet's bank names** — the recall baselines committed in the previous entry's harness were captured against the live instance, so every artefact carried the operator's bank roster with a row count beside each name, in a public repo. Bank ids are now pseudonymised at **capture time**: `--out` and `--csv` write `bank-01`, `bank-02`, … ranked by row count, so the size axis, the run-to-run joins the verdict modes depend on, and every latency number survive intact while the names do not. The stdout summary still shows real names (your screen, not an artefact) and the mapping is printed to stderr and never written beside the file. The committed baselines under `docs/baselines/hindsight-recall-2026-08-07/` and the narrative that quotes them are rewritten to match, and `npm run lint:bench-baseline-anonymised` fails the build on any committed baseline naming a bank any other way — a whitelist of shape rather than a blocklist of names, so an agent added to the fleet tomorrow is covered too. Only bank names and row counts were ever exposed: no memory content, no credentials, no hostnames. Git history still contains the pre-fix artefacts; whether to rewrite it is tracked separately in #4499.
+
+### Self-improvement
+
+- **Label review-turn messages, stop raw-reasoning leaks to the operator** — a silent self-improvement review turn's mid-turn reasoning could be captured by the outbox backstop and delivered into the operator's DM as a raw, unlabelled message. A review turn now has exactly one sanctioned operator-facing output: a well-formed self-improvement card (a message opening with `🔧 **Self-improvement**`). The backstop delivers a review-originated record only when its text is that card; all other trailing prose classifies `internal` and is suppressed. Detection is deterministic on the synthesized inbound's `source="self_improve_review"` tag plus an exact card-title prefix, never a prose-shape heuristic. A residual title-framing layer (behind `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING`) prepends the title if a non-card review record ever reaches delivery with the audience gate off, so review reasoning can never appear unlabelled. The review prompt now locks the exact card shape (Signal / Suggestion / Status) and instructs silence on a no-op turn.
+- **Close the same leak on the live send path (#4490)** — the outbox sweep's card gate above never protected the LIVE/elected send path (`deliverCapturedProse`): when a review turn's own reply call threw, the single-writer election deferred to that bridge instead of the outbox, and the bridge had no audience gate or title framing at all, so a non-card review turn's raw reasoning could still reach the operator's DM. `reviewOriginated` provenance is now threaded from the transcript scan through the Stop hook's elected-state file into `deliverCapturedProse`, which applies the SAME shared card-gate / title-framing predicates the sweep uses — no parallel implementation, one shared decision on both delivery paths.
+- **Fix a duplicated title on a review record that is both a card and a reply-throw (#4489)** — `decideOutboxSweep` applied the self-improvement title-framing decision on the ALREADY provenance-banner-composed body, so a real card lost its own idempotency check (which only inspects what it was handed) and picked up a second title. The framing decision now gates on the raw record text.
 
 ### Test isolation and CI
 
@@ -204,6 +377,18 @@ now an anomaly worth investigating, not the norm.
   now **bans** `../history.js` mocks outright instead of carrying an exception
   that assumed no sibling suite used the real module.
 
+### Release process
+
+- **Enforce a continuously-staged CHANGELOG `## Unreleased` section:** every PR
+  that changes shippable code (`src`, the Telegram plugin, `bin`, `docker`,
+  `profiles`, `skills`, the vendored hindsight tree, CI workflows) must now add
+  an entry under `## Unreleased`, enforced deterministically by
+  `scripts/check-changelog-entry.mjs` as part of `npm run lint`. Docs/chore/
+  test-only PRs opt out with a `no-changelog` label or a `[skip changelog]`
+  token on its own line in the PR body or a commit message. This makes cutting a release a
+  trivial rename of this header instead of reconstructing the whole section
+  from `git log` at release time (as v0.20.12 had to).
+
 ### Dependencies
 
 - **Claude Code CLI pinned 2.1.221 → 2.1.223 (#4481)** — both pins move in
@@ -216,12 +401,6 @@ now an anomaly worth investigating, not the norm.
   which is exactly the fleet's LiteLLM gateway configuration. Two behaviour
   changes to expect: the **ultraplan** feature is gone, and `/review` is now an
   alias for `/code-review`.
-
-### Hindsight
-
-- **`hindsight.mem_limit` — the container's memory cap is configurable, and a cap that cannot hold `shared_buffers` now says so** — the cap was a hard-coded `16g` with no config path, while `shared_buffers` (a managed `hindsight.env` key) was configurable. An operator who raised the live container to 24 GiB by hand to fit a 12 GiB buffer pool had it silently reverted to 16 GiB by the next `switchroom memory setup --recreate`, with the 12 GiB `shared_buffers` left standing inside it — Postgres pinning most of its own cgroup as unreclaimable shared memory, warned about nowhere. `hindsight.mem_limit` (a docker size string; absent → the unchanged `16g` default) now reaches docker `--memory` and the compose `mem_limit:` from one resolver, so the two launch paths cannot disagree, and it is honoured on first-run `switchroom setup` as well as on `memory setup`. It is a first-class field rather than an `env:` key because it is a docker `HostConfig.Memory` flag, not a variable emitted into the container. On top of the knob, every launch now checks the resolved cap against the resolved `shared_buffers` and warns — naming both numbers and both keys — when the cap does not clear the buffer pool by the app working set plus the page-cache floor (4608 MiB). Warning, not refusal: the dangerous state is a default re-asserting itself, and hard-failing there would leave the fleet with no memory container at all. A malformed size string is still rejected outright, at `switchroom apply` by the schema and at launch rather than silently falling back to the default.
-
-- **`hindsight-bench` result files no longer publish the fleet's bank names** — the recall baselines committed in the previous entry's harness were captured against the live instance, so every artefact carried the operator's bank roster with a row count beside each name, in a public repo. Bank ids are now pseudonymised at **capture time**: `--out` and `--csv` write `bank-01`, `bank-02`, … ranked by row count, so the size axis, the run-to-run joins the verdict modes depend on, and every latency number survive intact while the names do not. The stdout summary still shows real names (your screen, not an artefact) and the mapping is printed to stderr and never written beside the file. The committed baselines under `docs/baselines/hindsight-recall-2026-08-07/` and the narrative that quotes them are rewritten to match, and `npm run lint:bench-baseline-anonymised` fails the build on any committed baseline naming a bank any other way — a whitelist of shape rather than a blocklist of names, so an agent added to the fleet tomorrow is covered too. Only bank names and row counts were ever exposed: no memory content, no credentials, no hostnames. Git history still contains the pre-fix artefacts; whether to rewrite it is tracked separately in #4499.
 
 ## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
 

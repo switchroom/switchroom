@@ -170,6 +170,41 @@ export function assertReadOnlyOrWritesAllowed(allowWrites: boolean, opts: SqlOpt
   }
 }
 
+/**
+ * The two {@link DbState} fields whose value is relative to the statistics
+ * epoch, re-readable on their own.
+ *
+ * Exists because `--reset-stats` invalidates them. `readDbState` necessarily
+ * runs BEFORE the reset — bank selection needs `bankRows` before the sweep can
+ * be configured — so without this the result file records
+ * `config.statsReset: true` beside a `db.statsResetAt` naming the epoch the run
+ * just DESTROYED, and a `db.heapHitRatio` accumulated over that dead epoch.
+ * Those two claims contradict each other, and `heapHitRatio` is the field
+ * #4476's cache-residency criterion is graded on — so this is not cosmetic, it
+ * is a wrong number in a committed baseline.
+ */
+export interface StatsEpoch {
+  statsResetAt: string | null;
+  heapHitRatio: number | null;
+}
+
+/** Re-read the statistics-epoch fields; see {@link StatsEpoch}. */
+export function readStatsEpoch(opts: SqlOptions = {}): StatsEpoch {
+  const rows = sql(
+    `SELECT
+       (SELECT stats_reset::text FROM pg_stat_database WHERE datname = current_database()),
+       (SELECT CASE WHEN heap_blks_hit + heap_blks_read = 0 THEN NULL
+                    ELSE heap_blks_hit::float8 / (heap_blks_hit + heap_blks_read) END
+          FROM pg_statio_user_tables WHERE relname = 'memory_units');`,
+    opts,
+  );
+  const f = (rows[0] ?? "").split("|");
+  return {
+    statsResetAt: (f[0] ?? "") === "" ? null : (f[0] as string),
+    heapHitRatio: (f[1] ?? "") === "" ? null : num(f[1]),
+  };
+}
+
 /** `pg_stat_reset()`. Never a side effect of a default run — see the CLI flag. */
 export function resetStats(opts: SqlOptions = {}): void {
   // pg_stat_reset() is a write to the stats collector, not to any relation, but

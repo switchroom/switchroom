@@ -182,11 +182,11 @@ describe("Dockerfile.hindsight shape", () => {
 
     // The non-amd64 branch is never EXECUTED by PR CI. Not because the job is
     // skipped — `build-hindsight` does run on pull_request and passes — but
-    // because PR builds pin `platforms: linux/amd64` and skip the QEMU setup
-    // step (`if: github.event_name != 'pull_request'`), so only the amd64 leg
-    // is ever built there. This assertion is therefore the only thing standing
-    // between that branch and an untested regression, and it has to be
-    // airtight rather than indicative.
+    // because the per-arch matrix pins `arch: ["amd64"]` on pull_request (the
+    // arm64 leg on its native ubuntu-24.04-arm runner only fans out on a
+    // main/tag/dispatch push), so only the amd64 leg is ever built there. This
+    // assertion is therefore the only thing standing between that branch and
+    // an untested regression, and it has to be airtight rather than indicative.
     //
     // Hence an ALLOWLIST, not a blocklist. Enumerating forbidden spellings
     // cannot hold: `pip3 install`, `uv add`, `apt-get install
@@ -419,6 +419,162 @@ describe("Dockerfile.hindsight shape", () => {
     );
     expect(dockerfile).toMatch(
       /switchroom hindsight pg_search tokenizer-drift guard: rebuilds preserve an inexpressible tokenizer/,
+    );
+
+    // #4478: a rebuild must re-emit the pushdown filter columns on BOTH
+    // branches, or the tokenizer fix silently un-does the pushdown fix.
+    expect(dockerfile).toMatch(
+      /filter_fields = pg_search_filter_fields\(table\)/,
+    );
+  });
+
+  it("keeps the pg_search BM25 filter-field pushdown (assert-guarded, fail-loud)", () => {
+    // Epic #4474, phase P4 (#4478). Upstream indexes only (id, text, context
+    // [, text_signals]), so ParadeDB cannot push the recall arm's
+    // `bank_id = $n AND fact_type = '<lit>'` into the Tantivy scan — it
+    // degrades them to a post-scoring heap_filter and every keyword arm scores
+    // the WHOLE table. Measured on an 800k-row corpus: 171,517 shared buffer
+    // hits per arm uncorrected vs 405 corrected (423x), and the uncorrected
+    // index runs 2-10x SLOWER than the native tsvector+GIN comparator.
+    // RESULTS are identical either way, so nothing but a plan or a latency
+    // chart can see the defect — which is why this needs a pinned guard.
+    // Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts.
+
+    // 1. the field map, scoped to the one table with a `@@@` arm.
+    expect(dockerfile).toMatch(
+      /PG_SEARCH_FILTER_FIELDS: dict\[str, tuple\[str, \.\.\.\]\] = \{/,
+    );
+    expect(dockerfile).toMatch(/"memory_units": \("bank_id", "fact_type"\),/);
+
+    // 2. THE LOAD-BEARING CONSTRAINT: the filter cast is the `literal`
+    //    tokenizer, hard-coded, never the configured text tokenizer. Equality
+    //    pushdown needs the whole column value to be one token, so a stemmed /
+    //    ngram / lindera cast here stops the predicate matching AT ALL — i.e.
+    //    empty keyword recall, not merely slow keyword recall.
+    expect(dockerfile).toMatch(/PG_SEARCH_FILTER_TOKENIZER = "literal"/);
+    expect(dockerfile).toMatch(
+      /assert "normalized" not in _filter_col_body, \(/,
+    );
+
+    // 3. both helpers, and the builder's new optional parameter (optional so
+    //    every upstream call site keeps its exact upstream output).
+    expect(dockerfile).toMatch(/def pg_search_filter_fields\(/);
+    expect(dockerfile).toMatch(/def pg_search_filter_columns\(/);
+    expect(dockerfile).toMatch(/filter_fields: Sequence\[str\] = \(\),/);
+
+    // 4. the fresh-install create site actually requests them — the one
+    //    memory_units BM25 create site the tokenizer-drift block does not own.
+    expect(dockerfile).toMatch(/pg_search_filter_fields\("memory_units"\)/);
+
+    // 5. NEGATIVE GUARD, deliberate: the query is NOT rewritten. #4478's
+    //    original plan folded bank_id/fact_type into paradedb.boolean(must =>
+    //    ...), which EXPLAIN showed is unnecessary — ParadeDB absorbs the plain
+    //    SQL WHERE once the columns carry the literal tokenizer. engine/sql/
+    //    postgresql.py stays untouched; if a patch ever starts rewriting the
+    //    arm, that is a re-litigation of a measured decision.
+    //    Comment lines are stripped first: the block's own header EXPLAINS the
+    //    rejected design, and the guard is about emitted code, not prose.
+    const dockerfileCode = dockerfile
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#"))
+      .join("\n");
+    expect(dockerfileCode).not.toMatch(/paradedb\.boolean\(\s*must\s*=>/);
+
+    // 6. the build FAILS if upstream grows a second search arm the field map
+    //    does not cover, rather than shipping an index that cannot push it down.
+    expect(dockerfile).toMatch(
+      /_arm_tables = set\(re\.findall\(r"paradedb\\\.match\\\('\(\\w\+\)'", _pg_sql\)\)/,
+    );
+    expect(dockerfile).toMatch(
+      /assert _pg_sql\.count\("id @@@ paradedb\.boolean\("\) == 1,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert _pg_sql\.count\("WHERE bank_id = \{bank_id_param\}"\) == 2,/,
+    );
+
+    // 7. the boot-path detector exists and is LOG-ONLY. Repairing a live index
+    //    on the boot path is the #4474/C2 fail-closed window (a DROP/CREATE on
+    //    a populated memory_units), and a raise there would take the semantic
+    //    arm down with the keyword one.
+    expect(dockerfile).toMatch(
+      /PG_SEARCH_FILTER_FIELD_DRIFT_MARKER = "pg_search_filter_field_drift"/,
+    );
+    expect(dockerfile).toMatch(/def check_pg_search_filter_field_drift\(/);
+
+    // 8. the stable operator signal.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight pg_search filter-field pushdown: bank_id\/fact_type indexed as pdb\.literal fast fields/,
+    );
+  });
+
+  it("keeps the text-search backend migration-path fix (assert-guarded, fail-loud)", () => {
+    // #4506. Five defects in `ensure_text_search_extension`, all OBSERVED in a
+    // rehearsal against a clone of the live 801,792-row memory_units.
+    // Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-text-search-migration-patch.test.ts; this pins the
+    // shape so a silent removal cannot ship.
+
+    // D1a. THE LOAD-BEARING CONSTRAINT: the data guard fires only when the
+    //      column type must genuinely change AND the target backend reads the
+    //      column's contents. Keyed on the (column, index) PAIR — as upstream
+    //      did — a merely-dropped index over a surviving column is fatal on
+    //      EVERY backend, including the one already in use, and the error's own
+    //      "set it back" advice cannot work. That was a one-way trapdoor.
+    expect(dockerfile).toMatch(
+      /target_search_vector_is_content = text_search_extension not in \(/,
+    );
+    expect(dockerfile).toMatch(
+      /if column_recreate_needed and target_search_vector_is_content:/,
+    );
+
+    // D1b. …and the rebuild path must not drop a correctly typed, POPULATED
+    //      column. `search_vector` is recreated EMPTY and only ever written on
+    //      INSERT, so an unconditional DROP on an index-only rebuild is silent
+    //      data loss in its own right.
+    expect(dockerfile).toMatch(
+      /if current_col_type and current_col_type != target_column_type:/,
+    );
+
+    // D2. the pg_search branch installs its own extension. Without this the
+    //     BM25 CREATE INDEX dies on `schema "pdb" does not exist`, because
+    //     nothing else in the boot path ever creates it (the entrypoint stages
+    //     the .so only, by design).
+    expect(dockerfile).toMatch(
+      /CREATE EXTENSION IF NOT EXISTS pg_search CASCADE/,
+    );
+    expect(dockerfile).toMatch(
+      /assert _branch\.index\("CREATE EXTENSION IF NOT EXISTS pg_search"\) < _branch\.index\("USING bm25"\)/,
+    );
+    // D2b. …and it is NOT wrapped in upstream's pgroonga-style "already exists /
+    //      no permission" fallback. `IF NOT EXISTS` makes that probe unreachable
+    //      as a suppressor, and the reconcile runs in ONE implicit transaction —
+    //      so on a real failure the probe fires on an already-aborted
+    //      transaction and buries the actual ParadeDB error under "current
+    //      transaction is aborted". That is exactly the diagnostic an operator
+    //      needs when prestart_pg0 (best-effort, `|| true`) left
+    //      shared_preload_libraries=pg_search ineffective.
+    expect(dockerfile).not.toMatch(
+      /except Exception:\s*\n\s*has_ext = conn\.execute\(text\("SELECT 1 FROM pg_extension WHERE extname = 'pg_search'"\)\)/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_search'" not in m, \(/,
+    );
+
+    // D3. the second memory table is reconciled under the name it actually has
+    //     (alembic t5o6p7q8r9s0 renamed reflections -> mental_models), and the
+    //     dead name is gone from the source entirely.
+    expect(dockerfile).toMatch(/"mental_models",\s+# renamed from `reflections`/);
+    expect(dockerfile).toMatch(/assert '"reflections",' not in m, \(/);
+
+    // D4. the detector never reports a backend it cannot read.
+    expect(dockerfile).toMatch(
+      /indeterminate \(TEXT search_vector, no text-search index\)/,
+    );
+
+    // the stable operator signal.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight text-search backend migration path: reconciles mental_models/,
     );
   });
 

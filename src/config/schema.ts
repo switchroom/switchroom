@@ -3014,7 +3014,12 @@ export const HindsightConfigSchema = z.object({
       "always-safe `english`, set `hindsight_english` to use switchroom's " +
       "junk-stopping config (dict + stopword file provisioned durably by the " +
       "image entrypoint, recall degrading to semantic-only if it is ever " +
-      "missing); plus the " +
+      "missing); and " +
+      "HINDSIGHT_API_BM25_MAX_QUERY_TERMS \u2014 the max number of query tokens the " +
+      "keyword (BM25) recall arm searches for; unset means upstream's 0 = " +
+      "unbounded, which makes a multi-KB consolidation query a disjunction " +
+      "over hundreds of terms; set e.g. 64 to cap it, at the cost of " +
+      "silently dropping the tail of a long query; plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
