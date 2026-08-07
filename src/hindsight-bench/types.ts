@@ -253,6 +253,12 @@ export interface ReproducibilityReport {
   cells: CellComparison[];
   /** cells present in one run but not the other */
   unmatched: string[];
+  /**
+   * Cells excluded from grading because the measurement itself failed there —
+   * all calls errored, or enough did that the survivors are a biased subset.
+   * Non-empty forces `pass: false`.
+   */
+  ungradeable: string[];
   /** the largest observed |relDelta| across matched cells */
   worstRelDelta: number;
   /** true only when every matched cell is within tolerance AND none is unmatched */

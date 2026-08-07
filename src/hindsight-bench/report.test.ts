@@ -11,6 +11,7 @@ import {
   formatReproducibility,
   formatSummary,
   toCsv,
+  ungradeableCells,
 } from "./report.js";
 import type { BenchResult } from "./types.js";
 
@@ -64,13 +65,17 @@ describe("compareRuns (AC1)", () => {
     expect(rep.unmatched).toEqual(["small@c1"]);
   });
 
-  it("treats an all-error reference cell as unmatched rather than dividing by NaN", () => {
+  it("treats an all-error reference cell as ungradeable rather than dividing by NaN", () => {
     const dead = makeCell("big", 10, 1, 1000);
     dead.samplesMs = [];
     dead.stats = { ...dead.stats, n: 0, errors: 20, p95: NaN };
     const rep = compareRuns(makeResult([dead]), makeResult([makeCell("big", 10, 1, 1000)]));
     expect(rep.pass).toBe(false);
-    expect(rep.unmatched).toEqual(["big@c1"]);
+    // "ungradeable", not "unmatched": the cell IS in both runs, the measurement
+    // failed there. Reporting it as missing would send a reader looking for a
+    // sweep-configuration difference that does not exist.
+    expect(rep.unmatched).toEqual([]);
+    expect(rep.ungradeable).toEqual(["big@c1 (no-samples, 20 errors)"]);
   });
 
   it("does not pass an empty comparison", () => {
@@ -128,6 +133,73 @@ describe("compareContention (AC4)", () => {
 
   it("does not pass with no matched cells", () => {
     expect(compareContention(idle, makeResult([])).pass).toBe(false);
+  });
+
+  it("REFUSES to pass when a cell of the contended run died mid-sweep", () => {
+    // Observed live 2026-08-07: the Hindsight container was recreated during a
+    // contended sweep, so two of ten cells recorded nothing. The remaining
+    // eight still cleared the threshold, and before this the verdict skipped
+    // the dead cells silently and printed PASS over a sweep that had partly
+    // failed. A verdict over the survivors is not a verdict over the run.
+    const dead = makeCell("small", 10, 1, 700);
+    dead.samplesMs = [];
+    dead.stats = { ...dead.stats, n: 0, errors: 40, p95: NaN };
+    const loaded = makeResult([makeCell("big", 100, 1, 1400), makeCell("big", 100, 4, 2200), dead]);
+    const rep = compareContention(idle, loaded);
+    expect(rep.raised).toBe(2);
+    expect(rep.medianRelDelta).toBeGreaterThan(CONTENTION_MIN_REL_DELTA);
+    expect(rep.ungradeable).toEqual(["small@c1 (no-samples, 40 errors)"]);
+    expect(rep.pass).toBe(false);
+  });
+
+  it("REFUSES to grade a cell whose survivors are a biased subset", () => {
+    // n=6 of 40 with 34 timeouts still yields a percentile — of whichever calls
+    // were fast enough not to time out. Graded naively that cell reads as the
+    // fastest in the run, which is the exact inverse of the truth.
+    const biased = makeCell("small", 10, 1, 700);
+    biased.stats = { ...biased.stats, n: 6, errors: 34 };
+    const loaded = makeResult([makeCell("big", 100, 1, 1400), makeCell("big", 100, 4, 2200), biased]);
+    const rep = compareContention(idle, loaded);
+    expect(rep.ungradeable).toEqual(["small@c1 (error-rate 85%, n=6)"]);
+    expect(rep.pass).toBe(false);
+  });
+
+  it("tolerates an error rate at the documented ceiling", () => {
+    const ok = makeCell("small", 10, 1, 700);
+    ok.stats = { ...ok.stats, n: 18, errors: 2 }; // 10 %, exactly at the cap
+    const loaded = makeResult([makeCell("big", 100, 1, 1400), makeCell("big", 100, 4, 2200), ok]);
+    const rep = compareContention(idle, loaded);
+    expect(rep.ungradeable).toEqual([]);
+    expect(rep.pass).toBe(true);
+  });
+});
+
+describe("ungradeableCells", () => {
+  it("blocks an AC1 pass when either run has a dead cell", () => {
+    const dead = makeCell("big", 10, 1, 1000);
+    dead.samplesMs = [];
+    dead.stats = { ...dead.stats, n: 0, errors: 20, p95: NaN };
+    const rep = compareRuns(
+      makeResult([makeCell("big", 10, 1, 1000), makeCell("small", 5, 1, 900)]),
+      makeResult([dead, makeCell("small", 5, 1, 900)]),
+    );
+    expect(rep.ungradeable).toEqual(["big@c1 (no-samples, 20 errors)"]);
+    // the surviving cell is identical in both runs, so without the gate this
+    // comparison would have reported a clean PASS.
+    expect(rep.cells.map((c) => c.relDelta)).toEqual([0]);
+    expect(rep.pass).toBe(false);
+  });
+
+  it("names both failure modes on a real-shaped result", () => {
+    const dead = makeCell("a", 10, 1, 100);
+    dead.samplesMs = [];
+    dead.stats = { ...dead.stats, n: 0, errors: 40, p95: NaN };
+    const biased = makeCell("b", 10, 4, 100);
+    biased.stats = { ...biased.stats, n: 6, errors: 34 };
+    expect(ungradeableCells(makeResult([dead, biased, makeCell("c", 10, 1, 100)]))).toEqual([
+      "a@c1 (no-samples, 40 errors)",
+      "b@c4 (error-rate 85%, n=6)",
+    ]);
   });
 });
 
