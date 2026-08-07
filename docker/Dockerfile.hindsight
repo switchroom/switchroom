@@ -587,7 +587,8 @@ assert '        return " | ".join(tokens)' in pg, "switchroom hindsight BM25 com
 print("switchroom hindsight BM25 compound-token patch: intact compound tokens appended (strict superset of upstream tokens); native tsquery left as a plain OR join")
 PYEOF
 
-# PG text-search regconfig / stopword-file recall fallback.
+# PG text-search recall fallback: missing regconfig / stopword-file (native)
+# AND absent pg_search BM25 index (ParadeDB) — follow-up to #4470.
 #
 # switchroom runs the native (Postgres) BM25 arms through a CUSTOM text-search
 # regconfig — HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE, set to
@@ -602,10 +603,20 @@ PYEOF
 # only caught Oracle's DRG-10599/ORA-30600/ORA-29902 and re-`raise`d everything
 # else, EVERY recall 500s — a total recall outage, not a degraded one.
 #
+# #4470 made pg_search (ParadeDB BM25) the default text-search backend for new
+# installs. It has the same failure mode on a different signature: whenever the
+# `USING bm25` index is absent — the initial build window, or any REINDEX — the
+# recall query's @@@ / paradedb.score arm raises SQLSTATE XX000 with
+# "<table> does not contain a USING bm25 index". The 42704/stopword predicate
+# below did not recognise that, so pg_search recall still failed CLOSED (500)
+# for the whole build/rebuild window while native degraded gracefully. A dry-run
+# on a full 772k-row clone caught it as a BLOCKER.
+#
 # This widens the existing semantic-only fallback (which the Oracle branch
-# already built, dialect-agnostically) to also trigger on the PG signatures,
-# reusing the very same rebuild. Recall degrades to semantic-only — lossy but
-# serving — until provisioning catches up, instead of failing closed. The
+# already built, dialect-agnostically) to also trigger on the native PG
+# signatures AND the pg_search "no bm25 index" signature, reusing the very same
+# rebuild. Recall degrades to semantic-only — lossy but serving — until
+# provisioning / the index build catches up, instead of failing closed. The
 # index-write path and the backfill migration are NOT touched here (they own
 # their own provisioning contract via the entrypoint); this covers the READ
 # path only, which is where a user-visible 500 would otherwise land.
@@ -633,9 +644,25 @@ NEW = '''        # switchroom: Postgres native BM25 arms run to_tsvector/to_tsqu
         # gap (fresh volume before the entrypoint provisioned the config, or an
         # embedded-pg version bump that orphaned the version-scoped stopfile),
         # never on a normal query.
+        #
+        # The pg_search (ParadeDB BM25) backend has the SAME failure shape on a
+        # DIFFERENT signature: when the `USING bm25` index is absent — the initial
+        # index-build window on a fresh/large volume, or any REINDEX/rebuild — a
+        # recall query that hits the @@@ / paradedb.score arm raises SQLSTATE
+        # XX000 with "<table> does not contain a USING bm25 index" (the table
+        # varies: memory_units, reflections, …). Native degrades gracefully here;
+        # pg_search did not, so recall failed CLOSED (HTTP 500) for the whole
+        # build/rebuild window (found by a dry-run on a full 772k-row clone).
+        # Match XX000 AND the stable, table-name-agnostic
+        # "does not contain a using bm25 index" substring (case-insensitive) —
+        # NOT XX000 alone, which is Postgres internal_error, a catch-all that
+        # would swallow unrelated internal errors and mask real bugs.
         _pg_text_search_unavailable = getattr(e, "sqlstate", None) == "42704" or (
             "could not open stop-word file" in err_str
-        ) or ("text search configuration" in err_str.lower() and "does not exist" in err_str.lower())
+        ) or ("text search configuration" in err_str.lower() and "does not exist" in err_str.lower()) or (
+            getattr(e, "sqlstate", None) == "XX000"
+            and "does not contain a using bm25 index" in err_str.lower()
+        )
         if _include_bm25 and ("DRG-10599" in err_str or "ORA-30600" in err_str or "ORA-29902" in err_str or _pg_text_search_unavailable):
             if _pg_text_search_unavailable:
                 logger.warning("Postgres text-search config unavailable (%s); falling back to semantic-only search", err_str[:160])
@@ -656,10 +683,689 @@ t = f.read_text()
 assert "_pg_text_search_unavailable" in t, "switchroom PG text-search recall-fallback patch: sentinel missing after patch"
 assert 'getattr(e, "sqlstate", None) == "42704"' in t, "switchroom PG text-search recall-fallback patch: 42704 guard missing after patch"
 assert "could not open stop-word file" in t, "switchroom PG text-search recall-fallback patch: stopword-file guard missing after patch"
+assert 'getattr(e, "sqlstate", None) == "XX000"' in t, "switchroom PG text-search recall-fallback patch: pg_search XX000 guard missing after patch"
+assert "does not contain a using bm25 index" in t, "switchroom PG text-search recall-fallback patch: pg_search bm25-index substring missing after patch"
 # The dialect-agnostic semantic-only rebuild the Oracle branch already had must
 # stay the SINGLE fallback path both branches reach — we only widened its trigger.
 assert t.count("rows = await conn.fetch(fb_query, *fb_params)") == 1, "switchroom PG text-search recall-fallback patch: shared semantic-only rebuild changed shape"
-print("switchroom hindsight PG text-search recall-fallback patch: recall degrades to semantic-only on missing regconfig / stopword file (SQLSTATE 42704)")
+print("switchroom hindsight PG text-search recall-fallback patch: recall degrades to semantic-only on missing regconfig / stopword file (SQLSTATE 42704) and on absent pg_search BM25 index (SQLSTATE XX000)")
+PYEOF
+
+# pg_search tokenizer-drift guard (switchroom epic #4474, finding C1).
+#
+# THE DEFECT, in the real shipping source at tag v0.8.6.
+#
+# The stemmed/stopworded ParadeDB variant the fleet needs for recall quality
+# ("Variant B": `stemmer=english` + `stopwords_language=english`) is NOT
+# expressible through HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER.
+# `_pg_search.py:32-85` accepts only a bare tokenizer NAME from a fixed set and
+# emits an UNSTEMMED `(field::pdb.<tok>)` cast — there is no stemmer or stopword
+# parameter anywhere in that module. So Variant B can only ever exist as
+# hand-built DDL.
+#
+# Meanwhile every place that decides "does the live index match the config"
+# keys on the `key_field` reloption alone (`migrations.py:887`) and never looks
+# at the tokenizer cast. A hand-built stemmed index is therefore silently
+# ADOPTED as correct — and any code path that rebuilds it emits the config's
+# unstemmed column list instead. The rebuild is real, not hypothetical:
+# `alembic/versions/a2b3c4d5e6f7_add_text_signals_column.py:75-83` does an
+# unconditional DROP INDEX + CREATE INDEX on a POPULATED memory_units, and
+# `migrations.py:1042-1070` rebuilds on the empty-table path. Both take their
+# column list from the config knob. Result: stemming silently disappears, with
+# no error, no log line, and nothing to notice it by until someone measures
+# recall quality.
+#
+# THE GUARD.
+#
+#  * `_pg_search.py` gains a parser for an existing ParadeDB indexdef, an
+#    "can the config knob even express this cast?" predicate (implemented by
+#    round-tripping through `normalize_pg_search_tokenizer`, so it can never
+#    drift from what config actually emits), a drift checker, and a
+#    rebuild-aware column builder.
+#  * `migrations.py` boot path: when column type / access method / key_field
+#    all agree, the tokenizer casts are compared too and a mismatch is logged
+#    at ERROR with the stable marker `pg_search_tokenizer_drift`.
+#  * Rebuild paths (`migrations.py` + the text_signals migration) read the
+#    PRE-EXISTING indexdef before dropping, and when the live tokenizer is one
+#    the knob cannot express they PRESERVE it instead of silently downgrading.
+#    A drift the knob CAN express is a deliberate config change and config
+#    still wins (logged at WARN).
+#
+# WHY THIS CANNOT CRASH-LOOP THE FLEET. `ensure_text_search_extension` runs on
+# EVERY boot and already raises RuntimeError on a schema mismatch with data
+# present (`migrations.py:768 -> :922 -> :940`); a guard that raised here would
+# take out the SEMANTIC arm too, i.e. a full memory outage — strictly worse
+# than the silent quality degradation it fixes. So this guard NEVER raises and
+# NEVER changes `index_matches`: every new code path is wrapped so that any
+# parse or comparison failure degrades to exactly upstream's behaviour with a
+# warning. The signal is a loud, repeated-every-boot structured log plus the
+# in-process `pg_search_tokenizer_drift_state()` accessor.
+#
+# NOT PATCHED, deliberately: `5a366d414dce_initial_schema.py` and
+# `n9i0j1k2l3m4_learnings_and_pinned_reflections.py` CREATE their tables in the
+# same migration, so no pre-existing index can be downgraded there.
+#
+# The cast syntax preserved here is ParadeDB's documented form —
+# `(description::pdb.simple('stemmer=english', 'stopwords_language=english'))`,
+# single-quoted `key=value` arguments (docs.paradedb.com, Create an Index /
+# Token Filters / Stemmer). The parser is deliberately syntax-agnostic: it
+# round-trips whatever cast text the catalog reports rather than assuming a
+# form, so an unquoted variant is preserved just as faithfully.
+#
+# Self-verifying at build time; behaviourally guarded by
+# tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts and statically
+# by tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+NAME = "pg_search tokenizer-drift guard"
+ROOT = pathlib.Path("/app/api/hindsight_api")
+
+
+def patch(rel, old, new, *, count=1):
+    f = ROOT / rel
+    s = f.read_text()
+    n = s.count(old)
+    assert n == count, (
+        f"switchroom hindsight {NAME}: anchor found {n}x (expected {count}) in {rel} — "
+        "upstream reformatted; re-author this patch in docker/Dockerfile.hindsight. "
+        f"Anchor head: {old.strip().splitlines()[0]!r}"
+    )
+    f.write_text(s.replace(old, new, count))
+
+
+# ---------------------------------------------------------------- _pg_search.py
+patch(
+    "_pg_search.py",
+    r'''import re
+from collections.abc import Sequence
+''',
+    r'''import logging
+import re
+from collections.abc import Sequence
+''',
+)
+
+GUARD = r'''
+
+# --- switchroom: pg_search tokenizer-drift guard (epic #4474, C1) -------------
+#
+# The config knob above can only ever emit a BARE tokenizer name, so a
+# stemmed / stopworded ParadeDB index can only exist as hand-built DDL — and
+# nothing upstream compares tokenizers when it decides to rebuild. Everything
+# below exists so a rebuild cannot silently change retrieval semantics. None of
+# it raises: it runs on the every-boot migration path.
+
+PG_SEARCH_TOKENIZER_DRIFT_MARKER = "pg_search_tokenizer_drift"
+
+_DRIFT_LOG = logging.getLogger(__name__)
+
+_LAST_TOKENIZER_DRIFT: dict[str, dict[str, object]] = {}
+
+_INDEX_COLUMNS_RE = re.compile(r"\busing\s+(?:bm25|paradedb)\s*\(", re.IGNORECASE)
+
+_FIELD_CAST_RE = re.compile(
+    r"^\"?(?P<field>[A-Za-z_][A-Za-z0-9_$]*)\"?\s*::\s*pdb\.(?P<cast>\S.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Conservative whitelist for a cast we are willing to re-emit into DDL. The text
+# comes from pg_get_indexdef (already-executed DDL, not user input), but we still
+# never splice anything into CREATE INDEX that is not a bare tokenizer name
+# optionally followed by simple identifier args or single-quoted key=value opts.
+_SAFE_CAST_RE = re.compile(
+    r"""^[a-z_][a-z0-9_]*
+        (\(\s*
+            (?:
+                '[A-Za-z0-9_=\-. ]*'(?:\s*,\s*'[A-Za-z0-9_=\-. ]*')*
+              | [A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*
+            )?
+        \s*\))?$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _strip_outer_parens(item: str) -> str:
+    item = item.strip()
+    while item.startswith("("):
+        depth = 0
+        quoted = False
+        end = -1
+        for i, ch in enumerate(item):
+            if quoted:
+                if ch == "'":
+                    quoted = False
+                continue
+            if ch == "'":
+                quoted = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end != len(item) - 1:
+            break
+        item = item[1:-1].strip()
+    return item
+
+
+def _split_top_level(columns: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quoted = False
+    for ch in columns:
+        if quoted:
+            buf.append(ch)
+            if ch == "'":
+                quoted = False
+            continue
+        if ch == "'":
+            quoted = True
+            buf.append(ch)
+        elif ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def parse_pg_search_index_casts(indexdef: str | None) -> dict[str, str] | None:
+    """Map indexed field -> tokenizer cast text, parsed from a ParadeDB indexdef.
+
+    The cast is whatever follows ``pdb.`` (e.g. ``simple('stemmer=english')``);
+    an uncast field maps to ``""``. Returns ``None`` when ``indexdef`` is absent
+    or is not a parseable ParadeDB / BM25 index definition — callers must treat
+    that as "nothing known", never as "no drift proven".
+    """
+
+    if not indexdef:
+        return None
+    match = _INDEX_COLUMNS_RE.search(indexdef)
+    if not match:
+        return None
+
+    open_at = match.end() - 1
+    depth = 0
+    quoted = False
+    close_at = -1
+    for i in range(open_at, len(indexdef)):
+        ch = indexdef[i]
+        if quoted:
+            if ch == "'":
+                quoted = False
+            continue
+        if ch == "'":
+            quoted = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_at = i
+                break
+    if close_at < 0:
+        return None
+
+    casts: dict[str, str] = {}
+    for item in _split_top_level(indexdef[open_at + 1 : close_at]):
+        bare = _strip_outer_parens(item)
+        cast_match = _FIELD_CAST_RE.match(bare)
+        if cast_match:
+            casts[cast_match.group("field").lower()] = cast_match.group("cast").strip()
+            continue
+        ident = bare.strip('"').strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", ident):
+            casts[ident.lower()] = ""
+    return casts or None
+
+
+def pg_search_tokenizer_is_expressible(cast: str) -> bool:
+    """True when the configured tokenizer knob can reproduce ``cast`` verbatim.
+
+    This is the C1 test. ``normalize_pg_search_tokenizer`` is the ONLY thing
+    that ever writes a cast from config, so a cast it cannot round-trip (e.g.
+    ``simple('stemmer=english')``) can only have come from hand-built DDL, and a
+    config-driven rebuild would silently destroy it. Defining the predicate as a
+    round-trip means it can never drift from what config actually emits.
+    """
+
+    if not cast:
+        return True
+    try:
+        return normalize_pg_search_tokenizer(cast) == cast.strip().lower()
+    except ValueError:
+        return False
+
+
+def _observed_cast(casts: dict[str, str], text_fields: Sequence[str]) -> tuple[str, bool]:
+    """The tokenizer cast the existing index applies to the fields being rebuilt.
+
+    Returns ``(cast, consistent)``. ``consistent`` is False when the index
+    applies more than one distinct cast across those fields; the first one wins
+    and the caller reports it.
+    """
+
+    seen: list[str] = []
+    for field in text_fields:
+        if field.lower() in casts:
+            value = casts[field.lower()]
+            if value not in seen:
+                seen.append(value)
+    if not seen:
+        return "", True
+    return seen[0], len(seen) == 1
+
+
+def pg_search_tokenizer_drift_state() -> dict[str, dict[str, object]]:
+    """Last recorded drift per index — for status surfaces and tests."""
+
+    return {key: dict(value) for key, value in _LAST_TOKENIZER_DRIFT.items()}
+
+
+def check_pg_search_tokenizer_drift(
+    indexdef: str | None,
+    text_fields: Sequence[str],
+    tokenizer: str | None,
+    *,
+    table: str = "",
+    index_name: str = "",
+    log=None,
+) -> dict[str, object] | None:
+    """Compare a live ParadeDB index's tokenizer against the configured one.
+
+    Returns a drift record, or ``None`` when there is no drift (or nothing
+    parseable to compare). NEVER raises and NEVER mutates the database: this
+    runs on the boot path, where an exception would take out the semantic arm
+    alongside the keyword one.
+    """
+
+    emit = log if log is not None else _DRIFT_LOG
+    try:
+        casts = parse_pg_search_index_casts(indexdef)
+        if casts is None:
+            return None
+        configured = normalize_pg_search_tokenizer(tokenizer)
+        observed, consistent = _observed_cast(casts, text_fields)
+        if observed == configured and consistent:
+            return None
+        expressible = pg_search_tokenizer_is_expressible(observed)
+        record: dict[str, object] = {
+            "table": table,
+            "index": index_name,
+            "observed_tokenizer": observed,
+            "configured_tokenizer": configured,
+            "config_expressible": expressible,
+            "consistent_across_fields": consistent,
+            "observed_casts": dict(casts),
+        }
+        _LAST_TOKENIZER_DRIFT[f"{table}.{index_name}"] = record
+        emit.error(
+            "%s table=%s index=%s observed=%r configured=%r config_expressible=%s "
+            "consistent_across_fields=%s - the live ParadeDB index does not tokenize the "
+            "way %s would build it, so keyword recall quality is NOT what the config "
+            "describes. See switchroom epic #4474 (C1).",
+            PG_SEARCH_TOKENIZER_DRIFT_MARKER,
+            table or "?",
+            index_name or "?",
+            observed,
+            configured,
+            expressible,
+            consistent,
+            PG_SEARCH_TOKENIZER_ENV,
+        )
+        return record
+    except Exception as exc:  # never raise on the boot path
+        emit.warning(
+            "%s check failed on table=%s index=%s: %s",
+            PG_SEARCH_TOKENIZER_DRIFT_MARKER,
+            table,
+            index_name,
+            exc,
+        )
+        return None
+
+
+def pg_search_rebuild_bm25_columns(
+    indexdef: str | None,
+    key_field: str,
+    text_fields: Sequence[str],
+    tokenizer: str | None,
+    *,
+    table: str = "",
+    index_name: str = "",
+    log=None,
+) -> str:
+    """Column list for REBUILDING a ParadeDB index that may already exist.
+
+    Identical to :func:`pg_search_bm25_columns` for a fresh build. When an index
+    already exists, its tokenizer is compared against the configured one:
+
+    * no drift -> the configured column list, unchanged;
+    * drift the tokenizer knob CAN express -> configured wins (a deliberate
+      config change), logged at WARN;
+    * drift the knob CANNOT express (the C1 hazard: a hand-built stemmed /
+      stopworded index) -> the observed cast is PRESERVED, so the rebuild cannot
+      silently downgrade a stemmed index to an unstemmed one.
+
+    Never raises: any parse or safety failure falls back to the configured
+    column list with a log line, i.e. exactly upstream's behaviour.
+    """
+
+    emit = log if log is not None else _DRIFT_LOG
+    configured_columns = pg_search_bm25_columns(key_field, text_fields, tokenizer)
+    drift = check_pg_search_tokenizer_drift(
+        indexdef, text_fields, tokenizer, table=table, index_name=index_name, log=emit
+    )
+    if drift is None:
+        return configured_columns
+    if drift["config_expressible"]:
+        emit.warning(
+            "%s rebuild=honour-config table=%s index=%s observed=%r configured=%r - the "
+            "configured tokenizer can express the live one, so the rebuild applies config.",
+            PG_SEARCH_TOKENIZER_DRIFT_MARKER,
+            table or "?",
+            index_name or "?",
+            drift["observed_tokenizer"],
+            drift["configured_tokenizer"],
+        )
+        return configured_columns
+
+    observed = str(drift["observed_tokenizer"])
+    if not _SAFE_CAST_RE.match(observed):
+        emit.error(
+            "%s rebuild=downgrade-unavoidable table=%s index=%s observed=%r - the live "
+            "tokenizer cast is not in a re-emittable form, so the rebuild CANNOT preserve "
+            "it. The rebuilt index will tokenize as %r; re-apply the hand-built DDL.",
+            PG_SEARCH_TOKENIZER_DRIFT_MARKER,
+            table or "?",
+            index_name or "?",
+            observed,
+            drift["configured_tokenizer"],
+        )
+        return configured_columns
+
+    emit.error(
+        "%s rebuild=preserve-observed table=%s index=%s observed=%r configured=%r - %s "
+        "cannot express the live tokenizer, so the rebuild PRESERVES it rather than "
+        "silently reverting to the configured (unstemmed) form. See epic #4474 (C1).",
+        PG_SEARCH_TOKENIZER_DRIFT_MARKER,
+        table or "?",
+        index_name or "?",
+        observed,
+        drift["configured_tokenizer"],
+        PG_SEARCH_TOKENIZER_ENV,
+    )
+    return ", ".join([key_field, *(f"({field}::pdb.{observed})" for field in text_fields)])
+'''
+
+_pg = ROOT / "_pg_search.py"
+_src = _pg.read_text()
+assert "pg_search_rebuild_bm25_columns" not in _src, (
+    f"switchroom hindsight {NAME}: upstream now ships a rebuild-aware column builder — "
+    "retire this patch in docker/Dockerfile.hindsight"
+)
+_pg.write_text(_src.rstrip("\n") + "\n" + GUARD)
+
+# ---------------------------------------------------------------- migrations.py
+patch(
+    "migrations.py",
+    r'''from ._pg_search import normalize_pg_search_tokenizer, pg_search_bm25_columns
+''',
+    r'''from ._pg_search import (
+    check_pg_search_tokenizer_drift,
+    normalize_pg_search_tokenizer,
+    pg_search_rebuild_bm25_columns,
+)
+''',
+)
+
+# Boot path: column type, access method and key_field can all agree while the
+# index tokenizes completely differently. Compare the casts too — LOG ONLY.
+patch(
+    "migrations.py",
+    r'''            else:
+                logger.debug(f"Text search OK for {table_name}: {current_column_type}/{current_index_type}")
+''',
+    r'''            else:
+                # switchroom (epic #4474, C1): everything upstream checks — column
+                # type, access method, key_field — can agree while the live index
+                # tokenizes completely differently, because the tokenizer cast is
+                # never inspected. Compare it and say so LOUDLY. Deliberately log
+                # only: this is the every-boot path and the mismatch branch below
+                # raises RuntimeError when data is present, which would take the
+                # SEMANTIC arm down too. A quality regression must not become an
+                # availability outage.
+                if want_pg_search and current_is_pg_search:
+                    check_pg_search_tokenizer_drift(
+                        current_index_def,
+                        ("text", "context", "text_signals")
+                        if table_name == "memory_units"
+                        else ("name", "content"),
+                        pg_search_tokenizer,
+                        table=table_name,
+                        index_name=f"idx_{table_name.replace('.', '_')}_text_search",
+                        log=logger,
+                    )
+                logger.debug(f"Text search OK for {table_name}: {current_column_type}/{current_index_type}")
+''',
+)
+
+# Rebuild path: capture the pre-existing definition BEFORE the DROP.
+patch(
+    "migrations.py",
+    r'''        for table_name, current_col_type, current_idx_type, _was_pg_search in mismatched_tables:
+            # Drop existing index if it exists
+''',
+    r'''        for table_name, current_col_type, current_idx_type, _was_pg_search in mismatched_tables:
+            # switchroom (epic #4474, C1): read the existing index definition
+            # BEFORE dropping it, so the rebuild below can tell whether it is
+            # about to silently change tokenizer semantics.
+            _prior_index_name = f"idx_{table_name.replace('.', '_')}_text_search"
+            try:
+                prior_indexdef = conn.execute(
+                    text(
+                        "SELECT indexdef FROM pg_indexes "
+                        "WHERE schemaname = :schema AND indexname = :index_name"
+                    ),
+                    {"schema": schema_name, "index_name": _prior_index_name},
+                ).scalar()
+            except Exception as exc:  # never block the rebuild on the guard
+                logger.warning("Could not read prior indexdef for %s: %s", _prior_index_name, exc)
+                prior_indexdef = None
+
+            # Drop existing index if it exists
+''',
+)
+
+patch(
+    "migrations.py",
+    r'''                if table_name == "memory_units":
+                    bm25_cols = pg_search_bm25_columns(
+                        "id",
+                        ("text", "context", "text_signals"),
+                        pg_search_tokenizer,
+                    )
+                else:  # reflections
+                    bm25_cols = pg_search_bm25_columns(
+                        "id",
+                        ("name", "content"),
+                        pg_search_tokenizer,
+                    )
+''',
+    r'''                # switchroom (epic #4474, C1): rebuild-aware — preserves a live
+                # tokenizer the config knob cannot express instead of silently
+                # reverting the index to unstemmed.
+                if table_name == "memory_units":
+                    bm25_cols = pg_search_rebuild_bm25_columns(
+                        prior_indexdef,
+                        "id",
+                        ("text", "context", "text_signals"),
+                        pg_search_tokenizer,
+                        table=table_name,
+                        index_name=_prior_index_name,
+                        log=logger,
+                    )
+                else:  # reflections
+                    bm25_cols = pg_search_rebuild_bm25_columns(
+                        prior_indexdef,
+                        "id",
+                        ("name", "content"),
+                        pg_search_tokenizer,
+                        table=table_name,
+                        index_name=_prior_index_name,
+                        log=logger,
+                    )
+''',
+)
+
+# ------------------------------------------- a2b3c4d5e6f7_add_text_signals_column
+# The one rebuild that runs DROP INDEX + CREATE INDEX against a POPULATED
+# memory_units. Upstream takes the new column list straight from the config
+# knob, which is exactly how a hand-built stemmed index disappears.
+MIG = "alembic/versions/a2b3c4d5e6f7_add_text_signals_column.py"
+
+patch(
+    MIG,
+    r'''from hindsight_api._pg_search import (
+    PG_SEARCH_TOKENIZER_ENV,
+    normalize_pg_search_tokenizer,
+    pg_search_bm25_columns,
+)
+''',
+    r'''from hindsight_api._pg_search import (
+    PG_SEARCH_TOKENIZER_ENV,
+    normalize_pg_search_tokenizer,
+    pg_search_rebuild_bm25_columns,
+)
+''',
+)
+
+patch(
+    MIG,
+    r'''def _pg_search_tokenizer() -> str:
+    return normalize_pg_search_tokenizer(os.getenv(PG_SEARCH_TOKENIZER_ENV))
+''',
+    r'''def _pg_search_tokenizer() -> str:
+    return normalize_pg_search_tokenizer(os.getenv(PG_SEARCH_TOKENIZER_ENV))
+
+
+def _prior_indexdef(index_name: str) -> str | None:
+    """The live definition of ``index_name``, read BEFORE it is dropped.
+
+    switchroom (epic #4474, C1): the rebuild below takes its column list from
+    the tokenizer config knob, which cannot express a stemmed / stopworded
+    ParadeDB index. Without this read, a hand-built stemmed index is silently
+    replaced by an unstemmed one on a populated table. Returns None on any
+    failure — the guard must never break the migration.
+
+    Honest caveat: this SELECT runs inside the migration's transaction, so a
+    failure would abort that transaction and the DDL after it would fail too,
+    swallowed exception or not. That is accepted rather than papered over —
+    the query is a parameterised read of a core catalog view, so the only
+    realistic failure mode is a dead connection, which fails the migration
+    regardless.
+    """
+
+    from sqlalchemy import text as _sa_text
+
+    schema = context.config.get_main_option("target_schema") or "public"
+    try:
+        return (
+            op.get_bind()
+            .execute(
+                _sa_text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = :schema AND indexname = :index_name"
+                ),
+                {"schema": schema, "index_name": index_name},
+            )
+            .scalar()
+        )
+    except Exception:
+        return None
+''',
+)
+
+patch(
+    MIG,
+    r'''        bm25_cols = pg_search_bm25_columns("id", ("text", "context", "text_signals"), _pg_search_tokenizer())
+        op.execute(f"DROP INDEX IF EXISTS {schema}idx_memory_units_text_search")
+''',
+    r'''        bm25_cols = pg_search_rebuild_bm25_columns(
+            _prior_indexdef("idx_memory_units_text_search"),
+            "id",
+            ("text", "context", "text_signals"),
+            _pg_search_tokenizer(),
+            table="memory_units",
+            index_name="idx_memory_units_text_search",
+        )
+        op.execute(f"DROP INDEX IF EXISTS {schema}idx_memory_units_text_search")
+''',
+)
+
+patch(
+    MIG,
+    r'''        bm25_cols = pg_search_bm25_columns("id", ("text", "context"), _pg_search_tokenizer())
+        op.execute(f"DROP INDEX IF EXISTS {schema}idx_memory_units_text_search")
+''',
+    r'''        bm25_cols = pg_search_rebuild_bm25_columns(
+            _prior_indexdef("idx_memory_units_text_search"),
+            "id",
+            ("text", "context"),
+            _pg_search_tokenizer(),
+            table="memory_units",
+            index_name="idx_memory_units_text_search",
+        )
+        op.execute(f"DROP INDEX IF EXISTS {schema}idx_memory_units_text_search")
+''',
+)
+
+# ----------------------------------------------------------------- verification
+import py_compile
+
+for rel in ("_pg_search.py", "migrations.py", MIG):
+    py_compile.compile(str(ROOT / rel), doraise=True)
+
+t = (ROOT / "_pg_search.py").read_text()
+assert "def parse_pg_search_index_casts(" in t, f"switchroom hindsight {NAME}: parser missing after patch"
+assert "def pg_search_tokenizer_is_expressible(" in t, f"switchroom hindsight {NAME}: expressibility predicate missing after patch"
+assert "def pg_search_rebuild_bm25_columns(" in t, f"switchroom hindsight {NAME}: rebuild builder missing after patch"
+assert "def pg_search_tokenizer_drift_state(" in t, f"switchroom hindsight {NAME}: drift-state accessor missing after patch"
+assert 'PG_SEARCH_TOKENIZER_DRIFT_MARKER = "pg_search_tokenizer_drift"' in t, f"switchroom hindsight {NAME}: log marker missing after patch"
+# The guard body must contain no `raise` statement at all: it runs on the
+# every-boot path, where an exception is an availability outage.
+_guard_body = t.split("# --- switchroom: pg_search tokenizer-drift guard")[1]
+_raises = [ln for ln in _guard_body.splitlines() if ln.strip().startswith(("raise ", "raise\t", "raise\n")) or ln.strip() == "raise"]
+assert not _raises, f"switchroom hindsight {NAME}: guard body contains a raise statement ({_raises!r}) — it runs on the every-boot path"
+
+m = (ROOT / "migrations.py").read_text()
+assert "check_pg_search_tokenizer_drift(" in m, f"switchroom hindsight {NAME}: boot-path drift check missing after patch"
+assert m.count("pg_search_rebuild_bm25_columns(") == 2, f"switchroom hindsight {NAME}: expected 2 rebuild call sites in migrations.py"
+assert m.count("pg_search_bm25_columns(") == 0, f"switchroom hindsight {NAME}: a config-only pg_search rebuild call site survived in migrations.py"
+assert "prior_indexdef" in m, f"switchroom hindsight {NAME}: pre-drop indexdef capture missing after patch"
+# The boot detector must NOT have become a new failure mode.
+assert m.count("raise RuntimeError(") == 9, (
+    f"switchroom hindsight {NAME}: migrations.py RuntimeError count changed — the guard must "
+    "add no new raise on the every-boot text-search path"
+)
+
+a = (ROOT / MIG).read_text()
+assert a.count("pg_search_rebuild_bm25_columns(") == 2, f"switchroom hindsight {NAME}: expected 2 call sites in the text_signals migration"
+assert a.count("pg_search_bm25_columns(") == 0, f"switchroom hindsight {NAME}: a config-only rebuild call site survived in the text_signals migration"
+assert "def _prior_indexdef(" in a, f"switchroom hindsight {NAME}: pre-drop indexdef read missing from the text_signals migration"
+
+print("switchroom hindsight pg_search tokenizer-drift guard: rebuilds preserve an inexpressible tokenizer and drift is logged as pg_search_tokenizer_drift; no new raise on the boot path")
 PYEOF
 
 # Empty-TimeoutError-message fix: both retry loops in

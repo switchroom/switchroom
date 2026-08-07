@@ -2,9 +2,36 @@
 
 ## Unreleased
 
+<!--
+Staging area for the NEXT release. Every PR that changes shippable code adds
+its entry HERE, under this header, in the SAME PR — grouped under `###`
+subheads like the released sections below. `scripts/check-changelog-entry.mjs`
+(part of `npm run lint`) fails a PR that ships code without staging an entry
+here; docs/chore/test-only PRs opt out with a `no-changelog` label or a
+`[skip changelog]` token on its own line (in the PR body or a commit message).
+Cutting a release is then just renaming this header
+to `## vX.Y.Z — <summary>` (see skills/switchroom-release/SKILL.md, Step 1).
+Keep this header present and non-empty; an empty Unreleased at release time is
+now an anomaly worth investigating, not the norm.
+-->
+
 ### Self-improvement
 
 - **Label review-turn messages, stop raw-reasoning leaks to the operator** — a silent self-improvement review turn's mid-turn reasoning could be captured by the outbox backstop and delivered into the operator's DM as a raw, unlabelled message. A review turn now has exactly one sanctioned operator-facing output: a well-formed self-improvement card (a message opening with `🔧 **Self-improvement**`). The backstop delivers a review-originated record only when its text is that card; all other trailing prose classifies `internal` and is suppressed. Detection is deterministic on the synthesized inbound's `source="self_improve_review"` tag plus an exact card-title prefix, never a prose-shape heuristic. A residual title-framing layer (behind `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING`) prepends the title if a non-card review record ever reaches delivery with the audience gate off, so review reasoning can never appear unlabelled. The review prompt now locks the exact card shape (Signal / Suggestion / Status) and instructs silence on a no-op turn.
+- **Close the same leak on the live send path (#4490)** — the outbox sweep's card gate above never protected the LIVE/elected send path (`deliverCapturedProse`): when a review turn's own reply call threw, the single-writer election deferred to that bridge instead of the outbox, and the bridge had no audience gate or title framing at all, so a non-card review turn's raw reasoning could still reach the operator's DM. `reviewOriginated` provenance is now threaded from the transcript scan through the Stop hook's elected-state file into `deliverCapturedProse`, which applies the SAME shared card-gate / title-framing predicates the sweep uses — no parallel implementation, one shared decision on both delivery paths.
+- **Fix a duplicated title on a review record that is both a card and a reply-throw (#4489)** — `decideOutboxSweep` applied the self-improvement title-framing decision on the ALREADY provenance-banner-composed body, so a real card lost its own idempotency check (which only inspects what it was handed) and picked up a second title. The framing decision now gates on the raw record text.
+
+### Release process
+
+- **Enforce a continuously-staged CHANGELOG `## Unreleased` section:** every PR
+  that changes shippable code (`src`, the Telegram plugin, `bin`, `docker`,
+  `profiles`, `skills`, the vendored hindsight tree, CI workflows) must now add
+  an entry under `## Unreleased`, enforced deterministically by
+  `scripts/check-changelog-entry.mjs` as part of `npm run lint`. Docs/chore/
+  test-only PRs opt out with a `no-changelog` label or a `[skip changelog]`
+  token on its own line in the PR body or a commit message. This makes cutting a release a
+  trivial rename of this header instead of reconstructing the whole section
+  from `git log` at release time (as v0.20.12 had to).
 
 ## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
 

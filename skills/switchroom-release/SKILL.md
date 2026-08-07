@@ -22,12 +22,13 @@ Cut a release of `switchroom/switchroom` and get it live on the fleet. This is a
 1. `git fetch origin`, confirm `main` is at the commit you want released.
 2. `gh pr list --state open` — confirm no PR meant for this release is still open. Ask the operator if unsure.
 3. Confirm CI on `main` is green (`gh run list --branch main --limit 3`).
-4. Read `CHANGELOG.md` — the `## Unreleased` section is the staging area for this release's notes. If it's empty, there's nothing to release.
+4. Read `CHANGELOG.md` — the `## Unreleased` section is the **continuously-maintained** staging area for this release's notes. Every PR since the last release stages its own entry there as it merges, enforced by `scripts/check-changelog-entry.mjs` (part of `npm run lint`), so by release time this section should already read as a near-complete draft — you tidy and summarise, you do NOT author it from scratch. **An empty (or missing) `## Unreleased` at release time is now an ANOMALY, not the normal state:** it means either there genuinely is nothing to release, OR the enforcement was bypassed (`no-changelog` labels / `[skip changelog]` tokens on their own line on PRs that should have staged entries). Before assuming the former, cross-check against `git log <last-tag>..origin/main` — if real shippable work landed but Unreleased is bare, investigate and reconstruct rather than shipping a hollow release (this is exactly the v0.20.12 failure mode the enforcement exists to prevent).
 5. Pick the next version: read the latest tag (`git tag --list 'v*' --sort=-v:refname | head -1`) and bump the patch (or minor if the operator asks). Confirm with the operator which.
 
 ## Step 1 — Consolidate the changelog (the release commit is CHANGELOG-only)
 
-- Move the `## Unreleased` entries under a new `## vX.Y.Z — <one-line summary>` heading.
+- The section is maintained continuously (see pre-flight 4), so this step is now a **rename + tidy**, not authorship: change the `## Unreleased` header to `## vX.Y.Z — <one-line summary>`, then read through the staged entries and lightly edit for grouping/summary. If Unreleased was empty or thin, STOP and resolve the anomaly (pre-flight 4) before proceeding — do not invent a release note.
+- **Re-seed a fresh empty `## Unreleased` block at the top** (header + the convention HTML comment) immediately below `# Changelog`, so the staging area exists for the next cycle and `scripts/check-changelog-entry.mjs` keeps enforcing it. (Copy the comment block from the section you just renamed.)
 - The release commit touches **CHANGELOG.md only**. Do NOT bump `package.json` (placeholder discipline).
 - Branch protection blocks direct push to `main`, so: create a `release/vX.Y.Z` branch, push it, open a `chore: release vX.Y.Z` PR (base `main`), arm auto-merge (squash, delete-branch) on green CI.
 

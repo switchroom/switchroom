@@ -90,6 +90,11 @@ core:
   # ws9f1-security anchor.)
   - 'scripts/check-agent-attribution-trailers.mjs'
   - 'scripts/agent-pr-label.mjs'
+  # tests/changelog-entry-check.test.ts SPAWNS check-changelog-entry.mjs and
+  # asserts its exit codes + failure text. Same reason as the two scripts
+  # above — `scripts/check-*.mjs` is in the `lint` filter only, so without
+  # this a PR editing just this script would skip the tests covering it.
+  - 'scripts/check-changelog-entry.mjs'
   - 'vitest.config.ts'
   - 'tsconfig.json'
   - 'package.json'

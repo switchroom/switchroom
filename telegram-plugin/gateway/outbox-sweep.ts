@@ -50,6 +50,7 @@ import {
   formatSelfImprovementFraming,
   resolveRecordAudience,
   shouldSuppressForAudience,
+  type Audience,
 } from '../hooks/audience-classify.mjs'
 import { isShownBlock } from '../shown-ledger.js'
 import { richMessage, isParseEntitiesError } from '../rich-send.js'
@@ -1025,6 +1026,26 @@ export function journalExternalDelivery(
      * bridge), hours later.
      */
     framedProvenance?: 'reply-throw'
+    /**
+     * #4490: the record's audience, carried onto the journal line — parity
+     * with the sweep's own `DeliveredEntry.audience`. Lets the captured-prose
+     * bridge (`outbound-send-path.ts`), the OTHER delivery machine, journal
+     * through this ONE shared function instead of a second, hand-rolled
+     * `appendDelivered` call.
+     */
+    audience?: Audience
+    /**
+     * #4490: this journal line is a TERMINAL SUPPRESSION (the audience gate
+     * withheld an `'internal'` record), not a delivery — mirrors
+     * `DeliveredEntry.suppressedAudience`.
+     */
+    suppressedAudience?: Audience
+    /**
+     * #4490: this delivery carried the self-improvement title framing —
+     * mirrors `DeliveredEntry.framedSelfImprovement`, applied on either
+     * delivery path.
+     */
+    framedSelfImprovement?: 'self-improve'
   },
   stateDir?: string,
   now: number = Date.now(),
@@ -1045,6 +1066,9 @@ export function journalExternalDelivery(
         ? {}
         : { replyAlreadyDeliveredThisTurn: args.replyAlreadyDeliveredThisTurn }),
       ...(args.framedProvenance == null ? {} : { framedProvenance: args.framedProvenance }),
+      ...(args.audience == null ? {} : { audience: args.audience }),
+      ...(args.suppressedAudience == null ? {} : { suppressedAudience: args.suppressedAudience }),
+      ...(args.framedSelfImprovement == null ? {} : { framedSelfImprovement: args.framedSelfImprovement }),
     },
     stateDir,
   )
