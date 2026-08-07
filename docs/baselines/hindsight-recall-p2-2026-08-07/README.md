@@ -15,7 +15,7 @@ narrative says so at every point it quotes one.
 |---|---|---|---|
 | `idle.json` / `.csv` | 5 banks × c=1,4,8,16, n=40, no load. Carries the `pg_stat_reset()` epoch. | 04:56:55 – 05:14:41 | good, but see "external load" |
 | `contended-read.json` / `.csv` | 5 banks × c=8,16, n=40, 4 read-contention workers. The AC2 hit-ratio window. | 05:14:57 – 05:26:07 | good — 4/4 backends confirmed attached, 0 errors, 0 zero-result calls |
-| `phases.json` / `.csv` | `--phases` attribution pass, 3 banks × c=1,8,16 | 05:31 – 05:41 | the AC3 refutation number; see the caveat below |
+| `phases.json` | `--phases` attribution pass, 3 banks × c=1,8,16 | 05:31 – 05:41 | the AC3 refutation number; see the caveat below |
 
 Every file carries its own `config`, `db` and `instance` block and `samplesMs`
 in completion order, so any of it can be re-reduced without re-running.
@@ -47,6 +47,15 @@ workers, so those three cells never reach the concurrency they are labelled
 with. Do not quote them. (`phases[]` does not have this problem: the phase sweep
 raises its own call count to `max(samples, concurrency)` for exactly this
 reason.)
+
+**There is deliberately no `phases.csv`.** The harness's CSV writer emits the
+`cells[]` table only — it carries no phase columns at all — so a `phases.csv`
+would have been 100 % the unquotable low-sample latency block and 0 % the
+attribution the run exists to produce, published in the single most
+copy-pasteable form in this directory, one row away from `idle.csv`'s
+identically-shaped rows. The generated file was removed rather than annotated:
+a warning in a README does not travel with a CSV that someone diffs. Read the
+shares out of `phases.json`.
 
 ## What is deliberately not here
 

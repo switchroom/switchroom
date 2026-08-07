@@ -73,11 +73,24 @@ statement about whether the working set fits.
 
 ## AC2 — heap hit ratio under load, on reset counters
 
-`pg_stat_reset()` was run at **2026-08-07T04:56:22Z**, the first such reset in
-this instance's life. The cumulative counters it discarded were snapshotted to
-the host first. Every ratio below is therefore a statement about measured load,
-not about the lifetime since `initdb` — which is what the criterion demands and
-what #4474 flagged as missing.
+`pg_stat_reset()` was run at **2026-08-07T04:56:56.942545Z**, the first such
+reset in this instance's life. The cumulative counters it discarded were
+snapshotted to the host first. Every ratio below is therefore a statement about
+measured load, not about the lifetime since `initdb` — which is what the
+criterion demands and what #4474 flagged as missing.
+
+> `idle.json` records `db.statsResetAt` as `04:56:22.400601+00` — an **earlier,
+> manual** reset, not the one its counters belong to. That mismatch was a real
+> harness bug, found by this PR's own review and fixed in it: `readDbState`
+> necessarily runs before `--reset-stats` fires (bank selection needs
+> `bankRows` to configure the sweep), so the file recorded
+> `config.statsReset: true` beside the epoch the run had just destroyed — and
+> beside a `db.heapHitRatio` accumulated over that dead epoch, which is the
+> field *this criterion* is graded on. `readStatsEpoch` now re-reads both
+> immediately after the reset. The committed P2 files predate the fix and are
+> left as captured rather than hand-edited; cite the `04:56:56.942545Z` figure
+> above, which is what the `pg_stat_database` checkpoints below are differenced
+> from.
 
 The ratio is **differenced between two checkpoints** taken either side of the
 contention sweep, not read cumulatively off the reset epoch. A cumulative read

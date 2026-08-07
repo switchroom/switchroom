@@ -53,6 +53,7 @@ import {
   readDbState,
   readInstanceState,
   resetStats,
+  readStatsEpoch,
 } from "../hindsight-bench/db.js";
 import { renderPlot } from "../hindsight-bench/plot.js";
 import { QUERY_SET_ID } from "../hindsight-bench/recall.js";
@@ -290,6 +291,12 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
     try {
       resetStats(sqlOpts);
       process.stderr.write(`${chalk.yellow("!")} pg_stat_reset() called — cumulative statistics were discarded\n`);
+      // `db` was read BEFORE the reset (bank selection needs `bankRows` to
+      // configure the sweep), so its two epoch-relative fields now describe an
+      // epoch this process just destroyed. Re-read them, or the file claims
+      // `statsReset: true` while quoting the superseded reset time and a
+      // cumulative hit ratio from before it — the exact field #4476 grades.
+      db = { ...db, ...readStatsEpoch(sqlOpts) };
     } catch (e) {
       fail(`--reset-stats failed: ${(e as Error).message}`);
     }

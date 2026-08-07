@@ -39,6 +39,16 @@ now an anomaly worth investigating, not the norm.
   disk instead of a hardcoded two-file list. Under that list a newly added
   narrative doc opted out of the gate by existing, which is exactly what
   `docs/hindsight-bench-p2-residency.md` would have done.
+- **Fixed: `--reset-stats` result files recorded the statistics epoch they had
+  just destroyed** — `readDbState` necessarily runs *before* the reset (bank
+  selection needs `bankRows` to configure the sweep), so a `--reset-stats` run
+  wrote `config.statsReset: true` beside a `db.statsResetAt` naming the previous
+  epoch and a `db.heapHitRatio` accumulated over it. Those two claims contradict
+  each other, and `heapHitRatio` is the field the #4476 cache-residency
+  criterion is graded on — a wrong number in a committed baseline, not a
+  cosmetic one. The new `readStatsEpoch` re-reads both immediately after the
+  reset. Baselines captured before this fix are annotated in
+  `docs/hindsight-bench-p2-residency.md` rather than hand-edited.
 
 ## v0.20.13 — ParadeDB pg_search BM25 keyword recall, `vault:` secrets resolved off the apply path, and recall quality as a gating number
 
