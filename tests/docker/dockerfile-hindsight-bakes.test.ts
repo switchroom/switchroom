@@ -340,6 +340,76 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the pg_search tokenizer-drift guard (assert-guarded, fail-loud)", () => {
+    // Epic #4474, finding C1. The stemmed/stopworded ParadeDB variant the fleet
+    // needs for recall quality cannot be expressed through
+    // HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_TOKENIZER (_pg_search.py
+    // takes a bare tokenizer NAME and emits an UNSTEMMED cast), so it can only
+    // exist as hand-built DDL — and nothing upstream defends it: every
+    // "does the index match the config" decision keys on the `key_field`
+    // reloption alone (migrations.py:887) and never inspects the tokenizer.
+    // The text_signals migration then DROPs and re-CREATEs the index on a
+    // POPULATED memory_units from the config knob, silently reverting it to
+    // unstemmed. Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts.
+
+    // The exact-once anchor guard (fail-loud on upstream drift), naming the
+    // file and the re-author path.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight \{NAME\}: anchor found \{n\}x \(expected \{count\}\) in \{rel\}/,
+    );
+
+    // The three mechanisms, all load-bearing.
+    // 1. expressibility is defined as a ROUND-TRIP through the same normalizer
+    //    config uses, so the predicate can never drift from what config emits.
+    expect(dockerfile).toMatch(
+      /return normalize_pg_search_tokenizer\(cast\) == cast\.strip\(\)\.lower\(\)/,
+    );
+    // 2. the boot path compares tokenizers, not just key_field…
+    expect(dockerfile).toMatch(/check_pg_search_tokenizer_drift\(/);
+    // 3. …and every rebuild reads the PRE-EXISTING definition before dropping.
+    expect(dockerfile).toMatch(/SELECT indexdef FROM pg_indexes /);
+    expect(dockerfile).toMatch(/def pg_search_rebuild_bm25_columns\(/);
+
+    // The stable, greppable operator signal.
+    expect(dockerfile).toMatch(
+      /PG_SEARCH_TOKENIZER_DRIFT_MARKER = "pg_search_tokenizer_drift"/,
+    );
+
+    // THE CRASH-LOOP CONSTRAINT, pinned. ensure_text_search_extension runs on
+    // EVERY boot and already raises RuntimeError on a schema mismatch with data
+    // present (migrations.py:768 → :922 → :940); a guard that raised there
+    // would take the SEMANTIC arm down alongside the keyword one — a full
+    // memory outage, strictly worse than the silent degradation being fixed.
+    // Both halves are pinned: the guard body carries no `raise` statement, and
+    // migrations.py's RuntimeError count is unchanged by the patch.
+    expect(dockerfile).toMatch(
+      /assert not _raises, f"switchroom hindsight \{NAME\}: guard body contains a raise statement/,
+    );
+    expect(dockerfile).toMatch(
+      /assert m\.count\("raise RuntimeError\("\) == 9,/,
+    );
+
+    // Post-replace re-assertions (verification-on-build): both rebuild call
+    // sites in each patched file must be the rebuild-aware builder, with no
+    // config-only call site left behind.
+    expect(dockerfile).toMatch(
+      /assert m\.count\("pg_search_rebuild_bm25_columns\("\) == 2,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert m\.count\("pg_search_bm25_columns\("\) == 0,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert a\.count\("pg_search_rebuild_bm25_columns\("\) == 2,/,
+    );
+    expect(dockerfile).toMatch(
+      /assert a\.count\("pg_search_bm25_columns\("\) == 0,/,
+    );
+    expect(dockerfile).toMatch(
+      /switchroom hindsight pg_search tokenizer-drift guard: rebuilds preserve an inexpressible tokenizer/,
+    );
+  });
+
   it("creates /backups owned by hindsight BEFORE `USER hindsight` (so the named volume is writable)", () => {
     // A root-owned /backups mount point makes the fresh named volume
     // root-owned → the non-root hindsight process EACCESes on pg_dump and
