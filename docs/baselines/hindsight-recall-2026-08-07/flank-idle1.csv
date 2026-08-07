@@ -1,0 +1,11 @@
+label,bank,rows,concurrency,n,errors,p50_ms,p95_ms,p95_ci_low_ms,p95_ci_high_ms,p99_ms,max_ms,mean_ms,stddev_ms,cv,mean_results,zero_result_calls,contention
+"flank idle pre-contention",klanker,230020,1,40,0,1041.71,1798.01,1313.87,3540.1,3540.1,3540.1,1194.35,462.02,0.3868,62.75,0,off
+"flank idle pre-contention",klanker,230020,4,40,0,4629.24,10078.81,8364.55,12291.76,12291.76,12291.76,5350.71,2444.23,0.4568,62.75,0,off
+"flank idle pre-contention",gymbro,17977,1,40,0,946.12,4452.19,2115.89,6533.26,6533.26,6533.26,1521.32,1294.97,0.8512,58.25,0,off
+"flank idle pre-contention",gymbro,17977,4,40,0,4015.14,6210.97,6074.79,7440.21,7440.21,7440.21,4503.37,1199.61,0.2664,58.25,0,off
+"flank idle pre-contention",ziggy,1493,1,40,0,991.89,5976.19,3333.15,6886.05,6886.05,6886.05,1791.98,1605.96,0.8962,62.85,0,off
+"flank idle pre-contention",ziggy,1493,4,40,0,3874.13,9243.01,4460.73,9682.34,9682.34,9682.34,4215.37,1856.28,0.4404,62.85,0,off
+"flank idle pre-contention",lisa-profile,157,1,40,0,839.25,2845.18,1201.61,3718.9,3718.9,3718.9,1098.97,673.55,0.6129,56.85,0,off
+"flank idle pre-contention",lisa-profile,157,4,40,0,3422.78,6081,5604.95,6094.42,6094.42,6094.42,3946.19,1135,0.2876,56.85,0,off
+"flank idle pre-contention",switchroom-dev,12,1,40,0,852.99,2624.25,1903.52,3452.38,3452.38,3452.38,1260.83,709.79,0.563,12,0,off
+"flank idle pre-contention",switchroom-dev,12,4,40,0,3988.3,7243.81,5188.96,9814.34,9814.34,9814.34,4324.68,1602.65,0.3706,12,0,off
