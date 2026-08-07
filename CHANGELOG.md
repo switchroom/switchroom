@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.15 — migrating a populated Hindsight bank to ParadeDB `pg_search` is a plain env flip, not a trapdoor
+
 ### Hindsight: a populated bank can migrate to `pg_search` by flipping the env, not by hand
 
 - **`native` → `pg_search` on a POPULATED bank is now a plain env flip +
