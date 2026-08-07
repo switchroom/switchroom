@@ -433,8 +433,8 @@ describe("Dockerfile.hindsight shape", () => {
     // [, text_signals]), so ParadeDB cannot push the recall arm's
     // `bank_id = $n AND fact_type = '<lit>'` into the Tantivy scan — it
     // degrades them to a post-scoring heap_filter and every keyword arm scores
-    // the WHOLE table. Measured on an 800k-row corpus: 171,522 shared buffer
-    // hits per arm uncorrected vs 416 corrected (412x), and the uncorrected
+    // the WHOLE table. Measured on an 800k-row corpus: 171,517 shared buffer
+    // hits per arm uncorrected vs 405 corrected (423x), and the uncorrected
     // index runs 2-10x SLOWER than the native tsvector+GIN comparator.
     // RESULTS are identical either way, so nothing but a plan or a latency
     // chart can see the defect — which is why this needs a pinned guard.

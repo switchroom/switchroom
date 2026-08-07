@@ -8,8 +8,8 @@
  * columns are not in the index, ParadeDB cannot push the predicates into the
  * Tantivy scan — it degrades them to a post-scoring `heap_filter` inside the
  * custom scan. The BM25 arm therefore scores the WHOLE table and discards
- * almost everything afterwards. Measured on an 800k-row corpus: 171,522
- * shared buffer hits per arm uncorrected vs 416 corrected (412x), and the
+ * almost everything afterwards. Measured on an 800k-row corpus: 171,517
+ * shared buffer hits per arm uncorrected vs 405 corrected (423x), and the
  * uncorrected index is 2-10x SLOWER than the native tsvector+GIN comparator.
  *
  * THE FIX: append `(bank_id::pdb.literal), (fact_type::pdb.literal)` to the
@@ -336,7 +336,7 @@ check = getattr(pgs, "check_pg_search_filter_field_drift", None) if pgs else Non
 if check is None:
     fail(
         "NO FILTER-FIELD DRIFT DETECTOR: an index that cannot push bank_id/fact_type "
-        "down is adopted silently and the 412x buffer amplification is invisible"
+        "down is adopted silently and the 423x buffer amplification is invisible"
     )
 else:
     record = check(LIVE_STEMMED, "memory_units", index_name="idx")

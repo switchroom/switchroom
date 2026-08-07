@@ -714,16 +714,16 @@ PYEOF
 # distribution, real recall arm shape, EXPLAIN (ANALYZE, BUFFERS, VERBOSE):
 #
 #   uncorrected  Tantivy Query carries
-#                  "field_filters":[{"heap_filter":"(bank_id = 'bank-A'::text)"}]
+#                  "field_filters":[{"heap_filter":"(bank_id = 'bank-01'::text)"}]
 #                  "field_filters":[{"heap_filter":"(fact_type = 'world'::text)"}]
-#                Buffers: shared hit=171522     Execution Time 253.923 ms
+#                Buffers: shared hit=171517     Execution Time 231.436 ms
 #
 #   corrected    Tantivy Query carries
-#                  {"term":{"field":"bank_id","value":"bank-A"}}
+#                  {"term":{"field":"bank_id","value":"bank-01"}}
 #                  {"term":{"field":"fact_type","value":"world"}}
-#                Buffers: shared hit=416        Execution Time   7.553 ms
+#                Buffers: shared hit=405        Execution Time   7.807 ms
 #
-# 412x fewer buffers, 33.6x faster, IDENTICAL result sets (120 queries / 4,362
+# 423x fewer buffers, 29.6x faster, IDENTICAL result sets (120 queries / 4,362
 # rows: 0 rows added, 0 dropped, 0 score changes, 0 rank changes) — the filter
 # moved, it did not narrow.
 #
