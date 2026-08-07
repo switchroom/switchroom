@@ -30,6 +30,7 @@ import {
   getHindsightContainerEnv,
   getHindsightImageEnv,
   hindsightContainerEnvPairs,
+  hindsightMemBudgetWarningFor,
   hindsightResolvedCapabilities,
   preflightHindsightPorts,
   getHindsightDeviceRequests,
@@ -1042,8 +1043,15 @@ export function registerMemoryCommand(program: Command): void {
           // disagree with the guard that just cleared it — the exact class of
           // silent divergence this PR exists to close.
           gpuDecision.enabled,
-          // Operator overrides for the capability-gated performance defaults.
-          { env: hindsightConfig.hindsight?.env },
+          // Operator overrides for the capability-gated performance defaults,
+          // plus the container's memory cap (`hindsight.mem_limit`). Without
+          // that last one every `--recreate` silently reset the cap to the
+          // hard-coded default while leaving the operator's `shared_buffers`
+          // standing — see resolveHindsightMemLimit.
+          {
+            env: hindsightConfig.hindsight?.env,
+            memLimit: hindsightConfig.hindsight?.mem_limit,
+          },
           // Resolved `hindsight.cp_access_key`. Absent ⇒ the CP dashboard has
           // no login, so hindsightCpAuthEnvPairs pins it to loopback.
           cpAccessKey,
@@ -1096,6 +1104,18 @@ export function registerMemoryCommand(program: Command): void {
         if (!cpAccessKey) {
           console.error(chalk.yellow(`# ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
         }
+        // The docker-run path warns from inside startHindsight(); the compose
+        // generator is a pure string builder, so its wrapper carries the same
+        // check. To stderr with a `#` prefix so a redirected stdout stays a
+        // valid compose file even under `2>&1` (same discipline as the
+        // secrets notice below).
+        {
+          const memWarning = hindsightMemBudgetWarningFor({
+            env: snippetConfig.hindsight?.env,
+            memLimit: snippetConfig.hindsight?.mem_limit,
+          });
+          if (memWarning) console.error(chalk.yellow(`# ! ${memWarning}`));
+        }
         // Resolve `vault:` api_key refs so the emitted compose file carries the
         // real credential — the same reason the docker-run path resolves them,
         // and the same shape the cp_access_key above already takes. An emitted
@@ -1125,7 +1145,12 @@ export function registerMemoryCommand(program: Command): void {
             hindsightGpuDecision(
               resolveHindsightGpuOverride({ config: snippetConfig.hindsight?.gpu }),
             ).enabled,
-            { env: snippetConfig.hindsight?.env },
+            // Same options object the docker-run path builds, so the emitted
+            // compose file caps the container exactly as `memory setup` would.
+            {
+              env: snippetConfig.hindsight?.env,
+              memLimit: snippetConfig.hindsight?.mem_limit,
+            },
             cpAccessKey,
           ),
         );

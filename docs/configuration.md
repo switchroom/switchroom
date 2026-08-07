@@ -756,6 +756,35 @@ hindsight:
 
 If you run your own Hindsight container outside `switchroom memory --start` (e.g. you point `memory.config.url` at an external server), switchroom doesn't manage that container's env — set the cap on your own image.
 
+### Memory cap for the Hindsight container (`hindsight.mem_limit`)
+
+The Hindsight container is created with a hard memory cap — docker `--memory` on the `switchroom memory setup` path, `mem_limit:` in the `switchroom memory docker-compose` snippet. The default is **16g**, and until this key existed that was also the *only* value: there was no config path at all.
+
+```yaml
+hindsight:
+  mem_limit: 24g          # a docker size string: 24g, 16384m, …
+  env:
+    SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS: 12288MB
+```
+
+It is a first-class field rather than a `hindsight.env` key on purpose: `env` is the map of variables switchroom **emits into** the container, and the memory cap is a docker `HostConfig.Memory` flag consumed by the daemon — no process inside the container ever sees it.
+
+**Move it together with `shared_buffers`.** They are one decision, not two knobs. Hindsight's embedded PostgreSQL runs with `shared_memory_type=mmap`, so `shared_buffers` is charged to the container's cgroup as **unreclaimable** anonymous memory: whatever you give the buffer pool is subtracted from the cap before anything else in the container gets a byte. The container still has to hold its ~2.5 GiB app working set (API process, embedder, cross-encoder, next-server) plus a page-cache floor on top of that.
+
+The failure this key removes is the asymmetry, not the number. `shared_buffers` was configurable (a managed `hindsight.env` key); the cap was not. So an operator who raised the live container's cap by hand to fit a larger buffer pool had it silently reverted to 16g by the **next `switchroom memory setup --recreate`**, while their `shared_buffers` stayed exactly where they had put it — leaving Postgres pinning most of its own cgroup, with no warning anywhere. Setting `hindsight.mem_limit` makes the cap survive a recreate like every other configured value.
+
+Switchroom now also **warns** when the resolved cap does not clear the resolved `shared_buffers` by at least the app working set plus the page-cache floor (4608 MiB — the same arithmetic the shipped defaults are derived from). The warning names both numbers and both keys, and fires on the launch path itself, so a `--recreate` that puts the container into that state says so:
+
+```
+! hindsight: container memory cap 16g (16 GiB) leaves only 4 GiB above shared_buffers
+  12288MB (12 GiB) — … Raise `hindsight.mem_limit` to at least 17 GiB, or lower
+  `hindsight.env.SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS`.
+```
+
+It is a **warning, not a refusal**, deliberately: the dangerous state is reached by a default re-asserting itself, so hard-failing there would turn "the memory container is badly sized" into "the fleet has no memory container at all". Two things *are* rejected outright: a malformed size string (by the schema at `switchroom apply`, and again at launch rather than silently falling back to the default), and a cap below the container's 4g memory *reservation* — docker will not create such a container, and its own rejection is late and opaque.
+
+Both launch paths resolve the cap from one place, so the `docker run` and `--compose` outputs cannot disagree. Changing it takes effect on the next container recreate (`switchroom memory setup --recreate`), not live.
+
 ### Logging in to the Hindsight dashboard (`hindsight.cp_access_key`)
 
 The Hindsight container also serves a **control-plane dashboard** (Next.js, host port 9999) alongside the memory API. That dashboard's login is armed by exactly one thing — upstream's `HINDSIGHT_CP_ACCESS_KEY`. When the variable is unset the access-key middleware short-circuits and lets every request through: the dashboard is not weakly protected, it has **no authentication at all**.

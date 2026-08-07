@@ -219,6 +219,151 @@ export function pgMib(mib: number): string {
 }
 
 /**
+ * `shared_buffers` pg0 itself starts with when switchroom's `-c` flag is
+ * omitted — the sentinel `off` case. Read off the live argv quoted in the
+ * module header (`-c shared_buffers=256MB`).
+ */
+export const HINDSIGHT_PG0_FALLBACK_SHARED_BUFFERS_MIB = 256;
+
+/**
+ * Parse a **docker** size string (`16g`, `512m`, `2G`, `1024`, `2gb`) to MiB.
+ *
+ * Docker's own parser is base-1024 and treats a bare number as BYTES; a bare
+ * number is almost always an operator mistake at this scale, so it is parsed
+ * faithfully rather than being second-guessed. Returns `null` for anything
+ * unparseable so callers can degrade instead of asserting a wrong number.
+ */
+export function parseDockerSizeToMib(size: string): number | null {
+  const m = size.trim().match(/^(\d+(?:\.\d+)?)\s*([bkmgt])?b?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return null;
+  switch ((m[2] ?? "b").toLowerCase()) {
+    case "b":
+      return n / (1024 * 1024);
+    case "k":
+      return n / 1024;
+    case "m":
+      return n;
+    case "g":
+      return n * 1024;
+    case "t":
+      return n * 1024 * 1024;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Parse a **PostgreSQL** memory-parameter value (`6144MB`, `4GB`, `256MB`,
+ * `off`, or a bare block count) to MiB.
+ *
+ * Two shapes that are NOT docker's:
+ *  - a bare integer is a count of 8 kB blocks (postgres' `BLCKSZ`), not bytes;
+ *  - the sentinel `off` means switchroom omits the `-c` flag entirely, so the
+ *    effective value is pg0's own {@link HINDSIGHT_PG0_FALLBACK_SHARED_BUFFERS_MIB}.
+ *
+ * Returns `null` when the string is not a size switchroom can reason about.
+ */
+export function parsePgSizeToMib(value: string): number | null {
+  const raw = value.trim();
+  if (raw.toLowerCase() === "off") return HINDSIGHT_PG0_FALLBACK_SHARED_BUFFERS_MIB;
+  const m = raw.match(/^(\d+(?:\.\d+)?)\s*(kB|MB|GB|TB)?$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return null;
+  switch ((m[2] ?? "").toUpperCase()) {
+    case "":
+      // Bare number = 8 kB blocks.
+      return (n * 8) / 1024;
+    case "KB":
+      return n / 1024;
+    case "MB":
+      return n;
+    case "GB":
+      return n * 1024;
+    case "TB":
+      return n * 1024 * 1024;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Non-`shared_buffers` memory the container must still be left, in MiB.
+ *
+ * Not a new number: it is exactly the two reservations the budget derivation
+ * above already subtracts out of the ceiling — the app's anonymous working set
+ * and the page-cache floor. Stating it as its own constant lets the runtime
+ * check use the SAME arithmetic the compile-time budget uses, so the two can
+ * never disagree about what "comfortably larger" means.
+ */
+export const HINDSIGHT_PG_MIN_NON_BUFFER_MIB =
+  HINDSIGHT_PG_APP_ANON_MIB + HINDSIGHT_PG_PAGE_CACHE_FLOOR_MIB;
+
+/** Render a MiB figure the way an operator reads a docker cap. */
+function mib(n: number): string {
+  return n >= 1024 && n % 1024 === 0 ? `${n / 1024} GiB` : `${Math.round(n)} MiB`;
+}
+
+/**
+ * Is this container cap comfortably larger than the `shared_buffers` it is
+ * configured to pin? Returns a ready-to-print warning, or `null` when safe.
+ *
+ * ## Why this check exists
+ *
+ * {@link HINDSIGHT_PG_SHARED_BUFFERS_BUDGET_MIB} is a COMPILE-TIME budget: it
+ * is derived from a literal 16 GiB ceiling and pinned by a test. That protects
+ * the pair of numbers checked into this repo, and nothing else. Once the cap
+ * and `shared_buffers` are both operator-configurable they can be moved
+ * independently, at different times, by different mechanisms — and the
+ * observed failure is exactly that: an operator raised the live container to
+ * 24 GiB to fit a 12 GiB `shared_buffers`, and the next
+ * `switchroom memory setup --recreate` put the cap back to the hard-coded
+ * 16 GiB default while leaving the 12 GiB buffer pool configured inside the
+ * container. Postgres came back up pinning 75% of its cgroup as unreclaimable
+ * shared memory, with no warning anywhere.
+ *
+ * **Warn, do not fail.** Two reasons, and they point the same way:
+ *  1. The dangerous state is reached by a DEFAULT re-asserting itself, not by
+ *     a bad operator edit. Hard-failing there turns "the memory container is
+ *     badly sized" into "the fleet has no memory container at all", which is
+ *     strictly worse for every agent on the host.
+ *  2. The headroom figure is a heuristic (a measured anon working set plus a
+ *     page-cache floor), not a hard kernel limit. A heuristic should not be
+ *     able to brick `switchroom setup` on a host whose workload the heuristic
+ *     was not measured against.
+ *
+ * The warning names both numbers and the key to change, which is the whole
+ * point: the previous behaviour named neither.
+ */
+export function hindsightMemBudgetWarning(input: {
+  /** Resolved docker memory cap, as it will be handed to docker (`16g`). */
+  memLimit: string;
+  /** Resolved `shared_buffers`, as it will be handed to pg0 (`12288MB`). */
+  sharedBuffers: string;
+}): string | null {
+  const capMib = parseDockerSizeToMib(input.memLimit);
+  const bufMib = parsePgSizeToMib(input.sharedBuffers);
+  // Unparseable on either side: say nothing rather than assert a wrong number.
+  // The schema regex is what rejects a malformed `hindsight.mem_limit`.
+  if (capMib === null || bufMib === null) return null;
+  const headroom = capMib - bufMib;
+  if (headroom >= HINDSIGHT_PG_MIN_NON_BUFFER_MIB) return null;
+  return (
+    `hindsight: container memory cap ${input.memLimit} (${mib(capMib)}) leaves only ` +
+    `${mib(Math.max(headroom, 0))} above shared_buffers ${input.sharedBuffers} ` +
+    `(${mib(bufMib)}) — Postgres pins that buffer pool as unreclaimable shared ` +
+    `memory, so the container needs at least ${mib(HINDSIGHT_PG_MIN_NON_BUFFER_MIB)} ` +
+    `beyond it (${mib(HINDSIGHT_PG_APP_ANON_MIB)} app working set + ` +
+    `${mib(HINDSIGHT_PG_PAGE_CACHE_FLOOR_MIB)} page-cache floor). Raise ` +
+    `\`hindsight.mem_limit\` to at least ` +
+    `${mib(Math.ceil((bufMib + HINDSIGHT_PG_MIN_NON_BUFFER_MIB) / 1024) * 1024)}, or lower ` +
+    "`hindsight.env.SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS`."
+  );
+}
+
+/**
  * Env var carrying the `effective_cache_size` the entrypoint should pass to
  * `pg0 start`. Empty / unset ⇒ the entrypoint skips that flag.
  */

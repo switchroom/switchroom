@@ -195,6 +195,10 @@ now an anomaly worth investigating, not the norm.
   changes to expect: the **ultraplan** feature is gone, and `/review` is now an
   alias for `/code-review`.
 
+### Hindsight
+
+- **`hindsight.mem_limit` — the container's memory cap is configurable, and a cap that cannot hold `shared_buffers` now says so** — the cap was a hard-coded `16g` with no config path, while `shared_buffers` (a managed `hindsight.env` key) was configurable. An operator who raised the live container to 24 GiB by hand to fit a 12 GiB buffer pool had it silently reverted to 16 GiB by the next `switchroom memory setup --recreate`, with the 12 GiB `shared_buffers` left standing inside it — Postgres pinning most of its own cgroup as unreclaimable shared memory, warned about nowhere. `hindsight.mem_limit` (a docker size string; absent → the unchanged `16g` default) now reaches docker `--memory` and the compose `mem_limit:` from one resolver, so the two launch paths cannot disagree, and it is honoured on first-run `switchroom setup` as well as on `memory setup`. It is a first-class field rather than an `env:` key because it is a docker `HostConfig.Memory` flag, not a variable emitted into the container. On top of the knob, every launch now checks the resolved cap against the resolved `shared_buffers` and warns — naming both numbers and both keys — when the cap does not clear the buffer pool by the app working set plus the page-cache floor (4608 MiB). Warning, not refusal: the dangerous state is a default re-asserting itself, and hard-failing there would leave the fleet with no memory container at all. A malformed size string is still rejected outright, at `switchroom apply` by the schema and at launch rather than silently falling back to the default.
+
 ## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
 
 ### Web tooling

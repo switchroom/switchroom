@@ -2796,6 +2796,28 @@ export const HindsightConfigSchema = z.object({
       "turn a GPU container into a CPU one). `--gpu`/`--no-gpu` on `memory " +
       "setup` override this for a single run.",
     ),
+  mem_limit: z
+    .string()
+    .regex(
+      /^\d+(\.\d+)?\s*[bkmgt]?b?$/i,
+      "hindsight.mem_limit must be a docker memory size, e.g. `24g` or `16384m`",
+    )
+    .optional()
+    .describe(
+      "Hard memory cap for the hindsight container — docker `--memory` on the " +
+      "`memory setup` path and `mem_limit:` in the emitted compose snippet. A " +
+      "docker size string (`24g`, `16384m`). Absent → switchroom's default " +
+      "(`HINDSIGHT_DEFAULT_MEM_LIMIT`, 16g). This is a docker HostConfig flag, " +
+      "not a container env var, which is why it is a first-class field here " +
+      "rather than an `env:` key. **Move it together with " +
+      "`env.SWITCHROOM_HINDSIGHT_PG_SHARED_BUFFERS`**: Postgres pins the " +
+      "buffer pool as unreclaimable shared memory inside this cap, so a cap " +
+      "that does not clear `shared_buffers` by the container's app working " +
+      "set plus its page-cache floor puts Postgres in a near-OOM " +
+      "configuration. switchroom warns, naming both numbers, when it does " +
+      "not. A value below the container's memory RESERVATION (4g) is " +
+      "rejected outright — docker will not create such a container.",
+    ),
   cp_access_key: z
     .string()
     .min(1)

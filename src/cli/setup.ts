@@ -1348,8 +1348,13 @@ export async function stepMemoryBackend(
       hindsightConsumerMirrorDir(config),
       // gpu: omitted ⇒ hindsightGpuEnabled() reads the persisted verdict.
       undefined,
-      // perf: omitted ⇒ the managed defaults, same as before.
-      undefined,
+      // The container's memory cap (`hindsight.mem_limit`, absent ⇒
+      // HINDSIGHT_DEFAULT_MEM_LIMIT) plus the `hindsight.env` overrides the
+      // cap is checked against — the shared_buffers-vs-cap warning is only
+      // honest when it can see the operator's shared_buffers override, and a
+      // knob honoured on `memory setup` but ignored on first-run `switchroom
+      // setup` would be the same silent divergence again.
+      { env: config.hindsight?.env, memLimit: config.hindsight?.mem_limit },
       // Resolved `hindsight.cp_access_key` — absent ⇒ loginless dashboard,
       // pinned to loopback by hindsightCpAuthEnvPairs.
       cpAccessKey,
