@@ -259,6 +259,13 @@ function buildTurnId(chatId, threadId, messageId) {
  */
 function buildBlockResult(envelope, reason, pendingText, hasTrailingProse, replyToolThrewThisTurn) {
   const block = { decided: 'block', reason }
+  // #4490: the enqueue envelope's RAW `source` tag, carried through exactly
+  // like `replyToolThrewThisTurn` above — the single-writer election needs it
+  // to derive `reviewOriginated` for the captured-prose bridge (the ELECTED
+  // path's deliverer, which never writes an outbox record and so has no other
+  // way to learn a review turn's provenance). Omitted when the envelope carried
+  // none, so a spread of a prior state file is never read as positive evidence.
+  if (envelope.source != null) block.source = envelope.source
   if (replyToolThrewThisTurn === true) block.replyToolThrewThisTurn = true
   // Single-writer election input (#duplicate-message fix): does ANY
   // non-empty, non-silent trailing text block exist after the last
@@ -360,7 +367,7 @@ function buildBlockResult(envelope, reason, pendingText, hasTrailingProse, reply
  * false-positive that burned retry budget on healthy turns.
  *
  * @param {string} jsonl
- * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, turnId?: string, chatId?: string, threadId?: number | null, pendingText?: string }}
+ * @returns {{ decided: 'allow' | 'block' | 'unknown', reason: string, turnKey?: string, turnId?: string, chatId?: string, threadId?: number | null, pendingText?: string, source?: string, replyToolThrewThisTurn?: boolean }}
  */
 export function scanTurnForFinalReply(jsonl) {
   const lines = jsonl.split('\n')

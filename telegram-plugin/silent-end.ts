@@ -82,6 +82,26 @@ export interface SilentEndState {
    * throw", which delivers exactly as before. It never suppresses.
    */
   replyToolThrewThisTurn?: boolean
+  /**
+   * #4490 — did the turn that produced `pendingText` originate from a
+   * self-improvement review inbound (`source="self_improve_review"`)?
+   *
+   * Stamped by the Stop hook's single-writer election
+   * (`silent-end-interrupt-stop.mjs` → `buildNextState`) from the SAME
+   * enqueue-envelope `source` tag `writeOutboxRecord` reads for the outbox
+   * capture path; the gateway's own `writeSilentEndState` never sets it.
+   * Consumed by `deliverCapturedProse` (`gateway/outbound-send-path.ts`),
+   * which is the ELECTED path's deliverer — it never writes an outbox record,
+   * so the sweep's audience gate / self-improvement framing can never reach
+   * this message, and this is the only way that machine can learn the
+   * provenance. Restores the #4141-style symmetry #4485 left one-sided (card
+   * gate + title framing applied at the sweep only).
+   *
+   * Optional and only ever `true`: absent means "no positive evidence of a
+   * review-origin turn", which delivers exactly as before. It never widens
+   * suppression on a normal user turn.
+   */
+  reviewOriginated?: boolean
 }
 
 export interface SilentEndDeps {
@@ -346,6 +366,15 @@ export interface CapturedProseDecision {
    * `true` only on positive evidence; never affects `deliver`.
    */
   replyToolThrewThisTurn?: boolean
+  /**
+   * #4490 — the persisted record says this turn originated from a
+   * self-improvement review inbound. Surfaced (not acted on) so
+   * `deliverCapturedProse` can apply the SAME card-gate / title-framing rules
+   * the outbox sweep applies. `true` only on positive evidence; never affects
+   * `deliver` here — the audience decision is made downstream, exactly as
+   * `replyToolThrewThisTurn`'s banner decision is.
+   */
+  reviewOriginated?: boolean
   /** Machine-readable reason (for logs / tests). */
   reason:
     | 'captured-prose'
@@ -426,17 +455,31 @@ export function decideCapturedProseDelivery(
     // AFTER every `deliver:false` gate above — the banner is a labelling
     // concern, and must never become an input to whether we deliver at all.
     ...(state.replyToolThrewThisTurn === true ? { replyToolThrewThisTurn: true } : {}),
+    // #4490: same discipline for the review-origin signal — placed after every
+    // `deliver:false` gate so it can never become an input to whether the
+    // (structurally different) "should we deliver at all" decision above
+    // fires. The caller decides suppression/framing from this raw flag.
+    ...(state.reviewOriginated === true ? { reviewOriginated: true } : {}),
   }
 }
 
 /**
  * Outcome of a captured-prose send attempt (Option A transcript-prose bridge).
- *   - `sent`         — the answer was delivered fresh this call.
- *   - `skipped-dedup`— the exact answer already went out (dedup hit); nothing
- *                      new was sent, but the answer IS with the user.
- *   - `failed`       — the send threw; the answer did NOT reach the user.
+ *   - `sent`               — the answer was delivered fresh this call.
+ *   - `skipped-dedup`      — the exact answer already went out (dedup hit);
+ *                            nothing new was sent, but the answer IS with the
+ *                            user.
+ *   - `failed`             — the send threw; the answer did NOT reach the
+ *                            user.
+ *   - `suppressed-internal`— #4490: the audience gate classified this prose
+ *                            as internal (a non-card self-improvement review
+ *                            turn) and it was never sent. Falls through the
+ *                            SAME close-obligation + clear-state bookkeeping
+ *                            as `sent` / `skipped-dedup` below — no operator
+ *                            is waiting on a message that was never meant to
+ *                            reach them, so there is nothing to recover.
  */
-export type CapturedProseSendOutcome = 'sent' | 'skipped-dedup' | 'failed'
+export type CapturedProseSendOutcome = 'sent' | 'skipped-dedup' | 'failed' | 'suppressed-internal'
 
 /**
  * The bookkeeping effects the gateway applies after a captured-prose send

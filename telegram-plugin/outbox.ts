@@ -77,6 +77,7 @@ import {
   shouldFrameReplyThrow,
   applySelfImprovementFraming,
   shouldFrameSelfImprovement,
+  isSelfImprovementCard,
 } from './hooks/audience-classify.mjs'
 
 export type { Audience }
@@ -643,9 +644,17 @@ export function decideOutboxSweep(input: {
   // it is applied AFTER the reply-throw banner — a review record that somehow
   // also threw reads "🔧 Self-improvement" first, then the provenance note, then
   // the prose. Additive only: it can never turn a send into a skip.
-  const selfImproveFramed = shouldFrameSelfImprovement(record, {
-    frameEnabled: selfImprovementFraming,
-  })
+  //
+  // #4489: idempotency is gated on the RAW `record.text`, NOT on `provenanceBody`.
+  // A real card's `record.text` opens with the title; the reply-throw banner
+  // above is PREPENDED in front of it, so `provenanceBody` no longer opens with
+  // the title even though the underlying card does. `applySelfImprovementFraming`
+  // alone can't see that — its idempotency check only looks at what it was
+  // handed — so gating the whole decision on the raw text is what keeps a real
+  // card from acquiring a second, duplicated title when both framings compose.
+  const selfImproveFramed =
+    shouldFrameSelfImprovement(record, { frameEnabled: selfImprovementFraming }) &&
+    !isSelfImprovementCard(record.text)
   const body = selfImproveFramed ? applySelfImprovementFraming(provenanceBody) : provenanceBody
   return {
     action: delayed ? 'send-delayed' : 'send',
