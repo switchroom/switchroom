@@ -565,6 +565,18 @@ _run_fallback("sqlstate_42704", _mk_pgerr('text search configuration "hindsight_
 _run_fallback("stopword_file", _mk_pgerr('could not open stop-word file "/x/hindsight_extra.stop": No such file or directory'), True)
 _run_fallback("config_msg", _mk_pgerr('text search configuration "public.hindsight_english" does not exist'), True)
 _run_fallback("unrelated_error", _mk_pgerr('relation "memory_units" does not exist', sqlstate="42P01"), False)
+# pg_search (ParadeDB BM25) index absent during the initial build window or a
+# REINDEX: XX000 + "<table> does not contain a USING bm25 index". Degrades.
+# Table-name-agnostic: reflections also uses a bm25 index, so match the stable
+# fragment, not the table name.
+_run_fallback("pg_search_no_bm25_index", _mk_pgerr('memory_units does not contain a USING bm25 index', sqlstate="XX000"), True)
+_run_fallback("pg_search_no_bm25_index_reflections", _mk_pgerr('reflections does not contain a USING bm25 index', sqlstate="XX000"), True)
+# The XX000 arm is gated on the SPECIFIC substring, not on XX000 alone (which is
+# Postgres internal_error, a catch-all). An unrelated XX000 must still propagate.
+_run_fallback("xx000_unrelated", _mk_pgerr('some other internal error', sqlstate="XX000"), False)
+# And the bm25 substring alone, under a different sqlstate, must still propagate:
+# the guard requires BOTH XX000 AND the substring.
+_run_fallback("bm25_msg_wrong_sqlstate", _mk_pgerr('memory_units does not contain a USING bm25 index', sqlstate="42P01"), False)
 
 _retr.RetrievalResult.from_db_row = _orig_from_db_row
 
@@ -786,6 +798,12 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain(
         "sqlstate_42704: recall raised Exception instead of degrading to semantic-only"
       );
+      // The pg_search "no bm25 index" signature (SQLSTATE XX000) also RAISES on
+      // unpatched upstream — this is the fail-CLOSED blocker this PR fixes.
+      expect(stdout).toMatch(/PGFALLBACK pg_search_no_bm25_index RAISED /);
+      expect(stdout).toContain(
+        "pg_search_no_bm25_index: recall raised Exception instead of degrading to semantic-only"
+      );
       // …but an unrelated error already propagates on upstream too (so the
       // patched behaviour for it is unchanged, not a new regression).
       expect(stdout).toMatch(/PGFALLBACK unrelated_error RAISED Exception '42P01'/);
@@ -875,9 +893,27 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("PGFALLBACK sqlstate_42704 RETURNED 2 ['sem-1']");
       expect(stdout).toContain("PGFALLBACK stopword_file RETURNED 2 ['sem-1']");
       expect(stdout).toContain("PGFALLBACK config_msg RETURNED 2 ['sem-1']");
+      // … including the pg_search "no bm25 index" signature (XX000), which now
+      // degrades to semantic-only during the initial build window / any REINDEX
+      // instead of 500ing every recall. Table-name-agnostic: memory_units AND
+      // reflections both degrade off the stable substring.
+      expect(stdout).toContain(
+        "PGFALLBACK pg_search_no_bm25_index RETURNED 2 ['sem-1']"
+      );
+      expect(stdout).toContain(
+        "PGFALLBACK pg_search_no_bm25_index_reflections RETURNED 2 ['sem-1']"
+      );
       // … while an UNRELATED error (undefined_table) still propagates, proving
       // the widened fallback is not a catch-all.
       expect(stdout).toMatch(/PGFALLBACK unrelated_error RAISED Exception '42P01'/);
+      // … and the XX000 arm is gated on the SPECIFIC substring, not XX000 alone
+      // (internal_error is a catch-all): an unrelated XX000 still propagates, and
+      // the bm25 substring under a different sqlstate still propagates — the
+      // guard requires BOTH to hold.
+      expect(stdout).toMatch(/PGFALLBACK xx000_unrelated RAISED Exception 'XX000'/);
+      expect(stdout).toMatch(
+        /PGFALLBACK bm25_msg_wrong_sqlstate RAISED Exception '42P01'/
+      );
     }, 240_000);
   }
 );
