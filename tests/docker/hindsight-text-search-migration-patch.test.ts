@@ -44,6 +44,16 @@
  *  6. AN INDEX-ONLY REBUILD MUST NOT DISCARD A POPULATED COLUMN. Upstream's
  *     reconcile loop drops `search_vector` unconditionally, which is safe only
  *     while (1) makes an index-only rebuild unreachable.
+ *  7. THE PRODUCTION SHAPE ITSELF. (1)-(6) each isolate one defect; none of
+ *     them is the migration the operator procedure actually performs — a
+ *     populated `memory_units` carrying a tsvector column under a live GIN
+ *     index, flipped to pg_search. (2) is that shape at zero rows and (3) is
+ *     it on the 43-row `mental_models`, so the row-count arm of the guard was
+ *     never exercised on the real table. S7 covers it end to end at the
+ *     fleet's actual row count, and pins the ORDER of the repair — stale index
+ *     before its column, CREATE EXTENSION before the BM25 build that needs the
+ *     `pdb` schema — plus the #4478 filter-pushdown fast fields on the
+ *     rebuilt index.
  *
  * The probe drives the REAL shipping `ensure_text_search_extension` with a
  * fake ONLY at the SQLAlchemy boundary (`create_engine` / `to_libpq_url`): the
@@ -130,13 +140,14 @@ function patchBlocks(): string[] {
 }
 
 /**
- * The Python probe. Exits 0 only when all six properties above hold, and
+ * The Python probe. Exits 0 only when all seven properties above hold, and
  * prints the offending assertions otherwise. It asserts OUTCOMES: it runs the
  * real `ensure_text_search_extension` and reads back the DDL it emitted and
  * the exceptions it raised.
  */
 const PROBE = String.raw`
 import json
+import re
 import sys
 
 import hindsight_api.migrations as M
@@ -264,6 +275,37 @@ else:
         fail("S1: the missing BM25 index was not rebuilt: %s" % ddl(conn))
     if "DROP COLUMN" in ddl(conn):
         fail("S1: an index-only rebuild dropped the search_vector column: %s" % ddl(conn))
+    # The rebuild must come back with the #4478 filter-pushdown fast fields.
+    # "USING bm25" alone would still pass with the pushdown columns silently
+    # dropped, which is exactly the regression pg_search_rebuild_bm25_columns
+    # exists to prevent: it re-emits pg_search_filter_fields(table) on EVERY
+    # branch because they encode the recall arm's WHERE shape, not a tokenizer
+    # choice. Structural match, not an exact string: postgres RENDERS the stored
+    # indexdef as ((bank_id)::pdb.literal) while the emitted DDL is
+    # (bank_id::pdb.literal), and the whitespace here is the f-string's.
+    _s1 = ddl(conn)
+    for _col in ("bank_id", "fact_type"):
+        if not re.search(r"\(+%s\)?::pdb\.literal" % _col, _s1):
+            fail(
+                "PUSHDOWN LOST: the rebuilt memory_units BM25 index omits the #4478 "
+                "%s::pdb.literal filter fast field, so the recall arm's = predicate "
+                "falls back to a post-scoring heap_filter -> %s" % (_col, _s1)
+            )
+    if not re.search(r"key_field='?id'?", _s1):
+        fail("S1: the rebuilt BM25 index has no key_field=id reloption -> %s" % _s1)
+    # …and the whole column list, in order. FakeConn already collapsed the
+    # f-string's newlines, so this is order-sensitive without being
+    # whitespace-brittle.
+    if not re.search(
+        r"CREATE INDEX idx_memory_units_text_search ON public\.memory_units USING bm25 "
+        r"\( *id, *text, *context, *text_signals, *\(+bank_id\)?::pdb\.literal\), *"
+        r"\(+fact_type\)?::pdb\.literal\) *\)",
+        _s1,
+    ):
+        fail(
+            "S1: the rebuilt memory_units index is not the known-good BM25 shape "
+            "(id, text, context, text_signals, bank_id::pdb.literal, fact_type::pdb.literal) -> %s" % _s1
+        )
 
 # --- S2. NOBODY CREATES THE EXTENSION -----------------------------------------
 # Empty table so upstream reaches the pg_search branch: it emits CREATE INDEX
@@ -353,6 +395,52 @@ else:
         fail("DATA LOSS: the populated tsvector column is dropped and recreated empty on an index-only rebuild -> %s" % d)
     if "USING gin" not in d:
         fail("S6: the GIN index was not rebuilt -> %s" % d)
+
+# --- S7. THE PRODUCTION SHAPE: native -> pg_search on a POPULATED table ---------
+# This is the migration the operator procedure actually performs, and until now
+# no scenario covered it. S2 is this shape at rows=0 (so the guard is trivially
+# satisfied) and S3 is it on mental_models at 43 rows; neither exercises the
+# real one — memory_units carrying a populated tsvector under a live GIN index,
+# at the fleet's actual row count. The guard must NOT fire (pg_search keeps
+# search_vector as a dummy, so recreating it loses nothing), and the full repair
+# sequence must be emitted in the only order that works.
+err, conn = run(
+    {"memory_units": {"udt_name": "tsvector", "am": "gin", "indexdef": IDX_GIN, "rows": BIG}},
+    "pg_search",
+)
+print("S7_ERR", repr(err))
+print("S7_DDL", ddl(conn))
+if err is not None:
+    fail(
+        "S7: the real native -> pg_search migration on %d rows RAISED instead of migrating -> %r"
+        % (BIG, err)
+    )
+else:
+    d = ddl(conn)
+    # Order is load-bearing end to end: the stale GIN index must go before its
+    # column; the tsvector column must go before the TEXT one replaces it; and
+    # CREATE EXTENSION must precede the BM25 build or the pdb schema the
+    # ParadeDB casts live in does not exist yet.
+    _seq = [
+        ("DROP INDEX IF EXISTS public.idx_memory_units_text_search", "drop the stale GIN index"),
+        ("ALTER TABLE public.memory_units DROP COLUMN IF EXISTS search_vector", "drop the tsvector column"),
+        ("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE", "install pg_search"),
+        ("ALTER TABLE public.memory_units ADD COLUMN IF NOT EXISTS search_vector TEXT", "add the dummy TEXT column"),
+        ("USING bm25", "build the BM25 index"),
+    ]
+    _at = -1
+    for _needle, _what in _seq:
+        _i = d.find(_needle)
+        if _i < 0:
+            fail("S7: the migration never emitted the step to %s -> %s" % (_what, d))
+            break
+        if _i < _at:
+            fail("S7: the step to %s is emitted out of order -> %s" % (_what, d))
+            break
+        _at = _i
+    else:
+        if not re.search(r"\(+bank_id\)?::pdb\.literal", d):
+            fail("S7: the production migration builds a BM25 index without the #4478 pushdown fields -> %s" % d)
 
 print("FAILURES", json.dumps(failures))
 print("PROBE_EXECUTED")
@@ -529,9 +617,16 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toMatch(
         /S6_ERR .*Cannot change text search extension from native to native/,
       );
+      // 7. and the migration the operator procedure actually performs — a
+      //    populated native memory_units to pg_search — is fatal too, which is
+      //    the whole reason the documented runbook could not work.
+      expect(stdout).toMatch(
+        /S7_ERR .*Cannot change text search extension from native to pg_search/,
+      );
+      expect(stdout).toMatch(/^S7_DDL\s*$/m); // no repair DDL at all
     }, 300_000);
 
-    it("upstream + the baked patch block is GREEN on all six properties", () => {
+    it("upstream + the baked patch block is GREEN on all seven properties", () => {
       const { status, stdout } = runProbe(true);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
@@ -563,6 +658,18 @@ describe.skipIf(!dockerOk || !imageOk)(
       // 6. an index-only rebuild keeps the populated tsvector column.
       expect(stdout).toMatch(/S6_DDL .*USING gin/);
       expect(stdout).not.toMatch(/S6_DDL .*DROP COLUMN/);
+      // 7. the production migration — populated native memory_units to
+      //    pg_search — completes, in the only order that works.
+      expect(stdout).toMatch(/S7_ERR None/);
+      expect(stdout).toMatch(
+        /S7_DDL .*DROP INDEX IF EXISTS public\.idx_memory_units_text_search.*DROP COLUMN IF EXISTS search_vector.*CREATE EXTENSION IF NOT EXISTS pg_search CASCADE.*ADD COLUMN IF NOT EXISTS search_vector TEXT.*USING bm25/,
+      );
+      // …and the rebuilt index keeps the #4478 filter-pushdown fast fields, on
+      // BOTH the in-place rebuild (S1) and the full production migration (S7).
+      expect(stdout).toMatch(/S1_DDL .*bank_id\)?::pdb\.literal/);
+      expect(stdout).toMatch(/S1_DDL .*fact_type\)?::pdb\.literal/);
+      expect(stdout).toMatch(/S1_DDL .*key_field='id'/);
+      expect(stdout).toMatch(/S7_DDL .*bank_id\)?::pdb\.literal/);
     }, 300_000);
   },
 );
