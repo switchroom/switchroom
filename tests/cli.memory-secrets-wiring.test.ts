@@ -182,6 +182,31 @@ describe("registerMemoryCommand wiring (#4486, #4487)", () => {
     expect(process.exitCode ?? 0).toBe(0);
   });
 
+  it("warns when a `vault:` LLM api_key ref is DROPPED on `memory setup --recreate` (#4473, preserved through the #4487 reconcile)", async () => {
+    // #4473 landed independently of #4486/#4487 and wired
+    // diffDroppedHindsightLlmVaultKeys into this same action for a DIFFERENT
+    // failure mode (a `vault:` ref that fails to resolve is silently dropped,
+    // not a resolved secret reaching stdout). The #4487 rebase touched the
+    // docker-compose action only — this pins that the --recreate warning
+    // wiring survived the reconcile untouched.
+    mocks.getViaBrokerStructured.mockResolvedValue({
+      kind: "denied",
+      code: "VAULT-BROKER-DENIED",
+      msg: "no grant for this key",
+    });
+
+    await buildProgram(configPath).parseAsync(["memory", "setup", "--recreate"], {
+      from: "user",
+    });
+
+    const out = logs.join("\n");
+    expect(out).toMatch(/dropped|vault:litellm\/gpt-oss-key/i);
+    const llmArg = mocks.startHindsight.mock.calls[0]?.[3] as { api_key?: string } | undefined;
+    // The fail-safe: a ref that can't be resolved must not be baked in
+    // literally either — it's dropped (undefined), not passed through raw.
+    expect(llmArg?.api_key).toBeUndefined();
+  });
+
   // ─── #4487: memory docker-compose --resolve-secrets ────────────────────
 
   it("`memory docker-compose` (no flag) emits the `vault:` ref UNRESOLVED, with a note, and never touches the broker", async () => {
