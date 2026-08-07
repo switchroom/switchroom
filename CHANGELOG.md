@@ -15,37 +15,7 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
-### Benchmarking
-
-- **`switchroom hindsight-bench` — a model-free harness that measures Hindsight recall latency against bank size and concurrency (#4475)** — #4474's goal ("consistent latency across any bank size, including under contention") was unfalsifiable: there was no number to move, so every later phase would have shipped on assertion. The new verb sweeps recall across banks and concurrency levels, reports nearest-rank p50/p95/p99 with variance, sample and error counts (errors never fold into percentiles — a timeout is not a fast call), and reduces two runs to a PASS/FAIL verdict (`0` pass · `1` verdict failed · `2` could not run). Every psql session is clamped read-only via `PGOPTIONS` and the clamp is *verified* by requiring Postgres to reject a real `CREATE TEMP TABLE`; cells with no samples or a >10 % error rate are classified ungradeable, named in the report, and block a pass, so a partly-broken run can no longer be graded on whichever cells survived. The opt-in `--contention` generator degrades the live box deliberately (documented blast radius, conservative defaults, load backends bounded by an in-SQL deadline plus a signal-wired terminate sweep) and confirms its own backends attached rather than silently measuring an idle box. Additive: one new CLI verb and its registration, zero model tokens, no change to any existing code path. Baseline captured in `docs/baselines/hindsight-recall-2026-08-07/`, with AC1 (±10 % reproducibility) reported as FAILED — at these sample counts the p95 estimator's own bootstrap interval is wider than the gate — and AC4 (contention moves the tail) PASSED, measured A/B/A.
-
-### Hindsight / LiteLLM metering
-
-- **A dropped LiteLLM routing key no longer silently unmeters Hindsight, and the routing env has ONE derivation** — `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` (what makes Hindsight's LLM traffic transit the proxy and land in `LiteLLM_SpendLogs` as `end_user=hindsight`) were built from a duplicated literal in `hindsightContainerEnvPairs` (docker-run / `memory setup --recreate`) and again in `generateHindsightComposeSnippet`; both now come from one `hindsightLiteLlmEnvPairs` helper, which also fails closed on a blank key instead of baking an empty `Bearer `. Separately, the resolver behind those launch paths collapsed "LiteLLM is off", "the broker denied the key" and "the broker is down" into one bare `undefined` — and was itself a verbatim copy in both `src/cli/memory.ts` and `src/cli/setup.ts` — so a denied grant launched Hindsight with no routing env, no warning, and unmetered spend (observed 2026-08-07). `resolveHindsightLiteLlm` now distinguishes those cases and returns the dropped `vault:` reference (never the secret), which both launch paths print as a warning alongside the existing `cp_access_key` / LLM-api_key drop warnings — naming it as a broker-grant failure rather than the operator env drift the ENV DRIFT report makes it look like.
-
-### Self-improvement
-
-- **Label review-turn messages, stop raw-reasoning leaks to the operator** — a silent self-improvement review turn's mid-turn reasoning could be captured by the outbox backstop and delivered into the operator's DM as a raw, unlabelled message. A review turn now has exactly one sanctioned operator-facing output: a well-formed self-improvement card (a message opening with `🔧 **Self-improvement**`). The backstop delivers a review-originated record only when its text is that card; all other trailing prose classifies `internal` and is suppressed. Detection is deterministic on the synthesized inbound's `source="self_improve_review"` tag plus an exact card-title prefix, never a prose-shape heuristic. A residual title-framing layer (behind `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING`) prepends the title if a non-card review record ever reaches delivery with the audience gate off, so review reasoning can never appear unlabelled. The review prompt now locks the exact card shape (Signal / Suggestion / Status) and instructs silence on a no-op turn.
-- **Close the same leak on the live send path (#4490)** — the outbox sweep's card gate above never protected the LIVE/elected send path (`deliverCapturedProse`): when a review turn's own reply call threw, the single-writer election deferred to that bridge instead of the outbox, and the bridge had no audience gate or title framing at all, so a non-card review turn's raw reasoning could still reach the operator's DM. `reviewOriginated` provenance is now threaded from the transcript scan through the Stop hook's elected-state file into `deliverCapturedProse`, which applies the SAME shared card-gate / title-framing predicates the sweep uses — no parallel implementation, one shared decision on both delivery paths.
-- **Fix a duplicated title on a review record that is both a card and a reply-throw (#4489)** — `decideOutboxSweep` applied the self-improvement title-framing decision on the ALREADY provenance-banner-composed body, so a real card lost its own idempotency check (which only inspects what it was handed) and picked up a second title. The framing decision now gates on the raw record text.
-
-### Release process
-
-- **Enforce a continuously-staged CHANGELOG `## Unreleased` section:** every PR
-  that changes shippable code (`src`, the Telegram plugin, `bin`, `docker`,
-  `profiles`, `skills`, the vendored hindsight tree, CI workflows) must now add
-  an entry under `## Unreleased`, enforced deterministically by
-  `scripts/check-changelog-entry.mjs` as part of `npm run lint`. Docs/chore/
-  test-only PRs opt out with a `no-changelog` label or a `[skip changelog]`
-  token on its own line in the PR body or a commit message. This makes cutting a release a
-  trivial rename of this header instead of reconstructing the whole section
-  from `git log` at release time (as v0.20.12 had to).
-
-### Memory CLI secret hygiene
-
-- **`memory docker-compose` no longer prints live secrets to stdout by default (#4487)** — the compose snippet now emits `vault:` refs unresolved, plus a note, unless the new `--resolve-secrets` flag is passed; `cp_access_key` follows the same rule. Closes the follow-up from #4471, which correctly wired `vault:` resolution into the snippet emit site but changed the command to print a live `sk-…` key on an operator-invoked command whose stdout is routinely pasted around.
-- **`memory setup --recreate` vault-ref wiring now has a direct test (#4486)** — adds the first `registerMemoryCommand` test harness and a wiring assertion pinning that the `--recreate` launch path (the one that caused the 2026-08-06 outage) resolves `hindsight.llm` `vault:` refs before they reach `startHindsight`.
-- **The cleartext-secrets warning now fires on every path that actually emits one** — it is decided ONCE, from the values about to be printed rather than from the flag, so `--resolve-secrets` (the only path that emits a live `sk-…` key) can never warn LESS than the safe default does; a PLAINTEXT api_key written straight into `switchroom.yaml`, which no `vault:` gate ever applied to, is warned about too; and a snippet carrying only unresolved `vault:` refs stays quiet, since a `vault:…` string is not a secret and crying wolf there would devalue the warning where it matters.
+## v0.20.13 — ParadeDB pg_search BM25 keyword recall, `vault:` secrets resolved off the apply path, and recall quality as a gating number
 
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)
 
@@ -136,6 +106,20 @@ now an anomaly worth investigating, not the norm.
   under `2>&1`, while an interactive operator is told the output is
   secret-bearing.
 
+### Memory CLI secret hygiene
+
+- **`memory docker-compose` no longer prints live secrets to stdout by default (#4487)** — the compose snippet now emits `vault:` refs unresolved, plus a note, unless the new `--resolve-secrets` flag is passed; `cp_access_key` follows the same rule. Closes the follow-up from #4471, which correctly wired `vault:` resolution into the snippet emit site but changed the command to print a live `sk-…` key on an operator-invoked command whose stdout is routinely pasted around.
+- **`memory setup --recreate` vault-ref wiring now has a direct test (#4486)** — adds the first `registerMemoryCommand` test harness and a wiring assertion pinning that the `--recreate` launch path (the one that caused the 2026-08-06 outage) resolves `hindsight.llm` `vault:` refs before they reach `startHindsight`.
+- **The cleartext-secrets warning now fires on every path that actually emits one** — it is decided ONCE, from the values about to be printed rather than from the flag, so `--resolve-secrets` (the only path that emits a live `sk-…` key) can never warn LESS than the safe default does; a PLAINTEXT api_key written straight into `switchroom.yaml`, which no `vault:` gate ever applied to, is warned about too; and a snippet carrying only unresolved `vault:` refs stays quiet, since a `vault:…` string is not a secret and crying wolf there would devalue the warning where it matters.
+
+### Hindsight / LiteLLM metering
+
+- **A dropped LiteLLM routing key no longer silently unmeters Hindsight, and the routing env has ONE derivation** — `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` (what makes Hindsight's LLM traffic transit the proxy and land in `LiteLLM_SpendLogs` as `end_user=hindsight`) were built from a duplicated literal in `hindsightContainerEnvPairs` (docker-run / `memory setup --recreate`) and again in `generateHindsightComposeSnippet`; both now come from one `hindsightLiteLlmEnvPairs` helper, which also fails closed on a blank key instead of baking an empty `Bearer `. Separately, the resolver behind those launch paths collapsed "LiteLLM is off", "the broker denied the key" and "the broker is down" into one bare `undefined` — and was itself a verbatim copy in both `src/cli/memory.ts` and `src/cli/setup.ts` — so a denied grant launched Hindsight with no routing env, no warning, and unmetered spend (observed 2026-08-07). `resolveHindsightLiteLlm` now distinguishes those cases and returns the dropped `vault:` reference (never the secret), which both launch paths print as a warning alongside the existing `cp_access_key` / LLM-api_key drop warnings — naming it as a broker-grant failure rather than the operator env drift the ENV DRIFT report makes it look like.
+
+### Hindsight container memory cap
+
+- **`hindsight.mem_limit` — the container's memory cap is configurable, and a cap that cannot hold `shared_buffers` now says so** — the cap was a hard-coded `16g` with no config path, while `shared_buffers` (a managed `hindsight.env` key) was configurable. An operator who raised the live container to 24 GiB by hand to fit a 12 GiB buffer pool had it silently reverted to 16 GiB by the next `switchroom memory setup --recreate`, with the 12 GiB `shared_buffers` left standing inside it — Postgres pinning most of its own cgroup as unreclaimable shared memory, warned about nowhere. `hindsight.mem_limit` (a docker size string; absent → the unchanged `16g` default) now reaches docker `--memory` and the compose `mem_limit:` from one resolver, so the two launch paths cannot disagree, and it is honoured on first-run `switchroom setup` as well as on `memory setup`. It is a first-class field rather than an `env:` key because it is a docker `HostConfig.Memory` flag, not a variable emitted into the container. On top of the knob, every launch now checks the resolved cap against the resolved `shared_buffers` and warns — naming both numbers and both keys — when the cap does not clear the buffer pool by the app working set plus the page-cache floor (4608 MiB). Warning, not refusal: the dangerous state is a default re-asserting itself, and hard-failing there would leave the fleet with no memory container at all. A malformed size string is still rejected outright, at `switchroom apply` by the schema and at launch rather than silently falling back to the default.
+
 ### Recall quality is now a measurable, gating number
 
 - **Recall-quality regression suite (#4484)** — the strongest datapoint in the
@@ -156,6 +140,18 @@ now an anomaly worth investigating, not the norm.
   query built purely from `hindsight_english` stopwords plus the corpus
   boilerplate (`claude`, `code`, `agent`, `assistant`, `user`, `switchroom`,
   `sidechain`).
+
+### Benchmarking
+
+- **`switchroom hindsight-bench` — a model-free harness that measures Hindsight recall latency against bank size and concurrency (#4475)** — #4474's goal ("consistent latency across any bank size, including under contention") was unfalsifiable: there was no number to move, so every later phase would have shipped on assertion. The new verb sweeps recall across banks and concurrency levels, reports nearest-rank p50/p95/p99 with variance, sample and error counts (errors never fold into percentiles — a timeout is not a fast call), and reduces two runs to a PASS/FAIL verdict (`0` pass · `1` verdict failed · `2` could not run). Every psql session is clamped read-only via `PGOPTIONS` and the clamp is *verified* by requiring Postgres to reject a real `CREATE TEMP TABLE`; cells with no samples or a >10 % error rate are classified ungradeable, named in the report, and block a pass, so a partly-broken run can no longer be graded on whichever cells survived. The opt-in `--contention` generator degrades the live box deliberately (documented blast radius, conservative defaults, load backends bounded by an in-SQL deadline plus a signal-wired terminate sweep) and confirms its own backends attached rather than silently measuring an idle box. Additive: one new CLI verb and its registration, zero model tokens, no change to any existing code path. Baseline captured in `docs/baselines/hindsight-recall-2026-08-07/`, with AC1 (±10 % reproducibility) reported as FAILED — at these sample counts the p95 estimator's own bootstrap interval is wider than the gate — and AC4 (contention moves the tail) PASSED, measured A/B/A.
+
+- **`hindsight-bench` result files no longer publish the fleet's bank names** — the recall baselines committed in the previous entry's harness were captured against the live instance, so every artefact carried the operator's bank roster with a row count beside each name, in a public repo. Bank ids are now pseudonymised at **capture time**: `--out` and `--csv` write `bank-01`, `bank-02`, … ranked by row count, so the size axis, the run-to-run joins the verdict modes depend on, and every latency number survive intact while the names do not. The stdout summary still shows real names (your screen, not an artefact) and the mapping is printed to stderr and never written beside the file. The committed baselines under `docs/baselines/hindsight-recall-2026-08-07/` and the narrative that quotes them are rewritten to match, and `npm run lint:bench-baseline-anonymised` fails the build on any committed baseline naming a bank any other way — a whitelist of shape rather than a blocklist of names, so an agent added to the fleet tomorrow is covered too. Only bank names and row counts were ever exposed: no memory content, no credentials, no hostnames. Git history still contains the pre-fix artefacts; whether to rewrite it is tracked separately in #4499.
+
+### Self-improvement
+
+- **Label review-turn messages, stop raw-reasoning leaks to the operator** — a silent self-improvement review turn's mid-turn reasoning could be captured by the outbox backstop and delivered into the operator's DM as a raw, unlabelled message. A review turn now has exactly one sanctioned operator-facing output: a well-formed self-improvement card (a message opening with `🔧 **Self-improvement**`). The backstop delivers a review-originated record only when its text is that card; all other trailing prose classifies `internal` and is suppressed. Detection is deterministic on the synthesized inbound's `source="self_improve_review"` tag plus an exact card-title prefix, never a prose-shape heuristic. A residual title-framing layer (behind `SWITCHROOM_TG_OUTBOX_SELF_IMPROVE_FRAMING`) prepends the title if a non-card review record ever reaches delivery with the audience gate off, so review reasoning can never appear unlabelled. The review prompt now locks the exact card shape (Signal / Suggestion / Status) and instructs silence on a no-op turn.
+- **Close the same leak on the live send path (#4490)** — the outbox sweep's card gate above never protected the LIVE/elected send path (`deliverCapturedProse`): when a review turn's own reply call threw, the single-writer election deferred to that bridge instead of the outbox, and the bridge had no audience gate or title framing at all, so a non-card review turn's raw reasoning could still reach the operator's DM. `reviewOriginated` provenance is now threaded from the transcript scan through the Stop hook's elected-state file into `deliverCapturedProse`, which applies the SAME shared card-gate / title-framing predicates the sweep uses — no parallel implementation, one shared decision on both delivery paths.
+- **Fix a duplicated title on a review record that is both a card and a reply-throw (#4489)** — `decideOutboxSweep` applied the self-improvement title-framing decision on the ALREADY provenance-banner-composed body, so a real card lost its own idempotency check (which only inspects what it was handed) and picked up a second title. The framing decision now gates on the raw record text.
 
 ### Test isolation and CI
 
@@ -192,6 +188,18 @@ now an anomaly worth investigating, not the norm.
   now **bans** `../history.js` mocks outright instead of carrying an exception
   that assumed no sibling suite used the real module.
 
+### Release process
+
+- **Enforce a continuously-staged CHANGELOG `## Unreleased` section:** every PR
+  that changes shippable code (`src`, the Telegram plugin, `bin`, `docker`,
+  `profiles`, `skills`, the vendored hindsight tree, CI workflows) must now add
+  an entry under `## Unreleased`, enforced deterministically by
+  `scripts/check-changelog-entry.mjs` as part of `npm run lint`. Docs/chore/
+  test-only PRs opt out with a `no-changelog` label or a `[skip changelog]`
+  token on its own line in the PR body or a commit message. This makes cutting a release a
+  trivial rename of this header instead of reconstructing the whole section
+  from `git log` at release time (as v0.20.12 had to).
+
 ### Dependencies
 
 - **Claude Code CLI pinned 2.1.221 → 2.1.223 (#4481)** — both pins move in
@@ -204,12 +212,6 @@ now an anomaly worth investigating, not the norm.
   which is exactly the fleet's LiteLLM gateway configuration. Two behaviour
   changes to expect: the **ultraplan** feature is gone, and `/review` is now an
   alias for `/code-review`.
-
-### Hindsight
-
-- **`hindsight.mem_limit` — the container's memory cap is configurable, and a cap that cannot hold `shared_buffers` now says so** — the cap was a hard-coded `16g` with no config path, while `shared_buffers` (a managed `hindsight.env` key) was configurable. An operator who raised the live container to 24 GiB by hand to fit a 12 GiB buffer pool had it silently reverted to 16 GiB by the next `switchroom memory setup --recreate`, with the 12 GiB `shared_buffers` left standing inside it — Postgres pinning most of its own cgroup as unreclaimable shared memory, warned about nowhere. `hindsight.mem_limit` (a docker size string; absent → the unchanged `16g` default) now reaches docker `--memory` and the compose `mem_limit:` from one resolver, so the two launch paths cannot disagree, and it is honoured on first-run `switchroom setup` as well as on `memory setup`. It is a first-class field rather than an `env:` key because it is a docker `HostConfig.Memory` flag, not a variable emitted into the container. On top of the knob, every launch now checks the resolved cap against the resolved `shared_buffers` and warns — naming both numbers and both keys — when the cap does not clear the buffer pool by the app working set plus the page-cache floor (4608 MiB). Warning, not refusal: the dangerous state is a default re-asserting itself, and hard-failing there would leave the fleet with no memory container at all. A malformed size string is still rejected outright, at `switchroom apply` by the schema and at launch rather than silently falling back to the default.
-
-- **`hindsight-bench` result files no longer publish the fleet's bank names** — the recall baselines committed in the previous entry's harness were captured against the live instance, so every artefact carried the operator's bank roster with a row count beside each name, in a public repo. Bank ids are now pseudonymised at **capture time**: `--out` and `--csv` write `bank-01`, `bank-02`, … ranked by row count, so the size axis, the run-to-run joins the verdict modes depend on, and every latency number survive intact while the names do not. The stdout summary still shows real names (your screen, not an artefact) and the mapping is printed to stderr and never written beside the file. The committed baselines under `docs/baselines/hindsight-recall-2026-08-07/` and the narrative that quotes them are rewritten to match, and `npm run lint:bench-baseline-anonymised` fails the build on any committed baseline naming a bank any other way — a whitelist of shape rather than a blocklist of names, so an agent added to the fleet tomorrow is covered too. Only bank names and row counts were ever exposed: no memory content, no credentials, no hostnames. Git history still contains the pre-fix artefacts; whether to rewrite it is tracked separately in #4499.
 
 ## v0.20.12 — native WebSearch fleet-wide, faster sub-agent cards, Hindsight recall speedups, and token-aware LiteLLM pacing
 
