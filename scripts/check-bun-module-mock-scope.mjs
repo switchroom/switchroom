@@ -42,15 +42,29 @@
  * through a dependency seam instead of touching the module registry. A DI fake
  * exists only inside the instance the test constructs and cannot leak.
  *
- * What this does NOT catch (deliberate, documented residual)
- * ----------------------------------------------------------
- * An intra-`telegram-plugin/` module mock leaks just as globally. Two of those
- * exist today (`../history.js`, `../gateway/auth-broker-client.js`) and are
- * benign only because no sibling suite exercises the real module. Banning them
- * outright would be a retrofit beyond this gate's evidence; the cross-package
- * boundary is where the demonstrated breakage occurred, and it is the boundary
- * a new mock is most likely to cross. If an intra-plugin mock ever collides,
- * tighten this to a total ban rather than adding an exception.
+ * An intra-`telegram-plugin/` module mock leaks just as globally — this WAS
+ * theoretical, and is no longer. #4488/#4491: `tests/captured-answer-resume.test.ts`
+ * module-mocked `../history.js` (assumed "benign" here because "no sibling
+ * suite exercises the real module" — that assumption was simply wrong:
+ * `tests/history.test.ts` imports and calls the real `hasOutboundWithText`
+ * directly). Under `bun test`'s process-global `mock.module`, the mock's
+ * default stub (`() => false`) retroactively answered `history.test.ts`'s
+ * calls too, producing false `hasOutboundWithText` misses against a database
+ * that in fact held the row — the exact "Expected: true / Received: false"
+ * signature from #4488/#4491, intermittent because it depends on bun's file
+ * discovery/module-resolution ordering within the sweep. Fixed by injecting
+ * the oracle through `CapturedResumePorts.hasOutboundWithText` instead (see
+ * `gateway/captured-answer-resume.ts`) and removing that mock.
+ *
+ * Per this gate's own prior guidance ("if an intra-plugin mock ever
+ * collides, tighten this to a total ban"): `../history.js` is now banned
+ * outright below, not just discouraged in a comment. It is still exercised
+ * for real by other swept suites, so any future re-introduction of a
+ * `../history.js` module-mock in this sweep is exactly as dangerous as the
+ * one that just broke `bun-test-run`.
+ * `../gateway/auth-broker-client.js` remains an untightened, still-documented
+ * residual risk (no proven collision yet) — out of scope for this change;
+ * tighten it the same way if it ever collides.
  *
  * Run: `npm run lint:bun-module-mock-scope` (also part of `npm run lint`).
  */
@@ -77,6 +91,15 @@ export const SWEPT_DIRS = [
 
 /** The package boundary a swept file's module mocks must stay inside. */
 export const MOCK_BOUNDARY = 'telegram-plugin'
+
+/**
+ * Intra-plugin specifiers that are banned outright for swept files, even
+ * though they resolve inside `MOCK_BOUNDARY`. `../history.js` (any relative
+ * depth) was the #4488/#4491 collision: proven to leak into a sibling suite
+ * that exercises the real module. Matched by resolved path suffix so it
+ * catches every file's relative spelling of the same module.
+ */
+export const BANNED_INTRA_PLUGIN_MOCKS = ['telegram-plugin/history.ts', 'telegram-plugin/history.js']
 
 /**
  * Strip `//` line comments and block comments so a file that merely
@@ -147,6 +170,10 @@ export function findModuleMocks(src) {
 export function evaluateMock(file, spec, line) {
   if (!spec.startsWith('.')) return null
   const resolved = relative(repoRoot, resolve(dirname(join(repoRoot, file)), spec))
+  const resolvedAsTs = resolved.replace(/\.js$/, '.ts')
+  if (BANNED_INTRA_PLUGIN_MOCKS.includes(resolved) || BANNED_INTRA_PLUGIN_MOCKS.includes(resolvedAsTs)) {
+    return { file, line, spec, resolved, banned: true }
+  }
   if (resolved.startsWith(MOCK_BOUNDARY + sep)) return null
   return { file, line, spec, resolved }
 }
@@ -186,6 +213,16 @@ function main() {
     return
   }
   for (const v of violations) {
+    if (v.banned) {
+      console.error(
+        `${v.file}:${v.line}: module-mocks '${v.spec}' → ${v.resolved}, which is banned outright ` +
+        `(the #4488/#4491 collision — see this script's docblock).\n` +
+        `  Under 'bun test' this replaces that module for EVERY test file in the run, including\n` +
+        `  suites that exercise the real module. Inject a fake through a dependency seam instead\n` +
+        `  (see gateway/captured-answer-resume.ts's CapturedResumePorts.hasOutboundWithText).`,
+      )
+      continue
+    }
     console.error(
       `${v.file}:${v.line}: module-mocks '${v.spec}' → ${v.resolved}, outside ${MOCK_BOUNDARY}/.\n` +
       `  Under 'bun test' this replaces that module for EVERY test file in the run.\n` +
