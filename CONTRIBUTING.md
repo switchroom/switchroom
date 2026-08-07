@@ -118,6 +118,14 @@ your agents are on the latest code.
    "and also" in the PR description, split it.
 3. Add tests for new behavior. Bug fixes should include a regression test
    that would have caught the bug.
+   - **Stage a CHANGELOG entry.** A PR that changes shippable code (`src`,
+     `telegram-plugin`, `bin`, `docker`, `profiles`, `skills`, the vendored
+     hindsight tree, or CI workflows) must add a line under the `## Unreleased`
+     header in `CHANGELOG.md`, in the same PR — `npm run lint` (via
+     `scripts/check-changelog-entry.mjs`) fails otherwise. Cutting a release is
+     then just renaming that header. For a docs/chore/test-only PR that ships
+     nothing user-visible, opt out with a `no-changelog` label on the PR or a
+     `[skip changelog]` token on its own line in the PR body or a commit message.
 4. Run `bun run lint` (tsc noEmit) and `bun run test` before pushing.
 5. Push the branch to `origin` and open a PR against `switchroom/switchroom:main`:
    ```
