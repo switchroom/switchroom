@@ -146,6 +146,38 @@ of bug as the #2816 non-main-dispatch follow-up. Queue builds tag
   `release.yml` produce no required context. That is the complete
   remainder: the seven workflows above plus these seven are all 14.
 
+## Author-side changelog generation (why not a CI commit-back)
+
+#4469 makes a staged `## Unreleased` entry a precondition of the required
+`lint` context (`scripts/check-changelog-entry.mjs`). The obvious way to spare
+authors the round-trip is to have CI derive the entry from the PR title and
+**commit it back to the PR branch**. On this repo that is a wedge, not a
+convenience, and the reason is the merge-queue model this file governs.
+
+A push made with a workflow's default `GITHUB_TOKEN` **does not create new
+workflow runs** — GitHub's recursion guard. So a CI commit-back would advance
+the PR head to a SHA that no `pull_request` workflow ever runs on, leaving all
+seven required contexts (`lint`, `vitest`, `bun-test`, `python-ok`,
+`uat-gate`, `e2e-ok`, `images-ok`) *expected but absent* on the new head. The
+PR sits `BLOCKED` indefinitely and `--auto --squash` never fires — the same
+"required context resting on nothing" failure the three rules above exist to
+prevent. Re-triggering the checks would need a GitHub App / PAT push
+credential, which the repo deliberately does not carry (only `GITHUB_TOKEN`,
+`NPM_TOKEN` and the UAT Telegram secrets exist).
+
+So generation runs **author-side** instead: `scripts/gen-changelog-entry.mjs`
+(`bun run changelog:generate`) derives the entry from the branch's
+conventional-commit title and appends it under `## Unreleased` in the AUTHOR's
+own commit, before `gh pr create`. That push is an ordinary author push — it
+re-triggers every required check normally, exactly the property the
+commit-back path cannot have. The generator is idempotent (a second run sees
+its own entry as growth and no-ops), skips on `merge_group` (empty PR
+context), no-ops on a non-shippable / release PR, and honours the same escape
+hatches as the check — the `no-changelog` label or a `[skip changelog]` token
+on its own line opts OUT of both enforcement and generation. #4469's check
+remains the deterministic **backstop**: skip the helper and CI still reds
+until an entry exists.
+
 ## Diagnosing a stuck queue
 
 ```bash

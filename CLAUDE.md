@@ -475,10 +475,17 @@ first.
    writer's euid.
 3. Implement with tests; validate locally with scoped vitest/bun test +
    `npm run lint`.
-4. Conventional Commits (`feat(scope):` …). Push the branch to `origin`
-   (canonical-only model, no forks): `gh pr create --repo
-   switchroom/switchroom --base main`. Title <70 chars; body: Summary / Why /
-   Test plan / Risk + the job-spec citation.
+4. Conventional Commits (`feat(scope):` …). **Before pushing a shippable
+   change, stage the CHANGELOG entry author-side:** `bun run
+   changelog:generate` derives a `## Unreleased` entry from your
+   conventional-commit title (idempotent; respects the `no-changelog` /
+   `[skip changelog]` hatches), then commit `CHANGELOG.md` so it rides your own
+   push — #4469's `check-changelog-entry.mjs` stays the CI backstop. Generation
+   is author-side, not a CI commit-back, because a `GITHUB_TOKEN` push can't
+   re-trigger the required checks (see `.github/MERGE-QUEUE.md` § "Author-side
+   changelog generation"). Push the branch to `origin` (canonical-only model,
+   no forks): `gh pr create --repo switchroom/switchroom --base main`. Title
+   <70 chars; body: Summary / Why / Test plan / Risk + the job-spec citation.
 5. **Fresh-process review before auto-merge.** The coder can't review its own
    work in-context. Dispatch a separate reviewer agent; iterate to APPROVE;
    only then `gh pr merge --auto --squash`. Never enable auto-merge before

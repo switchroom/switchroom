@@ -139,6 +139,17 @@ is not a rebuttal.
   `AWAITING_CHECKS` means a required workflow is not listening for
   `merge_group`; `.github/MERGE-QUEUE.md` owns that failure mode and the
   invariants that prevent it.
+- **Stage the CHANGELOG entry author-side, before `gh pr create`.** A PR that
+  changes shippable code must add a `## Unreleased` entry (#4469's
+  `check-changelog-entry.mjs`, part of `npm run lint`, enforces it). Don't
+  hand-write it: run `bun run changelog:generate` in the repo — it derives the
+  entry from your conventional-commit title, appends it under `## Unreleased`
+  (idempotently — a second run is a no-op), and respects the escape hatches. Then
+  commit CHANGELOG.md so it lands in your own push. It runs AUTHOR-side, not in
+  CI, because a CI commit-back with the default `GITHUB_TOKEN` cannot re-trigger
+  the required checks and would wedge the PR (`.github/MERGE-QUEUE.md` §
+  "Author-side changelog generation"). Opt a docs/chore/test PR out with the
+  `no-changelog` label or a `[skip changelog]` token on its own line.
 - **A test that wouldn't fail on the bug it guards is not a test.** Assert the
   observable outcome, not that the code path executed.
 - **Prefer a deterministic mechanism over prompt discipline.** If a check, a
