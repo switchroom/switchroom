@@ -43,15 +43,17 @@ import {
   resolveHindsightLlmSecrets,
   diffDroppedHindsightLlmVaultKeys,
   hindsightLlmDroppedKeyWarning,
+  resolveHindsightLiteLlm,
+  hindsightLiteLlmDroppedKeyWarning,
+  type HindsightLiteLlmResolution,
   HINDSIGHT_CONSUMER_NAME,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
   pickHindsightPorts,
   preflightHindsightPorts,
-  type LiteLLMHindsightConfig,
   type DockerProbe,
 } from "../setup/hindsight.js";
-import { getViaBrokerStructured, readVaultTokenFile } from "../vault/broker/client.js";
+import type { getViaBrokerStructured } from "../vault/broker/client.js";
 import {
   ask,
   askHidden,
@@ -1027,29 +1029,17 @@ async function stepCreateTopics(
 
 // ─── Step 6: Memory Backend ─────────────────────────────────────────────────
 
+/**
+ * Thin delegator to {@link resolveHindsightLiteLlm} — the SAME resolution the
+ * `memory setup --recreate` launch path uses, so first-run setup and a
+ * recreate cannot disagree about whether hindsight is metered. It used to be a
+ * verbatim second copy of that function, silent `undefined` and all.
+ */
 async function resolveLiteLLMForHindsight(
   config: SwitchroomConfig,
-): Promise<LiteLLMHindsightConfig | undefined> {
-  const topLiteLLM = (config as { litellm?: { enabled?: boolean; base_url?: string } }).litellm;
-  if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
-  // Issue #1053: forward the agent's capability token so the broker's grant
-  // path bypasses the peercred ACL. Without it a freshly-minted grant is
-  // ignored and the `.catch(() => null)` silently swallows the DENIED,
-  // leaving LiteLLM routing (ANTHROPIC_BASE_URL/headers) underived. Mirrors
-  // the working `vault get` path in src/cli/vault.ts. Token stays undefined
-  // when SWITCHROOM_AGENT_NAME is unset — identical to prior host-operator
-  // peercred behavior.
-  const agentSlug = process.env.SWITCHROOM_AGENT_NAME;
-  const token = agentSlug ? readVaultTokenFile(agentSlug) ?? undefined : undefined;
-  const result = await getViaBrokerStructured("litellm/hindsight/api-key", {
-    ...(token ? { token } : {}),
-  }).catch(() => null);
-  if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
-  return {
-    baseUrl: topLiteLLM.base_url,
-    apiKey: result.entry.value,
-    model: config.memory?.config?.llm_model,
-  };
+  deps: { getViaBrokerStructured?: typeof getViaBrokerStructured } = {},
+): Promise<HindsightLiteLlmResolution> {
+  return resolveHindsightLiteLlm(config, deps);
 }
 
 /** Injectable seams for the memory-backend step (tests: no docker needed). */
@@ -1320,7 +1310,17 @@ export async function stepMemoryBackend(
   // Start the container in broker-fed mode (no API key).
   const spin = spinner("Starting Hindsight Docker container...");
   try {
-    const litellmCfg = await resolveLiteLLMForHindsight(config);
+    const { litellm: litellmCfg, droppedRef: litellmDroppedRef } =
+      await resolveLiteLLMForHindsight(
+        config,
+        deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
+      );
+    // Symmetric to the cp_access_key and LLM api_key warnings below: LiteLLM is
+    // enabled but its key did not resolve, so the container is about to launch
+    // unmetered. Never silent.
+    if (litellmDroppedRef) {
+      console.log(chalk.yellow(`  ! ${hindsightLiteLlmDroppedKeyWarning(litellmDroppedRef)}`));
+    }
     const cpAccessKey = await resolveHindsightCpAccessKey(config);
     if (!cpAccessKey) {
       console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));

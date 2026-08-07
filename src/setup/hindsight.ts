@@ -1584,6 +1584,107 @@ async function resolveHindsightVaultString(
 }
 
 /**
+ * The vault key that authenticates hindsight's LiteLLM passthrough.
+ *
+ * Deliberately NOT the top-level `litellm.admin_key` (`vault:litellm/master-key`):
+ * that is the proxy's master credential and has no business inside a service
+ * container. This is the per-service virtual key `switchroom apply` provisions,
+ * and it is the ONLY key that should ever appear as the
+ * `ANTHROPIC_CUSTOM_HEADERS` bearer — see `src/litellm/key-allowlist.ts`.
+ * Byte-pinned against `HINDSIGHT_KEY_VAULT_REF` (the doctor check's copy) by
+ * `hindsight-litellm-env.test.ts`; the constant is duplicated rather than
+ * imported only to keep `src/litellm/`'s doctor/provision import graph out of
+ * this module.
+ */
+export const HINDSIGHT_LITELLM_KEY_VAULT_REF = "litellm/hindsight/api-key";
+
+/** Outcome of {@link resolveHindsightLiteLlm}. */
+export interface HindsightLiteLlmResolution {
+  /**
+   * The routing config to hand `startHindsight` /
+   * {@link hindsightContainerEnvPairs}. Absent when LiteLLM is not enabled for
+   * this fleet, or when its key could not be resolved (see {@link droppedRef}).
+   */
+  litellm?: LiteLLMHindsightConfig;
+  /**
+   * Set ONLY when LiteLLM *is* enabled and configured but its key did not
+   * resolve — i.e. the launch is about to silently drop proxy routing. Carries
+   * the `vault:<key>` REFERENCE, never the secret. Callers must surface it;
+   * {@link hindsightLiteLlmDroppedKeyWarning} is the sanctioned wording.
+   */
+  droppedRef?: string;
+}
+
+/**
+ * Resolve the hindsight container's LiteLLM routing config, reporting a
+ * dropped key instead of swallowing it.
+ *
+ * ## The failure this exists to make visible
+ *
+ * The predecessor of this function returned a bare `undefined` for every
+ * outcome — LiteLLM off, LiteLLM on but the broker denied, LiteLLM on but the
+ * broker was down. So a denied grant made `memory setup --recreate` launch
+ * hindsight with NO `ANTHROPIC_BASE_URL` / `ANTHROPIC_CUSTOM_HEADERS` and say
+ * nothing about it. The container comes up healthy, reflect/consolidation go
+ * straight to the provider, and the spend simply stops appearing in
+ * `LiteLLM_SpendLogs` under `end_user=hindsight`. The only trace is the
+ * env-drift report listing the two vars as dropped — which reads as operator
+ * drift ("were set imperatively") and has been misdiagnosed as exactly that.
+ * Observed live 2026-08-07: `litellm/hindsight/api-key` denied to a caller
+ * without a standing grant, routing silently gone.
+ *
+ * The two sibling resolvers on this same launch path already fail loudly — a
+ * missing `cp_access_key` prints {@link HINDSIGHT_CP_NO_ACCESS_KEY_WARNING},
+ * a dropped LLM api_key prints {@link hindsightLlmDroppedKeyWarning}. This is
+ * the third secret on the path and it is now held to the same standard.
+ *
+ * Never returns the literal `vault:…` string as a key (see
+ * {@link resolveHindsightVaultString}) — a `vault:` bearer would be rejected
+ * by LiteLLM at auth, which is the 2026-08-06 outage shape.
+ */
+export async function resolveHindsightLiteLlm(
+  config:
+    | {
+        litellm?: { enabled?: boolean; base_url?: string };
+        memory?: { config?: { llm_model?: string } };
+      }
+    | undefined,
+  deps: HindsightVaultResolveDeps = {},
+): Promise<HindsightLiteLlmResolution> {
+  const top = config?.litellm;
+  // Not enabled (or no proxy URL) ⇒ routing is *meant* to be absent. Not a drop
+  // and not a warning: the operator has not asked for a metered lane.
+  if (!top?.enabled || !top.base_url?.trim()) return {};
+  const ref = `vault:${HINDSIGHT_LITELLM_KEY_VAULT_REF}`;
+  const apiKey = await resolveHindsightVaultString(ref, deps);
+  if (!apiKey) return { droppedRef: ref };
+  return {
+    litellm: {
+      baseUrl: top.base_url,
+      apiKey,
+      model: config?.memory?.config?.llm_model,
+    },
+  };
+}
+
+/**
+ * Operator-facing wording for a dropped LiteLLM routing key. Takes the
+ * `vault:<key>` reference and NEVER the resolved secret — same contract as
+ * {@link hindsightLlmDroppedKeyWarning}.
+ */
+export function hindsightLiteLlmDroppedKeyWarning(ref: string): string {
+  return (
+    `hindsight: LiteLLM routing key \`${ref}\` did not resolve through the ` +
+    "vault broker (denied, missing, or broker down) — ANTHROPIC_BASE_URL and " +
+    "ANTHROPIC_CUSTOM_HEADERS were DROPPED, so hindsight's LLM traffic will " +
+    "bypass the proxy entirely and its spend will NOT be metered under " +
+    "`end_user=hindsight`. Check the broker grant for the reference above, " +
+    "then re-run. If an ENV DRIFT report above named those two vars, THIS is " +
+    "why — it is NOT operator env drift."
+  );
+}
+
+/**
  * Resolve every `vault:<key>` reference in a hindsight LLM config's API-key
  * fields to its real secret, through the auto-unlocked broker — the SAME
  * non-interactive path {@link resolveHindsightCpAccessKey} uses.
@@ -2161,6 +2262,72 @@ export function hindsightPgEnvPairs(
 }
 
 /**
+ * LiteLLM customer id / spend tag hindsight's proxy traffic is attributed to.
+ *
+ * This literal is what produces the `end_user=hindsight` rows in LiteLLM's
+ * `LiteLLM_SpendLogs`. Changing it silently orphans every historical row from
+ * the lane that produced it, so it lives here once rather than inline.
+ */
+export const HINDSIGHT_LITELLM_CUSTOMER_ID = "hindsight";
+
+/**
+ * THE single construction of hindsight's LiteLLM routing env — the
+ * `ANTHROPIC_BASE_URL` + `ANTHROPIC_CUSTOM_HEADERS` pair that makes the
+ * container's `claude-code` provider transit the proxy and be METERED there.
+ *
+ * ## Why it is a helper and not two inline literals
+ *
+ * It used to be two: one in {@link hindsightContainerEnvPairs} (the
+ * docker-run / `memory setup --recreate` launch path) and one in
+ * {@link generateHindsightComposeSnippet}. Two copies of a credential-bearing
+ * literal is exactly the shape that drifts: the compose copy is the only one
+ * an operator ever *reads*, and the docker-run copy is the only one the fleet
+ * actually *runs*. Emitting both from one function makes a divergence
+ * unrepresentable rather than merely unlikely — the same twin-path discipline
+ * {@link hindsightCpAuthEnvPairs} and {@link hindsightHostNetworkBindEnvPairs}
+ * already enforce for the CP dashboard and the host-network bind.
+ *
+ * ## Fail-closed on a missing key
+ *
+ * Returns `[]` unless BOTH a base URL and a non-blank API key are present. A
+ * blank key would otherwise bake `x-litellm-api-key: Bearer ` into the
+ * container, which LiteLLM rejects at auth — an unmetered lane that *looks*
+ * configured is strictly worse than an obviously-unconfigured one. Callers
+ * that need to tell the operator WHY the key is missing use
+ * {@link resolveHindsightLiteLlm}'s `droppedRef`.
+ *
+ * The returned value is newline-separated, which is what the `-e` docker-run
+ * form wants. The compose emitter escapes the newlines for its YAML scalar.
+ *
+ * @param llmModel The resolved hindsight LLM model. Claude models ride the
+ *   Anthropic pass-through (`<root>/anthropic`, raw byte-forward, OAuth) — the
+ *   model-mapped route re-chunks the SSE stream and stalls long Claude
+ *   responses mid-flight (the 2026-07-05 stall). Any other model (e.g.
+ *   OpenRouter) MUST use the model-mapped root instead: the pass-through only
+ *   forwards to the real Anthropic API, so a non-Claude `model_name` there
+ *   404s / always fails open.
+ */
+export function hindsightLiteLlmEnvPairs(
+  litellm: LiteLLMHindsightConfig | undefined,
+  llmModel: string,
+): Array<[string, string]> {
+  const baseUrl = litellm?.baseUrl?.trim();
+  const apiKey = litellm?.apiKey?.trim();
+  if (!baseUrl || !apiKey) return [];
+  const litellmRoot = baseUrl.replace(/\/+$/, "");
+  const anthropicBaseUrl = isClaudeModel(llmModel) ? `${litellmRoot}/anthropic` : litellmRoot;
+  return [
+    ["ANTHROPIC_BASE_URL", anthropicBaseUrl],
+    [
+      "ANTHROPIC_CUSTOM_HEADERS",
+      `x-litellm-api-key: Bearer ${apiKey}\n` +
+        `x-litellm-customer-id: ${HINDSIGHT_LITELLM_CUSTOMER_ID}\n` +
+        `x-litellm-tags: service:${HINDSIGHT_LITELLM_CUSTOMER_ID}`,
+    ],
+  ];
+}
+
+/**
  * THE complete container environment `startHindsight` launches with — every
  * `-e` pair, in argv order, derived from the same inputs.
  *
@@ -2294,27 +2461,10 @@ export function hindsightContainerEnvPairs(opts: {
     }),
   );
 
-  if (litellm) {
-    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
-    // Claude models ride the Anthropic pass-through (<root>/anthropic,
-    // raw byte-forward, OAuth) — the model-mapped route re-chunks the SSE
-    // stream and stalls long Claude responses mid-flight (the 2026-07-05
-    // stall). Any other model (e.g. OpenRouter) MUST use the model-mapped
-    // root instead — the pass-through only forwards to the real Anthropic
-    // API, so a non-Claude model_name there 404s / always fails open.
-    const anthropicBaseUrl = isClaudeModel(llmModel)
-      ? `${litellmRoot}/anthropic`
-      : litellmRoot;
-    pairs.push(
-      // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
-      // consolidation/reflect calls hit the proxy for spend tracking.
-      ["ANTHROPIC_BASE_URL", anthropicBaseUrl],
-      [
-        "ANTHROPIC_CUSTOM_HEADERS",
-        `x-litellm-api-key: Bearer ${litellm.apiKey}\nx-litellm-customer-id: hindsight\nx-litellm-tags: service:hindsight`,
-      ],
-    );
-  }
+  // LiteLLM routing: inherited by the claude_agent_sdk subprocess so
+  // consolidation/reflect calls hit the proxy for spend tracking. Built by the
+  // SAME helper the compose emitter uses — see {@link hindsightLiteLlmEnvPairs}.
+  pairs.push(...hindsightLiteLlmEnvPairs(litellm, llmModel));
 
   return pairs;
 }
@@ -2885,20 +3035,22 @@ export function generateHindsightComposeSnippet(
       ([k, v]) => `      - ${k}=${v}`,
     ),
   ];
-  // Optional LiteLLM proxy env (ANTHROPIC_BASE_URL + spend-tag headers) —
-  // same shape startHindsight emits when litellm is configured. Requires the
-  // api key; compose generators without a vault-resolved key skip headers
-  // but still get host network + health pairing from loopback per-op URLs.
-  if (litellm?.baseUrl?.trim() && litellm.apiKey?.trim()) {
-    const litellmRoot = litellm.baseUrl.replace(/\/+$/, "");
-    const anthropicBaseUrl = isClaudeModel(llmModel)
-      ? `${litellmRoot}/anthropic`
-      : litellmRoot;
-    environment.push(
-      `      - ANTHROPIC_BASE_URL=${anthropicBaseUrl}`,
-      `      - ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer ${litellm.apiKey}\\nx-litellm-customer-id: hindsight\\nx-litellm-tags: service:hindsight`,
-    );
-  }
+  // Optional LiteLLM proxy env (ANTHROPIC_BASE_URL + spend-tag headers) — not
+  // "the same shape" as the docker-run path but literally the SAME derivation
+  // ({@link hindsightLiteLlmEnvPairs}), so compose and `memory setup
+  // --recreate` cannot drift on the credential-bearing header. Emits nothing
+  // without a resolved api key; a compose generator in that state still gets
+  // host network + health pairing from the loopback per-op URLs.
+  //
+  // The one compose-specific transform: `ANTHROPIC_CUSTOM_HEADERS` is
+  // newline-separated, and a raw newline inside an unquoted compose
+  // `environment:` scalar would terminate the entry, so the newlines are
+  // escaped to a literal `\n` here exactly as they were before the extraction.
+  environment.push(
+    ...hindsightLiteLlmEnvPairs(litellm, llmModel).map(
+      ([k, v]) => `      - ${k}=${v.replace(/\n/g, "\\n")}`,
+    ),
+  );
   // Mirror mode (#2578): a one-shot init service chowns the fresh shared
   // creds volume to the consumer UID (a named volume mounts root:root, but
   // hindsight's entrypoint runs as UID 11000 and would EACCES on its
