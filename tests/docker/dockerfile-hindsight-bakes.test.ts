@@ -546,6 +546,20 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /assert _branch\.index\("CREATE EXTENSION IF NOT EXISTS pg_search"\) < _branch\.index\("USING bm25"\)/,
     );
+    // D2b. …and it is NOT wrapped in upstream's pgroonga-style "already exists /
+    //      no permission" fallback. `IF NOT EXISTS` makes that probe unreachable
+    //      as a suppressor, and the reconcile runs in ONE implicit transaction —
+    //      so on a real failure the probe fires on an already-aborted
+    //      transaction and buries the actual ParadeDB error under "current
+    //      transaction is aborted". That is exactly the diagnostic an operator
+    //      needs when prestart_pg0 (best-effort, `|| true`) left
+    //      shared_preload_libraries=pg_search ineffective.
+    expect(dockerfile).not.toMatch(
+      /except Exception:\s*\n\s*has_ext = conn\.execute\(text\("SELECT 1 FROM pg_extension WHERE extname = 'pg_search'"\)\)/,
+    );
+    expect(dockerfile).toMatch(
+      /assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_search'" not in m, \(/,
+    );
 
     // D3. the second memory table is reconciled under the name it actually has
     //     (alembic t5o6p7q8r9s0 renamed reflections -> mental_models), and the

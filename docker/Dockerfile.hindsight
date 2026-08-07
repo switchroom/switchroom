@@ -2091,14 +2091,27 @@ patch(
                 # died with `InvalidSchemaName: schema "pdb" does not exist`
                 # because the pdb schema only exists once the extension is
                 # installed. The pgroonga branch above already does exactly this;
-                # mirror it, including the "already exists / no permission"
-                # verification fallback.
-                try:
-                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE"))
-                except Exception:
-                    has_ext = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'pg_search'")).fetchone()
-                    if not has_ext:
-                        raise
+                # mirror its CREATE EXTENSION — but deliberately NOT its
+                # try/except fallback (#4507 review):
+                #
+                #   1. `IF NOT EXISTS` already makes the fallback's "already
+                #      exists" case unreachable, so the probe can never return a
+                #      row that suppresses the raise. It is dead code.
+                #   2. Worse than dead: the whole reconcile runs in ONE implicit
+                #      transaction (this connection is opened once and committed
+                #      only at the end of ensure_text_search_extension), so by the
+                #      time CREATE EXTENSION raises the transaction is already
+                #      aborted and the fallback SELECT raises
+                #      InFailedSqlTransactionError on top of it. The operator sees
+                #      "current transaction is aborted" instead of the real
+                #      ParadeDB error.
+                #
+                # That matters precisely here: prestart_pg0 is best-effort
+                # (`|| true`), so an ineffective `shared_preload_libraries=pg_search`
+                # is the single most likely real-world failure of this migration —
+                # and it is exactly the case whose diagnostic the fallback
+                # destroyed. Let it raise.
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE"))
 
                 logger.info(f"Creating TEXT column on {table_name}")
 ''',
@@ -2134,6 +2147,16 @@ assert m.count("ADD COLUMN IF NOT EXISTS search_vector") == 5, (
 )
 assert 'CREATE EXTENSION IF NOT EXISTS pg_search CASCADE' in m, (
     f"switchroom hindsight {NAME}: the pg_search branch still never creates the extension"
+)
+# …and it must NOT be wrapped in upstream's pgroonga-style verification fallback.
+# `IF NOT EXISTS` makes that probe unreachable as a suppressor, and the whole
+# reconcile is ONE implicit transaction, so on a real failure the probe runs on
+# an already-aborted transaction and reports "current transaction is aborted"
+# over the top of the actual ParadeDB error. See the D2 block for the argument.
+assert "SELECT 1 FROM pg_extension WHERE extname = 'pg_search'" not in m, (
+    f"switchroom hindsight {NAME}: the dead CREATE EXTENSION fallback is back — it cannot "
+    "suppress anything and it destroys the diagnostic for the most likely real-world failure "
+    "of this migration (an ineffective shared_preload_libraries=pg_search)"
 )
 # The CREATE EXTENSION must come BEFORE the CREATE INDEX in that branch, or the
 # pdb schema still does not exist when the index is built.
