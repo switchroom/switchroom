@@ -15,6 +15,31 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### `hindsight-bench --phases`: a refutation number for database-side proposals
+
+- **`switchroom hindsight-bench --phases [n]` attributes recall latency to
+  request phases and reports a ceiling (#4476)** — a traced pass over the full
+  concurrency ladder reduces `trace.summary.phase_metrics[]` to one number per
+  cell: the fraction of end-to-end recall latency that would disappear if every
+  PostgreSQL call became *instantaneous*. That is an upper bound assuming a
+  physically impossible database, so any proposal claiming a larger end-to-end
+  reduction from database-side work is refuted before anyone builds it. #4476
+  was graded this way and its own latency target was refuted by it — see
+  `docs/hindsight-bench-p2-residency.md`. The per-arm `retrieval_*` spans are
+  excluded from the share arithmetic because they are `diagnostic: true`
+  overlays nested inside `parallel_retrieval` and summing them roughly triples
+  the database's apparent share; `connection_wait` is counted *in* despite the
+  same marker, because it is genuine database wait and every rounding decision
+  here deliberately inflates the database's share — a refutation built on an
+  under-count is not a refutation.
+- **The bank-anonymisation gate covers the new field and every narrative doc
+  (#4499 follow-up)** — `scripts/check-bench-baseline-anonymised.mjs` now checks
+  `phases[].bank`, which the `--phases` sweep introduced after the gate was
+  written, and enumerates its prose scope as `docs/hindsight-bench*.md` from
+  disk instead of a hardcoded two-file list. Under that list a newly added
+  narrative doc opted out of the gate by existing, which is exactly what
+  `docs/hindsight-bench-p2-residency.md` would have done.
+
 ## v0.20.13 — ParadeDB pg_search BM25 keyword recall, `vault:` secrets resolved off the apply path, and recall quality as a gating number
 
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)

@@ -114,6 +114,39 @@ individual recall arms. Tracing changes what is being timed, so **arm results
 must never be compared against the latency table** — they answer "where does
 the time go", not "how long does it take".
 
+### Phase attribution answers "could the database even deliver this?"
+
+`--phases [n]` (default 8) runs a second traced pass, but over the **full
+concurrency ladder** rather than at c=1, because the question it answers is a
+question about contention. It reduces `trace.summary.phase_metrics[]` into one
+number per cell:
+
+> **`max gain`** — the fraction of end-to-end recall latency that would
+> disappear if every PostgreSQL call in the request became *instantaneous*.
+
+That is an upper bound assuming a physically impossible database, not an
+estimate. Its purpose is deterministic refutation: if a proposal claims an X%
+end-to-end reduction from database-side work and `max gain < X`, the proposal
+is dead before anyone builds it. #4476 was graded this way.
+
+Two details that decide whether the number is honest:
+
+- The per-arm `retrieval_*` entries carry `details.diagnostic = true` and are
+  **nested inside `parallel_retrieval`**. Summing them would count the same
+  wall-clock two or three times and roughly triple the database's apparent
+  share. They are excluded from all share arithmetic.
+- `connection_wait` is *also* flagged diagnostic, but it is genuine database
+  wait, so it is counted into the database total from a separate map — at the
+  risk of double-counting it against `parallel_retrieval`. Every rounding
+  decision here deliberately inflates the database's share, because a
+  refutation built on an under-count is not a refutation. `semaphore_wait` is
+  the model-concurrency semaphore and is *not* counted as database time.
+
+Same caveat as `--arms`: these are traced milliseconds and are **not
+comparable to the latency table**. The shares are the product; the absolute
+numbers are context. A cell whose traced calls all failed is omitted rather
+than reported as a database-free cell of zeros.
+
 ## Output
 
 Every run emits:
@@ -216,3 +249,7 @@ contend with each other and both results are garbage.
 See `docs/hindsight-bench-baseline.md` for the captured post-index-drop
 baseline, the reproducibility number actually achieved, and what that baseline
 can and cannot tell us.
+
+`docs/hindsight-bench-p2-residency.md` grades #4476 against it, and is the
+worked example of what `--phases` is for: it refutes the epic's own central
+hypothesis with the ceiling number rather than with an argument.

@@ -11,7 +11,15 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 // @ts-expect-error — .mjs guard script, no types
-import { checkCsv, checkJson, checkProse, checkTables, collectViolations } from "../scripts/check-bench-baseline-anonymised.mjs";
+import {
+  bankFields,
+  checkCsv,
+  checkJson,
+  checkProse,
+  checkTables,
+  collectViolations,
+  proseFiles,
+} from "../scripts/check-bench-baseline-anonymised.mjs";
 
 const repoRoot = join(import.meta.dirname, "..");
 const BASELINE = "docs/baselines/hindsight-recall-2026-08-07";
@@ -29,6 +37,7 @@ function resultWith(bank: string): string {
     db: { bankRows: [{ bank, rows: 228952 }] },
     cells: [{ bank, rows: 228952, concurrency: 1 }],
     arms: [{ bank, method: "semantic", fact_type: "world" }],
+    phases: [{ bank, rows: 228952, concurrency: 8, phases: [] }],
   });
 }
 
@@ -36,7 +45,34 @@ describe("check-bench-baseline-anonymised — JSON artefacts", () => {
   it("fails on a real bank id, naming every field that carries it", () => {
     const v = checkJson("x.json", resultWith("klanker")) as Violation[];
     const fields = v.map((x) => x.detail.split(" ")[0]);
-    expect(fields).toEqual(["config.banks[]", "db.bankRows[].bank", "cells[].bank", "arms[].bank"]);
+    expect(fields).toEqual([
+      "config.banks[]",
+      "db.bankRows[].bank",
+      "cells[].bank",
+      "arms[].bank",
+      "phases[].bank",
+    ]);
+  });
+
+  it("catches a real bank id that ONLY appears in phases[] (#4476's new field)", () => {
+    // The gap this closes: `phases[]` was added by the --phases sweep after the
+    // gate was written, so a result file whose cells were pseudonymised but
+    // whose phase cells were not would have passed clean.
+    const doc = JSON.stringify({
+      schema: 2,
+      config: { banks: ["bank-01"] },
+      db: { bankRows: [{ bank: "bank-01", rows: 1 }] },
+      cells: [{ bank: "bank-01", concurrency: 1 }],
+      arms: null,
+      phases: [{ bank: "klanker", concurrency: 8 }],
+    });
+    const v = checkJson("x.json", doc) as Violation[];
+    expect(v).toHaveLength(1);
+    expect(v[0]?.detail).toBe('phases[].bank = "klanker" is not a bank-NN pseudonym');
+  });
+
+  it("tolerates a legacy result file with no phases key", () => {
+    expect(bankFields({ cells: [{ bank: "bank-01" }] })).toEqual([{ field: "cells[].bank", value: "bank-01" }]);
   });
 
   it("passes on pseudonyms", () => {
@@ -47,7 +83,7 @@ describe("check-bench-baseline-anonymised — JSON artefacts", () => {
     // This is the property that matters: a brand-new agent added to the fleet
     // tomorrow is caught, because the rule whitelists a SHAPE, not names.
     const v = checkJson("x.json", resultWith("a-brand-new-agent-2031")) as Violation[];
-    expect(v.length).toBe(4);
+    expect(v.length).toBe(5);
   });
 
   it("rejects near-miss pseudonyms rather than waving them through", () => {
@@ -112,6 +148,23 @@ describe("check-bench-baseline-anonymised — prose", () => {
   it("passes a bank table full of pseudonyms", () => {
     const md = ["| bank | rows |", "|---|---:|", "| `bank-01` | 230,020 |", "| `bank-14` | 12 |"].join("\n");
     expect(checkTables("d.md", md)).toEqual([]);
+  });
+});
+
+describe("check-bench-baseline-anonymised — prose scope", () => {
+  it("enumerates every docs/hindsight-bench*.md from disk, not a hardcoded list", () => {
+    const files = proseFiles() as string[];
+    // The two the original list named, plus the P2 narrative that was written
+    // afterwards and would have escaped the gate entirely under that list.
+    expect(files).toContain("docs/hindsight-bench-baseline.md");
+    expect(files).toContain("docs/hindsight-bench.md");
+    expect(files).toContain("docs/hindsight-bench-p2-residency.md");
+    for (const f of files) expect(f).toMatch(/^docs\/hindsight-bench[\w.-]*\.md$/);
+  });
+
+  it("scopes to hindsight-bench docs only", () => {
+    const files = proseFiles() as string[];
+    expect(files.some((f) => f.includes("README"))).toBe(false);
   });
 });
 
