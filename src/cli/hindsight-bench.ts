@@ -39,6 +39,7 @@ import { dirname, resolve } from "node:path";
 import type { Command } from "commander";
 import chalk from "chalk";
 
+import { anonymiseResult, formatBankMapping } from "../hindsight-bench/anonymise.js";
 import { BankSelectionError, parseConcurrency, selectBanks } from "../hindsight-bench/banks.js";
 import {
   DEFAULT_CONTENTION,
@@ -371,9 +372,24 @@ async function runMeasureMode(opts: BenchOpts): Promise<void> {
     load.stop();
   }
 
+  // The terminal summary keeps REAL bank names — it is the operator's own
+  // screen, not a file, and it is what makes the run readable while it happens.
   process.stdout.write(formatSummary(result) + "\n");
-  if (opts.out !== undefined) writeOut(opts.out, JSON.stringify(result, null, 2) + "\n");
-  if (opts.csv !== undefined) writeOut(opts.csv, toCsv(result) + "\n");
+
+  // Everything that reaches DISK is anonymised first (#4499). Result files are
+  // committed to a public repo as regression baselines, and a real bank id in
+  // one publishes the operator's private fleet roster. This is the only write
+  // path for a `BenchResult`, so the guarantee holds without anyone
+  // remembering to ask for it.
+  const { result: safeResult, mapping } = anonymiseResult(result);
+  if (opts.out !== undefined || opts.csv !== undefined) {
+    process.stderr.write(
+      `${chalk.cyan("i")} bank names are pseudonymised in the written file(s); this mapping is NOT persisted:\n` +
+        `${formatBankMapping(mapping)}\n`,
+    );
+  }
+  if (opts.out !== undefined) writeOut(opts.out, JSON.stringify(safeResult, null, 2) + "\n");
+  if (opts.csv !== undefined) writeOut(opts.csv, toCsv(safeResult) + "\n");
   if (opts.out === undefined && opts.csv === undefined) {
     process.stderr.write(
       chalk.yellow("! no --out given — this run's samples were not persisted and cannot be diffed later\n"),

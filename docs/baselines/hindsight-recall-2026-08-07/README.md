@@ -15,9 +15,9 @@ re-running anything.
 |---|---|---|
 | `idle-a.json` / `.csv` | 5 banks × c=1,4,8,16, n=40, no load | good — the reference run |
 | `idle-b.json` / `.csv` | the same sweep repeated ~20 min later | good — the AC1 repeat |
-| `aba3-idle1.json` | `klanker`@c1, n=100, idle | good — A of the A/B/A |
-| `aba3-cont.json` | `klanker`@c1, n=100, 4 load workers × 10 % scans | good — B, 4/4 backends confirmed attached |
-| `aba3-idle2.json` | `klanker`@c1, n=100, idle | good — the second A |
+| `aba3-idle1.json` | `bank-01`@c1, n=100, idle | good — A of the A/B/A |
+| `aba3-cont.json` | `bank-01`@c1, n=100, 4 load workers × 10 % scans | good — B, 4/4 backends confirmed attached |
+| `aba3-idle2.json` | `bank-01`@c1, n=100, idle | good — the second A |
 | `flank-idle1.json` / `.csv` | 5 banks × c=1,4, n=40, idle | good |
 | `contended2.json` / `.csv` | the same sweep under load | **partial** — see below |
 | `arms.json` | per-retrieval-arm attribution, low-sample traced pass | indicative only; a traced recall serialises megabytes, so these timings are NOT comparable to the latency cells |
@@ -25,8 +25,8 @@ re-running anything.
 ## `contended2.json` is partly unusable, deliberately kept
 
 The Hindsight container was recreated by unrelated fleet work at 00:15:50Z,
-partway through this sweep. `switchroom-dev@c4` recorded 40 errors and no
-samples; `switchroom-dev@c1` recorded 6 samples against 34 errors, and its
+partway through this sweep. `bank-14@c4` recorded 40 errors and no
+samples; `bank-14@c1` recorded 6 samples against 34 errors, and its
 resulting p95 of 1728 ms — computed over whichever calls were fast enough not to
 fail — would read as the fastest cell in the run.
 

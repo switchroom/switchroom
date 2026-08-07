@@ -20,7 +20,7 @@ number every later phase (#4476, #4477, #4478) is graded against.
 | working set / `shared_buffers` | 84 % |
 | `pg_stat_database.stats_reset` | **NEVER** — cache-hit ratios are cumulative since initdb and are not a statement about this run |
 | `memory_units` heap hit ratio | 97.1 % (cumulative, see above) |
-| banks swept | `klanker` (230,020 rows), `gymbro` (17,977), `ziggy` (1,493), `lisa-profile` (157), `switchroom-dev` (12) |
+| banks swept | `bank-01` (230,020 rows), `bank-07` (17,977), `bank-10` (1,493), `bank-12` (157), `bank-14` (12) |
 | query set | `generic-v1`, budget `mid`, `max_tokens` 4096 |
 
 ## Idle latency by bank size and concurrency
@@ -30,17 +30,17 @@ every later phase is graded on.
 
 | bank | rows | c=1 | c=4 | c=8 | c=16 |
 |---|---:|---:|---:|---:|---:|
-| `klanker` | 230,020 | **1886** | **8968** | **16487** | **24129** |
-| `gymbro` | 17,977 | **2559** | **5067** | **15944** | **27049** |
-| `ziggy` | 1,493 | **4181** | **9361** | **10974** | **23815** |
-| `lisa-profile` | 157 | **2394** | **15582** | **20200** | **22383** |
-| `switchroom-dev` | 12 | **2562** | **10824** | **13157** | **21801** |
+| `bank-01` | 230,020 | **1886** | **8968** | **16487** | **24129** |
+| `bank-07` | 17,977 | **2559** | **5067** | **15944** | **27049** |
+| `bank-10` | 1,493 | **4181** | **9361** | **10974** | **23815** |
+| `bank-12` | 157 | **2394** | **15582** | **20200** | **22383** |
+| `bank-14` | 12 | **2562** | **10824** | **13157** | **21801** |
 
 Two things fall out of this table immediately, and neither depends on the
 reproducibility question below.
 
-**Bank size is not the dominant axis; concurrency is.** `klanker` has ~19,000×
-the rows of `switchroom-dev` and its single-threaded p95 is *lower*. Moving from
+**Bank size is not the dominant axis; concurrency is.** `bank-01` has ~19,000×
+the rows of `bank-14` and its single-threaded p95 is *lower*. Moving from
 c=1 to c=16 multiplies p95 by 9–13× on every bank regardless of size. Whatever
 #4474 fixes, "big banks are slow" is not the shape of the problem in the
 measured range — queueing is.
@@ -57,8 +57,8 @@ runs. It was not met. The measured result, not a tuned one:
 |---|---:|---:|---:|---:|---:|
 | `idle-a` vs `idle-b` (p95) | 40 | 20 | **82.7 %** | 30.5 % | 3/20 |
 | `idle-a` vs `idle-b` (p50) | 40 | 20 | 59.8 % | 21.7 % | 3/20 |
-| `aba3-idle1` vs `aba3-idle2`, `klanker`@c1 (p95) | 100 | 1 | **11.5 %** | — | 0/1 |
-| `aba3-idle1` vs `aba3-idle2`, `klanker`@c1 (p50) | 100 | 1 | **6.4 %** | — | 1/1 |
+| `aba3-idle1` vs `aba3-idle2`, `bank-01`@c1 (p95) | 100 | 1 | **11.5 %** | — | 0/1 |
+| `aba3-idle1` vs `aba3-idle2`, `bank-01`@c1 (p50) | 100 | 1 | **6.4 %** | — | 1/1 |
 
 **Two distinct causes, and they act on opposite ends of the sweep.**
 
@@ -88,7 +88,7 @@ it to whatever the noise happens to be is how a measurement stops being one.
 ## AC4 — the contention mode demonstrably moves the tail: **PASSED**
 
 Measured as A/B/A so drift cannot be mistaken for effect — an idle run, a
-contended run, then a second idle run, `klanker`@c1, n=100 each, load = 4
+contended run, then a second idle run, `bank-01`@c1, n=100 each, load = 4
 workers × 10 % `TABLESAMPLE` scans, **4 of 4 backends confirmed attached to
 PostgreSQL** before the sweep started.
 
@@ -103,7 +103,7 @@ Contention raises p95 by **+174.9 %** against the preceding idle run and
 the contended one, so this is the load, not drift.
 
 Broader shape, `flank-idle1` vs `contended2` (5 banks × c=1,4, n=40): p95 rose
-in **7 of 8 gradeable cells**, median **+19.8 %**, worst `lisa-profile`@c4 at
+in **7 of 8 gradeable cells**, median **+19.8 %**, worst `bank-12`@c4 at
 +162.6 %.
 
 > That comparison's own verdict is `FAIL`, on purpose: the Hindsight container

@@ -5,11 +5,11 @@
     "apiUrl": "http://127.0.0.1:18888",
     "container": "switchroom-hindsight",
     "banks": [
-      "klanker",
-      "gymbro",
-      "ziggy",
-      "lisa-profile",
-      "switchroom-dev"
+      "bank-01",
+      "bank-07",
+      "bank-10",
+      "bank-12",
+      "bank-14"
     ],
     "concurrency": [
       1
@@ -35,59 +35,59 @@
     "memoryUnitsIndexBytes": 2375778304,
     "bankRows": [
       {
-        "bank": "klanker",
+        "bank": "bank-01",
         "rows": 229799
       },
       {
-        "bank": "overlord",
+        "bank": "bank-02",
         "rows": 223000
       },
       {
-        "bank": "finn",
+        "bank": "bank-03",
         "rows": 86488
       },
       {
-        "bank": "assistant",
+        "bank": "bank-04",
         "rows": 86240
       },
       {
-        "bank": "carrie",
+        "bank": "bank-05",
         "rows": 81844
       },
       {
-        "bank": "marko",
+        "bank": "bank-06",
         "rows": 43716
       },
       {
-        "bank": "gymbro",
+        "bank": "bank-07",
         "rows": 17977
       },
       {
-        "bank": "reggie",
+        "bank": "bank-08",
         "rows": 10688
       },
       {
-        "bank": "lawgpt",
+        "bank": "bank-09",
         "rows": 8957
       },
       {
-        "bank": "ziggy",
+        "bank": "bank-10",
         "rows": 1493
       },
       {
-        "bank": "ken-profile",
+        "bank": "bank-11",
         "rows": 190
       },
       {
-        "bank": "lisa-profile",
+        "bank": "bank-12",
         "rows": 157
       },
       {
-        "bank": "kdogg",
+        "bank": "bank-13",
         "rows": 66
       },
       {
-        "bank": "switchroom-dev",
+        "bank": "bank-14",
         "rows": 12
       }
     ],
@@ -143,7 +143,7 @@
   },
   "cells": [
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "rows": 229799,
       "concurrency": 1,
       "stats": {
@@ -168,7 +168,7 @@
       "errorSamples": []
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "rows": 17977,
       "concurrency": 1,
       "stats": {
@@ -193,7 +193,7 @@
       "errorSamples": []
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "rows": 1493,
       "concurrency": 1,
       "stats": {
@@ -218,7 +218,7 @@
       "errorSamples": []
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "rows": 157,
       "concurrency": 1,
       "stats": {
@@ -243,7 +243,7 @@
       "errorSamples": []
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "rows": 12,
       "concurrency": 1,
       "stats": {
@@ -270,7 +270,7 @@
   ],
   "arms": [
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "method": "semantic",
       "fact_type": "world",
       "n": 5,
@@ -279,7 +279,7 @@
       "max": 43.93458366394043
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "method": "bm25",
       "fact_type": "world",
       "n": 5,
@@ -288,7 +288,7 @@
       "max": 43.93458366394043
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "method": "semantic",
       "fact_type": "experience",
       "n": 5,
@@ -297,7 +297,7 @@
       "max": 43.93458366394043
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "method": "bm25",
       "fact_type": "experience",
       "n": 5,
@@ -306,7 +306,7 @@
       "max": 43.93458366394043
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "method": "graph",
       "fact_type": "experience",
       "n": 5,
@@ -315,7 +315,7 @@
       "max": 24.28579330444336
     },
     {
-      "bank": "gymbro",
+      "bank": "bank-07",
       "method": "graph",
       "fact_type": "world",
       "n": 5,
@@ -324,7 +324,7 @@
       "max": 19.286155700683594
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "method": "semantic",
       "fact_type": "world",
       "n": 5,
@@ -333,7 +333,7 @@
       "max": 178.5515546798706
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "method": "bm25",
       "fact_type": "world",
       "n": 5,
@@ -342,7 +342,7 @@
       "max": 178.5515546798706
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "method": "semantic",
       "fact_type": "experience",
       "n": 5,
@@ -351,7 +351,7 @@
       "max": 178.5515546798706
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "method": "bm25",
       "fact_type": "experience",
       "n": 5,
@@ -360,7 +360,7 @@
       "max": 178.5515546798706
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "method": "graph",
       "fact_type": "experience",
       "n": 5,
@@ -369,7 +369,7 @@
       "max": 28.50794792175293
     },
     {
-      "bank": "klanker",
+      "bank": "bank-01",
       "method": "graph",
       "fact_type": "world",
       "n": 5,
@@ -378,7 +378,7 @@
       "max": 25.397300720214844
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "method": "graph",
       "fact_type": "world",
       "n": 5,
@@ -387,7 +387,7 @@
       "max": 10.900020599365234
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "method": "graph",
       "fact_type": "experience",
       "n": 5,
@@ -396,7 +396,7 @@
       "max": 10.82754135131836
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "method": "semantic",
       "fact_type": "world",
       "n": 5,
@@ -405,7 +405,7 @@
       "max": 1.7474889755249023
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "method": "bm25",
       "fact_type": "world",
       "n": 5,
@@ -414,7 +414,7 @@
       "max": 1.7474889755249023
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "method": "semantic",
       "fact_type": "experience",
       "n": 5,
@@ -423,7 +423,7 @@
       "max": 1.7474889755249023
     },
     {
-      "bank": "lisa-profile",
+      "bank": "bank-12",
       "method": "bm25",
       "fact_type": "experience",
       "n": 5,
@@ -432,7 +432,7 @@
       "max": 1.7474889755249023
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "method": "graph",
       "fact_type": "world",
       "n": 5,
@@ -441,7 +441,7 @@
       "max": 9.499311447143555
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "method": "semantic",
       "fact_type": "world",
       "n": 5,
@@ -450,7 +450,7 @@
       "max": 1.2860298156738281
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "method": "bm25",
       "fact_type": "world",
       "n": 5,
@@ -459,7 +459,7 @@
       "max": 1.2860298156738281
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "method": "semantic",
       "fact_type": "experience",
       "n": 5,
@@ -468,7 +468,7 @@
       "max": 1.2860298156738281
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "method": "bm25",
       "fact_type": "experience",
       "n": 5,
@@ -477,7 +477,7 @@
       "max": 1.2860298156738281
     },
     {
-      "bank": "switchroom-dev",
+      "bank": "bank-14",
       "method": "graph",
       "fact_type": "experience",
       "n": 5,
@@ -486,7 +486,7 @@
       "max": 0.6318092346191406
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "method": "graph",
       "fact_type": "experience",
       "n": 5,
@@ -495,7 +495,7 @@
       "max": 15.457630157470703
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "method": "graph",
       "fact_type": "world",
       "n": 5,
@@ -504,7 +504,7 @@
       "max": 16.547203063964844
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "method": "semantic",
       "fact_type": "world",
       "n": 5,
@@ -513,7 +513,7 @@
       "max": 180.8382272720337
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "method": "bm25",
       "fact_type": "world",
       "n": 5,
@@ -522,7 +522,7 @@
       "max": 180.8382272720337
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "method": "semantic",
       "fact_type": "experience",
       "n": 5,
@@ -531,7 +531,7 @@
       "max": 180.8382272720337
     },
     {
-      "bank": "ziggy",
+      "bank": "bank-10",
       "method": "bm25",
       "fact_type": "experience",
       "n": 5,
