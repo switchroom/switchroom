@@ -24,6 +24,32 @@ now an anomaly worth investigating, not the norm.
   the image pull and reuses the registry buildcache instead of rebuilding. Cuts
   roughly 4-6 min off release image builds and 2-3 min off e2e runs. (#4513)
 
+### Release process: the `## Unreleased` entry is staged author-side
+
+- **Auto-stage the `## Unreleased` entry author-side, so #4469's check stops
+  costing a round-trip (#4501)** — new `scripts/gen-changelog-entry.mjs`
+  (`bun run changelog:generate`) derives an entry from the branch's
+  conventional-commit title and appends it under `## Unreleased` in the AUTHOR's
+  own commit, before `gh pr create`. It runs author-side rather than as a CI
+  commit-back on purpose: a push made with the workflow's default `GITHUB_TOKEN`
+  does not create new workflow runs (GitHub's recursion guard), so a
+  committed-back entry would leave all seven required contexts absent on the new
+  head SHA and wedge the PR — and the repo carries no App/PAT push credential to
+  re-trigger them. The generator reads the WORKING-TREE changelog (so it is
+  idempotent even before the entry is committed — a second run no-ops and it
+  never clobbers a hand-written one), reuses `check-changelog-entry.mjs`'s
+  parsing rather than duplicating it, skips on `merge_group` and the release PR,
+  and honours the same `no-changelog` / `[skip changelog]` hatches as an opt-out
+  of both enforcement and generation. #4469's check stays as the deterministic
+  CI backstop. Documented in the `dev-protocol` skill and this repo's PR-hygiene
+  flow; rationale in `.github/MERGE-QUEUE.md` § "Author-side changelog
+  generation". It is deliberately NOT in the always-loaded
+  `profiles/_shared/dev-protocol.md.hbs` fragment: that fragment carries
+  judgement criteria, not procedure, and `scripts/claude-md-byte-ratchet.txt`
+  is the mechanism that keeps the split honest — a 749-byte procedure bullet
+  there breached the rendered-CLAUDE.md ceiling, and the ratchet's own doctrine
+  says the remedy is on-demand skill material, never a higher ceiling.
+
 ## v0.20.15 — migrating a populated Hindsight bank to ParadeDB `pg_search` is a plain env flip, not a trapdoor
 
 ### Hindsight: a populated bank can migrate to `pg_search` by flipping the env, not by hand

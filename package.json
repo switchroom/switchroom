@@ -51,6 +51,7 @@
     "lint:litellm-config-guard": "node scripts/check-litellm-config-guard.mjs",
     "lint:release-asset-contract": "node scripts/check-release-asset-names.mjs",
     "lint:changelog-entry": "node scripts/check-changelog-entry.mjs",
+    "changelog:generate": "node scripts/gen-changelog-entry.mjs",
     "lint:agent-attribution-trailers": "node scripts/check-agent-attribution-trailers.mjs",
     "lint:hostd-template-guard": "bun scripts/check-hostd-template-guard.ts",
     "lint:bench-baseline-anonymised": "node scripts/check-bench-baseline-anonymised.mjs",
