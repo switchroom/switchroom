@@ -18,7 +18,10 @@ import {
   resolveHindsightPerfOverrides,
 } from "./hindsight-perf-defaults.js";
 import {
+  HINDSIGHT_PG_SHARED_BUFFERS_ENV,
+  hindsightMemBudgetWarning,
   hindsightPgEnv,
+  parseDockerSizeToMib,
   resolveHindsightPgOverrides,
 } from "./hindsight-pg-defaults.js";
 import {
@@ -879,6 +882,16 @@ export { HINDSIGHT_DEFAULT_CONSOLIDATION_LLM_PARALLELISM } from "./hindsight-per
 // OOM kill that takes memory down for the whole fleet. Never emit a
 // memory-swap equal to the memory limit — `tests/setup/hindsight.test.ts`
 // asserts the invariant on BOTH the run-args and compose paths.
+//
+// **This is the DEFAULT, not the value.** It was the value until this knob landed: with
+// no config path, an operator who raised the live container's cap by hand had
+// it silently reverted to 16g by the next `switchroom memory setup --recreate`
+// — while `shared_buffers` (which IS configurable, via `hindsight.env`) stayed
+// where they had put it. That is how a 16 GiB cap ended up carrying a 12 GiB
+// buffer pool on the live fleet. Override with `hindsight.mem_limit`; see
+// {@link resolveHindsightMemLimit} for the resolution and
+// {@link import("./hindsight-pg-defaults.js").hindsightMemBudgetWarning} for
+// the check that now names the dangerous combination out loud.
 export const HINDSIGHT_DEFAULT_MEM_LIMIT = "16g";
 export const HINDSIGHT_DEFAULT_MEM_RESERVATION = "4g";
 export const HINDSIGHT_DEFAULT_PIDS_LIMIT = 1000;
@@ -2020,8 +2033,91 @@ export interface HindsightPerfOptions {
    * URLs. Tests pass an explicit boolean.
    */
   localLlm?: boolean;
+  /**
+   * The operator's `hindsight.mem_limit` — the container's docker memory cap.
+   * Absent / blank ⇒ {@link HINDSIGHT_DEFAULT_MEM_LIMIT}.
+   *
+   * This rides the options object rather than `env` on purpose. `env` is a map
+   * of vars switchroom EMITS INTO the container (`-e K=V` /
+   * `environment: - K=V`); the memory cap is a docker `HostConfig.Memory`
+   * flag, consumed by the daemon and never seen by any process inside the
+   * container. Putting it in `env` would either emit a var nothing reads or
+   * break that map's one invariant. It rides the options object rather than a
+   * new positional for the reason this object exists at all (see the interface
+   * doc): a 9th positional is a silent argument-order mismatch waiting to
+   * happen between the two launch paths.
+   *
+   * @see resolveHindsightMemLimit
+   */
+  memLimit?: string;
   /** Process-environment seam for tests; defaults to `process.env`. */
   processEnv?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The docker memory cap the hindsight container is actually created with.
+ *
+ * ONE derivation, called by both {@link startHindsight} and
+ * {@link generateHindsightComposeSnippet}, for the same anti-drift reason as
+ * {@link hindsightPerfEnvPairs}: a cap that differs between the docker-run and
+ * compose paths is exactly the class of divergence that produced the bug this
+ * knob exists to fix.
+ *
+ * A blank / whitespace-only value is an accident rather than an override
+ * (same discipline as `resolveHindsightPgOverrides`) and falls back to the
+ * default. A non-blank value that docker could not parse THROWS: the schema
+ * regex is the first line of defence, and silently substituting the default
+ * for a typo'd cap would reproduce the very "silently reverted to 16g"
+ * behaviour this change removes.
+ *
+ * It also throws below {@link HINDSIGHT_DEFAULT_MEM_RESERVATION}. The soft
+ * reservation is emitted unconditionally on both launch paths, and docker
+ * refuses to create a container whose memory limit is under its reservation —
+ * a previously unreachable state (the cap was a constant `16g`) that this knob
+ * makes reachable. Docker's own rejection is late and opaque; this one names
+ * both numbers.
+ */
+export function resolveHindsightMemLimit(perf?: HindsightPerfOptions): string {
+  const raw = perf?.memLimit?.trim();
+  if (!raw) return HINDSIGHT_DEFAULT_MEM_LIMIT;
+  const capMib = parseDockerSizeToMib(raw);
+  if (capMib === null) {
+    throw new Error(
+      `hindsight.mem_limit: \`${raw}\` is not a docker memory size. Use a ` +
+        "number with an optional b/k/m/g suffix, e.g. `24g` or `16384m`.",
+    );
+  }
+  const reservationMib = parseDockerSizeToMib(HINDSIGHT_DEFAULT_MEM_RESERVATION);
+  if (reservationMib !== null && capMib < reservationMib) {
+    throw new Error(
+      `hindsight.mem_limit: \`${raw}\` is below the container's memory ` +
+        `reservation (${HINDSIGHT_DEFAULT_MEM_RESERVATION}) — docker refuses ` +
+        "to create a container whose memory limit is under its reservation.",
+    );
+  }
+  return raw;
+}
+
+/**
+ * The memory-budget warning for the config this container will launch with, or
+ * `null` when the cap comfortably clears the configured `shared_buffers`.
+ *
+ * Resolves BOTH sides from the same helpers the launch paths use — the cap
+ * from {@link resolveHindsightMemLimit}, `shared_buffers` from
+ * {@link hindsightPgEnvPairs} — so the check can never be evaluated against a
+ * different pair of numbers than the container gets.
+ */
+export function hindsightMemBudgetWarningFor(
+  perf?: HindsightPerfOptions,
+): string | null {
+  const sharedBuffers = hindsightPgEnvPairs(perf).find(
+    ([k]) => k === HINDSIGHT_PG_SHARED_BUFFERS_ENV,
+  )?.[1];
+  if (!sharedBuffers) return null;
+  return hindsightMemBudgetWarning({
+    memLimit: resolveHindsightMemLimit(perf),
+    sharedBuffers,
+  });
 }
 
 /**
@@ -2268,14 +2364,22 @@ export function startHindsight(
     perf,
   }).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
 
+  // Loud on the launch path itself, not only in the CLI wrappers: `switchroom
+  // memory setup --recreate` is what silently reverted the cap, so the warning
+  // has to be attached to the thing that does the reverting.
+  const memBudgetWarning = hindsightMemBudgetWarningFor(perf);
+  if (memBudgetWarning) console.warn(`  ! ${memBudgetWarning}`);
+
   const args = [
     "run", "-d",
     "--name", "switchroom-hindsight",
     "--restart", "always",
     // Container resource caps (memory + pids only; CPU uncapped —
     // see HINDSIGHT_DEFAULT_MEM_LIMIT constant for the v0.13.22 → v0.13.23
-    // unwind rationale).
-    `--memory=${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
+    // unwind rationale). The cap itself is `hindsight.mem_limit` (default
+    // HINDSIGHT_DEFAULT_MEM_LIMIT), resolved through the SAME helper the
+    // compose path uses.
+    `--memory=${resolveHindsightMemLimit(perf)}`,
     `--memory-reservation=${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `--pids-limit=${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
     // PostgreSQL needs far more than Docker's 64MB default shm (see
@@ -2872,7 +2976,10 @@ export function generateHindsightComposeSnippet(
     // paths (see HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS / _MAX, #3795 / #3797).
     `      - SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS=${HINDSIGHT_DEFAULT_REQUEUE_DEAD_LETTERS}`,
     `      - SWITCHROOM_HINDSIGHT_REQUEUE_MAX=${HINDSIGHT_DEFAULT_REQUEUE_MAX}`,
-    `    mem_limit: ${HINDSIGHT_DEFAULT_MEM_LIMIT}`,
+    // Operator's `hindsight.mem_limit` (default HINDSIGHT_DEFAULT_MEM_LIMIT),
+    // from the SAME resolver the docker-run path uses so an emitted compose
+    // file cannot cap the container differently than `memory setup` would.
+    `    mem_limit: ${resolveHindsightMemLimit(perf)}`,
     `    mem_reservation: ${HINDSIGHT_DEFAULT_MEM_RESERVATION}`,
     `    pids_limit: ${HINDSIGHT_DEFAULT_PIDS_LIMIT}`,
     // PostgreSQL shm — see HINDSIGHT_DEFAULT_SHM_SIZE. Without this the
