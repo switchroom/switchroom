@@ -70,6 +70,22 @@ now an anomaly worth investigating, not the norm.
   six scenarios, including the two that must keep failing. Wired into the
   `hindsight-probe` CI job, which hard-fails rather than skipping. (#4506)
 
+### Hindsight: `HINDSIGHT_API_BM25_MAX_QUERY_TERMS` is no longer silently discarded
+
+- **The key was inert no matter what an operator wrote.** Upstream parses
+  `HINDSIGHT_API_BM25_MAX_QUERY_TERMS` (`config.py:764`, `:2946`) and threads it
+  to `retrieval.py:240` -> `engine/sql/postgresql.py:258`, where it truncates the
+  token list before the BM25 query is built — the direct lever on a multi-KB
+  consolidation query becoming a disjunction over hundreds of terms. But it was
+  not a member of `HINDSIGHT_PERF_ENV_KEYS`, and `resolveHindsightPerfOverrides`
+  skips every key outside the managed set, so a `hindsight.env` line for it was
+  dropped with no error and never reached the container on either launch path.
+  Added to `HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS` and documented on the
+  `hindsight.env` schema description. Override-only on purpose: switchroom emits
+  no default, so a stock fleet keeps upstream's unbounded `0` — a cap chosen
+  without a measurement silently drops the tail of a long query and degrades
+  recall quality with nothing to notice. (#4506)
+
 ## v0.20.14 — BM25 filter-field pushdown for Hindsight keyword recall, and a phase-attribution ceiling for database-side proposals
 
 ### Hindsight keyword recall: BM25 filter-field pushdown

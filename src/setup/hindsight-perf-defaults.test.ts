@@ -352,7 +352,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these fifty keys, by name", () => {
+  it("is overridable on exactly these fifty-one keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -360,6 +360,7 @@ describe("operator override wins", () => {
     // `hindsight.env` description names these keys), so pin the literal list:
     // adding or dropping a managed key must fail here and force the doc update.
     expect([...HINDSIGHT_PERF_ENV_KEYS].sort()).toEqual([
+      "HINDSIGHT_API_BM25_MAX_QUERY_TERMS",
       "HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
@@ -623,6 +624,66 @@ describe("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE (override-only)", 
     );
     // Both paths, or the value dies on whichever recreate the operator uses —
     // exactly the live-vs-durable gap this whole change closes.
+    expect(fromRun.get(KEY)).toEqual([VALUE]);
+    expect(fromCompose.get(KEY)).toEqual([VALUE]);
+  });
+
+  it("still reaches the container on a host with NO gated capability", () => {
+    const perf = { env: { [KEY]: VALUE }, processEnv: {} };
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual([VALUE]);
+  });
+});
+
+describe("HINDSIGHT_API_BM25_MAX_QUERY_TERMS (override-only)", () => {
+  // Upstream parses this at config.py:2946 from ENV_BM25_MAX_QUERY_TERMS
+  // (config.py:764), defaults it to 0 = unbounded, and threads it to
+  // retrieval.py:240 -> engine/sql/postgresql.py:258, which truncates the token
+  // list before the BM25 query is built. Before this key joined the managed
+  // set it was INERT: resolveHindsightPerfOverrides skips anything outside
+  // HINDSIGHT_PERF_ENV_KEYS, so an operator's hindsight.env line was discarded
+  // with no error and never reached the container on EITHER launch path. That
+  // is the regression these cases guard — the value must survive `switchroom
+  // apply` and arrive intact.
+  const KEY = "HINDSIGHT_API_BM25_MAX_QUERY_TERMS";
+  const VALUE = "64";
+  const CAPS = [
+    { gpu: false, localLlm: false },
+    { gpu: true, localLlm: false },
+    { gpu: false, localLlm: true },
+    { gpu: true, localLlm: true },
+  ];
+
+  it("is in the managed set but in NO defaults group (no emitted default)", () => {
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
+    for (const group of [
+      HINDSIGHT_PERF_DEFAULTS_UNGATED,
+      HINDSIGHT_PERF_DEFAULTS_GPU,
+      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+    ]) {
+      expect(group.map(([k]) => k)).not.toContain(KEY);
+    }
+  });
+
+  it.each(CAPS)(
+    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — upstream's unbounded 0 stands",
+    (caps) => {
+      // A cap picked without a measurement would silently drop the tail of a
+      // long query and degrade recall QUALITY with no error to notice, so a
+      // stock fleet must stay on upstream's 0.
+      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+    },
+  );
+
+  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
+    const perf = { env: { [KEY]: VALUE }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    // Both paths, or the value dies on whichever recreate the operator uses.
     expect(fromRun.get(KEY)).toEqual([VALUE]);
     expect(fromCompose.get(KEY)).toEqual([VALUE]);
   });

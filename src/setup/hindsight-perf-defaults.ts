@@ -1479,6 +1479,38 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE: "hindsight_english"
  * ```
  *
+ * ### `HINDSIGHT_API_BM25_MAX_QUERY_TERMS` (override-only)
+ *
+ * A cap on how many tokens of a query the keyword arm actually searches for.
+ * Upstream parses it at `config.py:2946` from `ENV_BM25_MAX_QUERY_TERMS`
+ * (`config.py:764`), defaults it to `0` = unbounded (`DEFAULT_BM25_MAX_QUERY_TERMS`,
+ * `config.py:935`), and threads it to `retrieval.py:240` ->
+ * `engine/sql/postgresql.py:258`, which truncates the token list before the
+ * BM25 query is built. It is the direct lever on the pathological case: a
+ * multi-KB consolidation query becomes a BM25 disjunction over hundreds of
+ * terms, and the cost of that scan is linear in the term count.
+ *
+ * Until now the key was INERT no matter what an operator wrote. It is not a
+ * member of {@link HINDSIGHT_PERF_ENV_KEYS} (of which this set is one of the
+ * three constituents), and {@link resolveHindsightPerfOverrides} skips every
+ * key outside the managed set — so a `hindsight.env` line for it was discarded
+ * with no error and no warning, and the value never reached the container on
+ * either launch path. That is the same silent-drop defect recorded above for
+ * the reranker keys; this entry closes it for this one.
+ *
+ * OVERRIDE-ONLY, deliberately: switchroom emits no default, so a stock fleet
+ * keeps upstream's unbounded `0`. Choosing a cap here would be an
+ * unfalsifiable opinion — the right ceiling depends on a fleet's query shape,
+ * and a too-low value silently drops query terms and degrades recall QUALITY
+ * with no error to notice. Promote it to an emitted default only behind a
+ * measurement.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_BM25_MAX_QUERY_TERMS: "64"
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1508,6 +1540,7 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_TEMPORAL_LANGUAGES",
   "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
   "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
+  "HINDSIGHT_API_BM25_MAX_QUERY_TERMS",
 ]);
 
 /**
