@@ -1,0 +1,29 @@
+Pager usage is off.
+SET
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=10.00..10.62 rows=50 width=20) (actual time=231.165..231.291 rows=50.00 loops=1)
+   Output: id, (paradedb.score(id))
+   Buffers: shared hit=171517
+   ->  Custom Scan (ParadeDB Base Scan) on public.memory_units  (cost=10.00..10.62 rows=50 width=20) (actual time=231.163..231.286 rows=50.00 loops=1)
+         Output: id, paradedb.score(id)
+         Table: memory_units
+         Index: idx_memory_units_text_search
+         Segment Count: 4
+         Worker Selection: Per-segment
+         Heap Fetches: 50
+         Virtual Tuples: 0
+         Invisible Tuples: 0
+         Exec Method: TopKScanExecState
+         Scores: true
+            TopK Order By: pdb.score() desc
+            TopK Limit: 50
+            Queries: 1
+         Tantivy Query: {"boolean":{"must":[{"heap_filter":{"indexed_query":{"boolean":{"must":[{"with_index":{"query":{"boolean":{"should":[{"match":{"field":"text","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}},{"match":{"field":"context","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}},{"match":{"field":"text_signals","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}}]}}}}]}},"field_filters":[{"heap_filter":"(bank_id = 'bank-01'::text)"}]}},{"heap_filter":{"indexed_query":{"boolean":{"must":[{"with_index":{"query":{"boolean":{"should":[{"match":{"field":"text","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}},{"match":{"field":"context","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}},{"match":{"field":"text_signals","value":"tk00007 tk00031 tk00120","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":null}}]}}}}]}},"field_filters":[{"heap_filter":"(fact_type = 'world'::text)"}]}}]}}
+         Buffers: shared hit=171517
+ Planning:
+   Buffers: shared hit=281
+ Planning Time: 2.991 ms
+ Execution Time: 231.446 ms
+(23 rows)
+

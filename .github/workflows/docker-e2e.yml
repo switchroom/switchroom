@@ -135,6 +135,7 @@ jobs:
               - 'tests/docker/hindsight-retry-perturbation-patches.test.ts'
               - 'tests/docker/hindsight-mm-refresh-debounce-patch.test.ts'
               - 'tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts'
+              - 'tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts'
               - 'tests/docker/hindsight-graph-seed-retirement.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'src/setup/hindsight-perf-defaults.ts'
@@ -420,6 +421,22 @@ jobs:
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts
+
+      - name: Run the hindsight pg_search filter-pushdown probe (RED/GREEN, must not skip)
+        # Epic #4474 phase P4 (#4478). The bakes test can only see that the
+        # filter-field map and the literal cast are PRESENT in the patched
+        # source; it cannot see the outcome that matters — that the two real
+        # shipping migrations emit a CREATE INDEX carrying
+        # `(bank_id::pdb.literal), (fact_type::pdb.literal)`, on the fresh-install
+        # path AND on both rebuild branches. The regression this guards is
+        # silent and expensive: without those columns ParadeDB degrades the
+        # recall arm's `bank_id`/`fact_type` equality to a post-scoring
+        # heap_filter, so every keyword arm scores the whole table (measured
+        # 171,517 vs 405 shared buffer hits per arm, 423x) with identical
+        # RESULTS — nothing but a plan or a latency chart can tell.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts
 
       - name: Run the hindsight graph-seed RETIREMENT probe (RED/GREEN, must not skip)
         # The v0.8.5 upstream #2968 carry was retired in the v0.8.6 base bump —

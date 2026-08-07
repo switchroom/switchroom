@@ -99,22 +99,37 @@ const UPSTREAM_IMAGE = (() => {
 const PATCH_NAME = "pg_search tokenizer-drift guard";
 
 /**
- * The patch block under test, pulled out of the Dockerfile's
- * `RUN python3 - <<'PYEOF' ... PYEOF` heredocs by its unique patch name.
+ * PREREQUISITE, applied first (switchroom #4478). The pushdown block installs
+ * `pg_search_filter_fields` / `pg_search_filter_columns` into `_pg_search.py`,
+ * which this patch's rebuild calls so that a rebuild cannot silently un-do the
+ * BM25 filter-field fix. It is a real ordering dependency in the Dockerfile,
+ * so the probe reproduces it rather than pretending the block is standalone;
+ * `hindsight-pg-search-filter-pushdown-patch.test.ts` owns its assertions.
+ */
+const PREREQ_PATCH_NAME = "pg_search filter-field pushdown";
+
+/**
+ * The patch block under test plus its prerequisite, pulled out of the
+ * Dockerfile's `RUN python3 - <<'PYEOF' ... PYEOF` heredocs by their unique
+ * patch names and returned in Dockerfile (application) order.
  */
 function patchBlocks(): string[] {
   const blocks = [
     ...dockerfile.matchAll(/^RUN python3 - <<'PYEOF'\n([\s\S]*?)^PYEOF$/gm),
   ].map((m) => m[1]);
-  const hits = blocks.filter((b) => b.includes(PATCH_NAME));
-  if (hits.length !== 1) {
-    throw new Error(
-      `Dockerfile.hindsight contains ${hits.length} "${PATCH_NAME}" RUN blocks ` +
-        `(expected exactly 1) — if the patch was deliberately removed, delete ` +
-        `this test with it.`,
-    );
+  const picked: string[] = [];
+  for (const name of [PREREQ_PATCH_NAME, PATCH_NAME]) {
+    const hits = blocks.filter((b) => b.includes(name));
+    if (hits.length !== 1) {
+      throw new Error(
+        `Dockerfile.hindsight contains ${hits.length} "${name}" RUN blocks ` +
+          `(expected exactly 1) — if the patch was deliberately removed, delete ` +
+          `this test with it.`,
+      );
+    }
+    picked.push(hits[0]);
   }
-  return hits;
+  return blocks.filter((b) => picked.includes(b));
 }
 
 /**
@@ -410,8 +425,11 @@ describe("Dockerfile.hindsight pg_search tokenizer-drift probe is real, not a si
     expect(UPSTREAM_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
   });
 
-  it("extracts exactly the one patch block it claims to prove", () => {
-    expect(patchBlocks()).toHaveLength(1);
+  it("extracts the patch block it claims to prove plus its prerequisite, in order", () => {
+    const picked = patchBlocks();
+    expect(picked).toHaveLength(2);
+    expect(picked[0]).toContain(PREREQ_PATCH_NAME);
+    expect(picked[1]).toContain(PATCH_NAME);
   });
 
   it("hard-fails rather than skipping when CI demands a real run", () => {
