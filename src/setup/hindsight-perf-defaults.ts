@@ -884,17 +884,33 @@ export const HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 30;
  *
  * ## Migration boundary — READ THIS before assuming a live fleet flips
  *
- * This default is safe **only for a NEW install (empty memory tables).**
- * hindsight_api HARD-REFUSES to switch the text-search backend on a non-empty
- * database: swapping `native` → `pg_search` requires the BM25 index to be
- * rebuilt with a different operator class, and upstream will not silently drop
- * and recreate it under live data. So this key going to `pg_search` does NOT
- * migrate an existing bank on the next `switchroom apply` — the container would
- * refuse to start against populated tables.
+ * Since #4506 a POPULATED fleet DOES migrate `native` → `pg_search` on the next
+ * restart after this key changes. That is deliberate and it is a behaviour
+ * change: previously hindsight_api refused the switch outright and the
+ * container would not start against populated tables. The direction is safe
+ * because `pg_search` indexes the base columns and keeps `search_vector` as an
+ * unread dummy, so nothing is lost by recreating it; the image's baked patch
+ * creates the extension and rebuilds the index in one boot with no operator DDL
+ * (`docker/Dockerfile.hindsight`, patch block "text-search backend migration
+ * path"; behaviour pinned by
+ * `tests/docker/hindsight-text-search-migration-patch.test.ts`).
  *
- * The data migration is a DELIBERATE, operator-run manual step, NOT encoded
- * here. An operator on a populated fleet who is not ready to migrate must pin
- * the prior backend in `hindsight.env`:
+ * The REVERSE direction is still hard-refused on non-empty tables: `native` and
+ * `vchord` store the indexed content IN `search_vector` and only ever write it
+ * on INSERT, so recreating that column would leave every existing row
+ * unsearchable with no backfill anywhere. hindsight_api raises and tells the
+ * operator to clear the data or stay put.
+ *
+ * COST of the forward migration, measured on this fleet's 801,792-row
+ * `memory_units`: `CREATE EXTENSION` 0.06s, BM25 build 12.7s, total
+ * container-unavailable window 34s. `start-all.sh` kills the container if the
+ * API is not healthy within `HINDSIGHT_API_STARTUP_WAIT_SECONDS` (default 300),
+ * so a substantially larger table should raise that ceiling before flipping.
+ * Take a `pg_dump` backup first regardless: the flip is reversible only by
+ * restore, since the reverse direction is refused.
+ *
+ * An operator who does not want that migration to happen on their next
+ * `switchroom apply` + restart must pin the prior backend in `hindsight.env`:
  *
  * ```yaml
  * hindsight:
@@ -907,8 +923,9 @@ export const HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 30;
  * {@link HINDSIGHT_PERF_ENV_KEYS} (the allowlist is the union of the default
  * groups) and {@link resolveHindsightPerfOverrides} then lets the operator
  * value replace the emitted default. Absent that allowlist membership the pin
- * would be silently discarded and the fleet would try to boot on `pg_search`
- * against live data — which is exactly the trap this pairing avoids.
+ * would be silently discarded and a populated fleet would migrate itself to
+ * `pg_search` on the next restart without the operator ever having chosen it —
+ * which is exactly the trap this pairing avoids.
  */
 export const HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION = "pg_search";
 

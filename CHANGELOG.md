@@ -15,6 +15,61 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Hindsight: a populated bank can migrate to `pg_search` by flipping the env, not by hand
+
+- **`native` → `pg_search` on a POPULATED bank is now a plain env flip +
+  restart.** v0.20.13 shipped `pg_search` as the default for new installs but
+  said an existing bank had to be migrated by a manual operator procedure. That
+  procedure did not work. Following it (drop the native search index, flip
+  `HINDSIGHT_API_TEXT_SEARCH_EXTENSION`, restart) produced a
+  column-without-index state that `ensure_text_search_extension` classified as a
+  backend CHANGE and refused — on **every** backend, including the one already
+  configured. Held constant at `pg_search`, a 801,792-row `memory_units` gave
+  `RuntimeError: Cannot change text search extension from pg_textsearch to
+  pg_search: the following tables contain data: memory_units(801792 rows)`, and
+  the error's own "put it back" advice could not work either. The bank came up
+  on nothing. `docker/Dockerfile.hindsight` now bakes a fix so the guard fires
+  only on a genuinely lossy column recreate; a stale or absent index is rebuilt
+  in place. Measured on that bank: `CREATE EXTENSION` 0.06s, BM25 build 12.7s,
+  34s total unavailable. (#4506)
+- **The `pg_search` migration branch now creates its own extension.**
+  `provision_pg_search()` stages the `.so` and control/SQL but deliberately
+  never touches the database, and nothing else ran `CREATE EXTENSION pg_search`
+  — so the branch went straight to `CREATE INDEX ... USING bm25` and died with
+  `InvalidSchemaName: schema "pdb" does not exist`. It now creates the extension
+  first, mirroring what the `pgroonga` branch already did. (#4506)
+- **The second memory table is reconciled again.** `tables_to_check` still named
+  `reflections`, renamed to `mental_models` by alembic `t5o6p7q8r9s0`, so that
+  table matched nothing and silently kept whatever index it had under any
+  backend. (#4506)
+- **The refusal message no longer guesses a backend or names a dead table.** A
+  `TEXT` `search_vector` with no index carries nothing to identify the live
+  backend from, yet the error asserted `pg_textsearch` and told the operator to
+  `DELETE FROM public.reflections`. It now reports
+  `indeterminate (TEXT search_vector, no text-search index)` in that case, names
+  the tables that actually exist, and only offers the "stay on your current
+  backend" remedy when it could genuinely read what that backend is. (#4506)
+- **The reverse direction is still refused, and an index-only rebuild no longer
+  discards data.** `pg_search` → `native`/`vchord` on non-empty tables stays
+  fatal: those backends store the indexed content IN `search_vector` and only
+  write it on INSERT, so every existing row would go unsearchable. Relatedly,
+  the reconcile loop's unconditional `DROP COLUMN` is now conditional on the
+  column type actually changing, so rebuilding a missing GIN index no longer
+  drops and recreates a populated `tsvector` empty. (#4506)
+- **`docker/hindsight-entrypoint.sh` and
+  `src/setup/hindsight-perf-defaults.ts` documented the old hard refusal as a
+  guarantee.** Both are rewritten: the flip now migrates, so the pin
+  (`HINDSIGHT_API_TEXT_SEARCH_EXTENSION: "native"` under `hindsight.env`) is
+  what an operator who is *not* ready to migrate must set, and the
+  `HINDSIGHT_API_STARTUP_WAIT_SECONDS` ceiling (default 300s) is called out for
+  banks much larger than this one. (#4506)
+- **Regression-pinned behaviourally, not structurally.**
+  `tests/docker/hindsight-text-search-migration-patch.test.ts` runs the real
+  shipping `ensure_text_search_extension` against the pinned upstream digest in
+  a throwaway container and asserts it is RED unpatched and GREEN patched across
+  six scenarios, including the two that must keep failing. Wired into the
+  `hindsight-probe` CI job, which hard-fails rather than skipping. (#4506)
+
 ## v0.20.14 — BM25 filter-field pushdown for Hindsight keyword recall, and a phase-attribution ceiling for database-side proposals
 
 ### Hindsight keyword recall: BM25 filter-field pushdown

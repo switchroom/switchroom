@@ -136,6 +136,7 @@ jobs:
               - 'tests/docker/hindsight-mm-refresh-debounce-patch.test.ts'
               - 'tests/docker/hindsight-pg-search-tokenizer-drift-patch.test.ts'
               - 'tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts'
+              - 'tests/docker/hindsight-text-search-migration-patch.test.ts'
               - 'tests/docker/hindsight-graph-seed-retirement.test.ts'
               - 'tests/docker/hindsight-maxitems-grammar-patch.test.ts'
               - 'src/setup/hindsight-perf-defaults.ts'
@@ -438,6 +439,23 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-pg-search-filter-pushdown-patch.test.ts
 
+      - name: Run the hindsight text-search migration-path probe (RED/GREEN, must not skip)
+        # #4506. The bakes test can only see that the new guard conditions are
+        # PRESENT in the patched source; it cannot see the outcome that matters
+        # — that the real shipping `ensure_text_search_extension`, handed a
+        # populated table whose text-search INDEX was dropped while
+        # `search_vector` survived, REPAIRS it instead of raising. Upstream
+        # raises there on every backend including the one already configured
+        # ("from pg_textsearch to pg_search" on 801,792 rows, observed), so the
+        # database comes up on none of them. The same probe pins the other half:
+        # a genuinely lossy pg_search → native switch on populated tables must
+        # STILL be refused, and an index-only rebuild must not drop a populated
+        # tsvector column. Only running the real function and reading back the
+        # DDL it emits can tell those four states apart.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-text-search-migration-patch.test.ts
+
       - name: Run the hindsight graph-seed RETIREMENT probe (RED/GREEN, must not skip)
         # The v0.8.5 upstream #2968 carry was retired in the v0.8.6 base bump —
         # upstream ships the behaviour natively and exposes
@@ -581,7 +599,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done
