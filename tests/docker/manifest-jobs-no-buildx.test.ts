@@ -90,6 +90,7 @@ describe('manifest-only workflow jobs never set up buildx (no docker.io dependen
     expect(found.sort()).toEqual([
       'docker-images.yml:merge-base',
       'docker-images.yml:merge-dependents',
+      'docker-images.yml:merge-hindsight',
       'docker-images.yml:promote-to-dev',
       'docker-images.yml:retag-unchanged',
       'promote.yml:promote',
