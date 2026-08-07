@@ -182,11 +182,11 @@ describe("Dockerfile.hindsight shape", () => {
 
     // The non-amd64 branch is never EXECUTED by PR CI. Not because the job is
     // skipped — `build-hindsight` does run on pull_request and passes — but
-    // because PR builds pin `platforms: linux/amd64` and skip the QEMU setup
-    // step (`if: github.event_name != 'pull_request'`), so only the amd64 leg
-    // is ever built there. This assertion is therefore the only thing standing
-    // between that branch and an untested regression, and it has to be
-    // airtight rather than indicative.
+    // because the per-arch matrix pins `arch: ["amd64"]` on pull_request (the
+    // arm64 leg on its native ubuntu-24.04-arm runner only fans out on a
+    // main/tag/dispatch push), so only the amd64 leg is ever built there. This
+    // assertion is therefore the only thing standing between that branch and
+    // an untested regression, and it has to be airtight rather than indicative.
     //
     // Hence an ALLOWLIST, not a blocklist. Enumerating forbidden spellings
     // cannot hold: `pip3 install`, `uv add`, `apt-get install
