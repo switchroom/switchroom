@@ -1,0 +1,544 @@
+{
+  "schema": 2,
+  "config": {
+    "startedAt": "2026-08-06T23:29:04.398Z",
+    "apiUrl": "http://127.0.0.1:18888",
+    "container": "switchroom-hindsight",
+    "banks": [
+      "klanker",
+      "gymbro",
+      "ziggy",
+      "lisa-profile",
+      "switchroom-dev"
+    ],
+    "concurrency": [
+      1
+    ],
+    "samples": 1,
+    "warmup": 0,
+    "timeoutMs": 30000,
+    "contention": "off",
+    "contentionWorkers": 0,
+    "statsReset": false,
+    "allowWrites": false,
+    "querySet": "generic-v1",
+    "budget": "mid",
+    "maxTokens": 4096,
+    "label": "arm attribution"
+  },
+  "db": {
+    "sharedBuffersBytes": 6442450944,
+    "effectiveCacheSizeBytes": 12884901888,
+    "hnswEfSearch": null,
+    "memoryUnitsTotalBytes": 5443878912,
+    "memoryUnitsHeapBytes": 3068100608,
+    "memoryUnitsIndexBytes": 2375778304,
+    "bankRows": [
+      {
+        "bank": "klanker",
+        "rows": 229799
+      },
+      {
+        "bank": "overlord",
+        "rows": 223000
+      },
+      {
+        "bank": "finn",
+        "rows": 86488
+      },
+      {
+        "bank": "assistant",
+        "rows": 86240
+      },
+      {
+        "bank": "carrie",
+        "rows": 81844
+      },
+      {
+        "bank": "marko",
+        "rows": 43716
+      },
+      {
+        "bank": "gymbro",
+        "rows": 17977
+      },
+      {
+        "bank": "reggie",
+        "rows": 10688
+      },
+      {
+        "bank": "lawgpt",
+        "rows": 8957
+      },
+      {
+        "bank": "ziggy",
+        "rows": 1493
+      },
+      {
+        "bank": "ken-profile",
+        "rows": 190
+      },
+      {
+        "bank": "lisa-profile",
+        "rows": 157
+      },
+      {
+        "bank": "kdogg",
+        "rows": 66
+      },
+      {
+        "bank": "switchroom-dev",
+        "rows": 12
+      }
+    ],
+    "largestIndexes": [
+      {
+        "name": "idx_mu_emb_worl_81cef5f6a42e4b4d",
+        "bytes": 312795136,
+        "scans": 9293
+      },
+      {
+        "name": "idx_mu_emb_worl_4f0539ab5e0a49c8",
+        "bytes": 268230656,
+        "scans": 7891
+      },
+      {
+        "name": "idx_memory_units_text_search",
+        "bytes": 163880960,
+        "scans": 19913
+      },
+      {
+        "name": "idx_mu_emb_obsv_4f0539ab5e0a49c8",
+        "bytes": 134283264,
+        "scans": 5985
+      },
+      {
+        "name": "idx_mu_emb_worl_04a9d55562094f28",
+        "bytes": 112214016,
+        "scans": 149
+      },
+      {
+        "name": "idx_mu_emb_obsv_81cef5f6a42e4b4d",
+        "bytes": 109002752,
+        "scans": 5268
+      },
+      {
+        "name": "idx_mu_emb_worl_ce0d84949a914feb",
+        "bytes": 107700224,
+        "scans": 392
+      },
+      {
+        "name": "idx_mu_emb_expr_4f0539ab5e0a49c8",
+        "bytes": 101711872,
+        "scans": 1902
+      }
+    ],
+    "statsResetAt": null,
+    "heapHitRatio": 0.9742905410218052,
+    "serverVersion": "PostgreSQL 18.1 on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit"
+  },
+  "instance": {
+    "imageTag": "ghcr.io/switchroom/switchroom-hindsight:v0.20.12",
+    "rerankerMaxCandidates": 150
+  },
+  "cells": [
+    {
+      "bank": "klanker",
+      "rows": 229799,
+      "concurrency": 1,
+      "stats": {
+        "n": 1,
+        "errors": 0,
+        "min": 3005.748278,
+        "p50": 3005.748278,
+        "p95": 3005.748278,
+        "p99": 3005.748278,
+        "max": 3005.748278,
+        "mean": 3005.748278,
+        "stddev": 0,
+        "cv": 0,
+        "p95CiLow": 3005.748278,
+        "p95CiHigh": 3005.748278
+      },
+      "meanResults": 66,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        3005.748278
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "gymbro",
+      "rows": 17977,
+      "concurrency": 1,
+      "stats": {
+        "n": 1,
+        "errors": 0,
+        "min": 4706.844359,
+        "p50": 4706.844359,
+        "p95": 4706.844359,
+        "p99": 4706.844359,
+        "max": 4706.844359,
+        "mean": 4706.844359,
+        "stddev": 0,
+        "cv": 0,
+        "p95CiLow": 4706.844359,
+        "p95CiHigh": 4706.844359
+      },
+      "meanResults": 74,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        4706.844359
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "ziggy",
+      "rows": 1493,
+      "concurrency": 1,
+      "stats": {
+        "n": 1,
+        "errors": 0,
+        "min": 3436.175320000002,
+        "p50": 3436.175320000002,
+        "p95": 3436.175320000002,
+        "p99": 3436.175320000002,
+        "max": 3436.175320000002,
+        "mean": 3436.175320000002,
+        "stddev": 0,
+        "cv": 0,
+        "p95CiLow": 3436.175320000002,
+        "p95CiHigh": 3436.175320000002
+      },
+      "meanResults": 60,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        3436.175320000002
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "lisa-profile",
+      "rows": 157,
+      "concurrency": 1,
+      "stats": {
+        "n": 1,
+        "errors": 0,
+        "min": 1874.6562589999994,
+        "p50": 1874.6562589999994,
+        "p95": 1874.6562589999994,
+        "p99": 1874.6562589999994,
+        "max": 1874.6562589999994,
+        "mean": 1874.6562589999994,
+        "stddev": 0,
+        "cv": 0,
+        "p95CiLow": 1874.6562589999994,
+        "p95CiHigh": 1874.6562589999994
+      },
+      "meanResults": 57,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        1874.6562589999994
+      ],
+      "errorSamples": []
+    },
+    {
+      "bank": "switchroom-dev",
+      "rows": 12,
+      "concurrency": 1,
+      "stats": {
+        "n": 1,
+        "errors": 0,
+        "min": 2676.4115679999995,
+        "p50": 2676.4115679999995,
+        "p95": 2676.4115679999995,
+        "p99": 2676.4115679999995,
+        "max": 2676.4115679999995,
+        "mean": 2676.4115679999995,
+        "stddev": 0,
+        "cv": 0,
+        "p95CiLow": 2676.4115679999995,
+        "p95CiHigh": 2676.4115679999995
+      },
+      "meanResults": 12,
+      "zeroResultCalls": 0,
+      "samplesMs": [
+        2676.4115679999995
+      ],
+      "errorSamples": []
+    }
+  ],
+  "arms": [
+    {
+      "bank": "gymbro",
+      "method": "semantic",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 31.698226928710938,
+      "p95": 43.93458366394043,
+      "max": 43.93458366394043
+    },
+    {
+      "bank": "gymbro",
+      "method": "bm25",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 31.698226928710938,
+      "p95": 43.93458366394043,
+      "max": 43.93458366394043
+    },
+    {
+      "bank": "gymbro",
+      "method": "semantic",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 31.698226928710938,
+      "p95": 43.93458366394043,
+      "max": 43.93458366394043
+    },
+    {
+      "bank": "gymbro",
+      "method": "bm25",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 31.698226928710938,
+      "p95": 43.93458366394043,
+      "max": 43.93458366394043
+    },
+    {
+      "bank": "gymbro",
+      "method": "graph",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 20.67279815673828,
+      "p95": 24.28579330444336,
+      "max": 24.28579330444336
+    },
+    {
+      "bank": "gymbro",
+      "method": "graph",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 16.62158966064453,
+      "p95": 19.286155700683594,
+      "max": 19.286155700683594
+    },
+    {
+      "bank": "klanker",
+      "method": "semantic",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 71.47789001464844,
+      "p95": 178.5515546798706,
+      "max": 178.5515546798706
+    },
+    {
+      "bank": "klanker",
+      "method": "bm25",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 71.47789001464844,
+      "p95": 178.5515546798706,
+      "max": 178.5515546798706
+    },
+    {
+      "bank": "klanker",
+      "method": "semantic",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 71.47789001464844,
+      "p95": 178.5515546798706,
+      "max": 178.5515546798706
+    },
+    {
+      "bank": "klanker",
+      "method": "bm25",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 71.47789001464844,
+      "p95": 178.5515546798706,
+      "max": 178.5515546798706
+    },
+    {
+      "bank": "klanker",
+      "method": "graph",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 26.69239044189453,
+      "p95": 28.50794792175293,
+      "max": 28.50794792175293
+    },
+    {
+      "bank": "klanker",
+      "method": "graph",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 20.722627639770508,
+      "p95": 25.397300720214844,
+      "max": 25.397300720214844
+    },
+    {
+      "bank": "lisa-profile",
+      "method": "graph",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 8.646011352539062,
+      "p95": 10.900020599365234,
+      "max": 10.900020599365234
+    },
+    {
+      "bank": "lisa-profile",
+      "method": "graph",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 8.571147918701172,
+      "p95": 10.82754135131836,
+      "max": 10.82754135131836
+    },
+    {
+      "bank": "lisa-profile",
+      "method": "semantic",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 1.4195442199707031,
+      "p95": 1.7474889755249023,
+      "max": 1.7474889755249023
+    },
+    {
+      "bank": "lisa-profile",
+      "method": "bm25",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 1.4195442199707031,
+      "p95": 1.7474889755249023,
+      "max": 1.7474889755249023
+    },
+    {
+      "bank": "lisa-profile",
+      "method": "semantic",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 1.4195442199707031,
+      "p95": 1.7474889755249023,
+      "max": 1.7474889755249023
+    },
+    {
+      "bank": "lisa-profile",
+      "method": "bm25",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 1.4195442199707031,
+      "p95": 1.7474889755249023,
+      "max": 1.7474889755249023
+    },
+    {
+      "bank": "switchroom-dev",
+      "method": "graph",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 8.804798126220703,
+      "p95": 9.499311447143555,
+      "max": 9.499311447143555
+    },
+    {
+      "bank": "switchroom-dev",
+      "method": "semantic",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 1.1444091796875,
+      "p95": 1.2860298156738281,
+      "max": 1.2860298156738281
+    },
+    {
+      "bank": "switchroom-dev",
+      "method": "bm25",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 1.1444091796875,
+      "p95": 1.2860298156738281,
+      "max": 1.2860298156738281
+    },
+    {
+      "bank": "switchroom-dev",
+      "method": "semantic",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 1.1444091796875,
+      "p95": 1.2860298156738281,
+      "max": 1.2860298156738281
+    },
+    {
+      "bank": "switchroom-dev",
+      "method": "bm25",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 1.1444091796875,
+      "p95": 1.2860298156738281,
+      "max": 1.2860298156738281
+    },
+    {
+      "bank": "switchroom-dev",
+      "method": "graph",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 0.5114078521728516,
+      "p95": 0.6318092346191406,
+      "max": 0.6318092346191406
+    },
+    {
+      "bank": "ziggy",
+      "method": "graph",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 14.014482498168945,
+      "p95": 15.457630157470703,
+      "max": 15.457630157470703
+    },
+    {
+      "bank": "ziggy",
+      "method": "graph",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 13.926982879638672,
+      "p95": 16.547203063964844,
+      "max": 16.547203063964844
+    },
+    {
+      "bank": "ziggy",
+      "method": "semantic",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 12.36259937286377,
+      "p95": 180.8382272720337,
+      "max": 180.8382272720337
+    },
+    {
+      "bank": "ziggy",
+      "method": "bm25",
+      "fact_type": "world",
+      "n": 5,
+      "p50": 12.36259937286377,
+      "p95": 180.8382272720337,
+      "max": 180.8382272720337
+    },
+    {
+      "bank": "ziggy",
+      "method": "semantic",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 12.36259937286377,
+      "p95": 180.8382272720337,
+      "max": 180.8382272720337
+    },
+    {
+      "bank": "ziggy",
+      "method": "bm25",
+      "fact_type": "experience",
+      "n": 5,
+      "p50": 12.36259937286377,
+      "p95": 180.8382272720337,
+      "max": 180.8382272720337
+    }
+  ],
+  "durationS": 55.629
+}
