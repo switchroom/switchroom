@@ -201,6 +201,22 @@ describe("gen-changelog-entry — idempotency", () => {
     expect(second.out).toContain("no change");
   });
 
+  it("running twice WITHOUT committing in between still does not double-add", () => {
+    const f = makeFixture("gen-idem-nocommit-");
+    f.writeFile("src/feature.ts", "export const x = 1;\n");
+    f.commit("feat(cli): add a verb");
+
+    const first = f.gen(["--pr", "42"]);
+    expect(first.code).toBe(0);
+    // No commit here — the generated entry is still an uncommitted work-tree edit.
+    const second = f.gen(["--pr", "42"]);
+    expect(second.code).toBe(0);
+    expect(second.out).toContain("no change");
+
+    const count = f.readChangelog().split("add a verb").length - 1;
+    expect(count).toBe(1);
+  });
+
   it("does not add when the author already staged an entry (respects hand-written)", () => {
     const f = makeFixture("gen-respect-");
     f.writeFile("src/feature.ts", "export const x = 1;\n");

@@ -40,6 +40,24 @@ now an anomaly worth investigating, not the norm.
   token on its own line in the PR body or a commit message. This makes cutting a release a
   trivial rename of this header instead of reconstructing the whole section
   from `git log` at release time (as v0.20.12 had to).
+- **Auto-stage that `## Unreleased` entry author-side, so the check above stops
+  costing a round-trip (#4501)** — new `scripts/gen-changelog-entry.mjs`
+  (`bun run changelog:generate`) derives an entry from the branch's
+  conventional-commit title and appends it under `## Unreleased` in the AUTHOR's
+  own commit, before `gh pr create`. It runs author-side rather than as a CI
+  commit-back on purpose: a push made with the workflow's default `GITHUB_TOKEN`
+  does not create new workflow runs (GitHub's recursion guard), so a
+  committed-back entry would leave all seven required contexts absent on the new
+  head SHA and wedge the PR — and the repo carries no App/PAT push credential to
+  re-trigger them. The generator reads the WORKING-TREE changelog (so it is
+  idempotent even before the entry is committed — a second run no-ops and it
+  never clobbers a hand-written one), reuses `check-changelog-entry.mjs`'s
+  parsing rather than duplicating it, skips on `merge_group` and the release PR,
+  and honours the same `no-changelog` / `[skip changelog]` hatches as an opt-out
+  of both enforcement and generation. #4469's check stays as the deterministic
+  CI backstop. Wired into the fleet dev-protocol fragment, the `dev-protocol`
+  skill, and this repo's PR-hygiene flow; rationale in `.github/MERGE-QUEUE.md`
+  § "Author-side changelog generation".
 
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)
 

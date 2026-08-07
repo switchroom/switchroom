@@ -61,7 +61,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
   isShippable,
@@ -427,12 +427,25 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env, arg
     return { status: 'skip', lines: ['gen-changelog-entry: SKIP — no CHANGELOG.md at HEAD.'] }
   }
 
-  const changedFiles = gitSoft(['diff', '--name-only', `${mergeBase}..${range.head}`], cwd)
-    .split('\n')
+  // Changed files: the committed range PLUS any uncommitted work-tree changes
+  // and new files — the author may run this before OR after committing code.
+  const changedFiles = [
+    ...gitSoft(['diff', '--name-only', `${mergeBase}..${range.head}`], cwd).split('\n'),
+    ...gitSoft(['diff', '--name-only', 'HEAD'], cwd).split('\n'),
+    ...gitSoft(['ls-files', '--others', '--exclude-standard'], cwd).split('\n'),
+  ]
     .map((l) => l.trim())
     .filter(Boolean)
+
   const baseChangelog = gitSoft(['show', `${mergeBase}:CHANGELOG.md`], cwd)
-  const headChangelog = gitSoft(['show', `${range.head}:CHANGELOG.md`], cwd)
+  // HEAD content is the WORKING-TREE CHANGELOG.md the author is about to commit,
+  // not the committed blob — so an already-staged (or already-generated but
+  // uncommitted) entry counts as growth and a re-run is a genuine no-op, rather
+  // than double-adding when run twice before the commit lands.
+  const changelogPath = `${resolveRepoRoot(cwd)}/CHANGELOG.md`
+  const headChangelog = existsSync(changelogPath)
+    ? readFileSync(changelogPath, 'utf-8')
+    : gitSoft(['show', `${range.head}:CHANGELOG.md`], cwd)
   const commitMessages = gitSoft(['log', `--format=%B${RECORD}`, `${mergeBase}..${range.head}`], cwd)
     .split(RECORD)
     .map((m) => m.trim())
