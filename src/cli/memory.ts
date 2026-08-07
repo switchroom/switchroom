@@ -62,6 +62,7 @@ import {
   HINDSIGHT_CONTAINER_NAME,
   REPAIR_FAILED_EXIT,
 } from "../memory/hindsight-repair.js";
+import { isVaultReference } from "../vault/resolver.js";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { writeConfigFileSync } from "../util/atomic.js";
@@ -158,6 +159,28 @@ export function resolveMemorySetupTag(input: {
   const pin = normalizeHindsightVersionTag(input.releasePin);
   if (pin) return { tag: pin, reason: "pin" };
   return { tag: undefined, reason: "latest" };
+}
+
+/**
+ * Whether `memory docker-compose`'s unresolved-by-default snippet (#4487)
+ * actually carries a `vault:` ref anywhere the emit path reads a secret from
+ * — the global/per-op LLM `api_key` fields and `cp_access_key`. Used only to
+ * decide whether the "these refs are unresolved" note is accurate; the
+ * refs themselves are never touched here (that's `resolveHindsightLlmSecrets`
+ * / `resolveHindsightCpAccessKey`, gated behind `--resolve-secrets`).
+ */
+function hasUnresolvedHindsightVaultRef(config: SwitchroomConfig): boolean {
+  const hindsight = (config as { hindsight?: { cp_access_key?: string; llm?: HindsightLlmConfig } })
+    .hindsight;
+  const isRef = (v?: string) => typeof v === "string" && isVaultReference(v);
+  if (isRef(hindsight?.cp_access_key)) return true;
+  const llm = hindsight?.llm;
+  if (!llm) return false;
+  if (isRef(llm.api_key)) return true;
+  for (const op of ["retain", "reflect", "consolidation"] as const) {
+    if (isRef(llm[op]?.api_key)) return true;
+  }
+  return false;
 }
 
 /**
@@ -1126,19 +1149,21 @@ export function registerMemoryCommand(program: Command): void {
           snippetLlm = await resolveHindsightLlmSecrets(snippetConfig.hindsight?.llm);
         } else {
           // DEFAULT: emit the `vault:` refs unresolved. This snippet is not
-          // runnable as-is — that's the point (#4487). Pass --resolve-secrets
-          // for a runnable file with live secret values.
+          // runnable as-is when it carries one — that's the point (#4487).
+          // Pass --resolve-secrets for a runnable file with live secret values.
           cpAccessKey = snippetConfig.hindsight?.cp_access_key;
           snippetLlm = snippetConfig.hindsight?.llm;
-          console.log(
-            chalk.yellow(
-              "# NOTE: `vault:` references below are left UNRESOLVED (default) — this\n" +
-                "#       snippet is not runnable as-is. Resolve them yourself before use, or\n" +
-                "#       re-run with --resolve-secrets to print the live secret values\n" +
-                "#       instead. If you do, treat this command's output as a secret: don't\n" +
-                "#       paste it into chat, logs, or an unencrypted file.\n",
-            ),
-          );
+          if (hasUnresolvedHindsightVaultRef(snippetConfig)) {
+            console.log(
+              chalk.yellow(
+                "# NOTE: `vault:` references below are left UNRESOLVED (default) — this\n" +
+                  "#       snippet is not runnable as-is. Resolve them yourself before use, or\n" +
+                  "#       re-run with --resolve-secrets to print the live secret values\n" +
+                  "#       instead. If you do, treat this command's output as a secret: don't\n" +
+                  "#       paste it into chat, logs, or an unencrypted file.\n",
+              ),
+            );
+          }
         }
         // The docker-run path warns from inside startHindsight(); the compose
         // generator is a pure string builder, so its wrapper carries the same

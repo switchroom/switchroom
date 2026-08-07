@@ -211,6 +211,32 @@ describe("registerMemoryCommand wiring (#4486, #4487)", () => {
     expect(mocks.getViaBrokerStructured).toHaveBeenCalledWith("litellm/gpt-oss-key", {});
   });
 
+  it("`memory docker-compose` (no flag) omits the unresolved note when there is no `vault:` ref to resolve", async () => {
+    writeFileSync(
+      configPath,
+      [
+        "switchroom:",
+        "  version: 1",
+        `  agents_dir: ${join(tmpDir, "agents")}`,
+        "telegram:",
+        '  bot_token: "test:token"',
+        '  forum_chat_id: "0"',
+        "agents:",
+        "  alpha:",
+        "    topic_name: alpha",
+        "",
+      ].join("\n"),
+    );
+
+    await buildProgram(configPath).parseAsync(["memory", "docker-compose"], {
+      from: "user",
+    });
+
+    const out = logs.join("\n");
+    expect(out).not.toMatch(/unresolved/i);
+    expect(mocks.getViaBrokerStructured).not.toHaveBeenCalled();
+  });
+
   it("`cp_access_key` follows the SAME default-unresolved rule as the LLM api_key", async () => {
     writeFileSync(
       configPath,
