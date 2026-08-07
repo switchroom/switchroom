@@ -43,7 +43,9 @@ import {
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
-  type LiteLLMHindsightConfig,
+  resolveHindsightLiteLlm,
+  hindsightLiteLlmDroppedKeyWarning,
+  type HindsightLiteLlmResolution,
 } from "../setup/hindsight.js";
 import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
 import {
@@ -59,7 +61,6 @@ import {
   HINDSIGHT_CONTAINER_NAME,
   REPAIR_FAILED_EXIT,
 } from "../memory/hindsight-repair.js";
-import { getViaBrokerStructured, readVaultTokenFile } from "../vault/broker/client.js";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { writeConfigFileSync } from "../util/atomic.js";
@@ -159,34 +160,20 @@ export function resolveMemorySetupTag(input: {
 }
 
 /**
- * Resolve LiteLLM routing config for the hindsight container. Returns
- * undefined when LiteLLM is not globally enabled or the vault key is absent.
- * The returned config is passed to `startHindsight()` to enable host-network
- * mode and inject the proxy env vars.
+ * Resolve LiteLLM routing config for the hindsight container, plus the
+ * `vault:` reference that was DROPPED when the key could not be resolved.
+ *
+ * A thin delegator to {@link resolveHindsightLiteLlm} (`src/setup/hindsight.ts`),
+ * which owns the resolution, the capability-token forwarding (#1053) and the
+ * fail-safe that never returns a literal `vault:…` string. The `litellm` half
+ * is passed to `startHindsight()` to enable host-network mode and inject the
+ * proxy env vars; the `droppedRef` half is what the launch site must TELL the
+ * operator about instead of silently launching an unmetered container.
  */
 async function resolveLiteLLMForHindsight(
   config: SwitchroomConfig,
-): Promise<LiteLLMHindsightConfig | undefined> {
-  const topLiteLLM = (config as { litellm?: { enabled?: boolean; base_url?: string } }).litellm;
-  if (!topLiteLLM?.enabled || !topLiteLLM.base_url) return undefined;
-  // Issue #1053: forward the agent's capability token so the broker's grant
-  // path bypasses the peercred ACL. Without it a freshly-minted grant is
-  // ignored and the `.catch(() => null)` silently swallows the DENIED,
-  // leaving LiteLLM routing (ANTHROPIC_BASE_URL/headers) underived. Mirrors
-  // the working `vault get` path in src/cli/vault.ts. Token stays undefined
-  // when SWITCHROOM_AGENT_NAME is unset — identical to prior host-operator
-  // peercred behavior.
-  const agentSlug = process.env.SWITCHROOM_AGENT_NAME;
-  const token = agentSlug ? readVaultTokenFile(agentSlug) ?? undefined : undefined;
-  const result = await getViaBrokerStructured("litellm/hindsight/api-key", {
-    ...(token ? { token } : {}),
-  }).catch(() => null);
-  if (!result || result.kind !== "ok" || result.entry.kind !== "string") return undefined;
-  return {
-    baseUrl: topLiteLLM.base_url,
-    apiKey: result.entry.value,
-    model: config.memory?.config?.llm_model,
-  };
+): Promise<HindsightLiteLlmResolution> {
+  return resolveHindsightLiteLlm(config);
 }
 
 interface RecallLogEntry {
@@ -803,7 +790,7 @@ export function registerMemoryCommand(program: Command): void {
           const liveEnv = getHindsightContainerEnv();
           if (liveEnv) {
             const driftConfig = getConfig(program);
-            const driftLitellm = await resolveLiteLLMForHindsight(driftConfig);
+            const driftLitellm = (await resolveLiteLLMForHindsight(driftConfig)).litellm;
             const driftPerf = { env: driftConfig.hindsight?.env };
             // Resolve `vault:` api_key refs the SAME way the launch below does,
             // so the drift compare is against the env we will ACTUALLY bake —
@@ -1010,7 +997,20 @@ export function registerMemoryCommand(program: Command): void {
       console.log(chalk.gray("  Starting Hindsight Docker container..."));
       try {
         const hindsightConfig = getConfig(program);
-        const litellmCfg = await resolveLiteLLMForHindsight(hindsightConfig);
+        const { litellm: litellmCfg, droppedRef: litellmDroppedRef } =
+          await resolveLiteLLMForHindsight(hindsightConfig);
+        // LiteLLM is enabled for this fleet but its key did not resolve: the
+        // container is about to launch WITHOUT proxy routing and its spend will
+        // not be metered. Say so — on a recreate the env-drift report printed
+        // above has ALREADY listed the two ANTHROPIC_* vars as dropped, which
+        // reads as operator drift and has been misdiagnosed as exactly that.
+        // This names the real cause (a broker grant), which the drift report
+        // structurally cannot know.
+        if (litellmDroppedRef) {
+          console.log(
+            chalk.yellow(`  ! ${hindsightLiteLlmDroppedKeyWarning(litellmDroppedRef)}`),
+          );
+        }
         const cpAccessKey = await resolveHindsightCpAccessKey(hindsightConfig);
         if (!cpAccessKey) console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
         // Resolve any `vault:` refs in the LLM api_key fields through the
