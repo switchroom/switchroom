@@ -58,10 +58,24 @@ describe('evaluateMock', () => {
     expect(v.line).toBe(41)
   })
 
-  it('allows a mock that stays inside telegram-plugin/', () => {
-    // The two in-tree precedents.
-    expect(evaluateMock(SWEPT, '../history.js', 8)).toBeNull()
+  it('allows a mock that stays inside telegram-plugin/ and is not separately banned', () => {
     expect(evaluateMock(SWEPT, '../gateway/auth-broker-client.js', 58)).toBeNull()
+  })
+
+  it('REJECTS a module-mock of history.js — the #4488/#4491 collision', () => {
+    // `tests/captured-answer-resume.test.ts` used to `vi.mock('../history.js', ...)`
+    // with a default stub that always returned false. Under bun's process-global
+    // `mock.module`, that leaked into `tests/history.test.ts`'s calls to the REAL
+    // `hasOutboundWithText`, producing the exact "Expected: true / Received: false"
+    // signature CI saw intermittently. This gate must reject that mock outright,
+    // not merely allow it because the specifier resolves inside telegram-plugin/.
+    const v = evaluateMock(SWEPT, '../history.js', 8)
+    expect(v).not.toBeNull()
+    expect(v.banned).toBe(true)
+    expect(v.resolved).toBe('telegram-plugin/history.js')
+
+    // Any relative depth / .ts spelling of the same module is caught too.
+    expect(evaluateMock('telegram-plugin/gateway/sub/x.test.ts', '../../history.ts', 1)?.banned).toBe(true)
   })
 
   it('allows a bare package specifier (not a first-party module)', () => {

@@ -1,14 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest'
-
-// The dispatcher's resume closure reaches for the durable outbound-text oracle
-// (history.hasOutboundWithText) to reconcile crash-idempotency. Mock it so these
-// stay pure vitest unit tests (no bun:sqlite / real DB) and we can control the
-// "did this chunk's text land durably?" answer per scenario.
-let mockOracle: (chatId: string, text: string, threadId: number | null, since: number) => boolean = () => false
-vi.mock('../history.js', () => ({
-  hasOutboundWithText: (chatId: string, text: string, threadId: number | null, since: number) =>
-    mockOracle(chatId, text, threadId, since),
-}))
+import { describe, expect, it, beforeEach } from 'vitest'
 
 import {
   BackstopDeliveryLedger,
@@ -36,7 +26,24 @@ import {
  *   (c) a fully-landed answer's represent sends NOTHING.
  * A test that would still pass if the resume re-sent a confirmed chunk is not a
  * test — every scenario asserts the exact `sendChunk` index set.
+ *
+ * The dispatcher's resume closure reaches for the durable outbound-text oracle
+ * (history.hasOutboundWithText) to reconcile crash-idempotency. `mockOracle`
+ * below is injected per-scenario via `createCapturedResumeDispatcher`'s
+ * `hasOutboundWithText` port (see `gateway/captured-answer-resume.ts`) — NOT
+ * via `vi.mock('../history.js', ...)`. That used to module-mock `history.js`,
+ * which looks file-scoped under vitest but under bun's vitest-compat layer
+ * `vi.mock` maps onto the process-global `mock.module`: `bun test` runs the
+ * whole `telegram-plugin/` surface in one process
+ * (`telegram-plugin/scripts/bun-test-ci.sh`), so the mock retroactively
+ * rebound `hasOutboundWithText` for every OTHER file in the same sweep —
+ * including `tests/history.test.ts`'s calls to the REAL implementation. That
+ * was the actual root cause of #4488/#4491: a row `history.test.ts` had
+ * genuinely just written to its own real bun:sqlite DB was reported "not
+ * found" because its `hasOutboundWithText` import had been silently rebound
+ * to this file's `() => false` default. See check-bun-module-mock-scope.mjs.
  */
+let mockOracle: (chatId: string, text: string, threadId: number | null, since: number) => boolean = () => false
 
 beforeEach(() => {
   mockOracle = () => false
@@ -192,6 +199,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
     oblLedger.noteCapturedDelivery('#t1', snapshot)
 
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: makeResumeDeliverAnswer(resumeLedger, sentIdx),
       obligationLedger: oblLedger,
       backstopDeliveryLedger: resumeLedger,
@@ -228,6 +236,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
     mockOracle = (_c, txt) => txt === 'c0'
 
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: makeResumeDeliverAnswer(resumeLedger, sentIdx),
       obligationLedger: oblLedger,
       backstopDeliveryLedger: resumeLedger,
@@ -258,6 +267,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
     oblLedger.noteCapturedDelivery('#t1', snapshot)
 
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: makeResumeDeliverAnswer(resumeLedger, sentIdx),
       obligationLedger: oblLedger,
       backstopDeliveryLedger: resumeLedger,
@@ -302,6 +312,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
 
     const lines: string[] = []
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: async (a) => {
         a.resume.hydrate(resumeLedger, a.turnId)
         const res = await runBackstopDelivery(
@@ -351,6 +362,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
 
     let probes = 0
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: async (a) => {
         a.resume.hydrate(resumeLedger, a.turnId)
         const res = await runBackstopDelivery(
@@ -388,6 +400,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
 
     // A resume whose tail send keeps throwing ⇒ not delivered ⇒ obligation stays OPEN.
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: async (a) => {
         a.resume.hydrate(resumeLedger, a.turnId)
         const res = await runBackstopDelivery(
@@ -423,6 +436,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
     oblLedger.noteCapturedDelivery('#t1', snapshot)
 
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: async (a) => {
         deliverCalls++
         a.resume.hydrate(resumeLedger, a.turnId)
@@ -448,6 +462,7 @@ describe('#3282 createCapturedResumeDispatcher — the represent RESUME outcome'
   it('no captured snapshot ⇒ dispatch is a no-op (caller falls through to fresh generation)', async () => {
     let delivered = false
     const dispatcher = createCapturedResumeDispatcher({
+      hasOutboundWithText: mockOracle,
       deliverAnswer: async () => { delivered = true; return { delivered: true, sentIds: [] } },
       obligationLedger: new ObligationLedger(2),
       backstopDeliveryLedger: new BackstopDeliveryLedger(),

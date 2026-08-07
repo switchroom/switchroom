@@ -68,7 +68,7 @@
  * `deliver` (via `deliverAnswer`), the durable oracle, and the obligation I/O.
  */
 
-import { hasOutboundWithText } from '../history.js'
+import { hasOutboundWithText as realHasOutboundWithText } from '../history.js'
 import type { BackstopDeliveryLedger } from './backstop-delivery.js'
 import type { CapturedDeliverySnapshot, Obligation } from './obligation-ledger.js'
 
@@ -168,6 +168,27 @@ export interface CapturedResumePorts {
   /** True when history is queryable (else the durable-text oracle reconcile that
    *  gives crash-idempotency — §2.3/A5 — is skipped). */
   historyEnabled: boolean
+  /**
+   * The durable outbound-text oracle. Defaults to the real `history.js`
+   * implementation; tests inject a fake here instead of module-mocking
+   * `../history.js`. A `vi.mock('../history.js', ...)` looks file-scoped
+   * under vitest but is NOT under bun's vitest-compat layer (`bun test`
+   * maps `vi.mock` onto the PROCESS-GLOBAL `mock.module`, which retroactively
+   * rebinds every other file's import of the same specifier in the same
+   * `bun-test-run` sweep — see check-bun-module-mock-scope.mjs). That leak
+   * was the actual root cause of #4488/#4491: a mocked `hasOutboundWithText`
+   * from this module's own test file silently answered
+   * `telegram-plugin/tests/history.test.ts`'s calls to the REAL function
+   * elsewhere in the same 651-file sweep, so a row `history.test.ts` had
+   * genuinely just written was reported as not found. Injecting via this
+   * port keeps the fake scoped to the dispatcher instance that receives it.
+   */
+  hasOutboundWithText?: (
+    chatId: string,
+    text: string,
+    threadId: number | null,
+    sinceMs?: number,
+  ) => boolean
   stderr?: (s: string) => void
 }
 
@@ -198,6 +219,7 @@ export interface CapturedResumeDispatcher {
  */
 export function createCapturedResumeDispatcher(ports: CapturedResumePorts): CapturedResumeDispatcher {
   const stderr = ports.stderr ?? (() => {})
+  const hasOutboundWithText = ports.hasOutboundWithText ?? realHasOutboundWithText
   const inFlight = new Set<string>()
 
   /** Re-deliver the UNSENT tail of `o`'s captured answer, byte-identical,
