@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.16 — the release CHANGELOG entry is staged author-side, and image builds got faster
+
 ### CI: faster hindsight image build and e2e probe
 
 - **The `build-hindsight` job builds arm64 natively and the hindsight-probe
