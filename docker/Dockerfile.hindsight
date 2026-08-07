@@ -1736,6 +1736,428 @@ assert "def _prior_indexdef(" in a, f"switchroom hindsight {NAME}: pre-drop inde
 print("switchroom hindsight pg_search tokenizer-drift guard: rebuilds preserve an inexpressible tokenizer and drift is logged as pg_search_tokenizer_drift; no new raise on the boot path")
 PYEOF
 
+# Text-search backend migration path (switchroom #4506).
+#
+# THE DEFECTS, in the real shipping source at the pinned digest. All five were
+# OBSERVED in a rehearsal against a clone of this fleet's 801,792-row
+# `memory_units`, following the operator runbook that
+# `docker/hindsight-entrypoint.sh` documented at the time.
+#
+# D1 — DROPPED-INDEX-WITH-SURVIVING-COLUMN IS A ONE-WAY TRAPDOOR.
+# `migrations.py::ensure_text_search_extension` decides "does the schema match
+# the configured backend" on the (column, index) PAIR, then raises whenever a
+# mismatched table has rows. So a database whose text-search INDEX had been
+# dropped while `search_vector` survived hit the row-count check and raised —
+# regardless of the target backend. With the backend held CONSTANT
+# (pg_search -> pg_search) the rehearsal got, verbatim:
+#     RuntimeError: Cannot change text search extension from pg_textsearch to
+#     pg_search: the following tables contain data: memory_units(801792 rows).
+# The database then booted on NEITHER backend, and the error's own "set it
+# back" advice could not work — the same pair still mismatched. That is exactly
+# the state the old runbook told operators to create ("drop the native search
+# index"), so the documented migration was a trapdoor.
+#
+# What is actually at risk is never the index — an index is rebuilt from the
+# heap — but the COLUMN: a recreated `search_vector` comes back EMPTY and is
+# only ever populated on INSERT (`ops_postgresql.insert_facts_batch`), with no
+# backfill anywhere. And that only matters for the backends that store the
+# indexed content IN the column (native `tsvector`, vchord `bm25vector`).
+# pg_textsearch, pgroonga and pg_search keep `search_vector` purely for schema
+# symmetry and index the BASE columns directly, so recreating it under live
+# data loses precisely nothing. The guard is therefore re-keyed onto
+# "the column type must genuinely change AND the target backend reads the
+# column" — a real lossy switch (pg_search -> native on populated tables) is
+# still refused, while a stale/absent index over a correctly typed column is
+# rebuilt in place. The rebuild loop's unconditional `DROP COLUMN` is narrowed
+# to match, because dropping a correctly typed, POPULATED tsvector and
+# recreating it empty was silent data loss in its own right.
+#
+# D2 — NOTHING EVER RAN `CREATE EXTENSION pg_search`. The entrypoint's
+# `provision_pg_search()` stages the `.so` + control/sql into the embedded-pg
+# install and deliberately does not touch the database; the migration's
+# pg_search branch went straight to `CREATE INDEX ... USING bm25` and died with
+# `psycopg2.errors.InvalidSchemaName: schema "pdb" does not exist` (the pdb
+# schema is created BY the extension). The extension was available the whole
+# time — `default_version` 0.25.1, `installed_version` None. The pgroonga
+# branch a few lines above already does the right thing; this mirrors it,
+# including the "already exists / no permission" verification fallback.
+#
+# D3 — `tables_to_check` NAMED A TABLE THAT DOES NOT EXIST. Alembic revision
+# `t5o6p7q8r9s0_rename_mental_models_to_observations.py:70,76` renamed
+# `reflections` -> `mental_models` and `idx_reflections_text_search` ->
+# `idx_mental_models_text_search`. The old name matched nothing, so this loop
+# reconciled `memory_units` ALONE: `mental_models` kept a native tsvector
+# column + GIN index under a pg_search backend (an orphan — harmless today only
+# because the BM25 arm in `engine/sql/postgresql.py:185-247` is memory_units
+# only), and the RuntimeError advised `DELETE FROM public.reflections`.
+# Renaming the entry rather than deleting it keeps upstream's evident intent —
+# both memory tables tracking the configured backend — costs one BM25 index
+# over 43 rows on this fleet, and leaves nothing orphaned for a future arm to
+# trip over.
+#
+# D4 — THE ERROR MISREPORTED THE LIVE BACKEND. With `column=text, index=None`
+# there is no `key_field` reloption to read and pg_textsearch / pgroonga /
+# pg_search are indistinguishable, yet the detector reported `pg_textsearch`
+# and told the operator to pin it. It now says the backend is indeterminate and
+# how to read it off the schema. It also describes a table that actually
+# TRIPPED the guard (upstream read `mismatched_tables[0]`, which need not be
+# one of them) and names real tables in the remedy.
+#
+# CONSEQUENCE, which is the point of the ticket. `CREATE EXTENSION pg_search`
+# needs `shared_preload_libraries=pg_search`, which only `prestart_pg0()` sets
+# and which only applies at postmaster start — but booting the API on pg_search
+# tripped D1, so the rehearsal could only get through with a manual
+# `HINDSIGHT_ENABLE_API=false` boot. With D1 and D2 fixed the entrypoint's
+# existing order (provision_pg_search -> prestart_pg0 -> exec start-all.sh)
+# already satisfies the dependency, and a populated fleet migrates on a plain
+# env flip + restart in ONE boot. No entrypoint ordering change was needed; the
+# runbook comment in `docker/hindsight-entrypoint.sh` is rewritten to match.
+#
+# Self-verifying at build time; behaviourally guarded by
+# tests/docker/hindsight-text-search-migration-patch.test.ts (RED on unpatched
+# upstream, GREEN here) and statically by
+# tests/docker/dockerfile-hindsight-bakes.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+NAME = "text-search backend migration path"
+ROOT = pathlib.Path("/app/api/hindsight_api")
+
+
+def patch(rel, old, new, *, count=1):
+    f = ROOT / rel
+    s = f.read_text()
+    n = s.count(old)
+    assert n == count, (
+        f"switchroom hindsight {NAME}: anchor found {n}x (expected {count}) in {rel} — "
+        "upstream reformatted; re-author this patch in docker/Dockerfile.hindsight. "
+        f"Anchor head: {old.strip().splitlines()[0]!r}"
+    )
+    f.write_text(s.replace(old, new, count))
+
+
+# ------------------------------------------------- D3: the table list is stale
+patch(
+    "migrations.py",
+    r'''        tables_to_check = [
+            "memory_units",
+            "reflections",  # Renamed from pinned_reflections in p1k2l3m4n5o6 migration
+        ]
+''',
+    r'''        # switchroom (#4506, D3): `reflections` was renamed to `mental_models` by
+        # alembic revision t5o6p7q8r9s0 (which also renamed
+        # idx_reflections_text_search -> idx_mental_models_text_search). The old
+        # name matched no table, so this loop silently reconciled memory_units
+        # ALONE: mental_models kept a native tsvector column + GIN index under a
+        # pg_search backend, and the RuntimeError below advised deleting a table
+        # that does not exist.
+        tables_to_check = [
+            "memory_units",
+            "mental_models",  # renamed from `reflections` by alembic t5o6p7q8r9s0
+        ]
+''',
+)
+
+# The three `else:` arms below select the mental_models column list; their
+# comments still said `reflections`.
+patch(
+    "migrations.py",
+    "                else:  # reflections\n",
+    "                else:  # mental_models\n",
+    count=3,
+)
+
+# ------------------------- D1: classify the target backend's search_vector role
+patch(
+    "migrations.py",
+    r'''        else:  # native
+            target_column_type = "tsvector"
+            target_index_type = "gin"
+
+        mismatched_tables = []
+        tables_with_data = []
+''',
+    r'''        else:  # native
+            target_column_type = "tsvector"
+            target_index_type = "gin"
+
+        # switchroom (#4506, D1): does the TARGET backend store the indexed
+        # content IN `search_vector`, or is the column a dummy?
+        #
+        #   native  -> tsvector, written by ops_postgresql.insert_facts_batch
+        #   vchord  -> bm25vector, tokenized on INSERT
+        #   pg_textsearch / pgroonga / pg_search -> a DUMMY column kept only for
+        #       schema symmetry; those index the BASE columns (text, context,
+        #       text_signals / name, content) directly.
+        #
+        # This is the whole basis of the data guard further down: a recreated
+        # `search_vector` comes back EMPTY and is only ever populated on INSERT,
+        # so recreating it under live rows is lossy for the first group and
+        # completely inert for the second. Expressed as a NEGATIVE test so an
+        # unrecognised future backend is treated as content-bearing (guarded),
+        # never as safe-to-recreate.
+        target_search_vector_is_content = text_search_extension not in (
+            "pg_textsearch",
+            "pgroonga",
+            "pg_search",
+        )
+
+        mismatched_tables = []
+        tables_with_data = []
+''',
+)
+
+# ------------------- D1: guard only a genuinely lossy COLUMN recreate, not any
+#                     (column, index) pair mismatch.
+patch(
+    "migrations.py",
+    r'''                mismatched_tables.append((table_name, current_column_type, current_index_type, current_is_pg_search))
+
+                # Check if table has data
+                row_count = conn.execute(text(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")).scalar()
+
+                if row_count > 0:
+                    tables_with_data.append((table_name, row_count))
+''',
+    r'''                mismatched_tables.append((table_name, current_column_type, current_index_type, current_is_pg_search))
+
+                # switchroom (#4506, D1): the data guard must fire ONLY for a
+                # genuinely lossy backend change.
+                #
+                # Upstream keyed it on the (column, index) PAIR: ANY mismatch on
+                # a populated table raised. So a database whose text-search INDEX
+                # had been dropped while the column survived became a one-way
+                # trapdoor — it booted on NEITHER backend (the pair still
+                # mismatched whatever you set the env var back to), and the
+                # error's own "set it back" advice therefore could not work. That
+                # is exactly the state the documented native->pg_search runbook
+                # asked operators to create.
+                #
+                # What is actually at risk is the COLUMN, never the index: an
+                # index is rebuilt from the heap, a recreated `search_vector`
+                # comes back empty and nothing backfills it. So guard when, and
+                # only when, (a) the column type must genuinely change AND (b) the
+                # target backend reads the column's contents. Everything else — a
+                # stale/absent index over a correctly typed column, or a swap
+                # between two dummy-column backends — is repaired in place.
+                column_recreate_needed = current_column_type != target_column_type
+                if column_recreate_needed and target_search_vector_is_content:
+                    row_count = conn.execute(text(f"SELECT COUNT(*) FROM {schema_name}.{table_name}")).scalar()
+                    if row_count > 0:
+                        tables_with_data.append((table_name, row_count))
+                elif column_recreate_needed:
+                    logger.info(
+                        f"{table_name}: search_vector is a dummy column under "
+                        f"'{text_search_extension}' (the base columns are indexed directly), "
+                        f"so it is recreated in place — no row data is at risk"
+                    )
+                else:
+                    logger.info(
+                        f"{table_name}: search_vector column already has the type "
+                        f"'{text_search_extension}' requires; rebuilding the text-search "
+                        f"index in place"
+                    )
+'''
+    ,
+)
+
+# ---------------------------------------- D3 + D4: an accurate, actionable error
+patch(
+    "migrations.py",
+    r'''            current_col_type = mismatched_tables[0][1]
+            current_idx_type = mismatched_tables[0][2]
+            first_is_pg_search = mismatched_tables[0][3]
+            if current_col_type == "tsvector":
+                current_ext = "native"
+            elif current_col_type == "bm25vector":
+                current_ext = "vchord"
+            elif current_col_type == "text" and current_idx_type == "pgroonga":
+                current_ext = "pgroonga"
+            elif current_col_type == "text":
+                current_ext = "pg_search" if first_is_pg_search else "pg_textsearch"
+            else:
+                current_ext = "unknown"
+            raise RuntimeError(
+                f"Cannot change text search extension from {current_ext} to {text_search_extension}: "
+                f"the following tables contain data: {table_list}. "
+                f"To change text search extension, you must either:\n"
+                f"  1. Clear all data: DELETE FROM {schema_name}.memory_units; "
+                f"DELETE FROM {schema_name}.reflections; then restart\n"
+                f"  2. Use the current text search extension (set HINDSIGHT_API_TEXT_SEARCH_EXTENSION='{current_ext}')"
+            )
+''',
+    r'''            # switchroom (#4506, D4): describe the table that actually TRIPPED
+            # the guard. Upstream read mismatched_tables[0], which need not be one
+            # of the blocked tables at all.
+            _blocked = {t for t, _n in tables_with_data}
+            _row = next((m for m in mismatched_tables if m[0] in _blocked), mismatched_tables[0])
+            current_col_type = _row[1]
+            current_idx_type = _row[2]
+            first_is_pg_search = _row[3]
+            if current_col_type == "tsvector":
+                current_ext = "native"
+            elif current_col_type == "bm25vector":
+                current_ext = "vchord"
+            elif current_col_type == "text" and current_idx_type == "pgroonga":
+                current_ext = "pgroonga"
+            elif current_col_type == "text" and current_idx_type is None:
+                # switchroom (#4506, D4): with no index there is no `key_field`
+                # reloption to read, and pg_textsearch / pgroonga / pg_search all
+                # sit on a plain TEXT column — the live backend is genuinely
+                # undetermined. Upstream reported `pg_textsearch` here, which was
+                # a guess presented as a reading, and it sent operators to set an
+                # env value that did not describe their database.
+                current_ext = "indeterminate (TEXT search_vector, no text-search index)"
+            elif current_col_type == "text":
+                current_ext = "pg_search" if first_is_pg_search else "pg_textsearch"
+            elif current_col_type is None:
+                current_ext = "none (no search_vector column)"
+            else:
+                current_ext = f"unknown (search_vector is {current_col_type})"
+
+            # switchroom (#4506, D3): name tables that EXIST. Upstream hard-coded
+            # `reflections`, renamed to `mental_models` by alembic t5o6p7q8r9s0,
+            # so remedy 1 could not be run as written.
+            _clear = " ".join(f"DELETE FROM {schema_name}.{table};" for table, _n in tables_with_data)
+            if current_ext in ("native", "vchord", "pgroonga", "pg_textsearch", "pg_search"):
+                _keep = (
+                    f"  2. Stay on the current backend "
+                    f"(set HINDSIGHT_API_TEXT_SEARCH_EXTENSION='{current_ext}') and restart"
+                )
+            else:
+                _keep = (
+                    "  2. Identify the live backend from the schema "
+                    "(\\d+ on the table, then \\di+ on its *_text_search index) and pin that value "
+                    "in HINDSIGHT_API_TEXT_SEARCH_EXTENSION"
+                )
+            raise RuntimeError(
+                f"Cannot change text search extension from {current_ext} to {text_search_extension}: "
+                f"the following tables contain data: {table_list}. "
+                f"'{text_search_extension}' stores the indexed content IN the search_vector column and "
+                f"only populates it on INSERT, so recreating that column here would leave every "
+                f"existing row unsearchable. To change text search extension, you must either:\n"
+                f"  1. Clear all data: {_clear} then restart\n"
+                f"{_keep}"
+            )
+'''
+    ,
+)
+
+# ------------------------- D1: an index-only rebuild must not drop the column
+patch(
+    "migrations.py",
+    r'''            # Drop existing column if it exists
+            if current_col_type:
+                logger.info(f"Dropping {current_col_type} column on {table_name}")
+                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} DROP COLUMN IF EXISTS search_vector"))
+''',
+    r'''            # switchroom (#4506, D1): drop the column ONLY when its type is
+            # genuinely wrong. Upstream dropped unconditionally, which turned an
+            # index-only rebuild (correct column, stale/absent index) into silent
+            # data loss: the populated native tsvector would be discarded and
+            # recreated empty, and nothing ever backfills it.
+            if current_col_type and current_col_type != target_column_type:
+                logger.info(f"Dropping {current_col_type} column on {table_name}")
+                conn.execute(text(f"ALTER TABLE {schema_name}.{table_name} DROP COLUMN IF EXISTS search_vector"))
+            elif current_col_type:
+                logger.info(
+                    f"Keeping the existing {current_col_type} search_vector column on {table_name}; "
+                    f"rebuilding the {target_index_type} index only"
+                )
+''',
+)
+
+# The five ADD COLUMN sites become idempotent so the preserved-column path above
+# is a no-op rather than a duplicate-column error.
+patch(
+    "migrations.py",
+    "ADD COLUMN search_vector",
+    "ADD COLUMN IF NOT EXISTS search_vector",
+    count=5,
+)
+
+# ---------------------------------------------- D2: nobody creates the extension
+patch(
+    "migrations.py",
+    r'''            elif text_search_extension == "pg_search":
+                logger.info(f"Creating TEXT column on {table_name}")
+''',
+    r'''            elif text_search_extension == "pg_search":
+                # switchroom (#4506, D2): NOTHING in the boot path ever ran
+                # `CREATE EXTENSION pg_search`. The entrypoint's
+                # provision_pg_search() stages the .so + control/sql into the
+                # embedded-pg install and deliberately does not touch the
+                # database, and this branch went straight to CREATE INDEX — which
+                # died with `InvalidSchemaName: schema "pdb" does not exist`
+                # because the pdb schema only exists once the extension is
+                # installed. The pgroonga branch above already does exactly this;
+                # mirror it, including the "already exists / no permission"
+                # verification fallback.
+                try:
+                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE"))
+                except Exception:
+                    has_ext = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'pg_search'")).fetchone()
+                    if not has_ext:
+                        raise
+
+                logger.info(f"Creating TEXT column on {table_name}")
+''',
+)
+
+# ----------------------------------------------------------------- verification
+import py_compile
+
+py_compile.compile(str(ROOT / "migrations.py"), doraise=True)
+
+m = (ROOT / "migrations.py").read_text()
+assert '"mental_models",  # renamed from `reflections` by alembic t5o6p7q8r9s0' in m, (
+    f"switchroom hindsight {NAME}: tables_to_check still does not name mental_models"
+)
+assert '"reflections",' not in m, (
+    f"switchroom hindsight {NAME}: the dead `reflections` table name survived the patch"
+)
+assert "DELETE FROM {schema_name}.reflections" not in m, (
+    f"switchroom hindsight {NAME}: the error message still advises deleting a table that does not exist"
+)
+assert "target_search_vector_is_content = text_search_extension not in (" in m, (
+    f"switchroom hindsight {NAME}: the content-vs-dummy classification is missing"
+)
+assert "if column_recreate_needed and target_search_vector_is_content:" in m, (
+    f"switchroom hindsight {NAME}: the data guard is not narrowed to a lossy column recreate"
+)
+assert "if current_col_type and current_col_type != target_column_type:" in m, (
+    f"switchroom hindsight {NAME}: the rebuild path still drops the column unconditionally"
+)
+assert m.count("ADD COLUMN IF NOT EXISTS search_vector") == 5, (
+    f"switchroom hindsight {NAME}: expected 5 idempotent ADD COLUMN sites, found "
+    f"{m.count('ADD COLUMN IF NOT EXISTS search_vector')}"
+)
+assert 'CREATE EXTENSION IF NOT EXISTS pg_search CASCADE' in m, (
+    f"switchroom hindsight {NAME}: the pg_search branch still never creates the extension"
+)
+# The CREATE EXTENSION must come BEFORE the CREATE INDEX in that branch, or the
+# pdb schema still does not exist when the index is built.
+# NB: `elif text_search_extension == "pg_search":` also appears in the
+# target-type selection at the top of the function — take the DDL branch.
+_branch = m.split('elif text_search_extension == "pg_search":\n                # switchroom (#4506, D2)', 1)[
+    1
+].split("else:  # native", 1)[0]
+assert _branch.index("CREATE EXTENSION IF NOT EXISTS pg_search") < _branch.index("USING bm25"), (
+    f"switchroom hindsight {NAME}: CREATE EXTENSION pg_search must precede the BM25 CREATE INDEX"
+)
+assert "indeterminate (TEXT search_vector, no text-search index)" in m, (
+    f"switchroom hindsight {NAME}: the detector still guesses a backend it cannot read"
+)
+
+print(
+    "switchroom hindsight text-search backend migration path: reconciles mental_models (not the "
+    "renamed-away `reflections`); the data guard now fires only on a genuinely lossy column "
+    "recreate, so a stale/absent index is rebuilt in place instead of being a one-way trapdoor; "
+    "the pg_search branch creates its extension before building the BM25 index; the mismatch "
+    "error names real tables and never guesses a backend it cannot read"
+)
+PYEOF
+
 # Empty-TimeoutError-message fix: both retry loops in
 # engine/providers/litellm_llm.py end their timeout handler with a bare
 # `raise`, which re-raises the asyncio.TimeoutError produced by

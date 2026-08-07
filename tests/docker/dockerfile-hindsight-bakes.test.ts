@@ -508,6 +508,62 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the text-search backend migration-path fix (assert-guarded, fail-loud)", () => {
+    // #4506. Five defects in `ensure_text_search_extension`, all OBSERVED in a
+    // rehearsal against a clone of the live 801,792-row memory_units.
+    // Behaviour is proven against the pinned upstream image in
+    // tests/docker/hindsight-text-search-migration-patch.test.ts; this pins the
+    // shape so a silent removal cannot ship.
+
+    // D1a. THE LOAD-BEARING CONSTRAINT: the data guard fires only when the
+    //      column type must genuinely change AND the target backend reads the
+    //      column's contents. Keyed on the (column, index) PAIR — as upstream
+    //      did — a merely-dropped index over a surviving column is fatal on
+    //      EVERY backend, including the one already in use, and the error's own
+    //      "set it back" advice cannot work. That was a one-way trapdoor.
+    expect(dockerfile).toMatch(
+      /target_search_vector_is_content = text_search_extension not in \(/,
+    );
+    expect(dockerfile).toMatch(
+      /if column_recreate_needed and target_search_vector_is_content:/,
+    );
+
+    // D1b. …and the rebuild path must not drop a correctly typed, POPULATED
+    //      column. `search_vector` is recreated EMPTY and only ever written on
+    //      INSERT, so an unconditional DROP on an index-only rebuild is silent
+    //      data loss in its own right.
+    expect(dockerfile).toMatch(
+      /if current_col_type and current_col_type != target_column_type:/,
+    );
+
+    // D2. the pg_search branch installs its own extension. Without this the
+    //     BM25 CREATE INDEX dies on `schema "pdb" does not exist`, because
+    //     nothing else in the boot path ever creates it (the entrypoint stages
+    //     the .so only, by design).
+    expect(dockerfile).toMatch(
+      /CREATE EXTENSION IF NOT EXISTS pg_search CASCADE/,
+    );
+    expect(dockerfile).toMatch(
+      /assert _branch\.index\("CREATE EXTENSION IF NOT EXISTS pg_search"\) < _branch\.index\("USING bm25"\)/,
+    );
+
+    // D3. the second memory table is reconciled under the name it actually has
+    //     (alembic t5o6p7q8r9s0 renamed reflections -> mental_models), and the
+    //     dead name is gone from the source entirely.
+    expect(dockerfile).toMatch(/"mental_models",\s+# renamed from `reflections`/);
+    expect(dockerfile).toMatch(/assert '"reflections",' not in m, \(/);
+
+    // D4. the detector never reports a backend it cannot read.
+    expect(dockerfile).toMatch(
+      /indeterminate \(TEXT search_vector, no text-search index\)/,
+    );
+
+    // the stable operator signal.
+    expect(dockerfile).toMatch(
+      /switchroom hindsight text-search backend migration path: reconciles mental_models/,
+    );
+  });
+
   it("creates /backups owned by hindsight BEFORE `USER hindsight` (so the named volume is writable)", () => {
     // A root-owned /backups mount point makes the fresh named volume
     // root-owned → the non-root hindsight process EACCESes on pg_dump and
