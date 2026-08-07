@@ -162,26 +162,80 @@ export function resolveMemorySetupTag(input: {
 }
 
 /**
+ * Every secret-bearing value `memory docker-compose` can emit: the global and
+ * per-op LLM `api_key` fields plus `cp_access_key`. Blank/absent entries are
+ * dropped, so callers can treat the result as "the secrets in play".
+ *
+ * One enumerator so the two questions asked below — "is there a `vault:` ref
+ * to warn is unresolved?" and "will this snippet carry a live secret?" — can
+ * never disagree about WHICH fields carry a secret.
+ */
+function hindsightSecretValues(input: {
+  llm?: HindsightLlmConfig;
+  cpAccessKey?: string;
+}): string[] {
+  const out: string[] = [];
+  const push = (v?: string) => {
+    if (typeof v === "string" && v.trim().length > 0) out.push(v.trim());
+  };
+  push(input.cpAccessKey);
+  push(input.llm?.api_key);
+  for (const op of ["retain", "reflect", "consolidation"] as const) {
+    push(input.llm?.[op]?.api_key);
+  }
+  return out;
+}
+
+/**
  * Whether `memory docker-compose`'s unresolved-by-default snippet (#4487)
- * actually carries a `vault:` ref anywhere the emit path reads a secret from
- * — the global/per-op LLM `api_key` fields and `cp_access_key`. Used only to
- * decide whether the "these refs are unresolved" note is accurate; the
- * refs themselves are never touched here (that's `resolveHindsightLlmSecrets`
- * / `resolveHindsightCpAccessKey`, gated behind `--resolve-secrets`).
+ * actually carries a `vault:` ref anywhere the emit path reads a secret from.
+ * Used only to decide whether the "these refs are unresolved" note is
+ * accurate; the refs themselves are never touched here (that's
+ * `resolveHindsightLlmSecrets` / `resolveHindsightCpAccessKey`, gated behind
+ * `--resolve-secrets`).
  */
 function hasUnresolvedHindsightVaultRef(config: SwitchroomConfig): boolean {
   const hindsight = (config as { hindsight?: { cp_access_key?: string; llm?: HindsightLlmConfig } })
     .hindsight;
-  const isRef = (v?: string) => typeof v === "string" && isVaultReference(v);
-  if (isRef(hindsight?.cp_access_key)) return true;
-  const llm = hindsight?.llm;
-  if (!llm) return false;
-  if (isRef(llm.api_key)) return true;
-  for (const op of ["retain", "reflect", "consolidation"] as const) {
-    if (isRef(llm[op]?.api_key)) return true;
-  }
-  return false;
+  return hindsightSecretValues({
+    llm: hindsight?.llm,
+    cpAccessKey: hindsight?.cp_access_key,
+  }).some((v) => isVaultReference(v));
 }
+
+/**
+ * Whether the snippet about to be printed carries a secret in CLEARTEXT.
+ *
+ * Asked of the values that will actually be emitted, NOT of the flag, so one
+ * predicate covers both branches and neither can drift:
+ *
+ *   - `--resolve-secrets`: the `vault:` refs have already been swapped for
+ *     live `sk-…` values by here, so they read as cleartext ⇒ warn. A ref the
+ *     broker DENIED resolves to nothing and is correctly not warned about —
+ *     nothing cleartext reaches stdout in that case.
+ *   - default: refs are emitted literally (a `vault:…` string is not a
+ *     secret), but a PLAINTEXT key written straight into switchroom.yaml is
+ *     still copied verbatim into the snippet ⇒ warn. The `--resolve-secrets`
+ *     gate never applied to those, so they must not lose the warning `main`
+ *     always printed.
+ */
+function emitsCleartextHindsightSecret(input: {
+  llm?: HindsightLlmConfig;
+  cpAccessKey?: string;
+}): boolean {
+  return hindsightSecretValues(input).some((v) => !isVaultReference(v));
+}
+
+/**
+ * The one cleartext-secrets warning for `memory docker-compose`. Kept next to
+ * the predicate above so the message and the condition that fires it stay in
+ * one place. Emitted to stderr with a `#` prefix by every caller, so a
+ * piped/redirected stdout stays a valid compose file even under `2>&1`.
+ */
+export const HINDSIGHT_COMPOSE_CLEARTEXT_SECRETS_WARNING =
+  "This snippet embeds secrets in CLEARTEXT (LLM api_key and/or cp_access_key)." +
+  " Treat the output as sensitive — do not paste it into shared channels or" +
+  " commit it unredacted.";
 
 /**
  * Resolve LiteLLM routing config for the hindsight container, plus the
@@ -1177,6 +1231,14 @@ export function registerMemoryCommand(program: Command): void {
             memLimit: snippetConfig.hindsight?.mem_limit,
           });
           if (memWarning) console.error(chalk.yellow(`# ! ${memWarning}`));
+        }
+        // Warn ONCE, from ONE site covering BOTH branches, whenever the
+        // snippet about to print actually carries a cleartext secret — the
+        // warning `main` printed unconditionally before `--resolve-secrets`
+        // existed. The dangerous path (`--resolve-secrets`, which emits live
+        // `sk-…` keys) must never warn LESS than the safe default does.
+        if (emitsCleartextHindsightSecret({ llm: snippetLlm, cpAccessKey })) {
+          console.error(chalk.yellow(`# ! ${HINDSIGHT_COMPOSE_CLEARTEXT_SECRETS_WARNING}`));
         }
         console.log(
           generateHindsightComposeSnippet(

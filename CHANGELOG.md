@@ -45,6 +45,7 @@ now an anomaly worth investigating, not the norm.
 
 - **`memory docker-compose` no longer prints live secrets to stdout by default (#4487)** — the compose snippet now emits `vault:` refs unresolved, plus a note, unless the new `--resolve-secrets` flag is passed; `cp_access_key` follows the same rule. Closes the follow-up from #4471, which correctly wired `vault:` resolution into the snippet emit site but changed the command to print a live `sk-…` key on an operator-invoked command whose stdout is routinely pasted around.
 - **`memory setup --recreate` vault-ref wiring now has a direct test (#4486)** — adds the first `registerMemoryCommand` test harness and a wiring assertion pinning that the `--recreate` launch path (the one that caused the 2026-08-06 outage) resolves `hindsight.llm` `vault:` refs before they reach `startHindsight`.
+- **The cleartext-secrets warning now fires on every path that actually emits one** — it is decided ONCE, from the values about to be printed rather than from the flag, so `--resolve-secrets` (the only path that emits a live `sk-…` key) can never warn LESS than the safe default does; a PLAINTEXT api_key written straight into `switchroom.yaml`, which no `vault:` gate ever applied to, is warned about too; and a snippet carrying only unresolved `vault:` refs stays quiet, since a `vault:…` string is not a secret and crying wolf there would devalue the warning where it matters.
 
 ### Hindsight keyword recall moves to ParadeDB pg_search (BM25)
 

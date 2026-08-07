@@ -236,6 +236,77 @@ describe("registerMemoryCommand wiring (#4486, #4487)", () => {
     expect(mocks.getViaBrokerStructured).toHaveBeenCalledWith("litellm/gpt-oss-key", {});
   });
 
+  // The dangerous branch must not warn LESS than the safe one. Before this
+  // guard, `--resolve-secrets` — the ONLY path that emits a live `sk-…` key —
+  // printed no cleartext warning at all, having dropped the unconditional one
+  // `main` carried (src/cli/memory.ts, pre-#4487), while the safe default
+  // branch got a five-line NOTE.
+  it("`memory docker-compose --resolve-secrets` WARNS that the snippet embeds cleartext secrets", async () => {
+    await buildProgram(configPath).parseAsync(
+      ["memory", "docker-compose", "--resolve-secrets"],
+      { from: "user" },
+    );
+
+    // Assert the OUTCOME: the warning text actually reached the operator, on
+    // stderr, `#`-prefixed so a redirected stdout stays a valid compose file.
+    const err = errs.join("\n");
+    expect(err).toMatch(/cleartext/i);
+    expect(err).toMatch(/do not paste it into shared channels/i);
+    expect(err).toMatch(/^# ! /m);
+    // And the thing it is warning about really is in the output.
+    expect(logs.join("\n")).toContain(REAL_KEY);
+  });
+
+  it("warns about a PLAINTEXT api_key in config even without --resolve-secrets (nothing gates it)", async () => {
+    // A key written straight into switchroom.yaml is never a `vault:` ref, so
+    // the unresolved-refs NOTE does not fire for it and `--resolve-secrets`
+    // does not apply to it — yet it is copied verbatim into the snippet. On
+    // `main` this printed the unconditional cleartext warning; it must not
+    // have become the one case that prints a live key silently.
+    const PLAINTEXT_KEY = "sk-" + "test-fake-plaintext-key-111";
+    writeFileSync(
+      configPath,
+      [
+        "switchroom:",
+        "  version: 1",
+        `  agents_dir: ${join(tmpDir, "agents")}`,
+        "telegram:",
+        '  bot_token: "test:token"',
+        '  forum_chat_id: "0"',
+        "agents:",
+        "  alpha:",
+        "    topic_name: alpha",
+        "hindsight:",
+        "  llm:",
+        "    provider: openai",
+        `    api_key: "${PLAINTEXT_KEY}"`,
+        "",
+      ].join("\n"),
+    );
+
+    await buildProgram(configPath).parseAsync(["memory", "docker-compose"], {
+      from: "user",
+    });
+
+    expect(logs.join("\n")).toContain(PLAINTEXT_KEY);
+    const err = errs.join("\n");
+    expect(err).toMatch(/cleartext/i);
+    expect(err).toMatch(/do not paste it into shared channels/i);
+  });
+
+  it("stays QUIET about cleartext when the snippet carries only unresolved `vault:` refs", async () => {
+    // The complement of the two guards above: a `vault:…` string is not a
+    // secret, so the default branch must not cry wolf — otherwise the warning
+    // becomes noise on the safe path and stops meaning anything on the
+    // dangerous one.
+    await buildProgram(configPath).parseAsync(["memory", "docker-compose"], {
+      from: "user",
+    });
+
+    expect(logs.join("\n")).toContain(VAULT_REF);
+    expect(errs.join("\n")).not.toMatch(/cleartext/i);
+  });
+
   it("`memory docker-compose` (no flag) omits the unresolved note when there is no `vault:` ref to resolve", async () => {
     writeFileSync(
       configPath,
