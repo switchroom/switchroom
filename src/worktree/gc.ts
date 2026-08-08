@@ -67,9 +67,24 @@ export function repoRootFromWorktreeGitdir(gitdir: string): string | null {
   return gitdir.slice(0, idx);
 }
 
-/** True if an `origin` URL points at the canonical switchroom repo. */
+/**
+ * True if an `origin` URL points at a switchroom checkout GC should own.
+ *
+ * That is the canonical `switchroom/switchroom` repo AND the dead
+ * `mekenthompson/switchroom` fork (archived, read-only, hundreds of commits
+ * behind — see the `.rev-pr4` incident where a fork-origin clone survived 8
+ * days uncollected). A fork-origin clone must be GC-ELIGIBLE just like a
+ * canonical-origin one, so both owners count as "ours". The match is anchored
+ * to the exact repo name, so `mekenthompson/switchroom-web` and other repos
+ * are NOT over-matched. Handles https/ssh, optional `.git`, and a trailing
+ * slash. Note: this only decides whether a checkout ALREADY under an
+ * agent-managed scan root (Phase A ~/code orphans, Phase C home/work task
+ * trees) is switchroom-owned — it never widens WHERE the GC looks, and every
+ * downstream safety guard (merged PR, clean, pushed, idle, not-in-use) still
+ * applies before anything is reclaimed.
+ */
 export function isSwitchroomRemote(originUrl: string): boolean {
-  return /[:/]switchroom\/switchroom(\.git)?\/?$/.test(originUrl.trim());
+  return /[:/](?:switchroom|mekenthompson)\/switchroom(\.git)?\/?$/.test(originUrl.trim());
 }
 
 export interface WorktreeEntry {

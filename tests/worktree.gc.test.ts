@@ -57,10 +57,18 @@ describe("isSwitchroomRemote", () => {
     expect(isSwitchroomRemote("git@github.com:switchroom/switchroom.git")).toBe(true);
     expect(isSwitchroomRemote("https://github.com/switchroom/switchroom")).toBe(true);
   });
-  it("rejects other repos (incl. the dead fork & web repo)", () => {
+  it("matches the dead mekenthompson fork so a fork-origin clone is GC-eligible", () => {
+    // The .rev-pr4 incident: a clone whose origin still pointed at the dead
+    // fork was invisible to GC and lingered 8 days. It must now be recognized.
+    expect(isSwitchroomRemote("https://github.com/mekenthompson/switchroom.git")).toBe(true);
+    expect(isSwitchroomRemote("https://github.com/mekenthompson/switchroom")).toBe(true); // no .git
+    expect(isSwitchroomRemote("git@github.com:mekenthompson/switchroom.git")).toBe(true); // ssh
+    expect(isSwitchroomRemote("https://github.com/mekenthompson/switchroom/")).toBe(true); // trailing slash
+  });
+  it("rejects other repos (incl. the web repo — no over-match)", () => {
     expect(isSwitchroomRemote("https://github.com/mekenthompson/switchroom-web.git")).toBe(false);
     expect(isSwitchroomRemote("https://github.com/someone/clued-in.git")).toBe(false);
-    expect(isSwitchroomRemote("https://github.com/mekenthompson/switchroom.git")).toBe(false);
+    expect(isSwitchroomRemote("https://github.com/notmekenthompson/switchroom.git")).toBe(false);
   });
 });
 
