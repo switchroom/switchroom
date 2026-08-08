@@ -26,7 +26,13 @@
     "  jaccard_max     inclusive upper bound; above this the shift did NOT",
     "                  occur and is reported as such",
     "  from_api_version / to_api_version   version scope, or null for 'any'",
-    "  reason / evidence / signed_off_by   why this is not a defect"
+    "  reason / evidence / signed_off_by   why this is not a defect",
+    "  band_derivation how the min/max bounds were chosen (optional)",
+    "  issue           the investigation this declaration came out of (optional)",
+    "  follow_up       the issue tracking the UNDERLYING defect, for a",
+    "                  declaration that accepts a real defect rather than a",
+    "                  benign behavioural difference. Accepting a shift must",
+    "                  never become the way the bug gets lost (optional)."
   ],
   "shifts": [
     {
@@ -36,11 +42,12 @@
       "jaccard_max": 0.85,
       "from_api_version": "0.8.6",
       "to_api_version": "0.9.0",
-      "reason": "Deterministic tie-break reshuffle, not a retrieval defect. _select_with_temporal_coverage (0.9.0 retrieval.py:428) ranks its pool with a stable sort on similarity and NO deterministic tiebreaker, then buckets in ranked order, so equal-similarity ties inherit SQL row order. Any change to plans, physical order or pool composition reshuffles the temporal arm's entry points and everything downstream (graph spreading, rerank) follows. The function itself is byte-identical between 0.8.6 and 0.9.0.",
+      "reason": "Deterministic tie-break reshuffle, not a retrieval defect. _select_with_temporal_coverage (0.9.0 retrieval.py:428) ranks its pool with a stable sort on similarity and NO deterministic tiebreaker, then buckets in ranked order, so equal-similarity ties inherit SQL row order. Any change to plans, physical order or pool composition reshuffles the temporal arm's entry points and everything downstream (graph spreading, rerank) follows. The function itself is byte-identical between 0.8.6 and 0.9.0. The missing tiebreaker is itself a real defect and is tracked in switchroom#4544: accepting this band is a rollout decision about blast radius, not a claim that the ranking is correct.",
       "evidence": "WP6 (switchroom#4533) comparison C, byte-identical data, 0.8.6 image vs 0.9.0 image on the same restored copy: overlord 0.793, klanker 0.688, finn 0.782. Counts -1%/+9%/+1%, latency unchanged. Reproduced exactly across a container restart and a full downgrade -> re-upgrade cycle (Jaccard 1.000 against itself). 27/30 other cells passed, 25 of them at 1.000, including entity-person at 1.000 on all three banks. Stage-4 independent validation (switchroom#4525) confirmed the attribution in 0.9.0 source.",
       "band_derivation": "WP6 measured 0.688-0.793 on byte-identical data. The band is widened to 0.60-0.85 to absorb the organic ingest that accrues between a live pre-capture and a live post-capture minutes later. It is deliberately NOT widened further: below 0.60 is outside anything WP6 observed and should stop the rollout.",
-      "signed_off_by": "epic owner sign-off required before the WP7 window - see switchroom#4525 'the epic owner still owes the explicit better/worse/accept call'",
-      "issue": "switchroom#4533"
+      "signed_off_by": "ACCEPTED by the epic owner (Ken Thompson / @mekenthompson) on 2026-08-08: the shift is real, but it is bounded to 1 of 10 query shapes, deterministic, and count- and latency-neutral. Rollout proceeds; the missing tiebreaker in _select_with_temporal_coverage is tracked for later tuning (switchroom#4544) rather than blocking the WP7 window. See switchroom#4533.",
+      "issue": "switchroom#4533",
+      "follow_up": "switchroom#4544"
     }
   ]
 }
