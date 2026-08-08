@@ -15,6 +15,20 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Build: `npm ci` works again on a clean clone
+
+- **`package-lock.json` is resynced with `package.json`.** #4208 added
+  `nostr-tools@^2.24.1` as a dependency but never regenerated the lockfile, so
+  `origin/main` carried a `package.json` declaring the dep against a lock with
+  zero `node_modules/nostr-tools` entries. Every fresh clone or worktree failed
+  at `npm ci` with `Missing: nostr-tools@2.24.1 from lock file` (plus its
+  `nostr-wasm` / `@noble/*` / `@scure/*` transitives), which is why recent work
+  had to symlink `node_modules` in from another checkout to run tests at all.
+  Regenerating is purely additive — eight new package entries, no version bumps,
+  no integrity or `lockfileVersion` churn — apart from `typescript` moving
+  `dev` → `devOptional`, which is npm correctly recording nostr-tools' optional
+  `typescript` peer.
+
 ### Hindsight: an agent can finally read its own knowledge pages
 
 - **The MCP shim now synthesizes three GET-only knowledge-page tools —
