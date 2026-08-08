@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.17 — Hindsight bakes the bge ONNX export into the image and boots HF-offline
+
 ### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot
 
 - **`docker/Dockerfile.hindsight` now bakes the `BAAI/bge-small-en-v1.5`
