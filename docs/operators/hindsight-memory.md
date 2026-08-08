@@ -72,6 +72,82 @@ switchroom agent restart test-harness --wait --force   # or: docker restart swit
 switchroom memory repair --all
 ```
 
+## Rolling the base image FORWARD: the rollout gate
+
+`scripts/hindsight-rollout-gate/` decides go/no-go for a Hindsight **server**
+bump by measuring whether recall result sets and latency changed across the
+restart. Read its `README.md` before the window; the essentials are here.
+
+### Capture the baseline LIVE, minutes before the window
+
+```sh
+cd scripts/hindsight-rollout-gate
+export HINDSIGHT_API_URL=http://127.0.0.1:18888
+
+./rollout_gate.sh pre        # MINUTES before the maintenance window
+# ... perform the upgrade ...
+./rollout_gate.sh post       # captures, compares, prints the verdict
+```
+
+`post` reuses the run directory, API URL and pinned recency anchor recorded by
+`pre`, so they cannot drift between the two halves.
+
+> **Do not gate on an old frozen baseline.** The result-set comparison is
+> meaningful in exactly one configuration: live-before vs live-after, same
+> running instance, baseline captured minutes beforehand. WP6
+> (switchroom#4533) proved the alternative empirically — comparing a captured
+> baseline against **the same code** on a fresh restore of that instance's own
+> dump flagged **30/30 cells at Jaccard 0.36–0.75** on completely healthy data.
+> The number is dominated by physical row order (ties in `LIMIT`-ed retrieval
+> arms have no deterministic tiebreaker), not by the code under test.
+>
+> The gate now enforces this rather than trusting it: each capture records the
+> Postgres cluster identity (`pg_controldata`, read-only) and its capture time,
+> and the comparator **refuses** a cross-instance or stale (>4h) baseline.
+
+### Reading the verdict
+
+| exit | meaning | what to do |
+|---|---|---|
+| `0` | **GATE PASS** | proceed; declared expected shifts are listed, check them |
+| `1` | **GATE FAIL** | a verdict about the upgrade — investigate / roll back |
+| `2` | **GATE MISUSE** | *not* a verdict. The two captures are not comparable (different instance, stale baseline, mismatched recency anchor). Fix the inputs and re-run. |
+
+Exit 2 is deliberately distinct from exit 1. A red board that turns out to mean
+"you used the gate wrong" trains you to ignore red.
+
+`--allow-cross-instance` / `--allow-stale-baseline` downgrade those refusals to
+warnings and stamp the report **ADVISORY ONLY**. They are for post-hoc
+investigation, never for a rollout decision.
+
+### Expected shifts
+
+`expected_shifts.json` pre-declares cells known to move for an understood,
+non-defect reason. A declared cell reports as `expected-shift` instead of
+failing — but it is still printed with its measured Jaccard, in its own report
+section, and it still FAILS if it drops below the declared band or if its
+result count moves. If the declared shift does **not** occur, that is reported
+too (`expected-shift-not-observed`): a declaration that has stopped matching
+reality is stale and must be visible.
+
+For 0.8.6 → 0.9.0 there is exactly one: **`temporal-relative`, band 0.60–0.85**.
+`_select_with_temporal_coverage` (0.9.0 `retrieval.py:428`) stable-sorts on
+similarity with no tiebreaker, so equal-similarity ties inherit SQL row order
+and the temporal arm's entry points reshuffle. WP6 measured 0.688–0.793 on
+byte-identical data, reproducible across restarts and a full
+downgrade/re-upgrade cycle, count-neutral and latency-neutral. Declarations are
+version-scoped, so this one retires itself once the fleet is past 0.9.0.
+
+### Soak numbers
+
+Latency medians/p90 are robust to organic ingest, so they still come from the
+WP0 frozen window rather than a fresh capture:
+
+```sh
+./soak_measure.py --json soak-metrics-<date>.json           # pre
+./soak_measure.py --since <rollout ts> --json <out>.json    # post-flight
+```
+
 ## Rolling the base image BACK (schema first, then the digest)
 
 `docker/Dockerfile.hindsight` pins upstream Hindsight by digest, and a bump

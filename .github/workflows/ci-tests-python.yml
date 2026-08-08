@@ -73,6 +73,8 @@ jobs:
               - 'vendor/hindsight-memory/hooks/**'
               - 'docker/voice-sidecar/**'
               - 'docker/litellm-pacer/**'
+              # Hindsight server-bump rollout gate (scripts + its self-test).
+              - 'scripts/hindsight-rollout-gate/**'
               - '.github/workflows/ci-tests-python.yml'
 
   unittest:
@@ -123,6 +125,15 @@ jobs:
       - name: Run litellm-pacer unittests
         working-directory: docker/litellm-pacer
         run: python3 -m unittest discover -s . -p 'test_*.py'
+
+      # Hindsight server-bump rollout gate. Stdlib-only, no network. This
+      # suite exists because the gate's first version would have reported a
+      # fully-red board on healthy data at rollout time (switchroom#4533
+      # comparison B: same code, restored copy, 30/30 cells flagged) and had
+      # never been run against a known-good or known-bad input.
+      - name: Run hindsight-rollout-gate unittests
+        working-directory: scripts/hindsight-rollout-gate
+        run: python3 -m unittest discover -s tests -t .
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context (see ci-lint.yml header for the
