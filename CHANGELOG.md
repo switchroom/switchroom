@@ -24,6 +24,17 @@ now an anomaly worth investigating, not the norm.
   healthy BM25 index — a false positive; no index rebuild is warranted. The
   alarm still fires when a filter field is genuinely absent. (#4526)
 
+### Telegram: surface `/private` and `/public` in the slash-command menu
+
+- **`/private` and `/public` now appear in the Telegram autocomplete menu**
+  (`setMyCommands`). The handlers already shipped (#4445) — `/private` pauses
+  Hindsight auto-retain for the session, `/public` resumes it, and
+  session-start resets to public — but the two commands were never registered
+  in `TELEGRAM_MENU_COMMANDS`, so they didn't autocomplete when a user typed
+  `/`. Added both to the session-controls group of the menu (right after
+  `/clear`) and to the `/commands` help text. Autocomplete-only change; no
+  handler or retain-side logic touched.
+
 ## v0.20.17 — Hindsight bakes the bge ONNX export into the image and boots HF-offline
 
 ### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot

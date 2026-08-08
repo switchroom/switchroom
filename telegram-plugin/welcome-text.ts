@@ -356,6 +356,11 @@ export const TELEGRAM_MENU_COMMANDS = [
   { command: "new", description: "Fresh session (flush handoff, restart)" },
   { command: "compact", description: "Compact context (summarize, keep the thread)" },
   { command: "clear", description: "Clear context (fresh slate; memory in Hindsight)" },
+  // Privacy — pause/resume Hindsight auto-retain for this session
+  // (session-start resets to public). Handlers shipped in #4445;
+  // these entries only add them to the autocomplete menu.
+  { command: "private", description: "Pause saving this session to memory" },
+  { command: "public", description: "Resume saving this session to memory" },
   // Inline approvals
   { command: "approve", description: "Approve pending tool permission" },
   { command: "deny", description: "Deny pending tool permission" },
@@ -418,6 +423,8 @@ export function switchroomHelpText(agentName: string): string {
     `\`/new\` — fresh session (flush handoff, restart)`,
     `\`/compact\` — compact context (summarize, keep the thread)`,
     `\`/clear\` — clear context (fresh slate; memory in Hindsight)`,
+    `\`/private\` — pause saving this session to memory`,
+    `\`/public\` — resume saving this session to memory`,
     `\`/approve [id]\` — approve pending tool permission`,
     `\`/deny [id]\` — deny pending tool permission`,
     `\`/pending\` — list pending permission prompts`,

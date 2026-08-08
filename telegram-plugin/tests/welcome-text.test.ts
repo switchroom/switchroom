@@ -533,11 +533,12 @@ describe("TELEGRAM_MENU_COMMANDS (slash-menu shape)", () => {
     ).not.toMatch(/`\/reauth\b/);
   });
 
-  it("menu is short enough for a mobile keyboard (<= 21 entries)", () => {
+  it("menu is short enough for a mobile keyboard (<= 23 entries)", () => {
     // Hard cap: Telegram autocomplete on mobile shows ~8-10 commands
-    // without scrolling. 21 is a generous upper bound (well under
-    // Telegram's own 100-command limit). /whoami brought it to 21.
-    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(21);
+    // without scrolling. 23 is a generous upper bound (well under
+    // Telegram's own 100-command limit). /whoami brought it to 21;
+    // /private + /public (autocomplete for the shipped handlers) → 23.
+    expect(TELEGRAM_MENU_COMMANDS.length).toBeLessThanOrEqual(23);
   });
 
   it("menu includes /whoami (sandbox introspection)", () => {
