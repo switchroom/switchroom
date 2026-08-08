@@ -15,6 +15,20 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Hindsight: allow the ONNX embeddings env overrides through `memory.env`
+
+- **`resolveHindsightPerfOverrides()` now forwards the five ONNX-embeddings
+  provider keys** — `HINDSIGHT_API_EMBEDDINGS_PROVIDER` plus the four
+  `..._ONNX_{MODEL_ID,POOLING,QUERY_PREFIX,PASSAGE_PREFIX}` keys — as
+  override-only fields (`HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS`). The two `_PREFIX`
+  keys are also added to a new `HINDSIGHT_PERF_ALLOW_EMPTY_KEYS` allow-list so
+  an empty-string value survives verbatim instead of being dropped as an
+  "accidental empty env var": bge-small-en-v1.5 takes no query/passage affix,
+  and the empty prefix is exactly what reproduces the `local` backend's
+  byte-identical vectors — dropping it would let upstream's `"query: "` /
+  `"passage: "` defaults reappear and silently corrupt recall. Override-only,
+  no shipped default; an operator opts in via `hindsight.env`. (#4523)
+
 ### Hindsight: the pg_search filter-field drift alarm no longer cries wolf
 
 - Fixed `parse_pg_search_index_casts()`, which could not read the
