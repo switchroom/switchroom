@@ -50,7 +50,7 @@
  * without buildx, and it never touches the production `switchroom-hindsight`
  * container.
  *
- * SKIP DISCIPLINE: identical to `hindsight-temporal-language-patch.test.ts`.
+ * SKIP DISCIPLINE: identical to `hindsight-query-analyzer-languages.test.ts`.
  * Locally, with no docker or no cached image, this skips (never pull a 6.4GB
  * third-party image onto a dev box). In CI the `hindsight-probe` job
  * (`.github/workflows/docker-e2e.yml`) pulls the pinned digest and runs this
@@ -98,9 +98,10 @@ function patchBlockNamed(name: string): string {
   return b;
 }
 
-// The offload patch's anchors are the POST-#4313 file state, so #4313 must be
-// applied first — the same order the Dockerfile applies them.
-const LANG_BLOCK = patchBlockNamed("temporal-language patch");
+// At v0.8.6 the offload patch's anchors were the POST-#4313 file state, so the
+// language block had to be applied first. Upstream #3154 (v0.9.0) absorbed
+// #4313, that block was deleted, and the offload patch is now anchored on plain
+// upstream — so this probe applies exactly one block, as the Dockerfile does.
 const OFFLOAD_BLOCK = patchBlockNamed("temporal-offload patch");
 
 /**
@@ -337,16 +338,10 @@ function runProbe(offload: boolean, probe: string): ProbeResult {
       { stdio: ["ignore", "ignore", "pipe"] }
     );
 
-    // #4313 first (its anchors are upstream); it is the baseline both RED and
-    // GREEN share, since it ships independently of this fix.
-    execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
-      input: LANG_BLOCK,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
     if (offload) {
-      // Self-verifying: asserts its post-#4313 anchors exist exactly once, so a
-      // non-zero exit here means upstream (or #4313) drifted and the patch must
-      // be re-authored.
+      // Self-verifying: asserts its upstream anchors exist exactly once, so a
+      // non-zero exit here means upstream drifted and the patch must be
+      // re-authored.
       execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
         input: OFFLOAD_BLOCK,
         stdio: ["pipe", "pipe", "pipe"],

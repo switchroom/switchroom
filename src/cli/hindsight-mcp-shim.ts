@@ -158,11 +158,15 @@ export const TOOLS_CACHE_FILENAME = "hindsight-tools-list.json";
  * both directions AND flows straight into call-time validation — do not
  * hand-write a second accepted-prop list anywhere.
  *
- * This table now describes 0.8.6, which the image pins: 0.8.6 registers the
- * same 32 tools as 0.8.5 plus exactly ONE prop — `reflect.apply_all_directives`
- * (upstream #3013) — derived by dumping `create_mcp_server(...)`'s registration
- * surface inside each pinned digest, a method cross-validated by reproducing
- * the committed 0.8.5 capture byte-for-byte before trusting the 0.8.6 one.
+ * This table now describes 0.9.0, which the image pins. The 0.8.6 → 0.9.0 bump
+ * changed NOTHING here: both digests register the same 32 tools with identical
+ * required/props (upstream's `mcp_tools.py`, `api/mcp.py` and
+ * `extensions/mcp.py` are byte-identical between the two tags). The surface is
+ * derived by dumping `create_mcp_server(...)`'s registration inside each pinned
+ * digest, a method cross-validated at every bump by reproducing the committed
+ * previous capture byte-for-byte before trusting the new one — done again for
+ * 0.9.0. The 0.8.5 → 0.8.6 step before it added exactly one prop,
+ * `reflect.apply_all_directives` (upstream #3013).
  * Advertising it is deliberate: it is a real accepted prop, and because this
  * table is also the tools/CALL allowlist, omitting it would make
  * {@link guardAndClampToolCall} REJECT a legitimate upstream argument. Byte-equality with

@@ -144,7 +144,7 @@ jobs:
               - 'tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts'
               - 'tests/docker/hindsight-reranker-priority-patch.test.ts'
               - 'tests/docker/hindsight-work-conserving-admission-patch.test.ts'
-              - 'tests/docker/hindsight-temporal-language-patch.test.ts'
+              - 'tests/docker/hindsight-query-analyzer-languages.test.ts'
               - 'tests/docker/hindsight-temporal-offload-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
@@ -580,18 +580,19 @@ jobs:
           SWITCHROOM_HINDSIGHT_BUILT_IMAGE: switchroom-hindsight:probe
         run: npx vitest run tests/docker/hindsight-work-conserving-admission-patch.test.ts
 
-      - name: Run the hindsight temporal-language probe (RED/GREEN, must not skip)
-        # Same contract, for the #4313 dateparser language-pin patch. The bakes
-        # test cannot cover the failure that matters here: its assertions are
-        # grep-on-file, so reverting the `languages=` pin on the search_dates
-        # call stays green there while every recall again auto-detects across
-        # 200+ locales inline on the shared asyncio loop. Only capturing the
-        # real search_dates call's kwargs (and confirming English extraction
-        # still parses under the pin) catches it. Runs against the raw pinned
-        # upstream image, applying the patch block by `docker exec`.
+      - name: Run the hindsight query-analyzer-language probe (RED/GREEN, must not skip)
+        # Same contract, for the dateparser language pin. At v0.9.0 upstream
+        # #3154 replaced switchroom's #4313 patch with a native knob whose
+        # DEFAULT is still the 200+-locale auto-detect, so what buys the ~165x
+        # now is switchroom emitting HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES on
+        # every host. No grep-on-file test can see that: the emission lives in
+        # TypeScript and the cost lives in the image. This probe runs the pinned
+        # upstream image with the variable UNSET (RED — no languages= reaches
+        # search_dates) and set to the emitted value (GREEN — pinned, still
+        # parses), so dropping or demoting the emission reds here.
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
-        run: npx vitest run tests/docker/hindsight-temporal-language-patch.test.ts
+        run: npx vitest run tests/docker/hindsight-query-analyzer-languages.test.ts
 
       - name: Run the hindsight temporal-offload probe (RED/GREEN, must not skip)
         # Same contract, for the temporal-offload patch (this PR). The bakes
@@ -627,7 +628,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-temporal-language-patch hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

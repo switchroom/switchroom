@@ -2,10 +2,10 @@
  "_meta": {
   "captured_from": "docker run <pinned digest>: hindsight_api.api.mcp.create_mcp_server(multi_bank=True) registration surface",
   "server": "switchroom-hindsight",
-  "captured_at": "2026-08-01",
-  "hindsight_api_version": "0.8.6",
+  "captured_at": "2026-08-08",
+  "hindsight_api_version": "0.9.0",
   "count": 32,
-  "note": "Captured in-image from the exact digest docker/Dockerfile.hindsight pins, by building the FastMCP server the backend builds (create_mcp_server(memory, multi_bank=True)) and dumping each tool's JSON-schema required/properties. Cross-validated: the identical derivation run against the PREVIOUS pinned digest (0.8.5, sha256:0710076c...) reproduces THIS file's previous 0.8.5 revision byte-for-byte across all 32 tools \u2014 so the method is equivalent to a live capture and the delta below is real, not an artefact of the capture. NOT forward-patched: this file must never describe a newer server than the pinned image. Hindsight drops an unknown argument SILENTLY (isError:false), so a prop advertised here but unknown to the server makes an agent believe a filter was applied when it was not \u2014 a silent wrong answer. The 0.8.5 -> 0.8.6 delta is exactly additive and exactly one prop (reflect.apply_all_directives, from upstream #3013); no tool was added or removed, both wheels register 32."
+  "note": "Captured in-image from the exact digest docker/Dockerfile.hindsight pins, by building the FastMCP server the backend builds (create_mcp_server(memory, multi_bank=True)) and dumping each tool's JSON-schema required/properties. Cross-validated at every bump: the identical derivation run against the PREVIOUS pinned digest reproduces this file's previous revision byte-for-byte across all 32 tools, so the method is equivalent to a live capture and any delta is real rather than an artefact of the capture. Re-verified for the 0.8.6 -> 0.9.0 bump (previous digest sha256:ffa391a7..., current sha256:6364c3c5...). NOT forward-patched: this file must never describe a newer server than the pinned image. Hindsight drops an unknown argument SILENTLY (isError:false), so a prop advertised here but unknown to the server makes an agent believe a filter was applied when it was not \u2014 a silent wrong answer. The 0.8.6 -> 0.9.0 delta is EMPTY: all 32 tools, and every required/prop on each, are byte-identical between the two digests (mcp_tools.py, api/mcp.py and extensions/mcp.py are byte-identical between the v0.8.6 and v0.9.0 tags). Only this _meta block moved."
  },
  "tools": {
   "retain": {

@@ -2995,12 +2995,13 @@ export const HindsightConfigSchema = z.object({
       "means the image's baked 3600, 0 restores upstream's " +
       "refresh-every-round behaviour; explicit and cron-scheduled refreshes " +
       "are never debounced; and " +
-      "HINDSIGHT_API_TEMPORAL_LANGUAGES — the language set dateparser is " +
-      "restricted to during temporal query analysis, made live by switchroom's " +
-      "temporal-language image patch (which ended a 200+-locale auto-detection " +
-      "pass that blocked the shared asyncio loop on every recall); " +
-      "comma-separated, unset means the image's baked `en`, set e.g. `en,es` to " +
-      "restore i18n parsing; and " +
+      "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES — the language set dateparser is " +
+      "restricted to during temporal query analysis (upstream #3154, which " +
+      "superseded switchroom's own temporal-language image patch at v0.9.0); " +
+      "comma-separated; switchroom EMITS `en` on every host because upstream's " +
+      "unset default auto-detects across 200+ locales inline on the shared " +
+      "asyncio loop (~165x slower per call), set e.g. `en,es` for i18n parsing; " +
+      "and " +
       "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS — the max chars of query text " +
       "dateparser.search_dates() is handed during temporal analysis (0 = " +
       "unlimited), made live by switchroom's temporal-offload image patch " +
@@ -3029,7 +3030,19 @@ export const HindsightConfigSchema = z.object({
       "set to the empty string for bge parity (vectors are byte-identical " +
       "between the two backends, so no re-embedding is needed) — unusually " +
       "for this block an EMPTY value here is honoured, not dropped, because an " +
-      "affix-free prefix is the intended value; plus the " +
+      "affix-free prefix is the intended value; and the v0.9.0 knobs " +
+      "switchroom allowlists for reach but emits no value for — " +
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_{LOW,MID,HIGH} (per-recall-budget " +
+      "rerank caps; unset/0 falls back to the global " +
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES switchroom does pin), " +
+      "HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS (embedding-input truncation " +
+      "ceiling; unset means the model's own limit), " +
+      "HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD (entity-resolution fuzzy " +
+      "match floor; unset means upstream's 0.15) and " +
+      "HINDSIGHT_API_ENABLE_{TEMPORAL_RETRIEVAL,GRAPH_RETRIEVAL,RERANKING} " +
+      "(global per-stage kill switches, all default true — the emergency lever " +
+      "if one retrieval stage is implicated in a latency incident, at the cost " +
+      "of recall quality); plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
