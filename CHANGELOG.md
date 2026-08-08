@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Features
+
+- **hindsight: synthesize GET-only knowledge-page read tools in the MCP shim**
+
 ## v0.20.18 — Hindsight's pinned server moves to 0.9.0, plus the env plumbing, alarm and guidance fixes around it
 
 ### Hindsight: allow the ONNX embeddings env overrides through `memory.env`
