@@ -55,6 +55,7 @@ import { execFileSync } from "node:child_process";
 import {
   HINDSIGHT_BROKER_SOCK_VOLUME,
   HINDSIGHT_CRED_DIR,
+  HINDSIGHT_CREDS_MIRROR_VOLUME,
   HINDSIGHT_DEFAULT_API_PORT,
   HINDSIGHT_DEFAULT_SHM_SIZE,
   HINDSIGHT_DEFAULT_UID,
@@ -497,6 +498,14 @@ export function hindsightRecallPoolEnvPairs(opts: {
  * container's pg0), and it ALWAYS runs `--network host` (it must reach pg0 on
  * loopback `127.0.0.1:5432`, independent of whether LiteLLM routing is on).
  *
+ * `mirrorDir` mirrors the authority's creds mode (#2578) and must be threaded
+ * through by every caller: the pool serves REFLECT, which makes LLM calls with
+ * the consumer's OAuth credentials. Left off while the authority has mirror
+ * mode on, the pool silently falls back to pull-only — so after an account
+ * failover the authority gets the broker's pushed creds immediately while the
+ * pool's reflect lane runs on stale credentials for up to the 30-minute pull
+ * interval. Absent (mirror off) ⇒ the private tmpfs, unchanged.
+ *
  * The caller is responsible for ordering: the authority container's pg0 must be
  * healthy before this runs, or the pool crash-loops on connection-refused. See
  * {@link waitForHindsightHealthy} and the launcher in src/cli/memory.ts.
@@ -510,6 +519,8 @@ export function startHindsightRecallPool(opts: {
   gpu?: boolean;
   perf?: HindsightPerfOptions;
   cpAccessKey?: string;
+  /** The hindsight consumer's `mirror_dir`; absent ⇒ tmpfs creds (pull-only). */
+  mirrorDir?: string;
   exec?: (cmd: string, args: string[]) => void;
 }): void {
   const {
@@ -521,6 +532,7 @@ export function startHindsightRecallPool(opts: {
     gpu,
     perf,
     cpAccessKey,
+    mirrorDir,
     exec = (cmd, args) => {
       execFileSync(cmd, args, { stdio: "pipe" });
     },
@@ -564,9 +576,14 @@ export function startHindsightRecallPool(opts: {
     "--health-timeout", "5s",
     "--health-retries", "3",
     "--health-start-period", "60s",
-    // Creds dir: private tmpfs, owned by the image's UID 11000 (same as the
-    // authority container's tmpfs branch). No pg0 / backups volume — stateless.
-    "--tmpfs", `${HINDSIGHT_CRED_DIR}:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`,
+    // Creds dir — the SAME two modes as the authority container, because the
+    // pool serves reflect and needs the same OAuth credentials on the same
+    // failover timeline. Mirror ON: the shared named volume the broker pushes
+    // into. Mirror OFF: a private tmpfs owned by the image's UID 11000.
+    // No pg0 / backups volume either way — the pool is stateless.
+    ...(mirrorDir
+      ? ["-v", `${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`]
+      : ["--tmpfs", `${HINDSIGHT_CRED_DIR}:rw,mode=0700,uid=${HINDSIGHT_DEFAULT_UID},gid=${HINDSIGHT_DEFAULT_UID}`]),
     "-v", `${HINDSIGHT_BROKER_SOCK_VOLUME}:/run/switchroom/auth-broker`,
     ...envArgs,
     hindsightImageRef(imageTag),

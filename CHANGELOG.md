@@ -104,6 +104,13 @@ now an anomaly worth investigating, not the norm.
   the status projection returned the POOL's "Up 2 minutes (healthy)" while the
   authority sat in `Exited (1)`, hiding an outage on the two surfaces an
   operator reaches for during one.
+- **The recall pool now shares the authority's credential mode (#2578).** The
+  pool serves `reflect`, which spends the hindsight consumer's OAuth
+  credentials, but it mounted a private tmpfs unconditionally — so with mirror
+  mode on, a broker account failover pushed fresh credentials to the authority
+  while the pool kept serving reflect on credentials up to a pull interval
+  stale. `mirrorDir` is now threaded to every pool launch: the shared mirror
+  volume when the consumer has one, tmpfs (unchanged) when it does not.
 
 ### Hindsight: an agent can finally read its own knowledge pages
 

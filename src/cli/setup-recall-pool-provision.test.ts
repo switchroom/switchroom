@@ -90,6 +90,30 @@ describe("stepMemoryBackend — recall-pool provisioning wiring", () => {
     expect(waitForHealthy.mock.calls.map((c) => c[0])).toEqual([18889, 18888]);
   });
 
+  it("threads the consumer's mirror_dir into the pool (#2578 creds parity)", async () => {
+    // The pool serves reflect, which spends the consumer's OAuth credentials.
+    // Dropped here, the pool mounts a private tmpfs and keeps serving reflect
+    // on credentials up to a pull-interval stale after a broker failover,
+    // while the authority beside it has the pushed ones.
+    const startRecallPool = vi.fn();
+    const config = {
+      ...SPLIT_ENABLED,
+      auth: { consumers: [{ name: "hindsight", mirror_dir: "/srv/creds/hindsight" }] },
+    } as unknown as SwitchroomConfig;
+
+    await stepMemoryBackend(config, true, tempConfigPath(), {
+      dockerProbe: makeDockerProbe({ authorityUp: true }),
+      recallPoolRunningProbe: () => false,
+      startContainer: vi.fn(),
+      startRecallPool,
+      waitForHealthy: vi.fn(() => Promise.resolve(true)),
+      stopRecallPool: vi.fn(),
+    });
+
+    expect(startRecallPool).toHaveBeenCalledTimes(1);
+    expect(startRecallPool.mock.calls[0][0].mirrorDir).toBe("/srv/creds/hindsight");
+  });
+
   it("builds the full split on a fresh host with the split enabled", async () => {
     const state = { authorityUp: false };
     // startContainer brings the authority "up" for the subsequent ready-check.

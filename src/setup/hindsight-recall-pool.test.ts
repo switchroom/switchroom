@@ -26,6 +26,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { HINDSIGHT_PERF_ENV_KEYS } from "./hindsight-perf-defaults.js";
+import { HINDSIGHT_CRED_DIR, HINDSIGHT_CREDS_MIRROR_VOLUME } from "./hindsight.js";
 import {
   HINDSIGHT_BACKGROUND_CONNECTION_BUDGET,
   HINDSIGHT_BACKGROUND_DB_POOL_MAX_SIZE,
@@ -397,6 +398,29 @@ describe("startHindsightRecallPool — docker argv", () => {
     // The only volume is the auth-broker socket; no host path : /var/lib/... data volume.
     for (const m of mounts) {
       expect(m).not.toMatch(/pg0|pgdata|backups|\/data/i);
+    }
+  });
+
+  it("backs creds with the shared MIRROR volume when the consumer has mirror_dir (#2578)", () => {
+    // The pool serves reflect, which makes OAuth-credentialed LLM calls. If it
+    // does not share the authority's mirror volume it silently falls back to a
+    // private tmpfs and serves reflect on credentials up to a pull-interval
+    // stale after a broker account failover.
+    const args = runArgs({ mirrorDir: "/home/x/.switchroom/creds/hindsight" });
+    expect(valuesForFlag(args, "-v")).toContain(
+      `${HINDSIGHT_CREDS_MIRROR_VOLUME}:${HINDSIGHT_CRED_DIR}`,
+    );
+    // …and no private tmpfs shadowing the mount at the same path.
+    for (const t of valuesForFlag(args, "--tmpfs")) {
+      expect(t).not.toContain(HINDSIGHT_CRED_DIR);
+    }
+  });
+
+  it("falls back to the private tmpfs creds dir when mirror mode is off", () => {
+    const args = runArgs();
+    expect(valuesForFlag(args, "--tmpfs").join(" ")).toContain(`${HINDSIGHT_CRED_DIR}:rw`);
+    for (const m of valuesForFlag(args, "-v")) {
+      expect(m).not.toContain(HINDSIGHT_CREDS_MIRROR_VOLUME);
     }
   });
 

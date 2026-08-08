@@ -414,6 +414,12 @@ export async function stepMemoryBackend(
             memLimit: config.hindsight?.mem_limit,
           },
           cpAccessKey: secrets.cpAccessKey,
+          // The pool serves REFLECT (OAuth-credentialed LLM calls), so it must
+          // share the authority's creds mode (#2578): mirror volume when the
+          // consumer has one, private tmpfs otherwise. Omitted, the pool would
+          // silently run pull-only and serve reflect on credentials up to ~30
+          // minutes stale after a broker account failover.
+          mirrorDir: hindsightConsumerMirrorDir(config),
         }),
       degradeToSingleContainer: () => {
         // Stop the pool + the parked authority and relaunch a SOLE container on

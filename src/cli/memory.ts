@@ -875,6 +875,11 @@ export function registerMemoryCommand(program: Command): void {
                     memLimit: repairConfig.hindsight?.mem_limit,
                   },
                   cpAccessKey: repairCpAccessKey,
+                  // The pool serves REFLECT, which makes LLM calls with the
+                  // consumer's OAuth creds — it must share the authority's
+                  // creds mode (#2578) or it runs on stale creds after a
+                  // broker failover until the next ~30-min pull.
+                  mirrorDir: hindsightConsumerMirrorDir(repairConfig),
                 }),
               degradeToSingleContainer: () => {
                 // Pool restore failed → stop the pool + the parked authority and
@@ -1409,6 +1414,9 @@ export function registerMemoryCommand(program: Command): void {
                   memLimit: hindsightConfig.hindsight?.mem_limit,
                 },
                 cpAccessKey,
+                // Same creds mode as the authority (#2578) — see the repair
+                // path above; the pool's reflect lane needs pushed creds too.
+                mirrorDir: hindsightConsumerMirrorDir(hindsightConfig),
               }),
             degradeToSingleContainer: () => {
               // Stop the pool + the parked authority and relaunch a SOLE
