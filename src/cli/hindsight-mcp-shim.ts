@@ -33,14 +33,20 @@
  *
  * ## The one place the shim is not a pure proxy (#directive-retirement)
  *
- * It also SYNTHESIZES two tools that no backend version registers —
- * `deactivate_directive` and `reactivate_directive` (see
- * {@link SYNTHESIZED_TOOL_TABLE}). Hindsight's MCP surface can create, list
- * and delete a directive but cannot flip `is_active`; only the REST API can,
- * so without this the only retirement path was hand-rolled curl. These two are
- * answered locally by {@link DirectiveAdmin} against the REST base derived
- * from `HINDSIGHT_MCP_URL`, with the bank pinned to `HINDSIGHT_BANK_ID`, and
- * are never forwarded upstream.
+ * It also SYNTHESIZES tools that no backend version registers (see
+ * {@link SYNTHESIZED_TOOL_TABLE}), answered locally over REST against the base
+ * derived from `HINDSIGHT_MCP_URL`, with the bank pinned to
+ * `HINDSIGHT_BANK_ID`, and never forwarded upstream:
+ *
+ *   - `deactivate_directive` / `reactivate_directive` — hindsight's MCP
+ *     surface can create, list and delete a directive but cannot flip
+ *     `is_active`; only the REST API can, so without this the only retirement
+ *     path was hand-rolled curl. Backed by {@link DirectiveAdmin}.
+ *   - `search_knowledge_pages` / `get_knowledge_page` / `get_knowledge_tree` —
+ *     hindsight 0.9.0 serves a full Knowledge Base REST surface and registers
+ *     no knowledge MCP tools at all, so an agent's own curated pages were
+ *     unreachable from a tool call. Backed by {@link KnowledgeAdmin}, which is
+ *     GET-only: page authorship and deletion stay off this surface entirely.
  *
  * That pin is a usability and provenance boundary, NOT a security one — the
  * REST API is unauthenticated and raw curl bypasses the shim entirely. See the
@@ -79,6 +85,13 @@ import {
   DirectiveAdmin,
   DirectivePairInconsistentError,
 } from "../memory/hindsight-directive-admin.js";
+import {
+  KnowledgeAdmin,
+  KNOWLEDGE_SEARCH_LIMIT_DEFAULT,
+  KNOWLEDGE_SEARCH_LIMIT_MAX,
+  KNOWLEDGE_SEARCH_LIMIT_MIN,
+  type KnowledgeNode,
+} from "../memory/hindsight-knowledge-admin.js";
 import { redact } from "../secret-detect/redact.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 
@@ -222,7 +235,7 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
  * filter applied when it did not. The harm is entirely a property of tools
  * whose calls are FORWARDED to the backend.
  *
- * These two are not. `toolsCall()` intercepts them by name before any upstream
+ * These are not. `toolsCall()` intercepts them by name before any upstream
  * request exists and answers them locally over REST, so there is no server to
  * mis-describe and no argument that can be silently dropped: an unknown
  * argument here is rejected loudly by {@link HindsightShim.synthesizedCall}.
@@ -235,8 +248,13 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
  * `tests/memory.hindsight-contract.fixture.test.ts` still asserts
  * `FALLBACK_TOOL_TABLE` ≡ the snapshot, plus a new assertion that these names
  * do NOT appear in the snapshot — so if a future image bump registers real
- * `deactivate_directive` / `reactivate_directive` tools, the test reds and the
- * synthesis gets retired rather than silently shadowing them.
+ * `deactivate_directive` / `search_knowledge_pages` / … tools, the test reds
+ * and the synthesis gets retired rather than silently shadowing them.
+ *
+ * The knowledge tools additionally carry `type: "integer"` props. See
+ * {@link coerceSynthesizedArg}: an integer prop is range-checked against its
+ * own `minimum`/`maximum` here rather than forwarded, because the upstream
+ * endpoint answers a 422 the calling model cannot act on.
  *
  * NOTE the deliberate absence of a `bank_id` property. The bank is pinned from
  * `HINDSIGHT_BANK_ID`; a caller cannot name one. That is a usability and
@@ -283,10 +301,147 @@ export const SYNTHESIZED_TOOL_TABLE: Record<
       },
     },
   },
+  search_knowledge_pages: {
+    description:
+      "Search YOUR OWN knowledge pages — the curated, continuously-refreshed " +
+      "summaries of what this bank knows — with hybrid full-text + semantic " +
+      "search. Reach for this before re-deriving a standing answer from raw " +
+      "recall: a page is already synthesized, where recall returns fragments. " +
+      "Returns ranked hits with a relevance snippet and a page id; read the " +
+      "whole page with get_knowledge_page. Read-only, and only ever your own " +
+      "memory bank. An empty knowledge base returns no results, not an error.",
+    required: ["query"],
+    props: {
+      query: {
+        type: "string",
+        description: "What to look for, in natural language.",
+      },
+      limit: {
+        type: "integer",
+        minimum: KNOWLEDGE_SEARCH_LIMIT_MIN,
+        maximum: KNOWLEDGE_SEARCH_LIMIT_MAX,
+        description:
+          `Maximum hits to return (${KNOWLEDGE_SEARCH_LIMIT_MIN}-` +
+          `${KNOWLEDGE_SEARCH_LIMIT_MAX}, default ${KNOWLEDGE_SEARCH_LIMIT_DEFAULT}).`,
+      },
+    },
+  },
+  get_knowledge_page: {
+    description:
+      "Read one of YOUR OWN knowledge pages in full, by the page id returned " +
+      "by search_knowledge_pages or get_knowledge_tree. Returns the complete " +
+      "markdown document (YAML frontmatter + synthesized body). Prefer this " +
+      "over rebuilding the same understanding from scratch. Read-only: it " +
+      "returns the page as it currently stands and never triggers a refresh.",
+    required: ["page_id"],
+    props: {
+      page_id: {
+        type: "string",
+        description:
+          "Id of the page to read, from search_knowledge_pages or " +
+          "get_knowledge_tree.",
+      },
+    },
+  },
+  get_knowledge_tree: {
+    description:
+      "List YOUR OWN knowledge base as a folder/page tree — every page's id, " +
+      "name, source query, tags and staleness flag. Call this to see what " +
+      "this bank already knows before reading anything else; is_stale=true " +
+      "means the page MAY be behind newer memories, not that it is wrong. " +
+      "Read-only, and only ever your own memory bank.",
+    required: [],
+    props: {},
+  },
 };
 
 /** Names of the shim-synthesized tools (never forwarded upstream). */
 export const SYNTHESIZED_TOOL_NAMES = Object.keys(SYNTHESIZED_TOOL_TABLE);
+
+/**
+ * The ONLY string spelling of an integer `coerceSynthesizedArg` accepts.
+ *
+ * Deliberately narrower than `/^-?\d+$/` over a trimmed value, which took
+ * `"01"`, `" 5 "` and `"50\n"`. Those are not what an MCP client's number
+ * stringification produces; accepting them means accepting a value the caller
+ * did not mean to send in that form, and `"01"` in particular is the shape a
+ * truncated or hand-mangled argument arrives in. No surrounding whitespace, no
+ * leading zeros, `0` itself allowed.
+ */
+const INTEGER_STRING_PATTERN = /^-?(?:0|[1-9]\d*)$/;
+
+/**
+ * Validate + coerce ONE synthesized-tool argument against its declared schema.
+ *
+ * Per-property, deliberately. The original rule was "every argument must be a
+ * non-empty string", which was true while every declared prop was a string and
+ * became a latent bug the moment one was not: a well-formed `limit: 5` would
+ * have been rejected with "'limit' must be a non-empty string", and the model
+ * would have had no way to satisfy the schema it was shown.
+ *
+ * The strictness is preserved, not relaxed:
+ *   • a string prop still rejects a non-string and an empty string — silently
+ *     treating `superseded_by: ""` as "no supersession" would drop provenance
+ *     the caller asked for without saying so;
+ *   • an integer prop rejects anything that is not an integer (or the exact
+ *     decimal string of one — MCP clients routinely stringify numbers) and
+ *     rejects out-of-range rather than clamping, because the bound is in the
+ *     schema the model was shown and a silently-clamped `limit: 500` reads as
+ *     "you got 500 hits" when it got 50.
+ *
+ * Exported for direct test coverage of the table's contract.
+ */
+export function coerceSynthesizedArg(
+  toolName: string,
+  key: string,
+  propSchema: unknown,
+  value: unknown,
+): { ok: true; value: string | number } | { ok: false; text: string } {
+  const schema = (propSchema ?? {}) as {
+    type?: string;
+    minimum?: number;
+    maximum?: number;
+  };
+  if (schema.type !== "integer") {
+    if (typeof value !== "string" || value.length === 0) {
+      return {
+        ok: false,
+        text: `${toolName}: '${key}' must be a non-empty string.`,
+      };
+    }
+    return { ok: true, value };
+  }
+  const min = schema.minimum;
+  const max = schema.maximum;
+  const range =
+    min !== undefined && max !== undefined ? ` between ${min} and ${max}` : "";
+  let n: number;
+  if (typeof value === "number") {
+    n = value;
+  } else if (typeof value === "string" && INTEGER_STRING_PATTERN.test(value)) {
+    n = Number(value);
+  } else {
+    return {
+      ok: false,
+      text: `${toolName}: '${key}' must be an integer${range}.`,
+    };
+  }
+  if (!Number.isSafeInteger(n)) {
+    return {
+      ok: false,
+      text: `${toolName}: '${key}' must be an integer${range}.`,
+    };
+  }
+  if ((min !== undefined && n < min) || (max !== undefined && n > max)) {
+    return {
+      ok: false,
+      text:
+        `${toolName}: '${key}' must be an integer${range} — got ${n}. ` +
+        `Re-issue the call with a value in range.`,
+    };
+  }
+  return { ok: true, value: n };
+}
 
 /** Materialize the synthesized tools in MCP tools/list shape. */
 export function buildSynthesizedToolsList(): ToolDef[] {
@@ -476,6 +631,122 @@ export const DEFAULT_REFLECT_MAX_TOKENS = 1024;
  */
 export const DEFAULT_RECALL_BUDGET = "low";
 export const DEFAULT_REFLECT_BUDGET = "mid";
+
+// ─── Synthesized knowledge-read response caps ─────────────────────────────
+
+/**
+ * Char ceiling on ONE synthesized knowledge response.
+ *
+ * The forwarded reads are token-budgeted ({@link DEFAULT_RECALL_MAX_TOKENS} =
+ * 1024) precisely because an unbounded payload silently overruns the MCP
+ * output cap and never lands in the agent's context. The knowledge reads had
+ * no equivalent ceiling: a big tree or a long page went back verbatim.
+ *
+ * 16384 = 4096 tokens × ~4 chars/token, i.e. exactly the budget upstream
+ * generates a page against (`KNOWLEDGE_PAGE_DEFAULT_MAX_TOKENS = 4096`,
+ * hindsight 0.9.0 `engine/memory_engine.py:13347`), so a normally-sized page
+ * is never touched and only a genuinely oversized payload is cut.
+ */
+export const KNOWLEDGE_RESPONSE_MAX_CHARS = 16_384;
+
+/**
+ * Chars held back from the tree's budget for the omission marker, so the
+ * capped render (JSON + marker) still fits {@link KNOWLEDGE_RESPONSE_MAX_CHARS}
+ * rather than overshooting it by the length of its own footnote.
+ *
+ * Deliberately NOT paired with a node-count constant. A minimal node
+ * serializes to ~35 chars, so any node ceiling low enough to bind before the
+ * char budget would have to be under ~460 — i.e. a second threshold that
+ * either never fires (dead config, which is what a 500-node cap turned out to
+ * be) or silently overrides the one that matters. One budget, in the unit the
+ * MCP output cap is actually denominated in.
+ */
+const KNOWLEDGE_TREE_MARKER_RESERVE = 256;
+
+/**
+ * Cut an oversized synthesized payload, SAYING SO.
+ *
+ * The marker is the whole point: a silently-truncated page reads to the model
+ * as a complete page that simply ends, and it will act on the missing half as
+ * if it did not exist. An explicit tail makes the gap something the model can
+ * see and route around.
+ */
+export function capKnowledgeResponse(text: string): string {
+  if (text.length <= KNOWLEDGE_RESPONSE_MAX_CHARS) return text;
+  const omitted = text.length - KNOWLEDGE_RESPONSE_MAX_CHARS;
+  return (
+    text.slice(0, KNOWLEDGE_RESPONSE_MAX_CHARS) +
+    `\n\n…truncated at ${KNOWLEDGE_RESPONSE_MAX_CHARS} chars — ${omitted} ` +
+    `chars omitted. This is a PARTIAL read; narrow it with ` +
+    `search_knowledge_pages rather than treating the above as the whole.`
+  );
+}
+
+/** Total nodes in a knowledge forest, children included. */
+function countKnowledgeNodes(nodes: KnowledgeNode[]): number {
+  let n = 0;
+  for (const node of nodes) n += 1 + countKnowledgeNodes(node.children ?? []);
+  return n;
+}
+
+/** Depth-first prefix of a forest holding at most `budget` nodes. */
+function takeKnowledgeNodes(
+  nodes: KnowledgeNode[],
+  budget: { left: number },
+): KnowledgeNode[] {
+  const out: KnowledgeNode[] = [];
+  for (const node of nodes) {
+    if (budget.left <= 0) break;
+    budget.left -= 1;
+    out.push(
+      node.children === undefined
+        ? node
+        : { ...node, children: takeKnowledgeNodes(node.children, budget) },
+    );
+  }
+  return out;
+}
+
+/**
+ * Render the tree inside {@link KNOWLEDGE_RESPONSE_MAX_CHARS}.
+ *
+ * `capKnowledgeResponse` is deliberately NOT used here: a char-level cut of
+ * JSON leaves an unparseable document, which is worse than no answer. The
+ * NODE budget is shrunk proportionally until the serialized form fits
+ * instead, so the JSON is well-formed at every size.
+ *
+ * Depth-first prune so the retained part is a valid subtree (a folder is never
+ * emitted without its own record), compact JSON so the budget buys nodes
+ * rather than indentation, and an explicit `N of M nodes omitted` tail
+ * whenever anything was dropped.
+ */
+export function renderKnowledgeTree(roots: KnowledgeNode[]): string {
+  const total = countKnowledgeNodes(roots);
+  const whole = JSON.stringify(roots);
+  if (whole.length <= KNOWLEDGE_RESPONSE_MAX_CHARS) return whole;
+  const charBudget = KNOWLEDGE_RESPONSE_MAX_CHARS - KNOWLEDGE_TREE_MARKER_RESERVE;
+  let allowed = total;
+  let kept = takeKnowledgeNodes(roots, { left: allowed });
+  let json = JSON.stringify(kept);
+  // Proportional shrink, guaranteed to make progress (the -1 floor), so this
+  // terminates even on pathologically large single nodes.
+  while (json.length > charBudget && allowed > 0) {
+    allowed = Math.max(
+      0,
+      Math.min(allowed - 1, Math.floor(allowed * (charBudget / json.length))),
+    );
+    kept = takeKnowledgeNodes(roots, { left: allowed });
+    json = JSON.stringify(kept);
+  }
+  const shown = countKnowledgeNodes(kept);
+  if (shown === total) return json;
+  return (
+    json +
+    `\n…${total - shown} of ${total} nodes omitted — the knowledge tree was ` +
+    `truncated to fit the response budget. This is a PARTIAL listing; use ` +
+    `search_knowledge_pages to find a specific page.`
+  );
+}
 
 const VALID_BUDGETS = new Set(["low", "mid", "high"]);
 
@@ -1058,10 +1329,13 @@ export class HindsightShim {
       );
       this.staleManifestServed = true;
       const cached = this.readCache();
-      // The synthesized directive tools do not depend on the backend at all,
-      // so they are advertised identically on every path — cold boot, cached,
-      // or live. An agent must never lose the retirement path just because
-      // memory is briefly down.
+      // The synthesized tools — the two directive-retirement tools AND the
+      // three knowledge-page reads — do not depend on the backend's MCP
+      // surface at all, so they are advertised identically on every path:
+      // cold boot, cached, or live. An agent must never lose the retirement
+      // path, or sight of its own knowledge pages, just because the MCP
+      // session is briefly down. (Their REST calls can still fail; that
+      // surfaces as an honest isError at call time, not as a missing tool.)
       return cached ? withSynthesizedTools(cached) : buildFallbackToolsList();
     }
   }
@@ -1080,6 +1354,22 @@ export class HindsightShim {
       });
     }
     return this.directiveAdminCache;
+  }
+
+  /** Lazily built REST client for the synthesized knowledge-page reads. */
+  private knowledgeAdminCache: KnowledgeAdmin | null = null;
+
+  private get knowledgeAdmin(): KnowledgeAdmin {
+    if (!this.knowledgeAdminCache) {
+      this.knowledgeAdminCache = new KnowledgeAdmin({
+        apiBaseUrl:
+          this.opts.apiBaseUrl ?? this.opts.url.replace(/\/mcp\/?$/, ""),
+        // PINNED. There is no parameter path from a tool call to this value.
+        bankId: this.opts.bankId,
+        ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
+      });
+    }
+    return this.knowledgeAdminCache;
   }
 
   /**
@@ -1114,38 +1404,28 @@ export class HindsightShim {
             : ""),
       );
     }
-    // Every declared arg is a string; an empty one is rejected rather than
-    // coerced away — silently treating `superseded_by: ""` as "no
-    // supersession" would drop the provenance the caller asked for without
-    // saying so.
+    // Each declared arg is validated against ITS OWN schema entry — see
+    // coerceSynthesizedArg for why this is per-property rather than the flat
+    // "must be a non-empty string" rule it replaced.
+    const clean: Record<string, string | number> = {};
     for (const key of Object.keys(args)) {
-      if (typeof args[key] !== "string" || (args[key] as string).length === 0) {
-        return fail(`${name}: '${key}' must be a non-empty string.`);
-      }
+      const coerced = coerceSynthesizedArg(name, key, spec.props[key], args[key]);
+      if (!coerced.ok) return fail(coerced.text);
+      clean[key] = coerced.value;
     }
     for (const req of spec.required) {
-      if (args[req] === undefined) {
+      if (clean[req] === undefined) {
         return fail(`${name} requires '${req}'.`);
       }
     }
     if (!this.opts.bankId) {
       return fail(
         `${name} is unavailable: this agent has no HINDSIGHT_BANK_ID, so ` +
-          "there is no bank to pin the change to.",
+          "there is no bank to pin it to.",
       );
     }
     try {
-      const text =
-        name === "deactivate_directive"
-          ? await this.directiveAdmin.deactivate({
-              name: args.name as string,
-              ...(typeof args.superseded_by === "string"
-                ? { supersededBy: args.superseded_by }
-                : {}),
-            })
-          : await this.directiveAdmin.reactivate({
-              name: args.name as string,
-            });
+      const text = await this.runSynthesized(name, clean);
       return { content: [{ type: "text", text }], isError: false };
     } catch (err) {
       if (err instanceof DirectivePairInconsistentError) {
@@ -1155,11 +1435,83 @@ export class HindsightShim {
     }
   }
 
+  /**
+   * Dispatch one validated synthesized call to its REST backing and render
+   * the agent-facing text.
+   *
+   * A name switch rather than a ternary chain: the directive pair was
+   * expressible as `name === "deactivate_directive" ? … : …` only while there
+   * were exactly two, and that shape silently routes any unrecognised name to
+   * the else branch. The `default` throw makes a table entry added without a
+   * dispatch arm a loud failure instead of a wrong tool running.
+   *
+   * Rendering differs by tool on purpose: a page IS a markdown document, so it
+   * is returned verbatim; search hits and the tree are structured data with no
+   * canonical prose form, so they are JSON.
+   */
+  private async runSynthesized(
+    name: string,
+    args: Record<string, string | number>,
+  ): Promise<string> {
+    switch (name) {
+      case "deactivate_directive":
+        return this.directiveAdmin.deactivate({
+          name: args.name as string,
+          ...(typeof args.superseded_by === "string"
+            ? { supersededBy: args.superseded_by }
+            : {}),
+        });
+      case "reactivate_directive":
+        return this.directiveAdmin.reactivate({ name: args.name as string });
+      case "search_knowledge_pages": {
+        const res = await this.knowledgeAdmin.search({
+          query: args.query as string,
+          ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+        });
+        if (res.results.length === 0) {
+          // An empty bank is a normal answer, not a failure — say so in words
+          // so the model does not read `[]` as a broken tool and retry.
+          return (
+            "No knowledge pages matched that query in your memory bank. " +
+            "The bank may have no pages yet — get_knowledge_tree lists what " +
+            "exists."
+          );
+        }
+        // `total` rides along deliberately: with `results` alone the model
+        // cannot tell a complete set from one the `limit` cut short, and would
+        // read 10 of 200 hits as "there are 10".
+        return capKnowledgeResponse(
+          JSON.stringify({ total: res.total, results: res.results }, null, 2),
+        );
+      }
+      case "get_knowledge_page": {
+        const page = await this.knowledgeAdmin.getPage({
+          page_id: args.page_id as string,
+        });
+        return capKnowledgeResponse(page.markdown);
+      }
+      case "get_knowledge_tree": {
+        const tree = await this.knowledgeAdmin.tree();
+        if (tree.roots.length === 0) {
+          return (
+            "Your knowledge base has no pages yet. Pages are synthesized from " +
+            "mental models — propose one to start it."
+          );
+        }
+        return renderKnowledgeTree(tree.roots);
+      }
+      default:
+        throw new Error(
+          `${name} is advertised as a synthesized tool but has no dispatch arm`,
+        );
+    }
+  }
+
   /** tools/call: lazy connect + bounded timeout + one retry; isError on down. */
   private async toolsCall(params: unknown): Promise<unknown> {
     const called = (params as { name?: string; arguments?: unknown } | undefined);
     // Synthesized tools are answered here and NEVER forwarded — the upstream
-    // MCP surface has no directive-update tool to forward them to.
+    // MCP surface has no directive-update or knowledge tool to forward them to.
     if (called?.name && SYNTHESIZED_TOOL_NAMES.includes(called.name)) {
       return this.synthesizedCall(called.name, called.arguments);
     }

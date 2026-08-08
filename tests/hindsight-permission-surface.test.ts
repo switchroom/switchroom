@@ -44,6 +44,8 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__get_bank",
       "mcp__hindsight__get_bank_stats",
       "mcp__hindsight__get_document",
+      "mcp__hindsight__get_knowledge_page",
+      "mcp__hindsight__get_knowledge_tree",
       "mcp__hindsight__get_memory",
       "mcp__hindsight__get_mental_model",
       "mcp__hindsight__get_operation",
@@ -59,6 +61,7 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
       "mcp__hindsight__recall",
       "mcp__hindsight__reflect",
       "mcp__hindsight__retain",
+      "mcp__hindsight__search_knowledge_pages",
       "mcp__hindsight__sync_retain",
       "mcp__hindsight__update_bank",
       "mcp__hindsight__update_memory",
@@ -156,6 +159,40 @@ describe("Hindsight pre-approved permission surface (Fix 1.2, #2903)", () => {
         "history table upstream) — it must keep its per-call approval card. " +
         "Deactivation being pre-approved is not a precedent for deletion.",
     ).not.toContain("mcp__hindsight__delete_directive");
+  });
+
+  /**
+   * The knowledge-page surface is READS ONLY, asserted in both directions.
+   *
+   * The three reads are pre-approved; no page-authoring name may appear here,
+   * and none is synthesized at all (KnowledgeAdmin has no write method). Page
+   * DELETE upstream removes the page and its backing mental model with no
+   * undo, so a "while we're here" write addition must fail loudly rather than
+   * inherit the reads' pre-approval.
+   */
+  it("knowledge-page READS are pre-approved and no page WRITE is", () => {
+    for (const read of [
+      "mcp__hindsight__search_knowledge_pages",
+      "mcp__hindsight__get_knowledge_page",
+      "mcp__hindsight__get_knowledge_tree",
+    ]) {
+      expect(HINDSIGHT_MCP_TOOLS).toContain(read);
+    }
+    for (const write of [
+      "mcp__hindsight__create_knowledge_page",
+      "mcp__hindsight__create_knowledge_folder",
+      "mcp__hindsight__update_knowledge_node",
+      "mcp__hindsight__delete_knowledge_node",
+    ]) {
+      expect(
+        HINDSIGHT_MCP_TOOLS,
+        `${write} would pre-approve knowledge-page authorship/deletion — the ` +
+          `shim deliberately synthesizes reads only (KnowledgeAdmin is GET-only)`,
+      ).not.toContain(write);
+      expect(SYNTHESIZED_TOOL_NAMES).not.toContain(
+        write.replace("mcp__hindsight__", ""),
+      );
+    }
   });
 
   it("read-only mental-model tools ARE pre-approved (get/list), writes are not", () => {

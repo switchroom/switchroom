@@ -1287,6 +1287,17 @@ export const HINDSIGHT_MCP_TOOLS = [
   // Mental models — READ ONLY (writes go through the propose card).
   "mcp__hindsight__get_mental_model",
   "mcp__hindsight__list_mental_models",
+  // Knowledge pages — READ ONLY, and SHIM-SYNTHESIZED
+  // (src/cli/hindsight-mcp-shim.ts, backed by KnowledgeAdmin). Hindsight
+  // serves a full Knowledge Base REST surface but registers no knowledge MCP
+  // tools, so these three are answered locally as plain GETs with the bank
+  // pinned to HINDSIGHT_BANK_ID. They are pre-approved for the same reason the
+  // read/list surface above is: they read the agent's own bank and change
+  // nothing. Page authorship and deletion are deliberately NOT synthesized, so
+  // there is no write counterpart to gate.
+  "mcp__hindsight__search_knowledge_pages",
+  "mcp__hindsight__get_knowledge_page",
+  "mcp__hindsight__get_knowledge_tree",
   // Tags.
   "mcp__hindsight__list_tags",
   // Operations.

@@ -25,6 +25,8 @@ import {
   TOOLS_CACHE_FILENAME,
   SHIM_SUPPORTED_PROTOCOL_VERSIONS,
   SYNTHESIZED_TOOL_NAMES,
+  SYNTHESIZED_TOOL_TABLE,
+  coerceSynthesizedArg,
   guardAndClampToolCall,
   DEFAULT_RECALL_MAX_TOKENS,
   DEFAULT_RECALL_BUDGET,
@@ -989,5 +991,187 @@ describe("reflect re-roll through the live shim", () => {
     );
     expect(n).toBe(1);
     await backend.close();
+  });
+});
+
+// ─── 8. the synthesized knowledge-page reads ──────────────────────────────
+
+/**
+ * The knowledge tools are shim-local, so their contract must hold with the
+ * backend DOWN — that is the whole reason they are synthesized rather than
+ * forwarded. The REST-backed behaviour lives in
+ * tests/hindsight-knowledge-admin.test.ts; what is pinned here is the shim
+ * half: advertisement, argument validation, and that validation happens
+ * before any network I/O.
+ */
+describe("synthesized knowledge-page tools", () => {
+  it("are advertised with the backend dead, schemas intact", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(rpc(1, "tools/list") as never);
+    const { tools } = res?.result as {
+      tools: { name: string; inputSchema: { properties: Record<string, unknown>; required: string[] } }[];
+    };
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    for (const n of [
+      "search_knowledge_pages",
+      "get_knowledge_page",
+      "get_knowledge_tree",
+    ]) {
+      expect(SYNTHESIZED_TOOL_NAMES).toContain(n);
+      expect(byName.has(n), `${n} missing from the served manifest`).toBe(true);
+    }
+    expect(byName.get("search_knowledge_pages")!.inputSchema.required).toEqual([
+      "query",
+    ]);
+    expect(
+      byName.get("search_knowledge_pages")!.inputSchema.properties.limit,
+    ).toMatchObject({ type: "integer", minimum: 1, maximum: 50 });
+    expect(byName.get("get_knowledge_page")!.inputSchema.required).toEqual([
+      "page_id",
+    ]);
+    expect(byName.get("get_knowledge_tree")!.inputSchema.required).toEqual([]);
+  });
+
+  it("rejects an unknown argument locally, naming bank_id explicitly", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(2, "tools/call", {
+        name: "get_knowledge_tree",
+        arguments: { bank_id: "someone-elses-bank" },
+      }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("bank_id");
+    expect(result.content[0].text).toContain("your own memory bank");
+    // NOT the forwarded "memory is temporarily unavailable" path: the backend
+    // is dead and the answer still came from the shim.
+    expect(result.content[0].text).not.toMatch(/temporarily unavailable/i);
+  });
+
+  it("requires the declared required argument", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(3, "tools/call", {
+        name: "search_knowledge_pages",
+        arguments: {},
+      }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("search_knowledge_pages requires 'query'.");
+  });
+
+  /**
+   * The regression this exists for: the validator used to require EVERY
+   * argument to be a non-empty string, so a schema-legal `limit: 5` was
+   * rejected with an error the model could not act on.
+   */
+  it("accepts an integer limit and a numeric string, rejects the rest", () => {
+    const spec = SYNTHESIZED_TOOL_TABLE.search_knowledge_pages;
+    const arg = (v: unknown) =>
+      coerceSynthesizedArg("search_knowledge_pages", "limit", spec.props.limit, v);
+    expect(arg(5)).toEqual({ ok: true, value: 5 });
+    expect(arg("5")).toEqual({ ok: true, value: 5 });
+    expect(arg(1)).toEqual({ ok: true, value: 1 });
+    expect(arg(50)).toEqual({ ok: true, value: 50 });
+    // The accepted STRING spelling is exact: no surrounding whitespace, no
+    // leading zeros. `" 5 "`, `"01"` and `"50\n"` are not what an MCP client's
+    // number stringification emits, so taking them means silently accepting a
+    // mangled argument as though the caller had meant it that way.
+    for (const bad of [
+      0,
+      51,
+      -1,
+      2.5,
+      "abc",
+      "",
+      " 5 ",
+      "01",
+      "50\n",
+      Number.MAX_SAFE_INTEGER + 2,
+      true,
+      null,
+      {},
+    ]) {
+      const r = arg(bad);
+      expect(r.ok, `${JSON.stringify(bad)} must not be an accepted limit`).toBe(
+        false,
+      );
+      if (!r.ok) expect(r.text).toContain("integer");
+    }
+    // Out-of-range says the range rather than silently clamping — a clamped
+    // 500 reads to the model as "you got 500 hits".
+    const over = arg(500);
+    expect(over.ok).toBe(false);
+    if (!over.ok) {
+      expect(over.text).toContain("between 1 and 50");
+      expect(over.text).toContain("500");
+    }
+  });
+
+  it("still rejects an empty STRING argument (the old rule is intact)", () => {
+    const spec = SYNTHESIZED_TOOL_TABLE.search_knowledge_pages;
+    const r = coerceSynthesizedArg(
+      "search_knowledge_pages",
+      "query",
+      spec.props.query,
+      "",
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.text).toContain("non-empty string");
+    expect(
+      coerceSynthesizedArg(
+        "deactivate_directive",
+        "superseded_by",
+        SYNTHESIZED_TOOL_TABLE.deactivate_directive.props.superseded_by,
+        "",
+      ).ok,
+    ).toBe(false);
+  });
+
+  it("an out-of-range limit is refused before any network I/O", async () => {
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(4, "tools/call", {
+        name: "search_knowledge_pages",
+        arguments: { query: "x", limit: 500 },
+      }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("between 1 and 50");
+  });
+
+  it("every advertised synthesized tool has a dispatch arm", async () => {
+    // The name switch throws on an unmatched name, so a table entry added
+    // without an arm surfaces here as "no dispatch arm" instead of silently
+    // running whichever tool the old ternary's else branch happened to be.
+    // Each call gets SCHEMA-VALID required args so it clears validation and
+    // actually reaches the switch; the backend is dead, so a wired arm fails
+    // at the network with "<name> failed:".
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    for (const name of SYNTHESIZED_TOOL_NAMES) {
+      const spec = SYNTHESIZED_TOOL_TABLE[name];
+      const args = Object.fromEntries(
+        spec.required.map((k) => [
+          k,
+          (spec.props[k] as { type?: string })?.type === "integer" ? 1 : "x",
+        ]),
+      );
+      const res = await shim.handle(
+        rpc(5, "tools/call", { name, arguments: args }) as never,
+      );
+      const result = res?.result as {
+        isError: boolean;
+        content: { text: string }[];
+      };
+      expect(result.isError, `${name} unexpectedly succeeded`).toBe(true);
+      expect(
+        result.content[0].text,
+        `${name} is advertised but the dispatch switch has no arm for it`,
+      ).not.toContain("no dispatch arm");
+      expect(result.content[0].text).toContain(`${name} failed:`);
+    }
   });
 });
