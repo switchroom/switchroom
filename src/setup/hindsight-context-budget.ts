@@ -104,21 +104,76 @@ export const HINDSIGHT_CONTEXT_SAFETY_FRACTION = 0.2;
 
 /**
  * Fixed prompt cost of ONE consolidation call, independent of batch size:
- * system prompt + JSON schema + recall context. Back-derived from the
- * measured p90 (32,270 prompt tokens at batch size 12) split as
- * `overhead + batch × per-fact` — see {@link HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT}.
+ * system prompt + JSON schema + recall context. Held at its original value and
+ * treated as the KNOWN term when the marginal per-fact cost was re-measured
+ * against production in 2026-08 — the measurement solves
+ * `input = overhead + batch × per-fact` for the per-fact term with this
+ * overhead fixed, so an error here lands entirely in
+ * {@link HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT}, which is the conservative
+ * place for it (the per-fact term is what shrinks the batch). Re-measuring the
+ * intercept needs a spread of batch sizes the production log does not supply:
+ * outside batch 6, every sample is a post-split remainder.
  */
 export const HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS = 2_270;
 
 /**
  * Marginal prompt cost of each additional fact in a consolidation batch.
- * 30,000 / 12 from the same measured p90 decomposition. This is the number
- * that makes batch size a TOKEN decision rather than a throughput one — the
- * comment this fix replaced claimed batch size was "tokens-per-call, not
- * concurrency, so it doesn't affect the ceiling", which was true of the
- * *quota* ceiling and dead wrong about the *context* ceiling.
+ *
+ * This is the number that makes batch size a TOKEN decision rather than a
+ * throughput one — the comment the original fix replaced claimed batch size
+ * was "tokens-per-call, not concurrency, so it doesn't affect the ceiling",
+ * which was true of the *quota* ceiling and dead wrong about the *context*
+ * ceiling.
+ *
+ * **Measured, not back-derived (2026-08-09).** This constant was 2,500,
+ * justified as `30,000 / 12`: the whole of a measured p90 prompt at batch 12
+ * divided by the batch. That derivation is unsound twice over — it attributes
+ * the ENTIRE prompt (fixed overhead included) to the marginal per-fact cost,
+ * and it reads one p90 sample at one batch size as the marginal cost at
+ * another. The old docstring's own record of a batch-8 experiment on
+ * 2026-07-28 hitting 15.5% `OutputTooLongError` against a 32,768-token window
+ * was the first symptom of the constant being too small.
+ *
+ * The replacement is measured directly off production. 24h of
+ * `switchroom-hindsight` logs were joined per batch: each
+ * `[CONSOLIDATION] … llm_batch #N (K memories, 1 llm calls)` summary line
+ * gives the batch size, and the `slow llm call: scope=consolidation …
+ * input_tokens=` line for that same call gives the backend's OWN tokenizer
+ * count of the prompt. (The summary line's `input_tokens=~` field is only an
+ * internal estimate and under-reports the real count by ~20%, which is part of
+ * why this went unnoticed.) Restricted to unsplit, single-call batches of 6 —
+ * n = 450, banks `overlord` and `klanker`:
+ *
+ * ```
+ *   p50 25,585   p90 28,882   p95 29,738   p99 31,391   max 31,903
+ * ```
+ *
+ * Solving `input = OVERHEAD + 6 × PER_FACT` across that tail gives 4,435 (p90)
+ * / 4,578 (p95) / 4,854 (p99) / 4,939 (max) tokens per fact: the old 2,500 was
+ * low by ~1.8×. This constant feeds a safety preflight, so it must bound the
+ * tail rather than the average — it takes the observed **maximum**, rounded up
+ * to 5,000. (Batch 3 holds for any value in 3,939…5,251, so the rounding is
+ * slack, not a cliff.)
+ *
+ * Production evidence that the resulting batch size of 3 is the right answer,
+ * from the same 24h window: **9 `LLM failed for sub-batch of 6, splitting into
+ * 3/3` events, and zero failures at any smaller sub-batch size.** Every 6 → 3/3
+ * split then succeeded. Under the old constant a 32,768-token window derived
+ * batch 6 with an estimated worst case of 25,462 tokens, which "fit" the 26,215
+ * usable band and passed preflight — while real prompts reached 31,707, so
+ * `prompt + 8,192 requested completion` blew straight through the window, the
+ * backend truncated, and hindsight logged `LiteLLM response was truncated due
+ * to token limit`, retried three times uselessly (LiteLLM's redis cache returns
+ * the identical truncated response), then split the batch.
+ *
+ * The trade is throughput for correctness: on a 32k backend batch 6 → 3 roughly
+ * doubles the consolidation LLM call count, and the LLM is already the
+ * bottleneck. That is the intended direction — under-declaring costs
+ * throughput, over-declaring corrupts memory. A 131k or 200k window still
+ * derives the historical batch 12 under this constant, so a big-window operator
+ * is unaffected.
  */
-export const HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT = 2_500;
+export const HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT = 5_000;
 
 /**
  * Worst-case prompt size of one retain (fact-extraction) call: the chunk
@@ -366,10 +421,13 @@ export function resolveLaneContextWindow(
  *   promptBudget    = usable − maxCompletion
  *   batchSize       = clamp(⌊(promptBudget − OVERHEAD) / PER_FACT⌋, 1, 12)
  *
- * For a 32,768-token window that lands on batch 6 / consolidation completion
- * 8,192 / retain completion 6,144 — the values applied by hand to the live
- * container when the incident was diagnosed. For 131k or 200k it lands on
- * the historical batch 12, so a big-window operator loses nothing.
+ * For a 32,768-token window that lands on batch 3 / consolidation completion
+ * 8,192 / retain completion 6,144. Batch 3, not the 6 this originally derived:
+ * the per-fact constant was re-measured against production in 2026-08 and the
+ * old value was low by ~1.8×, so 32k backends were passing preflight at a
+ * batch whose real prompts overflowed the window (see
+ * {@link HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT}). For 131k or 200k it still
+ * lands on the historical batch 12, so a big-window operator loses nothing.
  *
  * The retain lane has no batch knob and a FIXED prompt estimate, so nothing in
  * its derivation shrinks with the window — `usable` binds it only through the

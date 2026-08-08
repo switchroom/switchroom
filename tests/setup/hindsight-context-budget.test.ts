@@ -15,6 +15,7 @@ import {
   HINDSIGHT_CLAUDE_CONTEXT_WINDOW,
   HINDSIGHT_CONSERVATIVE_CONTEXT_WINDOW,
   HINDSIGHT_CONSOLIDATION_BATCH_SIZE_CEILING,
+  HINDSIGHT_CONSOLIDATION_BATCH_SIZE_FLOOR,
   HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS,
   HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT,
   HINDSIGHT_RETAIN_MAX_COMPLETION_CEILING,
@@ -57,18 +58,51 @@ const LOCAL_SLOT_WINDOW = 32_768;
 const localLlm = { provider: "litellm", context_window: LOCAL_SLOT_WINDOW };
 
 describe("hindsight context budget — derivation (#3716)", () => {
-  it("lands on the hand-applied 32k values: batch 6 / consolidation 8192 / retain 6144", () => {
+  it("lands on the 32k values: batch 3 / consolidation 8192 / retain 6144", () => {
     const b = resolveHindsightContextBudget(localLlm);
-    expect(b.consolidation.batchSize).toBe(6);
+    expect(b.consolidation.batchSize).toBe(3);
     expect(b.consolidation.maxCompletionTokens).toBe(8192);
     expect(b.retain.maxCompletionTokens).toBe(6144);
   });
 
+  it("holds the 32k batch at 3 — the size production never fails at", () => {
+    // Outcome pin for the 2026-08-09 per-fact re-measurement. This test FAILS
+    // on the pre-fix constant: 2,500 tokens/fact derives batch 6, which in 24h
+    // of live logs produced 9 `LLM failed for sub-batch of 6, splitting into
+    // 3/3` truncation events and zero failures at any smaller sub-batch — the
+    // measured batch-6 prompt tail reached 31,903 tokens against a 32,768
+    // window with 8,192 completion requested on top.
+    //
+    // Asserted through the real measurement rather than only through the
+    // derived number, so a future edit to the constant that silently moves the
+    // batch has to confront the production evidence, not just retune a literal.
+    const MEASURED_BATCH6_PROMPT_TOKENS_MAX = 31_903; // n=450, banks overlord+klanker
+    const impliedPerFact =
+      (MEASURED_BATCH6_PROMPT_TOKENS_MAX - HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS) / 6;
+    expect(HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT).toBeGreaterThanOrEqual(impliedPerFact);
+
+    const b = resolveHindsightContextBudget(localLlm);
+    expect(b.consolidation.batchSize).toBe(3);
+
+    // The bug in one line: what the OLD constant claimed a batch of 6 would
+    // cost, versus what a batch of 6 really costs. The estimate has to bound
+    // the measurement, and 2,500/fact did not.
+    const preFixEstimateForSix = HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS + 6 * 2_500;
+    expect(preFixEstimateForSix).toBeLessThan(MEASURED_BATCH6_PROMPT_TOKENS_MAX);
+    expect(
+      HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS +
+        6 * HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT +
+        b.consolidation.maxCompletionTokens,
+    ).toBeGreaterThan(LOCAL_SLOT_WINDOW);
+  });
+
   it("keeps worst-case prompt+completion strictly inside a 32k window", () => {
-    // THE regression assertion. On main the emitted batch size was a hard 12,
-    // whose measured p90 prompt was 32,270 tokens against a 32,768 slot — with
-    // an uncapped completion on top, i.e. guaranteed overflow. Recomputing the
-    // pre-fix worst case here proves this test would have failed on the bug.
+    // THE regression assertion for #3716. Before it, the emitted batch size
+    // was a hard 12 with an uncapped completion on top against a 32,768 slot,
+    // i.e. guaranteed overflow. Recomputing the pre-fix worst case here proves
+    // this test would have failed on the bug — and it holds a fortiori under
+    // the 2026-08 per-fact re-measurement, which only made the estimate for a
+    // batch of 12 larger.
     const preFixPrompt =
       HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS +
       HINDSIGHT_CONSOLIDATION_BATCH_SIZE_CEILING * HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT;
@@ -116,7 +150,7 @@ describe("hindsight context budget — derivation (#3716)", () => {
     });
     // An undeclared litellm backend is assumed local-and-small, so it gets the
     // ratcheted budget rather than the pre-fix one.
-    expect(resolveHindsightContextBudget({ provider: "litellm" }).consolidation.batchSize).toBe(6);
+    expect(resolveHindsightContextBudget({ provider: "litellm" }).consolidation.batchSize).toBe(3);
   });
 
   it("resolves per-op window over global over provider default", () => {
@@ -259,9 +293,38 @@ describe("hindsight context budget — the safety band binds the retain lane too
   it("REJECTS the low edge of the band (11,072 — raw check passes exactly)", () => {
     const at = { provider: "litellm", context_window: 11_072 };
     expect(() => resolveCheckedHindsightContextBudget(at)).toThrow(HindsightContextBudgetError);
-    expect(() => resolveCheckedHindsightContextBudget(at)).toThrow(/hindsight retain/);
     // usable = 11072 − ⌊11072 × 0.2⌋ = 8858.
     expect(usableContextTokens(11_072)).toBe(8_858);
+    // Retain trips the band on its own — that is #3721's point, and the `pins
+    // the arithmetic` case above asserts it directly. It is no longer the lane
+    // NAMED in the message: since the 2026-08 per-fact re-measurement,
+    // consolidation at its batch floor of 1 costs 2,270 + 5,000 prompt and is
+    // checked first, so it reports at this window too. Both lanes overflowing
+    // is a stronger rejection, not a weaker one.
+    const b = resolveHindsightContextBudget(at);
+    expect(b.consolidation.batchSize).toBe(HINDSIGHT_CONSOLIDATION_BATCH_SIZE_FLOOR);
+    expect(b.consolidation.worstCaseTotalTokens).toBeGreaterThan(b.consolidation.usableTokens);
+    expect(() => resolveCheckedHindsightContextBudget(at)).toThrow(/hindsight consolidation/);
+  });
+
+  it("leaves the smallest admissible window at 13,839 — retain is still the binding lane", () => {
+    // The corrected per-fact constant raises consolidation's floor-batch cost,
+    // so it is worth pinning that it did NOT move the documented minimum.
+    // Consolidation stops fitting below 13,217, which is under retain's 13,839,
+    // so retain remains what decides the floor and the module docstring's
+    // "smallest declared window switchroom will accept is 13,839" still holds.
+    for (const window of [13_217, 13_838]) {
+      const b = resolveHindsightContextBudget({ provider: "litellm", context_window: window });
+      expect(b.consolidation.worstCaseTotalTokens, `cons@${window}`).toBeLessThanOrEqual(
+        b.consolidation.usableTokens,
+      );
+      expect(b.retain.worstCaseTotalTokens, `retain@${window}`).toBeGreaterThan(
+        b.retain.usableTokens,
+      );
+    }
+    expect(() =>
+      resolveCheckedHindsightContextBudget({ provider: "litellm", context_window: 13_839 }),
+    ).not.toThrow();
   });
 
   it("REJECTS the high edge of the band (13,838 — usable 11,071, one short)", () => {
@@ -418,7 +481,7 @@ describe("hindsight context budget — emit paths stay in sync (#3716)", () => {
     const snippet = generateHindsightComposeSnippet(localLlm);
 
     for (const pair of [
-      "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=6",
+      "HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE=3",
       "HINDSIGHT_API_CONSOLIDATION_MAX_COMPLETION_TOKENS=8192",
       "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS=6144",
       "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=20000",
