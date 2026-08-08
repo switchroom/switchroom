@@ -929,6 +929,51 @@ export const HINDSIGHT_DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 30;
  */
 export const HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION = "pg_search";
 
+/**
+ * The language set `dateparser.search_dates()` is restricted to during temporal
+ * query analysis, comma-separated. `"en"` — the fleet is English.
+ *
+ * ## Why this is an EMITTED default and not override-only
+ *
+ * Upstream calls `search_dates()` with no `languages=` unless this is set, and
+ * an unlanguaged call auto-detects across 200+ locales INLINE on the shared
+ * asyncio loop on every recall that reaches temporal analysis. Measured in this
+ * image's venv: 99.8 ms/call auto-detect vs 0.6 ms/call with `languages=["en"]`
+ * — ~165x — and the loop watchdog logged 128 `EVENT LOOP BLOCKED >=1s` events
+ * in 20 minutes, with dateparser's per-locale language-split frames appearing
+ * 1383x in the blocked stacks (switchroom #4313).
+ *
+ * Through v0.8.6 switchroom bought that speedup with an image patch that pinned
+ * `languages=` at both `search_dates` call sites and defaulted it in-image, so
+ * the TS layer only needed an override-only escape hatch
+ * (`HINDSIGHT_API_TEMPORAL_LANGUAGES`, retired at v0.9.0). Upstream #3154
+ * (merged 2026-08-05, in v0.9.0) implements the same idea natively and the
+ * patch was deleted — but upstream's default is `None`, i.e. the SLOW
+ * auto-detecting behaviour. Nothing in the image pins it any more.
+ *
+ * So this key must be a member of {@link HINDSIGHT_PERF_DEFAULTS_UNGATED},
+ * emitted on every host. An override-only entry is emitted ONLY when the
+ * operator writes it into `hindsight.env` (see `resolveHindsightPerfOverrides`),
+ * which for a stock fleet means never — and "never" here is not a missing
+ * nicety, it is a silent 165x regression on the recall path. An operator who
+ * genuinely wants other locales overrides this key; an operator who wants
+ * upstream's auto-detect sets it to the empty string.
+ *
+ * Upstream plumbing, confirmed against the pinned 0.9.0 digest:
+ * `config.py` `ENV_QUERY_ANALYZER_LANGUAGES` → `query_analyzer_languages:
+ * list[str] | None` (CSV parsed in `from_env()`, all-empty ⇒ `None`), consumed
+ * at `memory_engine.py` as `DateparserQueryAnalyzer(languages=config.
+ * query_analyzer_languages)` and forwarded through
+ * `DateparserQueryAnalyzer._search_kwargs()` into both `load()` and `analyze()`.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES: "en,es"   # also parse Spanish dates
+ * ```
+ */
+export const HINDSIGHT_DEFAULT_QUERY_ANALYZER_LANGUAGES = "en";
+
 /** Emitted on every host — bounded work, no hardware assumption. */
 export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, string]> = [
   [
@@ -1000,6 +1045,14 @@ export const HINDSIGHT_PERF_DEFAULTS_UNGATED: ReadonlyArray<readonly [string, st
   // `native`. See HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION's migration-boundary
   // note above for why this pairing (default + allowlist membership) is load-bearing.
   ["HINDSIGHT_API_TEXT_SEARCH_EXTENSION", HINDSIGHT_DEFAULT_TEXT_SEARCH_EXTENSION],
+  // ALWAYS-ON, not override-only. Upstream's default is None = 200+-locale
+  // auto-detect inline on the shared loop (~165x slower per call). See
+  // HINDSIGHT_DEFAULT_QUERY_ANALYZER_LANGUAGES above: this emission is what
+  // replaced switchroom's retired in-image language pin at the v0.9.0 bump.
+  [
+    "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES",
+    HINDSIGHT_DEFAULT_QUERY_ANALYZER_LANGUAGES,
+  ],
 ];
 
 /** Emitted only when the container can reach a GPU. */
@@ -1393,31 +1446,18 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S: "0"   # upstream behaviour, patch inert
  * ```
  *
- * ### `HINDSIGHT_API_TEMPORAL_LANGUAGES`
+ * ### RETIRED at v0.9.0: `HINDSIGHT_API_TEMPORAL_LANGUAGES`
  *
- * The language set `dateparser.search_dates()` is restricted to during temporal
- * query analysis, comma-separated. Unpatched, `search_dates()` was called with
- * NO `languages=`, so it auto-detected across 200+ locales INLINE on the shared
- * asyncio loop on every recall that reached it — the loop watchdog logged 128
- * `EVENT LOOP BLOCKED >=1s` events in 20 minutes with dateparser's per-locale
- * language-split frames appearing 1383× in the blocked stacks (99.8 ms/call vs
- * 0.6 ms/call once pinned, ~165×). switchroom's temporal-language image patch
- * (`docker/Dockerfile.hindsight`, the `config.py` + `engine/query_analyzer.py`
- * block) pins it, defaulting to `"en"` — the fleet is English.
- *
- * Unlike the CE-gap / MM-refresh knobs above, this IS a real `HINDSIGHT_API_`
- * config.py field: the patch adds `ENV_TEMPORAL_LANGUAGES` and a
- * `temporal_languages: list[str]` field that `from_env()` parses (CSV → stripped
- * non-empty list, `["en"]` floor). Override-only here because that default lives
- * in the image, not in switchroom's TS layer — emitting a second copy would only
- * create drift. Restore i18n with e.g. `"en,es"`; an all-empty value floors back
- * to English, so the loop-starving no-languages call is unreachable.
- *
- * ```yaml
- * hindsight:
- *   env:
- *     HINDSIGHT_API_TEMPORAL_LANGUAGES: "en,es"   # re-enable Spanish parsing
- * ```
+ * switchroom's own locale knob, added by the #4313 image patch. Upstream #3154
+ * (v0.9.0) implements the same pin natively as
+ * `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES`, the patch was deleted, and this key
+ * became a name nothing in the image reads. It is gone from
+ * {@link HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS} rather than left as an inert alias:
+ * a key in the allowlist that reaches the container and does nothing is worse
+ * than an unknown one, because `findUnmanagedHindsightEnvKeys` would stop
+ * flagging it. No fleet yaml set it (grepped at the bump), so nothing broke.
+ * The replacement is an ALWAYS-EMITTED default, not an override —
+ * see {@link HINDSIGHT_DEFAULT_QUERY_ANALYZER_LANGUAGES}.
  *
  * ### `HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS`
  *
@@ -1550,6 +1590,47 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX: ""   # bge parity — no affix
  * ```
  *
+ * ### New at v0.9.0 (override-only, REACH not opinion)
+ *
+ * The v0.9.0 server bump added several knobs that are worth an operator's
+ * reach but that switchroom deliberately emits NO value for. Each is a real
+ * `HINDSIGHT_API_` field on the pinned digest (verified against 0.9.0
+ * `config.py` at the line noted), and each has an upstream default that is
+ * already the right answer for this fleet — so allowlisting them buys the
+ * ability to change one without a code change, while emitting a value would
+ * only create a second copy of an opinion to drift. Listing them here also
+ * satisfies `tests/hindsight-env-keys-are-reachable.test.ts`, which requires a
+ * managed key to exist in the pinned image — hence "same PR as the digest
+ * bump", not later.
+ *
+ * - `HINDSIGHT_API_RERANKER_MAX_CANDIDATES_{LOW,MID,HIGH}` (`config.py:476-478`,
+ *   parsed `:3349-3355`, defaults `0` at `:961-963`). Per-recall-budget caps on
+ *   how many fused candidates reach the cross-encoder, resolved by
+ *   `_resolve_reranker_max_candidates`. `0` means "no per-budget cap", i.e. fall
+ *   back to the global `HINDSIGHT_API_RERANKER_MAX_CANDIDATES` that
+ *   {@link HINDSIGHT_PERF_DEFAULTS_UNGATED} already pins at
+ *   {@link HINDSIGHT_DEFAULT_RERANKER_MAX_CANDIDATES}. Splitting that single
+ *   number three ways is a quality/latency trade with no measurement behind it
+ *   yet; keep one knob until a budget tier is shown to be the problem.
+ * - `HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS` (`config.py:439`, parsed
+ *   `:3166`, default `None` at `:1099`). Truncation ceiling for embedding
+ *   inputs. `None` means "whatever the model advertises" — a hand-set value can
+ *   only silently truncate text the model would have accepted.
+ * - `HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD` (`config.py:687`, parsed
+ *   `:3681`, default `0.15` at `:1248`). Fuzzy-match floor for entity
+ *   resolution, backed by the trigram index that v0.9.0's `b3e8d1c6f4a9`
+ *   migration rebuilds. Raising it merges only near-identical surface forms;
+ *   lowering it costs precision. Entity resolution quality is not a complaint on
+ *   this fleet, so upstream's value stands.
+ * - `HINDSIGHT_API_ENABLE_{TEMPORAL_RETRIEVAL,GRAPH_RETRIEVAL,RERANKING}`
+ *   (`config.py:781-783`, parsed `:3731-3736`, all default `True` at
+ *   `:1297-1299`). Global kill-switches for three retrieval stages (v0.9.0 also
+ *   threads them per-bank). These are the emergency lever if one stage is ever
+ *   implicated in a latency incident — reach matters precisely because you want
+ *   it without a rebuild. Switchroom sets none of them: disabling a retrieval
+ *   arm trades recall QUALITY for latency silently, and doing it in the same
+ *   change as a server bump would destroy attribution.
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1576,7 +1657,6 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
   "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
   "HINDSIGHT_MM_REFRESH_MIN_INTERVAL_S",
-  "HINDSIGHT_API_TEMPORAL_LANGUAGES",
   "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
   "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
   "HINDSIGHT_API_BM25_MAX_QUERY_TERMS",
@@ -1591,6 +1671,15 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING",
   "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX",
   "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX",
+  // --- new at the v0.9.0 bump (reach only; switchroom emits no value) ---
+  "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_LOW",
+  "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_MID",
+  "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_HIGH",
+  "HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS",
+  "HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD",
+  "HINDSIGHT_API_ENABLE_TEMPORAL_RETRIEVAL",
+  "HINDSIGHT_API_ENABLE_GRAPH_RETRIEVAL",
+  "HINDSIGHT_API_ENABLE_RERANKING",
 ]);
 
 /**

@@ -1604,8 +1604,22 @@ describe("Dockerfile.hindsight shape", () => {
     // Post-replace verification-on-build: full surface present, exact-14, and
     // both orthogonal switchroom-local mods asserted to SURVIVE the patch
     // (a re-ordered future patch that drops either fails the build here).
+    // 14 predict() signatures at v0.8.6, 15 at v0.9.0: upstream added
+    // MultiCrossEncoder (the reranker failover chain), whose predict() shares
+    // the signature line. The EXACT count is the drift detector — a range would
+    // stop catching an upstream reranker that never learns `background`.
     expect(dockerfile).toContain(
-      'assert ce.count("*, background: bool = False) -> list[float]:") == 14',
+      'assert ce.count("*, background: bool = False) -> list[float]:") == 15',
+    );
+    // v0.9.0 only: MultiCrossEncoder sits BETWEEN the engine and the member that
+    // owns the foreground-priority pool. Without this forward it would accept
+    // `background` and drop it, silently reinstating the bug #3142 fixes behind
+    // a chain that still type-checks.
+    expect(dockerfile).toContain(
+      "scores = await member.predict(pairs, background=background)",
+    );
+    expect(dockerfile).toContain(
+      'assert ce.count("await member.predict(pairs)") == 0',
     );
     expect(dockerfile).toMatch(
       /_background_search_semaphore" in me, "switchroom recall-admission-split mod lost/,
@@ -1626,53 +1640,38 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
-  it("keeps the temporal-language fix (assert-guarded, fail-loud)", () => {
-    // dateparser.search_dates() with no `languages=` auto-detected across 200+
-    // locales inline on the shared asyncio loop on every recall — 128 loop
-    // blocks/20min, 1383 language-split frames in the blocked stacks. The patch
-    // pins `languages=` to a config knob (default en) on both search_dates
-    // call sites, eliminating the auto-detection pass.
-
-    // The exact-once anchor guard (fail-loud on upstream drift).
-    expect(dockerfile).toMatch(
-      /switchroom hindsight temporal-language patch: anchor found \{n\}x/,
-    );
-
-    // The config.py knob, wired end to end: env name, default, dataclass
-    // field, and the CSV-with-["en"]-floor parse in from_env.
-    expect(dockerfile).toContain(
+  it("RETIRED the temporal-language patch at v0.9.0, leaving no residue", () => {
+    // switchroom #4313 pinned dateparser's `languages=` with an image patch
+    // because upstream auto-detected across 200+ locales inline on the shared
+    // asyncio loop (99.8ms/call vs 0.6ms pinned, ~165x; 128 loop blocks/20min).
+    // Upstream #3154 (v0.9.0) implements the same pin natively, so the block was
+    // DELETED rather than rebased — carrying both would be a duplicate knob.
+    //
+    // What replaces it is NOT in this file: switchroom emits
+    // HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES=en as an always-on default
+    // (src/setup/hindsight-perf-defaults.ts). Upstream's default is None = the
+    // slow auto-detect, so the emission — not the image — is now what buys the
+    // speedup. These assertions exist so a revert of the deletion reds here.
+    // Assert on the CODE the block emitted, not on the name: the retirement
+    // note deliberately still says "HINDSIGHT_API_TEMPORAL_LANGUAGES" in prose,
+    // and a test that banned the string would only teach people to delete the
+    // explanation.
+    expect(dockerfile).not.toContain(
       'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"',
     );
-    expect(dockerfile).toContain('DEFAULT_TEMPORAL_LANGUAGES = "en"');
-    expect(dockerfile).toContain("    temporal_languages: list[str]");
-    expect(dockerfile).toContain("temporal_languages=_parse_str_list(");
-    expect(dockerfile).toMatch(
-      /os\.getenv\(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES\)/,
-    );
-    expect(dockerfile).toMatch(/\) or \["en"\],/);
+    expect(dockerfile).not.toContain('DEFAULT_TEMPORAL_LANGUAGES = "en"');
+    expect(dockerfile).not.toContain("temporal_languages=_parse_str_list(");
+    expect(dockerfile).not.toContain("_resolve_temporal_languages()");
+    expect(dockerfile).not.toContain("languages=self._languages");
+    expect(dockerfile).not.toMatch(/temporal-language patch: anchor found/);
 
-    // Both search_dates call sites pinned — the load() warm-up and the
-    // analyze() call.
+    // The tombstone stays: the next person to read this file must find out WHY
+    // the block is absent and that an env emission is load-bearing, not infer
+    // that the pin was simply dropped.
     expect(dockerfile).toContain(
-      'self._search_dates("today", languages=self._languages)',
+      "# --- RETIRED (v0.9.0): switchroom #4313 dateparser language pin ---",
     );
-    expect(dockerfile).toContain(
-      "results = self._search_dates(query, settings=settings, languages=self._languages)",
-    );
-    // The analyzer resolves its pin from config, defaulting to English.
-    expect(dockerfile).toContain(
-      "self._languages = _resolve_temporal_languages()",
-    );
-
-    // The post-replace assertion that would RED if the pin were reverted: the
-    // no-languages call must be GONE from analyze(). This is the guard that
-    // makes the fix's absence a build failure, not a silent regression.
-    expect(dockerfile).toContain(
-      'assert qa.count("self._search_dates(query, settings=settings)") == 0,',
-    );
-    expect(dockerfile).toMatch(
-      /switchroom hindsight temporal-language patch: dateparser pinned to/,
-    );
+    expect(dockerfile).toContain("HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES");
   });
 
   it("keeps the temporal-offload fix (assert-guarded, fail-loud)", () => {
@@ -1707,8 +1706,10 @@ describe("Dockerfile.hindsight shape", () => {
     );
     expect(dockerfile).toContain("loop.run_in_executor(");
     // The single async call site now awaits the off-loop wrapper.
+    // v0.9.0 moved this call site inside upstream's `if enable_temporal_retrieval:`
+    // block and wrapped it across lines, so match the wrapped form.
     expect(dockerfile).toContain(
-      "await extract_temporal_constraint_async(query_text",
+      'await extract_temporal_constraint_async(\\n"\n        "            query_text',
     );
 
     // The analyzer truncates its input before search_dates.
@@ -1716,19 +1717,39 @@ describe("Dockerfile.hindsight shape", () => {
       "search_query = search_query[: self._max_query_chars]",
     );
 
-    // The #4313 language pin MUST survive: the (now truncated) call still
-    // carries languages=self._languages. This is the in-patch guard that reds
-    // if this fix ever regresses #4313.
+    // The locale pin MUST survive the truncation. At v0.9.0 it arrives via
+    // upstream's shared `_search_kwargs()` helper (#3154) rather than our
+    // retired `languages=self._languages`, so the truncated call must still
+    // SPREAD it — losing the spread silently restores the 200+-locale
+    // auto-detect with no error anywhere.
     expect(dockerfile).toContain(
-      "self._search_dates(search_query, settings=settings, languages=self._languages)",
+      "self._search_dates(search_query, settings=settings, **self._search_kwargs())",
     );
     expect(dockerfile).toMatch(
-      /switchroom hindsight temporal-offload patch: #4313 language pin lost/,
+      /search_dates call no longer spreads \*\*self\._search_kwargs\(\)/,
+    );
+    // Warm-up and analyze() must resolve the same locale set.
+    expect(dockerfile).toContain(
+      'assert \'self._search_dates("today", **self._search_kwargs())\' in qa',
+    );
+    // The knob switchroom now emits must still be parsed by config.py — if
+    // upstream ever drops it, the emitted `en` becomes a no-op, which is the
+    // 165x regression wearing a green build.
+    expect(dockerfile).toContain(
+      'ENV_QUERY_ANALYZER_LANGUAGES = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES"',
+    );
+    // temporal_extraction.py's get_default_analyzer() builds an UNLANGUAGED
+    // analyzer. It is unreachable only because retrieval.py always passes an
+    // explicit analyzer; assert that argument survives so an upstream change
+    // that makes the fallback reachable fails the build instead of quietly
+    // un-pinning the recall path.
+    expect(dockerfile).toContain(
+      'assert "analyzer=query_analyzer" in rt',
     );
 
     // The RED guard: the untruncated on-loop call must be GONE from analyze().
     expect(dockerfile).toContain(
-      'assert qa.count("self._search_dates(query, settings=settings, languages=self._languages)") == 0,',
+      'assert qa.count("self._search_dates(query, settings=settings, **self._search_kwargs())") == 0,',
     );
     expect(dockerfile).toMatch(
       /switchroom hindsight temporal-offload patch: temporal extraction runs on a/,

@@ -73,6 +73,54 @@ now an anomaly worth investigating, not the norm.
 
 - **The dev-protocol template names `switchroom/switchroom` (via `origin`) as the single source of truth and forbids the archived `mekenthompson/switchroom` fork, and `isSwitchroomRemote()` now recognizes a fork-origin checkout so the worktree GC can reclaim it instead of leaving it orphaned (the `.rev-pr4` clone lingered 8 days).**
 
+### Hindsight: bump the pinned server 0.8.6 -> 0.9.0 (#4525)
+
+- **`docker/Dockerfile.hindsight` now pins upstream `0.9.0`**
+  (`sha256:6364c3c5...913b6`), and the machine-read
+  `# switchroom:hindsight-api-version` marker, the MCP tool snapshot's `_meta`,
+  and `HINDSIGHT_MIN_API_VERSION` move with it in the same commit. The MCP
+  surface did NOT change across the bump: re-capturing the tool list from the
+  new digest reproduces all 32 tools with identical `required`/`properties`,
+  and the capture method was validated first by reproducing the committed
+  0.8.6 snapshot byte-for-byte from the OLD digest.
+- **First boot on 0.9.0 runs five alembic migrations** (~1-2 min on this
+  fleet). Rolling back is two-step for one of them only: the last migration
+  swaps the entity trigram index, so downgrade past it before restoring an
+  older image. The full history note lives in the Dockerfile header.
+- **switchroom now emits `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES=en` on every
+  host.** Upstream #3154 implements the dateparser language pin natively, so
+  switchroom's own image patch for it (#4313) is deleted -- but upstream's
+  DEFAULT is auto-detection across 200+ locales, running inline on the shared
+  asyncio loop at ~165x the pinned cost (99.8 ms/call vs 0.6 ms/call measured;
+  128 `EVENT LOOP BLOCKED >=1s` events in 20 minutes). The env emission, not
+  the image, is what buys that speedup now, so it is an always-on default
+  rather than an override-only key, and a RED/GREEN docker probe
+  (`tests/docker/hindsight-query-analyzer-languages.test.ts`) fails if it is
+  ever dropped or demoted.
+- **`HINDSIGHT_API_TEMPORAL_LANGUAGES` is retired** -- it was switchroom's own
+  knob, read by nothing in the 0.9.0 image. It is REMOVED from the managed set
+  rather than left inert, so `switchroom doctor` keeps flagging it if a yaml
+  still sets one (no fleet yaml does).
+- **Eight 0.9.0 knobs are now reachable from `hindsight.env`** with no value
+  emitted: `HINDSIGHT_API_RERANKER_MAX_CANDIDATES_{LOW,MID,HIGH}`,
+  `HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS`,
+  `HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD` and
+  `HINDSIGHT_API_ENABLE_{TEMPORAL_RETRIEVAL,GRAPH_RETRIEVAL,RERANKING}`.
+  Upstream's defaults are already right for this fleet; allowlisting them buys
+  an operator the lever without a code change, and the retrieval-stage kill
+  switches deliberately stay off in the same change as the bump so any latency
+  movement stays attributable to one variable.
+- **Two image patches were re-authored against 0.9.0 source.** The reranker
+  foreground-priority lane now also forwards `background` through upstream's
+  new `MultiCrossEncoder` failover chain -- without that the chain would accept
+  the flag and drop it before the member that owns the priority pool, silently
+  reverting the patch. The temporal-offload patch is rebased on #3154's shared
+  `_search_kwargs()` helper, and asserts both that the truncated `search_dates`
+  call still spreads it and that `retrieval.py` still passes an explicit
+  analyzer -- which is what keeps the unlanguaged `get_default_analyzer()`
+  fallback off the recall path.
+
+
 ## v0.20.17 — Hindsight bakes the bge ONNX export into the image and boots HF-offline
 
 ### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot

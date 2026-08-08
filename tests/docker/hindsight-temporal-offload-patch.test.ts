@@ -18,9 +18,11 @@
  *   reranker together for seconds: 186 `EVENT LOOP BLOCKED` events in 4.5h, p50
  *   1.36s, max 14.95s (16KB date-dense text ≈ 988ms measured).
  *
- * The #4313 language pin (a SEPARATE, already-shipped patch) cut dateparser's
- * per-locale cost but cannot bound the per-CALL cost on unbounded input. This
- * patch does two things: (a) offloads `search_dates` to a dedicated
+ * The language pin (#4313, absorbed by upstream #3154 at v0.9.0 and now
+ * supplied by switchroom's `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES` emission)
+ * cut dateparser's per-locale cost but cannot bound the per-CALL cost on
+ * unbounded input. This patch does two things: (a) offloads `search_dates` to a
+ * dedicated
  * single-worker `ThreadPoolExecutor` via `loop.run_in_executor`, and (b) caps
  * the query fed to it with `HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS` (default
  * 2000, 0 = unlimited).
@@ -34,15 +36,26 @@
  * duration — while a real ≥200ms extraction completes. A test that merely
  * grepped for `run_in_executor` would not fail on the defect; this one bites.
  *
- * RED  = upstream + only the #4313 language block (offload patch ABSENT):
+ * RED  = the pinned upstream image with the offload patch ABSENT:
  *        `extract_temporal_constraint` called inline on the loop blocks the
  *        ticker for ≈ the full parse duration, and the async wrapper / config
  *        knob do not exist.
- * GREEN = upstream + #4313 + this offload block: awaiting
+ * GREEN = the same image + this offload block: awaiting
  *        `extract_temporal_constraint_async` keeps the max inter-tick gap tiny
  *        while the same parse runs, the char cap collapses a 34KB parse from
- *        ~800ms to <200ms, and the cap drops a date past char 2000 while cap=0
- *        preserves the full scan.
+ *        ~840ms to <200ms (~80ms measured), and the cap drops a date past char
+ *        2000 while cap=0 preserves the full scan.
+ *
+ * BOTH arms run with `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES` set to the value
+ * switchroom emits on every host, and build their analyzers from
+ * `HindsightConfig.from_env()` the way `memory_engine.py` does. That is not
+ * decoration: at v0.9.0 the language pin lives in switchroom's env emission
+ * rather than in the image, so a bare `DateparserQueryAnalyzer()` is
+ * `languages=None` = upstream's 200+-locale auto-detect, which costs ~780ms on
+ * the capped 2000-char parse below versus ~80ms pinned. Timing the wrong
+ * configuration would red this probe for a reason that has nothing to do with
+ * the offload patch it guards. The pin is held constant across RED and GREEN so
+ * the only variable is the patch.
  *
  * The patch blocks are extracted from the Dockerfile itself rather than
  * duplicated here, so this test cannot drift from what actually ships. It
@@ -50,7 +63,7 @@
  * without buildx, and it never touches the production `switchroom-hindsight`
  * container.
  *
- * SKIP DISCIPLINE: identical to `hindsight-temporal-language-patch.test.ts`.
+ * SKIP DISCIPLINE: identical to `hindsight-query-analyzer-languages.test.ts`.
  * Locally, with no docker or no cached image, this skips (never pull a 6.4GB
  * third-party image onto a dev box). In CI the `hindsight-probe` job
  * (`.github/workflows/docker-e2e.yml`) pulls the pinned digest and runs this
@@ -66,6 +79,7 @@ import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { HINDSIGHT_PERF_DEFAULTS_UNGATED } from "../../src/setup/hindsight-perf-defaults.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dockerfile = readFileSync(
@@ -75,6 +89,43 @@ const dockerfile = readFileSync(
 
 const RUN_ID = randomUUID();
 const TEST_PHASE = "hindsight-temporal-offload-patch";
+
+const LANG_ENV_KEY = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES";
+
+/**
+ * The language pin the container really runs with, read from the emission table
+ * rather than restated here.
+ *
+ * This probe measures dateparser wall-clock against a threshold, so the analyzer
+ * it builds MUST be configured the way production's is or the numbers are
+ * meaningless. At v0.8.6 switchroom's own image patch made the in-image default
+ * `"en"`, so a bare `DateparserQueryAnalyzer()` was already pinned; at v0.9.0
+ * that patch is retired and the pin moved to this env emission, so a bare
+ * analyzer is `languages=None` = upstream's 200+-locale auto-detect. Measured
+ * in-image on the pinned digest, the capped-2000 parse below costs ~780ms
+ * unlanguaged vs ~80ms pinned — the unlanguaged analyzer blows the 200ms cap
+ * assertion for a reason that has nothing to do with the offload patch this
+ * file guards. Import, don't hardcode: a dropped emission must red this suite
+ * rather than leave it proving a configuration nothing ships.
+ */
+const EMITTED_LANGUAGES = (() => {
+  const entry = HINDSIGHT_PERF_DEFAULTS_UNGATED.find(
+    ([k]) => k === LANG_ENV_KEY
+  );
+  if (!entry) {
+    throw new Error(
+      `${LANG_ENV_KEY} is no longer an emitted UNGATED default. This probe's ` +
+        `timing thresholds assume the production language pin — see ` +
+        `hindsight-query-analyzer-languages.test.ts before deleting it.`
+    );
+  }
+  return entry[1];
+})();
+
+/** `"en"` -> `['en']` as Python renders the parsed list. */
+const EXPECTED_PY_LIST = `[${EMITTED_LANGUAGES.split(",")
+  .map((c) => `'${c.trim().toLowerCase()}'`)
+  .join(", ")}]`;
 
 /** The pinned upstream image, read from the Dockerfile so it can never drift. */
 const UPSTREAM_IMAGE = (() => {
@@ -98,13 +149,14 @@ function patchBlockNamed(name: string): string {
   return b;
 }
 
-// The offload patch's anchors are the POST-#4313 file state, so #4313 must be
-// applied first — the same order the Dockerfile applies them.
-const LANG_BLOCK = patchBlockNamed("temporal-language patch");
+// At v0.8.6 the offload patch's anchors were the POST-#4313 file state, so the
+// language block had to be applied first. Upstream #3154 (v0.9.0) absorbed
+// #4313, that block was deleted, and the offload patch is now anchored on plain
+// upstream — so this probe applies exactly one block, as the Dockerfile does.
 const OFFLOAD_BLOCK = patchBlockNamed("temporal-offload patch");
 
 /**
- * GREEN probe. Runs against upstream + #4313 + the offload block. Exits 0 only
+ * GREEN probe. Runs against upstream + the offload block. Exits 0 only
  * when the loop stays responsive off-loop AND the char cap behaves. Asserts
  * OUTCOMES, never source text.
  */
@@ -125,11 +177,36 @@ from hindsight_api.engine.search.temporal_extraction import (
     extract_temporal_constraint_async,
 )
 
+cfg = HindsightConfig.from_env()
+
 # ---- the config knob resolves to 2000 through the REAL loader ----
-cap_default = getattr(HindsightConfig.from_env(), "temporal_max_query_chars", "__ABSENT__")
+cap_default = getattr(cfg, "temporal_max_query_chars", "__ABSENT__")
 print("DEFAULT_CAP", cap_default)
 if cap_default != 2000:
     failures.append("default temporal_max_query_chars != 2000: %r" % (cap_default,))
+
+# ---- every analyzer below is built the way PRODUCTION builds it ----
+# memory_engine.py: DateparserQueryAnalyzer(languages=config.query_analyzer_languages),
+# fed by the HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES the harness passes in with
+# the value switchroom emits on every host. A bare DateparserQueryAnalyzer() is
+# languages=None = upstream's 200+-locale auto-detect (~10x the per-call cost),
+# which is NOT what ships and would make the timing thresholds below measure the
+# wrong thing entirely.
+QA_LANGS = getattr(cfg, "query_analyzer_languages", None)
+print("CONFIG_LANGS", QA_LANGS)
+if not QA_LANGS:
+    failures.append(
+        "analyzer language pin absent from config (%r) — the probe would be timing "
+        "200-locale auto-detect, not the shipping configuration" % (QA_LANGS,)
+    )
+
+
+def make_analyzer(max_query_chars=None):
+    """Production's analyzer, optionally with the offload patch's cap overridden."""
+    an = QA.DateparserQueryAnalyzer(languages=QA_LANGS)
+    if max_query_chars is not None:
+        an._max_query_chars = max_query_chars
+    return an
 
 # A big, date-dense text: long enough that the parse is unambiguously real work.
 chunk = "on june 10 2025 and march 3 2024 and 5 days ago something happened; "
@@ -148,8 +225,7 @@ async def ticker(stop, gaps):
 
 async def measure_offloop():
     # Uncapped analyzer so the off-loop parse is genuinely long.
-    an = QA.DateparserQueryAnalyzer()
-    an._max_query_chars = 0
+    an = make_analyzer(max_query_chars=0)
     stop = asyncio.Event()
     gaps = []
     tk = asyncio.create_task(ticker(stop, gaps))
@@ -181,8 +257,7 @@ if max_gap >= extract_ms * 0.5:
 
 # ---- the char cap collapses per-call cost on a huge query ----
 big = chunk * 500  # ~34KB
-an_cap = QA.DateparserQueryAnalyzer()
-an_cap._max_query_chars = 2000
+an_cap = make_analyzer(max_query_chars=2000)
 t0 = time.perf_counter()
 extract_temporal_constraint(big, analyzer=an_cap)
 capped_ms = (time.perf_counter() - t0) * 1000.0
@@ -194,12 +269,8 @@ if capped_ms >= 200:
 # Head has no temporal content; the only date lives well past 2000 chars.
 head = ("plain words with no temporal content here " * 60)[:2100]
 mixed = head + " on june 10 2025 clearly a date"
-an_c = QA.DateparserQueryAnalyzer()
-an_c._max_query_chars = 2000
-capped_res = extract_temporal_constraint(mixed, analyzer=an_c)
-an_u = QA.DateparserQueryAnalyzer()
-an_u._max_query_chars = 0
-full_res = extract_temporal_constraint(mixed, analyzer=an_u)
+capped_res = extract_temporal_constraint(mixed, analyzer=make_analyzer(max_query_chars=2000))
+full_res = extract_temporal_constraint(mixed, analyzer=make_analyzer(max_query_chars=0))
 print("MIXED_HEADLEN", len(head))
 print("CAPPED_DROPS_LATE_DATE", capped_res is None)
 print("FULLSCAN_KEEPS_LATE_DATE", full_res is not None)
@@ -209,7 +280,7 @@ if full_res is None:
     failures.append("cap=0 (full scan) missed the late date it should keep")
 
 # ---- and the cap does not harm a short live-recall-shaped query ----
-short = extract_temporal_constraint("what happened on june 10 2025", analyzer=QA.DateparserQueryAnalyzer())
+short = extract_temporal_constraint("what happened on june 10 2025", analyzer=make_analyzer())
 print("SHORT_QUERY_NONNULL", short is not None)
 if short is None:
     failures.append("cap regressed a short explicit-date query (would break live recall)")
@@ -220,8 +291,8 @@ sys.exit(1 if failures else 0)
 `;
 
 /**
- * RED probe. Runs against upstream + only the #4313 language block (offload
- * patch ABSENT). Proves the defect bites: the async wrapper and config knob do
+ * RED probe. Runs against the pinned upstream image with the offload patch
+ * ABSENT. Proves the defect bites: the async wrapper and config knob do
  * not exist, and calling the sync extractor inline on the loop blocks the
  * ticker for ≈ the full parse duration.
  */
@@ -236,11 +307,19 @@ from hindsight_api.config import HindsightConfig
 from hindsight_api.engine import query_analyzer as QA
 import hindsight_api.engine.search.temporal_extraction as TE
 
+cfg = HindsightConfig.from_env()
+
 # The async wrapper must not exist yet, and neither must the config knob.
 has_async = hasattr(TE, "extract_temporal_constraint_async")
 print("HAS_ASYNC_WRAPPER", has_async)
-cap_default = getattr(HindsightConfig.from_env(), "temporal_max_query_chars", "__ABSENT__")
+cap_default = getattr(cfg, "temporal_max_query_chars", "__ABSENT__")
 print("DEFAULT_CAP", cap_default)
+
+# Same production-shaped analyzer as GREEN (see that probe's note): RED and
+# GREEN must differ ONLY in whether the offload block is applied, so the
+# language pin is held constant across both arms.
+QA_LANGS = getattr(cfg, "query_analyzer_languages", None)
+print("CONFIG_LANGS", QA_LANGS)
 
 chunk = "on june 10 2025 and march 3 2024 and 5 days ago something happened; "
 text = chunk * 500
@@ -257,7 +336,7 @@ async def ticker(stop, gaps):
 
 
 async def measure_inline():
-    an = QA.DateparserQueryAnalyzer()
+    an = QA.DateparserQueryAnalyzer(languages=QA_LANGS)
     stop = asyncio.Event()
     gaps = []
     tk = asyncio.create_task(ticker(stop, gaps))
@@ -309,8 +388,8 @@ const imageOk = dockerOk && hasImage(UPSTREAM_IMAGE);
 type ProbeResult = { status: number; stdout: string };
 
 /**
- * Run a probe in a throwaway container. Always applies the #4313 language block
- * first (it is already-shipped); applies the offload block too iff `offload`.
+ * Run a probe in a throwaway container, always with switchroom's language
+ * emission set (as every host runs it); applies the offload block iff `offload`.
  */
 function runProbe(offload: boolean, probe: string): ProbeResult {
   const name = `sr-hs-toff-${offload ? "green" : "red"}-${RUN_ID.slice(0, 8)}`;
@@ -330,6 +409,12 @@ function runProbe(offload: boolean, probe: string): ProbeResult {
         "root",
         "--network",
         "none",
+        // Both arms run with switchroom's language emission, exactly as every
+        // host does. Without it the analyzer falls back to 200-locale
+        // auto-detect and the timing assertions below measure that instead of
+        // the offload patch. See EMITTED_LANGUAGES.
+        "-e",
+        `${LANG_ENV_KEY}=${EMITTED_LANGUAGES}`,
         UPSTREAM_IMAGE,
         "sleep",
         "400",
@@ -337,16 +422,10 @@ function runProbe(offload: boolean, probe: string): ProbeResult {
       { stdio: ["ignore", "ignore", "pipe"] }
     );
 
-    // #4313 first (its anchors are upstream); it is the baseline both RED and
-    // GREEN share, since it ships independently of this fix.
-    execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
-      input: LANG_BLOCK,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
     if (offload) {
-      // Self-verifying: asserts its post-#4313 anchors exist exactly once, so a
-      // non-zero exit here means upstream (or #4313) drifted and the patch must
-      // be re-authored.
+      // Self-verifying: asserts its upstream anchors exist exactly once, so a
+      // non-zero exit here means upstream drifted and the patch must be
+      // re-authored.
       execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
         input: OFFLOAD_BLOCK,
         stdio: ["pipe", "pipe", "pipe"],
@@ -429,6 +508,9 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("HAS_ASYNC_WRAPPER False");
       // …nor the config knob (getattr sentinel on the real loader).
       expect(stdout).toContain("DEFAULT_CAP __ABSENT__");
+      // Both arms are language-pinned exactly as production is, so the only
+      // variable between RED and GREEN is the offload block itself.
+      expect(stdout).toContain(`CONFIG_LANGS ${EXPECTED_PY_LIST}`);
 
       // The concrete defect: the loop was blocked for ≈ the whole parse. Parse
       // the two numbers out and assert the gap is a large fraction of it.
@@ -447,7 +529,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       ).toBeGreaterThan(extract * 0.5);
     }, 240_000);
 
-    it("upstream + #4313 + the offload block is GREEN — the loop stays responsive off-loop and the char cap bounds cost", () => {
+    it("upstream + the offload block is GREEN — the loop stays responsive off-loop and the char cap bounds cost", () => {
       const { status, stdout } = runProbe(true, GREEN_PROBE);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
@@ -457,6 +539,10 @@ describe.skipIf(!dockerOk || !imageOk)(
 
       // The knob resolves to 2000 through the real loader.
       expect(stdout).toContain("DEFAULT_CAP 2000");
+      // The analyzers under test carry production's language pin (a bare
+      // analyzer would be 200-locale auto-detect at ~10x the cost, blowing the
+      // cap assertion for reasons unrelated to this patch).
+      expect(stdout).toContain(`CONFIG_LANGS ${EXPECTED_PY_LIST}`);
       // The load-bearing outcome: real work off-loop, loop stayed responsive.
       expect(stdout).toContain("CAPPED_DROPS_LATE_DATE True");
       expect(stdout).toContain("FULLSCAN_KEEPS_LATE_DATE True");

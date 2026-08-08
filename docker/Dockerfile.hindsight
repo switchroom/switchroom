@@ -31,47 +31,72 @@
 # from another org; an upstream repoint would otherwise flow into the
 # published hindsight image undetected. Dependabot tracks bumps.
 #
-# Pinned to vectorize-io/hindsight v0.8.6 (digest below; label
-# org.opencontainers.image.version=0.8.6, image revision 08995e30, built
-# 2026-07-29). Bumped from v0.8.5 (sha256:0710076c…) to pick up, natively,
-# three things switchroom either carried as a patch or could not configure:
-#   * upstream #2968 (graph seed reuse + the fetch_unit_dates UUID cast) —
-#     this file carried it as an UPSTREAM CARRY block; now retired.
-#   * upstream `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS` — makes the consolidation
-#     `maxItems` grammar patch a config toggle; that block is now retired too.
-#   * upstream #3016 — the per-type worker slot env vars are renamed
-#     `HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS` → `..._RESERVED_SLOTS`. THE OLD
-#     NAME IS A DEPRECATED ALIAS AND SETTING BOTH NAMES FOR THE SAME TYPE IS A
-#     HARD BOOT ValueError (verified live against this digest). switchroom's
-#     emitter therefore accepts the old name as INPUT and always emits the
-#     canonical one, never both — see src/setup/hindsight-perf-defaults.ts.
+# Pinned to vectorize-io/hindsight v0.9.0 (digest below; ghcr tag `0.9.0`,
+# registry-verified). Bumped from v0.8.6 (sha256:ffa391a7…) primarily for the
+# pooled-connection fixes — upstream #3082/#3083 (stop holding a pooled DB
+# connection across LLM/embedder calls) and #3145 (release concurrency permits
+# during retry backoff) — which target exactly this fleet's contention profile
+# (a 25.9M-row `memory_links` table). It also lets one patch retire and adds
+# knobs we allowlist but do not set:
+#   * upstream #3154 (merged 2026-08-05) reimplements our dateparser locale pin
+#     natively as `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES`, routed through a new
+#     `DateparserQueryAnalyzer._search_kwargs()` helper. Our RUN block for it is
+#     RETIRED here. CAUTION: upstream's default is `None` = auto-detect across
+#     200+ locales, i.e. the SLOW path our patch existed to kill (measured
+#     99.8 ms → 0.6 ms/call, ~165x). switchroom therefore emits
+#     `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES=en` as an ALWAYS-ON default (in
+#     HINDSIGHT_PERF_DEFAULTS_UNGATED, not override-only) —
+#     src/setup/hindsight-perf-defaults.ts. Dropping that emission is a silent
+#     165x regression, not a config nicety.
+#   * per-budget rerank caps (`…_RERANKER_MAX_CANDIDATES_{LOW,MID,HIGH}`) and
+#     per-bank retrieval stage toggles (`…_ENABLE_{TEMPORAL,GRAPH}_RETRIEVAL`,
+#     `…_ENABLE_RERANKING`) — allowlisted as override-only, deliberately UNSET
+#     (defaults are correct and toggling a stage in the same change as a server
+#     bump would destroy attribution).
+#   * upstream #3142 (our foreground-priority reranker lane) was CLOSED UNMERGED
+#     on 2026-08-03, so that block stays ours; it is re-authored below against
+#     0.9.0's `MultiCrossEncoder` / `RerankerMemberConfig` reranker refactor.
 #
-# MIGRATION COST: exactly ONE new alembic revision, c7d1e9a4b3f2
-# (head d7b2f8a1c934 → c7d1e9a4b3f2), adding `causal_links JSONB NOT NULL
-# DEFAULT '[]'` to the invalidated_memory_units archive so revert-of-an-
-# invalidate can rematerialize causal edges. `ADD COLUMN … DEFAULT` is
-# metadata-only on PG 11+; measured 5.5 ms on this fleet's volume.
+# MIGRATION COST: FIVE new alembic revisions, chained off 0.8.6 head
+# c7d1e9a4b3f2: a1c9e7f3b2d8 (drop an `observation_history` FK) → a9b8c7d6e5f4
+# (add the additive `knowledge_pages` table) → e4a7c1b9d2f6 (DROP COLUMN
+# `memory_units.access_count`; metadata-only, nothing in switchroom reads it) →
+# f2a6d8c4b1e9 (DROP INDEX IF EXISTS `idx_memory_units_embedding` — a NO-OP on
+# this fleet, whose vector search is served by bank-scoped partial indexes) →
+# b3e8d1c6f4a9 (add `entities.entity_kind`, backfill, then swap the entity trgm
+# index: CREATE INDEX CONCURRENTLY the new partial one, DROP CONCURRENTLY the
+# old). Estimated ~1-2 minutes total on this fleet's volume, dominated by the
+# concurrent GIN build over ~226k entities.
 #
-# ROLLING BACK to 0.8.5 is, for THIS revision only, safe without a downgrade:
-# the column is additive, defaulted, lives on the archive alone, and 0.8.5
-# discovers the archive column list by introspecting `memory_units` (not the
-# archive) in `_memory_unit_columns` (memory_engine.py:6638-6652), so it never
-# sees the new column. That is the opposite of the 0.8.4→0.8.5 bump, where a
-# DROP COLUMN made a naive rollback break. Do NOT generalise it: the ordered
-# two-step (alembic downgrade FIRST while this image still runs, THEN repoint
-# the digest) remains the rule for any bump that drops or narrows a column,
-# because an older image does not stop you at boot — it logs "Database is at a
-# newer migration revision …" and carries on. Full runbook:
+# ROLLING BACK to 0.8.6 is a TWO-STEP, and the reason is b3e8d1c6f4a9 alone:
+# `alembic downgrade c7d1e9a4b3f2` FIRST, while the 0.9.0 image is still
+# running (its downgrade rebuilds the exact original
+# `entities_canonical_name_lower_trgm_idx` CONCURRENTLY *before* dropping
+# `entity_kind`, so entity resolution stays indexed throughout), THEN repoint
+# the digest. A naive rollback (digest repoint with no downgrade) boots fine —
+# 0.8.6 logs "Database is at a newer migration revision …" and carries on — but
+# leaves entity fuzzy-resolution seq-scanning, because the surviving index is
+# partial on `entity_kind != 'label'` and 0.8.6's resolver query cannot use it.
+# That is a silent latency cliff, not a crash. There is no vector-search cliff
+# on this fleet (f2a6d8c4b1e9 is a no-op here). Full runbook, including the
+# manual `CREATE INDEX CONCURRENTLY` repair:
 # docs/operators/hindsight-memory.md § "Rolling the base image BACK".
 #
-# Prior history: v0.8.4→v0.8.5 picked up `hindsight-admin repair-bank`
+# Prior history: v0.8.5→v0.8.6 picked up upstream #2968, the
+# `HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS` toggle, and the #3016
+# `…_MAX_SLOTS`→`…_RESERVED_SLOTS` worker-slot rename (the old name is a
+# deprecated alias and setting BOTH for one type is a hard boot ValueError, so
+# switchroom's emitter accepts the old name as input and always emits exactly
+# the canonical one); v0.8.4→v0.8.5 picked up `hindsight-admin repair-bank`
 # (upstream #2645) and dropped `search_vector` from the archive, which is what
 # made THAT rollback a two-step; v0.8.2→v0.8.4 merged divergent alembic heads
 # and widened bank_id columns; v0.7.1→v0.8.2 fixed the `batch_retain`
-# ForeignKeyViolation on `unit_entities` (switchroom #2392). NOTE: upstream
-# publishes only `:latest` (no `:vX.Y.Z` tag in ghcr), so the digest IS the
-# version pin. A bump runs DB migrations on the persisted memory volume —
-# back up `switchroom-hindsight-data` first.
+# ForeignKeyViolation on `unit_entities` (switchroom #2392). NOTE: upstream now
+# publishes real version tags in ghcr (`0.9.0`, `0.9.0-slim`, `0.9`, …, ~153
+# tags) as well as the mutable `:latest`; we still pin by DIGEST, because the
+# tag is a third-party mutable ref and the digest is what makes an upstream
+# repoint visible instead of silent. A bump runs DB migrations on the persisted
+# memory volume — back up `switchroom-hindsight-data` first.
 #
 # MACHINE-READ MARKER — the `api_version` the digest below resolves to. Bump it
 # in the SAME commit as the digest. `tests/memory.hindsight-contract.fixture.test.ts`
@@ -82,8 +107,8 @@
 # the pinned image makes the shim's cold-boot fallback advertise props the
 # server silently drops, and the agent then believes a filter applied when it
 # did not.
-# switchroom:hindsight-api-version=0.8.6
-FROM ghcr.io/vectorize-io/hindsight:latest@sha256:ffa391a77284e49f6b55e32c86f33529ac4257831407b14038a72b6a0a232039
+# switchroom:hindsight-api-version=0.9.0
+FROM ghcr.io/vectorize-io/hindsight:latest@sha256:6364c3c5f1e551447976d6c3ab369040d0237c0980f10f911d76d981290913b6
 
 USER root
 
@@ -4550,10 +4575,11 @@ def apply(path, anchor, repl, *, count=1):
 
 
 # ---- cross_encoder.py: new stdlib imports for the priority pool ----
+# v0.9.0 dropped `import os` from this module (the reranker env reads moved to
+# RerankerMemberConfig), so the anchor no longer carries it.
 apply(CE, (
     "import asyncio\n"
     "import logging\n"
-    "import os\n"
     "import warnings\n"
     "from abc import ABC, abstractmethod\n"
     "from concurrent.futures import ThreadPoolExecutor\n"
@@ -4562,7 +4588,6 @@ apply(CE, (
     "import asyncio\n"
     "import itertools\n"
     "import logging\n"
-    "import os\n"
     "import queue\n"
     "import threading\n"
     "import warnings\n"
@@ -4820,11 +4845,30 @@ apply(CE, (
 # Abstract base + all concrete providers share one identical signature line (remote
 # providers accept-and-ignore the flag). Count-asserted so a dropped/added provider
 # fails the build loudly rather than silently under-patching.
+#
+# 14 at v0.8.6, 15 at v0.9.0: upstream added MultiCrossEncoder (the reranker
+# failover chain), whose predict() shares the same signature line. Do NOT relax
+# this to a range — the exact count is the drift detector.
 apply(CE, (
     "    async def predict(self, pairs: list[tuple[str, str]]) -> list[float]:\n"
 ), (
     "    async def predict(self, pairs: list[tuple[str, str]], *, background: bool = False) -> list[float]:\n"
-), count=14)
+), count=15)
+
+# ---- cross_encoder.py: MultiCrossEncoder forwards `background` to its members ----
+# v0.9.0's failover chain delegates to member.predict(pairs). The census patch above
+# gives MultiCrossEncoder.predict the `background` kwarg, so without this the flag
+# would be accepted and then DROPPED on the way to the member that actually owns the
+# priority pool — every rerank would enqueue as foreground and #3142's starvation fix
+# would be silently dead behind a chain. switchroom runs a single `local` reranker
+# today (the chain is only built when HINDSIGHT_API_RERANKER_<n>_* is configured, and
+# the secondaries need external API keys we decline), so this is defence-in-depth
+# rather than a live path — but a one-line forward is cheaper than the trap.
+apply(CE, (
+    "                scores = await member.predict(pairs)\n"
+), (
+    "                scores = await member.predict(pairs, background=background)\n"
+), count=1)
 
 # ---- reranking.py: CrossEncoderReranker.rerank() gains `background` + forwards it ----
 apply(RR, (
@@ -4929,16 +4973,27 @@ apply(ME, (
 # ---- memory_engine.py: thread `_background` down to the rerank site (switchroom #4212) ----
 # The admission signal `_background` lives on recall_async; the rerank site lives one frame
 # down in _search_with_retries, which only saw `request_context`. Thread `_background`
-# through so the rerank class can be derived as (_background OR internal). The preceding
-# `max_source_facts_tokens_per_observation: int = -1,` line disambiguates this signature
-# from recall_async's (which has the same `reranking=` default but a different prior line).
+# through so the rerank class can be derived as (_background OR internal). recall_async's
+# signature ends `reranking: RecallReranking = "cross_encoder",\n    ) -> RecallResultModel:`
+# too, so the anchor must disambiguate: at v0.9.0 it does so with the three parameters
+# upstream added to _search_with_retries ALONE (`reranker_max_candidates`,
+# `enable_temporal_retrieval`, `enable_graph_retrieval` — per-budget rerank caps and the
+# per-bank stage toggles), which recall_async resolves and passes down rather than accepts.
+# (At v0.8.6 the disambiguator was the preceding `max_source_facts_tokens_per_observation`
+# line; upstream's new parameters are a stronger one.)
 apply(ME, (
     "        max_source_facts_tokens_per_observation: int = -1,\n"
     "        reranking: RecallReranking = \"cross_encoder\",\n"
+    "        reranker_max_candidates: int | None = None,\n"
+    "        enable_temporal_retrieval: bool = True,\n"
+    "        enable_graph_retrieval: bool = True,\n"
     "    ) -> RecallResultModel:\n"
 ), (
     "        max_source_facts_tokens_per_observation: int = -1,\n"
     "        reranking: RecallReranking = \"cross_encoder\",\n"
+    "        reranker_max_candidates: int | None = None,\n"
+    "        enable_temporal_retrieval: bool = True,\n"
+    "        enable_graph_retrieval: bool = True,\n"
     "        # switchroom #4212: mirrors recall_async's admission `_background` so the\n"
     "        # rerank priority class is derived as (_background OR internal), keeping the\n"
     "        # DB-admission and reranker-pool priority signals from silently diverging.\n"
@@ -4948,10 +5003,16 @@ apply(ME, (
 apply(ME, (
     "                            max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,\n"
     "                            reranking=reranking,\n"
+    "                            reranker_max_candidates=reranker_max_candidates,\n"
+    "                            enable_temporal_retrieval=enable_temporal_retrieval,\n"
+    "                            enable_graph_retrieval=enable_graph_retrieval,\n"
     "                        )\n"
 ), (
     "                            max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,\n"
     "                            reranking=reranking,\n"
+    "                            reranker_max_candidates=reranker_max_candidates,\n"
+    "                            enable_temporal_retrieval=enable_temporal_retrieval,\n"
+    "                            enable_graph_retrieval=enable_graph_retrieval,\n"
     "                            _background=_background,  # switchroom #4212\n"
     "                        )\n"
 ), count=1)
@@ -4981,8 +5042,11 @@ apply(ME, (
 # ---- post-conditions: full surface present, parses, switchroom-local mods survive ----
 ce = pathlib.Path(CE).read_text()
 assert "class _PriorityRerankExecutor:" in ce, "switchroom #3142: executor class missing post-patch"
-assert ce.count("*, background: bool = False) -> list[float]:") == 14, "switchroom #3142: predict-sig count drift"
+assert ce.count("*, background: bool = False) -> list[float]:") == 15, "switchroom #3142: predict-sig count drift"
 assert "LocalSTCrossEncoder._get_executor().submit(self._predict_sync, pairs, background=background)" in ce, "switchroom #3142: local predict body not rewired"
+# v0.9.0 failover chain: the flag must reach the member, not stop at MultiCrossEncoder.
+assert "scores = await member.predict(pairs, background=background)" in ce, "switchroom #3142: MultiCrossEncoder drops `background` on the way to its members"
+assert ce.count("await member.predict(pairs)") == 0, "switchroom #3142: an unforwarded MultiCrossEncoder member call survives"
 # switchroom #4213: the reranker-pool teardown classmethod must exist for close() to wire.
 assert "def shutdown_executor(cls, wait: bool = True) -> None:" in ce, "switchroom #4213: shutdown_executor classmethod missing after patch"
 ast.parse(ce)
@@ -5009,7 +5073,8 @@ assert "await asyncio.to_thread(LocalSTCrossEncoder.shutdown_executor)" in me, "
 assert "_background_search_semaphore" in me, "switchroom recall-admission-split mod lost — patch ordering broke"
 ast.parse(me)
 print("switchroom #3142: reranker foreground-priority lane baked "
-      "(14 predict sigs, _PriorityRerankExecutor, rerank + call-site background flag); "
+      "(15 predict sigs incl. MultiCrossEncoder, forwarded through the failover chain, "
+      "_PriorityRerankExecutor, rerank + call-site background flag); "
       "#4212 dual-signal reconciliation (rerank = _background OR internal, threaded + guarded); "
       "#4213 shutdown_executor wired into close(); "
       "_background_search_semaphore + CE-saturation mods preserved")
@@ -5416,198 +5481,61 @@ print(
 )
 PYEOF
 
-# --- switchroom: pin temporal dateparser to a configurable language set ---
+# --- RETIRED (v0.9.0): switchroom #4313 dateparser language pin ---
 #
-# dateparser.search_dates() with NO `languages=` auto-detects across 200+
-# locales on EVERY recall. That auto-detection runs INLINE on the single shared
-# asyncio loop (recall + consolidation + reranker all share one process), and
-# under consolidation recall fan-out it blocked the loop for 1-2.6s at a time —
-# the loop watchdog logged 128 `EVENT LOOP BLOCKED >=1s` events in 20 minutes,
-# with dateparser's per-locale language-split frames
-# (dateparser/languages/locale.py:_split, dictionary.py:_split_by_known_words /
-# _should_capture) appearing 1383x in the blocked stacks.
+# This position used to hold a RUN block that added a
+# HINDSIGHT_API_TEMPORAL_LANGUAGES knob to config.py and pinned `languages=` on
+# both `search_dates` call sites in engine/query_analyzer.py, because upstream
+# ran dateparser with NO `languages=`, auto-detecting across 200+ locales inline
+# on the single shared asyncio loop (measured in this image's venv: 99.8 ms/call
+# auto-detect vs 0.6 ms/call with languages=["en"], ~165x; the loop watchdog
+# logged 128 `EVENT LOOP BLOCKED >=1s` events in 20 minutes).
 #
-# Pinning `languages=` to a fixed list eliminates the auto-detection pass
-# entirely — those language-split frames stop executing by construction, not
-# merely run faster. Measured in this image's venv on a representative recall
-# query: auto-detect 99.8 ms/call vs languages=["en"] 0.6 ms/call (~165x).
+# Upstream #3154 (merged 2026-08-05, in v0.9.0) implements the same idea
+# natively: `DateparserQueryAnalyzer(languages=...)`, a shared `_search_kwargs()`
+# helper used by BOTH `load()` and `analyze()`, and the config knob
+# HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES (config.py ENV_QUERY_ANALYZER_LANGUAGES,
+# consumed at memory_engine.py `DateparserQueryAnalyzer(languages=config.
+# query_analyzer_languages)`). Carrying our block on top would be a duplicate
+# implementation of upstream behaviour, so it is DELETED, not disabled.
 #
-# The list is a real config.py knob, HINDSIGHT_API_TEMPORAL_LANGUAGES
-# (comma-separated, default "en"), so the fleet runs English-only by default and
-# future i18n is a pure config change with no image edit. The default is baked
-# here in config.py; the knob is exposed to operators as an override-only key in
-# src/setup/hindsight-perf-defaults.ts (HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS).
+# THE ONE THING THAT MUST NOT BE LOST WITH IT: upstream's default is `None` —
+# i.e. the 200+-locale auto-detect, the slow path our patch existed to kill.
+# The pin now lives in switchroom's env emitter, as an ALWAYS-ON default:
+# `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES=en` in HINDSIGHT_PERF_DEFAULTS_UNGATED
+# (src/setup/hindsight-perf-defaults.ts), NOT an override-only key — an
+# override-only key emits nothing unless an operator writes yaml, which would
+# silently reinstate the 165x regression. tests/setup/hindsight-perf-defaults.test.ts
+# asserts the key is in the always-emitted set.
 #
-# Self-verifying; guarded structurally by
-# tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
-# unpatched upstream / GREEN patched) by
-# tests/docker/hindsight-temporal-language-patch.test.ts.
-RUN python3 - <<'PYEOF'
-import ast
-import pathlib
-
-BASE = pathlib.Path("/app/api/hindsight_api")
-
-
-def apply(rel, edits):
-    f = BASE / rel
-    s = f.read_text()
-    for anchor, repl in edits:
-        n = s.count(anchor)
-        assert n == 1, (
-            f"switchroom hindsight temporal-language patch: anchor found {n}x "
-            f"(expected 1) in {rel} — upstream reformatted; re-author this patch in "
-            f"docker/Dockerfile.hindsight. Anchor head: {anchor.splitlines()[0]!r}"
-        )
-        s = s.replace(anchor, repl, 1)
-    f.write_text(s)
-    return s
-
-
-# ---- 1. config.py: the HINDSIGHT_API_TEMPORAL_LANGUAGES knob (default "en") ----
-cfg = apply("config.py", [
-    (
-        'ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"\n',
-        'ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY = "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY"\n'
-        "# switchroom: languages dateparser.search_dates() is restricted to during temporal\n"
-        '# query analysis. Comma-separated; default "en". Pinning this eliminates the\n'
-        "# 200+-locale auto-detection pass that blocked the shared asyncio loop.\n"
-        'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"\n',
-    ),
-    (
-        "DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1\n",
-        "DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1\n"
-        "# switchroom: English-only by default (the fleet is English); operators restore\n"
-        '# i18n with e.g. HINDSIGHT_API_TEMPORAL_LANGUAGES="en,es".\n'
-        'DEFAULT_TEMPORAL_LANGUAGES = "en"\n',
-    ),
-    (
-        "    temporal_semantic_min_similarity: float\n",
-        "    temporal_semantic_min_similarity: float\n"
-        "    temporal_languages: list[str]  # switchroom: dateparser language pin (default ['en'])\n",
-    ),
-    (
-        "            temporal_semantic_min_similarity=float(\n"
-        "                os.getenv(ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY))\n"
-        "            ),\n",
-        "            temporal_semantic_min_similarity=float(\n"
-        "                os.getenv(ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY))\n"
-        "            ),\n"
-        "            # switchroom: CSV -> stripped non-empty list; falls back to ['en'] if it\n"
-        "            # resolves empty, so the loop-starving no-languages call is unreachable.\n"
-        "            temporal_languages=_parse_str_list(\n"
-        "                os.getenv(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES)\n"
-        '            ) or ["en"],\n',
-    ),
-])
-
-# ---- 2. query_analyzer.py: pin languages= on BOTH search_dates call sites ----
-qa = apply("engine/query_analyzer.py", [
-    (
-        "logger = logging.getLogger(__name__)\n",
-        "logger = logging.getLogger(__name__)\n"
-        "\n"
-        "\n"
-        "def _resolve_temporal_languages() -> list[str]:\n"
-        '    """switchroom: the dateparser language pin, read from config (default ["en"]).\n'
-        "\n"
-        "    Read from HindsightConfig.temporal_languages, itself parsed from\n"
-        "    HINDSIGHT_API_TEMPORAL_LANGUAGES. Defensive: if config is not yet loaded\n"
-        "    (e.g. the analyzer is constructed in isolation), fall back to English so a\n"
-        "    bare search_dates(query) with no languages= -- the 200+-locale auto-detect\n"
-        "    that starves the shared asyncio loop -- can never be reached.\n"
-        '    """\n'
-        "    try:\n"
-        "        from hindsight_api.config import get_config\n"
-        "\n"
-        "        langs = [str(x).strip() for x in (get_config().temporal_languages or []) if str(x).strip()]\n"
-        "        if langs:\n"
-        "            return langs\n"
-        "    except Exception:\n"
-        "        pass\n"
-        '    return ["en"]\n',
-    ),
-    (
-        "    def __init__(self):\n"
-        '        """Initialize dateparser query analyzer."""\n'
-        "        self._search_dates = None\n",
-        "    def __init__(self):\n"
-        '        """Initialize dateparser query analyzer."""\n'
-        "        self._search_dates = None\n"
-        "        # switchroom: restrict dateparser to these languages on every call so it\n"
-        "        # never runs the 200+-locale auto-detection pass inline on the loop.\n"
-        "        self._languages = _resolve_temporal_languages()\n",
-    ),
-    (
-        "            self._search_dates = search_dates\n"
-        "            # Warm up: fire a dummy call to trigger lazy-loaded internal tables.\n"
-        '            self._search_dates("today")\n',
-        "            self._search_dates = search_dates\n"
-        "            # Warm up: fire a dummy call to trigger lazy-loaded internal tables.\n"
-        '            self._search_dates("today", languages=self._languages)\n',
-    ),
-    (
-        "            results = self._search_dates(query, settings=settings)\n",
-        "            results = self._search_dates(query, settings=settings, languages=self._languages)\n",
-    ),
-])
-
-# ---- verification ----
-# The knob is wired end to end: env name, default, dataclass field, and the
-# from_env parse that turns the CSV into a list with an ["en"] floor.
-assert 'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"' in cfg, (
-    "switchroom hindsight temporal-language patch: ENV name missing after patch"
-)
-assert 'DEFAULT_TEMPORAL_LANGUAGES = "en"' in cfg, (
-    "switchroom hindsight temporal-language patch: default missing after patch"
-)
-assert "    temporal_languages: list[str]" in cfg, (
-    "switchroom hindsight temporal-language patch: dataclass field missing after patch"
-)
-assert "temporal_languages=_parse_str_list(" in cfg, (
-    "switchroom hindsight temporal-language patch: from_env wiring missing after patch"
-)
-# Neither search_dates call may remain WITHOUT languages=. This is the assertion
-# that would RED if the pin were reverted -- the whole point of the patch.
-assert qa.count("self._search_dates(query, settings=settings)") == 0, (
-    "switchroom hindsight temporal-language patch: analyze() still calls search_dates "
-    "WITHOUT languages= -- the loop-starving auto-detection pass survives"
-)
-assert "self._search_dates(query, settings=settings, languages=self._languages)" in qa, (
-    "switchroom hindsight temporal-language patch: analyze() search_dates is not pinned"
-)
-assert 'self._search_dates("today")' not in qa, (
-    "switchroom hindsight temporal-language patch: load() warm-up still auto-detects"
-)
-assert 'self._search_dates("today", languages=self._languages)' in qa, (
-    "switchroom hindsight temporal-language patch: load() warm-up is not pinned"
-)
-assert "self._languages = _resolve_temporal_languages()" in qa, (
-    "switchroom hindsight temporal-language patch: analyzer does not resolve its language pin"
-)
-ast.parse(cfg)
-ast.parse(qa)
-print(
-    "switchroom hindsight temporal-language patch: dateparser pinned to "
-    "HINDSIGHT_API_TEMPORAL_LANGUAGES (default en) on both search_dates call sites; "
-    "the 200+-locale auto-detection pass that starved the shared asyncio loop is gone"
-)
-PYEOF
+# Residual, deliberately accepted: engine/search/temporal_extraction.py's lazy
+# module-level fallback `get_default_analyzer()` still constructs
+# `DateparserQueryAnalyzer()` with no languages. It is unreachable on the recall
+# path — the only caller, retrieval.py, always passes `analyzer=query_analyzer`,
+# which memory_engine builds from config — and the temporal-offload block below
+# asserts that call site keeps passing an explicit analyzer, so a future upstream
+# change that starts relying on the unlanguaged fallback fails the build.
 
 # --- switchroom: run temporal extraction off the event loop and bound its input ---
 #
-# The #4313 language pin above cut dateparser's PER-LOCALE cost, but it cannot
-# bound the PER-CALL cost on unbounded input. `dateparser.search_dates()` is
-# synchronous, pure-Python CPU work whose cost is linear in input length x date
-# density, and it ran INLINE on the single shared asyncio loop:
+# Upstream's own locale pin (#3154, `HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES`,
+# which switchroom sets to `en` — see the RETIRED block above) cuts dateparser's
+# PER-LOCALE cost, but it cannot bound the PER-CALL cost on unbounded input.
+# `dateparser.search_dates()` is synchronous, pure-Python CPU work whose cost is
+# linear in input length x date density, and it runs INLINE on the single shared
+# asyncio loop:
 #
-#   retrieval.py retrieve_all_fact_types_parallel() (an async def) called
+#   retrieval.py retrieve_all_fact_types_parallel() (an async def) calls
 #   extract_temporal_constraint() -> temporal_extraction.py ->
 #   query_analyzer.py analyze() -> search_dates(...) synchronously, BEFORE any
 #   await. The consolidation caller (consolidator.py, query=m["text"]) passes
 #   full multi-KB memory text, so one extraction blocked recall + consolidation
 #   + reranker together for seconds: 186 `EVENT LOOP BLOCKED` events in 4.5h,
 #   p50 1.36s, max 14.95s (measured: 16KB date-dense text ~988ms).
+#
+# Still absent at v0.9.0: `temporal_extraction.py` is byte-identical between
+# v0.8.6 and v0.9.0, and upstream's #3154 touched only the locale set, so the
+# off-loop offload and the input cap remain ours.
 #
 # This patch does two things:
 #
@@ -5623,16 +5551,26 @@ PYEOF
 #      stall into ~5ms scheduler slices (sys.setswitchinterval granularity).
 #
 #  (b) BOUND THE INPUT. A new config knob, HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS
-#      (default 2000, 0 = unlimited), wired exactly like the #4313 language knob,
-#      truncates the query fed to search_dates in analyze(). Correctness: the
-#      temporal constraint gates only ONE of four retrieval arms
-#      (retrieve_temporal_combined); semantic/BM25/graph see the full query.
-#      Live recall-hook queries are short and never hit the cap; only multi-KB
-#      consolidation queries lose date matches past char 2000.
+#      (default 2000, 0 = unlimited), truncates the query fed to search_dates in
+#      analyze(). Correctness: the temporal constraint gates only ONE of four
+#      retrieval arms (retrieve_temporal_combined); semantic/BM25/graph see the
+#      full query. Live recall-hook queries are short and never hit the cap; only
+#      multi-KB consolidation queries lose date matches past char 2000.
 #
-# The #4313 language pin (`languages=self._languages` on the search_dates call)
-# MUST survive this patch -- a verification assert below pins it. Runs AFTER the
-# #4313 block, so its anchors are the post-#4313 file state.
+# v0.9.0 RE-AUTHORING NOTES (this block was rewritten for the 0.8.6->0.9.0 bump):
+#  * The config knob is now anchored on upstream's ENV_QUERY_ANALYZER_LANGUAGES /
+#    `query_analyzer_languages` rather than on our own retired
+#    HINDSIGHT_API_TEMPORAL_LANGUAGES, so it sits beside the locale knob it
+#    complements.
+#  * analyze() now calls `self._search_dates(query, settings=settings,
+#    **self._search_kwargs())` (upstream #3154). The truncation is spliced in
+#    front of that call and the `**self._search_kwargs()` forwarding is asserted
+#    to SURVIVE — losing it would silently restore the 200+-locale auto-detect.
+#  * retrieval.py's call site moved inside upstream's new
+#    `if enable_temporal_retrieval:` block and is now multi-line. The `analyzer=
+#    query_analyzer` argument is asserted to survive too: that is what keeps the
+#    unlanguaged `get_default_analyzer()` fallback (temporal_extraction.py) off
+#    the recall path.
 #
 # Self-verifying; guarded structurally by
 # tests/docker/dockerfile-hindsight-bakes.test.ts and behaviourally (RED against
@@ -5661,35 +5599,41 @@ def apply(rel, edits):
 
 
 # ---- 1. config.py: the HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS knob (default 2000) ----
+# Anchored on upstream's query-analyzer locale knob (#3154) so our per-call cap
+# lives next to the per-locale one it complements.
 cfg = apply("config.py", [
     (
-        'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"\n',
-        'ENV_TEMPORAL_LANGUAGES = "HINDSIGHT_API_TEMPORAL_LANGUAGES"\n'
+        'ENV_QUERY_ANALYZER_LANGUAGES = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES"\n',
+        'ENV_QUERY_ANALYZER_LANGUAGES = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES"\n'
         "# switchroom: max chars of query text fed to dateparser.search_dates()\n"
         "# during temporal analysis (0 = unlimited). Bounds the per-call cost of\n"
         "# the (now off-loop) extraction on multi-KB consolidation queries.\n"
         'ENV_TEMPORAL_MAX_QUERY_CHARS = "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS"\n',
     ),
     (
-        'DEFAULT_TEMPORAL_LANGUAGES = "en"\n',
-        'DEFAULT_TEMPORAL_LANGUAGES = "en"\n'
+        "DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1\n",
+        "DEFAULT_TEMPORAL_SEMANTIC_MIN_SIMILARITY = 0.1\n"
         "# switchroom: 2000 chars is far above any live recall-hook query yet well\n"
         "# below the multi-KB consolidation text that made search_dates block for\n"
         "# seconds. 0 disables the cap (full-scan).\n"
         "DEFAULT_TEMPORAL_MAX_QUERY_CHARS = 2000\n",
     ),
     (
-        "    temporal_languages: list[str]  # switchroom: dateparser language pin (default ['en'])\n",
-        "    temporal_languages: list[str]  # switchroom: dateparser language pin (default ['en'])\n"
+        "    query_analyzer_languages: list[str] | None\n",
+        "    query_analyzer_languages: list[str] | None\n"
         "    temporal_max_query_chars: int  # switchroom: cap on search_dates input (0 = unlimited)\n",
     ),
     (
-        "            temporal_languages=_parse_str_list(\n"
-        "                os.getenv(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES)\n"
-        '            ) or ["en"],\n',
-        "            temporal_languages=_parse_str_list(\n"
-        "                os.getenv(ENV_TEMPORAL_LANGUAGES, DEFAULT_TEMPORAL_LANGUAGES)\n"
-        '            ) or ["en"],\n'
+        "            query_analyzer_languages=(\n"
+        '                [code.strip().lower() for code in raw.split(",") if code.strip()] or None\n'
+        '                if (raw := os.getenv(ENV_QUERY_ANALYZER_LANGUAGES, "").strip())\n'
+        "                else None\n"
+        "            ),\n",
+        "            query_analyzer_languages=(\n"
+        '                [code.strip().lower() for code in raw.split(",") if code.strip()] or None\n'
+        '                if (raw := os.getenv(ENV_QUERY_ANALYZER_LANGUAGES, "").strip())\n'
+        "                else None\n"
+        "            ),\n"
         "            # switchroom: non-negative int (0 = unlimited); reuses upstream's\n"
         "            # fail-fast parser so a malformed value stops boot rather than\n"
         "            # silently disabling the cap.\n"
@@ -5704,18 +5648,7 @@ cfg = apply("config.py", [
 # ---- 2. query_analyzer.py: resolve the cap and truncate the search_dates input ----
 qa = apply("engine/query_analyzer.py", [
     (
-        "        if langs:\n"
-        "            return langs\n"
-        "    except Exception:\n"
-        "        pass\n"
-        '    return ["en"]\n',
-        "        if langs:\n"
-        "            return langs\n"
-        "    except Exception:\n"
-        "        pass\n"
-        '    return ["en"]\n'
-        "\n"
-        "\n"
+        "class DateparserQueryAnalyzer(QueryAnalyzer):\n",
         "def _resolve_temporal_max_query_chars() -> int:\n"
         '    """switchroom: max chars fed to dateparser.search_dates (0 = unlimited).\n'
         "\n"
@@ -5733,17 +5666,22 @@ qa = apply("engine/query_analyzer.py", [
         "            return n\n"
         "    except Exception:\n"
         "        pass\n"
-        "    return 2000\n",
+        "    return 2000\n"
+        "\n"
+        "\n"
+        "class DateparserQueryAnalyzer(QueryAnalyzer):\n",
     ),
     (
-        "        self._languages = _resolve_temporal_languages()\n",
-        "        self._languages = _resolve_temporal_languages()\n"
+        "        self._search_dates = None\n"
+        "        self._languages = languages\n",
+        "        self._search_dates = None\n"
+        "        self._languages = languages\n"
         "        # switchroom: cap the chars handed to dateparser.search_dates (0 = off).\n"
         "        self._max_query_chars = _resolve_temporal_max_query_chars()\n",
     ),
     (
         "        try:\n"
-        "            results = self._search_dates(query, settings=settings, languages=self._languages)\n",
+        "            results = self._search_dates(query, settings=settings, **self._search_kwargs())\n",
         "        # switchroom: bound the text handed to dateparser.search_dates. Its cost\n"
         "        # is linear in input length x date density; a multi-KB consolidation query\n"
         "        # could otherwise block the (now off-loop) worker for seconds. Live recall\n"
@@ -5755,7 +5693,7 @@ qa = apply("engine/query_analyzer.py", [
         "            search_query = search_query[: self._max_query_chars]\n"
         "\n"
         "        try:\n"
-        "            results = self._search_dates(search_query, settings=settings, languages=self._languages)\n",
+        "            results = self._search_dates(search_query, settings=settings, **self._search_kwargs())\n",
     ),
 ])
 
@@ -5833,14 +5771,22 @@ te = apply("engine/search/temporal_extraction.py", [
 ])
 
 # ---- 4. retrieval.py: await the off-loop wrapper at the single async call site ----
+# v0.9.0 moved this into an `if enable_temporal_retrieval:` block and wrapped the
+# call across lines; the anchor below is that exact post-#3153 shape.
 rt = apply("engine/search/retrieval.py", [
     (
-        "    from .temporal_extraction import extract_temporal_constraint\n",
-        "    from .temporal_extraction import extract_temporal_constraint_async\n",
-    ),
-    (
-        "    temporal_constraint = extract_temporal_constraint(query_text, reference_date=question_date, analyzer=query_analyzer)\n",
-        "    temporal_constraint = await extract_temporal_constraint_async(query_text, reference_date=question_date, analyzer=query_analyzer)\n",
+        "    if enable_temporal_retrieval:\n"
+        "        from .temporal_extraction import extract_temporal_constraint\n"
+        "\n"
+        "        temporal_constraint = extract_temporal_constraint(\n"
+        "            query_text, reference_date=question_date, analyzer=query_analyzer\n"
+        "        )\n",
+        "    if enable_temporal_retrieval:\n"
+        "        from .temporal_extraction import extract_temporal_constraint_async\n"
+        "\n"
+        "        temporal_constraint = await extract_temporal_constraint_async(\n"
+        "            query_text, reference_date=question_date, analyzer=query_analyzer\n"
+        "        )\n",
     ),
 ])
 
@@ -5858,6 +5804,19 @@ assert "    temporal_max_query_chars: int" in cfg, (
 assert "temporal_max_query_chars=_parse_non_negative_int(" in cfg, (
     "switchroom hindsight temporal-offload patch: from_env wiring missing after patch"
 )
+# Upstream's own locale knob (#3154) is what replaced our retired language-pin
+# block. It must still be present and wired: switchroom emits
+# HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES=en against it, and losing it silently
+# restores the 200+-locale auto-detect (measured ~165x slower per call).
+assert 'ENV_QUERY_ANALYZER_LANGUAGES = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES"' in cfg, (
+    "switchroom hindsight temporal-offload patch: upstream #3154 locale knob "
+    "ENV_QUERY_ANALYZER_LANGUAGES is gone — switchroom's emitted "
+    "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES=en would be silently ignored"
+)
+assert "query_analyzer_languages=(" in cfg, (
+    "switchroom hindsight temporal-offload patch: upstream #3154 locale knob is no "
+    "longer parsed in from_env"
+)
 
 # (b) analyzer resolves the cap and truncates BEFORE search_dates.
 assert "def _resolve_temporal_max_query_chars() -> int:" in qa, (
@@ -5871,14 +5830,22 @@ assert "search_query = search_query[: self._max_query_chars]" in qa, (
 )
 # The RED guard: the untruncated call must be GONE from analyze() — this is what
 # would fail if the cap were not actually wired into the search_dates call.
-assert qa.count("self._search_dates(query, settings=settings, languages=self._languages)") == 0, (
+assert qa.count("self._search_dates(query, settings=settings, **self._search_kwargs())") == 0, (
     "switchroom hindsight temporal-offload patch: analyze() still passes the FULL "
     "query to search_dates — the char cap is not wired in"
 )
-# …and the #4313 language pin MUST survive: the truncated call still carries it.
-assert "self._search_dates(search_query, settings=settings, languages=self._languages)" in qa, (
-    "switchroom hindsight temporal-offload patch: #4313 language pin lost — the "
-    "search_dates call no longer carries languages=self._languages"
+# …and upstream's locale forwarding MUST survive: the truncated call still spreads
+# _search_kwargs(), which is what carries `languages=` when
+# HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES is set.
+assert "self._search_dates(search_query, settings=settings, **self._search_kwargs())" in qa, (
+    "switchroom hindsight temporal-offload patch: #3154 locale forwarding lost — the "
+    "search_dates call no longer spreads **self._search_kwargs()"
+)
+# Both call sites must agree on the locale set (upstream's own invariant): the
+# load() warm-up spreads the same kwargs and this patch does not touch it.
+assert 'self._search_dates("today", **self._search_kwargs())' in qa, (
+    "switchroom hindsight temporal-offload patch: load() warm-up no longer spreads "
+    "_search_kwargs() — warm-up and analyze() would use different locale sets"
 )
 
 # (c) off-loop machinery present.
@@ -5898,12 +5865,23 @@ assert "def extract_temporal_constraint(" in te, (
 
 # (d) the single async call site now awaits the off-loop wrapper; the inline
 # sync call must be GONE (the RED guard for the off-loop change).
-assert "await extract_temporal_constraint_async(query_text" in rt, (
+assert "await extract_temporal_constraint_async(\n            query_text" in rt, (
     "switchroom hindsight temporal-offload patch: retrieval call site not awaited off-loop"
 )
-assert rt.count("temporal_constraint = extract_temporal_constraint(query_text") == 0, (
+assert rt.count("temporal_constraint = extract_temporal_constraint(") == 0, (
     "switchroom hindsight temporal-offload patch: retrieval still calls extract_temporal_constraint "
     "synchronously on the loop"
+)
+# The recall path must keep passing an EXPLICIT analyzer. memory_engine builds it
+# as DateparserQueryAnalyzer(languages=config.query_analyzer_languages); the
+# module-level fallback in temporal_extraction.py (get_default_analyzer ->
+# DateparserQueryAnalyzer() with no languages) is the 200+-locale slow path. If
+# upstream ever drops this argument, that fallback becomes reachable and the
+# switchroom locale pin stops applying on recall — fail the build instead.
+assert "analyzer=query_analyzer" in rt, (
+    "switchroom hindsight temporal-offload patch: retrieval no longer passes an explicit "
+    "analyzer — the unlanguaged get_default_analyzer() fallback would become reachable "
+    "and HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES would stop applying on the recall path"
 )
 
 ast.parse(cfg)
@@ -5913,8 +5891,8 @@ ast.parse(rt)
 print(
     "switchroom hindsight temporal-offload patch: temporal extraction runs on a "
     "single-worker ThreadPoolExecutor off the shared asyncio loop, its input bounded "
-    "by HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS (default 2000); the #4313 language pin "
-    "is preserved"
+    "by HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS (default 2000); upstream #3154's "
+    "_search_kwargs() locale forwarding and the explicit recall-path analyzer are preserved"
 )
 PYEOF
 

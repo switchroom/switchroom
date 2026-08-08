@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { HINDSIGHT_MIN_API_VERSION } from "../src/memory/hindsight-tools.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -42,6 +43,16 @@ function snapshotAdvertised(): AdvertisedTool[] {
   ) as { tools: Record<string, { required: string[] }> };
   return Object.entries(snap.tools).map(([name, s]) => ({ name, required: s.required }));
 }
+
+/**
+ * A version strictly NEWER than the contract floor, derived by bumping the
+ * minor. Hardcoding one is how the skew tests below silently inverted at the
+ * last bump; derivation makes them survive the next one.
+ */
+const NEWER_THAN_CONTRACT = (() => {
+  const [maj, min] = HINDSIGHT_MIN_API_VERSION.split(".").map(Number);
+  return `${maj}.${min + 1}.0`;
+})();
 
 describe("classifyToolContract — live contract-drift detector", () => {
   it("ALL OK against the real server surface (no drift today)", () => {
@@ -701,16 +712,26 @@ describe("hindsight version skew", () => {
   });
 
   it("WARNS on a server newer than the contract — a capability nobody can see", () => {
-    const r = classifyHindsightVersionSkew("0.9.0");
+    // DERIVED from the contract floor, not written down: this test used to name
+    // a literal ("0.9.0" against a 0.8.6 floor) and inverted its own meaning the
+    // moment the floor caught up to it — it asserted "newer" while feeding an
+    // EQUAL version. Bumping the minor keeps it strictly newer forever.
+    const newer = NEWER_THAN_CONTRACT;
+    const r = classifyHindsightVersionSkew(newer);
     expect(r?.status).toBe("warn");
-    expect(r?.detail).toContain("0.9.0");
+    expect(r?.detail).toContain(newer);
     // The fix must name what to re-capture, not just complain.
     expect(r?.fix).toContain("hindsight-tools-list.snapshot.json");
   });
 
-  it("orders numerically, so 0.8.10 is NEWER than a 0.8.9 contract (not older)", () => {
-    // Guards the lexical-compare bug: "0.8.10" < "0.8.9" as strings.
-    expect(classifyHindsightVersionSkew("0.8.10")?.status).not.toBe("fail");
+  it("orders numerically, so a higher minor is NEWER than the contract (not older)", () => {
+    // Guards the lexical-compare bug: with a 0.9.0 contract, "0.10.0" < "0.9.0"
+    // as strings, so a string compare would call the newer server OLDER and
+    // hard-fail doctor against an image the operator just rolled forward to.
+    expect(classifyHindsightVersionSkew(NEWER_THAN_CONTRACT)?.status).not.toBe("fail");
+    // Same trap one level down, which is what the 0.8.10-vs-0.8.9 form caught.
+    const [maj, min] = HINDSIGHT_MIN_API_VERSION.split(".");
+    expect(classifyHindsightVersionSkew(`${maj}.${min}.10`)?.status).not.toBe("fail");
   });
 
   it("emits NO row when the version probe fails — /health already owns the outage", () => {

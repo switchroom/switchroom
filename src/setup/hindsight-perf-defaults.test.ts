@@ -195,6 +195,7 @@ describe("hindsightPerfEnv — capability gating", () => {
       "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS",
       "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
       "HINDSIGHT_API_TEXT_SEARCH_EXTENSION",
+      "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES",
     ];
     expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toEqual(UNGATED);
     for (const caps of [
@@ -354,7 +355,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these fifty-six keys, by name", () => {
+  it("is overridable on exactly these sixty-four keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -369,11 +370,18 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
       // The ONNX embeddings provider cutover — override-only, no shipped
       // default. The two _PREFIX keys are also empty-string-legal.
+      // Plus the v0.9.0 reach-only knobs (reranker caps, embeddings input
+      // ceiling, entity trgm floor, per-stage enable switches).
+      "HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS",
       "HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID",
       "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX",
       "HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING",
       "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX",
       "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
+      "HINDSIGHT_API_ENABLE_GRAPH_RETRIEVAL",
+      "HINDSIGHT_API_ENABLE_RERANKING",
+      "HINDSIGHT_API_ENABLE_TEMPORAL_RETRIEVAL",
+      "HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD",
       "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
@@ -384,6 +392,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_LLM_SUPPORTS_MAX_ITEMS",
       "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
+      "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
       "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
       "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
@@ -395,10 +404,12 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RERANKER_LOCAL_FP16",
       "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT",
       "HINDSIGHT_API_RERANKER_MAX_CANDIDATES",
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_HIGH",
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_LOW",
+      "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_MID",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
-      "HINDSIGHT_API_TEMPORAL_LANGUAGES",
       "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
       "HINDSIGHT_API_TEXT_SEARCH_EXTENSION",
       "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
@@ -1010,9 +1021,9 @@ describe("HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT (override-only)", ()
   });
 });
 
-// ── the temporal-language pin ─────────────────────────────────────────────
-describe("HINDSIGHT_API_TEMPORAL_LANGUAGES (override-only, i18n restore hatch)", () => {
-  const KEY = "HINDSIGHT_API_TEMPORAL_LANGUAGES";
+// ── the query-analyzer language pin ───────────────────────────────────────
+describe("HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES (ALWAYS-ON default)", () => {
+  const KEY = "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES";
   const CAPS = [
     { gpu: false, localLlm: false },
     { gpu: true, localLlm: false },
@@ -1020,61 +1031,60 @@ describe("HINDSIGHT_API_TEMPORAL_LANGUAGES (override-only, i18n restore hatch)",
     { gpu: true, localLlm: true },
   ];
 
-  it("is in the managed set but in NO defaults group", () => {
-    // switchroom's temporal-language image patch pins dateparser to this list
-    // (default "en", baked in config.py) to end the 200+-locale auto-detection
-    // pass that blocked the shared asyncio loop. Managed so an operator's
-    // hindsight.env line restoring i18n is not silently dropped by
-    // resolveHindsightPerfOverrides; override-only because the default lives in
-    // the image, so emitting one here would only create a second copy to drift.
+  it("is an UNGATED default, not an override-only key", () => {
+    // The whole point of the v0.9.0 disposition. Upstream #3154 replaced
+    // switchroom's in-image language pin with a native knob whose default is
+    // None = auto-detect across 200+ locales inline on the shared asyncio loop
+    // (~165x slower per call, measured). Nothing in the image pins it any more,
+    // so an override-only entry — emitted ONLY when an operator writes yaml —
+    // would leave every stock fleet on the slow path.
+    expect(HINDSIGHT_PERF_DEFAULTS_UNGATED.map(([k]) => k)).toContain(KEY);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(false);
     expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(true);
-    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(true);
-    for (const group of [
-      HINDSIGHT_PERF_DEFAULTS_UNGATED,
-      HINDSIGHT_PERF_DEFAULTS_GPU,
-      HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
-    ]) {
-      expect(group.map(([k]) => k)).not.toContain(KEY);
-    }
-  });
-
-  it("survives resolveHindsightPerfOverrides from BOTH sources", () => {
-    expect(resolveHindsightPerfOverrides({ [KEY]: "en,es" }).get(KEY)).toBe("en,es");
-    expect(resolveHindsightPerfOverrides(undefined, { [KEY]: "en,es" }).get(KEY)).toBe("en,es");
   });
 
   it.each(CAPS)(
-    "is NOT emitted when unset (gpu=$gpu localLlm=$localLlm) — the image's baked English default stands",
+    "is emitted as `en` on every host (gpu=$gpu localLlm=$localLlm)",
     (caps) => {
-      // Override-only means REACHABLE, not changed: a host that sets nothing
-      // keeps the image's baked default "en". Emitting a value here would pin
-      // every install to switchroom's copy of that opinion.
-      expect(hindsightPerfEnv(caps).map(([k]) => k)).not.toContain(KEY);
+      expect(hindsightPerfEnv(caps)).toContainEqual([KEY, "en"]);
     },
   );
 
-  it("reaches BOTH launch paths, with the operator's value, when set in hindsight.env", () => {
-    // The outcome that matters: an operator re-enabling i18n from declarative
-    // yaml must actually reach the container. Before the key entered the managed
-    // set, the line read as durable config yet was dropped and the pin stayed
-    // English-only regardless.
-    const perf = { env: { [KEY]: "en,es" }, processEnv: {} };
-    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
-    const fromRun = runEnv(runArgs());
-    const fromCompose = composeEnv(
-      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
-    );
-    expect(fromRun.get(KEY)).toEqual(["en,es"]);
-    expect(fromCompose.get(KEY)).toEqual(["en,es"]);
+  it("reaches BOTH launch paths with the default when the operator sets nothing", () => {
+    // The regression this guards is silent: a dropped emission costs ~165x on
+    // the recall path with no error anywhere, so assert the value actually
+    // arrives at the container rather than merely that the pair exists.
+    startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, undefined);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["en"]);
+    expect(
+      composeEnv(
+        generateHindsightComposeSnippet(undefined, undefined, CLOUD_LITELLM, false, undefined),
+      ).get(KEY),
+    ).toEqual(["en"]);
   });
 
-  it("still reaches the container on a host with NO gated capability", () => {
-    // It belongs to no capability group, so a gate-shaped regression that only
-    // emits grouped keys would drop it. Cloud endpoint + no GPU is the harshest
-    // gating case.
+  it("lets an operator override it for i18n", () => {
+    const perf = { env: { [KEY]: "en,es" }, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    expect(runEnv(runArgs()).get(KEY)).toEqual(["en,es"]);
+  });
+});
+
+describe("HINDSIGHT_API_TEMPORAL_LANGUAGES (retired at v0.9.0)", () => {
+  const KEY = "HINDSIGHT_API_TEMPORAL_LANGUAGES";
+
+  it("is no longer managed and is never emitted", () => {
+    // switchroom's own knob, added by the #4313 image patch and superseded by
+    // upstream #3154. Nothing in the pinned image reads it. Leaving it in the
+    // allowlist would let an operator's line reach the container and do
+    // nothing, AND would stop findUnmanagedHindsightEnvKeys from flagging it —
+    // strictly worse than removing it.
+    expect(HINDSIGHT_PERF_ENV_KEYS.has(KEY)).toBe(false);
+    expect(HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(KEY)).toBe(false);
+    expect(resolveHindsightPerfOverrides({ [KEY]: "en,es" }).has(KEY)).toBe(false);
     const perf = { env: { [KEY]: "en,es" }, processEnv: {} };
     startHindsight(undefined, CLOUD_LITELLM, undefined, undefined, undefined, false, perf);
-    expect(runEnv(runArgs()).get(KEY)).toEqual(["en,es"]);
+    expect(runEnv(runArgs()).get(KEY)).toBeUndefined();
   });
 });
 

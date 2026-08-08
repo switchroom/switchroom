@@ -109,8 +109,16 @@ export interface HindsightToolSpec {
  * snapshot from the new digest. The two values no longer coincide with
  * {@link HINDSIGHT_REPAIR_MIN_API_VERSION} (still 0.8.5, where `repair-bank`
  * first shipped) — which is the separation working as designed, not drift.
+ *
+ * 2026-08-08: moved to 0.9.0 with the base bump (switchroom #4525/#4529), again
+ * alongside a re-capture of the snapshot from the new digest. The MCP surface
+ * itself did not move: `mcp_tools.py`, `api/mcp.py` and `extensions/mcp.py` are
+ * byte-identical between the v0.8.6 and v0.9.0 tags, so the re-capture is
+ * expected to change only `_meta`. That is the reassuring outcome, not a reason
+ * to skip the capture — "we assumed it was identical" is exactly how the
+ * snapshot went weeks stale last time.
  */
-export const HINDSIGHT_MIN_API_VERSION = "0.8.6";
+export const HINDSIGHT_MIN_API_VERSION = "0.9.0";
 
 /**
  * The hindsight version that first ships `hindsight-admin repair-bank`
