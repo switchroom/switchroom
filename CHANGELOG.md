@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.18 — Hindsight's pinned server moves to 0.9.0, plus the env plumbing, alarm and guidance fixes around it
+
 ### Hindsight: allow the ONNX embeddings env overrides through `memory.env`
 
 - **`resolveHindsightPerfOverrides()` now forwards the five ONNX-embeddings
