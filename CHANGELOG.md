@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **hindsight: measure consolidation per-fact tokens, 32k batch 6 to 3**
+
 ### Build: `npm ci` works again on a clean clone
 
 - **`package-lock.json` is resynced with `package.json`.** #4208 added
