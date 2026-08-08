@@ -158,7 +158,13 @@ export const HINDSIGHT_CONSOLIDATION_PROMPT_OVERHEAD_TOKENS = 2_270;
  * Production evidence that the resulting batch size of 3 is the right answer,
  * from the same 24h window: **9 `LLM failed for sub-batch of 6, splitting into
  * 3/3` events, and zero failures at any smaller sub-batch size.** Every 6 → 3/3
- * split then succeeded. Under the old constant a 32,768-token window derived
+ * split then succeeded. Corroboration from the other direction, same window:
+ * genuine (unsplit, not post-split) batches of 3 measured n = 9, max 17,160
+ * prompt tokens — which the corrected estimate for a batch of 3
+ * (2,270 + 3 × 5,000 = 17,270) bounds, where the old constant's estimate for a
+ * batch of 6 did not bound the batch-6 measurement.
+ *
+ * Under the old constant a 32,768-token window derived
  * batch 6 with an estimated worst case of 25,462 tokens, which "fit" the 26,215
  * usable band and passed preflight — while real prompts reached 31,707, so
  * `prompt + 8,192 requested completion` blew straight through the window, the

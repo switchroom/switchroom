@@ -17,7 +17,21 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
-- **hindsight: measure consolidation per-fact tokens, 32k batch 6 to 3**
+- **hindsight: measure consolidation per-fact tokens, 32k batch 6 to 3.** The
+  marginal prompt cost of a fact in a consolidation batch was 2,500 tokens,
+  back-derived as `30,000 / 12` from a whole-prompt p90 at batch 12 — a
+  derivation that charges the entire prompt, fixed overhead included, to the
+  marginal term. Measured directly against 24h of production consolidation
+  logs, unsplit batches of 6 (n=450) run to a p90 of 28,882 and a max of 31,903
+  input tokens, so the real marginal cost is ~4,939/fact and the constant was
+  low by ~1.8x. It is now 5,000. Effect: a 32,768-token backend derives batch
+  **3** instead of 6, which is the size that never failed in production (9
+  truncate-and-split events at batch 6, zero below it) — batch 6's real prompts
+  plus the 8,192-token completion overflowed the window, and llama.cpp answers
+  an overflow with HTTP 200 and conversational text rather than an error. A
+  131k or 200k window still derives the historical batch 12, so a big-window
+  operator is unaffected. The trade on a 32k backend is throughput for
+  correctness: roughly twice as many consolidation LLM calls.
 
 ### Build: `npm ci` works again on a clean clone
 

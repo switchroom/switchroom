@@ -313,6 +313,13 @@ describe("hindsight context budget — the safety band binds the retain lane too
     // Consolidation stops fitting below 13,217, which is under retain's 13,839,
     // so retain remains what decides the floor and the module docstring's
     // "smallest declared window switchroom will accept is 13,839" still holds.
+    // The 13,216 case asserts that boundary rather than only asserting the
+    // comment — without it a future constant change could push consolidation's
+    // floor ABOVE retain's and this test would still pass.
+    {
+      const b = resolveHindsightContextBudget({ provider: "litellm", context_window: 13_216 });
+      expect(b.consolidation.worstCaseTotalTokens).toBeGreaterThan(b.consolidation.usableTokens);
+    }
     for (const window of [13_217, 13_838]) {
       const b = resolveHindsightContextBudget({ provider: "litellm", context_window: window });
       expect(b.consolidation.worstCaseTotalTokens, `cons@${window}`).toBeLessThanOrEqual(
