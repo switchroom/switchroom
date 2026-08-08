@@ -103,10 +103,17 @@ export interface KnowledgeTree {
 
 /**
  * Search limit bounds, mirroring the upstream Query declaration
- * (`limit: int = Query(10, ge=1, le=50)`). Out-of-range is a 422 upstream, so
- * the value is clamped here rather than forwarded — a caller asking for 200
- * results gets the 50 the server can give, not a validation error it cannot
- * act on.
+ * (`limit: int = Query(10, ge=1, le=50)`).
+ *
+ * The clamp below is a LOWER-LAYER BACKSTOP, not the policy an agent sees.
+ * Out-of-range is a 422 upstream, so a non-shim caller of this module (a
+ * script, a future CLI subcommand) that asks for 200 gets the 50 the server
+ * can give rather than a validation error it cannot act on. The MCP shim layer
+ * does NOT rely on it: `coerceSynthesizedArg`
+ * (`src/cli/hindsight-mcp-shim.ts`) REJECTS an out-of-range `limit` before the
+ * call ever reaches here, because the bound is in the schema the model was
+ * shown and a silently-clamped `limit: 500` reads to the model as "you got 500
+ * hits" when it got 50. Two layers, two different right answers.
  */
 export const KNOWLEDGE_SEARCH_LIMIT_MIN = 1;
 export const KNOWLEDGE_SEARCH_LIMIT_MAX = 50;
@@ -138,6 +145,26 @@ export interface KnowledgeAdminOptions {
 }
 
 export const KNOWLEDGE_ADMIN_TIMEOUT_MS = 15_000;
+
+/**
+ * Accepted shape of a knowledge-node id.
+ *
+ * Matches what upstream actually mints: `create_knowledge_page` builds
+ * `f"kp-{uuid.uuid4().hex}"` and `create_knowledge_folder` the `kf-` twin
+ * (hindsight 0.9.0, `hindsight_api/engine/memory_engine.py:13477`), so
+ * `[A-Za-z0-9_-]+` covers every real id with room for a future uuid spelling
+ * that carries dashes.
+ *
+ * The reason it is enforced rather than merely documented is `.` and `..`:
+ * `encodeURIComponent("..")` is `..` verbatim, and the URL parser then
+ * collapses the segment, so `page_id: ".."` turns
+ * `.../knowledge-base/pages/..` into a GET of `.../knowledge-base/` — a
+ * different endpoint whose body would then be cast to `KnowledgePage` and
+ * handed to the agent as if it were a page. Not a bank-escape (single level,
+ * GET, own bank only), but an unintended endpoint is not something a page read
+ * should be able to reach.
+ */
+export const KNOWLEDGE_PAGE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Read-only client for one bank's knowledge base.
@@ -210,8 +237,15 @@ export class KnowledgeAdmin {
       );
     }
     const parsed = (await res.json()) as Partial<KnowledgePageSearchResponse>;
-    const results = parsed.results ?? [];
-    return { results, total: parsed.total ?? results.length };
+    // `Array.isArray`, not `?? []`. A malformed `{"results": "stringy"}` has a
+    // truthy `.length`, so a nullish-coalesce alone would sail past the
+    // empty-result check and the shim would stringify a STRING as if it were
+    // the hit list — an isError:false answer that is not hits.
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    return {
+      results,
+      total: typeof parsed.total === "number" ? parsed.total : results.length,
+    };
   }
 
   /**
@@ -223,6 +257,13 @@ export class KnowledgeAdmin {
    * instead.
    */
   async getPage(args: { page_id: string }): Promise<KnowledgePage> {
+    if (!KNOWLEDGE_PAGE_ID_PATTERN.test(args.page_id)) {
+      throw new Error(
+        `'${args.page_id}' is not a knowledge page id. Ids look like ` +
+          `'kp-<hex>' (letters, digits, '-' and '_' only) and come from ` +
+          `search_knowledge_pages or get_knowledge_tree.`,
+      );
+    }
     const res = await this.get(
       `${this.knowledgeBasePath()}/pages/${encodeURIComponent(args.page_id)}`,
     );
@@ -238,7 +279,20 @@ export class KnowledgeAdmin {
           `'${this.opts.bankId}' failed: HTTP ${res.status}`,
       );
     }
-    return (await res.json()) as KnowledgePage;
+    const page = (await res.json()) as Partial<KnowledgePage>;
+    // The ONLY field the caller actually renders. Unvalidated, a response that
+    // omits it (field rename on an image bump, or an explicit `markdown: null`)
+    // makes the shim emit `{"type":"text"}` with no `text` key — a content
+    // block that fails MCP client schema validation while `isError` is false,
+    // i.e. a read that silently failed. Fail loudly and name the page instead.
+    if (typeof page.markdown !== "string") {
+      throw new Error(
+        `knowledge page '${args.page_id}' in bank '${this.opts.bankId}' came ` +
+          `back with no markdown body — the response had no string 'markdown' ` +
+          `field, so there is nothing to read.`,
+      );
+    }
+    return page as KnowledgePage;
   }
 
   /** The pinned bank's folder/page tree, including per-page `is_stale`. */
@@ -250,7 +304,9 @@ export class KnowledgeAdmin {
       );
     }
     const parsed = (await res.json()) as Partial<KnowledgeTree>;
-    return { roots: parsed.roots ?? [] };
+    // Same hole as `search()`: a non-array `roots` must read as "no tree", not
+    // as a tree, or the shim renders a scalar as the agent's knowledge base.
+    return { roots: Array.isArray(parsed.roots) ? parsed.roots : [] };
   }
 }
 
@@ -259,10 +315,23 @@ export class KnowledgeAdmin {
  *
  * Exported so the test can assert the member set directly rather than
  * inferring read-only-ness from behaviour — the same mechanism-not-comment
- * move as `buildDirectivePatchBody`'s key-set assertion. TypeScript's
- * `private` is erased at runtime, so a `createPage` added anywhere in the
- * class body appears here and reds the test, whether or not it is exported
- * API.
+ * move as `buildDirectivePatchBody`'s key-set assertion.
+ *
+ * WHAT THIS COVERS, exactly: prototype members. TypeScript's `private` is
+ * erased at runtime, so a `createPage()` declared as a normal (or `private`)
+ * METHOD lands on the prototype, appears here, and reds
+ * `tests/hindsight-knowledge-admin.test.ts`.
+ *
+ * WHAT IT DOES NOT COVER, and why the test pairs it with two more assertions:
+ *   • a write installed as a class FIELD (`createPage = async () => …`) is an
+ *     INSTANCE own-property, not a prototype one — the test therefore also
+ *     asserts a constructed instance has no function-valued own key;
+ *   • a `static` method, and a plain exported module-level function, are on
+ *     neither — nothing here sees those. The backstop for both is the
+ *     behavioural assertion that no non-GET request ever reaches the mock API,
+ *     plus review of this file's diff.
+ * Neither this list nor the instance check is a substitute for reading the
+ * diff; they are the two cheap mechanical tripwires.
  */
 export const KNOWLEDGE_ADMIN_MEMBERS = [
   "constructor",

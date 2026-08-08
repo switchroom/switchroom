@@ -30,7 +30,10 @@ import {
   type KnowledgePage,
   type KnowledgePageSearchResult,
 } from "../src/memory/hindsight-knowledge-admin.js";
-import { HindsightShim } from "../src/cli/hindsight-mcp-shim.js";
+import {
+  HindsightShim,
+  KNOWLEDGE_RESPONSE_MAX_CHARS,
+} from "../src/cli/hindsight-mcp-shim.js";
 
 // ─── stateful mock of the hindsight REST knowledge-base API ───────────────
 
@@ -52,6 +55,14 @@ interface MockApi {
   seen: SeenRequest[];
   /** Force the next N responses for a sub-path to this status. */
   failStatus: (subPath: string) => number | null;
+  /**
+   * Replace the 200 body for a sub-path with an arbitrary payload.
+   *
+   * Exists to reproduce a MALFORMED-but-successful response — the field a
+   * future image bump renames, the `null` where a string was promised. Those
+   * are the responses a client that only checks `res.ok` mis-handles.
+   */
+  bodyOverride: (subPath: string) => unknown | undefined;
   close: () => Promise<void>;
 }
 
@@ -64,6 +75,7 @@ async function startMockApi(
     banks,
     seen: [],
     failStatus: () => null,
+    bodyOverride: () => undefined,
     close: async () => undefined,
   };
 
@@ -87,6 +99,8 @@ async function startMockApi(
       const sub = m[2].startsWith("pages/") ? "pages" : m[2];
       const injected = state.failStatus(sub);
       if (injected !== null) return send(injected, { detail: "injected" });
+      const overridden = state.bodyOverride(sub);
+      if (overridden !== undefined) return send(200, overridden);
       const kb = state.banks[bank];
       if (!kb) return send(404, { detail: "no such bank" });
       // The real API accepts GET on all three. Anything else is a 405 here so
@@ -233,8 +247,8 @@ describe("GET-only — no write verb is reachable", () => {
   it("KnowledgeAdmin's prototype has exactly the read members, no more", () => {
     // Asserted as a key set rather than inferred from behaviour, the same way
     // buildDirectivePatchBody's whitelist is. TypeScript `private` is erased
-    // at runtime, so a `createPage` added anywhere in the class body appears
-    // here — exported or not.
+    // at runtime, so a `createPage` declared as a METHOD (private or not)
+    // lands on the prototype and shows up here.
     expect(Object.getOwnPropertyNames(KnowledgeAdmin.prototype).sort()).toEqual(
       [...KNOWLEDGE_ADMIN_MEMBERS].sort(),
     );
@@ -244,6 +258,31 @@ describe("GET-only — no write verb is reachable", () => {
         `${write} would make page authorship/deletion reachable from a tool call`,
       ).not.toContain(write);
     }
+  });
+
+  /**
+   * The prototype inventory alone is NOT the whole guard, and the header
+   * comment used to claim it was. A write installed as a class FIELD —
+   * `createPage = async () => fetch(url, {method: "POST"})` — is an INSTANCE
+   * own-property, so `KnowledgeAdmin.prototype` never sees it and the test
+   * above stays green while page authorship is fully reachable. This closes
+   * that half; `static` methods and module-level functions are covered by
+   * neither and are left to the no-mutating-request assertion plus review, as
+   * the corrected header now says.
+   */
+  it("a constructed KnowledgeAdmin carries no function-valued own property", () => {
+    const instance = new KnowledgeAdmin({
+      apiBaseUrl: api.baseUrl,
+      bankId: OWN_BANK,
+    }) as unknown as Record<string, unknown>;
+    const callable = Object.getOwnPropertyNames(instance).filter(
+      (k) => typeof instance[k] === "function",
+    );
+    expect(
+      callable,
+      `${callable.join(", ")} is a class FIELD holding a function — a write ` +
+        `installed this way is invisible to the prototype inventory`,
+    ).toEqual([]);
   });
 
   it("every public method issues GET and nothing else", async () => {
@@ -287,23 +326,47 @@ describe("bank pinning — every path embeds the agent's own bank", () => {
   });
 
   it("a page_id cannot path-traverse into a peer bank", async () => {
-    // encodeURIComponent means the traversal survives only as an inert,
-    // percent-encoded LEAF segment under our own bank — the separators never
-    // reach the router, so it 404s here instead of resolving the peer's page.
+    // Rejected by shape before a socket is opened — and even if the id regex
+    // were removed, encodeURIComponent would leave the traversal an inert,
+    // percent-encoded LEAF segment under our own bank.
     await expect(
       admin().getPage({ page_id: `../../${PEER_BANK}/knowledge-base/pages/pg-secret` }),
+    ).rejects.toThrow(/is not a knowledge page id/);
+    expect(api.seen).toHaveLength(0);
+  });
+
+  /**
+   * The defect: `encodeURIComponent("..")` is `..` VERBATIM (it is an
+   * unreserved-set string), so the URL parser collapses the segment and
+   * `.../knowledge-base/pages/..` becomes a GET of `.../knowledge-base/` — a
+   * different endpoint whose body was then cast to `KnowledgePage`. Not a
+   * bank escape, but a page read must not be able to retarget the request.
+   */
+  it("a dot-segment page_id is refused instead of retargeting the request", async () => {
+    for (const bad of ["..", ".", "../", "a/b", "pg conventions", ""]) {
+      await expect(
+        admin().getPage({ page_id: bad }),
+        `page_id ${JSON.stringify(bad)} must be refused by shape`,
+      ).rejects.toThrow(/is not a knowledge page id/);
+    }
+    // Not one of them reached the network.
+    expect(api.seen).toHaveLength(0);
+
+    // ...and the real id spelling upstream mints (`kp-<uuid4 hex>`,
+    // memory_engine.py:13477) still passes the gate and is routed as a page.
+    await expect(
+      admin().getPage({ page_id: "kp-0123456789abcdef0123456789abcdef" }),
     ).rejects.toThrow(/no knowledge page/);
     expect(api.seen).toHaveLength(1);
-    const [prefix, id] = [
-      api.seen[0].path.slice(0, api.seen[0].path.lastIndexOf("/")),
-      api.seen[0].path.slice(api.seen[0].path.lastIndexOf("/") + 1),
-    ];
-    // The routed part of the URL is entirely ours.
-    expect(prefix).toBe(`/v1/default/banks/${OWN_BANK}/knowledge-base/pages`);
-    expect(prefix).not.toContain(PEER_BANK);
-    // ...and the peer's name only ever appears escaped inside the id.
-    expect(id).not.toContain("/");
-    expect(id).toContain(encodeURIComponent(`../../${PEER_BANK}/`));
+    expect(api.seen[0].path).toBe(
+      `/v1/default/banks/${OWN_BANK}/knowledge-base/pages/kp-0123456789abcdef0123456789abcdef`,
+    );
+
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_page", { page_id: ".." });
+      expect(res.isError).toBe(true);
+      expect(res.text).toMatch(/is not a knowledge page id/);
+    });
   });
 
   it("the tool schemas expose no bank_id, and a bank_id argument is REJECTED", async () => {
@@ -451,5 +514,230 @@ describe("results and failure text", () => {
     await expect(admin().getPage({ page_id: "pg-conventions" })).rejects.toThrow(
       /HTTP 503/,
     );
+  });
+
+  it("search reports the TOTAL alongside the hits, not the hits alone", async () => {
+    // With `results` alone the model cannot tell a complete set from one the
+    // limit cut short — 10 of 200 hits reads as "there are 10".
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "search_knowledge_pages", {
+        query: "Use",
+      });
+      expect(res.isError).toBe(false);
+      const parsed = JSON.parse(res.text) as {
+        total: number;
+        results: { id: string }[];
+      };
+      expect(parsed.total).toBe(1);
+      expect(parsed.results.map((r) => r.id)).toEqual(["pg-conventions"]);
+    });
+  });
+});
+
+// ─── 5. malformed-but-successful responses ────────────────────────────────
+
+/**
+ * HTTP 200 is not a promise about the BODY. A field rename on an image bump,
+ * or an explicit `null`, yields a successful response whose payload is not the
+ * shape the caller casts it to — and a cast is not a check. Each test here
+ * pins the failure mode that response used to produce.
+ */
+describe("a 200 with the wrong body shape", () => {
+  it("a page with no markdown is a loud failure, not a text-less content block", async () => {
+    api.bodyOverride = (sub) =>
+      sub === "pages"
+        ? {
+            id: "pg-conventions",
+            name: "Conventions",
+            type: "knowledge-page",
+            body: "Use tabs.",
+            // `markdown` renamed away upstream — the field the shim renders.
+          }
+        : undefined;
+    await expect(
+      admin().getPage({ page_id: "pg-conventions" }),
+    ).rejects.toThrow(/no markdown body/);
+
+    await withShim(OWN_BANK, async (shim) => {
+      const res = (await shim.handle({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "get_knowledge_page",
+          arguments: { page_id: "pg-conventions" },
+        },
+      })) as {
+        result: { isError: boolean; content: { type: string; text?: string }[] };
+      };
+      // Unfixed, this returned `{type:"text"}` with NO text key and
+      // isError:false — a block that fails MCP client schema validation while
+      // claiming success, i.e. a read that silently failed.
+      expect(res.result.isError).toBe(true);
+      expect(typeof res.result.content[0].text).toBe("string");
+      expect(res.result.content[0].text).toContain("pg-conventions");
+    });
+  });
+
+  it("a null markdown is refused the same way", async () => {
+    api.bodyOverride = (sub) =>
+      sub === "pages"
+        ? { id: "pg-conventions", name: "Conventions", markdown: null }
+        : undefined;
+    await expect(
+      admin().getPage({ page_id: "pg-conventions" }),
+    ).rejects.toThrow(/no markdown body/);
+  });
+
+  it("a non-array `results` is no results, never echoed as if it were hits", async () => {
+    // `"stringy".length` is truthy, so a `?? []` fallback sailed past the
+    // empty check and the shim stringified a STRING as the hit list.
+    api.bodyOverride = (sub) =>
+      sub === "search" ? { results: "stringy", total: 7 } : undefined;
+    const res = await admin().search({ query: "Use" });
+    expect(res.results).toEqual([]);
+
+    await withShim(OWN_BANK, async (shim) => {
+      const out = await callTool(shim, "search_knowledge_pages", {
+        query: "Use",
+      });
+      expect(out.isError).toBe(false);
+      expect(out.text).toMatch(/no knowledge pages/i);
+      expect(out.text).not.toContain("stringy");
+    });
+  });
+
+  it("a non-array `roots` is an empty tree, never rendered as a tree", async () => {
+    api.bodyOverride = (sub) => (sub === "tree" ? { roots: "stringy" } : undefined);
+    expect((await admin().tree()).roots).toEqual([]);
+
+    await withShim(OWN_BANK, async (shim) => {
+      const out = await callTool(shim, "get_knowledge_tree", {});
+      expect(out.isError).toBe(false);
+      expect(out.text).toMatch(/no pages yet/i);
+      expect(out.text).not.toContain("stringy");
+    });
+  });
+});
+
+// ─── 6. response size caps ────────────────────────────────────────────────
+
+/**
+ * The forwarded reads are token-budgeted (`DEFAULT_RECALL_MAX_TOKENS`) because
+ * an unbounded payload silently overruns the MCP output cap and never lands in
+ * the agent's context. The knowledge reads had no equivalent ceiling.
+ *
+ * The marker is as load-bearing as the cut: a silently-truncated page reads to
+ * the model as a complete page that simply ends.
+ */
+describe("oversized responses are capped, and say so", () => {
+  it("a page longer than the char budget is cut with an explicit marker", async () => {
+    const huge = "x".repeat(KNOWLEDGE_RESPONSE_MAX_CHARS + 5_000);
+    api.bodyOverride = (sub) =>
+      sub === "pages"
+        ? { id: "pg-conventions", name: "Conventions", markdown: huge }
+        : undefined;
+
+    // The REST layer still returns the whole document — the cap is the shim's
+    // rendering decision, not a lie told to every caller of KnowledgeAdmin.
+    expect((await admin().getPage({ page_id: "pg-conventions" })).markdown)
+      .toHaveLength(huge.length);
+
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_page", {
+        page_id: "pg-conventions",
+      });
+      expect(res.isError).toBe(false);
+      expect(res.text.length).toBeLessThan(huge.length);
+      expect(res.text).toMatch(/truncated at \d+ chars/);
+      expect(res.text).toContain("PARTIAL");
+      expect(res.text).toContain("5000 chars omitted");
+    });
+  });
+
+  it("a page inside the budget is returned byte-for-byte", async () => {
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_page", {
+        page_id: "pg-conventions",
+      });
+      expect(res.text).toBe("---\nname: Conventions\n---\n\nUse tabs.\n");
+      expect(res.text).not.toContain("truncated");
+    });
+  });
+
+  it("an oversized tree is capped, stays parseable JSON, and states the omission", async () => {
+    const total = 700;
+    const roots: KnowledgeNode[] = Array.from({ length: total }, (_, i) => ({
+      id: `kp-${i}`,
+      kind: "page" as const,
+      name: `Page ${i}`,
+      is_stale: false,
+    }));
+    api.bodyOverride = (sub) => (sub === "tree" ? { roots } : undefined);
+
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_tree", {});
+      expect(res.isError).toBe(false);
+      expect(res.text).toMatch(
+        new RegExp(`…\\d+ of ${total} nodes omitted`),
+      );
+      expect(res.text).toContain("PARTIAL");
+      // The whole render — JSON plus its own footnote — fits the budget.
+      expect(res.text.length).toBeLessThanOrEqual(KNOWLEDGE_RESPONSE_MAX_CHARS);
+      // A char-level cut of JSON would leave an unparseable document — worse
+      // than no answer. The prune is by node, so this always parses.
+      const json = res.text.slice(0, res.text.indexOf("\n…"));
+      const parsed = JSON.parse(json) as KnowledgeNode[];
+      expect(parsed.length).toBeGreaterThan(0);
+      expect(parsed.length).toBeLessThan(total);
+      expect(parsed[0].id).toBe("kp-0");
+      // The stated count is the truth, not an estimate.
+      const omitted = Number(
+        /…(\d+) of \d+ nodes omitted/.exec(res.text)![1],
+      );
+      expect(parsed.length + omitted).toBe(total);
+    });
+  });
+
+  it("a nested tree is pruned depth-first, never leaving an orphan child", async () => {
+    // A folder must never be dropped while its children survive: the ids
+    // would be unreachable and the shape a lie about the bank's layout.
+    const roots: KnowledgeNode[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `kf-${i}`,
+      kind: "folder" as const,
+      name: `Folder ${i} ${"pad".repeat(30)}`,
+      children: Array.from({ length: 20 }, (_, j) => ({
+        id: `kp-${i}-${j}`,
+        kind: "page" as const,
+        name: `Page ${i}/${j} ${"pad".repeat(30)}`,
+      })),
+    }));
+    api.bodyOverride = (sub) => (sub === "tree" ? { roots } : undefined);
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_tree", {});
+      expect(res.text.length).toBeLessThanOrEqual(KNOWLEDGE_RESPONSE_MAX_CHARS);
+      const parsed = JSON.parse(
+        res.text.slice(0, res.text.indexOf("\n…")),
+      ) as KnowledgeNode[];
+      expect(parsed.length).toBeGreaterThan(0);
+      expect(parsed.length).toBeLessThan(roots.length);
+      // Every retained child sits under a retained folder, by construction.
+      for (const folder of parsed) {
+        expect(folder.kind).toBe("folder");
+        for (const child of folder.children ?? []) {
+          expect(child.id.startsWith(`${folder.id.replace("kf-", "kp-")}-`)).toBe(
+            true,
+          );
+        }
+      }
+    });
+  });
+
+  it("a small tree is rendered whole, with no omission marker", async () => {
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_tree", {});
+      expect(res.text).not.toContain("omitted");
+      expect(JSON.parse(res.text)).toHaveLength(1);
+    });
   });
 });

@@ -90,6 +90,7 @@ import {
   KNOWLEDGE_SEARCH_LIMIT_DEFAULT,
   KNOWLEDGE_SEARCH_LIMIT_MAX,
   KNOWLEDGE_SEARCH_LIMIT_MIN,
+  type KnowledgeNode,
 } from "../memory/hindsight-knowledge-admin.js";
 import { redact } from "../secret-detect/redact.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
@@ -358,6 +359,18 @@ export const SYNTHESIZED_TOOL_TABLE: Record<
 export const SYNTHESIZED_TOOL_NAMES = Object.keys(SYNTHESIZED_TOOL_TABLE);
 
 /**
+ * The ONLY string spelling of an integer `coerceSynthesizedArg` accepts.
+ *
+ * Deliberately narrower than `/^-?\d+$/` over a trimmed value, which took
+ * `"01"`, `" 5 "` and `"50\n"`. Those are not what an MCP client's number
+ * stringification produces; accepting them means accepting a value the caller
+ * did not mean to send in that form, and `"01"` in particular is the shape a
+ * truncated or hand-mangled argument arrives in. No surrounding whitespace, no
+ * leading zeros, `0` itself allowed.
+ */
+const INTEGER_STRING_PATTERN = /^-?(?:0|[1-9]\d*)$/;
+
+/**
  * Validate + coerce ONE synthesized-tool argument against its declared schema.
  *
  * Per-property, deliberately. The original rule was "every argument must be a
@@ -405,15 +418,15 @@ export function coerceSynthesizedArg(
   let n: number;
   if (typeof value === "number") {
     n = value;
-  } else if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
-    n = Number(value.trim());
+  } else if (typeof value === "string" && INTEGER_STRING_PATTERN.test(value)) {
+    n = Number(value);
   } else {
     return {
       ok: false,
       text: `${toolName}: '${key}' must be an integer${range}.`,
     };
   }
-  if (!Number.isInteger(n)) {
+  if (!Number.isSafeInteger(n)) {
     return {
       ok: false,
       text: `${toolName}: '${key}' must be an integer${range}.`,
@@ -618,6 +631,122 @@ export const DEFAULT_REFLECT_MAX_TOKENS = 1024;
  */
 export const DEFAULT_RECALL_BUDGET = "low";
 export const DEFAULT_REFLECT_BUDGET = "mid";
+
+// ─── Synthesized knowledge-read response caps ─────────────────────────────
+
+/**
+ * Char ceiling on ONE synthesized knowledge response.
+ *
+ * The forwarded reads are token-budgeted ({@link DEFAULT_RECALL_MAX_TOKENS} =
+ * 1024) precisely because an unbounded payload silently overruns the MCP
+ * output cap and never lands in the agent's context. The knowledge reads had
+ * no equivalent ceiling: a big tree or a long page went back verbatim.
+ *
+ * 16384 = 4096 tokens × ~4 chars/token, i.e. exactly the budget upstream
+ * generates a page against (`KNOWLEDGE_PAGE_DEFAULT_MAX_TOKENS = 4096`,
+ * hindsight 0.9.0 `engine/memory_engine.py:13347`), so a normally-sized page
+ * is never touched and only a genuinely oversized payload is cut.
+ */
+export const KNOWLEDGE_RESPONSE_MAX_CHARS = 16_384;
+
+/**
+ * Chars held back from the tree's budget for the omission marker, so the
+ * capped render (JSON + marker) still fits {@link KNOWLEDGE_RESPONSE_MAX_CHARS}
+ * rather than overshooting it by the length of its own footnote.
+ *
+ * Deliberately NOT paired with a node-count constant. A minimal node
+ * serializes to ~35 chars, so any node ceiling low enough to bind before the
+ * char budget would have to be under ~460 — i.e. a second threshold that
+ * either never fires (dead config, which is what a 500-node cap turned out to
+ * be) or silently overrides the one that matters. One budget, in the unit the
+ * MCP output cap is actually denominated in.
+ */
+const KNOWLEDGE_TREE_MARKER_RESERVE = 256;
+
+/**
+ * Cut an oversized synthesized payload, SAYING SO.
+ *
+ * The marker is the whole point: a silently-truncated page reads to the model
+ * as a complete page that simply ends, and it will act on the missing half as
+ * if it did not exist. An explicit tail makes the gap something the model can
+ * see and route around.
+ */
+export function capKnowledgeResponse(text: string): string {
+  if (text.length <= KNOWLEDGE_RESPONSE_MAX_CHARS) return text;
+  const omitted = text.length - KNOWLEDGE_RESPONSE_MAX_CHARS;
+  return (
+    text.slice(0, KNOWLEDGE_RESPONSE_MAX_CHARS) +
+    `\n\n…truncated at ${KNOWLEDGE_RESPONSE_MAX_CHARS} chars — ${omitted} ` +
+    `chars omitted. This is a PARTIAL read; narrow it with ` +
+    `search_knowledge_pages rather than treating the above as the whole.`
+  );
+}
+
+/** Total nodes in a knowledge forest, children included. */
+function countKnowledgeNodes(nodes: KnowledgeNode[]): number {
+  let n = 0;
+  for (const node of nodes) n += 1 + countKnowledgeNodes(node.children ?? []);
+  return n;
+}
+
+/** Depth-first prefix of a forest holding at most `budget` nodes. */
+function takeKnowledgeNodes(
+  nodes: KnowledgeNode[],
+  budget: { left: number },
+): KnowledgeNode[] {
+  const out: KnowledgeNode[] = [];
+  for (const node of nodes) {
+    if (budget.left <= 0) break;
+    budget.left -= 1;
+    out.push(
+      node.children === undefined
+        ? node
+        : { ...node, children: takeKnowledgeNodes(node.children, budget) },
+    );
+  }
+  return out;
+}
+
+/**
+ * Render the tree inside {@link KNOWLEDGE_RESPONSE_MAX_CHARS}.
+ *
+ * `capKnowledgeResponse` is deliberately NOT used here: a char-level cut of
+ * JSON leaves an unparseable document, which is worse than no answer. The
+ * NODE budget is shrunk proportionally until the serialized form fits
+ * instead, so the JSON is well-formed at every size.
+ *
+ * Depth-first prune so the retained part is a valid subtree (a folder is never
+ * emitted without its own record), compact JSON so the budget buys nodes
+ * rather than indentation, and an explicit `N of M nodes omitted` tail
+ * whenever anything was dropped.
+ */
+export function renderKnowledgeTree(roots: KnowledgeNode[]): string {
+  const total = countKnowledgeNodes(roots);
+  const whole = JSON.stringify(roots);
+  if (whole.length <= KNOWLEDGE_RESPONSE_MAX_CHARS) return whole;
+  const charBudget = KNOWLEDGE_RESPONSE_MAX_CHARS - KNOWLEDGE_TREE_MARKER_RESERVE;
+  let allowed = total;
+  let kept = takeKnowledgeNodes(roots, { left: allowed });
+  let json = JSON.stringify(kept);
+  // Proportional shrink, guaranteed to make progress (the -1 floor), so this
+  // terminates even on pathologically large single nodes.
+  while (json.length > charBudget && allowed > 0) {
+    allowed = Math.max(
+      0,
+      Math.min(allowed - 1, Math.floor(allowed * (charBudget / json.length))),
+    );
+    kept = takeKnowledgeNodes(roots, { left: allowed });
+    json = JSON.stringify(kept);
+  }
+  const shown = countKnowledgeNodes(kept);
+  if (shown === total) return json;
+  return (
+    json +
+    `\n…${total - shown} of ${total} nodes omitted — the knowledge tree was ` +
+    `truncated to fit the response budget. This is a PARTIAL listing; use ` +
+    `search_knowledge_pages to find a specific page.`
+  );
+}
 
 const VALID_BUDGETS = new Set(["low", "mid", "high"]);
 
@@ -1200,10 +1329,13 @@ export class HindsightShim {
       );
       this.staleManifestServed = true;
       const cached = this.readCache();
-      // The synthesized directive tools do not depend on the backend at all,
-      // so they are advertised identically on every path — cold boot, cached,
-      // or live. An agent must never lose the retirement path just because
-      // memory is briefly down.
+      // The synthesized tools — the two directive-retirement tools AND the
+      // three knowledge-page reads — do not depend on the backend's MCP
+      // surface at all, so they are advertised identically on every path:
+      // cold boot, cached, or live. An agent must never lose the retirement
+      // path, or sight of its own knowledge pages, just because the MCP
+      // session is briefly down. (Their REST calls can still fail; that
+      // surfaces as an honest isError at call time, not as a missing tool.)
       return cached ? withSynthesizedTools(cached) : buildFallbackToolsList();
     }
   }
@@ -1345,13 +1477,18 @@ export class HindsightShim {
             "exists."
           );
         }
-        return JSON.stringify(res.results, null, 2);
+        // `total` rides along deliberately: with `results` alone the model
+        // cannot tell a complete set from one the `limit` cut short, and would
+        // read 10 of 200 hits as "there are 10".
+        return capKnowledgeResponse(
+          JSON.stringify({ total: res.total, results: res.results }, null, 2),
+        );
       }
       case "get_knowledge_page": {
         const page = await this.knowledgeAdmin.getPage({
           page_id: args.page_id as string,
         });
-        return page.markdown;
+        return capKnowledgeResponse(page.markdown);
       }
       case "get_knowledge_tree": {
         const tree = await this.knowledgeAdmin.tree();
@@ -1361,7 +1498,7 @@ export class HindsightShim {
             "mental models — propose one to start it."
           );
         }
-        return JSON.stringify(tree.roots, null, 2);
+        return renderKnowledgeTree(tree.roots);
       }
       default:
         throw new Error(

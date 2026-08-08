@@ -15,9 +15,36 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
-### Features
+### Hindsight: an agent can finally read its own knowledge pages
 
-- **hindsight: synthesize GET-only knowledge-page read tools in the MCP shim**
+- **The MCP shim now synthesizes three GET-only knowledge-page tools —
+  `search_knowledge_pages`, `get_knowledge_page` and `get_knowledge_tree`.**
+  Hindsight 0.9.0 serves a full Knowledge Base REST surface
+  (`/v1/default/banks/{bank}/knowledge-base/...`) but registers ZERO knowledge
+  tools on its MCP surface, so an agent's own curated pages — the synthesized
+  standing answer, where recall returns fragments — were unreachable from a
+  tool call. The shim answers all three locally over REST, the same way it
+  already synthesizes `deactivate_directive` / `reactivate_directive`, so they
+  work on every path: cold boot, cached manifest, or live.
+- **Read-only by construction, not by convention.** The backing
+  `KnowledgeAdmin` has exactly three methods and one network primitive that
+  hard-codes `method: "GET"` with no parameter to override it, so
+  `POST .../pages`, `PATCH .../nodes/{id}` and `DELETE .../nodes/{id}` are
+  unreachable — a page delete would remove the page AND its backing mental
+  model with no undo. Page authorship stays on the operator-approved
+  `mental_model_propose` card. The bank is pinned from `HINDSIGHT_BANK_ID` and
+  no schema exposes a `bank_id`, so a tool call cannot name another agent's
+  bank. (#4548)
+- **Known upstream defect:** `search_knowledge_pages` currently returns
+  HTTP 500 against the deployed Hindsight 0.9.0 backend. Upstream's
+  `search_knowledge_pages` hard-codes `ts_rank_cd`/tsvector and 500s on every
+  non-native text-search backend
+  (https://github.com/vectorize-io/hindsight/issues/3268); the deployed schema
+  has `mental_models.search_vector` as `text`, so the query raises
+  `asyncpg UndefinedFunctionError: function ts_rank_cd(text, tsquery) does not
+  exist`. The shim surfaces it as an honest `HTTP 500` isError result rather
+  than an empty one. `get_knowledge_page` and `get_knowledge_tree` are
+  unaffected. (#4548)
 
 ## v0.20.18 — Hindsight's pinned server moves to 0.9.0, plus the env plumbing, alarm and guidance fixes around it
 

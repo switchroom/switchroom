@@ -213,20 +213,24 @@ describe("hindsight contract — the shim fallback manifest mirrors the snapshot
    * The shim-synthesized carve-out, asserted rather than asserted-away.
    *
    * `FALLBACK_TOOL_TABLE` remains a byte-faithful description of the pinned
-   * image (test above) — the synthesized directive tools deliberately are NOT
-   * in it. What they DO ride in on is the served manifest, so these two
-   * assertions pin the boundary:
+   * image (test above) — the synthesized tools deliberately are NOT in it.
+   * That set is FIVE, not two: the two directive-retirement tools plus the
+   * three knowledge-page reads. The loop below iterates
+   * `SYNTHESIZED_TOOL_NAMES` rather than a hard-coded pair, so it covers
+   * whatever the table holds. What they DO ride in on is the served manifest,
+   * so the two tests here pin the boundary:
    *
-   *  1. the synthesized names must not exist upstream. If an image bump
-   *     registers a real `deactivate_directive`, this reds and the synthesis
-   *     gets retired instead of silently shadowing the backend's version
-   *     (which would accept a `bank_id` the shim's deliberately does not).
+   *  1. no synthesized name may exist upstream. If an image bump registers a
+   *     real `deactivate_directive` or `search_knowledge_pages`, this reds and
+   *     the synthesis gets retired instead of silently shadowing the backend's
+   *     version (which would accept a `bank_id` the shim's deliberately does
+   *     not).
    *  2. the served manifest must be exactly snapshot ∪ synthesized. A tool
    *     added to either table without review changes that set and reds here,
    *     which is what stops "over-reporting" creeping back in under the
    *     synthesis banner.
    */
-  it("the synthesized directive tools are NOT tools the pinned image registers", () => {
+  it("no shim-synthesized tool is one the pinned image registers", () => {
     for (const name of SYNTHESIZED_TOOL_NAMES) {
       expect(
         Object.keys(snapshot.tools),

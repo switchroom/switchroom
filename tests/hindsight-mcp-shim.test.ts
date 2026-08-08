@@ -1073,10 +1073,27 @@ describe("synthesized knowledge-page tools", () => {
       coerceSynthesizedArg("search_knowledge_pages", "limit", spec.props.limit, v);
     expect(arg(5)).toEqual({ ok: true, value: 5 });
     expect(arg("5")).toEqual({ ok: true, value: 5 });
-    expect(arg(" 5 ")).toEqual({ ok: true, value: 5 });
     expect(arg(1)).toEqual({ ok: true, value: 1 });
     expect(arg(50)).toEqual({ ok: true, value: 50 });
-    for (const bad of [0, 51, -1, 2.5, "abc", "", true, null, {}]) {
+    // The accepted STRING spelling is exact: no surrounding whitespace, no
+    // leading zeros. `" 5 "`, `"01"` and `"50\n"` are not what an MCP client's
+    // number stringification emits, so taking them means silently accepting a
+    // mangled argument as though the caller had meant it that way.
+    for (const bad of [
+      0,
+      51,
+      -1,
+      2.5,
+      "abc",
+      "",
+      " 5 ",
+      "01",
+      "50\n",
+      Number.MAX_SAFE_INTEGER + 2,
+      true,
+      null,
+      {},
+    ]) {
       const r = arg(bad);
       expect(r.ok, `${JSON.stringify(bad)} must not be an accepted limit`).toBe(
         false,
