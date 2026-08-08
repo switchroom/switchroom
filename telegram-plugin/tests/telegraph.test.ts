@@ -164,6 +164,40 @@ describe('markdownToTelegraphNodes — block elements', () => {
     expect(r[0].tag).toBe('blockquote')
   })
 
+  it('folds an expandable `**>` quote into one blockquote, marker stripped', () => {
+    // The Bot API 10.1 expandable-blockquote syntax: `**>` opener on the first
+    // line, `>` continuation lines. Telegra.ph has no collapsible-blockquote
+    // tag, so it degrades to a normal blockquote — but the `**>` marker MUST be
+    // recognised. Before the fix the `**>` line became a paragraph with literal
+    // `**>` text and the `>` lines split into a detached second quote.
+    const r = markdownToTelegraphNodes('**> summary of the thing\n> body one\n> body two')
+    expect(r).toHaveLength(1)
+    expect(r[0].tag).toBe('blockquote')
+    // Summary and body are joined in the single quote, no literal `**>` leaks.
+    const flat = JSON.stringify(r)
+    expect(flat).not.toContain('**>')
+    expect(flat).not.toContain('*') // no stray bold delimiter survives
+    expect(flat).toContain('summary of the thing')
+    expect(flat).toContain('body one')
+    expect(flat).toContain('body two')
+  })
+
+  it('does not let a paragraph absorb a following `**>` opener', () => {
+    // isBlockStart must treat `**>` as a block start so the preceding line ends
+    // the paragraph instead of swallowing the quote (which left the `**>`
+    // literal glued into prose).
+    const r = markdownToTelegraphNodes('Intro line\n**> quoted summary')
+    expect(r.map((n) => n.tag)).toEqual(['p', 'blockquote'])
+    expect(r[0].children).toEqual(['Intro line'])
+  })
+
+  it('does not misread a line that merely opens with bold text', () => {
+    // `**` is only a quote marker when `>` follows it immediately. A line
+    // starting with real bold must stay a paragraph, not become a blockquote.
+    const r = markdownToTelegraphNodes('**bold** > x')
+    expect(r.map((n) => n.tag)).toEqual(['p'])
+  })
+
   it('handles a mixed document end-to-end', () => {
     const md = '# Title\n\nIntro paragraph.\n\n## Steps\n\n- one\n- two\n\nFinal note.'
     const r = markdownToTelegraphNodes(md)

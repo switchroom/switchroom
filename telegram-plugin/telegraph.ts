@@ -193,6 +193,18 @@ export async function createTelegraphPage(
 }
 
 /**
+ * A blockquote line: a plain `> ` marker OR the expandable-blockquote opener
+ * `**> ` (Bot API 10.1 syntax the switchroom render path emits on the first
+ * line of an expandable quote — see `render/render.ts` and
+ * `reference/telegram-formatting-guide.md`). Telegra.ph has no collapsible
+ * blockquote tag, so an expandable quote degrades to a normal `<blockquote>`;
+ * the `**` prefix must still be recognised and stripped here, else the
+ * unterminated `**` renders as literal `**>` text and the `>` continuation
+ * lines split off into a second, detached quote.
+ */
+const TELEGRAPH_QUOTE_LINE = /^(?:\*\*)?>\s?/
+
+/**
  * Convert reply text (markdown-ish) into Telegraph node structure.
  *
  * Lives between the two extremes of "raw text in one paragraph"
@@ -278,11 +290,15 @@ export function markdownToTelegraphNodes(text: string): TelegraphNode[] {
       continue
     }
 
-    // Blockquote.
-    if (/^>\s?/.test(line)) {
+    // Blockquote — plain `> …` OR an expandable `**> …` opener followed by
+    // `> …` continuation lines. Both collapse into one <blockquote> with the
+    // markers stripped (Telegra.ph has no expandable-blockquote tag, so the
+    // expandable quote degrades faithfully to a normal one; the `**>` marker is
+    // stripped so no literal `**>` leaks and the summary stays with its body).
+    if (TELEGRAPH_QUOTE_LINE.test(line)) {
       const quoted: string[] = []
-      while (i < lines.length && /^>\s?/.test(lines[i])) {
-        quoted.push(lines[i].replace(/^>\s?/, ''))
+      while (i < lines.length && TELEGRAPH_QUOTE_LINE.test(lines[i])) {
+        quoted.push(lines[i].replace(TELEGRAPH_QUOTE_LINE, ''))
         i++
       }
       nodes.push({ tag: 'blockquote', children: parseInline(quoted.join(' ')) })
@@ -310,7 +326,9 @@ function isBlockStart(line: string): boolean {
     /^[-*]\s+/.test(line) ||
     /^\d+\.\s+/.test(line) ||
     line.trim().startsWith('```') ||
-    /^>\s?/.test(line)
+    // A `**>` expandable-quote opener is a block start too, so a preceding
+    // paragraph does not absorb it (which is what left the `**>` literal).
+    TELEGRAPH_QUOTE_LINE.test(line)
   )
 }
 

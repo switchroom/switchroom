@@ -17,6 +17,21 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **telegraph: `**>` expandable blockquotes render correctly in Instant View
+  pages.** `markdownToTelegraphNodes` — the Telegra.ph node builder used when a
+  telegraph-enabled agent's reply exceeds the ~3000-char threshold — matched
+  blockquote lines with `/^>\s?/` only, so the documented expandable-quote
+  syntax (`**> summary` opener plus `> body` continuation lines) fell through to
+  paragraph handling: the unterminated `**` leaked as a literal `**>` paragraph
+  and the `>` lines split off into a second, detached blockquote. The live
+  outbound entity path (`render/parse.ts`, `render/render.ts`) already handled
+  `**>`; only this Instant View builder disagreed. It now recognises the
+  `**>`-opener group, strips the markers, and folds opener plus continuations
+  into a single `<blockquote>` — Telegra.ph's tag set has no collapsible-quote
+  tag, so an expandable quote degrades faithfully to a normal one. `isBlockStart`
+  treats `**>` as a block start too, so a preceding paragraph no longer absorbs
+  it. Plain `>` quotes are unchanged.
+
 - **hindsight: measure consolidation per-fact tokens, 32k batch 6 to 3.** The
   marginal prompt cost of a fact in a consolidation batch was 2,500 tokens,
   back-derived as `30,000 / 12` from a whole-prompt p90 at batch 12 — a
