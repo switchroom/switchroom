@@ -47,6 +47,32 @@ now an anomaly worth investigating, not the norm.
   `dev` → `devOptional`, which is npm correctly recording nostr-tools' optional
   `typescript` peer.
 
+### Hindsight: the recall/background worker split is now a first-class, opt-in topology
+
+- **New `hindsight.recall_pool` config provisions the recall/background split
+  that was previously applied by hand and reverted by every recreate.** When
+  `hindsight.recall_pool.enabled: true`, `switchroom memory setup --recreate`
+  keeps `switchroom-hindsight` as the AUTHORITY container (embedded pg0, the
+  single background WorkerPoller, migrations, control plane, healthcheck) but
+  moves it OFF the public port onto public+1, and launches a NEW
+  `switchroom-hindsight-recall` sibling on the unchanged public port: N uvicorn
+  workers, background poller OFF, connecting to the authority container's pg0
+  over host-network loopback. It serves recall/reflect only. Measured ~2.2x
+  recall throughput with the split on. `memory.config.url` never moves, so every
+  agent's memory client is unaffected.
+- **OFF by default, strictly backward-compatible.** Absent or
+  `enabled: false` ⇒ the single-container path is byte-for-byte unchanged and no
+  second container is created. Only the literal boolean `true` opts in.
+- **The connection budget is enforced, not hoped for.** pg0 runs
+  `max_connections=250`; the authority container reserves 60 (write 40 / read
+  20) and the pool's per-worker DB pools are auto-sized from the remaining
+  budget (default 4 workers, GPU-reranker-VRAM-bound above that). An operator
+  override that would overflow the ceiling is a hard failure at resolve/launch
+  (`assertRecallPoolConnectionBudget`), not a mid-load Postgres `FATAL: too many
+  clients`. Launch is health-gated: the authority container's pg0 must answer
+  `/health` before the pool starts, and the pool must bind the public port
+  before `memory.config.url` is declared live.
+
 ### Hindsight: an agent can finally read its own knowledge pages
 
 - **The MCP shim now synthesizes three GET-only knowledge-page tools —

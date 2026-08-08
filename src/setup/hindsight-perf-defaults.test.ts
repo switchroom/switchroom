@@ -355,7 +355,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these sixty-four keys, by name", () => {
+  it("is overridable on exactly these seventy-one keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -368,6 +368,13 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
       "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
+      // The recall/background-split keys (HINDSIGHT_RECALL_POOL_ENV_KEYS):
+      // external DB URL + duplicate alias, per-worker DB pool caps, worker
+      // count + poller toggle, migrations toggle. Reachable via `hindsight.env`
+      // and non-drift on a split deployment.
+      "HINDSIGHT_API_DATABASE_URL",
+      "HINDSIGHT_API_DB_POOL_MAX_SIZE",
+      "HINDSIGHT_API_DB_URL",
       // The ONNX embeddings provider cutover — override-only, no shipped
       // default. The two _PREFIX keys are also empty-string-legal.
       // Plus the v0.9.0 reach-only knobs (reranker caps, embeddings input
@@ -393,6 +400,7 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT",
       "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE",
       "HINDSIGHT_API_QUERY_ANALYZER_LANGUAGES",
+      "HINDSIGHT_API_READ_DB_POOL_MAX_SIZE",
       "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE",
       "HINDSIGHT_API_RECALL_MAX_CONCURRENT",
       "HINDSIGHT_API_RECENCY_DECAY_FUNCTION",
@@ -409,10 +417,14 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_RERANKER_MAX_CANDIDATES_MID",
       "HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT",
       "HINDSIGHT_API_RETAIN_WALL_TIMEOUT",
+      "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP",
       "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
       "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
       "HINDSIGHT_API_TEXT_SEARCH_EXTENSION",
       "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
+      // The recall pool's uvicorn worker count (`WORKERS`, plural) sorts before
+      // the singular WORKER_* slot-reservation block ('S' < '_').
+      "HINDSIGHT_API_WORKERS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY",
       // Both spellings of every per-type slot reservation are ACCEPTED as
       // input (see HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES); only the
@@ -420,6 +432,9 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_CONSOLIDATION_SLOT_LIMIT",
+      // The recall pool's background-poller toggle ('E' sorts after the
+      // WORKER_CONSOLIDATION_* block, before WORKER_FILE_*).
+      "HINDSIGHT_API_WORKER_ENABLED",
       "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS",
       "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS",
       "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_MAX_SLOTS",

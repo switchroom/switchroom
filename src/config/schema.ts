@@ -2919,6 +2919,68 @@ export const HindsightConfigSchema = z.object({
       "`consolidation` blocks override individual ops. All fields optional; " +
       "unset fields fall back to the hard-coded defaults.",
     ),
+  recall_pool: z
+    .object({
+      enabled: z
+        .boolean()
+        .optional()
+        .describe(
+          "Turn on the recall/background WORKER SPLIT: a second container, " +
+            "`switchroom-hindsight-recall`, serves recall/reflect only with N " +
+            "uvicorn workers, while the existing `switchroom-hindsight` " +
+            "container keeps pg0, the single background WorkerPoller, the " +
+            "healthcheck and all consolidation/retain processing but moves off " +
+            "the public port onto public+1. The public port (memory.config.url) " +
+            "does not change — the pool binds it instead. Absent/false (the " +
+            "default) → the single-container topology, unchanged. Opt-in only. " +
+            "Raises recall throughput ~2.2x on the fleet (2.6→5.6 rps).",
+        ),
+      workers: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "uvicorn `--workers` for the recall pool (HINDSIGHT_API_WORKERS). " +
+            "Default 4. Each worker holds its own GPU cross-encoder reranker, " +
+            "so past ~4 workers contend for VRAM rather than adding throughput " +
+            "on a single GPU — raise only on a bigger GPU or a CPU reranker. " +
+            "The per-worker DB pools are auto-sized down from the pg0 " +
+            "connection budget so N*(write+read)+60 background stays under " +
+            "max_connections=250; a worker count that would overflow that " +
+            "budget is rejected at launch.",
+        ),
+      db_pool_max_size: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Override the per-worker WRITE pool cap " +
+            "(HINDSIGHT_API_DB_POOL_MAX_SIZE). Absent → auto-sized from the " +
+            "worker count. Set this only to override the auto-sizing; the " +
+            "connection-budget check still applies and rejects an overflow.",
+        ),
+      read_db_pool_max_size: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Override the per-worker READ pool cap " +
+            "(HINDSIGHT_API_READ_DB_POOL_MAX_SIZE). Absent → auto-sized from " +
+            "the worker count. Set this only to override the auto-sizing; the " +
+            "connection-budget check still applies and rejects an overflow.",
+        ),
+    })
+    .optional()
+    .describe(
+      "Optional recall/background container split for the hindsight " +
+        "singleton. Off by default; see `enabled`. Provisioned by " +
+        "`switchroom memory setup` (src/setup/hindsight-recall-pool.ts) so it " +
+        "survives `switchroom apply` — the hand-applied topology it replaces " +
+        "did not.",
+    ),
   env: z
     .record(z.union([z.string(), z.number(), z.boolean()]))
     .optional()
