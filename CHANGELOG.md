@@ -55,6 +55,10 @@ now an anomaly worth investigating, not the norm.
   fleet-wide. Prose only — an agent picks the corrected guidance up on its next
   restart.
 
+### Chore: harden against the dead mekenthompson fork (fleet guidance + worktree GC)
+
+- **The dev-protocol template names `switchroom/switchroom` (via `origin`) as the single source of truth and forbids the archived `mekenthompson/switchroom` fork, and `isSwitchroomRemote()` now recognizes a fork-origin checkout so the worktree GC can reclaim it instead of leaving it orphaned (the `.rev-pr4` clone lingered 8 days).**
+
 ## v0.20.17 — Hindsight bakes the bge ONNX export into the image and boots HF-offline
 
 ### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot
