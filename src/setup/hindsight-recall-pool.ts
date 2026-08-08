@@ -241,6 +241,38 @@ export function resolveHindsightLaunchPorts(input: {
   return { publicApiPort, basePorts: { apiPort, uiPort: input.uiPort } };
 }
 
+/**
+ * Detect the HALF-BUILT topology: the authority container is running, but on a
+ * port that is NOT the public port `memory.config.url` points at, and no recall
+ * pool is bound there either. Nothing serves the public port, so every agent's
+ * memory client refuses — fleet-wide memory outage — while an
+ * authority-only "is it running?" check happily reports success.
+ *
+ * This is reachable, and has been reached in production: enable the split (the
+ * authority moves to public+1 and the pool takes the public port), then remove
+ * the pool or set `hindsight.recall_pool.enabled: false` WITHOUT
+ * `--recreate`. The authority stays parked on public+1 with `--restart always`
+ * and survives reboots, so the outage is durable and silent.
+ *
+ * Deliberately positive-evidence-only — it must never manufacture a refusal out
+ * of not knowing:
+ *   - `configUrlPort` absent (no `memory.config.url` pin) ⇒ there is no declared
+ *     public port to be unserved. No verdict.
+ *   - `authorityApiPort` absent (`docker port`/`inspect` unreadable) ⇒ we cannot
+ *     tell where the authority is bound. No verdict.
+ *   - `poolRunning` ⇒ the pool owns the public port; the authority sitting on
+ *     public+1 is the CORRECT split topology, not an outage.
+ */
+export function publicPortIsUnserved(input: {
+  configUrlPort: number | undefined;
+  authorityApiPort: number | undefined;
+  poolRunning: boolean;
+}): boolean {
+  if (input.configUrlPort == null || input.authorityApiPort == null) return false;
+  if (input.poolRunning) return false;
+  return input.authorityApiPort !== input.configUrlPort;
+}
+
 /** Resolved recall-pool settings, or `null` when the feature is off. */
 export interface RecallPoolConfig {
   /** Number of uvicorn workers the pool runs (`--workers`). */

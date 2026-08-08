@@ -87,6 +87,23 @@ now an anomaly worth investigating, not the norm.
   loud error. Bare `switchroom memory setup` (no `--recreate`) on an
   authority-up/pool-dead split now performs the same pool repair the wizard
   does instead of reporting "already running" over the unbound public port.
+- **"The container is running" no longer counts as "memory works".** Both
+  already-running paths (`switchroom setup` step 6 and bare `switchroom memory
+  setup`) now refuse to report success when `switchroom-hindsight` is bound to a
+  port that is NOT the one `memory.config.url` declares and no recall pool is
+  serving it. That half-built topology — reachable by turning the split on and
+  then removing the pool (or setting `enabled: false`) without `--recreate` —
+  survives reboots on `--restart always`, so it is a silent, durable, fleet-wide
+  memory outage that every "is hindsight running?" check answers "yes" to.
+  Positive-evidence-only: no `memory.config.url` pin, or an unreadable container
+  port, yields no verdict rather than a manufactured refusal.
+- **`switchroom memory --status` and the web dashboard report the AUTHORITY
+  container's status, not the pool's.** `docker ps --filter
+  name=switchroom-hindsight` is a substring match that also returns
+  `switchroom-hindsight-recall`, newest-created first — so on a split deployment
+  the status projection returned the POOL's "Up 2 minutes (healthy)" while the
+  authority sat in `Exited (1)`, hiding an outage on the two surfaces an
+  operator reaches for during one.
 
 ### Hindsight: an agent can finally read its own knowledge pages
 

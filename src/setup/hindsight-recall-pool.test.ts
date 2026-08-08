@@ -38,6 +38,7 @@ import {
   HINDSIGHT_RECALL_POOL_HEADROOM,
   HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS,
   HINDSIGHT_RECALL_POOL_PG_DSN,
+  publicPortIsUnserved,
   HINDSIGHT_RECALL_POOL_WORKER_ID,
   applyRecallPoolEnvOverrides,
   assertRecallPoolConnectionBudget,
@@ -516,5 +517,68 @@ describe("env allowlist membership", () => {
         expect(HINDSIGHT_PERF_ENV_KEYS.has(k)).toBe(true);
       }
     }
+  });
+});
+
+describe("publicPortIsUnserved — the half-built-topology outage guard", () => {
+  // The production shape (2026-08): the split was applied by hand, the pool was
+  // later removed, and `switchroom-hindsight` stayed parked on 18889 with
+  // `--restart always` while every agent's memory.config.url pointed at 18888.
+  // Nothing was bound on 18888 for weeks and every "is hindsight running?"
+  // check said yes.
+  it("fires when the authority is parked off the public port with no pool", () => {
+    expect(
+      publicPortIsUnserved({
+        configUrlPort: 18888,
+        authorityApiPort: 18889,
+        poolRunning: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("does NOT fire on a correct split — the pool owns the public port", () => {
+    // Same port mismatch, but the pool IS bound on 18888. This is the intended
+    // topology, not an outage; flagging it would break every split deployment.
+    expect(
+      publicPortIsUnserved({
+        configUrlPort: 18888,
+        authorityApiPort: 18889,
+        poolRunning: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("does NOT fire on a healthy single container", () => {
+    expect(
+      publicPortIsUnserved({
+        configUrlPort: 18888,
+        authorityApiPort: 18888,
+        poolRunning: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("stays silent with no declared public port (no memory.config.url pin)", () => {
+    // Positive evidence only: with nothing declaring the public port there is
+    // no port to be unserved, so a non-default authority port is legitimate.
+    expect(
+      publicPortIsUnserved({
+        configUrlPort: undefined,
+        authorityApiPort: 18889,
+        poolRunning: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("stays silent when the authority's port is unreadable", () => {
+    // `docker port` / `docker inspect` unreadable ⇒ we cannot tell where it is
+    // bound. Must never manufacture a refusal out of not knowing.
+    expect(
+      publicPortIsUnserved({
+        configUrlPort: 18888,
+        authorityApiPort: undefined,
+        poolRunning: false,
+      }),
+    ).toBe(false);
   });
 });

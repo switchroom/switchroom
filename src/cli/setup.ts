@@ -31,40 +31,10 @@ import {
 } from "../setup/onboarding.js";
 import { detectGpuCapabilities } from "../setup/gpu-detect.js";
 import { saveVoiceCapability } from "../setup/host-capabilities.js";
-import {
-  probeDockerAvailability,
-  isHindsightRunning,
-  isHindsightContainerExists,
-  startHindsight,
-  hindsightConsumerMirrorDir,
-  stopHindsight,
-  ensureHindsightConsumer,
-  resolveHindsightCpAccessKey,
-  resolveHindsightLlmSecrets,
-  diffDroppedHindsightLlmVaultKeys,
-  hindsightLlmDroppedKeyWarning,
-  resolveHindsightLiteLlm,
-  hindsightLiteLlmDroppedKeyWarning,
-  type HindsightLiteLlmResolution,
-  HINDSIGHT_CONSUMER_NAME,
-  HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
-  HINDSIGHT_DEFAULT_API_PORT,
-  pickHindsightPorts,
-  preflightHindsightPorts,
-  type DockerProbe,
-} from "../setup/hindsight.js";
-import {
-  resolveRecallPoolConfig,
-  resolveHindsightLaunchPorts,
-  startHindsightRecallPool,
-  stopHindsightRecallPool,
-  isHindsightRecallPoolRunning,
-  backgroundContainerPoolEnv,
-  waitForHindsightHealthy,
-  HINDSIGHT_RECALL_POOL_CONTAINER,
-  type RecallPoolConfig,
-} from "../setup/hindsight-recall-pool.js";
-import type { getViaBrokerStructured } from "../vault/broker/client.js";
+// NOTE: step 6's hindsight/recall-pool imports moved WITH stepMemoryBackend
+// into setup-memory-backend.ts. Nothing left in this file consumes them, so
+// they are not re-imported here — a dead import of the recall-pool module from
+// the wizard's entry point would misrepresent where the launch actually lives.
 import {
   ask,
   askHidden,

@@ -55,6 +55,7 @@ import {
   startHindsightRecallPool,
   stopHindsightRecallPool,
   isHindsightRecallPoolRunning,
+  publicPortIsUnserved,
   waitForHindsightHealthy,
   launchRecallPoolHealthGated,
   backgroundContainerPoolEnv,
@@ -955,6 +956,39 @@ export function registerMemoryCommand(program: Command): void {
             );
           }
           return;
+        }
+        // Running ≠ serving. If the authority is parked on a port that is not
+        // the one memory.config.url declares, and no pool is bound there, the
+        // fleet's memory endpoint refuses — the half-built topology a
+        // split→single toggle (or a removed pool) leaves behind, durable across
+        // reboots via `--restart always`. Refuse to report success over it.
+        const liveApiPort = getRunningHindsightPorts()?.apiPort;
+        const liveConfigUrlPort = ((): number | undefined => {
+          try {
+            const p = Number(new URL(getConfig(program).memory?.config?.url ?? "").port);
+            return Number.isInteger(p) && p > 0 ? p : undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+        if (
+          publicPortIsUnserved({
+            configUrlPort: liveConfigUrlPort,
+            authorityApiPort: liveApiPort,
+            poolRunning: isHindsightRecallPoolRunning(),
+          })
+        ) {
+          console.error(
+            chalk.red(
+              `\n  switchroom-hindsight is running on port ${liveApiPort}, but ` +
+                `memory.config.url points at ${liveConfigUrlPort} and nothing is serving ` +
+                `it — fleet memory is DOWN.\n` +
+                `  Run \`switchroom memory setup --recreate\` to rebind it to ` +
+                `${liveConfigUrlPort}, or set hindsight.recall_pool.enabled: true to restore ` +
+                `the recall pool on the public port.\n`,
+            ),
+          );
+          process.exit(1);
         }
         console.log(chalk.green("\n  Hindsight container is already running (switchroom-hindsight).\n"));
         return;

@@ -184,6 +184,54 @@ describe("stepMemoryBackend — recall-pool provisioning wiring", () => {
     expect(waitForHealthy.mock.calls.map((c) => c[0])).toEqual([18889, 18888, 18888]);
   });
 
+  it("REFUSES success when the authority is parked off the public port with no pool", async () => {
+    // The production outage shape: the split was turned on (authority moved to
+    // 18889), then the pool was removed / `enabled` set back to false WITHOUT
+    // `--recreate`. The authority survives reboots on `--restart always`, so
+    // `isHindsightRunning()` says yes forever while NOTHING is bound on 18888
+    // and every agent's memory.config.url refuses. This step used to print
+    // "already running" and return success over that.
+    const startContainer = vi.fn();
+    const startRecallPool = vi.fn();
+
+    const splitDisabled = {
+      memory: { config: { url: "http://127.0.0.1:18888/mcp/" } },
+    } as unknown as SwitchroomConfig;
+
+    const deps: MemoryBackendDeps = {
+      dockerProbe: makeDockerProbe({ authorityUp: true }),
+      recallPoolRunningProbe: () => false,
+      // The live authority is bound to the split's background port, not 18888.
+      runningPortsProbe: () => ({ apiPort: 18889, uiPort: 19999 }),
+      startContainer,
+      startRecallPool,
+    };
+
+    await expect(
+      stepMemoryBackend(splitDisabled, true, tempConfigPath(), deps),
+    ).rejects.toThrow(/Memory backend setup failed:.*running on port 18889.*points at 18888/s);
+    // It must not paper over the outage by launching anything either.
+    expect(startContainer).not.toHaveBeenCalled();
+    expect(startRecallPool).not.toHaveBeenCalled();
+  });
+
+  it("accepts a correct split: authority off the public port BUT the pool serving it", async () => {
+    // Same port mismatch as above; the difference is the pool is bound on
+    // 18888. This is the intended topology — the guard must not fire, or every
+    // split deployment fails its own setup step.
+    const deps: MemoryBackendDeps = {
+      dockerProbe: makeDockerProbe({ authorityUp: true }),
+      recallPoolRunningProbe: () => true,
+      runningPortsProbe: () => ({ apiPort: 18889, uiPort: 19999 }),
+      startContainer: vi.fn(),
+      startRecallPool: vi.fn(),
+    };
+
+    await expect(
+      stepMemoryBackend(SPLIT_ENABLED, true, tempConfigPath(), deps),
+    ).resolves.toEqual({ hindsightExpected: true, optedOut: false });
+  });
+
   it("does not touch the pool seam when the split is disabled (strict opt-in)", async () => {
     const state = { authorityUp: false };
     const startContainer = vi.fn<NonNullable<MemoryBackendDeps["startContainer"]>>(() => {

@@ -2936,17 +2936,38 @@ export function hindsightResolvedCapabilities(
 }
 
 /**
- * Get the status of the Hindsight Docker container.
+ * Get the status of the Hindsight AUTHORITY Docker container.
+ *
+ * Exact-name match on `{{.Names}}`, for the same reason as
+ * {@link isHindsightRunning}: `--filter name=switchroom-hindsight` is a
+ * SUBSTRING match that also returns the recall-pool sibling
+ * `switchroom-hindsight-recall`. `docker ps` orders newest-created first and
+ * the pool is always created after the authority, so a `{{.Status}}`-only
+ * projection returns TWO lines with the POOL's status first — i.e. `switchroom
+ * memory --status` and the web dashboard would report the pool's "Up 2 minutes
+ * (healthy)" while the authority sat in `Exited (1)`, hiding the outage on the
+ * two surfaces an operator reaches for during one.
+ *
+ * Injectable `exec` so the multi-row ordering is testable without docker.
  */
-export function getHindsightStatus(): string | null {
+export function getHindsightStatus(
+  exec: (cmd: string, args: string[]) => string = (cmd, args) =>
+    execFileSync(cmd, args, { stdio: "pipe", encoding: "utf-8" }),
+): string | null {
   try {
-    const output = execFileSync(
-      "docker",
-      ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"],
-      { stdio: "pipe", encoding: "utf-8" },
-    );
-    const status = output.trim();
-    return status.length > 0 ? status : null;
+    const output = exec("docker", [
+      "ps", "-a",
+      "--filter", "name=switchroom-hindsight",
+      "--format", "{{.Names}}\t{{.Status}}",
+    ]);
+    for (const line of output.split("\n")) {
+      const tab = line.indexOf("\t");
+      if (tab === -1) continue;
+      if (line.slice(0, tab).trim() !== HINDSIGHT_CONTAINER_NAME) continue;
+      const status = line.slice(tab + 1).trim();
+      if (status.length > 0) return status;
+    }
+    return null;
   } catch {
     return null;
   }

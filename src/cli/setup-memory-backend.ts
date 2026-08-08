@@ -6,6 +6,7 @@ import {
   probeDockerAvailability,
   isHindsightRunning,
   isHindsightContainerExists,
+  getRunningHindsightPorts,
   startHindsight,
   hindsightConsumerMirrorDir,
   stopHindsight,
@@ -31,6 +32,7 @@ import {
   startHindsightRecallPool,
   stopHindsightRecallPool,
   isHindsightRecallPoolRunning,
+  publicPortIsUnserved,
   backgroundContainerPoolEnv,
   waitForHindsightHealthy,
   launchRecallPoolHealthGated,
@@ -135,6 +137,13 @@ export interface MemoryBackendDeps {
    * Production ⇒ {@link pickHindsightPorts}.
    */
   pickPorts?: typeof pickHindsightPorts;
+  /**
+   * Reads the ports the RUNNING authority container is actually bound to, for
+   * the unserved-public-port guard on the already-running path. Injected so a
+   * test can drive the half-built topology without docker. Production ⇒
+   * {@link getRunningHindsightPorts}.
+   */
+  runningPortsProbe?: typeof getRunningHindsightPorts;
   /**
    * Host-port preflight seam, paired with {@link pickPorts}. Returns a conflict
    * descriptor (or null when free). Injected so the split's authority-port
@@ -496,6 +505,33 @@ export async function stepMemoryBackend(
         );
       }
       return { hindsightExpected: true, optedOut: false };
+    }
+    // "The authority container is running" is NOT the same as "memory works".
+    // If it is parked on a port that is not the one `memory.config.url`
+    // declares, and no pool is bound there, NOTHING serves the fleet's memory
+    // endpoint — the half-built topology a split→single toggle (or a removed
+    // pool) leaves behind, durable across reboots via `--restart always`.
+    // Reporting "already running" over that is exactly the silent-success-over-
+    // an-outage class review H2 closed for the other paths in this step.
+    const runningPorts = (deps.runningPortsProbe ?? getRunningHindsightPorts)();
+    if (
+      publicPortIsUnserved({
+        configUrlPort: parseUrlPort(config.memory?.config?.url),
+        authorityApiPort: runningPorts?.apiPort,
+        poolRunning: poolIsRunning(deps.dockerProbe),
+      })
+    ) {
+      const publicPort = parseUrlPort(config.memory?.config?.url);
+      const msg =
+        `switchroom-hindsight is running on port ${runningPorts?.apiPort}, but ` +
+        `memory.config.url points at ${publicPort} and nothing is serving it — ` +
+        `fleet memory is DOWN.`;
+      console.log(chalk.red(`  x ${msg}`));
+      throw new Error(
+        `Memory backend setup failed: ${msg} Run \`switchroom memory setup --recreate\` ` +
+          `to rebind it to ${publicPort}, or set hindsight.recall_pool.enabled: true to ` +
+          `restore the recall pool on the public port.`,
+      );
     }
     console.log(chalk.green(`  ${STEP_DONE} Hindsight container already running (switchroom-hindsight)`));
     return { hindsightExpected: true, optedOut: false };
