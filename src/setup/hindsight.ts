@@ -816,6 +816,15 @@ export function hindsightLlmBudgetEnv(llm?: HindsightLlmConfig): Array<[string, 
  * `hindsight.llm.context_window` and asserted to fit before launch. Picking
  * "better" constants would only relocate the same latent bug to the next
  * backend swap.
+ *
+ * **Caveat on the p90 above (added 2026-08-09).** That 32,270 figure measures
+ * whole prompts at batch 12; it is NOT a per-fact marginal cost, and dividing
+ * it by 12 to get one is the mistake that left
+ * `HINDSIGHT_CONSOLIDATION_TOKENS_PER_FACT` at 2,500 — low by ~1.8×. A
+ * 32,768-token backend therefore passed preflight at batch 6 and then
+ * truncated in production. The marginal cost has since been measured directly
+ * per batch size; see that constant's docstring in
+ * `hindsight-context-budget.ts`.
  */
 // Batch-size CEILING — the value the derivation lands on whenever the declared
 // window is large enough to fit it (131k and 200k both are), so a big-window
