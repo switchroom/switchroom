@@ -130,6 +130,60 @@ describe("stepMemoryBackend — recall-pool provisioning wiring", () => {
     expect(waitForHealthy.mock.calls.map((c) => c[0])).toEqual([18889, 18888]);
   });
 
+  it("degrades to a single container on the public port when the pool never becomes healthy", async () => {
+    // The outage finding: on a fresh split build the authority comes up on
+    // public+1 but the pool never becomes healthy, so NOTHING is bound on the
+    // public port that memory.config.url points at. The step must DEGRADE — stop
+    // the parked authority and relaunch a sole container on the PUBLIC port —
+    // and report success over a served endpoint, NOT throw into an outage.
+    const state = { authorityUp: false };
+    const startContainer = vi.fn<NonNullable<MemoryBackendDeps["startContainer"]>>(() => {
+      state.authorityUp = true;
+    });
+    const startRecallPool = vi.fn();
+    const stopRecallPool = vi.fn();
+    const stopContainer = vi.fn();
+    // authority(18889) healthy; pool(18888) never healthy; the single-container
+    // fallback re-probed on the public port (18888) is healthy.
+    const health = new Map<number, boolean[]>([
+      [18889, [true]],
+      [18888, [false, true]],
+    ]);
+    const waitForHealthy = vi.fn((port: number) =>
+      Promise.resolve(health.get(port)!.shift() ?? true),
+    );
+
+    const deps: MemoryBackendDeps = {
+      dockerProbe: makeDockerProbe(state),
+      recallPoolRunningProbe: () => false,
+      startContainer,
+      stopContainer,
+      startRecallPool,
+      waitForHealthy,
+      stopRecallPool,
+      readyRetries: 1,
+      sleep: async () => {},
+      pickPorts: async () => ({ apiPort: 18888, uiPort: 19999 }),
+      preflightPorts: async () => null,
+    };
+
+    const outcome = await stepMemoryBackend(SPLIT_ENABLED, true, tempConfigPath(), deps);
+
+    // Success over a served public port — not a throw.
+    expect(outcome).toEqual({ hindsightExpected: true, optedOut: false });
+    // startContainer twice: authority on public+1 (18889), then the sole
+    // fallback container on the PUBLIC port (18888).
+    expect(startContainer).toHaveBeenCalledTimes(2);
+    expect(startContainer.mock.calls[0][0]).toEqual(expect.objectContaining({ apiPort: 18889 }));
+    expect(startContainer.mock.calls[1][0]).toEqual(expect.objectContaining({ apiPort: 18888 }));
+    // The parked authority is stopped before the sole container relaunches.
+    expect(stopContainer).toHaveBeenCalledTimes(1);
+    // The pool was attempted once; the health gate ran authority, pool (fail),
+    // then the single-container fallback on the public port.
+    expect(startRecallPool).toHaveBeenCalledTimes(1);
+    expect(waitForHealthy.mock.calls.map((c) => c[0])).toEqual([18889, 18888, 18888]);
+  });
+
   it("does not touch the pool seam when the split is disabled (strict opt-in)", async () => {
     const state = { authorityUp: false };
     const startContainer = vi.fn<NonNullable<MemoryBackendDeps["startContainer"]>>(() => {

@@ -75,6 +75,18 @@ now an anomaly worth investigating, not the norm.
   clients`. Launch is health-gated: the authority container's pg0 must answer
   `/health` before the pool starts, and the pool must bind the public port
   before `memory.config.url` is declared live.
+- **A pool-boot failure now DEGRADES to single-container instead of taking
+  fleet memory down.** When the pool fails its health gate the authority is
+  parked on public+1 with nothing on the public port, so every agent's
+  `memory.config.url` would refuse — a total memory outage the crash-loop path
+  (`switchroom update` → `memory setup --recreate` on a bad worker count / OOM /
+  image regression) could hit. Both launch paths now fall back through one
+  shared orchestrator (`launchRecallPoolHealthGated`): stop the pool + the
+  parked authority and relaunch a sole container on the PUBLIC port, so the
+  fleet's memory endpoint stays served; only a fallback that ALSO fails is a
+  loud error. Bare `switchroom memory setup` (no `--recreate`) on an
+  authority-up/pool-dead split now performs the same pool repair the wizard
+  does instead of reporting "already running" over the unbound public port.
 
 ### Hindsight: an agent can finally read its own knowledge pages
 

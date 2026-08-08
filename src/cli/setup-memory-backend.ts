@@ -20,6 +20,7 @@ import {
   HINDSIGHT_CONSUMER_NAME,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
+  HINDSIGHT_DEFAULT_UI_PORT,
   pickHindsightPorts,
   preflightHindsightPorts,
   type DockerProbe,
@@ -32,6 +33,7 @@ import {
   isHindsightRecallPoolRunning,
   backgroundContainerPoolEnv,
   waitForHindsightHealthy,
+  launchRecallPoolHealthGated,
   HINDSIGHT_RECALL_POOL_CONTAINER,
   type RecallPoolConfig,
 } from "../setup/hindsight-recall-pool.js";
@@ -85,6 +87,14 @@ export interface MemoryBackendDeps {
    * without docker.
    */
   startContainer?: typeof startHindsight;
+  /**
+   * The authority-container stop seam, paired with {@link startContainer}. Only
+   * exercised by the pool-failure fallback (which stops the parked authority
+   * before relaunching a sole container on the public port), so a test can drive
+   * the degrade path without issuing real `docker stop`/`rm`. Production leaves
+   * it undefined ⇒ the real {@link stopHindsight}.
+   */
+  stopContainer?: typeof stopHindsight;
   /**
    * Broker seam for `resolveHindsightLlmSecrets`. Injected so tests can assert
    * the WIRING outcome — that a `vault:` LLM api_key is resolved BEFORE it
@@ -358,51 +368,90 @@ export async function stepMemoryBackend(
     return { litellmCfg, cpAccessKey, resolvedLlm };
   };
 
-  // The split's launch ordering, health-gated like the memory.ts launcher:
-  // the authority's pg0 must answer /health before the pool starts (else the
-  // pool crash-loops on connection-refused), and the pool must be healthy on
-  // the public port before the step reports success. Throws a named
-  // `Memory backend setup failed:` error so step 13 catches a half-built split.
+  // The split's launch ordering, health-gated like the memory.ts launcher, with
+  // the SAME pool-failure fallback (shared orchestrator so the two paths cannot
+  // diverge): the authority's pg0 must answer /health before the pool starts
+  // (else the pool crash-loops on connection-refused). If the pool never becomes
+  // healthy the authority is parked on public+1 with NOTHING on the public port
+  // (memory.config.url refuses) — so we DEGRADE to a single container on the
+  // public port rather than leave the fleet's memory endpoint unbound. Returns
+  // the end topology so the caller prints the right message. Throws a named
+  // `Memory backend setup failed:` error (step 13 catches it) only when even the
+  // single-container fallback cannot come up.
   const launchRecallPool = async (
     cfg: RecallPoolConfig,
     publicApiPort: number,
     authorityApiPort: number,
+    fallbackUiPort: number,
     secrets: Awaited<ReturnType<typeof resolveLaunchSecrets>>,
-  ): Promise<void> => {
-    console.log(
-      chalk.gray(
-        `  Waiting for the authority container to become healthy on ${authorityApiPort} (pg0 startup)...`,
-      ),
-    );
-    if (!(await waitHealthy(authorityApiPort))) {
-      throw new Error(
-        `Memory backend setup failed: the authority container did not become healthy on ` +
-          `${authorityApiPort}. Check \`docker logs switchroom-hindsight --tail 50\`, then ` +
-          "re-run `switchroom setup`, or set hindsight.recall_pool.enabled: false to skip the split.",
-      );
-    }
-    // Clear any stale sibling so `docker run --name` cannot hit a name conflict.
-    stopPool();
-    console.log(chalk.gray(`  Starting recall pool (${cfg.workers} workers) on ${publicApiPort}...`));
-    startPool({
-      cfg,
-      poolPort: publicApiPort,
-      litellm: secrets.litellmCfg,
-      llm: secrets.resolvedLlm,
-      // The authority caps its own DB pools when the split is on; the pool
-      // container inherits the same env base plus its own overrides.
-      perf: {
-        env: { ...backgroundContainerPoolEnv(), ...(config.hindsight?.env ?? {}) },
-        memLimit: config.hindsight?.mem_limit,
+  ): Promise<"split" | "degraded"> => {
+    const startContainer = deps.startContainer ?? startHindsight;
+    const result = await launchRecallPoolHealthGated({
+      publicApiPort,
+      authorityApiPort,
+      workers: cfg.workers,
+      waitForHealthy: (p) => waitHealthy(p),
+      stopPool,
+      startPool: () =>
+        startPool({
+          cfg,
+          poolPort: publicApiPort,
+          litellm: secrets.litellmCfg,
+          llm: secrets.resolvedLlm,
+          // The authority caps its own DB pools when the split is on; the pool
+          // container inherits the same env base plus its own overrides.
+          perf: {
+            env: { ...backgroundContainerPoolEnv(), ...(config.hindsight?.env ?? {}) },
+            memLimit: config.hindsight?.mem_limit,
+          },
+          cpAccessKey: secrets.cpAccessKey,
+        }),
+      degradeToSingleContainer: () => {
+        // Stop the pool + the parked authority and relaunch a SOLE container on
+        // the PUBLIC port with the single-container env (no background pool
+        // caps), so memory.config.url is served again.
+        stopPool();
+        (deps.stopContainer ?? stopHindsight)();
+        startContainer(
+          { apiPort: publicApiPort, uiPort: fallbackUiPort },
+          secrets.litellmCfg,
+          undefined,
+          secrets.resolvedLlm,
+          hindsightConsumerMirrorDir(config),
+          undefined,
+          { env: config.hindsight?.env, memLimit: config.hindsight?.mem_limit },
+          secrets.cpAccessKey,
+        );
       },
-      cpAccessKey: secrets.cpAccessKey,
+      log: (m) => console.log(chalk.gray(m)),
     });
-    if (!(await waitHealthy(publicApiPort))) {
-      throw new Error(
-        `Memory backend setup failed: the recall pool did not become healthy on ${publicApiPort}. ` +
-          `Inspect \`docker logs ${HINDSIGHT_RECALL_POOL_CONTAINER}\`, or set ` +
-          "hindsight.recall_pool.enabled: false and re-run `switchroom setup`.",
-      );
+    switch (result.outcome) {
+      case "split":
+        return "split";
+      case "degraded-single-container":
+        console.log(
+          chalk.yellow(
+            `  ! Recall pool failed (${result.reason}); DEGRADED to a single container on the ` +
+              `public port ${publicApiPort}. memory.config.url IS served, but the recall split is ` +
+              `OFF — inspect \`docker logs ${HINDSIGHT_RECALL_POOL_CONTAINER}\` and re-run ` +
+              "`switchroom setup` once fixed, or set hindsight.recall_pool.enabled: false.",
+          ),
+        );
+        return "degraded";
+      case "authority-unhealthy":
+        throw new Error(
+          `Memory backend setup failed: the authority container did not become healthy on ` +
+            `${authorityApiPort}. Check \`docker logs switchroom-hindsight --tail 50\`, then ` +
+            "re-run `switchroom setup`, or set hindsight.recall_pool.enabled: false to skip the split.",
+        );
+      case "degrade-failed":
+        throw new Error(
+          `Memory backend setup failed: the recall pool did not become healthy on ${publicApiPort} ` +
+            `AND the single-container fallback also failed to bind the public port. Inspect ` +
+            `\`docker logs switchroom-hindsight --tail 50\` and \`docker logs ` +
+            `${HINDSIGHT_RECALL_POOL_CONTAINER}\`, then re-run \`switchroom setup\`, or set ` +
+            "hindsight.recall_pool.enabled: false to skip the split.",
+        );
     }
   };
 
@@ -429,12 +478,23 @@ export async function stepMemoryBackend(
         uiPort: 0,
         defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
       });
-      await launchRecallPool(recallPoolCfg, publicApiPort, basePorts.apiPort, secrets);
-      console.log(
-        chalk.green(
-          `  ${STEP_DONE} Recall pool restored on ${publicApiPort} (authority on ${basePorts.apiPort})`,
-        ),
+      // fallbackUiPort: the authority is already running with its own UI port;
+      // this is only used if the pool restore fails and we relaunch a sole
+      // container. The default UI port is a safe fallback for that rare path.
+      const topo = await launchRecallPool(
+        recallPoolCfg,
+        publicApiPort,
+        basePorts.apiPort,
+        HINDSIGHT_DEFAULT_UI_PORT,
+        secrets,
       );
+      if (topo === "split") {
+        console.log(
+          chalk.green(
+            `  ${STEP_DONE} Recall pool restored on ${publicApiPort} (authority on ${basePorts.apiPort})`,
+          ),
+        );
+      }
       return { hindsightExpected: true, optedOut: false };
     }
     console.log(chalk.green(`  ${STEP_DONE} Hindsight container already running (switchroom-hindsight)`));
@@ -631,13 +691,24 @@ export async function stepMemoryBackend(
   // here throws a named `Memory backend setup failed:` error (step 13 catches
   // it), so the wizard never reports success over a half-built split.
   if (recallPoolCfg) {
-    await launchRecallPool(recallPoolCfg, publicApiPort, basePorts.apiPort, launchSecrets);
-    console.log(
-      chalk.green(
-        `  ${STEP_DONE} Hindsight recall split started: authority (pg0 + background) on ` +
-          `${basePorts.apiPort}, ${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}`,
-      ),
+    const topo = await launchRecallPool(
+      recallPoolCfg,
+      publicApiPort,
+      basePorts.apiPort,
+      basePorts.uiPort,
+      launchSecrets,
     );
+    if (topo === "split") {
+      console.log(
+        chalk.green(
+          `  ${STEP_DONE} Hindsight recall split started: authority (pg0 + background) on ` +
+            `${basePorts.apiPort}, ${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}`,
+        ),
+      );
+    }
+    // A `degraded` topology already logged its own warning inside launchRecallPool;
+    // the container serving the public port is now a single container, and the
+    // API/UI lines printed below still describe the live public port.
   }
 
   console.log(chalk.gray(`  API: http://localhost:${publicApiPort}/mcp`));

@@ -617,3 +617,99 @@ export async function waitForHindsightHealthy(
     await sleep(intervalMs);
   }
 }
+
+/**
+ * The end topology a split launch/repair actually reached. Callers branch on
+ * this instead of on an early `process.exit` / throw, so the "pool failed"
+ * path can DEGRADE to single-container rather than crash into a fleet-wide
+ * memory outage.
+ *
+ *   - `split`                      — authority + pool both healthy (the goal).
+ *   - `degraded-single-container`  — the pool never became healthy, so we fell
+ *                                    back to a sole container on the PUBLIC
+ *                                    port. memory.config.url IS served; the
+ *                                    operator should investigate the pool.
+ *   - `authority-unhealthy`        — the authority container itself never came
+ *                                    up. There is nothing to fall back TO (a
+ *                                    single container shares the same pg0), so
+ *                                    the caller fails loud.
+ *   - `degrade-failed`             — the pool failed AND the single-container
+ *                                    fallback also failed to bind the public
+ *                                    port. Nothing serves it; fail loud.
+ */
+export type RecallPoolLaunchResult =
+  | { outcome: "split" }
+  | { outcome: "degraded-single-container"; reason: string }
+  | { outcome: "authority-unhealthy" }
+  | { outcome: "degrade-failed"; reason: string };
+
+/**
+ * Health-gate the split launch AND own the pool-failure fallback, so BOTH
+ * launch paths (`switchroom memory setup` and first-run `switchroom setup`)
+ * degrade identically instead of diverging.
+ *
+ * The caller must have ALREADY started (or confirmed running) the authority
+ * container on `authorityApiPort` — this function does not start it, so the
+ * same sequence serves a fresh build and an "authority up, pool dead" repair.
+ * Sequence:
+ *
+ *   1. Wait for the authority to answer /health on `authorityApiPort` (its pg0
+ *      must be up before the pool connects, else the pool crash-loops on
+ *      connection-refused). Not healthy ⇒ `authority-unhealthy` (fail loud;
+ *      a single container shares the same pg0, so there is nothing to fall
+ *      back to).
+ *   2. Clear any stale sibling, start the pool on the PUBLIC port, wait for it
+ *      to answer /health. Healthy ⇒ `split`.
+ *   3. Pool NOT healthy ⇒ this is the outage finding: the authority is parked
+ *      on `public+1` and NOTHING is bound on the public port, so every agent's
+ *      memory.config.url refuses. DEGRADE: `degradeToSingleContainer` must stop
+ *      the pool + the parked authority and relaunch a SOLE container on the
+ *      public port. Health-gate the public port: healthy ⇒
+ *      `degraded-single-container`; still not ⇒ `degrade-failed` (fail loud —
+ *      even single-container could not come up).
+ *
+ * Every docker/health side effect is a caller-supplied closure so this is unit
+ * testable with no real containers.
+ */
+export async function launchRecallPoolHealthGated(opts: {
+  publicApiPort: number;
+  authorityApiPort: number;
+  workers: number;
+  waitForHealthy: (port: number) => Promise<boolean>;
+  /** Clear a stale recall-pool sibling before (re)launch. */
+  stopPool: () => void;
+  /** Start the recall pool on the public port. */
+  startPool: () => void;
+  /**
+   * Stop the pool + the parked authority and relaunch a SOLE container on the
+   * public port. Only invoked when the pool failed its health gate.
+   */
+  degradeToSingleContainer: () => void;
+  log?: (msg: string) => void;
+}): Promise<RecallPoolLaunchResult> {
+  const log = opts.log ?? (() => {});
+  log(
+    `  Waiting for the authority container to become healthy on ` +
+      `${opts.authorityApiPort} (pg0 startup)...`,
+  );
+  if (!(await opts.waitForHealthy(opts.authorityApiPort))) {
+    return { outcome: "authority-unhealthy" };
+  }
+  // Clear any stale sibling so `docker run --name` cannot hit a name conflict.
+  opts.stopPool();
+  log(`  Starting recall pool (${opts.workers} workers) on ${opts.publicApiPort}...`);
+  opts.startPool();
+  if (await opts.waitForHealthy(opts.publicApiPort)) {
+    return { outcome: "split" };
+  }
+  const reason = `the recall pool did not become healthy on ${opts.publicApiPort}`;
+  log(
+    `  Recall pool unhealthy on ${opts.publicApiPort}; degrading to a single ` +
+      `container on the public port so memory.config.url stays served...`,
+  );
+  opts.degradeToSingleContainer();
+  if (await opts.waitForHealthy(opts.publicApiPort)) {
+    return { outcome: "degraded-single-container", reason };
+  }
+  return { outcome: "degrade-failed", reason };
+}

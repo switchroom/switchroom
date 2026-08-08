@@ -42,6 +42,7 @@ import {
   hindsightLlmDroppedKeyWarning,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
+  HINDSIGHT_DEFAULT_UI_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
   resolveHindsightLiteLlm,
   hindsightLiteLlmDroppedKeyWarning,
@@ -53,9 +54,12 @@ import {
   resolveHindsightLaunchPorts,
   startHindsightRecallPool,
   stopHindsightRecallPool,
+  isHindsightRecallPoolRunning,
   waitForHindsightHealthy,
+  launchRecallPoolHealthGated,
   backgroundContainerPoolEnv,
   HINDSIGHT_RECALL_POOL_CONTAINER,
+  type RecallPoolConfig,
 } from "../setup/hindsight-recall-pool.js";
 import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
 import {
@@ -796,9 +800,162 @@ export function registerMemoryCommand(program: Command): void {
       // to pickHindsightPorts, e.g. when nothing is running yet.)
       const reusePorts = recreate ? getRunningHindsightPorts() : null;
 
-      // A plain `setup` on a running container is a no-op; --recreate
-      // proceeds (pull + recreate) even when it's up.
+      // A plain `setup` on a running container is a no-op — UNLESS the recall
+      // split is enabled and the pool sibling is dead. In that "authority up,
+      // pool dead" state (an apply that outlived its pool, a crash, a prior
+      // single-container run) the public port is UNBOUND and every agent's
+      // memory.config.url refuses, yet the authority-only check would report
+      // "already running" and return success over a partial outage. Mirror the
+      // wizard's repair: restore JUST the pool without restarting the authority.
+      // --recreate falls through to the full pull + recreate below.
       if (isHindsightRunning() && !recreate) {
+        let noRecreatePoolCfg: RecallPoolConfig | null = null;
+        try {
+          noRecreatePoolCfg = resolveRecallPoolConfig(getConfig(program).hindsight?.recall_pool);
+        } catch {
+          // A malformed recall_pool block degrades to single-container semantics
+          // (mirrors the launch path); nothing to repair, treat as already-running.
+          noRecreatePoolCfg = null;
+        }
+        if (noRecreatePoolCfg && !isHindsightRecallPoolRunning()) {
+          console.log(
+            chalk.gray(
+              "\n  Authority container is up but the recall pool is not — restoring the pool...",
+            ),
+          );
+          const repairConfig = getConfig(program);
+          const repairGpu = hindsightGpuDecision(
+            resolveHindsightGpuOverride({ flag: opts.gpu, config: repairConfig.hindsight?.gpu }),
+          );
+          // The running authority sits at public+1; the public port is anchored
+          // on config (an operator pin, or the port memory.ts persisted). Absent
+          // ⇒ the scaffolding default. basePorts.apiPort = public+1 = the port
+          // the authority is already serving on.
+          const repairConfigUrlPort = ((): number | undefined => {
+            try {
+              const p = Number(new URL(repairConfig.memory?.config?.url ?? "").port);
+              return Number.isInteger(p) && p > 0 ? p : undefined;
+            } catch {
+              return undefined;
+            }
+          })();
+          const { publicApiPort: repairPublicPort, basePorts: repairBasePorts } =
+            resolveHindsightLaunchPorts({
+              recallEnabled: true,
+              configUrlPort: repairConfigUrlPort,
+              reuseApiPort: undefined,
+              uiPort: 0,
+              defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
+            });
+          try {
+            const { litellm: repairLitellm } = await resolveLiteLLMForHindsight(repairConfig);
+            const repairLlm = await getResolvedLlm();
+            const repairCpAccessKey = await resolveHindsightCpAccessKey(repairConfig);
+            const repairAuthorityEnv = {
+              ...backgroundContainerPoolEnv(),
+              ...(repairConfig.hindsight?.env ?? {}),
+            };
+            const repairResult = await launchRecallPoolHealthGated({
+              publicApiPort: repairPublicPort,
+              authorityApiPort: repairBasePorts.apiPort,
+              workers: noRecreatePoolCfg.workers,
+              waitForHealthy: (p) => waitForHindsightHealthy(p),
+              stopPool: () => stopHindsightRecallPool(),
+              startPool: () =>
+                startHindsightRecallPool({
+                  cfg: noRecreatePoolCfg!,
+                  poolPort: repairPublicPort,
+                  imageTag: effectiveTag,
+                  litellm: repairLitellm,
+                  llm: repairLlm,
+                  gpu: repairGpu.enabled,
+                  perf: {
+                    env: repairAuthorityEnv,
+                    memLimit: repairConfig.hindsight?.mem_limit,
+                  },
+                  cpAccessKey: repairCpAccessKey,
+                }),
+              degradeToSingleContainer: () => {
+                // Pool restore failed → stop the pool + the parked authority and
+                // relaunch a SOLE container on the PUBLIC port (single-container
+                // env, no pool caps) so memory.config.url is served again.
+                const uiPort = getRunningHindsightPorts()?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
+                stopHindsightRecallPool();
+                stopHindsight();
+                startHindsight(
+                  { apiPort: repairPublicPort, uiPort },
+                  repairLitellm,
+                  effectiveTag,
+                  repairLlm,
+                  hindsightConsumerMirrorDir(repairConfig),
+                  repairGpu.enabled,
+                  { env: repairConfig.hindsight?.env, memLimit: repairConfig.hindsight?.mem_limit },
+                  repairCpAccessKey,
+                );
+              },
+              log: (m) => console.log(chalk.gray(m)),
+            });
+            switch (repairResult.outcome) {
+              case "split":
+                console.log(
+                  chalk.green(
+                    `\n  Recall pool restored on ${repairPublicPort} ` +
+                      `(authority on ${repairBasePorts.apiPort}).\n`,
+                  ),
+                );
+                break;
+              case "degraded-single-container":
+                console.log(
+                  chalk.yellow(
+                    `\n  ! Recall pool failed (${repairResult.reason}); DEGRADED to a single ` +
+                      `container on the public port ${repairPublicPort}. memory.config.url IS ` +
+                      `served, but the recall split is OFF — inspect \`docker logs ` +
+                      `${HINDSIGHT_RECALL_POOL_CONTAINER}\` and re-run \`switchroom memory setup ` +
+                      `--recreate\` once fixed, or set hindsight.recall_pool.enabled: false.\n`,
+                  ),
+                );
+                break;
+              case "authority-unhealthy":
+                console.error(
+                  chalk.red(
+                    `\n  The running authority container is not answering /health on ` +
+                      `${repairBasePorts.apiPort}; cannot restore the pool. Inspect ` +
+                      `\`docker logs switchroom-hindsight\` and re-run \`switchroom memory setup ` +
+                      `--recreate\`.\n`,
+                  ),
+                );
+                process.exit(1);
+                break;
+              case "degrade-failed":
+                console.error(
+                  chalk.red(
+                    `\n  Recall pool restore failed AND the single-container fallback could not ` +
+                      `bind the public port ${repairPublicPort}. Inspect \`docker logs ` +
+                      `switchroom-hindsight\` and \`docker logs ${HINDSIGHT_RECALL_POOL_CONTAINER}\`, ` +
+                      `then re-run \`switchroom memory setup --recreate\`.\n`,
+                  ),
+                );
+                process.exit(1);
+                break;
+            }
+          } catch (err) {
+            console.error(chalk.red(`\n  Failed to restore the recall pool: ${(err as Error).message}\n`));
+            process.exit(1);
+          }
+          // Anchor memory.config.url on the public port (unchanged when it was
+          // already pinned there; written when config had no url yet).
+          const repairUrl = `http://127.0.0.1:${repairPublicPort}/mcp/`;
+          try {
+            if (persistMemoryConfigUrl(getConfigPath(program), "claude-code", repairUrl)) {
+              console.log(chalk.gray(`  Updated ${getConfigPath(program)} with memory.config.url = ${repairUrl}`));
+            }
+          } catch (err) {
+            console.error(
+              chalk.yellow(`  Note: could not auto-update switchroom.yaml: ${(err as Error).message}`),
+            );
+          }
+          return;
+        }
         console.log(chalk.green("\n  Hindsight container is already running (switchroom-hindsight).\n"));
         return;
       }
@@ -1193,58 +1350,95 @@ export function registerMemoryCommand(program: Command): void {
         // pool crash-loops on connection-refused), then wait for the pool to
         // bind the public port before declaring memory.config.url live.
         if (recallPoolCfg) {
-          console.log(
-            chalk.gray(
-              `  Waiting for the authority container to become healthy on ${basePorts.apiPort} (pg0 startup)...`,
-            ),
-          );
-          const authorityHealthy = await waitForHindsightHealthy(basePorts.apiPort);
-          if (!authorityHealthy) {
-            console.error(
-              chalk.red(
-                `\n  Authority container did not become healthy on ${basePorts.apiPort}. ` +
-                  `The recall pool was NOT started; the authority container is serving on ` +
-                  `${basePorts.apiPort} only. Investigate \`docker logs switchroom-hindsight\` ` +
-                  `and re-run \`switchroom memory setup --recreate\`.\n`,
-              ),
-            );
-            process.exit(1);
-          }
-          console.log(
-            chalk.gray(`  Starting recall pool (${recallPoolCfg.workers} workers) on ${publicApiPort}...`),
-          );
-          startHindsightRecallPool({
-            cfg: recallPoolCfg,
-            poolPort: publicApiPort,
-            imageTag: effectiveTag,
-            litellm: litellmCfg,
-            llm: resolvedLlm,
-            gpu: gpuDecision.enabled,
-            perf: {
-              env: authorityEnv,
-              memLimit: hindsightConfig.hindsight?.mem_limit,
+          // Health-gate + own the pool-failure fallback through the SHARED
+          // orchestrator so this path and first-run `switchroom setup` cannot
+          // diverge. On pool-health failure we DEGRADE to a single container on
+          // the public port rather than exit into a fleet-wide memory outage
+          // (the authority is parked on public+1 with nothing on the public
+          // port, so every agent's memory.config.url would refuse).
+          const launchResult = await launchRecallPoolHealthGated({
+            publicApiPort,
+            authorityApiPort: basePorts.apiPort,
+            workers: recallPoolCfg.workers,
+            waitForHealthy: (p) => waitForHindsightHealthy(p),
+            stopPool: () => stopHindsightRecallPool(),
+            startPool: () =>
+              startHindsightRecallPool({
+                cfg: recallPoolCfg,
+                poolPort: publicApiPort,
+                imageTag: effectiveTag,
+                litellm: litellmCfg,
+                llm: resolvedLlm,
+                gpu: gpuDecision.enabled,
+                perf: {
+                  env: authorityEnv,
+                  memLimit: hindsightConfig.hindsight?.mem_limit,
+                },
+                cpAccessKey,
+              }),
+            degradeToSingleContainer: () => {
+              // Stop the pool + the parked authority and relaunch a SOLE
+              // container on the PUBLIC port with the single-container env (no
+              // background pool caps), so memory.config.url is served again.
+              stopHindsightRecallPool();
+              stopHindsight();
+              startHindsight(
+                { apiPort: publicApiPort, uiPort: basePorts.uiPort },
+                litellmCfg,
+                effectiveTag,
+                resolvedLlm,
+                hindsightConsumerMirrorDir(hindsightConfig),
+                gpuDecision.enabled,
+                { env: hindsightConfig.hindsight?.env, memLimit: hindsightConfig.hindsight?.mem_limit },
+                cpAccessKey,
+              );
             },
-            cpAccessKey,
+            log: (m) => console.log(chalk.gray(m)),
           });
-          const poolHealthy = await waitForHindsightHealthy(publicApiPort);
-          if (!poolHealthy) {
-            console.error(
-              chalk.red(
-                `\n  Recall pool did not become healthy on ${publicApiPort}. The authority ` +
-                  `container is up on ${basePorts.apiPort}, but the public port is not being ` +
-                  `served. Inspect \`docker logs ${HINDSIGHT_RECALL_POOL_CONTAINER}\`. To fall ` +
-                  `back to single-container, set hindsight.recall_pool.enabled: false and re-run ` +
-                  `\`switchroom memory setup --recreate\`.\n`,
-              ),
-            );
-            process.exit(1);
+          switch (launchResult.outcome) {
+            case "split":
+              console.log(
+                chalk.green(
+                  `\n  Hindsight recall split started: authority (pg0 + background) on ` +
+                    `${basePorts.apiPort}, ${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}.\n`,
+                ),
+              );
+              break;
+            case "degraded-single-container":
+              console.log(
+                chalk.yellow(
+                  `\n  ! Recall pool failed (${launchResult.reason}); DEGRADED to a single ` +
+                    `container on the public port ${publicApiPort}. memory.config.url IS served, ` +
+                    `but the recall split is OFF — inspect \`docker logs ` +
+                    `${HINDSIGHT_RECALL_POOL_CONTAINER}\` and re-run \`switchroom memory setup ` +
+                    `--recreate\` once fixed, or set hindsight.recall_pool.enabled: false.\n`,
+                ),
+              );
+              break;
+            case "authority-unhealthy":
+              console.error(
+                chalk.red(
+                  `\n  Authority container did not become healthy on ${basePorts.apiPort}. ` +
+                    `The recall pool was NOT started and no single container could share its ` +
+                    `pg0. Investigate \`docker logs switchroom-hindsight\` and re-run ` +
+                    `\`switchroom memory setup --recreate\`.\n`,
+                ),
+              );
+              process.exit(1);
+              break;
+            case "degrade-failed":
+              console.error(
+                chalk.red(
+                  `\n  Recall pool did not become healthy on ${publicApiPort} AND the ` +
+                    `single-container fallback also failed to bind the public port. Inspect ` +
+                    `\`docker logs switchroom-hindsight\` and \`docker logs ` +
+                    `${HINDSIGHT_RECALL_POOL_CONTAINER}\`, then re-run \`switchroom memory setup ` +
+                    `--recreate\`.\n`,
+                ),
+              );
+              process.exit(1);
+              break;
           }
-          console.log(
-            chalk.green(
-              `\n  Hindsight recall split started: authority (pg0 + background) on ` +
-                `${basePorts.apiPort}, ${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}.\n`,
-            ),
-          );
         } else {
           console.log(chalk.green(`\n  Hindsight container started (switchroom-hindsight) on port ${basePorts.apiPort}.\n`));
         }
