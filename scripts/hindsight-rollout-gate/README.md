@@ -131,10 +131,20 @@ between a live pre-capture and a live post-capture minutes later. It is
 deliberately not widened to cover WP6's comparison-B artefact range (0.36–0.75):
 the low end must stay a failure.
 
-**This entry needs the epic owner's explicit sign-off** before the WP7 window —
-WP6 and the stage-4 validator both flagged that Jaccard cannot say whether the
-shift is better or worse, only that it is real, bounded, deterministic,
-count-neutral and latency-neutral.
+**This entry is signed off.** WP6 and the stage-4 validator both flagged that
+Jaccard cannot say whether the shift is better or worse, only that it is real,
+bounded, deterministic, count-neutral and latency-neutral — so the call was the
+epic owner's to make. Ken Thompson (@mekenthompson) made it on **2026-08-08:
+ACCEPT**. Rollout proceeds on that basis.
+
+Accepting the band is a decision about blast radius, not a claim that the
+ranking is correct. The underlying defect — `_select_with_temporal_coverage`
+(0.9.0 `retrieval.py:428`) has no deterministic tiebreaker, so equal-similarity
+ties inherit SQL row order — is tracked in **switchroom#4544** (`follow_up` on
+the declaration). When it is fixed, `temporal-relative` should return to ~1.000
+on byte-identical data and this declaration should be deleted; the comparator's
+`expected-shift-not-observed` verdict is the mechanism that will surface the
+stale declaration if it is not.
 
 ## Soak measurement
 
