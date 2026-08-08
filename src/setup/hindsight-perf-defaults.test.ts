@@ -41,6 +41,8 @@ import {
   HINDSIGHT_PERF_DEFAULTS_GPU,
   HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
   HINDSIGHT_PERF_DEFAULTS_UNGATED,
+  HINDSIGHT_PERF_ALLOW_EMPTY_KEYS,
+  findUnmanagedHindsightEnvKeys,
   HINDSIGHT_PERF_ENV_KEYS,
   HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS,
   HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES,
@@ -352,7 +354,7 @@ describe("operator override wins", () => {
     expect(got.size).toBe(0);
   });
 
-  it("is overridable on exactly these fifty-one keys, by name", () => {
+  it("is overridable on exactly these fifty-six keys, by name", () => {
     // Spelled out, NOT derived from the three group arrays. HINDSIGHT_PERF_ENV_KEYS
     // is DEFINED as the union of those arrays, so asserting it equals that union
     // is a tautology — it passes no matter which keys are in the arrays. The
@@ -365,6 +367,13 @@ describe("operator override wins", () => {
       "HINDSIGHT_API_CONSOLIDATION_LLM_PARALLELISM",
       "HINDSIGHT_API_CONSOLIDATION_MAX_MEMORIES_PER_ROUND",
       "HINDSIGHT_API_CONSOLIDATION_RECALL_MAX_CONCURRENT",
+      // The ONNX embeddings provider cutover — override-only, no shipped
+      // default. The two _PREFIX keys are also empty-string-legal.
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID",
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX",
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING",
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX",
+      "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
       "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
       "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT",
       "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT",
@@ -504,6 +513,99 @@ describe("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY (override-only)", () 
     expect(runEnv(runArgs()).get("HINDSIGHT_API_WORKER_CONSOLIDATION_BANK_PRIORITY")).toEqual([
       MAP,
     ]);
+  });
+});
+
+// ── the ONNX embeddings provider cutover (override-only, empty-legal) ──────
+describe("ONNX embeddings env overrides", () => {
+  // The exact five-key block an operator writes to cut hindsight over from the
+  // slower `local` backend to ONNX-CPU. The two prefixes are intentionally "".
+  const EMBED_ENV = {
+    HINDSIGHT_API_EMBEDDINGS_PROVIDER: "onnx",
+    HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID: "BAAI/bge-small-en-v1.5",
+    HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING: "cls",
+    HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX: "",
+    HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX: "",
+  };
+  const KEYS = Object.keys(EMBED_ENV);
+
+  it("all five keys are managed and override-only (no shipped default)", () => {
+    for (const key of KEYS) {
+      expect(HINDSIGHT_PERF_ENV_KEYS.has(key), `${key} must be managed`).toBe(true);
+      expect(
+        HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS.has(key),
+        `${key} must be override-only`,
+      ).toBe(true);
+    }
+    const defaulted = new Set(
+      [
+        ...HINDSIGHT_PERF_DEFAULTS_UNGATED,
+        ...HINDSIGHT_PERF_DEFAULTS_GPU,
+        ...HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM,
+      ].map(([k]) => k),
+    );
+    for (const key of KEYS) {
+      expect(defaulted.has(key), `${key} must not ship a default`).toBe(false);
+    }
+    // The empty-legal exception is scoped to exactly the two affix prefixes.
+    expect([...HINDSIGHT_PERF_ALLOW_EMPTY_KEYS].sort()).toEqual([
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX",
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX",
+    ]);
+  });
+
+  it("resolves all five, PRESERVING the two empty-string prefixes", () => {
+    // The bug this guards: resolveHindsightPerfOverrides drops empty values as
+    // "an empty env var is an accident". For bge parity the empty prefix is
+    // REQUIRED — dropping it lets upstream's "query: "/"passage: " defaults
+    // reappear and corrupts recall against a bank embedded without them.
+    const got = resolveHindsightPerfOverrides(EMBED_ENV, {});
+    expect(got.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")).toBe("onnx");
+    expect(got.get("HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID")).toBe("BAAI/bge-small-en-v1.5");
+    expect(got.get("HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING")).toBe("cls");
+    expect(got.has("HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX")).toBe(true);
+    expect(got.get("HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX")).toBe("");
+    expect(got.has("HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX")).toBe(true);
+    expect(got.get("HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX")).toBe("");
+  });
+
+  it("an empty value on a NON-allow-empty embeddings key is still dropped", () => {
+    // The empty-legal carve-out must not leak to the other three keys — an
+    // empty provider/model/pooling is genuinely an accident upstream rejects.
+    const got = resolveHindsightPerfOverrides(
+      {
+        HINDSIGHT_API_EMBEDDINGS_PROVIDER: "",
+        HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID: "   ",
+      },
+      {},
+    );
+    expect(got.has("HINDSIGHT_API_EMBEDDINGS_PROVIDER")).toBe(false);
+    expect(got.has("HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID")).toBe(false);
+  });
+
+  it("reaches BOTH launch paths, empty prefixes included, from hindsight.env", () => {
+    // Whole-block durability: the hand-recreated container cutover must survive
+    // the next `switchroom apply`/recreate on whichever path the operator uses.
+    const perf = { env: EMBED_ENV, processEnv: {} };
+    startHindsight(undefined, LOOPBACK_LITELLM, undefined, undefined, undefined, false, perf);
+    const fromRun = runEnv(runArgs());
+    const fromCompose = composeEnv(
+      generateHindsightComposeSnippet(undefined, undefined, LOOPBACK_LITELLM, false, perf),
+    );
+    expect(fromRun.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")).toEqual(["onnx"]);
+    expect(fromCompose.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")).toEqual(["onnx"]);
+    // `-e KEY=` and `      - KEY=` are the empty-string forms on each path;
+    // both must carry the key, with an empty value, not drop it.
+    expect(fromRun.get("HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX")).toEqual([""]);
+    expect(fromRun.get("HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX")).toEqual([""]);
+    expect(fromCompose.get("HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX")).toEqual([""]);
+    expect(fromCompose.get("HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX")).toEqual([""]);
+  });
+
+  it("is NOT flagged as an unmanaged hindsight.env key", () => {
+    // Before this change these keys were outside the managed set, so a yaml
+    // line for them was both silently dropped AND surfaced as a doctor FAIL.
+    expect(findUnmanagedHindsightEnvKeys(EMBED_ENV)).toEqual([]);
   });
 });
 

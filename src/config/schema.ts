@@ -3019,7 +3019,17 @@ export const HindsightConfigSchema = z.object({
       "keyword (BM25) recall arm searches for; unset means upstream's 0 = " +
       "unbounded, which makes a multi-KB consolidation query a disjunction " +
       "over hundreds of terms; set e.g. 64 to cap it, at the cost of " +
-      "silently dropping the tail of a long query; plus the " +
+      "silently dropping the tail of a long query; and " +
+      "HINDSIGHT_API_EMBEDDINGS_PROVIDER with the four " +
+      "HINDSIGHT_API_EMBEDDINGS_ONNX_{MODEL_ID,POOLING,QUERY_PREFIX," +
+      "PASSAGE_PREFIX} keys — the ONNX-embeddings cutover: unset keeps " +
+      "upstream's slower `local` (PyTorch) backend, set `onnx` plus the model " +
+      "id/pooling to run the SAME model on ONNX-CPU at a fraction of the " +
+      "latency; the two _PREFIX keys are the query/passage affixes and are " +
+      "set to the empty string for bge parity (vectors are byte-identical " +
+      "between the two backends, so no re-embedding is needed) — unusually " +
+      "for this block an EMPTY value here is honoured, not dropped, because an " +
+      "affix-free prefix is the intended value; plus the " +
       "embedded-PostgreSQL (pg0) sizing keys switchroom manages in " +
       "src/setup/hindsight-pg-defaults.ts (`HINDSIGHT_PG_ENV_KEYS`: " +
       "SWITCHROOM_HINDSIGHT_PG_EFFECTIVE_CACHE_SIZE, " +
