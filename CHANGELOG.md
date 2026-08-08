@@ -35,6 +35,26 @@ now an anomaly worth investigating, not the norm.
   `/clear`) and to the `/commands` help text. Autocomplete-only change; no
   handler or retain-side logic touched.
 
+### Agent guidance: correct three wrong Hindsight claims in the profile templates
+
+- **`profiles/*/CLAUDE.md.hbs` no longer tells agents that every Hindsight MCP
+  tool is pre-approved, that recall fires on every inbound message, or that
+  auto-retain is fixed at every 3rd turn.** All three were false against the
+  source: the permission surface is an enumerated 26-name allow-list
+  (`src/agents/scaffold.ts:1241`) that omits eight server tools — the four
+  mental-model writes (blocked by the #2974 PreToolUse redirect) plus
+  `delete_bank` / `clear_memories` / `delete_directive` / `clear_mental_model`,
+  which raise an approval card; recall has three early-return gates before it
+  queries anything (short prompt, ack phrase, `_is_trivial_stateless` under a
+  default-on `recallSkipTrivial` —
+  `vendor/hindsight-memory/scripts/recall.py:1716,1749,1762`), so an empty
+  memory block does not mean an empty bank; and the retain cadence is per-agent
+  (`memory.retain.every_n_turns`, scaffold default 3, live agents at 8) with a
+  window of `overlap_turns + every_n_turns`, not a fixed ~4. `profiles/default`
+  is injected into every agent, so each wrong sentence was a wrong belief
+  fleet-wide. Prose only — an agent picks the corrected guidance up on its next
+  restart.
+
 ## v0.20.17 — Hindsight bakes the bge ONNX export into the image and boots HF-offline
 
 ### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot
