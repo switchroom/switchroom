@@ -24,7 +24,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { SwitchroomConfig } from "../config/schema.js";
 import type { DockerProbe } from "../setup/hindsight.js";
-import { stepMemoryBackend, type MemoryBackendDeps } from "./setup.js";
+import { stepMemoryBackend, type MemoryBackendDeps } from "./setup-memory-backend.js";
 
 /** A writable switchroom.yaml so `ensureHindsightConsumer` has a file to edit. */
 function tempConfigPath(): string {
