@@ -40,11 +40,12 @@ import {
   AGENT_POLL_INTERVAL_MS,
   SetupVerificationError,
 } from "../src/setup/verify.js";
-import {
-  stepVerification,
-  stepMemoryBackend,
-  reportSetupFailure,
-} from "../src/cli/setup.js";
+import { stepVerification, reportSetupFailure } from "../src/cli/setup.js";
+// `stepMemoryBackend` was extracted out of setup.ts into its own vault-free
+// module so its own tests can run under vitest at all (the old placement
+// pulled bun:sqlite transitively through the vault graph). setup.ts now only
+// consumes it, so import it from where it actually lives.
+import { stepMemoryBackend } from "../src/cli/setup-memory-backend.js";
 import { classifyContainerStatus } from "../src/cli/doctor-docker.js";
 import type { ContainerRow } from "../src/cli/doctor-docker.js";
 import type { SwitchroomConfig } from "../src/config/schema.js";

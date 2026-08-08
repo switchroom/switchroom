@@ -641,20 +641,30 @@ describe("Hindsight port-collision regression", () => {
   // ports arg, bypassing the pick+preflight guard `switchroom memory` applies,
   // so a fresh install with 18888 occupied would crash-loop. It must route the
   // launch through the SAME pick+preflight helpers.
-  it("setup.ts routes its Hindsight launch through the pick+preflight guard", () => {
-    const src = readFileSync(resolve(import.meta.dirname, "../src/cli/setup.ts"), "utf-8");
+  it("the setup memory step routes its Hindsight launch through the pick+preflight guard", () => {
+    // `stepMemoryBackend` — and with it this launch — was extracted out of
+    // setup.ts into src/cli/setup-memory-backend.ts. Read the file that
+    // actually owns the call site, or this guard passes vacuously.
+    const src = readFileSync(
+      resolve(import.meta.dirname, "../src/cli/setup-memory-backend.ts"),
+      "utf-8",
+    );
     // Must no longer blind-launch on the default port. Whitespace-tolerant:
     // the call site may be formatted multi-line (#2578 added trailing args).
     expect(src).not.toMatch(/startHindsight\(\s*undefined/);
     // Must use the shared guard helpers (not a parallel implementation) and
-    // hand the chosen ports to the launch (first argument = `ports`).
+    // hand the chosen ports to the launch as the first argument.
     expect(src).toContain("pickHindsightPorts");
     expect(src).toContain("preflightHindsightPorts");
-    // The launch now goes through an injectable seam (setup-verification
-    // review H2 needed a docker-free test of "started but did not stay
-    // running"), so accept either name at the call site — and pin that the
-    // seam's DEFAULT is still the real `startHindsight`.
-    expect(src).toMatch(/(?:startHindsight|startContainer)\(\s*ports\b/);
+    // The launch goes through an injectable seam (setup-verification review H2
+    // needed a docker-free test of "started but did not stay running"), so
+    // accept either name at the call site. The first argument is the
+    // guard-derived ports object: `ports` straight from pick+preflight, or
+    // `basePorts` — the recall-pool split's re-anchoring of that same object
+    // (resolveHindsightLaunchPorts takes `reuseApiPort: ports.apiPort`), never
+    // `undefined` or a raw default. Pin that the seam's DEFAULT is still the
+    // real `startHindsight`.
+    expect(src).toMatch(/(?:startHindsight|startContainer)\(\s*(?:ports|basePorts)\b/);
     expect(src).toMatch(/deps\.startContainer \?\? startHindsight/);
   });
 
