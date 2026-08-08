@@ -1511,6 +1511,45 @@ export const HINDSIGHT_PERF_DEFAULTS_LOCAL_LLM: ReadonlyArray<readonly [string, 
  *     HINDSIGHT_API_BM25_MAX_QUERY_TERMS: "64"
  * ```
  *
+ * ### The ONNX embeddings provider cutover
+ *
+ * `HINDSIGHT_API_EMBEDDINGS_PROVIDER`, `..._ONNX_MODEL_ID`,
+ * `..._ONNX_POOLING`, `..._ONNX_QUERY_PREFIX`, `..._ONNX_PASSAGE_PREFIX`.
+ *
+ * Upstream defaults the embedding backend to `local` (PyTorch), which on this
+ * fleet carries a ~130 ms/encode garbage-collection tax and a recall p50 near
+ * 160 ms. The `onnx` provider runs the SAME model on ONNX Runtime CPU at a p50
+ * near 5.7 ms. The vectors are byte-identical between the two backends
+ * (BAAI/bge-small-en-v1.5, dim 384, CLS pooling, no affixes), so this is a
+ * latency choice, not a correctness one — an existing bank does not need
+ * re-embedding to switch.
+ *
+ * Override-only, no shipped default: which provider is worth it is a property
+ * of the host (CPU headroom, whether an ONNX build of the model is present in
+ * the image), not of the software, so switchroom ships no opinion and keeps
+ * upstream's `local` until an operator opts in. All five keys ARE real
+ * upstream `HINDSIGHT_API_` config fields — the block is emitted verbatim,
+ * nothing is derived.
+ *
+ * The cutover is all-or-nothing: `PROVIDER: onnx` alone is not enough, the
+ * model id, pooling, and BOTH affix keys pin bge parity. The two prefix keys
+ * are set to the EMPTY string on purpose — bge-small takes no query/passage
+ * affix, and an empty prefix is the value that reproduces the `local`
+ * backend's vectors exactly. That empty string is load-bearing: dropping it
+ * (see {@link HINDSIGHT_PERF_ALLOW_EMPTY_KEYS}) would let upstream's own
+ * `"query: "` / `"passage: "` defaults reappear and silently corrupt recall
+ * against a bank embedded without them.
+ *
+ * ```yaml
+ * hindsight:
+ *   env:
+ *     HINDSIGHT_API_EMBEDDINGS_PROVIDER: "onnx"
+ *     HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID: "BAAI/bge-small-en-v1.5"
+ *     HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING: "cls"
+ *     HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX: ""     # bge parity — no affix
+ *     HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX: ""   # bge parity — no affix
+ * ```
+ *
  * ### DELIBERATELY NOT ADOPTED from v0.8.6
  *
  * - `HINDSIGHT_API_LOOP_WATCHDOG_ENABLED` / `..._STALL_THRESHOLD_MS` /
@@ -1541,6 +1580,34 @@ export const HINDSIGHT_PERF_OVERRIDE_ONLY_KEYS: ReadonlySet<string> = new Set([
   "HINDSIGHT_API_TEMPORAL_MAX_QUERY_CHARS",
   "HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE",
   "HINDSIGHT_API_BM25_MAX_QUERY_TERMS",
+  // The ONNX embeddings provider cutover — all five pin bge parity so a bank
+  // does not need re-embedding to switch off upstream's slower `local`
+  // backend. The two prefix keys are override-only AND empty-string-legal
+  // (see HINDSIGHT_PERF_ALLOW_EMPTY_KEYS): "" is the value that reproduces the
+  // local backend's affix-free vectors, and dropping it would reintroduce
+  // upstream's "query: " / "passage: " defaults.
+  "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
+  "HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID",
+  "HINDSIGHT_API_EMBEDDINGS_ONNX_POOLING",
+  "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX",
+  "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX",
+]);
+
+/**
+ * Managed keys for which an EMPTY-string value is a legitimate override, not
+ * the "empty env var is an accident" case {@link resolveHindsightPerfOverrides}
+ * otherwise drops.
+ *
+ * Both entries are ONNX-embeddings affix prefixes. bge-small-en-v1.5 takes no
+ * query/passage affix, so the empty string is the value that reproduces the
+ * `local` backend's vectors exactly. Because these are verbatim affixes rather
+ * than tuning scalars, the resolver preserves their value UNTRIMMED — a prefix
+ * such as E5's `"query: "` is meaningful down to its trailing space, and the
+ * empty string must survive rather than being read as "unset".
+ */
+export const HINDSIGHT_PERF_ALLOW_EMPTY_KEYS: ReadonlySet<string> = new Set([
+  "HINDSIGHT_API_EMBEDDINGS_ONNX_QUERY_PREFIX",
+  "HINDSIGHT_API_EMBEDDINGS_ONNX_PASSAGE_PREFIX",
 ]);
 
 /**
@@ -1638,7 +1705,9 @@ export const HINDSIGHT_PERF_ENV_KEYS: ReadonlySet<string> = new Set([
  * Keys outside {@link HINDSIGHT_PERF_ENV_KEYS} are ignored, as are empty /
  * whitespace-only values (an empty env var is an accident, not an override —
  * forwarding it would hand the container a value upstream's config parser
- * rejects).
+ * rejects). The exception is {@link HINDSIGHT_PERF_ALLOW_EMPTY_KEYS}: for those
+ * keys an empty string is a deliberate override (an affix-free embeddings
+ * prefix) and is preserved verbatim, untrimmed.
  *
  * @param configEnv `config.hindsight?.env`, if any.
  * @param processEnv Injected for tests; defaults to `process.env`.
@@ -1674,7 +1743,14 @@ export function resolveHindsightPerfOverrides(
   const seenProcess = new Set<string>();
   for (const key of HINDSIGHT_PERF_ENV_KEYS) {
     const fromProcess = processEnv[key];
-    if (typeof fromProcess === "string" && fromProcess.trim() !== "") {
+    if (typeof fromProcess !== "string") continue;
+    // Verbatim-affix keys accept "" and preserve surrounding whitespace — an
+    // empty embeddings prefix is a deliberate override, not an accident.
+    if (HINDSIGHT_PERF_ALLOW_EMPTY_KEYS.has(key)) {
+      set(out, seenProcess, key, fromProcess);
+      continue;
+    }
+    if (fromProcess.trim() !== "") {
       set(out, seenProcess, key, fromProcess.trim());
     }
   }
@@ -1688,6 +1764,12 @@ export function resolveHindsightPerfOverrides(
   );
   for (const [key, raw] of configEntries) {
     if (!HINDSIGHT_PERF_ENV_KEYS.has(key)) continue;
+    // Verbatim-affix keys keep their exact value, including "" and any
+    // surrounding whitespace — see HINDSIGHT_PERF_ALLOW_EMPTY_KEYS.
+    if (HINDSIGHT_PERF_ALLOW_EMPTY_KEYS.has(key)) {
+      set(out, seenConfig, key, String(raw));
+      continue;
+    }
     const value = String(raw).trim();
     if (value === "") continue;
     set(out, seenConfig, key, value);
