@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "_doc": [
+    "Declared expected-shift cells for the Hindsight rollout gate.",
+    "",
+    "An entry here does NOT silence a cell. It reclassifies it from FAIL to",
+    "EXPECTED-SHIFT, and compare_baseline.py still prints its measured Jaccard",
+    "in a dedicated section of every report. A declared shift that vanishes",
+    "from the output is how a real regression hides, so the comparator also",
+    "reports when a declared shift did NOT occur (jaccard above the band) and",
+    "when a declaration matched no cell at all (stale declaration).",
+    "",
+    "A measurement BELOW jaccard_min is still a FAIL: the declaration is a",
+    "band, not a floor removal.",
+    "",
+    "Entries are version-scoped. A declaration applies only when the baseline",
+    "capture's api_version matches from_api_version AND the post capture's",
+    "matches to_api_version. That makes the list self-retiring: once the fleet",
+    "is past 0.9.0, the entry below stops applying on its own instead of",
+    "quietly excusing the same cell forever.",
+    "",
+    "Fields:",
+    "  query_id        query id from canned_recall.py QUERIES",
+    "  banks           '*' or an explicit list of bank ids",
+    "  jaccard_min     inclusive lower bound of the accepted shift band",
+    "  jaccard_max     inclusive upper bound; above this the shift did NOT",
+    "                  occur and is reported as such",
+    "  from_api_version / to_api_version   version scope, or null for 'any'",
+    "  reason / evidence / signed_off_by   why this is not a defect"
+  ],
+  "shifts": [
+    {
+      "query_id": "temporal-relative",
+      "banks": "*",
+      "jaccard_min": 0.6,
+      "jaccard_max": 0.85,
+      "from_api_version": "0.8.6",
+      "to_api_version": "0.9.0",
+      "reason": "Deterministic tie-break reshuffle, not a retrieval defect. _select_with_temporal_coverage (0.9.0 retrieval.py:428) ranks its pool with a stable sort on similarity and NO deterministic tiebreaker, then buckets in ranked order, so equal-similarity ties inherit SQL row order. Any change to plans, physical order or pool composition reshuffles the temporal arm's entry points and everything downstream (graph spreading, rerank) follows. The function itself is byte-identical between 0.8.6 and 0.9.0.",
+      "evidence": "WP6 (switchroom#4533) comparison C, byte-identical data, 0.8.6 image vs 0.9.0 image on the same restored copy: overlord 0.793, klanker 0.688, finn 0.782. Counts -1%/+9%/+1%, latency unchanged. Reproduced exactly across a container restart and a full downgrade -> re-upgrade cycle (Jaccard 1.000 against itself). 27/30 other cells passed, 25 of them at 1.000, including entity-person at 1.000 on all three banks. Stage-4 independent validation (switchroom#4525) confirmed the attribution in 0.9.0 source.",
+      "band_derivation": "WP6 measured 0.688-0.793 on byte-identical data. The band is widened to 0.60-0.85 to absorb the organic ingest that accrues between a live pre-capture and a live post-capture minutes later. It is deliberately NOT widened further: below 0.60 is outside anything WP6 observed and should stop the rollout.",
+      "signed_off_by": "epic owner sign-off required before the WP7 window - see switchroom#4525 'the epic owner still owes the explicit better/worse/accept call'",
+      "issue": "switchroom#4533"
+    }
+  ]
+}

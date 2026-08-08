@@ -160,6 +160,10 @@ jobs:
       - name: Run litellm-pacer unittests
         working-directory: docker/litellm-pacer
         run: python3 -m unittest discover -s . -p 'test_*.py'
+      # Mirrors ci-tests-python.yml — hindsight server-bump rollout gate.
+      - name: Run hindsight-rollout-gate unittests
+        working-directory: scripts/hindsight-rollout-gate
+        run: python3 -m unittest discover -s tests -t .
 
   # ─── Docker e2e, forced COLD path (mirrors docker-e2e.yml e2e) ────
   # Deliberately no actions/cache restore: the nightly job exists to
