@@ -15,6 +15,21 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot
+
+- **`docker/Dockerfile.hindsight` now bakes the `BAAI/bge-small-en-v1.5`
+  `onnx/model.onnx` export into the HF cache and sets `HF_HUB_OFFLINE=1`.**
+  The base image already bakes the bge *safetensors* weights and the
+  `cross-encoder/ms-marco-MiniLM-L-6-v2` reranker, but the ONNX graph the
+  `onnx` embeddings provider needs was fetched at runtime into the container's
+  ephemeral writable layer — so a `docker rm`/recreate wiped it and boot
+  re-downloaded 133MB from HuggingFace, taking recall down for every agent
+  when HF was slow or unreachable. Baking the graph (pinned to the same
+  `5c38ec7` snapshot as the tokenizer/config) and forcing HF offline makes
+  hindsight boot fully self-contained. The paired provider override block
+  (`HINDSIGHT_API_EMBEDDINGS_PROVIDER=onnx` + bge/CLS/no-prefix settings)
+  lands separately in `switchroom.yaml` after this image ships.
+
 ## v0.20.16 — the release CHANGELOG entry is staged author-side, and image builds got faster
 
 ### CI: faster hindsight image build and e2e probe
