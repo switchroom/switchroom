@@ -97,6 +97,159 @@ volume. **Rolling forward is one step; rolling back is two, in this order.**
 3. Take a `pg_dump` first (see "On-demand backup" above). A downgrade is not
    guaranteed to be lossless — see the caveat below.
 
+### v0.9.0 → v0.8.6, concretely
+
+**Do the alembic downgrade.** Rolling back properly here is a *full* repair —
+nothing is left degraded — and skipping it costs you an entity-resolution
+latency cliff that nothing alarms on. That asymmetry is the whole reason this
+entry exists.
+
+0.9.0 advances the head `c7d1e9a4b3f2` → `b3e8d1c6f4a9` over **five**
+migrations, in this order (verified from
+`hindsight-api-slim/hindsight_api/alembic/versions/`, `down_revision` chain
+read revision by revision):
+
+| # | Revision | Forward op | Downgrade restores |
+|---|----------|-----------|--------------------|
+| 1 | `a1c9e7f3b2d8` | `DROP CONSTRAINT IF EXISTS observation_history_observation_id_fkey` | DELETEs `observation_history` rows whose `observation_id` has no live `memory_units` row, then re-adds the FK |
+| 2 | `a9b8c7d6e5f4` | `CREATE TABLE IF NOT EXISTS knowledge_pages` + 2 indexes | drops the table and its indexes |
+| 3 | `e4a7c1b9d2f6` | `DROP COLUMN IF EXISTS access_count` on `memory_units` + `invalidated_memory_units` | re-adds the column `NOT NULL DEFAULT 0` and `idx_memory_units_access_count` (values are gone; nothing reads them) |
+| 4 | `f2a6d8c4b1e9` | `DROP INDEX IF EXISTS idx_memory_units_embedding` (under `SET LOCAL lock_timeout='10s'`) | **deliberate no-op** — see "no vector cliff" below |
+| 5 | `b3e8d1c6f4a9` | adds `entities.entity_kind` + CHECK, backfills it, builds the partial trgm index `entities_canonical_name_lower_trgm_nonlabel_idx` CONCURRENTLY, then drops the old full index | rebuilds the old full index CONCURRENTLY *first*, then drops the column (which takes the partial index and CHECK with it) |
+
+The head to downgrade *to* is `c7d1e9a4b3f2` — 0.8.6's own head, i.e. the
+`down_revision` of migration 1 above.
+
+#### Step 1 — downgrade, while the 0.9.0 image is still running
+
+```bash
+docker exec switchroom-hindsight /app/api/.venv/bin/python - <<'PY'
+from pathlib import Path
+from alembic import command
+from alembic.config import Config
+import hindsight_api
+from hindsight_api.migrations import _set_alembic_main_option
+cfg = Config()
+_set_alembic_main_option(
+    cfg, "script_location", str(Path(hindsight_api.__file__).parent / "alembic"))
+_set_alembic_main_option(cfg, "sqlalchemy.url", "<the libpq URL for pg0>")
+command.downgrade(cfg, "c7d1e9a4b3f2")   # 0.8.6's head
+PY
+```
+
+Confirm before moving on:
+
+```bash
+docker exec switchroom-hindsight sh -lc '
+  PW=$(python3 -c "import json;print(json.load(open(\"/home/hindsight/.pg0/instances/hindsight/instance.json\"))[\"password\"])")
+  PGPASSWORD="$PW" /home/hindsight/.pg0/installation/*/bin/psql -U hindsight -h /tmp -d hindsight -c \
+    "SELECT version_num FROM alembic_version" -c \
+    "SELECT indexname FROM pg_indexes WHERE tablename = '"'"'entities'"'"' AND indexname LIKE '"'"'%trgm%'"'"'"
+'
+```
+
+Expect `c7d1e9a4b3f2`, `entities_canonical_name_lower_trgm_idx` **present**,
+and `…_nonlabel_idx` **gone**.
+
+#### Step 2 — then repoint the digest
+
+Set `docker/Dockerfile.hindsight`'s digest and its
+`# switchroom:hindsight-api-version=` marker back to 0.8.6, revert the
+marker-coupled changes that shipped with the bump
+(`HINDSIGHT_MIN_API_VERSION` in `src/memory/hindsight-tools.ts` and the
+`tests/fixtures/hindsight-tools-list.snapshot.json` re-capture), rebuild/pull,
+and recreate the container.
+
+#### Why a proper downgrade here is a *full* repair
+
+The one thing worth losing sleep over — 0.8.6's fuzzy entity resolution
+losing its trigram index — is explicitly handled by the migration itself.
+`b3e8d1c6f4a9`'s PG downgrade rebuilds the **exact original index**
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS entities_canonical_name_lower_trgm_idx
+  ON entities USING GIN (LOWER(canonical_name) gin_trgm_ops)
+```
+
+inside an `autocommit_block`, and only *afterwards* runs
+`ALTER TABLE entities DROP COLUMN IF EXISTS entity_kind` — which is what
+removes the partial index. Coverage never lapses in either direction; the
+comment in the source says so in as many words ("Restore the full index before
+dropping the partial one so fuzzy probes keep index coverage throughout"). The
+rebuild is CONCURRENTLY, so it does not lock `entities`, but it is not free —
+budget tens of seconds at fleet scale (~226k entity rows / ~77 MB) and do not
+kill it midway (a cancelled CONCURRENTLY build leaves an INVALID index behind).
+
+The only fidelity loss in the whole chain is cosmetic: `access_count` values
+(nothing in switchroom reads them) and `knowledge_pages` rows (the table
+arrives inert — we do not use Knowledge Pages).
+
+#### Naive rollback (digest repoint, no downgrade): one cliff, and only one
+
+It does **not** explode. 0.8.6 boots against a 0.9.0 database: its startup
+migration runner catches the revision-resolution error and logs
+`Database is at a newer migration revision than this code version knows about.
+This is expected during rolling deployments. Skipping migrations.`
+(v0.8.6 `hindsight_api/migrations.py`, the `ResolutionError` / `CommandError`
+handler around the `command.upgrade(cfg, "heads")` call). The server then
+serves normally.
+
+What you get instead is a **silent entity-resolution latency cliff, and
+nothing else**:
+
+- `entity_kind` still exists (you didn't downgrade), so the surviving trigram
+  index is the partial one, `WHERE entity_kind != 'label'`.
+- 0.8.6's candidate query has no `entity_kind` predicate — it is just
+  `e.bank_id = $1 AND LOWER(e.canonical_name) % LOWER(q.query_text)`
+  (`engine/entity_resolver.py`, the trigram candidate fetch). The planner
+  cannot prove that query implies the partial index's predicate, so it will
+  not use the index.
+- Result: every fuzzy entity probe sequential-scans `entities` (~77 MB).
+  Recall still returns correct results — just slowly, with no error anywhere.
+
+Detection: entity-resolution stage latency in recall timings, plus
+`pg_stat_user_tables.seq_scan` climbing on `entities`.
+
+Repair without re-upgrading — recreate the old index by hand (CONCURRENTLY, so
+it is safe on a live table):
+
+```bash
+docker exec switchroom-hindsight sh -lc '
+  PW=$(python3 -c "import json;print(json.load(open(\"/home/hindsight/.pg0/instances/hindsight/instance.json\"))[\"password\"])")
+  PGPASSWORD="$PW" /home/hindsight/.pg0/installation/*/bin/psql -U hindsight -h /tmp -d hindsight -c \
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS entities_canonical_name_lower_trgm_idx ON entities USING GIN (LOWER(canonical_name) gin_trgm_ops)"
+'
+```
+
+#### There is NO vector-index cliff on this fleet
+
+Say it plainly, because an early draft of the upgrade plan claimed there was
+one and it was wrong: migration `f2a6d8c4b1e9` drops
+`idx_memory_units_embedding`, **and that index does not exist on our
+deployment**. Vector search here is served by 45 bank-scoped *partial* indexes
+(`idx_mu_emb_{expr,obsv,worl}_<hash>`, the ones `switchroom memory repair`
+maintains — see "Vector index coverage" below), which `f2a6d8c4b1e9` does not
+touch. So the forward migration is a `DROP INDEX IF EXISTS` against nothing —
+a clean no-op — and its downgrade is a deliberate `pass` ("recreating a
+potentially multi-GB vector index that no query uses is not a safe downgrade
+action"). **Neither direction, proper or naive, degrades vector recall.** Do
+not add a vector-index step to this procedure, and do not let the `f2a6` no-op
+downgrade look like a gap that needs filling.
+
+Confirm for yourself in ten seconds if you are mid-incident and want the fact
+rather than the claim:
+
+```bash
+docker exec switchroom-hindsight sh -lc '
+  PW=$(python3 -c "import json;print(json.load(open(\"/home/hindsight/.pg0/instances/hindsight/instance.json\"))[\"password\"])")
+  PGPASSWORD="$PW" /home/hindsight/.pg0/installation/*/bin/psql -U hindsight -h /tmp -d hindsight -c \
+    "SELECT indexname FROM pg_indexes WHERE tablename = '"'"'memory_units'"'"' AND indexname LIKE '"'"'%emb%'"'"'"
+'
+```
+
+If `idx_memory_units_embedding` is absent from that list (it is), the vector
+question is settled.
+
 ### v0.8.6 → v0.8.5, concretely
 
 **This one is safe to roll back by repointing the digest alone** — and that is
