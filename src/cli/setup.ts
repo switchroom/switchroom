@@ -53,6 +53,17 @@ import {
   preflightHindsightPorts,
   type DockerProbe,
 } from "../setup/hindsight.js";
+import {
+  resolveRecallPoolConfig,
+  resolveHindsightLaunchPorts,
+  startHindsightRecallPool,
+  stopHindsightRecallPool,
+  isHindsightRecallPoolRunning,
+  backgroundContainerPoolEnv,
+  waitForHindsightHealthy,
+  HINDSIGHT_RECALL_POOL_CONTAINER,
+  type RecallPoolConfig,
+} from "../setup/hindsight-recall-pool.js";
 import type { getViaBrokerStructured } from "../vault/broker/client.js";
 import {
   ask,
@@ -1063,6 +1074,46 @@ export interface MemoryBackendDeps {
    * outage. Production leaves it undefined ⇒ the real auto-unlocked broker.
    */
   getViaBrokerStructured?: typeof import("../vault/broker/client.js").getViaBrokerStructured;
+  /**
+   * The recall-pool `docker run` seam (split provisioning). Injected so a test
+   * can drive the enabled path — fresh split build AND authority-up-pool-dead
+   * repair — without docker. Production leaves it undefined ⇒ the real
+   * {@link startHindsightRecallPool}.
+   */
+  startRecallPool?: typeof startHindsightRecallPool;
+  /**
+   * Health-probe seam gating the split launch ordering (authority healthy
+   * before the pool starts; pool healthy before the step reports success).
+   * Injected so a test resolves it synchronously. Production ⇒
+   * {@link waitForHindsightHealthy}.
+   */
+  waitForHealthy?: typeof waitForHindsightHealthy;
+  /**
+   * Probe for whether the recall-pool sibling is already running (exact-name).
+   * Injected so a test can drive the repair branch. Production ⇒
+   * {@link isHindsightRecallPoolRunning}.
+   */
+  recallPoolRunningProbe?: typeof isHindsightRecallPoolRunning;
+  /**
+   * Seam to clear a stale recall-pool sibling before (re)launch. Injected so a
+   * test never issues real `docker rm` against the host daemon. Production ⇒
+   * {@link stopHindsightRecallPool}.
+   */
+  stopRecallPool?: typeof stopHindsightRecallPool;
+  /**
+   * Host-port allocation seam. Injected so a test can drive the fresh-build
+   * path deterministically instead of binding real OS ports (which on a host
+   * already running Hindsight would spuriously report 18888/18889 occupied).
+   * Production ⇒ {@link pickHindsightPorts}.
+   */
+  pickPorts?: typeof pickHindsightPorts;
+  /**
+   * Host-port preflight seam, paired with {@link pickPorts}. Returns a conflict
+   * descriptor (or null when free). Injected so the split's authority-port
+   * preflight never probes a real socket in tests. Production ⇒
+   * {@link preflightHindsightPorts}.
+   */
+  preflightPorts?: typeof preflightHindsightPorts;
 }
 
 /**
@@ -1095,6 +1146,8 @@ export async function stepMemoryBackend(
   stepHeader(6, "Memory backend", STEP_ACTIVE);
 
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const pickPorts = deps.pickPorts ?? pickHindsightPorts;
+  const preflightPorts = deps.preflightPorts ?? preflightHindsightPorts;
 
   // Check if memory backend is configured and is hindsight
   if (isMemoryBackendDisabled(config)) {
@@ -1224,8 +1277,144 @@ export async function stepMemoryBackend(
     );
   }
 
+  // Resolve the recall/background split config up front. It changes the launch
+  // topology (a second container on the public port, the authority moved to
+  // public+1), so first-run `switchroom setup` must honour it too — a knob
+  // respected on `switchroom memory setup` but ignored here would be the same
+  // silent divergence this PR exists to close. Degrade to single-container on a
+  // malformed block rather than aborting the whole wizard (mirrors memory.ts).
+  let recallPoolCfg: RecallPoolConfig | null;
+  try {
+    recallPoolCfg = resolveRecallPoolConfig(config.hindsight?.recall_pool);
+  } catch (err) {
+    console.log(
+      chalk.yellow(
+        `  ! Ignoring hindsight.recall_pool (${(err as Error).message}); ` +
+          "starting the single-container topology.",
+      ),
+    );
+    recallPoolCfg = null;
+  }
+
+  const startPool = deps.startRecallPool ?? startHindsightRecallPool;
+  const waitHealthy = deps.waitForHealthy ?? waitForHindsightHealthy;
+  const poolIsRunning = deps.recallPoolRunningProbe ?? isHindsightRecallPoolRunning;
+  const stopPool = deps.stopRecallPool ?? stopHindsightRecallPool;
+
+  const parseUrlPort = (u?: string): number | undefined => {
+    try {
+      const p = Number(new URL(u ?? "").port);
+      return Number.isInteger(p) && p > 0 ? p : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  // Secret resolution shared by the fresh launch and the pool-repair path, so
+  // the pool container bakes the SAME resolved `vault:` refs the authority does
+  // (the 2026-08-06 literal-`vault:` outage class), with the same drop warnings.
+  const resolveLaunchSecrets = async () => {
+    const { litellm: litellmCfg, droppedRef: litellmDroppedRef } =
+      await resolveLiteLLMForHindsight(
+        config,
+        deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
+      );
+    if (litellmDroppedRef) {
+      console.log(chalk.yellow(`  ! ${hindsightLiteLlmDroppedKeyWarning(litellmDroppedRef)}`));
+    }
+    const cpAccessKey = await resolveHindsightCpAccessKey(config);
+    if (!cpAccessKey) {
+      console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
+    }
+    const resolvedLlm = await resolveHindsightLlmSecrets(
+      config.hindsight?.llm,
+      deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
+    );
+    for (const drop of await diffDroppedHindsightLlmVaultKeys(config.hindsight?.llm, resolvedLlm)) {
+      console.log(chalk.yellow(`  ! ${hindsightLlmDroppedKeyWarning(drop)}`));
+    }
+    return { litellmCfg, cpAccessKey, resolvedLlm };
+  };
+
+  // The split's launch ordering, health-gated like the memory.ts launcher:
+  // the authority's pg0 must answer /health before the pool starts (else the
+  // pool crash-loops on connection-refused), and the pool must be healthy on
+  // the public port before the step reports success. Throws a named
+  // `Memory backend setup failed:` error so step 13 catches a half-built split.
+  const launchRecallPool = async (
+    cfg: RecallPoolConfig,
+    publicApiPort: number,
+    authorityApiPort: number,
+    secrets: Awaited<ReturnType<typeof resolveLaunchSecrets>>,
+  ): Promise<void> => {
+    console.log(
+      chalk.gray(
+        `  Waiting for the authority container to become healthy on ${authorityApiPort} (pg0 startup)...`,
+      ),
+    );
+    if (!(await waitHealthy(authorityApiPort))) {
+      throw new Error(
+        `Memory backend setup failed: the authority container did not become healthy on ` +
+          `${authorityApiPort}. Check \`docker logs switchroom-hindsight --tail 50\`, then ` +
+          "re-run `switchroom setup`, or set hindsight.recall_pool.enabled: false to skip the split.",
+      );
+    }
+    // Clear any stale sibling so `docker run --name` cannot hit a name conflict.
+    stopPool();
+    console.log(chalk.gray(`  Starting recall pool (${cfg.workers} workers) on ${publicApiPort}...`));
+    startPool({
+      cfg,
+      poolPort: publicApiPort,
+      litellm: secrets.litellmCfg,
+      llm: secrets.resolvedLlm,
+      // The authority caps its own DB pools when the split is on; the pool
+      // container inherits the same env base plus its own overrides.
+      perf: {
+        env: { ...backgroundContainerPoolEnv(), ...(config.hindsight?.env ?? {}) },
+        memLimit: config.hindsight?.mem_limit,
+      },
+      cpAccessKey: secrets.cpAccessKey,
+    });
+    if (!(await waitHealthy(publicApiPort))) {
+      throw new Error(
+        `Memory backend setup failed: the recall pool did not become healthy on ${publicApiPort}. ` +
+          `Inspect \`docker logs ${HINDSIGHT_RECALL_POOL_CONTAINER}\`, or set ` +
+          "hindsight.recall_pool.enabled: false and re-run `switchroom setup`.",
+      );
+    }
+  };
+
   // Check if already running
   if (isHindsightRunning(deps.dockerProbe)) {
+    // Authority is up. When the split is enabled but the pool sibling is dead
+    // (an apply that outlived its pool, a crash, a prior single-container run),
+    // restore JUST the pool so the public port is served — don't leave the
+    // topology half-built and silently return success.
+    if (recallPoolCfg && !poolIsRunning(deps.dockerProbe)) {
+      console.log(
+        chalk.gray(
+          "  Authority container is up but the recall pool is not — restoring the pool...",
+        ),
+      );
+      const secrets = await resolveLaunchSecrets();
+      // The running authority sits at public+1; the public port comes from
+      // config (an operator pin, or the port memory.ts persisted). basePorts
+      // gives public+1 = the port the authority is already serving on.
+      const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+        recallEnabled: true,
+        configUrlPort: parseUrlPort(config.memory?.config?.url),
+        reuseApiPort: undefined,
+        uiPort: 0,
+        defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
+      });
+      await launchRecallPool(recallPoolCfg, publicApiPort, basePorts.apiPort, secrets);
+      console.log(
+        chalk.green(
+          `  ${STEP_DONE} Recall pool restored on ${publicApiPort} (authority on ${basePorts.apiPort})`,
+        ),
+      );
+      return { hindsightExpected: true, optedOut: false };
+    }
     console.log(chalk.green(`  ${STEP_DONE} Hindsight container already running (switchroom-hindsight)`));
     return { hindsightExpected: true, optedOut: false };
   }
@@ -1235,6 +1424,8 @@ export async function stepMemoryBackend(
     console.log(chalk.gray("  Found stopped switchroom-hindsight container, removing..."));
     stopHindsight();
   }
+  // Also clear a stale recall-pool sibling before a fresh (re)build.
+  stopPool();
 
   // Pick + preflight host ports through the SAME guard `switchroom memory`
   // uses, so a fresh install never hands an occupied host port to
@@ -1249,7 +1440,7 @@ export async function stepMemoryBackend(
   // a named error with a resume instruction.
   let ports: { apiPort: number; uiPort: number };
   try {
-    ports = await pickHindsightPorts();
+    ports = await pickPorts();
   } catch (err) {
     console.log(chalk.red(`  ${(err as Error).message}`));
     throw new Error(
@@ -1271,7 +1462,7 @@ export async function stepMemoryBackend(
   // Preflight: NEVER hand an occupied host port to `docker run`. If the
   // chosen port is occupied, re-pick from scratch; if still occupied, abort
   // loudly rather than crash-looping.
-  let conflict = await preflightHindsightPorts(ports);
+  let conflict = await preflightPorts(ports);
   if (conflict) {
     const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
     console.log(
@@ -1281,7 +1472,7 @@ export async function stepMemoryBackend(
       ),
     );
     try {
-      ports = await pickHindsightPorts();
+      ports = await pickPorts();
     } catch (err) {
       console.log(chalk.red(`  ${(err as Error).message}`));
       throw new Error(
@@ -1290,7 +1481,7 @@ export async function stepMemoryBackend(
           "`switchroom setup`, or set SWITCHROOM_MEMORY_BACKEND=none to skip it.",
       );
     }
-    conflict = await preflightHindsightPorts(ports);
+    conflict = await preflightPorts(ports);
     if (conflict) {
       const stillHeldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
       const msg =
@@ -1307,44 +1498,57 @@ export async function stepMemoryBackend(
     );
   }
 
-  // Start the container in broker-fed mode (no API key).
-  const spin = spinner("Starting Hindsight Docker container...");
-  try {
-    const { litellm: litellmCfg, droppedRef: litellmDroppedRef } =
-      await resolveLiteLLMForHindsight(
-        config,
-        deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
+  // Anchor the public port (memory.config.url) on config — an operator pin —
+  // else the free port picked above. When the split is on the authority moves
+  // to public+1 and the pool takes the public port; when off, basePorts IS the
+  // public port, so the single-container path is unchanged.
+  const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+    recallEnabled: recallPoolCfg != null,
+    configUrlPort: parseUrlPort(config.memory?.config?.url),
+    reuseApiPort: ports.apiPort,
+    uiPort: ports.uiPort,
+    defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
+  });
+  // The authority's public+1 port is not covered by the single-container
+  // preflight above; verify it too. Refuse rather than reassign — relocating it
+  // would desync the pool's public port from what agents hit.
+  if (recallPoolCfg) {
+    const bgConflict = await preflightPorts({
+      apiPort: basePorts.apiPort,
+      uiPort: basePorts.apiPort,
+    });
+    if (bgConflict) {
+      const heldBy = bgConflict.holder ? ` (held by ${bgConflict.holder})` : "";
+      const msg =
+        `Refusing to start the hindsight recall split: authority port ` +
+        `${bgConflict.port} is occupied${heldBy}.`;
+      console.log(chalk.red(`  ${msg}`));
+      throw new Error(
+        `Memory backend setup failed: ${msg} Free it and re-run \`switchroom setup\`, ` +
+          "or set hindsight.recall_pool.enabled: false to skip the split.",
       );
-    // Symmetric to the cp_access_key and LLM api_key warnings below: LiteLLM is
-    // enabled but its key did not resolve, so the container is about to launch
-    // unmetered. Never silent.
-    if (litellmDroppedRef) {
-      console.log(chalk.yellow(`  ! ${hindsightLiteLlmDroppedKeyWarning(litellmDroppedRef)}`));
     }
-    const cpAccessKey = await resolveHindsightCpAccessKey(config);
-    if (!cpAccessKey) {
-      console.log(chalk.yellow(`  ! ${HINDSIGHT_CP_NO_ACCESS_KEY_WARNING}`));
-    }
-    // Resolve `vault:` api_key refs through the broker before launch, so the
-    // container bakes the real `sk-` key rather than the literal `vault:…`
-    // string (the recreate/refresh-hindsight outage class; apply's passphrase
-    // resolver does not run on this path).
-    const resolvedLlm = await resolveHindsightLlmSecrets(
-      config.hindsight?.llm,
-      deps.getViaBrokerStructured ? { getViaBrokerStructured: deps.getViaBrokerStructured } : {},
-    );
-    // Symmetric to the cp_access_key warning above: a `vault:` LLM api_key ref
-    // that fails to resolve is dropped and the lane silently falls back to the
-    // provider default, so name every drop rather than launch on it quietly.
-    for (const drop of await diffDroppedHindsightLlmVaultKeys(config.hindsight?.llm, resolvedLlm)) {
-      console.log(chalk.yellow(`  ! ${hindsightLlmDroppedKeyWarning(drop)}`));
-    }
+  }
+
+  // Start the (authority, when split; sole, when not) container in broker-fed
+  // mode (no API key). Secrets are resolved by the shared helper so the pool —
+  // launched below — bakes the identical resolved `vault:` refs.
+  const spin = spinner("Starting Hindsight Docker container...");
+  let launchSecrets: Awaited<ReturnType<typeof resolveLaunchSecrets>>;
+  try {
+    launchSecrets = await resolveLaunchSecrets();
+    // When the split is on the authority caps its own DB pools to free
+    // connection headroom for the pool's N workers (the keys ride the
+    // HINDSIGHT_PERF_ENV_KEYS allowlist); an explicit `hindsight.env` still wins.
+    const authorityEnv = recallPoolCfg
+      ? { ...backgroundContainerPoolEnv(), ...(config.hindsight?.env ?? {}) }
+      : config.hindsight?.env;
     const startContainer = deps.startContainer ?? startHindsight;
     startContainer(
-      ports,
-      litellmCfg,
+      basePorts,
+      launchSecrets.litellmCfg,
       undefined,
-      resolvedLlm,
+      launchSecrets.resolvedLlm,
       hindsightConsumerMirrorDir(config),
       // gpu: omitted ⇒ hindsightGpuEnabled() reads the persisted verdict.
       undefined,
@@ -1354,12 +1558,12 @@ export async function stepMemoryBackend(
       // honest when it can see the operator's shared_buffers override, and a
       // knob honoured on `memory setup` but ignored on first-run `switchroom
       // setup` would be the same silent divergence again.
-      { env: config.hindsight?.env, memLimit: config.hindsight?.mem_limit },
+      { env: authorityEnv, memLimit: config.hindsight?.mem_limit },
       // Resolved `hindsight.cp_access_key` — absent ⇒ loginless dashboard,
       // pinned to loopback by hindsightCpAuthEnvPairs.
-      cpAccessKey,
+      launchSecrets.cpAccessKey,
     );
-    if (litellmCfg) {
+    if (launchSecrets.litellmCfg) {
       console.log(chalk.gray("  LiteLLM routing enabled (--network host, ANTHROPIC_BASE_URL set)."));
     }
   } catch (err) {
@@ -1399,8 +1603,23 @@ export async function stepMemoryBackend(
   }
 
   spin.stop(chalk.green(`${STEP_DONE} Hindsight container started (switchroom-hindsight)`));
-  console.log(chalk.gray(`  API: http://localhost:${ports.apiPort}/mcp`));
-  console.log(chalk.gray(`  UI:  http://localhost:${ports.uiPort}`));
+
+  // Split: the container just started is the AUTHORITY (on public+1); now
+  // health-gate it and bring up the recall pool on the public port. A failure
+  // here throws a named `Memory backend setup failed:` error (step 13 catches
+  // it), so the wizard never reports success over a half-built split.
+  if (recallPoolCfg) {
+    await launchRecallPool(recallPoolCfg, publicApiPort, basePorts.apiPort, launchSecrets);
+    console.log(
+      chalk.green(
+        `  ${STEP_DONE} Hindsight recall split started: authority (pg0 + background) on ` +
+          `${basePorts.apiPort}, ${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}`,
+      ),
+    );
+  }
+
+  console.log(chalk.gray(`  API: http://localhost:${publicApiPort}/mcp`));
+  console.log(chalk.gray(`  UI:  http://localhost:${basePorts.uiPort}`));
 
   return { hindsightExpected: true, optedOut: false };
 }

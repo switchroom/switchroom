@@ -110,6 +110,12 @@ export const HINDSIGHT_CONSUMER_NAME = "hindsight";
  * *before* the deferred reaper.
  */
 export const HINDSIGHT_DEFAULT_WORKER_ID = "switchroom-hindsight";
+/**
+ * The authority container's exact name. Kept as a constant so exact-name
+ * container checks (see {@link isHindsightRunning}) never accidentally
+ * substring-match the recall-pool sibling `switchroom-hindsight-recall`.
+ */
+export const HINDSIGHT_CONTAINER_NAME = "switchroom-hindsight";
 /** Named volume holding embedded pg — dual mounts = dual writers. */
 export const HINDSIGHT_DATA_VOLUME = "switchroom-hindsight-data";
 
@@ -1091,7 +1097,7 @@ export const DOCKER_PROBE_TIMEOUT_MS = 60 * 1000;
  */
 export type DockerProbe = (args: string[]) => string | null;
 
-const defaultDockerProbe: DockerProbe = (args) => {
+export const defaultDockerProbe: DockerProbe = (args) => {
   try {
     return execFileSync("docker", args, {
       stdio: "pipe",
@@ -1135,26 +1141,50 @@ export function isDockerAvailable(probe: DockerProbe = defaultDockerProbe): bool
 }
 
 /**
- * Check if the switchroom-hindsight container is currently running.
+ * Docker's `--filter name=…` is a SUBSTRING match, so `name=switchroom-hindsight`
+ * also matches the recall-pool sibling `switchroom-hindsight-recall`. Every
+ * "is the authority container up/present?" check must therefore match the name
+ * EXACTLY, or a running pool with a dead authority reads as "authority up" (and
+ * the reverse). We filter by the shared prefix (cheap server-side narrowing)
+ * and then exact-compare `{{.Names}}` in-process — robust across docker
+ * versions, which disagree on whether an anchored `^…$` regex sees the leading
+ * `/`. Returns whether any returned row's name equals `want` exactly.
  */
-export function isHindsightRunning(probe: DockerProbe = defaultDockerProbe): boolean {
-  const out = probe(["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"]);
-  return (out ?? "").trim().length > 0;
+export function dockerNameMatchesExactly(
+  probe: DockerProbe,
+  args: string[],
+  want: string,
+): boolean {
+  const out = probe(args);
+  return (out ?? "")
+    .split("\n")
+    .map((n) => n.trim())
+    .some((n) => n === want);
 }
 
 /**
- * Check if the switchroom-hindsight container exists (running or stopped).
+ * Check if the switchroom-hindsight AUTHORITY container is currently running.
+ * Exact-name match, so a running recall-pool sibling never counts as the
+ * authority being up (see {@link dockerNameMatchesExactly}).
+ */
+export function isHindsightRunning(probe: DockerProbe = defaultDockerProbe): boolean {
+  return dockerNameMatchesExactly(
+    probe,
+    ["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Names}}"],
+    HINDSIGHT_CONTAINER_NAME,
+  );
+}
+
+/**
+ * Check if the switchroom-hindsight AUTHORITY container exists (running or
+ * stopped). Exact-name match for the same reason as {@link isHindsightRunning}.
  */
 export function isHindsightContainerExists(probe: DockerProbe = defaultDockerProbe): boolean {
-  const out = probe([
-    "ps",
-    "-a",
-    "--filter",
-    "name=switchroom-hindsight",
-    "--format",
-    "{{.Names}}",
-  ]);
-  return (out ?? "").trim().length > 0;
+  return dockerNameMatchesExactly(
+    probe,
+    ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Names}}"],
+    HINDSIGHT_CONTAINER_NAME,
+  );
 }
 
 /**

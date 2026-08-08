@@ -51,8 +51,11 @@ now an anomaly worth investigating, not the norm.
 
 - **New `hindsight.recall_pool` config provisions the recall/background split
   that was previously applied by hand and reverted by every recreate.** When
-  `hindsight.recall_pool.enabled: true`, `switchroom memory setup --recreate`
-  keeps `switchroom-hindsight` as the AUTHORITY container (embedded pg0, the
+  `hindsight.recall_pool.enabled: true`, BOTH launch paths provision the split —
+  `switchroom memory setup --recreate` and first-run `switchroom setup` (so a
+  fresh host, and a `switchroom apply` that finds the authority up but the pool
+  dead, both build/restore it rather than silently honouring the knob on only
+  one path). It keeps `switchroom-hindsight` as the AUTHORITY container (embedded pg0, the
   single background WorkerPoller, migrations, control plane, healthcheck) but
   moves it OFF the public port onto public+1, and launches a NEW
   `switchroom-hindsight-recall` sibling on the unchanged public port: N uvicorn

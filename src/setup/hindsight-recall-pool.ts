@@ -61,10 +61,13 @@ import {
   HINDSIGHT_HEALTHCHECK_CMD,
   HINDSIGHT_HOST_NETWORK_BIND_ADDR,
   buildLiteLlmAwareHealthCmd,
+  defaultDockerProbe,
+  dockerNameMatchesExactly,
   hindsightContainerEnvPairs,
   hindsightGpuEnabled,
   hindsightImageRef,
   pickHindsightLiteLlmProbeUrl,
+  type DockerProbe,
   type HindsightLlmConfig,
   type HindsightPerfOptions,
   type LiteLLMHindsightConfig,
@@ -93,17 +96,61 @@ export const HINDSIGHT_BACKGROUND_CONNECTION_BUDGET =
   HINDSIGHT_BACKGROUND_DB_POOL_MAX_SIZE + HINDSIGHT_BACKGROUND_READ_DB_POOL_MAX_SIZE;
 
 /**
- * Connections the pool's workers may share, total. `250 - 60 background - 10
- * headroom = 180`. The 10-connection headroom absorbs the handful of
- * short-lived admin/maintenance connections pg0 opens for itself
- * (autovacuum launcher, the entrypoint's pg_dump backup loop, `psql` probes),
- * which are NOT part of either pool's budget. Peak observed live was 55.
+ * PostgreSQL's `superuser_reserved_connections` (default 3). These slots at the
+ * top of `max_connections` are usable ONLY by superusers, so the effective
+ * ceiling for the app's own (non-superuser) connections is `max_connections -
+ * superuser_reserved_connections`. It is called out as its own constant so the
+ * headroom below is provably ≥ it: the app must never be sized to consume a
+ * slot PG will refuse it anyway (that manifests as the same `FATAL: too many
+ * clients` the budget exists to prevent).
+ */
+export const HINDSIGHT_PG_SUPERUSER_RESERVED_CONNECTIONS = 3;
+
+/**
+ * Connection HEADROOM below `max_connections` that no pool — auto-sized OR
+ * operator-overridden — may consume. It covers, in one number:
+ *   - PG's {@link HINDSIGHT_PG_SUPERUSER_RESERVED_CONNECTIONS} superuser slots
+ *     (3), which non-superuser app connections cannot use at all, plus
+ *   - the handful of short-lived admin/maintenance connections pg0 opens for
+ *     itself (autovacuum launcher, the entrypoint's pg_dump backup loop, `psql`
+ *     probes) that are NOT part of either pool's budget. Peak observed live: 55
+ *     app connections against the 240 ceiling.
+ * 10 ≥ 3 by construction, so the superuser reserve is always inside the
+ * headroom and can never be handed out. See {@link asserted at build time below}.
  */
 export const HINDSIGHT_RECALL_POOL_HEADROOM = 10;
+
+// The headroom must cover the superuser reserve, or the "effective ceiling"
+// reasoning above is a lie. Proven at module load — a future edit that lowers
+// the headroom below the reserve fails fast here rather than at pg0 runtime.
+if (HINDSIGHT_RECALL_POOL_HEADROOM < HINDSIGHT_PG_SUPERUSER_RESERVED_CONNECTIONS) {
+  throw new Error(
+    `HINDSIGHT_RECALL_POOL_HEADROOM (${HINDSIGHT_RECALL_POOL_HEADROOM}) must be ≥ ` +
+      `HINDSIGHT_PG_SUPERUSER_RESERVED_CONNECTIONS ` +
+      `(${HINDSIGHT_PG_SUPERUSER_RESERVED_CONNECTIONS}).`,
+  );
+}
+
+/**
+ * The hard ceiling on TOTAL app connection demand (background + pool):
+ * `max_connections - headroom = 250 - 10 = 240`. Every connection PG will
+ * actually hand the app must fit under this — the {@link
+ * HINDSIGHT_RECALL_POOL_HEADROOM} above (which subsumes the superuser reserve)
+ * is deliberately left free. {@link assertRecallPoolConnectionBudget} enforces
+ * it against BOTH the auto-sized config and any operator override, so an
+ * override cannot silently eat the headroom.
+ */
+export const HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS =
+  HINDSIGHT_PG_MAX_CONNECTIONS - HINDSIGHT_RECALL_POOL_HEADROOM;
+
+/**
+ * Connections the pool's workers may share, total. `240 total ceiling - 60
+ * background = 180`. This is the budget the auto-sizer divides across workers;
+ * because it is the total ceiling minus the background reserve, an auto-sized
+ * pool lands exactly on the 240 ceiling and never above it.
+ */
 export const HINDSIGHT_RECALL_POOL_CONNECTION_BUDGET =
-  HINDSIGHT_PG_MAX_CONNECTIONS -
-  HINDSIGHT_BACKGROUND_CONNECTION_BUDGET -
-  HINDSIGHT_RECALL_POOL_HEADROOM;
+  HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS - HINDSIGHT_BACKGROUND_CONNECTION_BUDGET;
 
 /**
  * Default uvicorn worker count for the pool.
@@ -152,6 +199,48 @@ export function hindsightBackgroundApiPort(publicApiPort: number): number {
   return publicApiPort + 1;
 }
 
+/**
+ * Resolve the PUBLIC api port agents hit (memory.config.url) for a launch,
+ * INDEPENDENT of whether the recall split is on. This is the load-bearing
+ * invariant behind the split: toggling `hindsight.recall_pool.enabled` must
+ * never move the public port. Precedence:
+ *
+ *   1. `configUrlPort` — the port already in `memory.config.url`.
+ *      Authoritative: it honors an operator pin AND equals the port the
+ *      launcher itself persisted after the previous launch. A split-ON launch
+ *      persists the POOL's public port, so a later split→single `--recreate`
+ *      reads that same public port back here instead of inheriting the
+ *      authority container's `public+1` (the +1 creep this fixes: without the
+ *      config anchor, `getRunningHindsightPorts()` reports the parked authority
+ *      at `public+1` and the sole container would bind — and then persist —
+ *      that, climbing one port per off→recreate).
+ *   2. `reuseApiPort` — the port a container currently publishes, on
+ *      `--recreate` with no persisted url. Preserves "don't auto-migrate a live
+ *      port mid-recreate". Only reachable before any launch has persisted a url
+ *      (i.e. before any pool has ever run), so it is always a genuine
+ *      single-container public port, never a parked `public+1`.
+ *   3. `defaultApiPort` — fresh host, nothing running or persisted.
+ *
+ * `basePorts.apiPort` is what the AUTHORITY (split on) or SOLE (split off)
+ * container binds: the public port directly when off, `public+1` when on (the
+ * pool then takes the public port). `uiPort` is passed through unchanged — it
+ * has no split semantics.
+ */
+export function resolveHindsightLaunchPorts(input: {
+  recallEnabled: boolean;
+  configUrlPort: number | undefined;
+  reuseApiPort: number | undefined;
+  uiPort: number;
+  defaultApiPort: number;
+}): { publicApiPort: number; basePorts: { apiPort: number; uiPort: number } } {
+  const publicApiPort =
+    input.configUrlPort ?? input.reuseApiPort ?? input.defaultApiPort;
+  const apiPort = input.recallEnabled
+    ? hindsightBackgroundApiPort(publicApiPort)
+    : publicApiPort;
+  return { publicApiPort, basePorts: { apiPort, uiPort: input.uiPort } };
+}
+
 /** Resolved recall-pool settings, or `null` when the feature is off. */
 export interface RecallPoolConfig {
   /** Number of uvicorn workers the pool runs (`--workers`). */
@@ -176,9 +265,12 @@ export interface RecallPoolConfigInput {
  *
  * Deterministic: split the per-worker budget 40% write / 60% read (recall is
  * read-heavy; the write pool only carries the recall-path's own bookkeeping).
- * The floor + 40/60 split reproduces the values validated live on the fleet:
- *   - 4 workers → 45/worker → write 18, read 27  (180 + 60 = 240 < 250)
- *   - 6 workers → 30/worker → write 12, read 18  (180 + 60 = 240 < 250)
+ * The floor + 40/60 split reproduces the values validated live on the fleet,
+ * and lands the total exactly on the 240 ceiling — the 10-slot headroom (which
+ * subsumes PG's superuser reserve) stays free, so this fits the ENFORCED
+ * ceiling, not merely the raw 250 `max_connections`:
+ *   - 4 workers → 45/worker → write 18, read 27  (180 pool + 60 bg = 240 ≤ 240)
+ *   - 6 workers → 30/worker → write 12, read 18  (180 pool + 60 bg = 240 ≤ 240)
  *
  * Never returns a pool smaller than 1 connection each, so a pathologically
  * high worker count fails the budget assertion loudly rather than emitting a
@@ -195,21 +287,31 @@ export function recallPoolDbPoolSizing(workers: number): {
 }
 
 /**
- * Assert the total connection demand of the split fits under pg0's
- * `max_connections`. Throws (fail-closed) so an operator override that would
- * overflow the ceiling is caught before launch, not as a mid-load Postgres
- * `FATAL: sorry, too many clients already`.
+ * Assert the total connection demand of the split (background + pool) fits
+ * under the ENFORCED ceiling {@link HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS}
+ * (`max_connections - headroom = 240`), NOT the raw `max_connections` (250).
+ * Asserting against 240 is the load-bearing difference: a legal-LOOKING
+ * operator override — e.g. 4 workers × (25 write + 22 read) = 188 pool + 60
+ * background = 248 ≤ 250 — would pass a raw-250 check yet leave only 2 slots
+ * for PG's superuser reserve (3) and maintenance, so the very `FATAL: sorry,
+ * too many clients already` this guard exists to prevent still fires under
+ * load. Throws (fail-closed) so the override is caught before launch. Overrides
+ * do NOT bypass the headroom.
  */
 export function assertRecallPoolConnectionBudget(cfg: RecallPoolConfig): void {
   const poolDemand = cfg.workers * (cfg.dbPoolMaxSize + cfg.readDbPoolMaxSize);
   const total = poolDemand + HINDSIGHT_BACKGROUND_CONNECTION_BUDGET;
-  if (total > HINDSIGHT_PG_MAX_CONNECTIONS) {
+  if (total > HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS) {
     throw new Error(
       `hindsight.recall_pool connection budget overflow: ${cfg.workers} workers × ` +
         `(${cfg.dbPoolMaxSize} write + ${cfg.readDbPoolMaxSize} read) = ${poolDemand}, ` +
-        `plus ${HINDSIGHT_BACKGROUND_CONNECTION_BUDGET} background = ${total} > pg0 ` +
-        `max_connections=${HINDSIGHT_PG_MAX_CONNECTIONS}. Lower hindsight.recall_pool.workers ` +
-        `or its db_pool_max_size/read_db_pool_max_size.`,
+        `plus ${HINDSIGHT_BACKGROUND_CONNECTION_BUDGET} background = ${total} > the ` +
+        `${HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS}-connection ceiling ` +
+        `(pg0 max_connections=${HINDSIGHT_PG_MAX_CONNECTIONS} − ` +
+        `${HINDSIGHT_RECALL_POOL_HEADROOM} headroom, which reserves PG's ` +
+        `${HINDSIGHT_PG_SUPERUSER_RESERVED_CONNECTIONS} superuser slots plus ` +
+        `maintenance). Lower hindsight.recall_pool.workers or its ` +
+        `db_pool_max_size/read_db_pool_max_size.`,
     );
   }
 }
@@ -455,6 +557,22 @@ export function stopHindsightRecallPool(
   try { exec("docker", ["update", "--restart=no", HINDSIGHT_RECALL_POOL_CONTAINER]); } catch { /* gone */ }
   try { exec("docker", ["stop", HINDSIGHT_RECALL_POOL_CONTAINER]); } catch { /* gone */ }
   try { exec("docker", ["rm", "-f", HINDSIGHT_RECALL_POOL_CONTAINER]); } catch { /* gone */ }
+}
+
+/**
+ * Whether the recall-pool sibling container is currently running. Exact-name
+ * match (the shared `switchroom-hindsight` prefix would otherwise substring-hit
+ * the authority container). Lets first-run provisioning tell "authority up,
+ * pool dead" from "both up" so it can restore just the missing half.
+ */
+export function isHindsightRecallPoolRunning(
+  probe: DockerProbe = defaultDockerProbe,
+): boolean {
+  return dockerNameMatchesExactly(
+    probe,
+    ["ps", "--filter", `name=${HINDSIGHT_RECALL_POOL_CONTAINER}`, "--format", "{{.Names}}"],
+    HINDSIGHT_RECALL_POOL_CONTAINER,
+  );
 }
 
 /**

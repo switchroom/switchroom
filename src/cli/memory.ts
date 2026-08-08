@@ -50,11 +50,11 @@ import {
 } from "../setup/hindsight.js";
 import {
   resolveRecallPoolConfig,
+  resolveHindsightLaunchPorts,
   startHindsightRecallPool,
   stopHindsightRecallPool,
   waitForHindsightHealthy,
   backgroundContainerPoolEnv,
-  hindsightBackgroundApiPort,
   HINDSIGHT_RECALL_POOL_CONTAINER,
 } from "../setup/hindsight-recall-pool.js";
 import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
@@ -980,161 +980,122 @@ export function registerMemoryCommand(program: Command): void {
       // ports are assigned (the authority container moves to public+1 and the
       // pool owns the public port), so the single-container port-reuse warnings
       // below must not fire when the split owns port assignment deterministically.
-      const recallPoolCfg = resolveRecallPoolConfig(
-        getConfig(program).hindsight?.recall_pool,
-      );
-
-      // Reuse the prior ports on --recreate; otherwise pick host ports —
-      // upstream defaults first, fall back to 18888/19999 if 8888/9999 are
-      // already bound.
-      let ports: { apiPort: number; uiPort: number };
-      if (reusePorts) {
-        ports = reusePorts;
-        // Migration hazard: --recreate pins the container to the SAME host
-        // port it currently publishes, but fresh scaffolding now defaults
-        // memory.config.url to HINDSIGHT_DEFAULT_API_PORT (18888). If the
-        // reused port diverges AND no agent has an explicit memory.config.url,
-        // agents may be repointed to a dead URL. Warn loudly; do NOT
-        // auto-migrate (too risky mid-recreate). Suppressed under the split:
-        // the authority container INTENTIONALLY sits at public+1 there, and the
-        // pool (not this container) owns memory.config.url's public port.
-        if (!recallPoolCfg && reusePorts.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
-          let explicitUrl: string | undefined;
-          try {
-            explicitUrl = getConfig(program).memory?.config?.url;
-          } catch {
-            explicitUrl = undefined;
-          }
-          if (!explicitUrl) {
-            console.log(
-              chalk.yellow(
-                `\n  ⚠  MIGRATION HAZARD: reusing stale host port ${reusePorts.apiPort} ` +
-                `for switchroom-hindsight, but scaffolding now defaults to ` +
-                `${HINDSIGHT_DEFAULT_API_PORT} and no explicit memory.config.url is set.`,
-              ),
-            );
-            console.log(
-              chalk.yellow(
-                `  Agents may be repointed to a dead URL (http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/) ` +
-                `while the container listens on ${reusePorts.apiPort}.`,
-              ),
-            );
-            console.log(
-              chalk.yellow(
-                `  Fix: set memory.config.url: http://127.0.0.1:${reusePorts.apiPort}/mcp/ explicitly, ` +
-                `or migrate the container to port ${HINDSIGHT_DEFAULT_API_PORT}.\n`,
-              ),
-            );
-          }
-        }
-      } else {
-        try {
-          ports = await pickHindsightPorts();
-        } catch (err) {
-          console.error(chalk.red(`\n  ${(err as Error).message}\n`));
-          process.exit(1);
-        }
-      }
-      // Suppressed under the split for the same reason as the migration-hazard
-      // warning above: reusePorts reflects the authority container at public+1,
-      // which is by design, not a port collision the operator must act on.
-      if (!recallPoolCfg && ports.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
-        console.log(
-          chalk.yellow(
-            `  Port ${HINDSIGHT_DEFAULT_API_PORT} is already in use; ` +
-            `using ${ports.apiPort}/${ports.uiPort} instead.`
-          )
+      // Defensive parse (mirrors the other optional config reads on this path):
+      // a malformed recall_pool block degrades to the single-container topology
+      // rather than aborting the launch.
+      let recallPoolCfg: ReturnType<typeof resolveRecallPoolConfig>;
+      try {
+        recallPoolCfg = resolveRecallPoolConfig(
+          getConfig(program).hindsight?.recall_pool,
         );
-      }
-
-      // Preflight: NEVER hand an occupied host port to `docker run` — that's
-      // the 2026-07 outage (the --recreate path reused the previously-bound
-      // port with no free-check, so hindsight crash-looped on `[Errno 98]
-      // address already in use` while fleet memory was silently down). The
-      // reuse path (getRunningHindsightPorts) especially bypasses
-      // pickHindsightPorts entirely, so re-validate here for BOTH paths.
-      let conflict = await preflightHindsightPorts(ports);
-      if (conflict) {
-        const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+      } catch (err) {
         console.log(
           chalk.yellow(
-            `\n  Chosen Hindsight port ${conflict.port} is occupied${heldBy}; ` +
-            `selecting a free port instead of crash-looping.`,
+            `  ! Ignoring hindsight.recall_pool (${(err as Error).message}); ` +
+            `starting the single-container topology.`,
           ),
         );
-        // Re-pick from scratch (skips the occupied port via findFreePort).
+        recallPoolCfg = null;
+      }
+
+      // ── Port assignment ──────────────────────────────────────────────────
+      // The PUBLIC api port (memory.config.url, the port every agent hits) is
+      // derived UNCONDITIONALLY — before and independent of the recall-split
+      // branch — so toggling `hindsight.recall_pool.enabled` never moves it.
+      // See resolveHindsightLaunchPorts for the precedence. The UI port has no
+      // split semantics: reuse it on --recreate, else pick a free one.
+      let uiPort: number;
+      if (reusePorts) {
+        uiPort = reusePorts.uiPort;
+      } else {
         try {
-          ports = await pickHindsightPorts();
+          uiPort = (await pickHindsightPorts()).uiPort;
         } catch (err) {
           console.error(chalk.red(`\n  ${(err as Error).message}\n`));
           process.exit(1);
         }
-        conflict = await preflightHindsightPorts(ports);
-        if (conflict) {
-          const stillHeldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
-          console.error(
-            chalk.red(
-              `\n  Refusing to start Hindsight: port ${conflict.port} is still ` +
-              `occupied${stillHeldBy} after reassignment. Free it and retry ` +
-              `\`switchroom memory --start\`.\n`,
-            ),
-          );
-          process.exit(1);
+      }
+
+      // The port already persisted in memory.config.url is authoritative (an
+      // operator pin, or the port THIS launcher wrote last time — a split-on
+      // launch persists the pool's PUBLIC port, so a later split→single
+      // recreate reads the public port back rather than the parked authority's
+      // public+1). Parse defensively: a malformed url falls through to reuse /
+      // default rather than crashing the launch.
+      const configUrlPort = ((): number | undefined => {
+        try {
+          const p = Number(new URL(getConfig(program).memory?.config?.url ?? "").port);
+          return Number.isInteger(p) && p > 0 ? p : undefined;
+        } catch {
+          return undefined;
         }
+      })();
+
+      const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+        recallEnabled: recallPoolCfg != null,
+        configUrlPort,
+        reuseApiPort: reusePorts?.apiPort,
+        uiPort,
+        defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
+      });
+
+      // Migration note (single-container, --recreate, url unset, non-default
+      // reused port): agents without an explicit memory.config.url follow
+      // whatever we persist below. We persist the ACTUAL bound port
+      // (publicApiPort, which equals the reused port here), so there is no
+      // dead-URL repoint — but surface the divergence from the scaffolding
+      // default so the operator can choose to migrate deliberately. Suppressed
+      // under the split: the authority intentionally sits at public+1 and the
+      // pool owns the public port, which is anchored on config.
+      if (
+        !recallPoolCfg &&
+        configUrlPort == null &&
+        reusePorts &&
+        reusePorts.apiPort !== HINDSIGHT_DEFAULT_API_PORT
+      ) {
         console.log(
-          chalk.green(`  Reassigned Hindsight to port ${ports.apiPort}/${ports.uiPort}.`),
+          chalk.yellow(
+            `\n  Note: reusing host port ${reusePorts.apiPort} for switchroom-hindsight ` +
+            `(scaffolding default is ${HINDSIGHT_DEFAULT_API_PORT}); memory.config.url will be ` +
+            `pinned to ${reusePorts.apiPort} so agents follow the live port. Migrate deliberately ` +
+            `if you want ${HINDSIGHT_DEFAULT_API_PORT}.\n`,
+          ),
         );
       }
 
-      // ── Optional recall/background split (hindsight.recall_pool) ─────────
-      // recallPoolCfg was resolved up front (before port assignment). When
-      // enabled, the AUTHORITY container (pg0 + single background poller) moves
-      // off the public port onto public+1, and a second container — the recall
-      // pool — takes the public port. The public port is anchored on config
-      // (memory.config.url), NOT on the running authority container, which sits
-      // at public+1 and would creep +1 on every recreate otherwise.
-      //
-      // basePorts: what the AUTHORITY container binds. publicApiPort: the port
-      // agents hit (memory.config.url). Identical to `ports` when the split is
-      // off, so the single-container path is byte-for-byte unchanged.
-      let basePorts = ports;
-      let publicApiPort = ports.apiPort;
       if (recallPoolCfg) {
-        const urlPort = ((): number | undefined => {
-          try {
-            const p = Number(new URL(getConfig(program).memory?.config?.url ?? "").port);
-            return Number.isInteger(p) && p > 0 ? p : undefined;
-          } catch {
-            return undefined;
-          }
-        })();
-        publicApiPort = urlPort ?? HINDSIGHT_DEFAULT_API_PORT;
-        basePorts = {
-          apiPort: hindsightBackgroundApiPort(publicApiPort),
-          uiPort: ports.uiPort,
-        };
-        // Both the public port (pool) and public+1 (authority) must be free.
-        // Both containers were stopped above, so a conflict here is a genuine
-        // foreign holder — refuse rather than crash-loop.
-        for (const p of [publicApiPort, basePorts.apiPort]) {
-          const c = await preflightHindsightPorts({ apiPort: p, uiPort: p });
-          if (c) {
-            const heldBy = c.holder ? ` (held by ${c.holder})` : "";
-            console.error(
-              chalk.red(
-                `\n  Refusing to start the hindsight recall split: port ${c.port} is ` +
-                  `occupied${heldBy}. Free it and retry.\n`,
-              ),
-            );
-            process.exit(1);
-          }
-        }
         console.log(
           chalk.gray(
             `  recall_pool enabled: authority (pg0 + background) on ${basePorts.apiPort}, ` +
               `${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}.`,
           ),
         );
+      }
+
+      // Preflight EVERY host port we hand `docker run`: basePorts for the
+      // (authority|sole) container, plus the public port when the pool binds
+      // it. NEVER hand an occupied port to docker — that's the 2026-07 outage
+      // (the --recreate path reused the previously-bound port with no
+      // free-check, so hindsight crash-looped on `[Errno 98] address already in
+      // use` while fleet memory was silently down). Both our own containers
+      // were stopped above, so a conflict here is a genuine FOREIGN holder:
+      // refuse with guidance rather than silently relocating the public port
+      // (which would defeat the config anchor and strand agents' memory.config.url).
+      const portsToBind = recallPoolCfg
+        ? [publicApiPort, basePorts.apiPort, basePorts.uiPort]
+        : [basePorts.apiPort, basePorts.uiPort];
+      for (const p of portsToBind) {
+        const conflict = await preflightHindsightPorts({ apiPort: p, uiPort: p });
+        if (conflict) {
+          const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+          console.error(
+            chalk.red(
+              `\n  Refusing to start Hindsight: port ${conflict.port} is occupied${heldBy}. ` +
+              `Free it and retry \`switchroom memory setup --recreate\`.\n`,
+            ),
+          );
+          process.exit(1);
+        }
       }
 
       // RFC H §4.8 — hindsight runs in broker-fed mode against the

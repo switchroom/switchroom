@@ -268,6 +268,10 @@ export default defineConfig({
       // or bun:test) and therefore can't run under vitest/Node. Each is
       // covered by the test:bun script.
       "**/tests/vault-broker-passphrase.test.ts",
+      // setup-recall-pool-provision.test.ts imports stepMemoryBackend from
+      // ./setup.js, whose static graph reaches vault/grants-db.ts (bun:sqlite)
+      // via the vault-broker → broker/server chain — run via test:bun.
+      "**/src/cli/setup-recall-pool-provision.test.ts",
       "**/src/cli/vault-get-broker.test.ts",
       "**/src/vault/resolver-via-broker.test.ts",
       "**/src/vault/broker/scope.test.ts",

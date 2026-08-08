@@ -35,6 +35,8 @@ import {
   HINDSIGHT_RECALL_POOL_CONTAINER,
   HINDSIGHT_RECALL_POOL_DEFAULT_WORKERS,
   HINDSIGHT_RECALL_POOL_ENV_KEYS,
+  HINDSIGHT_RECALL_POOL_HEADROOM,
+  HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS,
   HINDSIGHT_RECALL_POOL_PG_DSN,
   HINDSIGHT_RECALL_POOL_WORKER_ID,
   applyRecallPoolEnvOverrides,
@@ -44,6 +46,7 @@ import {
   recallPoolDbPoolSizing,
   recallPoolEnabled,
   recallPoolEnvOverrides,
+  resolveHindsightLaunchPorts,
   resolveRecallPoolConfig,
   startHindsightRecallPool,
   stopHindsightRecallPool,
@@ -121,9 +124,13 @@ describe("connection budget invariant", () => {
     expect(HINDSIGHT_BACKGROUND_CONNECTION_BUDGET).toBe(
       HINDSIGHT_BACKGROUND_DB_POOL_MAX_SIZE + HINDSIGHT_BACKGROUND_READ_DB_POOL_MAX_SIZE,
     );
-    // 250 - 60 background - 10 headroom = 180.
+    // 250 - 10 headroom = 240 enforced ceiling; - 60 background = 180 pool budget.
+    expect(HINDSIGHT_RECALL_POOL_HEADROOM).toBe(10);
+    expect(HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS).toBe(
+      HINDSIGHT_PG_MAX_CONNECTIONS - HINDSIGHT_RECALL_POOL_HEADROOM,
+    );
     expect(HINDSIGHT_RECALL_POOL_CONNECTION_BUDGET).toBe(
-      HINDSIGHT_PG_MAX_CONNECTIONS - HINDSIGHT_BACKGROUND_CONNECTION_BUDGET - 10,
+      HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS - HINDSIGHT_BACKGROUND_CONNECTION_BUDGET,
     );
   });
 
@@ -134,7 +141,7 @@ describe("connection budget invariant", () => {
     expect(recallPoolDbPoolSizing(6)).toEqual({ dbPoolMaxSize: 12, readDbPoolMaxSize: 18 });
   });
 
-  it("auto-sized configs always fit under pg0 max_connections", () => {
+  it("auto-sized configs always fit under the enforced ceiling (headroom preserved)", () => {
     for (let workers = 1; workers <= 20; workers++) {
       const cfg = resolveRecallPoolConfig({ enabled: true, workers });
       // resolve throws if it would overflow, so a non-null return is proof it fits.
@@ -142,7 +149,13 @@ describe("connection budget invariant", () => {
       const total =
         cfg!.workers * (cfg!.dbPoolMaxSize + cfg!.readDbPoolMaxSize) +
         HINDSIGHT_BACKGROUND_CONNECTION_BUDGET;
-      expect(total).toBeLessThanOrEqual(HINDSIGHT_PG_MAX_CONNECTIONS);
+      // The invariant is the ENFORCED ceiling (max_connections - headroom),
+      // not the raw 250: the 10-slot headroom (subsuming PG's superuser
+      // reserve) must stay free, so assert against 240, not 250.
+      expect(total).toBeLessThanOrEqual(HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS);
+      expect(HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS).toBeLessThan(
+        HINDSIGHT_PG_MAX_CONNECTIONS,
+      );
     }
   });
 
@@ -159,8 +172,11 @@ describe("connection budget invariant", () => {
   });
 
   it("assertRecallPoolConnectionBudget throws on the boundary + 1", () => {
-    // Right at the ceiling is fine; one over throws.
-    const room = HINDSIGHT_PG_MAX_CONNECTIONS - HINDSIGHT_BACKGROUND_CONNECTION_BUDGET;
+    // The boundary is the ENFORCED ceiling (240 = max_connections - headroom),
+    // NOT the raw 250 — one over the enforced ceiling eats the reserved
+    // headroom and throws, even though it is still < max_connections.
+    const room =
+      HINDSIGHT_RECALL_POOL_MAX_TOTAL_CONNECTIONS - HINDSIGHT_BACKGROUND_CONNECTION_BUDGET;
     expect(() =>
       assertRecallPoolConnectionBudget({
         workers: 1,
@@ -168,6 +184,11 @@ describe("connection budget invariant", () => {
         readDbPoolMaxSize: 0,
       }),
     ).not.toThrow();
+    // room + 1 lands at 241: over the 240 enforced ceiling, still under 250 —
+    // proving the assertion guards the headroom, not just raw max_connections.
+    expect(room + HINDSIGHT_BACKGROUND_CONNECTION_BUDGET + 1).toBeLessThan(
+      HINDSIGHT_PG_MAX_CONNECTIONS,
+    );
     expect(() =>
       assertRecallPoolConnectionBudget({
         workers: 1,
@@ -183,6 +204,121 @@ describe("port derivation", () => {
     expect(hindsightBackgroundApiPort(18888)).toBe(18889);
     // Non-default public port still gets a deterministic collision-free background port.
     expect(hindsightBackgroundApiPort(20000)).toBe(20001);
+  });
+
+  it("anchors the public port on config, ignoring the parked authority's public+1", () => {
+    // Split ON, --recreate: getRunningHindsightPorts() reports the AUTHORITY,
+    // which sits at public+1 (18889). memory.config.url still holds the public
+    // port (18888) the launcher persisted. The public port MUST come from
+    // config, not from the parked authority — else it creeps +1.
+    const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+      recallEnabled: true,
+      configUrlPort: 18888,
+      reuseApiPort: 18889, // parked authority
+      uiPort: 9999,
+      defaultApiPort: 18888,
+    });
+    expect(publicApiPort).toBe(18888);
+    expect(basePorts.apiPort).toBe(18889); // authority re-parks at public+1
+  });
+
+  it("falls back to the reused port when no url is persisted (no auto-migrate)", () => {
+    // Fresh-ish --recreate of a single container on a non-default port, url
+    // unset: keep the live port rather than silently migrating to the default.
+    const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+      recallEnabled: false,
+      configUrlPort: undefined,
+      reuseApiPort: 9100,
+      uiPort: 9101,
+      defaultApiPort: 18888,
+    });
+    expect(publicApiPort).toBe(9100);
+    expect(basePorts.apiPort).toBe(9100); // sole container binds the public port directly
+  });
+
+  it("uses the scaffolding default on a fresh host (nothing running or persisted)", () => {
+    const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+      recallEnabled: false,
+      configUrlPort: undefined,
+      reuseApiPort: undefined,
+      uiPort: 9999,
+      defaultApiPort: 18888,
+    });
+    expect(publicApiPort).toBe(18888);
+    expect(basePorts.apiPort).toBe(18888);
+  });
+
+  it(
+    "keeps the public port and memory.config.url fixed across enabled true→false→true recreates",
+    () => {
+      // Regression for M1: toggling hindsight.recall_pool.enabled across
+      // --recreate cycles must NOT creep the public port. We simulate the
+      // launcher's recreate loop as a state machine:
+      //   - persistedUrlPort: what memory.config.url holds (launcher persists
+      //     publicApiPort after every launch — memory.ts line ~1246/1298).
+      //   - runningAuthorityPort: what getRunningHindsightPorts() would report
+      //     next time, i.e. the port the (authority|sole) container binds.
+      const DEFAULT = 18888;
+      const UI = 9999;
+
+      // Fresh first launch, split ON.
+      let persistedUrlPort: number | undefined = undefined;
+      let runningAuthorityPort: number | undefined = undefined;
+
+      const publicPortsSeen: number[] = [];
+      const persistedUrlsSeen: number[] = [];
+
+      // true (fresh) → true → false → true → false ... exercise both toggles
+      // several times to catch any per-cycle drift, not just a single flip.
+      const toggleSequence = [true, false, true, false, true, false, true];
+
+      for (const enabled of toggleSequence) {
+        const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+          recallEnabled: enabled,
+          configUrlPort: persistedUrlPort,
+          reuseApiPort: runningAuthorityPort, // --recreate reuse
+          uiPort: UI,
+          defaultApiPort: DEFAULT,
+        });
+
+        publicPortsSeen.push(publicApiPort);
+
+        // The launcher persists the PUBLIC port to memory.config.url every run.
+        persistedUrlPort = publicApiPort;
+        persistedUrlsSeen.push(persistedUrlPort);
+
+        // Next --recreate's getRunningHindsightPorts() reports the
+        // (authority|sole) container's bound api port.
+        runningAuthorityPort = basePorts.apiPort;
+      }
+
+      // The public port never moved off the default across any toggle.
+      expect(publicPortsSeen).toEqual(toggleSequence.map(() => DEFAULT));
+      // memory.config.url is pinned to the public port every cycle — never the
+      // authority's public+1.
+      expect(persistedUrlsSeen).toEqual(toggleSequence.map(() => DEFAULT));
+      expect(persistedUrlsSeen).not.toContain(DEFAULT + 1);
+    },
+  );
+
+  it("honors an operator-pinned non-default public port across toggles", () => {
+    // Operator pinned memory.config.url to :20000. Both split states must keep
+    // the public port at 20000 and never persist the +1 background port.
+    const PIN = 20000;
+    let persistedUrlPort: number | undefined = PIN;
+    let runningAuthorityPort: number | undefined = undefined;
+    for (const enabled of [true, false, true]) {
+      const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+        recallEnabled: enabled,
+        configUrlPort: persistedUrlPort,
+        reuseApiPort: runningAuthorityPort,
+        uiPort: 9999,
+        defaultApiPort: 18888,
+      });
+      expect(publicApiPort).toBe(PIN);
+      persistedUrlPort = publicApiPort;
+      runningAuthorityPort = basePorts.apiPort;
+    }
   });
 });
 
