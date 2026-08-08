@@ -1,0 +1,1 @@
+CREATE INDEX idx_memory_units_text_search ON public.memory_units USING bm25 (id, text, context, text_signals, ((bank_id)::pdb.literal), ((fact_type)::pdb.literal)) WITH (key_field=id)
