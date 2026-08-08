@@ -1050,9 +1050,21 @@ _LAST_FILTER_FIELD_DRIFT: dict[str, dict[str, object]] = {}
 
 _INDEX_COLUMNS_RE = re.compile(r"\busing\s+(?:bm25|paradedb)\s*\(", re.IGNORECASE)
 
+# Two field spellings, because pg_get_indexdef does NOT echo back the DDL we
+# wrote. We emit `(bank_id::pdb.literal)`; after PostgreSQL normalises the
+# expression the catalog reports `((bank_id)::pdb.literal)` — the cast operand
+# wrapped in its own parens. `_strip_outer_parens` removes the WHOLE-item pair
+# and stops there (the remaining `(bank_id)` is not a whole-string pair), so a
+# field-anchored-at-^ pattern misses every normalised column and the drift
+# checker reports healthy filter fields as missing (switchroom #4526).
+# The paren-wrapped alternative is matched as a balanced pair rather than with
+# optional `\(?`/`\)?` so a malformed `(bank_id::pdb.literal` cannot parse.
 _FIELD_CAST_RE = re.compile(
-    r"^\"?(?P<field>[A-Za-z_][A-Za-z0-9_$]*)\"?\s*::\s*pdb\.(?P<cast>\S.*)$",
-    re.IGNORECASE | re.DOTALL,
+    r"""^(?:
+            \(\s*"?(?P<paren_field>[A-Za-z_][A-Za-z0-9_$]*)"?\s*\)
+          | "?(?P<field>[A-Za-z_][A-Za-z0-9_$]*)"?
+        )\s*::\s*pdb\.(?P<cast>\S.*)$""",
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
 )
 
 # Conservative whitelist for a cast we are willing to re-emit into DDL. The text
@@ -1168,7 +1180,8 @@ def parse_pg_search_index_casts(indexdef: str | None) -> dict[str, str] | None:
         bare = _strip_outer_parens(item)
         cast_match = _FIELD_CAST_RE.match(bare)
         if cast_match:
-            casts[cast_match.group("field").lower()] = cast_match.group("cast").strip()
+            field = cast_match.group("paren_field") or cast_match.group("field")
+            casts[field.lower()] = cast_match.group("cast").strip()
             continue
         ident = bare.strip('"').strip()
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", ident):

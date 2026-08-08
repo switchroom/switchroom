@@ -15,6 +15,15 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Hindsight: the pg_search filter-field drift alarm no longer cries wolf
+
+- Fixed `parse_pg_search_index_casts()`, which could not read the
+  `((bank_id)::pdb.literal)` spelling `pg_get_indexdef` emits after PostgreSQL
+  normalises the DDL. Every boot logged
+  `pg_search_filter_field_drift ... missing=['bank_id', 'fact_type']` against a
+  healthy BM25 index — a false positive; no index rebuild is warranted. The
+  alarm still fires when a filter field is genuinely absent. (#4526)
+
 ## v0.20.17 — Hindsight bakes the bge ONNX export into the image and boots HF-offline
 
 ### Hindsight: bake the bge ONNX export into the image and go HF-offline at boot
