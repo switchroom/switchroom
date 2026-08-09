@@ -5956,9 +5956,34 @@ RUN OLD_UID=$(id -u hindsight) && NEW_UID=11000 \
 # (11000, post-remap above) — a root-owned cache file would EACCES the
 # non-root API at boot. Self-verifying: the build FAILS LOUDLY if the export
 # is absent or truncated, so we never ship a half-baked image.
-RUN set -eu; \
-    HF_HOME=/home/hindsight/.cache/huggingface \
-    /app/api/.venv/bin/python - <<'PYEOF'
+#
+# ONE `RUN`, and the ownership fixup is a SCOPED `find`, not `chown -R` —
+# both halves matter and neither alone is sufficient (#4566):
+#
+#   * SCOPED. `chown(2)` triggers an overlayfs copy-up even when the
+#     ownership is UNCHANGED, so `chown -R` over the whole cache copied up
+#     all 344MB of it. Only the blob this stage just downloaded is
+#     root-owned; the upstream-baked bge safetensors + ms-marco reranker
+#     were already set to the runtime uid by the `find … -exec chown` remap
+#     above. The `! -user / ! -group` predicate narrows the set of files
+#     TOUCHED to exactly those that actually need it — same guarantee, and
+#     it stays idempotent on re-runs. (Same reasoning as the #2807 `-xdev`
+#     scoping above: chown only what is genuinely wrong, never a blanket
+#     sweep, because every needless chown is a copy-up.)
+#   * ONE LAYER. A scoped chown in a SEPARATE `RUN` would still copy the
+#     freshly-downloaded 133MB graph up a second time — the download layer
+#     and a chown layer would each carry a full copy. Merging makes the
+#     fixup free: the files are created and corrected in the same layer.
+#
+# Together these drop a 360MB (230.8MB compressed) pure-duplicate layer.
+# The EACCES guarantee is unchanged — every file not owned by hindsight is
+# still chowned, and a post-condition check below now proves it — and the
+# `test -f` assertion is retained, so the build still fails loudly if the
+# pinned export is missing.
+RUN <<'SHEOF'
+set -eu
+HF_HOME=/home/hindsight/.cache/huggingface \
+/app/api/.venv/bin/python - <<'PYEOF'
 import os
 from huggingface_hub import snapshot_download
 
@@ -5975,9 +6000,19 @@ sz = os.path.getsize(p)
 assert sz > 100_000_000, f"switchroom: bge onnx export suspiciously small ({sz} bytes) — download truncated?"
 print(f"switchroom: baked {REPO}@{REV[:7]} onnx export -> {p} ({sz} bytes)")
 PYEOF
-RUN chown -R hindsight:hindsight /home/hindsight/.cache/huggingface \
- && test -f /home/hindsight/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5/snapshots/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/onnx/model.onnx \
- && echo "switchroom: bge onnx export owned by hindsight and present at pinned revision" >&2
+find /home/hindsight/.cache/huggingface -xdev \( ! -user hindsight -o ! -group hindsight \) \
+     -exec chown -h hindsight:hindsight {} +
+test -f /home/hindsight/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5/snapshots/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/onnx/model.onnx
+# Assert the EACCES guarantee rather than trusting the chown above: nothing
+# under the cache may be left owned by anyone but hindsight. A leftover here
+# would otherwise surface as a runtime EACCES on a non-root boot.
+STRAY=$(find /home/hindsight/.cache/huggingface -xdev \( ! -user hindsight -o ! -group hindsight \) -print -quit)
+if [ -n "$STRAY" ]; then
+  echo "switchroom: FATAL — HF cache still has non-hindsight-owned files (e.g. $STRAY)" >&2
+  exit 1
+fi
+echo "switchroom: bge onnx export owned by hindsight and present at pinned revision" >&2
+SHEOF
 
 # HF_HUB_OFFLINE=1: hard boot-offline guarantee. With the bge safetensors +
 # bge onnx export + the ms-marco reranker ALL baked into the image cache
