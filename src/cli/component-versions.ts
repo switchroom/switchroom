@@ -256,25 +256,76 @@ export function detectComponentDrift(
 }
 
 /**
+ * What is known about the HOST operator CLI when the inventory is taken from
+ * inside a container.
+ *
+ * `observedVersion` is what the host CLI recorded about itself in
+ * `~/.switchroom/host-cli.json` (`host-cli-stamp.ts`) — the only way a
+ * container can learn it, since hostd mounts `~/.switchroom` and nothing else.
+ */
+export interface HostCliObservation {
+  /** True when the process taking the inventory runs inside a container. */
+  inContainer: boolean;
+  /** Semver from the stamp (`v`-prefixed or bare), when one exists. */
+  observedVersion?: string;
+}
+
+/**
+ * The `cli (host)` row. Pure, so the honesty rule is unit-asserted (#4571).
+ *
+ * On the host shell the running process IS the host CLI, so its own version
+ * is authoritative. Inside a container it is NOT: `SWITCHROOM_VERSION` there
+ * is the hostd/agent IMAGE's bundled CLI, and reporting that as `cli (host)`
+ * is what let the real host binary drift five releases behind the fleet while
+ * every check said the host CLI was fine. In a container the STAMPED version
+ * wins; with no stamp the row is `unknown` — reported, never guessed.
+ */
+export function hostCliComponent(
+  cliVersion: string,
+  observation: HostCliObservation = { inContainer: false },
+): ComponentVersion {
+  if (observation.inContainer) {
+    const stamped = normalizeSemverTag(observation.observedVersion);
+    if (stamped) {
+      return {
+        name: "cli (host)",
+        kind: "cli",
+        version: stamped,
+        detail: "observed via the host CLI stamp (~/.switchroom/host-cli.json)",
+      };
+    }
+    return {
+      name: "cli (host)",
+      kind: "cli",
+      version: null,
+      detail:
+        "not observable from inside a container and no host-cli.json stamp " +
+        "found — run any switchroom command on the host to record it",
+    };
+  }
+  const version = normalizeSemverTag(cliVersion);
+  return {
+    name: "cli (host)",
+    kind: "cli",
+    version,
+    ...(version ? {} : { detail: `unparseable CLI version "${cliVersion}"` }),
+  };
+}
+
+/**
  * Collect the full inventory: the host CLI plus every running container.
  *
  * `cliVersion` is the running CLI's own version (`SWITCHROOM_VERSION`).
  * It is passed in rather than imported so the caller controls the seam
- * and tests stay hermetic.
+ * and tests stay hermetic. `observation` decides whether that version can
+ * honestly stand in for the HOST CLI — see {@link hostCliComponent}.
  */
 export function collectComponents(
   cliVersion: string,
   exec: ExecFn,
+  observation: HostCliObservation = { inContainer: false },
 ): ComponentVersion[] {
-  const cli: ComponentVersion = {
-    name: "cli (host)",
-    kind: "cli",
-    version: normalizeSemverTag(cliVersion),
-    ...(normalizeSemverTag(cliVersion)
-      ? {}
-      : { detail: `unparseable CLI version "${cliVersion}"` }),
-  };
-  return [cli, ...collectContainerComponents(exec)];
+  return [hostCliComponent(cliVersion, observation), ...collectContainerComponents(exec)];
 }
 
 /**

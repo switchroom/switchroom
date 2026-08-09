@@ -107,6 +107,7 @@ import { classifyBlastRadius } from "./config-blast-radius.js";
 import type { ApprovalGateway } from "./approval-gateway.js";
 import type { RolloutRelay } from "./rollout-relay.js";
 import { renderRolloutStatus } from "./render-rollout-status.js";
+import { readHostCliStamp } from "../cli/host-cli-stamp.js";
 import { loadConfig, resolveAgentsDir, findConfigFile } from "../config/loader.js";
 import { getAllAgentStatuses } from "../agents/lifecycle.js";
 import {
@@ -4700,6 +4701,14 @@ export class HostdServer {
         ...(entry.warnings && entry.warnings.length > 0
           ? { warnings: entry.warnings }
           : {}),
+        // #4571 — hostd mounts the operator's `~/.switchroom`, so the host
+        // CLI's own stamp is readable from here. Without it the card printed a
+        // hardcoded `sudo npm i -g` (wrong for a user-owned nvm prefix) and
+        // listed the host CLI as outstanding even once it was converged.
+        ...(() => {
+          const stamp = readHostCliStamp();
+          return stamp ? { hostCli: stamp } : {};
+        })(),
       });
       this.opts.rolloutRelay.postTerminal({
         requestId: entry.request_id,

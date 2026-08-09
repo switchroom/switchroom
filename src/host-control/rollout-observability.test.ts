@@ -15,6 +15,7 @@ import {
   formatDurationMs,
 } from "./render-rollout-status.js";
 import { HOSTD_TEMPLATE_LAST_CHANGED } from "../config/hostd-template-version.js";
+import type { HostCliStamp } from "../cli/host-cli-stamp.js";
 
 /** Build one JSONL audit row (the shape hostd writes, chain fields elided —
  *  parseAuditLine ignores `_seq`/`_prev`/`_hash`). */
@@ -197,6 +198,30 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("elapsed 1m 45s");
   });
 
+  /**
+   * #4571 — the host-CLI residual is now DERIVED from the host CLI's own
+   * install stamp rather than hardcoded to `sudo npm i -g`. These fixtures pin
+   * the two install shapes: a root-owned npm tree (where `sudo npm i -g`
+   * genuinely IS the command) and the user-owned nvm prefix this fleet
+   * actually runs (where it is not).
+   */
+  const rootNpmHostCli = (version: string): HostCliStamp => ({
+    version,
+    installKind: "npm-global",
+    path: "/usr/local/lib/node_modules/switchroom/dist/cli/switchroom.js",
+    npmPrefix: "/usr/local",
+    ownerUid: 0,
+    ownerUser: "root",
+  });
+  const userNvmHostCli = (version: string): HostCliStamp => ({
+    version,
+    installKind: "npm-global",
+    path: "/home/op/.nvm/versions/node/v22.22.2/lib/node_modules/switchroom/dist/cli/switchroom.js",
+    npmPrefix: "/home/op/.nvm/versions/node/v22.22.2",
+    ownerUid: 1000,
+    ownerUser: "op",
+  });
+
   it("renders the ✅ terminal summary with rolled list, elapsed total and deferred components", () => {
     const out = renderRolloutStatus({
       target: "v1.2.3",
@@ -204,6 +229,7 @@ describe("renderRolloutStatus", () => {
       rolled: ["test-harness", "clerk"],
       m: 2,
       elapsedMs: 492_000,
+      hostCli: rootNpmHostCli("1.2.0"),
     });
     expect(out.startsWith("✅")).toBe(true);
     expect(out).toContain("Done");
@@ -211,7 +237,7 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("`test-harness`, `clerk`");
     // What is genuinely still host-side, with its exact command.
     expect(out).toContain("Still host-side");
-    expect(out).toContain("sudo npm i -g switchroom@1.2.3");
+    expect(out).toContain("sudo npm i -g --prefix /usr/local switchroom@1.2.3");
     expect(out).toContain("switchroom hostd install --tag v1.2.3");
   });
 
@@ -247,6 +273,7 @@ describe("renderRolloutStatus", () => {
       terminal: "completed",
       rolled: ["test-harness"],
       m: 1,
+      hostCli: rootNpmHostCli(PRE_TEMPLATE_CHANGE.slice(1)),
     });
     expect(out).toContain("not needed");
     expect(out).toContain(`unchanged since ${HOSTD_TEMPLATE_LAST_CHANGED}`);
@@ -254,7 +281,9 @@ describe("renderRolloutStatus", () => {
     expect(out).not.toContain("only if the release changed");
     expect(out).not.toContain("switchroom hostd install");
     // The CLI residual is still named.
-    expect(out).toContain(`sudo npm i -g switchroom@${POST_B.slice(1)}`);
+    expect(out).toContain(
+      `sudo npm i -g --prefix /usr/local switchroom@${POST_B.slice(1)}`,
+    );
   });
 
   it("✅ card says regen REQUIRED, as one copy-paste block, when the roll crosses the template change (#4269)", () => {
@@ -264,13 +293,14 @@ describe("renderRolloutStatus", () => {
       terminal: "completed",
       rolled: ["test-harness"],
       m: 1,
+      hostCli: rootNpmHostCli(PRE_TEMPLATE_CHANGE.slice(1)),
     });
     expect(out).toContain("REQUIRED");
     expect(out).toContain(`changed in ${HOSTD_TEMPLATE_LAST_CHANGED}`);
     expect(out).not.toContain("only if the release changed");
     // Both residuals collapse into a single copy-paste command line.
     expect(out).toContain(
-      `\`sudo npm i -g switchroom@${POST_A.slice(1)} && switchroom hostd install --tag ${POST_A}\``,
+      `\`sudo npm i -g --prefix /usr/local switchroom@${POST_A.slice(1)} && switchroom hostd install --tag ${POST_A}\``,
     );
   });
 
@@ -283,6 +313,96 @@ describe("renderRolloutStatus", () => {
     });
     expect(out).toContain("only if the release changed hostd mounts/env");
     expect(out).toContain(`switchroom hostd install --tag ${POST_A}`);
+  });
+
+  // #4571 — the two regressions the hardcoded `sudo npm i -g` line caused on
+  // the reference host: wrong advice, and advice for work already done.
+  it("✅ card never tells a USER-OWNED npm install to sudo, and names the owner", () => {
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: PRE_TEMPLATE_CHANGE,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+      hostCli: userNvmHostCli(PRE_TEMPLATE_CHANGE.slice(1)),
+    });
+    // `sudo npm i -g` into a user-owned nvm prefix installs into the WRONG
+    // tree (or root-poisons this one) — it must never be emitted as a command.
+    expect(out).not.toContain(`sudo npm i -g`);
+    expect(out).toContain(
+      `npm i -g --prefix /home/op/.nvm/versions/node/v22.22.2 switchroom@${POST_A.slice(1)}`,
+    );
+    expect(out).toContain("run as op");
+    expect(out).toContain("/home/op/.nvm/versions/node/v22.22.2");
+    // …and the regen command is NOT collapsed onto that line, because the
+    // "run as op, NOT under sudo" caveat cannot survive an `&&` chain.
+    expect(out).not.toContain(
+      `&& switchroom hostd install --tag ${POST_A}\``,
+    );
+    expect(out).toContain(`switchroom hostd install --tag ${POST_A}`);
+  });
+
+  it("✅ card does NOT list the host CLI as outstanding once it is already on target", () => {
+    // The roll refuses to start against a stale host CLI (#4571 preflight
+    // gate), so on a completed roll the stamp normally reads >= target. Naming
+    // it as "still host-side" then is the same false residual #3928 deleted
+    // for switchroom-web — work the operator would redo for nothing.
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: POST_A,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+      hostCli: userNvmHostCli(POST_A.slice(1)),
+    });
+    expect(out).not.toContain("npm i -g switchroom");
+    expect(out).not.toContain("host operator CLI —");
+    expect(out).toContain(`Host operator CLI: **on ${POST_A.slice(1)}**`);
+  });
+
+  // The inverse of the test above, and the one that matters. Dropping the
+  // residual requires PROOF of convergence. `shouldRefuseStaleHostCli` is
+  // false for an UNORDERABLE stamp as well as a converged one (deliberately —
+  // the roll must not block on a version it cannot compare), so reusing it to
+  // decide "nothing to do" turns every rc/dev/sha host CLI into a fresh
+  // all-clear over exactly the drift this feature exists to expose.
+  it("✅ card does NOT claim 'nothing to do' for an UNORDERABLE host CLI version", () => {
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: POST_A,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+      // `switchroom update --channel rc` produces exactly this shape.
+      hostCli: userNvmHostCli(`${PRE_TEMPLATE_CHANGE.slice(1)}-rc.1`),
+    });
+    expect(out).not.toContain("nothing to do");
+    // Still listed as outstanding, and honest about WHY it can't be ordered.
+    expect(out).toContain("Still host-side");
+    expect(out).toContain("not comparable");
+    expect(out).toContain("switchroom --version");
+    expect(out).toContain(
+      `npm i -g --prefix /home/op/.nvm/versions/node/v22.22.2 switchroom@${POST_A.slice(1)}`,
+    );
+  });
+
+  it("✅ card never &&-collapses an UNORDERABLE host CLI into one copy-paste", () => {
+    // Regen REQUIRED + a root-owned npm tree is the one shape that collapses.
+    // An unorderable version must still not collapse: the "confirm host-side"
+    // caveat is load-bearing and cannot survive an `&&` chain, exactly like
+    // the "run as <user>" one.
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: PRE_TEMPLATE_CHANGE,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+      hostCli: rootNpmHostCli(`${PRE_TEMPLATE_CHANGE.slice(1)}-rc.1`),
+    });
+    expect(out).toContain("REQUIRED");
+    expect(out).not.toContain("One copy-paste");
+    expect(out).not.toContain(`&& switchroom hostd install --tag ${POST_A}\``);
+    expect(out).toContain("not comparable");
   });
 
   it("renders the ❌ terminal-error summary with the failed step + agent", () => {

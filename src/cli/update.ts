@@ -52,6 +52,7 @@ import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
 import { getBuiltinDefaultSkillEntries } from "../memory/scaffold-integration.js";
 import { syncBundledSkills } from "./sync-bundled-skills.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
+import { observeHostCli } from "./host-cli-stamp.js";
 import {
   alreadySelfUpdated,
   detectInstallKind,
@@ -1718,7 +1719,10 @@ export function renderDriftPreamble(opts: UpdateOptions): string {
       pin = undefined;
     }
     const report = detectComponentDrift(
-      collectComponents(SWITCHROOM_VERSION, exec),
+      // #4571 — `observeHostCli()` keeps the `cli (host)` row honest when this
+      // runs inside a container (the hostd `update_check` verb): the running
+      // CLI is the IMAGE's, not the host's.
+      collectComponents(SWITCHROOM_VERSION, exec, observeHostCli()),
       pin,
     );
     const body = formatComponentDrift(report);

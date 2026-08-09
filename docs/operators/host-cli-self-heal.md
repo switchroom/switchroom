@@ -42,6 +42,40 @@ a cadence, so a behind host CLI is corrected within one interval.
 Deliberate container rolls stay the operator's explicit, un-skipped
 `switchroom update`. This unit's only job is keeping the **host binary** current.
 
+## This timer does NOT heal an `npm i -g` install (#4571)
+
+`self-update-cli` classifies the running CLI first and **returns early for
+anything that is not a `static-binary`** (`src/cli/update.ts`, the
+`detection.kind !== "static-binary"` branch). An `npm i -g switchroom` install —
+including the common nvm-prefix one — is therefore *never* swapped by this
+timer, no matter how often it ticks. It prints `host CLI not self-updated: …`
+and moves on.
+
+That is precisely how the reference host ended up on **0.20.16 while the fleet
+ran 0.20.21**: the host CLI lived in the operator's nvm tree, self-heal skipped
+it every tick, and the only other signal was a trailing rollout warning that
+scrolled past.
+
+Two mechanisms close it, and neither depends on anyone remembering to look:
+
+1. **The host CLI stamps itself.** Every host-context CLI invocation refreshes
+   `~/.switchroom/host-cli.json` with its version, install kind, npm prefix and
+   the uid/user owning the install tree (idempotent — an unchanged stamp is not
+   rewritten). That is the only path by which a container can observe the *host*
+   binary, because hostd mounts `~/.switchroom` and nothing else.
+2. **`switchroom rollout` refuses to roll past a stale host CLI.** The gate
+   reads the stamp before any agent restarts and stops with the exact install
+   command *derived from the stamp* — never a hardcoded `sudo npm i -g`, which
+   is wrong on a user-owned prefix. `--allow-stale-host-cli` overrides it and
+   says so loudly in the roll's warnings.
+
+An npm-installed host CLI is upgraded with `npm i -g switchroom@<version>` **as
+the user who owns the npm prefix**. Running that under `sudo` on a user-owned
+nvm tree either installs into root's prefix (so the operator's `switchroom`
+never moves) or leaves root-owned files in the operator's tree. `switchroom
+doctor`'s `cli (host)` row prints the correct command for the install it
+actually observed.
+
 ## Requirements
 
 - **systemd** on the host.

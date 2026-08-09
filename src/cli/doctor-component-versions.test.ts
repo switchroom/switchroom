@@ -12,6 +12,15 @@ const ps = (lines: string[]): ExecFn => () => ({
   stdout: lines.join("\n"),
 });
 
+/**
+ * The default seams for the host-shell case: the process running the check IS
+ * the host CLI (so `cliVersion` drives the `cli (host)` row), and no install
+ * stamp exists. Both are pinned EXPLICITLY rather than left to production
+ * detection, which reads `/.dockerenv` and the real switchroom home — a test
+ * that inherited those would pass or fail depending on where it ran.
+ */
+const HOST_SHELL = { hostCli: { inContainer: false }, hostCliStamp: null } as const;
+
 const REFERENCE_HOST = [
   "switchroom-hostd\tghcr.io/switchroom/switchroom-hostd:v0.19.28",
   "switchroom-hindsight-autoheal\tghcr.io/switchroom/switchroom-hostd:v0.19.26",
@@ -24,6 +33,7 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config("v0.19.28"), {
       exec: ps(REFERENCE_HOST),
       cliVersion: "0.19.23",
+      ...HOST_SHELL,
     });
     const warns = rows.filter((r) => r.status === "warn");
     // Containers that lag are warn-only (they can trail legitimately
@@ -49,6 +59,7 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config("v0.19.28"), {
       exec: ps(REFERENCE_HOST),
       cliVersion: "0.19.23",
+      ...HOST_SHELL,
     });
     const hostCli = rows.find((r) => r.name === "component behind: cli (host)");
     expect(hostCli?.status).toBe("fail");
@@ -62,6 +73,7 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config("v0.19.28"), {
       exec: ps(REFERENCE_HOST),
       cliVersion: "0.19.28",
+      ...HOST_SHELL,
     });
     expect(rows.some((r) => r.status === "fail")).toBe(false);
     // The lagging containers are still surfaced, as warnings.
@@ -72,6 +84,7 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config("v0.19.28"), {
       exec: ps(REFERENCE_HOST.map((l) => l.replace("v0.19.26", "v0.19.28"))),
       cliVersion: "0.19.28",
+      ...HOST_SHELL,
     });
     expect(rows.filter((r) => r.status === "warn")).toEqual([]);
     expect(rows[0].status).toBe("ok");
@@ -81,6 +94,7 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config(), {
       exec: () => ({ status: 1, stdout: "" }),
       cliVersion: "not-a-version",
+      ...HOST_SHELL,
     });
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe("skip");
@@ -90,6 +104,7 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config("v0.19.26"), {
       exec: ps(REFERENCE_HOST),
       cliVersion: "0.19.26",
+      ...HOST_SHELL,
     });
     const ahead = rows.filter((r) => r.name.startsWith("component ahead:"));
     expect(ahead.map((r) => r.name).sort()).toEqual([
@@ -105,9 +120,64 @@ describe("doctor: component versions (#3919)", () => {
     const rows = runComponentVersionChecks(config("v0.19.26"), {
       exec: ps(REFERENCE_HOST.map((l) => l.replace(/v0\.19\.2[68]/g, "v0.19.26"))),
       cliVersion: "0.19.28",
+      ...HOST_SHELL,
     });
     const hostCli = rows.find((r) => r.name.includes("cli (host)"));
     expect(hostCli?.status).not.toBe("fail");
     expect(rows.some((r) => r.status === "fail")).toBe(false);
+  });
+});
+
+/**
+ * #4571 — the reason the silent drift survived five releases. From inside a
+ * container the running CLI is the CONTAINER's CLI, but the inventory reported
+ * it under the `cli (host)` label, so the one enumerative check that should
+ * have caught a stale host binary was measuring the wrong binary and always
+ * agreed with the target.
+ */
+describe("doctor: the host CLI row must never report the CONTAINER's version", () => {
+  it("uses the STAMPED host version, not the container's, when a stamp exists", () => {
+    const rows = runComponentVersionChecks(config("v0.19.28"), {
+      exec: ps(REFERENCE_HOST),
+      // The container CLI is on target — the pre-fix code reported this and
+      // called the host converged.
+      cliVersion: "0.19.28",
+      hostCli: { inContainer: true, observedVersion: "0.19.23" },
+      hostCliStamp: {
+        version: "0.19.23",
+        installKind: "npm-global",
+        path: "/home/op/.nvm/versions/node/v22/lib/node_modules/switchroom/dist/cli/switchroom.js",
+        npmPrefix: "/home/op/.nvm/versions/node/v22",
+        ownerUid: 1000,
+        ownerUser: "op",
+      },
+    });
+    const hostCli = rows.find((r) => r.name === "component behind: cli (host)");
+    expect(hostCli?.status).toBe("fail");
+    expect(hostCli?.detail).toContain("0.19.23");
+    // …and the remediation is derived from how the host is ACTUALLY installed:
+    // a user-owned npm prefix, so neither `switchroom update` (a no-op on an
+    // npm install) nor `sudo npm i -g` (wrong tree) is correct.
+    expect(hostCli?.fix).toContain(
+      "npm i -g --prefix /home/op/.nvm/versions/node/v22 switchroom@0.19.28",
+    );
+    expect(hostCli?.fix).toContain("run as op");
+    expect(hostCli?.fix).not.toMatch(/(^|[;&|]\s*)sudo\s/);
+  });
+
+  it("reports the host CLI as UNKNOWN in a container with no stamp, never as converged", () => {
+    const rows = runComponentVersionChecks(config("v0.19.28"), {
+      exec: ps(REFERENCE_HOST),
+      cliVersion: "0.19.28",
+      hostCli: { inContainer: true },
+      hostCliStamp: null,
+    });
+    // Not a behind row, not an ok row silently claiming the host is on target:
+    // an explicit "not observable from here".
+    expect(rows.some((r) => r.name.includes("cli (host)") && r.status !== "skip")).toBe(
+      false,
+    );
+    const unknown = rows.find((r) => r.name === "component version unknown: cli (host)");
+    expect(unknown?.status).toBe("skip");
   });
 });

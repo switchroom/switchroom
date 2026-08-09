@@ -31,7 +31,6 @@
  */
 
 import { spawnSync } from "node:child_process";
-
 import type { SwitchroomConfig } from "../config/schema.js";
 import type { CheckResult } from "./doctor.js";
 import { SWITCHROOM_VERSION } from "./resolve-version.js";
@@ -40,14 +39,33 @@ import {
   detectComponentDrift,
   type ComponentVersion,
   type ExecFn,
+  type HostCliObservation,
 } from "./component-versions.js";
 import { classifyComponent, remediationFor } from "./component-scope.js";
+import {
+  observeHostCli,
+  readHostCliStamp,
+  type HostCliStamp,
+} from "./host-cli-stamp.js";
 
 export interface ComponentVersionCheckOpts {
   /** Test seam — replace the `docker ps` shellout. */
   exec?: ExecFn;
   /** Test seam — override the running CLI's version. */
   cliVersion?: string;
+  /**
+   * Test seam — what is known about the HOST CLI. Production derives it:
+   * in a container the running CLI is NOT the host CLI, so the stamp is
+   * consulted instead of `SWITCHROOM_VERSION` (#4571).
+   */
+  hostCli?: HostCliObservation;
+  /**
+   * Test seam — the host CLI's install record, used to render the `cli` row's
+   * `fix:`. `undefined` reads the real stamp (production); `null` means
+   * "explicitly no stamp", which is how a test pins the generic remediation
+   * without depending on whether the machine running it has one.
+   */
+  hostCliStamp?: HostCliStamp | null;
 }
 
 const defaultExec: ExecFn = (cmd, args) => {
@@ -64,8 +82,12 @@ const defaultExec: ExecFn = (cmd, args) => {
  * the duplication that let `switchroom-hindsight-autoheal` sit outside
  * the roll's scope while doctor knew perfectly well how to fix it.
  */
-function fixFor(c: ComponentVersion, target: string): string {
-  return remediationFor(classifyComponent(c), target);
+function fixFor(
+  c: ComponentVersion,
+  target: string,
+  hostCli: HostCliStamp | undefined,
+): string {
+  return remediationFor(classifyComponent(c), target, hostCli);
 }
 
 /**
@@ -85,7 +107,16 @@ export function runComponentVersionChecks(
   opts: ComponentVersionCheckOpts = {},
 ): CheckResult[] {
   const exec = opts.exec ?? defaultExec;
-  const components = collectComponents(opts.cliVersion ?? SWITCHROOM_VERSION, exec);
+  // `null` is the explicit "no stamp" seam; `undefined` means "read the real one".
+  const hostCliStamp =
+    opts.hostCliStamp === undefined
+      ? readHostCliStamp()
+      : (opts.hostCliStamp ?? undefined);
+  const components = collectComponents(
+    opts.cliVersion ?? SWITCHROOM_VERSION,
+    exec,
+    opts.hostCli ?? observeHostCli(),
+  );
   const report = detectComponentDrift(components, config.release?.pin);
 
   if (!report.target) {
@@ -119,9 +150,15 @@ export function runComponentVersionChecks(
       status,
       detail:
         status === "fail"
-          ? `on ${c.version}, expected ${report.target} (${src}) — the host CLI must never trail the fleet; it self-heals in-band via \`switchroom update\``
+          ? // #4571 — this used to promise "self-heals in-band via `switchroom
+            // update`". That is false for an `npm i -g` install:
+            // `self-update-cli` returns early for anything that is not a
+            // static binary, so the self-heal timer skipped this host's CLI
+            // every tick while it drifted five releases. The `fix:` below
+            // carries the command derived from the actual install.
+            `on ${c.version}, expected ${report.target} (${src}) — the host CLI must never trail the fleet: it drives \`apply\`, \`vault\`, \`doctor\` and the next roll`
           : `on ${c.version}, expected ${report.target} (${src})`,
-      fix: fixFor(c, report.target),
+      fix: fixFor(c, report.target, hostCliStamp),
     });
   }
   for (const c of report.ahead) {
