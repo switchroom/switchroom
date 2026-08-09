@@ -208,8 +208,14 @@ export interface ReplyToBufferFallbackParams {
   /** REPLY_TO_TEXT_MAX. */
   replyToTextMax: number
   /** `lookupMessageRoleAndText` bound to the chat, or any equivalent. May
-   *  throw (e.g. requireDb when history disabled mid-run) — this is caught. */
-  lookup: (messageId: number) => { role: 'user' | 'assistant'; text: string } | null
+   *  throw (e.g. requireDb when history disabled mid-run) — this is caught.
+   *
+   *  Bind it with `includeSystem: true` (#4571) so a reply that points at a
+   *  CARD — the activity card, a status pin, an approval card — resolves
+   *  instead of returning null. `kind` carries the card family. */
+  lookup: (
+    messageId: number,
+  ) => { role: 'user' | 'assistant' | 'system'; text: string; kind?: string | null } | null
 }
 
 /**
@@ -232,15 +238,22 @@ export interface ReplyToBufferFallbackParams {
 export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
   replyToText: string | undefined
   replyToTextEscaped: string | undefined
-  replyToRole: 'user' | 'assistant' | undefined
+  replyToRole: 'user' | 'assistant' | 'system' | undefined
+  /** Card family (`activity-summary`, `approval-card`, …) when the antecedent
+   *  is a system-lane row. Undefined otherwise. #4571. */
+  replyToKind: string | undefined
 } {
   let replyToText = p.replyToText
   let replyToTextEscaped = p.replyToTextEscaped
-  let replyToRole: 'user' | 'assistant' | undefined
+  let replyToRole: 'user' | 'assistant' | 'system' | undefined
+  let replyToKind: string | undefined
   const liveTextEmpty = replyToTextEscaped == null || replyToTextEscaped.length === 0
   if (p.historyEnabled && p.replyToMessageId != null && liveTextEmpty) {
     try {
       const recovered = p.lookup(p.replyToMessageId)
+      if (recovered != null && recovered.role === 'system' && recovered.kind) {
+        replyToKind = recovered.kind
+      }
       if (recovered && recovered.text.length > 0) {
         replyToText =
           recovered.text.length > p.replyToTextMax
@@ -258,7 +271,7 @@ export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
       // silently to the id-only inputs (current behavior).
     }
   }
-  return { replyToText, replyToTextEscaped, replyToRole }
+  return { replyToText, replyToTextEscaped, replyToRole, replyToKind }
 }
 
 /** Inputs for {@link buildInboundEnvelope} — every field is an at-call
@@ -288,7 +301,11 @@ export interface EnvelopeBuildParams {
    * message, 'user' = a person's), when known — recovered from the history
    * buffer by handleInbound's reply-to fallback. Undefined when the role
    * can't be determined (e.g. text came live off the update, not the DB). */
-  replyToRole: 'user' | 'assistant' | undefined
+  replyToRole: 'user' | 'assistant' | 'system' | undefined
+  /** #4571 — when the antecedent is a CARD the gateway posted (activity card,
+   * status pin, approval card…), the card family. Emitted as `reply_to_kind`
+   * alongside `reply_to_role="system"`. */
+  replyToKind?: string | undefined
   forwardOriginMeta: Record<string, string>
   /** TOPIC_FRAMING_ENABLED — fixed constant. */
   topicFramingEnabled: boolean
@@ -390,6 +407,14 @@ export function buildInboundEnvelope(p: EnvelopeBuildParams): InboundMessage {
       // guessing the antecedent. Free: the history-buffer lookup that recovers
       // reply_to_text already returns the role. Emitted only when known.
       ...(p.replyToRole != null ? { reply_to_role: p.replyToRole } : {}),
+      // #4571 — the antecedent is one of the bot's own CARDS, not a reply.
+      // `reply_to_role="system"` + `reply_to_kind="activity-summary"` tells the
+      // agent the operator tapped the live working card (the most recent thing
+      // on their screen for most of a turn) rather than an answer, so it can
+      // read `reply_to_text` as the card body instead of reporting amnesia.
+      ...(p.replyToKind != null && p.replyToKind.length > 0
+        ? { reply_to_kind: p.replyToKind }
+        : {}),
       // Forwarded-message origin (server-stamped, attrs-only — see above).
       // forwarded_from / forwarded_from_type / forwarded_from_id /
       // forwarded_date, plus numbered _2.. siblings for a multi-origin

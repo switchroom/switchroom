@@ -1,0 +1,394 @@
+/**
+ * Card history lane — REAL history.db end-to-end (#4571).
+ *
+ * The bug: the gateway posts activity cards, status pins, approval / boot /
+ * issues cards and progress lines as real Telegram messages that consume real
+ * message ids, but ONLY the `reply` family (which calls `recordOutbound`) ever
+ * wrote a row. Measured on a live agent's buffer: 116 rows across a 266-id
+ * span. The operator quote-replies to the activity card — the most recent
+ * message on their screen for most of a turn — Telegram delivers
+ * `reply_to_message_id` pointing at it, the buffer has nothing, and the agent
+ * answers "I can't see the message you replied to".
+ *
+ * This drives the WHOLE chain against a real bun:sqlite DB, because a stored
+ * row nobody can look up is not a fix:
+ *
+ *     robustApiCall resolves → observer → recordSystemOutbound
+ *       → lookupMessageRoleAndText({ includeSystem: true })
+ *       → resolveReplyToFromBuffer → buildInboundEnvelope
+ *       → meta.reply_to_role='system' + meta.reply_to_kind + reply_to_text
+ *
+ * plus the three regressions the lane must not cause: card rows must not be
+ * LISTED by `query()` (get_recent_messages), a real reply must always beat the
+ * provisional card row for the same id, and the schema migration must be
+ * idempotent against a live pre-#4571 DB without losing a row.
+ *
+ * Runs under `bun test` (bun:sqlite is a Bun built-in vitest can't resolve);
+ * vitest-excluded in vitest.config.ts, covered by the bun `tests/` target in
+ * telegram-plugin/scripts/bun-test-ci.sh.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { Database } from 'bun:sqlite'
+import { mkdtempSync, rmSync, existsSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import {
+  initHistory,
+  recordInbound,
+  recordOutbound,
+  recordSystemOutbound,
+  updateSystemOutboundText,
+  lookupMessageRoleAndText,
+  query,
+  _resetForTests,
+} from '../history.js'
+import {
+  resolveReplyToFromBuffer,
+  buildInboundEnvelope,
+  type EnvelopeBuildParams,
+} from '../gateway/inbound-router.js'
+import { makeSystemMessageObserver } from '../gateway/system-message-observer.js'
+
+const CHAT = '5550001'
+const REPLY_TO_TEXT_MAX = 200
+
+/** The gateway's own wiring, verbatim: history writers behind the observer. */
+function makeObserver(now?: () => number) {
+  return makeSystemMessageObserver({
+    insert: recordSystemOutbound,
+    updateText: updateSystemOutboundText,
+    ...(now != null ? { now } : {}),
+  })
+}
+
+/** A Telegram Message response, as `robustApiCall` resolves with. */
+function sentMessage(messageId: number, text: string) {
+  return { message_id: messageId, chat: { id: Number(CHAT) }, text }
+}
+
+/** The reply-antecedent lookup as gateway.ts binds it (#4571: includeSystem). */
+function boundLookup(messageId: number) {
+  return lookupMessageRoleAndText(CHAT, messageId, { includeSystem: true })
+}
+
+function makeEnvelopeParams(overrides: Partial<EnvelopeBuildParams>): EnvelopeBuildParams {
+  return {
+    ctx: { message: { date: 1_700_000_000 } } as unknown as EnvelopeBuildParams['ctx'],
+    chat_id: CHAT,
+    messageThreadId: undefined,
+    msgId: 20268,
+    effectiveText: 'stop what you are doing and check the other repo',
+    imagePath: undefined,
+    attachment: undefined,
+    attachmentCount: 0,
+    extraMeta: {},
+    from: { id: 111, username: 'alice' },
+    access: { groups: {} },
+    isSteering: false,
+    isQueuedPrefix: false,
+    isQueuedMidTurn: false,
+    priorTurnInProgress: false,
+    secondsSinceTurnStart: undefined,
+    priorAssistantPreview: undefined,
+    replyToMessageId: undefined,
+    replyToTextEscaped: undefined,
+    replyToRole: undefined,
+    forwardOriginMeta: {},
+    topicFramingEnabled: false,
+    personDirectory: { byTelegramKey: {} },
+    isDmChatId: () => true,
+    ...overrides,
+  } as EnvelopeBuildParams
+}
+
+let stateDir: string
+
+beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), 'card-history-lane-'))
+  initHistory(stateDir, 30)
+})
+
+afterEach(() => {
+  _resetForTests()
+  if (existsSync(stateDir)) rmSync(stateDir, { recursive: true, force: true })
+})
+
+describe('a quote-reply to the live activity card is UNDERSTOOD, end to end', () => {
+  it('card posted → id resolvable → the reply carries role=system, the card kind, and its body', () => {
+    const observe = makeObserver()
+    const CARD_ID = 20267
+
+    // 1. The gateway opens the activity card. No `recordOutbound` anywhere —
+    //    this is the exact path that used to leave NO row at all.
+    observe(sentMessage(CARD_ID, '⚙️ Working — reading history.ts, 3 tools'), {
+      chat_id: CHAT,
+      verb: 'activity-summary.send',
+    })
+
+    // 2. The operator quote-replies to it. Telegram gives the id but NOT the
+    //    text (the bot authored it), so the live reply text is empty.
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: CARD_ID,
+      replyToText: undefined,
+      replyToTextEscaped: undefined,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: boundLookup,
+    })
+
+    // 3. The antecedent resolves — this is the assertion the bug fails.
+    expect(resolved.replyToRole).toBe('system')
+    expect(resolved.replyToKind).toBe('activity-summary')
+    expect(resolved.replyToText).toBe('⚙️ Working — reading history.ts, 3 tools')
+
+    // 4. …and reaches the agent on the inbound envelope, so it can read the
+    //    card body instead of reporting amnesia.
+    const msg = buildInboundEnvelope(
+      makeEnvelopeParams({
+        replyToMessageId: CARD_ID,
+        replyToTextEscaped: resolved.replyToTextEscaped,
+        replyToRole: resolved.replyToRole,
+        replyToKind: resolved.replyToKind,
+      }),
+    )
+    expect(msg.meta?.reply_to_message_id).toBe(String(CARD_ID))
+    expect(msg.meta?.reply_to_role).toBe('system')
+    expect(msg.meta?.reply_to_kind).toBe('activity-summary')
+    expect(msg.meta?.reply_to_text).toBe('⚙️ Working — reading history.ts, 3 tools')
+  })
+
+  it('WITHOUT the observer the same reply resolves to nothing (the bug, pinned)', () => {
+    // No observe() call — i.e. pre-#4571 behaviour for a card send.
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: 20267,
+      replyToText: undefined,
+      replyToTextEscaped: undefined,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: boundLookup,
+    })
+    expect(resolved.replyToRole).toBeUndefined()
+    expect(resolved.replyToText).toBeUndefined()
+  })
+
+  it('surfaces the LATEST card body, not the text it was opened with', () => {
+    let t = 1_000
+    const observe = makeObserver(() => t)
+    observe(sentMessage(20267, '⚙️ Working — starting'), {
+      chat_id: CHAT,
+      verb: 'activity-summary.send',
+    })
+    t += 60_000
+    observe(sentMessage(20267, '⚙️ Working — 11 tools, editing gateway.ts'), {
+      chat_id: CHAT,
+      verb: 'activity-summary.edit',
+    })
+
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: 20267,
+      replyToText: undefined,
+      replyToTextEscaped: undefined,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: boundLookup,
+    })
+    expect(resolved.replyToText).toBe('⚙️ Working — 11 tools, editing gateway.ts')
+  })
+})
+
+describe('the card lane does not pollute normal history reads', () => {
+  it('query() (get_recent_messages) lists the conversation, never the cards', () => {
+    const observe = makeObserver()
+    recordInbound({
+      chat_id: CHAT,
+      thread_id: null,
+      message_id: 20200,
+      user: 'alice',
+      user_id: '111',
+      ts: 1_000,
+      text: 'what is the status of the migration?',
+    })
+    for (const id of [20209, 20210, 20212, 20213]) {
+      observe(sentMessage(id, `card ${id}`), { chat_id: CHAT, verb: 'activity-summary.send' })
+    }
+    recordOutbound({
+      chat_id: CHAT,
+      thread_id: null,
+      message_ids: [20214],
+      texts: ['Migration is applied on all three boxes.'],
+      ts: 2_000,
+    })
+
+    const listed = query({ chat_id: CHAT, limit: 50 })
+    expect(listed.map((r) => r.message_id)).toEqual([20200, 20214])
+    expect(listed.some((r) => r.role === 'system')).toBe(false)
+
+    // Opt-in still sees them — resolvable, just not listed.
+    const withCards = query({ chat_id: CHAT, limit: 50, include_system: true })
+    expect(withCards.map((r) => r.message_id).sort((a, b) => a - b)).toEqual([
+      20200, 20209, 20210, 20212, 20213, 20214,
+    ])
+  })
+
+  it('an authorship-sensitive lookup (reaction trigger) still cannot see a card', () => {
+    makeObserver()(sentMessage(20267, 'card'), { chat_id: CHAT, verb: 'activity-summary.send' })
+    // Default (no includeSystem) — the pre-#4571 contract, unchanged.
+    expect(lookupMessageRoleAndText(CHAT, 20267)).toBeNull()
+    expect(lookupMessageRoleAndText(CHAT, 20267, { includeSystem: true })?.role).toBe('system')
+  })
+})
+
+describe('a real reply always beats the provisional card row', () => {
+  it('recordOutbound promotes the id to assistant and leaves exactly one row', () => {
+    const observe = makeObserver()
+    const ID = 20261
+    // The observer fires first — it runs when the API call resolves, strictly
+    // before the caller reaches its own recordOutbound.
+    observe(sentMessage(ID, 'Migration is applied on all three boxes.'), {
+      chat_id: CHAT,
+      verb: 'reply',
+    })
+    recordOutbound({
+      chat_id: CHAT,
+      thread_id: null,
+      message_ids: [ID],
+      texts: ['Migration is applied on all three boxes.'],
+      ts: 2_000,
+    })
+
+    const rows = query({ chat_id: CHAT, limit: 50, include_system: true })
+    expect(rows.filter((r) => r.message_id === ID)).toHaveLength(1)
+    expect(rows[0]?.role).toBe('assistant')
+    // And a reply pointing at it reads as an ANSWER, not a card.
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: ID,
+      replyToText: undefined,
+      replyToTextEscaped: undefined,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: boundLookup,
+    })
+    expect(resolved.replyToRole).toBe('assistant')
+    expect(resolved.replyToKind).toBeUndefined()
+  })
+
+  it('promotes even when the observer recorded a DIFFERENT thread for the id', () => {
+    // Telegram stamps message_thread_id on reply chains in plain supergroups,
+    // so the observer's thread can differ from the gateway's. The unique key
+    // folds thread_id, so without the explicit delete BOTH rows would survive
+    // and the card could shadow the answer.
+    recordSystemOutbound({
+      chat_id: CHAT,
+      thread_id: 77,
+      message_id: 20263,
+      kind: 'activity-summary',
+      text: 'card',
+    })
+    recordOutbound({
+      chat_id: CHAT,
+      thread_id: null,
+      message_ids: [20263],
+      texts: ['the real answer'],
+      ts: 2_000,
+    })
+    const rows = query({ chat_id: CHAT, limit: 50, include_system: true })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.role).toBe('assistant')
+  })
+
+  it('a card never overwrites an inbound that already owns the id', () => {
+    recordInbound({
+      chat_id: CHAT,
+      thread_id: null,
+      message_id: 20300,
+      user: 'alice',
+      user_id: '111',
+      ts: 1_000,
+      text: 'the operator said this',
+    })
+    expect(
+      recordSystemOutbound({
+        chat_id: CHAT,
+        thread_id: null,
+        message_id: 20300,
+        kind: 'activity-summary',
+        text: 'card',
+      }),
+    ).toBe(false)
+    expect(updateSystemOutboundText({ chat_id: CHAT, message_id: 20300, text: 'card' })).toBe(false)
+    const row = lookupMessageRoleAndText(CHAT, 20300, { includeSystem: true })
+    expect(row?.role).toBe('user')
+    expect(row?.text).toBe('the operator said this')
+  })
+})
+
+describe('migration onto a live pre-#4571 history.db', () => {
+  it('adds `kind` without losing a row, and is a no-op when already migrated', () => {
+    _resetForTests()
+    const legacyDir = mkdtempSync(join(tmpdir(), 'card-history-legacy-'))
+    try {
+      // A pre-#4571 schema: no `kind` column, no logical-key index.
+      const raw = new Database(join(legacyDir, 'history.db'))
+      raw.exec(`
+        CREATE TABLE messages (
+          chat_id TEXT NOT NULL, thread_id INTEGER, message_id INTEGER NOT NULL,
+          role TEXT NOT NULL, user TEXT, user_id TEXT, ts INTEGER NOT NULL,
+          text TEXT NOT NULL, attachment_kind TEXT, group_id INTEGER,
+          PRIMARY KEY (chat_id, thread_id, message_id)
+        )
+      `)
+      const ins = raw.prepare(
+        `INSERT INTO messages (chat_id, thread_id, message_id, role, user, user_id, ts, text)
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?)`,
+      )
+      const nowSec = Math.floor(Date.now() / 1000)
+      for (let i = 0; i < 200; i++) {
+        ins.run(CHAT, 19000 + i, i % 2 === 0 ? 'user' : 'assistant', 'alice', '111', nowSec, `row ${i}`)
+      }
+      raw.close()
+
+      const countRows = () => {
+        const d = new Database(join(legacyDir, 'history.db'), { readonly: true })
+        try {
+          return (d.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number }).c
+        } finally {
+          d.close()
+        }
+      }
+      expect(countRows()).toBe(200)
+
+      // First migration.
+      initHistory(legacyDir, 30)
+      expect(countRows()).toBe(200)
+      // The new column is usable, and every legacy row kept its exact contents.
+      expect(lookupMessageRoleAndText(CHAT, 19000)).toEqual({
+        role: 'user',
+        text: 'row 0',
+        kind: null,
+      })
+      recordSystemOutbound({
+        chat_id: CHAT,
+        thread_id: null,
+        message_id: 19500,
+        kind: 'boot-card',
+        text: 'booted',
+      })
+      _resetForTests()
+
+      // Re-run against the ALREADY-migrated file: idempotent, non-destructive.
+      initHistory(legacyDir, 30)
+      expect(countRows()).toBe(201)
+      expect(lookupMessageRoleAndText(CHAT, 19500, { includeSystem: true })).toEqual({
+        role: 'system',
+        text: 'booted',
+        kind: 'boot-card',
+      })
+      _resetForTests()
+    } finally {
+      rmSync(legacyDir, { recursive: true, force: true })
+      // Restore the per-test DB the shared afterEach expects to close.
+      initHistory(stateDir, 30)
+    }
+  })
+})

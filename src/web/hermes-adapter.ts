@@ -310,7 +310,10 @@ function readHistoryDb(
     try {
       const rows = db
         .prepare(
+          // role <> 'system' excludes the card lane (#4571): activity cards /
+          // status pins / approval cards are ephemeral UI, not transcript.
           `SELECT role, text, ts FROM messages
+           WHERE role <> 'system'
            ORDER BY ts DESC, rowid DESC LIMIT ?`,
         )
         .all(limit) as Array<{ role: string; text: string; ts: number }>;

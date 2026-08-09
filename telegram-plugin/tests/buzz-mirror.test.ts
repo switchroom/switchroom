@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,6 +28,17 @@ function mirrorWith(sender: (m: OutboundToBuzzMessage) => boolean, opts?: { defa
 }
 
 const BUZZ_COORDS = { channelId: 'chan-A', eventId: 'evt-1', threadRoot: 'root-1' }
+
+// Cross-FILE isolation. `getBuzzMirror()` is a module-level singleton and the
+// last describe here boots one (`maybeBootBuzzMirror`) with no trailing reset —
+// every `beforeEach` in this file resets on the way IN, nothing resets on the
+// way OUT. `bun test` runs every file in ONE process with no guaranteed file
+// order, so a booted mirror leaks into whichever suite runs next: sendReply's
+// Buzz hook (outbound-send-path.ts:2658) then fires in suites that never wired
+// its deps and dies on `findLatestTurnForChat is not a function` (observed:
+// 43 failures in send-reply-golden.test.ts, purely from readdir order).
+// Unconditional teardown here is the only ordering-proof fix.
+afterAll(() => __resetBuzzMirrorForTests())
 
 describe('BuzzMirror.mirrorReplyDelivered — routing + S1 owner guard', () => {
   beforeEach(() => __resetBuzzMirrorForTests())
