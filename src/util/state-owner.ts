@@ -520,6 +520,48 @@ export function reconcileStateDirOwnership(
 }
 
 /**
+ * {@link reconcileStateDirOwnership} plus the caller-side reporting every
+ * caller wants, so the wiring is one line at the call site instead of a
+ * try/catch + formatter inlined into a host file.
+ *
+ * Two behaviours are deliberately owned here rather than by the caller:
+ *
+ * - **Never throws.** The backfill rides the host's existing boot path, where
+ *   an unexpected throw would take the process down before it can serve. A
+ *   failed ownership sweep is a hygiene regression; a failed boot is an
+ *   outage.
+ * - **Silent when there was nothing to do.** The pass runs on every tick and
+ *   the common case (non-root process, or an already-clean tree) adopts
+ *   nothing; logging that every time would be noise. Only a real adoption or
+ *   a truncated walk is worth a line.
+ *
+ * @param dir     state directory to reconcile
+ * @param reason  free-form tick label, echoed into the log line (e.g. `boot`)
+ * @param opts.prefix  log-line prefix identifying the host process
+ * @param opts.write   sink; defaults to stderr (test seam)
+ */
+export function reconcileStateDirOwnershipLogged(
+  dir: string,
+  reason: string,
+  opts: { prefix?: string; write?: (line: string) => void } = {},
+): void {
+  const prefix = opts.prefix ?? "switchroom";
+  const write = opts.write ?? defaultLog;
+  try {
+    const own = reconcileStateDirOwnership(dir);
+    if (own.adopted > 0 || own.truncated) {
+      write(
+        `${prefix}: state-owner reconcile (${reason}) scanned=${own.scanned}` +
+          ` adopted=${own.adopted} symlinksSkipped=${own.symlinksSkipped}` +
+          ` truncated=${own.truncated}\n`,
+      );
+    }
+  } catch (err) {
+    write(`${prefix}: state-owner reconcile (${reason}) failed: ${(err as Error).message}\n`);
+  }
+}
+
+/**
  * Adopt and report whether anything actually changed — the reconcile pass
  * needs the "did I change it" bit that {@link adoptStateOwnership} discards.
  */

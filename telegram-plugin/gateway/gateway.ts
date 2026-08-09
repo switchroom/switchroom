@@ -660,18 +660,8 @@ import { createStatusPinApi, type PinCapableBot, type RobustApiSeam } from './st
 import { collectSweepTargets, type StalePinSweeper, type SweepTarget } from './stale-pin-sweep.js'
 import { createGatewayStalePinSweeper } from './stale-pin-sweep-wiring.js'
 import { reseedSweepLedger } from './stale-pin-sweep-store.js'
-import { atomicWriteFileSync } from '../../src/util/atomic.js'
-// Ownership choke point for state-dir writes: a ROOT-tier agent's gateway runs
-// as uid 0 and would otherwise leave root:root files in an agent-owned dir,
-// EACCESing every non-root reader. Zero-syscall no-op off the root path — see
-// src/util/state-owner.ts.
-import {
-  appendStateFileSync,
-  atomicWriteStateFileSync,
-  mkdirStateSync,
-  reconcileStateDirOwnership,
-  writeStateFileSync,
-} from '../../src/util/state-owner.js'
+// Ownership choke point for every state-dir write; zero-syscall no-op off the root path. Rationale: src/util/state-owner.ts.
+import { appendStateFileSync, atomicWriteStateFileSync, mkdirStateSync, reconcileStateDirOwnershipLogged, writeStateFileSync } from '../../src/util/state-owner.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
 import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
 
@@ -2161,24 +2151,8 @@ function runHistoryReaperNow(reason: 'boot' | 'periodic'): void {
       process.stderr.write(`telegram gateway: history-reaper (${reason}) failed: ${(err as Error).message}\n`)
     }
   }
-  // State-dir ownership backfill for files the write helpers can't reach —
-  // leftovers from a previously-root gateway, and files a sibling root process
-  // (hook, sidecar) created. Rides this EXISTING tick (boot, then 6h) rather
-  // than adding a timer; bounded and symlink-safe, and a single stat when the
-  // process isn't root. Rationale in src/util/state-owner.ts.
-  // (try/catch: this also runs on the BOOT path, where an unexpected throw
-  // would take the gateway down before it can serve.)
-  try {
-    const own = reconcileStateDirOwnership(STATE_DIR)
-    if (own.adopted > 0 || own.truncated) {
-      process.stderr.write(
-        `telegram gateway: state-owner reconcile (${reason}) scanned=${own.scanned}`
-        + ` adopted=${own.adopted} symlinksSkipped=${own.symlinksSkipped} truncated=${own.truncated}\n`,
-      )
-    }
-  } catch (err) {
-    process.stderr.write(`telegram gateway: state-owner reconcile (${reason}) failed: ${(err as Error).message}\n`)
-  }
+  // State-dir ownership backfill (never throws; rides this EXISTING boot/6h tick). See src/util/state-owner.ts.
+  reconcileStateDirOwnershipLogged(STATE_DIR, reason, { prefix: 'telegram gateway' })
 }
 // Run once at boot to catch up long-stopped agents. (#2996 P0c: gated.)
 if (isGatewayMain) runHistoryReaperNow('boot')

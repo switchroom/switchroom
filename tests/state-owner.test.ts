@@ -47,6 +47,7 @@ import {
   atomicWriteStateFileSync,
   mkdirStateSync,
   reconcileStateDirOwnership,
+  reconcileStateDirOwnershipLogged,
   resolveStateOwner,
   writeStateFileSync,
 } from "../src/util/state-owner.js";
@@ -246,6 +247,42 @@ describe.runIf(isRoot)("state-owner: root writer into an agent-owned dir", () =>
       expect(statSync(join(dir, "a", "b")).uid).toBe(AGENT_UID);
       expect(statSync(join(dir, "a", "b", "c")).uid).toBe(0);
     });
+
+    // The gateway wires the sweep through the *Logged wrapper, so the operator-
+    // visible outcome is the line it emits — not the result object.
+    it("the logged wrapper adopts and reports exactly one line", () => {
+      const dir = agentOwnedDir();
+      writeFileSync(join(dir, "gateway-beacon.json"), "{}");
+      const lines: string[] = [];
+
+      reconcileStateDirOwnershipLogged(dir, "boot", {
+        prefix: "telegram gateway",
+        write: line => lines.push(line),
+      });
+
+      expect(statSync(join(dir, "gateway-beacon.json")).uid).toBe(AGENT_UID);
+      expect(lines).toEqual([
+        "telegram gateway: state-owner reconcile (boot) scanned=1 adopted=1" +
+          " symlinksSkipped=0 truncated=false\n",
+      ]);
+    });
+
+    it("the logged wrapper stays silent on a pass that adopted nothing", () => {
+      // A 6-hourly tick over an already-clean tree must not add a log line —
+      // the sweep is silent unless it actually changed something.
+      const dir = agentOwnedDir();
+      const path = join(dir, "clean.json");
+      writeFileSync(path, "{}");
+      chownSync(path, AGENT_UID, AGENT_GID);
+      const lines: string[] = [];
+
+      reconcileStateDirOwnershipLogged(dir, "periodic", {
+        prefix: "telegram gateway",
+        write: line => lines.push(line),
+      });
+
+      expect(lines).toEqual([]);
+    });
   });
 
   it("writeStateFileSync through a symlinked target still writes, but does not chown it", () => {
@@ -315,6 +352,18 @@ describe("state-owner: non-root is inert", () => {
       symlinksSkipped: 0,
       truncated: false,
     });
+  });
+
+  it("the logged wrapper never throws on a missing state dir", () => {
+    // It runs on the gateway's BOOT path: a throw here would take the gateway
+    // down before it can serve, which is strictly worse than an unswept tree.
+    const lines: string[] = [];
+    expect(() =>
+      reconcileStateDirOwnershipLogged(join(root, "gone"), "boot", {
+        write: line => lines.push(line),
+      }),
+    ).not.toThrow();
+    expect(lines).toEqual([]);
   });
 
   it("adopt helpers never throw on a missing file", () => {
