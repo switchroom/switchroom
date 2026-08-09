@@ -15,10 +15,17 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.22 — recall budget default moves to `mid`, speaker-aware retain context, and fail-safe recall fact-type filtering
+
 ### Features
 
-- **hindsight: default recall budget low->mid + fix stale budget comment**
-- **hindsight: speaker-aware retain context template ({agent}/{bank_id} resolved per-retain)**
+- **hindsight: default recall budget `low`→`mid`** (fleet default; per-agent override still wins). Under the current candidate caps (`MAX_CANDIDATES_PER_SOURCE=30`, `RERANKER_MAX_CANDIDATES=150`) this is near-inert on large banks — measured mid vs low returned the same top-6 in 11/12 queries with ~+0.5s latency and 0 deadline crosses; the real recall-depth lever is the candidate caps. Also fixes a stale `recallBudget` code comment.
+- **hindsight: speaker-aware retain context template** — `retainContext` now resolves `{agent}`/`{bank_id}` per-retain so stored memories carry which agent/bank produced them.
+
+### Fixed
+
+- **hindsight: recall no longer dies on an invalid `fact_type`.** `recall.py` sent `memory.recall.types` to the engine unvalidated; a typo (e.g. `fact`) returned HTTP 422 and killed recall entirely (empty every turn). A new `filter_recall_types` helper filters to the valid set `{experience, observation, world}`, drops unknowns, falls back to the default if emptied, and never raises. (#4574)
+- **hindsight: retain cadence env-override keys restored.** Added `HINDSIGHT_RETAIN_EVERY_N_TURNS` / `_OVERLAP_TURNS` / `_CONTEXT` / `_TAGS` to the config env-override table, restoring env-wins parity with the recall knobs. (#4574)
 
 ## v0.20.21 — recall slot floors scale with the `max_memories` cap, and release tags retag unchanged images instead of rebuilding them
 
