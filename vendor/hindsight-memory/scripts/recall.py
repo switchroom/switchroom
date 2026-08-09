@@ -59,7 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.bank import derive_bank_id, ensure_bank_mission
 from lib.client import HindsightClient
-from lib.config import debug_log, load_config
+from lib.config import debug_log, filter_recall_types, load_config
 from lib.content import (
     _extract_text_content,
     compose_recall_query,
@@ -2091,6 +2091,15 @@ def main():
     if recall_request_timeout <= 0:
         recall_request_timeout = 12.0
 
+    # Fail-safe the recall `types` BEFORE any bank task runs: the 0.9.0 engine
+    # 422s an invalid fact type (e.g. an operator typo "observations"/"fact" in
+    # memory.recall.types), which fails the whole recall and drops memory
+    # injection for the turn. filter_recall_types drops unknowns (shouting on
+    # stderr) and falls back to the default set if the filter empties it — it
+    # never raises. Computed once here so every bank in the fan-out sends the
+    # same validated set.
+    resolved_recall_types = filter_recall_types(config)
+
     def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups, timeout_override=None):
         def _bank_task():
             return client.recall(
@@ -2098,7 +2107,7 @@ def main():
                 query=search_query,
                 max_tokens=config.get("recallMaxTokens", 1024),
                 budget=config.get("recallBudget", "mid"),
-                types=config.get("recallTypes"),
+                types=resolved_recall_types,
                 # Upstream 962140eef — optional per-bank tag filters (resolved
                 # above the cache check; part of the cache key).
                 tags=b_tags,

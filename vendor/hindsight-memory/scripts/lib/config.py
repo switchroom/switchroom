@@ -396,6 +396,23 @@ ENV_OVERRIDES = {
     "HINDSIGHT_AUTO_RECALL": ("autoRecall", bool),
     "HINDSIGHT_AUTO_RETAIN": ("autoRetain", bool),
     "HINDSIGHT_RETAIN_MODE": ("retainMode", str),
+    # Switchroom-local: auto-retain cadence knobs. These had a DEFAULTS entry and
+    # a settings.json stamp (applyHindsightSettingsOverrides) but NO env channel,
+    # so env — the TOP of the config precedence chain (DEFAULTS → settings.json →
+    # ~/.hindsight/claude-code.json → env) — could not reach them at all. That
+    # broke parity with the recall knobs and left the only override paths as a
+    # settings.json rewrite (scaffold-time) or a hand-edit that `switchroom apply`
+    # re-copies away. Adding the env keys lets `memory.retain.*` (or an agent
+    # `env:` map, or a docker-exec'd retain that does not inherit the supervised
+    # env) drive them, and makes the env value authoritative when set.
+    # `retainEveryNTurns` / `retainOverlapTurns` mirror the yaml surface
+    # (`memory.retain.every_n_turns` / `.overlap_turns`); `retainContext` /
+    # `retainTags` have no yaml surface yet but gain the same env channel as the
+    # other retain knobs for consistency and exec-path overrides.
+    "HINDSIGHT_RETAIN_EVERY_N_TURNS": ("retainEveryNTurns", int),
+    "HINDSIGHT_RETAIN_OVERLAP_TURNS": ("retainOverlapTurns", int),
+    "HINDSIGHT_RETAIN_CONTEXT": ("retainContext", str),
+    "HINDSIGHT_RETAIN_TAGS": ("retainTags", list),
     # Switchroom-local: per-row observation scope on retains. Set by start.sh
     # from agents.<name>.memory.observation_scopes (cascading through
     # defaults.memory.observation_scopes) ONLY when the operator set it; unset
@@ -518,6 +535,77 @@ ENV_OVERRIDES = {
 #: src/memory/observation-scopes.ts, which the zod enum reads — widening the
 #: set means widening BOTH.
 OBSERVATION_SCOPES_VALUES = ("per_tag", "combined", "all_combinations", "shared")
+
+
+#: Switchroom-local: the fact types Hindsight's recall endpoint accepts. Sending
+#: any other value makes the 0.9.0 engine return HTTP 422 ("Invalid fact type(s):
+#: … Must be one of: experience, observation, world") — a validation that was
+#: silently tolerated before vectorize-io/hindsight#3062. A 422 fails the WHOLE
+#: recall for the turn, so an operator typo in `memory.recall.types` (e.g.
+#: "observations", "fact") would otherwise kill memory injection on EVERY turn.
+#: Verified against the live engine's 422 detail string and /openapi.json
+#: RecallRequest; widening this set means widening it server-side too.
+RECALL_FACT_TYPES = ("world", "experience", "observation")
+
+#: The recall types used when a configured `recallTypes` filters down to empty
+#: (mirrors the `recallTypes` DEFAULTS entry). Falling back to this — rather than
+#: sending an empty/invalid set — keeps recall running with the shipped behaviour
+#: instead of degrading to nothing.
+DEFAULT_RECALL_FACT_TYPES = ("world", "experience")
+
+
+def filter_recall_types(config: dict):
+    """Filter ``recallTypes`` to the set Hindsight's recall endpoint accepts.
+
+    Returns the value to send as the recall ``types`` argument. THIS FUNCTION
+    MUST NEVER RAISE: an invalid ``memory.recall.types`` value is a
+    misconfiguration, and both raising here and passing the bad value through
+    have the same catastrophic outcome — a 422 that fails the recall and drops
+    memory injection for the turn. This mirrors the degrade-don't-raise contract
+    of :func:`compute_observation_scopes` (a bad config degrades the FEATURE,
+    never loses the turn).
+
+    * ``None`` / unset → ``None``: omit the field entirely, letting the engine
+      apply its own default (world + experience). Byte-identical to the wire
+      body a pre-filter client sent.
+    * a list/tuple     → keep the members in :data:`RECALL_FACT_TYPES` (order
+      and de-duplicated), dropping every unknown value WITH a stderr warning
+      that names it. If nothing valid survives, fall back to
+      :data:`DEFAULT_RECALL_FACT_TYPES` so recall still runs.
+    * anything else     → shout and fall back to :data:`DEFAULT_RECALL_FACT_TYPES`.
+    """
+    raw = config.get("recallTypes")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        print(
+            f"[Hindsight] recallTypes={raw!r} is not a list; falling back to "
+            f"{list(DEFAULT_RECALL_FACT_TYPES)}. Set it via `memory.recall.types` "
+            "in switchroom.yaml.",
+            file=sys.stderr,
+        )
+        return list(DEFAULT_RECALL_FACT_TYPES)
+    valid = []
+    for fact_type in raw:
+        if isinstance(fact_type, str) and fact_type in RECALL_FACT_TYPES:
+            if fact_type not in valid:
+                valid.append(fact_type)
+        else:
+            print(
+                f"[Hindsight] recallTypes entry {fact_type!r} is not a valid "
+                f"Hindsight fact type ({', '.join(RECALL_FACT_TYPES)}); dropping "
+                "it. An invalid type 422s the recall and drops memory injection "
+                "for the turn — fix it via `memory.recall.types` in switchroom.yaml.",
+                file=sys.stderr,
+            )
+    if not valid:
+        print(
+            f"[Hindsight] recallTypes={raw!r} left no valid fact types after "
+            f"filtering; falling back to {list(DEFAULT_RECALL_FACT_TYPES)}.",
+            file=sys.stderr,
+        )
+        return list(DEFAULT_RECALL_FACT_TYPES)
+    return valid
 
 
 def classify_observation_scopes(config: dict):
