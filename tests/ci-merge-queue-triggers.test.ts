@@ -533,3 +533,75 @@ describe('docker-images — build-dependents is decoupled from build-base on PR/
     )
   })
 })
+
+describe('CI parallelism — docker-e2e sharded 3-way, ci-tests-core 8-way', () => {
+  // Guards the free-runner parallelism split. Each assertion fails on the
+  // exact regression it protects: a shard count reverted, the required
+  // sentinel losing a shard's coverage, or the shard parameter never
+  // reaching the test runner (which would run the whole suite N times over
+  // — no speedup and wasted runners). None of this is observable on a
+  // green run; only a shape test pins it.
+
+  const shardsOf = (job: Job | undefined): unknown[] => {
+    const matrix = (job?.strategy as { matrix?: { shard?: unknown[] } } | undefined)?.matrix?.shard
+    return Array.isArray(matrix) ? matrix : []
+  }
+  const needsOf = (job: Job | undefined): string[] => {
+    const n = job?.needs
+    return Array.isArray(n) ? n : n ? [String(n)] : []
+  }
+
+  it('docker-e2e: e2e-shard is a 3-way matrix', () => {
+    const job = (load('docker-e2e.yml').jobs ?? {})['e2e-shard']
+    expect(job, 'docker-e2e.yml must define the sharded e2e-shard job').toBeTruthy()
+    expect(shardsOf(job)).toEqual([1, 2, 3])
+  })
+
+  it('docker-e2e: every e2e shard threads its shard index into the snapshot gate', () => {
+    const job = (load('docker-e2e.yml').jobs ?? {})['e2e-shard']
+    const gateStep = stepsOf(job).find((s) => (s.run ?? '').includes('docker-snapshot-gate.sh')) as
+      | (Step & { env?: Record<string, string> })
+      | undefined
+    expect(gateStep, 'the e2e-shard job must still run docker-snapshot-gate.sh').toBeTruthy()
+    // The gate slices tests/docker by VITEST_SHARD; without this env each
+    // leg runs the WHOLE suite, three times over — the exact anti-speedup.
+    expect(gateStep!.env?.VITEST_SHARD, 'VITEST_SHARD must pin this leg to /3').toBe(
+      '${{ matrix.shard }}/3',
+    )
+  })
+
+  it('docker-e2e: the e2e-ok sentinel aggregates every e2e shard + hindsight-probe', () => {
+    const sentinel = (load('docker-e2e.yml').jobs ?? {})['e2e-ok']
+    const needs = needsOf(sentinel)
+    // `needs: e2e-shard` aggregates ALL matrix legs — success only if
+    // every shard passed; failure/cancel if any did. Dropping it (or a
+    // stale `needs: e2e`) would let a failing shard slip past the one
+    // required context for this workflow.
+    expect(needs, 'e2e-ok must need the sharded e2e job').toContain('e2e-shard')
+    expect(needs, 'e2e-ok must still need hindsight-probe').toContain('hindsight-probe')
+    expect(needs, 'e2e-ok must not reference the pre-shard job name').not.toContain('e2e')
+    const verdict = JSON.stringify(sentinel?.steps ?? [])
+    expect(verdict, 'the verdict must fail the sentinel on a shard failure').toContain(
+      'needs.e2e-shard.result',
+    )
+    expect(verdict, 'the verdict must not read the stale e2e.result').not.toContain(
+      'needs.e2e.result',
+    )
+  })
+
+  it('ci-tests-core: vitest-shard is an 8-way matrix and both arms shard /8', () => {
+    const job = (load('ci-tests-core.yml').jobs ?? {})['vitest-shard']
+    expect(shardsOf(job)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    const shardCmds = stepsOf(job)
+      .map((s) => s.run ?? '')
+      .filter((r) => r.includes('vitest run'))
+    expect(
+      shardCmds.length,
+      'expected both vitest arms (PR --changed + full suite)',
+    ).toBeGreaterThanOrEqual(2)
+    for (const cmd of shardCmds) {
+      expect(cmd, 'every vitest arm must shard /8, not a stale /4').toContain('${{ matrix.shard }}/8')
+      expect(cmd, 'no stale /4 denominator may remain').not.toContain('/4')
+    }
+  })
+})

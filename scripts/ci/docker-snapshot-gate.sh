@@ -89,8 +89,19 @@ echo "captured pre-snapshot: $(wc -l <"$PRE_FILE") containers"
 
 # Run the docker test slice. Any failure is captured but does NOT skip
 # the post-snapshot — we MUST always compare.
+#
+# VITEST_SHARD (e.g. "2/3") fans the suite across parallel CI runners:
+# docker-e2e.yml's e2e-shard matrix sets it per leg so each runner
+# executes a `--shard i/N` slice. Unset, we run the whole suite — the
+# original single-runner path, preserved for any other caller. When
+# sharding, --passWithNoTests guards the (unlikely) empty-slice case so
+# a shard with zero selected files does not exit 1 and red the gate.
 set +e
-bunx vitest run tests/docker
+if [ -n "${VITEST_SHARD:-}" ]; then
+  bunx vitest run tests/docker --shard "${VITEST_SHARD}" --passWithNoTests
+else
+  bunx vitest run tests/docker
+fi
 VITEST_EXIT=$?
 set -e
 
