@@ -110,6 +110,12 @@ export type SensorSignal =
   // that the live compose does not bind-mount. LiteLLM imports callbacks during
   // startup, so this is a hard crash-loop with no degraded mode.
   | "litellm-callback-mount-missing"
+  // The live compose declares a passthrough/patch bind mount whose target
+  // hard-codes a CPython minor version (`.../python3.13/site-packages/...`) that
+  // no longer matches the live image. The mount lands at an inert path and the
+  // patch is SILENTLY dropped — no crash, unlike the callback case; the proxy
+  // comes up "healthy" on unpatched code. See `passthrough-mount-guard.ts`.
+  | "litellm-passthrough-mount-stale"
   // The live `switchroom-hindsight` container is running CPU-only
   // (`HostConfig.DeviceRequests` empty) while the host has a PROVABLY usable
   // GPU (nvidia-smi + the nvidia container runtime). Reranker + local

@@ -20,6 +20,7 @@
  * a structured finding. No LLM, no network.
  */
 
+import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -40,6 +41,10 @@ import {
   canReadComposeMounts,
   detectMissingCallbackMounts,
 } from "../litellm/callback-mount-guard.js";
+import {
+  detectStalePassthroughMounts,
+  extractVersionedSitePackagesMounts,
+} from "../litellm/passthrough-mount-guard.js";
 
 /** The pseudo-agent the litellm misconfig finding is attributed to. It is not a
  *  real switchroom agent — it names the shared LiteLLM proxy so the ledger's
@@ -58,6 +63,11 @@ export interface LitellmSensorOptions {
   /** Live-config discovery, injectable so tests never depend on the host's
    *  real `/data/coolify/services` tree (see `DiscoverFn`). */
   discoverFn?: DiscoverFn;
+  /** Resolve the CPython minor version the LIVE litellm image actually ships
+   *  (e.g. `"3.13"`), or null when it cannot be determined (docker down, no
+   *  container, off-host CI/dev). Injectable so the suite never depends on a
+   *  real container. Defaults to `resolveLiveLitellmPythonVersion`. */
+  pythonVersionFn?: PythonVersionFn;
   log?: (msg: string) => void;
   /** Timestamp for the finding (ISO). Defaults to now. */
   nowIso?: string;
@@ -79,6 +89,55 @@ export interface LitellmSensorResult {
  * exists — a host-dependent test is a real defect, fixed by injecting here.
  */
 export type DiscoverFn = () => LiveConfigDiscovery;
+
+/**
+ * Resolve-the-live-image-python-version seam. Defaults to a `docker exec` of the
+ * live litellm container (same `docker inspect`-the-live-container division of
+ * labour the image pin and the GPU-drift sensor use). Tests inject a stub so
+ * they assert the version-coherence LOGIC instead of reaching for a real
+ * container. Returns null for "cannot tell" — docker down, no container,
+ * off-host CI/dev — which the passthrough check treats as a visible skip.
+ */
+export type PythonVersionFn = () => string | null;
+
+/**
+ * Default live resolver: find the litellm container and read the CPython minor
+ * version its interpreter actually ships, straight from the venv site-packages
+ * layout (`/app/.venv/lib/pythonX.Y/`). That layout IS the ground truth a
+ * versioned shadow mount must match, so reading it — rather than guessing from
+ * the image tag, which does not encode python — is what makes the check
+ * substantiated. Any failure (no docker, no container, unexpected layout)
+ * returns null so the sensor skips instead of fabricating a version.
+ *
+ * Model-free: two docker calls, no LLM, no network. Not exercised by the unit
+ * suite (which injects `pythonVersionFn`); it runs only on-host where the scan
+ * runs and a real container exists.
+ */
+export function resolveLiveLitellmPythonVersion(): string | null {
+  try {
+    const ps = execFileSync("docker", ["ps", "--format", "{{.Names}}\t{{.Image}}"], {
+      encoding: "utf-8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const line = ps
+      .split("\n")
+      .find((l) => /litellm-database|(^|\s)litellm/i.test(l) && l.trim().length > 0);
+    if (!line) return null;
+    const name = line.split("\t")[0]?.trim();
+    if (!name) return null;
+
+    const lsOut = execFileSync(
+      "docker",
+      ["exec", name, "sh", "-c", "ls -d /app/.venv/lib/python*/ 2>/dev/null"],
+      { encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const m = lsOut.match(/python(\d+\.\d+)/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Resolve the live config path: explicit arg → `LITELLM_CONFIG_PATH` env →
@@ -226,6 +285,46 @@ export function scanLitellmConfig(
       agent: LITELLM_PROXY_PSEUDO_AGENT,
       turn_id: `litellm-callback-mount:${m.module}`,
       log_pointer: `${composePath}: ${m.detail}`,
+      ts: nowIso,
+    });
+  }
+
+  // Passthrough / shadow-mount version STALENESS: a patch mount whose target
+  // hard-codes a CPython minor version the live image no longer ships lands at
+  // an inert path and SILENTLY drops the patch — no crash, unlike the callback
+  // case above, so nothing but this check would surface it. Scope note: this
+  // detects a mount pinned to the WRONG python version, not a mount that was
+  // removed entirely — removal has no config anchor to test against and stays
+  // uncovered (tracked in #4558). Resolving the image's real python version
+  // costs two `docker exec`s, so gate it behind "there is actually a versioned
+  // mount to validate": on a compose with zero versioned mounts there is
+  // nothing to check, so skip the resolve (and its log) entirely rather than
+  // paying ~10s and emitting a misleading "could not resolve" line every scan.
+  const versionedMounts =
+    composeText !== null ? extractVersionedSitePackagesMounts(composeText) : null;
+  const hasVersionedMounts = versionedMounts !== null && versionedMounts.length > 0;
+  const pythonVersionFn = opts.pythonVersionFn ?? resolveLiveLitellmPythonVersion;
+  const actualPythonVersion = hasVersionedMounts ? pythonVersionFn() : null;
+  if (hasVersionedMounts && actualPythonVersion === null) {
+    log(
+      `fleet-health: litellm-config sensor — passthrough-mount check SKIPPED, ` +
+        `could not resolve the live litellm image's CPython version (docker down, no ` +
+        `container, or off-host CI/dev)`,
+    );
+  }
+  const staleMounts = detectStalePassthroughMounts(composeText, actualPythonVersion);
+  if (hasVersionedMounts && actualPythonVersion !== null && staleMounts.length === 0) {
+    log(
+      `fleet-health: litellm-config sensor OK — every versioned site-packages shadow ` +
+        `mount in ${composePath} matches the live image's CPython ${actualPythonVersion}`,
+    );
+  }
+  for (const s of staleMounts) {
+    findings.push({
+      signal: "litellm-passthrough-mount-stale",
+      agent: LITELLM_PROXY_PSEUDO_AGENT,
+      turn_id: `litellm-passthrough-mount:${s.declaredPythonVersion}->${s.actualPythonVersion}`,
+      log_pointer: `${composePath}: ${s.detail}`,
       ts: nowIso,
     });
   }
