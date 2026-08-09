@@ -274,6 +274,65 @@ export function publicPortIsUnserved(input: {
   return input.authorityApiPort !== input.configUrlPort;
 }
 
+/**
+ * What a "split is DECLARED OFF but a recall pool is still running" state has
+ * to do to converge on the declared single-container topology.
+ *
+ *   - `none`                     — nothing to converge (no stale pool, or not
+ *                                  enough positive evidence to act safely).
+ *   - `stop-pool`                — the authority ALREADY serves the public
+ *                                  port, so the pool is a pure orphan. Stopping
+ *                                  it cannot unserve anything.
+ *   - `relaunch-single-on-public`— the pool HOLDS the public port and the
+ *                                  authority is parked elsewhere (public+1).
+ *                                  Just stopping the pool would leave the
+ *                                  public port unbound — the exact outage
+ *                                  {@link publicPortIsUnserved} exists to
+ *                                  catch. The pool may only be stopped as part
+ *                                  of relaunching a sole container ON the
+ *                                  public port, health-gated.
+ */
+export type StaleRecallPoolConvergence =
+  | { action: "none" }
+  | { action: "stop-pool" }
+  | { action: "relaunch-single-on-public"; publicApiPort: number };
+
+/**
+ * Plan the convergence for a stale recall pool.
+ *
+ * The defect this closes: with `hindsight.recall_pool.enabled` absent/false but
+ * a pool container still running, the no-recreate "is it already running?"
+ * branch in both launch paths printed "already running" and returned success.
+ * {@link publicPortIsUnserved} deliberately returns false there (the pool IS
+ * serving the public port, so it is not an outage), which left an orphan
+ * container contradicting declared config — durable across reboots via
+ * `--restart always`, and carrying the pool's own DB-pool caps against a
+ * background container that is no longer capped for a split.
+ *
+ * Positive-evidence-only, like {@link publicPortIsUnserved}: with no declared
+ * public port (`configUrlPort` absent) or no readable authority port, there is
+ * no way to tell whether stopping the pool would strand the public port, so the
+ * plan is `none` rather than a guess that could cause the outage it is
+ * preventing.
+ */
+export function planStaleRecallPoolConvergence(input: {
+  /** `hindsight.recall_pool.enabled` — a DECLARED pool is never stale. */
+  recallEnabled: boolean;
+  poolRunning: boolean;
+  /** Port the authority container currently publishes, if readable. */
+  authorityApiPort: number | undefined;
+  /** Port `memory.config.url` declares, if any. */
+  configUrlPort: number | undefined;
+}): StaleRecallPoolConvergence {
+  if (input.recallEnabled) return { action: "none" };
+  if (!input.poolRunning) return { action: "none" };
+  if (input.configUrlPort == null || input.authorityApiPort == null) {
+    return { action: "none" };
+  }
+  if (input.authorityApiPort === input.configUrlPort) return { action: "stop-pool" };
+  return { action: "relaunch-single-on-public", publicApiPort: input.configUrlPort };
+}
+
 /** Resolved recall-pool settings, or `null` when the feature is off. */
 export interface RecallPoolConfig {
   /** Number of uvicorn workers the pool runs (`--workers`). */
@@ -395,6 +454,102 @@ export function backgroundContainerPoolEnv(): Record<string, string> {
     HINDSIGHT_API_DB_POOL_MAX_SIZE: String(HINDSIGHT_BACKGROUND_DB_POOL_MAX_SIZE),
     HINDSIGHT_API_READ_DB_POOL_MAX_SIZE: String(HINDSIGHT_BACKGROUND_READ_DB_POOL_MAX_SIZE),
   };
+}
+
+/**
+ * The two env keys the split COMPUTES for itself, in both containers, and
+ * therefore cannot honour from `hindsight.env`. They are the DB-pool caps, and
+ * they are the load-bearing inputs to
+ * {@link assertRecallPoolConnectionBudget}: the assertion proves
+ * `pool + {@link HINDSIGHT_BACKGROUND_CONNECTION_BUDGET} ≤ 240`, which is only
+ * a proof if BOTH sides are the values the containers actually launch with.
+ */
+/** The operator's `hindsight.env` block, as switchroom.yaml types it. */
+export type HindsightEnvBlock = Record<string, string | number | boolean>;
+
+export const HINDSIGHT_SPLIT_MANAGED_DB_POOL_KEYS = [
+  "HINDSIGHT_API_DB_POOL_MAX_SIZE",
+  "HINDSIGHT_API_READ_DB_POOL_MAX_SIZE",
+] as const;
+
+/** One operator `hindsight.env` key the split had to override, and with what. */
+export interface SplitDbPoolEnvConflict {
+  key: string;
+  /** What the operator wrote in `hindsight.env`. */
+  operatorValue: string;
+  /** What the AUTHORITY container launches with instead. */
+  authorityValue: string;
+  /** What the RECALL POOL container launches with instead. */
+  poolValue: string;
+}
+
+/**
+ * Which of {@link HINDSIGHT_SPLIT_MANAGED_DB_POOL_KEYS} the operator set in
+ * `hindsight.env` while the split is on — i.e. every value that will NOT reach
+ * either container. Empty when the operator set none (the overwhelmingly
+ * common case), so the caller warns about nothing.
+ */
+export function splitDbPoolEnvConflicts(
+  operatorEnv: HindsightEnvBlock | undefined,
+  cfg: RecallPoolConfig,
+): SplitDbPoolEnvConflict[] {
+  if (!operatorEnv) return [];
+  const authority = backgroundContainerPoolEnv();
+  const pool: Record<string, string> = {
+    HINDSIGHT_API_DB_POOL_MAX_SIZE: String(cfg.dbPoolMaxSize),
+    HINDSIGHT_API_READ_DB_POOL_MAX_SIZE: String(cfg.readDbPoolMaxSize),
+  };
+  const out: SplitDbPoolEnvConflict[] = [];
+  for (const key of HINDSIGHT_SPLIT_MANAGED_DB_POOL_KEYS) {
+    const operatorValue = operatorEnv[key];
+    if (operatorValue === undefined) continue;
+    out.push({
+      key,
+      operatorValue: String(operatorValue),
+      authorityValue: authority[key]!,
+      poolValue: pool[key]!,
+    });
+  }
+  return out;
+}
+
+/** Operator-facing text for one {@link splitDbPoolEnvConflicts} entry. */
+export function splitDbPoolEnvConflictWarning(c: SplitDbPoolEnvConflict): string {
+  const knob =
+    c.key === "HINDSIGHT_API_DB_POOL_MAX_SIZE"
+      ? "hindsight.recall_pool.db_pool_max_size"
+      : "hindsight.recall_pool.read_db_pool_max_size";
+  return (
+    `hindsight.env.${c.key}=${c.operatorValue} is IGNORED while ` +
+    `hindsight.recall_pool.enabled is true: the split computes this cap for both ` +
+    `containers (authority ${c.authorityValue}, recall pool ${c.poolValue}) so the ` +
+    `pg0 connection budget stays provable. Set \`${knob}\` instead — it is budget-checked — ` +
+    `or set hindsight.recall_pool.enabled: false to have hindsight.env win again.`
+  );
+}
+
+/**
+ * The `hindsight.env`-shaped perf overrides a SPLIT launch passes to both
+ * containers: the operator's `hindsight.env` with the split's own DB-pool caps
+ * layered LAST, so the managed keys win.
+ *
+ * The precedence is the fix, not an accident. Before this, the composition was
+ * `{...backgroundContainerPoolEnv(), ...hindsight.env}` — the operator's value
+ * won on the AUTHORITY (silently making the 60-connection background reserve
+ * that {@link assertRecallPoolConnectionBudget} asserts against a fiction, so a
+ * large value overflows pg0's ceiling into `FATAL: too many clients` at load)
+ * while still LOSING on the pool, where {@link applyRecallPoolEnvOverrides}
+ * replaces it. Same key, two opposite silent outcomes. Now the managed value
+ * wins in both containers and {@link splitDbPoolEnvConflicts} makes it audible.
+ *
+ * Only the two managed keys are touched; every other `hindsight.env` entry is
+ * passed through untouched, and when the split is OFF this function is not
+ * called at all.
+ */
+export function splitContainerPerfEnv(
+  operatorEnv: HindsightEnvBlock | undefined,
+): HindsightEnvBlock {
+  return { ...(operatorEnv ?? {}), ...backgroundContainerPoolEnv() };
 }
 
 /**
@@ -625,6 +780,98 @@ export function isHindsightRecallPoolRunning(
 }
 
 /**
+ * Which container a health wait is gating. The three roles do MEASURABLY
+ * different amounts of work before they can answer `/health`, which is what
+ * {@link hindsightHealthTimeoutMs} turns into a deadline:
+ *
+ *   - `authority`        — owns pg0. On a fresh host that means initdb on a
+ *                          cold data volume, extension creation, and the full
+ *                          schema migration chain
+ *                          (`HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP`), THEN
+ *                          the API startup. The slowest role by far.
+ *   - `recall-pool`      — no pg0, no initdb, migrations explicitly OFF (see
+ *                          {@link recallPoolEnvOverrides}). It only boots N
+ *                          uvicorn workers, each loading its own reranker.
+ *   - `single-container` — the degrade/fallback relaunch. pg0 again, but over
+ *                          an EXISTING data volume, so no initdb; migrations
+ *                          may still run. Budgeted like the authority because
+ *                          the difference is not knowable from here.
+ */
+export type HindsightHealthRole = "authority" | "recall-pool" | "single-container";
+
+/**
+ * The floor every health deadline is raised to: the single default this
+ * function replaced. Keeping it as an explicit floor means the role-derived
+ * budgets below can only ever ADD headroom — no role silently gets a TIGHTER
+ * deadline than the code had before, so no path can start false-degrading.
+ */
+export const HINDSIGHT_HEALTH_MIN_TIMEOUT_MS = 150_000;
+
+/**
+ * Per-phase budgets a health deadline is composed from. These are deliberately
+ * generous UPPER BOUNDS, not measurements, and the asymmetry is why: the poll
+ * returns the instant `/health` answers 200, so a generous budget costs
+ * NOTHING on the happy path and is only ever spent when the boot is already
+ * failing. A budget that is too TIGHT, by contrast, converts a slow-but-fine
+ * first boot into a spurious "unhealthy" verdict and a topology change.
+ *
+ *   - `apiStartup` — uvicorn boot + app import + model load for the first
+ *     worker. Anchored on the image's own `--health-start-period` (60s, see
+ *     the `docker run` flags in this module and in hindsight.ts), which is
+ *     upstream's estimate of warm-start-to-serving.
+ *   - `pgFirstBoot` — pg0 `initdb` on a cold data volume plus extension
+ *     creation. Paid ONCE, on a fresh host, by whichever container owns pg0.
+ *   - `migrations` — the schema migration chain the pg0 owner runs at startup.
+ *     Longest on a first boot, when every migration applies.
+ *   - `perExtraWorker` — each ADDITIONAL uvicorn worker in the pool loads its
+ *     own cross-encoder onto the single GPU, and they serialize on VRAM, so
+ *     worker count extends the pool's startup roughly linearly.
+ */
+export const HINDSIGHT_HEALTH_PHASE_BUDGET_MS = {
+  apiStartup: 60_000,
+  pgFirstBoot: 90_000,
+  migrations: 90_000,
+  perExtraWorker: 15_000,
+} as const;
+
+/**
+ * The health deadline for a role, derived from the work that role actually
+ * does rather than from one flat number.
+ *
+ * The concrete defect this fixes: with the split ON, a fresh-host first boot
+ * runs pg0 initdb + the full migration chain + API startup in the AUTHORITY
+ * container before anything answers `/health`, and the single 150s deadline
+ * could expire mid-migration. {@link launchRecallPoolHealthGated} would then
+ * read that as `authority-unhealthy` and fail the launch — self-healing only
+ * because a re-run finds the authority already up and takes the repair branch.
+ * The authority now gets 60 + 90 + 90 = 240s.
+ *
+ * The pool is budgeted DOWN-ward by the same logic (no pg0, no migrations) but
+ * never below {@link HINDSIGHT_HEALTH_MIN_TIMEOUT_MS}, so the default 4-worker
+ * pool keeps exactly the deadline it has today.
+ */
+export function hindsightHealthTimeoutMs(input: {
+  role: HindsightHealthRole;
+  /** Pool worker count; only meaningful for `recall-pool`. */
+  workers?: number;
+}): number {
+  const p = HINDSIGHT_HEALTH_PHASE_BUDGET_MS;
+  let budget: number;
+  switch (input.role) {
+    case "authority":
+    case "single-container":
+      budget = p.apiStartup + p.pgFirstBoot + p.migrations;
+      break;
+    case "recall-pool": {
+      const workers = input.workers && input.workers > 0 ? input.workers : 1;
+      budget = p.apiStartup + (workers - 1) * p.perExtraWorker;
+      break;
+    }
+  }
+  return Math.max(HINDSIGHT_HEALTH_MIN_TIMEOUT_MS, budget);
+}
+
+/**
  * Poll `http://127.0.0.1:<port>/health` until it returns 200 or the deadline
  * passes. Returns true on healthy, false on timeout. Injectable `fetchImpl` +
  * `sleep` keep it deterministic under test.
@@ -634,11 +881,20 @@ export function isHindsightRecallPoolRunning(
  * connection-refused), and the pool must bind its port before
  * `memory.config.url` is declared live. Mirrors the health gate the
  * hand-applied `hindsight-recallsplit-swap.sh` used between steps.
+ *
+ * The deadline comes from {@link hindsightHealthTimeoutMs} for the given
+ * `role` (an explicit `timeoutMs` still wins). With no `role` the budget is the
+ * {@link HINDSIGHT_HEALTH_MIN_TIMEOUT_MS} floor, which is the value this
+ * defaulted to before roles existed.
  */
 export async function waitForHindsightHealthy(
   port: number,
   opts: {
     timeoutMs?: number;
+    /** The container being waited on; picks the phase-derived budget. */
+    role?: HindsightHealthRole;
+    /** Pool worker count, for the `recall-pool` role's budget. */
+    workers?: number;
     intervalMs?: number;
     fetchImpl?: typeof fetch;
     sleep?: (ms: number) => Promise<void>;
@@ -646,7 +902,10 @@ export async function waitForHindsightHealthy(
   } = {},
 ): Promise<boolean> {
   const {
-    timeoutMs = 150_000,
+    // No role ⇒ the pre-role flat default, exactly. A role ⇒ its phase budget.
+    timeoutMs = opts.role
+      ? hindsightHealthTimeoutMs({ role: opts.role, workers: opts.workers })
+      : HINDSIGHT_HEALTH_MIN_TIMEOUT_MS,
     intervalMs = 3_000,
     fetchImpl = fetch,
     sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)),
@@ -724,7 +983,13 @@ export async function launchRecallPoolHealthGated(opts: {
   publicApiPort: number;
   authorityApiPort: number;
   workers: number;
-  waitForHealthy: (port: number) => Promise<boolean>;
+  /**
+   * Health gate. The `role` says WHICH container is being waited on so the
+   * caller can pick the phase-derived deadline
+   * ({@link hindsightHealthTimeoutMs}) — the authority's first boot pays pg0
+   * initdb + migrations and needs far more headroom than the pool.
+   */
+  waitForHealthy: (port: number, role: HindsightHealthRole) => Promise<boolean>;
   /** Clear a stale recall-pool sibling before (re)launch. */
   stopPool: () => void;
   /** Start the recall pool on the public port. */
@@ -741,14 +1006,14 @@ export async function launchRecallPoolHealthGated(opts: {
     `  Waiting for the authority container to become healthy on ` +
       `${opts.authorityApiPort} (pg0 startup)...`,
   );
-  if (!(await opts.waitForHealthy(opts.authorityApiPort))) {
+  if (!(await opts.waitForHealthy(opts.authorityApiPort, "authority"))) {
     return { outcome: "authority-unhealthy" };
   }
   // Clear any stale sibling so `docker run --name` cannot hit a name conflict.
   opts.stopPool();
   log(`  Starting recall pool (${opts.workers} workers) on ${opts.publicApiPort}...`);
   opts.startPool();
-  if (await opts.waitForHealthy(opts.publicApiPort)) {
+  if (await opts.waitForHealthy(opts.publicApiPort, "recall-pool")) {
     return { outcome: "split" };
   }
   const reason = `the recall pool did not become healthy on ${opts.publicApiPort}`;
@@ -757,8 +1022,77 @@ export async function launchRecallPoolHealthGated(opts: {
       `container on the public port so memory.config.url stays served...`,
   );
   opts.degradeToSingleContainer();
-  if (await opts.waitForHealthy(opts.publicApiPort)) {
+  if (await opts.waitForHealthy(opts.publicApiPort, "single-container")) {
     return { outcome: "degraded-single-container", reason };
   }
   return { outcome: "degrade-failed", reason };
+}
+
+/** What {@link convergeStaleRecallPool} actually did. */
+export type StaleRecallPoolConvergenceResult =
+  | { outcome: "nothing-to-do" }
+  | { outcome: "pool-stopped" }
+  | { outcome: "relaunched-single"; publicApiPort: number }
+  | { outcome: "relaunch-failed"; publicApiPort: number };
+
+/**
+ * Execute a {@link planStaleRecallPoolConvergence} plan. Shared by both
+ * no-recreate launch paths (`switchroom memory setup` and first-run
+ * `switchroom setup`) so they cannot diverge on the ordering, which is the
+ * whole difficulty here.
+ *
+ * ## The ordering, and why it is the way it is
+ *
+ * A TCP port is exclusive: while the stale pool holds the public port the
+ * authority physically cannot bind it, so "converge without ever unbinding the
+ * public port" is not achievable — the handover has a gap by construction. What
+ * IS achievable, and what this enforces, is that the gap is bounded by a single
+ * relaunch and never LEFT open:
+ *
+ *   - `stop-pool` is only ever planned when the authority already serves the
+ *     public port, so that path has no gap at all.
+ *   - `relaunch-single-on-public` stops the pool and relaunches the sole
+ *     container on the public port as ONE step, then HEALTH-GATES the public
+ *     port before reporting success. A relaunch that does not come back is
+ *     reported as `relaunch-failed` for the caller to fail loud on — never as
+ *     silent success over an unbound public port, which is precisely the
+ *     half-built topology {@link publicPortIsUnserved} exists to refuse.
+ */
+export async function convergeStaleRecallPool(opts: {
+  plan: StaleRecallPoolConvergence;
+  /** Stop + remove the stale pool container. */
+  stopPool: () => void;
+  /**
+   * Stop the pool AND the parked authority, then relaunch a SOLE container on
+   * the public port with single-container env (no split DB-pool caps).
+   */
+  relaunchSingleOnPublic: (publicApiPort: number) => void;
+  waitForHealthy: (port: number, role: HindsightHealthRole) => Promise<boolean>;
+  log?: (msg: string) => void;
+}): Promise<StaleRecallPoolConvergenceResult> {
+  const log = opts.log ?? (() => {});
+  switch (opts.plan.action) {
+    case "none":
+      return { outcome: "nothing-to-do" };
+    case "stop-pool":
+      log(
+        "  hindsight.recall_pool is disabled but a recall pool container is running; " +
+          "the authority already serves the public port, so removing the orphan pool...",
+      );
+      opts.stopPool();
+      return { outcome: "pool-stopped" };
+    case "relaunch-single-on-public": {
+      const publicApiPort = opts.plan.publicApiPort;
+      log(
+        `  hindsight.recall_pool is disabled but a recall pool container still holds the ` +
+          `public port ${publicApiPort}; relaunching a single container on it to match the ` +
+          `declared topology...`,
+      );
+      opts.relaunchSingleOnPublic(publicApiPort);
+      if (await opts.waitForHealthy(publicApiPort, "single-container")) {
+        return { outcome: "relaunched-single", publicApiPort };
+      }
+      return { outcome: "relaunch-failed", publicApiPort };
+    }
+  }
 }

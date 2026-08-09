@@ -53,6 +53,14 @@ import {
   startHindsightRecallPool,
   stopHindsightRecallPool,
   waitForHindsightHealthy,
+  hindsightHealthTimeoutMs,
+  HINDSIGHT_HEALTH_MIN_TIMEOUT_MS,
+  HINDSIGHT_HEALTH_PHASE_BUDGET_MS,
+  splitContainerPerfEnv,
+  splitDbPoolEnvConflicts,
+  splitDbPoolEnvConflictWarning,
+  planStaleRecallPoolConvergence,
+  convergeStaleRecallPool,
 } from "./hindsight-recall-pool.js";
 
 /** Turn a flat `["run","-d",...]` docker argv into a lookup for -e KEY=VAL. */
@@ -604,5 +612,236 @@ describe("publicPortIsUnserved — the half-built-topology outage guard", () => 
         poolRunning: false,
       }),
     ).toBe(false);
+  });
+});
+
+/**
+ * A `waitForHindsightHealthy` driven by a fake clock: `/health` starts
+ * answering only once the clock passes `healthyAtMs`. This is the whole point
+ * of the test — it measures whether the DEADLINE is long enough to still be
+ * polling when the container finally answers, which is exactly the fresh-host
+ * first-boot question, and it does it without sleeping in real time.
+ */
+async function healthyAfter(
+  healthyAtMs: number,
+  opts: Parameters<typeof waitForHindsightHealthy>[1],
+): Promise<boolean> {
+  let t = 0;
+  const intervalMs = 3_000;
+  return waitForHindsightHealthy(18888, {
+    ...opts,
+    intervalMs,
+    now: () => t,
+    sleep: async () => {
+      t += intervalMs;
+    },
+    fetchImpl: (async () => ({ ok: t >= healthyAtMs })) as unknown as typeof fetch,
+  });
+}
+
+describe("health deadlines are derived from the work each container does", () => {
+  it("the authority survives a fresh-host boot that the old flat 150s deadline cut short", async () => {
+    // A first boot that answers /health at 200s: pg0 initdb + the migration
+    // chain + API startup. Under the pre-existing flat default this was read as
+    // "authority unhealthy" and the split launch failed, self-healing only
+    // because a re-run took the repair branch.
+    await expect(healthyAfter(200_000, { role: "authority" })).resolves.toBe(true);
+    // Same boot, the deadline this replaced: still a timeout. This is the
+    // control that proves the assertion above is about the deadline and not
+    // about the fake clock.
+    await expect(
+      healthyAfter(200_000, { timeoutMs: HINDSIGHT_HEALTH_MIN_TIMEOUT_MS }),
+    ).resolves.toBe(false);
+  });
+
+  it("the authority budget covers pg0 initdb AND migrations AND api startup", () => {
+    const p = HINDSIGHT_HEALTH_PHASE_BUDGET_MS;
+    expect(hindsightHealthTimeoutMs({ role: "authority" })).toBeGreaterThanOrEqual(
+      p.pgFirstBoot + p.migrations + p.apiStartup,
+    );
+    // The pool runs NEITHER pg0 nor migrations, so it must not be granted the
+    // authority's budget — a deadline that long would stall a genuinely broken
+    // pool for minutes before the degrade fires.
+    expect(hindsightHealthTimeoutMs({ role: "recall-pool", workers: 4 })).toBeLessThan(
+      hindsightHealthTimeoutMs({ role: "authority" }),
+    );
+  });
+
+  it("no role is ever granted a TIGHTER deadline than the flat default it replaced", () => {
+    for (const role of ["authority", "recall-pool", "single-container"] as const) {
+      for (const workers of [1, 4, 8]) {
+        expect(hindsightHealthTimeoutMs({ role, workers })).toBeGreaterThanOrEqual(
+          HINDSIGHT_HEALTH_MIN_TIMEOUT_MS,
+        );
+      }
+    }
+    // And with no role at all — the pre-role call shape — the behaviour is
+    // byte-identical to the old default.
+    expect(hindsightHealthTimeoutMs({ role: "recall-pool" })).toBe(
+      HINDSIGHT_HEALTH_MIN_TIMEOUT_MS,
+    );
+  });
+
+  it("a bigger pool gets proportionally longer to load its per-worker rerankers", () => {
+    const many = hindsightHealthTimeoutMs({ role: "recall-pool", workers: 16 });
+    const few = hindsightHealthTimeoutMs({ role: "recall-pool", workers: 4 });
+    expect(many).toBeGreaterThan(few);
+  });
+});
+
+describe("hindsight.env vs the split's managed DB-pool caps", () => {
+  const cfg = resolveRecallPoolConfig({ enabled: true, workers: 4 })!;
+
+  it("the managed cap WINS, so the asserted connection budget is the one that ships", () => {
+    // The operator asks for a 100-connection write pool. Honoured on the
+    // authority, that alone is 100 + 20 read + 4x45 pool = 300 connections
+    // against pg0's 250 ceiling — the `FATAL: too many clients` the budget
+    // assertion exists to prevent, arrived at by a path the assertion never
+    // saw.
+    const env = splitContainerPerfEnv({ HINDSIGHT_API_DB_POOL_MAX_SIZE: "100" });
+    expect(env.HINDSIGHT_API_DB_POOL_MAX_SIZE).toBe(
+      String(HINDSIGHT_BACKGROUND_DB_POOL_MAX_SIZE),
+    );
+    expect(env.HINDSIGHT_API_READ_DB_POOL_MAX_SIZE).toBe(
+      String(HINDSIGHT_BACKGROUND_READ_DB_POOL_MAX_SIZE),
+    );
+  });
+
+  it("supersession is REPORTED, naming the key, both values, and the right knob", () => {
+    const conflicts = splitDbPoolEnvConflicts(
+      { HINDSIGHT_API_DB_POOL_MAX_SIZE: "100", HINDSIGHT_API_RERANKER_BATCH_SIZE: "8" },
+      cfg,
+    );
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toEqual({
+      key: "HINDSIGHT_API_DB_POOL_MAX_SIZE",
+      operatorValue: "100",
+      authorityValue: String(HINDSIGHT_BACKGROUND_DB_POOL_MAX_SIZE),
+      poolValue: String(cfg.dbPoolMaxSize),
+    });
+    const warning = splitDbPoolEnvConflictWarning(conflicts[0]);
+    expect(warning).toContain("HINDSIGHT_API_DB_POOL_MAX_SIZE");
+    expect(warning).toContain("100");
+    // It must point at the knob that IS budget-checked, not leave the operator
+    // guessing why their value vanished.
+    expect(warning).toContain("hindsight.recall_pool.db_pool_max_size");
+  });
+
+  it("says nothing when the operator set no managed key (no warning spam)", () => {
+    expect(splitDbPoolEnvConflicts(undefined, cfg)).toEqual([]);
+    expect(splitDbPoolEnvConflicts({ HINDSIGHT_API_RERANKER_BATCH_SIZE: "8" }, cfg)).toEqual([]);
+  });
+
+  it("passes every OTHER hindsight.env key through untouched", () => {
+    const env = splitContainerPerfEnv({
+      HINDSIGHT_API_RERANKER_BATCH_SIZE: "8",
+      HINDSIGHT_API_DB_POOL_MAX_SIZE: "100",
+    });
+    expect(env.HINDSIGHT_API_RERANKER_BATCH_SIZE).toBe("8");
+  });
+});
+
+describe("converging a stale recall pool when the split is DECLARED off", () => {
+  it("relaunches a single container on the public port when the pool holds it", async () => {
+    // Split disabled in config, but the pool is still bound to 18888 and the
+    // authority is parked on 18889. Merely stopping the pool would leave 18888
+    // unbound — the fleet-memory outage. The plan must be the full relaunch.
+    const plan = planStaleRecallPoolConvergence({
+      recallEnabled: false,
+      poolRunning: true,
+      authorityApiPort: 18889,
+      configUrlPort: 18888,
+    });
+    expect(plan).toEqual({ action: "relaunch-single-on-public", publicApiPort: 18888 });
+
+    const stopPool = vi.fn();
+    const relaunchSingleOnPublic = vi.fn();
+    const waitForHealthy = vi.fn(() => Promise.resolve(true));
+    const result = await convergeStaleRecallPool({
+      plan,
+      stopPool,
+      relaunchSingleOnPublic,
+      waitForHealthy,
+    });
+    expect(result).toEqual({ outcome: "relaunched-single", publicApiPort: 18888 });
+    expect(relaunchSingleOnPublic).toHaveBeenCalledWith(18888);
+    // The PUBLIC port is health-gated before this is called success — the
+    // convergence must never hand back a topology it has not proven serves it.
+    expect(waitForHealthy).toHaveBeenCalledWith(18888, "single-container");
+  });
+
+  it("reports relaunch-failed rather than success over an unbound public port", async () => {
+    const result = await convergeStaleRecallPool({
+      plan: { action: "relaunch-single-on-public", publicApiPort: 18888 },
+      stopPool: vi.fn(),
+      relaunchSingleOnPublic: vi.fn(),
+      waitForHealthy: () => Promise.resolve(false),
+    });
+    expect(result).toEqual({ outcome: "relaunch-failed", publicApiPort: 18888 });
+  });
+
+  it("just drops the orphan when the authority ALREADY serves the public port", async () => {
+    const plan = planStaleRecallPoolConvergence({
+      recallEnabled: false,
+      poolRunning: true,
+      authorityApiPort: 18888,
+      configUrlPort: 18888,
+    });
+    expect(plan).toEqual({ action: "stop-pool" });
+
+    const stopPool = vi.fn();
+    const relaunchSingleOnPublic = vi.fn();
+    const result = await convergeStaleRecallPool({
+      plan,
+      stopPool,
+      relaunchSingleOnPublic,
+      waitForHealthy: () => Promise.resolve(true),
+    });
+    expect(result).toEqual({ outcome: "pool-stopped" });
+    expect(stopPool).toHaveBeenCalledTimes(1);
+    // No restart: the public port was served the whole time and must stay that
+    // way. Bouncing the authority here would be a gratuitous memory blip.
+    expect(relaunchSingleOnPublic).not.toHaveBeenCalled();
+  });
+
+  it("leaves a DECLARED pool alone", () => {
+    expect(
+      planStaleRecallPoolConvergence({
+        recallEnabled: true,
+        poolRunning: true,
+        authorityApiPort: 18889,
+        configUrlPort: 18888,
+      }),
+    ).toEqual({ action: "none" });
+  });
+
+  it("does nothing without positive evidence of where things are bound", () => {
+    // No declared public port, or an unreadable authority port: acting here
+    // could CAUSE the outage it is meant to prevent, so it must not guess.
+    expect(
+      planStaleRecallPoolConvergence({
+        recallEnabled: false,
+        poolRunning: true,
+        authorityApiPort: 18889,
+        configUrlPort: undefined,
+      }),
+    ).toEqual({ action: "none" });
+    expect(
+      planStaleRecallPoolConvergence({
+        recallEnabled: false,
+        poolRunning: true,
+        authorityApiPort: undefined,
+        configUrlPort: 18888,
+      }),
+    ).toEqual({ action: "none" });
+    // And no pool running at all is trivially nothing to do.
+    expect(
+      planStaleRecallPoolConvergence({
+        recallEnabled: false,
+        poolRunning: false,
+        authorityApiPort: 18889,
+        configUrlPort: 18888,
+      }),
+    ).toEqual({ action: "none" });
   });
 });
