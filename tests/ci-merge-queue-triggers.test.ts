@@ -354,17 +354,26 @@ describe('merge queue — docker-images never publishes from an unmerged ref', (
     // uses `github.event_name != 'pull_request'` as shorthand for "this
     // is a publishing event" — a shorthand that is silently WRONG on a
     // queue ref. Every occurrence must therefore also exclude
-    // merge_group, except the two deliberate JOB-LEVEL gates below,
-    // which mean "actually compile the images" and MUST run on
+    // merge_group, except the deliberate JOB-LEVEL gate below, which
+    // means "actually compile the base image" and MUST run on
     // merge_group or `images-ok` becomes a rubber stamp.
     //
     // The exemption is deliberately narrow: it is keyed on the job-level
-    // `if:` (4-space indent) and NOT on the job as a whole, because both
-    // exempt jobs also contain `push:` / `cache-to:` / step-level `if:`
+    // `if:` (4-space indent) and NOT on the job as a whole, because the
+    // exempt job also contains `push:` / `cache-to:` / step-level `if:`
     // occurrences of the same shorthand that must still be caught. A
     // job-wide exemption would wave those through — which is exactly the
     // bug this file exists to prevent.
-    const ALLOWED_JOB_LEVEL_GATES = ['build-base', 'build-dependents']
+    //
+    // Only `build-base` remains here. `build-dependents` used to be exempt
+    // too (its old bare `!= 'pull_request'` gate also meant "compile on
+    // merge_group"), but the build-base decoupling split the dependents
+    // build into two jobs: the PR/merge_group leg (`build-dependents`) now
+    // uses a POSITIVE event allowlist with no `!= 'pull_request'`
+    // shorthand, and the push leg (`build-dependents-push`) spells out
+    // `&& github.event_name != 'merge_group'` — so neither needs the
+    // exemption. See the "build-base decoupling" describe block below.
+    const ALLOWED_JOB_LEVEL_GATES = ['build-base']
 
     const lines = readFileSync(join(REPO, '.github/workflows/docker-images.yml'), 'utf8').split('\n')
     let job = '<workflow-level>'
@@ -385,7 +394,7 @@ describe('merge queue — docker-images never publishes from an unmerged ref', (
 
     expect(
       seenAllowed,
-      'expected the two deliberate build gates to still be present — if this drops to 0 the ' +
+      'expected the deliberate build-base gate to still be present — if this drops to 0 the ' +
         'rule below is passing vacuously and no longer guards anything',
     ).toBe(ALLOWED_JOB_LEVEL_GATES.length)
 
@@ -413,5 +422,114 @@ describe('merge queue — docker-images never publishes from an unmerged ref', (
           `only ever consumed from a main/tag push.`,
       ).toContain('merge_group')
     }
+  })
+})
+
+describe('docker-images — build-dependents is decoupled from build-base on PR/merge_group', () => {
+  // The dependents build was split into two jobs because GitHub Actions
+  // has no event-conditional `needs:` (a job always waits for every job
+  // it needs, even skipped ones, before its own `if` is evaluated):
+  //
+  //   - `build-dependents`      — PR / merge_group VALIDATION leg. Builds
+  //     FROM the PUBLISHED switchroom-base:latest, so it has NO data
+  //     dependency on build-base and must NOT `needs:` it — that is the
+  //     whole point (build-base's ~31s comes off the PR critical path).
+  //   - `build-dependents-push` — push / tag / dispatch leg. Consumes the
+  //     freshly-built per-arch scratch base tag, so it MUST wait on
+  //     build-base.
+  //
+  // Every assertion here is invisible on a PR run (the push leg never
+  // executes there), so a test is the only thing that stops a future edit
+  // from re-coupling the PR path — reintroducing the serialisation this
+  // change removed — or, worse, from dropping the push-path base
+  // dependency and racing build-base (a `FROM …:sha-<short>-<arch>` pull
+  // of a tag that does not exist yet).
+  const wf = load('docker-images.yml')
+  const jobs = wf.jobs ?? {}
+  const needsOf = (j?: Job): string[] => {
+    const n = j?.needs
+    return Array.isArray(n) ? n : n ? [String(n)] : []
+  }
+
+  it('both dependent legs exist', () => {
+    expect(Object.keys(jobs)).toEqual(
+      expect.arrayContaining(['build-dependents', 'build-dependents-push']),
+    )
+  })
+
+  it('the PR/merge_group leg does NOT depend on build-base', () => {
+    expect(
+      needsOf(jobs['build-dependents']),
+      'build-dependents must not `needs: build-base` — that edge would serialise the ' +
+        'base build ahead of dependents on every PR, which is exactly the wait this split ' +
+        'removes. It builds FROM the published :latest and has no data dependency on the run.',
+    ).not.toContain('build-base')
+  })
+
+  it('the push leg DOES depend on build-base (keeps the scratch-tag dependency)', () => {
+    expect(
+      needsOf(jobs['build-dependents-push']),
+      'build-dependents-push consumes switchroom-base:sha-<short>-<arch>, which build-base ' +
+        'pushes — without `needs: build-base` it would race the base build and fail the FROM.',
+    ).toContain('build-base')
+  })
+
+  it('the PR/merge_group leg runs on merge_group and never on push', () => {
+    const gate = String(jobs['build-dependents']?.if ?? '')
+    expect(gate, 'build-dependents must still compile on the queue ref (images-ok signal)').toContain(
+      'merge_group',
+    )
+    // Positive allowlist form — must not carry the `!= 'pull_request'`
+    // "this is a publish" shorthand (that is the push leg's spelling).
+    expect(
+      gate,
+      "the PR/merge_group leg must use a positive event allowlist, not the `!= 'pull_request'` " +
+        'publish shorthand',
+    ).not.toContain("!= 'pull_request'")
+  })
+
+  it('the push leg is fenced off PR and merge_group', () => {
+    const gate = String(jobs['build-dependents-push']?.if ?? '')
+    expect(gate).toContain("github.event_name != 'pull_request'")
+    expect(gate).toContain("github.event_name != 'merge_group'")
+    expect(
+      gate,
+      'the push leg must not publish past a failed base — keep the explicit success check ' +
+        'that replaces the default all-needs-succeeded semantics `!cancelled()` discards.',
+    ).toContain("needs.build-base.result == 'success'")
+  })
+
+  it('merge-dependents publishes from the PUSH leg, not the PR/merge_group leg', () => {
+    // On a real push the PR/merge_group leg is skipped; if merge-dependents
+    // needed it, the publish job would be skipped and NOTHING would land in
+    // GHCR. It must consume the push leg's per-arch scratch tags.
+    expect(needsOf(jobs['merge-dependents'])).toContain('build-dependents-push')
+    expect(needsOf(jobs['merge-dependents'])).not.toContain('build-dependents')
+    expect(String(jobs['merge-dependents']?.if ?? '')).toContain(
+      "needs.build-dependents-push.result == 'success'",
+    )
+  })
+
+  it('images-ok aggregates BOTH dependent legs', () => {
+    // A failure of either leg (PR-leg on a PR, push-leg on a push) must
+    // block the required sentinel — neither may drop out of coverage.
+    const needs = needsOf(jobs['images-ok'])
+    expect(needs).toContain('build-dependents')
+    expect(needs).toContain('build-dependents-push')
+    const verdict = JSON.stringify(jobs['images-ok']?.steps ?? [])
+    expect(verdict).toContain('build-dependents=')
+    expect(verdict).toContain('build-dependents-push=')
+  })
+
+  it('the two legs build the identical image set (drift guard)', () => {
+    // The legs are byte-identical except for `needs`/`if`. If a future
+    // edit adds an image to one matrix and forgets the other, PR
+    // validation and the published set would silently diverge.
+    expect(JSON.stringify(jobs['build-dependents']?.strategy)).toEqual(
+      JSON.stringify(jobs['build-dependents-push']?.strategy),
+    )
+    expect(JSON.stringify(jobs['build-dependents']?.steps)).toEqual(
+      JSON.stringify(jobs['build-dependents-push']?.steps),
+    )
   })
 })

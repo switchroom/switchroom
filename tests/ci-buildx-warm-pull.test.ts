@@ -120,6 +120,10 @@ describe('buildx warm-pull guard (#3815)', () => {
       'ci-full.yml:docker-images-build',
       'docker-images.yml:build-base',
       'docker-images.yml:build-dependents',
+      // PR/merge_group and push legs of the dependents build are separate
+      // jobs (GHA has no event-conditional `needs:`); both build images
+      // and so both go through the warm-pull action.
+      'docker-images.yml:build-dependents-push',
       'docker-images.yml:build-hindsight',
       'docker-images.yml:build-voice',
     ])

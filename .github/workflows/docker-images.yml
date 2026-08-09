@@ -15,7 +15,12 @@ name: docker-images
 # Pipelines (perf rework, follows #2807):
 #   - build-base + build-dependents run as a PER-ARCH matrix on NATIVE
 #     runners (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) — no
-#     QEMU emulation. Each arch leg pushes a temporary
+#     QEMU emulation. On PR / merge_group, build-dependents builds FROM
+#     the published switchroom-base:latest and does NOT wait on build-base
+#     (no data dependency — takes build-base off the PR critical path);
+#     the push/tag/dispatch build-dependents-push leg keeps the base
+#     dependency because it consumes the freshly-built scratch base tag.
+#     Each arch leg pushes a temporary
 #     `:sha-<short>-<arch>` tag; the merge-base / merge-dependents jobs
 #     then stitch the two arch images into the final multi-arch
 #     manifest (`:latest` / `:sha-<short>` / `:vX.Y.Z`) with
@@ -397,14 +402,158 @@ jobs:
             "${IMAGE}:sha-${SHA_SHORT}-arm64"
 
   build-dependents:
-    # Per-arch dependents FROM the per-arch base scratch tag pushed by
-    # build-base — no wait on merge-base (it runs in parallel).
+    # PR / merge_group VALIDATION leg. Each dependent builds FROM the
+    # PUBLISHED switchroom-base:latest (see the tags step) — NOT a base
+    # built earlier in THIS run — so there is NO data dependency on
+    # build-base, and this job deliberately does NOT `needs:` it. That
+    # takes build-base's ~31s off the PR / merge-queue critical path:
+    # the two now run in parallel instead of serialised. build-base
+    # still runs (and is still aggregated by images-ok), so a base
+    # Dockerfile regression is still caught here. The push/tag/dispatch
+    # leg that DOES consume the freshly-built per-arch scratch base tag
+    # is build-dependents-push below — GitHub Actions has no
+    # event-conditional `needs:`, so the push-path data dependency is
+    # expressed as a separate job rather than a conditional edge.
+    needs: changes
+    # PR: only when image inputs changed. merge_group: always — a queue
+    # entry that compiled no dependents would make images-ok a rubber
+    # stamp. Never push/tag/dispatch — that is build-dependents-push.
+    if: ${{ !cancelled() && ((github.event_name == 'pull_request' && needs.changes.outputs.images == 'true') || github.event_name == 'merge_group') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # merge_group is amd64-only for the same reason PRs are: the
+        # queue validates buildability and pushes nothing, and the arm64
+        # artifact is only ever consumed from a main/tag push.
+        arch: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && fromJSON('["amd64"]') || fromJSON('["amd64","arm64"]') }}
+        image:
+          - { name: agent,        file: docker/Dockerfile.agent }
+          - { name: broker,       file: docker/Dockerfile.broker }
+          - { name: kernel,       file: docker/Dockerfile.kernel }
+          - { name: hostd,        file: docker/Dockerfile.hostd }
+          - { name: auth-broker,  file: docker/Dockerfile.auth-broker }
+          - { name: web,          file: docker/Dockerfile.web }
+          # hindsight is NOT here — it has its own `build-hindsight`
+          # job (PR #1310) that runs in parallel with build-base
+          # because Dockerfile.hindsight extends upstream
+          # `vectorize-io/hindsight:latest`, not switchroom-base.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Node (for dist/ bundling)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        # Composite action: pinned bun (not `latest` — an unpinned bun
+        # release changing under a release build is a flake vector), bun
+        # package cache restore, and `bun install --frozen-lockfile`
+        # (a bare `bun install` can silently drift from bun.lock).
+        uses: ./.github/actions/setup-switchroom
+
+      - name: Build dist/
+        env:
+          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
+          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
+          # stays silent and dev builds fall back to package.json.
+          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: npm run build
+
+      - name: Set up Docker Buildx
+        # Composite action, NOT docker/setup-buildx-action directly (#3815).
+        # The docker-container driver boots BuildKit by pulling
+        # `moby/buildkit:buildx-stable-1` from DOCKER HUB — unauthenticated,
+        # un-retried, and before the GHCR login step below ever runs. 19 of
+        # the 21 failed image jobs between 2026-07-16 and 2026-07-27 died
+        # exactly there, reddening the required `images-ok` sentinel and
+        # ejecting four PRs from the merge queue. The composite warms that
+        # image into the runner's local image store behind a bounded,
+        # transient-only retry first, which also arms buildx's own
+        # "pulling failed, using local image" fallback.
+        # Enforced by tests/ci-buildx-warm-pull.test.ts.
+        uses: ./.github/actions/setup-buildx
+
+      - name: Log in to GHCR (push only on main / tags)
+        # merge_group excluded: a queue run is validation-only and pushes
+        # nothing, so it needs no registry credential.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags + base ref
+        id: tags
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-${{ matrix.image.name }}"
+          BASE="${REGISTRY}/${IMAGE_NAMESPACE}/switchroom-base"
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          if [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            # Merge-queue validation — see build-base for why the PR
+            # number can't be used here. Like a PR, the queue's base
+            # build pushed no scratch tag, so build FROM published
+            # :latest.
+            echo "tags=${IMAGE}:mq-${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+            echo "base=${BASE}:latest" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "tags=${IMAGE}:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            # On PRs the base wasn't pushed, so depend on the published
+            # :latest (multi-arch; buildx resolves the amd64 leg).
+            echo "base=${BASE}:latest" >> "$GITHUB_OUTPUT"
+          else
+            # Per-arch scratch tag; merge-dependents assigns the real
+            # tags from the merged manifest (see build-base comment).
+            echo "tags=${IMAGE}:sha-${SHA_SHORT}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+            echo "base=${BASE}:sha-${SHA_SHORT}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (and push on main/tag) ${{ matrix.image.name }} ${{ matrix.arch }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: .
+          file: ${{ matrix.image.file }}
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+          build-args: |
+            BASE_IMAGE=${{ steps.tags.outputs.base }}
+          # GHCR registry cache, not type=gha — #1965. `agent` (Chromium/
+          # webkite/playwright, 143MB layers) is the worst hit: its layers
+          # outran the GHA Azure-blob SAS token / stalled mid-restore and
+          # hard-failed the build, blocking releases. Registry cache has no
+          # SAS expiry; a miss degrades to a cold build. cache-to gated to
+          # non-PR (fork PRs can't write GHCR; export failure would break
+          # the required check). Per-image, per-arch :buildcache-<arch>
+          # tag, mode=max; legacy :buildcache kept as read-only fallback
+          # for the first post-split run.
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache-${{ matrix.arch }}
+            type=registry,ref=ghcr.io/${{ github.repository_owner }}/switchroom-${{ matrix.image.name }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' && format('type=registry,ref=ghcr.io/{0}/switchroom-{1}:buildcache-{2},mode=max,image-manifest=true,oci-mediatypes=true', github.repository_owner, matrix.image.name, matrix.arch) || '' }}
+          # sec WS9-F3 (#1418, relaxed per header): attestation on tag
+          # pushes only.
+          provenance: ${{ startsWith(github.ref, 'refs/tags/v') && 'mode=max' || 'false' }}
+          sbom: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+  build-dependents-push:
+    # push / tag / dispatch leg. Byte-identical build to
+    # build-dependents above EXCEPT for gating: this leg DOES consume
+    # the freshly-built per-arch scratch base tag
+    # (switchroom-base:sha-<short>-<arch>) that build-base pushes, so
+    # it MUST wait on build-base — hence `needs: [changes, build-base]`
+    # and the explicit base-success check (the push-path data
+    # dependency the PR/merge_group leg deliberately drops). Keep the
+    # strategy + steps below IN SYNC with build-dependents.
     needs: [changes, build-base]
-    # Same gate as build-base, plus an explicit success check on the
-    # base build — `!cancelled()` alone would let dependents run past
-    # a FAILED base (unlike the default all-needs-succeeded semantics
-    # it replaces). merge_group builds here too; see build-base.
-    if: ${{ !cancelled() && needs.build-base.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
+    # `!cancelled() && base succeeded` (not the default
+    # all-needs-succeeded, so a FAILED base blocks rather than
+    # silently skips), restricted to the publishing events. Never PR
+    # or merge_group — those are build-dependents' job.
+    if: ${{ !cancelled() && needs.build-base.result == 'success' && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
     strategy:
       fail-fast: false
       matrix:
@@ -528,10 +677,15 @@ jobs:
   # Stitch the per-arch dependent images into their final multi-arch
   # manifests. Same pattern as merge-base.
   merge-dependents:
-    needs: build-dependents
+    # build-dependents-push (NOT the PR/merge_group build-dependents leg)
+    # is what pushes the per-arch scratch tags on a real push, so this
+    # publishing job needs THAT leg. On a push the PR/merge_group leg is
+    # skipped; needing it here would leave merge-dependents skipped and
+    # nothing would ever publish.
+    needs: build-dependents-push
     # merge_group excluded — see merge-base. Publication is a push-to-main
     # concern, never a queue-validation concern.
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.build-dependents.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.build-dependents-push.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -1078,6 +1232,7 @@ jobs:
       - build-base
       - merge-base
       - build-dependents
+      - build-dependents-push
       - merge-dependents
       - build-hindsight
       - merge-hindsight
@@ -1102,6 +1257,7 @@ jobs:
             "build-base=${{ needs.build-base.result }}" \
             "merge-base=${{ needs.merge-base.result }}" \
             "build-dependents=${{ needs.build-dependents.result }}" \
+            "build-dependents-push=${{ needs.build-dependents-push.result }}" \
             "merge-dependents=${{ needs.merge-dependents.result }}" \
             "build-hindsight=${{ needs.build-hindsight.result }}" \
             "merge-hindsight=${{ needs.merge-hindsight.result }}" \
