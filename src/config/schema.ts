@@ -677,7 +677,9 @@ export const AgentMemorySchema = z
           .optional()
           .describe(
             "Cap on the number of memories injected into the prompt by " +
-            "auto-recall, regardless of token budget. Plugin default is 12. " +
+            "auto-recall, regardless of token budget. The vendor plugin ships " +
+            "12; switchroom's resolver default is 8 when this is unset, and the " +
+            "live fleet raises it via `defaults.memory.recall.max_memories`. " +
             "0 disables the cap (all memories Hindsight returns are injected).",
           ),
         cache_ttl_secs: z
@@ -799,8 +801,11 @@ export const AgentMemorySchema = z
             "— the rest is always won on pure relevance, so composition still " +
             "moves with the scores. Fixes score-based crowd-out only; a " +
             "timed-out bank returns no candidates and reservation is a no-op " +
-            "there. 0 disables (default). Switchroom-managed agents use 2 " +
-            "against the fleet-deployed cap of 6.",
+            "there. 0 disables (default). Switchroom-managed agents DERIVE this " +
+            "default from the count cap (≈ ⅓ of the effective `max_memories`, " +
+            "floored at 1) so it tracks the cap instead of going stale when the " +
+            "fleet raises it; an explicit value set here still wins over that " +
+            "derived default.",
           ),
         additional_bank_min_slots: z
           .number()
@@ -813,8 +818,10 @@ export const AgentMemorySchema = z
             "`own_bank_min_slots` — same floor-not-quota semantics, and the " +
             "two share the same half-of-cap reservation budget. When they sum " +
             "above that budget the own-bank floor is honoured first. 0 " +
-            "disables (default). Switchroom-managed agents use 1 against the " +
-            "fleet-deployed cap of 6. Observe `injected_own_bank_count` / " +
+            "disables (default). Switchroom-managed agents DERIVE this default " +
+            "from the count cap (≈ ⅙ of the effective `max_memories`, floored " +
+            "at 1) so it tracks the cap instead of going stale; an explicit " +
+            "value set here still wins. Observe `injected_own_bank_count` / " +
             "`injected_additional_bank_count` via " +
             "`switchroom memory recall-log`.",
           ),
@@ -912,13 +919,18 @@ export const AgentMemorySchema = z
           .enum(["low", "mid", "high"])
           .optional()
           .describe(
-            "How hard Hindsight searches. \"low\" (switchroom default) = " +
-            "vector retrieval only, ~1-2s. \"mid\" adds the LLM rerank pass " +
-            "and measured ~5s of hook latency on real fleet turns — the " +
-            "second-largest contributor to perceived dead air after model " +
-            "TTFT. \"high\" is thorough and slower still. Raise it for an " +
-            "agent whose recall quality matters more than its reply latency " +
-            "(a research or audit role); leave it at low for chat.",
+            "How deep Hindsight's recall search goes. It tunes the CANDIDATE-" +
+            "POOL depth retrieved before reranking — low (switchroom default) " +
+            "= 100, mid = 300, high = 1000 candidates. The local cross-encoder " +
+            "reranker (ms-marco-MiniLM) runs at EVERY tier; budget does not " +
+            "gate it on or off, and there is no LLM rerank pass in the recall " +
+            "path (the LLM serves reflect/retain/consolidation, not recall " +
+            "ranking). Higher tiers cost more latency purely from the deeper " +
+            "pool: mid measured ~5s of hook latency on real fleet turns (3× " +
+            "the retrieval+rerank pool, not an added model call), the second-" +
+            "largest contributor to perceived dead air after model TTFT. Raise " +
+            "it for an agent whose recall quality matters more than its reply " +
+            "latency (a research or audit role); leave it at low for chat.",
           ),
         max_tokens: z
           .number()

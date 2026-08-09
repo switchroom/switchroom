@@ -2901,13 +2901,41 @@ describe("reconcileAgent", () => {
     scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
 
     const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
-    expect(startSh).toContain("export HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS=2");
+    // No override and no max_memories set → cap resolves to the switchroom
+    // default of 8, and the floors DERIVE from it: own ≈ ⅓ = 3, additional
+    // ≈ ⅙ = 1. (These used to be the hardcoded literals 2/1; they are now
+    // cap-proportional so they track the cap instead of going stale.)
+    expect(startSh).toContain("export HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS=3");
     expect(startSh).toContain("export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS=1");
     // And never an empty assignment: `_cast_env("", int)` returns None, the
     // assignment is skipped, and claude-code.json wins again — the exact
     // failure mode this test exists to prevent.
     expect(startSh).not.toContain("export HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS=\n");
     expect(startSh).not.toContain("export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS=\n");
+  });
+
+  it("start.sh slot-floor exports SCALE with the max_memories cap (regression: #3755 stale literals)", () => {
+    // REGRESSION GUARD, env-export half. The floors were hardcoded 2/1 for the
+    // old cap of 6 (#3755, 4f469b1d); raising the fleet cap 6→16 left them
+    // reserving ~19% of the budget for the own bank. The defaults now derive
+    // from the cap (own ≈ ⅓, additional ≈ ⅙), so a cap raise carries the floors
+    // with it. This asserts the export tracks the cap — it FAILS if the floors
+    // are reverted to fixed literals while the cap moves.
+    const agentConfig = makeAgentConfig({
+      memory: { collection: "test-agent", recall: { max_memories: 16 } },
+    });
+    const withMemory = buildSwitchroomConfig(agentConfig, {
+      backend: "hindsight",
+      shared_collection: "shared",
+      config: { provider: "openai", docker_service: true, url: "http://127.0.0.1:18888/mcp/" },
+    });
+    scaffoldAgent("test-agent", agentConfig, tmpDir, telegramConfig, withMemory);
+
+    const startSh = readFileSync(join(tmpDir, "test-agent", "start.sh"), "utf-8");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_MEMORIES=16");
+    // Cap 16 → own = round(16/3) = 5, additional = round(16/6) = 3.
+    expect(startSh).toContain("export HINDSIGHT_RECALL_OWN_BANK_MIN_SLOTS=5");
+    expect(startSh).toContain("export HINDSIGHT_RECALL_ADDITIONAL_BANK_MIN_SLOTS=3");
   });
 
   it("start.sh exports the per-bank slot floors when the operator overrides them", () => {

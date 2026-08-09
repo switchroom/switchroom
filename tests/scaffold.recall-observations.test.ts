@@ -96,28 +96,63 @@ describe("hindsight recall overrides — observations + trivial-skip", () => {
   // banks return more candidates than the cap, one bank's score distribution
   // can fill every slot. These floors are the switchroom opt-in over the
   // vendor's 0/0 (pure head-slice).
-  it("reserves a floor of recall slots for each bank, sized to the DEPLOYED cap", () => {
+  it("reserves a floor of recall slots for each bank, at the resolver-default cap", () => {
+    // No `max_memories` set → resolver default 8 → own ≈ ⅓ = 3, additional ≈ ⅙ = 1.
     const s = settingsAfterInstall();
-    expect(s.recallOwnBankMinSlots).toBe(2);
+    expect(s.recallOwnBankMinSlots).toBe(3);
     expect(s.recallAdditionalBankMinSlots).toBe(1);
-    // The cap this fleet actually runs is 6 — `defaults.memory.recall
-    // .max_memories: 6` in switchroom.yaml cascades to
-    // HINDSIGHT_RECALL_MAX_MEMORIES, and env wins over the 8 stamped into
-    // settings.json. recall.py bounds the two floors to HALF the cap between
-    // them (`_reservable_slots`), so floors summing above 3 would be silently
-    // clamped and the stamped numbers would be a lie. Pinning against 6 rather
-    // than against `s.recallMaxMemories` is deliberate: asserting against the
-    // stamped 8 is exactly the mistake that let floors of 4/2 look safe when
-    // at the deployed cap they consumed the whole of it and `scores.final`
-    // stopped influencing composition at all.
-    const DEPLOYED_CAP = 6;
-    expect(
-      (s.recallOwnBankMinSlots as number) + (s.recallAdditionalBankMinSlots as number),
-    ).toBeLessThanOrEqual(Math.floor(DEPLOYED_CAP / 2));
     // Both floors must be non-zero, or one side can still be zeroed out.
     expect(s.recallOwnBankMinSlots as number).toBeGreaterThan(0);
     expect(s.recallAdditionalBankMinSlots as number).toBeGreaterThan(0);
   });
+
+  // REGRESSION GUARD (recall slot-floor scaling). The floors USED to be
+  // hardcoded literals `2 / 1`, sized to the cap-of-6 the fleet ran in 2026-07
+  // (#3755, 4f469b1d). When the fleet cap was raised 6→16 (switchroom.yaml,
+  // 2026-08-03) the literals silently kept reserving 2/1 — ~19% of a 16-slot
+  // budget for the agent's OWN bank — so a dense additional/profile bank could
+  // crowd out the agent's own recent context. The fix DERIVES the defaults from
+  // the cap (own ≈ ⅓, additional ≈ ⅙). This test parameterises over the cap and
+  // asserts the floors TRACK it: it would FAIL if someone raised the cap again
+  // and the floors stayed put (the exact regression), or reverted the defaults
+  // to fixed literals. `defaults.memory.recall.max_memories` cascades to the
+  // agent, and the SAME cap is stamped into settings.json, so the floors bind
+  // against it.
+  it("default slot floors SCALE with the max_memories cap (never go stale)", () => {
+    // [cap, expectedOwn, expectedAdditional] — own = round(cap/3), additional = round(cap/6).
+    const cases: [number, number, number][] = [
+      [6, 2, 1], // preserves the historical 2/1 the #3755 literals hardcoded
+      [8, 3, 1], // resolver default
+      [12, 4, 2], // vendor cap
+      [16, 5, 3], // the live fleet cap the literals went stale against
+      [24, 8, 4],
+    ];
+    for (const [cap, expectedOwn, expectedAdditional] of cases) {
+      config.defaults = {
+        memory: { recall: { max_memories: cap } },
+      } as SwitchroomConfig["defaults"];
+      const s = settingsAfterInstall();
+      // The stamp derives the floors from the SAME cap it stamps into settings.
+      expect(s.recallMaxMemories).toBe(cap);
+      expect(s.recallOwnBankMinSlots, `own floor at cap ${cap}`).toBe(expectedOwn);
+      expect(
+        s.recallAdditionalBankMinSlots,
+        `additional floor at cap ${cap}`,
+      ).toBe(expectedAdditional);
+      // The two floors must never exceed recall.py's half-cap reservation budget
+      // (`_reservable_slots`), or the stamped numbers would be silently clamped
+      // and the composition would stop moving with the scores. own ≈ ⅓ +
+      // additional ≈ ⅙ = ½, so the derived pair sits exactly at the budget.
+      expect(
+        (s.recallOwnBankMinSlots as number) + (s.recallAdditionalBankMinSlots as number),
+        `sum within half-cap budget at cap ${cap}`,
+      ).toBeLessThanOrEqual(Math.floor(cap / 2));
+      // Non-zero at both ends: even the smallest cap keeps an own-bank floor.
+      expect(s.recallOwnBankMinSlots as number).toBeGreaterThan(0);
+      expect(s.recallAdditionalBankMinSlots as number).toBeGreaterThan(0);
+    }
+  });
+
 
   // #2816 tag-filter port — INTENTIONALLY DORMANT (see the decision comment in
   // renderHindsightSettingsOverrides + reference/rfcs/hindsight-synthesis-

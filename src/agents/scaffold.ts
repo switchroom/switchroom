@@ -818,6 +818,7 @@ import {
   resolveHindsightRecallTunables,
   resolveHindsightRecallCaps,
   renderHindsightHooksOverrides,
+  DEFAULT_RECALL_MAX_MEMORIES,
   type HindsightRecallTunables,
   type HindsightRecallCaps,
   type RecallTunableInput,
@@ -3710,24 +3711,68 @@ function applyHindsightHooksOverrides(
 }
 
 /**
- * Per-bank recall slot floors, switchroom's shipped defaults.
+ * Per-bank recall slot floors, switchroom's shipped defaults — CAP-PROPORTIONAL.
  *
  * These are FLOORS inside `recallMaxMemories`, not fixed quotas. The effective
  * cap is whatever the operator sets in `memory.recall.max_memories` (cascaded to
  * both HINDSIGHT_RECALL_MAX_MEMORIES and the settings.json stamp — see
- * resolveHindsightRecallCaps; switchroom's own default is 8, the vendor ships
- * 12). recall.py bounds the two floors to HALF the cap between them
- * (`_reservable_slots`), so 2 + 1 stays comfortably within a floor at any cap
- * the fleet realistically runs (e.g. at cap 8 it reserves 3 of 8 and leaves 5 to
- * pure global relevance; larger caps only widen that margin). Floors that summed
- * to the cap would stop being floors and become a fixed quota.
+ * resolveHindsightRecallCaps; switchroom's own resolver default is 8, the vendor
+ * ships 12, the live fleet runs the `defaults.memory.recall.max_memories` in
+ * switchroom.yaml). recall.py bounds the SUM of the two floors to HALF the cap
+ * (`_reservable_slots`), so floors that summed to the cap would stop being
+ * floors and become a fixed quota.
+ *
+ * The defaults are DERIVED from the effective cap rather than hardcoded, so they
+ * track the cap and never go stale when the fleet raises it. History: these were
+ * literals `2 / 1`, sized to the cap-of-6 the fleet ran in 2026-07 (#3755,
+ * 4f469b1d, "sized to the cap the fleet actually deploys"). When the fleet cap
+ * was raised 6→16 (switchroom.yaml, 2026-08-03) the literals silently kept
+ * reserving 2/1 — ~19% of a 16-slot budget for the agent's OWN bank instead of
+ * the ~50% the design intended — so a dense additional/profile bank could crowd
+ * out the agent's own recent context (a live regression for agents using
+ * `additional_banks`). Deriving from the cap restores the original ratio at
+ * every cap: own ≈ ⅓, additional ≈ ⅙ (rounded, never below 1). Since ⅓ + ⅙ = ½,
+ * the derived pair sits exactly at recall.py's half-cap reservation budget and
+ * never overflows it:
+ *
+ *   cap 6  → own 2, additional 1   (preserves the historical 2/1)
+ *   cap 8  → own 3, additional 1   (resolver default)
+ *   cap 16 → own 5, additional 3   (live fleet)
+ *
+ * A per-agent `memory.recall.own_bank_min_slots` / `.additional_bank_min_slots`
+ * override still WINS over these computed defaults — see the `?? default(...)`
+ * call sites in the settings stamp and the start.sh env exports.
  *
  * These are also the values exported to the environment unconditionally (see
  * `start.sh.hbs`) so a stale `~/.hindsight/claude-code.json` — which loads
  * AFTER the plugin's settings.json — cannot shadow them (#3774).
  */
-const HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT = 2;
-const HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT = 1;
+const RECALL_OWN_BANK_SLOT_DIVISOR = 3; // own ≈ ⅓ of the cap
+const RECALL_ADDITIONAL_BANK_SLOT_DIVISOR = 6; // additional ≈ ⅙ of the cap
+
+function recallSlotFloorFromCap(maxMemories: number, divisor: number): number {
+  // A cap of 0 means "no count cap" (unlimited injection); reservation is moot
+  // because recall.py bounds floors to HALF the cap. Fall back to the resolver
+  // default so an unlimited/garbage cap still yields a sensible, non-zero floor.
+  const cap =
+    Number.isFinite(maxMemories) && maxMemories > 0
+      ? maxMemories
+      : DEFAULT_RECALL_MAX_MEMORIES;
+  // Round to nearest, floored at 1: even the smallest cap keeps a non-zero
+  // own-bank reservation, or one bank's score distribution could take every
+  // slot (the crowd-out this floor exists to prevent).
+  return Math.max(1, Math.round(cap / divisor));
+}
+
+/** Cap-proportional default floor for the agent's OWN bank (≈ ⅓ of the cap). */
+export function defaultRecallOwnBankMinSlots(maxMemories: number): number {
+  return recallSlotFloorFromCap(maxMemories, RECALL_OWN_BANK_SLOT_DIVISOR);
+}
+
+/** Cap-proportional default floor for the additional banks (≈ ⅙ of the cap). */
+export function defaultRecallAdditionalBankMinSlots(maxMemories: number): number {
+  return recallSlotFloorFromCap(maxMemories, RECALL_ADDITIONAL_BANK_SLOT_DIVISOR);
+}
 
 /**
  * Absolute relevance floor for injected memories (#3837), switchroom's shipped
@@ -3759,10 +3804,12 @@ const HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT = "degraded";
  *   - `retainMode`: full-session → chunked (Phase 6b: window, not whole
  *     transcript, re-consolidated per fire; paired with the vendor
  *     retain.py divergence)
- *   - `recallMaxMemories`: 12 → cascade (default 8; `memory.recall.max_memories`)
+ *   - `recallMaxMemories`: vendor 12 → cascade (resolver default 8;
+ *     `memory.recall.max_memories`)
  *   - `recallMaxTokens`: cascade (default 1024; `memory.recall.max_tokens`)
- *   - `recallOwnBankMinSlots` / `recallAdditionalBankMinSlots`: 0/0 → 2/1
- *     (FLOORS inside recallMaxMemories, bounded to half the cap by recall.py)
+ *   - `recallOwnBankMinSlots` / `recallAdditionalBankMinSlots`: 0/0 →
+ *     cap-proportional (own ≈ ⅓, additional ≈ ⅙ of recallMaxMemories; FLOORS
+ *     bounded to half the cap by recall.py)
  *
  * Future overrides go here, NOT in the vendor file. The vendor is
  * third-party code and must remain untouched for clean upstream
@@ -3931,22 +3978,28 @@ function renderHindsightSettingsOverrides(
   // field that would have caught the own-bank outage, since a fully timed-out
   // own bank still logs a full `result_count`.
   //
-  // 2/1 against recallMaxMemories, whatever the operator set it to
+  // Slot floors DERIVED from recallMaxMemories, whatever the operator set it to
   // (`memory.recall.max_memories` cascades to both HINDSIGHT_RECALL_MAX_MEMORIES
-  // and the settings.json stamp above — the two now carry the same value, so the
-  // floors bind against the same cap on every invocation, env-inheriting or not).
+  // and the settings.json stamp above — the two carry the same value, and both
+  // the stamp here and the start.sh env export derive the floors from that same
+  // cap, so they bind identically on every invocation, env-inheriting or not).
   // FLOORS, not quotas, and enforced as such: recall.py bounds the two floors to
   // HALF the cap between them (`_reservable_slots`), so at least half the slots
   // are always won on pure relevance and composition still moves with the
-  // scores (at the default cap of 8, that reserves 3 and leaves 5). Floors that
-  // summed to the cap would be a fixed quota with
-  // no score influence at all. Each side also gets its floor only if it returned
-  // that many, so a silent bank wastes nothing. Operators re-tune via
+  // scores. own ≈ ⅓ + additional ≈ ⅙ = ½ of the cap, exactly the reservation
+  // budget (cap 6 → 2/1, cap 8 → 3/1, cap 16 → 5/3). Deriving from the cap is
+  // what stops the floors going stale when the fleet raises max_memories — the
+  // #3755 literals (2/1, sized for the old cap of 6) reserved only ~19% of a
+  // 16-slot cap once it was raised. Each side also gets its floor only if it
+  // returned that many, so a silent bank wastes nothing. Operators re-tune via
   // memory.recall.own_bank_min_slots / .additional_bank_min_slots in
-  // switchroom.yaml (0/0 = the pre-fix head-slice). Vendor default is 0/0; this
-  // is the switchroom opt-in.
-  settings.recallOwnBankMinSlots = HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT;
-  settings.recallAdditionalBankMinSlots = HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
+  // switchroom.yaml (0/0 = the pre-fix head-slice), and an explicit override
+  // still wins over the derived default. Vendor default is 0/0; this is the
+  // switchroom opt-in.
+  settings.recallOwnBankMinSlots = defaultRecallOwnBankMinSlots(recallCaps.maxMemories);
+  settings.recallAdditionalBankMinSlots = defaultRecallAdditionalBankMinSlots(
+    recallCaps.maxMemories,
+  );
   // Phase 6a: on top of the ack-skip, skip recall on plausibly-stateless
   // trivial turns (time/date/day, bare greetings) — saves the ~1-2s
   // recall arm + up to ~1024 injected tokens on turns that never need
@@ -5335,11 +5388,19 @@ export function scaffoldAgent(
   // and loads AFTER the plugin's settings.json, so a conditional export lets a
   // stale hand-edited value there shadow what switchroom stamps — silently, and
   // permanently. Exporting the resolved effective value makes env authoritative.
+  // Default floors DERIVE from the effective count cap (resolved the same way
+  // the settings.json stamp resolves it) so the env export and the stamp agree,
+  // and so the floors track the cap instead of going stale when it is raised.
+  // An explicit per-agent override still wins over the derived default.
+  const hindsightRecallEffectiveMaxMemories = resolveHindsightRecallCaps(
+    agentConfig.memory?.recall as RecallCapInput | undefined,
+  ).maxMemories;
   const hindsightRecallOwnBankMinSlots =
-    agentConfig.memory?.recall?.own_bank_min_slots ?? HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT;
+    agentConfig.memory?.recall?.own_bank_min_slots ??
+    defaultRecallOwnBankMinSlots(hindsightRecallEffectiveMaxMemories);
   const hindsightRecallAdditionalBankMinSlots =
     agentConfig.memory?.recall?.additional_bank_min_slots ??
-    HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
+    defaultRecallAdditionalBankMinSlots(hindsightRecallEffectiveMaxMemories);
   // #3837 score floor. Same unconditional-export treatment as the slot floors
   // (#3774): a conditional export would let a stale hand-edited
   // `~/.hindsight/claude-code.json` silently turn a filter ON that switchroom
@@ -7946,11 +8007,19 @@ function reconcileAgentInner(
   // and loads AFTER the plugin's settings.json, so a conditional export lets a
   // stale hand-edited value there shadow what switchroom stamps — silently, and
   // permanently. Exporting the resolved effective value makes env authoritative.
+  // Default floors DERIVE from the effective count cap (resolved the same way
+  // the settings.json stamp resolves it) so the env export and the stamp agree,
+  // and so the floors track the cap instead of going stale when it is raised.
+  // An explicit per-agent override still wins over the derived default.
+  const hindsightRecallEffectiveMaxMemories = resolveHindsightRecallCaps(
+    agentConfig.memory?.recall as RecallCapInput | undefined,
+  ).maxMemories;
   const hindsightRecallOwnBankMinSlots =
-    agentConfig.memory?.recall?.own_bank_min_slots ?? HINDSIGHT_OWN_BANK_MIN_SLOTS_DEFAULT;
+    agentConfig.memory?.recall?.own_bank_min_slots ??
+    defaultRecallOwnBankMinSlots(hindsightRecallEffectiveMaxMemories);
   const hindsightRecallAdditionalBankMinSlots =
     agentConfig.memory?.recall?.additional_bank_min_slots ??
-    HINDSIGHT_ADDITIONAL_BANK_MIN_SLOTS_DEFAULT;
+    defaultRecallAdditionalBankMinSlots(hindsightRecallEffectiveMaxMemories);
   // #3837 score floor. Same unconditional-export treatment as the slot floors
   // (#3774): a conditional export would let a stale hand-edited
   // `~/.hindsight/claude-code.json` silently turn a filter ON that switchroom
