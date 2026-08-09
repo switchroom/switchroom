@@ -13,9 +13,10 @@ name: docker-images
 #   - pull_request: build only (no push) to validate Dockerfile changes.
 #
 # Pipelines (perf rework, follows #2807):
-#   - build-dist builds dist/ ONCE and uploads it as the `dist-built`
+#   - build-dist runs `npm run build` ONCE and uploads BOTH build-output
+#     trees — `dist/` and `telegram-plugin/dist/` — as the `dist-built`
 #     artifact; the dependent image legs download it instead of each
-#     rebuilding dist/ (an Actions-minutes saving — legs run in parallel
+#     rebuilding them (an Actions-minutes saving — legs run in parallel
 #     so wall-clock is ~neutral). build-base does NOT consume dist/
 #     (Dockerfile.base COPYs nothing from the context), so it builds no
 #     dist.
@@ -224,7 +225,25 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: dist-built
-          path: dist/
+          # BOTH build-output trees, not just dist/. `npm run build` emits
+          # dist/ AND telegram-plugin/dist/ (scripts/build.mjs shells
+          # telegram-plugin/scripts/build.mjs to bundle the plugin's
+          # server/gateway/bridge entry points), and Dockerfile.agent COPYs
+          # `telegram-plugin/dist`. Both are gitignored (.gitignore's bare
+          # `dist/` matches at any depth), so neither is in the leg's
+          # checkout — shipping only dist/ makes the agent leg fail with a
+          # bare `"/telegram-plugin/dist": not found` from buildx. Any
+          # gitignored path a dependent Dockerfile COPYs from MUST be listed
+          # here; tests/docker/ci-build-dist-shared.test.ts derives that set
+          # from the Dockerfiles and fails if one is missing.
+          #
+          # Two paths make upload-artifact root the archive at their least
+          # common ancestor — the workspace — so entries are `dist/...` and
+          # `telegram-plugin/dist/...`. The consumers download with
+          # `path: .` to restore that layout verbatim.
+          path: |
+            dist/
+            telegram-plugin/dist/
           # 1-day retention: the artifact is consumed by the image legs
           # that fire within minutes of this job.
           retention-days: 1
@@ -493,13 +512,34 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download dist artifact
-        # Built once by build-dist; each Dockerfile COPYs a slice of
-        # dist/ into its image. `context: .` in the build step below
-        # picks it up from the working directory.
+        # Built once by build-dist; each Dockerfile COPYs a slice of the
+        # build output into its image. `path: .` (NOT `dist/`) because the
+        # artifact is rooted at the workspace and carries BOTH build-output
+        # trees — `dist/` and `telegram-plugin/dist/`. Unpacking at `.`
+        # restores each at its original path, which is where the
+        # Dockerfiles' COPY sources resolve under `context: .` below.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: dist-built
-          path: dist/
+          path: .
+
+      - name: Verify build outputs landed
+        # Fail HERE, with a readable message, rather than 200 lines later
+        # inside buildx. A missing tree surfaces from docker build as a bare
+        # `failed to compute cache key: "/telegram-plugin/dist": not found`,
+        # which says nothing about the artifact being the culprit — that is
+        # exactly how the telegram-plugin/dist omission presented. Keep this
+        # list in sync with the upload paths in build-dist.
+        run: |
+          set -euo pipefail
+          missing=0
+          for d in dist telegram-plugin/dist; do
+            if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "::error::build output '$d' is missing or empty after downloading the dist-built artifact — check the upload paths in the build-dist job"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
 
       - name: Restore exec bits on bundled CLIs
         # upload-artifact stores a zip and strips POSIX exec bits on
@@ -626,13 +666,34 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Download dist artifact
-        # Built once by build-dist; each Dockerfile COPYs a slice of
-        # dist/ into its image. `context: .` in the build step below
-        # picks it up from the working directory.
+        # Built once by build-dist; each Dockerfile COPYs a slice of the
+        # build output into its image. `path: .` (NOT `dist/`) because the
+        # artifact is rooted at the workspace and carries BOTH build-output
+        # trees — `dist/` and `telegram-plugin/dist/`. Unpacking at `.`
+        # restores each at its original path, which is where the
+        # Dockerfiles' COPY sources resolve under `context: .` below.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: dist-built
-          path: dist/
+          path: .
+
+      - name: Verify build outputs landed
+        # Fail HERE, with a readable message, rather than 200 lines later
+        # inside buildx. A missing tree surfaces from docker build as a bare
+        # `failed to compute cache key: "/telegram-plugin/dist": not found`,
+        # which says nothing about the artifact being the culprit — that is
+        # exactly how the telegram-plugin/dist omission presented. Keep this
+        # list in sync with the upload paths in build-dist.
+        run: |
+          set -euo pipefail
+          missing=0
+          for d in dist telegram-plugin/dist; do
+            if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+              echo "::error::build output '$d' is missing or empty after downloading the dist-built artifact — check the upload paths in the build-dist job"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
 
       - name: Restore exec bits on bundled CLIs
         # upload-artifact stores a zip and strips POSIX exec bits on

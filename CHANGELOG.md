@@ -30,13 +30,19 @@ now an anomaly worth investigating, not the norm.
 
 ### CI: `dist/` is built once and shared with the dependent image legs
 
-- **docker-images: a single `build-dist` job bundles `dist/` once and uploads
-  it as the `dist-built` artifact; the dependent image legs download it instead
-  of each rebuilding `dist/`.** An Actions-minutes saving (one build instead of
-  one per leg per arch), not a wall-clock one — the legs already run in
-  parallel. `build-base` builds no `dist/` at all now: `Dockerfile.base` copies
-  nothing from the build context, so its dist build was dead work and is
-  removed.
+- **docker-images: a single `build-dist` job runs `npm run build` once and
+  uploads both build-output trees — `dist/` and `telegram-plugin/dist/` — as the
+  `dist-built` artifact; the dependent image legs download it instead of each
+  rebuilding them.** An Actions-minutes saving (one build instead of one per leg
+  per arch), not a wall-clock one — the legs already run in parallel.
+  `build-base` builds no `dist/` at all now: `Dockerfile.base` copies nothing
+  from the build context, so its dist build was dead work and is removed.
+  `telegram-plugin/dist/` is easy to overlook because `.gitignore`'s bare
+  `dist/` matches it at any depth, yet only `Dockerfile.agent` copies it — so
+  `tests/docker/ci-build-dist-shared.test.ts` now derives the required artifact
+  contents from the dependent Dockerfiles' `COPY` sources rather than
+  hardcoding them, and each leg verifies both trees landed before invoking
+  buildx.
 
 ### CI: `build-dependents` no longer serialized behind `build-base` on PR / merge_group
 
