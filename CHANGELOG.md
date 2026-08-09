@@ -38,6 +38,8 @@ now an anomaly worth investigating, not the norm.
   drops the host CLI line only once the stamp *proves* it converged; an
   unorderable version keeps the line with a confirm-host-side caveat.
 
+- **telegram: persist card/status messages so a quote-reply to them resolves**
+
 ## v0.20.22 — recall budget default moves to `mid`, speaker-aware retain context, and fail-safe recall fact-type filtering
 
 ### Features
