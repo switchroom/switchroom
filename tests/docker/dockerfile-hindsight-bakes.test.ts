@@ -589,6 +589,54 @@ describe("Dockerfile.hindsight shape", () => {
     expect(userIdx).toBeGreaterThan(chownIdx); // chown runs as root, before the USER switch
   });
 
+  it("fixes HF-cache ownership with a scoped find in the SAME RUN as the download (no `chown -R` copy-up layer)", () => {
+    // Regression guard for #4571. `chown(2)` copy-ups a file on overlayfs
+    // even when the ownership is UNCHANGED, so the old shape —
+    //
+    //   RUN … snapshot_download …            <- 133MB layer (the onnx graph)
+    //   RUN chown -R hindsight:hindsight /home/hindsight/.cache/huggingface
+    //
+    // — emitted a SECOND 360MB layer (230.8MB compressed) that was pure
+    // duplicate: the whole 344MB cache copied up, of which only the 133MB
+    // graph was actually root-owned (the upstream-baked bge safetensors +
+    // ms-marco reranker were already set to the runtime uid by the UID-remap
+    // `find` earlier in the file). Measured on v0.20.18 via `docker history`.
+    //
+    // Both halves of the fix are load-bearing, so both are pinned here:
+    //   * no blanket `chown -R` over the cache root (scope), and
+    //   * the fixup lives in the same RUN as the download (one layer),
+    //     otherwise the 133MB graph is copied up a second time anyway.
+    const cacheRoot = "/home/hindsight/.cache/huggingface";
+
+    // (a) The blanket recursive chown over the cache root must not come back.
+    expect(dockerfile).not.toMatch(
+      new RegExp(`chown\\s+-R\\s+\\S+\\s+${cacheRoot}`, "m"),
+    );
+
+    // (b) The download and the ownership fixup must live in ONE RUN. Slice
+    //     from the snapshot_download call to the next top-level instruction
+    //     and require the chown inside that slice.
+    const dlIdx = dockerfile.search(/from huggingface_hub import snapshot_download/);
+    expect(dlIdx).toBeGreaterThanOrEqual(0);
+    const rest = dockerfile.slice(dlIdx);
+    const nextInstr = rest.search(/^(RUN|ENV|COPY|USER|ENTRYPOINT|CMD)\s/m);
+    const runBody = nextInstr === -1 ? rest : rest.slice(0, nextInstr);
+    expect(runBody).toMatch(/chown -h hindsight:hindsight/);
+
+    // (c) …and that chown must be scoped by an ownership predicate, so it
+    //     touches only files that are genuinely mis-owned.
+    expect(runBody).toMatch(/! -user hindsight -o ! -group hindsight/);
+
+    // (d) The self-verifying assertions survive: the pinned export is still
+    //     required to exist, and nothing may be left non-hindsight-owned.
+    expect(runBody).toContain(
+      `test -f ${cacheRoot}/hub/models--BAAI--bge-small-en-v1.5/snapshots/` +
+        `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/onnx/model.onnx`,
+    );
+    expect(runBody).toMatch(/STRAY=\$\(find/);
+    expect(runBody).toMatch(/exit 1/);
+  });
+
   it("ends as USER hindsight (so the entrypoint runs as UID 11000)", () => {
     expect(dockerfile).toMatch(/^USER\s+hindsight\b/m);
   });

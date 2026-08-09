@@ -61,6 +61,27 @@ now an anomaly worth investigating, not the norm.
   mean BUILD, never skip — publishing a stale image under a release tag is
   unrecoverable, while a redundant rebuild only costs minutes.
 
+### Docker: drop a 230.8MB pure-duplicate layer from `switchroom-hindsight`
+
+- **`Dockerfile.hindsight` merged the HuggingFace ONNX download and its
+  ownership fixup into one `RUN`, and narrowed the fixup from `chown -R` to a
+  scoped `find`, cutting 230.8MB compressed (360MB uncompressed) off the
+  image.** `chown(2)` triggers an overlayfs copy-up even when the ownership is
+  *unchanged*, so the old standalone
+  `RUN chown -R hindsight:hindsight /home/hindsight/.cache/huggingface`
+  copied the entire 344MB cache into a second layer — of which only the 133MB
+  ONNX graph this stage actually downloads was ever root-owned. Everything else
+  (upstream's baked bge safetensors and the ms-marco reranker) was already set
+  to the runtime UID by the UID-11000 remap earlier in the file, so re-chowning
+  it bought nothing and duplicated the graph on top. Both halves of the fix are
+  load-bearing and `tests/docker/dockerfile-hindsight-bakes.test.ts` pins both:
+  scoping alone would still copy the graph up a second time in its own layer,
+  and merging alone would still copy up the whole cache. The EACCES guarantee
+  is unchanged — every file not owned by `hindsight` is still chowned — and is
+  now *asserted* rather than assumed: the build fails loudly if any file under
+  the cache is left non-`hindsight`-owned, alongside the retained `test -f`
+  check on the pinned export. Runtime UID 11000 is untouched.
+
 ## v0.20.20 — docker-images builds `dist/` once and shares it with the dependent image legs
 
 ### CI: `dist/` is built once and shared with the dependent image legs
