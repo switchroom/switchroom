@@ -58,8 +58,10 @@ export const DEFAULT_RECALL_HOOK_TIMEOUT_SECONDS = 12;
 /**
  * switchroom smart-default for `recallMaxMemories` — the count cap on memories
  * injected per turn. The vendor ships 12 (`vendor/hindsight-memory/settings.json`
- * / `lib/config.py` DEFAULTS); switchroom tightens it to 8 (less prompt noise at
- * our `recallBudget: low`, per the 2026-05-24 recall-quality audit). This is the
+ * / `lib/config.py` DEFAULTS); switchroom tightens it to 8 (less prompt noise,
+ * per the 2026-05-24 recall-quality audit). This is a count cap on the injected
+ * set and is independent of `recallBudget` (which sets candidate DEPTH, not the
+ * final head-slice). This is the
  * value stamped into the deployed settings.json when the operator sets no
  * `memory.recall.max_memories`, so it MUST equal what the fleet ran before this
  * became a stamped-from-cascade value or turning the stamp on would move

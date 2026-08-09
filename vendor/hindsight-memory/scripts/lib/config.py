@@ -48,16 +48,19 @@ DEFAULT_VOLATILE_SCOPE_PATTERNS = (
 DEFAULTS = {
     # Recall
     "autoRecall": True,
-    # Switchroom default: "low" — vector search only, no LLM reranking.
-    # Cuts the recall hook latency from ~5s (mid budget) to ~1-2s (low).
-    # Operators who want richer recall can set HINDSIGHT_RECALL_BUDGET=mid
-    # via per-agent env or write `recallBudget: "mid"` into the user
-    # config file. Forensics on real klanker turns showed mid-budget
-    # recall was ~5s of wall-clock latency dominated by the LLM filter
-    # pass; for chat-pattern agents the vector hits alone are fine and
-    # the 5s is the second-largest contributor to perceived dead air
-    # (after the model TTFT).
-    "recallBudget": "low",
+    # Switchroom fleet default: "mid". The budget sets candidate DEPTH — how
+    # many nodes the engine pulls across all TEMPR retrieval stages before
+    # ranking (recall_budget_fixed_low=100 / _mid=300 / _high=1000 units,
+    # hindsight_api engine/memory_engine.py). It does NOT gate the reranker:
+    # the cross-encoder runs at EVERY budget level and is bounded separately by
+    # RERANKER_MAX_CANDIDATES (HINDSIGHT_API_RERANKER_MAX_CANDIDATES, default
+    # 300), so "low" is not "vector-only, no rerank" — it is a shallower
+    # candidate pool feeding the same rerank+score pipeline. "mid" (300 nodes)
+    # is upstream's own default and the balanced point: deeper recall than
+    # "low" without "high"'s 1000-node cold-page tail. Operators who want the
+    # shallow/fast pool back set HINDSIGHT_RECALL_BUDGET=low via per-agent env
+    # or write `recallBudget: "low"` into the user config file.
+    "recallBudget": "mid",
     "recallMaxTokens": 1024,
     # Switchroom-local: cap on the number of memories injected into the
     # `<hindsight_memories>` block, regardless of token budget. Plugin v0.4.0
