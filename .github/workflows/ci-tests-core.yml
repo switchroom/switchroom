@@ -16,9 +16,12 @@ name: ci-tests-core
 #      ci-tests-core from ~1m10s to ~20-30s on the common case.
 #      Push to main runs the full suite — we don't gamble on main.
 #
-#   3. 4-way matrix sharding (carryover from #1320). With --changed
-#      the per-shard surface drops to a handful of files; shards still
-#      run in parallel for the few cases where many tests are affected.
+#   3. 8-way matrix sharding (raised from 4-way; carryover origin
+#      #1320). With --changed the per-shard surface drops to a handful
+#      of files; shards still run in parallel for the few cases where
+#      many tests are affected (push-to-main / merge_group full suite),
+#      where 8 free parallel runners roughly halve the wall-clock of the
+#      old 4-way split at zero extra cost.
 #
 # Sharding determinism: `vitest --shard X/Y` hashes test file paths so
 # a given file always lands in the same shard for a given Y. The
@@ -26,7 +29,7 @@ name: ci-tests-core
 #
 # Fork-pool tuning: VITEST_MAX_FORKS=2 honored by vitest.config.ts.
 # On a 2-vCPU runner that's 2 concurrent workers per shard, with all
-# 4 shards running on separate runners (matrix-parallel, not
+# 8 shards running on separate runners (matrix-parallel, not
 # co-located). Net: comfortable, not oversubscribed.
 
 on:
@@ -62,7 +65,7 @@ jobs:
   # below — it ALWAYS runs and aggregates the shards, so a docs-only
   # PR (shards skipped) still reports pass instead of blocking (#1343).
   # NOTE: branch protection must require `vitest` (the sentinel), NOT
-  # the old `vitest (1..4)` matrix contexts — see the PR description
+  # the old `vitest (1..8)` matrix contexts — see the PR description
   # for the one-time required-status-checks retune.
   changes:
     runs-on: ubuntu-latest
@@ -117,7 +120,7 @@ jobs:
   # ─── Sharded vitest run ───────────────────────────────────────────
   # Renamed vitest → vitest-shard so the required context is the
   # always-running `vitest` sentinel, not the path-skippable matrix
-  # contexts `vitest (1..4)` (those blocked docs-only PRs, #1343).
+  # contexts `vitest (1..8)` (those blocked docs-only PRs, #1343).
   vitest-shard:
     needs: [changes, build-dist]
     # push / merge_group: always run — both are (candidate) main.
@@ -127,7 +130,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       TELEGRAM_BOT_TOKEN: "123456:stub-for-tests"
       VITEST_MAX_FORKS: "2"
@@ -167,7 +170,7 @@ jobs:
           chmod +x dist/cli/*.js dist/cli/*.mjs 2>/dev/null || true
           ls -l dist/cli/
 
-      - name: Vitest shard ${{ matrix.shard }}/4 (PR — changed-files only)
+      - name: Vitest shard ${{ matrix.shard }}/8 (PR — changed-files only)
         if: github.event_name == 'pull_request'
         # --changed traces the import graph from files changed against
         # the PR base; vitest runs every test that transitively depends
@@ -176,7 +179,7 @@ jobs:
         # default behaviour is exit 1.
         run: |
           bunx vitest run \
-            --shard ${{ matrix.shard }}/4 \
+            --shard ${{ matrix.shard }}/8 \
             --changed origin/${{ github.base_ref }} \
             --passWithNoTests
 
@@ -188,9 +191,9 @@ jobs:
       # `github.base_ref`, which a queue ref does not have), so without
       # this the queue would "pass" vitest without executing a test.
       # Guarded by tests/ci-merge-queue-triggers.test.ts.
-      - name: Vitest shard ${{ matrix.shard }}/4 (push to main / merge queue — full suite)
+      - name: Vitest shard ${{ matrix.shard }}/8 (push to main / merge queue — full suite)
         if: github.event_name == 'push' || github.event_name == 'merge_group'
-        run: bunx vitest run --shard ${{ matrix.shard }}/4
+        run: bunx vitest run --shard ${{ matrix.shard }}/8
 
       - name: Upload coverage (if produced)
         if: always()
@@ -203,10 +206,10 @@ jobs:
 
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context. ALWAYS runs and aggregates the
-  # 4 shards. `needs.vitest-shard.result` is success only if every
+  # 8 shards. `needs.vitest-shard.result` is success only if every
   # matrix shard succeeded, failure if any failed, skipped if the whole
   # matrix was path-skipped (irrelevant PR → pass). Branch protection
-  # must require `vitest` (this job), NOT `vitest (1..4)`.
+  # must require `vitest` (this job), NOT `vitest (1..8)`.
   vitest:
     needs: [changes, vitest-shard]
     if: always()

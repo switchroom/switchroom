@@ -61,13 +61,13 @@ concurrency:
 
 jobs:
   # ─── Path-change filter (sentinel pattern; see ci-lint.yml header) ─
-  # This filter job always runs; the real work jobs (`e2e`,
+  # This filter job always runs; the real work jobs (`e2e-shard`,
   # `hindsight-probe`) are `if:`-gated on its outputs and report
   # `skipped` on PRs that don't touch the paths they cover.
   #
   # A `skipped` check is NOT success for branch protection — it BLOCKS
   # (proven by #1343, a docs-only PR hard-blocked; same deadlock as
-  # #2237). So neither `e2e` nor `hindsight-probe` can be a required
+  # #2237). So neither `e2e-shard` nor `hindsight-probe` can be a required
   # context, and in fact neither has ever been in ruleset 16470166.
   # The `e2e-ok` sentinel at the bottom of this file exists for exactly
   # that reason: it ALWAYS runs, so it is the one context here that can
@@ -149,7 +149,27 @@ jobs:
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
-  e2e:
+  # ─── Sharded docker e2e run ───────────────────────────────────────
+  # The tests/docker suite is split across a 3-way matrix so it runs on
+  # three free parallel runners instead of one (~8 min of test execution
+  # → ~3 min wall clock). Mirrors the ci-tests-core.yml vitest-shard
+  # pattern: a matrix job whose contexts (`e2e-shard (1..3)`) are NOT
+  # branch-protection-required, aggregated by the always-running `e2e-ok`
+  # sentinel below.
+  #
+  # Isolation across shards is already guaranteed by the suite itself:
+  # every test container carries a `switchroom.test=phase*` label and
+  # runs under its own compose project, so three shards on three separate
+  # runners never collide. Each shard leg does the SAME image
+  # build/cache setup the single job did — the warm-tarball cache is
+  # keyed on file hashes, so all three shards share one key (first cold
+  # build populates it; the rest hit it warm or cold-build in parallel,
+  # all free).
+  #
+  # Sharding is threaded into scripts/ci/docker-snapshot-gate.sh via the
+  # VITEST_SHARD env var (e.g. "2/3"); unset, the gate runs the whole
+  # suite (the original single-runner path, preserved for other callers).
+  e2e-shard:
     needs: changes
     # push / merge_group: always run — both are (candidate) main. On the
     # queue ref this is the job that actually catches a semantic conflict
@@ -157,6 +177,10 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -252,6 +276,12 @@ jobs:
         #      compose-project pattern `phase<digit><letter>-...` used
         #      by broker-ipc-race + per-agent-isolation. Filter now
         #      covers both shapes.
+        #
+        # VITEST_SHARD threads this matrix leg's shard into the gate's
+        # `vitest run` so each of the 3 runners executes a third of the
+        # tests/docker suite.
+        env:
+          VITEST_SHARD: ${{ matrix.shard }}/3
         run: bash scripts/ci/docker-snapshot-gate.sh
 
       - name: Capture broker / kernel logs on failure
@@ -293,7 +323,7 @@ jobs:
   # This job pulls the digest-pinned upstream image and sets
   # SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1, under which the suite treats an
   # unavailable docker/image as a HARD FAILURE. It is a separate job from
-  # `e2e` because the pull is large and unrelated to the phase1b image set,
+  # `e2e-shard` because the pull is large and unrelated to the phase1b image set,
   # and because it must not share that job's disk budget.
   hindsight-probe:
     needs: changes
@@ -363,11 +393,11 @@ jobs:
         # only correct base is the fully-patched source tree, which the shipping
         # image IS. We build it here rather than pull it: build-hindsight (in
         # docker-images.yml) does not push on PRs, and cross-workflow image
-        # hand-off is fragile — so, mirroring how the `e2e` job builds its own
+        # hand-off is fragile — so, mirroring how the `e2e-shard` job builds its own
         # image set in-job, this job builds the image it needs.
         #
         # `driver: docker` builds straight into the daemon's image store (same
-        # rationale as the `e2e` job) so the just-pulled FROM digest resolves
+        # rationale as the `e2e-shard` job) so the just-pulled FROM digest resolves
         # locally and the built tag is immediately runnable by `docker run`.
         # BuildKit (via buildx) is REQUIRED for Dockerfile.hindsight: its patch
         # steps are `RUN python3 - <<'PYEOF'` heredocs, which the legacy builder
@@ -640,14 +670,17 @@ jobs:
   # fail when any failed/was cancelled, or when the `changes` filter
   # job itself broke (can't trust a skip produced by broken infra).
   # Ruleset 16470166 should require `e2e-ok` as THE single required
-  # context for this workflow — `e2e` and `hindsight-probe` themselves
-  # cannot be required (they legitimately skip, and a skipped required
-  # check hard-blocks: #1343 / #2237). hindsight-probe in particular
-  # exists so the behavioural patch probe can never silently skip; it
-  # only actually gates via this sentinel. Keep this `needs` list
-  # complete when adding jobs.
+  # context for this workflow — the `e2e-shard` matrix legs and
+  # `hindsight-probe` themselves cannot be required (they legitimately
+  # skip, and a skipped required check hard-blocks: #1343 / #2237, and a
+  # matrix leg's context is `e2e-shard (N)`, not a stable name). A single
+  # `needs: e2e-shard` here aggregates ALL matrix legs: it is `success`
+  # only if every shard succeeded, `failure`/`cancelled` if any did.
+  # hindsight-probe in particular exists so the behavioural patch probe
+  # can never silently skip; it only actually gates via this sentinel.
+  # Keep this `needs` list complete when adding jobs.
   e2e-ok:
-    needs: [changes, e2e, hindsight-probe]
+    needs: [changes, e2e-shard, hindsight-probe]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -661,7 +694,7 @@ jobs:
           fi
           fail=0
           for pair in \
-            "e2e=${{ needs.e2e.result }}" \
+            "e2e-shard=${{ needs.e2e-shard.result }}" \
             "hindsight-probe=${{ needs.hindsight-probe.result }}"; do
             job="${pair%%=*}"; r="${pair#*=}"
             if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
