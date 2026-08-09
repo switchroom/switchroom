@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.19 — a 32k backend now consolidates in batches of 3, plus the first-class recall/background split and two LiteLLM mount guards
+
 ### CI: more free-runner test parallelism (docker-e2e sharded 3-way, ci-tests-core 8-way)
 
 - **docker-e2e's `e2e` job is now a 3-way `--shard` matrix (`e2e-shard`) and
