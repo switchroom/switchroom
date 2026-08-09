@@ -38,15 +38,14 @@
 import {
   closeSync,
   existsSync,
-  mkdirSync,
   openSync,
   readFileSync,
   statSync,
   unlinkSync,
   utimesSync,
-  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { mkdirStateSync, writeStateFileSync } from "../../src/util/state-owner.js";
 
 export const TURN_ACTIVE_MARKER_FILE = "turn-active.json";
 
@@ -82,8 +81,8 @@ export interface TurnActiveMarker {
  */
 export function writeTurnActiveMarker(stateDir: string, marker: TurnActiveMarker): void {
   try {
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(
+    mkdirStateSync(stateDir, { recursive: true });
+    writeStateFileSync(
       join(stateDir, TURN_ACTIVE_MARKER_FILE),
       JSON.stringify(marker, null, 2) + "\n",
       { mode: 0o600 },

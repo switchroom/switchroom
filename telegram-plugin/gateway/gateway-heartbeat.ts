@@ -21,8 +21,9 @@
  * conservatively BLOCKS (re-prompt), which is the safe direction.
  */
 
-import { mkdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { utimesSync } from 'node:fs'
 import { join } from 'node:path'
+import { mkdirStateSync, writeStateFileSync } from '../../src/util/state-owner.js'
 
 /** Filename under `TELEGRAM_STATE_DIR`. MUST stay in sync with
  * `GATEWAY_HEARTBEAT_FILE` in `hooks/silent-end-scan.mjs`. */
@@ -47,8 +48,8 @@ export function touchGatewayHeartbeat(stateDir: string): void {
   } catch {
     // File doesn't exist yet (or unstattable) — create it.
     try {
-      mkdirSync(stateDir, { recursive: true })
-      writeFileSync(path, `${Date.now()}\n`, { mode: 0o600 })
+      mkdirStateSync(stateDir, { recursive: true })
+      writeStateFileSync(path, `${Date.now()}\n`, { mode: 0o600 })
     } catch {
       // Best-effort — a heartbeat write failure makes the hook BLOCK
       // (re-prompt), which is the safe direction.

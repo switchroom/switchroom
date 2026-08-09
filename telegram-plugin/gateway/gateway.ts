@@ -661,6 +661,17 @@ import { collectSweepTargets, type StalePinSweeper, type SweepTarget } from './s
 import { createGatewayStalePinSweeper } from './stale-pin-sweep-wiring.js'
 import { reseedSweepLedger } from './stale-pin-sweep-store.js'
 import { atomicWriteFileSync } from '../../src/util/atomic.js'
+// Ownership choke point for state-dir writes: a ROOT-tier agent's gateway runs
+// as uid 0 and would otherwise leave root:root files in an agent-owned dir,
+// EACCESing every non-root reader. Zero-syscall no-op off the root path — see
+// src/util/state-owner.ts.
+import {
+  appendStateFileSync,
+  atomicWriteStateFileSync,
+  mkdirStateSync,
+  reconcileStateDirOwnership,
+  writeStateFileSync,
+} from '../../src/util/state-owner.js'
 import { startWebhookIngestServer } from './webhook-ingest-server.js'
 import { recordWebhookEvent } from '../../src/web/webhook-gateway-record.js'
 
@@ -2150,6 +2161,24 @@ function runHistoryReaperNow(reason: 'boot' | 'periodic'): void {
       process.stderr.write(`telegram gateway: history-reaper (${reason}) failed: ${(err as Error).message}\n`)
     }
   }
+  // State-dir ownership backfill for files the write helpers can't reach —
+  // leftovers from a previously-root gateway, and files a sibling root process
+  // (hook, sidecar) created. Rides this EXISTING tick (boot, then 6h) rather
+  // than adding a timer; bounded and symlink-safe, and a single stat when the
+  // process isn't root. Rationale in src/util/state-owner.ts.
+  // (try/catch: this also runs on the BOOT path, where an unexpected throw
+  // would take the gateway down before it can serve.)
+  try {
+    const own = reconcileStateDirOwnership(STATE_DIR)
+    if (own.adopted > 0 || own.truncated) {
+      process.stderr.write(
+        `telegram gateway: state-owner reconcile (${reason}) scanned=${own.scanned}`
+        + ` adopted=${own.adopted} symlinksSkipped=${own.symlinksSkipped} truncated=${own.truncated}\n`,
+      )
+    }
+  } catch (err) {
+    process.stderr.write(`telegram gateway: state-owner reconcile (${reason}) failed: ${(err as Error).message}\n`)
+  }
 }
 // Run once at boot to catch up long-stopped agents. (#2996 P0c: gated.)
 if (isGatewayMain) runHistoryReaperNow('boot')
@@ -2670,7 +2699,7 @@ function noteAgentOutputAt(key: string, ts: number): void {
 const OBLIGATION_STORE_PATH = join(STATE_DIR, 'obligations.json')
 const obligationStoreFs = {
   readFileSync: (p: string) => readFileSync(p, 'utf8'),
-  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  writeFileSync: (p: string, d: string) => writeStateFileSync(p, d),
   renameSync: (a: string, b: string) => renameSync(a, b),
   existsSync: (p: string) => existsSync(p),
   fsyncFileSync: fsyncPathSync, fsyncDirSync: fsyncPathSync, unlinkSync,
@@ -8402,7 +8431,7 @@ const statusPinRightsCache = new PinRightsCache()
 const STATUS_PIN_STORE_PATH = join(STATE_DIR, 'status-pins.json')
 const statusPinStoreFs = {
   readFileSync: (p: string) => readFileSync(p, 'utf8'),
-  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  writeFileSync: (p: string, d: string) => writeStateFileSync(p, d),
   renameSync: (a: string, b: string) => renameSync(a, b),
   existsSync: (p: string) => existsSync(p),
 }
@@ -8418,7 +8447,7 @@ const statusPinPersistEnabled = !STATIC && PIN_STATUS_WHILE_WORKING
 const ACTIVITY_CARD_STORE_PATH = join(STATE_DIR, 'activity-cards-pending.json')
 const activityCardStoreFs: ActivityCardStoreFsSeam = {
   readFileSync: (p: string) => readFileSync(p, 'utf8'),
-  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  writeFileSync: (p: string, d: string) => writeStateFileSync(p, d),
   renameSync: (a: string, b: string) => renameSync(a, b),
   existsSync: (p: string) => existsSync(p),
 }
@@ -8437,7 +8466,7 @@ const activityCardPersistEnabled = !STATIC
 const QUEUED_CARD_STORE_PATH = join(STATE_DIR, 'queued-cards-pending.json')
 const queuedCardStoreFs: QueuedCardStoreFsSeam = {
   readFileSync: (p: string) => readFileSync(p, 'utf8'),
-  writeFileSync: (p: string, d: string) => writeFileSync(p, d),
+  writeFileSync: (p: string, d: string) => writeStateFileSync(p, d),
   renameSync: (a: string, b: string) => renameSync(a, b),
   existsSync: (p: string) => existsSync(p),
 }
@@ -9072,7 +9101,7 @@ let stalePinSweepEligible = false
 const STALE_PIN_SWEEP_STORE_PATH = join(STATE_DIR, 'stale-pin-sweep.json')
 const sweepStoreFs = {
   readFileSync: (p: string) => readFileSync(p, 'utf-8'),
-  writeFileSync: (p: string, data: string) => atomicWriteFileSync(p, data, 0o600),
+  writeFileSync: (p: string, data: string) => atomicWriteStateFileSync(p, data, 0o600),
   existsSync: (p: string) => existsSync(p),
 }
 const stalePinSweeper: StalePinSweeper = createGatewayStalePinSweeper({
@@ -9170,7 +9199,7 @@ let workerActivityFeed: ReturnType<typeof createWorkerActivityFeed> | null = nul
 // ─── IPC server ───────────────────────────────────────────────────────────
 const SOCKET_PATH = process.env.SWITCHROOM_GATEWAY_SOCKET ?? join(STATE_DIR, 'gateway.sock')
 // Ensure the directory for the socket exists (#2996 P0c: gated — disk write).
-if (isGatewayMain) mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+if (isGatewayMain) mkdirStateSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
 // PID file + session marker. See pid-file.ts and session-marker.ts for
 // the 2026-04-22 incident that motivates these. The PID file lets the
@@ -9757,9 +9786,9 @@ if (isGatewayMain) inboundSpool = STATIC
   : createInboundSpool({
       path: join(STATE_DIR, 'inbound-spool.jsonl'),
       fs: {
-        appendFileSync: (p, d) => appendFileSync(p, d),
+        appendFileSync: (p, d) => appendStateFileSync(p, d),
         readFileSync: (p) => readFileSync(p, 'utf8'),
-        writeFileSync: (p, d) => writeFileSync(p, d),
+        writeFileSync: (p, d) => writeStateFileSync(p, d),
         renameSync: (a, b) => renameSync(a, b),
         existsSync: (p) => existsSync(p),
         statSizeSync: (p) => statSync(p).size,
@@ -12866,7 +12895,7 @@ async function publishToTelegraph(
     }
     account = created.value
     try {
-      mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+      mkdirStateSync(STATE_DIR, { recursive: true, mode: 0o700 })
       writeFileSync(accountPath, JSON.stringify(account, null, 2), { mode: 0o600 })
     } catch (err) {
       process.stderr.write(`telegram gateway: telegraph cache write failed: ${(err as Error).message}\n`)
@@ -16085,7 +16114,7 @@ function spawnSwitchroomDetached(
   const logPath = join(STATE_DIR, 'detached-spawn.log')
   let outFd: number | null = null
   try {
-    mkdirSync(STATE_DIR, { recursive: true })
+    mkdirStateSync(STATE_DIR, { recursive: true })
     outFd = openSync(logPath, 'a')
     writeFileSync(logPath, `\n[${new Date().toISOString()}] spawn ${SWITCHROOM_CLI} ${fullArgs.join(' ')}\n`, { flag: 'a' })
   } catch {}
@@ -17601,9 +17630,9 @@ function buildFolderPickerDeps(): FolderPickerHandlerDeps {
 // existing on-disk lockouts age out via DEFAULT_FALLBACK_COOLDOWN_MS.
 const lockoutOps: LockoutPersistOps = {
   readFileSync: (p, enc) => readFileSync(p, enc),
-  writeFileSync: (p, data, opts) => writeFileSync(p, data, opts),
+  writeFileSync: (p, data, opts) => writeStateFileSync(p, data, opts),
   existsSync: (p) => existsSync(p),
-  mkdirSync: (p, opts) => mkdirSync(p, opts),
+  mkdirSync: (p, opts) => mkdirStateSync(p, opts),
   joinPath: (...parts) => join(...parts),
 }
 

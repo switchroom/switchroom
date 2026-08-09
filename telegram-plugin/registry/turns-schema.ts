@@ -36,8 +36,9 @@
  *   otherwise; the gateway then resumes or reports accordingly.
  */
 
-import { chmodSync, mkdirSync } from 'fs'
+import { chmodSync } from 'fs'
 import { join } from 'path'
+import { adoptSqliteOwnership, mkdirStateSync } from '../../src/util/state-owner.js'
 
 // ---------------------------------------------------------------------------
 // bun:sqlite lazy-loader (same pattern as history.ts)
@@ -302,7 +303,7 @@ function applySchema(db: SqliteDatabase): void {
 export function openTurnsDb(agentDir: string): SqliteDatabase {
   const Database = loadDatabaseClass()
   const dir = join(agentDir, 'telegram')
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  mkdirStateSync(dir, { recursive: true, mode: 0o700 })
   const path = join(dir, 'registry.db')
   const db = new Database(path, { create: true })
   applySchema(db)
@@ -318,6 +319,11 @@ export function openTurnsDb(agentDir: string): SqliteDatabase {
   } catch {
     /* ignore — chmod not supported on some FUSE mounts */
   }
+  // Same reasoning as the chmod above, for the owner rather than the mode:
+  // a root-running gateway must not leave root:root DB files in an
+  // agent-owned state dir. `-wal`/`-shm` are created by SQLite in C, so this
+  // hook is the only place we can reach them. No-op off the root path.
+  adoptSqliteOwnership(path)
   return db
 }
 

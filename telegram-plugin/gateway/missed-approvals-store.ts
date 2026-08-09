@@ -31,7 +31,7 @@
 
 import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { atomicWriteStateFileSync } from '../../src/util/state-owner.js'
 import {
   preserveUnreadableStoreFile,
   quarantineCorruptStoreFile,
@@ -149,7 +149,7 @@ export function createMissedApprovalsStore(
         unreadable = false
       }
       // tmp + fsync + rename — never truncate the destination in place.
-      atomicWriteFileSync(filePath, JSON.stringify(f), 0o600)
+      atomicWriteStateFileSync(filePath, JSON.stringify(f), 0o600)
     } catch (err) {
       log(`telegram gateway: missed-approvals-store write failed: ${(err as Error).message}\n`)
     }
