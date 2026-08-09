@@ -110,6 +110,12 @@ export const HINDSIGHT_CONSUMER_NAME = "hindsight";
  * *before* the deferred reaper.
  */
 export const HINDSIGHT_DEFAULT_WORKER_ID = "switchroom-hindsight";
+/**
+ * The authority container's exact name. Kept as a constant so exact-name
+ * container checks (see {@link isHindsightRunning}) never accidentally
+ * substring-match the recall-pool sibling `switchroom-hindsight-recall`.
+ */
+export const HINDSIGHT_CONTAINER_NAME = "switchroom-hindsight";
 /** Named volume holding embedded pg — dual mounts = dual writers. */
 export const HINDSIGHT_DATA_VOLUME = "switchroom-hindsight-data";
 
@@ -1091,7 +1097,7 @@ export const DOCKER_PROBE_TIMEOUT_MS = 60 * 1000;
  */
 export type DockerProbe = (args: string[]) => string | null;
 
-const defaultDockerProbe: DockerProbe = (args) => {
+export const defaultDockerProbe: DockerProbe = (args) => {
   try {
     return execFileSync("docker", args, {
       stdio: "pipe",
@@ -1135,26 +1141,50 @@ export function isDockerAvailable(probe: DockerProbe = defaultDockerProbe): bool
 }
 
 /**
- * Check if the switchroom-hindsight container is currently running.
+ * Docker's `--filter name=…` is a SUBSTRING match, so `name=switchroom-hindsight`
+ * also matches the recall-pool sibling `switchroom-hindsight-recall`. Every
+ * "is the authority container up/present?" check must therefore match the name
+ * EXACTLY, or a running pool with a dead authority reads as "authority up" (and
+ * the reverse). We filter by the shared prefix (cheap server-side narrowing)
+ * and then exact-compare `{{.Names}}` in-process — robust across docker
+ * versions, which disagree on whether an anchored `^…$` regex sees the leading
+ * `/`. Returns whether any returned row's name equals `want` exactly.
  */
-export function isHindsightRunning(probe: DockerProbe = defaultDockerProbe): boolean {
-  const out = probe(["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"]);
-  return (out ?? "").trim().length > 0;
+export function dockerNameMatchesExactly(
+  probe: DockerProbe,
+  args: string[],
+  want: string,
+): boolean {
+  const out = probe(args);
+  return (out ?? "")
+    .split("\n")
+    .map((n) => n.trim())
+    .some((n) => n === want);
 }
 
 /**
- * Check if the switchroom-hindsight container exists (running or stopped).
+ * Check if the switchroom-hindsight AUTHORITY container is currently running.
+ * Exact-name match, so a running recall-pool sibling never counts as the
+ * authority being up (see {@link dockerNameMatchesExactly}).
+ */
+export function isHindsightRunning(probe: DockerProbe = defaultDockerProbe): boolean {
+  return dockerNameMatchesExactly(
+    probe,
+    ["ps", "--filter", "name=switchroom-hindsight", "--format", "{{.Names}}"],
+    HINDSIGHT_CONTAINER_NAME,
+  );
+}
+
+/**
+ * Check if the switchroom-hindsight AUTHORITY container exists (running or
+ * stopped). Exact-name match for the same reason as {@link isHindsightRunning}.
  */
 export function isHindsightContainerExists(probe: DockerProbe = defaultDockerProbe): boolean {
-  const out = probe([
-    "ps",
-    "-a",
-    "--filter",
-    "name=switchroom-hindsight",
-    "--format",
-    "{{.Names}}",
-  ]);
-  return (out ?? "").trim().length > 0;
+  return dockerNameMatchesExactly(
+    probe,
+    ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Names}}"],
+    HINDSIGHT_CONTAINER_NAME,
+  );
 }
 
 /**
@@ -2906,17 +2936,38 @@ export function hindsightResolvedCapabilities(
 }
 
 /**
- * Get the status of the Hindsight Docker container.
+ * Get the status of the Hindsight AUTHORITY Docker container.
+ *
+ * Exact-name match on `{{.Names}}`, for the same reason as
+ * {@link isHindsightRunning}: `--filter name=switchroom-hindsight` is a
+ * SUBSTRING match that also returns the recall-pool sibling
+ * `switchroom-hindsight-recall`. `docker ps` orders newest-created first and
+ * the pool is always created after the authority, so a `{{.Status}}`-only
+ * projection returns TWO lines with the POOL's status first — i.e. `switchroom
+ * memory --status` and the web dashboard would report the pool's "Up 2 minutes
+ * (healthy)" while the authority sat in `Exited (1)`, hiding the outage on the
+ * two surfaces an operator reaches for during one.
+ *
+ * Injectable `exec` so the multi-row ordering is testable without docker.
  */
-export function getHindsightStatus(): string | null {
+export function getHindsightStatus(
+  exec: (cmd: string, args: string[]) => string = (cmd, args) =>
+    execFileSync(cmd, args, { stdio: "pipe", encoding: "utf-8" }),
+): string | null {
   try {
-    const output = execFileSync(
-      "docker",
-      ["ps", "-a", "--filter", "name=switchroom-hindsight", "--format", "{{.Status}}"],
-      { stdio: "pipe", encoding: "utf-8" },
-    );
-    const status = output.trim();
-    return status.length > 0 ? status : null;
+    const output = exec("docker", [
+      "ps", "-a",
+      "--filter", "name=switchroom-hindsight",
+      "--format", "{{.Names}}\t{{.Status}}",
+    ]);
+    for (const line of output.split("\n")) {
+      const tab = line.indexOf("\t");
+      if (tab === -1) continue;
+      if (line.slice(0, tab).trim() !== HINDSIGHT_CONTAINER_NAME) continue;
+      const status = line.slice(tab + 1).trim();
+      if (status.length > 0) return status;
+    }
+    return null;
   } catch {
     return null;
   }

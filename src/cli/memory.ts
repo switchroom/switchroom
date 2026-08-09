@@ -42,12 +42,26 @@ import {
   hindsightLlmDroppedKeyWarning,
   HINDSIGHT_CP_NO_ACCESS_KEY_WARNING,
   HINDSIGHT_DEFAULT_API_PORT,
+  HINDSIGHT_DEFAULT_UI_PORT,
   HINDSIGHT_DEFAULT_MCP_URL,
   resolveHindsightLiteLlm,
   hindsightLiteLlmDroppedKeyWarning,
   type HindsightLiteLlmResolution,
   type HindsightLlmConfig,
 } from "../setup/hindsight.js";
+import {
+  resolveRecallPoolConfig,
+  resolveHindsightLaunchPorts,
+  startHindsightRecallPool,
+  stopHindsightRecallPool,
+  isHindsightRecallPoolRunning,
+  publicPortIsUnserved,
+  waitForHindsightHealthy,
+  launchRecallPoolHealthGated,
+  backgroundContainerPoolEnv,
+  HINDSIGHT_RECALL_POOL_CONTAINER,
+  type RecallPoolConfig,
+} from "../setup/hindsight-recall-pool.js";
 import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
 import {
   diffDroppedHindsightEnv,
@@ -699,6 +713,9 @@ export function registerMemoryCommand(program: Command): void {
           return;
         }
         console.log(chalk.gray("  Stopping switchroom-hindsight..."));
+        // Stop the recall pool FIRST (best-effort, no-op when the split is
+        // off) so it releases its pg0 connections before pg0 goes away.
+        stopHindsightRecallPool();
         stopHindsight();
         console.log(chalk.green("  Hindsight container stopped and removed."));
         return;
@@ -784,9 +801,200 @@ export function registerMemoryCommand(program: Command): void {
       // to pickHindsightPorts, e.g. when nothing is running yet.)
       const reusePorts = recreate ? getRunningHindsightPorts() : null;
 
-      // A plain `setup` on a running container is a no-op; --recreate
-      // proceeds (pull + recreate) even when it's up.
+      // A plain `setup` on a running container is a no-op — UNLESS the recall
+      // split is enabled and the pool sibling is dead. In that "authority up,
+      // pool dead" state (an apply that outlived its pool, a crash, a prior
+      // single-container run) the public port is UNBOUND and every agent's
+      // memory.config.url refuses, yet the authority-only check would report
+      // "already running" and return success over a partial outage. Mirror the
+      // wizard's repair: restore JUST the pool without restarting the authority.
+      // --recreate falls through to the full pull + recreate below.
       if (isHindsightRunning() && !recreate) {
+        let noRecreatePoolCfg: RecallPoolConfig | null = null;
+        try {
+          noRecreatePoolCfg = resolveRecallPoolConfig(getConfig(program).hindsight?.recall_pool);
+        } catch {
+          // A malformed recall_pool block degrades to single-container semantics
+          // (mirrors the launch path); nothing to repair, treat as already-running.
+          noRecreatePoolCfg = null;
+        }
+        if (noRecreatePoolCfg && !isHindsightRecallPoolRunning()) {
+          console.log(
+            chalk.gray(
+              "\n  Authority container is up but the recall pool is not — restoring the pool...",
+            ),
+          );
+          const repairConfig = getConfig(program);
+          const repairGpu = hindsightGpuDecision(
+            resolveHindsightGpuOverride({ flag: opts.gpu, config: repairConfig.hindsight?.gpu }),
+          );
+          // The running authority sits at public+1; the public port is anchored
+          // on config (an operator pin, or the port memory.ts persisted). Absent
+          // ⇒ the scaffolding default. basePorts.apiPort = public+1 = the port
+          // the authority is already serving on.
+          const repairConfigUrlPort = ((): number | undefined => {
+            try {
+              const p = Number(new URL(repairConfig.memory?.config?.url ?? "").port);
+              return Number.isInteger(p) && p > 0 ? p : undefined;
+            } catch {
+              return undefined;
+            }
+          })();
+          const { publicApiPort: repairPublicPort, basePorts: repairBasePorts } =
+            resolveHindsightLaunchPorts({
+              recallEnabled: true,
+              configUrlPort: repairConfigUrlPort,
+              reuseApiPort: undefined,
+              uiPort: 0,
+              defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
+            });
+          try {
+            const { litellm: repairLitellm } = await resolveLiteLLMForHindsight(repairConfig);
+            const repairLlm = await getResolvedLlm();
+            const repairCpAccessKey = await resolveHindsightCpAccessKey(repairConfig);
+            const repairAuthorityEnv = {
+              ...backgroundContainerPoolEnv(),
+              ...(repairConfig.hindsight?.env ?? {}),
+            };
+            const repairResult = await launchRecallPoolHealthGated({
+              publicApiPort: repairPublicPort,
+              authorityApiPort: repairBasePorts.apiPort,
+              workers: noRecreatePoolCfg.workers,
+              waitForHealthy: (p) => waitForHindsightHealthy(p),
+              stopPool: () => stopHindsightRecallPool(),
+              startPool: () =>
+                startHindsightRecallPool({
+                  cfg: noRecreatePoolCfg!,
+                  poolPort: repairPublicPort,
+                  imageTag: effectiveTag,
+                  litellm: repairLitellm,
+                  llm: repairLlm,
+                  gpu: repairGpu.enabled,
+                  perf: {
+                    env: repairAuthorityEnv,
+                    memLimit: repairConfig.hindsight?.mem_limit,
+                  },
+                  cpAccessKey: repairCpAccessKey,
+                  // The pool serves REFLECT, which makes LLM calls with the
+                  // consumer's OAuth creds — it must share the authority's
+                  // creds mode (#2578) or it runs on stale creds after a
+                  // broker failover until the next ~30-min pull.
+                  mirrorDir: hindsightConsumerMirrorDir(repairConfig),
+                }),
+              degradeToSingleContainer: () => {
+                // Pool restore failed → stop the pool + the parked authority and
+                // relaunch a SOLE container on the PUBLIC port (single-container
+                // env, no pool caps) so memory.config.url is served again.
+                const uiPort = getRunningHindsightPorts()?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT;
+                stopHindsightRecallPool();
+                stopHindsight();
+                startHindsight(
+                  { apiPort: repairPublicPort, uiPort },
+                  repairLitellm,
+                  effectiveTag,
+                  repairLlm,
+                  hindsightConsumerMirrorDir(repairConfig),
+                  repairGpu.enabled,
+                  { env: repairConfig.hindsight?.env, memLimit: repairConfig.hindsight?.mem_limit },
+                  repairCpAccessKey,
+                );
+              },
+              log: (m) => console.log(chalk.gray(m)),
+            });
+            switch (repairResult.outcome) {
+              case "split":
+                console.log(
+                  chalk.green(
+                    `\n  Recall pool restored on ${repairPublicPort} ` +
+                      `(authority on ${repairBasePorts.apiPort}).\n`,
+                  ),
+                );
+                break;
+              case "degraded-single-container":
+                console.log(
+                  chalk.yellow(
+                    `\n  ! Recall pool failed (${repairResult.reason}); DEGRADED to a single ` +
+                      `container on the public port ${repairPublicPort}. memory.config.url IS ` +
+                      `served, but the recall split is OFF — inspect \`docker logs ` +
+                      `${HINDSIGHT_RECALL_POOL_CONTAINER}\` and re-run \`switchroom memory setup ` +
+                      `--recreate\` once fixed, or set hindsight.recall_pool.enabled: false.\n`,
+                  ),
+                );
+                break;
+              case "authority-unhealthy":
+                console.error(
+                  chalk.red(
+                    `\n  The running authority container is not answering /health on ` +
+                      `${repairBasePorts.apiPort}; cannot restore the pool. Inspect ` +
+                      `\`docker logs switchroom-hindsight\` and re-run \`switchroom memory setup ` +
+                      `--recreate\`.\n`,
+                  ),
+                );
+                process.exit(1);
+                break;
+              case "degrade-failed":
+                console.error(
+                  chalk.red(
+                    `\n  Recall pool restore failed AND the single-container fallback could not ` +
+                      `bind the public port ${repairPublicPort}. Inspect \`docker logs ` +
+                      `switchroom-hindsight\` and \`docker logs ${HINDSIGHT_RECALL_POOL_CONTAINER}\`, ` +
+                      `then re-run \`switchroom memory setup --recreate\`.\n`,
+                  ),
+                );
+                process.exit(1);
+                break;
+            }
+          } catch (err) {
+            console.error(chalk.red(`\n  Failed to restore the recall pool: ${(err as Error).message}\n`));
+            process.exit(1);
+          }
+          // Anchor memory.config.url on the public port (unchanged when it was
+          // already pinned there; written when config had no url yet).
+          const repairUrl = `http://127.0.0.1:${repairPublicPort}/mcp/`;
+          try {
+            if (persistMemoryConfigUrl(getConfigPath(program), "claude-code", repairUrl)) {
+              console.log(chalk.gray(`  Updated ${getConfigPath(program)} with memory.config.url = ${repairUrl}`));
+            }
+          } catch (err) {
+            console.error(
+              chalk.yellow(`  Note: could not auto-update switchroom.yaml: ${(err as Error).message}`),
+            );
+          }
+          return;
+        }
+        // Running ≠ serving. If the authority is parked on a port that is not
+        // the one memory.config.url declares, and no pool is bound there, the
+        // fleet's memory endpoint refuses — the half-built topology a
+        // split→single toggle (or a removed pool) leaves behind, durable across
+        // reboots via `--restart always`. Refuse to report success over it.
+        const liveApiPort = getRunningHindsightPorts()?.apiPort;
+        const liveConfigUrlPort = ((): number | undefined => {
+          try {
+            const p = Number(new URL(getConfig(program).memory?.config?.url ?? "").port);
+            return Number.isInteger(p) && p > 0 ? p : undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+        if (
+          publicPortIsUnserved({
+            configUrlPort: liveConfigUrlPort,
+            authorityApiPort: liveApiPort,
+            poolRunning: isHindsightRecallPoolRunning(),
+          })
+        ) {
+          console.error(
+            chalk.red(
+              `\n  switchroom-hindsight is running on port ${liveApiPort}, but ` +
+                `memory.config.url points at ${liveConfigUrlPort} and nothing is serving ` +
+                `it — fleet memory is DOWN.\n` +
+                `  Run \`switchroom memory setup --recreate\` to rebind it to ` +
+                `${liveConfigUrlPort}, or set hindsight.recall_pool.enabled: true to restore ` +
+                `the recall pool on the public port.\n`,
+            ),
+          );
+          process.exit(1);
+        }
         console.log(chalk.green("\n  Hindsight container is already running (switchroom-hindsight).\n"));
         return;
       }
@@ -954,106 +1162,136 @@ export function registerMemoryCommand(program: Command): void {
         }
       }
 
+      // Always stop the recall pool before touching the authority container:
+      // it connects to the authority container's pg0, so it must release those
+      // connections before the pg0 blip. No-op (best-effort) when the split is
+      // off or the pool isn't running. It is relaunched below when configured.
+      stopHindsightRecallPool();
       if (isHindsightContainerExists()) {
         console.log(chalk.gray("  Removing existing switchroom-hindsight container..."));
         stopHindsight();
       }
 
-      // Reuse the prior ports on --recreate; otherwise pick host ports —
-      // upstream defaults first, fall back to 18888/19999 if 8888/9999 are
-      // already bound.
-      let ports: { apiPort: number; uiPort: number };
+      // Resolve the recall/background split config UP FRONT: it changes how
+      // ports are assigned (the authority container moves to public+1 and the
+      // pool owns the public port), so the single-container port-reuse warnings
+      // below must not fire when the split owns port assignment deterministically.
+      // Defensive parse (mirrors the other optional config reads on this path):
+      // a malformed recall_pool block degrades to the single-container topology
+      // rather than aborting the launch.
+      let recallPoolCfg: ReturnType<typeof resolveRecallPoolConfig>;
+      try {
+        recallPoolCfg = resolveRecallPoolConfig(
+          getConfig(program).hindsight?.recall_pool,
+        );
+      } catch (err) {
+        console.log(
+          chalk.yellow(
+            `  ! Ignoring hindsight.recall_pool (${(err as Error).message}); ` +
+            `starting the single-container topology.`,
+          ),
+        );
+        recallPoolCfg = null;
+      }
+
+      // ── Port assignment ──────────────────────────────────────────────────
+      // The PUBLIC api port (memory.config.url, the port every agent hits) is
+      // derived UNCONDITIONALLY — before and independent of the recall-split
+      // branch — so toggling `hindsight.recall_pool.enabled` never moves it.
+      // See resolveHindsightLaunchPorts for the precedence. The UI port has no
+      // split semantics: reuse it on --recreate, else pick a free one.
+      let uiPort: number;
       if (reusePorts) {
-        ports = reusePorts;
-        // Migration hazard: --recreate pins the container to the SAME host
-        // port it currently publishes, but fresh scaffolding now defaults
-        // memory.config.url to HINDSIGHT_DEFAULT_API_PORT (18888). If the
-        // reused port diverges AND no agent has an explicit memory.config.url,
-        // agents may be repointed to a dead URL. Warn loudly; do NOT
-        // auto-migrate (too risky mid-recreate).
-        if (reusePorts.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
-          let explicitUrl: string | undefined;
-          try {
-            explicitUrl = getConfig(program).memory?.config?.url;
-          } catch {
-            explicitUrl = undefined;
-          }
-          if (!explicitUrl) {
-            console.log(
-              chalk.yellow(
-                `\n  ⚠  MIGRATION HAZARD: reusing stale host port ${reusePorts.apiPort} ` +
-                `for switchroom-hindsight, but scaffolding now defaults to ` +
-                `${HINDSIGHT_DEFAULT_API_PORT} and no explicit memory.config.url is set.`,
-              ),
-            );
-            console.log(
-              chalk.yellow(
-                `  Agents may be repointed to a dead URL (http://127.0.0.1:${HINDSIGHT_DEFAULT_API_PORT}/mcp/) ` +
-                `while the container listens on ${reusePorts.apiPort}.`,
-              ),
-            );
-            console.log(
-              chalk.yellow(
-                `  Fix: set memory.config.url: http://127.0.0.1:${reusePorts.apiPort}/mcp/ explicitly, ` +
-                `or migrate the container to port ${HINDSIGHT_DEFAULT_API_PORT}.\n`,
-              ),
-            );
-          }
-        }
+        uiPort = reusePorts.uiPort;
       } else {
         try {
-          ports = await pickHindsightPorts();
+          uiPort = (await pickHindsightPorts()).uiPort;
         } catch (err) {
           console.error(chalk.red(`\n  ${(err as Error).message}\n`));
           process.exit(1);
         }
       }
-      if (ports.apiPort !== HINDSIGHT_DEFAULT_API_PORT) {
+
+      // The port already persisted in memory.config.url is authoritative (an
+      // operator pin, or the port THIS launcher wrote last time — a split-on
+      // launch persists the pool's PUBLIC port, so a later split→single
+      // recreate reads the public port back rather than the parked authority's
+      // public+1). Parse defensively: a malformed url falls through to reuse /
+      // default rather than crashing the launch.
+      const configUrlPort = ((): number | undefined => {
+        try {
+          const p = Number(new URL(getConfig(program).memory?.config?.url ?? "").port);
+          return Number.isInteger(p) && p > 0 ? p : undefined;
+        } catch {
+          return undefined;
+        }
+      })();
+
+      const { publicApiPort, basePorts } = resolveHindsightLaunchPorts({
+        recallEnabled: recallPoolCfg != null,
+        configUrlPort,
+        reuseApiPort: reusePorts?.apiPort,
+        uiPort,
+        defaultApiPort: HINDSIGHT_DEFAULT_API_PORT,
+      });
+
+      // Migration note (single-container, --recreate, url unset, non-default
+      // reused port): agents without an explicit memory.config.url follow
+      // whatever we persist below. We persist the ACTUAL bound port
+      // (publicApiPort, which equals the reused port here), so there is no
+      // dead-URL repoint — but surface the divergence from the scaffolding
+      // default so the operator can choose to migrate deliberately. Suppressed
+      // under the split: the authority intentionally sits at public+1 and the
+      // pool owns the public port, which is anchored on config.
+      if (
+        !recallPoolCfg &&
+        configUrlPort == null &&
+        reusePorts &&
+        reusePorts.apiPort !== HINDSIGHT_DEFAULT_API_PORT
+      ) {
         console.log(
           chalk.yellow(
-            `  Port ${HINDSIGHT_DEFAULT_API_PORT} is already in use; ` +
-            `using ${ports.apiPort}/${ports.uiPort} instead.`
-          )
+            `\n  Note: reusing host port ${reusePorts.apiPort} for switchroom-hindsight ` +
+            `(scaffolding default is ${HINDSIGHT_DEFAULT_API_PORT}); memory.config.url will be ` +
+            `pinned to ${reusePorts.apiPort} so agents follow the live port. Migrate deliberately ` +
+            `if you want ${HINDSIGHT_DEFAULT_API_PORT}.\n`,
+          ),
         );
       }
 
-      // Preflight: NEVER hand an occupied host port to `docker run` — that's
-      // the 2026-07 outage (the --recreate path reused the previously-bound
-      // port with no free-check, so hindsight crash-looped on `[Errno 98]
-      // address already in use` while fleet memory was silently down). The
-      // reuse path (getRunningHindsightPorts) especially bypasses
-      // pickHindsightPorts entirely, so re-validate here for BOTH paths.
-      let conflict = await preflightHindsightPorts(ports);
-      if (conflict) {
-        const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+      if (recallPoolCfg) {
         console.log(
-          chalk.yellow(
-            `\n  Chosen Hindsight port ${conflict.port} is occupied${heldBy}; ` +
-            `selecting a free port instead of crash-looping.`,
+          chalk.gray(
+            `  recall_pool enabled: authority (pg0 + background) on ${basePorts.apiPort}, ` +
+              `${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}.`,
           ),
         );
-        // Re-pick from scratch (skips the occupied port via findFreePort).
-        try {
-          ports = await pickHindsightPorts();
-        } catch (err) {
-          console.error(chalk.red(`\n  ${(err as Error).message}\n`));
-          process.exit(1);
-        }
-        conflict = await preflightHindsightPorts(ports);
+      }
+
+      // Preflight EVERY host port we hand `docker run`: basePorts for the
+      // (authority|sole) container, plus the public port when the pool binds
+      // it. NEVER hand an occupied port to docker — that's the 2026-07 outage
+      // (the --recreate path reused the previously-bound port with no
+      // free-check, so hindsight crash-looped on `[Errno 98] address already in
+      // use` while fleet memory was silently down). Both our own containers
+      // were stopped above, so a conflict here is a genuine FOREIGN holder:
+      // refuse with guidance rather than silently relocating the public port
+      // (which would defeat the config anchor and strand agents' memory.config.url).
+      const portsToBind = recallPoolCfg
+        ? [publicApiPort, basePorts.apiPort, basePorts.uiPort]
+        : [basePorts.apiPort, basePorts.uiPort];
+      for (const p of portsToBind) {
+        const conflict = await preflightHindsightPorts({ apiPort: p, uiPort: p });
         if (conflict) {
-          const stillHeldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
+          const heldBy = conflict.holder ? ` (held by ${conflict.holder})` : "";
           console.error(
             chalk.red(
-              `\n  Refusing to start Hindsight: port ${conflict.port} is still ` +
-              `occupied${stillHeldBy} after reassignment. Free it and retry ` +
-              `\`switchroom memory --start\`.\n`,
+              `\n  Refusing to start Hindsight: port ${conflict.port} is occupied${heldBy}. ` +
+              `Free it and retry \`switchroom memory setup --recreate\`.\n`,
             ),
           );
           process.exit(1);
         }
-        console.log(
-          chalk.green(`  Reassigned Hindsight to port ${ports.apiPort}/${ports.uiPort}.`),
-        );
       }
 
       // RFC H §4.8 — hindsight runs in broker-fed mode against the
@@ -1110,8 +1348,15 @@ export function registerMemoryCommand(program: Command): void {
         )) {
           console.log(chalk.yellow(`  ! ${hindsightLlmDroppedKeyWarning(drop)}`));
         }
+        // When the split is on, the authority container caps its own DB pools
+        // (write 40 / read 20) to free connection headroom for the pool's N
+        // workers. These ride the operator-override path (the keys are in
+        // HINDSIGHT_PERF_ENV_KEYS); an explicit `hindsight.env` still wins.
+        const authorityEnv = recallPoolCfg
+          ? { ...backgroundContainerPoolEnv(), ...(hindsightConfig.hindsight?.env ?? {}) }
+          : hindsightConfig.hindsight?.env;
         startHindsight(
-          ports,
+          basePorts,
           litellmCfg,
           effectiveTag,
           resolvedLlm,
@@ -1127,7 +1372,7 @@ export function registerMemoryCommand(program: Command): void {
           // hard-coded default while leaving the operator's `shared_buffers`
           // standing — see resolveHindsightMemLimit.
           {
-            env: hindsightConfig.hindsight?.env,
+            env: authorityEnv,
             memLimit: hindsightConfig.hindsight?.mem_limit,
           },
           // Resolved `hindsight.cp_access_key`. Absent ⇒ the CP dashboard has
@@ -1137,14 +1382,117 @@ export function registerMemoryCommand(program: Command): void {
         if (litellmCfg) {
           console.log(chalk.gray("  LiteLLM routing enabled for hindsight (--network host)."));
         }
-        console.log(chalk.green(`\n  Hindsight container started (switchroom-hindsight) on port ${ports.apiPort}.\n`));
+
+        // ── Recall pool launch (health-gated ordering) ─────────────────────
+        // Order mirrors the hand-applied swap: wait for the authority
+        // container's pg0 to answer /health before starting the pool (else the
+        // pool crash-loops on connection-refused), then wait for the pool to
+        // bind the public port before declaring memory.config.url live.
+        if (recallPoolCfg) {
+          // Health-gate + own the pool-failure fallback through the SHARED
+          // orchestrator so this path and first-run `switchroom setup` cannot
+          // diverge. On pool-health failure we DEGRADE to a single container on
+          // the public port rather than exit into a fleet-wide memory outage
+          // (the authority is parked on public+1 with nothing on the public
+          // port, so every agent's memory.config.url would refuse).
+          const launchResult = await launchRecallPoolHealthGated({
+            publicApiPort,
+            authorityApiPort: basePorts.apiPort,
+            workers: recallPoolCfg.workers,
+            waitForHealthy: (p) => waitForHindsightHealthy(p),
+            stopPool: () => stopHindsightRecallPool(),
+            startPool: () =>
+              startHindsightRecallPool({
+                cfg: recallPoolCfg,
+                poolPort: publicApiPort,
+                imageTag: effectiveTag,
+                litellm: litellmCfg,
+                llm: resolvedLlm,
+                gpu: gpuDecision.enabled,
+                perf: {
+                  env: authorityEnv,
+                  memLimit: hindsightConfig.hindsight?.mem_limit,
+                },
+                cpAccessKey,
+                // Same creds mode as the authority (#2578) — see the repair
+                // path above; the pool's reflect lane needs pushed creds too.
+                mirrorDir: hindsightConsumerMirrorDir(hindsightConfig),
+              }),
+            degradeToSingleContainer: () => {
+              // Stop the pool + the parked authority and relaunch a SOLE
+              // container on the PUBLIC port with the single-container env (no
+              // background pool caps), so memory.config.url is served again.
+              stopHindsightRecallPool();
+              stopHindsight();
+              startHindsight(
+                { apiPort: publicApiPort, uiPort: basePorts.uiPort },
+                litellmCfg,
+                effectiveTag,
+                resolvedLlm,
+                hindsightConsumerMirrorDir(hindsightConfig),
+                gpuDecision.enabled,
+                { env: hindsightConfig.hindsight?.env, memLimit: hindsightConfig.hindsight?.mem_limit },
+                cpAccessKey,
+              );
+            },
+            log: (m) => console.log(chalk.gray(m)),
+          });
+          switch (launchResult.outcome) {
+            case "split":
+              console.log(
+                chalk.green(
+                  `\n  Hindsight recall split started: authority (pg0 + background) on ` +
+                    `${basePorts.apiPort}, ${recallPoolCfg.workers}-worker recall pool on ${publicApiPort}.\n`,
+                ),
+              );
+              break;
+            case "degraded-single-container":
+              console.log(
+                chalk.yellow(
+                  `\n  ! Recall pool failed (${launchResult.reason}); DEGRADED to a single ` +
+                    `container on the public port ${publicApiPort}. memory.config.url IS served, ` +
+                    `but the recall split is OFF — inspect \`docker logs ` +
+                    `${HINDSIGHT_RECALL_POOL_CONTAINER}\` and re-run \`switchroom memory setup ` +
+                    `--recreate\` once fixed, or set hindsight.recall_pool.enabled: false.\n`,
+                ),
+              );
+              break;
+            case "authority-unhealthy":
+              console.error(
+                chalk.red(
+                  `\n  Authority container did not become healthy on ${basePorts.apiPort}. ` +
+                    `The recall pool was NOT started and no single container could share its ` +
+                    `pg0. Investigate \`docker logs switchroom-hindsight\` and re-run ` +
+                    `\`switchroom memory setup --recreate\`.\n`,
+                ),
+              );
+              process.exit(1);
+              break;
+            case "degrade-failed":
+              console.error(
+                chalk.red(
+                  `\n  Recall pool did not become healthy on ${publicApiPort} AND the ` +
+                    `single-container fallback also failed to bind the public port. Inspect ` +
+                    `\`docker logs switchroom-hindsight\` and \`docker logs ` +
+                    `${HINDSIGHT_RECALL_POOL_CONTAINER}\`, then re-run \`switchroom memory setup ` +
+                    `--recreate\`.\n`,
+                ),
+              );
+              process.exit(1);
+              break;
+          }
+        } else {
+          console.log(chalk.green(`\n  Hindsight container started (switchroom-hindsight) on port ${basePorts.apiPort}.\n`));
+        }
       } catch (err) {
         console.error(chalk.red(`\n  Failed to start Hindsight: ${(err as Error).message}\n`));
         process.exit(1);
       }
 
-      // Update switchroom.yaml with the chosen URL so agents pick it up
-      const url = `http://127.0.0.1:${ports.apiPort}/mcp/`;
+      // Update switchroom.yaml with the chosen URL so agents pick it up. The
+      // public port (pool port when the split is on) — never the authority
+      // container's public+1 port — so agents keep hitting the same URL.
+      const url = `http://127.0.0.1:${publicApiPort}/mcp/`;
       const configPath = getConfigPath(program);
       try {
         if (persistMemoryConfigUrl(configPath, provider, url)) {

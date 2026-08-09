@@ -62,6 +62,71 @@ now an anomaly worth investigating, not the norm.
   `dev` → `devOptional`, which is npm correctly recording nostr-tools' optional
   `typescript` peer.
 
+### Hindsight: the recall/background worker split is now a first-class, opt-in topology
+
+- **New `hindsight.recall_pool` config provisions the recall/background split
+  that was previously applied by hand and reverted by every recreate.** When
+  `hindsight.recall_pool.enabled: true`, BOTH launch paths provision the split —
+  `switchroom memory setup --recreate` and first-run `switchroom setup` (so a
+  fresh host, and a `switchroom apply` that finds the authority up but the pool
+  dead, both build/restore it rather than silently honouring the knob on only
+  one path). It keeps `switchroom-hindsight` as the AUTHORITY container (embedded pg0, the
+  single background WorkerPoller, migrations, control plane, healthcheck) but
+  moves it OFF the public port onto public+1, and launches a NEW
+  `switchroom-hindsight-recall` sibling on the unchanged public port: N uvicorn
+  workers, background poller OFF, connecting to the authority container's pg0
+  over host-network loopback. It serves recall/reflect only. Measured ~2.2x
+  recall throughput with the split on. `memory.config.url` never moves, so every
+  agent's memory client is unaffected.
+- **OFF by default, strictly backward-compatible.** Absent or
+  `enabled: false` ⇒ the single-container path is byte-for-byte unchanged and no
+  second container is created. Only the literal boolean `true` opts in.
+- **The connection budget is enforced, not hoped for.** pg0 runs
+  `max_connections=250`; the authority container reserves 60 (write 40 / read
+  20) and the pool's per-worker DB pools are auto-sized from the remaining
+  budget (default 4 workers, GPU-reranker-VRAM-bound above that). An operator
+  override that would overflow the ceiling is a hard failure at resolve/launch
+  (`assertRecallPoolConnectionBudget`), not a mid-load Postgres `FATAL: too many
+  clients`. Launch is health-gated: the authority container's pg0 must answer
+  `/health` before the pool starts, and the pool must bind the public port
+  before `memory.config.url` is declared live.
+- **A pool-boot failure now DEGRADES to single-container instead of taking
+  fleet memory down.** When the pool fails its health gate the authority is
+  parked on public+1 with nothing on the public port, so every agent's
+  `memory.config.url` would refuse — a total memory outage the crash-loop path
+  (`switchroom update` → `memory setup --recreate` on a bad worker count / OOM /
+  image regression) could hit. Both launch paths now fall back through one
+  shared orchestrator (`launchRecallPoolHealthGated`): stop the pool + the
+  parked authority and relaunch a sole container on the PUBLIC port, so the
+  fleet's memory endpoint stays served; only a fallback that ALSO fails is a
+  loud error. Bare `switchroom memory setup` (no `--recreate`) on an
+  authority-up/pool-dead split now performs the same pool repair the wizard
+  does instead of reporting "already running" over the unbound public port.
+- **"The container is running" no longer counts as "memory works".** Both
+  already-running paths (`switchroom setup` step 6 and bare `switchroom memory
+  setup`) now refuse to report success when `switchroom-hindsight` is bound to a
+  port that is NOT the one `memory.config.url` declares and no recall pool is
+  serving it. That half-built topology — reachable by turning the split on and
+  then removing the pool (or setting `enabled: false`) without `--recreate` —
+  survives reboots on `--restart always`, so it is a silent, durable, fleet-wide
+  memory outage that every "is hindsight running?" check answers "yes" to.
+  Positive-evidence-only: no `memory.config.url` pin, or an unreadable container
+  port, yields no verdict rather than a manufactured refusal.
+- **`switchroom memory --status` and the web dashboard report the AUTHORITY
+  container's status, not the pool's.** `docker ps --filter
+  name=switchroom-hindsight` is a substring match that also returns
+  `switchroom-hindsight-recall`, newest-created first — so on a split deployment
+  the status projection returned the POOL's "Up 2 minutes (healthy)" while the
+  authority sat in `Exited (1)`, hiding an outage on the two surfaces an
+  operator reaches for during one.
+- **The recall pool now shares the authority's credential mode (#2578).** The
+  pool serves `reflect`, which spends the hindsight consumer's OAuth
+  credentials, but it mounted a private tmpfs unconditionally — so with mirror
+  mode on, a broker account failover pushed fresh credentials to the authority
+  while the pool kept serving reflect on credentials up to a pull interval
+  stale. `mirrorDir` is now threaded to every pool launch: the shared mirror
+  volume when the consumer has one, tmpfs (unchanged) when it does not.
+
 ### Hindsight: an agent can finally read its own knowledge pages
 
 - **The MCP shim now synthesizes three GET-only knowledge-page tools —

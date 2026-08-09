@@ -1761,6 +1761,33 @@ export const HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES: ReadonlyMap<string, string>
 );
 
 /**
+ * The DB/worker/DSN env keys the recall/background split
+ * (src/setup/hindsight-recall-pool.ts) uses that switchroom does NOT emit on
+ * the single-container path.
+ *
+ * They are added to {@link HINDSIGHT_PERF_ENV_KEYS} for two reasons:
+ *   1. So the same knobs are reachable declaratively through `hindsight.env` —
+ *      the background/authority container's DB-pool caps ride the existing
+ *      `resolveHindsightPerfOverrides` path rather than a bespoke one.
+ *   2. So `switchroom doctor`'s unmanaged-key check
+ *      ({@link findUnmanagedHindsightEnvKeys}) does not flag them as drift when
+ *      an operator declares the split in `hindsight.env`.
+ *
+ * Defined here (the allowlist owner) rather than in the recall-pool module to
+ * avoid an import cycle (recall-pool → hindsight → hindsight-perf-defaults).
+ * The recall-pool module re-exports the union it emits from this constant.
+ */
+export const HINDSIGHT_RECALL_POOL_ENV_KEYS: readonly string[] = [
+  "HINDSIGHT_API_WORKERS",
+  "HINDSIGHT_API_WORKER_ENABLED",
+  "HINDSIGHT_API_DATABASE_URL",
+  "HINDSIGHT_API_DB_URL",
+  "HINDSIGHT_API_DB_POOL_MAX_SIZE",
+  "HINDSIGHT_API_READ_DB_POOL_MAX_SIZE",
+  "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP",
+];
+
+/**
  * Every key this module manages — and therefore the exact set an operator may
  * override through `hindsight.env` / the process environment.
  *
@@ -1782,6 +1809,9 @@ export const HINDSIGHT_PERF_ENV_KEYS: ReadonlySet<string> = new Set([
   // {@link HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES}.
   ...HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.keys(),
   ...HINDSIGHT_WORKER_RESERVED_SLOT_ALIASES.values(),
+  // The recall/background-split DB/worker/DSN keys — reachable via
+  // `hindsight.env` and non-drift on a split deployment (see above).
+  ...HINDSIGHT_RECALL_POOL_ENV_KEYS,
 ]);
 
 /**
