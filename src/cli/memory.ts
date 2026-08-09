@@ -56,10 +56,15 @@ import {
   stopHindsightRecallPool,
   isHindsightRecallPoolRunning,
   publicPortIsUnserved,
+  planStaleRecallPoolConvergence,
+  convergeStaleRecallPool,
   waitForHindsightHealthy,
   launchRecallPoolHealthGated,
-  backgroundContainerPoolEnv,
+  splitContainerPerfEnv,
+  splitDbPoolEnvConflicts,
+  splitDbPoolEnvConflictWarning,
   HINDSIGHT_RECALL_POOL_CONTAINER,
+  type HindsightHealthRole,
   type RecallPoolConfig,
 } from "../setup/hindsight-recall-pool.js";
 import { assessHindsightGpuDrop } from "../setup/hindsight-gpu-guard.js";
@@ -852,15 +857,26 @@ export function registerMemoryCommand(program: Command): void {
             const { litellm: repairLitellm } = await resolveLiteLLMForHindsight(repairConfig);
             const repairLlm = await getResolvedLlm();
             const repairCpAccessKey = await resolveHindsightCpAccessKey(repairConfig);
-            const repairAuthorityEnv = {
-              ...backgroundContainerPoolEnv(),
-              ...(repairConfig.hindsight?.env ?? {}),
-            };
+            // The two split-managed DB-pool caps WIN over `hindsight.env` —
+            // the connection budget asserted at resolve time is only a proof if
+            // the containers launch with the asserted numbers. Say so rather
+            // than dropping the operator's declared value in silence.
+            for (const conflict of splitDbPoolEnvConflicts(
+              repairConfig.hindsight?.env,
+              noRecreatePoolCfg,
+            )) {
+              console.log(chalk.yellow(`  ! ${splitDbPoolEnvConflictWarning(conflict)}`));
+            }
+            const repairAuthorityEnv = splitContainerPerfEnv(repairConfig.hindsight?.env);
             const repairResult = await launchRecallPoolHealthGated({
               publicApiPort: repairPublicPort,
               authorityApiPort: repairBasePorts.apiPort,
               workers: noRecreatePoolCfg.workers,
-              waitForHealthy: (p) => waitForHindsightHealthy(p),
+              // Role-aware deadline: the authority's first boot pays pg0
+              // initdb + the migration chain and needs far more headroom than
+              // the pool, which runs neither.
+              waitForHealthy: (p, role) =>
+                waitForHindsightHealthy(p, { role, workers: noRecreatePoolCfg!.workers }),
               stopPool: () => stopHindsightRecallPool(),
               startPool: () =>
                 startHindsightRecallPool({
@@ -967,7 +983,8 @@ export function registerMemoryCommand(program: Command): void {
         // fleet's memory endpoint refuses — the half-built topology a
         // split→single toggle (or a removed pool) leaves behind, durable across
         // reboots via `--restart always`. Refuse to report success over it.
-        const liveApiPort = getRunningHindsightPorts()?.apiPort;
+        const livePorts = getRunningHindsightPorts();
+        const liveApiPort = livePorts?.apiPort;
         const liveConfigUrlPort = ((): number | undefined => {
           try {
             const p = Number(new URL(getConfig(program).memory?.config?.url ?? "").port);
@@ -976,6 +993,102 @@ export function registerMemoryCommand(program: Command): void {
             return undefined;
           }
         })();
+        // MIRROR IMAGE of the pool-repair branch above: the split is DECLARED
+        // OFF but a pool container is still running. `publicPortIsUnserved`
+        // deliberately says "fine" (the pool IS serving the public port), which
+        // used to mean this printed "already running" and left an orphan
+        // container standing against declared config — durable across reboots
+        // via `--restart always`. Converge on the declared topology instead.
+        const stalePlan = planStaleRecallPoolConvergence({
+          recallEnabled: noRecreatePoolCfg !== null,
+          poolRunning: isHindsightRecallPoolRunning(),
+          authorityApiPort: liveApiPort,
+          configUrlPort: liveConfigUrlPort,
+        });
+        if (stalePlan.action !== "none") {
+          const staleConfig = getConfig(program);
+          const staleGpu = hindsightGpuDecision(
+            resolveHindsightGpuOverride({ flag: opts.gpu, config: staleConfig.hindsight?.gpu }),
+          );
+          try {
+            // Only the relaunch action launches a container, so only it needs
+            // secrets — removing an orphan must not spend broker round-trips.
+            const needsSecrets = stalePlan.action === "relaunch-single-on-public";
+            const staleLitellm = needsSecrets
+              ? (await resolveLiteLLMForHindsight(staleConfig)).litellm
+              : undefined;
+            const staleLlm = needsSecrets ? await getResolvedLlm() : undefined;
+            const staleCpAccessKey = needsSecrets
+              ? await resolveHindsightCpAccessKey(staleConfig)
+              : undefined;
+            const staleResult = await convergeStaleRecallPool({
+              plan: stalePlan,
+              stopPool: () => stopHindsightRecallPool(),
+              relaunchSingleOnPublic: (publicApiPort) => {
+                // ONE step: drop the pool holding the public port and the
+                // parked authority, then bring a sole container up ON the
+                // public port. convergeStaleRecallPool health-gates it before
+                // this is reported as success.
+                stopHindsightRecallPool();
+                stopHindsight();
+                startHindsight(
+                  { apiPort: publicApiPort, uiPort: livePorts?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT },
+                  staleLitellm,
+                  effectiveTag,
+                  staleLlm,
+                  hindsightConsumerMirrorDir(staleConfig),
+                  staleGpu.enabled,
+                  // Single-container env: no split DB-pool caps, so
+                  // `hindsight.env` is authoritative again — exactly what the
+                  // declared topology says.
+                  { env: staleConfig.hindsight?.env, memLimit: staleConfig.hindsight?.mem_limit },
+                  staleCpAccessKey,
+                );
+              },
+              waitForHealthy: (p, role) => waitForHindsightHealthy(p, { role }),
+              log: (m) => console.log(chalk.gray(m)),
+            });
+            switch (staleResult.outcome) {
+              case "pool-stopped":
+                console.log(
+                  chalk.green(
+                    "\n  Removed the orphan recall pool (hindsight.recall_pool is disabled).\n",
+                  ),
+                );
+                break;
+              case "relaunched-single":
+                console.log(
+                  chalk.green(
+                    `\n  Converged to the declared single-container topology on ` +
+                      `${staleResult.publicApiPort}.\n`,
+                  ),
+                );
+                break;
+              case "relaunch-failed":
+                console.error(
+                  chalk.red(
+                    `\n  hindsight.recall_pool is disabled, but the single container relaunched ` +
+                      `on the public port ${staleResult.publicApiPort} did not become healthy — ` +
+                      `nothing is serving fleet memory. Inspect \`docker logs ` +
+                      `switchroom-hindsight --tail 50\`, then re-run \`switchroom memory setup ` +
+                      `--recreate\`.\n`,
+                  ),
+                );
+                process.exit(1);
+                break;
+              case "nothing-to-do":
+                break;
+            }
+          } catch (err) {
+            console.error(
+              chalk.red(
+                `\n  Failed to converge the stale recall pool: ${(err as Error).message}\n`,
+              ),
+            );
+            process.exit(1);
+          }
+          return;
+        }
         if (
           publicPortIsUnserved({
             configUrlPort: liveConfigUrlPort,
@@ -1351,9 +1464,21 @@ export function registerMemoryCommand(program: Command): void {
         // When the split is on, the authority container caps its own DB pools
         // (write 40 / read 20) to free connection headroom for the pool's N
         // workers. These ride the operator-override path (the keys are in
-        // HINDSIGHT_PERF_ENV_KEYS); an explicit `hindsight.env` still wins.
+        // HINDSIGHT_PERF_ENV_KEYS) but they are MANAGED: they win over
+        // `hindsight.env`, because the connection budget asserted at resolve
+        // time is only a proof if the containers launch with the asserted
+        // numbers. A superseded operator value is warned about, not dropped
+        // silently.
+        if (recallPoolCfg) {
+          for (const conflict of splitDbPoolEnvConflicts(
+            hindsightConfig.hindsight?.env,
+            recallPoolCfg,
+          )) {
+            console.log(chalk.yellow(`  ! ${splitDbPoolEnvConflictWarning(conflict)}`));
+          }
+        }
         const authorityEnv = recallPoolCfg
-          ? { ...backgroundContainerPoolEnv(), ...(hindsightConfig.hindsight?.env ?? {}) }
+          ? splitContainerPerfEnv(hindsightConfig.hindsight?.env)
           : hindsightConfig.hindsight?.env;
         startHindsight(
           basePorts,
@@ -1399,7 +1524,11 @@ export function registerMemoryCommand(program: Command): void {
             publicApiPort,
             authorityApiPort: basePorts.apiPort,
             workers: recallPoolCfg.workers,
-            waitForHealthy: (p) => waitForHindsightHealthy(p),
+            // Role-aware deadline: the authority's first boot pays pg0 initdb
+            // + the migration chain, which the 150s flat default could expire
+            // mid-way through on a fresh host.
+            waitForHealthy: (p, role) =>
+              waitForHindsightHealthy(p, { role, workers: recallPoolCfg!.workers }),
             stopPool: () => stopHindsightRecallPool(),
             startPool: () =>
               startHindsightRecallPool({

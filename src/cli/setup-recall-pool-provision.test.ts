@@ -208,6 +208,134 @@ describe("stepMemoryBackend — recall-pool provisioning wiring", () => {
     expect(waitForHealthy.mock.calls.map((c) => c[0])).toEqual([18889, 18888, 18888]);
   });
 
+  it("CONVERGES a stale pool that still holds the public port when the split is disabled", async () => {
+    // The declared topology is single-container, but a pool container from a
+    // previous split is still bound to 18888 with the authority parked on
+    // 18889. `publicPortIsUnserved` correctly says this is not an outage (the
+    // pool IS serving 18888), which is exactly why this used to print "already
+    // running" and walk away, leaving an orphan container contradicting config
+    // and surviving reboots on `--restart always`.
+    const startContainer = vi.fn();
+    const stopContainer = vi.fn();
+    const stopRecallPool = vi.fn();
+    const waitForHealthy = vi.fn((_port: number) => Promise.resolve(true));
+
+    const splitDisabled = {
+      memory: { config: { url: "http://127.0.0.1:18888/mcp/" } },
+    } as unknown as SwitchroomConfig;
+
+    const outcome = await stepMemoryBackend(splitDisabled, true, tempConfigPath(), {
+      dockerProbe: makeDockerProbe({ authorityUp: true }),
+      recallPoolRunningProbe: () => true, // the stale pool is UP on 18888
+      runningPortsProbe: () => ({ apiPort: 18889, uiPort: 19999 }),
+      startContainer,
+      stopContainer,
+      stopRecallPool,
+      waitForHealthy,
+    });
+
+    expect(outcome).toEqual({ hindsightExpected: true, optedOut: false });
+    // The orphan is gone...
+    expect(stopRecallPool).toHaveBeenCalled();
+    // ...and the public port is SERVED by the declared single container, not
+    // left unbound. Stopping the pool alone would have been the outage.
+    expect(startContainer).toHaveBeenCalledTimes(1);
+    expect(startContainer.mock.calls[0][0]).toEqual(expect.objectContaining({ apiPort: 18888 }));
+    expect(stopContainer).toHaveBeenCalledTimes(1);
+    // And it is proven served before the step reports success.
+    expect(waitForHealthy).toHaveBeenCalledWith(18888, expect.anything());
+  });
+
+  it("fails loud when the converged single container never binds the public port", async () => {
+    const startContainer = vi.fn();
+    const splitDisabled = {
+      memory: { config: { url: "http://127.0.0.1:18888/mcp/" } },
+    } as unknown as SwitchroomConfig;
+
+    await expect(
+      stepMemoryBackend(splitDisabled, true, tempConfigPath(), {
+        dockerProbe: makeDockerProbe({ authorityUp: true }),
+        recallPoolRunningProbe: () => true,
+        runningPortsProbe: () => ({ apiPort: 18889, uiPort: 19999 }),
+        startContainer,
+        stopContainer: vi.fn(),
+        stopRecallPool: vi.fn(),
+        waitForHealthy: vi.fn(() => Promise.resolve(false)),
+      }),
+    ).rejects.toThrow(/Memory backend setup failed:.*did not become healthy/s);
+  });
+
+  it("drops the orphan pool WITHOUT bouncing an authority that already serves the public port", async () => {
+    // Same stale-pool state, but the authority is already on 18888. There is
+    // nothing to hand over, so the convergence must not restart anything — a
+    // gratuitous relaunch here is a memory blip for the whole fleet.
+    const startContainer = vi.fn();
+    const stopContainer = vi.fn();
+    const stopRecallPool = vi.fn();
+
+    const splitDisabled = {
+      memory: { config: { url: "http://127.0.0.1:18888/mcp/" } },
+    } as unknown as SwitchroomConfig;
+
+    const outcome = await stepMemoryBackend(splitDisabled, true, tempConfigPath(), {
+      dockerProbe: makeDockerProbe({ authorityUp: true }),
+      recallPoolRunningProbe: () => true,
+      runningPortsProbe: () => ({ apiPort: 18888, uiPort: 19999 }),
+      startContainer,
+      stopContainer,
+      stopRecallPool,
+      waitForHealthy: vi.fn(() => Promise.resolve(true)),
+    });
+
+    expect(outcome).toEqual({ hindsightExpected: true, optedOut: false });
+    expect(stopRecallPool).toHaveBeenCalled();
+    expect(startContainer).not.toHaveBeenCalled();
+    expect(stopContainer).not.toHaveBeenCalled();
+  });
+
+  it("ships the MANAGED db-pool caps and says so when hindsight.env conflicts", async () => {
+    // The operator pins a 100-connection write pool in `hindsight.env`. Honour
+    // it on the authority and the connection budget the launch asserted
+    // (background 60) is a fiction — 100 + 20 + 4x45 = 300 against pg0's 250.
+    // The managed value must ship, and the operator must be TOLD, not left to
+    // discover it in `docker inspect`.
+    const logs: string[] = [];
+    const logSpy = vi
+      .spyOn(console, "log")
+      .mockImplementation((...args: unknown[]) => void logs.push(args.join(" ")));
+    const startRecallPool = vi.fn();
+    try {
+      const config = {
+        hindsight: {
+          recall_pool: { enabled: true, workers: 4 },
+          env: { HINDSIGHT_API_DB_POOL_MAX_SIZE: "100" },
+        },
+        memory: { config: { url: "http://127.0.0.1:18888/mcp/" } },
+      } as unknown as SwitchroomConfig;
+
+      await stepMemoryBackend(config, true, tempConfigPath(), {
+        dockerProbe: makeDockerProbe({ authorityUp: true }),
+        recallPoolRunningProbe: () => false,
+        startContainer: vi.fn(),
+        startRecallPool,
+        waitForHealthy: vi.fn(() => Promise.resolve(true)),
+        stopRecallPool: vi.fn(),
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(startRecallPool).toHaveBeenCalledTimes(1);
+    // 40 is the split's background cap; 100 is the operator's, which cannot be
+    // honoured without overflowing pg0.
+    expect(startRecallPool.mock.calls[0][0].perf.env.HINDSIGHT_API_DB_POOL_MAX_SIZE).toBe("40");
+    expect(
+      logs.some(
+        (l) => l.includes("HINDSIGHT_API_DB_POOL_MAX_SIZE") && l.includes("IGNORED"),
+      ),
+    ).toBe(true);
+  });
+
   it("REFUSES success when the authority is parked off the public port with no pool", async () => {
     // The production outage shape: the split was turned on (authority moved to
     // 18889), then the pool was removed / `enabled` set back to false WITHOUT

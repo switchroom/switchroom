@@ -31,6 +31,40 @@ now an anomaly worth investigating, not the norm.
   (`src/litellm/callback-mount-guard.ts`), and `docker/litellm-pacer/README.md`
   documents the database as the only durable place to put the mount.
 
+- **hindsight: recall-pool split follow-ups — first-boot health headroom, an
+  audible `hindsight.env` conflict, and convergence on a disabled split.** Three
+  low-severity gaps left open when the recall/background worker split landed.
+  (1) The health gate used one flat 150s deadline for every wait, but with the
+  split on a fresh host the AUTHORITY container answers `/health` only after pg0
+  `initdb`, extension creation, and the whole first-boot migration chain — a
+  boot that outran the deadline was read as `authority-unhealthy` and failed the
+  launch, self-healing only because a re-run took the repair branch. The
+  deadline is now composed from the phases each container actually runs
+  (`hindsightHealthTimeoutMs`): 240s for the pg0 owner, an api-startup budget
+  plus per-worker model-load time for the pool, and never below the 150s the
+  flat default used, so no path gets a tighter deadline than before.
+  (2) A `hindsight.env` entry for `HINDSIGHT_API_DB_POOL_MAX_SIZE` /
+  `HINDSIGHT_API_READ_DB_POOL_MAX_SIZE` used to win on the authority container
+  and lose on the pool — the same key, two opposite silent outcomes, and the
+  winning half quietly falsified the 60-connection background reserve that the
+  connection-budget assertion proves `≤ 240` against (an operator's 100 would
+  have taken the split to 300 against pg0's 250, i.e. the `FATAL: too many
+  clients` the budget exists to prevent, reached by a path the budget never
+  saw). Both containers now take the split's computed cap, and every superseded
+  key is named in a warning that points at `hindsight.recall_pool.db_pool_max_size`
+  — the knob that IS budget-checked. Only these two keys are managed; the rest
+  of `hindsight.env` is untouched, and with the split off nothing changes.
+  (3) With `hindsight.recall_pool.enabled` false but a pool container still
+  running, `switchroom setup` and `switchroom memory setup` reported "already
+  running" and left the orphan up, contradicting declared config and surviving
+  reboots on `--restart always`. They now converge: the pool is dropped outright
+  when the authority already serves the public port, and when the pool HOLDS the
+  public port the authority is relaunched onto it as one step and the port is
+  health-gated before success is reported — never left unbound, which is the
+  outage the split's `publicPortIsUnserved` guard exists to refuse. With no
+  declared public port or an unreadable authority port there is no positive
+  evidence to act on, so nothing is touched.
+
 - **telegraph: `**>` expandable blockquotes render correctly in Instant View
   pages.** `markdownToTelegraphNodes` — the Telegra.ph node builder used when a
   telegraph-enabled agent's reply exceeds the ~3000-char threshold — matched

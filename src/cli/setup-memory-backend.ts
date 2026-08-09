@@ -33,10 +33,15 @@ import {
   stopHindsightRecallPool,
   isHindsightRecallPoolRunning,
   publicPortIsUnserved,
-  backgroundContainerPoolEnv,
+  planStaleRecallPoolConvergence,
+  convergeStaleRecallPool,
+  splitContainerPerfEnv,
+  splitDbPoolEnvConflicts,
+  splitDbPoolEnvConflictWarning,
   waitForHindsightHealthy,
   launchRecallPoolHealthGated,
   HINDSIGHT_RECALL_POOL_CONTAINER,
+  type HindsightHealthRole,
   type RecallPoolConfig,
 } from "../setup/hindsight-recall-pool.js";
 import type { getViaBrokerStructured } from "../vault/broker/client.js";
@@ -337,8 +342,24 @@ export async function stepMemoryBackend(
     recallPoolCfg = null;
   }
 
+  // A `hindsight.env` line for one of the split-managed DB-pool caps cannot
+  // reach either container while the split is on (the split computes both, and
+  // the connection budget is only provable if it does). Say so — silently
+  // dropping an operator's declared value is the defect.
+  if (recallPoolCfg) {
+    for (const conflict of splitDbPoolEnvConflicts(config.hindsight?.env, recallPoolCfg)) {
+      console.log(chalk.yellow(`  ! ${splitDbPoolEnvConflictWarning(conflict)}`));
+    }
+  }
+
   const startPool = deps.startRecallPool ?? startHindsightRecallPool;
   const waitHealthy = deps.waitForHealthy ?? waitForHindsightHealthy;
+  /**
+   * Role-aware health gate: the authority's first boot pays pg0 initdb + the
+   * migration chain, so it gets a much longer deadline than the pool.
+   */
+  const waitHealthyFor = (port: number, role: HindsightHealthRole) =>
+    waitHealthy(port, { role, workers: recallPoolCfg?.workers });
   const poolIsRunning = deps.recallPoolRunningProbe ?? isHindsightRecallPoolRunning;
   const stopPool = deps.stopRecallPool ?? stopHindsightRecallPool;
 
@@ -399,7 +420,7 @@ export async function stepMemoryBackend(
       publicApiPort,
       authorityApiPort,
       workers: cfg.workers,
-      waitForHealthy: (p) => waitHealthy(p),
+      waitForHealthy: waitHealthyFor,
       stopPool,
       startPool: () =>
         startPool({
@@ -408,9 +429,11 @@ export async function stepMemoryBackend(
           litellm: secrets.litellmCfg,
           llm: secrets.resolvedLlm,
           // The authority caps its own DB pools when the split is on; the pool
-          // container inherits the same env base plus its own overrides.
+          // container inherits the same env base plus its own overrides. The
+          // managed caps win over `hindsight.env` (warned about above) so the
+          // connection budget the launch asserted is the one that ships.
           perf: {
-            env: { ...backgroundContainerPoolEnv(), ...(config.hindsight?.env ?? {}) },
+            env: splitContainerPerfEnv(config.hindsight?.env),
             memLimit: config.hindsight?.mem_limit,
           },
           cpAccessKey: secrets.cpAccessKey,
@@ -512,6 +535,84 @@ export async function stepMemoryBackend(
       }
       return { hindsightExpected: true, optedOut: false };
     }
+    // MIRROR IMAGE of the branch above: the split is DECLARED OFF but a pool
+    // container is still running. `publicPortIsUnserved` deliberately says
+    // "fine" here (the pool IS serving the public port), which used to mean the
+    // step printed "already running" and left an orphan container standing
+    // against declared config — durable across reboots via `--restart always`.
+    // Converge instead.
+    const staleRunningPorts = (deps.runningPortsProbe ?? getRunningHindsightPorts)();
+    const stalePlan = planStaleRecallPoolConvergence({
+      recallEnabled: recallPoolCfg !== null,
+      poolRunning: poolIsRunning(deps.dockerProbe),
+      authorityApiPort: staleRunningPorts?.apiPort,
+      configUrlPort: parseUrlPort(config.memory?.config?.url),
+    });
+    if (stalePlan.action !== "none") {
+      // Only the relaunch action launches a container, so only it needs
+      // secrets — `stop-pool` must not spend broker round-trips to remove an
+      // orphan.
+      const staleSecrets =
+        stalePlan.action === "relaunch-single-on-public"
+          ? await resolveLaunchSecrets()
+          : undefined;
+      const startContainer = deps.startContainer ?? startHindsight;
+      const staleResult = await convergeStaleRecallPool({
+        plan: stalePlan,
+        stopPool,
+        relaunchSingleOnPublic: (publicApiPort) => {
+          // ONE step: drop the pool that holds the public port and the parked
+          // authority, then bring a sole container up ON the public port. The
+          // health gate inside convergeStaleRecallPool is what makes this safe
+          // to report on.
+          stopPool();
+          (deps.stopContainer ?? stopHindsight)();
+          startContainer(
+            {
+              apiPort: publicApiPort,
+              uiPort: staleRunningPorts?.uiPort ?? HINDSIGHT_DEFAULT_UI_PORT,
+            },
+            staleSecrets!.litellmCfg,
+            undefined,
+            staleSecrets!.resolvedLlm,
+            hindsightConsumerMirrorDir(config),
+            undefined,
+            // Single-container env: NO split DB-pool caps, so `hindsight.env`
+            // is authoritative again, exactly as the declared topology says.
+            { env: config.hindsight?.env, memLimit: config.hindsight?.mem_limit },
+            staleSecrets!.cpAccessKey,
+          );
+        },
+        waitForHealthy: waitHealthyFor,
+        log: (m) => console.log(chalk.gray(m)),
+      });
+      if (staleResult.outcome === "relaunch-failed") {
+        const msg =
+          `hindsight.recall_pool is disabled, but the single container relaunched on the ` +
+          `public port ${staleResult.publicApiPort} did not become healthy — nothing is ` +
+          `serving fleet memory.`;
+        console.log(chalk.red(`  x ${msg}`));
+        throw new Error(
+          `Memory backend setup failed: ${msg} Inspect \`docker logs switchroom-hindsight ` +
+            `--tail 50\`, then re-run \`switchroom setup\`.`,
+        );
+      }
+      if (staleResult.outcome === "pool-stopped") {
+        console.log(
+          chalk.green(
+            `  ${STEP_DONE} Removed the orphan recall pool (hindsight.recall_pool is disabled)`,
+          ),
+        );
+      } else if (staleResult.outcome === "relaunched-single") {
+        console.log(
+          chalk.green(
+            `  ${STEP_DONE} Converged to the declared single-container topology on ` +
+              `${staleResult.publicApiPort}`,
+          ),
+        );
+      }
+      return { hindsightExpected: true, optedOut: false };
+    }
     // "The authority container is running" is NOT the same as "memory works".
     // If it is parked on a port that is not the one `memory.config.url`
     // declares, and no pool is bound there, NOTHING serves the fleet's memory
@@ -519,7 +620,7 @@ export async function stepMemoryBackend(
     // pool) leaves behind, durable across reboots via `--restart always`.
     // Reporting "already running" over that is exactly the silent-success-over-
     // an-outage class review H2 closed for the other paths in this step.
-    const runningPorts = (deps.runningPortsProbe ?? getRunningHindsightPorts)();
+    const runningPorts = staleRunningPorts;
     if (
       publicPortIsUnserved({
         configUrlPort: parseUrlPort(config.memory?.config?.url),
@@ -663,9 +764,12 @@ export async function stepMemoryBackend(
     launchSecrets = await resolveLaunchSecrets();
     // When the split is on the authority caps its own DB pools to free
     // connection headroom for the pool's N workers (the keys ride the
-    // HINDSIGHT_PERF_ENV_KEYS allowlist); an explicit `hindsight.env` still wins.
+    // HINDSIGHT_PERF_ENV_KEYS allowlist). Those two caps are MANAGED: they win
+    // over `hindsight.env`, because the connection budget asserted at resolve
+    // time is only a proof if the containers launch with the asserted numbers.
+    // A superseded `hindsight.env` value was warned about above.
     const authorityEnv = recallPoolCfg
-      ? { ...backgroundContainerPoolEnv(), ...(config.hindsight?.env ?? {}) }
+      ? splitContainerPerfEnv(config.hindsight?.env)
       : config.hindsight?.env;
     const startContainer = deps.startContainer ?? startHindsight;
     startContainer(
