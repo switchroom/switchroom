@@ -40,6 +40,8 @@ now an anomaly worth investigating, not the norm.
 
 - **telegram: persist card/status messages so a quote-reply to them resolves**
 
+- **gateway: keep state-dir writes owned by the agent uid, not root**
+
 ### Fixed: hindsight's `/metrics` no longer grows a permanent series per document page
 
 - **The `endpoint` metric label is now templated on the whole path segment, so

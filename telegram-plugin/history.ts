@@ -25,8 +25,9 @@
  * chat exists in the DB.
  */
 
-import { chmodSync, existsSync, mkdirSync } from 'fs'
+import { chmodSync, existsSync } from 'fs'
 import { join } from 'path'
+import { adoptSqliteOwnership, mkdirStateSync } from '../src/util/state-owner.js'
 import { redact } from './secret-detect/redact.js'
 
 /**
@@ -216,7 +217,7 @@ function isValidMessageId(id: unknown): id is number {
 export function initHistory(stateDir: string, retentionDays = 30): void {
   if (db != null) return
   const Database = loadDatabaseClass()
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+  mkdirStateSync(stateDir, { recursive: true, mode: 0o700 })
   const path = join(stateDir, 'history.db')
   dbPath = path
   db = new Database(path, { create: true })
@@ -336,6 +337,12 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     const f = path + suffix
     if (existsSync(f)) { try { chmodSync(f, 0o644) } catch { /* ignore */ } }
   }
+  // Ownership rides the same hook as the mode, for the same reason. SQLite
+  // creates `-wal`/`-shm` itself, in C, so no `node:fs` write helper can ever
+  // see them — this is the only place we get to fix their owner. A root
+  // gateway would otherwise leave root:root DB files in an agent-owned state
+  // dir and EACCES every non-root reader. No-op off the root path.
+  adoptSqliteOwnership(path)
 
   if (retentionDays > 0) {
     const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400
@@ -458,6 +465,9 @@ export function checkpointWal(): boolean {
         const f = dbPath + suffix
         if (existsSync(f)) { try { chmodSync(f, 0o644) } catch { /* ignore */ } }
       }
+      // …and ownership with it: a TRUNCATE checkpoint DELETES and RE-CREATES
+      // the sidecars, so the owner we set at init is gone by here.
+      adoptSqliteOwnership(dbPath)
     }
     return true
   } catch {

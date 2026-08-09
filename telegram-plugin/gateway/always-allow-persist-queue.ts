@@ -60,7 +60,7 @@
 
 import { writeFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { atomicWriteStateFileSync } from '../../src/util/state-owner.js'
 import {
   preserveUnreadableStoreFile,
   quarantineCorruptStoreFile,
@@ -182,7 +182,7 @@ export function computeBackoffMs(attempts: number, retryAfterMs?: number): numbe
  */
 export const atomicWriteSeam = ((path, data, opts) => {
   const mode = typeof opts === 'object' && opts !== null && typeof opts.mode === 'number' ? opts.mode : 0o600
-  atomicWriteFileSync(path as string, data as string, mode)
+  atomicWriteStateFileSync(path as string, data as string, mode)
 }) as typeof writeFileSync
 
 export function createAlwaysAllowPersistQueue(

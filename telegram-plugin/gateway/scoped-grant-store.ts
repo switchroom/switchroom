@@ -28,7 +28,7 @@
  */
 
 import { join } from 'node:path'
-import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { atomicWriteStateFileSync } from '../../src/util/state-owner.js'
 import {
   preserveUnreadableStoreFile,
   quarantineCorruptStoreFile,
@@ -105,7 +105,7 @@ export function createScopedGrantStore(
         }
         // tmp + fsync + rename — a crash mid-persist leaves the previous
         // grant set intact rather than a torn file that reads as "no grants".
-        atomicWriteFileSync(filePath, JSON.stringify(serializeScopedGrants(store)), 0o600)
+        atomicWriteStateFileSync(filePath, JSON.stringify(serializeScopedGrants(store)), 0o600)
       } catch (err) {
         log(`telegram gateway: scoped-grant-store write failed: ${(err as Error).message}\n`)
       }

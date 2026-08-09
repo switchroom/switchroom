@@ -39,7 +39,7 @@ import { readFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { atomicWriteStateFileSync } from '../../src/util/state-owner.js'
 
 /** One half-open privacy interval. `end: null` = still open ("private now"). */
 export interface PrivacyInterval {
@@ -130,7 +130,7 @@ function writePrivacyState(state: PrivacyState, stateDir: string): void {
     /* dir may already exist / be unwritable — the write below reports */
   }
   try {
-    atomicWriteFileSync(privacyStatePath(stateDir), JSON.stringify(state), 0o600)
+    atomicWriteStateFileSync(privacyStatePath(stateDir), JSON.stringify(state), 0o600)
   } catch (err) {
     process.stderr.write(
       `telegram gateway: privacy-state write failed: ${err instanceof Error ? err.message : String(err)}\n`,

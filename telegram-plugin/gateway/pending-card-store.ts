@@ -44,7 +44,7 @@
 
 import { unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { atomicWriteFileSync } from '../../src/util/atomic.js'
+import { atomicWriteStateFileSync } from '../../src/util/state-owner.js'
 import {
   preserveUnreadableStoreFile,
   quarantineCorruptStoreFile,
@@ -162,7 +162,7 @@ export function createPendingCardStore(
       // tmp + fsync + rename, mode pinned to 0600 on the tempfile fd (so an
       // existing file can't keep laxer perms, and a crash mid-write leaves
       // the previous good file untouched).
-      atomicWriteFileSync(filePath, JSON.stringify(entries), 0o600)
+      atomicWriteStateFileSync(filePath, JSON.stringify(entries), 0o600)
     } catch (err) {
       log(`telegram gateway: pending-card-store write failed: ${(err as Error).message}\n`)
     }

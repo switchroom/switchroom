@@ -68,7 +68,6 @@ import { randomUUID } from 'node:crypto'
 import {
   closeSync,
   fsyncSync,
-  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
@@ -76,6 +75,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
+import { adoptStateOwnershipFd, mkdirStateSync } from '../../src/util/state-owner.js'
 
 /** Filename under `TELEGRAM_STATE_DIR`. */
 export const BOOT_BEACON_FILE = 'gateway-beacon.json'
@@ -297,12 +297,19 @@ export function writeBootBeaconFile(stateDir: string, beacon: BootBeacon): boole
     // gateway creates it 0o700 at boot. If it were ever missing here, a
     // default-mode recreate by this 5s tick would silently loosen the
     // permissions on that whole directory.
-    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    mkdirStateSync(stateDir, { recursive: true, mode: 0o700 })
     fd = openSync(tmp, 'w', 0o600)
     // writeFileSync (not writeSync) on the fd: it loops internally, so a short
     // write can't leave a truncated beacon that we then fsync and rename into
     // place as if it were whole.
     writeFileSync(fd, serializeBootBeacon(beacon))
+    // Ownership on the TEMPFILE FD, before the rename: a root-running gateway
+    // re-creates this file every 5s, so it is the loudest source of root-owned
+    // state in an agent-owned dir. Doing it on the fd (never a path) means no
+    // symlink can be raced in, and doing it before the rename means the file
+    // is never visible at its final name under the wrong owner. No-op off the
+    // root path.
+    adoptStateOwnershipFd(fd, stateDir)
     fsyncSync(fd)
     closeSync(fd)
     fd = undefined
