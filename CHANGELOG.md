@@ -15,20 +15,7 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
-## v0.20.19 — a 32k backend now consolidates in batches of 3, plus the first-class recall/background split and two LiteLLM mount guards
-
-### CI: more free-runner test parallelism (docker-e2e sharded 3-way, ci-tests-core 8-way)
-
-- **docker-e2e's `e2e` job is now a 3-way `--shard` matrix (`e2e-shard`) and
-  ci-tests-core's vitest matrix goes 4 → 8 shards**, both fanning across
-  additional free GitHub-hosted runners at zero extra cost (no runner-tier
-  change). The `tests/docker` suite (~8 min of execution) is threaded through
-  `scripts/ci/docker-snapshot-gate.sh` via a new `VITEST_SHARD` env var so each
-  leg runs `--shard i/3`, trimming ~4-5 min of wall clock; the core suite's
-  full-suite runs on push/merge_group split ~1 min further. The required
-  merge-queue sentinels are unchanged — `e2e-ok` still aggregates every e2e
-  shard + `hindsight-probe`, and `vitest` still aggregates all 8 core shards;
-  the individual shard contexts are NOT branch-protection-required.
+## v0.20.20 — docker-images builds `dist/` once and shares it with the dependent image legs
 
 ### CI: `dist/` is built once and shared with the dependent image legs
 
@@ -45,6 +32,21 @@ now an anomaly worth investigating, not the norm.
   contents from the dependent Dockerfiles' `COPY` sources rather than
   hardcoding them, and each leg verifies both trees landed before invoking
   buildx.
+
+## v0.20.19 — a 32k backend now consolidates in batches of 3, plus the first-class recall/background split and two LiteLLM mount guards
+
+### CI: more free-runner test parallelism (docker-e2e sharded 3-way, ci-tests-core 8-way)
+
+- **docker-e2e's `e2e` job is now a 3-way `--shard` matrix (`e2e-shard`) and
+  ci-tests-core's vitest matrix goes 4 → 8 shards**, both fanning across
+  additional free GitHub-hosted runners at zero extra cost (no runner-tier
+  change). The `tests/docker` suite (~8 min of execution) is threaded through
+  `scripts/ci/docker-snapshot-gate.sh` via a new `VITEST_SHARD` env var so each
+  leg runs `--shard i/3`, trimming ~4-5 min of wall clock; the core suite's
+  full-suite runs on push/merge_group split ~1 min further. The required
+  merge-queue sentinels are unchanged — `e2e-ok` still aggregates every e2e
+  shard + `hindsight-probe`, and `vitest` still aggregates all 8 core shards;
+  the individual shard contexts are NOT branch-protection-required.
 
 ### CI: `build-dependents` no longer serialized behind `build-base` on PR / merge_group
 
