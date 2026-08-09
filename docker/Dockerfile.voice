@@ -33,7 +33,7 @@
 # Dependabot tracks bumps. (Replace the digest when bumping the tag.)
 # Pinned to the linux/amd64 manifest digest (CI builds amd64-only); resolved
 # live via `docker manifest inspect nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`.
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c0409a5fd1d54ddfd646e5b9d8dee7878131271b563fc
 
 LABEL org.opencontainers.image.title="switchroom-voice" \
       org.opencontainers.image.description="Local GPU speech sidecar (faster-whisper STT + Kokoro TTS)"
