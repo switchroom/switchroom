@@ -106,6 +106,10 @@ export type GatewaySignal =
 export type SensorSignal =
   | "litellm-header-passthrough-misconfig"
   | "litellm-timeout-budget-drift"
+  // The live LiteLLM config names a custom callback module (`custom_pacing`)
+  // that the live compose does not bind-mount. LiteLLM imports callbacks during
+  // startup, so this is a hard crash-loop with no degraded mode.
+  | "litellm-callback-mount-missing"
   // The live `switchroom-hindsight` container is running CPU-only
   // (`HostConfig.DeviceRequests` empty) while the host has a PROVABLY usable
   // GPU (nvidia-smi + the nvidia container runtime). Reranker + local

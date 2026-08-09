@@ -21,6 +21,7 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import type { Finding } from "./detect.js";
 import type { LiveConfigDiscovery } from "../litellm/header-passthrough-guard.js";
@@ -34,6 +35,11 @@ import {
   detectLitellmTimeoutDrift,
   extractGroupTimeouts,
 } from "../litellm/timeout-budget.js";
+import {
+  LIVE_COMPOSE_BASENAME,
+  canReadComposeMounts,
+  detectMissingCallbackMounts,
+} from "../litellm/callback-mount-guard.js";
 
 /** The pseudo-agent the litellm misconfig finding is attributed to. It is not a
  *  real switchroom agent — it names the shared LiteLLM proxy so the ledger's
@@ -171,6 +177,55 @@ export function scanLitellmConfig(
       agent: LITELLM_PROXY_PSEUDO_AGENT,
       turn_id: `litellm-timeout:${d.role}:${d.group}`,
       log_pointer: `${path}: group '${d.group}' — ${d.detail}`,
+      ts: nowIso,
+    });
+  }
+
+  // Custom-callback mount coherence: a callback the config names but the
+  // deployed compose does not mount is a hard startup abort, not a degraded
+  // mode (2026-08-09 fleet outage — the v1.95.0 image bump regenerated the
+  // compose from Coolify's `docker_compose_raw` and dropped the pacer mount
+  // that only ever existed as a hand edit to the generated file). Only this
+  // sensor can see the LIVE pairing, same division of labour as the checks
+  // above. The compose sits beside the config in the Coolify service dir.
+  const composePath = join(dirname(path), LIVE_COMPOSE_BASENAME);
+  let composeText: string | null = null;
+  if (exists(composePath)) {
+    try {
+      composeText = read(composePath);
+    } catch (e) {
+      log(
+        `fleet-health: litellm-config sensor — callback-mount check SKIPPED, ` +
+          `${composePath} unreadable: ${String(e)}`,
+      );
+    }
+  } else {
+    log(
+      `fleet-health: litellm-config sensor — callback-mount check SKIPPED, ` +
+        `no ${LIVE_COMPOSE_BASENAME} beside ${path}`,
+    );
+  }
+
+  const missingMounts = detectMissingCallbackMounts(parsed, composeText);
+  if (composeText !== null && !canReadComposeMounts(composeText)) {
+    // Parsed to nothing usable (bad YAML, or no `services` mapping). Judging
+    // this a pass would be the silent-green failure the sensor exists to catch.
+    log(
+      `fleet-health: litellm-config sensor — callback-mount check SKIPPED, ` +
+        `${composePath} has no readable services/volumes mapping`,
+    );
+  } else if (composeText !== null && missingMounts.length === 0) {
+    log(
+      `fleet-health: litellm-config sensor OK — every custom callback module is ` +
+        `bind-mounted by ${composePath}`,
+    );
+  }
+  for (const m of missingMounts) {
+    findings.push({
+      signal: "litellm-callback-mount-missing",
+      agent: LITELLM_PROXY_PSEUDO_AGENT,
+      turn_id: `litellm-callback-mount:${m.module}`,
+      log_pointer: `${composePath}: ${m.detail}`,
       ts: nowIso,
     });
   }

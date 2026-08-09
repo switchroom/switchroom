@@ -17,6 +17,20 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **fleet health: a LiteLLM custom callback with no bind mount is now a loud
+  finding instead of a silent proxy outage.** LiteLLM imports callback modules
+  during startup, so a config that names `custom_pacing.pacer_instance` while
+  the deployed compose does not mount `/app/custom_pacing.py` crash-loops the
+  shared proxy with `ModuleNotFoundError` — no degraded mode, every
+  proxy-routed agent turn fails. That happened on 2026-08-09: a v1.91.0 →
+  v1.95.0 image bump made Coolify regenerate the compose from
+  `services.docker_compose_raw`, dropping the pacer and passthrough-patch
+  mounts that had only ever been hand-added to the GENERATED file. The
+  fleet-health LiteLLM sensor now pairs the live config against the live
+  compose and raises `litellm-callback-mount-missing` into the priority ledger
+  (`src/litellm/callback-mount-guard.ts`), and `docker/litellm-pacer/README.md`
+  documents the database as the only durable place to put the mount.
+
 - **telegraph: `**>` expandable blockquotes render correctly in Instant View
   pages.** `markdownToTelegraphNodes` — the Telegra.ph node builder used when a
   telegraph-enabled agent's reply exceeds the ~3000-char threshold — matched
