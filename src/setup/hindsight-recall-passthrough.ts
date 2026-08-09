@@ -164,7 +164,7 @@ export interface HindsightRecallPassthrough {
  */
 export const RECALL_PASSTHROUGH_DEFAULTS = Object.freeze({
   /** vendor/hindsight-memory/settings.json `recallBudget` */
-  budget: "low" as RecallBudget,
+  budget: "mid" as RecallBudget,
   /** settings.json `recallMaxTokens` */
   maxTokens: 1024,
   /** config.py DEFAULTS `recallPreferObservations` (not in settings.json) */

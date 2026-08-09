@@ -543,10 +543,15 @@ export const HINDSIGHT_DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = 1000;
  *   comment promises "36-54% speedup, quality-identical" by sorting
  *   candidate pairs by length to avoid padding waste. Pure win on CPU.
  *
- * - MAX_CANDIDATES: vendor default 300. At our `recallBudget=low`
- *   ~100 candidates feed in and we cap to 12 final memories; scoring
- *   300 wastes ~50% of rerank CPU on candidates that will never make
- *   the top-N.
+ * - MAX_CANDIDATES: vendor default 300, lowered to 150 (below). At the
+ *   fleet's `recallBudget=mid` the engine surfaces ~300 candidates
+ *   (budget = candidate depth: low=100 / mid=300 / high=1000), so this
+ *   150 cap now BINDS — it reranks the strongest 150 and drops the rest.
+ *   That bounds rerank CPU on a shared host while still reranking deeper
+ *   than `low` (~100, which sits under the cap and is never truncated).
+ *   We cap to 12 final memories regardless, so the tail below 150 would
+ *   never make the top-N. Raise `HINDSIGHT_API_RERANKER_MAX_CANDIDATES`
+ *   to rerank the full mid pool.
  *
  * - LOCAL_MAX_CONCURRENT: vendor default 4. With 9 always-on agents
  *   that's up to 36 simultaneous CPU-bound rerank tasks on a shared

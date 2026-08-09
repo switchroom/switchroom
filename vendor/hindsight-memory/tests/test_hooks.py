@@ -833,6 +833,11 @@ class TestRetainHook:
             assert captured["body"].get("async") is False
 
     def test_retain_includes_context_label(self, monkeypatch, tmp_path):
+        # Switchroom — the default retainContext is now a speaker-aware
+        # template resolved per-retain: {agent} from SWITCHROOM_AGENT_NAME
+        # and {bank_id} from the target bank. Pin a known agent name so the
+        # resolved label is deterministic regardless of the ambient env.
+        monkeypatch.setenv("SWITCHROOM_AGENT_NAME", "testbot")
         messages = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}]
         transcript = make_transcript_file(tmp_path, messages)
         hook_input = make_hook_input(transcript_path=transcript)
@@ -846,7 +851,11 @@ class TestRetainHook:
         _run_hook("retain", hook_input, monkeypatch, tmp_path, urlopen_side_effect=capture)
 
         if "body" in captured:
-            assert captured["body"]["items"][0]["context"] == "claude-code"
+            context = captured["body"]["items"][0]["context"]
+            # Template placeholders must be resolved (no literal braces left)
+            # and the agent name must be filled in from the env.
+            assert "{" not in context and "}" not in context
+            assert "agent 'testbot'" in context
 
     def test_disabled_auto_retain_does_not_call_api(self, monkeypatch, tmp_path):
         (tmp_path / "plugin_root").mkdir(exist_ok=True)

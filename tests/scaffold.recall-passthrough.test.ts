@@ -119,6 +119,24 @@ describe("recall passthrough (#3841)", () => {
       expect(RECALL_PASSTHROUGH_DEFAULTS.tagGroups).toEqual({});
     });
 
+    it("resolves the recall budget to mid when nothing overrides it", () => {
+      // Outcome assertion on the resolved value, not just the code path: with
+      // no memory.recall config the fleet default is `mid` (the low->mid tune).
+      expect(resolveHindsightRecallPassthrough(undefined).budget).toBe("mid");
+      expect(resolveHindsightRecallPassthrough({}).budget).toBe("mid");
+    });
+
+    it("lets an explicit per-agent budget override the new mid default", () => {
+      // Precedence still holds after the default moved: an agent that pins its
+      // own budget keeps winning. `low` is the exact case that must survive the
+      // default flip (env HINDSIGHT_RECALL_BUDGET is exported from this resolved
+      // value and outranks settings.json in config.py's cascade).
+      expect(resolveHindsightRecallPassthrough({ budget: "low" }).budget).toBe("low");
+      expect(resolveHindsightRecallPassthrough({ budget: "high" }).budget).toBe("high");
+      const { startSh } = scaffold(withRecall({ budget: "low" }));
+      expect(startSh).toContain("export HINDSIGHT_RECALL_BUDGET=low\n");
+    });
+
     it("matches config.py DEFAULTS for the keys settings.json does not ship", () => {
       expect(VENDOR_SETTINGS.recallPreferObservations).toBeUndefined();
       expect(VENDOR_SETTINGS.recallTranscriptFallback).toBeUndefined();
@@ -153,7 +171,7 @@ describe("recall passthrough (#3841)", () => {
       // Whole-line matches including the trailing newline: `toContain("=1")`
       // would also be satisfied by a rendered `=1024`, so a changed default
       // could sail through a substring assertion.
-      expect(startSh).toContain("export HINDSIGHT_RECALL_BUDGET=low\n");
+      expect(startSh).toContain("export HINDSIGHT_RECALL_BUDGET=mid\n");
       expect(startSh).toContain("export HINDSIGHT_RECALL_MAX_TOKENS=1024\n");
       expect(startSh).toContain("export HINDSIGHT_RECALL_PREFER_OBSERVATIONS=true\n");
       expect(startSh).toContain("export HINDSIGHT_RECALL_CONTEXT_TURNS=2\n");

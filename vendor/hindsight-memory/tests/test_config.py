@@ -42,8 +42,13 @@ class TestLoadConfig:
         cfg = load_config()
         assert cfg["autoRecall"] is True
         assert cfg["autoRetain"] is True
-        assert cfg["recallBudget"] == "low"
+        assert cfg["recallBudget"] == "mid"
         assert cfg["retainEveryNTurns"] == 10
+        # Switchroom — speaker-aware retain context template (resolved
+        # per-retain by build_retain_payload). Must carry the {agent} and
+        # {bank_id} slots so the consolidation LLM can attribute speakers.
+        assert "{agent}" in cfg["retainContext"]
+        assert "{bank_id}" in cfg["retainContext"]
 
     def test_settings_json_overrides_defaults(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
@@ -75,7 +80,7 @@ class TestLoadConfig:
         monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
         (tmp_path / "settings.json").write_text("not valid json{{")
         cfg = load_config()
-        assert cfg["recallBudget"] == "low"  # default still applies
+        assert cfg["recallBudget"] == "mid"  # default still applies
 
     def test_null_values_in_settings_json_not_applied(self, tmp_path, monkeypatch):
         monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(tmp_path))
@@ -112,7 +117,7 @@ class TestLoadConfig:
         # HOME points to tmp_path where no .hindsight/claude-code.json exists
         monkeypatch.setenv("HOME", str(tmp_path))
         cfg = load_config()
-        assert cfg["recallBudget"] == "low"  # default
+        assert cfg["recallBudget"] == "mid"  # default
 
     def test_env_var_wins_over_user_config(self, tmp_path, monkeypatch):
         plugin_root = tmp_path / "plugin"
