@@ -146,6 +146,7 @@ jobs:
               - 'tests/docker/hindsight-work-conserving-admission-patch.test.ts'
               - 'tests/docker/hindsight-query-analyzer-languages.test.ts'
               - 'tests/docker/hindsight-temporal-offload-patch.test.ts'
+              - 'tests/docker/hindsight-metrics-cardinality-patch.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -468,6 +469,19 @@ jobs:
         env:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-mm-refresh-debounce-patch.test.ts
+
+      - name: Run the hindsight metrics-cardinality probe (RED/GREEN, must not skip)
+        # Same contract again, for the /metrics endpoint-label cardinality patch.
+        # The bakes test cannot cover what matters here: it can only see that a
+        # regex string is present, not that the resulting `endpoint` label is
+        # actually bounded. Only importing the shipping
+        # `normalize_http_endpoint` and counting the distinct labels a corpus of
+        # REAL document ids produces catches a fix that handles the uuid-leading
+        # shape but not the `agent-`-prefixed one — which is exactly the half-fix
+        # the unanchored upstream regex already is.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-metrics-cardinality-patch.test.ts
 
       - name: Run the hindsight pg_search tokenizer-drift probe (RED/GREEN, must not skip)
         # Epic #4474 finding C1. The bakes test can only see that the patch TEXT
