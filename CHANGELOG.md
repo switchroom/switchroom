@@ -28,6 +28,16 @@ now an anomaly worth investigating, not the norm.
   shard + `hindsight-probe`, and `vitest` still aggregates all 8 core shards;
   the individual shard contexts are NOT branch-protection-required.
 
+### CI: `dist/` is built once and shared with the dependent image legs
+
+- **docker-images: a single `build-dist` job bundles `dist/` once and uploads
+  it as the `dist-built` artifact; the dependent image legs download it instead
+  of each rebuilding `dist/`.** An Actions-minutes saving (one build instead of
+  one per leg per arch), not a wall-clock one — the legs already run in
+  parallel. `build-base` builds no `dist/` at all now: `Dockerfile.base` copies
+  nothing from the build context, so its dist build was dead work and is
+  removed.
+
 ### CI: `build-dependents` no longer serialized behind `build-base` on PR / merge_group
 
 - **docker-images: dependent image builds now run in parallel with `build-base`
