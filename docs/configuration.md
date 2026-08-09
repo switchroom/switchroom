@@ -174,7 +174,7 @@ Hindsight's auto-recall hook injects relevant memories into every inbound prompt
 defaults:
   memory:
     recall:
-      max_memories: 12   # workspace default (also the plugin default)
+      max_memories: 16   # fleet default (switchroom's resolver default is 8 when unset; the vendor plugin ships 12)
 
 agents:
   coach:

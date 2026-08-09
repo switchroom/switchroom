@@ -15,6 +15,38 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Fixed: recall slot floors now scale with the `max_memories` cap (own/additional bank crowd-out)
+
+- **The per-turn recall slot floors that reserve a minimum for the agent's OWN
+  bank vs the additional/profile banks are now DERIVED from the effective
+  `max_memories` cap instead of being hardcoded literals.** They were fixed at
+  `own=2 / additional=1`, sized for the cap of 6 the fleet ran when they landed
+  (#3755, `4f469b1d`, "sized to the cap the fleet actually deploys"). When the
+  fleet cap was raised 6→16 (`switchroom.yaml`) the literals silently kept
+  reserving 2/1 — ~19% of a 16-slot budget for the agent's own bank instead of
+  the ~50% the design intended — so a dense additional/profile bank could crowd
+  out the agent's own recent context (a live regression for agents using
+  `additional_banks`). The defaults now compute as `own ≈ ⅓` and
+  `additional ≈ ⅙` of the cap (rounded, floored at 1), which preserves the
+  historical 2/1 at cap 6, yields 3/1 at the resolver default of 8, and 5/3 at
+  the live cap of 16 — and since ⅓ + ⅙ = ½ they sit exactly at recall.py's
+  half-cap reservation budget and never overflow it. An explicit per-agent
+  `memory.recall.own_bank_min_slots` / `.additional_bank_min_slots` override
+  still wins (via the authoritative start.sh env export). Regression tests in
+  `tests/scaffold.recall-observations.test.ts` and `tests/scaffold.test.ts`
+  parameterise over the cap and fail if the floors ever stop tracking it.
+- **Docs/comment accuracy (no runtime change):** the
+  `memory.recall.max_memories`, `own_bank_min_slots`, and
+  `additional_bank_min_slots` schema docstrings and `docs/configuration.md`
+  cited stale numbers (plugin default 12, "fleet cap of 6"); they now state the
+  resolver default of 8, the live fleet default, and the cap-proportional
+  derivation, phrased against the mechanism so they will not re-stale. The
+  `memory.recall.budget` enum docstring was factually wrong — it claimed `mid`
+  "adds the LLM rerank pass"; corrected to describe what `budget` actually
+  tunes: the retrieval/rerank candidate-pool depth (low=100 / mid=300 /
+  high=1000), with the local cross-encoder reranker running at every tier and
+  no LLM in the recall ranking path.
+
 ## v0.20.20 — docker-images builds `dist/` once and shares it with the dependent image legs
 
 ### CI: `dist/` is built once and shared with the dependent image legs
