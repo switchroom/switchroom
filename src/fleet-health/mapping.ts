@@ -122,6 +122,19 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "keep-my-subscription-honest",
     signature: "litellm-header-passthrough:oauth-leak-scope",
   },
+  "litellm-callback-mount-missing": {
+    // The live config names a custom callback module the live compose does not
+    // mount. LiteLLM resolves callbacks during startup, so the proxy aborts its
+    // lifespan and crash-loops — every proxy-routed agent turn fails.
+    // severity 3 (the ceiling): this is a total outage of the shared proxy, not
+    // a degraded lane. It shipped exactly this way on 2026-08-09, when a Coolify
+    // redeploy regenerated the compose from `docker_compose_raw` and dropped the
+    // pacer mount that had only ever been hand-added to the generated file.
+    failure_mode: "constraint-violation",
+    severity: 3,
+    job_spec: "fleet-stays-healthy",
+    signature: "litellm-callback-mount:missing-bind",
+  },
   "litellm-timeout-budget-drift": {
     // A per-deployment `timeout` in the live LiteLLM config no longer matches
     // the tier switchroom derived its client budgets from

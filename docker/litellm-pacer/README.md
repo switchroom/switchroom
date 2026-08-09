@@ -41,12 +41,63 @@ litellm_settings:
   callbacks: ["custom_pacing.pacer_instance"]
 ```
 
-Bind mount in the sibling `docker-compose.yml`:
+### Mounts live in Coolify's database, not in the compose file
+
+**Do not add the bind mount to the deployed
+`/data/coolify/services/<litellm-service-id>/docker-compose.yml`.** That file is
+GENERATED. Coolify rewrites it from `services.docker_compose_raw` in its own
+Postgres database on every deploy, so a hand edit survives exactly until the
+next one and no longer.
+
+That is not hypothetical. On 2026-08-09 a v1.91.0 -> v1.95.0 image bump
+regenerated the compose and silently dropped both this mount and the
+`anthropic_passthrough_logging_handler.py` patch mount, because both had only
+ever been hand-added to the generated file. The proxy crash-looped on
+`ModuleNotFoundError: No module named 'custom_pacing'` — LiteLLM resolves
+callbacks during startup, so there is no degraded mode; it served nothing until
+the mounts were restored in the real source.
+
+The mount belongs in `docker_compose_raw`, in the long object form that file
+uses:
 
 ```yaml
-volumes:
-  - '/data/coolify/services/<litellm-service-id>/custom_pacing.py:/app/custom_pacing.py'
+    volumes:
+      -
+        type: bind
+        source: ./custom_pacing.py
+        target: /app/custom_pacing.py
 ```
+
+Apply it to the database, then let Coolify regenerate and redeploy — never edit
+the generated file by hand:
+
+```bash
+# 1. back up the row you are about to change
+docker exec coolify-db psql -U coolify -d coolify -t -A \
+  -c "select docker_compose_raw from services where uuid='<litellm-service-id>';" > raw.yml.bak
+
+# 2. edit a copy, then write it back (dollar-quoted so YAML quoting survives)
+#    UPDATE services SET docker_compose_raw = $RAWYML$...$RAWYML$, updated_at=now()
+#      WHERE uuid='<litellm-service-id>';
+
+# 3. redeploy so Coolify regenerates the compose FROM the database
+curl -s -X POST -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+  "http://localhost:8000/api/v1/deploy?uuid=<litellm-service-id>"
+
+# 4. verify the mount actually landed in BOTH the generated file and the container
+grep -n custom_pacing /data/coolify/services/<litellm-service-id>/docker-compose.yml
+docker inspect <litellm-container> --format '{{range .Mounts}}{{.Destination}}{{println}}{{end}}'
+```
+
+`local_file_volumes` rows are worth keeping in sync too (they carry the file
+CONTENT, so Coolify can re-materialise the file), but a row there does **not**
+by itself produce a mount — only `docker_compose_raw` does.
+
+This coupling is now enforced rather than merely documented: the fleet-health
+LiteLLM sensor pairs the live config against the live compose and raises
+`litellm-callback-mount-missing` into the priority ledger whenever a declared
+callback module has no matching bind mount
+(`src/litellm/callback-mount-guard.ts`).
 
 ## Code defaults vs. live env overrides
 

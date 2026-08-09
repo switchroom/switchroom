@@ -27,4 +27,10 @@
 # the live host (commands above) — the public registry can tell you which tags
 # exist, but not which one this deployment runs. Guessing a plausible upstream
 # tag here would make the file confidently wrong.
-ghcr.io/berriai/litellm-database:v1.91.0@sha256:6151ddc97c5dc4590740bd14646d78d48267d8b7a1bf398eeaffcd6729b8f0b9
+#
+# RE-VERIFIED against the live deployment on 2026-08-09 after the v1.91.0 ->
+# v1.95.0 update, using method 1 above (Config.Image + RepoDigests of the
+# running container). That update is also what dropped the pacer bind mount and
+# crash-looped the proxy — see ../litellm-pacer/README.md "Mounts live in
+# Coolify's database" before touching this deployment.
+ghcr.io/berriai/litellm-database:v1.95.0@sha256:af7ff0444278be40f7615764d1562ac557df6103cba052e886915a7e1e944c27

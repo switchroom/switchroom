@@ -320,3 +320,111 @@ model_list:
     expect(logs.some((l) => /VIOLATION.*gpt-oss-20b/.test(l))).toBe(true);
   });
 });
+
+/**
+ * Custom-callback mount coherence (2026-08-09 outage). These drive the real
+ * sensor with fakes only at the fs boundary, and assert the OUTCOME the ledger
+ * consumes — the failure here was a composition between config and compose, so
+ * a unit test of the guard alone would not have caught it.
+ */
+describe("scanLitellmConfig — custom callback mount coherence", () => {
+  const CONFIG_PATH = "/svc/p/litellm-config.yaml";
+  const COMPOSE_PATH = "/svc/p/docker-compose.yml";
+  const PACER_CONFIG = `
+litellm_settings:
+  callbacks: ["custom_pacing.pacer_instance"]
+`;
+
+  /** Serve the config at CONFIG_PATH and whatever `compose` is at the sibling
+   *  docker-compose.yml. `compose: null` means the file is absent. */
+  function scan(config: string, compose: string | null, logs: string[] = []) {
+    const res = scanLitellmConfig({
+      path: CONFIG_PATH,
+      existsFn: (p) => (p === COMPOSE_PATH ? compose !== null : true),
+      readFn: (p) => {
+        if (p === COMPOSE_PATH) {
+          if (compose === null) throw new Error("ENOENT");
+          return compose;
+        }
+        return config;
+      },
+      log: (m) => logs.push(m),
+      nowIso: "2026-08-09T00:00:00.000Z",
+    });
+    return { res, logs };
+  }
+
+  it("derives the compose path as a sibling of the config", () => {
+    const seen: string[] = [];
+    scanLitellmConfig({
+      path: CONFIG_PATH,
+      existsFn: (p) => {
+        seen.push(p);
+        return true;
+      },
+      readFn: () => PACER_CONFIG,
+      nowIso: "2026-08-09T00:00:00.000Z",
+    });
+    expect(seen).toContain(COMPOSE_PATH);
+  });
+
+  it("raises a ledger finding when the declared pacer has no bind mount", () => {
+    const { res } = scan(
+      PACER_CONFIG,
+      `
+services:
+  litellm:
+    volumes:
+      - '/svc/p/litellm-config.yaml:/app/config.yaml'
+`,
+    );
+    expect(res.status).toBe("violation");
+    const f = res.findings.find((x) => x.signal === "litellm-callback-mount-missing");
+    expect(f).toBeDefined();
+    expect(f!.agent).toBe(LITELLM_PROXY_PSEUDO_AGENT);
+    expect(f!.turn_id).toBe("litellm-callback-mount:custom_pacing");
+    expect(f!.log_pointer).toContain(COMPOSE_PATH);
+    expect(f!.log_pointer).toContain("docker_compose_raw");
+    // and it must be a signal the ledger can actually classify
+    expect(mapSignal(f!.signal)).toBeDefined();
+  });
+
+  it("passes when the mount is present", () => {
+    const { res } = scan(
+      PACER_CONFIG,
+      `
+services:
+  litellm:
+    volumes:
+      - '/svc/p/custom_pacing.py:/app/custom_pacing.py'
+`,
+    );
+    expect(res.findings.some((f) => f.signal === "litellm-callback-mount-missing")).toBe(false);
+  });
+
+  it("flags a compose that parses but declares no volumes at all", () => {
+    const { res } = scan(
+      PACER_CONFIG,
+      `
+services:
+  litellm:
+    image: 'ghcr.io/berriai/litellm-database:v1.95.0'
+`,
+    );
+    expect(res.findings.some((f) => f.signal === "litellm-callback-mount-missing")).toBe(true);
+  });
+
+  it("SKIPS visibly, never passes, when the compose is absent", () => {
+    const { res, logs } = scan(PACER_CONFIG, null);
+    expect(res.findings.some((f) => f.signal === "litellm-callback-mount-missing")).toBe(false);
+    expect(logs.some((l) => /callback-mount check SKIPPED/.test(l))).toBe(true);
+    expect(logs.some((l) => /every custom callback module is/.test(l))).toBe(false);
+  });
+
+  it("SKIPS visibly, never claims OK, when the compose is unparseable", () => {
+    const { res, logs } = scan(PACER_CONFIG, "\tnot: [valid");
+    expect(res.findings.some((f) => f.signal === "litellm-callback-mount-missing")).toBe(false);
+    expect(logs.some((l) => /callback-mount check SKIPPED/.test(l))).toBe(true);
+    expect(logs.some((l) => /every custom callback module is/.test(l))).toBe(false);
+  });
+});
