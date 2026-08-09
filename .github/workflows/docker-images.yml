@@ -13,6 +13,12 @@ name: docker-images
 #   - pull_request: build only (no push) to validate Dockerfile changes.
 #
 # Pipelines (perf rework, follows #2807):
+#   - build-dist builds dist/ ONCE and uploads it as the `dist-built`
+#     artifact; the dependent image legs download it instead of each
+#     rebuilding dist/ (an Actions-minutes saving — legs run in parallel
+#     so wall-clock is ~neutral). build-base does NOT consume dist/
+#     (Dockerfile.base COPYs nothing from the context), so it builds no
+#     dist.
 #   - build-base + build-dependents run as a PER-ARCH matrix on NATIVE
 #     runners (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) — no
 #     QEMU emulation. On PR / merge_group, build-dependents builds FROM
@@ -164,6 +170,66 @@ jobs:
         with:
           filters: .github/path-filters.yml
 
+  # ─── Build dist/ once, share with the dependent image legs ────────
+  # The dependent images (agent/broker/kernel/hostd/auth-broker/web)
+  # each COPY a slice of dist/ into their image. Before this job every
+  # matrix leg rebuilt dist/ from scratch (setup-node + frozen bun
+  # install + `npm run build`) — identical work, once per leg per arch.
+  # Build it ONCE here and hand it to the legs as the `dist-built`
+  # artifact. This is an Actions-MINUTES saving, not a wall-clock one:
+  # the legs already run in parallel, so the critical path is roughly
+  # unchanged, but the redundant per-leg build work collapses into a
+  # single job. build-base is deliberately NOT a consumer — its
+  # Dockerfile.base COPYs nothing from the context (pure FROM
+  # node:22 + apt/npm), so its dist build was dead work and is dropped.
+  # Mirrors the build-dist -> dist-built pattern in ci-tests-core.yml.
+  build-dist:
+    needs: changes
+    # Runs whenever any dependent leg will: every non-PR event (push /
+    # tag / dispatch / merge_group) plus PRs that touched image inputs.
+    # Skipped only on a PR with no image changes — where no leg runs.
+    # `!cancelled()` for the SAME reason build-base has it: `changes` is
+    # skipped on tag / dispatch / merge_group (no diff base), and without
+    # a status expression that skip would propagate and skip build-dist —
+    # which would skip the merge_group validation legs AND, on a tag,
+    # skip the publish path entirely.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.images == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Node (for dist/ bundling)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
+        # Composite action: pinned bun (not `latest` — an unpinned bun
+        # release changing under a release build is a flake vector), bun
+        # package cache restore, and `bun install --frozen-lockfile`
+        # (a bare `bun install` can silently drift from bun.lock).
+        uses: ./.github/actions/setup-switchroom
+
+      - name: Build dist/
+        env:
+          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
+          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
+          # stays silent and dev builds fall back to package.json.
+          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist-built
+          path: dist/
+          # 1-day retention: the artifact is consumed by the image legs
+          # that fire within minutes of this job.
+          retention-days: 1
+          if-no-files-found: error
+
   build-base:
     needs: changes
     # Non-PR events (main push / tag / dispatch / merge_group): always
@@ -192,26 +258,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Set up Node (for dist/ bundling)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
-        with:
-          node-version: "22"
-
-      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
-        # Composite action: pinned bun (not `latest` — an unpinned bun
-        # release changing under a release build is a flake vector), bun
-        # package cache restore, and `bun install --frozen-lockfile`
-        # (a bare `bun install` can silently drift from bun.lock).
-        uses: ./.github/actions/setup-switchroom
-
-      - name: Build dist/
-        env:
-          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
-          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
-          # stays silent and dev builds fall back to package.json.
-          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: npm run build
 
       - name: Set up Docker Buildx
         # Composite action, NOT docker/setup-buildx-action directly (#3815).
@@ -414,11 +460,15 @@ jobs:
     # is build-dependents-push below — GitHub Actions has no
     # event-conditional `needs:`, so the push-path data dependency is
     # expressed as a separate job rather than a conditional edge.
-    needs: changes
+    needs: [changes, build-dist]
     # PR: only when image inputs changed. merge_group: always — a queue
     # entry that compiled no dependents would make images-ok a rubber
     # stamp. Never push/tag/dispatch — that is build-dependents-push.
-    if: ${{ !cancelled() && ((github.event_name == 'pull_request' && needs.changes.outputs.images == 'true') || github.event_name == 'merge_group') }}
+    # `needs.build-dist.result == 'success'` gates on the shared dist
+    # artifact — with `!cancelled()` replacing the default
+    # all-needs-succeeded, a failed build-dist would otherwise let this
+    # leg run and fail confusingly at `COPY dist/`.
+    if: ${{ !cancelled() && needs.build-dist.result == 'success' && ((github.event_name == 'pull_request' && needs.changes.outputs.images == 'true') || github.event_name == 'merge_group') }}
     strategy:
       fail-fast: false
       matrix:
@@ -442,25 +492,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Set up Node (for dist/ bundling)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - name: Download dist artifact
+        # Built once by build-dist; each Dockerfile COPYs a slice of
+        # dist/ into its image. `context: .` in the build step below
+        # picks it up from the working directory.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          node-version: "22"
+          name: dist-built
+          path: dist/
 
-      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
-        # Composite action: pinned bun (not `latest` — an unpinned bun
-        # release changing under a release build is a flake vector), bun
-        # package cache restore, and `bun install --frozen-lockfile`
-        # (a bare `bun install` can silently drift from bun.lock).
-        uses: ./.github/actions/setup-switchroom
-
-      - name: Build dist/
-        env:
-          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
-          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
-          # stays silent and dev builds fall back to package.json.
-          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: npm run build
+      - name: Restore exec bits on bundled CLIs
+        # upload-artifact stores a zip and strips POSIX exec bits on
+        # download; scripts/build.mjs chmods every entry-point bundle
+        # 0o755 because the runtime invokes them directly, and a
+        # Dockerfile COPY preserves the (now-stripped) source mode. Mirrors
+        # ci-tests-core.yml's dist-built consumers.
+        run: |
+          chmod +x dist/cli/*.js dist/cli/*.mjs 2>/dev/null || true
 
       - name: Set up Docker Buildx
         # Composite action, NOT docker/setup-buildx-action directly (#3815).
@@ -548,12 +596,12 @@ jobs:
     # and the explicit base-success check (the push-path data
     # dependency the PR/merge_group leg deliberately drops). Keep the
     # strategy + steps below IN SYNC with build-dependents.
-    needs: [changes, build-base]
-    # `!cancelled() && base succeeded` (not the default
-    # all-needs-succeeded, so a FAILED base blocks rather than
+    needs: [changes, build-base, build-dist]
+    # `!cancelled() && base succeeded && dist built` (not the default
+    # all-needs-succeeded, so a FAILED base or dist blocks rather than
     # silently skips), restricted to the publishing events. Never PR
     # or merge_group — those are build-dependents' job.
-    if: ${{ !cancelled() && needs.build-base.result == 'success' && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+    if: ${{ !cancelled() && needs.build-base.result == 'success' && needs.build-dist.result == 'success' && github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
     strategy:
       fail-fast: false
       matrix:
@@ -577,25 +625,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Set up Node (for dist/ bundling)
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+      - name: Download dist artifact
+        # Built once by build-dist; each Dockerfile COPYs a slice of
+        # dist/ into its image. `context: .` in the build step below
+        # picks it up from the working directory.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
-          node-version: "22"
+          name: dist-built
+          path: dist/
 
-      - name: Set up workspace (pinned bun + warm cache + frozen lockfile)
-        # Composite action: pinned bun (not `latest` — an unpinned bun
-        # release changing under a release build is a flake vector), bun
-        # package cache restore, and `bun install --frozen-lockfile`
-        # (a bare `bun install` can silently drift from bun.lock).
-        uses: ./.github/actions/setup-switchroom
-
-      - name: Build dist/
-        env:
-          # Arms the mis-stamp guard in scripts/build.mjs: on a tag build this is
-          # the tag (e.g. v0.15.56); on non-tag builds it is empty so the guard
-          # stays silent and dev builds fall back to package.json.
-          TAG_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-        run: npm run build
+      - name: Restore exec bits on bundled CLIs
+        # upload-artifact stores a zip and strips POSIX exec bits on
+        # download; scripts/build.mjs chmods every entry-point bundle
+        # 0o755 because the runtime invokes them directly, and a
+        # Dockerfile COPY preserves the (now-stripped) source mode. Mirrors
+        # ci-tests-core.yml's dist-built consumers.
+        run: |
+          chmod +x dist/cli/*.js dist/cli/*.mjs 2>/dev/null || true
 
       - name: Set up Docker Buildx
         # Composite action, NOT docker/setup-buildx-action directly (#3815).
@@ -1229,6 +1275,7 @@ jobs:
   images-ok:
     needs:
       - changes
+      - build-dist
       - build-base
       - merge-base
       - build-dependents
@@ -1254,6 +1301,7 @@ jobs:
           fi
           fail=0
           for pair in \
+            "build-dist=${{ needs.build-dist.result }}" \
             "build-base=${{ needs.build-base.result }}" \
             "merge-base=${{ needs.merge-base.result }}" \
             "build-dependents=${{ needs.build-dependents.result }}" \
