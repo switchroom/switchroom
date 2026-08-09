@@ -5895,6 +5895,167 @@ print(
     "_search_kwargs() locale forwarding and the explicit recall-path analyzer are preserved"
 )
 PYEOF
+# ── /metrics endpoint-label cardinality: template the WHOLE id segment ────────
+#
+# UPSTREAM PATCH — DELETE THIS BLOCK when vectorize-io/hindsight carries the fix
+# (or when the pinned digest above is bumped past it). It patches upstream
+# `hindsight_api/metrics.py`, a file switchroom does not own; the build asserts
+# the pre-patch text first, so a bump that already fixed it fails LOUDLY here
+# rather than silently double-patching. Reproduce with:
+#   curl -s localhost:18888/metrics | grep -o 'endpoint="[^"]*"' | sort -u | wc -l
+#
+# THE DEFECT, in the real shipping source (metrics.py:144 at the pinned digest):
+#
+#     _METRIC_UUID_RE = re.compile(r"/[0-9a-f]{8}-[0-9a-f]{4}-...-[0-9a-f]{12}")
+#
+# `normalize_http_endpoint` runs this over `request.url.path` (api/http.py:3884)
+# to bound the cardinality of the `endpoint` metric label. The pattern is
+# anchored to a `/` on the LEFT but to nothing on the RIGHT, so it only templates
+# a path segment that IS a bare UUID. Hindsight document ids are COMPOSITE —
+# `<uuid>-r<uuid>-<uuid>[-pNofM[-pNofM]]`, and for agent-scoped documents
+# `agent-<hex>-r<uuid>-<uuid>[-pNofM]` — so:
+#
+#   * a uuid-LEADING id gets its first UUID templated and the rest survives:
+#       endpoint="/v1/.../documents/{id}-r00223f38-6494-...-a771-...-p1of3"
+#   * an `agent-`-prefixed id has no UUID immediately after a `/` at all, so
+#     NOTHING is templated and the whole raw id lands in the label.
+#
+# Every document page ever fetched therefore mints a permanent OTel series set
+# that is never evicted. MEASURED on this fleet's live `switchroom-hindsight`
+# before the fix: /metrics served 23,303,354 bytes with 3,982 distinct
+# `endpoint` values (against 9 real route templates), taking 0.91s to generate.
+# `/etc/cron.d/hindsight-watch` scrapes every 15 min and the watchdog logged
+# `EVENT LOOP BLOCKED for >= 1.00s ... /health cannot be scheduled` at exactly
+# the scrape minutes (07:30:03, 08:30:03, 09:00:03, 09:15:03 UTC;
+# hindsight_event_loop_stalls_total = 4) — the scrape is a synchronous
+# `generate_latest()` on the serving loop, so this is a live availability bug,
+# not just a fat payload.
+#
+# THE FIX: anchor the templating to the WHOLE path segment by bracketing the
+# UUID with `[^/]*`. `[^/]` cannot cross a separator, so a match is always
+# confined to exactly one segment and neighbouring segments (`/chunks`,
+# `/reprocess`) are preserved. Deliberately NOT `.*`, which would swallow those
+# sub-resource routes and merge distinct endpoints.
+#
+# OVER-MATCH, checked rather than assumed: all 69 route templates registered by
+# the pinned image were normalised with the old and the new pattern — the
+# outputs are identical on every one, and no static segment is destroyed. The
+# only paths that change are those carrying a real id. Re-running the 3,982 live
+# label values through the new pattern collapses them to exactly 9.
+#
+# HONEST LIMITS (unchanged from upstream, deliberately not widened here):
+#   * `{document_id:path}` is a FastAPI path converter, so a document id may
+#     legally contain `/`. No such id exists on this fleet, but one would leave
+#     a residual un-templated segment. Fixing that needs route-template lookup,
+#     not a regex, and is upstream's call.
+#   * UUIDs are matched lower-case only, exactly as upstream.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+import re
+
+TAG = "switchroom hindsight metrics-endpoint-cardinality patch"
+
+f = pathlib.Path("/app/api/hindsight_api/metrics.py")
+s = f.read_text()
+
+OLD = (
+    '_METRIC_UUID_RE = re.compile('
+    r'r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"'
+    ')\n'
+)
+NEW = (
+    "# switchroom: anchored to the WHOLE path segment, not just a leading UUID.\n"
+    "# `[^/]` cannot cross a separator, so a match is confined to one segment and\n"
+    "# sub-resource routes (/chunks, /reprocess) survive. Composite document ids\n"
+    "# (`<uuid>-r<uuid>-<uuid>-pNofM`, `agent-<hex>-r<uuid>-<uuid>`) previously\n"
+    "# leaked into the `endpoint` label and minted one never-evicted OTel series\n"
+    "# set per document page: 3,982 distinct label values / 23MB of /metrics on a\n"
+    "# 9-route service, and a >1s event-loop stall on every scrape.\n"
+    "_METRIC_UUID_RE = re.compile(\n"
+    '    r"/[^/]*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[^/]*"\n'
+    ")\n"
+)
+
+n = s.count(OLD)
+assert n == 1, (
+    f"{TAG}: anchor found {n}x (expected 1) in hindsight_api/metrics.py — either "
+    "upstream reformatted _METRIC_UUID_RE or the pinned digest already carries the "
+    "fix. If upstream fixed it, DELETE this block (and its tests); otherwise "
+    "re-author the anchor in docker/Dockerfile.hindsight."
+)
+s = s.replace(OLD, NEW, 1)
+f.write_text(s)
+
+# ---- verification: BEHAVIOURAL, not a re-grep of the text we just wrote ----
+t = f.read_text()
+assert OLD not in t, f"{TAG}: the unanchored upstream pattern is still present after patching"
+ast.parse(t)
+
+# Execute the module-level id-templating constants and normalize_http_endpoint
+# STRAIGHT OUT OF THE PATCHED FILE in an isolated namespace, then drive them
+# with real ids. `import hindsight_api.metrics` is not an option here: this RUN
+# uses the system python3, which has no opentelemetry — but the point of the
+# assertion is the regex behaviour, and this proves it against the exact bytes
+# that ship rather than against a copy of them.
+tree = ast.parse(t)
+WANTED = {"_METRIC_BANK_SEGMENT_RE", "_METRIC_UUID_RE", "_METRIC_NUMERIC_ID_RE"}
+nodes = [
+    node
+    for node in tree.body
+    if (
+        isinstance(node, ast.Assign)
+        and any(getattr(tgt, "id", None) in WANTED for tgt in node.targets)
+    )
+    or (isinstance(node, ast.FunctionDef) and node.name == "normalize_http_endpoint")
+]
+assert len(nodes) == 4, (
+    f"{TAG}: expected 3 module-level id-templating regexes + normalize_http_endpoint, "
+    f"found {len(nodes)} — upstream restructured metrics.py; re-author this patch"
+)
+ns = {"re": re}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), "<metrics-patch>", "exec"), ns)
+normalize = ns["normalize_http_endpoint"]
+
+DOCS = "/v1/default/banks/overlord/documents/"
+TPL = "/v1/default/banks/{bank_id}/documents/{id}"
+# Every id below is a VERBATIM document id read from this fleet's live hindsight.
+UUID_LEADING = "c97ca37d-7350-4614-881f-86de20a592de-rd04165cc-28f2-4a5f-b26c-dda0d3f18a9a-dc76c2b4-65da-4e45-9632-2beb53ed9134-p3of3"
+DOUBLE_PAGED = "a7e62e47-03e2-4833-8b22-6d1f403eae41-r2006281d-a396-4a3f-bd94-4f2c4653ca3d-11c76e6c-c8c5-4e84-afa7-263ee3e8b02f-p3of10-p2of2"
+AGENT_SCOPED = "agent-a0e48667beb7ea9ad-r4190b384-15ec-4892-86b0-99a954debcc3-67832fa2-ab5f-4c76-a202-9538c877cda5"
+PLAIN_UUID = "e303f6cc-c858-4e97-a25e-c4ed85621641"
+
+CASES = [
+    # The three real id shapes, all collapsing to ONE label value.
+    (DOCS + UUID_LEADING, TPL),
+    (DOCS + DOUBLE_PAGED, TPL),
+    (DOCS + AGENT_SCOPED, TPL),
+    (DOCS + PLAIN_UUID, TPL),
+    # Sub-resource routes are preserved: the match may not cross a separator.
+    (DOCS + UUID_LEADING + "/chunks", TPL + "/chunks"),
+    (DOCS + AGENT_SCOPED + "/reprocess", TPL + "/reprocess"),
+    # Static segments are untouched (no over-match).
+    ("/v1/default/banks/overlord/memories/recall", "/v1/default/banks/{bank_id}/memories/recall"),
+    ("/v1/bank-template-schema", "/v1/bank-template-schema"),
+    ("/health", "/health"),
+    ("/metrics", "/metrics"),
+    # Upstream's other two arms still work.
+    ("/v1/default/banks/overlord/audit-logs/12345", "/v1/default/banks/{bank_id}/audit-logs/{id}"),
+    # Idempotent: an already-templated path is a fixed point.
+    (TPL, TPL),
+]
+for path, expected in CASES:
+    got = normalize(path)
+    assert got == expected, (
+        f"{TAG}: normalize_http_endpoint({path!r}) returned {got!r}, expected {expected!r}"
+    )
+
+print(
+    f"{TAG}: `endpoint` label templating anchored to the whole path segment; "
+    "composite document ids (uuid-leading, double-paged, agent-scoped) all collapse "
+    "to /documents/{id}; sub-resource routes and static segments unchanged"
+)
+PYEOF
 
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the

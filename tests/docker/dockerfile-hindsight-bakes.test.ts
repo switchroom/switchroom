@@ -1804,6 +1804,70 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the /metrics endpoint-label cardinality fix (assert-guarded, fail-loud)", () => {
+    // Upstream's `_METRIC_UUID_RE` is anchored to a "/" on the left and to
+    // NOTHING on the right, so it only templates a path segment that IS a bare
+    // UUID. Hindsight document ids are composite (`<uuid>-r<uuid>-<uuid>-pNofM`,
+    // and `agent-<hex>-r<uuid>-<uuid>` for agent-scoped documents), so the raw
+    // id leaked into the `endpoint` metric label and every document page ever
+    // fetched minted a permanent OTel series set. Measured live before the fix:
+    // 23,303,354 bytes of /metrics carrying 3,982 distinct `endpoint` values
+    // against 9 real route templates, 0.91s to generate, and a >1s event-loop
+    // stall on every 15-minute scrape.
+    //
+    // This test pins the SHAPE. The behaviour — that all four real id shapes
+    // collapse to one label, that /chunks and /reprocess are NOT swallowed, and
+    // that no registered route template normalises differently — is proven by
+    // tests/docker/hindsight-metrics-cardinality-patch.test.ts against the
+    // pinned image.
+
+    // The exact-once anchor guard (fail-loud on upstream drift OR on a base
+    // bump that already carries the fix).
+    expect(dockerfile).toContain(
+      'TAG = "switchroom hindsight metrics-endpoint-cardinality patch"',
+    );
+    expect(dockerfile).toContain(
+      'f"{TAG}: anchor found {n}x (expected 1) in hindsight_api/metrics.py — either "',
+    );
+
+    // The corrected pattern: segment-anchored with `[^/]*`, which cannot cross
+    // a separator. A `.*` here would pass the collapse property and silently
+    // merge /documents/{id}/chunks into /documents/{id}.
+    expect(dockerfile).toContain(
+      'r"/[^/]*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[^/]*"',
+    );
+    expect(dockerfile).not.toContain(
+      'r"/.*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}.*"',
+    );
+
+    // The post-patch verification must DRIVE normalize_http_endpoint, not
+    // re-grep the text the block just wrote. Pin the mechanism (exec the real
+    // module-level nodes out of the patched file) and the fixture table, so a
+    // future edit cannot downgrade it to a substring check.
+    expect(dockerfile).toContain('ns = {"re": re}');
+    expect(dockerfile).toContain('normalize = ns["normalize_http_endpoint"]');
+    expect(dockerfile).toContain(
+      "expected 3 module-level id-templating regexes + normalize_http_endpoint",
+    );
+    // The sub-resource cases are the ones that catch an over-broad fix.
+    expect(dockerfile).toContain(
+      '(DOCS + UUID_LEADING + "/chunks", TPL + "/chunks")',
+    );
+    expect(dockerfile).toContain(
+      '(DOCS + AGENT_SCOPED + "/reprocess", TPL + "/reprocess")',
+    );
+    // The agent-scoped shape is the one upstream templated NOT AT ALL; a fix
+    // that only handles the uuid-leading shape must not pass.
+    expect(dockerfile).toMatch(/AGENT_SCOPED = "agent-[0-9a-f]+-r[0-9a-f-]+"/);
+    expect(dockerfile).toContain("assert got == expected, (");
+
+    // The removal note: this patches a repo we do not own, so the block must
+    // say so and say when to delete it.
+    expect(dockerfile).toMatch(
+      /UPSTREAM PATCH — DELETE THIS BLOCK when vectorize-io\/hindsight carries the fix/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
