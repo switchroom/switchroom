@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.20.21 — recall slot floors scale with the `max_memories` cap, and release tags retag unchanged images instead of rebuilding them
+
 ### Fixed: recall slot floors now scale with the `max_memories` cap (own/additional bank crowd-out)
 
 - **The per-turn recall slot floors that reserve a minimum for the agent's OWN
