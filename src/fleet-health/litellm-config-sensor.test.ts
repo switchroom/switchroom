@@ -506,4 +506,33 @@ services:
     const { res } = scan(compose, "3.14");
     expect(res.findings.some((f) => f.signal === "litellm-passthrough-mount-stale")).toBe(false);
   });
+
+  it("skips the python-version resolve (no docker, no SKIP/OK log) when there is no versioned mount to check", () => {
+    // Gating fix: resolving the live image's python version costs two
+    // `docker exec`s, so it must not run — and must not emit a misleading
+    // "could not resolve" SKIP — on a compose that has zero versioned mounts.
+    const compose = `
+services:
+  litellm:
+    volumes:
+      - '/svc/p/custom_pacing.py:/app/custom_pacing.py'
+`;
+    let pythonVersionCalls = 0;
+    const logs: string[] = [];
+    const res = scanLitellmConfig({
+      path: CONFIG_PATH,
+      existsFn: (p) => (p === COMPOSE_PATH ? true : true),
+      readFn: (p) => (p === COMPOSE_PATH ? compose : PACER_CONFIG),
+      pythonVersionFn: () => {
+        pythonVersionCalls += 1;
+        return "3.14";
+      },
+      log: (m) => logs.push(m),
+      nowIso: "2026-08-09T00:00:00.000Z",
+    });
+    expect(pythonVersionCalls).toBe(0);
+    expect(res.findings.some((f) => f.signal === "litellm-passthrough-mount-stale")).toBe(false);
+    expect(logs.some((l) => /passthrough-mount check SKIPPED/.test(l))).toBe(false);
+    expect(logs.some((l) => /every versioned site-packages shadow/.test(l))).toBe(false);
+  });
 });

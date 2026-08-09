@@ -144,8 +144,10 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     // an outage to surface it. `constraint-violation`: the deploy has quietly
     // broken the mount-version invariant the pacer's passthrough metering
     // depends on. severity 3 — a silent correctness defect on the shared proxy
-    // that no health check would otherwise catch, and the exact residual hazard
-    // left open by the callback-mount guard (#4553).
+    // that no health check would otherwise catch. Scope: this covers a mount
+    // pinned to the WRONG python version, NOT a passthrough mount removed from
+    // the compose entirely — removal has no config anchor to test against and
+    // stays uncovered (tracked separately in #4558).
     failure_mode: "constraint-violation",
     severity: 3,
     job_spec: "fleet-stays-healthy",

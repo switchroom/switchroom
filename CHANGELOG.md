@@ -43,8 +43,10 @@ now an anomaly worth investigating, not the norm.
   versioned `pythonX.Y` site-packages shadow mount against the live image's
   actual CPython version (resolved from the live container) and raises
   `litellm-passthrough-mount-stale` into the priority ledger
-  (`src/litellm/passthrough-mount-guard.ts`) — closing the residual hazard the
-  callback-mount guard left open.
+  (`src/litellm/passthrough-mount-guard.ts`). Scope: this catches a mount pinned
+  to the WRONG python version, not a mount that was removed from the compose
+  entirely — a removed passthrough mount has no config anchor to test against
+  and stays uncovered (tracked separately in #4558).
 
 - **hindsight: recall-pool split follow-ups — first-boot health headroom, an
   audible `hindsight.env` conflict, and convergence on a disabled split.** Three

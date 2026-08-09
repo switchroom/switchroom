@@ -41,7 +41,10 @@ import {
   canReadComposeMounts,
   detectMissingCallbackMounts,
 } from "../litellm/callback-mount-guard.js";
-import { detectStalePassthroughMounts } from "../litellm/passthrough-mount-guard.js";
+import {
+  detectStalePassthroughMounts,
+  extractVersionedSitePackagesMounts,
+} from "../litellm/passthrough-mount-guard.js";
 
 /** The pseudo-agent the litellm misconfig finding is attributed to. It is not a
  *  real switchroom agent — it names the shared LiteLLM proxy so the ledger's
@@ -286,17 +289,23 @@ export function scanLitellmConfig(
     });
   }
 
-  // Passthrough / shadow-mount version coherence: a patch mount whose target
+  // Passthrough / shadow-mount version STALENESS: a patch mount whose target
   // hard-codes a CPython minor version the live image no longer ships lands at
   // an inert path and SILENTLY drops the patch — no crash, unlike the callback
-  // case above, so nothing but this check would surface it. It is the residual
-  // hazard #4553's callback guard left open. Resolving the image's real python
-  // version needs the live container, so it goes through an injectable seam; a
-  // null result (docker down, no container, off-host CI/dev) is a visible skip,
-  // never a fabricated finding.
+  // case above, so nothing but this check would surface it. Scope note: this
+  // detects a mount pinned to the WRONG python version, not a mount that was
+  // removed entirely — removal has no config anchor to test against and stays
+  // uncovered (tracked in #4558). Resolving the image's real python version
+  // costs two `docker exec`s, so gate it behind "there is actually a versioned
+  // mount to validate": on a compose with zero versioned mounts there is
+  // nothing to check, so skip the resolve (and its log) entirely rather than
+  // paying ~10s and emitting a misleading "could not resolve" line every scan.
+  const versionedMounts =
+    composeText !== null ? extractVersionedSitePackagesMounts(composeText) : null;
+  const hasVersionedMounts = versionedMounts !== null && versionedMounts.length > 0;
   const pythonVersionFn = opts.pythonVersionFn ?? resolveLiveLitellmPythonVersion;
-  const actualPythonVersion = composeText !== null ? pythonVersionFn() : null;
-  if (composeText !== null && canReadComposeMounts(composeText) && actualPythonVersion === null) {
+  const actualPythonVersion = hasVersionedMounts ? pythonVersionFn() : null;
+  if (hasVersionedMounts && actualPythonVersion === null) {
     log(
       `fleet-health: litellm-config sensor — passthrough-mount check SKIPPED, ` +
         `could not resolve the live litellm image's CPython version (docker down, no ` +
@@ -304,7 +313,7 @@ export function scanLitellmConfig(
     );
   }
   const staleMounts = detectStalePassthroughMounts(composeText, actualPythonVersion);
-  if (composeText !== null && actualPythonVersion !== null && staleMounts.length === 0) {
+  if (hasVersionedMounts && actualPythonVersion !== null && staleMounts.length === 0) {
     log(
       `fleet-health: litellm-config sensor OK — every versioned site-packages shadow ` +
         `mount in ${composePath} matches the live image's CPython ${actualPythonVersion}`,
