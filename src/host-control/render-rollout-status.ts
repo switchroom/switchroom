@@ -31,6 +31,14 @@ import {
   HOSTD_TEMPLATE_LAST_CHANGED,
   hostdTemplateRegenVerdict,
 } from "../config/hostd-template-version.js";
+// #4571 — the host CLI's install record + the DERIVED upgrade command. Pure
+// functions only (no fs from the renderer): the stamp arrives on the state.
+import {
+  hostCliInstallCommand,
+  hostCliInstallShellCommand,
+  shouldRefuseStaleHostCli,
+  type HostCliStamp,
+} from "../cli/host-cli-stamp.js";
 
 /** Per-agent progress an accumulator (the narrator) feeds the renderer. */
 export type AgentRollStatus = "pending" | "running" | "done" | "failed";
@@ -112,6 +120,15 @@ export interface RolloutRenderState {
   elapsedMs?: number;
   /** True once the hostd/web refresh was deferred to a host-side run. */
   deferred?: boolean;
+  /**
+   * The HOST operator CLI's own install record (#4571), when hostd could read
+   * `~/.switchroom/host-cli.json`. Two things depend on it, and both used to be
+   * guesses: whether the "still host-side — upgrade the CLI" line belongs on
+   * the card at all (a converged host CLI must not be listed as outstanding),
+   * and what the upgrade command actually is (`sudo npm i -g` is wrong on the
+   * user-owned nvm prefix this fleet actually runs).
+   */
+  hostCli?: HostCliStamp;
   /** Terminal outcome — set only once the roll finished. */
   terminal?: "completed" | "error";
   /** Step that stopped a failed roll. */
@@ -328,33 +345,52 @@ function etaLine(s: RolloutRenderState): string | null {
  * When the regen IS required, both residual commands collapse into one
  * copy-paste line.
  */
-function deferredLines(target: string, fromVersion?: string): string[] {
-  const bare = target.trim().replace(/^v/, "");
+function deferredLines(
+  target: string,
+  fromVersion?: string,
+  hostCli?: HostCliStamp,
+): string[] {
   const head = [
     `**Verified on ${target}** — every component this roll owned passed \`verify-components\`, so this is host convergence, not just the agents. Anything the roll was told to skip is named in its warnings.`,
-    `**Still host-side (nothing in a roll can do these):**`,
   ];
+  // #4571 — the host CLI line is CONDITIONAL now. A roll refuses to start
+  // against a stale host CLI, so on a completed roll the stamp normally says
+  // the host CLI is already on target — printing "still host-side: upgrade the
+  // CLI" there is the same false residual #3928 removed for switchroom-web.
+  const hostCliOutstanding = hostCli === undefined || shouldRefuseStaleHostCli(hostCli, target);
+  if (hostCli && !hostCliOutstanding) {
+    head.push(
+      `Host operator CLI: **on ${hostCli.version}** (read from \`~/.switchroom/host-cli.json\`) — nothing to do.`,
+    );
+  }
+  const cliCommand = hostCliInstallCommand(hostCli, target);
+  const cliLine = hostCli
+    ? `- host operator CLI — observed **${hostCli.version}**, run: \`${cliCommand}\``
+    : `- host operator CLI (version not observable from here — no \`~/.switchroom/host-cli.json\`) — ${cliCommand}`;
   const verdict = hostdTemplateRegenVerdict(target, fromVersion);
-  if (verdict === "required") {
+  // #4269's one-copy-paste block, preserved only where it is still CORRECT:
+  // both residuals collapse into one line when the host CLI's upgrade is a
+  // pasteable command (see hostCliInstallShellCommand for when it is not).
+  const collapsible =
+    verdict === "required" && hostCliOutstanding
+      ? hostCliInstallShellCommand(hostCli, target)
+      : undefined;
+  if (collapsible) {
     return [
       ...head,
+      `**Still host-side (nothing in a roll can do these):**`,
       `- host operator CLI + hostd template regen — regen is **REQUIRED** for this roll (hostd mounts/env changed in ${HOSTD_TEMPLATE_LAST_CHANGED}). One copy-paste:`,
-      `  \`sudo npm i -g switchroom@${bare} && switchroom hostd install --tag ${target}\``,
+      `  \`${collapsible} && switchroom hostd install --tag ${target}\``,
     ];
   }
-  const cliLine = `- host operator CLI — \`sudo npm i -g switchroom@${bare}\``;
-  if (verdict === "not-needed") {
-    return [
-      ...head,
-      cliLine,
-      `- hostd template regen: **not needed** for this release — hostd mounts/env unchanged since ${HOSTD_TEMPLATE_LAST_CHANGED}.`,
-    ];
-  }
-  return [
-    ...head,
-    cliLine,
-    `- hostd template regen (only if the release changed hostd mounts/env) — \`switchroom hostd install --tag ${target}\``,
-  ];
+  const regenLine =
+    verdict === "required"
+      ? `- hostd template regen — **REQUIRED** for this roll (hostd mounts/env changed in ${HOSTD_TEMPLATE_LAST_CHANGED}): \`switchroom hostd install --tag ${target}\``
+      : verdict === "not-needed"
+        ? `- hostd template regen: **not needed** for this release — hostd mounts/env unchanged since ${HOSTD_TEMPLATE_LAST_CHANGED}.`
+        : `- hostd template regen (only if the release changed hostd mounts/env) — \`switchroom hostd install --tag ${target}\``;
+  const outstanding = [...(hostCliOutstanding ? [cliLine] : []), regenLine];
+  return [...head, `**Still host-side (nothing in a roll can do these):**`, ...outstanding];
 }
 
 /**
@@ -412,7 +448,8 @@ function renderWith(s: RolloutRenderState, compact: boolean): string {
     if (checklist.length > 0) parts.push("", ...checklist);
     if (singletons.length > 0) parts.push("", ...singletons);
     if (warnings.length > 0) parts.push("", ...warnings);
-    if (s.deferred !== false) parts.push("", ...deferredLines(s.target, s.fromVersion));
+    if (s.deferred !== false)
+      parts.push("", ...deferredLines(s.target, s.fromVersion, s.hostCli));
     return parts.join("\n");
   }
 

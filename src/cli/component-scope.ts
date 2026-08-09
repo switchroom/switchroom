@@ -43,6 +43,7 @@
  */
 
 import type { ComponentVersion } from "./component-versions.js";
+import { hostCliInstallCommand, type HostCliStamp } from "./host-cli-stamp.js";
 
 /**
  * The mechanism that converges a component onto the release target.
@@ -142,11 +143,22 @@ export function classifyComponent(c: ComponentVersion): ComponentOwner {
  * Shared by the doctor row's `fix:` and the rollout drift gate's failure
  * text so an operator is never given two different answers for the same
  * drifted component.
+ *
+ * `hostCli` (#4571) is the host CLI's own record of how it was installed. When
+ * present, the `cli` remediation is derived from it instead of assuming the
+ * self-updatable static binary: `switchroom update` is a no-op on an npm
+ * install, and `sudo npm i -g` is actively wrong on a user-owned nvm prefix.
  */
-export function remediationFor(owner: ComponentOwner, target: string): string {
+export function remediationFor(
+  owner: ComponentOwner,
+  target: string,
+  hostCli?: HostCliStamp,
+): string {
   switch (owner.kind) {
     case "cli":
-      return `switchroom update  (self-updates the host CLI to ${target} first, then everything else)`;
+      return hostCli
+        ? `${hostCliInstallCommand(hostCli, target)}  (upgrade the host CLI FIRST — everything else is driven by it)`
+        : `switchroom update  (self-updates the host CLI to ${target} first, then everything else)`;
     case "web":
       return `switchroom webd install --tag ${target}  (separate compose project — regenerates + recreates switchroom-web)`;
     case "hostd":

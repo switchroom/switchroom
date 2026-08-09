@@ -125,7 +125,18 @@ The tag push triggers `docker-images` and `release`. `release` internally waits 
 ### Rehearsing a workflow change without releasing anything
 `gh workflow run release.yml --ref <branch>` — `dry_run` defaults to `true`, so it builds, checksums and verifies the full bundle and attaches it as a workflow artifact, touching no GitHub Release, no npm, and no image tags. This is the only supported way to prove a change to the release pipeline before a real tag.
 
-## Step 4 — Fleet rollout (operator-gated, canary-first)
+## Step 4 — HOST OPERATOR CLI FIRST (#4571)
+
+**The host CLI is upgraded BEFORE the fleet, not after.** It is what runs `switchroom apply`, `vault`, `doctor` and the *next* roll host-side, so a host CLI left behind means every later host-shell command runs retired code. Treating it as a trailing chore is how it silently drifted to **0.20.16 while the fleet ran 0.20.21** — five releases, with every roll exiting green.
+
+This is now **enforced, not advised**: `switchroom rollout` reads `~/.switchroom/host-cli.json` (the stamp every host-context CLI invocation refreshes) and **refuses to start** when the host CLI is observably older than the target — before a single agent restarts. The refusal names the exact install command, derived from how the host CLI was *actually* installed.
+
+- Ask the operator to run the upgrade on the host **before** you fire the roll. Do not hand them `sudo npm i -g switchroom@X` from memory: that is wrong on a user-owned nvm prefix (it installs into a different tree, or root-poisons this one). Take the command from `switchroom doctor`'s `cli (host)` fix line or from the rollout refusal text — both derive it from the stamp.
+- Confirm it landed: `switchroom --version` on the host shell reports the target. Any host-context switchroom command also refreshes the stamp, so the gate sees the new version immediately.
+- `--allow-stale-host-cli` is the escape hatch and must be a deliberate, stated decision — it leaves the host CLI drifted and says so loudly in the roll's warnings.
+- A host CLI predating this feature writes no stamp. The gate then does not block (it cannot know), and the roll's terminal card says so instead of claiming convergence. Confirm host-side.
+
+## Step 5 — Fleet rollout (operator-gated, canary-first)
 
 - Fire the rollout via the hostd rollout path (`mcp__hostd__rollout`), which pops an **approval card**. Do NOT roll without the operator tapping approve.
 - Canary discipline: roll the release-critical canary agent first (the test-harness agent, per CLAUDE.md > Release canary discipline), monitor its logs + a smoke check, then stagger the rest per-agent with a `--version` assertion each (guards the `:latest` pull-race).

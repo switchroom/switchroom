@@ -54,8 +54,23 @@ import { registerHindsightBenchCommand } from "./hindsight-bench.js";
 import { registerOpenRouterWatchCommand } from "./openrouter-watch.js";
 import { registerConfigRepoCommand } from "./config-repo.js";
 import { captureEvent, installGlobalErrorHandlers } from "../analytics/posthog.js";
+import { refreshHostCliStamp, runningInContainer } from "./host-cli-stamp.js";
 
 installGlobalErrorHandlers();
+
+// Record what the HOST operator CLI is, into the one host directory a
+// container can see (`~/.switchroom`). Without this the host binary's version
+// is unobservable from an agent-invoked rollout — which is how the host CLI
+// sat five releases behind the fleet while every roll exited green (#4571).
+// Runs on every invocation (idempotent: a byte-identical stamp is not
+// rewritten), no-ops inside a container, and is total: it cannot throw.
+refreshHostCliStamp({
+  version: VERSION,
+  execPath: process.execPath,
+  scriptPath: process.argv[1] ?? "",
+  bundleDir: import.meta.dirname,
+  inContainer: runningInContainer(),
+});
 
 // VERSION (aliased from SWITCHROOM_VERSION) resolves at runtime from the
 // shipped package.json, with src/build-info.ts as the fallback — see

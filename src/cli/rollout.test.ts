@@ -3110,3 +3110,141 @@ describe("rollout CLI — the pre-roll crash net and its --dry-run gate", () => 
     expect(err.join("")).toMatch(/reverted an UNCOMMITTED release\.pin/);
   });
 });
+
+// ── #4571 — HOST-CLI-FIRST gate ────────────────────────────────────────────
+//
+// The outcome under test is ORDERING: with the host operator CLI observably
+// behind the target, a roll must not reach the agent-roll step at all. Before
+// this gate the host CLI was a warning printed AFTER every agent had already
+// been restarted, which is how it drifted five releases (0.20.16 vs a 0.20.21
+// fleet) with every roll exiting green.
+//
+// Driven through the real command so the assertion is on what the verb DOES,
+// not on the pure predicate (which `host-cli-stamp.test.ts` covers). `--dry-run`
+// is the observation point: the plan print sits AFTER the gate, so "did the
+// plan render" is exactly "did the roll get as far as the agent steps", with no
+// docker, no spawn and nothing written.
+describe("host-CLI-first gate (#4571)", () => {
+  const OLD_HOST_HOME = process.env.SWITCHROOM_HOST_HOME;
+
+  afterEach(() => {
+    if (OLD_HOST_HOME === undefined) delete process.env.SWITCHROOM_HOST_HOME;
+    else process.env.SWITCHROOM_HOST_HOME = OLD_HOST_HOME;
+    process.exitCode = 0;
+  });
+
+  /**
+   * A tmp operator home holding a fleet config and a host-CLI stamp at
+   * `hostCliVersion` (omit for "no stamp"). `SWITCHROOM_HOST_HOME` points the
+   * stamp resolver at it — first in precedence, so the real `/host-home` on a
+   * switchroom host is never consulted.
+   */
+  function makeHost(hostCliVersion?: string): string {
+    const home = mkdtempSync(join(tmpdir(), "rollout-hostcli-"));
+    const dir = join(home, ".switchroom");
+    mkdirSync(dir, { recursive: true });
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `switchroom:\n  version: 1\ntelegram:\n  bot_token: x\n  forum_chat_id: "1"\n` +
+        `release:\n  pin: v0.0.1\nagents:\n  clerk:\n    topic_name: clerk\n`,
+      "utf8",
+    );
+    if (hostCliVersion) {
+      writeFileSync(
+        join(dir, "host-cli.json"),
+        JSON.stringify({
+          version: hostCliVersion,
+          installKind: "npm-global",
+          path: "/home/op/.nvm/versions/node/v22.22.2/lib/node_modules/switchroom/dist/cli/switchroom.js",
+          npmPrefix: "/home/op/.nvm/versions/node/v22.22.2",
+          ownerUid: 1000,
+          ownerUser: "op",
+        }),
+        "utf8",
+      );
+    }
+    process.env.SWITCHROOM_HOST_HOME = home;
+    return configPath;
+  }
+
+  async function runRollout(configPath: string, extra: string[] = []) {
+    const program = new Command();
+    program.exitOverride();
+    program.option("-c, --config <path>", "Path to switchroom.yaml config file");
+    registerRolloutCommand(program);
+    const out: string[] = [];
+    const err: string[] = [];
+    const writeOut = process.stdout.write.bind(process.stdout);
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stdout.write = ((s: string) => {
+      out.push(String(s));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((s: string) => {
+      err.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      // Target v0.0.1: older than the CLI running the tests, so the
+      // stale-DRIVING-cli guard above this one can never be what refuses.
+      await program.parseAsync(
+        ["--config", configPath, "rollout", "--pin", "v0.0.1", "--dry-run", ...extra],
+        { from: "user" },
+      );
+    } finally {
+      process.stdout.write = writeOut;
+      process.stderr.write = writeErr;
+    }
+    return { out: out.join(""), err: err.join("") };
+  }
+
+  it("REFUSES before the agent-roll step when the host CLI is behind the target", async () => {
+    const configPath = makeHost("0.0.0");
+    const { out, err } = await runRollout(configPath);
+
+    expect(process.exitCode).toBe(2);
+    expect(err).toMatch(/HOST operator CLI is v0\.0\.0, OLDER than the target v0\.0\.1/);
+    // The whole point: the roll never got as far as planning agent restarts.
+    expect(out).not.toMatch(/Rollout plan/);
+    expect(out).not.toMatch(/restart clerk/);
+  });
+
+  it("names the CORRECT install command — derived from the recorded prefix + owner, not `sudo npm i -g`", async () => {
+    const configPath = makeHost("0.0.0");
+    const { err } = await runRollout(configPath);
+
+    expect(err).toContain("npm i -g switchroom@0.0.1");
+    expect(err).toContain("run as op");
+    expect(err).toContain("/home/op/.nvm/versions/node/v22.22.2");
+    // `sudo npm i -g` on a user-owned nvm prefix either installs somewhere
+    // else or root-poisons the tree. It must not be what we tell the operator.
+    expect(err).not.toMatch(/(^|[;&|]\s*)sudo\s+npm/m);
+  });
+
+  it("PROCEEDS to the agent-roll step when the host CLI is already on the target", async () => {
+    const configPath = makeHost("0.0.1");
+    const { out } = await runRollout(configPath);
+
+    expect(process.exitCode).not.toBe(2);
+    expect(out).toMatch(/Rollout plan → v0\.0\.1:/);
+    expect(out).toMatch(/restart clerk/);
+  });
+
+  it("PROCEEDS with --allow-stale-host-cli, and says loudly that it is doing so", async () => {
+    const configPath = makeHost("0.0.0");
+    const { out, err } = await runRollout(configPath, ["--allow-stale-host-cli"]);
+
+    expect(out).toMatch(/Rollout plan → v0\.0\.1:/);
+    expect(out).toMatch(/restart clerk/);
+    expect(err).toMatch(/--allow-stale-host-cli/);
+    expect(err).toContain("npm i -g switchroom@0.0.1");
+  });
+
+  it("never blocks when no stamp exists — a host CLI predating the stamp writes none", async () => {
+    const configPath = makeHost(undefined);
+    const { out } = await runRollout(configPath);
+
+    expect(out).toMatch(/Rollout plan → v0\.0\.1:/);
+  });
+});

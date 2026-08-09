@@ -55,6 +55,14 @@ import {
   recoverPinJournal,
 } from "./rollout-pin-journal.js";
 import { resolveOperatorUid } from "./operator-uid.js";
+import {
+  HOST_CLI_STAMP_FILENAME,
+  PREFLIGHT_HOST_CLI_STALE_STEP,
+  hostCliInstallCommand,
+  observeHostCli,
+  readHostCliStamp,
+  shouldRefuseStaleHostCli,
+} from "./host-cli-stamp.js";
 import { resolveSelfInvocation } from "./self-invoke.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
@@ -2186,7 +2194,12 @@ export function createRolloutDeps(params: {
         if (cmd !== "docker") return { status: 1, stdout: "" };
         const r = dockerRun(args);
         return { status: r.ok ? 0 : 1, stdout: r.stdout };
-      }) satisfies ExecFn),
+      }) satisfies ExecFn,
+      // #4571 — inside hostd, SWITCHROOM_VERSION is the hostd IMAGE's CLI,
+      // not the host operator's. Hand the collector the stamped host version
+      // so the `cli (host)` row stops reporting the container's own version
+      // under a `(host)` label.
+      observeHostCli({}, params.hostdCtx)),
     persistPin: (pin) => {
       const before = readFileSync(configPath, "utf8");
       const after = setReleasePinInConfig(before, pin);
@@ -2279,8 +2292,17 @@ export function registerRolloutCommand(program: Command): void {
         "When set, the downgrade guard is relaxed so --pin may be older than the " +
         "current release.pin. All other safety rails apply unchanged.",
     )
+    .option(
+      "--allow-stale-host-cli",
+      "Roll the fleet even though the HOST operator CLI is observably behind " +
+        "the target. Escape hatch for the host-CLI-first gate: the host CLI is " +
+        "then left drifted and every later host-shell command runs old code. " +
+        "HOST-SHELL ONLY: deliberately not exposed as an `mcp__hostd__rollout` " +
+        "parameter, so an agent cannot roll past the gate on its own — " +
+        "overriding requires the same host shell needed to actually fix it.",
+    )
     .option("--dry-run", "Print the plan and exit without changing anything.")
-    .action(async (opts: { pin?: string; agents?: string; skipWeb?: boolean; allowDowngrade?: boolean; dryRun?: boolean }) => {
+    .action(async (opts: { pin?: string; agents?: string; skipWeb?: boolean; allowDowngrade?: boolean; allowStaleHostCli?: boolean; dryRun?: boolean }) => {
       // Crash recovery (host-shell path). A previous roll that was SIGKILLed
       // between the provisional `release.pin` write and its commit leaves a
       // journal on disk; revert it BEFORE reading the config, so this roll
@@ -2371,6 +2393,68 @@ export function registerRolloutCommand(program: Command): void {
         }
         process.exitCode = 2;
         return;
+      }
+      // #4571 — HOST-CLI-FIRST gate. The host operator CLI must already be on
+      // the target before a single agent moves.
+      //
+      // On the host-shell path the driving CLI IS the host CLI, so the
+      // `shouldRefuseStaleCli` guard above already enforces this. On the
+      // agent/hostd path it does not: the driving CLI is the hostd IMAGE's
+      // bundled CLI, and nothing in the roll ever observed the host binary —
+      // it was named in a trailing warning after every agent had already
+      // moved. That is how the host CLI reached five releases of drift with
+      // every roll exiting green.
+      //
+      // hostd mounts only `~/.switchroom` (hostd.ts:332): it cannot read
+      // `/usr/local/bin`, cannot read an nvm tree, and cannot `npm i -g` on
+      // the host. So the roll CANNOT install the host CLI itself and any step
+      // claiming to would be a lie. What it can do is REFUSE — deterministic,
+      // before the first mutation, with the correct install command derived
+      // from what the host CLI recorded about itself
+      // (`~/.switchroom/host-cli.json`, written by every host-context CLI
+      // invocation). Silence becomes impossible; the ordering becomes real.
+      //
+      // Conservative, like every other guard here: no stamp (a host CLI older
+      // than this feature never wrote one) or an unorderable version never
+      // blocks. `--allow-stale-host-cli` is the explicit override.
+      const hostCliStamp = readHostCliStamp();
+      if (
+        !opts.allowStaleHostCli &&
+        shouldRefuseStaleHostCli(hostCliStamp, target)
+      ) {
+        const observed = hostCliStamp?.version ?? "unknown";
+        const refusal =
+          `rollout refused: the HOST operator CLI is v${observed}, OLDER than ` +
+          `the target ${target}. The host CLI must be upgraded FIRST — it is ` +
+          `what runs \`switchroom apply\`, \`vault\`, \`doctor\` and the next ` +
+          `roll host-side, and leaving it behind is how it silently drifted ` +
+          `five releases. Run this on the host, then re-run the roll: ` +
+          `${hostCliInstallCommand(hostCliStamp, target)}. ` +
+          `(Observed from ${HOST_CLI_STAMP_FILENAME}, refreshed by every ` +
+          `host-context switchroom command — if you already upgraded, run any ` +
+          `switchroom command on the host to refresh it, or pass ` +
+          `--allow-stale-host-cli to roll anyway.) Nothing was changed.`;
+        process.stderr.write(refusal + "\n");
+        if (hostdCtx) {
+          process.stdout.write(
+            encodeRolloutResultLine({
+              ok: false,
+              rolled: [],
+              failedStep: PREFLIGHT_HOST_CLI_STALE_STEP,
+              got: observed,
+              warnings: [refusal],
+            }) + "\n",
+          );
+        }
+        process.exitCode = 2;
+        return;
+      }
+      if (opts.allowStaleHostCli && shouldRefuseStaleHostCli(hostCliStamp, target)) {
+        process.stderr.write(
+          `⚠️  --allow-stale-host-cli: rolling past a HOST operator CLI on ` +
+            `v${hostCliStamp?.version} (target ${target}). Fix it host-side ` +
+            `with: ${hostCliInstallCommand(hostCliStamp, target)}\n`,
+        );
       }
       // #2487 PR2 — downgrade guard: reject a version older than the
       // current release.pin on the hostd path UNLESS --allow-downgrade is
@@ -2505,9 +2589,28 @@ export function registerRolloutCommand(program: Command): void {
                 `full hostd template regen (only needed when a release changes ` +
                 `hostd's mounts/env) is \`switchroom hostd install --tag ${target}\` ` +
                 `host-side. `;
+        // #4571 — the host CLI clause is now derived from what was OBSERVED,
+        // not asserted unconditionally. Reaching here with the host CLI
+        // behind means `--allow-stale-host-cli` was passed (the gate refuses
+        // otherwise), so the three cases are: measured-and-current (say
+        // nothing — the old text claimed drift that no longer exists),
+        // measured-and-behind (name the version AND the command derived from
+        // the recorded install kind/prefix/owner — `sudo npm i -g` is wrong
+        // on a user-prefix nvm install), and unmeasured (say so honestly).
+        const hostCliClause = !hostCliStamp
+          ? `the host operator CLI's version could NOT be observed from here ` +
+            `(no ${HOST_CLI_STAMP_FILENAME} in the switchroom home — it is ` +
+            `written by any host-context switchroom command). Confirm it ` +
+            `host-side with \`switchroom --version\`; if it is behind: ` +
+            `${hostCliInstallCommand(undefined, target)}. `
+          : shouldRefuseStaleHostCli(hostCliStamp, target)
+            ? `still on the PRIOR version after this roll: the host operator ` +
+              `CLI (observed v${hostCliStamp.version}, target ${target}) — ` +
+              `you passed --allow-stale-host-cli. Fix it host-side: ` +
+              `${hostCliInstallCommand(hostCliStamp, target)}. `
+            : "";
         result.warnings.push(
-          `still on the PRIOR version after this roll: the host operator ` +
-            `CLI (\`sudo npm i -g switchroom@${normalizeVersion(target)}\`). ` +
+          hostCliClause +
             regenClause +
             `An agent-invoked rollout cannot recreate its own hostd ` +
             `container mid-roll without killing itself.` +

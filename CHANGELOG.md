@@ -15,6 +15,25 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **rollout: the host operator CLI is upgraded FIRST, and the roll refuses to
+  start until it is.** The v0.20.21 roll finished green while the host CLI sat
+  on 0.20.16 — five releases of drift. The one enumerative drift check was
+  measuring the wrong binary (the `cli (host)` row was built from the
+  *checking* process's version, so inside hostd it reported the container
+  image's CLI), and the only other signal was a trailing warning printed after
+  the fleet had already rolled, carrying advice (`sudo npm i -g switchroom@X`)
+  that is wrong for a user-owned npm prefix. Every host-context CLI invocation
+  now stamps `~/.switchroom/host-cli.json`, and `switchroom rollout` refuses
+  before the first mutation when the host CLI is behind the target, printing
+  the install command derived from the observed install.
+  `--allow-stale-host-cli` overrides (host shell only). An absent stamp or an
+  unorderable version never blocks. `switchroom doctor`'s `cli (host)` fix and
+  the rollout terminal card's host-side residual are derived from the same
+  stamp — and the card no longer lists the host CLI at all once it is
+  converged.
+
 ## v0.20.22 — recall budget default moves to `mid`, speaker-aware retain context, and fail-safe recall fact-type filtering
 
 ### Features
