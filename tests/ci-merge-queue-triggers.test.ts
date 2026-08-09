@@ -365,15 +365,24 @@ describe('merge queue — docker-images never publishes from an unmerged ref', (
     // job-wide exemption would wave those through — which is exactly the
     // bug this file exists to prevent.
     //
-    // Only `build-base` remains here. `build-dependents` used to be exempt
-    // too (its old bare `!= 'pull_request'` gate also meant "compile on
-    // merge_group"), but the build-base decoupling split the dependents
-    // build into two jobs: the PR/merge_group leg (`build-dependents`) now
-    // uses a POSITIVE event allowlist with no `!= 'pull_request'`
-    // shorthand, and the push leg (`build-dependents-push`) spells out
-    // `&& github.event_name != 'merge_group'` — so neither needs the
-    // exemption. See the "build-base decoupling" describe block below.
-    const ALLOWED_JOB_LEVEL_GATES = ['build-base']
+    // Two jobs are exempt: `build-base` and `build-dist`. Both mean
+    // "actually produce the build input" — build-base compiles the base
+    // image, build-dist bundles dist/ once for the dependent legs — and
+    // both MUST run on merge_group so the validation legs have something
+    // to build (else `images-ok` is a rubber stamp). Crucially, NEITHER
+    // pushes anything: build-base's push/cache-to are step-level and gated
+    // separately, and build-dist only uploads an in-run artifact. So the
+    // bare `!= 'pull_request'` job gate is safe on the queue ref for both.
+    //
+    // `build-dependents` used to be exempt too (its old bare
+    // `!= 'pull_request'` gate also meant "compile on merge_group"), but
+    // the build-base decoupling split the dependents build into two jobs:
+    // the PR/merge_group leg (`build-dependents`) now uses a POSITIVE event
+    // allowlist with no `!= 'pull_request'` shorthand, and the push leg
+    // (`build-dependents-push`) spells out `&& github.event_name !=
+    // 'merge_group'` — so neither needs the exemption. See the "build-base
+    // decoupling" describe block below.
+    const ALLOWED_JOB_LEVEL_GATES = ['build-base', 'build-dist']
 
     const lines = readFileSync(join(REPO, '.github/workflows/docker-images.yml'), 'utf8').split('\n')
     let job = '<workflow-level>'
