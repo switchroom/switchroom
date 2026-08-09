@@ -92,7 +92,9 @@ describe('manifest-only workflow jobs never set up buildx (no docker.io dependen
       'docker-images.yml:merge-dependents',
       'docker-images.yml:merge-hindsight',
       'docker-images.yml:promote-to-dev',
+      'docker-images.yml:retag-release',
       'docker-images.yml:retag-unchanged',
+      'docker-images.yml:tag-retag-plan',
       'promote.yml:promote',
     ])
   })
