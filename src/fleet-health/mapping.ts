@@ -135,6 +135,22 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "fleet-stays-healthy",
     signature: "litellm-callback-mount:missing-bind",
   },
+  "litellm-passthrough-mount-stale": {
+    // The live compose declares a passthrough/patch shadow mount whose target
+    // hard-codes a CPython minor version the live image no longer ships, so the
+    // mount lands at an inert path and the patch is silently dropped. Unlike the
+    // callback case this does NOT crash the proxy — it comes up "healthy" while
+    // running unpatched code, which is why it needs a standing sensor rather than
+    // an outage to surface it. `constraint-violation`: the deploy has quietly
+    // broken the mount-version invariant the pacer's passthrough metering
+    // depends on. severity 3 — a silent correctness defect on the shared proxy
+    // that no health check would otherwise catch, and the exact residual hazard
+    // left open by the callback-mount guard (#4553).
+    failure_mode: "constraint-violation",
+    severity: 3,
+    job_spec: "fleet-stays-healthy",
+    signature: "litellm-passthrough-mount:stale-python-version",
+  },
   "litellm-timeout-budget-drift": {
     // A per-deployment `timeout` in the live LiteLLM config no longer matches
     // the tier switchroom derived its client budgets from

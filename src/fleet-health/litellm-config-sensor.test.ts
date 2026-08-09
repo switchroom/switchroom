@@ -428,3 +428,82 @@ services:
     expect(logs.some((l) => /every custom callback module is/.test(l))).toBe(false);
   });
 });
+
+describe("scanLitellmConfig — passthrough shadow-mount version coherence", () => {
+  const CONFIG_PATH = "/svc/p/litellm-config.yaml";
+  const COMPOSE_PATH = "/svc/p/docker-compose.yml";
+  const PACER_CONFIG = `
+litellm_settings:
+  callbacks: ["custom_pacing.pacer_instance"]
+`;
+  const PASSTHROUGH_TARGET =
+    "/app/.venv/lib/python3.13/site-packages/litellm/proxy/pass_through_endpoints/" +
+    "llm_provider_handlers/anthropic_passthrough_logging_handler.py";
+
+  /** Compose with both mounts present and correct for a python3.13 image. */
+  const COMPOSE_313 = `
+services:
+  litellm:
+    volumes:
+      - '/svc/p/custom_pacing.py:/app/custom_pacing.py'
+      - '/svc/p/anthropic_passthrough_logging_handler.py:${PASSTHROUGH_TARGET}'
+`;
+
+  /** Inject the live image's python version so the suite never touches docker. */
+  function scan(compose: string | null, pyVersion: string | null, logs: string[] = []) {
+    const res = scanLitellmConfig({
+      path: CONFIG_PATH,
+      existsFn: (p) => (p === COMPOSE_PATH ? compose !== null : true),
+      readFn: (p) => {
+        if (p === COMPOSE_PATH) {
+          if (compose === null) throw new Error("ENOENT");
+          return compose;
+        }
+        return PACER_CONFIG;
+      },
+      pythonVersionFn: () => pyVersion,
+      log: (m) => logs.push(m),
+      nowIso: "2026-08-09T00:00:00.000Z",
+    });
+    return { res, logs };
+  }
+
+  it("raises a ledger finding when a 3.13 shadow mount runs on a 3.14 image", () => {
+    // The bug: an image bumped to python 3.14 moves site-packages, the 3.13
+    // mount lands at an inert path, and the passthrough patch silently drops.
+    const { res } = scan(COMPOSE_313, "3.14");
+    expect(res.status).toBe("violation");
+    const f = res.findings.find((x) => x.signal === "litellm-passthrough-mount-stale");
+    expect(f).toBeDefined();
+    expect(f!.agent).toBe(LITELLM_PROXY_PSEUDO_AGENT);
+    expect(f!.turn_id).toBe("litellm-passthrough-mount:3.13->3.14");
+    expect(f!.log_pointer).toContain(COMPOSE_PATH);
+    expect(f!.log_pointer).toContain("docker_compose_raw");
+    expect(f!.log_pointer).toContain("SILENTLY dropped");
+    // and it must be a signal the ledger can actually classify
+    expect(mapSignal(f!.signal)).toBeDefined();
+  });
+
+  it("passes when the shadow mount matches the live image's python version", () => {
+    const { res } = scan(COMPOSE_313, "3.13");
+    expect(res.findings.some((f) => f.signal === "litellm-passthrough-mount-stale")).toBe(false);
+  });
+
+  it("SKIPS visibly, never claims OK, when the image python version is unresolvable", () => {
+    const { res, logs } = scan(COMPOSE_313, null);
+    expect(res.findings.some((f) => f.signal === "litellm-passthrough-mount-stale")).toBe(false);
+    expect(logs.some((l) => /passthrough-mount check SKIPPED/.test(l))).toBe(true);
+    expect(logs.some((l) => /every versioned site-packages shadow/.test(l))).toBe(false);
+  });
+
+  it("does not flag a compose with no versioned shadow mounts", () => {
+    const compose = `
+services:
+  litellm:
+    volumes:
+      - '/svc/p/custom_pacing.py:/app/custom_pacing.py'
+`;
+    const { res } = scan(compose, "3.14");
+    expect(res.findings.some((f) => f.signal === "litellm-passthrough-mount-stale")).toBe(false);
+  });
+});
