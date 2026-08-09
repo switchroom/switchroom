@@ -590,7 +590,7 @@ describe("Dockerfile.hindsight shape", () => {
   });
 
   it("fixes HF-cache ownership with a scoped find in the SAME RUN as the download (no `chown -R` copy-up layer)", () => {
-    // Regression guard for #4571. `chown(2)` copy-ups a file on overlayfs
+    // Regression guard for #4566. `chown(2)` copy-ups a file on overlayfs
     // even when the ownership is UNCHANGED, so the old shape —
     //
     //   RUN … snapshot_download …            <- 133MB layer (the onnx graph)

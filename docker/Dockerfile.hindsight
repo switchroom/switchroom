@@ -5958,7 +5958,7 @@ RUN OLD_UID=$(id -u hindsight) && NEW_UID=11000 \
 # is absent or truncated, so we never ship a half-baked image.
 #
 # ONE `RUN`, and the ownership fixup is a SCOPED `find`, not `chown -R` —
-# both halves matter and neither alone is sufficient (#4571):
+# both halves matter and neither alone is sufficient (#4566):
 #
 #   * SCOPED. `chown(2)` triggers an overlayfs copy-up even when the
 #     ownership is UNCHANGED, so `chown -R` over the whole cache copied up
