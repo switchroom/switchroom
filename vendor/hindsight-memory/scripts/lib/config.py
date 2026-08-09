@@ -209,7 +209,17 @@ DEFAULTS = {
     "retainEveryNTurns": 10,
     "retainOverlapTurns": 2,
     "retainToolCalls": True,
-    "retainContext": "claude-code",
+    # Switchroom — speaker-aware retain context. Resolved per-retain via
+    # build_retain_payload's _resolve_template, which fills {agent} from
+    # SWITCHROOM_AGENT_NAME and {bank_id} from the target bank. Tells the
+    # consolidation LLM who is speaking on each line so first-person agent
+    # actions ("experience") are not confused with the operator's world facts.
+    "retainContext": (
+        "Transcript of Claude Code agent '{agent}' ({bank_id}). "
+        "'assistant'/tool lines are the agent's own first-person actions "
+        "(experience); 'user' lines are the human operator speaking (their "
+        "statements are world facts)."
+    ),
     "retainTags": [],
     "retainMetadata": {},
     # Switchroom-local: per-row Hindsight `observation_scopes` on every retain.

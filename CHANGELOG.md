@@ -18,6 +18,7 @@ now an anomaly worth investigating, not the norm.
 ### Features
 
 - **hindsight: default recall budget low->mid + fix stale budget comment**
+- **hindsight: speaker-aware retain context template ({agent}/{bank_id} resolved per-retain)**
 
 ## v0.20.21 — recall slot floors scale with the `max_memories` cap, and release tags retag unchanged images instead of rebuilding them
 

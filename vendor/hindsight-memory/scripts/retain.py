@@ -549,6 +549,11 @@ def build_retain_payload(
         "bank_id": bank_id,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "user_id": os.environ.get("HINDSIGHT_USER_ID", ""),
+        # Switchroom — the agent's own name, so a speaker-aware retainContext
+        # template can name whose first-person experience this transcript is.
+        # Empty outside switchroom (no SWITCHROOM_AGENT_NAME); a template that
+        # references {agent} then renders an empty slot, which is harmless.
+        "agent": os.environ.get("SWITCHROOM_AGENT_NAME", ""),
     }
 
     def _resolve_template(value: str) -> str:
@@ -682,7 +687,7 @@ def build_retain_payload(
         "bank_id": bank_id,
         "content": transcript,
         "document_id": document_id,
-        "context": config.get("retainContext", "claude-code"),
+        "context": _resolve_template(config.get("retainContext", "claude-code")),
         "metadata": metadata,
         "tags": tags,
         "observation_scopes": scope,
