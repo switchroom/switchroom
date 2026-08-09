@@ -15,6 +15,18 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### CI: `build-dependents` no longer serialized behind `build-base` on PR / merge_group
+
+- **docker-images: dependent image builds now run in parallel with `build-base`
+  on PRs and the merge queue** instead of waiting ~31s for it. On
+  `pull_request` / `merge_group` the dependents build FROM the published
+  `switchroom-base:latest` — no data dependency on the base built in the same
+  run — so the job is split into `build-dependents` (validation, no base
+  dependency) and `build-dependents-push` (the publish leg that still consumes
+  the freshly-built per-arch scratch base tag). `build-base` still runs and is
+  still aggregated by `images-ok`, so base-Dockerfile regressions are still
+  caught; this only takes it off the PR critical path.
+
 ### Bug fixes
 
 - **fleet health: a LiteLLM custom callback with no bind mount is now a loud
