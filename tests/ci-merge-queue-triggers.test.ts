@@ -327,15 +327,25 @@ describe('merge queue — docker-images never publishes from an unmerged ref', (
 
   it('no manifest job moves a user-facing tag on merge_group', () => {
     // merge-base / merge-dependents / merge-hindsight / promote-to-dev /
-    // retag-unchanged assign :latest / :sha-<short> / :dev with
-    // `imagetools create`.
+    // retag-unchanged / retag-release assign :latest / :sha-<short> /
+    // :dev / :vX.Y.Z with `imagetools create`.
     const manifestJobs = jobs.filter(([, job]) =>
       stepsOf(job).some((s) => (s.run ?? '').includes('imagetools create')),
     )
     expect(
       manifestJobs.map(([n]) => n).sort(),
       'the rule must still match the publishing jobs it guards',
-    ).toEqual(['merge-base', 'merge-dependents', 'merge-hindsight', 'promote-to-dev', 'retag-unchanged'])
+    ).toEqual([
+      'merge-base',
+      'merge-dependents',
+      'merge-hindsight',
+      'promote-to-dev',
+      // Release-tag twin of retag-unchanged: assigns :vX.Y.Z from the
+      // previous release's manifest when tag-retag-plan proved the
+      // image's inputs identical to that release.
+      'retag-release',
+      'retag-unchanged',
+    ])
 
     const offenders = manifestJobs.filter(([, job]) => !excludesMergeGroup(job.if)).map(([n]) => n)
 
