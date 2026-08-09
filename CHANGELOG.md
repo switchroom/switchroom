@@ -31,6 +31,21 @@ now an anomaly worth investigating, not the norm.
   (`src/litellm/callback-mount-guard.ts`), and `docker/litellm-pacer/README.md`
   documents the database as the only durable place to put the mount.
 
+- **fleet health: a stale versioned passthrough patch mount is now caught
+  before it silently drops the patch.** The pacer's
+  `anthropic_passthrough_logging_handler.py` patch mount shadows a file at a
+  hard-coded CPython minor version
+  (`/app/.venv/lib/python3.13/site-packages/…`). A future image built on python
+  3.14 moves site-packages, so the 3.13 target lands at an inert path and the
+  patch is SILENTLY dropped — no crash (unlike the callback case above), the
+  proxy comes up "healthy" on unpatched code, so nothing but a standing sensor
+  would surface it. The fleet-health LiteLLM sensor now validates every
+  versioned `pythonX.Y` site-packages shadow mount against the live image's
+  actual CPython version (resolved from the live container) and raises
+  `litellm-passthrough-mount-stale` into the priority ledger
+  (`src/litellm/passthrough-mount-guard.ts`) — closing the residual hazard the
+  callback-mount guard left open.
+
 - **hindsight: recall-pool split follow-ups — first-boot health headroom, an
   audible `hindsight.env` conflict, and convergence on a disabled split.** Three
   low-severity gaps left open when the recall/background worker split landed.
