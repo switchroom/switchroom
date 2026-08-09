@@ -34,9 +34,9 @@ import {
 // #4571 — the host CLI's install record + the DERIVED upgrade command. Pure
 // functions only (no fs from the renderer): the stamp arrives on the state.
 import {
+  compareHostCliToTarget,
   hostCliInstallCommand,
   hostCliInstallShellCommand,
-  shouldRefuseStaleHostCli,
   type HostCliStamp,
 } from "../cli/host-cli-stamp.js";
 
@@ -357,22 +357,33 @@ function deferredLines(
   // against a stale host CLI, so on a completed roll the stamp normally says
   // the host CLI is already on target — printing "still host-side: upgrade the
   // CLI" there is the same false residual #3928 removed for switchroom-web.
-  const hostCliOutstanding = hostCli === undefined || shouldRefuseStaleHostCli(hostCli, target);
-  if (hostCli && !hostCliOutstanding) {
+  //
+  // Dropping the line requires PROOF of convergence, not merely the absence of
+  // proof of drift: an unorderable stamp (`0.20.16-rc.1`, `sha-…`) is exactly
+  // what the gate declines to block on, and reading that silence as "converged"
+  // would print a fresh all-clear over the drift this file exists to expose.
+  const posture = compareHostCliToTarget(hostCli, target);
+  const hostCliOutstanding = posture !== "current-or-ahead";
+  if (posture === "current-or-ahead" && hostCli) {
     head.push(
       `Host operator CLI: **on ${hostCli.version}** (read from \`~/.switchroom/host-cli.json\`) — nothing to do.`,
     );
   }
   const cliCommand = hostCliInstallCommand(hostCli, target);
-  const cliLine = hostCli
-    ? `- host operator CLI — observed **${hostCli.version}**, run: \`${cliCommand}\``
-    : `- host operator CLI (version not observable from here — no \`~/.switchroom/host-cli.json\`) — ${cliCommand}`;
+  const cliLine = !hostCli
+    ? `- host operator CLI (version not observable from here — no \`~/.switchroom/host-cli.json\`) — ${cliCommand}`
+    : posture === "behind"
+      ? `- host operator CLI — observed **${hostCli.version}**, run: \`${cliCommand}\``
+      : `- host operator CLI — observed **${hostCli.version}**, which is not comparable to ${target} (a channel/pre-release build). Confirm host-side with \`switchroom --version\`; if it is behind: ${cliCommand}`;
   const verdict = hostdTemplateRegenVerdict(target, fromVersion);
   // #4269's one-copy-paste block, preserved only where it is still CORRECT:
   // both residuals collapse into one line when the host CLI's upgrade is a
   // pasteable command (see hostCliInstallShellCommand for when it is not).
+  // Only a PROVEN-behind host CLI collapses: the "not comparable, confirm
+  // host-side" caveat cannot survive being &&-chained any more than the
+  // "run as <user>" one can.
   const collapsible =
-    verdict === "required" && hostCliOutstanding
+    verdict === "required" && posture === "behind"
       ? hostCliInstallShellCommand(hostCli, target)
       : undefined;
   if (collapsible) {

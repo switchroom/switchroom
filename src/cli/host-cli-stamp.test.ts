@@ -6,6 +6,8 @@ import { join } from "node:path";
 import {
   HOST_CLI_STAMP_FILENAME,
   buildHostCliStamp,
+  compareHostCliToTarget,
+  hostCliConvergedOnTarget,
   hostCliInstallCommand,
   hostCliInstallShellCommand,
   npmPackageRoot,
@@ -280,7 +282,9 @@ describe("hostCliInstallCommand — the command must match how the host is ACTUA
       },
       target,
     );
-    expect(cmd).toContain("npm i -g switchroom@0.20.21");
+    expect(cmd).toContain(
+      "npm i -g --prefix /home/op/.nvm/versions/node/v22.22.2 switchroom@0.20.21",
+    );
     // The literal command must not be a sudo invocation. (It DOES contain the
     // word "sudo" inside the explicit "NOT under sudo" caution — that caution
     // is the point of this test, so match the invocation shape, not the word.)
@@ -301,7 +305,7 @@ describe("hostCliInstallCommand — the command must match how the host is ACTUA
       },
       target,
     );
-    expect(cmd).toBe("sudo npm i -g switchroom@0.20.21 (npm prefix /usr/local)");
+    expect(cmd).toBe("sudo npm i -g --prefix /usr/local switchroom@0.20.21");
   });
 
   it("points a static-binary install at `switchroom update`, not npm", () => {
@@ -335,7 +339,7 @@ describe("hostCliInstallShellCommand — pasteable ONLY when the caveat isn't lo
         },
         "v0.20.21",
       ),
-    ).toBe("sudo npm i -g switchroom@0.20.21");
+    ).toBe("sudo npm i -g --prefix /usr/local switchroom@0.20.21");
     expect(
       hostCliInstallShellCommand(
         { version: "0.20.16", installKind: "static-binary", path: "/usr/local/bin/switchroom" },
@@ -363,6 +367,40 @@ describe("hostCliInstallShellCommand — pasteable ONLY when the caveat isn't lo
   it("returns undefined with no stamp at all", () => {
     expect(hostCliInstallShellCommand(undefined, "v0.20.21")).toBeUndefined();
   });
+
+  // npm resolves the global prefix from the INVOKING user's npmrc, and under
+  // `sudo` that is root's — not necessarily the tree the stamp measured. A
+  // bare `-g` then converges a DIFFERENT install and leaves the observed one
+  // exactly as drifted as before, with the card reporting success.
+  it("carries the OBSERVED prefix, because sudo swaps in root's npmrc prefix", () => {
+    const rootOwnedElsewhere: HostCliStamp = {
+      version: "0.20.16",
+      installKind: "npm-global",
+      path: "/opt/npm-global/lib/node_modules/switchroom/dist/cli/switchroom.js",
+      npmPrefix: "/opt/npm-global",
+      ownerUid: 0,
+    };
+    expect(hostCliInstallShellCommand(rootOwnedElsewhere, "v0.20.21")).toBe(
+      "sudo npm i -g --prefix /opt/npm-global switchroom@0.20.21",
+    );
+    expect(hostCliInstallCommand(rootOwnedElsewhere, "v0.20.21")).toBe(
+      "sudo npm i -g --prefix /opt/npm-global switchroom@0.20.21",
+    );
+  });
+
+  it("omits --prefix when the stamp never recorded one", () => {
+    expect(
+      hostCliInstallShellCommand(
+        {
+          version: "0.20.16",
+          installKind: "npm-global",
+          path: "/some/unusual/switchroom",
+          ownerUid: 0,
+        },
+        "v0.20.21",
+      ),
+    ).toBe("sudo npm i -g switchroom@0.20.21");
+  });
 });
 
 describe("shouldRefuseStaleHostCli", () => {
@@ -389,5 +427,43 @@ describe("shouldRefuseStaleHostCli", () => {
   it("never blocks on an unorderable version", () => {
     expect(shouldRefuseStaleHostCli(stamp("0.0.0-dev"), "v0.20.21")).toBe(false);
     expect(shouldRefuseStaleHostCli(stamp("0.20.16"), "nightly")).toBe(false);
+  });
+});
+
+// The asymmetry that made a false all-clear possible: `shouldRefuseStaleHostCli`
+// returns false for "converged" AND for "cannot be ordered", because the ROLL
+// must not block on the latter. Any surface that instead wants to ASSERT the
+// host CLI is done needs the third state, or it prints "nothing to do" over a
+// host CLI that is five releases behind on an rc build.
+describe("compareHostCliToTarget / hostCliConvergedOnTarget", () => {
+  const stamp = (version: string): HostCliStamp => ({
+    version,
+    installKind: "npm-global",
+    path: NVM_SCRIPT,
+  });
+
+  it("separates behind / current-or-ahead / unknown", () => {
+    expect(compareHostCliToTarget(stamp("0.20.16"), "v0.20.21")).toBe("behind");
+    expect(compareHostCliToTarget(stamp("0.20.21"), "v0.20.21")).toBe("current-or-ahead");
+    expect(compareHostCliToTarget(stamp("0.21.0"), "v0.20.21")).toBe("current-or-ahead");
+    expect(compareHostCliToTarget(stamp("0.20.16-rc.1"), "v0.20.21")).toBe("unknown");
+    expect(compareHostCliToTarget(stamp("sha-abc1234"), "v0.20.21")).toBe("unknown");
+    expect(compareHostCliToTarget(undefined, "v0.20.21")).toBe("unknown");
+  });
+
+  it("treats an UNORDERABLE version as not-converged, unlike the roll gate", () => {
+    for (const v of ["0.20.16-rc.1", "0.20.16-dev", "sha-abc1234"]) {
+      // The gate lets it through…
+      expect(shouldRefuseStaleHostCli(stamp(v), "v0.20.21")).toBe(false);
+      // …and that must NOT be readable as "the host CLI is on target".
+      expect(hostCliConvergedOnTarget(stamp(v), "v0.20.21")).toBe(false);
+    }
+  });
+
+  it("is true only for an observed, orderable, on-or-past version", () => {
+    expect(hostCliConvergedOnTarget(stamp("0.20.21"), "v0.20.21")).toBe(true);
+    expect(hostCliConvergedOnTarget(stamp("0.21.0"), "v0.20.21")).toBe(true);
+    expect(hostCliConvergedOnTarget(stamp("0.20.16"), "v0.20.21")).toBe(false);
+    expect(hostCliConvergedOnTarget(undefined, "v0.20.21")).toBe(false);
   });
 });

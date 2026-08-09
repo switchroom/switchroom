@@ -62,6 +62,7 @@ import {
   observeHostCli,
   readHostCliStamp,
   shouldRefuseStaleHostCli,
+  type HostCliStamp,
 } from "./host-cli-stamp.js";
 import { resolveSelfInvocation } from "./self-invoke.js";
 import { writeConfigFileSync } from "../util/atomic.js";
@@ -688,6 +689,18 @@ export interface RolloutDeps {
    * look like a converged one.
    */
   collectComponents?(): ComponentVersion[];
+  /**
+   * The HOST operator CLI's own install record (#4571), when one was readable.
+   *
+   * Threaded through so the executor's drift warnings render the SAME `fix:`
+   * doctor does — `remediationFor`'s contract is that an operator is never
+   * given two different answers for one drifted component, and without this
+   * the roll keeps emitting the generic "`switchroom update` self-updates the
+   * host CLI", which is a no-op on the npm install this issue was opened
+   * about. Optional: absent (no stamp, or a test) degrades to that generic
+   * text, which is the pre-#4571 behaviour.
+   */
+  hostCli?: HostCliStamp;
 }
 
 export interface RolloutResult {
@@ -1610,7 +1623,7 @@ export async function executeRollout(
               `${c.name} is on ${c.version ?? "an unreadable version"}, behind ` +
                 `${target}, but was OUTSIDE this roll's scope (no step in this ` +
                 `plan owns it). Finish it: ` +
-                `${remediationFor(classifyComponent(c), `v${normalizeVersion(target)}`)}`,
+                `${remediationFor(classifyComponent(c), `v${normalizeVersion(target)}`, deps.hostCli)}`,
             );
           }
           break;
@@ -1734,7 +1747,7 @@ export async function executeRollout(
         `${c.name} is STILL on ${c.version ?? "an unreadable version"} after ` +
           `the roll to ${target} — it was in this roll's scope and did not ` +
           `converge. Finish it: ` +
-          `${remediationFor(classifyComponent(c), normalizedTarget)}`,
+          `${remediationFor(classifyComponent(c), normalizedTarget, deps.hostCli)}`,
       );
     }
     deps.log(
@@ -2200,6 +2213,13 @@ export function createRolloutDeps(params: {
       // so the `cli (host)` row stops reporting the container's own version
       // under a `(host)` label.
       observeHostCli({}, params.hostdCtx)),
+    // #4571 — the same stamp, for the drift warnings' `fix:` text. Read once
+    // here rather than per-warning, so one roll cannot quote two different
+    // host CLIs if the operator upgrades mid-roll.
+    ...(() => {
+      const stamp = readHostCliStamp();
+      return stamp ? { hostCli: stamp } : {};
+    })(),
     persistPin: (pin) => {
       const before = readFileSync(configPath, "utf8");
       const after = setReleasePinInConfig(before, pin);

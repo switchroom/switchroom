@@ -158,7 +158,9 @@ describe("doctor: the host CLI row must never report the CONTAINER's version", (
     // …and the remediation is derived from how the host is ACTUALLY installed:
     // a user-owned npm prefix, so neither `switchroom update` (a no-op on an
     // npm install) nor `sudo npm i -g` (wrong tree) is correct.
-    expect(hostCli?.fix).toContain("npm i -g switchroom@0.19.28");
+    expect(hostCli?.fix).toContain(
+      "npm i -g --prefix /home/op/.nvm/versions/node/v22 switchroom@0.19.28",
+    );
     expect(hostCli?.fix).toContain("run as op");
     expect(hostCli?.fix).not.toMatch(/(^|[;&|]\s*)sudo\s/);
   });

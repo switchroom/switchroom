@@ -237,7 +237,7 @@ describe("renderRolloutStatus", () => {
     expect(out).toContain("`test-harness`, `clerk`");
     // What is genuinely still host-side, with its exact command.
     expect(out).toContain("Still host-side");
-    expect(out).toContain("sudo npm i -g switchroom@1.2.3");
+    expect(out).toContain("sudo npm i -g --prefix /usr/local switchroom@1.2.3");
     expect(out).toContain("switchroom hostd install --tag v1.2.3");
   });
 
@@ -281,7 +281,9 @@ describe("renderRolloutStatus", () => {
     expect(out).not.toContain("only if the release changed");
     expect(out).not.toContain("switchroom hostd install");
     // The CLI residual is still named.
-    expect(out).toContain(`sudo npm i -g switchroom@${POST_B.slice(1)}`);
+    expect(out).toContain(
+      `sudo npm i -g --prefix /usr/local switchroom@${POST_B.slice(1)}`,
+    );
   });
 
   it("✅ card says regen REQUIRED, as one copy-paste block, when the roll crosses the template change (#4269)", () => {
@@ -298,7 +300,7 @@ describe("renderRolloutStatus", () => {
     expect(out).not.toContain("only if the release changed");
     // Both residuals collapse into a single copy-paste command line.
     expect(out).toContain(
-      `\`sudo npm i -g switchroom@${POST_A.slice(1)} && switchroom hostd install --tag ${POST_A}\``,
+      `\`sudo npm i -g --prefix /usr/local switchroom@${POST_A.slice(1)} && switchroom hostd install --tag ${POST_A}\``,
     );
   });
 
@@ -326,8 +328,10 @@ describe("renderRolloutStatus", () => {
     });
     // `sudo npm i -g` into a user-owned nvm prefix installs into the WRONG
     // tree (or root-poisons this one) — it must never be emitted as a command.
-    expect(out).not.toContain(`sudo npm i -g switchroom@${POST_A.slice(1)}`);
-    expect(out).toContain(`npm i -g switchroom@${POST_A.slice(1)}`);
+    expect(out).not.toContain(`sudo npm i -g`);
+    expect(out).toContain(
+      `npm i -g --prefix /home/op/.nvm/versions/node/v22.22.2 switchroom@${POST_A.slice(1)}`,
+    );
     expect(out).toContain("run as op");
     expect(out).toContain("/home/op/.nvm/versions/node/v22.22.2");
     // …and the regen command is NOT collapsed onto that line, because the
@@ -354,6 +358,51 @@ describe("renderRolloutStatus", () => {
     expect(out).not.toContain("npm i -g switchroom");
     expect(out).not.toContain("host operator CLI —");
     expect(out).toContain(`Host operator CLI: **on ${POST_A.slice(1)}**`);
+  });
+
+  // The inverse of the test above, and the one that matters. Dropping the
+  // residual requires PROOF of convergence. `shouldRefuseStaleHostCli` is
+  // false for an UNORDERABLE stamp as well as a converged one (deliberately —
+  // the roll must not block on a version it cannot compare), so reusing it to
+  // decide "nothing to do" turns every rc/dev/sha host CLI into a fresh
+  // all-clear over exactly the drift this feature exists to expose.
+  it("✅ card does NOT claim 'nothing to do' for an UNORDERABLE host CLI version", () => {
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: POST_A,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+      // `switchroom update --channel rc` produces exactly this shape.
+      hostCli: userNvmHostCli(`${PRE_TEMPLATE_CHANGE.slice(1)}-rc.1`),
+    });
+    expect(out).not.toContain("nothing to do");
+    // Still listed as outstanding, and honest about WHY it can't be ordered.
+    expect(out).toContain("Still host-side");
+    expect(out).toContain("not comparable");
+    expect(out).toContain("switchroom --version");
+    expect(out).toContain(
+      `npm i -g --prefix /home/op/.nvm/versions/node/v22.22.2 switchroom@${POST_A.slice(1)}`,
+    );
+  });
+
+  it("✅ card never &&-collapses an UNORDERABLE host CLI into one copy-paste", () => {
+    // Regen REQUIRED + a root-owned npm tree is the one shape that collapses.
+    // An unorderable version must still not collapse: the "confirm host-side"
+    // caveat is load-bearing and cannot survive an `&&` chain, exactly like
+    // the "run as <user>" one.
+    const out = renderRolloutStatus({
+      target: POST_A,
+      fromVersion: PRE_TEMPLATE_CHANGE,
+      terminal: "completed",
+      rolled: ["test-harness"],
+      m: 1,
+      hostCli: rootNpmHostCli(`${PRE_TEMPLATE_CHANGE.slice(1)}-rc.1`),
+    });
+    expect(out).toContain("REQUIRED");
+    expect(out).not.toContain("One copy-paste");
+    expect(out).not.toContain(`&& switchroom hostd install --tag ${POST_A}\``);
+    expect(out).toContain("not comparable");
   });
 
   it("renders the ❌ terminal-error summary with the failed step + agent", () => {

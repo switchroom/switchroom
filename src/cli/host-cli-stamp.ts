@@ -405,14 +405,18 @@ export function hostCliInstallCommand(
   }
   switch (stamp.installKind) {
     case "npm-global": {
-      const prefixNote = stamp.npmPrefix ? ` (npm prefix ${stamp.npmPrefix})` : "";
-      const asRoot = stamp.ownerUid === 0;
-      if (asRoot) return `sudo npm i -g switchroom@${bare}${prefixNote}`;
+      // `--prefix` is spelled out whenever the stamp recorded one. npm resolves
+      // the global prefix from the INVOKING user's npmrc, which under `sudo` is
+      // root's, not the one the observed install actually lives in — so a bare
+      // `npm i -g` can quietly converge a different tree and leave the drift
+      // exactly where it was.
+      const npmCmd = `npm i -g${stamp.npmPrefix ? ` --prefix ${stamp.npmPrefix}` : ""} switchroom@${bare}`;
+      if (stamp.ownerUid === 0) return `sudo ${npmCmd}`;
       const who = stamp.ownerUser ?? (stamp.ownerUid !== undefined ? `uid ${stamp.ownerUid}` : undefined);
       const asNote = who
-        ? ` — run as ${who}, NOT under sudo${prefixNote}`
-        : ` — run as the user owning ${stamp.path}, NOT under sudo${prefixNote}`;
-      return `npm i -g switchroom@${bare}${asNote}`;
+        ? ` — run as ${who}, NOT under sudo`
+        : ` — run as the user owning ${stamp.path}, NOT under sudo`;
+      return `${npmCmd}${asNote}`;
     }
     case "static-binary":
       return `switchroom update --pin v${bare}  (replaces the static binary at ${stamp.path})`;
@@ -448,7 +452,10 @@ export function hostCliInstallShellCommand(
   const bare = target.replace(/^v/, "");
   if (stamp.installKind === "static-binary") return `switchroom update --pin v${bare}`;
   if (stamp.installKind === "npm-global" && stamp.ownerUid === 0) {
-    return `sudo npm i -g switchroom@${bare}`;
+    // Carry the observed prefix, for the same reason the prose command does:
+    // `sudo` swaps in root's npmrc prefix, so a bare `-g` can install into a
+    // tree that is not the one this stamp measured.
+    return `sudo npm i -g${stamp.npmPrefix ? ` --prefix ${stamp.npmPrefix}` : ""} switchroom@${bare}`;
   }
   return undefined;
 }
@@ -476,10 +483,44 @@ export function shouldRefuseStaleHostCli(
   stamp: HostCliStamp | undefined,
   target: string,
 ): boolean {
-  if (!stamp) return false;
+  return compareHostCliToTarget(stamp, target) === "behind";
+}
+
+/**
+ * Where the observed host CLI sits relative to `target`. THREE states, not two.
+ *
+ * `unknown` is the one that matters: an absent stamp, or a version that is not
+ * a clean `vX.Y.Z` (a `-rc.N` / `-dev` / `sha-…` build — `switchroom update
+ * --channel rc` produces exactly these), is unorderable. `shouldRefuseStaleHostCli`
+ * folds `unknown` in with `current` deliberately, because the ROLL must not
+ * block on what it cannot order. Nothing may fold it in the other direction and
+ * ASSERT convergence: a card that reads "on 0.20.16-rc.1 — nothing to do" while
+ * the fleet rolls to v0.20.22 is the same silent all-clear this whole file
+ * exists to delete. Use {@link hostCliConvergedOnTarget} for that question.
+ */
+export function compareHostCliToTarget(
+  stamp: HostCliStamp | undefined,
+  target: string,
+): "behind" | "current-or-ahead" | "unknown" {
+  if (!stamp) return "unknown";
   const cmp = compareReleaseTags(
     `v${stamp.version.replace(/^v/, "")}`,
     `v${target.replace(/^v/, "")}`,
   );
-  return cmp !== null && cmp < 0;
+  if (cmp === null) return "unknown";
+  return cmp < 0 ? "behind" : "current-or-ahead";
+}
+
+/**
+ * True ONLY when the host CLI was observed and is provably on-or-past `target`.
+ *
+ * The affirmative counterpart to {@link shouldRefuseStaleHostCli}: anything
+ * unobserved or unorderable is NOT converged, so a surface that reports
+ * outstanding host-side work keeps reporting it rather than guessing.
+ */
+export function hostCliConvergedOnTarget(
+  stamp: HostCliStamp | undefined,
+  target: string,
+): boolean {
+  return compareHostCliToTarget(stamp, target) === "current-or-ahead";
 }
