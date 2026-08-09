@@ -127,6 +127,36 @@ def _session_id_from_path(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def _annotate_reconcile_payload(payload: dict, session_id: str, built: dict) -> dict:
+    """Stamp watermark-anchoring fields onto a QUEUED reconcile payload.
+
+    switchroom #4571 — the recurring ``pending-retains`` spike. A slice that
+    reconcile enqueues (over-budget / out-of-lookback) or defers (turn-cap
+    split) is later drained by ``drain_pending.py`` on a confirmed 200, but the
+    drain had no way to know WHICH session/uuid the entry anchored, so it never
+    advanced the transcript watermark for these paths. Reconcile's gap detection
+    is watermark-keyed, so on the next boot it re-derives the identical tail and
+    re-enqueues it — a false-alarm queue spike that recurs every boot (no memory
+    is lost: enqueue dedupe + the archive protect it, but the depth trips the
+    memory-queue watchdog). These fields let the drain advance the watermark once
+    the slice is confirmed durable, under the no-loss guard in
+    ``drain_pending._commit_reconcile_watermark``.
+
+    ``reconcile_is_tail`` is the load-bearing one: only a slice whose last uuid
+    is the TRANSCRIPT tail may ever anchor the watermark. An older remainder
+    (turn-cap split) ends mid-transcript, so advancing to it would skip the
+    newer turns that follow it.
+    """
+    ordered = built.get("ordered_uuids") or []
+    last_uuid = built.get("last_uuid")
+    tail_uuid = ordered[-1] if ordered else None
+    payload["reconcile_session_id"] = session_id
+    payload["reconcile_last_uuid"] = last_uuid
+    payload["reconcile_ordered_uuids"] = ordered
+    payload["reconcile_is_tail"] = bool(last_uuid) and last_uuid == tail_uuid
+    return payload
+
+
 def reconcile(config: dict | None = None, hook_input: dict | None = None) -> dict:
     """Diff watermarks vs transcript tails and recover un-committed work.
 
@@ -297,6 +327,11 @@ def _post_inline(
         return "skip"
     payload = built["payload"]
     document_id = built["document_id"]
+    # Stamp the watermark-anchoring fields so that IF this slice falls through
+    # to the pending queue (lock busy / POST failed) the drain can advance the
+    # watermark once it lands, instead of leaving reconcile to re-enqueue it
+    # every boot (switchroom #4571).
+    _annotate_reconcile_payload(payload, session_id, built)
 
     with inflight_lock(blocking=True) as acquired:
         if not acquired:  # pragma: no cover - blocking acquire fails open
@@ -350,6 +385,7 @@ def _enqueue_slice(config, session_id, path, all_messages, slice_messages, bank_
     )
     if built is None:
         return False
+    _annotate_reconcile_payload(built["payload"], session_id, built)
     queued = pending_enqueue(built["payload"], RuntimeError("reconcile deferred (bound/budget)"))
     if queued is None:
         debug_log(config, "reconcile_tail: pending-retains full, could not enqueue remainder")

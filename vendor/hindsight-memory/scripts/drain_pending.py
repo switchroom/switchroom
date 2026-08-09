@@ -171,6 +171,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from lib import watermark
 from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.pending import (
@@ -770,6 +771,72 @@ def _record_failure(
     return err_class
 
 
+def _reconcile_index(entries: list[tuple[str, dict]]) -> dict:
+    """``session_id -> set(abs_path)`` for reconcile-sourced queue entries.
+
+    Powers the no-loss sibling guard in ``_commit_reconcile_watermark``. Only
+    entries reconcile stamped (``reconcile_session_id``, switchroom #4571) are
+    indexed; everything else is ignored, so a non-reconcile queue entry for the
+    same session never blocks — its turns are covered by the reconcile slice's
+    own document, not by it.
+    """
+    idx: dict[str, set[str]] = {}
+    for path, entry in entries:
+        sid = entry.get("reconcile_session_id")
+        if sid:
+            idx.setdefault(sid, set()).add(os.path.abspath(path))
+    return idx
+
+
+def _commit_reconcile_watermark(entry: dict, path: str, index: dict) -> None:
+    """Advance the transcript watermark for a just-confirmed reconcile entry.
+
+    switchroom #4571. Called ONLY from a confirmed-durable retire branch — a
+    synchronous (``async_processing=False``) retain 200, or a presence GET that
+    returned True — so reaching here means this entry's content is durable. A
+    no-op for a non-reconcile entry (no ``reconcile_session_id``).
+
+    NO-LOSS GUARD. The watermark is a single "last contiguously-committed entry"
+    pointer, so it may only ever advance to the TRANSCRIPT TAIL, and only once
+    NO other slice of the same session is still queued:
+
+    * ``reconcile_is_tail`` False → an older turn-cap-split remainder that ends
+      mid-transcript; advancing to it would skip the newer turns after it.
+    * a live sibling in ``index`` → an unconfirmed earlier remainder OR a
+      size-split part of this same tail; advancing now could jump the watermark
+      past turns that are not yet durable.
+
+    Either way we leave the watermark and accept a redundant re-enqueue on the
+    next boot. ``watermark.commit`` is monotonic + idempotent and refuses
+    backward/compacted moves, so over-conservatism only ever costs repeat work,
+    never a lost turn — and that is the side to err on.
+    """
+    sid = entry.get("reconcile_session_id")
+    if not sid:
+        return
+    live = index.get(sid)
+    if live is not None:
+        # This entry is now durable + archived; drop it from the live set so a
+        # sibling that drains AFTER it is no longer blocked by it.
+        live.discard(os.path.abspath(path))
+    if not entry.get("reconcile_is_tail"):
+        return
+    last_uuid = entry.get("reconcile_last_uuid")
+    if not last_uuid:
+        return
+    if live:  # an earlier remainder / split part of this session is still queued
+        return
+    try:
+        watermark.commit(
+            sid,
+            last_uuid,
+            entry.get("document_id", ""),
+            ordered_uuids=entry.get("reconcile_ordered_uuids"),
+        )
+    except Exception:  # pragma: no cover - a watermark write must never fail a drain
+        pass
+
+
 def _new_summary() -> dict:
     return {
         "drained": 0,
@@ -892,7 +959,12 @@ def _drain_inhook_impl(config: dict, force: bool = False) -> dict:
     # behind them — see ``_drain_order``. Matters even more here than in the
     # backlog drain: the in-hook budget is ~4s, so a single entry at the head
     # that always burns its clamped timeout consumes the entire run.
-    entries = _park_broken(_drain_order(iter_entries()), summary, force)
+    all_entries = iter_entries()
+    # Built from the FULL queue (before parking): a parked reconcile entry is
+    # still queued and unconfirmed, so it must still block a sibling's watermark
+    # advance (#4571).
+    reconcile_index = _reconcile_index(all_entries)
+    entries = _park_broken(_drain_order(all_entries), summary, force)
     if not entries:
         debug_log(
             config,
@@ -938,6 +1010,7 @@ def _drain_inhook_impl(config: dict, force: bool = False) -> dict:
             if _document_state(entry, timeout=_clamp(timeout, budget, started)) is True:
                 if archive_reconciled(path):
                     summary["reconciled"] += 1
+                    _commit_reconcile_watermark(entry, path, reconcile_index)
                 else:
                     # Archive unwritable: the entry is STILL QUEUED (it is
                     # never deleted), so calling it reconciled would be a lie.
@@ -1003,6 +1076,7 @@ def _drain_inhook_impl(config: dict, force: bool = False) -> dict:
         # horizon costs.
         if archive_reconciled(path):
             summary["drained"] += 1
+            _commit_reconcile_watermark(entry, path, reconcile_index)
         else:
             summary["archive_failed"] += 1
         consecutive_failures = 0
@@ -1056,7 +1130,7 @@ def _phase_failed(summary: dict, phase: str, e: BaseException, cost: str) -> Non
     )
 
 
-def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
+def _reconcile_phase(config: dict, summary: dict, dry_run: bool, reconcile_index: dict) -> None:
     """PHASE 1 — free pass: drop entries whose document already exists.
 
     This is the phase that makes backlog replay affordable. 70.4% of a
@@ -1082,8 +1156,11 @@ def _reconcile_phase(config: dict, summary: dict, dry_run: bool) -> None:
             continue
         state = _document_state(entry)
         if state is True:
-            if dry_run or archive_reconciled(path):
+            if dry_run:
                 summary["reconciled"] += 1
+            elif archive_reconciled(path):
+                summary["reconciled"] += 1
+                _commit_reconcile_watermark(entry, path, reconcile_index)
             else:
                 summary["archive_failed"] += 1
         elif state is None:
@@ -1264,8 +1341,14 @@ def _drain_backlog_impl(
                 f"archived, not deleted"
             )
 
+    # Built AFTER the pre-drain phases (collapse / re-split may have changed the
+    # queue) and shared across the reconcile pass and phase 2, so a sibling that
+    # phase 1 retires is dropped from the live set before phase 2 evaluates the
+    # tail's watermark advance (#4571).
+    reconcile_index = _reconcile_index(iter_entries())
+
     if phase in ("reconcile", "both"):
-        _reconcile_phase(config, summary, dry_run)
+        _reconcile_phase(config, summary, dry_run, reconcile_index)
     if phase == "reconcile":
         return summary
 
@@ -1356,6 +1439,7 @@ def _drain_backlog_impl(
                 if _document_state(entry) is True:
                     if archive_reconciled(path):
                         summary["drained"] += 1
+                        _commit_reconcile_watermark(entry, path, reconcile_index)
                     else:
                         summary["archive_failed"] += 1
                 else:

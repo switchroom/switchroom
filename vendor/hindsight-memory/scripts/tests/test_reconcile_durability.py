@@ -565,6 +565,119 @@ class TestObservationScopes(DurabilityTestBase):
         self.assertTrue(all(s is None for s in self.daemon.observation_scopes_seen))
 
 
+class TestDrainAdvancesWatermark(DurabilityTestBase):
+    """switchroom #4571 — the drain must advance the transcript watermark for a
+    reconcile-sourced slice it confirms durable, so reconcile stops re-deriving
+    and re-enqueueing the identical tail on every boot (the recurring
+    ``pending-retains`` spike). And it must NOT advance while an earlier sibling
+    of the same session is still queued (the no-loss guard).
+    """
+
+    # -- the fix: an enqueued tail, once drained, advances the watermark --------
+    def test_enqueued_tail_drained_advances_watermark_and_stops_reenqueue(self):
+        # This test FAILS on HEAD: the drain never commits the watermark for an
+        # enqueued reconcile slice, so `watermark.load` stays None after the
+        # drain and the second reconcile re-enqueues the same tail.
+        session = "drainA"
+        tpath = os.path.join(self.transcripts, f"{session}.jsonl")
+        _write_transcript(tpath, 3, session_prefix=session)
+        hook = {"session_id": session, "transcript_path": tpath, "cwd": "/x"}
+
+        # Force the out-of-lookback ENQUEUE path (no inline POST): lookback=0
+        # makes every transcript "too old", so reconcile enqueues the full tail
+        # and defers it to the drain — exactly the path that never committed.
+        with mock.patch.dict(os.environ, {"HINDSIGHT_RECONCILE_LOOKBACK_H": "0"}):
+            s1 = reconcile_tail.reconcile(self._config(), hook_input=hook)
+        self.assertEqual(s1["enqueued"], 1)
+        self.assertEqual(len(self._pending_entries()), 1)
+        # Nothing posted inline, so the watermark is still unset.
+        self.assertIsNone(watermark.load(session))
+
+        # Drain against a healthy daemon: the tail lands durably AND (the fix)
+        # the watermark advances to the transcript tail.
+        from drain_pending import drain
+        drain(self._config())
+        self.assertEqual(len(self._pending_entries()), 0)
+        wm = watermark.load(session)
+        self.assertIsNotNone(
+            wm,
+            "drain must advance the watermark for a confirmed-durable reconcile "
+            "tail (#4571) — without it, reconcile re-enqueues every boot",
+        )
+        self.assertEqual(wm["last_uuid"], f"{session}-a2")
+
+        # Second reconcile pass (still out of lookback) is now skipped_clean:
+        # the tail is watermarked, so it is NOT re-derived or re-enqueued.
+        with mock.patch.dict(os.environ, {"HINDSIGHT_RECONCILE_LOOKBACK_H": "0"}):
+            s2 = reconcile_tail.reconcile(self._config(), hook_input=hook)
+        self.assertEqual(s2["skipped_clean"], 1)
+        self.assertEqual(s2["enqueued"], 0)
+        self.assertEqual(len(self._pending_entries()), 0)
+
+    # -- the no-loss guard: an earlier sibling blocks the tail's advance --------
+    def test_tail_drain_does_not_advance_while_earlier_sibling_queued(self):
+        session = "drainB"
+        ordered = [
+            f"{session}-u0", f"{session}-a0", f"{session}-u1",
+            f"{session}-a1", f"{session}-u2", f"{session}-a2",
+        ]
+        older_doc = f"{session}-r{session}-u0-{session}-a1"
+        tail_doc = f"{session}-r{session}-u0-{session}-a2"
+
+        from lib import pending
+
+        def _payload(doc, content, last_uuid, is_tail):
+            return {
+                "api_url": "http://fake", "api_token": None, "bank_id": "test-bank",
+                "content": content, "document_id": doc, "context": "claude-code",
+                "metadata": {}, "tags": [], "observation_scopes": None,
+                "reconcile_session_id": session,
+                "reconcile_last_uuid": last_uuid,
+                "reconcile_ordered_uuids": ordered,
+                "reconcile_is_tail": is_tail,
+            }
+
+        # The earlier remainder (mid-transcript last_uuid) is enqueued FIRST so
+        # it sorts ahead of the tail in the oldest-first drain order.
+        pending.enqueue(
+            _payload(older_doc, "older remainder turns", f"{session}-a1", False),
+            RuntimeError("reconcile deferred"),
+        )
+        import time as _t
+        _t.sleep(0.002)
+        pending.enqueue(
+            _payload(tail_doc, "tail turns", f"{session}-a2", True),
+            RuntimeError("reconcile deferred"),
+        )
+        self.assertEqual(len(self._pending_entries()), 2)
+
+        # Upstream: the tail commits, but the earlier remainder still fails, so
+        # it stays queued through the whole drain run.
+        posted = []
+
+        def fake_retain(self_c, bank_id=None, content=None,
+                        document_id="conversation", **kw):
+            posted.append(document_id)
+            if document_id == older_doc:
+                raise RuntimeError("earlier remainder still failing upstream")
+            return {"ok": True}
+
+        from drain_pending import drain
+        with mock.patch.object(HindsightClient, "retain", fake_retain):
+            drain(self._config())
+
+        # The tail POST succeeded and its entry was retired ...
+        self.assertIn(tail_doc, posted)
+        remaining = [e["document_id"] for _p, e in self._pending_entries()]
+        self.assertNotIn(tail_doc, remaining)
+        # ... but the watermark did NOT advance: an earlier, still-unconfirmed
+        # sibling of the same session is queued, and advancing past it would
+        # risk silent loss of the remainder (#4571 no-loss guard).
+        self.assertIsNone(watermark.load(session))
+        # The earlier remainder is still queued (its POST failed).
+        self.assertIn(older_doc, remaining)
+
+
 def _stdin(obj):
     import io
     return io.StringIO(json.dumps(obj))
