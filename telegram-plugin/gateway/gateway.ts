@@ -395,7 +395,9 @@ import {
   pruneMessagesOlderThanDays,
   hasOutboundDeliveredSince,
   hasOutboundWithText,
+  recordSystemOutbound, updateSystemOutboundText,
 } from '../history.js'
+import { makeSystemMessageObserver } from './system-message-observer.js'
 import {
   runRegistryReaper,
   resolveRetentionDays as resolveRegistryRetentionDays,
@@ -5595,10 +5597,26 @@ const rawRobustApiCall = createRetryApiCall({
   floodWaitRemainingMs: probeFloodWaitRemainingMs,
 })
 
+// #4571 — card/system-surface history lane. Every card the gateway posts
+// (activity card, status pin, approval/boot/issues/worker-feed cards, progress
+// lines, notices) goes through `robustApiCall`, so observing its RESOLVED
+// result is the one chokepoint that makes every posted message id resolvable
+// when the operator quote-replies to it. Never throws; see
+// system-message-observer.ts for the send-vs-edit and throttling contract.
+// Gated on the SAME condition as `initHistory` above — a non-main gateway
+// process never opens the DB, so an observer there would be pure noise.
+const observeSentMessage = isGatewayMain && HISTORY_ENABLED
+  ? makeSystemMessageObserver({ insert: recordSystemOutbound, updateText: updateSystemOutboundText })
+  : undefined
+
 const robustApiCall = <T>(
   fn: () => Promise<T>,
   opts?: Parameters<typeof rawRobustApiCall<T>>[1],
-): Promise<T> => sendGate.gate(() => rawRobustApiCall(fn, opts), opts)
+): Promise<T> => {
+  const p = sendGate.gate(() => rawRobustApiCall(fn, opts), opts)
+  if (observeSentMessage == null) return p
+  return p.then((res) => { observeSentMessage(res, opts); return res })
+}
 
 // Fire-and-forget wrapper for outbound surfaces that previously had
 // `.catch(() => {})` directly on `bot.api.*` calls. Resolves to undefined
@@ -15048,13 +15066,18 @@ export async function handleInbound(
     replyToText,
     replyToTextEscaped,
     replyToRole,
+    replyToKind,
   } = resolveReplyToFromBuffer({
     replyToMessageId,
     replyToText: replyForwardCtx.replyToText,
     replyToTextEscaped: replyForwardCtx.replyToTextEscaped,
     historyEnabled: HISTORY_ENABLED,
     replyToTextMax: REPLY_TO_TEXT_MAX,
-    lookup: (messageId) => lookupMessageRoleAndText(chat_id, messageId),
+    // includeSystem (#4571): a quote-reply to the live activity card / a status
+    // pin / an approval card must resolve. Scoped to THIS lookup — the
+    // reaction-trigger's bot-authored predicate keeps the default (cards
+    // invisible), so its behaviour is unchanged.
+    lookup: (messageId) => lookupMessageRoleAndText(chat_id, messageId, { includeSystem: true }),
   })
 
   if (HISTORY_ENABLED) {
@@ -15132,6 +15155,7 @@ export async function handleInbound(
     replyToMessageId,
     replyToTextEscaped,
     replyToRole,
+    replyToKind,
     forwardOriginMeta,
     topicFramingEnabled: TOPIC_FRAMING_ENABLED,
     personDirectory: PERSON_DIRECTORY,

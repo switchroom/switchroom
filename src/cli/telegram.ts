@@ -180,7 +180,7 @@ function readTopicsFromHistory(
           MIN(ts) AS first_ts,
           MAX(ts) AS last_ts
         FROM messages
-        WHERE chat_id = ?
+        WHERE chat_id = ? AND role <> 'system'
         GROUP BY thread_id
         ORDER BY first_ts ASC
         LIMIT ?
@@ -196,8 +196,10 @@ function readTopicsFromHistory(
     // Fetch the first-message text per (chat, thread, ts). SQLite's
     // `thread_id IS NULL` distinguishes the null row from numeric ids.
     const firstStmt = db.prepare(
+      // role <> 'system' keeps the ephemeral card lane (#4571) out of both the
+      // per-topic count and the first-message preview.
       `SELECT text, role FROM messages
-       WHERE chat_id = ? AND ts = ?
+       WHERE chat_id = ? AND ts = ? AND role <> 'system'
        AND (thread_id IS NULL AND ? IS NULL OR thread_id = ?)
        ORDER BY message_id ASC LIMIT 1`,
     );

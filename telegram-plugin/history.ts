@@ -81,7 +81,22 @@ function loadDatabaseClass(): SqliteDatabaseConstructor {
   }
 }
 
-export type MessageRole = 'user' | 'assistant'
+/**
+ * `system` is the CARD lane (#4571): a bot→user message the gateway posted as
+ * a UI surface rather than as an answer — the mid-turn activity card, the
+ * status pin, approval / boot / issues / worker-feed cards, restart notices,
+ * `progress_update` lines. Those consume real Telegram message ids, so the
+ * operator can (and does) quote-reply to one; before this lane existed the
+ * row simply did not exist and the reply resolved to nothing.
+ *
+ * They are deliberately NOT `assistant`: every delivery-accounting predicate
+ * in this file keys on `role = 'assistant'` meaning "the user was actually
+ * answered" (`getRecentOutboundCount`, `hasOutboundDeliveredSince`,
+ * `hasOutboundWithText`), and calling a card an answer would silently suppress
+ * the silence/over-ping/represent safety nets. A distinct value keeps every
+ * existing predicate byte-identical while making the id resolvable.
+ */
+export type MessageRole = 'user' | 'assistant' | 'system'
 
 export interface RecordedMessage {
   chat_id: string
@@ -127,6 +142,14 @@ export interface RecordedMessage {
   forwarded_from_id: string | null
   forwarded_date: string | null
   forwarded_message_id: number | null
+  /**
+   * Discriminator for a `system` (card) row: the send's `verb` tag as it was
+   * passed to the gateway's retry wrapper, normalised (`activity-summary.send`
+   * → `activity-summary`). Null for `user` / `assistant` rows and for an
+   * untagged send. Surfaced to the agent as `reply_to_kind` when a native
+   * reply points at one of these messages.
+   */
+  kind: string | null
 }
 
 export interface QueryOptions {
@@ -134,6 +157,14 @@ export interface QueryOptions {
   thread_id?: number | null
   limit?: number
   before_message_id?: number
+  /**
+   * Include `system` (card) rows in the result. DEFAULT FALSE, deliberately:
+   * cards are ephemeral UI, and `get_recent_messages` renders straight into
+   * the operator-visible model context — a wall of activity-card rows there
+   * would be a regression. Card rows stay RESOLVABLE by id (see
+   * {@link lookupMessageRoleAndText}) without being LISTED.
+   */
+  include_system?: boolean
 }
 
 const DEFAULT_LIMIT = 10
@@ -212,6 +243,7 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
       group_id       INTEGER,
       reply_to_message_id INTEGER,
       reply_to_text  TEXT,
+      kind           TEXT,
       PRIMARY KEY (chat_id, thread_id, message_id)
     )
   `)
@@ -232,6 +264,10 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
     "forwarded_from_id TEXT",
     "forwarded_date TEXT",
     "forwarded_message_id INTEGER",
+    // #4571 — card/system-surface discriminator. Nullable with no default, so
+    // the ALTER is instant on a multi-thousand-row live DB and every existing
+    // row keeps its exact contents (SQLite backfills NULL without a rewrite).
+    "kind TEXT",
   ]) {
     try {
       db.exec(`ALTER TABLE messages ADD COLUMN ${column}`)
@@ -609,12 +645,29 @@ export function recordOutbound(args: RecordOutboundArgs): void {
       (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id)
     VALUES (?, ?, ?, 'assistant', NULL, NULL, ?, ?, ?, ?)
   `)
+  // #4571 — a real reply ALWAYS wins over a provisional card row.
+  //
+  // The system-lane observer (gateway `robustApiCall`) records every sent
+  // message the moment the API resolves, which is BEFORE the caller reaches
+  // its own `recordOutbound`. `INSERT OR REPLACE` alone would not reliably
+  // overwrite that row: the unique key folds `thread_id`, and the observer
+  // derives the thread from the Telegram response (which sets
+  // `message_thread_id` on reply chains in plain supergroups) while this
+  // writer uses the gateway's own `threadId` — a mismatch would leave BOTH
+  // rows and let the card row shadow the answer for id lookups. Deleting on
+  // (chat_id, message_id) — unique within a chat regardless of thread, the
+  // same assumption `recordEdit` / `recordReaction` already make — makes the
+  // promotion exact and is a no-op when no observer row exists.
+  const dropSystem = requireDb().prepare(
+    `DELETE FROM messages WHERE chat_id = ? AND message_id = ? AND role = 'system'`,
+  )
   // bun:sqlite has a transaction() helper. Cheap insurance against partial
   // writes if the process dies mid-loop. The transaction signature is
   // typed as variadic-unknown for genericity; cast the typed callback
   // through the wider shape.
   const tx = requireDb().transaction(((rows: Array<{ id: number; text: string; attachKind: string | null }>) => {
     for (const r of rows) {
+      dropSystem.run(args.chat_id, r.id)
       stmt.run(args.chat_id, args.thread_id ?? null, r.id, ts, r.text, r.attachKind, groupId)
     }
   }) as (...args: unknown[]) => unknown)
@@ -631,6 +684,97 @@ export function recordOutbound(args: RecordOutboundArgs): void {
         `${err instanceof Error ? err.message : String(err)} — this outbound will be absent from history`,
     )
     throw err
+  }
+}
+
+export interface RecordSystemOutboundArgs {
+  chat_id: string
+  thread_id: number | null | undefined
+  message_id: number
+  /** Normalised send verb (`activity-summary`, `approval-card`, …) or null. */
+  kind: string | null | undefined
+  /** Rendered text as Telegram echoed it back. May be empty. */
+  text: string
+  /** Unix SECONDS. Defaults to now. */
+  ts?: number
+}
+
+/**
+ * Record a CARD / system-surface outbound (#4571).
+ *
+ * Conditional insert on (chat_id, message_id): if ANY row already exists for
+ * that id — a real `assistant` reply recorded by `recordOutbound`, an inbound,
+ * or a previously-recorded card — this is a no-op and returns false. That is
+ * what makes the call safe to fire from a blanket send observer that cannot
+ * distinguish a fresh send from an edit of a message it already knows: an edit
+ * returns the SAME `message_id`, hits the `NOT EXISTS` guard, and falls through
+ * to {@link updateSystemOutboundText} instead of duplicating a row per edit.
+ *
+ * Never throws — a card row is a nice-to-have, and a failure here must not
+ * break the send path it is observing. Failures are logged via `warnHistory`.
+ *
+ * Returns true iff a new row was inserted.
+ */
+export function recordSystemOutbound(args: RecordSystemOutboundArgs): boolean {
+  if (!isValidMessageId(args.message_id)) return false
+  // History disabled / not yet initialised: stay silent. This is called from a
+  // blanket send observer, so a warn here would be one stderr line per API call.
+  if (db == null) return false
+  try {
+    const res = requireDb()
+      .prepare(`
+        INSERT INTO messages
+          (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, kind)
+        SELECT ?, ?, ?, 'system', NULL, NULL, ?, ?, NULL, NULL, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?
+         )
+      `)
+      .run(
+        args.chat_id,
+        args.thread_id ?? null,
+        args.message_id,
+        args.ts ?? Math.floor(Date.now() / 1000),
+        // Same outbound redaction chokepoint as recordOutbound: a card body is
+        // rendered from live tool activity and can quote a secret.
+        redact(args.text),
+        args.kind ?? null,
+        args.chat_id,
+        args.message_id,
+      ) as { changes?: number }
+    return (res?.changes ?? 0) > 0
+  } catch (err) {
+    warnHistory(
+      `recordSystemOutbound: INSERT failed (chat=${args.chat_id} id=${args.message_id}): ` +
+        `${err instanceof Error ? err.message : String(err)} — a posted card will not be ` +
+        `resolvable if the operator quote-replies to it`,
+    )
+    return false
+  }
+}
+
+/**
+ * Refresh a card row's stored text in place (#4571). Only ever touches a
+ * `system` row, so an edit of a real reply can never be rewritten through this
+ * path (`recordEdit` owns that).
+ *
+ * `ts` is deliberately NOT bumped: it is the card's POST time, which is what
+ * retention prunes on. Never throws. Returns true iff a row was updated.
+ */
+export function updateSystemOutboundText(args: {
+  chat_id: string
+  message_id: number
+  text: string
+}): boolean {
+  try {
+    const res = requireDb()
+      .prepare(
+        `UPDATE messages SET text = ? WHERE chat_id = ? AND message_id = ? AND role = 'system'`,
+      )
+      .run(redact(args.text), args.chat_id, args.message_id) as { changes?: number }
+    return (res?.changes ?? 0) > 0
+  } catch {
+    return false
   }
 }
 
@@ -781,16 +925,27 @@ export function getLatestInboundMessageId(
 export function lookupMessageRoleAndText(
   chatId: string,
   messageId: number,
-): { role: 'user' | 'assistant'; text: string } | null {
-  const row = requireDb()
-    .prepare(
-      `SELECT role, text FROM messages WHERE chat_id = ? AND message_id = ? LIMIT 1`,
-    )
-    .get(chatId, messageId) as
-    | { role: 'user' | 'assistant'; text: string | null }
+  opts?: {
+    /**
+     * Also resolve `system` (card) rows. DEFAULT FALSE so the two
+     * authorship-sensitive callers — the reaction trigger's
+     * `role === 'assistant'` bot-authored predicate and the
+     * `reaction_dispatch` preview — keep their exact pre-#4571 behaviour
+     * (a card was invisible to them, and still is). The reply-antecedent
+     * resolver opts IN: that is the whole point of the card lane.
+     */
+    includeSystem?: boolean
+  },
+): { role: MessageRole; text: string; kind: string | null } | null {
+  const sql =
+    `SELECT role, text, kind FROM messages WHERE chat_id = ? AND message_id = ?` +
+    (opts?.includeSystem === true ? '' : ` AND role <> 'system'`) +
+    ` LIMIT 1`
+  const row = requireDb().prepare(sql).get(chatId, messageId) as
+    | { role: MessageRole; text: string | null; kind: string | null }
     | undefined
   if (!row) return null
-  return { role: row.role, text: row.text ?? '' }
+  return { role: row.role, text: row.text ?? '', kind: row.kind ?? null }
 }
 
 export function getRecentOutboundCount(
@@ -1007,6 +1162,8 @@ export function query(opts: QueryOptions): RecordedMessage[] {
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT))
   const params: unknown[] = [opts.chat_id]
   let sql = 'SELECT * FROM messages WHERE chat_id = ?'
+  // #4571 — card rows are resolvable, not listable. See QueryOptions.include_system.
+  if (opts.include_system !== true) sql += " AND role <> 'system'"
   if (opts.thread_id !== undefined) {
     if (opts.thread_id === null) {
       sql += ' AND thread_id IS NULL'
