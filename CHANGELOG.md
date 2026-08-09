@@ -47,6 +47,20 @@ now an anomaly worth investigating, not the norm.
   high=1000), with the local cross-encoder reranker running at every tier and
   no LLM in the recall ranking path.
 
+### CI: release tags retag unchanged images instead of rebuilding them
+
+- **docker-images: a new `tag-retag-plan` job diffs a release tag against the
+  previous release tag over each image's declared build inputs, and a new
+  `retag-release` job re-points the previous release's manifest at `:vX.Y.Z` for
+  any image whose inputs are provably identical.** `hindsight` and `voice` were
+  rebuilt from scratch at every release even when their build context had not
+  moved a byte — the main-push path already had this short-circuit
+  (`retag-unchanged`), the tag path did not, because `dorny/paths-filter` has no
+  diff base on a tag push. Both verdicts are fail-safe: no previous tag, an
+  unreadable filter file, a registry hiccup, or a skipped/failed plan job all
+  mean BUILD, never skip — publishing a stale image under a release tag is
+  unrecoverable, while a redundant rebuild only costs minutes.
+
 ## v0.20.20 — docker-images builds `dist/` once and shares it with the dependent image legs
 
 ### CI: `dist/` is built once and shared with the dependent image legs
