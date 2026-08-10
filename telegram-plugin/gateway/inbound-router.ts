@@ -35,6 +35,7 @@ import {
 } from './inbound-interceptors.js'
 import type { InboundMessage } from './ipc-protocol.js'
 import { deriveTurnId } from './derive-turn-id.js'
+import { extractRichMessageText } from './rich-message-handler.js'
 import { formatReplyToText } from '../steering.js'
 import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
 import { safeResolvePersonName, type PersonDirectory } from './resolve-person.js'
@@ -160,10 +161,33 @@ export function buildReplyForwardContext(p: ReplyForwardContextParams): {
   // gateway runs when neither is present. Accessed defensively in case the
   // installed grammy/@grammyjs/types predate `TextQuote`.
   const quoteText = p.ctx.message?.quote?.text
+  // Rich-message parents (#4598). Every card the gateway posts goes out via
+  // Bot API 10.1 `sendRichMessage`, so a native reply to one delivers a
+  // `reply_to_message` whose body lives under `rich_message.blocks` with
+  // `text` / `caption` ABSENT. Reading only `.text ?? .caption` therefore
+  // yielded `undefined` for 100% of card parents and pushed every such reply
+  // onto the history-buffer fallback — which cannot help when no row was ever
+  // recorded (a send while the gateway was down, or one that bypassed the
+  // recording chokepoint).
+  //
+  // Measured on the wire, not inferred: a user reply to a `sendRichMessage`
+  // card yields `reply_to_message` keys
+  // `[message_id, from, chat, date, rich_message]`, `text`/`caption` absent,
+  // `rich_message.blocks` fully populated. The older "Telegram omits the
+  // parent body" comments on this path predate rich messages.
+  //
+  // Flattened by the SAME renderer the inbound rich-message handler and the
+  // outbound card observer use, so all three agree on what a card "says".
+  // Returns `undefined` (never `''`) for an unrenderable block tree, so
+  // `resolveReplyToFromBuffer`'s `liveTextEmpty` gate still falls through to
+  // the buffer instead of pinning an empty antecedent.
+  const richParentText = extractRichMessageText(
+    (replyToMsg as { rich_message?: unknown } | undefined)?.rich_message,
+  )
   const replyToTextRaw = (quoteText != null && quoteText.length > 0)
     ? quoteText
     : replyToMsg
-      ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
+      ? (replyToMsg.text ?? replyToMsg.caption ?? richParentText ?? undefined)
       : undefined
   const replyToText = replyToTextRaw != null
     ? (replyToTextRaw.length > p.replyToTextMax
@@ -198,8 +222,11 @@ export function buildReplyForwardContext(p: ReplyForwardContextParams): {
 export interface ReplyToBufferFallbackParams {
   /** From {@link buildReplyForwardContext}. */
   replyToMessageId: number | undefined
-  /** Raw reply text off the live update (for the SQLite write); empty when the
-   *  reply target is the bot's own message (Telegram omits its text). */
+  /** Raw reply text off the live update (for the SQLite write). Empty only
+   *  when the live update carried NO readable parent body at all — a plain
+   *  `sendMessage` parent (Telegram omits `.text` on the bot's own plain
+   *  messages), or a rich parent whose blocks render to nothing. A normal
+   *  card parent now arrives populated off `rich_message` (#4598). */
   replyToText: string | undefined
   /** XML-escaped reply text for the channel meta; empty in the same case. */
   replyToTextEscaped: string | undefined
@@ -219,21 +246,36 @@ export interface ReplyToBufferFallbackParams {
 }
 
 /**
- * Reply-to buffer fallback (post-reset continuity). On a native reply to the
- * BOT's OWN message, Telegram delivers `reply_to_message.message_id` but NOT
- * its `.text` — so the live reply text is empty even though the gateway
- * authored (and, via `recordOutbound`, persisted) that message. This recovers
- * the antecedent from the local history buffer so it survives a session reset
- * (`resume_mode: handoff`), where the transcript is gone.
+ * Reply-to buffer fallback (post-reset continuity). On a native reply to a
+ * PLAIN message the bot itself sent, Telegram delivers
+ * `reply_to_message.message_id` but NOT its `.text` — so the live reply text
+ * is empty even though the gateway authored (and, via `recordOutbound`,
+ * persisted) that message. This recovers the antecedent from the local history
+ * buffer so it survives a session reset (`resume_mode: handoff`), where the
+ * transcript is gone.
+ *
+ * Since #4598 this is the SECOND line of defence FOR THE TEXT, not the first:
+ * a reply to a RICH parent (every card) now carries its body on
+ * `reply_to_message.rich_message` and is resolved live in
+ * {@link buildReplyForwardContext}, so a live-resolved body is never
+ * overwritten from the buffer.
+ *
+ * The LOOKUP itself, however, still runs on every reply while history is on.
+ * `replyToRole` and `replyToKind` have no live-update source at all, so
+ * skipping the lookup whenever the live text resolved would strip
+ * `reply_to_role` / `reply_to_kind` from precisely the recorded-card replies
+ * the #4571 kind lane was built for.
  *
  * Returns updated `replyToText` (raw, for the SQLite `recordInbound` write —
  * envelope-only would leave the row NULL and starve future handoff briefings),
  * `replyToTextEscaped` (for the channel-meta `reply_to_text`), and the
  * recovered `replyToRole` ('assistant' = the bot's own message, disambiguating
  * the "you're replying to yourself" case). Pure except for the injected
- * `lookup`. Only fills in when the live reply text is empty — never overwrites
- * a non-empty live value (a partial-quote or a reply to a person's message).
- * Degrades silently to the id-only inputs on any lookup failure.
+ * `lookup`. Only fills in the TEXT when the live reply text is empty — never
+ * overwrites a non-empty live value (a partial-quote, a reply to a person's
+ * message, or a live-rendered rich parent). Role and kind are filled in from
+ * any buffer hit regardless. Degrades silently to the id-only inputs on any
+ * lookup failure.
  */
 export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
   replyToText: string | undefined
@@ -248,23 +290,32 @@ export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
   let replyToRole: 'user' | 'assistant' | 'system' | undefined
   let replyToKind: string | undefined
   const liveTextEmpty = replyToTextEscaped == null || replyToTextEscaped.length === 0
-  if (p.historyEnabled && p.replyToMessageId != null && liveTextEmpty) {
+  if (p.historyEnabled && p.replyToMessageId != null) {
     try {
       const recovered = p.lookup(p.replyToMessageId)
-      if (recovered != null && recovered.role === 'system' && recovered.kind) {
-        replyToKind = recovered.kind
-      }
-      if (recovered && recovered.text.length > 0) {
-        replyToText =
-          recovered.text.length > p.replyToTextMax
-            ? recovered.text.slice(0, p.replyToTextMax - 1) + '…'
-            : recovered.text
-        replyToTextEscaped = formatReplyToText(recovered.text, p.replyToTextMax)
+      if (recovered != null) {
+        // Role and kind are produced ONLY here — there is no live-update
+        // source for either. So the lookup runs on EVERY reply, not just the
+        // ones whose text the live update failed to carry: gating it on
+        // `liveTextEmpty` would mean a full reply to a recorded card resolved
+        // its body live (#4598) and silently lost `reply_to_role="system"` +
+        // `reply_to_kind` (#4571) — exactly the case the kind lane exists for,
+        // and the thing #4599 goes to AsyncLocalStorage lengths to record.
+        // Costs one SQLite point-read per reply.
         replyToRole = recovered.role
-      } else if (recovered) {
-        // Row exists (authorship known) but text is empty/redacted — still
-        // surface the role so the model knows whose message it is replying to.
-        replyToRole = recovered.role
+        if (recovered.role === 'system' && recovered.kind) {
+          replyToKind = recovered.kind
+        }
+        // The TEXT is still second line of defence: never overwrite a
+        // non-empty live value (a partial quote, a person's message, or a
+        // rich parent rendered off the wire).
+        if (liveTextEmpty && recovered.text.length > 0) {
+          replyToText =
+            recovered.text.length > p.replyToTextMax
+              ? recovered.text.slice(0, p.replyToTextMax - 1) + '…'
+              : recovered.text
+          replyToTextEscaped = formatReplyToText(recovered.text, p.replyToTextMax)
+        }
       }
     } catch {
       // History disabled mid-run / requireDb throws / row missing — degrade
