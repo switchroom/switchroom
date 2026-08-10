@@ -188,6 +188,34 @@ describe("detectGatewayFindings", () => {
     expect(dup?.turn_id).toBe(`${CHAT}:_#42`);
     expect(dup?.ts).toBe("2026-07-02T21:03:00Z");
   });
+
+  // The orphaned-DB-fd sweep's alarm is the ONLY notification for the
+  // registry.db lane, which has no in-process recovery — an unmatched signature
+  // means silent data loss stays silent. The fixture is the literal line
+  // `orphaned-db-sweep.ts` emits.
+  const sweepLine =
+    "2026-08-10T03:05:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+    " DB handle(s): fd=13 /state/history.db-wal (deleted), fd=14 /state/history.db-shm" +
+    " (deleted) — another process unlinked these files while we held them open;" +
+    " every row written since the last checkpoint is LOST and further writes would" +
+    " be lost too.";
+
+  it("counts the orphaned-db-handle alarm", () => {
+    const { gw_hits, findings } = detectGatewayFindings("alpha", sweepLine);
+    expect(gw_hits["orphaned-db-handle"]).toBe(1);
+    const f = findings.find((x) => x.signal === "orphaned-db-handle");
+    expect(f?.agent).toBe("alpha");
+    expect(f?.ts).toBe("2026-08-10T03:05:00Z");
+  });
+
+  it("does not fire on the sweep's recovery or disabled-detection lines", () => {
+    const quiet = [
+      "telegram gateway: orphaned-db-sweep reopened history.db — writes are durable again",
+      "telegram gateway: orphaned-db-sweep cannot resolve stateDir=/nope — deleted-inode DB" +
+        " detection is DISABLED until it exists and is readable.",
+    ].join("\n");
+    expect(detectGatewayFindings("alpha", quiet).gw_hits["orphaned-db-handle"]).toBe(0);
+  });
 });
 
 describe("scanAgent escalation decision", () => {

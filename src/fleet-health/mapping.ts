@@ -84,6 +84,21 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "talk-to-agents-from-anywhere",
     signature: "reply-delivery-failure:sendRichMessage-err",
   },
+  "orphaned-db-handle": {
+    // The gateway held a `*.db` handle onto a DELETED inode: every INSERT
+    // through it reported success and none of the rows were on disk. That is
+    // `success-theater` in its purest form — the 2026-08-10 incident ran 3h06m
+    // logging a successful insert every time. severity 3: `history.db` is the
+    // durable record the fleet's own delivery accounting and restart recovery
+    // read back, and the `registry.db` lane has NO in-process recovery, so the
+    // alarm is the only thing standing between the operator and silent loss.
+    // Maps to `survive-reboots-and-real-life`: the promise this breaks is that
+    // what happened before the restart is still there after it.
+    failure_mode: "success-theater",
+    severity: 3,
+    job_spec: "survive-reboots-and-real-life",
+    signature: "orphaned-db-handle:deleted-inode-writes",
+  },
   "hang-long-stalled": {
     failure_mode: "partial",
     severity: 2,

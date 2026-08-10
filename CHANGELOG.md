@@ -40,16 +40,29 @@
   gateway now polls: every 5 minutes it walks `/proc/self/fd` for a state-dir
   `*.db*` handle marked `(deleted)`. On a hit it logs loudly that every row
   written since the last checkpoint is LOST, then reopens `history.db` in place
-  so new writes are durable again. The reopen does a hard close first — a plain
-  close leaves the dead descriptors open and the reopen then fails — and
+  so new writes are durable again. The reopen does a hard close first: bun's
+  plain `close()` is a soft close that leaves the dead descriptors open while
+  prepared statements are outstanding, and the reopened connection then LOOKS
+  healthy (the open and the WAL pragma both succeed) and throws on the first
+  WRITE. Every history statement now goes through a module-level cache that the
+  close explicitly finalizes, so the release is deterministic rather than
+  dependent on when the GC happens to run. The reopen also
   deliberately issues no salvage checkpoint through the orphaned handle,
   because a checkpoint through a stale mapping can corrupt the pages that did
   land. `registry.db` gets the same detection and the same loud log but no
   in-process reopen: its handle is captured by value into long-lived wiring, so
   closing it would strand those consumers on a closed database; that lane names
-  the restart instead of pretending to fix itself. Silent history loss is now
-  bounded to 5 minutes rather than however long it takes someone to notice
-  missing messages.
+  the restart instead of pretending to fix itself, as does any other state-dir
+  `*.db` no lane owns. The success line is gated on a post-reopen writer
+  self-check, so "writes are durable again" is a proven claim and not an
+  optimistic one; a reopen that fails says so and asks for a restart, and
+  because that failure releases the very descriptors that would have triggered
+  the next retry, the sweep also re-alarms and retries off a sticky flag on
+  every tick with no fd evidence left to go on. Fleet-health's L0 detector
+  matches the alarm as `orphaned-db-handle`. This does not recover lost rows:
+  rows already written into the orphaned WAL remain unrecoverable. What changes
+  is that the condition is now DETECTED within 5 minutes and stops accruing,
+  rather than running silently until someone notices missing messages.
 
 - **rollout: the host-CLI self-heal no longer fails its own verification on a
   perfectly good release binary.** The self-update proof step ran the

@@ -396,7 +396,7 @@ import {
   pruneMessagesOlderThanDays,
   hasOutboundDeliveredSince,
   hasOutboundWithText,
-  recordSystemOutbound, updateSystemOutboundText, reopenHistory,
+  recordSystemOutbound, updateSystemOutboundText, reopenHistory, getHistoryReopenFailure,
 } from '../history.js'
 import { startOrphanedDbSweep } from './orphaned-db-sweep.js'
 import { makeSystemMessageObserver } from './system-message-observer.js'
@@ -2163,7 +2163,7 @@ if (isGatewayMain) runHistoryReaperNow('boot')
 if (isGatewayMain && !STATIC) {
   setInterval(() => runHistoryReaperNow('periodic'), REGISTRY_REAPER_INTERVAL_MS).unref()
 }
-if (isGatewayMain && !STATIC) startOrphanedDbSweep({ stateDir: STATE_DIR, reopenHistory: HISTORY_ENABLED ? () => reopenHistory(STATE_DIR, HISTORY_ACCESS.historyRetentionDays ?? 30) : undefined, log: (l) => process.stderr.write(l) }) // own 5-min tick, NOT the 6h reaper: bounds silent data loss from a deleted-inode DB handle to one interval (gateway/orphaned-db-sweep.ts). Runs regardless of HISTORY_ENABLED — registry.db opens whenever isGatewayMain.
+if (isGatewayMain && !STATIC) startOrphanedDbSweep({ stateDir: STATE_DIR, reopenHistory: HISTORY_ENABLED ? () => reopenHistory(STATE_DIR, HISTORY_ACCESS.historyRetentionDays ?? 30) : undefined, historyReopenFailure: HISTORY_ENABLED ? getHistoryReopenFailure : undefined, log: (l) => process.stderr.write(l) }) // own 5-min tick, NOT the 6h reaper: bounds silent data loss from a deleted-inode DB handle to one interval (gateway/orphaned-db-sweep.ts). Runs regardless of HISTORY_ENABLED — registry.db opens whenever isGatewayMain.
 
 // ─── Approval polling ─────────────────────────────────────────────────────
 function checkApprovals(): void {
