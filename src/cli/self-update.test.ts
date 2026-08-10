@@ -237,7 +237,7 @@ function makeIO(overrides: Partial<SelfUpdateIO> = {}) {
       files.set(dest, "NEW-BINARY");
     },
     sha256File: () => GOOD_SHA,
-    probeBinaryVersion: () => "0.19.28",
+    probeBinary: () => ({ ok: true, version: "0.19.28" }),
     mkdirp: (d) => void dirs.add(d),
     copyFile: (src, dest) => void files.set(dest, files.get(realpath(src)) ?? ""),
     chmodExec: () => {},
@@ -361,9 +361,38 @@ describe("performSelfUpdate", () => {
   });
 
   it("refuses a binary that cannot run on this host, BEFORE the swap", async () => {
-    const { io, files } = makeIO({ probeBinaryVersion: () => null });
-    await expect(run(io)).rejects.toThrow(/did not run cleanly/);
+    const { io, files } = makeIO({
+      probeBinary: () => ({ ok: false, kind: "ran-but-failed", detail: "exit 1" }),
+    });
+    await expect(run(io)).rejects.toThrow(/the artifact itself is faulty/);
     // The whole point: a broken binary never reaches $PATH.
+    expect(files.get("/usr/local/bin/switchroom")).toBe("OLD-BINARY");
+  });
+
+  // #4586 follow-up. Before this split, EVERY probe failure was reported as
+  // "the downloaded binary did not run cleanly on this host", which reads as
+  // "the artifact is bad" and sends the operator to re-download an artifact
+  // whose sha256 already matched. A failure to EXEC is a property of the
+  // staging location (a `noexec` mount, a lost +x bit, a foreign arch), and
+  // the message must say so or the remedy is wrong.
+  it("says the artifact is fine and the LOCATION is not, when the exec itself fails", async () => {
+    const { io, files } = makeIO({
+      probeBinary: () => ({
+        ok: false,
+        kind: "not-executable",
+        detail: "EACCES: spawnSync .../switchroom-v0.19.28.download EACCES",
+      }),
+    });
+    const err = await run(io).then(
+      () => "",
+      (e: Error) => e.message,
+    );
+    expect(err).toContain("could not EXECUTE");
+    expect(err).toContain("noexec");
+    expect(err).toContain("re-downloading will not help");
+    // It must NOT accuse the artifact.
+    expect(err).not.toContain("the artifact itself is faulty");
+    // Still refuses: an unproven binary never reaches $PATH.
     expect(files.get("/usr/local/bin/switchroom")).toBe("OLD-BINARY");
   });
 

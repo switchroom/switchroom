@@ -34,6 +34,12 @@ import type { SelfUpdateIO } from "./self-update.js";
 /** Bounded so a hung GitHub/CDN connection can't wedge an update. */
 const HTTP_TIMEOUT_MS = 60_000;
 
+/** First non-empty line of a stream, bounded — probe details go into prose. */
+function firstLine(s: string | undefined | null): string {
+  const line = `${s ?? ""}`.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
 export function defaultSelfUpdateIO(): SelfUpdateIO {
   return {
     async httpGetText(url) {
@@ -78,18 +84,63 @@ export function defaultSelfUpdateIO(): SelfUpdateIO {
       }
       return hash.digest("hex");
     },
-    probeBinaryVersion(path) {
-      const r = spawnSync(path, ["version"], {
+    probeBinary(path) {
+      // `--version`, NOT the `version` SUBCOMMAND.
+      //
+      // This is the #4586 dead end, root-caused. `switchroom version` renders
+      // the fleet health summary: it calls `getConfig()` and exits 1 with
+      // "Config error: No switchroom.yaml found" in any context that has no
+      // `~/.switchroom/switchroom.yaml`, then enumerates agent containers over
+      // the docker socket. The host-CLI heal helper deliberately mounts the
+      // install prefix AND NOTHING ELSE — no `~/.switchroom`, no docker socket
+      // (`host-cli-heal.ts`, `healHelperArgs`) — so the probe of a perfectly
+      // good release binary exited 1 there, every time, and the roll refused
+      // with "the downloaded binary did not run cleanly on this host".
+      //
+      // `--version` is commander's own flag. It still execs the artifact and
+      // loads its entire bundled runtime — which is the ONLY thing this check
+      // is trying to prove — while touching no config, no docker socket and no
+      // network. It is therefore both the cheapest and the strictly more
+      // correct proof: a non-zero exit from it indicts the binary, whereas a
+      // non-zero exit from `version` mostly indicts the environment.
+      const r = spawnSync(path, ["--version"], {
         encoding: "utf-8",
         timeout: 30_000,
         // A candidate binary must not inherit the self-update sentinel or
         // it could mask a loop guard in a future refactor.
         env: { ...process.env, SWITCHROOM_SELF_UPDATED: "" },
       });
-      if (r.status !== 0) return null;
+      // spawn itself failed: EACCES from a `noexec` staging mount or a missing
+      // +x bit, ENOEXEC from a foreign architecture, ENOENT. None of these say
+      // anything about the artifact's integrity.
+      if (r.error) {
+        const code = (r.error as NodeJS.ErrnoException).code;
+        return {
+          ok: false,
+          kind: "not-executable",
+          detail: code ? `${code}: ${r.error.message}` : r.error.message,
+        };
+      }
+      if (r.signal) {
+        return { ok: false, kind: "not-executable", detail: `killed by signal ${r.signal}` };
+      }
+      if (r.status !== 0) {
+        return {
+          ok: false,
+          kind: "ran-but-failed",
+          detail: `exit ${r.status}${firstLine(r.stderr) ? `: ${firstLine(r.stderr)}` : ""}`,
+        };
+      }
       const out = `${r.stdout ?? ""}`.trim();
       const m = out.match(/\d+\.\d+\.\d+/);
-      return m ? m[0] : null;
+      if (!m) {
+        return {
+          ok: false,
+          kind: "no-version",
+          detail: out ? `printed ${JSON.stringify(firstLine(out))}` : "printed nothing",
+        };
+      }
+      return { ok: true, version: m[0] };
     },
     mkdirp(dir) {
       mkdirSync(dir, { recursive: true });

@@ -367,6 +367,84 @@ export function alreadySelfUpdated(env: NodeJS.ProcessEnv): boolean {
 // verify → prove → swap sequence is exercisable in a unit test with an
 // in-memory filesystem and no network.
 
+/**
+ * The outcome of executing a candidate binary to ask it its version.
+ *
+ * The `kind` split is the whole point. Before #4586's follow-up the probe
+ * returned `string | null`, so THREE different situations arrived at the
+ * caller as the same `null`:
+ *
+ *  - the artifact is genuinely broken (wrong arch, unloadable runtime),
+ *  - the artifact is fine but this process could not EXEC it where it was
+ *    staged (a `noexec` staging mount, a lost +x bit, ENOEXEC under an
+ *    emulated arch),
+ *  - the artifact ran fine but the command we chose to run needed something
+ *    the environment does not have.
+ *
+ * Only the first is "do not install this binary". The other two are
+ * environment faults, and reporting them as a bad download sends the
+ * operator to re-download an artifact that was never the problem — which is
+ * exactly the wrong-remedy dead end this type exists to prevent.
+ */
+export type BinaryProbe =
+  | { ok: true; version: string }
+  | {
+      ok: false;
+      /**
+       * `not-executable` — the exec never happened or the process was killed
+       * by a signal (EACCES from a `noexec` mount or a missing +x bit,
+       * ENOEXEC, ENOENT). Says nothing about the artifact's integrity.
+       *
+       * `ran-but-failed` — the binary executed and exited non-zero. THIS is
+       * the one that indicts the artifact, provided the probe command is one
+       * that cannot fail for environmental reasons (see
+       * `defaultSelfUpdateIO().probeBinary`).
+       *
+       * `no-version` — exited 0 but printed nothing that parses as a semver.
+       */
+      kind: "not-executable" | "ran-but-failed" | "no-version";
+      /** One bounded line naming the errno / exit code / output. */
+      detail: string;
+    };
+
+/**
+ * Operator-facing prose for a failed probe, phrased per {@link BinaryProbe}
+ * `kind` so the remedy the reader acts on is the right one.
+ *
+ * Shared by `performSelfUpdate` (probing the freshly downloaded candidate)
+ * and `host-cli-upgrade` (probing the binary after the swap) so the two can
+ * never disagree about what a probe failure means.
+ */
+export function describeBinaryProbeFailure(opts: {
+  probe: Extract<BinaryProbe, { ok: false }>;
+  /** Path that was probed. */
+  path: string;
+  /** What the probed file is, for the sentence subject. */
+  subject: string;
+}): string {
+  const { probe, path, subject } = opts;
+  switch (probe.kind) {
+    case "not-executable":
+      return (
+        `could not EXECUTE ${subject} at ${path} (${probe.detail}). This is a ` +
+        `property of WHERE it was staged, not of the artifact — the usual causes ` +
+        `are a staging directory mounted \`noexec\`, a lost execute bit, or an ` +
+        `architecture this kernel cannot run. The download's sha256 already ` +
+        `matched the release's checksums file, so re-downloading will not help.`
+      );
+    case "ran-but-failed":
+      return (
+        `${subject} at ${path} ran but exited non-zero for \`--version\` ` +
+        `(${probe.detail}) — the artifact itself is faulty.`
+      );
+    case "no-version":
+      return (
+        `${subject} at ${path} ran and exited 0 but printed no parseable version ` +
+        `(${probe.detail}) — the artifact itself is faulty.`
+      );
+  }
+}
+
 export interface SelfUpdateIO {
   /** GET a URL as text. Throws on non-2xx. */
   httpGetText(url: string): Promise<string>;
@@ -374,9 +452,15 @@ export interface SelfUpdateIO {
   httpDownload(url: string, dest: string): Promise<void>;
   /** Lowercase hex SHA256 of a file. */
   sha256File(path: string): string;
-  /** Run `<path> version` and return the printed version, or null when
-   *  the binary does not exit 0 / prints nothing parseable. */
-  probeBinaryVersion(path: string): string | null;
+  /**
+   * Execute `<path>` and read back the version it reports.
+   *
+   * Returns a THREE-state answer, not a boolean-ish `string | null`, because
+   * "the binary is bad" and "we could not execute it here" demand opposite
+   * remedies and conflating them is what dead-ended a real roll (#4586 →
+   * this fix). See {@link BinaryProbe}.
+   */
+  probeBinary(path: string): BinaryProbe;
   mkdirp(dir: string): void;
   copyFile(src: string, dest: string): void;
   chmodExec(path: string): void;
@@ -748,12 +832,19 @@ export async function performSelfUpdate(opts: {
   // artifact (impossible, but cheap to exclude), and a binary whose
   // bundled runtime this host cannot load. A CLI that cannot print its
   // own version must never reach the operator's PATH.
-  const proved = io.probeBinaryVersion(tmp);
-  if (!proved) {
+  //
+  // The check is never SKIPPED, whatever the probe says — an unproven binary
+  // does not get installed. But the message distinguishes "the artifact is
+  // bad" from "we could not run it here", because the remedies are opposite.
+  const proved = io.probeBinary(tmp);
+  if (!proved.ok) {
     io.remove(tmp);
     throw new Error(
-      `self-update: the downloaded ${plan.to} binary did not run cleanly on this host ` +
-        `(\`switchroom version\` failed) — refusing to install it. The installed CLI is unchanged.`,
+      `self-update: ${describeBinaryProbeFailure({
+        probe: proved,
+        path: tmp,
+        subject: `the downloaded ${plan.to} binary`,
+      })} Refusing to install it. The installed CLI is unchanged.`,
     );
   }
 

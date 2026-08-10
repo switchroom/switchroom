@@ -44,6 +44,7 @@ import { lchownSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Command } from "commander";
 import {
+  describeBinaryProbeFailure,
   payloadVersionDir,
   performSelfUpdate,
   releaseAssetName,
@@ -330,12 +331,23 @@ export async function runHostCliUpgrade(
 
     // Prove the file that is NOW on the host's $PATH answers with the target —
     // `performSelfUpdate` proves the staged candidate, this proves the swap.
-    const proven = io.selfUpdate.probeBinaryVersion(binary);
-    if (!proven || `v${proven.replace(/^v/, "")}` !== pin) {
+    const proven = io.selfUpdate.probeBinary(binary);
+    if (!proven.ok) {
       return {
         ok: false,
         error:
-          `swapped ${binary} but it reports ${proven ?? "<nothing>"}, not ${pin} — ` +
+          `swapped ${binary} but ${describeBinaryProbeFailure({
+            probe: proven,
+            path: binary,
+            subject: "the installed binary",
+          })} ${result.message}`,
+      };
+    }
+    if (`v${proven.version.replace(/^v/, "")}` !== pin) {
+      return {
+        ok: false,
+        error:
+          `swapped ${binary} but it reports ${proven.version}, not ${pin} — ` +
           `the install did not land. ${result.message}`,
       };
     }

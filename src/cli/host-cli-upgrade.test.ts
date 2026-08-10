@@ -77,7 +77,7 @@ function makeIo(overrides: {
       asRoot(dest);
     },
     sha256File: () => GOOD_SHA,
-    probeBinaryVersion: () => "0.22.0",
+    probeBinary: () => ({ ok: true, version: "0.22.0" }),
     mkdirp: (d) => {
       dirs.add(d);
       asRoot(d);
@@ -278,11 +278,11 @@ describe("runHostCliUpgrade — the swap", () => {
     let calls = 0;
     const { io, files } = makeIo({
       self: {
-        probeBinaryVersion: () => {
+        probeBinary: () => {
           calls += 1;
           // First call proves the staged candidate inside performSelfUpdate;
           // the second is host-cli-upgrade re-probing the installed path.
-          return calls === 1 ? "0.22.0" : "0.21.0";
+          return { ok: true, version: calls === 1 ? "0.22.0" : "0.21.0" };
         },
       },
     });

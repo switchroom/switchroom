@@ -79,5 +79,8 @@ switchroom-checksums.txt
 # Scratch dir for tests/ci-buildx-warm-pull.test.ts when /tmp is noexec.
 .buildx-warm-test-*/
 
+# Scratch dir for src/cli/self-update-io-probe.test.ts when /tmp is noexec.
+.probe-argv-test-*/
+
 # Locally built release asset payload (#4163).
 switchroom-assets.tar.gz
