@@ -700,27 +700,22 @@ describe('startOrphanedDbSweep', () => {
     // Multiple ticks: proves the interval repeats, not just fires once.
     expect(lines.length).toBeGreaterThan(1)
 
+    const atStop = lines.length
     stop()
-    // A tick is async, so one may be in flight when stop() lands — the property
-    // under test is "no NEW ticks start", not "no line is ever appended after
-    // the stop() call returns". That allowance used to be a FIXED 60ms settle
-    // window, which a loaded merge-queue runner blew straight through: the
-    // in-flight tick landed after the snapshot and the exact-equality assertion
-    // below saw atStop + 1 (#4601, two of three consecutive queue passes).
+    // The property under test is "no NEW ticks start", not "no line is ever
+    // appended after stop() returns": the tick body is async, so one tick can
+    // already be in flight when stop() lands and will still emit its line.
     //
-    // Poll to QUIESCENCE instead of guessing a window. This stays a real test
-    // of the property: an uncleared 5ms interval never quiesces, so it burns
-    // the whole deadline and STILL fails the assertion below.
-    const quiesceBy = Date.now() + 5_000
-    let atStop = lines.length
-    for (;;) {
-      await sleep(40)
-      if (lines.length === atStop) break
-      atStop = lines.length
-      if (Date.now() > quiesceBy) break
-    }
-    await sleep(250)
-    // A stop() that did not clear the interval would add ~50 more lines here.
-    expect(lines.length).toBe(atStop)
+    // The sweep's own `running` guard means AT MOST ONE can be in flight, so
+    // the tolerance is exactly one line — assert that, rather than trying to
+    // out-wait the in-flight tick and then demanding exact equality. Every
+    // fixed settle window is a guess a loaded runner beats: 60ms flaked two of
+    // three consecutive merge-queue passes and a 40ms quiescence poll flaked
+    // again on the very next one (#4601), because a tick that has not yet
+    // resolved looks identical to quiescence.
+    await sleep(400)
+    // Not a weakening: an uncleared 5ms interval adds dozens of lines here, so
+    // this still fails hard on a stop() that does not clear the timer.
+    expect(lines.length - atStop).toBeLessThanOrEqual(1)
   })
 })
