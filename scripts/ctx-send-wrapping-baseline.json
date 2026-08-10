@@ -1,0 +1,26 @@
+{
+  "_readme": [
+    "Inventory of raw, UNWRAPPED grammy CONTEXT sends: ctx.reply /",
+    "ctx.replyWithRichMessage (and the replyWith<Media> family), outside any",
+    "robustApiCall-family wrapper. Enforced by scripts/check-ctx-send-wrapping.mjs",
+    "as an EXACT match, both directions: a new bypass fails CI, and removing one",
+    "fails CI until you lower the number here in the same PR.",
+    "These are not harmless. grammy's Context.reply auto-injects message_thread_id",
+    "for topic messages, so each of these is in the THREAD_NOT_FOUND blast radius",
+    "with no retryWithThreadFallback; each 429 it earns is missing from the flood",
+    "ledger; and before switchroom#4599 the card it posted left no history row, so",
+    "a native reply to a /usage card resolved to an id with no text (measured live,",
+    "agent overlord, message id 20938).",
+    "These entries are a BACKLOG, not an allowance. Lower them; never raise them."
+  ],
+  "files": {
+    "telegram-plugin/gateway/approvals-commands.ts": 8,
+    "telegram-plugin/gateway/bot-commands-model-effort.ts": 2,
+    "telegram-plugin/gateway/bot-commands-start-info.ts": 5,
+    "telegram-plugin/gateway/callback-query-handlers.ts": 4,
+    "telegram-plugin/gateway/folder-picker-handler.ts": 2,
+    "telegram-plugin/gateway/gateway.ts": 6,
+    "telegram-plugin/gateway/inbound-router.ts": 1,
+    "telegram-plugin/shared/bot-runtime.ts": 2
+  }
+}

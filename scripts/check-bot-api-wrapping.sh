@@ -49,7 +49,23 @@ cd "$(dirname "$0")/.."
 # do NOT take `message_thread_id` so they're not in the THREAD_NOT_FOUND
 # blast radius and we skip them. answerCallbackQuery is also excluded
 # for the same reason.
-PATTERN='\b(bot|lockedBot|ctx)\.api\.(sendMessage|sendPhoto|sendDocument|sendMediaGroup|sendAnimation|sendVideo|sendVoice|sendAudio|sendSticker|sendLocation|editMessageText|editMessageCaption|editMessageMedia|editMessageReplyMarkup|forwardMessage|forwardMessages|copyMessage|copyMessages|pinChatMessage|unpinChatMessage|unpinAllChatMessages|deleteMessage|deleteMessages)\b'
+#
+# SCOPE, stated precisely (switchroom#4599). This pattern is anchored on
+# `\.api\.`. It therefore covers `bot.api.X` / `lockedBot.api.X` /
+# `ctx.api.X` and NOTHING ELSE — in particular it can never match
+# `ctx.reply(` or `ctx.replyWithRichMessage(`, which is how every
+# slash-command card (`/usage`, `/model`, `/auth`, `/approvals`, `/start`,
+# `/help`) reaches Telegram via `switchroomReply`. Do not read a green run
+# of this guard as "every outbound send transits `robustApiCall`": that
+# claim was written into `gateway/system-message-observer.ts` and was false
+# from the day it merged (measured: agent overlord, message id 20938 — a
+# `/usage` card that left no history row, so a native reply to it resolved
+# to an id with no text). The context-send family has its own ratchet,
+# `scripts/check-ctx-send-wrapping.mjs`.
+#
+# `sendRichMessage` / `sendRichMessageDraft` (Bot API 10.1) were missing
+# from the verb list below until #4599 added them.
+PATTERN='\b(bot|lockedBot|ctx)\.api\.(sendRichMessage|sendRichMessageDraft|sendMessage|sendPhoto|sendDocument|sendMediaGroup|sendAnimation|sendVideo|sendVoice|sendAudio|sendSticker|sendLocation|editMessageText|editMessageCaption|editMessageMedia|editMessageReplyMarkup|forwardMessage|forwardMessages|copyMessage|copyMessages|pinChatMessage|unpinChatMessage|unpinAllChatMessages|deleteMessage|deleteMessages)\b'
 
 # Files we scan. retry-api-call.ts is the definition of the wrapper so
 # excluded; tests directories use the API directly to assert call shape.

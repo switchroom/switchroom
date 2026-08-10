@@ -91,6 +91,12 @@ import { readFileSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { execFileSync } from 'node:child_process'
+import {
+  countRawCtxCalls,
+  evaluateInventory,
+  WRAPPERS as SHARED_WRAPPERS,
+  WRAP_LOOKBACK_LINES as SHARED_LOOKBACK,
+} from './lib/raw-ctx-scan.mjs'
 
 /** Path of the checked-in inventory, relative to the repo root. */
 export const BASELINE_PATH = 'scripts/callback-ctx-wrapping-baseline.json'
@@ -108,33 +114,18 @@ export const CALLBACK_CTX_METHODS = [
   'editMessageReplyMarkup',
 ]
 
-/** Retry wrappers whose presence marks a call as already-policed. */
-export const WRAPPERS = [
-  'apiCall',
-  'robustApiCall',
-  'swallowingApiCall',
-  'nonEssentialApiCall',
-  'retryApiCall',
-  'retryWithThreadFallback',
-]
+/**
+ * Retry wrappers whose presence marks a call as already-policed. Re-exported
+ * from the shared scanner so this guard and `check-ctx-send-wrapping.mjs`
+ * cannot drift apart (switchroom#4599).
+ */
+export const WRAPPERS = SHARED_WRAPPERS
 
 /** How many preceding lines are searched for a wrapper invocation. */
-export const WRAP_LOOKBACK_LINES = 10
+export const WRAP_LOOKBACK_LINES = SHARED_LOOKBACK
 
 /** Marker that waives ONE raw call site. Reason is mandatory. */
 export const EXEMPT_MARKER = 'allow-raw-callback-ctx:'
-
-const CTX_CALL_RE = new RegExp(
-  String.raw`\bctx\.(?:api\.)?(?:${CALLBACK_CTX_METHODS.join('|')})\s*\(`,
-  'g',
-)
-const WRAPPER_RE = new RegExp(String.raw`\b(?:${WRAPPERS.join('|')})\s*\(`)
-
-/** True for a line that is purely a comment (so a doc mention isn't a call). */
-function isCommentLine(line) {
-  const t = line.trim()
-  return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')
-}
 
 /**
  * Count raw, unwrapped callback-context calls in one file.
@@ -143,43 +134,10 @@ function isCommentLine(line) {
  * @returns {{ count: number, sites: {line: number, text: string}[], errors: string[] }}
  */
 export function countRawCallbackCtxCalls(path, source) {
-  const lines = source.split('\n')
-  const sites = []
-  const errors = []
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    if (isCommentLine(line)) continue
-    CTX_CALL_RE.lastIndex = 0
-    let m
-    while ((m = CTX_CALL_RE.exec(line)) !== null) {
-      // Exemption marker on the immediately preceding line.
-      const prev = i > 0 ? lines[i - 1] : ''
-      const at = prev.indexOf(EXEMPT_MARKER)
-      if (at !== -1) {
-        const reason = prev.slice(at + EXEMPT_MARKER.length).trim()
-        if (reason === '') {
-          errors.push(
-            `${path}:${i + 1}: '${EXEMPT_MARKER}' with no reason. State WHY this raw ` +
-              `callback-context call may skip the retry/flood policy, in the marker itself.`,
-          )
-        }
-        continue
-      }
-      // Wrapped? A wrapper invocation on this line BEFORE the match, or on any
-      // of the preceding WRAP_LOOKBACK_LINES lines.
-      const head = line.slice(0, m.index)
-      let wrapped = WRAPPER_RE.test(head)
-      for (let k = 1; !wrapped && k <= WRAP_LOOKBACK_LINES && i - k >= 0; k++) {
-        const prevLine = lines[i - k]
-        if (isCommentLine(prevLine)) continue
-        if (WRAPPER_RE.test(prevLine)) wrapped = true
-      }
-      if (wrapped) continue
-      sites.push({ line: i + 1, text: line.trim() })
-    }
-  }
-  return { count: sites.length, sites, errors }
+  return countRawCtxCalls(path, source, {
+    methods: CALLBACK_CTX_METHODS,
+    exemptMarker: EXEMPT_MARKER,
+  })
 }
 
 /**
@@ -239,45 +197,26 @@ export function checkFinalizeSeam(path, source) {
  */
 export function evaluateCallbackCtxWrapping(files, baseline) {
   const errors = []
-  /** @type {Record<string, number>} */
-  const actual = {}
+  const counted = []
 
   for (const { path, source } of files) {
     errors.push(...checkFinalizeSeam(path, source))
     const { count, sites, errors: siteErrors } = countRawCallbackCtxCalls(path, source)
     errors.push(...siteErrors)
-    if (count > 0) actual[path] = count
-
-    const expected = baseline[path] ?? 0
-    if (count > expected) {
-      const fresh = sites.slice(expected).map((s) => `${path}:${s.line}: ${s.text}`)
-      errors.push(
-        `${path}: ${count} raw callback-context call(s), inventory says ${expected}. ` +
-          `A NEW raw \`ctx.answerCallbackQuery\`/\`editMessageText\`/\`editMessageReplyMarkup\` ` +
-          `bypasses the retry/flood policy: its 429s never reach the ledger and a failed ` +
-          `repaint leaves a live-looking card (switchroom#3891). Wrap it in \`robustApiCall\`, ` +
-          `or mark it \`// ${EXEMPT_MARKER} <reason>\`.\n      Candidates:\n        ` +
-          fresh.join('\n        '),
-      )
-    } else if (count < expected) {
-      errors.push(
-        `${path}: ${count} raw callback-context call(s), inventory says ${expected}. ` +
-          `You removed some — lower the number in ${BASELINE_PATH} in the SAME PR. ` +
-          `That is what makes this a ratchet: a stale inventory would re-admit the ` +
-          `bypasses you just deleted.`,
-      )
-    }
+    counted.push({ path, count, sites })
   }
 
-  // A file in the inventory that no longer has any raw calls (renamed/deleted).
-  for (const [path, expected] of Object.entries(baseline)) {
-    if (expected > 0 && actual[path] === undefined) {
-      errors.push(
-        `${path}: listed in ${BASELINE_PATH} with ${expected} raw call(s) but has none ` +
-          `(file moved, renamed, or fully converted). Remove the entry in the same PR.`,
-      )
-    }
-  }
+  const { errors: ratchetErrors, actual } = evaluateInventory(counted, baseline, {
+    baselinePath: BASELINE_PATH,
+    growMessage: ({ path, count, expected, fresh }) =>
+      `${path}: ${count} raw callback-context call(s), inventory says ${expected}. ` +
+      `A NEW raw \`ctx.answerCallbackQuery\`/\`editMessageText\`/\`editMessageReplyMarkup\` ` +
+      `bypasses the retry/flood policy: its 429s never reach the ledger and a failed ` +
+      `repaint leaves a live-looking card (switchroom#3891). Wrap it in \`robustApiCall\`, ` +
+      `or mark it \`// ${EXEMPT_MARKER} <reason>\`.\n      Candidates:\n        ` +
+      fresh.join('\n        '),
+  })
+  errors.push(...ratchetErrors)
 
   return { ok: errors.length === 0, errors, actual }
 }
