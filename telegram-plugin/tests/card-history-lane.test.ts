@@ -49,8 +49,13 @@ import {
   type EnvelopeBuildParams,
 } from '../gateway/inbound-router.js'
 import { makeSystemMessageObserver } from '../gateway/system-message-observer.js'
-import { Bot } from 'grammy'
-import { installRichMarkdownGuard } from '../shared/bot-runtime.js'
+import { Bot, Context } from 'grammy'
+import {
+  installRichMarkdownGuard,
+  installSystemMessageObserver,
+  makeSwitchroomReply,
+  withTgSendContext,
+} from '../shared/bot-runtime.js'
 import { installSentTextCapture } from '../shared/sent-text-capture.js'
 import { richMessage } from '../rich-send.js'
 
@@ -314,6 +319,170 @@ describe('#4576: the stored card body is NOT empty — real sendRichMessage resp
     )
     expect(cards).toHaveLength(verbs.length)
     expect(cards.filter((r) => r.text.length === 0)).toEqual([])
+  })
+})
+
+describe('#4599: the SLASH-COMMAND card path is recorded too', () => {
+  const BOT_INFO = {
+    id: 123456, is_bot: true as const, first_name: 'Test', username: 'test_bot',
+    can_join_groups: false, can_read_all_group_messages: false,
+    supports_inline_queries: false, can_connect_to_business: false,
+    has_main_web_app: false,
+  }
+
+  /**
+   * The gateway's REAL transformer stack with the observer installed exactly
+   * where gateway.ts installs it (after `installSentTextCapture`), transport
+   * stubbed to answer with the true `Message.RichMessageMessage` shape echoing
+   * the markdown that was actually POSTed.
+   *
+   * `editMessageText` re-uses the `message_id` in the payload, so an edit
+   * returns the id it edited — the shape the observer's send-vs-edit rule
+   * depends on.
+   */
+  function makeCardBot(observe: (result: unknown, opts?: { verb?: string }) => void) {
+    let nextId = 30_000
+    const posted: string[] = []
+    const fakeFetch = (async (_url: unknown, init: { body?: string } | undefined) => {
+      const payload = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      posted.push(String(payload.__method__ ?? ''))
+      const rich = payload.rich_message as { markdown?: unknown } | undefined
+      const id = typeof payload.message_id === 'number' ? payload.message_id : nextId++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          result: {
+            message_id: id,
+            date: 0,
+            chat: { id: Number(CHAT), type: 'private' },
+            ...(typeof rich?.markdown === 'string'
+              ? { rich_message: { blocks: [{ type: 'paragraph', text: { text: rich.markdown } }] } }
+              : { text: String(payload.text ?? '') }),
+          },
+        }),
+      } as unknown as Response
+    }) as unknown as typeof fetch
+
+    const bot = new Bot('123456:TEST_TOKEN', { botInfo: BOT_INFO, client: { fetch: fakeFetch } })
+    installRichMarkdownGuard(bot)
+    installSentTextCapture(bot)
+    installSystemMessageObserver(bot, observe)
+    return { bot, posted }
+  }
+
+  /** A grammy Context for an inbound `/usage`, as the command handler receives it. */
+  function makeCtx(bot: Bot): Context {
+    return new Context(
+      {
+        update_id: 1,
+        message: {
+          message_id: 20_930,
+          date: 0,
+          chat: { id: Number(CHAT), type: 'private' as const },
+          from: { id: 111, is_bot: false, first_name: 'Alice' },
+          text: '/usage',
+        },
+      } as never,
+      bot.api,
+      BOT_INFO,
+    )
+  }
+
+  it('a /usage card sent via switchroomReply leaves exactly one non-empty row', async () => {
+    // THE #4599 DEFECT, pinned. `switchroomReply` answers every slash command
+    // through `ctx.replyWithRichMessage`, which builds its own payload and calls
+    // `bot.api.*` directly — it never transits `robustApiCall`, where the #4571
+    // recorder was hooked. Measured on a live agent: the `/usage` card at id
+    // 20938 left no row, so a quote-reply to it resolved to nothing. A recorder
+    // that only sees `robustApiCall` cannot pass this test.
+    const observe = makeObserver()
+    const { bot } = makeCardBot(observe)
+    const switchroomReply = makeSwitchroomReply(() => undefined)
+    const BODY = 'Usage this week — Opus 41 percent, Sonnet 12 percent'
+
+    await switchroomReply(makeCtx(bot), BODY, { html: true })
+
+    const cards = query({ chat_id: CHAT, limit: 50, include_system: true }).filter(
+      (r) => r.role === 'system',
+    )
+    expect(cards).toHaveLength(1)
+    expect(cards[0]!.text).toBe(BODY)
+
+    // …and the quote-reply the operator actually makes now resolves.
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: cards[0]!.message_id,
+      replyToText: undefined,
+      replyToTextEscaped: undefined,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: boundLookup,
+    })
+    expect(resolved.replyToRole).toBe('system')
+    expect(resolved.replyToText).toBe(BODY)
+  })
+
+  it('the PLAIN ctx.reply branch of switchroomReply is recorded as well', async () => {
+    const observe = makeObserver()
+    const { bot } = makeCardBot(observe)
+    const switchroomReply = makeSwitchroomReply(() => undefined)
+
+    await switchroomReply(makeCtx(bot), 'plain notice, no markdown', {})
+
+    const cards = query({ chat_id: CHAT, limit: 50, include_system: true }).filter(
+      (r) => r.role === 'system',
+    )
+    expect(cards).toHaveLength(1)
+    expect(cards[0]!.text).toBe('plain notice, no markdown')
+  })
+
+  it('a wrapped send keeps its verb → kind, and its edits do NOT add a second row', async () => {
+    // The behaviour the move must PRESERVE: `robustApiCall` publishes its verb
+    // through `withTgSendContext`, so the 117 live `role='system'` rows keep
+    // their `kind` (`activity-summary`, `worker-feed`, …) instead of degrading
+    // to null now that the recorder no longer sits on that wrapper.
+    let clock = 1_000
+    const observe = makeObserver(() => clock)
+    const { bot } = makeCardBot(observe)
+
+    const sent = await withTgSendContext({ chat_id: CHAT, verb: 'activity-summary.send' }, () =>
+      bot.api.sendRichMessage(Number(CHAT), richMessage('Working — 3 tools')),
+    )
+    const id = (sent as { message_id: number }).message_id
+
+    clock += 60_000
+    await withTgSendContext({ chat_id: CHAT, verb: 'activity-summary.edit' }, () =>
+      bot.api.editMessageText(Number(CHAT), id, richMessage('Working — 11 tools')),
+    )
+
+    const cards = query({ chat_id: CHAT, limit: 50, include_system: true }).filter(
+      (r) => r.role === 'system',
+    )
+    expect(cards).toHaveLength(1)
+    expect(cards[0]!.message_id).toBe(id)
+    expect(cards[0]!.kind).toBe('activity-summary')
+    expect(cards[0]!.text).toBe('Working — 11 tools')
+  })
+
+  it('a Telegram REJECTION is never recorded as a card', async () => {
+    // grammy resolves the transformer chain with the raw `{ok:false}` body and
+    // only throws afterwards, so a failed send reaches the observer as a
+    // RESOLVED response. Recording its error object would be #4576 all over.
+    const observe = makeObserver()
+    const failFetch = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: false, error_code: 400, description: 'chat not found' }),
+      }) as unknown as Response) as unknown as typeof fetch
+    const bot = new Bot('123456:TEST_TOKEN', { botInfo: BOT_INFO, client: { fetch: failFetch } })
+    installSystemMessageObserver(bot, observe)
+
+    await expect(
+      bot.api.sendRichMessage(Number(CHAT), richMessage('never lands')),
+    ).rejects.toThrow()
+    expect(query({ chat_id: CHAT, limit: 50, include_system: true })).toHaveLength(0)
   })
 })
 

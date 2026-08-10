@@ -24,10 +24,29 @@
  * Rather than add a `recordSystemOutbound(...)` call to each of the ~110 raw
  * send sites (which is exactly the kind of per-call-site discipline that
  * decays — the `reply` path was the only site anyone remembered), this hooks
- * the ONE chokepoint every gateway outbound already goes through:
- * `gateway.ts`'s `robustApiCall` (chat-lock → send-gate → retry policy). Every
- * card send in the gateway is routed through it, enforced by the
- * `check-bot-api-wrapping` lint guard.
+ * ONE chokepoint and observes the resolved response there.
+ *
+ * WHICH chokepoint took two goes, and the first answer was wrong (#4599). This
+ * docblock used to say the hook sat on `gateway.ts`'s `robustApiCall` — "the
+ * ONE chokepoint every gateway outbound already goes through … enforced by the
+ * `check-bot-api-wrapping` lint guard". Both halves were false from the day it
+ * merged. grammY's `ctx.*` sugar builds the payload and calls `bot.api.*`
+ * itself, so `switchroomReply` — the helper every SLASH-COMMAND card answers
+ * through (`/usage`, `/model`, `/auth`, `/approvals`, `/start`, `/help`) — sends
+ * via `ctx.replyWithRichMessage` and never touches `robustApiCall`; and the
+ * lint guard could not have caught that, because its verb pattern matched only
+ * `(bot|lockedBot|ctx)\.api\.<verb>`, never mentioned `sendRichMessage`, and
+ * structurally cannot match a `ctx.replyWith*` call at all. Measured, not
+ * inferred: a live agent's `/usage` card at id 20938 left NO row while the
+ * `tg-post` transformer logged its `sendRichMessage` POST.
+ *
+ * The hook therefore lives at the grammy API TRANSFORMER layer
+ * (`installSystemMessageObserver` in `shared/bot-runtime.ts`), which grammy
+ * resolves immediately around the HTTP POST — below every helper, `ctx.*`
+ * shorthand, `lockedBot`, and `bot.api.raw`. No call shape reaches Telegram
+ * without passing through it, so no future verb can opt out the way
+ * `switchroomReply` silently did. `robustApiCall` still publishes its `verb`
+ * down to that layer (`withTgSendContext`) so cards keep their `kind`.
  *
  * The observer reads the Telegram RESPONSE, which buys three things for free:
  *   - the real `message_id` (the only thing a reply can point at),
@@ -90,7 +109,7 @@ export interface SentMessageLike {
   rich_message?: unknown
 }
 
-/** The subset of `robustApiCall`'s opts the observer reads. */
+/** The call-site metadata the observer reads (`bot-runtime.ts`'s `TgSendContext`). */
 export interface ObservedCallOpts {
   chat_id?: string
   threadId?: number
@@ -293,7 +312,7 @@ type TrackedState = { lane: 'system' | 'foreign'; lastStoredMs: number; storedLe
 
 /**
  * Build the observer. The returned function is called with the RESOLVED result
- * of every `robustApiCall` and never throws.
+ * of every outbound Bot API call (from the transformer layer) and never throws.
  */
 export function makeSystemMessageObserver(
   deps: SystemMessageObserverDeps,
