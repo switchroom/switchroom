@@ -500,7 +500,11 @@ function scrubSqlite(path: string, values: Array<{ key: string; value: string }>
     try {
       const out = execFileSync(
         'sqlite3',
-        [path, `SELECT COUNT(*) FROM messages WHERE text LIKE '%${esc}%'`],
+        // `-readonly` — the counting pass is a pure SELECT and must not be
+        // able to checkpoint-and-unlink the sidecars of a DB the gateway may
+        // still hold open (#4595). The UPDATE pass below is the deliberate
+        // writer.
+        ['-readonly', path, `SELECT COUNT(*) FROM messages WHERE text LIKE '%${esc}%'`],
         { encoding: 'utf8', timeout: 10000 },
       )
       const n = parseInt(out.trim(), 10)
@@ -516,6 +520,8 @@ function scrubSqlite(path: string, values: Array<{ key: string; value: string }>
       for (const { key, value } of values) {
         const esc = value.replace(/'/g, "''")
         const replacement = `vault:${key}`.replace(/'/g, "''")
+        // allow-rw-db-open: `vault sweep` is the deliberate writer here — it
+        // scrubs leaked secrets out of history; a .bak copy is taken first.
         execFileSync(
           'sqlite3',
           [path, `UPDATE messages SET text = replace(text, '${esc}', '${replacement}')`],

@@ -165,8 +165,19 @@ function readTopicsFromHistory(
     );
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { Database } = metaRequire("bun:sqlite") as { Database: new (path: string, opts?: { create?: boolean }) => any };
-  const db = new Database(dbPath, { create: false });
+  const { Database } = metaRequire("bun:sqlite") as {
+    Database: new (
+      path: string,
+      opts?: { create?: boolean; readonly?: boolean },
+    ) => any;
+  };
+  // `readonly: true` is load-bearing, not cosmetic. This CLI is a FOREIGN
+  // process against the gateway's live WAL database: a read-write handle that
+  // closes as the last connection runs SQLite's checkpoint-and-delete path and
+  // UNLINKS `history.db-wal` / `-shm`, orphaning any handle still mapped to
+  // those inodes (see #4595 and the comment at the sqlite3 connect in
+  // `bin/handoff-briefing.sh`). Everything below is a SELECT.
+  const db = new Database(dbPath, { create: false, readonly: true });
   try {
     // Per-topic aggregate: msg count, first/last seen, plus the FIRST
     // message text (joined via a correlated subquery so we don't fire

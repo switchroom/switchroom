@@ -580,11 +580,16 @@ export function readLastMessages(historyDbPath: string): LastMessagesResult {
     // Fall through.
   }
 
-  // Attempt 2: sqlite3 CLI.
+  // Attempt 2: sqlite3 CLI. `-readonly` matches attempt 1's `readonly: true`
+  // and is load-bearing for the same reason: the CLI defaults to READ-WRITE,
+  // and a read-write handle on the gateway's live WAL DB that closes as the
+  // last connection checkpoints and UNLINKS `history.db-wal` / `-shm` (see
+  // #4595). `switchroom status` is a foreign process that only ever SELECTs.
   try {
     const out = execFileSync(
       "sqlite3",
       [
+        "-readonly",
         historyDbPath,
         "SELECT role, MAX(ts) FROM messages GROUP BY role;",
       ],

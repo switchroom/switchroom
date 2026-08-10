@@ -263,6 +263,11 @@ async function defaultLoadDecisions(): Promise<DecisionRow[] | null> {
         "exec",
         "switchroom-vault-broker",
         "sqlite3",
+        // `-readonly` — doctor is a FOREIGN process against the broker's live
+        // WAL `grants.db`. The CLI defaults to read-write, and a read-write
+        // handle that closes as the last connection checkpoints and UNLINKS
+        // the `-wal` / `-shm` sidecars (see #4595). DECISIONS_SQL is a SELECT.
+        "-readonly",
         "-separator",
         SEP,
         GRANTS_DB_CONTAINER_PATH,

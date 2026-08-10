@@ -129,6 +129,7 @@ function quarantineGrantsDb(dbPath: string): string {
  * migrations. Throws on any failure (caller decides whether to quarantine).
  */
 function openAndMigrate(dbPath: string): Database {
+  // allow-rw-db-open: the vault-broker OWNS grants.db — it is the writer
   const db = new Database(dbPath, { create: true });
 
   // If any post-open step throws (pragma / migration), the Database handle is
