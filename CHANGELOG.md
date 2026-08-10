@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+<!--
+Staging area for the NEXT release. Every PR that changes shippable code adds
+its entry HERE, under this header, in the SAME PR — grouped under `###`
+subheads like the released sections below. `scripts/check-changelog-entry.mjs`
+(part of `npm run lint`) fails a PR that ships code without staging an entry
+here; docs/chore/test-only PRs opt out with a `no-changelog` label or a
+`[skip changelog]` token on its own line (in the PR body or a commit message).
+Cutting a release is then just renaming this header
+to `## vX.Y.Z — <summary>` (see skills/switchroom-release/SKILL.md, Step 1).
+Keep this header present and non-empty; an empty Unreleased at release time is
+now an anomaly worth investigating, not the norm.
+-->
+
+## v0.21.4 — gateway SQLite databases open read-only from foreign processes, and an orphaned-fd sweep that catches the damage when they don't
+
 ### Fixes
 
 - **telegram: the boot briefing no longer opens the gateway's live history DB
@@ -25,7 +40,7 @@
   counting pass, and the subagent-tracker hooks' SELECT paths — and a new
   `check-foreign-db-readonly` lint gate fails any future read-write open of a
   SQLite DB from `bin/`, `src/`, or `telegram-plugin/hooks/` that is not marked
-  with a reasoned `allow-rw-db-open:` exemption. (#4595)
+  with a reasoned `allow-rw-db-open:` exemption. (#4596)
 
 - **telegram: the gateway no longer writes hours of chat history into a deleted
   file and calls it success.** When another process opened `history.db`
@@ -62,7 +77,7 @@
   matches the alarm as `orphaned-db-handle`. This does not recover lost rows:
   rows already written into the orphaned WAL remain unrecoverable. What changes
   is that the condition is now DETECTED within 5 minutes and stops accruing,
-  rather than running silently until someone notices missing messages.
+  rather than running silently until someone notices missing messages. (#4595)
 
 - **rollout: the host-CLI self-heal no longer fails its own verification on a
   perfectly good release binary.** The self-update proof step ran the
@@ -79,20 +94,7 @@
   now three-way, so "we could not EXECUTE it here" (a `noexec` staging mount, a
   lost +x bit, a foreign arch) is reported as a location fault instead of
   mis-accusing the artifact and sending operators to re-download a good file.
-  (#4586)
-
-<!--
-Staging area for the NEXT release. Every PR that changes shippable code adds
-its entry HERE, under this header, in the SAME PR — grouped under `###`
-subheads like the released sections below. `scripts/check-changelog-entry.mjs`
-(part of `npm run lint`) fails a PR that ships code without staging an entry
-here; docs/chore/test-only PRs opt out with a `no-changelog` label or a
-`[skip changelog]` token on its own line (in the PR body or a commit message).
-Cutting a release is then just renaming this header
-to `## vX.Y.Z — <summary>` (see skills/switchroom-release/SKILL.md, Step 1).
-Keep this header present and non-empty; an empty Unreleased at release time is
-now an anomaly worth investigating, not the norm.
--->
+  (#4594)
 
 ## v0.21.3 — external spend reads litellm's pre-aggregated daily table; supersedes the never-published v0.21.2
 
