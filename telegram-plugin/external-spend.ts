@@ -28,7 +28,7 @@ export {
   shortModelLabel,
   formatUsd,
   summarizeExternalSpend,
-  normalizeSpendLogRows,
+  normalizeDailyActivityRows,
   utcDateString,
   addUtcDays,
   EXTERNAL_SPEND_CACHE_TTL_MS,

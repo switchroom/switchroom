@@ -182,12 +182,14 @@ describe("get-external-spend", () => {
     }
   });
 
-  it("returns available:true with per-model summary from a healthy /spend/logs body (real fetch path, openrouter rows)", async () => {
+  it("returns available:true with per-model summary from a healthy /user/daily/activity body (real fetch path, openrouter rows)", async () => {
     // End-to-end handoff guard: drive the REAL fetchAndSummarizeExternalSpend
     // (no _testFetchExternalSpend seam) against a stubbed global fetch that
-    // returns a healthy `/spend/logs` body with openrouter/* rows. Locks that
-    // a live, reachable proxy yields available:true + the per-model top block —
-    // the state the /usage External row needs (and rendered blank in the bug).
+    // returns a healthy `/user/daily/activity` page with openrouter/* rows.
+    // Locks that a live, reachable proxy yields available:true + the per-model
+    // top block — the state the /usage External row needs (and rendered blank
+    // in the bug). Also asserts we hit the pre-aggregated daily endpoint, not
+    // the deprecated O(rows) /spend/logs handler that aborted every fetch.
     const h = makeHarness();
     seedAccount(h, "default");
     const today = new Date().toISOString().slice(0, 10);
@@ -196,17 +198,20 @@ describe("get-external-spend", () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       calledUrl = String(input);
       const body = {
-        data: [
+        results: [
           {
-            startTime: `${today}T00:00:00Z`,
-            spend: 12.5,
-            models: {
-              "openrouter/openai/gpt-oss-120b": 6.1,
-              "openrouter/x-ai/grok-4": 3.4,
-              "claude-sonnet-4": 99.0, // subscription passthrough — excluded
+            date: today,
+            breakdown: {
+              models: {
+                "openrouter/openai/gpt-oss-120b": { metrics: { spend: 6.1 } },
+                "openrouter/x-ai/grok-4": { metrics: { spend: 3.4 } },
+                // subscription passthrough — excluded
+                "claude-sonnet-4": { metrics: { spend: 99.0 } },
+              },
             },
           },
         ],
+        metadata: { page: 1, total_pages: 1, has_more: false },
       };
       return new Response(JSON.stringify(body), {
         status: 200,
@@ -247,8 +252,10 @@ describe("get-external-spend", () => {
       const top = resp.data?.top ?? [];
       expect(top.map((t) => t.label)).toEqual(["gpt-oss-120b", "grok-4"]);
       expect(top[0]?.usd).toBeCloseTo(6.1, 5);
-      // Went through the real /spend/logs endpoint, not the enterprise report.
-      expect(calledUrl).toContain("/spend/logs");
+      // Went through the pre-aggregated daily endpoint, not the deprecated
+      // O(rows) /spend/logs handler that aborted on the large table.
+      expect(calledUrl).toContain("/user/daily/activity");
+      expect(calledUrl).not.toContain("/spend/logs");
       // Master key never crosses the wire.
       expect(JSON.stringify(resp)).not.toContain("sk-secret-master");
     } finally {
