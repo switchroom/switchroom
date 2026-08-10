@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.2 — Claude Code CLI 2.1.226, and an explicit refusal of its new cross-session inbox
+
 ### Documentation
 
 - **The #1978 thinking-effort guard no longer restates the claude-CLI pin.**
@@ -29,9 +31,58 @@ now an anomaly worth investigating, not the norm.
   class of staleness stops recurring. Two more of the same in test comments go
   with them.
 
+### Dependencies
+
+- **Claude Code CLI pinned 2.1.223 → 2.1.226** — all three lockstep locations
+  move together (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
+  `dependencies.json`). The motivating fixes are headless-session reliability,
+  which is every agent in the fleet: a transient 401 could replace a long-lived
+  `CLAUDE_CODE_OAUTH_TOKEN` with a stored login's short-lived token and break a
+  headless session until restart; cross-session messages could stay parked with
+  no notice or expiry in headless sessions and during startup; a `SendMessage`
+  whose write to a teammate's inbox failed reported "Message sent" anyway; and
+  long (>200 char) project paths could resolve into another project's session
+  directory. One other behaviour change to expect: the 200-subagent-per-session
+  spawn cap is gone — the fleet's own limit is the separate
+  `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=15` concurrency export, which is
+  unchanged. The bump also carries a new cross-session messaging inbox that we
+  explicitly opt out of; see the security note below.
+
+### Security
+
+- **Opt every agent out of Claude Code's new cross-session messaging inbox**
+  — `docker/Dockerfile.base`'s baked managed settings now carry
+  `"crossSessionInbound":"refuse"` alongside `"channelsEnabled":true`.
+  Claude Code 2.1.224 (new in this bump; 2.1.223's bundle has no
+  `uds-messaging` / `CLAUDE_CODE_MESSAGING_SOCKET` / `crossSessionInbound`
+  strings at all) added a unix-socket ingress that queues an inbound peer
+  message as a **user-role turn**. Leaving the setting unset is not neutral
+  for us: with no explicit value the resolver's `bypassPermissions` branch
+  returns `accept` outright for a `selfSent` message — one sent by a process
+  in the claude PID's ancestry — and `CLAUDE_CODE_MESSAGING_SOCKET` is
+  exported into the environment of every child process claude spawns. Every
+  switchroom agent runs bypassed (`profiles/_base/start.sh.hbs`), so any
+  Bash-tool command, npm postinstall, or script influenced by injected
+  content could have written one JSON line to that socket and gotten a
+  user-role turn with no approval and no hold. An explicit setting is
+  consulted first and short-circuits that branch, so the message is dropped.
+  Mitigating factors that made this latent rather than live: the transport
+  only binds when the `tengu_harbor_kite` statsig gate (or
+  `CLAUDE_CODE_HARBOR_KITE`) is on — currently off — the socket is 0600 in a
+  0700 directory with an `SO_PEERCRED` peer-uid check, and agent containers
+  do not share a claude home, so the reachable blast radius was
+  intra-container. We refuse rather than rely on a remote flag staying off.
+  Nothing switchroom depends on is affected: the gate is consulted at exactly
+  four ingress sites in the 2.1.226 bundle (`uds-messaging`, `bridge:repl`,
+  `bridge:sdk`, `remote-io`), of which we use only `uds-messaging`. Telegram
+  and cron inbound arrive over the MCP channel notification handler with
+  origin kind `channel`, and in-session sub-agent `SendMessage` steers and
+  handbacks enqueue directly from the tool — both paths skip the gate
+  entirely, and `channel` classifies as `ungated` (always accept) even where
+  the gate does run.
+
 ### Bug fixes
 
-- **telegram: store the card body a quote-reply needs, not an empty string**
 - **rollout: an agent-initiated roll can now heal a stale host CLI instead of
   dead-ending on the refusal.** The #4571 host-CLI-first gate refused with
   `preflight-host-cli-stale` and named `switchroom update --pin vX.Y.Z` — a
@@ -49,6 +100,16 @@ now an anomaly worth investigating, not the norm.
   the refusal now says plainly that an **operator** must run the command on the
   host. (#4585)
 - **litellm: read external spend from pre-aggregated daily table**
+
+## v0.21.1 — quote-replying to a card now carries the card body
+
+<!-- Filed retroactively: v0.21.1 was tagged without a consolidation commit,
+     so this entry was still sitting under `## Unreleased`. -->
+
+### Bug fixes
+
+- **telegram: store the card body a quote-reply needs, not an empty string**
+  (#4583)
 
 ## v0.21.0 — rollout now gates on the host CLI, plus telegram card persistence, gateway state-dir ownership, and hindsight `/metrics` cardinality fixes
 
