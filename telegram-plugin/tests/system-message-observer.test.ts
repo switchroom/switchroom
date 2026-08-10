@@ -1,7 +1,9 @@
 /**
  * system-message-observer — the card-lane recorder's pure behaviour (#4571).
  *
- * The observer hangs off gateway.ts's single `robustApiCall` chokepoint and
+ * The observer hangs off the grammy API transformer seam, installed at bot
+ * construction (#4599 moved it there from gateway.ts's `robustApiCall`, which
+ * the `ctx.replyWithRichMessage` slash-command path bypassed entirely), and
  * turns every card the gateway posts (activity summary, status pin, approval /
  * boot / issues cards, progress lines) into ONE resolvable history row. The
  * two properties that make it safe to run on the hot send path are asserted
@@ -12,12 +14,20 @@
  *   2. an id that turns out to belong to a real reply / inbound is demoted to
  *      `foreign` and never written to again.
  *
+ * Both install the observer in their OWN harness bot, so a third block at the
+ * bottom of this file pins the single PRODUCTION install line in
+ * `initGatewayBot()` — see its docblock.
+ *
  * The end-to-end proof (card posted → id resolvable → a reply pointing at it
  * is understood) needs a real bun:sqlite history.db and lives in
  * card-history-lane.test.ts (bun).
  */
 
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
+import ts from 'typescript'
 import {
   makeSystemMessageObserver,
   normalizeSendVerb,
@@ -221,5 +231,78 @@ describe('makeSystemMessageObserver', () => {
     observe(sentMessage(1, 'card 1 edited'), { chat_id: CHAT, verb: 'boot-card' })
     expect(store.rows.size).toBe(64)
     expect(store.rows.get(1)?.text).toBe('card 1 edited')
+  })
+})
+
+/**
+ * Boot-wiring pin (#4599).
+ *
+ * Every behaviour test above installs the observer in its OWN harness, so
+ * deleting the single production install line in `initGatewayBot()` leaves all
+ * of them green while ALL card recording silently vanishes — worse than
+ * pre-#4571, because the old `robustApiCall` hook is gone and the empty-body
+ * alarm now lives INSIDE the observer, so nothing would fire either. Grammy's
+ * installed transformers are anonymous fns with nothing to grip at runtime, so
+ * this is a source-level AST assertion on the boot path — the same approach
+ * `format-guard-pins.test.ts` uses for `installRichMarkdownGuard`.
+ */
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const GATEWAY_PATH = resolve(__dirname, '..', 'gateway', 'gateway.ts')
+const GATEWAY_SRC = readFileSync(GATEWAY_PATH, 'utf8')
+const gatewaySource = ts.createSourceFile(
+  GATEWAY_PATH,
+  GATEWAY_SRC,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TS,
+)
+
+function findFunction(name: string): ts.FunctionDeclaration | undefined {
+  for (const s of gatewaySource.statements) {
+    if (ts.isFunctionDeclaration(s) && s.name?.text === name) return s
+  }
+  return undefined
+}
+
+function countCallsTo(root: ts.Node, name: string): number {
+  let count = 0
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === name
+    ) {
+      count++
+      // Installed on the constructed bot instance, with the real observer.
+      expect(node.arguments[0]?.getText(gatewaySource)).toBe('bot')
+      expect(node.arguments[1]?.getText(gatewaySource)).toBe('observeSentMessage')
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(root)
+  return count
+}
+
+describe('boot wiring: installSystemMessageObserver is installed on the production Bot', () => {
+  it('imports installSystemMessageObserver from ../shared/bot-runtime.js', () => {
+    // The import must exist for the boot call to resolve; a refactor that drops
+    // the import would break the seam.
+    expect(GATEWAY_SRC).toMatch(
+      /import\s*\{[^}]*\binstallSystemMessageObserver\b[^}]*\}\s*from\s*'\.\.\/shared\/bot-runtime\.js'/,
+    )
+  })
+
+  it('calls installSystemMessageObserver(bot, observeSentMessage) exactly once inside initGatewayBot()', () => {
+    const fn = findFunction('initGatewayBot')
+    expect(fn?.body).toBeDefined()
+    expect(countCallsTo(fn!.body!, 'installSystemMessageObserver')).toBe(1)
+  })
+
+  it('builds the production observer from the real history writers', () => {
+    // The install is conditional on `observeSentMessage`; pin what fills it, or
+    // the line above could survive against a permanently-undefined observer.
+    expect(GATEWAY_SRC).toMatch(
+      /const observeSentMessage = isGatewayMain && HISTORY_ENABLED\s*\n?\s*\?\s*makeSystemMessageObserver\(/,
+    )
   })
 })

@@ -5,8 +5,10 @@
  * standalone foreman bot before its retirement.
  *
  * What lives here:
- *   - `installTgPostLogger` / `installRichMarkdownGuard` — the grammy API
- *     transformers every outbound call transits.
+ *   - `installTgPostLogger` / `installRichMarkdownGuard` /
+ *     `installSystemMessageObserver` — the grammy API transformers every
+ *     outbound call transits. This layer, not any caller-side wrapper, is the
+ *     one seam no `ctx.*` helper or raw `bot.api.*` call can bypass.
  *   - `makeSwitchroomExec` / `makeSwitchroomExecCombined` — factory fns for
  *     the switchroom CLI exec helpers (callers pass their own CLI path / config
  *     env so each process can be configured independently).
@@ -290,6 +292,121 @@ export function installRichMarkdownGuard(bot: Bot): void {
     }
     return prev(method, payload, signal)
   })
+}
+
+// ─── outbound send observation (#4571 / #4599) ────────────────────────────
+
+/**
+ * The call-site metadata a send observer wants but the wire payload cannot
+ * supply. Structurally the same shape as `ObservedCallOpts` in
+ * `gateway/system-message-observer.ts`; declared here so this module keeps its
+ * no-imports-from-gateway rule.
+ */
+export interface TgSendContext {
+  chat_id?: string
+  threadId?: number
+  /** The caller's own label for what this send IS (`activity-summary.send`). */
+  verb?: string
+}
+
+const sendContextStore = new AsyncLocalStorage<TgSendContext | undefined>()
+
+/**
+ * Publish the enclosing call's `{chat_id, threadId, verb}` to the API
+ * transformer layer for the duration of `fn`'s async chain. `gateway.ts`'s
+ * `robustApiCall` wraps every call it issues; anything sent outside it (a
+ * `ctx.reply*` helper, a raw `bot.api.*`) simply observes with no verb.
+ */
+export function withTgSendContext<T>(ctx: TgSendContext | undefined, fn: () => T): T {
+  return sendContextStore.run(ctx, fn)
+}
+
+/** Exposed for the transformer (and tests). Undefined outside a wrapped call. */
+export function _getTgSendContext(): TgSendContext | undefined {
+  return sendContextStore.getStore()
+}
+
+/**
+ * Install the card-history send observer as a grammy API TRANSFORMER — the
+ * real universal outbound seam (#4599).
+ *
+ * #4571 hooked the observer onto `gateway.ts`'s `robustApiCall`, and
+ * `system-message-observer.ts` claimed that was "the ONE chokepoint every
+ * gateway outbound already goes through … enforced by the
+ * `check-bot-api-wrapping` lint guard". That claim was false on both halves.
+ * grammY's `ctx.*` sugar builds the payload and calls `bot.api.*` directly, so
+ * `switchroomReply` (`gateway.ts`, the helper every SLASH-COMMAND card answers
+ * through — `/usage`, `/model`, `/auth`, `/approvals`, `/start`, `/help`) sends
+ * via `ctx.replyWithRichMessage` and never transits `robustApiCall` at all; and
+ * the lint guard could not have caught it, because its verb pattern matched
+ * only `(bot|lockedBot|ctx)\.api\.<verb>` — it never mentioned `sendRichMessage`
+ * and structurally cannot match a `ctx.replyWith*` helper.
+ *
+ * Measured, not inferred: on a live agent's buffer the `/usage` card at id
+ * 20938 left NO row, while the `tg-post` transformer in this very file logged
+ * its `sendRichMessage` POST. The transformer layer SAW the send the recorder
+ * missed. That is the whole argument for moving here: grammy resolves this
+ * chain immediately around the HTTP POST, below every helper, every `ctx.*`
+ * shorthand, `lockedBot`, and `bot.api.raw` — there is no call shape that
+ * reaches Telegram without passing through it, so no future verb can silently
+ * opt out the way `switchroomReply` did.
+ *
+ * `observe` is injected rather than imported: this module must not depend on
+ * anything under `gateway/` (see the file header). The caller keeps ownership
+ * of the history writers, the `isGatewayMain && HISTORY_ENABLED` gate, and the
+ * empty-body alarm.
+ *
+ * Only a RESOLVED, `ok:true` response is observed. grammy hands this chain the
+ * raw `ApiResponse` and converts `{ok:false}` into a thrown `GrammyError` only
+ * after the chain returns (see `installTgPostLogger`'s docblock), so a
+ * rejection arrives here as a resolved body and must be skipped — recording a
+ * Telegram error object as a card body is exactly the empty-row failure #4576
+ * was. Non-message results (`getUpdates` arrays, `getMe`, `true` from
+ * `answerCallbackQuery`) are filtered by the observer's own shape test.
+ *
+ * Pure observation: the response is returned untouched and nothing here can
+ * throw into the send path.
+ */
+export function installSystemMessageObserver(
+  bot: Bot,
+  observe: (result: unknown, opts?: TgSendContext) => void,
+): void {
+  bot.api.config.use(async (prev, method, payload, signal) => {
+    const res = await prev(method, payload, signal)
+    try {
+      const r = res as unknown as { ok?: boolean; result?: unknown }
+      if (r != null && typeof r === 'object' && r.ok === true) {
+        observe(r.result, resolveSendContext(payload))
+      }
+    } catch {
+      /* observing a send must never break the send */
+    }
+    return res
+  })
+}
+
+/**
+ * Merge the caller-published context with what the outbound PAYLOAD itself
+ * carries. The context wins where both exist (it is the caller's own intent);
+ * the payload is what keeps an unwrapped `ctx.reply*` send attributable to a
+ * chat and topic at all. The response's own `chat.id` still outranks both
+ * downstream — this is only the fallback tier.
+ */
+function resolveSendContext(payload: unknown): TgSendContext | undefined {
+  const ctx = sendContextStore.getStore()
+  const p = (payload ?? {}) as Record<string, unknown>
+  const rawChat = p.chat_id
+  const chat_id =
+    ctx?.chat_id ??
+    (typeof rawChat === 'string' || typeof rawChat === 'number' ? String(rawChat) : undefined)
+  const rawThread = p.message_thread_id
+  const threadId = ctx?.threadId ?? (typeof rawThread === 'number' ? rawThread : undefined)
+  if (chat_id == null && threadId == null && ctx?.verb == null) return undefined
+  return {
+    ...(chat_id != null ? { chat_id } : {}),
+    ...(threadId != null ? { threadId } : {}),
+    ...(ctx?.verb != null ? { verb: ctx.verb } : {}),
+  }
 }
 
 // ─── robustApiCall factory: REMOVED (#3863) ───────────────────────────────

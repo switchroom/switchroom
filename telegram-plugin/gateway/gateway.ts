@@ -302,7 +302,7 @@ import {
 import { installEditFloodFuse, editFloodFuseConfigFromEnv } from '../edit-flood-fuse.js'
 import { createSendGate, sendGateConfigFromEnv, isSendGateShed } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
-import { installTgPostLogger, installRichMarkdownGuard, withTgPostTags } from '../shared/bot-runtime.js'
+import { installTgPostLogger, installRichMarkdownGuard, withTgPostTags, withTgSendContext, installSystemMessageObserver } from '../shared/bot-runtime.js'
 import { installSentTextCapture } from '../shared/sent-text-capture.js'
 import {
   floodStatePath,
@@ -5603,28 +5603,25 @@ const rawRobustApiCall = createRetryApiCall({
   floodWaitRemainingMs: probeFloodWaitRemainingMs,
 })
 
-// #4571 — card/system-surface history lane. Every card the gateway posts
-// (activity card, status pin, approval/boot/issues/worker-feed cards, progress
-// lines, notices) goes through `robustApiCall`, so observing its RESOLVED
-// result is the one chokepoint that makes every posted message id resolvable
-// when the operator quote-replies to it. Never throws; see
-// system-message-observer.ts for the send-vs-edit and throttling contract.
-// Gated on the SAME condition as `initHistory` above — a non-main gateway
-// process never opens the DB, so an observer there would be pure noise.
-// The empty-body alarm (#4576) is the observer's own default — see
-// `defaultEmptyCardTextWarning` in system-message-observer.ts.
+// #4571 — card/system-surface history lane: every card the gateway posts must leave
+// a row so its id resolves when the operator quote-replies to it. #4599 moved the
+// hook off `robustApiCall` (which the `ctx.replyWithRichMessage` slash-command card
+// path bypasses entirely) onto the grammy transformer layer — see
+// `installSystemMessageObserver`, wired at bot construction, and
+// system-message-observer.ts for the send-vs-edit / throttling / alarm contract.
+// Gated as `initHistory` is: a non-main gateway never opens the DB.
 const observeSentMessage = isGatewayMain && HISTORY_ENABLED
   ? makeSystemMessageObserver({ insert: recordSystemOutbound, updateText: updateSystemOutboundText })
   : undefined
 
+// `withTgSendContext` publishes {chat_id, threadId, verb} down to the transformer layer
+// where the observer runs — how a card keeps its `kind`. Sends outside this wrapper
+// still record, just without a verb.
 const robustApiCall = <T>(
   fn: () => Promise<T>,
   opts?: Parameters<typeof rawRobustApiCall<T>>[1],
-): Promise<T> => {
-  const p = sendGate.gate(() => rawRobustApiCall(fn, opts), opts)
-  if (observeSentMessage == null) return p
-  return p.then((res) => { observeSentMessage(res, opts); return res })
-}
+): Promise<T> =>
+  sendGate.gate(() => withTgSendContext(opts, () => rawRobustApiCall(fn, opts)), opts)
 
 // Fire-and-forget wrapper for outbound surfaces that previously had
 // `.catch(() => {})` directly on `bot.api.*` calls. Resolves to undefined
@@ -22887,6 +22884,9 @@ async function initGatewayBot(): Promise<void> {
   // on the resolved Message for the shapes a response can't supply. After the fmt
   // guard so it composes OUTSIDE it. See sent-text-capture.ts.
   installSentTextCapture(bot)
+  // #4599 card-history lane: AFTER sent-text-capture so it composes outside it and
+  // can read the request-side stamp. The seam `ctx.replyWithRichMessage` can't bypass.
+  if (observeSentMessage != null) installSystemMessageObserver(bot, observeSentMessage)
   // #3620 flood fuse — installed LAST so it composes OUTERMOST: the one seam no
   // outbound call can bypass (grammY has no route to the network that skips the
   // transformer stack). Kill-switch SWITCHROOM_EDIT_FUSE=0; see edit-flood-fuse.ts.

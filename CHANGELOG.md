@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **gateway: record card sends at the transformer seam, not robustApiCall**
+
 ## v0.21.4 — gateway SQLite databases open read-only from foreign processes, and an orphaned-fd sweep that catches the damage when they don't
 
 ### Fixes
