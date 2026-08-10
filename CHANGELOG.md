@@ -15,6 +15,19 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.3 — external spend reads litellm's pre-aggregated daily table; supersedes the never-published v0.21.2
+
+<!-- Why `## v0.21.2` below is still standing rather than folded into this
+     section: v0.21.2 WAS tagged, and its `:v0.21.2` images were built and
+     pushed to ghcr, but its `release` run failed at the `images-gate` leg on
+     a transient ghcr.io login timeout — so the GitHub Release stayed a draft
+     and npm never received it. The tag and the images are real and immutable,
+     so this file stays a truthful per-tag record and that section is left
+     alone. Consequence: npm goes 0.21.1 -> 0.21.3, this section holds only
+     what landed AFTER v0.21.2 was tagged, and the v0.21.3 GitHub Release
+     notes carry the FULL user-visible delta since v0.21.1 — which is what an
+     operator upgrading from 0.21.1 actually receives. -->
+
 ### Fixes
 
 - **litellm: read external spend from a pre-aggregated daily table.** The
