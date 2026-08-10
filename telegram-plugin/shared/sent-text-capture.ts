@@ -1,9 +1,28 @@
 /**
- * sent-text-capture.ts — pair a card's RENDERED body with the message id
- * Telegram assigned it (#4571 follow-up).
+ * sent-text-capture.ts — the card-body FALLBACK: stamp a send's REQUEST body
+ * onto the `Message` Telegram returned for it (#4571 / #4576 follow-up).
  *
- * The bug this exists to close
- * ---------------------------
+ * Read this first: it is NOT the primary source of the stored card body.
+ * -----------------------------------------------------------------------
+ * `system-message-observer.ts` takes the body off the RESPONSE — `rich_message`
+ * (Telegram's own rendered block tree) first, then `text` / `caption`. That is
+ * the more faithful source, and it covers every send verb the gateway writes a
+ * history row for. This module supplies the LAST tier of that precedence
+ * chain, for responses that carry no renderable body at all: a rich send whose
+ * blocks flatten to nothing (a media-only card), or a future verb whose
+ * response omits the body.
+ *
+ * Deliberately last, because the body it captures is NOT the body as written.
+ * The dominant card path is `sendRichMessage(chat, richMessage(body))`, and
+ * `richMessage()` applies `guardAccidentalFormatting` in the CALLER
+ * (`rich-send.ts`), long before any transformer seam. So what this module sees
+ * on that path is already wire-escaped: `sent_text_capture.ts` arrives as
+ * `sent\_text\_capture.ts`, `$12.40` as `\$12.40`. Escaped-but-present beats
+ * empty, which is why the tier exists at all — but it must never win over a
+ * response that resolved those escapes.
+ *
+ * The bug this exists to backstop
+ * -------------------------------
  * #4576 gave every gateway card a `role='system'` history row so a quote-reply
  * to it resolves. The row carried the right `message_id`, chat, thread and
  * `kind` — and an EMPTY `text`, on 100% of the rows, on every agent in the
@@ -11,20 +30,21 @@
  * body is non-empty (`inbound-router.ts`), so the agent learned WHICH card was
  * tapped and still could not see WHAT IT SAID. That was the entire point.
  *
- * Root cause: the observer derived the body from the Telegram RESPONSE
+ * Root cause: the observer read ONE body field off the response
  * (`msg.text ?? msg.caption`), and every card goes out through Bot API 10.1
  * `sendRichMessage`, whose response is a `Message.RichMessageMessage` — the
  * body lives under `rich_message: { blocks }`, and `text` / `caption` are
- * simply absent (`@grammyjs/types` `message.d.ts:98`, `:184`). So the extractor
- * fell through to `''` every single time.
+ * simply absent (`@grammyjs/types` `message.d.ts:94`, `:180`; Bot API
+ * `RichMessage.blocks` = "Content of the message"). So the extractor fell
+ * through to `''` every single time. Reading `rich_message` is the fix; this
+ * module is the belt to that pair of braces.
  *
  * The mechanism
  * -------------
- * Don't re-derive the body from a response shape that varies per send verb.
- * Capture it from the REQUEST, where it is unambiguously known for every verb,
- * at the one seam no outbound call can bypass: a grammY API transformer
- * (`bot.api.config.use`) — the same seam `installRichMarkdownGuard` already
- * uses, and the reason that guard is universal where `richMessage()` is not.
+ * Capture the body from the REQUEST at the one seam no outbound call can
+ * bypass: a grammY API transformer (`bot.api.config.use`) — the same seam
+ * `installRichMarkdownGuard` already uses, and the reason that guard is
+ * universal where `richMessage()` is not.
  *
  * The transformer sees the outbound payload AND the resolved response in one
  * call, so it can pair them with zero bookkeeping: no id→text map, no eviction,
@@ -145,9 +165,16 @@ export function readSentText(message: unknown): string | null {
  *
  * Install it AFTER `installRichMarkdownGuard` so it composes OUTSIDE the guard
  * (grammY's last-installed transformer runs first) and therefore captures the
- * body as the CALLER wrote it, before the accidental-formatting guard's
- * backslash escapes are applied. The stored antecedent is what the card said,
- * not the wire-escaped form of it.
+ * payload before the guard's backslash escapes are applied.
+ *
+ * Be precise about what that does and does not buy. It only avoids the
+ * TRANSFORMER's escaping pass, which matters for the call sites that build a
+ * raw `{ markdown }` and go straight to `sendRichMessage` / `editMessageText`
+ * (banners, approval and folder-picker edits — see `richMessage()`'s docblock
+ * for the list). It does NOT recover a pre-escape body for the dominant path,
+ * because `richMessage()` escapes in the CALLER, upstream of every transformer.
+ * There is no seam that can. That is precisely why this capture is the LAST
+ * tier of the observer's precedence chain rather than the first.
  */
 export function installSentTextCapture(bot: Bot): void {
   bot.api.config.use(async (prev, method, payload, signal) => {

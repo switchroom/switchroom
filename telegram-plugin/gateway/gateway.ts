@@ -22880,10 +22880,10 @@ async function initGatewayBot(): Promise<void> {
 
   bot = new Bot(TOKEN)
   installTgPostLogger(bot); installRichMarkdownGuard(bot) // #3252/#3463: universal fmt guard installed after logger (composes outermost); see installRichMarkdownGuard docblock
-  // #4571 follow-up: stamp each send's REQUEST body onto its resolved Message so
-  // the card-history observer stores what the card SAID (a sendRichMessage
-  // response carries no `text`). Installed after the fmt guard so it composes
-  // OUTSIDE it and captures the caller's body pre-escape. See sent-text-capture.ts.
+  // #4576 follow-up: FALLBACK card body. The observer takes the stored body off
+  // the RESPONSE (`rich_message` → `text`/`caption`); this stamps the REQUEST body
+  // on the resolved Message for the shapes a response can't supply. After the fmt
+  // guard so it composes OUTSIDE it. See sent-text-capture.ts.
   installSentTextCapture(bot)
   // #3620 flood fuse — installed LAST so it composes OUTERMOST: the one seam no
   // outbound call can bypass (grammY has no route to the network that skips the
