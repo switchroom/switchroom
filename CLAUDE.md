@@ -220,7 +220,8 @@ obligation:
 `check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
 `check-litellm-config-guard`, `check-release-asset-names`,
 `check-status-pin-single-path`, `check-agent-attribution-trailers`,
-`check-callback-ctx-wrapping`, `check-foreign-db-readonly`.
+`check-callback-ctx-wrapping`, `check-ctx-send-wrapping`,
+`check-foreign-db-readonly`.
 
 Traps that bite repeatedly:
 
@@ -243,6 +244,17 @@ Traps that bite repeatedly:
   `scripts/callback-ctx-wrapping-baseline.json` — adding one fails, and removing
   one fails until you lower the number in the same PR. Escape hatch (reason
   mandatory): `// allow-raw-callback-ctx: <reason>` on the preceding line.
+
+- **`check-ctx-send-wrapping` ratchets the context-SEND path** (#4599). Same
+  mechanism, different family: raw `ctx.reply` / `ctx.replyWithRichMessage`.
+  `check-bot-api-wrapping.sh` is anchored on `\.api\.` and *structurally cannot*
+  match these, so a green run of it never meant "every send transits
+  `robustApiCall`" — that false claim in `system-message-observer.ts` is why
+  `/usage` cards left no history row and native replies to them resolved to an
+  id with no text. EXACT per-file inventory in
+  `scripts/ctx-send-wrapping-baseline.json`; escape hatch (reason mandatory):
+  `// allow-raw-ctx-send: <reason>` on the preceding line. Counting rules for
+  both ratchets live once in `scripts/lib/raw-ctx-scan.mjs`.
 
 - **`check-no-pii-secrets` fails on real operator PII** — real Telegram
   chat/user IDs, emails, hostnames pasted into tests or docs. Use synthetic
