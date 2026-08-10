@@ -21,19 +21,23 @@
 # VOICE_STT_MODEL and (optionally) checksum-verified fail-closed via
 # VOICE_STT_MODEL_SHA256. See server.py:_load_model.
 #
-# Base: nvidia/cuda 12.8.1 cudnn *runtime* on ubuntu24.04 (Python 3.12).
+# Base: nvidia/cuda 12.9.2 cudnn *runtime* on ubuntu24.04 (Python 3.12).
 # ubuntu22.04/py3.10 is EOL-track for this image line; 24.04/3.12 is the
 # maintained base. CUDA is kept on the 12.x / cuDNN 9 line deliberately —
 # BOTH GPU libs here are CUDA-12-only: ctranslate2 (via faster-whisper, STT)
 # and onnxruntime-gpu (Kokoro TTS) ship CUDA-12/cuDNN-9 wheels and do NOT
 # support CUDA 13 (which is why the CUDA-13 attempt in #4225 was wrong and
-# is closed). 12.8 keeps both on supported ground.
+# is closed). 12.9 keeps both on supported ground.
 #
 # sec: pinned by digest — a CUDA `:runtime` tag from nvidia is mutable.
 # Dependabot tracks bumps. (Replace the digest when bumping the tag.)
-# Pinned to the linux/amd64 manifest digest (CI builds amd64-only); resolved
-# live via `docker manifest inspect nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`.
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9
+# Pinned to the MULTI-ARCH INDEX digest — that is what dependabot writes, and
+# what `docker buildx imagetools inspect
+# nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04` reports. The builder selects
+# the amd64 child manifest out of it (CI builds amd64-only). Do NOT re-pin a
+# per-arch manifest digest here: this line used to carry one, and hand-pinning
+# it back flip-flops the pin kind against every dependabot bump.
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c0409a5fd1d54ddfd646e5b9d8dee7878131271b563fc
 
 LABEL org.opencontainers.image.title="switchroom-voice" \
       org.opencontainers.image.description="Local GPU speech sidecar (faster-whisper STT + Kokoro TTS)"
