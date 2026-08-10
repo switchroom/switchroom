@@ -72,8 +72,12 @@ function resolveSyncSqlite() {
   if (typeof globalThis.Bun !== 'undefined') {
     try {
       const { Database } = require('bun:sqlite')
-      return function BunDatabaseSyncAdapter(p) {
-        const d = new Database(p)
+      return function BunDatabaseSyncAdapter(p, opts) {
+        // Translate node:sqlite's `readOnly` to bun:sqlite's `readonly` so a
+        // read-only call site is read-only on BOTH bindings. See the
+        // `readBackgroundFlagSync` comment for why that matters.
+        // allow-rw-db-open: shared adapter — the writer call sites open RW through it
+        const d = new Database(p, opts?.readOnly ? { readonly: true } : undefined)
         return {
           exec: (sql) => d.exec(sql),
           prepare: (sql) => d.prepare(sql),
@@ -90,6 +94,8 @@ function resolveSyncSqlite() {
  * Calls cb(error | null) when the process exits.
  */
 function spawnSql(dbPath, sql, cb) {
+  // allow-rw-db-open: this is the tracker's WRITE path (INSERT/UPDATE) — it
+  // must be read-write. The SELECT path is `spawnSqlRead`, which is -readonly.
   const child = spawn('sqlite3', [dbPath, sql], { stdio: ['ignore', 'ignore', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', (d) => { stderr += d })
@@ -108,7 +114,11 @@ function spawnSql(dbPath, sql, cb) {
  * Calls cb(error | null, stdout | null).
  */
 function spawnSqlRead(dbPath, sql, cb) {
-  const child = spawn('sqlite3', [dbPath, sql], { stdio: ['ignore', 'pipe', 'pipe'] })
+  // `-readonly`: this hook is a FOREIGN process against a DB the gateway holds
+  // open. The sqlite3 CLI defaults to read-write, and a read-write handle that
+  // closes as the LAST connection checkpoints and UNLINKS the `-wal`/`-shm`
+  // sidecars, orphaning the gateway's mapped fds (#4595). This path only SELECTs.
+  const child = spawn('sqlite3', ['-readonly', dbPath, sql], { stdio: ['ignore', 'pipe', 'pipe'] })
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', (d) => { stdout += d })
@@ -629,7 +639,12 @@ function readBackgroundFlagSync(dbPath, id) {
   const DatabaseSync = resolveSyncSqlite()
   if (DatabaseSync == null) return null
   try {
-    const db = new DatabaseSync(dbPath)
+    // READ-ONLY: this hook is a FOREIGN process against a DB the gateway holds
+    // open. A read-write handle that closes as the LAST connection checkpoints
+    // and UNLINKS the `-wal`/`-shm` sidecars, orphaning the gateway's mapped
+    // fds — after which its writes silently land in deleted inodes (#4595).
+    // This function only ever SELECTs.
+    const db = new DatabaseSync(dbPath, { readOnly: true })
     const row = db.prepare('SELECT background FROM subagents WHERE id = ?').get(id)
     db.close()
     if (row == null) return null

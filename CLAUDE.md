@@ -220,7 +220,7 @@ obligation:
 `check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
 `check-litellm-config-guard`, `check-release-asset-names`,
 `check-status-pin-single-path`, `check-agent-attribution-trailers`,
-`check-callback-ctx-wrapping`.
+`check-callback-ctx-wrapping`, `check-foreign-db-readonly`.
 
 Traps that bite repeatedly:
 

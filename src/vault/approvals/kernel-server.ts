@@ -80,6 +80,7 @@ const DEFAULT_DB_PATH = "/state/approvals/kernel.db";
 export function openKernelDb(dbPath: string): Database {
   const dir = dirname(dbPath);
   mkdirSync(dir, { recursive: true });
+  // allow-rw-db-open: the approval-kernel OWNS grants.db — it is the writer
   const db = new Database(dbPath, { create: true });
   try {
     chmodSync(dbPath, 0o600);

@@ -4,6 +4,29 @@
 
 ### Fixes
 
+- **telegram: the boot briefing no longer opens the gateway's live history DB
+  read-write — the generator of the orphaned-fd history loss #4595 detects.**
+  `bin/handoff-briefing.sh` assembled its Telegram section with
+  `sqlite3.connect(db_path)`, whose stdlib default is READ-WRITE. Every
+  statement it runs is a `SELECT` or a `PRAGMA table_info`, so the write access
+  bought nothing and cost the ability to destroy data: SQLite's close path
+  checkpoints and then UNLINKS `history.db-wal` / `-shm` when the closing
+  connection is the last one, and this script runs at agent boot — precisely
+  when the gateway is down or starting and the briefing IS the last connection.
+  Any handle still mapped to those inodes then writes into deleted files, with
+  every `INSERT` reporting success and every row gone at the next restart
+  (`/proc/<pid>/fd/N -> history.db-wal (deleted)`). The connect is now
+  `file:<path>?mode=ro`, which cannot checkpoint and cannot unlink a sidecar,
+  and still reads a WAL database correctly with the sidecars present, with
+  `-shm` absent, and with `-shm` absent on an unwritable directory. Five
+  sibling read-only callsites that opened owned databases read-write are fixed
+  the same way — `switchroom telegram topics`, `switchroom status`'s `sqlite3`
+  CLI fallback, `switchroom doctor`'s broker `grants.db` probe, `vault sweep`'s
+  counting pass, and the subagent-tracker hooks' SELECT paths — and a new
+  `check-foreign-db-readonly` lint gate fails any future read-write open of a
+  SQLite DB from `bin/`, `src/`, or `telegram-plugin/hooks/` that is not marked
+  with a reasoned `allow-rw-db-open:` exemption. (#4595)
+
 - **rollout: the host-CLI self-heal no longer fails its own verification on a
   perfectly good release binary.** The self-update proof step ran the
   downloaded artifact's `version` SUBCOMMAND, which loads

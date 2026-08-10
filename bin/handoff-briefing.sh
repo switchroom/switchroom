@@ -136,6 +136,7 @@ if [ -n "$TELEGRAM_STATE" ] && [ -d "$TELEGRAM_STATE" ]; then
     # under `2>/dev/null`, so the breadcrumb is a debug/manual-run diagnostic.
     TELEGRAM_ROWS=$(python3 - "$HISTORY_DB" "$MAX_MESSAGES" "$TARGET_CHAT_ID" "$TARGET_THREAD_ID" <<'PYEOF'
 import sys, sqlite3, datetime
+from urllib.parse import quote
 
 db_path = sys.argv[1]
 limit = int(sys.argv[2])
@@ -143,7 +144,28 @@ target_chat = sys.argv[3] if len(sys.argv) > 3 else ""
 target_thread = sys.argv[4] if len(sys.argv) > 4 else ""
 
 try:
-    conn = sqlite3.connect(db_path)
+    # READ-ONLY, ALWAYS. `sqlite3.connect(path)` defaults to READ-WRITE, which
+    # makes this briefing assembler a writer on the gateway's live WAL DB. A
+    # read-write connection that closes as the LAST connection runs SQLite's
+    # checkpoint-and-delete path and UNLINKS `history.db-wal` / `-shm` — and
+    # this script runs at agent boot, precisely when the gateway is down or
+    # starting and this process IS the last connection. Any handle still
+    # mapped to those inodes then writes into deleted files: every INSERT
+    # reports success and every row is gone at the next restart (the
+    # `/proc/<pid>/fd/N -> history.db-wal (deleted)` signature that #4595
+    # sweeps for after the fact).
+    #
+    # `mode=ro` removes that primitive entirely: a read-only connection cannot
+    # checkpoint and cannot unlink a sidecar. It still reads a WAL database
+    # correctly in every boot state we care about — sidecars present, `-shm`
+    # absent, and `-shm` absent with an unwritable directory (SQLite falls back
+    # to a heap wal-index rather than failing). Every statement below is a
+    # SELECT or a PRAGMA table_info, so nothing here needs write access.
+    #
+    # The path is percent-encoded: a `?` or `#` in the state dir would
+    # otherwise be parsed as the URI's query/fragment delimiter and silently
+    # truncate the filename.
+    conn = sqlite3.connect("file:" + quote(db_path) + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 

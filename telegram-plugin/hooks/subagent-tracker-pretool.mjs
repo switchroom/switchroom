@@ -123,8 +123,12 @@ function resolveSyncSqlite() {
       // Adapt bun:sqlite to the node:sqlite DatabaseSync surface used
       // below. bun's Database.prepare/run/get/all and exec are
       // sufficient — we only need the call-site shape.
-      return function BunDatabaseSyncAdapter(p) {
-        const d = new Database(p)
+      return function BunDatabaseSyncAdapter(p, opts) {
+        // Translate node:sqlite's `readOnly` to bun:sqlite's `readonly` so a
+        // read-only call site is read-only on BOTH bindings. See the
+        // `readBackgroundFlagSync` comment for why that matters.
+        // allow-rw-db-open: shared adapter — the writer call sites open RW through it
+        const d = new Database(p, opts?.readOnly ? { readonly: true } : undefined)
         return {
           exec: (sql) => d.exec(sql),
           prepare: (sql) => d.prepare(sql),
@@ -141,6 +145,8 @@ function resolveSyncSqlite() {
  * Calls cb(error | null) when the process exits.
  */
 function spawnSql(dbPath, sql, cb) {
+  // allow-rw-db-open: this is the tracker's WRITE path (INSERT/UPDATE) — it
+  // must be read-write. The SELECT path is `spawnSqlRead`, which is -readonly.
   const child = spawn('sqlite3', [dbPath, sql], { stdio: ['ignore', 'ignore', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', (d) => { stderr += d })
