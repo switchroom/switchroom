@@ -35,6 +35,7 @@ import {
 } from './inbound-interceptors.js'
 import type { InboundMessage } from './ipc-protocol.js'
 import { deriveTurnId } from './derive-turn-id.js'
+import { extractRichMessageText } from './rich-message-handler.js'
 import { formatReplyToText } from '../steering.js'
 import { fmtLocalStamp, resolveEnvTimezone } from '../shared/local-time.js'
 import { safeResolvePersonName, type PersonDirectory } from './resolve-person.js'
@@ -160,10 +161,33 @@ export function buildReplyForwardContext(p: ReplyForwardContextParams): {
   // gateway runs when neither is present. Accessed defensively in case the
   // installed grammy/@grammyjs/types predate `TextQuote`.
   const quoteText = p.ctx.message?.quote?.text
+  // Rich-message parents (#4598). Every card the gateway posts goes out via
+  // Bot API 10.1 `sendRichMessage`, so a native reply to one delivers a
+  // `reply_to_message` whose body lives under `rich_message.blocks` with
+  // `text` / `caption` ABSENT. Reading only `.text ?? .caption` therefore
+  // yielded `undefined` for 100% of card parents and pushed every such reply
+  // onto the history-buffer fallback — which cannot help when no row was ever
+  // recorded (a send while the gateway was down, or one that bypassed the
+  // recording chokepoint).
+  //
+  // Measured on the wire, not inferred: a user reply to a `sendRichMessage`
+  // card yields `reply_to_message` keys
+  // `[message_id, from, chat, date, rich_message]`, `text`/`caption` absent,
+  // `rich_message.blocks` fully populated. The older "Telegram omits the
+  // parent body" comments on this path predate rich messages.
+  //
+  // Flattened by the SAME renderer the inbound rich-message handler and the
+  // outbound card observer use, so all three agree on what a card "says".
+  // Returns `undefined` (never `''`) for an unrenderable block tree, so
+  // `resolveReplyToFromBuffer`'s `liveTextEmpty` gate still falls through to
+  // the buffer instead of pinning an empty antecedent.
+  const richParentText = extractRichMessageText(
+    (replyToMsg as { rich_message?: unknown } | undefined)?.rich_message,
+  )
   const replyToTextRaw = (quoteText != null && quoteText.length > 0)
     ? quoteText
     : replyToMsg
-      ? (replyToMsg.text ?? replyToMsg.caption ?? undefined)
+      ? (replyToMsg.text ?? replyToMsg.caption ?? richParentText ?? undefined)
       : undefined
   const replyToText = replyToTextRaw != null
     ? (replyToTextRaw.length > p.replyToTextMax
@@ -198,8 +222,11 @@ export function buildReplyForwardContext(p: ReplyForwardContextParams): {
 export interface ReplyToBufferFallbackParams {
   /** From {@link buildReplyForwardContext}. */
   replyToMessageId: number | undefined
-  /** Raw reply text off the live update (for the SQLite write); empty when the
-   *  reply target is the bot's own message (Telegram omits its text). */
+  /** Raw reply text off the live update (for the SQLite write). Empty only
+   *  when the live update carried NO readable parent body at all — a plain
+   *  `sendMessage` parent (Telegram omits `.text` on the bot's own plain
+   *  messages), or a rich parent whose blocks render to nothing. A normal
+   *  card parent now arrives populated off `rich_message` (#4598). */
   replyToText: string | undefined
   /** XML-escaped reply text for the channel meta; empty in the same case. */
   replyToTextEscaped: string | undefined
@@ -219,12 +246,19 @@ export interface ReplyToBufferFallbackParams {
 }
 
 /**
- * Reply-to buffer fallback (post-reset continuity). On a native reply to the
- * BOT's OWN message, Telegram delivers `reply_to_message.message_id` but NOT
- * its `.text` — so the live reply text is empty even though the gateway
- * authored (and, via `recordOutbound`, persisted) that message. This recovers
- * the antecedent from the local history buffer so it survives a session reset
- * (`resume_mode: handoff`), where the transcript is gone.
+ * Reply-to buffer fallback (post-reset continuity). On a native reply to a
+ * PLAIN message the bot itself sent, Telegram delivers
+ * `reply_to_message.message_id` but NOT its `.text` — so the live reply text
+ * is empty even though the gateway authored (and, via `recordOutbound`,
+ * persisted) that message. This recovers the antecedent from the local history
+ * buffer so it survives a session reset (`resume_mode: handoff`), where the
+ * transcript is gone.
+ *
+ * Since #4598 this is the SECOND line of defence, not the first: a reply to a
+ * RICH parent (every card) now carries its body on `reply_to_message
+ * .rich_message` and is resolved live in {@link buildReplyForwardContext},
+ * so the buffer is consulted only when the live update genuinely carried no
+ * readable body.
  *
  * Returns updated `replyToText` (raw, for the SQLite `recordInbound` write —
  * envelope-only would leave the row NULL and starve future handoff briefings),

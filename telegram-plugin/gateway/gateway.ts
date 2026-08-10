@@ -15058,11 +15058,11 @@ export async function handleInbound(
   } = replyForwardCtx
 
   // Reply-to buffer fallback (post-reset continuity, resolveReplyToFromBuffer).
-  // On a native reply to the BOT's OWN message, Telegram delivers
-  // reply_to_message.message_id but NOT its .text — so the live reply text is
-  // empty even though we authored (and, via recordOutbound, persisted) that
-  // message to history.db (role='assistant', 30-day retention). Recover it so
-  // the antecedent survives a session reset. Fills replyToText (raw, so the
+  // On a native reply to a PLAIN bot-sent message, Telegram delivers
+  // reply_to_message.message_id but NOT its .text (a RICH parent — every card —
+  // carries rich_message and is resolved LIVE upstream since #4598), so the live
+  // reply text is empty even though we persisted it (role='assistant', 30-day
+  // retention). Recover it so it survives a reset. Fills replyToText (raw, so the
   // recordInbound write below persists it — envelope-only would leave the row
   // NULL and starve future briefings), replyToTextEscaped (channel meta), and
   // replyToRole (the reply_to_role attribute). Only when the live text is
