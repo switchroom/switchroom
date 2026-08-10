@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   addUtcDays,
+  EXTERNAL_SPEND_MAX_PAGES,
   fetchAndSummarizeExternalSpend,
   formatUsd,
   isExternalModel,
@@ -206,5 +207,44 @@ describe("fetchAndSummarizeExternalSpend", () => {
     expect(s?.day7dUsd).toBeCloseTo(9, 5);
     expect(s?.top[0]?.label).toBe("gpt-oss-20b");
     expect(s?.top[0]?.usd).toBeCloseTo(6, 5);
+  });
+
+  // OUTCOME GUARD: a `has_more` that never clears must leave an operator
+  // breadcrumb. Every page here reports `has_more: true`, so the loop runs to
+  // the pagination cap; the fetch must warn (so the under-report is visible)
+  // AND still summarize the pages it collected rather than returning null.
+  it("warns and summarizes what it collected when the pagination cap is hit", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const fetchImpl = vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify(
+              dailyActivityPage(
+                [{ date: "2026-07-19", models: { "openrouter/openai/gpt-oss-20b": 1 } }],
+                true, // never clears has_more
+              ),
+            ),
+            { status: 200 },
+          ),
+      );
+      const s = await fetchAndSummarizeExternalSpend({
+        adminKey: "sk-x",
+        baseUrl: "http://litellm.test",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        now: NOW,
+      });
+      // Stopped at the cap, not looping forever.
+      expect(fetchImpl).toHaveBeenCalledTimes(EXTERNAL_SPEND_MAX_PAGES);
+      // Breadcrumb emitted for the truncated total.
+      expect(
+        warn.mock.calls.some((c) => String(c[0]).includes("pagination cap")),
+      ).toBe(true);
+      // Still summarizes the collected rows (1 usd/page × cap) rather than null.
+      expect(s).not.toBeNull();
+      expect(s?.day24hUsd).toBeCloseTo(EXTERNAL_SPEND_MAX_PAGES, 5);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

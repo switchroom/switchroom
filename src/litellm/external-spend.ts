@@ -279,6 +279,10 @@ export async function fetchAndSummarizeExternalSpend(opts: {
   for (let page = 1; page <= EXTERNAL_SPEND_MAX_PAGES; page++) {
     // `/user/daily/activity` end_date is inclusive; summarizeExternalSpend
     // re-clamps to the UTC today/7d window so a wider fetch stays exact.
+    // Fleet-scoping invariant: called with the LiteLLM MASTER key, this
+    // endpoint aggregates ALL users' daily spend, not just the admin user's —
+    // the correctness of the External total depends on that. Parity-verified
+    // against the old `/spend/logs` path (82.95 new vs 83.53 old over 7d).
     const url =
       `${base}/user/daily/activity?start_date=${encodeURIComponent(start)}` +
       `&end_date=${encodeURIComponent(today)}` +
@@ -320,6 +324,18 @@ export async function fetchAndSummarizeExternalSpend(opts: {
           ? (body as DailyActivityResponse).metadata
           : undefined;
       if (!meta?.has_more) break;
+      if (page === EXTERNAL_SPEND_MAX_PAGES) {
+        // Cap hit with `has_more` still set: we stop paginating and summarize
+        // only the pages collected, so the External /usage total is a lower
+        // bound, not the true figure. Every other early exit in this loop
+        // leaves a breadcrumb; without this one an operator sees a
+        // plausible-but-low number with no signal it was truncated.
+        console.warn(
+          `external-spend: LiteLLM /user/daily/activity still reports has_more at ` +
+            `page ${EXTERNAL_SPEND_MAX_PAGES} (pagination cap) — External /usage ` +
+            `total is under-reported (collected ${rows.length} day rows)`,
+        );
+      }
     } catch (err) {
       // Transport failure (unreachable / DNS / timeout-abort). This is the
       // exact branch the bridge-vs-loopback outage hit: the broker could not
