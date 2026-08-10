@@ -18,6 +18,22 @@ now an anomaly worth investigating, not the norm.
 ### Bug fixes
 
 - **telegram: store the card body a quote-reply needs, not an empty string**
+- **rollout: an agent-initiated roll can now heal a stale host CLI instead of
+  dead-ending on the refusal.** The #4571 host-CLI-first gate refused with
+  `preflight-host-cli-stale` and named `switchroom update --pin vX.Y.Z` — a
+  remedy the caller (an agent inside hostd, with no host bindir mounted) could
+  not perform, so the roll could only be finished by a human at a terminal. For
+  a `static-binary` host CLI the roll now runs that upgrade itself, in a
+  short-lived helper container that binds the host install prefix and nothing
+  else (no docker socket, no `~/.switchroom`): checksum-verified download,
+  prove-then-swap, the outgoing binary kept for rollback, the tree chowned back
+  to its pre-swap owner, the swapped binary re-probed, and
+  `~/.switchroom/host-cli.json` refreshed with the version actually PROVEN on
+  disk. A failed heal falls through to the pre-existing refusal with the
+  helper's own diagnostic attached. `--dry-run` performs no heal and reports
+  what the real run would do instead. An `npm i -g` install still refuses, and
+  the refusal now says plainly that an **operator** must run the command on the
+  host. (#4585)
 
 ## v0.21.0 — rollout now gates on the host CLI, plus telegram card persistence, gateway state-dir ownership, and hindsight `/metrics` cardinality fixes
 

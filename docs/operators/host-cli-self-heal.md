@@ -76,6 +76,43 @@ never moves) or leaves root-owned files in the operator's tree. `switchroom
 doctor`'s `cli (host)` row prints the correct command for the install it
 actually observed.
 
+## The roll heals a static-binary host CLI itself (#4585)
+
+The gate above is right to stop, but on the **agent path** it used to stop at a
+dead end: `mcp__hostd__rollout(pin=…)` refused with `failedStep:
+preflight-host-cli-stale` and named `switchroom update --pin vX.Y.Z` — a command
+only a human at a host terminal could run. The roll could not be finished from
+chat.
+
+For a **`static-binary`** host CLI that remedy is entirely mechanical, so the
+roll now performs it before refusing:
+
+1. It reads the stamp, sees the host binary is behind, and spawns a **short-lived
+   helper container** from the *running hostd image* (so a fork or GHCR mirror
+   keeps working, and no multi-hundred-MB pull happens).
+2. The helper is given **one bind mount — the host CLI's install prefix, rw —
+   and nothing else**: no docker socket, no `~/.switchroom`, no config. It runs
+   `switchroom host-cli-upgrade`, which is the same checksum-verified,
+   prove-then-swap sequence `switchroom update` runs, pointed at the bind-mounted
+   binary instead of its own. The outgoing binary is kept for rollback under
+   `<bindir>/.switchroom-versions/`, and the tree is chowned back to whoever
+   owned the binary before the swap — so the non-root timer above keeps working
+   on the next tick.
+3. The roll then **re-probes the swapped binary** and only continues if it
+   reports the target. It rewrites `~/.switchroom/host-cli.json` with the
+   **proven** version — not the pin it asked for — because nothing has run that
+   binary in host context, so no other code path would refresh the stamp.
+
+If any of that fails, the roll falls back to exactly the pre-existing refusal
+with the helper's own diagnostic appended, having changed nothing else. The
+prefix bind is refused outright for a path that is not a plain absolute
+`…/<dir>/switchroom` (no traversal, and never the host root).
+
+**Scope:** `static-binary` only. An `npm i -g` install still refuses — replacing
+one file is not the whole update for it — and the refusal now says plainly that
+**an operator must run this on the host**, rather than addressing the caller as
+though it could.
+
 ## Requirements
 
 - **systemd** on the host.

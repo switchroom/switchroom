@@ -64,7 +64,11 @@ import {
   PIN_JOURNAL_MAX_AGE_MS,
 } from "./rollout-pin-journal.js";
 import type { ComponentVersion } from "./component-versions.js";
-import type { HostCliStamp } from "./host-cli-stamp.js";
+import {
+  PREFLIGHT_HOST_CLI_STALE_STEP,
+  type HostCliStamp,
+} from "./host-cli-stamp.js";
+import { encodeHostCliUpgradeResult } from "./host-cli-upgrade.js";
 import { getReleasePinFromConfig } from "./release-yaml.js";
 import { SCOPED_SWEEP_ENV } from "../agents/agent-owned-tree.js";
 
@@ -3294,5 +3298,317 @@ describe("host-CLI-first gate (#4571)", () => {
     const { out } = await runRollout(configPath);
 
     expect(out).toMatch(/Rollout plan → v0\.0\.1:/);
+  });
+});
+
+// ── #4585 — HOST-CLI SELF-HEAL before the refusal ──────────────────────────
+//
+// The outcome under test: an AGENT-initiated roll against a stale
+// static-binary host CLI must no longer dead-end. Before this, the gate above
+// refused with `preflight-host-cli-stale` and a remedy (`switchroom update` on
+// the host) that the caller — an agent inside hostd, with no host bindir
+// mounted — could not perform, so the roll could only be finished by a human
+// at a terminal.
+//
+// Driven through the real command with docker injected, so the assertions are
+// on what the VERB does (proceeds / refuses, and what it records) rather than
+// on the planner in isolation (`host-cli-heal.test.ts` covers that).
+describe("host-CLI self-heal (#4585)", () => {
+  const OLD_HOST_HOME = process.env.SWITCHROOM_HOST_HOME;
+  const OLD_HOSTD_CTX = process.env.SWITCHROOM_HOSTD_CONTEXT;
+
+  afterEach(() => {
+    if (OLD_HOST_HOME === undefined) delete process.env.SWITCHROOM_HOST_HOME;
+    else process.env.SWITCHROOM_HOST_HOME = OLD_HOST_HOME;
+    if (OLD_HOSTD_CTX === undefined) delete process.env.SWITCHROOM_HOSTD_CONTEXT;
+    else process.env.SWITCHROOM_HOSTD_CONTEXT = OLD_HOSTD_CTX;
+    delete process.env.SWITCHROOM_PIN_JOURNAL_DIR;
+    process.exitCode = 0;
+  });
+
+  /** A tmp operator home whose host CLI is a stale STATIC-BINARY install. */
+  function makeStaticBinaryHost(
+    hostCliVersion: string,
+    overrides: Record<string, unknown> = {},
+  ): { configPath: string; stampPath: string } {
+    const home = mkdtempSync(join(tmpdir(), "rollout-heal-"));
+    const dir = join(home, ".switchroom");
+    mkdirSync(dir, { recursive: true });
+    const configPath = join(dir, "switchroom.yaml");
+    writeFileSync(
+      configPath,
+      `switchroom:\n  version: 1\ntelegram:\n  bot_token: x\n  forum_chat_id: "1"\n` +
+        `release:\n  pin: v0.0.1\nagents:\n  clerk:\n    topic_name: clerk\n`,
+      "utf8",
+    );
+    const stampPath = join(dir, "host-cli.json");
+    writeFileSync(
+      stampPath,
+      JSON.stringify({
+        version: hostCliVersion,
+        installKind: "static-binary",
+        path: "/usr/local/bin/switchroom",
+        ownerUid: 1000,
+        ownerUser: "op",
+        ...overrides,
+      }),
+      "utf8",
+    );
+    process.env.SWITCHROOM_HOST_HOME = home;
+    return { configPath, stampPath };
+  }
+
+  /** Docker that heals: hostd's image resolves, the helper exits 0 on `v0.0.1`. */
+  function healingDocker(sentinel: string) {
+    const calls: string[][] = [];
+    const docker = (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "inspect")
+        return { ok: true, stdout: "ghcr.io/switchroom/switchroom-hostd:v0.0.1\n", stderr: "" };
+      if (args[0] === "wait") return { ok: true, stdout: "0\n", stderr: "" };
+      if (args[0] === "logs") return { ok: true, stdout: sentinel, stderr: "" };
+      return { ok: true, stdout: "", stderr: "" };
+    };
+    return { docker, calls };
+  }
+
+  /**
+   * A REAL (non-dry-run) roll — the heal only runs there, because --dry-run
+   * writes nothing. `--agents nope` is the observation point: the unknown-agent
+   * bail sits immediately AFTER the host-CLI gate and before any mutation, so
+   * "did stderr say `unknown agent(s)`" is exactly "did the roll clear the
+   * gate", with no docker, no spawn and nothing written.
+   */
+  const PAST_THE_GATE = /unknown agent\(s\): nope/;
+
+  async function runRollout(
+    configPath: string,
+    docker: (args: string[]) => { ok: boolean; stdout: string; stderr: string },
+    extra: string[] = ["--agents", "nope"],
+  ) {
+    process.env.SWITCHROOM_HOSTD_CONTEXT = "1";
+    process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(
+      join(tmpdir(), "rollout-heal-journal-"),
+    );
+    const program = new Command();
+    program.exitOverride();
+    program.option("-c, --config <path>", "Path to switchroom.yaml config file");
+    registerRolloutCommand(program, { hostCliHealDocker: docker });
+    const out: string[] = [];
+    const err: string[] = [];
+    const writeOut = process.stdout.write.bind(process.stdout);
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stdout.write = ((s: string) => {
+      out.push(String(s));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((s: string) => {
+      err.push(String(s));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      await program.parseAsync(
+        ["--config", configPath, "rollout", "--pin", "v0.0.1", ...extra],
+        { from: "user" },
+      );
+    } finally {
+      process.stdout.write = writeOut;
+      process.stderr.write = writeErr;
+    }
+    return { out: out.join(""), err: err.join("") };
+  }
+
+  it("heals the stale host CLI and PROCEEDS, instead of dead-ending on the refusal", async () => {
+    const { configPath } = makeStaticBinaryHost("0.0.0");
+    const { docker, calls } = healingDocker(
+      encodeHostCliUpgradeResult({
+        ok: true,
+        version: "v0.0.1",
+        binaryPath: "/hostcli/bin/switchroom",
+      }),
+    );
+    const { out, err } = await runRollout(configPath, docker);
+
+    // The outcome that was impossible before: the roll clears the gate.
+    expect(err).toMatch(PAST_THE_GATE);
+    expect(err).not.toMatch(/HOST operator CLI is v0\.0\.0/);
+    expect(out).not.toContain(PREFLIGHT_HOST_CLI_STALE_STEP);
+    expect(err).toMatch(/host CLI upgraded 0\.0\.0 → v0\.0\.1/);
+    // …and it did it by spawning the upgrade helper bound to the host PREFIX.
+    const run = calls.find((c) => c[0] === "run");
+    expect(run).toBeDefined();
+    expect(run).toContain("/usr/local:/hostcli:rw");
+    expect(run).toContain("host-cli-upgrade");
+  });
+
+  it("refreshes host-cli.json, so the NEXT roll does not refuse on a CLI it already fixed", async () => {
+    // The trap called out on the issue: the swapped binary never ran in host
+    // context, so nothing else rewrites the stamp.
+    const { configPath, stampPath } = makeStaticBinaryHost("0.0.0");
+    const { docker } = healingDocker(
+      encodeHostCliUpgradeResult({ ok: true, version: "v0.0.1" }),
+    );
+    await runRollout(configPath, docker);
+
+    const stamp = JSON.parse(readFileSync(stampPath, "utf8")) as Record<string, unknown>;
+    expect(stamp.version).toBe("0.0.1");
+    // The rest of the record is preserved — this is a version refresh, not a
+    // re-derivation from a container that cannot see the host install.
+    expect(stamp.installKind).toBe("static-binary");
+    expect(stamp.path).toBe("/usr/local/bin/switchroom");
+    expect(stamp.ownerUser).toBe("op");
+  });
+
+  it("records the version the helper PROVED, never the pin it was asked for", async () => {
+    // A helper that lands 0.0.0 again must not be recorded as 0.0.1 — that
+    // would convert a failed heal into permanent silent drift.
+    const { configPath, stampPath } = makeStaticBinaryHost("0.0.0");
+    const { docker } = healingDocker(
+      encodeHostCliUpgradeResult({ ok: true, version: "v0.0.0" }),
+    );
+    const { out, err } = await runRollout(configPath, docker);
+
+    expect(JSON.parse(readFileSync(stampPath, "utf8")).version).toBe("0.0.0");
+    // Still behind, so the gate still refuses.
+    expect(process.exitCode).toBe(2);
+    expect(err).toMatch(/HOST operator CLI is v0\.0\.0/);
+    expect(out).toContain(PREFLIGHT_HOST_CLI_STALE_STEP);
+  });
+
+  it("REFUSES with the helper's own diagnostic when the heal fails", async () => {
+    const { configPath, stampPath } = makeStaticBinaryHost("0.0.0");
+    const { docker } = (() => {
+      const d = (args: string[]) => {
+        if (args[0] === "inspect")
+          return { ok: true, stdout: "hostd:v0.0.1", stderr: "" };
+        if (args[0] === "wait") return { ok: true, stdout: "1", stderr: "" };
+        if (args[0] === "logs")
+          return {
+            ok: true,
+            stdout: encodeHostCliUpgradeResult({
+              ok: false,
+              error: "checksum mismatch for switchroom-linux-amd64",
+            }),
+            stderr: "",
+          };
+        return { ok: true, stdout: "", stderr: "" };
+      };
+      return { docker: d };
+    })();
+    const { out, err } = await runRollout(configPath, docker);
+
+    expect(process.exitCode).toBe(2);
+    expect(err).toMatch(/host CLI self-heal FAILED/);
+    expect(err).toContain("checksum mismatch for switchroom-linux-amd64");
+    expect(out).toContain(PREFLIGHT_HOST_CLI_STALE_STEP);
+    expect(err).not.toMatch(PAST_THE_GATE);
+    // A failed heal must not have moved the recorded version.
+    expect(JSON.parse(readFileSync(stampPath, "utf8")).version).toBe("0.0.0");
+  });
+
+  it("tells the truth about WHO must act: an operator, on the host", async () => {
+    // The pre-#4585 message addressed the agent as though it could run the
+    // command itself, which is the dead end this issue is about.
+    const { configPath } = makeStaticBinaryHost("0.0.0");
+    const { err } = await runRollout(
+      configPath,
+      () => ({ ok: false, stdout: "", stderr: "no such container" }),
+    );
+
+    expect(err).toContain("An operator must run this on the host");
+    expect(err).toMatch(/host CLI self-heal FAILED/);
+  });
+
+  it("does not attempt a heal for an npm-global install, and says why", async () => {
+    // Replacing one file is NOT the whole update for an npm install, so the
+    // helper cannot honestly do it — the refusal must stay, with a reason.
+    const { configPath } = makeStaticBinaryHost("0.0.0", {
+      installKind: "npm-global",
+      path: "/home/op/.nvm/versions/node/v22/lib/node_modules/switchroom/dist/cli/switchroom.js",
+      npmPrefix: "/home/op/.nvm/versions/node/v22",
+    });
+    let dockerCalls = 0;
+    const { err } = await runRollout(configPath, () => {
+      dockerCalls += 1;
+      return { ok: true, stdout: "", stderr: "" };
+    });
+
+    expect(process.exitCode).toBe(2);
+    expect(err).toContain("host CLI self-heal not attempted");
+    expect(err).toContain("npm-global");
+    expect(err).toContain("npm i -g --prefix /home/op/.nvm/versions/node/v22 switchroom@0.0.1");
+    // No container was spawned at all.
+    expect(dockerCalls).toBe(0);
+  });
+
+  it("never spawns a helper when the host CLI is already current", async () => {
+    const { configPath } = makeStaticBinaryHost("0.0.1");
+    let dockerCalls = 0;
+    const { err } = await runRollout(configPath, () => {
+      dockerCalls += 1;
+      return { ok: true, stdout: "", stderr: "" };
+    });
+
+    expect(err).toMatch(PAST_THE_GATE);
+    expect(dockerCalls).toBe(0);
+  });
+
+  it("never spawns a helper under --allow-stale-host-cli", async () => {
+    const { configPath } = makeStaticBinaryHost("0.0.0");
+    let dockerCalls = 0;
+    const { err } = await runRollout(
+      configPath,
+      () => {
+        dockerCalls += 1;
+        return { ok: true, stdout: "", stderr: "" };
+      },
+      ["--allow-stale-host-cli", "--agents", "nope"],
+    );
+
+    expect(err).toMatch(PAST_THE_GATE);
+    expect(dockerCalls).toBe(0);
+  });
+
+  it("--dry-run performs NO heal, and says what the real run would do", async () => {
+    // --dry-run's contract is that it writes nothing, and swapping the host
+    // binary is emphatically a write. It must neither spawn the helper nor
+    // refuse for a condition the real run clears itself.
+    const { configPath, stampPath } = makeStaticBinaryHost("0.0.0");
+    let dockerCalls = 0;
+    const { out, err } = await runRollout(
+      configPath,
+      () => {
+        dockerCalls += 1;
+        return { ok: true, stdout: "", stderr: "" };
+      },
+      ["--dry-run"],
+    );
+
+    expect(dockerCalls).toBe(0);
+    expect(out).toContain("would upgrade the HOST CLI 0.0.0 → v0.0.1");
+    expect(out).toContain("/usr/local");
+    // The plan still renders — the roll is not refused …
+    expect(out).toMatch(/Rollout plan → v0\.0\.1:/);
+    expect(out).toMatch(/restart clerk/);
+    expect(err).not.toMatch(/HOST operator CLI is v0\.0\.0/);
+    // … and the stamp on disk is untouched.
+    expect(JSON.parse(readFileSync(stampPath, "utf8")).version).toBe("0.0.0");
+  });
+
+  it("--dry-run still REFUSES when no heal is available", async () => {
+    const { configPath } = makeStaticBinaryHost("0.0.0", {
+      installKind: "npm-global",
+      path: "/home/op/.nvm/versions/node/v22/lib/node_modules/switchroom/dist/cli/switchroom.js",
+      npmPrefix: "/home/op/.nvm/versions/node/v22",
+    });
+    const { out, err } = await runRollout(
+      configPath,
+      () => ({ ok: true, stdout: "", stderr: "" }),
+      ["--dry-run"],
+    );
+
+    expect(process.exitCode).toBe(2);
+    expect(err).toMatch(/HOST operator CLI is v0\.0\.0/);
+    expect(out).not.toMatch(/Rollout plan/);
   });
 });
