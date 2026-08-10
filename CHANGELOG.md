@@ -48,6 +48,7 @@ now an anomaly worth investigating, not the norm.
   what the real run would do instead. An `npm i -g` install still refuses, and
   the refusal now says plainly that an **operator** must run the command on the
   host. (#4585)
+- **litellm: read external spend from pre-aggregated daily table**
 
 ## v0.21.0 — rollout now gates on the host CLI, plus telegram card persistence, gateway state-dir ownership, and hindsight `/metrics` cardinality fixes
 
