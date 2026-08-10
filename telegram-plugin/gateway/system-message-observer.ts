@@ -29,12 +29,20 @@
  * card send in the gateway is routed through it, enforced by the
  * `check-bot-api-wrapping` lint guard.
  *
- * The observer reads the Telegram RESPONSE, not the request, which buys three
+ * The observer reads the Telegram RESPONSE, not the request, which buys two
  * things for free:
  *   - the real `message_id` (the only thing a reply can point at),
- *   - the chat and forum-topic the message actually landed in,
- *   - the RENDERED text, which for a card is otherwise unrecoverable (it is
- *     composed from live tool activity and never persisted anywhere).
+ *   - the chat and forum-topic the message actually landed in.
+ *
+ * The BODY does NOT come from the response. It arrives stamped on the message
+ * by the `installSentTextCapture` transformer, which captured it from the
+ * outbound REQUEST (`shared/sent-text-capture.ts`). That split is the #4576
+ * bug, fixed: every card goes out via Bot API 10.1 `sendRichMessage`, whose
+ * response is a `Message.RichMessageMessage` carrying `rich_message.blocks`
+ * and NO `text` / `caption` — so deriving the body from the response yielded
+ * `''` on 100% of the rows on every agent in the fleet, and the agent could see
+ * WHICH card was quote-replied to but never WHAT IT SAID. The request is the
+ * one place the body is unambiguously known for every send verb.
  *
  * Send vs edit is NOT guessed from the verb (verb tagging is not uniform
  * across call sites and would rot). It falls out of the data: an edit returns
@@ -55,6 +63,9 @@
  * is observing.
  */
 
+import { readSentText } from '../shared/sent-text-capture.js'
+import { extractRichMessageText } from './rich-message-handler.js'
+
 /** The subset of a Telegram `Message` response this observer reads. */
 export interface SentMessageLike {
   message_id?: unknown
@@ -62,6 +73,7 @@ export interface SentMessageLike {
   message_thread_id?: unknown
   text?: unknown
   caption?: unknown
+  rich_message?: unknown
 }
 
 /** The subset of `robustApiCall`'s opts the observer reads. */
@@ -91,6 +103,20 @@ export interface SystemMessageObserverDeps {
   updateText: (args: { chat_id: string; message_id: number; text: string }) => boolean
   /** Injectable clock for the edit throttle. Defaults to `Date.now`. */
   now?: () => number
+  /**
+   * Called when a card row is about to be written with an EMPTY body — i.e.
+   * the text-capture seam did not reach this send.
+   *
+   * This is the alarm for the #4576 failure mode. That bug was silent for a
+   * whole release precisely because an empty body is indistinguishable from a
+   * healthy row unless someone queries `length(text)`. Fired at most ONCE per
+   * `kind` per process so a broken verb is loud in the log without becoming a
+   * per-send stderr storm. Never called with a non-empty body.
+   *
+   * Defaults to `defaultEmptyCardTextWarning` (stderr). Pass an explicit
+   * function to redirect it, or `() => {}` to silence it in a test.
+   */
+  onEmptyText?: (info: { chat_id: string; message_id: number; kind: string | null }) => void
 }
 
 export interface SystemMessageObserverOptions {
@@ -133,7 +159,16 @@ export function normalizeSendVerb(verb: string | undefined | null): string | nul
  *
  * The response's own `chat.id` wins over the caller's `chat_id` opt: it is what
  * Telegram actually delivered to, and several call sites pass no `chat_id` at
- * all. Pure.
+ * all.
+ *
+ * `text` is resolved in strict precedence order, most authoritative first:
+ *   1. the body stamped by `installSentTextCapture` from the outbound REQUEST —
+ *      correct for every send verb, which is why it is first;
+ *   2. `rich_message` echoed back on the response, flattened by the same
+ *      renderer the inbound rich-message handler uses;
+ *   3. `text` / `caption`, the plain-send shapes.
+ * `''` only when all three are absent, which the observer treats as an alarm.
+ * Pure.
  */
 export function extractSentMessage(
   result: unknown,
@@ -157,8 +192,36 @@ export function extractSentMessage(
         ? opts.threadId
         : null
   const text =
-    typeof msg.text === 'string' ? msg.text : typeof msg.caption === 'string' ? msg.caption : ''
+    readSentText(result) ??
+    (msg.rich_message != null ? extractRichMessageText(msg.rich_message) : undefined) ??
+    (typeof msg.text === 'string' ? msg.text : typeof msg.caption === 'string' ? msg.caption : '')
   return { chatId, messageId: id, threadId, text }
+}
+
+/**
+ * The observer's DEFAULT empty-body alarm: one stderr line naming the card kind
+ * whose text capture missed.
+ *
+ * It lives here, and is the default rather than something gateway.ts wires,
+ * for two reasons: gateway.ts is under an anti-inflation line ratchet
+ * (switchroom#2996) so new logic belongs in a module; and a caller that forgets
+ * to pass `onEmptyText` is exactly the caller that would re-ship #4576
+ * silently. Opting OUT is now the explicit act.
+ */
+export function defaultEmptyCardTextWarning(info: {
+  chat_id: string
+  message_id: number
+  kind: string | null
+}): void {
+  try {
+    process.stderr.write(
+      `telegram gateway: card-history text capture MISSED kind=${info.kind ?? '-'} ` +
+        `chat=${info.chat_id} id=${info.message_id} — a quote-reply to this card will ` +
+        `resolve its kind but not its body (see shared/sent-text-capture.ts)\n`,
+    )
+  } catch {
+    /* a broken stderr must never break the send */
+  }
 }
 
 /** Per-id bookkeeping. `foreign` = the id belongs to a non-system row (a real
@@ -177,6 +240,20 @@ export function makeSystemMessageObserver(
   const editRefreshMs = options?.editRefreshMs ?? DEFAULT_EDIT_REFRESH_MS
   const maxTracked = Math.max(1, options?.maxTracked ?? DEFAULT_MAX_TRACKED)
   const tracked = new Map<string, TrackedState>()
+  /** Kinds already reported through `onEmptyText` — one alarm per kind, per process. */
+  const emptyReported = new Set<string>()
+  const onEmptyText = deps.onEmptyText ?? defaultEmptyCardTextWarning
+
+  function reportEmpty(chatId: string, messageId: number, kind: string | null): void {
+    const bucket = kind ?? '<untagged>'
+    if (emptyReported.has(bucket)) return
+    emptyReported.add(bucket)
+    try {
+      onEmptyText({ chat_id: chatId, message_id: messageId, kind })
+    } catch {
+      /* the alarm must never break the send either */
+    }
+  }
 
   function remember(key: string, state: TrackedState): void {
     tracked.set(key, state)
@@ -200,8 +277,16 @@ export function makeSystemMessageObserver(
       const t = now()
       const seen = tracked.get(key)
 
+      const kind = normalizeSendVerb(opts?.verb)
+      if (sent.text.length === 0) reportEmpty(sent.chatId, sent.messageId, kind)
+
       if (seen != null) {
         if (seen.lane === 'foreign') return
+        // Never blank a body we already stored. A refresh whose text did not
+        // reach us is missing information, not new information — overwriting
+        // with `''` would destroy a usable quote-reply antecedent and hand the
+        // agent the #4576 symptom on a row that was healthy a moment ago.
+        if (sent.text.length === 0) return
         if (t - seen.lastStoredMs < editRefreshMs) return
         if (deps.updateText({ chat_id: sent.chatId, message_id: sent.messageId, text: sent.text })) {
           seen.lastStoredMs = t
@@ -218,7 +303,7 @@ export function makeSystemMessageObserver(
         chat_id: sent.chatId,
         thread_id: sent.threadId,
         message_id: sent.messageId,
-        kind: normalizeSendVerb(opts?.verb),
+        kind,
         text: sent.text,
       })
       if (inserted) {
@@ -228,7 +313,10 @@ export function makeSystemMessageObserver(
       // A row already exists for this id and we did not create it in this
       // process: either a real reply / inbound (leave it alone), or a card this
       // gateway posted before a restart. One probing update disambiguates —
-      // `updateText` only ever matches a `system` row.
+      // `updateText` only ever matches a `system` row. The probe WRITES, so an
+      // empty body cannot be used to run it: skip, stay untracked, and let the
+      // next observation of this id (which carries a body) do the probing.
+      if (sent.text.length === 0) return
       const refreshed = deps.updateText({
         chat_id: sent.chatId,
         message_id: sent.messageId,

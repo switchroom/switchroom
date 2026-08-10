@@ -303,6 +303,7 @@ import { installEditFloodFuse, editFloodFuseConfigFromEnv } from '../edit-flood-
 import { createSendGate, sendGateConfigFromEnv, isSendGateShed } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
 import { installTgPostLogger, installRichMarkdownGuard, withTgPostTags } from '../shared/bot-runtime.js'
+import { installSentTextCapture } from '../shared/sent-text-capture.js'
 import {
   floodStatePath,
   floodWindowsPath,
@@ -5608,6 +5609,8 @@ const rawRobustApiCall = createRetryApiCall({
 // system-message-observer.ts for the send-vs-edit and throttling contract.
 // Gated on the SAME condition as `initHistory` above — a non-main gateway
 // process never opens the DB, so an observer there would be pure noise.
+// The empty-body alarm (#4576) is the observer's own default — see
+// `defaultEmptyCardTextWarning` in system-message-observer.ts.
 const observeSentMessage = isGatewayMain && HISTORY_ENABLED
   ? makeSystemMessageObserver({ insert: recordSystemOutbound, updateText: updateSystemOutboundText })
   : undefined
@@ -22877,6 +22880,11 @@ async function initGatewayBot(): Promise<void> {
 
   bot = new Bot(TOKEN)
   installTgPostLogger(bot); installRichMarkdownGuard(bot) // #3252/#3463: universal fmt guard installed after logger (composes outermost); see installRichMarkdownGuard docblock
+  // #4571 follow-up: stamp each send's REQUEST body onto its resolved Message so
+  // the card-history observer stores what the card SAID (a sendRichMessage
+  // response carries no `text`). Installed after the fmt guard so it composes
+  // OUTSIDE it and captures the caller's body pre-escape. See sent-text-capture.ts.
+  installSentTextCapture(bot)
   // #3620 flood fuse — installed LAST so it composes OUTERMOST: the one seam no
   // outbound call can bypass (grammY has no route to the network that skips the
   // transformer stack). Kill-switch SWITCHROOM_EDIT_FUSE=0; see edit-flood-fuse.ts.
