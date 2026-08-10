@@ -19,6 +19,8 @@ now an anomaly worth investigating, not the norm.
 
 - **gateway: record card sends at the transformer seam, not robustApiCall**
 
+- **gateway: read a rich-message reply parent's body off the live update**
+
 ## v0.21.4 — gateway SQLite databases open read-only from foreign processes, and an orphaned-fd sweep that catches the damage when they don't
 
 ### Fixes
