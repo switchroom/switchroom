@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.0 — rollout now gates on the host CLI, plus telegram card persistence, gateway state-dir ownership, and hindsight `/metrics` cardinality fixes
+
 ### Bug fixes
 
 - **rollout: the host operator CLI is upgraded FIRST, and the roll refuses to
@@ -42,30 +44,28 @@ now an anomaly worth investigating, not the norm.
 
 - **gateway: keep state-dir writes owned by the agent uid, not root**
 
-### Fixed: hindsight's `/metrics` no longer grows a permanent series per document page
-
-- **The `endpoint` metric label is now templated on the whole path segment, so
-  it is bounded by the number of routes instead of the number of documents ever
-  fetched.** Upstream hindsight templates ids in that label with a pattern
-  anchored to a `/` on the left and to nothing on the right, so it only
+- **hindsight: `/metrics` no longer grows a permanent series per document
+  page.** The `endpoint` metric label is now templated on the whole path
+  segment, so it is bounded by the number of routes instead of the number of
+  documents ever fetched. Upstream hindsight templates ids in that label with a
+  pattern anchored to a `/` on the left and to nothing on the right, so it only
   collapses a segment that IS a bare UUID. Hindsight document ids are composite
   (`<uuid>-r<uuid>-<uuid>` plus up to two `-pNofM` pagination suffixes, and
   `agent-<hex>-r<uuid>-<uuid>` for agent-scoped documents), so a uuid-leading id
   kept everything after its first UUID and an `agent-`-prefixed id was not
   templated at all. Every document page ever fetched minted an OpenTelemetry
-  series set that is never evicted.
-- **Measured on the live fleet before the fix:** `/metrics` served 23,303,354
-  bytes carrying 3,982 distinct `endpoint` values against 9 real route
-  templates, and took 0.91s to generate. `generate_latest()` runs synchronously
-  on the serving loop, so the 15-minute `hindsight-watch` scrape logged
-  `EVENT LOOP BLOCKED for >= 1.00s ... /health cannot be scheduled` at exactly
-  the scrape minutes. That made it an availability bug, not just a fat payload.
-  Re-running the 3,982 live label values through the corrected pattern collapses
-  them to 9.
-- `metrics.py` belongs to upstream `vectorize-io/hindsight`, so the fix is a
-  build-time patch in `docker/Dockerfile.hindsight` carrying a removal note. It
-  asserts the pre-patch text exists exactly once, so a base-image bump that
-  already carries the fix fails the build loudly rather than shipping unpatched.
+  series set that is never evicted. Measured on the live fleet before the fix:
+  `/metrics` served 23,303,354 bytes carrying 3,982 distinct `endpoint` values
+  against 9 real route templates, and took 0.91s to generate.
+  `generate_latest()` runs synchronously on the serving loop, so the 15-minute
+  `hindsight-watch` scrape logged `EVENT LOOP BLOCKED for >= 1.00s ... /health
+  cannot be scheduled` at exactly the scrape minutes. That made it an
+  availability bug, not just a fat payload. Re-running the 3,982 live label
+  values through the corrected pattern collapses them to 9. `metrics.py`
+  belongs to upstream `vectorize-io/hindsight`, so the fix is a build-time
+  patch in `docker/Dockerfile.hindsight` carrying a removal note. It asserts
+  the pre-patch text exists exactly once, so a base-image bump that already
+  carries the fix fails the build loudly rather than shipping unpatched.
   **Takes effect on the next hindsight image rebuild + restart.**
 
 ## v0.20.22 — recall budget default moves to `mid`, speaker-aware retain context, and fail-safe recall fact-type filtering
