@@ -29,6 +29,26 @@ now an anomaly worth investigating, not the norm.
   class of staleness stops recurring. Two more of the same in test comments go
   with them.
 
+### Dependencies
+
+- **Claude Code CLI pinned 2.1.223 → 2.1.226** — all three lockstep locations
+  move together (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
+  `dependencies.json`). The motivating fixes are headless-session reliability,
+  which is every agent in the fleet: a transient 401 could replace a long-lived
+  `CLAUDE_CODE_OAUTH_TOKEN` with a stored login's short-lived token and break a
+  headless session until restart; cross-session messages could stay parked with
+  no notice or expiry in headless sessions and during startup; a `SendMessage`
+  whose write to a teammate's inbox failed reported "Message sent" anyway; and
+  long (>200 char) project paths could resolve into another project's session
+  directory. Two behaviour changes to expect: the new `crossSessionInbound` and
+  `dialogExpiry` settings hold cross-session messages sent into a
+  bypassed-permissions session for approval (switchroom agents are bypassed, but
+  take their inbound over the Telegram channel plugin rather than Claude Code's
+  cross-session inbox, so the defaults are left alone), and the
+  200-subagent-per-session spawn cap is gone — the fleet's own limit is the
+  separate `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=15` concurrency export, which
+  is unchanged.
+
 ### Bug fixes
 
 - **telegram: store the card body a quote-reply needs, not an empty string**
