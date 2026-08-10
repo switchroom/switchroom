@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.2 — Claude Code CLI 2.1.226, and an explicit refusal of its new cross-session inbox
+
 ### Documentation
 
 - **The #1978 thinking-effort guard no longer restates the claude-CLI pin.**
@@ -81,7 +83,6 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
-- **telegram: store the card body a quote-reply needs, not an empty string**
 - **rollout: an agent-initiated roll can now heal a stale host CLI instead of
   dead-ending on the refusal.** The #4571 host-CLI-first gate refused with
   `preflight-host-cli-stale` and named `switchroom update --pin vX.Y.Z` — a
@@ -98,6 +99,16 @@ now an anomaly worth investigating, not the norm.
   what the real run would do instead. An `npm i -g` install still refuses, and
   the refusal now says plainly that an **operator** must run the command on the
   host. (#4585)
+
+## v0.21.1 — quote-replying to a card now carries the card body
+
+<!-- Filed retroactively: v0.21.1 was tagged without a consolidation commit,
+     so this entry was still sitting under `## Unreleased`. -->
+
+### Bug fixes
+
+- **telegram: store the card body a quote-reply needs, not an empty string**
+  (#4583)
 
 ## v0.21.0 — rollout now gates on the host CLI, plus telegram card persistence, gateway state-dir ownership, and hindsight `/metrics` cardinality fixes
 
