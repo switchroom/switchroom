@@ -76,7 +76,7 @@ function fakeIO(): SelfUpdateIO & { files: Map<string, string>; links: Map<strin
       files.set(dest, url.endsWith(".tar.gz") ? `PAYLOAD:${tag}` : "NEW");
     },
     sha256File: () => "a".repeat(64),
-    probeBinaryVersion: () => "9.9.9",
+    probeBinary: () => ({ ok: true, version: "9.9.9" }),
     mkdirp: () => {},
     copyFile: (s, d) => void files.set(d, files.get(s) ?? ""),
     chmodExec: () => {},
@@ -329,7 +329,12 @@ describe("swap → re-exec", () => {
         installProbe: STATIC_PROBE,
         selfUpdateIO: {
           ...fakeIO(),
-          probeBinaryVersion: () => null, // downloaded binary won't run
+          // downloaded binary won't run
+          probeBinary: () => ({
+            ok: false as const,
+            kind: "ran-but-failed" as const,
+            detail: "exit 1",
+          }),
         },
         latestReleaseTagFn: async () => "v9.9.9",
         runner: () => ({ status: 0 }),
@@ -341,7 +346,7 @@ describe("swap → re-exec", () => {
       });
       expect(code).toBe(1);
       expect(err).toContain("self-update-cli failed");
-      expect(err).toContain("did not run cleanly");
+      expect(err).toContain("the artifact itself is faulty");
     });
   });
 });

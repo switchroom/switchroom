@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixes
+
+- **rollout: the host-CLI self-heal no longer fails its own verification on a
+  perfectly good release binary.** The self-update proof step ran the
+  downloaded artifact's `version` SUBCOMMAND, which loads
+  `~/.switchroom/switchroom.yaml` and enumerates agent containers — so it
+  exits 1 wherever there is no fleet config. The heal helper container
+  deliberately mounts the install prefix and nothing else, so the probe could
+  never pass there: a `pin: v0.21.3` roll refused at
+  `preflight-host-cli-stale` reporting "the downloaded v0.21.3 binary did not
+  run cleanly on this host" for an artifact whose sha256 matched and which
+  installed by hand minutes later. The probe now runs `--version`, which execs
+  the whole bundled runtime (the only thing the check proves) and touches no
+  config, docker socket or network. The check is never skipped; its verdict is
+  now three-way, so "we could not EXECUTE it here" (a `noexec` staging mount, a
+  lost +x bit, a foreign arch) is reported as a location fault instead of
+  mis-accusing the artifact and sending operators to re-download a good file.
+  (#4586)
+
 <!--
 Staging area for the NEXT release. Every PR that changes shippable code adds
 its entry HERE, under this header, in the SAME PR — grouped under `###`
