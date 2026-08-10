@@ -577,8 +577,10 @@ export function checkConfig(config: SwitchroomConfig, configPath: string): Check
   // Adaptive-thinking effort guard (#1978). PINNED Opus 4.x only: the
   // upstream claude-CLI merge bug that produced the 400 on thinking blocks
   // was fixed in claude-code 2.1.156 (pinned by switchroom v0.14.8; the base
-  // image now runs 2.1.219), so Opus 5 and the bare `opus` alias are no
-  // longer flagged. Resolve each agent's effective model + effort and flag
+  // image runs the pin in `docker/Dockerfile.base`, well past that floor), so
+  // Opus 5 and the bare `opus` alias are no longer flagged. The live pin is
+  // never restated here — the `claude CLI floor (#1978)` check reads it from
+  // the Dockerfile. Resolve each agent's effective model + effort and flag
   // the combo so an operator sees it at `doctor`/`apply` time.
   const effortRisks: string[] = [];
   for (const [name, agentConfig] of Object.entries(config.agents)) {

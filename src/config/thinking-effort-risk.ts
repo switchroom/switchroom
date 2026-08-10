@@ -14,8 +14,11 @@
  * THIS BUG IS FIXED UPSTREAM. It was an UPSTREAM claude CLI streaming-merge
  * bug, not a switchroom bug, and the fix shipped in claude-code **2.1.156**
  * — pinned by switchroom v0.14.8 (CHANGELOG "Claude CLI pinned to `@2.1.156`
- * (the 400-fix build)"). Containers now run 2.1.219
- * (`docker/Dockerfile.base:157`), 63 builds past the fix.
+ * (the 400-fix build)"). Containers run the production pin from
+ * `docker/Dockerfile.base` (`ARG CLAUDE_CODE_VERSION`), many builds past that
+ * fix. Do NOT restate the pin here: it moves on every CLI bump, and
+ * `readPinnedClaudeCliVersion()` (`src/cli/doctor-claude-cli.ts`) reads it out
+ * of the Dockerfile at doctor time so nothing has to hardcode it.
  *
  * The guard is therefore retained ONLY for pinned Opus 4.x model ids
  * (`claude-opus-4*`), where the `medium`+ reproduction was actually observed
@@ -24,8 +27,9 @@
  *
  *   - Opus 5 runs at `thinking_effort: medium` on klanker and overlord since
  *     2026-07-25 with no recurrence of the 400.
- *   - The `opus` alias now resolves to Opus 5 (claude-code 2.1.219 made Opus 5
- *     the default Opus), so matching the bare alias would flag Opus 5 by proxy.
+ *   - The bare `opus` alias resolves to whatever the CLI's *current* default
+ *     Opus is (Opus 5 on the pinned build), so matching the alias would flag
+ *     Opus 5 by proxy.
  *
  * A related, separately-verified NON-cause: the em-dash scrubber was once
  * blamed for invalidating thinking-block signatures. That is wrong —

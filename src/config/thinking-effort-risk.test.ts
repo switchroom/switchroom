@@ -15,7 +15,7 @@ describe("isAdaptiveThinkingOpus", () => {
   });
 
   // The #1978 CLI merge bug was fixed upstream in claude-code 2.1.156 (pinned
-  // by switchroom v0.14.8; docker/Dockerfile.base now pins 2.1.219). The guard
+  // by switchroom v0.14.8; docker/Dockerfile.base pins a later build). The guard
   // is legacy scope for pinned Opus 4.x only, so Opus 5 must NOT be flagged.
   it("does NOT match Opus 5 (bug fixed upstream at CLI 2.1.156)", () => {
     expect(isAdaptiveThinkingOpus("claude-opus-5")).toBe(false);
@@ -24,8 +24,8 @@ describe("isAdaptiveThinkingOpus", () => {
     expect(isAdaptiveThinkingOpus("claude-opus-6")).toBe(false);
   });
 
-  // The bare alias resolves to the latest Opus (Opus 5 on claude-code 2.1.219),
-  // so matching it would flag Opus 5 by proxy.
+  // The bare alias resolves to the CLI's current default Opus (Opus 5 on the
+  // pinned build), so matching it would flag Opus 5 by proxy.
   it("does NOT match the bare `opus` alias", () => {
     expect(isAdaptiveThinkingOpus("opus")).toBe(false);
     expect(isAdaptiveThinkingOpus("OPUS")).toBe(false);

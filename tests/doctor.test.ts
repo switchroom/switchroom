@@ -690,9 +690,10 @@ describe("checkConfig — default subagents check", () => {
 });
 
 // The #1978 merge-400 was an upstream claude-CLI streaming-merge bug, fixed in
-// claude-code 2.1.156 (pinned by switchroom v0.14.8; docker/Dockerfile.base now
-// pins 2.1.219). The guard's scope is legacy pinned Opus 4.x only, so a modern
-// Opus 5 / `opus`-alias fleet at medium effort must NOT produce an operator warn.
+// claude-code 2.1.156 (pinned by switchroom v0.14.8; docker/Dockerfile.base
+// pins a later build). The guard's scope is legacy pinned Opus 4.x only, so a
+// modern Opus 5 / `opus`-alias fleet at medium effort must NOT produce an
+// operator warn.
 describe("checkConfig — thinking_effort × adaptive model", () => {
   const CHECK = "thinking_effort × adaptive model";
 
