@@ -102,20 +102,32 @@ describe('resolveReplyToFromBuffer — reply-to buffer fallback (1a)', () => {
   })
 
   it('does NOT overwrite a non-empty LIVE reply text (reply to a person, or a partial quote)', () => {
-    const lookup = () => {
-      throw new Error('lookup must not be called when live text is present')
-    }
     const out = resolveReplyToFromBuffer({
       replyToMessageId: 9,
       replyToText: 'live raw text',
       replyToTextEscaped: 'live escaped text',
       historyEnabled: true,
       replyToTextMax: REPLY_TO_TEXT_MAX,
-      lookup,
+      lookup: () => ({ role: 'user', text: 'STALE BUFFER TEXT' }),
     })
     expect(out.replyToText).toBe('live raw text')
     expect(out.replyToTextEscaped).toBe('live escaped text')
+    // …but the lookup still supplies the ROLE, which has no live-update source.
+    expect(out.replyToRole).toBe('user')
+  })
+
+  it('a missing row does not clobber a live reply text', () => {
+    const out = resolveReplyToFromBuffer({
+      replyToMessageId: 9,
+      replyToText: 'live raw text',
+      replyToTextEscaped: 'live escaped text',
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: () => null,
+    })
+    expect(out.replyToText).toBe('live raw text')
     expect(out.replyToRole).toBeUndefined()
+    expect(out.replyToKind).toBeUndefined()
   })
 
   it('history-disabled guard: never calls lookup, degrades to id-only, does not throw', () => {
@@ -309,11 +321,13 @@ describe('buildReplyForwardContext — rich_message parent (#4598)', () => {
     expect(out.replyToText).toBe('Opus 41%')
   })
 
-  it('THE BUFFER-ONLY KILLER: the live rich body wins and the buffer is never consulted', () => {
-    // A buffer-only implementation resolves this reply from the stored row, so
-    // it returns the STALE text and calls `lookup`. Both assertions fail on
-    // such an implementation — which is the point: this is the one test in the
-    // file that a recording-side-only fix cannot pass.
+  it('THE BUFFER-ONLY KILLER: the live rich body wins over a DIFFERENT stored row', () => {
+    // A buffer-only implementation resolves this reply from the stored row and
+    // returns the STALE text — which is the point: this is the one test in the
+    // file that a recording-side-only fix cannot pass. The lookup DOES run
+    // (role/kind have no live source, see the next test) but it must not be
+    // allowed to win the text, so the stub deliberately returns a different
+    // body from the one on the wire.
     const ctx = makeCtx({ reply_to_message: richParent(9925) })
     const live = buildReplyForwardContext({
       ctx,
@@ -335,8 +349,49 @@ describe('buildReplyForwardContext — rich_message parent (#4598)', () => {
     })
 
     expect(out.replyToText).toBe(RENDERED)
+    expect(out.replyToTextEscaped).toBe(RENDERED)
     expect(out.replyToText).not.toContain('STALE BUFFER TEXT')
-    expect(lookupCalls).toBe(0)
+    // The row was consulted — for role/kind only, never for the body.
+    expect(lookupCalls).toBe(1)
+  })
+
+  it('a live-resolved rich body still carries reply_to_role AND reply_to_kind through the envelope', () => {
+    // The regression the `liveTextEmpty` gate introduced: an operator FULL-
+    // replies (no partial quote) to a live activity card whose row IS in
+    // history.db. The body now resolves live off `rich_message` — and if that
+    // short-circuits the lookup, the envelope loses `reply_to_role="system"`
+    // and `reply_to_kind="activity-summary"` entirely, killing the #4571 kind
+    // lane for exactly the case it was built for.
+    const ctx = makeCtx({ reply_to_message: richParent(9925) })
+    const live = buildReplyForwardContext({
+      ctx,
+      coalescedForwardOrigins: undefined,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+    })
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: live.replyToMessageId,
+      replyToText: live.replyToText,
+      replyToTextEscaped: live.replyToTextEscaped,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      // The row IS recorded — same card, stored body.
+      lookup: () => ({ role: 'system', text: RENDERED, kind: 'activity-summary' }),
+    })
+    expect(resolved.replyToRole).toBe('system')
+    expect(resolved.replyToKind).toBe('activity-summary')
+
+    const msg = buildInboundEnvelope(
+      makeEnvelopeParams({
+        ctx,
+        replyToMessageId: live.replyToMessageId,
+        replyToTextEscaped: resolved.replyToTextEscaped,
+        replyToRole: resolved.replyToRole,
+        replyToKind: resolved.replyToKind,
+      }),
+    )
+    expect(msg.meta?.reply_to_text).toBe(RENDERED)
+    expect(msg.meta?.reply_to_role).toBe('system')
+    expect(msg.meta?.reply_to_kind).toBe('activity-summary')
   })
 
   it('carries the live rich body through to the inbound envelope', () => {

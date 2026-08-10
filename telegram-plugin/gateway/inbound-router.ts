@@ -254,11 +254,17 @@ export interface ReplyToBufferFallbackParams {
  * buffer so it survives a session reset (`resume_mode: handoff`), where the
  * transcript is gone.
  *
- * Since #4598 this is the SECOND line of defence, not the first: a reply to a
- * RICH parent (every card) now carries its body on `reply_to_message
- * .rich_message` and is resolved live in {@link buildReplyForwardContext},
- * so the buffer is consulted only when the live update genuinely carried no
- * readable body.
+ * Since #4598 this is the SECOND line of defence FOR THE TEXT, not the first:
+ * a reply to a RICH parent (every card) now carries its body on
+ * `reply_to_message.rich_message` and is resolved live in
+ * {@link buildReplyForwardContext}, so a live-resolved body is never
+ * overwritten from the buffer.
+ *
+ * The LOOKUP itself, however, still runs on every reply while history is on.
+ * `replyToRole` and `replyToKind` have no live-update source at all, so
+ * skipping the lookup whenever the live text resolved would strip
+ * `reply_to_role` / `reply_to_kind` from precisely the recorded-card replies
+ * the #4571 kind lane was built for.
  *
  * Returns updated `replyToText` (raw, for the SQLite `recordInbound` write —
  * envelope-only would leave the row NULL and starve future handoff briefings),
@@ -282,23 +288,32 @@ export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
   let replyToRole: 'user' | 'assistant' | 'system' | undefined
   let replyToKind: string | undefined
   const liveTextEmpty = replyToTextEscaped == null || replyToTextEscaped.length === 0
-  if (p.historyEnabled && p.replyToMessageId != null && liveTextEmpty) {
+  if (p.historyEnabled && p.replyToMessageId != null) {
     try {
       const recovered = p.lookup(p.replyToMessageId)
-      if (recovered != null && recovered.role === 'system' && recovered.kind) {
-        replyToKind = recovered.kind
-      }
-      if (recovered && recovered.text.length > 0) {
-        replyToText =
-          recovered.text.length > p.replyToTextMax
-            ? recovered.text.slice(0, p.replyToTextMax - 1) + '…'
-            : recovered.text
-        replyToTextEscaped = formatReplyToText(recovered.text, p.replyToTextMax)
+      if (recovered != null) {
+        // Role and kind are produced ONLY here — there is no live-update
+        // source for either. So the lookup runs on EVERY reply, not just the
+        // ones whose text the live update failed to carry: gating it on
+        // `liveTextEmpty` would mean a full reply to a recorded card resolved
+        // its body live (#4598) and silently lost `reply_to_role="system"` +
+        // `reply_to_kind` (#4571) — exactly the case the kind lane exists for,
+        // and the thing #4599 goes to AsyncLocalStorage lengths to record.
+        // Costs one SQLite point-read per reply.
         replyToRole = recovered.role
-      } else if (recovered) {
-        // Row exists (authorship known) but text is empty/redacted — still
-        // surface the role so the model knows whose message it is replying to.
-        replyToRole = recovered.role
+        if (recovered.role === 'system' && recovered.kind) {
+          replyToKind = recovered.kind
+        }
+        // The TEXT is still second line of defence: never overwrite a
+        // non-empty live value (a partial quote, a person's message, or a
+        // rich parent rendered off the wire).
+        if (liveTextEmpty && recovered.text.length > 0) {
+          replyToText =
+            recovered.text.length > p.replyToTextMax
+              ? recovered.text.slice(0, p.replyToTextMax - 1) + '…'
+              : recovered.text
+          replyToTextEscaped = formatReplyToText(recovered.text, p.replyToTextMax)
+        }
       }
     } catch {
       // History disabled mid-run / requireDb throws / row missing — degrade
