@@ -29,12 +29,34 @@
  * card send in the gateway is routed through it, enforced by the
  * `check-bot-api-wrapping` lint guard.
  *
- * The observer reads the Telegram RESPONSE, not the request, which buys three
- * things for free:
+ * The observer reads the Telegram RESPONSE, which buys three things for free:
  *   - the real `message_id` (the only thing a reply can point at),
  *   - the chat and forum-topic the message actually landed in,
- *   - the RENDERED text, which for a card is otherwise unrecoverable (it is
- *     composed from live tool activity and never persisted anywhere).
+ *   - the BODY, as Telegram RENDERED it.
+ *
+ * The #4576 bug was reading only ONE body field off the response. Every card
+ * goes out via Bot API 10.1 `sendRichMessage`, and the `Message` it returns is
+ * a `Message.RichMessageMessage`: the body lives under `rich_message.blocks`
+ * ("Content of the message" — Bot API `RichMessage`), and `text` / `caption`
+ * are absent. `extractSentMessage` read `msg.text ?? msg.caption ?? ''` and so
+ * stored `''` on 100% of the rows on every agent in the fleet — the agent could
+ * see WHICH card was quote-replied to but never WHAT IT SAID. The fix is to
+ * read `rich_message` too, flattened by the same renderer the inbound
+ * rich-message handler uses.
+ *
+ * Preferring the response is not just simpler, it is more FAITHFUL. The
+ * request-side body for the dominant card path has already been through
+ * `richMessage()`'s `guardAccidentalFormatting` (`rich-send.ts`), which is
+ * applied in the CALLER, so `sent_text_capture.ts` is on the wire as
+ * `sent\_text\_capture.ts` and `$12.40` as `\$12.40`. The response's
+ * `rich_message` is the parsed, rendered block tree with those escapes already
+ * resolved — i.e. what the operator actually saw on screen, which is exactly
+ * what a quote-reply antecedent should say.
+ *
+ * The request-side stamp (`shared/sent-text-capture.ts`) is kept, LAST in the
+ * precedence order, as the fallback for the shapes a response cannot supply —
+ * a rich send whose blocks render to nothing (a media-only card), or a future
+ * verb whose response omits the body. It is never preferred over the response.
  *
  * Send vs edit is NOT guessed from the verb (verb tagging is not uniform
  * across call sites and would rot). It falls out of the data: an edit returns
@@ -55,6 +77,9 @@
  * is observing.
  */
 
+import { readSentText } from '../shared/sent-text-capture.js'
+import { extractRichMessageText } from './rich-message-handler.js'
+
 /** The subset of a Telegram `Message` response this observer reads. */
 export interface SentMessageLike {
   message_id?: unknown
@@ -62,6 +87,7 @@ export interface SentMessageLike {
   message_thread_id?: unknown
   text?: unknown
   caption?: unknown
+  rich_message?: unknown
 }
 
 /** The subset of `robustApiCall`'s opts the observer reads. */
@@ -91,6 +117,23 @@ export interface SystemMessageObserverDeps {
   updateText: (args: { chat_id: string; message_id: number; text: string }) => boolean
   /** Injectable clock for the edit throttle. Defaults to `Date.now`. */
   now?: () => number
+  /**
+   * Called when a card row is about to be written with an EMPTY body — i.e.
+   * neither the response nor the request-side stamp yielded anything readable.
+   *
+   * This is the alarm for the #4576 failure mode. That bug was silent for a
+   * whole release precisely because an empty body is indistinguishable from a
+   * healthy row unless someone queries `length(text)`. Fired at most ONCE per
+   * `kind` (else per raw verb) per process so a broken verb is loud in the log
+   * without becoming a per-send stderr storm. Never called with a non-empty
+   * body, and never for a response that is legitimately bodiless
+   * (`isLegitimatelyBodiless`) — an alarm on `sendSticker` is noise a reader
+   * cannot act on, and noise is what teaches people to ignore the alarm.
+   *
+   * Defaults to `defaultEmptyCardTextWarning` (stderr). Pass an explicit
+   * function to redirect it, or `() => {}` to silence it in a test.
+   */
+  onEmptyText?: (info: { chat_id: string; message_id: number; kind: string | null }) => void
 }
 
 export interface SystemMessageObserverOptions {
@@ -133,7 +176,20 @@ export function normalizeSendVerb(verb: string | undefined | null): string | nul
  *
  * The response's own `chat.id` wins over the caller's `chat_id` opt: it is what
  * Telegram actually delivered to, and several call sites pass no `chat_id` at
- * all. Pure.
+ * all.
+ *
+ * `text` is resolved in strict precedence order, most authoritative first:
+ *   1. `rich_message` on the RESPONSE, flattened by the same renderer the
+ *      inbound rich-message handler uses. This is Telegram's own rendering of
+ *      the block tree, so markdown escapes are already resolved — it is what
+ *      the operator saw, and it is the shape every card send returns;
+ *   2. `text` / `caption`, the plain-send and media-caption response shapes;
+ *   3. the body stamped by `installSentTextCapture` from the outbound REQUEST —
+ *      LAST, because on the dominant card path (`richMessage(body)`) it is the
+ *      guard-escaped wire form, not the body as written. It is the fallback for
+ *      responses that carry no renderable body at all.
+ * `''` only when all three are absent, which the observer treats as an alarm
+ * unless the response is legitimately bodiless. Pure.
  */
 export function extractSentMessage(
   result: unknown,
@@ -157,13 +213,83 @@ export function extractSentMessage(
         ? opts.threadId
         : null
   const text =
-    typeof msg.text === 'string' ? msg.text : typeof msg.caption === 'string' ? msg.caption : ''
+    (msg.rich_message != null ? extractRichMessageText(msg.rich_message) : undefined) ??
+    nonEmptyString(msg.text) ??
+    nonEmptyString(msg.caption) ??
+    readSentText(result) ??
+    ''
   return { chatId, messageId: id, threadId, text }
 }
 
+/** `v` when it is a non-empty string, else undefined — so an empty `text` on
+ *  the response falls THROUGH to the next precedence tier instead of pinning
+ *  the result to `''`. */
+function nonEmptyString(v: unknown): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined
+}
+
+/**
+ * Response keys that mark a Telegram `Message` as LEGITIMATELY bodiless: the
+ * send verb that produced it has no user-visible text by construction.
+ *
+ * The empty-body alarm exists to make a recurrence of #4576 loud. It is only
+ * useful if it fires on a REGRESSION, so the verbs that are *supposed* to
+ * store an empty body — `sendSticker`, `sendAnimation`, `sendVoice`,
+ * `forwardMessage` of a media message, an uncaptioned `sendPhoto` — must not
+ * emit an alarm indistinguishable from one.
+ *
+ * Keyed on the RESPONSE SHAPE rather than on `opts.verb` deliberately: verb
+ * tagging is not uniform across call sites (`forwardMessage`,
+ * `gateway.ts`, passes none at all), so a verb allowlist would rot exactly
+ * where this needs to hold. A regressed CARD is a `rich_message` response
+ * whose blocks rendered to nothing — it carries none of these keys and still
+ * alarms. Pure.
+ */
+const BODILESS_MESSAGE_KEYS = [
+  'sticker', 'animation', 'voice', 'video_note', 'dice', 'game', 'poll',
+  'contact', 'location', 'venue', 'story', 'invoice', 'successful_payment',
+  'checklist', 'photo', 'video', 'audio', 'document', 'paid_media',
+] as const
+
+export function isLegitimatelyBodiless(result: unknown): boolean {
+  if (result == null || typeof result !== 'object') return false
+  const r = result as Record<string, unknown>
+  return BODILESS_MESSAGE_KEYS.some((k) => r[k] != null)
+}
+
+/**
+ * The observer's DEFAULT empty-body alarm: one stderr line naming the card kind
+ * whose text capture missed.
+ *
+ * It lives here, and is the default rather than something gateway.ts wires,
+ * for two reasons: gateway.ts is under an anti-inflation line ratchet
+ * (switchroom#2996) so new logic belongs in a module; and a caller that forgets
+ * to pass `onEmptyText` is exactly the caller that would re-ship #4576
+ * silently. Opting OUT is now the explicit act.
+ */
+export function defaultEmptyCardTextWarning(info: {
+  chat_id: string
+  message_id: number
+  kind: string | null
+}): void {
+  try {
+    process.stderr.write(
+      `telegram gateway: card-history text capture MISSED kind=${info.kind ?? '-'} ` +
+        `chat=${info.chat_id} id=${info.message_id} — the response carried no ` +
+        `rich_message/text/caption and no request-side body was stamped, so a ` +
+        `quote-reply to this card will resolve its kind but not its body ` +
+        `(see gateway/system-message-observer.ts extractSentMessage)\n`,
+    )
+  } catch {
+    /* a broken stderr must never break the send */
+  }
+}
+
 /** Per-id bookkeeping. `foreign` = the id belongs to a non-system row (a real
- *  reply or an inbound); never write to it again. */
-type TrackedState = { lane: 'system' | 'foreign'; lastStoredMs: number }
+ *  reply or an inbound); never write to it again. `storedLen` is the length of
+ *  the body currently in the row — 0 means the row is a HOLE, which the edit
+ *  throttle must not preserve. */
+type TrackedState = { lane: 'system' | 'foreign'; lastStoredMs: number; storedLen: number }
 
 /**
  * Build the observer. The returned function is called with the RESOLVED result
@@ -177,6 +303,30 @@ export function makeSystemMessageObserver(
   const editRefreshMs = options?.editRefreshMs ?? DEFAULT_EDIT_REFRESH_MS
   const maxTracked = Math.max(1, options?.maxTracked ?? DEFAULT_MAX_TRACKED)
   const tracked = new Map<string, TrackedState>()
+  /** Kinds already reported through `onEmptyText` — one alarm per kind, per process. */
+  const emptyReported = new Set<string>()
+  const onEmptyText = deps.onEmptyText ?? defaultEmptyCardTextWarning
+
+  function reportEmpty(
+    chatId: string,
+    messageId: number,
+    kind: string | null,
+    verb: string | undefined,
+  ): void {
+    // Bucket on the kind, else the RAW verb, else the untagged catch-all. Using
+    // `kind ?? '<untagged>'` alone collapsed every untagged verb into one
+    // bucket, so the first bodiless untagged send in the process permanently
+    // silenced the alarm for every other untagged verb — including a real
+    // regression.
+    const bucket = kind ?? (typeof verb === 'string' && verb.length > 0 ? verb : '<untagged>')
+    if (emptyReported.has(bucket)) return
+    emptyReported.add(bucket)
+    try {
+      onEmptyText({ chat_id: chatId, message_id: messageId, kind })
+    } catch {
+      /* the alarm must never break the send either */
+    }
+  }
 
   function remember(key: string, state: TrackedState): void {
     tracked.set(key, state)
@@ -200,11 +350,30 @@ export function makeSystemMessageObserver(
       const t = now()
       const seen = tracked.get(key)
 
+      const kind = normalizeSendVerb(opts?.verb)
+      if (sent.text.length === 0 && !isLegitimatelyBodiless(result)) {
+        reportEmpty(sent.chatId, sent.messageId, kind, opts?.verb)
+      }
+
       if (seen != null) {
         if (seen.lane === 'foreign') return
-        if (t - seen.lastStoredMs < editRefreshMs) return
+        // Never blank a body we already stored. A refresh whose text did not
+        // reach us is missing information, not new information — overwriting
+        // with `''` would destroy a usable quote-reply antecedent and hand the
+        // agent the #4576 symptom on a row that was healthy a moment ago.
+        if (sent.text.length === 0) return
+        // The dual rule, and the one whose absence kept the #4576 symptom alive
+        // on a row the alarm had already given up on: ALWAYS fill an EMPTY
+        // stored body. A bodiless first observation (a media-only card, a
+        // response we could not read) inserts `''` and starts the throttle
+        // clock; the first REAL body then lands inside the 20s window and was
+        // dropped, leaving the row permanently unusable as a quote-reply
+        // antecedent. The throttle exists to cap SQLite writes on a card that
+        // is already READABLE, so it only applies once something is stored.
+        if (seen.storedLen > 0 && t - seen.lastStoredMs < editRefreshMs) return
         if (deps.updateText({ chat_id: sent.chatId, message_id: sent.messageId, text: sent.text })) {
           seen.lastStoredMs = t
+          seen.storedLen = sent.text.length
         } else {
           // The row is gone (retention prune / delete) or was promoted to a
           // real `assistant` reply by recordOutbound. Either way this id is no
@@ -218,23 +387,30 @@ export function makeSystemMessageObserver(
         chat_id: sent.chatId,
         thread_id: sent.threadId,
         message_id: sent.messageId,
-        kind: normalizeSendVerb(opts?.verb),
+        kind,
         text: sent.text,
       })
       if (inserted) {
-        remember(key, { lane: 'system', lastStoredMs: t })
+        remember(key, { lane: 'system', lastStoredMs: t, storedLen: sent.text.length })
         return
       }
       // A row already exists for this id and we did not create it in this
       // process: either a real reply / inbound (leave it alone), or a card this
       // gateway posted before a restart. One probing update disambiguates —
-      // `updateText` only ever matches a `system` row.
+      // `updateText` only ever matches a `system` row. The probe WRITES, so an
+      // empty body cannot be used to run it: skip, stay untracked, and let the
+      // next observation of this id (which carries a body) do the probing.
+      if (sent.text.length === 0) return
       const refreshed = deps.updateText({
         chat_id: sent.chatId,
         message_id: sent.messageId,
         text: sent.text,
       })
-      remember(key, { lane: refreshed ? 'system' : 'foreign', lastStoredMs: t })
+      remember(key, {
+        lane: refreshed ? 'system' : 'foreign',
+        lastStoredMs: t,
+        storedLen: refreshed ? sent.text.length : 0,
+      })
     } catch {
       /* observing a send must never break the send */
     }

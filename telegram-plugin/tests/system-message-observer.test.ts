@@ -27,8 +27,17 @@ import {
 
 const CHAT = '5550001'
 
-/** A Telegram `Message` response as the Bot API returns it from sendMessage /
- *  editMessageText. */
+/**
+ * A Telegram `Message` response as the Bot API returns it from a PLAIN
+ * `sendMessage` / `editMessageText`.
+ *
+ * These cases exercise the observer's BOOKKEEPING (one row per card, edit
+ * throttling, foreign-lane demotion), for which the body is incidental. Do NOT
+ * assert card-body behaviour through this fixture: a card never goes out as a
+ * plain message, and hand-building a `text` field is exactly what let #4576
+ * ship an empty body on 100% of the fleet's card rows. Body coverage lives in
+ * `sent-text-capture.test.ts` (real grammy stack) and `card-history-lane.test.ts`.
+ */
 function sentMessage(messageId: number, text: string, threadId?: number) {
   return {
     message_id: messageId,

@@ -49,6 +49,10 @@ import {
   type EnvelopeBuildParams,
 } from '../gateway/inbound-router.js'
 import { makeSystemMessageObserver } from '../gateway/system-message-observer.js'
+import { Bot } from 'grammy'
+import { installRichMarkdownGuard } from '../shared/bot-runtime.js'
+import { installSentTextCapture } from '../shared/sent-text-capture.js'
+import { richMessage } from '../rich-send.js'
 
 const CHAT = '5550001'
 const REPLY_TO_TEXT_MAX = 200
@@ -62,9 +66,56 @@ function makeObserver(now?: () => number) {
   })
 }
 
-/** A Telegram Message response, as `robustApiCall` resolves with. */
+/**
+ * A Telegram Message response, as `robustApiCall` resolves with.
+ *
+ * NOTE (#4576): this PLAIN shape is what `sendMessage` returns. No CARD send
+ * uses it — cards go out via `sendRichMessage`, whose response carries no
+ * `text` at all. Tests that assert the card BODY must use `sentRichCard()`
+ * below; a hand-built `{ text }` fixture cannot fail on the empty-body bug.
+ */
 function sentMessage(messageId: number, text: string) {
   return { message_id: messageId, chat: { id: Number(CHAT) }, text }
+}
+
+/**
+ * The result of a REAL `sendRichMessage` through the production transformer
+ * stack (fmt guard + `installSentTextCapture`), transport stubbed to answer
+ * with the true `Message.RichMessageMessage` shape: `rich_message` blocks, and
+ * NO `text` / `caption`.
+ *
+ * This is the fixture the #4576 defect demanded: every `role='system'` row on
+ * every agent in the fleet had `length(text)=0`, because the lane's tests fed
+ * the observer a response shape production never produces.
+ */
+async function sentRichCard(messageId: number, body: string): Promise<unknown> {
+  const fakeFetch = (async () =>
+    ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        result: {
+          message_id: messageId,
+          date: 0,
+          chat: { id: Number(CHAT), type: 'private' },
+          rich_message: { blocks: [{ type: 'paragraph', text: { text: body } }] },
+        },
+      }),
+    }) as unknown as Response) as unknown as typeof fetch
+
+  const bot = new Bot('123456:TEST_TOKEN', {
+    botInfo: {
+      id: 123456, is_bot: true, first_name: 'Test', username: 'test_bot',
+      can_join_groups: false, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business: false,
+      has_main_web_app: false,
+    },
+    client: { fetch: fakeFetch },
+  })
+  installRichMarkdownGuard(bot)
+  installSentTextCapture(bot)
+  return bot.api.sendRichMessage(Number(CHAT), richMessage(body))
 }
 
 /** The reply-antecedent lookup as gateway.ts binds it (#4571: includeSystem). */
@@ -194,6 +245,75 @@ describe('a quote-reply to the live activity card is UNDERSTOOD, end to end', ()
       lookup: boundLookup,
     })
     expect(resolved.replyToText).toBe('⚙️ Working — 11 tools, editing gateway.ts')
+  })
+})
+
+describe('#4576: the stored card body is NOT empty — real sendRichMessage response', () => {
+  it('a rich card write leaves a non-empty row, and the quote-reply carries the body', async () => {
+    const observe = makeObserver()
+    const CARD_ID = 20395
+    const BODY = '⚙️ Working — reading history.ts, 3 tools'
+
+    // The exact production path: sendRichMessage → transformer stack → observer.
+    // Its response has NO `text` field, which is what made every fleet row empty.
+    const result = await sentRichCard(CARD_ID, BODY)
+    expect((result as { text?: unknown }).text).toBeUndefined()
+    observe(result, { chat_id: CHAT, verb: 'activity-summary.send' })
+
+    const row = lookupMessageRoleAndText(CHAT, CARD_ID, { includeSystem: true })
+    expect(row?.role).toBe('system')
+    expect(row?.kind).toBe('activity-summary')
+    // The assertion the shipped bug fails: a stored body, not ''.
+    expect(row?.text.length).toBeGreaterThan(0)
+    expect(row?.text).toBe(BODY)
+
+    const resolved = resolveReplyToFromBuffer({
+      replyToMessageId: CARD_ID,
+      replyToText: undefined,
+      replyToTextEscaped: undefined,
+      historyEnabled: true,
+      replyToTextMax: REPLY_TO_TEXT_MAX,
+      lookup: boundLookup,
+    })
+    expect(resolved.replyToText).toBe(BODY)
+
+    const msg = buildInboundEnvelope(
+      makeEnvelopeParams({
+        replyToMessageId: CARD_ID,
+        replyToTextEscaped: resolved.replyToTextEscaped,
+        replyToRole: resolved.replyToRole,
+        replyToKind: resolved.replyToKind,
+      }),
+    )
+    expect(msg.meta?.reply_to_text).toBe(BODY)
+  })
+
+  it('holds for every card verb observed on the live fleet, not just the activity card', async () => {
+    const observe = makeObserver()
+    // The `kind` values measured on live agents' history.db after v0.21.0.
+    const verbs: [string, number, string][] = [
+      ['boot-card', 5082, '🟢 **overlord** is up — sonnet, 3 skills'],
+      ['worker-feed', 20404, '🛠 Worker — scoping the card-persistence defect'],
+      ['issues-card', 20405, '**3 open issues** — #4571, #4576, #4580'],
+      ['rollout-status-post', 20402, 'Rolling v0.21.0 — 4/12 agents done'],
+      ['quota-watch.fleet-roll', 20407, 'Quota 61% — resets 09:00'],
+      ['permission_request', 20406, '**Approve** `docker restart switchroom-clerk`?'],
+    ]
+    for (const [verb, id, body] of verbs) {
+      observe(await sentRichCard(id, body), { chat_id: CHAT, verb })
+    }
+    for (const [verb, id, body] of verbs) {
+      const row = lookupMessageRoleAndText(CHAT, id, { includeSystem: true })
+      expect(`${verb}:${row?.text.length ?? 0}`).not.toBe(`${verb}:0`)
+      expect(row?.text).toBe(body)
+    }
+    // No card row anywhere in the buffer is bodiless — the fleet-wide invariant
+    // the shipped release violated on 100% of its rows.
+    const cards = query({ chat_id: CHAT, limit: 100, include_system: true }).filter(
+      (r) => r.role === 'system',
+    )
+    expect(cards).toHaveLength(verbs.length)
+    expect(cards.filter((r) => r.text.length === 0)).toEqual([])
   })
 })
 

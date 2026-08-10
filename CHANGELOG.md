@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **telegram: store the card body a quote-reply needs, not an empty string**
+
 ## v0.21.0 — rollout now gates on the host CLI, plus telegram card persistence, gateway state-dir ownership, and hindsight `/metrics` cardinality fixes
 
 ### Bug fixes
