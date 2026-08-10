@@ -15,11 +15,58 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.5 — a native Telegram reply to a bot-sent card resolves its parent body again
+
 ### Bug fixes
 
-- **gateway: record card sends at the transformer seam, not robustApiCall**
+- **gateway: record card sends at the transformer seam, not
+  `robustApiCall`.** #4571 hooked the card-history observer onto
+  `gateway.ts`'s `robustApiCall` and asserted that was the one chokepoint
+  every outbound send transits. It never was: grammY's `ctx.*` sugar builds
+  the payload and calls `bot.api.*` itself, so `switchroomReply` — the helper
+  every slash-command card answers through (`/usage`, `/model`, `/auth`,
+  `/approvals`, `/start`, `/help`) — sends via `ctx.replyWithRichMessage` and
+  never reaches `robustApiCall`. Measured live, not inferred: the `/usage`
+  card at message id 20938 left no row in `history.db` while the `tg-post`
+  transformer logged its `sendRichMessage` POST, so a quote-reply to any
+  slash-command card resolved to nothing. The observer is now installed as a
+  grammy API transformer, which resolves immediately around the HTTP POST —
+  below every helper, every `ctx.*` shorthand, `lockedBot`, and
+  `bot.api.raw` — so no call shape can opt out. `robustApiCall` publishes
+  `{chat_id, threadId, verb}` through `withTgSendContext` so existing
+  `role='system'` rows keep their `kind`; the send-vs-edit rule and the
+  one-row-per-card guarantee are unchanged, and a Telegram rejection (a
+  resolved `{ok:false}` body) still records nothing. (#4599)
 
-- **gateway: read a rich-message reply parent's body off the live update**
+- **gateway: read a rich-message reply parent's body off the live update.**
+  Every card the gateway posts ships via Bot API 10.1 `sendRichMessage`, so a
+  native reply to one delivers `reply_to_message` with the body under
+  `rich_message.blocks` and `text`/`caption` absent.
+  `buildReplyForwardContext` read only `.text ?? .caption`, so a card
+  antecedent's body was 100% buffer-sourced — and a card the buffer never
+  recorded (posted while the gateway was down, or through a send path that
+  bypassed the recording chokepoint) was permanently unresolvable. The parent
+  body is now flattened with `extractRichMessageText`, the same renderer the
+  inbound handler and the outbound card observer use, yielding `undefined`
+  (never `''`) so an unrenderable block tree still falls through to the
+  buffer. Precedence is unchanged: quote > parent text/caption > parent rich
+  > buffer. The buffer lookup also now runs on every reply while history is
+  on, because `reply_to_role` / `reply_to_kind` have no live-update source
+  and were being lost whenever the live rich body resolved; only the text
+  overwrite stays gated. (#4598)
+
+- **lint: ratchet raw `ctx.reply` sends and close the `sendRichMessage` verb
+  gap.** `check-bot-api-wrapping.sh` is anchored on `\.api\.`, so it can
+  never match `ctx.reply(` or `ctx.replyWithRichMessage(` — the exact bypass
+  above — and `sendRichMessage` / `sendRichMessageDraft` were absent from its
+  verb list entirely. The verbs are added (0 new violations), the pattern's
+  real scope is stated in its header, and a new
+  `check-ctx-send-wrapping.mjs` ratchet holds an exact per-file inventory of
+  the `ctx.reply*` family so the 31st raw send fails CI. The 30 sites present
+  today are recorded as backlog rather than waived: grammY's `Context.reply`
+  auto-injects `message_thread_id`, so each is a `THREAD_NOT_FOUND` candidate
+  with no `retryWithThreadFallback`. Both ratchets now share one counting
+  implementation (`scripts/lib/raw-ctx-scan.mjs`). (#4600)
 
 ## v0.21.4 — gateway SQLite databases open read-only from foreign processes, and an orphaned-fd sweep that catches the damage when they don't
 
