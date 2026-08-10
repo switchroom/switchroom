@@ -15,6 +15,20 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Documentation
+
+- **The #1978 thinking-effort guard no longer restates the claude-CLI pin.**
+  Four comment/doc sites (`docs/configuration.md`, `src/cli/doctor.ts`,
+  `src/config/thinking-effort-risk.ts` ×2) asserted the base image pins
+  claude-code **2.1.219** — already wrong on main, and wrong again after every
+  CLI bump. The load-bearing fact in each is the **2.1.156** fix floor, not the
+  live pin, and the pin already has one source of truth: `ARG
+  CLAUDE_CODE_VERSION` in `docker/Dockerfile.base`, which `switchroom doctor`
+  reads from that file at runtime. Those sites now point at it instead of
+  copying a number (and the drift-prone `:157` line anchor is gone), so this
+  class of staleness stops recurring. Two more of the same in test comments go
+  with them.
+
 ### Bug fixes
 
 - **telegram: store the card body a quote-reply needs, not an empty string**
