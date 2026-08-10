@@ -53,7 +53,17 @@ type SqliteDatabase = {
     get(...params: unknown[]): unknown
   }
   transaction(fn: (...args: unknown[]) => unknown): (...args: unknown[]) => unknown
-  close(): void
+  /**
+   * `throwOnError` is bun:sqlite's "hard close" switch. The default
+   * (`close()`) is a SOFT close that silently defers the real
+   * `sqlite3_close` while any un-finalized `Statement` still references the
+   * connection — and every one of our statements is created per-call by
+   * `requireDb().prepare(...)`, so they are only reclaimed by GC.
+   * `close(true)` instead THROWS (`database is locked`) when the close did
+   * not actually happen, which is the only way to know. Load-bearing for
+   * {@link reopenHistory}; see the long note there.
+   */
+  close(throwOnError?: boolean): void
 }
 type SqliteDatabaseConstructor = new (path: string, opts?: { create?: boolean }) => SqliteDatabase
 
@@ -473,6 +483,84 @@ export function checkpointWal(): boolean {
   } catch {
     return false
   }
+}
+
+/**
+ * Drop the current history handle and re-open the DB from its path.
+ *
+ * THE FAILURE MODE THIS RECOVERS
+ * ------------------------------
+ * A FOREIGN process rw-opens `history.db`, and on exit — as the last
+ * connection — checkpoints and UNLINKS `history.db-wal` / `-shm`. Our
+ * long-lived connection keeps the deleted inodes mapped and keeps writing into
+ * them; every INSERT still reports success and the rows are simply gone at the
+ * next restart. Signature: `/proc/<pid>/fd/N -> …/history.db-wal (deleted)`.
+ * A container restart heals it; this is that restart, in-process. Detection and
+ * the call site live in `gateway/orphaned-db-sweep.ts`.
+ *
+ * WHY `close()` IS NOT ENOUGH (measured, not assumed)
+ * ---------------------------------------------------
+ * bun:sqlite's default `close()` is a SOFT close: it defers the real
+ * `sqlite3_close` while any un-finalized `Statement` still holds the
+ * connection, and every statement here is created per-call by
+ * `requireDb().prepare(...)`, so they are only reclaimed by GC. Measured on
+ * bun 1.3.13: after a plain `db.close()` the process STILL held
+ * `h.db`, `h.db-wal (deleted)` and `h.db-shm (deleted)` in `/proc/self/fd`,
+ * and the immediate re-open then failed with `SQLITE_IOERR_SHORT_READ`
+ * (errno 522) — because SQLite's unix VFS keeps per-inode WAL-index state
+ * alive for as long as any connection to that inode is open. A naive
+ * close-and-reopen therefore turns silent row loss into a TOTAL history
+ * outage. (The same DB file opened from a SEPARATE process reads fine, which
+ * is how we know the on-disk DB is not corrupt and the poisoning is
+ * in-process.)
+ *
+ * So the close has to be a HARD one, in two steps that are both load-bearing:
+ *   1. Force statement finalization. `Bun.gc(true)` is a synchronous full
+ *      collection; without it step 2 always throws.
+ *   2. `close(true)`, which THROWS rather than silently deferring. That throw
+ *      is the determinism: if we cannot actually close, we must NOT null `db`
+ *      and pretend to have recovered — we rethrow so the sweep logs the
+ *      failure and asks for a restart, leaving the (bad but working) old
+ *      handle in place rather than a null one that fails every write.
+ *
+ * NO EXPLICIT SALVAGE CHECKPOINT
+ * ------------------------------
+ * We never issue `wal_checkpoint` through the orphaned handle. Once a new
+ * `-shm` exists on disk, our handle and any other connection are in DISJOINT
+ * locking domains and a checkpoint through the stale mapping can corrupt the
+ * main DB. Losing rows is strictly better than corrupting the ones that landed.
+ * `close()` does still run SQLite's IMPLICIT checkpoint-on-close through the
+ * old fds — a knowingly accepted residual, not an oversight: it is exactly what
+ * a clean container restart already does today, so this path is no more
+ * dangerous than the restart it replaces. (In the isolated case it also
+ * SALVAGES the orphaned rows; we do not rely on that, because the concurrent
+ * case cannot.)
+ *
+ * `initHistory` early-returns when `db != null`, so nulling is load-bearing —
+ * without it the reopen is a silent no-op and the orphaned handle keeps eating
+ * rows. The re-init re-runs the idempotent DDL/migrations, the chmod/ownership
+ * fixups, retention, and `verifyHistoryWritable()` — a free post-reopen proof
+ * that the new handle can actually persist a row.
+ *
+ * Throws if the hard close or the re-init fails. Callers must treat a throw as
+ * "history is still broken, restart required".
+ */
+export function reopenHistory(stateDir: string, retentionDays = 30): void {
+  const current = db
+  if (current != null) {
+    // Reclaim the per-call prepared statements so the hard close below can
+    // actually run. Guarded: `Bun.gc` is Bun-only and this must not be the
+    // thing that throws.
+    const gc = (globalThis as { Bun?: { gc?: (force: boolean) => void } }).Bun?.gc
+    if (typeof gc === 'function') {
+      try { gc(true) } catch { /* best-effort; close(true) below reports the truth */ }
+    }
+    // Deliberately NOT caught: a failed close means the fds are still open and
+    // a re-open would fail with SQLITE_IOERR_SHORT_READ. Propagate.
+    current.close(true)
+  }
+  db = null
+  initHistory(stateDir, retentionDays)
 }
 
 /**

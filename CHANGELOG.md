@@ -27,6 +27,30 @@
   SQLite DB from `bin/`, `src/`, or `telegram-plugin/hooks/` that is not marked
   with a reasoned `allow-rw-db-open:` exemption. (#4595)
 
+- **telegram: the gateway no longer writes hours of chat history into a deleted
+  file and calls it success.** When another process opened `history.db`
+  read-write and exited as the last connection, SQLite checkpointed and
+  UNLINKED the `-wal`/`-shm` sidecars out from under the gateway's long-lived
+  handle. The gateway kept writing into the now-deleted inodes for 3h06m,
+  logging a successful insert every time; the rows were never on disk and
+  vanished at the next restart. Nothing in the write path could notice — the
+  inserts return success, the boot-time writer self-check ran hours earlier,
+  and even a WAL checkpoint through the stale mapping "succeeds". The only
+  evidence is the process's own file-descriptor table, so that is what the
+  gateway now polls: every 5 minutes it walks `/proc/self/fd` for a state-dir
+  `*.db*` handle marked `(deleted)`. On a hit it logs loudly that every row
+  written since the last checkpoint is LOST, then reopens `history.db` in place
+  so new writes are durable again. The reopen does a hard close first — a plain
+  close leaves the dead descriptors open and the reopen then fails — and
+  deliberately issues no salvage checkpoint through the orphaned handle,
+  because a checkpoint through a stale mapping can corrupt the pages that did
+  land. `registry.db` gets the same detection and the same loud log but no
+  in-process reopen: its handle is captured by value into long-lived wiring, so
+  closing it would strand those consumers on a closed database; that lane names
+  the restart instead of pretending to fix itself. Silent history loss is now
+  bounded to 5 minutes rather than however long it takes someone to notice
+  missing messages.
+
 - **rollout: the host-CLI self-heal no longer fails its own verification on a
   perfectly good release binary.** The self-update proof step ran the
   downloaded artifact's `version` SUBCOMMAND, which loads

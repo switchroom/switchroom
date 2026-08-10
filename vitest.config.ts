@@ -176,6 +176,10 @@ export default defineConfig({
       // PR #994.
       "**/telegram-plugin/uat/**",
       "**/telegram-plugin/tests/history.test.ts",
+      // orphaned-db-sweep.test.ts unlinks a live history.db `-wal`/`-shm` out
+      // from under an open bun:sqlite handle and probes the on-disk rows with a
+      // second bun:sqlite connection — excluded here, run via bun.
+      "**/telegram-plugin/tests/orphaned-db-sweep.test.ts",
       // reply-to-buffer-history.test.ts seeds a real history.db via bun:sqlite
       // (recordOutbound → lookup → recordInbound) — excluded here, run via bun.
       "**/telegram-plugin/tests/reply-to-buffer-history.test.ts",
