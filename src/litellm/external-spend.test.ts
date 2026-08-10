@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   addUtcDays,
+  EXTERNAL_SPEND_MAX_PAGES,
   fetchAndSummarizeExternalSpend,
   formatUsd,
   isExternalModel,
-  normalizeSpendLogRows,
+  normalizeDailyActivityRows,
   shortModelLabel,
   summarizeExternalSpend,
   utcDateString,
@@ -76,13 +77,55 @@ describe("summarizeExternalSpend", () => {
   });
 });
 
-describe("normalizeSpendLogRows", () => {
-  it("accepts array or {data}", () => {
-    expect(normalizeSpendLogRows([{ startTime: "x" }])).toHaveLength(1);
-    expect(normalizeSpendLogRows({ data: [{ startTime: "x" }] })).toHaveLength(1);
-    expect(normalizeSpendLogRows({})).toEqual([]);
+describe("normalizeDailyActivityRows", () => {
+  it("collapses breakdown.models[].metrics.spend into a flat day row", () => {
+    const rows = normalizeDailyActivityRows({
+      results: [
+        {
+          date: "2026-07-19",
+          breakdown: {
+            models: {
+              "openrouter/openai/gpt-oss-20b": { metrics: { spend: 1.5 } },
+              "claude-sonnet-5": { metrics: { spend: 9 } },
+            },
+          },
+        },
+      ],
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.startTime).toBe("2026-07-19");
+    expect(rows[0]?.models).toEqual({
+      "openrouter/openai/gpt-oss-20b": 1.5,
+      "claude-sonnet-5": 9,
+    });
+  });
+
+  it("tolerates missing/partial fields without throwing", () => {
+    expect(normalizeDailyActivityRows({})).toEqual([]);
+    expect(normalizeDailyActivityRows(null)).toEqual([]);
+    // day with no breakdown → empty models map, not a crash.
+    const rows = normalizeDailyActivityRows({ results: [{ date: "2026-07-19" }] });
+    expect(rows[0]?.models).toEqual({});
   });
 });
+
+// Builds a healthy `/user/daily/activity` page envelope for the fetch tests.
+function dailyActivityPage(
+  results: Array<{ date: string; models: Record<string, number> }>,
+  hasMore = false,
+): unknown {
+  return {
+    results: results.map((r) => ({
+      date: r.date,
+      breakdown: {
+        models: Object.fromEntries(
+          Object.entries(r.models).map(([name, spend]) => [name, { metrics: { spend } }]),
+        ),
+      },
+    })),
+    metadata: { page: 1, total_pages: hasMore ? 2 : 1, has_more: hasMore },
+  };
+}
 
 describe("fetchAndSummarizeExternalSpend", () => {
   it("returns null on 401", async () => {
@@ -95,16 +138,21 @@ describe("fetchAndSummarizeExternalSpend", () => {
     expect(s).toBeNull();
   });
 
-  it("summarizes OK body", async () => {
-    const body = [
+  // OUTCOME GUARD: locks the migration off the deprecated O(rows) endpoint.
+  // The old code hit `/spend/logs` and read a FLAT `models[name]` number, so
+  // it would (a) call the wrong URL and (b) parse this nested
+  // `breakdown.models[].metrics.spend` body as zeros. Both assertions fail
+  // on the pre-migration implementation.
+  it("reads the pre-aggregated /user/daily/activity endpoint, not /spend/logs", async () => {
+    const body = dailyActivityPage([
       {
-        startTime: "2026-07-19",
+        date: "2026-07-19",
         models: { "openrouter/openai/gpt-oss-20b": 1.5, "claude-sonnet-5": 9 },
       },
-    ];
+    ]);
+    let calledUrl = "";
     const fetchImpl = vi.fn(async (url: string) => {
-      expect(String(url)).toContain("start_date=2026-07-13");
-      expect(String(url)).toContain("end_date=2026-07-20");
+      calledUrl = String(url);
       return new Response(JSON.stringify(body), { status: 200 });
     });
     const s = await fetchAndSummarizeExternalSpend({
@@ -113,7 +161,90 @@ describe("fetchAndSummarizeExternalSpend", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
       now: NOW,
     });
+    expect(calledUrl).toContain("/user/daily/activity");
+    expect(calledUrl).not.toContain("/spend/logs");
+    expect(calledUrl).toContain("start_date=2026-07-13");
+    expect(calledUrl).toContain("end_date=2026-07-19");
+    expect(calledUrl).toContain("timezone=0");
+    // Nested spend correctly extracted; Claude passthrough excluded.
     expect(s?.day24hUsd).toBeCloseTo(1.5, 5);
     expect(s?.top[0]?.label).toBe("gpt-oss-20b");
+  });
+
+  // OUTCOME GUARD: pagination. The daily table paginates over raw rows, so a
+  // large fleet spills a UTC day across pages; the fetch must walk `has_more`
+  // and MERGE every page's per-model spend. The single-request old path could
+  // never satisfy this.
+  it("walks pagination and merges per-model spend across pages", async () => {
+    const page1 = dailyActivityPage(
+      [{ date: "2026-07-19", models: { "openrouter/openai/gpt-oss-20b": 4 } }],
+      true,
+    );
+    const page2 = dailyActivityPage(
+      [
+        { date: "2026-07-19", models: { "openrouter/openai/gpt-oss-20b": 2 } },
+        { date: "2026-07-18", models: { "sr-grok-4.5": 3 } },
+      ],
+      false,
+    );
+    const pages = [page1, page2];
+    const seenPages: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      const u = String(url);
+      seenPages.push(u.match(/page=(\d+)/)?.[1] ?? "?");
+      const idx = u.includes("page=2") ? 1 : 0;
+      return new Response(JSON.stringify(pages[idx]), { status: 200 });
+    });
+    const s = await fetchAndSummarizeExternalSpend({
+      adminKey: "sk-x",
+      baseUrl: "http://litellm.test",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      now: NOW,
+    });
+    expect(seenPages).toEqual(["1", "2"]);
+    // gpt-oss split 4 + 2 across pages → 6 today; grok 3 in-window (7d).
+    expect(s?.day24hUsd).toBeCloseTo(6, 5);
+    expect(s?.day7dUsd).toBeCloseTo(9, 5);
+    expect(s?.top[0]?.label).toBe("gpt-oss-20b");
+    expect(s?.top[0]?.usd).toBeCloseTo(6, 5);
+  });
+
+  // OUTCOME GUARD: a `has_more` that never clears must leave an operator
+  // breadcrumb. Every page here reports `has_more: true`, so the loop runs to
+  // the pagination cap; the fetch must warn (so the under-report is visible)
+  // AND still summarize the pages it collected rather than returning null.
+  it("warns and summarizes what it collected when the pagination cap is hit", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const fetchImpl = vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify(
+              dailyActivityPage(
+                [{ date: "2026-07-19", models: { "openrouter/openai/gpt-oss-20b": 1 } }],
+                true, // never clears has_more
+              ),
+            ),
+            { status: 200 },
+          ),
+      );
+      const s = await fetchAndSummarizeExternalSpend({
+        adminKey: "sk-x",
+        baseUrl: "http://litellm.test",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        now: NOW,
+      });
+      // Stopped at the cap, not looping forever.
+      expect(fetchImpl).toHaveBeenCalledTimes(EXTERNAL_SPEND_MAX_PAGES);
+      // Breadcrumb emitted for the truncated total.
+      expect(
+        warn.mock.calls.some((c) => String(c[0]).includes("pagination cap")),
+      ).toBe(true);
+      // Still summarizes the collected rows (1 usd/page × cap) rather than null.
+      expect(s).not.toBeNull();
+      expect(s?.day24hUsd).toBeCloseTo(EXTERNAL_SPEND_MAX_PAGES, 5);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

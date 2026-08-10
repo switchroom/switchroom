@@ -2,8 +2,16 @@
  * External (non-Claude / OpenRouter cash) spend — pure helpers shared by
  * the auth-broker publisher and the Telegram `/usage` card renderer.
  *
- * Windows are **UTC calendar days** on LiteLLM `/spend/logs` `startTime`
- * (the card still labels the today window "24h" per operator layout B).
+ * Windows are **UTC calendar days**. Spend is read from LiteLLM's
+ * pre-aggregated daily table via `/user/daily/activity` (one row per
+ * user×date×model — O(days), a few hundred rows), NOT the deprecated
+ * unpaginated `/spend/logs?summarize=true` handler. That handler ran a
+ * Prisma `group_by([api_key,user,model,startTime])` over the raw
+ * `LiteLLM_SpendLogs` table: on ~1M rows it materialises ~967k groups,
+ * blows past any sane fetch timeout, and each aborted-but-computed result
+ * is a driver of the proxy's RSS creep. `/user/daily/activity` returns the
+ * same per-model day totals the `/usage` External row needs in O(days).
+ * The card still labels the today window "24h" per operator layout B.
  *
  * Security: never put the LiteLLM master key in agent containers. The
  * auth-broker fetches with the master key and serves only a sanitized
@@ -21,12 +29,39 @@ export interface ExternalSpendSummary {
   top: ExternalSpendTopModel[];
 }
 
-/** One daily row from LiteLLM summarized `/spend/logs`. */
+/**
+ * One normalized per-day spend row consumed by `summarizeExternalSpend`.
+ * `startTime` is a UTC calendar-day string (`YYYY-MM-DD`); `models` is a
+ * flat `{ [model]: usd }` map. Both the daily-activity path and the legacy
+ * `/spend/logs` shape collapse to this internal row.
+ */
 export interface LiteLLMDaySpendRow {
   startTime?: string;
   /** Day total including Claude — never used as External. */
   spend?: number;
   models?: Record<string, number | string>;
+}
+
+/**
+ * `results[].breakdown.models[<model>]` entry from `/user/daily/activity`
+ * — the pre-aggregated daily table. Only `metrics.spend` is read.
+ */
+export interface DailyActivityModelEntry {
+  metrics?: { spend?: number | string };
+}
+
+/** One `results[]` day bucket from `/user/daily/activity`. */
+export interface DailyActivityDay {
+  date?: string;
+  breakdown?: {
+    models?: Record<string, DailyActivityModelEntry | undefined>;
+  };
+}
+
+/** Paginated envelope returned by `/user/daily/activity`. */
+export interface DailyActivityResponse {
+  results?: DailyActivityDay[];
+  metadata?: { page?: number; total_pages?: number; has_more?: boolean };
 }
 
 export const EXTERNAL_SPEND_TOP_N = 3;
@@ -35,8 +70,20 @@ export const DEFAULT_LITELLM_BASE = "http://127.0.0.1:4010";
 /** Broker cooldown between live refreshes (also agent soft-cache). */
 export const EXTERNAL_SPEND_CACHE_TTL_MS = 90_000;
 
-/** Live LiteLLM fetch timeout. */
+/** Live LiteLLM fetch timeout (per page request). */
 export const EXTERNAL_SPEND_FETCH_TIMEOUT_MS = 5_000;
+
+/** `/user/daily/activity` max `page_size` (LiteLLM caps at 1000). */
+export const EXTERNAL_SPEND_PAGE_SIZE = 1000;
+
+/**
+ * Safety bound on daily-activity pagination. The window is 7 UTC days of
+ * a pre-aggregated table (rows ≈ days×users×models), so one max-size page
+ * covers any realistic fleet; this cap only guards a misbehaving
+ * `has_more` that never clears. On the cap we summarize what we have
+ * rather than looping forever.
+ */
+export const EXTERNAL_SPEND_MAX_PAGES = 50;
 
 /**
  * Filename under the auth-broker state dir for the master key material
@@ -166,14 +213,32 @@ export function summarizeExternalSpend(
   return { day24hUsd, day7dUsd, top };
 }
 
-/** Normalize `/spend/logs` JSON body into day rows. */
-export function normalizeSpendLogRows(body: unknown): LiteLLMDaySpendRow[] {
-  if (Array.isArray(body)) return body as LiteLLMDaySpendRow[];
-  if (body && typeof body === "object") {
-    const data = (body as { data?: unknown }).data;
-    if (Array.isArray(data)) return data as LiteLLMDaySpendRow[];
+/**
+ * Normalize one `/user/daily/activity` page body into internal day rows.
+ * Collapses each day's `breakdown.models[<model>].metrics.spend` into the
+ * flat `{ [model]: usd }` map `summarizeExternalSpend` consumes. Tolerant
+ * of missing/partial fields — an unparseable body yields `[]`, which
+ * summarizes to a zeroed row set rather than throwing.
+ */
+export function normalizeDailyActivityRows(body: unknown): LiteLLMDaySpendRow[] {
+  const results =
+    body && typeof body === "object" && Array.isArray((body as DailyActivityResponse).results)
+      ? (body as DailyActivityResponse).results!
+      : [];
+  const rows: LiteLLMDaySpendRow[] = [];
+  for (const day of results) {
+    if (!day || typeof day !== "object") continue;
+    const models: Record<string, number> = {};
+    const breakdown = day.breakdown?.models ?? {};
+    for (const [name, entry] of Object.entries(breakdown)) {
+      const raw = entry?.metrics?.spend;
+      const n = typeof raw === "number" ? raw : Number(raw);
+      if (!Number.isFinite(n)) continue;
+      models[name] = (models[name] ?? 0) + n;
+    }
+    rows.push({ startTime: day.date, models });
   }
-  return [];
+  return rows;
 }
 
 export function resolveLitellmBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
@@ -183,7 +248,17 @@ export function resolveLitellmBaseUrl(env: NodeJS.ProcessEnv = process.env): str
 
 /**
  * Fetch + summarize external spend from LiteLLM. Pure-ish: inject fetch/key.
- * Returns null on transport/auth/timeout failure.
+ * Returns null on transport/auth/parse failure (the `/usage` External row
+ * then nulls out cleanly — the broker never crashes on this path).
+ *
+ * Reads the pre-aggregated daily table via `/user/daily/activity`
+ * (O(days), a few hundred rows), paginating at the LiteLLM max page size
+ * until `metadata.has_more` clears. This replaces the deprecated
+ * unpaginated `/spend/logs?summarize=true` handler, whose per-row Prisma
+ * `group_by` was uncomputable within any sane timeout on a large
+ * `LiteLLM_SpendLogs` table (~1M rows → ~967k groups) and left the row
+ * permanently blank while churning proxy RSS. `timezone=0` pins the day
+ * buckets to UTC to match `summarizeExternalSpend`'s window clamp.
  */
 export async function fetchAndSummarizeExternalSpend(opts: {
   adminKey: string;
@@ -196,53 +271,83 @@ export async function fetchAndSummarizeExternalSpend(opts: {
   const base = (opts.baseUrl ?? DEFAULT_LITELLM_BASE).replace(/\/+$/, "");
   const today = utcDateString(now);
   const start = addUtcDays(today, -6);
-  const end = addUtcDays(today, 1);
-  const url =
-    `${base}/spend/logs?start_date=${encodeURIComponent(start)}` +
-    `&end_date=${encodeURIComponent(end)}`;
 
   const fetchImpl = opts.fetchImpl ?? fetch;
   const timeoutMs = opts.timeoutMs ?? EXTERNAL_SPEND_FETCH_TIMEOUT_MS;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const res = await fetchImpl(url, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${opts.adminKey}`,
-        Accept: "application/json",
-      },
-      signal: ac.signal,
-    });
-    if (!res.ok) {
-      // Operator-observable signal (broker log): a 401 here is the classic
-      // stale/wrong master key; a 5xx is proxy trouble. Without this the
-      // /usage External row just silently vanishes with no breadcrumb.
-      console.warn(
-        `external-spend: LiteLLM /spend/logs returned HTTP ${res.status} — ` +
-          `External /usage row will be blank (check master key / proxy)`,
-      );
-      return null;
-    }
-    let body: unknown;
+
+  const rows: LiteLLMDaySpendRow[] = [];
+  for (let page = 1; page <= EXTERNAL_SPEND_MAX_PAGES; page++) {
+    // `/user/daily/activity` end_date is inclusive; summarizeExternalSpend
+    // re-clamps to the UTC today/7d window so a wider fetch stays exact.
+    // Fleet-scoping invariant: called with the LiteLLM MASTER key, this
+    // endpoint aggregates ALL users' daily spend, not just the admin user's —
+    // the correctness of the External total depends on that. Parity-verified
+    // against the old `/spend/logs` path (82.95 new vs 83.53 old over 7d).
+    const url =
+      `${base}/user/daily/activity?start_date=${encodeURIComponent(start)}` +
+      `&end_date=${encodeURIComponent(today)}` +
+      `&page=${page}&page_size=${EXTERNAL_SPEND_PAGE_SIZE}&timezone=0`;
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
-      body = await res.json();
+      const res = await fetchImpl(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${opts.adminKey}`,
+          Accept: "application/json",
+        },
+        signal: ac.signal,
+      });
+      if (!res.ok) {
+        // Operator-observable signal (broker log): a 401 here is the classic
+        // stale/wrong master key; a 5xx is proxy trouble. Without this the
+        // /usage External row just silently vanishes with no breadcrumb.
+        console.warn(
+          `external-spend: LiteLLM /user/daily/activity returned HTTP ${res.status} — ` +
+            `External /usage row will be blank (check master key / proxy)`,
+        );
+        return null;
+      }
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch (err) {
+        console.warn(
+          `external-spend: failed to parse /user/daily/activity JSON: ${(err as Error)?.message ?? err}`,
+        );
+        return null;
+      }
+      rows.push(...normalizeDailyActivityRows(body));
+      const meta =
+        body && typeof body === "object"
+          ? (body as DailyActivityResponse).metadata
+          : undefined;
+      if (!meta?.has_more) break;
+      if (page === EXTERNAL_SPEND_MAX_PAGES) {
+        // Cap hit with `has_more` still set: we stop paginating and summarize
+        // only the pages collected, so the External /usage total is a lower
+        // bound, not the true figure. Every other early exit in this loop
+        // leaves a breadcrumb; without this one an operator sees a
+        // plausible-but-low number with no signal it was truncated.
+        console.warn(
+          `external-spend: LiteLLM /user/daily/activity still reports has_more at ` +
+            `page ${EXTERNAL_SPEND_MAX_PAGES} (pagination cap) — External /usage ` +
+            `total is under-reported (collected ${rows.length} day rows)`,
+        );
+      }
     } catch (err) {
+      // Transport failure (unreachable / DNS / timeout-abort). This is the
+      // exact branch the bridge-vs-loopback outage hit: the broker could not
+      // reach a loopback-published proxy and the error was swallowed to null.
       console.warn(
-        `external-spend: failed to parse /spend/logs JSON: ${(err as Error)?.message ?? err}`,
+        `external-spend: LiteLLM /user/daily/activity fetch failed: ${(err as Error)?.message ?? err}`,
       );
       return null;
+    } finally {
+      clearTimeout(timer);
     }
-    return summarizeExternalSpend(normalizeSpendLogRows(body), now);
-  } catch (err) {
-    // Transport failure (unreachable / DNS / timeout-abort). This is the
-    // exact branch the bridge-vs-loopback outage hit: the broker could not
-    // reach a loopback-published proxy and the error was swallowed to null.
-    console.warn(
-      `external-spend: LiteLLM /spend/logs fetch failed: ${(err as Error)?.message ?? err}`,
-    );
-    return null;
-  } finally {
-    clearTimeout(timer);
   }
+
+  return summarizeExternalSpend(rows, now);
 }

@@ -15,6 +15,17 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Fixes
+
+- **litellm: read external spend from a pre-aggregated daily table.** The
+  auth-broker fetched the `/usage` External row via the deprecated,
+  unpaginated `GET /spend/logs?summarize=true`, which in litellm v1.95 runs
+  an O(rows) Prisma `group_by` over `LiteLLM_SpendLogs` — uncomputable in the
+  broker's 5s budget, so the row stayed permanently blank and the aborted
+  queries drove the proxy's RSS creep. Switched to `GET /user/daily/activity`
+  (pre-aggregated `LiteLLM_DailyUserSpend`, O(days)); the public
+  `/usage` shape is unchanged. (#4591)
+
 ## v0.21.2 — Claude Code CLI 2.1.226, and an explicit refusal of its new cross-session inbox
 
 ### Documentation
