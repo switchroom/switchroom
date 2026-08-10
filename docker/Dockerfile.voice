@@ -89,7 +89,7 @@ RUN apt-get update \
 # CUDAExecutionProvider (server.py builds the InferenceSession with an
 # explicit CUDA->CPU provider list + graceful fallback). onnxruntime-gpu 1.20.x
 # is built for CUDA 12.x + cuDNN 9, matching this image's
-# nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 base — no extra CUDA libs are
+# nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 base — no extra CUDA libs are
 # needed (STT/CTranslate2 already proves CUDA 12 + cuDNN 9 runtime are present).
 # NB: keep the base on CUDA 12 / cuDNN 9 — onnxruntime-gpu (and ctranslate2 for
 # STT) have no CUDA-13 wheels, so a CUDA-13 base would silently drop TTS+STT to
