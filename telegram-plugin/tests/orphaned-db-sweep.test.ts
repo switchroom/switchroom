@@ -700,14 +700,22 @@ describe('startOrphanedDbSweep', () => {
     // Multiple ticks: proves the interval repeats, not just fires once.
     expect(lines.length).toBeGreaterThan(1)
 
-    stop()
-    // A tick is async, so one may be in flight when stop() lands. Let it settle
-    // before snapshotting — the property under test is "no NEW ticks start",
-    // not "no line is ever appended after the stop() call returns".
-    await sleep(60)
     const atStop = lines.length
-    await sleep(250)
-    // A stop() that did not clear the interval would add ~50 more lines here.
-    expect(lines.length).toBe(atStop)
+    stop()
+    // The property under test is "no NEW ticks start", not "no line is ever
+    // appended after stop() returns": the tick body is async, so one tick can
+    // already be in flight when stop() lands and will still emit its line.
+    //
+    // The sweep's own `running` guard means AT MOST ONE can be in flight, so
+    // the tolerance is exactly one line — assert that, rather than trying to
+    // out-wait the in-flight tick and then demanding exact equality. Every
+    // fixed settle window is a guess a loaded runner beats: 60ms flaked two of
+    // three consecutive merge-queue passes and a 40ms quiescence poll flaked
+    // again on the very next one (#4601), because a tick that has not yet
+    // resolved looks identical to quiescence.
+    await sleep(400)
+    // Not a weakening: an uncleared 5ms interval adds dozens of lines here, so
+    // this still fails hard on a stop() that does not clear the timer.
+    expect(lines.length - atStop).toBeLessThanOrEqual(1)
   })
 })
