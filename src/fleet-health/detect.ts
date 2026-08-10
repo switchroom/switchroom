@@ -97,7 +97,14 @@ export type TurnSignal =
 export type GatewaySignal =
   | "duplicate-delivery-represent"
   | "represent-escalation"
-  | "reply-delivery-failure";
+  | "reply-delivery-failure"
+  // The gateway's orphaned-DB-fd sweep found a `*.db` handle pointing at a
+  // DELETED inode under the state dir. Every row written to that handle since
+  // the last checkpoint is gone, and the write path reported success for all of
+  // them. `history.db` self-heals in process; `registry.db` and anything else
+  // needs a restart — either way a human has to be told, which is what this
+  // signal is for. See `telegram-plugin/gateway/orphaned-db-sweep.ts`.
+  | "orphaned-db-handle";
 
 /** Signals from the standalone config/state sensors — NOT derived from an
  *  agent's turns.jsonl or gateway log. Each sensor reads a hard artifact
@@ -183,6 +190,12 @@ export const GATEWAY_SIGNATURES: Record<GatewaySignal, RegExp> = {
   "duplicate-delivery-represent": /represent duplicate-send/,
   "represent-escalation": /obligation escalation/,
   "reply-delivery-failure": /tg-post method=sendRichMessage[^\n]*status=err(?![a-z])/,
+  // Anchored on the sweep's DETECTED line, which is emitted once per tick per
+  // incident for EVERY lane (history, registry, unowned) — so the registry
+  // alarm, which has no in-process recovery at all, still reaches a human.
+  // Deliberately not anchored on the per-lane lines: those change wording as
+  // lanes are added, and one signal per incident is the right escalation rate.
+  "orphaned-db-handle": /orphaned-db-sweep DETECTED \d+ deleted-inode DB handle/,
 };
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
@@ -394,6 +407,7 @@ export function detectGatewayFindings(
     "duplicate-delivery-represent": 0,
     "represent-escalation": 0,
     "reply-delivery-failure": 0,
+    "orphaned-db-handle": 0,
   };
   const lines = logText.split("\n");
   for (const [name, re] of Object.entries(GATEWAY_SIGNATURES) as [

@@ -27,6 +27,43 @@
   SQLite DB from `bin/`, `src/`, or `telegram-plugin/hooks/` that is not marked
   with a reasoned `allow-rw-db-open:` exemption. (#4595)
 
+- **telegram: the gateway no longer writes hours of chat history into a deleted
+  file and calls it success.** When another process opened `history.db`
+  read-write and exited as the last connection, SQLite checkpointed and
+  UNLINKED the `-wal`/`-shm` sidecars out from under the gateway's long-lived
+  handle. The gateway kept writing into the now-deleted inodes for 3h06m,
+  logging a successful insert every time; the rows were never on disk and
+  vanished at the next restart. Nothing in the write path could notice — the
+  inserts return success, the boot-time writer self-check ran hours earlier,
+  and even a WAL checkpoint through the stale mapping "succeeds". The only
+  evidence is the process's own file-descriptor table, so that is what the
+  gateway now polls: every 5 minutes it walks `/proc/self/fd` for a state-dir
+  `*.db*` handle marked `(deleted)`. On a hit it logs loudly that every row
+  written since the last checkpoint is LOST, then reopens `history.db` in place
+  so new writes are durable again. The reopen does a hard close first: bun's
+  plain `close()` is a soft close that leaves the dead descriptors open while
+  prepared statements are outstanding, and the reopened connection then LOOKS
+  healthy (the open and the WAL pragma both succeed) and throws on the first
+  WRITE. Every history statement now goes through a module-level cache that the
+  close explicitly finalizes, so the release is deterministic rather than
+  dependent on when the GC happens to run. The reopen also
+  deliberately issues no salvage checkpoint through the orphaned handle,
+  because a checkpoint through a stale mapping can corrupt the pages that did
+  land. `registry.db` gets the same detection and the same loud log but no
+  in-process reopen: its handle is captured by value into long-lived wiring, so
+  closing it would strand those consumers on a closed database; that lane names
+  the restart instead of pretending to fix itself, as does any other state-dir
+  `*.db` no lane owns. The success line is gated on a post-reopen writer
+  self-check, so "writes are durable again" is a proven claim and not an
+  optimistic one; a reopen that fails says so and asks for a restart, and
+  because that failure releases the very descriptors that would have triggered
+  the next retry, the sweep also re-alarms and retries off a sticky flag on
+  every tick with no fd evidence left to go on. Fleet-health's L0 detector
+  matches the alarm as `orphaned-db-handle`. This does not recover lost rows:
+  rows already written into the orphaned WAL remain unrecoverable. What changes
+  is that the condition is now DETECTED within 5 minutes and stops accruing,
+  rather than running silently until someone notices missing messages.
+
 - **rollout: the host-CLI self-heal no longer fails its own verification on a
   perfectly good release binary.** The self-update proof step ran the
   downloaded artifact's `version` SUBCOMMAND, which loads

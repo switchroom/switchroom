@@ -45,15 +45,34 @@ import { redact } from './secret-detect/redact.js'
  * The only Database APIs we touch are constructor(path, opts), exec,
  * prepare, transaction, close — all stable across bun:sqlite versions.
  */
+type SqliteStatement = {
+  run(...params: unknown[]): unknown
+  all(...params: unknown[]): unknown[]
+  get(...params: unknown[]): unknown
+  /**
+   * Release the underlying `sqlite3_stmt` NOW. This is the deterministic
+   * counterpart to waiting for GC: an un-finalized statement is exactly what
+   * makes bun:sqlite's close a deferred no-op, so {@link reopenHistory}
+   * finalizes every cached statement before closing. Optional in the type
+   * because a test double need not implement it.
+   */
+  finalize?(): void
+}
 type SqliteDatabase = {
   exec(sql: string): void
-  prepare(sql: string): {
-    run(...params: unknown[]): unknown
-    all(...params: unknown[]): unknown[]
-    get(...params: unknown[]): unknown
-  }
+  prepare(sql: string): SqliteStatement
   transaction(fn: (...args: unknown[]) => unknown): (...args: unknown[]) => unknown
-  close(): void
+  /**
+   * `throwOnError` is bun:sqlite's "hard close" switch. The default
+   * (`close()`) is a SOFT close that silently defers the real
+   * `sqlite3_close` while any un-finalized `Statement` still references the
+   * connection. `close(true)` instead THROWS (`database is locked`) when the
+   * close did not actually happen, which is the only way to know. Every
+   * statement this module creates goes through {@link prep} and is explicitly
+   * finalized before the close, so the close is deterministic rather than
+   * GC-dependent. Load-bearing for {@link reopenHistory}; see the note there.
+   */
+  close(throwOnError?: boolean): void
 }
 type SqliteDatabaseConstructor = new (path: string, opts?: { create?: boolean }) => SqliteDatabase
 
@@ -173,6 +192,79 @@ const MAX_LIMIT = 50
 
 let db: SqliteDatabase | null = null
 let dbPath: string | null = null
+
+/**
+ * Module-level prepared-statement cache — the DETERMINISTIC half of
+ * {@link reopenHistory}.
+ *
+ * WHY THIS EXISTS (it is not a performance cache, though it is also that)
+ * ----------------------------------------------------------------------
+ * bun:sqlite's `close()` is a soft close and `close(true)` throws for as long
+ * as ANY `Statement` created from the connection is still un-finalized. Every
+ * statement in this module used to be created per-call (`requireDb().prepare(…)`)
+ * and dropped on the floor, so nothing in the process held a reference we could
+ * finalize — the only way to release them was to wait for the JS GC to collect
+ * the wrappers. `Bun.gc(true)` was therefore load-bearing AND non-deterministic:
+ * measured on bun 1.3.13, a single `gc(true)` + `close(true)` pair failed 13/20
+ * times against an empty heap and 30/30 with an arithmetic loop between the last
+ * write and the gc. A recovery path that works "most of the time" is not a
+ * recovery path.
+ *
+ * With every statement routed through {@link prep}, the module OWNS a reference
+ * to each live statement and can call `.finalize()` on it explicitly. The close
+ * then succeeds because nothing is outstanding — no collection required, no
+ * heap-shape dependence.
+ *
+ * Keyed by SQL text. The set of distinct SQL strings this module can produce is
+ * small and structural (a handful of `WHERE` shapes built from booleans), not
+ * user-derived — parameters are always bound, never interpolated. {@link MAX_CACHED_STATEMENTS}
+ * is defence-in-depth against a future caller that builds SQL in a loop.
+ */
+const stmtCache = new Map<string, SqliteStatement>()
+
+/** Cap on live cached statements; oldest is finalized and evicted past this. */
+const MAX_CACHED_STATEMENTS = 128
+
+/**
+ * Prepare (or reuse) a statement against the current connection.
+ *
+ * Every SQL string in this module goes through here. Do NOT call
+ * `db.prepare(...)` directly: a statement outside the cache is one
+ * {@link reopenHistory} cannot finalize, which silently re-introduces the
+ * GC dependence this cache exists to remove.
+ */
+function prep(sql: string): SqliteStatement {
+  const cached = stmtCache.get(sql)
+  if (cached != null) return cached
+  const stmt = requireDb().prepare(sql)
+  if (stmtCache.size >= MAX_CACHED_STATEMENTS) {
+    // Map iteration is insertion-ordered, so this evicts the oldest entry.
+    const oldestKey = stmtCache.keys().next().value
+    if (oldestKey != null) {
+      const oldest = stmtCache.get(oldestKey)
+      stmtCache.delete(oldestKey)
+      try { oldest?.finalize?.() } catch { /* already gone; nothing to release */ }
+    }
+  }
+  stmtCache.set(sql, stmt)
+  return stmt
+}
+
+/**
+ * Finalize and forget every cached statement.
+ *
+ * MUST run before any `close()` of the connection they were prepared against,
+ * and MUST leave the cache empty: a statement prepared against the OLD
+ * connection would otherwise be handed out after the reopen and operate on a
+ * dead handle. Individual `finalize()` failures are swallowed — the close is
+ * the authority on whether the release actually happened.
+ */
+function finalizeCachedStatements(): void {
+  for (const stmt of stmtCache.values()) {
+    try { stmt.finalize?.() } catch { /* best-effort; close(true) reports the truth */ }
+  }
+  stmtCache.clear()
+}
 
 /**
  * Loud, unconditional failure logging for the history writer.
@@ -300,9 +392,9 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
   // (`thread_id IS NULL` / `thread_id = ?`) is unchanged.
   const LOGICAL_KEY_INDEX = 'idx_messages_logical_key'
   const logicalKeyIndexExists =
-    db
-      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`)
-      .get(LOGICAL_KEY_INDEX) != null
+    prep(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`).get(
+      LOGICAL_KEY_INDEX,
+    ) != null
   if (!logicalKeyIndexExists) {
     // De-dupe rows an earlier (pre-fix) build already appended, keeping the
     // NEWEST row per logical key (highest ts, then highest rowid = the last
@@ -346,7 +438,7 @@ export function initHistory(stateDir: string, retentionDays = 30): void {
 
   if (retentionDays > 0) {
     const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400
-    db.prepare('DELETE FROM messages WHERE ts < ?').run(cutoff)
+    prep('DELETE FROM messages WHERE ts < ?').run(cutoff)
   }
 
   // Boot-time writer self-check (2026-07-16 incident hardening). "history
@@ -391,15 +483,15 @@ export function verifyHistoryWritable(): { ok: boolean; error?: string } {
   const sentinelId = Date.now()
   try {
     // Clear any stale sentinel from a prior crashed self-check first.
-    db.prepare('DELETE FROM messages WHERE chat_id = ?').run(SENTINEL_CHAT)
-    db.prepare(
+    prep('DELETE FROM messages WHERE chat_id = ?').run(SENTINEL_CHAT)
+    prep(
       `INSERT OR REPLACE INTO messages
          (chat_id, thread_id, message_id, role, ts, text)
        VALUES (?, NULL, ?, 'assistant', ?, ?)`,
     ).run(SENTINEL_CHAT, sentinelId, Math.floor(Date.now() / 1000), 'selfcheck')
-    const row = db
-      .prepare('SELECT text FROM messages WHERE chat_id = ? AND message_id = ?')
-      .get(SENTINEL_CHAT, sentinelId) as { text?: string } | undefined
+    const row = prep(
+      'SELECT text FROM messages WHERE chat_id = ? AND message_id = ?',
+    ).get(SENTINEL_CHAT, sentinelId) as { text?: string } | undefined
     if (row?.text !== 'selfcheck') {
       return { ok: false, error: 'sentinel row not read back after insert' }
     }
@@ -409,7 +501,7 @@ export function verifyHistoryWritable(): { ok: boolean; error?: string } {
   } finally {
     // Never leave the sentinel behind, even if the SELECT/assert path threw.
     try {
-      db.prepare('DELETE FROM messages WHERE chat_id = ?').run(SENTINEL_CHAT)
+      prep('DELETE FROM messages WHERE chat_id = ?').run(SENTINEL_CHAT)
     } catch {
       /* best-effort cleanup */
     }
@@ -424,21 +516,40 @@ export function verifyHistoryWritable(): { ok: boolean; error?: string } {
  * empty instead of throwing. Do NOT use for writes — every write path goes
  * through the record* functions above so redaction and validity checks
  * cannot be bypassed.
+ *
+ * The returned `prepare` routes through the module statement cache rather than
+ * handing out the raw `Database`. That is deliberate: a statement prepared
+ * directly off the connection by an outside caller is one `reopenHistory`
+ * cannot finalize, and a single such statement is enough to make the hard close
+ * throw. Keeping the seam inside the cache keeps the reopen deterministic no
+ * matter who else reads.
  */
 export function getHistoryDbForBriefing(): {
   prepare(sql: string): { all(...params: unknown[]): unknown[] }
 } | null {
-  return db
+  if (db == null) return null
+  return {
+    prepare(sql: string) {
+      return { all: (...params: unknown[]) => prep(sql).all(...params) }
+    },
+  }
 }
 
 /**
  * For tests — close the singleton and forget it. Production code never
  * needs this; the DB is held open for the lifetime of the process.
+ *
+ * Uses the SAME deterministic hard close as {@link reopenHistory}: a soft
+ * `close()` here leaked three fds per test (`h.db`, `-wal`, `-shm`), which is
+ * how the state-dir prefix guard in the sweep test came to look covered when it
+ * was not — the leaked fds from the previous test were doing the filtering.
  */
 export function _resetForTests(): void {
+  historyReopenFailure = null
   if (db != null) {
-    db.close()
+    const current = db
     db = null
+    hardCloseDb(current)
   }
 }
 
@@ -458,7 +569,7 @@ export function _resetForTests(): void {
 export function checkpointWal(): boolean {
   if (db == null) return false
   try {
-    db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').run()
+    prep('PRAGMA wal_checkpoint(TRUNCATE)').run()
     // Re-apply permissions after WAL truncation (SQLite may recreate -wal/-shm)
     if (dbPath) {
       for (const suffix of ['-shm', '-wal']) {
@@ -473,6 +584,152 @@ export function checkpointWal(): boolean {
   } catch {
     return false
   }
+}
+
+/**
+ * Drop the current history handle and re-open the DB from its path.
+ *
+ * THE FAILURE MODE THIS RECOVERS
+ * ------------------------------
+ * A FOREIGN process rw-opens `history.db`, and on exit — as the last
+ * connection — checkpoints and UNLINKS `history.db-wal` / `-shm`. Our
+ * long-lived connection keeps the deleted inodes mapped and keeps writing into
+ * them; every INSERT still reports success and the rows are simply gone at the
+ * next restart. Signature: `/proc/<pid>/fd/N -> …/history.db-wal (deleted)`.
+ * A container restart heals it; this is that restart, in-process. Detection and
+ * the call site live in `gateway/orphaned-db-sweep.ts`.
+ *
+ * WHY `close()` IS NOT ENOUGH (measured, not assumed)
+ * ---------------------------------------------------
+ * bun:sqlite's default `close()` is a SOFT close: it defers the real
+ * `sqlite3_close` while any un-finalized `Statement` still holds the
+ * connection. Measured on bun 1.3.13: after a plain `db.close()` the process
+ * STILL held `h.db`, `h.db-wal (deleted)` and `h.db-shm (deleted)` in
+ * `/proc/self/fd`, and the reopen then produced a connection that LOOKS
+ * healthy — `new Database(...)` and `PRAGMA journal_mode = WAL` both SUCCEED —
+ * and throws on the first WRITE instead (`SQLITE_IOERR_SHORT_READ`, errno 522),
+ * because SQLite's unix VFS keeps per-inode WAL-index state alive for as long
+ * as any connection to that inode is open. A naive close-and-reopen therefore
+ * turns silent row loss into a TOTAL history outage, and does it at a point
+ * where the reopen has already "succeeded". (The same DB file opened from a
+ * SEPARATE process reads fine, which is how we know the on-disk DB is not
+ * corrupt and the poisoning is in-process.)
+ *
+ * So the close has to be a HARD one — {@link hardCloseDb}, in two steps that
+ * are both load-bearing:
+ *   1. FINALIZE every outstanding statement, explicitly. Every statement in
+ *      this module is created through {@link prep} and held in `stmtCache`
+ *      precisely so this step can exist: `finalizeCachedStatements()` releases
+ *      each `sqlite3_stmt` synchronously. This is the determinism. The earlier
+ *      version of this code had no cache and leaned on `Bun.gc(true)` to
+ *      collect the per-call wrappers, which is a coin flip: 13/20 failures with
+ *      an empty heap and 30/30 with an arithmetic loop before the gc.
+ *      `Bun.gc(true)` is still called, but only as belt-and-braces for a
+ *      statement some future caller creates outside the cache — correctness no
+ *      longer depends on it, and the test suite proves that by asserting the
+ *      reopen under the exact heap shape that made the gc-only version fail
+ *      every time.
+ *   2. `close(true)`, which THROWS rather than silently deferring. If we cannot
+ *      actually close we must NOT null `db` and pretend to have recovered — we
+ *      rethrow so the sweep logs the failure and asks for a restart, leaving
+ *      the (bad but working) old handle in place rather than a null one that
+ *      fails every write.
+ *
+ * NO EXPLICIT SALVAGE CHECKPOINT
+ * ------------------------------
+ * We never issue `wal_checkpoint` through the orphaned handle. Once a new
+ * `-shm` exists on disk, our handle and any other connection are in DISJOINT
+ * locking domains and a checkpoint through the stale mapping can corrupt the
+ * main DB. Losing rows is strictly better than corrupting the ones that landed.
+ * `close()` does still run SQLite's IMPLICIT checkpoint-on-close through the
+ * old fds — a knowingly accepted residual, not an oversight: it is exactly what
+ * a clean container restart already does today, so this path is no more
+ * dangerous than the restart it replaces. (In the isolated case it also
+ * SALVAGES the orphaned rows; we do not rely on that, because the concurrent
+ * case cannot.)
+ *
+ * `initHistory` early-returns when `db != null`, so nulling is load-bearing —
+ * without it the reopen is a silent no-op and the orphaned handle keeps eating
+ * rows. The re-init re-runs the idempotent DDL/migrations, the chmod/ownership
+ * fixups, retention, and `verifyHistoryWritable()` — a free post-reopen proof
+ * that the new handle can actually persist a row.
+ *
+ * THREE FAILURE SHAPES, THREE DIFFERENT RESIDUAL STATES
+ * -----------------------------------------------------
+ * If the hard CLOSE throws, `db` is untouched: history is still lossy but
+ * functional, and the orphaned fds are still present so the sweep re-detects
+ * and retries on the next tick. If the close SUCCEEDS and the re-init throws,
+ * `db` is null and the orphaned fds are gone — the sweep's fd detector will
+ * never fire again — so that state is recorded in {@link historyReopenFailure}
+ * for the sweep to re-alarm on independently of detection. Without that flag a
+ * failed re-init is a permanent, silent history outage: strictly worse than the
+ * bug this whole path exists to fix. If the re-init succeeds but the SELF-CHECK
+ * fails, `db` is the new (readable, un-writable) handle: reads keep working,
+ * the flag is set, and the sweep keeps retrying — the state is dead for writes
+ * but there is no reason to also blind the read paths.
+ *
+ * Throws if the hard close, the re-init, or the post-reopen writer self-check
+ * fails. Callers must treat a throw as "history is still broken, restart
+ * required".
+ */
+export function reopenHistory(stateDir: string, retentionDays = 30): void {
+  const current = db
+  if (current != null) {
+    // Deliberately NOT caught: a failed close means the fds are still open and
+    // writes through the reopened handle would fail. Propagate with `db` intact.
+    hardCloseDb(current)
+  }
+  db = null
+  try {
+    initHistory(stateDir, retentionDays)
+    // `initHistory` only WARNS when the self-check fails and returns normally,
+    // so without this the sweep would log "writes are durable again" on a full
+    // disk, right next to "WRITER SELF-CHECK FAILED". Prove it, don't claim it.
+    const check = verifyHistoryWritable()
+    if (!check.ok) {
+      throw new Error(`post-reopen writer self-check failed: ${check.error ?? 'unknown'}`)
+    }
+  } catch (err) {
+    historyReopenFailure = err instanceof Error ? err.message : String(err)
+    throw err
+  }
+  historyReopenFailure = null
+}
+
+/**
+ * Deterministically release a connection: finalize every statement this module
+ * owns, then hard-close.
+ *
+ * Exported for the sweep's own use and for tests that need to prove the close
+ * is real. `Bun.gc(true)` runs first as belt-and-braces for any statement
+ * created outside the cache (a future caller, or bun's own internal
+ * transaction statements); the finalize pass is what makes the close
+ * deterministic. `close(true)` is NOT caught — a deferred close is exactly the
+ * failure this function exists to surface.
+ */
+export function hardCloseDb(handle: SqliteDatabase): void {
+  finalizeCachedStatements()
+  const gc = (globalThis as { Bun?: { gc?: (force: boolean) => void } }).Bun?.gc
+  if (typeof gc === 'function') {
+    try { gc(true) } catch { /* best-effort; close(true) below reports the truth */ }
+  }
+  handle.close(true)
+}
+
+/**
+ * Sticky record of a reopen that closed the old handle successfully and then
+ * failed to re-init. Non-null means `db` is null and every read/write path is
+ * dead — a state nothing else in the process can detect, because the orphaned
+ * fds that triggered the reopen are gone.
+ *
+ * Read by the orphaned-DB sweep on EVERY tick, independently of fd detection,
+ * so the outage keeps alarming and keeps being retried.
+ */
+let historyReopenFailure: string | null = null
+
+/** The sticky reopen-failure message, or null when history is healthy. */
+export function getHistoryReopenFailure(): string | null {
+  return historyReopenFailure
 }
 
 /**
@@ -497,7 +754,7 @@ export function pruneMessagesOlderThanDays(
   if (db == null) return 0
   if (retentionDays <= 0) return 0
   const cutoffSec = (nowSec ?? Math.floor(Date.now() / 1000)) - retentionDays * 86400
-  const stmt = db.prepare(`
+  const stmt = prep(`
     DELETE FROM messages
     WHERE rowid IN (
       SELECT rowid FROM messages WHERE ts < ? LIMIT ?
@@ -572,7 +829,7 @@ export function recordInbound(args: RecordInboundArgs): void {
     )
     return
   }
-  const stmt = requireDb().prepare(`
+  const stmt = prep(`
     INSERT OR REPLACE INTO messages
       (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, reply_to_message_id, reply_to_text, forwarded_from, forwarded_from_type, forwarded_from_id, forwarded_date, forwarded_message_id)
     VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
@@ -650,7 +907,7 @@ export function recordOutbound(args: RecordOutboundArgs): void {
   }
   if (validRows.length === 0) return
   const groupId = validRows[0]!.id
-  const stmt = requireDb().prepare(`
+  const stmt = prep(`
     INSERT OR REPLACE INTO messages
       (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id)
     VALUES (?, ?, ?, 'assistant', NULL, NULL, ?, ?, ?, ?)
@@ -668,7 +925,7 @@ export function recordOutbound(args: RecordOutboundArgs): void {
   // (chat_id, message_id) — unique within a chat regardless of thread, the
   // same assumption `recordEdit` / `recordReaction` already make — makes the
   // promotion exact and is a no-op when no observer row exists.
-  const dropSystem = requireDb().prepare(
+  const dropSystem = prep(
     `DELETE FROM messages WHERE chat_id = ? AND message_id = ? AND role = 'system'`,
   )
   // bun:sqlite has a transaction() helper. Cheap insurance against partial
@@ -731,9 +988,8 @@ export function recordSystemOutbound(args: RecordSystemOutboundArgs): boolean {
   // blanket send observer, so a warn here would be one stderr line per API call.
   if (db == null) return false
   try {
-    const res = requireDb()
-      .prepare(`
-        INSERT INTO messages
+    const res = prep(`
+      INSERT INTO messages
           (chat_id, thread_id, message_id, role, user, user_id, ts, text, attachment_kind, group_id, kind)
         SELECT ?, ?, ?, 'system', NULL, NULL, ?, ?, NULL, NULL, ?
          WHERE NOT EXISTS (
@@ -777,11 +1033,9 @@ export function updateSystemOutboundText(args: {
   text: string
 }): boolean {
   try {
-    const res = requireDb()
-      .prepare(
-        `UPDATE messages SET text = ? WHERE chat_id = ? AND message_id = ? AND role = 'system'`,
-      )
-      .run(redact(args.text), args.chat_id, args.message_id) as { changes?: number }
+    const res = prep(
+      `UPDATE messages SET text = ? WHERE chat_id = ? AND message_id = ? AND role = 'system'`,
+    ).run(redact(args.text), args.chat_id, args.message_id) as { changes?: number }
     return (res?.changes ?? 0) > 0
   } catch {
     return false
@@ -805,12 +1059,11 @@ interface RecordEditArgs {
  * original send-time thread isn't known at edit time.
  */
 export function recordEdit(args: RecordEditArgs): void {
-  requireDb()
-    .prepare(`
-      UPDATE messages
-         SET text = ?
-       WHERE chat_id = ? AND message_id = ?
-    `)
+  prep(`
+    UPDATE messages
+       SET text = ?
+     WHERE chat_id = ? AND message_id = ?
+  `)
     // Same outbound chokepoint as recordOutbound — an edit must not
     // reintroduce a raw secret into the stored row.
     .run(redact(args.text), args.chat_id, args.message_id)
@@ -833,12 +1086,11 @@ export interface RecordReactionArgs {
  * we match on (chat_id, message_id) and ignore thread_id — same as recordEdit.
  */
 export function recordReaction(args: RecordReactionArgs): void {
-  requireDb()
-    .prepare(`
-      UPDATE messages
-         SET user_reaction = ?
-       WHERE chat_id = ? AND message_id = ?
-    `)
+  prep(`
+    UPDATE messages
+       SET user_reaction = ?
+     WHERE chat_id = ? AND message_id = ?
+  `)
     .run(args.emoji, args.chat_id, args.message_id)
 }
 
@@ -857,11 +1109,10 @@ export interface DeleteFromHistoryArgs {
  * we match on (chat_id, message_id) and ignore thread.
  */
 export function deleteFromHistory(args: DeleteFromHistoryArgs): void {
-  requireDb()
-    .prepare(`
-      DELETE FROM messages
-       WHERE chat_id = ? AND message_id = ?
-    `)
+  prep(`
+    DELETE FROM messages
+     WHERE chat_id = ? AND message_id = ?
+  `)
     .run(args.chat_id, args.message_id)
 }
 
@@ -913,7 +1164,7 @@ export function getLatestInboundMessageId(
     }
   }
   sql += ' ORDER BY ts DESC, message_id DESC LIMIT 1'
-  const row = requireDb().prepare(sql).get(...params as any[]) as
+  const row = prep(sql).get(...params as any[]) as
     | { message_id: number }
     | undefined
   return row?.message_id ?? null
@@ -947,11 +1198,17 @@ export function lookupMessageRoleAndText(
     includeSystem?: boolean
   },
 ): { role: MessageRole; text: string; kind: string | null } | null {
+  // History dead (a reopen that closed the old handle and failed to re-init) or
+  // never initialised → "no such row", which is the answer this caller already
+  // handles for a reaped message. A `requireDb()` throw would instead propagate
+  // into the reaction-trigger handler; the same degrade
+  // `hasOutboundDeliveredSince` / `hasOutboundWithText` already apply.
+  if (db == null) return null
   const sql =
     `SELECT role, text, kind FROM messages WHERE chat_id = ? AND message_id = ?` +
     (opts?.includeSystem === true ? '' : ` AND role <> 'system'`) +
     ` LIMIT 1`
-  const row = requireDb().prepare(sql).get(chatId, messageId) as
+  const row = prep(sql).get(chatId, messageId) as
     | { role: MessageRole; text: string | null; kind: string | null }
     | undefined
   if (!row) return null
@@ -963,11 +1220,9 @@ export function getRecentOutboundCount(
   withinSeconds: number,
 ): number {
   const cutoff = Math.floor(Date.now() / 1000) - withinSeconds
-  const row = requireDb()
-    .prepare(
-      'SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ? AND role = ? AND ts >= ?',
-    )
-    .get(chatId, 'assistant', cutoff) as { cnt: number } | undefined
+  const row = prep(
+    'SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ? AND role = ? AND ts >= ?',
+  ).get(chatId, 'assistant', cutoff) as { cnt: number } | undefined
   return row?.cnt ?? 0
 }
 
@@ -1041,9 +1296,9 @@ export function hasOutboundDeliveredSince(
       }
     }
     sql += ' LIMIT 1'
-    const row = requireDb()
-      .prepare(sql)
-      .get(...(params as [unknown, ...unknown[]])) as Record<string, unknown> | undefined
+    const row = prep(sql).get(...(params as [unknown, ...unknown[]])) as
+      | Record<string, unknown>
+      | undefined
     return row != null
   } catch {
     return false
@@ -1121,9 +1376,9 @@ export function hasOutboundWithText(
     }
     // Newest first: a redelivery candidate's match is almost always recent.
     sql += ' ORDER BY ts DESC LIMIT 500'
-    const rows = requireDb()
-      .prepare(sql)
-      .all(...(params as [unknown, ...unknown[]])) as { text: string | null }[]
+    const rows = prep(sql).all(...(params as [unknown, ...unknown[]])) as {
+      text: string | null
+    }[]
     for (const r of rows) {
       const hay = normalizeDeliveryText(r.text ?? '')
       if (hay.length === 0) continue
@@ -1169,6 +1424,17 @@ export function deliveryTextMatch(hay: string, needle: string): boolean {
 }
 
 export function query(opts: QueryOptions): RecordedMessage[] {
+  // History dead or never initialised → no rows, the same result the caller
+  // gets from a genuinely empty chat. `get_recent_messages` degrades to "no
+  // history" instead of erroring the whole tool call; the operator-visible
+  // signal for the dead case is the sweep's sticky alarm, not this throw.
+  if (db == null) {
+    warnHistory(
+      'query: history DB is not open — returning no rows. If a reopen failed, the ' +
+        'orphaned-db-sweep is alarming about it every tick; RESTART the gateway.',
+    )
+    return []
+  }
   const limit = Math.min(MAX_LIMIT, Math.max(1, opts.limit ?? DEFAULT_LIMIT))
   const params: unknown[] = [opts.chat_id]
   let sql = 'SELECT * FROM messages WHERE chat_id = ?'
@@ -1188,7 +1454,7 @@ export function query(opts: QueryOptions): RecordedMessage[] {
   }
   sql += ' ORDER BY ts DESC, message_id DESC LIMIT ?'
   params.push(limit)
-  const rows = requireDb().prepare(sql).all(...params as any[]) as RecordedMessage[]
+  const rows = prep(sql).all(...params as any[]) as RecordedMessage[]
   // SELECT was DESC; flip to oldest-first for the caller.
   rows.reverse()
   return rows
