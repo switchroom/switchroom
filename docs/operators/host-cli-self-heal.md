@@ -95,18 +95,30 @@ roll now performs it before refusing:
    `switchroom host-cli-upgrade`, which is the same checksum-verified,
    prove-then-swap sequence `switchroom update` runs, pointed at the bind-mounted
    binary instead of its own. The outgoing binary is kept for rollback under
-   `<bindir>/.switchroom-versions/`, and the tree is chowned back to whoever
-   owned the binary before the swap — so the non-root timer above keeps working
-   on the next tick.
+   `<bindir>/.switchroom-versions/`, and the whole tree it touched — the binary,
+   the rollback store, `<prefix>/share` and every file in the extracted asset
+   payload, however deeply nested — is chowned back to whoever owned the binary
+   before the swap, so the non-root timer above keeps working on the next tick.
+   That handoff runs on **every** exit path, including a failed download or a
+   checksum mismatch: the helper is root, and a root-owned directory left inside
+   an operator-owned bindir would `EACCES` the operator's own `switchroom update`
+   from then on.
 3. The roll then **re-probes the swapped binary** and only continues if it
    reports the target. It rewrites `~/.switchroom/host-cli.json` with the
    **proven** version — not the pin it asked for — because nothing has run that
-   binary in host context, so no other code path would refresh the stamp.
+   binary in host context, so no other code path would refresh the stamp. If that
+   file cannot be written, the roll still continues on the proven version and
+   says so; the next roll will simply re-observe the old record and heal again.
 
 If any of that fails, the roll falls back to exactly the pre-existing refusal
 with the helper's own diagnostic appended, having changed nothing else. The
 prefix bind is refused outright for a path that is not a plain absolute
 `…/<dir>/switchroom` (no traversal, and never the host root).
+
+**Ordering:** the heal runs *after* every request-validation bail — the downgrade
+guard, an unknown `--agents` name, an empty agent list — and before the first
+fleet mutation. A roll that is going to exit 2 on a typo does not swap your host
+binary on the way out.
 
 **Scope:** `static-binary` only. An `npm i -g` install still refuses — replacing
 one file is not the whole update for it — and the refusal now says plainly that

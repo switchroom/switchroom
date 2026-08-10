@@ -67,6 +67,7 @@ import type { ComponentVersion } from "./component-versions.js";
 import {
   PREFLIGHT_HOST_CLI_STALE_STEP,
   type HostCliStamp,
+  type StampIo,
 } from "./host-cli-stamp.js";
 import { encodeHostCliUpgradeResult } from "./host-cli-upgrade.js";
 import { getReleasePinFromConfig } from "./release-yaml.js";
@@ -3330,6 +3331,7 @@ describe("host-CLI self-heal (#4585)", () => {
   function makeStaticBinaryHost(
     hostCliVersion: string,
     overrides: Record<string, unknown> = {},
+    configPin = "v0.0.1",
   ): { configPath: string; stampPath: string } {
     const home = mkdtempSync(join(tmpdir(), "rollout-heal-"));
     const dir = join(home, ".switchroom");
@@ -3338,7 +3340,7 @@ describe("host-CLI self-heal (#4585)", () => {
     writeFileSync(
       configPath,
       `switchroom:\n  version: 1\ntelegram:\n  bot_token: x\n  forum_chat_id: "1"\n` +
-        `release:\n  pin: v0.0.1\nagents:\n  clerk:\n    topic_name: clerk\n`,
+        `release:\n  pin: ${configPin}\nagents:\n  clerk:\n    topic_name: clerk\n`,
       "utf8",
     );
     const stampPath = join(dir, "host-cli.json");
@@ -3374,17 +3376,21 @@ describe("host-CLI self-heal (#4585)", () => {
 
   /**
    * A REAL (non-dry-run) roll — the heal only runs there, because --dry-run
-   * writes nothing. `--agents nope` is the observation point: the unknown-agent
-   * bail sits immediately AFTER the host-CLI gate and before any mutation, so
-   * "did stderr say `unknown agent(s)`" is exactly "did the roll clear the
-   * gate", with no docker, no spawn and nothing written.
+   * writes nothing. The observation point is the fleet actually MOVING: the
+   * executor is wired to fakes, so `runs` containing the agent restart is
+   * exactly "the roll cleared the host-CLI gate and executed", with no docker
+   * and no subprocess. Deliberately NOT an early bail such as `--agents nope`:
+   * the gate now sits below every request-validation bail (#4585 M3), so a
+   * bail-based probe would observe a roll that never reached the gate at all.
    */
-  const PAST_THE_GATE = /unknown agent\(s\): nope/;
+  const rolledClerk = (runs: string[][]) =>
+    runs.some((r) => r[0] === "agent" && r[1] === "restart" && r[2] === "clerk");
 
   async function runRollout(
     configPath: string,
     docker: (args: string[]) => { ok: boolean; stdout: string; stderr: string },
-    extra: string[] = ["--agents", "nope"],
+    extra: string[] = [],
+    hostCliStampIo?: StampIo,
   ) {
     process.env.SWITCHROOM_HOSTD_CONTEXT = "1";
     process.env.SWITCHROOM_PIN_JOURNAL_DIR = mkdtempSync(
@@ -3393,7 +3399,12 @@ describe("host-CLI self-heal (#4585)", () => {
     const program = new Command();
     program.exitOverride();
     program.option("-c, --config <path>", "Path to switchroom.yaml config file");
-    registerRolloutCommand(program, { hostCliHealDocker: docker });
+    const { deps, runs } = harness({ versions: { clerk: "0.0.1" } });
+    registerRolloutCommand(program, {
+      hostCliHealDocker: docker,
+      rolloutDeps: deps,
+      ...(hostCliStampIo ? { hostCliStampIo } : {}),
+    });
     const out: string[] = [];
     const err: string[] = [];
     const writeOut = process.stdout.write.bind(process.stdout);
@@ -3415,7 +3426,7 @@ describe("host-CLI self-heal (#4585)", () => {
       process.stdout.write = writeOut;
       process.stderr.write = writeErr;
     }
-    return { out: out.join(""), err: err.join("") };
+    return { out: out.join(""), err: err.join(""), runs };
   }
 
   it("heals the stale host CLI and PROCEEDS, instead of dead-ending on the refusal", async () => {
@@ -3427,10 +3438,11 @@ describe("host-CLI self-heal (#4585)", () => {
         binaryPath: "/hostcli/bin/switchroom",
       }),
     );
-    const { out, err } = await runRollout(configPath, docker);
+    const { out, err, runs } = await runRollout(configPath, docker);
 
-    // The outcome that was impossible before: the roll clears the gate.
-    expect(err).toMatch(PAST_THE_GATE);
+    // The outcome that was impossible before: the roll clears the gate and the
+    // fleet actually moves.
+    expect(rolledClerk(runs)).toBe(true);
     expect(err).not.toMatch(/HOST operator CLI is v0\.0\.0/);
     expect(out).not.toContain(PREFLIGHT_HOST_CLI_STALE_STEP);
     expect(err).toMatch(/host CLI upgraded 0\.0\.0 → v0\.0\.1/);
@@ -3495,13 +3507,13 @@ describe("host-CLI self-heal (#4585)", () => {
       };
       return { docker: d };
     })();
-    const { out, err } = await runRollout(configPath, docker);
+    const { out, err, runs } = await runRollout(configPath, docker);
 
     expect(process.exitCode).toBe(2);
     expect(err).toMatch(/host CLI self-heal FAILED/);
     expect(err).toContain("checksum mismatch for switchroom-linux-amd64");
     expect(out).toContain(PREFLIGHT_HOST_CLI_STALE_STEP);
-    expect(err).not.toMatch(PAST_THE_GATE);
+    expect(rolledClerk(runs)).toBe(false);
     // A failed heal must not have moved the recorded version.
     expect(JSON.parse(readFileSync(stampPath, "utf8")).version).toBe("0.0.0");
   });
@@ -3544,28 +3556,28 @@ describe("host-CLI self-heal (#4585)", () => {
   it("never spawns a helper when the host CLI is already current", async () => {
     const { configPath } = makeStaticBinaryHost("0.0.1");
     let dockerCalls = 0;
-    const { err } = await runRollout(configPath, () => {
+    const { runs } = await runRollout(configPath, () => {
       dockerCalls += 1;
       return { ok: true, stdout: "", stderr: "" };
     });
 
-    expect(err).toMatch(PAST_THE_GATE);
+    expect(rolledClerk(runs)).toBe(true);
     expect(dockerCalls).toBe(0);
   });
 
   it("never spawns a helper under --allow-stale-host-cli", async () => {
     const { configPath } = makeStaticBinaryHost("0.0.0");
     let dockerCalls = 0;
-    const { err } = await runRollout(
+    const { runs } = await runRollout(
       configPath,
       () => {
         dockerCalls += 1;
         return { ok: true, stdout: "", stderr: "" };
       },
-      ["--allow-stale-host-cli", "--agents", "nope"],
+      ["--allow-stale-host-cli"],
     );
 
-    expect(err).toMatch(PAST_THE_GATE);
+    expect(rolledClerk(runs)).toBe(true);
     expect(dockerCalls).toBe(0);
   });
 
@@ -3611,4 +3623,64 @@ describe("host-CLI self-heal (#4585)", () => {
     expect(err).toMatch(/HOST operator CLI is v0\.0\.0/);
     expect(out).not.toMatch(/Rollout plan/);
   });
+  it("does NOT touch the host before an invalid request bails (#4585 ordering)", async () => {
+    // The gate stopped being read-only when it gained the self-heal. A roll
+    // that is going to exit 2 on a typo'd --agents must not have swapped the
+    // host binary and rewritten host-cli.json on its way out — the bail says
+    // "Nothing was changed."
+    const { configPath, stampPath } = makeStaticBinaryHost("0.0.0");
+    let dockerCalls = 0;
+    const { err } = await runRollout(
+      configPath,
+      () => {
+        dockerCalls += 1;
+        return { ok: true, stdout: "", stderr: "" };
+      },
+      ["--agents", "nope"],
+    );
+
+    expect(process.exitCode).toBe(2);
+    expect(err).toMatch(/unknown agent\(s\): nope/);
+    expect(dockerCalls).toBe(0);
+    expect(JSON.parse(readFileSync(stampPath, "utf8")).version).toBe("0.0.0");
+  });
+
+  it("does NOT touch the host before the downgrade guard bails (#4585 ordering)", async () => {
+    const { configPath, stampPath } = makeStaticBinaryHost("0.0.0", {}, "v0.0.2");
+    let dockerCalls = 0;
+    const { err } = await runRollout(configPath, () => {
+      dockerCalls += 1;
+      return { ok: true, stdout: "", stderr: "" };
+    });
+
+    expect(process.exitCode).toBe(2);
+    expect(err).toMatch(/refuses a DOWNGRADE/);
+    expect(err).toContain("Nothing was changed.");
+    expect(dockerCalls).toBe(0);
+    expect(JSON.parse(readFileSync(stampPath, "utf8")).version).toBe("0.0.0");
+  });
+
+  it("PROCEEDS on the proven version when the stamp cannot be rewritten", async () => {
+    // The helper re-ran the swapped binary and it answered v0.0.1, so the
+    // gate's premise is disproved. Reverting to the pre-heal version because
+    // the RECORD of it could not be written would refuse the roll for a
+    // staleness that no longer exists — and name a remedy already applied.
+    const { configPath } = makeStaticBinaryHost("0.0.0");
+    const { docker } = healingDocker(
+      encodeHostCliUpgradeResult({ ok: true, version: "v0.0.1" }),
+    );
+    const { out, err, runs } = await runRollout(configPath, docker, [], {
+      writeFile: () => {
+        throw new Error("EACCES: permission denied");
+      },
+    });
+
+    expect(rolledClerk(runs)).toBe(true);
+    expect(out).not.toContain(PREFLIGHT_HOST_CLI_STALE_STEP);
+    // …and it says so, rather than pretending the record is current.
+    expect(err).toContain("could not be refreshed");
+    expect(err).toContain("EACCES: permission denied");
+    expect(err).toContain("heal again");
+  });
 });
+

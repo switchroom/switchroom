@@ -40,7 +40,7 @@
  *   `performSelfUpdate`, which throws rather than half-installing).
  */
 
-import { chownSync, existsSync, readdirSync, statSync } from "node:fs";
+import { lchownSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Command } from "commander";
 import {
@@ -104,10 +104,16 @@ const SEMVER_TAG_RE = /^v\d+\.\d+\.\d+$/;
 export interface HostCliUpgradeIo {
   /** True when `path` is an existing regular file. */
   isFile: (path: string) => boolean;
-  /** True when `path` exists at all (file, dir or symlink). */
-  exists: (path: string) => boolean;
+  /**
+   * Kind of `path` WITHOUT following symlinks, or undefined when it does not
+   * exist / is unreadable. The ownership walk needs the un-followed answer:
+   * `<prefix>/share/switchroom` is a symlink, and treating it as its target
+   * would both mis-chown and risk walking an unrelated tree.
+   */
+  kind: (path: string) => "file" | "dir" | "symlink" | "other" | undefined;
   /** uid/gid of `path`, or undefined when unreadable. */
   owner: (path: string) => { uid: number; gid: number } | undefined;
+  /** `lchown` semantics: retargets a symlink itself, never its target. */
   chown: (path: string, uid: number, gid: number) => void;
   /** Entry names in `dir`; `[]` when unreadable. */
   list: (dir: string) => string[];
@@ -128,16 +134,26 @@ function defaultIo(): HostCliUpgradeIo {
         return false;
       }
     },
-    exists: (p) => existsSync(p),
+    kind: (p) => {
+      try {
+        const st = lstatSync(p);
+        if (st.isSymbolicLink()) return "symlink";
+        if (st.isDirectory()) return "dir";
+        if (st.isFile()) return "file";
+        return "other";
+      } catch {
+        return undefined;
+      }
+    },
     owner: (p) => {
       try {
-        const st = statSync(p);
+        const st = lstatSync(p);
         return { uid: st.uid, gid: st.gid };
       } catch {
         return undefined;
       }
     },
-    chown: (p, uid, gid) => chownSync(p, uid, gid),
+    chown: (p, uid, gid) => lchownSync(p, uid, gid),
     list: (d) => {
       try {
         return readdirSync(d);
@@ -163,6 +179,13 @@ function defaultIo(): HostCliUpgradeIo {
  * permanent regression. Same rule as every other root-writes-into-an-operator-
  * tree site in this repo (CLAUDE.md § Root-context editing).
  *
+ * The walk is COMPLETE, not depth-bounded. `<prefix>/share/switchroom-<ver>/`
+ * is the extracted asset payload — `scripts/build-asset-payload.mjs` ships
+ * `profiles/`, `skills/`, `vendor/hindsight-memory/` and `ui/` into it, and
+ * `skills/` alone nests six to eight levels deep. Anything left root-owned in
+ * there breaks the operator's NEXT update, which recursively removes the old
+ * version dir (`prunePayloadVersions` → `io.removeTree`, self-update.ts).
+ *
  * Best-effort by construction: a chown failure is reported, never fatal — the
  * binary is already correctly installed at that point.
  */
@@ -170,25 +193,27 @@ export function handBackOwnership(
   paths: string[],
   owner: { uid: number; gid: number },
   io: HostCliUpgradeIo,
-  depth = 0,
 ): string[] {
   const failures: string[] = [];
-  for (const p of paths) {
-    if (!io.exists(p)) continue;
+  const seen = new Set<string>();
+  const stack = [...paths];
+  while (stack.length > 0) {
+    const p = stack.pop();
+    if (p === undefined || seen.has(p)) continue;
+    seen.add(p);
+    const kind = io.kind(p);
+    if (kind === undefined) continue;
     try {
       io.chown(p, owner.uid, owner.gid);
     } catch (err) {
       failures.push(`${p}: ${(err as Error).message}`);
     }
-    // One level of recursion per call, bounded — the trees involved are
-    // `<install>/.switchroom-versions/` (flat) and `<prefix>/share/` (a
-    // symlink plus versioned dirs), not arbitrary user data.
-    if (depth < 3) {
-      const children = io.list(p).map((c) => join(p, c));
-      if (children.length > 0) {
-        failures.push(...handBackOwnership(children, owner, io, depth + 1));
-      }
-    }
+    // Descend into real directories only. A symlink is re-owned in place
+    // (lchown) but never followed: `<prefix>/share/switchroom` points at the
+    // versioned dir, which is enumerated on its own, and following links
+    // would let a stray link drag an unrelated tree into the chown.
+    if (kind !== "dir") continue;
+    for (const child of io.list(p)) stack.push(join(p, child));
   }
   return failures;
 }
@@ -248,56 +273,77 @@ export async function runHostCliUpgrade(
   // so its own ownership carries no information about who should own it.
   const priorOwner = io.owner(binary);
 
-  let result;
-  try {
-    result = await performSelfUpdate({
-      plan: {
-        action: "update",
-        from: `v${from.replace(/^v/, "")}`,
-        to: pin,
-        binaryPath: binary,
-      },
-      assetName: asset,
-      io: io.selfUpdate,
-      log,
-    });
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
-  }
-
-  // Prove the file that is NOW on the host's $PATH answers with the target —
-  // `performSelfUpdate` proves the staged candidate, this proves the swap.
-  const proven = io.selfUpdate.probeBinaryVersion(binary);
-  if (!proven || `v${proven.replace(/^v/, "")}` !== pin) {
-    return {
-      ok: false,
-      error:
-        `swapped ${binary} but it reports ${proven ?? "<nothing>"}, not ${pin} — ` +
-        `the install did not land. ${result.message}`,
-    };
-  }
-
-  if (priorOwner && priorOwner.uid !== io.getuid()) {
-    const installDir = dirname(binary);
-    const failures = handBackOwnership(
-      [
-        binary,
-        join(installDir, ".switchroom-versions"),
-        payloadInstallRoot(binary),
-        payloadVersionDir(payloadInstallRoot(binary), pin),
-      ],
-      priorOwner,
-      io,
-    );
-    if (failures.length > 0) {
-      log(
-        `warning: could not hand ownership back to uid ${priorOwner.uid}: ` +
-          `${failures.join("; ")}\n`,
+  // An INVARIANT, not a success epilogue. `performSelfUpdate` creates
+  // `<bindir>/.switchroom-versions` as its very first action and `<prefix>/share`
+  // shortly after, both as root — so a download 503, a checksum mismatch or a
+  // wait timeout still leaves root-owned directories inside an operator-owned
+  // install tree, and the operator's own non-root `switchroom update` (and the
+  // self-heal timer) then fail with EACCES forever. Whatever happens below,
+  // the tree goes back to its owner before this process exits.
+  const handBack = (): void => {
+    try {
+      if (!priorOwner || priorOwner.uid === io.getuid()) return;
+      const installRoot = payloadInstallRoot(binary);
+      const failures = handBackOwnership(
+        [
+          binary,
+          join(dirname(binary), ".switchroom-versions"),
+          // `<prefix>/share` itself: `installAssetPayload` mkdirp's it, so on a
+          // prefix that had no payload yet it is created root-owned and the
+          // operator can no longer write the next `.incoming` staging dir.
+          dirname(installRoot),
+          installRoot,
+          payloadVersionDir(installRoot, pin),
+        ],
+        priorOwner,
+        io,
       );
+      if (failures.length > 0) {
+        log(
+          `warning: could not hand ownership back to uid ${priorOwner.uid}: ` +
+            `${failures.join("; ")}\n`,
+        );
+      }
+    } catch (err) {
+      // Never let the handoff mask the real result.
+      log(`warning: ownership handoff failed: ${(err as Error).message}\n`);
     }
-  }
+  };
 
-  return { ok: true, version: pin, binaryPath: binary };
+  try {
+    let result;
+    try {
+      result = await performSelfUpdate({
+        plan: {
+          action: "update",
+          from: `v${from.replace(/^v/, "")}`,
+          to: pin,
+          binaryPath: binary,
+        },
+        assetName: asset,
+        io: io.selfUpdate,
+        log,
+      });
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+
+    // Prove the file that is NOW on the host's $PATH answers with the target —
+    // `performSelfUpdate` proves the staged candidate, this proves the swap.
+    const proven = io.selfUpdate.probeBinaryVersion(binary);
+    if (!proven || `v${proven.replace(/^v/, "")}` !== pin) {
+      return {
+        ok: false,
+        error:
+          `swapped ${binary} but it reports ${proven ?? "<nothing>"}, not ${pin} — ` +
+          `the install did not land. ${result.message}`,
+      };
+    }
+
+    return { ok: true, version: pin, binaryPath: binary };
+  } finally {
+    handBack();
+  }
 }
 
 export function registerHostCliUpgradeCommand(program: Command): void {

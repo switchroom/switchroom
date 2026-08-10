@@ -64,6 +64,7 @@ import {
   shouldRefuseStaleHostCli,
   writeHostCliStamp,
   type HostCliStamp,
+  type StampIo,
 } from "./host-cli-stamp.js";
 import {
   HOST_CLI_HEAL_TIMEOUT_MS,
@@ -2298,6 +2299,19 @@ export function registerRolloutCommand(
      * docker; production builds the bounded runner below.
      */
     hostCliHealDocker?: DockerRunner;
+    /**
+     * Executor dependencies. Injected in tests so a roll that CLEARS the
+     * preflight gates can be observed executing, without spawning `docker` or
+     * `switchroom apply`; production always builds them via
+     * {@link createRolloutDeps}.
+     */
+    rolloutDeps?: RolloutDeps;
+    /**
+     * IO for the post-heal `host-cli.json` refresh. Injected in tests to make
+     * an UNWRITABLE stamp deterministic (the real failure is an EACCES on the
+     * operator's home, which cannot be reproduced as root).
+     */
+    hostCliStampIo?: StampIo;
   },
 ): void {
   const hostdCtx = isHostdContext();
@@ -2450,8 +2464,54 @@ export function registerRolloutCommand(
         process.exitCode = 2;
         return;
       }
+      // #2487 PR2 — downgrade guard: reject a version older than the
+      // current release.pin on the hostd path UNLESS --allow-downgrade is
+      // set (the operator-approved rollback path). compareReleaseTags is
+      // conservative: it only refuses a clean vX.Y.Z → older-vX.Y.Z move,
+      // never a channel/sha (those return null and never block).
+      // Use resolvedPin (which may have been auto-filled from prior_pin).
+      if (shouldRefuseDowngrade(hostdCtx, resolvedPin, config.release?.pin, opts.allowDowngrade)) {
+        const current = config.release?.pin;
+        process.stderr.write(
+          `rollout (hostd path) refuses a DOWNGRADE: ${resolvedPin} is older ` +
+            `than the current pin ${current}. Pass --allow-downgrade to ` +
+            `authorize an operator-approved rollback to a known-good earlier ` +
+            `tag. Nothing was changed.\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      if (opts.allowDowngrade) {
+        const current = config.release?.pin;
+        process.stdout.write(
+          `⤵ DOWNGRADE authorized (operator-approved rollback): ${current ?? "<unpinned>"} → ${target}\n`,
+        );
+      }
+      const allAgents = Object.keys(config.agents ?? {});
+      const requested = opts.agents
+        ? opts.agents.split(",").map((s) => s.trim()).filter(Boolean)
+        : allAgents;
+      const unknown = requested.filter((a) => !allAgents.includes(a));
+      if (unknown.length > 0) {
+        process.stderr.write(`unknown agent(s): ${unknown.join(", ")}\n`);
+        process.exitCode = 2;
+        return;
+      }
+      if (requested.length === 0) {
+        process.stderr.write("no agents to roll.\n");
+        process.exitCode = 2;
+        return;
+      }
+
       // #4571 — HOST-CLI-FIRST gate. The host operator CLI must already be on
       // the target before a single agent moves.
+      //
+      // ORDERING (#4585): this deliberately sits BELOW every request-validation
+      // bail — downgrade guard, unknown agent, empty agent list. The gate stopped
+      // being read-only when it gained the self-heal: it can now swap the host
+      // binary and rewrite `host-cli.json`. A roll that is going to exit 2 on a
+      // typo'd `--agents` must not mutate the host on its way out, and those
+      // bails promise "Nothing was changed." in as many words.
       //
       // On the host-shell path the driving CLI IS the host CLI, so the
       // `shouldRefuseStaleCli` guard above already enforces this. On the
@@ -2517,11 +2577,22 @@ export function registerRolloutCommand(
               ...(hostCliStamp as HostCliStamp),
               version: outcome.version.replace(/^v/, ""),
             };
-            const w = writeHostCliStamp(updated);
-            hostCliStamp = w.status === "skipped" ? hostCliStamp : updated;
+            const w = writeHostCliStamp(updated, testHooks?.hostCliStampIo ?? {});
+            // The PROVEN version wins over the record of it. `outcome.version`
+            // comes from host-cli-upgrade re-running the swapped binary, so the
+            // gate's premise — "the host CLI is older than the target" — is
+            // disproved regardless of whether the stamp file could be updated.
+            // Reverting to the pre-heal version here would refuse the roll for
+            // a staleness that no longer exists, and the operator's remedy
+            // ("upgrade the host CLI") would be a no-op they cannot satisfy.
+            hostCliStamp = updated;
             healNote =
               `${outcome.message}` +
-              (w.status === "skipped" ? ` (stamp not refreshed: ${w.reason})` : "");
+              (w.status === "skipped"
+                ? ` (proceeding on the PROVEN version; ${HOST_CLI_STAMP_FILENAME} ` +
+                  `could not be refreshed: ${w.reason} — the next roll will ` +
+                  `re-observe the old version and heal again)`
+                : "");
             process.stderr.write(`✅ ${healNote}\n`);
           } else {
             healNote = `host CLI self-heal FAILED: ${outcome.message}.`;
@@ -2570,44 +2641,6 @@ export function registerRolloutCommand(
             `with: ${hostCliInstallCommand(hostCliStamp, target)}\n`,
         );
       }
-      // #2487 PR2 — downgrade guard: reject a version older than the
-      // current release.pin on the hostd path UNLESS --allow-downgrade is
-      // set (the operator-approved rollback path). compareReleaseTags is
-      // conservative: it only refuses a clean vX.Y.Z → older-vX.Y.Z move,
-      // never a channel/sha (those return null and never block).
-      // Use resolvedPin (which may have been auto-filled from prior_pin).
-      if (shouldRefuseDowngrade(hostdCtx, resolvedPin, config.release?.pin, opts.allowDowngrade)) {
-        const current = config.release?.pin;
-        process.stderr.write(
-          `rollout (hostd path) refuses a DOWNGRADE: ${resolvedPin} is older ` +
-            `than the current pin ${current}. Pass --allow-downgrade to ` +
-            `authorize an operator-approved rollback to a known-good earlier ` +
-            `tag. Nothing was changed.\n`,
-        );
-        process.exitCode = 2;
-        return;
-      }
-      if (opts.allowDowngrade) {
-        const current = config.release?.pin;
-        process.stdout.write(
-          `⤵ DOWNGRADE authorized (operator-approved rollback): ${current ?? "<unpinned>"} → ${target}\n`,
-        );
-      }
-      const allAgents = Object.keys(config.agents ?? {});
-      const requested = opts.agents
-        ? opts.agents.split(",").map((s) => s.trim()).filter(Boolean)
-        : allAgents;
-      const unknown = requested.filter((a) => !allAgents.includes(a));
-      if (unknown.length > 0) {
-        process.stderr.write(`unknown agent(s): ${unknown.join(", ")}\n`);
-        process.exitCode = 2;
-        return;
-      }
-      if (requested.length === 0) {
-        process.stderr.write("no agents to roll.\n");
-        process.exitCode = 2;
-        return;
-      }
 
       // Persist the pin durably only when a pin was explicitly given (either
       // via --pin or auto-resolved from prior_pin); a target read from
@@ -2647,13 +2680,15 @@ export function registerRolloutCommand(
         resolveBankId = (agent: string) =>
           (config.agents?.[agent]?.memory as { collection?: string } | undefined)?.collection ?? agent;
       }
-      const deps = createRolloutDeps({
-        configPath,
-        scriptPath,
-        hostdCtx,
-        hindsightApiUrl,
-        resolveBankId,
-      });
+      const deps =
+        testHooks?.rolloutDeps ??
+        createRolloutDeps({
+          configPath,
+          scriptPath,
+          hostdCtx,
+          hindsightApiUrl,
+          resolveBankId,
+        });
 
       process.stdout.write(
         `${opts.allowDowngrade ? "Rolling back" : "Rolling"} ${requested.length} agent(s) to ${target}…\n`,
