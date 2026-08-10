@@ -62,8 +62,15 @@ import {
   observeHostCli,
   readHostCliStamp,
   shouldRefuseStaleHostCli,
+  writeHostCliStamp,
   type HostCliStamp,
+  type StampIo,
 } from "./host-cli-stamp.js";
+import {
+  HOST_CLI_HEAL_TIMEOUT_MS,
+  planHostCliHeal,
+  runHostCliHeal,
+} from "./host-cli-heal.js";
 import { resolveSelfInvocation } from "./self-invoke.js";
 import { writeConfigFileSync } from "../util/atomic.js";
 import { compareReleaseTags } from "../config/release-resolve.js";
@@ -2283,8 +2290,51 @@ export function createRolloutDeps(params: {
   };
 }
 
-export function registerRolloutCommand(program: Command): void {
+export function registerRolloutCommand(
+  program: Command,
+  testHooks?: {
+    /**
+     * Docker runner for the #4585 host-CLI self-heal. Injected in tests so the
+     * heal's OUTCOME (does the roll proceed / refuse?) is assertable without
+     * docker; production builds the bounded runner below.
+     */
+    hostCliHealDocker?: DockerRunner;
+    /**
+     * Executor dependencies. Injected in tests so a roll that CLEARS the
+     * preflight gates can be observed executing, without spawning `docker` or
+     * `switchroom apply`; production always builds them via
+     * {@link createRolloutDeps}.
+     */
+    rolloutDeps?: RolloutDeps;
+    /**
+     * IO for the post-heal `host-cli.json` refresh. Injected in tests to make
+     * an UNWRITABLE stamp deterministic (the real failure is an EACCES on the
+     * operator's home, which cannot be reproduced as root).
+     */
+    hostCliStampIo?: StampIo;
+  },
+): void {
   const hostdCtx = isHostdContext();
+  const hostCliHealDocker = testHooks?.hostCliHealDocker;
+  /**
+   * Bounded `docker …` for the heal helper. Its own (long) budget rather than
+   * {@link ROLLOUT_PROBE_TIMEOUT_MS}: `docker wait` blocks for the whole
+   * download+verify+swap, which legitimately exceeds a probe timeout, while
+   * an unbounded call would strand hostd's fleet-mutation latch — the failure
+   * class `ROLLOUT_RUN_TIMEOUT_MS` exists for.
+   */
+  const defaultHostCliHealDocker: DockerRunner = (args) => {
+    try {
+      const r = spawnSync("docker", args, {
+        encoding: "utf8",
+        timeout: HOST_CLI_HEAL_TIMEOUT_MS,
+        killSignal: ROLLOUT_KILL_SIGNAL,
+      });
+      return { ok: r.status === 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+    } catch (err) {
+      return { ok: false, stdout: "", stderr: (err as Error).message };
+    }
+  };
   program
     .command("rollout")
     .description(
@@ -2414,68 +2464,6 @@ export function registerRolloutCommand(program: Command): void {
         process.exitCode = 2;
         return;
       }
-      // #4571 — HOST-CLI-FIRST gate. The host operator CLI must already be on
-      // the target before a single agent moves.
-      //
-      // On the host-shell path the driving CLI IS the host CLI, so the
-      // `shouldRefuseStaleCli` guard above already enforces this. On the
-      // agent/hostd path it does not: the driving CLI is the hostd IMAGE's
-      // bundled CLI, and nothing in the roll ever observed the host binary —
-      // it was named in a trailing warning after every agent had already
-      // moved. That is how the host CLI reached five releases of drift with
-      // every roll exiting green.
-      //
-      // hostd mounts only `~/.switchroom` (hostd.ts:332): it cannot read
-      // `/usr/local/bin`, cannot read an nvm tree, and cannot `npm i -g` on
-      // the host. So the roll CANNOT install the host CLI itself and any step
-      // claiming to would be a lie. What it can do is REFUSE — deterministic,
-      // before the first mutation, with the correct install command derived
-      // from what the host CLI recorded about itself
-      // (`~/.switchroom/host-cli.json`, written by every host-context CLI
-      // invocation). Silence becomes impossible; the ordering becomes real.
-      //
-      // Conservative, like every other guard here: no stamp (a host CLI older
-      // than this feature never wrote one) or an unorderable version never
-      // blocks. `--allow-stale-host-cli` is the explicit override.
-      const hostCliStamp = readHostCliStamp();
-      if (
-        !opts.allowStaleHostCli &&
-        shouldRefuseStaleHostCli(hostCliStamp, target)
-      ) {
-        const observed = hostCliStamp?.version ?? "unknown";
-        const refusal =
-          `rollout refused: the HOST operator CLI is v${observed}, OLDER than ` +
-          `the target ${target}. The host CLI must be upgraded FIRST — it is ` +
-          `what runs \`switchroom apply\`, \`vault\`, \`doctor\` and the next ` +
-          `roll host-side, and leaving it behind is how it silently drifted ` +
-          `five releases. Run this on the host, then re-run the roll: ` +
-          `${hostCliInstallCommand(hostCliStamp, target)}. ` +
-          `(Observed from ${HOST_CLI_STAMP_FILENAME}, refreshed by every ` +
-          `host-context switchroom command — if you already upgraded, run any ` +
-          `switchroom command on the host to refresh it, or pass ` +
-          `--allow-stale-host-cli to roll anyway.) Nothing was changed.`;
-        process.stderr.write(refusal + "\n");
-        if (hostdCtx) {
-          process.stdout.write(
-            encodeRolloutResultLine({
-              ok: false,
-              rolled: [],
-              failedStep: PREFLIGHT_HOST_CLI_STALE_STEP,
-              got: observed,
-              warnings: [refusal],
-            }) + "\n",
-          );
-        }
-        process.exitCode = 2;
-        return;
-      }
-      if (opts.allowStaleHostCli && shouldRefuseStaleHostCli(hostCliStamp, target)) {
-        process.stderr.write(
-          `⚠️  --allow-stale-host-cli: rolling past a HOST operator CLI on ` +
-            `v${hostCliStamp?.version} (target ${target}). Fix it host-side ` +
-            `with: ${hostCliInstallCommand(hostCliStamp, target)}\n`,
-        );
-      }
       // #2487 PR2 — downgrade guard: reject a version older than the
       // current release.pin on the hostd path UNLESS --allow-downgrade is
       // set (the operator-approved rollback path). compareReleaseTags is
@@ -2513,6 +2501,145 @@ export function registerRolloutCommand(program: Command): void {
         process.stderr.write("no agents to roll.\n");
         process.exitCode = 2;
         return;
+      }
+
+      // #4571 — HOST-CLI-FIRST gate. The host operator CLI must already be on
+      // the target before a single agent moves.
+      //
+      // ORDERING (#4585): this deliberately sits BELOW every request-validation
+      // bail — downgrade guard, unknown agent, empty agent list. The gate stopped
+      // being read-only when it gained the self-heal: it can now swap the host
+      // binary and rewrite `host-cli.json`. A roll that is going to exit 2 on a
+      // typo'd `--agents` must not mutate the host on its way out, and those
+      // bails promise "Nothing was changed." in as many words.
+      //
+      // On the host-shell path the driving CLI IS the host CLI, so the
+      // `shouldRefuseStaleCli` guard above already enforces this. On the
+      // agent/hostd path it does not: the driving CLI is the hostd IMAGE's
+      // bundled CLI, and nothing in the roll ever observed the host binary —
+      // it was named in a trailing warning after every agent had already
+      // moved. That is how the host CLI reached five releases of drift with
+      // every roll exiting green.
+      //
+      // hostd mounts only `~/.switchroom` (hostd.ts:332): it cannot read
+      // `/usr/local/bin`, cannot read an nvm tree, and cannot `npm i -g` on
+      // the host. So the roll CANNOT install the host CLI IN-PROCESS and any
+      // step claiming to would be a lie. What it can do is REFUSE —
+      // deterministic, before the first mutation, with the correct install
+      // command derived from what the host CLI recorded about itself
+      // (`~/.switchroom/host-cli.json`, written by every host-context CLI
+      // invocation). Silence becomes impossible; the ordering becomes real.
+      //
+      // Conservative, like every other guard here: no stamp (a host CLI older
+      // than this feature never wrote one) or an unorderable version never
+      // blocks. `--allow-stale-host-cli` is the explicit override.
+      let hostCliStamp = readHostCliStamp();
+      // #4585 — SELF-HEAL BEFORE REFUSING. The refusal above names a remedy
+      // the agent path's caller cannot perform, so an agent-initiated roll
+      // dead-ends on it. For a static-binary host CLI the remedy is entirely
+      // mechanical, so attempt it here — in a short-lived helper container
+      // that binds the host install prefix and nothing else (see
+      // ./host-cli-heal.ts for why a helper rather than a hostd mount) — and
+      // only refuse if it fails. Note this runs BEFORE the fleet's first
+      // mutation and touches nothing else: a failed heal leaves the roll
+      // exactly where it stood, refused, with the reason appended.
+      let healNote: string | undefined;
+      // Set when --dry-run declined to perform an otherwise-available heal, so
+      // the gate below reports the INTENT instead of a refusal the real run
+      // would not produce.
+      let healDeferredByDryRun = false;
+      if (!opts.allowStaleHostCli && shouldRefuseStaleHostCli(hostCliStamp, target)) {
+        const plan = planHostCliHeal({ stamp: hostCliStamp, target, hostdCtx });
+        if (plan.action === "skip") {
+          healNote = `host CLI self-heal not attempted: ${plan.reason}.`;
+        } else if (opts.dryRun) {
+          // --dry-run writes NOTHING (the same contract the plan print below
+          // keeps), and swapping the host binary is emphatically a write. So
+          // report what the real run would do and let the plan render, rather
+          // than refusing for a condition the real run clears itself.
+          healDeferredByDryRun = true;
+          healNote =
+            `would upgrade the HOST CLI ${plan.from} → ${plan.target} first, in a ` +
+            `short-lived helper container binding ${plan.prefixHostPath}`;
+          process.stdout.write(`↻ dry-run: ${healNote}\n`);
+        } else {
+          const outcome = runHostCliHeal({
+            plan,
+            docker: hostCliHealDocker ?? defaultHostCliHealDocker,
+            log: (line) => process.stderr.write(line),
+          });
+          if (outcome.ok && outcome.version) {
+            // The swapped binary has not run in host context, so nothing has
+            // refreshed the stamp — do it here, or the gate keeps refusing on
+            // a host CLI that is already correct (#4585 "the stamp doesn't
+            // refresh from a container").
+            const updated: HostCliStamp = {
+              ...(hostCliStamp as HostCliStamp),
+              version: outcome.version.replace(/^v/, ""),
+            };
+            const w = writeHostCliStamp(updated, testHooks?.hostCliStampIo ?? {});
+            // The PROVEN version wins over the record of it. `outcome.version`
+            // comes from host-cli-upgrade re-running the swapped binary, so the
+            // gate's premise — "the host CLI is older than the target" — is
+            // disproved regardless of whether the stamp file could be updated.
+            // Reverting to the pre-heal version here would refuse the roll for
+            // a staleness that no longer exists, and the operator's remedy
+            // ("upgrade the host CLI") would be a no-op they cannot satisfy.
+            hostCliStamp = updated;
+            healNote =
+              `${outcome.message}` +
+              (w.status === "skipped"
+                ? ` (proceeding on the PROVEN version; ${HOST_CLI_STAMP_FILENAME} ` +
+                  `could not be refreshed: ${w.reason} — the next roll will ` +
+                  `re-observe the old version and heal again)`
+                : "");
+            process.stderr.write(`✅ ${healNote}\n`);
+          } else {
+            healNote = `host CLI self-heal FAILED: ${outcome.message}.`;
+            process.stderr.write(`⚠️  ${healNote}\n`);
+          }
+        }
+      }
+      if (
+        !opts.allowStaleHostCli &&
+        !healDeferredByDryRun &&
+        shouldRefuseStaleHostCli(hostCliStamp, target)
+      ) {
+        const observed = hostCliStamp?.version ?? "unknown";
+        const refusal =
+          `rollout refused: the HOST operator CLI is v${observed}, OLDER than ` +
+          `the target ${target}. The host CLI must be upgraded FIRST — it is ` +
+          `what runs \`switchroom apply\`, \`vault\`, \`doctor\` and the next ` +
+          `roll host-side, and leaving it behind is how it silently drifted ` +
+          `five releases. ` +
+          (healNote ? `${healNote} ` : "") +
+          `An operator must run this on the host, then re-run the roll: ` +
+          `${hostCliInstallCommand(hostCliStamp, target)}. ` +
+          `(Observed from ${HOST_CLI_STAMP_FILENAME}, refreshed by every ` +
+          `host-context switchroom command — if you already upgraded, run any ` +
+          `switchroom command on the host to refresh it, or pass ` +
+          `--allow-stale-host-cli to roll anyway.) Nothing was changed.`;
+        process.stderr.write(refusal + "\n");
+        if (hostdCtx) {
+          process.stdout.write(
+            encodeRolloutResultLine({
+              ok: false,
+              rolled: [],
+              failedStep: PREFLIGHT_HOST_CLI_STALE_STEP,
+              got: observed,
+              warnings: [refusal],
+            }) + "\n",
+          );
+        }
+        process.exitCode = 2;
+        return;
+      }
+      if (opts.allowStaleHostCli && shouldRefuseStaleHostCli(hostCliStamp, target)) {
+        process.stderr.write(
+          `⚠️  --allow-stale-host-cli: rolling past a HOST operator CLI on ` +
+            `v${hostCliStamp?.version} (target ${target}). Fix it host-side ` +
+            `with: ${hostCliInstallCommand(hostCliStamp, target)}\n`,
+        );
       }
 
       // Persist the pin durably only when a pin was explicitly given (either
@@ -2553,13 +2680,15 @@ export function registerRolloutCommand(program: Command): void {
         resolveBankId = (agent: string) =>
           (config.agents?.[agent]?.memory as { collection?: string } | undefined)?.collection ?? agent;
       }
-      const deps = createRolloutDeps({
-        configPath,
-        scriptPath,
-        hostdCtx,
-        hindsightApiUrl,
-        resolveBankId,
-      });
+      const deps =
+        testHooks?.rolloutDeps ??
+        createRolloutDeps({
+          configPath,
+          scriptPath,
+          hostdCtx,
+          hindsightApiUrl,
+          resolveBankId,
+        });
 
       process.stdout.write(
         `${opts.allowDowngrade ? "Rolling back" : "Rolling"} ${requested.length} agent(s) to ${target}…\n`,

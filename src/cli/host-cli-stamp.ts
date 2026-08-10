@@ -304,9 +304,29 @@ export function refreshHostCliStamp(
   input: BuildStampInput,
   io: StampIo = {},
 ): { status: "written" | "unchanged" | "skipped"; reason?: string; path?: string } {
+  const stamp = buildHostCliStamp(input, io);
+  if (!stamp) return { status: "skipped", reason: "running in a container" };
+  return writeHostCliStamp(stamp, io);
+}
+
+/**
+ * Write a stamp into the resolved switchroom home.
+ *
+ * Split out of {@link refreshHostCliStamp} so the ROLLOUT path can record a
+ * host CLI it upgraded out-of-band (#4585). After the heal helper swaps the
+ * host binary, nothing has run that binary in host context — so without this
+ * the stamp would keep reporting the old version and the gate would keep
+ * refusing, which is the "stamp doesn't refresh from a container" trap called
+ * out on #4585. The heal is only complete when the observable record moves
+ * with it.
+ *
+ * Best-effort and total, like its caller: every failure returns a reason.
+ */
+export function writeHostCliStamp(
+  stamp: HostCliStamp,
+  io: StampIo = {},
+): { status: "written" | "unchanged" | "skipped"; reason?: string; path?: string } {
   try {
-    const stamp = buildHostCliStamp(input, io);
-    if (!stamp) return { status: "skipped", reason: "running in a container" };
     const dir = resolveStampDir(io);
     if (!dir) return { status: "skipped", reason: "no switchroom home found" };
     const { exists, readFile, writeFile, getuid, chown, statOwner } = resolveIo(io);
