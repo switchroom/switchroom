@@ -271,9 +271,11 @@ export interface ReplyToBufferFallbackParams {
  * `replyToTextEscaped` (for the channel-meta `reply_to_text`), and the
  * recovered `replyToRole` ('assistant' = the bot's own message, disambiguating
  * the "you're replying to yourself" case). Pure except for the injected
- * `lookup`. Only fills in when the live reply text is empty — never overwrites
- * a non-empty live value (a partial-quote or a reply to a person's message).
- * Degrades silently to the id-only inputs on any lookup failure.
+ * `lookup`. Only fills in the TEXT when the live reply text is empty — never
+ * overwrites a non-empty live value (a partial-quote, a reply to a person's
+ * message, or a live-rendered rich parent). Role and kind are filled in from
+ * any buffer hit regardless. Degrades silently to the id-only inputs on any
+ * lookup failure.
  */
 export function resolveReplyToFromBuffer(p: ReplyToBufferFallbackParams): {
   replyToText: string | undefined
