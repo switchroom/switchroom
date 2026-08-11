@@ -6057,6 +6057,328 @@ print(
 )
 PYEOF
 
+# Graph-maintenance retry storm: don't retry a deterministic statement timeout,
+# don't lose the reason, don't roll back Pass 2 when Pass 3 fails.
+#
+# UPSTREAM PATCH — three defects in `graph_maintenance` / the retry helper it
+# uses, all confirmed against the pinned digest's real source. Self-verifying:
+# every anchor is asserted before replacement, so an upstream bump that
+# reformats any of these regions FAILS THE BUILD loudly rather than silently
+# dropping the fix.
+#
+# THE STORM, measured live on this fleet. `graph_maintenance` Pass 3
+# (`prune_stale_cooccurrences`) takes ~114,836 ms / 174M shared-buffer hits on
+# a production bank. The asyncpg client-side `command_timeout` is 60s
+# (HINDSIGHT_API_DB_COMMAND_TIMEOUT, applied at
+# engine/memory_engine.py:3654), so the statement is cancelled at 60s — and
+# then RETRIED, because `_SWEEP_MAX_RETRIES = 8` gives 9 attempts. Two banks x
+# every 30 minutes = ~18 minutes of wasted production DB CPU per cycle,
+# contending with live retain/recall traffic, for work that cannot possibly
+# succeed on attempt 2 when it deterministically failed on attempt 1.
+#
+# A1 — `_is_retryable` (engine/db_utils.py:57) returns True for
+# `asyncio.TimeoutError`. Retrying a statement that deterministically exceeds
+# its timeout is pure waste by construction. This adds an OPT-IN-TO-CURRENT
+# `retry_timeouts: bool = True` knob to `_is_retryable` / `retry_with_backoff`
+# (so every other caller — acquire_with_retry, vector_index_health,
+# bank_utils, memory_engine — keeps upstream behaviour byte-for-byte) and
+# passes `retry_timeouts=False` at the one call site that owns a known-slow
+# bank-wide sweep.
+#
+#   ORDER IS LOAD-BEARING, and this is the trap: on Python 3.10+ the builtin
+#   `TimeoutError` is an `OSError` SUBCLASS, and on 3.11+ (this image runs
+#   3.11.15) `asyncio.TimeoutError` IS that builtin. Upstream's single
+#   `isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError))` line
+#   therefore has TWO arms that both match a timeout. Splitting the timeout arm
+#   out and testing it FIRST is what makes `retry_timeouts=False` actually
+#   bite; leaving it after the OSError arm would make the whole fix inert while
+#   looking correct. Verified in the image:
+#     asyncio.TimeoutError is TimeoutError  -> True
+#     issubclass(TimeoutError, OSError)     -> True
+#
+# A2 — the failure was INVISIBLE. `worker/poller.py`'s generic task-failure
+# handler did `self._mark_failed(task.operation_id, str(e), task.schema)`, and
+# `str(asyncio.TimeoutError())` is the EMPTY STRING (the exception carries no
+# args). So the operation row landed as status='failed' with a BLANK
+# `error_message` and nothing anywhere said why. Measured on this fleet's live
+# bank before the fix: 23 of 28 failed `graph_maintenance` operations had an
+# empty `error_message`. `_describe_exception` guarantees a non-empty,
+# diagnostic string. Deliberately CONSERVATIVE: a non-empty `str(e)` is passed
+# through BYTE-FOR-BYTE, so existing operator surfaces that match on
+# error_message text (and `_summarise_child_error_messages`, which groups
+# siblings by exact message) are unaffected; only the previously-blank case
+# changes.
+#
+# A3 — Pass 2 and Pass 3 shared ONE transaction, so a Pass 3 timeout rolled
+# back Pass 2's completed orphan-entity prune as well: the cheap, useful pass
+# was destroyed by the expensive, failing one, every single cycle. They are
+# split into separate transactions AND separate retry scopes.
+#
+#   The separate RETRY scope is the point, not an accessory. The obvious
+#   split — one `_run_sweep` that does both, still retried as a unit — would
+#   re-run Pass 2 on every Pass 3 retry; the rerun finds 0 orphans (the first
+#   pass already committed them) and OVERWRITES the real count with 0, so the
+#   job under-reports its own work. Retrying only Pass 3 makes that
+#   impossible by construction rather than by a careful `max()`.
+#
+#   Pass 3's failure still propagates (the operation is still marked failed —
+#   this patch removes the wasted retries, it does not hide the failure), but
+#   the log line now names what Pass 2 committed before Pass 3 died.
+#
+# Guarded statically by tests/docker/dockerfile-hindsight-bakes.test.ts and
+# behaviourally (RED against unpatched upstream / GREEN patched) by
+# tests/docker/hindsight-graph-maintenance-retry-storm.test.ts.
+RUN python3 - <<'PYEOF'
+import ast
+import pathlib
+
+TAG = "switchroom hindsight graph-maintenance retry-storm patch"
+BASE = pathlib.Path("/app/api/hindsight_api")
+
+
+def apply(rel, old, new, *, count=1):
+    f = BASE / rel
+    s = f.read_text()
+    n = s.count(old)
+    assert n == count, (
+        f"{TAG}: anchor found {n}x (expected {count}) in {rel} — upstream reformatted "
+        f"this region; re-author this patch in docker/Dockerfile.hindsight. "
+        f"Anchor head: {old.splitlines()[0]!r}"
+    )
+    f.write_text(s.replace(old, new, count))
+
+
+# ---------------------------------------------------------------- A1: db_utils
+apply("engine/db_utils.py", (
+    "def _is_retryable(exc: BaseException) -> bool:\n"
+    '    """Check if an exception is retryable (transient connection issue)."""\n'
+    "    if isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError)):\n"
+    "        return True\n"
+), (
+    "def _is_retryable(exc: BaseException, retry_timeouts: bool = True) -> bool:\n"
+    '    """Check if an exception is retryable (transient connection issue).\n'
+    "\n"
+    "    switchroom: ``retry_timeouts=False`` excludes timeout-class exceptions from\n"
+    "    the retryable set. A statement that DETERMINISTICALLY exceeds the asyncpg\n"
+    "    ``command_timeout`` will exceed it again on the next attempt, so retrying it\n"
+    "    is pure wasted database CPU contending with live traffic. Defaults to True,\n"
+    "    i.e. upstream behaviour, so only callers that opt in are affected.\n"
+    "\n"
+    "    ORDER IS LOAD-BEARING. On Python 3.10+ the builtin ``TimeoutError`` is an\n"
+    "    ``OSError`` subclass, and on 3.11+ ``asyncio.TimeoutError`` IS that builtin.\n"
+    "    The timeout arm must therefore be tested BEFORE the OSError arm — otherwise\n"
+    "    ``retry_timeouts=False`` is silently swallowed by ``isinstance(exc, OSError)``\n"
+    "    and this whole fix is inert while still looking correct.\n"
+    '    """\n'
+    "    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):\n"
+    "        return retry_timeouts\n"
+    "    if isinstance(exc, (OSError, ConnectionError)):\n"
+    "        return True\n"
+))
+
+apply("engine/db_utils.py", (
+    "async def retry_with_backoff(\n"
+    "    func,\n"
+    "    max_retries: int = DEFAULT_MAX_RETRIES,\n"
+    "    base_delay: float = DEFAULT_BASE_DELAY,\n"
+    "    max_delay: float = DEFAULT_MAX_DELAY,\n"
+    "):\n"
+), (
+    "async def retry_with_backoff(\n"
+    "    func,\n"
+    "    max_retries: int = DEFAULT_MAX_RETRIES,\n"
+    "    base_delay: float = DEFAULT_BASE_DELAY,\n"
+    "    max_delay: float = DEFAULT_MAX_DELAY,\n"
+    "    retry_timeouts: bool = True,\n"
+    "):\n"
+))
+
+apply("engine/db_utils.py", (
+    "        max_delay: Maximum delay between retries (seconds)\n"
+    "\n"
+    "    Returns:\n"
+), (
+    "        max_delay: Maximum delay between retries (seconds)\n"
+    "        retry_timeouts: switchroom — when False, timeout-class exceptions are NOT\n"
+    "            retried. Defaults to True (upstream behaviour). Pass False when the\n"
+    "            wrapped statement is known to be deterministically slow, so that its\n"
+    "            timeout is a verdict rather than a transient blip.\n"
+    "\n"
+    "    Returns:\n"
+))
+
+apply("engine/db_utils.py", (
+    "        except Exception as e:\n"
+    "            if not _is_retryable(e):\n"
+    "                raise\n"
+    "            last_exception = e\n"
+), (
+    "        except Exception as e:\n"
+    "            if not _is_retryable(e, retry_timeouts=retry_timeouts):\n"
+    "                raise\n"
+    "            last_exception = e\n"
+))
+
+# ------------------------------------------------------------------ A2: poller
+apply("worker/poller.py", (
+    'def _summarise_child_error_messages(siblings: "Iterable[Any]") -> str:\n'
+), (
+    "def _describe_exception(exc: BaseException, *, context: str = \"\") -> str:\n"
+    '    """switchroom: a guaranteed-non-empty, diagnostic description of ``exc``.\n'
+    "\n"
+    "    ``str(asyncio.TimeoutError())`` is the EMPTY STRING — the exception carries\n"
+    "    no args — and the same is true of any other argless exception. Handing that\n"
+    "    straight to ``_mark_failed`` writes a BLANK ``error_message`` onto the\n"
+    "    operation row, which is the worst possible operator surface: the task reads\n"
+    "    'failed' and nothing anywhere records why. Measured on a live bank before\n"
+    "    this patch: 23 of 28 failed graph_maintenance operations had an empty\n"
+    "    ``error_message``.\n"
+    "\n"
+    "    Conservative on purpose: a non-empty ``str(exc)`` is returned BYTE-FOR-BYTE,\n"
+    "    so operator surfaces that match on error text — and\n"
+    "    ``_summarise_child_error_messages``, which groups failed siblings by exact\n"
+    "    message — are unaffected. Only the previously-blank case changes, and it\n"
+    "    gains the exception class name plus whatever context the caller supplies.\n"
+    '    """\n'
+    "    message = str(exc).strip()\n"
+    "    if message:\n"
+    "        return message\n"
+    "    described = f\"{type(exc).__name__} raised with no message\"\n"
+    "    return f\"{described} ({context})\" if context else described\n"
+    "\n"
+    "\n"
+    'def _summarise_child_error_messages(siblings: "Iterable[Any]") -> str:\n'
+))
+
+apply("worker/poller.py", (
+    "        except Exception as e:\n"
+    '            logger.error(f"Task {task.operation_id} failed: {e}")\n'
+    "            traceback.print_exc()\n"
+    "            try:\n"
+    "                await self._mark_failed(task.operation_id, str(e), task.schema)\n"
+), (
+    "        except Exception as e:\n"
+    "            # switchroom: str(e) is EMPTY for an argless exception (notably\n"
+    "            # asyncio.TimeoutError), which used to write a blank error_message.\n"
+    "            detail = _describe_exception(e, context=f\"task_type={task_type}\")\n"
+    '            logger.error(f"Task {task.operation_id} failed: {detail}")\n'
+    "            traceback.print_exc()\n"
+    "            try:\n"
+    "                await self._mark_failed(task.operation_id, detail, task.schema)\n"
+))
+
+# -------------------------------------------------------- A3: graph_maintenance
+apply("engine/graph_maintenance.py", (
+    "    async def _run_sweep() -> _SweepCounts:\n"
+    "        async with acquire_with_retry(backend) as conn:\n"
+    "            async with conn.transaction():\n"
+    "                orphan_pruned = await store.prune_orphan_entities(conn=conn, fq_table=fq_table, bank_id=bank_id)\n"
+    "                # The orphan prune above cascades cooccurrences via FK. The\n"
+    "                # explicit cooccurrence pass below catches the *stale-count*\n"
+    "                # case: both entities still exist but no current unit witnesses\n"
+    "                # them together.\n"
+    "                stale_pruned = await store.prune_stale_cooccurrences(conn=conn, fq_table=fq_table, bank_id=bank_id)\n"
+    "                return _SweepCounts(orphan_entities_pruned=orphan_pruned, stale_cooccurrences_pruned=stale_pruned)\n"
+), (
+    "    # switchroom: Pass 2 and Pass 3 run in SEPARATE transactions under SEPARATE\n"
+    "    # retry scopes. Sharing one transaction meant a Pass 3 timeout rolled back\n"
+    "    # Pass 2's completed orphan prune as well — the cheap useful pass destroyed\n"
+    "    # by the expensive failing one, every cycle. Sharing one retry scope would\n"
+    "    # additionally re-run Pass 2 on each Pass 3 retry, where it finds 0 orphans\n"
+    "    # (the first pass already committed them) and overwrites the true count with\n"
+    "    # 0. Retrying only Pass 3 makes both failure modes structurally impossible.\n"
+    "    async def _run_orphan_prune() -> int:\n"
+    "        async with acquire_with_retry(backend) as conn:\n"
+    "            async with conn.transaction():\n"
+    "                return await store.prune_orphan_entities(conn=conn, fq_table=fq_table, bank_id=bank_id)\n"
+    "\n"
+    "    async def _run_cooccurrence_prune() -> int:\n"
+    "        # The orphan prune above cascades cooccurrences via FK. This explicit\n"
+    "        # pass catches the *stale-count* case: both entities still exist but no\n"
+    "        # current unit witnesses them together.\n"
+    "        async with acquire_with_retry(backend) as conn:\n"
+    "            async with conn.transaction():\n"
+    "                return await store.prune_stale_cooccurrences(conn=conn, fq_table=fq_table, bank_id=bank_id)\n"
+))
+
+apply("engine/graph_maintenance.py", (
+    "    sweep = await retry_with_backoff(_run_sweep, max_retries=_SWEEP_MAX_RETRIES)\n"
+    "    result.orphan_entities_pruned = sweep.orphan_entities_pruned\n"
+    "    result.stale_cooccurrences_pruned = sweep.stale_cooccurrences_pruned\n"
+), (
+    "    sweep = _SweepCounts(orphan_entities_pruned=0, stale_cooccurrences_pruned=0)\n"
+    "    sweep.orphan_entities_pruned = await retry_with_backoff(_run_orphan_prune, max_retries=_SWEEP_MAX_RETRIES)\n"
+    "    # Committed and recorded BEFORE Pass 3 is attempted, so a Pass 3 failure can\n"
+    "    # neither roll this back nor zero the number that gets reported.\n"
+    "    result.orphan_entities_pruned = sweep.orphan_entities_pruned\n"
+    "    try:\n"
+    "        # switchroom: retry_timeouts=False. Pass 3 is a bank-wide sweep measured at\n"
+    "        # ~115s against a 60s asyncpg command_timeout on a production bank; a\n"
+    "        # cancelled attempt is a verdict on the statement, not a transient blip, so\n"
+    "        # the 8 further attempts were ~9 minutes of wasted DB CPU per bank per run.\n"
+    "        # Deadlocks and connection drops are still retried in full.\n"
+    "        sweep.stale_cooccurrences_pruned = await retry_with_backoff(\n"
+    "            _run_cooccurrence_prune, max_retries=_SWEEP_MAX_RETRIES, retry_timeouts=False\n"
+    "        )\n"
+    "    except Exception as e:\n"
+    "        logger.error(\n"
+    "            f\"[GRAPH_MAINT] bank={bank_id} stale-cooccurrence prune failed \"\n"
+    "            # str(e), NOT `e or ...`: the latter tests the EXCEPTION OBJECT's\n"
+    "            # truthiness (always True), so an argless TimeoutError would print an\n"
+    "            # empty message here — the very defect A2 exists to remove.\n"
+    "            f\"({type(e).__name__}: {str(e) or 'no message'}); Pass 2 already committed \"\n"
+    "            f\"{sweep.orphan_entities_pruned} orphan entities, operation_id={operation_id}\"\n"
+    "        )\n"
+    "        raise\n"
+    "    result.stale_cooccurrences_pruned = sweep.stale_cooccurrences_pruned\n"
+))
+
+# ------------------------------------------------------------------ verify
+for rel in ("engine/db_utils.py", "worker/poller.py", "engine/graph_maintenance.py"):
+    src = (BASE / rel).read_text()
+    ast.parse(src)
+
+du = (BASE / "engine/db_utils.py").read_text()
+assert du.index("isinstance(exc, (asyncio.TimeoutError, TimeoutError))") < du.index(
+    "isinstance(exc, (OSError, ConnectionError))"
+), f"{TAG}: the timeout arm must precede the OSError arm (TimeoutError is an OSError subclass) or retry_timeouts=False is inert"
+assert "asyncio.TimeoutError))" not in du.split("def _is_retryable", 1)[1].split("def retry_with_backoff", 1)[0].replace(
+    "isinstance(exc, (asyncio.TimeoutError, TimeoutError))", ""
+), f"{TAG}: a timeout arm still hides inside another isinstance tuple in _is_retryable"
+assert du.count("_is_retryable(e, retry_timeouts=retry_timeouts)") == 1, (
+    f"{TAG}: retry_with_backoff no longer threads retry_timeouts into _is_retryable"
+)
+assert du.count("if not _is_retryable(e):") == 1, (
+    f"{TAG}: expected acquire_with_retry to keep the plain (timeout-retrying) predicate"
+)
+
+po = (BASE / "worker/poller.py").read_text()
+assert "def _describe_exception(" in po, f"{TAG}: _describe_exception helper missing"
+assert "await self._mark_failed(task.operation_id, str(e), task.schema)" not in po, (
+    f"{TAG}: the generic failure path still passes a possibly-empty str(e) to _mark_failed"
+)
+assert po.count("_describe_exception(e, context=") == 1, f"{TAG}: failure path does not use _describe_exception"
+
+gm = (BASE / "engine/graph_maintenance.py").read_text()
+assert "_run_sweep" not in gm, f"{TAG}: the shared Pass 2+3 transaction survived the patch"
+assert gm.count("async def _run_orphan_prune") == 1 and gm.count("async def _run_cooccurrence_prune") == 1, (
+    f"{TAG}: the split prune helpers are missing"
+)
+assert gm.count("retry_with_backoff(") == 2, f"{TAG}: expected exactly two independent retry scopes"
+assert "retry_timeouts=False" in gm, f"{TAG}: the cooccurrence prune is still retrying timeouts"
+# Pass 2's count must be recorded before Pass 3 is even attempted, so no Pass 3
+# outcome (failure, retry, or rerun) can clobber it.
+assert gm.index("result.orphan_entities_pruned = sweep.orphan_entities_pruned") < gm.index("_run_cooccurrence_prune, max_retries="), (
+    f"{TAG}: the orphan count is recorded after Pass 3 runs and can still be clobbered"
+)
+
+print(
+    f"{TAG}: timeouts are opt-out non-retryable (order-safe against TimeoutError<:OSError); "
+    "empty-str() exceptions now yield a diagnostic error_message; graph-maintenance Pass 2/3 "
+    "split into independent transactions and retry scopes"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

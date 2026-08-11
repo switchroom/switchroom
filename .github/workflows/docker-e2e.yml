@@ -147,6 +147,7 @@ jobs:
               - 'tests/docker/hindsight-query-analyzer-languages.test.ts'
               - 'tests/docker/hindsight-temporal-offload-patch.test.ts'
               - 'tests/docker/hindsight-metrics-cardinality-patch.test.ts'
+              - 'tests/docker/hindsight-graph-maintenance-retry-storm.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
@@ -483,6 +484,21 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-metrics-cardinality-patch.test.ts
 
+      - name: Run the hindsight graph-maintenance retry-storm probe (RED/GREEN, must not skip)
+        # Same contract, for the graph_maintenance retry-storm fix. The bakes
+        # test is grep-on-file and cannot see the outcomes that matter here:
+        # (a) on Python 3.11 `asyncio.TimeoutError` IS builtin `TimeoutError`,
+        # which is an `OSError` SUBCLASS — so an `_is_retryable` whose OSError
+        # arm is checked first returns True regardless of `retry_timeouts`,
+        # leaving the fix silently inert while every string assertion stays
+        # green; (b) that Pass 2's committed orphan count survives a Pass-3
+        # retry instead of being clobbered to 0. Only driving the real
+        # `retry_with_backoff` / `run_graph_maintenance_job` and counting
+        # attempts + reading back the reported counters catches either.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-graph-maintenance-retry-storm.test.ts
+
       - name: Run the hindsight pg_search tokenizer-drift probe (RED/GREEN, must not skip)
         # Epic #4474 finding C1. The bakes test can only see that the patch TEXT
         # is present; it cannot see the outcome that matters — that the shipping
@@ -672,7 +688,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-graph-maintenance-retry-storm hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done
