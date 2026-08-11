@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.6 — Hindsight's `graph_maintenance` sweep stops retrying a query that can never beat its own timeout
+
 ### Bug fixes
 
 - **hindsight: stop the `graph_maintenance` retry storm.** Pass 3 of the
