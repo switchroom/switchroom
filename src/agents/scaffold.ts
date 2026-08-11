@@ -6887,10 +6887,25 @@ export interface ReconcileOptions {
   /**
    * Set true when the caller wants a CRON-ONLY reconcile: only the
    * `schedule.d/` → `cron.d/` derived surfaces (and the cron-session
-   * Tier-1 artifacts under `.claude-cron/`) may be written. Every
-   * switchroom-owned write whose path `classifyChangeKind`
-   * (`src/agents/lifecycle.ts`) does NOT classify as `"cron"` is
-   * suppressed.
+   * Tier-1 artifacts under `.claude-cron/`) should be written.
+   *
+   * SCOPE OF THE GUARANTEE — read this before relying on it. The audit
+   * behind #4607 enumerated the `changes.push` sites reachable from
+   * `reconcileAgentInner`, so what this flag actually guarantees is:
+   *
+   *   no write whose path `classifyChangeKind` (`src/agents/lifecycle.ts`)
+   *   does NOT classify as `"cron"` can reach `result.changes`.
+   *
+   * That is exactly the invariant the bridge's post-hoc check asserts,
+   * and it is what makes #4607 unreproducible. It is NOT a blanket "this
+   * process performs no non-cron file IO": two gated writers here
+   * (`ensureMcpServersTrusted`, `syncGlobalSkills`) never reached
+   * `changes` in the first place and are suppressed on contract grounds
+   * rather than to satisfy the guard, and a handful of ungated non-cron
+   * writes on this path remain — none of them `changes`-visible, so none
+   * can regress #4607. Tracked separately; see the follow-up issue linked
+   * from #4608. Before claiming "the cron-only reconcile writes nothing
+   * else", re-audit rather than trusting this comment.
    *
    * Why this exists (switchroom #4607). `reconcileAgentCronOnly`
    * (`src/cli/reconcile-bridge.ts`) used to run the FULL reconcile with
@@ -6903,9 +6918,10 @@ export interface ReconcileOptions {
    * the scaffold — and the retry succeeded only because the writers are
    * content-gated and the second render was a no-op.
    *
-   * Concretely, this option suppresses FIVE non-cron write sites inside
-   * `reconcileAgent` (the full audit behind #4607 — the issue named the
-   * first two, the other three surface on the same path):
+   * Concretely, this option suppresses FIVE `changes`-visible non-cron
+   * write sites inside `reconcileAgent` (the `changes.push` audit behind
+   * #4607 — the issue named the first two, the other three surface on the
+   * same path):
    *
    *   1. `.claude/settings.json` (classified `"settings"`).
    *   2. `.claude/agents/<sub>.md` sub-agent definitions (`"other"`) —

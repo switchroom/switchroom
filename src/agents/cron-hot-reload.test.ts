@@ -22,6 +22,32 @@ describe("classifyChangeKind", () => {
     expect(classifyChangeKind("/state/agents/foo/telegram/.env")).not.toBe("cron");
   });
 
+  it("tags the telegram/cron-<hash>.source attribution sidecar as cron (#4607)", () => {
+    // The stale-artifact sweep in reconcileAgent unlinks `cron-<hash>.sh`
+    // and its `.source` sidecar in the SAME pass, so a classifier that
+    // anchors on `.sh` alone makes a cron-only reconcile reject its own
+    // cron cleanup. Both basename forms the sweep can produce:
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-0123456789ab.source")).toBe("cron");
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-0123456789ab.sh")).toBe("cron");
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-7.source")).toBe("cron");
+  });
+
+  it("does NOT over-match near-miss cron basenames (#4607 widening stays tight)", () => {
+    // The widened `\.(?:sh|source)$` alternation must not loosen the
+    // `cron-<12hex>|cron-<digits>` stem: a non-hex / wrong-length stem is
+    // not a cron artifact, and mis-tagging one would let a cron-only
+    // reconcile write an arbitrary telegram/ file unchallenged.
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-nothex.source")).toBe("other");
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-nothex.sh")).toBe("other");
+    // 12 hex chars is the Phase-D length; 11 and 13 are not.
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-0123456789a.source")).toBe("other");
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-0123456789abc.source")).toBe("other");
+    // Right stem, wrong extension.
+    expect(classifyChangeKind("/state/agents/foo/telegram/cron-0123456789ab.json")).toBe("other");
+    // `.source` outside the cron- family.
+    expect(classifyChangeKind("/state/agents/foo/telegram/access.source")).toBe("other");
+  });
+
   it("tags settings.json and .mcp.json as settings", () => {
     expect(classifyChangeKind("/state/agents/foo/.claude/settings.json")).toBe("settings");
     expect(classifyChangeKind("/state/agents/foo/.mcp.json")).toBe("settings");

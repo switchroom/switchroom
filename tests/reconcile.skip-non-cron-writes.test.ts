@@ -15,14 +15,26 @@
  * content-gated (second render = no-op).
  *
  * The fix is a real opt-out — `ReconcileOptions.skipNonCronWrites` —
- * which suppresses every writer whose path `classifyChangeKind` does not
- * call `"cron"`.
+ * which suppresses the known writers whose paths `classifyChangeKind`
+ * does not call `"cron"`. Its load-bearing guarantee is scoped to the
+ * `changes.push` audit behind #4607 (no non-cron write can reach
+ * `result.changes`), not to "this process performs no non-cron file IO";
+ * see the option's doc-comment in `src/agents/scaffold.ts`.
  *
- * These tests deliberately assert BOTH halves for each gated writer:
- *   (1) the reconcile succeeds / reports no non-cron change, and
- *   (2) the drifted file on disk is byte-identical to how it started.
- * A test that only checked (1) would pass on the buggy code once the
- * guard was removed, while the writes still landed.
+ * These tests deliberately assert BOTH halves for each gated writer, and
+ * always in this order:
+ *   (1) the drifted file on disk is byte-identical to how it started, and
+ *   (2) the reconcile reports no non-cron change.
+ * Disk state comes FIRST in every drift case on purpose: it is the half a
+ * guard-only "fix" would not catch (a test that only checked (2) passes on
+ * the buggy code the moment the bridge's guard is deleted, while the writes
+ * still land), and for the two writers that never reach `changes` at all —
+ * `syncGlobalSkills`, `ensureMcpServersTrusted` — it is the ONLY half that
+ * can assert anything.
+ *
+ * Cases whose writer never surfaces in `changes` carry an in-test positive
+ * control: the same fixture re-reconciled with the gate off, proving the
+ * writer is genuinely reachable and the gated assertion is not vacuous.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
@@ -32,6 +44,7 @@ import {
   existsSync,
   readFileSync,
   lstatSync,
+  mkdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -143,8 +156,62 @@ describe("reconcileAgent — skipNonCronWrites (#4607)", () => {
       CRON_ONLY,
     );
 
-    expect(result.changes.filter((p) => classifyChangeKind(p) !== "cron")).toEqual([]);
+    // Disk state first — see case 1.
     expect(readFileSync(mcpJsonPath, "utf-8")).toBe(drifted);
+    expect(result.changes.filter((p) => classifyChangeKind(p) !== "cron")).toEqual([]);
+  });
+
+  it("placeholder telegram/.env: cron-only reconcile does NOT perform the bot-token refresh", () => {
+    // The scenario from #4607's review: an agent scaffolded while its
+    // `bot_token` was an unresolvable `vault:` reference froze the
+    // placeholder into `telegram/.env`; the operator later runs
+    // `vault set`, and the agent's next `schedule_add` would have
+    // silently rewritten `.env` (classified "other") as a side effect.
+    // A schedule change never implies a bot-token repair — that is the
+    // host reconcile's job.
+    const name = "zeta";
+    scaffoldAgent(name, makeAgentConfig(), tmpDir, telegramConfig, switchroomConfig);
+
+    const envPath = join(tmpDir, name, "telegram", ".env");
+    expect(existsSync(envPath)).toBe(true);
+    // Put the file back into the state a vault-unresolvable scaffold
+    // leaves behind: no active TELEGRAM_BOT_TOKEN= line.
+    const placeholder = "# Set your bot token: TELEGRAM_BOT_TOKEN=your-token-here\n";
+    writeFileSync(envPath, placeholder, "utf-8");
+
+    const result = reconcileAgent(
+      name,
+      makeAgentConfig(),
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+      undefined,
+      CRON_ONLY,
+    );
+
+    // Disk state first — see case 1.
+    expect(readFileSync(envPath, "utf-8")).toBe(placeholder);
+    expect(result.changes.filter((p) => classifyChangeKind(p) !== "cron")).toEqual([]);
+
+    // Positive control, in-test: the SAME fixture with the gate off DOES
+    // refresh the token. Without this the case could pass vacuously (a
+    // fixture that never reaches the writer asserts nothing), and it is
+    // what makes the test fail if the gate at scaffold.ts's
+    // `refreshTelegramBotTokenEnv` call site is ever dropped — the first
+    // assertion above would then see the refreshed body instead of the
+    // placeholder.
+    const ungated = reconcileAgent(
+      name,
+      makeAgentConfig(),
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+      undefined,
+      {},
+    );
+    expect(readFileSync(envPath, "utf-8")).not.toBe(placeholder);
+    expect(readFileSync(envPath, "utf-8")).toContain(telegramConfig.bot_token);
+    expect(ungated.changes).toContain(envPath);
   });
 
   it("missing SOUL.md symlink: cron-only reconcile does not perform the migration", () => {
@@ -171,9 +238,54 @@ describe("reconcileAgent — skipNonCronWrites (#4607)", () => {
       CRON_ONLY,
     );
 
-    expect(result.changes.filter((p) => classifyChangeKind(p) !== "cron")).toEqual([]);
+    // Disk state first — see case 1.
     expect(lstatSync(agentSoulPath).isSymbolicLink()).toBe(false);
     expect(readFileSync(agentSoulPath, "utf-8")).toBe("# hand-written soul\n");
+    expect(result.changes.filter((p) => classifyChangeKind(p) !== "cron")).toEqual([]);
+  });
+
+  it("newly declared global skill: cron-only reconcile does NOT sync the .claude/skills/ symlink", () => {
+    // `syncGlobalSkills` never pushes to `changes`, so the bridge's guard
+    // could never have caught it — it is gated because the contract is
+    // "cron only", not "cron only as far as the guard can see". Asserted
+    // on disk for exactly that reason.
+    const name = "eta";
+    const skillsPool = join(tmpDir, "_pool");
+    mkdirSync(join(skillsPool, "humanizer"), { recursive: true });
+    writeFileSync(join(skillsPool, "humanizer", "SKILL.md"), "# humanizer\n", "utf-8");
+    const configWithPool = {
+      ...switchroomConfig,
+      switchroom: { skills_dir: skillsPool },
+    } as unknown as SwitchroomConfig;
+
+    // Scaffold WITHOUT the skill, then reconcile with it declared — the
+    // real shape (operator adds `skills:` to switchroom.yaml; the agent's
+    // next schedule_add must not be what installs it).
+    scaffoldAgent(name, makeAgentConfig(), tmpDir, telegramConfig, configWithPool);
+    const linkPath = join(tmpDir, name, ".claude", "skills", "humanizer");
+    // lstat, not existsSync: existsSync follows the link, so a BROKEN
+    // symlink would read as "absent" and pass this vacuously.
+    expect(lstatSyncSafe(linkPath)).toBe(false);
+
+    const withSkill = { ...makeAgentConfig(), skills: ["humanizer"] } as unknown as AgentConfig;
+    const result = reconcileAgent(
+      name,
+      withSkill,
+      tmpDir,
+      telegramConfig,
+      configWithPool,
+      undefined,
+      CRON_ONLY,
+    );
+
+    // Disk state first — see case 1.
+    expect(lstatSyncSafe(linkPath)).toBe(false);
+    expect(result.changes.filter((p) => classifyChangeKind(p) !== "cron")).toEqual([]);
+
+    // Positive control: same fixture, gate off, the symlink lands. Proves
+    // the case is not passing vacuously on an unreachable writer.
+    reconcileAgent(name, withSkill, tmpDir, telegramConfig, configWithPool, undefined, {});
+    expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
   });
 
   it("default options still write the scaffold surfaces (the gate is honest, not a global mute)", () => {

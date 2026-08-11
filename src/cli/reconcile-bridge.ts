@@ -81,11 +81,17 @@ export function reconcileAgentCronOnly(
       { skipProfileTemplates: true, skipNonCronWrites: true },
     );
     const changes = [...result.changes];
-    // Invariant assertion, not a filter: with skipNonCronWrites the
-    // reconcile cannot write a non-cron path, so a non-cron entry here
-    // means a new writer was added without a gate. Keeping the check
-    // makes that regression loud at the first call instead of silently
-    // widening the cron-only contract.
+    // Invariant assertion, not a filter. `skipNonCronWrites` gates every
+    // known non-cron writer that reports into `changes`, so a non-cron
+    // entry HERE means a new `changes.push` writer was added without a
+    // gate. Keeping the check makes that regression loud at the first
+    // call instead of silently widening the cron-only contract.
+    //
+    // Note the reach: this can only see writes that surface in `changes`.
+    // A non-cron writer that pushes nothing is invisible to it — which is
+    // why the gate, not this check, is the fix for #4607, and why the
+    // remaining ungated `changes`-invisible writes on this path are
+    // tracked as a follow-up rather than assumed absent.
     const nonCron = changes.filter((p) => classifyChangeKind(p) !== "cron");
     if (nonCron.length > 0) {
       return {
