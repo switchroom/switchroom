@@ -19,7 +19,7 @@
  * the duplicate. This is the exact duplicate-reply class the shared-singleton
  * injection (never a re-`new`) exists to kill.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import {
@@ -46,6 +46,15 @@ import {
 } from '../typing-emitter.js'
 import type { CurrentTurn } from '../gateway/gateway.js'
 import type { ReplyOwnerTier } from '../reply-owner-resolve.js'
+
+// The parked turn-start store is module-scope and `bun test` runs every file in
+// ONE process, so the two describe-scoped `beforeEach` resets below clean ENTRY
+// only — a case that ends mid-park still leaks into the next FILE, where the
+// obligation sweep reads the leftover as a busy session (#4611). File-level so
+// it covers every case here, not just the two blocks that reset on entry.
+afterEach(() => {
+  __resetParkedTurnStartsForTest()
+})
 
 /** The owner-resolution shape `resolveReplyOwnerTurn` returns, including the
  *  candidate set the content-gate bypass corroborates against. These fixtures

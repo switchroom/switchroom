@@ -15,17 +15,29 @@
 #                           Hindsight auto-creates on miss. On 2026-07-30 a
 #                           harness sweep minted 11 that way, one named
 #                           `clerk`, colliding with a live agent.
+#   parked-turn-start-guard a `bun test` file that EXITS with an entry still
+#                           parked in stream-render's module-scope
+#                           `parkedTurnStarts` makes every later file in the
+#                           one-process sweep read the CLI session as busy —
+#                           how #4611 ejected two PRs from the merge queue.
+#                           Fails the leaking test, not its victim 200 files
+#                           later. `bun test` only: it needs `bun:test`'s
+#                           lifecycle registry, so it has no vitest.config.ts
+#                           counterpart (the suites that drive the parked
+#                           store are bun-side).
 #
 # bun reads the bunfig.toml in its CWD (not an ancestor's), and this repo runs
 # `bun test` from two directories — the repo root (`npm run test:bun`) and
 # `telegram-plugin/` (CI's `bun-test-run`, via scripts/bun-test-ci.sh). Hence
-# the sibling `telegram-plugin/bunfig.toml`. All four wirings are pinned by
-# `npm run lint:agent-state-dir-hermeticity` and
-# `npm run lint:hindsight-bank-hermeticity`.
+# the sibling `telegram-plugin/bunfig.toml`. All six wirings are pinned by
+# `npm run lint:agent-state-dir-hermeticity`,
+# `npm run lint:hindsight-bank-hermeticity` and
+# `npm run lint:parked-turn-start-hermeticity`.
 #
 # `preload` paths are resolved relative to this file.
 [test]
 preload = [
   "./tests/vitest-setup/agent-state-dir-guard.mjs",
   "./tests/vitest-setup/hindsight-bank-guard.mjs",
+  "./tests/vitest-setup/parked-turn-start-guard.mjs",
 ]

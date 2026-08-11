@@ -23,7 +23,7 @@
  * parked store is emptied AND the parked message was handed back into turn
  * processing (its turn begun, its card opened) rather than silently dropped.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   handleSessionEvent,
   drainParkedTurnStartsForChat,
@@ -34,7 +34,13 @@ import { buildSilencePokeOptions } from '../gateway/liveness-wiring.js'
 import { makeLivenessFixture, makeTurn, statusKeyForTests } from './helpers/liveness-wiring-fixture.js'
 import { CHAT, enqueue, makeHarness } from './turn-mint-harness.js'
 
+// Module-scope store + one-process `bun test` sweep: resetting on ENTRY alone
+// leaves a mid-park case's entry behind for every later FILE, which makes the
+// obligation sweep read the session as busy for the rest of the run (#4611).
 beforeEach(() => {
+  __resetParkedTurnStartsForTest()
+})
+afterEach(() => {
   __resetParkedTurnStartsForTest()
 })
 

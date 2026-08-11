@@ -392,6 +392,12 @@ export default defineConfig({
       // run under bun by definition (same shape as the state-dir alarm
       // above). The vitest half is pinned by tests/hindsight-bank-guard.test.ts.
       "**/telegram-plugin/tests/hindsight-bank-preload.test.ts",
+      // parked-turn-start-preload.test.ts is the runtime alarm for the
+      // parked-turn-start leak guard (#4611). That guard is bun-ONLY — it
+      // registers a global `afterEach` through `bun:test`'s lifecycle registry
+      // — so both it and its alarm run under bun by definition; there is no
+      // vitest half to pin.
+      "**/telegram-plugin/tests/parked-turn-start-preload.test.ts",
     ],
     coverage: {
       provider: "v8",

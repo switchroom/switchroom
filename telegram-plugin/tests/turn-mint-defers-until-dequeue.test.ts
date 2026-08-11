@@ -20,7 +20,7 @@
  * These drive the REAL `handleSessionEvent` (extracted-module golden-harness
  * oracle, same standard as `stream-render-golden.test.ts`).
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   handleSessionEvent,
   __resetParkedTurnStartsForTest,
@@ -29,7 +29,13 @@ import {
 import { projectTranscriptLine } from '../session-tail.js'
 import { CHAT, enqueue, inbound, makeHarness } from './turn-mint-harness.js'
 
+// Module-scope store + one-process `bun test` sweep: resetting on ENTRY alone
+// leaves a mid-park case's entry behind for every later FILE, which makes the
+// obligation sweep read the session as busy for the rest of the run (#4611).
 beforeEach(() => {
+  __resetParkedTurnStartsForTest()
+})
+afterEach(() => {
   __resetParkedTurnStartsForTest()
 })
 

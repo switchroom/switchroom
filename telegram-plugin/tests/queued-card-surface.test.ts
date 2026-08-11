@@ -14,7 +14,7 @@
  *   • remove  → the card is finalized as "folded into the current task".
  *   • TTL     → the card is finalized as timed-out, never left frozen.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   handleSessionEvent,
   __resetParkedTurnStartsForTest,
@@ -58,7 +58,15 @@ function withRecordingBot(h: Harness) {
  *  stores the card id on the parked envelope) has run. */
 const settle = () => new Promise((r) => setTimeout(r, 0))
 
+// The parked store is module-scope and `bun test` runs all ~657 files in ONE
+// process, so resetting on ENTRY alone is not enough: a case that ends mid-park
+// leaves the entry behind for every later FILE. #4611 — this suite's last case
+// parks msg 502 and never dequeues, and the leftover made the obligation sweep
+// read the session as busy for the rest of the run, failing represent-guard.
 beforeEach(() => {
+  __resetParkedTurnStartsForTest()
+})
+afterEach(() => {
   __resetParkedTurnStartsForTest()
 })
 

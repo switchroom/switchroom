@@ -3,12 +3,20 @@
 #
 # bun reads the bunfig.toml in its CWD only, so this file exists purely to load
 # the same shared-state hermeticity preloads as the repo-root bunfig.toml. Keep
-# the two in sync; `npm run lint:agent-state-dir-hermeticity` and
-# `npm run lint:hindsight-bank-hermeticity` fail if either bunfig stops loading
-# either guard. Rationale lives in tests/vitest-setup/agent-state-dir-guard.mjs
-# and tests/vitest-setup/hindsight-bank-guard.mjs.
+# the two in sync; `npm run lint:agent-state-dir-hermeticity`,
+# `npm run lint:hindsight-bank-hermeticity` and
+# `npm run lint:parked-turn-start-hermeticity` fail if either bunfig stops
+# loading any of the three guards. Rationale lives in
+# tests/vitest-setup/agent-state-dir-guard.mjs,
+# tests/vitest-setup/hindsight-bank-guard.mjs and
+# tests/vitest-setup/parked-turn-start-guard.mjs.
+#
+# This is the bunfig CI's full plugin sweep reads, so the parked-turn-start
+# guard's blast radius is exactly the ~657-file one-process run that #4611
+# poisoned.
 [test]
 preload = [
   "../tests/vitest-setup/agent-state-dir-guard.mjs",
   "../tests/vitest-setup/hindsight-bank-guard.mjs",
+  "../tests/vitest-setup/parked-turn-start-guard.mjs",
 ]
