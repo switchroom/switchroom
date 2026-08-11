@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **autoaccept: select Continue with Fable on the usage-credits consent modal**
+
 ## v0.21.6 — Hindsight's `graph_maintenance` sweep stops retrying a query that can never beat its own timeout
 
 ### Bug fixes
