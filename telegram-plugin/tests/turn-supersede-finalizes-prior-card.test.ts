@@ -25,7 +25,7 @@
  * mints straight on top of it. That is the exact orphan carrie hit, and it is
  * what FIX B finalizes.
  */
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   handleSessionEvent,
   __resetParkedTurnStartsForTest,
@@ -45,7 +45,13 @@ function syntheticEnqueue(chatId: string, text: string) {
   }
 }
 
+// Module-scope store + one-process `bun test` sweep: resetting on ENTRY alone
+// leaves a mid-park case's entry behind for every later FILE, which makes the
+// obligation sweep read the session as busy for the rest of the run (#4611).
 beforeEach(() => {
+  __resetParkedTurnStartsForTest()
+})
+afterEach(() => {
   __resetParkedTurnStartsForTest()
 })
 

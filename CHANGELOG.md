@@ -39,6 +39,30 @@ now an anomaly worth investigating, not the norm.
 
 - **autoaccept: select Continue with Fable on the usage-credits consent modal**
 - **reconcile: make the cron-only reconcile actually cron-only (#4607)**
+- **tests: stop one bun test file leaking a parked turn-start into the next
+  (#4611).** `bun test` runs all ~657 telegram-plugin files in ONE process with
+  ONE module registry, so `parkedTurnStarts` — module-scope in
+  `gateway/stream-render.ts` by design, because it mirrors the ONE claude CLI
+  session's ONE queue — is shared by every file in the sweep.
+  `tests/queued-card-surface.test.ts` reset it in `beforeEach` only; its last
+  case parks message 502 and never dequeues, so the file EXITED with
+  `parkedTurnStartCount() === 1` and nothing later in the suite drained it.
+  `gateway/obligation-wiring.ts` folds that count into `sessionBusy`, so
+  `tests/represent-guard.test.ts`'s "does NOT defer when the session is idle" —
+  which stubs out every OTHER busy input — saw a 20-minute background-work
+  grace and asserted `toHaveLength(1)` against `0`. Because bun's file order is
+  not stable across checkouts it only failed when the leaker happened to run
+  first, so two PRs were ejected from the merge queue (`failed_checks`) by runs
+  whose byte-identical retries then passed. Two halves: the five suites that
+  drive `handleSessionEvent` now reset on EXIT as well as entry
+  (`afterEach(() => __resetParkedTurnStartsForTest())`), and — so the class
+  cannot regrow the next time someone adds a sixth — a new bun preload
+  (`tests/vitest-setup/parked-turn-start-guard.mjs`, wired into both
+  `bunfig.toml`s and pinned by `npm run lint:parked-turn-start-hermeticity`)
+  registers a global `afterEach` that fails the LEAKING test by name, on the
+  line that leaked, and resets the store before rethrowing so one actionable
+  failure replaces the ~1800-deep victim cascade a permanent leak otherwise
+  produces.
 
 ## v0.21.6 — Hindsight's `graph_maintenance` sweep stops retrying a query that can never beat its own timeout
 
