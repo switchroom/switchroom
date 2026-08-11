@@ -39,10 +39,131 @@ export interface PromptRule {
   name: string;
   /** regex against the captured pane text */
   match: RegExp;
+  /**
+   * Optional NEGATIVE guard. When it matches the same pane, the rule does
+   * NOT fire even though `match` hit. Used to keep broad catch-all rules
+   * (the generic "Enter to confirm") off panes where their remedy would be
+   * actively wrong — see `NUMBERED_CHOICE_SIGNATURE`.
+   */
+  notMatch?: RegExp;
   /** keystrokes to send via `tmux send-keys -t <agent>`. e.g. ["Enter"] or ["Down", "Enter"] */
   keys: string[];
+  /**
+   * Optional pane-derived keystroke resolver, for rules that must SELECT a
+   * specific labelled option rather than send a fixed sequence (the
+   * `usageCreditsMenuNav()` idiom in `wedge-watchdog.ts`). Returning `null`
+   * falls back to the static `keys`, so a rule with a resolver still has a
+   * deterministic remedy when the pane can't be parsed.
+   */
+  keysFor?: (text: string) => string[] | null;
   /** Optional: only match this prompt at most N times. Default 1. */
   maxFires?: number;
+}
+
+/**
+ * A pane presenting a NUMBERED multiple-choice selector — at least an
+ * option-1 and an option-2 row, with or without the `❯` cursor glyph.
+ *
+ * This is the negative guard on the generic "Enter to confirm" catch-all.
+ * Blind Enter on a selector does not "confirm" anything meaningful: it
+ * activates whatever row the CLI focused by default, which may be neither
+ * safe nor what the operator configured. The Fable-5 usage-credits modal is
+ * the case that proved it — its `defaultFocusValue` is `"switch"` (option 2,
+ * "Switch to Sonnet 5 and continue"), so the catch-all's bare Enter silently
+ * DECLINED Fable and downgraded every agent pinned to it, until start.sh gave
+ * up: "session-model: override 'fable' did not reach a healthy boot after 3
+ * attempts — reverting to configured default".
+ *
+ * Every selector the boot poller is meant to answer already has a dedicated,
+ * option-aware rule above the catch-all (theme, provider, MCP trust,
+ * dev-channels, fable-consent). The catch-all's remaining job is the PLAIN
+ * confirmation ("Press Enter to confirm your selection"), which has no
+ * numbered rows. So the guard costs nothing for known prompts, and for an
+ * UNKNOWN numbered chooser it deliberately prefers a visible stall (the
+ * wedge-watchdog and the operator both see it) over an invisible wrong pick.
+ */
+export const NUMBERED_CHOICE_SIGNATURE =
+  /(?=[\s\S]*^[^\S\n]*(?:❯[^\S\n]*)?1\.[^\S\n]+\S)(?=[\s\S]*^[^\S\n]*(?:❯[^\S\n]*)?2\.[^\S\n]+\S)/m;
+
+/**
+ * Claude Code's Fable-5 usage-credits consent modal:
+ *
+ *     Fable 5 now uses usage credits
+ *
+ *     Fable 5 runs on usage credits, purchased separately from your plan.
+ *
+ *       1. Continue with Fable 5
+ *     ❯ 2. Switch to Sonnet 5 and continue
+ *
+ *     Enter to confirm · Esc to cancel
+ *
+ * Two INDEPENDENT anchors, both required, so it can never false-positive on
+ * ordinary model output or on the `/rate-limit-options` menu (which also says
+ * "usage credits" but never "Continue with Fable"):
+ *   (a) the confirm-option row "Continue with Fable", which sits at the
+ *       BOTTOM of the pane with the other options and therefore cannot
+ *       scroll out of the `capture-pane` viewport (the #2218 lesson), AND
+ *   (b) the "usage credits" wording of the modal body/title.
+ *
+ * Anchor (a) is load-bearing for SPEND SAFETY, not just precision. The same
+ * CLI component renders variants whose option 1 is "Buy usage credits" /
+ * "Yes, buy usage credits" / "Request usage credits from your admin" when the
+ * org has no credit balance. Those are purchase actions and must NEVER be
+ * auto-selected; none of them contains "Continue with Fable", so this
+ * signature does not match them and the modal is simply left alone.
+ *
+ * Consent authority: selecting "Continue with Fable 5" is not the watchdog
+ * deciding to spend. This modal only renders because the session was launched
+ * on (or switched to) `fable`, which is an operator decision expressed in
+ * `switchroom.yaml` / a `/model fable` command. The keystroke re-affirms a
+ * choice the operator already made; declining it is what silently contradicts
+ * them.
+ */
+export const FABLE_CONSENT_SIGNATURE =
+  /(?=[\s\S]*Continue with Fable)(?=[\s\S]*usage credits)/i;
+
+/**
+ * Compute the keystroke sequence that selects "Continue with Fable 5" in the
+ * consent modal above, from a captured pane. Same shape as
+ * `usageCreditsMenuNav()` in `wedge-watchdog.ts`: parse the numbered option
+ * rows, locate the one we want by LABEL, and emit keys for it.
+ *
+ * The remedy is the option's own digit followed by Enter — verified by hand
+ * on a live wedged pane (finn, 2026-08-11): `1` + Enter selected "Continue
+ * with Fable 5" and the session came up on fable immediately. Digit-select is
+ * preferred over `usageCreditsMenuNav`'s relative Up/Down navigation here
+ * because the modal's default focus is option 2, so a directional plan would
+ * depend on correctly reading the `❯` cursor; the digit is absolute.
+ *
+ * Returns `null` when the row cannot be located (no numbered rows parsed, or
+ * no row labelled "Continue with Fable") — the caller then falls back to the
+ * rule's static keys.
+ */
+export function fableConsentNav(text: string): string[] | null {
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$/);
+    if (!m) continue;
+    if (/Continue with Fable/i.test(m[3])) return [m[2], "Enter"];
+  }
+  return null;
+}
+
+/**
+ * Whether `rule` applies to this pane: `match` hits AND the optional
+ * `notMatch` guard does not. Single decision point shared by the boot poller
+ * and by any caller that needs to reason about rule applicability (e.g. the
+ * wedge-watchdog's `deferToPrompts`), so a guard can never be honoured in one
+ * place and ignored in another.
+ */
+export function ruleMatches(rule: PromptRule, text: string): boolean {
+  if (!rule.match.test(text)) return false;
+  if (rule.notMatch && rule.notMatch.test(text)) return false;
+  return true;
+}
+
+/** Keys this rule would send for this pane (resolver first, static fallback). */
+export function resolveRuleKeys(rule: PromptRule, text: string): string[] {
+  return rule.keysFor?.(text) ?? rule.keys;
 }
 
 export interface AutoacceptOptions {
@@ -172,10 +293,37 @@ export const PROMPTS: PromptRule[] = [
     maxFires: 5,
   },
   {
+    // Fable-5 usage-credits consent modal. MUST sit above the generic
+    // "Enter to confirm" catch-all: the modal's footer is "Enter to confirm
+    // · Esc to cancel", so the catch-all matches it too — and its bare Enter
+    // hits the CLI's `defaultFocusValue:"switch"`, i.e. option 2 ("Switch to
+    // Sonnet 5 and continue"), silently declining Fable. The catch-all is
+    // additionally guarded below, but rule order is the primary defence.
+    //
+    // Remedy is the option's digit + Enter, resolved from the pane by
+    // `fableConsentNav` so a reordered menu still selects the right LABEL.
+    // The static fallback is ["1", "Enter"] because "Continue with Fable 5"
+    // is option 1 in every rendering of this component, and the signature
+    // has already proved that label is on screen.
+    //
+    // maxFires is 1: consent is persisted by the CLI to
+    // `$CLAUDE_CONFIG_DIR/.claude.json` under `fableOverageConsentV2`, so a
+    // healthy boot answers this at most once per agent config.
+    name: "fable-usage-credits-consent",
+    match: FABLE_CONSENT_SIGNATURE,
+    keysFor: fableConsentNav,
+    keys: ["1", "Enter"],
+  },
+  {
     // Generic "Enter to confirm" — last because the more specific
     // matchers above should take precedence on the same screen.
+    //
+    // Guarded against numbered selectors: on those, Enter activates the
+    // CLI's default focus rather than confirming anything, which is how the
+    // Fable consent modal got auto-declined. See NUMBERED_CHOICE_SIGNATURE.
     name: "enter-to-confirm",
     match: /Enter.{1,30}confirm/,
+    notMatch: NUMBERED_CHOICE_SIGNATURE,
     keys: ["Enter"],
   },
 ];
@@ -283,14 +431,15 @@ export async function runAutoaccept(
     if (text) {
       for (const entry of rules) {
         if (entry.fired >= entry.cap) continue;
-        if (entry.rule.match.test(text)) {
+        if (ruleMatches(entry.rule, text)) {
+          const keys = resolveRuleKeys(entry.rule, text);
           entry.fired++;
           matchedThisPoll = true;
           fired.push(entry.rule.name);
           console.error(
-            `[autoaccept] ${opts.agentName}: fired ${entry.rule.name} (${entry.rule.keys.join("+")})`,
+            `[autoaccept] ${opts.agentName}: fired ${entry.rule.name} (${keys.join("+")})`,
           );
-          sendKeys(opts.agentName, entry.rule.keys);
+          sendKeys(opts.agentName, keys);
         }
       }
     }

@@ -8,10 +8,12 @@ import {
   parseWeeklyReset,
   WEDGE_FOOTER_SIGNATURE,
   CONFIRM_MODAL_SIGNATURE,
+  RATE_LIMIT_MENU_SIGNATURE,
   PERMISSION_PROMPT_SIGNATURE,
   STOP_HOOK_ERROR_SIGNATURE,
   MANIFESTING_SIGNATURE,
 } from "../src/agents/wedge-watchdog.js";
+import { FABLE_CONSENT_SIGNATURE } from "../src/agents/autoaccept.js";
 
 // A realistic blocking-modal pane (the klanker AskUserQuestion shape).
 const WEDGE_SCREEN =
@@ -952,6 +954,95 @@ describe("runWedgeWatchdog — flood-aware permission gate", () => {
 // account for a WEEK. The new branch resolves it to the next occurrence of that
 // wall-clock time (hours away), tz-aware, while leaving the month/day form
 // untouched.
+describe("Fable-5 usage-credits consent modal (mid-session)", () => {
+  // Captured from a live wedged pane (finn, 2026-08-11). Two renderings so
+  // the fixtures exercise SHAPE persistence, not byte-stability.
+  const FABLE_A =
+    "  Fable 5 now uses usage credits\n" +
+    "\n" +
+    "  Fable 5 runs on usage credits, purchased separately from your plan.\n" +
+    "\n" +
+    "    1. Continue with Fable 5\n" +
+    "  ❯ 2. Switch to Sonnet 5 and continue\n" +
+    "\n" +
+    "  Enter to confirm · Esc to cancel";
+  const FABLE_B = FABLE_A.replace("plan.", "plan. ");
+
+  it("no pre-existing signature classifies it — this is why it wedged", () => {
+    // The footer has no "to select" / "to navigate" / ↑↓ affordance…
+    expect(WEDGE_FOOTER_SIGNATURE.test(FABLE_A)).toBe(false);
+    // …option 2 is "Switch to Sonnet 5", not "No"…
+    expect(CONFIRM_MODAL_SIGNATURE.test(FABLE_A)).toBe(false);
+    // …there is no "Do you want to proceed?" / "don't ask again"…
+    expect(PERMISSION_PROMPT_SIGNATURE.test(FABLE_A)).toBe(false);
+    // …and no "Stop and wait for" (the quota-wall anchor), despite the
+    // shared "usage credits" wording.
+    expect(RATE_LIMIT_MENU_SIGNATURE.test(FABLE_A)).toBe(false);
+    // The dedicated signature is the only one that sees it.
+    expect(FABLE_CONSENT_SIGNATURE.test(FABLE_A)).toBe(true);
+  });
+
+  it("selects 'Continue with Fable 5' after the present-streak, never Enter/Esc", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "finn",
+      fableConsentPolls: 3,
+      rateLimitSignature: null,
+      manifestStallSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 3,
+      capture: captureFlicker([FABLE_A, FABLE_B, FABLE_A]),
+      send,
+    });
+    expect(res.fableConsentFires).toBe(1);
+    expect(res.fires).toBe(1);
+    expect(calls).toEqual([["1", "Enter"]]);
+    // Esc cancels the modal (leaving the operator's model choice unmade) and
+    // Enter picks the CLI's default focus, which is option 2.
+    expect(calls).not.toContainEqual(["Escape"]);
+    expect(calls).not.toContainEqual(["Enter"]);
+  });
+
+  it("does NOT fire before the present-streak threshold", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "finn",
+      fableConsentPolls: 3,
+      rateLimitSignature: null,
+      manifestStallSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 2,
+      capture: captureFlicker([FABLE_A, FABLE_B]),
+      send,
+    });
+    expect(res.fableConsentFires).toBe(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("with the branch disabled, nothing else touches the modal (kill switch)", async () => {
+    const { send, calls } = recordSend();
+    const res = await runWedgeWatchdog({
+      agentName: "finn",
+      fableConsentSignature: null,
+      rateLimitSignature: null,
+      manifestStallSignature: null,
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 6,
+      capture: captureFlicker([FABLE_A, FABLE_B]),
+      send,
+    });
+    expect(res.fableConsentFires).toBe(0);
+    expect(res.fires).toBe(0);
+    expect(calls).toEqual([]);
+  });
+});
+
 describe("parseWeeklyReset — time-only session-cap branch (Fix 2)", () => {
   const HOUR = 3600_000;
   const WEEK = 7 * 24 * HOUR;

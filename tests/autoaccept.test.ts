@@ -19,8 +19,44 @@ import {
   PROMPTS,
   capturePane,
   sendKeys,
+  ruleMatches,
+  resolveRuleKeys,
+  fableConsentNav,
+  NUMBERED_CHOICE_SIGNATURE,
   type PromptRule,
 } from "../src/agents/autoaccept.js";
+
+/**
+ * The Fable-5 usage-credits consent modal, as rendered by Claude Code and
+ * captured from a live wedged pane (finn, 2026-08-11). The CLI's option list
+ * carries `defaultFocusValue:"switch"`, i.e. the ❯ cursor sits on option 2 —
+ * so a bare Enter here DECLINES Fable and downgrades the agent to Sonnet.
+ */
+const FABLE_CONSENT_SCREEN =
+  "  Fable 5 now uses usage credits\n" +
+  "\n" +
+  "  Fable 5 runs on usage credits, purchased separately from your plan.\n" +
+  "\n" +
+  "  Learn more: https://support.claude.com/en/articles/12429409-extra-usage\n" +
+  "\n" +
+  "    1. Continue with Fable 5\n" +
+  "  ❯ 2. Switch to Sonnet 5 and continue\n" +
+  "\n" +
+  "  Enter to confirm · Esc to cancel";
+
+/**
+ * The no-credit-balance variant of the SAME CLI component: option 1 is a
+ * PURCHASE, not a consent. Must never be auto-selected.
+ */
+const FABLE_BUY_CREDITS_SCREEN =
+  "  Fable 5 now uses usage credits\n" +
+  "\n" +
+  "  You don't have usage credits yet.\n" +
+  "\n" +
+  "    1. Buy usage credits\n" +
+  "  ❯ 2. Switch to Sonnet 5 and continue\n" +
+  "\n" +
+  "  Enter to confirm · Esc to cancel";
 
 const mockedExec = execFileSync as unknown as ReturnType<typeof vi.fn>;
 
@@ -298,7 +334,9 @@ describe("PROMPTS — regex sanity (translated from bin/autoaccept.exp)", () => 
 
   for (const { text, expected } of fixtures) {
     it(`matches the ${expected} prompt`, () => {
-      const hit = PROMPTS.find((p) => p.match.test(text));
+      // `ruleMatches`, not a bare `match.test`, so the table reflects what
+      // the dispatcher actually does (negative guards included).
+      const hit = PROMPTS.find((p) => ruleMatches(p, text));
       expect(hit?.name).toBe(expected);
     });
   }
@@ -392,6 +430,86 @@ describe("runAutoaccept — new dev-channels prompt dispatch", () => {
     });
     expect(res.fired).toContain("dev-channels");
     expect(sentKeys[0]).toEqual(["Down", "Enter"]);
+  });
+});
+
+describe("Fable-5 usage-credits consent modal", () => {
+  const catchAll = PROMPTS.find((p) => p.name === "enter-to-confirm")!;
+  const fable = PROMPTS.find((p) => p.name === "fable-usage-credits-consent")!;
+
+  it("dispatches option 1 (Continue with Fable 5), never a bare Enter", async () => {
+    const { sentKeys } = setupTmux([FABLE_CONSENT_SCREEN, ""]);
+    const res = await runAutoaccept({
+      agentName: "finn",
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 4,
+    });
+    expect(res.fired).toContain("fable-usage-credits-consent");
+    // THE bug: the pane's "Enter to confirm · Esc to cancel" footer matched
+    // the catch-all, whose bare Enter hit `defaultFocusValue:"switch"` —
+    // option 2, "Switch to Sonnet 5 and continue" — so the agent silently
+    // ran on Sonnet and start.sh eventually reverted the fable override.
+    expect(res.fired).not.toContain("enter-to-confirm");
+    expect(sentKeys).toEqual([["1", "Enter"]]);
+    expect(sentKeys).not.toContainEqual(["Enter"]);
+  });
+
+  it("the fable rule is ordered ABOVE the enter-to-confirm catch-all", () => {
+    const names = PROMPTS.map((p) => p.name);
+    expect(names.indexOf("fable-usage-credits-consent")).toBeLessThan(
+      names.indexOf("enter-to-confirm"),
+    );
+  });
+
+  it("the catch-all is guarded off any numbered selector", () => {
+    expect(catchAll.notMatch).toBe(NUMBERED_CHOICE_SIGNATURE);
+    expect(ruleMatches(catchAll, FABLE_CONSENT_SCREEN)).toBe(false);
+    // Generic shape, not just this modal: any numbered chooser carrying the
+    // confirm footer must be left to a dedicated, option-aware rule.
+    expect(
+      ruleMatches(
+        catchAll,
+        "Pick a plan\n❯ 1. Keep current plan\n  2. Upgrade\n\nEnter to confirm · Esc to cancel",
+      ),
+    ).toBe(false);
+  });
+
+  it("the catch-all still fires on a plain confirmation (no numbered rows)", () => {
+    expect(ruleMatches(catchAll, "Press Enter to confirm your selection")).toBe(true);
+  });
+
+  it("resolves the digit from the pane label, not a hardcoded position", () => {
+    // Same modal with the options renumbered — we follow the LABEL.
+    const reordered = FABLE_CONSENT_SCREEN.replace("    1. Continue with Fable 5", "    3. Continue with Fable 5");
+    expect(fableConsentNav(reordered)).toEqual(["3", "Enter"]);
+    expect(resolveRuleKeys(fable, reordered)).toEqual(["3", "Enter"]);
+  });
+
+  it("falls back to the verified ['1','Enter'] when the rows cannot be parsed", () => {
+    // Signature still hits (label + "usage credits" present) but no option
+    // row parses — the static remedy must still be the fable option.
+    const unparsed = "Fable 5 runs on usage credits · Continue with Fable 5 [1] / Switch to Sonnet [2]";
+    expect(fableConsentNav(unparsed)).toBeNull();
+    expect(ruleMatches(fable, unparsed)).toBe(true);
+    expect(resolveRuleKeys(fable, unparsed)).toEqual(["1", "Enter"]);
+  });
+
+  it("never auto-selects the 'Buy usage credits' variant (spend safety)", async () => {
+    expect(ruleMatches(fable, FABLE_BUY_CREDITS_SCREEN)).toBe(false);
+    const { sentKeys } = setupTmux([FABLE_BUY_CREDITS_SCREEN, ""]);
+    const res = await runAutoaccept({
+      agentName: "finn",
+      pollIntervalMs: 0,
+      now: () => 0,
+      sleep: () => {},
+      maxPolls: 4,
+    });
+    // No rule may answer a purchase prompt — including the catch-all, which
+    // the numbered-selector guard keeps off it.
+    expect(res.fired).toEqual([]);
+    expect(sentKeys).toEqual([]);
   });
 });
 

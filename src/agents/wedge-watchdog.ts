@@ -29,7 +29,15 @@
 //     quo. So we require BOTH a precise blocking-modal signature AND
 //     multi-poll stability before acting, and a cooldown after firing.
 
-import { capturePane, sendKeys, PROMPTS, type PromptRule } from "./autoaccept.js";
+import {
+  capturePane,
+  sendKeys,
+  PROMPTS,
+  ruleMatches,
+  FABLE_CONSENT_SIGNATURE,
+  fableConsentNav,
+  type PromptRule,
+} from "./autoaccept.js";
 import {
   queryPendingPermission as defaultQueryPendingPermission,
   type PendingPermissionQueryResult,
@@ -350,6 +358,10 @@ const DEFAULT_COOLDOWN_MS = 60_000;
 //     stop-hook error anyway).
 const DEFAULT_CONFIRM_MODAL_POLLS = 3;
 const DEFAULT_MANIFEST_STALL_POLLS = 60;
+// The Fable-5 usage-credits consent modal must be PRESENT for this many
+// consecutive polls before we answer it. Same shape-persistence rationale as
+// CONFIRM_MODAL (the Ink modal repaints, so it is never byte-stable).
+const DEFAULT_FABLE_CONSENT_POLLS = 3;
 // A per-tool permission prompt must be PRESENT for this many consecutive
 // polls before Esc. Same shape-persistence rationale as CONFIRM_MODAL:
 // the Ink-rendered prompt repaints so it's not byte-stable. 3 polls ≈ 15s
@@ -482,6 +494,28 @@ export interface WedgeWatchdogOptions {
    */
   confirmModalPolls?: number;
   /**
+   * Fable-5 usage-credits consent modal, detected by SHAPE persistence.
+   *
+   * This modal is a REAL mid-session gap, not just a boot one: none of the
+   * other signatures reach it. `WEDGE_FOOTER_SIGNATURE` requires a "to
+   * select" / "to navigate" / ↑↓ affordance the modal's
+   * "Enter to confirm · Esc to cancel" footer does not have;
+   * `CONFIRM_MODAL_SIGNATURE` requires a "1. Yes / 2. No" pair (option 2 here
+   * is "Switch to Sonnet 5 and continue"); `PERMISSION_PROMPT_SIGNATURE`
+   * requires "Do you want to proceed?" + "don't ask again"; and
+   * `RATE_LIMIT_MENU_SIGNATURE` requires "Stop and wait for". So a `/model
+   * fable` switch mid-session parks the agent on an unanswerable modal
+   * forever. On a shape-persistent match the watchdog selects "Continue with
+   * Fable 5" (`fableConsentNav`), which is the operator's already-expressed
+   * model choice. `null` disables this branch.
+   */
+  fableConsentSignature?: RegExp | null;
+  /**
+   * Consecutive polls the Fable consent modal must be PRESENT before we
+   * answer it. Default `SWITCHROOM_WEDGE_FABLE_POLLS` or 3.
+   */
+  fableConsentPolls?: number;
+  /**
    * Per-tool permission-prompt TUI signature, detected by SHAPE
    * persistence (the prompt continuously PRESENT across polls), same as
    * the confirmation modal. Catches a non-pre-approved MCP tool's
@@ -601,6 +635,9 @@ export interface WedgeWatchdogResult {
   /** #2471 — subset of `fires` that dismissed a confirmation modal detected
    *  by SHAPE persistence (the `/effort`-class wedge). */
   confirmModalFires: number;
+  /** Subset of `fires` that answered the Fable-5 usage-credits consent modal
+   *  by SELECTING "Continue with Fable 5" (never a "buy credits" variant). */
+  fableConsentFires: number;
   /** Subset of `fires` that dismissed a per-tool permission-prompt TUI
    *  (the config_propose_edit / hostd-verb freeze) with a safe Esc-decline. */
   permissionPromptFires: number;
@@ -669,6 +706,13 @@ export async function runWedgeWatchdog(
       : (opts.confirmModalSignature ?? CONFIRM_MODAL_SIGNATURE);
   const confirmModalPolls =
     opts.confirmModalPolls ?? envInt("SWITCHROOM_WEDGE_CONFIRM_POLLS", DEFAULT_CONFIRM_MODAL_POLLS);
+  // Fable-5 usage-credits consent modal. `null` disables; `undefined` → on.
+  const fableConsentSignature =
+    opts.fableConsentSignature === null
+      ? null
+      : (opts.fableConsentSignature ?? FABLE_CONSENT_SIGNATURE);
+  const fableConsentPolls =
+    opts.fableConsentPolls ?? envInt("SWITCHROOM_WEDGE_FABLE_POLLS", DEFAULT_FABLE_CONSENT_POLLS);
   // Per-tool permission-prompt TUI freeze (config_propose_edit / hostd verbs).
   // `null` disables the branch; `undefined` → default on.
   const permissionPromptSignature =
@@ -721,6 +765,7 @@ export async function runWedgeWatchdog(
   let rateLimitFires = 0;
   let overageCreditSelections = 0;
   let confirmModalFires = 0;
+  let fableConsentFires = 0;
   let permissionPromptFires = 0;
   let permissionPromptDeferrals = 0;
   let permissionPromptFloodHolds = 0;
@@ -730,6 +775,7 @@ export async function runWedgeWatchdog(
   // #2471 — shape-persistence counters (independent of the byte-stable
   // `stableCount`): how many CONSECUTIVE polls each shape has been PRESENT.
   let confirmModalPresent = 0;
+  let fableConsentPresent = 0;
   let permissionPromptPresent = 0;
   let manifestStallPresent = 0;
   // Byte-stability of the Manifesting pane across polls — the progress
@@ -738,6 +784,7 @@ export async function runWedgeWatchdog(
   // poll and resets the stall counter; a frozen spinner keeps it identical.
   let lastManifestKey: string | null = null;
   let confirmCooldownUntil = 0;
+  let fableCooldownUntil = 0;
   let permissionCooldownUntil = 0;
   // Log throttle for the two new "holding off on Esc" paths. They are
   // evaluated EVERY poll (deliberately — that is how we notice the moment the
@@ -781,14 +828,29 @@ export async function runWedgeWatchdog(
     // freeze. Precedence above the confirm-modal branch: its shape
     // ("1. Yes / 2. Yes, and don't ask again / 3. No") is a SUPERSET match
     // risk, so we classify it first and Esc-decline it (safe DENY).
+    //
+    // The Fable-5 usage-credits consent modal is classified BEFORE the
+    // permission/confirm/blocking branches, all of which would (if they
+    // matched at all) Esc it — and Esc here cancels the operator's own model
+    // choice. It sits below the rate-limit branch purely defensively: the two
+    // signatures are disjoint ("Stop and wait for" vs "Continue with Fable"),
+    // but the quota wall must always win if a pane ever showed both.
+    const isFableConsent =
+      !isRateLimitMenu &&
+      !!text &&
+      fableConsentSignature !== null &&
+      fableConsentSignature.test(text);
+
     const isPermissionPrompt =
       !isRateLimitMenu &&
+      !isFableConsent &&
       !!text &&
       permissionPromptSignature !== null &&
       permissionPromptSignature.test(text);
 
     const isConfirmModal =
       !isRateLimitMenu &&
+      !isFableConsent &&
       !isPermissionPrompt &&
       !!text &&
       confirmModalSignature !== null &&
@@ -796,13 +858,15 @@ export async function runWedgeWatchdog(
 
     const isBlockingModal =
       !isRateLimitMenu &&
+      !isFableConsent &&
       !isPermissionPrompt &&
       !isConfirmModal &&
       !!text &&
       signature.test(text) &&
       // Defer to the boot autoaccept poller for first-run prompts — those
-      // want Enter, not Esc.
-      !deferToPrompts.some((p) => p.match.test(text));
+      // want Enter, not Esc. `ruleMatches` (not a bare `match.test`) so a
+      // rule's negative guard is honoured here too.
+      !deferToPrompts.some((p) => ruleMatches(p, text));
 
     // #2471 — semantic no-progress tracker, INDEPENDENT of the modal chain: a
     // "Manifesting"/spinning turn that is NOT advancing is wedged despite the
@@ -967,6 +1031,42 @@ export async function runWedgeWatchdog(
         stableCount = 0;
         lastKey = null;
       }
+    } else if (isFableConsent) {
+      // SHAPE persistence (the Ink modal repaints; it is never byte-stable).
+      fableConsentPresent++;
+      // A different shape is showing — keep the other streaks neutral.
+      stableCount = 0;
+      lastKey = null;
+      permissionPromptPresent = 0;
+      confirmModalPresent = 0;
+      if (fableConsentPresent >= fableConsentPolls && now() >= fableCooldownUntil) {
+        // Select "Continue with Fable 5" by its own digit. `fableConsentNav`
+        // resolves the digit from the pane's LABELS; the ["1", "Enter"]
+        // fallback is safe because the signature has already proved the
+        // "Continue with Fable" row is on screen and it is option 1 in every
+        // rendering of this component. We never send a bare Enter: the CLI
+        // focuses option 2 ("Switch to Sonnet 5 and continue") by default, so
+        // Enter would decline the operator's configured model.
+        const nav = fableConsentNav(text) ?? ["1", "Enter"];
+        console.error(
+          `[wedge-watchdog] ${opts.agentName}: Fable-5 usage-credits consent modal present ` +
+            `${fableConsentPresent} polls ` +
+            `(~${Math.round((fableConsentPresent * pollIntervalMs) / 1000)}s) — ` +
+            `selecting "Continue with Fable 5" (${nav.join(" ")}); the session is on fable ` +
+            `because the operator configured it, and Enter/Esc here would silently decline it`,
+        );
+        try {
+          send(opts.agentName, nav);
+        } catch (err) {
+          console.error(
+            `[wedge-watchdog] ${opts.agentName}: send threw: ${(err as Error).message}`,
+          );
+        }
+        fires++;
+        fableConsentFires++;
+        fableCooldownUntil = now() + cooldownMs;
+        fableConsentPresent = 0;
+      }
     } else if (isPermissionPrompt) {
       // SHAPE persistence (the Ink-rendered prompt repaints, so it is not
       // byte-stable). Count consecutive polls the prompt has been PRESENT.
@@ -974,6 +1074,7 @@ export async function runWedgeWatchdog(
       // Keep the byte-stable machinery neutral so a later wedge starts fresh.
       stableCount = 0;
       lastKey = null;
+      fableConsentPresent = 0;
       if (permissionPromptPresent >= permissionPromptPolls && now() >= permissionCooldownUntil) {
         // Issue #2971 — card-aware gate, BEFORE any keystroke. Claude Code
         // renders this TUI AND emits the `permission_request` channel
@@ -1110,6 +1211,7 @@ export async function runWedgeWatchdog(
       stableCount = 0;
       lastKey = null;
       permissionPromptPresent = 0;
+      fableConsentPresent = 0;
       if (confirmModalPresent >= confirmModalPolls && now() >= confirmCooldownUntil) {
         console.error(
           `[wedge-watchdog] ${opts.agentName}: dismissing stuck confirmation modal ` +
@@ -1169,6 +1271,8 @@ export async function runWedgeWatchdog(
       confirmModalPresent = 0;
       // Same for the permission-prompt streak — gone means re-accumulate.
       permissionPromptPresent = 0;
+      // …and the Fable consent modal's.
+      fableConsentPresent = 0;
     }
 
     await sleep(pollIntervalMs);
@@ -1179,6 +1283,7 @@ export async function runWedgeWatchdog(
     rateLimitFires,
     overageCreditSelections,
     confirmModalFires,
+    fableConsentFires,
     permissionPromptFires,
     permissionPromptDeferrals,
     permissionPromptFloodHolds,

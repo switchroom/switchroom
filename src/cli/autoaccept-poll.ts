@@ -154,7 +154,7 @@ async function main(): Promise<void> {
       floodPressure: permissionFloodAware ? undefined : null,
     });
     console.error(
-      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} permissionPromptFires=${res.permissionPromptFires} permissionPromptDeferrals=${res.permissionPromptDeferrals} permissionPromptFloodHolds=${res.permissionPromptFloodHolds} permissionPromptCardlessHolds=${res.permissionPromptCardlessHolds} restartEscalations=${res.restartEscalations}`,
+      `[autoaccept-poll] ${agentName}: wedge-watchdog returned reason=${res.reason} fires=${res.fires} rateLimitFires=${res.rateLimitFires} overageCreditSelections=${res.overageCreditSelections} confirmModalFires=${res.confirmModalFires} fableConsentFires=${res.fableConsentFires} permissionPromptFires=${res.permissionPromptFires} permissionPromptDeferrals=${res.permissionPromptDeferrals} permissionPromptFloodHolds=${res.permissionPromptFloodHolds} permissionPromptCardlessHolds=${res.permissionPromptCardlessHolds} restartEscalations=${res.restartEscalations}`,
     );
   } catch (err) {
     console.error(
