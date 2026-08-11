@@ -18,6 +18,7 @@ now an anomaly worth investigating, not the norm.
 ### Bug fixes
 
 - **autoaccept: select Continue with Fable on the usage-credits consent modal**
+- **reconcile: make the cron-only reconcile actually cron-only (#4607)**
 
 ## v0.21.6 — Hindsight's `graph_maintenance` sweep stops retrying a query that can never beat its own timeout
 
