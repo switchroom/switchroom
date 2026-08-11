@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
+
 ### Dependencies
 
 - **Claude Code CLI pinned 2.1.226 → 2.1.228** — all three lockstep locations
@@ -37,8 +39,54 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
-- **autoaccept: select Continue with Fable on the usage-credits consent modal**
-- **reconcile: make the cron-only reconcile actually cron-only (#4607)**
+- **autoaccept: select Continue with Fable on the usage-credits consent
+  modal.** The Fable 5 usage-credits consent modal renders with
+  `defaultFocusValue:"switch"` — the focused option is 2, "Switch to Sonnet 5
+  and continue" — and its footer, "Enter to confirm · Esc to cancel", matched
+  the boot poller's generic `enter-to-confirm` catch-all. The bare Enter
+  therefore selected the DEFAULT and silently declined Fable, so an agent
+  pinned to `fable` never reached a healthy fable boot: `start.sh` logged
+  "session-model: override 'fable' did not reach a healthy boot after 3
+  attempts — reverting to configured default" (observed on `finn`,
+  2026-08-11). Three parts: a new `fable-usage-credits-consent` rule ordered
+  above the catch-all selects the option by its own digit via
+  `fableConsentNav()` and anchors on the "Continue with Fable" label, so the
+  no-balance variant of the same component ("Buy usage credits") is never
+  auto-selected; a new `PromptRule.notMatch` guard makes the catch-all decline
+  any numbered selector (`NUMBERED_CHOICE_SIGNATURE`), where a blind Enter
+  activates the CLI's default focus rather than confirming anything; and
+  `wedge-watchdog` gains a dedicated `FABLE_CONSENT_SIGNATURE` branch, because
+  no existing signature classified this modal and a mid-session `/model fable`
+  parked the agent on it forever. (#4606)
+
+- **reconcile: make the cron-only reconcile actually cron-only.**
+  `reconcileAgentCronOnly` ran the FULL `reconcileAgent` with only
+  `skipProfileTemplates: true`, then post-hoc rejected the result if any path
+  in `result.changes` was not classified `"cron"`. The scaffold writers had no
+  skip gate, so `.claude/agents/<sub>.md` and `.claude/settings.json` were
+  already on disk by the time the guard ran: the first `schedule_add` /
+  `schedule_remove` after any scaffold drift returned `E_RECONCILE_FAILED`
+  having ALREADY committed both the overlay change and the scaffold rewrite. A
+  blind retry then succeeded, because the writers are content-gated and the
+  second render was a no-op — which is why this read as a transient error
+  rather than a bug. The check was a detector standing where a suppressor
+  belongs. A new `ReconcileOptions.skipNonCronWrites`, passed by the bridge
+  alongside `skipProfileTemplates`, suppresses every write site whose path
+  `classifyChangeKind` does not call `"cron"`: `.claude/settings.json` and the
+  sub-agent `.md` files nested in that block, `.mcp.json` +
+  `ensureMcpServersTrusted`, the `telegram/.env` bot-token refresh, the
+  `.claude/skills/` pool symlink sync, and the `SOUL.md` symlink migration.
+  `mcpServers` is still COMPUTED, so `maybeWriteCronMcp` keeps writing
+  `.claude-cron/.mcp.json`, which IS cron-classified. `classifyChangeKind` now
+  also matches the `cron-<hash>.source` attribution sidecar alongside the
+  `.sh`: the stale-artifact sweep unlinks the pair together, so the old
+  `.sh`-only anchor made the cron-only reconcile reject its own cron cleanup,
+  the same write-then-fail shape. The post-hoc guard stays, re-framed as an
+  invariant assertion that can now only fire if a future writer lands ungated.
+  Regression coverage asserts both halves — the reconcile reports no non-cron
+  change AND the deliberately drifted scaffold file is left byte-identical;
+  reverting the suppressors fails the byte-identity assertion first, which is
+  the half a guard-only fix would not catch. (#4607, #4608)
 - **tests: stop one bun test file leaking a parked turn-start into the next
   (#4611).** `bun test` runs all ~657 telegram-plugin files in ONE process with
   ONE module registry, so `parkedTurnStarts` — module-scope in
