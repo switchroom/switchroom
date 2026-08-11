@@ -15,6 +15,36 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **hindsight: stop the `graph_maintenance` retry storm.** Pass 3 of the
+  graph-maintenance sweep (`prune_stale_cooccurrences`) was measured at
+  ~115s against a live bank, well past the 60s asyncpg `command_timeout`,
+  and `_is_retryable` treated the resulting `asyncio.TimeoutError` as a
+  transient connection fault — so `_SWEEP_MAX_RETRIES = 8` turned one slow
+  query into **9 full-cost attempts**, ~9 minutes of wasted DB CPU per bank
+  per 30-minute cycle, contending with live retain/recall traffic. Three
+  baked patches, all fail-loud anchor-and-replace in
+  `docker/Dockerfile.hindsight`: (A1) `retry_with_backoff` /
+  `_is_retryable` take a `retry_timeouts` flag (default `True`, so nothing
+  else changes) and the graph-maintenance sweep passes `retry_timeouts=False`
+  — a query that cannot finish inside the deadline will not finish on
+  attempt nine either. The timeout arm is checked **before** the `OSError`
+  arm because on Python 3.11 `asyncio.TimeoutError` *is* builtin
+  `TimeoutError`, which subclasses `OSError`; get that order wrong and the
+  fix is silently inert. (A2) `str(asyncio.TimeoutError())` is the empty
+  string, so 23 of 28 failed `graph_maintenance` operations recorded a blank
+  `error_message` and the storm was invisible in the operations table — the
+  worker now falls back to `<ExcClass> raised with no message (task_type=…)`.
+  (A3) Passes 2 and 3 ran in ONE transaction, so a Pass-3 timeout rolled back
+  Pass 2's completed orphan prune as well; they are now separate transactions
+  with separate retry scopes, which also makes it structurally impossible for
+  a Pass-3 retry to clobber the reported orphan count to 0. Covered by a
+  behavioural RED/GREEN probe against the pinned upstream image
+  (`tests/docker/hindsight-graph-maintenance-retry-storm.test.ts`) that counts
+  real retry attempts and reads back the reported counters — the grep-on-file
+  bakes suite cannot see either outcome.
+
 ## v0.21.5 — a native Telegram reply to a bot-sent card resolves its parent body again
 
 ### Bug fixes

@@ -1868,6 +1868,107 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the graph-maintenance retry-storm fix (assert-guarded, fail-loud)", () => {
+    // Three defects turned one slow statement into a recurring production
+    // incident. A1: `_is_retryable` retried a deterministic asyncpg
+    // command_timeout — 9 attempts x 2 banks every 30 minutes ≈ 18 minutes of
+    // wasted DB CPU per cycle, contending with live retain/recall. A2: the
+    // generic task-failure path passed `str(e)` to `_mark_failed`, and
+    // `str(asyncio.TimeoutError())` is the EMPTY STRING, so 23 of 28 failed
+    // graph_maintenance operations carried a blank error_message. A3: Pass 2
+    // and Pass 3 shared one transaction, so a Pass 3 timeout rolled back Pass
+    // 2's completed orphan prune.
+    //
+    // Behaviour (RED against unpatched upstream / GREEN patched) is proven in
+    // tests/docker/hindsight-graph-maintenance-retry-storm.test.ts. This pins
+    // only the shape a grep can see.
+
+    // The exact-once anchor guard (fail-loud on upstream drift).
+    expect(dockerfile).toMatch(
+      /\{TAG\}: anchor found \{n\}x \(expected \{count\}\) in \{rel\}/,
+    );
+
+    // ---- A1 ----
+    // The opt-out knob, on the predicate and on the retry helper.
+    expect(dockerfile).toContain(
+      "def _is_retryable(exc: BaseException, retry_timeouts: bool = True) -> bool:",
+    );
+    expect(dockerfile).toContain('"    retry_timeouts: bool = True,\\n"');
+    expect(dockerfile).toContain(
+      "_is_retryable(e, retry_timeouts=retry_timeouts)",
+    );
+    // The timeout arm must be SPLIT OUT of the OSError tuple, because on
+    // py3.10+ the builtin TimeoutError is an OSError subclass and on 3.11+
+    // asyncio.TimeoutError IS that builtin. A version that added the parameter
+    // but left the timeout inside the OSError tuple would carry every other
+    // literal here while retrying timeouts exactly as before.
+    expect(dockerfile).toContain(
+      '"    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):\\n"',
+    );
+    expect(dockerfile).toContain('"        return retry_timeouts\\n"');
+    expect(dockerfile).toContain(
+      '"    if isinstance(exc, (OSError, ConnectionError)):\\n"',
+    );
+    // The build asserts that ordering itself, so a re-author cannot lose it.
+    expect(dockerfile).toMatch(
+      /the timeout arm must precede the OSError arm \(TimeoutError is an OSError subclass\)/,
+    );
+    // Every other caller keeps upstream behaviour: acquire_with_retry's
+    // predicate is deliberately left retrying timeouts.
+    expect(dockerfile).toMatch(
+      /assert du\.count\("if not _is_retryable\(e\):"\) == 1,/,
+    );
+
+    // ---- A2 ----
+    expect(dockerfile).toContain("def _describe_exception(");
+    expect(dockerfile).toContain(
+      '"                await self._mark_failed(task.operation_id, detail, task.schema)\\n"',
+    );
+    expect(dockerfile).toMatch(
+      /the generic failure path still passes a possibly-empty str\(e\) to _mark_failed/,
+    );
+
+    // ---- A3 ----
+    expect(dockerfile).toContain(
+      '"    async def _run_orphan_prune() -> int:\\n"',
+    );
+    expect(dockerfile).toContain(
+      '"    async def _run_cooccurrence_prune() -> int:\\n"',
+    );
+    expect(dockerfile).toContain(
+      "_run_cooccurrence_prune, max_retries=_SWEEP_MAX_RETRIES, retry_timeouts=False",
+    );
+    // The shared-transaction helper must be GONE, not merely shadowed, and the
+    // two passes must sit in two independent retry scopes.
+    expect(dockerfile).toMatch(/assert "_run_sweep" not in gm,/);
+    expect(dockerfile).toMatch(
+      /assert gm\.count\("retry_with_backoff\("\) == 2,/,
+    );
+    // The reviewer-caught clobber: Pass 2's count is recorded BEFORE Pass 3 is
+    // attempted, so no Pass 3 retry can overwrite it with 0.
+    expect(dockerfile).toMatch(
+      /the orphan count is recorded after Pass 3 runs and can still be clobbered/,
+    );
+    // `e or ...` tests the exception OBJECT's truthiness (always True) and
+    // would reintroduce the very empty message A2 exists to remove.
+    expect(dockerfile).toContain("{str(e) or 'no message'}");
+    expect(dockerfile).not.toContain("{e or 'no message'}");
+
+    // Post-replace verification: every patched file must still parse.
+    expect(dockerfile).toContain(
+      'for rel in ("engine/db_utils.py", "worker/poller.py", "engine/graph_maintenance.py"):',
+    );
+    // The block's TAG (which every assert message and the success line
+    // interpolate) is what the behavioural probe test greps the block out by,
+    // so it must not drift.
+    expect(dockerfile).toContain(
+      'TAG = "switchroom hindsight graph-maintenance retry-storm patch"',
+    );
+    expect(dockerfile).toMatch(
+      /\{TAG\}: timeouts are opt-out non-retryable \(order-safe against TimeoutError<:OSError\)/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
