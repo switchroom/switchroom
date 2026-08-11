@@ -15,6 +15,26 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Dependencies
+
+- **Claude Code CLI pinned 2.1.226 → 2.1.228** — all three lockstep locations
+  move together (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
+  `dependencies.json`). Two fixes land that the fleet has already felt. 2.1.227
+  fixes feature flags being evaluated **without the user's subscription tier**
+  when a session starts with an expired login token, which wrongly prompted Max
+  plan users to enable usage credits for Fable — that is the upstream root cause
+  of the consent modal `autoaccept` learned to answer in the entry below, so a
+  fable agent should now boot without hitting the modal at all. (The autoaccept
+  rule stays: consent is persisted per agent config, older bundles can still be
+  in play during a staggered roll, and the modal is legitimate on a genuinely
+  credit-funded org.) 2.1.228 fixes the deferred-tools reminder occasionally
+  being sent to the model **twice** after a skill invocation — every agent here
+  is a skill-using session, so that was duplicated context on our turns. One
+  behaviour change to expect: the Write tool now lets **newer models overwrite
+  an existing file they have not read this session**, matching the Edit tool's
+  rules (older models still require the read first). Nothing in the repo
+  depended on the read-first guarantee.
+
 ### Bug fixes
 
 - **autoaccept: select Continue with Fable on the usage-credits consent modal**
