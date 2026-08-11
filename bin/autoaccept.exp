@@ -86,8 +86,28 @@ expect {
         send "\r"
         exp_continue
     }
+    -re {Continue with Fable} {
+        # Fable-5 usage-credits consent modal:
+        #     Fable 5 runs on usage credits, purchased separately from your plan.
+        #       1. Continue with Fable 5
+        #     ❯ 2. Switch to Sonnet 5 and continue
+        #     Enter to confirm · Esc to cancel
+        # MUST precede the generic "Enter to confirm" branch below: that
+        # footer matches this modal too, and the CLI focuses option 2 by
+        # default (`defaultFocusValue:"switch"`), so a bare Return silently
+        # declines Fable and downgrades the agent to Sonnet. Select option 1
+        # by digit instead. Kept in sync with the `fable-usage-credits-consent`
+        # rule in src/agents/autoaccept.ts.
+        sleep 0.5
+        send "1\r"
+        exp_continue
+    }
     -re {Enter.{1,30}confirm} {
-        # Generic "Enter to confirm" prompt (dev channels, trust dialog)
+        # Generic "Enter to confirm" prompt (dev channels, trust dialog).
+        # NOTE: the TS poller additionally guards this catch-all against
+        # numbered selectors (NUMBERED_CHOICE_SIGNATURE). expect matches a
+        # STREAM in branch order, so here the equivalent protection is
+        # ordering: every option-selecting branch must sit above this one.
         sleep 0.8
         send "\r"
         exp_continue
