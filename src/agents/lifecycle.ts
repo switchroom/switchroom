@@ -841,7 +841,12 @@ export function classifyChangeKind(path: string): ChangeKind {
   // `switchroom migrate cron-unit-names` renames them, after which only
   // the new form remains on disk. The shared regex lives in
   // `cron-unit-name.ts` so all classifiers stay in lockstep.
-  if (/\/telegram\/cron-(?:\d+|[0-9a-f]{12})\.sh$/.test(path)) return "cron";
+  // #4607: the `.source` attribution sidecar is unlinked in the SAME
+  // sweep as its `.sh` and is just as much a cron artifact, but this
+  // pattern anchored on `.sh` alone — so sweeping a stale pair classified
+  // the sidecar "other" and the cron-only bridge rejected its own cron
+  // cleanup (after performing it). Match both extensions.
+  if (/\/telegram\/cron-(?:\d+|[0-9a-f]{12})\.(?:sh|source)$/.test(path)) return "cron";
   // Cron-session (Tier-1) infrastructure: the trimmed `.claude-cron/.mcp.json`
   // (+ cron-session.sh) are rendered when a cron routes to a cheap session.
   // They are a deterministic consequence of a CRON change (the value-gate

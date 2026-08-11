@@ -6884,6 +6884,67 @@ export interface ReconcileOptions {
    * continues to run all five.
    */
   skipProfileTemplates?: boolean;
+  /**
+   * Set true when the caller wants a CRON-ONLY reconcile: only the
+   * `schedule.d/` → `cron.d/` derived surfaces (and the cron-session
+   * Tier-1 artifacts under `.claude-cron/`) should be written.
+   *
+   * SCOPE OF THE GUARANTEE — read this before relying on it. The audit
+   * behind #4607 enumerated the `changes.push` sites reachable from
+   * `reconcileAgentInner`, so what this flag actually guarantees is:
+   *
+   *   no write whose path `classifyChangeKind` (`src/agents/lifecycle.ts`)
+   *   does NOT classify as `"cron"` can reach `result.changes`.
+   *
+   * That is exactly the invariant the bridge's post-hoc check asserts,
+   * and it is what makes #4607 unreproducible. It is NOT a blanket "this
+   * process performs no non-cron file IO": two gated writers here
+   * (`ensureMcpServersTrusted`, `syncGlobalSkills`) never reached
+   * `changes` in the first place and are suppressed on contract grounds
+   * rather than to satisfy the guard, and a handful of ungated non-cron
+   * writes on this path remain — none of them `changes`-visible, so none
+   * can regress #4607. Tracked separately; see the follow-up issue linked
+   * from #4608. Before claiming "the cron-only reconcile writes nothing
+   * else", re-audit rather than trusting this comment.
+   *
+   * Why this exists (switchroom #4607). `reconcileAgentCronOnly`
+   * (`src/cli/reconcile-bridge.ts`) used to run the FULL reconcile with
+   * only `skipProfileTemplates: true`, then post-hoc reject the result
+   * if any returned change path wasn't `"cron"`. That check is a
+   * detector standing where a suppressor belongs: the writers had
+   * already committed to disk by the time it ran, so the first
+   * `schedule_add` / `schedule_remove` after any scaffold drift
+   * returned `E_RECONCILE_FAILED` *after* mutating both the overlay and
+   * the scaffold — and the retry succeeded only because the writers are
+   * content-gated and the second render was a no-op.
+   *
+   * Concretely, this option suppresses FIVE `changes`-visible non-cron
+   * write sites inside `reconcileAgent` (the `changes.push` audit behind
+   * #4607 — the issue named the first two, the other three surface on the
+   * same path):
+   *
+   *   1. `.claude/settings.json` (classified `"settings"`).
+   *   2. `.claude/agents/<sub>.md` sub-agent definitions (`"other"`) —
+   *      nested inside the settings block, so gated with it.
+   *   3. `.mcp.json` + its `ensureMcpServersTrusted` companion
+   *      (`"settings"`). The `mcpServers` map is still COMPUTED, because
+   *      `maybeWriteCronMcp` needs it: `.claude-cron/.mcp.json` is
+   *      classified `"cron"` and stays in scope.
+   *   4. `telegram/.env` bot-token refresh (`"other"`).
+   *   5. The `<agentDir>/SOUL.md` → `workspace/SOUL.md` symlink
+   *      migration (`"other"`), plus the `.claude/skills/` global-pool
+   *      symlink sync — neither of which a schedule change implies.
+   *
+   * Orthogonal to `skipProfileTemplates`, which answers a different
+   * question ("is the bundled `profiles/` tree on disk?") and is
+   * therefore kept separate rather than widened: a host-side caller can
+   * legitimately want one without the other. The in-container cron
+   * bridge passes both.
+   *
+   * The host-side full reconcile leaves this false and writes
+   * everything, as before.
+   */
+  skipNonCronWrites?: boolean;
 }
 
 /**
@@ -8422,7 +8483,13 @@ function reconcileAgentInner(
 
   // --- Reconcile settings.json ---
   const settingsPath = join(agentDir, ".claude", "settings.json");
-  if (existsSync(settingsPath)) {
+  // skipNonCronWrites (#4607): this block owns two non-cron write sites —
+  // `.claude/settings.json` (classified "settings") and the nested
+  // `.claude/agents/<sub>.md` sub-agent definitions ("other"). A cron-only
+  // reconcile must not touch either. Gated at the block head rather than at
+  // each write so the read + render work is skipped too; every binding
+  // declared inside is block-scoped and unused below.
+  if (existsSync(settingsPath) && !options.skipNonCronWrites) {
     const before = readFileSync(settingsPath, "utf-8");
     const settings = JSON.parse(before);
 
@@ -8728,13 +8795,19 @@ function reconcileAgentInner(
   // by THIS agent's config (agentConfig.bot_token ?? telegramConfig.bot_token),
   // so the interrupt window (vault has <new>.bot_token while agents.<old> lingers
   // in config) can't mis-attribute another agent's token here.
-  refreshTelegramBotTokenEnv(agentDir, resolvedBotToken, changes);
+  // skipNonCronWrites (#4607): `telegram/.env` classifies "other" — a
+  // schedule change never implies a bot-token repair.
+  if (!options.skipNonCronWrites) {
+    refreshTelegramBotTokenEnv(agentDir, resolvedBotToken, changes);
+  }
 
   // --- Reconcile global skills pool symlinks ---
   //
   // Mirrors the scaffold syncGlobalSkills call so reconcile picks up
   // added/removed entries in switchroom.yaml.
-  if (agentConfig.skills) {
+  // skipNonCronWrites (#4607): these symlinks live under `.claude/skills/`
+  // ("skill"), not the cron surface.
+  if (agentConfig.skills && !options.skipNonCronWrites) {
     syncGlobalSkills(agentDir, agentConfig.skills, switchroomConfig.switchroom.skills_dir);
   }
 
@@ -8897,7 +8970,10 @@ function reconcileAgentInner(
     const before = existsSync(mcpJsonPath)
       ? readFileSync(mcpJsonPath, "utf-8")
       : "";
-    if (after !== before) {
+    // skipNonCronWrites (#4607): `.mcp.json` classifies "settings". The
+    // `mcpServers` map above is still built because `maybeWriteCronMcp`
+    // below consumes it and `.claude-cron/.mcp.json` IS cron-classified.
+    if (after !== before && !options.skipNonCronWrites) {
       // Atomic (tmp + fsync + rename) so a crash / ENOSPC mid-write can
       // never leave a torn / truncated .mcp.json that Claude Code then
       // fails to parse — same guarantee as the M5 fix. Mode 0600
@@ -8917,7 +8993,12 @@ function reconcileAgentInner(
     // Code's per-project trust allowlist (idempotent — runs every
     // reconcile so a newly-added gdrive/hostd is trusted on the next
     // `switchroom apply`, not just at original onboarding).
-    ensureMcpServersTrusted(agentDir, Object.keys(mcpServers));
+    // skipNonCronWrites (#4607): rewrites `.claude/.claude.json`, which is
+    // only ever out of date because `.mcp.json` changed — and that write is
+    // suppressed above, so there is nothing to trust-sync here.
+    if (!options.skipNonCronWrites) {
+      ensureMcpServersTrusted(agentDir, Object.keys(mcpServers));
+    }
   }
 
   // --- Re-seed workspace bootstrap files from the profile.
@@ -9012,7 +9093,10 @@ function reconcileAgentInner(
   // --- Phase 2: symlink <agentDir>/SOUL.md → workspace/SOUL.md (migration) ---
   const agentSoulPath = join(agentDir, "SOUL.md");
   const workspaceSoulPath = join(agentDir, "workspace", "SOUL.md");
-  if (existsSync(workspaceSoulPath)) {
+  // skipNonCronWrites (#4607): the symlink migration classifies "other".
+  // It is a one-shot repair the host-side reconcile owns; a cron-only
+  // reconcile must not perform it (and used to fail on it after doing so).
+  if (existsSync(workspaceSoulPath) && !options.skipNonCronWrites) {
     if (existsSync(agentSoulPath)) {
       const stat = lstatSync(agentSoulPath);
       if (stat.isSymbolicLink()) {

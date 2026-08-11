@@ -9,9 +9,10 @@
  * #1185 shipped `applyCronChangesHot` (cron-only hot-reload, no container
  * bounce). This bridge wires the broker write to that path: load config
  * (overlays applied), call `reconcileAgent`, then `applyCronChangesHot`
- * with the resulting `changes` list. All non-cron changes here would
- * indicate a logic bug — the broker's dry-run reconcile assertion
- * already gates that — so we treat them as `E_RECONCILE_FAILED`.
+ * with the resulting `changes` list. The reconcile is narrowed to the
+ * cron surface by `skipNonCronWrites` (#4607); the post-hoc non-cron
+ * check that remains is an invariant assertion over that narrowing, not
+ * the narrowing itself.
  *
  * The bridge is exported as a function so `agent-config-write.ts` can
  * accept it as a DI parameter (tests stub it).
@@ -68,17 +69,36 @@ export function reconcileAgentCronOnly(
       // A cron-only reconcile has no business re-rendering profile
       // templates anyway — schedule changes only mutate `schedule.d/` and
       // generated `cron.d/` scripts. See switchroom #1618.
-      { skipProfileTemplates: true },
+      // skipNonCronWrites: the actual cron-only opt-out (#4607). Without
+      // it this call ran the FULL reconcile and the guard below rejected
+      // the result *after* the scaffold writers had already committed to
+      // disk — so the first schedule_add/schedule_remove after any
+      // scaffold drift returned E_RECONCILE_FAILED having mutated both
+      // the overlay and the scaffold, and only the retry succeeded
+      // (content-gated writers make the second render a no-op). The flag
+      // suppresses every non-cron writer instead of detecting it late;
+      // see ReconcileOptions.skipNonCronWrites for the gated set.
+      { skipProfileTemplates: true, skipNonCronWrites: true },
     );
     const changes = [...result.changes];
-    // Defensive: refuse to silently restart on non-cron changes — the
-    // broker's contract is cron-only. If non-cron drift surfaces here,
-    // that's a logic gap, not something we should paper over.
+    // Invariant assertion, not a filter. `skipNonCronWrites` gates every
+    // known non-cron writer that reports into `changes`, so a non-cron
+    // entry HERE means a new `changes.push` writer was added without a
+    // gate. Keeping the check makes that regression loud at the first
+    // call instead of silently widening the cron-only contract.
+    //
+    // Note the reach: this can only see writes that surface in `changes`.
+    // A non-cron writer that pushes nothing is invisible to it — which is
+    // why the gate, not this check, is the fix for #4607, and why the
+    // remaining ungated `changes`-invisible writes on this path are
+    // tracked as a follow-up rather than assumed absent.
     const nonCron = changes.filter((p) => classifyChangeKind(p) !== "cron");
     if (nonCron.length > 0) {
       return {
         ok: false,
-        error: `non-cron changes surfaced during cron-only reconcile: ${nonCron.join(", ")}`,
+        error:
+          `non-cron changes surfaced during cron-only reconcile ` +
+          `(ungated writer — see ReconcileOptions.skipNonCronWrites): ${nonCron.join(", ")}`,
       };
     }
     const r = applyCronChangesHot(agent, changes);
