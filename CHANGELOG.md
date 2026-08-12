@@ -66,8 +66,7 @@ now an anomaly worth investigating, not the norm.
   ~23 h of accumulated churn, which took its VM straight back to 100 %. That
   is the problem rather than the refutation: a container recreate inside that
   day-long window resets the dead-tuple counter and the map just stays stale.
-  `EXPLAIN (ANALYZE,
-  BUFFERS)` over 200 k index tuples paid 64,177 heap fetches on
+  `EXPLAIN (ANALYZE, BUFFERS)` over 200 k index tuples paid 64,177 heap fetches on
   `idx_unit_entities_entity_unit` and 138,465 on `pk_entities` — 69 % of the
   "index-only" rows on `entities` touching the heap anyway, on indexes the
   graph queries drive 6.2 M / 73.8 M scans through. `entities` was never in
@@ -83,11 +82,11 @@ now an anomaly worth investigating, not the norm.
   floor (the 22.5 h average that reached the old 4,849 trigger, ~5.2 k
   dead/day), while the rate measured live in the 38.5 min after the 22:19Z
   pass — 948 dead tuples, 21-25/min ≈ 30-35 k/day, consistent across six
-  samples — puts it closer to hourly, ~18-21 passes/day. More frequent
-  vacuum is more background
-  I/O, and the upper end is the number to budget against; these two are small
-  enough (108 MB + 261 MB of index, and 25 MB + 56 MB) that a pass is a few
-  hundred MB of mostly-cached reads, and the ~hourly one is the 81 MB table.
+  samples — puts it closer to hourly, ~18-21 passes/day. More frequent vacuum
+  is more background I/O, and the upper end is the number to budget against;
+  these two are small enough (108 MB + 261 MB of index, and 25 MB + 56 MB) that
+  a pass is a few hundred MB of mostly-cached reads, and the ~hourly one is the
+  81 MB table.
   `memory_units` (1.7 GB + HNSW) is deliberately left alone. (#4634)
 
 - **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
