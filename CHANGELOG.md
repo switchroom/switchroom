@@ -69,6 +69,17 @@ now an anomaly worth investigating, not the norm.
   now await a small `execFileAsync` helper (`tests/docker/_exec-async.ts`)
   that keeps the loop turning, so the RPC reply is read as it arrives. No
   retry was added: a retry would equally hide a real hang.
+- **fleet-health: a gateway finding's timestamp is no longer read as local
+  time.** `detect.extractTs` lifted the ISO prefix off a gateway log line with
+  the `Z` designator OPTIONAL and handed the raw string to `Date.parse`, which
+  reads a designator-less timestamp as LOCAL time — a finding misdated by the
+  host's UTC offset (ten hours on the Melbourne host). That skewed
+  `recencyFactor` and, now that the ledger windows its findings, could shift one
+  across the window boundary. Every producer in the repo stamps UTC
+  (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
+  so a designator-less line is now normalised to `Z` at the producer. An
+  explicit `+HH:MM` offset is preserved untouched.
+
 - **fleet-health: the ledger's `windowDays` now actually windows the
   findings.** `buildLedger` read `windowDays` but aggregated EVERY finding ever
   recorded into the dedup_key map — `count` and `reach` had no time filter, so
