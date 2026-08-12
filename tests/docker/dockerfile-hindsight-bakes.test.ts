@@ -1969,6 +1969,105 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the graph-maintenance bounded-sweep fix (assert-guarded, fail-loud)", () => {
+    // #4604 (above) stopped Pass 3 WASTING time on a statement that could not
+    // finish; it did not make it finish. Measured read-only on the live fleet:
+    // the predicate alone takes 65.2s on a 517k-row bank against a 60s asyncpg
+    // command_timeout, before the sort, the locks and the DELETE — so the pass
+    // has never once completed on the two largest banks. This block bounds it.
+    //
+    // Behaviour (RED against unpatched upstream / GREEN patched) is proven in
+    // tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts. This pins
+    // only the shape a grep can see.
+
+    // The block must come AFTER the retry-storm block: its graph_maintenance
+    // anchors are that block's REPLACEMENT text, so a reordering breaks the
+    // build. Assert the order rather than trusting it.
+    expect(
+      dockerfile.indexOf(
+        'TAG = "switchroom hindsight graph-maintenance retry-storm patch"',
+      ),
+    ).toBeLessThan(
+      dockerfile.indexOf(
+        'TAG = "switchroom hindsight graph-maintenance bounded sweep patch"',
+      ),
+    );
+
+    // ---- B1: the statement is bounded by a LIMIT that is a BOUND PARAMETER.
+    // Interpolating the cap into the SQL text would still grep as "has a LIMIT"
+    // while making the adaptive shrink below impossible.
+    expect(dockerfile).toContain('"                LIMIT $6::int\\n"');
+    expect(dockerfile).toContain('"            WITH page AS MATERIALIZED (\\n"');
+    expect(dockerfile).toMatch(/the page CTE lost its LIMIT/);
+    // The keyset cursor and the rotating hash slice.
+    expect(dockerfile).toContain(
+      "(c.entity_id_1, c.entity_id_2) > (\\n",
+    );
+    expect(dockerfile).toContain("md5(c.entity_id_1::text), 1, 4");
+    expect(dockerfile).toMatch(/the rotating slice filter is missing/);
+
+    // The bound must NOT have been bought by weakening the sweep: the #2473
+    // INTERSECT predicate and the #2529 ordered lock are upstream's, unchanged.
+    expect(dockerfile).toMatch(/the #2529 ordered lock did not survive/);
+    expect(dockerfile).toMatch(
+      /the #2473 INTERSECT predicate was replaced — a semi-join rewrite measured/,
+    );
+
+    // ---- B2: the caller must LOOP and the cursor must ADVANCE. A single
+    // bounded page that never pages again would silently stop pruning most of
+    // the bank while looking correct in the diff.
+    expect(dockerfile).toContain('"_SWEEP_BATCH_SIZE = 1000\\n"');
+    expect(dockerfile).toContain('"_SWEEP_MIN_BATCH_SIZE = 50\\n"');
+    expect(dockerfile).toContain('"_SWEEP_SLICE_COUNT = 24\\n"');
+    expect(dockerfile).toContain('"_SWEEP_SLICE_SECONDS = 1800\\n"');
+    expect(dockerfile).toContain('"_SWEEP_MAX_PAGES = 2000\\n"');
+    expect(dockerfile).toContain(
+      "int(time.time()) // _SWEEP_SLICE_SECONDS % _SWEEP_SLICE_COUNT",
+    );
+    expect(dockerfile).toMatch(/the paging loop no longer terminates on a short page/);
+    expect(dockerfile).toMatch(/the cursor is never advanced/);
+
+    // ---- B3: shrink-and-retry, and it must retry the SAME cursor. A version
+    // that shrinks but advances skips exactly the rows it failed on, for ever —
+    // the build asserts the `continue` precedes the cursor advance.
+    expect(dockerfile).toContain(
+      "batch_size = max(_SWEEP_MIN_BATCH_SIZE, batch_size // 2)",
+    );
+    expect(dockerfile).toMatch(
+      /shrink-and-retry must re-run the SAME cursor, not advance past the page it failed on/,
+    );
+    // #4604's opt-out must survive, or the timeout reaches the shrink only
+    // after nine full-cost attempts.
+    expect(dockerfile).toMatch(
+      /#4604's timeout opt-out was dropped from the loop/,
+    );
+
+    // Per-batch transactions are load-bearing (a timed-out page must not roll
+    // back the pages that already committed), so the loop owns the connection.
+    expect(dockerfile).toContain(
+      "async with acquire_with_retry(backend) as conn:\\n",
+    );
+
+    // Every backend implements the new return shape, including the ones that
+    // opt out of paging by reporting scanned=0.
+    expect(dockerfile).toContain("class CooccurrenceSweepBatch:");
+    expect(dockerfile).toMatch(
+      /does not import\/return the page result type/,
+    );
+
+    // Post-replace verification: every patched file must still parse.
+    expect(dockerfile).toContain('"engine/db/ops.py",\n    "engine/db/ops_postgresql.py",');
+    expect(dockerfile).toContain('"engine/memories/pg/graph.py",');
+    // The block's TAG is what the behavioural probe test greps the block out
+    // by, so it must not drift.
+    expect(dockerfile).toContain(
+      'TAG = "switchroom hindsight graph-maintenance bounded sweep patch"',
+    );
+    expect(dockerfile).toMatch(
+      /\{TAG\}: Pass 3 now sweeps bounded keyset pages/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

@@ -154,6 +154,7 @@ jobs:
               - 'tests/docker/hindsight-temporal-offload-patch.test.ts'
               - 'tests/docker/hindsight-metrics-cardinality-patch.test.ts'
               - 'tests/docker/hindsight-graph-maintenance-retry-storm.test.ts'
+              - 'tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
             # hindsight-watch's streak probe (#4620) asserts its OUTCOME
