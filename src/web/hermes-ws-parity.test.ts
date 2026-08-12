@@ -253,9 +253,17 @@ const CONTRACT: ContractCase[] = [
     upstream: "tui_gateway/methods_session.py:2442",
     desktopCall: null,
     params: { session_id: SESSION, limit: 50 },
-    // methods_session.py:2456-2462 → {"count": ..., "messages": [...]}
+    // methods_session.py:2457-2462 → {"count": ..., "messages": [...]}
     resultKeys: ["count", "messages"],
-    note: "adapter also echoes session_id, which upstream omits — additive, harmless",
+    note:
+      "Adapter also echoes session_id, which upstream omits — additive, " +
+      "harmless. `count` is NOT identical to upstream's: upstream's is " +
+      "len(history), the RAW pre-projection row count, while `messages` is " +
+      "_history_to_messages(history), a lossy display projection " +
+      "(tui_gateway/server.py:7136+) that drops hidden scaffolding rows and " +
+      "assistant turns carrying only tool calls — so upstream has " +
+      "count >= len(messages), strictly greater on a tool-using transcript. " +
+      "The adapter applies no projection, so the two are always equal here.",
   },
   {
     method: "session.list",
@@ -269,10 +277,18 @@ const CONTRACT: ContractCase[] = [
     upstream: "tui_gateway/methods_session.py:214",
     desktopCall: null,
     params: {},
-    resultKeys: ["session_id"],
+    resultKeys: ["session_id", "title", "started_at", "source"],
     note:
-      "upstream methods_session.py:214-235 returns {session_id}, null when no " +
-      "eligible session — the adapter now matches (it returned {session} before)",
+      "Upstream has TWO shapes. A HIT returns four keys — " +
+      "{session_id, title, started_at, source} (methods_session.py:248-256). " +
+      "Every no-answer path (no db / no eligible row / internal exception) " +
+      "returns the bare {session_id: null} (:234, :257, :260); :214-235 is the " +
+      "docstring describing that null case, not the success return. The " +
+      "adapter emits all four on a hit — the fixture config has agents, so " +
+      "this case exercises the hit path — and {session_id: null} otherwise. " +
+      "It used to return {session}, a key no caller ever found. Pinning only " +
+      "`session_id` here would have passed with the other three ABSENT: the " +
+      "check below is per-key toHaveProperty, a subset check, not exact-shape.",
   },
   {
     method: "session.close",

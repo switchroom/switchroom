@@ -898,15 +898,61 @@ export async function handleHermesRest(
     if (pathname.endsWith("/soul")) {
       return { status: 200, body: { content: "", exists: false } };
     }
-    // /api/profiles/:name/setup-command — { command: string }. Switchroom has
-    // no shell-launchable profiles, so the command is empty; the key must
-    // still be present and a string (upstream returns a bare `string`,
-    // hermes_cli/web_routers/profiles.py:779-781).
+    // /api/profiles/:name/setup-command — upstream returns an OBJECT,
+    // `{"command": _profile_setup_command(name)}`
+    // (hermes_cli/web_routers/profiles.py:779-781), and the desktop
+    // destructures `.command` off it (hermes.ts:1544-1548). Switchroom has no
+    // shell-launchable profiles, so the command is empty — but the key must
+    // still be present and a string, not missing and not null.
     if (pathname.endsWith("/setup-command")) {
       return { status: 200, body: { command: "" } };
     }
-    // Everything else under /api/profiles is unimplemented — 404 rather than a
-    // fabricated 200 the client cannot distinguish from a real answer.
+    // /api/profiles/active — { active, current }
+    // (hermes_cli/web_routers/profiles.py:738-755). NOT emitted from
+    // apps/desktop/src/hermes.ts: `refreshActiveProfile`
+    // (apps/desktop/src/store/profile.ts:105-118) calls it directly, at
+    // startup. Switchroom has exactly one implicit profile and no
+    // `hermes profile use` sticky-default concept, so both keys are the
+    // desktop's own canonical root-profile name — which is also what upstream
+    // falls back to when its profile module raises (profiles.py:747, :753) and
+    // what `$activeProfile` is seeded with (store/profile.ts:31).
+    if (pathname === "/api/profiles/active") {
+      return { status: 200, body: { active: "default", current: "default" } };
+    }
+    // /api/profiles/projects/tree — the all-profiles grouped sidebar's tree
+    // (hermes_cli/web_routers/profiles.py:457-533). Also not emitted from
+    // hermes.ts: `refreshProjectTreeAcrossProfiles`
+    // (apps/desktop/src/store/projects.ts:473-499) calls it directly.
+    //
+    // Switchroom has no project/checkout grouping to report — a session is an
+    // agent, not a repo working tree — so every list is empty. Served rather
+    // than 404'd because the caller's failure path
+    // (`markProjectsRpcFailure`, store/projects.ts:52-56) only reacts to
+    // *JSON-RPC method-missing* errors (`isMissingRpcMethod`,
+    // lib/gateway-rpc.ts:2-6), which an HTTP 404 never matches: a 404 leaves
+    // `$projectsRpcAvailable` stuck at null forever, while the full-shape
+    // empty payload runs `applyProjectTreePayload` + `markProjectsRpcSuccess`
+    // and tells the truth ("the surface exists, it has nothing in it").
+    // All four upstream keys are emitted, not just the one the desktop's
+    // `ProjectTreePayload` (store/projects.ts:389-393) declares.
+    if (pathname === "/api/profiles/projects/tree") {
+      return {
+        status: 200,
+        body: { projects: [], active_id: null, scoped_session_ids: [], errors: [] },
+      };
+    }
+    // Deliberate 404s under this prefix, and why each is safe:
+    //   - POST /api/profiles/sessions/pull-requests (hermes.ts:571-582) —
+    //     switchroom transcripts carry no `gh pr create` tool output to scan.
+    //     `recoverSessionPullRequests` (store/pull-requests.ts:96) awaits it
+    //     inside a try/catch and simply records no PRs.
+    // Every other verb under /api/profiles (create/rename/delete/import/
+    // export/soul-write) is a profile *mutation*; switchroom's fleet is
+    // YAML-owned, and those all fell through to a 404 before this branch too
+    // (the prefix branch has always been GET-gated).
+    //
+    // Anything else 404s rather than returning a fabricated 200 the client
+    // cannot distinguish from a real answer.
     return null;
   }
 
@@ -1075,12 +1121,29 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     }
 
     case "session.most_recent": {
-      // Upstream returns the bare id — `{"session_id": <id|null>}`, with null
-      // meaning "no eligible session right now"
-      // (tui_gateway/methods_session.py:214-235). Returning `{session}` here
-      // meant no caller ever found the id it destructures.
+      // Upstream has TWO result shapes (tui_gateway/methods_session.py:214-260):
+      // a hit returns four keys — `{session_id, title, started_at, source}`
+      // (:248-256) — and every no-answer path (no db, no eligible row, or an
+      // internal exception) returns the bare `{"session_id": null}`
+      // (:234, :257, :260). Returning `{session}` here meant no caller ever
+      // found the id it destructures; returning only `session_id` on a hit
+      // would still be short three keys the adapter has in hand.
       const sessions = await buildAllSessions(config);
-      sendResponse(ctx, rpcOk(id, { session_id: sessions[0]?.id ?? null }));
+      const mostRecent = sessions[0];
+      sendResponse(
+        ctx,
+        rpcOk(
+          id,
+          mostRecent
+            ? {
+                session_id: mostRecent.id,
+                title: mostRecent.title ?? "",
+                started_at: mostRecent.started_at ?? 0,
+                source: mostRecent.source ?? "",
+              }
+            : { session_id: null },
+        ),
+      );
       break;
     }
 
@@ -1158,7 +1221,17 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
       const agentsDir = resolveAgentsDir(config);
       const histMessages = readHistoryDb(agentsDir, histAgent, limit);
       // `count` is part of the upstream result — `{"count", "messages"}`,
-      // tui_gateway/methods_session.py:2456-2462.
+      // tui_gateway/methods_session.py:2457-2462.
+      //
+      // Not byte-for-byte the upstream contract, deliberately: upstream's
+      // `count` is `len(history)`, the RAW pre-projection row count, while
+      // `messages` is `_history_to_messages(history)` — a lossy display
+      // projection (tui_gateway/server.py:7136+) that drops hidden scaffolding
+      // rows and assistant turns that are only tool calls. So upstream's
+      // `count >= len(messages)`, strictly greater on any tool-using
+      // transcript. The adapter applies no such projection, so the two are
+      // always equal here; `count` is still the honest count of what
+      // `messages` was built from, which is what the key means.
       if (histMessages !== null) {
         sendResponse(
           ctx,

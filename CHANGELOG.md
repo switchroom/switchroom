@@ -54,14 +54,30 @@ now an anomaly worth investigating, not the norm.
   / `blueprints` undefined, and now return real (if short) lists. And both
   catch-alls are gone: an unrecognised path under either prefix 404s, so the
   desktop can tell a missing route from a served one.
+- **hermes adapter: serve the two `/api/profiles` reads the route census could
+  not see.** `GET /api/profiles/active` (`store/profile.ts:114`, runs at
+  startup) and `GET /api/profiles/projects/tree` (`store/projects.ts:479`, the
+  all-profiles sidebar) are emitted from the desktop's stores, not from
+  `hermes.ts` — so narrowing the `/api/profiles` branch to an allowlist derived
+  from a `hermes.ts`-only grep 404'd both. Each is now served with its real
+  upstream shape: `{active, current}` and the four-key empty project tree. The
+  project-tree one matters beyond tidiness — the caller's failure path only
+  reacts to JSON-RPC method-missing errors, so an HTTP 404 left
+  `$projectsRpcAvailable` pinned at `null` instead of "the surface exists and
+  is empty". The parity fixture's census is now swept whole-tree (`src/**` +
+  `electron/**`) with its residual scope written down, and a new case asserts
+  every desktop-emitted `/api/profiles` GET is still served, so an allowlist
+  narrowing cannot silently drop one again.
 - **hermes adapter: honour `source` / `exclude_sources` on the session-list
   routes.** They were ignored, so the sidebar's cron slice and its recents
   slice returned the identical unfiltered fleet. Both the batched sidebar route
   and `/api/profiles/sessions` now filter through one shared helper.
 - **hermes adapter: two JSON-RPC results now match upstream.**
   `session.history` carries `count` alongside `messages`, and
-  `session.most_recent` returns `{session_id}` (null when there is none)
-  rather than `{session}` — the key every caller destructures.
+  `session.most_recent` returns the four-key hit shape
+  `{session_id, title, started_at, source}` — falling back to the bare
+  `{session_id: null}` when there is no eligible session — rather than
+  `{session}`, the key no caller was ever finding.
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 

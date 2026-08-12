@@ -17,13 +17,50 @@
  *
  *   git clone https://github.com/NousResearch/hermes-agent
  *   cd hermes-agent && git checkout <NEW_SHA>
- *   # every call site the desktop emits:
- *   grep -n "path: " apps/desktop/src/hermes.ts
+ *   # every call site the desktop emits — the WHOLE tree, renderer AND the
+ *   # Electron main process, not just apps/desktop/src/hermes.ts:
+ *   grep -rn "['\"\`]/api/" apps/desktop/src apps/desktop/electron \
+ *     --include='*.ts' --include='*.tsx' | grep -v '\.test\.'
  *   # the routes the real backend actually serves:
  *   grep -rn "^@router\.\|^@app\.\|^@[a-z_]*_router\." hermes_cli/
  *
  * Then reconcile CENSUS below against that grep: a row that disappears
  * upstream should be deleted here, a new row added with its `served` verdict.
+ *
+ * ─── Scope of the census (read this before trusting it) ─────────────────────
+ *
+ * This used to grep `apps/desktop/src/hermes.ts` alone, and that was wrong in
+ * a way that cost real routes. `GET /api/profiles/active` and
+ * `GET /api/profiles/projects/tree` are emitted from `src/store/*.ts`, and
+ * `GET /api/auth/providers` from the Electron MAIN process — none of them live
+ * in hermes.ts. So any "the census proves every emitted path under this prefix
+ * is handled" argument built on the old grep proved nothing about them, and
+ * narrowing the /api/profiles prefix branch to an allowlist 404'd both. The
+ * sweep is now whole-tree.
+ *
+ * What CENSUS enumerates today, stated precisely so the residual hole is a
+ * written list rather than an unstated assumption:
+ *
+ *   - every path × verb in `apps/desktop/src/hermes.ts`, in full; PLUS
+ *   - every whole-tree (`src/**` + `electron/**`) call site under the route
+ *     families this adapter claims with a PREFIX branch, and therefore has to
+ *     get exhaustively right: /api/profiles, /api/cron, /api/messaging,
+ *     /api/auth.
+ *
+ * NOT yet enumerated — emitted outside hermes.ts, under families the adapter
+ * matches by exact path only. An unlisted sibling there has always 404'd and
+ * always will; there is no prefix branch that can silently swallow one:
+ *
+ *   /api/fs/*                src/lib/desktop-fs.ts:46,97,127 (remote mode)
+ *   /api/git/*               src/lib/desktop-git.ts:42,46    (remote mode)
+ *   /api/plugins/*           src/contrib/plugin.ts, src/plugins/kanban/api.ts
+ *   /api/media               src/lib/chat-runtime.ts
+ *   /api/audio/speak-stream  src/lib/voice-playback.ts
+ *   /api/health, /api/agents electron/backend-health.ts, connection-config.ts
+ *   /api/ws                  websocket upgrade, not REST — see the WS fixture
+ *
+ * Enumerating those is a separate, larger pass. Listing them by name here is
+ * what stops this fixture overclaiming its own coverage a second time.
  *
  * @see reference/rfcs/fleet-dashboard.md — the RFC this adapter implements
  */
@@ -137,11 +174,21 @@ function call(method: string, path: string, search = ""): Promise<HermesRestResu
 // to or dropped from the adapter without this table being updated, and when a
 // desktop bump introduces a route nobody classified. Body shape is Part 2.
 //
-// `line` is the call site in apps/desktop/src/hermes.ts at UPSTREAM_HERMES_SHA.
+// `line` is the call site's line number at UPSTREAM_HERMES_SHA, in `file` —
+// which defaults to apps/desktop/src/hermes.ts and is stated explicitly for
+// every row that lives anywhere else (see the scope note at the top).
 // ═══════════════════════════════════════════════════════════════════════════
+
+/** Where a census row's `line` points when the row does not say otherwise. */
+const DEFAULT_CENSUS_FILE = "apps/desktop/src/hermes.ts";
 
 interface CensusRow {
   line: number;
+  /** Call-site file, relative to the upstream repo root. Defaults to
+   *  {@link DEFAULT_CENSUS_FILE}. Set it for every non-hermes.ts call site —
+   *  a row that lies about its file is how the old single-file grep hid
+   *  /api/profiles/active and /api/profiles/projects/tree. */
+  file?: string;
   method: string;
   /** Concrete path — template params already substituted with fixture values. */
   path: string;
@@ -150,11 +197,45 @@ interface CensusRow {
   note?: string;
 }
 
+/** The families the adapter still claims with a `pathname.startsWith(...)`
+ *  branch: /api/profiles (hermes-adapter.ts:892) and /api/cron (:810).
+ *  A prefix branch is exactly the construct that can swallow — or, once
+ *  narrowed to an allowlist, silently 404 — a call site nobody censused, so
+ *  these get the extra rails below. (/api/messaging and /api/auth are matched
+ *  by exact path; they are whole-tree censused for scope, but they cannot
+ *  swallow anything.) */
+const PREFIX_BRANCH_FAMILIES = ["/api/profiles", "/api/cron"];
+
+function censusFile(row: CensusRow): string {
+  return row.file ?? DEFAULT_CENSUS_FILE;
+}
+
+/** Shared verdict for every profile-MUTATING verb. Not a regression from the
+ *  prefix-branch narrowing and not a new decision: the /api/profiles branch
+ *  (hermes-adapter.ts:892) has always been GET-gated, so these have always
+ *  fallen through to a 404. Switchroom's fleet is YAML-owned — there is no
+ *  profile to create, rename, delete, re-soul, export or import. */
+const PROFILE_WRITE_404 =
+  "Profile mutation. The /api/profiles branch (hermes-adapter.ts:892) is " +
+  "GET-gated and always has been, so this 404'd before the narrowing too. " +
+  "Switchroom's fleet is YAML-owned: there is no profile to mutate.";
+
 const CENSUS: CensusRow[] = [
   // ── sessions ──────────────────────────────────────────────────────────────
   { line: 400, method: "GET", path: "/api/sessions", served: true },
   { line: 440, method: "GET", path: "/api/profiles/sessions", served: true },
-  { line: 578, method: "POST", path: "/api/profiles/sessions/pull-requests", served: false },
+  {
+    line: 578,
+    method: "POST",
+    path: "/api/profiles/sessions/pull-requests",
+    served: false,
+    note:
+      "The one deliberately-404'd path a client really emits under the " +
+      "narrowed /api/profiles prefix branch. Safe: recoverSessionPullRequests " +
+      "(store/pull-requests.ts:96) awaits it inside try/catch and records no " +
+      "PRs, and switchroom transcripts carry no `gh pr create` tool output to " +
+      "scan in the first place.",
+  },
   {
     line: 608,
     method: "GET",
@@ -217,10 +298,11 @@ const CENSUS: CensusRow[] = [
       "The adapter serves /api/auth/providers instead. That is NOT a stub " +
       "aimed at a dead route: /api/auth/providers is a real upstream route " +
       "(hermes_cli/dashboard_auth/routes.py:152) called by the desktop's " +
-      "Electron MAIN process — gatewayAuthProviders (electron/main.ts:4954) " +
-      "and probeRemoteAuthMode (:7590). This census only greps " +
-      "apps/desktop/src/hermes.ts, which is the renderer, so main-process " +
-      "call sites are out of its scope by construction.",
+      "Electron MAIN process, and it now has its own census row below. The " +
+      "census used to grep apps/desktop/src/hermes.ts alone, which is the " +
+      "renderer, so main-process call sites were out of scope by " +
+      "construction; the sweep is whole-tree now (see the scope note at the " +
+      "top of this file).",
   },
   { line: 981, method: "DELETE", path: "/api/providers/oauth/anthropic", served: false },
   { line: 989, method: "POST", path: "/api/providers/oauth/anthropic/start", served: false },
@@ -315,14 +397,61 @@ const CENSUS: CensusRow[] = [
 
   // ── profiles ──────────────────────────────────────────────────────────────
   { line: 1502, method: "GET", path: "/api/profiles", served: true },
-  { line: 1509, method: "POST", path: "/api/profiles", served: false },
-  { line: 1517, method: "PATCH", path: "/api/profiles/default", served: false },
-  { line: 1525, method: "DELETE", path: "/api/profiles/default", served: false },
+  {
+    line: 1509,
+    method: "POST",
+    path: "/api/profiles",
+    served: false,
+    note: PROFILE_WRITE_404,
+  },
+  { line: 1517, method: "PATCH", path: "/api/profiles/default", served: false, note: PROFILE_WRITE_404 },
+  { line: 1525, method: "DELETE", path: "/api/profiles/default", served: false, note: PROFILE_WRITE_404 },
   { line: 1532, method: "GET", path: "/api/profiles/default/soul", served: true },
-  { line: 1538, method: "PUT", path: "/api/profiles/default/soul", served: false },
+  { line: 1538, method: "PUT", path: "/api/profiles/default/soul", served: false, note: PROFILE_WRITE_404 },
   { line: 1546, method: "GET", path: "/api/profiles/default/setup-command", served: true },
-  { line: 1558, method: "POST", path: "/api/profiles/default/export", served: false },
-  { line: 1573, method: "POST", path: "/api/profiles/import", served: false },
+  { line: 1558, method: "POST", path: "/api/profiles/default/export", served: false, note: PROFILE_WRITE_404 },
+  { line: 1573, method: "POST", path: "/api/profiles/import", served: false, note: PROFILE_WRITE_404 },
+
+  // ── profiles, emitted from OUTSIDE hermes.ts ──────────────────────────────
+  // The rows the single-file grep could not see. Both are GETs, both run at
+  // startup, and both were 404'd by the narrowed prefix branch until this was
+  // caught in review. See the scope note at the top of this file.
+  {
+    line: 114,
+    file: "apps/desktop/src/store/profile.ts",
+    method: "GET",
+    path: "/api/profiles/active",
+    served: true,
+    note:
+      "refreshActiveProfile, at startup. Served for real: { active, current } " +
+      "(hermes_cli/web_routers/profiles.py:738-755), both 'default'.",
+  },
+  {
+    line: 479,
+    file: "apps/desktop/src/store/projects.ts",
+    method: "GET",
+    path: "/api/profiles/projects/tree",
+    served: true,
+    note:
+      "refreshProjectTreeAcrossProfiles, on entering all-profiles mode. " +
+      "Served as a full-shape EMPTY tree rather than 404'd: the caller's " +
+      "failure path (markProjectsRpcFailure, store/projects.ts:52-56) only " +
+      "reacts to JSON-RPC method-missing errors, so a 404 leaves " +
+      "$projectsRpcAvailable stuck at null instead of saying 'exists, empty'.",
+  },
+  // ── auth (Electron main process — also outside hermes.ts) ─────────────────
+  {
+    line: 4954,
+    file: "apps/desktop/electron/main.ts",
+    method: "GET",
+    path: "/api/auth/providers",
+    served: true,
+    note:
+      "gatewayAuthProviders (:4954) and probeRemoteAuthMode (:7590) read " +
+      "body.providers to label the sign-in button. A real upstream route " +
+      "(hermes_cli/dashboard_auth/routes.py:152); switchroom's token-auth " +
+      "gateway answers an empty list. See the /api/providers/oauth row.",
+  },
 
   // ── analytics / ops / audio / update ──────────────────────────────────────
   {
@@ -352,27 +481,31 @@ describe(`Hermes REST route census (upstream ${UPSTREAM_HERMES_SHA.slice(0, 7)})
   });
 
   it("census has no duplicate (method, path) rows", () => {
-    const seen = new Map<string, number>();
+    const seen = new Map<string, string>();
     const dupes: string[] = [];
     for (const row of CENSUS) {
       const key = `${row.method} ${row.path}`;
-      if (seen.has(key)) dupes.push(`${key} (hermes.ts:${seen.get(key)} and :${row.line})`);
-      else seen.set(key, row.line);
+      // Cite the FILE, not a bare line number: rows now come from four
+      // different desktop files, and "hermes.ts:114" for a store/profile.ts
+      // row would be a lie in the very message meant to locate the clash.
+      const at = `${censusFile(row).replace("apps/desktop/", "")}:${row.line}`;
+      if (seen.has(key)) dupes.push(`${key} (${seen.get(key)} and ${at})`);
+      else seen.set(key, at);
     }
     // Three PATCH /api/sessions/:id call sites share one route (archive, pin,
     // rename); they are deliberately NOT deduped in CENSUS because each is an
     // independent desktop feature that breaks. Assert the known set so a new
     // collision on some other route still fails here.
     expect(dupes).toEqual([
-      `PATCH /api/sessions/${AGENT} (hermes.ts:637 and :650)`,
-      `PATCH /api/sessions/${AGENT} (hermes.ts:637 and :770)`,
+      `PATCH /api/sessions/${AGENT} (src/hermes.ts:637 and src/hermes.ts:650)`,
+      `PATCH /api/sessions/${AGENT} (src/hermes.ts:637 and src/hermes.ts:770)`,
     ]);
   });
 
   for (const row of CENSUS) {
     const label = `${row.method} ${row.path} → ${row.served ? "served" : "404 (not a Hermes route)"}`;
     it(
-      `${label}  [hermes.ts:${row.line}]`,
+      `${label}  [${censusFile(row).replace("apps/desktop/", "")}:${row.line}]`,
       async () => {
         const res = await call(row.method, row.path);
         if (row.served) {
@@ -385,10 +518,46 @@ describe(`Hermes REST route census (upstream ${UPSTREAM_HERMES_SHA.slice(0, 7)})
     );
   }
 
-  it("every census row cites a real call-site line in apps/desktop/src/hermes.ts", () => {
+  it("every census row cites a plausible call-site line in a real desktop file", () => {
+    // `wc -l` at UPSTREAM_HERMES_SHA, rounded up: hermes.ts 1934,
+    // store/profile.ts 442, store/projects.ts 1263, electron/main.ts 12535.
+    // Bound each row by the file it actually claims, so a row that silently
+    // inherits the hermes.ts default while citing a main-process line number
+    // fails here instead of reading as plausible.
+    const MAX_LINE: Record<string, number> = {
+      "apps/desktop/src/hermes.ts": 1935,
+      "apps/desktop/src/store/profile.ts": 443,
+      "apps/desktop/src/store/projects.ts": 1264,
+      "apps/desktop/electron/main.ts": 12536,
+    };
     for (const row of CENSUS) {
-      expect(row.line, `${row.method} ${row.path}`).toBeGreaterThan(0);
-      expect(row.line, `${row.method} ${row.path}`).toBeLessThan(2000);
+      const where = `${row.method} ${row.path} [${censusFile(row)}]`;
+      expect(MAX_LINE, `${where}: unknown census file — add its bound`).toHaveProperty(
+        censusFile(row),
+      );
+      expect(row.line, where).toBeGreaterThan(0);
+      expect(row.line, where).toBeLessThan(MAX_LINE[censusFile(row)]);
+    }
+  });
+
+  // Under a prefix branch, a 404'd row is a DECISION — the branch claimed the
+  // path and chose to hand back null — not an accident of the route table, so
+  // it has to carry its reasoning. Elsewhere an unlisted path 404s for the
+  // ordinary reason that nothing matched, and a bare row is fine.
+  //
+  // Both prefix branches are GET-gated for reads and answer every mutating
+  // verb the same way (cron: 422; profiles: 404), so the interesting case is
+  // reads: a GET the desktop emits under a narrowed prefix branch must be
+  // served, or say in writing why the client survives without it.
+  it("every 404'd row under a prefix-branch family explains why the 404 is safe", () => {
+    for (const row of CENSUS) {
+      if (row.served) continue;
+      if (!PREFIX_BRANCH_FAMILIES.some((p) => row.path.startsWith(p))) continue;
+      expect(
+        row.note?.length ?? 0,
+        `${row.method} ${row.path} is 404'd under a prefix branch with no ` +
+          `justification — say why the desktop tolerates it, or serve it`,
+      ).toBeGreaterThan(40);
     }
   });
 });
@@ -407,10 +576,18 @@ interface ContractCase {
   path: string;
   /** Query string the desktop sends, verbatim from the pinned call site. */
   search?: string;
-  /** Desktop call site — apps/desktop/src/hermes.ts:NNN at the pinned SHA. */
+  /** Desktop call site — `<file>:NNN` under apps/desktop/src at the pinned SHA. */
   client: string;
-  /** Real backend route — hermes_cli/... at the pinned SHA. */
-  server: string;
+  /** Real backend route — `hermes_cli/...` at the pinned SHA, or null when the
+   *  case probes a path that has NO upstream route on purpose (see
+   *  {@link ContractCase.synthetic}). A citation must name the thing it is
+   *  actually about; inventing a plausible-looking `hermes_cli/` line for a
+   *  path upstream never serves is worse than admitting there isn't one. */
+  server: null | string;
+  /** True when `path` is not a route any client emits — a probe of the
+   *  adapter's fall-through behaviour rather than of a contract. Lets `server`
+   *  be null and exempts the case from the "cites a real route" rail. */
+  synthetic?: boolean;
   /** Set when the adapter does not satisfy this today. Runs under `it.fails`. */
   gap?: string;
   assert: (res: HermesRestResult | null) => void;
@@ -561,8 +738,12 @@ const CONTRACT: ContractCase[] = [
     name: "an unrecognised /api/profiles GET 404s rather than faking a 200 (synthetic probe path)",
     method: "GET",
     path: "/api/profiles/default/__not_a_route__",
-    client: "hermes.ts:520-536 (isEndpointMissingError)",
-    server: "hermes_cli/web_routers/profiles.py:232",
+    client: "hermes.ts:520-536 (isEndpointMissingError — the code that requires the 404)",
+    // No upstream route: the whole point of the probe is a path FastAPI never
+    // matches either. The previous citation here (profiles.py:232, the sidebar
+    // route) belonged to neither the probed path nor this assertion.
+    server: null,
+    synthetic: true,
     assert: (res) => {
       expect(res === null || res.status === 404).toBe(true);
     },
@@ -1062,10 +1243,47 @@ const CONTRACT: ContractCase[] = [
     server: "hermes_cli/web_routers/profiles.py:779",
     assert: (res) => {
       const b = body200(res);
-      // Upstream declares a bare string; switchroom has no shell-launchable
-      // profile, so the honest answer is an empty one — not a missing key and
-      // not null.
+      // Upstream returns an OBJECT — `{"command": _profile_setup_command(name)}`
+      // (profiles.py:779-781) — and the desktop destructures `.command` off it.
+      // Switchroom has no shell-launchable profile, so the honest answer is an
+      // empty command string: not a missing key, not null.
       expect(typeof b.command).toBe("string");
+    },
+  },
+  {
+    name: "GET /api/profiles/active returns { active, current }",
+    method: "GET",
+    path: "/api/profiles/active",
+    client: "store/profile.ts:105-118 (refreshActiveProfile, at startup)",
+    server: "hermes_cli/web_routers/profiles.py:738",
+    assert: (res) => {
+      const b = body200(res);
+      // The desktop reads `res.current || 'default'` (store/profile.ts:117).
+      // Both keys are strings upstream, including on its own error fallbacks
+      // (profiles.py:747, :753).
+      expect(typeof b.active).toBe("string");
+      expect(typeof b.current).toBe("string");
+      expect(b.current).toBe("default");
+    },
+  },
+  {
+    name: "GET /api/profiles/projects/tree returns the full empty-tree shape, not {}",
+    method: "GET",
+    path: "/api/profiles/projects/tree",
+    search: "?preview_limit=3",
+    client: "store/projects.ts:473-499 (refreshProjectTreeAcrossProfiles)",
+    server: "hermes_cli/web_routers/profiles.py:457",
+    assert: (res) => {
+      const b = body200(res);
+      // Upstream returns four keys (profiles.py:526-533). The desktop's own
+      // ProjectTreePayload (store/projects.ts:389-393) declares three of them
+      // and `applyProjectTreePayload` reads all three; `errors` rides along
+      // because upstream sends it. Switchroom has no repo/checkout grouping,
+      // so every list is empty — which is a real answer, unlike a bare 200 {}.
+      expect(Array.isArray(b.projects)).toBe(true);
+      expect(b.active_id).toBeNull();
+      expect(Array.isArray(b.scoped_session_ids)).toBe(true);
+      expect(Array.isArray(b.errors)).toBe(true);
     },
   },
   {
@@ -1165,12 +1383,59 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     );
   }
 
+  // The assertion the probe case above cannot make about itself, and the one
+  // that would have caught this branch 404-ing two live startup routes:
+  // proving the narrowed /api/profiles branch CAN 404 says nothing about
+  // whether every path a client DOES emit survived the narrowing.
+  //
+  // Driven off CENSUS so the list cannot drift from the census table, but the
+  // path SET is pinned inline as well — silently deleting a row is the other
+  // half of the failure mode, and a bare `for (row of rows)` loop over an
+  // emptied list passes vacuously.
+  it("every /api/profiles GET the desktop emits is still served after the narrowing", async () => {
+    const rows = CENSUS.filter((r) => r.method === "GET" && r.path.startsWith("/api/profiles"));
+    expect(rows.map((r) => r.path).sort()).toEqual([
+      "/api/profiles",
+      "/api/profiles/active",
+      "/api/profiles/default/setup-command",
+      "/api/profiles/default/soul",
+      "/api/profiles/projects/tree",
+      "/api/profiles/sessions",
+      "/api/profiles/sessions/sidebar",
+    ]);
+    for (const row of rows) {
+      const res = await call(row.method, row.path);
+      expect(
+        res,
+        `${row.path} (${censusFile(row)}:${row.line}) 404s — the desktop emits it`,
+      ).not.toBeNull();
+      expect(res!.status, row.path).toBe(200);
+    }
+  }, CASE_TIMEOUT_MS);
+
   it("every contract case cites both a desktop call site and a real backend route", () => {
     for (const c of CONTRACT) {
-      expect(c.client, c.name).toMatch(/hermes(-cron-scope)?\.ts:\d+|types\/hermes\.ts:\d+/);
+      expect(c.client, c.name).toMatch(
+        /(hermes(-cron-scope)?|types\/hermes|store\/[a-z-]+|electron\/main)\.tsx?:\d+/,
+      );
+      if (c.synthetic) {
+        // A probe of fall-through behaviour has no upstream route to cite, and
+        // must not invent one. `server: null` is the honest value; anything
+        // else here is a citation that describes a different route.
+        expect(c.server, `${c.name}: synthetic probes must not cite a route`).toBeNull();
+        continue;
+      }
       expect(c.server, c.name).toMatch(/hermes_cli\//);
     }
   });
+
+  // NOT checked: whether a cited `file:line` actually exists. It cannot be,
+  // cheaply or otherwise — the citations point into an upstream checkout at
+  // UPSTREAM_HERMES_SHA that this repo does not vendor and CI does not clone,
+  // so there is nothing on disk to resolve them against. Format-checking is
+  // the ceiling here; the semantic check is the human re-derive step
+  // documented at the top of this file. Said out loud so the next reader does
+  // not mistake the regex above for a verification that the line is real.
 
   it("every gap carries a written explanation, not a bare flag", () => {
     for (const c of CONTRACT) {
@@ -1185,8 +1450,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // Ratchet: this only moves when the adapter is fixed. Lower `gaps` (and
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
-      total: 45,
-      green: 27,
+      total: 47,
+      green: 29,
       gaps: 18,
     });
   });
