@@ -23,7 +23,8 @@ import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import type { SwitchroomConfig } from "../config/schema.js";
 import type { Turn } from "../../telegram-plugin/registry/turns-schema.js";
-import { resolveAgentsDir } from "../config/loader.js";
+import { resolveAgentsDir, findConfigFile } from "../config/loader.js";
+import { VERSION, COMMIT_DATE } from "../build-info.js";
 import { resolveChannelTarget } from "../agent-scheduler/channel-target.js";
 import {
   handleGetAgents,
@@ -920,20 +921,43 @@ export async function handleHermesRest(
 
   // GET /api/status — StatusResponse shape Hermes Desktop expects
   if (method === "GET" && pathname === "/api/status") {
+    // config_path, env_path and release_date are declared as BARE `string` in
+    // StatusResponse (apps/desktop/src/types/hermes.ts:1144-1160), not
+    // `string | null`. Sending null made the settings pane render the literal
+    // "null" — or throw, wherever it calls a string method on one.
+    //
+    // Each value below is the real one, not a placeholder:
+    //   - config_path  the switchroom.yaml this process actually resolved.
+    //                  findConfigFile throws when there is none (a legitimate
+    //                  state for an unconfigured host), and the empty string is
+    //                  the honest "no file", so the throw is caught rather than
+    //                  turned into a fake path.
+    //   - env_path     switchroom has no env file by construction — secrets
+    //                  live in the encrypted vault and config in YAML — so ""
+    //                  is not a stub, it is the answer.
+    //   - release_date the build's commit date (src/build-info.ts, regenerated
+    //                  by scripts/build.mjs), which is the only release
+    //                  timestamp switchroom has.
+    let configPath = "";
+    try {
+      configPath = findConfigFile();
+    } catch {
+      configPath = "";
+    }
     return {
       status: 200,
       body: {
-        version: "switchroom",
+        version: VERSION,
         gateway_running: true,
         gateway_platforms: {},
         gateway_state: "ready",
         config_version: 0,
         latest_config_version: 0,
         hermes_home: "switchroom",
-        release_date: null,
+        release_date: COMMIT_DATE ?? "",
         active_sessions: 0,
-        config_path: null,
-        env_path: null,
+        config_path: configPath,
+        env_path: "",
         gateway_exit_reason: null,
         gateway_health_url: null,
         gateway_pid: null,

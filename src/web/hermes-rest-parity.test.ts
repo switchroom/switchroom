@@ -976,10 +976,6 @@ const CONTRACT: ContractCase[] = [
     path: "/api/status",
     client: "hermes.ts:785-790 (getStatus); types/hermes.ts:1144-1160",
     server: "hermes_cli/web_server.py",
-    gap:
-      "hermes-adapter.ts:658-661 sends null for release_date, config_path and " +
-      "env_path. StatusResponse declares all three as bare `string`, so the " +
-      "settings pane renders 'null' or throws on a string method.",
     assert: (res) => {
       const b = body200(res);
       for (const field of ["config_path", "env_path", "release_date", "hermes_home", "version"]) {
@@ -1410,8 +1406,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
       total: 47,
-      green: 40,
-      gaps: 7,
+      green: 41,
+      gaps: 6,
     });
   });
 });
