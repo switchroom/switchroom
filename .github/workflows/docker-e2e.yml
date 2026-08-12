@@ -191,7 +191,16 @@ jobs:
     # push / merge_group: always run — both are (candidate) main. On the
     # queue ref this is the job that actually catches a semantic conflict
     # between two individually-green PRs, so it must not be skippable.
-    if: github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.relevant == 'true'
+    #
+    # workflow_dispatch is here because the header advertises `gh workflow
+    # run docker-e2e.yml --ref main` as THE recovery lever, and without
+    # this term it recovered nothing: `changes` has no diff base on a
+    # dispatch, so `relevant` came back false and the whole workflow
+    # reported a 3-second green with zero tests run. Verified on run
+    # 31131064381 (2026-08-06): e2e + hindsight-probe both `skipped`,
+    # `e2e-ok` `success`. A recovery lever that reports success without
+    # running is worse than no lever.
+    if: github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -348,8 +357,10 @@ jobs:
     # this job exists so the patch probe can NEVER silently skip, and the
     # queue ref is the last gate before those patches reach main. Letting
     # it path-skip on the new candidate-main path would contradict the
-    # job's entire purpose.
-    if: github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.hindsight == 'true'
+    # job's entire purpose. workflow_dispatch: the recovery lever must
+    # actually run the probe (see the e2e-shard `if:` above for the run
+    # that proved it did not).
+    if: github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hindsight == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -772,6 +783,26 @@ jobs:
   # hindsight-probe in particular exists so the behavioural patch probe
   # can never silently skip; it only actually gates via this sentinel.
   # Keep this `needs` list complete when adding jobs.
+  #
+  # THREE states, not two (#4619). `e2e-ok` is a REQUIRED context, so it
+  # cannot go non-green when the shards path-skip — that would hard-block
+  # every docs-only PR (#1343 / #2237 all over again). But "green because
+  # nothing ran" and "green because e2e passed" are not the same claim,
+  # and reading the first as the second is what got #4619 approved and
+  # then EJECTED from the merge queue when `hindsight-probe` failed on the
+  # `merge_group` ref it had never run on. So:
+  #
+  #   ran + passed   → success, "VERIFIED" in the summary
+  #   ran + failed   → failure (unchanged)
+  #   path-skipped   → success (required-context constraint) but a loud
+  #                    `::warning::` annotation + a step summary that says
+  #                    NOT VERIFIED HERE and names the queue ref as the
+  #                    place it will actually run
+  #   skipped when it was supposed to run → FAILURE. A skip is only
+  #                    legitimate when the path filter said so; a skip on
+  #                    push / merge_group / workflow_dispatch (all
+  #                    must-run events) means the gate is broken, not
+  #                    satisfied, and that used to read as a pass.
   e2e-ok:
     needs: [changes, e2e-shard, hindsight-probe, hindsight-watch-pg-probe]
     if: always()
@@ -779,22 +810,105 @@ jobs:
     timeout-minutes: 1
     steps:
       - name: Verdict
+        env:
+          EVENT: ${{ github.event_name }}
+          CHANGES: ${{ needs.changes.result }}
+          E2E_SHARD: ${{ needs.e2e-shard.result }}
+          HINDSIGHT_PROBE: ${{ needs.hindsight-probe.result }}
+          HINDSIGHT_WATCH_PG_PROBE: ${{ needs.hindsight-watch-pg-probe.result }}
+          # Empty on push / merge_group / workflow_dispatch — the filter
+          # steps don't run there. `must_run` covers those events.
+          WANT_E2E_SHARD: ${{ needs.changes.outputs.relevant }}
+          WANT_HINDSIGHT_PROBE: ${{ needs.changes.outputs.hindsight }}
+          WANT_HINDSIGHT_WATCH_PG_PROBE: ${{ needs.changes.outputs.hindsightwatch }}
         run: |
-          c='${{ needs.changes.result }}'
-          if [ "$c" = "failure" ] || [ "$c" = "cancelled" ]; then
-            echo "::error::changes=$c — path-filter infra failed; can't trust the skip"
+          set -u
+          if [ "$CHANGES" = "failure" ] || [ "$CHANGES" = "cancelled" ]; then
+            echo "::error::changes=$CHANGES — path-filter infra failed; can't trust the skip"
             exit 1
           fi
+
+          # Events where the work jobs are unconditional (their `if:` has
+          # no filter term). A skip on one of these is a broken gate.
+          # Derived PER JOB from that job's own `if:`, not globally:
+          # e2e-shard and hindsight-probe carry a workflow_dispatch term,
+          # hindsight-watch-pg-probe does not, so a dispatch skip is
+          # legitimate for it and a broken gate for the other two.
+          must_run=0
+          case "$EVENT" in
+            push|merge_group|workflow_dispatch) must_run=1 ;;
+          esac
+          must_run_pg=0
+          case "$EVENT" in
+            push|merge_group) must_run_pg=1 ;;
+          esac
+
           fail=0
-          for pair in \
-            "e2e-shard=${{ needs.e2e-shard.result }}" \
-            "hindsight-probe=${{ needs.hindsight-probe.result }}" \
-            "hindsight-watch-pg-probe=${{ needs.hindsight-watch-pg-probe.result }}"; do
-            job="${pair%%=*}"; r="${pair#*=}"
-            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
-              echo "::error::${job}=${r} — real e2e failure, blocking"
-              fail=1
+          verified=0
+          unverified=0
+          summary=""
+
+          verdict() {
+            job="$1"; result="$2"; want="$3"; must="$4"
+            case "$result" in
+              success)
+                verified=$((verified + 1))
+                summary="${summary}| \`${job}\` | ${result} | ran and passed |"$'\n'
+                ;;
+              failure|cancelled)
+                echo "::error::${job}=${result} — real e2e failure, blocking"
+                fail=1
+                summary="${summary}| \`${job}\` | ${result} | FAILED |"$'\n'
+                ;;
+              skipped)
+                if [ "$must" = "1" ] || [ "$want" = "true" ]; then
+                  echo "::error title=e2e gate broken::${job} was SKIPPED on a ref where it must run (event=${EVENT}, path-filter=${want:-n/a}) — that is a broken gate, not a satisfied one"
+                  fail=1
+                  summary="${summary}| \`${job}\` | ${result} | SKIPPED BUT SHOULD HAVE RUN |"$'\n'
+                else
+                  unverified=$((unverified + 1))
+                  echo "::warning title=e2e NOT verified on this ref::${job} was path-skipped, so e2e correctness is UNVERIFIED here — this green means \"not run\", not \"passed\". It runs for real on the merge-queue ref, where a PR can still be ejected (#4619)."
+                  summary="${summary}| \`${job}\` | ${result} | path-skipped — **not verified here** |"$'\n'
+                fi
+                ;;
+              *)
+                echo "::error::${job}=${result} — unrecognised result, refusing to call it a pass"
+                fail=1
+                summary="${summary}| \`${job}\` | ${result} | unrecognised |"$'\n'
+                ;;
+            esac
+          }
+
+          verdict e2e-shard "$E2E_SHARD" "$WANT_E2E_SHARD" "$must_run"
+          verdict hindsight-probe "$HINDSIGHT_PROBE" "$WANT_HINDSIGHT_PROBE" "$must_run"
+          verdict hindsight-watch-pg-probe "$HINDSIGHT_WATCH_PG_PROBE" \
+            "$WANT_HINDSIGHT_WATCH_PG_PROBE" "$must_run_pg"
+
+          if [ "$fail" -ne 0 ]; then
+            headline="❌ FAILED"
+          elif [ "$unverified" -gt 0 ] && [ "$verified" -eq 0 ]; then
+            headline="⚪ NOT VERIFIED on this ref (everything path-skipped)"
+          elif [ "$unverified" -gt 0 ]; then
+            headline="🟡 PARTIALLY VERIFIED on this ref"
+          else
+            headline="✅ VERIFIED on this ref"
+          fi
+
+          {
+            echo "### e2e-ok — ${headline}"
+            echo ""
+            echo "| job | result | meaning |"
+            echo "| --- | --- | --- |"
+            printf '%s' "$summary"
+            echo ""
+            if [ "$unverified" -gt 0 ] && [ "$fail" -eq 0 ]; then
+              echo "\`e2e-ok\` is a required context and therefore stays green when the"
+              echo "path filter skips the work jobs — but **a green here does not mean e2e"
+              echo "passed**. The skipped jobs run unconditionally on the \`merge_group\`"
+              echo "ref, so a PR merged on this signal can still be ejected from the queue"
+              echo "(that is exactly what happened to #4619)."
             fi
-          done
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          echo "event=$EVENT changes=$CHANGES e2e-shard=$E2E_SHARD hindsight-probe=$HINDSIGHT_PROBE hindsight-watch-pg-probe=$HINDSIGHT_WATCH_PG_PROBE → ${headline}"
           [ "$fail" -eq 0 ] || exit 1
-          echo "changes=$c → pass (e2e jobs green or path-skipped)"
