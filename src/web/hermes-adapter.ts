@@ -226,6 +226,27 @@ function intParam(params: URLSearchParams, key: string, fallback: number): numbe
   return Number.isFinite(n) ? Math.min(Math.max(n, 1), 500) : fallback;
 }
 
+/**
+ * Read a `?limit=`/`?offset=`-style bound with upstream's own clamping.
+ *
+ * Distinct from {@link intParam}, which floors at 1 for the sidebar's slice
+ * caps. The paging routes declare `ge=0` (`hermes_cli/web_routers/sessions.py:57`,
+ * `profiles.py:90`), so `limit=0` is a legal "give me the count, no rows" query
+ * and must not silently become 1.
+ */
+function boundParam(
+  params: URLSearchParams,
+  key: string,
+  fallback: number,
+  max: number,
+): number {
+  const raw = params.get(key);
+  if (raw === null || raw === "") return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, 0), max);
+}
+
 // ─── prompt.submit → inject_inbound ──────────────────────────────────────────
 
 interface InjectResult {
@@ -645,23 +666,43 @@ export async function handleHermesRest(
 ): Promise<HermesRestResult | null> {
   // GET /api/sessions or /api/profiles/sessions — fleet session list
   // Hermes Desktop calls /api/profiles/sessions for the cross-profile sidebar.
+  //
+  // Both routes PAGE. Reporting `limit: sessions.length` (as this used to)
+  // told the desktop its page size was however many rows happened to come
+  // back, so `pageWindow()` re-windowed a full page down to the fleet size and
+  // the sidebar footer's `total > limit` arithmetic was wrong. Upstream's
+  // bounds, verbatim: `/api/sessions` is `limit=Query(20, ge=0, le=100)`
+  // (hermes_cli/web_routers/sessions.py:57-59) and `/api/profiles/sessions` is
+  // `le=500` (profiles.py:90) because the desktop's archived/palette callers
+  // ask for 200.
   if (
     method === "GET" &&
     (pathname === "/api/sessions" || pathname === "/api/profiles/sessions")
   ) {
+    const acrossProfiles = pathname === "/api/profiles/sessions";
     const query = new URLSearchParams(search);
     const sessions = filterSessionsBySource(await buildAllSessions(config), {
       source: query.get("source"),
       excludeSources: csvParam(query, "exclude_sources"),
     });
+    const limit = boundParam(query, "limit", 20, acrossProfiles ? 500 : 100);
+    const offset = boundParam(query, "offset", 0, Number.MAX_SAFE_INTEGER);
     return {
       status: 200,
       body: {
-        sessions,
+        sessions: sessions.slice(offset, offset + limit),
+        // `total` is the size of the whole matching set, NOT of the window —
+        // it is what the footer's "showing N of M" is built from.
         total: sessions.length,
-        limit: sessions.length,
-        offset: 0,
+        limit,
+        offset,
         profile_totals: { default: sessions.length },
+        // Per-profile read failures. Only the cross-profile route carries this
+        // upstream (profiles.py:225-228; /api/sessions has no such key), and
+        // `listSidebarSessionsLegacy` reads `recents.errors ?? []`
+        // (hermes.ts:552). Switchroom has one implicit profile whose read
+        // either succeeds or throws, so an empty list is the honest answer.
+        ...(acrossProfiles ? { errors: [] } : {}),
       },
     };
   }
@@ -731,14 +772,56 @@ export async function handleHermesRest(
   }
 
   // GET /api/sessions/:id/messages — conversation history (SessionMessagesResponse shape)
+  //
+  // The `pagination` object is load-bearing, not decoration. `getAllSessionMessages`
+  // (apps/desktop/src/hermes.ts:713-750 at 9da6d45) walks pages with
+  // `order:'oldest'`, and stops when `!page.pagination` — it reads a MISSING
+  // pagination block as "legacy backend, that was the whole transcript". Emitting
+  // no pagination therefore truncated every transcript at the first page with no
+  // error anywhere.
+  //
+  // Bounds and defaults are upstream's, verbatim
+  // (hermes_cli/web_routers/sessions.py:601-651): limit is `ge=0`, capped at 500,
+  // and defaults to 500 when omitted; `order` defaults to `latest` when the caller
+  // omitted `limit` (the dashboard's "show me the end of the conversation" view)
+  // and to `oldest` when it paged explicitly; an unrecognised `order` is a 400.
   const messagesMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/);
   if (method === "GET" && messagesMatch) {
     const id = decodeURIComponent(messagesMatch[1]);
     if (!isKnownSession(config, id)) return { status: 404, body: { error: "Unknown session" } };
-    const result = handleGetTurns(config, id, 100);
+    const query = new URLSearchParams(search);
+    const orderParam = query.get("order");
+    if (orderParam !== null && orderParam !== "oldest" && orderParam !== "latest") {
+      return { status: 400, body: { detail: "order must be one of: oldest, latest" } };
+    }
+    const explicitLimit = query.get("limit") !== null && query.get("limit") !== "";
+    const limit = boundParam(query, "limit", 500, 500);
+    const offset = boundParam(query, "offset", 0, Number.MAX_SAFE_INTEGER);
+    const order = orderParam ?? (explicitLimit ? "oldest" : "latest");
+
+    // `listTurnsForAgent` reads newest-first and hard-caps at 200 rows
+    // (telegram-plugin/registry/turns-schema.ts:735), so this window is the most
+    // recent 200 turns of the thread — reversed here into the chronological order
+    // a transcript is rendered in. Anything older than 200 turns is not readable
+    // through this helper at all; see the known-limits note in the parity fixture.
+    const result = handleGetTurns(config, id, 200);
     // Degrade gracefully on DB errors — return empty messages.
-    const messages = turnsToMessages(result.turns ?? []);
-    return { status: 200, body: { session_id: id, messages } };
+    const chronological = turnsToMessages([...(result.turns ?? [])].reverse());
+    const window =
+      order === "latest"
+        ? chronological.slice(
+            Math.max(0, chronological.length - offset - limit),
+            Math.max(0, chronological.length - offset),
+          )
+        : chronological.slice(offset, offset + limit);
+    return {
+      status: 200,
+      body: {
+        session_id: id,
+        messages: window,
+        pagination: { limit, offset, order, returned: window.length },
+      },
+    };
   }
 
   // GET /api/status — StatusResponse shape Hermes Desktop expects

@@ -175,6 +175,11 @@ export default defineConfig({
       // and bun's vitest shim is partial — coverage discussion in
       // PR #994.
       "**/telegram-plugin/uat/**",
+      // hermes-messages-paging.test.ts seeds a real turns registry.db via
+      // bun:sqlite (openTurnsDb) to assert transcript ORDER and offset
+      // windowing — properties that pass vacuously against the empty agents
+      // dir the vitest parity fixture points at.
+      "**/telegram-plugin/tests/hermes-messages-paging.test.ts",
       "**/telegram-plugin/tests/history.test.ts",
       // orphaned-db-sweep.test.ts unlinks a live history.db `-wal`/`-shm` out
       // from under an open bun:sqlite handle and probes the on-disk rows with a
