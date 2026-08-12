@@ -56,6 +56,27 @@ now an anomaly worth investigating, not the norm.
   Passes 1 and 2 are byte-for-byte unaffected, and timeouts still take the inner
   halve-the-page path from #4604.
 
+- **hindsight pg0: `unit_entities` / `entities` now get vacuumed often enough
+  to keep their visibility maps fresh, so index-only scans stay index-only.**
+  Measured read-only on the live fleet DB (2026-08-13): `unit_entities` at
+  62.8 % `relallvisible/relpages` and `entities` at 31.4 %, with
+  `last_autovacuum` NULL and `autovacuum_count` 0 on both. `EXPLAIN (ANALYZE,
+  BUFFERS)` over 200 k index tuples paid 64,177 heap fetches on
+  `idx_unit_entities_entity_unit` and 138,465 on `pk_entities` — 69 % of the
+  "index-only" rows on `entities` touching the heap anyway, on indexes the
+  graph queries drive 6.2 M / 73.8 M scans through. `entities` was never in
+  the maintenance script's autovacuum tuning at all, and the
+  `scale_factor=0.05` `unit_entities` already had is the DEAD-tuple trigger —
+  useless on a table that took 25,583 inserts and 0 updates over the measured
+  window. Its INSERT trigger was still stock: 1000 + 0.2 × 1.7 M = 340,735
+  inserts, about two weeks of ingest, so nothing ever refreshed the map. Both
+  tables now pin the insert / dead-tuple / analyze triggers plus a cost budget
+  so a pass lands roughly every 8 h at the measured churn (~9.5 k inserts for
+  `unit_entities`, ~1.7 k dead tuples for `entities`). More frequent vacuum is
+  more background I/O; these two are small enough (108 MB + 261 MB of index,
+  and 25 MB + 56 MB) that a pass is a few hundred MB of mostly-cached reads.
+  `memory_units` (1.7 GB + HNSW) is deliberately left alone. (#4634)
+
 - **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
   `hindsight-watch-pg-probe`'s `if:` gate carried `push` and `merge_group` but
   not `workflow_dispatch`, unlike its siblings `e2e-shard` and
