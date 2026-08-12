@@ -3929,6 +3929,36 @@ export class HostdServer {
         cmd: "test -f /state/agent/telegram/.env && grep -qE '^TELEGRAM_BOT_TOKEN=[0-9]+:' /state/agent/telegram/.env",
       },
       { name: "state", cmd: "test -w /state/agent" },
+      {
+        // tzdata integrity. The compose `/etc/localtime` bind mount is
+        // aimed at a path that stock Debian ships as a SYMLINK into
+        // /usr/share/zoneinfo; Docker resolves the destination through
+        // that symlink before mounting, so on any agent image built
+        // before the Dockerfile.agent de-symlink step the agent's local
+        // zonefile was written over /usr/share/zoneinfo/Etc/UTC. The
+        // container then reports LOCAL time for every by-name UTC
+        // lookup (`ZoneInfo("UTC")`, `TZ=UTC date`, Go/Java/Rust) —
+        // hours wrong, silently, with no error anywhere.
+        //
+        // This probe is the loud detector for a stale image: it fails
+        // when (a) /etc/localtime is still a symlink (the precondition
+        // that lets the clobber happen at all) or (b) Etc/UTC no longer
+        // decodes to a zero offset (the clobber already happened).
+        // Condition (b) also catches a mount aimed at some other zone.
+        // Exit code only — nothing is printed, so no container state
+        // leaks into the hostd response.
+        //
+        // python3 is guaranteed present (the `mcp` probe above relies
+        // on it). Single-quoted around the python body so the shell
+        // passes it verbatim.
+        name: "tzdata",
+        cmd:
+          "test ! -L /etc/localtime && python3 -c 'import sys;" +
+          "from datetime import datetime;" +
+          "from zoneinfo import ZoneInfo;" +
+          'sys.exit(0 if datetime.now(ZoneInfo("Etc/UTC")).utcoffset()' +
+          ".total_seconds()==0 else 1)'",
+      },
     ];
     if (req.args.deep) {
       // Token-introspect probe: parse .credentials.json in-container and

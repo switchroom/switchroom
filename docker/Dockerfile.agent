@@ -432,6 +432,54 @@ COPY dist/agent-scheduler/index.js /opt/switchroom/agent-scheduler/index.js
 # forks it when BUZZ_ENABLED=1, so this COPY is inert for every current agent.
 COPY dist/buzz-gateway/index.js /opt/switchroom/buzz-gateway/index.js
 
+# /etc/localtime MUST be a regular file, not the stock tzdata symlink.
+#
+# The compose generator bind-mounts the host's zoneinfo file for the
+# agent's resolved zone onto `/etc/localtime` (src/agents/compose.ts,
+# the `/etc/localtime passthrough` block). Docker resolves a bind
+# mount's DESTINATION path through symlinks inside the container rootfs
+# BEFORE it mounts. Stock Debian tzdata ships
+# `/etc/localtime -> /usr/share/zoneinfo/Etc/UTC`, so the mount landed
+# on the symlink's TARGET: the agent's local zonefile was written over
+# `/usr/share/zoneinfo/Etc/UTC` and `/etc/localtime` still resolved
+# there. Net effect: `/etc/localtime` read correct local time by
+# accident, while every tzdata consumer that asked for UTC by NAME got
+# local time instead — Python `zoneinfo.ZoneInfo("UTC")`, `TZ=UTC
+# date`, and any Go/Java/Rust binary reading the OS zoneinfo db were
+# silently offset by the agent's UTC offset (10h for
+# Australia/Melbourne). `/usr/share/zoneinfo/UTC` is itself a symlink
+# to `Etc/UTC`, so it inherited the corruption too. Node is unaffected
+# (bundled full-ICU, never reads /usr/share/zoneinfo).
+#
+# Materialising `/etc/localtime` as a plain file gives the mount a real
+# path to attach to, so it lands where it was aimed and nothing else is
+# touched. We keep the mount rather than dropping it because the
+# statically-linked Go / JVM readers it was added for (#1198 follow-up)
+# ignore `TZ` and read `/etc/localtime` directly — dropping it would
+# regress them back to image-default UTC.
+#
+# Copied from whatever the base image's link currently resolves to, so
+# the unmounted image default is unchanged (Etc/UTC). Byte-identical
+# content, different inode type. Must run as root, i.e. before `USER`.
+#
+# Trade-off: `readlink /etc/localtime` no longer yields a zone name in
+# this image. Nothing regresses — `detectServerTimezone()`
+# (src/config/timezone.ts) treats an Etc/UTC link as "no signal" and
+# returns undefined already, which is exactly what it now returns for a
+# non-symlink; and the agent image never runs the apply-time resolver
+# (hostd does, from Dockerfile.hostd, which is deliberately untouched
+# so its readlink layer keeps working).
+RUN set -eu; \
+    src="$(readlink -f /etc/localtime 2>/dev/null || true)"; \
+    [ -f "$src" ] || src=/usr/share/zoneinfo/Etc/UTC; \
+    rm -f /etc/localtime; \
+    cp "$src" /etc/localtime; \
+    chmod 0644 /etc/localtime; \
+    if [ -L /etc/localtime ] || [ ! -f /etc/localtime ]; then \
+      echo "FATAL: /etc/localtime is not a regular file after de-symlink" >&2; \
+      exit 1; \
+    fi
+
 # sec WS6-F5 (#1419): non-root image default. Pre-#1419 the agent
 # image had NO `USER`, so its effective default was root — all agent
 # privilege-reduction was compose-emitted only (the four root
