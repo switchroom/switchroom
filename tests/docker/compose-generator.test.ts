@@ -165,12 +165,16 @@ function findCollidingPair(): [string, string] {
  *      `^ {2}` anchor is the only thing excluding it.
  *
  * Change any of those emit sites and this helper must change with them. A
- * clause-2 break yields an empty `all`, which would make callers assert over
- * an empty set instead of failing (`expect(labelled).toEqual(all)` is
- * trivially true when both are empty) — so the helper hard-fails on a
- * zero-service parse. generateCompose emits the vault-broker singleton
- * unconditionally (compose.ts:1520), so zero services always means the PARSER
- * broke, never the input.
+ * GLOBAL clause-2 break (every emit site moving at once) empties `all`, which
+ * would make callers assert over an empty set instead of failing
+ * (`expect(labelled).toEqual(all)` is trivially true when both are empty) — so
+ * the helper hard-fails on a zero-service parse. A SINGLE-SITE break leaves
+ * `all` non-empty and slips past that guard silently; it is caught only by the
+ * call sites' explicit `expect(all).toEqual([...])` name lists, which is why
+ * those lists must stay explicit rather than degrade into a length or set
+ * check. generateCompose emits the vault-broker singleton unconditionally
+ * (compose.ts:1520), so zero services always means the PARSER broke, never the
+ * input.
  */
 function servicesByFleetLabel(
   yaml: string,
