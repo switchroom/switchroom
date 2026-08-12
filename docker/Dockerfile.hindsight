@@ -6457,26 +6457,42 @@ PYEOF
 #      `int(now) // _SWEEP_SLICE_SECONDS % slice_count` — so no cursor is
 #      persisted anywhere: it survives a worker restart, needs no new table, no
 #      alembic revision, and has nothing to corrupt. Slicing is on
-#      `md5(entity_id_1)`, and every row has exactly one `entity_id_1`, so the
-#      slices PARTITION the bank. Measured slice balance on overlord at 26
-#      slices: largest 23,359 rows against a 19,903 mean.
+#      `md5(entity_id_1)`: the slices PARTITION the bank because the filter is
+#      a function of ONE deterministic column value per row, so exactly one
+#      slice_index matches each row. `entity_id_2` would partition just as
+#      well; `entity_id_1` is chosen because it is the LEADING column of the
+#      scan and lock order (so a slice is contiguous index ranges, not a
+#      scatter) and because the bank join is already `ON e.id = c.entity_id_1`.
+#      Measured slice balance on overlord at 26 slices: largest 23,359 rows
+#      against a 19,903 mean.
 #
 #      COVERAGE IS COUPON-COLLECTOR, NOT A CYCLE. `graph_maintenance` is
 #      DEMAND-DRIVEN: `submit_async_graph_maintenance` fires when work is
 #      enqueued (retain / delete / edit) and short-circuits with `no_work=True`
 #      on an empty queue — there is no timer anywhere. Runs are therefore
 #      uncorrelated with the clock the index is taken from, each run samples an
-#      effectively random slice, and expected full coverage is `N*H(N)` runs,
+#      effectively random slice, and expected full coverage is `N*H(N)` DRAWS,
 #      not `N`. That is precisely why `N` is kept as small as the bank allows.
-#      Measured runs/day per bank over 30 days (`async_operations`,
-#      2026-08-12): overlord 28.9, klanker 26.3, finn 9.4, carrie 8.3,
-#      marko 5.2, assistant 3.0, gymbro 1.8, ziggy 0.77, reggie 0.70,
-#      lawgpt 0.30. A FIXED 24 would have given those banks expected full
-#      coverage every 3.1, 3.5, 9.6, 11.0, 17.4, 29.9, 49.4, 118.2, 129.5 and
-#      302.1 days — putting the quietest banks, which never had the timeout and
-#      swept whole in 2.7-4.3 s, on a rotation measured in months to fix a
-#      problem they do not have. Size-derived they are 2.7, 2.6, 1.9, 1.8, 1.1,
-#      2.8, 0.6, 1.3, 1.4 and 3.3 days.
+#
+#      A DRAW IS A DISTINCT `_SWEEP_SLICE_SECONDS` WINDOW, NOT A RUN. Runs that
+#      land inside the same window compute the same slice index, so the later
+#      ones re-sweep what the first just swept and contribute no coverage. At
+#      the 1800 s this patch originally shipped, overlord averaged 3.95 runs
+#      per window and klanker 3.60 — ~75% of their sweeps were duplicate work,
+#      and every coverage figure computed from runs/day understated the truth
+#      by 1.7-3.9x. See `_SWEEP_SLICE_SECONDS` below for why it is now 120 s.
+#
+#      Measured distinct 120 s windows/day per bank over 30 days
+#      (`async_operations`, 2026-08-12): overlord 21.8, klanker 21.6, finn 7.6,
+#      carrie 6.6, marko 4.8, assistant 2.4, gymbro 1.6, ziggy 0.70,
+#      reggie 0.70, lawgpt 0.30. A FIXED 24 would have given those banks
+#      expected full coverage every 4.2, 4.2, 12.0, 13.7, 18.8, 38.4, 58.0,
+#      130, 130 and 303 days — putting the quietest banks, which never had the
+#      timeout and swept whole in 2.7-4.3 s, on a rotation measured in months
+#      to fix a problem they do not have. Size-derived they are 3.5, 3.1, 2.4,
+#      2.2, 1.1, 3.5, 0.5, 1.3, 1.4 and 3.3 days; replaying the real arrival
+#      log rather than assuming uniform draws gives 1.3, 1.1, 0.6, 0.8, 0.7,
+#      1.4 for the six sliced banks.
 #
 #      WHY THE FULL SWEEP STAYS, rather than being replaced by a watermark
 #      scoped to recently-touched entities. A cooccurrence goes stale when a
@@ -6792,10 +6808,16 @@ apply("engine/db/ops_postgresql.py", (
     "        #\n"
     "        # The slice filter is `md5(entity_id_1) % slice_count = slice_index`.\n"
     "        # Hashing rather than using the UUID's own bits keeps the slices even\n"
-    "        # for banks whose entity ids are not uniformly distributed, and taking\n"
-    "        # it on entity_id_1 ALONE is what makes the slices a partition: every\n"
-    "        # row has exactly one entity_id_1, so it belongs to exactly one slice\n"
-    "        # and consecutive runs cover the bank exactly once each. `bit(16)` is\n"
+    "        # for banks whose entity ids are not uniformly distributed. What makes\n"
+    "        # the slices a PARTITION is that the filter is a function of ONE\n"
+    "        # deterministic column value per row: every row gets exactly one hash,\n"
+    "        # so exactly one slice_index matches it, and the slices tile the bank.\n"
+    "        # That is true of entity_id_2 as well — the reason the column is\n"
+    "        # entity_id_1 specifically is (a) LOCALITY: entity_id_1 is the leading\n"
+    "        # column of the scan and lock order below, so a slice is a set of\n"
+    "        # contiguous index ranges rather than a scatter across the whole index,\n"
+    "        # and (b) the bank join is already `ON e.id = c.entity_id_1`, so the\n"
+    "        # hashed column is one the row is filtered on anyway. `bit(16)` is\n"
     "        # always non-negative, so no abs() is needed and slice_index is always\n"
     "        # in range; at slice_count = 1 the filter degenerates to `% 1 = 0`,\n"
     "        # i.e. the whole bank, with no branch in the SQL.\n"
@@ -7174,11 +7196,15 @@ apply("engine/graph_maintenance.py", (
     "# on an empty queue (`no_work=True`), so runs are uncorrelated with the wall\n"
     "# clock the slice index is derived from. Each run therefore samples an\n"
     "# effectively random slice and full coverage is COUPON-COLLECTOR — expected\n"
-    "# N*H(N) runs, ~91 for N=24, not 24. Measured runs/day per bank over 30 days\n"
-    "# (async_operations, 2026-08-12) span 28.9 (overlord) to 0.30 (lawgpt), so a\n"
+    "# N*H(N) DRAWS, ~91 for N=24, not 24. A draw is a distinct\n"
+    "# _SWEEP_SLICE_SECONDS window, NOT a run: runs sharing a window share a\n"
+    "# slice index and the later ones are duplicate work (see the note on that\n"
+    "# constant below). Measured over 30 days (async_operations, 2026-08-12),\n"
+    "# distinct 120 s windows/day span 21.8 (overlord) to 0.30 (lawgpt), so a\n"
     "# fixed 24 would have moved the QUIET banks — the ones that never had the\n"
     "# timeout, and swept whole in 2.7-4.3 s — from full coverage every run to\n"
-    "# 13-302 days per full sweep. Size-derived, every bank lands at 0.6-3.3 days.\n"
+    "# 12-303 days per full sweep. Size-derived, every bank lands at 0.5-3.5 days\n"
+    "# (measured by replaying the real arrival log: 0.5-3.3).\n"
     "#\n"
     "# _SWEEP_MIN_BATCH_SIZE is the floor for the halve-and-retry in the loop\n"
     "# below, which exists because a page landing entirely inside ONE hub entity's\n"
@@ -7194,11 +7220,39 @@ apply("engine/graph_maintenance.py", (
     "# page shrank to the floor of 50 — but `batch_size` never recovers after a\n"
     "# shrink, so a slice that shrinks EARLY is the one shape that can reach the\n"
     "# tripwire on honest work. The log line names both causes for that reason.\n"
+    "#\n"
+    "# _SWEEP_SLICE_SECONDS is a DECORRELATION window, not a schedule. Nothing\n"
+    "# depends on it but this: two runs that land inside the SAME window compute\n"
+    "# the SAME slice index, so the second one re-sweeps rows the first just\n"
+    "# swept and contributes nothing. It was 1800 — the leftover of the same\n"
+    "# 'a run arrives every 30 minutes' model the slice COUNT above already\n"
+    "# abandons. Runs are demand-driven and clustered on write bursts, so the\n"
+    "# measured cost of that window was severe (async_operations, 30 d to\n"
+    "# 2026-08-12): 3.95 runs per 1800 s window on overlord and 3.60 on klanker,\n"
+    "# i.e. ~75% of every busy bank's sweeps were pure duplicate DB work.\n"
+    "#\n"
+    "# 120 s is picked from the measured INTER-ARRIVAL distribution, which is the\n"
+    "# only thing this constant has to beat: median gap between consecutive runs\n"
+    "# is 197 s (overlord) and 250 s (klanker), so a 120 s window is the largest\n"
+    "# round value that puts a TYPICAL consecutive pair in different windows.\n"
+    "# Measured, replaying the real arrival log at slice_count = 21/19:\n"
+    "#\n"
+    "#   window   duplicate runs        mean days to full coverage\n"
+    "#            overlord / klanker    overlord / klanker\n"
+    "#   1800 s   74.7% / 72.3%         2.49 / 2.19\n"
+    "#    300 s   40.3% / 33.3%         1.58 / 1.24\n"
+    "#    120 s   25.5% / 18.3%         1.27 / 1.10\n"
+    "#     60 s   15.7% /  9.5%         1.21 / 0.91\n"
+    "#\n"
+    "# 60 s buys little more on the banks that matter and starts to WOBBLE on the\n"
+    "# small ones, where the whole rotation becomes 3-6 minutes and can alias\n"
+    "# against the worker's own cadence (carrie, 6 slices: 0.80 d at 120 s but\n"
+    "# 1.01 d at 60 s; assistant, 4 slices: 1.13 d at 300 s, 1.42 d at 120 s).\n"
     "_SWEEP_BATCH_SIZE = 1000\n"
     "_SWEEP_MIN_BATCH_SIZE = 50\n"
     "_SWEEP_SLICE_TARGET_ROWS = 25000\n"
     "_SWEEP_MAX_SLICE_COUNT = 24\n"
-    "_SWEEP_SLICE_SECONDS = 1800\n"
+    "_SWEEP_SLICE_SECONDS = 120\n"
     "_SWEEP_MAX_PAGES = 2000\n"
     "\n"
     "\n"
@@ -7240,8 +7294,11 @@ apply("engine/graph_maintenance.py", (
     "        # current unit witnesses them together.\n"
     "        #\n"
     "        # switchroom: this was ONE whole-bank statement, measured at 115s on a\n"
-    "        # 517k-row bank against a 60s command_timeout — it could not finish, so\n"
-    "        # the pass had never once completed on this fleet's two largest banks.\n"
+    "        # 517k-row bank against a 60s command_timeout. Its cost grows with the\n"
+    "        # bank, so it worked until it did not: overlord and klanker completed\n"
+    "        # 849 and 779 runs through July 2026 at a p50 of 15-33s, then crossed\n"
+    "        # the 60s wall in the week of 2026-08-03 and have failed EVERY run\n"
+    "        # since (overlord 17/22 then 2/3 failed; klanker 9/14).\n"
     "        # It is now a loop of BOUNDED, RESUMABLE pages over one time-rotating\n"
     "        # slice of the bank.\n"
     "        #\n"
@@ -7255,8 +7312,10 @@ apply("engine/graph_maintenance.py", (
     "        #\n"
     "        # The slice index is a pure function of the wall clock: no persisted\n"
     "        # cursor, no new table, no alembic revision, unaffected by a restart.\n"
-    "        # The slices PARTITION the bank (the hash is on entity_id_1 and every\n"
-    "        # row has exactly one), so a row is swept by exactly one slice.\n"
+    "        # The slices PARTITION the bank: the filter is a function of ONE\n"
+    "        # deterministic column value per row, so exactly one slice_index\n"
+    "        # matches it. (See the note on the filter itself for why that column\n"
+    "        # is entity_id_1 rather than entity_id_2 — locality, not partition.)\n"
     "        #\n"
     "        # COVERAGE IS PROBABILISTIC, NOT A CYCLE, and the comment that used to\n"
     "        # sit here claiming '24 consecutive runs cover the bank exactly once\n"
@@ -7399,13 +7458,43 @@ for rel in TOUCHED:
 
 pg = (BASE / "engine/db/ops_postgresql.py").read_text()
 sweep = pg.split("async def prune_stale_cooccurrences", 1)[1].split("\n    async def ", 1)[0]
-assert "LIMIT $6::int" in sweep, (
-    f"{TAG}: the page CTE lost its LIMIT — the statement is unbounded again and the "
-    "whole point of this patch is gone"
+# The LIMIT and the ORDER BY that feeds it are pinned as ONE WHOLE-LINE PAIR,
+# not as two substrings. Both halves of that matter:
+#
+#   * A bare `"LIMIT $6::int" in sweep` is satisfied by `LIMIT $6::int + 1`,
+#     which is still "a LIMIT" to a grep and still bounded — but no longer the
+#     bound this patch measured.
+#   * The ORDER BY is the load-bearing half and had NO guard at all. `LIMIT`
+#     without `ORDER BY` returns an ARBITRARY batch_size rows, and the caller
+#     then sets its cursor to the MAX key of that arbitrary set (the
+#     `ORDER BY … DESC LIMIT 1` subselects below). Every qualifying row that
+#     sorts BELOW that max but did not happen to land in the page is skipped
+#     for the rest of the slice pass — silently, with no short page, no error
+#     and a plausible `scanned` count. It survives a small fixture because the
+#     planner picks the PK index scan and the rows come out sorted by luck; a
+#     bitmap heap scan or a parallel seq scan on a 500k-row bank does not.
+#     Deleting this one line is therefore a silent data-coverage bug, which is
+#     exactly the class that has to be pinned rather than trusted.
+assert (
+    "\n                ORDER BY c.entity_id_1, c.entity_id_2\n"
+    "                LIMIT $6::int\n"
+) in sweep, (
+    f"{TAG}: the page CTE's `ORDER BY c.entity_id_1, c.entity_id_2` + `LIMIT $6::int` "
+    "pair is not the exact two lines this patch ships. Without the ORDER BY the page "
+    "is an ARBITRARY batch_size rows and the cursor — the MAX key of that page — skips "
+    "every qualifying row below it that the page did not happen to contain. Without "
+    "the exact LIMIT line the measured bound is not the shipped bound"
 )
 assert "WITH page AS MATERIALIZED" in sweep, f"{TAG}: the page CTE is no longer materialised"
-# Count the SQL form (16-space indent inside the victims CTE), not the prose
-# mentions in the comment above it.
+# Count the SQL forms (16-space indent inside the CTEs), not the prose mentions
+# in the comment above them. TWO ordered scans ship: the page CTE's (pinned
+# whole-line above, it makes the keyset page a deterministic prefix) and the
+# victims CTE's (it is the #2529 ordered lock's sort). Count them together so
+# neither can be dropped in isolation.
+assert sweep.count("\n                ORDER BY c.entity_id_1, c.entity_id_2\n") == 2, (
+    f"{TAG}: the sweep no longer has BOTH ordered scans — the page CTE's keyset order "
+    "and the #2529 ordered lock's"
+)
 assert sweep.count("\n                FOR UPDATE OF c\n") == 1, (
     f"{TAG}: the #2529 ordered lock did not survive the rewrite"
 )

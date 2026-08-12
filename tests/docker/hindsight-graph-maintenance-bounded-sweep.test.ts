@@ -33,8 +33,12 @@
  *   overlord    517,475   65.2 s   <- past the 60s asyncpg command_timeout
  *                                     BEFORE the sort, the locks and the DELETE
  *
- * So on the two largest banks the pass cannot finish, has never once finished,
- * and leaks stale cooccurrence rows for ever. The prior fix (#4604) removed the
+ * Because that cost GROWS with the bank, this worked until it did not. From
+ * `async_operations` over the 30 days to 2026-08-12: overlord and klanker
+ * completed 849 and 779 runs through July at a p50 of 15-33 s, then crossed the
+ * 60 s wall in the week of 2026-08-03 — overlord 17 of 22 runs failed that
+ * week and 2 of 3 the next, klanker 9 of 14 — and both have leaked stale
+ * cooccurrence rows on every run since. The prior fix (#4604) removed the
  * 9x retry storm around it and the blank `error_message` it hid behind; it
  * deliberately did not make the statement finish. This one does.
  *
@@ -254,8 +258,17 @@ check("B1_returns_cursor",
 # than being frozen into the SQL text, which is what lets B3 shrink it.
 check("B1_limit_is_bound", "LIMIT $" in sql, "no bound LIMIT in the page CTE")
 check("B1_batch_size_bound", 250 in params, f"batch_size not among params {params!r}")
-check("B1_slice_bound", 24 in params and 5 in params, f"slice not among params {params!r}")
-check("B1_cursor_bound", "cur1" in params and "cur2" in params, f"cursor not among params {params!r}")
+# POSITION, not membership. "24 in params and 5 in params" is true no matter
+# which placeholder each value reaches, so swapping slice_count and slice_index
+# at the bind site yields "... % 5 = 24" — a predicate that is NEVER true, so
+# the sweep deletes nothing, for ever, on every sliced bank — with this probe
+# still green. Same for the two cursor uuids: reversed, the keyset predicate
+# compares against the wrong tuple. The bind ORDER is part of the contract, so
+# assert the whole tuple against the $1..$6 the SQL above declares.
+check("B1_params_are_positional",
+      params == ("bank-x", "cur1", "cur2", 24, 5, 250),
+      "expected ('bank-x', 'cur1', 'cur2', 24, 5, 250) — $1 bank_id, $2/$3 cursor, "
+      f"$4 slice_count, $5 slice_index, $6 batch_size, in THAT order — got {params!r}")
 check("B1_keyset_predicate", "(c.entity_id_1, c.entity_id_2) >" in sql, "no keyset predicate")
 check("B1_slice_predicate", "md5(c.entity_id_1::text)" in sql, "no hash-slice predicate")
 # Unchanged upstream invariants — the fix must not buy its bound with these.
@@ -281,8 +294,10 @@ check("C_slice_target_rows", getattr(gm, "_SWEEP_SLICE_TARGET_ROWS", None) == 25
       f"got {getattr(gm, '_SWEEP_SLICE_TARGET_ROWS', None)}")
 check("C_max_slice_count", getattr(gm, "_SWEEP_MAX_SLICE_COUNT", None) == 24,
       f"got {getattr(gm, '_SWEEP_MAX_SLICE_COUNT', None)}")
-check("C_slice_seconds", getattr(gm, "_SWEEP_SLICE_SECONDS", None) == 1800,
-      f"got {getattr(gm, '_SWEEP_SLICE_SECONDS', None)}")
+check("C_slice_seconds", getattr(gm, "_SWEEP_SLICE_SECONDS", None) == 120,
+      f"got {getattr(gm, '_SWEEP_SLICE_SECONDS', None)}; the decorrelation window is 120s "
+      "— at the old 1800s, 3.95 (overlord) / 3.60 (klanker) runs landed in the SAME "
+      "window and swept the SAME slice, making ~75% of them duplicate work")
 check("C_max_pages", getattr(gm, "_SWEEP_MAX_PAGES", None) == 2000,
       f"got {getattr(gm, '_SWEEP_MAX_PAGES', None)}")
 check("C_no_fixed_slice_count", not hasattr(gm, "_SWEEP_SLICE_COUNT"),
@@ -313,8 +328,8 @@ if callable(_sc):
     check("S_slice_count_is_capped", _sc(10**9) == 24, f"got {_sc(10**9)}")
 
 _si = getattr(gm, "_sweep_slice_index", None)
-check("S_slice_index_is_pure", callable(_si) and _si(0.0, 24) == 0 and _si(1800.0, 24) == 1
-      and _si(24 * 1800.0, 24) == 0 and _si(5 * 1800.0, 1) == 0,
+check("S_slice_index_is_pure", callable(_si) and _si(0.0, 24) == 0 and _si(120.0, 24) == 1
+      and _si(24 * 120.0, 24) == 0 and _si(5 * 120.0, 1) == 0,
       "graph_maintenance._sweep_slice_index(now, slice_count) is missing or is not the "
       "documented pure function of the clock")
 
@@ -440,7 +455,7 @@ real_time_mod = gm.time
 seen = set()
 try:
     for tick in range(21):
-        gm.time = types.SimpleNamespace(time=(lambda t: (lambda: float(t)))(tick * 1800))
+        gm.time = types.SimpleNamespace(time=(lambda t: (lambda: float(t)))(tick * 120))
         s = FakeStore([page(0, 1, "z", "z")])
         guard("B2_rotation_job_runs", lambda: run_job(s))
         if s.calls:
@@ -1024,6 +1039,15 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
   // have silently green-skipped on every runner without the 6.4GB image. The
   // guard is written over EVERY probe rather than this one, so the next probe
   // cannot repeat it.
+  //
+  // KNOWN GAP, filed as #4636: this discovers its own subject by grepping for
+  // the same string it asserts, so a one-character typo in a probe both
+  // de-registers it here AND makes its own REQUIRED flag permanently false —
+  // two silent failures that cancel out. Only this file is hard-pinned below;
+  // the other 18 are not. The durable fix is a set-identity assertion between
+  // the `hindsight-*.test.ts` glob and the workflow's run steps with a named
+  // allowlist, which also catches the reverse drift (a run step outliving a
+  // deleted probe) that nothing checks today.
   it("every probe that demands a real run has a workflow step that gives it one", () => {
     const workflow = readFileSync(
       resolve(root, ".github/workflows/docker-e2e.yml"),
@@ -1155,6 +1179,11 @@ describe.skipIf(!dockerOk || !imageOk)(
       // travels with the call (which is what lets B3 shrink it).
       expect(stdout).toContain("B1_limit_is_bound=OK");
       expect(stdout).toContain("B1_batch_size_bound=OK");
+      // …and every value reaches the placeholder it is meant to. Asserted by
+      // POSITION: a membership check is green even with slice_count and
+      // slice_index swapped, which makes the filter `% 5 = 24` and deletes
+      // nothing, for ever, on every sliced bank.
+      expect(stdout).toContain("B1_params_are_positional=OK");
       expect(stdout).toContain("B1_keyset_predicate=OK");
       expect(stdout).toContain("B1_slice_predicate=OK");
       // The bound must not have been bought by weakening the sweep.
@@ -1167,7 +1196,7 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("B2_cursor_advances=OK");
       expect(stdout).toContain("B2_sums_deletions_across_pages=OK");
       expect(stdout).toContain("B2_slice_index_stable_within_run=OK");
-      // Consecutive 30-minute ticks visit every slice — i.e. the rotation
+      // Consecutive _SWEEP_SLICE_SECONDS ticks visit every slice — i.e. the rotation
       // covers the WHOLE bank rather than resampling part of it.
       expect(stdout).toContain("B2_slice_rotates_over_whole_bank=OK");
 

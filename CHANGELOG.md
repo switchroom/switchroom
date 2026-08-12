@@ -95,10 +95,14 @@ now an anomaly worth investigating, not the norm.
   carries the `errors` array the sidebar reads.
 - **hindsight graph maintenance: the stale-cooccurrence sweep can now finish on
   a large bank.** `graph_maintenance` Pass 3 was ONE bank-wide statement whose
-  cost grows with the bank, and it had never once completed on the fleet's two
-  largest banks: measured read-only on live data, the predicate alone takes
-  65.2 s on a 517,475-row bank against a 60 s asyncpg `command_timeout` —
-  before the sort, the row locks and the DELETE. #4604 removed the 9x retry
+  cost grows with the bank, so it worked until it did not: measured read-only
+  on live data, the predicate alone takes 65.2 s on a 517,475-row bank against
+  a 60 s asyncpg `command_timeout` — before the sort, the row locks and the
+  DELETE. The fleet's two largest banks completed 849 (overlord) and 779
+  (klanker) runs through July 2026 at a p50 of 15–33 s, then crossed the 60 s
+  wall in the week of 2026-08-03 and have **failed every run since** (overlord
+  17 of 22 that week and 2 of 3 the next, klanker 9 of 14), leaking stale
+  cooccurrence rows on every one. #4604 removed the 9x retry
   storm around it but deliberately left the statement unable to finish, so
   stale cooccurrence rows leaked for ever. Pass 3 now sweeps bounded,
   resumable keyset pages (at most `batch_size` predicate evaluations per
@@ -116,13 +120,21 @@ now an anomaly worth investigating, not the norm.
   (`submit_async_graph_maintenance` fires when work is enqueued and
   short-circuits on an empty queue; there is no timer), so a bank is visited as
   often as it is written to, and slice coverage is coupon-collector rather than
-  a cycle. Measured over the live `async_operations` log, mean days between
-  visits per bank runs from 0.8 (overlord) to 80.0 (lawgpt) — under a fixed 24
-  the quiet banks would have waited an expected 30–300 days for full coverage,
-  to fix a timeout they never had (their whole-bank sweep finishes in 2.7–4.3
-  s). Size-derived, every bank at or below 25,000 rows keeps `slice_count = 1`
-  and is still swept WHOLE on every run, and expected full-coverage latency
-  across the fleet lands between 0.6 and 3.3 days.
+  a cycle. A "draw" in that model is a distinct `_SWEEP_SLICE_SECONDS` window,
+  not a run — runs sharing a window compute the same slice index, so the later
+  ones re-sweep what the first just swept. That window is **120 s**, derived
+  from the measured median inter-arrival gap between runs (197 s on overlord,
+  250 s on klanker); the 1800 s it replaces was the last surviving piece of the
+  "a run arrives every 30 minutes" model this change otherwise abandons, and
+  held 3.95 / 3.60 runs per window — about 75% of the busiest banks' sweeps
+  were duplicate work. Measured over the live `async_operations` log, distinct
+  120 s windows per bank per day run from 21.8 (overlord) to 0.30 (lawgpt) —
+  under a fixed 24 the quiet banks would have waited an expected 12–303 days
+  for full coverage, to fix a timeout they never had (their whole-bank sweep
+  finishes in 2.7–4.3 s). Size-derived, every bank at or below 25,000 rows
+  keeps `slice_count = 1` and is still swept WHOLE on every run, and expected
+  full-coverage latency across the fleet lands between 0.5 and 3.5 days
+  (0.5–3.3 measured by replaying the real arrival log).
 
   The full sweep is kept (rotated, not replaced by a watermark) because nothing
   durable records the entities of a deleted unit, so a watermark would silently

@@ -1973,8 +1973,11 @@ describe("Dockerfile.hindsight shape", () => {
     // #4604 (above) stopped Pass 3 WASTING time on a statement that could not
     // finish; it did not make it finish. Measured read-only on the live fleet:
     // the predicate alone takes 65.2s on a 517k-row bank against a 60s asyncpg
-    // command_timeout, before the sort, the locks and the DELETE — so the pass
-    // has never once completed on the two largest banks. This block bounds it.
+    // command_timeout, before the sort, the locks and the DELETE. That cost
+    // grows with the bank, so the pass worked until it did not: overlord and
+    // klanker completed 849/779 runs through July 2026, then crossed the wall
+    // in the week of 2026-08-03 and have failed every run since. This block
+    // bounds it.
     //
     // Behaviour (RED against unpatched upstream / GREEN patched) is proven in
     // tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts. This pins
@@ -1998,7 +2001,26 @@ describe("Dockerfile.hindsight shape", () => {
     // while making the adaptive shrink below impossible.
     expect(dockerfile).toContain('"                LIMIT $6::int\\n"');
     expect(dockerfile).toContain('"            WITH page AS MATERIALIZED (\\n"');
-    expect(dockerfile).toMatch(/the page CTE lost its LIMIT/);
+    // …and the LIMIT is only a correct page because of the ORDER BY directly
+    // above it. An unordered LIMIT returns an ARBITRARY batch_size rows, and
+    // the caller then advances its cursor to the MAX key of that arbitrary set
+    // — so every qualifying row sorting below that max but absent from the page
+    // is skipped for the rest of the slice pass, with no short page, no error
+    // and a plausible `scanned` count. A small fixture hides it (the planner
+    // picks the PK index scan and the rows come out sorted by luck); a bitmap
+    // heap or parallel seq scan on a 500k-row bank does not. Pin the two lines
+    // as an ADJACENT PAIR: pinned separately, the ORDER BY could be moved out
+    // of the page CTE with this test still green.
+    expect(dockerfile).toContain(
+      '"                ORDER BY c.entity_id_1, c.entity_id_2\\n"\n' +
+        '    "                LIMIT $6::int\\n"',
+    );
+    expect(dockerfile).toMatch(
+      /the page CTE's `ORDER BY c\.entity_id_1, c\.entity_id_2` \+ `LIMIT \$6::int` /,
+    );
+    // Both ordered scans must survive — the page CTE's keyset order and the
+    // #2529 ordered lock's sort.
+    expect(dockerfile).toMatch(/the sweep no longer has BOTH ordered scans/);
     // The keyset cursor and the rotating hash slice.
     expect(dockerfile).toContain(
       "(c.entity_id_1, c.entity_id_2) > (\\n",
@@ -2030,7 +2052,13 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toContain('"_SWEEP_MIN_BATCH_SIZE = 50\\n"');
     expect(dockerfile).toContain('"_SWEEP_SLICE_TARGET_ROWS = 25000\\n"');
     expect(dockerfile).toContain('"_SWEEP_MAX_SLICE_COUNT = 24\\n"');
-    expect(dockerfile).toContain('"_SWEEP_SLICE_SECONDS = 1800\\n"');
+    // The decorrelation window. It is NOT a cadence: runs that land inside the
+    // same window compute the same slice index, so the later ones re-sweep what
+    // the first just swept. Measured over 30 days of async_operations, a 1800 s
+    // window held 3.95 (overlord) / 3.60 (klanker) runs — ~75% duplicate work —
+    // against a median inter-arrival gap of 197 s / 250 s, which is what 120 s
+    // is derived from.
+    expect(dockerfile).toContain('"_SWEEP_SLICE_SECONDS = 120\\n"');
     expect(dockerfile).toContain('"_SWEEP_MAX_PAGES = 2000\\n"');
     // How many slices is DERIVED FROM BANK SIZE, not fixed. `graph_maintenance`
     // is demand-driven (`submit_async_graph_maintenance` fires on retain /
