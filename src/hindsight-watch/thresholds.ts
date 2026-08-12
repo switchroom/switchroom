@@ -1133,9 +1133,8 @@ export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
  * Because completions are pruned at 30 days while failures are immortal, a
  * `lastCompletedAgeS` of `null` does not symmetrically mean "no completion in
  * the retention window" — it can mean the successes were swept while the
- * failures defining the streak were kept, and an unbounded
- * `coalesce(…, '-infinity')` then counted every historical failure, including
- * ones that predate a now-deleted success. The `newestFailureAgeS` guard on
+ * failures defining the streak were kept, and an unbounded scan then counted
+ * every historical failure, including ones that predate a now-deleted success. The `newestFailureAgeS` guard on
  * the null arm cannot catch that, because those retained failures are ancient
  * by construction. It is fixed where the issue said it belonged — in the
  * streak query, not here: the failure scan is now floored at the SAME horizon
@@ -1151,6 +1150,16 @@ export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
  * were swept while its failures are still INSIDE the window still breaches on
  * the null arm, and that breach now clears when those failures cross the
  * horizon instead of persisting for ever.
+ *
+ * It costs this constant some reach in one direction, stated here because it
+ * is the sparse arm's own coverage that shrinks: the streak arriving here is
+ * TRUNCATED at the horizon, so a pair failing slower than
+ * `CONSOLIDATION_FAILURE_STREAK_WARN` attempts per retention window can arrive
+ * below the warn line and read `ok` even with no completion on record. Five
+ * failures over 60 days, two inside 30, arrives as 2. Accepted deliberately —
+ * counting across the horizon would assert a consecutiveness the surviving
+ * rows cannot support, which is #4620 — and pinned against a real database in
+ * `streak-retention-floor.pg.test.ts`.
  *
  * That is a documented limitation, not a safety claim: the alternative is the
  * status quo, where a permanently-broken sparse type reads green for ever.

@@ -7,7 +7,7 @@
  * The defect lives in SQL and nowhere else. `docker/hindsight-maintenance.sh`
  * deletes `status='completed'` rows past the retention horizon and never
  * touches `failed` ones, so the two halves of a streak age differently. With
- * an unbounded `coalesce(…, '-infinity')` fallback the streak query then counts
+ * an unbounded failure scan the streak query then counts
  * failures that predate a completion which no longer exists: the pair reports a
  * large streak with no visible success, the evaluator's null arm cannot
  * discriminate it (those failures are ancient by construction — that is the
@@ -24,18 +24,20 @@
  *
  * The floored query (GREEN) and the pre-#4620 unbounded one (RED) run against
  * the SAME seeded rows. The RED arm is the mutation, built in: it is the exact
- * `-infinity` semantics this PR replaced, reproduced by handing the query
- * builder a floor so wide it cannot bind, and it must PAGE. Without it, a
- * fixture that stopped discriminating (say, seeded inside the window) would
- * leave the GREEN arm green for ever.
+ * pre-fix semantics this PR replaced, reproduced by handing the query builder
+ * a floor so wide it cannot bind, and it must PAGE. Without it, a fixture that
+ * stopped discriminating (say, seeded inside the window) would leave the GREEN
+ * arm green for ever.
  *
  * ### Skip discipline
  *
  * Same shape as the `tests/docker/` probes: no docker, or no cached
  * `postgres:16-alpine`, and this skips rather than pulling an image onto a dev
- * box. Set `SWITCHROOM_REQUIRE_PG_PROBE=1` to make that a hard failure instead
- * — that is the switch a CI job wires up. It is not wired into a workflow yet
- * (this PR is scoped to `src/hindsight-watch/`); tracked as follow-up.
+ * box. Set `SWITCHROOM_REQUIRE_PG_PROBE=1` to make that a hard failure instead.
+ * `.github/workflows/docker-e2e.yml`'s `hindsight-watch-pg-probe` job sets it,
+ * so on CI this file cannot silently skip: the outcome assertions here are the
+ * only ones in the repo that can fail on a semantics regression rather than on
+ * a changed string.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -67,6 +69,73 @@ if (REQUIRED && !available) {
  * with it could never fail for any value of it.
  */
 const RETENTION_DAYS = 30;
+
+/**
+ * The line the `postgres:*` entrypoint prints AFTER the temporary init server
+ * is gone and BEFORE the real one starts. See {@link waitForRealServer}.
+ */
+const INIT_COMPLETE = "PostgreSQL init process complete; ready for start up.";
+
+/** One quantum of waiting. No timers inside `beforeAll`, so this is a spawn. */
+function nap(): void {
+  spawnSync("sh", ["-c", "sleep 0.25"], { stdio: "ignore" });
+}
+
+function poll(what: string, ready: () => boolean, tries: number): void {
+  for (let i = 0; i < tries; i++) {
+    if (ready()) return;
+    nap();
+  }
+  throw new Error(`throwaway postgres: ${what} (gave up after ~${Math.round(tries / 4)}s)`);
+}
+
+/**
+ * Wait for the REAL server, not the init one — the reason this file used to be
+ * flaky.
+ *
+ * The `postgres:16-alpine` entrypoint runs a TEMPORARY server on the same unix
+ * socket while it runs `initdb` and the `/docker-entrypoint-initdb.d` hooks,
+ * then shuts it down and execs the real one. `pg_isready` returns 0 against
+ * that temporary server, and so does `psql`. A readiness loop that breaks on
+ * the FIRST success therefore returns while the socket is about to disappear,
+ * and the next `docker exec … psql` dies with
+ * `connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed:
+ * No such file or directory` — either in the seed (a broken run) or in
+ * `beforeAll` itself (four skipped tests). Measured at 3 failures in 8 runs on
+ * review; reproduced here with the old discipline at 1 seed failure in 10.
+ * Retrying the seed would paper over it; two consecutive readies would still
+ * be a race, just a narrower one.
+ *
+ * So the wait is deterministic instead. The entrypoint logs, in this order:
+ *
+ *     LOG:  database system is ready to accept connections   ← temp server
+ *     PostgreSQL init process complete; ready for start up.  ← init done
+ *     LOG:  database system is ready to accept connections   ← real server
+ *
+ * (verified on `postgres:16-alpine`.) The middle line is printed only once and
+ * only after the temporary server has exited, so blocking on it first removes
+ * the ambiguity entirely: any connection that succeeds after it is talking to
+ * the real server. `select 1` rather than `pg_isready` for the second phase,
+ * because a real query is the thing the seed is about to do.
+ */
+function waitForRealServer(): void {
+  poll(
+    "the entrypoint never finished initdb",
+    () => {
+      const r = spawnSync("docker", ["logs", CONTAINER], { encoding: "utf8" });
+      return `${r.stdout ?? ""}${r.stderr ?? ""}`.includes(INIT_COMPLETE);
+    },
+    240,
+  );
+  poll(
+    "the post-init server never accepted a query",
+    () =>
+      spawnSync("docker", ["exec", CONTAINER, "psql", "-U", "postgres", "-tAc", "select 1"], {
+        stdio: "ignore",
+      }).status === 0,
+    120,
+  );
+}
 
 function psql(sql: string): string {
   return execFileSync("docker", ["exec", CONTAINER, "psql", "-U", "postgres", "-tAc", sql], {
@@ -106,17 +175,7 @@ describe.skipIf(!available)("#4620 — the streak query cannot count across a pr
       encoding: "utf8",
       timeout: 120_000,
     });
-    let up = false;
-    for (let i = 0; i < 60; i++) {
-      if (spawnSync("docker", ["exec", CONTAINER, "pg_isready", "-q"], { stdio: "ignore" }).status === 0) {
-        up = true;
-        break;
-      }
-      // Deliberate busy-wait: no timers inside beforeAll, and 60 tries at
-      // ~150ms of spawn overhead each is ~10s of budget for a cold pg.
-      spawnSync("sh", ["-c", "sleep 0.25"], { stdio: "ignore" });
-    }
-    if (!up) throw new Error("throwaway postgres never became ready");
+    waitForRealServer();
 
     psql(`
       CREATE TABLE async_operations(bank_id text, operation_type text, status text, created_at timestamptz);
@@ -131,10 +190,12 @@ describe.skipIf(!available)("#4620 — the streak query cannot count across a pr
         SELECT 'overlord', 'consolidation', 'failed', now() - interval '40 days' + (g || ' minutes')::interval
           FROM generate_series(1, 112) g;
 
-      -- (2) THE PROPERTY '-infinity' EXISTS FOR. A genuinely new pair whose
-      -- very first ops failed, an hour ago, with no completion ever. It must
-      -- still register — a floor that swallowed this would trade one blind
-      -- spot for another.
+      -- (2) THE NEVER-COMPLETED CASE. A genuinely new pair whose very first
+      -- ops failed, an hour ago, with no completion ever. greatest() ignores
+      -- the NULL subselect, so the floor is the only bound and this must still
+      -- register — a floor that swallowed it would trade one blind spot for
+      -- another. (This pair clears the floor trivially; fixture 5 is the one
+      -- that STRADDLES it.)
       INSERT INTO async_operations
         SELECT 'newbank', 'graph_maintenance', 'failed', now() - interval '1 hour' FROM generate_series(1, 4);
 
@@ -146,6 +207,20 @@ describe.skipIf(!available)("#4620 — the streak query cannot count across a pr
       -- (4) A pair that completed AFTER its failures: no streak at all.
       INSERT INTO async_operations VALUES ('carrie', 'consolidation', 'failed', now() - interval '3 hours');
       INSERT INTO async_operations VALUES ('carrie', 'consolidation', 'completed', now() - interval '1 hour');
+
+      -- (5) THE COST OF THE FLOOR, pinned. A never-completed pair failing too
+      -- slowly to accumulate 3 attempts inside a 30-day horizon: 5 failures
+      -- over 60 days, THREE outside the horizon and TWO inside it. Unbounded
+      -- it is a streak of 5 and breaches; floored it is a streak of 2, below
+      -- CONSOLIDATION_FAILURE_STREAK_WARN, and reads ok. Day literals on both
+      -- sides of the edge, deliberately far from it, so the fixture does not
+      -- move with the knob.
+      INSERT INTO async_operations VALUES
+        ('sparsebank', 'graph_maintenance', 'failed', now() - interval '55 days'),
+        ('sparsebank', 'graph_maintenance', 'failed', now() - interval '50 days'),
+        ('sparsebank', 'graph_maintenance', 'failed', now() - interval '45 days'),
+        ('sparsebank', 'graph_maintenance', 'failed', now() - interval '20 days'),
+        ('sparsebank', 'graph_maintenance', 'failed', now() - interval '10 days');
 
       INSERT INTO memory_units VALUES ('overlord', NULL, 'experience');
     `);
@@ -204,6 +279,40 @@ describe.skipIf(!available)("#4620 — the streak query cannot count across a pr
     // the floor must not have made new pairs invisible.
     const v = evaluateConsolidationFailureStreak([sampleWith(floored())]);
     expect(v.state).toBe("breach");
+  });
+
+  /**
+   * The verdict for ONE pair. The evaluator reports the worst live streak in
+   * the fleet, so a pair-level claim has to be asked pair-by-pair or the loud
+   * fixtures (klanker, newbank) answer for it.
+   */
+  const verdictFor = (banks: ReturnType<typeof probeBankConsolidation>, bank: string) =>
+    evaluateConsolidationFailureStreak([
+      sampleWith(banks === null ? null : { ...banks, streaks: banks.streaks.filter((s) => s.bank === bank) }),
+    ]);
+
+  it("CAVEAT — truncation drops a straddling sparse pair BELOW the warn line", () => {
+    // This is a documented COST of the floor, not a bug, and it is pinned here
+    // so it cannot widen unnoticed: the count is truncated at the horizon, not
+    // just the window, so a pair failing slower than 3 attempts per retention
+    // window loses the sparse arm (`probe.ts`, "The floor also TRUNCATES a
+    // count"; `evaluate.ts`, the null-arm doc block). Restoring the old count
+    // would restore #4620 itself, so the narrowing is accepted — but silently
+    // reopening #4618's sparse blind spot further is not.
+    const before = unbounded()?.streaks.find((s) => s.bank === "sparsebank");
+    expect(before?.streak).toBe(5);
+    expect(before?.lastCompletedAgeS).toBeNull();
+    expect(verdictFor(unbounded(), "sparsebank").state).toBe("breach");
+
+    const after = floored()?.streaks.find((s) => s.bank === "sparsebank");
+    // Present — the pair is NOT the all-or-nothing case the docs used to
+    // describe as the only narrowing — but truncated to what survives.
+    expect(after?.streak).toBe(2);
+    expect(after?.lastCompletedAgeS).toBeNull();
+    expect(after?.newestFailureAgeS).toBeGreaterThan(9 * 86_400);
+    const v = verdictFor(floored(), "sparsebank");
+    expect(v.state).toBe("ok");
+    expect(v.severity).toBeUndefined();
   });
 
   it("GREEN — a live streak with a recent completion is counted exactly as before", () => {

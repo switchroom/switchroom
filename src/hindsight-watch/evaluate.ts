@@ -924,8 +924,8 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *    failed/pending/processing rows**. So the two halves of a streak age
  *    differently: successes are swept, the failures that define the streak are
  *    immortal. `null` can therefore mean "the successes were deleted while the
- *    failures were kept", and an unbounded `coalesce(…, '-infinity')` would
- *    then count failures that predate a completion which no longer exists.
+ *    failures were kept", and an unbounded scan would then count failures that
+ *    predate a completion which no longer exists.
  *
  *    The null arm carries the same age evidence the numeric arm does rather
  *    than firing on absence alone, which covers the honest cases — a new pair,
@@ -940,6 +940,21 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *    still page here, and that page clears when those failures cross the
  *    horizon. Distinguishing "swept success" from "never succeeded" inside the
  *    window is impossible once the row is gone.
+ *
+ *    **The floor also narrows THIS arm, and the narrowing is not all-or-
+ *    nothing.** `s.streak` arrives already truncated to the horizon, so a pair
+ *    with failures on both sides of it can arrive BELOW
+ *    `CONSOLIDATION_FAILURE_STREAK_WARN` and be rejected two lines down. Five
+ *    failures over 60 days with two inside 30 arrives as `streak = 2`, fails
+ *    `2 >= 3`, and reads `ok` where the unbounded count breached at 5. That is
+ *    a real reduction in this arm's reach for very sparse pairs — roughly,
+ *    ones failing slower than three attempts per retention window — and it is
+ *    accepted on soundness: a failure older than the horizon cannot be shown
+ *    to be consecutive with the ones after it, because the completion that
+ *    would have broken the streak is exactly what the prune deletes. Do NOT
+ *    "fix" it by widening the scan; that is #4620. `pending-consolidation-
+ *    depth` (R7) covers the same pair from the depth side. Pinned in
+ *    `streak-retention-floor.pg.test.ts` (fixture 5, `sparsebank`).
  */
 function lastSuccessPhrase(lastCompletedAgeS: number | null | undefined): string {
   if (lastCompletedAgeS === undefined) return "unknown (state predates the field)";

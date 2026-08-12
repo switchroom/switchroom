@@ -394,18 +394,35 @@ describe("the streak scan's retention floor", () => {
     expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "1" })).toBe("1");
   });
 
-  it("the shipped statement floors the fallback with the resolved horizon", () => {
-    // The unbounded `-infinity` fallback is what #4620 is about: it must not
-    // survive as the OUTER bound, and the floor must be the shell-resolved
-    // value rather than a literal baked in here.
+  it("clamps an absurdly large horizon — make_interval takes an int, not a bigint", () => {
+    // All-digits is not enough. `make_interval(days => 3000000000)` raises
+    // `function make_interval(days => bigint) does not exist` (verified on
+    // pg16), psql exits non-zero, and BOTH bank signals degrade to `no-data`
+    // off one knob typo.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "3000000000" })).toBe("30");
+    // A value too large for the shell to compare at all takes the same branch.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "9".repeat(40) })).toBe("30");
+    // The boundary itself: a century is allowed, a century and a day is not.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "36500" })).toBe("36500");
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "36501" })).toBe("30");
+  });
+
+  it("the shipped statement floors the failure scan with the resolved horizon", () => {
+    // The unbounded scan is what #4620 is about: it must not survive as the
+    // bound, and the floor must be the shell-resolved value rather than a
+    // literal baked in here.
     expect(BANK_CONSOLIDATION_SH).toContain("now() - make_interval(days => $RD)");
-    expect(BANK_CONSOLIDATION_SH).toMatch(/greatest\(coalesce\(/);
+    expect(BANK_CONSOLIDATION_SH).toMatch(/created_at > greatest\(\(SELECT max\(b\.created_at\)/);
     expect(BANK_CONSOLIDATION_SH).not.toMatch(/created_at > coalesce\(/);
-    // …and `-infinity` is still the INNER fallback, so a pair that has never
-    // completed is bounded by the floor and by nothing else. (The OUTCOME of
-    // all of this is asserted against a real PostgreSQL in
+    // No `-infinity` sentinel: `greatest` ignores NULLs, so one inside the
+    // `greatest` would be INERT while reading as though it widened the window
+    // for a never-completed pair. Verified on pg16 —
+    // `greatest(coalesce(NULL::timestamptz,'-infinity'), now()-interval '30 days')`
+    // is `IS NOT DISTINCT FROM` the same expression without the coalesce. This
+    // asserts it does not come back as documentation-by-dead-code. (The
+    // OUTCOME of all of this is asserted against a real PostgreSQL in
     // streak-retention-floor.pg.test.ts.)
-    expect(bankConsolidationQuery("$RD")).toContain("'-infinity'::timestamptz");
+    expect(bankConsolidationQuery("$RD")).not.toContain("-infinity");
   });
 });
 
