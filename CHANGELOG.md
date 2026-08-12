@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **hindsight-watch: measure the pool arm's threshold; make the latency retune executable**
+
 ### Features
 
 - **hindsight-watch: detect recall DEGRADATION, not just collapse** — three
