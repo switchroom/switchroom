@@ -88,13 +88,17 @@
  */
 
 import { describe, it, expect, afterAll } from "vitest";
-import { execFileSync, execSync } from "node:child_process";
-// #4628: every long docker leg is AWAITED, never `execFileSync`. A sync
-// exec blocks the vitest worker's event loop, and vitest's worker→main
-// birpc has a hard-coded 60 s timeout with no config knob — a file whose
-// legs exceed it dies with `Timeout calling "onTaskUpdate"` while every
-// test passes. This suite boots TWO containers plus a Postgres, so it is
-// squarely in that range.
+// `execSync` survives for the two module-scope PREFLIGHTS only (`docker
+// version`, `docker image inspect`): they run during collection, not the run
+// phase, and cost milliseconds.
+import { execSync } from "node:child_process";
+// #4628: every docker call in the RUN phase is AWAITED — legs and teardown
+// alike. A sync exec blocks the vitest worker's event loop, and vitest's
+// worker→main birpc has a hard-coded 60 s timeout with no config knob, so a
+// starved worker dies with `Timeout calling "onTaskUpdate"` while every test
+// PASSES. The timeout is not phase-scoped: `afterAll` starves the same loop.
+// This suite boots TWO containers plus a Postgres, so it is squarely in that
+// range.
 import { execFileAsync } from "./_exec-async.js";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
@@ -800,6 +804,39 @@ const pgOk = dockerOk && hasImage(PG_IMAGE);
 type ProbeResult = { status: number; stdout: string };
 
 /**
+ * Label-scoped teardown belt (never an unlabelled bulk removal).
+ *
+ * AWAITED, and bounded, for the same reason every probe leg is (#4628). The
+ * birpc 60 s timeout is not phase-scoped: a sync exec starves the worker's
+ * event loop in `afterAll` exactly as it would inside a test. The shipped
+ * sequence is fast — measured 144 ms for `docker ps -aq --filter label=…`
+ * plus `docker rm -f` against three real containers — so this is not a flake
+ * risk on time. It is a LEGIBILITY fix: neither `execSync` carried a
+ * `timeout`, so a wedged or saturated daemon blocks unboundedly and surfaces
+ * as `Timeout calling "onTaskUpdate"` with every test PASSING, which is the
+ * exact illegible mode #4628 exists to remove. Awaited and capped, the same
+ * daemon fails as a named, bounded teardown error.
+ */
+async function reapByRunLabel(label: string): Promise<void> {
+  try {
+    const { stdout } = await execFileAsync(
+      "docker",
+      ["ps", "-aq", "--filter", `label=switchroom.test.run=${label}`],
+      { timeoutMs: 60_000 },
+    );
+    const ids = stdout.split("\n").filter(Boolean);
+    if (ids.length) {
+      await execFileAsync("docker", ["rm", "-f", ...ids], {
+        timeoutMs: 120_000,
+      });
+    }
+  } catch {
+    /* nothing to clean, or the daemon is gone — the labels bound the blast
+       radius either way */
+  }
+}
+
+/**
  * Run a docker command, folding stderr into the returned text.
  *
  * Load-bearing: when a patch block stops applying, ALL the diagnosis is on
@@ -1106,21 +1143,8 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
 describe.skipIf(!dockerOk || !imageOk)(
   "Dockerfile.hindsight bounded-sweep patch changes real behaviour",
   () => {
-    afterAll(() => {
-      // Label-scoped teardown belt (never an unlabelled bulk removal).
-      try {
-        const ids = execSync(
-          `docker ps -aq --filter label=switchroom.test.run=${RUN_ID}`,
-          { encoding: "utf8" },
-        )
-          .split("\n")
-          .filter(Boolean);
-        if (ids.length) {
-          execFileSync("docker", ["rm", "-f", ...ids], { stdio: "ignore" });
-        }
-      } catch {
-        /* nothing to clean */
-      }
+    afterAll(async () => {
+      await reapByRunLabel(RUN_ID);
     });
 
     it("unpatched upstream is RED — one unbounded statement, no paging, no shrink", async () => {
@@ -1247,20 +1271,8 @@ describe.skipIf(!dockerOk || !imageOk)(
 describe.skipIf(!dockerOk || !imageOk || !pgOk)(
   "the slice filter really partitions the bank (executed SQL, real Postgres)",
   () => {
-    afterAll(() => {
-      try {
-        const ids = execSync(
-          `docker ps -aq --filter label=switchroom.test.run=${RUN_ID}-sql`,
-          { encoding: "utf8" },
-        )
-          .split("\n")
-          .filter(Boolean);
-        if (ids.length) {
-          execFileSync("docker", ["rm", "-f", ...ids], { stdio: "ignore" });
-        }
-      } catch {
-        /* nothing to clean */
-      }
+    afterAll(async () => {
+      await reapByRunLabel(`${RUN_ID}-sql`);
     });
 
     it("executes the shipping statement against real rows", async () => {
