@@ -953,7 +953,16 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *    to be consecutive with the ones after it, because the completion that
  *    would have broken the streak is exactly what the prune deletes. Do NOT
  *    "fix" it by widening the scan; that is #4620. `pending-consolidation-
- *    depth` (R7) covers the same pair from the depth side. Pinned in
+ *    depth` (R7) covers the same pair from the depth side ONLY when the pair
+ *    is `consolidation`: R7 counts `consolidated_at IS NULL` rows, and
+ *    `graph_maintenance` never writes that column. This arm is about TERMINAL
+ *    (`status = 'failed'`) attempts — fixture 5 and both real #4618 pairs are
+ *    that shape — and for a terminal `graph_maintenance` streak there is no
+ *    second signal. A `graph_maintenance` op wedged in the OTHER shape, stuck
+ *    `pending`/`processing`, still raises `consolidation-queue-age` (R5),
+ *    which filters on status alone and not on `operation_type`. See
+ *    `bankConsolidationQuery` and `CONSOLIDATION_QUEUE_SH` in `probe.ts` for
+ *    the evidence, and #4644 for the residual hole. Pinned in
  *    `streak-retention-floor.pg.test.ts` (fixture 5, `sparsebank`).
  */
 function lastSuccessPhrase(lastCompletedAgeS: number | null | undefined): string {
