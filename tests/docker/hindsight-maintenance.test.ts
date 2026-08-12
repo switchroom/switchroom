@@ -210,7 +210,10 @@ describe("hindsight-maintenance.sh", () => {
       expect(ue.autovacuum_analyze_scale_factor).toBeLessThanOrEqual(0.02);
 
       // entities is update-heavy (18,043 updates / 22h): the dead-tuple
-      // trigger governs. 500 + 0.005 * 239,939 ≈ 1.7k dead ≈ every ~8h.
+      // trigger governs. 500 + 0.005 * 239,939 ≈ 1.7k dead — a pass somewhere
+      // between ~3x/day (the 22.5h average) and roughly hourly (the 21-25
+      // dead-tuples/min rate sampled live); churn is bursty, so the low end
+      // is a floor. Derivation in docker/hindsight-maintenance.sh.
       const en = optsFor("entities");
       const enDeadTrigger =
         en.autovacuum_vacuum_threshold + en.autovacuum_vacuum_scale_factor * 239_939;
