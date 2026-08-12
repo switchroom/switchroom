@@ -22,6 +22,17 @@ export interface WorktreeRecord {
   heartbeatAt: string;
   /** Agent name that claimed this worktree (optional) */
   ownerAgent?: string;
+  /**
+   * How the checkout was provisioned.
+   *   - "clone"    — an independent `git clone` with its own object store,
+   *                  refs, stash, and HEAD (the default since the
+   *                  worktree-collision fix).
+   *   - "worktree" — a legacy `git worktree add` off the source repo
+   *                  (records written before the fix). Absent means legacy.
+   * Removal paths do NOT trust this field; they detect the checkout shape
+   * on disk (`.git` dir vs `.git` file) so legacy records stay removable.
+   */
+  kind?: "clone" | "worktree";
 }
 
 /** Input to claim_worktree */

@@ -34,8 +34,12 @@ describe("claim / release / list integration", () => {
   let checkoutsDir: string;
   const origReg = process.env.SWITCHROOM_WORKTREE_DIR;
   const origBase = process.env.SWITCHROOM_WORKTREE_BASE;
+  const origAllowTmp = process.env.SWITCHROOM_WORKTREE_ALLOW_TMP;
 
   beforeEach(() => {
+    // Test fixtures live under tmpdir; the production /tmp-noexec guard
+    // must not reject them.
+    process.env.SWITCHROOM_WORKTREE_ALLOW_TMP = "1";
     repoDir = initTempRepo();
     const base = mkdtempSync(join(tmpdir(), "sw-int-test-"));
     regDir = join(base, "registry");
@@ -58,6 +62,8 @@ describe("claim / release / list integration", () => {
     else process.env.SWITCHROOM_WORKTREE_DIR = origReg;
     if (origBase === undefined) delete process.env.SWITCHROOM_WORKTREE_BASE;
     else process.env.SWITCHROOM_WORKTREE_BASE = origBase;
+    if (origAllowTmp === undefined) delete process.env.SWITCHROOM_WORKTREE_ALLOW_TMP;
+    else process.env.SWITCHROOM_WORKTREE_ALLOW_TMP = origAllowTmp;
   });
 
   it("claim returns id, path, and branch", async () => {

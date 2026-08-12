@@ -40,6 +40,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { listRecords, deleteRecord } from "./registry.js";
+import { removeCheckout } from "./remove-checkout.js";
 import type { WorktreeRecord } from "./types.js";
 
 /** Heartbeat age threshold in ms. Claims older than this are stale. */
@@ -187,15 +188,16 @@ function hasUncommittedChanges(_repoPath: string, worktreePath: string): boolean
   }
 }
 
-/** Default force-remove: `git worktree remove --force <path>` from the repo. */
+/**
+ * Default force-remove — shape-aware (see remove-checkout.ts): independent
+ * clones are `rm -rf`d, legacy linked worktrees go through
+ * `git worktree remove --force`.
+ */
 function defaultRemoveWorktree(repoPath: string, worktreePath: string): void {
   try {
-    execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
-      cwd: repoPath,
-      stdio: "pipe",
-    });
+    removeCheckout(repoPath, worktreePath);
   } catch {
-    // If git remove fails, the caller still deletes the record. The path may
+    // If removal fails, the caller still deletes the record. The path may
     // have been manually deleted or the repo moved.
   }
 }

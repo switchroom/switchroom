@@ -184,14 +184,24 @@ switchroom web                                    # Web dashboard
 Migrating credentials from OpenClaw is covered in
 [vs-openclaw.md](vs-openclaw.md#migrating-credentials).
 
-## `switchroom worktree` — git worktree isolation for parallel agents
+## `switchroom worktree` — isolated checkouts for parallel agents
 
 Multiple agents (and sub-agents) can run concurrently on one host and
 touch the same repo. Working directly on a repo's primary checkout
 collides: mid-edit files, branch switches under another agent's feet,
 half-staged commits clobbered. `switchroom worktree` is the supported
-way to hand each task its own isolated git worktree on a fresh branch,
+way to hand each task its own isolated checkout on a fresh branch,
 with a registry so stale ones get reaped instead of accumulating.
+
+Each claim is an **independent clone** — not a linked `git worktree`
+off the source repo, which shares the stash ref, refs, and
+`.git/worktrees` admin metadata across concurrent tasks and lets them
+corrupt each other. The clone hardlinks the object store on the same
+filesystem, so it costs about what a worktree did, and its `origin` is
+rewired to the source repo's real remote so `git fetch` / `git push`
+work as usual. The checkout base must live under `$HOME` (default
+`~/.switchroom/worktree-checkouts`); a base under `/tmp` is rejected
+at claim time because agent containers mount tmp `noexec`.
 
 ```sh
 switchroom worktree claim <repo> [--task <name>] [--agent <name>] [--json]
@@ -200,18 +210,19 @@ switchroom worktree release <id> [--json]
 switchroom worktree reap [--dry-run] [--json]
 ```
 
-- **`claim <repo>`** claims a worktree for a repo (alias or absolute
-  path). Prints the worktree **id**, **branch**, and **path**. `--task`
-  becomes the branch suffix so the branch name says what it is for;
-  `--agent` associates the claim with an agent so the registry shows
-  who owns it.
+- **`claim <repo>`** claims an isolated checkout for a repo (alias or
+  absolute path). Prints the claim **id**, **branch**, and **path**.
+  `--task` becomes the branch suffix so the branch name says what it is
+  for; `--agent` associates the claim with an agent so the registry
+  shows who owns it.
 - **`list`** shows every active claim, with repo, branch, path, owning
   agent, and heartbeat age. `fresh` means the heartbeat is under 120s
   old.
-- **`release <id>`** releases a claim by id. If the underlying `git
-  worktree remove` fails (e.g. dirty tree) the registry entry is still
-  cleaned up and the result is reported as *partial* so it does not
-  leak.
+- **`release <id>`** releases a claim by id. Removal is shape-aware:
+  clone checkouts are deleted outright; legacy linked worktrees go
+  through `git worktree remove --force`. If removal fails the registry
+  entry is still cleaned up and the result is reported as *partial* so
+  it does not leak.
 - **`reap`** removes stale / orphaned worktrees (no heartbeat for
   >10 min). `--dry-run` prints what *would* be reaped without acting.
   Always sanity-check with `--dry-run` first on a shared host.
