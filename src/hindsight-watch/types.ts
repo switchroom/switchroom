@@ -269,6 +269,23 @@ export interface BankFailureStreak {
   streak: number;
   /** seconds since the NEWEST failure in the streak — the staleness guard */
   newestFailureAgeS: number;
+  /**
+   * Seconds since this pair's most recent `completed` op; `null` when the
+   * pair has NEVER completed one.
+   *
+   * The liveness evidence for a SPARSE operation type. `newestFailureAgeS`
+   * asks "is the newest failure recent?" as a proxy for "is this still
+   * broken?", which only holds for a job on a tight cadence. `graph_maintenance`
+   * is demand-driven — it runs only when work is enqueued — so its failures
+   * are routinely hours or days old while it is 100 % broken. "Has anything
+   * SUCCEEDED lately?" is the question that survives the sparse case, and it
+   * resolves the moment a completion lands.
+   *
+   * `undefined` — distinct from `null` — on a row persisted by a build older
+   * than this field. Unknown is not "never completed": the evaluator's sparse
+   * arm abstains on `undefined` rather than reading it as either state.
+   */
+  lastCompletedAgeS?: number | null;
 }
 
 /** One bank's unconsolidated-memory depth. */

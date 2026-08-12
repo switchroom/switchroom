@@ -1029,6 +1029,128 @@ export const CONSOLIDATION_FAILURE_STREAK_PAGE = 10;
 export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
 
 /**
+ * How long a pair may go with NO successful op before its already-breaching
+ * streak counts as live regardless of how old its newest failure is.
+ *
+ * `CONSOLIDATION_STREAK_RECENCY_S` above asks "is the newest FAILURE recent?"
+ * as a proxy for "is this still broken?". That proxy holds only for a job on a
+ * tight cadence — it was tuned against `consolidation`, whose incident rate
+ * was one failure every 87 s. It structurally CANNOT hold a sparse,
+ * demand-driven operation type: `graph_maintenance` runs only when work is
+ * enqueued, so it produces no new failures while it is broken and every
+ * failure it has ages out of a 2 h window within one afternoon. Measured live
+ * 2026-08-12, both banks 100 % broken and both reading `ok`:
+ *
+ *   overlord | graph_maintenance | streak 19 | newest failure 37.3 h ago
+ *   klanker  | graph_maintenance | streak  9 | newest failure 91.4 h ago
+ *
+ * …with the pair's last SUCCESS 220 h ago in both cases. The consequence is
+ * general: any permanently-broken sparse operation type reads green forever.
+ *
+ * ### The measurement window is 30 days, and that is a hard ceiling
+ *
+ * Every rate below is taken from `async_operations` on the production bank on
+ * 2026-08-12, and that table holds **30 days**, not more: `min(created_at)` for
+ * `completed` rows is 2026-07-13 — measured at 30.008 days and advancing in
+ * real time — while `memory_units` in the same database goes back to
+ * 2026-04-15. A longer baseline is not available to measure and cannot be
+ * claimed.
+ *
+ * The sweep is OURS, not the Hindsight API's:
+ * `docker/hindsight-maintenance.sh:136` runs
+ *
+ *   DELETE FROM async_operations
+ *    WHERE status='completed' AND created_at < now() - make_interval(days => N)
+ *
+ * on every maintenance tick, with `N = SWITCHROOM_HINDSIGHT_RETENTION_DAYS`
+ * defaulting to 30 (line 63) and unset in the fleet. Confirmed live in
+ * `docker logs switchroom-hindsight`: `pruned 40 completed async_operations
+ * older than 30d`. The API's own `operation_retention_days` sweep is a
+ * different mechanism and is NOT what bounds this window — it is disabled
+ * (`HINDSIGHT_API_OPERATION_RETENTION_DAYS` unset, code default 0).
+ *
+ * **The sweep is asymmetric, and that asymmetry matters below.** Only
+ * `status='completed'` is deleted; the script's own header (line 23) states
+ * that failed/pending/processing rows are NEVER touched, and the table bears
+ * it out — oldest `completed` row 30.008 days, oldest `failed` row 25.110
+ * days and ageing without bound.
+ *
+ * ### 48 h, and the honest limits of the derivation
+ *
+ *  - **Ceiling — the incidents this must catch.** Both live
+ *    `graph_maintenance` episodes are 220 h since their last success: 4.6× this
+ *    line. They are the only ≥3 streaks in the window that never recovered.
+ *
+ *  - **Floor — how long a self-healing fault legitimately takes.** Measured
+ *    over ALL 58 failure episodes in the window (56 of which recovered), each
+ *    scored success-to-success, which is exactly the span this constant
+ *    thresholds: p50 0.88 h, p95 16.16 h, **max 27.67 h** (`retain` /
+ *    `batch_retain`). 48 h clears the longest observed self-heal by 73 %.
+ *
+ *    The narrower population is reported too, because it is the one that looks
+ *    most relevant and is the most misleading: conditioning on ≥3 consecutive
+ *    failures leaves 6 recovered episodes (spans 2.01 / 4.82 / 5.99 / 8.70 /
+ *    9.75 / 17.64 h; median 7.35 h) and a max of 17.64 h. Deriving the line
+ *    from those six would put it under the 27.67 h self-heal that exists in
+ *    the same window — a margin that is an artefact of the conditioning, not a
+ *    property of the system. The wider population is the defensible one.
+ *
+ *  - **What is NOT measured, and cannot be.** Of the 8 ≥3 episodes in the
+ *    window, 5 are `refresh_mental_model`, 1 is `consolidation`, and the only
+ *    2 `graph_maintenance` ones are the unresolved live incidents. **There is
+ *    no recovered SPARSE ≥3 episode on record**, so the floor above is
+ *    measured on dense types (inter-completion p99 9.52–15.69 h) and applied
+ *    to a type whose own healthy inter-completion p99 is 28.47 h and whose max
+ *    healthy gap is 145.17 h. 48 h clears that p99 by 69 %, which is why it is
+ *    the line rather than 24 h; it does not clear the max, and nothing
+ *    sensible would.
+ *
+ * ### The residual exposure, stated rather than argued away
+ *
+ * A pair that has ALREADY breached (≥`CONSOLIDATION_FAILURE_STREAK_WARN`
+ * consecutive failures) and then goes idle IS exposed: three transient
+ * `graph_maintenance` failures followed by 48 h with no delete to enqueue work
+ * raises a warn on a pair that is not broken. For a demand-driven type the
+ * recovery clock is bounded below by DEMAND ARRIVAL, not by fault duration, so
+ * no threshold under 145.17 h removes this, and a threshold that high would
+ * not be a monitor. The exposure is bounded instead of eliminated:
+ *
+ *  - it needs a real streak first — a healthy pair that merely goes idle has
+ *    streak 0 and is never a candidate;
+ *  - it enters at `warn` (3), not `page` (10), so the noisy end is the quiet
+ *    end;
+ *  - it clears the instant one op completes, which is the property the
+ *    recency guard existed to protect.
+ *
+ * **What doubling 24 h → 48 h costs.** Worst-case detection latency for a
+ * broken sparse job doubles with it: a job that breaks the moment after its
+ * last success is now invisible for up to 48 h rather than 24 h. That is the
+ * price of the margin argued for above, and it is paid deliberately — against
+ * the status quo of *never*, and against a 24 h line that a measured 27.67 h
+ * self-heal would have false-paged.
+ *
+ * **The retention asymmetry leaves a second, LATENT residual.** Because
+ * completions are pruned at 30 days while failures are immortal, a
+ * `lastCompletedAgeS` of `null` does not symmetrically mean "no completion in
+ * the retention window" — it can mean the successes were swept while the
+ * failures defining the streak were kept, and the streak query's
+ * `coalesce(…, '-infinity')` then counts every historical failure, including
+ * ones that predate a now-deleted success. The `newestFailureAgeS` guard on
+ * the null arm cannot catch that, because those retained failures are ancient
+ * by construction. The exposure is a bank that still EXISTS but has been idle
+ * on one op type for longer than the retention window; a deleted bank takes
+ * its rows with it via the cascade-delete migration. Latent, not live:
+ * simulating the prune at 5- and 12-day horizons surfaces no pair other than
+ * the two live `graph_maintenance` ones. Closing it properly belongs in the
+ * streak query — bounding the failure scan to the retention horizon — not in
+ * the evaluator, and is tracked separately rather than widened into this fix.
+ *
+ * That is a documented limitation, not a safety claim: the alternative is the
+ * status quo, where a permanently-broken sparse type reads green for ever.
+ */
+export const CONSOLIDATION_STREAK_NO_SUCCESS_S = 48 * 60 * 60;
+
+/**
  * Per-bank unconsolidated depth: the floor below which GROWTH is not worth
  * scoring, and the growth thresholds themselves.
  *

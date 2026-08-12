@@ -686,8 +686,8 @@ describe("formatFiring — severity in the notification shade", () => {
  * the shell text so it cannot silently answer the wrong probe.
  */
 function dockerIncident(opts: {
-  /** `(bank, op_type, streak, newest_failure_age_s)` rows */
-  streaks?: Array<[string, string, number, number]>;
+  /** `(bank, op_type, streak, newest_failure_age_s, last_completed_age_s)` rows */
+  streaks?: Array<[string, string, number, number, number | null]>;
   /** `(bank, pending_consolidation)` rows */
   pending?: Array<[string, number]>;
   /** async_operations rows in `pending`/`processing` — the OLD signal's input */
@@ -708,7 +708,9 @@ function dockerIncident(opts: {
     }
     if (sh.includes("'S|'||")) {
       const lines = [
-        ...(opts.streaks ?? []).map(([b, t, n, age]) => `S|${b}|${t}|${n}|${age}`),
+        ...(opts.streaks ?? []).map(
+          ([b, t, n, age, ok]) => `S|${b}|${t}|${n}|${age}|${ok ?? ""}`,
+        ),
         ...(opts.pending ?? [["overlord", 0]] as Array<[string, number]>).map(
           ([b, n]) => `P|${b}|${n}`,
         ),
@@ -730,7 +732,7 @@ describe("tick — the 2026-07-29 silent consolidation outage", () => {
     const run = dockerIncident({
       // The live shape, read off the production database during the incident:
       // `overlord | consolidation | 103 | 668`. Nothing else in the fleet.
-      streaks: [["overlord", "consolidation", 103, 668]],
+      streaks: [["overlord", "consolidation", 103, 668, 9412]],
       pending: [["overlord", 38130], ["carrie", 45]],
       // …and the pending/processing queue is EMPTY at the same instant. This
       // is the whole bug: the old signal's input says the fleet is healthy.
@@ -765,6 +767,41 @@ describe("tick — the 2026-07-29 silent consolidation outage", () => {
     expect(dm).toBeDefined();
     expect(dm).toContain("overlord");
     expect(dm).toContain("103 consecutive FAILED consolidation");
+  });
+
+  it("DMs on the SPARSE 2026-08-12 shape, whose failures are 37h old", async () => {
+    // End-to-end proof of the blind spot: `graph_maintenance` is
+    // demand-driven, so a totally broken job emits no recent failure and the
+    // whole tick — probe, parse, evaluate, notify — used to come back green.
+    const sent: Sent = { texts: [] };
+    spool(0);
+    const t0 = Date.parse("2026-08-12T07:00:00Z");
+    const run = dockerIncident({
+      streaks: [
+        ["overlord", "graph_maintenance", 19, 133_977, 791_908],
+        ["klanker", "graph_maintenance", 9, 328_555, 791_676],
+      ],
+      pending: [["overlord", 0], ["klanker", 0]],
+      queueDepth: 0,
+    });
+    const r = await tick({
+      statePath,
+      agentsDir,
+      notify: makeNotify(sent),
+      run,
+      fetchImpl: fakeFetch(metricsBody(1000, 10)),
+      nowFn: () => t0,
+    });
+
+    const streak = r.outcomes.find((o) => o.verdict.signal === "consolidation-failure-streak")!;
+    expect(streak.verdict.state).toBe("breach");
+    expect(streak.verdict.severity).toBe("page");
+    expect(r.exitCode).toBe(10);
+
+    const dm = sent.texts.find((t) => t.includes("consolidation-failure-streak"));
+    expect(dm).toBeDefined();
+    expect(dm).toContain("19 consecutive FAILED graph_maintenance");
+    expect(dm).toContain("last SUCCESS 220.0h ago");
   });
 
   it("stays silent on a fleet with no failure streak at all — the live healthy shape", async () => {

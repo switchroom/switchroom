@@ -13,6 +13,7 @@ import {
   CONSOLIDATION_AGE_WARN_S,
   CONSOLIDATION_FAILURE_STREAK_PAGE,
   CONSOLIDATION_FAILURE_STREAK_WARN,
+  CONSOLIDATION_STREAK_NO_SUCCESS_S,
   CONSOLIDATION_STREAK_RECENCY_S,
   LLM_FAILURE_RATE_PAGE,
   LLM_FAILURE_RATE_WARN,
@@ -875,6 +876,91 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
 }
 
 /**
+ * Is this streak evidence of an ONGOING fault, or a historical one?
+ *
+ * A streak is defined relative to the pair's last COMPLETED op, so without
+ * some liveness test a bank that was fixed but has had no demand since keeps
+ * its historical streak — and alerts on it — for ever. Two arms, because one
+ * question does not cover both cadences:
+ *
+ *  - **Recent failure** (the original arm, unchanged). A DENSE operation type
+ *    that is still broken keeps producing failures: `consolidation` failed
+ *    every 87 s through the 2026-07-29 incident, so "newest failure inside
+ *    `CONSOLIDATION_STREAK_RECENCY_S`" tracks it exactly.
+ *
+ *  - **No success in a long time** (the arm added in #4618). A SPARSE,
+ *    demand-driven type produces no new failures while it is broken, because
+ *    it only runs when work is enqueued — so arm one structurally cannot hold
+ *    its streak. Measured live 2026-08-12: `overlord/graph_maintenance` held a
+ *    streak of 19 whose newest failure was 37 h old and `klanker/graph_maintenance`
+ *    a streak of 9 at 91 h; both failed the 2 h window, the candidate list
+ *    emptied, and the signal reported `{"status":"ok","breaches":0}` while the
+ *    job was 100 % broken. Both pairs had gone 220 h with no successful op.
+ *
+ * The second arm asks the honest question — "has anything SUCCEEDED lately?"
+ * — instead of the proxy, and is conjoined with
+ * `CONSOLIDATION_FAILURE_STREAK_WARN` so it is only ever asked about a pair
+ * that has already failed ≥3 times in a row. It resolves the moment a
+ * completion lands, which is the property the recency guard existed to
+ * protect.
+ *
+ * **The second arm is NOT scoped to sparse types** — nothing here can tell
+ * them apart, and inventing a classifier would be a second thing to get
+ * wrong. A `consolidation` pair with ≥3 failures and no completion for
+ * `CONSOLIDATION_STREAK_NO_SUCCESS_S` therefore breaches where it previously
+ * read `ok`. That is intended: it is the same fault shape, just slower.
+ *
+ * Two non-obvious readings of the field, both load-bearing:
+ *
+ *  - `undefined` means the row predates the field (an old persisted state
+ *    file), NOT that the pair never completed. The sparse arm abstains rather
+ *    than guess, leaving the row on the pre-existing behaviour until the next
+ *    probe fills the field in.
+ *  - `null` means "no `completed` row for this pair IS VISIBLE", which is NOT
+ *    the same as "never completed". `docker/hindsight-maintenance.sh:136`
+ *    deletes `status='completed'` rows older than
+ *    `SWITCHROOM_HINDSIGHT_RETENTION_DAYS` (default 30, unset in the fleet) —
+ *    and, per that script's own header at line 23, **never touches
+ *    failed/pending/processing rows**. So the two halves of a streak age
+ *    differently: successes are swept, the failures that define the streak are
+ *    immortal. `null` can therefore mean "the successes were deleted while the
+ *    failures were kept", and the streak query's `coalesce(…, '-infinity')`
+ *    then counts failures that predate a completion which no longer exists.
+ *
+ *    The null arm carries the same age evidence the numeric arm does rather
+ *    than firing on absence alone, which covers the honest cases — a new pair,
+ *    or a pair still actively retrying. It does NOT cover the asymmetry: those
+ *    retained failures are ancient by construction, so an age guard cannot
+ *    discriminate them. The residual is a bank that still exists and has been
+ *    idle on one op type past the retention window; a deleted bank takes its
+ *    rows with it via the cascade-delete migration. It is latent — no such pair
+ *    exists on the production bank — and closing it belongs in the streak
+ *    query, by bounding the failure scan to the retention horizon, not here.
+ */
+function lastSuccessPhrase(lastCompletedAgeS: number | null | undefined): string {
+  if (lastCompletedAgeS === undefined) return "unknown (state predates the field)";
+  if (lastCompletedAgeS === null) return "NEVER";
+  return `${(lastCompletedAgeS / 3600).toFixed(1)}h ago`;
+}
+
+function isLiveStreak(s: BankFailureStreak): boolean {
+  if (s.newestFailureAgeS <= CONSOLIDATION_STREAK_RECENCY_S) return true;
+  if (s.streak < CONSOLIDATION_FAILURE_STREAK_WARN) return false;
+  // `undefined` (a row persisted before the field existed) satisfies NEITHER
+  // disjunct and so abstains — which is only true while the null check stays
+  // STRICT. Loosening it to `== null`, or restructuring this as a negated
+  // "recent enough" test, silently promotes unknown to "never completed" and
+  // pages on hydration alone.
+  const last = s.lastCompletedAgeS;
+  // No visible completion: fall back to the only clock left, the streak's own
+  // age. Firing on absence alone would page a pair whose successes were swept
+  // by the 30-day retention delete, or one still actively retrying, rather
+  // than on evidence. (See the doc block for the case this does NOT cover.)
+  if (last === null) return s.newestFailureAgeS > CONSOLIDATION_STREAK_NO_SUCCESS_S;
+  return typeof last === "number" && last > CONSOLIDATION_STREAK_NO_SUCCESS_S;
+}
+
+/**
  * R6 — CONSECUTIVE terminal consolidation failures for one bank.
  *
  * The signal above, `consolidation-queue-age`, structurally cannot raise on
@@ -894,6 +980,9 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *
  * `no-data` when the block is missing, never a pass — the same rule the recall
  * signals live by.
+ *
+ * Liveness is decided by `isLiveStreak` below, on TWO arms — one for dense
+ * operation types and one for sparse ones. See its doc block.
  */
 export function evaluateConsolidationFailureStreak(ring: Sample[]): Verdict {
   const signal = "consolidation-failure-streak" as const;
@@ -908,11 +997,7 @@ export function evaluateConsolidationFailureStreak(ring: Sample[]): Verdict {
         "or the container is down) — the `container` signal covers the last of those",
     };
   }
-  // A streak whose newest failure is old is not evidence of an ONGOING fault:
-  // a streak is defined relative to the last COMPLETED op, so a fixed-but-idle
-  // bank would otherwise hold its historical streak — and alert on it — for
-  // ever.
-  const live = banks.streaks.filter((s) => s.newestFailureAgeS <= CONSOLIDATION_STREAK_RECENCY_S);
+  const live = banks.streaks.filter(isLiveStreak);
   let worst: BankFailureStreak | null = null;
   for (const s of live) if (worst === null || s.streak > worst.streak) worst = s;
   if (worst === null || worst.streak < CONSOLIDATION_FAILURE_STREAK_WARN) {
@@ -943,7 +1028,8 @@ export function evaluateConsolidationFailureStreak(ring: Sample[]): Verdict {
     detail:
       `bank "${worst.bank}": ${worst.streak} consecutive FAILED ${worst.operationType} ` +
       `operation(s) with no completion in between, newest ` +
-      `${Math.round(worst.newestFailureAgeS / 60)}m ago — ` +
+      `${Math.round(worst.newestFailureAgeS / 60)}m ago, last SUCCESS ` +
+      `${lastSuccessPhrase(worst.lastCompletedAgeS)} — ` +
       `warn ≥${CONSOLIDATION_FAILURE_STREAK_WARN}, page ≥${CONSOLIDATION_FAILURE_STREAK_PAGE}. ` +
       "The pending/processing queue reads EMPTY while this holds, so " +
       "`consolidation-queue-age` cannot see it." +
@@ -953,6 +1039,12 @@ export function evaluateConsolidationFailureStreak(ring: Sample[]): Verdict {
       bank: worst.bank,
       operationType: worst.operationType,
       newestFailureAgeS: worst.newestFailureAgeS,
+      // `"never"` = the pair has never completed an op; the key is absent
+      // altogether when the row predates the field, so a reader can tell
+      // "no success ever" from "we did not read it".
+      ...(worst.lastCompletedAgeS !== undefined
+        ? { lastCompletedAgeS: worst.lastCompletedAgeS ?? "never" }
+        : {}),
       breachingPairs: breaching.length,
     },
   };

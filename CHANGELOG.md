@@ -78,6 +78,33 @@ now an anomaly worth investigating, not the norm.
   `{session_id, title, started_at, source}` — falling back to the bare
   `{session_id: null}` when there is no eligible session — rather than
   `{session}`, the key no caller was ever finding.
+- **hindsight-watch: a permanently-broken SPARSE operation type no longer
+  reads green for ever.** `consolidation-failure-streak` admitted a streak
+  only when its newest FAILURE was under 2 h old
+  (`CONSOLIDATION_STREAK_RECENCY_S`) — a proxy for "still broken" tuned
+  against `consolidation`, which failed every 87 s during the 2026-07-29
+  incident. A demand-driven job produces no new failures while it is broken,
+  so the proxy structurally cannot hold its streak: live on 2026-08-12,
+  `overlord/graph_maintenance` held a streak of 19 (page line is 10) whose
+  newest failure was 37 h old and `klanker/graph_maintenance` a streak of 9 at
+  91 h, both banks 220 h since their last successful op — and the signal
+  reported `{"status":"ok","breaches":0}`. The per-pair psql pass now also
+  reads the age of the pair's most recent `completed` op, and a streak counts
+  as live when EITHER the failure is recent (the old condition, unchanged) OR
+  the streak has reached the warn line and nothing has succeeded for
+  `CONSOLIDATION_STREAK_NO_SUCCESS_S` (48 h). The second arm is **not** scoped
+  to sparse types — nothing in the data distinguishes them — so a DENSE pair
+  that is genuinely broken past 48 h now breaches where it previously read
+  `ok`; that is intended, but it is a behaviour change, not a no-op. 48 h is
+  derived against every self-resolving failure episode visible in the
+  `async_operations` window (58 episodes, 56 recovered: p50 0.88 h, p95
+  16.16 h, max 27.67 h) and against the p99 gap between successive
+  `graph_maintenance` completions (28.47 h). That window is 30 days — all the
+  table retains — and it contains **no** recovered sparse ≥3-failure episode,
+  so the constant's doc block states that limit rather than implying a safety
+  margin the data cannot support. Asking "has anything SUCCEEDED lately?"
+  instead of "is the failure recent?" still clears the instant a completion
+  lands, which is what the recency guard existed to protect. (#4618)
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
