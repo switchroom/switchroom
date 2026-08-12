@@ -2021,6 +2021,18 @@ describe("Dockerfile.hindsight shape", () => {
     // Both ordered scans must survive — the page CTE's keyset order and the
     // #2529 ordered lock's sort.
     expect(dockerfile).toMatch(/the sweep no longer has BOTH ordered scans/);
+    // …and symmetrically for the victims CTE: its ORDER BY is only the #2529
+    // ordered lock because it sits directly above `FOR UPDATE OF c`. A count of
+    // two ordered scans cannot see the two-edit defeat — delete the victims
+    // ORDER BY, re-add an identical line elsewhere in the statement, and the
+    // count still reads 2 while the lock is taken in scan order (i.e. in no
+    // order at all), which is exactly the deadlock #2529 fixed. Pin the pair,
+    // not the population.
+    expect(dockerfile).toContain(
+      '"                ORDER BY c.entity_id_1, c.entity_id_2\\n"\n' +
+        '    "                FOR UPDATE OF c\\n"',
+    );
+    expect(dockerfile).toMatch(/ADJACENT to its `FOR UPDATE OF c`/);
     // The keyset cursor and the rotating hash slice.
     expect(dockerfile).toContain(
       "(c.entity_id_1, c.entity_id_2) > (\\n",

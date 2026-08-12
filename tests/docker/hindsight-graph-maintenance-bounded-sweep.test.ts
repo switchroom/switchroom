@@ -89,6 +89,13 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+// #4628: every long docker leg is AWAITED, never `execFileSync`. A sync
+// exec blocks the vitest worker's event loop, and vitest's worker→main
+// birpc has a hard-coded 60 s timeout with no config knob — a file whose
+// legs exceed it dies with `Timeout calling "onTaskUpdate"` while every
+// test passes. This suite boots TWO containers plus a Postgres, so it is
+// squarely in that range.
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -799,12 +806,9 @@ type ProbeResult = { status: number; stdout: string };
  * stderr (the block's own assertion message names the drifted anchor). Dropping
  * it turns that into `expected '' to contain 'PROBE_EXECUTED'` with no cause.
  */
-function dockerText(args: string[], input?: string): string {
-  return execFileSync("docker", args, {
-    input,
-    stdio: ["pipe", "pipe", "pipe"],
-    encoding: "utf8",
-  });
+async function dockerText(args: string[], input?: string): Promise<string> {
+  const res = await execFileAsync("docker", args, { input });
+  return res.stdout;
 }
 
 function errText(e: unknown): string {
@@ -822,22 +826,20 @@ function errText(e: unknown): string {
  * the patch must be re-authored — and the message is on the stderr `dockerText`
  * preserves.
  */
-function applyPatches(container: string): void {
+async function applyPatches(container: string): Promise<void> {
   for (const block of patchBlocks()) {
-    dockerText(["exec", "-i", container, "python3", "-"], block);
+    await dockerText(["exec", "-i", container, "python3", "-"], block);
   }
 }
 
 /** Run the probe in a throwaway container, optionally patching first. */
-function runProbe(patched: boolean): ProbeResult {
+async function runProbe(patched: boolean): Promise<ProbeResult> {
   const name = `sr-hs-gmsweep-${patched ? "patched" : "upstream"}-${RUN_ID.slice(
     0,
     8,
   )}`;
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -853,13 +855,11 @@ function runProbe(patched: boolean): ProbeResult {
         UPSTREAM_IMAGE,
         "sleep",
         "300",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+    ]);
 
-    if (patched) applyPatches(name);
+    if (patched) await applyPatches(name);
 
-    const res = dockerText(
+    const res = await dockerText(
       ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
       PROBE,
     );
@@ -869,7 +869,7 @@ function runProbe(patched: boolean): ProbeResult {
     return { status: err.status ?? -1, stdout: errText(e) };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -881,7 +881,7 @@ function runProbe(patched: boolean): ProbeResult {
  * joined to its network namespace so the statement runs against a real server
  * over loopback. Both containers are labelled and force-removed in `finally`.
  */
-function runSqlProbe(): ProbeResult {
+async function runSqlProbe(): Promise<ProbeResult> {
   const tag = RUN_ID.slice(0, 8);
   const pg = `sr-hs-gmsweep-pg-${tag}`;
   const app = `sr-hs-gmsweep-sql-${tag}`;
@@ -892,9 +892,7 @@ function runSqlProbe(): ProbeResult {
     `switchroom.test.run=${RUN_ID}-sql`,
   ];
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -909,30 +907,27 @@ function runSqlProbe(): ProbeResult {
         "-e",
         `POSTGRES_DB=${PG_DB}`,
         PG_IMAGE,
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+    ]);
 
     // Readiness: pg_isready, not a fixed sleep.
     let ready = false;
     for (let i = 0; i < 60; i += 1) {
       try {
-        execFileSync("docker", ["exec", pg, "pg_isready", "-U", PG_USER], {
-          stdio: "ignore",
-        });
+        await execFileAsync("docker", ["exec", pg, "pg_isready", "-U", PG_USER]);
         ready = true;
         break;
       } catch {
-        execFileSync("sleep", ["1"], { stdio: "ignore" });
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
     if (!ready) {
-      return { status: -1, stdout: `postgres never became ready:\n${dockerLogs(pg)}` };
+      return {
+        status: -1,
+        stdout: `postgres never became ready:\n${await dockerLogs(pg)}`,
+      };
     }
 
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -945,13 +940,11 @@ function runSqlProbe(): ProbeResult {
         UPSTREAM_IMAGE,
         "sleep",
         "600",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+    ]);
 
-    applyPatches(app);
+    await applyPatches(app);
 
-    const out = dockerText(
+    const out = await dockerText(
       [
         "exec",
         "-i",
@@ -972,7 +965,7 @@ function runSqlProbe(): ProbeResult {
   } finally {
     for (const name of [app, pg]) {
       try {
-        execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+        await execFileAsync("docker", ["rm", "-f", name]);
       } catch {
         /* already gone */
       }
@@ -980,9 +973,9 @@ function runSqlProbe(): ProbeResult {
   }
 }
 
-function dockerLogs(name: string): string {
+async function dockerLogs(name: string): Promise<string> {
   try {
-    return dockerText(["logs", "--tail", "40", name]);
+    return await dockerText(["logs", "--tail", "40", name]);
   } catch (e) {
     return errText(e);
   }
@@ -1130,8 +1123,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("unpatched upstream is RED — one unbounded statement, no paging, no shrink", () => {
-      const { status, stdout } = runProbe(false);
+    it("unpatched upstream is RED — one unbounded statement, no paging, no shrink", async () => {
+      const { status, stdout } = await runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );
@@ -1164,8 +1157,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("B3_halving_sequence=FAIL");
     }, 240_000);
 
-    it("patched is GREEN — bounded pages, an advancing cursor, a rotating slice, a shrinking retry", () => {
-      const { status, stdout } = runProbe(true);
+    it("patched is GREEN — bounded pages, an advancing cursor, a rotating slice, a shrinking retry", async () => {
+      const { status, stdout } = await runProbe(true);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );
@@ -1270,8 +1263,8 @@ describe.skipIf(!dockerOk || !imageOk || !pgOk)(
       }
     });
 
-    it("executes the shipping statement against real rows", () => {
-      const { status, stdout } = runSqlProbe();
+    it("executes the shipping statement against real rows", async () => {
+      const { status, stdout } = await runSqlProbe();
       expect(stdout, `SQL probe did not run to completion:\n${stdout}`).toContain(
         "SQL_PROBE_EXECUTED",
       );

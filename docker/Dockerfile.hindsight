@@ -7495,6 +7495,17 @@ assert sweep.count("\n                ORDER BY c.entity_id_1, c.entity_id_2\n") 
     f"{TAG}: the sweep no longer has BOTH ordered scans — the page CTE's keyset order "
     "and the #2529 ordered lock's"
 )
+assert (
+    "\n                ORDER BY c.entity_id_1, c.entity_id_2\n"
+    "                FOR UPDATE OF c\n"
+) in sweep, (
+    f"{TAG}: the victims CTE's `ORDER BY c.entity_id_1, c.entity_id_2` is no longer "
+    "ADJACENT to its `FOR UPDATE OF c` — that adjacency IS the #2529 ordered lock. "
+    "The count assert above cannot see this on its own: deleting the victims ORDER BY "
+    "and re-adding an identical line anywhere else in the statement keeps the count at "
+    "2 and ships an unordered lock (deadlocks under concurrent maintenance) with a "
+    "green build"
+)
 assert sweep.count("\n                FOR UPDATE OF c\n") == 1, (
     f"{TAG}: the #2529 ordered lock did not survive the rewrite"
 )
