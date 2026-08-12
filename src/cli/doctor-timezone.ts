@@ -21,6 +21,7 @@
  * `doctor-*.ts` modules.
  */
 
+import { readFileSync } from "node:fs";
 import type { SwitchroomConfig } from "../config/schema.js";
 import type { CheckStatus } from "./doctor-status.js";
 import { resolveAgentConfig } from "../config/merge.js";
@@ -151,10 +152,124 @@ function timezoneVerdict(
   };
 }
 
-/** Section entry point for doctor.ts — returns the single timezone row. */
+/**
+ * Verify the local tzdata database still says UTC is UTC.
+ *
+ * This is the loud detector for the `/etc/localtime` bind-mount defect.
+ * The compose generator mounts the agent's zonefile onto
+ * `/etc/localtime`; Docker resolves a bind mount's destination through
+ * symlinks in the container rootfs BEFORE mounting, and stock Debian
+ * tzdata ships `/etc/localtime -> /usr/share/zoneinfo/Etc/UTC` — so on
+ * any image built before the `Dockerfile.agent` de-symlink step, the
+ * daemon wrote the LOCAL zonefile over `Etc/UTC`. Every by-name UTC
+ * lookup in the tzdata DB then returns local time: `TZ=UTC date`,
+ * Python `zoneinfo.ZoneInfo("UTC")`, and any Go/Java/Rust binary reading
+ * the OS zoneinfo DB. Node is immune (bundled full-ICU), which is
+ * exactly why nothing ever surfaced an error.
+ *
+ * `fail`, not `warn`: a wrong UTC is a silent multi-hour correctness
+ * bug, not a posture preference. There is no legitimate configuration in
+ * which `Etc/UTC` carries a non-zero offset.
+ *
+ * Reads the zonefile bytes directly rather than going through `Intl` —
+ * Node's bundled ICU reports a correct UTC even on a corrupted host, so
+ * an `Intl`-based check would mask the very defect this row exists to
+ * catch.
+ *
+ * Scope note: this inspects the filesystem `switchroom doctor` is
+ * RUNNING on. On the host that is a near-certain pass (the host is not
+ * where the mount lands), so it is cheap insurance rather than the
+ * primary per-agent detector — that is the `tzdata` probe in hostd's
+ * `agent_smoke` battery (`src/host-control/server.ts`), which runs
+ * inside each container. This row is what catches it when `doctor` runs
+ * in-container (the CLI is baked into the agent image at
+ * `/usr/local/bin/switchroom`).
+ *
+ * Exported for unit testing. `zoneinfoRoot` is injectable so a test can
+ * point at a fixture tree without mutating the host's /usr/share.
+ */
+export function checkZoneinfoIntegrity(
+  zoneinfoRoot = "/usr/share/zoneinfo",
+): CheckResult {
+  const name = "tzdata Etc/UTC integrity";
+  const path = `${zoneinfoRoot}/Etc/UTC`;
+  let buf: Buffer;
+  try {
+    buf = readFileSync(path);
+  } catch {
+    // No tzdata at all (exotic/minimal host). Nothing to verify and
+    // nothing is being corrupted — report skip, never fail.
+    return {
+      name,
+      status: "skip",
+      detail: `${path} not present — no tzdata to verify`,
+    };
+  }
+
+  const offset = readTzifGmtOffset(buf);
+  if (offset === undefined) {
+    return {
+      name,
+      status: "skip",
+      detail: `${path} is not a parseable TZif file — cannot verify`,
+    };
+  }
+  if (offset === 0) {
+    return { name, status: "ok", detail: `${path} decodes to UTC+00:00` };
+  }
+
+  // Report the raw seconds, not a derived hour count: on a clobbered
+  // file the first ttinfo is the source zone's LMT record (e.g. +34792
+  // for Australia/Melbourne), which is NOT that zone's current offset.
+  // Claiming "10 hours out" from it would be pseudo-precise.
+  return {
+    name,
+    status: "fail",
+    detail:
+      `${path} is not UTC — its first UT offset is ${offset}s, not 0. ` +
+      "Some other zone's data has been written over it. Every by-name UTC " +
+      "lookup in the tzdata DB (TZ=UTC date, Python " +
+      'zoneinfo.ZoneInfo("UTC"), Go/Java/Rust) returns that zone\'s local ' +
+      "time here, silently and with no error. Node is unaffected (bundled " +
+      "full-ICU), so nothing else will report this.",
+    fix:
+      "Almost always the /etc/localtime bind mount landing on the symlink's " +
+      "target: this container's image predates the Dockerfile.agent " +
+      "de-symlink step. Rebuild the agent image and recreate the container " +
+      "(`switchroom apply`). Verify with `ls -la /etc/localtime` — it must " +
+      "be a regular file, not a symlink into /usr/share/zoneinfo.",
+  };
+}
+
+/**
+ * Read the first ttinfo UT offset from a TZif buffer, in seconds.
+ * Returns undefined when the buffer is not a TZif file or carries no
+ * ttinfo record.
+ *
+ * TZif layout (RFC 8536 §3.1): magic[4] "TZif", version[1],
+ * reserved[15], then six 4-byte big-endian counts — isutcnt, isstdcnt,
+ * leapcnt, timecnt, typecnt, charcnt — at offsets 20, 24, 28, 32, 36,
+ * 40. The v1 data block starts at 44 with `timecnt` 4-byte transition
+ * times, then `timecnt` 1-byte type indices, then `typecnt` 6-byte
+ * ttinfo records whose first 4 bytes are the signed UT offset. A real
+ * UTC zonefile has no transitions and exactly one ttinfo at offset 0.
+ */
+function readTzifGmtOffset(buf: Buffer): number | undefined {
+  if (buf.length < 44 || buf.subarray(0, 4).toString("latin1") !== "TZif") {
+    return undefined;
+  }
+  const timecnt = buf.readUInt32BE(32);
+  const typecnt = buf.readUInt32BE(36);
+  if (typecnt === 0) return undefined;
+  const ttinfoStart = 44 + timecnt * 4 + timecnt * 1;
+  if (buf.length < ttinfoStart + 6) return undefined;
+  return buf.readInt32BE(ttinfoStart);
+}
+
+/** Section entry point for doctor.ts — returns the timezone rows. */
 export function runTimezoneChecks(
   config: SwitchroomConfig,
   tzOpts: ResolveTimezoneOpts = {},
 ): CheckResult[] {
-  return [checkTimezone(config, tzOpts)];
+  return [checkTimezone(config, tzOpts), checkZoneinfoIntegrity()];
 }

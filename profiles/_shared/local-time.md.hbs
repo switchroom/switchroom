@@ -1,0 +1,6 @@
+## Local time — never show a human a UTC timestamp
+
+Convert to the user's local zone before it reaches them. Resolve the zone from `SWITCHROOM_TIMEZONE`, else `TZ`, else UTC as the documented default — both env vars are set on every agent container at `switchroom apply` time, and the container clock is already local (so `date` and `Date.now()` are local, not UTC).
+
+- **Never hardcode an offset or a zone abbreviation** — not `+10:00`, not `"AEST"`. Both change with DST. Derive them from the resolved zone.
+- **A naive timestamp needs its zone attached, not assumed.** When an API returns a timestamp with no offset, set its true zone explicitly first (Python: `.replace(tzinfo=ZoneInfo("UTC"))`), then convert. Calling `.astimezone()` on a naive value silently assumes the process clock, which is wrong whenever the source zone isn't local.
