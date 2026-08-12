@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { applyHysteresis, formatFiring, tick } from "./run.js";
+import { recallLogPath } from "./recall-log.js";
 import { loadState } from "./state.js";
 import { RENOTIFY_MS } from "./thresholds.js";
 import type { SignalState, Verdict } from "./types.js";
@@ -119,6 +120,35 @@ function spool(pending: number, dead = 0): void {
   mkdirSync(d, { recursive: true });
   for (let i = 0; i < pending; i++) writeFileSync(join(d, `p${i}.json`), "{}");
   for (let i = 0; i < dead; i++) writeFileSync(join(d, `d${i}.json.dead`), "{}");
+}
+
+/**
+ * Write a recall log for `agent` whose rows reduce to the given score/pool.
+ *
+ * Enough rows to clear `RECALL_MIN_SAMPLES`, all stamped just before `now` so
+ * they land inside the tick's trailing window; values are constant because
+ * these tests assert the PLUMBING (does the summary reach the baseline, does
+ * it survive a save/load), not the distribution — that is what
+ * `recall-degradation.test.ts` uses the real fixture for.
+ */
+function recallLog(agent: string, score: number, pool: number, now: number): void {
+  const p = recallLogPath(join(agentsDir, agent));
+  mkdirSync(dirname(p), { recursive: true });
+  const rows = Array.from({ length: 60 }, (_, i) => ({
+    ts: new Date(now - (60 - i) * 10_000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    bank_id: agent,
+    result_count: 8,
+    total_elapsed_ms: 1200,
+    deadline_hit: false,
+    deadline_effective_ms: 9993,
+    pre_cap_count: pool,
+    overlap_dropped: 0,
+    injected_score_max: score,
+    cache_hit: false,
+    error: null,
+    bank_timings: [{ bank_id: agent, elapsed_ms: 1200, timed_out: false, errored: false }],
+  }));
+  writeFileSync(p, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
 }
 
 /** #3599's `pending-evicted/` archive — a SIBLING of `pending-retains/`. */
@@ -569,6 +599,49 @@ describe("tick — end to end over a real state file", () => {
     expect(rate?.verdict.state).toBe("no-data");
     expect(sent.texts).toEqual([]);
     expect(r.exitCode).toBe(0);
+  });
+
+  it("the trailing baseline SURVIVES that same outage, unlike the ring", async () => {
+    // The paired assertion to the test above, and the reason the baseline is a
+    // separate structure rather than more ring. The ring must forget across a
+    // gap (a stale window would page about an era that already ended); the
+    // baseline must NOT, because a quality regression that begins during a
+    // watchdog outage is exactly the one still worth catching on return.
+    // Asserting only one of these would leave the other free to drift into it.
+    const sent: Sent = { texts: [] };
+    spool(10);
+    const base = { statePath, agentsDir, notify: makeNotify(sent), run: dockerOk() };
+    const t0 = Date.parse("2026-08-09T09:00:00Z");
+
+    recallLog("alpha", 0.87, 95, t0);
+    await tick({ ...base, fetchImpl: fakeFetch(metricsBody(1000, 10)), nowFn: () => t0 });
+
+    const t1 = t0 + 24 * 3_600_000;
+    recallLog("alpha", 0.86, 94, t1);
+    await tick({ ...base, fetchImpl: fakeFetch(metricsBody(1100, 20)), nowFn: () => t1 });
+
+    const back = loadState(statePath);
+    expect(back.ring).toHaveLength(1); // forgot, as it must
+    expect(back.baseline?.days.map((d) => d.day)).toEqual(["2026-08-09", "2026-08-10"]);
+    expect(back.baseline?.days[0]?.scoreObs).toHaveLength(1);
+  });
+
+  it("persists a baseline the next tick can actually read back", async () => {
+    // Round-trips through JSON and `normalizeBaseline`, which is where a
+    // schema that only worked in memory would break — and it would break
+    // SILENTLY, as a permanent `no-data` nobody is paged about.
+    const sent: Sent = { texts: [] };
+    spool(10);
+    const base = { statePath, agentsDir, notify: makeNotify(sent), run: dockerOk() };
+    const t0 = Date.parse("2026-08-11T09:00:00Z");
+    recallLog("alpha", 0.88, 96, t0);
+    await tick({ ...base, fetchImpl: fakeFetch(metricsBody(1000, 10)), nowFn: () => t0 });
+
+    const persisted = loadState(statePath).baseline;
+    expect(persisted).toBeDefined();
+    const day = persisted!.days.find((d) => d.day === "2026-08-11")!;
+    expect(day.scoreObs[0]).toBeCloseTo(0.88, 4);
+    expect(day.poolObs[0]).toBe(96);
   });
 });
 

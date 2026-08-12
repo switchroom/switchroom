@@ -6,6 +6,7 @@
  * 2026-07 retain-failure storm).
  */
 
+import { baselineFor, fractionalDrop } from "./baseline.js";
 import { counterDelta } from "./metrics.js";
 import {
   CONSOLIDATION_AGE_PAGE_S,
@@ -24,11 +25,19 @@ import {
   QUEUE_FLOOR,
   QUEUE_GROWTH_FRACTION,
   QUEUE_GROWTH_MIN_ABS,
+  RECALL_BASELINE_DAYS,
+  RECALL_BASELINE_MIN_DAYS,
+  RECALL_DEADLINE_HIT_PAGE,
+  RECALL_DEADLINE_HIT_WARN,
   RECALL_MIN_SAMPLES,
   RECALL_OWN_BANK_TIMEOUT_PAGE,
   RECALL_OWN_BANK_TIMEOUT_WARN,
+  RECALL_P95_PAGE_MS,
+  RECALL_P95_WARN_MS,
   RECALL_POOL_MEDIAN_PAGE,
   RECALL_POOL_MEDIAN_WARN,
+  RECALL_QUALITY_DROP_PAGE,
+  RECALL_QUALITY_DROP_WARN,
   RECALL_SCORE_P50_PAGE,
   RECALL_SCORE_P50_WARN,
   RECALL_WALL_MS,
@@ -38,6 +47,7 @@ import {
 } from "./thresholds.js";
 import type {
   BankFailureStreak,
+  RecallBaseline,
   RecallSample,
   Sample,
   SignalId,
@@ -390,23 +400,19 @@ function errorSuffix(r: { topError?: string | null }): string {
 /**
  * Render recall wall time as DM context, or "" when unavailable.
  *
- * There is deliberately no `recall-latency` SIGNAL — see the deletion note in
- * `thresholds.ts`, where the 8037 ms healthy p95 (right-censored at the retired
- * 8 s wall) is shown to leave no thresholdable band below the 10 s recall
- * deadline the #3759 declarative envelope resolves to ({@link RECALL_WALL_MS}).
- * The measurement is still worth SHOWING: it is what distinguishes "own-bank
- * recall failed"
- * meaning *timed out at the wall* from meaning *errored immediately*, which
- * is the first question the operator asks and the cheapest one to pre-answer.
- *
- * Presentational only, exactly like `errorSuffix` — no threshold reads it, so
- * it can never move a verdict.
+ * Still presentational HERE, exactly like `errorSuffix` — this suffix moves no
+ * verdict. Latency now also carries its own threshold in
+ * `evaluateRecallLatency` below, but on R1 the number answers a different
+ * question: whether "own-bank recall failed" means *timed out at the wall* or
+ * *errored immediately*. That is the first thing the operator asks and the
+ * cheapest one to pre-answer, so it stays inline on R1 rather than making the
+ * reader correlate two DMs.
  */
 function latencySuffix(r: { elapsedP95Ms?: number | null; elapsedConsidered?: number }): string {
   const p95 = r.elapsedP95Ms;
   if (typeof p95 !== "number" || !Number.isFinite(p95)) return "";
   const n = typeof r.elapsedConsidered === "number" ? r.elapsedConsidered : 0;
-  return `\n  recall wall time p95 ${Math.round(p95)}ms over ${n} fire(s) (not thresholded — the ${RECALL_WALL_MS}ms recall deadline leaves no healthy band below it)`;
+  return `\n  recall wall time p95 ${Math.round(p95)}ms over ${n} fire(s) (against the ${RECALL_WALL_MS}ms recall deadline)`;
 }
 
 /**
@@ -567,17 +573,250 @@ export function evaluateRecallInjectedScore(ring: Sample[]): Verdict {
   };
 }
 
-/*
- * There is no `evaluateRecallLatency`. `total_elapsed_ms` IS summarised (into
- * `RecallSample.elapsedP95Ms`) and IS shown, via `latencySuffix` on R1 — it
- * just carries no threshold, because the only healthy p95 ever measured
- * (8037 ms) is right-censored at the retired 8 s wall, and against the 10 s
- * recall deadline the #3759 declarative envelope resolves to ({@link
- * RECALL_WALL_MS}) there is still no band left underneath it. The full
- * derivation, including the bootstrap that breaches a 6000 ms line in 100 % of
- * healthy draws, is in `thresholds.ts` where the constants would otherwise have
- * lived.
+/**
+ * R4a — recall wall-time p95.
+ *
+ * This signal was drafted and deleted twice, both times correctly: the only
+ * healthy population then available was itself running at the wall, so no line
+ * below the wall could separate healthy from sick. It is restored here because
+ * the precondition the deletion named has been met — see `RECALL_P95_WARN_MS`
+ * in `thresholds.ts` for the re-baseline against the repaired fleet.
+ *
+ * Distinct from R4c below: this one says recall is SLOW. R4c says recall is
+ * being CUT OFF. Both can be true, and when both fire the pinning one is the
+ * actionable half.
  */
+export function evaluateRecallLatency(ring: Sample[]): Verdict {
+  const signal = "recall-latency" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+  if (r.elapsedConsidered < RECALL_MIN_SAMPLES || r.elapsedP95Ms === null) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        `only ${r.elapsedConsidered} recall(s) carrying a wall time ` +
+        `— below the ${RECALL_MIN_SAMPLES}-row floor`,
+      measured: { considered: r.elapsedConsidered },
+    };
+  }
+  const { state, severity } = scoreHigherIsWorse(
+    r.elapsedP95Ms,
+    RECALL_P95_WARN_MS,
+    RECALL_P95_PAGE_MS,
+  );
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `recall wall time p95 ${Math.round(r.elapsedP95Ms)}ms over ${r.elapsedConsidered} recall(s) ` +
+      `— warn ≥${RECALL_P95_WARN_MS}ms, page ≥${RECALL_P95_PAGE_MS}ms ` +
+      `(deadline ${RECALL_WALL_MS}ms). ` +
+      `Slow recall delays every turn it fires on, and approaches the deadline ` +
+      `past which memory is silently truncated.`,
+    measured: { elapsedP95Ms: r.elapsedP95Ms, considered: r.elapsedConsidered },
+  };
+}
+
+/**
+ * R4b — recall quality against its OWN trailing baseline.
+ *
+ * The only non-absolute signal in the file, and the one built for the
+ * 2026-08-01 → 08-07 degradation that all fourteen floors slept through: top-hit
+ * score fell ~5× while staying 9× above its absolute warn line.
+ *
+ * Two arms, OR'd, each gated on its own absolute-warn constant. The gate is
+ * what keeps this from double-reporting a collapse: once the BASELINE itself is
+ * at or below the floor, the fleet is not regressing, it is broken, and R3/R4
+ * own that. Below the gate this arm reports `no-data` — inert, per the
+ * `no-data` contract, so it neither fires nor resolves a live alert.
+ */
+export function evaluateRecallQualityRegression(
+  ring: Sample[],
+  baseline: RecallBaseline | undefined,
+  now: number,
+): Verdict {
+  const signal = "recall-quality-regression" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+
+  const base = baselineFor(baseline, now);
+
+  // Each arm carries its own denominator and its own gate, evaluated
+  // independently: a tick that can score the pool but not the score reports on
+  // the pool rather than reporting nothing.
+  const arms: {
+    label: string;
+    observed: number | null;
+    considered: number;
+    series: { value: number | null; days: number };
+    gate: number;
+    format: (x: number) => string;
+  }[] = [
+    {
+      label: "p50 injected top-hit score",
+      observed: r.scoreConsidered >= RECALL_MIN_SAMPLES ? r.scoreP50 : null,
+      considered: r.scoreConsidered,
+      series: base.score,
+      gate: RECALL_SCORE_P50_WARN,
+      format: (x) => x.toFixed(4),
+    },
+    {
+      label: "median candidate pool",
+      observed: r.poolConsidered >= RECALL_MIN_SAMPLES ? r.poolMedian : null,
+      considered: r.poolConsidered,
+      series: base.pool,
+      gate: RECALL_POOL_MEDIAN_WARN,
+      format: (x) => `${Math.round(x)}`,
+    },
+  ];
+
+  const scored = arms
+    .map((arm) => {
+      if (arm.series.value === null || arm.series.value <= arm.gate) return null;
+      const drop = fractionalDrop(arm.observed, arm.series.value);
+      if (drop === null) return null;
+      return { ...arm, baseline: arm.series.value, drop };
+    })
+    .filter((a): a is NonNullable<typeof a> => a !== null);
+
+  if (scored.length === 0) {
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        `no comparable trailing baseline yet ` +
+        `(score: ${base.score.days} day(s), pool: ${base.pool.days} day(s); ` +
+        `needs ${RECALL_BASELINE_MIN_DAYS} completed day(s) above the absolute floors)`,
+      measured: { scoreDays: base.score.days, poolDays: base.pool.days },
+    };
+  }
+
+  // Report the WORST arm. Both are shown in the detail line so the operator
+  // can see whether one moved or both did — during the 08-01 incident the pool
+  // GREW while the score collapsed, and that divergence is itself the clue.
+  const worst = scored.reduce((a, b) => (b.drop > a.drop ? b : a));
+  const { state, severity } = scoreHigherIsWorse(
+    worst.drop,
+    RECALL_QUALITY_DROP_WARN,
+    RECALL_QUALITY_DROP_PAGE,
+  );
+  const lines = scored
+    .map(
+      (a) =>
+        `\n  ${a.label} ${a.format(a.observed as number)} vs ${a.format(a.baseline)} baseline ` +
+        `over ${a.series.days} day(s) — ${pct(a.drop)} below`,
+    )
+    .join("");
+  return {
+    signal,
+    state,
+    severity,
+    detail:
+      `recall quality is ${pct(worst.drop)} below its own trailing ` +
+      `${RECALL_BASELINE_DAYS}-day baseline (worst arm: ${worst.label}) ` +
+      `— warn ≥${pct(RECALL_QUALITY_DROP_WARN)}, page ≥${pct(RECALL_QUALITY_DROP_PAGE)}.` +
+      // Only claim the floors are blind when they actually are. On an `ok`
+      // verdict this line still shows up in `--dry-run` output, and a status
+      // listing that asserts a problem it just decided there isn't teaches the
+      // operator to skim it.
+      (state === "breach"
+        ? ` Absolute floors cannot see this: the readings are still well above them.`
+        : "") +
+      lines,
+    measured: { drop: worst.drop, baseline: worst.baseline, considered: worst.considered },
+  };
+}
+
+/**
+ * R4c — recall pinned against its deadline.
+ *
+ * A p95 sitting on the wall is not the same failure as a p95 that is merely
+ * high: it means an unknown share of recalls never finished, and the agent was
+ * handed whatever had arrived when the deadline cut them off. Truncated memory
+ * looks exactly like sparse memory from inside the turn, which is why this is
+ * worth its own signal rather than a higher latency page.
+ *
+ * Scored on the rate at which rows REPORT being cut off, not on
+ * `p95 / deadline_effective_ms`. That fraction compared two independent config
+ * knobs (`parallel_deadline_seconds` against the per-request
+ * `request_timeout_seconds`) and was blind to the 07-20 → 07-26 week, where
+ * 84-95 % of recalls hit the deadline and it scored 0.81; see
+ * {@link RECALL_DEADLINE_HIT_WARN} for the replay. The rate reads no deadline
+ * value at all, so retuning either knob cannot move the verdict.
+ *
+ * Rows carrying no boolean `deadline_hit` are excluded rather than counted as
+ * completions, and a window holding fewer than {@link RECALL_MIN_SAMPLES} of
+ * them is `no-data`, not `ok`.
+ */
+export function evaluateRecallDeadlinePinning(ring: Sample[]): Verdict {
+  const signal = "recall-deadline-pinning" as const;
+  const r = latestRecall(ring);
+  if (r === null) return noRecallData(signal);
+
+  // Validated HERE rather than in `normalizeRecallSample`, which tolerates
+  // both fields as optional so a sample persisted by an older build stays
+  // usable. Tolerance must not become trust: a garbled `deadlineHitConsidered`
+  // would sail past a bare sample floor (`"x" < 30` is false), make `rate`
+  // NaN, and every `NaN >= threshold` is false — the fail-OPEN trap this file
+  // guards against everywhere else. Rejected to `no-data`, never zero-filled.
+  const considered = r.deadlineHitConsidered;
+  const hits = r.deadlineHitRows;
+  const usable =
+    typeof considered === "number" &&
+    typeof hits === "number" &&
+    Number.isInteger(considered) &&
+    Number.isInteger(hits) &&
+    hits >= 0 &&
+    hits <= considered &&
+    considered >= RECALL_MIN_SAMPLES;
+  if (!usable) {
+    const shown = typeof considered === "number" && Number.isFinite(considered) ? considered : 0;
+    return {
+      signal,
+      state: "no-data",
+      detail:
+        `cannot measure truncation this tick ` +
+        `(${shown} row(s) carry a usable deadline_hit flag, need ${RECALL_MIN_SAMPLES} ` +
+        `— samples persisted by builds before this signal carry none at all)`,
+      measured: { deadlineHitConsidered: shown },
+    };
+  }
+
+  const rate = hits / considered;
+  const state = rate >= RECALL_DEADLINE_HIT_WARN ? "breach" : "ok";
+  const severity = rate >= RECALL_DEADLINE_HIT_PAGE ? "page" : "warn";
+  // Reported, never thresholded: these two say WHERE the cut-off lands, which
+  // is the difference between "raise the deadline" and "the per-request
+  // timeout is sitting below the deadline". A garbled value cannot move the
+  // verdict, only the prose.
+  const deadline = r.deadlineEffectiveMedianMs ?? null;
+  const wall =
+    deadline !== null && deadline > 0 && r.elapsedP95Ms !== null
+      ? ` p95 was ${Math.round(r.elapsedP95Ms)}ms against a ${Math.round(deadline)}ms effective deadline.`
+      : "";
+  return {
+    signal,
+    state,
+    severity: state === "breach" ? severity : undefined,
+    detail:
+      `${hits}/${considered} recall(s) (${pct(rate)}) were CUT OFF at the deadline ` +
+      `— threshold ${pct(RECALL_DEADLINE_HIT_WARN)} warn / ${pct(RECALL_DEADLINE_HIT_PAGE)} page.` +
+      wall +
+      (state === "breach"
+        ? ` Those turns were handed truncated memory, which looks identical to ` +
+          `sparse memory from inside the turn.`
+        : ""),
+    measured: {
+      rate,
+      deadlineHits: hits,
+      deadlineHitConsidered: considered,
+      ...(r.elapsedP95Ms !== null ? { elapsedP95Ms: r.elapsedP95Ms } : {}),
+      ...(deadline !== null ? { deadlineMs: deadline } : {}),
+    },
+  };
+}
 
 /**
  * R5 — consolidation queue age.
@@ -905,8 +1144,22 @@ export function evaluateLlmFallback(ring: Sample[]): Verdict {
   };
 }
 
-/** Evaluate every level/edge signal over the window. Order is display order. */
-export function evaluateAll(ring: Sample[]): Verdict[] {
+/**
+ * Evaluate every level/edge signal over the window. Order is display order.
+ *
+ * `baseline` and `now` are OPTIONAL so that every existing call site — tests,
+ * and any caller that only wants the fourteen window-local signals — keeps
+ * compiling and keeps meaning what it meant. Omitting them does not make
+ * `recall-quality-regression` pass: with no baseline it reports `no-data`,
+ * which is inert. `now` defaults to the clock only when the caller declines to
+ * supply one; `run.ts` passes the tick's own timestamp so the evaluator stays
+ * a pure function of its arguments there.
+ */
+export function evaluateAll(
+  ring: Sample[],
+  baseline?: RecallBaseline,
+  now: number = Date.now(),
+): Verdict[] {
   return [
     evaluateContainer(ring),
     evaluateFailureRate(ring),
@@ -915,6 +1168,9 @@ export function evaluateAll(ring: Sample[]): Verdict[] {
     evaluateRecallOwnBankTimeout(ring),
     evaluateRecallCandidateFloor(ring),
     evaluateRecallInjectedScore(ring),
+    evaluateRecallLatency(ring),
+    evaluateRecallQualityRegression(ring, baseline, now),
+    evaluateRecallDeadlinePinning(ring),
     evaluateRecallZeroMemory(ring),
     evaluateConsolidationQueueAge(ring),
     evaluateConsolidationFailureStreak(ring),

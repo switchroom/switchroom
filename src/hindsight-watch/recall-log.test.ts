@@ -247,13 +247,14 @@ describe("recall signals fire at PAGE level on the real incident", () => {
     expect(v.severity).toBe("page");
   });
 
-  it("surfaces the deadline-pinned wall time as DM context, without thresholding it", () => {
-    // `recall-latency` is not a signal (see thresholds.ts), but the number is
-    // still what tells the operator "timed out at the wall" rather than
-    // "errored instantly", so it must reach the DM.
+  it("surfaces the wall time as DM context on the own-bank alert", () => {
+    // `recall-latency` is now its OWN signal, but this number still has to
+    // reach the own-bank DM: it is what tells the operator "timed out at the
+    // wall" rather than "errored instantly", and making them correlate two
+    // separate alerts to learn that would be a regression in the message.
     const detail = evaluateRecallOwnBankTimeout(ring).detail;
     expect(detail).toContain("recall wall time p95");
-    expect(detail).toContain("not thresholded");
+    expect(detail).toContain("recall deadline");
   });
 
   it("puts the reason, not just the rate, into the operator DM", () => {
@@ -265,11 +266,71 @@ describe("recall signals stay silent on a REAL healthy fleet", () => {
   const rows = healthyRows();
   const ring = ringOf(rows);
 
-  it("no recall signal breaches — not at warn, not at page", () => {
+  /**
+   * The four signals this fixture was CAPTURED to calibrate.
+   *
+   * Scoped deliberately, and the scope is the honest reading of what this
+   * fixture is. It was taken 2026-07-27, while the fleet was running the
+   * retired 8 s wall with a recall path that was itself degraded — its own
+   * header says so, and asks for exactly the regeneration that
+   * `repaired-fleet.fixture.ts` now provides. It is a valid "healthy" control
+   * for the four rate/floor signals derived from it, and it is NOT a healthy
+   * control for latency: this population was pinned against its deadline, and
+   * the next test asserts that directly rather than letting it hide behind a
+   * blanket green.
+   *
+   * `repaired-fleet.fixture.ts` carries the blanket green over ALL recall
+   * signals — see `recall-degradation.test.ts`.
+   */
+  const CALIBRATED_HERE = [
+    "recall-own-bank-timeout",
+    "recall-zero-memory",
+    "recall-candidate-floor",
+    "recall-injected-score",
+  ];
+
+  it("no recall signal calibrated on this fixture breaches — not at warn, not at page", () => {
+    const seen: string[] = [];
     for (const v of evaluateAll(ring)) {
-      if (!v.signal.startsWith("recall-")) continue;
+      if (!CALIBRATED_HERE.includes(v.signal)) continue;
+      seen.push(v.signal);
       expect(`${v.signal}=${v.state}`).toBe(`${v.signal}=ok`);
     }
+    // Guards the scoping itself: if a signal is renamed out from under this
+    // list, the loop silently asserts nothing.
+    expect(seen.sort()).toEqual([...CALIBRATED_HERE].sort());
+  });
+
+  it("this 'healthy' fleet was itself deadline-pinned — which is why it cannot calibrate latency", () => {
+    // The claim that killed the drafted latency signal twice, asserted rather
+    // than asserted-about-in-a-comment: the 2026-07 population runs AT the
+    // wall, so the restored signal fires on it. Restoring the old blanket
+    // green over this fixture would therefore require lifting the latency
+    // threshold above a distribution that is known-degraded, and this test is
+    // what makes that trade visible instead of silent.
+    const latency = evaluateAll(ring).find((v) => v.signal === "recall-latency")!;
+    expect(latency.state).toBe("breach");
+    expect(summarizeRecallRows(rows).elapsedP95Ms).toBeGreaterThanOrEqual(8000);
+  });
+
+  it("deadline pinning reads ok here ONLY because the fixture was conditioned to remove the hits", () => {
+    // Worth stating explicitly so nobody reads this green as evidence the
+    // 2026-07 fleet was not truncating. It was: 84-95 % of raw July rows hit
+    // the deadline. This fixture is CONDITIONED — its header records that it
+    // selected rows where no bank timed out, errored, or hit the deadline —
+    // so a 0 % truncation rate here is the selection criterion reflected back,
+    // not a measurement. The `recall-latency` test above is what carries the
+    // real verdict on this population.
+    const v = evaluateAll(ring).find((s) => s.signal === "recall-deadline-pinning")!;
+    expect(v.state).toBe("ok");
+    const s = summarizeRecallRows(rows);
+    expect(s.deadlineHitRows).toBe(0);
+    expect(s.deadlineHitConsidered).toBe(s.rows);
+  });
+
+  it("quality regression reports no-data with no persisted baseline, never ok", () => {
+    const v = evaluateAll(ring).find((s) => s.signal === "recall-quality-regression")!;
+    expect(v.state).toBe("no-data");
   });
 
   it("the fixture really is the live distribution, tails included", () => {
@@ -353,11 +414,20 @@ describe("recall signals stay silent on a REAL healthy fleet", () => {
     expect(falseFireRate(healthyScores, (w) => quantile(w, 0.5) <= 0.05)).toBeGreaterThan(0.1);
   });
 
-  it("no recall-latency line below the 8 s budget is safe — BLOCKER 1's evidence", () => {
-    // The drafted signal was warn 4000 / page 6000 ms. Both fire on
-    // essentially every healthy window; even 8000 ms, the per-bank budget
-    // itself, fires on a large fraction. There is no safe band beneath the
-    // budget, which is the entire argument for the signal not existing.
+  it("no recall-latency line below the 8 s budget was safe AGAINST THIS POPULATION — BLOCKER 1's evidence, preserved", () => {
+    // Kept exactly as measured, because it is still true and still the reason
+    // the signal could not ship in July: against the 2026-07 distribution the
+    // drafted warn 4000 / page 6000 fire on essentially every window, and even
+    // 8000 ms — the per-bank budget itself — fires on a large fraction.
+    //
+    // What CHANGED is not this arithmetic, it is the population. These rows
+    // were drawn from a fleet whose recall was itself broken and running at
+    // the wall (p50 6420 ms). The repaired fleet runs p50 1097 / p95 1486 ms,
+    // and the identical bootstrap against THAT distribution fires 0 % of the
+    // time at both lines — asserted in `recall-degradation.test.ts`. The
+    // deletion note named a re-baseline on a repaired fleet as its own
+    // precondition for restoration; this test records the "before" half of
+    // that comparison and must keep passing.
     expect(falseFireRate(healthyLatencies, (w) => quantile(w, 0.95) >= 4000)).toBeGreaterThan(0.9);
     expect(falseFireRate(healthyLatencies, (w) => quantile(w, 0.95) >= 6000)).toBeGreaterThan(0.9);
     expect(falseFireRate(healthyLatencies, (w) => quantile(w, 0.95) >= 8000)).toBeGreaterThan(0.3);

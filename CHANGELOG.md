@@ -15,6 +15,24 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Features
+
+- **hindsight-watch: detect recall DEGRADATION, not just collapse** — three
+  signals for the shape all fourteen existing ones missed. `recall-latency`
+  (p95 3 s warn / 6 s page), `recall-quality-regression` (top-hit score and
+  candidate pool against the fleet's own trailing 7-day median, 40 % warn /
+  60 % page), and `recall-deadline-pinning` (5 % / 20 % of recalls reporting
+  `deadline_hit`). A real ~5× recall-quality degradation ran 2026-08-01 →
+  08-07 and tripped none of the absolute floors, which are tuned for total
+  collapse. Pure arithmetic over telemetry already being logged — no model
+  call, no added cost per tick. Pinning is measured as a truncation RATE
+  rather than as `p95 / deadline_effective_ms`: that ratio compares two
+  independent config knobs (`parallel_deadline_seconds` against the
+  per-request `request_timeout_seconds`) and, replayed over 2026-07-20 →
+  07-26, reads 0.81 and stays silent while 84–95 % of recalls were being cut
+  off — the worst week in the log, scored as healthier than the milder August
+  incident it did catch.
+
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
 ### Dependencies
