@@ -150,6 +150,50 @@ function toHermesSession(sessionId: string, agent: AgentInfo, liveness: AgentLiv
     quota: agent.primaryAccount
       ? { used_pct: null, slot: agent.primaryAccount }
       : null,
+
+    // ─── Optional SessionInfo fields the sidebar groups and sorts on ────────
+    //
+    // All optional in SessionInfo (apps/desktop/src/types/hermes.ts:464-523),
+    // so omitting them threw nothing — the cost was silent feature loss: no
+    // Pinned section, no profile badge, no cost sort. Every value below is a
+    // true statement about switchroom, and the ones that are `false`/`null`
+    // are that way because the concept does not exist here, not as a stub:
+    //
+    //   pinned / archived  no per-session pin or archive store, and the PATCH
+    //                      that would set one is refused (see the DELETE
+    //                      /api/sessions/:id comment) — so these are
+    //                      permanently false, which is what the sidebar needs
+    //                      to know to render the sections at all.
+    //   profile            switchroom has exactly one profile and reports it
+    //                      as `default` (/api/profiles/active). The field's
+    //                      own docstring says the UI treats a missing profile
+    //                      as the default — stating it explicitly is the same
+    //                      answer, minus the inference.
+    //   git_*              a session is an agent, not a repo working tree;
+    //                      there is no branch or checkout to group by.
+    //   parent_session_id  no forking and no auto-compression, so no lineage:
+    //   _lineage_root_id   every session is its own root.
+    //   handoff_*          no cross-platform session handoff concept.
+    //   *_cost_usd         no token metering. Sending 0 would be a LIE that
+    //                      sorts to the top of a cost-ordered list; null is
+    //                      "unknown", which is the truth.
+    //
+    // Nullable per the type: only `archived`, `pinned`, `profile` and
+    // `is_default_profile` are declared without `| null`, and those four are
+    // the four non-null values here.
+    pinned: false,
+    archived: false,
+    profile: "default",
+    is_default_profile: true,
+    git_branch: null,
+    git_repo_root: null,
+    parent_session_id: null,
+    _lineage_root_id: null,
+    handoff_platform: null,
+    handoff_state: null,
+    handoff_error: null,
+    actual_cost_usd: null,
+    estimated_cost_usd: null,
   };
 }
 

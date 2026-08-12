@@ -908,15 +908,6 @@ const CONTRACT: ContractCase[] = [
     search: "?limit=40&offset=0&min_messages=0&archived=exclude&order=recent",
     client: "types/hermes.ts:464-523 (SessionInfo)",
     server: "hermes_cli/web_routers/sessions.py:54",
-    gap:
-      "toHermesSession (hermes-adapter.ts:128-153) emits none of these. They " +
-      "are all optional in SessionInfo so nothing throws — the cost is silent " +
-      "feature loss: no Pinned section (`pinned`), no archive state " +
-      "(`archived`), no profile badge (`profile`/`is_default_profile`), no " +
-      "branch/repo grouping (`git_branch`/`git_repo_root`), no fork lineage " +
-      "(`parent_session_id`/`_lineage_root_id`), no handoff badge " +
-      "(`handoff_platform`/`handoff_state`/`handoff_error`), and no cost sort " +
-      "(`actual_cost_usd`/`estimated_cost_usd`).",
     assert: (res) => {
       const b = body200(res);
       const s = (b.sessions as Record<string, unknown>[])[0];
@@ -1406,8 +1397,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
       total: 47,
-      green: 41,
-      gaps: 6,
+      green: 42,
+      gaps: 5,
     });
   });
 });

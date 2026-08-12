@@ -79,6 +79,14 @@ now an anomaly worth investigating, not the norm.
   (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
   so a designator-less line is now normalised to `Z` at the producer. An
   explicit `+HH:MM` offset is preserved untouched.
+
+- **hermes: the desktop sidebar gets the `SessionInfo` fields it groups and
+  sorts on.** Session rows omitted `pinned`, `archived`, `profile`,
+  `is_default_profile`, the `git_*`, lineage, handoff and cost fields. They are
+  all optional, so nothing threw — the cost was silent feature loss (no Pinned
+  section, no profile badge, no cost sort). Costs are `null` rather than `0`:
+  switchroom has no token metering, and `0` would sort every session to the top
+  of a cost-ordered list as if it were measured.
 - **hermes: `GET /api/status` no longer renders "null" in the settings pane.**
   `config_path`, `env_path` and `release_date` are declared as bare `string` in
   `StatusResponse`, and the adapter sent `null` for all three. They now carry
