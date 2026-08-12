@@ -1029,6 +1029,55 @@ export const CONSOLIDATION_FAILURE_STREAK_PAGE = 10;
 export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
 
 /**
+ * How long a pair may go with NO successful op before its already-breaching
+ * streak counts as live regardless of how old its newest failure is.
+ *
+ * `CONSOLIDATION_STREAK_RECENCY_S` above asks "is the newest FAILURE recent?"
+ * as a proxy for "is this still broken?". That proxy holds only for a job on a
+ * tight cadence — it was tuned against `consolidation`, whose incident rate
+ * was one failure every 87 s. It structurally CANNOT hold a sparse,
+ * demand-driven operation type: `graph_maintenance` runs only when work is
+ * enqueued, so it produces no new failures while it is broken and every
+ * failure it has ages out of a 2 h window within one afternoon. Measured live
+ * 2026-08-12, both banks 100 % broken and both reading `ok`:
+ *
+ *   overlord | graph_maintenance | streak 19 | newest failure 37.3 h ago
+ *   klanker  | graph_maintenance | streak  9 | newest failure 91.4 h ago
+ *
+ * …with the pair's last SUCCESS 220 h ago in both cases. The consequence is
+ * general: any permanently-broken sparse operation type reads green forever.
+ *
+ * **24 h, measured.** Two rates bound it, both taken from `async_operations`
+ * on the production bank, 2026-08-12:
+ *
+ *  - **Floor — how long a self-healing fault legitimately takes.** Over 90
+ *    days there were 6 episodes of ≥3 consecutive failures for a pair that
+ *    then RECOVERED. Measuring each episode success-to-success (the exact
+ *    window this constant thresholds): max 17.64 h
+ *    (`refresh_mental_model`), median 8.70 h, min 2.01 h. 24 h clears the
+ *    longest observed self-heal by ~36 %, so a fault that resolves on its own
+ *    does not page on the way.
+ *  - **Ceiling — the incidents this must catch.** The two live
+ *    `graph_maintenance` episodes are the only ≥3 streaks in that 90-day
+ *    window that never recovered; both are 220 h since last success, ~9× this
+ *    line.
+ *
+ * The healthy p99 inter-completion gap for the sparsest type is 28.47 h,
+ * ABOVE this line — deliberately not the bound used, because a healthy idle
+ * pair has streak 0 and is never a candidate. The conjunction with
+ * `CONSOLIDATION_FAILURE_STREAK_WARN` is what makes that safe: this window
+ * only ever gets asked about a pair that has ALREADY failed ≥3 times in a row
+ * with no completion in between.
+ *
+ * The residual, accepted deliberately: a pair that was broken, was fixed, and
+ * has had no demand since will page 24 h after its last success, because
+ * nothing has run to prove the fix. That is the honest reading of the
+ * evidence — and unlike the recency guard it resolves the instant one op
+ * completes.
+ */
+export const CONSOLIDATION_STREAK_NO_SUCCESS_S = 24 * 60 * 60;
+
+/**
  * Per-bank unconsolidated depth: the floor below which GROWTH is not worth
  * scoring, and the growth thresholds themselves.
  *

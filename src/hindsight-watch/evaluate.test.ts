@@ -487,6 +487,7 @@ import {
 import {
   CONSOLIDATION_FAILURE_STREAK_PAGE,
   CONSOLIDATION_FAILURE_STREAK_WARN,
+  CONSOLIDATION_STREAK_NO_SUCCESS_S,
   CONSOLIDATION_STREAK_RECENCY_S,
   PENDING_CONSOLIDATION_FLOOR,
 } from "./thresholds.js";
@@ -566,12 +567,187 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
               operationType: "consolidation",
               streak: 500,
               newestFailureAgeS: CONSOLIDATION_STREAK_RECENCY_S + 1,
+              // Fixed: a completion landed after the streak, 10 minutes ago.
+              lastCompletedAgeS: 600,
             },
           ],
         }),
       }),
     ]);
     expect(v.state).toBe("ok");
+  });
+
+  // ── the sparse-job blind spot (#4620) ────────────────────────────────────
+  //
+  // Every fixture below is HARD-CODED in seconds, deliberately not derived
+  // from the constants it exercises: a fixture written as
+  // `CONSOLIDATION_STREAK_NO_SUCCESS_S + 1` moves with the constant and the
+  // test can then never fail for any value of it. The two pins at the top are
+  // the tripwire that keeps the literals honest.
+  describe("a SPARSE, demand-driven op type that is 100% broken", () => {
+    it("pins the constants these fixtures are written against", () => {
+      // If either of these changes, the literal fixtures below stop meaning
+      // what their comments say — re-derive them, do not retune this pin.
+      expect(CONSOLIDATION_STREAK_NO_SUCCESS_S).toBe(86_400); // 24h
+      expect(CONSOLIDATION_STREAK_RECENCY_S).toBe(7_200); // 2h
+      expect(CONSOLIDATION_FAILURE_STREAK_WARN).toBe(3);
+    });
+
+    it("FIRES on the live 2026-08-12 shape the old guard read as healthy", () => {
+      // Read verbatim off the production `state.json` + `async_operations`:
+      //   overlord | graph_maintenance | streak 19 | newest failure 133,977s
+      //             (37.2h) | last SUCCESS 791,908s (220h) ago
+      //   klanker  | graph_maintenance | streak  9 | newest failure 328,555s
+      //             (91.3h) | last SUCCESS 791,676s (220h) ago
+      // Both failed the 2h recency guard, so the candidate list emptied and
+      // the signal reported {"status":"ok","breaches":0} while the job was
+      // completely broken. `graph_maintenance` is not a cron — it runs only
+      // when work is enqueued — so it CANNOT produce a recent failure.
+      const v = evaluateConsolidationFailureStreak([
+        sample(0, {
+          consolidation: { pending: 0, oldestAgeS: 0 },
+          banks: banks({
+            streaks: [
+              {
+                bank: "klanker",
+                operationType: "graph_maintenance",
+                streak: 9,
+                newestFailureAgeS: 328_555,
+                lastCompletedAgeS: 791_676,
+              },
+              {
+                bank: "overlord",
+                operationType: "graph_maintenance",
+                streak: 19,
+                newestFailureAgeS: 133_977,
+                lastCompletedAgeS: 791_908,
+              },
+            ],
+          }),
+        }),
+      ]);
+      expect(v.state).toBe("breach");
+      expect(v.severity).toBe("page");
+      expect(v.measured?.bank).toBe("overlord");
+      expect(v.measured?.streak).toBe(19);
+      expect(v.measured?.operationType).toBe("graph_maintenance");
+      expect(v.measured?.lastCompletedAgeS).toBe(791_908);
+      // Both pairs breach, not just the worst one.
+      expect(v.measured?.breachingPairs).toBe(2);
+      expect(v.detail).toContain("klanker/graph_maintenance×9");
+    });
+
+    it("does NOT fire while a success is recent — the dense case is unchanged", () => {
+      // The exact shape the recency guard was added for: old failures, but the
+      // pair completed since. 23h < 24h, so the sparse arm must abstain and
+      // the old arm already rejects the 100h-old failure.
+      const v = evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({
+            streaks: [
+              {
+                bank: "overlord",
+                operationType: "consolidation",
+                streak: 500,
+                newestFailureAgeS: 360_000, // 100h
+                lastCompletedAgeS: 82_800, // 23h — inside the window
+              },
+            ],
+          }),
+        }),
+      ]);
+      expect(v.state).toBe("ok");
+      expect(v.measured?.streak).toBe(0);
+    });
+
+    it("fires the moment the no-success window is CROSSED, not before", () => {
+      const at = (lastCompletedAgeS: number) =>
+        evaluateConsolidationFailureStreak([
+          sample(0, {
+            banks: banks({
+              streaks: [
+                {
+                  bank: "overlord",
+                  operationType: "graph_maintenance",
+                  streak: 19,
+                  newestFailureAgeS: 133_977, // 37h — fails the recency arm
+                  lastCompletedAgeS,
+                },
+              ],
+            }),
+          }),
+        ]).state;
+      expect(at(86_399)).toBe("ok"); // 24h − 1s
+      expect(at(86_400)).toBe("ok"); // exactly 24h — strictly greater required
+      expect(at(86_401)).toBe("breach"); // 24h + 1s
+    });
+
+    it("breaches when the pair has NEVER completed — no success is not a fresh one", () => {
+      const v = evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({
+            streaks: [
+              {
+                bank: "newbank",
+                operationType: "graph_maintenance",
+                streak: 12,
+                newestFailureAgeS: 500_000,
+                lastCompletedAgeS: null,
+              },
+            ],
+          }),
+        }),
+      ]);
+      expect(v.state).toBe("breach");
+      expect(v.detail).toContain("last SUCCESS NEVER");
+    });
+
+    it("needs a real streak: 2 stale failures with no success are still not a breach", () => {
+      // The conjunction is what keeps the 24h window safe. A healthy sparse
+      // pair legitimately goes ~28h between completions (measured p99), so the
+      // window alone would be noise — it is only ever asked about a pair that
+      // has already failed ≥3 times in a row.
+      const at = (streak: number) =>
+        evaluateConsolidationFailureStreak([
+          sample(0, {
+            banks: banks({
+              streaks: [
+                {
+                  bank: "overlord",
+                  operationType: "graph_maintenance",
+                  streak,
+                  newestFailureAgeS: 133_977,
+                  lastCompletedAgeS: 791_908,
+                },
+              ],
+            }),
+          }),
+        ]);
+      expect(at(2).state).toBe("ok");
+      expect(at(2).measured?.streak).toBe(0); // not even a live candidate
+      expect(at(3).state).toBe("breach");
+      expect(at(3).severity).toBe("warn");
+    });
+
+    it("ABSTAINS on a row persisted before the field existed — unknown is not 'never'", () => {
+      // A state file written by an older build has no `lastCompletedAgeS`.
+      // Reading that as "never completed" would page on hydration alone.
+      const v = evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({
+            streaks: [
+              {
+                bank: "overlord",
+                operationType: "graph_maintenance",
+                streak: 19,
+                newestFailureAgeS: 133_977,
+              },
+            ],
+          }),
+        }),
+      ]);
+      expect(v.state).toBe("ok");
+    });
   });
 
   it("reports no-data — never a pass — when the per-bank block is missing", () => {

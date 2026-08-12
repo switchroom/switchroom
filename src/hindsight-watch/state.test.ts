@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   defaultStatePath,
   loadState,
+  normalizeBankSample,
   normalizeConsolidationSample,
   normalizeRecallSample,
   pushSample,
@@ -146,6 +147,45 @@ describe("normalizeConsolidationSample", () => {
     });
     expect(normalizeConsolidationSample({ pending: 77 })).toBeNull();
     expect(normalizeConsolidationSample({ pending: 77, oldestAgeS: Number.NaN })).toBeNull();
+  });
+});
+
+describe("normalizeBankSample — streak rows across a version upgrade", () => {
+  const row = (over: Record<string, unknown> = {}) => ({
+    bank: "overlord",
+    operationType: "graph_maintenance",
+    streak: 19,
+    newestFailureAgeS: 133_977,
+    ...over,
+  });
+
+  it("KEEPS a row written before `lastCompletedAgeS` existed, without inventing one", () => {
+    // Dropping the row would read as a SHORTER streak — health — on the
+    // upgrade tick, which is the failure mode this whole signal exists to
+    // end. Defaulting it to null would read as "never completed" and page.
+    const out = normalizeBankSample({ streaks: [row()], pending: [] });
+    expect(out?.streaks).toHaveLength(1);
+    expect(out?.streaks[0].lastCompletedAgeS).toBeUndefined();
+    expect("lastCompletedAgeS" in out!.streaks[0]).toBe(false);
+  });
+
+  it("round-trips both real states: a number and an explicit null", () => {
+    expect(
+      normalizeBankSample({ streaks: [row({ lastCompletedAgeS: 791_908 })], pending: [] })
+        ?.streaks[0].lastCompletedAgeS,
+    ).toBe(791_908);
+    expect(
+      normalizeBankSample({ streaks: [row({ lastCompletedAgeS: null })], pending: [] })?.streaks[0]
+        .lastCompletedAgeS,
+    ).toBeNull();
+  });
+
+  it("drops a row whose `lastCompletedAgeS` is garbage rather than trusting it", () => {
+    for (const bad of [-1, Number.NaN, "9412", {}]) {
+      expect(
+        normalizeBankSample({ streaks: [row({ lastCompletedAgeS: bad })], pending: [] })?.streaks,
+      ).toEqual([]);
+    }
   });
 });
 

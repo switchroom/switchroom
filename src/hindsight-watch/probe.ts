@@ -407,6 +407,15 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
  *    finite date would silently window the count; a pair whose very first
  *    op failed must still register a streak.
  *
+ * The row also carries the age of the pair's most recent `completed` op —
+ * EMPTY when the pair has never completed one. That is the field that lets
+ * the evaluator ask "has anything succeeded lately?" instead of only "is the
+ * newest failure recent?"; the latter cannot hold the streak of a sparse,
+ * demand-driven operation type whose failures are legitimately hours or days
+ * old while the job is 100 % broken. It comes out of the same subselect shape
+ * the streak definition already pays for, so the query does not get a second
+ * pass over `async_operations`.
+ *
  * ### The depth query
  *
  * `count(*) FILTER (WHERE consolidated_at IS NULL AND fact_type IN
@@ -419,6 +428,10 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
 const BANK_CONSOLIDATION_SH = `${PSQL_BOOTSTRAP_SH}
 PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
   "SELECT 'S|'||a.bank_id||'|'||a.operation_type||'|'||count(*)||'|'||extract(epoch from (now()-max(a.created_at)))::bigint
+          ||'|'||coalesce(extract(epoch from (now()-(SELECT max(c.created_at) FROM async_operations c
+                                                      WHERE c.bank_id = a.bank_id
+                                                        AND c.operation_type = a.operation_type
+                                                        AND c.status = 'completed')))::bigint::text, '')
      FROM async_operations a
     WHERE a.status = 'failed'
       AND a.created_at > coalesce((SELECT max(b.created_at) FROM async_operations b
@@ -570,11 +583,28 @@ export function probeBankConsolidation(
     const t = line.trim();
     if (t === "") continue;
     const f = t.split("|");
-    if (f[0] === "S" && f.length === 5) {
+    if (f[0] === "S" && f.length === 6) {
       const streak = Number(f[3]);
       const age = Number(f[4]);
       if (!Number.isFinite(streak) || !Number.isFinite(age) || streak < 0 || age < 0) continue;
-      streaks.push({ bank: f[1], operationType: f[2], streak, newestFailureAgeS: age });
+      // Empty means the pair has never completed an op — a real state, and a
+      // DIFFERENT one from "we could not read it", so it is carried as an
+      // explicit null rather than dropped. An unparseable value drops the ROW:
+      // admitting it as null would read as "never succeeded" and could page on
+      // a garbled field.
+      let lastCompletedAgeS: number | null = null;
+      if (f[5] !== "") {
+        const completedAge = Number(f[5]);
+        if (!Number.isFinite(completedAge) || completedAge < 0) continue;
+        lastCompletedAgeS = completedAge;
+      }
+      streaks.push({
+        bank: f[1],
+        operationType: f[2],
+        streak,
+        newestFailureAgeS: age,
+        lastCompletedAgeS,
+      });
       parsedAny = true;
     } else if (f[0] === "P" && f.length === 3) {
       const n = Number(f[2]);

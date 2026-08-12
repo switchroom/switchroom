@@ -239,10 +239,18 @@ describe("probeBankConsolidation", () => {
   it("parses the live incident output into streaks and per-bank depth", () => {
     const out = probeBankConsolidation(
       "c",
-      psql("S|overlord|consolidation|103|668\nP|overlord|38130\nP|carrie|45\nP|klanker|0\n"),
+      psql("S|overlord|consolidation|103|668|9412\nP|overlord|38130\nP|carrie|45\nP|klanker|0\n"),
     );
     expect(out).toEqual({
-      streaks: [{ bank: "overlord", operationType: "consolidation", streak: 103, newestFailureAgeS: 668 }],
+      streaks: [
+        {
+          bank: "overlord",
+          operationType: "consolidation",
+          streak: 103,
+          newestFailureAgeS: 668,
+          lastCompletedAgeS: 9412,
+        },
+      ],
       pending: [
         { bank: "overlord", pending: 38130 },
         { bank: "carrie", pending: 45 },
@@ -265,17 +273,65 @@ describe("probeBankConsolidation", () => {
   it("skips a malformed row but keeps the rows it understood", () => {
     const out = probeBankConsolidation(
       "c",
-      psql("S|weird|bank|with|pipes|x|9\nS|overlord|consolidation|7|30\nP|overlord|12\n"),
+      psql("S|weird|bank|with|pipes|x|9|1|2\nS|overlord|consolidation|7|30|61\nP|overlord|12\n"),
     );
     expect(out?.streaks).toEqual([
-      { bank: "overlord", operationType: "consolidation", streak: 7, newestFailureAgeS: 30 },
+      {
+        bank: "overlord",
+        operationType: "consolidation",
+        streak: 7,
+        newestFailureAgeS: 30,
+        lastCompletedAgeS: 61,
+      },
     ]);
     expect(out?.pending).toEqual([{ bank: "overlord", pending: 12 }]);
   });
 
+  it("carries an EMPTY last-completed field through as null — never completed", () => {
+    // A pair whose very first op failed has no completion to age from. Null is
+    // a real state and a different one from "unreadable": the evaluator treats
+    // it as no success ever, which is a breach, so it must not be conflated
+    // with the absent field an older state file carries.
+    const out = probeBankConsolidation("c", psql("S|newbank|graph_maintenance|4|900|\nP|newbank|3\n"));
+    expect(out?.streaks).toEqual([
+      {
+        bank: "newbank",
+        operationType: "graph_maintenance",
+        streak: 4,
+        newestFailureAgeS: 900,
+        lastCompletedAgeS: null,
+      },
+    ]);
+  });
+
+  it("parses the live 2026-08-12 sparse shape, last success 220h back", () => {
+    const out = probeBankConsolidation(
+      "c",
+      psql("S|overlord|graph_maintenance|19|133977|791908\nP|overlord|0\n"),
+    );
+    expect(out?.streaks).toEqual([
+      {
+        bank: "overlord",
+        operationType: "graph_maintenance",
+        streak: 19,
+        newestFailureAgeS: 133_977,
+        lastCompletedAgeS: 791_908,
+      },
+    ]);
+  });
+
+  it("DROPS a row whose last-completed field is garbage — a garbled field must not read as 'never'", () => {
+    expect(
+      probeBankConsolidation("c", psql("S|b|graph_maintenance|9|900|NaN\nP|b|4\n"))?.streaks,
+    ).toEqual([]);
+    expect(
+      probeBankConsolidation("c", psql("S|b|graph_maintenance|9|900|-1\nP|b|4\n"))?.streaks,
+    ).toEqual([]);
+  });
+
   it("rejects a negative or non-numeric count rather than trusting it", () => {
-    expect(probeBankConsolidation("c", psql("S|b|consolidation|-1|30\nP|b|4\n"))?.streaks).toEqual([]);
-    expect(probeBankConsolidation("c", psql("S|b|consolidation|NaN|30\nP|b|4\n"))?.streaks).toEqual([]);
+    expect(probeBankConsolidation("c", psql("S|b|consolidation|-1|30|60\nP|b|4\n"))?.streaks).toEqual([]);
+    expect(probeBankConsolidation("c", psql("S|b|consolidation|NaN|30|60\nP|b|4\n"))?.streaks).toEqual([]);
   });
 });
 

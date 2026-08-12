@@ -187,6 +187,19 @@ export function normalizeBankSample(x: unknown): Sample["banks"] {
   const streaks = b.streaks.filter((r): r is BankFailureStreak => {
     if (typeof r !== "object" || r === null) return false;
     const s = r as Record<string, unknown>;
+    // `lastCompletedAgeS` is deliberately tolerated as ABSENT: a state file
+    // written by a build older than the field would otherwise have every
+    // streak row dropped on the upgrade tick, and a dropped row reads as a
+    // SHORTER streak — health — not as blindness. Absent stays `undefined`,
+    // which is what makes the evaluator's sparse arm abstain rather than
+    // mistake "we never read this" for "never completed".
+    if (
+      s.lastCompletedAgeS !== undefined &&
+      s.lastCompletedAgeS !== null &&
+      !isCount(s.lastCompletedAgeS)
+    ) {
+      return false;
+    }
     return (
       typeof s.bank === "string" &&
       typeof s.operationType === "string" &&

@@ -78,6 +78,25 @@ now an anomaly worth investigating, not the norm.
   `{session_id, title, started_at, source}` — falling back to the bare
   `{session_id: null}` when there is no eligible session — rather than
   `{session}`, the key no caller was ever finding.
+- **hindsight-watch: a permanently-broken SPARSE operation type no longer
+  reads green for ever.** `consolidation-failure-streak` admitted a streak
+  only when its newest FAILURE was under 2 h old
+  (`CONSOLIDATION_STREAK_RECENCY_S`) — a proxy for "still broken" tuned
+  against `consolidation`, which failed every 87 s during the 2026-07-29
+  incident. A demand-driven job produces no new failures while it is broken,
+  so the proxy structurally cannot hold its streak: live on 2026-08-12,
+  `overlord/graph_maintenance` held a streak of 19 (page line is 10) whose
+  newest failure was 37 h old and `klanker/graph_maintenance` a streak of 9 at
+  91 h, both banks 220 h since their last successful op — and the signal
+  reported `{"status":"ok","breaches":0}`. The per-pair psql pass now also
+  reads the age of the pair's most recent `completed` op, and a streak counts
+  as live when EITHER the failure is recent (unchanged for dense jobs) OR the
+  streak has reached the warn line and nothing has succeeded for
+  `CONSOLIDATION_STREAK_NO_SUCCESS_S` (24 h, measured: the longest
+  self-resolving ≥3 streak on record spans 17.64 h success-to-success). Asking
+  "has anything SUCCEEDED lately?" instead of "is the failure recent?" still
+  clears the instant a completion lands, which is what the recency guard
+  existed to protect. (#4620)
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
