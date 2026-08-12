@@ -1969,6 +1969,174 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the graph-maintenance bounded-sweep fix (assert-guarded, fail-loud)", () => {
+    // #4604 (above) stopped Pass 3 WASTING time on a statement that could not
+    // finish; it did not make it finish. Measured read-only on the live fleet:
+    // the predicate alone takes 65.2s on a 517k-row bank against a 60s asyncpg
+    // command_timeout, before the sort, the locks and the DELETE. That cost
+    // grows with the bank, so the pass worked until it did not: overlord and
+    // klanker completed 849/779 runs through July 2026, then crossed the wall
+    // in the week of 2026-08-03 and have failed every run since. This block
+    // bounds it.
+    //
+    // Behaviour (RED against unpatched upstream / GREEN patched) is proven in
+    // tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts. This pins
+    // only the shape a grep can see.
+
+    // The block must come AFTER the retry-storm block: its graph_maintenance
+    // anchors are that block's REPLACEMENT text, so a reordering breaks the
+    // build. Assert the order rather than trusting it.
+    expect(
+      dockerfile.indexOf(
+        'TAG = "switchroom hindsight graph-maintenance retry-storm patch"',
+      ),
+    ).toBeLessThan(
+      dockerfile.indexOf(
+        'TAG = "switchroom hindsight graph-maintenance bounded sweep patch"',
+      ),
+    );
+
+    // ---- B1: the statement is bounded by a LIMIT that is a BOUND PARAMETER.
+    // Interpolating the cap into the SQL text would still grep as "has a LIMIT"
+    // while making the adaptive shrink below impossible.
+    expect(dockerfile).toContain('"                LIMIT $6::int\\n"');
+    expect(dockerfile).toContain('"            WITH page AS MATERIALIZED (\\n"');
+    // …and the LIMIT is only a correct page because of the ORDER BY directly
+    // above it. An unordered LIMIT returns an ARBITRARY batch_size rows, and
+    // the caller then advances its cursor to the MAX key of that arbitrary set
+    // — so every qualifying row sorting below that max but absent from the page
+    // is skipped for the rest of the slice pass, with no short page, no error
+    // and a plausible `scanned` count. A small fixture hides it (the planner
+    // picks the PK index scan and the rows come out sorted by luck); a bitmap
+    // heap or parallel seq scan on a 500k-row bank does not. Pin the two lines
+    // as an ADJACENT PAIR: pinned separately, the ORDER BY could be moved out
+    // of the page CTE with this test still green.
+    expect(dockerfile).toContain(
+      '"                ORDER BY c.entity_id_1, c.entity_id_2\\n"\n' +
+        '    "                LIMIT $6::int\\n"',
+    );
+    expect(dockerfile).toMatch(
+      /the page CTE's `ORDER BY c\.entity_id_1, c\.entity_id_2` \+ `LIMIT \$6::int` /,
+    );
+    // Both ordered scans must survive — the page CTE's keyset order and the
+    // #2529 ordered lock's sort.
+    expect(dockerfile).toMatch(/the sweep no longer has BOTH ordered scans/);
+    // …and symmetrically for the victims CTE: its ORDER BY is only the #2529
+    // ordered lock because it sits directly above `FOR UPDATE OF c`. A count of
+    // two ordered scans cannot see the two-edit defeat — delete the victims
+    // ORDER BY, re-add an identical line elsewhere in the statement, and the
+    // count still reads 2 while the lock is taken in scan order (i.e. in no
+    // order at all), which is exactly the deadlock #2529 fixed. Pin the pair,
+    // not the population.
+    expect(dockerfile).toContain(
+      '"                ORDER BY c.entity_id_1, c.entity_id_2\\n"\n' +
+        '    "                FOR UPDATE OF c\\n"',
+    );
+    expect(dockerfile).toMatch(/ADJACENT to its `FOR UPDATE OF c`/);
+    // The keyset cursor and the rotating hash slice.
+    expect(dockerfile).toContain(
+      "(c.entity_id_1, c.entity_id_2) > (\\n",
+    );
+    expect(dockerfile).toContain("md5(c.entity_id_1::text), 1, 4");
+    // The build-time assert pins the slice filter as a WHOLE EXPRESSION, not as
+    // two independent substrings: `AND 0 * ('x' || substr(md5(…), 1, 4))
+    // ::bit(16)::int % $4::int = $5::int` satisfies both substrings and puts
+    // every row in slice 0.
+    expect(dockerfile).toMatch(
+      /the slice filter is not the exact whole expression this patch ships/,
+    );
+    expect(dockerfile).toContain(
+      '"\\n                  AND (\'x\' || substr(md5(c.entity_id_1::text), 1, 4))"\n' +
+        '    "::bit(16)::int % $4::int = $5::int\\n"',
+    );
+
+    // The bound must NOT have been bought by weakening the sweep: the #2473
+    // INTERSECT predicate and the #2529 ordered lock are upstream's, unchanged.
+    expect(dockerfile).toMatch(/the #2529 ordered lock did not survive/);
+    expect(dockerfile).toMatch(
+      /the #2473 INTERSECT predicate was replaced — a semi-join rewrite measured/,
+    );
+
+    // ---- B2: the caller must LOOP and the cursor must ADVANCE. A single
+    // bounded page that never pages again would silently stop pruning most of
+    // the bank while looking correct in the diff.
+    expect(dockerfile).toContain('"_SWEEP_BATCH_SIZE = 1000\\n"');
+    expect(dockerfile).toContain('"_SWEEP_MIN_BATCH_SIZE = 50\\n"');
+    expect(dockerfile).toContain('"_SWEEP_SLICE_TARGET_ROWS = 25000\\n"');
+    expect(dockerfile).toContain('"_SWEEP_MAX_SLICE_COUNT = 24\\n"');
+    // The decorrelation window. It is NOT a cadence: runs that land inside the
+    // same window compute the same slice index, so the later ones re-sweep what
+    // the first just swept. Measured over 30 days of async_operations, a 1800 s
+    // window held 3.95 (overlord) / 3.60 (klanker) runs — ~75% duplicate work —
+    // against a median inter-arrival gap of 197 s / 250 s, which is what 120 s
+    // is derived from.
+    expect(dockerfile).toContain('"_SWEEP_SLICE_SECONDS = 120\\n"');
+    expect(dockerfile).toContain('"_SWEEP_MAX_PAGES = 2000\\n"');
+    // How many slices is DERIVED FROM BANK SIZE, not fixed. `graph_maintenance`
+    // is demand-driven (`submit_async_graph_maintenance` fires on retain /
+    // delete / edit, and short-circuits on an empty queue — there is no timer),
+    // so coverage is coupon-collector, not a cycle: a fixed 24 would put the
+    // fleet's quiet banks on an expected-full-coverage latency of weeks to
+    // months, to fix a timeout only the two largest banks ever had.
+    expect(dockerfile).toContain(
+      "int(now) // _SWEEP_SLICE_SECONDS % slice_count",
+    );
+    expect(dockerfile).toContain('"    if total_rows <= _SWEEP_SLICE_TARGET_ROWS:\\n"');
+    expect(dockerfile).toContain('"        slice_count = _sweep_slice_count(total_rows)\\n"');
+    // …and a fixed count must not come back.
+    expect(dockerfile).not.toContain("_SWEEP_SLICE_COUNT = ");
+    expect(dockerfile).toMatch(/the paging loop no longer terminates on a short page/);
+    expect(dockerfile).toMatch(/the cursor is never advanced/);
+
+    // ---- B3: shrink-and-retry, and it must retry the SAME cursor. A version
+    // that shrinks but advances skips exactly the rows it failed on, for ever —
+    // the build asserts the `continue` precedes the cursor advance.
+    expect(dockerfile).toContain(
+      "batch_size = max(_SWEEP_MIN_BATCH_SIZE, batch_size // 2)",
+    );
+    expect(dockerfile).toMatch(
+      /shrink-and-retry must re-run the SAME cursor, not advance past the page it failed on/,
+    );
+    // #4604's opt-out must survive, or the timeout reaches the shrink only
+    // after nine full-cost attempts.
+    expect(dockerfile).toMatch(
+      /#4604's timeout opt-out was dropped from the loop/,
+    );
+
+    // Per-page transactions are load-bearing: a page that times out must not
+    // roll back the pages that already committed, or a slice whose late pages
+    // are slow makes NO progress at all, run after run. Pin the whole nesting —
+    // acquire, THEN transaction, THEN the call — because pinning the acquire
+    // alone leaves the transaction removable with the suite still green.
+    expect(dockerfile).toContain(
+      '"            async with acquire_with_retry(backend) as conn:\\n"\n' +
+        '    "                async with conn.transaction():\\n"\n' +
+        '    "                    return await store.prune_stale_cooccurrences(\\n"',
+    );
+    // The image build re-checks it as a post-condition on the patched file, so
+    // this cannot be satisfied by a comment that says the right thing.
+    expect(dockerfile).toMatch(/each page must be its OWN transaction/);
+
+    // Every backend implements the new return shape, including the ones that
+    // opt out of paging by reporting scanned=0.
+    expect(dockerfile).toContain("class CooccurrenceSweepBatch:");
+    expect(dockerfile).toMatch(
+      /does not import\/return the page result type/,
+    );
+
+    // Post-replace verification: every patched file must still parse.
+    expect(dockerfile).toContain('"engine/db/ops.py",\n    "engine/db/ops_postgresql.py",');
+    expect(dockerfile).toContain('"engine/memories/pg/graph.py",');
+    // The block's TAG is what the behavioural probe test greps the block out
+    // by, so it must not drift.
+    expect(dockerfile).toContain(
+      'TAG = "switchroom hindsight graph-maintenance bounded sweep patch"',
+    );
+    expect(dockerfile).toMatch(
+      /\{TAG\}: Pass 3 now sweeps bounded keyset pages/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the
