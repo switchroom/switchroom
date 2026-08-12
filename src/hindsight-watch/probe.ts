@@ -406,9 +406,20 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
  *  - **Grouped by the PAIR, not the bank.** During the incident `overlord`
  *    completed 3,753 retains while its consolidation failed 112 times; a
  *    bank-wide streak would have been reset by every one of them.
- *  - **`-infinity` for a pair that has never completed.** `coalesce` to a
- *    finite date would silently window the count; a pair whose very first
- *    op failed must still register a streak.
+ *  - **`-infinity` for a pair that has never completed, FLOORED at the
+ *    retention horizon.** `coalesce` to a fixed finite date would silently
+ *    window the count, and a pair whose very first op failed must still
+ *    register a streak — which is why the fallback is `-infinity` and not a
+ *    constant. But an UNBOUNDED fallback counts failures that predate a
+ *    completion which has since been swept: `docker/hindsight-maintenance.sh`
+ *    deletes `status='completed'` rows older than the retention horizon and,
+ *    per its own header, NEVER touches failed rows. So a pair that succeeded
+ *    35 days ago and failed 40 days ago reads as "112 consecutive failures,
+ *    never completed" — a page nothing can ever clear, because nothing is
+ *    left to complete (#4620). `greatest(…, now() - retention)` bounds the
+ *    scan to the window in which the two halves of a streak are still
+ *    comparable. See {@link bankConsolidationQuery} for where the horizon
+ *    comes from and what it does and does not close.
  *
  * The row also carries the age of the pair's most recent `completed` op —
  * EMPTY when the pair has never completed one. That is the field that lets
@@ -431,24 +442,95 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
  * fetched over N HTTP calls: measured 0.284 s for the whole fleet, against
  * ~1.4-2.1 s PER BANK for the `/stats` endpoint.
  */
-const BANK_CONSOLIDATION_SH = `${PSQL_BOOTSTRAP_SH}
-PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
-  "SELECT 'S|'||a.bank_id||'|'||a.operation_type||'|'||count(*)||'|'||extract(epoch from (now()-max(a.created_at)))::bigint
+/**
+ * The streak + depth statement, with the retention floor left as a SQL
+ * expression the caller supplies.
+ *
+ * ### Why the floor is a parameter, and where the value comes from
+ *
+ * The floor closes #4620 only if it is the SAME horizon the pruner uses.
+ * `docker/hindsight-maintenance.sh:63` reads
+ * `SWITCHROOM_HINDSIGHT_RETENTION_DAYS` (default 30) from its own process
+ * environment, and that script runs INSIDE the hindsight container
+ * (`docker/hindsight-entrypoint.sh:82`). This probe reaches the same table
+ * through `docker exec` on the same container, and `docker exec` inherits the
+ * container's environment — verified live: `HINDSIGHT_API_PORT` reads back
+ * `18888` through `docker exec`, and `SWITCHROOM_HINDSIGHT_RETENTION_DAYS`
+ * reads back unset, which is exactly what the fleet has and why the pruner is
+ * on its 30-day default.
+ *
+ * So the shell expands the knob itself rather than this module hard-coding a
+ * number. A hard-coded 30 would be silently wrong on precisely the deployment
+ * that tuned the knob: at `RETENTION_DAYS=7`, completions in the 7–30 day band
+ * are already deleted while failures in that band would still be swept into
+ * the streak, and #4620 survives in miniature. Deriving it costs one `case`
+ * statement and cannot drift.
+ *
+ * Two guards on the expansion, because it is spliced into SQL:
+ *
+ *  - **Non-numeric → 30.** The value is `case`-matched against `*[!0-9]*` and
+ *    replaced with the documented default. This is what makes the splice safe
+ *    rather than an injection point; it is also the pruner's own behaviour, in
+ *    the sense that `make_interval(days => garbage)` fails there too and the
+ *    prune silently no-ops.
+ *  - **Clamped to ≥ 1 day.** `RETENTION_DAYS=0` prunes every completion on
+ *    sight; a 0-day floor would be `now()`, which would empty the candidate
+ *    list and DELETE this signal. One day is the tightest floor that still
+ *    lets a genuinely live streak register.
+ *
+ * ### What the floor closes, and what it does not
+ *
+ * It closes the unbounded case: a pair whose failures are ALL older than the
+ * horizon drops out of the candidate list entirely (no row, streak 0), so a
+ * retired pair cannot page for ever off failures whose matching completions
+ * were swept.
+ *
+ * It does NOT make a pre-sweep streak invisible while those failures are still
+ * inside the window. A pair that last succeeded 35 days ago and failed 20 days
+ * ago still reports 20-day-old failures with no visible completion, and the
+ * evaluator's null arm still pages on it. That page is now BOUNDED — it clears
+ * when the failures themselves cross the horizon — instead of permanent, which
+ * is the whole of the defect. Making it invisible sooner would need the
+ * evaluator to distinguish "swept success" from "never succeeded", and the two
+ * are indistinguishable by construction once the row is gone.
+ */
+export function bankConsolidationQuery(retentionDaysSql: string): string {
+  return `SELECT 'S|'||a.bank_id||'|'||a.operation_type||'|'||count(*)||'|'||extract(epoch from (now()-max(a.created_at)))::bigint
           ||'|'||coalesce(extract(epoch from (now()-(SELECT max(c.created_at) FROM async_operations c
                                                       WHERE c.bank_id = a.bank_id
                                                         AND c.operation_type = a.operation_type
                                                         AND c.status = 'completed')))::bigint::text, '')
      FROM async_operations a
     WHERE a.status = 'failed'
-      AND a.created_at > coalesce((SELECT max(b.created_at) FROM async_operations b
-                                    WHERE b.bank_id = a.bank_id
-                                      AND b.operation_type = a.operation_type
-                                      AND b.status = 'completed'), '-infinity'::timestamptz)
+      AND a.created_at > greatest(coalesce((SELECT max(b.created_at) FROM async_operations b
+                                             WHERE b.bank_id = a.bank_id
+                                               AND b.operation_type = a.operation_type
+                                               AND b.status = 'completed'), '-infinity'::timestamptz),
+                                  now() - make_interval(days => ${retentionDaysSql}))
     GROUP BY a.bank_id, a.operation_type
     UNION ALL
    SELECT 'P|'||m.bank_id||'|'||count(*) FILTER (WHERE m.consolidated_at IS NULL AND m.fact_type IN ('experience','world'))
      FROM memory_units m
-    GROUP BY m.bank_id"
+    GROUP BY m.bank_id`;
+}
+
+/**
+ * Resolve `$RD`, the retention horizon in days, from the SAME environment
+ * variable the pruner reads — see {@link bankConsolidationQuery} for why it is
+ * derived rather than hard-coded, and for the two guards below.
+ *
+ * Exported so its behaviour can be tested by running it, rather than by
+ * reading it: it is three lines of `sh` and the interesting cases (garbage, 0,
+ * unset) are exactly the ones a static assertion would get wrong.
+ */
+export const RETENTION_DAYS_SH = `RD="\${SWITCHROOM_HINDSIGHT_RETENTION_DAYS:-30}"
+case "$RD" in ''|*[!0-9]*) RD=30 ;; esac
+[ "$RD" -ge 1 ] 2>/dev/null || RD=1`;
+
+export const BANK_CONSOLIDATION_SH = `${PSQL_BOOTSTRAP_SH}
+${RETENTION_DAYS_SH}
+PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
+  "${bankConsolidationQuery("$RD")}"
 `;
 
 /**

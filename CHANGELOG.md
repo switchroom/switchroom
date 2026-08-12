@@ -52,6 +52,28 @@ now an anomaly worth investigating, not the norm.
   timestamp is not evidence of age, and such findings score recency 0 so they
   cannot float to the top on their own.
 
+- **hindsight-watch: `consolidation-failure-streak` can no longer count
+  failures that predate a completion the retention prune deleted (#4620), and
+  its recency boundary is pinned (#4621).** `docker/hindsight-maintenance.sh`
+  deletes `status='completed'` rows past `SWITCHROOM_HINDSIGHT_RETENTION_DAYS`
+  and, per its own header, never touches failed ones — measured live on the
+  production bank: oldest `completed` row 30.01 days, oldest `failed` row 25.16
+  days and ageing without bound. So the streak query's unbounded
+  `coalesce(…, '-infinity')` fallback swept in every historical failure once a
+  pair's successes aged out, reporting a large streak with no completion on
+  record. The evaluator's null arm cannot discriminate that shape (those
+  retained failures are ancient by construction), so it would have paged for
+  ever on a bank that is merely idle, with nothing left that could ever
+  complete to clear it. The failure scan is now floored at the SAME horizon the
+  pruner uses — read from the container's own env at probe time rather than
+  hard-coded, so an operator who lowers retention moves the floor with it — and
+  a pair whose failures have all aged past that horizon drops out of the
+  candidate list entirely. Behaviour-neutral on the fleet today: the fixed and
+  unbounded statements return byte-identical rows against production. Separately,
+  the recency arm's `newestFailureAgeS <= CONSOLIDATION_STREAK_RECENCY_S`
+  survived mutation to `<` with the suite green; a 7,199 / 7,200 / 7,201 s
+  boundary trio now pins it.
+
 - **hermes adapter: stop reporting success for writes and reads that never
   happened.** The REST handler's `/api/cron` and `/api/profiles` prefix
   branches both ended in a catch-all `return {status: 200, body: {}}`, which

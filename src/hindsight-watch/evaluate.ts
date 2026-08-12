@@ -924,18 +924,22 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *    failed/pending/processing rows**. So the two halves of a streak age
  *    differently: successes are swept, the failures that define the streak are
  *    immortal. `null` can therefore mean "the successes were deleted while the
- *    failures were kept", and the streak query's `coalesce(…, '-infinity')`
- *    then counts failures that predate a completion which no longer exists.
+ *    failures were kept", and an unbounded `coalesce(…, '-infinity')` would
+ *    then count failures that predate a completion which no longer exists.
  *
  *    The null arm carries the same age evidence the numeric arm does rather
  *    than firing on absence alone, which covers the honest cases — a new pair,
- *    or a pair still actively retrying. It does NOT cover the asymmetry: those
- *    retained failures are ancient by construction, so an age guard cannot
- *    discriminate them. The residual is a bank that still exists and has been
- *    idle on one op type past the retention window; a deleted bank takes its
- *    rows with it via the cascade-delete migration. It is latent — no such pair
- *    exists on the production bank — and closing it belongs in the streak
- *    query, by bounding the failure scan to the retention horizon, not here.
+ *    or a pair still actively retrying. It cannot cover the asymmetry itself:
+ *    those retained failures are ancient by construction, so an age guard here
+ *    cannot discriminate them. That is closed one layer down instead (#4620):
+ *    the streak scan is floored at the SAME retention horizon the pruner uses
+ *    (`bankConsolidationQuery` in `probe.ts`), so a pair whose failures are all
+ *    older than the horizon produces no row at all and can never reach this
+ *    function. What survives is bounded rather than permanent: a pair whose
+ *    successes were swept while its failures are still INSIDE the window does
+ *    still page here, and that page clears when those failures cross the
+ *    horizon. Distinguishing "swept success" from "never succeeded" inside the
+ *    window is impossible once the row is gone.
  */
 function lastSuccessPhrase(lastCompletedAgeS: number | null | undefined): string {
   if (lastCompletedAgeS === undefined) return "unknown (state predates the field)";

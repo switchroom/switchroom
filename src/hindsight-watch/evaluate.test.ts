@@ -830,6 +830,40 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
     });
   });
 
+  // ── the recency arm's own boundary (#4621) ───────────────────────────────
+  //
+  // Pre-existing on `main`: `newestFailureAgeS <= CONSOLIDATION_STREAK_RECENCY_S`
+  // survived mutation to `<` with the whole suite green — nothing pinned a
+  // streak whose newest failure is EXACTLY 7,200 s old. The mutation is
+  // behaviourally real: at the boundary the `<` variant drops through to the
+  // sparse arm, where this pair (a recent success) reads `ok` instead of
+  // `breach`. Same discipline as the block above — literal seconds, pinned
+  // against the constant rather than derived from it.
+  it("holds a streak whose newest failure is EXACTLY at the recency line", () => {
+    expect(CONSOLIDATION_STREAK_RECENCY_S).toBe(7_200); // 2h — the fixtures below are written against this
+    const at = (newestFailureAgeS: number) =>
+      evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({
+            streaks: [
+              {
+                bank: "overlord",
+                operationType: "consolidation",
+                streak: 5,
+                newestFailureAgeS,
+                // A success 1h ago, so the SPARSE arm cannot fire and the
+                // recency arm is the only thing deciding this verdict.
+                lastCompletedAgeS: 3_600,
+              },
+            ],
+          }),
+        }),
+      ]).state;
+    expect(at(7_199)).toBe("breach"); // inside the window
+    expect(at(7_200)).toBe("breach"); // exactly at it — the comparison is inclusive
+    expect(at(7_201)).toBe("ok"); // past it, with no other arm satisfied
+  });
+
   it("reports no-data — never a pass — when the per-bank block is missing", () => {
     expect(evaluateConsolidationFailureStreak([sample(0)]).state).toBe("no-data");
     expect(evaluateConsolidationFailureStreak([sample(0, { banks: null })]).state).toBe("no-data");

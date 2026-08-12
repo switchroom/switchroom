@@ -1129,21 +1129,28 @@ export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
  * the status quo of *never*, and against a 24 h line that a measured 27.67 h
  * self-heal would have false-paged.
  *
- * **The retention asymmetry leaves a second, LATENT residual.** Because
- * completions are pruned at 30 days while failures are immortal, a
+ * **The retention asymmetry left a second residual, since closed (#4620).**
+ * Because completions are pruned at 30 days while failures are immortal, a
  * `lastCompletedAgeS` of `null` does not symmetrically mean "no completion in
  * the retention window" — it can mean the successes were swept while the
- * failures defining the streak were kept, and the streak query's
- * `coalesce(…, '-infinity')` then counts every historical failure, including
+ * failures defining the streak were kept, and an unbounded
+ * `coalesce(…, '-infinity')` then counted every historical failure, including
  * ones that predate a now-deleted success. The `newestFailureAgeS` guard on
  * the null arm cannot catch that, because those retained failures are ancient
- * by construction. The exposure is a bank that still EXISTS but has been idle
- * on one op type for longer than the retention window; a deleted bank takes
- * its rows with it via the cascade-delete migration. Latent, not live:
- * simulating the prune at 5- and 12-day horizons surfaces no pair other than
- * the two live `graph_maintenance` ones. Closing it properly belongs in the
- * streak query — bounding the failure scan to the retention horizon — not in
- * the evaluator, and is tracked separately rather than widened into this fix.
+ * by construction. It is fixed where the issue said it belonged — in the
+ * streak query, not here: the failure scan is now floored at the SAME horizon
+ * the pruner uses, read from `SWITCHROOM_HINDSIGHT_RETENTION_DAYS` in the
+ * hindsight container rather than hard-coded (see `bankConsolidationQuery` in
+ * `probe.ts`), so a pair whose failures have all aged past the horizon never
+ * reaches this constant at all. No new threshold is introduced by that fix,
+ * deliberately: the horizon is an operator knob with a documented default, not
+ * a measured rate, and duplicating it here as a constant would be the drift
+ * the fix exists to avoid.
+ *
+ * The floor bounds the exposure rather than erasing it. A pair whose successes
+ * were swept while its failures are still INSIDE the window still breaches on
+ * the null arm, and that breach now clears when those failures cross the
+ * horizon instead of persisting for ever.
  *
  * That is a documented limitation, not a safety claim: the alternative is the
  * status quo, where a permanently-broken sparse type reads green for ever.
