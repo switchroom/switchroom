@@ -7,7 +7,11 @@
  * messages and an assertion about ORDER or about which slice came back passes
  * vacuously there. Ordering and offset windowing are exactly the properties
  * that need real rows, and the turns DB is `bun:sqlite` — hence a bun test
- * (vitest excludes it; see vitest.config.ts).
+ * (vitest excludes it; see vitest.config.ts). It lives under
+ * telegram-plugin/tests/ rather than beside the adapter because that is the only
+ * tree the bun CI job walks — `bun test` runs with cwd telegram-plugin/, so a
+ * root-level src/ bun test is executed by NEITHER runner
+ * (scripts/check-test-runner-coverage.mjs, and the debt list it guards).
  *
  * Upstream contract being asserted (`hermes_cli/web_routers/sessions.py:601-651`
  * at 9da6d455c9e1f2bf74bb9f47766ee9fc52e17bfb):
@@ -26,9 +30,9 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openTurnsDb } from "../../telegram-plugin/registry/turns-schema.js";
-import { handleHermesRest, type HermesRestResult } from "./hermes-adapter.js";
-import type { SwitchroomConfig } from "../config/schema.js";
+import { openTurnsDb } from "../registry/turns-schema.js";
+import { handleHermesRest, type HermesRestResult } from "../../src/web/hermes-adapter.js";
+import type { SwitchroomConfig } from "../../src/config/schema.js";
 
 const AGENT = "alpha";
 let agentsDir = "";
