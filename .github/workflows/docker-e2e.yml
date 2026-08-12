@@ -128,6 +128,11 @@ jobs:
             # would get no probe run until the merge queue.
             hindsight:
               - 'docker/Dockerfile.hindsight'
+              # Every probe runner below drives docker through this helper, so
+              # a change to it changes how all of them execute. Listed for the
+              # same reason as the Dockerfile: the hindsight-probe job is gated
+              # on this filter, not on `vitest --changed`.
+              - 'tests/docker/_exec-async.ts'
               - 'docker/hindsight-entrypoint.sh'
               - 'src/setup/hindsight-pg-defaults.ts'
               - 'tests/docker/hindsight-pg-fsync-probe.test.ts'

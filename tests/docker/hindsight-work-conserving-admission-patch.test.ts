@@ -77,6 +77,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -626,12 +627,10 @@ type ProbeResult = { status: number; stdout: string };
  * self-verifying — a non-zero exit on application means upstream drifted and
  * the patch must be re-authored, surfaced here as a test failure.
  */
-function runProbe(image: string, role: string, blocks: string[]): ProbeResult {
+async function runProbe(image: string, role: string, blocks: string[]): Promise<ProbeResult> {
   const name = `sr-hs-wc-${role}-${RUN_ID.slice(0, 8)}`;
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -647,23 +646,14 @@ function runProbe(image: string, role: string, blocks: string[]): ProbeResult {
         image,
         "sleep",
         "300",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
+      ]);
 
     for (const block of blocks) {
-      execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
-        input: block,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      await execFileAsync("docker", ["exec", "-i", name, "python3", "-"], { input: block });
     }
 
-    const res = execFileSync(
-      "docker",
-      ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
-      { input: PROBE, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" }
-    );
-    return { status: 0, stdout: res };
+    const res = await execFileAsync("docker", ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"], { input: PROBE });
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -672,7 +662,7 @@ function runProbe(image: string, role: string, blocks: string[]): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -758,8 +748,8 @@ describe.skipIf(!dockerOk || !upstreamOk)(
       }
     });
 
-    it("unpatched upstream is RED: no priority — foreground queues FIFO behind the drain", () => {
-      const { status, stdout } = runProbe(UPSTREAM_IMAGE, "upstream", []);
+    it("unpatched upstream is RED: no priority — foreground queues FIFO behind the drain", async () => {
+      const { status, stdout } = await runProbe(UPSTREAM_IMAGE, "upstream", []);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
@@ -774,8 +764,8 @@ describe.skipIf(!dockerOk || !upstreamOk)(
       expect(stdout).toContain("NO PRIORITY: a foreground recall waited");
     }, 240_000);
 
-    it("the strict reservation (today's shipping behaviour) is RED: not work-conserving", () => {
-      const { status, stdout } = runProbe(
+    it("the strict reservation (today's shipping behaviour) is RED: not work-conserving", async () => {
+      const { status, stdout } = await runProbe(
         UPSTREAM_IMAGE,
         "strict",
         patchBlocks([SPLIT_BLOCK])
@@ -796,8 +786,8 @@ describe.skipIf(!dockerOk || !upstreamOk)(
       expect(stdout).toMatch(/PRIORITY_BG_INFLIGHT_AT_SUBMIT 2 FG_WAIT 0\.0\d+s/);
     }, 240_000);
 
-    it("split + gate is GREEN: work-conserving AND priority AND every safety property", () => {
-      const { status, stdout } = runProbe(
+    it("split + gate is GREEN: work-conserving AND priority AND every safety property", async () => {
+      const { status, stdout } = await runProbe(
         UPSTREAM_IMAGE,
         "gate",
         patchBlocks([SPLIT_BLOCK, WC_BLOCK])
@@ -863,8 +853,8 @@ describe.skipIf(!dockerOk || !builtOk)(
       }
     });
 
-    it("the shipping bytes carry the gate AND preserve the #4212 rerank-lane invariants", () => {
-      const { status, stdout } = runProbe(BUILT_IMAGE, "built", []);
+    it("the shipping bytes carry the gate AND preserve the #4212 rerank-lane invariants", async () => {
+      const { status, stdout } = await runProbe(BUILT_IMAGE, "built", []);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );

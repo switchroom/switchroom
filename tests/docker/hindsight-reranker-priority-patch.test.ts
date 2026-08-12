@@ -78,6 +78,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -418,12 +419,10 @@ type ProbeResult = { status: number; stdout: string };
  * has #3142 baked on top of every prerequisite switchroom patch exactly as it
  * ships. `role` only names the container for debuggability.
  */
-function runProbe(image: string, role: string): ProbeResult {
+async function runProbe(image: string, role: string): Promise<ProbeResult> {
   const name = `sr-hs-rerank-${role}-${RUN_ID.slice(0, 8)}`;
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -439,16 +438,10 @@ function runProbe(image: string, role: string): ProbeResult {
         image,
         "sleep",
         "300",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
+      ]);
 
-    const res = execFileSync(
-      "docker",
-      ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
-      { input: PROBE, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" }
-    );
-    return { status: 0, stdout: res };
+    const res = await execFileAsync("docker", ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"], { input: PROBE });
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -457,7 +450,7 @@ function runProbe(image: string, role: string): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -524,8 +517,8 @@ describe.skipIf(!dockerOk || !upstreamOk)(
   () => {
     afterAll(teardownRun);
 
-    it("unpatched upstream is RED (no priority pool, no background kwarg)", () => {
-      const { status, stdout } = runProbe(UPSTREAM_IMAGE, "upstream");
+    it("unpatched upstream is RED (no priority pool, no background kwarg)", async () => {
+      const { status, stdout } = await runProbe(UPSTREAM_IMAGE, "upstream");
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
@@ -549,8 +542,8 @@ describe.skipIf(!dockerOk || !builtOk)(
   () => {
     afterAll(teardownRun);
 
-    it("through-built #3142 image is GREEN, priority ordering and all", () => {
-      const { status, stdout } = runProbe(BUILT_IMAGE, "built");
+    it("through-built #3142 image is GREEN, priority ordering and all", async () => {
+      const { status, stdout } = await runProbe(BUILT_IMAGE, "built");
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );

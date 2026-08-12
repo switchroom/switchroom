@@ -70,6 +70,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -398,15 +399,13 @@ const PG0 =
 type ProbeResult = { status: number; stdout: string };
 
 /** Run the probe in a throwaway container, optionally patching first. */
-function runProbe(patched: boolean): ProbeResult {
+async function runProbe(patched: boolean): Promise<ProbeResult> {
   const name = `sr-hs-refdir-${patched ? "patched" : "upstream"}-${RUN_ID.slice(
     0,
     8
   )}`;
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -422,31 +421,20 @@ function runProbe(patched: boolean): ProbeResult {
         UPSTREAM_IMAGE,
         "sleep",
         "600",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
+      ]);
 
     if (patched) {
       // The block is self-verifying: it asserts its upstream anchors exist
       // exactly once and re-asserts the result, so a non-zero exit here means
       // upstream drifted and the patch must be re-authored.
-      execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
-        input: patchBlock(),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      await execFileAsync("docker", ["exec", "-i", name, "python3", "-"], { input: patchBlock() });
     }
 
     // A real database, bundled in the image and started offline. postgres
     // refuses to run as root, so this and the probe run as `hindsight`.
-    execFileSync(
-      "docker",
-      ["exec", "-u", "hindsight", "-e", "HOME=/home/hindsight", name, PG0, "start"],
-      { stdio: ["ignore", "pipe", "pipe"] }
-    );
+    await execFileAsync("docker", ["exec", "-u", "hindsight", "-e", "HOME=/home/hindsight", name, PG0, "start"]);
 
-    const res = execFileSync(
-      "docker",
-      [
+    const res = await execFileAsync("docker", [
         "exec",
         "-i",
         "-u",
@@ -458,10 +446,8 @@ function runProbe(patched: boolean): ProbeResult {
         name,
         "/app/api/.venv/bin/python",
         "-",
-      ],
-      { input: PROBE, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" }
-    );
-    return { status: 0, stdout: res };
+      ], { input: PROBE });
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -470,7 +456,7 @@ function runProbe(patched: boolean): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -530,8 +516,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("unpatched upstream is RED: a tagged directive never reaches reflect", () => {
-      const { status, stdout } = runProbe(false);
+    it("unpatched upstream is RED: a tagged directive never reaches reflect", async () => {
+      const { status, stdout } = await runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
@@ -563,8 +549,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       );
     }, 300_000);
 
-    it("upstream + the baked patch block is GREEN, and tag scoping is untouched", () => {
-      const { status, stdout } = runProbe(true);
+    it("upstream + the baked patch block is GREEN, and tag scoping is untouched", async () => {
+      const { status, stdout } = await runProbe(true);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );

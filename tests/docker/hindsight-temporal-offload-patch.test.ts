@@ -75,6 +75,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -391,10 +392,13 @@ type ProbeResult = { status: number; stdout: string };
  * Run a probe in a throwaway container, always with switchroom's language
  * emission set (as every host runs it); applies the offload block iff `offload`.
  */
-function runProbe(offload: boolean, probe: string): ProbeResult {
+async function runProbe(
+  offload: boolean,
+  probe: string
+): Promise<ProbeResult> {
   const name = `sr-hs-toff-${offload ? "green" : "red"}-${RUN_ID.slice(0, 8)}`;
   try {
-    execFileSync(
+    await execFileAsync(
       "docker",
       [
         "run",
@@ -418,26 +422,24 @@ function runProbe(offload: boolean, probe: string): ProbeResult {
         UPSTREAM_IMAGE,
         "sleep",
         "400",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
+      ]
     );
 
     if (offload) {
       // Self-verifying: asserts its upstream anchors exist exactly once, so a
       // non-zero exit here means upstream drifted and the patch must be
       // re-authored.
-      execFileSync("docker", ["exec", "-i", name, "python3", "-"], {
+      await execFileAsync("docker", ["exec", "-i", name, "python3", "-"], {
         input: OFFLOAD_BLOCK,
-        stdio: ["pipe", "pipe", "pipe"],
       });
     }
 
-    const res = execFileSync(
+    const res = await execFileAsync(
       "docker",
       ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
-      { input: probe, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" }
+      { input: probe }
     );
-    return { status: 0, stdout: res };
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -446,7 +448,7 @@ function runProbe(offload: boolean, probe: string): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -499,8 +501,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("unpatched (offload absent) is RED — sync extraction blocks the loop for ≈ the full parse, and the wrapper/knob don't exist", () => {
-      const { stdout } = runProbe(false, RED_PROBE);
+    it("unpatched (offload absent) is RED — sync extraction blocks the loop for ≈ the full parse, and the wrapper/knob don't exist", async () => {
+      const { stdout } = await runProbe(false, RED_PROBE);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
@@ -529,8 +531,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       ).toBeGreaterThan(extract * 0.5);
     }, 240_000);
 
-    it("upstream + the offload block is GREEN — the loop stays responsive off-loop and the char cap bounds cost", () => {
-      const { status, stdout } = runProbe(true, GREEN_PROBE);
+    it("upstream + the offload block is GREEN — the loop stays responsive off-loop and the char cap bounds cost", async () => {
+      const { status, stdout } = await runProbe(true, GREEN_PROBE);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
