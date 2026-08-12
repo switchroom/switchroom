@@ -79,6 +79,14 @@ now an anomaly worth investigating, not the norm.
   (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
   so a designator-less line is now normalised to `Z` at the producer. An
   explicit `+HH:MM` offset is preserved untouched.
+- **hermes: `GET /api/status` no longer renders "null" in the settings pane.**
+  `config_path`, `env_path` and `release_date` are declared as bare `string` in
+  `StatusResponse`, and the adapter sent `null` for all three. They now carry
+  the real resolved `switchroom.yaml` path, `""` for the env file switchroom
+  does not have by construction, and the build's commit date. `version`
+  reports the actual switchroom version instead of the literal string
+  `"switchroom"`.
+
 - **hermes: the cron panel no longer shows every agent's schedule under one
   profile.** `GET /api/cron/jobs` ignored `?profile=`, which the desktop uses
   as endpoint-level scoping rather than a hint. Switchroom has exactly one
