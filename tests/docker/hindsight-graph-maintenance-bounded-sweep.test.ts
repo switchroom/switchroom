@@ -104,6 +104,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { parse } from "yaml";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dockerfile = readFileSync(
@@ -1142,6 +1143,113 @@ async function dockerLogs(name: string): Promise<string> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Probe registry (#4636). The set of hindsight docker probes is derived from
+// the FILENAME GLOB `tests/docker/hindsight-*.test.ts` minus the explicit
+// allowlist below — never by scanning a file for the very string the guard then
+// asserts. That inversion is the whole point: under the old content-scan
+// discovery a one-character typo in a probe both de-registered it from the
+// guard AND made its own `REQUIRED` flag permanently false, two silent failures
+// that cancelled out. A filename cannot be edited by a typo *inside* the file.
+// ---------------------------------------------------------------------------
+
+/**
+ * `hindsight-*.test.ts` files that legitimately need NO hindsight image and
+ * therefore no `docker-e2e.yml` run step. Each drives a host-side shell script
+ * or a pure parser against checked-in fixtures. Adding an entry here is a
+ * deliberate, reviewable act — which is exactly the property the content scan
+ * lacked.
+ */
+const NOT_A_PROBE: readonly string[] = [
+  // docker/hindsight-autoheal.sh — pure decision core, sourced lib-only.
+  "hindsight-autoheal.test.ts",
+  // docker/hindsight-entrypoint.sh — portable sh + node against a fake UDS.
+  "hindsight-entrypoint.test.ts",
+  // docker/hindsight-maintenance.sh — no-pg no-op path plus static SQL pins.
+  "hindsight-maintenance.test.ts",
+  // parse_pg_search_index_casts() regression over real catalog-output fixtures.
+  "hindsight-pg-search-cast-parser.test.ts",
+];
+
+const DOCKER_E2E_WORKFLOW = ".github/workflows/docker-e2e.yml";
+
+/** The exact spelling every probe must use to opt into the hard-fail path. */
+const PROBE_ENV_VAR = "SWITCHROOM_REQUIRE_HINDSIGHT_PROBE";
+
+/** Every file in `tests/docker`. */
+function dockerTestDir(): string[] {
+  return readdirSync(resolve(root, "tests/docker"));
+}
+
+/** Every `hindsight-*.test.ts` on disk, sorted. */
+function hindsightTestFiles(): string[] {
+  return dockerTestDir()
+    .filter((f) => f.startsWith("hindsight-") && f.endsWith(".test.ts"))
+    .sort();
+}
+
+/** The probe set: the glob minus the named allowlist. */
+function probeSet(): string[] {
+  return hindsightTestFiles().filter((f) => !NOT_A_PROBE.includes(f));
+}
+
+/**
+ * Every `tests/docker/<file>` named by an `npx vitest run` step in the workflow.
+ *
+ * PARSED, not grepped. A regex over the raw workflow TEXT counts a step that is
+ * not a step: `#   run: npx vitest run tests/docker/x.test.ts` — the exact edit
+ * a "disabled temporarily, it's flaky" commit makes — still matches, so the
+ * set-identity guard below would stay green while the probe stopped running in
+ * CI. That is the guard failing open on precisely the change it exists to
+ * catch. Parsing with `yaml` and enumerating real `jobs.*.steps[].run` values
+ * makes a commented-out step disappear from the set, which is the truth.
+ *
+ * Shell-comment lines INSIDE a surviving block scalar are stripped for the same
+ * reason: `run: |` blocks here interleave prose comments with commands (see the
+ * structural-guards step in docker-e2e.yml), so a `#`-prefixed invocation in one
+ * of those is disabled too, and must not count.
+ *
+ * YAML-parsing a workflow in a test follows the in-repo idiom of
+ * `tests/docker/ci-build-dist-shared.test.ts`.
+ */
+interface WorkflowStep {
+  run?: unknown;
+}
+interface WorkflowJob {
+  steps?: WorkflowStep[];
+}
+
+function workflowRunSteps(): string[] {
+  const wf = parse(
+    readFileSync(resolve(root, DOCKER_E2E_WORKFLOW), "utf8"),
+  ) as { jobs?: Record<string, WorkflowJob> };
+  const jobs = wf?.jobs ?? {};
+  // A workflow that parsed to no jobs would make every assertion below
+  // vacuously green — the exact fail-open this function was rewritten to close.
+  expect(
+    Object.keys(jobs).length,
+    `${DOCKER_E2E_WORKFLOW} parsed to zero jobs — the guard would pass ` +
+      "vacuously; the workflow is malformed or its shape changed",
+  ).toBeGreaterThan(0);
+
+  const files = new Set<string>();
+  for (const job of Object.values(jobs)) {
+    for (const step of job?.steps ?? []) {
+      if (typeof step?.run !== "string") continue;
+      const live = step.run
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("#"))
+        .join("\n");
+      for (const m of live.matchAll(
+        /npx vitest run tests\/docker\/([A-Za-z0-9._-]+\.test\.ts)/g,
+      )) {
+        files.add(m[1]);
+      }
+    }
+  }
+  return [...files].sort();
+}
+
 describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", () => {
   it("pins the upstream image by digest so the probe tests the exact shipping bytes", () => {
     expect(UPSTREAM_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
@@ -1194,40 +1302,103 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
   // guard is written over EVERY probe rather than this one, so the next probe
   // cannot repeat it.
   //
-  // KNOWN GAP, filed as #4636: this discovers its own subject by grepping for
-  // the same string it asserts, so a one-character typo in a probe both
-  // de-registers it here AND makes its own REQUIRED flag permanently false —
-  // two silent failures that cancel out. Only this file is hard-pinned below;
-  // the other 18 are not. The durable fix is a set-identity assertion between
-  // the `hindsight-*.test.ts` glob and the workflow's run steps with a named
-  // allowlist, which also catches the reverse drift (a run step outliving a
-  // deleted probe) that nothing checks today.
-  it("every probe that demands a real run has a workflow step that gives it one", () => {
-    const workflow = readFileSync(
-      resolve(root, ".github/workflows/docker-e2e.yml"),
-      "utf8",
-    );
-    const probes = readdirSync(resolve(root, "tests/docker"))
-      .filter((f) => f.endsWith(".test.ts"))
-      .filter((f) =>
-        readFileSync(resolve(root, "tests/docker", f), "utf8").includes(
-          "SWITCHROOM_REQUIRE_HINDSIGHT_PROBE",
-        ),
-      );
-    // Sanity: the discovery itself must not silently find nothing.
-    expect(probes.length).toBeGreaterThan(5);
-    expect(probes).toContain(
-      "hindsight-graph-maintenance-bounded-sweep.test.ts",
-    );
+  // #4636 closed the guard's own blind spot. It used to DISCOVER its subject
+  // set by grepping each file for `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE` — the
+  // same string it then asserted — so the membership predicate and the property
+  // under test were one string and a typo defeated both at once. The subject is
+  // now the filename glob minus `NOT_A_PROBE` (see above), and the three
+  // assertions below are mutually independent: nothing a probe's *contents* say
+  // can remove it from the check.
 
-    const missing = probes.filter(
-      (f) => !workflow.includes(`npx vitest run tests/docker/${f}`),
+  it("the probe set is exactly the set of probes docker-e2e.yml runs", () => {
+    const onDisk = hindsightTestFiles();
+    // Sanity: the glob itself must not silently find nothing.
+    expect(onDisk.length).toBeGreaterThan(5);
+    expect(onDisk).toContain(TEST_PHASE + ".test.ts");
+
+    // A stale allowlist entry silently excuses a probe — and after a RENAME it
+    // excuses the old name while the new one goes unrun. Force the edit.
+    expect(
+      NOT_A_PROBE.filter((f) => !onDisk.includes(f)),
+      `NOT_A_PROBE names ${
+        DOCKER_E2E_WORKFLOW
+      } exemptions that no longer exist in tests/docker — the allowlist ` +
+        "outlived a rename or deletion and must be edited deliberately",
+    ).toEqual([]);
+
+    // The INVERSE, and the one that makes NOT_A_PROBE more than an unverified
+    // escape hatch. The allowlist's only claim is "this file needs no hindsight
+    // image, so it needs no run step" — and every real probe reads
+    // PROBE_ENV_VAR to opt into the hard-fail path. So an entry that DOES read
+    // it is a real probe being excused: append its name here, delete its run
+    // step, and every other guard in this file stays green while the probe
+    // silently retires from CI. Verified against the four current entries:
+    // none of them contains the string.
+    expect(
+      NOT_A_PROBE.filter((f) =>
+        readFileSync(resolve(root, "tests/docker", f), "utf8").includes(
+          PROBE_ENV_VAR,
+        ),
+      ),
+      `these NOT_A_PROBE entries DO read ${PROBE_ENV_VAR} — they are real ` +
+        "probes being excused from their run step, which retires them from CI " +
+        "with every other guard here still green; remove the allowlist entry " +
+        `and add a ${DOCKER_E2E_WORKFLOW} run step`,
+    ).toEqual([]);
+
+    const expected = probeSet();
+    const ran = workflowRunSteps().filter((f) => f.startsWith("hindsight-"));
+
+    // Direction 1: on disk but not run by CI. This is the failure #4624 caught
+    // for real, and the one a typo used to hide.
+    expect(
+      expected.filter((f) => !ran.includes(f)),
+      `these hindsight probes exist on disk but no ${DOCKER_E2E_WORKFLOW} step ` +
+        `runs them, so ${PROBE_ENV_VAR} is never set and their hard-fail ` +
+        "discipline is inert — add the run step, or add the file to " +
+        "NOT_A_PROBE with a reason",
+    ).toEqual([]);
+
+    // Direction 2: run by CI but not a probe on disk. A run step that outlives
+    // a deleted or renamed probe is a silently no-op (or hard-failing) job.
+    expect(
+      ran.filter((f) => !expected.includes(f)),
+      `these ${DOCKER_E2E_WORKFLOW} steps run hindsight probe files that are ` +
+        "not in the probe set — the step outlived a deleted or renamed probe, " +
+        "or names a file the NOT_A_PROBE allowlist says needs no run step",
+    ).toEqual([]);
+
+    // Set identity, not merely mutual coverage.
+    expect(ran).toEqual(expected);
+  });
+
+  it("every probe spells the require-env-var exactly", () => {
+    // The cheap assert the set-identity above makes possible: because
+    // membership no longer depends on this string, a probe that mis-spells it
+    // is now LOUD instead of silently de-registering itself.
+    const silent = probeSet().filter(
+      (f) =>
+        !readFileSync(resolve(root, "tests/docker", f), "utf8").includes(
+          PROBE_ENV_VAR,
+        ),
     );
     expect(
-      missing,
-      `these probes read SWITCHROOM_REQUIRE_HINDSIGHT_PROBE but no docker-e2e.yml ` +
-        `step runs them, so the env var is never set and their hard-fail ` +
-        `discipline is inert: ${missing.join(", ")}`,
+      silent,
+      `these hindsight probes never read ${PROBE_ENV_VAR}, so CI sets it for ` +
+        "them and they skip anyway — a mis-spelling here green-skips for ever " +
+        "on every runner without the image",
+    ).toEqual([]);
+  });
+
+  it("every docker-e2e.yml run step points at a test file that still exists", () => {
+    // Catches the reverse drift for NON-hindsight steps too (the set-identity
+    // assert above only ranges over `hindsight-*`).
+    const dir = dockerTestDir();
+    const stale = workflowRunSteps().filter((f) => !dir.includes(f));
+    expect(
+      stale,
+      `these ${DOCKER_E2E_WORKFLOW} steps run tests/docker files that do not ` +
+        "exist — the step outlived a deletion or rename",
     ).toEqual([]);
   });
 
