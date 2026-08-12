@@ -986,6 +986,20 @@ export async function handleHermesRest(
   // the UI — the same constraint as the Telegram /schedule command).
   if (pathname.startsWith("/api/cron")) {
     if (method === "GET" && pathname === "/api/cron/jobs") {
+      // `?profile=` is endpoint-level scoping, not a client-side hint: the
+      // desktop asks for "just that profile's jobs, or all"
+      // (apps/desktop/src/hermes.ts:1381-1389) and renders whatever comes back,
+      // pinned upstream at apps/desktop/src/hermes-cron-scope.test.ts:60-73.
+      // Ignoring it leaked every agent's schedule into a single profile's panel.
+      //
+      // Switchroom has exactly one profile, and `default` is the name it
+      // reports for it (see the /api/profiles/active branch below). So the
+      // fleet's schedule IS that profile's schedule, and any other profile owns
+      // nothing — an empty list is the true answer here, not a fabricated one.
+      const profile = new URLSearchParams(search).get("profile");
+      if (profile !== null && profile !== "" && profile !== "default") {
+        return { status: 200, body: [] };
+      }
       const schedule = await handleGetSchedule(config);
       const jobs = scheduleToCronJobs(schedule);
       return { status: 200, body: jobs };

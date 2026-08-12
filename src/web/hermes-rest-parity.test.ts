@@ -1045,11 +1045,6 @@ const CONTRACT: ContractCase[] = [
     search: "?profile=__no_such_profile__",
     client: "hermes.ts:1381-1389 — 'list just that profile's jobs, or all'",
     server: "hermes_cli/web_server.py",
-    gap:
-      "hermes-adapter.ts:713-717 ignores ?profile= and returns the whole " +
-      "fleet's schedule. The desktop expects endpoint-level filtering — pinned " +
-      "upstream at apps/desktop/src/hermes-cron-scope.test.ts:60-73 — so cron " +
-      "jobs from every agent leak into a single profile's panel.",
     assert: (res) => {
       expect(res!.status).toBe(200);
       // The fixture fleet has 2 jobs (asserted above), none of them owned by
@@ -1415,8 +1410,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
       total: 47,
-      green: 39,
-      gaps: 8,
+      green: 40,
+      gaps: 7,
     });
   });
 });
