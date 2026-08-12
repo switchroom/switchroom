@@ -32,6 +32,14 @@ now an anomaly worth investigating, not the norm.
   07-26, reads 0.81 and stays silent while 84–95 % of recalls were being cut
   off — the worst week in the log, scored as healthier than the milder August
   incident it did catch.
+- **every agent inherits a local-time rule** — a new unconditional shared
+  prompt fragment (`profiles/_shared/local-time.md.hbs`) appended at both
+  scaffold sites, so no profile can opt out. Fixing the OS stops the machine
+  lying about UTC; it does not stop an agent showing a human a technically
+  correct UTC timestamp, hardcoding `+10:00` or `"AEST"` (both change with
+  DST), or calling `.astimezone()` on a naive value and silently assuming the
+  process clock. Six lines, zone-agnostic, and pinned by a prompt-budget
+  ratchet test — this is context every agent pays for on every turn.
 
 ### Bug fixes
 
@@ -319,7 +327,37 @@ now an anomaly worth investigating, not the norm.
   margin the data cannot support. Asking "has anything SUCCEEDED lately?"
   instead of "is the failure recent?" still clears the instant a completion
   lands, which is what the recency guard existed to protect. (#4618)
-- **docker: stop /etc/localtime mount clobbering zoneinfo Etc/UTC**
+- **docker: stop /etc/localtime mount clobbering zoneinfo Etc/UTC** — every
+  agent container has been silently shipping a tzdata database in which UTC is
+  not UTC. The compose generator bind-mounts the agent's zonefile onto
+  `/etc/localtime`, and Docker resolves a mount destination through symlinks in
+  the container rootfs *before* mounting; stock Debian tzdata ships
+  `/etc/localtime -> /usr/share/zoneinfo/Etc/UTC`, so the daemon wrote the
+  local zonefile straight over `Etc/UTC` (and over `UTC`, which symlinks to
+  it). Confirmed live: in a Melbourne-configured agent,
+  `md5sum /usr/share/zoneinfo/Etc/UTC /usr/share/zoneinfo/Australia/Melbourne`
+  matched byte-for-byte, and Python's `ZoneInfo("UTC")` reported a +10:00
+  offset. Anything reading the OS zoneinfo DB by name — `TZ=UTC date`, Python
+  `zoneinfo`, Go/Java/Rust — got local time labelled UTC, with no error
+  anywhere. Node is immune (bundled full-ICU), which is exactly why this went
+  unnoticed for so long. `Dockerfile.agent` now materialises `/etc/localtime`
+  as a regular file (`readlink -f` the current target, copy it, fail the build
+  if the result is still a symlink) so the mount lands on `/etc/localtime`
+  itself; the mount is kept rather than dropped because a statically-linked
+  binary reads `/etc/localtime` directly and would silently fall back to UTC
+  without it. Downstream victim found and reproduced: `vendor/hindsight-memory`
+  tags naive timestamps with `ZoneInfo("UTC")`, which in a corrupted container
+  resolved to the local zone and made the following `.astimezone()` a no-op —
+  a naive `04:09` UTC rendered as `04:09 AM AEST` instead of `02:09 PM`.
+  **Existing containers stay broken until their image is rebuilt and the
+  container recreated (`switchroom apply`).** Two detectors ship alongside so
+  this class of bug is visible on every install rather than only where someone
+  happens to look: a `tzdata` probe in hostd's `agent_smoke` battery (runs
+  inside each container, so it catches a stale image per-agent) and a
+  `tzdata Etc/UTC integrity` row in `switchroom doctor` that parses the TZif
+  bytes directly and FAILs on a non-zero first UT offset — deliberately not via
+  `Intl`, since Node's ICU reports a correct UTC even on a corrupted host and
+  would mask exactly this defect.
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
