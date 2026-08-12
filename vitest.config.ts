@@ -180,6 +180,9 @@ export default defineConfig({
       // windowing — properties that pass vacuously against the empty agents
       // dir the vitest parity fixture points at.
       "**/telegram-plugin/tests/hermes-messages-paging.test.ts",
+      // hermes-session-search.test.ts likewise seeds a real turns DB, to tell
+      // a real search apart from a hardcoded empty result set.
+      "**/telegram-plugin/tests/hermes-session-search.test.ts",
       "**/telegram-plugin/tests/history.test.ts",
       // orphaned-db-sweep.test.ts unlinks a live history.db `-wal`/`-shm` out
       // from under an open bun:sqlite handle and probes the on-disk rows with a

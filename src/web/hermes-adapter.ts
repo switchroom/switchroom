@@ -759,6 +759,77 @@ export async function handleHermesRest(
     };
   }
 
+  // GET /api/sessions/search — the sidebar search box (`searchSessions`,
+  // apps/desktop/src/hermes.ts:656-660, no catch: the rejection propagates
+  // into the panel).
+  //
+  // MUST stay above the `/api/sessions/:id` branch below — that regex matches
+  // `search` as a session id, which is how this route used to answer
+  // `404 {error:'Unknown session'}` and throw the search panel.
+  //
+  // Two passes, in upstream's order (hermes_cli/web_routers/sessions.py:169-383):
+  // session-id matches first, then message-content matches, one row per
+  // session. Switchroom has no FTS index, so the content pass is a substring
+  // scan of the turn previews the turns DB already stores — the same text
+  // `/messages` serves. That is a smaller haystack than upstream's full message
+  // bodies and the difference is real, but it is a genuine search over genuine
+  // content, which a hardcoded `{results: []}` would not be.
+  //
+  // `lineage_root` is the session id: switchroom never rotates a conversation
+  // onto a fresh id (no auto-compression), so every session is its own root.
+  if (method === "GET" && pathname === "/api/sessions/search") {
+    const query = new URLSearchParams(search);
+    const q = (query.get("q") ?? "").trim();
+    // Upstream short-circuits an empty query rather than returning the fleet.
+    if (q === "") return { status: 200, body: { results: [] } };
+    const limit = Math.max(1, boundParam(query, "limit", 20, 100));
+    const needle = q.toLowerCase();
+    const sessions = filterSessionsBySource(await buildAllSessions(config), {
+      source: query.get("source"),
+      excludeSources: csvParam(query, "exclude_sources"),
+    });
+
+    const results: object[] = [];
+    const matched = new Set<string>();
+    for (const s of sessions) {
+      if (results.length >= limit) break;
+      if (!s.id.toLowerCase().includes(needle)) continue;
+      matched.add(s.id);
+      results.push({
+        session_id: s.id,
+        lineage_root: s.id,
+        snippet: s.title || `Session ID: ${s.id}`,
+        role: null,
+        source: s.source,
+        model: s.model,
+        session_started: s.started_at,
+      });
+    }
+    for (const s of sessions) {
+      if (results.length >= limit) break;
+      if (matched.has(s.id)) continue;
+      const turns = handleGetTurns(config, s.id, 200).turns ?? [];
+      for (const t of turns) {
+        const user = t.user_prompt_preview ?? "";
+        const assistant = t.assistant_reply_preview ?? "";
+        const inUser = user.toLowerCase().includes(needle);
+        if (!inUser && !assistant.toLowerCase().includes(needle)) continue;
+        matched.add(s.id);
+        results.push({
+          session_id: s.id,
+          lineage_root: s.id,
+          snippet: inUser ? user : assistant,
+          role: inUser ? "user" : "assistant",
+          source: s.source,
+          model: s.model,
+          session_started: Math.floor(t.started_at / 1000),
+        });
+        break; // one row per session — upstream's lineage dedup collapses the same way
+      }
+    }
+    return { status: 200, body: { results } };
+  }
+
   // GET /api/sessions/:id — single session status
   const sessionMatch = pathname.match(/^\/api\/sessions\/([^/]+)$/);
   if (method === "GET" && sessionMatch) {
