@@ -979,7 +979,7 @@ import {
 } from './resume-inbound-builder.js'
 import { maybeQueueBootBriefing } from './boot-briefing-wiring.js'
 import { writePendingTurnEnv } from './pending-turn-env.js'
-import { shouldSkipBootResumeForGatewayOnlyRespawn } from './agent-process-liveness.js'
+import { shouldSkipBootResumeForGatewayOnlyRespawn, markBootResumeComplete } from './agent-process-liveness.js'
 import {
   createBridgeDeadWatchdog,
   consumeBridgeDeadEscalationMarker,
@@ -1668,7 +1668,7 @@ bootResumeInit: if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqli
   // schema; subagents lives alongside in registry.db. Idempotent — safe on
   // pre-existing DBs (handles the jsonl_agent_id column migration).
   applySubagentsSchema(turnsDb)
-  if (shouldSkipBootResumeForGatewayOnlyRespawn(STATE_DIR)) break bootResumeInit // #4641: agent process still alive — ONLY the gateway respawned; reaper/resume/pending-env would all be lies
+  if (shouldSkipBootResumeForGatewayOnlyRespawn(STATE_DIR)) break bootResumeInit // #4641: this container generation's boot resume is already done — ONLY the gateway respawned. The break skips ALL of: the orphan-turn reaper, consumeBridgeDeadEscalationMarker (already consumed by the gateway that stamped the token), the bridge-dead idle notice, the resume/report synthetic, the pendingRedelivery capture (the turn is still running and will answer itself — redelivering would double-send) and writePendingTurnEnv. Each is safe ONLY because the token proves one gateway already did it this generation; see "What `break bootResumeInit` skips" in agent-process-liveness.ts.
 
   // Read the turn-active marker (the in-flight turn the watchdog tracks)
   // BEFORE classifying — its mtime is "ms since last tool progress" and its
@@ -1954,7 +1954,7 @@ bootResumeInit: if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqli
   // wake-audit context. The injected inbound above is the real wake signal;
   // these vars are passive context only. Extracted to pending-turn-env.ts
   // (atomic tmp+rename writer; never throws).
-  writePendingTurnEnv(agentDir, pending)
+  writePendingTurnEnv(agentDir, pending); markBootResumeComplete(STATE_DIR) // #4641 generation token, LAST statement of the block: this container generation's boot resume completed, so a respawned gateway must skip it. A crash before here leaves no token and the successor redoes the work. (Joined onto one line: gateway.ts sits at its line ratchet — scripts/gateway-line-ratchet.txt.)
 } catch (err) {
   process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)
   turnsDb = null

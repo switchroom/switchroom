@@ -145,6 +145,54 @@ describe('start.sh agent-process record (#4641)', () => {
     }
   })
 
+  it('opens a fresh boot-resume generation before the gateway is forked', () => {
+    // The generation token is the whole #4641 mechanism, and its meaning
+    // ("a gateway in THIS container generation already finished its boot
+    // resume") rests entirely on WHERE start.sh clears it: once per container
+    // boot, in the outer docker pass, BEFORE the supervised gateway sidecar is
+    // forked. Clear it after the fork and a respawned gateway could wipe its
+    // own generation; clear it in the inner pass and the token would never
+    // outlive a boot at all.
+    const src = readFileSync(TEMPLATE, 'utf-8')
+    const outerPass = src.indexOf(
+      'if [ "$SWITCHROOM_RUNTIME" = "docker" ] && [ -z "$SWITCHROOM_DOCKER_TMUX_INNER" ]; then',
+    )
+    expect(outerPass, 'outer docker pass guard not found').toBeGreaterThan(-1)
+    const clear = src.indexOf('rm -f "$TELEGRAM_STATE_DIR/.boot-resume-done"')
+    const fork = src.indexOf('_switchroom_supervise gateway')
+    const tmuxReexec = src.indexOf('exec tmux -L')
+    expect(clear, '.boot-resume-done is never cleared').toBeGreaterThan(-1)
+    expect(fork, 'gateway sidecar fork not found').toBeGreaterThan(-1)
+    expect(clear).toBeGreaterThan(outerPass)
+    expect(clear).toBeLessThan(fork)
+    expect(fork).toBeLessThan(tmuxReexec) // …and the whole thing is the outer pass
+    // The stale agent record from the previous container generation goes with
+    // it: a container restart resets the pid namespace, so its (pid,
+    // starttime) pair could collide with an unrelated live process.
+    expect(src.slice(clear, src.indexOf('\n', clear))).toContain('agent-process.json')
+    // Exactly one clear, so no second site can re-open a generation mid-boot.
+    expect(src.split('rm -f "$TELEGRAM_STATE_DIR/.boot-resume-done"').length - 1).toBe(1)
+  })
+
+  it('actually deletes both files when that outer-pass line runs', () => {
+    // Executed, not pattern-matched: `rm -f` on a path that does not exist
+    // must also be a no-op that cannot fail the boot.
+    const stateDir = join(dir, 'telegram-clear')
+    execFileSync('mkdir', ['-p', stateDir])
+    const token = join(stateDir, '.boot-resume-done')
+    const record = join(stateDir, 'agent-process.json')
+    writeFileSync(token, '{"pid":1}')
+    writeFileSync(record, '{"pid":1,"starttime":"5"}')
+    const src = readFileSync(TEMPLATE, 'utf-8')
+    const clear = src.indexOf('rm -f "$TELEGRAM_STATE_DIR/.boot-resume-done"')
+    const line = src.slice(clear, src.indexOf('\n', clear))
+    const p = join(dir, 'clear.sh')
+    writeFileSync(p, `#!/bin/bash\nset -e\n${line}\n${line}\n`)
+    execFileSync('bash', [p], { env: { ...process.env, TELEGRAM_STATE_DIR: stateDir } })
+    expect(existsSync(token)).toBe(false)
+    expect(existsSync(record)).toBe(false)
+  })
+
   it('is written immediately before the exec, never after it', () => {
     const src = readFileSync(TEMPLATE, 'utf-8')
     const marker = src.indexOf(START_MARKER)

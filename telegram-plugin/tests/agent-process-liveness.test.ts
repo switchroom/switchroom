@@ -1,21 +1,30 @@
 /**
- * switchroom#4641 — agent-process liveness probe.
+ * switchroom#4641 — the boot-resume generation guard.
  *
- * These tests use REAL processes and the REAL `/proc`, not a mocked fs: the
- * whole point of the probe is that it can tell a live agent from a dead one,
- * and a fixture that hand-writes both answers would pass against a probe that
- * always says "alive". Every liveness assertion below is anchored on a process
- * this test actually spawned (and, for the dead case, actually killed).
+ * Two mechanisms, tested for what each is actually responsible for:
  *
- * The two stand-ins are ordinary `sleep` children spawned in a known order:
- * `agentProc` first, `gatewayProc` second — exactly the production ordering of
- * a gateway-only respawn (claude has been running for ages; the replacement
- * gateway was forked seconds ago).
+ *   - the per-container-boot GENERATION TOKEN (`.boot-resume-done`) is the
+ *     only thing that can say "suppress". start.sh deletes it once per
+ *     container boot before forking the gateway; the gateway stamps it after
+ *     completing its boot-resume block.
+ *   - the `/proc` AGENT RECORD is a VETO only: it can re-enable a boot resume
+ *     when the recorded agent is provably gone, never suppress one.
+ *
+ * Liveness assertions use REAL processes and the REAL `/proc`, not a mocked
+ * fs: a fixture that hand-writes both answers would pass against a probe that
+ * always says "alive". Every "alive" claim is anchored on a process this test
+ * spawned; every "dead" claim on one it killed.
+ *
+ * Deliberately NOT tested here, because it no longer exists: any comparison of
+ * the agent's `/proc` starttime against the gateway's. The previous revision
+ * suppressed on "the agent predates me", which was correct only by accident of
+ * the docker tmux re-exec (measured margin on a live container: one clock
+ * tick) and which broke outright when a gateway crashed during its own boot.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -25,7 +34,10 @@ import {
   decideGatewayOnlyRespawn,
   detectGatewayOnlyRespawn,
   shouldSkipBootResumeForGatewayOnlyRespawn,
+  markBootResumeComplete,
+  bootResumeDonePath,
   AGENT_PROCESS_RECORD_FILE,
+  BOOT_RESUME_DONE_FILE,
 } from '../gateway/agent-process-liveness.js'
 
 function starttimeOf(pid: number): string {
@@ -45,23 +57,28 @@ async function waitForExit(child: ChildProcess): Promise<void> {
 
 let dir: string
 let agentProc: ChildProcess
-let gatewayProc: ChildProcess
 
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'agent-liveness-'))
-  // Order is load-bearing: the "agent" must exist BEFORE the "gateway".
   agentProc = spawnSleeper()
-  await new Promise((r) => setTimeout(r, 20))
-  gatewayProc = spawnSleeper()
   await new Promise((r) => setTimeout(r, 20))
 })
 
 afterAll(() => {
-  for (const p of [agentProc, gatewayProc]) {
-    try { p.kill('SIGKILL') } catch { /* already gone */ }
-  }
+  try { agentProc.kill('SIGKILL') } catch { /* already gone */ }
   rmSync(dir, { recursive: true, force: true })
 })
+
+beforeEach(() => {
+  // Every case states its own generation-token state explicitly.
+  try { unlinkSync(bootResumeDonePath(dir)) } catch { /* absent */ }
+  try { unlinkSync(join(dir, AGENT_PROCESS_RECORD_FILE)) } catch { /* absent */ }
+})
+
+/** start.sh's outer-pass "open a new generation" step. */
+function clearToken(): void {
+  try { unlinkSync(bootResumeDonePath(dir)) } catch { /* absent */ }
+}
 
 function writeRecord(rec: unknown, name = AGENT_PROCESS_RECORD_FILE): string {
   const p = join(dir, name)
@@ -96,85 +113,113 @@ describe('parseProcStat', () => {
   })
 })
 
-describe('gateway-only respawn detection (real processes)', () => {
-  it('reports a gateway-only respawn when the agent is alive and older', () => {
+describe('the generation token decides', () => {
+  it('suppresses ONLY after a gateway stamped the token this generation', () => {
     writeRecord({ pid: agentProc.pid, starttime: starttimeOf(agentProc.pid!) })
-    const decision = detectGatewayOnlyRespawn({ stateDir: dir, selfPid: gatewayProc.pid })
-    expect(decision).toEqual({
+
+    // Fresh container boot: start.sh cleared the token, no gateway has
+    // finished its boot resume yet. The live agent record must NOT suppress.
+    expect(detectGatewayOnlyRespawn({ stateDir: dir })).toEqual({
+      gatewayOnly: false,
+      reason: 'no-boot-resume-sentinel',
+      pid: agentProc.pid,
+    })
+
+    // …the first gateway completes its boot-resume block…
+    markBootResumeComplete(dir)
+    expect(existsSync(bootResumeDonePath(dir))).toBe(true)
+
+    // …and a respawned gateway now sees the generation already handled.
+    expect(detectGatewayOnlyRespawn({ stateDir: dir })).toEqual({
       gatewayOnly: true,
       reason: 'gateway-only-respawn',
       pid: agentProc.pid,
     })
   })
 
-  it('does NOT claim a gateway-only respawn when the agent process is dead', async () => {
+  it('does NOT suppress when the gateway crashed during its own boot', () => {
+    // The #4641-motivating Bun crash-at-boot pattern: gateway #1 died before
+    // finishing the boot-resume block, so it never stamped the token — even
+    // though start.sh had already published a live agent record. Gateway #2
+    // MUST do the boot resume; the previous starttime-ordering guard
+    // suppressed here and lost the interrupted turn permanently.
+    writeRecord({ pid: agentProc.pid, starttime: starttimeOf(agentProc.pid!) })
+    const decision = detectGatewayOnlyRespawn({ stateDir: dir })
+    expect(decision.gatewayOnly).toBe(false)
+    expect(decision.reason).toBe('no-boot-resume-sentinel')
+  })
+
+  it('suppresses on a token with no record yet (gateway respawn pre-exec)', () => {
+    // The gateway boots long before start.sh reaches `exec claude`. A gateway
+    // that crashes in that window must still not repeat this generation's
+    // boot resume — repeating it would spool the resume synthetic twice.
+    markBootResumeComplete(dir)
+    expect(detectGatewayOnlyRespawn({ stateDir: dir })).toEqual({
+      gatewayOnly: true,
+      reason: 'gateway-only-respawn-no-record',
+      pid: null,
+    })
+  })
+
+  it('a container restart re-opens the generation (start.sh clears the token)', () => {
+    writeRecord({ pid: agentProc.pid, starttime: starttimeOf(agentProc.pid!) })
+    markBootResumeComplete(dir)
+    expect(detectGatewayOnlyRespawn({ stateDir: dir }).gatewayOnly).toBe(true)
+    clearToken()
+    expect(detectGatewayOnlyRespawn({ stateDir: dir }).gatewayOnly).toBe(false)
+  })
+})
+
+describe('the /proc record can only VETO a suppression', () => {
+  it('vetoes when the recorded agent process is really dead', async () => {
     const doomed = spawnSleeper()
     await new Promise((r) => setTimeout(r, 20))
     writeRecord({ pid: doomed.pid, starttime: starttimeOf(doomed.pid!) })
     doomed.kill('SIGKILL')
     await waitForExit(doomed)
-    const decision = detectGatewayOnlyRespawn({ stateDir: dir, selfPid: gatewayProc.pid })
+    markBootResumeComplete(dir)
+
+    const decision = detectGatewayOnlyRespawn({ stateDir: dir })
     expect(decision.gatewayOnly).toBe(false)
     expect(decision.reason).toBe('agent-process-dead')
   })
 
-  it('rejects a recycled PID: same pid, different starttime', () => {
+  it('vetoes a recycled PID: same pid, different starttime', () => {
     const live = starttimeOf(agentProc.pid!)
     writeRecord({ pid: agentProc.pid, starttime: String(BigInt(live) - 1n) })
-    const decision = detectGatewayOnlyRespawn({ stateDir: dir, selfPid: gatewayProc.pid })
-    expect(decision).toEqual({
+    markBootResumeComplete(dir)
+    expect(detectGatewayOnlyRespawn({ stateDir: dir })).toEqual({
       gatewayOnly: false,
       reason: 'starttime-mismatch',
       pid: agentProc.pid,
     })
   })
 
-  it('rejects an agent that started AFTER this gateway (fresh-boot race)', () => {
-    // Swap the roles: the record names the LATER process, the probe runs as
-    // the EARLIER one. This is the fresh-container ordering (gateway launched,
-    // then `exec claude`), where the resume must still fire.
-    writeRecord({ pid: gatewayProc.pid, starttime: starttimeOf(gatewayProc.pid!) })
-    const decision = detectGatewayOnlyRespawn({ stateDir: dir, selfPid: agentProc.pid })
-    expect(decision).toEqual({
-      gatewayOnly: false,
-      reason: 'agent-started-after-gateway',
-      pid: gatewayProc.pid,
-    })
+  it('cannot manufacture a suppression on its own', () => {
+    // A live, matching, older record with NO token still runs the boot resume.
+    writeRecord({ pid: agentProc.pid, starttime: starttimeOf(agentProc.pid!) })
+    expect(detectGatewayOnlyRespawn({ stateDir: dir }).gatewayOnly).toBe(false)
   })
 
-  it('fails open with no record at all (first boot)', () => {
-    const empty = mkdtempSync(join(tmpdir(), 'agent-liveness-empty-'))
-    try {
-      expect(detectGatewayOnlyRespawn({ stateDir: empty, selfPid: gatewayProc.pid })).toEqual({
-        gatewayOnly: false,
-        reason: 'no-record',
-        pid: null,
-      })
-    } finally {
-      rmSync(empty, { recursive: true, force: true })
-    }
-  })
-
-  it('fails open on a torn record', () => {
+  it('fails open on a torn record even with the token present', () => {
+    markBootResumeComplete(dir)
     writeRecord('{"pid": 12')
-    expect(detectGatewayOnlyRespawn({ stateDir: dir, selfPid: gatewayProc.pid }).gatewayOnly)
-      .toBe(false)
-    writeRecord({ pid: agentProc.pid, starttime: 'not-a-number' })
-    expect(detectGatewayOnlyRespawn({ stateDir: dir, selfPid: gatewayProc.pid }).gatewayOnly)
-      .toBe(false)
+    // Torn record is indistinguishable from "no record" — and with the token
+    // present that is a suppression, which is the safe answer here: the block
+    // demonstrably already ran this generation.
+    expect(detectGatewayOnlyRespawn({ stateDir: dir }).reason)
+      .toBe('gateway-only-respawn-no-record')
   })
 
   it('honours the SWITCHROOM_GATEWAY_RESPAWN_GUARD=0 escape hatch', () => {
     writeRecord({ pid: agentProc.pid, starttime: starttimeOf(agentProc.pid!) })
+    markBootResumeComplete(dir)
     const lines: string[] = []
     const prev = process.env.SWITCHROOM_GATEWAY_RESPAWN_GUARD
     process.env.SWITCHROOM_GATEWAY_RESPAWN_GUARD = '0'
     try {
       expect(
-        shouldSkipBootResumeForGatewayOnlyRespawn(dir, {
-          selfPid: gatewayProc.pid,
-          log: (s) => lines.push(s),
-        }),
+        shouldSkipBootResumeForGatewayOnlyRespawn(dir, { log: (s) => lines.push(s) }),
       ).toBe(false)
     } finally {
       if (prev == null) delete process.env.SWITCHROOM_GATEWAY_RESPAWN_GUARD
@@ -183,49 +228,57 @@ describe('gateway-only respawn detection (real processes)', () => {
     expect(lines.join('')).toContain('guard-disabled')
   })
 
-  it('skips the boot-resume path (and says so) for a live older agent', () => {
+  it('skips the boot-resume path (and says so) for a live agent + token', () => {
     writeRecord({ pid: agentProc.pid, starttime: starttimeOf(agentProc.pid!) })
+    markBootResumeComplete(dir)
     const lines: string[] = []
-    const skip = shouldSkipBootResumeForGatewayOnlyRespawn(dir, {
-      selfPid: gatewayProc.pid,
-      log: (s) => lines.push(s),
-    })
-    expect(skip).toBe(true)
-    expect(lines.join('')).toContain('GATEWAY-ONLY respawn')
+    expect(shouldSkipBootResumeForGatewayOnlyRespawn(dir, { log: (s) => lines.push(s) })).toBe(true)
+    const out = lines.join('')
+    expect(out).toContain('GATEWAY-ONLY respawn')
+    // The log must name the side effects the break skips (the MEDIUM finding:
+    // it skips more than the resume synthetic).
+    expect(out).toContain('bridge-dead marker')
+    expect(out).toContain('crash-redelivery')
+  })
+})
+
+describe('markBootResumeComplete', () => {
+  it('writes the token atomically and leaves no tmp file behind', () => {
+    markBootResumeComplete(dir)
+    const p = bootResumeDonePath(dir)
+    expect(p.endsWith(BOOT_RESUME_DONE_FILE)).toBe(true)
+    expect(JSON.parse(readFileSync(p, 'utf8'))).toMatchObject({ pid: process.pid })
+    expect(existsSync(`${p}.tmp.${process.pid}`)).toBe(false)
+  })
+
+  it('never throws when the state dir is unwritable — it logs and continues', () => {
+    const lines: string[] = []
+    expect(() =>
+      markBootResumeComplete(join(dir, 'no', 'such', 'dir'), { log: (s) => lines.push(s) }),
+    ).not.toThrow()
+    expect(lines.join('')).toContain(BOOT_RESUME_DONE_FILE)
   })
 })
 
 describe('decideGatewayOnlyRespawn (pure)', () => {
   const record = { pid: 42, starttime: '1000' }
+  const live = { starttime: '1000', comm: 'claude', state: 'S' }
 
   it('rejects a comm mismatch when the record carries one', () => {
     expect(
       decideGatewayOnlyRespawn({
+        sentinelPresent: true,
         record: { ...record, comm: 'claude' },
-        live: { starttime: '1000', comm: 'imposter', state: 'S' },
-        gatewayStarttime: '2000',
+        live: { ...live, comm: 'imposter' },
       }),
     ).toEqual({ gatewayOnly: false, reason: 'comm-mismatch', pid: 42 })
   })
 
-  it('fails open when this gateway has no readable starttime', () => {
-    expect(
-      decideGatewayOnlyRespawn({
-        record,
-        live: { starttime: '1000', comm: 'claude', state: 'S' },
-        gatewayStarttime: null,
-      }).gatewayOnly,
-    ).toBe(false)
-  })
-
-  it('rejects an exact starttime tie (cannot have forked before itself)', () => {
-    expect(
-      decideGatewayOnlyRespawn({
-        record,
-        live: { starttime: '1000', comm: 'claude', state: 'S' },
-        gatewayStarttime: '1000',
-      }).reason,
-    ).toBe('agent-started-after-gateway')
+  it('never suppresses without the generation token, whatever /proc says', () => {
+    for (const l of [live, null]) {
+      expect(decideGatewayOnlyRespawn({ sentinelPresent: false, record, live: l }).gatewayOnly)
+        .toBe(false)
+    }
   })
 })
 
