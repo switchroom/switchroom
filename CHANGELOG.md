@@ -17,6 +17,24 @@ now an anomaly worth investigating, not the norm.
 
 ### Features
 
+- **every agent inherits a local-time rule, and it pays for its own bytes** —
+  a new unconditional shared prompt fragment
+  (`profiles/_shared/local-time.md.hbs`) appended at both scaffold sites, so no
+  profile can opt out. Fixing the container's tzdata (#4647) stops the machine
+  lying about UTC; it does not stop an agent showing a human a technically
+  correct UTC timestamp, hardcoding `+10:00` or `"AEST"` (both move with DST),
+  or calling `.astimezone()` on a naive value and silently assuming the process
+  clock. 432 chars, zone-agnostic, pinned by a `< 500` fragment ratchet. The
+  worst-case CLAUDE.md byte ratchet was NOT raised: the bytes come from cutting
+  four duplicated rules out of the default profile — the contentless `## Tools`
+  section (the Core Behavior tool bullet already says it), "save important
+  facts … to memory" (the whole Memory section says it), the auto-retain
+  restatement under "What to retain" (verbatim the `retain` bullet above it),
+  and the corrections-go-to-directives bullet (stated in full under
+  Directives), plus the generic "respond helpfully, concisely, and
+  conversationally" bullet, which is SOUL.md's job and can contradict a
+  persona. Net: the worst-case prompt is 45 chars SMALLER than before this PR.
+
 - **hindsight-watch: detect recall DEGRADATION, not just collapse** — three
   signals for the shape all fourteen existing ones missed. `recall-latency`
   (p95 3 s warn / 6 s page), `recall-quality-regression` (top-hit score and

@@ -213,7 +213,7 @@ Handlebars.registerHelper("isNumber", (value: unknown) => {
 // The _shared/ directory is underscore-prefixed (like _base/) and is not
 // listed by listAvailableProfiles() — it's framework-internal.
 const SHARED_FRAGMENTS_DIR = resolve(PROFILES_ROOT, "_shared");
-const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service", "execution-discipline", "reply-discipline", "dev-protocol"] as const;
+const SHARED_FRAGMENTS = ["vault-protocol", "agent-self-service", "execution-discipline", "reply-discipline", "dev-protocol", "local-time"] as const;
 for (const name of SHARED_FRAGMENTS) {
   const fragPath = join(SHARED_FRAGMENTS_DIR, `${name}.md.hbs`);
   if (existsSync(fragPath)) {
@@ -316,6 +316,60 @@ export function renderDevProtocolFragment(
   profilesRoot: string = PROFILES_ROOT,
 ): string {
   const fragPath = join(resolve(profilesRoot, "_shared"), "dev-protocol.md.hbs");
+  if (!existsSync(fragPath)) return "";
+  const source = readFileSync(fragPath, "utf-8");
+  const template = Handlebars.compile(source, { noEscape: true });
+  return template(context).trimEnd();
+}
+
+/**
+ * Render the local-time fragment standalone for unconditional append to
+ * every agent's CLAUDE.md. Same unconditional-carrier pattern as
+ * {@link renderDevProtocolFragment}.
+ *
+ * Why this is a PROMPT rule and not only a platform fix: the container
+ * `/etc/localtime` defect (Dockerfile.agent de-symlink) stopped the OS
+ * lying about what UTC is, but nothing stops an agent — or a skill it
+ * writes — from correctly reading a UTC stamp and then showing that UTC
+ * stamp to a human, or from hardcoding `+10:00` / `"AEST"` into a
+ * formatter that then breaks at the DST boundary. Those are prompt-level
+ * failures no amount of tzdata correctness prevents.
+ *
+ * Deliberately zone-AGNOSTIC: it names the `SWITCHROOM_TIMEZONE` → `TZ` →
+ * UTC cascade (the same one `bin/timezone-hook.sh`,
+ * `src/config/timezone.ts` and
+ * `vendor/hindsight-memory/scripts/lib/content.py:_resolve_agent_timezone`
+ * use) rather than baking a resolved zone in. That keeps it correct on
+ * every install, and — unlike a rendered zone — needs no new key threaded
+ * through BOTH the `buildWorkspaceContext` scaffold context and the
+ * hand-curated reconcile `claudeContext`, which must mirror each other
+ * byte-for-byte or the reconcile diff-abort trips.
+ *
+ * Not a duplicate of the existing guidance:
+ * `buildSubAgentLocalTimeLine` (src/agents/sub-agent-telegram-prompt.ts)
+ * reaches Task-tool sub-agents only and says "the wall clock is already
+ * local, treat it as now"; `bin/timezone-hook.sh` injects the current
+ * local time per turn. Neither states a rule about how a timestamp must
+ * be FORMATTED before a human sees it, which is the gap this closes.
+ *
+ * Kept to a heading plus two bullets on purpose — this is prompt budget
+ * every agent pays on every turn, and the worst-case CLAUDE.md byte
+ * ratchet (tests/scaffold.persona.test.ts,
+ * scripts/claude-md-byte-ratchet.txt) had ~18 chars of headroom before
+ * this fragment existed. Its 432 chars are funded by deleting duplicated
+ * rules from profiles/default/CLAUDE.md.hbs in the same change, NOT by
+ * raising the ceiling — which that test forbids. A profiles.test.ts
+ * ratchet pins the fragment at < 500 chars so it cannot creep back.
+ *
+ * Returns the rendered Markdown, or an empty string if the fragment
+ * file is missing (e.g. partial install).
+ */
+export function renderLocalTimeFragment(
+  context: Record<string, unknown> = {},
+  /** Override the profiles root; used by tests. */
+  profilesRoot: string = PROFILES_ROOT,
+): string {
+  const fragPath = join(resolve(profilesRoot, "_shared"), "local-time.md.hbs");
   if (!existsSync(fragPath)) return "";
   const source = readFileSync(fragPath, "utf-8");
   const template = Handlebars.compile(source, { noEscape: true });

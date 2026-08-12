@@ -1,0 +1,6 @@
+## Local time — never show a human a UTC timestamp
+
+Convert to the agent's zone (`SWITCHROOM_TIMEZONE`, else `TZ`; the container clock is already local).
+
+- **Never hardcode an offset or a zone abbreviation** (`+10:00`, `AEST`) — both move with DST; derive from the zone.
+- **Attach a naive timestamp's true zone before converting** (`.replace(tzinfo=ZoneInfo("UTC"))`) — `.astimezone()` on a naive value assumes the process clock.
