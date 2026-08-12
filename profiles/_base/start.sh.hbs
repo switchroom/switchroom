@@ -2475,6 +2475,60 @@ fi
 rm -f "$_session_model_resolved_tmp"
 unset _session_model_resolved_tmp
 
+# --- Agent-process identity record (switchroom#4641) ---
+#
+# The gateway and the agent are SEPARATE processes: the gateway runs as a
+# supervised sidecar (see `_switchroom_supervise gateway` above) while THIS
+# shell becomes the agent via `exec claude` below. A gateway crash respawns
+# only the gateway — this process, its conversation, its in-flight turn and
+# its sub-agents all keep running. The gateway used to read its own boot as
+# "the agent restarted" and fire a false `resume_interrupted` into the live
+# session ("your previous turn was interrupted", "your sub-agents were killed")
+# while everything it named was demonstrably still alive.
+#
+# So publish this process's identity for the gateway to probe:
+#   pid       — `$$`, and because the `exec` below REPLACES this shell rather
+#               than forking, that pid IS the claude process's pid.
+#   starttime — `/proc/<pid>/stat` field 22, clock ticks since host boot.
+#               Assigned at fork and NOT reset by `exec`, so the value read
+#               here is exactly what claude will carry. PIDs are reused (and a
+#               container restart resets the pid namespace), so identity is the
+#               PAIR — the gateway rejects a pid whose starttime disagrees.
+#
+# Deliberately NOT recorded: `comm`. It is "bash" here and becomes claude's
+# after the exec, so recording it would guarantee a mismatch.
+#
+# Written LAST, immediately before the exec: a record must never name a
+# process that does not exist yet. Best-effort throughout — a missing or torn
+# record makes the gateway fail open to its pre-#4641 behaviour.
+_sr_agent_stat=$(cat "/proc/$$/stat" 2>/dev/null || true)
+if [ -n "$_sr_agent_stat" ]; then
+  # comm is parenthesised and may contain spaces/`)`, so split on the LAST ") ".
+  _sr_agent_rest=${_sr_agent_stat##*') '}
+  # Field 22 (starttime) is the 20th field after comm. Subshell + `set -f` so
+  # the word split neither globs nor clobbers this script's positional params.
+  _sr_agent_start=$( set -f; set -- $_sr_agent_rest; printf '%s' "${20}" )
+  case "$_sr_agent_start" in
+    ''|*[!0-9]*) _sr_agent_start="" ;;
+  esac
+  if [ -n "$_sr_agent_start" ]; then
+    _sr_agent_dir="${TELEGRAM_STATE_DIR:-{{agentDir}}/telegram}"
+    mkdir -p "$_sr_agent_dir" 2>/dev/null || true
+    _sr_agent_tmp="$_sr_agent_dir/agent-process.json.tmp.$$"
+    if printf '{"pid":%s,"starttime":"%s","boot_at":%s}\n' \
+         "$$" "$_sr_agent_start" "$(( $(date +%s) * 1000 ))" > "$_sr_agent_tmp" 2>/dev/null; then
+      mv -f "$_sr_agent_tmp" "$_sr_agent_dir/agent-process.json" 2>/dev/null || true
+    fi
+    rm -f "$_sr_agent_tmp" 2>/dev/null || true
+    # Passive context for the agent process itself (diagnostics only — the
+    # gateway reads the FILE; it was already running when this env was set).
+    export SWITCHROOM_AGENT_PID="$$"
+    export SWITCHROOM_AGENT_STARTTIME="$_sr_agent_start"
+    unset _sr_agent_dir _sr_agent_tmp
+  fi
+fi
+unset _sr_agent_stat _sr_agent_rest _sr_agent_start
+
 {{#if useSwitchroomPlugin}}
 if [ -n "$APPEND_PROMPT" ]; then
   exec claude $CONTINUE_FLAG --dangerously-load-development-channels server:switchroom-telegram --plugin-dir "{{securityPluginDir}}"{{#if hindsightEnabled}} --plugin-dir "{{agentDir}}/.claude/plugins/hindsight-memory"{{/if}} $SR_FLEET_ARG --model "$_EFFECTIVE_MODEL" $_EFFORT_ARG{{#if permissionMode}} --permission-mode {{permissionMode}}{{/if}}{{#if fallbackModelQ}} --fallback-model {{{fallbackModelQ}}}{{/if}} --append-system-prompt "$APPEND_PROMPT"{{#if dangerousMode}} --dangerously-skip-permissions{{/if}}{{#if extraCliArgs}}{{{extraCliArgs}}}{{/if}}

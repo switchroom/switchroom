@@ -979,6 +979,7 @@ import {
 } from './resume-inbound-builder.js'
 import { maybeQueueBootBriefing } from './boot-briefing-wiring.js'
 import { writePendingTurnEnv } from './pending-turn-env.js'
+import { shouldSkipBootResumeForGatewayOnlyRespawn } from './agent-process-liveness.js'
 import {
   createBridgeDeadWatchdog,
   consumeBridgeDeadEscalationMarker,
@@ -1656,7 +1657,7 @@ let pendingRedelivery: { turn: Turn; maxAgeMs: number } | null = null
 // boots (the consumed marker's `count`; 0 when no fresh marker). Set in
 // the boot block below, consumed by the watchdog constructor further down.
 let bridgeDeadPriorStreak = 0
-if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqlite + writes .pending-turn.env
+bootResumeInit: if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqlite + writes .pending-turn.env
   // STATE_DIR is `<agentDir>/telegram` in production. openTurnsDb expects
   // the parent (agent dir) and joins `telegram/registry.db` itself.
   const agentDir = STATE_DIR.endsWith('/telegram')
@@ -1667,6 +1668,7 @@ if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqlite + writes .pen
   // schema; subagents lives alongside in registry.db. Idempotent — safe on
   // pre-existing DBs (handles the jsonl_agent_id column migration).
   applySubagentsSchema(turnsDb)
+  if (shouldSkipBootResumeForGatewayOnlyRespawn(STATE_DIR)) break bootResumeInit // #4641: agent process still alive — ONLY the gateway respawned; reaper/resume/pending-env would all be lies
 
   // Read the turn-active marker (the in-flight turn the watchdog tracks)
   // BEFORE classifying — its mtime is "ms since last tool progress" and its

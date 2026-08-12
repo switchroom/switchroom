@@ -129,6 +129,25 @@ now an anomaly worth investigating, not the norm.
   81 MB table.
   `memory_units` (1.7 GB + HNSW) is deliberately left alone. (#4634)
 
+- **A gateway crash no longer tells the live session it restarted.** The
+  gateway and `claude` are separate supervised processes: when only the gateway
+  crashed and respawned (three Bun 1.3.13 SIGBUS crashes on one agent,
+  2026-08-12), its boot block read its own boot as an agent restart. It stamped
+  the STILL-EXECUTING turn `ended_via='restart'`, injected a
+  `resume_interrupted` synthetic ("You just restarted. Your previous turn was
+  interrupted…") into a session that had never stopped, and listed the
+  still-running sub-agents as "killed by the restart" — so the agent abandoned
+  live work and re-ran finished work on a lie. `start.sh` now publishes the
+  agent process's identity (pid + `/proc` starttime, which survives `exec`)
+  immediately before `exec claude`, and the gateway probes it at boot: if that
+  exact process is still alive and predates this gateway, the orphan-turn
+  reaper, the resume synthetic and `.pending-turn.env` are all skipped. Identity
+  is the (pid, starttime) PAIR, never pid alone, so a recycled PID after a
+  container restart cannot masquerade as the live agent; every uncertainty
+  (no record, torn record, unreadable `/proc`) fails open to the previous
+  behaviour, so genuine restarts, watchdog timeouts and first boots are
+  unchanged. (#4641)
+
 - **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
   `hindsight-watch-pg-probe`'s `if:` gate carried `push` and `merge_group` but
   not `workflow_dispatch`, unlike its siblings `e2e-shard` and

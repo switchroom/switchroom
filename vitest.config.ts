@@ -299,6 +299,9 @@ export default defineConfig({
       "**/telegram-plugin/tests/setup-state.test.ts",
       // registry-turns.test.ts uses bun:sqlite — excluded here, run via test:bun.
       "**/telegram-plugin/tests/registry-turns.test.ts",
+      // #4641 gateway-only-respawn OUTCOME suite drives a real turns registry
+      // (bun:sqlite openTurnsDb) — excluded here, run via bun (`tests/`).
+      "**/telegram-plugin/tests/boot-resume-gateway-only-respawn.test.ts",
       // subagents.test.ts uses bun:sqlite + bun:test — excluded here, run via test:bun.
       "**/telegram-plugin/registry/subagents.test.ts",
       // turns-writer.test.ts uses bun:sqlite — excluded here, run via test:bun.
