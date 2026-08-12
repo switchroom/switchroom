@@ -81,6 +81,43 @@ function newer(a: string | null, b: string | null): string | null {
   return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
+/** Default scan window (days) — matches `recencyFactor`'s default. */
+export const DEFAULT_WINDOW_DAYS = 30;
+
+/**
+ * Is this finding inside the scan window ending at `now`?
+ *
+ * `Finding.ts` is an ISO-8601 string or null (`detect.isoFromTs` converts the
+ * unix-seconds `turns.jsonl` field; `detect.extractTs` lifts the gateway log
+ * line's ISO prefix; the standalone sensors stamp `now`). So the only shapes
+ * that reach here are: a parseable ISO instant, an unparseable string, or null.
+ *
+ * Fallback for an undatable finding (null or unparseable `ts`): KEEP it. An
+ * absent timestamp is not evidence of age — it is a gateway line whose prefix
+ * did not match, or a `turns.jsonl` row missing `ts`. Dropping those would
+ * silently erase live signal on a log-format change, which is the worse
+ * failure. They cost nothing in ranking (`recencyFactor(null) === 0`, so an
+ * undatable-only cluster scores 0 and cannot float to the top), but they do
+ * keep contributing their frequency/reach evidence.
+ */
+export function withinWindow(
+  ts: string | null,
+  now: Date,
+  windowDays: number,
+): boolean {
+  if (!ts) return true; // undatable → keep (see above)
+  const t = Date.parse(ts);
+  if (!Number.isFinite(t)) return true; // unparseable → keep
+  const days =
+    Number.isFinite(windowDays) && windowDays > 0
+      ? windowDays
+      : DEFAULT_WINDOW_DAYS;
+  const ageMs = now.getTime() - t;
+  // Future-dated findings (clock skew) are in-window, not stale.
+  if (ageMs < 0) return true;
+  return ageMs < days * 86_400_000;
+}
+
 export interface BuildLedgerOptions {
   ownerAgent?: string;
   now?: Date;
@@ -103,13 +140,27 @@ export function buildLedger(
   opts: BuildLedgerOptions = {},
 ): FleetHealthLedger {
   const now = opts.now ?? new Date();
-  const windowDays = opts.windowDays ?? 30;
+  const windowDays = opts.windowDays ?? DEFAULT_WINDOW_DAYS;
   const priorIdx = indexPriorIssues(opts.prior ?? null);
   const nowIso = now.toISOString();
 
-  // Aggregate findings by dedup_key.
+  // Aggregate findings by dedup_key — WITHIN THE SCAN WINDOW ONLY. `windowDays`
+  // used to damp `priority_score` via `recencyFactor` alone, which floors at
+  // 0.1 and never reaches zero, so a fixed-and-quiet cluster kept its full
+  // historical `frequency`/`reach` and could hold the #1 rank for a whole
+  // window after its last occurrence. Filtering here makes the window mean what
+  // it says: only occurrences inside it count toward frequency, reach, recency
+  // and therefore ranking.
+  //
+  // A cluster whose findings are ALL out of window produces no agg at all, so
+  // it falls through to the close-on-zero path below: if it was open in the
+  // prior ledger it is emitted once as a zero-frequency `closed` issue (so
+  // gh-sync closes its GitHub issue) and then drops out. That is the same
+  // treatment a genuinely-fixed cluster already gets, and it needs no new
+  // "historical context" concept in the ledger shape.
   const aggs = new Map<string, Agg>();
   for (const f of findings) {
+    if (!withinWindow(f.ts, now, windowDays)) continue;
     const m = mapSignal(f.signal);
     const key = dedupKeyFor(f);
     let agg = aggs.get(key);

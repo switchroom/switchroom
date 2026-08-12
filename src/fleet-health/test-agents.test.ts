@@ -76,6 +76,11 @@ describe("runScan excludes test agents from the ledger", () => {
     // this fixture scan. "could not tell" ⇒ always ok, no finding.
     const res = runScan({
       base,
+      // Pin the scan clock next to the fixture's log timestamp: `buildLedger`
+      // windows findings by `windowDays` (default 30) relative to `now`, so a
+      // fixed-`ts` fixture scanned against the wall clock ages out of the
+      // window and the assertions below stop describing anything.
+      now: new Date("2026-07-03T03:00:00Z"),
       hindsightGpuDeps: {
         probe: () => ({ gpuPresent: false, containerToolkit: false, engine: "cloud", reason: "test stub" }),
         capsRead: () => ({ status: "absent", path: "/x", caps: null, detail: "" }),

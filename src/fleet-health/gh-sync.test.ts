@@ -7,6 +7,11 @@ import type { FleetHealthLedger } from "../web/fleet-health-read.js";
 
 const CHAT = "77770003";
 
+/** Pinned scan clock. `buildLedger` windows findings by `windowDays` (default
+ *  30) relative to `now`, so a fixture with a fixed `ts` must pin `now` too —
+ *  otherwise it silently ages out of the window as the wall clock moves. */
+const NOW = new Date("2026-07-03T00:00:00Z");
+
 function dup(agent: string, seq: number): Finding {
   return {
     signal: "duplicate-delivery-represent",
@@ -43,7 +48,9 @@ function fakeDeps(over: Partial<GhSyncDeps> = {}): {
 
 describe("gh-sync (no network — injected deps)", () => {
   it("no-ops with a clear signal when gh is unavailable", () => {
-    const led = buildLedger([dup("clerk", 1), dup("clerk", 2), dup("marko", 3)]);
+    const led = buildLedger([dup("clerk", 1), dup("clerk", 2), dup("marko", 3)], {
+      now: NOW,
+    });
     const { deps } = fakeDeps({
       run: (args) =>
         args[0] === "auth"
@@ -56,7 +63,9 @@ describe("gh-sync (no network — injected deps)", () => {
   });
 
   it("opens an issue with fleet-health + severity + job labels and stores the number", () => {
-    const led = buildLedger([dup("clerk", 1), dup("clerk", 2), dup("marko", 3)]);
+    const led = buildLedger([dup("clerk", 1), dup("clerk", 2), dup("marko", 3)], {
+      now: NOW,
+    });
     const { deps, calls } = fakeDeps();
     const r = syncLedgerIssues(led, "switchroom/switchroom", deps);
     expect(r.skipped).toBe(false);
