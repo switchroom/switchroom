@@ -659,12 +659,44 @@ export const RECALL_WALL_MS =
  * The alternative considered and rejected was warn 6000 / page 8000, 1.31×
  * above that 4578 ms recovery peak, which emits 3 messages instead of 8. It
  * buys five fewer DMs across one recovery in exchange for doubling the
- * detection floor permanently, and it is NOT a drop-in retune: 6000 as a warn
- * would put a fleet running a 7000 ms p95 — slow, and completing, so
- * `recall-deadline-pinning` stays silent on it — one arm away from unwatched.
- * `recall-degradation.test.ts` pins that shape deliberately. If this ever does
- * need retuning, re-derive it against a fresh capture rather than adopting
- * these numbers.
+ * detection floor permanently, and it MOVES THE PAGE LINE: a fleet running a
+ * 7000 ms p95 — slow, and completing, so `recall-deadline-pinning` stays
+ * silent on it — drops from paging to merely warning. That is a real loss of
+ * coverage in the one band only this signal watches, and it is why 6000/8000
+ * is not the retune to reach for.
+ *
+ * ── THE VALIDATED RETUNE, IF 3000 EVER PROVES NOISY (#4616) ───────────────
+ *
+ *   warn 5000 / page 6000
+ *
+ * Derived the same way the shipped pair was: contiguous replay of the live
+ * logs at the true 15-minute cadence, no resampling.
+ *
+ *   line     ticks breaching, 08-08 →   ticks breaching, 08-09 →
+ *   3000                        138/397                     49/301
+ *   5000                         43/397                      0/301
+ *   6000                         39/397                      0/301
+ *
+ * It targets the ONLY complaint against the shipped pair — warn chatter on the
+ * incident's own recovery tail — cutting the 08-08-onward warn breaches by
+ * 69 % (138 → 43) and reaching total silence from 08-09 (0/301 ticks at both
+ * lines), against a settled band whose tick p95 never exceeds 1589 ms from
+ * 08-11 onward.
+ *
+ * Crucially it leaves PAGE at 6000 exactly where it is, so nothing about the
+ * slow-but-completing band changes: a 7000 ms fleet still pages. That is what
+ * makes this pair drop-in where 6000/8000 was not. The cost, stated plainly:
+ * warn moves from 2.0× to 3.4× the healthy p95 of 1477 ms, so the early-warning
+ * arm gets less sensitive. Only take that trade if 3000 is actually generating
+ * DMs a human ignores.
+ *
+ * `recall-degradation.test.ts` derives its slow-but-completing fixture FROM
+ * these constants rather than hard-coding a millisecond literal, so applying
+ * the retune above is a two-constant edit that leaves the suite green — the
+ * escape hatch is executable, not just documented. It also pins, separately
+ * and independently of the numbers, that a fleet at the page line still pages
+ * while `recall-deadline-pinning` stays silent: a retune that gave up that
+ * band would fail there rather than passing quietly.
  */
 export const RECALL_P95_WARN_MS = 3000;
 export const RECALL_P95_PAGE_MS = 6000;
@@ -707,6 +739,42 @@ export const RECALL_P95_PAGE_MS = 6000;
  * see `evaluateRecallQualityRegression`. That reuses the existing constants
  * deliberately: the two signals then partition the space instead of both
  * shouting about the same collapse.
+ *
+ * ── THE POOL ARM CARRIES ITS OWN MEASUREMENT (#4615) ──────────────────────
+ *
+ * The two constants above were derived from the SCORE series, and the pool arm
+ * originally borrowed them by assumption. It no longer does. Replayed
+ * contiguously over the live logs — 25 247 rows across 12 agents,
+ * 2026-04-30 → 2026-08-12, reduced to 9 897 ticks at the true 15-minute
+ * cadence, each tick reading the same trailing window a production tick reads
+ * and folding the baseline in `run.ts`'s fold-then-evaluate order:
+ *
+ *   population (pool baseline above the gate)   ticks   ≥0.4   ≥0.6
+ *   2026-07-29 → 08-12                           1356      0      0
+ *
+ * ZERO false fires, and the margin is not marginal: across all 1356 ticks the
+ * observed pool median never once fell BELOW its trailing baseline at all. The
+ * worst excursion is a 1.14 % SURPLUS, and the settled era sits a median 7.95 %
+ * above baseline. Any line down to a few percent would have measured 0 too.
+ *
+ * That is the honest shape of the result, and it is stated rather than dressed
+ * up: the repaired fleet's pool RECOVERED monotonically (baseline 13 → 88 over
+ * the window), so the live replay proves the arm is quiet and cannot, on its
+ * own, bound its behaviour on a stationary series. The bound comes from the
+ * committed fixture instead, which is a stratified sample with the extremes
+ * forced back in and therefore HARSHER than real trailing windows: over every
+ * contiguous 60-row window of `repaired-fleet.fixture.ts` the worst window
+ * median is 17.5 % below the fixture's own median, so 0.4 clears the worst
+ * observed healthy excursion by 2.29× and 0.6 by 3.43×. Both numbers are
+ * pinned by `recall-degradation.test.ts` so they cannot drift silently.
+ *
+ * The pre-repair eras fire heavily (1251 ticks across 05-01 → 07-19) and those
+ * are TRUE positives, not noise. 1004 of them land on a tick where
+ * `recall-candidate-floor` is already breaching, so they cost no extra DM. The
+ * other 247 are the ones that justify the arm existing: pool medians of 9-13
+ * against baselines of 15-28 — 40-54 % regressions sitting comfortably ABOVE
+ * the absolute floor's warn line of {@link RECALL_POOL_MEDIAN_WARN} (8), which
+ * is exactly the band no floor can see.
  */
 export const RECALL_QUALITY_DROP_WARN = 0.4;
 export const RECALL_QUALITY_DROP_PAGE = 0.6;
@@ -787,6 +855,31 @@ export const RECALL_BASELINE_MAX_OBS_PER_DAY = 96;
  * every day from 08-08 on is silent on both. A 60× gap is what earns a
  * two-tier split here: the old ratio's 6× spread genuinely could not support
  * one, which is why it carried a single severity, and this one can.
+ *
+ * ── THE "0.2 %-TO-5 % BLIND BAND" IS A UNIT ARTIFACT, AND WARN STAYS AT 5 % ─
+ *
+ * Review raised that 07-28 (3.08 %) and 07-30 (4.28 %) sit under the warn line
+ * while still truncating, so a lower warn would be strictly better. Measured,
+ * it is not, because those two numbers are CALENDAR-DAY row rates and this
+ * signal never evaluates a calendar day — `evaluateRecallDeadlinePinning`
+ * scores the trailing window a tick reads. Replayed in the unit the signal
+ * actually uses (9 897 real ticks, 15-minute cadence):
+ *
+ *   day      row rate   tick median   ticks already ≥5 % warn
+ *   07-28      3.08 %       5.75 %                     70/96
+ *   07-30      4.28 %       5.33 %                     88/96
+ *
+ * Both days already warn on the large majority of their ticks, because a
+ * trailing 24 h window on 07-28 still holds 07-27's 36.4 % tail. There is no
+ * blind band to close.
+ *
+ * Lowering the line is not free either. From 08-09 onward every candidate down
+ * to 0.5 % measures 0/301 ticks, so the settled fleet is genuinely silent at
+ * any of them — but 08-08, the day whose 0.20 % row rate IS the healthy
+ * ceiling quoted above, goes from 22 breaching ticks at 5 % to 41 at 1 %, for
+ * the same trailing-window reason. Warn 5 % is kept: it already covers the
+ * shape review wanted covered, and moving it would only add chatter to the
+ * healthiest day in the record.
  */
 export const RECALL_DEADLINE_HIT_WARN = 0.05;
 export const RECALL_DEADLINE_HIT_PAGE = 0.2;

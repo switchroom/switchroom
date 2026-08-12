@@ -310,19 +310,105 @@ describe("the 2026-08-01 → 08-07 degradation the fourteen existing signals mis
   });
 
   it("latency alone cannot distinguish 'slow' from 'cut off' — which is why pinning is separate", () => {
-    // 7 s against a 10 s wall: genuinely slow, pages on latency, and NOT
-    // truncated. Collapsing the two signals would put the wrong remedy in the
-    // DM for this shape.
+    // Genuinely slow against a 10 s wall, pages on latency, and NOT truncated.
+    // Collapsing the two signals would put the wrong remedy in the DM for this
+    // shape.
+    //
+    // The fixture is DERIVED FROM THE CONSTANTS, not written as a millisecond
+    // literal (#4616). It used to sit at a hard-coded 7000 ms, which silently
+    // coupled this test to the specific value of `RECALL_P95_PAGE_MS`: the
+    // retune documented next to that constant could not be applied without
+    // reddening a test whose actual claim — that latency and pinning separate
+    // a slow fleet from a truncated one — has nothing to do with any
+    // particular number. A documented escape hatch that cannot be executed is
+    // not an escape hatch, so the coupling is removed rather than described.
     const slowButCompleting = sickRows({
       score: 0.7,
       pool: 90,
-      latP50: 6000,
-      latP95: 7000,
+      latP50: RECALL_P95_WARN_MS,
+      latP95: RECALL_P95_PAGE_MS + 1000,
       deadlineHitRate: 0,
     });
     const ring = ringOf(slowButCompleting);
     expect(evaluateRecallLatency(ring).severity).toBe("page");
     expect(evaluateRecallDeadlinePinning(ring).state).toBe("ok");
+  });
+
+  it("the slow-but-completing band stays PAGE-covered under any retune", () => {
+    // The coverage claim the previous test used to carry by accident, now
+    // asserted on purpose (#4616).
+    //
+    // ANCHORED ON THE WALL, NOT ON THE CONSTANTS. This is the one claim here
+    // that must NOT be derived from the thresholds: a test whose fixture moves
+    // with the line it is checking can never detect the line moving, and the
+    // first cut of this test did exactly that — it passed under the rejected
+    // 6000/8000 pair, the one pair it exists to reject. The band is defined by
+    // the fleet's deadline, which is a property of the fleet: a fleet whose
+    // p95 has reached 70 % of the wall is slow enough to be one drift away
+    // from truncating, and because it is still COMPLETING,
+    // `recall-deadline-pinning` has no truncation rate to report and stays
+    // silent. `recall-latency` is the only signal on it, so that band must
+    // reach PAGE, not merely warn.
+    //
+    // A retune is free to move where warning starts. It is not free to hand
+    // this band to the warn arm and leave nothing paging — which is precisely
+    // what warn 6000 / page 8000 did, and why it reddens here.
+    const wall = 9993; // `deadline_effective_ms` the fixtures carry
+    const nearWall = ringOf(
+      sickRows({
+        score: 0.7,
+        pool: 90,
+        latP50: Math.round(wall * 0.6),
+        latP95: Math.round(wall * 0.7),
+        deadlineHitRate: 0,
+      }),
+    );
+    expect(evaluateRecallLatency(nearWall).severity).toBe("page");
+    expect(evaluateRecallDeadlinePinning(nearWall).state).toBe("ok");
+    // Stated as the invariant it is, so the failure message names the rule
+    // rather than a millisecond: page must sit at or below 70 % of the wall.
+    expect(RECALL_P95_PAGE_MS).toBeLessThanOrEqual(Math.round(wall * 0.7));
+
+    // …and the band between the two arms is still WATCHED, just not paged.
+    // This half IS threshold-relative — it is a claim about the arms, not
+    // about the fleet — so it derives its fixture from the constants and
+    // survives any retune that keeps the arms ordered.
+    const betweenTheArms = ringOf(
+      sickRows({
+        score: 0.7,
+        pool: 90,
+        latP50: Math.round(RECALL_P95_WARN_MS * 0.8),
+        latP95: Math.round((RECALL_P95_WARN_MS + RECALL_P95_PAGE_MS) / 2),
+        deadlineHitRate: 0,
+      }),
+    );
+    expect(evaluateRecallLatency(betweenTheArms).severity).toBe("warn");
+    expect(evaluateRecallDeadlinePinning(betweenTheArms).state).toBe("ok");
+    expect(RECALL_P95_PAGE_MS).toBeGreaterThan(RECALL_P95_WARN_MS);
+  });
+
+  it("the sub-5 % truncation days are NOT in a blind band — they already warn", () => {
+    // Review read 07-28 (3.08 %) and 07-30 (4.28 %) as falling under the warn
+    // line, and proposed lowering it. Those are CALENDAR-DAY row rates, and
+    // this signal never scores a calendar day — it scores the trailing window
+    // a tick reads, where the same two days measure 5.75 % and 5.33 % because
+    // the window still holds 07-27's 36.4 % tail. Replayed over the live logs,
+    // 70/96 and 88/96 of their ticks already breach.
+    //
+    // Asserted so the premise cannot silently become true: raising
+    // `RECALL_DEADLINE_HIT_WARN` above the measured tick-level rate of the
+    // mildest such day would open the band review was worried about, and fail
+    // here.
+    for (const [day, tickRate] of [
+      ["07-30", 0.0533],
+      ["07-28", 0.0575],
+    ] as const) {
+      const v = evaluateRecallDeadlinePinning(
+        ringOf(sickRows({ score: 0.7, pool: 90, latP50: 1200, latP95: 1600, deadlineHitRate: tickRate })),
+      );
+      expect(`${day}:${v.state}/${v.severity}`).toBe(`${day}:breach/warn`);
+    }
+    expect(RECALL_DEADLINE_HIT_WARN).toBeLessThanOrEqual(0.0533);
   });
 });
 
@@ -425,6 +511,56 @@ describe("the three new signals stay silent on the REAL repaired fleet", () => {
       expect(`${line}:${rate}:${windows > 100}`).toBe(`${line}:0:true`);
     }
     expect(RECALL_P95_PAGE_MS).toBeGreaterThan(RECALL_P95_WARN_MS);
+  });
+
+  it("the POOL ARM's own false-fire rate is measured, not borrowed (#4615)", () => {
+    // `RECALL_QUALITY_DROP_WARN` / `_PAGE` were derived from the SCORE series
+    // and the pool arm used to reuse them by assumption. This is the pool
+    // series' own measurement, taken the same contiguous way as the latency
+    // lines above.
+    //
+    // WHY THE FIXTURE AND NOT THE LIVE REPLAY. Replaying the real logs gives
+    // 0/1356 fires at both lines, but the repaired fleet's pool RECOVERED
+    // monotonically (baseline 13 → 88), so the observed median never once fell
+    // below its trailing baseline and the worst excursion is a 1.14 % SURPLUS.
+    // A rate of zero taken over a series that never dipped bounds nothing —
+    // it would read zero at a 2 % line too. The fixture is the harsher
+    // population: it is a stratified sample with the smallest pools forced back
+    // in, so its contiguous windows swing further than any real trailing
+    // window does, and a margin measured against it is conservative.
+    const pool = REPAIRED_FLEET_ROWS.filter((r) => typeof r.pre_cap_count === "number").map(
+      (r) =>
+        (r.pre_cap_count as number) +
+        (typeof r.overlap_dropped === "number" ? r.overlap_dropped : 0),
+    );
+    // The arm's own statistic, so the reducer's definition is used rather than
+    // a second one invented here.
+    const base = summarizeRecallRows(rows).poolMedian!;
+    expect(base).toBeGreaterThan(0);
+
+    const median = (v: number[]): number => {
+      const s = [...v].sort((a, b) => a - b);
+      return s.length % 2 ? s[(s.length - 1) / 2]! : (s[s.length / 2 - 1]! + s[s.length / 2]!) / 2;
+    };
+    const dropOf = (w: number[]) => Math.max(0, (base - median(w)) / base);
+
+    for (const line of [RECALL_QUALITY_DROP_WARN, RECALL_QUALITY_DROP_PAGE]) {
+      const { rate, windows } = contiguousFireRate(pool, (w) => dropOf(w) >= line);
+      expect(`${line}:${rate}:${windows > 100}`).toBe(`${line}:0:true`);
+    }
+
+    // The MEASUREMENT itself, recorded so it cannot drift silently. The worst
+    // contiguous 60-row window sits 17.5 % below the fixture's own median, so
+    // the shipped warn clears the worst observed healthy excursion by 2.29×.
+    // Lowering `RECALL_QUALITY_DROP_WARN` into that excursion — or regenerating
+    // the fixture into a dippier population — reddens this line rather than
+    // quietly turning the pool arm into a chatter source.
+    let worst = 0;
+    for (let i = 0; i + 60 <= pool.length; i++) worst = Math.max(worst, dropOf(pool.slice(i, i + 60)));
+    expect(worst).toBeGreaterThan(0.15);
+    expect(worst).toBeLessThan(0.18);
+    expect(RECALL_QUALITY_DROP_WARN).toBeGreaterThan(worst * 2);
+    expect(RECALL_QUALITY_DROP_PAGE).toBeGreaterThan(worst * 3);
   });
 
   it("no contiguous window of repaired traffic comes near the truncation lines", () => {
