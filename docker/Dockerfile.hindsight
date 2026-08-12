@@ -6423,7 +6423,8 @@ PYEOF
 #     upstream wrote it. The fix is not a cleverer predicate; it is evaluating
 #     the same predicate over a bounded number of rows at a time.
 #
-# THE FIX — two independent mechanisms, each with one job.
+# THE FIX — independent mechanisms, each with one job. B1-B3 shipped in #4624;
+# B4 is the #4635 follow-up that block filed against itself.
 #
 #   B1 BOUNDED PAGES bound the STATEMENT. `prune_stale_cooccurrences` now
 #      sweeps ONE keyset-paginated page of at most `batch_size` cooccurrence
@@ -6546,6 +6547,43 @@ PYEOF
 #      command_timeout. 1,000 is the point that keeps ~135x headroom on the
 #      worst measured page while keeping a slice down to ~25 statements.
 #
+#   B4 THE OUTER RETRY RESUMES INSTEAD OF RESTARTING (#4635). Shipped as a
+#      follow-up to the block above, which documented this as known and
+#      accepted.
+#
+#      There are THREE nested budgets around Pass 3, not two: the slice-level
+#      `retry_with_backoff(_run_cooccurrence_prune, max_retries=8)` below, the
+#      PER-PAGE `retry_with_backoff(lambda: _run_page(...), max_retries=8)`
+#      inside the loop, and the timeout-only shrink ladder (<=4 halvings). A
+#      retryable NON-timeout error — connection reset, deadlock, transient pool
+#      failure — is retried nine times by the per-page budget first; only if all
+#      nine fail does it reach the slice-level one, which used to re-enter
+#      `_run_cooccurrence_prune` with its cursor freshly `None` and re-sweep
+#      every page already committed. Idempotent (delete-if-stale), but up to 9x
+#      a slice, and a slice is 3-6 s on the largest banks.
+#
+#      THE FIX IS A SCOPE, NOT A CONTRACT. The eight progress variables move
+#      from the helper's frame to the enclosing one and the helper declares them
+#      `nonlocal`. `retry_with_backoff` is not touched — Passes 1 and 2 call the
+#      same wrapper with the same semantics, byte for byte — which is what makes
+#      this a narrow change rather than the shared-wrapper refactor #4624
+#      deferred. The slice-level budget is KEPT: its remaining honest job is the
+#      one call it covers that the per-page budget does not, `count_bank_
+#      cooccurrences`, and a failure there is the one place restarting IS free
+#      because no page has been swept yet.
+#
+#      Pinning `slice_count` / `slice_index` on first entry is a CORRECTNESS
+#      requirement, not just an optimisation: `slice_index` is derived from
+#      `time.time()`, so a retry seconds later can compute a different slice,
+#      and carrying the old slice's cursor into it would silently skip every row
+#      below that cursor. `slice_count is None` is the resumption sentinel.
+#
+#      Behavioural proof: the R_ checks in
+#      tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts inject a
+#      non-timeout retryable error mid-slice, exhaust the per-page budget, and
+#      assert the retry's first page carries the LAST COMMITTED cursor (not
+#      None) and that no page is swept twice.
+#
 # PER-BATCH TRANSACTIONS ARE LOAD-BEARING, not incidental. Each page runs in
 # its own transaction, so (a) a page that times out cannot roll back the pages
 # that already succeeded, (b) row locks taken by the `FOR UPDATE OF c` ordered
@@ -6570,14 +6608,6 @@ PYEOF
 #   * The Oracle path. It returns `scanned=0`, which terminates the caller's
 #     loop after one call — i.e. exactly upstream's single-statement behaviour.
 #     Deliberate dialect asymmetry, like the #2529 note already in that file.
-#
-# KNOWN, ACCEPTED, NOT FIXED HERE. The outer `retry_with_backoff(...,
-# max_retries=8)` that wraps `_run_cooccurrence_prune` is upstream's and is
-# untouched, so a retryable NON-timeout error escaping the inner per-page loop
-# restarts the whole slice from cursor `None`. Idempotent (the sweep is a
-# delete-if-stale), but up to 9x wasted work on a slice. Collapsing the two
-# budgets means changing a retry wrapper shared with Passes 1 and 2 — a
-# separate concern with its own blast radius, tracked rather than smuggled in.
 #
 # NO NEW ENV KNOBS. `batch_size` / slice sizing / slice period are module
 # constants rather than `HINDSIGHT_API_*` settings: a knob would have to be
@@ -7288,6 +7318,38 @@ apply("engine/graph_maintenance.py", (
     "            async with conn.transaction():\n"
     "                return await store.prune_stale_cooccurrences(conn=conn, fq_table=fq_table, bank_id=bank_id)\n"
 ), (
+    "    # switchroom (#4635): the sweep's PROGRESS lives in this enclosing scope, not\n"
+    "    # in _run_cooccurrence_prune's own frame, and that placement IS the fix.\n"
+    "    #\n"
+    "    # The helper is wrapped by retry_with_backoff(max_retries=_SWEEP_MAX_RETRIES),\n"
+    "    # so a retryable error that escapes the per-page budget below RE-ENTERS it.\n"
+    "    # With the cursor local to the helper, that re-entry restarted the slice from\n"
+    "    # cursor None and re-swept every page already committed — correct (the sweep\n"
+    "    # is delete-if-stale, so a re-run page deletes nothing the second time) but up\n"
+    "    # to 9x the work of a slice, which is 3-6 s on the largest banks. Hoisting the\n"
+    "    # state ONE scope out turns that restart into a RESUME.\n"
+    "    #\n"
+    "    # NOTHING SHARED CHANGES. retry_with_backoff is untouched — the same wrapper\n"
+    "    # Passes 1 and 2 use, with the same contract for them. The only thing that\n"
+    "    # moved is which frame owns eight local variables.\n"
+    "    #\n"
+    "    # slice_count doubles as the RESUMPTION SENTINEL: None means 'this run has not\n"
+    "    # sized the bank yet'. Re-deriving the slice on a retry would be a CORRECTNESS\n"
+    "    # bug, not merely waste — slice_index is a function of time.time(), so a retry\n"
+    "    # seconds later can land on a DIFFERENT slice, and carrying an old slice's\n"
+    "    # cursor into a new one skips every row below it. Pinning both on first entry\n"
+    "    # makes that impossible, and stops the bank being re-counted per attempt. A\n"
+    "    # failure BEFORE the count still recounts, which is the one place restarting\n"
+    "    # is genuinely free: no page has been swept yet.\n"
+    "    total_rows = 0\n"
+    "    slice_count: int | None = None\n"
+    "    slice_index = 0\n"
+    "    batch_size = _SWEEP_BATCH_SIZE\n"
+    "    after_1: str | None = None\n"
+    "    after_2: str | None = None\n"
+    "    deleted = 0\n"
+    "    pages = 0\n"
+    "\n"
     "    async def _run_cooccurrence_prune() -> int:\n"
     "        # The orphan prune above cascades cooccurrences via FK. This explicit\n"
     "        # pass catches the *stale-count* case: both entities still exist but no\n"
@@ -7332,17 +7394,31 @@ apply("engine/graph_maintenance.py", (
     "        # recently-touched entities: nothing durable records the entities of a\n"
     "        # deleted unit, so a watermark would silently miss every staleness\n"
     "        # source that failed to enqueue, for ever.\n"
-    "        async with acquire_with_retry(backend) as conn:\n"
-    "            total_rows = await store.count_bank_cooccurrences(\n"
-    "                conn=conn, fq_table=fq_table, bank_id=bank_id\n"
+    "        #\n"
+    "        # switchroom (#4635): every one of these is the ENCLOSING scope's, so an\n"
+    "        # outer retry of this helper resumes the slice instead of restarting it.\n"
+    "        # See the block comment above the initialisers for why.\n"
+    "        nonlocal total_rows, slice_count, slice_index, batch_size\n"
+    "        nonlocal after_1, after_2, deleted, pages\n"
+    "\n"
+    "        if slice_count is None:\n"
+    "            async with acquire_with_retry(backend) as conn:\n"
+    "                total_rows = await store.count_bank_cooccurrences(\n"
+    "                    conn=conn, fq_table=fq_table, bank_id=bank_id\n"
+    "                )\n"
+    "            slice_count = _sweep_slice_count(total_rows)\n"
+    "            slice_index = _sweep_slice_index(time.time(), slice_count)\n"
+    "        elif after_1 is not None or pages:\n"
+    "            # Only reachable via the outer retry_with_backoff. Logged at WARNING\n"
+    "            # because reaching it at all means a page exhausted its own 9-attempt\n"
+    "            # budget — rare, and worth seeing — while the RESUME itself is the\n"
+    "            # cheap outcome, not the alarming one.\n"
+    "            logger.warning(\n"
+    "                f\"[GRAPH_MAINT] bank={bank_id} cooccurrence sweep RESUMING slice \"\n"
+    "                f\"{slice_index}/{slice_count} at cursor ({after_1}, {after_2}) after \"\n"
+    "                f\"{pages} page(s) and {deleted} row(s) already committed; batch_size \"\n"
+    "                f\"{batch_size}, operation_id={operation_id}\"\n"
     "            )\n"
-    "        slice_count = _sweep_slice_count(total_rows)\n"
-    "        slice_index = _sweep_slice_index(time.time(), slice_count)\n"
-    "        batch_size = _SWEEP_BATCH_SIZE\n"
-    "        after_1: str | None = None\n"
-    "        after_2: str | None = None\n"
-    "        deleted = 0\n"
-    "        pages = 0\n"
     "\n"
     "        async def _run_page(size: int):\n"
     "            # Each page is its OWN transaction. Load-bearing three times over: a\n"
@@ -7584,6 +7660,70 @@ assert prune.index("continue") < prune.index("after_1 = page.last_entity_id_1"),
     f"{TAG}: shrink-and-retry must re-run the SAME cursor, not advance past the page it failed on"
 )
 
+# ── #4635: the outer retry must RESUME the slice, not restart it ─────────────
+# The helper is wrapped by retry_with_backoff(max_retries=_SWEEP_MAX_RETRIES),
+# so a retryable error that escapes the per-page budget RE-ENTERS it. Whether
+# that re-entry resumes or restarts is decided by ONE thing: which frame owns
+# the cursor. Pin that frame.
+state_head, _, state_tail = gm.partition("    async def _run_cooccurrence_prune")
+assert (
+    "\n    total_rows = 0\n"
+    "    slice_count: int | None = None\n"
+    "    slice_index = 0\n"
+    "    batch_size = _SWEEP_BATCH_SIZE\n"
+    "    after_1: str | None = None\n"
+    "    after_2: str | None = None\n"
+    "    deleted = 0\n"
+    "    pages = 0\n"
+) in state_head, (
+    f"{TAG}: the sweep's progress is not initialised in the scope ENCLOSING "
+    "_run_cooccurrence_prune. Owned by the helper's own frame, every outer retry "
+    "restarts the slice from cursor None and re-sweeps every page already committed "
+    "— up to 9x a slice (#4635)"
+)
+assert (
+    "        nonlocal total_rows, slice_count, slice_index, batch_size\n"
+    "        nonlocal after_1, after_2, deleted, pages\n"
+) in prune, (
+    f"{TAG}: _run_cooccurrence_prune no longer declares the sweep state nonlocal. "
+    "Without it every assignment in the loop rebinds a fresh LOCAL and the enclosing "
+    "cursor never moves — the outer retry would resume from None, i.e. restart (#4635)"
+)
+# The defeat this guards is a one-line re-add: any `after_1 = None` (or a
+# `pages = 0` / `deleted = 0`) back inside the helper silently restores
+# restart-from-the-top while every other assert here stays green.
+_RESET_LITERALS = ("None", "0", "_SWEEP_BATCH_SIZE")
+for _line in prune.split("\n"):
+    # Exactly 8 spaces = _run_cooccurrence_prune's own body. Deeper indents are
+    # inside the `if slice_count is None:` guard or the loop, where assignment
+    # is the point; shallower is a different function.
+    if not (_line.startswith("        ") and _line[8:9] not in (" ", "")):
+        continue
+    _name = _line.strip().split(":")[0].split("=")[0].strip()
+    if _name not in ("after_1", "after_2", "deleted", "pages", "batch_size", "slice_count"):
+        continue
+    assert not _line.rstrip().endswith(_RESET_LITERALS), (
+        f"{TAG}: _run_cooccurrence_prune re-initialises the sweep state at its own "
+        f"body level ({_line.strip()!r}). That resets the cursor on every outer "
+        "retry, which is exactly the restart-from-cursor-None waste #4635 removed"
+    )
+# The slice must be pinned on FIRST entry only. slice_index is a function of
+# time.time(), so re-deriving it on a retry can land on a DIFFERENT slice while
+# the cursor still refers to the old one — every row below that cursor in the
+# new slice would be skipped. That is a correctness bug, not waste.
+assert "        if slice_count is None:\n" in prune, (
+    f"{TAG}: the bank sizing / slice derivation is not guarded by the resumption "
+    "sentinel, so a retry re-derives slice_index from a LATER clock and can carry the "
+    "previous slice's cursor into a different slice (#4635)"
+)
+assert prune.index("if slice_count is None:") < prune.index("slice_count = _sweep_slice_count(total_rows)"), (
+    f"{TAG}: the slice is derived outside the first-entry guard"
+)
+assert "cooccurrence sweep RESUMING slice" in prune, (
+    f"{TAG}: a resumed sweep is silent. Reaching the resume path means a page "
+    "exhausted its own 9-attempt budget; that must be visible in the log"
+)
+
 ops = (BASE / "engine/db/ops.py").read_text()
 assert "class CooccurrenceSweepBatch" in ops, f"{TAG}: the page result type is missing"
 for rel in ("engine/db/ops_postgresql.py", "engine/db/ops_oracle.py", "engine/memories/pg/graph.py", "engine/memories/base.py"):
@@ -7612,7 +7752,8 @@ print(
     f"{TAG}: Pass 3 now sweeps bounded keyset pages (LIMIT-capped, cursor-advancing, "
     "one transaction each) over a hash slice whose COUNT is derived from the size of "
     "the bank (1 slice below _SWEEP_SLICE_TARGET_ROWS, so a bank that sweeps whole is "
-    "never rotated), halving the page on a timeout; the #2473 predicate and the #2529 "
+    "never rotated), halving the page on a timeout and RESUMING from the last committed "
+    "cursor when the outer retry re-enters (#4635); the #2473 predicate and the #2529 "
     "ordered lock are unchanged"
 )
 PYEOF
