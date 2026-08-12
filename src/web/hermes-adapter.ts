@@ -771,6 +771,29 @@ export async function handleHermesRest(
     return { status: 200, body: { session: toHermesSession(id, agent, agentLiveness(config, agentName), config) } };
   }
 
+  // DELETE /api/sessions/:id — `deleteSession` (apps/desktop/src/hermes.ts:755-761)
+  // has no catch, so whatever comes back is what the sidebar's delete action
+  // does. A switchroom session IS an agent, and an agent is created and removed
+  // by editing `switchroom.yaml` and applying — there is no per-session row to
+  // drop. That makes this route genuinely unsupported, but a bare 404 is the
+  // wrong way to say so: `isEndpointMissingError` reads 404 as "old backend,
+  // fall back", so the desktop cannot tell a refused delete from a dead
+  // gateway. 422 with a reason is the same answer the schedule-write branch
+  // above already gives, and the desktop surfaces the body.
+  //
+  // Unknown ids are refused identically rather than 404-ing: deletion is
+  // unsupported for every id, so branching on existence would leak a
+  // distinction that has no bearing on the outcome.
+  if (method === "DELETE" && sessionMatch) {
+    return {
+      status: 422,
+      body: {
+        error:
+          "Sessions are switchroom agents — remove the agent from switchroom.yaml and apply, rather than deleting a session here.",
+      },
+    };
+  }
+
   // GET /api/sessions/:id/messages — conversation history (SessionMessagesResponse shape)
   //
   // The `pagination` object is load-bearing, not decoration. `getAllSessionMessages`
@@ -1047,6 +1070,53 @@ export async function handleHermesRest(
   // GET /api/env — API keys / env-var panel; no agent env vars to surface
   if (method === "GET" && pathname === "/api/env") {
     return { status: 200, body: {} };
+  }
+
+  // PUT /api/env — `setEnvVar` (apps/desktop/src/hermes.ts:891-898) has no
+  // catch. Switchroom agent environments are composed from `switchroom.yaml`
+  // plus the encrypted vault and are re-materialised on apply, so a value
+  // written here would be silently discarded at the next reconcile. Refuse it
+  // in the shape the desktop can render, not with a 404 that
+  // `isEndpointMissingError` mistakes for an old backend.
+  if (method === "PUT" && pathname === "/api/env") {
+    return {
+      status: 422,
+      body: {
+        error:
+          "Agent environment is owned by switchroom.yaml and the encrypted vault — set the value there and apply; edits made here would be discarded on the next reconcile.",
+      },
+    };
+  }
+
+  // GET|PUT /api/memory/providers/:provider/config — the memory settings pane
+  // (`getMemoryProviderConfig` / `saveMemoryProviderConfig`,
+  // apps/desktop/src/hermes.ts:868-882; both always append `?surface=declared`).
+  //
+  // `fields: []` is not a stub: `MemoryProviderConfig` is
+  // `{docs_url, fields, label, name}` (apps/desktop/src/types/hermes.ts:151-156)
+  // and the panel that consumes it returns null on an empty field list —
+  // "Providers without a declared config surface (e.g. builtin) render nothing"
+  // (apps/desktop/src/app/settings/memory/provider-config-panel.tsx:80-82).
+  // That is precisely switchroom's situation: memory is Hindsight over MCP,
+  // declared in `switchroom.yaml` and credentialed through the vault, with no
+  // key the console may edit. Upstream answers an undeclared provider with this
+  // same shape (`hermes_cli/web_server.py:6125`), so the pane collapses cleanly
+  // instead of rendering an empty form that cannot save.
+  const memoryConfigMatch = pathname.match(/^\/api\/memory\/providers\/([^/]+)\/config$/);
+  if (memoryConfigMatch) {
+    const provider = decodeURIComponent(memoryConfigMatch[1]);
+    if (method === "GET") {
+      return { status: 200, body: { name: provider, label: provider, docs_url: "", fields: [] } };
+    }
+    if (method === "PUT") {
+      return {
+        status: 422,
+        body: {
+          error:
+            "Memory providers are declared in switchroom.yaml and credentialed through the vault — there is no console-writable configuration to save.",
+        },
+      };
+    }
   }
 
   // POST /api/providers/validate — credential check; switchroom has no API keys

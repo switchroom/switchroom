@@ -261,7 +261,7 @@ const CENSUS: CensusRow[] = [
   { line: 637, method: "PATCH", path: `/api/sessions/${AGENT}`, served: false, note: "setSessionArchived" },
   { line: 650, method: "PATCH", path: `/api/sessions/${AGENT}`, served: false, note: "setSessionPinnedRemote" },
   { line: 770, method: "PATCH", path: `/api/sessions/${AGENT}`, served: false, note: "renameSession" },
-  { line: 758, method: "DELETE", path: `/api/sessions/${AGENT}`, served: false, note: "deleteSession" },
+  { line: 758, method: "DELETE", path: `/api/sessions/${AGENT}`, served: true, note: "deleteSession — refused 422, see the route comment" },
 
   // ── status / config / model ───────────────────────────────────────────────
   { line: 787, method: "GET", path: "/api/status", served: true },
@@ -280,7 +280,7 @@ const CENSUS: CensusRow[] = [
 
   // ── env / providers ───────────────────────────────────────────────────────
   { line: 887, method: "GET", path: "/api/env", served: true },
-  { line: 894, method: "PUT", path: "/api/env", served: false },
+  { line: 894, method: "PUT", path: "/api/env", served: true, note: "refused 422 — env is YAML+vault owned" },
   { line: 956, method: "DELETE", path: "/api/env", served: false },
   { line: 965, method: "POST", path: "/api/env/reveal", served: false },
   { line: 907, method: "POST", path: "/api/providers/validate", served: true },
@@ -315,14 +315,15 @@ const CENSUS: CensusRow[] = [
     line: 871,
     method: "GET",
     path: "/api/memory/providers/hindsight/config",
-    served: false,
+    served: true,
     note:
-      "Still unimplemented. The adapter used to serve the bare " +
-      "/api/memory/providers instead — a path with no upstream route " +
-      "(hermes_cli/memory_oauth.py:18 mounts the prefix but registers no bare " +
-      "handler) and no call site; that dead stub has been deleted.",
+      "Served with an empty declared surface ({name, label, docs_url, fields: []}). " +
+      "The adapter used to serve the bare /api/memory/providers instead — a " +
+      "path with no upstream route (hermes_cli/memory_oauth.py:18 mounts the " +
+      "prefix but registers no bare handler) and no call site; that dead stub " +
+      "has been deleted.",
   },
-  { line: 878, method: "PUT", path: "/api/memory/providers/hindsight/config", served: false },
+  { line: 878, method: "PUT", path: "/api/memory/providers/hindsight/config", served: true, note: "refused 422 — no console-writable memory config" },
   { line: 1024, method: "POST", path: "/api/memory/providers/hindsight/oauth/start", served: false },
   { line: 1032, method: "GET", path: "/api/memory/providers/hindsight/oauth/status", served: false },
   { line: 1865, method: "GET", path: "/api/memory", served: false },
@@ -880,11 +881,6 @@ const CONTRACT: ContractCase[] = [
     path: `/api/sessions/${AGENT}`,
     client: "hermes.ts:755-761 (deleteSession) — no catch",
     server: "hermes_cli/web_routers/sessions.py:655",
-    gap:
-      "Unimplemented. Switchroom sessions ARE agents, so a real delete is not " +
-      "meaningful — but a bare 404 makes the desktop throw. The contract " +
-      "answer is an explicit refusal the client can render (the 422 the cron " +
-      "branch already uses at hermes-adapter.ts:739-741), not silence.",
     assert: (res) => {
       expect(res).not.toBeNull();
       // Either honoured, or refused in a way the desktop can surface.
@@ -1298,10 +1294,6 @@ const CONTRACT: ContractCase[] = [
     path: "/api/env",
     client: "hermes.ts:891-898 (setEnv)",
     server: "hermes_cli/web_server.py:7209",
-    gap:
-      "Unimplemented. Switchroom has no desktop-writable env — but the honest " +
-      "answer is the 422 refusal the cron branch already models, not a 404 " +
-      "the client cannot distinguish from a dead backend.",
     assert: (res) => {
       expect(res).not.toBeNull();
       expect([200, 422]).toContain(res!.status);
@@ -1314,9 +1306,6 @@ const CONTRACT: ContractCase[] = [
     search: "?surface=declared",
     client: "hermes.ts:868-873 (getMemoryProviderConfig)",
     server: "hermes_cli/web_server.py:6125",
-    gap:
-      "Unimplemented. The adapter serves the bare /api/memory/providers " +
-      "(hermes-adapter.ts:767) instead — a path no desktop call site emits.",
     assert: (res) => {
       expect(res).not.toBeNull();
       expect(res!.status).toBe(200);
@@ -1329,10 +1318,6 @@ const CONTRACT: ContractCase[] = [
     search: "?surface=declared",
     client: "hermes.ts:875-882 (setMemoryProviderConfig)",
     server: "hermes_cli/web_server.py:6170",
-    gap:
-      "Unimplemented — same root cause as the GET above: the adapter's only " +
-      "memory route is the bare /api/memory/providers, which the desktop " +
-      "never calls. The memory settings pane cannot save.",
     assert: (res) => {
       expect(res).not.toBeNull();
       expect([200, 422]).toContain(res!.status);
@@ -1435,8 +1420,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
       total: 47,
-      green: 34,
-      gaps: 13,
+      green: 38,
+      gaps: 9,
     });
   });
 });

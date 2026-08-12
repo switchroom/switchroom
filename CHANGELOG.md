@@ -79,6 +79,19 @@ now an anomaly worth investigating, not the norm.
   (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
   so a designator-less line is now normalised to `Z` at the producer. An
   explicit `+HH:MM` offset is preserved untouched.
+- **hermes: session delete, env writes and memory-provider config answer an
+  explicit refusal instead of a 404 the desktop misreads.** `DELETE
+  /api/sessions/:id`, `PUT /api/env` and `PUT /api/memory/providers/:p/config`
+  fell through to a 404, and the desktop's `isEndpointMissingError` only
+  matches 404s — so a route switchroom deliberately does not support was
+  indistinguishable from a dead gateway, and the action either threw or
+  silently took a fallback path. All three now return 422 with a reason
+  naming where the real control lives (switchroom.yaml / the vault), the same
+  answer the schedule-write branch already gives. `GET
+  /api/memory/providers/:p/config` now serves the real `MemoryProviderConfig`
+  shape with an empty declared surface, which is the desktop's own signal to
+  collapse the pane rather than render a form that cannot save.
+
 - **hermes: transcripts past the first page are no longer silently dropped,
   and no longer arrive backwards.** `GET /api/sessions/:id/messages` emitted no
   `pagination` block, and the desktop's `getAllSessionMessages` reads a missing
