@@ -9,13 +9,16 @@
 #                   SEPARATE from the data volume, so a data-volume loss
 #                   or corruption is recoverable. Runs at most once per
 #                   BACKUP_INTERVAL_MIN. Keeps the newest BACKUP_KEEP.
-#   2. Autovacuum — pins per-table autovacuum scale factors on the large
-#                   / high-churn tables. Upstream ships pg defaults (0.2),
-#                   which on a multi-million-row table means autovacuum
+#   2. Autovacuum — pins per-table autovacuum scale factors / thresholds on
+#                   the large / high-churn tables. Upstream ships pg defaults
+#                   (0.2), which on a multi-million-row table means autovacuum
 #                   never fires until >1M dead tuples — so memory_links /
 #                   async_operations bloat unbounded and their planner
 #                   stats go stale (mis-estimating the worker's queue
-#                   table by ~80x). Idempotent `ALTER TABLE ... SET`.
+#                   table by ~80x). On unit_entities / entities the same
+#                   under-vacuuming leaves the VISIBILITY MAP stale, which
+#                   silently un-does index-only scans (#4634). Idempotent
+#                   `ALTER TABLE ... SET`.
 #   3. Retention  — prune COMPLETED async_operations older than
 #                   RETENTION_DAYS. Terminal queue records the worker
 #                   never reads again; left unbounded they accumulate
@@ -127,10 +130,112 @@ _sql() {
 }
 
 # --- 2. Autovacuum tuning (idempotent; ALTER is a no-op if unchanged) ---
+#
+# `ALTER TABLE ... SET (...)` MERGES into reloptions — options not named on a
+# line are left standing — so each line states only what it means to pin.
+#
+# COROLLARY: DELETING A LINE HERE DOES NOT UNDO IT. reloptions live in the
+# catalog, on the data volume; nothing in this script ever RESETs them. So a
+# `git revert` of the change that added a line leaves every option it set
+# standing on the live database forever, invisibly — which is precisely the
+# hand-applied drift #4650 exists to document. Backing a tuning out means
+# running the matching RESET by hand, once, against the live DB. For the
+# unit_entities / entities block below (#4634) that is:
+#
+#   -- unit_entities: reverting restores the old line, which re-pins
+#   -- autovacuum_vacuum_scale_factor / autovacuum_analyze_scale_factor to
+#   -- 0.05 on the next tick, but leaves these six standing:
+#   ALTER TABLE unit_entities RESET (
+#     autovacuum_vacuum_threshold,
+#     autovacuum_vacuum_insert_scale_factor,
+#     autovacuum_vacuum_insert_threshold,
+#     autovacuum_analyze_threshold,
+#     autovacuum_vacuum_cost_delay,
+#     autovacuum_vacuum_cost_limit);
+#
+#   -- entities: main has NO line for this table, so a revert restores
+#   -- nothing at all here and all eight must be reset explicitly.
+#   ALTER TABLE entities RESET (
+#     autovacuum_vacuum_scale_factor,
+#     autovacuum_vacuum_threshold,
+#     autovacuum_vacuum_insert_scale_factor,
+#     autovacuum_vacuum_insert_threshold,
+#     autovacuum_analyze_scale_factor,
+#     autovacuum_analyze_threshold,
+#     autovacuum_vacuum_cost_delay,
+#     autovacuum_vacuum_cost_limit);
+#
+# (RESET drops the per-table override so the global GUC applies again. It does
+# NOT restore any hand-applied value that predated the line — on `entities`
+# that was scale_factor=0.02 / cost_limit=2000, per #4650.)
 _sql "ALTER TABLE IF EXISTS memory_links SET (autovacuum_vacuum_scale_factor=0.02, autovacuum_analyze_scale_factor=0.02)" >/dev/null
 _sql "ALTER TABLE IF EXISTS async_operations SET (autovacuum_vacuum_scale_factor=0.05, autovacuum_analyze_scale_factor=0.02)" >/dev/null
 _sql "ALTER TABLE IF EXISTS entity_cooccurrences SET (autovacuum_vacuum_scale_factor=0.05, autovacuum_analyze_scale_factor=0.05)" >/dev/null
-_sql "ALTER TABLE IF EXISTS unit_entities SET (autovacuum_vacuum_scale_factor=0.05, autovacuum_analyze_scale_factor=0.05)" >/dev/null
+#
+# unit_entities / entities: VISIBILITY-MAP freshness, not bloat (#4634).
+#
+# Only VACUUM sets all-visible bits, so how often a table is vacuumed IS how
+# fresh its visibility map is, and a stale VM turns an index-only scan into an
+# index scan plus a heap access per row. Measured read-only on the live fleet
+# DB, 2026-08-12 UTC (all timestamps in this block are UTC), over 22h of uptime
+# since the last crash-recovery stats reset:
+#
+#   relation       relpages  relallvisible    VM%       rows
+#   unit_entities    13,454          8,445  62.8%  1,739,740
+#   entities          3,210          1,009  31.4%    239,939
+#
+#   EXPLAIN (ANALYZE, BUFFERS) over the first 200k index tuples:
+#     idx_unit_entities_entity_unit -> Heap Fetches:  64,177  (63,492 buffers)
+#     pk_entities                   -> Heap Fetches: 138,465 (139,325 buffers)
+#
+#   i.e. 69% of the "index-only" rows on `entities` hit the heap anyway, on
+#   indexes the graph queries drive 6.2M / 73.8M scans through.
+#
+# Why the previous unit_entities line (scale_factor=0.05 alone) did not fix it:
+# autovacuum computes its triggers from pg_class.reltuples, and it has THREE
+# independent triggers. The dead-tuple one is the only one 0.05 touched, and
+# unit_entities is append-only — 25,583 inserts vs 0 updates and 560 deletes
+# over those 22h — so dead tuples never approach 50 + 0.05 * 1.7M = 84,984.
+# What governs an insert-only table is the INSERT trigger, and that was still
+# at the stock 1000 + 0.2 * 1.7M = 340,735 inserts (~2 weeks of ingest at the
+# measured rate). Hence `last_autovacuum` NULL and `autovacuum_count` 0 on
+# BOTH tables at the time of measurement, while `entities` was not listed here
+# at all.
+#
+# The values below bound VM staleness to hours instead of leaving it unbounded:
+#   unit_entities insert trigger: 1000 + 0.005 * 1,698,677 =  9,493 ins  (was 340,735)
+#   entities      dead   trigger:  500 + 0.005 *   239,964 =  1,700 dead (was 4,849)
+#
+# unit_entities: 29,014 inserts over 23.1h of pg uptime (~1,255/h) puts 9,493
+# about 7.6h out — call it ~3 passes/day, up from ~0.
+#
+# entities: AT LEAST ~3 passes/day, and in practice a good deal more. Churn is
+# bursty, so quote a range, not a point:
+#   - 22.5h-average: it took that long to reach the old 4,849 trigger, i.e.
+#     ~5.2k dead/day => 1,700 every ~8h => ~3 passes/day. This is the FLOOR.
+#   - measured live in the 38.5 min after the 2026-08-12 22:19:13Z pass: 948
+#     dead tuples accumulated, i.e. 21-25/min ≈ 30-35k/day, consistent across
+#     six samples spanning 22:52-22:58Z (arrival is bursty minute to minute,
+#     but the trend is flat, so this is not one spike) => 1,700 every ~70-80
+#     min => ~18-21 passes/day.
+# Size the I/O expectation off the upper end (roughly hourly), not the floor.
+#
+# 4,849 IS reachable — `entities` did hit it once, autovacuuming at 2026-08-12
+# 22:19:13Z and taking its VM from 31.4% straight back to 100% — but only after
+# roughly 23h of accumulated churn. That is the problem, not the refutation:
+# any container recreate inside that day-long window resets the dead-tuple
+# counter, the trigger is never reached, and the visibility map just stays
+# stale. 1,700 puts a pass well inside the restart window.
+# Cost is the tradeoff — more frequent vacuum is more background I/O — but
+# these two are small: 108MB heap + 261MB index (unit_entities) and 25MB + 56MB
+# (entities), so a pass is a few hundred MB of mostly-cached reads. That holds
+# even at the ~20x/day upper end above, because the frequent table is the 81MB
+# one; the 369MB one stays at ~3x/day on its insert trigger. memory_units
+# (1.7GB + HNSW) is a genuinely expensive pass and is deliberately left alone.
+# cost_delay / cost_limit match the memory_links precedent so the pass finishes
+# promptly instead of being throttled across the ingest window.
+_sql "ALTER TABLE IF EXISTS unit_entities SET (autovacuum_vacuum_scale_factor=0.01, autovacuum_vacuum_threshold=1000, autovacuum_vacuum_insert_scale_factor=0.005, autovacuum_vacuum_insert_threshold=1000, autovacuum_analyze_scale_factor=0.02, autovacuum_analyze_threshold=1000, autovacuum_vacuum_cost_delay=2, autovacuum_vacuum_cost_limit=3000)" >/dev/null
+_sql "ALTER TABLE IF EXISTS entities SET (autovacuum_vacuum_scale_factor=0.005, autovacuum_vacuum_threshold=500, autovacuum_vacuum_insert_scale_factor=0.01, autovacuum_vacuum_insert_threshold=1000, autovacuum_analyze_scale_factor=0.01, autovacuum_analyze_threshold=500, autovacuum_vacuum_cost_delay=2, autovacuum_vacuum_cost_limit=3000)" >/dev/null
 
 # --- 3. Retention: prune terminal completed ops (never failed/pending/processing) ---
 _pruned="$(_sql "WITH d AS (DELETE FROM async_operations WHERE status='completed' AND created_at < now() - make_interval(days => ${RETENTION_DAYS}) RETURNING 1) SELECT count(*) FROM d")"

@@ -147,6 +147,114 @@ describe("hindsight-maintenance.sh", () => {
     expect(raw).toMatch(/ALTER TABLE IF EXISTS async_operations SET \(autovacuum_vacuum_scale_factor=/);
   });
 
+  // ── Visibility-map freshness on unit_entities / entities (#4634) ─────────
+  //
+  // A stale visibility map silently un-does index-only scans: measured on the
+  // live fleet DB (2026-08-13) 200k index tuples cost 64,177 heap fetches on
+  // `idx_unit_entities_entity_unit` and 138,465 on `pk_entities`. Only VACUUM
+  // sets all-visible bits, so the fix is a vacuum that actually fires.
+  //
+  // This drives the script with a FAKE psql and asserts the OUTCOME — the
+  // reloptions actually SENT to postgres, parsed and bounds-checked. It fails
+  // if either table is dropped from the tuning, if the INSERT trigger (the one
+  // that governs an append-only table like unit_entities) is left at the stock
+  // 0.2, or if a scale factor is loosened past what the measurement supports.
+  it("tunes unit_entities + entities so autovacuum actually fires (VM freshness)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "swr-hsi-maint-"));
+    const binDir = installFakePsql();
+    try {
+      const pgInstance = join(dir, "instance.json");
+      const sqlLog = join(dir, "psql-sql.log");
+      writePgInstance(pgInstance);
+      const r = spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: pgInstance,
+          FAKE_PSQL_LOG: sqlLog,
+        },
+        encoding: "utf-8",
+        timeout: 15_000,
+      });
+      expect(r.status).toBe(0);
+      const sql = readFileSync(sqlLog, "utf-8");
+
+      /**
+       * Parse the reloptions the script actually SET on `table`.
+       *
+       * `ALTER TABLE ... SET (...)` MERGES reloptions and is last-write-wins,
+       * so a second ALTER appended below the first silently overrides those
+       * keys in live postgres. Reading only the FIRST match would let exactly
+       * that regression through green — the very merge semantic this file
+       * exists to pin — so require there be exactly ONE ALTER per table.
+       */
+      const optsFor = (table: string): Record<string, number> => {
+        const prefix = `ALTER TABLE IF EXISTS ${table} SET (`;
+        const hits = sql
+          .split("\n")
+          .map((l, i) => ({ line: l, lineNo: i + 1 }))
+          .filter((h) => h.line.startsWith(prefix));
+        expect(hits.length, `no autovacuum ALTER issued for ${table}`).toBeGreaterThan(0);
+        expect(
+          hits.length,
+          `${hits.length} autovacuum ALTERs issued for ${table} (SQL-log lines ` +
+            `${hits.map((h) => h.lineNo).join(", ")}) — ALTER TABLE ... SET MERGES ` +
+            `reloptions last-write-wins, so the LAST one silently overrides the ` +
+            `earlier ones. Fold them into a single ALTER in ` +
+            `docker/hindsight-maintenance.sh.`,
+        ).toBe(1);
+        const line = hits[0].line;
+        const body = line.slice(line.indexOf("(") + 1, line.lastIndexOf(")"));
+        return Object.fromEntries(
+          body.split(",").map((kv) => {
+            const [k, v] = kv.split("=");
+            return [k.trim(), Number(v)];
+          }),
+        );
+      };
+
+      // unit_entities is append-only (25,583 inserts / 0 updates over the
+      // measured 22h), so the INSERT trigger is the one that governs it. The
+      // stock 0.2 needs 340,735 inserts (~2 weeks of ingest); pin it small.
+      const ue = optsFor("unit_entities");
+      expect(ue.autovacuum_vacuum_insert_scale_factor).toBeLessThanOrEqual(0.005);
+      expect(ue.autovacuum_vacuum_insert_threshold).toBeLessThanOrEqual(1000);
+      // 1000 + 0.005 * 1.74M rows ≈ 9.5k inserts — well under a day of ingest.
+      const ueInsertTrigger =
+        ue.autovacuum_vacuum_insert_threshold +
+        ue.autovacuum_vacuum_insert_scale_factor * 1_739_740;
+      expect(ueInsertTrigger).toBeLessThan(20_000);
+      // ...and the dead-tuple / analyze triggers stay tightened too.
+      expect(ue.autovacuum_vacuum_scale_factor).toBeLessThanOrEqual(0.01);
+      expect(ue.autovacuum_analyze_scale_factor).toBeLessThanOrEqual(0.02);
+
+      // entities is update-heavy (18,043 updates / 22h): the dead-tuple
+      // trigger governs. 500 + 0.005 * 239,939 ≈ 1.7k dead — a pass somewhere
+      // between ~3x/day (the 22.5h average) and roughly hourly (the 21-25
+      // dead-tuples/min rate sampled live); churn is bursty, so the low end
+      // is a floor. Derivation in docker/hindsight-maintenance.sh.
+      const en = optsFor("entities");
+      const enDeadTrigger =
+        en.autovacuum_vacuum_threshold + en.autovacuum_vacuum_scale_factor * 239_939;
+      expect(enDeadTrigger).toBeLessThan(2_500);
+      expect(en.autovacuum_vacuum_insert_scale_factor).toBeLessThanOrEqual(0.01);
+
+      // Both get a cost budget that lets the pass finish rather than being
+      // throttled across the ingest window (the memory_links precedent).
+      for (const o of [ue, en]) {
+        expect(o.autovacuum_vacuum_cost_limit).toBeGreaterThanOrEqual(2000);
+        expect(o.autovacuum_vacuum_cost_delay).toBeLessThanOrEqual(2);
+      }
+
+      // Tuning only — job #2 must never VACUUM/ANALYZE inline (that would run a
+      // blocking full pass inside the 30-min maintenance tick).
+      expect(sql).not.toMatch(/^\s*(VACUUM|ANALYZE)\b/im);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
   it("writes backups to a separate dir + rotates, and is gated on an interval + pg readiness", () => {
     const raw = readFileSync(SCRIPT, "utf-8");
     // Rotated pg_dump in custom format to the backup dir.
