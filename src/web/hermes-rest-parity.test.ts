@@ -161,9 +161,9 @@ const CENSUS: CensusRow[] = [
     path: "/api/profiles/sessions/sidebar",
     served: true,
     note:
-      "Served, but with the WRONG shape — see the sidebar case in Part 2. " +
-      "`pathname.includes('sessions')` inside the /api/profiles branch " +
-      "(hermes-adapter.ts:753) swallows it.",
+      "Served for real — the batched three-slice SidebarSessionsResponse, off " +
+      "the same buildAllSessions list the per-slice route answers from. See " +
+      "the sidebar case in Part 2.",
   },
   {
     line: 658,
@@ -214,8 +214,13 @@ const CENSUS: CensusRow[] = [
     path: "/api/providers/oauth",
     served: false,
     note:
-      "The adapter serves /api/auth/providers (hermes-adapter.ts:787), which " +
-      "no desktop call site emits — a stub aimed at a route that does not exist.",
+      "The adapter serves /api/auth/providers instead. That is NOT a stub " +
+      "aimed at a dead route: /api/auth/providers is a real upstream route " +
+      "(hermes_cli/dashboard_auth/routes.py:152) called by the desktop's " +
+      "Electron MAIN process — gatewayAuthProviders (electron/main.ts:4954) " +
+      "and probeRemoteAuthMode (:7590). This census only greps " +
+      "apps/desktop/src/hermes.ts, which is the renderer, so main-process " +
+      "call sites are out of its scope by construction.",
   },
   { line: 981, method: "DELETE", path: "/api/providers/oauth/anthropic", served: false },
   { line: 989, method: "POST", path: "/api/providers/oauth/anthropic/start", served: false },
@@ -230,8 +235,10 @@ const CENSUS: CensusRow[] = [
     path: "/api/memory/providers/hindsight/config",
     served: false,
     note:
-      "The adapter serves the bare /api/memory/providers (hermes-adapter.ts:767); " +
-      "no desktop call site emits that path, only this /:provider/config one.",
+      "Still unimplemented. The adapter used to serve the bare " +
+      "/api/memory/providers instead — a path with no upstream route " +
+      "(hermes_cli/memory_oauth.py:18 mounts the prefix but registers no bare " +
+      "handler) and no call site; that dead stub has been deleted.",
   },
   { line: 878, method: "PUT", path: "/api/memory/providers/hindsight/config", served: false },
   { line: 1024, method: "POST", path: "/api/memory/providers/hindsight/oauth/start", served: false },
@@ -519,10 +526,6 @@ const CONTRACT: ContractCase[] = [
     search: "?limit=40&offset=0&min_messages=1&archived=exclude&order=recent&profile=all&source=cron",
     client: "hermes.ts:434-445 — the cron slice passes source='cron'",
     server: "hermes_cli/web_routers/profiles.py:82",
-    gap:
-      "hermes-adapter.ts:601-620 ignores `source`, so the sidebar's cron slice " +
-      "and its recents slice return the identical unfiltered fleet list — the " +
-      "exact starvation the upstream comment at hermes.ts:418-422 describes.",
     assert: (res) => {
       const b = body200(res);
       // No switchroom session has source='cron' (toHermesSession hardcodes
@@ -540,15 +543,6 @@ const CONTRACT: ContractCase[] = [
     search: "?recents_profile=all&recents_limit=40&cron_limit=20&messaging_limit=20",
     client: "hermes.ts:596-628 (listSidebarSessions); shape at hermes.ts:487-492",
     server: "hermes_cli/web_routers/profiles.py:232",
-    gap:
-      "The /api/profiles prefix branch's `pathname.includes('sessions')` test " +
-      "(hermes-adapter.ts:752-755) swallows this path and answers 200 with a " +
-      "PaginatedSessions-shaped literal. That is strictly WORSE than not " +
-      "implementing it: `isEndpointMissingError` (hermes.ts:520-536) only " +
-      "matches 404-ish shapes, so a 200 never trips the legacy fallback at " +
-      "hermes.ts:619-626. The sidebar reads `result.recents?.sessions ?? []` " +
-      "(hermes.ts:629) and renders three permanently-empty slices instead of " +
-      "degrading to listSidebarSessionsLegacy.",
     assert: (res) => {
       const b = body200(res);
       for (const slice of ["recents", "cron", "messaging"]) {
@@ -558,20 +552,37 @@ const CONTRACT: ContractCase[] = [
     },
   },
   {
-    name: "GET /api/profiles/sessions/sidebar 404s if unimplemented, so the legacy fallback fires",
+    // The paired "…or 404 so the legacy fallback fires" case that used to sit
+    // here is gone: the adapter now serves the batched route for real, so the
+    // tolerance-side assertion is unreachable by construction. Kept as a note
+    // because the tolerance still matters — an unrecognised /api/profiles path
+    // must 404, never answer a bare 200 (isEndpointMissingError, hermes.ts:520-536,
+    // only recognises 404-shaped failures).
+    name: "an unrecognised /api/profiles GET 404s rather than faking a 200 (synthetic probe path)",
+    method: "GET",
+    path: "/api/profiles/default/__not_a_route__",
+    client: "hermes.ts:520-536 (isEndpointMissingError)",
+    server: "hermes_cli/web_routers/profiles.py:232",
+    assert: (res) => {
+      expect(res === null || res.status === 404).toBe(true);
+    },
+  },
+  {
+    name: "the sidebar's cron slice is source-scoped, not a copy of recents",
     method: "GET",
     path: "/api/profiles/sessions/sidebar",
     search: "?recents_profile=all&recents_limit=40&cron_limit=20&messaging_limit=20",
-    client: "hermes.ts:520-536 (isEndpointMissingError) + hermes.ts:619-626",
-    server: "hermes_cli/web_routers/profiles.py:232",
-    gap:
-      "Same root cause as the case above, asserted from the tolerance side: " +
-      "if the adapter is not going to serve the batched route it MUST 404 so " +
-      "the desktop falls back. Today it 200s. Either this case or the one " +
-      "above goes green when the gap is fixed — never both; whichever fix " +
-      "lands, delete the other.",
+    client: "hermes.ts:543-552 (listSidebarSessionsLegacy passes source='cron')",
+    server: "hermes_cli/web_routers/profiles.py:347 (_slice(db, source='cron'))",
     assert: (res) => {
-      expect(res === null || res.status === 404).toBe(true);
+      const b = body200(res);
+      const recents = (b.recents as Record<string, unknown>).sessions as unknown[];
+      const cron = (b.cron as Record<string, unknown>).sessions as unknown[];
+      // No switchroom session reports source='cron' (toHermesSession hardcodes
+      // 'switchroom'), so a correctly-scoped cron slice is empty while recents
+      // is not — which is exactly what "not a copy of recents" means here.
+      expect(recents.length).toBeGreaterThan(0);
+      expect(cron).toEqual([]);
     },
   },
 
@@ -896,12 +907,6 @@ const CONTRACT: ContractCase[] = [
     path: `/api/cron/jobs/${AGENT}~0`,
     client: "hermes.ts:1428-1434 (updateCronJob)",
     server: "hermes_cli/web_server.py",
-    gap:
-      "The cron branch refuses POST/PATCH/DELETE with 422 " +
-      "(hermes-adapter.ts:739-741) but not PUT, so an edit falls to the " +
-      "catch-all `return {status:200, body:{}}` at :743. The desktop reads a " +
-      "200 and reports the edit saved; nothing was written. Schedules are " +
-      "YAML-owned, so PUT belongs in the same 422 list as the other verbs.",
     assert: (res) => {
       expect(res).not.toBeNull();
       expect(res!.status).toBe(422);
@@ -945,15 +950,19 @@ const CONTRACT: ContractCase[] = [
     method: "GET",
     path: "/api/cron/delivery-targets",
     client: "hermes.ts:1410-1416 (getCronDeliveryTargets) — destructures { targets }",
-    server: "hermes_cli/web_server.py",
-    gap:
-      "The /api/cron prefix branch's catch-all (hermes-adapter.ts:743) answers " +
-      "200 {} for this, so `const { targets } = ...` is undefined. The caller " +
-      "coalesces (`targets ?? []`), so this degrades rather than throwing — " +
-      "but the cron editor then offers zero delivery targets.",
+    server: "hermes_cli/web_routers/cron.py:72 (always prepends the implicit `local`)",
     assert: (res) => {
       const b = body200(res);
-      expect(Array.isArray(b.targets)).toBe(true);
+      const targets = b.targets as Record<string, unknown>[];
+      expect(Array.isArray(targets)).toBe(true);
+      // Upstream's contract: `local` is always offered, and every entry carries
+      // the four CronDeliveryTarget fields (types/hermes.ts:836-841).
+      expect(targets.map((t) => t.id)).toContain("local");
+      for (const t of targets) {
+        for (const field of ["id", "name", "home_target_set", "home_env_var"]) {
+          expect(t, `CronDeliveryTarget.${field} missing`).toHaveProperty(field);
+        }
+      }
     },
   },
 
@@ -1051,13 +1060,12 @@ const CONTRACT: ContractCase[] = [
     path: "/api/profiles/default/setup-command",
     client: "hermes.ts:1544-1548 (getProfileSetupCommand)",
     server: "hermes_cli/web_routers/profiles.py:779",
-    gap:
-      "The /api/profiles catch-all (hermes-adapter.ts:764) answers 200 {}. " +
-      "Degrades rather than throwing, but the profile pane shows no setup " +
-      "command.",
     assert: (res) => {
       const b = body200(res);
-      expect(b).toHaveProperty("command");
+      // Upstream declares a bare string; switchroom has no shell-launchable
+      // profile, so the honest answer is an empty one — not a missing key and
+      // not null.
+      expect(typeof b.command).toBe("string");
     },
   },
   {
@@ -1177,9 +1185,9 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // Ratchet: this only moves when the adapter is fixed. Lower `gaps` (and
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
-      total: 44,
-      green: 20,
-      gaps: 24,
+      total: 45,
+      green: 27,
+      gaps: 18,
     });
   });
 });

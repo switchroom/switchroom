@@ -255,8 +255,7 @@ const CONTRACT: ContractCase[] = [
     params: { session_id: SESSION, limit: 50 },
     // methods_session.py:2456-2462 → {"count": ..., "messages": [...]}
     resultKeys: ["count", "messages"],
-    gap: "shape",
-    note: "adapter returns {session_id, messages} — `count` missing (hermes-adapter.ts:1008)",
+    note: "adapter also echoes session_id, which upstream omits — additive, harmless",
   },
   {
     method: "session.list",
@@ -271,8 +270,9 @@ const CONTRACT: ContractCase[] = [
     desktopCall: null,
     params: {},
     resultKeys: ["session_id"],
-    gap: "shape",
-    note: "upstream methods_session.py:234 returns {session_id}; adapter returns {session}",
+    note:
+      "upstream methods_session.py:214-235 returns {session_id}, null when no " +
+      "eligible session — the adapter now matches (it returned {session} before)",
   },
   {
     method: "session.close",

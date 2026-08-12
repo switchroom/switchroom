@@ -33,6 +33,36 @@ now an anomaly worth investigating, not the norm.
   off — the worst week in the log, scored as healthier than the milder August
   incident it did catch.
 
+### Bug fixes
+
+- **hermes adapter: stop reporting success for writes and reads that never
+  happened.** The REST handler's `/api/cron` and `/api/profiles` prefix
+  branches both ended in a catch-all `return {status: 200, body: {}}`, which
+  answered a fabricated success for every route underneath them that had no
+  handler. Four things that cost, all now fixed: `PUT /api/cron/jobs/:id` (the
+  desktop's `updateCronJob`) fell to that catch-all, so the cron editor told
+  the operator the edit saved while nothing was written — it now returns the
+  same 422 its POST/PATCH/DELETE siblings already return, because switchroom
+  schedules are YAML-owned. `GET /api/profiles/sessions/sidebar` was swallowed
+  by a `pathname.includes('sessions')` test and answered with a
+  `PaginatedSessions` literal; since the desktop's `isEndpointMissingError`
+  only recognises 404-shaped failures, a 200 never tripped its legacy fallback
+  and the sidebar rendered three permanently-empty slices — it now serves the
+  real batched `SidebarSessionsResponse` off the same session list the
+  per-slice route uses. `GET /api/cron/delivery-targets` and
+  `GET /api/cron/blueprints` returned `{}`, leaving the destructured `targets`
+  / `blueprints` undefined, and now return real (if short) lists. And both
+  catch-alls are gone: an unrecognised path under either prefix 404s, so the
+  desktop can tell a missing route from a served one.
+- **hermes adapter: honour `source` / `exclude_sources` on the session-list
+  routes.** They were ignored, so the sidebar's cron slice and its recents
+  slice returned the identical unfiltered fleet. Both the batched sidebar route
+  and `/api/profiles/sessions` now filter through one shared helper.
+- **hermes adapter: two JSON-RPC results now match upstream.**
+  `session.history` carries `count` alongside `messages`, and
+  `session.most_recent` returns `{session_id}` (null when there is none)
+  rather than `{session}` — the key every caller destructures.
+
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
 ### Dependencies
