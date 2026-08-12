@@ -128,17 +128,30 @@ describe('blocked-approval record — the off-Telegram surface', () => {
   // meant the whole feature was a silent no-op in production.
   it('falls back to the agent\'s own state dir when the shared dir is not writable', () => {
     // Simulate the production failure: Docker auto-created the bind source as
-    // root:root, so this agent's uid can neither create the dir nor chmod it.
-    // Modelled as a read-only PARENT — the store can't mkdir the shared dir
-    // inside it, and can't chmod its way out either.
-    const readOnlyParent = join(root, 'root-owned')
-    mkdirSync(readOnlyParent, { recursive: true })
-    chmodSync(readOnlyParent, 0o555) // r-xr-xr-x
-    const unwritable = join(readOnlyParent, 'blocked-approvals') // cannot be created
+    // root:root, so this agent's uid cannot write inside it.
+    //
+    // This used to be modelled as a read-only PARENT (`chmod 0555`). uid 0
+    // IGNORES file modes, so under root the shared write SUCCEEDED, the fallback
+    // branch was never taken, and this test went red for the wrong reason (the
+    // suite runs as root in the fleet's debug container). Inject the EACCES
+    // instead — deterministic for every uid, and every branch of the real
+    // `write()` still runs.
+    const unwritable = join(root, 'root-owned', 'blocked-approvals')
     const ownDir = join(root, 'agent-state')
     mkdirSync(ownDir, { recursive: true })
 
-    const store = createBlockedApprovalStore(unwritable, 'overlord', ownDir)
+    const store = createBlockedApprovalStore(unwritable, 'overlord', ownDir, {
+      writeFileSync: ((file, data, opts) => {
+        if (String(file).startsWith(unwritable)) {
+          const e: NodeJS.ErrnoException = new Error(
+            `EACCES: permission denied, open '${String(file)}'`,
+          )
+          e.code = 'EACCES'
+          throw e
+        }
+        return writeFileSync(file, data, opts)
+      }) as typeof writeFileSync,
+    })
     store.write(REC)
 
     // The record MUST exist somewhere — never silently lost.

@@ -4,6 +4,7 @@ import {
   parseTurns,
   detectTurnFindings,
   detectGatewayFindings,
+  extractTs,
   HANG_MS,
   SILENT_NOOP_FLOOR_TS,
 } from "./detect.js";
@@ -215,6 +216,71 @@ describe("detectGatewayFindings", () => {
         " detection is DISABLED until it exists and is readable.",
     ].join("\n");
     expect(detectGatewayFindings("alpha", quiet).gw_hits["orphaned-db-handle"]).toBe(0);
+  });
+});
+
+/**
+ * `extractTs` feeds `Finding.ts`, which `ledger.recencyFactor` and (since
+ * #4622) `ledger.withinWindow` both read through `Date.parse`. A timestamp with
+ * no zone designator is parsed as LOCAL time there, so it is not enough for the
+ * string to survive the regex — it has to name its zone by the time it leaves
+ * this module.
+ */
+describe("extractTs — a finding's timestamp always names its zone", () => {
+  it("returns the real gateway prefix verbatim (it is already UTC)", () => {
+    // The literal shape `stderr-timestamps.ts` writes: `toISOString()`, i.e.
+    // millisecond precision and a trailing Z. All ~2.5M timestamps in the live
+    // gateway logs look exactly like this.
+    expect(
+      extractTs("[2026-08-12T09:00:00.123Z] telegram gateway: tg-post status=err"),
+    ).toBe("2026-08-12T09:00:00.123Z");
+  });
+
+  it("normalises a designator-less timestamp to UTC instead of silently going local", () => {
+    // THE bug: `Date.parse('2026-08-12T09:00:00')` is LOCAL time, so on the
+    // fleet's +10:00 host this finding was dated 23:00Z the previous day — a
+    // ten-hour error in `recencyFactor`, and enough to move a finding across
+    // `withinWindow`'s boundary.
+    //
+    // The assertion is on the STRING, deliberately: it is host-independent, so
+    // it goes red on the bug on a UTC CI runner too. An assertion on the parsed
+    // INSTANT alone would only fail on a host whose offset is non-zero — a guard
+    // that passes for the wrong reason on half the machines that run it.
+    expect(extractTs("2026-08-12T09:00:00 gateway: represent duplicate-send")).toBe(
+      "2026-08-12T09:00:00Z",
+    );
+    // …and the normalised form is a real UTC instant.
+    expect(Date.parse(extractTs("2026-08-12T09:00:00 gw")!)).toBe(
+      Date.UTC(2026, 7, 12, 9, 0, 0),
+    );
+  });
+
+  it("normalises a designator-less timestamp WITH fractional seconds too", () => {
+    expect(extractTs("2026-08-12T09:00:00.500 gw: x")).toBe("2026-08-12T09:00:00.500Z");
+  });
+
+  it("leaves an EXPLICIT offset alone — appending Z would invent a 10h error", () => {
+    expect(extractTs("2026-08-12T19:00:00+10:00 gw: x")).toBe("2026-08-12T19:00:00+10:00");
+    // Same instant as 09:00Z — the offset is honoured, not overwritten.
+    expect(Date.parse(extractTs("2026-08-12T19:00:00+10:00 gw: x")!)).toBe(
+      Date.UTC(2026, 7, 12, 9, 0, 0),
+    );
+    expect(extractTs("2026-08-12T04:00:00-05:00 gw: x")).toBe("2026-08-12T04:00:00-05:00");
+  });
+
+  it("is still null for a line carrying no timestamp at all", () => {
+    // Undatable stays undatable — `withinWindow` KEEPS those rather than
+    // guessing an age, so inventing one here would be worse than none.
+    expect(extractTs("telegram gateway: tg-post method=getUpdates status=err")).toBeNull();
+  });
+
+  it("dates a gateway FINDING in UTC even when the line's prefix has no Z", () => {
+    // End to end through the real detector, not just the helper.
+    const { findings } = detectGatewayFindings(
+      "alpha",
+      `2026-08-12T09:00:00 gateway: represent duplicate-send tid=${CHAT}:_#42`,
+    );
+    expect(findings[0]?.ts).toBe("2026-08-12T09:00:00Z");
   });
 });
 

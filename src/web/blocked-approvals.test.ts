@@ -1,7 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, statSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  chmodSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import {
   readBlockedApprovals,
   readBlockedApprovalsWithErrors,
@@ -16,6 +24,52 @@ import { deriveAttention, handleGetSummary } from "./api.js";
 // contract (writer picks the path, reader has to scan it); testing either half
 // alone is how it shipped broken.
 import { createBlockedApprovalStore } from "../../telegram-plugin/gateway/approval-hold.js";
+
+/**
+ * Does this process actually get told "no" by a file mode?
+ *
+ * uid 0 does NOT — root reads a 0000 file happily — and neither do some CI
+ * filesystems. A chmod-based guard is therefore VACUOUS for those runs, and the
+ * uid check it replaces was only ever a proxy for this question. Probe the real
+ * capability instead, and say so LOUDLY when it is absent, so a skipped guard
+ * can never be mistaken for a passing one.
+ *
+ * Only the two tests whose SUBJECT is real kernel mode enforcement use this.
+ * Every other unreadable-record case is driven by EISDIR (a directory named
+ * `<agent>.json`), which fails for every uid including root.
+ */
+function fileModesEnforced(): boolean {
+  const probeRoot = mkdtempSync(join(tmpdir(), "sr-mode-probe-"));
+  const probe = join(probeRoot, "probe");
+  try {
+    writeFileSync(probe, "x");
+    chmodSync(probe, 0o000);
+    try {
+      readFileSync(probe);
+      return false; // read succeeded through a 0000 mode — root, or a mode-less fs
+    } catch {
+      return true;
+    }
+  } finally {
+    try {
+      chmodSync(probe, 0o644);
+    } catch {
+      /* best effort */
+    }
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
+const MODES_ENFORCED = fileModesEnforced();
+if (!MODES_ENFORCED) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "blocked-approvals.test.ts: file modes are NOT enforced for this process " +
+      `(uid ${process.getuid?.() ?? "?"}) — the two guards that assert on a REAL ` +
+      "0600/0000 record are SKIPPED, not passing. Run the suite as a non-root uid " +
+      "to exercise them.",
+  );
+}
 
 /**
  * The blocked-approvals surface: an agent held on an approval it could not
@@ -162,8 +216,9 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
     expect(blocked[0].agent).toBe("overlord");
   });
 
-  it.skipIf(process.getuid?.() === 0)(
-    "degrades honestly on a real 0600/0000 file instead of exploding",
+  it.skipIf(!MODES_ENFORCED)(
+    "degrades honestly on a real 0600/0000 file instead of exploding " +
+      "(skipped when file modes are not enforced — e.g. running as root)",
     () => {
       writeFileSync(join(dir, "locked.json"), JSON.stringify(overlord));
       chmodSync(join(dir, "locked.json"), 0o000);
@@ -226,8 +281,9 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
       expect(unreadable).toBe(1);
     });
 
-    it.skipIf(process.getuid?.() === 0)(
-      "a real 0600 root-owned-style record counts as unreadable, not as absent",
+    it.skipIf(!MODES_ENFORCED)(
+      "a real 0600 root-owned-style record counts as unreadable, not as absent " +
+        "(skipped when file modes are not enforced — e.g. running as root)",
       () => {
         writeFileSync(join(dir, "locked.json"), JSON.stringify(overlord));
         chmodSync(join(dir, "locked.json"), 0o000);
@@ -330,39 +386,60 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
   // ───────────────────────────────────────────────────────────────────────────
   describe("the FALLBACK record (agent's own state dir) reaches the dashboard", () => {
     /**
-     * The production trigger, faithfully: the SHARED dir cannot be written by
-     * this uid. In prod that is docker auto-creating the bind source root-owned
-     * while the agent runs as uid 10001+. A test can't chown, and it can't just
-     * chmod the shared dir either — `tryWrite` chmods its own parent back to
-     * 1777, and in-test we OWN it, so that would succeed and no fallback fires.
-     * So make the shared dir UNCREATABLE by locking its parent (the pattern from
-     * telegram-plugin/tests/approval-hold-record.test.ts). Same `tryWrite` →
-     * false → fallback branch, no root required.
+     * The production trigger, faithfully: the SHARED dir cannot be WRITTEN by
+     * this uid (docker auto-creates the bind source root-owned while the agent
+     * runs as uid 10001+), while still being readable/enumerable by the web
+     * reader.
+     *
+     * This used to be simulated by `chmod 0500` on the shared dir's parent.
+     * **That guard was vacuous whenever the suite ran as root** — uid 0 ignores
+     * file modes, so the shared write SUCCEEDED and the fallback branch was
+     * never entered. `is written world-readable` and `clears both locations`
+     * then passed while describing the SHARED record, and the two tests that
+     * assert on the fallback PATH went red. Root is not exotic: it is how the
+     * fleet's debug container runs the suite.
+     *
+     * A filesystem artifact cannot replace the chmod either — anything planted
+     * in the shared dir to make the write fail is also seen by the READER and
+     * counted as an unreadable record, which is precisely what
+     * `unreadable === 0` below measures. So the EACCES is INJECTED (see
+     * `BlockedApprovalStoreDeps`): the store's real branch logic runs, the
+     * refusal is deterministic for every uid, and the shared dir stays a clean,
+     * honestly-empty directory from the reader's side.
      */
-    let locked: string; // read-only parent
-    let sharedDir: string; // the (uncreatable) shared dir under it
+    let sharedRoot: string; // stands in for `~/.switchroom`
+    let sharedDir: string; // its `blocked-approvals` — writes here are refused
     let agentsRoot: string; // its `agents` sibling — the fallback root
 
     beforeEach(() => {
-      locked = join(root, "locked");
-      sharedDir = join(locked, "blocked-approvals");
-      agentsRoot = join(locked, "agents");
+      sharedRoot = join(root, "held");
+      sharedDir = join(sharedRoot, "blocked-approvals");
+      agentsRoot = join(sharedRoot, "agents");
       mkdirSync(agentsRoot, { recursive: true });
     });
-    afterEach(() => {
-      try {
-        chmodSync(locked, 0o755);
-      } catch {
-        /* not every case locks it */
-      }
-    });
 
-    /** The real gateway store, pointed at the locked layout. */
+    /** EACCES in the shape the kernel raises it for a root-owned shared dir. */
+    function eacces(path: string): NodeJS.ErrnoException {
+      const e: NodeJS.ErrnoException = new Error(
+        `EACCES: permission denied, open '${path}'`,
+      );
+      e.code = "EACCES";
+      e.errno = -13;
+      e.syscall = "open";
+      e.path = path;
+      return e;
+    }
+
+    /** The real gateway store, with the SHARED write refused (uid-independent). */
     function heldStore(agent: string) {
       const ownDir = join(agentsRoot, agent);
       mkdirSync(ownDir, { recursive: true });
-      const s = createBlockedApprovalStore(sharedDir, agent, ownDir);
-      chmodSync(locked, 0o500); // shared dir now uncreatable — fallback territory
+      const s = createBlockedApprovalStore(sharedDir, agent, ownDir, {
+        writeFileSync: ((file, data, opts) => {
+          if (String(file).startsWith(sharedDir + sep)) throw eacces(String(file));
+          return writeFileSync(file, data, opts);
+        }) as typeof writeFileSync,
+      });
       return { store: s, ownDir };
     }
 
@@ -456,18 +533,18 @@ describe("readBlockedApprovals (Telegram-independent view of a held agent)", () 
     });
 
     it("counts an UNREADABLE fallback record rather than implying all-clear", () => {
+      // The 0600-mode trap, expressed as EISDIR: a DIRECTORY named
+      // `blocked-approval.json` is unreadable by `readFileSync` for EVERY uid,
+      // including root, and lands on the same non-ENOENT branch a real EACCES
+      // does. A `chmod 0000` here was vacuous-then-red under uid 0 — root reads
+      // a 0000 file, so the record surfaced as blocked and `unreadable` was 0.
       const s = store("overlord");
-      const f = join(s.ownDir, "blocked-approval.json");
-      writeFileSync(f, JSON.stringify(rec("overlord")));
-      chmodSync(f, 0o000); // the 0600-mode trap, in its extreme form
-      try {
-        const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
-        expect(blocked).toEqual([]);
-        // "I could not look" — NEVER "nothing is blocked".
-        expect(unreadable).toBe(1);
-      } finally {
-        chmodSync(f, 0o644);
-      }
+      mkdirSync(join(s.ownDir, "blocked-approval.json"), { recursive: true });
+
+      const { blocked, unreadable } = readBlockedApprovalsWithErrors(dir);
+      expect(blocked).toEqual([]);
+      // "I could not look" — NEVER "nothing is blocked".
+      expect(unreadable).toBe(1);
     });
   });
 });

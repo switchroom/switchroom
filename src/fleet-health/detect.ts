@@ -439,11 +439,42 @@ export function extractTurnId(line: string): string | null {
   return m ? m[0] : null;
 }
 
-/** Best-effort ISO-timestamp extraction from a gateway log line. Gateway lines
- *  are prefixed with an ISO-8601 timestamp; return it if present. */
+/**
+ * ISO-8601 instant, with the zone designator captured separately so a
+ * designator-less match can be told apart from a `Z` or an explicit offset.
+ */
+const ISO_TS_RE =
+  /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?/;
+
+/**
+ * Best-effort ISO-timestamp extraction from a gateway log line, ALWAYS returned
+ * as a zoned instant.
+ *
+ * Gateway lines are prefixed with an ISO-8601 timestamp by
+ * `telegram-plugin/stderr-timestamps.ts:29-31`, which stamps
+ * `new Date().toISOString()` — UTC with a literal `Z`, always. Verified against
+ * the 12 live `gateway-supervisor.log` files on the dev host: ~2.5M timestamp
+ * matches, every one `YYYY-MM-DDTHH:MM:SS.mmmZ`, none without. The shell-side
+ * stamps that reach the same log agree — `profiles/_base/start.sh.hbs:2456` and
+ * `docker/hindsight-autoheal.sh:110` both use `date -u …Z`.
+ *
+ * The designator stays OPTIONAL in the match, deliberately: a log-format change
+ * that dropped it must not silently stop dating findings (the same
+ * keep-the-signal posture as `ledger.withinWindow`'s undatable fallback). But a
+ * designator-less string is no longer returned as-is — `Date.parse` reads that
+ * as LOCAL time, so on this fleet's +10:00 host every such finding would be
+ * misdated by ten hours, skewing `recencyFactor` and able to shift a finding
+ * across `buildLedger`'s window boundary (#4622). Every producer in this repo
+ * writes UTC, so a designator-less line is UTC BY CONVENTION, and it is
+ * normalised here at the producer rather than left for each consumer to guess.
+ *
+ * An EXPLICIT offset (`+10:00`) is preserved untouched — it already names its
+ * zone, and appending `Z` to it would invent a ten-hour error.
+ */
 export function extractTs(line: string): string | null {
-  const m = line.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/);
-  return m ? m[0] : null;
+  const m = line.match(ISO_TS_RE);
+  if (!m) return null;
+  return m[1] ? m[0] : `${m[0]}Z`;
 }
 
 /**

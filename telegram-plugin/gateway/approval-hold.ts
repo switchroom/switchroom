@@ -233,6 +233,34 @@ export function safeActionForRecord(
     : naturalAction(toolName, undefined)
 }
 
+/**
+ * The one fs call whose FAILURE selects the fallback branch, injectable.
+ *
+ * The production trigger is "the shared dir is not writable by this uid" — and
+ * that is exactly the condition a test cannot create for itself, because a test
+ * run as **root ignores file modes**. The suite runs as uid 0 in the fleet's
+ * debug container (and in any `docker run` without `--user`), where a
+ * `chmod 0500` on the parent is a no-op: the shared write SUCCEEDS, the fallback
+ * branch is never taken, and every assertion about the fallback record silently
+ * describes the SHARED record instead. Two tests passed that way for real
+ * (`is written world-readable`, `clears both locations`) — vacuous guards that
+ * report coverage they do not provide.
+ *
+ * A filesystem artifact can't fix that either: anything planted in the shared
+ * dir to make the write fail (an `<agent>.json` DIRECTORY → EISDIR, a symlink →
+ * the lstat guard below) is also visible to the READER, which then counts it as
+ * an unreadable record — changing the very thing the test measures. So the
+ * refusal is injected instead: the real `write()` branch logic, the lstat guard,
+ * the fallback selection, the stale-unlink and the stderr log all still run.
+ *
+ * Production callers never pass this.
+ */
+export interface BlockedApprovalStoreDeps {
+  /** Defaults to `node:fs`'s. Tests substitute one that throws EACCES for the
+   *  shared path, reproducing a root-owned bind under a per-agent uid. */
+  writeFileSync?: typeof writeFileSync
+}
+
 export interface BlockedApprovalStore {
   /** Write (or replace) the blocked record for this agent. */
   write(rec: BlockedApprovalRecord): void
@@ -288,7 +316,10 @@ export function createBlockedApprovalStore(
    *      which must stay in sync with the filename below).
    */
   fallbackDir?: string,
+  /** Test-only fs seam — see {@link BlockedApprovalStoreDeps}. */
+  deps: BlockedApprovalStoreDeps = {},
 ): BlockedApprovalStore {
+  const write_ = deps.writeFileSync ?? writeFileSync
   const primary = join(dir, `${agent}.json`)
   // Keep in sync with FALLBACK_RECORD_NAME in src/web/blocked-approvals-read.ts —
   // the reader matches this filename exactly. Pinned by the fallback-contract
@@ -324,7 +355,7 @@ export function createBlockedApprovalStore(
       if (dirMode != null) {
         try { chmodSync(parent, dirMode) } catch { /* not ours to chmod */ }
       }
-      writeFileSync(target, body, { encoding: 'utf-8', mode: BLOCKED_APPROVAL_FILE_MODE })
+      write_(target, body, { encoding: 'utf-8', mode: BLOCKED_APPROVAL_FILE_MODE })
       chmodSync(target, BLOCKED_APPROVAL_FILE_MODE)
       return true
     } catch {
