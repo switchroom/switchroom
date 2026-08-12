@@ -163,12 +163,20 @@ _sql "ALTER TABLE IF EXISTS entity_cooccurrences SET (autovacuum_vacuum_scale_fa
 # What governs an insert-only table is the INSERT trigger, and that was still
 # at the stock 1000 + 0.2 * 1.7M = 340,735 inserts (~2 weeks of ingest at the
 # measured rate). Hence `last_autovacuum` NULL and `autovacuum_count` 0 on
-# BOTH tables, while `entities` was not listed here at all.
+# BOTH tables at the time of measurement, while `entities` was not listed here
+# at all.
 #
 # The values below put a vacuum on each table roughly every 8h at the measured
 # churn, bounding VM staleness to hours instead of leaving it unbounded:
 #   unit_entities insert trigger: 1000 + 0.005 * 1.7M    =  9,493 ins  (was 340,735)
 #   entities      dead   trigger:  500 + 0.005 * 239,629 =  1,698 dead (was 4,843)
+# 4,843 IS reachable — `entities` did hit it once, autovacuuming at 2026-08-12
+# 22:19Z and taking its VM from 31.4% straight back to 100% — but only after
+# roughly 23h of accumulated churn (~5.2k dead tuples/day). That is the
+# problem, not the refutation: any container recreate inside that day-long
+# window resets the dead-tuple counter, the trigger is never reached, and the
+# visibility map just stays stale. 1,698 puts a pass ~3x/day, well inside the
+# restart window.
 # Cost is the tradeoff — more frequent vacuum is more background I/O — but
 # these two are small: 108MB heap + 261MB index (unit_entities) and 25MB + 56MB
 # (entities), so a pass is a few hundred MB of mostly-cached reads, unlike

@@ -57,7 +57,8 @@ now an anomaly worth investigating, not the norm.
   halve-the-page path from #4604.
 
 - **hindsight pg0: `unit_entities` / `entities` now get vacuumed often enough
-  to keep their visibility maps fresh, so index-only scans stay index-only.**
+  to bound visibility-map staleness to hours, so index-only scans stay mostly
+  index-only.**
   Measured read-only on the live fleet DB (2026-08-13): `unit_entities` at
   62.8 % `relallvisible/relpages` and `entities` at 31.4 %, with
   `last_autovacuum` NULL and `autovacuum_count` 0 on both. `EXPLAIN (ANALYZE,
