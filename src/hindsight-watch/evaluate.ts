@@ -715,8 +715,14 @@ export function evaluateRecallQualityRegression(
     detail:
       `recall quality is ${pct(worst.drop)} below its own trailing ` +
       `${RECALL_BASELINE_DAYS}-day baseline (worst arm: ${worst.label}) ` +
-      `— warn ≥${pct(RECALL_QUALITY_DROP_WARN)}, page ≥${pct(RECALL_QUALITY_DROP_PAGE)}. ` +
-      `Absolute floors cannot see this: the readings are still well above them.` +
+      `— warn ≥${pct(RECALL_QUALITY_DROP_WARN)}, page ≥${pct(RECALL_QUALITY_DROP_PAGE)}.` +
+      // Only claim the floors are blind when they actually are. On an `ok`
+      // verdict this line still shows up in `--dry-run` output, and a status
+      // listing that asserts a problem it just decided there isn't teaches the
+      // operator to skim it.
+      (state === "breach"
+        ? ` Absolute floors cannot see this: the readings are still well above them.`
+        : "") +
       lines,
     measured: { drop: worst.drop, baseline: worst.baseline, considered: worst.considered },
   };
