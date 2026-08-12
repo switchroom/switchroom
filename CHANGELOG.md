@@ -79,6 +79,20 @@ now an anomaly worth investigating, not the norm.
   (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
   so a designator-less line is now normalised to `Z` at the producer. An
   explicit `+HH:MM` offset is preserved untouched.
+- **hermes: transcripts past the first page are no longer silently dropped,
+  and no longer arrive backwards.** `GET /api/sessions/:id/messages` emitted no
+  `pagination` block, and the desktop's `getAllSessionMessages` reads a missing
+  block as "legacy backend, that was the whole transcript" and stops paging —
+  so every session was truncated at a hardcoded 100 turns with no error
+  anywhere. It also projected the turns DB's newest-first read order straight
+  onto the wire, so the transcript rendered in reverse. The route now serves
+  upstream's real contract: `{limit, offset, order, returned}`, `order=oldest`
+  windowing from the start and `order=latest` from the end, chronological
+  inside the page, and a 400 on an unrecognised `order`. Related: the session
+  list routes (`/api/sessions`, `/api/profiles/sessions`) now honour `?limit=`
+  and `?offset=` instead of reporting `limit = sessions.length` — which made
+  the sidebar's `total > limit` arithmetic wrong — and the cross-profile route
+  carries the `errors` array the sidebar reads.
 
 - **fleet-health: the ledger's `windowDays` now actually windows the
   findings.** `buildLedger` read `windowDays` but aggregated EVERY finding ever

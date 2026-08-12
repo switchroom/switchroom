@@ -609,10 +609,6 @@ const CONTRACT: ContractCase[] = [
     search: "?limit=1&offset=0&min_messages=0&archived=exclude&order=recent",
     client: "hermes.ts:398-405 (listSessions)",
     server: "hermes_cli/web_routers/sessions.py:54 (get_sessions)",
-    gap:
-      "hermes-adapter.ts:601-620 ignores every query param and reports " +
-      "limit = sessions.length, so the desktop's pageWindow() silently " +
-      "truncates a list the adapter claimed was a full page.",
     assert: (res) => {
       const b = body200(res);
       expect((b.sessions as unknown[]).length).toBeLessThanOrEqual(1);
@@ -626,10 +622,6 @@ const CONTRACT: ContractCase[] = [
     search: "?limit=40&offset=0&min_messages=0&archived=exclude&order=recent",
     client: "hermes.ts:398-411 — spreads `...result` then re-windows to `limit`",
     server: "hermes_cli/web_routers/sessions.py:54",
-    gap:
-      "hermes-adapter.ts:616 sets limit = sessions.length. With 2 agents the " +
-      "desktop is told the page size is 2 when it asked for 40, which makes " +
-      "`total > limit` pagination arithmetic wrong in the sidebar footer.",
     assert: (res) => {
       const b = body200(res);
       expect(b.limit).toBe(40);
@@ -690,7 +682,6 @@ const CONTRACT: ContractCase[] = [
       "hermes.ts:552 (listSidebarSessionsLegacy reads `recents.errors ?? []`); " +
       "types/hermes.ts:444-446",
     server: "hermes_cli/web_routers/profiles.py:82",
-    gap: "hermes-adapter.ts:611-620 emits no `errors` key at all.",
     assert: (res) => {
       const b = body200(res);
       expect(Array.isArray(b.errors)).toBe(true);
@@ -775,12 +766,6 @@ const CONTRACT: ContractCase[] = [
     search: "?limit=500&offset=0&order=oldest",
     client: "hermes.ts:679-712 (getSessionMessages); types/hermes.ts:584-593",
     server: "hermes_cli/web_routers/sessions.py:602",
-    gap:
-      "SILENT DATA LOSS. hermes-adapter.ts:637-644 hardcodes 100 turns and " +
-      "emits no `pagination`. getAllSessionMessages (hermes.ts:744-746) treats " +
-      "a missing `pagination` as 'legacy backend returned the full transcript' " +
-      "and stops paging — so any transcript past 100 turns is silently " +
-      "truncated with no error anywhere.",
     assert: (res) => {
       const b = body200(res);
       expect(b.pagination).toBeTypeOf("object");
@@ -798,7 +783,6 @@ const CONTRACT: ContractCase[] = [
     search: "?limit=1&offset=0&order=oldest",
     client: "hermes.ts:679-712",
     server: "hermes_cli/web_routers/sessions.py:602-612 (limit/offset/order are real Query params)",
-    gap: "hermes-adapter.ts:640 passes the constant 100 and never reads `search`.",
     assert: (res) => {
       const b = body200(res);
       expect(b.pagination).toBeTypeOf("object");
@@ -1451,8 +1435,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
       total: 47,
-      green: 29,
-      gaps: 18,
+      green: 34,
+      gaps: 13,
     });
   });
 });

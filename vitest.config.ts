@@ -114,6 +114,11 @@ export default defineConfig({
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
+      // hermes-messages-paging.test.ts seeds a real turns registry.db via
+      // bun:sqlite (openTurnsDb) to assert transcript ORDER and offset
+      // windowing — properties that pass vacuously against the empty agents
+      // dir the vitest parity fixture points at. Run via test:bun.
+      "**/src/web/hermes-messages-paging.test.ts",
       "**/src/vault/grants.test.ts",
       "**/src/vault/grants-db.test.ts",
       // Approval-kernel suites use bun:sqlite — run via test:bun.
