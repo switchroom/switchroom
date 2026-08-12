@@ -38,7 +38,7 @@ workers issue thousands.
 | `recall-zero-memory` | >25 % (warn) / >40 % (page) of recalls injected nothing | level |
 | `recall-latency` | recall wall-time p95 ≥3 000 ms (warn) / ≥6 000 ms (page) | level |
 | `recall-quality-regression` | p50 `injected_score_max` **or** median candidate pool fell ≥40 % (warn) / ≥60 % (page) below its **own** trailing 7-day baseline | level |
-| `recall-deadline-pinning` | recall p95 reaches ≥90 % of the per-row `deadline_effective_ms` — recalls being cut off rather than completing | level |
+| `recall-deadline-pinning` | ≥5 % (warn) / ≥20 % (page) of recalls report `deadline_hit` — recalls being cut off rather than completing | level |
 | `consolidation-queue-age` | oldest pending `async_operations` row ≥2 h (warn) / ≥12 h (page) | level |
 | `consolidation-failure-streak` | ≥3 (warn) / ≥10 (page) consecutive **failed** `async_operations` for one `(bank, operation_type)` pair, newest within 2 h | edge |
 | `pending-consolidation-depth` | one bank's unconsolidated memories ≥500 **and** grew by ≥max(500, 50 %) across the window (≥5 000 pages) | level |
@@ -145,13 +145,15 @@ measurement in the doc comment. Summary:
   below its median and a resampling test put the false-fire rate at >90 % of
   healthy windows. The removal named its own precondition — re-baseline against
   a fleet that is both repaired and running the 10 s envelope (#3792). Recall
-  was repaired 2026-08-08 and the fleet now reads **p50 1097 ms, p95 1486 ms,
-  max 2759 ms** with zero deadline hits over 953 rows, so the healthy
+  was repaired 2026-08-08 and the fleet now reads **p50 1093 ms, p95 1477 ms,
+  max 2759 ms** with zero deadline hits over 972 rows, so the healthy
   distribution sits at ~15 % of the wall where it used to sit at ~80 %. The
   shipped lines are 3 000 / 6 000 ms — 2× and 4× the healthy p95 — and both
-  bootstrap tests are kept: `recall-log.test.ts` still asserts the old
-  population would have chattered, `recall-degradation.test.ts` asserts the
-  repaired one does not.
+  safety tests are kept: `recall-log.test.ts` still asserts the old population
+  would have chattered, `recall-degradation.test.ts` asserts the repaired one
+  does not, replaying every *contiguous* window of the capture rather than
+  resampling rows independently (recall latency is autocorrelated, and an IID
+  bootstrap understates a threshold's false-fire rate).
 - **no RETAIN p95 latency signal** — deliberately removed rather than retuned.
   Hindsight's exposition tops out at a finite `le` of 120 s, and a *healthy*
   post-#3610 backend already runs 52 of 268 retains (19.4 %) past it, because
@@ -237,13 +239,23 @@ from a floor, which is why they are three and not one:
 |---|---|---|
 | `recall-latency` | is recall slow against a wall it is not hitting? | the whole sick week pages |
 | `recall-quality-regression` | is recall worse than it *recently was*? | 08-02 warn → 08-03 page, four days before anything else |
-| `recall-deadline-pinning` | are recalls being *cut off* rather than completing? | p95 at 90.4 % of the 9993 ms effective deadline, every sick day |
+| `recall-deadline-pinning` | are recalls being *cut off* rather than completing? | 12.5–39.2 % of recalls truncated, every sick day |
 
 `recall-latency` and `recall-deadline-pinning` are kept separate deliberately:
-a p95 of 6 s against a 10 s wall means recall is slow *and completing*; a p95
-on the wall means an unknown share never completed and the agent silently got
-truncated memory. The two need different fixes, so merging them would put the
-wrong remedy in the DM.
+a p95 of 6 s against a 10 s wall means recall is slow *and completing*; a
+window where a third of recalls hit the wall means that third never completed
+and those agents silently got truncated memory. The two need different fixes,
+so merging them would put the wrong remedy in the DM.
+
+Pinning is measured as a **rate of `deadline_hit`**, not as
+`p95 / deadline_effective_ms`. That ratio compares two independent config
+knobs — the fan-out `parallel_deadline_seconds` (10) against the separate
+per-request `request_timeout_seconds` (9) — so an operator retuning either one
+moves the verdict without anything about recall changing. It was also blind in
+practice: replayed over 2026-07-20 → 07-26, when that knob was 8, the ratio
+reads 0.81 and stays silent while **84–95 % of every recall was being cut
+off**, scoring the worst week in the log as healthier than the milder August
+incident it did catch. The rate reads no deadline value at all.
 
 Notes on the reduction, all of which are fail-CLOSED by design:
 

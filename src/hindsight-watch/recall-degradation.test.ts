@@ -40,9 +40,12 @@ import {
   RECALL_BASELINE_DAYS,
   RECALL_BASELINE_MAX_OBS_PER_DAY,
   RECALL_BASELINE_MIN_DAYS,
+  RECALL_DEADLINE_HIT_WARN,
   RECALL_MIN_SAMPLES,
   RECALL_P95_PAGE_MS,
   RECALL_P95_WARN_MS,
+  RECALL_QUALITY_DROP_PAGE,
+  RECALL_QUALITY_DROP_WARN,
 } from "./thresholds.js";
 import type { RecallBaseline, Sample } from "./types.js";
 
@@ -178,11 +181,58 @@ describe("the 2026-08-01 → 08-07 degradation the fourteen existing signals mis
     }
   });
 
-  it("recall-deadline-pinning PAGES on every single day of it", () => {
+  it("recall-deadline-pinning fires on every single day of it, graded by how much was cut off", () => {
+    // Severity tracks the measured truncation rate rather than being flat, so
+    // the three mildest days of the incident are a warn and the four worst are
+    // a page. Asserted day-by-day against the aggregates in SICK_DAYS: a test
+    // that only checked `state === "breach"` would pass just as happily if the
+    // grading were inverted.
+    const expected: Record<keyof typeof SICK_DAYS, string> = {
+      "08-01": "breach/page", // 22.3%
+      "08-02": "breach/page", // 37.2%
+      "08-03": "breach/page", // 39.2%
+      "08-04": "breach/warn", // 12.5%
+      "08-05": "breach/warn", // 17.9%
+      "08-06": "breach/page", // 26.6%
+      "08-07": "breach/warn", // 15.7%
+    };
     for (const [day, spec] of Object.entries(SICK_DAYS)) {
       const v = evaluateRecallDeadlinePinning(ringOf(sickRows(spec)));
-      expect(`${day}:${v.state}/${v.severity}`).toBe(`${day}:breach/page`);
+      expect(`${day}:${v.state}/${v.severity}`).toBe(
+        `${day}:${expected[day as keyof typeof SICK_DAYS]}`,
+      );
     }
+  });
+
+  /**
+   * The regression test for the defect review found in #4614's first cut.
+   *
+   * That version scored `p95 >= 0.90 × deadline_effective_ms`. Both of those
+   * are config: the fan-out wall is `parallel_deadline_seconds` (10) and the
+   * censoring point is the separate per-request `request_timeout_seconds`,
+   * which `switchroom.yaml` records being revised 8 → 9 on 2026-07-29. So the
+   * ratio was reporting 8/10 for the whole week of 07-20 → 07-26 and staying
+   * silent, while 84-95 % of every recall on those days was being cut off —
+   * blind to the worst week in the log, and scoring it as HEALTHIER than the
+   * milder August incident it did catch.
+   *
+   * The rate is config-independent, so the July shape fires loudly. If anyone
+   * reintroduces a deadline-relative ratio, this is the test that stops it.
+   */
+  it("fires on the July config shape, where a deadline-relative ratio was blind", () => {
+    const july = sickRows({
+      score: 0.62,
+      pool: 70,
+      latP50: 6500,
+      latP95: 8095, // the measured 07-20 → 07-26 p95, against a ~9997ms deadline
+      deadlineHitRate: 0.9, // 84-95% measured across those seven days
+    });
+    // The old ratio scored this 0.81, comfortably under its 0.90 line.
+    expect(8095 / 9993).toBeLessThan(0.9);
+
+    const v = evaluateRecallDeadlinePinning(ringOf(july));
+    expect(`${v.state}/${v.severity}`).toBe("breach/page");
+    expect(v.measured?.rate).toBeGreaterThan(0.8);
   });
 
   it("recall-quality-regression fires on the ONSET, warn then page", () => {
@@ -299,7 +349,7 @@ describe("the three new signals stay silent on the REAL repaired fleet", () => {
     // guarded: if a regeneration ever flattens it into comfortable constants,
     // the safety assertions above quietly stop testing safety.
     const s = summarizeRecallRows(rows);
-    expect(s.rows).toBe(278);
+    expect(s.rows).toBe(258);
     // The measurement that made the latency signal restorable at all.
     expect(s.elapsedP95Ms!).toBeLessThan(RECALL_P95_WARN_MS);
     expect(s.elapsedP95Ms!).toBeGreaterThan(1000);
@@ -320,29 +370,38 @@ describe("the three new signals stay silent on the REAL repaired fleet", () => {
   /**
    * The assertion with teeth, and the one the deleted latency signal failed.
    *
-   * A point estimate over the pooled fixture is not enough: a real tick reads
-   * roughly a 60-row window, and what condemns a threshold is the SPREAD of
-   * that window statistic, not its pooled value. Same seeded-LCG bootstrap as
-   * `recall-log.test.ts` uses for the injected-score line, so a failure is a
-   * regression rather than a flake.
+   * A point estimate over the pooled fixture is not enough: a real tick reads a
+   * WINDOW, and what condemns a threshold is the spread of that window
+   * statistic, not its pooled value.
+   *
+   * CONTIGUOUS, not a bootstrap. The first cut of this file drew each window by
+   * sampling rows independently at random, which assumes recall latency is IID
+   * across rows. It is not — the failure mode this whole PR exists to catch is
+   * precisely a multi-day correlated excursion, and independent resampling
+   * destroys exactly the autocorrelation that produces a bad window. An IID
+   * bootstrap systematically UNDERSTATES the false-fire rate of a threshold,
+   * which is the optimistic direction, on the one number this PR uses to argue
+   * a previously-rejected signal is now safe. So every window here is a run of
+   * adjacent rows in time order, and the claim is over the real sequence.
+   *
+   * Scope, stated rather than implied: the fixture is a stratified sample, so
+   * `windowSize` adjacent entries span more wall-clock than the same count of
+   * raw log rows. This measures the threshold against every contiguous stretch
+   * of the repaired capture; it is not a claim about traffic outside it.
    */
-  function falseFireRate(
+  function contiguousFireRate(
     values: number[],
     fires: (w: number[]) => boolean,
-    { windowSize = 60, draws = 2000, seed = 0x5eed } = {},
-  ): number {
-    let s = seed >>> 0;
-    const next = () => {
-      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
-      return s / 0x1_0000_0000;
-    };
+    windowSize = 60,
+  ): { rate: number; windows: number } {
+    expect(values.length).toBeGreaterThan(windowSize);
     let fired = 0;
-    for (let d = 0; d < draws; d++) {
-      const w: number[] = [];
-      for (let i = 0; i < windowSize; i++) w.push(values[Math.floor(next() * values.length)]!);
-      if (fires(w)) fired++;
+    let windows = 0;
+    for (let start = 0; start + windowSize <= values.length; start++) {
+      windows++;
+      if (fires(values.slice(start, start + windowSize))) fired++;
     }
-    return fired / draws;
+    return { rate: fired / windows, windows };
   }
 
   function quantile(values: number[], p: number): number {
@@ -354,22 +413,31 @@ describe("the three new signals stay silent on the REAL repaired fleet", () => {
     .map((r) => r.total_elapsed_ms)
     .filter((n): n is number => typeof n === "number");
 
-  it("the SHIPPED latency lines never fire on repaired traffic — the re-baseline BLOCKER 1 asked for", () => {
+  it("the SHIPPED latency lines never fire on ANY contiguous window of repaired traffic", () => {
     // The exact inverse of the "no line below the 8 s budget is safe" test in
     // `recall-log.test.ts`, run against the population that test's comment
     // said would be needed before the signal could ship. 4000 and 6000 ms
     // fired on >90 % of 2026-07 windows; here they fire on none.
-    expect(falseFireRate(latencies, (w) => quantile(w, 0.95) >= RECALL_P95_WARN_MS)).toBe(0);
-    expect(falseFireRate(latencies, (w) => quantile(w, 0.95) >= RECALL_P95_PAGE_MS)).toBe(0);
+    for (const line of [RECALL_P95_WARN_MS, RECALL_P95_PAGE_MS]) {
+      const { rate, windows } = contiguousFireRate(latencies, (w) => quantile(w, 0.95) >= line);
+      // The window count is asserted too: a fixture that shrank below the
+      // window size would make `rate` vacuously 0 via an empty loop.
+      expect(`${line}:${rate}:${windows > 100}`).toBe(`${line}:0:true`);
+    }
     expect(RECALL_P95_PAGE_MS).toBeGreaterThan(RECALL_P95_WARN_MS);
   });
 
-  it("the deadline-pinning ratio never approaches its line on repaired traffic", () => {
-    const deadline = summarizeRecallRows(rows).deadlineEffectiveMedianMs!;
-    // Not merely under the 0.90 line — under a THIRD of it, so the thin
-    // 0.4 % margin recorded on the constant is a property of the sick side
-    // only and cannot flip this one.
-    expect(falseFireRate(latencies, (w) => quantile(w, 0.95) / deadline >= 0.3)).toBe(0);
+  it("no contiguous window of repaired traffic comes near the truncation lines", () => {
+    // The signal's own denominator, replayed the same way: not merely under
+    // the 5 % warn line but at zero on every window, because a repaired fleet
+    // does not truncate at all.
+    const hits = rows.map((r) => (r.deadline_hit === true ? 1 : 0));
+    const { rate } = contiguousFireRate(
+      hits,
+      (w) => w.reduce((a, b) => a + b, 0) / w.length >= RECALL_DEADLINE_HIT_WARN,
+    );
+    expect(rate).toBe(0);
+    expect(summarizeRecallRows(rows).deadlineHitRows).toBe(0);
   });
 });
 
@@ -447,14 +515,56 @@ describe("the trailing baseline is bounded and cannot contaminate itself", () =>
     );
   });
 
-  it("excludes TODAY from its own baseline", () => {
-    // The crux of the signal. Include today and the current degradation drags
-    // the reference toward the measurement and shrinks the drop being
-    // detected. Asserted as a value, not a comment.
-    let b = warmBaseline({ score: 0.8, pool: 90, days: 7, endingBefore: "2026-08-12" });
+  it("excludes TODAY from its own baseline, and the exclusion changes the VERDICT", () => {
+    // The crux of the signal, and a test that has to be built deliberately to
+    // have teeth. A FLAT prior week cannot test this at all: seven days of a
+    // constant 0.8 plus one bad day still has a median of 0.8, so `d.day <
+    // today` and `d.day <= today` agree and the assertion passes either way.
+    //
+    // A monotone slide separates them. The prior week is already sagging, so
+    // admitting today pulls the reference down with the measurement — the
+    // self-referential failure this whole design exists to avoid, where a slow
+    // decline normalises itself and the drop being detected shrinks toward
+    // nothing exactly as the decline gets worse.
+    //
+    //   prior 7 days   0.65 0.64 0.62 0.60 0.30 0.28 0.25  → median 0.60
+    //   today          0.20
+    //   contaminated   median of all eight              → 0.45
+    //
+    //   drop against the correct 0.60 baseline   66.7 %  → PAGE
+    //   drop against the contaminated 0.45       55.6 %  → warn
+    //
+    // So the mutation is visible as a severity change, not just a number.
+    const week = [0.65, 0.64, 0.62, 0.6, 0.3, 0.28, 0.25];
     const now = Date.parse("2026-08-12T12:00:00Z");
-    b = foldBaseline(b, sampleAt(0.05, 90), now);
-    expect(baselineFor(b, now).score.value).toBeCloseTo(0.8, 6);
+    const end = Date.parse("2026-08-12T00:00:00Z");
+    let b: RecallBaseline | undefined;
+    week.forEach((score, i) => {
+      // Pool held flat so the pool arm contributes nothing and the verdict is
+      // unambiguously the score arm's.
+      b = foldBaseline(b, sampleAt(score, 90), end - (week.length - i) * 86_400_000 + 43_200_000);
+    });
+    b = foldBaseline(b, sampleAt(0.2, 90), now);
+
+    expect(baselineFor(b!, now).score.value).toBeCloseTo(0.6, 6);
+
+    const v = evaluateRecallQualityRegression(
+      ringOf(sickRows({ score: 0.2, pool: 90, latP50: 1100, latP95: 1500, deadlineHitRate: 0 }), now),
+      b,
+      now,
+    );
+    expect(`${v.state}/${v.severity}`).toBe("breach/page");
+    expect(v.measured?.baseline as number).toBeCloseTo(0.6, 6);
+    expect(v.measured?.drop as number).toBeGreaterThan(RECALL_QUALITY_DROP_PAGE);
+
+    // …and the counterfactual, spelled out: scored against the CONTAMINATED
+    // 0.45 the very same measurement is only a warn. This is the assertion the
+    // flat-week version of this test could not make, and the one that fails if
+    // `baselineFor`'s day filter is loosened to include today.
+    const observed = (1 - (v.measured?.drop as number)) * 0.6;
+    const contaminated = 1 - observed / 0.45;
+    expect(contaminated).toBeGreaterThanOrEqual(RECALL_QUALITY_DROP_WARN);
+    expect(contaminated).toBeLessThan(RECALL_QUALITY_DROP_PAGE);
   });
 
   it("reports no-data below the minimum warm-up rather than firing on one day of history", () => {
@@ -591,13 +701,51 @@ describe("fail-closed reduction for the new signals", () => {
     expect(evaluateRecallQualityRegression(ring, repairedBaseline(), NOW).state).toBe("no-data");
   });
 
-  it("pinning refuses to substitute a constant for an absent per-row deadline", () => {
-    // The fail-open shape: scoring against the compiled-in RECALL_WALL_MS when
-    // the rows carry no deadline. On a fleet that RAISED its deadline that
-    // would invent breaches; on one that lowered it, it would hide them.
+  it("pinning still scores when the rows carry no deadline value at all", () => {
+    // The whole point of moving off `p95 / deadline_effective_ms`: the verdict
+    // must not depend on a config value the row may not even carry. The
+    // non-parallel recall path logs `deadline_effective_ms` as null, and the
+    // first cut of this signal went blind on exactly that.
     const rows = repairedRows().map((r) => ({ ...r, deadline_effective_ms: null }));
     const v = evaluateRecallDeadlinePinning(ringOf(rows));
-    expect(v.state).toBe("no-data");
+    expect(v.state).toBe("ok");
+
+    const cutOff = rows.map((r, i) => ({ ...r, deadline_hit: i % 2 === 0 }));
+    const sick = evaluateRecallDeadlinePinning(ringOf(cutOff));
+    expect(`${sick.state}/${sick.severity}`).toBe("breach/page");
+  });
+
+  it("excludes rows with no deadline_hit flag instead of counting them as completions", () => {
+    // The fail-OPEN shape this guards: using `rows` as the denominator. 4 of
+    // the 40 instrumented rows were cut off (10% — a warn), but 80 further
+    // rows predate the flag. Against `rows` the rate dilutes to 4/120 = 3.3%
+    // and the signal reports `ok` on a fleet that is truncating one recall in
+    // ten, with the dilution worst exactly when the log is least trustworthy.
+    const base = repairedRows(120);
+    const rows = base.map((r, i) => ({
+      ...r,
+      deadline_hit: i >= 40 ? undefined : i < 4,
+    }));
+    const v = evaluateRecallDeadlinePinning(ringOf(rows));
+    expect(`${v.state}/${v.severity}`).toBe("breach/warn");
+    expect(v.measured?.deadlineHitConsidered).toBe(40);
+    expect(v.measured?.rate).toBeCloseTo(0.1, 6);
+  });
+
+  it("rejects a garbled persisted truncation count instead of scoring NaN as ok", () => {
+    // `normalizeRecallSample` tolerates these two fields as optional so an
+    // older persisted sample stays usable, which means the evaluator is the
+    // only thing standing between a corrupt state file and a false all-clear:
+    // `"120" < 30` is false, so a bare floor check would pass, and the
+    // resulting `NaN >= threshold` is false, so the signal would report `ok`
+    // on a fleet it cannot see at all.
+    const ring = ringOf(repairedRows());
+    for (const bad of [{ deadlineHitConsidered: "120" }, { deadlineHitConsidered: 120, deadlineHitRows: 200 }, { deadlineHitConsidered: 120.5 }, { deadlineHitConsidered: 120, deadlineHitRows: -1 }]) {
+      const poisoned = ringOf(repairedRows());
+      poisoned[0]!.recall = { ...ring[0]!.recall!, ...bad } as (typeof ring)[0]["recall"];
+      const v = evaluateRecallDeadlinePinning(poisoned);
+      expect(`${JSON.stringify(bad)}=${v.state}`).toBe(`${JSON.stringify(bad)}=no-data`);
+    }
   });
 });
 

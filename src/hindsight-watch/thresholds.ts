@@ -619,11 +619,12 @@ export const RECALL_WALL_MS =
  * recall is BOTH fixed AND running the 10 s envelope" (follow-up #3792). That
  * fleet now exists.
  *
- * The healthy population is `repaired-fleet.fixture.ts`: 2026-08-10 00:00 →
- * 08-12 12:00 UTC, UNCONDITIONED because it needs no conditioning — over 953
- * rows, 3 had a degraded own bank and ZERO hit the deadline. It reads
+ * The healthy population is `repaired-fleet.fixture.ts`: the half-open window
+ * 2026-08-10 00:00 → 08-13 00:00 UTC, UNCONDITIONED because it needs no
+ * conditioning — over 972 rows, 3 had a degraded own bank and ZERO hit the
+ * deadline. It reads
  *
- *   p50 1097 ms   p90 1350 ms   p95 1486 ms   max 2759 ms
+ *   p50 1093 ms   p90 1347 ms   p95 1477 ms   max 2759 ms
  *
  * against a `deadline_effective_ms` of ~9993 ms. That is a healthy band of a
  * kind that has never previously been measurable here: the whole healthy
@@ -636,16 +637,34 @@ export const RECALL_WALL_MS =
  * cadence: 96/96 ticks per day page across all seven days, and 0/337 ticks
  * fire anywhere from 08-09 00:00 onward.
  *
- * THE ONE CAVEAT, recorded rather than hidden: the same replay fires the WARN
- * arm on 46/96 ticks of 08-10 and 3/96 of 08-09. Those are not steady state —
- * a tick reads a trailing 24 h window, so on 08-09 and 08-10 the window still
- * contains the incident's recovery tail (08-09 rows reach p99 7238 ms), and
- * the trailing p95 peaks at 4578 ms before settling under 1600 ms from 08-11
- * onward. Warning while the fleet is still slow is defensible; if it proves
- * noisy in practice the derived-and-rejected alternative is warn 6000 / page
- * 8000, which is 1.31× above that 4578 ms recovery peak, fires on 0/337
- * post-repair ticks including the recovery days, and still pages on 100 % of
- * the sick era. Retune to those two numbers rather than inventing new ones.
+ * THE ONE CAVEAT, recorded rather than hidden, and measured in the unit that
+ * actually matters. The same replay breaches the WARN arm on 138 of the 480
+ * ticks from 08-08 onward, which sounds alarming and is the wrong number to
+ * reason about: a breaching tick is not a DM. Hysteresis
+ * ({@link BREACHES_TO_FIRE_LEVEL} to fire, {@link CLEARS_TO_RESOLVE} to
+ * resolve, {@link RENOTIFY_MS} between reminders) collapses those 138 ticks
+ * into EIGHT messages —
+ *
+ *   08-08  fire + 3 six-hourly reminders, resolved 22:30
+ *   08-09  fire 23:30, 1 reminder, resolved 08-10 11:45
+ *   08-11 onward  0/192 ticks breach, 0 messages
+ *
+ * — every one of them on the incident's own recovery tail. A tick reads a
+ * trailing 24 h window, so through 08-09 and 08-10 that window still contains
+ * the tail (08-09 rows reach p99 7238 ms) and the trailing p95 peaks at
+ * 4578 ms before settling under 1600 ms from 08-11 onward. Eight DMs telling
+ * the operator recall is still slow while recall was still slow is the signal
+ * working, not chatter, and the steady state is silence.
+ *
+ * The alternative considered and rejected was warn 6000 / page 8000, 1.31×
+ * above that 4578 ms recovery peak, which emits 3 messages instead of 8. It
+ * buys five fewer DMs across one recovery in exchange for doubling the
+ * detection floor permanently, and it is NOT a drop-in retune: 6000 as a warn
+ * would put a fleet running a 7000 ms p95 — slow, and completing, so
+ * `recall-deadline-pinning` stays silent on it — one arm away from unwatched.
+ * `recall-degradation.test.ts` pins that shape deliberately. If this ever does
+ * need retuning, re-derive it against a fresh capture rather than adopting
+ * these numbers.
  */
 export const RECALL_P95_WARN_MS = 3000;
 export const RECALL_P95_PAGE_MS = 6000;
@@ -720,37 +739,57 @@ export const RECALL_BASELINE_MIN_DAYS = 3;
 export const RECALL_BASELINE_MAX_OBS_PER_DAY = 96;
 
 /**
- * Deadline pinning: the fraction of the effective deadline a p95 must reach
- * before the window counts as truncated rather than merely slow.
+ * Deadline pinning: the share of recalls that were CUT OFF, warn / page, as a
+ * fraction of the rows that carry a boolean `deadline_hit`.
  *
  * A DIFFERENT failure from `recall-latency`, which is why it is a different
  * signal: a p95 of 6 s against a 10 s wall means recall is slow and completing;
- * a p95 sitting on the wall means an unknown share of recalls never completed
- * at all and the agent was handed whatever had arrived by then. The two need
- * different remedies (make it faster vs raise the ceiling / find what hangs),
- * so collapsing them into one line would put the wrong fix in the DM.
+ * a window where a third of recalls hit the wall means that third never
+ * completed at all and those agents were handed whatever had arrived by then.
+ * The two need different remedies (make it faster vs raise the ceiling / find
+ * what hangs), so collapsing them would put the wrong fix in the DM.
  *
- * Read against each window's OWN `deadline_effective_ms` rather than against
- * {@link RECALL_WALL_MS}: the constant is the stock resolution with no operator
- * overrides, and a fleet that raised `recallParallelDeadlineSeconds` must be
- * scored against the wall it is actually running.
+ * WHY A RATE AND NOT `p95 / deadline_effective_ms` — this signal shipped in
+ * #4614 as `p95 >= 0.90 × deadline`, and review was right to reject it. That
+ * fraction is not a health measurement, it is a comparison of two independent
+ * config knobs:
  *
- * 0.90 verified by replay. Sick era p95 9028-9037 ms against a median
- * `deadline_effective_ms` of 9993 ms is 90.3-90.4 % — over the line on 96/96
- * ticks for every day 08-01 → 08-07. Post-repair the ratio is 13-16 % and it
- * fires on 0/337 ticks from 08-09 onward.
+ *   - `parallel_deadline_seconds` (10) is the fan-out wall, and it is what
+ *     `deadline_effective_ms` reports. `parallel_recall.py:128-129` grants a
+ *     straggler the whole remaining budget with no epsilon.
+ *   - `request_timeout_seconds` (9, fleet-wide) is a SEPARATE per-request
+ *     ceiling — `recall.py:2088` → `client.py:127`'s `urlopen(timeout=)`.
  *
- * THE MARGIN IS THIN AND THAT IS WORTH KNOWING: 9028 clears 0.90 × 9993 =
- * 8994 ms by 34 ms, i.e. 0.4 %. The observed truncation point (~9030 ms) is
- * NOT the fan-out deadline (~9993 ms) — something downstream cuts these
- * requests off about a second early — so a small drift in that downstream
- * limit could put the sick shape back under the line. The corroborating
- * instrument is already carried in the DM but deliberately NOT thresholded:
- * `deadline_hit` ran 12.5-39.2 % of rows through the incident against 0.0-0.2 %
- * after it, a ~60× separation against this ratio's 6×. If this signal ever
- * needs re-deriving, move it to that rate rather than loosening the fraction.
+ * The observed ~9.03 s truncation point is the SECOND knob, so the ratio was
+ * really measuring 9/10. `switchroom.yaml` records that knob being revised
+ * 8 → 9 on 2026-07-29 ("still one full second below the shared
+ * parallel_deadline_seconds (10)"), which is exactly the step in the data:
+ * timed-out slots have a median of 8018 ms before that date and 9019 ms after.
+ * An operator moving either knob moves the verdict without anything about
+ * recall having changed.
+ *
+ * That is not hypothetical. Replaying the log with the ratio, the week of
+ * 07-20 → 07-26 (n = 1768, knob at 8) scores 0.803-0.806 — UNDER the 0.90
+ * line, silent — while 84-95 % of every recall on those days hit the deadline.
+ * The ratio was blind to the worst week in the record and got there by scoring
+ * it as HEALTHIER (0.81) than the milder August incident (0.90). The rate is
+ * config-independent and monotone in the harm:
+ *
+ *   era                       n      deadline_hit %   old ratio   old verdict
+ *   07-20 → 07-26 (knob 8)   1768        84.0-95.0    0.80-0.81   SILENT (!)
+ *   08-01 → 08-07 (knob 9)   3315        12.5-39.2    0.90-0.90   page
+ *   08-08 → 08-12 (repaired) 1821         0.0- 0.2    0.13-0.43   silent
+ *
+ * 0.05 / 0.20 derived from that separation. The healthy CEILING is 0.2 % over
+ * 1821 post-repair rows, so warn sits 25× above the worst healthy day and page
+ * 100× above it, while the sick FLOOR is 12.5 % — every one of 08-01 → 08-07
+ * clears warn (12.5, 15.7, 17.9 → warn; 22.3, 26.6, 37.2, 39.2 → page) and
+ * every day from 08-08 on is silent on both. A 60× gap is what earns a
+ * two-tier split here: the old ratio's 6× spread genuinely could not support
+ * one, which is why it carried a single severity, and this one can.
  */
-export const RECALL_DEADLINE_PIN_FRACTION = 0.9;
+export const RECALL_DEADLINE_HIT_WARN = 0.05;
+export const RECALL_DEADLINE_HIT_PAGE = 0.2;
 
 /**
  * Consolidation queue age: warn / page, in seconds.

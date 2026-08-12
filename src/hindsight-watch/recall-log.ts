@@ -293,12 +293,24 @@ export interface RecallStats {
    */
   deadlineEffectiveMedianMs: number | null;
   /**
+   * Rows carrying a BOOLEAN `deadline_hit` — the denominator of the truncation
+   * rate, and its own denominator, not `rows`.
+   *
+   * A row that never logged the field is not a row that completed in time. If
+   * `rows` were the denominator, every pre-instrumentation row would count as
+   * healthy and the rate would be diluted toward zero exactly when the log is
+   * least trustworthy — the fail-OPEN direction. Excluded instead.
+   */
+  deadlineHitConsidered: number;
+  /**
    * Rows whose `deadline_hit` was true — any bank (or the directives slot)
    * missed the shared fan-out deadline.
    *
-   * Diagnostic ONLY, like `topError`: it goes into the DM so the operator can
-   * see how much of the window was actually cut off, but no threshold reads
-   * it, so a missing or garbled value can never move a verdict.
+   * THRESHOLDED (changed in review of #4614): `recall-deadline-pinning` scores
+   * `deadlineHitRows / deadlineHitConsidered`. It was diagnostic-only while
+   * that signal divided p95 by `deadlineEffectiveMedianMs`; that ratio turned
+   * out to compare two config knobs rather than measure health, and was blind
+   * to the worst week in the log. See {@link RECALL_DEADLINE_HIT_WARN}.
    */
   deadlineHitRows: number;
 
@@ -342,6 +354,7 @@ export const emptyRecallStats = (): RecallStats => ({
   elapsedP95Ms: null,
   deadlineConsidered: 0,
   deadlineEffectiveMedianMs: null,
+  deadlineHitConsidered: 0,
   deadlineHitRows: 0,
   errorRows: 0,
   topError: null,
@@ -416,7 +429,12 @@ export function summarizeRecallRows(rows: RecallLogRow[]): RecallStats {
       deadlines.push(row.deadline_effective_ms);
       out.deadlineConsidered++;
     }
-    if (row.deadline_hit === true) out.deadlineHitRows++;
+    // Denominator first, and only for rows that actually carry the boolean:
+    // a row with no `deadline_hit` is unknown, not healthy.
+    if (typeof row.deadline_hit === "boolean") {
+      out.deadlineHitConsidered++;
+      if (row.deadline_hit) out.deadlineHitRows++;
+    }
   }
 
   pool.sort((a, b) => a - b);

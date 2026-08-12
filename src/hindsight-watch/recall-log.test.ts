@@ -313,12 +313,19 @@ describe("recall signals stay silent on a REAL healthy fleet", () => {
     expect(summarizeRecallRows(rows).elapsedP95Ms).toBeGreaterThanOrEqual(8000);
   });
 
-  it("deadline pinning reports no-data on rows that predate the field, never ok", () => {
-    // This fixture carries no `deadline_effective_ms`. The fail-open shape
-    // would be scoring it against a hardcoded wall, or defaulting the missing
-    // denominator to something and passing. It must be inert instead.
+  it("deadline pinning reads ok here ONLY because the fixture was conditioned to remove the hits", () => {
+    // Worth stating explicitly so nobody reads this green as evidence the
+    // 2026-07 fleet was not truncating. It was: 84-95 % of raw July rows hit
+    // the deadline. This fixture is CONDITIONED — its header records that it
+    // selected rows where no bank timed out, errored, or hit the deadline —
+    // so a 0 % truncation rate here is the selection criterion reflected back,
+    // not a measurement. The `recall-latency` test above is what carries the
+    // real verdict on this population.
     const v = evaluateAll(ring).find((s) => s.signal === "recall-deadline-pinning")!;
-    expect(v.state).toBe("no-data");
+    expect(v.state).toBe("ok");
+    const s = summarizeRecallRows(rows);
+    expect(s.deadlineHitRows).toBe(0);
+    expect(s.deadlineHitConsidered).toBe(s.rows);
   });
 
   it("quality regression reports no-data with no persisted baseline, never ok", () => {

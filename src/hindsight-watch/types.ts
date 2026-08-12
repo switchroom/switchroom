@@ -220,7 +220,17 @@ export interface RecallSample {
    */
   deadlineConsidered?: number;
   deadlineEffectiveMedianMs?: number | null;
-  /** Diagnostic only — see `RecallStats.deadlineHitRows`. */
+  /**
+   * The truncation rate `recall-deadline-pinning` scores, and its own
+   * denominator. Optional on the wire for exactly the reason stated above, and
+   * safe for exactly the same reason: an absent `deadlineHitConsidered` reads
+   * as 0, which is below `RECALL_MIN_SAMPLES`, which is `no-data` — one signal
+   * blind for one window on upgrade, never a false all-clear.
+   *
+   * Note `deadlineEffectiveMedianMs` is NOT part of the verdict any more; it
+   * survives as DM prose only. See `RecallStats.deadlineHitRows`.
+   */
+  deadlineHitConsidered?: number;
   deadlineHitRows?: number;
   /**
    * Diagnostic only — the modal `error` string over the window and how many

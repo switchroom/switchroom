@@ -27,7 +27,8 @@ import {
   QUEUE_GROWTH_MIN_ABS,
   RECALL_BASELINE_DAYS,
   RECALL_BASELINE_MIN_DAYS,
-  RECALL_DEADLINE_PIN_FRACTION,
+  RECALL_DEADLINE_HIT_PAGE,
+  RECALL_DEADLINE_HIT_WARN,
   RECALL_MIN_SAMPLES,
   RECALL_OWN_BANK_TIMEOUT_PAGE,
   RECALL_OWN_BANK_TIMEOUT_WARN,
@@ -737,56 +738,83 @@ export function evaluateRecallQualityRegression(
  * looks exactly like sparse memory from inside the turn, which is why this is
  * worth its own signal rather than a higher latency page.
  *
- * Scored against the window's OWN `deadlineEffectiveMedianMs`, never against
- * {@link RECALL_WALL_MS} — a fleet that raised its deadline must be judged
- * against the wall it is actually running. When the rows do not carry one (the
- * non-parallel recall path logs it as null, as do samples persisted by builds
- * before this signal), the answer is `no-data`, not a substituted constant.
+ * Scored on the rate at which rows REPORT being cut off, not on
+ * `p95 / deadline_effective_ms`. That fraction compared two independent config
+ * knobs (`parallel_deadline_seconds` against the per-request
+ * `request_timeout_seconds`) and was blind to the 07-20 → 07-26 week, where
+ * 84-95 % of recalls hit the deadline and it scored 0.81; see
+ * {@link RECALL_DEADLINE_HIT_WARN} for the replay. The rate reads no deadline
+ * value at all, so retuning either knob cannot move the verdict.
+ *
+ * Rows carrying no boolean `deadline_hit` are excluded rather than counted as
+ * completions, and a window holding fewer than {@link RECALL_MIN_SAMPLES} of
+ * them is `no-data`, not `ok`.
  */
 export function evaluateRecallDeadlinePinning(ring: Sample[]): Verdict {
   const signal = "recall-deadline-pinning" as const;
   const r = latestRecall(ring);
   if (r === null) return noRecallData(signal);
 
-  const deadline = r.deadlineEffectiveMedianMs ?? null;
-  const deadlineConsidered = r.deadlineConsidered ?? 0;
-  if (
-    r.elapsedConsidered < RECALL_MIN_SAMPLES ||
-    r.elapsedP95Ms === null ||
-    deadlineConsidered < RECALL_MIN_SAMPLES ||
-    deadline === null ||
-    deadline <= 0
-  ) {
+  // Validated HERE rather than in `normalizeRecallSample`, which tolerates
+  // both fields as optional so a sample persisted by an older build stays
+  // usable. Tolerance must not become trust: a garbled `deadlineHitConsidered`
+  // would sail past a bare sample floor (`"x" < 30` is false), make `rate`
+  // NaN, and every `NaN >= threshold` is false — the fail-OPEN trap this file
+  // guards against everywhere else. Rejected to `no-data`, never zero-filled.
+  const considered = r.deadlineHitConsidered;
+  const hits = r.deadlineHitRows;
+  const usable =
+    typeof considered === "number" &&
+    typeof hits === "number" &&
+    Number.isInteger(considered) &&
+    Number.isInteger(hits) &&
+    hits >= 0 &&
+    hits <= considered &&
+    considered >= RECALL_MIN_SAMPLES;
+  if (!usable) {
+    const shown = typeof considered === "number" && Number.isFinite(considered) ? considered : 0;
     return {
       signal,
       state: "no-data",
       detail:
-        `cannot compare against the deadline this tick ` +
-        `(${r.elapsedConsidered} wall time(s), ${deadlineConsidered} deadline(s) ` +
-        `— each needs ${RECALL_MIN_SAMPLES}; older samples carry no deadline at all)`,
-      measured: { elapsedConsidered: r.elapsedConsidered, deadlineConsidered },
+        `cannot measure truncation this tick ` +
+        `(${shown} row(s) carry a usable deadline_hit flag, need ${RECALL_MIN_SAMPLES} ` +
+        `— samples persisted by builds before this signal carry none at all)`,
+      measured: { deadlineHitConsidered: shown },
     };
   }
 
-  const ratio = r.elapsedP95Ms / deadline;
-  // One severity only. There is no "a bit truncated": either the tail is
-  // sitting on the wall or it is not, and a two-tier split here would invent a
-  // distinction the measurement cannot support (see the 0.4 % margin recorded
-  // on RECALL_DEADLINE_PIN_FRACTION).
-  const state = ratio >= RECALL_DEADLINE_PIN_FRACTION ? "breach" : "ok";
-  const hits = r.deadlineHitRows ?? 0;
+  const rate = hits / considered;
+  const state = rate >= RECALL_DEADLINE_HIT_WARN ? "breach" : "ok";
+  const severity = rate >= RECALL_DEADLINE_HIT_PAGE ? "page" : "warn";
+  // Reported, never thresholded: these two say WHERE the cut-off lands, which
+  // is the difference between "raise the deadline" and "the per-request
+  // timeout is sitting below the deadline". A garbled value cannot move the
+  // verdict, only the prose.
+  const deadline = r.deadlineEffectiveMedianMs ?? null;
+  const wall =
+    deadline !== null && deadline > 0 && r.elapsedP95Ms !== null
+      ? ` p95 was ${Math.round(r.elapsedP95Ms)}ms against a ${Math.round(deadline)}ms effective deadline.`
+      : "";
   return {
     signal,
     state,
-    severity: state === "breach" ? "page" : undefined,
+    severity: state === "breach" ? severity : undefined,
     detail:
-      `recall p95 ${Math.round(r.elapsedP95Ms)}ms is ${pct(ratio)} of the ${Math.round(deadline)}ms ` +
-      `effective deadline over ${r.elapsedConsidered} recall(s) ` +
-      `— pinned at ≥${pct(RECALL_DEADLINE_PIN_FRACTION)}. ` +
-      `Requests are being CUT OFF rather than completing, so an unknown share of ` +
-      `turns saw truncated memory that looks identical to sparse memory.` +
-      `\n  ${hits} row(s) in this window reported hitting the deadline outright`,
-    measured: { ratio, elapsedP95Ms: r.elapsedP95Ms, deadlineMs: deadline, deadlineHits: hits },
+      `${hits}/${considered} recall(s) (${pct(rate)}) were CUT OFF at the deadline ` +
+      `— threshold ${pct(RECALL_DEADLINE_HIT_WARN)} warn / ${pct(RECALL_DEADLINE_HIT_PAGE)} page.` +
+      wall +
+      (state === "breach"
+        ? ` Those turns were handed truncated memory, which looks identical to ` +
+          `sparse memory from inside the turn.`
+        : ""),
+    measured: {
+      rate,
+      deadlineHits: hits,
+      deadlineHitConsidered: considered,
+      ...(r.elapsedP95Ms !== null ? { elapsedP95Ms: r.elapsedP95Ms } : {}),
+      ...(deadline !== null ? { deadlineMs: deadline } : {}),
+    },
   };
 }
 
