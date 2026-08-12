@@ -53,6 +53,28 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
+  not a linked `git worktree` — concurrent sub-agents can no longer collide
+  through shared git state.** Linked worktrees share the parent repo's refs
+  (including the single `refs/stash`), object store, and
+  `.git/worktrees/<name>` admin metadata. Observed in production: one worker's
+  `git stash pop` popped a DIFFERENT worker's stash entry, leaving conflict
+  markers in unrelated files; stale worktree admin metadata survived
+  `worktree remove --force` + `rm -rf` + `prune` and resurrected a previous
+  claim's dirty index state on re-claim; and workers operating in the shared
+  parent repo flipped it to detached HEAD mid-run. Those are inherent to
+  `git worktree` semantics, so the fix avoids worktrees rather than patching
+  around them: each claim is a local `git clone` (hardlinked object store —
+  near-worktree cost on the same filesystem) on its own task branch, with
+  `origin` rewired to the source repo's real remote so fetch/push still hit
+  upstream. The claim also now REJECTS a checkout base under `/tmp`/`/var/tmp`
+  (agent containers mount tmp `noexec`, so builds there fail with
+  `spawnSync … EACCES` minutes into a task) with a clear error at claim time —
+  escape hatch `SWITCHROOM_WORKTREE_ALLOW_TMP=1` for exec-mounted hosts.
+  Release, reap, and gc are shape-aware (`.git` dir = clone → `rm -rf`;
+  `.git` file = legacy linked worktree → `git worktree remove`), so records
+  written before this fix stay removable.
+
 - **hindsight: the cooccurrence sweep now RESUMES instead of restarting when the
   outer retry re-enters.** `_run_cooccurrence_prune` (Pass 3 of
   `graph_maintenance`, patched in via `docker/Dockerfile.hindsight`) kept its

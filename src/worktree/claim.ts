@@ -1,21 +1,36 @@
 /**
- * claim_worktree: atomically reserve a git worktree for a sub-agent.
+ * claim_worktree: atomically reserve an isolated checkout for a sub-agent.
  *
  * Protocol:
  *   1. Resolve repo path from alias or absolute path.
  *   2. Check concurrency cap.
  *   3. Write registry record BEFORE running git (atomic claim).
- *   4. Run git worktree add with the generated branch.
+ *   4. Provision an INDEPENDENT CLONE of the repo on the generated branch.
  *   5. Return { id, path, branch }.
  *
  * If git fails after the registry write, we clean up the record so the
  * claim doesn't ghost.
+ *
+ * WHY A CLONE AND NOT `git worktree add` (worktree-collision fix):
+ * linked worktrees share the parent repo's object store, refs — including
+ * the SINGLE `refs/stash` — and `.git/worktrees/<name>` admin metadata.
+ * Observed in production: one worker's `git stash pop` popped a DIFFERENT
+ * worker's stash entry, leaving conflict markers in unrelated files; stale
+ * `.git/worktrees/<name>` index metadata survived `worktree remove --force`
+ * + `rm -rf` + `prune` and resurrected a previous claim's dirty state; and
+ * workers stepping into the shared parent repo flipped it to detached HEAD
+ * mid-run. Those are inherent to worktree semantics — no amount of naming
+ * or locking discipline fixes a shared stash ref. An independent clone
+ * shares NOTHING mutable with the source repo, so concurrent claims cannot
+ * collide by construction. A local clone hardlinks the object store (same
+ * filesystem), so the disk/time cost is near a worktree's, not a full
+ * re-download.
  */
 
 import { execFileSync } from "node:child_process";
-import { closeSync, mkdirSync, openSync, existsSync, unlinkSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { closeSync, mkdirSync, openSync, existsSync, rmSync, unlinkSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { writeRecord, countByRepo, deleteRecord, registryDir } from "./registry.js";
 import type { ClaimInput, ClaimResult, CodeRepoEntry } from "./types.js";
@@ -60,11 +75,40 @@ function acquireRepoLock(repoPath: string): () => void {
 /** Default max simultaneous worktrees per repo. */
 export const DEFAULT_CONCURRENCY = 5;
 
-/** Base directory where worktrees are created. */
+/** Base directory where task checkouts are created. */
 export function worktreesBaseDir(): string {
   return resolve(
     process.env.SWITCHROOM_WORKTREE_BASE ?? join(homedir(), ".switchroom", "worktree-checkouts"),
   );
+}
+
+/**
+ * Reject a checkout base directory under a tmp mount.
+ *
+ * Agent containers mount /tmp `noexec`, so a checkout placed there fails the
+ * moment anything tries to run a binary out of it (`npm ci` →
+ * `spawnSync .../esbuild EACCES`). That failure surfaces minutes into a task
+ * and looks like a toolchain bug; failing the CLAIM with a clear message is
+ * the deterministic version of the "never /tmp, always $HOME" prose rule.
+ *
+ * Escape hatch: SWITCHROOM_WORKTREE_ALLOW_TMP=1 (tests and hosts whose tmp
+ * is exec-mounted).
+ */
+export function assertBaseDirNotTmp(baseDir: string): void {
+  if (process.env.SWITCHROOM_WORKTREE_ALLOW_TMP === "1") return;
+  const base = resolve(baseDir);
+  const tmpRoots = new Set([resolve(tmpdir()), "/tmp", "/var/tmp"]);
+  for (const root of tmpRoots) {
+    if (base === root || base.startsWith(root + sep)) {
+      throw new Error(
+        `Refusing to provision a checkout under "${base}": tmp filesystems are ` +
+        `mounted noexec in agent containers, so builds there fail with EACCES ` +
+        `(e.g. npm ci spawning esbuild). Set SWITCHROOM_WORKTREE_BASE to a ` +
+        `directory under $HOME (default: ~/.switchroom/worktree-checkouts), or ` +
+        `set SWITCHROOM_WORKTREE_ALLOW_TMP=1 if this host's tmp is exec-mounted.`,
+      );
+    }
+  }
 }
 
 /**
@@ -166,8 +210,9 @@ export async function claimWorktree(
     const taskSuffix = input.taskName ? sanitizeTaskName(input.taskName) : "task";
     branch = `task/${taskSuffix}-${id}`;
 
-    // Compute worktree path
+    // Compute checkout path — enforced OUTSIDE tmp (noexec in containers).
     const baseDir = worktreesBaseDir();
+    assertBaseDirNotTmp(baseDir);
     mkdirSync(baseDir, { recursive: true });
     worktreePath = join(baseDir, `${id}-${taskSuffix}`);
 
@@ -193,6 +238,7 @@ export async function claimWorktree(
       createdAt: now,
       heartbeatAt: now,
       ownerAgent,
+      kind: "clone" as const,
     };
 
     // ATOMIC: write registry record BEFORE git operation.
@@ -205,16 +251,54 @@ export async function claimWorktree(
   }
 
   try {
-    // git worktree add -b <branch> <path>
-    execFileSync("git", ["worktree", "add", "-b", branch, worktreePath], {
+    // Provision an INDEPENDENT clone (see module header for why not
+    // `git worktree add`). Branch from the source repo's current HEAD
+    // commit — the same starting point `worktree add -b` used — resolved
+    // BEFORE cloning so a detached-HEAD source still works.
+    const headSha = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: repoPath,
       stdio: "pipe",
+      encoding: "utf-8",
+    }).trim();
+
+    // Local clone: hardlinks the object store on the same filesystem, so
+    // this is cheap. --no-checkout because we check out the task branch
+    // ourselves in the next step.
+    execFileSync("git", ["clone", "--quiet", "--no-checkout", repoPath, worktreePath], {
+      stdio: "pipe",
     });
+    execFileSync("git", ["checkout", "--quiet", "-b", branch, headSha], {
+      cwd: worktreePath,
+      stdio: "pipe",
+    });
+
+    // Rewire `origin` from the local source path to the source repo's real
+    // remote, so `git fetch origin` / `git push origin` in the checkout hit
+    // upstream — matching what a linked worktree (which shared the parent's
+    // remotes) used to give workers. If the source has no origin, leave the
+    // local path in place.
+    let originUrl: string | undefined;
+    try {
+      originUrl = execFileSync("git", ["remote", "get-url", "origin"], {
+        cwd: repoPath,
+        stdio: "pipe",
+        encoding: "utf-8",
+      }).trim();
+    } catch {
+      /* source repo has no origin remote */
+    }
+    if (originUrl) {
+      execFileSync("git", ["remote", "set-url", "origin", originUrl], {
+        cwd: worktreePath,
+        stdio: "pipe",
+      });
+    }
   } catch (err) {
-    // Clean up the registry record since git failed
+    // Clean up the registry record AND any partial clone since git failed.
     deleteRecord(id);
+    rmSync(worktreePath, { recursive: true, force: true });
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`git worktree add failed: ${msg}`);
+    throw new Error(`checkout provisioning (git clone) failed: ${msg}`);
   }
 
   return { id, path: worktreePath, branch };

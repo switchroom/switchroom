@@ -1,18 +1,21 @@
 /**
- * release_worktree: tear down a claimed worktree.
+ * release_worktree: tear down a claimed checkout.
  *
  * Best-effort cleanup:
  *   1. Read the registry record.
- *   2. Run `git worktree remove --force` on the path.
+ *   2. Remove the checkout — shape-aware: independent clones are `rm -rf`d
+ *      (nothing lives outside the directory), legacy linked worktrees go
+ *      through `git worktree remove --force` so the source repo's admin
+ *      entry is pruned too (see remove-checkout.ts).
  *   3. Delete the registry record.
  *
  * If any step fails, we continue and report `released: false`.
  * The reaper will handle orphans on its next run.
  */
 
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readRecord, deleteRecord } from "./registry.js";
+import { removeCheckout } from "./remove-checkout.js";
 import type { ReleaseInput, ReleaseResult } from "./types.js";
 
 /**
@@ -30,12 +33,9 @@ export function releaseWorktree(input: ReleaseInput): ReleaseResult {
   let gitSuccess = true;
   if (existsSync(record.path)) {
     try {
-      execFileSync("git", ["worktree", "remove", "--force", record.path], {
-        cwd: record.repo,
-        stdio: "pipe",
-      });
+      removeCheckout(record.repo, record.path);
     } catch {
-      // git remove failed — path may have been deleted externally, or
+      // removal failed — path may have been deleted externally, or the
       // repo is gone. Don't block the record cleanup.
       gitSuccess = false;
     }

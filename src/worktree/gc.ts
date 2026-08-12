@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { join, resolve, basename } from "node:path";
 import { listRecords } from "./registry.js";
 import { probePathInUse, type PathUseState } from "./reaper.js";
+import { detectCheckoutKind } from "./remove-checkout.js";
 
 // ── pure helpers ────────────────────────────────────────────────────────────
 
@@ -817,6 +818,14 @@ export function applyGc(plan: GcPlan, deps: ApplyDeps = {}): GcApplyResult {
   for (const r of plan.registered) {
     if (r.verdict !== "remove") continue;
     try {
+      if (detectCheckoutKind(r.path) === "clone") {
+        // Independent clone (post worktree-collision fix): the task branch,
+        // refs, and metadata all live INSIDE the directory — removing it is
+        // the whole cleanup. Nothing to delete or prune in the source repo.
+        rmSync(r.path, { recursive: true, force: true });
+        res.removed.push(r.path);
+        continue;
+      }
       exec("git", ["-C", r.repo, "worktree", "remove", "--force", r.path]);
       res.removed.push(r.path);
       if (r.branch) {
