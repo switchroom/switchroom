@@ -140,8 +140,11 @@ now an anomaly worth investigating, not the norm.
   live work and re-ran finished work on a lie. The boot-resume block is a
   once-per-CONTAINER-boot action, so that is now literal: `start.sh` clears a
   `.boot-resume-done` generation token once per container boot, before it forks
-  the gateway sidecar; the gateway stamps the token as the last thing its boot
-  block does; a gateway that boots and finds the token knows another gateway in
+  the gateway sidecar; the gateway stamps the token the moment the boot resume
+  becomes DURABLE — immediately after the resume inbound reaches the inbound
+  spool, not at the end of the block that merely builds it in memory, so a
+  crash in between loses the token and repeats the work rather than losing the
+  work; a gateway that boots and finds the token knows another gateway in
   this same container generation already did the work, and skips the
   orphan-turn reaper, the resume synthetic and `.pending-turn.env`. No clock
   comparison is involved, so a gateway that crashes during its OWN boot leaves
@@ -153,7 +156,11 @@ now an anomaly worth investigating, not the norm.
   recycled PID after a container restart cannot masquerade as the live agent;
   every uncertainty (no token, dead or mismatched record, unreadable `/proc`)
   fails open to the previous behaviour, so genuine restarts, watchdog timeouts
-  and first boots are unchanged. (#4641)
+  and first boots are unchanged. The token additionally records the container
+  boot it was written under (PID 1's `/proc` starttime), so a token that
+  outlives its generation — `start.sh`'s `rm -f … || true` swallows a per-file
+  unlink failure — is self-evidently stale rather than a permanent, silent
+  resume suppressor. (#4641)
 
 - **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
   `hindsight-watch-pg-probe`'s `if:` gate carried `push` and `merge_group` but

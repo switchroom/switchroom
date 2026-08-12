@@ -23,12 +23,52 @@
  *   1. `start.sh`, in the OUTER docker pass and BEFORE it forks the gateway,
  *      deletes `<stateDir>/.boot-resume-done` (and any stale
  *      `agent-process.json`). That deletion happens exactly once per container
- *      boot, and the gateway supervisor cannot re-run it.
- *   2. The gateway runs its boot-resume block and, on completing it, writes
- *      the sentinel (`markBootResumeComplete`).
- *   3. A gateway that boots and FINDS the sentinel knows some gateway in this
- *      same container generation already did the boot resume — so this boot is
- *      a gateway-only respawn and must skip the whole block.
+ *      boot, and the gateway supervisor cannot re-run it. NOTE: that clear
+ *      lives inside start.sh's `[ "$SWITCHROOM_RUNTIME" = "docker" ]` guard, so
+ *      it is DOCKER-ONLY. Under the legacy systemd runtime nothing clears the
+ *      token, and the guard's fail-open rests entirely on the two vetoes below
+ *      (the boot-identity check and the `/proc` record). The fleet is all
+ *      docker; this is stated so a systemd revival does not inherit it silently.
+ *   2. The gateway runs its boot-resume block and, once the resume inbound is
+ *      DURABLY spooled, writes the sentinel (`markBootResumeComplete`). The
+ *      token embeds the container-boot identity it was written under.
+ *   3. A gateway that boots and FINDS the sentinel — carrying THIS container
+ *      boot's identity — knows some gateway in this same container generation
+ *      already did the boot resume, so this boot is a gateway-only respawn and
+ *      must skip the whole block.
+ *
+ * ## WHERE the token is stamped, and why it is NOT the tail of the block
+ *
+ * The stamp must follow the point at which the resume becomes CRASH-SURVIVABLE,
+ * not the point at which the block stops running. Those are ~8k lines apart in
+ * gateway.ts: the `bootResumeInit` block only builds `bootResumeInbound` in
+ * MEMORY; the inbound becomes durable much later, at
+ * `inboundSpool.put(bootResumeInbound.agent, bootResumeInbound.msg)`. So
+ * `markBootResumeComplete` is called immediately AFTER that put (and after
+ * `markTurnResumed`, which obeys the identical rule — see turns-schema.ts:
+ * "the caller must stamp only AFTER the resume inbound is durably spooled").
+ *
+ * Stamping at the tail of the block instead would create a NEW, silent
+ * work-loss mode, worse than the bug this module fixes. On a genuine restart
+ * the reaper durably stamps the interrupted turn `ended_via='restart'`; if the
+ * gateway then dies before the durable put — the Bun-crash-at-boot pattern
+ * #4641 exists for, and also the `acquireStartupLock` → `process.exit(1)`
+ * path, both of which sit inside that window — the successor would find a
+ * token, find no `agent-process.json` (start.sh has not reached `exec claude`;
+ * its inner pass waits on the LiteLLM probe first), return
+ * `gateway-only-respawn-no-record` and suppress. The turn stays
+ * `ended_via='restart'` with `resumed_at` NULL and is never resumed.
+ *
+ * Stamping after the put moves that window the other way, which is safe BY
+ * CONSTRUCTION: a successor that re-runs the block re-mints the same resume,
+ * `resumed_at` is still NULL so the turn is still findable, and the spool
+ * dedups on `s:resume:<resume_turn_key>` — so the retry is idempotent, not a
+ * double-send. Lose the token, repeat the work; never lose the work.
+ *
+ * The stamp is UNCONDITIONAL: a boot that found nothing to resume still
+ * completed this generation's boot resume, and a later gateway-only respawn
+ * must still be suppressed — that respawn running the reaper against a
+ * meanwhile-started live turn IS bug #4641.
  *
  * This is deliberately NOT timing-derived. An earlier revision of this module
  * compared `/proc` starttimes ("the agent must predate me") and justified it
@@ -66,11 +106,43 @@
  *
  * ## FAIL-OPEN is the invariant
  *
- * No sentinel → run the boot resume (the pre-#4641 behaviour). Recorded
- * process dead or mismatched → run it. Probe throws → run it. Plus a
- * `SWITCHROOM_GATEWAY_RESPAWN_GUARD=0` ops escape hatch. Suppressing a real
- * resume loses work; an extra resume on an already-restarted agent is merely
- * the status quo.
+ * No sentinel → run the boot resume (the pre-#4641 behaviour). Sentinel from a
+ * DIFFERENT container boot → run it. Recorded process dead or mismatched → run
+ * it. Probe throws → run it. Plus a `SWITCHROOM_GATEWAY_RESPAWN_GUARD=0` ops
+ * escape hatch. Suppressing a real resume loses work; an extra resume on an
+ * already-restarted agent is merely the status quo.
+ *
+ * The invariant admits no path-override env vars. An earlier revision let
+ * `SWITCHROOM_BOOT_RESUME_DONE_FILE` / `SWITCHROOM_AGENT_PROCESS_FILE`
+ * redirect the token and record paths from the live process env, while
+ * start.sh hard-codes `"$TELEGRAM_STATE_DIR/.boot-resume-done"`. Setting
+ * either in a container would have made start.sh clear one path and the
+ * gateway read another — the token then never cleared, and EVERY boot
+ * suppressing its resume forever. That is the one fail-CLOSED direction the
+ * module can take, so the overrides are confined to `DetectOpts` (test
+ * injection). Verified: nothing in the repo ever set them.
+ *
+ * ## Why the token carries the container-boot identity
+ *
+ * `gateway-only-respawn-no-record` is the only branch that suppresses on the
+ * token ALONE, with no corroborating `/proc` evidence — and start.sh's clear is
+ * `rm -f … 2>/dev/null || true`, which swallows a per-file failure (EROFS,
+ * EACCES, an immutable attr) while the sibling `agent-process.json` unlink
+ * succeeds. A token surviving into the next container generation would then
+ * suppress a genuine restart's resume, permanently and silently.
+ *
+ * So the token records the container-boot identity it was written under: PID
+ * 1's `/proc` starttime. PID 1 is the container's entry process — it lives for
+ * exactly one container generation and a restart replaces it, which is the
+ * property we need. (`/proc/sys/kernel/random/boot_id` is NOT usable here: it
+ * identifies the HOST kernel boot, which containers share and which survives a
+ * container restart.) A token naming a DIFFERENT boot is self-evidently stale
+ * and is ignored.
+ *
+ * The check is deliberately one-directional — only a MISMATCH is evidence.
+ * A token with no recorded identity, or an unreadable `/proc/1`, keeps the
+ * pre-existing "present ⇒ suppress" behaviour, so the hardening can never
+ * itself re-open #4641.
  *
  * ## What `break bootResumeInit` skips, and why each is safe
  *
@@ -90,6 +162,9 @@
  *     this path at all;
  *   - the bridge-dead IDLE notice — same generation, same marker, already
  *     surfaced (or already declined for want of an allowFrom chat);
+ *   - `bridgeDeadPriorStreak` — the #3038 cross-boot damper seed derived from
+ *     that marker. Left at 0 on a respawn: the streak belongs to the boot that
+ *     consumed the marker, and re-seeding it here would double-count;
  *   - the `pendingRedelivery` capture — a crash-redelivery candidate for the
  *     interrupted turn. Skipped deliberately: on a gateway-only respawn the
  *     turn is STILL RUNNING and will emit its own answer, so re-sending a
@@ -145,6 +220,7 @@ export type RespawnReason =
   | 'gateway-only-respawn-no-record'
   | 'guard-disabled'
   | 'no-boot-resume-sentinel'
+  | 'stale-boot-token'
   | 'agent-process-dead'
   | 'starttime-mismatch'
   | 'comm-mismatch'
@@ -224,32 +300,92 @@ export function bootResumeDonePath(stateDir: string): string {
   return join(stateDir, BOOT_RESUME_DONE_FILE)
 }
 
-/** Is this container generation's boot resume already done? Never throws. */
-export function readBootResumeSentinel(path: string): boolean {
+/** On-disk shape of the generation token. All fields are best-effort. */
+export interface BootResumeToken {
+  /** PID of the gateway that stamped it. Diagnostic. */
+  pid?: number
+  /** Wall-clock ms at stamp time. Diagnostic. */
+  at?: number
+  /** Container-boot identity (PID 1's starttime) at stamp time. */
+  boot?: string
+}
+
+/**
+ * This container generation's identity: PID 1's `/proc` starttime.
+ *
+ * PID 1 is the container's entry process — one per container generation,
+ * replaced on restart. Null when `/proc/1` is unreadable, which callers must
+ * treat as "no evidence", never as a mismatch.
+ */
+export function containerBootIdentity(procRoot = '/proc'): string | null {
+  return readProcIdentity(1, procRoot)?.starttime ?? null
+}
+
+export interface SentinelState {
+  /** The token file exists (whatever its contents). */
+  present: boolean
+  /** Present AND provably written under a DIFFERENT container boot. */
+  stale: boolean
+}
+
+/**
+ * Read the generation token and judge whether it belongs to THIS container
+ * boot. Never throws.
+ *
+ * Only a positive mismatch marks the token stale. An absent/blank/legacy
+ * `boot` field, an unparseable body, or an unreadable `/proc/1` all leave
+ * `stale: false` — so the hardening can only ever ADD a fail-open path, never
+ * suppress where the previous revision would not have.
+ */
+export function readBootResumeSentinel(
+  path: string,
+  opts: { procRoot?: string } = {},
+): SentinelState {
+  let raw: string
   try {
-    return existsSync(path)
+    if (!existsSync(path)) return { present: false, stale: false }
+    raw = readFileSync(path, 'utf8')
   } catch {
-    return false // unreadable → fail open (run the boot resume)
+    return { present: false, stale: false } // unreadable → fail open
   }
+  let stamped: string | null = null
+  try {
+    const parsed = JSON.parse(raw) as BootResumeToken | null
+    if (parsed != null && typeof parsed === 'object' && typeof parsed.boot === 'string' && parsed.boot.length > 0) {
+      stamped = parsed.boot
+    }
+  } catch { /* legacy/foreign body — no identity evidence, treat as present */ }
+  const live = containerBootIdentity(opts.procRoot)
+  if (stamped != null && live != null && stamped !== live) return { present: true, stale: true }
+  return { present: true, stale: false }
 }
 
 /**
  * Stamp the generation token: THIS container generation's boot-resume block
  * ran to completion, so a later gateway respawn must not re-run it.
  *
- * Called from gateway.ts at the END of the boot block (so a gateway that dies
- * mid-boot leaves no token and its successor redoes the work). Atomic
- * tmp+rename, and never throws: failing to stamp only costs a duplicate
- * boot-resume on a respawn, which is the pre-#4641 behaviour.
+ * Called from gateway.ts immediately AFTER the boot-resume inbound is durably
+ * spooled — NOT at the end of the boot block; see "WHERE the token is stamped"
+ * above for why those are different places and why the difference is a
+ * work-loss bug. Atomic tmp+rename, and never throws: failing to stamp only
+ * costs a duplicate boot-resume on a respawn, which is the pre-#4641
+ * behaviour.
+ *
+ * The body records the container-boot identity so a token that outlives its
+ * generation (start.sh's `rm -f … || true` swallowing a per-file failure) is
+ * self-evidently stale rather than a permanent resume suppressor.
  */
 export function markBootResumeComplete(
   stateDir: string,
-  opts: { path?: string; now?: number; log?: (s: string) => void } = {},
+  opts: { path?: string; now?: number; procRoot?: string; log?: (s: string) => void } = {},
 ): void {
-  const path = opts.path ?? process.env.SWITCHROOM_BOOT_RESUME_DONE_FILE ?? bootResumeDonePath(stateDir)
+  const path = opts.path ?? bootResumeDonePath(stateDir)
   const tmp = `${path}.tmp.${process.pid}`
+  const boot = containerBootIdentity(opts.procRoot)
   try {
-    writeFileSync(tmp, JSON.stringify({ pid: process.pid, at: opts.now ?? Date.now() }) + '\n')
+    const token: BootResumeToken = { pid: process.pid, at: opts.now ?? Date.now() }
+    if (boot != null) token.boot = boot
+    writeFileSync(tmp, JSON.stringify(token) + '\n')
     renameSync(tmp, path)
   } catch (err) {
     try { unlinkSync(tmp) } catch { /* best effort */ }
@@ -265,20 +401,27 @@ export function markBootResumeComplete(
  * The decision, pure.
  *
  * `sentinelPresent` is the generation token — the ONLY thing that can say
- * "suppress". `live` is the `/proc` identity read back for `record.pid` (null
- * when that pid is gone) and can only VETO a suppression.
+ * "suppress". `sentinelStale` and `live` (the `/proc` identity read back for
+ * `record.pid`, null when that pid is gone) can only VETO a suppression.
  */
 export function decideGatewayOnlyRespawn(input: {
   sentinelPresent: boolean
+  /** Token exists but names a different container boot. Defaults false. */
+  sentinelStale?: boolean
   record: AgentProcessRecord | null
   live: ProcIdentity | null
 }): RespawnDecision {
-  const { sentinelPresent, record, live } = input
+  const { sentinelPresent, sentinelStale, record, live } = input
   // No token → no gateway in this container generation has completed the boot
   // resume yet. That covers a genuine container restart, a first boot, AND a
   // gateway that crashed during its own boot before finishing the block.
   if (!sentinelPresent) {
     return { gatewayOnly: false, reason: 'no-boot-resume-sentinel', pid: record?.pid ?? null }
+  }
+  // A token start.sh's `rm -f` failed to clear: it names a PREVIOUS container
+  // boot, so it proves nothing about this generation. Run the boot resume.
+  if (sentinelStale === true) {
+    return { gatewayOnly: false, reason: 'stale-boot-token', pid: record?.pid ?? null }
   }
   // Token present but start.sh has not yet published the agent record (the
   // gateway boots long before `exec claude`). The token alone is proof enough:
@@ -300,9 +443,14 @@ export function decideGatewayOnlyRespawn(input: {
 export interface DetectOpts {
   /** Gateway STATE_DIR (`<agentDir>/telegram`). The record + token live here. */
   stateDir: string
-  /** Override the record path outright (tests, ops escape hatch). */
+  /**
+   * Override the record path. TEST INJECTION ONLY — deliberately not readable
+   * from the process env: start.sh hard-codes the production paths, so an env
+   * override could only ever desynchronise the writer from the reader. See
+   * "FAIL-OPEN is the invariant".
+   */
   recordPath?: string
-  /** Override the generation-token path (tests). */
+  /** Override the generation-token path. Test injection only (see above). */
   sentinelPath?: string
   /** `/proc` root; injectable for tests. */
   procRoot?: string
@@ -314,13 +462,19 @@ export interface DetectOpts {
 export function detectGatewayOnlyRespawn(opts: DetectOpts): RespawnDecision {
   if (opts.enabled === false) return { gatewayOnly: false, reason: 'guard-disabled', pid: null }
   const procRoot = opts.procRoot ?? '/proc'
-  const sentinelPresent = readBootResumeSentinel(
+  const sentinel = readBootResumeSentinel(
     opts.sentinelPath ?? bootResumeDonePath(opts.stateDir),
+    { procRoot },
   )
   const recordPath = opts.recordPath ?? join(opts.stateDir, AGENT_PROCESS_RECORD_FILE)
   const record = readAgentProcessRecord(recordPath)
   const live = record == null ? null : readProcIdentity(record.pid, procRoot)
-  return decideGatewayOnlyRespawn({ sentinelPresent, record, live })
+  return decideGatewayOnlyRespawn({
+    sentinelPresent: sentinel.present,
+    sentinelStale: sentinel.stale,
+    record,
+    live,
+  })
 }
 
 /**
@@ -342,8 +496,6 @@ export function shouldSkipBootResumeForGatewayOnlyRespawn(
       ...opts,
       stateDir,
       enabled: opts.enabled ?? process.env.SWITCHROOM_GATEWAY_RESPAWN_GUARD !== '0',
-      recordPath: opts.recordPath ?? process.env.SWITCHROOM_AGENT_PROCESS_FILE ?? undefined,
-      sentinelPath: opts.sentinelPath ?? process.env.SWITCHROOM_BOOT_RESUME_DONE_FILE ?? undefined,
     })
   } catch (err) {
     // Fail-open: any surprise keeps the pre-#4641 behaviour.

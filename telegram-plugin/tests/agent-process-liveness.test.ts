@@ -36,6 +36,8 @@ import {
   shouldSkipBootResumeForGatewayOnlyRespawn,
   markBootResumeComplete,
   bootResumeDonePath,
+  readBootResumeSentinel,
+  containerBootIdentity,
   AGENT_PROCESS_RECORD_FILE,
   BOOT_RESUME_DONE_FILE,
 } from '../gateway/agent-process-liveness.js'
@@ -295,5 +297,110 @@ describe('readAgentProcessRecord', () => {
   it('rejects a nonsense pid', () => {
     expect(readAgentProcessRecord(writeRecord({ pid: 0, starttime: '5' }))).toBeNull()
     expect(readAgentProcessRecord(writeRecord({ pid: -1, starttime: '5' }))).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// #4648 LOW-2: the token carries the container-boot identity
+// ---------------------------------------------------------------------------
+
+describe('generation-token boot identity', () => {
+  it('stamps the live container-boot identity (PID 1 starttime) into the token', () => {
+    markBootResumeComplete(dir)
+    const body = JSON.parse(readFileSync(bootResumeDonePath(dir), 'utf8')) as { boot?: string }
+    expect(body.boot).toBe(containerBootIdentity()!)
+  })
+
+  it('treats a token from a DIFFERENT container boot as stale, not as a suppressor', () => {
+    // The failure this closes: start.sh's `rm -f … 2>/dev/null || true` swallows
+    // a per-file unlink failure, so a token can outlive its generation and
+    // suppress EVERY later resume — permanently and silently, since
+    // `gateway-only-respawn-no-record` needs no corroborating evidence.
+    writeFileSync(
+      bootResumeDonePath(dir),
+      JSON.stringify({ pid: 4242, at: Date.now(), boot: '1' }) + '\n',
+    )
+    const decision = detectGatewayOnlyRespawn({ stateDir: dir })
+    expect(decision.gatewayOnly).toBe(false)
+    expect(decision.reason).toBe('stale-boot-token')
+  })
+
+  it('still suppresses for a token stamped in THIS boot, with no record present', () => {
+    // The `gateway-only-respawn-no-record` path must survive the hardening:
+    // the gateway boots long before start.sh `exec`s claude.
+    markBootResumeComplete(dir)
+    expect(existsSync(join(dir, AGENT_PROCESS_RECORD_FILE))).toBe(false)
+    const decision = detectGatewayOnlyRespawn({ stateDir: dir })
+    expect(decision.gatewayOnly).toBe(true)
+    expect(decision.reason).toBe('gateway-only-respawn-no-record')
+  })
+
+  it('keeps the pre-existing behaviour when the token carries NO identity', () => {
+    // One-directional by design: only a positive MISMATCH is evidence. A
+    // legacy/identity-less token must not become a fail-open path, or the
+    // hardening would itself re-open #4641.
+    writeFileSync(bootResumeDonePath(dir), JSON.stringify({ pid: 4242, at: Date.now() }) + '\n')
+    expect(readBootResumeSentinel(bootResumeDonePath(dir))).toEqual({ present: true, stale: false })
+    expect(detectGatewayOnlyRespawn({ stateDir: dir }).gatewayOnly).toBe(true)
+  })
+
+  it('keeps the pre-existing behaviour when the token body is unparseable', () => {
+    writeFileSync(bootResumeDonePath(dir), 'not json at all')
+    expect(readBootResumeSentinel(bootResumeDonePath(dir))).toEqual({ present: true, stale: false })
+  })
+
+  it('keeps the pre-existing behaviour when /proc/1 is unreadable', () => {
+    // No live identity to compare against → no evidence → not stale.
+    writeFileSync(
+      bootResumeDonePath(dir),
+      JSON.stringify({ pid: 4242, at: Date.now(), boot: '1' }) + '\n',
+    )
+    const emptyProc = mkdtempSync(join(tmpdir(), 'noproc-'))
+    try {
+      expect(containerBootIdentity(emptyProc)).toBeNull()
+      expect(readBootResumeSentinel(bootResumeDonePath(dir), { procRoot: emptyProc }))
+        .toEqual({ present: true, stale: false })
+    } finally {
+      rmSync(emptyProc, { recursive: true, force: true })
+    }
+  })
+
+  it('reports absent when there is no token at all', () => {
+    clearToken()
+    expect(readBootResumeSentinel(bootResumeDonePath(dir))).toEqual({ present: false, stale: false })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// #4648 LOW-1: no env var may redirect the token/record paths
+// ---------------------------------------------------------------------------
+
+describe('path overrides are test-injection only (fail-open invariant)', () => {
+  it('ignores SWITCHROOM_BOOT_RESUME_DONE_FILE / SWITCHROOM_AGENT_PROCESS_FILE', () => {
+    // If these were honoured, start.sh (which hard-codes
+    // "$TELEGRAM_STATE_DIR/.boot-resume-done") would clear one path while the
+    // gateway read another: the token would never be cleared and EVERY boot
+    // would suppress its resume forever — the module's one fail-CLOSED path.
+    const decoy = mkdtempSync(join(tmpdir(), 'decoy-'))
+    const prevToken = process.env.SWITCHROOM_BOOT_RESUME_DONE_FILE
+    const prevRecord = process.env.SWITCHROOM_AGENT_PROCESS_FILE
+    try {
+      process.env.SWITCHROOM_BOOT_RESUME_DONE_FILE = join(decoy, 'token')
+      process.env.SWITCHROOM_AGENT_PROCESS_FILE = join(decoy, 'record')
+      clearToken()
+      // A token written into the decoy path must NOT be seen…
+      writeFileSync(join(decoy, 'token'), JSON.stringify({ pid: 1, at: Date.now() }) + '\n')
+      expect(shouldSkipBootResumeForGatewayOnlyRespawn(dir, { log: () => {} })).toBe(false)
+      // …and the stamp must land in stateDir, not the decoy.
+      markBootResumeComplete(dir)
+      expect(existsSync(bootResumeDonePath(dir))).toBe(true)
+      expect(shouldSkipBootResumeForGatewayOnlyRespawn(dir, { log: () => {} })).toBe(true)
+    } finally {
+      if (prevToken == null) delete process.env.SWITCHROOM_BOOT_RESUME_DONE_FILE
+      else process.env.SWITCHROOM_BOOT_RESUME_DONE_FILE = prevToken
+      if (prevRecord == null) delete process.env.SWITCHROOM_AGENT_PROCESS_FILE
+      else process.env.SWITCHROOM_AGENT_PROCESS_FILE = prevRecord
+      rmSync(decoy, { recursive: true, force: true })
+    }
   })
 })

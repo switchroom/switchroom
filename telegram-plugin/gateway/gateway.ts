@@ -1668,7 +1668,7 @@ bootResumeInit: if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqli
   // schema; subagents lives alongside in registry.db. Idempotent — safe on
   // pre-existing DBs (handles the jsonl_agent_id column migration).
   applySubagentsSchema(turnsDb)
-  if (shouldSkipBootResumeForGatewayOnlyRespawn(STATE_DIR)) break bootResumeInit // #4641: this container generation's boot resume is already done — ONLY the gateway respawned. The break skips ALL of: the orphan-turn reaper, consumeBridgeDeadEscalationMarker (already consumed by the gateway that stamped the token), the bridge-dead idle notice, the resume/report synthetic, the pendingRedelivery capture (the turn is still running and will answer itself — redelivering would double-send) and writePendingTurnEnv. Each is safe ONLY because the token proves one gateway already did it this generation; see "What `break bootResumeInit` skips" in agent-process-liveness.ts.
+  if (shouldSkipBootResumeForGatewayOnlyRespawn(STATE_DIR)) break bootResumeInit // #4641: this container generation's boot resume is already done — ONLY the gateway respawned. The break skips ALL of: the orphan-turn reaper, consumeBridgeDeadEscalationMarker (already consumed by the gateway that stamped the token), the bridge-dead idle notice, the resume/report synthetic, the pendingRedelivery capture (the turn is still running and will answer itself — redelivering would double-send), the bridgeDeadPriorStreak seed for the #3038 cross-boot damper (left 0: the streak belongs to the gateway that consumed the marker, and re-seeding it here would double-count) and writePendingTurnEnv. Each is safe ONLY because the token proves one gateway already did it this generation; see "What `break bootResumeInit` skips" in agent-process-liveness.ts.
 
   // Read the turn-active marker (the in-flight turn the watchdog tracks)
   // BEFORE classifying — its mtime is "ms since last tool progress" and its
@@ -1950,11 +1950,10 @@ bootResumeInit: if (isGatewayMain) try {  // #2996 P0c: gated — opens bun:sqli
     }
   }
 
-  // Diagnostic env file (one-shot, sourced by start.sh) — kept for the
-  // wake-audit context. The injected inbound above is the real wake signal;
-  // these vars are passive context only. Extracted to pending-turn-env.ts
-  // (atomic tmp+rename writer; never throws).
-  writePendingTurnEnv(agentDir, pending); markBootResumeComplete(STATE_DIR) // #4641 generation token, LAST statement of the block: this container generation's boot resume completed, so a respawned gateway must skip it. A crash before here leaves no token and the successor redoes the work. (Joined onto one line: gateway.ts sits at its line ratchet — scripts/gateway-line-ratchet.txt.)
+  // Diagnostic env file (one-shot, sourced by start.sh) — kept for wake-audit
+  // context. The injected inbound above is the real wake signal; these vars are
+  // passive context only. pending-turn-env.ts: atomic writer, never throws.
+  writePendingTurnEnv(agentDir, pending) // #4641: the generation token is deliberately NOT stamped here. This block only builds `bootResumeInbound` IN MEMORY; the resume becomes crash-survivable ~8k lines below, at the `inboundSpool.put` — and that is where the stamp lives. See the comment at that call site.
 } catch (err) {
   process.stderr.write(`telegram gateway: turn-registry init failed (${(err as Error).message}) — turn tracking disabled\n`)
   turnsDb = null
@@ -10169,6 +10168,7 @@ if (isGatewayMain && bootResumeInbound != null) {
     }
   }
 }
+if (isGatewayMain) markBootResumeComplete(STATE_DIR) // #4641 generation token, stamped HERE — AFTER the boot-resume inbound is durably spooled above, never at the tail of the `bootResumeInit` block (which only builds it in memory). Same ordering rule, same reason, as `markTurnResumed` directly above: a crash between the block and this line must leave NO token, so the successor re-mints the resume rather than suppressing it. Unconditional by design (a boot with nothing to resume still completed this generation's boot resume). Full argument: "WHERE the token is stamped" in agent-process-liveness.ts. (One line: gateway.ts sits at its line ratchet — scripts/gateway-line-ratchet.txt.)
 // Boot-replay: re-queue every un-acked spooled inbound into the
 // in-memory buffer so the existing drain triggers (onClientRegistered
 // / silence-poke #1546 / idle-drain #1549) deliver them. push →

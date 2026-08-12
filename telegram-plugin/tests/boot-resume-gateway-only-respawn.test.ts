@@ -11,20 +11,35 @@
  * What this test asserts is the OUTCOME the issue names, end to end over the
  * REAL collaborators — a real bun:sqlite registry, the real boot reaper, the
  * real interrupted-turn finder, the real inbound builders and the real durable
- * inbound spool — with only the ORDERING supplied by `runBootSequence` below,
- * which mirrors gateway.ts's block 1:1 (and `boot-resume-guard-wiring.test.ts`
- * pins that gateway.ts still calls the guard in that position):
+ * inbound spool — with only the ORDERING supplied by `runBootSequence` below.
+ *
+ * ORDERING FIDELITY (the point an earlier revision of this file got wrong):
+ * gateway.ts's `bootResumeInit` block does NOT spool the resume. It builds
+ * `bootResumeInbound` in MEMORY; the durable `inboundSpool.put` lives ~8k lines
+ * later, and the generation-token stamp lives immediately after THAT. A
+ * harness that puts inside its model of the block collapses the whole window
+ * between "block done" and "resume durable" — the one window a crash can
+ * actually land in — and so cannot see a stamp placed too early. This harness
+ * keeps the three stages distinct and lets `crashAt` land in each of them.
+ * `stampAt: 'block-end'` reproduces the defective placement on purpose.
+ * (`boot-resume-guard-wiring.test.ts` pins that gateway.ts really does stamp
+ * after the put, since this file cannot import the block.)
  *
  *   - gateway killed mid-turn while the claude process LIVES
  *       → ZERO `resume_interrupted` entries in the on-disk spool,
  *         the in-flight turn row is left OPEN (no `ended_via` lie), and
  *         no `.pending-turn.env` is written.
  *   - a gateway that CRASHES DURING ITS OWN BOOT, before stamping the
- *     per-container-boot generation token
+ *     per-container-boot generation token — at each of the three reachable
+ *     points (after the guard, after the block but before the durable spool
+ *     put, after the put but before the stamp)
  *       → the successor gateway does the full boot resume; the interrupted
  *         turn is not lost. (This is the case the earlier starttime-ordering
  *         guard got wrong: it saw a live claude that predated it and
  *         suppressed forever.)
+ *   - the same crash with the token stamped at the END OF THE BLOCK instead
+ *       → the resume is DROPPED forever. Asserted explicitly as a defect
+ *         reproduction, so the correct placement is pinned by outcome.
  *   - a suppressed respawn and the #3038 bridge-dead escalation marker
  *       → the marker is NOT re-consumed, because the gateway that stamped
  *         the token already consumed it this generation.
@@ -65,6 +80,7 @@ import {
   markOrphanedWithTimeoutClassification,
   findLatestTurnIfInterrupted,
   getTurnByKey,
+  markTurnResumed,
 } from '../registry/turns-schema.js'
 import {
   decideBootResumeKind,
@@ -73,6 +89,7 @@ import {
 } from '../gateway/resume-inbound-builder.js'
 import { writePendingTurnEnv } from '../gateway/pending-turn-env.js'
 import { createInboundSpool } from '../gateway/inbound-spool.js'
+import type { InboundMessage } from '../gateway/ipc-protocol.js'
 import {
   readProcIdentity,
   shouldSkipBootResumeForGatewayOnlyRespawn,
@@ -134,32 +151,67 @@ interface BootResult {
 }
 
 /**
- * The gateway's boot-resume block, in gateway.ts's order, over the real
- * collaborators. `guarded: false` reproduces the pre-#4641 gateway.
+ * Where a gateway dies during its own boot (the Bun 1.3.13 crash-at-boot
+ * pattern that motivated the fix). Each value names the point the process
+ * vanishes; everything before it has already happened.
  *
- * `crashAt` models a gateway that dies during its own boot (the Bun 1.3.13
- * crash-at-boot pattern that motivated the fix): `'guard'` dies immediately
- * after the guard, before any side effect; `'stamp'` gets all the way through
- * the effects but dies before stamping the token. Neither stamps it.
+ *   'after-guard'            — before any side effect at all.
+ *   'after-block-before-put' — the WHOLE bootResumeInit block ran (turn reaped
+ *                              and durably stamped `ended_via='restart'`, env
+ *                              written, inbound built IN MEMORY) but the
+ *                              process dies before the durable spool put. This
+ *                              is the window a too-early token stamp loses
+ *                              work in, and the one the pre-fix harness could
+ *                              not express.
+ *   'after-put-before-stamp' — the resume IS durable; only the token is
+ *                              missing. Successor repeats, spool dedups.
+ */
+type CrashPoint = 'after-guard' | 'after-block-before-put' | 'after-put-before-stamp'
+
+/** Sentinel used to unwind out of the modelled boot at `crashAt`. */
+const BOOT_CRASH = Symbol('boot-crash')
+
+/**
+ * The gateway's boot sequence in gateway.ts's real order, over the real
+ * collaborators, in THREE distinct stages:
+ *
+ *   1. `bootResumeInit` — guard, reaper, marker, builders. In-memory only.
+ *   2. the durable `inboundSpool.put` (gateway.ts ~8k lines later).
+ *   3. `markBootResumeComplete` — unconditional, top level.
+ *
+ * `guarded: false` reproduces the pre-#4641 gateway. `stampAt: 'block-end'`
+ * reproduces this PR's first (defective) placement.
  */
 function runBootSequence(opts: {
   guarded?: boolean
   markerTurnKey?: string | null
   markerAgeMs?: number | null
-  crashAt?: 'guard' | 'stamp'
+  crashAt?: CrashPoint
+  /** Where the generation token is stamped. Default = production. */
+  stampAt?: 'block-end' | 'after-durable-put'
 }): BootResult {
   const spoolPath = join(stateDir, 'inbound-spool.jsonl')
   const db = openTurnsDb(agentDir)
   const spool = createInboundSpool({ path: spoolPath, fs: SPOOL_FS, log: () => {} })
+  const stampAt = opts.stampAt ?? 'after-durable-put'
   let reaped = 0
   let bridgeDeadStreak: number | null = null
   let tokenStamped = false
+  const stamp = (): void => {
+    markBootResumeComplete(stateDir)
+    tokenStamped = true
+  }
   try {
-    // ---- the guard (gateway.ts: immediately after applySubagentsSchema) ----
+    // ---- stage 1: the bootResumeInit block (IN MEMORY ONLY) ----------------
+    // The guard, gateway.ts: immediately after applySubagentsSchema.
     const skip =
       (opts.guarded ?? true) &&
       shouldSkipBootResumeForGatewayOnlyRespawn(stateDir, { log: () => {} })
-    if (!skip && opts.crashAt !== 'guard') {
+    // gateway.ts:1648 — `bootResumeInbound`, stashed and pushed to the spool
+    // only much later. Nothing on disk yet.
+    let bootResumeInbound: InboundMessage | null = null
+    if (!skip) {
+      if (opts.crashAt === 'after-guard') throw BOOT_CRASH
       const res = markOrphanedWithTimeoutClassification(db, {
         markerTurnKey: opts.markerTurnKey ?? null,
         markerAgeMs: opts.markerAgeMs ?? null,
@@ -182,22 +234,34 @@ function runBootSequence(opts: {
           maxAgeMs: 10_800_000,
         })
         if (kind === 'resume') {
-          spool.put('tester', buildResumeInterruptedInbound({ turn: pending, subagents: [] }))
+          bootResumeInbound = buildResumeInterruptedInbound({ turn: pending, subagents: [] })
         } else if (kind === 'report') {
-          spool.put(
-            'tester',
-            buildResumeWatchdogReportInbound({ turn: pending, idleMs: 600_000, subagents: [] }),
-          )
+          bootResumeInbound = buildResumeWatchdogReportInbound({
+            turn: pending,
+            idleMs: 600_000,
+            subagents: [],
+          })
         }
       }
       writePendingTurnEnv(agentDir, pending, () => {})
-      // gateway.ts: LAST statement of the block. A crash before here leaves no
-      // token, so the successor gateway redoes the whole boot resume.
-      if (opts.crashAt !== 'stamp') {
-        markBootResumeComplete(stateDir)
-        tokenStamped = true
-      }
+      // THE DEFECT, reproducible on demand: stamping here marks the generation
+      // done while the resume exists only in this process's heap.
+      if (stampAt === 'block-end') stamp()
+      if (opts.crashAt === 'after-block-before-put') throw BOOT_CRASH
     }
+    // ---- stage 2: gateway.ts ~:10148, the DURABLE put ----------------------
+    if (bootResumeInbound != null) {
+      spool.put('tester', bootResumeInbound)
+      // …and the at-most-once ledger, stamped only AFTER the put — the same
+      // ordering rule the generation token now obeys (turns-schema.ts).
+      const rk = bootResumeInbound.meta?.resume_turn_key
+      if (typeof rk === 'string' && rk.length > 0) markTurnResumed(db, rk)
+    }
+    if (opts.crashAt === 'after-put-before-stamp') throw BOOT_CRASH
+    // ---- stage 3: the token, unconditional (gateway.ts, top level) ---------
+    if (stampAt === 'after-durable-put') stamp()
+  } catch (err) {
+    if (err !== BOOT_CRASH) throw err
   } finally {
     db.close()
   }
@@ -344,7 +408,7 @@ describe('gateway crash during its own boot', () => {
     const turnKey = seedInFlightTurn()
     writeAgentProcessRecord(agentProc.pid!, starttimeOf(agentProc.pid!))
 
-    const crashed = runBootSequence({ crashAt: 'guard' })
+    const crashed = runBootSequence({ crashAt: 'after-guard' })
     expect(crashed.tokenStamped).toBe(false)
     expect(crashed.spooledSources).toEqual([])
     expect(existsSync(bootResumeDonePath(stateDir))).toBe(false)
@@ -371,7 +435,7 @@ describe('gateway crash during its own boot', () => {
     const markerPath = writeBridgeDeadMarker(3)
     writeAgentProcessRecord(agentProc.pid!, starttimeOf(agentProc.pid!))
 
-    const crashed = runBootSequence({ crashAt: 'guard' })
+    const crashed = runBootSequence({ crashAt: 'after-guard' })
     expect(crashed.bridgeDeadStreak).toBeNull()
     expect(existsSync(markerPath)).toBe(true)
 
@@ -380,19 +444,82 @@ describe('gateway crash during its own boot', () => {
     expect(existsSync(markerPath)).toBe(false)
   })
 
-  it('a crash after the effects but before the stamp does not suppress either', () => {
-    // The other half of the window: the block ran, but the token write never
-    // landed. The successor re-runs the block. That is a duplicate resume, not
-    // a lost one — the deliberate fail-open direction.
+  it('a crash after the DURABLE PUT but before the stamp does not suppress either', () => {
+    // The resume is already on disk; only the token is missing. The successor
+    // re-runs the block, and the spool's `s:resume:<turnKey>` dedup makes the
+    // repeat a no-op rather than a double-send.
     seedInFlightTurn()
     writeAgentProcessRecord(agentProc.pid!, starttimeOf(agentProc.pid!))
 
-    const crashed = runBootSequence({ crashAt: 'stamp' })
+    const crashed = runBootSequence({ crashAt: 'after-put-before-stamp' })
     expect(crashed.spooledSources).toEqual(['resume_interrupted'])
     expect(crashed.tokenStamped).toBe(false)
 
     const out = runBootSequence({})
     expect(out.tokenStamped).toBe(true) // it did NOT suppress
+    // …and exactly ONE resume reached the spool across both boots.
+    expect(out.spooledSources).toEqual(['resume_interrupted'])
+  })
+
+  it('a crash AFTER the block but BEFORE the durable put still resumes (the reachable window)', () => {
+    // THE regression this placement fix exists for. The block ran to
+    // completion: the reaper has DURABLY stamped the turn `ended_via='restart'`
+    // and the resume inbound exists only in the dying process's heap. Nothing
+    // about the resume is on disk.
+    //
+    // With the token stamped after the durable put (production), the successor
+    // finds no token and re-mints the resume — the work survives.
+    const turnKey = seedInFlightTurn()
+    // Note: start.sh has NOT yet published agent-process.json at this point —
+    // the gateway is forked long before `exec claude`. That is precisely why a
+    // premature token is fatal here: the successor's only corroborating
+    // evidence is absent, so it returns `gateway-only-respawn-no-record`.
+    expect(existsSync(join(stateDir, AGENT_PROCESS_RECORD_FILE))).toBe(false)
+
+    const crashed = runBootSequence({ crashAt: 'after-block-before-put' })
+    expect(crashed.spooledSources).toEqual([]) // nothing durable yet
+    expect(crashed.reaped).toBe(1) // …but the turn IS durably stamped
+    expect(crashed.tokenStamped).toBe(false)
+    expect(existsSync(bootResumeDonePath(stateDir))).toBe(false)
+
+    const out = runBootSequence({})
+
+    expect(out.spooledSources).toEqual(['resume_interrupted'])
+    expect(out.tokenStamped).toBe(true)
+    const db = openTurnsDb(agentDir)
+    try {
+      expect(getTurnByKey(db, turnKey)!.ended_via).toBe('restart')
+    } finally {
+      db.close()
+    }
+  })
+
+  it('WOULD lose the turn forever if the token were stamped at the end of the block', () => {
+    // Defect reproduction for the placement, mirroring the `guarded: false`
+    // bug-reproduction above. Same crash point as the test directly above;
+    // only the stamp moves. The turn is durably `ended_via='restart'`, no
+    // resume ever reaches the spool, and the successor suppresses on the token
+    // alone — silent, permanent work loss, and a NEW failure mode versus the
+    // pre-#4641 gateway, which simply re-ran the block.
+    const turnKey = seedInFlightTurn()
+
+    const crashed = runBootSequence({ crashAt: 'after-block-before-put', stampAt: 'block-end' })
+    expect(crashed.tokenStamped).toBe(true) // stamped while the resume is in RAM
+    expect(crashed.spooledSources).toEqual([])
+    expect(existsSync(bootResumeDonePath(stateDir))).toBe(true)
+
+    const out = runBootSequence({})
+
+    expect(out.spooledSources, 'the resume is dropped, not retried').toEqual([])
+    expect(out.reaped).toBe(0)
+    const db = openTurnsDb(agentDir)
+    try {
+      const turn = getTurnByKey(db, turnKey)!
+      expect(turn.ended_via).toBe('restart') // durably ended…
+      expect(turn.resumed_at).toBeNull() // …and never resumed
+    } finally {
+      db.close()
+    }
   })
 })
 

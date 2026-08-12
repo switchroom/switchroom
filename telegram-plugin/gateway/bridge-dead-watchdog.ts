@@ -228,16 +228,28 @@ export function writeBridgeDeadEscalationMarker(
 /**
  * Read + consume the escalation marker at boot. Returns the marker only
  * when it is fresh (< maxAgeMs); a stale or malformed marker is cleared
- * and ignored. The file is ALWAYS removed — the cause note must surface
- * on exactly the boot that follows the escalation, never a later one.
+ * and ignored. Whenever this function runs the file IS removed — the cause
+ * note must surface on exactly the boot that follows the escalation, never
+ * a later one.
  *
- * Known race window (accepted, documented per review): the marker is
- * written by gateway boot N and consumed by whichever gateway boots NEXT.
- * Normally that is the post-container-restart gateway (the SIGTERM to
- * PID 1 fires ~1.5s after the write and takes the whole container down).
- * But if the escalating gateway PROCESS dies and its supervisor relaunches
- * a new gateway inside the same container before the SIGTERM lands, that
- * interim gateway consumes the marker instead — the cause note is then
+ * Since #4641 the caller does not always run: the gateway's boot-resume
+ * block `break`s before reaching this call when the per-container-boot
+ * generation token says only the GATEWAY respawned. That narrows — and for
+ * the common shape closes — the race documented below, so it is an
+ * improvement rather than a hole; the marker is left on disk for the boot
+ * that genuinely follows the container restart. See "What `break
+ * bootResumeInit` skips" in agent-process-liveness.ts.
+ *
+ * Known race window (accepted, documented per review; largely closed by the
+ * #4641 guard above): the marker is written by gateway boot N and consumed
+ * by whichever gateway boots NEXT and reaches this call. Normally that is
+ * the post-container-restart gateway (the SIGTERM to PID 1 fires ~1.5s
+ * after the write and takes the whole container down). But if the
+ * escalating gateway PROCESS dies and its supervisor relaunches a new
+ * gateway inside the same container before the SIGTERM lands, and that
+ * interim gateway's boot block is NOT suppressed by the generation token
+ * (i.e. no gateway in this generation had completed its boot resume yet),
+ * the interim gateway consumes the marker instead — the cause note is then
  * surfaced (or dropped with the interim process) one boot early, and the
  * post-restart boot sees no marker. Consequences are bounded and safe:
  * the honesty note may be lost for one incident (the loud supervisor-log

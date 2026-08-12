@@ -7,10 +7,10 @@
  * supplies the ORDERING itself: gateway.ts is a 24k-line module whose boot
  * block cannot be imported without booting a gateway. This file closes that gap
  * by pinning gateway.ts's own wiring, so a refactor cannot move the guard below
- * the reaper, drop it, or move the token stamp out of the block's tail while
+ * the reaper, drop it, or move the token stamp back inside the block while
  * the outcome suite stays green against its own copy of the sequence.
  *
- * Pinned, in source order inside the labelled `bootResumeInit` block:
+ * Pinned:
  *   1. the label exists and is on the `isGatewayMain` boot-registry block,
  *   2. the guard runs and `break`s out of that label,
  *   3. it precedes the orphan-turn reaper, the bridge-dead marker consumption,
@@ -18,8 +18,18 @@
  *      capture and `writePendingTurnEnv` — i.e. `break` skips ALL of them,
  *   4. the break carries a comment naming those skipped effects (the reviewer
  *      MEDIUM: the skip is wider than the resume path and was undocumented),
- *   5. the generation token is stamped as the LAST thing the block does, so a
- *      gateway that dies mid-boot leaves no token behind.
+ *   5. THE STAMP FOLLOWS THE DURABLE PUT. The `bootResumeInit` block only
+ *      builds `bootResumeInbound` in MEMORY; the resume becomes crash-
+ *      survivable ~8k lines later at `inboundSpool.put(...)`. Stamping at the
+ *      tail of the block (the shape this PR's first revision shipped) means a
+ *      crash in between leaves a token, no `agent-process.json`, and a
+ *      successor that suppresses a turn already stamped `ended_via='restart'`
+ *      — silent, permanent work loss. So: the stamp must NOT appear inside the
+ *      block at all, must come after the put and after `markTurnResumed`, and
+ *      must be UNCONDITIONAL (top-level, gated only on `isGatewayMain`) so a
+ *      boot with nothing to resume still writes a token. Same rule
+ *      `markTurnResumed` already obeys — see turns-schema.ts's "the caller
+ *      must stamp only AFTER the resume inbound is durably spooled".
  */
 
 import { describe, it, expect } from 'vitest'
@@ -91,32 +101,61 @@ describe('#4641 boot-resume guard wiring in gateway.ts', () => {
     }
   })
 
-  it('stamps the generation token as the LAST statement of the block', () => {
-    // A gateway that crashes mid-boot must leave NO token, so its successor
-    // redoes the boot resume (reviewer MAJOR 2). That property is exactly
-    // "the stamp is last": everything the block does precedes it.
-    const stamp = idx('markBootResumeComplete(STATE_DIR)')
-    for (const effect of [
-      'markOrphanedWithTimeoutClassification(turnsDb',
-      'consumeBridgeDeadEscalationMarker(',
-      'findLatestTurnIfInterrupted(turnsDb)',
-      'buildResumeInterruptedInbound({',
-      'buildBridgeDeadIdleNoticeInbound({',
-      'writePendingTurnEnv(agentDir, pending)',
-    ]) {
-      expect(idx(effect), `${effect} must run before the token stamp`).toBeLessThan(stamp)
-    }
-    // …and it is inside the block, i.e. before the block's catch clause.
+  it('stamps the generation token AFTER the durable spool put, never inside the block', () => {
+    // The invariant this pins, and why it is NOT "the stamp is last in the
+    // block": the block builds `bootResumeInbound` in memory only. Stamping at
+    // its tail marks the generation done while the resume is still nowhere on
+    // disk, so a crash before the put leaves a token + no `agent-process.json`
+    // + a turn stamped `ended_via='restart'` and `resumed_at` NULL — and the
+    // successor returns `gateway-only-respawn-no-record` and drops it forever.
+    const durablePut = idx('inboundSpool.put(bootResumeInbound.agent, bootResumeInbound.msg)')
+    const stamps = [...SRC.matchAll(/markBootResumeComplete\(STATE_DIR\)/g)].map((m) => m.index!)
+    expect(stamps.length, 'exactly one token stamp site in gateway.ts').toBe(1)
+    const stamp = stamps[0]!
+
+    // 1. It is OUTSIDE the bootResumeInit block: the block's `} catch (err) {`
+    //    closes long before the stamp.
     const blockStart = idx('bootResumeInit: if (isGatewayMain) try {')
-    const catchAt = SRC.indexOf('} catch (err) {', stamp)
-    expect(blockStart).toBeLessThan(stamp)
-    expect(catchAt).toBeGreaterThan(stamp)
-    // Nothing else may run between the stamp and the end of the block.
-    const afterStamp = SRC.slice(stamp, catchAt)
-      .replace('markBootResumeComplete(STATE_DIR)', '')
-      .replace(/\/\/[^\n]*/g, '')
-      .trim()
-    expect(afterStamp, 'no statement may follow the generation-token stamp').toBe('')
+    const blockEnd = SRC.indexOf('} catch (err) {', blockStart)
+    expect(blockEnd).toBeGreaterThan(blockStart)
+    expect(
+      stamp,
+      'the token stamp must NOT live inside the bootResumeInit block — the block only builds the resume in memory',
+    ).toBeGreaterThan(blockEnd)
+
+    // 2. It follows the durable put, and the at-most-once `markTurnResumed`
+    //    ledger that obeys the identical ordering rule.
+    expect(durablePut, 'the durable spool put must precede the token stamp').toBeLessThan(stamp)
+    expect(idx('markTurnResumed(turnsDb, resumeTurnKey)')).toBeLessThan(stamp)
+
+    // 3. It is UNCONDITIONAL — top-level (zero indentation, so not nested
+    //    inside `if (isGatewayMain && bootResumeInbound != null)`), gated only
+    //    on isGatewayMain. A boot with nothing to resume must still stamp, or
+    //    a later gateway-only respawn reaps a meanwhile-started live turn.
+    const stampLine = SRC.split('\n').find((l) => l.includes('markBootResumeComplete(STATE_DIR)'))!
+    expect(stampLine).toMatch(/^if \(isGatewayMain\) markBootResumeComplete\(STATE_DIR\)/)
+
+    // 4. Nothing durable-resume-related may sneak between the put and the
+    //    stamp except the resumed_at ledger — i.e. the stamp closes that
+    //    sequence rather than floating somewhere later in module init.
+    const between = SRC.slice(durablePut + 1, stamp)
+    expect(between, 'no second spool put may separate the durable put from the stamp')
+      .not.toContain('inboundSpool.put(bootResumeInbound')
+    expect(
+      between.split('\n').length,
+      'the stamp must sit immediately after the resume-commit block, not drift away from it',
+    ).toBeLessThan(40)
+  })
+
+  it('does not re-join the stamp onto writePendingTurnEnv inside the block', () => {
+    // The exact regression shape: `writePendingTurnEnv(agentDir, pending); markBootResumeComplete(STATE_DIR)`
+    // — joined onto one line to satisfy the gateway line ratchet. The ratchet
+    // is not a licence to stamp early.
+    const envLine = SRC.split('\n').find((l) => l.includes('writePendingTurnEnv(agentDir, pending)'))!
+    expect(
+      envLine,
+      'the generation token must not be stamped alongside writePendingTurnEnv (still in-memory-only territory)',
+    ).not.toContain('markBootResumeComplete')
   })
 
   it('keeps the guard AFTER the registry is opened, so turn tracking still works', () => {
