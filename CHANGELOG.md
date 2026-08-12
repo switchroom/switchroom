@@ -79,6 +79,14 @@ now an anomaly worth investigating, not the norm.
   (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
   so a designator-less line is now normalised to `Z` at the producer. An
   explicit `+HH:MM` offset is preserved untouched.
+- **hermes: the desktop's session search box works instead of throwing.**
+  `GET /api/sessions/search` was caught by the `/api/sessions/:id` regex, which
+  read `search` as a session id and answered `404 {error:'Unknown session'}`;
+  `searchSessions` has no client-side catch, so the rejection propagated into
+  the panel. It is now a real branch above that regex, matching session ids
+  first and then turn-preview content, one row per session — a genuine search,
+  not a hardcoded empty result set.
+
 - **hermes: session delete, env writes and memory-provider config answer an
   explicit refusal instead of a 404 the desktop misreads.** `DELETE
   /api/sessions/:id`, `PUT /api/env` and `PUT /api/memory/providers/:p/config`

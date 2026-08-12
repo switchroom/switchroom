@@ -252,9 +252,9 @@ const CENSUS: CensusRow[] = [
     path: "/api/sessions/search",
     served: true,
     note:
-      "Served only by accident: the /api/sessions/:id regex " +
-      "(hermes-adapter.ts:624) matches 'search' as an id, so this 404s as " +
-      "{error:'Unknown session'} rather than falling through.",
+      "Served by a real branch that sits ABOVE the /api/sessions/:id regex. " +
+      "It used to be caught by that regex as an id and answer 404 " +
+      "{error:'Unknown session'}, which threw the search panel.",
   },
   { line: 671, method: "GET", path: `/api/sessions/${AGENT}`, served: true },
   { line: 706, method: "GET", path: `/api/sessions/${AGENT}/messages`, served: true },
@@ -823,11 +823,6 @@ const CONTRACT: ContractCase[] = [
     search: "?q=deploy",
     client: "hermes.ts:656-660 (searchSessions) — no catch, the rejection propagates",
     server: "hermes_cli/web_routers/sessions.py:169",
-    gap:
-      "Unimplemented, and worse than unimplemented: the /api/sessions/:id " +
-      "regex (hermes-adapter.ts:624) matches 'search' as a session id and " +
-      "answers 404 {error:'Unknown session'}. searchSessions has no " +
-      "client-side tolerance, so the search panel throws.",
     assert: (res) => {
       const b = body200(res);
       expect(Array.isArray(b.results)).toBe(true);
@@ -1420,8 +1415,8 @@ describe(`Hermes REST response contract (upstream ${UPSTREAM_HERMES_SHA.slice(0,
     // raise `green`) in the same PR that removes a `gap` field.
     expect({ total: CONTRACT.length, green, gaps }).toEqual({
       total: 47,
-      green: 38,
-      gaps: 9,
+      green: 39,
+      gaps: 8,
     });
   });
 });
