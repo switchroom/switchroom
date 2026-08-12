@@ -104,6 +104,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { parse } from "yaml";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dockerfile = readFileSync(
@@ -1068,18 +1069,61 @@ function probeSet(): string[] {
   return hindsightTestFiles().filter((f) => !NOT_A_PROBE.includes(f));
 }
 
-/** Every `tests/docker/<file>` named by an `npx vitest run` step in the workflow. */
+/**
+ * Every `tests/docker/<file>` named by an `npx vitest run` step in the workflow.
+ *
+ * PARSED, not grepped. A regex over the raw workflow TEXT counts a step that is
+ * not a step: `#   run: npx vitest run tests/docker/x.test.ts` — the exact edit
+ * a "disabled temporarily, it's flaky" commit makes — still matches, so the
+ * set-identity guard below would stay green while the probe stopped running in
+ * CI. That is the guard failing open on precisely the change it exists to
+ * catch. Parsing with `yaml` and enumerating real `jobs.*.steps[].run` values
+ * makes a commented-out step disappear from the set, which is the truth.
+ *
+ * Shell-comment lines INSIDE a surviving block scalar are stripped for the same
+ * reason: `run: |` blocks here interleave prose comments with commands (see the
+ * structural-guards step in docker-e2e.yml), so a `#`-prefixed invocation in one
+ * of those is disabled too, and must not count.
+ *
+ * YAML-parsing a workflow in a test follows the in-repo idiom of
+ * `tests/docker/ci-build-dist-shared.test.ts`.
+ */
+interface WorkflowStep {
+  run?: unknown;
+}
+interface WorkflowJob {
+  steps?: WorkflowStep[];
+}
+
 function workflowRunSteps(): string[] {
-  const workflow = readFileSync(resolve(root, DOCKER_E2E_WORKFLOW), "utf8");
-  return [
-    ...new Set(
-      [
-        ...workflow.matchAll(
-          /npx vitest run tests\/docker\/([A-Za-z0-9._-]+\.test\.ts)/g,
-        ),
-      ].map((m) => m[1]),
-    ),
-  ].sort();
+  const wf = parse(
+    readFileSync(resolve(root, DOCKER_E2E_WORKFLOW), "utf8"),
+  ) as { jobs?: Record<string, WorkflowJob> };
+  const jobs = wf?.jobs ?? {};
+  // A workflow that parsed to no jobs would make every assertion below
+  // vacuously green — the exact fail-open this function was rewritten to close.
+  expect(
+    Object.keys(jobs).length,
+    `${DOCKER_E2E_WORKFLOW} parsed to zero jobs — the guard would pass ` +
+      "vacuously; the workflow is malformed or its shape changed",
+  ).toBeGreaterThan(0);
+
+  const files = new Set<string>();
+  for (const job of Object.values(jobs)) {
+    for (const step of job?.steps ?? []) {
+      if (typeof step?.run !== "string") continue;
+      const live = step.run
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("#"))
+        .join("\n");
+      for (const m of live.matchAll(
+        /npx vitest run tests\/docker\/([A-Za-z0-9._-]+\.test\.ts)/g,
+      )) {
+        files.add(m[1]);
+      }
+    }
+  }
+  return [...files].sort();
 }
 
 describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", () => {
@@ -1156,6 +1200,26 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
         DOCKER_E2E_WORKFLOW
       } exemptions that no longer exist in tests/docker — the allowlist ` +
         "outlived a rename or deletion and must be edited deliberately",
+    ).toEqual([]);
+
+    // The INVERSE, and the one that makes NOT_A_PROBE more than an unverified
+    // escape hatch. The allowlist's only claim is "this file needs no hindsight
+    // image, so it needs no run step" — and every real probe reads
+    // PROBE_ENV_VAR to opt into the hard-fail path. So an entry that DOES read
+    // it is a real probe being excused: append its name here, delete its run
+    // step, and every other guard in this file stays green while the probe
+    // silently retires from CI. Verified against the four current entries:
+    // none of them contains the string.
+    expect(
+      NOT_A_PROBE.filter((f) =>
+        readFileSync(resolve(root, "tests/docker", f), "utf8").includes(
+          PROBE_ENV_VAR,
+        ),
+      ),
+      `these NOT_A_PROBE entries DO read ${PROBE_ENV_VAR} — they are real ` +
+        "probes being excused from their run step, which retires them from CI " +
+        "with every other guard here still green; remove the allowlist entry " +
+        `and add a ${DOCKER_E2E_WORKFLOW} run step`,
     ).toEqual([]);
 
     const expected = probeSet();
