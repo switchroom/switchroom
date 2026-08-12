@@ -538,7 +538,6 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
       renderVaultProtocolFragment,
       renderAgentSelfServiceFragment,
       renderDevProtocolFragment,
-      renderLocalTimeFragment,
       renderDelegationGoldenRuleFragment,
     } = await import("./profiles.js");
     const Handlebars = (await import("handlebars")).default;
@@ -546,10 +545,6 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
     const groundingMarker = "Grounding — check before you assert";
     const pacingMarker = "## Delegation";
     const devProtocolMarker = "## Development Protocol";
-    // Every agent on every profile must inherit the "never show a human a
-    // UTC timestamp" rule — the container /etc/localtime fix stops the OS
-    // lying, this stops the AGENT surfacing UTC to a person.
-    const localTimeMarker = "never show a human a UTC timestamp";
 
     const composeForProfile = (profileName: string): string => {
       const profileDir = getProfilePath(profileName);
@@ -558,13 +553,12 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
         noEscape: true,
       })({});
       // Mirror scaffold.ts append order: vault, self-service,
-      // discipline, dev-protocol, local-time, delegation (last — tail recency).
+      // discipline, dev-protocol, delegation (last — tail recency).
       for (const frag of [
         renderVaultProtocolFragment(),
         renderAgentSelfServiceFragment(),
         renderExecutionDisciplineFragment(),
         renderDevProtocolFragment(),
-        renderLocalTimeFragment(),
         renderDelegationGoldenRuleFragment(),
       ]) {
         if (frag) rendered = rendered.trimEnd() + "\n\n" + frag + "\n";
@@ -586,7 +580,6 @@ describe("execution-discipline partial — fleet-wide grounding / verify-before-
       expect(rendered, `${name}: grounding marker`).toContain(groundingMarker);
       expect(rendered, `${name}: pacing marker`).toContain(pacingMarker);
       expect(rendered, `${name}: dev-protocol marker`).toContain(devProtocolMarker);
-      expect(rendered, `${name}: local-time marker`).toContain(localTimeMarker);
     }
   });
 });
@@ -751,7 +744,6 @@ describe("delegation single-sourcing + recency (regression #3231)", () => {
       renderAgentSelfServiceFragment,
       renderExecutionDisciplineFragment,
       renderDevProtocolFragment,
-      renderLocalTimeFragment,
       renderDelegationGoldenRuleFragment,
     } = await import("./profiles.js");
     const Handlebars = (await import("handlebars")).default;
@@ -760,13 +752,12 @@ describe("delegation single-sourcing + recency (regression #3231)", () => {
       noEscape: true,
     })({});
     // Mirror scaffold.ts append order EXACTLY: vault, self-service,
-    // execution-discipline, dev-protocol, local-time, delegation-golden-rule.
+    // execution-discipline, dev-protocol, delegation-golden-rule.
     for (const frag of [
       renderVaultProtocolFragment(),
       renderAgentSelfServiceFragment(),
       renderExecutionDisciplineFragment(),
       renderDevProtocolFragment(),
-      renderLocalTimeFragment(),
       renderDelegationGoldenRuleFragment(),
     ]) {
       if (frag) rendered = rendered.trimEnd() + "\n\n" + frag + "\n";
@@ -992,58 +983,5 @@ describe("steer-forwarding guidance — the shared delegation fragment", () => {
         "queue it and say so",
       );
     }
-  });
-});
-
-describe("renderLocalTimeFragment", () => {
-  // The container /etc/localtime fix stops the OS lying about what UTC
-  // is; this fragment stops an AGENT (or a skill it writes) formatting a
-  // correct UTC stamp and showing it to a human, hardcoding an offset or
-  // a DST-varying abbreviation, or calling .astimezone() on a naive
-  // value. Those are prompt-level failures no tzdata correctness
-  // prevents, so the rule has to reach every agent on every profile.
-
-  it("forbids showing a human a UTC timestamp", async () => {
-    const { renderLocalTimeFragment } = await import("./profiles.js");
-    const fragment = renderLocalTimeFragment();
-    expect(fragment.toLowerCase()).toContain("never show a human a utc timestamp");
-  });
-
-  it("names the SWITCHROOM_TIMEZONE -> TZ -> UTC cascade, not a baked zone", async () => {
-    const { renderLocalTimeFragment } = await import("./profiles.js");
-    const fragment = renderLocalTimeFragment();
-    expect(fragment).toContain("SWITCHROOM_TIMEZONE");
-    expect(fragment).toContain("`TZ`");
-    // Zone-agnostic on purpose: a rule naming one fleet's zone is wrong
-    // on every other install, and threading a resolved zone in would need
-    // a new key mirrored across BOTH scaffold contexts byte-for-byte.
-    expect(fragment).not.toContain("Australia/Melbourne");
-  });
-
-  it("forbids hardcoded offsets and zone abbreviations", async () => {
-    const { renderLocalTimeFragment } = await import("./profiles.js");
-    const fragment = renderLocalTimeFragment();
-    expect(fragment).toContain("Never hardcode an offset or a zone abbreviation");
-    expect(fragment).toContain("AEST");
-    expect(fragment).toContain("DST");
-  });
-
-  it("requires attaching a zone to a naive timestamp rather than assuming one", async () => {
-    const { renderLocalTimeFragment } = await import("./profiles.js");
-    const fragment = renderLocalTimeFragment();
-    expect(fragment).toContain("naive");
-    expect(fragment).toContain(".astimezone()");
-    expect(fragment).toContain("replace(tzinfo=");
-  });
-
-  it("stays inside its prompt budget — a heading plus two bullets", async () => {
-    const { renderLocalTimeFragment } = await import("./profiles.js");
-    const fragment = renderLocalTimeFragment();
-    // Every agent pays this on every turn, so ratchet it: an edit that
-    // grows the rule into a section has to justify itself here first.
-    expect(fragment.length).toBeLessThan(1200);
-    expect(
-      fragment.split("\n").filter((l) => l.trimStart().startsWith("- ")),
-    ).toHaveLength(2);
   });
 });

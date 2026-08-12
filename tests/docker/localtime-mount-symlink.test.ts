@@ -97,7 +97,23 @@ function hasImage(ref: string): boolean {
   }
 }
 
-const DOCKER = hasDocker() && hasImage(BASE);
+function pullImage(ref: string): boolean {
+  try {
+    execSync(`docker pull ${ref}`, { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// busybox is ~5MB, so pull it rather than skipping when it is absent —
+// same idiom as docker-exec-argv-e2e.test.ts. Without the pull this whole
+// layer reported green-by-skip on CI: nothing in `.github/` or
+// tests/docker/build-images.sh preloads busybox, and the `docker save`
+// cache only covers `switchroom/*`. docker-e2e.yml also shards across
+// three runners and DOCKER is evaluated at module-collection time, so a
+// sibling test having pulled busybox is not something this file can rely on.
+const DOCKER = hasDocker() && (hasImage(BASE) || pullImage(BASE));
 
 /** Build a throwaway image from an inline Dockerfile. */
 function buildImage(tag: string, dockerfile: string): void {
@@ -135,8 +151,17 @@ describe("Dockerfile.agent — /etc/localtime is a regular file", () => {
     // The mount destination must be a real path, not a link into
     // /usr/share/zoneinfo. Without this RUN the compose mount silently
     // overwrites the link's target zonefile instead.
-    expect(dockerfile).toMatch(/rm -f \/etc\/localtime/);
-    expect(dockerfile).toMatch(/cp "\$src" \/etc\/localtime/);
+    expect(dockerfile).toMatch(/readlink -f \/etc\/localtime/);
+    expect(dockerfile).toMatch(/cp "\$src" \/etc\/localtime\.desymlink\.tmp/);
+    expect(dockerfile).toMatch(/mv -f \/etc\/localtime\.desymlink\.tmp \/etc\/localtime/);
+  });
+
+  it("never deletes /etc/localtime before the copy reads it", () => {
+    // If a future base image ships /etc/localtime as a regular file,
+    // `readlink -f` resolves it to itself — an `rm` before the `cp` would
+    // then delete the copy's own source and fail the build. The step must
+    // write a temp file and rename it into place instead.
+    expect(dockerfile).not.toMatch(/rm -f \/etc\/localtime;/);
   });
 
   it("asserts the invariant at build time so a base-image change fails the build", () => {
@@ -144,7 +169,7 @@ describe("Dockerfile.agent — /etc/localtime is a regular file", () => {
   });
 
   it("runs the de-symlink as root, i.e. before USER", () => {
-    const runIdx = dockerfile.indexOf("rm -f /etc/localtime");
+    const runIdx = dockerfile.search(/^\s*mv -f \/etc\/localtime\.desymlink\.tmp/m);
     const userIdx = dockerfile.search(/^USER /m);
     expect(runIdx).toBeGreaterThan(-1);
     expect(userIdx).toBeGreaterThan(-1);
@@ -252,12 +277,15 @@ describe.skipIf(!DOCKER || !hasImage(AGENT_IMAGE))(
       expect(r.status).toBe(0);
     });
 
-    it("keeps Etc/UTC at a zero offset with a non-UTC zone mounted on /etc/localtime", () => {
+    it("keeps Etc/UTC at a zero offset with a non-UTC zone mounted on /etc/localtime", (ctx) => {
       // Skip on an exotic runner with no tzdata for the probe zone.
+      // ctx.skip(), not a bare `return` — a return marks the test PASSED,
+      // which reports a missing zone as a green assertion that never ran.
       const hostZone = "/usr/share/zoneinfo/Australia/Melbourne";
       try {
         readFileSync(hostZone);
       } catch {
+        ctx.skip(`host has no ${hostZone}`);
         return;
       }
       const r = spawnSync(

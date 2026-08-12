@@ -462,6 +462,14 @@ COPY dist/buzz-gateway/index.js /opt/switchroom/buzz-gateway/index.js
 # the unmounted image default is unchanged (Etc/UTC). Byte-identical
 # content, different inode type. Must run as root, i.e. before `USER`.
 #
+# Written via a temp file + `mv` rather than `rm` then `cp`: if a future
+# base image ever ships `/etc/localtime` as a REGULAR FILE already,
+# `readlink -f` resolves it to itself, and an `rm` before the `cp` would
+# delete the source out from under the copy (`cp: can't stat
+# '/etc/localtime'`) and break the build. Temp-then-`mv` makes the step
+# idempotent and base-image-agnostic; `mv -f` replaces a symlink or a
+# regular file alike, in one rename.
+#
 # Trade-off: `readlink /etc/localtime` no longer yields a zone name in
 # this image. Nothing regresses — `detectServerTimezone()`
 # (src/config/timezone.ts) treats an Etc/UTC link as "no signal" and
@@ -472,9 +480,9 @@ COPY dist/buzz-gateway/index.js /opt/switchroom/buzz-gateway/index.js
 RUN set -eu; \
     src="$(readlink -f /etc/localtime 2>/dev/null || true)"; \
     [ -f "$src" ] || src=/usr/share/zoneinfo/Etc/UTC; \
-    rm -f /etc/localtime; \
-    cp "$src" /etc/localtime; \
-    chmod 0644 /etc/localtime; \
+    cp "$src" /etc/localtime.desymlink.tmp; \
+    chmod 0644 /etc/localtime.desymlink.tmp; \
+    mv -f /etc/localtime.desymlink.tmp /etc/localtime; \
     if [ -L /etc/localtime ] || [ ! -f /etc/localtime ]; then \
       echo "FATAL: /etc/localtime is not a regular file after de-symlink" >&2; \
       exit 1; \

@@ -32,14 +32,6 @@ now an anomaly worth investigating, not the norm.
   07-26, reads 0.81 and stays silent while 84–95 % of recalls were being cut
   off — the worst week in the log, scored as healthier than the milder August
   incident it did catch.
-- **every agent inherits a local-time rule** — a new unconditional shared
-  prompt fragment (`profiles/_shared/local-time.md.hbs`) appended at both
-  scaffold sites, so no profile can opt out. Fixing the OS stops the machine
-  lying about UTC; it does not stop an agent showing a human a technically
-  correct UTC timestamp, hardcoding `+10:00` or `"AEST"` (both change with
-  DST), or calling `.astimezone()` on a naive value and silently assuming the
-  process clock. Six lines, zone-agnostic, and pinned by a prompt-budget
-  ratchet test — this is context every agent pays for on every turn.
 
 ### Bug fixes
 

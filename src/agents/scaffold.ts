@@ -773,7 +773,6 @@ import {
   renderAgentSelfServiceFragment,
   renderExecutionDisciplineFragment,
   renderDevProtocolFragment,
-  renderLocalTimeFragment,
   renderDelegationGoldenRuleFragment,
   renderReplyDisciplineFragment,
 } from "./profiles.js";
@@ -6096,18 +6095,6 @@ export function scaffoldAgent(
             if (devProtocol) {
               rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
             }
-            // Local-time fragment — "never show a human a UTC timestamp",
-            // plus the no-hardcoded-offset and naive-timestamp rules. Same
-            // unconditional-append pattern so it reaches EVERY agent on
-            // EVERY profile; the container /etc/localtime fix stops the OS
-            // lying about UTC, this stops the AGENT surfacing UTC to a
-            // human. ORDER (…, dev-protocol, then local-time, then
-            // delegation-golden-rule) must mirror the reconcile path or the
-            // diff-abort trips on every reconcile.
-            const localTime = renderLocalTimeFragment(context);
-            if (localTime) {
-              rendered = rendered.trimEnd() + "\n\n" + localTime + "\n";
-            }
             // Delegation golden-rule fragment — appended LAST (after
             // execution-discipline and dev-protocol) on purpose so the
             // "prefer delegating execution to a sub-agent" signal regains
@@ -8455,14 +8442,6 @@ function reconcileAgentInner(
       const devProtocol = renderDevProtocolFragment(claudeContext);
       if (devProtocol) {
         rendered = rendered.trimEnd() + "\n\n" + devProtocol + "\n";
-      }
-      // Local-time fragment — ORDER must mirror the first-scaffold path
-      // above (…, dev-protocol, then local-time, then
-      // delegation-golden-rule) or the diff-abort below trips on every
-      // reconcile.
-      const localTime = renderLocalTimeFragment(claudeContext);
-      if (localTime) {
-        rendered = rendered.trimEnd() + "\n\n" + localTime + "\n";
       }
       // Delegation golden-rule fragment — appended LAST (after
       // execution-discipline and dev-protocol) so the "prefer delegating
