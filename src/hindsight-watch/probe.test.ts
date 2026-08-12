@@ -357,6 +357,75 @@ describe("probeBankConsolidation", () => {
   });
 });
 
+// ── the retention floor on the streak scan (#4620) ──────────────────────
+
+import { spawnSync } from "node:child_process";
+import { BANK_CONSOLIDATION_SH, RETENTION_DAYS_SH, bankConsolidationQuery } from "./probe.js";
+
+describe("the streak scan's retention floor", () => {
+  /** Run the real derivation under `sh` and read back the days it resolved. */
+  const resolve = (env: Record<string, string>): string =>
+    spawnSync("sh", ["-c", `${RETENTION_DAYS_SH}\nprintf '%s' "$RD"`], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...env },
+    }).stdout;
+
+  it("derives the horizon from the pruner's own knob, not from a constant here", () => {
+    // Unset is the fleet's actual state, and 30 is what
+    // `docker/hindsight-maintenance.sh:63` then prunes at.
+    expect(resolve({})).toBe("30");
+    // The case the review note flagged: an operator who tunes the knob down
+    // must move the floor with it, or completions in the 7–30 day band are
+    // already deleted while failures in that band still count.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "7" })).toBe("7");
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "90" })).toBe("90");
+  });
+
+  it("refuses anything that is not a plain number — the value is spliced into SQL", () => {
+    for (const bad of ["", "abc", "30x", "-5", "7 OR 1=1", "$(id)", "1;DROP TABLE async_operations"]) {
+      expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: bad })).toBe("30");
+    }
+  });
+
+  it("clamps 0 to one day — a floor of now() would delete this signal", () => {
+    // RETENTION_DAYS=0 prunes every completion on sight. Flooring at now()
+    // would empty the candidate list and report health for ever.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "0" })).toBe("1");
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "1" })).toBe("1");
+  });
+
+  it("clamps an absurdly large horizon — make_interval takes an int, not a bigint", () => {
+    // All-digits is not enough. `make_interval(days => 3000000000)` raises
+    // `function make_interval(days => bigint) does not exist` (verified on
+    // pg16), psql exits non-zero, and BOTH bank signals degrade to `no-data`
+    // off one knob typo.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "3000000000" })).toBe("30");
+    // A value too large for the shell to compare at all takes the same branch.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "9".repeat(40) })).toBe("30");
+    // The boundary itself: a century is allowed, a century and a day is not.
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "36500" })).toBe("36500");
+    expect(resolve({ SWITCHROOM_HINDSIGHT_RETENTION_DAYS: "36501" })).toBe("30");
+  });
+
+  it("the shipped statement floors the failure scan with the resolved horizon", () => {
+    // The unbounded scan is what #4620 is about: it must not survive as the
+    // bound, and the floor must be the shell-resolved value rather than a
+    // literal baked in here.
+    expect(BANK_CONSOLIDATION_SH).toContain("now() - make_interval(days => $RD)");
+    expect(BANK_CONSOLIDATION_SH).toMatch(/created_at > greatest\(\(SELECT max\(b\.created_at\)/);
+    expect(BANK_CONSOLIDATION_SH).not.toMatch(/created_at > coalesce\(/);
+    // No `-infinity` sentinel: `greatest` ignores NULLs, so one inside the
+    // `greatest` would be INERT while reading as though it widened the window
+    // for a never-completed pair. Verified on pg16 —
+    // `greatest(coalesce(NULL::timestamptz,'-infinity'), now()-interval '30 days')`
+    // is `IS NOT DISTINCT FROM` the same expression without the coalesce. This
+    // asserts it does not come back as documentation-by-dead-code. (The
+    // OUTCOME of all of this is asserted against a real PostgreSQL in
+    // streak-retention-floor.pg.test.ts.)
+    expect(bankConsolidationQuery("$RD")).not.toContain("-infinity");
+  });
+});
+
 describe("probeVectorIndexes", () => {
   const notice = (probed: number, bad: string[]) =>
     `NOTICE:  VECIDX|${probed}|${bad.length}|${bad.map((b) => b + ";").join("")}\n`;

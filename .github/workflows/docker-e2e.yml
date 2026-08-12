@@ -81,6 +81,7 @@ jobs:
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
       hindsight: ${{ steps.filter.outputs.hindsight }}
+      hindsightwatch: ${{ steps.filter.outputs.hindsightwatch }}
     steps:
       # merge_group: no diff base exists on a queue ref, so skip the
       # filter (the job still reports `success`, which `e2e-ok` requires)
@@ -149,6 +150,20 @@ jobs:
               - 'tests/docker/hindsight-metrics-cardinality-patch.test.ts'
               - 'tests/docker/hindsight-graph-maintenance-retry-storm.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
+              - '.github/workflows/docker-e2e.yml'
+            # hindsight-watch's streak probe (#4620) asserts its OUTCOME
+            # against a real PostgreSQL, because the defect lives in SQL and no
+            # cheaper layer can see which rows the server actually aggregates.
+            # That test `skipIf`s without docker, so the ordinary vitest shards
+            # (which have docker but never set the require flag) would let a
+            # semantics regression through on the hermetic string pins alone.
+            # It gets a job here — the only workflow that already treats a
+            # docker-dependent probe as a gate.
+            hindsightwatch:
+              - 'src/hindsight-watch/probe.ts'
+              - 'src/hindsight-watch/evaluate.ts'
+              - 'src/hindsight-watch/thresholds.ts'
+              - 'src/hindsight-watch/streak-retention-floor.pg.test.ts'
               - '.github/workflows/docker-e2e.yml'
 
   # ─── Sharded docker e2e run ───────────────────────────────────────
@@ -693,6 +708,54 @@ jobs:
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done
 
+  # ─── hindsight-watch streak probe against a real PostgreSQL (#4620) ─
+  # Cheap by design: no image build, no 6.4GB pull — one throwaway
+  # `postgres:16-alpine` (~80MB), booted and torn down by the test
+  # itself, on `--network none`.
+  #
+  # SWITCHROOM_REQUIRE_PG_PROBE=1 is the whole point. Without it the
+  # test `skipIf`s when docker is unavailable, which is right on a dev
+  # box and useless as a gate: the remaining hermetic assertions in
+  # probe.test.ts are TEXT PINS, so a rewrite that preserved the
+  # strings while breaking the semantics would pass everywhere. With
+  # it, an absent docker or image FAILS the job instead of skipping,
+  # so the only assertions in the repo that can fail on the #4620
+  # outcome always run.
+  #
+  # merge_group and push run it unconditionally, same reasoning as
+  # hindsight-probe: a job that exists so a probe cannot silently skip
+  # must not silently skip on candidate-main.
+  hindsight-watch-pg-probe:
+    needs: changes
+    if: github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.hindsightwatch == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up workspace
+        uses: ./.github/actions/setup-switchroom
+
+      - name: Pull postgres:16-alpine
+        # Pulled HERE rather than left to the test: the test deliberately
+        # refuses to pull (it must not drag an image onto a dev box), and with
+        # SWITCHROOM_REQUIRE_PG_PROBE=1 a cache miss is a hard failure.
+        run: |
+          docker pull postgres:16-alpine
+          docker image inspect postgres:16-alpine >/dev/null
+
+      - name: Streak retention floor, against a real PostgreSQL
+        env:
+          SWITCHROOM_REQUIRE_PG_PROBE: "1"
+        run: npx vitest run src/hindsight-watch/streak-retention-floor.pg.test.ts
+
+      - name: Teardown any orphaned probe container
+        if: always()
+        run: |
+          ids=$(docker ps -aq --filter "name=swr-streak-floor-" 2>/dev/null || true)
+          if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
+
   # ─── Sentinel ─────────────────────────────────────────────────────
   # Branch-protection-required context (see ci-lint.yml header for the
   # pattern). ALWAYS runs and aggregates the path-gated jobs above:
@@ -710,7 +773,7 @@ jobs:
   # can never silently skip; it only actually gates via this sentinel.
   # Keep this `needs` list complete when adding jobs.
   e2e-ok:
-    needs: [changes, e2e-shard, hindsight-probe]
+    needs: [changes, e2e-shard, hindsight-probe, hindsight-watch-pg-probe]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -725,7 +788,8 @@ jobs:
           fail=0
           for pair in \
             "e2e-shard=${{ needs.e2e-shard.result }}" \
-            "hindsight-probe=${{ needs.hindsight-probe.result }}"; do
+            "hindsight-probe=${{ needs.hindsight-probe.result }}" \
+            "hindsight-watch-pg-probe=${{ needs.hindsight-watch-pg-probe.result }}"; do
             job="${pair%%=*}"; r="${pair#*=}"
             if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
               echo "::error::${job}=${r} — real e2e failure, blocking"
