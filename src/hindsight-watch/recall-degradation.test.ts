@@ -353,7 +353,15 @@ describe("the 2026-08-01 → 08-07 degradation the fourteen existing signals mis
     // A retune is free to move where warning starts. It is not free to hand
     // this band to the warn arm and leave nothing paging — which is precisely
     // what warn 6000 / page 8000 did, and why it reddens here.
-    const wall = 9993; // `deadline_effective_ms` the fixtures carry
+    // Read the wall OUT of the fixture rather than restating it. A literal
+    // here would be the same coupling defect this test exists to remove, only
+    // pointed at `sickRows`'s `deadline_effective_ms` instead of at the
+    // thresholds: change the generator's wall and a hard-coded 9993 goes stale
+    // silently, still green, no longer checking the band it names.
+    const wall = summarizeRecallRows(
+      sickRows({ score: 0.7, pool: 90, latP50: 1200, latP95: 1600, deadlineHitRate: 0 }),
+    ).deadlineEffectiveMedianMs!;
+    expect(wall).toBeGreaterThan(9000);
     const nearWall = ringOf(
       sickRows({
         score: 0.7,
