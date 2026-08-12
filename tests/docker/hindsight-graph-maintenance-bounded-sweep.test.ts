@@ -671,9 +671,9 @@ try:
         # Against the LITERAL cursor the last committed page returned, not
         # against another observation: two None cursors compared to each other
         # are "equal" and would pass vacuously on the broken shape. Asserted at
-        # BOTH re-entries: on origin/main the cursor does not merely reset once,
-        # it resets again on the second re-entry, so a single-re-entry probe
-        # cannot see a fix that decays.
+        # BOTH re-entries: the reset the #4635 fix removed did not happen
+        # once, it happened on EVERY re-entry, so a single-re-entry probe
+        # cannot see a fix that holds the first time and decays after.
         check("R_re_entry_uses_the_last_committed_cursor",
               [cursors[i] for i in RE_ENTRY_CALLS] == [("k2a", "k2b"), ("k2a", "k2b")],
               f"the first calls after the two slice-level re-entries ran at "
