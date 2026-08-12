@@ -179,13 +179,32 @@ describe("hindsight-maintenance.sh", () => {
       expect(r.status).toBe(0);
       const sql = readFileSync(sqlLog, "utf-8");
 
-      /** Parse the reloptions the script actually SET on `table`. */
+      /**
+       * Parse the reloptions the script actually SET on `table`.
+       *
+       * `ALTER TABLE ... SET (...)` MERGES reloptions and is last-write-wins,
+       * so a second ALTER appended below the first silently overrides those
+       * keys in live postgres. Reading only the FIRST match would let exactly
+       * that regression through green — the very merge semantic this file
+       * exists to pin — so require there be exactly ONE ALTER per table.
+       */
       const optsFor = (table: string): Record<string, number> => {
-        const line = sql
+        const prefix = `ALTER TABLE IF EXISTS ${table} SET (`;
+        const hits = sql
           .split("\n")
-          .find((l) => l.startsWith(`ALTER TABLE IF EXISTS ${table} SET (`));
-        expect(line, `no autovacuum ALTER issued for ${table}`).toBeTruthy();
-        const body = line!.slice(line!.indexOf("(") + 1, line!.lastIndexOf(")"));
+          .map((l, i) => ({ line: l, lineNo: i + 1 }))
+          .filter((h) => h.line.startsWith(prefix));
+        expect(hits.length, `no autovacuum ALTER issued for ${table}`).toBeGreaterThan(0);
+        expect(
+          hits.length,
+          `${hits.length} autovacuum ALTERs issued for ${table} (SQL-log lines ` +
+            `${hits.map((h) => h.lineNo).join(", ")}) — ALTER TABLE ... SET MERGES ` +
+            `reloptions last-write-wins, so the LAST one silently overrides the ` +
+            `earlier ones. Fold them into a single ALTER in ` +
+            `docker/hindsight-maintenance.sh.`,
+        ).toBe(1);
+        const line = hits[0].line;
+        const body = line.slice(line.indexOf("(") + 1, line.lastIndexOf(")"));
         return Object.fromEntries(
           body.split(",").map((kv) => {
             const [k, v] = kv.split("=");
