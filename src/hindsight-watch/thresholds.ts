@@ -1047,35 +1047,69 @@ export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
  * …with the pair's last SUCCESS 220 h ago in both cases. The consequence is
  * general: any permanently-broken sparse operation type reads green forever.
  *
- * **24 h, measured.** Two rates bound it, both taken from `async_operations`
- * on the production bank, 2026-08-12:
+ * ### The measurement window is 30 days, and that is a hard ceiling
  *
- *  - **Floor — how long a self-healing fault legitimately takes.** Over 90
- *    days there were 6 episodes of ≥3 consecutive failures for a pair that
- *    then RECOVERED. Measuring each episode success-to-success (the exact
- *    window this constant thresholds): max 17.64 h
- *    (`refresh_mental_model`), median 8.70 h, min 2.01 h. 24 h clears the
- *    longest observed self-heal by ~36 %, so a fault that resolves on its own
- *    does not page on the way.
- *  - **Ceiling — the incidents this must catch.** The two live
- *    `graph_maintenance` episodes are the only ≥3 streaks in that 90-day
- *    window that never recovered; both are 220 h since last success, ~9× this
- *    line.
+ * Every rate below is taken from `async_operations` on the production bank on
+ * 2026-08-12, and that table holds **30 days**, not more: `min(created_at)` is
+ * 2026-07-13 and NO terminal row older than 30 days by `updated_at` survives,
+ * while `memory_units` in the same database goes back to 2026-04-15. Terminal
+ * operations are swept by the retention job
+ * (`engine/maintenance.py::_run_operation_cleanup` →
+ * `prune_terminal_operations`, deleting `completed|failed|cancelled` rows by
+ * `updated_at < now() - operation_retention_days`). A longer baseline is not
+ * available to measure and cannot be claimed.
  *
- * The healthy p99 inter-completion gap for the sparsest type is 28.47 h,
- * ABOVE this line — deliberately not the bound used, because a healthy idle
- * pair has streak 0 and is never a candidate. The conjunction with
- * `CONSOLIDATION_FAILURE_STREAK_WARN` is what makes that safe: this window
- * only ever gets asked about a pair that has ALREADY failed ≥3 times in a row
- * with no completion in between.
+ * ### 48 h, and the honest limits of the derivation
  *
- * The residual, accepted deliberately: a pair that was broken, was fixed, and
- * has had no demand since will page 24 h after its last success, because
- * nothing has run to prove the fix. That is the honest reading of the
- * evidence — and unlike the recency guard it resolves the instant one op
- * completes.
+ *  - **Ceiling — the incidents this must catch.** Both live
+ *    `graph_maintenance` episodes are 220 h since their last success: 4.6× this
+ *    line. They are the only ≥3 streaks in the window that never recovered.
+ *
+ *  - **Floor — how long a self-healing fault legitimately takes.** Measured
+ *    over ALL 58 failure episodes in the window (56 of which recovered), each
+ *    scored success-to-success, which is exactly the span this constant
+ *    thresholds: p50 0.88 h, p95 16.16 h, **max 27.67 h** (`retain` /
+ *    `batch_retain`). 48 h clears the longest observed self-heal by 73 %.
+ *
+ *    The narrower population is reported too, because it is the one that looks
+ *    most relevant and is the most misleading: conditioning on ≥3 consecutive
+ *    failures leaves 6 recovered episodes (spans 2.01 / 4.82 / 5.99 / 8.70 /
+ *    9.75 / 17.64 h; median 7.35 h) and a max of 17.64 h. Deriving the line
+ *    from those six would put it under the 27.67 h self-heal that exists in
+ *    the same window — a margin that is an artefact of the conditioning, not a
+ *    property of the system. The wider population is the defensible one.
+ *
+ *  - **What is NOT measured, and cannot be.** Of the 8 ≥3 episodes in the
+ *    window, 5 are `refresh_mental_model`, 1 is `consolidation`, and the only
+ *    2 `graph_maintenance` ones are the unresolved live incidents. **There is
+ *    no recovered SPARSE ≥3 episode on record**, so the floor above is
+ *    measured on dense types (inter-completion p99 9.52–15.69 h) and applied
+ *    to a type whose own healthy inter-completion p99 is 28.47 h and whose max
+ *    healthy gap is 145.17 h. 48 h clears that p99 by 69 %, which is why it is
+ *    the line rather than 24 h; it does not clear the max, and nothing
+ *    sensible would.
+ *
+ * ### The residual exposure, stated rather than argued away
+ *
+ * A pair that has ALREADY breached (≥`CONSOLIDATION_FAILURE_STREAK_WARN`
+ * consecutive failures) and then goes idle IS exposed: three transient
+ * `graph_maintenance` failures followed by 48 h with no delete to enqueue work
+ * raises a warn on a pair that is not broken. For a demand-driven type the
+ * recovery clock is bounded below by DEMAND ARRIVAL, not by fault duration, so
+ * no threshold under 145.17 h removes this, and a threshold that high would
+ * not be a monitor. The exposure is bounded instead of eliminated:
+ *
+ *  - it needs a real streak first — a healthy pair that merely goes idle has
+ *    streak 0 and is never a candidate;
+ *  - it enters at `warn` (3), not `page` (10), so the noisy end is the quiet
+ *    end;
+ *  - it clears the instant one op completes, which is the property the
+ *    recency guard existed to protect.
+ *
+ * That is a documented limitation, not a safety claim: the alternative is the
+ * status quo, where a permanently-broken sparse type reads green for ever.
  */
-export const CONSOLIDATION_STREAK_NO_SUCCESS_S = 24 * 60 * 60;
+export const CONSOLIDATION_STREAK_NO_SUCCESS_S = 48 * 60 * 60;
 
 /**
  * Per-bank unconsolidated depth: the floor below which GROWTH is not worth

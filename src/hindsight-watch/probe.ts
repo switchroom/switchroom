@@ -387,8 +387,11 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
  *
  * Two tagged sections on stdout, so one round trip answers both signals:
  *
- *   `S|<bank>|<operation_type>|<streak>|<newest_failure_age_seconds>`
+ *   `S|<bank>|<operation_type>|<streak>|<newest_failure_age_seconds>|<last_completed_age_seconds>`
  *   `P|<bank>|<pending_consolidation>`
+ *
+ * The sixth field is EMPTY when the pair has never completed an op. The
+ * five-field row is the pre-#4618 shape and is still parsed, as unknown.
  *
  * ### The streak query
  *
@@ -412,9 +415,12 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
  * the evaluator ask "has anything succeeded lately?" instead of only "is the
  * newest failure recent?"; the latter cannot hold the streak of a sparse,
  * demand-driven operation type whose failures are legitimately hours or days
- * old while the job is 100 % broken. It comes out of the same subselect shape
- * the streak definition already pays for, so the query does not get a second
- * pass over `async_operations`.
+ * old while the job is 100 % broken. It reuses the same correlated-subselect
+ * SHAPE the streak definition already uses, but it is a SECOND correlated
+ * subselect and does cost a second `SubPlan` over `async_operations` — the
+ * measured price on the production database is the whole statement at 20.3 ms
+ * (`EXPLAIN (ANALYZE, TIMING OFF)`), against a 5 s probe budget, so it is
+ * affordable rather than free.
  *
  * ### The depth query
  *
@@ -583,27 +589,38 @@ export function probeBankConsolidation(
     const t = line.trim();
     if (t === "") continue;
     const f = t.split("|");
-    if (f[0] === "S" && f.length === 6) {
+    // Exactly 6 fields is the current row; exactly 5 is the pre-#4618 shape,
+    // accepted for the same reason a garbled sixth field does not drop the
+    // row — a dropped streak reads as HEALTH. Any OTHER arity is a row we did
+    // not understand (a bank id containing a `|`, a changed query) and is
+    // skipped, so the arity is pinned at both ends rather than open-ended.
+    if (f[0] === "S" && (f.length === 6 || f.length === 5)) {
       const streak = Number(f[3]);
       const age = Number(f[4]);
       if (!Number.isFinite(streak) || !Number.isFinite(age) || streak < 0 || age < 0) continue;
-      // Empty means the pair has never completed an op — a real state, and a
-      // DIFFERENT one from "we could not read it", so it is carried as an
-      // explicit null rather than dropped. An unparseable value drops the ROW:
-      // admitting it as null would read as "never succeeded" and could page on
-      // a garbled field.
-      let lastCompletedAgeS: number | null = null;
-      if (f[5] !== "") {
+      // Three states, and the tie-break matters more than it looks. EMPTY is
+      // a real reading — the pair has never completed an op. A GARBLED value
+      // is not: it becomes `undefined`, on which the evaluator's sparse arm
+      // abstains, so the STREAK still counts on the pre-existing recency
+      // behaviour. Dropping the whole row instead would delete a streak of 19
+      // from the sample, and a missing streak reads as HEALTH — the exact
+      // failure mode this signal exists to end, and the same tie-break
+      // `normalizeBankSample` makes for a row that lacks the field.
+      let lastCompletedAgeS: number | null | undefined;
+      if (f.length === 5) {
+        lastCompletedAgeS = undefined; // pre-#4618 row: unknown, not "never"
+      } else if (f[5] === "") {
+        lastCompletedAgeS = null;
+      } else {
         const completedAge = Number(f[5]);
-        if (!Number.isFinite(completedAge) || completedAge < 0) continue;
-        lastCompletedAgeS = completedAge;
+        if (Number.isFinite(completedAge) && completedAge >= 0) lastCompletedAgeS = completedAge;
       }
       streaks.push({
         bank: f[1],
         operationType: f[2],
         streak,
         newestFailureAgeS: age,
-        lastCompletedAgeS,
+        ...(lastCompletedAgeS !== undefined ? { lastCompletedAgeS } : {}),
       });
       parsedAny = true;
     } else if (f[0] === "P" && f.length === 3) {

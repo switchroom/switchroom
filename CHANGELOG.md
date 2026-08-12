@@ -90,13 +90,21 @@ now an anomaly worth investigating, not the norm.
   91 h, both banks 220 h since their last successful op — and the signal
   reported `{"status":"ok","breaches":0}`. The per-pair psql pass now also
   reads the age of the pair's most recent `completed` op, and a streak counts
-  as live when EITHER the failure is recent (unchanged for dense jobs) OR the
-  streak has reached the warn line and nothing has succeeded for
-  `CONSOLIDATION_STREAK_NO_SUCCESS_S` (24 h, measured: the longest
-  self-resolving ≥3 streak on record spans 17.64 h success-to-success). Asking
-  "has anything SUCCEEDED lately?" instead of "is the failure recent?" still
-  clears the instant a completion lands, which is what the recency guard
-  existed to protect. (#4620)
+  as live when EITHER the failure is recent (the old condition, unchanged) OR
+  the streak has reached the warn line and nothing has succeeded for
+  `CONSOLIDATION_STREAK_NO_SUCCESS_S` (48 h). The second arm is **not** scoped
+  to sparse types — nothing in the data distinguishes them — so a DENSE pair
+  that is genuinely broken past 48 h now breaches where it previously read
+  `ok`; that is intended, but it is a behaviour change, not a no-op. 48 h is
+  derived against every self-resolving failure episode visible in the
+  `async_operations` window (58 episodes, 56 recovered: p50 0.88 h, p95
+  16.16 h, max 27.67 h) and against the p99 gap between successive
+  `graph_maintenance` completions (28.47 h). That window is 30 days — all the
+  table retains — and it contains **no** recovered sparse ≥3-failure episode,
+  so the constant's doc block states that limit rather than implying a safety
+  margin the data cannot support. Asking "has anything SUCCEEDED lately?"
+  instead of "is the failure recent?" still clears the instant a completion
+  lands, which is what the recency guard existed to protect. (#4618)
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 

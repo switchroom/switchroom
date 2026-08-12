@@ -320,13 +320,35 @@ describe("probeBankConsolidation", () => {
     ]);
   });
 
-  it("DROPS a row whose last-completed field is garbage — a garbled field must not read as 'never'", () => {
+  it("ABSTAINS on a garbled last-completed field — keeps the streak, drops the field", () => {
+    // A dropped streak row reads as HEALTH, which is the exact failure this
+    // whole change exists to remove. The unreadable field is discarded; the
+    // streak and its failure age, which parsed fine, are not. Absent ≠ null:
+    // the evaluator must not read a garbled field as "never completed".
+    for (const garbage of ["NaN", "-1", "yesterday"]) {
+      expect(
+        probeBankConsolidation("c", psql(`S|b|graph_maintenance|9|900|${garbage}\nP|b|4\n`))?.streaks,
+      ).toEqual([{ bank: "b", operationType: "graph_maintenance", streak: 9, newestFailureAgeS: 900 }]);
+    }
+  });
+
+  it("accepts the pre-#4618 FIVE-field row as unknown, not as 'never'", () => {
+    // A stale container or a rolled-back query still emits the old shape.
+    // Dropping those rows would blind every signal on the block.
+    expect(probeBankConsolidation("c", psql("S|b|consolidation|7|30\nP|b|4\n"))?.streaks).toEqual([
+      { bank: "b", operationType: "consolidation", streak: 7, newestFailureAgeS: 30 },
+    ]);
+  });
+
+  it("pins the arity at BOTH ends — a 7-field row is a row we did not understand", () => {
+    // Open-ended `>= 5` would silently accept a row whose bank id contains a
+    // `|`, mis-assigning every field after it. Seven fields is not a shape
+    // this query can emit, so it is a parse failure, not a longer row.
     expect(
-      probeBankConsolidation("c", psql("S|b|graph_maintenance|9|900|NaN\nP|b|4\n"))?.streaks,
+      probeBankConsolidation("c", psql("S|b|consolidation|7|30|60|99\nP|b|4\n"))?.streaks,
     ).toEqual([]);
-    expect(
-      probeBankConsolidation("c", psql("S|b|graph_maintenance|9|900|-1\nP|b|4\n"))?.streaks,
-    ).toEqual([]);
+    // Four fields likewise: too short to carry a failure age at all.
+    expect(probeBankConsolidation("c", psql("S|b|consolidation|7\nP|b|4\n"))?.streaks).toEqual([]);
   });
 
   it("rejects a negative or non-numeric count rather than trusting it", () => {

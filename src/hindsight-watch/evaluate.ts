@@ -888,7 +888,7 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *    every 87 s through the 2026-07-29 incident, so "newest failure inside
  *    `CONSOLIDATION_STREAK_RECENCY_S`" tracks it exactly.
  *
- *  - **No success in a long time** (the arm added for #4620). A SPARSE,
+ *  - **No success in a long time** (the arm added in #4618). A SPARSE,
  *    demand-driven type produces no new failures while it is broken, because
  *    it only runs when work is enqueued — so arm one structurally cannot hold
  *    its streak. Measured live 2026-08-12: `overlord/graph_maintenance` held a
@@ -904,10 +904,27 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  * completion lands, which is the property the recency guard existed to
  * protect.
  *
- * `lastCompletedAgeS === undefined` means the row predates the field (an old
- * persisted state file), NOT that the pair never completed: the sparse arm
- * abstains rather than guess, leaving the row on the pre-existing behaviour
- * until the next probe fills the field in.
+ * **The second arm is NOT scoped to sparse types** — nothing here can tell
+ * them apart, and inventing a classifier would be a second thing to get
+ * wrong. A `consolidation` pair with ≥3 failures and no completion for
+ * `CONSOLIDATION_STREAK_NO_SUCCESS_S` therefore breaches where it previously
+ * read `ok`. That is intended: it is the same fault shape, just slower.
+ *
+ * Two non-obvious readings of the field, both load-bearing:
+ *
+ *  - `undefined` means the row predates the field (an old persisted state
+ *    file), NOT that the pair never completed. The sparse arm abstains rather
+ *    than guess, leaving the row on the pre-existing behaviour until the next
+ *    probe fills the field in.
+ *  - `null` means "no `completed` row for this pair IS VISIBLE", which is only
+ *    the same as "never completed" while operation retention is longer than
+ *    this window. Retention is configurable
+ *    (`HINDSIGHT_API_OPERATION_RETENTION_DAYS`; the sweep is disabled at its
+ *    code default of 0, and the production bank observably holds 30 days), so
+ *    the null arm carries the same age evidence the numeric arm does rather
+ *    than firing on absence alone. Under a retention shorter than this window
+ *    the numeric arm would be silently unreachable, and an unguarded null arm
+ *    would then page on every streak.
  */
 function lastSuccessPhrase(lastCompletedAgeS: number | null | undefined): string {
   if (lastCompletedAgeS === undefined) return "unknown (state predates the field)";
@@ -924,7 +941,10 @@ function isLiveStreak(s: BankFailureStreak): boolean {
   // "recent enough" test, silently promotes unknown to "never completed" and
   // pages on hydration alone.
   const last = s.lastCompletedAgeS;
-  if (last === null) return true;
+  // No visible completion: fall back to the only clock left, the streak's own
+  // age. Firing on absence alone would page on a short retention window (see
+  // the doc block) rather than on evidence.
+  if (last === null) return s.newestFailureAgeS > CONSOLIDATION_STREAK_NO_SUCCESS_S;
   return typeof last === "number" && last > CONSOLIDATION_STREAK_NO_SUCCESS_S;
 }
 

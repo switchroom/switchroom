@@ -577,7 +577,7 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
     expect(v.state).toBe("ok");
   });
 
-  // ── the sparse-job blind spot (#4620) ────────────────────────────────────
+  // ── the sparse-job blind spot (#4618) ────────────────────────────────────
   //
   // Every fixture below is HARD-CODED in seconds, deliberately not derived
   // from the constants it exercises: a fixture written as
@@ -588,7 +588,7 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
     it("pins the constants these fixtures are written against", () => {
       // If either of these changes, the literal fixtures below stop meaning
       // what their comments say — re-derive them, do not retune this pin.
-      expect(CONSOLIDATION_STREAK_NO_SUCCESS_S).toBe(86_400); // 24h
+      expect(CONSOLIDATION_STREAK_NO_SUCCESS_S).toBe(172_800); // 48h
       expect(CONSOLIDATION_STREAK_RECENCY_S).toBe(7_200); // 2h
       expect(CONSOLIDATION_FAILURE_STREAK_WARN).toBe(3);
     });
@@ -639,7 +639,7 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
 
     it("does NOT fire while a success is recent — the dense case is unchanged", () => {
       // The exact shape the recency guard was added for: old failures, but the
-      // pair completed since. 23h < 24h, so the sparse arm must abstain and
+      // pair completed since. 46h < 48h, so the sparse arm must abstain and
       // the old arm already rejects the 100h-old failure.
       const v = evaluateConsolidationFailureStreak([
         sample(0, {
@@ -650,7 +650,7 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
                 operationType: "consolidation",
                 streak: 500,
                 newestFailureAgeS: 360_000, // 100h
-                lastCompletedAgeS: 82_800, // 23h — inside the window
+                lastCompletedAgeS: 165_600, // 46h — inside the window
               },
             ],
           }),
@@ -677,9 +677,9 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
             }),
           }),
         ]).state;
-      expect(at(86_399)).toBe("ok"); // 24h − 1s
-      expect(at(86_400)).toBe("ok"); // exactly 24h — strictly greater required
-      expect(at(86_401)).toBe("breach"); // 24h + 1s
+      expect(at(172_799)).toBe("ok"); // 48h − 1s
+      expect(at(172_800)).toBe("ok"); // exactly 48h — strictly greater required
+      expect(at(172_801)).toBe("breach"); // 48h + 1s
     });
 
     it("breaches when the pair has NEVER completed — no success is not a fresh one", () => {
@@ -700,10 +700,85 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
       ]);
       expect(v.state).toBe("breach");
       expect(v.detail).toContain("last SUCCESS NEVER");
+      expect(v.measured?.lastCompletedAgeS).toBe("never");
+    });
+
+    it("a NEVER-completed pair is still held to the clock — absence alone must not page", () => {
+      // The only clock available when nothing has ever completed is the
+      // streak's own age. Firing on absence alone would page a pair whose
+      // history simply fell out of the retention window, or a brand-new pair
+      // whose first three ops failed an hour ago and is already retrying.
+      const at = (newestFailureAgeS: number) =>
+        evaluateConsolidationFailureStreak([
+          sample(0, {
+            banks: banks({
+              streaks: [
+                {
+                  bank: "newbank",
+                  operationType: "graph_maintenance",
+                  streak: 12,
+                  newestFailureAgeS,
+                  lastCompletedAgeS: null,
+                },
+              ],
+            }),
+          }),
+        ]).state;
+      expect(at(172_799)).toBe("ok"); // 48h − 1s since the newest failure
+      expect(at(172_800)).toBe("ok"); // exactly 48h — strictly greater required
+      expect(at(172_801)).toBe("breach"); // 48h + 1s
+      // …and the recency arm still fires independently of any of this.
+      expect(at(60)).toBe("breach");
+    });
+
+    it("says UNKNOWN, and omits the key, when the row predates the field", () => {
+      // A legacy row that breaches on the RECENCY arm still reports. The
+      // distinction the operator needs is "never succeeded" vs "we did not
+      // read it": the detail must not claim the former, and `measured` must
+      // omit the key entirely rather than emit a null the reader would have
+      // to guess at.
+      const v = evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({
+            streaks: [
+              {
+                bank: "overlord",
+                operationType: "consolidation",
+                streak: 12,
+                newestFailureAgeS: 60, // fresh — breaches on the old arm
+              },
+            ],
+          }),
+        }),
+      ]);
+      expect(v.state).toBe("breach");
+      expect(v.detail).toContain("last SUCCESS unknown (state predates the field)");
+      expect(v.detail).not.toContain("NEVER");
+      expect(v.measured).not.toHaveProperty("lastCompletedAgeS");
+    });
+
+    it("reports a KNOWN last success as an age, not as 'never'", () => {
+      const v = evaluateConsolidationFailureStreak([
+        sample(0, {
+          banks: banks({
+            streaks: [
+              {
+                bank: "overlord",
+                operationType: "graph_maintenance",
+                streak: 19,
+                newestFailureAgeS: 133_977,
+                lastCompletedAgeS: 791_908, // 219.97h
+              },
+            ],
+          }),
+        }),
+      ]);
+      expect(v.detail).toContain("last SUCCESS 220.0h ago");
+      expect(v.measured?.lastCompletedAgeS).toBe(791_908);
     });
 
     it("needs a real streak: 2 stale failures with no success are still not a breach", () => {
-      // The conjunction is what keeps the 24h window safe. A healthy sparse
+      // The conjunction is what keeps the 48h window safe. A healthy sparse
       // pair legitimately goes ~28h between completions (measured p99), so the
       // window alone would be noise — it is only ever asked about a pair that
       // has already failed ≥3 times in a row.
@@ -732,21 +807,26 @@ describe("evaluateConsolidationFailureStreak — the signal that was missing", (
     it("ABSTAINS on a row persisted before the field existed — unknown is not 'never'", () => {
       // A state file written by an older build has no `lastCompletedAgeS`.
       // Reading that as "never completed" would page on hydration alone.
-      const v = evaluateConsolidationFailureStreak([
-        sample(0, {
-          banks: banks({
-            streaks: [
-              {
-                bank: "overlord",
-                operationType: "graph_maintenance",
-                streak: 19,
-                newestFailureAgeS: 133_977,
-              },
-            ],
+      const at = (newestFailureAgeS: number) =>
+        evaluateConsolidationFailureStreak([
+          sample(0, {
+            banks: banks({
+              streaks: [
+                {
+                  bank: "overlord",
+                  operationType: "graph_maintenance",
+                  streak: 19,
+                  newestFailureAgeS,
+                },
+              ],
+            }),
           }),
-        }),
-      ]);
-      expect(v.state).toBe("ok");
+        ]).state;
+      expect(at(133_977)).toBe("ok"); // 37h
+      // The interesting one: an absent field must abstain even when the
+      // streak is old enough that a genuine `null` WOULD breach. `undefined`
+      // and `null` differ here, and a loose `== null` check erases that.
+      expect(at(500_000)).toBe("ok"); // 139h — a null here breaches; unknown must not
     });
   });
 
