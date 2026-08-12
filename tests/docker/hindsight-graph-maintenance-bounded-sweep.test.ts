@@ -1173,6 +1173,24 @@ const NOT_A_PROBE: readonly string[] = [
 
 const DOCKER_E2E_WORKFLOW = ".github/workflows/docker-e2e.yml";
 
+/**
+ * Every workflow that invokes a `tests/docker` suite. The stale-run-step guard
+ * ranges over all of them: a run step that outlives a rename is exactly as
+ * broken in `docker-images.yml` or `ci-tests-race-long.yml` as it is here, and
+ * scoping the guard to one file left the other two unpoliced (#4651).
+ *
+ * `ci-tests-race-long.yml` invokes via `bunx`, not `npx` — see
+ * `vitestTargets()` for why that matters.
+ */
+const GUARDED_WORKFLOWS: readonly string[] = [
+  DOCKER_E2E_WORKFLOW,
+  ".github/workflows/docker-images.yml",
+  ".github/workflows/ci-tests-race-long.yml",
+];
+
+/** The paths-filter output that gates the job running the hindsight probes. */
+const HINDSIGHT_FILTER = "hindsight";
+
 /** The exact spelling every probe must use to opt into the hard-fail path. */
 const PROBE_ENV_VAR = "SWITCHROOM_REQUIRE_HINDSIGHT_PROBE";
 
@@ -1213,41 +1231,152 @@ function probeSet(): string[] {
  * `tests/docker/ci-build-dist-shared.test.ts`.
  */
 interface WorkflowStep {
+  name?: unknown;
+  uses?: unknown;
+  with?: Record<string, unknown>;
   run?: unknown;
 }
 interface WorkflowJob {
   steps?: WorkflowStep[];
 }
 
-function workflowRunSteps(): string[] {
-  const wf = parse(
-    readFileSync(resolve(root, DOCKER_E2E_WORKFLOW), "utf8"),
-  ) as { jobs?: Record<string, WorkflowJob> };
+/** `jobs:` of a workflow, loud rather than vacuous when the shape changes. */
+function workflowJobs(path: string): Record<string, WorkflowJob> {
+  const wf = parse(readFileSync(resolve(root, path), "utf8")) as {
+    jobs?: Record<string, WorkflowJob>;
+  };
   const jobs = wf?.jobs ?? {};
   // A workflow that parsed to no jobs would make every assertion below
   // vacuously green — the exact fail-open this function was rewritten to close.
   expect(
     Object.keys(jobs).length,
-    `${DOCKER_E2E_WORKFLOW} parsed to zero jobs — the guard would pass ` +
+    `${path} parsed to zero jobs — the guard would pass ` +
       "vacuously; the workflow is malformed or its shape changed",
   ).toBeGreaterThan(0);
+  return jobs;
+}
 
-  const files = new Set<string>();
-  for (const job of Object.values(jobs)) {
-    for (const step of job?.steps ?? []) {
-      if (typeof step?.run !== "string") continue;
-      const live = step.run
+/**
+ * Each `run:` in a job, with shell-comment lines stripped (see above), in
+ * declaration order. Steps without a `run:` (`uses:` actions) yield nothing.
+ */
+function liveRunSteps(job: WorkflowJob): string[] {
+  const out: string[] = [];
+  for (const step of job?.steps ?? []) {
+    if (typeof step?.run !== "string") continue;
+    out.push(
+      step.run
         .split("\n")
         .filter((line) => !line.trim().startsWith("#"))
-        .join("\n");
-      for (const m of live.matchAll(
-        /npx vitest run tests\/docker\/([A-Za-z0-9._-]+\.test\.ts)/g,
-      )) {
-        files.add(m[1]);
-      }
+        .join("\n"),
+    );
+  }
+  return out;
+}
+
+/**
+ * The `tests/docker/<file>` targets of every `vitest run` invocation in a run
+ * step, in order.
+ *
+ * RUNNER-AGNOSTIC on purpose. `docker-e2e.yml` and `docker-images.yml` invoke
+ * through `npx`; `ci-tests-race-long.yml` invokes through `bunx`. A matcher
+ * anchored on the `npx` literal returns the EMPTY set for the bunx workflow,
+ * so every guard over it passes vacuously — a guard that fails open on the
+ * whole file it is supposed to police, which is the same fail-open shape
+ * #4643 closed for commented-out steps. Match the `vitest run` invocation and
+ * take its arguments instead, so a switch of package runner (or a second file
+ * on one invocation) cannot silently drop coverage.
+ */
+function vitestTargets(runText: string): string[] {
+  const files: string[] = [];
+  for (const inv of runText.matchAll(/vitest run ([^\n]*)/g)) {
+    for (const m of inv[1].matchAll(
+      /tests\/docker\/([A-Za-z0-9._-]+\.test\.ts)/g,
+    )) {
+      files.push(m[1]);
     }
   }
+  return files;
+}
+
+function workflowRunSteps(path: string = DOCKER_E2E_WORKFLOW): string[] {
+  const files = new Set<string>();
+  for (const job of Object.values(workflowJobs(path))) {
+    for (const run of liveRunSteps(job)) {
+      for (const f of vitestTargets(run)) files.add(f);
+    }
+  }
+  // Every guarded workflow runs at least one tests/docker suite today. An
+  // empty set here is not "nothing to check", it is the matcher having lost
+  // its grip on the file (a renamed invocation, a runner swap, a moved job) —
+  // and every assertion downstream would go green on it.
+  expect(
+    files.size,
+    `${path} yielded no \`vitest run tests/docker/...\` steps — the matcher ` +
+      "no longer sees this workflow's invocations, so every guard over it " +
+      "passes vacuously",
+  ).toBeGreaterThan(0);
   return [...files].sort();
+}
+
+/**
+ * The single docker-e2e.yml job that runs THIS probe. Job-scoped, because
+ * docker-e2e.yml has more than one `Label-scoped teardown` step (one per job)
+ * and a phase listed in some other job's teardown reaps nothing here.
+ */
+function hindsightProbeJob(): { name: string; job: WorkflowJob } {
+  const target = `${TEST_PHASE}.test.ts`;
+  const hits = Object.entries(workflowJobs(DOCKER_E2E_WORKFLOW)).filter(
+    ([, job]) =>
+      liveRunSteps(job).some((run) => vitestTargets(run).includes(target)),
+  );
+  expect(
+    hits.map(([name]) => name),
+    `exactly one ${DOCKER_E2E_WORKFLOW} job must run \`vitest run ` +
+      `tests/docker/${target}\` — none means the probe does not run in CI at ` +
+      "all; several means the guards below are scoped to an arbitrary one",
+  ).toHaveLength(1);
+  return { name: hits[0][0], job: hits[0][1] };
+}
+
+/**
+ * The glob list of one `dorny/paths-filter` output, parsed out of the action's
+ * `with.filters` block scalar (itself YAML).
+ */
+function pathsFilterGlobs(filter: string): string[] {
+  const specs: string[] = [];
+  for (const job of Object.values(workflowJobs(DOCKER_E2E_WORKFLOW))) {
+    for (const step of job?.steps ?? []) {
+      if (
+        typeof step?.uses !== "string" ||
+        !step.uses.includes("dorny/paths-filter")
+      ) {
+        continue;
+      }
+      const spec = step.with?.filters;
+      if (typeof spec === "string") specs.push(spec);
+    }
+  }
+  expect(
+    specs.length,
+    `${DOCKER_E2E_WORKFLOW} has no \`dorny/paths-filter\` step with a ` +
+      "`filters:` spec — the filter guard below cannot see its subject",
+  ).toBeGreaterThan(0);
+
+  const globs: string[] = [];
+  for (const spec of specs) {
+    const parsed = parse(spec) as Record<string, unknown> | null;
+    const list = parsed?.[filter];
+    if (Array.isArray(list)) {
+      for (const g of list) if (typeof g === "string") globs.push(g);
+    }
+  }
+  expect(
+    globs.length,
+    `the \`${filter}:\` paths filter in ${DOCKER_E2E_WORKFLOW} is missing or ` +
+      "empty — a guard over an empty list asserts nothing",
+  ).toBeGreaterThan(0);
+  return globs;
 }
 
 describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", () => {
@@ -1320,10 +1449,10 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
     // excuses the old name while the new one goes unrun. Force the edit.
     expect(
       NOT_A_PROBE.filter((f) => !onDisk.includes(f)),
-      `NOT_A_PROBE names ${
-        DOCKER_E2E_WORKFLOW
-      } exemptions that no longer exist in tests/docker — the allowlist ` +
-        "outlived a rename or deletion and must be edited deliberately",
+      "these NOT_A_PROBE entries name files that no longer exist in " +
+        `tests/docker, so they excuse nothing from a ${DOCKER_E2E_WORKFLOW} ` +
+        "run step — the allowlist outlived a rename or deletion and must be " +
+        "edited deliberately",
     ).toEqual([]);
 
     // The INVERSE, and the one that makes NOT_A_PROBE more than an unverified
@@ -1390,45 +1519,106 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
     ).toEqual([]);
   });
 
-  it("every docker-e2e.yml run step points at a test file that still exists", () => {
+  it("every guarded workflow's run steps point at test files that still exist", () => {
     // Catches the reverse drift for NON-hindsight steps too (the set-identity
-    // assert above only ranges over `hindsight-*`).
+    // assert above only ranges over `hindsight-*`), and for the sibling
+    // workflows the guard used to ignore entirely (#4651).
     const dir = dockerTestDir();
-    const stale = workflowRunSteps().filter((f) => !dir.includes(f));
+    for (const wf of GUARDED_WORKFLOWS) {
+      const stale = workflowRunSteps(wf).filter((f) => !dir.includes(f));
+      expect(
+        stale,
+        `${wf} runs ${stale.join(", ")} — tests/docker files that do not ` +
+          "exist; the step outlived a deletion or rename",
+      ).toEqual([]);
+    }
+  });
+
+  // The other half of #4624's failure family. The set-identity assert above
+  // proves every probe HAS a run step; it says nothing about whether editing
+  // that probe TRIGGERS the job. The `hindsight:` paths filter enumerates all
+  // of them individually, so a probe added to the run steps but not to the
+  // filter never runs on its own edit — it waits for the merge queue, which is
+  // exactly the "guard exists, enumeration drifts" shape.
+  //
+  // If the enumeration is ever replaced by a directory glob, delete it AND
+  // this expectation together, deliberately: a glob that no longer names test
+  // files makes this assert red rather than silently weakening it.
+  it("the `hindsight:` paths filter and the probe job's run steps agree", () => {
+    const prefix = "tests/docker/";
+    const filtered = [
+      ...new Set(
+        pathsFilterGlobs(HINDSIGHT_FILTER)
+          .filter((g) => g.startsWith(prefix) && g.endsWith(".test.ts"))
+          .map((g) => g.slice(prefix.length)),
+      ),
+    ].sort();
+    const { name, job } = hindsightProbeJob();
+    const ran = [
+      ...new Set(liveRunSteps(job).flatMap(vitestTargets)),
+    ].sort();
+    expect(ran.length, `the ${name} job runs no tests/docker suites`)
+      .toBeGreaterThan(0);
+
+    const unfiltered = ran.filter((f) => !filtered.includes(f));
     expect(
-      stale,
-      `these ${DOCKER_E2E_WORKFLOW} steps run tests/docker files that do not ` +
-        "exist — the step outlived a deletion or rename",
+      unfiltered,
+      `the ${name} job runs ${unfiltered.join(", ")} but the ` +
+        `\`${HINDSIGHT_FILTER}:\` paths filter does not list them — editing ` +
+        "one of them does not trigger the job, so it goes unproven until the " +
+        `merge queue; add '${prefix}<file>' to the filter`,
     ).toEqual([]);
+
+    const unrun = filtered.filter((f) => !ran.includes(f));
+    expect(
+      unrun,
+      `the \`${HINDSIGHT_FILTER}:\` paths filter lists ${unrun.join(", ")} ` +
+        `but the ${name} job does not run them — the filter entry outlived a ` +
+        "rename, a deletion, or a run step that was never added",
+    ).toEqual([]);
+
+    expect(ran).toEqual(filtered);
   });
 
   it("this probe's containers are reaped by the label-scoped teardown", () => {
-    const workflow = readFileSync(
-      resolve(root, ".github/workflows/docker-e2e.yml"),
-      "utf8",
+    // Job-scoped and YAML-PARSED (#4651): the raw-text split this used to do
+    // matched a commented-out `run:` line, so disabling this probe's own run
+    // step left the guard green. Not exploitable then — the set-identity
+    // assert above went red on the same edit — but a guard whose subject can
+    // be a comment is not a guard.
+    const { name, job } = hindsightProbeJob();
+    const teardowns = (job.steps ?? [])
+      .filter(
+        (s) =>
+          typeof s?.name === "string" &&
+          s.name.includes("Label-scoped teardown"),
+      )
+      .map((s) =>
+        typeof s.run === "string"
+          ? s.run
+              .split("\n")
+              .filter((line) => !line.trim().startsWith("#"))
+              .join("\n")
+          : "",
+      );
+    expect(
+      teardowns.length,
+      `the ${name} job has no \`Label-scoped teardown\` step`,
+    ).toBeGreaterThan(0);
+
+    const phases = teardowns.flatMap((run) =>
+      (run.split("for phase in ")[1]?.split("; do")[0] ?? "")
+        .split(/\s+/)
+        .filter(Boolean),
     );
-    // Scope to the JOB that actually runs this probe: docker-e2e.yml has more
-    // than one `Label-scoped teardown` step (one per job), and a phase listed
-    // in some OTHER job's teardown reaps nothing here.
-    const runStep = `npx vitest run tests/docker/${TEST_PHASE}.test.ts`;
-    const jobs = workflow.split(/^ {2}(?=[A-Za-z0-9_-]+:$)/m);
-    const job = jobs.find((j) => j.includes(runStep));
     expect(
-      job,
-      `no docker-e2e.yml job runs \`${runStep}\``,
-    ).toBeTruthy();
-    const teardown = (job ?? "")
-      .split("Label-scoped teardown")[1]
-      ?.split("for phase in ")[1]
-      ?.split("; do")[0];
-    expect(
-      teardown,
-      "the job that runs this probe has no `for phase in ...` label-scoped teardown",
-    ).toBeTruthy();
+      phases.length,
+      `the ${name} job's teardown has no \`for phase in ...\` phase list`,
+    ).toBeGreaterThan(0);
     // Both arms label with TEST_PHASE, including the SQL arm's pg sidecar, so
     // one entry reaps everything this file starts.
     expect(
-      (teardown ?? "").split(/\s+/),
+      phases,
       `${TEST_PHASE} is missing from the teardown phase list, so a crashed run ` +
         "leaves its containers (and the SQL arm's Postgres) on the runner",
     ).toContain(TEST_PHASE);
