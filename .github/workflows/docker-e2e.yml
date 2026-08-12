@@ -549,6 +549,23 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-graph-maintenance-retry-storm.test.ts
 
+      - name: Run the hindsight graph-maintenance bounded-sweep probe (RED/GREEN, must not skip)
+        # The bounded-sweep fix, and the ONLY place it is really executed. The
+        # bakes test is grep-on-file; the properties that matter are all
+        # behavioural — that the caller actually LOOPS, that the cursor strictly
+        # ADVANCES, that the shrink retries the SAME cursor, that slice_count is
+        # derived from the bank size the job measured (a fixed count would put
+        # quiet banks on a weeks-long rotation, since this job is demand-driven,
+        # not timed), and that the `_SWEEP_MAX_PAGES` tripwire actually fires.
+        #
+        # Its SECOND arm executes the shipping sweep statement against the
+        # digest-pinned Postgres pulled above: a substring check cannot tell a
+        # hash-slice PARTITION from a filter that puts every row in slice 0, and
+        # `AND 0 * (...)` was green against the string-only version.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts
+
       - name: Run the hindsight pg_search tokenizer-drift probe (RED/GREEN, must not skip)
         # Epic #4474 finding C1. The bakes test can only see that the patch TEXT
         # is present; it cannot see the outcome that matters — that the shipping
@@ -738,7 +755,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-graph-maintenance-retry-storm hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-graph-maintenance-retry-storm hindsight-graph-maintenance-bounded-sweep hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

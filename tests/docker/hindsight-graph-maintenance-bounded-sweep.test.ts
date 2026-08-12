@@ -85,7 +85,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -1016,6 +1016,73 @@ describe("Dockerfile.hindsight bounded-sweep probe is real, not a silent skip", 
 
   it("pins the SQL arm's Postgres by digest as well", () => {
     expect(PG_IMAGE).toMatch(/@sha256:[0-9a-f]{64}$/);
+  });
+
+  // Caught for real: this probe shipped with its paths-filter entry but NO run
+  // step, so `SWITCHROOM_REQUIRE_HINDSIGHT_PROBE` was never set for it in CI and
+  // its entire hard-fail-instead-of-skip discipline was inert — the suite would
+  // have silently green-skipped on every runner without the 6.4GB image. The
+  // guard is written over EVERY probe rather than this one, so the next probe
+  // cannot repeat it.
+  it("every probe that demands a real run has a workflow step that gives it one", () => {
+    const workflow = readFileSync(
+      resolve(root, ".github/workflows/docker-e2e.yml"),
+      "utf8",
+    );
+    const probes = readdirSync(resolve(root, "tests/docker"))
+      .filter((f) => f.endsWith(".test.ts"))
+      .filter((f) =>
+        readFileSync(resolve(root, "tests/docker", f), "utf8").includes(
+          "SWITCHROOM_REQUIRE_HINDSIGHT_PROBE",
+        ),
+      );
+    // Sanity: the discovery itself must not silently find nothing.
+    expect(probes.length).toBeGreaterThan(5);
+    expect(probes).toContain(
+      "hindsight-graph-maintenance-bounded-sweep.test.ts",
+    );
+
+    const missing = probes.filter(
+      (f) => !workflow.includes(`npx vitest run tests/docker/${f}`),
+    );
+    expect(
+      missing,
+      `these probes read SWITCHROOM_REQUIRE_HINDSIGHT_PROBE but no docker-e2e.yml ` +
+        `step runs them, so the env var is never set and their hard-fail ` +
+        `discipline is inert: ${missing.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("this probe's containers are reaped by the label-scoped teardown", () => {
+    const workflow = readFileSync(
+      resolve(root, ".github/workflows/docker-e2e.yml"),
+      "utf8",
+    );
+    // Scope to the JOB that actually runs this probe: docker-e2e.yml has more
+    // than one `Label-scoped teardown` step (one per job), and a phase listed
+    // in some OTHER job's teardown reaps nothing here.
+    const runStep = `npx vitest run tests/docker/${TEST_PHASE}.test.ts`;
+    const jobs = workflow.split(/^ {2}(?=[A-Za-z0-9_-]+:$)/m);
+    const job = jobs.find((j) => j.includes(runStep));
+    expect(
+      job,
+      `no docker-e2e.yml job runs \`${runStep}\``,
+    ).toBeTruthy();
+    const teardown = (job ?? "")
+      .split("Label-scoped teardown")[1]
+      ?.split("for phase in ")[1]
+      ?.split("; do")[0];
+    expect(
+      teardown,
+      "the job that runs this probe has no `for phase in ...` label-scoped teardown",
+    ).toBeTruthy();
+    // Both arms label with TEST_PHASE, including the SQL arm's pg sidecar, so
+    // one entry reaps everything this file starts.
+    expect(
+      (teardown ?? "").split(/\s+/),
+      `${TEST_PHASE} is missing from the teardown phase list, so a crashed run ` +
+        "leaves its containers (and the SQL arm's Postgres) on the runner",
+    ).toContain(TEST_PHASE);
   });
 });
 
