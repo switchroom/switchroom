@@ -131,6 +131,50 @@ function findCollidingPair(): [string, string] {
   throw new Error("no collision found in 20000 candidates (impossible for 999 buckets)");
 }
 
+/**
+ * Split a generated compose file into the services it emits and the subset
+ * of those that carry `switchroom.fleet: "<fleet>"`.
+ *
+ * Both arrays come back sorted so callers assert a SET, not emit order.
+ * Counting label lines (the pre-#4637 shape) reports drift as
+ * `expected 5 to be 4`, which names nothing and cannot tell "a new service
+ * arrived" from "a service lost its label"; comparing the two arrays does
+ * both, and vitest prints the offending name in the diff.
+ *
+ * Parsing is intentionally structural: service keys are the 2-space-indented
+ * mapping keys under the top-level `services:` block, and a label line binds
+ * to the service key that most recently opened.
+ */
+function servicesByFleetLabel(
+  yaml: string,
+  fleet: string,
+): { all: string[]; labelled: string[] } {
+  const all: string[] = [];
+  const labelled: string[] = [];
+  let inServices = false;
+  let current: string | null = null;
+  for (const line of yaml.split("\n")) {
+    // A non-indented, non-comment line opens a new top-level block
+    // (`services:`, `volumes:`, ...).
+    if (/^[^\s#]/.test(line)) {
+      inServices = line.startsWith("services:");
+      current = null;
+      continue;
+    }
+    if (!inServices) continue;
+    const key = /^ {2}([A-Za-z0-9._-]+):\s*$/.exec(line);
+    if (key) {
+      current = key[1];
+      all.push(current);
+      continue;
+    }
+    if (current && line.trim() === `switchroom.fleet: "${fleet}"`) {
+      labelled.push(current);
+    }
+  }
+  return { all: all.sort(), labelled: labelled.sort() };
+}
+
 describe("assertNoAgentUidCollision — sec WS6-F4 (#1419)", () => {
   it("passes for a distinct-UID fleet", () => {
     expect(() =>
@@ -334,16 +378,50 @@ describe("generateCompose", () => {
     expect(out).not.toContain('switchroom.fleet: "switchroom"');
   });
 
-  it("default containerNamePrefix preserves the production fleet label", () => {
-    // Critical for productionFleetIsLive() to keep working: the
-    // default-emit path MUST still stamp `switchroom.fleet=switchroom`
-    // on every service so `docker ps --filter
-    // label=switchroom.fleet=switchroom` finds them.
-    const out = generateCompose({ config: makeConfig({ coach: {} }) });
-    // One label line per service: vault-broker + approval-kernel +
-    // switchroom-auth-broker + 1 agent = 4.
-    const matches = out.match(/switchroom\.fleet: "switchroom"/g) ?? [];
-    expect(matches.length).toBe(4);
+  // Critical for productionFleetIsLive() to keep working: the default-emit
+  // path MUST stamp `switchroom.fleet=switchroom` on EVERY service so
+  // `docker ps --filter label=switchroom.fleet=switchroom` finds them.
+  //
+  // Both cases pin `voiceEngine` explicitly. Omitting it sends the generator
+  // down `opts.voiceEngine ?? loadHostCapabilities()?.voice.engine ??
+  // "cloud"` (src/agents/compose.ts), which reads the DEVELOPER'S
+  // ~/.switchroom/host-capabilities.json — so on a GPU box the extra
+  // `voice-sidecar` service appeared and the old count assertion failed with
+  // `expected 5 to be 4` (#4637). Pinning the option is what the option is
+  // for, and asserting the service SET (not a magic count) means the next
+  // drift fails with a diff that NAMES the service that arrived or lost its
+  // label.
+  it("default containerNamePrefix labels every service — cloud verdict", () => {
+    const out = generateCompose({
+      config: makeConfig({ coach: {} }),
+      voiceEngine: "cloud",
+    });
+    const { all, labelled } = servicesByFleetLabel(out, "switchroom");
+    expect(all).toEqual([
+      "agent-coach",
+      "approval-kernel",
+      "switchroom-auth-broker",
+      "vault-broker",
+    ]);
+    expect(labelled).toEqual(all);
+  });
+
+  // The `local` companion: nothing else covers that the OPTIONAL service is
+  // labelled at all, and productionFleetIsLive() depends on it being found.
+  it("default containerNamePrefix labels the voice-sidecar too — local verdict", () => {
+    const out = generateCompose({
+      config: makeConfig({ coach: {} }),
+      voiceEngine: "local",
+    });
+    const { all, labelled } = servicesByFleetLabel(out, "switchroom");
+    expect(all).toEqual([
+      "agent-coach",
+      "approval-kernel",
+      "switchroom-auth-broker",
+      "vault-broker",
+      "voice-sidecar",
+    ]);
+    expect(labelled).toEqual(all);
   });
 
   it("emits agents in sorted order", () => {
