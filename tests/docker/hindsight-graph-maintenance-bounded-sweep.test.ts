@@ -179,6 +179,7 @@ indistinguishable from a red assertion.
 
 import asyncio
 import contextlib
+import logging
 import sys
 import types
 from dataclasses import dataclass
@@ -563,9 +564,13 @@ if _real_backoff is not None:
 class FlakyStore(FakeStore):
     """Serves pages, then raises a retryable non-timeout error fail_times times.
 
-    10 > the 9 attempts the per-page budget allows, so the 10th failure is served
-    to the re-entry the slice-level budget performs — and that call is the only
-    observation that can distinguish a resume from a restart.
+    Each slice-level re-entry costs 9 more failures (a fresh per-page budget),
+    so fail_times=19 buys TWO of them: failures 1-9 exhaust the first per-page
+    budget, 10-18 the second, and the 19th is served to the third attempt,
+    after which the run completes. Two is the point — a fix that reset the
+    cursor on the SECOND re-entry only (say, state carried in a local rebound
+    inside the retry wrapper rather than in the enclosing scope) passes a
+    one-re-entry probe.
     """
 
     def __init__(self, pages, fail_after_pages, fail_times):
@@ -603,39 +608,77 @@ def _ticking_clock():
 _r_real_time = gm.time
 gm.time = types.SimpleNamespace(time=_ticking_clock)
 
+# The RESUME is also LOGGED, and the log line is the only signal an operator
+# gets that a slice re-entered. Pinning the format string in the Dockerfile
+# source proves the text was written; it cannot prove the line is reachable or
+# that its fields interpolate to the truth, so capture what the shipping code
+# actually emits. Attached to the module's own logger object rather than the
+# root: that is the one the patched code calls.
+class _ResumeLogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.NOTSET)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+_r_log = _ResumeLogCapture()
+_r_logger = getattr(gm, "logger", None)
+_r_logger_level = _r_logger.level if _r_logger is not None else None
+if _r_logger is not None:
+    _r_logger.addHandler(_r_log)
+    _r_logger.setLevel(logging.DEBUG)
+check("R_module_has_a_logger", _r_logger is not None,
+      "graph_maintenance has no module-level 'logger', so the RESUMING line cannot "
+      "be captured — the runtime log assertions below would pass vacuously")
+
 try:
     flaky = FlakyStore(
         [page(2, 1000, "k1a", "k1b"), page(3, 1000, "k2a", "k2b"), page(1, 400, "k3a", "k3b")],
         fail_after_pages=2,
-        fail_times=10,
+        fail_times=19,
     )
     res = guard("R_job_runs", lambda: run_job(flaky)) or {}
     cursors = [(c.get("after_entity_id_1"), c.get("after_entity_id_2")) for c in flaky.calls]
+    # The first Pass 3 call of each slice-level re-entry: index 11 after the
+    # first per-page budget (2 pages + 9 attempts), index 20 after the second
+    # (9 more). Everything below that indexes cursors is guarded on the call
+    # count, so a shape change reports as a count mismatch instead of an
+    # IndexError that reads like a crash.
+    RE_ENTRY_CALLS = (11, 20)
 
     # Precondition: the error really did exhaust the per-page budget and reach
-    # the slice-level one. Without it the resume check below could pass
+    # the slice-level one TWICE. Without it the resume checks below could pass
     # vacuously on a run where the outer retry never fired at all.
-    check("R_error_escaped_the_page_budget", flaky.failed == 10,
-          f"the store raised {flaky.failed} time(s), expected 10 — nine to exhaust the "
-          "per-page retry_with_backoff and a tenth served to the slice-level re-entry")
-    check("R_outer_retry_re_entered", len(flaky.calls) == 13,
-          f"made {len(flaky.calls)} Pass 3 call(s), expected 13: 2 pages + 9 failed "
-          f"per-page attempts + 1 failed attempt after re-entry + 1 final page; "
-          f"cursors {cursors}")
+    check("R_error_escaped_the_page_budget", flaky.failed == 19,
+          f"the store raised {flaky.failed} time(s), expected 19 — nine to exhaust the "
+          "first per-page retry_with_backoff, nine more for the second, and a "
+          "nineteenth served to the third attempt")
+    check("R_outer_retry_re_entered_twice", len(flaky.calls) == 22,
+          f"made {len(flaky.calls)} Pass 3 call(s), expected 22: 2 pages + 9 failed "
+          f"per-page attempts + 9 more after the first re-entry + 1 failed attempt "
+          f"after the second + 1 final page; cursors {cursors}")
 
     # THE check. Exactly ONE call in the whole run may carry a null cursor: the
-    # very first page. A second one is the slice restarting from the top.
+    # very first page. A second one is the slice restarting from the top — and
+    # over TWO re-entries a fix that only holds once shows up as a third.
     check("R_resumes_instead_of_restarting", cursors.count((None, None)) == 1,
           f"{cursors.count((None, None))} Pass 3 call(s) ran with a null cursor; only "
           "the first page may. A second means the slice-level retry restarted from the "
           f"top and re-swept every committed page (#4635). Cursors: {cursors}")
-    if len(cursors) == 13:
+    if len(cursors) == 22:
         # Against the LITERAL cursor the last committed page returned, not
         # against another observation: two None cursors compared to each other
-        # are "equal" and would pass vacuously on the broken shape.
-        check("R_re_entry_uses_the_last_committed_cursor", cursors[11] == ("k2a", "k2b"),
-              f"the first call after the slice-level re-entry ran at {cursors[11]}; it "
-              "must be the literal ('k2a', 'k2b') the last committed page returned")
+        # are "equal" and would pass vacuously on the broken shape. Asserted at
+        # BOTH re-entries: on origin/main the cursor does not merely reset once,
+        # it resets again on the second re-entry, so a single-re-entry probe
+        # cannot see a fix that decays.
+        check("R_re_entry_uses_the_last_committed_cursor",
+              [cursors[i] for i in RE_ENTRY_CALLS] == [("k2a", "k2b"), ("k2a", "k2b")],
+              f"the first calls after the two slice-level re-entries ran at "
+              f"{[cursors[i] for i in RE_ENTRY_CALLS]}; both must be the literal "
+              "('k2a', 'k2b') the last committed page returned")
     # The count survives the re-entry too: pages 1 and 2 COMMITTED their deletes
     # before the failure, so a deleted counter that restarts at 0 under-reports
     # rows that really were pruned.
@@ -654,10 +697,63 @@ try:
           f"slice_indexes {sorted({c.get('slice_index') for c in flaky.calls}, key=str)}, "
           f"slice_counts {sorted({c.get('slice_count') for c in flaky.calls}, key=str)}")
     check("R_bank_sized_once_across_re_entry", flaky.size_calls == 1,
-          f"the bank was sized {flaky.size_calls} time(s); the re-entry must not re-count "
-          "it, because a different count is a different slice_count")
+          f"the bank was sized {flaky.size_calls} time(s); the re-entries must not "
+          "re-count it, because a different count is a different slice_count")
+
+    # ---- the RESUMING log, as EMITTED. --------------------------------------
+    # One line per re-entry, at WARNING, and every interpolated field checked
+    # against the parameters of the Pass 3 call that re-entry actually made —
+    # not against a restatement of the format string. A field that names the
+    # wrong variable (cursor components swapped, pages where deleted was
+    # meant, a stale slice) is invisible to a source-text pin and red here.
+    resume_logs = [r for r in _r_log.records
+                   if "cooccurrence sweep RESUMING slice" in r.getMessage()]
+    check("R_resume_is_logged_once_per_re_entry", len(resume_logs) == 2,
+          f"the shipping code emitted {len(resume_logs)} RESUMING line(s), expected 2 "
+          f"— one per slice-level re-entry. Captured: "
+          f"{[r.getMessage() for r in _r_log.records]}")
+    check("R_resume_is_logged_at_warning",
+          bool(resume_logs) and all(r.levelno == logging.WARNING for r in resume_logs),
+          f"levels {[r.levelname for r in resume_logs]}; reaching a re-entry means a "
+          "page burned its whole 9-attempt budget, which must not be logged below "
+          "WARNING or an operator never sees it")
+    if len(resume_logs) == 2 and len(flaky.calls) == 22:
+        for n, (rec, idx) in enumerate(zip(resume_logs, RE_ENTRY_CALLS), start=1):
+            msg = rec.getMessage()
+            call = flaky.calls[idx]
+            # An f-string whose braces survived into the output rendered NO
+            # field at all; every substring check below would still pass on a
+            # line that says "{after_1}".
+            check(f"R{n}_resume_log_is_interpolated", "{" not in msg and "}" not in msg,
+                  f"unrendered braces in the emitted line: {msg!r}")
+            check(f"R{n}_resume_log_names_the_bank", "bank=bank-x" in msg,
+                  f"emitted line does not carry bank=bank-x: {msg!r}")
+            expected_slice = f"RESUMING slice {call['slice_index']}/{call['slice_count']} "
+            check(f"R{n}_resume_log_slice_matches_the_call", expected_slice in msg,
+                  f"the line says something other than {expected_slice!r}, which is the "
+                  f"slice the next Pass 3 call actually used: {msg!r}")
+            expected_cursor = (f"at cursor ({call['after_entity_id_1']}, "
+                               f"{call['after_entity_id_2']}) ")
+            check(f"R{n}_resume_log_cursor_matches_the_call", expected_cursor in msg,
+                  f"the line does not say {expected_cursor!r} — the cursor an operator "
+                  f"reads must be the cursor the resume used: {msg!r}")
+            # Committed work at both re-entries is the same: pages 1 and 2, 2+3
+            # rows. A counter that reset would report 0 here AND under-report
+            # the run total, so this is the same defect seen from the log side.
+            check(f"R{n}_resume_log_reports_committed_work",
+                  "after 2 page(s) and 5 row(s) already committed" in msg,
+                  f"expected the two committed pages and their 5 rows: {msg!r}")
+            check(f"R{n}_resume_log_reports_batch_size",
+                  f"batch_size {call['batch_size']}," in msg,
+                  f"the line does not report batch_size {call['batch_size']}: {msg!r}")
+            check(f"R{n}_resume_log_carries_the_operation_id",
+                  "operation_id=op-1" in msg,
+                  f"no operation_id=op-1 to correlate with async_operations: {msg!r}")
 finally:
     gm.time = _r_real_time
+    if _r_logger is not None:
+        _r_logger.removeHandler(_r_log)
+        _r_logger.setLevel(_r_logger_level)
     if _real_backoff is not None:
         _db_utils._backoff_delay = _real_backoff
 
@@ -1478,7 +1574,9 @@ describe.skipIf(!dockerOk || !imageOk)(
       // #4635 — there is no per-page budget to exhaust and no cursor to resume
       // from, because there is no paging loop at all.
       expect(stdout).toContain("R_error_escaped_the_page_budget=FAIL");
-      expect(stdout).toContain("R_outer_retry_re_entered=FAIL");
+      expect(stdout).toContain("R_outer_retry_re_entered_twice=FAIL");
+      // …and nothing announces a resume, because nothing resumes.
+      expect(stdout).toContain("R_resume_is_logged_once_per_re_entry=FAIL");
     }, 240_000);
 
     it("patched is GREEN — bounded pages, an advancing cursor, a rotating slice, a shrinking retry", async () => {
@@ -1556,16 +1654,35 @@ describe.skipIf(!dockerOk || !imageOk)(
       // re-entry must RESUME from the last committed cursor. Before the fix it
       // restarted from None: the two committed pages were swept again (up to 9x
       // a slice) and `deleted` restarted at 0, under-reporting the prune.
+      // TWO re-entries, not one: a fix that holds the first time and decays the
+      // second passes a single-re-entry probe. On unpatched upstream the drift
+      // compounds across three different slices.
       expect(stdout).toContain("R_error_escaped_the_page_budget=OK");
-      expect(stdout).toContain("R_outer_retry_re_entered=OK");
+      expect(stdout).toContain("R_outer_retry_re_entered_twice=OK");
       expect(stdout).toContain("R_resumes_instead_of_restarting=OK");
       expect(stdout).toContain("R_re_entry_uses_the_last_committed_cursor=OK");
       expect(stdout).toContain("R_deleted_count_survives_re_entry=OK");
       // slice_index is a function of time.time(): re-deriving it on the re-entry
       // could carry the old slice's cursor into a DIFFERENT slice and skip every
-      // row below it. Pinned, not recomputed.
+      // row below it. Pinned, not recomputed — across BOTH re-entries.
       expect(stdout).toContain("R_slice_is_pinned_across_re_entry=OK");
       expect(stdout).toContain("R_bank_sized_once_across_re_entry=OK");
+      // The RESUMING line the operator reads, as EMITTED — one per re-entry,
+      // at WARNING, every field checked against the parameters of the Pass 3
+      // call that re-entry actually made. The Dockerfile's source pin proves
+      // the format string was written; only this proves it renders the truth.
+      expect(stdout).toContain("R_module_has_a_logger=OK");
+      expect(stdout).toContain("R_resume_is_logged_once_per_re_entry=OK");
+      expect(stdout).toContain("R_resume_is_logged_at_warning=OK");
+      for (const n of [1, 2]) {
+        expect(stdout).toContain(`R${n}_resume_log_is_interpolated=OK`);
+        expect(stdout).toContain(`R${n}_resume_log_names_the_bank=OK`);
+        expect(stdout).toContain(`R${n}_resume_log_slice_matches_the_call=OK`);
+        expect(stdout).toContain(`R${n}_resume_log_cursor_matches_the_call=OK`);
+        expect(stdout).toContain(`R${n}_resume_log_reports_committed_work=OK`);
+        expect(stdout).toContain(`R${n}_resume_log_reports_batch_size=OK`);
+        expect(stdout).toContain(`R${n}_resume_log_carries_the_operation_id=OK`);
+      }
 
       // The constants are what this file's hard-coded expectations assume.
       expect(stdout).toContain("C_batch_size=OK");
