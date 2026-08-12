@@ -532,8 +532,21 @@ PGPASSWORD="$PW" "$PSQL" -U "$U" -h /tmp -p "$P" -d "$DB" -tAc \\
  * pair failing more slowly than the retention window can accumulate three
  * attempts — for a 30-day horizon, slower than roughly one attempt per 10
  * days. That pair is still caught the moment a third attempt lands inside the
- * window, and `pending-consolidation-depth` (R7) covers it from the other
- * side, on rising unconsolidated depth rather than on failure counting.
+ * window. Do NOT read `pending-consolidation-depth` (R7) as a general backstop
+ * for it: R7 counts `memory_units` rows with `consolidated_at IS NULL AND
+ * fact_type IN ('experience','world')`, keyed by bank alone, so it moves on
+ * the CONSOLIDATION BACKLOG — which a wedged `consolidation` pair raises, but
+ * so does retain volume outrunning consolidation, consolidation never being
+ * scheduled, or a bulk re-consolidation reset. What it cannot do is move for a
+ * `graph_maintenance` pair: that path never writes the column — verified
+ * against `ghcr.io/switchroom/switchroom-hindsight:v0.21.7`, where
+ * `engine/graph_maintenance.py` contains zero references to `consolidated_at`
+ * (it drains `graph_maintenance_queue`, i.e. entity relinking) and dispatches
+ * as its own `task_type` branch alongside `consolidation`, not beneath it.
+ * Fixture 5 and both real #4618 pairs (`overlord/graph_maintenance`,
+ * `klanker/graph_maintenance`) are exactly that op type, so for them the
+ * third-attempt-inside-the-window path is the whole of the coverage. The
+ * residual hole that leaves is tracked as #4644.
  */
 export function bankConsolidationQuery(retentionDaysSql: string): string {
   return `SELECT 'S|'||a.bank_id||'|'||a.operation_type||'|'||count(*)||'|'||extract(epoch from (now()-max(a.created_at)))::bigint

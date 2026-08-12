@@ -165,11 +165,16 @@ jobs:
             # semantics regression through on the hermetic string pins alone.
             # It gets a job here — the only workflow that already treats a
             # docker-dependent probe as a gate.
+            #
+            # The whole directory, not a file list: the enumeration already
+            # omitted `types.ts`, which the probe imports and the gated test
+            # pulls in transitively, so a change there would not have run the
+            # gate. A list has to be maintained by whoever next adds a file to
+            # the module and silently loses coverage when they don't; the glob
+            # cannot drift. It costs at most one extra 34s job on a change to
+            # a file the gated test does not read.
             hindsightwatch:
-              - 'src/hindsight-watch/probe.ts'
-              - 'src/hindsight-watch/evaluate.ts'
-              - 'src/hindsight-watch/thresholds.ts'
-              - 'src/hindsight-watch/streak-retention-floor.pg.test.ts'
+              - 'src/hindsight-watch/**'
               - '.github/workflows/docker-e2e.yml'
 
   # ─── Sharded docker e2e run ───────────────────────────────────────
