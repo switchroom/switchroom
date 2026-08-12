@@ -536,6 +536,130 @@ check("B4_tripwire_returns_not_raises", res.get("stale_cooccurrences_pruned") ==
       f"got {res.get('stale_cooccurrences_pruned')}; the tripwire must return the rows it "
       "did prune, not discard them")
 
+# --- R (#4635): the SLICE-LEVEL retry must RESUME, not restart from the top.
+#
+# There are THREE budgets around Pass 3: the shrink ladder (timeouts only), the
+# PER-PAGE retry_with_backoff(max_retries=8), and the slice-level
+# retry_with_backoff(_run_cooccurrence_prune, max_retries=8). A retryable
+# NON-timeout error is retried nine times by the per-page budget; only when all
+# nine fail does it reach the slice-level one, which RE-ENTERS the helper. If the
+# cursor lives in the helper's own frame, that re-entry restarts the slice from
+# None and re-sweeps every page already committed — up to 9x a slice — and
+# the deleted counter restarts at 0, so the run also UNDER-REPORTS its prune.
+#
+# ConnectionResetError is an OSError, so db_utils._is_retryable accepts it and
+# #4604's retry_timeouts=False does NOT exclude it: exactly the class this check
+# exists for. The backoff DELAY is neutralised (nine real jittered sleeps capped
+# at DEFAULT_MAX_DELAY = 5.0 would add ~20 s to the probe for no signal); the
+# retry COUNTING is untouched, which is the part under test.
+from hindsight_api.engine import db_utils as _db_utils
+
+_real_backoff = getattr(_db_utils, "_backoff_delay", None)
+if _real_backoff is not None:
+    _db_utils._backoff_delay = lambda *a, **k: 0.0
+
+
+class FlakyStore(FakeStore):
+    """Serves pages, then raises a retryable non-timeout error fail_times times.
+
+    10 > the 9 attempts the per-page budget allows, so the 10th failure is served
+    to the re-entry the slice-level budget performs — and that call is the only
+    observation that can distinguish a resume from a restart.
+    """
+
+    def __init__(self, pages, fail_after_pages, fail_times):
+        super().__init__(pages)
+        self.fail_after_pages = fail_after_pages
+        self.fail_times = fail_times
+        self.failed = 0
+        self.served = 0
+
+    async def prune_stale_cooccurrences(self, **kw):
+        self.calls.append(kw)
+        if self.served >= self.fail_after_pages and self.failed < self.fail_times:
+            self.failed += 1
+            raise ConnectionResetError("transient connection reset")
+        idx = self.served
+        self.served += 1
+        if idx >= len(self.pages):
+            return CooccurrenceSweepBatch(0, 0, None, None)
+        return self.pages[idx]
+
+
+# The clock ADVANCES a full _SWEEP_SLICE_SECONDS window on every read. Without
+# that, R_slice_is_pinned_across_re_entry passes vacuously — a re-entry that
+# genuinely re-derives slice_index from a real-but-unmoved clock lands on the
+# same slice, and the check cannot see the bug it exists to guard. A ticking
+# clock makes "derived once" and "derived twice" observably different.
+_r_clock = {"n": 0}
+
+
+def _ticking_clock():
+    _r_clock["n"] += 1
+    return float(_r_clock["n"] * 120)
+
+
+_r_real_time = gm.time
+gm.time = types.SimpleNamespace(time=_ticking_clock)
+
+try:
+    flaky = FlakyStore(
+        [page(2, 1000, "k1a", "k1b"), page(3, 1000, "k2a", "k2b"), page(1, 400, "k3a", "k3b")],
+        fail_after_pages=2,
+        fail_times=10,
+    )
+    res = guard("R_job_runs", lambda: run_job(flaky)) or {}
+    cursors = [(c.get("after_entity_id_1"), c.get("after_entity_id_2")) for c in flaky.calls]
+
+    # Precondition: the error really did exhaust the per-page budget and reach
+    # the slice-level one. Without it the resume check below could pass
+    # vacuously on a run where the outer retry never fired at all.
+    check("R_error_escaped_the_page_budget", flaky.failed == 10,
+          f"the store raised {flaky.failed} time(s), expected 10 — nine to exhaust the "
+          "per-page retry_with_backoff and a tenth served to the slice-level re-entry")
+    check("R_outer_retry_re_entered", len(flaky.calls) == 13,
+          f"made {len(flaky.calls)} Pass 3 call(s), expected 13: 2 pages + 9 failed "
+          f"per-page attempts + 1 failed attempt after re-entry + 1 final page; "
+          f"cursors {cursors}")
+
+    # THE check. Exactly ONE call in the whole run may carry a null cursor: the
+    # very first page. A second one is the slice restarting from the top.
+    check("R_resumes_instead_of_restarting", cursors.count((None, None)) == 1,
+          f"{cursors.count((None, None))} Pass 3 call(s) ran with a null cursor; only "
+          "the first page may. A second means the slice-level retry restarted from the "
+          f"top and re-swept every committed page (#4635). Cursors: {cursors}")
+    if len(cursors) == 13:
+        # Against the LITERAL cursor the last committed page returned, not
+        # against another observation: two None cursors compared to each other
+        # are "equal" and would pass vacuously on the broken shape.
+        check("R_re_entry_uses_the_last_committed_cursor", cursors[11] == ("k2a", "k2b"),
+              f"the first call after the slice-level re-entry ran at {cursors[11]}; it "
+              "must be the literal ('k2a', 'k2b') the last committed page returned")
+    # The count survives the re-entry too: pages 1 and 2 COMMITTED their deletes
+    # before the failure, so a deleted counter that restarts at 0 under-reports
+    # rows that really were pruned.
+    check("R_deleted_count_survives_re_entry", res.get("stale_cooccurrences_pruned") == 6,
+          f"got {res.get('stale_cooccurrences_pruned')}, expected 2+3+1=6 — a reset "
+          "counter drops the rows the committed pages already deleted")
+    # The slice must be PINNED across the re-entry. slice_index is derived from
+    # time.time(), so re-deriving it can select a different slice while the cursor
+    # still refers to the old one, skipping every row below that cursor in the new
+    # slice. Correctness, not efficiency. The clock above ticks a full window per
+    # read, so a second derivation lands on a DIFFERENT index and this check sees
+    # it — with a still clock it would pass on the broken shape too.
+    check("R_slice_is_pinned_across_re_entry",
+          len({c.get("slice_index") for c in flaky.calls}) == 1
+          and len({c.get("slice_count") for c in flaky.calls}) == 1,
+          f"slice_indexes {sorted({c.get('slice_index') for c in flaky.calls}, key=str)}, "
+          f"slice_counts {sorted({c.get('slice_count') for c in flaky.calls}, key=str)}")
+    check("R_bank_sized_once_across_re_entry", flaky.size_calls == 1,
+          f"the bank was sized {flaky.size_calls} time(s); the re-entry must not re-count "
+          "it, because a different count is a different slice_count")
+finally:
+    gm.time = _r_real_time
+    if _real_backoff is not None:
+        _db_utils._backoff_delay = _real_backoff
+
 print("PROBE_EXECUTED")
 for f in failures:
     print("FAILURE:", f)
@@ -1179,6 +1303,11 @@ describe.skipIf(!dockerOk || !imageOk)(
       // A timeout is fatal to the pass — there is no page to shrink.
       expect(stdout).toContain("B3_retried_after_timeout=FAIL");
       expect(stdout).toContain("B3_halving_sequence=FAIL");
+
+      // #4635 — there is no per-page budget to exhaust and no cursor to resume
+      // from, because there is no paging loop at all.
+      expect(stdout).toContain("R_error_escaped_the_page_budget=FAIL");
+      expect(stdout).toContain("R_outer_retry_re_entered=FAIL");
     }, 240_000);
 
     it("patched is GREEN — bounded pages, an advancing cursor, a rotating slice, a shrinking retry", async () => {
@@ -1250,6 +1379,22 @@ describe.skipIf(!dockerOk || !imageOk)(
       // out of pages, and returns rather than raising.
       expect(stdout).toContain("B4_tripwire_stops_the_loop=OK");
       expect(stdout).toContain("B4_tripwire_returns_not_raises=OK");
+
+      // R (#4635) — a retryable NON-timeout error that exhausts the per-page
+      // budget reaches the slice-level retry, which RE-ENTERS the helper. That
+      // re-entry must RESUME from the last committed cursor. Before the fix it
+      // restarted from None: the two committed pages were swept again (up to 9x
+      // a slice) and `deleted` restarted at 0, under-reporting the prune.
+      expect(stdout).toContain("R_error_escaped_the_page_budget=OK");
+      expect(stdout).toContain("R_outer_retry_re_entered=OK");
+      expect(stdout).toContain("R_resumes_instead_of_restarting=OK");
+      expect(stdout).toContain("R_re_entry_uses_the_last_committed_cursor=OK");
+      expect(stdout).toContain("R_deleted_count_survives_re_entry=OK");
+      // slice_index is a function of time.time(): re-deriving it on the re-entry
+      // could carry the old slice's cursor into a DIFFERENT slice and skip every
+      // row below it. Pinned, not recomputed.
+      expect(stdout).toContain("R_slice_is_pinned_across_re_entry=OK");
+      expect(stdout).toContain("R_bank_sized_once_across_re_entry=OK");
 
       // The constants are what this file's hard-coded expectations assume.
       expect(stdout).toContain("C_batch_size=OK");

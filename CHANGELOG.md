@@ -35,6 +35,27 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **hindsight: the cooccurrence sweep now RESUMES instead of restarting when the
+  outer retry re-enters.** `_run_cooccurrence_prune` (Pass 3 of
+  `graph_maintenance`, patched in via `docker/Dockerfile.hindsight`) kept its
+  paging cursor, page size, deleted count and rotating slice index in its own
+  frame, while `retry_with_backoff(..., max_retries=8, retry_timeouts=False)`
+  wraps the whole call. A retryable NON-timeout error (connection reset,
+  deadlock, transient pool failure) that outlives the per-page budget therefore
+  restarted the entire slice from cursor `None` — up to 9 full re-sweeps of
+  pages already committed, on a slice that runs 3–6 s on the largest banks. The
+  state is now hoisted into the enclosing scope and reached through `nonlocal`,
+  so a re-entry picks up at the last committed cursor. Two bugs fell out of the
+  same placement: `stale_cooccurrences_pruned` under-reported (the deleted
+  counter reset on every re-entry, so the job reported only the final attempt's
+  deletions), and the slice index was re-derived from the wall clock on
+  re-entry, so a retry that crossed a 120 s window boundary silently swept a
+  DIFFERENT slice and left the original one unfinished until its next rotation.
+  Sizing the bank (`count_bank_cooccurrences`) now also happens exactly once per
+  job rather than once per attempt. No change to `retry_with_backoff` itself —
+  Passes 1 and 2 are byte-for-byte unaffected, and timeouts still take the inner
+  halve-the-page path from #4604.
+
 - **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
   `hindsight-watch-pg-probe`'s `if:` gate carried `push` and `merge_group` but
   not `workflow_dispatch`, unlike its siblings `e2e-shard` and

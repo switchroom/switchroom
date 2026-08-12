@@ -2082,7 +2082,13 @@ describe("Dockerfile.hindsight shape", () => {
       "int(now) // _SWEEP_SLICE_SECONDS % slice_count",
     );
     expect(dockerfile).toContain('"    if total_rows <= _SWEEP_SLICE_TARGET_ROWS:\\n"');
-    expect(dockerfile).toContain('"        slice_count = _sweep_slice_count(total_rows)\\n"');
+    // 12-space indent: since #4635 the derivation sits INSIDE the
+    // `if slice_count is None:` first-entry guard, not at the helper's body
+    // level. Pinning the indent is what stops it drifting back out of the guard
+    // (where a retry would re-derive slice_index from a later clock).
+    expect(dockerfile).toContain(
+      '"            slice_count = _sweep_slice_count(total_rows)\\n"',
+    );
     // …and a fixed count must not come back.
     expect(dockerfile).not.toContain("_SWEEP_SLICE_COUNT = ");
     expect(dockerfile).toMatch(/the paging loop no longer terminates on a short page/);
@@ -2116,6 +2122,48 @@ describe("Dockerfile.hindsight shape", () => {
     // The image build re-checks it as a post-condition on the patched file, so
     // this cannot be satisfied by a comment that says the right thing.
     expect(dockerfile).toMatch(/each page must be its OWN transaction/);
+
+    // ---- B4 (#4635): the slice-level retry must RESUME, not restart. The
+    // helper is wrapped by retry_with_backoff(max_retries=_SWEEP_MAX_RETRIES),
+    // so a retryable NON-timeout error that outlives the per-page budget
+    // RE-ENTERS it. Whether that re-entry resumes or re-sweeps every committed
+    // page comes down to ONE thing a grep can see: which frame owns the cursor.
+    // The initialisers must be at 4-space (enclosing-function) indent…
+    expect(dockerfile).toContain(
+      '"    after_1: str | None = None\\n"\n' +
+        '    "    after_2: str | None = None\\n"',
+    );
+    // …and the helper must declare them nonlocal, or every assignment in the
+    // loop rebinds a fresh local and the enclosing cursor never moves.
+    expect(dockerfile).toContain(
+      '"        nonlocal total_rows, slice_count, slice_index, batch_size\\n"\n' +
+        '    "        nonlocal after_1, after_2, deleted, pages\\n"',
+    );
+    // slice_count doubles as the resumption sentinel: re-deriving the slice on a
+    // retry can land on a DIFFERENT slice (slice_index is a function of
+    // time.time()) while the cursor still refers to the old one — a correctness
+    // bug, not just waste.
+    expect(dockerfile).toContain('"        if slice_count is None:\\n"');
+    // The image build re-checks all of it as a post-condition on the patched
+    // file, including the one-line defeat (re-adding `after_1 = None` inside the
+    // helper), so none of this can be satisfied by a comment.
+    expect(dockerfile).toMatch(
+      /the sweep's progress is not initialised in the scope ENCLOSING/,
+    );
+    expect(dockerfile).toMatch(
+      /no longer declares the sweep state nonlocal/,
+    );
+    expect(dockerfile).toMatch(
+      /re-initialises the sweep state at its own /,
+    );
+    expect(dockerfile).toMatch(
+      /is not guarded by the resumption /,
+    );
+    // The banner must no longer claim this is unfixed.
+    expect(dockerfile).not.toContain("KNOWN, ACCEPTED, NOT FIXED HERE");
+    expect(dockerfile).toContain(
+      "B4 THE OUTER RETRY RESUMES INSTEAD OF RESTARTING (#4635)",
+    );
 
     // Every backend implements the new return shape, including the ones that
     // opt out of paging by reporting scanned=0.
