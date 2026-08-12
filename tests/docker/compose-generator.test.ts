@@ -144,6 +144,33 @@ function findCollidingPair(): [string, string] {
  * Parsing is intentionally structural: service keys are the 2-space-indented
  * mapping keys under the top-level `services:` block, and a label line binds
  * to the service key that most recently opened.
+ *
+ * EMIT SHAPE THIS HELPER PINS. It pattern-matches generated text, so it is
+ * coupled to how `src/agents/compose.ts` emits a service block. The contract,
+ * and why each clause is load-bearing:
+ *
+ *   1. A top-level block opens at column 0 (`name:`, `services:`, `volumes:`,
+ *      `networks:` — compose.ts:1515, :1517, :2075, :2134). Only lines after
+ *      `services:` and before the next column-0 line count. That gate is what
+ *      keeps the volume and network keys (compose.ts:2077-2136) — also
+ *      2-space-indented and colon-terminated — out of `all`.
+ *   2. A service key is EXACTLY 2 spaces of indent, the name, a colon, then
+ *      nothing but optional trailing whitespace: the shape
+ *      `lines.push(`  <name>:`)` produces. Emit sites are compose.ts:642
+ *      (voice-sidecar), :1520 (vault-broker), :1769 (approval-kernel),
+ *      :1862 (switchroom-auth-broker) and :2178 (agent-<name>).
+ *   3. Indentation ALONE separates a service key from a nested mapping key of
+ *      the same textual form. The 6-space `vault-broker:` under `depends_on:`
+ *      (compose.ts:2274-2282) is byte-identical but for its indent; the
+ *      `^ {2}` anchor is the only thing excluding it.
+ *
+ * Change any of those emit sites and this helper must change with them. A
+ * clause-2 break yields an empty `all`, which would make callers assert over
+ * an empty set instead of failing (`expect(labelled).toEqual(all)` is
+ * trivially true when both are empty) — so the helper hard-fails on a
+ * zero-service parse. generateCompose emits the vault-broker singleton
+ * unconditionally (compose.ts:1520), so zero services always means the PARSER
+ * broke, never the input.
  */
 function servicesByFleetLabel(
   yaml: string,
@@ -171,6 +198,17 @@ function servicesByFleetLabel(
     if (current && line.trim() === `switchroom.fleet: "${fleet}"`) {
       labelled.push(current);
     }
+  }
+  // Fail loudly on a vacuous parse. See clause 2/3 above: the only way a
+  // generated compose has no services is that the emit shape moved out from
+  // under this matcher.
+  if (all.length === 0) {
+    throw new Error(
+      "servicesByFleetLabel parsed 0 services — generateCompose always emits " +
+        "at least `  vault-broker:` (src/agents/compose.ts:1520), so the " +
+        "service emit shape this helper pins has changed. Update the matcher " +
+        "and the docblock above it.",
+    );
   }
   return { all: all.sort(), labelled: labelled.sort() };
 }
