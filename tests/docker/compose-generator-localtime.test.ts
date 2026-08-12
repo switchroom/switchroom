@@ -11,7 +11,14 @@
  * unprivileged on a read-only rootfs, so it cannot fix the symlink from
  * inside start.sh — a docker-daemon bind mount is the correct layer.
  *
- * Pure compose-string assertions — no docker invocation.
+ * Pure compose-string assertions — no docker invocation. That is a real
+ * blind spot, not a stylistic one: the emitted string stayed correct
+ * throughout the period when this mount was silently overwriting
+ * /usr/share/zoneinfo/Etc/UTC, because Docker resolves the mount
+ * DESTINATION through the stock tzdata symlink before mounting. The
+ * mount SEMANTICS are covered by
+ * `tests/docker/localtime-mount-symlink.test.ts`; this file covers
+ * generation only.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";

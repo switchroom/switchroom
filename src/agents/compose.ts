@@ -2901,6 +2901,24 @@ function emitAgentService(
   // and fall back to the env-var path (the cosmetic 95% case). Same host
   // path inside the container, so a plain absolute bind with no
   // `homePrefix` rewrite.
+  //
+  // LOAD-BEARING IMAGE INVARIANT: this mount is only correct because
+  // `docker/Dockerfile.agent` materialises `/etc/localtime` as a plain
+  // REGULAR FILE before `USER 10001`. Docker resolves a bind mount's
+  // destination path through symlinks in the container rootfs BEFORE
+  // mounting, so against stock tzdata (`/etc/localtime ->
+  // /usr/share/zoneinfo/Etc/UTC`) this line silently mounted the
+  // agent's local zonefile over `/usr/share/zoneinfo/Etc/UTC` instead.
+  // `/etc/localtime` then read correct local time by accident while
+  // every by-NAME UTC lookup in the tzdata db (Python
+  // `zoneinfo.ZoneInfo("UTC")`, `TZ=UTC date`, Go/Java/Rust) returned
+  // LOCAL time — a silent multi-hour error, not a cosmetic one.
+  // `/usr/share/zoneinfo/UTC` is a symlink to `Etc/UTC` so it was
+  // corrupted too. If you ever change the agent image's
+  // `/etc/localtime` back to a symlink, this mount becomes actively
+  // harmful and must be removed with it. Guarded by
+  // `tests/docker/localtime-mount-symlink.test.ts` and by the `tzdata`
+  // agent_smoke probe in `src/host-control/server.ts`.
   if (isValidTimezone(a.timezone) && existsSync(`/usr/share/zoneinfo/${a.timezone}`)) {
     lines.push(`      - /usr/share/zoneinfo/${a.timezone}:/etc/localtime:ro`);
   }

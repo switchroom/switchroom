@@ -654,7 +654,7 @@ describe("hostd server — agent_smoke (read-only in-agent battery)", () => {
     const body = JSON.parse(resp.stdout_tail!);
     expect(body.container).toBe("running");
     expect(body.probes.map((p: { name: string }) => p.name).sort()).toEqual(
-      ["auth", "bot_token", "mcp", "scheduler", "state"],
+      ["auth", "bot_token", "mcp", "scheduler", "state", "tzdata"],
     );
     expect(body.probes.every((p: { state: string }) => p.state === "ok")).toBe(true);
   });
