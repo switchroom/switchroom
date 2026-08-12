@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Features
+
+- **hindsight-watch: detect recall DEGRADATION, not just collapse**
+
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
 ### Dependencies
