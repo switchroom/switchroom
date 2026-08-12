@@ -319,6 +319,7 @@ now an anomaly worth investigating, not the norm.
   margin the data cannot support. Asking "has anything SUCCEEDED lately?"
   instead of "is the failure recent?" still clears the instant a completion
   lands, which is what the recency guard existed to protect. (#4618)
+- **docker: stop /etc/localtime mount clobbering zoneinfo Etc/UTC**
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
