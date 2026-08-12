@@ -6441,16 +6441,42 @@ PYEOF
 #      cursor that produced it. The loop cannot stall on a page, so
 #      `_SWEEP_MAX_PAGES` is a corruption tripwire, not a work limit.
 #
-#   B2 A ROTATING SLICE bounds the COST PER RUN. Each run sweeps one
-#      deterministic 1/`_SWEEP_SLICE_COUNT` slice of the bank, chosen by wall
-#      clock — `int(time.time()) // _SWEEP_SLICE_SECONDS % _SWEEP_SLICE_COUNT`.
-#      No cursor is persisted anywhere: the slice is a pure function of the
-#      clock, so it survives a worker restart, needs no new table, no alembic
-#      revision, and nothing to corrupt. Slicing is on `md5(entity_id_1)`, and
-#      every row has exactly one `entity_id_1`, so the slices PARTITION the
-#      bank: consecutive runs cover it exactly once each. Measured slice
-#      balance on overlord at 26 slices: largest 23,359 rows against a 19,903
-#      mean.
+#   B2 A ROTATING SLICE bounds the COST PER RUN, and HOW MANY SLICES IS DERIVED
+#      FROM BANK SIZE: `ceil(rows / _SWEEP_SLICE_TARGET_ROWS)`, capped at
+#      `_SWEEP_MAX_SLICE_COUNT` and floored at 1. A bank that already sweeps
+#      whole inside the timeout therefore gets ONE slice and keeps being swept
+#      entirely on every run; only a bank big enough to need the bound rotates,
+#      and only as far as its size demands. Measured on this fleet: overlord
+#      516,563 rows → 21 slices, klanker 463,534 → 19, finn 159,076 → 7,
+#      carrie 132,784 → 6, assistant 91,409 → 4, marko 60,994 → 3, and every
+#      bank at or below 25,000 rows (reggie, gymbro, lawgpt, ziggy and the
+#      profile banks) → 1. Whole-slice sweep at the target size measures
+#      4.7 s (overlord), 3.3 s (klanker), 4.7 s (lawgpt, whole bank).
+#
+#      The slice INDEX is a pure function of the wall clock —
+#      `int(now) // _SWEEP_SLICE_SECONDS % slice_count` — so no cursor is
+#      persisted anywhere: it survives a worker restart, needs no new table, no
+#      alembic revision, and has nothing to corrupt. Slicing is on
+#      `md5(entity_id_1)`, and every row has exactly one `entity_id_1`, so the
+#      slices PARTITION the bank. Measured slice balance on overlord at 26
+#      slices: largest 23,359 rows against a 19,903 mean.
+#
+#      COVERAGE IS COUPON-COLLECTOR, NOT A CYCLE. `graph_maintenance` is
+#      DEMAND-DRIVEN: `submit_async_graph_maintenance` fires when work is
+#      enqueued (retain / delete / edit) and short-circuits with `no_work=True`
+#      on an empty queue — there is no timer anywhere. Runs are therefore
+#      uncorrelated with the clock the index is taken from, each run samples an
+#      effectively random slice, and expected full coverage is `N*H(N)` runs,
+#      not `N`. That is precisely why `N` is kept as small as the bank allows.
+#      Measured runs/day per bank over 30 days (`async_operations`,
+#      2026-08-12): overlord 28.9, klanker 26.3, finn 9.4, carrie 8.3,
+#      marko 5.2, assistant 3.0, gymbro 1.8, ziggy 0.77, reggie 0.70,
+#      lawgpt 0.30. A FIXED 24 would have given those banks expected full
+#      coverage every 3.1, 3.5, 9.6, 11.0, 17.4, 29.9, 49.4, 118.2, 129.5 and
+#      302.1 days — putting the quietest banks, which never had the timeout and
+#      swept whole in 2.7-4.3 s, on a rotation measured in months to fix a
+#      problem they do not have. Size-derived they are 2.7, 2.6, 1.9, 1.8, 1.1,
+#      2.8, 0.6, 1.3, 1.4 and 3.3 days.
 #
 #      WHY THE FULL SWEEP STAYS, rather than being replaced by a watermark
 #      scoped to recently-touched entities. A cooccurrence goes stale when a
@@ -6465,13 +6491,16 @@ PYEOF
 #      be correct — it sweeps every row on a fixed period whatever produced it
 #      — which is the whole reason it was chosen over the watermark.
 #
-#      The price is prune LATENCY: a stale row survives up to one rotation
-#      (`_SWEEP_SLICE_COUNT` runs = ~12h at the 30-minute job cadence) instead
-#      of up to one run. For a sweep upstream itself documents as "defensive"
-#      — Pass 2's FK cascade already removes the missing-entity case; this pass
-#      only catches the stale-count case — trading 12h of latency for a job
-#      that completes at all is the correct trade. It currently completes
-#      NEVER, so any bounded latency is a strict improvement.
+#      The price is prune LATENCY, and it is only paid by banks that are
+#      sliced at all. A stale row survives up to one coverage period — and up
+#      to TWO, because a row inserted mid-rotation below the cursor of its own
+#      slice is not seen until that slice comes round again. Measured worst
+#      case across this fleet: 3.3 days (lawgpt, slice_count 1, 0.3 runs/day),
+#      i.e. bounded by how often the bank is touched at all. For a sweep
+#      upstream itself documents as "defensive" — Pass 2's FK cascade already
+#      removes the missing-entity case; this pass only catches the stale-count
+#      case — that is the correct trade against a pass that currently completes
+#      NEVER on the two largest banks.
 #
 #   B3 ADAPTIVE SHRINK removes the last unbounded term. A page's cost is
 #      `batch_size` x the degrees of the two entities, and entity degree is not
@@ -6480,10 +6509,26 @@ PYEOF
 #      entity's cooccurrences is therefore the one shape that could still
 #      exceed the timeout at `batch_size = 1000`. On a timeout the sweep HALVES
 #      the page size and retries the SAME cursor, down to
-#      `_SWEEP_MIN_BATCH_SIZE`. That is at most log2(1000/50) = 4 halvings, and
-#      it makes the sweep structurally unable to wedge: without it a single
-#      pathological page would fail its slice on every rotation for ever, which
-#      is precisely the failure this whole block exists to remove.
+#      `_SWEEP_MIN_BATCH_SIZE` — at most log2(1000/50) = 4 halvings.
+#
+#      Its LIMIT, stated honestly: shrink makes a hub page survivable, it does
+#      not make the sweep unwedgeable. A page that still times out AT the 50-row
+#      floor raises, which fails Pass 3 for that bank on that run exactly as
+#      today — the difference is that four halvings must be exhausted first, and
+#      that the pages already committed are not lost (per-page transactions) and
+#      are named in the log line beside the raise, since the exception carries
+#      no count. `batch_size` also does not RECOVER after a shrink: the rest of
+#      that slice runs at the reduced size, which is why the `_SWEEP_MAX_PAGES`
+#      tripwire's log names an early shrink as a legitimate second cause.
+#
+#      WHY `batch_size = 1000`. Not a throughput choice — measured read-only on
+#      live data, total time to sweep a whole target-sized slice is FLAT in the
+#      page size (overlord, 24,640 rows: 4.9 s at 200, 4.6 s at 500, 4.3 s at
+#      1,000, 5.0 s at 2,000, 5.0 s at 4,000). What the constant actually buys
+#      is per-STATEMENT latency, which is linear in it: worst observed page
+#      229 ms at 500, 445 ms at 1,000, 578 ms at 2,000, against the 60,000 ms
+#      command_timeout. 1,000 is the point that keeps ~135x headroom on the
+#      worst measured page while keeping a slice down to ~25 statements.
 #
 # PER-BATCH TRANSACTIONS ARE LOAD-BEARING, not incidental. Each page runs in
 # its own transaction, so (a) a page that times out cannot roll back the pages
@@ -6495,8 +6540,11 @@ PYEOF
 # inside the store method, which is handed one.
 #
 # WHAT IS DELIBERATELY UNCHANGED:
-#   * The staleness predicate, byte for byte (see the rejected rewrite above,
-#     and upstream's #2473 comment).
+#   * The staleness predicate itself — the `NOT EXISTS (… INTERSECT …)` body,
+#     byte for byte (see the rejected rewrite above, and upstream's #2473
+#     comment). The `victims` CTE AROUND it is materially rewritten: it now
+#     joins the bounded `page` CTE instead of scanning the bank, which is the
+#     whole mechanism. "Byte for byte" describes the predicate, not the CTE.
 #   * The `ORDER BY … FOR UPDATE OF c` ordered lock (#2529). It is preserved
 #     inside each page, and pages proceed in ascending key order, so the global
 #     acquisition order retain's `_flush_pending` upsert relies on still holds.
@@ -6507,7 +6555,15 @@ PYEOF
 #     loop after one call — i.e. exactly upstream's single-statement behaviour.
 #     Deliberate dialect asymmetry, like the #2529 note already in that file.
 #
-# NO NEW ENV KNOBS. `batch_size` / slice count / slice period are module
+# KNOWN, ACCEPTED, NOT FIXED HERE. The outer `retry_with_backoff(...,
+# max_retries=8)` that wraps `_run_cooccurrence_prune` is upstream's and is
+# untouched, so a retryable NON-timeout error escaping the inner per-page loop
+# restarts the whole slice from cursor `None`. Idempotent (the sweep is a
+# delete-if-stale), but up to 9x wasted work on a slice. Collapsing the two
+# budgets means changing a retry wrapper shared with Passes 1 and 2 — a
+# separate concern with its own blast radius, tracked rather than smuggled in.
+#
+# NO NEW ENV KNOBS. `batch_size` / slice sizing / slice period are module
 # constants rather than `HINDSIGHT_API_*` settings: a knob would have to be
 # threaded through `config.py` AND added to switchroom's
 # `HINDSIGHT_PERF_ENV_KEYS` allowlist in `src/setup/hindsight-perf-defaults.ts`
@@ -6627,6 +6683,26 @@ apply("engine/db/ops.py", (
     '        after one call.\n'
     '        """\n'
     "        ...\n"
+    "\n"
+    "    async def count_bank_cooccurrences(\n"
+    "        self,\n"
+    "        conn: DatabaseConnection,\n"
+    "        ec_table: str,\n"
+    "        entities_table: str,\n"
+    "        bank_id: str,\n"
+    "    ) -> int:\n"
+    '        """switchroom: how many cooccurrence rows ``bank_id`` currently has.\n'
+    "\n"
+    "        Sizing input for the sweep above: the caller divides this by a target\n"
+    "        rows-per-slice to decide how many slices the bank needs, so a bank small\n"
+    "        enough to sweep whole in one run is never sliced at all.\n"
+    "\n"
+    "        CONCRETE, not abstract, and 0 means 'no idea'. A backend that cannot\n"
+    "        answer cheaply must not be forced to answer expensively: the caller\n"
+    "        reads 0 as ``slice_count = 1``, i.e. sweep the whole bank, which is the\n"
+    "        behaviour every backend had before slicing existed.\n"
+    '        """\n'
+    "        return 0\n"
 ))
 
 # ────────────────────────────────────────────────── B1: the Postgres page sweep
@@ -6789,6 +6865,35 @@ apply("engine/db/ops_postgresql.py", (
     "            last_entity_id_1=str(last_1) if last_1 is not None else None,\n"
     "            last_entity_id_2=str(last_2) if last_2 is not None else None,\n"
     "        )\n"
+    "\n"
+    "    async def count_bank_cooccurrences(\n"
+    "        self,\n"
+    "        conn: DatabaseConnection,\n"
+    "        ec_table: str,\n"
+    "        entities_table: str,\n"
+    "        bank_id: str,\n"
+    "    ) -> int:\n"
+    '        """switchroom: exact cooccurrence-row count for the bank.\n'
+    "\n"
+    "        EXACT rather than an ``reltuples`` estimate: this is the whole input to\n"
+    "        how many slices the bank is cut into, a stale estimate on a bank that\n"
+    "        just grew would under-slice it, and the count is cheap. Measured on this\n"
+    "        fleet's largest bank (516,563 rows) it is a parallel seq scan of\n"
+    "        entity_cooccurrences hash-joined to the bank's entities: 93 ms, once per\n"
+    "        run, against a slice sweep of ~4.7 s.\n"
+    '        """\n'
+    "        return int(\n"
+    "            await conn.fetchval(\n"
+    "                f\"\"\"\n"
+    "                SELECT count(*)\n"
+    "                FROM {ec_table} c\n"
+    "                JOIN {entities_table} e ON e.id = c.entity_id_1\n"
+    "                WHERE e.bank_id = $1\n"
+    "                \"\"\",\n"
+    "                bank_id,\n"
+    "            )\n"
+    "            or 0\n"
+    "        )\n"
 ))
 
 # ────────────────────────────────────────────────────────── B1: the Oracle path
@@ -6922,6 +7027,24 @@ apply("engine/memories/pg/graph.py", (
     "        after_entity_id_1=after_entity_id_1,\n"
     "        after_entity_id_2=after_entity_id_2,\n"
     "    )\n"
+    "\n"
+    "\n"
+    "async def count_bank_cooccurrences(\n"
+    "    *,\n"
+    "    conn: DatabaseConnection,\n"
+    "    fq_table: Callable[[str], str],\n"
+    "    bank_id: str,\n"
+    ") -> int:\n"
+    '    """switchroom: cooccurrence-row count for the bank; sizing input for the\n'
+    "    sweep's slice count. See :func:`prune_stale_cooccurrences`.\n"
+    '    """\n'
+    "    ops = _ops_for(conn)\n"
+    "    return await ops.count_bank_cooccurrences(\n"
+    "        conn,\n"
+    "        fq_table(\"entity_cooccurrences\"),\n"
+    "        fq_table(\"entities\"),\n"
+    "        bank_id,\n"
+    "    )\n"
 ))
 
 apply("engine/memories/pg/graph.py", (
@@ -6971,6 +7094,9 @@ apply("engine/memories/postgres.py", (
     "            after_entity_id_1=after_entity_id_1,\n"
     "            after_entity_id_2=after_entity_id_2,\n"
     "        )\n"
+    "\n"
+    "    async def count_bank_cooccurrences(self, *, conn, fq_table, bank_id: str) -> int:\n"
+    "        return await graph.count_bank_cooccurrences(conn=conn, fq_table=fq_table, bank_id=bank_id)\n"
 ))
 
 apply("engine/memories/base.py", (
@@ -6998,6 +7124,11 @@ apply("engine/memories/base.py", (
     "        return CooccurrenceSweepBatch(\n"
     "            deleted=0, scanned=0, last_entity_id_1=None, last_entity_id_2=None\n"
     "        )\n"
+    "\n"
+    "    async def count_bank_cooccurrences(self, *, conn, fq_table, bank_id: str) -> int:\n"
+    '        """switchroom: no join table, nothing to size. 0 means "no idea", which\n'
+    '        the caller reads as slice_count = 1."""\n'
+    "        return 0\n"
 ))
 
 # ─────────────────────────────── B2 + B3: the paging loop and the rotating slice
@@ -7029,11 +7160,25 @@ apply("engine/graph_maintenance.py", (
     "# rows) as pages measured a worst page of 4,322 ms at 2,000 rows/page against\n"
     "# a 60,000 ms command_timeout; 1,000 halves that again.\n"
     "#\n"
-    "# _SWEEP_SLICE_COUNT bounds the COST PER RUN: each run sweeps one 1/24th hash\n"
-    "# slice of the bank, so the bank is covered every 24 runs (~12h at the\n"
-    "# 30-minute job cadence) for ~1/24th of the DB CPU per run. Measured on\n"
-    "# overlord: ~3-6s per slice, against a whole-bank sweep that could not finish\n"
-    "# inside the timeout at all.\n"
+    "# _SWEEP_SLICE_TARGET_ROWS bounds the COST PER RUN, and is the reason the\n"
+    "# slice count is DERIVED FROM BANK SIZE rather than fixed. Slicing is a cost\n"
+    "# control, and a bank that already sweeps whole inside the timeout has no cost\n"
+    "# to control — slicing it only delays its prunes. So: slices =\n"
+    "# ceil(rows / _SWEEP_SLICE_TARGET_ROWS), capped at _SWEEP_MAX_SLICE_COUNT and\n"
+    "# floored at 1, which makes ~25k rows the per-run unit of work for EVERY bank.\n"
+    "# Measured whole-slice sweep at that size: overlord 4.7 s, klanker 3.3 s,\n"
+    "# lawgpt (whole bank, 15,443 rows, slice_count=1) 4.7 s.\n"
+    "#\n"
+    "# WHY NOT A FIXED 24. `graph_maintenance` is DEMAND-DRIVEN, not timed:\n"
+    "# `submit_async_graph_maintenance` fires on enqueued work and short-circuits\n"
+    "# on an empty queue (`no_work=True`), so runs are uncorrelated with the wall\n"
+    "# clock the slice index is derived from. Each run therefore samples an\n"
+    "# effectively random slice and full coverage is COUPON-COLLECTOR — expected\n"
+    "# N*H(N) runs, ~91 for N=24, not 24. Measured runs/day per bank over 30 days\n"
+    "# (async_operations, 2026-08-12) span 28.9 (overlord) to 0.30 (lawgpt), so a\n"
+    "# fixed 24 would have moved the QUIET banks — the ones that never had the\n"
+    "# timeout, and swept whole in 2.7-4.3 s — from full coverage every run to\n"
+    "# 13-302 days per full sweep. Size-derived, every bank lands at 0.6-3.3 days.\n"
     "#\n"
     "# _SWEEP_MIN_BATCH_SIZE is the floor for the halve-and-retry in the loop\n"
     "# below, which exists because a page landing entirely inside ONE hub entity's\n"
@@ -7041,15 +7186,43 @@ apply("engine/graph_maintenance.py", (
     "# (max entity degree measured on this fleet: 32,730 unit_entities rows,\n"
     "# against a mean of 7.3).\n"
     "#\n"
-    "# _SWEEP_MAX_PAGES is a corruption tripwire, NOT a work limit: the keyset\n"
-    "# cursor is set to the MAX key of a page whose own predicate is\n"
-    "# `> the previous cursor`, so it advances strictly and the loop terminates\n"
-    "# without it. It fires only if that invariant is ever broken.\n"
+    "# _SWEEP_MAX_PAGES is a tripwire, NOT a tuned work limit. Its PRIMARY job is\n"
+    "# to catch a non-advancing keyset cursor: the cursor is set to the MAX key of\n"
+    "# a page whose own predicate is `> the previous cursor`, so it advances\n"
+    "# strictly and the loop terminates without it. Headroom against legitimate\n"
+    "# work: a target-sized slice is 25 pages at 1,000, and 500 pages even if every\n"
+    "# page shrank to the floor of 50 — but `batch_size` never recovers after a\n"
+    "# shrink, so a slice that shrinks EARLY is the one shape that can reach the\n"
+    "# tripwire on honest work. The log line names both causes for that reason.\n"
     "_SWEEP_BATCH_SIZE = 1000\n"
     "_SWEEP_MIN_BATCH_SIZE = 50\n"
-    "_SWEEP_SLICE_COUNT = 24\n"
+    "_SWEEP_SLICE_TARGET_ROWS = 25000\n"
+    "_SWEEP_MAX_SLICE_COUNT = 24\n"
     "_SWEEP_SLICE_SECONDS = 1800\n"
     "_SWEEP_MAX_PAGES = 2000\n"
+    "\n"
+    "\n"
+    "def _sweep_slice_count(total_rows: int) -> int:\n"
+    '    """switchroom: how many slices a bank of ``total_rows`` cooccurrences needs.\n'
+    "\n"
+    "    1 for anything that fits in one target-sized run — a bank that never had\n"
+    "    the timeout must not be put on a rotation to fix a problem it does not\n"
+    "    have. 0 (a backend that cannot count) is also 1: sweep the whole bank,\n"
+    "    which is what every backend did before slicing existed.\n"
+    '    """\n'
+    "    if total_rows <= _SWEEP_SLICE_TARGET_ROWS:\n"
+    "        return 1\n"
+    "    return min(_SWEEP_MAX_SLICE_COUNT, -(-total_rows // _SWEEP_SLICE_TARGET_ROWS))\n"
+    "\n"
+    "\n"
+    "def _sweep_slice_index(now: float, slice_count: int) -> int:\n"
+    '    """switchroom: which slice this run sweeps. A pure function of the wall\n'
+    "    clock, so it needs no persisted cursor and survives a worker restart.\n"
+    "\n"
+    "    It is NOT a schedule. The job is demand-driven, so consecutive runs do not\n"
+    "    land on consecutive ticks and coverage is coupon-collector, not a cycle;\n"
+    '    the clock here only makes the choice deterministic and testable."""\n'
+    "    return int(now) // _SWEEP_SLICE_SECONDS % slice_count\n"
 ))
 
 apply("engine/graph_maintenance.py", (
@@ -7072,16 +7245,40 @@ apply("engine/graph_maintenance.py", (
     "        # It is now a loop of BOUNDED, RESUMABLE pages over one time-rotating\n"
     "        # slice of the bank.\n"
     "        #\n"
-    "        # The slice index is a pure function of the wall clock, so it needs no\n"
-    "        # persisted cursor, no new table and no alembic revision, and it is\n"
-    "        # unaffected by a worker restart. The slices partition the bank (the\n"
-    "        # hash is on entity_id_1, and every row has exactly one), so successive\n"
-    "        # runs cover every row rather than resampling. That total coverage is\n"
-    "        # why this is a rotating full sweep and not a watermark scoped to\n"
+    "        # HOW MANY SLICES IS A FUNCTION OF BANK SIZE, not a constant. Slicing\n"
+    "        # trades prune latency for per-run cost, and a bank that already sweeps\n"
+    "        # whole inside the timeout has no per-run cost to trade — so it gets\n"
+    "        # slice_count = 1 and keeps being swept entirely, every run. Only a bank\n"
+    "        # bigger than _SWEEP_SLICE_TARGET_ROWS rotates, and only as far as its\n"
+    "        # size requires. The count is one cheap statement (93 ms on the largest\n"
+    "        # bank on this fleet) issued once per run, not per page.\n"
+    "        #\n"
+    "        # The slice index is a pure function of the wall clock: no persisted\n"
+    "        # cursor, no new table, no alembic revision, unaffected by a restart.\n"
+    "        # The slices PARTITION the bank (the hash is on entity_id_1 and every\n"
+    "        # row has exactly one), so a row is swept by exactly one slice.\n"
+    "        #\n"
+    "        # COVERAGE IS PROBABILISTIC, NOT A CYCLE, and the comment that used to\n"
+    "        # sit here claiming '24 consecutive runs cover the bank exactly once\n"
+    "        # each' was wrong. This job is demand-driven — submit_async_graph_\n"
+    "        # maintenance fires on enqueued work and short-circuits on an empty\n"
+    "        # queue — so runs are uncorrelated with the clock the index comes from,\n"
+    "        # each run samples an effectively random slice, and expected full\n"
+    "        # coverage is N*H(N) runs. That is why N is kept as small as the bank\n"
+    "        # allows. A row inserted mid-rotation BELOW the cursor of its own slice\n"
+    "        # is missed until that slice comes round again, so worst-case prune\n"
+    "        # latency is ~2 coverage periods, not one.\n"
+    "        #\n"
+    "        # It is still a rotating FULL sweep rather than a watermark scoped to\n"
     "        # recently-touched entities: nothing durable records the entities of a\n"
     "        # deleted unit, so a watermark would silently miss every staleness\n"
     "        # source that failed to enqueue, for ever.\n"
-    "        slice_index = int(time.time()) // _SWEEP_SLICE_SECONDS % _SWEEP_SLICE_COUNT\n"
+    "        async with acquire_with_retry(backend) as conn:\n"
+    "            total_rows = await store.count_bank_cooccurrences(\n"
+    "                conn=conn, fq_table=fq_table, bank_id=bank_id\n"
+    "            )\n"
+    "        slice_count = _sweep_slice_count(total_rows)\n"
+    "        slice_index = _sweep_slice_index(time.time(), slice_count)\n"
     "        batch_size = _SWEEP_BATCH_SIZE\n"
     "        after_1: str | None = None\n"
     "        after_2: str | None = None\n"
@@ -7101,7 +7298,7 @@ apply("engine/graph_maintenance.py", (
     "                        conn=conn,\n"
     "                        fq_table=fq_table,\n"
     "                        bank_id=bank_id,\n"
-    "                        slice_count=_SWEEP_SLICE_COUNT,\n"
+    "                        slice_count=slice_count,\n"
     "                        slice_index=slice_index,\n"
     "                        batch_size=size,\n"
     "                        after_entity_id_1=after_1,\n"
@@ -7112,9 +7309,12 @@ apply("engine/graph_maintenance.py", (
     "            if pages >= _SWEEP_MAX_PAGES:\n"
     "                logger.error(\n"
     "                    f\"[GRAPH_MAINT] bank={bank_id} cooccurrence sweep hit the \"\n"
-    "                    f\"{_SWEEP_MAX_PAGES}-page tripwire at cursor ({after_1}, {after_2}) — \"\n"
-    "                    f\"the keyset cursor is not advancing; slice {slice_index} is incomplete, \"\n"
-    "                    f\"operation_id={operation_id}\"\n"
+    "                    f\"{_SWEEP_MAX_PAGES}-page tripwire at cursor ({after_1}, {after_2}) \"\n"
+    "                    f\"with batch_size={batch_size}: either the keyset cursor is not \"\n"
+    "                    f\"advancing, or the page shrank early and this slice legitimately \"\n"
+    "                    f\"needs more pages than the tripwire allows. Slice \"\n"
+    "                    f\"{slice_index}/{slice_count} is INCOMPLETE; {deleted} row(s) were \"\n"
+    "                    f\"pruned before the cut, operation_id={operation_id}\"\n"
     "                )\n"
     "                break\n"
     "            requested = batch_size\n"
@@ -7129,16 +7329,24 @@ apply("engine/graph_maintenance.py", (
     "                    retry_timeouts=False,\n"
     "                )\n"
     "            except TimeoutError:\n"
-    "                # A page that still cannot finish inside command_timeout is a hub\n"
-    "                # page: `batch_size` rows whose entities have enormous degree.\n"
-    "                # Halve and retry the SAME cursor rather than failing the slice —\n"
-    "                # otherwise one pathological page fails its slice on every\n"
-    "                # rotation for ever, which is the failure this whole change\n"
-    "                # exists to remove. At most log2(batch/min) halvings.\n"
+    "                # The likely cause is a hub page: `batch_size` rows whose entities\n"
+    "                # have enormous degree. Halve and retry the SAME cursor rather\n"
+    "                # than failing the slice — otherwise one pathological page fails\n"
+    "                # its slice on every rotation for ever, which is the failure this\n"
+    "                # whole change exists to remove. At most log2(batch/min) halvings.\n"
     "                #\n"
-    "                # Catching the builtin TimeoutError is sufficient AND correct:\n"
-    "                # asyncpg raises asyncio.TimeoutError on command_timeout, and on\n"
-    "                # this image's Python (3.11) asyncio.TimeoutError IS the builtin.\n"
+    "                # Catching the builtin TimeoutError is sufficient: asyncpg raises\n"
+    "                # asyncio.TimeoutError on command_timeout, and on this image's\n"
+    "                # Python (3.11) asyncio.TimeoutError IS the builtin — a fact the\n"
+    "                # probe asserts rather than assumes, because it stops being true\n"
+    "                # below 3.11.\n"
+    "                #\n"
+    "                # It is not PRECISE: `acquire_with_retry` can raise the same type\n"
+    "                # on a pool-acquire timeout, which has nothing to do with the page\n"
+    "                # and shrinks it for no reason. Safe (the shrunk page re-runs the\n"
+    "                # same cursor and `deleted` is unaffected) but it costs throughput\n"
+    "                # for the rest of the slice, so the log says 'timed out' and does\n"
+    "                # not claim to know which.\n"
     "                if batch_size > _SWEEP_MIN_BATCH_SIZE:\n"
     "                    batch_size = max(_SWEEP_MIN_BATCH_SIZE, batch_size // 2)\n"
     "                    logger.warning(\n"
@@ -7147,6 +7355,16 @@ apply("engine/graph_maintenance.py", (
     "                        f\"{batch_size}, operation_id={operation_id}\"\n"
     "                    )\n"
     "                    continue\n"
+    "                # The floor is reached: this page cannot be made small enough, so\n"
+    "                # the raise fails Pass 3 for this bank. The pages that already\n"
+    "                # COMMITTED are not rolled back, so log their count before it is\n"
+    "                # lost — the caller only sees the exception.\n"
+    "                logger.error(\n"
+    "                    f\"[GRAPH_MAINT] bank={bank_id} cooccurrence page of {requested} timed out at \"\n"
+    "                    f\"the {_SWEEP_MIN_BATCH_SIZE}-row floor, cursor ({after_1}, {after_2}); \"\n"
+    "                    f\"slice {slice_index}/{slice_count} abandoned after {pages} page(s) with \"\n"
+    "                    f\"{deleted} row(s) already pruned and committed, operation_id={operation_id}\"\n"
+    "                )\n"
     "                raise\n"
     "            pages += 1\n"
     "            deleted += page.deleted\n"
@@ -7160,7 +7378,7 @@ apply("engine/graph_maintenance.py", (
     "\n"
     "        logger.info(\n"
     "            f\"[GRAPH_MAINT] bank={bank_id} cooccurrence sweep: slice \"\n"
-    "            f\"{slice_index}/{_SWEEP_SLICE_COUNT}, {pages} page(s), final batch_size \"\n"
+    "            f\"{slice_index}/{slice_count} of {total_rows} row(s), {pages} page(s), final batch_size \"\n"
     "            f\"{batch_size}, {deleted} pruned, operation_id={operation_id}\"\n"
     "        )\n"
     "        return deleted\n"
@@ -7196,17 +7414,63 @@ assert "INTERSECT" in sweep, (
     "NO faster (65,555 ms vs 65,168 ms) because the planner hash-joins all of "
     "unit_entities at bank scale"
 )
-assert "% $4::int = $5::int" in sweep, f"{TAG}: the rotating slice filter is missing"
+# The slice filter is pinned as ONE WHOLE PREDICATE, from the AND to the bound
+# parameter. Two independent substring checks ("md5(...)" somewhere, "% $4 = $5"
+# somewhere) do NOT pin a partition: `AND 0 * ('x' || substr(md5(...), 1, 4))
+# ::bit(16)::int % $4::int = $5::int` contains both and collapses the whole bank
+# into slice 0. The real proof that this expression partitions is executable and
+# runs against a real Postgres — see the SQL arm of
+# tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts. This assert is
+# the cheap build-time backstop for it, not a substitute.
+assert (
+    "\n                  AND ('x' || substr(md5(c.entity_id_1::text), 1, 4))"
+    "::bit(16)::int % $4::int = $5::int\n"
+) in sweep, (
+    f"{TAG}: the slice filter is not the exact whole expression this patch ships. Any "
+    "extra factor or term in it stops the slices partitioning the bank and silently "
+    "un-sweeps most of it"
+)
 assert "COALESCE($2::uuid" in sweep and "(c.entity_id_1, c.entity_id_2) > (" in sweep, (
     f"{TAG}: the keyset cursor predicate is missing — pages would restart from the top for ever"
 )
 
 gm = (BASE / "engine/graph_maintenance.py").read_text()
-for const in ("_SWEEP_BATCH_SIZE", "_SWEEP_MIN_BATCH_SIZE", "_SWEEP_SLICE_COUNT", "_SWEEP_SLICE_SECONDS", "_SWEEP_MAX_PAGES"):
+for const in (
+    "_SWEEP_BATCH_SIZE",
+    "_SWEEP_MIN_BATCH_SIZE",
+    "_SWEEP_SLICE_TARGET_ROWS",
+    "_SWEEP_MAX_SLICE_COUNT",
+    "_SWEEP_SLICE_SECONDS",
+    "_SWEEP_MAX_PAGES",
+):
     assert f"\n{const} = " in gm, f"{TAG}: {const} is missing"
-prune = gm.split("async def _run_cooccurrence_prune", 1)[1].split("\n    # A larger retry budget", 1)[0]
-assert "int(time.time()) // _SWEEP_SLICE_SECONDS % _SWEEP_SLICE_COUNT" in prune, (
+assert "_SWEEP_SLICE_COUNT" not in gm, (
+    f"{TAG}: a fixed _SWEEP_SLICE_COUNT is back. The slice count MUST be derived from "
+    "bank size (_sweep_slice_count) — this job is demand-driven, so a fixed count puts "
+    "quiet banks on a rotation measured in weeks to fix a timeout they never had"
+)
+assert "return int(now) // _SWEEP_SLICE_SECONDS % slice_count" in gm, (
     f"{TAG}: the slice index is no longer a pure function of the clock"
+)
+assert "if total_rows <= _SWEEP_SLICE_TARGET_ROWS:\n        return 1" in gm, (
+    f"{TAG}: a bank small enough to sweep whole is no longer given slice_count = 1"
+)
+prune = gm.split("async def _run_cooccurrence_prune", 1)[1].split("\n    # A larger retry budget", 1)[0]
+assert "slice_count = _sweep_slice_count(total_rows)" in prune, (
+    f"{TAG}: the sweep no longer derives its slice count from the size of the bank"
+)
+assert "await store.count_bank_cooccurrences(" in prune, (
+    f"{TAG}: the bank is never sized, so the slice count cannot depend on it"
+)
+assert (
+    "            async with acquire_with_retry(backend) as conn:\n"
+    "                async with conn.transaction():\n"
+    "                    return await store.prune_stale_cooccurrences(\n"
+) in prune, (
+    f"{TAG}: each page must be its OWN transaction, nested inside its own connection "
+    "acquire. Without the transaction a page that times out takes down the pages that "
+    "already committed, so a slice whose late pages are slow makes NO progress at all, "
+    "run after run — the exact wedge this patch exists to remove"
 )
 assert "batch_size = max(_SWEEP_MIN_BATCH_SIZE, batch_size // 2)" in prune, (
     f"{TAG}: the halve-and-retry is gone — one hub page would wedge its slice for ever"
@@ -7226,11 +7490,30 @@ for rel in ("engine/db/ops_postgresql.py", "engine/db/ops_oracle.py", "engine/me
     assert "CooccurrenceSweepBatch" in (BASE / rel).read_text(), (
         f"{TAG}: {rel} does not import/return the page result type"
     )
+# The sizing op must exist at every layer the caller reaches through, and must
+# stay CONCRETE with a 0 default on the ABC — an abstractmethod here would make
+# "cannot count cheaply" unimplementable rather than meaning "sweep it whole".
+assert "    async def count_bank_cooccurrences(\n        self,\n" in ops, (
+    f"{TAG}: DataAccessOps.count_bank_cooccurrences is missing"
+)
+assert ops.split("async def count_bank_cooccurrences", 1)[1].split('"""\n', 1)[1].startswith(
+    "        return 0\n"
+), f"{TAG}: DataAccessOps.count_bank_cooccurrences no longer defaults to 0 ('sweep it whole')"
+assert "@abstractmethod\n    async def count_bank_cooccurrences" not in ops, (
+    f"{TAG}: count_bank_cooccurrences became abstract — a backend that cannot count "
+    "cheaply must be allowed to say so and be swept whole"
+)
+for rel in ("engine/db/ops_postgresql.py", "engine/memories/pg/graph.py", "engine/memories/postgres.py", "engine/memories/base.py"):
+    assert "count_bank_cooccurrences" in (BASE / rel).read_text(), (
+        f"{TAG}: {rel} does not carry the bank-sizing op"
+    )
 
 print(
     f"{TAG}: Pass 3 now sweeps bounded keyset pages (LIMIT-capped, cursor-advancing, "
-    "one transaction each) over a clock-rotating 1/24 hash slice, halving the page on a "
-    "timeout; the #2473 predicate and the #2529 ordered lock are unchanged"
+    "one transaction each) over a hash slice whose COUNT is derived from the size of "
+    "the bank (1 slice below _SWEEP_SLICE_TARGET_ROWS, so a bank that sweeps whole is "
+    "never rotated), halving the page on a timeout; the #2473 predicate and the #2529 "
+    "ordered lock are unchanged"
 )
 PYEOF
 

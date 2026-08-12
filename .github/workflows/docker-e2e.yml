@@ -419,6 +419,24 @@ jobs:
           docker pull "$ref"
           docker image inspect "$ref" >/dev/null
 
+      - name: Pull the digest-pinned Postgres for the bounded-sweep SQL arm
+        # The bounded-sweep probe's SQL arm EXECUTES the shipping sweep
+        # statement against a real server — the only executable proof that the
+        # hash slice filter PARTITIONS the bank (a substring check cannot tell a
+        # partition from a filter that puts every row in slice 0). Same
+        # anti-drift rule as above: the ref is read from the test file that
+        # asserts it rather than duplicated here. ~120MB alpine, not a second
+        # 6.4GB pull. `test -n` so a rename of the constant fails the job loudly
+        # instead of silently leaving the arm unpullable (which under
+        # SWITCHROOM_REQUIRE_HINDSIGHT_PROBE=1 is a hard failure anyway).
+        run: |
+          ref="$(grep -oE 'postgres@sha256:[0-9a-f]{64}' \
+                 tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts | head -1)"
+          test -n "$ref"
+          echo "pulling $ref"
+          docker pull "$ref"
+          docker image inspect "$ref" >/dev/null
+
       - name: Set up Docker Buildx (docker driver) for the through-built image
         # The reranker-priority probe's GREEN arm runs against the actual
         # THROUGH-BUILT switchroom-hindsight image, because #3142's anchors and

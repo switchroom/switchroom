@@ -103,18 +103,32 @@ now an anomaly worth investigating, not the norm.
   stale cooccurrence rows leaked for ever. Pass 3 now sweeps bounded,
   resumable keyset pages (at most `batch_size` predicate evaluations per
   statement, each in its own transaction) over one deterministic
-  clock-rotating 1/24 hash slice of the bank, so the per-statement cost stops
-  depending on bank size and each run pays ~1/24 of the sweep: measured 3–6 s
-  per slice with a 1.3 s worst statement, against a whole-bank sweep that
-  could not finish at all. A page that still times out — the one remaining
-  unbounded term is entity degree, max 32,730 on this fleet against a mean of
-  7.3 — halves its size and retries the SAME cursor down to a floor of 50,
-  so no single pathological page can wedge its slice permanently. The full
-  sweep is kept (rotated, not replaced by a watermark) because nothing durable
-  records the entities of a deleted unit, so a watermark would silently miss
-  every staleness source that failed to enqueue; the price is that a stale row
-  now survives up to one ~12 h rotation. The #2473 INTERSECT predicate and the
-  #2529 ordered lock are unchanged — a semi-join rewrite was measured and is
+  clock-rotating hash slice of the bank, so the per-statement cost stops
+  depending on bank size: measured 3–6 s per slice with a 1.3 s worst
+  statement, against a whole-bank sweep that could not finish at all. A page
+  that still times out — the one remaining unbounded term is entity degree,
+  max 32,730 on this fleet against a mean of 7.3 — halves its size and retries
+  the SAME cursor down to a floor of 50, so no single pathological page can
+  wedge its slice permanently.
+
+  HOW MANY SLICES IS DERIVED FROM BANK SIZE — `ceil(rows / 25,000)`, capped at
+  24, floored at 1 — rather than fixed. `graph_maintenance` is DEMAND-DRIVEN
+  (`submit_async_graph_maintenance` fires when work is enqueued and
+  short-circuits on an empty queue; there is no timer), so a bank is visited as
+  often as it is written to, and slice coverage is coupon-collector rather than
+  a cycle. Measured over the live `async_operations` log, mean days between
+  visits per bank runs from 0.8 (overlord) to 80.0 (lawgpt) — under a fixed 24
+  the quiet banks would have waited an expected 30–300 days for full coverage,
+  to fix a timeout they never had (their whole-bank sweep finishes in 2.7–4.3
+  s). Size-derived, every bank at or below 25,000 rows keeps `slice_count = 1`
+  and is still swept WHOLE on every run, and expected full-coverage latency
+  across the fleet lands between 0.6 and 3.3 days.
+
+  The full sweep is kept (rotated, not replaced by a watermark) because nothing
+  durable records the entities of a deleted unit, so a watermark would silently
+  miss every staleness source that failed to enqueue. The #2473 INTERSECT
+  predicate and the #2529 ordered lock are unchanged — a semi-join rewrite was
+  measured and is
   no faster (65.6 s), because at bank scale the planner hash-joins all of
   `unit_entities`.
 - **fleet-health: the ledger's `windowDays` now actually windows the

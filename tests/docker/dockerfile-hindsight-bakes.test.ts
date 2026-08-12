@@ -2004,7 +2004,17 @@ describe("Dockerfile.hindsight shape", () => {
       "(c.entity_id_1, c.entity_id_2) > (\\n",
     );
     expect(dockerfile).toContain("md5(c.entity_id_1::text), 1, 4");
-    expect(dockerfile).toMatch(/the rotating slice filter is missing/);
+    // The build-time assert pins the slice filter as a WHOLE EXPRESSION, not as
+    // two independent substrings: `AND 0 * ('x' || substr(md5(…), 1, 4))
+    // ::bit(16)::int % $4::int = $5::int` satisfies both substrings and puts
+    // every row in slice 0.
+    expect(dockerfile).toMatch(
+      /the slice filter is not the exact whole expression this patch ships/,
+    );
+    expect(dockerfile).toContain(
+      '"\\n                  AND (\'x\' || substr(md5(c.entity_id_1::text), 1, 4))"\n' +
+        '    "::bit(16)::int % $4::int = $5::int\\n"',
+    );
 
     // The bound must NOT have been bought by weakening the sweep: the #2473
     // INTERSECT predicate and the #2529 ordered lock are upstream's, unchanged.
@@ -2018,12 +2028,23 @@ describe("Dockerfile.hindsight shape", () => {
     // the bank while looking correct in the diff.
     expect(dockerfile).toContain('"_SWEEP_BATCH_SIZE = 1000\\n"');
     expect(dockerfile).toContain('"_SWEEP_MIN_BATCH_SIZE = 50\\n"');
-    expect(dockerfile).toContain('"_SWEEP_SLICE_COUNT = 24\\n"');
+    expect(dockerfile).toContain('"_SWEEP_SLICE_TARGET_ROWS = 25000\\n"');
+    expect(dockerfile).toContain('"_SWEEP_MAX_SLICE_COUNT = 24\\n"');
     expect(dockerfile).toContain('"_SWEEP_SLICE_SECONDS = 1800\\n"');
     expect(dockerfile).toContain('"_SWEEP_MAX_PAGES = 2000\\n"');
+    // How many slices is DERIVED FROM BANK SIZE, not fixed. `graph_maintenance`
+    // is demand-driven (`submit_async_graph_maintenance` fires on retain /
+    // delete / edit, and short-circuits on an empty queue — there is no timer),
+    // so coverage is coupon-collector, not a cycle: a fixed 24 would put the
+    // fleet's quiet banks on an expected-full-coverage latency of weeks to
+    // months, to fix a timeout only the two largest banks ever had.
     expect(dockerfile).toContain(
-      "int(time.time()) // _SWEEP_SLICE_SECONDS % _SWEEP_SLICE_COUNT",
+      "int(now) // _SWEEP_SLICE_SECONDS % slice_count",
     );
+    expect(dockerfile).toContain('"    if total_rows <= _SWEEP_SLICE_TARGET_ROWS:\\n"');
+    expect(dockerfile).toContain('"        slice_count = _sweep_slice_count(total_rows)\\n"');
+    // …and a fixed count must not come back.
+    expect(dockerfile).not.toContain("_SWEEP_SLICE_COUNT = ");
     expect(dockerfile).toMatch(/the paging loop no longer terminates on a short page/);
     expect(dockerfile).toMatch(/the cursor is never advanced/);
 
@@ -2042,11 +2063,19 @@ describe("Dockerfile.hindsight shape", () => {
       /#4604's timeout opt-out was dropped from the loop/,
     );
 
-    // Per-batch transactions are load-bearing (a timed-out page must not roll
-    // back the pages that already committed), so the loop owns the connection.
+    // Per-page transactions are load-bearing: a page that times out must not
+    // roll back the pages that already committed, or a slice whose late pages
+    // are slow makes NO progress at all, run after run. Pin the whole nesting —
+    // acquire, THEN transaction, THEN the call — because pinning the acquire
+    // alone leaves the transaction removable with the suite still green.
     expect(dockerfile).toContain(
-      "async with acquire_with_retry(backend) as conn:\\n",
+      '"            async with acquire_with_retry(backend) as conn:\\n"\n' +
+        '    "                async with conn.transaction():\\n"\n' +
+        '    "                    return await store.prune_stale_cooccurrences(\\n"',
     );
+    // The image build re-checks it as a post-condition on the patched file, so
+    // this cannot be satisfied by a comment that says the right thing.
+    expect(dockerfile).toMatch(/each page must be its OWN transaction/);
 
     // Every backend implements the new return shape, including the ones that
     // opt out of paging by reporting scanned=0.
