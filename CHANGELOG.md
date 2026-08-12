@@ -35,6 +35,21 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
+  `hindsight-watch-pg-probe`'s `if:` gate carried `push` and `merge_group` but
+  not `workflow_dispatch`, unlike its siblings `e2e-shard` and
+  `hindsight-probe`. `changes` has no diff base on a dispatch, so
+  `hindsightwatch` came back false and a manual `gh workflow run
+  docker-e2e.yml` never exercised the streak-retention-floor probe against a
+  real PostgreSQL at all — the same "recovered nothing and said it had" shape
+  run 31131064381 surfaced for the other two jobs. The gate now carries the
+  `workflow_dispatch` term, and `e2e-ok`'s verdict drops the separate
+  `must_run_pg` must-run set #4628 had added purely to excuse that skip: all
+  three work jobs share one `must_run`, so a pg-probe skip on any must-run
+  event is a broken gate again rather than a tolerated one. The job needs
+  nothing the dispatch path lacks — no service container, no secret, no
+  workflow input; it pulls `postgres:16-alpine` in its own step. (#4638)
+
 - **CI: `e2e-ok` no longer reports a path-skipped run as a verified pass.** The
   sentinel collapsed "the e2e shards ran and passed" and "nothing ran at all"
   into the same silent green, so a reviewer could not tell them apart. PR #4619
@@ -54,9 +69,8 @@ now an anomaly worth investigating, not the norm.
   `relevant=false`, every job skipped, and the run went green in 3 seconds
   (run 31131064381) without testing anything. `hindsight-watch-pg-probe`
   (added to the sentinel's `needs:` by #4623) is aggregated by the same
-  three-state verdict, with its must-run set derived from its own `if:` —
-  it carries no `workflow_dispatch` term, so a dispatch skip warns there
-  rather than failing the gate.
+  three-state verdict; its `if:` gained the matching `workflow_dispatch`
+  term in #4638, above.
 - **CI: the `hindsight-probe` `Timeout calling "onTaskUpdate"` flake is
   fixed at the cause.** All five tests passed and vitest still exited 1. The
   docker probes drove `docker run` / `docker exec` through `execFileSync`,

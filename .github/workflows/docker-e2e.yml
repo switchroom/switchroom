@@ -776,10 +776,15 @@ jobs:
   #
   # merge_group and push run it unconditionally, same reasoning as
   # hindsight-probe: a job that exists so a probe cannot silently skip
-  # must not silently skip on candidate-main.
+  # must not silently skip on candidate-main. workflow_dispatch is here
+  # for the same reason it is on e2e-shard and hindsight-probe: `changes`
+  # has no diff base on a dispatch, so `hindsightwatch` comes back false
+  # and the advertised recovery lever would exercise no pg probe at all
+  # (#4638). The job needs nothing the dispatch path lacks — no service
+  # container, no secret, no input; it pulls postgres:16-alpine itself.
   hindsight-watch-pg-probe:
     needs: changes
-    if: github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.hindsightwatch == 'true'
+    if: github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hindsightwatch == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -871,17 +876,15 @@ jobs:
 
           # Events where the work jobs are unconditional (their `if:` has
           # no filter term). A skip on one of these is a broken gate.
-          # Derived PER JOB from that job's own `if:`, not globally:
-          # e2e-shard and hindsight-probe carry a workflow_dispatch term,
-          # hindsight-watch-pg-probe does not, so a dispatch skip is
-          # legitimate for it and a broken gate for the other two.
+          # One set for all three: since #4638 every work job's `if:`
+          # carries the same push / merge_group / workflow_dispatch terms
+          # (hindsight-watch-pg-probe used to omit workflow_dispatch and
+          # needed a separate, weaker `must_run_pg` to excuse the skip).
+          # If a job's `if:` ever diverges again, split this back out —
+          # the set must be derived from the gate it is judging.
           must_run=0
           case "$EVENT" in
             push|merge_group|workflow_dispatch) must_run=1 ;;
-          esac
-          must_run_pg=0
-          case "$EVENT" in
-            push|merge_group) must_run_pg=1 ;;
           esac
 
           fail=0
@@ -923,7 +926,7 @@ jobs:
           verdict e2e-shard "$E2E_SHARD" "$WANT_E2E_SHARD" "$must_run"
           verdict hindsight-probe "$HINDSIGHT_PROBE" "$WANT_HINDSIGHT_PROBE" "$must_run"
           verdict hindsight-watch-pg-probe "$HINDSIGHT_WATCH_PG_PROBE" \
-            "$WANT_HINDSIGHT_WATCH_PG_PROBE" "$must_run_pg"
+            "$WANT_HINDSIGHT_WATCH_PG_PROBE" "$must_run"
 
           if [ "$fail" -ne 0 ]; then
             headline="❌ FAILED"

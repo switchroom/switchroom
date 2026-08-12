@@ -205,15 +205,14 @@ describe('e2e-ok verdict — a skip that should not have happened is a failure',
       expect(r.stdout).toContain('::error title=e2e gate broken::e2e-shard was SKIPPED')
       expect(r.stdout).toContain('::error title=e2e gate broken::hindsight-probe was SKIPPED')
 
-      // must-run is derived PER JOB from that job's own `if:`.
-      // hindsight-watch-pg-probe carries no workflow_dispatch term, so a
-      // dispatch skip is legitimate for it and a broken gate elsewhere.
-      const pgBroken = r.stdout.includes(
-        '::error title=e2e gate broken::hindsight-watch-pg-probe was SKIPPED',
-      )
-      expect(pgBroken, `hindsight-watch-pg-probe skip on ${event}`).toBe(
-        event !== 'workflow_dispatch',
-      )
+      // Since #4638 all three work jobs carry the same must-run terms, so
+      // a skip on ANY of these events — workflow_dispatch included — is a
+      // broken gate for the pg probe too. Before #4638 it was excused on
+      // dispatch by a separate, weaker `must_run_pg`.
+      expect(
+        r.stdout,
+        `hindsight-watch-pg-probe skip on ${event} must fail the gate`,
+      ).toContain('::error title=e2e gate broken::hindsight-watch-pg-probe was SKIPPED')
     })
   }
 
@@ -244,9 +243,13 @@ describe('docker-e2e — the workflow_dispatch recovery lever actually runs the 
   // hindsight-probe both `skipped` — `changes` has no diff base on a
   // dispatch, so `relevant` came back false. The advertised recovery
   // lever recovered nothing and said it had.
+  //
+  // hindsight-watch-pg-probe kept that exact gap after #4628 (#4638): its
+  // `if:` carried push and merge_group only, so a manual dispatch never
+  // exercised the streak-retention-floor probe against a real PostgreSQL.
   const jobs = (workflow.jobs ?? {}) as Record<string, { if?: string }>
 
-  for (const name of ['e2e-shard', 'hindsight-probe']) {
+  for (const name of ['e2e-shard', 'hindsight-probe', 'hindsight-watch-pg-probe']) {
     it(`${name} runs on workflow_dispatch`, () => {
       const cond = jobs[name]?.if ?? ''
       expect(cond, `${name} must have a gating if:`).toBeTruthy()
