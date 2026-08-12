@@ -35,6 +35,23 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **fleet-health: the ledger's `windowDays` now actually windows the
+  findings.** `buildLedger` read `windowDays` but aggregated EVERY finding ever
+  recorded into the dedup_key map — `count` and `reach` had no time filter, so
+  the window only damped `priority_score` through `recencyFactor`, which floors
+  at 0.1 and never reaches zero. Consequence, observed on the live ledger: a
+  delivery-failure cluster whose 177 occurrences all fell between 2026-07-18
+  and 2026-07-27, fixed on 2026-07-26 with zero occurrences since, still ranked
+  #1 — and would have held that rank for a further two weeks purely because
+  nothing aged out. Findings outside the window are now excluded from `count`,
+  `reach`, `recency` and therefore from ranking. A cluster whose occurrences
+  have all aged out produces no aggregate and falls through the existing
+  close-on-zero path: it is emitted once as a zero-frequency `closed` issue so
+  `gh-sync` closes its GitHub issue, then drops out. A finding with no usable
+  timestamp (null or unparseable) is KEPT, not silently dropped — an absent
+  timestamp is not evidence of age, and such findings score recency 0 so they
+  cannot float to the top on their own.
+
 - **hermes adapter: stop reporting success for writes and reads that never
   happened.** The REST handler's `/api/cron` and `/api/profiles` prefix
   branches both ended in a catch-all `return {status: 200, body: {}}`, which

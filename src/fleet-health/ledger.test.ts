@@ -9,13 +9,36 @@ import { readFleetHealth } from "../web/fleet-health-read.js";
 
 const CHAT = "77770002";
 
-function dupFinding(agent: string, seq: number): Finding {
+function dupFinding(agent: string, seq: number, ts = "2026-07-02T21:03:00Z"): Finding {
   return {
     signal: "duplicate-delivery-represent",
     agent,
     turn_id: `${CHAT}:_#${seq}`,
     log_pointer: `logs/${agent}/gateway-supervisor.log:${seq}`,
-    ts: "2026-07-02T21:03:00Z",
+    ts,
+  };
+}
+
+/** The real-world cluster this regression is about: `reply-delivery-failure`
+ *  (severity 3) on the delivery job spec. */
+function deliveryFailFinding(agent: string, seq: number, ts: string): Finding {
+  return {
+    signal: "reply-delivery-failure",
+    agent,
+    turn_id: `${CHAT}:_#${seq}`,
+    log_pointer: `logs/${agent}/gateway-supervisor.log:${seq}`,
+    ts,
+  };
+}
+
+/** A finding on a DIFFERENT job spec, so a scenario can compare ranks. */
+function killedFinding(agent: string, seq: number, ts: string): Finding {
+  return {
+    signal: "killed-incomplete-turn",
+    agent,
+    turn_id: `${CHAT}:_#${seq}`,
+    log_pointer: `agents/${agent}/turns.jsonl:${seq}`,
+    ts,
   };
 }
 
@@ -58,6 +81,135 @@ describe("buildLedger", () => {
     )!;
     expect(nd.issues[0].gh_issue).toBe(4242);
     expect(nd.issues[0].status).toBe("resolved-pending-verify");
+  });
+});
+
+describe("buildLedger — windowDays actually windows the findings", () => {
+  const DELIVERY = "talk-to-agents-from-anywhere";
+  const KILLED = "steer-or-queue-mid-flight";
+
+  const FLEET = ["clerk", "marko", "klanker", "scout"];
+
+  /** The real regression: 177 delivery-failure occurrences fleet-wide, all
+   *  between 2026-07-18 and 2026-07-27, fixed on 2026-07-26, none since. Scanned
+   *  well past the 30-day window they must no longer count at all. */
+  function staleDeliveryBurst(): Finding[] {
+    return Array.from({ length: 177 }, (_, i) =>
+      deliveryFailFinding(
+        FLEET[i % FLEET.length],
+        i,
+        `2026-07-${String(18 + (i % 10)).padStart(2, "0")}T12:00:00Z`,
+      ),
+    );
+  }
+
+  it("drops a cluster whose every occurrence is older than the window", () => {
+    const now = new Date("2026-09-01T00:00:00Z"); // > 30d after 2026-07-27
+    const led = buildLedger(staleDeliveryBurst(), { now });
+    const delivery = led.records.find((r) => r.job_spec === DELIVERY)!;
+    expect(delivery.issues).toHaveLength(0);
+    expect(delivery.open_issue_count).toBe(0);
+    expect(delivery.priority_score).toBe(0);
+  });
+
+  it("ranks a small FRESH cluster above a large stale one", () => {
+    const now = new Date("2026-09-01T00:00:00Z");
+    const led = buildLedger(
+      [
+        ...staleDeliveryBurst(), // 177, all out of window
+        killedFinding("clerk", 1, "2026-08-31T09:00:00Z"), // 2, in window
+        killedFinding("clerk", 2, "2026-08-31T10:00:00Z"),
+      ],
+      { now },
+    );
+    const delivery = led.records.find((r) => r.job_spec === DELIVERY)!;
+    const killed = led.records.find((r) => r.job_spec === KILLED)!;
+    expect(killed.priority_score).toBeGreaterThan(delivery.priority_score);
+    // and the fresh one is genuinely at the top of the ledger
+    const top = [...led.records].sort(
+      (a, b) => b.priority_score - a.priority_score,
+    )[0];
+    expect(top.job_spec).toBe(KILLED);
+  });
+
+  it("counts only the in-window occurrences of a mixed cluster", () => {
+    const now = new Date("2026-09-01T00:00:00Z");
+    const led = buildLedger(
+      [
+        ...staleDeliveryBurst(), // 177 stale, fleet-wide
+        deliveryFailFinding("clerk", 900, "2026-08-30T12:00:00Z"), // 1 fresh
+        deliveryFailFinding("clerk", 901, "2026-08-31T12:00:00Z"), // 1 fresh
+      ],
+      { now },
+    );
+    const delivery = led.records.find((r) => r.job_spec === DELIVERY)!;
+    expect(delivery.issues).toHaveLength(1);
+    expect(delivery.issues[0].frequency).toBe(2);
+    // the other three agents appear only in the stale burst
+    expect(delivery.issues[0].reach).toEqual(["clerk"]);
+    expect(delivery.issues[0].recency).toBe("2026-08-31T12:00:00Z");
+  });
+
+  it("closes a prior-open issue whose occurrences all aged out", () => {
+    const at = new Date("2026-07-28T00:00:00Z");
+    const prior = buildLedger(staleDeliveryBurst(), { now: at });
+    const pd = prior.records.find((r) => r.job_spec === DELIVERY)!;
+    expect(pd.issues[0].frequency).toBe(177); // in-window at scan time
+    pd.issues[0].gh_issue = 4242;
+
+    // Same findings, scanned a month later — every one is now out of window.
+    const next = buildLedger(staleDeliveryBurst(), {
+      now: new Date("2026-09-01T00:00:00Z"),
+      prior,
+    });
+    const nd = next.records.find((r) => r.job_spec === DELIVERY)!;
+    expect(nd.issues).toHaveLength(1);
+    expect(nd.issues[0].status).toBe("closed");
+    expect(nd.issues[0].frequency).toBe(0);
+    expect(nd.issues[0].gh_issue).toBe(4242);
+    expect(nd.open_issue_count).toBe(0);
+  });
+
+  it("keeps an undatable finding (ts null) rather than silently dropping it", () => {
+    const now = new Date("2026-09-01T00:00:00Z");
+    const led = buildLedger(
+      [
+        { ...dupFinding("clerk", 1), ts: null },
+        { ...dupFinding("clerk", 2), ts: null },
+      ],
+      { now },
+    );
+    const delivery = led.records.find((r) => r.job_spec === DELIVERY)!;
+    expect(delivery.issues).toHaveLength(1);
+    expect(delivery.issues[0].frequency).toBe(2);
+    // …but an undatable-only cluster carries no recency, so it cannot rank.
+    expect(delivery.issues[0].recency).toBe(null);
+    expect(delivery.priority_score).toBe(0);
+  });
+
+  it("keeps an unparseable-ts finding, and it still cannot rank", () => {
+    const now = new Date("2026-09-01T00:00:00Z");
+    const led = buildLedger(
+      [{ ...dupFinding("clerk", 1), ts: "not-a-timestamp" }],
+      { now },
+    );
+    const delivery = led.records.find((r) => r.job_spec === DELIVERY)!;
+    expect(delivery.issues[0].frequency).toBe(1);
+    // `recencyFactor` cannot parse it → 0, so the cluster scores 0 regardless.
+    expect(delivery.priority_score).toBe(0);
+  });
+
+  it("honours a custom (shorter) windowDays", () => {
+    const now = new Date("2026-08-12T00:00:00Z"); // inside the default 30d
+    const findings = staleDeliveryBurst();
+    const wide = buildLedger(findings, { now });
+    const narrow = buildLedger(findings, { now, windowDays: 7 });
+    expect(
+      wide.records.find((r) => r.job_spec === DELIVERY)!.issues[0].frequency,
+    ).toBe(177);
+    expect(
+      narrow.records.find((r) => r.job_spec === DELIVERY)!.issues,
+    ).toHaveLength(0);
   });
 });
 
