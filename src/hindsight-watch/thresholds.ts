@@ -750,12 +750,36 @@ export const RECALL_P95_PAGE_MS = 6000;
  * and folding the baseline in `run.ts`'s fold-then-evaluate order:
  *
  *   population (pool baseline above the gate)   ticks   ≥0.4   ≥0.6
- *   2026-07-29 → 08-12                           1356      0      0
+ *   2026-07-29 → 08-12                           1358      0      0
  *
- * ZERO false fires, and the margin is not marginal: across all 1356 ticks the
- * observed pool median never once fell BELOW its trailing baseline at all. The
- * worst excursion is a 1.14 % SURPLUS, and the settled era sits a median 7.95 %
- * above baseline. Any line down to a few percent would have measured 0 too.
+ * ZERO false fires, and the margin is not marginal: across all 1358 ticks the
+ * observed pool median never once fell BELOW its trailing baseline. The closest
+ * it came was a TIE — observed 13 against baseline 13 on 07-29, the era's first
+ * scored day — and the settled era sits a median 40.7 % ABOVE baseline, with
+ * even the worst 5 % of ticks 4.8 % above. Any line down to a few percent would
+ * have measured 0 too.
+ *
+ * Two numbers in an earlier revision of this block were wrong and are corrected
+ * above: a "1.14 % worst excursion" and a "median 7.95 % above baseline". Both
+ * are real measurements, but they are the PER-DAY closest approach for 08-11/12
+ * and for 08-10 respectively — single days quoted as if they described the era.
+ * The era-wide figures are the ones above. Recorded rather than quietly
+ * overwritten, because this block's whole contract is that its numbers are
+ * reproducible, and a reader who reran the old ones would have found neither.
+ *
+ * Units, since an independent replay of this block disagreed on the sign: the
+ * observed series is the fleet pool median from `probeRecallLogs`' unit — each
+ * agent's last {@link RECALL_WINDOW_ROWS} rows aged to
+ * {@link RECALL_MAX_ROW_AGE_MS}, unioned, then summarized — and the baseline is
+ * the median of the trailing {@link RECALL_BASELINE_DAYS} COMPLETED days'
+ * medians, evaluated before the current tick is folded in. The ratio is
+ * `(baseline − observed) / baseline`, matching `fractionalDrop`, so positive is
+ * a DROP. Under that convention the 08-11/12 excursion is a 1.14 % surplus, not
+ * a deficit; a replay reporting ≈1.11 % the other way is the same tick read
+ * with the opposite sign, plus drift from an append-only log that has grown
+ * since. Counts here were replayed on 2026-08-12 over 25 321 rows and will
+ * drift as the log grows — the 0-fire result is what this block asserts, and
+ * the non-drifting bound is the fixture one below.
  *
  * That is the honest shape of the result, and it is stated rather than dressed
  * up: the repaired fleet's pool RECOVERED monotonically (baseline 13 → 88 over
@@ -768,13 +792,23 @@ export const RECALL_P95_PAGE_MS = 6000;
  * observed healthy excursion by 2.29× and 0.6 by 3.43×. Both numbers are
  * pinned by `recall-degradation.test.ts` so they cannot drift silently.
  *
- * The pre-repair eras fire heavily (1251 ticks across 05-01 → 07-19) and those
- * are TRUE positives, not noise. 1004 of them land on a tick where
- * `recall-candidate-floor` is already breaching, so they cost no extra DM. The
- * other 247 are the ones that justify the arm existing: pool medians of 9-13
- * against baselines of 15-28 — 40-54 % regressions sitting comfortably ABOVE
- * the absolute floor's warn line of {@link RECALL_POOL_MEDIAN_WARN} (8), which
- * is exactly the band no floor can see.
+ * The pre-repair eras fire heavily — 1339 ticks, first fire 05-30, last 07-13 —
+ * and those are TRUE positives, not noise. They split three ways:
+ *
+ *   1007  `recall-candidate-floor` is already BREACHING on the same tick, so
+ *         the arm costs no extra DM; it is second-sourcing a known outage.
+ *     85  the floor returns `no-data` (fewer than {@link RECALL_MIN_SAMPLES}
+ *         rows reporting `pre_cap_count`), so there is no floor verdict to
+ *         agree or disagree with.
+ *    247  the floor is scored and OK. These are the ones that justify the arm
+ *         existing: pool medians of 9-13 against baselines of 15-28 — drops of
+ *         40.0 % to 64.3 % sitting comfortably ABOVE the floor's warn line of
+ *         {@link RECALL_POOL_MEDIAN_WARN} (8), which is exactly the band no
+ *         absolute floor can see.
+ *
+ * The 85 are called out rather than folded into the 247 because "the floor did
+ * not breach" and "the floor could not score" are different claims, and only
+ * the second group is evidence that the arm sees something no floor can.
  */
 export const RECALL_QUALITY_DROP_WARN = 0.4;
 export const RECALL_QUALITY_DROP_PAGE = 0.6;
@@ -866,20 +900,24 @@ export const RECALL_BASELINE_MAX_OBS_PER_DAY = 96;
  * actually uses (9 897 real ticks, 15-minute cadence):
  *
  *   day      row rate   tick median   ticks already ≥5 % warn
- *   07-28      3.08 %       5.75 %                     70/96
- *   07-30      4.28 %       5.33 %                     88/96
+ *   07-28      3.08 %       5.74 %                     70/96
+ *   07-30      4.28 %       5.31 %                     88/96
  *
  * Both days already warn on the large majority of their ticks, because a
  * trailing 24 h window on 07-28 still holds 07-27's 36.4 % tail. There is no
  * blind band to close.
  *
  * Lowering the line is not free either. From 08-09 onward every candidate down
- * to 0.5 % measures 0/301 ticks, so the settled fleet is genuinely silent at
- * any of them — but 08-08, the day whose 0.20 % row rate IS the healthy
- * ceiling quoted above, goes from 22 breaching ticks at 5 % to 41 at 1 %, for
- * the same trailing-window reason. Warn 5 % is kept: it already covers the
- * shape review wanted covered, and moving it would only add chatter to the
- * healthiest day in the record.
+ * to 0.5 % measures 0/302 ticks (the settled fleet peaks at a 0.29 % tick
+ * rate), so the fleet is genuinely silent at any of them — but 08-08, the
+ * recovery day whose 0.20 % row rate IS the healthy ceiling quoted above, has
+ * a long trailing-window tail: 21 of its 96 ticks breach at 5 %, and 40 would
+ * at 1 %. Nearly double the chatter, on a day the fleet was already coming
+ * right. Warn 5 % is kept: it already covers the shape review wanted covered,
+ * and moving it would only add noise to the healthiest week in the record.
+ * Both directions are now pinned in `recall-degradation.test.ts` — raising the
+ * line past 07-30's 5.33 % tick median reddens, and so does dropping it under
+ * 08-08's in-band tail.
  */
 export const RECALL_DEADLINE_HIT_WARN = 0.05;
 export const RECALL_DEADLINE_HIT_PAGE = 0.2;

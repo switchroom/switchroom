@@ -378,21 +378,33 @@ describe("the 2026-08-01 → 08-07 degradation the fourteen existing signals mis
     expect(RECALL_P95_PAGE_MS).toBeLessThanOrEqual(Math.round(wall * 0.7));
 
     // …and the band between the two arms is still WATCHED, just not paged.
-    // This half IS threshold-relative — it is a claim about the arms, not
-    // about the fleet — so it derives its fixture from the constants and
-    // survives any retune that keeps the arms ordered.
+    //
+    // The obvious way to write this — fixture at the MIDPOINT of warn and page,
+    // expect "warn" — is inert: the midpoint of any ordered pair lies between
+    // them, so it holds for warn 5900 / page 6000 as readily as for 3000/6000
+    // and can never fail. It needs an EXTERNAL anchor, so it gets the measured
+    // one: over the live logs the fleet's trailing p95 moves between adjacent
+    // ticks by 5 ms at p50 and 285 ms at p95 (417 non-zero moves over 2217
+    // scored ticks, replayed 2026-08-12; largest single move 1731 ms). A warn
+    // band only a couple of hundred ms wide is one the fleet steps clean over
+    // between two ticks, so "watched but not paged" would name a band that
+    // nothing is ever observed in. Require at least 2× the p95 move.
+    const MIN_WARN_BAND_MS = 570; // 2 × the measured 285 ms p95 adjacent move
+    expect(RECALL_P95_PAGE_MS - RECALL_P95_WARN_MS).toBeGreaterThanOrEqual(MIN_WARN_BAND_MS);
     const betweenTheArms = ringOf(
       sickRows({
         score: 0.7,
         pool: 90,
         latP50: Math.round(RECALL_P95_WARN_MS * 0.8),
-        latP95: Math.round((RECALL_P95_WARN_MS + RECALL_P95_PAGE_MS) / 2),
+        // A real point inside the band the assertion above just guaranteed,
+        // rather than a midpoint that moves with whatever the pair happens
+        // to be.
+        latP95: RECALL_P95_WARN_MS + Math.round(MIN_WARN_BAND_MS / 2),
         deadlineHitRate: 0,
       }),
     );
     expect(evaluateRecallLatency(betweenTheArms).severity).toBe("warn");
     expect(evaluateRecallDeadlinePinning(betweenTheArms).state).toBe("ok");
-    expect(RECALL_P95_PAGE_MS).toBeGreaterThan(RECALL_P95_WARN_MS);
   });
 
   it("the sub-5 % truncation days are NOT in a blind band — they already warn", () => {
@@ -417,6 +429,31 @@ describe("the 2026-08-01 → 08-07 degradation the fourteen existing signals mis
       expect(`${day}:${v.state}/${v.severity}`).toBe(`${day}:breach/warn`);
     }
     expect(RECALL_DEADLINE_HIT_WARN).toBeLessThanOrEqual(0.0533);
+
+    // The other half of the argument, which was recorded in prose but left
+    // unguarded: lowering the line is NOT free, so the line needs a FLOOR too.
+    //
+    // 08-08 is the recovery day — median tick rate 0.47 %, but a long tail. At
+    // the 5 % line 21 of its 96 ticks breach; at a 1 % line 40 do, nearly
+    // double, on a day the fleet was already coming right. These are real
+    // trailing-window rates observed on that day, every one of them under the
+    // current line, and each would start warning if the line dropped to 1 %.
+    //
+    // `sickRows` realises a rate as `ceil(n × rate) / n`, so with n = 120 the
+    // granularity is 0.83 % and the day's true band-top of 4.64 % would land on
+    // 6/120 = exactly 5.00 % and breach for a rounding reason rather than a
+    // real one. 4.08 % is the largest observed value that survives the
+    // generator intact, so it is the one asserted.
+    for (const tickRate of [0.0117, 0.0203, 0.0344, 0.0408]) {
+      const v = evaluateRecallDeadlinePinning(
+        ringOf(sickRows({ score: 0.7, pool: 90, latP50: 1200, latP95: 1600, deadlineHitRate: tickRate })),
+      );
+      expect(`${tickRate}:${v.state}`).toBe(`${tickRate}:ok`);
+    }
+    // Stated as the invariant, so the failure names the rule: the line must sit
+    // above 08-08's in-band tail (the genuinely healthy days that follow peak
+    // at 0.29 %, so there is room) — dropping it to 1 % or 2 % reddens here.
+    expect(RECALL_DEADLINE_HIT_WARN).toBeGreaterThan(0.0408);
   });
 });
 
