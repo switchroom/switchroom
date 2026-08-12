@@ -184,6 +184,48 @@ async function buildAllSessions(
   return sessions
 }
 
+/**
+ * Source scoping for the session-list endpoints.
+ *
+ * Upstream's `list_sessions_rich` takes `source` (keep only this source) and
+ * `exclude_sources` (drop these), and the desktop leans on both: the sidebar's
+ * cron slice asks for `source=cron`, its recents slice excludes the cron and
+ * messaging taxonomies, and its messaging slice excludes the local ones
+ * (`apps/desktop/src/app/session/hooks/use-session-list-actions.ts:47-50`,
+ * `hermes.ts:436-441` at 9da6d45). Ignoring them makes every slice return the
+ * identical unfiltered fleet — the starvation the upstream comment at
+ * `hermes.ts:418-422` describes.
+ *
+ * Every switchroom session reports `source: "switchroom"` (see
+ * {@link toHermesSession}), which is in none of the desktop's exclude
+ * taxonomies and is not `cron` — so `source=cron` correctly yields nothing.
+ */
+function filterSessionsBySource<T extends { source: string }>(
+  sessions: T[],
+  opts: { source?: string | null; excludeSources?: string[] },
+): T[] {
+  const exclude = new Set(opts.excludeSources ?? []);
+  return sessions.filter(
+    (s) => (!opts.source || s.source === opts.source) && !exclude.has(s.source),
+  );
+}
+
+/** Read a comma-separated query param (`exclude_sources`, `recents_exclude`, …). */
+function csvParam(params: URLSearchParams, key: string): string[] {
+  return (params.get(key) ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Clamp a numeric query param the way upstream's sidebar route does. */
+function intParam(params: URLSearchParams, key: string, fallback: number): number {
+  const raw = params.get(key);
+  if (raw === null) return fallback;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? Math.min(Math.max(n, 1), 500) : fallback;
+}
+
 // ─── prompt.submit → inject_inbound ──────────────────────────────────────────
 
 interface InjectResult {
@@ -607,7 +649,11 @@ export async function handleHermesRest(
     method === "GET" &&
     (pathname === "/api/sessions" || pathname === "/api/profiles/sessions")
   ) {
-    const sessions = await buildAllSessions(config);
+    const query = new URLSearchParams(search);
+    const sessions = filterSessionsBySource(await buildAllSessions(config), {
+      source: query.get("source"),
+      excludeSources: csvParam(query, "exclude_sources"),
+    });
     return {
       status: 200,
       body: {
@@ -616,6 +662,58 @@ export async function handleHermesRest(
         limit: sessions.length,
         offset: 0,
         profile_totals: { default: sessions.length },
+      },
+    };
+  }
+
+  // GET /api/profiles/sessions/sidebar — the batched three-slice sidebar payload
+  // (SidebarSessionsResponse, apps/desktop/src/hermes.ts:486-491 at 9da6d45).
+  //
+  // MUST be served or 404'd honestly, never answered with a bare 200: the
+  // desktop's `isEndpointMissingError` (hermes.ts:520-536) only recognises
+  // 404-shaped failures, so a 200 with the wrong body never trips the
+  // `listSidebarSessionsLegacy` fallback — the sidebar just renders three
+  // permanently-empty slices. Serving it for real is strictly better than
+  // 404-ing, because the data is the same `buildAllSessions` list the
+  // per-slice route already answers from.
+  //
+  // Slice semantics mirror hermes_cli/web_routers/profiles.py:232-383: all
+  // three windows are recency-ordered and source-scoped, cron is an implicit
+  // `source=cron`, and recents/messaging honour the caller's CSV exclude lists.
+  //
+  // Consequence worth knowing: `source: "switchroom"` is in neither the
+  // recents nor the messaging exclude list, so a switchroom session appears in
+  // both slices. That is what the taxonomy says — every switchroom session is
+  // a Telegram thread AND a recent chat — and the alternative (retagging
+  // sessions as `source: "telegram"`) would move the whole fleet OUT of
+  // recents, since the desktop excludes every messaging source from it
+  // (use-session-list-actions.ts:47). Deliberate, not an oversight.
+  if (method === "GET" && pathname === "/api/profiles/sessions/sidebar") {
+    const query = new URLSearchParams(search);
+    const all = await buildAllSessions(config);
+    const recentsCap = intParam(query, "recents_limit", 20);
+    const cronCap = intParam(query, "cron_limit", 50);
+    const messagingCap = intParam(query, "messaging_limit", 100);
+    const recents = filterSessionsBySource(all, {
+      excludeSources: csvParam(query, "recents_exclude"),
+    }).slice(0, recentsCap);
+    const cron = filterSessionsBySource(all, { source: "cron" }).slice(0, cronCap);
+    const messaging = filterSessionsBySource(all, {
+      excludeSources: csvParam(query, "messaging_exclude"),
+    }).slice(0, messagingCap);
+    return {
+      status: 200,
+      body: {
+        // `profiles_usage` is deliberately omitted rather than zero-filled:
+        // switchroom does no token/spend metering, and upstream declares the
+        // key optional (hermes.ts:465-467), so absent is the honest answer.
+        recents: {
+          sessions: recents,
+          profiles_truncated: { default: recents.length >= recentsCap },
+        },
+        cron: { sessions: cron },
+        messaging: { sessions: messaging, total: messaging.length },
+        errors: [],
       },
     };
   }
@@ -735,24 +833,63 @@ export async function handleHermesRest(
       return { status: 200, body: job };
     }
 
-    // Create/update/pause/resume/delete: schedules are config-owned, not UI-mutable.
-    if (method === "POST" || method === "PATCH" || method === "DELETE") {
+    // GET /api/cron/delivery-targets — the platforms a cron job may deliver to.
+    // Upstream (hermes_cli/web_routers/cron.py:72-95) always prepends the
+    // implicit `local` option and derives the rest from the configured gateway
+    // platforms. Switchroom's only delivery platform is Telegram, and a cron
+    // fire lands in the agent's own thread — so `home_target_set` is true iff
+    // at least one agent actually resolves a channel target.
+    if (method === "GET" && pathname === "/api/cron/delivery-targets") {
+      const telegramConfigured = Object.keys(config.agents ?? {}).some(
+        (name) =>
+          resolveChannelTarget(config as Parameters<typeof resolveChannelTarget>[0], name) !== null,
+      );
+      return {
+        status: 200,
+        body: {
+          targets: [
+            { id: "local", name: "Local (save only)", home_target_set: true, home_env_var: null },
+            {
+              id: "telegram",
+              name: "Telegram",
+              home_target_set: telegramConfigured,
+              home_env_var: null,
+            },
+          ],
+        },
+      };
+    }
+
+    // GET /api/cron/blueprints — the automation-blueprint gallery
+    // (`{ blueprints }`, read at apps/desktop/src/hermes.ts:1480-1486).
+    // Switchroom has no blueprint catalog, and instantiating one would be a
+    // schedule write, which the 422 below refuses anyway — so the honest
+    // answer is an empty catalog, not a bare 200 that leaves `blueprints`
+    // undefined at the call site.
+    if (method === "GET" && pathname === "/api/cron/blueprints") {
+      return { status: 200, body: { blueprints: [] } };
+    }
+
+    // Create/update/pause/resume/delete: schedules are config-owned, not
+    // UI-mutable. PUT is in this list because `updateCronJob`
+    // (apps/desktop/src/hermes.ts:1428-1434) uses it — without it the edit fell
+    // through to a 200 and the desktop reported a save that never happened.
+    if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
       return { status: 422, body: { error: "Schedules are managed via switchroom YAML config — edit the agent config file and apply." } };
     }
 
-    return { status: 200, body: {} };
+    // No blanket 200 for unrecognised /api/cron reads: a fabricated empty
+    // success is indistinguishable from a served route at the call site, so an
+    // unknown path 404s (via the caller's null handling) and the desktop can
+    // tell that the route is missing.
+    return null;
   }
 
-  if (method === "GET" && pathname.startsWith("/api/messaging")) {
-    // GET /api/messaging/platforms → { platforms: [] }
-    if (pathname === "/api/messaging/platforms") return { status: 200, body: { platforms: [] } };
-    return { status: 200, body: {} };
+  if (method === "GET" && pathname === "/api/messaging/platforms") {
+    return { status: 200, body: { platforms: [] } };
   }
 
   if (method === "GET" && pathname.startsWith("/api/profiles")) {
-    if (pathname.includes("sessions")) {
-      return { status: 200, body: { sessions: [], total: 0, limit: 0, offset: 0 } };
-    }
     // /api/profiles — ProfilesResponse: { profiles: ProfileInfo[] }
     if (pathname === "/api/profiles") {
       return { status: 200, body: { profiles: [] } };
@@ -761,11 +898,62 @@ export async function handleHermesRest(
     if (pathname.endsWith("/soul")) {
       return { status: 200, body: { content: "", exists: false } };
     }
-    return { status: 200, body: {} };
-  }
-
-  if (method === "GET" && pathname === "/api/memory/providers") {
-    return { status: 200, body: {} };
+    // /api/profiles/:name/setup-command — upstream returns an OBJECT,
+    // `{"command": _profile_setup_command(name)}`
+    // (hermes_cli/web_routers/profiles.py:779-781), and the desktop
+    // destructures `.command` off it (hermes.ts:1544-1548). Switchroom has no
+    // shell-launchable profiles, so the command is empty — but the key must
+    // still be present and a string, not missing and not null.
+    if (pathname.endsWith("/setup-command")) {
+      return { status: 200, body: { command: "" } };
+    }
+    // /api/profiles/active — { active, current }
+    // (hermes_cli/web_routers/profiles.py:738-755). NOT emitted from
+    // apps/desktop/src/hermes.ts: `refreshActiveProfile`
+    // (apps/desktop/src/store/profile.ts:105-118) calls it directly, at
+    // startup. Switchroom has exactly one implicit profile and no
+    // `hermes profile use` sticky-default concept, so both keys are the
+    // desktop's own canonical root-profile name — which is also what upstream
+    // falls back to when its profile module raises (profiles.py:747, :753) and
+    // what `$activeProfile` is seeded with (store/profile.ts:31).
+    if (pathname === "/api/profiles/active") {
+      return { status: 200, body: { active: "default", current: "default" } };
+    }
+    // /api/profiles/projects/tree — the all-profiles grouped sidebar's tree
+    // (hermes_cli/web_routers/profiles.py:457-533). Also not emitted from
+    // hermes.ts: `refreshProjectTreeAcrossProfiles`
+    // (apps/desktop/src/store/projects.ts:473-499) calls it directly.
+    //
+    // Switchroom has no project/checkout grouping to report — a session is an
+    // agent, not a repo working tree — so every list is empty. Served rather
+    // than 404'd because the caller's failure path
+    // (`markProjectsRpcFailure`, store/projects.ts:52-56) only reacts to
+    // *JSON-RPC method-missing* errors (`isMissingRpcMethod`,
+    // lib/gateway-rpc.ts:2-6), which an HTTP 404 never matches: a 404 leaves
+    // `$projectsRpcAvailable` stuck at null forever, while the full-shape
+    // empty payload runs `applyProjectTreePayload` + `markProjectsRpcSuccess`
+    // and tells the truth ("the surface exists, it has nothing in it").
+    // All four upstream keys are emitted, not just the one the desktop's
+    // `ProjectTreePayload` (store/projects.ts:389-393) declares.
+    if (pathname === "/api/profiles/projects/tree") {
+      return {
+        status: 200,
+        body: { projects: [], active_id: null, scoped_session_ids: [], errors: [] },
+      };
+    }
+    // Deliberate 404s under this prefix, and why each is safe:
+    //   - POST /api/profiles/sessions/pull-requests (hermes.ts:571-582) —
+    //     switchroom transcripts carry no `gh pr create` tool output to scan.
+    //     `recoverSessionPullRequests` (store/pull-requests.ts:96) awaits it
+    //     inside a try/catch and simply records no PRs.
+    // Every other verb under /api/profiles (create/rename/delete/import/
+    // export/soul-write) is a profile *mutation*; switchroom's fleet is
+    // YAML-owned, and those all fell through to a 404 before this branch too
+    // (the prefix branch has always been GET-gated).
+    //
+    // Anything else 404s rather than returning a fabricated 200 the client
+    // cannot distinguish from a real answer.
+    return null;
   }
 
   // GET /api/fs/default-cwd — remote mode cwd seeding (caught by caller)
@@ -783,7 +971,14 @@ export async function handleHermesRest(
     return { status: 200, body: { ok: true, model: null } };
   }
 
-  // GET /api/auth/providers — OAuth provider listing (only needed in OAuth mode)
+  // GET /api/auth/providers — the login-bootstrap provider list
+  // (hermes_cli/dashboard_auth/routes.py:152). NOT dead weight: Hermes
+  // Desktop's *main* process probes it — `gatewayAuthProviders`
+  // (apps/desktop/electron/main.ts:4954) and `probeRemoteAuthMode`
+  // (:7590) — to label the sign-in button and to tell a password provider
+  // from an OAuth one. Both read `body.providers` and both treat a failure as
+  // "keep the strict guard", so switchroom's token-auth gateway answering an
+  // empty list is the correct signal.
   if (method === "GET" && pathname === "/api/auth/providers") {
     return { status: 200, body: { providers: [] } };
   }
@@ -926,8 +1121,29 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
     }
 
     case "session.most_recent": {
+      // Upstream has TWO result shapes (tui_gateway/methods_session.py:214-260):
+      // a hit returns four keys — `{session_id, title, started_at, source}`
+      // (:248-256) — and every no-answer path (no db, no eligible row, or an
+      // internal exception) returns the bare `{"session_id": null}`
+      // (:234, :257, :260). Returning `{session}` here meant no caller ever
+      // found the id it destructures; returning only `session_id` on a hit
+      // would still be short three keys the adapter has in hand.
       const sessions = await buildAllSessions(config);
-      sendResponse(ctx, rpcOk(id, { session: sessions[0] ?? null }));
+      const mostRecent = sessions[0];
+      sendResponse(
+        ctx,
+        rpcOk(
+          id,
+          mostRecent
+            ? {
+                session_id: mostRecent.id,
+                title: mostRecent.title ?? "",
+                started_at: mostRecent.started_at ?? 0,
+                source: mostRecent.source ?? "",
+              }
+            : { session_id: null },
+        ),
+      );
       break;
     }
 
@@ -1004,12 +1220,28 @@ export async function onHermesMessage(ctx: HermesWsContext, raw: string) {
       const { agentName: histAgent } = parseHermesSessionId(sessionId);
       const agentsDir = resolveAgentsDir(config);
       const histMessages = readHistoryDb(agentsDir, histAgent, limit);
+      // `count` is part of the upstream result — `{"count", "messages"}`,
+      // tui_gateway/methods_session.py:2457-2462.
+      //
+      // Not byte-for-byte the upstream contract, deliberately: upstream's
+      // `count` is `len(history)`, the RAW pre-projection row count, while
+      // `messages` is `_history_to_messages(history)` — a lossy display
+      // projection (tui_gateway/server.py:7136+) that drops hidden scaffolding
+      // rows and assistant turns that are only tool calls. So upstream's
+      // `count >= len(messages)`, strictly greater on any tool-using
+      // transcript. The adapter applies no such projection, so the two are
+      // always equal here; `count` is still the honest count of what
+      // `messages` was built from, which is what the key means.
       if (histMessages !== null) {
-        sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: histMessages }));
+        sendResponse(
+          ctx,
+          rpcOk(id, { session_id: sessionId, count: histMessages.length, messages: histMessages }),
+        );
       } else {
         // Fall back to turns preview if history.db is unavailable
         const result = handleGetTurns(config, sessionId, Math.min(limit, 200));
-        sendResponse(ctx, rpcOk(id, { session_id: sessionId, messages: turnsToMessages(result.turns ?? []) }));
+        const messages = turnsToMessages(result.turns ?? []);
+        sendResponse(ctx, rpcOk(id, { session_id: sessionId, count: messages.length, messages }));
       }
       break;
     }
