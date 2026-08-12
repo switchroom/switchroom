@@ -17,11 +17,18 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { MAX_SAMPLE_AGE_MS, RING_MAX } from "./thresholds.js";
+import {
+  MAX_SAMPLE_AGE_MS,
+  RECALL_BASELINE_DAYS,
+  RECALL_BASELINE_MAX_OBS_PER_DAY,
+  RING_MAX,
+} from "./thresholds.js";
 import {
   emptyState,
   type BankFailureStreak,
   type BankPendingConsolidation,
+  type RecallBaseline,
+  type RecallBaselineDay,
   type Sample,
   type WatchState,
 } from "./types.js";
@@ -55,7 +62,54 @@ export function loadState(path: string): WatchState {
     }))
     .slice(-RING_MAX);
   const signals = typeof s.signals === "object" && s.signals !== null ? s.signals : {};
-  return { v: 1, ring, signals };
+  const baseline = normalizeBaseline(s.baseline);
+  return baseline === null ? { v: 1, ring, signals } : { v: 1, ring, signals, baseline };
+}
+
+/**
+ * Validate the persisted trailing baseline, or drop it to `null`.
+ *
+ * Same fail-closed contract as the sample validators, and it matters MORE here
+ * because this block is the denominator of `recall-quality-regression`: a
+ * garbage observation would propagate into a median and then into a division,
+ * and the resulting NaN would compare false against both thresholds — the
+ * fail-open shape the rest of this file exists to prevent. So the filtering is
+ * per-value, not per-block: a day keeps the observations that are real numbers
+ * and drops the rest, and a day left with nothing is dropped entirely.
+ *
+ * The per-day cap is re-applied on LOAD as well as on fold. A hand-edited or
+ * downgraded-then-upgraded state file could otherwise carry an unbounded array
+ * into memory, and this structure's whole licence to exist is that it is
+ * bounded.
+ */
+export function normalizeBaseline(x: unknown): RecallBaseline | null {
+  if (x === null || typeof x !== "object") return null;
+  const b = x as Record<string, unknown>;
+  if (!Array.isArray(b.days)) return null;
+  const days: RecallBaselineDay[] = [];
+  for (const raw of b.days) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const d = raw as Record<string, unknown>;
+    // `YYYY-MM-DD` exactly: the day key is compared with `<` and `localeCompare`
+    // throughout `baseline.ts`, and both are only meaningful on a fixed-width
+    // lexicographically-sortable string.
+    if (typeof d.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(d.day)) continue;
+    const scoreObs = numbers(d.scoreObs);
+    const poolObs = numbers(d.poolObs);
+    if (scoreObs.length === 0 && poolObs.length === 0) continue;
+    days.push({ day: d.day, scoreObs, poolObs });
+  }
+  if (days.length === 0) return null;
+  days.sort((a, b2) => a.day.localeCompare(b2.day));
+  return { days: days.slice(-(RECALL_BASELINE_DAYS + 1)) };
+}
+
+/** Finite, non-negative observations only, capped, keeping the NEWEST. */
+function numbers(x: unknown): number[] {
+  if (!Array.isArray(x)) return [];
+  return x
+    .filter((n): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0)
+    .slice(-RECALL_BASELINE_MAX_OBS_PER_DAY);
 }
 
 /**

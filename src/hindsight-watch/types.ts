@@ -13,15 +13,14 @@
  * distinguishes healthy from sick. The full derivation is in
  * `thresholds.ts`, where the constant used to be.
  *
- * `recall-latency` was removed for the SAME reason and caught the same way,
- * one signal-set later: the drafted 6000 ms page line sat below the healthy
- * MEDIAN (p50 6420 ms), and the only healthy p95 ever measured (8037 ms) was
- * right-censored at the then-8 s per-bank wall — retired by #3759, which made
- * the recall deadline a 10 s declarative envelope. Against that 10 s wall the
- * band is STILL not thresholdable, and re-deriving it needs a re-baseline on a
- * fixed fleet (follow-up #3792); the full argument lives in `thresholds.ts`.
- * Twice now the trap has been a latency threshold measured against an outage
- * instead of against a working fleet.
+ * `recall-latency` was removed twice for the same reason — the healthy
+ * population it was calibrated against was itself running at the wall — and is
+ * RESTORED here, on the re-baseline that removal always named as its
+ * precondition (follow-up #3792). The fleet's recall was repaired on
+ * 2026-08-08 and has since run p95 ~1.5 s against a ~10 s wall, so a healthy
+ * band demonstrably exists now where it demonstrably did not before. The
+ * derivation, and the measurement that would falsify it, are in
+ * `thresholds.ts`.
  */
 export type SignalId =
   | "probe" // the watchdog itself could not see hindsight
@@ -38,6 +37,18 @@ export type SignalId =
   | "recall-zero-memory" // recall "succeeded" and injected nothing
   | "recall-candidate-floor" // the candidate pool itself is empty
   | "recall-injected-score" // what we DID inject scores like noise
+  // ── recall: degradation the four ABSOLUTE floors above cannot see ────
+  // All four are collapse detectors, tuned so a working fleet never trips
+  // them. That is the right shape for an outage and the wrong shape for a
+  // DEGRADATION: between 2026-08-01 and 2026-08-07 recall quality fell ~5×
+  // (top-hit p50 0.55 → 0.19) and not one of them moved — the score floor
+  // wants ≤0.02 and the worst reading was 0.186, the pool floor wants ≤8 and
+  // the pool GREW from 58 to 87. These three are relative and latency-aware
+  // instead: they measure the fleet against its own recent past and against
+  // the deadline it is running into.
+  | "recall-latency" // recall is slow, against a wall it is not hitting
+  | "recall-quality-regression" // quality fell off its OWN trailing baseline
+  | "recall-deadline-pinning" // requests are being cut off, not completing
   | "consolidation-queue-age" // the async queue is not draining
   // ── consolidation: the half `consolidation-queue-age` cannot see ─────
   // `consolidation-queue-age` reads ONLY `status IN ('pending','processing')`,
@@ -66,6 +77,9 @@ export const ALL_SIGNALS: SignalId[] = [
   "recall-zero-memory",
   "recall-candidate-floor",
   "recall-injected-score",
+  "recall-latency",
+  "recall-quality-regression",
+  "recall-deadline-pinning",
   "consolidation-queue-age",
   "consolidation-failure-streak",
   "pending-consolidation-depth",
@@ -193,6 +207,22 @@ export interface RecallSample {
   elapsedConsidered: number;
   elapsedP95Ms: number | null;
   /**
+   * The effective recall deadline as the rows themselves report it, and how
+   * many rows reported one.
+   *
+   * OPTIONAL on the wire even though `recall-deadline-pinning` reads
+   * `deadlineEffectiveMedianMs` — which is a deliberate exception to the rule
+   * `errorRows` states. A required field would make `normalizeRecallSample`
+   * reject every sample persisted by an older build, re-baselining all
+   * fourteen pre-existing signals on upgrade. Absent is safe here BECAUSE the
+   * evaluator treats absent as `no-data`, never as a pass: an upgrade costs
+   * one signal one window, not a false all-clear.
+   */
+  deadlineConsidered?: number;
+  deadlineEffectiveMedianMs?: number | null;
+  /** Diagnostic only — see `RecallStats.deadlineHitRows`. */
+  deadlineHitRows?: number;
+  /**
    * Diagnostic only — the modal `error` string over the window and how many
    * rows carried one. Optional (unlike every field above) precisely BECAUSE no
    * threshold reads them: a persisted sample written before this field shipped
@@ -286,12 +316,55 @@ export interface SignalState {
   lastNotifiedAt?: number;
 }
 
+/**
+ * One UTC day of recall-quality observations, as the trailing baseline keeps
+ * them.
+ *
+ * The sample ring cannot carry this: it is 8 samples capped at 3 h old
+ * (`RING_MAX` / `MAX_SAMPLE_AGE_MS`), deliberately, so that a stopped cron
+ * re-baselines instead of paging off a stale era. A 7-day baseline therefore
+ * needs its own structure, and it needs the OPPOSITE property — surviving a
+ * gap rather than being erased by one.
+ *
+ * Observations are the per-tick `scoreP50` / `poolMedian`, kept raw so the
+ * day's representative value is a MEDIAN of them rather than a mean: one tick
+ * during a restart or a deploy must not drag a whole baseline day.
+ */
+export interface RecallBaselineDay {
+  /** `YYYY-MM-DD`, UTC. UTC and not local so the key cannot shift under DST. */
+  day: string;
+  /** per-tick `scoreP50` observations, newest last, capped (see `foldBaseline`) */
+  scoreObs: number[];
+  /** per-tick `poolMedian` observations, newest last, capped */
+  poolObs: number[];
+}
+
+/**
+ * The trailing recall-quality baseline. Bounded by construction: at most
+ * `RECALL_BASELINE_DAYS + 1` days, each holding at most
+ * `RECALL_BASELINE_MAX_OBS_PER_DAY` observations of each of two series.
+ */
+export interface RecallBaseline {
+  /** oldest first; the last entry is TODAY and is never its own baseline */
+  days: RecallBaselineDay[];
+}
+
 /** The whole durable state file. */
 export interface WatchState {
   v: 1;
   /** rolling window, oldest first, capped at RING_MAX */
   ring: Sample[];
   signals: Partial<Record<SignalId, SignalState>>;
+  /**
+   * Trailing per-day recall quality, for `recall-quality-regression`.
+   *
+   * OPTIONAL on the wire so a state file written before this shipped still
+   * loads. Absent ⇒ the signal reports `no-data` and the baseline starts
+   * accumulating from this tick — inert for the first
+   * `RECALL_BASELINE_MIN_DAYS` days, which is honest: a baseline-relative
+   * signal genuinely cannot say anything until it has a baseline.
+   */
+  baseline?: RecallBaseline;
 }
 
 export function emptyState(): WatchState {

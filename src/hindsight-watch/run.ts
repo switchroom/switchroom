@@ -9,6 +9,7 @@
  */
 
 import { ProbeError, probeOnce, type ProbeOptions } from "./probe.js";
+import { foldBaseline } from "./baseline.js";
 import { evaluateAll } from "./evaluate.js";
 import { loadState, pushSample, saveState } from "./state.js";
 import {
@@ -278,10 +279,16 @@ export async function tick(opts: TickOptions): Promise<TickResult> {
 
   // ── evaluate ─────────────────────────────────────────────────────────
   const withSample = pushSample(state, sample!);
+  // Fold THIS tick into the trailing baseline before evaluating. Ordering is
+  // safe because `baselineFor` scores against COMPLETED days only, so a tick
+  // can never contaminate its own reference; folding first is what lets the
+  // baseline start accumulating on the very first run rather than needing a
+  // warm-up tick it would never announce.
+  const baseline = foldBaseline(state.baseline, sample!.recall ?? null, now);
   const signals: Partial<Record<SignalId, SignalState>> = { probe: probeStep.next };
   let anyFiring = false;
 
-  for (const verdict of evaluateAll(withSample.ring)) {
+  for (const verdict of evaluateAll(withSample.ring, baseline, now)) {
     const prev = initial(state, verdict.signal);
     const step = applyHysteresis(prev, verdict, now);
     let transition = step.transition;
@@ -324,7 +331,7 @@ export async function tick(opts: TickOptions): Promise<TickResult> {
   // ── persist ──────────────────────────────────────────────────────────
   if (!opts.dryRun) {
     try {
-      saveState(opts.statePath, { ...withSample, signals });
+      saveState(opts.statePath, { ...withSample, signals, baseline });
     } catch (e) {
       // Fail loudly: without a persisted window the next tick starts blind,
       // and hysteresis counters never accumulate.

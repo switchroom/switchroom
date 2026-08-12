@@ -36,13 +36,16 @@ workers issue thousands.
 | `recall-candidate-floor` | median candidate pool (`pre_cap_count + overlap_dropped`) ≤8 (warn) / ≤3 (page) | level |
 | `recall-injected-score` | p50 of `injected_score_max` ≤0.02 (warn) / ≤0.01 (page) | level |
 | `recall-zero-memory` | >25 % (warn) / >40 % (page) of recalls injected nothing | level |
+| `recall-latency` | recall wall-time p95 ≥3 000 ms (warn) / ≥6 000 ms (page) | level |
+| `recall-quality-regression` | p50 `injected_score_max` **or** median candidate pool fell ≥40 % (warn) / ≥60 % (page) below its **own** trailing 7-day baseline | level |
+| `recall-deadline-pinning` | recall p95 reaches ≥90 % of the per-row `deadline_effective_ms` — recalls being cut off rather than completing | level |
 | `consolidation-queue-age` | oldest pending `async_operations` row ≥2 h (warn) / ≥12 h (page) | level |
 | `consolidation-failure-streak` | ≥3 (warn) / ≥10 (page) consecutive **failed** `async_operations` for one `(bank, operation_type)` pair, newest within 2 h | edge |
 | `pending-consolidation-depth` | one bank's unconsolidated memories ≥500 **and** grew by ≥max(500, 50 %) across the window (≥5 000 pages) | level |
 | `vector-index-corruption` | a nearest-neighbour probe against an HNSW index raises | edge |
 | `llm-fallback-ineffective` | ≥2 % (warn) / ≥10 % (page) of hindsight LLM calls failed outright | level |
 
-The five recall signals read `recall_log.jsonl` — the hook's own telemetry —
+The seven recall signals read `recall_log.jsonl` — the hook's own telemetry —
 because **every layer of the recall path fails open** and none of the metrics
 above can see it: `recall.py` exits 0 on a bank timeout (blocking the prompt
 would be worse), Claude Code swallows hook stderr on a zero exit, the agent is
@@ -134,20 +137,21 @@ measurement in the doc comment. Summary:
   memories", so both are written as `⌈memories × 4.4⌉` in `thresholds.ts`
   (100 → 440, 20 → 88). Without this, five worst-case memories (17 parts
   each = 85 entries) would have paged under the pre-#3610 numbers.
-- **no RECALL latency signal, either** — drafted at 4 s / 6 s and deleted in
-  review for the same reason as the retain one below. Measured over the
-  healthy-conditioned population (no bank timed out, errored, or hit the
-  shared deadline; n=183 across 9 agents) the fleet reads **p50 6420 ms, p95
-  8037 ms**, and every one of the nine agents' healthy p95 lands between
-  7816 ms and 11859 ms. The drafted page line of 6000 ms therefore sat *below
-  the healthy median*, and a resampling test puts its false-fire rate at
-  >90 % of healthy windows. Raising it above the noise does not rescue it
-  either: the per-bank budget is 8 s, so any line clear of healthy traffic can
-  only ever mean "pinned at the deadline", which `recall-own-bank-timeout`
-  already reports from a cleaner instrument. Wall time is still *shown* — it
-  rides along on the own-bank-timeout DM as diagnostic context — it just
-  carries no threshold until recall is repaired and the distribution can be
-  re-baselined.
+- **RECALL latency now HAS a signal — restored, after being deleted twice.**
+  Drafted at 4 s / 6 s and removed in review both times, correctly: the only
+  "healthy" population then available (n=183, 2026-07-27) read **p50 6420 ms,
+  p95 8037 ms**, right-censored at the retired 8 s per-bank wall. That
+  population was itself running *at* the deadline, so the drafted page line sat
+  below its median and a resampling test put the false-fire rate at >90 % of
+  healthy windows. The removal named its own precondition — re-baseline against
+  a fleet that is both repaired and running the 10 s envelope (#3792). Recall
+  was repaired 2026-08-08 and the fleet now reads **p50 1097 ms, p95 1486 ms,
+  max 2759 ms** with zero deadline hits over 953 rows, so the healthy
+  distribution sits at ~15 % of the wall where it used to sit at ~80 %. The
+  shipped lines are 3 000 / 6 000 ms — 2× and 4× the healthy p95 — and both
+  bootstrap tests are kept: `recall-log.test.ts` still asserts the old
+  population would have chattered, `recall-degradation.test.ts` asserts the
+  repaired one does not.
 - **no RETAIN p95 latency signal** — deliberately removed rather than retuned.
   Hindsight's exposition tops out at a finite `le` of 120 s, and a *healthy*
   post-#3610 backend already runs 52 of 268 retains (19.4 %) past it, because
@@ -156,6 +160,20 @@ measurement in the doc comment. Summary:
   where an early warning would live, and any threshold it *can* resolve fires
   permanently on a healthy fleet. Restoring the signal needs new `le` edges
   from hindsight — an instrument change, not a constant change.
+- **the trailing quality baseline is NOT the ring** — `recall-quality-regression`
+  compares against the last 7 completed UTC days, which the 8-sample / 3-hour
+  ring cannot hold, and which it deliberately must not: the ring exists to
+  *forget* across a gap so a stopped cron re-baselines, whereas a regression
+  that begins during an outage is exactly the one still worth catching on
+  return. So the baseline is a separate `baseline` block in the state file with
+  the opposite property, bounded at 8 days × 96 observations × 2 series
+  (~15 KB), each day reduced to its median and the baseline taken as the
+  median of those. **Today is never part of its own baseline** — include it and
+  the current degradation drags the reference toward the measurement. The
+  honest limitation, stated because a trailing baseline cannot avoid it: this
+  catches the *onset* of a regression, not its plateau. Once a degradation has
+  been running for a week it is inside its own baseline and the signal goes
+  quiet; the absolute floors are what cover a plateau.
 - **window: 8 samples, max 3 h old** — 2 h at a 15-minute cadence, with the
   age cap so a stopped cron re-baselines instead of paging about a stale era.
 - **re-notify quiet period: 6 h** — a firing signal DMs once, then at most
@@ -175,13 +193,57 @@ asserted:
 | zero-memory turn rate | >25 % / >40 % | **54.0 %** (232/430) | 0–22.5 % | PAGE |
 | candidate-pool median | ≤8 / ≤3 | **0** | 28–40 | PAGE |
 | injected top-hit p50 | ≤0.05 / ≤0.01 | **0.0013** (n=198) | 0.061–0.61 | PAGE |
-| recall p95 | ≥4 s / ≥6 s | **8063 ms** (bank budget 8000 ms) | ~1.1 s | PAGE |
+| recall p95 | ≥3 s / ≥6 s | **8063 ms** (bank budget 8000 ms) | ~1.1 s | PAGE |
 | consolidation oldest | ≥2 h / ≥12 h | **4.6 h** (122 pending) | — | WARN |
 | LLM outright-failure rate | ≥2 % / ≥10 % | **0.00 %** (0/800) | — | clean |
 
 `consolidation-queue-age` landing on WARN rather than PAGE is the severity
 split doing real work: a backlog worth mentioning is not a backlog worth
 waking someone for.
+
+### The degradation the table above could not see
+
+Every threshold in that table is an **absolute floor** — calibrated so a fleet
+that has *collapsed* trips it and a working fleet never does. That is the right
+shape for the six-week outage they were built for and the wrong shape for a
+degradation. Between **2026-08-01 and 08-07** recall quality fell ~5× and all
+fourteen signals stayed green:
+
+| day | n | lat p50 | lat p95 | top-hit p50 | pool p50 | `deadline_hit` |
+|---|---|---|---|---|---|---|
+| 08-01 | 570 | 6660 ms | 9037 ms | 0.5493 | 58 | 22.3 % |
+| 08-02 | 441 | 7801 ms | 9033 ms | 0.2856 | 61 | 37.2 % |
+| 08-03 | 431 | 7993 ms | 9034 ms | **0.1857** | 78 | 39.2 % |
+| 08-05 | 452 | 6161 ms | 9028 ms | 0.6046 | 85 | 17.9 % |
+| 08-07 | 381 | 5111 ms | 9031 ms | 0.6593 | 87 | 15.7 % |
+| *repaired 08-08* | | | | | | |
+| 08-10 | 457 | 1121 ms | 1545 ms | 0.8638 | 97 | 0.0 % |
+| 08-11 | 440 | 1090 ms | 1455 ms | 0.8953 | 90 | 0.0 % |
+
+Why each floor stayed silent, in its own terms:
+
+- **`recall-injected-score`** warns at ≤0.02. The worst day was **0.1857** —
+  9× above the line — while quality was ~5× off its own baseline.
+- **`recall-candidate-floor`** warns at ≤8. The pool *grew*, 58 → 87. A floor
+  cannot fire on a metric moving the right way.
+- **`recall-own-bank-timeout`** reads own-bank failure, and the own bank was
+  answering — slowly, but answering.
+- **latency** carried no threshold at all.
+
+The three signals added in response are each a *different kind of instrument*
+from a floor, which is why they are three and not one:
+
+| signal | asks | catches |
+|---|---|---|
+| `recall-latency` | is recall slow against a wall it is not hitting? | the whole sick week pages |
+| `recall-quality-regression` | is recall worse than it *recently was*? | 08-02 warn → 08-03 page, four days before anything else |
+| `recall-deadline-pinning` | are recalls being *cut off* rather than completing? | p95 at 90.4 % of the 9993 ms effective deadline, every sick day |
+
+`recall-latency` and `recall-deadline-pinning` are kept separate deliberately:
+a p95 of 6 s against a 10 s wall means recall is slow *and completing*; a p95
+on the wall means an unknown share never completed and the agent silently got
+truncated memory. The two need different fixes, so merging them would put the
+wrong remedy in the DM.
 
 Notes on the reduction, all of which are fail-CLOSED by design:
 

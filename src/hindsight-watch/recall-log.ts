@@ -61,6 +61,19 @@ export interface RecallLogRow {
   result_count?: number;
   total_elapsed_ms?: number;
   deadline_hit?: boolean;
+  /**
+   * The wait the parallel fan-out was ACTUALLY granted, in ms: the configured
+   * `recallParallelDeadlineSeconds` budget minus whatever the pre-fan-out work
+   * (mission-ensure, transcript read) already spent
+   * (`recall.py:2184-2194`). Read rather than assumed because it is the only
+   * per-row statement of the wall `total_elapsed_ms` is being measured
+   * against — the CONFIGURED budget rides along as `deadline_budget_ms`, and
+   * the two differ by 5-15 ms on this fleet.
+   *
+   * Absent on rows written before the field shipped and on the
+   * `recallParallel: false` path, which logs both deadline fields as `null`.
+   */
+  deadline_effective_ms?: number | null;
   /** post-overlap-gate, pre-cap candidate count */
   pre_cap_count?: number;
   /** candidates the overlap gate removed */
@@ -266,6 +279,29 @@ export interface RecallStats {
   /** p95 of `total_elapsed_ms` in ms, or null */
   elapsedP95Ms: number | null;
 
+  /** rows carrying a numeric `deadline_effective_ms` */
+  deadlineConsidered: number;
+  /**
+   * Median of `deadline_effective_ms` over the window, or null.
+   *
+   * The median rather than the max: the value drifts by a few ms per row (it
+   * is the budget minus that row's pre-fan-out spend), and `recall-deadline-
+   * pinning` divides by it, so the central value is what the ratio should be
+   * read against. Never substituted with a constant — a fleet running an
+   * operator-overridden `recallParallelDeadlineSeconds` must be scored against
+   * ITS wall, not the stock one.
+   */
+  deadlineEffectiveMedianMs: number | null;
+  /**
+   * Rows whose `deadline_hit` was true — any bank (or the directives slot)
+   * missed the shared fan-out deadline.
+   *
+   * Diagnostic ONLY, like `topError`: it goes into the DM so the operator can
+   * see how much of the window was actually cut off, but no threshold reads
+   * it, so a missing or garbled value can never move a verdict.
+   */
+  deadlineHitRows: number;
+
   /** rows carrying a non-empty `error` string */
   errorRows: number;
   /**
@@ -304,6 +340,9 @@ export const emptyRecallStats = (): RecallStats => ({
   scoreP50: null,
   elapsedConsidered: 0,
   elapsedP95Ms: null,
+  deadlineConsidered: 0,
+  deadlineEffectiveMedianMs: null,
+  deadlineHitRows: 0,
   errorRows: 0,
   topError: null,
 });
@@ -323,6 +362,7 @@ export function summarizeRecallRows(rows: RecallLogRow[]): RecallStats {
   const pool: number[] = [];
   const scores: number[] = [];
   const elapsed: number[] = [];
+  const deadlines: number[] = [];
   const errorCounts = new Map<string, number>();
 
   for (const row of rows) {
@@ -368,14 +408,25 @@ export function summarizeRecallRows(rows: RecallLogRow[]): RecallStats {
       elapsed.push(row.total_elapsed_ms);
       out.elapsedConsidered++;
     }
+
+    // Guarded on `> 0` and not merely on `typeof number`: the non-parallel
+    // path logs `null`, and a zero would become the denominator of the
+    // pinning ratio. A wall of zero is not a measurement.
+    if (typeof row.deadline_effective_ms === "number" && row.deadline_effective_ms > 0) {
+      deadlines.push(row.deadline_effective_ms);
+      out.deadlineConsidered++;
+    }
+    if (row.deadline_hit === true) out.deadlineHitRows++;
   }
 
   pool.sort((a, b) => a - b);
   scores.sort((a, b) => a - b);
   elapsed.sort((a, b) => a - b);
+  deadlines.sort((a, b) => a - b);
   out.poolMedian = median(pool);
   out.scoreP50 = median(scores);
   out.elapsedP95Ms = quantile(elapsed, 0.95);
+  out.deadlineEffectiveMedianMs = median(deadlines);
 
   // Modal reason, ties broken by the lexicographically smaller string so the
   // DM text is deterministic for a given window (Map iteration order is

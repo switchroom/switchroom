@@ -560,54 +560,197 @@ export const RECALL_WALL_MS =
   resolveHindsightRecallTunables(undefined).parallelDeadlineSeconds * 1000;
 
 /*
- * THERE IS NO `RECALL_P95_WARN_MS` / `RECALL_P95_PAGE_MS`. A recall latency
- * SLI was drafted at 4 s / 6 s, deleted before it shipped, and is STILL not
- * re-derivable after #3759 moved the wall — recording why against the CURRENT
- * envelope, because the number looked reasonable and the reasoning is the point.
+ * ── B12. The 2026-08-01 → 08-07 quality degradation, and why NONE of the
+ *         four signals above could see it ─────────────────────────────────
  *
- * The wall is no longer 8 s. #3759 made the recall deadline the declarative
- * envelope above ({@link RECALL_WALL_MS}, 10 s by default = 12 s hook ceiling
- * − 2 s headroom), and the per-bank request timeout now derives to the same
- * 10 s rather than the old hardcoded 8 s. The healthy readings below cannot set
- * a line against that 10 s wall, for two reasons that COMPOUND:
+ * Every threshold above is an ABSOLUTE FLOOR, calibrated so that a fleet which
+ * has COLLAPSED trips it and a working fleet never does. That is the correct
+ * shape for the six-week outage they were built for. It is the wrong shape for
+ * a degradation, and the fleet ran one for a week with all fourteen signals
+ * green.
  *
- *   1. They are CENSORED at the retired 8 s wall. Every p95 here was measured
- *      while the per-bank timeout was 8 s, so the distribution is right-clipped
- *      at ~8 s ("pinned at the 8 s budget", baseline block above). The true
- *      healthy p95 under a 10 s wall is unknown and can only be HIGHER, because
- *      recalls that were cut off at 8 s now run on — so 8037 ms is a FLOOR on
- *      healthy p95, not an estimate of it. Measured over the healthy-conditioned
- *      population (rows where no bank timed out, errored, or hit the shared
- *      deadline), n=183 across 9 agents, all under the 8 s wall:
+ * Measured 2026-08-12 over every agent's `recall_log.jsonl`, cache hits
+ * excluded, one row per real recall (`n` is fleet-wide rows for that UTC day):
  *
- *        FLEET  p50 6420 ms  p75 7566  p90 7935  p95 8037  p99 11426
+ *   day     n    lat p50   lat p95   top-hit p50   pool p50   deadline_hit
+ *   08-01   570   6660 ms   9037 ms      0.5493        58        22.3 %
+ *   08-02   441   7801 ms   9033 ms      0.2856        61        37.2 %
+ *   08-03   431   7993 ms   9034 ms      0.1857        78        39.2 %
+ *   08-04   488   5749 ms   9029 ms      0.5593        89        12.5 %
+ *   08-05   452   6161 ms   9028 ms      0.6046        85        17.9 %
+ *   08-06   552   6173 ms   9034 ms      0.5700        83        26.6 %
+ *   08-07   381   5111 ms   9031 ms      0.6593        87        15.7 %
+ *   ── recall repaired 08-08 ──────────────────────────────────────────────
+ *   08-08   492   1263 ms   2778 ms      0.8759        90         0.2 %
+ *   08-09   358   1251 ms   4316 ms      0.8459        95         0.0 %
+ *   08-10   457   1121 ms   1545 ms      0.8638        97         0.0 %
+ *   08-11   440   1090 ms   1455 ms      0.8953        90         0.0 %
  *
- *      The p99 already sat at 11426 ms — PAST the new 10 s wall — so the healthy
- *      tail extends beyond the wall and any warn line below it fires on healthy
- *      traffic. Per-agent healthy p95 ran 7816 (ziggy) … 11859 (overlord).
- *   2. Even taking 8037 ms at face value, the band between it and the 10 s wall
- *      is 8037-10000 ms ≈ 1.24× — indistinguishable in width from the
- *      6420-8000 ms (1.25×) band this signal was already rejected over — and
- *      the degraded case inside it is already reported by `RECALL_OWN_BANK_
- *      TIMEOUT` from a cleaner instrument (a bank that misses its deadline),
- *      not from a percentile of a censored wall-time. A 2000-draw bootstrap
- *      over healthy rows still breaches the drafted 6000 ms line in 100.0 % of
- *      draws; the PAGE sat below the healthy median then and does now.
+ * Why each existing signal stayed silent, in its own terms:
  *
- * So moving the wall 8 s → 10 s did not open a thresholdable band; it widened
- * the region of IGNORANCE (8-10 s) that the old, censored measurement cannot
- * describe. This is the same defect this file articulates when deleting
- * `RETAIN_P95_SECONDS` above: the healthy population sits at/past the threshold
- * and the instrument saturates at a deadline just beyond it.
+ *   - `RECALL_SCORE_P50_WARN` is 0.02. The worst daily reading was 0.1857 —
+ *     9× above the warn line — while quality had fallen ~5× off its own
+ *     baseline. The floor is set where injected memory becomes indistinguish-
+ *     able from noise, and a 5× regression never gets there.
+ *   - `RECALL_POOL_MEDIAN_WARN` is 8. The pool GREW, 58 → 87. A floor cannot
+ *     fire on a metric moving the right way while the thing it proxies for
+ *     moves the wrong way.
+ *   - `RECALL_OWN_BANK_TIMEOUT_*` reads own-bank failure, and the own bank was
+ *     answering. Slowly, but answering.
+ *   - Latency carried no threshold at all — the deletion note this block
+ *     replaces.
  *
- * `total_elapsed_ms` is still summarised into `RecallSample.elapsedP95Ms` and
- * rendered as DIAGNOSTIC context on the own-bank-timeout DM (against
- * {@link RECALL_WALL_MS}) — the datum is useful, it just cannot carry a
- * threshold today. Restoring the signal needs a re-baseline against a fleet
- * whose recall is BOTH fixed AND running the 10 s envelope, gated on that
- * measurement rather than on this one; filed as follow-up #3792. Until then a
- * latency line here would be calibrated against a wall that no longer exists.
+ * The three constants below are the response, and each is a DIFFERENT kind of
+ * instrument from a floor: an absolute latency line (now that a healthy band
+ * exists), a self-relative quality line, and a line against the deadline.
  */
+
+/**
+ * Recall wall-time p95: warn / page, in ms.
+ *
+ * THE PRIOR DELETION WAS CORRECT AND ITS PRECONDITION HAS NOW BEEN MET. The
+ * signal was drafted at 4 s / 6 s and deleted twice, both times because the
+ * "healthy" population it was calibrated against was itself running AT the
+ * wall: n=183 conditioned rows from 2026-07-27 read p50 6420 ms / p95 8037 ms,
+ * right-censored at the then-8 s per-bank timeout. Against that population any
+ * line below the wall fires on healthy traffic, and
+ * `recall-log.test.ts` still asserts exactly that, on the same fixture. The
+ * removal named its own precondition — "a re-baseline against a fleet whose
+ * recall is BOTH fixed AND running the 10 s envelope" (follow-up #3792). That
+ * fleet now exists.
+ *
+ * The healthy population is `repaired-fleet.fixture.ts`: 2026-08-10 00:00 →
+ * 08-12 12:00 UTC, UNCONDITIONED because it needs no conditioning — over 953
+ * rows, 3 had a degraded own bank and ZERO hit the deadline. It reads
+ *
+ *   p50 1097 ms   p90 1350 ms   p95 1486 ms   max 2759 ms
+ *
+ * against a `deadline_effective_ms` of ~9993 ms. That is a healthy band of a
+ * kind that has never previously been measurable here: the whole healthy
+ * distribution now sits at ~15 % of the wall, where in July it sat at ~80 %.
+ *
+ * WARN 3000 ms is 2.0× the healthy p95 and above the slowest single healthy
+ * recall observed (2759 ms). PAGE 6000 ms is 4.0× it. Both are far below the
+ * sick era's 9027-9037 ms, so the whole of 08-01 → 08-07 pages — verified by
+ * replaying the real logs through the tick reduction at the true 15-minute
+ * cadence: 96/96 ticks per day page across all seven days, and 0/337 ticks
+ * fire anywhere from 08-09 00:00 onward.
+ *
+ * THE ONE CAVEAT, recorded rather than hidden: the same replay fires the WARN
+ * arm on 46/96 ticks of 08-10 and 3/96 of 08-09. Those are not steady state —
+ * a tick reads a trailing 24 h window, so on 08-09 and 08-10 the window still
+ * contains the incident's recovery tail (08-09 rows reach p99 7238 ms), and
+ * the trailing p95 peaks at 4578 ms before settling under 1600 ms from 08-11
+ * onward. Warning while the fleet is still slow is defensible; if it proves
+ * noisy in practice the derived-and-rejected alternative is warn 6000 / page
+ * 8000, which is 1.31× above that 4578 ms recovery peak, fires on 0/337
+ * post-repair ticks including the recovery days, and still pages on 100 % of
+ * the sick era. Retune to those two numbers rather than inventing new ones.
+ */
+export const RECALL_P95_WARN_MS = 3000;
+export const RECALL_P95_PAGE_MS = 6000;
+
+/**
+ * Recall-quality regression against the fleet's OWN trailing baseline: the
+ * fractional drop that warns / pages.
+ *
+ * This is the signal built for B12 specifically, and it is the only one in
+ * this file that is not an absolute line. It asks a different question — not
+ * "is recall broken" but "is recall materially worse than it has recently
+ * been" — and that is the question the 08-01 → 08-07 week needed asked.
+ *
+ * Scored on the SAME two statistics the floors use (`scoreP50`, `poolMedian`),
+ * OR'd, because they fail independently and the incident moved only one of
+ * them. The comparison is the current tick against the MEDIAN of the previous
+ * `RECALL_BASELINE_DAYS` completed days, each day itself reduced to the median
+ * of its ticks — medians throughout, so neither one bad tick nor one bad day
+ * can set or spoil the line.
+ *
+ * 40 % / 60 % replayed against the real logs (baseline warmed from 07-20,
+ * scored on each day's WORST tick):
+ *
+ *   08-02  baseline 0.6465 → worst tick 0.2770   57.2 % drop   WARN
+ *   08-03  baseline 0.6465 → worst tick 0.0572   91.2 % drop   PAGE
+ *   08-04  baseline 0.6465 → worst tick 0.1857   71.3 % drop   PAGE
+ *   08-05 … 08-12                                   ≤37.2 %    silent
+ *
+ * So it fires on 08-02, four days into a week nothing else saw, and goes quiet
+ * once the repair lands. Note what it does NOT do: by 08-05 the degradation is
+ * IN its own baseline and the signal stops. That is inherent to a trailing
+ * baseline and is stated here rather than papered over — this signal catches
+ * the ONSET of a regression, not its plateau. A plateau is what the absolute
+ * floors are for, and if a plateau sits between the two, that gap is real.
+ *
+ * A relative drop is meaningless when the baseline is already at the floor
+ * (0.002 → 0.0005 is a "75 % regression" on a fleet that is simply broken, and
+ * already paging from `recall-injected-score`), so each arm requires its
+ * baseline to sit above that arm's absolute WARN line before it will score —
+ * see `evaluateRecallQualityRegression`. That reuses the existing constants
+ * deliberately: the two signals then partition the space instead of both
+ * shouting about the same collapse.
+ */
+export const RECALL_QUALITY_DROP_WARN = 0.4;
+export const RECALL_QUALITY_DROP_PAGE = 0.6;
+
+/**
+ * Trailing baseline window, in completed UTC days, and the minimum before the
+ * signal will score at all.
+ *
+ * 7 days because a shorter window absorbs a slow regression into its own
+ * baseline faster (the 08-05 blind spot above gets worse), and a longer one
+ * starts comparing against a materially different fleet — agents are added,
+ * banks grow, and the query mix moves. 3 days minimum so a fresh install or a
+ * restored state file reports `no-data` rather than firing off one day of
+ * history.
+ */
+export const RECALL_BASELINE_DAYS = 7;
+export const RECALL_BASELINE_MIN_DAYS = 3;
+
+/**
+ * Per-day observation cap, per series. The bound on the whole baseline is
+ * `(RECALL_BASELINE_DAYS + 1) × RECALL_BASELINE_MAX_OBS_PER_DAY × 2` numbers —
+ * 1536 at these values, ~15 KB of JSON, next to a `ring` that already carries
+ * far more.
+ *
+ * 96 is a full day at the recommended 15-minute cadence, so in production
+ * nothing is ever dropped. A faster cadence drops the OLDEST observations of
+ * that day, which keeps the cap hard and the day's median honest (it becomes
+ * the median of that day's most recent 96 ticks, not of a biased subsample).
+ */
+export const RECALL_BASELINE_MAX_OBS_PER_DAY = 96;
+
+/**
+ * Deadline pinning: the fraction of the effective deadline a p95 must reach
+ * before the window counts as truncated rather than merely slow.
+ *
+ * A DIFFERENT failure from `recall-latency`, which is why it is a different
+ * signal: a p95 of 6 s against a 10 s wall means recall is slow and completing;
+ * a p95 sitting on the wall means an unknown share of recalls never completed
+ * at all and the agent was handed whatever had arrived by then. The two need
+ * different remedies (make it faster vs raise the ceiling / find what hangs),
+ * so collapsing them into one line would put the wrong fix in the DM.
+ *
+ * Read against each window's OWN `deadline_effective_ms` rather than against
+ * {@link RECALL_WALL_MS}: the constant is the stock resolution with no operator
+ * overrides, and a fleet that raised `recallParallelDeadlineSeconds` must be
+ * scored against the wall it is actually running.
+ *
+ * 0.90 verified by replay. Sick era p95 9028-9037 ms against a median
+ * `deadline_effective_ms` of 9993 ms is 90.3-90.4 % — over the line on 96/96
+ * ticks for every day 08-01 → 08-07. Post-repair the ratio is 13-16 % and it
+ * fires on 0/337 ticks from 08-09 onward.
+ *
+ * THE MARGIN IS THIN AND THAT IS WORTH KNOWING: 9028 clears 0.90 × 9993 =
+ * 8994 ms by 34 ms, i.e. 0.4 %. The observed truncation point (~9030 ms) is
+ * NOT the fan-out deadline (~9993 ms) — something downstream cuts these
+ * requests off about a second early — so a small drift in that downstream
+ * limit could put the sick shape back under the line. The corroborating
+ * instrument is already carried in the DM but deliberately NOT thresholded:
+ * `deadline_hit` ran 12.5-39.2 % of rows through the incident against 0.0-0.2 %
+ * after it, a ~60× separation against this ratio's 6×. If this signal ever
+ * needs re-deriving, move it to that rate rather than loosening the fraction.
+ */
+export const RECALL_DEADLINE_PIN_FRACTION = 0.9;
 
 /**
  * Consolidation queue age: warn / page, in seconds.
