@@ -50,6 +50,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -214,7 +215,7 @@ type ProbeResult = { status: number; stdout: string };
  * Run the probe in a throwaway container, with or without switchroom's env
  * emission. `emitted: false` is upstream's stock state — the RED case.
  */
-function runProbe(emitted: boolean): ProbeResult {
+async function runProbe(emitted: boolean): Promise<ProbeResult> {
   const name = `sr-hs-qalang-${emitted ? "emitted" : "stock"}-${RUN_ID.slice(
     0,
     8
@@ -236,14 +237,10 @@ function runProbe(emitted: boolean): ProbeResult {
     ];
     if (emitted) runArgs.push("-e", `${ENV_KEY}=${EMITTED_LANGUAGES}`);
     runArgs.push(UPSTREAM_IMAGE, "sleep", "300");
-    execFileSync("docker", runArgs, { stdio: ["ignore", "ignore", "pipe"] });
+    await execFileAsync("docker", runArgs);
 
-    const res = execFileSync(
-      "docker",
-      ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
-      { input: probeSource(), stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" }
-    );
-    return { status: 0, stdout: res };
+    const res = await execFileAsync("docker", ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"], { input: probeSource() });
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -252,7 +249,7 @@ function runProbe(emitted: boolean): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -315,8 +312,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("stock upstream (variable UNSET) is RED — search_dates gets no languages= and auto-detects 200+ locales (proves the probe bites)", () => {
-      const { status, stdout } = runProbe(false);
+    it("stock upstream (variable UNSET) is RED — search_dates gets no languages= and auto-detects 200+ locales (proves the probe bites)", async () => {
+      const { status, stdout } = await runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );
@@ -328,8 +325,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("CAPTURED_LANGUAGES __ABSENT__");
     }, 240_000);
 
-    it("with switchroom's emission the recall path is pinned, still parses, and English extraction still works", () => {
-      const { status, stdout } = runProbe(true);
+    it("with switchroom's emission the recall path is pinned, still parses, and English extraction still works", async () => {
+      const { status, stdout } = await runProbe(true);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED"
       );

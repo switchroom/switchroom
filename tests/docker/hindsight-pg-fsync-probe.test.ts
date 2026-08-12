@@ -50,6 +50,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, dirname, join } from "node:path";
@@ -136,16 +137,14 @@ type ProbeResult = { fsync: string; source: string; argv: string; log: string };
  * the GREEN arm exercises the production values and the RED arm differs from
  * it by exactly one variable.
  */
-function probe(label: string, extraEnv: Record<string, string>): ProbeResult {
+async function probe(label: string, extraEnv: Record<string, string>): Promise<ProbeResult> {
   const name = `sr-hs-fsync-${label}-${RUN_ID.slice(0, 8)}`;
   const stage = mkdtempSync(join(tmpdir(), "sr-fsync-probe-"));
   try {
     writeFileSync(join(stage, "fake-broker.cjs"), FAKE_BROKER);
     writeFileSync(join(stage, "fake-fetch.cjs"), FAKE_FETCHER);
 
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -165,23 +164,15 @@ function probe(label: string, extraEnv: Record<string, string>): ProbeResult {
         "sleep",
         UPSTREAM_IMAGE,
         "300",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+      ]);
 
     for (const f of ["fake-broker.cjs", "fake-fetch.cjs"]) {
-      execFileSync("docker", ["cp", join(stage, f), `${name}:/tmp/${f}`], {
-        stdio: "ignore",
-      });
+      await execFileAsync("docker", ["cp", join(stage, f), `${name}:/tmp/${f}`]);
     }
     // The REAL entrypoint, byte for byte — never a reimplementation.
-    execFileSync("docker", ["cp", ENTRYPOINT, `${name}:/tmp/entrypoint.sh`], {
-      stdio: "ignore",
-    });
+    await execFileAsync("docker", ["cp", ENTRYPOINT, `${name}:/tmp/entrypoint.sh`]);
 
-    execFileSync("docker", ["exec", "-d", name, "node", "/tmp/fake-broker.cjs", "/tmp/fake.sock"], {
-      stdio: "ignore",
-    });
+    await execFileAsync("docker", ["exec", "-d", name, "node", "/tmp/fake-broker.cjs", "/tmp/fake.sock"]);
 
     const env: Record<string, string> = {
       SWITCHROOM_AUTH_BROKER_SOCKET: "/tmp/fake.sock",
@@ -203,17 +194,22 @@ function probe(label: string, extraEnv: Record<string, string>): ProbeResult {
 
     // The entrypoint logs to stderr; fold it into stdout so the pre-start line
     // is available for assertions and for the failure message.
-    const log = execFileSync(
-      "docker",
-      ["exec", ...envArgs, name, "sh", "-c", "sh /tmp/entrypoint.sh true 2>&1"],
-      { stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" },
-    );
+    const log = (
+      await execFileAsync("docker", [
+        "exec",
+        ...envArgs,
+        name,
+        "sh",
+        "-c",
+        "sh /tmp/entrypoint.sh true 2>&1",
+      ])
+    ).stdout;
 
-    const out = execFileSync("docker", ["exec", "-i", name, "sh", "-s"], {
-      input: READBACK,
-      stdio: ["pipe", "pipe", "pipe"],
-      encoding: "utf8",
-    });
+    const out = (
+      await execFileAsync("docker", ["exec", "-i", name, "sh", "-s"], {
+        input: READBACK,
+      })
+    ).stdout;
     const [setting = "", source = ""] = (out.match(/^FSYNC=(.*)$/m)?.[1] ?? "").split(":");
     return {
       fsync: setting,
@@ -223,7 +219,7 @@ function probe(label: string, extraEnv: Record<string, string>): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -277,8 +273,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("the shipping configuration yields fsync=on, sourced from the command line", () => {
-      const r = probe("green", {});
+    it("the shipping configuration yields fsync=on, sourced from the command line", async () => {
+      const r = await probe("green", {});
       // THE assertion. Everything else in this file exists to make this one
       // mean something.
       expect(r.fsync, `pre-start log:\n${r.log}\nargv: ${r.argv}`).toBe("on");
@@ -295,8 +291,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(r.log).toMatch(/pg0 pre-start ok: .*fsync=on/);
     }, 180_000);
 
-    it("the RED arm really reads off, so the GREEN arm is not a tautology", () => {
-      const r = probe("red", { SWITCHROOM_HINDSIGHT_PG_FSYNC: "off" });
+    it("the RED arm really reads off, so the GREEN arm is not a tautology", async () => {
+      const r = await probe("red", { SWITCHROOM_HINDSIGHT_PG_FSYNC: "off" });
       expect(r.fsync, `pre-start log:\n${r.log}\nargv: ${r.argv}`).toBe("off");
       // With the flag omitted, pg0's `-F` is unopposed and postgres reports
       // the value as a command-line one too — which is exactly why a source

@@ -50,6 +50,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -219,15 +220,13 @@ type ProbeResult = { status: number; stdout: string };
  * on the CONTAINER, not injected into the probe source, so what runs is the same
  * `HindsightConfig.from_env()` path the real server takes.
  */
-function runProbe(withEnv: boolean, floor: string): ProbeResult {
+async function runProbe(withEnv: boolean, floor: string): Promise<ProbeResult> {
   const name = `sr-hs-graphseed-${withEnv ? "emitted" : "default"}-${RUN_ID.slice(
     0,
     8,
   )}`;
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -246,16 +245,10 @@ function runProbe(withEnv: boolean, floor: string): ProbeResult {
         UPSTREAM_IMAGE,
         "sleep",
         "300",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+      ]);
 
-    const res = execFileSync(
-      "docker",
-      ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
-      { input: PROBE, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" },
-    );
-    return { status: 0, stdout: res };
+    const res = await execFileAsync("docker", ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"], { input: PROBE });
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -264,7 +257,7 @@ function runProbe(withEnv: boolean, floor: string): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -327,8 +320,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("the pinned image ships #2968 natively, wired end to end", () => {
-      const { status, stdout } = runProbe(true, PINNED_FLOOR);
+    it("the pinned image ships #2968 natively, wired end to end", async () => {
+      const { status, stdout } = await runProbe(true, PINNED_FLOOR);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );
@@ -355,21 +348,21 @@ describe.skipIf(!dockerOk || !imageOk)(
      * that is deliberately NOT upstream's default: without the emission the
      * container resolves 0.3 and the probe goes red.
      */
-    it("the floor comes from switchroom's emission, not from upstream's default", () => {
+    it("the floor comes from switchroom's emission, not from upstream's default", async () => {
       const OFF_DEFAULT = "0.42";
       expect(
         OFF_DEFAULT,
         "this arm is meaningless if it happens to equal the pinned floor",
       ).not.toBe(PINNED_FLOOR);
 
-      const emitted = runProbe(true, OFF_DEFAULT);
+      const emitted = await runProbe(true, OFF_DEFAULT);
       expect(emitted.stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );
       expect(emitted.status, `probe failed:\n${emitted.stdout}`).toBe(0);
       expect(emitted.stdout).toContain("RESOLVED_FLOOR 0.42");
 
-      const unset = runProbe(false, OFF_DEFAULT);
+      const unset = await runProbe(false, OFF_DEFAULT);
       expect(unset.stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );

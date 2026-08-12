@@ -64,6 +64,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import { execFileSync, execSync } from "node:child_process";
+import { execFileAsync } from "./_exec-async.js";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -274,15 +275,13 @@ type ProbeResult = { status: number; stdout: string };
  * The env var is set on the CONTAINER, not injected into the probe source, so
  * what runs is the same `HindsightConfig.from_env()` path the real server takes.
  */
-function runProbe(configured: boolean): ProbeResult {
+async function runProbe(configured: boolean): Promise<ProbeResult> {
   const name = `sr-hs-maxitems-${configured ? "configured" : "default"}-${RUN_ID.slice(
     0,
     8,
   )}`;
   try {
-    execFileSync(
-      "docker",
-      [
+    await execFileAsync("docker", [
         "run",
         "-d",
         "--name",
@@ -299,16 +298,10 @@ function runProbe(configured: boolean): ProbeResult {
         UPSTREAM_IMAGE,
         "sleep",
         "300",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
+      ]);
 
-    const res = execFileSync(
-      "docker",
-      ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"],
-      { input: PROBE, stdio: ["pipe", "pipe", "pipe"], encoding: "utf8" },
-    );
-    return { status: 0, stdout: res };
+    const res = await execFileAsync("docker", ["exec", "-i", "-w", "/app/api", name, "/app/api/.venv/bin/python", "-"], { input: PROBE });
+    return { status: 0, stdout: res.stdout };
   } catch (e) {
     const err = e as { status?: number; stdout?: Buffer | string };
     return {
@@ -317,7 +310,7 @@ function runProbe(configured: boolean): ProbeResult {
     };
   } finally {
     try {
-      execFileSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+      await execFileAsync("docker", ["rm", "-f", name]);
     } catch {
       /* already gone */
     }
@@ -391,8 +384,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       }
     });
 
-    it("upstream's DEFAULT is RED — the schema carries the bank's raw slot count", () => {
-      const { status, stdout } = runProbe(false);
+    it("upstream's DEFAULT is RED — the schema carries the bank's raw slot count", async () => {
+      const { status, stdout } = await runProbe(false);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );
@@ -418,8 +411,8 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("PYTHON_TRUNCATION_PRESENT True");
     }, 240_000);
 
-    it(`upstream + ${ENV_KEY}=false is GREEN — maxItems is absent entirely`, () => {
-      const { status, stdout } = runProbe(true);
+    it(`upstream + ${ENV_KEY}=false is GREEN — maxItems is absent entirely`, async () => {
+      const { status, stdout } = await runProbe(true);
       expect(stdout, "probe did not run to completion").toContain(
         "PROBE_EXECUTED",
       );

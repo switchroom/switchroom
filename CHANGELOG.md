@@ -35,6 +35,40 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **CI: `e2e-ok` no longer reports a path-skipped run as a verified pass.** The
+  sentinel collapsed "the e2e shards ran and passed" and "nothing ran at all"
+  into the same silent green, so a reviewer could not tell them apart. PR #4619
+  was approved and enqueued on that green and then ejected from the merge queue
+  when `docker-e2e` failed on the `merge_group` ref the PR ref had never
+  exercised. `e2e-ok` is a branch-protection-required context, so it must stay
+  green when the path filter legitimately skips the work jobs; it now
+  distinguishes the three states explicitly instead — ran+passed is `VERIFIED`,
+  ran+failed still fails, and a path-skip stays green but carries a
+  `::warning title=e2e NOT verified on this ref::` annotation plus a job
+  summary naming where the suite will really run. A skip on a ref where the
+  work jobs are unconditional (`push` / `merge_group` / `workflow_dispatch`),
+  or on a PR where the filter said the paths WERE relevant, is now a hard
+  failure — that skip means the gate itself is broken. Separately,
+  `e2e-shard` and `hindsight-probe` now run on `workflow_dispatch`: the
+  advertised manual recovery lever had no diff base, so `changes` reported
+  `relevant=false`, every job skipped, and the run went green in 3 seconds
+  (run 31131064381) without testing anything. `hindsight-watch-pg-probe`
+  (added to the sentinel's `needs:` by #4623) is aggregated by the same
+  three-state verdict, with its must-run set derived from its own `if:` —
+  it carries no `workflow_dispatch` term, so a dispatch skip warns there
+  rather than failing the gate.
+- **CI: the `hindsight-probe` `Timeout calling "onTaskUpdate"` flake is
+  fixed at the cause.** All five tests passed and vitest still exited 1. The
+  docker probes drove `docker run` / `docker exec` through `execFileSync`,
+  which blocks the vitest WORKER's event loop for the whole leg; vitest's
+  worker→main birpc has a hard-coded 60 s timeout (`DEFAULT_TIMEOUT = 6e4`,
+  with no config knob), so a worker starved past 60 s fires the timer before
+  it ever reads the reply the main process had already sent. Run 31575484897
+  had two tests of 32.3 s and 30.3 s of uninterrupted sync exec in a 63.07 s
+  file — one merge-queue ejection and a manual re-enqueue. The probe runners
+  now await a small `execFileAsync` helper (`tests/docker/_exec-async.ts`)
+  that keeps the loop turning, so the RPC reply is read as it arrives. No
+  retry was added: a retry would equally hide a real hang.
 - **fleet-health: the ledger's `windowDays` now actually windows the
   findings.** `buildLedger` read `windowDays` but aggregated EVERY finding ever
   recorded into the dedup_key map — `count` and `reach` had no time filter, so
