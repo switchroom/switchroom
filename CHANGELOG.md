@@ -79,6 +79,12 @@ now an anomaly worth investigating, not the norm.
   (`stderr-timestamps.ts` uses `toISOString()`; the shell stamps use `date -u`),
   so a designator-less line is now normalised to `Z` at the producer. An
   explicit `+HH:MM` offset is preserved untouched.
+- **hermes: the cron panel no longer shows every agent's schedule under one
+  profile.** `GET /api/cron/jobs` ignored `?profile=`, which the desktop uses
+  as endpoint-level scoping rather than a hint. Switchroom has exactly one
+  profile (`default`, the name `/api/profiles/active` reports), so that profile
+  gets the fleet's schedule and any other profile correctly gets none.
+
 - **hermes: the desktop's session search box works instead of throwing.**
   `GET /api/sessions/search` was caught by the `/api/sessions/:id` regex, which
   read `search` as a session id and answered `404 {error:'Unknown session'}`;
