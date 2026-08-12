@@ -1050,14 +1050,30 @@ export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
  * ### The measurement window is 30 days, and that is a hard ceiling
  *
  * Every rate below is taken from `async_operations` on the production bank on
- * 2026-08-12, and that table holds **30 days**, not more: `min(created_at)` is
- * 2026-07-13 and NO terminal row older than 30 days by `updated_at` survives,
- * while `memory_units` in the same database goes back to 2026-04-15. Terminal
- * operations are swept by the retention job
- * (`engine/maintenance.py::_run_operation_cleanup` →
- * `prune_terminal_operations`, deleting `completed|failed|cancelled` rows by
- * `updated_at < now() - operation_retention_days`). A longer baseline is not
- * available to measure and cannot be claimed.
+ * 2026-08-12, and that table holds **30 days**, not more: `min(created_at)` for
+ * `completed` rows is 2026-07-13 — measured at 30.008 days and advancing in
+ * real time — while `memory_units` in the same database goes back to
+ * 2026-04-15. A longer baseline is not available to measure and cannot be
+ * claimed.
+ *
+ * The sweep is OURS, not the Hindsight API's:
+ * `docker/hindsight-maintenance.sh:136` runs
+ *
+ *   DELETE FROM async_operations
+ *    WHERE status='completed' AND created_at < now() - make_interval(days => N)
+ *
+ * on every maintenance tick, with `N = SWITCHROOM_HINDSIGHT_RETENTION_DAYS`
+ * defaulting to 30 (line 63) and unset in the fleet. Confirmed live in
+ * `docker logs switchroom-hindsight`: `pruned 40 completed async_operations
+ * older than 30d`. The API's own `operation_retention_days` sweep is a
+ * different mechanism and is NOT what bounds this window — it is disabled
+ * (`HINDSIGHT_API_OPERATION_RETENTION_DAYS` unset, code default 0).
+ *
+ * **The sweep is asymmetric, and that asymmetry matters below.** Only
+ * `status='completed'` is deleted; the script's own header (line 23) states
+ * that failed/pending/processing rows are NEVER touched, and the table bears
+ * it out — oldest `completed` row 30.008 days, oldest `failed` row 25.110
+ * days and ageing without bound.
  *
  * ### 48 h, and the honest limits of the derivation
  *
@@ -1105,6 +1121,29 @@ export const CONSOLIDATION_STREAK_RECENCY_S = 2 * 60 * 60;
  *    end;
  *  - it clears the instant one op completes, which is the property the
  *    recency guard existed to protect.
+ *
+ * **What doubling 24 h → 48 h costs.** Worst-case detection latency for a
+ * broken sparse job doubles with it: a job that breaks the moment after its
+ * last success is now invisible for up to 48 h rather than 24 h. That is the
+ * price of the margin argued for above, and it is paid deliberately — against
+ * the status quo of *never*, and against a 24 h line that a measured 27.67 h
+ * self-heal would have false-paged.
+ *
+ * **The retention asymmetry leaves a second, LATENT residual.** Because
+ * completions are pruned at 30 days while failures are immortal, a
+ * `lastCompletedAgeS` of `null` does not symmetrically mean "no completion in
+ * the retention window" — it can mean the successes were swept while the
+ * failures defining the streak were kept, and the streak query's
+ * `coalesce(…, '-infinity')` then counts every historical failure, including
+ * ones that predate a now-deleted success. The `newestFailureAgeS` guard on
+ * the null arm cannot catch that, because those retained failures are ancient
+ * by construction. The exposure is a bank that still EXISTS but has been idle
+ * on one op type for longer than the retention window; a deleted bank takes
+ * its rows with it via the cascade-delete migration. Latent, not live:
+ * simulating the prune at 5- and 12-day horizons surfaces no pair other than
+ * the two live `graph_maintenance` ones. Closing it properly belongs in the
+ * streak query — bounding the failure scan to the retention horizon — not in
+ * the evaluator, and is tracked separately rather than widened into this fix.
  *
  * That is a documented limitation, not a safety claim: the alternative is the
  * status quo, where a permanently-broken sparse type reads green for ever.

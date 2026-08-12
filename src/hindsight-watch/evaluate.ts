@@ -916,15 +916,26 @@ export function evaluateConsolidationQueueAge(ring: Sample[]): Verdict {
  *    file), NOT that the pair never completed. The sparse arm abstains rather
  *    than guess, leaving the row on the pre-existing behaviour until the next
  *    probe fills the field in.
- *  - `null` means "no `completed` row for this pair IS VISIBLE", which is only
- *    the same as "never completed" while operation retention is longer than
- *    this window. Retention is configurable
- *    (`HINDSIGHT_API_OPERATION_RETENTION_DAYS`; the sweep is disabled at its
- *    code default of 0, and the production bank observably holds 30 days), so
- *    the null arm carries the same age evidence the numeric arm does rather
- *    than firing on absence alone. Under a retention shorter than this window
- *    the numeric arm would be silently unreachable, and an unguarded null arm
- *    would then page on every streak.
+ *  - `null` means "no `completed` row for this pair IS VISIBLE", which is NOT
+ *    the same as "never completed". `docker/hindsight-maintenance.sh:136`
+ *    deletes `status='completed'` rows older than
+ *    `SWITCHROOM_HINDSIGHT_RETENTION_DAYS` (default 30, unset in the fleet) —
+ *    and, per that script's own header at line 23, **never touches
+ *    failed/pending/processing rows**. So the two halves of a streak age
+ *    differently: successes are swept, the failures that define the streak are
+ *    immortal. `null` can therefore mean "the successes were deleted while the
+ *    failures were kept", and the streak query's `coalesce(…, '-infinity')`
+ *    then counts failures that predate a completion which no longer exists.
+ *
+ *    The null arm carries the same age evidence the numeric arm does rather
+ *    than firing on absence alone, which covers the honest cases — a new pair,
+ *    or a pair still actively retrying. It does NOT cover the asymmetry: those
+ *    retained failures are ancient by construction, so an age guard cannot
+ *    discriminate them. The residual is a bank that still exists and has been
+ *    idle on one op type past the retention window; a deleted bank takes its
+ *    rows with it via the cascade-delete migration. It is latent — no such pair
+ *    exists on the production bank — and closing it belongs in the streak
+ *    query, by bounding the failure scan to the retention horizon, not here.
  */
 function lastSuccessPhrase(lastCompletedAgeS: number | null | undefined): string {
   if (lastCompletedAgeS === undefined) return "unknown (state predates the field)";
@@ -942,8 +953,9 @@ function isLiveStreak(s: BankFailureStreak): boolean {
   // pages on hydration alone.
   const last = s.lastCompletedAgeS;
   // No visible completion: fall back to the only clock left, the streak's own
-  // age. Firing on absence alone would page on a short retention window (see
-  // the doc block) rather than on evidence.
+  // age. Firing on absence alone would page a pair whose successes were swept
+  // by the 30-day retention delete, or one still actively retrying, rather
+  // than on evidence. (See the doc block for the case this does NOT cover.)
   if (last === null) return s.newestFailureAgeS > CONSOLIDATION_STREAK_NO_SUCCESS_S;
   return typeof last === "number" && last > CONSOLIDATION_STREAK_NO_SUCCESS_S;
 }
