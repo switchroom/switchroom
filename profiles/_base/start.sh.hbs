@@ -563,6 +563,32 @@ x-litellm-tags: agent:$SWITCHROOM_AGENT_NAME,profile:${SWITCHROOM_AGENT_PROFILE:
       bun /opt/switchroom/agent-scheduler/index.js &
   fi
 
+  # 3a) switchroom-tmp-reaper — bounded janitor for the /tmp tmpfs.
+  #
+  #     /tmp is a RAM-backed tmpfs sized by `resources.tmp_size`
+  #     (DEFAULT_TMP_SIZE = 2g) and mounted noexec by Docker's tmpfs
+  #     defaults. Nothing ages out of a tmpfs, so a long-running container
+  #     accumulates every scratch dir any tool forgot to remove until writes
+  #     start failing ENOSPC — and the failure surfaces in the victim (npm
+  #     ci, git, the CLI's own staging), never at the cause. Observed live:
+  #     4,462 top-level entries and 490 MiB used, 204 MiB of it two orphaned
+  #     compile artifacts from one test run.
+  #
+  #     Deliberately NOT "raise tmp_size": a bigger tmpfs converts a fast,
+  #     loud failure into a slow leak against host RAM. The safety contract
+  #     (age floor, open-file check, /tmp-only scope) lives in the script's
+  #     header and is pinned by tests/tmp-reaper.test.ts.
+  #
+  #     Kill switch: SWITCHROOM_TMP_REAPER=0 in the container env. Supervised
+  #     like the other sidecars so a crash self-heals and its log rotates;
+  #     NOT --oneshot-ok, because a clean exit from an endless loop is
+  #     abnormal and must restart.
+  if [ "$SWITCHROOM_TMP_REAPER" != "0" ] \
+     && [ -x /opt/switchroom/bin/tmp-reaper.sh ]; then
+    _switchroom_supervise tmp-reaper /var/log/switchroom/tmp-reaper.log \
+      bash /opt/switchroom/bin/tmp-reaper.sh &
+  fi
+
   # 3b) Buzz co-channel inbound sidecar (Phase 1, channels.buzz).
   #     A supervised sibling that opens a WebSocket Nostr subscription to a
   #     closed Buzz relay, NIP-42-authenticates, and injects allowlisted

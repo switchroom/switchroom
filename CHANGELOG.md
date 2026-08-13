@@ -53,6 +53,33 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **`/tmp` no longer fills up and takes the container down with it.** An
+  agent's `/tmp` is a 2 GiB RAM-backed tmpfs (`DEFAULT_TMP_SIZE`), and nothing
+  ages out of a tmpfs — a long-running container accumulates every scratch
+  dir any tool forgot to remove until writes start failing ENOSPC, in the
+  victim (`npm ci`, git, the CLI's own staging) rather than at the cause.
+  Measured on a live agent: 4,462 top-level entries, 490 MiB used, 204 MiB of
+  it two orphaned `bun build --compile` trees from a single run of
+  `tests/install/static-binary.test.ts`, which allocated a scratch dir per
+  test and never removed it. Two changes, no third: (1) that test now
+  allocates through a helper that registers cleanup with `onTestFinished`, so
+  the artifact goes away on the FAILURE path too — the run that leaves the
+  biggest artifact behind, and the one a trailing `rmSync` in the test body
+  misses. Measured before/after in a live agent container: 490 MiB → 694 MiB
+  before the fix, 490 MiB → 490 MiB after. (2) a new named sidecar,
+  `switchroom-tmp-reaper` (`bin/tmp-reaper.sh`, supervised from start.sh
+  block 3a, log at `/var/log/switchroom/tmp-reaper.log`), sweeps `/tmp`
+  hourly. It only ever considers direct children of `/tmp`; it skips
+  anything whose subtree holds a file modified or accessed within 24h (a
+  directory's own mtime does not move when a grandchild is written, so the
+  whole subtree is checked); it skips anything open by a live process
+  (`/proc/*/fd`, `cwd`, `exe`, and mmapped regions from `/proc/*/maps`); it
+  cannot escape `/tmp` (`-xdev`, no symlink deref, `rm --one-file-system`);
+  and it logs every entry it takes with size and age, plus a per-pass
+  summary. Kill switch `SWITCHROOM_TMP_REAPER=0`; thresholds tunable with a
+  1h floor. The tmpfs size was deliberately NOT raised — a bigger tmpfs
+  converts a fast, loud failure into a slow leak against host RAM.
+
 - **repos: per-agent STANDING trees (`repos:` in switchroom.yaml) are now
   independent clones too — two agents on the same repo no longer share a
   stash ref.** The claim-path fix below stopped sub-agent checkouts sharing
