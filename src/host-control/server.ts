@@ -298,6 +298,19 @@ export interface ServerOptions {
     requestId: string;
   }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
   /**
+   * Test seam: override how the live config file is written during a
+   * `config_propose_edit` apply (both the forward write and the rollback
+   * restores go through it). Default: `writeFileInPlacePreservingInode`.
+   *
+   * Exists so a test can install a write that SILENTLY DOES NOTHING and
+   * assert the RESPONSE, which is the exact production failure the
+   * post-write verification below guards: a write that does not throw but
+   * does not land. Without the seam a test can only reach that state via a
+   * filesystem trick (chattr / a bind mount / a racing writer), none of
+   * which are portable in CI.
+   */
+  writeConfigFile?: (path: string, content: string) => void;
+  /**
    * #1841 — operator-passphrase attestation verifier. Default: a
    * broker-backed verifier that forwards the passphrase to the vault
    * broker at `HOSTD_BROKER_SOCKET_PATH`. Tests inject a stub. Only
@@ -678,6 +691,123 @@ function writeFileInPlacePreservingInode(
       `in-place write short: wrote ${buf.length} bytes but read back ${readBack.length}`,
     );
   }
+}
+
+/**
+ * Outcome of the post-write verification for a `config_propose_edit` apply.
+ * `ok` means the bytes we intended to write are the bytes the next reader of
+ * `configPath` will see, AND that they mean semantically what the operator
+ * approved. `size`/`mtimeMs` are echoed into the audit row on success so a
+ * future false success leaves evidence behind.
+ */
+interface ConfigWriteObservation {
+  ok: boolean;
+  /** Human-readable failure reasons; empty iff `ok`. */
+  reasons: string[];
+  /** Observed bytes, or null when the read-back itself failed. */
+  observed: Buffer | null;
+  size: number | null;
+  mtimeMs: number | null;
+}
+
+/**
+ * #4661 — verify a config write was OBSERVED, not merely un-thrown.
+ *
+ * `writeFileInPlacePreservingInode` returning without throwing proves only
+ * that a `write(2)` to SOME fd reported the right byte count. It does not
+ * prove the bytes are visible at `configPath` to the next reader, and its own
+ * read-back is a LENGTH-ONLY truncation guard. A real incident: a
+ * `config_propose_edit` returned `result: completed, exit_code: 0` with a
+ * clean reconcile while the approved block was absent from the config every
+ * other process reads.
+ *
+ * Two independent assertions, both computed so the failure detail names each
+ * one that tripped:
+ *
+ *  1. BYTE COMPARE — re-read `configPath` and compare against the exact bytes
+ *     we handed the writer. Catches a no-op write, a partial write, and a
+ *     competing writer that landed inside the window.
+ *  2. SEMANTIC CHANGE SET — reclassify `snapshot → observed` and require the
+ *     changed YAML paths to still equal the set the operator approved. This
+ *     is the check that catches "the added block is absent" even if the byte
+ *     compare were ever relaxed or defeated. Compared as a SET (order- and
+ *     duplicate-insensitive) rather than positionally.
+ *
+ * Byte-exactness is safe here: `expected` originates from
+ * `readFileSync(scratch, "utf8")` inside the validator's `applyPatch`, so it
+ * can carry no lone surrogates, and the writer encodes with the same utf-8
+ * codec we decode with — the string→bytes→string round trip is lossless.
+ * `git apply` runs with `--whitespace=nowarn` (warn-suppression, NOT `fix`),
+ * and every transformation applyPatch performs happens BEFORE `expected`
+ * exists, so nothing downstream of the caller's write can legitimately alter
+ * the bytes. The only remaining source of divergence is a writer outside the
+ * apply mutex (documented residual race) — which is exactly what we want to
+ * fail on, not tolerate.
+ *
+ * KNOWN LIMITATION: this reads back the SAME path it wrote. If hostd's read
+ * and write go through the same aliased-or-wrong path, verification passes
+ * and a path-divergence bug survives. Closing that requires asserting path
+ * IDENTITY (the wire `target_path` vs the resolved `configPath`), which is
+ * out of scope here.
+ */
+function verifyConfigWriteObserved(
+  configPath: string,
+  expected: string,
+  snapshot: string,
+  proposedChangedPaths: string[],
+): ConfigWriteObservation {
+  const expectedBuf = Buffer.from(expected, "utf-8");
+  let observed: Buffer;
+  let size: number | null = null;
+  let mtimeMs: number | null = null;
+  try {
+    observed = readFileSync(configPath);
+    const st = statSync(configPath);
+    size = st.size;
+    mtimeMs = st.mtimeMs;
+  } catch (e) {
+    return {
+      ok: false,
+      reasons: [`post-write read-back of ${configPath} failed: ${(e as Error).message}`],
+      observed: null,
+      size: null,
+      mtimeMs: null,
+    };
+  }
+  const reasons: string[] = [];
+  if (!observed.equals(expectedBuf)) {
+    let firstDiff = 0;
+    const min = Math.min(observed.length, expectedBuf.length);
+    while (firstDiff < min && observed[firstDiff] === expectedBuf[firstDiff]) {
+      firstDiff += 1;
+    }
+    reasons.push(
+      `written bytes are not observable at ${configPath} ` +
+        `(expected ${expectedBuf.length} bytes, read back ${observed.length}, ` +
+        `first difference at offset ${firstDiff})`,
+    );
+  }
+  // Independent of the byte compare: does the file on disk still MEAN what
+  // the operator approved? A parse failure fails safe inside
+  // classifyBlastRadius (`["<unparseable>"]`), which cannot match an
+  // approved set, so a corrupted file trips this too.
+  const observedChangedPaths = classifyBlastRadius(
+    snapshot,
+    observed.toString("utf-8"),
+  ).changedPaths;
+  const approvedSet = new Set(proposedChangedPaths);
+  const observedSet = new Set(observedChangedPaths);
+  const sameSet =
+    approvedSet.size === observedSet.size &&
+    [...approvedSet].every((p) => observedSet.has(p));
+  if (!sameSet) {
+    reasons.push(
+      `on-disk change set diverged from what was approved ` +
+        `(approved: [${[...approvedSet].sort().join(", ")}]; ` +
+        `observed on disk: [${[...observedSet].sort().join(", ")}])`,
+    );
+  }
+  return { ok: reasons.length === 0, reasons, observed, size, mtimeMs };
 }
 
 const STATUS_RETENTION_MS = 10 * 60 * 1000; // 10 min
@@ -3657,13 +3787,13 @@ export class HostdServer {
       // switchroom.yaml is itself a read-only bind-mount source mounted
       // into every agent container — see writeFileInPlacePreservingInode.
       try {
-        writeFileInPlacePreservingInode(configPath, postApplyFresh);
+        this.writeLiveConfig(configPath, postApplyFresh);
       } catch (e) {
         // Write failed before any bytes were flushed, OR mid-write. We
         // hold the snapshot, so restore it in place to be safe rather
         // than assume the live file is untouched.
         try {
-          writeFileInPlacePreservingInode(configPath, snapshot);
+          this.writeLiveConfig(configPath, snapshot);
         } catch {
           /* best-effort restore; original error is the one that matters */
         }
@@ -3673,6 +3803,69 @@ export class HostdServer {
         });
         return this.reconcileFailedRolledBack(
           `write failed: ${(e as Error).message}`,
+          req,
+          caller,
+          started,
+        );
+      }
+      // ── #4661 — the write must be OBSERVED before we trust it ──
+      // A write that neither throws nor lands used to flow straight into
+      // reconcile, and a clean `switchroom apply` (which re-reads the
+      // UNCHANGED file, so of course it passes) then returned
+      // `result: completed, exit_code: 0` for an edit that was never applied.
+      // `completed` must be keyed off the file, not off the reconcile's exit
+      // code. Verify BEFORE the reconcile so a false success cannot be
+      // laundered through it.
+      const observation = verifyConfigWriteObserved(
+        configPath,
+        postApplyFresh,
+        snapshot,
+        proposedChangedPaths,
+      );
+      if (!observation.ok) {
+        const why = `post-write verification failed: ${observation.reasons.join("; ")}`;
+        // Bytes may or may not be on disk — we cannot tell, which is the
+        // whole problem — so restore the snapshot unless what we read back
+        // ALREADY is the snapshot (a no-op write: rewriting identical bytes
+        // would only bump mtime and wake config watchers for nothing).
+        const snapshotBuf = Buffer.from(snapshot, "utf-8");
+        const alreadySnapshot =
+          observation.observed !== null && observation.observed.equals(snapshotBuf);
+        let restoreDetail: string;
+        if (alreadySnapshot) {
+          restoreDetail =
+            "live config already byte-identical to the pre-write snapshot; no restore needed";
+        } else {
+          try {
+            this.writeLiveConfig(configPath, snapshot);
+            restoreDetail = "rolled back to the pre-write snapshot";
+          } catch (e) {
+            // Nested failure: verification failed AND the restore failed.
+            // The live file is in an unknown state and no automated path can
+            // recover it — say so loudly rather than implying a clean rollback.
+            restoreDetail =
+              `SNAPSHOT RESTORE ALSO FAILED: ${(e as Error).message} — ` +
+              `live config at ${configPath} is in an UNKNOWN state, inspect it by hand`;
+          }
+        }
+        // Closest available terminal card state — NOT a claim that a
+        // reconcile ran and rejected the config (it never ran; see the
+        // `writeNotObserved` doc comment, which is the WIRE code and IS
+        // precise). `ApprovalResult.finalize`'s `outcome` is a 3-valued
+        // contract — "applied" | "aborted_config_changed" |
+        // "reconcile_failed_rolled_back" — shared with the telegram card
+        // renderer, and old gateways reject an unknown outcome
+        // (mixed-version safety), so widening it to a distinct
+        // "write_not_observed" needs the gateway side to land first.
+        // Same reuse, same reason, as update-notifier.ts's apply_refused
+        // path. Until then the detail below carries the honest cause.
+        // Tracked in #4667 (widen the outcome enum + card renderer).
+        await approval.finalize({
+          outcome: "reconcile_failed_rolled_back",
+          detail: `${why}; ${restoreDetail}`,
+        });
+        return this.writeNotObserved(
+          `${why}; ${restoreDetail}`,
           req,
           caller,
           started,
@@ -3703,13 +3896,22 @@ export class HostdServer {
           affectedAgents: blast.agents,
           fleetWide: blast.fleetWide,
         });
+        // #4661 diagnosability: pin WHICH file this `completed` is a claim
+        // about, and what it looked like immediately after the verified
+        // write. A future false success then leaves evidence in the audit
+        // row instead of an unattributable "exit 0".
+        const writeEvidence =
+          `config write observed: path=${configPath} ` +
+          `size=${observation.size} mtime_ms=${observation.mtimeMs}`;
         return {
           v: 1,
           request_id: req.request_id,
           result: "completed",
           exit_code: 0,
           duration_ms: Date.now() - started,
-          stdout_tail: tail(recRes.stdout),
+          // Appended (not prefixed): `tail` keeps the END of an over-budget
+          // string, so the evidence survives a chatty reconcile.
+          stdout_tail: tail(`${recRes.stdout}\n--- ${writeEvidence} ---`),
           stderr_tail: tail(recRes.stderr),
         };
       }
@@ -3718,7 +3920,7 @@ export class HostdServer {
       // bind-mount safe.
       let rollbackDetail = "";
       try {
-        writeFileInPlacePreservingInode(configPath, snapshot);
+        this.writeLiveConfig(configPath, snapshot);
       } catch (e) {
         rollbackDetail = `snapshot restore failed: ${(e as Error).message}`;
         await approval.finalize({
@@ -3789,6 +3991,51 @@ export class HostdServer {
       .caller(caller.kind === "agent" ? "agent" : "operator")
       .agentName(caller.kind === "agent" ? caller.name : undefined)
       .asDenied()
+      .build(req.request_id, Date.now() - started);
+    return { ...built, error: legacy };
+  }
+
+  /**
+   * The single write path for the live config during a `config_propose_edit`
+   * apply — forward write AND both rollback restores. Routed through the
+   * `writeConfigFile` opt so a test can install a write that silently does
+   * nothing (see the opt's doc comment); defaults to the real bind-mount-safe
+   * in-place writer.
+   */
+  private writeLiveConfig(path: string, content: string): void {
+    (this.opts.writeConfigFile ?? writeFileInPlacePreservingInode)(path, content);
+  }
+
+  /**
+   * #4661 — the apply wrote bytes but they are NOT observable at
+   * `configPath` (or the file on disk no longer means what the operator
+   * approved). Deliberately DISTINCT from `E_RECONCILE_FAILED_ROLLED_BACK`:
+   * that code says "the config changed and switchroom apply rejected it",
+   * this one says "hostd cannot prove the config changed at all". Conflating
+   * them is what let the original incident read as an ordinary reconcile
+   * failure. Infra-class — the agent cannot self-recover by re-proposing,
+   * because the diff was fine; the write path is what is broken.
+   */
+  private writeNotObserved(
+    detail: string,
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
+    started: number,
+  ): HostdResponse {
+    const legacy = `E_WRITE_NOT_OBSERVED: ${detail}`;
+    const built = err(
+      "E_WRITE_NOT_OBSERVED",
+      "config write could not be observed on the target file; apply aborted before reconcile",
+    )
+      .why(detail)
+      .fixOperatorAction("infra", [
+        "confirm hostd reads and writes the SAME switchroom.yaml the fleet reads (check the hostd bind mount over /state/config/switchroom.yaml)",
+        "check for a competing writer to the config (operator hand-edit or editor daemon) during the apply window",
+        "inspect the live config by hand before re-proposing — the diff was valid, the write path was not",
+      ])
+      .op("config_propose_edit")
+      .caller(caller.kind === "agent" ? "agent" : "operator")
+      .agentName(caller.kind === "agent" ? caller.name : undefined)
       .build(req.request_id, Date.now() - started);
     return { ...built, error: legacy };
   }

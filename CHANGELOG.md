@@ -72,6 +72,28 @@ now an anomaly worth investigating, not the norm.
   legacy linked worktree → `git worktree remove` from the bare), detected
   by filesystem shape, never a stored kind field.
 
+- **hostd: `config_propose_edit` no longer reports `completed` for a config
+  write it cannot prove landed.** A production edit came back
+  `result: completed, exit_code: 0` with a clean reconcile while the approved
+  block was absent from the config every other process reads. The cause was
+  structural: between the in-place write and the response there was NO re-read
+  of the target file, so `completed` was keyed entirely off `switchroom apply`'s
+  exit code — and an apply that re-reads an UNCHANGED file passes, laundering
+  the false success. The writer's own read-back is length-only (a truncation
+  guard), so a write that neither throws nor lands sailed through it. The apply
+  path now verifies BEFORE reconciling: it re-reads the resolved config path,
+  byte-compares against the exact content it handed the writer, and
+  independently re-classifies the on-disk change set against the set the
+  operator approved. Either check failing rolls back and returns a NEW,
+  distinguishable `E_WRITE_NOT_OBSERVED` (never
+  `E_RECONCILE_FAILED_ROLLED_BACK` — nothing rejected the config; hostd could
+  not prove it changed at all), and the nested case where the rollback ITSELF
+  fails says so rather than implying a clean revert. A successful apply now
+  echoes the resolved path, byte size and mtime into `stdout_tail`, so a future
+  false success leaves evidence in the audit row. Known limitation: read-back
+  goes through the same path as the write, so a hostd whose read and write are
+  both aliased to the WRONG file still verifies clean — asserting path identity
+  is separate work.
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide
   through shared git state.** Linked worktrees share the parent repo's refs
