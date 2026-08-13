@@ -56,6 +56,7 @@ function makeServer(opts: {
     stdout: string;
     stderr: string;
   }>;
+  writeConfigFile?: (path: string, content: string) => void;
 }) {
   return new HostdServer({
     homeDir: tmp,
@@ -73,6 +74,7 @@ function makeServer(opts: {
     approvalGateway: opts.approvalGateway,
     generateApprovalId: opts.generateApprovalId,
     runReconcile: opts.runReconcile,
+    writeConfigFile: opts.writeConfigFile,
   });
 }
 
@@ -1007,6 +1009,199 @@ describe("hostd config_propose_edit — apply-time re-apply guard (#3084)", () =
  * pre-fix code (the edits landed in the other agent's block / the wrong
  * outcome was finalized).
  */
+// ─────────────────────────────────────────────────────────────────────
+// #4661 — post-write verification. A write that neither throws nor
+// lands used to flow straight into reconcile: `switchroom apply`
+// re-read the UNCHANGED file, passed, and the response came back
+// `result: completed, exit_code: 0` for an edit that was never applied.
+// Pre-fix, case 1 below returns completed/0 — the assertions here are on
+// the RESPONSE and on the file's mtime, never on "a code path ran".
+// ─────────────────────────────────────────────────────────────────────
+describe("hostd config_propose_edit — post-write verification (#4661)", () => {
+  // A base with one real (non-comment) key we can point a semantic diff at.
+  const VERIFY_BASE_YAML =
+    "switchroom:\n" +
+    "  version: 1\n" +
+    "telegram:\n" +
+    '  bot_token: "x"\n' +
+    '  forum_chat_id: "1"\n' +
+    "agents:\n" +
+    "  bob:\n" +
+    '    topic_name: "Twin"\n';
+
+  // Approved change set: exactly ["telegram.forum_chat_id"].
+  const FORUM_ID_DIFF =
+    "--- a/switchroom.yaml\n" +
+    "+++ b/switchroom.yaml\n" +
+    "@@ -3,4 +3,4 @@\n" +
+    " telegram:\n" +
+    '   bot_token: "x"\n' +
+    '-  forum_chat_id: "1"\n' +
+    '+  forum_chat_id: "2"\n' +
+    " agents:\n";
+
+  // What a mis-targeted write lands instead: a DIFFERENT yaml path changes.
+  const WRONG_PATHS_YAML =
+    "switchroom:\n" +
+    "  version: 1\n" +
+    "telegram:\n" +
+    '  bot_token: "x"\n' +
+    '  forum_chat_id: "1"\n' +
+    "agents:\n" +
+    "  bob:\n" +
+    '    topic_name: "Hijacked"\n';
+
+  it("a write that silently does not land returns E_WRITE_NOT_OBSERVED, never 'completed'", async () => {
+    // GOOD_DIFF is comment-only, so the APPROVED change set is empty and the
+    // change-set pin passes trivially (both sides []). The byte compare is
+    // the only thing standing between this and a false `completed` — which
+    // is exactly why it exists.
+    const { gw, finalizeCalls } = stubGateway("approve");
+    let reconcileInvocations = 0;
+    const writes: string[] = [];
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      // The production failure, reproduced honestly: the write returns
+      // normally and throws nothing, but no bytes reach the target.
+      writeConfigFile: (_p, content) => {
+        writes.push(content);
+      },
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "applied ok", stderr: "" };
+      },
+    });
+    await server.start();
+    const before = readFile(configPath, "utf8");
+    const mtimeBefore = statSync(configPath).mtimeMs;
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "wno-1" });
+
+    // The response is the observable: pre-fix this was completed / exit 0.
+    expect(resp.result).not.toBe("completed");
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/E_WRITE_NOT_OBSERVED/);
+    expect(resp.error_envelope?.code).toBe("E_WRITE_NOT_OBSERVED");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
+    // Byte compare is the check that caught it; the (empty) change-set pin
+    // could not have.
+    expect(resp.error).toMatch(/not observable at/);
+    expect(resp.error).not.toMatch(/change set diverged/);
+    // The reconcile must NOT have run — a clean apply over an unchanged file
+    // is precisely how the false success used to launder itself.
+    expect(reconcileInvocations).toBe(0);
+    // The target file was never touched: same bytes, same mtime.
+    expect(readFile(configPath, "utf8")).toBe(before);
+    expect(statSync(configPath).mtimeMs).toBe(mtimeBefore);
+    // Forward write attempted once; no pointless snapshot re-write, because
+    // what we read back already WAS the snapshot.
+    expect(writes.length).toBe(1);
+    expect(finalizeCalls.length).toBe(1);
+    expect(finalizeCalls[0]!.outcome).toBe("reconcile_failed_rolled_back");
+    expect(finalizeCalls[0]!.detail).toMatch(/no restore needed/);
+  });
+
+  it("a write that lands at the WRONG yaml paths returns E_WRITE_NOT_OBSERVED naming both change sets", async () => {
+    writeFileSync(configPath, VERIFY_BASE_YAML);
+    const { gw, finalizeCalls } = stubGateway("approve");
+    let reconcileInvocations = 0;
+    let writeCalls = 0;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      // First call = the mis-targeted write (lands agents.bob.topic_name,
+      // not the approved telegram.forum_chat_id). Later calls = the
+      // rollback restore, which writes honestly.
+      writeConfigFile: (p, content) => {
+        writeCalls += 1;
+        writeFileSync(p, writeCalls === 1 ? WRONG_PATHS_YAML : content);
+      },
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "applied ok", stderr: "" };
+      },
+    });
+    await server.start();
+    const resp = await send({
+      unified_diff: FORUM_ID_DIFF,
+      request_id: "wno-2",
+    });
+
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/E_WRITE_NOT_OBSERVED/);
+    // The change-set pin fired and reported the ACTUAL on-disk set — proof
+    // it re-classified the file rather than trusting the intent.
+    expect(resp.error).toMatch(/on-disk change set diverged/);
+    expect(resp.error).toMatch(/telegram\.forum_chat_id/);
+    expect(resp.error).toMatch(/agents\.bob\.topic_name/);
+    expect(reconcileInvocations).toBe(0);
+    // Rolled back: the hijacked value is gone and the snapshot is restored.
+    const live = readFile(configPath, "utf8");
+    expect(live).toBe(VERIFY_BASE_YAML);
+    expect(live).not.toContain("Hijacked");
+    expect(writeCalls).toBe(2); // forward write + snapshot restore
+    expect(finalizeCalls[0]!.outcome).toBe("reconcile_failed_rolled_back");
+    expect(finalizeCalls[0]!.detail).toMatch(/rolled back to the pre-write snapshot/);
+  });
+
+  it("verification failure whose rollback ALSO fails says so instead of implying a clean rollback", async () => {
+    const { gw, finalizeCalls } = stubGateway("approve");
+    let writeCalls = 0;
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      writeConfigFile: (p, content) => {
+        writeCalls += 1;
+        if (writeCalls === 1) {
+          // Lands SOMETHING that is neither the intent nor the snapshot, so
+          // the restore branch is genuinely required.
+          writeFileSync(p, `${content}# truncated tail lost\n`);
+          return;
+        }
+        throw new Error("EROFS: read-only file system");
+      },
+      runReconcile: async () => ({ exit_code: 0, stdout: "", stderr: "" }),
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "wno-3" });
+
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/E_WRITE_NOT_OBSERVED/);
+    expect(resp.error).toMatch(/SNAPSHOT RESTORE ALSO FAILED/);
+    expect(resp.error).toMatch(/EROFS/);
+    expect(resp.error).toMatch(/UNKNOWN state/);
+    expect(writeCalls).toBe(2);
+    expect(finalizeCalls[0]!.detail).toMatch(/SNAPSHOT RESTORE ALSO FAILED/);
+  });
+
+  it("happy path still completes, and echoes the resolved path + size + mtime as evidence", async () => {
+    const { gw, finalizeCalls } = stubGateway("approve");
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async () => ({ exit_code: 0, stdout: "applied ok", stderr: "" }),
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "wno-4" });
+
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    expect(readFile(configPath, "utf8")).toContain("# touched by apply-path test");
+    expect(finalizeCalls[0]!.outcome).toBe("applied");
+    // The reconcile's own output is preserved …
+    expect(resp.stdout_tail).toContain("applied ok");
+    // … and the `completed` claim now names the file it is a claim about.
+    const size = statSync(configPath).size;
+    expect(resp.stdout_tail).toContain(`config write observed: path=${configPath}`);
+    expect(resp.stdout_tail).toContain(`size=${size}`);
+    expect(resp.stdout_tail).toMatch(/mtime_ms=\d+/);
+  });
+});
+
 describe("hostd config_propose_edit — relocation guards (#3121 follow-up)", () => {
   // bob is the only agent at PROPOSE time, so the generic (agent-name-free)
   // hunk context below anchors uniquely in bob's block and the self-scope

@@ -444,6 +444,11 @@ export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   // validation and the (up to 60-min-delayed) operator approval, so the apply
   // ABORTED under the mutex rather than silently revert the intervening change.
   "E_CONFIG_CHANGED",
+  // #4661 — the apply wrote bytes that are NOT observable at the resolved
+  // config path (or the file on disk no longer carries the approved change
+  // set). Distinct from E_RECONCILE_FAILED_ROLLED_BACK: nothing rejected the
+  // config, hostd could not prove it changed at all.
+  "E_WRITE_NOT_OBSERVED",
 ] as const;
 export type ConfigProposeEditErrorCode =
   (typeof CONFIG_PROPOSE_EDIT_ERROR_CODES)[number];
