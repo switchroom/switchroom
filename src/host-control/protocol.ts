@@ -384,6 +384,15 @@ export const AgentSmokeRequestSchema = z.object({
 // operator approval card, and an explicit `target_path` that MUST equal the
 // canonical config path — guarding against accidental multi-file diffs and
 // giving the validator a single load-bearing path string to anchor on.
+/**
+ * The one config path this verb is allowed to name on the wire — the container
+ * path `hostd install` bind-mounts `~/.switchroom/switchroom.yaml` onto
+ * (`src/cli/hostd.ts`). Exported so the three places that compare against it
+ * (this schema, hostd's fallback resolution, and the startup path-provenance
+ * assertion in `main.ts`) cannot drift apart independently.
+ */
+export const CANONICAL_CONFIG_PATH = "/state/config/switchroom.yaml" as const;
+
 export const ConfigProposeEditRequestSchema = z.object({
   ...RequestEnvelope,
   op: z.literal("config_propose_edit"),
@@ -399,7 +408,7 @@ export const ConfigProposeEditRequestSchema = z.object({
     /** Must be the canonical path. Rejected dispatcher-side if not —
      *  this is a defense-in-depth check on top of PR 1b's diff-path
      *  validation. */
-    target_path: z.literal("/state/config/switchroom.yaml"),
+    target_path: z.literal(CANONICAL_CONFIG_PATH),
   }),
 });
 
@@ -449,6 +458,13 @@ export const CONFIG_PROPOSE_EDIT_ERROR_CODES = [
   // set). Distinct from E_RECONCILE_FAILED_ROLLED_BACK: nothing rejected the
   // config, hostd could not prove it changed at all.
   "E_WRITE_NOT_OBSERVED",
+  // #4661 follow-up — the file hostd would WRITE is not the file the fleet
+  // READS: the write target and `findConfigFile()`'s answer resolve to
+  // different real paths. Returned BEFORE anything is written (no snapshot, no
+  // approval card), because writing one file and reconciling another produces
+  // an `exit 0, result: completed` for a change that is absent from the config
+  // every other process loads.
+  "E_CONFIG_PATH_MISMATCH",
 ] as const;
 export type ConfigProposeEditErrorCode =
   (typeof CONFIG_PROPOSE_EDIT_ERROR_CODES)[number];

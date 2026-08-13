@@ -31,7 +31,7 @@ import {
   type GatewayCandidate,
 } from "./config-degraded.js";
 import { allocateAgentUid } from "../agents/compose.js";
-import { HostdServer } from "./server.js";
+import { HostdServer, configPathProvenanceWarning } from "./server.js";
 import { dockerFleetComponents } from "./prior-pin.js";
 import { SocketApprovalGateway } from "./approval-gateway.js";
 import { SocketRolloutRelay } from "./rollout-relay.js";
@@ -140,6 +140,20 @@ async function main(): Promise<void> {
       "hostd: refusing to start — host_control.enabled is not true in switchroom.yaml\n",
     );
     process.exit(2);
+  }
+
+  // #4661 follow-up — is the file `config_propose_edit` writes the file the
+  // fleet reads? The write target is the wire literal
+  // (`/state/config/switchroom.yaml`); everything else — agents, the CLI,
+  // hostd's own loadConfig — goes through findConfigFile. Say so LOUDLY at boot
+  // if they disagree, and do NOT refuse to start: a config-layout change would
+  // otherwise take the whole daemon (rollouts included) down to protect one
+  // verb that already refuses on its own at apply time. Two NAMES for one file
+  // (same dev+inode) stay silent — the shipped install is exactly that, and a
+  // warning that fires every boot is a warning nobody reads.
+  const provenanceWarning = configPathProvenanceWarning();
+  if (provenanceWarning !== null) {
+    process.stderr.write(`hostd: ${provenanceWarning}\n`);
   }
 
   // Bind a per-agent UDS for EVERY agent, not just admin-flagged ones.

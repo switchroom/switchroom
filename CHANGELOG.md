@@ -187,6 +187,31 @@ now an anomaly worth investigating, not the norm.
   the notice→evict→notice recursion, whereas `eval_case_suppressed` is never
   produced by eviction and participates in no cycle.
 
+- **hostd: `config_propose_edit` can no longer write one `switchroom.yaml` and
+  reconcile another.** The write target came from the wire literal
+  (`/state/config/switchroom.yaml` — `main.ts` never passes the `configPath`
+  test seam, so production fell through to it), while the `switchroom apply`
+  child resolved its own config through `findConfigFile()`
+  (`$SWITCHROOM_CONFIG` → cwd → `~/.switchroom`). The two agreed only because
+  `hostd install` happens to export `SWITCHROOM_CONFIG` alongside the bind
+  mount; nothing enforced it, and on divergence hostd wrote file X, reconciled
+  file Y cleanly, and returned `completed, exit_code: 0` for a change absent
+  from the file everything else reads. Three changes, and no retarget of the
+  in-place bind-mount-safe write: the reconcile spawn now PINS
+  `SWITCHROOM_CONFIG` to the file just written (forward AND rollback
+  reconcile), so the child cannot diverge; a mismatch between the write target
+  and `findConfigFile()`'s answer refuses the apply with a distinct
+  `E_CONFIG_PATH_MISMATCH` **before** any card, snapshot, or write; and hostd
+  logs one greppable `hostd-config-path-provenance` line at boot when they
+  disagree — logging, never refusing, because a config-layout change must not
+  take the whole daemon (rollouts included) down to protect one verb that
+  already refuses on its own. Two names for one file (same `st_dev` + `st_ino`)
+  stay silent: the shipped install is exactly that, and a warning that fires
+  every boot is a warning nobody reads. Identity is compared as dev+inode, not
+  `realpath(2)` — `realpath` collapses neither a bind mount nor a hard link, so
+  it would report "different file" for two names that are provably the same
+  bytes.
+
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide
   through shared git state.** Linked worktrees share the parent repo's refs
