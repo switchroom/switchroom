@@ -160,7 +160,12 @@ now an anomaly worth investigating, not the norm.
   boot it was written under (PID 1's `/proc` starttime), so a token that
   outlives its generation — `start.sh`'s `rm -f … || true` swallows a per-file
   unlink failure — is self-evidently stale rather than a permanent, silent
-  resume suppressor. (#4641)
+  resume suppressor. The stamp itself is placed to be crash-honest: it happens
+  only after the resume inbound is durably spooled, and only if the boot block
+  did not throw — the block's `catch` swallows and lets init continue, so an
+  ungated stamp could mark the generation done after the reaper had already
+  durably ended a turn that was never spooled. Lose the token, repeat the
+  work; never lose the work. (#4641)
 
 - **CI: the `docker-e2e` manual recovery lever now actually runs the pg probe.**
   `hindsight-watch-pg-probe`'s `if:` gate carried `push` and `merge_group` but

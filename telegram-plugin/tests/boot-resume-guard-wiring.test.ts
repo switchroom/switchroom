@@ -128,12 +128,18 @@ describe('#4641 boot-resume guard wiring in gateway.ts', () => {
     expect(durablePut, 'the durable spool put must precede the token stamp').toBeLessThan(stamp)
     expect(idx('markTurnResumed(turnsDb, resumeTurnKey)')).toBeLessThan(stamp)
 
-    // 3. It is UNCONDITIONAL — top-level (zero indentation, so not nested
-    //    inside `if (isGatewayMain && bootResumeInbound != null)`), gated only
-    //    on isGatewayMain. A boot with nothing to resume must still stamp, or
-    //    a later gateway-only respawn reaps a meanwhile-started live turn.
+    // 3. It is top-level (zero indentation, so not nested inside
+    //    `if (isGatewayMain && bootResumeInbound != null)`) and independent of
+    //    whether there was anything to resume — a boot that found nothing must
+    //    still stamp, or a later gateway-only respawn reaps a
+    //    meanwhile-started live turn — but it IS gated on the block not having
+    //    thrown. gateway.ts's block-level `catch` swallows and lets init
+    //    continue, so an ungated stamp marks the generation done after the
+    //    reaper has already durably ended a turn that was never spooled.
     const stampLine = SRC.split('\n').find((l) => l.includes('markBootResumeComplete(STATE_DIR)'))!
-    expect(stampLine).toMatch(/^if \(isGatewayMain\) markBootResumeComplete\(STATE_DIR\)/)
+    expect(stampLine).toMatch(
+      /^if \(isGatewayMain && !bootResumeThrew\) markBootResumeComplete\(STATE_DIR\)/,
+    )
 
     // 4. Nothing durable-resume-related may sneak between the put and the
     //    stamp except the resumed_at ledger — i.e. the stamp closes that
@@ -156,6 +162,32 @@ describe('#4641 boot-resume guard wiring in gateway.ts', () => {
       envLine,
       'the generation token must not be stamped alongside writePendingTurnEnv (still in-memory-only territory)',
     ).not.toContain('markBootResumeComplete')
+  })
+
+  it("sets bootResumeThrew in the block's own catch, and nowhere else", () => {
+    // The catch is a SWALLOW: it logs, nulls turnsDb and lets module init run
+    // on to the stamp. By then the reaper may already have durably written
+    // `ended_via='restart'` with nothing spooled, so the catch must record the
+    // failure and the stamp must honour it. Pinned by source text because the
+    // block is module-init code this suite cannot import.
+    const blockStart = idx('bootResumeInit: if (isGatewayMain) try {')
+    const catchAt = SRC.indexOf('} catch (err) {', blockStart)
+    const stamp = idx('markBootResumeComplete(STATE_DIR)')
+
+    const sets = [...SRC.matchAll(/bootResumeThrew = true/g)].map((m) => m.index!)
+    expect(sets.length, 'exactly one assignment site').toBe(1)
+    expect(sets[0]!, "the assignment must be in the block's catch").toBeGreaterThan(catchAt)
+    expect(sets[0]!, 'and before the stamp reads it').toBeLessThan(stamp)
+
+    // The catch must not early-return/exit instead: init continues, which is
+    // precisely why the flag is needed.
+    const catchBody = SRC.slice(catchAt, SRC.indexOf('\n}\n', catchAt) + 2)
+    expect(catchBody).toContain('turnsDb = null')
+    expect(catchBody).not.toContain('process.exit')
+
+    const decl = SRC.indexOf('let bootResumeThrew = false')
+    expect(decl, 'declared before the block so the stamp can read it').toBeGreaterThan(-1)
+    expect(decl).toBeLessThan(blockStart)
   })
 
   it('keeps the guard AFTER the registry is opened, so turn tracking still works', () => {

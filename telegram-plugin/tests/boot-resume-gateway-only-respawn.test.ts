@@ -25,6 +25,12 @@
  * (`boot-resume-guard-wiring.test.ts` pins that gateway.ts really does stamp
  * after the put, since this file cannot import the block.)
  *
+ * The second fidelity trap, same shape: an in-block failure is NOT a process
+ * death. gateway.ts swallows it (`catch { log; turnsDb = null }`) and module
+ * init runs on to the stamp. `throwAt` models that swallow — distinct from
+ * `crashAt`, which kills the sequence — and it is why the stamp is gated on
+ * `bootResumeThrew`, not merely placed late.
+ *
  *   - gateway killed mid-turn while the claude process LIVES
  *       → ZERO `resume_interrupted` entries in the on-disk spool,
  *         the in-flight turn row is left OPEN (no `ended_via` lie), and
@@ -170,6 +176,13 @@ type CrashPoint = 'after-guard' | 'after-block-before-put' | 'after-put-before-s
 
 /** Sentinel used to unwind out of the modelled boot at `crashAt`. */
 const BOOT_CRASH = Symbol('boot-crash')
+/**
+ * A throw INSIDE the boot block — swallowed, not fatal. gateway.ts's block
+ * ends in `catch (err) { log; turnsDb = null }` and module init CONTINUES, so
+ * unlike BOOT_CRASH the later stages still run. Modelling every in-block
+ * failure as a process death is what hid the swallow-then-stamp defect.
+ */
+const BLOCK_THROW = Symbol('block-throw')
 
 /**
  * The gateway's boot sequence in gateway.ts's real order, over the real
@@ -189,6 +202,17 @@ function runBootSequence(opts: {
   crashAt?: CrashPoint
   /** Where the generation token is stamped. Default = production. */
   stampAt?: 'block-end' | 'after-durable-put'
+  /**
+   * Throw inside the block and let gateway.ts's `catch` swallow it. Unlike
+   * `crashAt` the process survives, so stages 2 and 3 still run — which is the
+   * whole point: the reaper has already durably ended the turn.
+   */
+  throwAt?: 'after-reaper'
+  /**
+   * Production (post-fix) gates the stamp on the block not having thrown
+   * (`bootResumeThrew`). Set false to reproduce the ungated defect.
+   */
+  gateStampOnBlockThrow?: boolean
 }): BootResult {
   const spoolPath = join(stateDir, 'inbound-spool.jsonl')
   const db = openTurnsDb(agentDir)
@@ -203,51 +227,65 @@ function runBootSequence(opts: {
   }
   try {
     // ---- stage 1: the bootResumeInit block (IN MEMORY ONLY) ----------------
-    // The guard, gateway.ts: immediately after applySubagentsSchema.
-    const skip =
-      (opts.guarded ?? true) &&
-      shouldSkipBootResumeForGatewayOnlyRespawn(stateDir, { log: () => {} })
+    // gateway.ts's block-level `catch`: it logs, nulls turnsDb and lets module
+    // init CONTINUE. `bootResumeThrew` is the flag that catch sets.
+    let bootResumeThrew = false
     // gateway.ts:1648 — `bootResumeInbound`, stashed and pushed to the spool
     // only much later. Nothing on disk yet.
     let bootResumeInbound: InboundMessage | null = null
-    if (!skip) {
-      if (opts.crashAt === 'after-guard') throw BOOT_CRASH
-      const res = markOrphanedWithTimeoutClassification(db, {
-        markerTurnKey: opts.markerTurnKey ?? null,
-        markerAgeMs: opts.markerAgeMs ?? null,
-        hangThresholdMs: 300_000,
-      })
-      reaped = res.reaped
-      // gateway.ts:~1721 — consumed (always cleared) whether or not a turn was
-      // in flight. The `break` skips this too, which is only correct because
-      // the token proves a gateway already consumed it this generation.
-      const marker = consumeBridgeDeadEscalationMarker(
-        join(stateDir, 'bridge-dead-escalation.json'),
-      )
-      if (marker != null) bridgeDeadStreak = marker.count ?? 1
-      const pending = findLatestTurnIfInterrupted(db)
-      if (pending != null) {
-        const kind = decideBootResumeKind({
-          pending,
-          suppressed: false,
-          ageMs: Math.max(0, Date.now() - pending.started_at),
-          maxAgeMs: 10_800_000,
+    try {
+      // The guard, gateway.ts: immediately after applySubagentsSchema.
+      const skip =
+        (opts.guarded ?? true) &&
+        shouldSkipBootResumeForGatewayOnlyRespawn(stateDir, { log: () => {} })
+      if (!skip) {
+        if (opts.crashAt === 'after-guard') throw BOOT_CRASH
+        const res = markOrphanedWithTimeoutClassification(db, {
+          markerTurnKey: opts.markerTurnKey ?? null,
+          markerAgeMs: opts.markerAgeMs ?? null,
+          hangThresholdMs: 300_000,
         })
-        if (kind === 'resume') {
-          bootResumeInbound = buildResumeInterruptedInbound({ turn: pending, subagents: [] })
-        } else if (kind === 'report') {
-          bootResumeInbound = buildResumeWatchdogReportInbound({
-            turn: pending,
-            idleMs: 600_000,
-            subagents: [],
+        reaped = res.reaped
+        // The turn is NOW durably `ended_via='restart'`. Everything from here to
+        // the first `bootResumeInbound =` — findLatestTurnIfInterrupted, the
+        // clean-shutdown-marker read, listNonTerminalSubagentsForTurn, the
+        // builders — is ~156 lines of DB and fs I/O that can throw.
+        if (opts.throwAt === 'after-reaper') throw BLOCK_THROW
+        // gateway.ts:~1721 — consumed (always cleared) whether or not a turn was
+        // in flight. The `break` skips this too, which is only correct because
+        // the token proves a gateway already consumed it this generation.
+        const marker = consumeBridgeDeadEscalationMarker(
+          join(stateDir, 'bridge-dead-escalation.json'),
+        )
+        if (marker != null) bridgeDeadStreak = marker.count ?? 1
+        const pending = findLatestTurnIfInterrupted(db)
+        if (pending != null) {
+          const kind = decideBootResumeKind({
+            pending,
+            suppressed: false,
+            ageMs: Math.max(0, Date.now() - pending.started_at),
+            maxAgeMs: 10_800_000,
           })
+          if (kind === 'resume') {
+            bootResumeInbound = buildResumeInterruptedInbound({ turn: pending, subagents: [] })
+          } else if (kind === 'report') {
+            bootResumeInbound = buildResumeWatchdogReportInbound({
+              turn: pending,
+              idleMs: 600_000,
+              subagents: [],
+            })
+          }
         }
+        writePendingTurnEnv(agentDir, pending, () => {})
+        // THE DEFECT, reproducible on demand: stamping here marks the generation
+        // done while the resume exists only in this process's heap.
+        if (stampAt === 'block-end') stamp()
+        if (opts.crashAt === 'after-block-before-put') throw BOOT_CRASH
       }
-      writePendingTurnEnv(agentDir, pending, () => {})
-      // THE DEFECT, reproducible on demand: stamping here marks the generation
-      // done while the resume exists only in this process's heap.
-      if (stampAt === 'block-end') stamp()
-      if (opts.crashAt === 'after-block-before-put') throw BOOT_CRASH
+    } catch (err) {
+      if (err === BOOT_CRASH) throw err // process death: nothing below runs
+      if (err !== BLOCK_THROW) throw err
+      bootResumeThrew = true // swallowed — module init continues below
     }
     // ---- stage 2: gateway.ts ~:10148, the DURABLE put ----------------------
     if (bootResumeInbound != null) {
@@ -258,8 +296,11 @@ function runBootSequence(opts: {
       if (typeof rk === 'string' && rk.length > 0) markTurnResumed(db, rk)
     }
     if (opts.crashAt === 'after-put-before-stamp') throw BOOT_CRASH
-    // ---- stage 3: the token, unconditional (gateway.ts, top level) ---------
-    if (stampAt === 'after-durable-put') stamp()
+    // ---- stage 3: the token (gateway.ts, top level) ------------------------
+    // Unconditional on there being anything to resume; NOT unconditional on
+    // the block having completed.
+    const gated = (opts.gateStampOnBlockThrow ?? true) && bootResumeThrew
+    if (stampAt === 'after-durable-put' && !gated) stamp()
   } catch (err) {
     if (err !== BOOT_CRASH) throw err
   } finally {
@@ -510,6 +551,55 @@ describe('gateway crash during its own boot', () => {
 
     const out = runBootSequence({})
 
+    expect(out.spooledSources, 'the resume is dropped, not retried').toEqual([])
+    expect(out.reaped).toBe(0)
+    const db = openTurnsDb(agentDir)
+    try {
+      const turn = getTurnByKey(db, turnKey)!
+      expect(turn.ended_via).toBe('restart') // durably ended…
+      expect(turn.resumed_at).toBeNull() // …and never resumed
+    } finally {
+      db.close()
+    }
+  })
+
+  it('a SWALLOWED throw inside the block leaves no token, so the successor still resumes', () => {
+    // gateway.ts's block ends in `catch { log; turnsDb = null }` — a swallow,
+    // not a death: module init continues and reaches the stamp with
+    // `bootResumeInbound` still null. By then the reaper has ALREADY durably
+    // written `ended_via='restart'`. Gating the stamp on that catch is what
+    // keeps the work recoverable.
+    const turnKey = seedInFlightTurn()
+
+    const threw = runBootSequence({ throwAt: 'after-reaper' })
+    expect(threw.reaped, 'the reaper ran and durably ended the turn').toBe(1)
+    expect(threw.spooledSources, 'nothing was spooled — the block never built it').toEqual([])
+    expect(threw.tokenStamped, 'a swallowed throw must not stamp the generation').toBe(false)
+    expect(existsSync(bootResumeDonePath(stateDir))).toBe(false)
+
+    // The gateway respawns (the Bun-crash pattern #4641 exists for).
+    const out = runBootSequence({})
+    expect(out.spooledSources, 'the successor re-mints the resume').toEqual(['resume_interrupted'])
+    const db = openTurnsDb(agentDir)
+    try {
+      expect(getTurnByKey(db, turnKey)!.resumed_at, 'and stamps it resumed').not.toBeNull()
+    } finally {
+      db.close()
+    }
+  })
+
+  it('WOULD lose the turn forever if a swallowed throw still stamped the token', () => {
+    // Defect reproduction for the ungated stamp: same swallow, stamp not gated
+    // on `bootResumeThrew`. The turn is durably ended, nothing is spooled, and
+    // the successor suppresses on the token alone.
+    const turnKey = seedInFlightTurn()
+
+    const threw = runBootSequence({ throwAt: 'after-reaper', gateStampOnBlockThrow: false })
+    expect(threw.reaped).toBe(1)
+    expect(threw.spooledSources).toEqual([])
+    expect(threw.tokenStamped, 'stamped with nothing spooled anywhere').toBe(true)
+
+    const out = runBootSequence({})
     expect(out.spooledSources, 'the resume is dropped, not retried').toEqual([])
     expect(out.reaped).toBe(0)
     const db = openTurnsDb(agentDir)

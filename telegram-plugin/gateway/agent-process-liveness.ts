@@ -65,10 +65,29 @@
  * dedups on `s:resume:<resume_turn_key>` — so the retry is idempotent, not a
  * double-send. Lose the token, repeat the work; never lose the work.
  *
- * The stamp is UNCONDITIONAL: a boot that found nothing to resume still
- * completed this generation's boot resume, and a later gateway-only respawn
- * must still be suppressed — that respawn running the reaper against a
- * meanwhile-started live turn IS bug #4641.
+ * The stamp does not depend on there being anything to resume: a boot that
+ * found nothing still completed this generation's boot resume, and a later
+ * gateway-only respawn must still be suppressed — that respawn running the
+ * reaper against a meanwhile-started live turn IS bug #4641.
+ *
+ * It DOES depend on the block not having thrown. gateway.ts's boot block ends
+ * in a `catch` that logs, sets `turnsDb = null` and lets module init continue
+ * — a swallow, not a death. Without a guard that path reaches the stamp with
+ * `bootResumeInbound` still null, and it is reachable from ~156 lines of DB
+ * and fs I/O between the reaper and the first assignment
+ * (`findLatestTurnIfInterrupted`, the clean-shutdown-marker read,
+ * `listNonTerminalSubagentsForTurn`, the synthetic builders). The reaper has
+ * ALREADY durably written `ended_via='restart'` by then, so a token stamped on
+ * that path is exactly the tail-of-block failure above reached through a
+ * different door: gateway respawns, successor sees a this-generation token and
+ * no `agent-process.json`, suppresses, and the turn is never resumed. So
+ * gateway.ts carries a `bootResumeThrew` flag set in that `catch` and the
+ * stamp is gated on it — a swallowed throw leaves NO token, and the next
+ * gateway retries the boot resume. Fail open, as everywhere else here.
+ *
+ * (On `origin/main` a throw in that window also loses the boot's resume; what
+ * the guard preserves is the accidental recovery-on-respawn that the token
+ * would otherwise remove.)
  *
  * This is deliberately NOT timing-derived. An earlier revision of this module
  * compared `/proc` starttimes ("the agent must predate me") and justified it
@@ -176,8 +195,8 @@
  * once per CONTAINER boot and start.sh does not re-run on a gateway respawn.)
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, readdirSync } from 'node:fs'
+import { join, dirname, basename } from 'node:path'
 
 /** Default basename of the record start.sh writes into the telegram state dir. */
 export const AGENT_PROCESS_RECORD_FILE = 'agent-process.json'
@@ -361,6 +380,28 @@ export function readBootResumeSentinel(
 }
 
 /**
+ * Delete `<file>.tmp.<pid>` siblings left behind by a writer that died between
+ * `writeFileSync` and `renameSync`.
+ *
+ * The tmp name is pid-qualified (two writers must not share one tmp path), so
+ * a crashed write leaves a stray that nothing else removes: start.sh's cleanup
+ * (`start.sh.hbs`) `rm -f`s the two exact filenames with no glob, so strays
+ * would accumulate in STATE_DIR one per crashed generation, forever.
+ *
+ * Called only after our own successful rename, so it never races our own tmp.
+ * Best-effort and never throws — a stray costs bytes, not correctness.
+ */
+function sweepStrayTmps(path: string): void {
+  const prefix = `${basename(path)}.tmp.`
+  try {
+    for (const name of readdirSync(dirname(path))) {
+      if (!name.startsWith(prefix)) continue
+      try { unlinkSync(join(dirname(path), name)) } catch { /* best effort */ }
+    }
+  } catch { /* unreadable dir — nothing to sweep */ }
+}
+
+/**
  * Stamp the generation token: THIS container generation's boot-resume block
  * ran to completion, so a later gateway respawn must not re-run it.
  *
@@ -387,6 +428,7 @@ export function markBootResumeComplete(
     if (boot != null) token.boot = boot
     writeFileSync(tmp, JSON.stringify(token) + '\n')
     renameSync(tmp, path)
+    sweepStrayTmps(path)
   } catch (err) {
     try { unlinkSync(tmp) } catch { /* best effort */ }
     const log = opts.log ?? ((s: string) => process.stderr.write(s))
