@@ -99,6 +99,22 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "survive-reboots-and-real-life",
     signature: "orphaned-db-handle:deleted-inode-writes",
   },
+  "orphaned-db-handle-recovered": {
+    // #4680 — the same alarm, but the sweep reopened `history.db` in the same
+    // tick and proved the new handle durable (the 2026-08-12 occurrence
+    // recovered in 20ms), with no lane left un-recovered. The rows written
+    // before the reopen are still gone, so the operator is still told — but a
+    // guard that fired and self-healed is not the silent-loss incident severity
+    // 3 describes, and booking it as one is exactly the success-theater
+    // inversion this ledger exists to avoid. severity 1, informational: the
+    // same split `flush-recovered-turn` makes against `silent-no-op-candidate`.
+    // Anything left un-recovered in the tick (registry.db, an unowned handle, a
+    // FAILED reopen) stays `orphaned-db-handle` at severity 3.
+    failure_mode: "drift",
+    severity: 1,
+    job_spec: "survive-reboots-and-real-life",
+    signature: "orphaned-db-handle:recovered-in-tick",
+  },
   "hang-long-stalled": {
     failure_mode: "partial",
     severity: 2,

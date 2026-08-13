@@ -405,10 +405,27 @@ the 23 `reference/jobs/*.md`) and a taxonomy class + severity:
 | `killed-incomplete-turn` | missed-trigger | 3 | `steer-or-queue-mid-flight` | the turn was abandoned incomplete while in progress |
 | `represent-escalation` | drift | 1 | `feel-like-a-colleague` | the gateway had to nudge on the agent's behalf — UX-friction, informational (does not alone open a sev-3 issue) |
 
-Note: `represent-escalation` (`/obligation escalation/`) is an added sev-1
-*informational* signal beyond the two precise delivery signatures — it flags
-UX-friction, not a delivery failure, and does not alone open a sev-3 issue, so
-it is not scope creep on the delivery-signature detection.
+Note: `represent-escalation` is an added sev-1 *informational* signal beyond the
+two precise delivery signatures — it flags UX-friction, not a delivery failure,
+and does not alone open a sev-3 issue, so it is not scope creep on the
+delivery-signature detection. Its signature matches the two TERMINAL escalation
+outcomes only (`delivered + closed`, `PERMANENTLY undeliverable`), for the same
+attempt-vs-outcome reason as `reply-delivery-failure` (#3931): the bare
+`/obligation escalation/` substring also matched the per-attempt retry line and
+the `deferred — bridge down` SUPPRESSION line, so the guard *declining* to
+escalate while the bridge was down was booked as a failure.
+
+`orphaned-db-handle` splits on recovery rather than on attempt: an alarm whose
+sweep tick also logged `reopened history.db — writes are durable again`, with no
+lane left un-recovered, is emitted as `orphaned-db-handle-recovered` (drift, sev
+1, `survive-reboots-and-real-life`). A tick that left `registry.db`, an unowned
+handle, or a FAILED reopen behind stays `orphaned-db-handle` at sev 3 — that is
+genuine silent loss.
+
+A gateway finding is one EVENT, not one log line: matched lines carrying the
+same `origin=` turn id fold into a single finding for that signal, so ledger
+`frequency` counts distinct affected turns. Lines with no origin id keep
+one-finding-per-line.
 
 The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
 

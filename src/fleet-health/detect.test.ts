@@ -8,6 +8,7 @@ import {
   HANG_MS,
   SILENT_NOOP_FLOOR_TS,
 } from "./detect.js";
+import { mapSignal } from "./mapping.js";
 import { ROUTE_FIELD_SHIP_TS } from "../../telegram-plugin/gateway/turn-record-status.js";
 
 /**
@@ -173,7 +174,9 @@ describe("detectGatewayFindings", () => {
     `2026-07-02T21:03:00Z gateway: represent duplicate-send tid=${CHAT}:_#42`,
     `2026-07-02T21:04:00Z gateway: tg-post method=getUpdates status=err timeout`,
     `2026-07-02T21:05:00Z gateway: tg-post method=sendRichMessage tid=${CHAT}:_#43 status=err`,
-    `2026-07-02T21:06:00Z gateway: obligation escalation tid=${CHAT}:_#44`,
+    // The literal terminal line `escalation-drive.ts:62` emits.
+    `2026-07-02T21:06:00Z telegram gateway: obligation escalation delivered + closed` +
+      ` origin=${CHAT}:_#44`,
   ].join("\n");
 
   it("counts represent-duplicate and reply-delivery-failure, ignores getUpdates blip", () => {
@@ -216,6 +219,186 @@ describe("detectGatewayFindings", () => {
         " detection is DISABLED until it exists and is readable.",
     ].join("\n");
     expect(detectGatewayFindings("alpha", quiet).gw_hits["orphaned-db-handle"]).toBe(0);
+  });
+});
+
+/**
+ * #4680 — two detector rules matched an ALARM without checking its OUTCOME, so
+ * the nightly ledger booked working safety mechanisms as failures. Every fixture
+ * below is the literal line its emitter writes; a fixture that drifts from the
+ * emitter is the failure mode these rules already had once.
+ */
+describe("#4680 — a working guard is not a failure", () => {
+  const ORIGIN = `${CHAT}:_#2198`;
+
+  describe("represent-escalation matches the terminal OUTCOME, not every attempt", () => {
+    // `obligation-wiring.ts:303` — the guard deliberately NOT escalating while
+    // the Telegram bridge is down. This is the suppression path working.
+    const suppressed =
+      `2026-08-12T02:00:00Z telegram gateway: obligation escalation deferred — bridge down` +
+      ` (nudge waits for reconnect) origin=${ORIGIN}`;
+    // `escalation-drive.ts:72` — one line per ATTEMPT, below the retry policy.
+    const retrying =
+      `2026-08-12T02:05:00Z telegram gateway: obligation escalation send failed (attempt 1/3),` +
+      ` retrying next sweep origin=${ORIGIN}: Error: 429`;
+    // `escalation-drive.ts:62` / `:68` — the two mutually-exclusive terminals.
+    const delivered =
+      `2026-08-12T02:10:00Z telegram gateway: obligation escalation delivered + closed` +
+      ` origin=${ORIGIN}`;
+    const undeliverable =
+      `2026-08-12T02:15:00Z telegram gateway: obligation escalation PERMANENTLY undeliverable` +
+      ` after 3 attempts — closing best-effort origin=${ORIGIN}: Error: 403`;
+
+    it("does NOT flag the bridge-down SUPPRESSION line", () => {
+      const { gw_hits, findings } = detectGatewayFindings("carrie", suppressed);
+      expect(gw_hits["represent-escalation"]).toBe(0);
+      expect(findings).toHaveLength(0);
+    });
+
+    it("does NOT flag a retry attempt (the nudge has not resolved yet)", () => {
+      expect(
+        detectGatewayFindings("carrie", retrying).gw_hits["represent-escalation"],
+      ).toBe(0);
+    });
+
+    it("DOES flag a delivered escalation", () => {
+      const { gw_hits, findings } = detectGatewayFindings("carrie", delivered);
+      expect(gw_hits["represent-escalation"]).toBe(1);
+      expect(findings[0]?.turn_id).toBe(ORIGIN);
+    });
+
+    it("DOES flag a permanently-undeliverable escalation", () => {
+      expect(
+        detectGatewayFindings("carrie", undeliverable).gw_hits["represent-escalation"],
+      ).toBe(1);
+    });
+
+    // The live shape: one obligation, four matching lines, of which exactly one
+    // is an escalation that happened. Before the fix this booked 4 findings.
+    it("books ONE finding for one obligation's full retry-then-deliver history", () => {
+      const log = [suppressed, retrying, retrying, delivered].join("\n");
+      const { findings } = detectGatewayFindings("carrie", log);
+      const esc = findings.filter((f) => f.signal === "represent-escalation");
+      expect(esc).toHaveLength(1);
+      expect(esc[0]?.ts).toBe("2026-08-12T02:10:00Z");
+    });
+  });
+
+  describe("orphaned-db-handle splits on whether the sweep RECOVERED", () => {
+    const detect = (n: number, target: string) =>
+      `2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED ${n} deleted-inode` +
+      ` DB handle(s): fd=13 ${target} (deleted) — another process unlinked these files while` +
+      ` we held them open; every row written since the last checkpoint is LOST and further` +
+      ` writes would be lost too.`;
+    const reopened =
+      "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep reopened history.db —" +
+      " writes are durable again (proved by the post-reopen writer self-check); rows" +
+      " written since the last checkpoint are NOT recoverable.";
+
+    /** Severity is what the ledger acts on, so assert THAT, not the signal name. */
+    const severityOf = (log: string): number[] =>
+      detectGatewayFindings("overlord", log).findings.map(
+        (f) => mapSignal(f.signal).severity,
+      );
+
+    it("DETECT + reopen in the same tick is NOT a severity-3 record", () => {
+      const log = [detect(1, "/state/history.db"), reopened].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+      const { gw_hits } = detectGatewayFindings("overlord", log);
+      expect(gw_hits["orphaned-db-handle"]).toBe(0);
+      expect(gw_hits["orphaned-db-handle-recovered"]).toBe(1);
+      // Still reported — the pre-reopen rows really are gone.
+      expect(detectGatewayFindings("overlord", log).findings).toHaveLength(1);
+    });
+
+    it("DETECT with no recovery line STAYS severity 3", () => {
+      expect(severityOf(detect(1, "/state/history.db"))).toEqual([3]);
+    });
+
+    it("a FAILED reopen stays severity 3", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep FAILED to reopen" +
+          " history.db: EACCES — history writes are NOT durable; RESTART the gateway.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("registry.db stays severity 3 even when history recovers in the same tick", () => {
+      // The registry lane has NO in-process recovery — reopening history does
+      // not make those rows durable, so the tick is not recovered.
+      const log = [
+        detect(2, "/state/registry.db"),
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — the turnsDb handle" +
+          " is captured by value into long-lived wiring, so closing it would leave those" +
+          " consumers on a closed handle. RESTART the gateway to recover; subagent/turn" +
+          " rows written since the last checkpoint are LOST.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("an unowned lane stays severity 3 even alongside a history reopen", () => {
+      const log = [
+        detect(2, "/state/grants.db"),
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found orphaned handle(s)" +
+          " on grants.db, which no recovery lane owns — the gateway cannot reopen them in" +
+          " place. RESTART the gateway to recover; rows written to those files since the" +
+          " last checkpoint are LOST.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("a LATER tick's recovery does not launder an earlier unrecovered alarm", () => {
+      const log = [detect(1, "/state/history.db"), detect(1, "/state/history.db"), reopened]
+        .join("\n");
+      expect(severityOf(log)).toEqual([3, 1]);
+    });
+  });
+
+  describe("gateway findings dedup by event identity, not by log line", () => {
+    it("folds repeated lines for the same origin into one finding", () => {
+      const log = [
+        `2026-08-12T04:00:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+        `2026-08-12T04:01:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+      ].join("\n");
+      const { findings, gw_hits } = detectGatewayFindings("carrie", log);
+      expect(findings).toHaveLength(1);
+      // gw_hits stays the RAW line count — it is the digest's noise readout.
+      expect(gw_hits["duplicate-delivery-represent"]).toBe(2);
+    });
+
+    // `buildLedger` windows AND ranks on `Finding.ts`, so a folded event that
+    // kept the FIRST line's timestamp could age a still-happening cluster out
+    // of the scan window entirely.
+    it("carries the NEWEST line's timestamp and pointer, not the first's", () => {
+      const log = [
+        `2026-07-01T04:00:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+        `2026-08-12T04:01:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+      ].join("\n");
+      const { findings } = detectGatewayFindings("carrie", log);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ts).toBe("2026-08-12T04:01:00Z");
+      expect(findings[0]?.log_pointer).toBe("logs/carrie/gateway-supervisor.log:2");
+    });
+
+    it("keeps DISTINCT origins as distinct findings", () => {
+      const log = [
+        `2026-08-12T04:00:00Z gateway: represent duplicate-send origin=${CHAT}:_#1`,
+        `2026-08-12T04:01:00Z gateway: represent duplicate-send origin=${CHAT}:_#2`,
+      ].join("\n");
+      expect(detectGatewayFindings("carrie", log).findings).toHaveLength(2);
+    });
+
+    it("keeps one-finding-per-line when the line carries NO origin id", () => {
+      const log = [
+        "2026-08-12T04:00:00Z gateway: represent duplicate-send",
+        "2026-08-12T04:01:00Z gateway: represent duplicate-send",
+      ].join("\n");
+      expect(detectGatewayFindings("carrie", log).findings).toHaveLength(2);
+    });
   });
 });
 
@@ -295,7 +478,12 @@ describe("scanAgent escalation decision", () => {
   });
 
   it("does NOT escalate on a represent-escalation alone", () => {
-    const res = scanAgent("alpha", turn(1, {}), "gateway: obligation escalation");
+    const res = scanAgent(
+      "alpha",
+      turn(1, {}),
+      `telegram gateway: obligation escalation delivered + closed origin=${CHAT}:_#44`,
+    );
+    expect(res.gw_hits["represent-escalation"]).toBe(1);
     expect(res.escalate).toBe(false);
   });
 

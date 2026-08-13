@@ -104,7 +104,15 @@ export type GatewaySignal =
   // them. `history.db` self-heals in process; `registry.db` and anything else
   // needs a restart — either way a human has to be told, which is what this
   // signal is for. See `telegram-plugin/gateway/orphaned-db-sweep.ts`.
-  | "orphaned-db-handle";
+  | "orphaned-db-handle"
+  // The same alarm, but the sweep's OWN recovery landed in the same tick: the
+  // `history.db` lane reopened and proved the handle durable again, and no
+  // lane in that tick was left un-recovered. The rows written before the
+  // reopen are still lost, so this stays a reportable event — but the
+  // mechanism designed to catch it WORKED, which is not a severity-3
+  // data-loss incident. Informational counterpart of `orphaned-db-handle`,
+  // exactly as `flush-recovered-turn` is to `silent-no-op-candidate`.
+  | "orphaned-db-handle-recovered";
 
 /** Signals from the standalone config/state sensors — NOT derived from an
  *  agent's turns.jsonl or gateway log. Each sensor reads a hard artifact
@@ -186,9 +194,34 @@ export interface AgentScanResult {
  * incidental: it pins the match to the exact token `err`, so no future
  * `err<suffix>` tier can silently re-enter this signal.
  */
-export const GATEWAY_SIGNATURES: Record<GatewaySignal, RegExp> = {
+/** The gateway signals matched by a single log LINE. `orphaned-db-handle-recovered`
+ *  is deliberately absent: it is not a line signature but a RECLASSIFICATION of
+ *  the `orphaned-db-handle` alarm decided by the lines that follow it within the
+ *  same sweep tick (see `classifyOrphanedDbTick`). */
+export type LineMatchedGatewaySignal = Exclude<
+  GatewaySignal,
+  "orphaned-db-handle-recovered"
+>;
+
+export const GATEWAY_SIGNATURES: Record<LineMatchedGatewaySignal, RegExp> = {
   "duplicate-delivery-represent": /represent duplicate-send/,
-  "represent-escalation": /obligation escalation/,
+  // #4680 — same attempt-vs-OUTCOME rule as `reply-delivery-failure` above.
+  // Four emitter lines carry the literal `obligation escalation`, and a bare
+  // substring match counted all four:
+  //   escalation-drive.ts:62  delivered + closed         ← terminal outcome
+  //   escalation-drive.ts:68  PERMANENTLY undeliverable  ← terminal outcome
+  //   escalation-drive.ts:72  send failed … retrying next sweep  ← an ATTEMPT
+  //   obligation-wiring.ts:303 deferred — bridge down    ← the SUPPRESSION path
+  // The last one is the guard deliberately NOT escalating while the Telegram
+  // bridge is down, i.e. the safety mechanism WORKING; counting it reported a
+  // healthy suppression as a failure. The retry line is the #3931 shape exactly:
+  // one line per attempt, so a nudge that landed on attempt 3 used to book three
+  // findings for one obligation. Anchoring on the two mutually-exclusive
+  // TERMINAL lines yields exactly one hit per escalated obligation, and keeps
+  // the permanently-undeliverable case (a real escalation that never reached the
+  // operator) in the ledger rather than dropping coverage.
+  "represent-escalation":
+    /obligation escalation (?:delivered \+ closed|PERMANENTLY undeliverable)/,
   "reply-delivery-failure": /tg-post method=sendRichMessage[^\n]*status=err(?![a-z])/,
   // Anchored on the sweep's DETECTED line, which is emitted once per tick per
   // incident for EVERY lane (history, registry, unowned) — so the registry
@@ -197,6 +230,59 @@ export const GATEWAY_SIGNATURES: Record<GatewaySignal, RegExp> = {
   // lanes are added, and one signal per incident is the right escalation rate.
   "orphaned-db-handle": /orphaned-db-sweep DETECTED \d+ deleted-inode DB handle/,
 };
+
+/** The sweep's in-process recovery line, logged by `attemptHistoryReopen` the
+ *  moment the reopened `history.db` handle passes its post-reopen writer
+ *  self-check (`orphaned-db-sweep.ts:279`). `reopened` is the first-detection
+ *  verb; `recovered` is the sticky-failure retry verb, which fires on a tick
+ *  with no DETECTED line at all and so never pairs with an alarm here. */
+const ORPHANED_DB_RECOVERED_RE =
+  /orphaned-db-sweep reopened history\.db — writes are durable again/;
+
+/**
+ * Lines that say a lane in THIS tick was left un-recovered — each one is real,
+ * unrecovered data loss and must keep the severity-3 alarm even if the history
+ * lane reopened alongside it. Verbatim from `orphaned-db-sweep.ts`:
+ * registry.db (:233), the unowned lane (:247), history-with-no-reopen-wired
+ * (:225), the sticky closed-history lane (:260) and a failed reopen (:285).
+ */
+const ORPHANED_DB_UNRECOVERED_RE =
+  /orphaned-db-sweep (?:found an orphaned registry\.db handle|found orphaned handle\(s\) on |found an orphaned history\.db handle but no reopen|history\.db is CLOSED and a previous reopen failed|FAILED to reopen history\.db)/;
+
+/** Upper bound on the lookahead for a tick's follow-up lines. One tick emits at
+ *  most a handful (alarm + up to three lane lines + the recovery line); the cap
+ *  keeps a truncated or interleaved log from scanning the whole file. */
+const ORPHANED_DB_TICK_LOOKAHEAD = 12;
+
+/**
+ * Decide whether an `orphaned-db-sweep DETECTED` alarm at `alarmIdx` was
+ * RECOVERED inside its own sweep tick.
+ *
+ * `runOrphanedDbSweepTick` logs the alarm and every lane line synchronously,
+ * with no `await` between them, so a tick's lines are contiguous. The window
+ * therefore runs from the alarm to the next DETECTED line (the next tick's
+ * alarm) or `ORPHANED_DB_TICK_LOOKAHEAD` lines, whichever comes first.
+ *
+ * Recovered means BOTH: the reopen-succeeded line landed, AND no lane in the
+ * tick reported itself un-recovered. `registry.db` has no in-process recovery
+ * at all, so a tick that reopened history while registry stayed orphaned is
+ * still severity-3 silent loss.
+ */
+export function classifyOrphanedDbTick(
+  lines: readonly string[],
+  alarmIdx: number,
+): "recovered" | "unrecovered" {
+  let recovered = false;
+  const end = Math.min(lines.length, alarmIdx + 1 + ORPHANED_DB_TICK_LOOKAHEAD);
+  for (let j = alarmIdx + 1; j < end; j++) {
+    const line = lines[j];
+    if (!line) continue;
+    if (GATEWAY_SIGNATURES["orphaned-db-handle"].test(line)) break; // next tick
+    if (ORPHANED_DB_UNRECOVERED_RE.test(line)) return "unrecovered";
+    if (ORPHANED_DB_RECOVERED_RE.test(line)) recovered = true;
+  }
+  return recovered ? "recovered" : "unrecovered";
+}
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
  *  (a corrupt line must never crash the scan — RFC: defensive).
@@ -394,8 +480,26 @@ export function detectTurnFindings(
 
 /**
  * Run the precise gateway signatures over one agent's gateway log text. Returns
- * both the per-signature hit counts and one Finding per matched line (so the
- * ledger gets real log pointers). `logName` is only used to build the pointer.
+ * the per-signature hit counts and the findings the ledger aggregates (with real
+ * log pointers). `logName` is only used to build the pointer.
+ *
+ * A finding is one EVENT, not one log line. Where a matched line carries an
+ * `origin=`/`tid=` origin-turn id, every line for that (signal, origin) pair
+ * folds into ONE finding: the ledger's `frequency` then counts distinct
+ * affected turns, which is what its priority scoring means by "how often".
+ * Lines with no origin id keep their old one-finding-per-line behaviour — there
+ * is no identity to fold on, and guessing one would merge unrelated events.
+ *
+ * The folded finding carries the NEWEST line's timestamp and pointer, not the
+ * first's. A gateway log is append-ordered, and `buildLedger` both windows
+ * (`withinWindow`) and ranks (`recencyFactor`) on `Finding.ts` — pinning the
+ * oldest line would let a cluster that is still happening age out of the scan
+ * window, which is the "the board lies" failure this detector exists to
+ * prevent. The pointer moves with it, so the operator lands on live evidence.
+ *
+ * `gw_hits` stays a RAW line count on purpose: it is the digest's
+ * signature-frequency readout and the input to the escalate decision, and both
+ * want "how noisy was the log", not "how many distinct turns".
  */
 export function detectGatewayFindings(
   agent: string,
@@ -408,23 +512,49 @@ export function detectGatewayFindings(
     "represent-escalation": 0,
     "reply-delivery-failure": 0,
     "orphaned-db-handle": 0,
+    "orphaned-db-handle-recovered": 0,
   };
   const lines = logText.split("\n");
+  /** (signal, origin) → index of that event's finding in `findings`. */
+  const eventIndex = new Map<string, number>();
   for (const [name, re] of Object.entries(GATEWAY_SIGNATURES) as [
-    GatewaySignal,
+    LineMatchedGatewaySignal,
     RegExp,
   ][]) {
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (!line) continue;
       if (re.test(line)) {
-        gw_hits[name] += 1;
+        // The orphaned-DB alarm splits on what the REST of its sweep tick did:
+        // an in-process reopen that proved the handle durable again is the
+        // mechanism working, not a severity-3 data-loss incident.
+        const signal: GatewaySignal =
+          name === "orphaned-db-handle" &&
+          classifyOrphanedDbTick(lines, i) === "recovered"
+            ? "orphaned-db-handle-recovered"
+            : name;
+        gw_hits[signal] += 1;
+        const origin = extractTurnId(line);
+        const pointer = `${logName}:${i + 1}`;
+        const ts = extractTs(line);
+        if (origin !== null) {
+          const eventKey = `${signal}|${origin}`;
+          const at = eventIndex.get(eventKey);
+          if (at !== undefined) {
+            // Same event, later line: advance the evidence to the newest one
+            // rather than booking a second occurrence.
+            const prev = findings[at]!;
+            findings[at] = { ...prev, log_pointer: pointer, ts: ts ?? prev.ts };
+            continue;
+          }
+          eventIndex.set(eventKey, findings.length);
+        }
         findings.push({
-          signal: name,
+          signal,
           agent,
-          turn_id: extractTurnId(line) ?? `${agent}:gw#${i + 1}`,
-          log_pointer: `${logName}:${i + 1}`,
-          ts: extractTs(line),
+          turn_id: origin ?? `${agent}:gw#${i + 1}`,
+          log_pointer: pointer,
+          ts,
         });
       }
     }
