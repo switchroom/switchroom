@@ -104,6 +104,12 @@ describe('inbound source classification (F1 durability)', () => {
     expect(stampsHandbackMarker('eval_case_applied')).toBe(false)
     expect(stampsHandbackMarker('eval_case_rejected')).toBe(false)
     expect(stampsHandbackMarker('eval_case_apply_failed')).toBe(false)
+    // #4664 — the suppressed-proposal notice. The exhaustiveness test below pins
+    // only its PRESENCE; this pins the VALUE, which is the part with runtime
+    // consequence: classified `true` (or left to the fail-safe default) it would
+    // hold the content gate chat-wide for 60 s every time a duplicate eval case
+    // is declined.
+    expect(stampsHandbackMarker('eval_case_suppressed')).toBe(false)
   })
 
   it('a normal user inbound (no meta.source) never stamps', () => {

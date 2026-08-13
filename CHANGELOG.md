@@ -128,6 +128,25 @@ now an anomaly worth investigating, not the norm.
   retains every rejection still inside the TTL, so trimming can never
   un-suppress a card.
 
+  Suppression is NOT a silent exit. It pairs with #4662, which makes the agent's
+  contract "propose, end your turn, wait for the outcome inbound" — and the
+  propose CLI is fire-and-forget, printing `ok:true` for the IPC send, never for
+  a card being posted. A branch that quietly posts nothing would therefore leave
+  the agent waiting for a tap that can never come: the exact silent block #4662
+  exists to eliminate, re-entering through a new door. So the suppressed branch
+  wakes the agent with an `eval_case_suppressed` synthetic inbound
+  (`buildEvalCaseSuppressedInbound`) telling it plainly that the case was
+  declined as a duplicate of one the operator already dismissed, that this is
+  expected rather than an error, and that it must not wait or re-propose.
+  `deliverResumeSyntheticOrBuffer` is now a REQUIRED `ProposalWiringDeps` field
+  so no future call site can reinstate the silence by omission.
+
+  Note the identity rule: `caseFingerprint` hashes the PROMPT only, so the same
+  prompt re-proposed with a corrected `expected_output`/`expectations`
+  fingerprints identically and stays suppressed for the full TTL. That is
+  deliberate — it is the identity the CLI's own `evals.json` dedup uses, and a
+  looser rule here would re-admit cases the applier would then reject.
+
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide
   through shared git state.** Linked worktrees share the parent repo's refs

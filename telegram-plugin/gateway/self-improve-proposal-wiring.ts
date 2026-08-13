@@ -21,7 +21,7 @@
 
 import type { Bot, Context } from 'grammy'
 import type { RetryCallOpts } from '../retry-api-call.js'
-import type { PostSkillProposalMessage, PostEvalCaseProposalMessage } from './ipc-protocol.js'
+import type { PostSkillProposalMessage, PostEvalCaseProposalMessage, InboundMessage } from './ipc-protocol.js'
 import { renderSkillProposalCard, skillProposalKeyboard } from './skill-proposal-card.js'
 import { renderEvalCaseProposalCard, evalCaseProposalKeyboard } from './eval-case-proposal-card.js'
 import {
@@ -39,6 +39,68 @@ export interface ProposalWiringDeps {
   bot: Bot<Context>
   assertAllowedChat: (chatId: string) => void
   swallowingApiCall: <T>(fn: () => Promise<T>, opts?: RetryCallOpts) => Promise<T | undefined>
+  /**
+   * Wake the proposing agent with a synthetic inbound (gateway.ts's
+   * `deliverResumeSyntheticOrBuffer`). REQUIRED, not optional: the suppressed
+   * branch below is a silent exit, and a call site that forgot to wire this
+   * would reinstate exactly the wait-forever bug it exists to prevent — so the
+   * type system forces every caller to supply it.
+   */
+  deliverResumeSyntheticOrBuffer: (agent: string, inbound: InboundMessage) => boolean
+}
+
+/**
+ * Build the synthetic inbound that tells a proposing agent its eval case was
+ * SUPPRESSED as a duplicate of one the operator already dismissed.
+ *
+ * WHY THIS EXISTS (cross-PR, #4662 + #4664). #4662 makes the agent's contract
+ * "fire `add-eval-case`, end your turn, wait for the outcome inbound". #4664
+ * adds a branch that posts NO card. The propose CLI is fire-and-forget — it
+ * prints `ok:true` for the IPC SEND, never for a card being posted
+ * (src/cli/self-improve-eval-case.ts) — so without this the agent would end its
+ * turn and wait for a tap that can never come: the exact silent block #4662
+ * exists to eliminate, re-entering through a new door.
+ *
+ * The tone is deliberate. Suppression is the system working as designed, not a
+ * failure, so the text says so plainly — an agent told only "no card" would
+ * reasonably retry, which is the nagging loop #4664 is removing.
+ *
+ * Co-located here rather than in #4662's `eval-case-proposal-inbound-builders.ts`
+ * because that module does not exist on this branch; consolidating the four
+ * builders once both PRs land is a tracked follow-up.
+ */
+export function buildEvalCaseSuppressedInbound(opts: {
+  agent: string
+  chatId: string
+  threadId?: number
+  skillSlug: string
+  fingerprint: string
+  nowMs?: number
+}): InboundMessage {
+  const ts = opts.nowMs ?? Date.now()
+  return {
+    type: 'inbound',
+    chatId: opts.chatId,
+    ...(opts.threadId != null ? { threadId: opts.threadId } : {}),
+    messageId: ts, // synthetic — no Telegram message id exists
+    user: 'self-improve',
+    userId: 0,
+    ts,
+    text:
+      `ℹ️ Your proposed eval case for \`${opts.skillSlug}\` was NOT posted as a ` +
+      `card: the operator already dismissed this exact case, and the dismissal ` +
+      `is still in effect. This is EXPECTED and is not an error or a failure on ` +
+      `your part — nothing was written and no card is pending, so do NOT wait ` +
+      `for an approval tap. Do NOT re-propose this case. Carry on with the ` +
+      `original task without it.`,
+    meta: {
+      source: 'eval_case_suppressed',
+      agent: opts.agent,
+      ...(opts.threadId != null ? { message_thread_id: String(opts.threadId) } : {}),
+      skill_slug: opts.skillSlug,
+      fingerprint: opts.fingerprint,
+    },
+  }
 }
 
 /**
@@ -129,7 +191,18 @@ export function handlePostSkillProposal(
  * evals.json compares those fingerprints EXACTLY
  * (src/cli/self-improve-eval-case.ts). So this requires exact fingerprint
  * equality AND same-slug, matching the CLI's per-skill dedup scope: no fuzzy
- * bar to tune, and a genuinely different correction can never be swallowed.
+ * bar to tune, and a different PROMPT can never be swallowed.
+ *
+ * KNOWN CONSEQUENCE — identity is the PROMPT, not the whole case.
+ * `caseFingerprint` hashes the normalized prompt ONLY; an `EvalCase` also
+ * carries `expected_output` and `expectations` (src/self-improve/eval-cases.ts),
+ * and neither is in the hash. So re-proposing the SAME prompt with a CORRECTED
+ * expected_output/expectations fingerprints identically to the dismissed one and
+ * stays suppressed for the full TTL. This is deliberate, not an oversight: it is
+ * the same identity the CLI's own evals.json dedup uses, so a looser rule here
+ * would disagree with the applier and re-admit cases the CLI would then reject.
+ * To land a revised assertion for an already-dismissed prompt, reword the prompt
+ * (a genuinely different input) or wait out REJECTION_TTL_MS.
  *
  * The TTL semantics ARE mirrored (a dismissal shouldn't suppress forever), on
  * the same REJECTION_TTL_MS window. The eval-case store records no
@@ -172,7 +245,7 @@ export function handlePostEvalCaseProposal(
   msg: PostEvalCaseProposalMessage,
   deps: ProposalWiringDeps,
 ): void {
-  const { bot, assertAllowedChat, swallowingApiCall } = deps
+  const { bot, assertAllowedChat, swallowingApiCall, deliverResumeSyntheticOrBuffer } = deps
   const self = process.env.SWITCHROOM_AGENT_NAME
   if (self && msg.agentName !== self) {
     process.stderr.write(
@@ -202,9 +275,22 @@ export function handlePostEvalCaseProposal(
     skillSlug: msg.skillSlug,
     fingerprint: msg.fingerprint,
   })) {
+    // Tell the agent, or this becomes a silent exit it waits on forever (see
+    // buildEvalCaseSuppressedInbound). No card is posted and nothing is written
+    // — the operator's dismissal already decided this case.
+    const delivered = deliverResumeSyntheticOrBuffer(
+      msg.agentName,
+      buildEvalCaseSuppressedInbound({
+        agent: msg.agentName,
+        chatId: msg.chatId,
+        ...(msg.threadId != null ? { threadId: msg.threadId } : {}),
+        skillSlug: msg.skillSlug,
+        fingerprint: msg.fingerprint,
+      }),
+    )
     process.stderr.write(
       `telegram gateway: post_eval_case_proposal suppressed (dismissed before) ` +
-      `slug=${msg.skillSlug} fp=${msg.fingerprint}\n`,
+      `slug=${msg.skillSlug} fp=${msg.fingerprint} delivered=${delivered}\n`,
     )
     return
   }

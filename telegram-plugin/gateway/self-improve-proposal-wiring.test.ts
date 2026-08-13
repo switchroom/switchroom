@@ -28,6 +28,7 @@ import {
 import type {
   PostSkillProposalMessage,
   PostEvalCaseProposalMessage,
+  InboundMessage,
 } from './ipc-protocol.js'
 import {
   enqueueProposal as enqueueSkillProposal,
@@ -42,8 +43,13 @@ import {
 
 const CHAT = '424242'
 
-function makeDeps(): { deps: ProposalWiringDeps; sent: string[] } {
+function makeDeps(): {
+  deps: ProposalWiringDeps
+  sent: string[]
+  woken: Array<{ agent: string; inbound: InboundMessage }>
+} {
   const sent: string[] = []
+  const woken: Array<{ agent: string; inbound: InboundMessage }> = []
   const bot = {
     api: {
       sendMessage: vi.fn(async (_chat: string, text: string) => {
@@ -56,8 +62,12 @@ function makeDeps(): { deps: ProposalWiringDeps; sent: string[] } {
     bot,
     assertAllowedChat: () => {},
     swallowingApiCall: async <T>(fn: () => Promise<T>) => await fn(),
+    deliverResumeSyntheticOrBuffer: (agent, inbound) => {
+      woken.push({ agent, inbound })
+      return true
+    },
   }
-  return { deps, sent }
+  return { deps, sent, woken }
 }
 
 const evalCase = {
@@ -160,6 +170,80 @@ describe('self-improve proposal wiring — rejection suppression', () => {
     expect(sent).toEqual([])
     // Observable 2: no new record written to the store.
     expect(readEvalCaseProposals(dir)).toHaveLength(before)
+  })
+
+  // ── the suppressed exit must not be SILENT (cross-PR #4662 + #4664) ──
+  //
+  // #4662 makes the agent's contract "propose, end your turn, wait for the
+  // outcome inbound". This branch posts no card, so without a wake-up the agent
+  // waits forever — the exact silent block #4662 exists to eliminate. Remove the
+  // `deliverResumeSyntheticOrBuffer` call in the suppressed branch and this test
+  // fails with `woken` empty: the agent is left with no outcome.
+
+  it('a suppressed eval case still WAKES the agent — the silent exit is the bug', () => {
+    const p = enqueueEvalCaseProposal(dir, {
+      skill_slug: 'deploy-checklist',
+      skill_dir: '/skills/deploy-checklist',
+      case: evalCase,
+      fingerprint: 'aaaa1111',
+      held_out: false,
+    })
+    setEvalCaseProposalStatus(dir, p.id, 'rejected')
+
+    const { deps, sent, woken } = makeDeps()
+    handlePostEvalCaseProposal(evalMsg({ threadId: 7 }), deps)
+
+    // No card — that part is unchanged.
+    expect(sent).toEqual([])
+    // But the agent is TOLD, exactly once, and routed back to its own topic.
+    expect(woken).toHaveLength(1)
+    expect(woken[0]!.agent).toBe('carrie')
+    expect(woken[0]!.inbound.meta.source).toBe('eval_case_suppressed')
+    expect(woken[0]!.inbound.meta.skill_slug).toBe('deploy-checklist')
+    expect(woken[0]!.inbound.meta.fingerprint).toBe('aaaa1111')
+    expect(woken[0]!.inbound.threadId).toBe(7)
+    expect(woken[0]!.inbound.meta.message_thread_id).toBe('7')
+    // The instruction that keeps the agent from waiting or retrying.
+    expect(woken[0]!.inbound.text).toContain('do NOT wait')
+    expect(woken[0]!.inbound.text).toContain('Do NOT re-propose')
+    // Suppression is the system working, not a failure — an agent told only
+    // "no card" would reasonably retry, which is the loop this PR removes.
+    expect(woken[0]!.inbound.text).toContain('EXPECTED')
+  })
+
+  it('a NORMAL (unsuppressed) proposal posts a card and does NOT wake the agent', () => {
+    const { deps, sent, woken } = makeDeps()
+    handlePostEvalCaseProposal(evalMsg(), deps)
+
+    // Proves the wake above is specific to the suppressed branch, not something
+    // this handler does on every call.
+    expect(sent).toHaveLength(1)
+    expect(woken).toEqual([])
+  })
+
+  it('never suppresses on an empty fingerprint — it carries no identity', () => {
+    // A stored rejection with an empty fingerprint must not swallow a later
+    // proposal that also lacks one: two different cases, no shared identity.
+    const p = enqueueEvalCaseProposal(dir, {
+      skill_slug: 'deploy-checklist',
+      skill_dir: '/skills/deploy-checklist',
+      case: evalCase,
+      fingerprint: '',
+      held_out: false,
+    })
+    setEvalCaseProposalStatus(dir, p.id, 'rejected')
+
+    expect(
+      isEvalCaseProposalSuppressed(dir, {
+        skillSlug: 'deploy-checklist',
+        fingerprint: '',
+      }),
+    ).toBe(false)
+
+    // …and the handler still posts the card rather than silently dropping it.
+    const { deps, sent } = makeDeps()
+    handlePostEvalCaseProposal(evalMsg({ fingerprint: '' }), deps)
+    expect(sent).toHaveLength(1)
   })
 
   it('still enqueues and posts an eval case with a different fingerprint', () => {
