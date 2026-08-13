@@ -31,7 +31,7 @@
     "@secretlint/core": "^12.2.0",
     "@secretlint/secretlint-rule-preset-recommend": "^12.2.0",
     "@xterm/headless": "^6.0.0",
-    "grammy": "^1.44",
+    "grammy": "^1.45",
     "mdast-util-from-markdown": "^2.0.2",
     "mdast-util-gfm": "^3.0.0",
     "micromark-extension-gfm": "^3.0.0",

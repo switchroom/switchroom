@@ -70,7 +70,7 @@
     "bcryptjs": "^3.0.3",
     "chalk": "^5.4.0",
     "commander": "^13.1.0",
-    "grammy": "^1.44",
+    "grammy": "^1.45",
     "handlebars": "^4.7.8",
     "nostr-tools": "^2.24.1",
     "posthog-node": "^5.29.2",
