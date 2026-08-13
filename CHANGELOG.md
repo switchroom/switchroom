@@ -909,6 +909,7 @@ now an anomaly worth investigating, not the norm.
   `Intl`, since Node's ICU reports a correct UTC even on a corrupted host and
   would mask exactly this defect.
 - **gateway: never evict an approval outcome while anything else is droppable**
+- **gateway: ignore a reply thread anchor from a different chat**
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
