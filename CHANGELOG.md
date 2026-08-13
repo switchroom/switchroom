@@ -200,17 +200,22 @@ now an anomaly worth investigating, not the norm.
   in-place bind-mount-safe write: the reconcile spawn now PINS
   `SWITCHROOM_CONFIG` to the file just written (forward AND rollback
   reconcile), so the child cannot diverge; a mismatch between the write target
-  and `findConfigFile()`'s answer refuses the apply with a distinct
-  `E_CONFIG_PATH_MISMATCH` **before** any card, snapshot, or write; and hostd
-  logs one greppable `hostd-config-path-provenance` line at boot when they
-  disagree — logging, never refusing, because a config-layout change must not
+  and what HOSTD'S OWN `findConfigFile()` names refuses the apply with a
+  distinct `E_CONFIG_PATH_MISMATCH` **before** any card, snapshot, or write;
+  and hostd logs one greppable `hostd-config-path-provenance` line at boot when
+  they disagree — logging, never refusing, because a config-layout change must
+  not
   take the whole daemon (rollouts included) down to protect one verb that
   already refuses on its own. Two names for one file (same `st_dev` + `st_ino`)
   stay silent: the shipped install is exactly that, and a warning that fires
   every boot is a warning nobody reads. Identity is compared as dev+inode, not
   `realpath(2)` — `realpath` collapses neither a bind mount nor a hard link, so
   it would report "different file" for two names that are provably the same
-  bytes.
+  bytes. Scope, stated honestly: the gate and the boot line prove HOSTD-INTERNAL
+  consistency — the write target against hostd's own resolver, inside hostd's
+  cwd, `$HOME` and mount namespace. They cannot speak for an agent container or
+  the operator's host shell, which resolve in namespaces hostd cannot observe;
+  what stops the CHILD diverging is the `SWITCHROOM_CONFIG` pin, not the check.
 
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide

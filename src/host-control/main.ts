@@ -142,15 +142,18 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  // #4661 follow-up — is the file `config_propose_edit` writes the file the
-  // fleet reads? The write target is the wire literal
-  // (`/state/config/switchroom.yaml`); everything else — agents, the CLI,
-  // hostd's own loadConfig — goes through findConfigFile. Say so LOUDLY at boot
-  // if they disagree, and do NOT refuse to start: a config-layout change would
-  // otherwise take the whole daemon (rollouts included) down to protect one
-  // verb that already refuses on its own at apply time. Two NAMES for one file
-  // (same dev+inode) stay silent — the shipped install is exactly that, and a
-  // warning that fires every boot is a warning nobody reads.
+  // #4661 follow-up — would `config_propose_edit` write a file hostd itself
+  // would not read back? The write target is the wire literal
+  // (`/state/config/switchroom.yaml`); hostd's own loadConfig and pin journal
+  // go through findConfigFile. This compares those two INSIDE hostd's own cwd,
+  // `$HOME` and mount namespace — it is not, and cannot be, a statement about
+  // an agent container or the operator's host shell, which resolve elsewhere.
+  // Say so LOUDLY at boot if they disagree, and do NOT refuse to start: a
+  // config-layout change would otherwise take the whole daemon (rollouts
+  // included) down to protect one verb that already refuses on its own at
+  // apply time. Two NAMES for one file (same dev+inode) stay silent — the
+  // shipped install is exactly that, and a warning that fires every boot is a
+  // warning nobody reads.
   const provenanceWarning = configPathProvenanceWarning();
   if (provenanceWarning !== null) {
     process.stderr.write(`hostd: ${provenanceWarning}\n`);

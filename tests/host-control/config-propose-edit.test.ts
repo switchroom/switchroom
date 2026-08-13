@@ -1424,6 +1424,54 @@ describe("hostd config_propose_edit — config path provenance (#4661 follow-up)
     expect(envs[0]!.SWITCHROOM_CONFIG).toBe(configPath);
   });
 
+  // The test above asserts the `runReconcile` SEAM's `env` argument. That
+  // argument is a MIRROR, not the child's environment: production never calls
+  // the seam — it calls the default closure, which passes `reconcileEnv`
+  // positionally to `runSwitchroom(args, extraEnv)` and ignores its own `env`
+  // parameter. They are two independent references to one variable, so deleting
+  // the real `runSwitchroom` argument leaves every seam-based test green.
+  //
+  // This one drives the REAL spawn — no `runReconcile` injection at all —
+  // through the `switchroomBin` stub and reads SWITCHROOM_CONFIG out of the
+  // child's OWN environment. Same pattern as the SWITCHROOM_HOSTD_CONTEXT
+  // assertions in `server.test.ts`. It is the only test that fails if the
+  // production spawn loses the pin.
+  it("spawns the REAL reconcile child (no runReconcile seam) with SWITCHROOM_CONFIG pinned to the written file", async () => {
+    const { gw } = stubGateway("approve");
+    const rec = join(tmp, "reconcile-child-env.txt");
+    // Overwrite the default stub with one that reports its own env + argv.
+    // `switchroomBin` is read at spawn time, so rewriting the same path here
+    // (before the server is constructed) is enough.
+    writeFileSync(
+      stubBin,
+      `#!/bin/sh\n` +
+        `echo "argv: $*" >> "${rec}"\n` +
+        `echo "cfg: $SWITCHROOM_CONFIG" >> "${rec}"\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stubBin, 0o755);
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      // runReconcile deliberately NOT injected — this is the production path.
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "prov-real-1" });
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+
+    // Exactly one child, and its environment carries the pin. A production
+    // spawn that dropped `reconcileEnv` writes `cfg:` with an empty value here
+    // (the harness does not export SWITCHROOM_CONFIG), which is the pre-fix
+    // bug: the child would re-derive its own path via findConfigFile().
+    const lines = readFile(rec, "utf8").trim().split("\n");
+    expect(lines).toEqual([
+      "argv: apply --only klanker --non-interactive",
+      `cfg: ${configPath}`,
+    ]);
+  });
+
   it("pins the same SWITCHROOM_CONFIG on the ROLLBACK reconcile, not just the forward one", async () => {
     const { gw } = stubGateway("approve");
     const envs: Array<Record<string, string> | undefined> = [];

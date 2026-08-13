@@ -298,11 +298,21 @@ export interface ServerOptions {
   runReconcile?: (args: {
     requestId: string;
     /**
-     * The env overlay the production spawn merges onto `process.env` for this
-     * reconcile — the SAME object the real `runSwitchroom` call receives, so a
-     * test asserting on it is asserting the child's environment and not a
-     * parallel construction. Carries `SWITCHROOM_CONFIG` on the
+     * A MIRROR of the env overlay the production spawn merges onto
+     * `process.env` for this reconcile. Carries `SWITCHROOM_CONFIG` on the
      * `config_propose_edit` path (#4661 follow-up).
+     *
+     * It is NOT the child's environment: production never calls this seam, it
+     * calls the default closure, which passes the same variable POSITIONALLY to
+     * `runSwitchroom(args, extraEnv)` and ignores this parameter entirely. Two
+     * independent references to one variable — nothing in the type system ties
+     * them, and dropping the real spawn's argument would leave every
+     * seam-asserting test green. What keeps the mirror honest is the real-spawn
+     * test "spawns the REAL reconcile child (no runReconcile seam) with
+     * SWITCHROOM_CONFIG pinned to the written file" in
+     * `tests/host-control/config-propose-edit.test.ts`, which injects no seam
+     * and reads the variable out of the child's own environment. Keep them in
+     * step: change the spawn, and that test is what fails.
      */
     env?: Record<string, string>;
   }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
@@ -956,10 +966,15 @@ function statIdentity(path: string): FileIdentity {
  * change absent from the file everything else reads.
  *
  * The reconcile spawn now pins `SWITCHROOM_CONFIG` to the write target, so the
- * CHILD can no longer diverge. This function covers the rest of the fleet —
- * agents, the CLI, hostd's own `loadConfig()` and pin journal — which all go
- * through `findConfigFile`. If that answer is a different file from the one we
- * are about to write, the write is invisible to them and must not happen.
+ * CHILD can no longer diverge. This function covers what is left: HOSTD-INTERNAL
+ * consistency between the write target and hostd's OWN `findConfigFile()`
+ * answer — the same resolver hostd's `loadConfig()` and pin journal use. It
+ * cannot speak for the rest of the fleet: `findConfigFile()` is evaluated inside
+ * the hostd container against hostd's cwd, `$HOME` and mount namespace, while an
+ * agent container or the operator's host shell resolve in namespaces hostd
+ * cannot observe. A divergence hostd CAN see is nonetheless proof that the write
+ * is landing somewhere hostd itself would not read back, so the write must not
+ * happen.
  *
  * Deliberately quiet about the cases that are NOT divergence, because a check
  * that cries wolf on every boot is worse than no check:
