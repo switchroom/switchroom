@@ -11,13 +11,48 @@
  * without the bun toolchain) or when the `BUN_BUILD_COMPILE_SKIP` env
  * var is set (sandbox where compile is too heavy).
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, onTestFinished } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  existsSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(__dirname, "../..");
+
+/**
+ * Allocate a scratch dir under the system tmpdir AND register its removal
+ * with `onTestFinished` in one move.
+ *
+ * WHY THIS EXISTS (the leak this closes). Each of the tests below compiles
+ * the CLI with `bun build --compile`, which writes a ~102 MiB self-contained
+ * binary into its scratch dir, and neither test removed it. Agent containers
+ * mount `/tmp` as a 2 GiB RAM-backed tmpfs (src/agents/compose.ts
+ * DEFAULT_TMP_SIZE), so ~204 MiB per suite run accumulated until the tmpfs
+ * was full and every subsequent `/tmp` write — including `npm ci`'s
+ * postinstall staging — failed. Measured on a live agent container: two
+ * orphaned `switchroom-static-*` trees held 204 MiB of a 490 MiB total.
+ *
+ * `onTestFinished` rather than a trailing `rmSync` in the test body: the
+ * hook runs on the FAILURE path too. A trailing statement does not — the
+ * first failed `expect` throws past it, which is exactly the run (a broken
+ * compile, a flaky assertion) that leaves the biggest artifact behind.
+ * `afterEach` would work as well, but it cannot see the per-test path
+ * without a mutable module-scope variable, and would silently reap nothing
+ * if a future test forgot to assign it.
+ */
+function scratchDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  onTestFinished(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return dir;
+}
 
 function bunAvailable(): boolean {
   if (process.env.BUN_BUILD_COMPILE_SKIP) return false;
@@ -80,7 +115,7 @@ describe("static binary — import.meta.dirname regression", () => {
   it.skipIf(!bunAvailable())(
     "apply --example switchroom works inside a `bun build --compile` artifact",
     () => {
-      const tmp = mkdtempSync(join(tmpdir(), "switchroom-static-"));
+      const tmp = scratchDir("switchroom-static-");
       const binPath = compileStaticBinary(tmp);
       expect(existsSync(binPath)).toBe(true);
 
@@ -129,7 +164,7 @@ describe("static binary — import.meta.dirname regression", () => {
       // "../../examples")` → `/examples` inside the binary, so it died with
       // "Example config not found" while `apply --example` (already embedded)
       // worked. Both now go through src/cli/embedded-examples.ts.
-      const tmp = mkdtempSync(join(tmpdir(), "switchroom-static-setup-"));
+      const tmp = scratchDir("switchroom-static-setup-");
       const binPath = compileStaticBinary(tmp);
 
       const fakeHome = join(tmp, "home");
@@ -161,4 +196,61 @@ describe("static binary — import.meta.dirname regression", () => {
     },
     120_000,
   );
+});
+
+/**
+ * Guards the cleanup contract itself, and specifically the FAILURE path —
+ * the one a trailing `rmSync` in the test body does not cover, and the one
+ * that leaks the largest artifact (a half-written 102 MiB compile output).
+ *
+ * These assert an OUTCOME (the directory no longer exists on disk once its
+ * test has finished), not that `onTestFinished` was called. They run
+ * unconditionally — no `bun` needed — so the contract stays pinned on CI
+ * workers that skip the compile tests above.
+ *
+ * Vitest runs the tests in a file sequentially in declaration order, so the
+ * observer test below runs strictly after the allocating test has finished
+ * and its cleanup hooks have drained.
+ */
+const observed: Record<string, string> = {};
+
+describe("scratch dirs are reaped after each test (tmpfs exhaustion, /tmp)", () => {
+  it.fails("a FAILING test allocates a scratch dir and then throws", () => {
+    observed.failing = scratchDir("switchroom-scratch-guard-fail-");
+    // A stand-in for the ~102 MiB compile artifact: something with real
+    // bytes in it, so a leak is a leak of storage and not just an inode.
+    writeFileSync(join(observed.failing, "artifact.bin"), Buffer.alloc(64 * 1024));
+    expect(existsSync(join(observed.failing, "artifact.bin"))).toBe(true);
+    // Deliberate failure — `it.fails` asserts this test throws. Everything
+    // after this line is unreachable, which is exactly the point: a trailing
+    // cleanup statement here would never run.
+    throw new Error("deliberate failure — exercises the cleanup failure path");
+  });
+
+  it("a PASSING test allocates a scratch dir", () => {
+    observed.passing = scratchDir("switchroom-scratch-guard-pass-");
+    writeFileSync(join(observed.passing, "artifact.bin"), Buffer.alloc(64 * 1024));
+    expect(existsSync(join(observed.passing, "artifact.bin"))).toBe(true);
+  });
+
+  it("…and BOTH scratch dirs are gone from the tmpdir afterwards", () => {
+    expect(
+      observed.failing,
+      "the failing test did not run — this guard is vacuous",
+    ).toBeTruthy();
+    expect(
+      observed.passing,
+      "the passing test did not run — this guard is vacuous",
+    ).toBeTruthy();
+    expect(
+      existsSync(observed.failing),
+      `leaked scratch dir from the FAILING test: ${observed.failing} — ` +
+        `cleanup must be registered with onTestFinished, which runs on the ` +
+        `failure path; a trailing rmSync in the test body does not.`,
+    ).toBe(false);
+    expect(
+      existsSync(observed.passing),
+      `leaked scratch dir from the PASSING test: ${observed.passing}`,
+    ).toBe(false);
+  });
 });
