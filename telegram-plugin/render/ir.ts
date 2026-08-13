@@ -30,6 +30,7 @@
 //     highlight -> `==…==`  (Bot API 10.1 marked entity)
 //     code      -> `` `…` ``
 //     link      -> `[…](…)`
+//     tg-entity -> `![…](tg://…)`  (Bot API date_time / custom-emoji entity)
 //
 //   Block
 //     paragraph      -> children joined; blocks separated by "\n\n"
@@ -109,6 +110,30 @@ export interface LinkNode extends Pos {
   children: Inline[];
 }
 
+/** A Telegram rich-markdown INLINE entity written in mdast IMAGE position.
+ *  The "Rich Markdown style" grammar (https://core.telegram.org/bots/api,
+ *  quoted in `reference/telegram-formatting-guide.md`) lists exactly two:
+ *
+ *    ![](tg://emoji?id=5368324170671202286)                  custom emoji
+ *    ![22:45 tomorrow](tg://time?unix=1647531900&format=wDT) date_time
+ *
+ *  (the `date_time` MessageEntity is Bot API 9.5, March 1 2026; the rich-message
+ *  `RichTextDateTime` class is 10.1, June 11 2026 — both in the Bot API
+ *  changelog.) `parse.ts` folds ONLY those two `tg:` hrefs into this node;
+ *  every other image url keeps the historical demote-to-`plain` fallback,
+ *  because an http(s) `![](…)` is a Telegram MEDIA block — "Media can be
+ *  specified only as a separate block" (same doc) — not an inline entity, and
+ *  switchroom does not emit media blocks.
+ *
+ *  `label` is the DECODED alternative text (mdast `image.alt`, empty for the
+ *  emoji form); `href` is the `tg:` URL. Both are re-escaped on render, same
+ *  as `LinkNode`. */
+export interface TgEntityNode extends Pos {
+  type: "tg-entity";
+  label: string;
+  href: string;
+}
+
 export type Inline =
   | PlainNode
   | BoldNode
@@ -118,7 +143,8 @@ export type Inline =
   | SpoilerNode
   | HighlightNode
   | CodeNode
-  | LinkNode;
+  | LinkNode
+  | TgEntityNode;
 
 // ---------------------------------------------------------------------------
 // Block nodes

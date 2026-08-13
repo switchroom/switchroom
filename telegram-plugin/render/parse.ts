@@ -99,6 +99,24 @@ function slice(source: string, node: MdastNode): string {
  *  the rewritten `  >` past 3 spaces and turn it into an indented code block. */
 const EXPANDABLE_MARKER_RE = /^\*\*>/;
 
+/** The `tg:` hrefs Telegram's "Rich Markdown style" grammar accepts in IMAGE
+ *  position — `![label](tg://…)`. Exactly two are documented
+ *  (https://core.telegram.org/bots/api): `tg://emoji?id=…` (custom emoji) and
+ *  `tg://time?unix=…[&format=…]` (the `date_time` entity). Deliberately an
+ *  ALLOWLIST rather than a bare `tg:` scheme test: an undocumented `tg://…` in
+ *  image position is not known-good syntax, and demoting it to literal text
+ *  (the historical behaviour) is safer than shipping a construct Telegram may
+ *  parse-reject. */
+const TG_INLINE_ENTITY_HREFS = ["tg://emoji", "tg://time"] as const;
+
+/** True when an mdast `image` url is one of the documented inline `tg:`
+ *  entities. Scheme/host comparison is case-insensitive (URLs are), but the
+ *  ORIGINAL href is what gets re-emitted — we never rewrite the author's bytes. */
+function isTgInlineEntityHref(href: string): boolean {
+  const h = href.toLowerCase();
+  return TG_INLINE_ENTITY_HREFS.some((base) => h === base || h.startsWith(`${base}?`));
+}
+
 /** Pre-transform expandable-blockquote markers so mdast can parse them as
  *  ordinary blockquotes, WITHOUT shifting any source offset. Each line that
  *  opens with `**>` has its two `*` characters replaced by two spaces
@@ -170,8 +188,22 @@ function foldInline(node: PhrasingContent, source: string): Inline {
         children: foldInlineChildren(node, source),
         ...pos(node),
       };
-    // Not in the palette (break, image, html, footnoteReference, …): keep the
-    // raw source text so no content is lost.
+    case "image": {
+      // GFM's image syntax doubles as Telegram's INLINE-entity syntax:
+      // `![22:45 tomorrow](tg://time?unix=…&format=…)` (date_time) and
+      // `![](tg://emoji?id=…)` (custom emoji). Fold those two into a
+      // `tg-entity` node so the renderer re-emits the construct verbatim
+      // instead of escaping the brackets to literal text. Every OTHER image
+      // url — notably the http(s) MEDIA forms, which Telegram accepts only as
+      // a SEPARATE block — falls through to the demote-to-`plain` default
+      // below, unchanged.
+      if (isTgInlineEntityHref(node.url)) {
+        return { type: "tg-entity", label: node.alt ?? "", href: node.url, ...pos(node) };
+      }
+      return { type: "plain", text: slice(source, node), ...pos(node) };
+    }
+    // Not in the palette (break, non-`tg:` image, html, footnoteReference, …):
+    // keep the raw source text so no content is lost.
     default:
       return { type: "plain", text: slice(source, node), ...pos(node) };
   }

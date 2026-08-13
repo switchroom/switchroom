@@ -1414,7 +1414,12 @@ const INLINE_SPAN_PATTERNS: readonly RegExp[] = [
   /\*\*[^*\n]+\*\*/g, // bold
   /__[^_\n]+__/g, // underline
   /(?<![\w*])_[^_\n]+_(?![\w*])/g, // italic (snake_case-guarded)
-  /\[[^\]\n]*\]\([^)\n]*\)/g, // link [label](href)
+  // link `[label](href)` — and, via the optional leading `!`, Telegram's
+  // inline-entity form `![22:45 tomorrow](tg://time?unix=…&format=…)` /
+  // `![](tg://emoji?id=…)`. Without the `!?` the protected span would start at
+  // the `[`, so a cut could land in the one-character gap and strand the `!`
+  // on the previous chunk — silently demoting a date_time entity to a link.
+  /!?\[[^\]\n]*\]\([^)\n]*\)/g,
   /~~[^~\n]+~~/g, // strikethrough
   /\|\|[^|\n]+\|\|/g, // spoiler
 ]
