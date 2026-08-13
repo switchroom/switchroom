@@ -3,11 +3,14 @@
  *
  * One bare clone per repo slug lives at ~/.switchroom/repos/<slug>.git,
  * shared across all agents. The bare clone is the source from which
- * per-agent worktrees are created (git worktree add).
+ * per-agent standing trees are provisioned — as INDEPENDENT local clones
+ * (see src/repos/agent-worktree.ts), not `git worktree add` (linked
+ * worktrees shared the bare's refs, including the single refs/stash).
  *
- * Design decision: bare clones share .git/objects across all worktrees
- * checked out of them, so five agents on the same 200MB repo cost one
- * clone worth of storage, not five.
+ * Design decision: a local clone hardlinks .git/objects (same
+ * filesystem), so five agents on the same 200MB repo still cost about
+ * one clone worth of storage, not five — without sharing any mutable
+ * git state.
  */
 
 import { execFileSync } from "node:child_process";

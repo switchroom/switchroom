@@ -4690,9 +4690,10 @@ export const AgentSchema = z.object({
     )
     .optional()
     .describe(
-      "Repos this agent operates on. Switchroom provisions a dedicated worktree for each " +
-      "repo at <agentDir>/work/<slug>/ on branch agent/<agentName>/main, backed by a " +
-      "shared bare clone at ~/.switchroom/repos/<slug>.git. The worktree path is injected " +
+      "Repos this agent operates on. Switchroom provisions a dedicated standing tree for " +
+      "each repo at <agentDir>/work/<slug>/ on branch agent/<agentName>/main — an " +
+      "independent clone (own refs/stash, hardlinked objects) seeded from a shared bare " +
+      "clone at ~/.switchroom/repos/<slug>.git. The tree's path is injected " +
       "into the agent's environment as SWITCHROOM_REPO_<SLUG_UPPER>. " +
       "Agents without this field continue to work unchanged.",
     ),
