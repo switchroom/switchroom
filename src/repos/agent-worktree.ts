@@ -1,23 +1,40 @@
 /**
- * Per-agent worktree management.
+ * Per-agent standing-tree management.
  *
  * Each agent that declares a repo in its switchroom.yaml config gets a
- * dedicated worktree at <agentDir>/work/<slug>/ on branch
- * agent/<agentName>/main. This worktree is:
+ * dedicated standing tree at <agentDir>/work/<slug>/ on branch
+ * agent/<agentName>/main. This tree is:
  *   - Created on the first reconcile after the repo appears in config.
  *   - Fast-forwarded to upstream/main (or the remote's default branch)
- *     on each subsequent reconcile when the worktree is clean.
- *   - Left unchanged (dirty: true) when the worktree has uncommitted
+ *     on each subsequent reconcile when the tree is clean.
+ *   - Left unchanged (dirty: true) when the tree has uncommitted
  *     changes — we never git reset --hard an agent's in-flight work.
  *   - Removed with the agent on `switchroom agent remove`.
  *
- * Isolation: two agents on the same repo get separate worktrees on
- * separate branches; they cannot interfere with each other.
+ * WHY AN INDEPENDENT CLONE AND NOT `git worktree add` (same class of bug
+ * as the claim-path fix in src/worktree/claim.ts, PR #4659): linked
+ * worktrees off the shared bare clone all share the bare's object store
+ * and refs — including the SINGLE `refs/stash` — so a `git stash pop` in
+ * one agent's standing tree can pop a DIFFERENT agent's stash entry, and
+ * `.git/worktrees/<name>` admin metadata in the bare can go stale across
+ * removals. An independent clone shares nothing mutable with the bare or
+ * with any other agent's tree by construction. A local clone hardlinks
+ * the object store (same filesystem), so the disk cost stays near a
+ * worktree's. `origin` is rewired from the local bare-clone path to the
+ * bare's real upstream URL so fetch/push in the tree hit upstream.
+ *
+ * PRE-EXISTING trees provisioned as linked worktrees are left in place
+ * (never force-migrated — that could lose in-flight work) and remain
+ * removable: removal is shape-aware via removeCheckout(), detecting by
+ * filesystem shape (`.git` dir = clone, `.git` file = linked worktree),
+ * never by a stored record field.
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { assertBaseDirNotTmp } from "../worktree/claim.js";
+import { removeCheckout } from "../worktree/remove-checkout.js";
 
 export interface WorktreeState {
   /** Absolute path to the worktree directory */
@@ -105,16 +122,16 @@ function branchExistsInBare(bareClonePath: string, branchName: string): boolean 
 }
 
 /**
- * Resolve the default remote tracking branch for the bare clone.
- * Tries refs/remotes/origin/HEAD → falls back to "main".
+ * Resolve the default remote tracking branch for a repo (bare clone or
+ * checked-out tree). Tries refs/remotes/origin/HEAD → falls back to "main".
  */
-function resolveDefaultBranch(bareClonePath: string): string {
+function resolveDefaultBranch(repoPath: string): string {
   try {
     const out = execFileSync(
       "git",
       ["symbolic-ref", "refs/remotes/origin/HEAD"],
       {
-        cwd: bareClonePath,
+        cwd: repoPath,
         stdio: ["ignore", "pipe", "pipe"],
         encoding: "utf-8",
       },
@@ -128,15 +145,35 @@ function resolveDefaultBranch(bareClonePath: string): string {
 }
 
 /**
- * Ensure a per-agent worktree exists for a given repo.
+ * Check whether a fully-qualified ref exists in a repo.
+ */
+function refExists(repoPath: string, ref: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", ref], {
+      cwd: repoPath,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure a per-agent standing tree exists for a given repo.
  *
  * Behaviour:
- *   1. First call: creates <agentDir>/work/<slug>/ as a git worktree on
- *      branch agent/<agentName>/main. The branch is created off the
- *      remote's default branch (e.g. origin/main).
- *   2. Subsequent calls (clean worktree): fetches latest from remote
- *      and fast-forwards agent/<agentName>/main to origin/<defaultBranch>.
- *   3. Subsequent calls (dirty worktree): leaves the worktree unchanged,
+ *   1. First call: creates <agentDir>/work/<slug>/ as an INDEPENDENT
+ *      local clone of the bare clone (own object store, own refs, own
+ *      refs/stash — see module header) on branch agent/<agentName>/main.
+ *      The branch starts at the bare's copy of the per-agent branch when
+ *      one exists (re-provisioning after a pre-fix removal), else at the
+ *      remote's default branch (e.g. origin/main). `origin` is rewired
+ *      to the bare's real upstream URL.
+ *   2. Subsequent calls (clean tree): fetches latest from origin and
+ *      fast-forwards agent/<agentName>/main to origin/<defaultBranch>.
+ *      Works unchanged for PRE-EXISTING linked-worktree trees.
+ *   3. Subsequent calls (dirty tree): leaves the tree unchanged,
  *      returns dirty: true.
  *
  * Synchronous: uses execFileSync internally; exported as a sync function
@@ -155,43 +192,70 @@ export function ensureAgentWorktree(
 ): WorktreeState {
   const worktreePath = agentWorktreePath(agentDir, slug);
   const branch = agentBranchName(agentName);
-  const defaultBranch = resolveDefaultBranch(bareClonePath);
 
   if (!existsSync(worktreePath)) {
-    // First time: create the worktree directory and the agent branch.
-    mkdirSync(join(agentDir, "work"), { recursive: true });
+    // First time: provision an independent clone of the bare clone.
+    // Same remedy shape as the claim path (src/worktree/claim.ts, #4659).
+    const workDir = join(agentDir, "work");
+    // Agent containers mount /tmp noexec — a standing tree there fails the
+    // moment a build runs in it. Same guard as the claim path.
+    assertBaseDirNotTmp(workDir);
+    mkdirSync(workDir, { recursive: true });
 
-    if (branchExistsInBare(bareClonePath, branch)) {
-      // Branch already exists (e.g. re-provisioning after removal).
-      // Add the worktree using the existing branch — don't re-create it.
+    try {
+      // Local clone: hardlinks the bare's object store (same filesystem), so
+      // this is cheap. --no-checkout because we check out the per-agent
+      // branch ourselves in the next step. Cloning a bare repo maps the
+      // bare's refs/heads/* to refs/remotes/origin/* in the clone, so a
+      // legacy per-agent branch left in the bare by the pre-fix
+      // `worktree add -b` provisioning surfaces as origin/<branch> here.
       execFileSync(
         "git",
-        ["worktree", "add", worktreePath, branch],
-        {
-          cwd: bareClonePath,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
+        ["clone", "--quiet", "--no-checkout", bareClonePath, worktreePath],
+        { stdio: ["ignore", "pipe", "pipe"] },
       );
-    } else {
-      // Create the worktree and the per-agent branch together.
-      // The branch starts at origin/<defaultBranch>.
+
+      const defaultBranch = resolveDefaultBranch(worktreePath);
+      const startPoint = refExists(worktreePath, `refs/remotes/origin/${branch}`)
+        ? `origin/${branch}` // preserve the legacy per-agent branch's state
+        : `origin/${defaultBranch}`;
       execFileSync(
         "git",
-        [
-          "worktree", "add",
-          worktreePath,
-          "-b", branch,
-          `origin/${defaultBranch}`,
-        ],
-        {
+        ["checkout", "--quiet", "-b", branch, startPoint],
+        { cwd: worktreePath, stdio: ["ignore", "pipe", "pipe"] },
+      );
+
+      // Rewire `origin` from the local bare-clone path to the bare's real
+      // upstream URL, so fetch/push in the standing tree hit upstream —
+      // matching what a linked worktree (which shared the bare's remote
+      // config) used to give agents. If the bare has no origin, leave the
+      // local path in place.
+      let originUrl: string | undefined;
+      try {
+        originUrl = execFileSync("git", ["remote", "get-url", "origin"], {
           cwd: bareClonePath,
           stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
+          encoding: "utf-8",
+        }).trim();
+      } catch {
+        /* bare clone has no origin remote */
+      }
+      if (originUrl) {
+        execFileSync("git", ["remote", "set-url", "origin", originUrl], {
+          cwd: worktreePath,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      }
+    } catch (err) {
+      // Remove any partial clone: a half-provisioned dir would otherwise be
+      // mistaken for an existing tree (and reported dirty) on the next
+      // reconcile. Mirrors the claim path's failure cleanup.
+      rmSync(worktreePath, { recursive: true, force: true });
+      throw err;
     }
 
     process.stderr.write(
-      `[switchroom] repo "${slug}": worktree ready at ${worktreePath} (branch: ${branch})\n`,
+      `[switchroom] repo "${slug}": standing tree ready at ${worktreePath} (branch: ${branch}, independent clone)\n`,
     );
     return { path: resolve(worktreePath), branch, dirty: false };
   }
@@ -218,6 +282,11 @@ export function ensureAgentWorktree(
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    // Resolve from the tree itself: works for both shapes (an independent
+    // clone has its own refs/remotes/origin/HEAD; a legacy linked worktree
+    // resolves through the bare clone's refs).
+    const defaultBranch = resolveDefaultBranch(worktreePath);
+
     execFileSync(
       "git",
       ["merge", "--ff-only", `origin/${defaultBranch}`],
@@ -242,13 +311,20 @@ export function ensureAgentWorktree(
 }
 
 /**
- * Remove the per-agent worktree for a given repo.
+ * Remove the per-agent standing tree for a given repo.
  *
  * Steps:
- *   1. `git worktree remove --force <path>` from the bare clone.
- *   2. `git branch -D agent/<agentName>/main` from the bare clone.
+ *   1. Shape-aware removal via removeCheckout(): an independent clone
+ *      (`.git` directory) is `rm -rf`'d — everything lives inside it; a
+ *      PRE-EXISTING linked worktree (`.git` FILE) goes through
+ *      `git worktree remove --force` from the bare clone so the bare's
+ *      `.git/worktrees/<name>` admin entry is cleaned up too. Detection
+ *      is by filesystem shape, never a stored kind field.
+ *   2. `git branch -D agent/<agentName>/main` from the bare clone (a
+ *      legacy leftover for clone-shaped trees; the live branch for
+ *      worktree-shaped ones).
  *
- * Idempotent — safe to call even when the worktree or branch is absent.
+ * Idempotent — safe to call even when the tree or branch is absent.
  *
  * Synchronous: uses execFileSync internally; exported as a sync function
  * so that callers do not need to become async.
@@ -264,14 +340,7 @@ export function removeAgentWorktree(
 
   if (existsSync(worktreePath)) {
     try {
-      execFileSync(
-        "git",
-        ["worktree", "remove", "--force", worktreePath],
-        {
-          cwd: bareClonePath,
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
+      removeCheckout(bareClonePath, worktreePath);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(

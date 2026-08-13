@@ -76,7 +76,7 @@ Each field type has specific merge behavior when values exist at multiple layers
 | `resources.memory_reservation` | per-field | Soft memory floor (Docker `mem_reservation` → cgroup `memory.low`). Protects this much from reclaim under host-wide pressure. Must be ≤ `memory`. |
 | `resources.pids_limit` | per-field | Max processes in the cgroup (`pids.max`). Idle agent ≈ 30 PIDs; `npm test`-style workloads spike past 200. |
 | `resources.cpus` | per-field | CPU quota (Docker `cpus`), fractional OK. Unset at every layer → per-profile default (klanker/coding 2.0, default 1.0, lightweight 0.5). |
-| `resources.tmp_size` | per-field | Size of the container's RAM-backed `/tmp` (`tmpfs: - /tmp:size=<this>,mode=1777`). Docker size string (`4g`, `512m`). **Default `2g`.** The container root FS is read-only, so `/tmp` is the *only* scratch space the agent and its sub-agents get — repo clones, `bunx`/`npx`/`pip` toolchain caches. Raise it for agents that fan out several sub-agents at once (the earlier hard-coded 1g was measured 90% full on a busy root-tier agent, 785M of it concurrent sub-agent clones and caches). A tmpfs is a ceiling, not a reservation: it consumes host RAM only for pages actually written, so raising it costs nothing until used — but those pages count against `resources.memory`, so raise both together. Takes effect when the container is recreated (`switchroom apply`), not on a running one. |
+| `resources.tmp_size` | per-field | Size of the container's RAM-backed `/tmp` (`tmpfs: - /tmp:size=<this>,mode=1777`). Docker size string (`4g`, `512m`). **Default `2g`.** The container root FS is read-only, so `/tmp` is the *only* scratch space the agent and its sub-agents get — `bunx`/`npx`/`pip` toolchain caches and similar scratch. (NOT repo checkouts: `/tmp` is mounted `noexec`, so builds there fail with `EACCES` — checkouts are guarded to land under `$HOME`, see `assertBaseDirNotTmp` in `src/worktree/claim.ts`.) Raise it for agents that fan out several sub-agents at once (the earlier hard-coded 1g was measured 90% full on a busy root-tier agent, 785M of it concurrent sub-agent clones and caches). A tmpfs is a ceiling, not a reservation: it consumes host RAM only for pages actually written, so raising it costs nothing until used — but those pages count against `resources.memory`, so raise both together. Takes effect when the container is recreated (`switchroom apply`), not on a running one. |
 | `settings_raw` | deep merge | Escape hatch: raw settings.json overrides |
 | `claude_md_raw` | concatenate | Escape hatch: append to CLAUDE.md on scaffold |
 | `cli_args` | concatenate | Escape hatch: extra `exec claude` flags |
@@ -1367,10 +1367,11 @@ primitives is the right tool:
 
 - **"Agent should edit a git repo (incl. switchroom itself)."** Use
   `repos:` (see `src/config/schema.ts` `AgentRepoEntry`). Switchroom
-  provisions a dedicated worktree at `<agentDir>/work/<slug>/` from
-  a shared bare clone — the agent edits *inside its own sandbox*,
+  provisions a dedicated standing tree at `<agentDir>/work/<slug>/` —
+  an independent clone (its own refs and stash) seeded from a shared
+  bare clone — so the agent edits *inside its own sandbox*,
   not on a mounted host checkout. `bind_mounts:` is not needed and
-  doesn't help: the worktree pattern lets the agent commit + push +
+  doesn't help: the standing-tree pattern lets the agent commit + push +
   open a PR using its own git identity without touching host state.
 - **"Admin agent should deploy a merged change (`switchroom apply`,
   `agent restart`, `update apply`)."** That's the host-control

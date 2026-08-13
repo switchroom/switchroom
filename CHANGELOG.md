@@ -53,6 +53,25 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **repos: per-agent STANDING trees (`repos:` in switchroom.yaml) are now
+  independent clones too — two agents on the same repo no longer share a
+  stash ref.** The claim-path fix below stopped sub-agent checkouts sharing
+  git state, but `ensureAgentWorktree` still provisioned every agent's
+  standing tree at `<agentDir>/work/<slug>/` as a linked `git worktree` off
+  the shared bare clone at `~/.switchroom/repos/<slug>.git` — so all agents
+  on a repo shared the bare's object store, refs, and its SINGLE
+  `refs/stash`: a `git stash pop` in one agent's tree could pop another
+  agent's entry. Standing trees are now provisioned with the same remedy
+  shape: an independent local clone (hardlinked objects, own refs/stash),
+  `origin` rewired to the bare's real upstream, and a legacy per-agent
+  branch left in the bare is preserved as the start point on re-provision.
+  Provisioning also refuses an agent dir under `/tmp`/`/var/tmp` via the
+  same `assertBaseDirNotTmp` guard (tmp is `noexec` in agent containers).
+  PRE-EXISTING standing trees are never force-migrated and stay removable:
+  removal is shape-aware (`.git` dir = clone → `rm -rf`; `.git` FILE =
+  legacy linked worktree → `git worktree remove` from the bare), detected
+  by filesystem shape, never a stored kind field.
+
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide
   through shared git state.** Linked worktrees share the parent repo's refs
