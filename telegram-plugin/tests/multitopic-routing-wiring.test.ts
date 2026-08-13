@@ -26,7 +26,12 @@ const gatewaySrc =
   // P7 PR-10 (#2996): the InboundMessage envelope assembly (origin_turn_id,
   // topic_scope, meta lane) moved verbatim into gateway/inbound-router.ts
   // (buildInboundEnvelope) — include it in the scraped corpus.
-  readFileSync(resolve(__dirname, '..', 'gateway', 'inbound-router.ts'), 'utf-8')
+  readFileSync(resolve(__dirname, '..', 'gateway', 'inbound-router.ts'), 'utf-8') +
+  '\n' +
+  // The reply-route telemetry line (via/RECOVERED/UNROUTED/MISROUTE_RISK/
+  // CROSS_CHAT_ANCHOR_DROPPED) moved verbatim out of resolveAnswerThreadWithLog
+  // into the pure formatReplyRouteLog (#2996 line ratchet) — scrape it too.
+  readFileSync(resolve(__dirname, '..', 'gateway', 'reply-route-log.ts'), 'utf-8')
 // #2996 P4-A: the enqueue handler (turn ctor: `const turnId = deriveTurnId`,
 // `rememberRecentTurn(next)`, `promoteQueuedStatus`) moved VERBATIM into
 // stream-render.ts with handleSessionEvent. Enqueue-seam assertions span both.
@@ -145,6 +150,19 @@ describe('framework-owned origin recovery (determinism residual, 2026-06-05)', (
     // recent topic, and does NOT change the resolved thread.
     expect(gatewaySrc).toMatch(/const misrouteRisk =/)
     expect(gatewaySrc).toMatch(/via === 'quoted' \? ' QUOTED\(framework-origin\)' : ''/)
+  })
+
+  it('a thread anchor from ANOTHER chat is dropped before it can be sent (cross-chat guard)', () => {
+    // The routing input carries the target + anchor chat ids, so the pure
+    // resolver can refuse a foreign anchor (Telegram 400 "message thread not
+    // found"). Behaviour is asserted in answer-thread-resolve.test.ts; this
+    // pins the WIRING so a refactor cannot silently stop passing them.
+    const fn = gatewaySrc.split('function resolveAnswerThreadWithLog')[1]?.split('\nfunction ')[0] ?? ''
+    expect(fn).toMatch(/targetChatId: chatId/)
+    expect(fn).toMatch(/originChatId: originTurn\?\.sessionChatId/)
+    expect(fn).toMatch(/liveChatId: liveTurn\?\.sessionChatId/)
+    // And the dropped anchor is observable, with both chat ids on the line.
+    expect(gatewaySrc).toMatch(/CROSS_CHAT_ANCHOR_DROPPED\(target=/)
   })
 
   it('the kill switch defaults ON and is independent of TURN_ORIGIN_ROUTING', () => {

@@ -737,7 +737,8 @@ import {
   type CardDrainGateCtx,
 } from './emission-authority.js'
 import { CurrentTurnMap } from './current-turn-map.js'
-import { resolveAnswerThreadId } from './answer-thread-resolve.js'
+import { resolveAnswerThreadId, isCrossChatAnchor } from './answer-thread-resolve.js'
+import { formatReplyRouteLog } from './reply-route-log.js'
 import { latestTurnForChat } from './latest-turn-lookup.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
 import { maybeRotate, resolveAgentStateDir, resolveTurnsJsonlPath } from './turns-jsonl-rotate.js'
@@ -3909,19 +3910,11 @@ function resolveReplyOwnerTurn(
  * 2026-06-05 triage showed reply routing was the blind spot: `reply: invoked`
  * logged only chat + char count, so a late reply landing in the wrong topic was
  * invisible without hand-correlating raw tg-post threads against turn-lifecycle
- * timestamps. This wrapper logs, per reply: which precedence tier won (`via`),
- * the resolved thread, the origin turn + its thread, and whether the reply was
- * late (turn already ended). `via=recovered` marks a late reply this fix saved
- * from General; `via=quoted` marks an origin recovered from the framework-owned
- * quoted message_id (no model echo); `UNROUTED` flags a supergroup reply that
- * resolved to no topic with NO owner turn to attribute it to (genuinely lost).
- * `MISROUTE_RISK` flags the irreducible determinism residual: a no-echo,
- * no-quote reply that fell to the LIVE turn while a DIFFERENT topic recently had
- * a turn — the framework cannot tell which topic the bare reply answers, so the
- * routing MIGHT be wrong (HOLE a). It is observability only (the reply still
- * routes to the live turn) — it makes the one case that is genuinely
- * model-dependent visible instead of silently mis-routed. A General-topic turn
- * legitimately has no thread, so its replies are NOT UNROUTED-flagged.
+ * timestamps. The line itself — tier (`via`), resolved thread, owner turn, and
+ * the RECOVERED / QUOTED / UNROUTED / MISROUTE_RISK / CROSS_CHAT_ANCHOR_DROPPED
+ * / EXPLICIT_OVERRIDDEN markers — is built by the pure `formatReplyRouteLog`
+ * (`reply-route-log.ts`), which documents each marker. This wrapper binds the
+ * gateway's stateful lookups and owns the routing call.
  *
  * `originVia` distinguishes how the origin turn was resolved: 'echo' (model
  * echoed origin_turn_id), 'quoted' (framework recovered it from args.reply_to),
@@ -3935,17 +3928,25 @@ function resolveAnswerThreadWithLog(
   liveTurn: CurrentTurn | null,
   surface: 'reply' | 'stream_reply',
 ): number | undefined {
+  // Cross-chat anchor guard (2026-08-13, bug c in `answer-thread-resolve.ts`):
+  // an anchor turn owned by a DIFFERENT chat must not lend its topic id to this
+  // send. `resolveAnswerThreadId` drops it from the ROUTING (below); these
+  // locals apply the same predicate so the recovery tier and the telemetry
+  // agree with what routed.
+  const originAnchor = isCrossChatAnchor(chatId, originTurn?.sessionChatId) ? null : originTurn
+  const liveAnchor = isCrossChatAnchor(chatId, liveTurn?.sessionChatId) ? null : liveTurn
   // Recover ONLY for a genuinely LATE reply — no live turn at all. Gating on
   // `liveTurn?.sessionThreadId == null` (the original) also fired for a
   // threadless DM that still had a live turn, marking every DM reply
   // `via=recovered`/RECOVERED in the telemetry (routing result unchanged —
   // DM → undefined — but it drowned the real supergroup recoveries the marker
-  // exists to surface). `liveTurn == null` is the precise late-reply condition.
+  // exists to surface). No live turn is the precise late-reply condition — and
+  // a cross-chat live turn is, for THIS chat, no live turn.
   const recovered =
     LATE_REPLY_TOPIC_RECOVERY_ENABLED &&
     explicitThreadId == null &&
-    originTurn == null &&
-    liveTurn == null
+    originAnchor == null &&
+    liveAnchor == null
       ? findLatestTurnForChat(chatId, { endedOnly: false })
       : null
   const threadId = resolveAnswerThreadId({
@@ -3957,58 +3958,24 @@ function resolveAnswerThreadWithLog(
     lastEndedResolvedForChat: recovered != null,
     lastEndedThreadIdForChat: recovered?.sessionThreadId,
     frameworkTopicAuthority: REPLY_TOPIC_AUTHORITY_ENABLED,
+    targetChatId: chatId,
+    originChatId: originTurn?.sessionChatId,
+    liveChatId: liveTurn?.sessionChatId,
   })
-  // `via` reflects the ACTIVE precedence so telemetry matches routing.
-  const via = REPLY_TOPIC_AUTHORITY_ENABLED
-    ? (originTurn != null ? (originVia === 'quoted' ? 'quoted' : 'origin')
-      : liveTurn != null ? 'live'
-      : explicitThreadId != null ? 'explicit'
-      : recovered != null ? 'recovered'
-      : 'none')
-    : (explicitThreadId != null ? 'explicit'
-      : originTurn != null ? (originVia === 'quoted' ? 'quoted' : 'origin')
-      : liveTurn?.sessionThreadId != null ? 'live'
-      : recovered != null ? 'recovered'
-      : 'none')
-  // Observability: the model passed an explicit topic but a framework anchor
-  // (origin/live) overrode it. This is the deterministic correction that fixes
-  // the General→CRM misroute; surface it so the model's topic-grabbing is
-  // visible rather than silent.
-  const explicitOverridden =
-    REPLY_TOPIC_AUTHORITY_ENABLED &&
-    explicitThreadId != null &&
-    (originTurn != null || liveTurn != null) &&
-    threadId !== explicitThreadId
-  const ownerTurn = originTurn ?? recovered ?? liveTurn
-  const isSupergroup = chatId.startsWith('-100')
-  // UNROUTED = a supergroup reply that resolved to NO topic with NO owner turn
-  // to attribute it to (genuinely lost). A General-topic turn legitimately has
-  // no thread, so a reply owned by it resolving to `-` is CORRECT, not lost —
-  // gate on `ownerTurn == null` so General replies don't false-alarm (found by
-  // the multi-topic UAT stress, 2026-06-05).
-  const unrouted = isSupergroup && threadId == null && ownerTurn == null
-  // MISROUTE_RISK = the irreducible determinism residual (HOLE a). A no-echo,
-  // no-quote reply fell to the LIVE turn (via=live), but a DIFFERENT topic
-  // recently had a turn for this chat — so this bare reply MIGHT belong to that
-  // other topic and we cannot tell without the model's echo. Observability only;
-  // routing is unchanged. This is the one case framework state cannot
-  // disambiguate, surfaced instead of silently mis-routed.
-  const misrouteRisk =
-    isSupergroup &&
-    via === 'live' &&
-    hasDifferentThreadedRecentTurn(chatId, liveTurn?.sessionThreadId)
   process.stderr.write(
-    `telegram gateway: reply-route surface=${surface} chat=${chatId} ` +
-      `resolved_thread=${threadId ?? '-'} via=${via} late=${liveTurn == null} ` +
-      `originTurn=${ownerTurn?.turnId ?? '-'} origin_thread=${ownerTurn?.sessionThreadId ?? '-'}` +
-      (via === 'recovered' ? ' RECOVERED' : '') +
-      (via === 'quoted' ? ' QUOTED(framework-origin)' : '') +
-      (unrouted ? ' UNROUTED(supergroup→no-topic)' : '') +
-      (misrouteRisk ? ' MISROUTE_RISK(no-echo→live-successor)' : '') +
-      (explicitOverridden
-        ? ` EXPLICIT_OVERRIDDEN(model→${explicitThreadId},routed→${threadId ?? '-'})`
-        : '') +
-      '\n',
+    formatReplyRouteLog({
+      surface,
+      chatId,
+      threadId,
+      explicitThreadId,
+      originTurn,
+      originVia,
+      liveTurn,
+      recovered,
+      frameworkTopicAuthority: REPLY_TOPIC_AUTHORITY_ENABLED,
+      hasDifferentThreadedRecentTurn: (liveThreadId) =>
+        hasDifferentThreadedRecentTurn(chatId, liveThreadId),
+    }),
   )
   return threadId
 }

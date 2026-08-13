@@ -44,6 +44,20 @@
  *      orphaned-backstop reply lands in its topic instead of defaulting to the
  *      main chat (General). Not the `chatThreadMap` last-seen heuristic.
  *
+ * **(c) cross-chat thread anchor (2026-08-13).** A reply targeting chat A can be
+ * resolved against a turn anchor that belongs to a DIFFERENT chat B — the
+ * `origin_turn_id` echo lookup is keyed by turn id alone (not chat-scoped), and
+ * the LIVE turn is whatever the session is currently running, which in a
+ * multi-chat agent is frequently another chat. When B is a forum supergroup, its
+ * topic id was attached to the send into A and Telegram rejected the call with
+ * `400 Bad Request: message thread not found`. A retry fallback resent with no
+ * thread and succeeded, so nothing was lost — but every occurrence was a
+ * guaranteed-failed first API call (observed 3× since 2026-08-08). Fixed by
+ * IGNORING any anchor whose chat id does not match the target chat: precedence
+ * falls through to the model's explicit thread / no thread, exactly as if the
+ * anchor did not exist. The chat ids are optional inputs, so a caller that
+ * supplies none keeps the pre-existing behaviour verbatim.
+ *
  * Setting `frameworkTopicAuthority: false` (kill switch
  * SWITCHROOM_REPLY_TOPIC_AUTHORITY=0) restores the legacy explicit-first
  * precedence (the model's thread wins outright).
@@ -95,6 +109,33 @@ export interface AnswerThreadInput {
    * true. Kill switch SWITCHROOM_REPLY_TOPIC_AUTHORITY=0.
    */
   frameworkTopicAuthority?: boolean
+  /**
+   * Chat this reply is being SENT to (bug c). When supplied together with an
+   * anchor's chat id, an anchor from a DIFFERENT chat is ignored. Undefined
+   * disables the guard (behaviour identical to before the guard existed).
+   */
+  targetChatId?: string | undefined
+  /** Chat the ORIGIN anchor turn belongs to (`turn.sessionChatId`). */
+  originChatId?: string | undefined
+  /** Chat the LIVE in-flight turn belongs to (`turn.sessionChatId`). */
+  liveChatId?: string | undefined
+}
+
+/**
+ * True when `anchorChatId` names a DIFFERENT chat than the reply's target — i.e.
+ * the anchor's thread must NOT be attached to this send (bug c). Conservative:
+ * returns false when either id is absent, so an un-instrumented caller is
+ * unaffected. Exported so the gateway's telemetry (`via`,
+ * `CROSS_CHAT_ANCHOR_DROPPED`) derives from the SAME predicate that routes,
+ * rather than a second copy that can drift out of sync.
+ */
+export function isCrossChatAnchor(
+  targetChatId: string | undefined,
+  anchorChatId: string | undefined,
+): boolean {
+  if (targetChatId == null || targetChatId === '') return false
+  if (anchorChatId == null || anchorChatId === '') return false
+  return String(anchorChatId) !== String(targetChatId)
 }
 
 /**
@@ -107,26 +148,37 @@ export interface AnswerThreadInput {
  * exists. The chat last-seen `chatThreadMap` heuristic is NOT in this chain.
  */
 export function resolveAnswerThreadId(input: AnswerThreadInput): number | undefined {
+  // Bug (c): an anchor from another chat is not an anchor. Drop it BEFORE the
+  // precedence runs, in both modes — a wrong-chat topic id is an API error, not
+  // a routing policy, so the kill switch must not reinstate it. `lastEnded*` is
+  // already chat-scoped by its lookup, so it needs no guard here.
+  const originCrossChat = isCrossChatAnchor(input.targetChatId, input.originChatId)
+  const liveCrossChat = isCrossChatAnchor(input.targetChatId, input.liveChatId)
+  const originResolved = input.originResolved && !originCrossChat
+  const originThreadId = originCrossChat ? undefined : input.originThreadId
+  const liveTurnPresent = input.liveTurnPresent === true && !liveCrossChat
+  const liveThreadId = liveCrossChat ? undefined : input.liveThreadId
+
   if (input.frameworkTopicAuthority === false) {
     // ── Legacy precedence (kill switch): the model's explicit thread wins. ──
     if (input.explicitThreadId != null) return input.explicitThreadId
-    if (input.originResolved) return input.originThreadId
-    if (input.liveThreadId != null) return input.liveThreadId
+    if (originResolved) return originThreadId
+    if (liveThreadId != null) return liveThreadId
     if (input.lastEndedResolvedForChat) return input.lastEndedThreadIdForChat
-    return input.liveThreadId
+    return liveThreadId
   }
   // ── Framework-authority precedence (default) ───────────────────────────────
   // (1) origin turn → its thread (authoritative across a currentTurn flip; a
   //     General/DM origin yields undefined → main chat / General).
-  if (input.originResolved) return input.originThreadId
+  if (originResolved) return originThreadId
   // (2) a live in-flight turn → its thread. Key off PRESENCE, not the thread
   //     value: a General live turn has an undefined thread but is still the
   //     anchor, so the model's explicit can't pull the reply out of it.
-  if (input.liveTurnPresent) return input.liveThreadId
+  if (liveTurnPresent) return liveThreadId
   // (3) no framework anchor (genuinely orphaned / proactive) → honour the
   //     model's explicit thread, its only signal here.
   if (input.explicitThreadId != null) return input.explicitThreadId
   // (4) late reply, no anchor, no explicit → recover the chat's last-ended topic.
   if (input.lastEndedResolvedForChat) return input.lastEndedThreadIdForChat
-  return input.liveThreadId
+  return liveThreadId
 }
