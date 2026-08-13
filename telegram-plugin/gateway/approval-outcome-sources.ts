@@ -50,6 +50,14 @@ import type { InboundMessage } from './ipc-protocol.js'
  * is inert (nothing ever carries it), and it removes any ordering constraint
  * between the two changes — the alternative is a window where eval-case
  * verdicts are evictable.
+ *
+ * `eval_case_suppressed` is protected for the SAME reason, and it is the one
+ * member that is not a verdict card at all. It is the gateway's own notice
+ * that a re-proposed eval case was dropped against a live dismissal — the
+ * agent's turn is blocked on it and NO sweep regenerates it (it fires exactly
+ * once, at the moment of suppression, and the suppression path posts no card).
+ * Unprotected it would be tier-1's preferred victim, so a cap overflow would
+ * restore the silent block the notice exists to close.
  */
 export const APPROVAL_OUTCOME_SOURCES: ReadonlySet<string> = Object.freeze(
   new Set([
@@ -78,6 +86,11 @@ export const APPROVAL_OUTCOME_SOURCES: ReadonlySet<string> = Object.freeze(
     'eval_case_applied',
     'eval_case_rejected',
     'eval_case_apply_failed',
+    // #4664's suppressed-proposal notice. Not itself a tap, but it reports the
+    // standing effect of one the operator ALREADY made (the Dismiss that
+    // recorded the rejection), and it is the only thing that ends the agent's
+    // wait — see the doc comment above.
+    'eval_case_suppressed',
   ]),
 ) as ReadonlySet<string>
 
