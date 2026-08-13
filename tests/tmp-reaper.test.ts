@@ -219,6 +219,118 @@ describe("tmp-reaper — open files", () => {
     expect(out).toMatch(/kept_open=1/);
   });
 
+  /**
+   * MUTATION GUARD for the `readlink -f` canonicalisation in tmp_reaper_pass.
+   *
+   * /proc/<pid>/fd link targets are always FULLY RESOLVED by the kernel. If
+   * reaper compares them against a root reached through a symlinked ANCESTOR,
+   * no prefix ever matches, `open_list` matches nothing, and the open-file
+   * guard silently passes everything through — present in the source, dead in
+   * effect. That is the worst shape of bug this script can have.
+   *
+   * Every other open-file test CANNOT catch it: `beforeEach` realpath()s the
+   * fixture root, so the script's canonicalisation is a no-op for them. This
+   * one deliberately hands the script a non-canonical root.
+   */
+  it("keeps an open entry when the root is reached via a symlinked ANCESTOR", async () => {
+    // <root>/physical/inner/held, plus <root>/alias -> <root>/physical. The
+    // root we pass (<root>/alias/inner) is not ITSELF a symlink — _root_ok
+    // rejects those outright — but it resolves through one.
+    const physical = join(root, "physical");
+    const inner = join(physical, "inner");
+    const held = join(inner, "held");
+    mkdirSync(held, { recursive: true });
+    const file = join(held, "payload.bin");
+    writeFileSync(file, Buffer.alloc(4096, 0x61));
+    symlinkSync(physical, join(root, "alias"));
+    age(file, 72);
+    age(held, 72);
+
+    const child = spawn("bash", ["-c", `exec 3< "${file}"; sleep 60`], {
+      stdio: "ignore",
+    });
+    children.push(child);
+    await new Promise((r) => setTimeout(r, 700));
+
+    const { out } = pass({}, join(root, "alias", "inner"));
+
+    expect(
+      existsSync(held),
+      `an entry held open by a live process must survive even when the root ` +
+        `is reached through a symlinked ancestor: /proc/<pid>/fd targets are ` +
+        `already resolved, so the root must be canonicalised (readlink -f) ` +
+        `before the prefix compare or the open-file guard matches nothing ` +
+        `and reaps everything.\n${out}`,
+    ).toBe(true);
+    expect(out).toMatch(/kept_open=1/);
+  });
+
+  /**
+   * MUTATION GUARD for the mmap clause of _open_paths, which no other test
+   * reaches: every case above is an fd, and an fd is caught by the find
+   * branch whether or not the maps branch works at all.
+   *
+   * A file can be MAPPED with no fd open on it — the dynamic loader maps a
+   * shared library and immediately closes its descriptor, and mmap page
+   * faults do not update atime, so such a file can be genuinely 24h "idle"
+   * while a live process is executing out of it. Only /proc/<pid>/maps shows
+   * it. LD_PRELOAD of a copied .so reproduces exactly that shape without
+   * needing a compiler; the child's cwd is pinned outside the fixture so the
+   * cwd branch cannot mask a broken maps branch.
+   */
+  const preloadLib = [
+    "/lib/x86_64-linux-gnu/libz.so.1",
+    "/lib/aarch64-linux-gnu/libz.so.1",
+    "/usr/lib/x86_64-linux-gnu/libz.so.1",
+    "/usr/lib/aarch64-linux-gnu/libz.so.1",
+  ].find((p) => existsSync(p));
+
+  it.skipIf(!preloadLib)(
+    "keeps an aged entry that is MMAPPED by a live process with no fd open",
+    async () => {
+      const dir = join(root, "mapped-no-fd");
+      mkdirSync(dir, { recursive: true });
+      const lib = join(dir, "libprobe.so");
+      writeFileSync(lib, readFileSync(preloadLib as string));
+
+      const child = spawn("sleep", ["60"], {
+        stdio: "ignore",
+        env: { ...process.env, LD_PRELOAD: lib },
+        cwd: resolve(__dirname, ".."),
+      });
+      children.push(child);
+      await new Promise((r) => setTimeout(r, 700));
+
+      // Backdate AFTER the loader has mapped it. The loader's open+read bumps
+      // atime, so ageing beforehand would leave the entry "young" and the
+      // age guard — not the maps guard — would be what saved it. This is also
+      // the real shape: a library mapped days ago whose pages have not been
+      // faulted since (page faults do not update atime).
+      age(lib, 72);
+      age(dir, 72);
+
+      // Precondition: this must be a maps-ONLY hold, or the test proves
+      // nothing about the maps branch.
+      const maps = readFileSync(`/proc/${child.pid}/maps`, "utf8");
+      expect(maps, "LD_PRELOAD did not map the fixture library").toContain(lib);
+      const fds = spawnSync("ls", ["-l", `/proc/${child.pid}/fd`], { encoding: "utf8" });
+      expect(
+        fds.stdout ?? "",
+        "the loader still holds an fd — this test would pass via the find branch",
+      ).not.toContain(lib);
+
+      const { out } = pass();
+
+      expect(
+        existsSync(dir),
+        `an entry a live process has MMAPPED (no fd) must NOT be reaped: ` +
+          `mmap page faults do not touch atime, so the age guard will not ` +
+          `save it and /proc/<pid>/maps is the only signal.\n${out}`,
+      ).toBe(true);
+      expect(out).toMatch(/kept_open=1/);
+    },
+  );
+
   it("reaps the same entry once the holder exits", async () => {
     const dir = agedDir("held-then-released", 72);
     const file = join(dir, "payload.bin");
@@ -318,7 +430,11 @@ describe("tmp-reaper — boot wiring (start.sh.hbs block 3a)", () => {
    * for `_switchroom_supervise`, so the assertion is "a tmp-reaper sidecar
    * gets supervised at boot" rather than "the template mentions a string".
    */
-  function runGuard(env: Record<string, string>, scriptPresent: boolean): string {
+  function runGuard(
+    env: Record<string, string>,
+    scriptPresent: boolean,
+    unset: string[] = [],
+  ): string {
     const lines = SRC.split("\n");
     const start = lines.findIndex((l) => l.includes('if [ "$SWITCHROOM_TMP_REAPER" != "0" ]'));
     expect(start, "block 3a guard not found in start.sh.hbs").toBeGreaterThan(-1);
@@ -339,10 +455,14 @@ describe("tmp-reaper — boot wiring (start.sh.hbs block 3a)", () => {
     ].join("\n");
     const path = join(root, "guard.sh");
     writeFileSync(path, harness, { mode: 0o755 });
-    const r = spawnSync("bash", [path], {
-      encoding: "utf8",
-      env: { ...process.env, ...env },
-    });
+    // Build the child env explicitly so `unset` can genuinely REMOVE a var.
+    // Deleting from a local copy of process.env and then not passing it (the
+    // original shape of the "unset" case) is a no-op — the child inherited
+    // the ambient value and the test only passed because the runner happened
+    // not to have it set.
+    const childEnv: Record<string, string> = { ...(process.env as Record<string, string>), ...env };
+    for (const k of unset) delete childEnv[k];
+    const r = spawnSync("bash", [path], { encoding: "utf8", env: childEnv });
     return `${r.stdout ?? ""}${r.stderr ?? ""}`;
   }
 
@@ -355,9 +475,10 @@ describe("tmp-reaper — boot wiring (start.sh.hbs block 3a)", () => {
   });
 
   it("supervises it by default when the env var is unset", () => {
-    const env = { ...process.env } as Record<string, string>;
-    delete env.SWITCHROOM_TMP_REAPER;
-    const out = runGuard({}, true);
+    // Genuinely unset in the child, not merely absent from the runner's env —
+    // otherwise this asserts nothing about the default and flips to red on any
+    // machine that happens to export SWITCHROOM_TMP_REAPER=0.
+    const out = runGuard({}, true, ["SWITCHROOM_TMP_REAPER"]);
     expect(out).toContain("SUPERVISED:tmp-reaper:");
   });
 

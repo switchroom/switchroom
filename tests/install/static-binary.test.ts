@@ -18,12 +18,23 @@ import {
   writeFileSync,
   existsSync,
   readFileSync,
+  readdirSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(__dirname, "../..");
+
+/**
+ * Snapshot of any `switchroom-static-*` dirs that already existed in the
+ * tmpdir when this module loaded — leftovers from an earlier run, another
+ * worker, or a developer's aborted session. The leak guard at the bottom
+ * diffs against this so it only ever fails on dirs THIS run created.
+ */
+const preexistingStaticDirs = new Set(
+  readdirSync(tmpdir()).filter((n) => n.startsWith("switchroom-static-")),
+);
 
 /**
  * Allocate a scratch dir under the system tmpdir AND register its removal
@@ -252,5 +263,30 @@ describe("scratch dirs are reaped after each test (tmpfs exhaustion, /tmp)", () 
       existsSync(observed.passing),
       `leaked scratch dir from the PASSING test: ${observed.passing}`,
     ).toBe(false);
+  });
+
+  /**
+   * The two guards above pin the scratchDir() HELPER. They do not pin the
+   * compile tests' CALL SITES: reverting either of those to a bare
+   * `mkdtempSync(join(tmpdir(), "switchroom-static-"))` re-introduces the
+   * exact 204 MiB leak this file exists to close, with every assertion
+   * above still green. This sweeps the tmpdir for the real prefix instead.
+   *
+   * CAVEAT: trivially satisfied when bunAvailable() is false, because the
+   * compile tests skip and allocate nothing. That is acceptable — on a
+   * worker with no bun there is no leak to catch — but it means this guard
+   * only carries weight on runners that actually compile.
+   */
+  it("leaves no switchroom-static-* compile scratch behind in the tmpdir", () => {
+    const leaked = readdirSync(tmpdir()).filter(
+      (n) => n.startsWith("switchroom-static-") && !preexistingStaticDirs.has(n),
+    );
+    expect(
+      leaked,
+      `the bun --compile tests leaked scratch dirs into /tmp: ${leaked.join(", ")}. ` +
+        `Each holds a ~102 MiB compiled binary, and an agent's /tmp is a 2 GiB ` +
+        `tmpfs. Allocate through scratchDir(), which registers onTestFinished ` +
+        `cleanup, not through a bare mkdtempSync().`,
+    ).toEqual([]);
   });
 });

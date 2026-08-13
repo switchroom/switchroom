@@ -100,8 +100,25 @@ _root_ok() {
 #
 # Cost matters here: a busy container has hundreds of processes and thousands
 # of fds, so this uses ONE `find` (with -printf '%l' to read the link targets
-# in-process) and ONE `awk` across every maps file, rather than a readlink
-# fork per fd. A per-fd fork loop measured multiple seconds per pass.
+# in-process) and ONE `grep`+`awk` pipeline over the maps files, rather than a
+# readlink fork per fd. A per-fd fork loop measured multiple seconds per pass.
+#
+# CRITICAL: neither traversal may ABORT on an unreadable input. `find` reports
+# a vanished/denied start point and keeps going, which is what we need. `awk`
+# does NOT: the image ships mawk 1.3.4, which stops at the FIRST file it cannot
+# open and never reads the rest of its argument list. Handing mawk the raw
+# /proc/[0-9]*/maps glob therefore meant that one PID exiting between bash's
+# glob expansion and mawk's serial open (ESRCH), or one EPERM, silently
+# discarded every LATER process's mappings — a fail-OPEN in a safety guard,
+# after which the reaper would delete a tree a live process still had mapped.
+# So `grep` (GNU grep continues past unreadable files, exit 2) does the
+# multi-file read and `awk` only ever sees a single stdin stream.
+#
+# `awk substr` rather than `grep -o`: a maps line is
+# "addr perms offset dev inode <pathname>", so the path runs to end-of-line and
+# MAY CONTAIN SPACES. `grep -oE "$root/[^ ]*"` would truncate
+# "/tmp/my dir/lib.so" to "/tmp/my", which no longer prefix-matches the entry
+# in the caller below — fail-open again, for any /tmp entry with a space.
 _open_paths() {
   local root="$1"
   find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe \
@@ -109,8 +126,8 @@ _open_paths() {
     | grep -F -- "$root/" 2>/dev/null
   # mmapped files (a running binary, a memory-mapped DB) do not appear as an
   # fd once mapped and the fd is closed, but are absolutely still in use.
-  awk -v r="$root/" '{ p=index($0, r); if (p) print substr($0, p) }' \
-    /proc/[0-9]*/maps 2>/dev/null
+  grep -haF -- "$root/" /proc/[0-9]*/maps 2>/dev/null \
+    | awk -v r="$root/" '{ p=index($0, r); if (p) print substr($0, p) }'
 }
 
 _human() {
