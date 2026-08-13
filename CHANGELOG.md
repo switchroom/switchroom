@@ -94,6 +94,20 @@ now an anomaly worth investigating, not the norm.
   goes through the same path as the write, so a hostd whose read and write are
   both aliased to the WRONG file still verifies clean — asserting path identity
   is separate work.
+- **self-improve: an eval-case proposal card now tells the proposing agent what
+  the operator decided — Approve AND Dismiss both wake it.**
+  `handleEvalCaseProposalCallback` was a copy of the skill-proposal handler that
+  dropped the `deliverResumeSyntheticOrBuffer` line, so both exits set the
+  status, edited the card, and returned. The agent had been steered to end its
+  turn and wait for a wake-up that no code path sent — the CLI propose call is
+  fire-and-forget and the self-improve Stop hook reads eval integrity baselines,
+  not proposal status — so every tap was a silent block. Three new synthetic
+  inbounds close it: `eval_case_applied`, `eval_case_rejected`, and
+  `eval_case_apply_failed` (carrying the applier's output tail, so an approval
+  whose applier failed can't be mistaken for a landed regression test). The deny
+  inbound goes beyond parity with the skill handler, which still stays silent on
+  dismiss; silence is the defect. The `apply-eval-case` shell-out is now an
+  injectable dep, so both approve branches are covered by deterministic tests.
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide
   through shared git state.** Linked worktrees share the parent repo's refs

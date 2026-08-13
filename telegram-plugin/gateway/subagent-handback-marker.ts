@@ -176,6 +176,18 @@ export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion
   mental_model_proposal_failed: { decoupledCompletion: false },
   webhook: { decoupledCompletion: false },
   linear: { decoupledCompletion: false },
+  // Eval-case proposal outcomes (#4662) — the operator's Approve/Dismiss tap on
+  // an eval-case card wakes the PROPOSING agent with one of these, built in
+  // `eval-case-proposal-inbound-builders.ts` and injected via
+  // `deliverResumeSyntheticOrBuffer`. Exactly the `skill_proposal_apply` shape
+  // above: each lands as its OWN live inbound turn, so its reply resolves the
+  // live tier for its own turnId and structurally cannot supersede a different
+  // ended turn — it must NOT stamp. (Left unclassified, the fail-safe default
+  // stamps, holding the content gate chat-wide for 60 s after every eval-case
+  // decision and re-opening the reworded-own-answer visible dup in that window.)
+  eval_case_applied: { decoupledCompletion: false },
+  eval_case_rejected: { decoupledCompletion: false },
+  eval_case_apply_failed: { decoupledCompletion: false },
   // Buzz co-channel (Phase 1): a Nostr kind:9 group message the buzz sidecar
   // injects onto the gateway IPC queue as its OWN live inbound turn (anonymous
   // inject, `meta.source="buzz"`) — never a decoupled completion resolving a

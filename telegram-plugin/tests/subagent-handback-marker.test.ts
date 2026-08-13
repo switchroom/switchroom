@@ -96,6 +96,14 @@ describe('inbound source classification (F1 durability)', () => {
     expect(stampsHandbackMarker('reaction')).toBe(false)
     expect(stampsHandbackMarker('resume_interrupted')).toBe(false)
     expect(stampsHandbackMarker('vault_grant_approved')).toBe(false)
+    // #4662 — the eval-case outcome inbounds. The exhaustiveness test below pins
+    // only their PRESENCE in the registry; these pin the VALUE, which is the part
+    // with runtime consequence: classified `true` (or left to the fail-safe
+    // default) they would hold the content gate chat-wide for 60 s after every
+    // operator tap on an eval-case card.
+    expect(stampsHandbackMarker('eval_case_applied')).toBe(false)
+    expect(stampsHandbackMarker('eval_case_rejected')).toBe(false)
+    expect(stampsHandbackMarker('eval_case_apply_failed')).toBe(false)
   })
 
   it('a normal user inbound (no meta.source) never stamps', () => {

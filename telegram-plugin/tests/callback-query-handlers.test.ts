@@ -25,7 +25,7 @@
  * broker call, which is exactly the behavior the extraction must not change.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { Context } from 'grammy'
 import {
   createCallbackQueryHandlers,
@@ -42,6 +42,10 @@ import { createSweepableCardStore } from '../gateway/approval-card-stores.js'
 import { createSweepableStore } from '../gateway/pending-state-stores.js'
 import { StagingMap } from '../secret-detect/staging.js'
 import { InlineKeyboard } from 'grammy'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { enqueueEvalCaseProposal } from '../../src/self-improve/eval-case-proposals.js'
 
 // Mock the auth-broker client so the `auth:use:` swap path is observable
 // (spy on setActive) without a live UDS broker. Only handleAuthDashboardCallback
@@ -622,6 +626,144 @@ describe('handleSkillProposalCallback', () => {
     const { ctx, raw } = makeCtx()
     await h.handleSkillProposalCallback(ctx, 'sp:bogus')
     expect(raw.answerCallbackQuery).toHaveBeenCalledWith({ text: 'Bad request' })
+  })
+})
+
+// ── evcase:* — eval-case proposal ───────────────────────────────────────
+//
+// The defect these pin: this handler was a copy of the skill handler that
+// dropped the `deliverResumeSyntheticOrBuffer` call, so BOTH exits — dismiss
+// and approve — edited the card and returned without telling the proposing
+// agent anything. The agent had been steered to end its turn and wait for a
+// wake-up that no code path sent. On unmodified code every assertion below on
+// `deliverResumeSyntheticOrBuffer` fails with 0 calls.
+//
+// `handleEvalCaseProposalCallback` reads the proposal store off disk (not from
+// an injected store), so these drive a REAL tmp state dir via the real
+// `enqueueEvalCaseProposal`. `TELEGRAM_STATE_DIR` is NOT one of
+// `agent-state-dir-guard`'s GUARDED_STATE_DIR_VARS, so the guard neither
+// redirects nor blocks it — setting it here is the whole isolation.
+
+describe('handleEvalCaseProposalCallback', () => {
+  let stateDir: string
+  let prevStateDir: string | undefined
+  let prevAgent: string | undefined
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'evcase-cb-'))
+    prevStateDir = process.env.TELEGRAM_STATE_DIR
+    prevAgent = process.env.SWITCHROOM_AGENT_NAME
+    process.env.TELEGRAM_STATE_DIR = stateDir
+    process.env.SWITCHROOM_AGENT_NAME = 'test-agent'
+  })
+
+  afterEach(() => {
+    if (prevStateDir == null) delete process.env.TELEGRAM_STATE_DIR
+    else process.env.TELEGRAM_STATE_DIR = prevStateDir
+    if (prevAgent == null) delete process.env.SWITCHROOM_AGENT_NAME
+    else process.env.SWITCHROOM_AGENT_NAME = prevAgent
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+
+  function seedProposal(over: { heldOut?: boolean } = {}) {
+    return enqueueEvalCaseProposal(stateDir, {
+      skill_slug: 'deploy-checklist',
+      skill_dir: join(stateDir, 'skills', 'deploy-checklist'),
+      case: { prompt: 'the correction, as an input' },
+      fingerprint: 'fp-1',
+      held_out: over.heldOut === true,
+    })
+  }
+
+  it('dismiss wakes the agent with an eval_case_rejected inbound', async () => {
+    const { deps } = makeDeps()
+    const h = createCallbackQueryHandlers(deps)
+    const p = seedProposal()
+    const { ctx } = makeCtx()
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:deny:${p.id}`)
+    expect(deps.deliverResumeSyntheticOrBuffer).toHaveBeenCalledWith(
+      'test-agent',
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          source: 'eval_case_rejected',
+          proposal_id: p.id,
+          skill_slug: 'deploy-checklist',
+        }),
+      }),
+    )
+  })
+
+  it('approve with a successful applier wakes the agent with eval_case_applied', async () => {
+    const runEvalCaseApply = vi.fn(() => ({ ok: true, out: 'added 1 case' }))
+    const { deps } = makeDeps({ runEvalCaseApply })
+    const h = createCallbackQueryHandlers(deps)
+    const p = seedProposal()
+    const { ctx } = makeCtx()
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:approve:${p.id}`)
+    expect(runEvalCaseApply).toHaveBeenCalledWith(p.id)
+    expect(deps.deliverResumeSyntheticOrBuffer).toHaveBeenCalledWith(
+      'test-agent',
+      expect.objectContaining({
+        meta: expect.objectContaining({ source: 'eval_case_applied', proposal_id: p.id }),
+      }),
+    )
+  })
+
+  it('approve with a failing applier wakes the agent with eval_case_apply_failed + the output', async () => {
+    const runEvalCaseApply = vi.fn(() => ({ ok: false, out: 'ENOENT: skill dir missing' }))
+    const { deps, injected } = makeDeps({ runEvalCaseApply })
+    const h = createCallbackQueryHandlers(deps)
+    const p = seedProposal()
+    const { ctx } = makeCtx()
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:approve:${p.id}`)
+    expect(deps.deliverResumeSyntheticOrBuffer).toHaveBeenCalledWith(
+      'test-agent',
+      expect.objectContaining({
+        meta: expect.objectContaining({ source: 'eval_case_apply_failed', proposal_id: p.id }),
+      }),
+    )
+    // The applier's own diagnosis reaches the agent, not just "it failed".
+    expect(injected[0]?.text).toContain('ENOENT: skill dir missing')
+  })
+
+  it('carries the card’s forum topic into the outcome inbound', async () => {
+    const { deps } = makeDeps()
+    const h = createCallbackQueryHandlers(deps)
+    const p = seedProposal()
+    const { ctx } = makeCtx({ threadId: 7 })
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:deny:${p.id}`)
+    expect(deps.deliverResumeSyntheticOrBuffer).toHaveBeenCalledWith(
+      'test-agent',
+      expect.objectContaining({
+        threadId: 7,
+        meta: expect.objectContaining({ message_thread_id: '7' }),
+      }),
+    )
+  })
+
+  it('a second tap injects nothing — the non-pending guard runs before every injection', async () => {
+    const runEvalCaseApply = vi.fn(() => ({ ok: true, out: '' }))
+    const { deps } = makeDeps({ runEvalCaseApply })
+    const h = createCallbackQueryHandlers(deps)
+    const p = seedProposal()
+    const { ctx } = makeCtx()
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:approve:${p.id}`)
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:approve:${p.id}`)
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:deny:${p.id}`)
+    expect(deps.deliverResumeSyntheticOrBuffer).toHaveBeenCalledTimes(1)
+    expect(runEvalCaseApply).toHaveBeenCalledTimes(1)
+  })
+
+  it('a non-allowlisted tapper neither applies nor wakes the agent', async () => {
+    const runEvalCaseApply = vi.fn(() => ({ ok: true, out: '' }))
+    const { deps } = makeDeps({ runEvalCaseApply })
+    const h = createCallbackQueryHandlers(deps)
+    const p = seedProposal()
+    const { ctx, raw } = makeCtx({ senderId: '999' })
+    await h.handleEvalCaseProposalCallback(ctx, `evcase:approve:${p.id}`)
+    expect(raw.answerCallbackQuery).toHaveBeenCalledWith({ text: 'Not authorized.' })
+    expect(runEvalCaseApply).not.toHaveBeenCalled()
+    expect(deps.deliverResumeSyntheticOrBuffer).not.toHaveBeenCalled()
   })
 })
 
