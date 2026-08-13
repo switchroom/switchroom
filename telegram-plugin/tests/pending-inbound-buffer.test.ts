@@ -1035,6 +1035,42 @@ describe('pending-inbound-buffer — approval-outcome eviction protection (PR D)
         index: 1, reason: 'non-outcome',
       })
     })
+
+    // Tier 2 vs tier 3. These two tiers agree on the victim whenever the queue
+    // is in `ts`-ascending order (the oldest entry is then also the stalest),
+    // so an in-order fixture CANNOT tell them apart — disabling the age bound
+    // entirely leaves such a test green (verified by mutation). The
+    // discriminating case is a queue whose head is FRESH and whose later entry
+    // is STALE.
+    it('prefers a STALE outcome over a fresher one queued ahead of it', () => {
+      const nowMs = 100 * 60 * 1000
+      const fresh = out(nowMs)
+      const stale = out(nowMs - 20 * 60 * 1000) // past the 15-min window
+      expect(selectEvictionVictim([fresh, stale], nowMs)).toEqual({
+        index: 1, reason: 'stale-outcome',
+      })
+    })
+
+    // The `reason` is not cosmetic: it is what the eviction log line reports,
+    // and it is the only signal distinguishing "dropped an outcome the spool
+    // already escalated" from "dropped a live one because there was nothing
+    // else". Pin it in the ordinary in-order shape too.
+    it('reports stale-outcome (not all-outcomes) when the victim is past its window', () => {
+      const nowMs = 100 * 60 * 1000
+      expect(
+        selectEvictionVictim([out(nowMs - 20 * 60 * 1000), out(nowMs)], nowMs).reason,
+      ).toBe('stale-outcome')
+    })
+
+    // The bound must actually be a bound: an outcome one millisecond inside
+    // the window is still protected, so tier 3 is what fires.
+    it('an outcome just INSIDE the window is not stale — falls through to tier 3', () => {
+      const nowMs = 100 * 60 * 1000
+      const justInside = out(nowMs - (APPROVAL_OUTCOME_PROTECTION_MS - 1))
+      expect(selectEvictionVictim([out(nowMs), justInside], nowMs)).toEqual({
+        index: 0, reason: 'all-outcomes',
+      })
+    })
   })
 })
 

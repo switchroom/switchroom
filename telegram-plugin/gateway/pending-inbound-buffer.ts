@@ -46,11 +46,22 @@ export const DEFAULT_PENDING_INBOUND_CAP = 32
  *
  * Matched to the inbound spool's default `escalateAfterMs`
  * (`inbound-spool.ts:286`, 15 min). Past that the spool has already escalated
- * the entry and tombstoned it, so holding a buffer slot for it buys nothing —
- * and holding it FOREVER is a live pin: a buffer that refuses to evict
- * outcomes can otherwise be parked at cap by one outcome that is never
- * drained (a bridge that never re-registers), starving every later message.
- * The age bound is what makes the protection self-releasing rather than a leak.
+ * the entry and tombstoned it, so holding a buffer slot for it buys nothing.
+ *
+ * What this bound is NOT: it is not what keeps the buffer live. Liveness is
+ * structural and belongs entirely to tier 3 of `selectEvictionVictim`, which
+ * returns `index 0` unconditionally — the buffer can never refuse to evict, so
+ * there is no live pin for an age bound to release. An earlier version of this
+ * comment claimed otherwise; it was wrong.
+ *
+ * What it actually buys is victim QUALITY within the all-outcomes tier: given a
+ * choice among outcomes, drop one the spool has already escalated rather than
+ * one still inside its delivery window. Note this only changes the victim when
+ * the queue is NOT in `ts`-ascending order — in normal insertion order the
+ * oldest entry is also the stalest, so tier 2 and tier 3 select the same index
+ * and differ only in the `reason` they report. The test `selectEvictionVictim
+ * tiers > prefers a STALE outcome over a fresher one queued ahead of it` pins
+ * the case where they diverge; without it, deleting this bound is invisible.
  */
 export const APPROVAL_OUTCOME_PROTECTION_MS = 15 * 60 * 1000
 
@@ -69,11 +80,16 @@ export type EvictionReason = 'non-outcome' | 'stale-outcome' | 'all-outcomes'
  *      a burst of user messages while a turn is in flight — this tier hits,
  *      so an outcome can no longer be evicted out from under an agent that
  *      is blocked on it.
- *   2. The oldest outcome past `protectMaxAgeMs`. Bounds the pin (above).
+ *   2. The oldest outcome past `protectMaxAgeMs` — one the spool has already
+ *      escalated, so it is the least costly outcome to lose. This tier is a
+ *      victim-QUALITY preference, NOT a liveness guarantee (tier 3 supplies
+ *      liveness); it only changes the choice when the queue is out of `ts`
+ *      order, since otherwise the oldest entry is also the stalest.
  *   3. Pathological: every entry is a fresh outcome. The oldest goes and the
  *      caller is told via `onEvictCritical` — a dropped outcome the agent is
  *      never informed of is a permanent block, which is strictly worse than
- *      a dropped outcome it knows about.
+ *      a dropped outcome it knows about. This tier returns UNCONDITIONALLY,
+ *      which is what guarantees the buffer always makes progress.
  *
  * Insertion order of the SURVIVORS is unchanged in every tier (a splice of
  * one element preserves relative order), so the FIFO contract `drain` and
