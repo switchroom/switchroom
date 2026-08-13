@@ -24,18 +24,80 @@
  *     5-minute delay, not a permanent stall.
  *
  * Per-agent cap prevents a never-reconnecting bridge from leaking
- * unbounded memory. When the cap is hit, the OLDEST entry is dropped
- * — the assumption is the freshest wake-up is the most relevant. A
- * dropped entry is logged via the provided logger.
+ * unbounded memory. When the cap is hit exactly one entry is dropped and
+ * logged via the provided logger. The victim is NOT simply the oldest —
+ * see `selectEvictionVictim`. "Oldest wins" was wrong precisely because
+ * the oldest entry is the one most likely to be a synthetic approval
+ * outcome that has been waiting through an entire turn, and an approval
+ * outcome is the one inbound class the operator cannot resend.
  */
 
 import type { InboundMessage } from './ipc-protocol.js'
 import type { InboundSpool } from './inbound-spool.js'
 import { stampsHandbackMarker } from './subagent-handback-marker.js'
+import { createApprovalOutcomeDropNotifier, isApprovalOutcome } from './approval-outcome-sources.js'
 
 /** Default cap per agent. Tuned for `should fit a reasonable backlog of
  *  approval cards stacked while bridge is offline` but no more. */
 export const DEFAULT_PENDING_INBOUND_CAP = 32
+
+/**
+ * How long an approval outcome keeps its eviction protection.
+ *
+ * Matched to the inbound spool's default `escalateAfterMs`
+ * (`inbound-spool.ts:286`, 15 min). Past that the spool has already escalated
+ * the entry and tombstoned it, so holding a buffer slot for it buys nothing —
+ * and holding it FOREVER is a live pin: a buffer that refuses to evict
+ * outcomes can otherwise be parked at cap by one outcome that is never
+ * drained (a bridge that never re-registers), starving every later message.
+ * The age bound is what makes the protection self-releasing rather than a leak.
+ */
+export const APPROVAL_OUTCOME_PROTECTION_MS = 15 * 60 * 1000
+
+/** Why `selectEvictionVictim` picked the entry it picked. */
+export type EvictionReason = 'non-outcome' | 'stale-outcome' | 'all-outcomes'
+
+/**
+ * Choose which buffered entry to evict when the cap is hit. Pure, so the
+ * tiering can be pinned exhaustively.
+ *
+ * Three tiers, in order:
+ *   1. The oldest entry that is NOT an approval outcome. An ordinary chat
+ *      message is resendable and its loss is already surfaced by the
+ *      coalesced `onEvict` notice; an approval outcome is not resendable at
+ *      all (see approval-outcome-sources.ts). In every realistic overflow —
+ *      a burst of user messages while a turn is in flight — this tier hits,
+ *      so an outcome can no longer be evicted out from under an agent that
+ *      is blocked on it.
+ *   2. The oldest outcome past `protectMaxAgeMs`. Bounds the pin (above).
+ *   3. Pathological: every entry is a fresh outcome. The oldest goes and the
+ *      caller is told via `onEvictCritical` — a dropped outcome the agent is
+ *      never informed of is a permanent block, which is strictly worse than
+ *      a dropped outcome it knows about.
+ *
+ * Insertion order of the SURVIVORS is unchanged in every tier (a splice of
+ * one element preserves relative order), so the FIFO contract `drain` and
+ * `planBufferedRedelivery` rely on still holds.
+ *
+ * Returns index 0 on an empty queue; the caller's `splice` then yields
+ * `undefined` and is guarded, matching the previous `q.shift()` behaviour.
+ */
+export function selectEvictionVictim(
+  q: readonly InboundMessage[],
+  nowMs: number,
+  protectMaxAgeMs: number = APPROVAL_OUTCOME_PROTECTION_MS,
+): { index: number; reason: EvictionReason } {
+  for (let i = 0; i < q.length; i++) {
+    if (!isApprovalOutcome(q[i]!)) return { index: i, reason: 'non-outcome' }
+  }
+  for (let i = 0; i < q.length; i++) {
+    const ts = q[i]!.ts
+    if (typeof ts === 'number' && Number.isFinite(ts) && nowMs - ts >= protectMaxAgeMs) {
+      return { index: i, reason: 'stale-outcome' }
+    }
+  }
+  return { index: 0, reason: 'all-outcomes' }
+}
 
 export interface PendingInboundBuffer {
   /** Append `msg` to `agent`'s queue. Returns true if accepted, false if
@@ -88,8 +150,46 @@ export interface PendingInboundBufferOptions {
    * drop into a visible deferral (chat-is-the-single-source-of-truth:
    * surface the loss window, don't hide it). Best-effort: a throw here
    * never breaks the push hot path.
+   *
+   * Fires ONLY for a non-outcome eviction. When the victim is an approval
+   * outcome, `onEvictCritical` fires INSTEAD — the two notices would
+   * contradict each other otherwise. `onEvict`'s copy promises the message is
+   * "saved and will be handled … I'll ask you to resend it", which is exactly
+   * the promise that cannot be kept for a dropped approval outcome (the
+   * operator's tap already happened; there is nothing to resend).
    */
   onEvict?: (agent: string, evicted: InboundMessage) => void
+  /**
+   * DEFAULTS ON — leave it unset and `createPendingInboundBuffer` wires
+   * `createApprovalOutcomeDropNotifier` against its own `push`. Set it to
+   * override the notice, or to an explicit no-op to opt out.
+   *
+   * Called instead of `onEvict` when the evicted entry is an APPROVAL OUTCOME
+   * — either a stale one past `approvalOutcomeProtectionMs`, or the
+   * pathological case where every buffered entry is a fresh outcome so there
+   * is nothing else to drop.
+   *
+   * This is the one eviction the spool cannot make good on: `sweepEscalations`
+   * (`inbound-spool.ts:564-600`) tombstones and posts "couldn't deliver, please
+   * resend", which is meaningless for a `vault_grant_approved`. The gateway
+   * wires this to a distinct greppable log plus a synthetic notice inbound so
+   * the agent learns the outcome is gone rather than blocking on it forever.
+   *
+   * RE-ENTRANCY: the handler MUST NOT push into this buffer inside the call
+   * frame — it is invoked from the middle of `push`, on a queue that is at cap.
+   * Defer with `queueMicrotask`. The `try/catch` around this call protects the
+   * hot path from a throw; it does nothing against recursion.
+   *
+   * Best-effort: a throw here never breaks the push hot path.
+   */
+  onEvictCritical?: (agent: string, evicted: InboundMessage) => void
+  /**
+   * How long an approval outcome resists eviction. Defaults to
+   * `APPROVAL_OUTCOME_PROTECTION_MS` (the spool's escalation window).
+   */
+  approvalOutcomeProtectionMs?: number
+  /** Clock seam for the age bound. Defaults to `Date.now`. */
+  now?: () => number
   /**
    * fix/backstop-duplicate-reply MUST-FIX 2 — called on every push of a
    * `subagent_handback` envelope (live synthesis AND boot-replay re-push),
@@ -364,9 +464,11 @@ export function createPendingInboundBuffer(
   const cap = opts.capPerAgent ?? DEFAULT_PENDING_INBOUND_CAP
   const log = opts.log ?? ((line: string) => process.stderr.write(line))
   const spool = opts.spool
+  const now = opts.now ?? (() => Date.now())
+  const protectionMs = opts.approvalOutcomeProtectionMs ?? APPROVAL_OUTCOME_PROTECTION_MS
   const queues = new Map<string, InboundMessage[]>()
 
-  return {
+  const buffer: PendingInboundBuffer = {
     push(agent, msg) {
       let q = queues.get(agent)
       if (q == null) {
@@ -375,11 +477,17 @@ export function createPendingInboundBuffer(
       }
       let evicted = false
       if (q.length >= cap) {
-        const dropped = q.shift()
+        // Victim selection is TIERED, not `q.shift()`. The oldest entry is
+        // exactly the one most likely to be an approval outcome that has been
+        // waiting through an entire turn — and an approval outcome is the one
+        // inbound class the operator cannot resend. See selectEvictionVictim.
+        const { index, reason } = selectEvictionVictim(q, now(), protectionMs)
+        const dropped = q.splice(index, 1)[0]
         evicted = true
         log(
           `pending-inbound-buffer: agent=${agent} cap=${cap} reached — ` +
-          `dropped oldest entry source=${dropped?.meta?.source ?? '-'} ts=${dropped?.ts ?? '-'}\n`,
+          `dropped entry idx=${index} reason=${reason} ` +
+          `source=${dropped?.meta?.source ?? '-'} ts=${dropped?.ts ?? '-'}\n`,
         )
         // #2789 A: the cap eviction is no longer a SILENT in-session
         // drop. `dropped` still lives in the durable spool (it was
@@ -387,11 +495,19 @@ export function createPendingInboundBuffer(
         // escalation — but it won't be re-delivered THIS session. Hand
         // it to the caller so a coalesced "N messages deferred" notice
         // can be surfaced. Best-effort: never let the notice break push.
-        if (dropped != null && opts.onEvict != null) {
-          try {
-            opts.onEvict(agent, dropped)
-          } catch {
-            /* user-facing notice is best-effort; never break the hot path */
+        //
+        // An APPROVAL OUTCOME victim routes to `onEvictCritical` instead: the
+        // "saved, I'll ask you to resend" copy behind `onEvict` is a promise
+        // that cannot be kept for a verdict the operator already tapped.
+        if (dropped != null) {
+          const critical = reason !== 'non-outcome'
+          const cb = critical ? onEvictCritical : opts.onEvict
+          if (cb != null) {
+            try {
+              cb(agent, dropped)
+            } catch {
+              /* user-facing notice is best-effort; never break the hot path */
+            }
           }
         }
       }
@@ -453,4 +569,28 @@ export function createPendingInboundBuffer(
     },
     beforeRedeliver: opts.beforeRedeliver,
   }
+
+  // The critical-eviction notifier DEFAULTS ON, wired to this buffer's own
+  // `push`. Same reasoning as `beforeRedeliver` and the handback-marker stamp
+  // above: the guarantee we want is "a dropped approval outcome is never
+  // silent", and a guarantee that depends on each construction site
+  // remembering to pass a callback is discipline, not a mechanism. Defaulting
+  // it here makes it true by construction at every site, including future ones.
+  //
+  // A caller may still override to route the notice elsewhere. Passing an
+  // explicit no-op is the (deliberately explicit) way to opt out.
+  //
+  // The buffer can self-wire because it owns `push` — no caller plumbing, and
+  // notably no new inline code in gateway.ts, which is under a hard line
+  // ratchet (`scripts/check-gateway-line-ratchet.mjs`) with 2 lines of grace.
+  const onEvictCritical =
+    opts.onEvictCritical ??
+    createApprovalOutcomeDropNotifier({
+      push: (a, m) => {
+        buffer.push(a, m)
+      },
+      log,
+    })
+
+  return buffer
 }
