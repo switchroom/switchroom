@@ -7758,6 +7758,525 @@ print(
 )
 PYEOF
 
+# ─────────────────────────────────────────────────────────────────────────────
+# UPSTREAM PATCH — periodic graph-maintenance sweep (#4624 follow-up).
+#
+# THE DEFECT, in the shipping source at the pinned digest.
+#
+# `graph_maintenance` is ENQUEUE-DRIVEN and nothing else.
+# `submit_async_graph_maintenance` (engine/memory_engine.py) short-circuits with
+# `{"operation_id": None, "no_work": True}` whenever `graph_maintenance_queue`
+# is empty for the bank, and every caller reaches it from a unit-removal or
+# source-memory-unit path. There is NO interval scheduler anywhere:
+# engine/maintenance.py runs retention, operation cleanup, cross-store txn
+# recovery, the consolidation reconcile and the scheduled mental-model refresh —
+# and no graph job at all.
+#
+# So a bank that stops REMOVING units stops being maintained. For ever. That is
+# not a cosmetic gap: Pass 2 (orphan-entity prune) and Pass 3 (stale-cooccurrence
+# prune) are BANK-WIDE and need no queue rows whatsoever, so everything they
+# would have reclaimed simply leaks, permanently, in a bank that is otherwise
+# busy retaining and consolidating.
+#
+# MEASURED on this fleet, 2026-08-13. Of 12 active banks, only `marko` and
+# `gymbro` had run graph maintenance in the 70 minutes since the v0.21.8 roll.
+# Bank `klanker` had made ZERO attempts since 2026-08-08 — five days — with a
+# `graph_maintenance_queue` count of 0, while actively retaining and
+# consolidating throughout. Before that quiet period it failed 9 consecutive
+# times with an empty `error_message`; a later overlord row shows that to be
+# `TimeoutError raised with no message (task_type=graph_maintenance)`, i.e. the
+# 60s asyncpg command_timeout #4624 fixed. #4624 made the sweep FINISH. Nothing
+# made it RUN.
+#
+# WHAT THIS ADDS. One more job on the existing 60s maintenance tick, alongside
+# the consolidation reconcile it is modelled on: find banks whose last
+# `graph_maintenance` attempt is older than a configurable interval and submit
+# one, with `force_sweep=True`.
+#
+#   - `force_sweep=True`, NOT fake queue rows. Upstream already has that flag
+#     for exactly this shape of caller (one whose sweep-worthy work is invisible
+#     to the queue — see its docstring, and the unit-removal callers that pass
+#     it). Inserting synthetic `graph_maintenance_queue` rows to trick the
+#     short-circuit would put Pass 1 to work relinking units that need nothing.
+#
+#   - The submitted job is #4624's BOUNDED, slice-rotating sweep, unchanged.
+#     This patch changes WHEN a sweep runs; it does not touch how much any one
+#     sweep does. No unbounded sweep is reintroduced.
+#
+#   - NO STAMPEDE, two independent mechanisms. (a) A hard per-tick cap
+#     (`graph_maintenance_sweep_max_banks_per_tick`, default 2) bounds how many
+#     banks can be submitted per 60s tick no matter how many are due — 12 banks
+#     all due at once drain over six minutes, not one instant. (b) A
+#     deterministic per-bank, per-cycle phase jitter of 0-25% of the interval,
+#     computed IN SQL from `md5(bank_id || last_attempt)`, so banks do not
+#     re-synchronise after a fleet restart and a single bank's sweeps are not a
+#     fixed period. The second matters beyond politeness: #4624's slice index is
+#     `int(now) // 120 % slice_count`, so an exactly-periodic submitter aliases
+#     against that grid — at a flat 3600s interval a 21-slice bank advances 30
+#     slices per run, gcd(30, 21) = 3, and would visit only 7 of its 21 slices,
+#     ever. The jitter is what stops the periodic caller from being worse than
+#     the demand-driven one it backstops.
+#
+#   - IDEMPOTENT against a sweep already in flight, twice over. The discovery
+#     query excludes any bank with a `pending` OR `processing` graph_maintenance
+#     operation, and the submit itself goes through upstream's
+#     `dedupe_by_bank=True`, which re-checks for a pending row under the bank's
+#     `FOR NO KEY UPDATE` lock. The maintenance loop runs in EVERY api/worker
+#     process with no leader election (see the module docstring), so both are
+#     needed: the discovery read is a snapshot every process sees identically,
+#     and only the locked insert can break the tie.
+#
+#   - Due-ness is measured from the last ATTEMPT (`created_at`), not the last
+#     success. A bank whose sweeps are failing must be retried on the interval,
+#     not on every tick — #4604 removed a 9x retry storm around this exact job
+#     and this must not quietly reinstate one.
+#
+#   - A SUBMIT THAT RAISES STILL RECORDS AN ATTEMPT. Upstream writes the
+#     async_operations row only AFTER `_authenticate_tenant` and
+#     `_validate_operation`, so a bank whose submit dies in either records
+#     nothing, keeps a NULL last attempt, and — the discovery orders NULLS
+#     FIRST — sits at the head of the queue for ever. Two such banks consume the
+#     whole per-tick cap on every tick and every OTHER bank silently stops being
+#     swept: this job's own defect, reinstated, with a log line as the signal.
+#     The failure path therefore writes the failed attempt itself, into
+#     async_operations, where it is durable, visible to every process (no leader
+#     election here) and read by the one due-ness clock — so the failing bank is
+#     DELAYED by an interval, never banished.
+#
+# Behavioural proof, RED against unpatched upstream:
+# tests/docker/hindsight-graph-maintenance-interval-sweep.test.ts.
+RUN python3 - <<'PYEOF'
+import pathlib
+
+TAG = "switchroom hindsight graph-maintenance interval sweep patch"
+BASE = pathlib.Path("/app/api/hindsight_api")
+
+
+def apply(rel, edits, expect=1):
+    f = BASE / rel
+    s = f.read_text()
+    for anchor, repl in edits:
+        n = s.count(anchor)
+        assert n == expect, (
+            f"{TAG}: anchor found {n}x (expected {expect}) in {rel} — upstream drifted; "
+            f"re-author this patch in docker/Dockerfile.hindsight. "
+            f"Anchor head: {anchor.splitlines()[0]!r}"
+        )
+        s = s.replace(anchor, repl, expect)
+    f.write_text(s)
+    return s
+
+
+# ───────────────────────────────────────────── 1. config.py: the two knobs
+apply("config.py", [
+    (
+        'ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS"\n',
+
+        'ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS"\n'
+        "# switchroom: the periodic graph-maintenance sweep (see MaintenanceLoop._run_graph_sweep).\n"
+        "ENV_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS = (\n"
+        '    "HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS"\n'
+        ")\n"
+        "ENV_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK = (\n"
+        '    "HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK"\n'
+        ")\n",
+    ),
+    (
+        "DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS = 60\n",
+
+        "DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS = 60\n"
+        "\n"
+        "# switchroom: how stale a bank's LAST graph-maintenance ATTEMPT must be before the\n"
+        "# maintenance loop forces a sweep for it. Upstream has no interval scheduler for\n"
+        "# graph maintenance at all — the job only ever fires when a unit removal enqueues\n"
+        "# relink work — so a bank that goes quiet stops being swept for ever and the\n"
+        "# bank-wide orphan-entity and stale-cooccurrence passes leak permanently.\n"
+        "# 0 disables the sweep and restores exact upstream behaviour.\n"
+        "#\n"
+        "# One hour, not a day: #4624 cuts a large bank into up to 24 rotating hash slices\n"
+        "# and one run sweeps ONE of them, so the interval is the rotation step, not the\n"
+        "# coverage period. At 3600s the fleet's largest bank (21 slices) expects full\n"
+        "# coverage in ~3 days; at 86400s it would be ~11 weeks, which is not maintenance.\n"
+        "DEFAULT_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS = 3600\n"
+        "\n"
+        "# switchroom: hard cap on how many banks the sweep may submit per 60s maintenance\n"
+        "# tick, however many are due. This is the anti-stampede bound: 12 banks that all\n"
+        "# come due together (a fleet restart, or the first tick after this ships) drain\n"
+        "# over minutes instead of landing on the database at once. Steady-state supply at\n"
+        "# the default interval is ~0.2 banks/minute for a 12-bank fleet, well under this.\n"
+        "# This is NOT an off switch: values below 1 are floored to 1, so a fat-fingered 0\n"
+        "# cannot silently disable graph maintenance fleet-wide — which is exactly the\n"
+        "# defect this job exists to fix. Set the INTERVAL to 0 to turn the sweep off.\n"
+        "DEFAULT_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK = 2\n",
+    ),
+    (
+        "    mental_model_refresh_tick_seconds: int\n",
+
+        "    mental_model_refresh_tick_seconds: int\n"
+        "    # switchroom: interval floor for the periodic graph-maintenance sweep, measured\n"
+        "    # from each bank's last ATTEMPT. 0 = disabled (exact upstream behaviour).\n"
+        "    graph_maintenance_sweep_interval_seconds: int\n"
+        "    # switchroom: per-tick cap on banks submitted by that sweep (anti-stampede).\n"
+        "    graph_maintenance_sweep_max_banks_per_tick: int\n",
+    ),
+    (
+        "            mental_model_refresh_tick_seconds=int(\n"
+        "                os.getenv(\n"
+        "                    ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS,\n"
+        "                    str(DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS),\n"
+        "                )\n"
+        "            ),\n",
+
+        "            mental_model_refresh_tick_seconds=int(\n"
+        "                os.getenv(\n"
+        "                    ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS,\n"
+        "                    str(DEFAULT_MENTAL_MODEL_REFRESH_TICK_SECONDS),\n"
+        "                )\n"
+        "            ),\n"
+        "            # switchroom: periodic graph-maintenance sweep.\n"
+        "            graph_maintenance_sweep_interval_seconds=int(\n"
+        "                os.getenv(\n"
+        "                    ENV_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS,\n"
+        "                    str(DEFAULT_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS),\n"
+        "                )\n"
+        "            ),\n"
+        "            graph_maintenance_sweep_max_banks_per_tick=int(\n"
+        "                os.getenv(\n"
+        "                    ENV_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK,\n"
+        "                    str(DEFAULT_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK),\n"
+        "                )\n"
+        "            ),\n",
+    ),
+])
+
+
+# ────────────────────────────────── 2. maintenance.py: the job on the tick
+apply("engine/maintenance.py", [
+    # 2a. The discovery statement + the tick constant, beside the other job constants.
+    (
+        "# A pending txn is left alone for this long from first sighting before the sweep aborts an\n"
+        "# unwitnessed one — the writer may still be mid-flight (PendingTxn carries no timestamp).\n"
+        "_TXN_RECOVERY_GRACE_SECONDS = 300\n",
+
+        "# A pending txn is left alone for this long from first sighting before the sweep aborts an\n"
+        "# unwitnessed one — the writer may still be mid-flight (PendingTxn carries no timestamp).\n"
+        "_TXN_RECOVERY_GRACE_SECONDS = 300\n"
+        "# switchroom: how often the periodic graph-maintenance sweep CHECKS. Per-bank\n"
+        "# due-ness is the much longer cfg.graph_maintenance_sweep_interval_seconds; this\n"
+        "# is only the granularity at which a bank that became due gets noticed.\n"
+        "_GRAPH_SWEEP_TICK_SECONDS = 60\n"
+        "\n"
+        "# switchroom: banks whose last graph_maintenance ATTEMPT is older than the\n"
+        "# configured interval and that have nothing in flight, oldest first.\n"
+        "#\n"
+        "# $1 interval seconds, $2 per-tick cap. Both are bound parameters, never\n"
+        "# interpolated. The only interpolation is the two fully-qualified table names,\n"
+        "# which come from fq_table_explicit over a schema the tenant extension reported.\n"
+        "#\n"
+        "# THE JITTER TERM. `md5(bank_id || last_attempt)` gives a deterministic 0-255\n"
+        "# that every process computes identically (no leader election here — see the\n"
+        "# module docstring) and that CHANGES each cycle, because last_attempt does. It\n"
+        "# stretches the effective interval to 1.0-1.25x. Both properties are load-bearing:\n"
+        "# per-BANK variation stops 12 banks re-synchronising after a restart, and\n"
+        "# per-CYCLE variation stops one bank's sweeps forming an exact period, which\n"
+        "# would alias against the `int(now) // 120 % slice_count` slice clock #4624\n"
+        "# rotates on and pin the bank to a strict subset of its slices for ever.\n"
+        "#\n"
+        "# `created_at`, not `completed_at`: the interval must rate-limit ATTEMPTS. A bank\n"
+        "# whose sweeps fail would otherwise be resubmitted every single tick, which is\n"
+        "# the retry storm #4604 removed.\n"
+        "#\n"
+        "# Indexes: idx_async_operations_bank_created_desc (bank_id, created_at DESC) for\n"
+        "# the LATERAL, idx_async_operations_bank_status for the NOT EXISTS. No new\n"
+        "# migration, and therefore nothing for this patch to install at boot.\n"
+        "_GRAPH_SWEEP_DUE_SQL = \"\"\"\n"
+        "SELECT b.bank_id\n"
+        "FROM {banks} b\n"
+        "LEFT JOIN LATERAL (\n"
+        "    SELECT o.created_at\n"
+        "    FROM {ops} o\n"
+        "    WHERE o.bank_id = b.bank_id AND o.operation_type = 'graph_maintenance'\n"
+        "    ORDER BY o.created_at DESC\n"
+        "    LIMIT 1\n"
+        ") last ON TRUE\n"
+        "WHERE NOT EXISTS (\n"
+        "    SELECT 1 FROM {ops} p\n"
+        "    WHERE p.bank_id = b.bank_id\n"
+        "      AND p.operation_type = 'graph_maintenance'\n"
+        "      AND p.status IN ('pending', 'processing')\n"
+        ")\n"
+        "  AND (\n"
+        "    last.created_at IS NULL\n"
+        "    OR last.created_at < NOW() - make_interval(secs =>\n"
+        "        $1::float8 * (1.0 + (('x' || substr(\n"
+        "            md5(b.bank_id || COALESCE(last.created_at::text, '')), 1, 4\n"
+        "        ))::bit(16)::int % 256) / 1024.0)\n"
+        "    )\n"
+        "  )\n"
+        "ORDER BY last.created_at ASC NULLS FIRST, b.bank_id\n"
+        "LIMIT $2\n"
+        '"""\n'
+        "\n"
+        "# switchroom: the failed ATTEMPT a submit that raised never got to write.\n"
+        "#\n"
+        "# Upstream only inserts the async_operations row AFTER _authenticate_tenant and\n"
+        "# _validate_operation, so a bank whose submit dies in either records NOTHING.\n"
+        "# Its last attempt stays NULL and — the discovery orders NULLS FIRST — it sits\n"
+        "# at the head of the queue for ever. Two such banks eat the whole per-tick cap\n"
+        "# on every tick and every OTHER bank silently stops being swept: precisely the\n"
+        "# starvation this job exists to fix, reinstated, with a log line as the signal.\n"
+        "#\n"
+        "# The ledger IS async_operations, so the record goes there rather than into\n"
+        "# process memory: it is durable across restarts, EVERY process sees it (this\n"
+        "# loop has no leader election), it re-uses the one due-ness clock so the bank is\n"
+        "# retried on the INTERVAL instead of being banished, and it makes a wedged bank\n"
+        "# visible to the same query an operator already reaches for.\n"
+        "#\n"
+        "# status 'failed' is deliberate and is on every backend's status CHECK\n"
+        "# constraint. It is NOT claimable (the worker claims 'pending' rows with a\n"
+        "# non-null task_payload) and it does NOT suppress the next sweep (the in-flight\n"
+        "# exclusion above is 'pending'/'processing' only) — it only moves the bank off\n"
+        "# NULL. completed_at is set so operation cleanup reaps these like any other\n"
+        "# terminal row; operation_id and created_at come from their column defaults.\n"
+        "_GRAPH_SWEEP_FAILED_ATTEMPT_SQL = \"\"\"\n"
+        "INSERT INTO {ops} (bank_id, operation_type, status, error_message, completed_at)\n"
+        "VALUES ($1, 'graph_maintenance', 'failed', $2, NOW())\n"
+        '"""\n',
+    ),
+    # 2b. Enable the loop when this is the only job configured on.
+    (
+        "        op_cleanup_on = cfg.operation_retention_days > 0\n"
+        "        return (\n"
+        "            reconcile_on\n",
+
+        "        op_cleanup_on = cfg.operation_retention_days > 0\n"
+        "        # switchroom: the periodic graph-maintenance sweep is a job like any other\n"
+        "        # here — a deployment with only this one enabled must still start the loop.\n"
+        "        graph_sweep_on = getattr(cfg, \"graph_maintenance_sweep_interval_seconds\", 0) > 0\n"
+        "        return (\n"
+        "            graph_sweep_on\n"
+        "            or reconcile_on\n",
+    ),
+    # 2c. Run it on the tick.
+    (
+        "        if cfg.operation_retention_days > 0 and self._is_due(\"operation_cleanup\", _OPERATION_CLEANUP_INTERVAL_SECONDS):\n"
+        "            await self._run_timed(\"operation cleanup\", self._run_operation_cleanup(cfg))\n",
+
+        "        if cfg.operation_retention_days > 0 and self._is_due(\"operation_cleanup\", _OPERATION_CLEANUP_INTERVAL_SECONDS):\n"
+        "            await self._run_timed(\"operation cleanup\", self._run_operation_cleanup(cfg))\n"
+        "        # switchroom: periodic graph-maintenance sweep.\n"
+        "        if getattr(cfg, \"graph_maintenance_sweep_interval_seconds\", 0) > 0 and self._is_due(\n"
+        "            \"graph_sweep\", _GRAPH_SWEEP_TICK_SECONDS\n"
+        "        ):\n"
+        "            await self._run_timed(\"graph maintenance sweep\", self._run_graph_sweep(cfg))\n",
+    ),
+    # 2d. The job itself, ahead of the consolidation reconcile it is modelled on.
+    (
+        "    # ── consolidation reconcile ──────────────────────────────────────────────\n",
+
+        "    # ── periodic graph-maintenance sweep (switchroom) ────────────────────────\n"
+        "\n"
+        "    async def _run_graph_sweep(self, cfg: HindsightConfig) -> None:\n"
+        '        """switchroom: force a graph-maintenance sweep for banks that have gone quiet.\n'
+        "\n"
+        "        Upstream's ``submit_async_graph_maintenance`` is ENQUEUE-DRIVEN: it returns\n"
+        "        ``no_work=True`` when ``graph_maintenance_queue`` is empty for the bank, and\n"
+        "        every caller reaches it from a unit-removal path. A bank that stops removing\n"
+        "        units therefore stops being maintained for ever — and Passes 2 and 3\n"
+        "        (orphan-entity and stale-cooccurrence pruning) are bank-wide and need no\n"
+        "        queue rows at all, so what they would reclaim leaks permanently.\n"
+        "\n"
+        "        Measured 2026-08-13: of 12 active banks on one fleet only 2 had run graph\n"
+        "        maintenance in the 70 minutes since the v0.21.8 roll, and one bank had made\n"
+        "        zero attempts in five days with a queue count of 0 while retaining and\n"
+        "        consolidating throughout.\n"
+        "\n"
+        "        This is the missing floor. It submits with ``force_sweep=True`` — the flag\n"
+        "        upstream already provides for callers whose sweep-worthy work is invisible\n"
+        "        to the queue — rather than fabricating queue rows, which would put Pass 1 to\n"
+        "        work relinking units that need nothing.\n"
+        "\n"
+        "        The job it submits is the bounded, slice-rotating sweep; this changes WHEN a\n"
+        "        sweep runs, never how much one does.\n"
+        '        """\n'
+        "        interval = getattr(cfg, \"graph_maintenance_sweep_interval_seconds\", 0)\n"
+        "        if interval <= 0:\n"
+        "            return\n"
+        "        limit = max(1, getattr(cfg, \"graph_maintenance_sweep_max_banks_per_tick\", 1))\n"
+        "        engine = self._engine\n"
+        "\n"
+        "        # Only schemas the worker actually polls, for the same reason the reconcile\n"
+        "        # above restricts itself: an operation inserted into a schema nobody polls is\n"
+        "        # never claimed, and — because it stays `pending` — it would then block this\n"
+        "        # bank's every future sweep through the in-flight exclusion below.\n"
+        "        try:\n"
+        "            tenants = await engine._tenant_extension.list_tenants()\n"
+        "        except Exception as e:\n"
+        "            logger.warning(f\"Graph maintenance sweep tenant discovery failed: {e}\")\n"
+        "            return\n"
+        "        default_schema = get_config().database_schema\n"
+        "        targets: list[tuple[str, str | None]] = [(default_schema, None)]\n"
+        "        targets += [(t.schema, t.tenant_id) for t in tenants if t.schema != default_schema]\n"
+        "\n"
+        "        from .memory_engine import _current_schema\n"
+        "\n"
+        "        submitted = 0\n"
+        "        deduplicated = 0\n"
+        "        for schema, tenant_id in targets:\n"
+        "            token = _current_schema.set(schema)\n"
+        "            try:\n"
+        "                async with acquire_with_retry(engine._backend, max_retries=1) as conn:\n"
+        "                    rows = await conn.fetch(\n"
+        "                        _GRAPH_SWEEP_DUE_SQL.format(\n"
+        "                            banks=fq_table_explicit(\"banks\", schema),\n"
+        "                            ops=fq_table_explicit(\"async_operations\", schema),\n"
+        "                        ),\n"
+        "                        float(interval),\n"
+        "                        limit,\n"
+        "                    )\n"
+        "                for row in rows:\n"
+        "                    bank_id = row[\"bank_id\"]\n"
+        "                    try:\n"
+        "                        context = RequestContext(internal=True, tenant_id=tenant_id)\n"
+        "                        # force_sweep: the queue is empty by construction for a quiet\n"
+        "                        # bank, and without this the submit short-circuits to no_work\n"
+        "                        # and this whole job would be a no-op.\n"
+        "                        result = await engine.submit_async_graph_maintenance(\n"
+        "                            bank_id=bank_id, request_context=context, force_sweep=True\n"
+        "                        )\n"
+        "                        if result.get(\"deduplicated\"):\n"
+        "                            deduplicated += 1\n"
+        "                        else:\n"
+        "                            submitted += 1\n"
+        "                    except Exception as e:\n"
+        "                        logger.warning(\n"
+        "                            f\"Graph maintenance sweep failed for bank {bank_id} in {schema}: {e}\"\n"
+        "                        )\n"
+        "                        # …and record the ATTEMPT the aborted submit never wrote.\n"
+        "                        # Without this the bank keeps a NULL last-attempt, sorts\n"
+        "                        # first under NULLS FIRST for ever, and two such banks\n"
+        "                        # consume the whole per-tick cap on every tick — the same\n"
+        "                        # starvation this job exists to fix, with a log line as the\n"
+        "                        # only signal. See _GRAPH_SWEEP_FAILED_ATTEMPT_SQL.\n"
+        "                        await self._record_failed_graph_sweep(schema, bank_id, e)\n"
+        "            except Exception as e:\n"
+        "                logger.warning(f\"Graph maintenance sweep discovery failed for schema {schema}: {e}\")\n"
+        "            finally:\n"
+        "                _current_schema.reset(token)\n"
+        "\n"
+        "        if submitted or deduplicated:\n"
+        "            logger.info(\n"
+        "                f\"Graph maintenance sweep: scheduled {submitted} bank(s)\"\n"
+        "                + (f\", {deduplicated} already queued\" if deduplicated else \"\")\n"
+        "            )\n"
+        "\n"
+        "    async def _record_failed_graph_sweep(\n"
+        "        self, schema: str, bank_id: str, error: BaseException\n"
+        "    ) -> None:\n"
+        '        """switchroom: write the failed ATTEMPT an aborted submit never got to write.\n'
+        "\n"
+        "        Upstream inserts the async_operations row only AFTER _authenticate_tenant\n"
+        "        and _validate_operation, so a submit that raises in either leaves the bank\n"
+        "        with a NULL last attempt. The discovery orders NULLS FIRST, so that bank\n"
+        "        then sits at the head of the queue permanently: two of them consume the\n"
+        "        whole per-tick cap on every tick and every other bank stops being swept —\n"
+        "        the starvation this job exists to fix, reinstated.\n"
+        "\n"
+        "        Recording the attempt in async_operations (rather than in process memory)\n"
+        "        is what makes the rate-limit durable, shared by every process, visible to\n"
+        "        an operator, and — because it re-uses the one due-ness clock — a DELAY of\n"
+        "        one interval rather than a permanent exclusion.\n"
+        "\n"
+        "        Best effort by construction: this runs inside the per-bank failure path and\n"
+        "        must never abort the rest of the wave.\n"
+        '        """\n'
+        "        message = (\n"
+        "            f\"graph maintenance sweep submit failed: {type(error).__name__}: {error}\"\n"
+        "        )[:4000]\n"
+        "        try:\n"
+        "            async with acquire_with_retry(self._engine._backend, max_retries=1) as conn:\n"
+        "                await conn.execute(\n"
+        "                    _GRAPH_SWEEP_FAILED_ATTEMPT_SQL.format(\n"
+        "                        ops=fq_table_explicit(\"async_operations\", schema)\n"
+        "                    ),\n"
+        "                    bank_id,\n"
+        "                    message,\n"
+        "                )\n"
+        "        except Exception as e:\n"
+        "            # The bank keeps its NULL last attempt for now and will be retried on\n"
+        "            # the next tick. Loud, because a persistent failure here is what would\n"
+        "            # let the starvation back in.\n"
+        "            logger.warning(\n"
+        "                f\"Graph maintenance sweep could not record the failed attempt for \"\n"
+        "                f\"bank {bank_id} in {schema}: {e}\"\n"
+        "            )\n"
+        "\n"
+        "    # ── consolidation reconcile ──────────────────────────────────────────────\n",
+    ),
+])
+
+
+# ─────────────────────────────────────────────────────── post-conditions
+cfg_src = (BASE / "config.py").read_text()
+for name in (
+    "ENV_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS",
+    "DEFAULT_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS",
+    "graph_maintenance_sweep_interval_seconds",
+    "graph_maintenance_sweep_max_banks_per_tick",
+):
+    assert name in cfg_src, f"{TAG}: {name} is missing from config.py"
+assert '"HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS"' in cfg_src, (
+    f"{TAG}: the interval knob does not follow the HINDSIGHT_API_* env convention"
+)
+
+mnt = (BASE / "engine/maintenance.py").read_text()
+assert "async def _run_graph_sweep" in mnt, f"{TAG}: the sweep job is missing"
+assert "force_sweep=True" in mnt, (
+    f"{TAG}: the submit does not force the sweep — it would short-circuit on the empty "
+    "queue of exactly the quiet banks this job exists to reach, and do nothing at all"
+)
+assert "_GRAPH_SWEEP_DUE_SQL.format(" in mnt, f"{TAG}: the discovery statement is not used"
+assert "self._run_graph_sweep(cfg)" in mnt, f"{TAG}: the job is never run from the tick"
+assert "'pending', 'processing'" in mnt, (
+    f"{TAG}: the discovery no longer excludes in-flight sweeps — a bank with a running "
+    "sweep would be resubmitted every tick"
+)
+assert "md5(b.bank_id || COALESCE(last.created_at::text, '')" in mnt, (
+    f"{TAG}: the per-bank per-cycle phase jitter is gone. Without it the submitter is "
+    "exactly periodic and aliases against #4624's `int(now) // 120 % slice_count` slice "
+    "clock, pinning a bank to a strict subset of its slices for ever"
+)
+assert "LIMIT $2" in mnt, (
+    f"{TAG}: the per-tick cap is no longer bound — the sweep could stampede every due bank at once"
+)
+assert "async def _record_failed_graph_sweep" in mnt and (
+    "await self._record_failed_graph_sweep(schema, bank_id, e)" in mnt
+), (
+    f"{TAG}: a submit that raises no longer records an attempt. Upstream writes the "
+    "async_operations row only after _authenticate_tenant and _validate_operation, so "
+    "such a bank keeps a NULL last attempt, sorts first under NULLS FIRST for ever, and "
+    "two of them consume the whole per-tick cap on every tick — every other bank stops "
+    "being swept, which is this job's own defect reinstated"
+)
+assert "_GRAPH_SWEEP_FAILED_ATTEMPT_SQL.format(" in mnt, (
+    f"{TAG}: the failed-attempt record is not written through its statement"
+)
+# The bounded sweep must still be what gets submitted; this patch schedules it, it
+# does not replace it.
+gm_src = (BASE / "engine/graph_maintenance.py").read_text()
+assert "_SWEEP_BATCH_SIZE" in gm_src and "_sweep_slice_count" in gm_src, (
+    f"{TAG}: the #4624 bounded slice sweep is not in the image — scheduling an UNBOUNDED "
+    "sweep on an interval is strictly worse than not scheduling one"
+)
+
+print(
+    f"{TAG}: the maintenance loop now forces a bounded graph-maintenance sweep for banks "
+    "whose last attempt is older than HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS "
+    "(default 3600), at most graph_maintenance_sweep_max_banks_per_tick per 60s tick, "
+    "skipping banks with a sweep already pending or processing"
+)
+PYEOF
+
 # Pin the upstream `hindsight` user to UID 11000 to match
 # `HINDSIGHT_DEFAULT_UID` in src/setup/hindsight.ts (and the
 # `auth.consumers[hindsight].uid` value the operator writes in

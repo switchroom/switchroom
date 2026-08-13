@@ -259,6 +259,54 @@ now an anomaly worth investigating, not the norm.
   named as the real guarantee. And the RFC now states the ledger reopen path's
   one-scan durability window, which was true in code and documented nowhere.
 
+- **a memory bank that goes quiet is no longer abandoned by graph
+  maintenance.** Upstream Hindsight's `graph_maintenance` is enqueue-driven and
+  nothing else: `submit_async_graph_maintenance` short-circuits with
+  `no_work=True` whenever a bank's `graph_maintenance_queue` is empty, and every
+  caller reaches it from a unit-removal path. There is no interval scheduler —
+  `engine/maintenance.py` runs retention, operation cleanup, txn recovery, the
+  consolidation reconcile and the scheduled mental-model refresh, and no graph
+  job at all. So a bank that stops removing units stops being maintained, for
+  ever, while Pass 2 (orphan-entity prune) and Pass 3 (stale-cooccurrence prune)
+  — both bank-wide, both needing no queue rows — leak everything they would have
+  reclaimed. Measured on this fleet 2026-08-13: of 12 active banks only two had
+  run graph maintenance in the 70 minutes since the v0.21.8 roll, and bank
+  `klanker` had made **zero** attempts in five days with a queue count of 0
+  while actively retaining and consolidating throughout. #4624 made the sweep
+  *finish*; nothing made it *run*. `docker/Dockerfile.hindsight` now bakes a
+  periodic sweep onto the existing 60s maintenance tick: banks whose last
+  `graph_maintenance` **attempt** (not success — a failing bank must retry on
+  the interval, not every tick) is older than
+  `HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS` (default 3600, `0`
+  disables) get one submitted with `force_sweep=True` — upstream's own flag for
+  callers whose sweep-worthy work is invisible to the queue, rather than faking
+  queue rows and putting Pass 1 to work relinking units that need nothing. What
+  gets submitted is #4624's bounded, slice-rotating sweep, unchanged. Two
+  independent anti-stampede mechanisms: a hard per-tick cap
+  (`HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK`, default 2) so 12
+  simultaneously-due banks drain over minutes rather than landing at once, and a
+  deterministic per-bank, per-cycle phase jitter of 0–25% computed in SQL from
+  `md5(bank_id || last_attempt)` — which also decorrelates the submitter from
+  #4624's `int(now) // 120 % slice_count` slice clock, against which an exactly
+  periodic caller aliases (at a flat 3600s a 21-slice bank would visit only 7 of
+  its 21 slices, ever). Idempotent twice over, because the maintenance loop runs
+  in every api/worker process with no leader election: the discovery query
+  excludes any bank with a `pending` **or** `processing` graph-maintenance
+  operation, and the submit goes through upstream's `dedupe_by_bank=True`, which
+  re-checks under the bank's `FOR NO KEY UPDATE` lock. A submit that *raises*
+  still records its attempt: upstream writes the `async_operations` row only
+  after `_authenticate_tenant` and `_validate_operation`, so a bank that fails
+  in either would keep a NULL last attempt and — the discovery orders `NULLS
+  FIRST` — occupy the head of the queue permanently, letting two wedged banks
+  consume the whole per-tick cap for ever while every other bank is silently
+  starved of exactly the sweeps this change exists to schedule. The failure path
+  writes a terminal `failed` attempt row instead, which is durable, visible to
+  every process, and read by the same due-ness clock, so a failing bank is
+  delayed by one interval rather than banished. Proven RED-against-
+  upstream / GREEN-patched by
+  `tests/docker/hindsight-graph-maintenance-interval-sweep.test.ts`, whose
+  second arm executes the shipping discovery statement against a real Postgres.
+
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 
 ### Bug fixes
