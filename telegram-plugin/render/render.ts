@@ -59,6 +59,14 @@ interface InlineCtx {
   inTableCell?: boolean;
 }
 
+/** Collapse any whitespace run containing a newline down to a single space.
+ *  Used for a `tg-entity` label: `![` … `]` must stay on ONE line or the
+ *  construct is not an entity any more. mdast decodes a soft line break inside
+ *  the alt text to a literal `\n`, which is exactly the case this flattens. */
+function collapseLabelBreaks(label: string): string {
+  return label.replace(/[ \t]*\r?\n[ \t\r\n]*/g, " ");
+}
+
 function renderInline(node: Inline, ctx: InlineCtx = {}): string {
   switch (node.type) {
     case "plain":
@@ -91,6 +99,18 @@ function renderInline(node: Inline, ctx: InlineCtx = {}): string {
       // Escape the href so a literal `)` in the URL can't terminate the
       // destination early and break the link (F3).
       return `[${renderInlineChildren(node.children, ctx)}](${escapeLinkHref(node.href)})`;
+    case "tg-entity":
+      // `![label](tg://time?unix=…&format=…)` / `![](tg://emoji?id=…)`.
+      // The label is PROSE (the alternative text Telegram shows when it can't
+      // render the entity), so it is escaped exactly like a `plain` node —
+      // without that, a label containing `]` or a formatting delimiter
+      // (`![see [22:45]](tg://time?…)`) closes the label early and smuggles
+      // raw bracket syntax past the renderer. A newline inside the label would
+      // split the construct across lines, so runs of whitespace spanning one
+      // are collapsed to a single space first. The href gets the same
+      // `escapeLinkHref` treatment a link's does (a no-op for the paren-free
+      // `tg:` URLs in practice, load-bearing if one ever carries a `)`).
+      return `![${escapeMarkdown(collapseLabelBreaks(node.label))}](${escapeLinkHref(node.href)})`;
     default: {
       // Exhaustiveness guard — the IR union is closed; a new variant must be
       // handled above rather than silently dropped.
@@ -299,6 +319,10 @@ export const SUPPORTED_INLINE = [
   "highlight",
   "code",
   "link",
+  // `![…](tg://time?…)` / `![…](tg://emoji?id=…)` — the two inline `tg:`
+  // entities in Telegram's Rich Markdown grammar. Emitted verbatim (label and
+  // href re-escaped); any OTHER image url stays a `plain` node.
+  "tg-entity",
 ] as const;
 
 export const SUPPORTED_BLOCK = [

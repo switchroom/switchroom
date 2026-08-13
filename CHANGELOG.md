@@ -15,6 +15,25 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Fixed
+
+- **Telegram `tg://` inline entities survive the render pipeline** — the Bot API
+  "Rich Markdown style" grammar carries two inline entities in mdast IMAGE
+  position: `![22:45 tomorrow](tg://time?unix=…&format=…)` (the `date_time`
+  entity, Bot API 9.5; `RichTextDateTime` in 10.1) and `![](tg://emoji?id=…)`.
+  Both were DEAD on the streamed send path: `render/parse.ts` demoted every
+  mdast `image` node to plain text and `render/render.ts` then
+  `escapeMarkdown`'d it, shipping `!\[22:45 tomorrow\](tg://time?unix\=…)` as
+  literal characters. Those two documented hrefs now fold into a `tg-entity` IR
+  node and render back byte-exact (label re-escaped as prose, so a `]` inside it
+  can't close the label early; href through `escapeLinkHref`). Every OTHER image
+  url — notably the http(s) MEDIA forms, which Telegram accepts only as a
+  separate block — keeps the existing demote-to-literal behaviour.
+  `splitMarkdownChunks`' inline-span back-off now covers the leading `!`, so a
+  cap-straddling entity can no longer be cut into a stray `!` plus an ordinary
+  link. The reply-tool path never ran the renderer and was already correct; it
+  is now pinned by tests.
+
 ### Dependencies
 
 - **Claude Code CLI pinned 2.1.228 → 2.1.229** — all three lockstep locations
