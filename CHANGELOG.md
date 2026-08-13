@@ -15,6 +15,24 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Dependencies
+
+- **Claude Code CLI pinned 2.1.228 → 2.1.229** — all three lockstep locations
+  move together (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
+  `dependencies.json`), per `docs/operators/claude-cli-updates.md`. Three
+  upstream fixes matter directly to how this fleet runs. Dynamic workflows
+  inside **CPU-limited containers** no longer read the *host* machine's core
+  count instead of the container's CPU limit — every agent here is a
+  cpu-capped container, so the old behaviour sized fan-out against the host.
+  A **file-watcher handle leak after atomic file replacements** is fixed —
+  switchroom writes agent config, schedule, and skill overlays by atomic
+  replace on every apply and every hot-reload tick, exactly the pattern that
+  leaked handles in long-lived sessions. And a **crash to the error screen —
+  including on `--resume` of the affected session — when a tool call had a
+  non-string `glob`, `file_path`, or `command` value** is fixed; a poisoned
+  session that crashed on resume was unrecoverable, the worst failure mode for
+  an always-on agent whose continuity depends on resume.
+
 ### Features
 
 - **every agent inherits a local-time rule, and it pays for its own bytes** —
