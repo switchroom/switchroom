@@ -39,10 +39,17 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-// Same pattern src/cli/doctor-claude-cli.ts and the nightly canary workflow
-// use, so all three readers agree on what "the pin" is. Every ARG occurrence
-// is collected: a multi-stage Dockerfile that re-declares the arg with a
-// different default is itself a skew.
+// Matches a whole `ARG CLAUDE_CODE_VERSION=<v>` line, which is the same shape
+// all three readers of Dockerfile.base require: src/cli/doctor-claude-cli.ts
+// (`/^\s*ARG\s+CLAUDE_CODE_VERSION=([0-9][0-9.]*)\s*$/m`) and the anchored grep
+// in .github/workflows/ci-claude-latest-canary.yml. So a prose mention of
+// `CLAUDE_CODE_VERSION=<other>` elsewhere in the file cannot make one reader
+// see a different pin than another.
+//
+// One residual difference, deliberate: the other two take the FIRST matching
+// line, this collects EVERY one. That is strictly stricter, not divergent — a
+// multi-stage Dockerfile that re-declares the arg with a different default is
+// itself a skew, and this guard fails on it rather than picking a winner.
 const ARG_RE = /^[ \t]*ARG[ \t]+CLAUDE_CODE_VERSION=([0-9][0-9.]*)[ \t]*$/gm;
 
 /**
