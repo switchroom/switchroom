@@ -6,7 +6,7 @@ Switchroom ships an enhanced `switchroom-telegram` MCP plugin that replaces the 
 
 | Tool | What it does |
 |------|-------------|
-| `reply` | Send text, photos, or documents — the single final-answer tool. Chunks anything over Telegram's 4096-char limit. Supports threading, topic routing, file attachments. |
+| `reply` | Send text, photos, or documents — the single final-answer tool. Chunks anything over the 32768-char rich-message cap (4096 applies only to plain-text degradations). Supports threading, topic routing, file attachments. |
 | `react` | Add emoji reactions to messages (Telegram whitelist: 👍 👎 ❤️ 🔥 👀 🎉 etc). |
 | `edit_message` | Update a previously sent message. Edits are silent (no push notification). |
 | `delete_message` | Remove a bot-sent message (48h Telegram API limit). |
@@ -40,18 +40,20 @@ History survives process restarts and session resets.
 For long tasks you do not need to narrate progress by editing a message. The
 plugin renders an event-driven progress card (Plan → Run → Done with live tool
 bullets, elapsed time, and status emoji) for free while the turn is in-flight.
-Send the final answer once, with `reply` — it chunks anything over Telegram's
-4096-char limit. For an explicit mid-turn check-in use `progress_update`.
+Send the final answer once, with `reply` — it chunks anything over the
+32768-char rich-message cap (4096 applies only to plain-text degradations).
+For an explicit mid-turn check-in use `progress_update`.
 
 ## Formatting
 
-Markdown is auto-converted to Telegram HTML:
-- `**bold**` → `<b>bold</b>`
-- `` `code` `` → `<code>code</code>`
-- ` ```blocks``` ` → `<pre><code>...</code></pre>`
-- Smart chunking preserves tag balance across Telegram's 4096-char limit
-
-Formats: `html` (default), `markdownv2`, `text`
+Every outbound message is sent as raw GFM markdown via the Bot API 10.1
+rich-message path (`sendRichMessage` / `editMessageText({ markdown })`) —
+Telegram parses the markdown server-side. There is no markdown→HTML
+conversion and no `parse_mode` on this path. Smart chunking
+(`splitMarkdownChunks`) splits anything over the 32768-char rich cap without
+bisecting code fences or table rows; bodies that degrade to plain text fall
+back to the legacy 4096-char cap. See
+`reference/telegram-formatting-guide.md` for the full vocabulary.
 
 ## Access control
 

@@ -160,3 +160,46 @@ describe("guardDollarMath — link / table awareness (findings 1 & 3)", () => {
     expect(out).not.toMatch(/(?<!\\)\$/);
   });
 });
+
+describe("guardDollarMath — intentional math spans are exempt (wire-verified 2026-08-13)", () => {
+  it("never escapes a compact `$…$` math span", () => {
+    // Telegram renders `$x^2+y^2$` as a native mathematical_expression node;
+    // escaping it destroys a SUPPORTED construct. On the pre-fix guard this
+    // input came back as `inline \$x^2+y^2\$ done`.
+    const s = "inline $x^2+y^2$ done";
+    expect(guardDollarMath(s)).toBe(s);
+  });
+
+  it("math span dollars do not count toward the 2+ arming threshold", () => {
+    // Only ONE prose `$` outside the math span → can never pair → untouched.
+    const s = "solve $x^2+y^2$ for the $BUDGET case";
+    expect(guardDollarMath(s)).toBe(s);
+  });
+
+  it("still escapes currency in the SAME message as an exempt math span", () => {
+    const out = guardDollarMath("sum $x^2+y^2$ costs $5 and $10");
+    expect(out).toContain("$x^2+y^2$");
+    expect(out).toContain("\\$5");
+    expect(out).toContain("\\$10");
+  });
+
+  it("a currency-shaped compact pair (`$5M-$10M`) is NOT treated as math", () => {
+    // The `$5M-$` inner run is digits/magnitude punctuation only — two
+    // adjacent amounts, the exact #3252 accident. Must still be escaped.
+    const out = guardDollarMath("the range is $5M-$10M this year");
+    expect(out).not.toMatch(/(?<!\\)\$/);
+  });
+
+  it("spaced `$…$` spans are NOT exempt (indistinguishable from currency prose)", () => {
+    // Documented residual: `$a + b$` cannot be told apart from two stray
+    // currency signs, so when a currency signal arms the guard it is escaped
+    // (renders as literal text — legible, not broken).
+    const out = guardDollarMath("we know $a + b$ plus $5 fees");
+    expect(out).not.toMatch(/(?<!\\)\$/);
+  });
+
+  it("is idempotent with a math span present", () => {
+    const once = guardDollarMath("sum $x^2+y^2$ costs $5 and $10");
+    expect(guardDollarMath(once)).toBe(once);
+  });
+});

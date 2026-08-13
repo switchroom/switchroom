@@ -5,6 +5,7 @@ import {
   renderOutbound,
   maybeRenderOutbound,
 } from "../../render/rich-render.js";
+import { guardAccidentalFormatting } from "../../rich-send.js";
 
 describe("parseRichRenderEnabled", () => {
   it("defaults ON when unset (escape hatch, not opt-in)", () => {
@@ -52,8 +53,10 @@ describe("maybeRenderOutbound", () => {
   it("default (env unset) routes through parse -> renderSafe", () => {
     const r = maybeRenderOutbound("**> collapsible", {} as NodeJS.ProcessEnv);
     expect(r.mode).toBe("markdown");
-    // The expandable blockquote round-trips back to the `**> ` marker.
-    expect(r.text).toContain("**> ");
+    // The legacy expandable marker is REPAIRED to a plain quote: `**>` is
+    // MarkdownV2-only syntax the rich path renders as literal text
+    // (wire-proved 2026-08-13), so the renderer must never re-emit it.
+    expect(r.text).toBe("> collapsible");
   });
 
   it("default preserves plain prose through the round-trip", () => {
@@ -84,15 +87,53 @@ describe("maybeRenderOutbound", () => {
       SWITCHROOM_RICH_RENDER: "maybe",
     } as NodeJS.ProcessEnv);
     expect(r.mode).toBe("markdown");
-    expect(r.text).toContain("**> ");
+    expect(r.text).toBe("> collapsible");
   });
 });
 
 describe("renderOutbound (flag-independent)", () => {
-  it("renders an expandable blockquote round-trip end to end", () => {
+  it("repairs a legacy `**>` quote to a plain quote end to end", () => {
     const r = renderOutbound("**> hidden line one\n> hidden line two");
     expect(r.mode).toBe("markdown");
-    expect(r.text.split("\n")[0]).toMatch(/^\*\*> /);
+    // One coherent quote, no retired marker: on the pre-fix renderer the
+    // first line came back as `**> hidden line one`, which Telegram rendered
+    // as LITERAL `**>` paragraph text (wire-proved 2026-08-13).
+    expect(r.text).not.toContain("**>");
+    expect(r.text.split("\n")[0]).toBe("> hidden line one");
+    expect(r.text).toContain("> hidden line two");
+  });
+
+  it("passes native constructs through: <details>, $math$, footnotes", () => {
+    // Wire-verified natives (2026-08-13) must survive parse -> renderSafe
+    // BYTE-IDENTICAL. On the pre-fix pipeline the footnote case failed:
+    // escapeMarkdown turned `[^n1]` into `\[^n1\]`, breaking the construct.
+    const details =
+      "<details open><summary>S</summary>\n\nbody\n\n</details>";
+    expect(renderOutbound(details).text).toBe(details);
+
+    const math = "inline $x^2+y^2$ done";
+    expect(renderOutbound(math).text).toBe(math);
+
+    const footnotes = "claim[^n1] more\n\n[^n1]: body text";
+    expect(renderOutbound(footnotes).text).toBe(footnotes);
+  });
+
+  it("a tg:// inline entity and a footnote survive TOGETHER in one message", () => {
+    // Cross-feature composition (#4683 x #4685): the `tg-entity` fold (mdast
+    // image position) and the footnote `raw` fold (footnoteReference /
+    // footnoteDefinition) land in the SAME foldInline/foldBlock walk — this
+    // pins that neither eats the other. On #4683 alone the footnote came back
+    // as `claim\[^n1\]`; on #4685 alone (pre-rebase) the entity came back as
+    // `!\[now\](tg://time?unix\=…)` literal text.
+    const combined =
+      "meet at ![now](tg://time?unix=1755000000&format=wDT) as promised[^n1]\n\n[^n1]: agreed yesterday";
+    expect(renderOutbound(combined).text).toBe(combined);
+
+    // Same pair inside ONE paragraph plus the guard seam on top: the composed
+    // wire body (renderOutbound then the richMessage guard, i.e. the full
+    // streamed send path) is still byte-identical.
+    const guarded = guardAccidentalFormatting(renderOutbound(combined).text);
+    expect(guarded).toBe(combined);
   });
 
   it("falls back to plain mode for oversized atomic content", () => {

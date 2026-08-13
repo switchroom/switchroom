@@ -165,7 +165,7 @@ describe('markdownToTelegraphNodes — block elements', () => {
   })
 
   it('folds an expandable `**>` quote into one blockquote, marker stripped', () => {
-    // The Bot API 10.1 expandable-blockquote syntax: `**>` opener on the first
+    // The LEGACY switchroom expandable-quote encoding: `**>` opener on the first
     // line, `>` continuation lines. Telegra.ph has no collapsible-blockquote
     // tag, so it degrades to a normal blockquote — but the `**>` marker MUST be
     // recognised. Before the fix the `**>` line became a paragraph with literal

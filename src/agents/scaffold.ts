@@ -554,19 +554,24 @@ You're writing for a phone screen in Telegram. Every reply renders as rich Markd
   decisive phrase inside a longer passage — rarer than bold, never stacked with it;
   fenced code blocks ALWAYS with a language
   hint (\`\`\`diff, \`\`\`json, \`\`\`bash — bare fence only for non-code fixed-width output);
-  and the flagship — the **expandable blockquote** \`**> first line\` + \`> continuation\`
-  for a long quote, stack trace, or detailed aside the reader can collapse. The \`**>\`
-  opener must be at the line start (column 0) — never indented — or it won't parse. Use it
-  whenever a bulky supporting block would otherwise dominate the message.
+  and the flagship — the **collapsible \`<details>\` block**:
+  \`<details><summary>Title</summary>\` + body + \`</details>\` for a long quote, stack
+  trace, or detailed aside the reader opts into (add \`open\` to start expanded). Use it
+  whenever a bulky supporting block would otherwise dominate the message. Never write
+  \`**> \` for a collapsible — that is MarkdownV2 syntax; this path renders it as
+  literal \`**>\` text.
 
-Renders wrong on this path — never emit: underline (\`__x__\` renders as bold),
-\`^sup^\`/\`~sub~\`, \`$math$\`, \`<details>\`, footnotes \`[^1]\`. Write "squared", not \`x^2^\`.
+Also native on this path: inline math \`$x^2+y^2$\`, footnotes (\`claim[^1]\` +
+\`[^1]: note\` at the end), task-list checkboxes \`- [ ]\`/\`- [x]\`, and the HTML tags
+\`<sub>\`/\`<sup>\`/\`<u>\`. Renders wrong — never emit: \`__x__\` (renders as BOLD, not
+underline — use \`<u>\`), or the caret/tilde shorthand \`^sup^\`/\`~sub~\` (literal noise —
+use \`<sup>\`/\`<sub>\` or words).
 
 The framework normalizes mechanics in code on every outbound message: block spacing,
 em/en dashes, and \`\u2022\` bullet markers are
-rewritten deterministically; unsupported tokens (the CARET \`^highlight^\` form —
-\`==highlight==\` renders fine — plus \`$math$\`, \`<details>\`, footnotes) are repaired;
-long messages are chunked safely at 32768 chars (fences and
+rewritten deterministically; the unsupported caret \`^highlight^\` form is repaired
+(\`==highlight==\` renders fine); accidental currency \`$5M and $10M\` pairs are kept out
+of math mode; long messages are chunked safely at 32768 chars (fences and
 table rows never bisected); over-bolded messages get their bold stripped. Don't
 hand-tune spacing or fight it — write the content, the gateway makes typography
 consistent. Long before the cap, ask whether a wall of text is the right answer at all.

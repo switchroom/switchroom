@@ -135,4 +135,106 @@ describe("guardAccidentalFormatting composition (#3252)", () => {
     // And re-wrapping (streaming re-render) is byte-stable.
     expect(richMessage(wire.markdown).markdown).toBe(wire.markdown);
   });
+
+  // ── Wire-verified NATIVE constructs survive the FULL pipeline ────────────
+  // Raw sendRichMessage probes (2026-08-13) proved Telegram's rich markdown
+  // path natively renders `<details>`, `$…$` inline math, and footnotes. The
+  // pre-fix pipeline destroyed all three (details → the unsupported `**>`
+  // marker, `$x^2+y^2$` → `\$x^2+y^2\$`, `[^n1]` deleted) — each assertion
+  // below FAILS on that pipeline.
+  describe("native constructs pass through the full composed guard", () => {
+    it("<details open><summary> block survives byte-identical", () => {
+      const src = "<details open><summary>S</summary>\n\nbody\n\n</details>";
+      expect(guardAccidentalFormatting(src)).toBe(src);
+      expect(richMessage(src).markdown).toBe(src);
+    });
+
+    it("compact $math$ span survives byte-identical", () => {
+      const src = "inline $x^2+y^2$ done";
+      expect(guardAccidentalFormatting(src)).toBe(src);
+    });
+
+    it("footnote reference + definition survive byte-identical", () => {
+      const src = "claim[^n1]\n\n[^n1]: body";
+      expect(guardAccidentalFormatting(src)).toBe(src);
+    });
+
+    it("`**>` is never emitted for any input the pipeline repairs", () => {
+      const out = guardAccidentalFormatting(
+        "<details><summary>T</summary>\nbody\n</details>",
+      );
+      expect(out).not.toContain("**>");
+    });
+  });
+
+  // ── Guard-interaction cases for the now-passing-through constructs ───────
+  // Removing the old token conversions changes what the sibling guards see (a
+  // surviving `$`, a surviving `<`). These prove the emphasis / heading /
+  // block-construct / inline-pair / dollar guards do not mangle the natives,
+  // while their own repairs still fire in the SAME message.
+  describe("native constructs vs sibling guards (interaction)", () => {
+    it("math span is exempt while surrounding currency is still broken apart", () => {
+      const src = "sum $x^2+y^2$ costs $5 and $10 total";
+      const out = guardAccidentalFormatting(src);
+      // The math span reaches the wire byte-identical…
+      expect(out).toContain("$x^2+y^2$");
+      // …while the accidental currency pair is still defused (#3252).
+      expect(out).toContain("\$5");
+      expect(out).toContain("\$10");
+    });
+
+    it("currency-shaped adjacent amounts are NOT mistaken for math", () => {
+      // `$5M-$10M` has a whitespace-free `$…$` pair (`$5M-$`) — the currency
+      // shape must keep it guardable, else #3252 regresses.
+      const out = guardAccidentalFormatting("range is $5M-$10M this year");
+      expect(out).not.toMatch(/(?<!\\)\$/);
+    });
+
+    it("math span interior is protected from the emphasis and caret guards", () => {
+      // `a_b*c` inside math would trip the intra-word `_`/`*` escapes, and
+      // `^2y^` is an alphanumeric caret pair the token guard would strip —
+      // both must stay verbatim inside the protected span. The `_`/`*`
+      // OUTSIDE the span are still guarded — note the protected span's
+      // delimiters do NOT count toward the 2+ pairing threshold, so the
+      // prose needs its own pairable signals (`2*3 and 4*5`).
+      const src = "$a_b*c$ and file_name_here times 2*3 and 4*5";
+      const out = guardAccidentalFormatting(src);
+      expect(out).toContain("$a_b*c$");
+      expect(out).toContain("file\\_name\\_here");
+      expect(out).toContain("2\\*3");
+      expect(out).toContain("4\\*5");
+      expect(guardAccidentalFormatting("inline $x^2y^2$ done")).toBe(
+        "inline $x^2y^2$ done",
+      );
+    });
+
+    it("<details> lines are invisible to the line-start and heading guards", () => {
+      // A details block whose body carries genuine accidental signals: the
+      // guards must fire on the BODY prose without touching the tags.
+      const src =
+        "<details open><summary>Stats</summary>\n\n>2x growth and #1 priority\n\n</details>";
+      const out = guardAccidentalFormatting(src);
+      expect(out).toContain("<details open><summary>Stats</summary>");
+      expect(out).toContain("</details>");
+      // Line-start `>2x` and glued `#1` are still repaired inside the body.
+      expect(out).toContain("\>2x");
+      expect(out).toContain("\#1");
+    });
+
+    it("footnote markers survive alongside a firing dollar guard", () => {
+      const src = "cost[^1] was $5 then $9\n\n[^1]: the note";
+      const out = guardAccidentalFormatting(src);
+      expect(out).toContain("cost[^1]");
+      expect(out).toContain("[^1]: the note");
+      expect(out).toContain("\$5");
+      expect(out).toContain("\$9");
+    });
+
+    it("the whole composition stays idempotent with natives present", () => {
+      const src =
+        "claim[^1] and $x^2+y^2$ in <details><summary>T</summary>\nb\n</details> with $5 and $10\n\n[^1]: n";
+      const once = guardAccidentalFormatting(src);
+      expect(guardAccidentalFormatting(once)).toBe(once);
+    });
+  });
 });

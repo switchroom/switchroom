@@ -31,11 +31,20 @@
 //     code      -> `` `…` ``
 //     link      -> `[…](…)`
 //     tg-entity -> `![…](tg://…)`  (Bot API date_time / custom-emoji entity)
+//     raw       -> source bytes verbatim (never escaped) — footnote markers
+//                  `[^1]` and definition lines `[^1]: …`, which Telegram's
+//                  rich parser renders natively and escapeMarkdown would break
 //
 //   Block
 //     paragraph      -> children joined; blocks separated by "\n\n"
 //     heading        -> `#`…`######` line
-//     blockquote     -> `> …` (expandable === true -> `**> …` expandable blockquote)
+//     blockquote     -> `> …` on every line. `expandable === true` records that
+//                       the SOURCE carried the legacy `**> ` marker, but it is
+//                       NOT a distinct wire style: `**>` is MarkdownV2-only
+//                       syntax that the rich markdown path renders as literal
+//                       text (wire-verified 2026-08-13), so the renderer
+//                       degrades it to a plain quote. Authors wanting a real
+//                       collapsible use `<details><summary>…</summary>…</details>`.
 //     code-block     -> ```` ```lang … ``` ````
 //     list           -> line-per-item with `-`/`1.` markers
 //     thematic-break -> `---` thematic break
@@ -134,6 +143,16 @@ export interface TgEntityNode extends Pos {
   href: string;
 }
 
+/** Verbatim wire passthrough: the node's SOURCE bytes are already the exact
+ *  syntax Telegram's rich parser expects, so the renderer must emit them
+ *  unescaped (escapeMarkdown would corrupt them). Used for GFM footnote
+ *  reference markers (`[^1]`) and footnote definition lines (`[^1]: …`) —
+ *  both natively supported on the rich path (wire-verified 2026-08-13). */
+export interface RawNode extends Pos {
+  type: "raw";
+  text: string;
+}
+
 export type Inline =
   | PlainNode
   | BoldNode
@@ -144,7 +163,8 @@ export type Inline =
   | HighlightNode
   | CodeNode
   | LinkNode
-  | TgEntityNode;
+  | TgEntityNode
+  | RawNode;
 
 // ---------------------------------------------------------------------------
 // Block nodes
@@ -165,7 +185,11 @@ export interface HeadingNode extends Pos {
 export interface BlockquoteNode extends Pos {
   type: "blockquote";
   children: Block[];
-  /** Telegram <blockquote expandable>. Always false in Increment 1 — see parse.ts. */
+  /** True when the source carried the LEGACY switchroom `**> ` expandable
+   *  marker (see parse.ts markExpandableQuotes). Records authoring intent
+   *  only: `**>` is MarkdownV2 syntax with no rich-markdown equivalent
+   *  (wire-verified 2026-08-13), so the renderer emits a plain `> ` quote
+   *  either way. */
   expandable: boolean;
 }
 

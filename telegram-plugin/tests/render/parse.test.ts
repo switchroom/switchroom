@@ -336,7 +336,7 @@ describe("parse: nested lists", () => {
   });
 });
 
-describe("expandable blockquote (Bot API 10.1 `**>` marker)", () => {
+describe("expandable blockquote (LEGACY switchroom `**>` marker — input repair only)", () => {
   it("parses a single-line `**>` quote into an expandable blockquote", () => {
     const md = "**> a collapsible line";
     const doc = parse(md);
@@ -374,10 +374,10 @@ describe("expandable blockquote (Bot API 10.1 `**>` marker)", () => {
   });
 
   it("only recognises the marker at column 0 (leading indent is not expandable)", () => {
-    // The renderer only ever emits `**>` at column 0; a leading-indented
-    // variant is deliberately NOT treated as an expandable quote (matching it
-    // would push the length-preserving rewrite past the 3-space blockquote
-    // budget into indented-code-block territory).
+    // The legacy encoding only ever placed `**>` at column 0; a
+    // leading-indented variant is deliberately NOT treated as an expandable
+    // quote (matching it would push the length-preserving rewrite past the
+    // 3-space blockquote budget into indented-code-block territory).
     const md = "   **> indented";
     const doc = parse(md);
     const bq = doc.blocks[0] as any;
@@ -389,5 +389,30 @@ describe("expandable blockquote (Bot API 10.1 `**>` marker)", () => {
     // line start.
     const doc = parse("**bold** > not a quote");
     expect(doc.blocks[0].type).toBe("paragraph");
+  });
+});
+
+describe("footnotes fold to verbatim `raw` nodes (native Telegram construct)", () => {
+  it("a footnote reference marker folds to a raw inline carrying its source bytes", () => {
+    // GFM only recognises a reference when a matching definition exists in
+    // the document (a lone `[^n1]` is ordinary text).
+    const doc = parse("claim[^n1] more\n\n[^n1]: body");
+    const para = doc.blocks[0] as Extract<Block, { type: "paragraph" }>;
+    const raw = para.children.find((c: Inline) => c.type === "raw") as
+      | Extract<Inline, { type: "raw" }>
+      | undefined;
+    expect(raw).toBeDefined();
+    expect(raw!.text).toBe("[^n1]");
+  });
+
+  it("a footnote definition folds to a paragraph with one raw inline (verbatim slice)", () => {
+    const doc = parse("[^n1]: body text");
+    const para = doc.blocks[0] as Extract<Block, { type: "paragraph" }>;
+    expect(para.type).toBe("paragraph");
+    expect(para.children).toHaveLength(1);
+    expect(para.children[0].type).toBe("raw");
+    expect((para.children[0] as Extract<Inline, { type: "raw" }>).text).toBe(
+      "[^n1]: body text",
+    );
   });
 });

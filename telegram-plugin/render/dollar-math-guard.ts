@@ -29,6 +29,20 @@
 // a `$…$` pair if only the leading-`$digit` token is escaped — so we escape the
 // lot once the currency signal + 2-dollar threshold are met.
 //
+// ── INTENTIONAL math is exempt (wire-verified 2026-08-13) ─────────────────
+// Telegram's rich path renders a `$…$` pair as a native mathematical_expression
+// node, and intentional math (`$x^2+y^2$`) must reach the wire byte-identical —
+// an escaped `\$x^2+y^2\$` destroys a SUPPORTED construct. The discrimination
+// lives in `splitProtectedSegments` (code-segments.ts): a COMPACT math span
+// (whitespace-free inner, not currency-shaped) is a protected segment, so this
+// guard neither counts its `$`s toward the 2+ threshold nor escapes them.
+// Currency amounts always sit next to whitespace/prose (`$5M and $10M`) or have
+// a digits-and-punctuation-only inner (`$5M-$10M`), so #3252-class accidental
+// pairs remain fully guarded. Known residual: a SPACED math span (`$a + b$`)
+// is indistinguishable from currency prose and is not exempted — it is escaped
+// when the message also carries a currency signal, rendering as literal text
+// (legible, not broken).
+//
 // Idempotent (F5): the escape uses a negative-lookbehind (`(?<!\\)\$`) so an
 // already-escaped `\$` is never doubled to `\\$`. Running the guard twice (e.g.
 // the streaming path renders then this wrapper re-wraps) is a strict no-op the
@@ -100,7 +114,8 @@ const UNESCAPED_DOLLAR = /(?<!\\)\$/g;
  * them is digit-adjacent (a currency signal). When armed, EVERY unescaped prose
  * `$` is backslash-escaped so no two `$` can pair into a math span — this is
  * what closes the F3 trailing-`$` / `$.50` false-negatives. Code spans / fenced
- * blocks are never touched. Idempotent (F5) and deterministic.
+ * blocks AND compact intentional-math `$…$` spans (protected segments, see
+ * code-segments.ts) are never touched. Idempotent (F5) and deterministic.
  */
 export function guardDollarMath(text: string): string {
   if (!text.includes("$")) return text;

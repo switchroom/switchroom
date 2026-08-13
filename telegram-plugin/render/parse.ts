@@ -37,12 +37,18 @@
 //   own reading of the delimiters.
 //
 // Blockquote expandable handling:
-//   The IR carries `expandable: boolean` for Telegram's expandable blockquote
-//   (Bot API 10.1). GFM has no expandable marker; the switchroom render path
-//   emits `**> ` on the FIRST line of an expandable quote (`render.ts` /
-//   `reference/telegram-formatting-guide.md`). micromark does NOT understand
-//   `**> ` as a blockquote — the leading `**` makes the line a paragraph with
-//   an unclosed strong-emphasis run — so this module pre-transforms each
+//   The IR carries `expandable: boolean` for the LEGACY switchroom `**> `
+//   expandable-quote encoding. `**>` was believed to be the Bot API 10.1
+//   expandable-blockquote marker; wire probes (2026-08-13) proved it is
+//   MarkdownV2-only syntax that the rich markdown path renders as LITERAL
+//   `**>` text, so `render.ts` no longer emits it — an expandable node renders
+//   as a plain `> ` quote. Recognition here is kept as INPUT REPAIR: agent
+//   output (and Hindsight memories) trained on the old floor card still
+//   contains `**> ` quotes, and without this rewrite such a line would reach
+//   the wire as a broken literal-`**>` paragraph. micromark does NOT
+//   understand `**> ` as a blockquote — the leading `**` makes the line a
+//   paragraph with an unclosed strong-emphasis run — so this module
+//   pre-transforms each
 //   `**>` marker into a plain `  >` marker of IDENTICAL length (`**` → two
 //   spaces) before handing the text to mdast. Length preservation keeps every
 //   UTF-16 source offset (and therefore the never-lose-text round-trip
@@ -90,10 +96,12 @@ function slice(source: string, node: MdastNode): string {
   return source.slice(start, end);
 }
 
-/** The Bot API 10.1 expandable-blockquote marker: `**>` at the very start of
- *  a line (column 0). This is exactly what the render path emits
- *  (`render.ts` writes `**> ` on the first line of an expandable quote; see
- *  `reference/telegram-formatting-guide.md`). Matching only at column 0 keeps
+/** The LEGACY switchroom expandable-blockquote marker: `**>` at the very
+ *  start of a line (column 0). The render path no longer emits it (it is
+ *  MarkdownV2-only syntax, not rich markdown — see `render.ts`
+ *  renderBlockquote), but it is still RECOGNISED on input so a legacy `**> `
+ *  line is repaired into a real blockquote instead of shipping as literal
+ *  `**>` text. Matching only at column 0 keeps
  *  the length-preserving rewrite (`**` → two spaces) inside CommonMark's
  *  3-space blockquote-indent budget — allowing leading indent here would push
  *  the rewritten `  >` past 3 spaces and turn it into an indented code block. */
@@ -202,8 +210,16 @@ function foldInline(node: PhrasingContent, source: string): Inline {
       }
       return { type: "plain", text: slice(source, node), ...pos(node) };
     }
-    // Not in the palette (break, non-`tg:` image, html, footnoteReference, …):
-    // keep the raw source text so no content is lost.
+    // GFM footnote reference marker (`[^1]`): natively supported by Telegram's
+    // rich markdown path (wire-verified 2026-08-13 — renders as the full
+    // superscript + anchor + reference_link machinery). The source bytes ARE
+    // the wire syntax, so fold to a `raw` node the renderer emits verbatim;
+    // a `plain` node would be escapeMarkdown'd (`\[^1\]`) and break the
+    // construct on the wire.
+    case "footnoteReference":
+      return { type: "raw", text: slice(source, node), ...pos(node) };
+    // Not in the palette (break, non-`tg:` image, html, …): keep the raw
+    // source text so no content is lost.
     default:
       return { type: "plain", text: slice(source, node), ...pos(node) };
   }
@@ -364,8 +380,19 @@ function foldBlock(
         ...pos(node),
       };
     }
-    // Not in the palette (html, definition, footnoteDefinition, …): degrade to
-    // a paragraph carrying the raw source slice so no content is dropped.
+    // GFM footnote DEFINITION (`[^1]: body`): natively supported on the wire
+    // (2026-08-13 probe — pairs with the reference marker into footer/anchor
+    // nodes). Emit the raw source slice VERBATIM via a `raw` inline: a `plain`
+    // fold would escapeMarkdown the `[`/`]` (`\[^1\]: body`) and orphan the
+    // reference.
+    case "footnoteDefinition":
+      return {
+        type: "paragraph",
+        children: [{ type: "raw", text: slice(source, node), ...pos(node) }],
+        ...pos(node),
+      };
+    // Not in the palette (html, definition, …): degrade to a paragraph
+    // carrying the raw source slice so no content is dropped.
     default:
       return {
         type: "paragraph",
