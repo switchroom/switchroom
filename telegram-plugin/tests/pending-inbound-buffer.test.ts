@@ -7,7 +7,8 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick, planBufferedRedelivery, DEFAULT_PENDING_INBOUND_CAP } from '../gateway/pending-inbound-buffer.js'
+import { createPendingInboundBuffer, redeliverBufferedInbound, idleDrainTick, planBufferedRedelivery, selectEvictionVictim, DEFAULT_PENDING_INBOUND_CAP, APPROVAL_OUTCOME_PROTECTION_MS } from '../gateway/pending-inbound-buffer.js'
+import { APPROVAL_OUTCOME_SOURCES, APPROVAL_OUTCOME_DROPPED_SOURCE, isApprovalOutcome, createApprovalOutcomeDropNotifier } from '../gateway/approval-outcome-sources.js'
 import type { InboundMessage } from '../gateway/ipc-protocol.js'
 import { ObligationLedger } from '../gateway/obligation-ledger.js'
 import { makeRepresentRedeliveryGuard } from '../gateway/represent-delivery-guard.js'
@@ -171,7 +172,11 @@ describe('pending-inbound-buffer', () => {
     const buf = createPendingInboundBuffer({ capPerAgent: 1, log: (l) => logs.push(l) })
     buf.push('a', inbound('m1', 1))
     buf.push('a', inbound('m2', 2)) // evicts m1
-    expect(logs.some((l) => l.includes('cap=1') && l.includes('dropped oldest'))).toBe(true)
+    // PR D: victim selection is tiered, so the line names the index + tier
+    // rather than claiming "oldest" (it is the oldest of its tier).
+    expect(
+      logs.some((l) => l.includes('cap=1') && l.includes('dropped entry idx=0 reason=non-outcome')),
+    ).toBe(true)
     expect(logs.some((l) => l.includes('m1'))).toBe(true)
   })
 
@@ -847,5 +852,421 @@ describe('redeliverBufferedInbound — beforeRedeliver fail-open on throw', () =
     expect(r.retracted).toBe(0) // a throw is NOT a retract
     expect(r.rebuffered).toBe(0)
     expect(buf.depth('a')).toBe(0) // nothing stranded
+  })
+})
+
+/**
+ * PR D — cap eviction must not pick an APPROVAL OUTCOME while anything else is
+ * droppable. The victim used to be an unconditional `q.shift()`, and the oldest
+ * entry is exactly the one most likely to be a synthetic approval outcome that
+ * has been waiting through an entire turn. An ordinary chat message is
+ * resendable; a `vault_grant_approved` is not — the operator's tap already
+ * happened, so "please resend" is meaningless and the agent blocks forever.
+ */
+describe('pending-inbound-buffer — approval-outcome eviction protection (PR D)', () => {
+  /** A button tap: NO meta.source at all, only meta.button_callback. */
+  function tap(ts: number): InboundMessage {
+    return {
+      type: 'inbound',
+      chatId: 'c1',
+      messageId: ts,
+      user: 'alice',
+      userId: 42,
+      ts,
+      text: '[user tapped button: Approve]',
+      meta: { button_callback: 'true', button_callback_data: 'ag:ok', button_text: 'Approve' },
+    }
+  }
+
+  it('an outcome at the HEAD survives an overflow of ordinary messages', () => {
+    const buf = createPendingInboundBuffer({ log: () => {} }) // cap 32
+    buf.push('a', inbound('vault_grant_approved', 1))
+    for (let i = 0; i < 31; i++) buf.push('a', userMsg({ text: `m${i}`, ts: 100 + i }))
+    buf.push('a', userMsg({ text: 'overflow', ts: 999 }))
+    const drained = buf.drain('a')
+    expect(drained.some((m) => m.meta?.source === 'vault_grant_approved')).toBe(true)
+    // The oldest ORDINARY message went instead, and nothing else was lost.
+    expect(drained).toHaveLength(32)
+    expect(drained.map((m) => m.text)).not.toContain('m0')
+    expect(drained.map((m) => m.text)).toContain('overflow')
+  })
+
+  it('a sustained ordinary-message burst never evicts the buffered outcome', () => {
+    const buf = createPendingInboundBuffer({ capPerAgent: 4, log: () => {} })
+    buf.push('a', inbound('secret_provided', 1))
+    for (let i = 0; i < 40; i++) buf.push('a', userMsg({ text: `u${i}`, ts: 100 + i }))
+    const drained = buf.drain('a')
+    expect(drained[0]?.meta?.source).toBe('secret_provided')
+    expect(drained.map((m) => m.text).slice(1)).toEqual(['u37', 'u38', 'u39'])
+  })
+
+  it('a button tap is protected too — it carries NO meta.source', () => {
+    const buf = createPendingInboundBuffer({ capPerAgent: 3, log: () => {} })
+    buf.push('a', tap(1))
+    buf.push('a', userMsg({ text: 'u1', ts: 2 }))
+    buf.push('a', userMsg({ text: 'u2', ts: 3 }))
+    buf.push('a', userMsg({ text: 'u3', ts: 4 }))
+    const drained = buf.drain('a')
+    expect(drained[0]?.meta?.button_callback).toBe('true')
+    expect(drained.map((m) => m.text).slice(1)).toEqual(['u2', 'u3'])
+  })
+
+  it('survivors keep insertion order after a mid-queue eviction (FIFO contract)', () => {
+    const buf = createPendingInboundBuffer({ capPerAgent: 4, log: () => {} })
+    buf.push('a', inbound('vault_grant_approved', 1))
+    buf.push('a', userMsg({ text: 'u1', ts: 2 }))
+    buf.push('a', userMsg({ text: 'u2', ts: 3 }))
+    buf.push('a', userMsg({ text: 'u3', ts: 4 }))
+    buf.push('a', userMsg({ text: 'u4', ts: 5 })) // evicts u1 (index 1), not the head
+    expect(buf.drain('a').map((m) => m.meta?.source ?? m.text)).toEqual([
+      'vault_grant_approved', 'u2', 'u3', 'u4',
+    ])
+  })
+
+  it('onEvict (not onEvictCritical) fires for an ordinary victim', () => {
+    const ordinary: InboundMessage[] = []
+    const critical: InboundMessage[] = []
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 2,
+      log: () => {},
+      onEvict: (_a, m) => ordinary.push(m),
+      onEvictCritical: (_a, m) => critical.push(m),
+    })
+    buf.push('a', inbound('vault_grant_approved', 1))
+    buf.push('a', userMsg({ text: 'u1', ts: 2 }))
+    buf.push('a', userMsg({ text: 'u2', ts: 3 }))
+    expect(ordinary.map((m) => m.text)).toEqual(['u1'])
+    expect(critical).toHaveLength(0)
+  })
+
+  it('all-outcomes fallback: drops the oldest and fires onEvictCritical, NOT onEvict', () => {
+    const ordinary: InboundMessage[] = []
+    const critical: { agent: string; msg: InboundMessage }[] = []
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 3,
+      log: () => {},
+      now: () => 1000, // all three below are well inside the protection window
+      onEvict: (_a, m) => ordinary.push(m),
+      onEvictCritical: (agent, msg) => critical.push({ agent, msg }),
+    })
+    buf.push('a', inbound('vault_grant_approved', 900))
+    buf.push('a', inbound('secret_provided', 950))
+    buf.push('a', inbound('skill_proposal_apply', 980))
+    expect(critical).toHaveLength(0)
+    buf.push('a', inbound('mental_model_proposal_applied', 999))
+    expect(ordinary).toHaveLength(0)
+    expect(critical).toHaveLength(1)
+    expect(critical[0]!.agent).toBe('a')
+    expect(critical[0]!.msg.meta?.source).toBe('vault_grant_approved')
+    expect(critical[0]!.msg.ts).toBe(900)
+    // The newest outcome is in and the other two are intact.
+    expect(buf.drain('a').map((m) => m.meta?.source)).toEqual([
+      'secret_provided', 'skill_proposal_apply', 'mental_model_proposal_applied',
+    ])
+  })
+
+  it('a STALE outcome is evictable — protection is bounded, so it cannot pin the buffer', () => {
+    const critical: InboundMessage[] = []
+    const nowMs = 100 * 60 * 1000
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 2,
+      log: () => {},
+      now: () => nowMs,
+      onEvictCritical: (_a, m) => critical.push(m),
+    })
+    // Stale: older than the 15-min protection window (already spool-escalated).
+    buf.push('a', inbound('vault_grant_timeout', nowMs - 20 * 60 * 1000))
+    // Fresh.
+    buf.push('a', inbound('secret_provided', nowMs - 1000))
+    buf.push('a', inbound('vault_grant_approved', nowMs))
+    expect(critical.map((m) => m.meta?.source)).toEqual(['vault_grant_timeout'])
+    // The FRESH outcomes both survived — staleness, not arrival order, decided it.
+    expect(buf.drain('a').map((m) => m.meta?.source)).toEqual([
+      'secret_provided', 'vault_grant_approved',
+    ])
+  })
+
+  it('APPROVAL_OUTCOME_PROTECTION_MS matches the spool escalation window', () => {
+    expect(APPROVAL_OUTCOME_PROTECTION_MS).toBe(15 * 60 * 1000)
+  })
+
+  it('cap of 1 with a single fresh outcome: evicts it and reports critical', () => {
+    const critical: InboundMessage[] = []
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 1,
+      log: () => {},
+      now: () => 1000,
+      onEvictCritical: (_a, m) => critical.push(m),
+    })
+    buf.push('a', inbound('vault_grant_approved', 900))
+    buf.push('a', inbound('secret_provided', 950))
+    expect(critical.map((m) => m.meta?.source)).toEqual(['vault_grant_approved'])
+    expect(buf.drain('a').map((m) => m.meta?.source)).toEqual(['secret_provided'])
+  })
+
+  it('a throwing onEvictCritical never breaks the push hot path', () => {
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 1,
+      log: () => {},
+      onEvictCritical: () => { throw new Error('notice failed') },
+    })
+    buf.push('a', inbound('vault_grant_approved', 1))
+    expect(() => buf.push('a', inbound('secret_provided', 2))).not.toThrow()
+    expect(buf.drain('a').map((m) => m.meta?.source)).toEqual(['secret_provided'])
+  })
+
+  describe('selectEvictionVictim tiers', () => {
+    const out = (ts: number) => inbound('vault_grant_approved', ts)
+    const ord = (ts: number) => userMsg({ text: `u${ts}`, ts })
+
+    it('empty queue is safe (index 0, no crash at the call site)', () => {
+      expect(selectEvictionVictim([], 0)).toEqual({ index: 0, reason: 'all-outcomes' })
+    })
+
+    it('picks the FIRST non-outcome, not merely any non-outcome', () => {
+      expect(selectEvictionVictim([out(1), out(2), ord(3), ord(4)], 5)).toEqual({
+        index: 2, reason: 'non-outcome',
+      })
+    })
+
+    it('prefers an ordinary message over a STALE outcome', () => {
+      const nowMs = 60 * 60 * 1000
+      expect(selectEvictionVictim([out(1), ord(nowMs)], nowMs)).toEqual({
+        index: 1, reason: 'non-outcome',
+      })
+    })
+
+    // Tier 2 vs tier 3. These two tiers agree on the victim whenever the queue
+    // is in `ts`-ascending order (the oldest entry is then also the stalest),
+    // so an in-order fixture CANNOT tell them apart — disabling the age bound
+    // entirely leaves such a test green (verified by mutation). The
+    // discriminating case is a queue whose head is FRESH and whose later entry
+    // is STALE.
+    it('prefers a STALE outcome over a fresher one queued ahead of it', () => {
+      const nowMs = 100 * 60 * 1000
+      const fresh = out(nowMs)
+      const stale = out(nowMs - 20 * 60 * 1000) // past the 15-min window
+      expect(selectEvictionVictim([fresh, stale], nowMs)).toEqual({
+        index: 1, reason: 'stale-outcome',
+      })
+    })
+
+    // The `reason` is not cosmetic: it is what the eviction log line reports,
+    // and it is the only signal distinguishing "dropped an outcome the spool
+    // already escalated" from "dropped a live one because there was nothing
+    // else". Pin it in the ordinary in-order shape too.
+    it('reports stale-outcome (not all-outcomes) when the victim is past its window', () => {
+      const nowMs = 100 * 60 * 1000
+      expect(
+        selectEvictionVictim([out(nowMs - 20 * 60 * 1000), out(nowMs)], nowMs).reason,
+      ).toBe('stale-outcome')
+    })
+
+    // The bound must actually be a bound: an outcome one millisecond inside
+    // the window is still protected, so tier 3 is what fires.
+    it('an outcome just INSIDE the window is not stale — falls through to tier 3', () => {
+      const nowMs = 100 * 60 * 1000
+      const justInside = out(nowMs - (APPROVAL_OUTCOME_PROTECTION_MS - 1))
+      expect(selectEvictionVictim([out(nowMs), justInside], nowMs)).toEqual({
+        index: 0, reason: 'all-outcomes',
+      })
+    })
+  })
+})
+
+/**
+ * PR D — the notifier the gateway wires to `onEvictCritical`. This drives the
+ * REAL production factory (gateway.ts calls exactly this), so the re-entrancy
+ * and termination properties are pinned where they live, not in a test copy.
+ */
+describe('approval-outcome drop notifier (PR D)', () => {
+  /** Run every queued microtask to quiescence. */
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 50; i++) await Promise.resolve()
+  }
+
+  it('the approval_outcome_dropped notice lands in the buffer and names the source', async () => {
+    // Wire it exactly as gateway.ts does: the buffer's onEvictCritical calls
+    // the notifier, and the notifier pushes back into the same buffer.
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 3,
+      log: () => {},
+      now: () => 1000,
+      onEvictCritical: (a, m) => notifier(a, m),
+    })
+    const notifier = createApprovalOutcomeDropNotifier({
+      push: (agent, msg) => { buf.push(agent, msg) },
+      log: () => {},
+    })
+    buf.push('a', inbound('vault_grant_approved', 900))
+    buf.push('a', inbound('secret_provided', 950))
+    buf.push('a', inbound('skill_proposal_apply', 960))
+    buf.push('a', inbound('mental_model_proposal_applied', 970)) // critical evict
+    // Nothing enqueued synchronously — the notice must NOT ride the push frame.
+    expect(buf.depth('a')).toBe(3)
+    await settle()
+    const drained = buf.drain('a')
+    const notice = drained.find((m) => m.meta?.source === 'approval_outcome_dropped')
+    expect(notice).toBeDefined()
+    // The notice push itself ran against a queue still full of outcomes, so it
+    // evicted one more. The surviving notice must name BOTH — an earlier notice
+    // naming only the first drop is exactly what the next overflow evicts.
+    expect(notice!.meta?.dropped_sources).toBe('vault_grant_approved, secret_provided')
+    expect(notice!.text).toContain('vault_grant_approved')
+    // Every outcome that was NOT dropped is still buffered.
+    expect(drained.map((m) => m.meta?.source)).toEqual([
+      'skill_proposal_apply', 'mental_model_proposal_applied', 'approval_outcome_dropped',
+    ])
+  })
+
+  // The guarantee is "a dropped approval outcome is never silent". If it
+  // depended on each construction site passing a callback it would be
+  // discipline, not a mechanism — so the notifier defaults ON and this pins it.
+  it('is wired BY DEFAULT — a bare buffer still enqueues the notice', async () => {
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 3,
+      log: () => {},
+      now: () => 1000,
+      // NO onEvictCritical passed.
+    })
+    buf.push('a', inbound('vault_grant_approved', 900))
+    buf.push('a', inbound('secret_provided', 950))
+    buf.push('a', inbound('skill_proposal_apply', 960))
+    buf.push('a', inbound('vault_grant_denied', 970))
+    await settle()
+    const drained = buf.drain('a')
+    const notice = drained.find((m) => m.meta?.source === 'approval_outcome_dropped')
+    expect(notice).toBeDefined()
+    expect(notice!.meta?.dropped_sources).toContain('vault_grant_approved')
+  })
+
+  it('an explicit no-op onEvictCritical opts out of the notice', async () => {
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 3,
+      log: () => {},
+      now: () => 1000,
+      onEvictCritical: () => {},
+    })
+    for (let i = 0; i < 6; i++) buf.push('a', inbound('vault_grant_approved', 900 + i))
+    await settle()
+    expect(buf.drain('a').some((m) => m.meta?.source === 'approval_outcome_dropped')).toBe(false)
+  })
+
+  it('a burst of critical evictions terminates and does not spin the microtask queue', async () => {
+    let pushes = 0
+    const buf = createPendingInboundBuffer({
+      capPerAgent: 3,
+      log: () => {},
+      now: () => 1000,
+      onEvictCritical: (a, m) => notifier(a, m),
+    })
+    const notifier = createApprovalOutcomeDropNotifier({
+      push: (agent, msg) => { pushes++; buf.push(agent, msg) },
+      log: () => {},
+    })
+    for (let i = 0; i < 10; i++) buf.push('a', inbound('vault_grant_approved', 900 + i))
+    await settle()
+    // Bounded: at most one notice per burst plus the follow-up hop, never one
+    // notice per evicted outcome (that is the recursion this guards).
+    expect(pushes).toBeGreaterThan(0)
+    expect(pushes).toBeLessThanOrEqual(3)
+    // A notice is resident, and it is NOT itself an approval outcome — which is
+    // what makes it the preferred victim next time and bounds the chain.
+    const drained = buf.drain('a')
+    expect(drained.some((m) => m.meta?.source === 'approval_outcome_dropped')).toBe(true)
+  })
+
+  it('a burst coalesces into ONE notice naming every dropped source', async () => {
+    const notices: InboundMessage[] = []
+    const notifier = createApprovalOutcomeDropNotifier({
+      push: (_agent, msg) => { notices.push(msg) },
+      log: () => {},
+    })
+    notifier('a', inbound('vault_grant_approved', 1))
+    notifier('a', inbound('secret_declined', 2))
+    notifier('a', inbound('skill_proposal_apply', 3))
+    expect(notices).toHaveLength(0) // deferred, never same-frame
+    await settle()
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.meta?.dropped_sources).toBe(
+      'vault_grant_approved, secret_declined, skill_proposal_apply',
+    )
+    expect(notices[0]!.meta?.dropped_count).toBe('3')
+  })
+
+  it('a button tap victim is labelled button_callback, not "-"', async () => {
+    const notices: InboundMessage[] = []
+    const notifier = createApprovalOutcomeDropNotifier({
+      push: (_agent, msg) => { notices.push(msg) },
+      log: () => {},
+    })
+    notifier('a', {
+      type: 'inbound', chatId: 'c1', messageId: 1, user: 'alice', userId: 42, ts: 1,
+      text: '[user tapped button: Approve]', meta: { button_callback: 'true' },
+    })
+    await settle()
+    expect(notices[0]!.meta?.dropped_sources).toBe('button_callback')
+  })
+})
+
+describe('isApprovalOutcome (PR D)', () => {
+  const withMeta = (meta: Record<string, string> | undefined): InboundMessage => ({
+    type: 'inbound', chatId: 'c1', messageId: 1, user: 'u', userId: 1, ts: 1, text: 't',
+    ...(meta != null ? { meta } : {}),
+  } as InboundMessage)
+
+  it('true for every registered source', () => {
+    for (const s of APPROVAL_OUTCOME_SOURCES) {
+      expect(isApprovalOutcome(withMeta({ source: s }))).toBe(true)
+    }
+  })
+
+  it('true for a button tap with no source at all', () => {
+    expect(isApprovalOutcome(withMeta({ button_callback: 'true' }))).toBe(true)
+  })
+
+  it('false for ordinary messages and non-outcome system sources', () => {
+    expect(isApprovalOutcome(withMeta({}))).toBe(false)
+    expect(isApprovalOutcome(withMeta(undefined))).toBe(false)
+    for (const s of [
+      'missed_approval_retry', 'obligation_represent', 'subagent_handback',
+      'subagent_progress', 'resume_interrupted', 'warmup', 'reaction', 'cron',
+      'approval_outcome_dropped',
+    ]) {
+      expect(isApprovalOutcome(withMeta({ source: s }))).toBe(false)
+    }
+  })
+
+  it('the dropped-notice source is deliberately NOT protected', () => {
+    expect(APPROVAL_OUTCOME_SOURCES.has(APPROVAL_OUTCOME_DROPPED_SOURCE)).toBe(false)
+  })
+
+  // Drift pin on the registry itself. `Object.freeze` on a Set does NOT block
+  // `.add` (Set data lives in internal slots), so asserting `isFrozen` would be
+  // a placebo — immutability is enforced at compile time by the `ReadonlySet`
+  // type. What IS worth pinning is membership: silently dropping a source here
+  // makes that verdict class evictable again with no test going red.
+  it('the registry contents are exactly the audited set', () => {
+    expect([...APPROVAL_OUTCOME_SOURCES].sort()).toEqual([
+      'eval_case_applied',
+      'eval_case_apply_failed',
+      'eval_case_rejected',
+      'mental_model_proposal_applied',
+      'mental_model_proposal_denied',
+      'mental_model_proposal_failed',
+      'mental_model_propose_timeout',
+      'secret_declined',
+      'secret_provide_failed',
+      'secret_provided',
+      'secret_request_timeout',
+      'skill_proposal_apply',
+      'vault_grant_approved',
+      'vault_grant_denied',
+      'vault_grant_timeout',
+      'vault_save_completed',
+      'vault_save_discarded',
+      'vault_save_failed',
+      'vault_save_timeout',
+    ])
   })
 })
