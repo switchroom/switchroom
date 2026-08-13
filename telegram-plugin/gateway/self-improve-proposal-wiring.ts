@@ -27,8 +27,12 @@ import { renderEvalCaseProposalCard, evalCaseProposalKeyboard } from './eval-cas
 import {
   enqueueProposal as enqueueSkillProposal,
   isSuppressed as isSkillProposalSuppressed,
+  REJECTION_TTL_MS,
 } from '../../src/self-improve/skill-proposals.js'
-import { enqueueEvalCaseProposal } from '../../src/self-improve/eval-case-proposals.js'
+import {
+  enqueueEvalCaseProposal,
+  readEvalCaseProposals,
+} from '../../src/self-improve/eval-case-proposals.js'
 
 /** Collaborators the gateway injects into each handler. */
 export interface ProposalWiringDeps {
@@ -114,6 +118,50 @@ export function handlePostSkillProposal(
 }
 
 /**
+ * True iff the operator already DISMISSED this exact eval case within the
+ * rejection TTL — the eval-case twin of `isSuppressed` in skill-proposals.ts.
+ *
+ * Matching is deliberately TIGHTER than the skill path's. A skill proposal is
+ * free prose, so that check has to fuzzy-match (jaccard over content words,
+ * with the slug only relaxing the threshold). An eval case carries a
+ * precomputed `fingerprint` — `caseFingerprint(prompt)`, a hash of the
+ * normalized prompt — and the CLI's own dedup against a skill's applied
+ * evals.json compares those fingerprints EXACTLY
+ * (src/cli/self-improve-eval-case.ts). So this requires exact fingerprint
+ * equality AND same-slug, matching the CLI's per-skill dedup scope: no fuzzy
+ * bar to tune, and a genuinely different correction can never be swallowed.
+ *
+ * The TTL semantics ARE mirrored (a dismissal shouldn't suppress forever), on
+ * the same REJECTION_TTL_MS window. The eval-case store records no
+ * `rejected_at`, so age is measured from `created_at`, which is always <= the
+ * rejection time — the window therefore expires no LATER than a true
+ * rejected_at basis would, erring towards re-surfacing rather than
+ * over-suppressing. A record with an unparseable timestamp is treated as
+ * expired, same as the skill path.
+ */
+export function isEvalCaseProposalSuppressed(
+  stateDir: string,
+  candidate: { skillSlug: string; fingerprint: string },
+  opts: { now?: () => number; ttlMs?: number } = {},
+): boolean {
+  // A missing/empty fingerprint carries no identity — never suppress on it.
+  if (typeof candidate.fingerprint !== 'string' || candidate.fingerprint.length === 0) {
+    return false
+  }
+  const now = (opts.now ?? Date.now)()
+  const ttl = opts.ttlMs ?? REJECTION_TTL_MS
+  for (const p of readEvalCaseProposals(stateDir)) {
+    if (p.status !== 'rejected') continue
+    if (p.skill_slug !== candidate.skillSlug) continue
+    if (p.fingerprint !== candidate.fingerprint) continue
+    const age = now - new Date(p.created_at).getTime()
+    if (!Number.isFinite(age) || age > ttl) continue // expired
+    return true
+  }
+  return false
+}
+
+/**
  * RFC amendment §"corrections as eval cases" — persist an eval-case proposal
  * and post its Approve/Dismiss card. On Approve the callback runs the
  * DETERMINISTIC applier (handleEvalCaseProposalCallback), NOT a model turn, so
@@ -143,6 +191,21 @@ export function handlePostEvalCaseProposal(
   const stateDir = process.env.TELEGRAM_STATE_DIR
   if (stateDir == null || stateDir.length === 0) {
     process.stderr.write(`telegram gateway: post_eval_case_proposal: TELEGRAM_STATE_DIR unset, skipping\n`)
+    return
+  }
+  // Dedup against still-live dismissals — never re-surface an eval case the
+  // operator already tapped Dismiss on (the skill path's guard, which the
+  // eval-case path was missing: a dismissed case re-posted the same card on
+  // every subsequent correction, since the CLI only dedups against evals.json
+  // entries that were already APPLIED).
+  if (isEvalCaseProposalSuppressed(stateDir, {
+    skillSlug: msg.skillSlug,
+    fingerprint: msg.fingerprint,
+  })) {
+    process.stderr.write(
+      `telegram gateway: post_eval_case_proposal suppressed (dismissed before) ` +
+      `slug=${msg.skillSlug} fp=${msg.fingerprint}\n`,
+    )
     return
   }
   const proposal = enqueueEvalCaseProposal(stateDir, {

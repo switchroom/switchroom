@@ -94,6 +94,7 @@ now an anomaly worth investigating, not the norm.
   goes through the same path as the write, so a hostd whose read and write are
   both aliased to the WRONG file still verifies clean — asserting path identity
   is separate work.
+
 - **self-improve: an eval-case proposal card now tells the proposing agent what
   the operator decided — Approve AND Dismiss both wake it.**
   `handleEvalCaseProposalCallback` was a copy of the skill-proposal handler that
@@ -108,6 +109,25 @@ now an anomaly worth investigating, not the norm.
   inbound goes beyond parity with the skill handler, which still stays silent on
   dismiss; silence is the defect. The `apply-eval-case` shell-out is now an
   injectable dep, so both approve branches are covered by deterministic tests.
+
+- **self-improvement: a dismissed eval-case proposal stays dismissed.** The
+  skill-proposal path checked `isSuppressed` before enqueueing; its eval-case
+  twin checked nothing, and the CLI's only dedup was against cases already
+  APPLIED to `evals.json`. So Dismiss recorded `status: "rejected"` and then
+  nothing read it — the agent re-proposed the identical fingerprint on the next
+  correction and the operator got the same card forever. The gateway now
+  consults the proposal store first
+  (`isEvalCaseProposalSuppressed` in `self-improve-proposal-wiring.ts`) and
+  drops a re-proposal that matches a live dismissal. Matching is EXACT on
+  `caseFingerprint(prompt)` plus the skill slug — tighter than the skill path's
+  jaccard, so a genuinely different correction is never swallowed — and honours
+  the same `REJECTION_TTL_MS` window, so a dismissal ages out instead of
+  suppressing forever. `eval-case-proposals.jsonl` is now bounded too
+  (`MAX_EVAL_CASE_PROPOSALS`, mirroring `MAX_PENDING` in the missed-approvals
+  store), since it went from a per-tap read to a per-proposal read; compaction
+  retains every rejection still inside the TTL, so trimming can never
+  un-suppress a card.
+
 - **worktree: `switchroom worktree claim` now provisions an INDEPENDENT clone,
   not a linked `git worktree` — concurrent sub-agents can no longer collide
   through shared git state.** Linked worktrees share the parent repo's refs
