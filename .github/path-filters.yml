@@ -60,6 +60,13 @@ lint:
   - 'vendor/hindsight-memory/scripts/lib/secret_patterns.json'
   # Shared TS/Python behaviour vectors: both suites assert the same file.
   - 'vendor/hindsight-memory/scripts/lib/secret_redaction_vectors.json'
+  # The pinned-dependency manifest. check-claude-cli-lockstep.mjs asserts its
+  # `.claude.cli` equals the CLAUDE_CODE_VERSION pin in BOTH Dockerfiles, and
+  # dependencies.json matched nothing else in this filter — so the one PR
+  # shape that can silently skew it alone (the phantom fleet-wide CLI-drift
+  # shape) is the one that would skip ci-lint and thus skip the only guard
+  # that catches it. Same skip→pass hole the install.sh block above closes.
+  - 'dependencies.json'
   - '.github/actions/setup-switchroom/**'
   - '.github/workflows/ci-lint.yml'
   - *ws9f1-security

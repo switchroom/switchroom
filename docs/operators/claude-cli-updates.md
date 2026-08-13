@@ -1,14 +1,25 @@
 # Updating the bundled Claude CLI
 
 switchroom pins an **exact** Claude CLI version into every image so the whole
-fleet runs one auditable, deterministic runtime. The pin is the
-`CLAUDE_CODE_VERSION` build-arg default in **two** Dockerfiles, kept in lockstep
-(#1978 — a skew between the agent bundle and the hindsight reflection bundle can
-reintroduce the thinking-block failure class):
+fleet runs one auditable, deterministic runtime. The version is written down in
+**three** places and they must always agree (#1978 — a skew between the agent
+bundle and the hindsight reflection bundle can reintroduce the thinking-block
+failure class):
 
-- `docker/Dockerfile.base` → propagates to agent / broker / kernel / auth-broker
-  / hostd (all `FROM ${BASE_IMAGE}`)
-- `docker/Dockerfile.hindsight` (installs claude separately)
+- `docker/Dockerfile.base` → `ARG CLAUDE_CODE_VERSION`; propagates to agent /
+  broker / kernel / auth-broker / hostd (all `FROM ${BASE_IMAGE}`)
+- `docker/Dockerfile.hindsight` → `ARG CLAUDE_CODE_VERSION` (installs claude
+  separately — it does **not** derive from the base image)
+- `dependencies.json` → `.claude.cli`, the pinned-dependency manifest
+  `detectDrift()` (`src/manifest.ts`) compares against what a container
+  actually runs, surfaced by `switchroom doctor` and `switchroom versions`. A
+  stale value here makes every host report a phantom fleet-wide CLI drift.
+
+Lockstep is enforced deterministically by
+`scripts/check-claude-cli-lockstep.mjs` (part of `npm run lint`), which reds if
+any of the three disagrees. The floor half of the contract — every pin at or
+above the #1978 fix version — is asserted in
+`tests/doctor-claude-cli.test.ts`.
 
 A CLI bump is the one change where every *required* CI check can pass while the
 runtime silently breaks — the build checks only prove the binary **installs and
@@ -35,11 +46,15 @@ still works — and it needs a self-hosted runner with subscription creds (below
 1. **Check the canary.** If `ci-claude-latest-canary` is green, latest installs
    and keeps every flag switchroom needs. Read its job summary for the
    pinned-vs-latest delta.
-2. **Bump the pin.** Edit the `CLAUDE_CODE_VERSION=` default in **both**
-   `docker/Dockerfile.base` and `docker/Dockerfile.hindsight` to the new
-   version (keep them identical). One-line each.
+2. **Bump the pin — all three locations, same PR.** Edit the
+   `CLAUDE_CODE_VERSION=` default in **both** `docker/Dockerfile.base` and
+   `docker/Dockerfile.hindsight`, **and** `.claude.cli` in `dependencies.json`,
+   to the new version. One line each, all identical. Run
+   `npm run lint:claude-cli-lockstep` to confirm before pushing — leaving one
+   behind is the classic miss, and it is silent without that check.
 3. **PR → review → merge.** The `build-*` checks rebuild every image on the new
-   pin; the flag contract runs where claude is present.
+   pin; the flag contract runs where claude is present; `lint` enforces the
+   three-way lockstep.
 4. **Release** (version bump + CHANGELOG) → tag → `docker-images` rebuilds all
    images.
 5. **Canary on `test-harness` first** — pin it to the new release, restart, and
