@@ -21,11 +21,20 @@ import {
   chmodSync,
   statSync,
   rmSync,
+  symlinkSync,
+  linkSync,
+  realpathSync,
 } from "node:fs";
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HostdServer } from "../../src/host-control/server.js";
+import {
+  HostdServer,
+  checkConfigPathProvenance,
+  configPathProvenanceWarning,
+  CONFIG_PATH_PROVENANCE_TAG,
+} from "../../src/host-control/server.js";
+import { CANONICAL_CONFIG_PATH } from "../../src/host-control/protocol.js";
 import { hostdRequest } from "../../src/host-control/client.js";
 import type {
   ApprovalGateway,
@@ -51,12 +60,17 @@ function makeServer(opts: {
   configPath?: string;
   approvalGateway?: ApprovalGateway;
   generateApprovalId?: () => string;
-  runReconcile?: (args: { requestId: string }) => Promise<{
+  runReconcile?: (args: {
+    requestId: string;
+    env?: Record<string, string>;
+  }) => Promise<{
     exit_code: number;
     stdout: string;
     stderr: string;
   }>;
   writeConfigFile?: (path: string, content: string) => void;
+  resolveFleetConfigPath?: () => string;
+  identifyForProvenance?: (p: string) => { dev: number; ino: number };
 }) {
   return new HostdServer({
     homeDir: tmp,
@@ -75,6 +89,8 @@ function makeServer(opts: {
     generateApprovalId: opts.generateApprovalId,
     runReconcile: opts.runReconcile,
     writeConfigFile: opts.writeConfigFile,
+    resolveFleetConfigPath: opts.resolveFleetConfigPath,
+    identifyForProvenance: opts.identifyForProvenance,
   });
 }
 
@@ -1367,5 +1383,316 @@ describe("hostd config_propose_edit — relocation guards (#3121 follow-up)", ()
     expect(live).not.toContain("mcp__evil__tool");
     expect(reconcileInvocations).toBe(0);
     expect(finalizeCalls[0]!.outcome).toBe("aborted_config_changed");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// #4661 follow-up — CONFIG PATH PROVENANCE. hostd wrote one file and
+// reconciled a potentially different one: the write target came from the wire
+// literal (`opts.configPath` is unset in production — `main.ts` never passes
+// it), while the `switchroom apply` child resolved its own config through
+// `findConfigFile()` (`$SWITCHROOM_CONFIG` → cwd → `~/.switchroom`). They
+// agreed only because `hostd install` happens to export SWITCHROOM_CONFIG.
+// On divergence: write X, reconcile Y cleanly, `completed / exit 0`, and the
+// approved change is absent from the file everything else reads.
+// Assertions here are on the child's ENV, on a distinct error code, and on the
+// target file's bytes + mtime — never on "a code path ran".
+// ─────────────────────────────────────────────────────────────────────
+describe("hostd config_propose_edit — config path provenance (#4661 follow-up)", () => {
+  it("pins the reconcile child's SWITCHROOM_CONFIG to the file that was just written", async () => {
+    const { gw } = stubGateway("approve");
+    const envs: Array<Record<string, string> | undefined> = [];
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      runReconcile: async ({ env }) => {
+        envs.push(env);
+        return { exit_code: 0, stdout: "applied ok", stderr: "" };
+      },
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "prov-1" });
+
+    // Happy-path regression: the pin does not change the outcome.
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+    // The observable: the child's environment. Pre-fix this was `undefined` —
+    // the child re-derived its own config path and could name another file.
+    expect(envs.length).toBe(1);
+    expect(envs[0]).toBeDefined();
+    expect(envs[0]!.SWITCHROOM_CONFIG).toBe(configPath);
+  });
+
+  // The test above asserts the `runReconcile` SEAM's `env` argument. That
+  // argument is a MIRROR, not the child's environment: production never calls
+  // the seam — it calls the default closure, which passes `reconcileEnv`
+  // positionally to `runSwitchroom(args, extraEnv)` and ignores its own `env`
+  // parameter. They are two independent references to one variable, so deleting
+  // the real `runSwitchroom` argument leaves every seam-based test green.
+  //
+  // This one drives the REAL spawn — no `runReconcile` injection at all —
+  // through the `switchroomBin` stub and reads SWITCHROOM_CONFIG out of the
+  // child's OWN environment. Same pattern as the SWITCHROOM_HOSTD_CONTEXT
+  // assertions in `server.test.ts`. It is the only test that fails if the
+  // production spawn loses the pin.
+  it("spawns the REAL reconcile child (no runReconcile seam) with SWITCHROOM_CONFIG pinned to the written file", async () => {
+    const { gw } = stubGateway("approve");
+    const rec = join(tmp, "reconcile-child-env.txt");
+    // Overwrite the default stub with one that reports its own env + argv.
+    // `switchroomBin` is read at spawn time, so rewriting the same path here
+    // (before the server is constructed) is enough.
+    writeFileSync(
+      stubBin,
+      `#!/bin/sh\n` +
+        `echo "argv: $*" >> "${rec}"\n` +
+        `echo "cfg: $SWITCHROOM_CONFIG" >> "${rec}"\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stubBin, 0o755);
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      // runReconcile deliberately NOT injected — this is the production path.
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "prov-real-1" });
+    expect(resp.result).toBe("completed");
+    expect(resp.exit_code).toBe(0);
+
+    // Exactly one child, and its environment carries the pin. A production
+    // spawn that dropped `reconcileEnv` writes `cfg:` with an empty value here
+    // (the harness does not export SWITCHROOM_CONFIG), which is the pre-fix
+    // bug: the child would re-derive its own path via findConfigFile().
+    const lines = readFile(rec, "utf8").trim().split("\n");
+    expect(lines).toEqual([
+      "argv: apply --only klanker --non-interactive",
+      `cfg: ${configPath}`,
+    ]);
+  });
+
+  it("pins the same SWITCHROOM_CONFIG on the ROLLBACK reconcile, not just the forward one", async () => {
+    const { gw } = stubGateway("approve");
+    const envs: Array<Record<string, string> | undefined> = [];
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      // Forward reconcile fails → rollback restore → recovery reconcile. A
+      // rollback reconciled against a DIFFERENT file is the same bug wearing a
+      // different hat, so the recovery spawn must carry the pin too.
+      runReconcile: async ({ env }) => {
+        envs.push(env);
+        return { exit_code: envs.length === 1 ? 1 : 0, stdout: "", stderr: "boom" };
+      },
+    });
+    await server.start();
+    await send({ unified_diff: GOOD_DIFF, request_id: "prov-2" });
+
+    expect(envs.length).toBe(2);
+    for (const env of envs) {
+      expect(env?.SWITCHROOM_CONFIG).toBe(configPath);
+    }
+  });
+
+  it("returns E_CONFIG_PATH_MISMATCH — no card, no write, no reconcile — when the fleet reads a different file", async () => {
+    const { gw, requests, finalizeCalls } = stubGateway("approve");
+    let reconcileInvocations = 0;
+    const writes: string[] = [];
+    server = makeServer({
+      configEditEnabled: true,
+      // configPath deliberately UNSET: reproduce production, where the write
+      // target is the wire literal /state/config/switchroom.yaml.
+      approvalGateway: gw,
+      // …while the fleet's own resolver names an entirely different file.
+      resolveFleetConfigPath: () => configPath,
+      writeConfigFile: (_p, content) => {
+        writes.push(content);
+      },
+      runReconcile: async () => {
+        reconcileInvocations += 1;
+        return { exit_code: 0, stdout: "applied ok", stderr: "" };
+      },
+    });
+    await server.start();
+    const before = readFile(configPath, "utf8");
+    const mtimeBefore = statSync(configPath).mtimeMs;
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "prov-3" });
+
+    expect(resp.result).toBe("error");
+    expect(resp.error).toMatch(/^E_CONFIG_PATH_MISMATCH/);
+    expect(resp.error_envelope?.code).toBe("E_CONFIG_PATH_MISMATCH");
+    expect(resp.error_envelope?.fix?.kind).toBe("operator_action");
+    // Both paths are named, so the operator can see WHICH two disagree.
+    expect(resp.error).toContain("/state/config/switchroom.yaml");
+    expect(resp.error).toContain(configPath);
+    // Refused BEFORE the operator was ever asked, and before any write.
+    expect(requests.length).toBe(0);
+    expect(finalizeCalls.length).toBe(0);
+    expect(writes.length).toBe(0);
+    expect(reconcileInvocations).toBe(0);
+    // The file the fleet reads is untouched: same bytes, same mtime.
+    expect(readFile(configPath, "utf8")).toBe(before);
+    expect(statSync(configPath).mtimeMs).toBe(mtimeBefore);
+  });
+
+  it("does NOT fire when the fleet path is an ALIAS of the write target", async () => {
+    const { gw } = stubGateway("approve");
+    server = makeServer({
+      configEditEnabled: true,
+      approvalGateway: gw,
+      resolveFleetConfigPath: () => configPath,
+      // Both names carry the same dev+inode — exactly the shipped install,
+      // where /state/config/switchroom.yaml is a bind mount of
+      // ~/.switchroom/switchroom.yaml. A string-only check would reject it,
+      // and so would a realpath compare (a bind mount does not collapse).
+      identifyForProvenance: () => ({ dev: 42, ino: 99 }),
+      runReconcile: async () => ({ exit_code: 0, stdout: "", stderr: "" }),
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "prov-4" });
+
+    // The gate passed; this request then fails further down the pipeline
+    // (the wire literal does not exist in the test sandbox). What matters is
+    // that the provenance gate did not claim a mismatch.
+    expect(resp.error ?? "").not.toMatch(/E_CONFIG_PATH_MISMATCH/);
+  });
+
+  it("skips the gate when an embedder pins configPath explicitly", async () => {
+    const { gw } = stubGateway("approve");
+    server = makeServer({
+      configEditEnabled: true,
+      configPath,
+      approvalGateway: gw,
+      // A scratch config legitimately differs from whatever findConfigFile
+      // finds — an explicit configPath is the documented override, so this
+      // divergence must not be treated as the production bug.
+      resolveFleetConfigPath: () => "/somewhere/else/switchroom.yaml",
+      runReconcile: async () => ({ exit_code: 0, stdout: "applied ok", stderr: "" }),
+    });
+    await server.start();
+    const resp = await send({ unified_diff: GOOD_DIFF, request_id: "prov-5" });
+    expect(resp.result).toBe("completed");
+  });
+});
+
+describe("checkConfigPathProvenance (unit)", () => {
+  it("passes on an identical path string without touching the filesystem", () => {
+    let statCalls = 0;
+    const prov = checkConfigPathProvenance(
+      "/state/config/switchroom.yaml",
+      () => "/state/config/switchroom.yaml",
+      (_p) => {
+        statCalls += 1;
+        return { dev: 1, ino: 1 };
+      },
+    );
+    expect(prov.ok).toBe(true);
+    expect(statCalls).toBe(0);
+  });
+
+  it("passes on a REAL symlink to the config (same inode, different string)", () => {
+    const link = join(tmp, "aliased.yaml");
+    symlinkSync(configPath, link);
+    const prov = checkConfigPathProvenance(link, () => configPath);
+    expect(prov.ok).toBe(true);
+    expect(prov.identityChecked).toBe(true);
+    expect(prov.detail).toMatch(/two names for the SAME file/);
+  });
+
+  it("passes on a REAL hard link — which a realpath compare would have rejected", () => {
+    const hard = join(tmp, "hardlinked.yaml");
+    linkSync(configPath, hard);
+    // realpathSync(hard) === hard !== realpathSync(configPath), so a realpath
+    // compare calls these different files. They are the same inode: a write
+    // through either name is visible through the other, so refusing the apply
+    // here would be a pure false alarm.
+    expect(realpathSync(hard)).not.toBe(realpathSync(configPath));
+    const prov = checkConfigPathProvenance(hard, () => configPath);
+    expect(prov.ok).toBe(true);
+    expect(prov.identityChecked).toBe(true);
+  });
+
+  it("fails on two genuinely different real files and names both", () => {
+    const other = join(tmp, "other.yaml");
+    writeFileSync(other, VALID_BASE_YAML);
+    const prov = checkConfigPathProvenance(configPath, () => other);
+    expect(prov.ok).toBe(false);
+    expect(prov.identityChecked).toBe(true);
+    expect(prov.detail).toContain(configPath);
+    expect(prov.detail).toContain(other);
+    expect(prov.detail).toMatch(/DIFFERENT file/);
+  });
+
+  it("passes (and says why) when the fleet resolver cannot name a config at all", () => {
+    const prov = checkConfigPathProvenance(configPath, () => {
+      throw new Error("No switchroom.yaml found");
+    });
+    // Nothing to compare against is NOT evidence of divergence, and the child
+    // would fail loudly on its own — so this must not block an apply.
+    expect(prov.ok).toBe(true);
+    expect(prov.resolvedPath).toBeNull();
+    expect(prov.detail).toMatch(/could not name a config file/);
+  });
+
+  it("falls back to the string compare — and admits it — when stat throws", () => {
+    const prov = checkConfigPathProvenance(
+      "/state/config/switchroom.yaml",
+      () => configPath,
+      () => {
+        throw new Error("ENOENT: no such file or directory");
+      },
+    );
+    expect(prov.ok).toBe(false);
+    expect(prov.identityChecked).toBe(false);
+    expect(prov.detail).toMatch(/compared as strings, not inodes/);
+    expect(prov.detail).toMatch(/ENOENT/);
+  });
+});
+
+describe("configPathProvenanceWarning (boot assertion, #4661 follow-up)", () => {
+  it("is silent when the fleet resolver names the canonical wire path", () => {
+    expect(configPathProvenanceWarning(() => CANONICAL_CONFIG_PATH)).toBeNull();
+  });
+
+  it("is silent when the canonical path is another name for the fleet path", () => {
+    expect(
+      configPathProvenanceWarning(
+        () => configPath,
+        () => ({ dev: 7, ino: 7 }),
+      ),
+    ).toBeNull();
+  });
+
+  it("emits one greppable, actionable line on a genuine mismatch", () => {
+    const other = join(tmp, "elsewhere.yaml");
+    writeFileSync(other, VALID_BASE_YAML);
+    let ino = 0;
+    const line = configPathProvenanceWarning(
+      () => other,
+      () => ({ dev: 1, ino: (ino += 1) }),
+    );
+    expect(line).not.toBeNull();
+    expect(line!).toContain(CONFIG_PATH_PROVENANCE_TAG);
+    expect(line!).toContain(CANONICAL_CONFIG_PATH);
+    expect(line!).toContain(other);
+    // Names the consequence and the fix, not just the fact.
+    expect(line!).toMatch(/E_CONFIG_PATH_MISMATCH/);
+    expect(line!).toMatch(/SWITCHROOM_CONFIG/);
+    // One line — a multi-line warning gets truncated by log collectors.
+    expect(line!.includes("\n")).toBe(false);
+  });
+
+  it("does not refuse: the boot check only ever returns a string or null", () => {
+    // The deliberate design choice — a config-layout change must not take the
+    // whole daemon down (rollouts included) to protect one verb that refuses
+    // on its own at apply time. Assert the shape that makes that true.
+    let ino = 0;
+    const line = configPathProvenanceWarning(
+      () => "/nope/switchroom.yaml",
+      () => ({ dev: 1, ino: (ino += 1) }),
+    );
+    expect(typeof line).toBe("string");
   });
 });

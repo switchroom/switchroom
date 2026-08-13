@@ -49,6 +49,7 @@ import {
   deniedResponse,
   IDEMPOTENCY_WINDOW_MS,
   MAX_FRAME_BYTES,
+  CANONICAL_CONFIG_PATH,
   type HostdRequest,
   type HostdResponse,
   type Result,
@@ -296,6 +297,24 @@ export interface ServerOptions {
   /** Test seam: override the `switchroom apply` subprocess invocation. */
   runReconcile?: (args: {
     requestId: string;
+    /**
+     * A MIRROR of the env overlay the production spawn merges onto
+     * `process.env` for this reconcile. Carries `SWITCHROOM_CONFIG` on the
+     * `config_propose_edit` path (#4661 follow-up).
+     *
+     * It is NOT the child's environment: production never calls this seam, it
+     * calls the default closure, which passes the same variable POSITIONALLY to
+     * `runSwitchroom(args, extraEnv)` and ignores this parameter entirely. Two
+     * independent references to one variable — nothing in the type system ties
+     * them, and dropping the real spawn's argument would leave every
+     * seam-asserting test green. What keeps the mirror honest is the real-spawn
+     * test "spawns the REAL reconcile child (no runReconcile seam) with
+     * SWITCHROOM_CONFIG pinned to the written file" in
+     * `tests/host-control/config-propose-edit.test.ts`, which injects no seam
+     * and reads the variable out of the child's own environment. Keep them in
+     * step: change the spawn, and that test is what fails.
+     */
+    env?: Record<string, string>;
   }) => Promise<{ exit_code: number; stdout: string; stderr: string }>;
   /**
    * Test seam: override how the live config file is written during a
@@ -310,6 +329,24 @@ export interface ServerOptions {
    * which are portable in CI.
    */
   writeConfigFile?: (path: string, content: string) => void;
+  /**
+   * Test seam: override how the FLEET's config path is resolved for the
+   * apply-time path-provenance gate (#4661 follow-up). Default:
+   * {@link findConfigFile} — the same resolver every agent, the CLI, and
+   * hostd's own `loadConfig()` go through.
+   *
+   * Exists because the gate's whole subject is a disagreement between two
+   * resolvers, and the production one answers from `$SWITCHROOM_CONFIG` / cwd /
+   * `~/.switchroom` — none of which a test can point at
+   * `/state/config/switchroom.yaml` without root and a real bind mount.
+   */
+  resolveFleetConfigPath?: () => string;
+  /**
+   * Test seam: override the `stat(2)`-based file-identity probe the
+   * path-provenance gate uses to tell two NAMES for one file apart from two
+   * different files.
+   */
+  identifyForProvenance?: (p: string) => FileIdentity;
   /**
    * #1841 — operator-passphrase attestation verifier. Default: a
    * broker-backed verifier that forwards the passphrase to the vault
@@ -744,11 +781,12 @@ interface ConfigWriteObservation {
  * apply mutex (documented residual race) — which is exactly what we want to
  * fail on, not tolerate.
  *
- * KNOWN LIMITATION: this reads back the SAME path it wrote. If hostd's read
- * and write go through the same aliased-or-wrong path, verification passes
- * and a path-divergence bug survives. Closing that requires asserting path
- * IDENTITY (the wire `target_path` vs the resolved `configPath`), which is
- * out of scope here.
+ * SCOPE: this reads back the SAME path it wrote, so it cannot detect a write
+ * to the WRONG file — an aliased-or-wrong path reads back perfectly. That half
+ * is {@link checkConfigPathProvenance}'s job, asserted BEFORE the write
+ * (#4661 follow-up). The two compose and neither subsumes the other: a correct
+ * path can still swallow a write, and a landed write to the wrong file is
+ * still invisible to every other reader.
  */
 function verifyConfigWriteObserved(
   configPath: string,
@@ -880,7 +918,188 @@ interface AutoRolloutLatch {
  *
  * Exported so a test can assert the fallback is the LAST arm, not the first.
  */
-export const HOSTD_FALLBACK_CONFIG_PATH = "/state/config/switchroom.yaml";
+export const HOSTD_FALLBACK_CONFIG_PATH = CANONICAL_CONFIG_PATH;
+
+/**
+ * Result of comparing the file hostd would WRITE against the file the rest of
+ * the fleet READS. `ok: false` is the only interesting case; `detail` is
+ * operator-facing prose naming both paths and how they were compared.
+ */
+export interface ConfigPathProvenance {
+  ok: boolean;
+  /** The write target under scrutiny, verbatim. */
+  writePath: string;
+  /** What the fleet's own resolver named, or null when it could not name one. */
+  resolvedPath: string | null;
+  /**
+   * True when the verdict rests on FILE IDENTITY (`st_dev` + `st_ino`) rather
+   * than a string comparison. A `false` here on a `!ok` verdict means "these
+   * are different strings and we could not prove anything about the inodes".
+   */
+  identityChecked: boolean;
+  detail: string;
+}
+
+/** The `stat(2)` fields that define file identity. */
+export interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+/** Default identity probe: `stat(2)`, which follows symlinks. */
+function statIdentity(path: string): FileIdentity {
+  const st = statSync(path);
+  return { dev: st.dev, ino: st.ino };
+}
+
+/**
+ * #4661 follow-up — does hostd write the file the fleet reads?
+ *
+ * `handleConfigProposeEdit` resolves its write target from the WIRE literal
+ * (`req.args.target_path`, pinned to {@link CANONICAL_CONFIG_PATH}) whenever no
+ * explicit `opts.configPath` is set — i.e. in production, since `main.ts` never
+ * passes one. The reconcile child resolves its own config through
+ * {@link findConfigFile} (`$SWITCHROOM_CONFIG` → cwd → `~/.switchroom`). Those
+ * two agree today only because `hostd install` exports `SWITCHROOM_CONFIG`
+ * pointing at the bind mount. Nothing enforced it, and on divergence hostd
+ * wrote file X, reconciled file Y, and returned `completed, exit_code: 0` for a
+ * change absent from the file everything else reads.
+ *
+ * The reconcile spawn now pins `SWITCHROOM_CONFIG` to the write target, so the
+ * CHILD can no longer diverge. This function covers what is left: HOSTD-INTERNAL
+ * consistency between the write target and hostd's OWN `findConfigFile()`
+ * answer — the same resolver hostd's `loadConfig()` and pin journal use. It
+ * cannot speak for the rest of the fleet: `findConfigFile()` is evaluated inside
+ * the hostd container against hostd's cwd, `$HOME` and mount namespace, while an
+ * agent container or the operator's host shell resolve in namespaces hostd
+ * cannot observe. A divergence hostd CAN see is nonetheless proof that the write
+ * is landing somewhere hostd itself would not read back, so the write must not
+ * happen.
+ *
+ * Deliberately quiet about the cases that are NOT divergence, because a check
+ * that cries wolf on every boot is worse than no check:
+ *
+ *  - **Resolver throws** (`No switchroom.yaml found`) → `ok`. It proves nothing
+ *    about divergence, and the child would fail loudly on its own rather than
+ *    silently reconcile a different file.
+ *  - **Two names for one file** → `ok` when both sides carry the same
+ *    `st_dev` + `st_ino`. `/state/config/switchroom.yaml` IS another name for
+ *    `~/.switchroom/switchroom.yaml` in the shipped install, so comparing raw
+ *    strings would fire on every single boot. Identity is compared as
+ *    dev+inode rather than `realpath(2)` deliberately: `realpath` does NOT
+ *    collapse a bind mount (a file bind-mounted to a second path realpaths to
+ *    that second path) nor a hard link, so a realpath compare would report a
+ *    DIFFERENT file for two names that are provably the same bytes — the exact
+ *    false alarm this check must not raise. dev+inode is the definition.
+ *  - **`stat` throws** (either side missing) → fall back to the string compare
+ *    and SAY so in `detail` (`identityChecked: false`), so a mismatch report is
+ *    never read as inode-level evidence when it is not.
+ *
+ * `findConfigFile` already `resolve()`s a relative `$SWITCHROOM_CONFIG` against
+ * cwd, so a relative env value cannot produce a spurious string mismatch.
+ */
+export function checkConfigPathProvenance(
+  writePath: string,
+  resolveFleetConfig: () => string = findConfigFile,
+  identify: (p: string) => FileIdentity = statIdentity,
+): ConfigPathProvenance {
+  let resolvedPath: string;
+  try {
+    resolvedPath = resolveFleetConfig();
+  } catch (e) {
+    return {
+      ok: true,
+      writePath,
+      resolvedPath: null,
+      identityChecked: false,
+      detail:
+        `fleet config resolver could not name a config file ` +
+        `(${(e as Error).message}) — nothing to compare against ${writePath}`,
+    };
+  }
+  if (resolvedPath === writePath) {
+    return {
+      ok: true,
+      writePath,
+      resolvedPath,
+      identityChecked: false,
+      detail: `write target and fleet config path are the same string (${writePath})`,
+    };
+  }
+  let write: FileIdentity;
+  let fleet: FileIdentity;
+  try {
+    write = identify(writePath);
+    fleet = identify(resolvedPath);
+  } catch (e) {
+    return {
+      ok: false,
+      writePath,
+      resolvedPath,
+      identityChecked: false,
+      detail:
+        `write target ${writePath} differs from the fleet config path ` +
+        `${resolvedPath}, and file identity could not be established ` +
+        `(${(e as Error).message}) — compared as strings, not inodes`,
+    };
+  }
+  if (write.dev === fleet.dev && write.ino === fleet.ino) {
+    return {
+      ok: true,
+      writePath,
+      resolvedPath,
+      identityChecked: true,
+      detail:
+        `write target ${writePath} and fleet config path ${resolvedPath} are ` +
+        `two names for the SAME file (dev=${write.dev} ino=${write.ino})`,
+    };
+  }
+  return {
+    ok: false,
+    writePath,
+    resolvedPath,
+    identityChecked: true,
+    detail:
+      `write target ${writePath} (dev=${write.dev} ino=${write.ino}) is a ` +
+      `DIFFERENT file from the config the fleet reads, ${resolvedPath} ` +
+      `(dev=${fleet.dev} ino=${fleet.ino}) — a write here would be invisible ` +
+      `to every other reader`,
+  };
+}
+
+/**
+ * Greppable tag for the boot-time path-provenance warning. Distinct and
+ * stable so an operator (or a log alert) can match exactly this condition.
+ */
+export const CONFIG_PATH_PROVENANCE_TAG = "hostd-config-path-provenance";
+
+/**
+ * Boot-time assertion that hostd's canonical write target is the file the
+ * fleet reads. Returns the log line to emit, or null when they agree.
+ *
+ * LOGS, never refuses: a config-layout change that trips this would otherwise
+ * take hostd down entirely — losing every other verb, including the rollout
+ * path — to protect one verb that has its own apply-time gate
+ * (`E_CONFIG_PATH_MISMATCH`). A loud line plus a hard gate at the point of
+ * damage beats a crash-loop at boot.
+ */
+export function configPathProvenanceWarning(
+  resolveFleetConfig: () => string = findConfigFile,
+  identify: (p: string) => FileIdentity = statIdentity,
+): string | null {
+  const prov = checkConfigPathProvenance(
+    CANONICAL_CONFIG_PATH,
+    resolveFleetConfig,
+    identify,
+  );
+  if (prov.ok) return null;
+  return (
+    `${CONFIG_PATH_PROVENANCE_TAG}: ${prov.detail}. ` +
+    `config_propose_edit will REFUSE with E_CONFIG_PATH_MISMATCH until this ` +
+    `agrees — check the hostd bind mount over ${CANONICAL_CONFIG_PATH} and ` +
+    `the SWITCHROOM_CONFIG it exports alongside it.`
+  );
+}
 
 /**
  * Resolve the live `switchroom.yaml` this daemon reads/writes.
@@ -3268,6 +3487,29 @@ export class HostdServer {
     }
     const configPath =
       this.opts.configPath ?? req.args.target_path;
+    // ── #4661 follow-up — path provenance, BEFORE anything is read or written ──
+    // When no explicit `opts.configPath` is set (production: `main.ts` never
+    // passes one) the write target is the WIRE literal, NOT hostd's own
+    // `resolveHostdConfigPath`. Prove that literal names the same file the fleet
+    // reads before going anywhere near a snapshot, an approval card, or a write:
+    // writing one file and reconciling another returns `completed, exit_code: 0`
+    // for a change nothing else can see. First check in the handler after the
+    // feature flag, so a mismatch cannot leave half-changed state behind.
+    //
+    // An EXPLICIT `opts.configPath` skips the gate. That arm is the documented
+    // embedder/test override (see the opt's docs and `resolveHostdConfigPath`
+    // arm 1): the embedder has named the file deliberately, and a scratch config
+    // under `tmp/` legitimately differs from whatever `findConfigFile` finds.
+    if (this.opts.configPath === undefined) {
+      const provenance = checkConfigPathProvenance(
+        configPath,
+        this.opts.resolveFleetConfigPath ?? findConfigFile,
+        this.opts.identifyForProvenance ?? statIdentity,
+      );
+      if (!provenance.ok) {
+        return this.configPathMismatch(provenance.detail, req, caller, started);
+      }
+    }
     const verdict = validateConfigEdit({
       configPath,
       targetPath: req.args.target_path,
@@ -3877,6 +4119,18 @@ export class HostdServer {
       // within the gateway's 60s dispatch timeout. Falls back to a
       // full apply when the caller is the operator socket (rare) or
       // `runReconcile` is injected by tests.
+      //
+      // #4661 follow-up — PIN the child's config resolution to the file we just
+      // wrote. Without this the child ran `findConfigFile()` itself
+      // (`$SWITCHROOM_CONFIG` → cwd → `~/.switchroom`) while hostd wrote
+      // `configPath`, and the two agreed only because `hostd install` happens to
+      // export `SWITCHROOM_CONFIG`. Nothing enforced it, and the divergence is
+      // silent by construction: hostd writes X, the child reconciles Y cleanly,
+      // and the response is `completed, exit_code: 0` for a change absent from
+      // the file the fleet reads. One env var makes the agreement structural.
+      // The same overlay is handed to the ROLLBACK reconcile below (same
+      // `runner`), so the restore is reconciled against the same file too.
+      const reconcileEnv = { SWITCHROOM_CONFIG: configPath };
       const runner =
         this.opts.runReconcile ??
         (async () =>
@@ -3884,8 +4138,9 @@ export class HostdServer {
             caller.kind === "agent"
               ? ["apply", "--only", callerName, "--non-interactive"]
               : ["apply", "--non-interactive"],
+            reconcileEnv,
           ));
-      const recRes = await runner({ requestId: approvalId });
+      const recRes = await runner({ requestId: approvalId, env: reconcileEnv });
       if (recRes.exit_code === 0) {
         // Tell the operator which agents must restart for this edit to go
         // live (claude loads config at boot — an applied edit is inert until
@@ -3934,7 +4189,7 @@ export class HostdServer {
           started,
         );
       }
-      const recRes2 = await runner({ requestId: approvalId });
+      const recRes2 = await runner({ requestId: approvalId, env: reconcileEnv });
       const recoveryNote =
         recRes2.exit_code === 0
           ? "rolled back successfully"
@@ -4032,6 +4287,40 @@ export class HostdServer {
         "confirm hostd reads and writes the SAME switchroom.yaml the fleet reads (check the hostd bind mount over /state/config/switchroom.yaml)",
         "check for a competing writer to the config (operator hand-edit or editor daemon) during the apply window",
         "inspect the live config by hand before re-proposing — the diff was valid, the write path was not",
+      ])
+      .op("config_propose_edit")
+      .caller(caller.kind === "agent" ? "agent" : "operator")
+      .agentName(caller.kind === "agent" ? caller.name : undefined)
+      .build(req.request_id, Date.now() - started);
+    return { ...built, error: legacy };
+  }
+
+  /**
+   * #4661 follow-up — the write target is not the file the fleet reads, so the
+   * apply refused before touching anything. Sibling of
+   * {@link HostdServer.writeNotObserved}, and the two compose as before/after
+   * halves of the same guarantee: this one asserts path IDENTITY up front (the
+   * limitation `verifyConfigWriteObserved` documents as out of its scope), the
+   * other asserts the bytes LANDED at that path afterwards. Neither subsumes
+   * the other — a correct path can still swallow a write, and an observed write
+   * to the wrong file still reads back perfectly.
+   */
+  private configPathMismatch(
+    detail: string,
+    req: Extract<HostdRequest, { op: "config_propose_edit" }>,
+    caller: SocketIdentity,
+    started: number,
+  ): HostdResponse {
+    const legacy = `E_CONFIG_PATH_MISMATCH: ${detail}`;
+    const built = err(
+      "E_CONFIG_PATH_MISMATCH",
+      "hostd would write a different switchroom.yaml than the fleet reads; apply refused before any write",
+    )
+      .why(detail)
+      .fixOperatorAction("infra", [
+        `confirm the hostd container bind-mounts the live switchroom.yaml onto ${CANONICAL_CONFIG_PATH}`,
+        "confirm SWITCHROOM_CONFIG inside the hostd container points at that same path (hostd install exports it alongside the mount)",
+        "re-propose once the two agree — the diff was never applied, nothing was written",
       ])
       .op("config_propose_edit")
       .caller(caller.kind === "agent" ? "agent" : "operator")
