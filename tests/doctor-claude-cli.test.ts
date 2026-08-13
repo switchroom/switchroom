@@ -58,6 +58,21 @@ describe("claude CLI floor — the shared constant is the only source of truth",
     expect(claudeCliMeetsFloor(pinned!, FLOOR)).toBe(true);
   });
 
+  it("the Dockerfile.hindsight pin is at or above the #1978 fix floor", () => {
+    // Dockerfile.hindsight installs claude SEPARATELY — it does not derive
+    // from the base image — so the assertion above says nothing about it. A
+    // hindsight bundle left below the floor ships the reflection path on a
+    // CLI missing the thinking-merge fix (the exact agent/hindsight skew
+    // #1978 is about) while every other check stays green. That the two pins
+    // are EQUAL is enforced by scripts/check-claude-cli-lockstep.mjs; this is
+    // the floor half of the same contract.
+    const pinned = readPinnedClaudeCliVersion(
+      resolve(import.meta.dirname, "../docker/Dockerfile.hindsight"),
+    );
+    expect(pinned).not.toBeNull();
+    expect(claudeCliMeetsFloor(pinned!, FLOOR)).toBe(true);
+  });
+
   it("nothing outside thinking-effort-risk.ts re-types the floor literal", () => {
     // The floor must live in exactly one place. Both the doctor check and
     // the config-time guard's reason string interpolate the constant.

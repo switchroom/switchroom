@@ -53,6 +53,30 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **the three Claude CLI version pins are now held in lockstep by an
+  executable check, not by prose.** The bundled CLI version is written down in
+  `docker/Dockerfile.base` (`ARG CLAUDE_CODE_VERSION`),
+  `docker/Dockerfile.hindsight` (same ARG, installed separately) and
+  `dependencies.json` (`.claude.cli`) — and nothing executable enforced that
+  they agree. Every skew was provably silent: mutating any one of the three
+  left `npm run lint` at exit 0 with every related test green. The
+  consequences aren't cosmetic — a stale `.claude.cli` is what `detectDrift()`
+  (`src/manifest.ts`) compares against the running binary, so every host
+  reports a phantom fleet-wide CLI drift; and a `Dockerfile.hindsight` left
+  behind ships the reflection bundle on a CLI missing the #1978 thinking-merge
+  fix, which is exactly the agent/hindsight skew that fix exists to prevent.
+  New `scripts/check-claude-cli-lockstep.mjs` (wired into `npm run lint`, and
+  runnable alone as `npm run lint:claude-cli-lockstep`) reds on any
+  disagreement, naming each file, its parsed value, and which one is the odd
+  one out; `dependencies.json` joins the `lint` path filter so the
+  skew-it-alone PR shape can no longer skip ci-lint and with it the guard. The
+  floor half of the contract now covers both images:
+  `tests/doctor-claude-cli.test.ts` asserts `Dockerfile.hindsight` is at or
+  above the 2.1.156 fix floor, not just `Dockerfile.base`.
+  `docs/operators/claude-cli-updates.md` said "two Dockerfiles" while every
+  bump commit cited it as the authority for all three — corrected, with
+  `dependencies.json` added to the bump procedure.
+
 - **`/tmp` no longer fills up and takes the container down with it.** An
   agent's `/tmp` is a 2 GiB RAM-backed tmpfs (`DEFAULT_TMP_SIZE`), and nothing
   ages out of a tmpfs — a long-running container accumulates every scratch
