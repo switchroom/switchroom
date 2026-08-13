@@ -188,6 +188,13 @@ export const INBOUND_SOURCE_CLASSIFICATION: Record<string, { decoupledCompletion
   eval_case_applied: { decoupledCompletion: false },
   eval_case_rejected: { decoupledCompletion: false },
   eval_case_apply_failed: { decoupledCompletion: false },
+  // Eval-case proposal SUPPRESSED (#4664): the gateway declined to post a card
+  // because the operator already dismissed this exact case, and tells the
+  // proposing agent so instead of exiting silently
+  // (buildEvalCaseSuppressedInbound, self-improve-proposal-wiring.ts). Delivered
+  // via `deliverResumeSyntheticOrBuffer` as its OWN live inbound turn, same as
+  // skill_proposal_apply above — it must NOT stamp.
+  eval_case_suppressed: { decoupledCompletion: false },
   // Buzz co-channel (Phase 1): a Nostr kind:9 group message the buzz sidecar
   // injects onto the gateway IPC queue as its OWN live inbound turn (anonymous
   // inject, `meta.source="buzz"`) — never a decoupled completion resolving a

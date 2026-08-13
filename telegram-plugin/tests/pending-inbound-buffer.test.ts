@@ -1237,6 +1237,25 @@ describe('isApprovalOutcome (PR D)', () => {
     }
   })
 
+  // #4664. `eval_case_suppressed` is the one protected member that is not a
+  // verdict card, and it is the one with the least margin for error: no sweep
+  // regenerates it (it fires exactly once, at suppression time, and posts no
+  // card), so an eviction is a PERMANENT block on the agent's turn. Asserted
+  // through the buffer, not just the set, so the pin fails on the behaviour
+  // rather than on a membership literal.
+  it('a buffered eval_case_suppressed notice survives a cap overflow', () => {
+    const buf = createPendingInboundBuffer({ capPerAgent: 3, log: () => {} })
+    buf.push('a', inbound('eval_case_suppressed', 1))
+    buf.push('a', userMsg({ text: 'first', ts: 2 }))
+    buf.push('a', userMsg({ text: 'second', ts: 3 }))
+    // Overflow: the resendable user message must go, not the one-shot notice.
+    buf.push('a', userMsg({ text: 'third', ts: 4 }))
+    const drained = buf.drain('a')
+    expect(drained.map((m) => m.meta?.source ?? m.text)).toEqual([
+      'eval_case_suppressed', 'second', 'third',
+    ])
+  })
+
   it('the dropped-notice source is deliberately NOT protected', () => {
     expect(APPROVAL_OUTCOME_SOURCES.has(APPROVAL_OUTCOME_DROPPED_SOURCE)).toBe(false)
   })
@@ -1251,6 +1270,7 @@ describe('isApprovalOutcome (PR D)', () => {
       'eval_case_applied',
       'eval_case_apply_failed',
       'eval_case_rejected',
+      'eval_case_suppressed',
       'mental_model_proposal_applied',
       'mental_model_proposal_denied',
       'mental_model_proposal_failed',

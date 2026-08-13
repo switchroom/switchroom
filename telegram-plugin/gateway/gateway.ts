@@ -11635,14 +11635,14 @@ if (isGatewayMain) ipcServer = createIpcServer({
   // fall inside the source slice send-outbound-wiring.test.ts takes between
   // onSendOutbound and onQuotaWallDetected.
   onPostSkillProposal(_client: IpcClient, msg: PostSkillProposalMessage) {
-    handlePostSkillProposal(msg, { bot, assertAllowedChat, swallowingApiCall })
+    handlePostSkillProposal(msg, { bot, assertAllowedChat, swallowingApiCall, deliverResumeSyntheticOrBuffer })
   },
 
   // RFC amendment §"corrections as eval cases" — thin delegate; the
   // DETERMINISTIC applier runs on Approve in handleEvalCaseProposalCallback,
   // NOT a model turn. Body in self-improve-proposal-wiring.ts.
   onPostEvalCaseProposal(_client: IpcClient, msg: PostEvalCaseProposalMessage) {
-    handlePostEvalCaseProposal(msg, { bot, assertAllowedChat, swallowingApiCall })
+    handlePostEvalCaseProposal(msg, { bot, assertAllowedChat, swallowingApiCall, deliverResumeSyntheticOrBuffer })
   },
 
   // Buzz Phase 2b: the duplex peer's advisory publish outcome — no-op unless the hub mirror booted.

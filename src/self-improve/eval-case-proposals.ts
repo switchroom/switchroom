@@ -26,14 +26,34 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { EvalCase } from "./eval-cases.js";
+import { REJECTION_TTL_MS } from "./skill-proposals.js";
 
 export const EVAL_CASE_PROPOSALS_FILE = "eval-case-proposals.jsonl";
+
+/**
+ * Bound the on-disk store. This file is append-only (one line per enqueue,
+ * one more per lifecycle transition) and, since the gateway now consults it
+ * on EVERY proposal to honour dismissals, it is a read-per-proposal hot
+ * path — an unbounded file is unbounded parse cost. Mirrors MAX_PENDING in
+ * telegram-plugin/gateway/missed-approvals-store.ts.
+ *
+ * The cap counts DISTINCT proposals, applied separately to still-live
+ * rejections and to everything else, so the file settles at <= 2x this many
+ * lines. The split is the point: a naive drop-oldest trim could discard a
+ * rejection and silently un-suppress a card the operator already dismissed.
+ * Every rejection inside REJECTION_TTL_MS is retained; older ones no longer
+ * suppress anything, so dropping them is lossless.
+ */
+export const MAX_EVAL_CASE_PROPOSALS = 200;
 
 export type EvalCaseProposalStatus = "pending" | "approved" | "rejected";
 
@@ -108,6 +128,70 @@ export function readEvalCaseProposals(stateDir: string): EvalCaseProposal[] {
   return [...byId.values()];
 }
 
+/**
+ * The subset of `all` the bound retains: every rejection still inside the
+ * suppression TTL (capped, newest-first, so a runaway loop can't blow the
+ * bound either), plus the newest non-suppressing records. Relative order is
+ * preserved so a compacted file reads back in the same order as before.
+ */
+function withinBound(
+  all: EvalCaseProposal[],
+  now: number,
+): EvalCaseProposal[] {
+  const isLiveRejection = (r: EvalCaseProposal): boolean => {
+    if (r.status !== "rejected") return false;
+    const age = now - new Date(r.created_at).getTime();
+    // Unparseable timestamp: keep it. A record that can't be aged must not be
+    // silently dropped — suppression treats it as expired, which is the safe
+    // direction there, but deleting it is irreversible.
+    return !Number.isFinite(age) || age <= REJECTION_TTL_MS;
+  };
+  const keepTail = (rows: EvalCaseProposal[]): EvalCaseProposal[] =>
+    rows.length > MAX_EVAL_CASE_PROPOSALS
+      ? rows.slice(rows.length - MAX_EVAL_CASE_PROPOSALS)
+      : rows;
+  const keep = new Set<string>([
+    ...keepTail(all.filter(isLiveRejection)).map((r) => r.id),
+    ...keepTail(all.filter((r) => !isLiveRejection(r))).map((r) => r.id),
+  ]);
+  return all.filter((r) => keep.has(r.id));
+}
+
+/**
+ * Rewrite the store as one line per retained proposal, when it has grown past
+ * the bound. Called only from the append paths: the gateway is the sole writer
+ * (the CLI proposes over IPC), so a rewrite never races an append from another
+ * process. Best-effort — a failed compaction leaves the append-only file
+ * exactly as it was.
+ */
+function compactIfOversized(stateDir: string, now: number): void {
+  const path = proposalsPath(stateDir);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return;
+  }
+  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length <= MAX_EVAL_CASE_PROPOSALS * 2) return;
+  const kept = withinBound(readEvalCaseProposals(stateDir), now);
+  if (kept.length >= lines.length) return; // nothing to gain
+  const tmp = `${path}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmp, kept.map((r) => JSON.stringify(r) + "\n").join(""), {
+      encoding: "utf-8",
+      mode: 0o644,
+    });
+    renameSync(tmp, path);
+  } catch {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* nothing to clean up */
+    }
+  }
+}
+
 export function getEvalCaseProposal(
   stateDir: string,
   id: string,
@@ -130,6 +214,7 @@ export function enqueueEvalCaseProposal(
     ...input,
   };
   appendLine(proposalsPath(stateDir), proposal);
+  compactIfOversized(stateDir, now());
   return proposal;
 }
 
@@ -143,5 +228,6 @@ export function setEvalCaseProposalStatus(
   if (!cur) return undefined;
   const next: EvalCaseProposal = { ...cur, status };
   appendLine(proposalsPath(stateDir), next);
+  compactIfOversized(stateDir, Date.now());
   return next;
 }
