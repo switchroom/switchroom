@@ -75,6 +75,11 @@ import {
   getEvalCaseProposal,
   setEvalCaseProposalStatus,
 } from '../../src/self-improve/eval-case-proposals.js'
+import {
+  buildEvalCaseAppliedInbound,
+  buildEvalCaseRejectedInbound,
+  buildEvalCaseApplyFailedInbound,
+} from './eval-case-proposal-inbound-builders.js'
 import { maskToken } from '../secret-detect/mask.js'
 import {
   defaultVaultWrite,
@@ -464,6 +469,19 @@ export interface CallbackQueryHandlersDeps {
   brokerList?: typeof realListViaBroker
   brokerListGrants?: typeof realListGrantsViaBroker
   brokerVaultTokenFilePath?: typeof realVaultTokenFilePath
+
+  /**
+   * Run the DETERMINISTIC eval-case applier for an approved proposal. Returns
+   * `ok` plus the applier's combined output tail (both go on the card footer
+   * and into the outcome inbound the agent is woken with).
+   *
+   * Injectable for the same reason as the broker seams above: production leaves
+   * it unset and gets the real `switchroom self-improve apply-eval-case`
+   * `execFileSync`, but a unit test cannot shell out to a real CLI, so the
+   * approve path's two branches (applied / apply-failed) were untestable while
+   * this was a bare static import.
+   */
+  runEvalCaseApply?: (id: string) => { ok: boolean; out: string }
 }
 
 // Freshness throttle for the /auth dashboard ↻ refresh button — one live
@@ -625,6 +643,27 @@ export function createCallbackQueryHandlers(deps: CallbackQueryHandlersDeps) {
   const listViaBroker = deps.brokerList ?? realListViaBroker
   const listGrantsViaBroker = deps.brokerListGrants ?? realListGrantsViaBroker
   const vaultTokenFilePath = deps.brokerVaultTokenFilePath ?? realVaultTokenFilePath
+  // Eval-case applier seam. The default body is verbatim the execFileSync that
+  // used to sit inline in handleEvalCaseProposalCallback.
+  const runEvalCaseApply =
+    deps.runEvalCaseApply ??
+    ((id: string): { ok: boolean; out: string } => {
+      const cli = process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
+      try {
+        const out = execFileSync(
+          cli,
+          ['self-improve', 'apply-eval-case', '--id', id],
+          { encoding: 'utf8', timeout: 15000, env: process.env },
+        ).trim()
+        return { ok: true, out }
+      } catch (err) {
+        const e = err as { stdout?: string; stderr?: string; message?: string }
+        return {
+          ok: false,
+          out: [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim(),
+        }
+      }
+    })
 
 /**
  * Handle a callback_query from an auth dashboard button. Parses the
@@ -1377,8 +1416,31 @@ async function handleEvalCaseProposalCallback(ctx: Context, data: string): Promi
     return
   }
 
+  // Same idiom as the skill handler above: the card's own chat/topic is where
+  // the proposing agent was working, so the outcome inbound resumes it there.
+  const cbChatId = String(ctx.chat?.id ?? ctx.from?.id ?? '')
+  const cbThreadId = resolveThreadId(cbChatId, ctx.callbackQuery?.message?.message_thread_id)
+  const inboundCtx = {
+    agent,
+    chat_id: cbChatId,
+    ...(cbThreadId != null ? { threadId: cbThreadId } : {}),
+  }
+
   if (parsed.action === 'deny') {
     setEvalCaseProposalStatus(stateDir, parsed.id, 'rejected')
+    // The agent is TOLD it was dismissed. The skill handler stays silent here;
+    // silence is the defect — a dismissed proposal left the agent waiting on a
+    // wake-up that never came.
+    const denied = deliverResumeSyntheticOrBuffer(
+      agent,
+      buildEvalCaseRejectedInbound({
+        ctx: inboundCtx,
+        proposalId: proposal.id,
+        skillSlug: proposal.skill_slug,
+        heldOut: proposal.held_out,
+        operatorId: senderId,
+      }),
+    )
     await ctx.answerCallbackQuery({ text: '🚫 Dismissed.' }).catch(() => {})
     if (ctx.callbackQuery?.message && 'text' in ctx.callbackQuery.message) {
       await ctx
@@ -1388,6 +1450,10 @@ async function handleEvalCaseProposalCallback(ctx: Context, data: string): Promi
         )
         .catch(() => {})
     }
+    process.stderr.write(
+      `telegram gateway: eval_case_rejected agent=${agent} proposal=${proposal.id} ` +
+      `slug=${proposal.skill_slug} delivered=${denied}\n`,
+    )
     return
   }
 
@@ -1395,20 +1461,7 @@ async function handleEvalCaseProposalCallback(ctx: Context, data: string): Promi
   setEvalCaseProposalStatus(stateDir, parsed.id, 'approved')
   await ctx.answerCallbackQuery({ text: '✅ Adding the eval case…' }).catch(() => {})
 
-  const cli = process.env.SWITCHROOM_CLI_PATH ?? 'switchroom'
-  let applyOk = true
-  let applyOut = ''
-  try {
-    applyOut = execFileSync(
-      cli,
-      ['self-improve', 'apply-eval-case', '--id', parsed.id],
-      { encoding: 'utf8', timeout: 15000, env: process.env },
-    ).trim()
-  } catch (err) {
-    applyOk = false
-    const e = err as { stdout?: string; stderr?: string; message?: string }
-    applyOut = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim()
-  }
+  const { ok: applyOk, out: applyOut } = runEvalCaseApply(parsed.id)
 
   const footer = applyOk
     ? '✅ <i>Added as a regression test.</i>'
@@ -1421,9 +1474,28 @@ async function handleEvalCaseProposalCallback(ctx: Context, data: string): Promi
       )
       .catch(() => {})
   }
+  // Tell the agent the OUTCOME, not just that a tap happened — applied and
+  // apply-failed are different instructions (resume vs. don't assume it exists).
+  const outcomeInbound = applyOk
+    ? buildEvalCaseAppliedInbound({
+        ctx: inboundCtx,
+        proposalId: proposal.id,
+        skillSlug: proposal.skill_slug,
+        heldOut: proposal.held_out,
+        operatorId: senderId,
+      })
+    : buildEvalCaseApplyFailedInbound({
+        ctx: inboundCtx,
+        proposalId: proposal.id,
+        skillSlug: proposal.skill_slug,
+        heldOut: proposal.held_out,
+        operatorId: senderId,
+        applyOut,
+      })
+  const delivered = deliverResumeSyntheticOrBuffer(agent, outcomeInbound)
   process.stderr.write(
     `telegram gateway: eval_case_apply agent=${agent} proposal=${proposal.id} ` +
-    `slug=${proposal.skill_slug} ok=${applyOk}\n`,
+    `slug=${proposal.skill_slug} ok=${applyOk} delivered=${delivered}\n`,
   )
 }
 
