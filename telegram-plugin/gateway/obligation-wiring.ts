@@ -23,6 +23,11 @@ import { buildObligationRepresentInbound, type Obligation } from './obligation-l
 import { driveEscalation } from './escalation-drive.js'
 import { shouldSuppressRepresent } from './represent-guard.js'
 import { shouldDeferEscalationForBridge } from './escalation-bridge-gate.js'
+import {
+  answeredSinceOpen,
+  createEscalationSettleGate,
+  resolveEscalateSettleMs,
+} from './escalation-staleness.js'
 import { parkedTurnStartCount } from './stream-render.js'
 
 export function createObligationWiring(deps: ObligationWiringDeps) {
@@ -49,6 +54,11 @@ export function createObligationWiring(deps: ObligationWiringDeps) {
     bridgeAlive,
     sendEscalationNudge,
   } = deps
+
+  // Escalation settle gate (see escalation-staleness.ts). One instance per
+  // wiring — the sweep is the only caller, and the gate must remember the FIRST
+  // escalate decision for an obligation across sweep ticks.
+  const escalateSettleGate = createEscalationSettleGate(resolveEscalateSettleMs())
 
 /**
  * PR2 obligation-ledger CLOSE. Called when a SUBSTANTIVE final answer lands
@@ -304,11 +314,35 @@ function obligationSweep(): void {
     )
     return
   }
-  if (HISTORY_ENABLED && hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)) {
+  // The settle-gate key folds `openedAt` in beside the origin id: an obligation
+  // that is closed and later RE-OPENED under the same origin turn id gets a new
+  // `openedAt`, hence a new key, hence its own fresh settle window — a stale
+  // entry from the previous episode can never let its first escalation skip the
+  // re-check.
+  const settleKey = `${o.originTurnId}@${o.openedAt}`
+  // SCOPE: chat, not thread. The reply router demonstrably resolves an answer to
+  // a different topic than the obligation's — it logs the override
+  // (`EXPLICIT_OVERRIDDEN(model→4,routed→635)`) — so a thread-keyed query cannot
+  // see the delivered answer and nags on top of it. Rationale + evidence in
+  // escalation-staleness.ts.
+  if (answeredSinceOpen(o, { historyEnabled: HISTORY_ENABLED, hasOutboundDeliveredSince })) {
     process.stderr.write(
       `telegram gateway: obligation closed silently — outbound delivered since open origin=${o.originTurnId}\n`,
     )
+    escalateSettleGate.clear(settleKey)
     obligationLedger.close(o.originTurnId)
+    return
+  }
+  // SETTLE. The check above is a point-in-time read, and the answer is often
+  // still IN FLIGHT at this instant (reply tool invoked, history row not yet
+  // written) — confirmed lags of 1.23s and 2.81s between this decision and the
+  // answer landing. Defer the first decision and re-check on a later sweep, so
+  // the nudge only goes out when "unanswered" held across the settle window.
+  // Bounded: a genuinely unanswered obligation escalates one window later.
+  if (escalateSettleGate.shouldDefer(settleKey, now)) {
+    process.stderr.write(
+      `telegram gateway: obligation escalation deferred — settling (re-checking for an in-flight answer) origin=${o.originTurnId}\n`,
+    )
     return
   }
   // Proceed with escalation: send ONE operator-visible nudge and close the
@@ -337,6 +371,11 @@ function obligationSweep(): void {
     maxAttempts: OBLIGATION_ESCALATE_MAX,
     deadlineMs: OBLIGATION_ESCALATE_SEND_DEADLINE_MS,
   })
+  // Terminal for this settle episode. A send that FAILS leaves the obligation
+  // open and re-drives on a later sweep; that retry then opens its own fresh
+  // settle window, which is the same "re-check before nagging" guarantee, not a
+  // regression. Keeps the gate map from retaining closed obligations.
+  escalateSettleGate.clear(settleKey)
 }
 
   return {

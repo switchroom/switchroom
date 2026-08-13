@@ -291,6 +291,30 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **an obligation escalation no longer nags on top of an answer the user
+  already received.** The escalate branch of the obligation sweep sends a
+  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
+  staleness check that is supposed to stand it down when the agent has already
+  answered. Two mechanisms let that check miss a delivered answer. First it was
+  keyed on the obligation's *thread*, while the reply router routinely resolves
+  an answer to a different topic and logs the override
+  (`EXPLICIT_OVERRIDDEN(model→N,routed→M)`) — so a cross-topic answer was
+  invisible to it (marko 2026-08-13: obligation in thread 4, its 295-char answer
+  delivered to thread 3 at 04:02:51.987, nag fired anyway 14.2s later). Second
+  it is a point-in-time read, and the answer is often still *in flight* at the
+  instant the sweep decides — the reply tool has been invoked but no history row
+  exists yet (marko 2026-08-10: decision 06:36:08.047, answer delivered
+  06:36:09.281; and decision 07:52:34.400, answer delivered 07:52:37.209). The
+  check is now chat-scoped (thread first, chat as the cross-topic fallback), and
+  a new settle gate requires the "unanswered" read to hold across an 8.5s window
+  — derived as 3× the worst observed decision→delivery lag, rounded up to the
+  next 500ms, and at least one 5s sweep tick so a re-check actually runs — before
+  the nudge goes out. Both guards stay bounded: a genuinely unanswered obligation
+  still escalates one settle window later (the 2026-08-12 case, whose real answer
+  was 41s away, is unaffected). New `escalation-staleness.ts` carries the
+  evidence and the derivation; kill switch
+  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0`.
+
 - **the three Claude CLI version pins are now held in lockstep by an
   executable check, not by prose.** The bundled CLI version is written down in
   `docker/Dockerfile.base` (`ARG CLAUDE_CODE_VERSION`),
