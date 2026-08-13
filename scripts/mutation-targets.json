@@ -1,0 +1,25 @@
+{
+  "$comment": [
+    "Curated mutation targets. Every entry is a piece of logic where a silent",
+    "test regression has a real, argued blast radius — NOT a coverage wishlist.",
+    "The check only runs an entry when the PR touches its `file` or one of its",
+    "`tests`, so an unrelated PR pays nothing.",
+    "",
+    "Adding an entry: name the narrowest `symbols` that cover the logic (an",
+    "unscoped entry on a large module is hundreds of mutants), point `tests` at",
+    "the scoped suite, and state `why` in terms of what breaks silently.",
+    "Run `node scripts/check-mutation-coverage.mjs --all` locally first: a new",
+    "entry with surviving mutants fails CI, and the fix is a test that kills",
+    "them (or a `// mutation-allow: <reason>` if the survivor is genuinely",
+    "equivalent — see src/util/log-rotation.ts:641 for what that looks like)."
+  ],
+  "runner": "vitest",
+  "targets": [
+    {
+      "file": "telegram-plugin/gateway/pending-inbound-buffer.ts",
+      "symbols": ["selectEvictionVictim"],
+      "tests": ["telegram-plugin/tests/pending-inbound-buffer.test.ts"],
+      "why": "#4663. Victim selection decides whether a synthetic approval outcome — the one inbound class the operator cannot resend, because the Approve tap already happened — is dropped from the pending buffer. Neutralising the tier-2 age bound left all 76 tests green (git show 2338c280); the agent would block forever on a wake-up that is never coming, and nothing in CI would say so."
+    }
+  ]
+}

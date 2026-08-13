@@ -221,9 +221,28 @@ obligation:
 `check-litellm-config-guard`, `check-release-asset-names`,
 `check-status-pin-single-path`, `check-agent-attribution-trailers`,
 `check-callback-ctx-wrapping`, `check-ctx-send-wrapping`,
-`check-foreign-db-readonly`.
+`check-foreign-db-readonly`, `check-mutation-coverage`.
 
 Traps that bite repeatedly:
+
+- **`check-mutation-coverage` proves the tests constrain something** (v0.21.8
+  post-mortem). Two PRs in one release shipped suites that asserted nothing:
+  #4663's tier-2 age bound in `selectEvictionVictim` was invisible to all 76
+  tests (fixed in `2338c280`), and #4670's tests asserted an injected seam's
+  MIRROR of a variable production passes positionally to `runSwitchroom`, so
+  deleting the real argument left them green (fixed at
+  `tests/host-control/config-propose-edit.test.ts:1439`). Neither is a code
+  shape a linter can see — no `if (false && …)` was ever committed; that string
+  lives only in comments describing a mutation a REVIEWER applied. So the check
+  applies those mutations itself: for each entry in
+  `scripts/mutation-targets.json` whose file or tests the PR touched, it
+  perturbs the named symbols and fails if the scoped suite stays green.
+  DIFF-GATED — an unrelated PR runs nothing; the shipped target costs ~8s. Run
+  `npm run lint:mutation-coverage` for every target. Escape hatch (reason
+  mandatory): `// mutation-allow: <reason>` on or above the line, for genuinely
+  equivalent mutants — `src/util/log-rotation.ts:641` is the worked example.
+  Adding a target: name the narrowest `symbols` (an unscoped entry on a
+  6000-line module is hours of CI) and state the blast radius in `why`.
 
 - **`check-agent-attribution-trailers` needs full history.** It diffs
   `origin/<base>..HEAD` and looks for `Switchroom-Agent:` /
