@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
+
 ### Fixed
 
 - **Telegram `tg://` inline entities survive the render pipeline** — the Bot API
@@ -70,6 +72,11 @@ now an anomaly worth investigating, not the norm.
   card surface are untouched. 1.45.0 does add `duplex: "half"` to every API
   request; a live round-trip against `api.telegram.org` on the fleet's pinned
   Bun 1.3.13 confirms the transport still works.
+
+## v0.21.8 — UTC means UTC inside an agent container again, /tmp stops filling until the container falls over, and the stale-cooccurrence sweep finishes on a large bank
+
+### Dependencies
+
 - **Claude Code CLI pinned 2.1.228 → 2.1.229** — all three lockstep locations
   move together (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
   `dependencies.json`), per `docs/operators/claude-cli-updates.md`. Three
