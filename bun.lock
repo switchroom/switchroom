@@ -13,7 +13,7 @@
         "bcryptjs": "^3.0.3",
         "chalk": "^5.4.0",
         "commander": "^13.1.0",
-        "grammy": "^1.44",
+        "grammy": "^1.45",
         "handlebars": "^4.7.8",
         "nostr-tools": "^2.24.1",
         "posthog-node": "^5.29.2",
@@ -46,7 +46,7 @@
         "@secretlint/core": "^12.2.0",
         "@secretlint/secretlint-rule-preset-recommend": "^12.2.0",
         "@xterm/headless": "^6.0.0",
-        "grammy": "^1.44",
+        "grammy": "^1.45",
         "mdast-util-from-markdown": "^2.0.2",
         "mdast-util-gfm": "^3.0.0",
         "micromark-extension-gfm": "^3.0.0",
@@ -168,7 +168,7 @@
 
     "@grammyjs/runner": ["@grammyjs/runner@2.0.3", "", { "dependencies": { "abort-controller": "^3.0.0" }, "peerDependencies": { "grammy": "^1.13.1" } }, "sha512-nckmTs1dPWfVQteK9cxqxzE+0m1VRvluLWB8UgFzsjg62w3qthPJt0TYtJBEdG7OedvfQq4vnFAyE6iaMkR42A=="],
 
-    "@grammyjs/types": ["@grammyjs/types@3.28.0", "", {}, "sha512-4JvXCdxRZHCje0M4gHzLwtB4bLno3WD28xd8CNfk4POWIu73BFnSvGeW6OQ5gPem4eYTEwkD9yDaXssixl6tMQ=="],
+    "@grammyjs/types": ["@grammyjs/types@4.0.0", "", {}, "sha512-Z8lDLTvOlo12e5Vnly/vQh3JC9ppaitS1dGZ3w068gNitOd/y8tTSiib+Xm38aBGbtYGmUZwOc6afYrLs2CSTg=="],
 
     "@hono/node-server": ["@hono/node-server@1.19.14", "", { "peerDependencies": { "hono": "^4" } }, "sha512-GwtvgtXxnWsucXvbQXkRgqksiH2Qed37H9xHZocE5sA3N8O8O8/8FA3uclQXxXVzc9XBZuEOMK7+r02FmSpHtw=="],
 
@@ -544,7 +544,7 @@
 
     "graceful-fs": ["graceful-fs@4.2.11", "", {}, "sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ=="],
 
-    "grammy": ["grammy@1.44.0", "", { "dependencies": { "@grammyjs/types": "3.28.0", "abort-controller": "^3.0.0", "debug": "^4.4.3", "node-fetch": "^2.7.0" } }, "sha512-gGVykS5+c5f1tPV97LuU6IDRMawE2NzpwM9pNz58HQ35IZXDnYL3VOLvNzYognPSeBIOSzQXRu5w96V0aY8y8A=="],
+    "grammy": ["grammy@1.45.1", "", { "dependencies": { "@grammyjs/types": "4.0.0", "abort-controller": "^3.0.0", "debug": "^4.4.3", "node-fetch": "^2.7.0" } }, "sha512-Y4VL/hqJMZZxwlUr5ZgM68CFu2iIeEkNLR1cY3+Ww68CIvWARDsoXFix7+31rmyC0+7L85ZI+Pq3E5JSG5+nLQ=="],
 
     "handlebars": ["handlebars@4.7.9", "", { "dependencies": { "minimist": "^1.2.5", "neo-async": "^2.6.2", "source-map": "^0.6.1", "wordwrap": "^1.0.0" }, "optionalDependencies": { "uglify-js": "^3.1.4" }, "bin": { "handlebars": "bin/handlebars" } }, "sha512-4E71E0rpOaQuJR2A3xDZ+GM1HyWYv1clR58tC8emQNeQe3RH7MAzSbat+V0wG78LQBo6m6bzSG/L4pBuCsgnUQ=="],
 

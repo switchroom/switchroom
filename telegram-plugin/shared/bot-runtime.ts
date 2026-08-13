@@ -251,8 +251,9 @@ export function installTgPostLogger(bot: Bot): void {
  * call site, `ctx.*` sugar, `lockedBot`, or `bot.api.raw`, so it closes the
  * whole bypass class deterministically.
  *
- * Payload shape (verified against grammy 1.44.0 `out/core/api.js`, the pinned
- * lockfile version):
+ * Payload shape (verified against grammy 1.45.1 `out/core/api.js`, the pinned
+ * lockfile version — byte-identical to the 1.44.0 shape this was originally
+ * written against, re-checked on the 1.45.1 bump):
  *   - `sendRichMessage(chat_id, rich_message, ...)` → raw payload
  *     `{ chat_id, rich_message: { markdown }, ... }`
  *   - `editMessageText(chat_id, message_id, arg, ...)` → raw payload

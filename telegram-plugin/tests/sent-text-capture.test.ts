@@ -43,9 +43,9 @@ const CHAT = 5550001
 /**
  * The response Telegram actually returns for `sendRichMessage` — the body lives
  * in `rich_message.blocks`; `text` and `caption` are ABSENT. Verified against
- * `@grammyjs/types` 3.28.0 (the version `grammy@^1.44` resolves)
- * `message.d.ts:94` (`RichMessageMessage = CommonMessage &
- * MsgWith<"rich_message">`) and `:180` (`rich_message?: RichMessage`), and
+ * `@grammyjs/types` 4.0.0 (the version `grammy@^1.45` resolves)
+ * `message.d.ts:98` (`RichMessageMessage = CommonMessage &
+ * MsgWith<"rich_message">`) and `:184` (`rich_message?: RichMessage`), and
  * against the Bot API reference: `sendRichMessage` "On success, the sent
  * Message is returned", `Message.rich_message: RichMessage` "Optional. Message
  * is a rich formatted message", `RichMessage.blocks` "Content of the message".

@@ -58,6 +58,18 @@ now an anomaly worth investigating, not the norm.
 
 ### Dependencies
 
+- **grammy 1.44.0 → 1.45.1** (`@grammyjs/types` 3.28.0 → 4.0.0), which brings
+  Bot API 10.2 into the type surface and unblocks the rich-message `blocks`
+  work that cannot compile without it. Both manifests move their floor to
+  `^1.45` because 4.x types only ship with grammy ≥ 1.45.0. This also
+  RE-CONVERGES the two lockfiles: `package-lock.json` was already resolving
+  grammy 1.45.1 while `bun.lock` — the one CI installs from — still pinned
+  1.44.0. The outbound payload shape is unchanged (`sendRichMessage` /
+  `editMessageText` still emit `rich_message: { markdown }`, re-verified
+  against 1.45.1 `out/core/api.js`), so `installRichMarkdownGuard` and every
+  card surface are untouched. 1.45.0 does add `duplex: "half"` to every API
+  request; a live round-trip against `api.telegram.org` on the fleet's pinned
+  Bun 1.3.13 confirms the transport still works.
 - **Claude Code CLI pinned 2.1.228 → 2.1.229** — all three lockstep locations
   move together (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
   `dependencies.json`), per `docs/operators/claude-cli-updates.md`. Three
