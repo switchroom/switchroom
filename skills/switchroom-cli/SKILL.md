@@ -294,7 +294,7 @@ The `switchroom-telegram` plugin is an enhanced fork of the official Telegram MC
 
 | Tool | Purpose |
 |---|---|
-| `reply` | Send a text/photo message — the single final-answer tool; chunks anything over Telegram's 4096-char limit. Optional `reply_to` for threaded quotes |
+| `reply` | Send a text/photo message — the single final-answer tool; chunks anything over the 32768-char rich-message cap (4096 applies only to plain-text degradations). Optional `reply_to` for threaded quotes |
 | `react` | Emoji reaction on an inbound or outbound message |
 | `edit_message` | Modify an earlier bot message's text |
 | `delete_message` | Remove an earlier bot message |

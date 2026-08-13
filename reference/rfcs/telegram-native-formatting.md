@@ -71,16 +71,20 @@ constructs this engine cares about:
 | Bold / italic / strike / spoiler / code / link | `**b**`, `_i_`, `~~s~~`, `\|\|spoiler\|\|`, `` `code` ``, `[t](url)` |
 | Heading | bold line (Telegram has no `<h1>`–`<h6>`) |
 | Blockquote | `> …` line-prefixed |
-| **Expandable** blockquote | `**> …` (Bot API 10.1 expandable pull-quote) |
+| **Expandable** blockquote | ~~`**> …`~~ CORRECTED 2026-08-13: `**>` is MarkdownV2-only syntax; the rich markdown path renders it as literal text (wire-probed). The renderer emits a plain `> …` quote for legacy expandable input; a real collapsible is `<details><summary>…</summary>…</details>`, which passes through natively. |
 | Code block | fenced ```` ``` ```` with optional language |
 | List | `- item` / `1. item` |
 | Table | GFM pipe table (`\| col \| col \|` + `\| --- \| --- \|` separator row) |
 
 A live UAT scenario,
 [`telegram-plugin/uat/scenarios/jtbd-rich-formatting-render-dm.test.ts`](../../telegram-plugin/uat/scenarios/jtbd-rich-formatting-render-dm.test.ts),
-already confirms production Telegram renders these markdown constructs — pipe
-tables and expandable blockquotes included — correctly. The renderer's target
-is defined by what that scenario proves, not by a hypothetical HTML mapping.
+already confirms production Telegram renders these markdown constructs
+correctly. (It previously claimed the same for `**>` expandable blockquotes;
+raw wire probes on 2026-08-13 disproved that — the scenario's decode step only
+asserted a `blockquote` entity, which the plain `>` continuation lines produced
+on their own while the `**>` opener came back as literal paragraph text.) The
+renderer's target is defined by what real probes prove, not by a hypothetical
+HTML mapping.
 
 ---
 
@@ -162,7 +166,7 @@ Concretely, the corrections:
 | `code -> <code>…</code>` | `` code -> `…` `` |
 | `link -> <a href>…</a>` | `link -> [text](url)` |
 | `blockquote -> <blockquote>` | `blockquote -> > …` (line-prefixed) |
-| `expandable -> <blockquote expandable>` | `expandable -> **> …` |
+| `expandable -> <blockquote expandable>` | ~~`expandable -> **> …`~~ CORRECTED 2026-08-13: renders as a plain `> …` quote (`**>` is not rich-markdown syntax — wire-probed literal text) |
 | `code-block -> <pre><code class=…>` | fenced ```` ``` ```` + language |
 | `table -> monospaced <pre>` | GFM pipe table (Telegram renders it natively) |
 
@@ -178,9 +182,11 @@ scope for this doc-only PR, flagged for the renderer PR.)
 Telegram caps rich-message length. When rendered markdown exceeds the cap the
 renderer must split **on construct boundaries** — between blocks, list items, or
 table-with-its-own-header — never mid-construct. A table split across two
-messages must repeat its header row in the second; an expandable blockquote must
-not be cut so that its `**>` opener lands in one message and its body in
-another.
+messages must repeat its header row in the second; a blockquote must not be cut
+so that its opening `>` lines land in one message and the rest in another.
+(An earlier revision of this rule referenced the `**>` expandable opener; that
+marker is retired — wire probes 2026-08-13 showed `**>` is MarkdownV2-only and
+renders as literal text on the rich path, so the renderer no longer emits it.)
 
 **Hard rule: never truncate mid-construct.** If a single logical construct is
 itself larger than the cap and cannot be safely split (e.g. one enormous table

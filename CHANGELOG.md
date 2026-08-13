@@ -34,6 +34,28 @@ now an anomaly worth investigating, not the norm.
   link. The reply-tool path never ran the renderer and was already correct; it
   is now pinned by tests.
 
+- **Telegram rich-markdown guards no longer destroy natively-supported
+  constructs** — raw `sendRichMessage` wire probes (2026-08-13) proved
+  `<details><summary>` collapsibles, inline math `$x^2+y^2$`, footnotes
+  (`claim[^1]` + `[^1]: body`), `<sub>`/`<sup>`/`<u>`, `<aside>` pullquotes,
+  `tg://time` links and task lists are all REAL typed nodes on the Bot API
+  10.1 rich path, while the `**>` "expandable blockquote" the docs called
+  live-verified is MarkdownV2-only syntax that renders as literal `**>` text.
+  The send-time guard used to fold `<details>` into `**>` (converting a
+  supported construct into an unsupported one), backslash-escape `$math$`,
+  and delete footnote reference markers — all three conversions are deleted.
+  The renderer no longer emits `**>` anywhere: an IR `expandable` blockquote
+  (and legacy `**> ` agent input, which is still recognised and repaired)
+  degrades to a plain `>` quote, and a genuine collapsible is authored as
+  `<details>`, which now passes through the whole pipeline byte-identical.
+  Footnotes survive the parse→render path via a new verbatim `raw` IR node
+  (previously `escapeMarkdown` broke them as `\[^1\]`), and compact
+  non-currency `$…$` math spans are protected segments for every guard while
+  accidental `$5M … $10M` currency pairs are still defused (#3252). The
+  boot-injected formatting floor card, the formatting guide, the
+  native-formatting RFC, and the stale 4096-char cap claims (real rich cap:
+  `RICH_MESSAGE_MAX_CHARS = 32768`) are corrected in lockstep.
+
 ### Dependencies
 
 - **Claude Code CLI pinned 2.1.228 → 2.1.229** — all three lockstep locations

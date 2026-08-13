@@ -735,9 +735,12 @@ export function normalizePunctuation(text: string): string {
   // The dash rewrite runs per line so blockquote lines can be exempted:
   // `>` blockquotes are reserved for VERBATIM quoted text, and rewriting an
   // author's ` — ` to `, ` inside a quotation would corrupt what they quoted.
-  // The expandable-blockquote opener `**>` is a blockquote line too even though
-  // isBlockquoteLine (which keys on a leading `>`) doesn't catch the `**`
-  // prefix, so exempt it explicitly. Code spans and link hrefs stay masked
+  // A line opening with the LEGACY `**>` expandable-quote marker is a
+  // blockquote line too (the render path no longer emits `**>` — it is
+  // MarkdownV2-only syntax, see render.ts renderBlockquote — but legacy agent
+  // output still contains it and parse.ts repairs it into a real quote), so
+  // exempt it explicitly even though isBlockquoteLine (which keys on a leading
+  // `>`) doesn't catch the `**` prefix. Code spans and link hrefs stay masked
   // throughout, so their dashes are already protected on every line.
   const rewriteDashes = (line: string): string =>
     line

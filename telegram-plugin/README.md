@@ -204,7 +204,9 @@ For long tasks the model does **not** need to narrate progress or drive a
 streaming message itself. The plugin renders an event-driven progress card
 (Plan → Run → Done with live tool bullets, elapsed time, and status emoji)
 for free while the turn is in-flight. Send the final answer once, with
-`reply` — it chunks anything over Telegram's 4096-char limit. (The retired
+`reply` — it chunks anything over the rich-message wire cap of 32768 chars
+(`RICH_MESSAGE_MAX_CHARS` in `format.ts`; the legacy 4096 cap applies only to
+plain-text degradations). (The retired
 `stream_reply` tool was a redundant, worse alias of `reply`; the internal
 progress-card streaming that drove it is preserved and is what renders the
 live card.)

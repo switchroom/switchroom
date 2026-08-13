@@ -50,19 +50,24 @@ You're writing for a phone screen in Telegram. Every reply renders as rich Markd
   decisive phrase inside a longer passage — rarer than bold, never stacked with it;
   fenced code blocks ALWAYS with a language
   hint (```diff, ```json, ```bash — bare fence only for non-code fixed-width output);
-  and the flagship — the **expandable blockquote** `**> first line` + `> continuation`
-  for a long quote, stack trace, or detailed aside the reader can collapse. The `**>`
-  opener must be at the line start (column 0) — never indented — or it won't parse. Use it
-  whenever a bulky supporting block would otherwise dominate the message.
+  and the flagship — the **collapsible `<details>` block**:
+  `<details><summary>Title</summary>` + body + `</details>` for a long quote, stack
+  trace, or detailed aside the reader opts into (add `open` to start expanded). Use it
+  whenever a bulky supporting block would otherwise dominate the message. Never write
+  `**> ` for a collapsible — that is MarkdownV2 syntax; this path renders it as
+  literal `**>` text.
 
-Renders wrong on this path — never emit: underline (`__x__` renders as bold),
-`^sup^`/`~sub~`, `$math$`, `<details>`, footnotes `[^1]`. Write "squared", not `x^2^`.
+Also native on this path: inline math `$x^2+y^2$`, footnotes (`claim[^1]` +
+`[^1]: note` at the end), task-list checkboxes `- [ ]`/`- [x]`, and the HTML tags
+`<sub>`/`<sup>`/`<u>`. Renders wrong — never emit: `__x__` (renders as BOLD, not
+underline — use `<u>`), or the caret/tilde shorthand `^sup^`/`~sub~` (literal noise —
+use `<sup>`/`<sub>` or words).
 
 The framework normalizes mechanics in code on every outbound message: block spacing,
 em/en dashes, and `•` bullet markers are
-rewritten deterministically; unsupported tokens (the CARET `^highlight^` form —
-`==highlight==` renders fine — plus `$math$`, `<details>`, footnotes) are repaired;
-long messages are chunked safely at 32768 chars (fences and
+rewritten deterministically; the unsupported caret `^highlight^` form is repaired
+(`==highlight==` renders fine); accidental currency `$5M and $10M` pairs are kept out
+of math mode; long messages are chunked safely at 32768 chars (fences and
 table rows never bisected); over-bolded messages get their bold stripped. Don't
 hand-tune spacing or fight it — write the content, the gateway makes typography
 consistent. Long before the cap, ask whether a wall of text is the right answer at all.
@@ -94,13 +99,16 @@ Bot API 10.1 rich messages.
 | --- | --- | --- |
 | Bold | `**text**` | The one key fact, not decoration. |
 | Italic | `*text*` or `_text_` | Light emphasis, labels, asides. |
-| Underline | — (not supported) | **`__text__` renders as BOLD**, not underline — Telegram's rich-message markdown parser reads a `__…__` run identically to `**…**` (live-verified against the Bot API, 2026-07). There is no markdown token for underline on this path; don't rely on it. |
+| Underline | `<u>text</u>` | The HTML tag renders a native underline entity (wire-verified 2026-08-13). **The markdown form `__text__` renders as BOLD**, not underline — Telegram's rich-message markdown parser reads a `__…__` run identically to `**…**` (live-verified against the Bot API, 2026-07); never rely on it for underline. |
 | Strikethrough | `~~text~~` | Retractions, "was X now Y". |
 | Spoiler | `\|\|text\|\|` | Hidden until tapped — surprises, long-answer punchlines. Live-verified: surfaces as a `spoiler` entity on the wire (2026-07). |
 | Highlight / marked | `==text==` | Live-verified: surfaces as a `marked` entity on the wire (2026-07). The `=` is an `escapeMarkdown` special, so dynamic text won't trigger it by accident. |
 | Inline code | `` `text` `` | Identifiers, tap-to-copy. Content is literal — no escaping inside. |
-| Subscript | `~text~` (single tilde) | **Falls back to literal text** in rich messages (Bot API 10.1) — the only GFM construct that doesn't render. Avoid. |
-| Superscript | `^text^` | **Falls back to literal text** in rich messages — avoid (use words, e.g. "squared"). |
+| Subscript | `<sub>text</sub>` | The HTML tag renders a native subscript entity (wire-verified 2026-08-13). The tilde shorthand `~text~` (single tilde) **falls back to literal text** — avoid it. |
+| Superscript | `<sup>text</sup>` | The HTML tag renders a native superscript entity (wire-verified 2026-08-13). The caret shorthand `^text^` **falls back to literal text** and is repaired at send time (carets stripped) — avoid it. |
+| Inline math | `$x^2+y^2$` | Renders as a native `mathematical_expression` node (wire-verified 2026-08-13). A compact `$…$` span passes through the outbound guards verbatim; accidental currency pairs (`$5M and $10M`) are still broken apart by the dollar-math guard. |
+| Footnote | `claim[^1]` + `[^1]: note` | Native footnote machinery — superscript marker, anchor, reference link, and footer (wire-verified 2026-08-13). Put definitions at the end of the message. |
+| Date/time link | `[label](tg://time?unix=…)` | Renders a native `date_time` node (wire-verified 2026-08-13). |
 | Custom emoji | Telegram premium custom-emoji entity | Premium-only; renders as a normal emoji for non-premium viewers. Don't rely on it conveying meaning. |
 | Link | `[label](https://…)` | Standard GFM link. |
 
@@ -127,9 +135,17 @@ Bot API 10.1 rich messages.
     `WORKER_STEP_INDENT` in `telegram-plugin/status-no-truncate.ts`.
   - Do **not** reach for a leading `· ` as a pseudo-indent: Telegram promotes it to a
     real list bullet, which is a block-structure line.
-- **Pull-quote / expandable blockquote** — `**> …`** (Bot API 10.1 expandable
-  blockquote). A long quote the reader can collapse/expand. The `**>` opener must be at
-  the line start (column 0) — never indented — or it won't parse.
+- **Collapsible block** — `<details><summary>Title</summary>` + body + `</details>`.
+  Renders a native typed `details` node the reader expands on tap (wire-verified
+  2026-08-13); add `open` (`<details open>`) to start expanded. This replaces the
+  retired `**> ` "expandable blockquote": `**>` is MarkdownV2-only syntax that this
+  path renders as LITERAL `**>` text (wire-verified 2026-08-13). The renderer no
+  longer emits `**>` anywhere; legacy `**> ` input is repaired into a plain `>`
+  blockquote.
+- **Pull-quote** — `<aside>…<cite>credit</cite></aside>`. Renders a native `pullquote`
+  node with a credit line (wire-verified 2026-08-13).
+- **Task list** — `- [ ] open` / `- [x] done`. Renders native checkbox list items
+  (wire-verified 2026-08-13).
 - **Section heading** — `#` … `######`. Only in a genuinely long, multi-section answer.
 - **Preformatted block** — a code fence with no language, for fixed-width non-code
   (ASCII tables, aligned columns).
@@ -138,12 +154,14 @@ Bot API 10.1 rich messages.
 - **Divider** — `---` (thematic break). Heavy horizontal rule between genuinely
   separate sections. Use sparingly.
 
-> Reach for the exotic spans (spoiler, highlight, custom emoji) only when they
+> Reach for the exotic spans (spoiler, highlight, math, custom emoji) only when they
 > genuinely serve the reader. The floor card's "why" applies: structure for the reader,
-> not the writer. Two constructs do NOT render as intended and should be avoided:
-> **sub/superscript** falls back to literal text, and **underline (`__text__`) renders
-> as bold** (Telegram's rich-message markdown has no underline token — live-verified).
-> Spoiler (`||…||`) and highlight (`==…==`) DO render correctly on this path.
+> not the writer. Two SHORTHAND forms do NOT render as intended and should be avoided:
+> the caret/tilde **sub/superscript shorthand** (`^text^` / `~text~`) falls back to
+> literal text, and **underline written as `__text__` renders as bold**. Use the HTML
+> tags instead — `<sub>`, `<sup>`, `<u>` all render natively (wire-verified
+> 2026-08-13). Spoiler (`||…||`) and highlight (`==…==`) DO render correctly on this
+> path.
 
 ### Escaping rules
 

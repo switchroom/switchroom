@@ -73,6 +73,13 @@ export function splitCodeSegments(text: string): Segment[] {
 //   • bare autolinked URLs — `http(s)://…` and `www.…` runs Telegram auto-links.
 //   • GFM table rows — a table's structural pipes / empty cells (`|a||b|`) must
 //     survive; escaping inside a real table row corrupts the table.
+//   • inline-math `$…$` spans — Telegram's rich GFM parser typesets a `$…$`
+//     pair as a real mathematical_expression node (wire-verified 2026-08-13).
+//     A COMPACT span (whitespace-free inner run that is not a bare currency
+//     amount, e.g. `$x^2+y^2$`) is intentional math and must reach the wire
+//     byte-identical: no guard may escape its `$`, `^`, `_`, `*`, or `+`.
+//     Currency-shaped inners (`$5M-$`) are NOT protected, so the dollar-math
+//     guard still breaks accidental `$5M … $10M` currency pairs (#3252).
 // Everything else is prose and stays fully guarded. This is the sibling of the
 // code-span skip: a PROTECTED segment (`code: true`) is emitted verbatim.
 //
@@ -92,6 +99,19 @@ function isTableDelimiterRow(line: string): boolean {
 function isTableCandidateLine(line: string): boolean {
   return /^\s*\|/.test(line);
 }
+
+/** A compact `$…$` inline-math pair: opening `$`, a whitespace-free inner run
+ *  with no nested `$`, closing `$`. Anchored — tested at the scanner's current
+ *  position only. */
+const COMPACT_MATH_PAIR = /^\$([^\s$]+)\$/;
+
+/** A currency-shaped inner run: digits plus amount punctuation and magnitude
+ *  suffix letters only (`5M-`, `0.5`, `10,000`, `5+`). Such a run between two
+ *  `$` is a pair of ADJACENT currency amounts (`$5M-$10M`), not math — it must
+ *  stay guardable so the dollar-math guard can break the accidental pair. A
+ *  run containing any other character (`x^2+y^2`, `\alpha`, `a_b`) is treated
+ *  as intentional math and protected. */
+const CURRENCY_SHAPED_INNER = /^[0-9.,+\-kKmMbB]+$/;
 
 /** Find the [start, end) char ranges (relative to `text`) of GFM table blocks —
  *  maximal runs of 2+ consecutive `|`-leading lines that contain a delimiter
@@ -185,6 +205,19 @@ function splitProseProtected(text: string): Segment[] {
         continue;
       }
     }
+    // 4. Compact inline-math pair `$…$` — a supported Telegram construct
+    //    (mathematical_expression, wire-verified 2026-08-13) that must reach
+    //    the wire verbatim. Currency-shaped inners are NOT math (they are two
+    //    adjacent amounts like `$5M-$10M`) and stay guardable.
+    if (ch === "$") {
+      const m = COMPACT_MATH_PAIR.exec(text.slice(i));
+      if (m && !CURRENCY_SHAPED_INNER.test(m[1])) {
+        const end = i + m[0].length;
+        pushProtected(i, end);
+        i = end;
+        continue;
+      }
+    }
     i++;
   }
   if (plainStart < text.length) out.push({ code: false, text: text.slice(plainStart) });
@@ -193,10 +226,11 @@ function splitProseProtected(text: string): Segment[] {
 
 /** Split rendered markdown into prose / protected segments where a PROTECTED
  *  (`code: true`) segment is any content a guard must emit verbatim: code spans,
- *  fenced code blocks, markdown link destinations, bare autolinks, and GFM
- *  table rows. This is the link/table-aware superset of `splitCodeSegments` that
- *  all four #3252 guards route through. Prose segments (`code: false`) remain
- *  guardable (including a link's `[label]` text). Deterministic, linear-time. */
+ *  fenced code blocks, markdown link destinations, bare autolinks, GFM table
+ *  rows, and compact `$…$` inline-math spans. This is the link/table/math-aware
+ *  superset of `splitCodeSegments` that all the #3252 guards route through.
+ *  Prose segments (`code: false`) remain guardable (including a link's
+ *  `[label]` text). Deterministic, linear-time. */
 export function splitProtectedSegments(text: string): Segment[] {
   const out: Segment[] = [];
   for (const seg of splitCodeSegments(text)) {

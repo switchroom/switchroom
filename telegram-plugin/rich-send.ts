@@ -54,16 +54,31 @@ export interface InputRichMessageMarkdown {
  * guards is disjoint in the characters it inspects AND the characters it
  * inserts (`\_ \* \> \. \~ \=\= \|\|` vs `\$`), so no other insertion can
  * create or destroy a signal for a sibling. Verified by composition tests.
+ *
+ * Intentional inline math (`$x^2+y^2$`, a native Telegram construct) is
+ * PROTECTED from every sub-guard: `splitProtectedSegments` treats a compact
+ * non-currency `$…$` span like a code span (see code-segments.ts), so the
+ * dollar guard neither counts nor escapes its `$` and the emphasis/caret
+ * guards never rewrite its interior.
  */
 export function guardAccidentalFormatting(markdown: string): string {
   let out = markdown
-  // Repair Telegram-unrenderable tokens FIRST: `<details>` folds into a `**> `
-  // expandable blockquote whose `> `-with-space lines are invisible to the
-  // block-construct guard (which only escapes space-LESS `>digit`/`>=`), and
-  // `**> ` is the exact marker switchroom's own render path emits — so the
-  // downstream emphasis/block guards treat it identically to a native
-  // expandable quote. Caret/footnote removal inserts no trigger char for any
-  // sibling guard, so this pass neither creates nor destroys their signals.
+  // Repair Telegram-unrenderable tokens FIRST. This pass now strips ONLY caret
+  // pairs (`^x^` → `x`): removing a `^` inserts no trigger char for any
+  // sibling guard, so it neither creates nor destroys their signals.
+  //
+  // What this pass deliberately NO LONGER does (wire-verified 2026-08-13 by
+  // raw `sendRichMessage` probes): it used to fold `<details>` into a `**> `
+  // "expandable blockquote" and delete footnote markers `[^1]`. Both beliefs
+  // were false — `<details><summary>` and footnotes are NATIVE rich-markdown
+  // constructs (typed `details` / footnote nodes on the wire), while `**>` is
+  // MarkdownV2-only syntax the rich path renders as LITERAL `**>` text. The
+  // conversion destroyed a supported construct to emit an unsupported one, so
+  // it is deleted. `<details>`, footnotes, `<sub>`/`<sup>`/`<u>`, `<aside>`,
+  // `tg://` links and task lists all pass through every guard untouched: none
+  // of `< > [ ] : /` is a trigger char for the emphasis / heading /
+  // block-construct / inline-pair / dollar guards ('composition' tests cover
+  // this interaction).
   out = guardUnsupportedTokens(out)
   out = guardAccidentalEmphasis(out)
   out = guardAccidentalHeading(out)

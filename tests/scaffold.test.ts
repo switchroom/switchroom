@@ -4090,11 +4090,19 @@ describe("scaffoldAgent with global defaults cascade", () => {
     expect(startSh).toContain("chunked safely at 32768 chars");
     expect(startSh).toContain("Every reply renders as rich Markdown");
     // The thickened card promotes the flagship rich constructs resident so the
-    // model reaches for them without loading anything: expandable blockquotes,
-    // fenced-code language hints, and the "renders wrong — never emit" anti-list.
-    expect(startSh).toContain("expandable blockquote");
+    // model reaches for them without loading anything: the collapsible
+    // `<details>` block (which replaced the falsified `**>` "expandable
+    // blockquote" — wire probes 2026-08-13 showed `**>` renders as literal
+    // text on the rich path), fenced-code language hints, and the "renders
+    // wrong — never emit" anti-list.
+    expect(startSh).toContain("collapsible \`<details>\` block");
+    expect(startSh).not.toContain("expandable blockquote");
     expect(startSh).toContain("fenced code blocks ALWAYS with a language");
-    expect(startSh).toContain("never emit: underline");
+    expect(startSh).toContain("never emit: \`__x__\`");
+    // Wire-verified natives are taught as SUPPORTED, not forbidden.
+    expect(startSh).toContain("inline math \`$x^2+y^2$\`");
+    expect(startSh).toContain("footnotes (\`claim[^1]\`");
+    expect(startSh).toContain("task-list checkboxes");
     // Full Bot API 10.1 surface folded resident (the on-demand skill is gone,
     // so the card must carry EVERY construct with its when-to-use guidance):
     // italic, strikethrough, spoiler, ordered/nested lists, divider.
@@ -4109,7 +4117,7 @@ describe("scaffoldAgent with global defaults cascade", () => {
     // unambiguous that only the CARET ^...^ form is repaired away, so no agent
     // misreads "^highlight^ is repaired" as "highlighting never works".
     expect(startSh).toContain("`==highlight==` to marker-pen the one");
-    expect(startSh).toContain("the CARET `^highlight^` form");
+    expect(startSh).toContain("the unsupported caret `^highlight^` form");
     expect(startSh).toContain("`==highlight==` renders fine");
     // The on-demand telegram-formatting skill was deleted (its guidance is now
     // resident + deterministically repaired at send time). The card must carry

@@ -16,10 +16,11 @@
 // "HTML" }`. There is no HTML anywhere on the current outbound path (see
 // `reference/telegram-formatting-guide.md`). This renderer therefore targets
 // the ACTUAL contract: GFM markdown with the Bot API 10.1 extensions
-// documented in the formatting guide (expandable blockquote via `**> `,
-// spoiler via `||…||`, GFM pipe tables, etc). This module is NOT wired into
-// the live send path yet — that is a later increment, per the RFC's phased
-// rollout (rich rendering stays gated off by default until then).
+// documented in the formatting guide (spoiler via `||…||`, GFM pipe tables,
+// `<details>` collapsibles passed through as HTML, etc). NOTE: `**> ` is NOT
+// part of that contract — it is MarkdownV2-only syntax the rich path renders
+// as literal text (wire-verified 2026-08-13); this renderer no longer emits
+// it anywhere (see renderBlockquote).
 //
 // Round-trip note: `parse.ts` folds inline text (`PlainNode.text`,
 // `CodeNode.text`, `code-block` `text`, link `href`) into DECODED strings —
@@ -111,6 +112,13 @@ function renderInline(node: Inline, ctx: InlineCtx = {}): string {
       // `escapeLinkHref` treatment a link's does (a no-op for the paren-free
       // `tg:` URLs in practice, load-bearing if one ever carries a `)`).
       return `![${escapeMarkdown(collapseLabelBreaks(node.label))}](${escapeLinkHref(node.href)})`;
+    case "raw":
+      // Verbatim wire passthrough — the source bytes ARE the wire syntax
+      // (footnote reference markers `[^1]` / definition lines `[^1]: …`,
+      // which Telegram's rich parser renders natively; escapeMarkdown would
+      // escape their `[`/`]` and break the construct — the exact bug this
+      // node type exists to prevent).
+      return node.text;
     default: {
       // Exhaustiveness guard — the IR union is closed; a new variant must be
       // handled above rather than silently dropped.
@@ -138,17 +146,20 @@ function prefixLines(text: string, prefix: string): string {
 
 function renderBlockquote(node: BlockquoteNode): string {
   const inner = renderBlocks(node.children);
-  // Bot API 10.1 expandable blockquote: `**> ` on the first quoted line.
-  // Plain blockquote: `> ` on every line.
-  if (node.expandable) {
-    const lines = inner.split("\n");
-    return lines
-      .map((line, i) => {
-        const marker = i === 0 ? "**> " : "> ";
-        return line.length > 0 ? `${marker}${line}` : marker.trimEnd();
-      })
-      .join("\n");
-  }
+  // Always a plain `> ` blockquote — including for `expandable: true` nodes.
+  //
+  // This renderer USED to emit `**> ` on the first line of an expandable
+  // quote, believing it to be the Bot API 10.1 expandable-blockquote marker.
+  // That belief was falsified by raw sendRichMessage wire probes (2026-08-13):
+  // `**>` is MarkdownV2 syntax; the rich markdown path renders it as a LITERAL
+  // `**> …` paragraph followed by a detached plain quote. The `expandable`
+  // flag is retained on the IR (parse.ts still repairs legacy `**>` input into
+  // a real blockquote instead of letting the literal `**>` reach the wire),
+  // but it is NOT a distinct wire style — the faithful degradation is a plain
+  // quote, which shows the full content. An author who wants a genuine
+  // collapsible writes `<details><summary>…</summary>…</details>`, which the
+  // rich path renders natively (typed `details` node, wire-verified) and which
+  // passes through this pipeline verbatim.
   return prefixLines(inner, "> ");
 }
 
@@ -323,6 +334,9 @@ export const SUPPORTED_INLINE = [
   // entities in Telegram's Rich Markdown grammar. Emitted verbatim (label and
   // href re-escaped); any OTHER image url stays a `plain` node.
   "tg-entity",
+  // Verbatim passthrough for constructs whose SOURCE bytes are the wire syntax
+  // (footnote markers/definitions). Never escaped, never rewritten.
+  "raw",
 ] as const;
 
 export const SUPPORTED_BLOCK = [

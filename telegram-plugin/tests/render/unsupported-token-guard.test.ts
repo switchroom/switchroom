@@ -3,43 +3,60 @@ import { guardUnsupportedTokens } from "../../render/unsupported-token-guard.js"
 import { richMessage } from "../../rich-send.js";
 
 describe("guardUnsupportedTokens — deterministic send-time repair", () => {
-  it("folds <details><summary> into a Telegram expandable blockquote", () => {
+  // ── Natively-supported constructs pass through BYTE-IDENTICAL ────────────
+  // Wire-verified 2026-08-13: raw sendRichMessage probes showed `<details>`,
+  // footnotes, `<sub>`/`<sup>`/`<u>`, `<aside>`, `tg://time` and task lists
+  // all parse into real typed nodes on Telegram's rich markdown path. An
+  // earlier revision of this guard "repaired" `<details>` into a `**> `
+  // expandable blockquote (MarkdownV2-only syntax that renders as LITERAL
+  // `**>` text on this path) and deleted footnote markers — both conversions
+  // destroyed supported constructs and are deleted. These tests would FAIL on
+  // the old guard.
+  it("passes a <details><summary> block through untouched (native construct)", () => {
     const input =
-      "Here is the trace:\n<details><summary>Stack trace</summary>\nline 1\nline 2\n</details>\ndone";
-    const out = guardUnsupportedTokens(input);
-    // Anti-tautology: the raw HTML tags MUST be gone from the wire body.
-    expect(out).not.toContain("<details>");
-    expect(out).not.toContain("</details>");
-    expect(out).not.toContain("<summary>");
-    // Summary becomes the expandable-blockquote first line (`**> ` marker).
-    expect(out).toContain("**> Stack trace");
-    // Body lines become plain `> ` continuation lines.
-    expect(out).toContain("> line 1");
-    expect(out).toContain("> line 2");
+      "Here is the trace:\n<details open><summary>Stack trace</summary>\n\nline 1\nline 2\n\n</details>\ndone";
+    expect(guardUnsupportedTokens(input)).toBe(input);
   });
 
-  it("folds a <details> without a <summary> into an expandable blockquote", () => {
-    const out = guardUnsupportedTokens("<details>hidden body text</details>");
-    expect(out).not.toContain("<details");
-    expect(out).toContain("**> hidden body text");
+  it("passes a <details> without a <summary> through untouched", () => {
+    const input = "<details>hidden body text</details>";
+    expect(guardUnsupportedTokens(input)).toBe(input);
   });
 
+  it("never converts <details> into the retired `**>` marker", () => {
+    const out = guardUnsupportedTokens(
+      "<details><summary>More</summary>\nbody\n</details>",
+    );
+    expect(out).not.toContain("**>");
+    expect(out).toContain("<details>");
+  });
+
+  it("keeps footnote reference markers AND definition lines (native construct)", () => {
+    expect(guardUnsupportedTokens("see the note[^1] here")).toBe(
+      "see the note[^1] here",
+    );
+    expect(guardUnsupportedTokens("[^1]: the definition")).toBe(
+      "[^1]: the definition",
+    );
+    // Alphanumeric ids too — the pair renders as real footnote machinery.
+    expect(guardUnsupportedTokens("claim[^note] holds\n\n[^note]: body")).toBe(
+      "claim[^note] holds\n\n[^note]: body",
+    );
+  });
+
+  it("passes <sub>/<sup>/<u>/<aside> HTML tags through untouched", () => {
+    const input =
+      "H<sub>2</sub>O and x<sup>2</sup> and <u>under</u>\n<aside>pull\n<cite>credit</cite></aside>";
+    expect(guardUnsupportedTokens(input)).toBe(input);
+  });
+
+  // ── The one genuinely-unsupported token: caret pairs ─────────────────────
   it("strips caret highlight / superscript pairs to their inner text", () => {
     expect(guardUnsupportedTokens("energy is x^2^ joules")).toBe(
       "energy is x2 joules",
     );
     expect(guardUnsupportedTokens("a ^highlighted^ word")).toBe(
       "a highlighted word",
-    );
-  });
-
-  it("removes footnote reference markers but keeps definition lines", () => {
-    expect(guardUnsupportedTokens("see the note[^1] here")).toBe(
-      "see the note here",
-    );
-    // A `[^1]:` definition line is left intact (the negative lookahead).
-    expect(guardUnsupportedTokens("[^1]: the definition")).toBe(
-      "[^1]: the definition",
     );
   });
 
@@ -71,27 +88,18 @@ describe("guardUnsupportedTokens — deterministic send-time repair", () => {
     expect(guardUnsupportedTokens("x^2^ metres")).toBe("x2 metres");
   });
 
-  it("repairs alphanumeric footnote markers, not just numeric", () => {
-    // POLISH-4: widened from digits-only so `[^note]`/`[^ref]` no longer ship
-    // as literal bracket noise. Each would survive UNTOUCHED on origin/main.
-    expect(guardUnsupportedTokens("see the note[^note] here")).toBe(
-      "see the note here",
-    );
-    expect(guardUnsupportedTokens("as shown[^ref] above")).toBe(
-      "as shown above",
-    );
-    expect(guardUnsupportedTokens("point[^fn1] made")).toBe("point made");
-    // A single-letter id is a footnote too.
-    expect(guardUnsupportedTokens("claim[^a] holds")).toBe("claim holds");
-    // Definition lines with an alphanumeric id are still left intact (`(?!:)`).
-    expect(guardUnsupportedTokens("[^note]: the definition")).toBe(
-      "[^note]: the definition",
-    );
+  it("never strips carets inside a $…$ math span (protected segment)", () => {
+    // `$x^2y^2$` contains an alphanumeric-only caret pair (`^2y^`) that the
+    // caret regex WOULD strip in bare prose — but the compact math span is a
+    // protected segment (code-segments.ts), so the wire bytes survive intact
+    // for Telegram to typeset as a mathematical_expression node.
+    const math = "inline $x^2y^2$ done";
+    expect(guardUnsupportedTokens(math)).toBe(math);
   });
 
   it("leaves regex-literal negated char classes intact", () => {
-    // Real negated char classes contain punctuation / ranges / escapes, so the
-    // alphanumeric-only id requirement excludes them — these stay verbatim.
+    // The guard no longer touches `[^…]` at all (footnotes are supported),
+    // so every negated-char-class shape survives verbatim.
     expect(guardUnsupportedTokens("use [^/] to match")).toBe(
       "use [^/] to match",
     );
@@ -99,20 +107,11 @@ describe("guardUnsupportedTokens — deterministic send-time repair", () => {
       "strip [^a-z] chars",
     );
     expect(guardUnsupportedTokens('match [^"] here')).toBe('match [^"] here');
-    // Accepted tradeoff (task POLISH-4): a PURE-alphanumeric negated class in
-    // BARE prose like `array[^index]` is now treated as a footnote and stripped.
-    // This is rare — regex/index literals in real prose live in code spans,
-    // which splitProtectedSegments masks (see code-span test below).
-    expect(guardUnsupportedTokens("array[^index] lookup")).toBe("array lookup");
-    // …but inside a code span the same literal is untouched.
+    expect(guardUnsupportedTokens("array[^index] lookup")).toBe(
+      "array[^index] lookup",
+    );
     expect(guardUnsupportedTokens("`array[^index]` lookup")).toBe(
       "`array[^index]` lookup",
-    );
-  });
-
-  it("repairs a real numeric footnote marker", () => {
-    expect(guardUnsupportedTokens("see the note[^1] here")).toBe(
-      "see the note here",
     );
   });
 
@@ -139,18 +138,19 @@ describe("guardUnsupportedTokens — deterministic send-time repair", () => {
     expect(guardUnsupportedTokens(once)).toBe(once);
   });
 
-  it("OUTCOME: the composed richMessage wire body has unsupported tokens repaired", () => {
-    // End-to-end through the real send-path composition. This is the
-    // anti-tautology anchor: without guardUnsupportedTokens wired into
-    // guardAccidentalFormatting, the raw `<details>` / `^` / `[^1]` tokens would
-    // reach the wire and this assertion would FAIL.
+  it("OUTCOME: the composed richMessage wire body preserves supported constructs and repairs carets", () => {
+    // End-to-end through the real send-path composition (the FULL
+    // guardAccidentalFormatting pipeline). This is the anti-tautology anchor:
+    // on the pre-fix pipeline, `<details>` was folded into the unsupported
+    // `**>` marker and `[^1]` was deleted — every assertion below would FAIL.
     const { markdown } = richMessage(
-      "note[^1]\n<details><summary>More</summary>\ndetail line\n</details>\nx^2^",
+      "note[^1]\n<details><summary>More</summary>\ndetail line\n</details>\nx^2^\n\n[^1]: the note",
     );
-    expect(markdown).not.toContain("<details>");
-    expect(markdown).not.toContain("[^1]");
-    expect(markdown).toContain("**> More");
-    expect(markdown).toContain("> detail line");
-    expect(markdown).toContain("x2");
+    expect(markdown).toContain("<details><summary>More</summary>");
+    expect(markdown).toContain("</details>");
+    expect(markdown).toContain("note[^1]");
+    expect(markdown).toContain("[^1]: the note");
+    expect(markdown).not.toContain("**>");
+    expect(markdown).toContain("x2"); // caret pair repaired
   });
 });

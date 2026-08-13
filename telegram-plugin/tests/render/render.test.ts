@@ -195,7 +195,10 @@ describe("render: block palette", () => {
   it("plain blockquote", () => {
     expect(render(parse("> quoted line"))).toBe("> quoted line");
   });
-  it("expandable blockquote uses **> on the first line", () => {
+  it("expandable IR flag renders as a PLAIN quote — the retired `**>` marker is never emitted", () => {
+    // `**>` is MarkdownV2-only syntax; the rich markdown path renders it as
+    // LITERAL `**>` text (wire-proved 2026-08-13 via raw sendRichMessage
+    // probes), so the renderer degrades an expandable node to a plain quote.
     const doc: Document = {
       blocks: [
         {
@@ -214,9 +217,10 @@ describe("render: block palette", () => {
         },
       ],
     };
-    expect(render(doc)).toBe("**> hidden gem");
+    expect(render(doc)).toBe("> hidden gem");
+    expect(render(doc)).not.toContain("**>");
   });
-  it("multi-line expandable blockquote continues with a plain > marker", () => {
+  it("multi-line expandable blockquote renders every line with a plain > marker", () => {
     const doc: Document = {
       blocks: [
         {
@@ -242,8 +246,9 @@ describe("render: block palette", () => {
       ],
     };
     const out = render(doc);
+    expect(out).not.toContain("**>");
     const lines = out.split("\n");
-    expect(lines[0]).toBe("**> line one");
+    expect(lines[0]).toBe("> line one");
     for (const line of lines.slice(1)) {
       expect(line.startsWith("> ") || line === ">").toBe(true);
     }

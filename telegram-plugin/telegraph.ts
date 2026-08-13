@@ -193,10 +193,12 @@ export async function createTelegraphPage(
 }
 
 /**
- * A blockquote line: a plain `> ` marker OR the expandable-blockquote opener
- * `**> ` (Bot API 10.1 syntax the switchroom render path emits on the first
- * line of an expandable quote — see `render/render.ts` and
- * `reference/telegram-formatting-guide.md`). Telegra.ph has no collapsible
+ * A blockquote line: a plain `> ` marker OR the LEGACY expandable-blockquote
+ * opener `**> ` (a switchroom encoding once believed to be Bot API 10.1
+ * syntax; wire probes 2026-08-13 showed the rich path renders `**>` as
+ * literal text, so `render/render.ts` no longer emits it — but legacy agent
+ * output still contains it and it must be tolerated on input here).
+ * Telegra.ph has no collapsible
  * blockquote tag, so an expandable quote degrades to a normal `<blockquote>`;
  * the `**` prefix must still be recognised and stripped here, else the
  * unterminated `**` renders as literal `**>` text and the `>` continuation

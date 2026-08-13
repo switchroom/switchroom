@@ -271,13 +271,16 @@ function kindsPresent(msg: ObservedMessage): Set<string> {
 );
 
 // ---------------------------------------------------------------------------
-// Rich-render wiring proof — expandable / collapsible content round-trip.
+// Rich-render wiring proof — legacy `**> ` quote repair round-trip.
 //
 // This is the piece the unit suite CANNOT prove: that a REAL markdown reply
-// carrying the Bot API 10.1 expandable-blockquote marker (`**> `) flows
+// carrying the LEGACY switchroom expandable-quote marker (`**> `) flows
 // through the live send path — parse.ts (marker -> IR `expandable: true`) ->
-// render.ts (IR -> `**> ` markdown) -> renderSafe -> sendRichMessage — and
-// that Telegram actually parses it back to a blockquote entity on the wire.
+// render.ts (IR -> plain `> ` markdown; `**>` is MarkdownV2-only and renders
+// as literal text on the rich path, wire-proved 2026-08-13, so the renderer
+// no longer emits it) -> renderSafe -> sendRichMessage — and that Telegram
+// parses the repaired output back to a blockquote entity with NO literal
+// `**>` glyphs reaching the reader.
 //
 // Runs ONLY when the rich-render flag is on in this process (see
 // RICH_RENDER_ON) AND the driver creds are present; self-skips green
@@ -299,7 +302,7 @@ const EXPANDABLE_SAMPLE = [
   "uat: expandable/collapsible content round-trips through the live renderer",
   () => {
     it(
-      "a `**>` reply parses -> renders -> sends -> decodes as a blockquote entity",
+      "a legacy `**>` reply is repaired to a plain quote and decodes as a blockquote entity",
       async () => {
         const sc = await spinUp({ agent: AGENT });
         try {
@@ -318,9 +321,9 @@ const EXPANDABLE_SAMPLE = [
           ).not.toBe("\x01");
           expect(reply.text).toContain(EXP_MARKER);
 
-          // The collapsible construct must survive as a real blockquote entity
-          // on the wire — proof the parse->render->send path produced valid
-          // Bot API 10.1 markdown, not stray `**>` literal text.
+          // The legacy quote must survive as a real blockquote entity on the
+          // wire — proof the parse->render->send path repaired the `**>` line
+          // into the quote instead of shipping stray literal text.
           const present = kindsPresent(reply);
           expect(
             [...present],
@@ -330,6 +333,12 @@ const EXPANDABLE_SAMPLE = [
 
           // The quoted body text must round-trip (content never lost).
           expect(reply.text).toContain("first hidden line");
+
+          // And the retired marker must never reach the reader as literal
+          // glyphs — the exact failure mode of the pre-repair renderer
+          // (Telegram rendered the `**> ` opener as a literal `**>` paragraph
+          // while the `> ` continuation lines formed a detached quote).
+          expect(reply.text).not.toContain("**>");
 
           console.info(
             "[uat] expandable round-trip entity structure: " +
