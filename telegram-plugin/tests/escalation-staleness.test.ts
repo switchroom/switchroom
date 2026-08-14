@@ -13,6 +13,11 @@ import {
   createAnswerRouteOverrides,
   answerRouteOverrides,
 } from "../gateway/answer-route-overrides.js";
+import {
+  resolveAnswerThreadId,
+  isCrossChatAnchor,
+} from "../gateway/answer-thread-resolve.js";
+import { formatReplyRouteLog } from "../gateway/reply-route-log.js";
 import { ObligationLedger } from "../gateway/obligation-ledger.js";
 import { createObligationWiring } from "../gateway/obligation-wiring.js";
 
@@ -1133,5 +1138,123 @@ describe("obligationSweep escalate branch — nag only when the answer really is
     expect(seen[1]).toEqual([]);
     // And it is bounded: escalated on the first tick past the window.
     expect(seen[2]).toEqual([ORIGIN]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Drift guard for the #4680 merge. Before #4680 the gateway computed the
+// override boolean ONCE: `answerRouteOverrides.note()` returned it and the
+// telemetry line reused the return value, so the RECORD and the
+// EXPLICIT_OVERRIDDEN marker could not disagree. #4680 extracted the line into
+// the pure `formatReplyRouteLog`, which re-derives the predicate from its own
+// inputs — so there are now TWO copies of the rule and nothing structural
+// keeping them equal. The record is the load-bearing one: obligation escalation
+// closes on it. If it drifts from the marker, the log stops being evidence for
+// what the sweep will do, which is exactly what made the 2026-08-10 incidents
+// take a week to diagnose.
+//
+// This drives BOTH through the REAL router (`resolveAnswerThreadId`), so the
+// routed thread is not a hand-picked constant, and asserts they agree on every
+// combination of authority / explicit topic / anchor chat.
+describe("the recorded override and the EXPLICIT_OVERRIDDEN marker cannot drift apart", () => {
+  const TARGET = "-100999";
+  const OTHER = "-100888";
+  const turn = (chatId: string, threadId: number | undefined) => ({
+    turnId: "t1",
+    sessionChatId: chatId,
+    sessionThreadId: threadId,
+  });
+
+  const cases: Array<{
+    name: string;
+    enabled: boolean;
+    explicitThreadId: number | undefined;
+    originTurn: ReturnType<typeof turn> | null;
+    liveTurn: ReturnType<typeof turn> | null;
+  }> = [
+    { name: "explicit 4, same-chat origin in 635 — the General→CRM correction",
+      enabled: true, explicitThreadId: 4, originTurn: turn(TARGET, 635), liveTurn: null },
+    { name: "explicit 4, same-chat LIVE turn in 635",
+      enabled: true, explicitThreadId: 4, originTurn: null, liveTurn: turn(TARGET, 635) },
+    { name: "explicit 4, origin agrees at 4 — no override",
+      enabled: true, explicitThreadId: 4, originTurn: turn(TARGET, 4), liveTurn: null },
+    { name: "explicit 4, CROSS-CHAT origin — anchor dropped (#4680)",
+      enabled: true, explicitThreadId: 4, originTurn: turn(OTHER, 635), liveTurn: null },
+    { name: "explicit 4, cross-chat origin AND cross-chat live",
+      enabled: true, explicitThreadId: 4, originTurn: turn(OTHER, 635), liveTurn: turn(OTHER, 900) },
+    { name: "explicit 4, cross-chat origin but same-chat live in 900",
+      enabled: true, explicitThreadId: 4, originTurn: turn(OTHER, 635), liveTurn: turn(TARGET, 900) },
+    { name: "no explicit topic at all",
+      enabled: true, explicitThreadId: undefined, originTurn: turn(TARGET, 635), liveTurn: null },
+    { name: "explicit 4, same-chat origin in 635, authority DISABLED",
+      enabled: false, explicitThreadId: 4, originTurn: turn(TARGET, 635), liveTurn: null },
+  ];
+
+  for (const c of cases) {
+    it(`agrees: ${c.name}`, () => {
+      // Mirrors gateway.ts `resolveAnswerThreadWithLog` exactly.
+      const originAnchor = isCrossChatAnchor(TARGET, c.originTurn?.sessionChatId)
+        ? null
+        : c.originTurn;
+      const liveAnchor = isCrossChatAnchor(TARGET, c.liveTurn?.sessionChatId) ? null : c.liveTurn;
+      const threadId = resolveAnswerThreadId({
+        explicitThreadId: c.explicitThreadId,
+        originResolved: c.originTurn != null,
+        originThreadId: c.originTurn?.sessionThreadId,
+        liveThreadId: c.liveTurn?.sessionThreadId,
+        liveTurnPresent: c.liveTurn != null,
+        lastEndedResolvedForChat: false,
+        lastEndedThreadIdForChat: undefined,
+        frameworkTopicAuthority: c.enabled,
+        targetChatId: TARGET,
+        originChatId: c.originTurn?.sessionChatId,
+        liveChatId: c.liveTurn?.sessionChatId,
+      });
+      const recorded = createAnswerRouteOverrides().note({
+        chatId: TARGET,
+        enabled: c.enabled,
+        explicitThreadId: c.explicitThreadId,
+        anchored: originAnchor != null || liveAnchor != null,
+        routedThreadId: threadId,
+        nowMs: 1_000,
+      });
+      const marked = formatReplyRouteLog({
+        surface: "reply",
+        chatId: TARGET,
+        threadId,
+        explicitThreadId: c.explicitThreadId,
+        originTurn: c.originTurn,
+        originVia: "echo",
+        liveTurn: c.liveTurn,
+        recovered: null,
+        frameworkTopicAuthority: c.enabled,
+        hasDifferentThreadedRecentTurn: () => false,
+      }).includes("EXPLICIT_OVERRIDDEN");
+      expect(recorded).toBe(marked);
+    });
+  }
+
+  // Not vacuous: at least one case must actually BE an override, or the whole
+  // matrix could agree on `false` forever.
+  it("the matrix contains a real override (guards against agreeing on false)", () => {
+    const overrides = createAnswerRouteOverrides();
+    const threadId = resolveAnswerThreadId({
+      explicitThreadId: 4,
+      originResolved: true,
+      originThreadId: 635,
+      liveThreadId: undefined,
+      liveTurnPresent: false,
+      lastEndedResolvedForChat: false,
+      lastEndedThreadIdForChat: undefined,
+      frameworkTopicAuthority: true,
+      targetChatId: TARGET,
+      originChatId: TARGET,
+      liveChatId: undefined,
+    });
+    expect(threadId).toBe(635);
+    expect(
+      overrides.note({ chatId: TARGET, enabled: true, explicitThreadId: 4, anchored: true,
+        routedThreadId: threadId, nowMs: 1_000 }),
+    ).toBe(true);
   });
 });

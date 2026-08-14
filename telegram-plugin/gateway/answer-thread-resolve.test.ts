@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { resolveAnswerThreadId, type AnswerThreadInput } from './answer-thread-resolve.js'
+import {
+  resolveAnswerThreadId,
+  isCrossChatAnchor,
+  type AnswerThreadInput,
+} from './answer-thread-resolve.js'
 
 // Distinct symbolic thread ids so an output's provenance is unambiguous (no two
 // tiers share a value): explicit=70, origin=50, live=30, lastEnded=90.
@@ -104,6 +108,143 @@ describe('resolveAnswerThreadId — legacy (frameworkTopicAuthority:false)', () 
         liveThreadId: L,
       }),
     ).toBe(O)
+  })
+})
+
+// ── Cross-chat anchor guard (bug c, 2026-08-13) ─────────────────────────────
+//
+// The live failure: a reply into chat A resolved its thread from an anchor turn
+// owned by forum supergroup B, so B's topic id rode along on the send into A and
+// Telegram answered `400 Bad Request: message thread not found`. The retry
+// fallback resent threadless and succeeded, so the symptom was a guaranteed-
+// failed FIRST API call rather than a lost message. Each case below asserts the
+// RESOLVED THREAD, not that a branch ran.
+const CHAT_A = '12345678' // a DM — the reply target
+const CHAT_B = '-1003831053471' // a forum supergroup — where the anchor lives
+
+describe('resolveAnswerThreadId — cross-chat anchor guard', () => {
+  it("THE bug: a live turn in supergroup B must not lend its topic to a reply into chat A", () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_A,
+        originResolved: false,
+        liveTurnPresent: true,
+        liveThreadId: 635, // B's topic — the id Telegram rejected
+        liveChatId: CHAT_B,
+      }),
+    ).toBeUndefined() // → no thread; the send into A is threadless and succeeds
+  })
+
+  it('a cross-chat ORIGIN anchor (origin_turn_id echoed from another chat) is ignored', () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_A,
+        originResolved: true,
+        originThreadId: O,
+        originChatId: CHAT_B,
+      }),
+    ).toBeUndefined()
+  })
+
+  it('a dropped cross-chat anchor falls through to the model explicit (its only remaining signal)', () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_A,
+        explicitThreadId: T,
+        originResolved: true,
+        originThreadId: O,
+        originChatId: CHAT_B,
+        liveTurnPresent: true,
+        liveThreadId: L,
+        liveChatId: CHAT_B,
+      }),
+    ).toBe(T)
+  })
+
+  it('a dropped cross-chat anchor falls through to the chat-scoped last-ended recovery when there is no explicit', () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_A,
+        originResolved: false,
+        liveTurnPresent: true,
+        liveThreadId: L,
+        liveChatId: CHAT_B,
+        lastEndedResolvedForChat: true,
+        lastEndedThreadIdForChat: E,
+      }),
+    ).toBe(E)
+  })
+
+  it('a SAME-chat anchor is untouched — the guard only drops foreign chats', () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_B,
+        explicitThreadId: T,
+        originResolved: true,
+        originThreadId: O,
+        originChatId: CHAT_B,
+      }),
+    ).toBe(O)
+  })
+
+  it('an origin in chat A survives while a live turn in chat B is dropped (independent guards)', () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_A,
+        originResolved: true,
+        originThreadId: O,
+        originChatId: CHAT_A,
+        liveTurnPresent: true,
+        liveThreadId: L,
+        liveChatId: CHAT_B,
+      }),
+    ).toBe(O)
+  })
+
+  it('the guard also applies under the legacy kill switch — a wrong-chat topic is an API error, not a precedence policy', () => {
+    expect(
+      resolveAnswerThreadId({
+        frameworkTopicAuthority: false,
+        targetChatId: CHAT_A,
+        originResolved: true,
+        originThreadId: O,
+        originChatId: CHAT_B,
+        liveThreadId: L,
+        liveChatId: CHAT_B,
+      }),
+    ).toBeUndefined()
+  })
+
+  it('numeric-vs-string chat ids compare by value, so no anchor is dropped spuriously', () => {
+    expect(
+      resolveAnswerThreadId({
+        targetChatId: CHAT_B,
+        originResolved: true,
+        originThreadId: O,
+        originChatId: String(Number(CHAT_B)),
+      }),
+    ).toBe(O)
+  })
+
+  it('BACK-COMPAT: with no chat ids supplied the guard is inert (identical to pre-guard routing)', () => {
+    expect(
+      resolveAnswerThreadId({
+        originResolved: false,
+        liveTurnPresent: true,
+        liveThreadId: L,
+      }),
+    ).toBe(L)
+  })
+})
+
+describe('isCrossChatAnchor', () => {
+  it('true only when both ids are present and differ', () => {
+    expect(isCrossChatAnchor(CHAT_A, CHAT_B)).toBe(true)
+    expect(isCrossChatAnchor(CHAT_A, CHAT_A)).toBe(false)
+    expect(isCrossChatAnchor(undefined, CHAT_B)).toBe(false)
+    expect(isCrossChatAnchor(CHAT_A, undefined)).toBe(false)
+    expect(isCrossChatAnchor('', CHAT_B)).toBe(false)
+    expect(isCrossChatAnchor(CHAT_A, '')).toBe(false)
   })
 })
 
@@ -237,5 +378,38 @@ describe('resolveAnswerThreadId — total-enumeration proof (54 reachable inputs
 
   it('INV-EXPLICIT-DOMINANCE (legacy): explicit set ⇒ output === explicit, independent of all other fields', () => {
     for (const i of LEGACY) if (i.explicitThreadId != null) expect(resolveAnswerThreadId(i)).toBe(i.explicitThreadId)
+  })
+
+  // ── Cross-chat guard, proved over the same enumeration (both modes) ────────
+  it('INV-CROSS-CHAT: anchors in a FOREIGN chat route exactly as if they did not exist, on all 54 inputs × 2 modes', () => {
+    for (const i of [...FA, ...LEGACY]) {
+      const foreign = resolveAnswerThreadId({
+        ...i,
+        targetChatId: CHAT_A,
+        originChatId: CHAT_B,
+        liveChatId: CHAT_B,
+      })
+      const anchorless = resolveAnswerThreadId({
+        ...i,
+        originResolved: false,
+        originThreadId: undefined,
+        liveTurnPresent: false,
+        liveThreadId: undefined,
+      })
+      expect(foreign).toBe(anchorless)
+    }
+  })
+
+  it('INV-SAME-CHAT: annotating anchors with the TARGET chat changes nothing, on all 54 inputs × 2 modes', () => {
+    for (const i of [...FA, ...LEGACY]) {
+      expect(
+        resolveAnswerThreadId({
+          ...i,
+          targetChatId: CHAT_A,
+          originChatId: CHAT_A,
+          liveChatId: CHAT_A,
+        }),
+      ).toBe(resolveAnswerThreadId(i))
+    }
   })
 })
