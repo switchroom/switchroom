@@ -753,8 +753,8 @@ def _split_phonemes(phonemes: str, max_phonemes: int) -> tuple[list[str], int]:
 
     LOSSLESS by construction: every phoneme of the input appears in exactly one
     chunk (whitespace between chunks is the only thing normalised away). This is
-    the whole point of #4695 — Kokoro's own batcher DISCARDS the tail of any
-    over-long run, this one carries it into the next chunk instead.
+    the whole point of #4695 — hand Kokoro an over-long run and it discards the
+    tail or (usually) raises; this carries the tail into the next chunk instead.
 
     Returns (chunks, hard_cuts). `hard_cuts` counts boundaries that had to land
     MID-WORD because a single run of `max_phonemes` phonemes contained no space
@@ -938,8 +938,9 @@ def _espeak_phonemize(piece: str) -> tuple[str, bool]:
             _espeak_phonemize_warned = True
             _log(
                 f"espeak phonemize failed ({type(exc).__name__}: {exc}); "
-                "falling back to Kokoro's internal text path — long pieces may "
-                "be truncated at 510 phonemes (logged once)"
+                "falling back to Kokoro's internal text path — a clause past "
+                "510 phonemes will be truncated or fail the request "
+                "(logged once)"
             )
         return piece, False
 
@@ -950,12 +951,12 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
 
     Accepts text of ANY length: it is split into pieces ≤ TTS_MAX_CHARS on
     sentence/paragraph boundaries, each piece's PHONEME string is then split to
-    ≤ TTS_MAX_PHONEMES (#4695 — a batch past 510 phonemes is truncated by Kokoro
-    or, more often, raises and fails the request), each phoneme chunk
-    synthesized on the GPU, and the raw 24kHz
-    PCM concatenated into ONE stream (with a short inter-piece pad so joins
-    sound natural and never click) before a SINGLE opus encode. The caller
-    therefore always gets one valid, continuous Ogg/Opus file."""
+    ≤ TTS_MAX_PHONEMES (#4695 — a batch past 510 phonemes is truncated by
+    Kokoro or, in practice, raises and fails the whole request), each phoneme
+    chunk synthesized on the GPU, and the raw 24kHz PCM concatenated into ONE
+    stream (with a short inter-piece pad so joins sound natural and never
+    click) before a SINGLE opus encode. The caller therefore always gets one
+    valid, continuous Ogg/Opus file."""
     import numpy as np  # local — only TTS needs numpy
 
     with _tts_sem:
@@ -1001,6 +1002,11 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
                 piece_chunks = []
                 unchunked_pieces += 1
 
+            # `piece_chunks` can also be empty with is_phonemes=True when the
+            # piece phonemises to nothing but punctuation/whitespace. That falls
+            # through to the text path below WITHOUT counting an unchunked
+            # piece: there is no speech to lose, so it is not a degradation.
+
             if i > 0:
                 chunks.append(pad)
 
@@ -1043,9 +1049,11 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
             f"synth: {len(text)} chars -> {len(pieces)} piece(s) -> "
             f"{batches} batch(es) -> {audio_seconds:.2f}s audio in {elapsed_ms}ms"
         )
-        # #4695: the failure mode this replaced was audio that just stopped
-        # mid-sentence with nothing anywhere in the logs. Both residual lossy
-        # paths shout, at WARN volume, with enough context to find the message.
+        # #4695: the failure mode this replaced surfaced only as a voice
+        # message that never arrived (a 500 from the IndexError) or, where the
+        # slice landed on an out-of-vocab phoneme, audio that stopped
+        # mid-sentence. Both residual degradation paths now shout, at WARN
+        # volume, with enough context to find the offending message.
         if hard_cuts:
             _log(
                 f"WARNING: TTS split {hard_cuts} unbreakable phoneme run(s) "
