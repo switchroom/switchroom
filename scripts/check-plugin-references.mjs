@@ -14,8 +14,10 @@
  * own prose quoted "outboundDedup is not defined" inside ANOTHER reply
  * call (which also threw).
  *
- * This script catches the same class going forward. It runs `tsc
- * --noEmit` against a tsconfig that DOES include the plugin, filters
+ * This script catches the same class going forward. It runs the
+ * REPO-PINNED `tsc --noEmit` (never `npx tsc` — see `resolveTscBin()`
+ * below for why that distinction is load-bearing) against a tsconfig
+ * that DOES include the plugin, filters
  * the output to ONLY the dangerous error codes (undeclared names,
  * cannot-invoke-undefined, typo-suggestions), and exits non-zero if
  * any are found.
@@ -36,13 +38,45 @@
  * Run: `npm run lint:plugin-references` (also part of `npm run lint`).
  */
 
-import { execSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { createRequire } from 'node:module'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..')
+
+/**
+ * Resolve the REPO-PINNED TypeScript compiler.
+ *
+ * This used to be a bare `npx tsc`, and that was a silent-false-pass bug.
+ * `npx` only prefers `./node_modules/.bin/tsc` when it is there; when it
+ * is not (a fresh worktree checked before `bun install`, a symlinked or
+ * partially-installed `node_modules`, a run from a different cwd), npx
+ * goes to the NETWORK and installs whatever package is named `tsc` — which
+ * on the public registry is NOT TypeScript. It is `tsc@2.0.4`,
+ * "A deprecated release of the TypeScript compiler", a squatted stub that
+ * prints a banner and exits. Its output contains no `error TS` lines, so
+ * this script's filter found zero errors and printed
+ * "plugin-references: clean" — a guard that had stopped guarding, reporting
+ * success. (Reproduced on 2026-08-15: with `node_modules/.bin/tsc` moved
+ * aside, this script exited 0 "clean" and left
+ * `~/.npm/_npx/<hash>/package.json` = `{"dependencies":{"tsc":"^2.0.4"}}`.)
+ *
+ * Same hazard class the repo already guards for Playwright in
+ * `scripts/check-no-unpinned-npx-playwright.mjs`: a bare `npx <name>` is an
+ * unpinned network fetch of an arbitrary registry package into a trusted path.
+ *
+ * So: resolve `typescript/bin/tsc` through node resolution from this file and
+ * run it with `process.execPath`. No PATH lookup, no shell, no network. If
+ * TypeScript is not installed we exit NON-ZERO with an actionable message —
+ * a missing compiler must never read as "clean".
+ */
+export function resolveTscBin() {
+  const require = createRequire(import.meta.url)
+  return require.resolve('typescript/bin/tsc')
+}
 
 // Codes that catch the bug class that broke clerk in PR #599.
 // Adding TS6133 (unused declaration) would catch dead variables but
@@ -73,54 +107,74 @@ const tmpConfigBody = {
   ],
 }
 
-writeFileSync(tmpConfig, JSON.stringify(tmpConfigBody, null, 2))
+function main() {
+  let tscBin
+  try {
+    tscBin = resolveTscBin()
+  } catch {
+    console.error(
+      'plugin-references: cannot resolve the repo-pinned TypeScript compiler ' +
+      "(`typescript/bin/tsc`).\n\nRun `bun install` first. This check does NOT " +
+      'fall back to `npx tsc`: the registry package named `tsc` is a deprecated ' +
+      'stub, not TypeScript, and running it would report a false "clean".'
+    )
+    process.exit(1)
+  }
 
-let out = ''
-try {
-  out = execSync(`npx tsc --noEmit -p ${tmpConfig}`, {
-    cwd: repoRoot,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-} catch (err) {
-  out = (err.stdout || '') + (err.stderr || '')
-} finally {
-  if (existsSync(tmpConfig)) unlinkSync(tmpConfig)
+  writeFileSync(tmpConfig, JSON.stringify(tmpConfigBody, null, 2))
+
+  let out = ''
+  try {
+    out = execFileSync(process.execPath, [tscBin, '--noEmit', '-p', tmpConfig], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (err) {
+    out = (err.stdout || '') + (err.stderr || '')
+  } finally {
+    if (existsSync(tmpConfig)) unlinkSync(tmpConfig)
+  }
+
+  const lines = out.split('\n')
+  const allErrors = lines.filter((l) => l.includes('error TS'))
+
+  // As of #623, all 52 pre-existing type-debt errors in plugin source
+  // have been cleaned up. The check now fails on ANY tsc error — not
+  // just the four "dangerous-class" codes that were originally filtered.
+  // If you hit a new error here, fix it (don't broaden the filter
+  // again). DANGEROUS_CODES kept for backwards-compat / diagnostic
+  // labelling.
+  if (allErrors.length > 0) {
+    const dangerous = allErrors.filter((l) =>
+      DANGEROUS_CODES.some((code) => l.includes(`error ${code}`))
+    )
+    if (dangerous.length > 0) {
+      console.error('plugin-references: found dangerous-class type errors:\n')
+      for (const line of dangerous) console.error('  ' + line)
+      console.error(
+        `\nThese errors mean a reference, invocation, or property is wrong — ` +
+        `the kind of bug that ships to production undetected because tsc doesn't ` +
+        `cover telegram-plugin/. See scripts/check-plugin-references.mjs for context.\n`
+      )
+    }
+    const other = allErrors.filter((l) => !dangerous.includes(l))
+    if (other.length > 0) {
+      console.error('plugin-references: tsc errors in plugin source:\n')
+      for (const line of other) console.error('  ' + line)
+      console.error(
+        `\nThe lint check now enforces a fully clean tsc over plugin source ` +
+        `(see #623). Fix the error rather than re-introducing a filter.`
+      )
+    }
+    process.exit(1)
+  }
+
+  console.log('plugin-references: clean (no tsc errors in plugin source — strict since #623).')
+  process.exit(0)
 }
 
-const lines = out.split('\n')
-const allErrors = lines.filter((l) => l.includes('error TS'))
-
-// As of #623, all 52 pre-existing type-debt errors in plugin source
-// have been cleaned up. The check now fails on ANY tsc error — not
-// just the four "dangerous-class" codes that were originally filtered.
-// If you hit a new error here, fix it (don't broaden the filter
-// again). DANGEROUS_CODES kept for backwards-compat / diagnostic
-// labelling.
-if (allErrors.length > 0) {
-  const dangerous = allErrors.filter((l) =>
-    DANGEROUS_CODES.some((code) => l.includes(`error ${code}`))
-  )
-  if (dangerous.length > 0) {
-    console.error('plugin-references: found dangerous-class type errors:\n')
-    for (const line of dangerous) console.error('  ' + line)
-    console.error(
-      `\nThese errors mean a reference, invocation, or property is wrong — ` +
-      `the kind of bug that ships to production undetected because tsc doesn't ` +
-      `cover telegram-plugin/. See scripts/check-plugin-references.mjs for context.\n`
-    )
-  }
-  const other = allErrors.filter((l) => !dangerous.includes(l))
-  if (other.length > 0) {
-    console.error('plugin-references: tsc errors in plugin source:\n')
-    for (const line of other) console.error('  ' + line)
-    console.error(
-      `\nThe lint check now enforces a fully clean tsc over plugin source ` +
-      `(see #623). Fix the error rather than re-introducing a filter.`
-    )
-  }
-  process.exit(1)
+// Only run the check when invoked directly — tests import `resolveTscBin`.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main()
 }
-
-console.log('plugin-references: clean (no tsc errors in plugin source — strict since #623).')
-process.exit(0)
