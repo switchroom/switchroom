@@ -408,7 +408,12 @@ def _unpark_spans(text: str, parked: List[str]) -> str:
 _URL_RE = re.compile(r"\bhttps?://\S+|\bwww\.[^\s<>]+", re.IGNORECASE)
 _DOTTED_QUAD_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?(?![\w.])")
 _VERSION_RE = re.compile(r"(?<![\w.])(v?)(\d+(?:\.\d+){2,})(?![\w.])", re.IGNORECASE)
-_FILE_LINE_RE = re.compile(r"(?<![\w/.])([\w-]+)\.([A-Za-z]{1,5}):(\d{1,6})(?![\w.])")
+# The lookbehind excludes `.` but NOT `/`: a path-qualified file still
+# deserves the "file dot ext, line N" reading, and blocking on `/` meant
+# `tui_gateway/methods_session.py:14` fell through to the snake rule,
+# which spaced the stem and left `session.py:14` for a second pass
+# (corpus-replay idempotence breach).
+_FILE_LINE_RE = re.compile(r"(?<![\w.])([\w-]+)\.([A-Za-z]{1,5}):(\d{1,6})(?![\w.])")
 _HEX_RE = re.compile(r"(?<![\w])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])([0-9a-f]{7,40})(?![\w])")
 _LONG_DIGITS_RE = re.compile(r"(?<![\w.,])(\d{6,})(?![\w.,])")
 _SNAKE_RE = re.compile(r"(?<![\w])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?![\w])")
@@ -453,11 +458,20 @@ def _segment_words(token: str, joiner: str) -> str:
         if upper in ACRONYMS:
             spoken.append(_spell(upper))
         elif piece.isdigit():
-            spoken.append(_digits(piece))
+            # A short number inside an identifier is a COUNT, not a serial:
+            # "Snapshot_10" is "Snapshot ten", not "Snapshot one zero". Longer
+            # runs stay per-digit — that IS how a serial is read aloud.
+            spoken.append(_cardinal(piece) if len(piece) <= 2 else _digits(piece))
         elif piece.isupper() and len(piece) >= 2:
             spoken.append(piece.lower())
         else:
-            spoken.append(piece)
+            # A segment can itself be a dispatchable shape: splitting
+            # `wf_2f0e6072-af3` exposes a bare git hash that only the hex rule
+            # can speak. Resolving it HERE is what keeps the pass idempotent —
+            # otherwise the exposed shape sits in the output waiting for a
+            # second pass. Terminates: segments carry no `_`/`-` and cannot
+            # match the camel shape, so this recurses at most one level.
+            spoken.append(_dispatch_token(piece, joiner) or piece)
     return joiner.join(spoken)
 
 
@@ -533,7 +547,10 @@ def _identifiers(text: str) -> str:
         _LONG_DIGITS_RE,
     ):
         sub(pattern)
-    return text
+    # Identifier expansion produces prose the slash rule owns — see
+    # _slash_words for why this second application is a correctness fix and
+    # not a belt-and-braces re-run.
+    return _slash_words(text)
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +591,20 @@ def _markdown_belt(text: str) -> str:
     text = re.sub(r"~~([^~\n]+)~~", r"\1", text)
     text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", text)
     text = re.sub(r"\|", " ", text)
-    return text
+    return _MARKER_RESIDUE_RE.sub("", _EDGE_UNDERSCORE_RE.sub("", text))
+
+
+# Decorative residue is stripped HERE, not in the final sweep, because a
+# leftover marker HIDES an identifier from the dispatcher: `_resetForTests()`,
+# `^VOICE_`, `HINDSIGHT_API_EMBEDDINGS_*` and `${SE_KEY}` all failed their
+# pattern's `(?![\w])` boundary on pass 1, then had the marker swept away and
+# matched on pass 2 — five of the corpus replay's idempotence breaches, one
+# cause. Interior underscores survive: they are what snake_case is made of,
+# and the final sweep is still the backstop for any that reach it.
+# `~` is deliberately NOT in this set: it still carries meaning at this point
+# ("~500" → "about 500"), so it stays for the symbol rule and is swept later.
+_MARKER_RESIDUE_RE = re.compile(r"[`*]")
+_EDGE_UNDERSCORE_RE = re.compile(r"(?<![\w])_+|_+(?![\w])")
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +612,10 @@ def _markdown_belt(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _ISO_DATE_RE = re.compile(r"(?<![\w-])(\d{4})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])(?![\w-])")
+_ISO_STAMP_RE = re.compile(
+    r"(?<![\w-])(\d{4})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])"
+    r"[T ]([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?(?![\w])"
+)
 _SLASH_DATE_RE = re.compile(r"(?<![\w/.])(0?[1-9]|[12]\d|3[01])/(0?[1-9]|1[0-2])/(\d{4}|\d{2})(?![\w/.])")
 _MONTH_DAY_RE = re.compile(
     r"\b(" + "|".join(_MONTH_ABBR) + r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?![\w/])"
@@ -592,10 +626,31 @@ _DAY_MONTH_RE = re.compile(
 
 
 def _iso_dates(text: str) -> str:
+    def stamp(m: re.Match[str]) -> str:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hour, minute = int(m.group(4)), int(m.group(5))
+        spoken = f"{_MONTHS[month - 1]} {_ordinal(day)} {_year_words(year)} at "
+        if minute == 0:
+            spoken += f"{_cardinal(hour)} o'clock"
+        elif minute < 10:
+            spoken += f"{_cardinal(hour)} oh {_cardinal(minute)}"
+        else:
+            spoken += f"{_cardinal(hour)} {_cardinal(minute)}"
+        if m.group(6) == "Z":
+            spoken += " U T C"
+        return spoken
+
     def sub(m: re.Match[str]) -> str:
         year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
         return f"{_MONTHS[month - 1]} {_ordinal(day)} {_year_words(year)}"
 
+    # Timestamps first: the date half of `2026-08-08T12:39:00Z` matches the
+    # date rule and the time half matches the clock rule, and rewriting them
+    # independently leaves the `T` welded between two words ("08Ttwelve") —
+    # the exact digit-glued-to-letter shape contract 2 forbids, found by the
+    # corpus replay. Seconds are dropped on purpose: nobody wants a spoken
+    # ":00", and the minute is the smallest unit a listener can use.
+    text = _ISO_STAMP_RE.sub(stamp, text)
     return _ISO_DATE_RE.sub(sub, text)
 
 
@@ -692,17 +747,27 @@ _CURRENCY_RE = re.compile(
 _PERCENT_RE = re.compile(r"(?<![\d.,$])(\d{1,9}(?:\.\d+)?)[ \t]*%")
 _ORDINAL_RE = re.compile(r"(?<![\w.,])(\d{1,2})(st|nd|rd|th)(?![\w])", re.IGNORECASE)
 _MAGNITUDE_RE = re.compile(r"(?<![\w.,$])(\$?)(\d{1,9}(?:\.\d+)?)([kKMB])(?![\w])")
+# `(?!\.\d)` is the citation guard, found by the corpus replay: "Subdivision
+# Act 1988 s.35" matched the spaced single-letter form and was read as "1988
+# seconds". A unit followed by a dotted number is a section/clause reference,
+# never a measurement.
 _UNIT_RE = re.compile(
-    r"(?<![\d.,$])(\d{1,9}(?:\.\d+)?)[ \t]?("
+    r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)[ \t]?("
     + "|".join(sorted(_UNITS, key=len, reverse=True))
-    + r")(?![A-Za-z])",
+    + r")(?![\w]|\.\d)",
     re.IGNORECASE,
 )
 _UNIT1_RE = re.compile(
-    r"(?<![\d.,$])(\d{1,9}(?:\.\d+)?)[ \t]?(" + "|".join(_UNITS_1) + r")(?![A-Za-z])"
+    r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)[ \t]?(" + "|".join(_UNITS_1) + r")(?![\w]|\.\d)"
 )
-_MIN_GLUED_RE = re.compile(r"(?<![\d.,$])(\d{1,9}(?:\.\d+)?)m(?![A-Za-z])")
-_METRE_SPACED_RE = re.compile(r"(?<![\d.,$])(\d{1,9}(?:\.\d+)?)[ \t]m(?![A-Za-z])")
+_RANGE_RE = re.compile(
+    r"(?<![\w.,$])(\d{1,9})-(?=\d{1,9}(?:\.\d+)?[ \t]?(?:"
+    + "|".join(sorted(_UNITS, key=len, reverse=True) + sorted(_UNITS_1))
+    + r")(?![\w]|\.\d))",
+    re.IGNORECASE,
+)
+_MIN_GLUED_RE = re.compile(r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)m(?![\w])")
+_METRE_SPACED_RE = re.compile(r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)[ \t]m(?![\w])")
 
 
 def _currency(text: str) -> str:
@@ -772,6 +837,8 @@ def _status_words(number: str) -> str:
 
 
 def _decade_words(number: str) -> str:
+    if number == "2000":
+        return "two thousands"
     if len(number) == 4:
         return f"{_cardinal(int(number[:2]))} {_DECADE_WORDS[number[2:]]}"
     return _DECADE_WORDS[number]
@@ -792,8 +859,15 @@ def _is_decade(number: str, text: str, at: int) -> bool:
     duration is by far the common case in this fleet's chat, so the decade
     reading now has to earn itself with a cue word or an explicit century.
     """
-    if len(number) == 4 and number[:2] in {"19", "20"} and number[2:] != "00":
-        return True
+    # A four-digit decade must still BE a decade: "1990s" yes, "1988s" no.
+    # (The corpus produced "Subdivision Act 1988 s.35" — see _UNIT1_RE's
+    # `(?!\.\d)` guard — and an unguarded `19xx` branch crashed on it.)
+    if len(number) == 4 and number[:2] in {"19", "20"} and number[2:] in _DECADE_WORDS:
+        if number[2:] != "00":
+            return True
+        # "2000s" is as likely a round duration as a decade, so the century
+        # form still has to earn the decade reading with a cue.
+        return bool(_DECADE_CUES.search(text[max(0, at - 40) : at]))
     if not (len(number) == 2 and number.endswith("0")):
         return False
     if at > 0 and text[at - 1] == "'":
@@ -803,6 +877,10 @@ def _is_decade(number: str, text: str, at: int) -> bool:
 
 
 def _units(text: str) -> str:
+    # A range shares its unit: only the second number carries it, so without
+    # this the corpus produced "4-five minutes" — half spoken, half digits.
+    text = _RANGE_RE.sub(lambda m: f"{_cardinal(m.group(1))} to ", text)
+
     def multi(m: re.Match[str]) -> str:
         number, unit = m.group(1), m.group(2).lower()
         singular, plural = _UNITS[unit]
@@ -871,11 +949,23 @@ def _symbols(text: str) -> str:
     text = _AMP_LOOSE_RE.sub(" and ", text)
     text = _PLUS_RE.sub(" plus ", text)
     text = _EQ_RE.sub(" equals ", text)
-    text = _SLASH_WORDS_RE.sub(
-        lambda m: m.group(1) + m.group(2).replace("/", " slash "), text
-    )
+    text = _slash_words(text)
     text = _TILDE_NUM_RE.sub("about ", text)
     return text
+
+
+def _slash_words(text: str) -> str:
+    """`word/word` → "word slash word".
+
+    Applied twice: once here in symbol order, and once again immediately after
+    identifier dispatch. Expanding an identifier MAKES new word/word pairs —
+    `max_entries_to_build/merge` is one snake token plus "/merge", and only
+    after the token becomes "max entries to build" is there a `word/word` pair
+    for this rule to see. Without the second application the corpus replay
+    found the leftover slash surviving pass 1 and firing on pass 2, i.e. a
+    breach of the idempotence contract.
+    """
+    return _SLASH_WORDS_RE.sub(lambda m: m.group(1) + m.group(2).replace("/", " slash "), text)
 
 
 def _abbreviations(text: str) -> str:

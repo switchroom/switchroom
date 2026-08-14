@@ -371,6 +371,77 @@ class OverrideTableTests(unittest.TestCase):
         self.assertEqual(tn._CONDITIONS, {})
 
 
+class CorpusReplayRegressionTests(NormalizeCaseMixin, unittest.TestCase):
+    """Every case here was found by replaying the production corpus.
+
+    tools/replay_corpus.py runs the module over a captured corpus (kept out
+    of the repo — it is real message text) and gates on the two contracts.
+    Its first run over 1,679 messages found eight distinct defects that no
+    hand-written case had: a crash, six idempotence breaches and a created
+    digit-glued-to-letter token. Each is pinned below with the shape that
+    produced it.
+    """
+
+    def test_four_digit_non_decade_before_s_does_not_crash(self) -> None:
+        # "Subdivision Act 1988 s.35" — the decade branch accepted any 19xx
+        # and then KeyError'd on '88'. A statute reference is also not a
+        # measurement, so the citation guard leaves the whole thing alone.
+        self.assertSpoken("Subdivision Act 1988 s.35", "Subdivision Act 1988 s.35")
+        self.assertSpoken("under s.35(3)(c)", "under s.35(3)(c)")
+
+    def test_decades_still_speak(self) -> None:
+        self.assertSpoken("the 1990s", "the nineteen nineties")
+        self.assertSpoken("back in the 2000s", "back in the two thousands")
+
+    def test_hex_hash_is_not_eaten_by_the_unit_rule(self) -> None:
+        # "1b8d00b" (a git short sha) contains "8d" — which used to become
+        # "eight days", giving "1beight days00b".
+        self.assertSpoken("commit 1b8d00b landed", "commit 1 B 8 D 0 0 B landed")
+        self.assertSpoken("sha 2d8147d8f", "sha 2 D 8 1 4 7 D 8 F")
+
+    def test_iso_timestamp_speaks_as_one_thing(self) -> None:
+        # The date rule and the clock rule each matched half of this and left
+        # the `T` welded between two words ("08Ttwelve thirty-nine").
+        self.assertSpoken(
+            "2026-08-08T12:39:00Z",
+            "August eighth two thousand twenty-six at twelve thirty-nine U T C",
+        )
+        self.assertSpoken(
+            "at 2026-08-08 09:05",
+            "at August eighth two thousand twenty-six at nine oh five",
+        )
+
+    def test_identifier_exposed_by_expansion_is_resolved_in_one_pass(self) -> None:
+        # Splitting the snake token used to expose a bare hash / a bare
+        # file:line that only a SECOND pass would have spoken.
+        self.assertSpoken("wf_2f0e6072-af3", "wf 2 F 0 E 6 0 7 2-af3")
+        self.assertSpoken(
+            "tui_gateway/methods_session.py:14",
+            "tui gateway slash methods session dot py, line one four",
+        )
+
+    def test_slash_after_an_expanded_identifier_is_spoken(self) -> None:
+        self.assertSpoken(
+            "max_entries_to_build/merge", "max entries to build slash merge"
+        )
+
+    def test_edge_markers_do_not_hide_an_identifier(self) -> None:
+        # A trailing `_`/`*` broke the pattern's word boundary on pass 1 and
+        # was then swept away, exposing the token on pass 2.
+        self.assertSpoken("HINDSIGHT_API_EMBEDDINGS_* keys", "hindsight A P I embeddings keys")
+        self.assertSpoken("grep ^VOICE_ env", "grep ^voice env")
+        self.assertSpoken("_resetForTests() leaks", "reset For Tests() leaks")
+
+    def test_a_range_shares_its_unit(self) -> None:
+        # "4-5 min" used to come out half-spoken as "4-five minutes".
+        self.assertSpoken("4-5 min", "four to five minutes")
+        self.assertSpoken("takes 10-15 min", "takes ten to fifteen minutes")
+
+    def test_short_numbers_inside_an_identifier_are_counts(self) -> None:
+        self.assertSpoken("Snapshot_10", "Snapshot ten")
+        self.assertSpoken("run_2", "run two")
+
+
 class PropertyTests(unittest.TestCase):
     """Properties over a broad input set, not one case at a time."""
 
