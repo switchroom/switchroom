@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { formatReplyRouteLog, type ReplyRouteLogInput } from './reply-route-log.js'
 
 const CHAT_A = '12345678' // DM — the reply target
-const CHAT_B = '-1003831053471' // forum supergroup — where the anchor lives
+const CHAT_B = '-1001234567890' // forum supergroup — where the anchor lives
 
 function line(over: Partial<ReplyRouteLogInput> = {}): string {
   return formatReplyRouteLog({
@@ -86,6 +86,41 @@ describe('formatReplyRouteLog', () => {
     })
     expect(out).toContain('EXPLICIT_OVERRIDDEN(model→99,routed→4)')
     expect(out).toContain('via=origin')
+  })
+
+  // The two `explicitOverridden` clauses the escalation drift matrix
+  // (`tests/escalation-staleness.test.ts`) cannot pin, because it drives the
+  // REAL router: with authority off the router returns the explicit topic, and a
+  // dropped cross-chat anchor falls back to it too — so `threadId !== explicit`
+  // is never true on either arm there. Both combinations are reachable only by
+  // calling this pure formatter directly, and without these two cases both
+  // mutants (drop the authority clause; read the RAW turns instead of the
+  // cross-chat-filtered anchors) survive all 64 matrix cases.
+  it('authority DISABLED never claims the framework overrode the model, even when ' +
+    'the routed thread differs from the explicit one', () => {
+    const out = line({
+      chatId: CHAT_B,
+      frameworkTopicAuthority: false,
+      explicitThreadId: 99,
+      threadId: 4,
+      originTurn: { turnId: `${CHAT_B}:4#1`, sessionChatId: CHAT_B, sessionThreadId: 4 },
+      originVia: 'echo',
+    })
+    expect(out).not.toContain('EXPLICIT_OVERRIDDEN')
+  })
+
+  it('EXPLICIT_OVERRIDDEN reads the FILTERED anchors — a cross-chat origin overrode ' +
+    'nothing, so it must not be reported as if it had', () => {
+    const out = line({
+      chatId: CHAT_B,
+      explicitThreadId: 99,
+      // The target chat's own last-seen topic, not the dropped anchor's.
+      threadId: 4,
+      originTurn: { turnId: 'x', sessionChatId: CHAT_A, sessionThreadId: 635 },
+      originVia: 'echo',
+    })
+    expect(out).toContain('CROSS_CHAT_ANCHOR_DROPPED(')
+    expect(out).not.toContain('EXPLICIT_OVERRIDDEN')
   })
 
   it('MISROUTE_RISK reads the FILTERED live anchor — a cross-chat live turn cannot raise it', () => {

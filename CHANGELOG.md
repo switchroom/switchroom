@@ -17,6 +17,89 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **an obligation ESCALATION no longer nags on top of an answer the user
+  already received.** The escalate branch of the obligation sweep sends a
+  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
+  staleness check that is supposed to stand it down when the agent has already
+  answered. Two mechanisms let that check miss a delivered answer, and both fired
+  together on the two confirmed 2026-08-10 incidents. First it was keyed on the
+  obligation's *thread*, while the model can name a topic on its `reply` and have
+  the framework's topic authority override it — the router logs exactly that,
+  `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — so the answer is written to history
+  under a thread the check never queries (06:36:07.921
+  `EXPLICIT_OVERRIDDEN(model→4,routed→635)` for an obligation in thread 4, nag
+  126ms later; 07:52 the same shape with the answer routed to the chat root).
+  Second it is a point-in-time read, and the answer is often still *in flight* at
+  the instant the sweep decides — the reply tool has been invoked but no history
+  row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
+  07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
+  and adds a fallback to *only* the thread the router RECORDED an answer
+  addressed to this obligation's topic as having been routed to (new
+  `answer-route-overrides.ts`), reading history **only across that record's own
+  instant plus the match window** — bounded at *both* ends, so a delivery in the
+  routed topic can be paired with the record neither before it nor minutes after
+  it — and only while the record is itself **fresh** (settle window + two sweep
+  ticks = 18.5s at the default); and a new settle gate requires the "unanswered"
+  read to hold across an 8.5s window — derived as 3× the worst observed
+  decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
+  tick so a re-check actually runs — before the nudge goes out. All three
+  narrowings on the fallback are load-bearing, and each has a field
+  counter-example: a chat-wide "did anything long land in this chat" query has no
+  relationship to the obligation at all; an override-gated query cut at
+  `openedAt` is the same defect wearing a gate — on 2026-08-13 obligation
+  `…:4#5462` (thread 4, opened 03:50:02.807, escalated 04:03:06.140) it pairs a
+  stale `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an
+  unrelated 295-char delivery in thread 3 at 04:02:51.987 — a *different*
+  question's answer, 594.8s later — and closes a genuinely unanswered message in
+  silence; and an override-gated query cut at the record's own instant but left
+  *open-ended forward* is that same defect reached from the other side, because
+  freshness is judged at the first "unanswered" read while the history row is
+  read at the re-check, and the sweep can be starved for minutes in between (a
+  short reply rerouted to topic M at T+0 leaves the obligation correctly open,
+  an unrelated ≥200-char answer lands in M at T+90, and the sweep that finally
+  runs at T+107 closes the obligation `via=reroute`). That is the defect
+  `turn-flush-suppression.ts` was written to close, and the 2026-08-13 case
+  escalates correctly pre-fix, so either would have been a regression. Residual,
+  stated plainly: inside `[record, record + window]` the fallback still cannot
+  tell the rerouted answer from a second ≥200-char delivery landing in the same
+  thread in those few seconds — the override carries no message id. That interval
+  is fixed by the record's own timestamp, so a starved sweep cannot widen it.
+  Both guards stay bounded: a genuinely unanswered obligation still escalates one
+  settle window later (the 2026-08-12 case, whose real answer was 41s away, is
+  unaffected), and both windows are clamped so a config typo cannot silently
+  widen them. The freshness window is measured back from the settle gate's own
+  *first* "unanswered" read, not from whenever the re-check runs — the sweep's
+  earlier gates can skip ticks outright for minutes, and anchoring at the
+  re-check would let a starved sweep age a still-fresh record out of the window
+  and nag on top of the answer anyway — which is precisely why the *delivery*
+  needs its own forward bound: that anchor keeps the record readable across the
+  starvation gap, and without an upper bound the query would then reach across
+  the whole of it. Both paths are logged so the fallback is
+  measurable in production without a rebuild: a fallback-scope close logs
+  `via=reroute`, and a record the freshness bound *rejects* logs
+  `reroute record rejected age=…ms window=…ms`. New `escalation-staleness.ts`
+  carries the evidence and the derivation. Each guard has its OWN kill switch —
+  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` disables the settle gate (and only
+  the settle gate), `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the
+  reroute fallback (and only the fallback); set both for the pre-fix behaviour.
+  Both switches read only an explicit `0`: a whitespace-only value (`KEY=" "`,
+  which `Number()` coerces to `0`) is treated as unset, so a stray space in an
+  env file cannot silently turn a guard off.
+
+  The router's `answerRouteOverrides.note(...)` write is the whole premise of the
+  reroute fallback, and it is a side effect no pure module carries — so it is now
+  pinned by a test that drives the real gateway router against the real registry
+  (`answer-route-side-effect.test.ts`). Deleting that one call previously left
+  the entire suite green while silently restoring the nag.
+
+  **Scope:** this fixes the ESCALATE branch only. It narrows the standing
+  duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
+  the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped
+  at both its cutoffs, the #4341 delivery-time backstop in
+  `represent-delivery-guard.ts` forwards that same `threadId` and is therefore
+  cross-topic-blind too, and the represent branch has no settle gate at all, so a
+  re-present can still fire on top of a rerouted or in-flight answer. Tracked in
+  switchroom/switchroom#4700.
 - **gateway: ignore a reply thread anchor from a different chat** — a reply
   targeting chat A could be anchored to a turn belonging to chat B: the
   `origin_turn_id` echo lookup is keyed by turn id alone (not chat-scoped), and
@@ -216,6 +299,146 @@ now an anomaly worth investigating, not the norm.
   The regression test was raised to 1M runs: at the 200k it started at, the
   reinstated spread form still PASSES under Bun — the guard asserted nothing
   in the shipping runtime.
+
+- **fleet-health: a detector must check an alarm's OUTCOME, not just match
+  it.** Two Layer-0 rules matched an alarm and never asked how it ended, so the
+  nightly ledger booked working safety mechanisms as failures.
+  `represent-escalation` was the bare substring `/obligation escalation/`, which
+  five emitter lines carry — including the per-attempt retry line and
+  `obligation-wiring.ts`'s `deferred — bridge down` line, i.e. the guard
+  deliberately *not* escalating while the Telegram bridge is down. Three of 11
+  live hits were that suppression path, all for the same obligation. It now
+  anchors on the two mutually-exclusive TERMINAL outcomes (`delivered + closed`,
+  `PERMANENTLY undeliverable`), the same attempt-vs-outcome fix #3931 made for
+  `reply-delivery-failure`. `orphaned-db-handle` matched the deleted-inode sweep
+  alarm without checking whether the paired recovery followed; an alarm whose
+  own sweep tick reopened `history.db` and left no lane un-recovered is now
+  `orphaned-db-handle-recovered` (drift, severity 1) instead of a severity-3
+  silent-data-loss incident. `registry.db`, an unowned handle, a FAILED reopen,
+  or a tick the detector cannot see in full all keep severity 3 — every
+  narrowing fails *toward* the alarm.
+
+- **fleet-health: gateway findings count affected turns, and a change of
+  counting unit can no longer auto-close a live GitHub issue.** Matched gateway
+  lines sharing an `origin=` turn id now fold into one finding, so ledger
+  `frequency` counts distinct affected turns rather than log lines (`gw_hits`
+  stays a raw line count for the digest). That is a change of *ruler*, and the
+  ledger's count-drop self-verify closes an issue when the number falls: an open
+  `duplicate-delivery-represent` issue at frequency 8 across 3 turns would have
+  collapsed to 3 on the first scan after merge, flipped to
+  `resolved-pending-verify`, and had the sensor comment "Verified count-drop …
+  Closed by the Fleet Health sensor." on a still-broken issue. Each issue now
+  records the `counting_unit` its frequency was measured in, and the writer
+  holds an issue's status for exactly one scan when that unit changes — a real
+  close is delayed by one scan, never suppressed, and reopening still works.
+
+- **fleet-health: the orphaned-DB verdict no longer depends on when the scan
+  ran, and a reclassified issue no longer claims a fix nobody made.** The
+  recovered/unrecovered split used a 12-line lookahead to find its tick
+  boundary, but sweeps are five minutes apart, so the identical alarm+reopen
+  pair booked severity 1 while it sat at the log tail and severity 3 once
+  ordinary traffic accumulated behind it. The two verdicts carry different
+  signatures, so a flip moved the finding to a different dedup_key and emptied
+  the old one — which the writer reads as a drop to zero, closing a live
+  severity-3 issue with "Verified count-drop … Closed by the Fleet Health
+  sensor." The same lookahead also downgraded a real `registry.db` alarm to
+  informational whenever its lane line fell outside the window. The verdict is
+  now derived from the tick's content — the alarm line names every affected
+  lane, and the first sweep line after it is that tick's history-lane outcome —
+  so it no longer moves with log GROWTH. Truncation is a separate problem and
+  is handled separately (next entry): reading the alarm's lane list is only
+  sound if that list is COMPLETE, which the first cut of this fix did not
+  check. Alongside it: a close caused
+  by findings re-sorting into a sibling signature is recorded as
+  `close_reason: "reclassified"` and commented as such rather than as a
+  verified count-drop; an issue whose defect reappears after closing is now
+  reopened on GitHub instead of staying shut forever; the count-drop arm tests
+  `count < prior.frequency` so an issue held across a counting-unit change can
+  still close (previously it could only ever leave the board at zero, i.e.
+  stale-open however much of it got fixed); and the gateway-signal list that
+  drives the counting-unit guard is built from a `Record<GatewaySignal, true>`
+  so a new derived signal is a compile error rather than a signal silently
+  counted in the wrong unit.
+
+- **fleet-health: a TRUNCATED orphaned-DB alarm can no longer launder silent
+  data loss down to informational.** Deriving the verdict from the alarm line's
+  lane list (previous entry) traded position-dependence for total dependence on
+  that one line arriving intact, which is the same bug class on a different
+  path. The emitter writes `DETECTED <n>` and then exactly one `fd=<n> <target>`
+  pair per orphan, so count and list are 1:1 by construction — but the
+  classifier read the pairs and ignored the count. A short or interleaved
+  `write()` on the supervisor's stderr for an alarm line over `PIPE_BUF` —
+  reachable precisely when many handles are orphaned, i.e. the worst incident —
+  drops the tail of the list, and a surviving `history.db` pair then booked
+  severity 1 on a tick that also lost `registry.db`. The sharp case is that the
+  intact `registry.db … rows written since the last checkpoint are LOST.` line
+  was sitting right there in the log and the classifier never looked at it,
+  because it only ever read the FIRST sweep line after the alarm and the
+  registry lane is emitted after the history lane. Severity 1 migrates the
+  finding's `dedup_key`, empties the severity-3 key, and drives close-on-zero —
+  a real unrecoverable loss closed as fixed. Two guards now: the lane list is
+  cross-checked against the alarm's own count and an incomplete list fails
+  toward the alarm; and a registry/unowned lane line anywhere between an alarm
+  and the NEXT alarm vetoes a recovery outright, restoring the veto the first
+  cut deleted without restoring its line-count window (the scan is bounded by
+  the log's content, so no position-dependence returns). The sticky
+  closed-history and FAILED-reopen lines are deliberately NOT vetoes: both also
+  fire from the no-alarm retry path, so vetoing on them would let a later,
+  unrelated tick flip an earlier recovered verdict — the exact dependence the
+  previous entry removed. Also: the `Record<GatewaySignal, true>` exhaustiveness
+  guard's test was tautological — every runtime view of that set is derived from
+  the same constant, so it passed against the very hand-written array it was
+  filed about; it now asserts against an independently written list, with `tsc`
+  named as the real guarantee. And the RFC now states the ledger reopen path's
+  one-scan durability window, which was true in code and documented nowhere.
+
+- **a memory bank that goes quiet is no longer abandoned by graph
+  maintenance.** Upstream Hindsight's `graph_maintenance` is enqueue-driven and
+  nothing else: `submit_async_graph_maintenance` short-circuits with
+  `no_work=True` whenever a bank's `graph_maintenance_queue` is empty, and every
+  caller reaches it from a unit-removal path. There is no interval scheduler —
+  `engine/maintenance.py` runs retention, operation cleanup, txn recovery, the
+  consolidation reconcile and the scheduled mental-model refresh, and no graph
+  job at all. So a bank that stops removing units stops being maintained, for
+  ever, while Pass 2 (orphan-entity prune) and Pass 3 (stale-cooccurrence prune)
+  — both bank-wide, both needing no queue rows — leak everything they would have
+  reclaimed. Measured on this fleet 2026-08-13: of 12 active banks only two had
+  run graph maintenance in the 70 minutes since the v0.21.8 roll, and bank
+  `klanker` had made **zero** attempts in five days with a queue count of 0
+  while actively retaining and consolidating throughout. #4624 made the sweep
+  *finish*; nothing made it *run*. `docker/Dockerfile.hindsight` now bakes a
+  periodic sweep onto the existing 60s maintenance tick: banks whose last
+  `graph_maintenance` **attempt** (not success — a failing bank must retry on
+  the interval, not every tick) is older than
+  `HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS` (default 3600, `0`
+  disables) get one submitted with `force_sweep=True` — upstream's own flag for
+  callers whose sweep-worthy work is invisible to the queue, rather than faking
+  queue rows and putting Pass 1 to work relinking units that need nothing. What
+  gets submitted is #4624's bounded, slice-rotating sweep, unchanged. Two
+  independent anti-stampede mechanisms: a hard per-tick cap
+  (`HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK`, default 2) so 12
+  simultaneously-due banks drain over minutes rather than landing at once, and a
+  deterministic per-bank, per-cycle phase jitter of 0–25% computed in SQL from
+  `md5(bank_id || last_attempt)` — which also decorrelates the submitter from
+  #4624's `int(now) // 120 % slice_count` slice clock, against which an exactly
+  periodic caller aliases (at a flat 3600s a 21-slice bank would visit only 7 of
+  its 21 slices, ever). Idempotent twice over, because the maintenance loop runs
+  in every api/worker process with no leader election: the discovery query
+  excludes any bank with a `pending` **or** `processing` graph-maintenance
+  operation, and the submit goes through upstream's `dedupe_by_bank=True`, which
+  re-checks under the bank's `FOR NO KEY UPDATE` lock. A submit that *raises*
+  still records its attempt: upstream writes the `async_operations` row only
+  after `_authenticate_tenant` and `_validate_operation`, so a bank that fails
+  in either would keep a NULL last attempt and — the discovery orders `NULLS
+  FIRST` — occupy the head of the queue permanently, letting two wedged banks
+  consume the whole per-tick cap for ever while every other bank is silently
+  starved of exactly the sweeps this change exists to schedule. The failure path
+  writes a terminal `failed` attempt row instead, which is durable, visible to
+  every process, and read by the same due-ness clock, so a failing bank is
+  delayed by one interval rather than banished. Proven RED-against-
+  upstream / GREEN-patched by
+  `tests/docker/hindsight-graph-maintenance-interval-sweep.test.ts`, whose
+  second arm executes the shipping discovery statement against a real Postgres.
 
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 

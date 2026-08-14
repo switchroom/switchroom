@@ -155,6 +155,7 @@ jobs:
               - 'tests/docker/hindsight-metrics-cardinality-patch.test.ts'
               - 'tests/docker/hindsight-graph-maintenance-retry-storm.test.ts'
               - 'tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts'
+              - 'tests/docker/hindsight-graph-maintenance-interval-sweep.test.ts'
               - 'tests/docker/dockerfile-hindsight-bakes.test.ts'
               - '.github/workflows/docker-e2e.yml'
             # hindsight-watch's streak probe (#4620) asserts its OUTCOME
@@ -571,6 +572,26 @@ jobs:
           SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
         run: npx vitest run tests/docker/hindsight-graph-maintenance-bounded-sweep.test.ts
 
+      - name: Run the hindsight graph-maintenance interval-sweep probe (RED/GREEN, must not skip)
+        # The periodic-sweep fix, and the ONLY place it is really executed.
+        # Upstream's graph maintenance is enqueue-driven only, so a bank whose
+        # graph_maintenance_queue drains stops being swept for ever (klanker:
+        # zero attempts for five days, measured 2026-08-13). The properties
+        # that matter are all behavioural — that a bank with an EMPTY queue
+        # really gets an async_operations row created, that it happens through
+        # `force_sweep=True` on the REAL submit method rather than by inserting
+        # fake queue rows, that the per-tick cap bounds the wave, and that the
+        # tenant id travels with the request context.
+        #
+        # Its SECOND arm executes the shipping discovery statement against the
+        # digest-pinned Postgres pulled above: only a real server can prove the
+        # in-flight guard actually skips a bank whose sweep is `processing`
+        # (`status IN ('pending')` greps clean and stampedes), and that the
+        # jitter term really spreads the wave off #4624's 120s slice clock.
+        env:
+          SWITCHROOM_REQUIRE_HINDSIGHT_PROBE: "1"
+        run: npx vitest run tests/docker/hindsight-graph-maintenance-interval-sweep.test.ts
+
       - name: Run the hindsight pg_search tokenizer-drift probe (RED/GREEN, must not skip)
         # Epic #4474 finding C1. The bakes test can only see that the patch TEXT
         # is present; it cannot see the outcome that matters — that the shipping
@@ -760,7 +781,7 @@ jobs:
       - name: Label-scoped teardown
         if: always()
         run: |
-          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-graph-maintenance-retry-storm hindsight-graph-maintenance-bounded-sweep hindsight-pg-fsync-probe; do
+          for phase in hindsight-search-patches hindsight-recall-isolation-patches hindsight-retry-perturbation-patches hindsight-mm-refresh-debounce-patch hindsight-pg-search-tokenizer-drift-patch hindsight-pg-search-filter-pushdown-patch hindsight-text-search-migration-patch hindsight-graph-seed-retirement hindsight-maxitems-grammar-patch hindsight-reflect-directives-patch hindsight-recall-budget-reflect-grounding hindsight-reranker-priority-patch hindsight-query-analyzer-languages hindsight-temporal-offload-patch hindsight-graph-maintenance-retry-storm hindsight-graph-maintenance-bounded-sweep hindsight-graph-maintenance-interval-sweep hindsight-pg-fsync-probe; do
             ids=$(docker ps -aq --filter "label=switchroom.test=$phase" 2>/dev/null || true)
             if [ -n "$ids" ]; then docker rm -f $ids 2>/dev/null || true; fi
           done

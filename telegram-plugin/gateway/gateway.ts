@@ -738,6 +738,7 @@ import {
 } from './emission-authority.js'
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId, isCrossChatAnchor } from './answer-thread-resolve.js'
+import { answerRouteOverrides } from './answer-route-overrides.js'
 import { formatReplyRouteLog } from './reply-route-log.js'
 import { latestTurnForChat } from './latest-turn-lookup.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
@@ -3919,8 +3920,13 @@ function resolveReplyOwnerTurn(
  * `originVia` distinguishes how the origin turn was resolved: 'echo' (model
  * echoed origin_turn_id), 'quoted' (framework recovered it from args.reply_to),
  * or null (no origin turn). It only affects the `via` label, never the routing.
+ *
+ * Exported ONLY as a test seam: the `answerRouteOverrides.note()` call below is
+ * a SIDE EFFECT no pure module carries, so nothing else can prove it still
+ * happens (`answer-route-side-effect.test.ts`). No production caller — the
+ * gateway still hands it to `sendReply` through the deps object.
  */
-function resolveAnswerThreadWithLog(
+export function resolveAnswerThreadWithLog(
   chatId: string,
   explicitThreadId: number | undefined,
   originTurn: CurrentTurn | null,
@@ -3961,6 +3967,26 @@ function resolveAnswerThreadWithLog(
     targetChatId: chatId,
     originChatId: originTurn?.sessionChatId,
     liveChatId: liveTurn?.sessionChatId,
+  })
+  // RECORD the explicit-thread override. `formatReplyRouteLog` re-derives the
+  // same predicate for its EXPLICIT_OVERRIDDEN marker, but that one is a pure
+  // string — this call is the SIDE EFFECT the marker used to carry, and it is
+  // load-bearing: obligation escalation reads this registry to tell "topic A's
+  // answer landed in B" from "something unrelated landed in B" (predicate +
+  // rationale: answer-route-overrides.ts). Deleting it would make the escalate
+  // branch nag on top of answers the user already got.
+  //
+  // `anchored` uses the CROSS-CHAT-FILTERED anchors, not the raw turns: an
+  // anchor owned by another chat is dropped from the routing (#4680), so it
+  // overrode nothing and must not be recorded as if it had. This keeps the
+  // record, the log marker, and what actually routed in agreement.
+  answerRouteOverrides.note({
+    chatId,
+    enabled: REPLY_TOPIC_AUTHORITY_ENABLED,
+    explicitThreadId,
+    anchored: originAnchor != null || liveAnchor != null,
+    routedThreadId: threadId,
+    nowMs: Date.now(),
   })
   process.stderr.write(
     formatReplyRouteLog({

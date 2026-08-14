@@ -1263,6 +1263,20 @@ export function getRecentOutboundCount(
  *   - explicit number → only that thread (precise for supergroups with topics)
  *   - explicit null → only chat-root (non-thread) messages
  *
+ * `untilMs` semantics — the optional UPPER bound (#4681):
+ *   - omitted → open-ended forward, the original behaviour. Correct for a caller
+ *     whose SCOPE is already tied to the obligation (its own topic): anything
+ *     substantive delivered there since it opened is plausibly its answer.
+ *   - a number → only rows at or before it. Required by any caller whose scope is
+ *     licensed by a SEPARATE, time-bounded piece of evidence — the obligation
+ *     escalate branch's reroute fallback, where an `EXPLICIT_OVERRIDDEN` record
+ *     licenses a look in ANOTHER topic. There an open-ended forward query lets
+ *     unrelated traffic in that topic, arriving arbitrarily later, be mistaken
+ *     for the answer that routing produced. See `escalation-staleness.ts`.
+ *   Applied at SECOND granularity like the lower bound, rounded UP (ceil) so
+ *   rounding can only ever ADMIT a borderline row, never drop a legitimate one —
+ *   the false-negative-safe direction for this predicate.
+ *
  * Falls back to false (safe: never suppresses escalation) if history is not yet
  * initialised or the query fails.
  */
@@ -1271,6 +1285,7 @@ export function hasOutboundDeliveredSince(
   sinceMs: number,
   threadId?: number | null,
   minChars = 200,
+  untilMs?: number,
 ): boolean {
   try {
     const cutoffSec = Math.floor(sinceMs / 1000)
@@ -1287,6 +1302,12 @@ export function hasOutboundDeliveredSince(
     // edits / typing indicators are structurally excluded.
     let sql =
       "SELECT 1 FROM messages WHERE chat_id = ? AND role = 'assistant' AND ts >= ? AND LENGTH(text) >= ?"
+    if (untilMs != null && Number.isFinite(untilMs)) {
+      // Ceil: `ts` is whole seconds, so a bound of e.g. 18_500 ms past the
+      // second boundary must still admit the row written in that second.
+      sql += ' AND ts <= ?'
+      params.push(Math.ceil(untilMs / 1000))
+    }
     if (threadId !== undefined) {
       if (threadId === null) {
         sql += ' AND thread_id IS NULL'
