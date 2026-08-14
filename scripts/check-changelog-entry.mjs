@@ -246,18 +246,36 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
 /**
  * Blank every `<!-- ... -->` pair inside a SINGLE line's text and report
  * whether a comment is still open when the line ends.
+ *
+ * An UNTERMINATED `<!--` only reports `open: true` when it could actually start
+ * a multi-line comment. Per CommonMark that is HTML block type 2, whose opener
+ * must be line-start-anchored (at most 3 spaces of indent); a `<!--` anywhere
+ * else on the line is inline raw HTML, and inline raw HTML cannot span lines —
+ * so an unterminated one is plain literal text and is left VERBATIM. Getting
+ * this wrong is fail-open, not cosmetic: treating a prose mention of `<!--` as
+ * an opener blanks every following line to EOF, which erases the released `## `
+ * headings the placement rule exists to check against.
+ *
  * @param {string} s
+ * @param {boolean} [allowMultiline] false when `s` is a mid-line TAIL (the text
+ *   after a `-->`), where no `<!--` can be line-start-anchored by construction.
  * @returns {{masked: string, open: boolean}}
  */
-function maskCommentsInLine(s) {
+function maskCommentsInLine(s, allowMultiline = true) {
   let out = ''
   let i = 0
   for (;;) {
     const start = s.indexOf('<!--', i)
     if (start === -1) return { masked: out + s.slice(i), open: false }
-    out += s.slice(i, start)
     const end = s.indexOf('-->', start + 4)
-    if (end === -1) return { masked: out + ' '.repeat(s.length - start), open: true }
+    if (end === -1) {
+      // Nothing after `start` can close on this line, so every later `<!--` is
+      // literal too — emit the remainder in one piece either way.
+      const anchored = allowMultiline && start <= 3 && /^ *$/.test(s.slice(0, start))
+      if (!anchored) return { masked: out + s.slice(i), open: false }
+      return { masked: out + s.slice(i, start) + ' '.repeat(s.length - start), open: true }
+    }
+    out += s.slice(i, start)
     out += ' '.repeat(end + 3 - start)
     i = end + 3
   }
@@ -296,16 +314,27 @@ function maskCommentsInLine(s) {
  * inside a real comment must NOT open a block, which only a single stateful pass
  * gets right in both directions.
  *
- * CommonMark rules, minus the cases a changelog will never hit: an opener is
- * three-or-more backticks/tildes indented at most 3 spaces; the closer is the
- * same character, at least as long, with nothing but whitespace after it.
+ * CommonMark rules, minus the cases a changelog will never hit. Fences: an
+ * opener is three-or-more backticks/tildes indented at most 3 spaces; the closer
+ * is the same character, at least as long, with nothing but whitespace after it.
+ * Comments: an intra-line `<!-- ... -->` pair is masked wherever it appears, but
+ * only a line-start-anchored `<!--` (at most 3 spaces of indent — CommonMark
+ * HTML block type 2) may open a MULTI-LINE comment. A `<!--` elsewhere on the
+ * line is inline raw HTML, which cannot span lines, so an unterminated one stays
+ * literal prose. Not modelled, because a changelog does not hit them: the other
+ * six HTML block types, and comments opened inside an indented (4-space) code
+ * block.
  *
  * @param {string} text
- * @returns {{text: string, unclosedFenceLine: number | null}}
+ * @returns {{text: string, unclosedFenceLine: number | null, unclosedCommentLine: number | null}}
  *   `unclosedFenceLine` is the 1-based line of a fence that was never closed
  *   before EOF. CommonMark says such a fence runs to the end of the document,
  *   which silently blinds every section below it — correct, but worth a WARN, so
  *   callers surface it rather than reporting a confident OK over a blind spot.
+ *   `unclosedCommentLine` is the same for a line-start `<!--` never closed before
+ *   EOF, and for the same reason: the anchoring rule above makes the fail-open
+ *   shape unreachable from prose, but a guard whose whole value is "does not fail
+ *   open" must be LOUD when its own state machine ends in an unexpected state.
  */
 export function maskNonProseWithState(text) {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n')
@@ -313,6 +342,8 @@ export function maskNonProseWithState(text) {
   /** @type {{char: string, len: number, line: number} | null} */
   let fence = null
   let inComment = false
+  /** @type {number | null} 1-based line the currently-open comment started on. */
+  let commentLine = null
   /** @type {string[]} */
   const out = []
   for (let i = 0; i < lines.length; i++) {
@@ -334,10 +365,12 @@ export function maskNonProseWithState(text) {
         continue
       }
       // The comment closes mid-line. What follows on the SAME line is prose, but
-      // it cannot open a fence (an opener must start its own line, indented at
-      // most 3 spaces) — it may only open another comment.
-      const tail = maskCommentsInLine(line.slice(idx + 3))
+      // it can open neither a fence nor another MULTI-LINE comment — both
+      // openers must be line-start-anchored, and this tail is mid-line by
+      // construction. Intra-line pairs in the tail are still masked.
+      const tail = maskCommentsInLine(line.slice(idx + 3), false)
       inComment = tail.open
+      if (!inComment) commentLine = null
       out.push(' '.repeat(idx + 3) + tail.masked)
       continue
     }
@@ -349,9 +382,14 @@ export function maskNonProseWithState(text) {
     }
     const masked = maskCommentsInLine(line)
     inComment = masked.open
+    commentLine = inComment ? i + 1 : null
     out.push(masked.masked)
   }
-  return { text: out.join('\n'), unclosedFenceLine: fence ? fence.line : null }
+  return {
+    text: out.join('\n'),
+    unclosedFenceLine: fence ? fence.line : null,
+    unclosedCommentLine: inComment ? commentLine : null,
+  }
 }
 
 /**
@@ -881,12 +919,23 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
   // document — but it means every `## ` heading below it is masked away, so the
   // placement rule inspects nothing down there and would otherwise report a
   // confident OK over a blind spot. Say so rather than passing silently.
-  const unclosedFence = maskNonProseWithState(headChangelog).unclosedFenceLine
+  const headMaskState = maskNonProseWithState(headChangelog)
+  const unclosedFence = headMaskState.unclosedFenceLine
   if (unclosedFence !== null) {
     warnings.push(
       `check-changelog-entry: WARN — CHANGELOG.md has a code fence opened at line ${unclosedFence} that is never closed.`,
       '  Per CommonMark that fence runs to end-of-file, so every `## ` heading below it is code, not a',
       '  section — the placement rule cannot see anything past it. Close the fence.',
+    )
+  }
+  // Same class of blind spot, same duty to be loud: a line-start `<!--` never
+  // closed masks every `## ` heading below it away too.
+  const unclosedComment = headMaskState.unclosedCommentLine
+  if (unclosedComment !== null) {
+    warnings.push(
+      `check-changelog-entry: WARN — CHANGELOG.md has an HTML comment opened at line ${unclosedComment} that is never closed.`,
+      '  Everything below it is comment body, not prose, so every `## ` heading past it is invisible to',
+      '  the placement rule. Close the comment with `-->`.',
     )
   }
 

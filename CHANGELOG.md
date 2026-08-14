@@ -96,7 +96,20 @@ now an anomaly worth investigating, not the norm.
   heading (a typo fix) no longer blanket-exempts that whole section — newness
   keys on the section's version token, not on the heading line changing. A
   changelog with no `## Unreleased` section at all now gets a message that says
-  so, instead of the inapplicable post-release-merge story.
+  so, instead of the inapplicable post-release-merge story. The interleaved pass
+  also **anchors** the multi-line comment opener, which is what keeps it from
+  fail-opening the way the two-pass shape it replaced did: only a `<!--` at the
+  start of its line (CommonMark HTML block type 2, at most 3 spaces of indent)
+  may span lines, so a changelog entry that merely QUOTES the delimiter in prose
+  — as this very entry does — stays literal text instead of commenting out the
+  rest of the file. Unanchored, one such line measured on the real CHANGELOG.md
+  took the parse from 429 sections to 421, and the eight that vanished were
+  `## v0.21.10`, `## v0.21.9`, `## v0.21.8` and neighbours: exactly the sections
+  a post-release merge buries an entry in, which would have turned the new
+  placement rule straight back into a confident OK over a buried entry. A
+  line-start comment left unclosed at EOF now WARNs alongside the unclosed-fence
+  WARN, for the same reason — a guard whose whole value is *does not fail open*
+  has to be loud when its own state machine ends somewhere unexpected.
 - **telegram/render: a `<pre>` whose body contained ``` shipped an
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick

@@ -64,6 +64,15 @@ interface Fixture {
   gitTry: (args: string[]) => { status: number; stdout: string; stderr: string };
   /** Run the real guard over `main...HEAD`; returns exit code + output. */
   check: (env?: Record<string, string | undefined>) => { code: number; out: string };
+  /**
+   * As `check`, but keeps the two streams APART. A WARN the operator is meant
+   * to act on has to reach them on the stream they actually read: `bun run lint`
+   * and every `2>/dev/null` invocation show stdout only, so asserting on the
+   * merged blob cannot tell a visible warning from an invisible one.
+   */
+  checkStreams: (
+    env?: Record<string, string | undefined>,
+  ) => { code: number; stdout: string; stderr: string };
 }
 
 function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG): Fixture {
@@ -119,6 +128,24 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
   // falls through to plain `main` when no remote is configured.
   git(["checkout", "-q", "-b", "work"]);
 
+  const checkStreams = (extraEnv: Record<string, string | undefined> = {}) => {
+    const merged: Record<string, string | undefined> = {
+      ...env,
+      CHANGELOG_BASE: "main",
+      ...extraEnv,
+    };
+    // An explicit `undefined` DELETES the key rather than passing the string
+    // "undefined" through to the child, so a test can pin the genuinely-unset
+    // case and not just the set-to-garbage one.
+    for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];
+    const r = spawnSync(process.execPath, [CHECK], {
+      cwd: dir,
+      encoding: "utf-8",
+      env: merged as NodeJS.ProcessEnv,
+    });
+    return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+
   return {
     dir,
     writeFile,
@@ -138,22 +165,10 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
       git(["checkout", "-q", "work"]);
       return sha;
     },
+    checkStreams,
     check(extraEnv = {}) {
-      const merged: Record<string, string | undefined> = {
-        ...env,
-        CHANGELOG_BASE: "main",
-        ...extraEnv,
-      };
-      // An explicit `undefined` DELETES the key rather than passing the string
-      // "undefined" through to the child, so a test can pin the genuinely-unset
-      // case and not just the set-to-garbage one.
-      for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];
-      const r = spawnSync(process.execPath, [CHECK], {
-        cwd: dir,
-        encoding: "utf-8",
-        env: merged as NodeJS.ProcessEnv,
-      });
-      return { code: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+      const r = checkStreams(extraEnv);
+      return { code: r.code, out: `${r.stdout}${r.stderr}` };
     },
   };
 }
@@ -666,6 +681,176 @@ describe("check-changelog-entry — a fenced code block is not a section boundar
     const r = f.check();
     expect(r.out).toContain("code fence opened at line 7 that is never closed");
     expect(r.out).toContain("the placement rule cannot see anything past it");
+  });
+});
+
+describe("check-changelog-entry — a `<!--` in prose does not blind the parser", () => {
+  // The fail-OPEN the single stateful pass introduced, and the reason the
+  // multi-line comment opener is line-start-ANCHORED. Per CommonMark only an
+  // HTML block type 2 opener — `<!--` at the start of its line, indented at most
+  // 3 spaces — can span lines; a `<!--` anywhere else is inline raw HTML, which
+  // cannot. An unanchored scanner reads a changelog entry that merely QUOTES
+  // `<!--` as opening a comment that runs to EOF, blanks every released `## `
+  // heading below it, and then reports a confident OK over a buried entry.
+  //
+  // This is not hypothetical for this file: measured on the real CHANGELOG.md,
+  // one prose line quoting `<!--` at the end of `## Unreleased` took the parse
+  // from 429 sections to 421, and the 8 that vanished were `## v0.21.10`,
+  // `## v0.21.9`, `## v0.21.8` and neighbours — exactly the sections a
+  // post-release merge buries an entry in.
+
+  /**
+   * The trap: an entry buried under a RELEASED heading. `prose` is spliced into
+   * `## Unreleased` ABOVE the released heading — the only difference between the
+   * control and the attack.
+   */
+  function buriedEntryFixture(prefix: string, prose: string[]): Fixture {
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      ...prose,
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture(prefix, BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", `${BASE}- **BURIED ENTRY (#2):** appended under the RELEASED heading.\n`);
+    f.commit("feat: ship code and bury the entry under a released heading");
+    return f;
+  }
+
+  const MERGE_GROUP = { GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" };
+
+  // NON-VACUITY, structural: the control and the attack are the SAME fixture but
+  // for one prose line, and they are asserted to differ in BOTH exit code and
+  // message. The pair cannot pass by every case agreeing on one answer — a guard
+  // that always FAILs reds the control's twin below, and one that always passes
+  // reds the control here.
+  it("control: the buried entry FAILs when no `<!--` appears in prose", () => {
+    const r = buriedEntryFixture("changelog-prose-control-", []).check(MERGE_GROUP);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+    expect(r.out).toContain("BURIED ENTRY (#2)");
+  });
+
+  it("attack: one prose line quoting `<!--` must NOT turn that FAIL into an OK", () => {
+    // Mutation-proven: against the unanchored scanner this run is exit 0 with
+    // "OK — no entry added under a released section", because every heading
+    // below the prose line — including `## v0.20.11` — has been masked away.
+    const r = buriedEntryFixture("changelog-prose-attack-", [
+      "- guard: a bare `<!--` in prose is now literal text",
+    ]).check(MERGE_GROUP);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+    expect(r.out).toContain("BURIED ENTRY (#2)");
+    expect(r.out).toContain("## v0.20.11");
+  });
+
+  it("a `<!--` indented 4+ spaces does not open a multi-line comment either", () => {
+    // 4 spaces is past CommonMark's 3-space limit for an HTML block opener (it is
+    // an indented code block), so this must stay literal too. Sits at the
+    // boundary the anchoring rule actually implements, not just far from it.
+    const r = buriedEntryFixture("changelog-prose-indent4-", ["", "    <!--"]).check(MERGE_GROUP);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+    expect(r.out).toContain("## v0.20.11");
+  });
+
+  it("still masks a GENUINE line-start multi-line comment, `## ` lines and all", () => {
+    // The other side of the anchoring rule, and the real use this must not break:
+    // a comment that DOES start its own line spans lines exactly as before, so a
+    // `## ` inside it is commentary and not a section boundary. An entry appended
+    // after it is still plain Unreleased growth, not a burial.
+    const COMMENTED = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!--",
+      "## v9.9.9 — a heading inside a real comment, not a section",
+      "reviewer note: keep this block until the next cut",
+      "-->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-real-comment-", COMMENTED);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      COMMENTED.replace(
+        "- **Earlier entry (#0):** already staged.\n",
+        "- **Earlier entry (#0):** already staged.\n- **Branch entry (#2):** appended under Unreleased.\n",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry below a real HTML comment");
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("## Unreleased grew");
+    expect(r.out).not.toContain("ALREADY-RELEASED");
+    expect(r.out).not.toContain("v9.9.9");
+  });
+
+  it("WARNs on STDOUT when an HTML comment is left open at end-of-file", () => {
+    // Belt to the anchoring rule's braces. Anchoring makes the fail-open shape
+    // unreachable from prose, but a guard whose entire value proposition is
+    // "does not fail open" has to be LOUD when its own state machine ends in an
+    // unexpected state — the same duty, and the same wording, as the unclosed
+    // fence WARN it sits beside.
+    //
+    // Asserted on stdout ALONE on purpose: `bun run lint` and every `2>/dev/null`
+    // invocation show stdout only, so a WARN written to stderr would be invisible
+    // to the operator it is addressed to. The merged blob cannot tell them apart.
+    // The unclosed comment is in the BASE and trails the file, so the run itself
+    // PASSES — which is the case that matters. A WARN only earns its keep when
+    // the verdict is OK; on a FAIL the operator is already reading the output.
+    const UNCLOSED = [
+      "# Changelog", //                                                   1
+      "", //                                                              2
+      "## Unreleased", //                                                 3
+      "", //                                                              4
+      "<!-- staging area; entries land here per-PR -->", //                5
+      "", //                                                              6
+      "- **Earlier entry (#0):** already staged.", //                     7
+      "", //                                                              8
+      "## v0.20.11 — a released section", //                              9
+      "", //                                                             10
+      "- **Something shipped (#1):** prose.", //                         11
+      "", //                                                             12
+      "<!-- reviewer note: drop this before the cut", //                  13  ← never closed
+      "", //                                                             14
+    ].join("\n");
+    const f = makeFixture("changelog-unclosed-comment-", UNCLOSED);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    // The branch's ONLY changelog edit is an entry under `## Unreleased`, which
+    // pushes the unclosed opener from line 13 to line 14.
+    f.writeFile(
+      "CHANGELOG.md",
+      UNCLOSED.replace(
+        "- **Earlier entry (#0):** already staged.\n",
+        "- **Earlier entry (#0):** already staged.\n- **Branch entry (#2):** staged.\n",
+      ),
+    );
+    f.commit("feat: ship code with an unclosed HTML comment in the changelog");
+
+    const r = f.checkStreams();
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("HTML comment opened at line 14 that is never closed");
+    expect(r.stdout).toContain("every `## ` heading past it is invisible to");
+    expect(r.stdout).toContain("Close the comment with `-->`");
   });
 });
 
