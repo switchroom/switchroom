@@ -23,8 +23,12 @@ at `telegram-plugin/tests/`. Use it to lock in the Bot API call
 sequences switchroom emits — what the user actually sees in chat — so
 regressions fail a test instead of going silent in production.
 
-This skill is a quick-reference for that harness. The full guide lives
-at [`telegram-plugin/tests/HARNESS.md`](../../telegram-plugin/tests/HARNESS.md).
+This skill is the reference for that harness — there is no separate
+`HARNESS.md` guide file (it existed briefly, was deleted in the pinned
+progress-card removal (#1126), and was never recreated). Read the fake
+implementations directly for the authoritative contract:
+`telegram-plugin/tests/fake-bot-api.ts`, `update-factory.ts`,
+`bot-api.harness.ts`.
 
 ## When to use this harness
 
@@ -147,8 +151,6 @@ Example pairs:
 
 - `slot-banner.test.ts` (pure decision) +
   `slot-banner-driver.e2e.test.ts` (Bot API dispatch)
-- `auto-fallback.test.ts` (pure plan) +
-  `auto-fallback-dispatcher.e2e.test.ts` (notification dispatch)
 
 ## Test-design checklist
 
@@ -187,7 +189,6 @@ Before writing the test, ask:
 
 ## See also
 
-- `telegram-plugin/tests/HARNESS.md` — full guide
 - `telegram-plugin/tests/fake-bot-api.test.ts` — meta-test of the fake;
   read first when adding new fake-bot capabilities
 - `telegram-plugin/tests/streaming-e2e.test.ts` — worked example of a
