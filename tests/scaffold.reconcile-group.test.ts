@@ -14,7 +14,7 @@ import type { AgentConfig, TelegramConfig } from "../src/config/schema.js";
  */
 
 const SG = "-1001234567890";
-const FLEET_FORUM = "-1003852747971"; // a DIFFERENT chat — the shared fleet forum
+const FLEET_FORUM = "-1005555555555"; // a DIFFERENT chat — the shared fleet forum
 const agent = (overrides: Partial<AgentConfig> = {}): AgentConfig =>
   ({ extends: "default", ...overrides } as unknown as AgentConfig);
 // supergroup-owned: per-agent channels.telegram.chat_id override (the prod shape)
@@ -64,14 +64,14 @@ describe("reconcileConfiguredGroup", () => {
     writeAccess({
       dmPolicy: "allowlist",
       allowFrom: ["111", "222"],
-      groups: { "-5164217975": { requireMention: false, allowFrom: ["111"] } },
+      groups: { "-6666666666": { requireMention: false, allowFrom: ["111"] } },
       pending: { abc123: { senderId: "999", chatId: "999" } },
       stickers: { ok: "CAAC..." },
     });
     reconcileConfiguredGroup(accessPath, agent(), tg(SG));
     const a = readAccess();
-    expect(Object.keys(a.groups).sort()).toEqual([SG, "-5164217975"]);
-    expect(a.groups["-5164217975"]).toEqual({ requireMention: false, allowFrom: ["111"] });
+    expect(Object.keys(a.groups).sort()).toEqual([SG, "-6666666666"]);
+    expect(a.groups["-6666666666"]).toEqual({ requireMention: false, allowFrom: ["111"] });
     expect(a.allowFrom).toEqual(["111", "222"]);
     expect(a.pending).toEqual({ abc123: { senderId: "999", chatId: "999" } });
     expect(a.stickers).toEqual({ ok: "CAAC..." });

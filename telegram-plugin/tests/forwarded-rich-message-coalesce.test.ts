@@ -140,7 +140,7 @@ describe('wiring: message:rich_message dispatches through the coalescing path', 
 // through `handleInboundCoalesced`.
 // ---------------------------------------------------------------------------
 
-const CHAT_ID = -1004223464247
+const CHAT_ID = -1004444444444
 const USER_ID = 777
 
 function makeBotInfo() {
@@ -159,13 +159,13 @@ function makeBotInfo() {
 
 /** Forwarded rich (bot) message, no top-level text/caption — the live shape. */
 function makeForwardedRichUpdate(update_id: number, blocks: unknown[]): Update {
-  const originUser = { id: 8500000001, is_bot: true, first_name: 'Klanker', username: 'meken_klanker_bot' }
+  const originUser = { id: 8500000001, is_bot: true, first_name: 'Sidekick', username: 'example_sidekick_bot' }
   return {
     update_id,
     message: {
       message_id: update_id,
-      chat: { id: CHAT_ID, type: 'supergroup', title: 'ProductOS', is_forum: true },
-      from: { id: USER_ID, is_bot: false, first_name: 'Ken' },
+      chat: { id: CHAT_ID, type: 'supergroup', title: 'Example Supergroup', is_forum: true },
+      from: { id: USER_ID, is_bot: false, first_name: 'Alice' },
       date: 1784837003,
       forward_origin: { type: 'user', date: 1784830000, sender_user: originUser },
       forward_from: originUser,
@@ -180,8 +180,8 @@ function makeTextUpdate(update_id: number, text: string): Update {
     update_id,
     message: {
       message_id: update_id,
-      chat: { id: CHAT_ID, type: 'supergroup', title: 'ProductOS', is_forum: true },
-      from: { id: USER_ID, is_bot: false, first_name: 'Ken' },
+      chat: { id: CHAT_ID, type: 'supergroup', title: 'Example Supergroup', is_forum: true },
+      from: { id: USER_ID, is_bot: false, first_name: 'Alice' },
       date: 1784837004,
       text,
     },

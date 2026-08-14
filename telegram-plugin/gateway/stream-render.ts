@@ -546,7 +546,7 @@ function beginTurn(deps: StreamRenderDeps, ev: TurnStartEnvelope): void {
     // the narrative gate but NEVER touched the activity card — so the card
     // froze on its last landed edit, kept the `fg:<statusKey>` status pin
     // forever, and left NO `turn-lifecycle clear` line to explain it (carrie
-    // 2026-07-28, turn `-1004223464247:_#1078`). `clearActivitySummary`
+    // 2026-07-28, turn `-1004444444444:_#1078`). `clearActivitySummary`
     // finalizes/deletes the card AND releases the pin; it is idempotent and
     // no-ops when the turn never opened a card.
     // `endedAt == null` narrows this to a turn that never ended: a turn that

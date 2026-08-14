@@ -49,10 +49,10 @@ describe('(a) a forwarded plain-text message records a history row with forwarde
     const forwardOrigin = parseForwardOrigin({
       type: 'user',
       date: 1_700_000_000,
-      sender_user: { id: 424242, is_bot: false, first_name: 'Ken', last_name: 'Thompson' },
+      sender_user: { id: 424242, is_bot: false, first_name: 'Alice', last_name: 'Example' },
     })
     expect(forwardOrigin).toBeDefined()
-    expect(forwardOrigin!.name).toBe('Ken Thompson')
+    expect(forwardOrigin!.name).toBe('Alice Example')
 
     recordInbound({
       chat_id,
@@ -74,7 +74,7 @@ describe('(a) a forwarded plain-text message records a history row with forwarde
     // forwarded provenance.
     expect(row.role).toBe('user')
     expect(row.text).toBe('here is the brief I forwarded')
-    expect(row.forwarded_from).toBe('Ken Thompson')
+    expect(row.forwarded_from).toBe('Alice Example')
     expect(row.forwarded_from_type).toBe('user')
     expect(row.forwarded_from_id).toBe('424242')
   })
