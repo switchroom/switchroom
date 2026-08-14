@@ -67,8 +67,8 @@ now an anomaly worth investigating, not the norm.
   supplies the base the old skip note claimed did not exist. The entry-required
   rule still stands down there, since its `no-changelog` / PR-body escape hatch
   is unreadable on a queue ref; placement reads only the diff, so it needs no PR
-  context. The message names the real problem and fix (`your entry is under
-  ## v0.21.8, move it back under ## Unreleased`) instead of the misleading
+  context. The message names the real problem and fix (`your entry is under ##
+  v0.21.8, move it back under ## Unreleased`) instead of the misleading
   `adds no new entry` symptom, and an EMPTY diff range now WARNs that it checked
   nothing — the local-review trap where `npm run lint` over an *uncommitted*
   merge printed a cheerful OK. Deliberate old-section edits opt out with
