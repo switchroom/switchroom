@@ -29,12 +29,12 @@ import {
 
 describe("TelegramChannelSchema — supergroup smart defaults", () => {
   it("defaults default_topic_id to General (1) when chat_id is set and it is omitted", () => {
-    const r = TelegramChannelSchema.parse({ chat_id: "-1003831053471" });
+    const r = TelegramChannelSchema.parse({ chat_id: "-1001234567890" });
     expect(r?.default_topic_id).toBe(1);
   });
 
   it("preserves an explicit default_topic_id", () => {
-    const r = TelegramChannelSchema.parse({ chat_id: "-1003831053471", default_topic_id: 17 });
+    const r = TelegramChannelSchema.parse({ chat_id: "-1001234567890", default_topic_id: 17 });
     expect(r?.default_topic_id).toBe(17);
   });
 

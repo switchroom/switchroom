@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { formatReplyRouteLog, type ReplyRouteLogInput } from './reply-route-log.js'
 
 const CHAT_A = '12345678' // DM — the reply target
-const CHAT_B = '-1003831053471' // forum supergroup — where the anchor lives
+const CHAT_B = '-1001234567890' // forum supergroup — where the anchor lives
 
 function line(over: Partial<ReplyRouteLogInput> = {}): string {
   return formatReplyRouteLog({
