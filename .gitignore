@@ -84,3 +84,8 @@ switchroom-checksums.txt
 
 # Locally built release asset payload (#4163).
 switchroom-assets.tar.gz
+
+# Crash-recovery sentinel for scripts/check-mutation-coverage.mjs. Present only
+# while a mutation run is in flight; a leftover one is recovered (and deleted)
+# by the next run.
+.mutation-restore.json
