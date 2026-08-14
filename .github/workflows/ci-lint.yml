@@ -127,8 +127,28 @@ jobs:
         # than leaving it implicit — the same shape docker-images.yml's tag step
         # uses, and what tests/ci-merge-queue-triggers.test.ts requires of any
         # step reading PR-only context. On a queue ref both render '' and the
-        # check SKIPs the event outright; on push it diffs an empty range.
+        # entry-required rule is skipped for want of its escape hatch; on push
+        # it diffs an empty range.
+        #
+        # CHANGELOG_BASE is the load-bearing one on a queue ref. The queue's
+        # PLACEMENT check (an entry must not land under an already-released
+        # heading) is the ONLY thing that ever inspects the MERGED result: the
+        # PR-side run measures growth against the PR's own merge-base, which
+        # predates any release cut made while the PR sat open, so a post-release
+        # merge that buries the entry inside `## v0.21.8` is green there AND
+        # textually clean. `merge_group.base_sha` is the commit the queue ref
+        # was built on and is an ancestor of it, so the `fetch-depth: 0`
+        # checkout above already has it — no deepened fetch, and none of the
+        # dorny/paths-filter failure modes .github/MERGE-QUEUE.md warns about,
+        # because this is a plain `git diff` inside a job that has already got
+        # past checkout. Deleting this line does not make the check skip
+        # quietly: on merge_group the script treats CHANGELOG_BASE as
+        # AUTHORITATIVE — no origin/main fallback — and FAILs both when it is
+        # UNSET (what deleting this line produces) and when it is set but
+        # unresolvable. tests/changelog-entry-check.test.ts pins both, and also
+        # asserts this line exists.
         env:
+          CHANGELOG_BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || '' }}
           CHANGELOG_PR_BODY: ${{ github.event_name != 'merge_group' && github.event.pull_request.body || '' }}
           CHANGELOG_PR_LABELS: ${{ github.event_name != 'merge_group' && join(github.event.pull_request.labels.*.name, ' ') || '' }}
         run: bun lint

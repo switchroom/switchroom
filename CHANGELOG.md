@@ -15,6 +15,136 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **ci: the changelog guard now catches an entry that lands in an
+  already-released section** — a PR that stages its entry under `## Unreleased`
+  and then has a release cut underneath it merges **textually clean**: git
+  reapplies the entry at the same offset, which is now inside the shipped
+  `## vX.Y.Z` section. Exit 0, zero conflicts, wrong release notes, entry buried
+  forever. Nothing caught it, because the only moment the corruption exists is
+  the MERGED result: the `pull_request` run measures growth against the PR's own
+  merge-base (which predates the release, so the entry still reads as staged),
+  and `check-changelog-entry.mjs` SKIPped `merge_group` outright, so the queue
+  never re-checked. Four PRs (#4679–#4682) hit this simultaneously behind the
+  v0.21.9 cut; a fifth (#4561) landed the same way in August and was repaired by
+  hand at release time. The guard gains a PLACEMENT rule — no line added in the
+  range may land under a released heading, unless that SECTION is new in the
+  same range (the release PR's own `## Unreleased` → `## vX.Y.Z` rename) — and
+  it now RUNS on `merge_group`, where `github.event.merge_group.base_sha`
+  supplies the base the old skip note claimed did not exist. The entry-required
+  rule still stands down there, since its `no-changelog` / PR-body escape hatch
+  is unreadable on a queue ref; placement reads only the diff, so it needs no PR
+  context. The message names the real problem and fix (`your entry is under ##
+  v0.21.8, move it back under ## Unreleased`) instead of the misleading
+  `adds no new entry` symptom, and an EMPTY diff range now WARNs that it checked
+  nothing — the local-review trap where `npm run lint` over an *uncommitted*
+  merge printed a cheerful OK. Deliberate old-section edits opt out with
+  `[changelog placement ok]` on its own line. Four things the parser now gets
+  right, each of which otherwise turns the new rule into a false FAIL or a
+  silent miss: (1) **block structure is parsed, not scanned** — this changelog
+  pastes CI transcripts verbatim and already carries 30+ fence markers, and a
+  fenced line reading `## v9.9.9 — sample output` used to become a phantom
+  released section, which would then have red-flagged EVERY later PR appending
+  to the end of `## Unreleased`, repo-wide, until the code block was deleted;
+  (2) on a
+  queue ref `$CHANGELOG_BASE` is **authoritative, with no
+  `origin/main` fallback**, and both UNSET and set-but-unresolvable FAIL —
+  previously the cascade always rescued it (on a `fetch-depth: 0` checkout
+  `origin/main` always resolves), so a broken workflow silently diffed the
+  wrong range and reported OK; (3) a diff line whose CONTENT begins with `+++`
+  no longer desyncs the new-file line cursor, which used to attribute every
+  later added line in the hunk one line too low; and (4) editing a released
+  heading (a typo fix) no longer blanket-exempts that whole section — newness
+  keys on the section's version token, not on the heading line changing. A
+  changelog with no `## Unreleased` section at all now gets a message that says
+  so, instead of the inapplicable post-release-merge story.
+  That first item is why this took seven review rounds. It began as a
+  hand-written masker, and every round found one more block shape it had not
+  modelled — fences and comments interleaved, HTML block types 1 and 3-7,
+  `<!-->` and `<!--->` as COMPLETE comments (CommonMark 0.30+, matching the HTML
+  spec: the closing `-->` may reuse the opener's own dashes), container scoping,
+  a two-slot dedent latch. Each fix was about two lines and each one left the
+  CLASS alive; the last one, measured on the real CHANGELOG.md, took the parse
+  from 429 sections to 179 and returned `OK`, exit 0, over a genuinely buried
+  entry. So the masker is DELETED — -452/+134 lines on this script against the
+  previous revision of this PR — in favour of `commonmark@0.31.2`, the reference
+  implementation, as a **devDependency**: sections come from its own heading
+  nodes' `sourcepos`, and fenced-code and HTML-block lines are masked from its
+  own node spans. Nothing in the guard re-implements CommonMark any more, so
+  there is nothing left for CommonMark to disagree with. On the real
+  CHANGELOG.md the guard reports 429 sections against the reference
+  implementation's 429 column-0 level-2 headings: equal, not approximately
+  equal. The unclosed-fence and unclosed-comment WARNs go with the state machine
+  that raised them — an unclosed fence really does run to EOF in CommonMark, so
+  there is no anomaly to report — while the empty-range WARN, which is about the
+  guard's own inputs, stays. Nothing ships to users: `scripts/` is not in the
+  package `files` list, and CI already installs devDependencies before lint.
+  ONE deliberate divergence remains, and it is now the only one: a heading opens
+  a section at COLUMN 0 only, though CommonMark tolerates up to three spaces of
+  indent. Honouring the tolerance is fail-OPEN in exactly the direction this
+  guard exists to close — an indented `## Unreleased` written INSIDE an
+  already-released section (an entry quoting the staging header, which is a
+  thing this file does) would un-release every section below it and wave a
+  buried entry through. Refusing it can at worst invent a section and fail a PR
+  that should have passed: loud and wrong beats silent and wrong. That reasoning
+  only covered ONE of the two directions, and review caught the other: an
+  indented **released** heading is not "loud and wrong", it is silent and wrong.
+  An indented `## v0.21.5` under `## Unreleased` renders as a released section on
+  GitHub, while the guard's anchor drops it, so the section it opens stays folded
+  into `## Unreleased` — an entry pasted below it reads as staged,
+  `findMisplacedEntries` sees no released section to complain about, and the PR
+  passes. The anchor is therefore no longer allowed to discard silently: any
+  level-2..6 ATX heading the reference implementation renders from a
+  1–3-space-indented line is now its own FAIL, naming the line and the three ways
+  out (unindent it, fence it, or indent it to 4+ so it is code). The rule is
+  deliberately NOT escapable with `[changelog placement ok]`, since that hatch
+  exists for a deliberate edit to an old section, not for a heading nobody can
+  see. **This is a behaviour change**: a CHANGELOG.md that used to pass with an
+  indented heading now fails. Today's file has 429 column-0 headings and zero
+  indented ones, so it costs nothing here. Separately, a missing `commonmark`
+  devDependency now degrades to the guard's designed SKIP instead of
+  `ERR_MODULE_NOT_FOUND` — the import is guarded, so a half-installed tree gets
+  "skipped, dependency absent", not a stack trace.
+  Two of the things that were supposed to be PINNING all this were pinning
+  nothing, which is the same defect one layer up.
+  `scripts/changelog-mask-differential.mjs` scored its fail-open and fail-closed
+  columns with an expression character-identical to the implementation it was
+  auditing, so both counters were hard-wired to zero: a mutant that relaxed the
+  anchor and a mutant that disabled fence masking entirely both scored 0/0 and
+  exited 0 over 20,000 documents. Its oracle is now derived from the SOURCE TEXT
+  and from what the reference implementation actually renders; those same two
+  mutants now score 832 and 1,896 and exit 1, and three further mutants (deleting
+  the indent rule, inventing a heading, narrowing the section regex) score 206,
+  2,000 and 616. The battery's second assertion had the same
+  copy-of-the-implementation oracle and is likewise re-derived from the source
+  line and CommonMark's ATX rule.
+  The CommonMark evidence these rounds kept being argued from is now committed
+  twice over. `tests/fixtures/commonmark-mask-cases.mjs` is a 42-row conformance
+  corpus, one row per shape that cost a round, and the battery over it no longer
+  compares against hardcoded expectations — nine of those recorded answers the
+  old approximation got WRONG, so improving the guard turned nine rows red for
+  being right, which makes it a change-detector rather than a test. Both columns
+  are now derived from the reference implementation LIVE, so the table cannot
+  rot and the guard cannot drift from the parser it claims to be.
+  `scripts/changelog-mask-differential.mjs` is the seeded random search, now
+  runnable with no out-of-tree install, and its container sampling was widened:
+  it used to put the container marker on the construct's own line (`- ```yaml`),
+  which cannot generate this file's house style — a bullet, then the block
+  indented UNDER it on the following lines — the shape both the round-5 and the
+  round-7 fail-open lived in. The old container list had no lead-line form at
+  all, so that shape had probability ZERO; it now appears in 457 of every 60,000
+  documents at seed 1. Under the widened harness the masker this PR deletes
+  scores 13 fail-OPEN and 271,585 fail-CLOSED over 1,000,000 documents; the
+  parser replacing it scores 0 and 0 over the same 1,000,000, with the column-0
+  policy reported as its own named count rather than folded into an "agrees"
+  column that hid it.
+  `gen-changelog-entry.mjs` learned the same column-0 anchoring for
+  `## Unreleased` — at BOTH ends of the section, the header scan and the scan
+  that finds where it stops — so the writer and the checker cannot disagree about
+  which lines are the staging section and stage an entry where the guard will not
+  count it.
+
 ## v0.21.11 — obligation escalations stop nagging over a delivered answer, fleet-health detectors stop laundering silent passes as green, and long messages stop breaking TTS
 
 ### Tooling

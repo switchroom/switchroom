@@ -25,6 +25,12 @@ import { join, dirname, resolve } from "node:path";
 const repoRoot = resolve(import.meta.dirname, "..");
 const GEN = join(repoRoot, "scripts", "gen-changelog-entry.mjs");
 
+// The guard's own extractor, used to assert writer/checker AGREEMENT rather
+// than re-implementing "what counts as a staged entry" a third time here.
+const { extractUnreleasedEntries } = await import(
+  join(repoRoot, "scripts", "check-changelog-entry.mjs")
+);
+
 const SEED_CHANGELOG = [
   "# Changelog",
   "",
@@ -45,6 +51,13 @@ interface Fixture {
   writeFile: (rel: string, body: string) => void;
   commit: (message: string) => string;
   readChangelog: () => string;
+  /**
+   * Run git inside the fixture under its HERMETIC env (pinned identity, no
+   * ambient `~/.gitconfig`). Every git call a test makes MUST go through this:
+   * a bare `execFileSync("git", ...)` inherits the ambient environment, and a
+   * CI runner has no `user.name` / `user.email`.
+   */
+  git: (args: string[]) => string;
   /** Run the real generator over `main...HEAD`; returns exit code + output. */
   gen: (extraArgs?: string[], extraEnv?: Record<string, string>) => { code: number; out: string };
 }
@@ -96,6 +109,7 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
       git(["commit", "-q", "-m", message]);
       return git(["rev-parse", "HEAD"]).trim();
     },
+    git,
     readChangelog() {
       return readFileSync(join(dir, "CHANGELOG.md"), "utf-8");
     },
@@ -176,6 +190,95 @@ describe("gen-changelog-entry — derives an entry from the conventional-commit 
     expect(unreleasedBlock(f.readChangelog())).toContain(
       "- **BREAKING** **config: drop the legacy overlay (#99)**",
     );
+  });
+});
+
+describe("gen-changelog-entry — the writer and the checker agree on the section", () => {
+  it("ignores an INDENTED `## Unreleased` and stages where the guard will count it", () => {
+    // `insertEntry` finds the staging section at column 0, exactly like the
+    // guard's `parseSections` / `extractUnreleasedEntries`. Tolerate an indent
+    // and this file's example block becomes the staging target: the bullet gets
+    // written inside an indented code block, the guard counts zero new entries,
+    // and the PR reds for "no changelog entry" while its entry sits in the file.
+    // Asserted through the GUARD's own extractor, because agreement between the
+    // two scripts is the property, not either one's internal notion of a match.
+    const EXAMPLE_ONLY = [
+      "# Changelog",
+      "",
+      "- **Docs (#1):** the staging block is written like this:",
+      "",
+      "      ## Unreleased",
+      "",
+      "      <!-- staging area; entries land here per-PR -->",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("gen-indented-unreleased-", EXAMPLE_ONLY);
+    f.writeFile("src/feature.ts", "export const x = 1;\n");
+    f.commit("feat(cli): add a verb");
+
+    const r = f.gen(["--pr", "42"]);
+    expect(r.code).toBe(0);
+
+    const after = f.readChangelog();
+    const entries = extractUnreleasedEntries(after);
+    expect(entries.join("\n")).toContain("(#42)");
+    // The example block is untouched, and is still not a section.
+    expect(after).toContain("      ## Unreleased");
+  });
+
+  it("an indented `## ` does not TRUNCATE the staging section either", () => {
+    // The mirror of the test above, for the scan that finds where `## Unreleased`
+    // ENDS. Both ends of the section have to use the same column-0 definition of
+    // a heading as the guard's `extractUnreleasedEntries`, and until this test
+    // only the start was pinned: loosen the end scan to `/^\s*##\s/` and the
+    // section is cut short at the pasted, three-space-indented release heading.
+    // A bullet appended to the last category then lands at that truncated end —
+    // i.e. INSIDE the fenced block, where the guard masks it and counts zero new
+    // entries. The PR reds for "no changelog entry" while its entry sits in the
+    // file: the same silent disagreement between writer and checker that the
+    // START anchor exists to prevent.
+    //
+    // The category heading is load-bearing: it is the `catIdx !== -1` path,
+    // where the insertion point IS `end`, so a wrong `end` is a wrong write.
+    //
+    // Mutation-proven: `gen-changelog-entry.mjs`'s `if (/^##\s/.test(lines[i]))`
+    // end scan → `/^\s*##\s/` and this run fails on the `(#42)` assertion.
+    const INDENTED_TAIL = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "### Bug fixes",
+      "",
+      "- **Earlier entry (#0):** shows the release-heading style:",
+      "",
+      "```console",
+      "   ## v9.9.9 — a pasted release heading, indented by three",
+      "```",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("gen-indented-tail-", INDENTED_TAIL);
+    f.writeFile("src/feature.ts", "export const x = 1;\n");
+    f.commit("fix(cli): correct a verb");
+
+    const r = f.gen(["--pr", "42"]);
+    expect(r.code).toBe(0);
+
+    const after = f.readChangelog();
+    // The GUARD must see the generated entry: that agreement is the property.
+    expect(extractUnreleasedEntries(after).join("\n")).toContain("(#42)");
+    // The pasted block is left intact — it is example text, not a section break.
+    expect(after).toContain("   ## v9.9.9 — a pasted release heading, indented by three");
   });
 });
 
@@ -298,6 +401,23 @@ describe("gen-changelog-entry — no-ops that must never write", () => {
     expect(r.code).toBe(0);
     expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("merge_group");
+  });
+
+  it("skips cleanly when no base ref resolves", () => {
+    // `resolveRange` is shared with check-changelog-entry.mjs and reports
+    // failure as an `{error}` OBJECT, not null — a truthiness test here would
+    // sail past the guard and then diff against `undefined..HEAD`, so pin the
+    // skip. Rename `main` away so no candidate in the cascade resolves.
+    const f = makeFixture("gen-nobase-");
+    f.writeFile("src/feature.ts", "export const x = 1;\n");
+    f.commit("feat(cli): add a verb");
+    f.git(["branch", "-m", "main", "detached-away"]);
+
+    const before = f.readChangelog();
+    const r = f.gen(["--pr", "11"]);
+    expect(r.code).toBe(0);
+    expect(f.readChangelog()).toBe(before);
+    expect(r.out).toContain("no base ref to diff against");
   });
 
   it("--dry-run prints the entry but writes nothing", () => {

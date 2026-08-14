@@ -39,6 +39,16 @@ lint:
   - 'telegram-plugin/package.json'
   - 'telegram-plugin/bun.lock'
   - 'scripts/check-*.mjs'
+  # The rest of the changelog tooling. `scripts/check-*.mjs` covers the CHECKER
+  # and nothing else, so the WRITER (gen-changelog-entry.mjs) and the guard's
+  # differential harness (changelog-mask-differential.mjs) matched NO glob
+  # anywhere in this file: a PR editing only one of them skipped ci-lint
+  # entirely — including check-no-pii-secrets.mjs, which scans `git ls-files`
+  # and therefore covers those scripts' own contents. Written as one glob over
+  # the family rather than a third one-off name, so the next changelog script
+  # is covered the day it lands. Same skip→pass hole the install.sh and
+  # dependencies.json blocks below close.
+  - 'scripts/*changelog*.mjs'
   - 'scripts/check-bot-api-wrapping.sh'
   # Guard allowlists (check-status-pin-single-path, test-runner-coverage, the
   # hermeticity checks). An allowlist edit is a deliberate loosening of a
@@ -123,6 +133,10 @@ core:
   # above — `scripts/check-*.mjs` is in the `lint` filter only, so without
   # this a PR editing just this script would skip the tests covering it.
   - 'scripts/check-changelog-entry.mjs'
+  # …and its sibling writer, for the same reason: tests/gen-changelog-entry.test.ts
+  # SPAWNS gen-changelog-entry.mjs, and that script matched no glob in this file
+  # at all, so a PR editing only it skipped the tests that cover it.
+  - 'scripts/gen-changelog-entry.mjs'
   # tests/check-no-pii-telegram-id.test.ts SPAWNS check-no-pii-secrets.mjs over
   # throwaway git repos and asserts its exit codes + failure text, including the
   # fail-closed paths. Same reason again — `scripts/check-*.mjs` is `lint`-only,
