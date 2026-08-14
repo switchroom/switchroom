@@ -17,7 +17,28 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
-- **voice: unit-suffix regex lookbehind + case-sensitivity hotfix**
+- **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
+  number+unit-suffix regex shared by both TTS normalization passes
+  (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)
+  had three live defects on every outbound voice message. (1) No lookbehind
+  on the digit group: `\b` re-anchored between a decimal point/thousands
+  comma and the following digits, so `0.17s` → `"0.seventeen seconds"` and
+  `1,500s` → `"1,five hundred seconds"`, splitting the number apart. (2) The
+  whole unit alternation ran case-insensitively, so a bare capital letter —
+  money shorthand (`5M`), a memory size (`4G`/`12G`/`97G`), a product name
+  (`4080S`) — matched a single-letter unit it was never meant to and got
+  read as a wrong duration/distance/mass. Fixed by adding a
+  `(?<![\d.,])` lookbehind and splitting the unit alternation so
+  multi-letter units (`ms`, `GB`, …) stay case-insensitive while
+  single-letter units (`s`, `m`, `h`, `d`, `g`) are matched
+  case-sensitively, lowercase-only, in a second pass. **Known, deliberate
+  trade-off (disclosed, not fixed here):** a decimal- or comma-glued
+  number+unit token (`27.5s`, `89.5g`, `1,500s`) is now left completely
+  unexpanded — the unit goes unspoken — rather than mangled; corpus-measured,
+  samples carrying an unspoken digit-adjacent unit go 65 → 121 (60 samples
+  change, every one trading a wrong reading for a silently-skipped one).
+  Correctly expanding a decimal/comma-glued number is out of scope for this
+  narrow hotfix and is left for a follow-up.
 
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 
