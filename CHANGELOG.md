@@ -15,6 +15,10 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **voice: unit-suffix regex lookbehind + case-sensitivity hotfix**
+
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 
 ### Fixed
