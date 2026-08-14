@@ -59,14 +59,25 @@ sudo npm install -g bun @anthropic-ai/claude-code switchroom
 - **Bun is a hard runtime dep.** The `switchroom` CLI entrypoint is a
   Bun script. A Node-only CLI build is on the roadmap, not yet shipped,
   so install Bun even on the manual path.
-- **Static binary (planned, not yet shipped).** Pre-built single-binary
-  releases (no Node or Bun on the host) are scaffolded in
-  [`install.sh`](../install.sh) and referenced from the GitHub Releases
-  page, but the release workflow that publishes those binaries still
-  does not exist as of v0.12.0. Use the one-script or npm paths above.
-  Tracking work: switching the release pipeline to actually upload
-  `switchroom-linux-{amd64,arm64}` and `switchroom-macos-{amd64,arm64}`
-  on every tag.
+- **Static binary (recommended for a fresh host).** Pre-built single-binary
+  releases (no Node or Bun on the host) are the primary install path as of
+  v0.7+: the release workflow (`.github/workflows/release.yml`) builds and
+  uploads `switchroom-linux-{amd64,arm64}` and `switchroom-macos-{amd64,arm64}`
+  on every tag, and [`install.sh`](../install.sh) auto-detects platform/arch,
+  downloads the matching binary from the latest GitHub release, verifies its
+  SHA256, and installs it (falling back to `~/.local/bin` if
+  `/usr/local/bin` isn't writable):
+
+  ```sh
+  curl -fsSL https://github.com/switchroom/switchroom/raw/main/install.sh | sh
+  ```
+
+  This skips the Node/Bun dependency entirely — the binary bundles its own
+  Bun runtime. You still need the `claude` CLI installed separately (for the
+  OAuth login against your Pro/Max subscription); it isn't bundled. The
+  one-script (`install-deps.sh`) and npm paths above remain valid — use them
+  if you're developing against a source checkout, or already have Node/Bun
+  on the host.
 
 ## Step 2 — Create your bots in BotFather
 
