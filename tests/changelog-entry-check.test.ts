@@ -52,6 +52,16 @@ interface Fixture {
    * release renaming `## Unreleased`).
    */
   advanceMain: (files: Record<string, string>, message: string) => string;
+  /**
+   * Run git inside the fixture under its HERMETIC env (pinned identity, no
+   * ambient `~/.gitconfig`). Throws on non-zero. Every git call a test makes
+   * MUST go through this or `gitTry`: a bare `execFileSync("git", ...)`
+   * inherits the ambient environment, and a CI runner has no `user.name` /
+   * `user.email`, so any commit-creating command there dies with exit 128.
+   */
+  git: (args: string[]) => string;
+  /** As `git`, but non-throwing — returns the exit status and both streams. */
+  gitTry: (args: string[]) => { status: number; stdout: string; stderr: string };
   /** Run the real guard over `main...HEAD`; returns exit code + output. */
   check: (env?: Record<string, string>) => { code: number; out: string };
 }
@@ -80,6 +90,15 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
   const git = (args: string[]) =>
     execFileSync("git", args, { cwd: dir, encoding: "utf-8", env: env as NodeJS.ProcessEnv });
 
+  const gitTry = (args: string[]) => {
+    const r = spawnSync("git", args, {
+      cwd: dir,
+      encoding: "utf-8",
+      env: env as NodeJS.ProcessEnv,
+    });
+    return { status: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+
   const writeFile = (rel: string, body: string) => {
     const abs = join(dir, rel);
     mkdirSync(dirname(abs), { recursive: true });
@@ -98,6 +117,8 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
   return {
     dir,
     writeFile,
+    git,
+    gitTry,
     commit(message) {
       git(["add", "-A"]);
       git(["commit", "-q", "-m", message]);
@@ -390,7 +411,6 @@ describe("check-changelog-entry — an entry that lands in an already-released s
    */
   function trapFixture(prefix: string): Fixture {
     const f = makeFixture(prefix, FORK);
-    const git = (args: string[]) => execFileSync("git", args, { cwd: f.dir, encoding: "utf-8" });
 
     // The branch ships code and stages its entry under `## Unreleased`.
     f.writeFile("src/feature.ts", "export const feature = 9;\n");
@@ -401,14 +421,13 @@ describe("check-changelog-entry — an entry that lands in an already-released s
     f.advanceMain({ "CHANGELOG.md": AFTER_RELEASE }, "chore: release v0.21.0");
 
     // The merge that silently corrupts. It MUST be clean — that is the defect.
-    const merge = spawnSync("git", ["merge", "--no-edit", "main"], {
-      cwd: f.dir,
-      encoding: "utf-8",
-    });
+    // Runs under the fixture's pinned identity: this call CREATES a merge
+    // commit, so on an identity-less CI runner a bare git here exits 128.
+    const merge = f.gitTry(["merge", "--no-edit", "main"]);
     expect(merge.status, `the trap requires a CLEAN merge; got:\n${merge.stderr}`).toBe(0);
 
     // And the entry MUST now sit under the released heading, not Unreleased.
-    const merged = git(["show", "HEAD:CHANGELOG.md"]).split("\n");
+    const merged = f.git(["show", "HEAD:CHANGELOG.md"]).split("\n");
     const entryLine = merged.findIndex((l) => l.includes("Branch entry (#2)"));
     const releasedLine = merged.findIndex((l) => l.startsWith("## v0.21.0"));
     expect(entryLine, "fixture no longer reproduces: entry missing").toBeGreaterThan(-1);
@@ -480,7 +499,7 @@ describe("check-changelog-entry — non-vacuity", () => {
     // and used to print a cheerful OK — which cost real reviewer time on
     // exactly the corruption above. It must say it checked nothing.
     const f = makeFixture("changelog-empty-range-");
-    execFileSync("git", ["checkout", "-q", "main"], { cwd: f.dir, encoding: "utf-8" });
+    f.git(["checkout", "-q", "main"]);
     f.writeFile("src/uncommitted.ts", "export const x = 1;\n"); // dirty worktree
 
     const r = f.check({ CHANGELOG_BASE: "main" });
@@ -495,10 +514,7 @@ describe("check-changelog-entry — non-vacuity", () => {
     const f = makeFixture("changelog-mg-badbase-");
     f.writeFile("src/feature.ts", "export const feature = 2;\n");
     f.commit("feat: ship on a queue ref");
-    execFileSync("git", ["branch", "-m", "main", "detached-away"], {
-      cwd: f.dir,
-      encoding: "utf-8",
-    });
+    f.git(["branch", "-m", "main", "detached-away"]);
 
     const r = f.check({
       GITHUB_EVENT_NAME: "merge_group",
@@ -539,10 +555,7 @@ describe("check-changelog-entry — skips that must never gate", () => {
     f.commit("feat: ship without changelog, no base");
     // Rename the local `main` away so NONE of the guard's fallback candidates
     // (origin/main, main) resolve — the shallow-clone / detached-checkout shape.
-    execFileSync("git", ["branch", "-m", "main", "detached-away"], {
-      cwd: f.dir,
-      encoding: "utf-8",
-    });
+    f.git(["branch", "-m", "main", "detached-away"]);
 
     const r = f.check({ CHANGELOG_BASE: "does-not-exist-ref" });
     expect(r.code).toBe(0);
