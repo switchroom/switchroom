@@ -885,12 +885,14 @@ class Handler(BaseHTTPRequestHandler):
             # audio if anyone re-adds it unvalidated, so it is surfaced here
             # (degraded, not unhealthy — the rest of the table still works).
             if overrides_rejected or _norm_error:
-                body["degraded"] = {
-                    "overridesRejected": [
+                degraded: dict = {}
+                if overrides_rejected:
+                    degraded["overridesRejected"] = [
                         {"match": m, "reason": r} for m, r in overrides_rejected
-                    ],
-                    "normalize": _norm_error,
-                }
+                    ]
+                if _norm_error:
+                    degraded["normalize"] = _norm_error
+                body["degraded"] = degraded
             self._send_json(200, body)
         else:
             self._send_json(
