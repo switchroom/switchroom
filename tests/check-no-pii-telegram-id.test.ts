@@ -13,6 +13,11 @@
  *     against the pre-fix `\b<digits>\b` matcher: in the marked form the
  *     character before the id is the `0` of `-100`, a word character, so `\b`
  *     never matched and a denylisted id sat in a tracked file with lint green.
+ *   - `rejects a scrubbed id spelled as a plain negative with -100 stripped`
+ *     and `rejects a scrubbed id in its bare, unprefixed spelling` both FAIL
+ *     when `KNOWN_REAL_ID_BODIES` omits those two ids: neither spelling is
+ *     visible to the structural `-100(\d{8,13})` rule, so with the literal
+ *     entries removed the guard reports `clean` and exits 0.
  *   - the fail-closed cases assert exit 1 on *degradation*, which is the
  *     failure mode a `catch { continue }` would hide.
  *
@@ -36,6 +41,18 @@ const UNAUDITED_BODY = "48151" + "62342";
 /** An id the literal RULES table already names, used to pin the `-100`
  *  prefix hole. */
 const DENYLISTED_BODY = "38527" + "47971";
+/**
+ * A real id scrubbed by #4712, which historically appeared in
+ * `tests/scaffold.reconcile-group.test.ts` as a plain negative with the `-100`
+ * prefix STRIPPED (`-<body>`). The structural `-100(\d{8,13})` rule cannot see
+ * that spelling at all, so only a literal `KNOWN_REAL_ID_BODIES` entry catches
+ * it. Without one, rebasing a pre-scrub branch restores the real id with lint
+ * green — the exact recurrence the scrub exists to prevent.
+ */
+const UNMARKED_BODY = "51642" + "17975";
+/** The other id scrubbed by #4712, exercised in its BARE spelling — likewise
+ *  invisible to the structural rule. */
+const BARE_ONLY_BODY = "42234" + "64247";
 
 const scratchRoots: string[] = [];
 
@@ -112,6 +129,29 @@ describe("check-no-pii-secrets — Telegram supergroup id rule", () => {
     expect(r.out).toContain("real Telegram id (group)");
   });
 
+  it("rejects a scrubbed id spelled as a plain negative with -100 stripped", () => {
+    // The spelling the structural `-100(\d{8,13})` rule is blind to. This is
+    // how the id actually sat in the tree before it was scrubbed, so it is
+    // also what a rebase of a pre-scrub branch would restore.
+    const f = makeFixture("pii-id-unmarked-");
+    f.writeFile(
+      "tests/scaffold.fixture.ts",
+      `const groups = { "-${UNMARKED_BODY}": { requireMention: false } };\n`,
+    );
+    const r = f.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("real Telegram id (fleet forum)");
+    expect(r.out).toContain("tests/scaffold.fixture.ts:1");
+  });
+
+  it("rejects a scrubbed id in its bare, unprefixed spelling", () => {
+    const f = makeFixture("pii-id-bare-scrubbed-");
+    f.writeFile("docs/note.md", `the pin key was ${BARE_ONLY_BODY}:_#1078\n`);
+    const r = f.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("real Telegram id (supergroup)");
+  });
+
   it("rejects an unsanctioned id spelled as a t.me/c/ deep link", () => {
     const f = makeFixture("pii-id-tme-");
     f.writeFile("docs/note.md", `see https://t.me/c/${UNAUDITED_BODY}/1078\n`);
@@ -177,6 +217,37 @@ describe("check-no-pii-secrets — Telegram supergroup id rule", () => {
     const r = f.run();
     expect(r.code).toBe(1);
     expect(r.out).toContain("too broad");
+  });
+
+  it("fails closed on a widening that evades a two-body sample", () => {
+    // The self-check used to sample two known-real bodies. `^8\d{9}$` matches
+    // neither of those two, so it would have passed the sampled check — while
+    // admitting two OTHER known-real ids. Testing every body closes that.
+    const f = makeFixture("pii-id-sample-evade-");
+    const src = execFileSync("cat", [CHECK_ABS], { encoding: "utf-8" });
+    const widened = src.replace(/re: \/\^9900112233\$\//, "re: /^8\\d{9}$/");
+    expect(widened).not.toBe(src); // the mutation actually applied
+    f.writeFile(CHECK_REL, widened);
+    f.writeFile("src/fixture.ts", "export const OK = 1\n");
+    const r = f.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("too broad");
+    expect(r.out).toContain('known-real "user"');
+  });
+
+  it("scans its own source — a contiguous id in the guard is caught", () => {
+    // The guard used to skip its own path. That made it the one tracked file
+    // where a contiguous real id could sit unflagged, and one did.
+    const f = makeFixture("pii-id-self-", { withGuard: false });
+    const src = execFileSync("cat", [CHECK_ABS], { encoding: "utf-8" });
+    // Planted AFTER line 1: a shebang is only valid as the first line.
+    const lines = src.split("\n");
+    lines.splice(1, 0, `// planted in a comment: -100${BARE_ONLY_BODY}`);
+    f.writeFile(CHECK_REL, lines.join("\n"));
+    const r = f.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain(CHECK_REL);
+    expect(r.out).toContain("real Telegram id (supergroup)");
   });
 
   it("fails closed when git is unavailable", () => {

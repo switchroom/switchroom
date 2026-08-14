@@ -35,9 +35,15 @@ import { fileURLToPath } from 'node:url'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const repoRoot = resolve(__dirname, '..')
 
-// This script's own repo-relative path — never scan it (it documents
-// the fragments it forbids).
-const SELF = 'scripts/check-no-pii-secrets.mjs'
+// This script USED to exempt itself from the scan, on the theory that it
+// documents the fragments it forbids. It does not need the exemption — every
+// pattern here is assembled from fragments at runtime, so none of them match
+// this file's own source — and the exemption was actively harmful: it made
+// this the one tracked file where a contiguous real identifier could sit
+// unflagged, and a comment in this very file did exactly that during review of
+// #4712. Scanning ourselves turns the header docblock's "never contains a
+// contiguous PII literal" claim from a convention into an enforced invariant.
+// Keep writing patterns as fragments; that is what keeps this file clean.
 
 // NUL sentinel for the binary sniff, built without embedding a control
 // byte in this source file.
@@ -68,6 +74,43 @@ function realTelegramId(digits) {
   return new RegExp('(?<!\\d)(?:-?100)?' + digits + '(?!\\d)')
 }
 
+/**
+ * Every known-real Telegram id body, in one place. Two consumers, and BOTH
+ * are load-bearing:
+ *
+ *   1. `RULES` below gets one `realTelegramId(...)` entry per body, so each id
+ *      is caught in every spelling it occurs in — bare (`<body>`), plain
+ *      negative with the `-100` stripped (`-<body>`), and the Bot API marked
+ *      form (`-100<body>`).
+ *   2. `assertRuleIsLive()` tests every body against every sanctioned shape,
+ *      so a widening that would admit ANY known-real id fails the self-check,
+ *      not just one that happens to collide with the two bodies it used to
+ *      sample. (Sampling two was exploitable: a shape of `/^8\d{9}$/` matched
+ *      neither sample, passed the self-check, and would have admitted BOTH the
+ *      `user` and `alt` ids.)
+ *
+ * The literal entries are NOT redundant with the structural
+ * `TELEGRAM_MARKED_ID` rule below. That rule only ever sees the MARKED
+ * spelling; a real id written with the `-100` prefix stripped does not match
+ * it at all, and that is not hypothetical — the plain-negative `-<body>` form
+ * is exactly how the "fleet forum" id sat in
+ * `tests/scaffold.reconcile-group.test.ts` before #4712 scrubbed it. (Written
+ * as a placeholder here on purpose: this file must never carry a contiguous
+ * real id, even though it exempts itself from its own scan.) Without a literal
+ * entry, anyone rebasing a branch cut before
+ * the scrub — or restoring that fixture from a stale checkout — puts the real
+ * id back into a public repo with lint green.
+ *
+ * Add a body here whenever an id is scrubbed. Never remove one.
+ */
+const KNOWN_REAL_ID_BODIES = [
+  { label: 'user', digits: '82487' + '03757' },
+  { label: 'alt', digits: '82881' + '44562' },
+  { label: 'group', digits: '38527' + '47971' },
+  { label: 'supergroup', digits: '42234' + '64247' },
+  { label: 'fleet forum', digits: '51642' + '17975' },
+]
+
 // Patterns assembled from fragments. `id` is for the message; `re` is
 // the matcher; `allowIn` (optional) is a Set of repo-relative paths
 // where this specific pattern is sanctioned.
@@ -93,9 +136,10 @@ const RULES = [
   },
   { id: 'operator home path', re: new RegExp('/home/' + 'kenthompson') },
   { id: 'real Tailscale tailnet id', re: new RegExp('tail' + 'd78f7', 'i') },
-  { id: 'real Telegram id (user)', re: realTelegramId('82487' + '03757') },
-  { id: 'real Telegram id (alt)', re: realTelegramId('82881' + '44562') },
-  { id: 'real Telegram id (group)', re: realTelegramId('38527' + '47971') },
+  ...KNOWN_REAL_ID_BODIES.map(({ label, digits }) => ({
+    id: `real Telegram id (${label})`,
+    re: realTelegramId(digits),
+  })),
   // Live Coolify service id for the LiteLLM proxy, scrubbed in #3527. It
   // identifies a real deployment (and the exact host path of the
   // operator-maintained proxy config). Docs use the `<litellm-service-id>`
@@ -207,13 +251,28 @@ function assertRuleIsLive() {
   if (!Array.isArray(SANCTIONED_ID_SHAPES) || SANCTIONED_ID_SHAPES.length === 0) {
     throw new Error('SANCTIONED_ID_SHAPES is empty — no example id could ever pass')
   }
+  if (!Array.isArray(KNOWN_REAL_ID_BODIES) || KNOWN_REAL_ID_BODIES.length === 0) {
+    throw new Error('KNOWN_REAL_ID_BODIES is empty — the literal id denylist would be gone')
+  }
+  for (const b of KNOWN_REAL_ID_BODIES) {
+    if (!/^\d{8,13}$/.test(b.digits ?? '')) {
+      throw new Error(`KNOWN_REAL_ID_BODIES entry is not an id body: ${JSON.stringify(b)}`)
+    }
+  }
   for (const s of SANCTIONED_ID_SHAPES) {
     if (!(s.re instanceof RegExp) || typeof s.why !== 'string' || s.why.trim() === '') {
       throw new Error(`SANCTIONED_ID_SHAPES entry missing a regex or a justification: ${JSON.stringify(s)}`)
     }
-    // A shape that admits an arbitrary body is a vacuous allowlist.
-    if (s.re.test('4223' + '464247') || s.re.test('3852' + '747971')) {
-      throw new Error(`SANCTIONED_ID_SHAPES entry ${s.re} matches a real-shaped id — too broad`)
+    // A shape that admits any KNOWN-REAL body is a vacuous allowlist. Every
+    // body is tested, not a sample: a sample leaves a widening that misses the
+    // sampled ids but admits the others, which is the same fail-open in a
+    // smaller costume.
+    for (const { label, digits } of KNOWN_REAL_ID_BODIES) {
+      if (s.re.test(digits)) {
+        throw new Error(
+          `SANCTIONED_ID_SHAPES entry ${s.re} matches the known-real "${label}" id — too broad`,
+        )
+      }
     }
   }
 }
@@ -260,7 +319,6 @@ try {
 
   const unreadable = []
   for (const relPath of tracked) {
-    if (relPath === SELF) continue
     if (BINARY_EXT.test(relPath)) continue
     let src
     try {

@@ -30,6 +30,16 @@ now an anomaly worth investigating, not the norm.
   allowlist, `git` missing — exits non-zero rather than reporting clean.
   If a new example id is needed, use `-1001234567890` or `-100<one digit
   repeated ten times>`.
+  The structural rule only ever sees the *marked* `-100…` spelling, so every
+  known-real id also keeps a literal entry: one `KNOWN_REAL_ID_BODIES` list now
+  feeds both the denylist and the allowlist self-check. That matters for
+  restores — an id written with the `-100` stripped is invisible to the shape
+  rule, so without a literal entry, rebasing a branch cut before a scrub would
+  quietly put the real id back with lint green.
+  The guard also no longer exempts its own source from the scan. Its patterns
+  are assembled from fragments and never match themselves, but the exemption
+  made it the one tracked file where a contiguous real identifier could sit
+  unflagged.
 
 ### Bug fixes
 
