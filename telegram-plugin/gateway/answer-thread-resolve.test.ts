@@ -120,7 +120,7 @@ describe('resolveAnswerThreadId — legacy (frameworkTopicAuthority:false)', () 
 // failed FIRST API call rather than a lost message. Each case below asserts the
 // RESOLVED THREAD, not that a branch ran.
 const CHAT_A = '12345678' // a DM — the reply target
-const CHAT_B = '-1003831053471' // a forum supergroup — where the anchor lives
+const CHAT_B = '-1001234567890' // a forum supergroup — where the anchor lives
 
 describe('resolveAnswerThreadId — cross-chat anchor guard', () => {
   it("THE bug: a live turn in supergroup B must not lend its topic to a reply into chat A", () => {

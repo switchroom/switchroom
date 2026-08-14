@@ -13,7 +13,7 @@ import type { AgentConfig, TelegramConfig } from "../src/config/schema.js";
  * group_unknown). Must be strictly additive + non-destructive.
  */
 
-const SG = "-1003831053471";
+const SG = "-1001234567890";
 const FLEET_FORUM = "-1003852747971"; // a DIFFERENT chat — the shared fleet forum
 const agent = (overrides: Partial<AgentConfig> = {}): AgentConfig =>
   ({ extends: "default", ...overrides } as unknown as AgentConfig);

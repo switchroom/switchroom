@@ -404,7 +404,7 @@ describe('unified reconcile path — pin-rights 400 must never crash (marko 2026
     // rejection to the process.
     const next = await reconcilePin({
       api,
-      chatId: '-1003831053471',
+      chatId: '-1001234567890',
       prevState: null,
       desired: { pinned: true, messageId: 4 },
       onError: (phase, err) =>
@@ -437,7 +437,7 @@ describe('unified reconcile path — pin-rights 400 must never crash (marko 2026
       // Fire-and-forget, exactly as the gateway's auto-pin callsites do.
       void reconcilePin({
         api,
-        chatId: '-1003831053471',
+        chatId: '-1001234567890',
         prevState: null,
         desired: { pinned: true, messageId: 4 },
         onError: () => {},

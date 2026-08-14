@@ -84,7 +84,7 @@ agents:
   marko:
     channels:
       telegram:
-        chat_id: "-1003831053471"   # that's it — answers everywhere, DMs still work
+        chat_id: "-1001234567890"   # that's it — answers everywhere, DMs still work
 ```
 
 ### Phase 2 (follow-up PRs)

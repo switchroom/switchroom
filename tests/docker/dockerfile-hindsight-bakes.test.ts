@@ -2185,6 +2185,91 @@ describe("Dockerfile.hindsight shape", () => {
     );
   });
 
+  it("keeps the periodic graph-maintenance sweep (assert-guarded, fail-loud)", () => {
+    // #4624 (above) made the sweep FINISH; nothing made it RUN. Upstream's
+    // graph maintenance is enqueue-driven only — submit_async_graph_maintenance
+    // short-circuits with no_work=True on an empty graph_maintenance_queue, and
+    // every caller is a unit-removal path — so a bank that stops removing units
+    // stops being maintained for ever, while Pass 2/Pass 3 (both BANK-WIDE, both
+    // needing no queue rows) leak everything they would have reclaimed.
+    // Measured 2026-08-13: bank `klanker`, zero attempts in five days, queue
+    // count 0, actively retaining and consolidating throughout.
+    //
+    // Behaviour (RED against unpatched upstream / GREEN patched) is proven in
+    // tests/docker/hindsight-graph-maintenance-interval-sweep.test.ts. This pins
+    // only the shape a grep can see.
+
+    // Order: this block asserts #4624's bounded sweep is in the image, so it
+    // must come after it. Assert the order rather than trusting it.
+    expect(
+      dockerfile.indexOf(
+        'TAG = "switchroom hindsight graph-maintenance bounded sweep patch"',
+      ),
+    ).toBeLessThan(
+      dockerfile.indexOf(
+        'TAG = "switchroom hindsight graph-maintenance interval sweep patch"',
+      ),
+    );
+
+    // Configurable on the HINDSIGHT_API_* convention, with an off switch (0).
+    expect(dockerfile).toContain(
+      "HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS",
+    );
+    expect(dockerfile).toContain(
+      "HINDSIGHT_API_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK",
+    );
+    expect(dockerfile).toContain(
+      "DEFAULT_GRAPH_MAINTENANCE_SWEEP_INTERVAL_SECONDS = 3600",
+    );
+    expect(dockerfile).toContain(
+      "DEFAULT_GRAPH_MAINTENANCE_SWEEP_MAX_BANKS_PER_TICK = 2",
+    );
+
+    // The sweep is FORCED through upstream's existing flag, not faked by
+    // inserting synthetic graph_maintenance_queue rows (which would also put
+    // Pass 1 to work relinking units that need nothing).
+    expect(dockerfile).toContain("force_sweep=True");
+    expect(dockerfile).not.toContain("INSERT INTO {graph_maintenance_queue}");
+
+    // Idempotency against a sweep already in flight. The maintenance loop runs
+    // in EVERY api/worker process with no leader election, so the discovery
+    // read alone is not enough — the locked dedupe_by_bank insert breaks the tie.
+    expect(dockerfile).toContain("'pending', 'processing'");
+    expect(dockerfile).toContain("dedupe_by_bank=True");
+
+    // No stampede: a bound per-tick cap, and a per-bank per-cycle phase jitter
+    // that also decorrelates the submitter from #4624's 120s slice clock.
+    expect(dockerfile).toContain("LIMIT $2");
+    expect(dockerfile).toContain(
+      "md5(b.bank_id || COALESCE(last.created_at::text, '')",
+    );
+
+    // A submit that RAISES must still record an attempt. Upstream writes the
+    // async_operations row only after `_authenticate_tenant` and
+    // `_validate_operation`, so a bank whose submit dies in either keeps a NULL
+    // last attempt — and the discovery orders NULLS FIRST, so two of them
+    // consume the whole per-tick cap on every tick and every other bank stops
+    // being swept: this job's own defect, reinstated.
+    expect(dockerfile).toContain("async def _record_failed_graph_sweep");
+    expect(dockerfile).toContain("_GRAPH_SWEEP_FAILED_ATTEMPT_SQL");
+    // Recorded as a terminal `failed` attempt in the ledger the due-ness clock
+    // already reads, so the retry is delayed by one interval rather than
+    // banished — and NOT as `pending`/`processing`, which the in-flight
+    // exclusion would read as a sweep in progress and wedge the bank for ever.
+    expect(dockerfile).toContain(
+      "VALUES ($1, 'graph_maintenance', 'failed', $2, NOW())",
+    );
+
+    // The block's TAG is what the behavioural probe test greps the block out
+    // by, so it must not drift.
+    expect(dockerfile).toContain(
+      'TAG = "switchroom hindsight graph-maintenance interval sweep patch"',
+    );
+    expect(dockerfile).toMatch(
+      /\{TAG\}: the maintenance loop now forces a bounded graph-maintenance sweep/,
+    );
+  });
+
   it("preserves upstream's start-all.sh as the post-shim CMD", () => {
     // The shim does broker auth, then `exec "$@"` which is whatever
     // CMD docker passes — must be upstream's start-all.sh so the

@@ -431,9 +431,9 @@ function seedTurn(turnKey: string, chatId = '12345', threadId: string | null = n
 describe('Bug 5 — parent_turn_key stamped from the turn-active marker', () => {
   it('stamps parent_turn_key = marker.turnKey when a turn is active', () => {
     // Supergroup forum-topic turn_key (chat:thread:startedAt).
-    const turnKey = '-1003831053471:4:1780370238492'
-    seedTurn(turnKey, '-1003831053471', '4')
-    writeTurnActiveMarker(turnKey, '-1003831053471', '4')
+    const turnKey = '-1001234567890:4:1780370238492'
+    seedTurn(turnKey, '-1001234567890', '4')
+    writeTurnActiveMarker(turnKey, '-1001234567890', '4')
 
     const event = {
       session_id: 'sess-turnkey',
