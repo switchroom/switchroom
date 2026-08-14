@@ -42,30 +42,28 @@ To pull updates later:
 
 ## For maintainers: cutting a release
 
-1. Update the version in both manifests so they stay in sync:
-   - `package.json`: `version`
-   - `.claude-plugin/plugin.json`: `version`
-2. Commit the bump:
-   ```bash
-   git add package.json .claude-plugin/plugin.json
-   git commit -m "chore: release vX.Y.Z"
-   ```
-3. Tag and push:
-   ```bash
-   git tag vX.Y.Z
-   git push origin main --tags
-   ```
-4. Users running `/plugin marketplace update switchroom` will see the new version on
-   their next refresh. There is no separate publish step. GitHub is the
-   distribution channel.
+Releases are **not** cut from this document, and they are **not** cut by
+hand-bumping manifests. Do NOT bump `version` in `package.json` or
+`.claude-plugin/plugin.json`, and do NOT `git tag && git push --tags` from a
+local `main` — the committed `package.json` version is a stale placeholder by
+design, the `vX.Y.Z` **git tag is the version source of truth**
+(`scripts/build.mjs:resolveVersion()`), and the tag push fires
+`.github/workflows/release.yml`, which orchestrates the binaries, images, the
+npm publish, and the GitHub Release. An earlier revision of this file
+described a manual manifest-bump-and-tag flow; following it cuts a broken
+release.
 
-### Versioning
+The authoritative, ordered runbook is the **`switchroom-release`** skill:
+[`skills/switchroom-release/SKILL.md`](../skills/switchroom-release/SKILL.md),
+summarised in [`CONTRIBUTING.md`](../CONTRIBUTING.md) § "Release to npm
+(canonical maintainers only)". In short: consolidate the changelog, merge the
+CHANGELOG-only `chore: release vX.Y.Z` PR, create the draft GitHub Release on
+a pinned SHA, push the tag at that same SHA, and let `release.yml` gate
+everything else.
 
-Use [semver](https://semver.org):
-
-- **patch** (`0.1.0 → 0.1.1`): skill copy tweaks, doc fixes
-- **minor** (`0.1.0 → 0.2.0`): new skills, new capabilities
-- **major** (`0.1.0 → 1.0.0`): skill renames or removals (breaking)
+Plugin users need nothing beyond that: `/plugin marketplace update switchroom`
+reads this repo, so the plugin ships from the same tagged history. There is no
+separate plugin publish step.
 
 ## For contributors: developing locally
 
