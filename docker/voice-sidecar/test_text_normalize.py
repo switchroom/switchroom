@@ -456,7 +456,13 @@ class PropertyTests(unittest.TestCase):
         " weird  pua  everywhere ",
         "the 90s, the 1990s, 90s timeout, '90s music",
         "voice_sidecar_dir / metadataCache / 08262924abc / 192.168.2.58:4010",
-    ]
+    ] + json.load(
+        # The shipped replay fixture: synthetic messages in the SHAPES the
+        # production corpus has (the corpus itself is real chat text and stays
+        # out of the repo — point tools/replay_corpus.py at a capture for the
+        # full run). Properties hold over both sets.
+        open(os.path.join(HERE, "replay-fixture.json"), encoding="utf-8")
+    )
 
     def test_idempotent(self) -> None:
         # Span-bearing samples are excluded: a verbatim span is consumed on

@@ -760,11 +760,16 @@ _UNIT_RE = re.compile(
 _UNIT1_RE = re.compile(
     r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)[ \t]?(" + "|".join(_UNITS_1) + r")(?![\w]|\.\d)"
 )
+# Scoped case-insensitivity, deliberately: the multi-letter units are
+# case-blind ("6.4 GB"), the single-letter ones are NOT — an upper-case `G` or
+# `D` is "5G network" and "3D printer", never grams and days.
 _RANGE_RE = re.compile(
-    r"(?<![\w.,$])(\d{1,9})-(?=\d{1,9}(?:\.\d+)?[ \t]?(?:"
-    + "|".join(sorted(_UNITS, key=len, reverse=True) + sorted(_UNITS_1))
-    + r")(?![\w]|\.\d))",
-    re.IGNORECASE,
+    r"(?<![\w.,$])(\d{1,9})-(?=\d{1,9}(?:\.\d+)?[ \t]?"
+    + r"(?:(?i:"
+    + "|".join(sorted(_UNITS, key=len, reverse=True))
+    + r")|"
+    + "|".join(sorted(_UNITS_1))
+    + r")(?![\w]|\.\d))"
 )
 _MIN_GLUED_RE = re.compile(r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)m(?![\w])")
 _METRE_SPACED_RE = re.compile(r"(?<![\w.,$])(\d{1,9}(?:\.\d+)?)[ \t]m(?![\w])")
