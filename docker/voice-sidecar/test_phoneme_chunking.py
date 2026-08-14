@@ -1,0 +1,361 @@
+"""Unit tests for phoneme-length chunking on the TTS path (#4695).
+
+The defect these pin: the sidecar chunked on CHARACTERS (VOICE_TTS_MAX_CHARS
+= 1200) but kokoro-onnx synthesizes in PHONEMES and hard-slices any single
+batch past MAX_PHONEME_LENGTH = 510:
+
+    kokoro_onnx/__init__.py:97-101 (0.5.0)
+        if len(phonemes) > MAX_PHONEME_LENGTH:
+            log.warning(...)
+        phonemes = phonemes[:MAX_PHONEME_LENGTH]
+
+Kokoro does pre-batch a long phoneme string (Kokoro._split_phonemes), but that
+splitter breaks ONLY on `.,!?;` — so a punctuation-free run over 510 phonemes
+still loses its tail, and the listener just hears the sentence stop.
+
+`_FaithfulKokoro` below is a line-by-line port of kokoro-onnx 0.5.0's
+`_split_phonemes` + the `_create_audio` slice, so it discards exactly what the
+real engine discards. The load-bearing assertion is `spoken()` — the phonemes
+that actually reached synthesis — versus the phonemes handed in. On the
+pre-fix server (one _tts.create per ~1200-char piece) that assertion FAILS with
+real phonemes missing; with phoneme chunking it passes with zero loss.
+
+These run WITHOUT numpy / misaki / onnxruntime installed, like the sibling
+suites: server.py imports numpy lazily and the G2P + encoder touchpoints are
+injected through module globals.
+
+Run: python3 -m unittest discover -s docker/voice-sidecar -p 'test_*.py'
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+import types
+import unittest
+
+import server
+
+# The real constant from kokoro_onnx.config, restated so this suite does not
+# need the wheel installed. Verified against kokoro-onnx 0.5.0.
+MAX_PHONEME_LENGTH = 510
+
+
+class _FaithfulKokoro:
+    """A Kokoro stand-in that truncates EXACTLY like kokoro-onnx 0.5.0.
+
+    Records, per create() call, the phoneme text that survived to synthesis so a
+    test can compare it against what was handed in."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.synthesized: list[str] = []
+        self.truncated_batches = 0
+
+    # verbatim port of Kokoro._split_phonemes (kokoro_onnx/__init__.py:136-168)
+    @staticmethod
+    def _split_phonemes(phonemes: str) -> list[str]:
+        words = re.split(r"([.,!?;])", phonemes)
+        batched: list[str] = []
+        current_batch = ""
+        for part in words:
+            part = part.strip()
+            if part:
+                if len(current_batch) + len(part) + 1 >= MAX_PHONEME_LENGTH:
+                    batched.append(current_batch.strip())
+                    current_batch = part
+                else:
+                    if part in ".,!?;":
+                        current_batch += part
+                    else:
+                        if current_batch:
+                            current_batch += " "
+                        current_batch += part
+        if current_batch:
+            batched.append(current_batch.strip())
+        return batched
+
+    def create(self, text, voice=None, speed=None, lang=None, is_phonemes=False):  # noqa: ANN001
+        self.calls.append(
+            {"text": text, "voice": voice, "speed": speed, "lang": lang,
+             "is_phonemes": is_phonemes}
+        )
+        # Only the phoneme path is modelled; a text piece would go through
+        # espeak first, which this fake does not have.
+        phonemes = text if is_phonemes else text
+        for batch in self._split_phonemes(phonemes):
+            if len(batch) > MAX_PHONEME_LENGTH:
+                self.truncated_batches += 1
+            self.synthesized.append(batch[:MAX_PHONEME_LENGTH])
+        return ([0.0], server.TTS_SAMPLE_RATE)
+
+    def spoken(self) -> str:
+        """Every phoneme that actually reached the model, whitespace-normalised
+        (chunk seams legitimately renormalise spaces; dropped phonemes do not)."""
+        return re.sub(r"\s+", "", "".join(self.synthesized))
+
+
+def _install_fake_numpy() -> types.ModuleType | None:
+    prev = sys.modules.get("numpy")
+    fake = types.ModuleType("numpy")
+    fake.float32 = "float32"
+    fake.zeros = lambda n, dtype=None: [0.0] * int(n)
+    fake.asarray = lambda x, dtype=None: list(x)
+    fake.concatenate = lambda chunks: [v for c in chunks for v in c]
+    sys.modules["numpy"] = fake
+    return prev
+
+
+def _norm(phonemes: str) -> str:
+    return re.sub(r"\s+", "", phonemes)
+
+
+class SplitPhonemesTests(unittest.TestCase):
+    """The pure splitter: bounded, lossless, punctuation-preferring."""
+
+    def test_empty(self) -> None:
+        self.assertEqual(server._split_phonemes("", 100), ([], 0))
+        self.assertEqual(server._split_phonemes("   ", 100), ([], 0))
+
+    def test_short_string_is_one_chunk(self) -> None:
+        chunks, cuts = server._split_phonemes("fˈOni:mz", 100)
+        self.assertEqual(chunks, ["fˈOni:mz"])
+        self.assertEqual(cuts, 0)
+
+    def test_every_chunk_within_cap(self) -> None:
+        text = " ".join(["fˈOni:m"] * 400)
+        chunks, _ = server._split_phonemes(text, 60)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c), 60, msg=repr(c))
+
+    def test_lossless_over_word_boundaries(self) -> None:
+        text = " ".join(f"w{i}" for i in range(500))
+        chunks, cuts = server._split_phonemes(text, 61)
+        self.assertEqual(cuts, 0)
+        self.assertEqual(_norm(" ".join(chunks)), _norm(text))
+
+    def test_lossless_over_clause_boundaries(self) -> None:
+        text = ", ".join(["abcdefghij"] * 200) + "."
+        chunks, cuts = server._split_phonemes(text, 97)
+        self.assertEqual(cuts, 0)
+        self.assertEqual(_norm("".join(chunks)), _norm(text))
+        for c in chunks:
+            self.assertLessEqual(len(c), 97)
+
+    def test_unbreakable_run_is_carried_not_dropped(self) -> None:
+        # No space, no clause break: the one case that must still be cut. The
+        # cut is COUNTED and the remainder is CARRIED, never discarded.
+        run = "x" * 1300
+        chunks, cuts = server._split_phonemes(run, 500)
+        self.assertGreater(cuts, 0)
+        self.assertEqual(_norm("".join(chunks)), run)
+        for c in chunks:
+            self.assertLessEqual(len(c), 500)
+
+    def test_prefers_clause_break_over_mid_word_cut(self) -> None:
+        text = "aaaaa,bbbbb,ccccc,ddddd"
+        chunks, cuts = server._split_phonemes(text, 12)
+        self.assertEqual(cuts, 0)
+        # Each seam lands after a comma, never inside a run of letters.
+        for c in chunks[:-1]:
+            self.assertTrue(c.endswith(","), msg=repr(c))
+
+    def test_cap_is_clamped_below_kokoros_limit(self) -> None:
+        self.assertLessEqual(server.TTS_MAX_PHONEMES, MAX_PHONEME_LENGTH)
+
+
+class NoPhonemeLossThroughSynthesisTests(unittest.TestCase):
+    """The outcome test. Runs real-shaped input end-to-end through
+    _run_synthesis against a Kokoro that truncates like the real one, and
+    asserts nothing was discarded. RED before the phoneme-chunking fix."""
+
+    def setUp(self) -> None:
+        self._orig_g2p = server._g2p
+        self._orig_warned = server._g2p_warned
+        self._orig_tts = server._tts
+        self._orig_pcm = server._pcm_to_wav_bytes
+        self._orig_ogg = server._wav_to_ogg_opus
+        self._prev_numpy = _install_fake_numpy()
+        server._pcm_to_wav_bytes = lambda samples, sample_rate: b"WAV"
+        server._wav_to_ogg_opus = lambda wav: b"OGG"
+        self.tts = _FaithfulKokoro()
+        server._tts = self.tts
+        server._g2p_warned = False
+
+    def tearDown(self) -> None:
+        server._g2p = self._orig_g2p
+        server._g2p_warned = self._orig_warned
+        server._tts = self._orig_tts
+        server._pcm_to_wav_bytes = self._orig_pcm
+        server._wav_to_ogg_opus = self._orig_ogg
+        if self._prev_numpy is None:
+            sys.modules.pop("numpy", None)
+        else:
+            sys.modules["numpy"] = self._prev_numpy
+
+    @staticmethod
+    def _identity_g2p(piece: str):
+        """G2P stub with a realistic ~1.15 phonemes-per-char expansion, so a
+        1200-char piece phonemises well past 510 exactly as misaki does on real
+        text (measured: 1.15-1.30 on the production corpus)."""
+        return ("".join(ch + ("ˈ" if ch.isalpha() and ch in "aeiou" else "")
+                        for ch in piece), ["tok"])
+
+    def test_long_unpunctuated_clause_loses_no_phonemes(self) -> None:
+        # A single clause with spaces but NO `.,!?;` for well over 510
+        # phonemes. Kokoro's own batcher cannot break it, so pre-fix the tail
+        # was sliced off and never spoken.
+        text = " ".join(["consequently"] * 120) + "."
+        server._g2p = self._identity_g2p
+        expected, _ = self._identity_g2p(text)
+
+        server._run_synthesis(text, voice="af_heart")
+
+        self.assertEqual(self.tts.truncated_batches, 0)
+        self.assertEqual(self.tts.spoken(), _norm(expected))
+
+    def test_long_comma_free_paragraph_loses_no_phonemes(self) -> None:
+        # Shaped like the real corpus messages that lost audio: long sentences
+        # whose individual clauses exceed 510 phonemes.
+        sentence = " ".join(["deliberation"] * 60)
+        text = ". ".join([sentence] * 4) + "."
+        server._g2p = self._identity_g2p
+        expected, _ = self._identity_g2p(text)
+
+        server._run_synthesis(text, voice="af_heart")
+
+        self.assertEqual(self.tts.truncated_batches, 0)
+        self.assertEqual(self.tts.spoken(), _norm(expected))
+
+    def test_every_batch_handed_to_kokoro_is_within_the_limit(self) -> None:
+        text = " ".join(["antidisestablishmentarianism"] * 200)
+        server._g2p = self._identity_g2p
+
+        server._run_synthesis(text, voice="af_heart")
+
+        self.assertTrue(self.tts.calls)
+        for call in self.tts.calls:
+            self.assertTrue(call["is_phonemes"])
+            self.assertLessEqual(len(call["text"]), MAX_PHONEME_LENGTH)
+
+    def test_meta_reports_batches_and_clean_run_has_no_degradation(self) -> None:
+        text = " ".join(["consequently"] * 120) + "."
+        server._g2p = self._identity_g2p
+
+        _ogg, meta = server._run_synthesis(text, voice="af_heart")
+
+        self.assertEqual(meta["hardCuts"], 0)
+        self.assertEqual(meta["unchunkedPieces"], 0)
+        self.assertGreater(meta["batches"], 1)
+
+
+class LossyPathIsLoudTests(unittest.TestCase):
+    """Requirement 2 of #4695: whatever remains lossy must not be silent."""
+
+    def setUp(self) -> None:
+        self._orig_g2p = server._g2p
+        self._orig_tts = server._tts
+        self._orig_pcm = server._pcm_to_wav_bytes
+        self._orig_ogg = server._wav_to_ogg_opus
+        self._orig_log = server._log
+        self._prev_numpy = _install_fake_numpy()
+        server._pcm_to_wav_bytes = lambda samples, sample_rate: b"WAV"
+        server._wav_to_ogg_opus = lambda wav: b"OGG"
+        server._tts = _FaithfulKokoro()
+        self.logged: list[str] = []
+        server._log = self.logged.append
+
+    def tearDown(self) -> None:
+        server._g2p = self._orig_g2p
+        server._tts = self._orig_tts
+        server._pcm_to_wav_bytes = self._orig_pcm
+        server._wav_to_ogg_opus = self._orig_ogg
+        server._log = self._orig_log
+        if self._prev_numpy is None:
+            sys.modules.pop("numpy", None)
+        else:
+            sys.modules["numpy"] = self._prev_numpy
+
+    def test_mid_word_cut_is_counted_and_warned(self) -> None:
+        # An unbreakable phoneme run: no space, no clause break, over the cap.
+        server._g2p = lambda piece: ("x" * 1400, ["tok"])
+
+        _ogg, meta = server._run_synthesis("anything", voice="af_heart")
+
+        self.assertGreater(meta["hardCuts"], 0)
+        self.assertTrue(
+            any("WARNING" in line and "mid-word" in line for line in self.logged),
+            msg=f"no loud log emitted; got {self.logged!r}",
+        )
+
+    def test_unphonemizable_piece_is_counted_and_warned(self) -> None:
+        # Neither misaki nor Kokoro's espeak tokenizer available: the piece goes
+        # to Kokoro as raw text and Kokoro may slice it. Must not be silent.
+        server._g2p = None  # _FaithfulKokoro has no .tokenizer either
+
+        _ogg, meta = server._run_synthesis("anything at all", voice="af_heart")
+
+        self.assertEqual(meta["unchunkedPieces"], 1)
+        self.assertTrue(
+            any("WARNING" in line and "DISCARDED" in line for line in self.logged),
+            msg=f"no loud log emitted; got {self.logged!r}",
+        )
+
+    def test_clean_synthesis_emits_no_warning(self) -> None:
+        server._g2p = lambda piece: ("fˈOni:mz", ["tok"])
+
+        _ogg, meta = server._run_synthesis("phonemes", voice="af_heart")
+
+        self.assertEqual(meta["hardCuts"], 0)
+        self.assertEqual(meta["unchunkedPieces"], 0)
+        self.assertFalse([line for line in self.logged if "WARNING" in line])
+
+
+class EspeakPhonemizeTests(unittest.TestCase):
+    """The espeak path is phonemized here so it can be phoneme-chunked too."""
+
+    def setUp(self) -> None:
+        self._orig_tts = server._tts
+        self._orig_warned = server._espeak_phonemize_warned
+        server._espeak_phonemize_warned = False
+
+    def tearDown(self) -> None:
+        server._tts = self._orig_tts
+        server._espeak_phonemize_warned = self._orig_warned
+
+    def test_returns_text_and_false_without_a_tokenizer(self) -> None:
+        server._tts = object()
+        self.assertEqual(server._espeak_phonemize("hi"), ("hi", False))
+
+    def test_uses_kokoros_tokenizer_with_the_configured_lang(self) -> None:
+        seen: list[tuple] = []
+
+        class _Tok:
+            @staticmethod
+            def phonemize(text, lang):  # noqa: ANN001
+                seen.append((text, lang))
+                return "hˈaI"
+
+        class _TTS:
+            tokenizer = _Tok()
+
+        server._tts = _TTS()
+        self.assertEqual(server._espeak_phonemize("hi"), ("hˈaI", True))
+        self.assertEqual(seen, [("hi", server.TTS_LANG)])
+
+    def test_raising_tokenizer_degrades_to_text(self) -> None:
+        class _Tok:
+            @staticmethod
+            def phonemize(text, lang):  # noqa: ANN001
+                raise RuntimeError("espeak exploded")
+
+        class _TTS:
+            tokenizer = _Tok()
+
+        server._tts = _TTS()
+        self.assertEqual(server._espeak_phonemize("hi"), ("hi", False))
+
+
+if __name__ == "__main__":
+    unittest.main()
