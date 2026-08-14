@@ -22,18 +22,16 @@ RAW=$(switchroom agent list --json 2>/dev/null) || {
   exit 1
 }
 
-if [ -z "$RAW" ] || [ "$RAW" = "[]" ]; then
+if [ -z "$RAW" ] || [ "$RAW" = '{"agents":[]}' ]; then
   echo "No agents configured."
   exit 0
 fi
 
-TOTAL=$(echo "$RAW" | python3 -c "import sys,json; agents=json.load(sys.stdin); print(len(agents))" 2>/dev/null || echo "?")
-RUNNING=0
-
 echo "$RAW" | python3 -c "
-import sys, json, datetime
+import sys, json
 
-agents = json.load(sys.stdin)
+payload = json.load(sys.stdin)
+agents = payload.get('agents', [])
 running = 0
 
 for a in agents:
@@ -41,11 +39,9 @@ for a in agents:
     status  = a.get('status', 'unknown')
     model   = a.get('model', 'unknown')
     topic   = a.get('topic_name', '')
-    coll    = a.get('memory', {}).get('collection', '')
     uptime  = a.get('uptime', '')
-    pid     = a.get('pid', '')
 
-    status_icon = '✓' if status == 'running' else '✗' if status in ('stopped','failed') else '?'
+    status_icon = '✓' if status == 'active' else '✗' if status in ('inactive', 'exited', 'dead') else '?'
 
     line = f'{status_icon} {name}'
     if topic:
@@ -54,16 +50,11 @@ for a in agents:
     if uptime:
         line += f' ({uptime})'
     print(line)
-    print(f'    model: {model}', end='')
-    if coll:
-        print(f'  collection: {coll}', end='')
-    if pid:
-        print(f'  pid: {pid}', end='')
-    print()
+    print(f'    model: {model}')
     print()
 
-    if status == 'running':
+    if status == 'active':
         running += 1
 
 print(f'{running} of {len(agents)} agents running.')
-" 2>/dev/null || echo "$RAW"
+"

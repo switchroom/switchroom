@@ -1,0 +1,1 @@
+- **skills: parse the real agent-list JSON shape in status.sh (#4719)**
