@@ -22,12 +22,19 @@ Run: python3 -m unittest discover -s docker/voice-sidecar -p 'test_*.py'
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 
 import server
 import text_normalize as tn
+
+# Captured at import: LoadOrderTests monkeypatches these module-level helpers
+# and must put the real ones back, not a previous test's stub.
+_REAL_FETCH_WEIGHT = server._fetch_weight
+_REAL_BUILD_SESSION = server._build_tts_session
 
 
 class _RecordingTTS:
@@ -187,6 +194,89 @@ class VocabGuardWiringTests(unittest.TestCase):
             self.assertGreaterEqual(len(server._tts_overrides), 1)
         finally:
             server._tts_overrides, server._tts_overrides_rejected = orig
+
+
+class LoadOrderTests(unittest.TestCase):
+    """Override loading must not be able to cost us the misaki G2P.
+
+    _load_tts' model-load try/except `return`s on failure. While overrides were
+    loaded INSIDE that block, any raise from them (load_overrides is written not
+    to raise, but _kokoro_vocab reads kokoro-onnx internals whose shape can move
+    under a version bump) skipped G2P init entirely — and because _tts was
+    already set, /healthz still said ready while every utterance for the
+    container's whole lifetime went out on the degraded espeak path.
+    """
+
+    def setUp(self) -> None:
+        self._orig = (server._tts, server._g2p, server._tts_error, server._load_overrides)
+        self._prev_mods = {
+            name: sys.modules.get(name)
+            for name in ("kokoro_onnx", "misaki", "misaki.en", "misaki.espeak")
+        }
+        self._tmp = tempfile.mkdtemp()
+        self._prev_cache = server.MODEL_CACHE
+        server.MODEL_CACHE = self._tmp
+        server._fetch_weight = lambda url, path, sha: None
+        server._build_tts_session = lambda path: object()
+
+        kokoro_mod = types.ModuleType("kokoro_onnx")
+        kokoro_mod.Kokoro = types.SimpleNamespace(
+            from_session=lambda session, voices: types.SimpleNamespace(tokenizer=None)
+        )
+        sys.modules["kokoro_onnx"] = kokoro_mod
+
+        misaki = types.ModuleType("misaki")
+        en_mod = types.ModuleType("misaki.en")
+        en_mod.G2P = lambda trf=False, british=False, fallback=None: "G2P-SENTINEL"
+        espeak_mod = types.ModuleType("misaki.espeak")
+        espeak_mod.EspeakFallback = lambda british=False: None
+        misaki.en = en_mod
+        misaki.espeak = espeak_mod
+        sys.modules["misaki"] = misaki
+        sys.modules["misaki.en"] = en_mod
+        sys.modules["misaki.espeak"] = espeak_mod
+
+    def tearDown(self) -> None:
+        (
+            server._tts,
+            server._g2p,
+            server._tts_error,
+            server._load_overrides,
+        ) = self._orig
+        server.MODEL_CACHE = self._prev_cache
+        server._fetch_weight = _REAL_FETCH_WEIGHT
+        server._build_tts_session = _REAL_BUILD_SESSION
+        for name, mod in self._prev_mods.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_g2p_still_initialises_when_override_loading_raises(self) -> None:
+        if server.TTS_G2P != "misaki" or server.TTS_LANG not in ("en-us", "en-gb"):
+            self.skipTest("misaki G2P disabled by env")
+        boom = []
+
+        def _raiser(kokoro):  # noqa: ANN001
+            boom.append(kokoro)
+            raise RuntimeError("kokoro-onnx moved the tokenizer")
+
+        server._load_overrides = _raiser
+        server._tts = None
+        server._g2p = None
+        server._tts_error = None
+
+        server._load_tts()
+
+        self.assertEqual(len(boom), 1, "override loading must still be attempted")
+        self.assertIsNone(server._tts_error, "an override fault is not a model fault")
+        self.assertIsNotNone(server._tts, "the model must still be served")
+        self.assertEqual(
+            server._g2p,
+            "G2P-SENTINEL",
+            "misaki G2P must survive an override-loading failure",
+        )
 
 
 if __name__ == "__main__":

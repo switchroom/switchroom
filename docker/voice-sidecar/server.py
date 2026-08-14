@@ -537,11 +537,25 @@ def _load_tts() -> None:
         with _tts_lock:
             _tts = kokoro
         _log("TTS model ready")
-        _load_overrides(kokoro)
     except Exception as exc:  # noqa: BLE001 — fail closed, report on /healthz
         _tts_error = f"{type(exc).__name__}: {exc}"
         _log(f"TTS model load FAILED: {_tts_error}")
         return
+
+    # Overrides get their OWN try/except, deliberately OUTSIDE the model load
+    # above: that block `return`s on failure, so an override-loading raise there
+    # would silently skip misaki G2P init below and leave the container serving
+    # DEGRADED audio for its whole lifetime while /healthz still reports ready.
+    # load_overrides() itself is written not to raise, but _kokoro_vocab() reads
+    # kokoro-onnx internals and a future version bump can change their shape.
+    # Overrides are an enhancement: losing them must never cost us the G2P.
+    try:
+        _load_overrides(kokoro)
+    except Exception as exc:  # noqa: BLE001 — enhancement; degrade gracefully
+        _log(
+            f"TTS override load FAILED ({type(exc).__name__}: {exc}); "
+            "continuing without pronunciation overrides"
+        )
 
     # Build the misaki English G2P in its OWN try/except: it is an ENHANCEMENT
     # (heteronym-correct phonemes), NOT a requirement. If anything here fails —
