@@ -171,8 +171,17 @@ TTS_MAX_CHARS = int(os.environ.get("VOICE_TTS_MAX_CHARS", "1200"))
 # MAX_PHONEME_LENGTH = 510 (kokoro_onnx/__init__.py:97-101, verified against the
 # 0.5.0 wheel installed in this image). Kokoro does re-batch a long phoneme
 # string first (Kokoro._split_phonemes), but that splitter breaks ONLY on
-# `.,!?;` — so any punctuation-free run over 510 phonemes is still sliced and
-# the tail of that clause is simply never spoken.
+# `.,!?;` — so any punctuation-free run over 510 phonemes still overflows.
+#
+# And the overflow does not merely truncate. Two lines after the slice,
+# `voice = voice[len(tokens)]` (kokoro_onnx/__init__.py:108) indexes a voices
+# array of exactly 510 rows, so a batch that slices to 510 IN-VOCAB phonemes
+# indexes one past the end and RAISES — the whole /tts request 500s and the
+# user gets no voice message at all:
+#     IndexError: index 510 is out of bounds for axis 0 with size 510
+# Reproduced against the real model on a real corpus message (1,545-phoneme
+# batch). All 16 over-510 batches in a 1,679-message production corpus land on
+# that raise, not on a partial read — 15 messages, 0.9%, failing outright.
 #
 # So we chunk on the thing that actually overflows: after G2P we split the
 # phoneme string ourselves to <= TTS_MAX_PHONEMES and hand Kokoro one
@@ -941,8 +950,9 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
 
     Accepts text of ANY length: it is split into pieces ≤ TTS_MAX_CHARS on
     sentence/paragraph boundaries, each piece's PHONEME string is then split to
-    ≤ TTS_MAX_PHONEMES (#4695 — Kokoro discards anything past 510 phonemes in a
-    single batch), each phoneme chunk synthesized on the GPU, and the raw 24kHz
+    ≤ TTS_MAX_PHONEMES (#4695 — a batch past 510 phonemes is truncated by Kokoro
+    or, more often, raises and fails the request), each phoneme chunk
+    synthesized on the GPU, and the raw 24kHz
     PCM concatenated into ONE stream (with a short inter-piece pad so joins
     sound natural and never click) before a SINGLE opus encode. The caller
     therefore always gets one valid, continuous Ogg/Opus file."""
@@ -1047,8 +1057,9 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
             _log(
                 f"WARNING: TTS could not phonemize {unchunked_pieces} of "
                 f"{len(pieces)} piece(s) for a {len(text)}-char request; those "
-                "went to Kokoro as text and ANY past 510 phonemes was DISCARDED "
-                "— speech may stop mid-sentence"
+                "went to Kokoro as TEXT, so a clause past 510 phonemes is "
+                "truncated or fails the whole request (IndexError at "
+                "kokoro_onnx/__init__.py:108)"
             )
         return ogg, meta
 

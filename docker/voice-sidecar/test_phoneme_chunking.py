@@ -11,14 +11,24 @@ batch past MAX_PHONEME_LENGTH = 510:
 
 Kokoro does pre-batch a long phoneme string (Kokoro._split_phonemes), but that
 splitter breaks ONLY on `.,!?;` — so a punctuation-free run over 510 phonemes
-still loses its tail, and the listener just hears the sentence stop.
+still overflows.
 
-`_FaithfulKokoro` below is a line-by-line port of kokoro-onnx 0.5.0's
-`_split_phonemes` + the `_create_audio` slice, so it discards exactly what the
-real engine discards. The load-bearing assertion is `spoken()` — the phonemes
-that actually reached synthesis — versus the phonemes handed in. On the
-pre-fix server (one _tts.create per ~1200-char piece) that assertion FAILS with
-real phonemes missing; with phoneme chunking it passes with zero loss.
+And the overflow is worse than that slice suggests. Two lines later:
+
+    kokoro_onnx/__init__.py:108
+        voice = voice[len(tokens)]        # voices array has exactly 510 rows
+
+A batch that slices to 510 in-vocab phonemes indexes one past the end and
+RAISES, failing the whole /tts request — the user gets no voice message at all,
+not a truncated one. Reproduced live against the real model, and all 16
+over-limit batches in a 1,679-message production corpus land there.
+
+`_FaithfulKokoro` below is a line-by-line port of 0.5.0's `_split_phonemes`
+plus both consequences, so it fails exactly where the real engine fails. The
+load-bearing assertions are `spoken()` — the phonemes that actually reached
+synthesis — and the absence of that IndexError. On the pre-fix server (one
+_tts.create per ~1200-char piece) they are RED; with phoneme chunking they pass
+with zero loss.
 
 These run WITHOUT numpy / misaki / onnxruntime installed, like the sibling
 suites: server.py imports numpy lazily and the G2P + encoder touchpoints are
@@ -80,13 +90,24 @@ class _FaithfulKokoro:
             {"text": text, "voice": voice, "speed": speed, "lang": lang,
              "is_phonemes": is_phonemes}
         )
-        # Only the phoneme path is modelled; a text piece would go through
-        # espeak first, which this fake does not have.
-        phonemes = text if is_phonemes else text
-        for batch in self._split_phonemes(phonemes):
+        for batch in self._split_phonemes(text):
             if len(batch) > MAX_PHONEME_LENGTH:
                 self.truncated_batches += 1
-            self.synthesized.append(batch[:MAX_PHONEME_LENGTH])
+            sliced = batch[:MAX_PHONEME_LENGTH]
+            # kokoro_onnx/__init__.py:108 — `voice = voice[len(tokens)]` on a
+            # voices array of exactly MAX_PHONEME_LENGTH rows. A batch that
+            # slices to 510 IN-VOCAB phonemes indexes one past the end and
+            # RAISES, taking the whole /tts request down with it. Reproduced
+            # live against kokoro-onnx 0.5.0 on a real corpus message:
+            #   IndexError: index 510 is out of bounds for axis 0 with size 510
+            # (All 16 over-510 batches in the 1,679-message corpus land here;
+            # this fake assumes in-vocab, which held for all 16.)
+            if len(sliced) >= MAX_PHONEME_LENGTH:
+                raise IndexError(
+                    f"index {MAX_PHONEME_LENGTH} is out of bounds for axis 0 "
+                    f"with size {MAX_PHONEME_LENGTH}"
+                )
+            self.synthesized.append(sliced)
         return ([0.0], server.TTS_SAMPLE_RATE)
 
     def spoken(self) -> str:
@@ -261,6 +282,12 @@ class NoPhonemeLossThroughSynthesisTests(unittest.TestCase):
         for call in self.tts.calls:
             self.assertTrue(call["is_phonemes"])
             self.assertLessEqual(len(call["text"]), MAX_PHONEME_LENGTH)
+
+    def test_oversized_batch_would_fail_the_whole_request(self) -> None:
+        # Guards the fake itself: if this stops raising, kokoro-onnx changed and
+        # every "loses no phonemes" assertion above is measuring the wrong thing.
+        with self.assertRaises(IndexError):
+            self.tts.create("x" * 600, voice="af_heart", is_phonemes=True)
 
     def test_meta_reports_batches_and_clean_run_has_no_degradation(self) -> None:
         text = " ".join(["consequently"] * 120) + "."

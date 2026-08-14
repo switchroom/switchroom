@@ -17,21 +17,28 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
-- **voice: TTS chunks on phoneme length, not characters — long messages no
-  longer lose audio** (#4695) — the sidecar split text into ≤
-  `VOICE_TTS_MAX_CHARS` (1200) pieces and handed each to kokoro-onnx, but
-  kokoro synthesizes in *phonemes* and hard-slices any single batch past its
-  `MAX_PHONEME_LENGTH` of 510 (`kokoro_onnx/__init__.py:97-101`, verified
-  against the 0.5.0 wheel in the running image). Kokoro does pre-batch a long
-  phoneme string, but only on `.,!?;` — so any punctuation-free run over 510
-  phonemes lost its tail and the listener simply heard the sentence stop.
+- **voice: TTS chunks on phoneme length, not characters — long messages stop
+  failing** (#4695) — the sidecar split text into ≤ `VOICE_TTS_MAX_CHARS`
+  (1200) pieces and handed each to kokoro-onnx, but kokoro synthesizes in
+  *phonemes* and cannot take more than `MAX_PHONEME_LENGTH` = 510 in one batch
+  (`kokoro_onnx/__init__.py:97-101`, verified against the 0.5.0 wheel in the
+  running image). Kokoro does pre-batch a long phoneme string, but only on
+  `.,!?;`, so any punctuation-free run over 510 phonemes overflowed. The
+  overflow is worse than the documented truncation: two lines after the slice,
+  `voice = voice[len(tokens)]` indexes a 510-row array with 510 and **raises**,
+  so the whole `/tts` request 500s and the user gets **no voice message at
+  all** — reproduced live against the real model
+  (`IndexError: index 510 is out of bounds for axis 0 with size 510`).
   Measured over a 1,679-message production corpus through real misaki:
-  **16 truncated batches, 5,823 phonemes discarded, worst batch 1,545**.
+  **16 over-limit batches — all 16 hitting the raise, not a partial read —
+  across 15 messages (0.9%)**, worst batch 1,545 phonemes. On the worst
+  message, before: request fails, 0s of audio; after: **159.3s of complete
+  audio**.
   `docker/voice-sidecar/server.py` now splits the phoneme string itself
   (`_split_phonemes`, capped by the new `VOICE_TTS_MAX_PHONEMES`, default 500)
   and hands Kokoro one already-safe batch at a time; the split is lossless by
   construction — an over-long run is *carried* into the next batch rather than
-  discarded. Same corpus after: **0 truncated batches, 0 phonemes lost**, at a
+  discarded. Same corpus after: **0 over-limit batches, 0 phonemes lost**, at a
   cost of 6320 → 6413 synthesis batches (+1.5%). The espeak path
   (`VOICE_TTS_G2P=espeak`, non-English locales) is phonemized through Kokoro's
   own tokenizer so it is chunked the same way. Characters remain the coarse
