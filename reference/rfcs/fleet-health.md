@@ -427,6 +427,22 @@ same `origin=` turn id fold into a single finding for that signal, so ledger
 `frequency` counts distinct affected turns. Lines with no origin id keep
 one-finding-per-line.
 
+**A change of counting UNIT is not a count-drop.** `frequency` is a count, and
+the count-drop self-verify below closes an issue when it falls — so changing
+what an occurrence *is* makes every open issue on that signal look fixed, with
+nothing fixed. Each issue therefore records the `counting_unit` its `frequency`
+was measured in (`log-line` or `gateway-event`; absent means the legacy
+`log-line`). When the unit differs from the prior ledger's, the writer holds the
+issue's status for exactly one scan instead of advancing it toward closure. The
+issue is rewritten carrying the new unit, so the next scan compares like with
+like and a genuine drop still closes it — a real close is delayed by one scan,
+never suppressed. Reopening is still allowed: a count above the threshold cannot
+produce a false "fixed" claim. Without this the fold above would have flipped
+every live gateway issue to `resolved-pending-verify` on the first post-merge
+scan and had `gh-sync` comment "Verified count-drop … Closed by the Fleet Health
+sensor." on issues nobody touched — the board lying, which is the one failure
+this ledger exists to prevent.
+
 The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
 
 ### Priority score (as implemented)

@@ -231,6 +231,20 @@ export const GATEWAY_SIGNATURES: Record<LineMatchedGatewaySignal, RegExp> = {
   "orphaned-db-handle": /orphaned-db-sweep DETECTED \d+ deleted-inode DB handle/,
 };
 
+/**
+ * Every signal `detectGatewaySignals` can emit — the line-matched ones plus the
+ * `orphaned-db-handle-recovered` split it derives. #4680 rule 3 folds these
+ * findings by event identity (the `origin=` turn id) instead of one per log
+ * line, so this list is also the authoritative set of signals whose ledger
+ * COUNTING UNIT is `gateway-event` (see `countingUnitFor` in `mapping.ts`).
+ * Single-sourced here so a new gateway signal cannot be added to the detector
+ * and silently miss the ledger's counting-unit guard.
+ */
+export const GATEWAY_SIGNAL_NAMES: readonly GatewaySignal[] = [
+  ...(Object.keys(GATEWAY_SIGNATURES) as LineMatchedGatewaySignal[]),
+  "orphaned-db-handle-recovered",
+];
+
 /** The sweep's in-process recovery line, logged by `attemptHistoryReopen` the
  *  moment the reopened `history.db` handle passes its post-reopen writer
  *  self-check (`orphaned-db-sweep.ts:279`). `reopened` is the first-detection
@@ -267,21 +281,41 @@ const ORPHANED_DB_TICK_LOOKAHEAD = 12;
  * tick reported itself un-recovered. `registry.db` has no in-process recovery
  * at all, so a tick that reopened history while registry stayed orphaned is
  * still severity-3 silent loss.
+ *
+ * The lookahead cap is a safety valve, NOT a tick boundary, and the ordering
+ * makes that distinction load-bearing: `runOrphanedDbSweepTick` logs the
+ * history lane (and therefore the reopen-succeeded line, since
+ * `attemptHistoryReopen` is synchronous) at :219-229 BEFORE the registry lane
+ * at :231-238 and the unowned lane at :242-251. So the lines that veto a
+ * "recovered" verdict are exactly the ones an interleaved or truncated log
+ * pushes out of the window. If the scan runs out of window without reaching a
+ * tick boundary — the next tick's DETECTED alarm, or EOF — we have NOT seen
+ * the whole tick and cannot prove no lane was left un-recovered, so we fail
+ * toward the alarm and report `unrecovered` (severity 3). Without this, an
+ * emitter that grew an `await` between the lanes, or 12 interleaved lines from
+ * another gateway subsystem, would silently downgrade a real `registry.db`
+ * data loss from severity 3 to severity 1.
  */
 export function classifyOrphanedDbTick(
   lines: readonly string[],
   alarmIdx: number,
 ): "recovered" | "unrecovered" {
   let recovered = false;
-  const end = Math.min(lines.length, alarmIdx + 1 + ORPHANED_DB_TICK_LOOKAHEAD);
+  const cap = alarmIdx + 1 + ORPHANED_DB_TICK_LOOKAHEAD;
+  const end = Math.min(lines.length, cap);
+  // EOF inside the window means the log simply ended: the whole tick is visible.
+  let sawTickBoundary = lines.length <= cap;
   for (let j = alarmIdx + 1; j < end; j++) {
     const line = lines[j];
     if (!line) continue;
-    if (GATEWAY_SIGNATURES["orphaned-db-handle"].test(line)) break; // next tick
+    if (GATEWAY_SIGNATURES["orphaned-db-handle"].test(line)) {
+      sawTickBoundary = true; // next tick's alarm — this tick is fully seen
+      break;
+    }
     if (ORPHANED_DB_UNRECOVERED_RE.test(line)) return "unrecovered";
     if (ORPHANED_DB_RECOVERED_RE.test(line)) recovered = true;
   }
-  return recovered ? "recovered" : "unrecovered";
+  return recovered && sawTickBoundary ? "recovered" : "unrecovered";
 }
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
@@ -542,9 +576,15 @@ export function detectGatewayFindings(
           const at = eventIndex.get(eventKey);
           if (at !== undefined) {
             // Same event, later line: advance the evidence to the newest one
-            // rather than booking a second occurrence.
+            // rather than booking a second occurrence. `log_pointer` and `ts`
+            // move together or not at all — a newest line with no parseable
+            // timestamp must not leave a pointer at line N describing evidence
+            // whose `ts` came from an earlier line, because `withinWindow` and
+            // `buildLedger`'s recency then age on a `ts` the pointer disowns.
             const prev = findings[at]!;
-            findings[at] = { ...prev, log_pointer: pointer, ts: ts ?? prev.ts };
+            if (ts !== null || prev.ts === null) {
+              findings[at] = { ...prev, log_pointer: pointer, ts };
+            }
             continue;
           }
           eventIndex.set(eventKey, findings.length);

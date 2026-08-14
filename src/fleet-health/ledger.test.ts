@@ -309,3 +309,126 @@ describe("runScan (I/O) — defensive over a synthetic fleet tree", () => {
     }
   });
 });
+
+/**
+ * #4680 — the counting-UNIT guard.
+ *
+ * `frequency` is a count, and `buildLedger`'s self-verify closes an issue when
+ * the count DROPS. Rule 3 of this PR changes what a gateway finding counts:
+ * one per affected turn instead of one per matching log line. That makes every
+ * open gateway issue's frequency fall on the first scan after merge with
+ * nothing fixed — and the drop is indistinguishable from a real fix unless the
+ * ledger records the ruler alongside the number. Left unguarded, a live
+ * `duplicate-delivery-represent` issue flips to `resolved-pending-verify`,
+ * closes on the next scan, and `gh-sync` comments "Verified count-drop …" on a
+ * still-broken GitHub issue.
+ */
+describe("#4680 — a change of counting UNIT is not a count-drop", () => {
+  const NOW = new Date("2026-07-03T00:00:00Z");
+  const DELIVERY = "talk-to-agents-from-anywhere";
+  const KILLED_JOB = "steer-or-queue-mid-flight";
+
+  /** A ledger exactly as a PRE-#4680 scan wrote it to disk: counts are log
+   *  lines and no `counting_unit` field exists on any issue. */
+  function legacyLedger(findings: Finding[], ghIssue?: number) {
+    const led = buildLedger(findings, { now: NOW });
+    for (const rec of led.records) {
+      for (const iss of rec.issues) {
+        delete (iss as { counting_unit?: unknown }).counting_unit;
+        if (ghIssue !== undefined) iss.gh_issue = ghIssue;
+      }
+    }
+    return led;
+  }
+
+  const issueOn = (led: ReturnType<typeof buildLedger>, job: string) =>
+    led.records.find((r) => r.job_spec === job)!.issues[0];
+
+  it("holds a live gateway issue OPEN when the fold shrinks its frequency", () => {
+    // Pre-#4680 on-disk state: 8 duplicate-send log lines across 3 turns.
+    const prior = legacyLedger(
+      [1, 1, 1, 2, 2, 2, 3, 3].map((turn, i) => dupFinding("clerk", turn, `2026-07-02T21:0${i}:00Z`)),
+      4242,
+    );
+    expect(issueOn(prior, DELIVERY).frequency).toBe(8);
+    expect(issueOn(prior, DELIVERY).status).toBe("open");
+
+    // First post-merge scan: the SAME three broken turns, now folded to one
+    // finding each. 3 <= RESOLVED_THRESHOLD, so the naive rule fires.
+    const next = buildLedger(
+      [1, 2, 3].map((t) => dupFinding("clerk", t, "2026-07-02T21:30:00Z")),
+      { now: NOW, prior },
+    );
+    const iss = issueOn(next, DELIVERY);
+    expect(iss.frequency).toBe(3);
+    expect(iss.gh_issue).toBe(4242);
+    // The defect is unchanged, so the board must still say so.
+    expect(iss.status).toBe("open");
+    // …and the new ruler is recorded, so the NEXT scan compares like with like.
+    expect(iss.counting_unit).toBe("gateway-event");
+  });
+
+  it("still closes on a genuine drop the scan AFTER the unit change settles", () => {
+    const legacy = legacyLedger(
+      Array.from({ length: 20 }, (_, i) => dupFinding("clerk", i)),
+      4242,
+    );
+    // Scan 1 — unit changes; held open despite the low count.
+    const scan1 = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: legacy });
+    expect(issueOn(scan1, DELIVERY).status).toBe("open");
+    // Scan 2 — same unit on both sides now. Prior frequency is 1, which is not
+    // above the threshold, so the count-drop arm cannot fire; the guard must
+    // not have laundered a close either. A real regression back up and down is
+    // what re-arms it, which is the honest semantics.
+    const scan2 = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: scan1 });
+    expect(issueOn(scan2, DELIVERY).status).toBe("open");
+
+    // A real fix, measured in the SAME unit both times, still closes.
+    const busy = buildLedger(
+      Array.from({ length: 20 }, (_, i) => dupFinding("clerk", i)),
+      { now: NOW, prior: scan2 },
+    );
+    expect(issueOn(busy, DELIVERY).frequency).toBe(20);
+    const fixed = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: busy });
+    expect(issueOn(fixed, DELIVERY).status).toBe("resolved-pending-verify");
+    const verified = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: fixed });
+    expect(issueOn(verified, DELIVERY).status).toBe("closed");
+  });
+
+  it("does not delay a signal whose unit did NOT change", () => {
+    // `killed-incomplete-turn` is a turns.jsonl signal — the gateway fold never
+    // touched it, so its legacy `log-line` unit still matches and the ordinary
+    // count-drop must fire on the very first scan.
+    const legacy = legacyLedger(
+      Array.from({ length: 20 }, (_, i) =>
+        killedFinding("clerk", i, "2026-07-02T21:03:00Z"),
+      ),
+      777,
+    );
+    const next = buildLedger(
+      [killedFinding("clerk", 99, "2026-07-02T21:03:00Z")],
+      { now: NOW, prior: legacy },
+    );
+    const iss = issueOn(next, KILLED_JOB);
+    expect(iss.status).toBe("resolved-pending-verify");
+    expect(iss.counting_unit).toBe("log-line");
+  });
+
+  it("never advances a pending-verify gateway issue to closed across the change", () => {
+    const legacy = legacyLedger(
+      Array.from({ length: 20 }, (_, i) => dupFinding("clerk", i)),
+      4242,
+    );
+    // Pre-#4680: the issue had already dropped and was awaiting verification.
+    const pending = legacyLedger([dupFinding("clerk", 1)], 4242);
+    issueOn(pending, DELIVERY).status = "resolved-pending-verify";
+    expect(issueOn(legacy, DELIVERY).frequency).toBe(20);
+
+    const next = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: pending });
+    // Held, not closed: the verification scan must be measured in the same unit
+    // as the drop it is verifying.
+    expect(issueOn(next, DELIVERY).status).toBe("resolved-pending-verify");
+    const after = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: next });
+    expect(issueOn(after, DELIVERY).status).toBe("closed");
+  });
+});

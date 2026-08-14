@@ -47,6 +47,13 @@ export type FleetHealthIssueStatus =
   | "resolved-pending-verify"
   | "closed";
 
+/** The unit `frequency` counts in. `log-line` is one occurrence per matching
+ *  log line; `gateway-event` is one occurrence per distinct affected turn (the
+ *  #4680 gateway fold). The ledger's count-drop self-verify may only compare
+ *  two scans measured in the SAME unit — see `countingUnitFor` in
+ *  `src/fleet-health/mapping.ts` and the guard in `buildLedger`. */
+export type FleetHealthCountingUnit = "log-line" | "gateway-event";
+
 export interface FleetHealthIssue {
   /** Stable de-dup key — one GitHub issue per key, updated not re-created. */
   dedup_key: string;
@@ -64,6 +71,9 @@ export interface FleetHealthIssue {
   /** Linked GitHub issue number (identify + resolve system-of-record). */
   gh_issue?: number;
   status: FleetHealthIssueStatus;
+  /** The unit `frequency` was counted in on the scan that wrote this issue.
+   *  Absent on a ledger written before #4680, which means `log-line`. */
+  counting_unit?: FleetHealthCountingUnit;
 }
 
 /** One persistent record per job spec (23 of them). */

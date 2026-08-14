@@ -14,6 +14,7 @@ import type {
   FleetHealthRecord,
   FleetHealthIssue,
   FleetHealthOccurrence,
+  FleetHealthCountingUnit,
 } from "../web/fleet-health-read.js";
 import type { Finding } from "./detect.js";
 import {
@@ -21,6 +22,8 @@ import {
   mapSignal,
   dedupKeyFor,
   issuePriority,
+  countingUnitFor,
+  LEGACY_COUNTING_UNIT,
 } from "./mapping.js";
 
 /** Below this occurrence count, a previously-open issue is considered fixed —
@@ -40,6 +43,9 @@ export interface PriorIssueState {
   job_spec: string;
   failure_mode: FleetHealthIssue["failure_mode"];
   severity: number;
+  /** The unit `frequency` above was counted in. A ledger written before #4680
+   *  carries no field, which means the legacy one-per-log-line unit. */
+  counting_unit: FleetHealthCountingUnit;
 }
 
 export function indexPriorIssues(
@@ -56,6 +62,7 @@ export function indexPriorIssues(
         job_spec: rec.job_spec,
         failure_mode: iss.failure_mode,
         severity: iss.severity,
+        counting_unit: iss.counting_unit ?? LEGACY_COUNTING_UNIT,
       });
     }
   }
@@ -73,6 +80,8 @@ interface Agg {
   /** Authoritative frequency — every finding for this key. Tracked during the
    *  single aggregation pass to avoid an O(findings × aggs) re-filter later. */
   count: number;
+  /** The unit `count` is measured in — see `countingUnitFor`. */
+  counting_unit: FleetHealthCountingUnit;
 }
 
 function newer(a: string | null, b: string | null): string | null {
@@ -174,6 +183,7 @@ export function buildLedger(
         reach: new Set(),
         newest: null,
         count: 0,
+        counting_unit: countingUnitFor(f.signal),
       };
       aggs.set(key, agg);
     }
@@ -198,9 +208,32 @@ export function buildLedger(
     // single aggregation pass above; occurrences are capped-at-50 samples).
     const count = agg.count;
     const prior = priorIdx.get(agg.dedup_key);
+    // #4680 — did the RULER change under this issue since the prior scan?
+    // `frequency` is a count in `counting_unit`, and the self-verify below
+    // compares this scan's count against the prior ledger's. When the unit
+    // changes (the gateway fold switched from one-per-log-line to one-per
+    // affected-turn), the number falls with NOTHING fixed: a live
+    // `duplicate-delivery-represent` issue at frequency 8 over 3 turns lands
+    // at 3 on the very next scan. Honouring that as a count-drop flips it to
+    // `resolved-pending-verify`, closes it the scan after, and has `gh-sync`
+    // post "Verified count-drop … Closed by the Fleet Health sensor." on a
+    // still-broken issue — the board lying, which is the one failure this
+    // ledger exists to prevent.
+    const unitChanged = prior !== undefined && prior.counting_unit !== agg.counting_unit;
 
     let status: FleetHealthIssue["status"] = "open";
-    if (count <= RESOLVED_THRESHOLD && prior && prior.frequency > RESOLVED_THRESHOLD) {
+    if (unitChanged) {
+      // Hold state for exactly one scan: never advance toward closure across a
+      // unit change. The issue is rewritten below carrying the NEW unit, so the
+      // next scan compares like with like and a genuine drop still closes it —
+      // this delays a real close by one scan, it does not suppress it. Reopening
+      // is still allowed (a count above the threshold clears pending-verify),
+      // because that direction cannot produce a false "fixed" claim.
+      status =
+        count <= RESOLVED_THRESHOLD && prior.status === "resolved-pending-verify"
+          ? "resolved-pending-verify"
+          : "open";
+    } else if (count <= RESOLVED_THRESHOLD && prior && prior.frequency > RESOLVED_THRESHOLD) {
       // count dropped after a fix → pending verification.
       status = "resolved-pending-verify";
     } else if (prior?.status === "resolved-pending-verify" && count <= RESOLVED_THRESHOLD) {
@@ -217,6 +250,7 @@ export function buildLedger(
       occurrences: agg.occurrences,
       ...(prior?.gh_issue !== undefined ? { gh_issue: prior.gh_issue } : {}),
       status,
+      counting_unit: agg.counting_unit,
     };
     const list = byJob.get(agg.job_spec) ?? [];
     list.push(issue);
@@ -243,6 +277,11 @@ export function buildLedger(
       occurrences: [],
       ...(prior.gh_issue !== undefined ? { gh_issue: prior.gh_issue } : {}),
       status: "closed",
+      // Not subject to the unit guard: zero findings means the artifact is
+      // genuinely absent from the window. Folding a non-empty finding set can
+      // shrink a count but can never empty it, so a unit change cannot
+      // manufacture this path.
+      counting_unit: prior.counting_unit,
     };
     const list = byJob.get(prior.job_spec) ?? [];
     list.push(issue);

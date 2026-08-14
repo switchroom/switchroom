@@ -11,8 +11,12 @@
  * scoring is arithmetic, exactly as the RFC specifies.
  */
 
-import type { FleetHealthFailureMode } from "../web/fleet-health-read.js";
+import type {
+  FleetHealthCountingUnit,
+  FleetHealthFailureMode,
+} from "../web/fleet-health-read.js";
 import type { L0Signal, Finding } from "./detect.js";
+import { GATEWAY_SIGNAL_NAMES } from "./detect.js";
 
 /** How one L0 signal classifies: its failure mode, severity (1-3), the job
  *  spec it maps to, and the stable dedup-key signature fragment. */
@@ -243,6 +247,29 @@ export const ALL_JOB_SPECS: readonly string[] = [
 
 export function mapSignal(signal: L0Signal): SignalMapping {
   return SIGNAL_MAP[signal];
+}
+
+const GATEWAY_SIGNAL_SET: ReadonlySet<string> = new Set(GATEWAY_SIGNAL_NAMES);
+
+/** The unit every issue written before #4680 was counted in. A prior ledger
+ *  carries no `counting_unit` field, so this is what its absence means. */
+export const LEGACY_COUNTING_UNIT: FleetHealthCountingUnit = "log-line";
+
+/**
+ * The unit this signal's ledger `frequency` counts in.
+ *
+ * #4680 rule 3 folds gateway findings by event identity (the `origin=` turn
+ * id), so a gateway signal's frequency counts distinct affected turns, not
+ * matching log lines. Every other signal is still one finding per artifact.
+ *
+ * This exists so `buildLedger` can tell a genuine count DROP (someone fixed
+ * the defect) from a change of RULER (the same defect, measured differently).
+ * The two are indistinguishable from the number alone, and conflating them
+ * makes the sensor post "Verified count-drop" on a live GitHub issue nobody
+ * touched — the exact success-theater inversion the ledger exists to catch.
+ */
+export function countingUnitFor(signal: L0Signal): FleetHealthCountingUnit {
+  return GATEWAY_SIGNAL_SET.has(signal) ? "gateway-event" : "log-line";
 }
 
 /** The stable dedup key for a finding: `<job_spec>:<signature>`. One GitHub

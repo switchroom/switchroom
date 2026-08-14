@@ -351,6 +351,48 @@ describe("#4680 — a working guard is not a failure", () => {
       expect(severityOf(log)).toEqual([3]);
     });
 
+    // The tick's lane ordering is load-bearing and lives in a DIFFERENT file:
+    // `orphaned-db-sweep.ts` logs the history lane (and therefore the reopen
+    // line, since `attemptHistoryReopen` is synchronous) at :219-229 BEFORE
+    // the registry lane at :231-238. So the line that VETOES a "recovered"
+    // verdict is exactly the one an added `await`, or another subsystem's
+    // interleaved output, pushes past the lookahead cap. Without the
+    // tick-boundary requirement this silently downgrades real `registry.db`
+    // data loss from severity 3 to severity 1 — and no adjacent-lines fixture
+    // above would notice.
+    it("stays severity 3 when the registry lane is pushed past the lookahead cap", () => {
+      const filler = Array.from(
+        { length: 14 },
+        (_, i) => `2026-08-12T03:00:0${i % 10}Z telegram gateway: unrelated chatter #${i}`,
+      );
+      const log = [
+        detect(2, "/state/registry.db"),
+        reopened,
+        ...filler,
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — the turnsDb handle" +
+          " is captured by value into long-lived wiring, so closing it would leave those" +
+          " consumers on a closed handle. RESTART the gateway to recover; subagent/turn" +
+          " rows written since the last checkpoint are LOST.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    // The conservative rule must not swallow the ordinary recovered case: an
+    // alarm + reopen followed by a short quiet tail still ends at EOF inside
+    // the window, so the whole tick IS visible.
+    it("still books severity 1 when the whole tick is visible", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        reopened,
+        ...Array.from(
+          { length: 3 },
+          (_, i) => `2026-08-12T03:00:0${i}Z telegram gateway: unrelated chatter #${i}`,
+        ),
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+    });
+
     it("a LATER tick's recovery does not launder an earlier unrecovered alarm", () => {
       const log = [detect(1, "/state/history.db"), detect(1, "/state/history.db"), reopened]
         .join("\n");
@@ -382,6 +424,21 @@ describe("#4680 — a working guard is not a failure", () => {
       expect(findings).toHaveLength(1);
       expect(findings[0]?.ts).toBe("2026-08-12T04:01:00Z");
       expect(findings[0]?.log_pointer).toBe("logs/carrie/gateway-supervisor.log:2");
+    });
+
+    // `log_pointer` is the line the operator greps to check the `ts` the ledger
+    // windowed and ranked on. If a newest line with an unparseable timestamp
+    // advanced the pointer while `ts` fell back to an earlier line, the finding
+    // would claim line 2 as evidence for a timestamp that only line 1 carries.
+    it("does not advance the pointer past the line its `ts` came from", () => {
+      const log = [
+        `2026-08-12T04:00:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+        `gateway: represent duplicate-send origin=${ORIGIN}`, // no ISO prefix
+      ].join("\n");
+      const { findings } = detectGatewayFindings("carrie", log);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ts).toBe("2026-08-12T04:00:00Z");
+      expect(findings[0]?.log_pointer).toBe("logs/carrie/gateway-supervisor.log:1");
     });
 
     it("keeps DISTINCT origins as distinct findings", () => {

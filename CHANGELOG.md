@@ -204,6 +204,37 @@ now an anomaly worth investigating, not the norm.
   message to plain text. Also locks in the blank-line-separated expandable
   shape, the majority corpus shape, which worked but had no test.
 
+- **fleet-health: a detector must check an alarm's OUTCOME, not just match
+  it.** Two Layer-0 rules matched an alarm and never asked how it ended, so the
+  nightly ledger booked working safety mechanisms as failures.
+  `represent-escalation` was the bare substring `/obligation escalation/`, which
+  five emitter lines carry — including the per-attempt retry line and
+  `obligation-wiring.ts`'s `deferred — bridge down` line, i.e. the guard
+  deliberately *not* escalating while the Telegram bridge is down. Three of 11
+  live hits were that suppression path, all for the same obligation. It now
+  anchors on the two mutually-exclusive TERMINAL outcomes (`delivered + closed`,
+  `PERMANENTLY undeliverable`), the same attempt-vs-outcome fix #3931 made for
+  `reply-delivery-failure`. `orphaned-db-handle` matched the deleted-inode sweep
+  alarm without checking whether the paired recovery followed; an alarm whose
+  own sweep tick reopened `history.db` and left no lane un-recovered is now
+  `orphaned-db-handle-recovered` (drift, severity 1) instead of a severity-3
+  silent-data-loss incident. `registry.db`, an unowned handle, a FAILED reopen,
+  or a tick the detector cannot see in full all keep severity 3 — every
+  narrowing fails *toward* the alarm.
+- **fleet-health: gateway findings count affected turns, and a change of
+  counting unit can no longer auto-close a live GitHub issue.** Matched gateway
+  lines sharing an `origin=` turn id now fold into one finding, so ledger
+  `frequency` counts distinct affected turns rather than log lines (`gw_hits`
+  stays a raw line count for the digest). That is a change of *ruler*, and the
+  ledger's count-drop self-verify closes an issue when the number falls: an open
+  `duplicate-delivery-represent` issue at frequency 8 across 3 turns would have
+  collapsed to 3 on the first scan after merge, flipped to
+  `resolved-pending-verify`, and had the sensor comment "Verified count-drop …
+  Closed by the Fleet Health sensor." on a still-broken issue. Each issue now
+  records the `counting_unit` its frequency was measured in, and the writer
+  holds an issue's status for exactly one scan when that unit changes — a real
+  close is delayed by one scan, never suppressed, and reopening still works.
+
 ### Features
 
 - **voice: flag-gated raw-markdown speech capture (PR-0)** — `SWITCHROOM_SPEECH_CAPTURE=1`
@@ -980,7 +1011,6 @@ now an anomaly worth investigating, not the norm.
   `Intl`, since Node's ICU reports a correct UTC even on a corrupted host and
   would mask exactly this defect.
 - **gateway: never evict an approval outcome while anything else is droppable**
-- **fleet-health: detectors must check an alarm's outcome, not just match it**
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 

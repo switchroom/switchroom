@@ -136,3 +136,63 @@ describe("gh-sync (no network — injected deps)", () => {
     expect(closeCall).toBeDefined();
   });
 });
+
+/**
+ * #4680 — the end-to-end consequence the counting-unit guard exists to stop.
+ * Rule 3 of that PR folds gateway findings by affected turn instead of by log
+ * line, which shrinks every open gateway issue's `frequency` with nothing
+ * fixed. Two scans is all it takes for the naive count-drop rule to run
+ * `gh issue close` and comment "Verified count-drop … Closed by the Fleet
+ * Health sensor." on a live, still-broken issue.
+ */
+describe("#4680 — no GitHub issue auto-closes across a counting-unit change", () => {
+  const NOW = new Date("2026-07-03T00:00:00Z");
+
+  it("runs no `gh issue close` on either scan after the fold changes the unit", () => {
+    // Pre-#4680 on-disk ledger: 8 duplicate-send LOG LINES across 3 turns,
+    // tracked as GH #1841. Written before `counting_unit` existed.
+    const prior: FleetHealthLedger = buildLedger(
+      [1, 1, 1, 2, 2, 2, 3, 3].map((t) => dup("clerk", t)),
+      { now: NOW },
+    );
+    for (const rec of prior.records) {
+      for (const iss of rec.issues) {
+        delete (iss as { counting_unit?: unknown }).counting_unit;
+        iss.gh_issue = 1841;
+      }
+    }
+    const key = dedupKeyFor(dup("clerk", 1));
+    const priorIssue = prior.records
+      .flatMap((r) => r.issues)
+      .find((i) => i.dedup_key === key)!;
+    expect(priorIssue.frequency).toBe(8);
+    expect(priorIssue.status).toBe("open");
+
+    // The SAME three broken turns, now folded to one finding each. Nothing was
+    // fixed; only the ruler changed.
+    const scan1 = buildLedger([1, 2, 3].map((t) => dup("clerk", t)), {
+      now: NOW,
+      prior,
+    });
+    const scan2 = buildLedger([1, 2, 3].map((t) => dup("clerk", t)), {
+      now: NOW,
+      prior: scan1,
+    });
+
+    const closeCalls: string[][] = [];
+    for (const led of [scan1, scan2]) {
+      const { deps, calls } = fakeDeps();
+      syncLedgerIssues(led, "switchroom/switchroom", deps);
+      closeCalls.push(
+        ...calls.filter((c) => c[0] === "issue" && c[1] === "close"),
+      );
+    }
+    expect(closeCalls).toEqual([]);
+
+    const finalIssue = scan2.records
+      .flatMap((r) => r.issues)
+      .find((i) => i.dedup_key === key)!;
+    expect(finalIssue.status).toBe("open");
+    expect(finalIssue.gh_issue).toBe(1841);
+  });
+});
