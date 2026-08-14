@@ -23,13 +23,12 @@ now an anomaly worth investigating, not the norm.
   delimiter as a `raw` node — verbatim wire passthrough, so nothing downstream
   widened it — without ever inspecting the body. A `<pre>` carrying its own
   ``` therefore went to the wire with THREE delimiters instead of two:
-  Telegram opens at the first, closes at the embedded one, reads the remainder
-  as prose, and the trailing delimiter opens a fence that never terminates —
-  `can't find end of Pre entity`, a 400, and a plain-text resend of the WHOLE
-  message, which is precisely the denial-of-formatting outcome that module
-  exists to prevent. `fa9018a7` escaped the backticks instead: cosmetically
-  worse, but wire-correct, so the regression traded a cosmetic defect for a
-  400. The fence-width rule now has exactly ONE implementation, `codeFenceFor`
+  Telegram opens at the first, closes at the embedded one, and the trailing
+  delimiter opens a fence that never terminates: `can't find end of Pre
+  entity`, a 400, and a plain-text resend of the WHOLE message — the
+  denial-of-formatting outcome that module exists to prevent. (`fa9018a7`
+  escaped the backticks instead: cosmetically worse but wire-correct.)
+  The fence-width rule now has exactly ONE implementation, `codeFenceFor`
   (`telegram-plugin/format.ts`) — one backtick longer than the longest run in
   the body — and all three call sites use it: the `<pre>` fold, plus
   `renderCodeBlock` and `degradeToCodeFence` (`telegram-plugin/render/render.ts`),
@@ -38,12 +37,20 @@ now an anomaly worth investigating, not the norm.
   appears on exactly two lines and is strictly longer than every run inside.
   Consolidating also fixed a latent crash both copies shared: the width scan
   was `Math.max(0, ...runs.map(…))`, one argument per run, which throws
-  `RangeError: Maximum call stack size exceeded` out of the render path from
-  about 125k backtick runs (~375 KB, measured). That is reachable because
-  `renderOutboundChunks` renders the WHOLE raw body first and only re-splits
-  on overflow (`telegram-plugin/render/rich-render.ts:146`), so the fence scan
-  is not bounded by the 32768-character rich cap. The shared helper scans with
-  a loop instead; same O(n), cannot throw.
+  `RangeError: Maximum call stack size exceeded` out of the render path once
+  the body carries more backtick runs than the engine's argument limit. That
+  limit is ENGINE-DEPENDENT, so no single number states it: measured by
+  bisection on the pinned toolchain it is 638,621 runs (~1.9 MB) on Bun
+  1.3.13, the shipping runtime, and 125,289 (~375 KB) on Node 22 — the
+  vitest runner. Input is unbounded — `renderOutboundChunks` renders the WHOLE
+  raw body before any chunking (`telegram-plugin/render/rich-render.ts:146`),
+  so the scan is not capped by the 32768-character rich limit — though on Bun
+  a ~1.9 MB single message is an unlikely body, so this was latent there
+  rather than routine. The shared helper loops instead (same O(n), cannot
+  throw), so the fix does not depend on winning that reachability argument.
+  The regression test was raised to 1M runs: at the 200k it started at, the
+  reinstated spread form still PASSES under Bun — the guard asserted nothing
+  in the shipping runtime.
 
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 
