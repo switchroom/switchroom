@@ -103,12 +103,18 @@ import type {
 } from "./ir.js";
 import {
   HTML_FOLD_TAGS,
+  escapeHtmlLiteral,
   hrefOf,
+  isBlockLevelTag,
   isPassthroughTag,
+  isVoidTag,
+  languageOf,
+  matchedTagOffsets,
   tokenizeHtml,
   type HtmlFoldTarget,
   type HtmlTagInfo,
 } from "./html-fold.js";
+import { codeFenceFor } from "../format.js";
 
 /** Copy UTF-16 offsets off an mdast node. Falls back to 0-length when a
  *  synthesized node lacks a position (from-markdown always sets one, but the
@@ -158,9 +164,24 @@ function isTgInlineEntityHref(href: string): boolean {
 
 /** A top-level fenced-code delimiter: 3+ backticks or tildes, indented 0–3
  *  spaces. Deeper indentation is not a fence, and a fence nested inside a
- *  blockquote / list item is prefixed by its container's markup — so a
- *  column-0 `**>` line can only ever be code content inside a fence this
- *  matches, which is exactly the region the rewrite must not touch. */
+ *  blockquote / list item is prefixed by its container's markup, so this only
+ *  ever tracks TOP-LEVEL fences.
+ *
+ *  KNOWN LIMITATION (pre-existing, not a safety property): tracking only
+ *  top-level fences does NOT establish that every column-0 `**>` line outside
+ *  one is a real blockquote candidate. Counterexample:
+ *
+ *      > ```
+ *      **> lazy
+ *      > ```
+ *
+ *  The `> ``` ` opener is inside a blockquote so it never matches here; the
+ *  column-0 `**> lazy` line is rewritten to `  > lazy` and the `**` is eaten.
+ *  CommonMark forbids lazy continuation into fenced code, so that line should
+ *  CLOSE the blockquote and stay literal. Fixing it needs real container
+ *  tracking (blockquote/list prefixes), not a wider fence regex. The case is
+ *  pinned by a test in `tests/render/html-dialect.test.ts` so any future
+ *  container-aware rewrite has to decide it deliberately. */
 const FENCE_DELIM_RE = /^ {0,3}(`{3,}|~{3,})/;
 
 /** Pre-transform expandable-blockquote markers so mdast can parse them as
@@ -243,7 +264,7 @@ function foldAlign(a: AlignType | undefined): "left" | "center" | "right" | null
   return a ?? null;
 }
 
-function foldInline(node: PhrasingContent, source: string): Inline {
+function foldInline(node: PhrasingContent, source: string, ctx: FoldCtx): Inline {
   switch (node.type) {
     case "text":
       return { type: "plain", text: node.value, ...pos(node) };
@@ -254,21 +275,21 @@ function foldInline(node: PhrasingContent, source: string): Inline {
       const underline = source.slice(p.start, p.start + 2) === "__";
       return {
         type: underline ? "underline" : "bold",
-        children: foldInlineChildren(node, source),
+        children: foldInlineChildren(node, source, ctx),
         ...p,
       };
     }
     case "emphasis":
-      return { type: "italic", children: foldInlineChildren(node, source), ...pos(node) };
+      return { type: "italic", children: foldInlineChildren(node, source, ctx), ...pos(node) };
     case "delete":
-      return { type: "strike", children: foldInlineChildren(node, source), ...pos(node) };
+      return { type: "strike", children: foldInlineChildren(node, source, ctx), ...pos(node) };
     case "inlineCode":
       return { type: "code", text: node.value, ...pos(node) };
     case "link":
       return {
         type: "link",
         href: node.url,
-        children: foldInlineChildren(node, source),
+        children: foldInlineChildren(node, source, ctx),
         ...pos(node),
       };
     case "image": {
@@ -406,19 +427,86 @@ function inlineLiteralText(nodes: Inline[]): string | null {
   return out;
 }
 
+/** Where a folded run is being emitted. `noBreaks` marks a container whose
+ *  content must stay on ONE line — a heading or a table cell — so a `<br>` or
+ *  a structural separator has to degrade to a space instead of a line break,
+ *  and a `<pre>` to an inline code span instead of a fence. Without this a
+ *  `# a<br>b` heading emitted `# a  \nb`, which ends the heading block and
+ *  drops `b` out of it. */
+interface FoldCtx {
+  noBreaks?: boolean;
+  /** Source offsets of every HTML token the DOCUMENT-level pass found a
+   *  partner for (`matchedTagOffsets`). A token missing from this set is
+   *  unmatched — prose, not markup. Empty means "no HTML in this document",
+   *  in which case nothing consults it. */
+  matched: ReadonlySet<number>;
+}
+
+/** Separator nodes this module synthesized while degrading structural markup.
+ *  Tracked by identity so `normalizeSeparators` can collapse and trim OUR
+ *  separators without touching a hard break the author actually wrote with
+ *  `<br>` (`a<br><br>b` must keep both). */
+const structuralSeparators = new WeakSet<Inline>();
+
+/** The whitespace a degraded block-level tag leaves behind. A GFM HARD break
+ *  (two spaces + newline), not a bare `\n`: the renderer runs AFTER
+ *  `normalizeParagraphBreaks`, so a lone `\n` would never be promoted and
+ *  Telegram collapses it to a space. */
+function mkSeparator(ctx: FoldCtx, start: number, end: number): Inline {
+  const node: Inline = {
+    type: "raw",
+    text: ctx.noBreaks === true ? " " : "  \n",
+    start,
+    end,
+  };
+  structuralSeparators.add(node);
+  return node;
+}
+
+/** Drop leading/trailing synthesized separators and collapse runs of them, so
+ *  a degrade never contributes stray whitespace at the edges of a block
+ *  (`<div></div>` must still render to nothing, and a `<pre>` fence must not
+ *  leave a dangling newline). */
+function normalizeSeparators(nodes: Inline[]): Inline[] {
+  const out: Inline[] = [];
+  for (const node of nodes) {
+    if (!structuralSeparators.has(node)) {
+      out.push(node);
+      continue;
+    }
+    if (out.length === 0) continue;
+    if (structuralSeparators.has(out[out.length - 1])) continue;
+    out.push(node);
+  }
+  while (out.length > 0 && structuralSeparators.has(out[out.length - 1])) out.pop();
+  return out;
+}
+
+/** An unmatched marker or unclassifiable token kept as LITERAL text, with its
+ *  angle brackets HTML-entity-escaped so the wire sees prose, not a tag. */
+function literalTag(tag: HtmlTagInfo, start: number, end: number): Inline {
+  return { type: "plain", text: escapeHtmlLiteral(tag.raw), start, end };
+}
+
 /**
- * Apply the three-bucket HTML policy over a mixed tag/inline stream.
+ * Apply the HTML dialect policy over a mixed tag/inline stream.
  *
- * `active` carries the emphasis constructs already open in an ANCESTOR fold.
- * Markdown cannot nest same-kind emphasis — `**a **b** c**` is asterisk soup
- * on the reader's screen, not nested bold — so a tag whose target is already
- * active degrades to its children. Combined with the single-child unwrap in
- * `buildFoldedTag`, `<b>a <b>b</b> c</b>` and `<b>**already**</b>` both come
- * out as ONE bold run.
+ * `active` carries the constructs already open in an ANCESTOR fold. Markdown
+ * cannot nest same-kind emphasis — `**a **b** c**` is asterisk soup on the
+ * reader's screen, not nested bold — so an emphasis tag whose target is
+ * already active degrades to its children. Combined with the single-child
+ * unwrap in `buildFoldedTag`, `<b>a <b>b</b> c</b>` and `<b>**already**</b>`
+ * both come out as ONE bold run. A nested `<a>` is NOT unwrapped that way: its
+ * href is content, so it degrades to escaped literal markup instead of being
+ * silently deleted.
+ *
+ * See `html-fold.ts` for the bucket policy and the matched-vs-unmatched
+ * discriminator this implements.
  */
 function foldHtmlItems(
   items: HtmlFoldItem[],
-  active: ReadonlySet<HtmlFoldTarget> = new Set(),
+  active: ReadonlySet<HtmlFoldTarget>,
+  ctx: FoldCtx,
 ): Inline[] {
   const out: Inline[] = [];
   let i = 0;
@@ -430,50 +518,190 @@ function foldHtmlItems(
       continue;
     }
     const tag = it.tag;
-    // Bucket 2: wire-verified allowlist — emitted raw and unescaped.
-    if (isPassthroughTag(tag) && tag.kind !== "comment" && tag.kind !== "other") {
-      out.push({ type: "raw", text: tag.raw, start: it.start, end: it.end });
+
+    // A comment renders nothing anywhere: dropping it loses no content.
+    if (tag.kind === "comment") {
       i++;
       continue;
     }
-    // Bucket 1: fold to the native IR construct.
-    const target = tag.kind === "open" || tag.kind === "selfclose"
-      ? HTML_FOLD_TAGS[tag.name]
-      : undefined;
-    if (target === "break") {
-      // `<br>` / `<br/>`: a GFM HARD break (two spaces + newline), not a bare
-      // `\n`. The renderer runs AFTER `normalizeParagraphBreaks`
-      // (gateway/outbound-send-path.ts stage 1), so a lone `\n` inserted here
-      // would never be promoted and Telegram would collapse it to a space —
-      // silently losing the author's break. Emitted as `raw` so the two
-      // trailing spaces are not touched.
-      out.push({ type: "raw", text: "  \n", start: it.start, end: it.end });
+
+    // `<br>` / `<br/>` — a real line break (a space where breaks are illegal).
+    if (HTML_FOLD_TAGS[tag.name] === "break" && tag.kind !== "close") {
+      out.push(
+        ctx.noBreaks === true
+          ? { type: "raw", text: " ", start: it.start, end: it.end }
+          : { type: "raw", text: "  \n", start: it.start, end: it.end },
+      );
       i++;
       continue;
     }
-    if (target !== undefined && tag.kind === "open") {
+
+    // Void / self-closing tags delimit no content, so dropping their markup
+    // cannot lose text. Block-level ones still leave a separator.
+    if (tag.kind === "selfclose" || (tag.kind === "open" && isVoidTag(tag.name))) {
+      if (isPassthroughTag(tag)) {
+        out.push({ type: "raw", text: tag.raw, start: it.start, end: it.end });
+      } else if (isBlockLevelTag(tag.name)) {
+        out.push(mkSeparator(ctx, it.start, it.end));
+      }
+      i++;
+      continue;
+    }
+
+    // Bucket 2: the wire-verified allowlist, now BALANCE-CHECKED. Emitting an
+    // unmatched `<u>` raw is precisely the `unclosed start tag` 400 the fold
+    // policy exists to prevent — and the fallback resends the whole message as
+    // PLAIN TEXT, so one stray marker in relayed content degrades the entire
+    // reply. The check is document-level because a `<details>` open and close
+    // legitimately land in different mdast blocks.
+    if (isPassthroughTag(tag) && (tag.kind === "open" || tag.kind === "close")) {
+      out.push(
+        ctx.matched.has(it.start)
+          ? { type: "raw", text: tag.raw, start: it.start, end: it.end }
+          : literalTag(tag, it.start, it.end),
+      );
+      i++;
+      continue;
+    }
+
+    // Everything else must be BALANCED to count as markup.
+    if (tag.kind === "open") {
       const close = findClosingTag(items, i + 1, tag.name);
       const closeItem = close >= 0 ? items[close] : undefined;
       if (closeItem !== undefined && closeItem.kind === "tag") {
-        const nested = new Set(active);
-        nested.add(target);
-        const inner = foldHtmlItems(items.slice(i + 1, close), nested);
-        const folded = active.has(target)
-          ? null
-          : buildFoldedTag(target, tag, inner, it.start, closeItem.end);
-        // A tag we cannot represent faithfully (an `<a>` with no href, a
-        // `<code>` wrapping structure, an emphasis already open above)
-        // degrades to its CONTENT — bucket 3.
-        out.push(...(folded !== null ? [folded] : inner));
+        out.push(
+          ...foldMatchedTag(tag, closeItem, items.slice(i + 1, close), active, ctx, {
+            start: it.start,
+            end: closeItem.end,
+          }),
+        );
         i = close + 1;
         continue;
       }
     }
-    // Bucket 3: unknown tag, comment, or an unmatched open/close marker —
-    // drop the markup, keep everything around it.
+
+    // Matched somewhere ELSE in the document (a `<div>` whose `</div>` is a
+    // separate mdast block) — markup, so drop it, but leave a separator for a
+    // block-level name so the neighbouring blocks do not glue.
+    if (ctx.matched.has(it.start) && tag.kind !== "other") {
+      if (isBlockLevelTag(tag.name)) out.push(mkSeparator(ctx, it.start, it.end));
+      i++;
+      continue;
+    }
+
+    // Unmatched open, stray close, or an unclassifiable token: PROSE.
+    out.push(literalTag(tag, it.start, it.end));
     i++;
   }
-  return out;
+  return normalizeSeparators(out);
+}
+
+/** Emit a tag whose closing partner was found. */
+function foldMatchedTag(
+  tag: HtmlTagInfo,
+  closeTag: HtmlFoldItem & { kind: "tag" },
+  innerItems: HtmlFoldItem[],
+  active: ReadonlySet<HtmlFoldTarget>,
+  ctx: FoldCtx,
+  span: Pos,
+): Inline[] {
+  const target = HTML_FOLD_TAGS[tag.name];
+
+  // `<pre>` — the one BLOCK-level fold (see html-fold.ts).
+  if (target === "pre") {
+    const folded = buildPreBlock(innerItems, ctx, span);
+    if (folded !== null) return folded;
+  }
+
+  if (target !== undefined && target !== "break" && target !== "pre") {
+    const nested = new Set(active);
+    nested.add(target);
+    const inner = foldHtmlItems(innerItems, nested, ctx);
+    // A LINK cannot nest in markdown, and its href is content — degrading to
+    // the children would silently delete the inner URL. Keep the markup as
+    // escaped literal text instead.
+    if (active.has(target)) {
+      return target === "link"
+        ? [
+            literalTag(tag, span.start, span.start + tag.raw.length),
+            ...inner,
+            literalTag(closeTag.tag, closeTag.start, closeTag.end),
+          ]
+        : inner;
+    }
+    const folded = buildFoldedTag(target, tag, inner, span.start, span.end);
+    // A tag we cannot represent faithfully (an `<a>` with no href, a `<code>`
+    // wrapping structure) degrades to its CONTENT — nothing is lost.
+    return folded !== null ? [folded] : inner;
+  }
+
+  // Unknown but BALANCED: markup dropped, content kept. A block-level name
+  // leaves a separator so its neighbours cannot glue together.
+  const inner = foldHtmlItems(innerItems, active, ctx);
+  if (!isBlockLevelTag(tag.name)) return inner;
+  return [
+    mkSeparator(ctx, span.start, span.start + tag.raw.length),
+    ...inner,
+    mkSeparator(ctx, closeTag.start, closeTag.end),
+  ];
+}
+
+/** Build the fenced-code equivalent of a matched `<pre>…</pre>`, or null when
+ *  the content is not literal text a fence can carry (in which case the caller
+ *  falls back to the ordinary degrade). An optional single `<code …>` wrapper
+ *  is unwrapped, and its `class="language-…"` becomes the fence info string —
+ *  exactly the shape Telegram's own Rich HTML reference documents. */
+function buildPreBlock(
+  innerItems: HtmlFoldItem[],
+  ctx: FoldCtx,
+  span: Pos,
+): Inline[] | null {
+  let body = innerItems;
+  let language: string | null = null;
+  const first = body[0];
+  const last = body[body.length - 1];
+  if (
+    body.length >= 2 &&
+    first?.kind === "tag" &&
+    first.tag.kind === "open" &&
+    first.tag.name === "code" &&
+    last?.kind === "tag" &&
+    last.tag.kind === "close" &&
+    last.tag.name === "code"
+  ) {
+    language = languageOf(first.tag);
+    body = body.slice(1, -1);
+  }
+  let text = "";
+  for (const item of body) {
+    if (item.kind !== "inline" || item.node.type !== "plain") return null;
+    text += item.node.text;
+  }
+  // `<pre>` content routinely starts on the line after the tag and ends on the
+  // line before the close; those layout newlines are not content.
+  text = text.replace(/^\r?\n/, "").replace(/[ \t]*\r?\n[ \t]*$/, "");
+  // A fence cannot survive inside a heading or a table cell — degrade to an
+  // inline code span there, with the newlines flattened.
+  if (ctx.noBreaks === true) {
+    return [{ type: "code", text: text.replace(/\s*\r?\n\s*/g, " "), ...span }];
+  }
+  // The fence ships as a `raw` node — verbatim wire passthrough, so nothing
+  // downstream will widen it for us. A hardcoded ``` around a body carrying
+  // its own ``` earns `can't find end of Pre entity` and a plain-text resend
+  // of the whole message. Width comes from the same shared rule
+  // `renderCodeBlock` uses (`codeFenceFor`, format.ts): `buildPreBlock`
+  // returns `Inline[]` and so cannot route through `renderCodeBlock` (which
+  // takes a `Block`), but the width rule is SHARED, not copied.
+  const fence = codeFenceFor(text);
+  return [
+    mkSeparator(ctx, span.start, span.start),
+    {
+      type: "raw",
+      text: `${fence}${language ?? ""}\n${text}\n${fence}`,
+      ...span,
+    },
+    mkSeparator(ctx, span.end, span.end),
+  ];
 }
 
 function buildFoldedTag(
@@ -522,7 +750,11 @@ function htmlStringToItems(raw: string, base: number, source: string): HtmlFoldI
  *  then apply the raw-HTML tag policy across the whole run (open/close markers
  *  are SIBLING mdast `html` nodes, never a parent, so matching has to happen
  *  at this level). */
-function buildInlines(children: ReadonlyArray<MdastNode>, source: string): Inline[] {
+function buildInlines(
+  children: ReadonlyArray<MdastNode>,
+  source: string,
+  ctx: FoldCtx,
+): Inline[] {
   const items: HtmlFoldItem[] = [];
   let sawHtml = false;
   for (const child of children) {
@@ -532,24 +764,31 @@ function buildInlines(children: ReadonlyArray<MdastNode>, source: string): Inlin
       items.push(...htmlStringToItems(slice(source, child), p.start, source));
       continue;
     }
-    const folded = foldInline(child as PhrasingContent, source);
+    const folded = foldInline(child as PhrasingContent, source, ctx);
     const expanded = folded.type === "plain" ? expandPlainNode(folded, source) : [folded];
     for (const node of expanded) items.push({ kind: "inline", node });
   }
   if (!sawHtml) return items.map((it) => (it as { node: Inline }).node);
-  return foldHtmlItems(items);
+  return foldHtmlItems(items, new Set(), ctx);
 }
 
-function foldInlineChildren(node: MdastParent, source: string): Inline[] {
-  return buildInlines(node.children, source);
+function foldInlineChildren(
+  node: MdastParent,
+  source: string,
+  ctx: FoldCtx,
+): Inline[] {
+  return buildInlines(node.children, source, ctx);
 }
 
 function foldTableRow(
   row: Extract<RootContent, { type: "tableRow" }>,
   source: string,
+  ctx: FoldCtx,
 ): TableRow {
   const cells: TableCell[] = row.children.map((cell) => ({
-    children: buildInlines(cell.children, source),
+    // A table cell is one line on the wire — a `<br>` or a structural degrade
+    // inside it must not emit a newline (it would end the row).
+    children: buildInlines(cell.children, source, { ...ctx, noBreaks: true }),
     ...pos(cell),
   }));
   return { cells, ...pos(row) };
@@ -569,9 +808,10 @@ function foldBlocks(
   nodes: ReadonlyArray<RootContent>,
   source: string,
   expandableLineStarts: Set<number>,
+  ctx: FoldCtx,
 ): Block[] {
   return nodes
-    .map((n) => foldBlock(n, source, expandableLineStarts))
+    .map((n) => foldBlock(n, source, expandableLineStarts, ctx))
     .filter((b) => !isEmptyBlock(b));
 }
 
@@ -579,15 +819,18 @@ function foldBlock(
   node: RootContent,
   source: string,
   expandableLineStarts: Set<number>,
+  ctx: FoldCtx,
 ): Block {
   switch (node.type) {
     case "paragraph":
-      return { type: "paragraph", children: foldInlineChildren(node, source), ...pos(node) };
+      return { type: "paragraph", children: foldInlineChildren(node, source, ctx), ...pos(node) };
     case "heading":
       return {
         type: "heading",
         level: node.depth,
-        children: foldInlineChildren(node, source),
+        // A heading is a single `#…` LINE: an embedded newline would end the
+        // block and orphan the rest of the text (`# a<br>b`).
+        children: foldInlineChildren(node, source, { ...ctx, noBreaks: true }),
         ...pos(node),
       };
     case "blockquote": {
@@ -597,7 +840,7 @@ function foldBlock(
       const expandable = expandableLineStarts.has(lineStart(source, p.start));
       return {
         type: "blockquote",
-        children: foldBlocks(node.children, source, expandableLineStarts),
+        children: foldBlocks(node.children, source, expandableLineStarts, ctx),
         expandable,
         ...p,
       };
@@ -611,7 +854,7 @@ function foldBlock(
       };
     case "list": {
       const items: ListItem[] = node.children.map((li) => ({
-        children: foldBlocks(li.children, source, expandableLineStarts),
+        children: foldBlocks(li.children, source, expandableLineStarts, ctx),
         checked: li.checked ?? null,
         // mdast `listItem.spread`: whether this item's block children are
         // separated by a blank line. Tight (false) keeps a paragraph and its
@@ -636,8 +879,8 @@ function foldBlock(
       const [headerRow, ...bodyRows] = rows;
       return {
         type: "table",
-        header: foldTableRow(headerRow, source),
-        rows: bodyRows.map((r) => foldTableRow(r, source)),
+        header: foldTableRow(headerRow, source, ctx),
+        rows: bodyRows.map((r) => foldTableRow(r, source, ctx)),
         align: (node.align ?? []).map(foldAlign),
         ...pos(node),
       };
@@ -664,7 +907,11 @@ function foldBlock(
       const p = pos(node);
       return {
         type: "paragraph",
-        children: foldHtmlItems(htmlStringToItems(slice(source, node), p.start, source)),
+        children: foldHtmlItems(
+          htmlStringToItems(slice(source, node), p.start, source),
+          new Set(),
+          ctx,
+        ),
         ...p,
       };
     }
@@ -692,6 +939,33 @@ export function parse(markdown: string): Document {
     mdastExtensions: [gfmFromMarkdown()],
   });
   return {
-    blocks: foldBlocks(tree.children, markdown, expandableLineStarts),
+    blocks: foldBlocks(tree.children, markdown, expandableLineStarts, {
+      matched: matchedTagOffsets(collectHtmlTokens(tree.children, markdown)),
+    }),
   };
+}
+
+/** Every HTML token in the tree, in document order, for the balance pass.
+ *  Walks mdast `html` nodes only — a tag inside a code fence or a code span is
+ *  not markup and must not balance anything. */
+function collectHtmlTokens(
+  nodes: ReadonlyArray<MdastNode>,
+  source: string,
+): { tag: HtmlTagInfo; start: number }[] {
+  const out: { tag: HtmlTagInfo; start: number }[] = [];
+  const walk = (list: ReadonlyArray<MdastNode>): void => {
+    for (const node of list) {
+      if (node.type === "html") {
+        const p = pos(node);
+        for (const piece of tokenizeHtml(slice(source, node), p.start)) {
+          if (piece.kind === "tag") out.push({ tag: piece.tag, start: piece.start });
+        }
+        continue;
+      }
+      const children = (node as MdastParent).children;
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(nodes);
+  return out;
 }

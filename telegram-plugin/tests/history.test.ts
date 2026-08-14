@@ -546,6 +546,84 @@ describe('hasOutboundDeliveredSince', () => {
       expect(hasOutboundDeliveredSince('-100', openedAt, 6, 1)).toBe(false)
     })
   })
+
+  // #4681 — the optional UPPER bound. The obligation escalate branch's reroute
+  // fallback is licensed by an `EXPLICIT_OVERRIDDEN` record, which is evidence
+  // about ONE instant; an open-ended forward query lets unrelated traffic in the
+  // routed topic, arriving arbitrarily later, read as that record's answer and
+  // close a genuinely unanswered obligation in silence.
+  describe('untilMs parameter (the reroute fallback upper bound)', () => {
+    it('omitted, the query stays open-ended forward (pre-existing behaviour)', () => {
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: null,
+        message_ids: [10],
+        texts: [SUBSTANTIVE],
+        ts: 1_090_000, // 90_000s later
+      })
+      expect(hasOutboundDeliveredSince('-100', openedAt)).toBe(true)
+    })
+
+    it('excludes a row delivered AFTER the bound', () => {
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: null,
+        message_ids: [10],
+        texts: [SUBSTANTIVE],
+        ts: 1_000_090, // 90s after the lower bound
+      })
+      // Inside an 18.5s window it cannot be this record's answer.
+      expect(hasOutboundDeliveredSince('-100', openedAt, undefined, 200, openedAt + 18_500)).toBe(
+        false,
+      )
+    })
+
+    it('includes a row inside the bound, and the boundary second itself', () => {
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: null,
+        message_ids: [10],
+        texts: [SUBSTANTIVE],
+        ts: 1_000_018, // 18s after — inside an 18.5s window
+      })
+      expect(hasOutboundDeliveredSince('-100', openedAt, undefined, 200, openedAt + 18_500)).toBe(
+        true,
+      )
+      // The bound is CEILed to whole seconds, so a row written in the second the
+      // bound falls inside is admitted — rounding never drops a real answer.
+      expect(hasOutboundDeliveredSince('-100', openedAt, undefined, 200, openedAt + 17_600)).toBe(
+        true,
+      )
+    })
+
+    it('composes with the thread filter (parameter binding order)', () => {
+      // The `ts <= ?` placeholder is appended BEFORE `thread_id = ?`; if the two
+      // params were pushed in the wrong order the thread id would land in the
+      // timestamp comparison and this would silently misbehave.
+      const openedAt = 1_000_000 * 1000
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: 5,
+        message_ids: [10],
+        texts: [SUBSTANTIVE],
+        ts: 1_000_010,
+      })
+      recordOutbound({
+        chat_id: '-100',
+        thread_id: 6,
+        message_ids: [11],
+        texts: [SUBSTANTIVE],
+        ts: 1_000_090,
+      })
+      const until = openedAt + 18_500
+      expect(hasOutboundDeliveredSince('-100', openedAt, 5, 200, until)).toBe(true)
+      expect(hasOutboundDeliveredSince('-100', openedAt, 6, 200, until)).toBe(false) // too late
+      expect(hasOutboundDeliveredSince('-100', openedAt, 6, 200)).toBe(true) // unbounded finds it
+    })
+  })
 })
 
 // Review finding H5 regression: the original PRIMARY KEY (chat_id, thread_id, message_id) does

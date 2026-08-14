@@ -131,18 +131,48 @@ function syncIssue(
     deps.log(`fleet-health: gh issue edit #${num} failed: ${upd.stderr}`);
   }
 
-  if (iss.status === "closed") {
-    const c = deps.run([
+  // #4682 B1 — a CLOSED GitHub issue whose defect came back. `gh issue edit`
+  // above refreshed its body and left it closed, so without an explicit reopen
+  // the board would keep saying "fixed" while the sensor finds the defect every
+  // night — a permanent lie, and the one failure this ledger exists to prevent.
+  if (iss.reopened) {
+    const r = deps.run([
       "issue",
-      "close",
+      "reopen",
       num,
       "-R",
       repo,
       "--comment",
-      `Verified count-drop (frequency ${iss.frequency} ≤ resolved threshold). Closed by the Fleet Health sensor.`,
+      `Reopened by the Fleet Health sensor: this defect is back (frequency ${iss.frequency}` +
+        ` in the current scan window). The earlier close was not a durable fix.`,
     ]);
-    if (c.ok) deps.log(`fleet-health: closed GH #${num} (count-drop) for ${iss.dedup_key}`);
-    else deps.log(`fleet-health: gh issue close #${num} failed: ${c.stderr}`);
+    if (r.ok) deps.log(`fleet-health: reopened GH #${num} for ${iss.dedup_key}`);
+    else deps.log(`fleet-health: gh issue reopen #${num} failed: ${r.stderr}`);
+    return;
+  }
+
+  if (iss.status === "closed") {
+    // WHY it closed decides what we are allowed to claim. `reclassified` means
+    // the findings moved to a SIBLING signature — the same alarm re-sorted by
+    // its outcome — so the count is genuinely zero here but nobody fixed
+    // anything. Saying "Verified count-drop" there is the success-theater
+    // inversion this sensor exists to catch, so the comment names the
+    // reclassification and points at where the evidence went instead.
+    const reclassified = iss.close_reason === "reclassified";
+    const comment = reclassified
+      ? `No occurrences in the current scan window because these findings were` +
+        ` RECLASSIFIED into ${(iss.reclassified_into ?? []).join(", ")} — the same` +
+        ` detected condition re-sorted by its outcome. This is NOT a verified fix;` +
+        ` the evidence now lives on the sibling issue. Closed by the Fleet Health sensor.`
+      : `Verified count-drop (frequency ${iss.frequency} ≤ resolved threshold).` +
+        ` Closed by the Fleet Health sensor.`;
+    const c = deps.run(["issue", "close", num, "-R", repo, "--comment", comment]);
+    if (c.ok) {
+      deps.log(
+        `fleet-health: closed GH #${num} (${reclassified ? "reclassified" : "count-drop"})` +
+          ` for ${iss.dedup_key}`,
+      );
+    } else deps.log(`fleet-health: gh issue close #${num} failed: ${c.stderr}`);
   }
 }
 

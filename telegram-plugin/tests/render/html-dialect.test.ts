@@ -167,9 +167,12 @@ describe("markdown-equivalent HTML tags fold to native constructs (defect 3)", (
     );
   });
 
-  it("drops an unmatched open or close marker but keeps the text", () => {
-    expect(renderOutbound("<b>dangling").text).toBe("dangling");
-    expect(renderOutbound("dangling</b>").text).toBe("dangling");
+  it("keeps an unmatched open or close marker as escaped literal text", () => {
+    // An unmatched marker delimits nothing, so it is PROSE, not markup —
+    // deleting it silently mangles the author's sentence. Entity-escaped so
+    // the wire still cannot read it as an unsupported start tag.
+    expect(renderOutbound("<b>dangling").text).toBe("&lt;b&gt;dangling");
+    expect(renderOutbound("dangling</b>").text).toBe("dangling&lt;/b&gt;");
   });
 
   it("turns `<br>` into a GFM HARD break rather than deleting it", () => {

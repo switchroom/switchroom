@@ -196,7 +196,30 @@ assert 'lˈid' in lm and 'lˈɛd' not in lm, ('lead KNOWN GAP (#4270) closed? me
 print('misaki G2P heteronym guard OK:', lv, '|', la, '|', rp, '|', rd); \
 print('KNOWN GAP (#4270): lead metal sense still lˈid (should be lˈɛd) — misaki lexicon lacks a POS-keyed entry:', lm)"
 
+# server.py imports text_normalize (Stage B token normalisation) as a sibling
+# module and reads overrides.json from the same directory, so all three ship
+# together. A missing text_normalize degrades to raw-token speech (server.py
+# guards the import) — the guard below makes that impossible to ship unnoticed.
 COPY docker/voice-sidecar/server.py /opt/voice-sidecar/server.py
+COPY docker/voice-sidecar/text_normalize.py /opt/voice-sidecar/text_normalize.py
+COPY docker/voice-sidecar/overrides.json /opt/voice-sidecar/overrides.json
+
+# Build-time OUTCOME guard for Stage B: proves the normaliser imports (with its
+# num2words dependency), actually rewrites tokens, is idempotent, and — the
+# load-bearing one — that EVERY phoneme in overrides.json is inside Kokoro's
+# vocabulary. An out-of-vocab symbol is dropped SILENTLY by kokoro-onnx's
+# tokenizer, so an unvalidated table deletes whole words from the audio. This
+# is the cheapest place to notice.
+RUN cd /opt/voice-sidecar && python3 -c "\
+import text_normalize as tn; \
+from kokoro_onnx.config import DEFAULT_VOCAB; \
+out = tn.normalize('90s timeout, 16 m frontage, #4661'); \
+assert out == 'ninety seconds timeout, sixteen metres frontage, hash 4661', out; \
+assert tn.normalize(out) == out, ('not idempotent', out, tn.normalize(out)); \
+ok, bad = tn.load_overrides(vocab=DEFAULT_VOCAB.keys()); \
+assert not bad, ('overrides.json rejected entries', bad); \
+assert len(ok) >= 1, 'overrides.json loaded empty'; \
+print('Stage B guard OK:', len(ok), 'overrides |', out)"
 
 # Pre-create the model-cache dir owned by the runtime uid BEFORE the VOLUME
 # instruction. Docker initializes a fresh named volume from the ownership of

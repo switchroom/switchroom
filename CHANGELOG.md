@@ -17,6 +17,321 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **an obligation ESCALATION no longer nags on top of an answer the user
+  already received.** The escalate branch of the obligation sweep sends a
+  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
+  staleness check that is supposed to stand it down when the agent has already
+  answered. Two mechanisms let that check miss a delivered answer, and both fired
+  together on the two confirmed 2026-08-10 incidents. First it was keyed on the
+  obligation's *thread*, while the model can name a topic on its `reply` and have
+  the framework's topic authority override it — the router logs exactly that,
+  `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — so the answer is written to history
+  under a thread the check never queries (06:36:07.921
+  `EXPLICIT_OVERRIDDEN(model→4,routed→635)` for an obligation in thread 4, nag
+  126ms later; 07:52 the same shape with the answer routed to the chat root).
+  Second it is a point-in-time read, and the answer is often still *in flight* at
+  the instant the sweep decides — the reply tool has been invoked but no history
+  row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
+  07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
+  and adds a fallback to *only* the thread the router RECORDED an answer
+  addressed to this obligation's topic as having been routed to (new
+  `answer-route-overrides.ts`), reading history **only across that record's own
+  instant plus the match window** — bounded at *both* ends, so a delivery in the
+  routed topic can be paired with the record neither before it nor minutes after
+  it — and only while the record is itself **fresh** (settle window + two sweep
+  ticks = 18.5s at the default); and a new settle gate requires the "unanswered"
+  read to hold across an 8.5s window — derived as 3× the worst observed
+  decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
+  tick so a re-check actually runs — before the nudge goes out. All three
+  narrowings on the fallback are load-bearing, and each has a field
+  counter-example: a chat-wide "did anything long land in this chat" query has no
+  relationship to the obligation at all; an override-gated query cut at
+  `openedAt` is the same defect wearing a gate — on 2026-08-13 obligation
+  `…:4#5462` (thread 4, opened 03:50:02.807, escalated 04:03:06.140) it pairs a
+  stale `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an
+  unrelated 295-char delivery in thread 3 at 04:02:51.987 — a *different*
+  question's answer, 594.8s later — and closes a genuinely unanswered message in
+  silence; and an override-gated query cut at the record's own instant but left
+  *open-ended forward* is that same defect reached from the other side, because
+  freshness is judged at the first "unanswered" read while the history row is
+  read at the re-check, and the sweep can be starved for minutes in between (a
+  short reply rerouted to topic M at T+0 leaves the obligation correctly open,
+  an unrelated ≥200-char answer lands in M at T+90, and the sweep that finally
+  runs at T+107 closes the obligation `via=reroute`). That is the defect
+  `turn-flush-suppression.ts` was written to close, and the 2026-08-13 case
+  escalates correctly pre-fix, so either would have been a regression. Residual,
+  stated plainly: inside `[record, record + window]` the fallback still cannot
+  tell the rerouted answer from a second ≥200-char delivery landing in the same
+  thread in those few seconds — the override carries no message id. That interval
+  is fixed by the record's own timestamp, so a starved sweep cannot widen it.
+  Both guards stay bounded: a genuinely unanswered obligation still escalates one
+  settle window later (the 2026-08-12 case, whose real answer was 41s away, is
+  unaffected), and both windows are clamped so a config typo cannot silently
+  widen them. The freshness window is measured back from the settle gate's own
+  *first* "unanswered" read, not from whenever the re-check runs — the sweep's
+  earlier gates can skip ticks outright for minutes, and anchoring at the
+  re-check would let a starved sweep age a still-fresh record out of the window
+  and nag on top of the answer anyway — which is precisely why the *delivery*
+  needs its own forward bound: that anchor keeps the record readable across the
+  starvation gap, and without an upper bound the query would then reach across
+  the whole of it. Both paths are logged so the fallback is
+  measurable in production without a rebuild: a fallback-scope close logs
+  `via=reroute`, and a record the freshness bound *rejects* logs
+  `reroute record rejected age=…ms window=…ms`. New `escalation-staleness.ts`
+  carries the evidence and the derivation. Each guard has its OWN kill switch —
+  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` disables the settle gate (and only
+  the settle gate), `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the
+  reroute fallback (and only the fallback); set both for the pre-fix behaviour.
+  Both switches read only an explicit `0`: a whitespace-only value (`KEY=" "`,
+  which `Number()` coerces to `0`) is treated as unset, so a stray space in an
+  env file cannot silently turn a guard off.
+
+  The router's `answerRouteOverrides.note(...)` write is the whole premise of the
+  reroute fallback, and it is a side effect no pure module carries — so it is now
+  pinned by a test that drives the real gateway router against the real registry
+  (`answer-route-side-effect.test.ts`). Deleting that one call previously left
+  the entire suite green while silently restoring the nag.
+
+  **Scope:** this fixes the ESCALATE branch only. It narrows the standing
+  duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
+  the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped
+  at both its cutoffs, the #4341 delivery-time backstop in
+  `represent-delivery-guard.ts` forwards that same `threadId` and is therefore
+  cross-topic-blind too, and the represent branch has no settle gate at all, so a
+  re-present can still fire on top of a rerouted or in-flight answer. Tracked in
+  switchroom/switchroom#4700.
+- **gateway: ignore a reply thread anchor from a different chat** — a reply
+  targeting chat A could be anchored to a turn belonging to chat B: the
+  `origin_turn_id` echo lookup is keyed by turn id alone (not chat-scoped), and
+  the LIVE turn is whatever the session happens to be running, which in a
+  multi-chat agent is frequently another chat. When B was a forum supergroup,
+  B's topic id was attached to the send into A and Telegram rejected the call
+  with `400 Bad Request: message thread not found`. A retry fallback resent
+  without a thread, so no answer was lost — but every occurrence was a
+  guaranteed-failed first API call. The drop is enforced at TWO sites, because
+  the two branches resolve the thread through different code and grepping either
+  function name alone shows only half the fix. (1) `resolveAnswerThreadId`
+  (`telegram-plugin/gateway/answer-thread-resolve.ts`) — the default path and
+  the `SWITCHROOM_REPLY_TOPIC_AUTHORITY=0` path both run through it — now DROPS
+  any anchor whose chat id does not match the send target, before the precedence
+  runs; resolution falls through exactly as if the anchor did not exist. (2) The
+  `SWITCHROOM_TURN_ORIGIN_ROUTING=0` legacy branch never calls that resolver —
+  it passes the pinned turn's thread straight to `resolveThreadId` — so the
+  equivalent guard lives inline in `sendReply`
+  (`telegram-plugin/gateway/outbound-send-path.ts`), on the branch that
+  previously passed the live turn's thread through unfiltered. Net effect: the
+  drop is unconditional across BOTH kill switches — a wrong-chat topic id is an
+  API error, not a routing policy a kill switch should be able to reinstate.
+  Both sites, the late-reply recovery tier and the `reply-route` telemetry
+  derive from the SAME exported `isCrossChatAnchor` predicate, so no second copy
+  of the rule can drift and the log can never disagree with what actually
+  routed; the legacy branch emits the same `CROSS_CHAT_ANCHOR_DROPPED` marker
+  through the same `formatReplyRouteLog` formatter, so a kill-switched
+  deployment keeps the audit trail rather than dropping anchors silently.
+  Note that dropping the anchor does not mean "no thread": the legacy branch
+  still falls through to `resolveThreadId`'s chat-scoped last-seen topic, which
+  can only ever yield a topic valid for the target chat. Callers that supply no
+  chat ids are unaffected.
+- **telegram/render: a `<pre>` whose body contained ``` shipped an
+  unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
+  `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
+  delimiter as a `raw` node — verbatim wire passthrough, so nothing downstream
+  widened it — without ever inspecting the body. A `<pre>` carrying its own
+  ``` therefore went to the wire with THREE delimiters instead of two:
+  Telegram opens at the first, closes at the embedded one, and the trailing
+  delimiter opens a fence that never terminates: `can't find end of Pre
+  entity`, a 400, and a plain-text resend of the WHOLE message — the
+  denial-of-formatting outcome that module exists to prevent. (`fa9018a7`
+  escaped the backticks instead: cosmetically worse but wire-correct.)
+  The fence-width rule now has exactly ONE implementation, `codeFenceFor`
+  (`telegram-plugin/format.ts`) — one backtick longer than the longest run in
+  the body — and all three call sites use it: the `<pre>` fold, plus
+  `renderCodeBlock` and `degradeToCodeFence` (`telegram-plugin/render/render.ts`),
+  which each carried their own copy. Pinned by six outcome tests, five of
+  which fail on `6c120cee`, including a property check that the delimiter run
+  appears on exactly two lines and is strictly longer than every run inside.
+  Consolidating also fixed a latent crash both copies shared: the width scan
+  was `Math.max(0, ...runs.map(…))`, one argument per run, which throws
+  `RangeError: Maximum call stack size exceeded` out of the render path once
+  the body carries more backtick runs than the engine's argument limit. That
+  limit is ENGINE-DEPENDENT, so no single number states it: measured by
+  bisection on the pinned toolchain it is 638,621 runs (~1.9 MB) on Bun
+  1.3.13, the shipping runtime, and 125,289 (~375 KB) on Node 22 — the
+  vitest runner. Input is unbounded — `renderOutboundChunks` renders the WHOLE
+  raw body before any chunking (`telegram-plugin/render/rich-render.ts:146`),
+  so the scan is not capped by the 32768-character rich limit — though on Bun
+  a ~1.9 MB single message is an unlikely body, so this was latent there
+  rather than routine. The shared helper loops instead (same O(n), cannot
+  throw), so the fix does not depend on winning that reachability argument.
+  The regression test was raised to 1M runs: at the 200k it started at, the
+  reinstated spread form still PASSES under Bun — the guard asserted nothing
+  in the shipping runtime.
+
+- **fleet-health: a detector must check an alarm's OUTCOME, not just match
+  it.** Two Layer-0 rules matched an alarm and never asked how it ended, so the
+  nightly ledger booked working safety mechanisms as failures.
+  `represent-escalation` was the bare substring `/obligation escalation/`, which
+  five emitter lines carry — including the per-attempt retry line and
+  `obligation-wiring.ts`'s `deferred — bridge down` line, i.e. the guard
+  deliberately *not* escalating while the Telegram bridge is down. Three of 11
+  live hits were that suppression path, all for the same obligation. It now
+  anchors on the two mutually-exclusive TERMINAL outcomes (`delivered + closed`,
+  `PERMANENTLY undeliverable`), the same attempt-vs-outcome fix #3931 made for
+  `reply-delivery-failure`. `orphaned-db-handle` matched the deleted-inode sweep
+  alarm without checking whether the paired recovery followed; an alarm whose
+  own sweep tick reopened `history.db` and left no lane un-recovered is now
+  `orphaned-db-handle-recovered` (drift, severity 1) instead of a severity-3
+  silent-data-loss incident. `registry.db`, an unowned handle, a FAILED reopen,
+  or a tick the detector cannot see in full all keep severity 3 — every
+  narrowing fails *toward* the alarm.
+
+- **fleet-health: gateway findings count affected turns, and a change of
+  counting unit can no longer auto-close a live GitHub issue.** Matched gateway
+  lines sharing an `origin=` turn id now fold into one finding, so ledger
+  `frequency` counts distinct affected turns rather than log lines (`gw_hits`
+  stays a raw line count for the digest). That is a change of *ruler*, and the
+  ledger's count-drop self-verify closes an issue when the number falls: an open
+  `duplicate-delivery-represent` issue at frequency 8 across 3 turns would have
+  collapsed to 3 on the first scan after merge, flipped to
+  `resolved-pending-verify`, and had the sensor comment "Verified count-drop …
+  Closed by the Fleet Health sensor." on a still-broken issue. Each issue now
+  records the `counting_unit` its frequency was measured in, and the writer
+  holds an issue's status for exactly one scan when that unit changes — a real
+  close is delayed by one scan, never suppressed, and reopening still works.
+
+- **fleet-health: the orphaned-DB verdict no longer depends on when the scan
+  ran, and a reclassified issue no longer claims a fix nobody made.** The
+  recovered/unrecovered split used a 12-line lookahead to find its tick
+  boundary, but sweeps are five minutes apart, so the identical alarm+reopen
+  pair booked severity 1 while it sat at the log tail and severity 3 once
+  ordinary traffic accumulated behind it. The two verdicts carry different
+  signatures, so a flip moved the finding to a different dedup_key and emptied
+  the old one — which the writer reads as a drop to zero, closing a live
+  severity-3 issue with "Verified count-drop … Closed by the Fleet Health
+  sensor." The same lookahead also downgraded a real `registry.db` alarm to
+  informational whenever its lane line fell outside the window. The verdict is
+  now derived from the tick's content — the alarm line names every affected
+  lane, and the first sweep line after it is that tick's history-lane outcome —
+  so it no longer moves with log GROWTH. Truncation is a separate problem and
+  is handled separately (next entry): reading the alarm's lane list is only
+  sound if that list is COMPLETE, which the first cut of this fix did not
+  check. Alongside it: a close caused
+  by findings re-sorting into a sibling signature is recorded as
+  `close_reason: "reclassified"` and commented as such rather than as a
+  verified count-drop; an issue whose defect reappears after closing is now
+  reopened on GitHub instead of staying shut forever; the count-drop arm tests
+  `count < prior.frequency` so an issue held across a counting-unit change can
+  still close (previously it could only ever leave the board at zero, i.e.
+  stale-open however much of it got fixed); and the gateway-signal list that
+  drives the counting-unit guard is built from a `Record<GatewaySignal, true>`
+  so a new derived signal is a compile error rather than a signal silently
+  counted in the wrong unit.
+
+- **fleet-health: a TRUNCATED orphaned-DB alarm can no longer launder silent
+  data loss down to informational.** Deriving the verdict from the alarm line's
+  lane list (previous entry) traded position-dependence for total dependence on
+  that one line arriving intact, which is the same bug class on a different
+  path. The emitter writes `DETECTED <n>` and then exactly one `fd=<n> <target>`
+  pair per orphan, so count and list are 1:1 by construction — but the
+  classifier read the pairs and ignored the count. A short or interleaved
+  `write()` on the supervisor's stderr for an alarm line over `PIPE_BUF` —
+  reachable precisely when many handles are orphaned, i.e. the worst incident —
+  drops the tail of the list, and a surviving `history.db` pair then booked
+  severity 1 on a tick that also lost `registry.db`. The sharp case is that the
+  intact `registry.db … rows written since the last checkpoint are LOST.` line
+  was sitting right there in the log and the classifier never looked at it,
+  because it only ever read the FIRST sweep line after the alarm and the
+  registry lane is emitted after the history lane. Severity 1 migrates the
+  finding's `dedup_key`, empties the severity-3 key, and drives close-on-zero —
+  a real unrecoverable loss closed as fixed. Two guards now: the lane list is
+  cross-checked against the alarm's own count and an incomplete list fails
+  toward the alarm; and a registry/unowned lane line anywhere between an alarm
+  and the NEXT alarm vetoes a recovery outright, restoring the veto the first
+  cut deleted without restoring its line-count window (the scan is bounded by
+  the log's content, so no position-dependence returns). The sticky
+  closed-history and FAILED-reopen lines are deliberately NOT vetoes: both also
+  fire from the no-alarm retry path, so vetoing on them would let a later,
+  unrelated tick flip an earlier recovered verdict — the exact dependence the
+  previous entry removed. Also: the `Record<GatewaySignal, true>` exhaustiveness
+  guard's test was tautological — every runtime view of that set is derived from
+  the same constant, so it passed against the very hand-written array it was
+  filed about; it now asserts against an independently written list, with `tsc`
+  named as the real guarantee. And the RFC now states the ledger reopen path's
+  one-scan durability window, which was true in code and documented nowhere.
+
+## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
+
+### Bug fixes
+
+- **voice: TTS chunks on phoneme length, not characters — long messages stop
+  failing** (#4695) — the sidecar split text into ≤ `VOICE_TTS_MAX_CHARS`
+  (1200) pieces and handed each to kokoro-onnx, but kokoro synthesizes in
+  *phonemes* and cannot take more than `MAX_PHONEME_LENGTH` = 510 in one batch
+  (`kokoro_onnx/__init__.py:97-101`, verified against the 0.5.0 wheel in the
+  running image). Kokoro does pre-batch a long phoneme string, but only on
+  `.,!?;`, so any punctuation-free run over 510 phonemes overflowed. The
+  overflow is worse than the documented truncation: two lines after the slice,
+  `voice = voice[len(tokens)]` indexes a 510-row array with 510 and **raises**,
+  so the whole `/tts` request 500s and the user gets **no voice message at
+  all** — reproduced live against the real model
+  (`IndexError: index 510 is out of bounds for axis 0 with size 510`).
+  Measured over a 1,679-message production corpus through real misaki:
+  **16 over-limit batches — all 16 hitting the raise, not a partial read —
+  across 15 messages (0.9%)**, worst batch 1,545 phonemes. On the worst
+  message, before: request fails, 0s of audio; after: **159.3s of complete
+  audio**.
+  `docker/voice-sidecar/server.py` now splits the phoneme string itself
+  (`_split_phonemes`, capped by the new `VOICE_TTS_MAX_PHONEMES`, default 500)
+  and hands Kokoro one already-safe batch at a time; the split is lossless by
+  construction — an over-long run is *carried* into the next batch rather than
+  discarded. Same corpus after: **0 over-limit batches, 0 phonemes lost**, at a
+  cost of 6320 → 6412 synthesis batches (+1.5%). The espeak path
+  (`VOICE_TTS_G2P=espeak`, non-English locales) is phonemized through Kokoro's
+  own tokenizer so it is chunked the same way. Characters remain the coarse
+  pass, so `VOICE_TTS_MAX_CHARS` keeps its meaning but is no longer
+  load-bearing for correctness. Both residual degradation paths — a mid-word
+  seam in an unbreakable run, and a piece nothing could phonemize — are now
+  counted into the `/tts` response meta (`hardCuts`, `unchunkedPieces`) and
+  logged at WARNING volume to the sidecar's stderr, so the failure mode stops
+  being invisible. `VOICE_TTS_MAX_PHONEMES` is clamped to `[1, 508]` (508 is
+  the highest safe value — kokoro flushes a batch at `>=` 510), and an
+  out-of-range setting is warned about at startup rather than clamped
+  silently.
+
+- **telegram/render: the raw-HTML fold deleted prose, not just markup** —
+  #4691 (merged, unreleased) degraded every HTML token it could not fold or
+  pass through by DELETING it. That is right for markup and catastrophic for
+  prose: `Use the <service>/<key> convention`, `switchroom vault get <key>`,
+  `/host-home/.switchroom/logs/<agent>/` and "the `<b>` tag" all shipped with
+  the placeholders silently gone. The discriminator is now MATCHING rather
+  than the tag name — a balanced pair is markup (drop the markup, keep the
+  content), an UNMATCHED marker is prose and survives as literal text with
+  `&`/`<`/`>` HTML-entity-escaped, which Bot API Rich HTML documents as
+  supported named entities, so content is kept without risking the
+  `unsupported start tag` 400. Also in this pass:
+  `<pre>`/`<pre><code class="language-…">` now folds to a real fenced block
+  (it previously became an inline code span wrapping a newline, which
+  Telegram will not parse) and degrades to an inline span only where a fence
+  cannot survive (heading, table cell); structural tags (`<li>`, `<p>`,
+  `<div>`, `<td>`, …) leave a hard line break so
+  `<ul><li>one</li><li>two</li></ul>` no longer glues into `onetwo`; the
+  wire-verified passthrough allowlist (`<u>`, `<sub>`, `<details>`, …) is now
+  balance-checked document-wide before being emitted raw, closing the
+  unbalanced-`<u>` path to the exact `unclosed start tag` 400 the module
+  exists to prevent (whose fallback resends the whole message as PLAIN text);
+  `<br>` inside a heading or table cell degrades to a space instead of
+  breaking the block; a nested `<a>`'s href is kept as literal text instead
+  of being silently dropped; and `escapeLinkHref` percent-encodes ASCII
+  whitespace/control characters, which a backslash cannot rescue because a
+  bare link destination ends at the first whitespace byte.
+  `html-fold.ts`'s content-loss invariant is restated accurately and now names
+  its residuals (a `<` mdast hands over as a TEXT node never reaches this
+  module; a BALANCED pair of prose angle brackets is dropped as markup, the
+  accepted cost of the matching discriminator). Pinned by outcome tests in
+  `telegram-plugin/tests/render/html-dialect-content-loss.test.ts` — of the 37
+  now in that file, 29 fail on `fa9018a7` and 8 are guards that pass on both
+  revisions.
+
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
   (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)
@@ -75,6 +390,36 @@ now an anomaly worth investigating, not the norm.
   intentionally NOT enabled in any deployed config by this change, and a dated follow-up
   issue (switchroom/switchroom#4690) tracks disabling/removing the flag once the 7-day
   capture window closes.
+
+### Features
+
+- **Spoken-form token normalisation moved next to the phonemizer (Stage B)** —
+  the voice sidecar now owns how a token is *pronounced*, in one place:
+  `docker/voice-sidecar/text_normalize.py`. The gateway's two TTS passes had
+  drifted into contradicting each other — one read a bare `m` as "minutes", the
+  other as "metres", and whichever ran last won — with no single place to fix a
+  mispronunciation and nothing covering callers that hit `POST /tts` directly.
+  Stage B runs immediately before the text is split for synthesis and covers
+  units (`90s` → "ninety seconds", glued `m` = minutes / spaced `m` = metres),
+  dates and ISO timestamps, clock times, currency including the `A$7.46` glue
+  that used to say "Aseven dollars", magnitudes, ordinals, `#4661` → "hash
+  4661", acronyms and all-caps lowering, and identifier shapes (file:line,
+  dotted quads, versions, git hashes, snake/camel case). Two contracts are
+  enforced rather than asserted in a comment: the output never contains a digit
+  glued to a letter (the shape that makes misaki spell garbage), and
+  normalising twice equals normalising once — both are gated by
+  `tools/replay_corpus.py` over a captured production corpus, which found eight
+  defects the unit tests had missed. `VOICE_TTS_NORMALIZE=0` is a
+  byte-identical passthrough kill switch. **Gateway behaviour is unchanged by
+  this release** — the legacy passes still run and are removed in a later
+  change.
+- **Pronunciation override table for the TTS path** — `overrides.json` fixes
+  names misaki gets wrong (Postgres, PostgreSQL, Redis, kokoro, misaki, `Aug`,
+  cuda, async, dotenv, systemd, vite). Every entry was verified by an actual
+  phonemizer run and is validated against Kokoro's vocab at load: an entry
+  whose phonemes the model cannot represent is rejected and logged rather than
+  silently mangling an utterance, and `/healthz` reports the active and
+  rejected counts.
 
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 

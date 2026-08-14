@@ -152,6 +152,11 @@ jobs:
       - name: Run vendored plugin tests (pytest)
         working-directory: vendor/hindsight-memory
         run: python3 -m pytest tests/ -q
+      # Kept in step with ci-tests-python.yml: Stage B token normalisation
+      # (docker/voice-sidecar/text_normalize.py) needs num2words, pinned to
+      # the version Dockerfile.voice installs.
+      - name: Install num2words (voice-sidecar Stage B dependency)
+        run: pip install -q "num2words==0.5.14"
       - name: Run voice-sidecar unittests
         working-directory: docker/voice-sidecar
         run: python3 -m unittest discover -s . -p 'test_*.py'
