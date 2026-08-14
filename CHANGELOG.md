@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.11 — obligation escalations stop nagging over a delivered answer, fleet-health detectors stop laundering silent passes as green, and long messages stop breaking TTS
+
 ### Tooling
 
 - **`lint` now rejects any unsanctioned Telegram `-100…` chat id in the tree.**
