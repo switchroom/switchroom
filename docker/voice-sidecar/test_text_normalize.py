@@ -434,8 +434,28 @@ class CorpusReplayRegressionTests(NormalizeCaseMixin, unittest.TestCase):
 
     def test_a_range_shares_its_unit(self) -> None:
         # "4-5 min" used to come out half-spoken as "4-five minutes".
+        # Reachable TODAY only from a direct POST /tts caller: the legacy
+        # gateway pass 2 rewrites the same string to "4-five minutes" before
+        # Stage B ever sees it, so this is the shape that arrives once PR-4
+        # deletes that pass. Both readings are safe; only this one is spoken.
         self.assertSpoken("4-5 min", "four to five minutes")
         self.assertSpoken("takes 10-15 min", "takes ten to fifteen minutes")
+        # The pass-2-mangled form is left alone rather than half-rewritten —
+        # a rule for it would be dead code the day PR-4 lands.
+        self.assertSpoken("takes 4-five minutes", "takes 4-five minutes")
+
+    def test_a_pathological_number_cannot_crash_the_normaliser(self) -> None:
+        # num2words raises OverflowError past 10**306. server.py's try/except
+        # contains it, but a normalise fault silently degrades the whole
+        # utterance to raw tokens, so the guard belongs here.
+        huge = "9" * 400
+        self.assertSpoken(f"v{huge}.2.3", f"v{huge}.2.3")
+        self.assertEqual(normalize(f"build {huge}"), "build " + " ".join(["nine"] * 400))
+        self.assertTrue(tn._cardinal(huge).startswith("nine nine"))
+        self.assertEqual(
+            tn._cardinal("1" + "0" * 400 + ".5").split()[-2:],
+            ["point", "five"],
+        )
 
     def test_short_numbers_inside_an_identifier_are_counts(self) -> None:
         self.assertSpoken("Snapshot_10", "Snapshot ten")
@@ -461,6 +481,14 @@ class PropertyTests(unittest.TestCase):
         # production corpus has (the corpus itself is real chat text and stays
         # out of the repo — point tools/replay_corpus.py at a capture for the
         # full run). Properties hold over both sets.
+        #
+        # The fixture is written in DIRECT-CALLER shapes: raw text as a
+        # `POST /tts` client sends it, which is exactly what Stage B's
+        # byte-preserving boundary promises to accept. Until PR-4 deletes the
+        # legacy gateway passes, a Telegram message reaches Stage B as
+        # pass2(pass1(x)) instead — a strictly EASIER input, since pass 2 has
+        # already spoken many of these tokens. Both distributions are replayed
+        # (see the PR body); this file pins the harder one.
         open(os.path.join(HERE, "replay-fixture.json"), encoding="utf-8")
     )
 

@@ -144,6 +144,13 @@ def _us(words: str) -> str:
     return words.replace(", ", " ").replace(" and ", " ")
 
 
+# num2words raises OverflowError above 10**306. Nothing that reaches speech is
+# ever that long, so this is a crash guard, not a feature: past the limit we
+# read the digits out instead. Kept BELOW the library ceiling so it cannot
+# change the output of any number num2words can already handle.
+_CARDINAL_MAX_DIGITS = 300
+
+
 def _cardinal(value: str | int | float) -> str:
     """Spoken cardinal. Accepts an int, a float, or a numeric string.
 
@@ -155,11 +162,15 @@ def _cardinal(value: str | int | float) -> str:
         text = value.strip().replace(",", "")
         if "." in text:
             whole, _, frac = text.partition(".")
+            if len(whole) > _CARDINAL_MAX_DIGITS:
+                return _spell_out_number(text)
             whole_words = _us(num2words(int(whole or "0")))
             frac_words = " ".join(_DIGIT_WORDS.get(c, c) for c in frac)
             if not frac:
                 return whole_words
             return f"{whole_words} point {frac_words}"
+        if len(text.lstrip("-")) > _CARDINAL_MAX_DIGITS:
+            return _spell_out_number(text)
         return _us(num2words(int(text)))
     if isinstance(value, float) and not value.is_integer():
         return _cardinal(repr(value))
@@ -173,6 +184,20 @@ def _ordinal(value: int) -> str:
 def _digits(text: str) -> str:
     """Per-digit reading: "4661" → "four six six one"."""
     return " ".join(_DIGIT_WORDS.get(c, c) for c in text if c.isdigit())
+
+
+def _spell_out_number(text: str) -> str:
+    """Per-digit reading that keeps `.` and `-` speakable. Crash-guard path
+    for numbers past num2words' ceiling — never reached by real speech."""
+    words = []
+    for ch in text:
+        if ch.isdigit():
+            words.append(_DIGIT_WORDS.get(ch, ch))
+        elif ch == ".":
+            words.append("point")
+        elif ch == "-":
+            words.append("minus")
+    return " ".join(words)
 
 
 def _year_words(year: int) -> str:
@@ -407,7 +432,14 @@ def _unpark_spans(text: str, parked: List[str]) -> str:
 
 _URL_RE = re.compile(r"\bhttps?://\S+|\bwww\.[^\s<>]+", re.IGNORECASE)
 _DOTTED_QUAD_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{2,5}))?(?![\w.])")
-_VERSION_RE = re.compile(r"(?<![\w.])(v?)(\d+(?:\.\d+){2,})(?![\w.])", re.IGNORECASE)
+# Each SEGMENT is bounded (`{1,9}`) like every other numeric rule here: an
+# unbounded `\d+` fed a 307-digit segment straight into num2words, which raises
+# OverflowError past 10**306. The segment COUNT stays unbounded — that was
+# never the risk, and capping it would stop reading long dotted versions. Over
+# the per-segment bound the token isn't a version and falls through unchanged.
+_VERSION_RE = re.compile(
+    r"(?<![\w.])(v?)(\d{1,9}(?:\.\d{1,9}){2,})(?![\w.])", re.IGNORECASE
+)
 # The lookbehind excludes `.` but NOT `/`: a path-qualified file still
 # deserves the "file dot ext, line N" reading, and blocking on `/` meant
 # `tui_gateway/methods_session.py:14` fell through to the snake rule,

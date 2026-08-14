@@ -13,7 +13,7 @@
   "Commit 1b8d00b landed after 6694eb63; run wf_2f0e6072-af3 for the rest.",
   "Set HINDSIGHT_API_EMBEDDINGS_* and grep ^VOICE_ to see what the sidecar reads.",
   "The helper is get_recent_messages and the field is crossSessionInbound.",
-  "Takes 4-5 min, sometimes 10-15 min when the queue is cold.",
+  "Takes 4-five minutes, sometimes 10-fifteen minutes when the queue is cold.",
   "Snapshot_10 is the good one; run_2 is the rerun.",
   "Subdivision Act 1988 s.35 says the plan states it, under s.35(3)(c).",
   "Back in the 90s, the 1990s specifically, before the 2000s.",
