@@ -77,6 +77,25 @@ const REGULAR_IMAGE = `switchroom-tz-regular:${RUN_ID}`;
 const PRISTINE_UTC = "PRISTINE-ETC-UTC";
 const LOCAL_ZONE = "LOCAL-ZONE-BYTES";
 
+/**
+ * Timeout for every test below that shells out to `docker build` / `docker
+ * run`. These drive a real daemon, so vitest's 5000ms default does not apply.
+ *
+ * Not a blanket hedge against slowness: 5000ms is measurably ON the line for
+ * the FIRST e2e test in this file, which pays the runner's one-off BuildKit
+ * builder warm-up that every later build skips. Two observed CI failures, both
+ * this file's first e2e test, both a hair over the default, and both followed
+ * by a sibling doing identical work in a fraction of the time:
+ *
+ *   run 31659633813 (main @ 4ae73296)         6063ms → FAIL, sibling  942ms
+ *   run 31675696938 (ci/vacuous-test-guard)   5825ms → FAIL, sibling 1352ms
+ *
+ * BASE is already pulled at collection time (see `DOCKER` below), so the pull
+ * is not the variable — the warm-up is. 30s matches the idiom the other docker
+ * suites here use (hindsight-entrypoint.test.ts:162).
+ */
+const DOCKER_TEST_TIMEOUT_MS = 30_000;
+
 function hasDocker(): boolean {
   try {
     execSync("docker version --format '{{.Server.Version}}'", {
@@ -236,7 +255,7 @@ describe.skipIf(!DOCKER)(
       } finally {
         teardown();
       }
-    });
+    }, DOCKER_TEST_TIMEOUT_MS);
 
     it("mounting onto a REGULAR-FILE /etc/localtime leaves Etc/UTC pristine (the fix)", () => {
       setup();
@@ -256,7 +275,7 @@ describe.skipIf(!DOCKER)(
       } finally {
         teardown();
       }
-    });
+    }, DOCKER_TEST_TIMEOUT_MS);
   },
 );
 
@@ -275,7 +294,7 @@ describe.skipIf(!DOCKER || !hasImage(AGENT_IMAGE))(
         { encoding: "utf8" },
       );
       expect(r.status).toBe(0);
-    });
+    }, DOCKER_TEST_TIMEOUT_MS);
 
     it("keeps Etc/UTC at a zero offset with a non-UTC zone mounted on /etc/localtime", (ctx) => {
       // Skip on an exotic runner with no tzdata for the probe zone.
@@ -305,6 +324,6 @@ describe.skipIf(!DOCKER || !hasImage(AGENT_IMAGE))(
       expect(r.status).toBe(0);
       // Pre-fix this printed "36000 36000" (Melbourne) instead of "0 0".
       expect(r.stdout.trim()).toBe("0 0");
-    });
+    }, DOCKER_TEST_TIMEOUT_MS);
   },
 );
