@@ -157,18 +157,12 @@ now an anomaly worth investigating, not the norm.
   merge printed a cheerful OK. Deliberate old-section edits opt out with
   `[changelog placement ok]` on its own line. Four things the parser now gets
   right, each of which otherwise turns the new rule into a false FAIL or a
-  silent miss: (1) **fenced code is masked** before sections are parsed — this
-  changelog pastes CI transcripts verbatim and already carries 30+ fence
-  markers, and a fenced line reading `## v9.9.9 — sample output` used to become
-  a phantom released section, which would then have red-flagged EVERY later PR
-  appending to the end of `## Unreleased`, repo-wide, until the code block was
-  deleted — fences and HTML comments are masked in ONE interleaved CommonMark
-  pass, because whichever construct opens first swallows the other: masking
-  comments first let an unterminated `<!--` *inside* a fence pair with any `-->`
-  later in prose, blanking the fence's own closing delimiter, so the fence ran to
-  EOF, every heading below it vanished and the guard reported OK over a genuinely
-  buried entry; a fence left genuinely unclosed at EOF is CommonMark-correct but
-  now WARNs, since it blinds the placement rule to everything past it; (2) on a
+  silent miss: (1) **block structure is parsed, not scanned** — this changelog
+  pastes CI transcripts verbatim and already carries 30+ fence markers, and a
+  fenced line reading `## v9.9.9 — sample output` used to become a phantom
+  released section, which would then have red-flagged EVERY later PR appending
+  to the end of `## Unreleased`, repo-wide, until the code block was deleted;
+  (2) on a
   queue ref `$CHANGELOG_BASE` is **authoritative, with no
   `origin/main` fallback**, and both UNSET and set-but-unresolvable FAIL —
   previously the cascade always rescued it (on a `fetch-depth: 0` checkout
@@ -179,88 +173,58 @@ now an anomaly worth investigating, not the norm.
   heading (a typo fix) no longer blanket-exempts that whole section — newness
   keys on the section's version token, not on the heading line changing. A
   changelog with no `## Unreleased` section at all now gets a message that says
-  so, instead of the inapplicable post-release-merge story. The interleaved pass
-  also **anchors** the multi-line comment opener, which is what keeps it from
-  fail-opening the way the two-pass shape it replaced did: only a `<!--` at the
-  start of its line (CommonMark HTML block type 2, at most 3 spaces of indent)
-  may span lines, so a changelog entry that merely QUOTES the delimiter in prose
-  — as this very entry does — stays literal text instead of commenting out the
-  rest of the file. Unanchored, one such line measured on the real CHANGELOG.md
-  took the parse from 429 sections to 421, and the eight that vanished were
-  `## v0.21.10`, `## v0.21.9`, `## v0.21.8` and neighbours: exactly the sections
-  a post-release merge buries an entry in, which would have turned the new
-  placement rule straight back into a confident OK over a buried entry. A
-  line-start comment left unclosed at EOF now WARNs alongside the unclosed-fence
-  WARN, for the same reason — a guard whose whole value is *does not fail open*
-  has to be loud when its own state machine ends somewhere unexpected. The
-  anchoring rule alone was not enough, because the scanner also had to agree
-  with CommonMark about where a comment ENDS: `<!-->` and `<!--->` are COMPLETE
-  comments (CommonMark 0.30+, matching the HTML spec — the closing `-->` may
-  reuse the opener's own dashes), but the closer was searched for from four
-  characters in, which cannot see either form. A line-start one was therefore
-  read as an unterminated opener, passed the anchoring check, and blanked
-  everything down to the next `-->` in the FILE: the same 429 → 421 sections and
-  the same eight buried `## v0.21.x` headings as above, except SILENTLY — the
-  unclosed-comment WARN cannot fire, since as far as the state machine is
-  concerned nothing is open at EOF. Searching from two characters in is exactly
-  equivalent for every other comment and closes it. Heading recognition is now
-  column-0 anchored in BOTH parsers (the growth rule used to accept a `##
-  Unreleased` at any indent, including the 4+ spaces CommonMark reads as an
-  indented code block); the ≤3-space tolerance is deliberately not honoured,
-  because an indented `## Unreleased` inside an already-released section would
-  un-release everything below it. And the CommonMark evidence these rounds kept
-  being argued from is now committed as a 38-case differential battery
-  (`tests/fixtures/commonmark-mask-cases.mjs`), each row carrying the reference
-  implementation's answer, so the six unmodelled HTML block types are pinned with
-  their direction (a `## ` inside one is a phantom released section, fail-closed;
-  a line-start `<!--` inside a type-6 block masks a real heading away, fail-open)
-  rather than waved off as "a changelog does not hit them".
-  Finally, the masker is now CONTAINER-aware, which is the last and largest
-  fail-open of the set: CommonMark scopes a fence or comment to the container it
-  was opened in, so one opened inside a list item ends WITH that item and a
-  column-0 line below it is a real heading. The scanner tracked neither, kept the
-  block open at document level and blanked straight through — and the shape that
-  triggers it is this file's own house style, an entry with an indented example
-  under its bullet. Measured on the real CHANGELOG.md, a single unclosed fence
-  indented under a bullet erased 250 of the 429 released headings, with no WARN,
-  because as far as the state machine was concerned the block was legitimately
-  still open: end-to-end on a queue ref, a genuinely buried entry came back
-  `OK`, exit 0. It is the CONTAINER and not the indent — remove the bullet and
-  reference and scanner agree — so the fix is not to anchor openers at column 0
-  (measured, that is 2.6x WORSE: declining an indented opener desynchronises
-  fence state, and the fence's own later closer then opens a spurious block that
-  runs to EOF) but to refuse to mask past a DEDENT: a non-blank line indented
-  less than the opener ends the block. A blank line is not a dedent, since blank
-  lines are fence content. Where that guess is wrong the opener was document-level
-  and merely indented 1-3 spaces, so the block ends early and at worst invents a
-  phantom section — fail-CLOSED by construction, the direction this guard is
-  allowed to be wrong in. A dedent is AMBIGUOUS, though, and getting the
-  ambiguity wrong put the same run-to-EOF fail-open straight back. It has two
-  readings: the CONTAINER one (the item ended, the block ended with it, and this
-  line is a fresh document-level construct) and the DOC-LEVEL one (the opener was
-  merely indented, the block is still open and its own closer is still ahead).
-  So the dedent is now tested BEFORE the closer, without exception — testing the
-  closer first spent a dedented ``` as the indented fence's closer while
-  CommonMark had already ended that fence and was spending the delimiter as a
-  fresh OPENER, which inverts fence parity for the rest of the file and erases
-  every heading the next legitimate opener covers — and ending a block at a
-  dedent blocks any new block from opening until the delimiters BOTH readings
-  still owe have gone by, not just the first of them. The dedenting delimiter
-  itself is blanked rather than emitted: it is punctuation under either reading,
-  and emitting it verbatim would be its own fail-open, since a stray ``` under
-  `## Unreleased` counts as a staged entry and would credit a PR that staged
-  nothing. Parity on the real CHANGELOG.md is exact at 429 sections against 429
-  rendered `<h2>`, with nothing lost and nothing invented. The differential that
-  produced these numbers is now committed as
-  `scripts/changelog-mask-differential.mjs` — seeded, so the counts reproduce —
-  rather than quoted from a throwaway script: over 60,000 generated documents per
-  seed, against `commonmark@0.31.2`, fail-open documents go from 3/4/4/3/4 (seeds
-  1-5) to 1/1/3/1/2, every remaining one WARNs rather than failing silently, and
-  fail-closed moves under 0.1%. Not zero, and an earlier draft of this entry
-  claimed zero: the residue needs a fence marker sharing its line with a
-  container marker (`- > ```yaml`), which the `≤3 spaces` opener anchor cannot
-  see at all, and is out of reach of this approximation rather than one more
-  patch away. `gen-changelog-entry.mjs` learned the same column-0 anchoring for
+  so, instead of the inapplicable post-release-merge story.
+  That first item is why this took seven review rounds. It began as a
+  hand-written masker, and every round found one more block shape it had not
+  modelled — fences and comments interleaved, HTML block types 1 and 3-7,
+  `<!-->` and `<!--->` as COMPLETE comments (CommonMark 0.30+, matching the HTML
+  spec: the closing `-->` may reuse the opener's own dashes), container scoping,
+  a two-slot dedent latch. Each fix was about two lines and each one left the
+  CLASS alive; the last one, measured on the real CHANGELOG.md, took the parse
+  from 429 sections to 179 and returned `OK`, exit 0, over a genuinely buried
+  entry. So the masker is DELETED — -452/+134 lines on this script against the
+  previous revision of this PR — in favour of `commonmark@0.31.2`, the reference
+  implementation, as a **devDependency**: sections come from its own heading
+  nodes' `sourcepos`, and fenced-code and HTML-block lines are masked from its
+  own node spans. Nothing in the guard re-implements CommonMark any more, so
+  there is nothing left for CommonMark to disagree with. On the real
+  CHANGELOG.md the guard reports 429 sections against the reference
+  implementation's 429 column-0 level-2 headings: equal, not approximately
+  equal. The unclosed-fence and unclosed-comment WARNs go with the state machine
+  that raised them — an unclosed fence really does run to EOF in CommonMark, so
+  there is no anomaly to report — while the empty-range WARN, which is about the
+  guard's own inputs, stays. Nothing ships to users: `scripts/` is not in the
+  package `files` list, and CI already installs devDependencies before lint.
+  ONE deliberate divergence remains, and it is now the only one: a heading opens
+  a section at COLUMN 0 only, though CommonMark tolerates up to three spaces of
+  indent. Honouring the tolerance is fail-OPEN in exactly the direction this
+  guard exists to close — an indented `## Unreleased` written INSIDE an
+  already-released section (an entry quoting the staging header, which is a
+  thing this file does) would un-release every section below it and wave a
+  buried entry through. Refusing it can at worst invent a section and fail a PR
+  that should have passed: loud and wrong beats silent and wrong. Both
+  directions are pinned by tests.
+  The CommonMark evidence these rounds kept being argued from is now committed
+  twice over. `tests/fixtures/commonmark-mask-cases.mjs` is a 42-row conformance
+  corpus, one row per shape that cost a round, and the battery over it no longer
+  compares against hardcoded expectations — nine of those recorded answers the
+  old approximation got WRONG, so improving the guard turned nine rows red for
+  being right, which makes it a change-detector rather than a test. Both columns
+  are now derived from the reference implementation LIVE, so the table cannot
+  rot and the guard cannot drift from the parser it claims to be.
+  `scripts/changelog-mask-differential.mjs` is the seeded random search, now
+  runnable with no out-of-tree install, and its container sampling was widened:
+  it used to put the container marker on the construct's own line (`- ```yaml`),
+  which cannot generate this file's house style — a bullet, then the block
+  indented UNDER it on the following lines — the shape both the round-5 and the
+  round-7 fail-open lived in. The old container list had no lead-line form at
+  all, so that shape had probability ZERO; it now appears in 457 of every 60,000
+  documents at seed 1. Under the widened harness the masker this PR deletes
+  scores 13 fail-OPEN and 271,585 fail-CLOSED over 1,000,000 documents; the
+  parser replacing it scores 0 and 0 over the same 1,000,000, with the column-0
+  policy reported as its own named count rather than folded into an "agrees"
+  column that hid it.
+  `gen-changelog-entry.mjs` learned the same column-0 anchoring for
   `## Unreleased` — at BOTH ends of the section, the header scan and the scan
   that finds where it stops — so the writer and the checker cannot disagree about
   which lines are the staging section and stage an entry where the guard will not

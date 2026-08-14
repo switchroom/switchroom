@@ -1,58 +1,50 @@
 /**
- * The CommonMark differential battery for `maskNonProseWithState` in
+ * The CommonMark differential battery for the changelog guard's block parse in
  * `scripts/check-changelog-entry.mjs`.
  *
  * Why this file exists
  * --------------------
- * The guard's masker is a hand-written partial CommonMark implementation: it
- * models fenced code blocks and HTML block type 2 (comments) and nothing else.
- * Every review round of that masker has turned on the question "what does
- * CommonMark actually say here?", and each round the answer was argued from a
- * throwaway script that was never committed — so the next round could not
- * re-run it, and a real fail-open (`<!-->`, a COMPLETE comment per CommonMark
- * 0.30+, read as an unterminated opener) survived two of them. Load-bearing
- * evidence that is not in the repo does not exist. This is that evidence,
- * committed.
+ * The guard used to approximate CommonMark block structure with a hand-written
+ * masker. Every review round of it turned on the question "what does CommonMark
+ * actually say here?", and each round the answer was argued from a throwaway
+ * script that was never committed — so the next round could not re-run it, and
+ * real fail-opens survived several of them. Load-bearing evidence that is not in
+ * the repo does not exist. This is that evidence, committed.
+ *
+ * The guard now uses the reference implementation itself (`commonmark@0.31.2`,
+ * a devDependency), so this table is no longer a record of where an
+ * approximation went wrong. It is the CONFORMANCE corpus: the block shapes that
+ * cost seven review rounds to get right, pinned so a future change to the
+ * heading policy — or a parser upgrade — has to face them.
  *
  * How to read a row
  * -----------------
- * Each case is a tiny changelog. `commonmarkH2` is the list of level-2 headings
- * the REFERENCE implementation renders; `guardH2` is what `parseSections` sees.
- * `agrees` records whether the guard matches CommonMark, and for the rows where
- * it does not, `divergence` names the DIRECTION:
+ * Each case is a tiny changelog.
  *
- *   - `fail-closed` — the guard invents a section CommonMark does not render.
- *     Worst case a false FAIL (a legitimate PR blocked), repo-wide and sticky
- *     once such a block lands on main.
- *   - `fail-open`   — the guard loses a section CommonMark does render, so the
- *     placement rule cannot see entries under it. Worst case a buried entry
- *     reported as OK, which is the failure this guard exists to prevent.
+ *   - `commonmarkH2` — every level-2 heading the reference implementation
+ *     RENDERS, in order.
+ *   - `guardH2`      — the headings `parseSections` reports.
  *
- * The test asserts BOTH columns, so a change that closes a divergence (or opens
- * a new one) fails loudly and forces this table to be updated rather than
- * quietly changing what the guard believes.
+ * The two differ ONLY where the guard's one deliberate divergence bites: a
+ * heading is recognised at COLUMN 0 only, even though CommonMark allows up to 3
+ * spaces of indent. That is a documented fail-CLOSED choice (see `parseSections`
+ * for why it is fail-OPEN to honour the tolerance). Everywhere else the guard is
+ * the parser, and the accompanying test proves it by deriving BOTH columns from
+ * the reference implementation LIVE rather than trusting the numbers below —
+ * these are committed so a human can read them, not so the test can believe them.
  *
- * Regenerating the `commonmarkH2` column
- * --------------------------------------
- * `commonmark` is the reference implementation and is deliberately NOT a
- * dependency of this repo — one differential table does not justify a
- * supply-chain entry. Regenerate out-of-tree:
+ * Regenerating
+ * ------------
+ * `commonmark` is now an ordinary devDependency, so there is no out-of-tree
+ * recipe any more:
  *
- *   mkdir -p /tmp/cm-oracle && cd /tmp/cm-oracle && npm i commonmark
  *   node --input-type=module -e '
- *     import { createRequire } from "node:module"
- *     const require = createRequire("/tmp/cm-oracle/")
- *     const cm = require("commonmark")
- *     const { CASES } = await import("<repo>/tests/fixtures/commonmark-mask-cases.mjs")
- *     const p = new cm.Parser(), w = new cm.HtmlRenderer()
+ *     import { Parser, HtmlRenderer } from "commonmark"
+ *     const { CASES } = await import("./tests/fixtures/commonmark-mask-cases.mjs")
  *     for (const c of CASES) {
- *       const html = w.render(p.parse(c.md))
- *       const h2 = [...html.matchAll(/<h2>([^<]*)<\/h2>/g)].map((m) => m[1])
- *       console.log(c.name, JSON.stringify(h2))
+ *       const html = new HtmlRenderer().render(new Parser().parse(c.md))
+ *       console.log(c.name, JSON.stringify([...html.matchAll(/<h2>([^<]*)<\/h2>/g)].map((m) => m[1])))
  *     }'
- *
- * Every row below was produced that way against commonmark@0.31.2 (the JS
- * reference implementation, spec 0.31.2) on 2026-08-14.
  */
 
 /**
@@ -61,8 +53,6 @@
  * @property {string} md the whole document
  * @property {string[]} commonmarkH2 level-2 headings the reference impl renders
  * @property {string[]} guardH2 headings `parseSections` reports (trimmed)
- * @property {boolean} agrees
- * @property {'fail-open'|'fail-closed'|null} divergence
  * @property {string} why one line of spec grounding
  */
 
@@ -78,7 +68,6 @@ export const CASES = [
     md: doc(['<!-- staging area -->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'HTML block type 2 opens and closes on the same line.',
   },
   {
@@ -86,7 +75,6 @@ export const CASES = [
     md: doc(['<!--', '## v1.2.3 — a note, not a section', '-->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Inside an HTML block a `## ` line is raw HTML, not an ATX heading.',
   },
   {
@@ -94,7 +82,6 @@ export const CASES = [
     md: doc(['<!-->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'CommonMark 0.30+: `<!-->` is a comment; type 2 ends on a line containing `-->`.',
   },
   {
@@ -102,7 +89,6 @@ export const CASES = [
     md: doc(['<!--->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'CommonMark 0.30+: `<!--->` is a comment, closer overlaps the opener dashes.',
   },
   {
@@ -110,7 +96,6 @@ export const CASES = [
     md: doc(['<!---->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The `-->` starts at offset 4; no overlap involved.',
   },
   {
@@ -118,7 +103,6 @@ export const CASES = [
     md: doc(['<!--', '', '## v0.0.1 — swallowed', '', '-->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Type 2 runs until a line contains `-->`; a blank line does not end it.',
   },
   {
@@ -126,7 +110,6 @@ export const CASES = [
     md: ['## Unreleased', '', '<!--', '', '## v9.9.9', '', '- entry', ''].join('\n'),
     commonmarkH2: ['Unreleased'],
     guardH2: ['## Unreleased'],
-    agrees: true,
     why: 'An HTML block with no end condition runs to end of document.',
   },
   {
@@ -134,24 +117,20 @@ export const CASES = [
     md: doc(['- prose quoting a bare `<!--` opener']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Type 2 must be line-start-anchored; inline raw HTML cannot span lines.',
   },
   {
     name: '3-space indented `<!--` opens a block that a column-0 line ends',
     md: doc(['   <!--', '## v0.0.1 — swallowed', '-->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1 — swallowed', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'CommonMark keeps this doc-level block open; the guard ends it at the dedent (container scoping) and sees a phantom section.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'A ≤3-space indent still opens a doc-level HTML block; the `-->` closes it. The approximation ended it at the dedent and invented a section.',
   },
   {
     name: '4-space indented `<!--` is indented code, not an opener',
     md: doc(['', '    <!--', '', '- prose after']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: '4 spaces is an indented code block; the ≤3-space anchor already excludes it.',
   },
   {
@@ -159,7 +138,6 @@ export const CASES = [
     md: doc(['<!-- note --> ## v0.0.1']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The `## ` is mid-line text, and an ATX heading must start its line.',
   },
   {
@@ -167,7 +145,6 @@ export const CASES = [
     md: doc(['<!--', 'note', '--> trailing prose <!-- and a pair -->']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The tail is prose; intra-line pairs in it are still comments.',
   },
   {
@@ -175,7 +152,6 @@ export const CASES = [
     md: doc(['<!--', 'note', '--> tail with a bare <!-- in it', '', '- prose after']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'A tail is mid-line by construction, so no opener there is line-start-anchored.',
   },
 
@@ -185,7 +161,6 @@ export const CASES = [
     md: doc(['```', '## v0.0.1 — pasted stdout', '```']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Fence content is literal code.',
   },
   {
@@ -193,7 +168,6 @@ export const CASES = [
     md: doc(['~~~', '## v0.0.1 — pasted stdout', '~~~']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Tilde fences behave identically to backtick fences.',
   },
   {
@@ -201,7 +175,6 @@ export const CASES = [
     md: doc(['```console', '## v0.0.1 — pasted stdout', '```']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'An info string does not change the fence.',
   },
   {
@@ -209,7 +182,6 @@ export const CASES = [
     md: doc(['````', '```', '## v0.0.1', '```', '````']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The closer must be at least as long as the opener.',
   },
   {
@@ -217,7 +189,6 @@ export const CASES = [
     md: ['## Unreleased', '', '````', '```', '## v9.9.9', '', '- entry', ''].join('\n'),
     commonmarkH2: ['Unreleased'],
     guardH2: ['## Unreleased'],
-    agrees: true,
     why: 'Closer shorter than opener is content; the block runs to EOF.',
   },
   {
@@ -225,24 +196,20 @@ export const CASES = [
     md: ['## Unreleased', '', '```', 'x', '``` nope', '## v9.9.9', '', '- entry', ''].join('\n'),
     commonmarkH2: ['Unreleased'],
     guardH2: ['## Unreleased'],
-    agrees: true,
     why: 'Only whitespace may follow a closing fence.',
   },
   {
     name: '3-space indented fence opens, but a column-0 line ends it',
     md: doc(['   ```', '## v0.0.1', '   ```']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'Same container-scoping trade as the indented `<!--` row: the dedent ends the block early, so the guard invents a section.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'A ≤3-space indent still opens a doc-level fence; the closer closes it. The approximation ended it at the dedent and invented a section.',
   },
   {
     name: 'an opener whose info string holds a backtick is not a fence',
     md: doc(['``` a `tick` in the info string', '', '- prose after']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'A backtick-fence info string may not contain a backtick.',
   },
   {
@@ -250,7 +217,6 @@ export const CASES = [
     md: ['## Unreleased', '', '```', 'oops', '', '## v9.9.9', '', '- entry', ''].join('\n'),
     commonmarkH2: ['Unreleased'],
     guardH2: ['## Unreleased'],
-    agrees: true,
     why: 'An unclosed fence runs to end of document — hence the WARN.',
   },
   {
@@ -258,7 +224,6 @@ export const CASES = [
     md: doc(['```html', '<!-- unterminated on purpose', '```', '', '- prose with an --> arrow']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Inside a fence nothing else is markup — the round-2 fail-open.',
   },
   {
@@ -266,7 +231,6 @@ export const CASES = [
     md: doc(['<!--', '```', 'still comment', '-->', '', '- prose after']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Whichever construct opens FIRST swallows the other.',
   },
   {
@@ -274,7 +238,6 @@ export const CASES = [
     md: doc(['<!--', '```', '-->', '', '## v0.0.2 — a REAL heading after the comment']),
     commonmarkH2: ['Unreleased', 'v0.0.2 — a REAL heading after the comment', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v0.0.2 — a REAL heading after the comment', '## v9.9.9'],
-    agrees: true,
     why: 'The comment ends at `-->`; the ``` inside it never opened anything.',
   },
 
@@ -295,7 +258,6 @@ export const CASES = [
     ]),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The list item ends at the column-0 heading, so the fence inside it ends too.',
   },
   {
@@ -305,7 +267,6 @@ export const CASES = [
     ),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'Same container rule for HTML block type 2: the `-->` far below does not keep it open.',
   },
   {
@@ -313,7 +274,6 @@ export const CASES = [
     md: doc(['- an entry with an example:', '', '  ```yaml', '  key: value', '  ```']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The common shape: a closer at the opener indent closes it before any dedent.',
   },
   {
@@ -323,7 +283,6 @@ export const CASES = [
     ),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'A closer may be indented less than its opener; misreading it as an opener would run to EOF (fail-open).',
   },
   {
@@ -343,7 +302,6 @@ export const CASES = [
     ].join('\n'),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'After a dedent the guard opens nothing until the pending closer, so the `~~~` cannot start a run-to-EOF fence.',
   },
   {
@@ -367,7 +325,6 @@ export const CASES = [
     ].join('\n'),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The resync state is not a one-way latch: leave it stuck and the fence below never masks, so its `## ` becomes a phantom section.',
   },
   {
@@ -391,7 +348,6 @@ export const CASES = [
     ].join('\n'),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
     guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: true,
     why: 'The fence half of the resync rule: miss the pending closer and the fence below never masks, so its `## ` becomes a phantom section.',
   },
   {
@@ -400,68 +356,99 @@ export const CASES = [
       '\n',
     ),
     commonmarkH2: ['Unreleased'],
-    guardH2: ['## Unreleased', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'The price of container scoping: with no bullet the block IS document-level, and the guard ends it early.',
+    guardH2: ['## Unreleased'],
+    why: 'With no bullet the block IS document-level, so it really does run to EOF. The approximation ended it at the dedent and invented a section.',
   },
 
-  // ── HTML block types the guard deliberately does NOT model ───────────────
-  // Realism on THIS file is nil (the real CHANGELOG.md has zero line-start HTML
-  // block openers), but the directions are recorded so the docstring's claim is
-  // checkable rather than asserted.
+  // ── HTML block types 1 and 3–7 ───────────────────────────────────────────
+  // These are the types the hand-written masker never modelled — it knew type 2
+  // (comments) and nothing else, so each of these rows was a divergence, five
+  // fail-CLOSED and one fail-OPEN. There is nothing to model any more: the
+  // reference implementation knows all seven types, so they are ordinary rows.
+  // Kept because "the guard handles every HTML block type" is a claim, and a
+  // claim in a docstring with no row behind it is how this file started.
   {
-    name: 'UNMODELLED type 1 (`<script>`) containing a `## ` line',
+    name: 'HTML type 1 (`<script>`) containing a `## ` line',
     md: doc(['<script>', '## v0.0.1 — inside a script block', '</script>']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1 — inside a script block', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'Type 1 content is raw HTML; the guard reads the `## ` as a phantom released section.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Type 1 content is raw HTML, so the `## ` is not a heading. The approximation modelled no HTML type but 2 and invented a section.',
   },
   {
-    name: 'UNMODELLED type 3 (`<?`) containing a `## ` line',
+    name: 'HTML type 3 (`<?`) containing a `## ` line',
     md: doc(['<?php', '## v0.0.1 — inside a processing instruction', '?>']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1 — inside a processing instruction', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'Type 3 runs to `?>`; the guard sees a phantom released section inside it.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Type 3 runs to `?>`, and everything inside it is raw HTML.',
   },
   {
-    name: 'UNMODELLED type 4 (`<!DECLARATION`) containing a `## ` line',
+    name: 'HTML type 4 (`<!DECLARATION`) containing a `## ` line',
     md: doc(['<!DOCTYPE html', '## v0.0.1 — inside a declaration', '>']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1 — inside a declaration', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'Type 4 runs to `>`; same phantom-section direction.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Type 4 runs to `>`, and everything inside it is raw HTML.',
   },
   {
-    name: 'UNMODELLED type 5 (`<![CDATA[`) containing a `## ` line',
+    name: 'HTML type 5 (`<![CDATA[`) containing a `## ` line',
     md: doc(['<![CDATA[', '## v0.0.1 — inside CDATA', ']]>']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1 — inside CDATA', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'Type 5 runs to `]]>`; same phantom-section direction.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Type 5 runs to `]]>`, and everything inside it is raw HTML.',
   },
   {
-    name: 'UNMODELLED type 6 (`<div>`) containing a `## ` line',
+    name: 'HTML type 6 (`<div>`) containing a `## ` line',
     md: doc(['<div>', '## v0.0.1 — inside a div', '</div>']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
-    guardH2: ['## Unreleased', '## v0.0.1 — inside a div', '## v9.9.9'],
-    agrees: false,
-    divergence: 'fail-closed',
-    why: 'Type 6 runs to a blank line; same phantom-section direction.',
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Type 6 runs to a blank line, and everything inside it is raw HTML.',
   },
   {
-    name: 'UNMODELLED type 6 whose body holds a line-start `<!--`',
+    name: 'HTML type 6 whose body holds a line-start `<!--`',
     md: doc(['<div>', '<!-- a comment INSIDE the html block', '</div>']),
     commonmarkH2: ['Unreleased', 'v9.9.9'],
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Inside a type-6 block the `<!--` is content, not an opener. The approximation read it as one and masked to EOF — the last fail-OPEN row.',
+  },
+
+  // ── The column-0 heading policy: the guard's ONE deliberate divergence ────
+  // CommonMark allows an ATX opener up to 3 spaces of indent. The guard refuses
+  // them, and these are the rows where that shows. It is fail-CLOSED and it is
+  // load-bearing, not decorative — see `parseSections`. Nothing in the repo
+  // enforces "CHANGELOG.md has no indented headings"; the count is zero today
+  // because nobody has written one, which is exactly why the guard cannot
+  // assume it.
+  {
+    name: 'POLICY: a 3-space `## ` is a real heading to CommonMark, and not to the guard',
+    md: doc(['   ## v0.0.1 — indented by three spaces']),
+    commonmarkH2: ['Unreleased', 'v0.0.1 — indented by three spaces', 'v9.9.9'],
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'Fail-CLOSED: honouring the tolerance lets an indented `## Unreleased` inside a released section un-release the whole rest of the file.',
+  },
+  {
+    name: 'POLICY: an indented `## Unreleased` inside a list item does not open a section',
+    md: [
+      '## Unreleased',
+      '',
+      '- entry',
+      '',
+      '## v9.9.9',
+      '',
+      '- an entry that shows the staging header:',
+      '',
+      '   ## Unreleased',
+      '',
+      '- buried',
+      '',
+    ].join('\n'),
+    commonmarkH2: ['Unreleased', 'v9.9.9', 'Unreleased'],
+    guardH2: ['## Unreleased', '## v9.9.9'],
+    why: 'The concrete fail-OPEN the policy prevents: honour the indent and everything from that line on stops being a released section.',
+  },
+  {
+    name: 'POLICY: a SETEXT h2 is not a section either',
+    md: ['## Unreleased', '', '- entry', '', 'v0.0.1 — setext', '---', '', '- buried', ''].join('\n'),
+    commonmarkH2: ['Unreleased', 'v0.0.1 — setext'],
     guardH2: ['## Unreleased'],
-    agrees: false,
-    divergence: 'fail-open',
-    why: 'Inside a type-6 block the `<!--` is content, not an opener; the guard masks past it.',
+    why: 'CommonMark renders a setext underline as `<h2>`; the guard requires a literal `## ` ATX opener, so it reports one section.',
   },
 ]

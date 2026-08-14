@@ -127,6 +127,17 @@ import { execFileSync } from 'node:child_process'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// The REFERENCE CommonMark implementation (spec 0.31.2), a devDependency.
+//
+// This script is node-run lint tooling: `scripts/` is not in package.json
+// `files`, and nothing under `src/`, `bin/` or `telegram-plugin/` imports it,
+// so the shipped bun binary carries none of this. CI already installs
+// devDependencies (`bun install --frozen-lockfile`) before running lint.
+//
+// `commonmark`'s package exports resolve to an ESM entry with NAMED exports
+// only — `import cm from 'commonmark'` throws at load. Import the names.
+import { Parser } from 'commonmark'
+
 /**
  * Repo-relative path prefixes whose contents ship to users or the fleet. A
  * change under any of these requires a staged changelog entry — unless the
@@ -186,14 +197,89 @@ export function isShippable(p) {
 }
 
 /**
- * Strip `<!-- ... -->` HTML comment blocks (possibly multi-line) so the
- * convention comment seeded under `## Unreleased` is never counted as an
- * entry.
- * @param {string} text
- * @returns {string}
+ * Parse a changelog with the REFERENCE CommonMark implementation and return
+ * the two facts every rule below needs: which lines are prose, and where the
+ * level-2 headings are.
+ *
+ * WHY A REAL PARSER
+ * -----------------
+ * This used to be `maskNonProseWithState`, a ~200-line hand-written partial
+ * CommonMark implementation that modelled fenced code blocks and HTML block
+ * type 2 and approximated container scoping with a dedent/resync latch. Seven
+ * review rounds found seven defects of the same class, the last of them a
+ * silent fail-OPEN on the repo's own CHANGELOG.md: when PROSE caused the
+ * dedent out of a list item the latch carried no pending closer, the next bare
+ * delimiter was read as a fresh OPENER, fence parity inverted, and the masker
+ * blanked every heading through to EOF — 429 real `<h2>`s seen as 179, with
+ * both unclosed-* WARNs null. Approximating block structure with line-anchored
+ * regexes is the defect class; the fix is to stop approximating.
+ *
+ * WHAT COUNTS AS NON-PROSE
+ * ------------------------
+ * FENCED code blocks and HTML blocks only — deliberately NOT indented (4-space)
+ * code blocks. A 4-space-indented literal block under `## Unreleased` is a
+ * legitimate entry body and must still count as growth (pinned by
+ * `tests/changelog-entry-check.test.ts`). That is exactly the scope the old
+ * masker had, so this is not a behaviour change.
+ *
+ * Inline (mid-line) comments are NOT masked. A comment on its own line is an
+ * HTML block and is masked as one; a mid-line `<!-- … -->` leaves a prose line
+ * prose, and base and head are compared the same way, so nothing depends on it.
+ *
+ * HEADINGS: COLUMN 0 ONLY — see `parseSections` for why.
+ *
+ * Cached on the exact input string (one entry): CHANGELOG.md is >1.3 MiB here
+ * and a single run parses it several times.
+ *
+ * @param {string} changelog
+ * @returns {{lines: string[], prose: boolean[], headings: {line: number, text: string}[]}}
+ *   `prose[i]` is for 1-based line `i + 1`.
  */
-export function stripHtmlComments(text) {
-  return String(text).replace(/<!--[\s\S]*?-->/g, '')
+let analyzeCacheKey = /** @type {string | null} */ (null)
+let analyzeCacheValue = /** @type {any} */ (null)
+export function analyze(changelog) {
+  const md = String(changelog).replace(/\r\n/g, '\n')
+  if (analyzeCacheKey === md) return analyzeCacheValue
+
+  const lines = md.split('\n')
+  const prose = new Array(lines.length).fill(true)
+  /** @type {{line: number, text: string}[]} */
+  const headings = []
+
+  const walker = new Parser().parse(md).walker()
+  let ev
+  while ((ev = walker.next())) {
+    if (!ev.entering) continue
+    const node = ev.node
+    const pos = node.sourcepos
+    if (!pos) continue
+    // FENCED vs INDENTED code: `node.info` is the public discriminator, and it
+    // is the only one. commonmark 0.31.2 has no `isFenced` accessor on Node —
+    // the flag exists solely as the private `_isFenced` (`lib/node.js:84`,
+    // absent from the `defineProperty(proto, …)` list) and reading `.isFenced`
+    // silently yields `undefined`, i.e. "never mask a fence". `info` is a real
+    // accessor (`lib/node.js:170`) and is `null` for an indented block and a
+    // string (`""` when there is no info string) for a fenced one.
+    const fenced = node.type === 'code_block' && typeof node.info === 'string'
+    if (fenced || node.type === 'html_block') {
+      for (let n = pos[0][0]; n <= pos[1][0]; n++) {
+        if (n >= 1 && n <= lines.length) prose[n - 1] = false
+      }
+      continue
+    }
+    if (node.type !== 'heading' || node.level !== 2) continue
+    const line = pos[0][0]
+    const raw = lines[line - 1] ?? ''
+    // Column 0 only, and `^##\s` besides — which also excludes a SETEXT h2,
+    // whose sourcepos points at its text line, not at the `---` underline.
+    if (pos[0][1] !== 1 || !/^##\s/.test(raw)) continue
+    headings.push({ line, text: raw.trim() })
+  }
+
+  const value = { lines, prose, headings }
+  analyzeCacheKey = md
+  analyzeCacheValue = value
+  return value
 }
 
 /**
@@ -216,23 +302,18 @@ export function stripHtmlComments(text) {
  * @returns {string[]}
  */
 export function extractUnreleasedEntries(changelog) {
-  // Mask (not strip) comments and fenced code so a `## ` line that is merely
-  // PASTED OUTPUT inside a fence cannot truncate the section. See
-  // `maskNonProseWithState` for why that matters here.
-  const text = maskNonProse(String(changelog).replace(/\r\n/g, '\n'))
-  const lines = text.split('\n')
-  let i = 0
-  // Find the `## Unreleased` header (case-insensitive, tolerant of trailing
-  // text like `## Unreleased — staged`, column-0 anchored like `parseSections`).
-  while (i < lines.length && !/^##\s+unreleased\b/i.test(lines[i])) i++
-  if (i >= lines.length) return []
-  i++ // move past the header line
+  const { lines, prose, headings } = analyze(changelog)
+  const at = headings.findIndex((h) => /^##\s+unreleased\b/i.test(h.text))
+  if (at === -1) return []
+  const from = headings[at].line + 1
+  const to = at + 1 < headings.length ? headings[at + 1].line - 1 : lines.length
   /** @type {string[]} */
   const entries = []
-  for (; i < lines.length; i++) {
-    const line = lines[i]
-    if (/^##\s/.test(line)) break // next section header ends Unreleased
-    const trimmed = line.trim()
+  for (let n = from; n <= to; n++) {
+    // Fenced code and HTML blocks are not entries: a `## ` line that is merely
+    // PASTED OUTPUT inside a fence must not be credited as staged prose.
+    if (!prose[n - 1]) continue
+    const trimmed = (lines[n - 1] ?? '').trim()
     if (trimmed.length > 0) entries.push(trimmed)
   }
   return entries
@@ -252,392 +333,6 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
 }
 
 /**
- * Blank every `<!-- ... -->` pair inside a SINGLE line's text and report
- * whether a comment is still open when the line ends.
- *
- * An UNTERMINATED `<!--` only reports `open: true` when it could actually start
- * a multi-line comment. Per CommonMark that is HTML block type 2, whose opener
- * must be line-start-anchored (at most 3 spaces of indent); a `<!--` anywhere
- * else on the line is inline raw HTML, and inline raw HTML cannot span lines —
- * so an unterminated one is plain literal text and is left VERBATIM. Getting
- * this wrong is fail-open, not cosmetic: treating a prose mention of `<!--` as
- * an opener blanks every following line to EOF, which erases the released `## `
- * headings the placement rule exists to check against.
- *
- * The closer is searched from `start + 2`, NOT `start + 4`, because CommonMark
- * (0.30+, matching the HTML spec) says `<!-->` and `<!--->` are COMPLETE
- * comments — the closing `-->` is allowed to reuse the opener's own dashes.
- * Searching from `start + 4` cannot see either closer, so the scanner called a
- * closed comment "unterminated"; line-start-anchored (`start === 0`) it then set
- * `open: true` and masked everything down to the next `-->` in the FILE — which
- * on this repo's real CHANGELOG.md erased eight released `## v0.21.x` headings
- * and turned a genuinely buried entry into a silent OK. `start + 2` is exactly
- * equivalent for every other comment: a `-->` at `start + 2` forces the text to
- * be `<!-->` and one at `start + 3` forces `<!--->`, so the widened window can
- * only ever match those two literal forms.
- *
- * @param {string} s
- * @param {boolean} [allowMultiline] false when `s` is a mid-line TAIL (the text
- *   after a `-->`), where no `<!--` can be line-start-anchored by construction.
- * @returns {{masked: string, open: boolean}}
- */
-function maskCommentsInLine(s, allowMultiline = true) {
-  let out = ''
-  let i = 0
-  for (;;) {
-    const start = s.indexOf('<!--', i)
-    if (start === -1) return { masked: out + s.slice(i), open: false }
-    // `start + 2`, not `start + 4`: `<!-->` and `<!--->` are complete comments
-    // whose closer overlaps the opener's dashes. See the docstring.
-    const end = s.indexOf('-->', start + 2)
-    if (end === -1) {
-      // Nothing after `start` can close on this line, so every later `<!--` is
-      // literal too — emit the remainder in one piece either way.
-      const anchored = allowMultiline && start <= 3 && /^ *$/.test(s.slice(0, start))
-      if (!anchored) return { masked: out + s.slice(i), open: false }
-      return { masked: out + s.slice(i, start) + ' '.repeat(s.length - start), open: true }
-    }
-    out += s.slice(i, start)
-    out += ' '.repeat(end + 3 - start)
-    i = end + 3
-  }
-}
-
-/**
- * Blank everything that is not changelog PROSE — the CONTENT of fenced code
- * blocks (``` / ~~~) and their fence lines, AND `<!-- ... -->` comment bodies —
- * WITHOUT changing the line count, so 1-based line numbers keep addressing the
- * real file. (`stripHtmlComments` deletes text and therefore shifts every
- * subsequent line: fine for the growth rule, useless for placement, which maps a
- * diff's new-file line numbers onto sections.)
- *
- * Why fence-awareness is load-bearing: `## ` inside a fence is not a heading, it
- * is text. This repo's changelog style pastes CI transcripts and grep output
- * verbatim (CHANGELOG.md already carries 30+ fence markers), so a fenced line
- * reading `## v9.9.9 — sample output` is routine. A fence-blind parser turns that
- * into a phantom RELEASED section, and then EVERY entry appended after it — i.e.
- * every entry written the documented way, at the END of `## Unreleased` — reads
- * as landing under a released heading. That is not a one-PR false FAIL: once such
- * a block lands on main, the placement rule reds every subsequent PR, repo-wide,
- * until someone deletes the code block. It also truncates
- * `extractUnreleasedEntries`, so a genuinely-staged entry stops counting as
- * growth.
- *
- * ONE interleaved pass, not two sequential masks, because the two constructs are
- * mutually exclusive and whichever OPENS first swallows the other. Masking
- * comments first (the shape this replaced) was fail-OPEN in the other direction:
- * an unterminated `<!--` *inside* a fence — routine in a changelog that pastes
- * HTML templates verbatim — paired with any `-->` appearing later in prose, and
- * the comment mask blanked the fence's own CLOSING delimiter on the way. The
- * fence then ran to EOF, every heading below it was masked away, `parseSections`
- * saw only `## Unreleased`, and the placement rule reported OK on a genuinely
- * BURIED entry. Per CommonMark that `<!--` is code and the fence closes normally.
- * Masking fences first and comments second is not the fix either: a fence marker
- * inside a real comment must NOT open a block, which only a single stateful pass
- * gets right in both directions.
- *
- * CommonMark rules, minus the cases a changelog will never hit. Fences: an
- * opener is three-or-more backticks/tildes indented at most 3 spaces; the closer
- * is the same character, at least as long, with nothing but whitespace after it.
- * Comments: an intra-line `<!-- ... -->` pair is masked wherever it appears, but
- * only a line-start-anchored `<!--` (at most 3 spaces of indent — CommonMark
- * HTML block type 2) may open a MULTI-LINE comment. A `<!--` elsewhere on the
- * line is inline raw HTML, which cannot span lines, so an unterminated one stays
- * literal prose. `<!-->` and `<!--->` are COMPLETE comments (CommonMark 0.30+,
- * matching the HTML spec) — see `maskCommentsInLine`. A `<!--` inside an indented
- * (4-space) code block needs no special case: such a block's lines all carry 4+
- * spaces, which the ≤3-space anchor already rejects.
- *
- * CONTAINERS, approximated. CommonMark scopes a block to the CONTAINER it was
- * opened in: a fence or comment opened inside a list item ends where that list
- * item ends, so a column-0 line closes it and IS a real heading. Ignore that and
- * an unclosed fence indented under a bullet — the file's own house style for an
- * entry with an example — blanks every heading below it to EOF: measured, 250 of
- * the 429 released headings erased, with no WARN, because the state machine
- * still believed it was inside a block CommonMark had already closed. That is
- * the fail-OPEN this guard exists to prevent, so what is modelled here is not
- * the full container stack, only a refusal to mask past a DEDENT — and the
- * dedent is tested BEFORE the closer, without exception. Testing the closer
- * first was round 6's fail-open: a dedented fence delimiter got spent as this
- * fence's closer while CommonMark had already ended the fence at the dedent and
- * was spending that delimiter as a fresh OPENER. Fence parity inverts from
- * there, and the next legitimate opener erases real headings below it.
- *
- * The approximation: a non-blank line indented LESS than the line that opened
- * the block ends the block. A blank line is not a dedent (blank lines are fence
- * content, and do not end a type-2 comment). Where CommonMark disagrees it is
- * because the opener was document-level and merely indented 1–3 spaces, in which
- * case the block really did stay open — the guard ends it early and may invent a
- * phantom section, the fail-CLOSED direction, by construction.
- *
- * So a dedent has TWO readings, and indentation alone cannot tell them apart:
- * the CONTAINER reading (the item ended, the block ended with it, and this line
- * is a fresh document-level construct) and the DOC-LEVEL reading (the opener was
- * merely indented, the block is still open, and its own closer is still ahead).
- * Ending the block is right under the first and premature under the second, so
- * `resync` covers both: masking stays off, but nothing may OPEN until the
- * delimiters BOTH readings still owe have gone by — `pending`, the doc-level
- * block's own closer, and `pendingFence`, the closer of the fence the dedenting
- * line opens under the container reading. Releasing on whichever arrives first
- * lets the other reading's delimiter be misread as a fresh opener and restart
- * the very run-to-EOF fail-open this paragraph is about, so the latch lifts only
- * once BOTH slots are empty. A line that is nothing but a fence delimiter is
- * punctuation under both readings and is blanked, never emitted: RULE 1 counts
- * every non-blank line under `## Unreleased` as a staged entry, so emitting a
- * stray delimiter verbatim would be its own fail-open.
- *
- * NOT modelled: the other six HTML block types (1, 3, 4, 5, 6, 7), and — beyond
- * the dedent rule above — containers themselves: block quotes, and the list
- * marker/indent bookkeeping that would tell a real parser exactly where an item
- * ends. Realism on THIS file is nil for the HTML types — the real CHANGELOG.md
- * contains zero line-start HTML block openers — but "not hit in practice" is not
- * the same as "harmless", so the directions are recorded rather than waved away,
- * and pinned by the committed differential battery in
- * `tests/fixtures/commonmark-mask-cases.mjs`:
- *
- *   - fail-CLOSED: a `## ` line inside a type 1/3/4/5/6 block is raw HTML to
- *     CommonMark and a heading to this masker, so it becomes a PHANTOM released
- *     section. Worst case is a false FAIL, and — like the fenced-`## ` case
- *     above — a sticky, repo-wide one: every later PR appending to the end of
- *     `## Unreleased` reds until the block is deleted.
- *   - fail-OPEN: inside a type-6 block a line-start `<!--` is block CONTENT, not
- *     an opener; this masker treats it as one and blanks on to the next `-->`,
- *     which can erase a REAL released heading and hide a buried entry. This is
- *     the direction that matters, and it is the reason to keep the "changelogs
- *     do not contain raw HTML blocks" assumption honest rather than implicit.
- *
- * @param {string} text
- * @returns {{text: string, unclosedFenceLine: number | null, unclosedCommentLine: number | null}}
- *   `unclosedFenceLine` is the 1-based line of a fence that was never closed
- *   before EOF. CommonMark says such a fence runs to the end of the document,
- *   which silently blinds every section below it — correct, but worth a WARN, so
- *   callers surface it rather than reporting a confident OK over a blind spot.
- *   `unclosedCommentLine` is the same for a line-start `<!--` never closed before
- *   EOF, and for the same reason: the anchoring rule above makes the fail-open
- *   shape unreachable from prose, but a guard whose whole value is "does not fail
- *   open" must be LOUD when its own state machine ends in an unexpected state.
- *
- *   Both are ADVISORY and report THIS state machine's view, not CommonMark's.
- *   Measured against `commonmark@0.31.2` over 20,000 generated documents
- *   (`scripts/changelog-mask-differential.mjs`'s corpus, seed 1): when both the
- *   guard and the reference end with an unclosed fence they name the SAME opener
- *   1097 times out of 1103, and all 6 disagreements need a construct the masker
- *   openly does not model — a tab-indented fence, or a fence sharing its line
- *   with a list marker (`*       ~~~`), which the ≤3-space anchor cannot see. The
- *   guard also stays silent on 8463 documents where the reference does have an
- *   unclosed fence: the container rule ended it early, so the guard shows MORE
- *   text than CommonMark renders. That is the fail-CLOSED direction — a heading
- *   that turns out to be code, at worst a false FAIL — which is why a missing
- *   WARN there is tolerable and a missing WARN over a masked region would not be.
- */
-export function maskNonProseWithState(text) {
-  const lines = String(text).replace(/\r\n/g, '\n').split('\n')
-  const blank = (/** @type {string} */ l) => ' '.repeat(l.length)
-  /** @type {{char: string, len: number, line: number, indent: number} | null} */
-  let fence = null
-  let inComment = false
-  /** @type {number | null} 1-based line the currently-open comment started on. */
-  let commentLine = null
-  /** Indent (leading spaces) of the line the open comment started on. */
-  let commentIndent = 0
-  /**
-   * Set when a block was ended by a DEDENT rather than by its own closer, i.e.
-   * the container-scoping guess above. Masking is off while it is set (that is
-   * the fail-closed half); it exists so the block's REAL closer cannot be
-   * misread as a fresh opener. See the container note in the docstring.
-   *
-   * A dedent has TWO readings and the latch is released only once BOTH are
-   * satisfied, whichever comes later:
-   *
-   *   `pending`      the doc-level reading — the block never ended, so its own
-   *                  closer (a fence delimiter, or `-->` for a comment) is
-   *                  still ahead.
-   *   `pendingFence` the container reading — the block ended at the dedent and
-   *                  the dedenting line was itself a fresh fence OPENER, so
-   *                  that fence's closer is ahead too. Only set when the
-   *                  dedenting line is fence-delimiter-shaped.
-   *
-   * Releasing on the first of the two is the round-6 fail-open: the delimiter
-   * the guard spends on the release is the one CommonMark spends on the
-   * OPENER, fence parity inverts from there, and the next delimiter runs on to
-   * erase real headings.
-   * The latch is `null` exactly when both slots are empty.
-   * @type {{
-   *   pending: {kind: 'fence', char: string, len: number} | {kind: 'comment'} | null,
-   *   pendingFence: {char: string, len: number} | null,
-   * } | null}
-   */
-  let resync = null
-  /**
-   * The container reading's half of a dedent: if the dedenting line is
-   * fence-delimiter-shaped it opened a fence, whose closer must go by before
-   * the latch may release.
-   * @param {RegExpExecArray | null} mm
-   */
-  const openerOf = (mm) => (mm ? { char: mm[1][0], len: mm[1].length } : null)
-  /**
-   * Is `mm` a bare closing delimiter for `want` — same char, at least as long,
-   * nothing after it but whitespace? A null `want` is vacuously satisfied.
-   * @param {RegExpExecArray | null} mm
-   * @param {{char: string, len: number} | null} want
-   */
-  const closesFence = (mm, want) =>
-    want === null ||
-    Boolean(mm && mm[1][0] === want.char && mm[1].length >= want.len && mm[2].trim() === '')
-  /** @type {string[]} */
-  const out = []
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
-    const indent = /^ */.exec(line)[0].length
-    // CommonMark scopes a block to its CONTAINER: a fence or comment opened
-    // inside a list item ends with that list item, so a line indented LESS than
-    // the opener is outside the block. Blank lines are not a dedent (a blank
-    // line is fence content, and does not end a type-2 comment).
-    const dedents = (/** @type {number} */ openerIndent) =>
-      line.trim() !== '' && indent < openerIndent
-
-    if (fence !== null) {
-      // Inside a fence NOTHING else is markup: a `<!--` here is code, not a
-      // comment opener, so `inComment` cannot change.
-      //
-      // The closer is only a closer while the line is STILL INSIDE the block's
-      // container. CommonMark does let a closer be indented less than its
-      // opener — but only down to column 0 of the same container. Once the
-      // lower indent takes the line OUT of the container, the list item ends,
-      // the fence ends with it, and the line is a fresh DOCUMENT-LEVEL
-      // construct, not this fence's closer. Consuming it as a closer inverts
-      // fence parity: the next delimiter is then read as an opener and runs on
-      // to erase real headings. So the dedent is tested FIRST.
-      const closer = Boolean(
-        m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '',
-      )
-      if (!dedents(fence.indent)) {
-        if (closer) fence = null
-        out.push(blank(line))
-        continue
-      }
-      // A dedent out of a fence is AMBIGUOUS, and this is where round 6's
-      // fail-open lived. Two readings of the same text:
-      //
-      //   container  — the opener was inside a list item, the item ended here,
-      //                and THIS line is a fresh document-level construct.
-      //   doc-level  — the opener was merely indented 1–3 spaces at document
-      //                level, the block is still open, and this line is either
-      //                its closer or its content.
-      //
-      // Under the container reading masking is wrong; under the doc-level
-      // reading opening is wrong. So do neither: end the fence, emit verbatim,
-      // and open nothing until a delimiter has gone by that closes the block
-      // under BOTH readings (`resync`, below).
-      resync = {
-        pending: { kind: 'fence', char: fence.char, len: fence.len },
-        pendingFence: openerOf(m),
-      }
-      fence = null
-      if (m) {
-        // The dedenting line is itself fence-delimiter-shaped: a fresh opener
-        // under the container reading, the closer or fence content under the
-        // doc-level one. Punctuation either way, never a heading and never a
-        // changelog entry, so BLANK it — and, critically, do not let it fall
-        // through to the `resync` release below. Releasing on the very line
-        // that set the latch is what let the NEXT delimiter be read as an
-        // opener; under the container reading that next delimiter is this
-        // block's closer, so the latch must survive one more.
-        out.push(blank(line))
-        continue
-      }
-    } else if (inComment && dedents(commentIndent)) {
-      inComment = false
-      commentLine = null
-      // Same two readings, same latch. `pendingFence` matters here too: a
-      // comment dedented out of by a fence-delimiter line opened a fence under
-      // the container reading, and releasing on the doc-level `-->` alone lets
-      // that fence's CLOSER be read as an opener — the same parity inversion,
-      // reached through the comment path.
-      resync = { pending: { kind: 'comment' }, pendingFence: openerOf(m) }
-      if (m) {
-        out.push(blank(line))
-        continue
-      }
-    }
-    if (inComment) {
-      const idx = line.indexOf('-->')
-      if (idx === -1) {
-        out.push(blank(line))
-        continue
-      }
-      // The comment closes mid-line. What follows on the SAME line is prose, but
-      // it can open neither a fence nor another MULTI-LINE comment — both
-      // openers must be line-start-anchored, and this tail is mid-line by
-      // construction. Intra-line pairs in the tail are still masked.
-      const tail = maskCommentsInLine(line.slice(idx + 3), false)
-      inComment = tail.open
-      if (!inComment) commentLine = null
-      out.push(' '.repeat(idx + 3) + tail.masked)
-      continue
-    }
-    if (resync !== null) {
-      // We guessed a container exit and may be wrong — CommonMark may still be
-      // INSIDE the block. Emit verbatim (so a heading below is visible: worst
-      // case a phantom section, the fail-CLOSED direction) but open nothing,
-      // because the block's own closing delimiter is still ahead of us and
-      // reading it as an OPENER is what turns this into a fail-OPEN: the
-      // spurious block then runs on and erases real headings below.
-      // Each reading's pending delimiter is retired independently, and at most
-      // one per line — a single delimiter cannot both close the container
-      // reading's fence and close the doc-level reading's block. The latch
-      // lifts only once BOTH slots are empty.
-      let { pending, pendingFence } = resync
-      if (pendingFence !== null && closesFence(m, pendingFence)) {
-        pendingFence = null
-      } else if (
-        pending !== null &&
-        (pending.kind === 'fence' ? closesFence(m, pending) : line.includes('-->'))
-      ) {
-        pending = null
-      }
-      resync = pending === null && pendingFence === null ? null : { pending, pendingFence }
-      // A line that is nothing but a fence delimiter is punctuation under both
-      // readings, so blank it rather than emitting it. Emitting it verbatim is
-      // its own fail-OPEN: RULE 1 counts every non-blank line under
-      // `## Unreleased` as a staged entry, and a stray ``` would credit a PR
-      // that staged nothing. Blanking can only SHRINK the section, which is the
-      // fail-closed direction. Everything else — including a prose line that
-      // merely CONTAINS `-->` — is emitted verbatim, because it may legitimately
-      // be, or contain, a heading.
-      out.push(m && m[2].trim() === '' ? blank(line) : line)
-      continue
-    }
-    // An opening fence's info string may not contain a backtick (CommonMark).
-    if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
-      fence = { char: m[1][0], len: m[1].length, line: i + 1, indent }
-      out.push(blank(line))
-      continue
-    }
-    const masked = maskCommentsInLine(line)
-    inComment = masked.open
-    commentLine = inComment ? i + 1 : null
-    if (inComment) commentIndent = indent
-    out.push(masked.masked)
-  }
-  return {
-    text: out.join('\n'),
-    unclosedFenceLine: fence ? fence.line : null,
-    unclosedCommentLine: inComment ? commentLine : null,
-  }
-}
-
-/**
- * `maskNonProseWithState`, text only — the shape every parser here wants.
- * @param {string} text
- * @returns {string}
- */
-export function maskNonProse(text) {
-  return maskNonProseWithState(text).text
-}
-
-/**
  * Split a changelog into its `## ` sections with 1-based line numbers.
  *
  * INDENT: a heading is recognised at COLUMN 0 only, even though CommonMark
@@ -650,7 +345,18 @@ export function maskNonProse(text) {
  * by 1–3 spaces is invisible to the parser, which reports "no `## Unreleased`
  * section" and reds the PR until the indent is removed. `extractUnreleasedEntries`
  * anchors at column 0 for the same reason, so the two agree on what a heading is.
- * The real CHANGELOG.md has zero indented `## ` headings (checked repo-wide).
+ * The real CHANGELOG.md has zero indented `## ` headings (checked repo-wide) —
+ * but nothing ENFORCES that, so the policy is load-bearing, not decorative. It
+ * is also not hypothetical: `tests/changelog-entry-check.test.ts` pins a case
+ * where `   ## Unreleased` sits inside a list item in an already-released
+ * section. CommonMark renders that as a genuine `<h2>`; honouring the tolerance
+ * would un-release the entire rest of the file and turn a real FAIL into a pass.
+ *
+ * Now that the block structure comes from the reference implementation, this is
+ * the ONLY place the guard deliberately diverges from CommonMark, it diverges
+ * in the fail-CLOSED direction, and it is one filter rather than an
+ * approximation: keep the parser's heading nodes whose start column is 1 and
+ * whose source line is a literal `## ` ATX opener.
  *
  * @param {string} changelog
  * @returns {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]}
@@ -658,22 +364,17 @@ export function maskNonProse(text) {
  *   `## ` heading that is not `## Unreleased`.
  */
 export function parseSections(changelog) {
-  // Fenced code and HTML comments are masked (line-count preserving) first: a
-  // `## ` line inside a fence is pasted OUTPUT, not a section boundary. See
-  // `maskNonProseWithState`.
-  const lines = maskNonProse(String(changelog).replace(/\r\n/g, '\n')).split('\n')
+  const { lines, headings } = analyze(changelog)
   /** @type {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]} */
   const sections = []
-  for (let i = 0; i < lines.length; i++) {
-    if (!/^##\s/.test(lines[i])) continue
-    const heading = lines[i].trim()
-    if (sections.length > 0) sections[sections.length - 1].end = i // previous line, 1-based
+  for (const h of headings) {
+    if (sections.length > 0) sections[sections.length - 1].end = h.line - 1
     sections.push({
-      heading,
-      headingLine: i + 1,
-      start: i + 2,
+      heading: h.text,
+      headingLine: h.line,
+      start: h.line + 1,
       end: lines.length,
-      released: !/^##\s+unreleased\b/i.test(heading),
+      released: !/^##\s+unreleased\b/i.test(h.text),
     })
   }
   return sections
@@ -809,12 +510,8 @@ export function findMisplacedEntries(
   addedLineNumbers,
   removedSectionKeys = new Set(),
 ) {
-  const raw = String(headChangelog).replace(/\r\n/g, '\n')
-  // Hoisted: `raw` is >1.3 MiB in this repo, and re-splitting it once per hit
-  // made the report cost quadratic in the number of misplaced lines.
-  const rawLines = raw.split('\n')
-  const masked = maskNonProse(raw).split('\n')
-  const sections = parseSections(raw)
+  const { lines: rawLines, prose } = analyze(headChangelog)
+  const sections = parseSections(headChangelog)
   /** @type {{section: string, line: number, text: string}[]} */
   const hits = []
   for (const s of sections) {
@@ -824,8 +521,9 @@ export function findMisplacedEntries(
     if (isNewSection) continue // release PR: `## Unreleased` renamed to `## vX.Y.Z`
     for (let n = s.start; n <= s.end; n++) {
       if (!addedLineNumbers.has(n)) continue
-      const text = (masked[n - 1] ?? '').trim()
-      if (!text) continue // blank, an HTML comment, or fenced code
+      if (!prose[n - 1]) continue // fenced code or an HTML block, not an entry
+      const text = (rawLines[n - 1] ?? '').trim()
+      if (!text) continue // blank
       if (/^#{1,6}\s/.test(text)) continue // a sub-heading is structure, not an entry
       hits.push({ section: s.heading, line: n, text: (rawLines[n - 1] ?? '').trim() })
     }
@@ -1163,29 +861,13 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
   const baseChangelog = gitSoft(['show', `${mergeBase}:CHANGELOG.md`], cwd)
   const headChangelog = gitSoft(['show', `${range.head}:CHANGELOG.md`], cwd)
 
-  // A fence left open at EOF is CommonMark-correct — it runs to the end of the
-  // document — but it means every `## ` heading below it is masked away, so the
-  // placement rule inspects nothing down there and would otherwise report a
-  // confident OK over a blind spot. Say so rather than passing silently.
-  const headMaskState = maskNonProseWithState(headChangelog)
-  const unclosedFence = headMaskState.unclosedFenceLine
-  if (unclosedFence !== null) {
-    warnings.push(
-      `check-changelog-entry: WARN — CHANGELOG.md has a code fence opened at line ${unclosedFence} that is never closed.`,
-      '  Per CommonMark that fence runs to end-of-file, so every `## ` heading below it is code, not a',
-      '  section — the placement rule cannot see anything past it. Close the fence.',
-    )
-  }
-  // Same class of blind spot, same duty to be loud: a line-start `<!--` never
-  // closed masks every `## ` heading below it away too.
-  const unclosedComment = headMaskState.unclosedCommentLine
-  if (unclosedComment !== null) {
-    warnings.push(
-      `check-changelog-entry: WARN — CHANGELOG.md has an HTML comment opened at line ${unclosedComment} that is never closed.`,
-      '  Everything below it is comment body, not prose, so every `## ` heading past it is invisible to',
-      '  the placement rule. Close the comment with `-->`.',
-    )
-  }
+  // NOTE: the unclosed-fence / unclosed-comment WARNs that used to live here
+  // were a backstop for the hand-written masker's own guesswork — "I may have
+  // masked to EOF, so I might be blind below this line". With the reference
+  // implementation doing the block parse there is nothing to warn ABOUT: an
+  // unclosed fence really does run to end-of-document, the parser says so
+  // exactly, and the guard's view of what is a heading is now the same view
+  // GitHub renders. A WARN with no referent is noise.
 
   const commitMessages = gitSoft(['log', `--format=%B${RECORD}`, `${mergeBase}..${range.head}`], cwd)
     .split(RECORD)

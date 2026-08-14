@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * Randomised CommonMark differential for the changelog guard's block masker.
+ * Randomised CommonMark differential for the changelog guard's block parse.
  *
  * WHY THIS IS COMMITTED
  * ---------------------
- * `tests/fixtures/commonmark-mask-cases.mjs` is the *curated* differential: 39
+ * `tests/fixtures/commonmark-mask-cases.mjs` is the *curated* differential: 42
  * hand-written rows, each one a defect somebody found by hand. It pins what is
- * already known. It cannot find anything new, and every review round of
- * `maskNonProseWithState` so far has found its defect by generating documents
- * and diffing against a real parser — from a throwaway script that was never
+ * already known. It cannot find anything new, and every review round of the
+ * guard's old hand-written masker found its defect by generating documents and
+ * diffing against a real parser — from a throwaway script that was never
  * committed. Round 4 called that out ("load-bearing evidence that is not in the
  * repo does not exist") and the curated table was the answer for the cases it
  * covers; this file is the answer for the SEARCH that produces them.
@@ -17,53 +17,65 @@
  * evidence if the next reviewer can re-derive it. This is that generator, with
  * its seeded RNG, so the same seed gives the same corpus and the same counts.
  *
- * NOT A TEST, NOT IN CI
- * ---------------------
- * `commonmark` is deliberately NOT a dependency of this repo (see the note in
- * `tests/fixtures/commonmark-mask-cases.mjs`), so this script cannot run in CI
- * and is not wired into `bun run lint` or the vitest suite. It is a reviewer's
- * tool. Install the oracle out-of-tree and point the script at it:
+ * The masker is gone: `check-changelog-entry.mjs` now parses with
+ * `commonmark@0.31.2` itself. That does NOT make this script tautological. The
+ * guard applies a deliberate FILTER on top of the parse (a heading is a section
+ * only at column 0, only as an ATX `## ` opener), and a filter is exactly the
+ * kind of thing that can be subtly wrong. So the oracle here is every level-2
+ * heading NODE the reference implementation produces, unfiltered, and the
+ * script's job is to prove that every heading the guard drops is dropped by
+ * that documented policy and by nothing else.
  *
- *   mkdir -p /tmp/cm-oracle && cd /tmp/cm-oracle && npm i commonmark@0.31.2
- *   node scripts/changelog-mask-differential.mjs --oracle /tmp/cm-oracle \
- *     --docs 60000 --seed 1
+ * NOW RUNNABLE WITHOUT SETUP
+ * --------------------------
+ * `commonmark` is an ordinary devDependency, so the old out-of-tree install
+ * dance (and the `--oracle` flag) is gone:
  *
- * WHAT IT MEASURES, AND WHAT IT DOES NOT
- * --------------------------------------
- * Only the MASKER is under test, not `parseSections`' column-0 heading policy.
- * That policy is a separate, deliberate, documented fail-CLOSED choice (see
- * `parseSections`), and letting it into these counts would blur the two. So the
- * comparison is restricted to level-2 headings whose SOURCE line is a column-0
- * `## ` ATX line — the set both implementations are supposed to agree on.
+ *   node scripts/changelog-mask-differential.mjs --docs 60000 --seed 1
  *
- *   fail-OPEN   — CommonMark renders a heading the guard does not see. The
+ * It is still a reviewer's tool, not a test: 60k random documents is far too
+ * slow for CI, and the curated battery is what runs there.
+ *
+ * WHAT IT MEASURES
+ * ----------------
+ *   fail-OPEN   — the reference implementation produces a level-2 heading at a
+ *                 COLUMN-0 `## ` line and the guard does not see it. The
  *                 placement rule then cannot check entries under it: a buried
- *                 entry reported OK. This is the direction that matters.
- *   fail-CLOSED — the guard sees a heading CommonMark does not render. Worst
- *                 case a false FAIL. Noisy, not dangerous.
+ *                 entry reported OK. This is the direction that matters, and it
+ *                 must be ZERO.
+ *   fail-CLOSED — the guard reports a section the reference implementation does
+ *                 not produce a heading for at all. Worst case a false FAIL.
+ *                 Also expected to be zero now.
+ *   policy      — a heading the reference DOES render that the guard drops
+ *                 because it is indented 1–3 spaces or is a setext underline.
+ *                 Deliberate, documented, fail-CLOSED (see `parseSections`).
+ *                 Reported so the count is visible rather than silently folded
+ *                 into "agrees".
  *
- * Every run also reports how many fail-opens are SILENT, i.e. reach a wrong
- * answer with both `unclosedFenceLine` and `unclosedCommentLine` null, so the
- * guard's own WARN backstop never fires. That is the number to watch: a loud
- * fail-open is a bug, a silent one is a trap.
+ * CONTAINER SAMPLING
+ * ------------------
+ * The container list used to attach its marker to the SAME line as the
+ * construct (`- ```yaml`). That never generates the file's own house style —
+ * a bullet on one line, the block indented UNDER it on the next — which is the
+ * shape that produced the round-5 and round-7 fail-opens. Markers are now drawn
+ * from both forms, and the indented form applies to EVERY line of the
+ * construct, not just its opener.
  *
  * FLAGS
  * -----
- *   --oracle DIR       where `commonmark` is installed (default /tmp/cm-oracle)
  *   --docs N           corpus size (default 60000)
  *   --seed N           PRNG seed (default 1)
- *   --modelled-only    drop raw HTML blocks, block quotes and setext — the
- *                      constructs the masker openly does not model. Their
- *                      divergences are documented and fail-CLOSED by
- *                      construction, and at ~1 in 3 documents they swamp the
- *                      fail-CLOSED column.
+ *   --modelled-only    drop raw HTML blocks, block quotes and setext. Retained
+ *                      for continuity with the numbers earlier rounds quoted;
+ *                      with a real parser there is no longer anything the guard
+ *                      does not model, so it should change nothing.
  */
 
-import { createRequire } from 'node:module'
-import path from 'node:path'
 import process from 'node:process'
 
-import { maskNonProseWithState } from './check-changelog-entry.mjs'
+import { Parser } from 'commonmark'
+
+import { parseSections } from './check-changelog-entry.mjs'
 
 /**
  * Deterministic 32-bit PRNG (mulberry32). Seeded so a quoted count is
@@ -86,7 +98,45 @@ const pick = (r, xs) => xs[Math.floor(r() * xs.length)]
 const upto = (r, n) => Math.floor(r() * n)
 
 const INDENTS = ['', ' ', '  ', '   ', '    ', '     ', '      ']
-const CONTAINERS = ['', '- ', '* ', '1. ', '> ', '- > ']
+
+/**
+ * How a construct is placed inside (or outside) a block container.
+ *
+ * `prefix` puts the marker on the construct's FIRST line, the way this script
+ * used to do it exclusively. `lead` + `indent` puts the marker on a PRECEDING
+ * line and indents EVERY line of the construct under it — the house style, and
+ * the shape the old same-line-only list could never generate. Leaving it out
+ * under-sampled the interesting half of the search space by roughly two orders
+ * of magnitude; every container defect the review rounds found lives in it.
+ */
+const CONTAINERS = [
+  { lead: [], prefix: '', indent: '' },
+  { lead: [], prefix: '- ', indent: '' },
+  { lead: [], prefix: '* ', indent: '' },
+  { lead: [], prefix: '1. ', indent: '' },
+  { lead: [], prefix: '> ', indent: '' },
+  { lead: [], prefix: '- > ', indent: '' },
+  { lead: ['- an entry with an example:', ''], prefix: '', indent: '  ' },
+  { lead: ['- an entry with an example:'], prefix: '', indent: '  ' },
+  { lead: ['* an entry with an example:', ''], prefix: '', indent: '  ' },
+  { lead: ['1. an entry with an example:', ''], prefix: '', indent: '   ' },
+  { lead: ['- an entry, over-indented example:', ''], prefix: '', indent: '    ' },
+  { lead: ['> quoted context', ''], prefix: '', indent: '> ' },
+]
+
+/**
+ * Place `lines` in `container`. The marker either leads the first line or sits
+ * on its own line above, with the whole construct indented beneath it.
+ * @param {string[]} lines
+ * @param {{lead: string[], prefix: string, indent: string}} container
+ * @returns {string[]}
+ */
+function place(lines, container) {
+  if (container.lead.length === 0) {
+    return lines.map((l, i) => (i === 0 ? container.prefix + l : l))
+  }
+  return [...container.lead, ...lines.map((l) => container.indent + l)]
+}
 
 /**
  * Emit one random block construct as an array of lines.
@@ -142,26 +192,27 @@ function construct(r, modelledOnly) {
       for (let i = 0, n = upto(r, 3); i <= n; i++) {
         body.push(openIndent + pick(r, ['key: value', '$ cmd', '## v9.9.9 — pasted', '<!-- x', '-->']))
       }
-      const lines = [container + openIndent + char.repeat(openLen) + info, ...body]
+      const lines = [openIndent + char.repeat(openLen) + info, ...body]
       // A quarter of fences are left unclosed on purpose — an unclosed fence
-      // runs to EOF in CommonMark and is the shape the WARN backstop exists for.
+      // runs to EOF in CommonMark, and inside a container it ends with the
+      // container instead, which is the whole container question.
       if (r() < 0.75) {
         lines.push(pick(r, INDENTS) + char.repeat(3 + upto(r, 3)))
       }
-      return lines
+      return place(lines, container)
     }
     case 'comment': {
       const indent = pick(r, INDENTS)
       const container = pick(r, CONTAINERS)
       const open = pick(r, ['<!--', '<!-->', '<!--->', '<!-- note', '<!---->'])
-      const lines = [container + indent + open]
+      const lines = [indent + open]
       if (!open.includes('-->')) {
         for (let i = 0, n = upto(r, 3); i <= n; i++) {
           lines.push(indent + pick(r, ['note', '## v8.8.8 — commented out', '```', 'text']))
         }
         if (r() < 0.75) lines.push(pick(r, INDENTS) + pick(r, ['-->', 'tail -->']))
       }
-      return lines
+      return place(lines, container)
     }
     case 'heading':
       return [`## S${upto(r, 100)}`]
@@ -197,38 +248,33 @@ function document(r, modelledOnly) {
 }
 
 /**
- * Level-2 headings the reference implementation renders, restricted to those
- * whose SOURCE line is a column-0 `## ` ATX line. See the header note: this is
- * what isolates the masker from `parseSections`' column-0 policy.
- * @param {any} cm
+ * EVERY level-2 heading node the reference implementation produces, with the
+ * source line it came from and whether that line is a column-0 `## ` ATX
+ * opener. Deliberately UNFILTERED: the guard's column-0 policy is the thing
+ * under test, so the oracle must not bake it in.
  * @param {string} md
- * @returns {number[]} 1-based source lines
+ * @returns {{line: number, columnZero: boolean}[]}
  */
-function oracleH2Lines(cm, md) {
+function oracleH2(md) {
   const srcLines = md.split('\n')
-  const walker = new cm.Parser().parse(md).walker()
-  /** @type {number[]} */
+  const walker = new Parser().parse(md).walker()
+  /** @type {{line: number, columnZero: boolean}[]} */
   const out = []
   let ev
   while ((ev = walker.next())) {
     if (!ev.entering || ev.node.type !== 'heading' || ev.node.level !== 2) continue
     const line = ev.node.sourcepos[0][0]
-    if (/^##\s/.test(srcLines[line - 1] ?? '')) out.push(line)
+    out.push({
+      line,
+      columnZero: ev.node.sourcepos[0][1] === 1 && /^##\s/.test(srcLines[line - 1] ?? ''),
+    })
   }
   return out
 }
 
-/** Level-2 headings the guard's masker leaves visible at column 0. */
+/** The 1-based lines the guard reports as section headings. */
 function guardH2Lines(/** @type {string} */ md) {
-  const state = maskNonProseWithState(md)
-  const lines = state.text.split('\n')
-  /** @type {number[]} */
-  const out = []
-  for (let i = 0; i < lines.length; i++) if (/^##\s/.test(lines[i])) out.push(i + 1)
-  return {
-    lines: out,
-    warned: state.unclosedFenceLine !== null || state.unclosedCommentLine !== null,
-  }
+  return parseSections(md).map((s) => s.headingLine)
 }
 
 function main() {
@@ -238,54 +284,51 @@ function main() {
     const i = argv.indexOf(`--${name}`)
     return i === -1 ? fallback : argv[i + 1]
   }
-  const oracleDir = arg('oracle', '/tmp/cm-oracle')
   const docs = Number(arg('docs', '60000'))
   const seed = Number(arg('seed', '1'))
   const modelledOnly = argv.includes('--modelled-only')
 
-  let cm
-  try {
-    cm = createRequire(path.resolve(oracleDir) + path.sep)('commonmark')
-  } catch {
-    console.error(
-      `changelog-mask-differential: no \`commonmark\` under ${oracleDir}.\n` +
-        `  mkdir -p ${oracleDir} && (cd ${oracleDir} && npm i commonmark@0.31.2)`,
-    )
-    process.exit(2)
-  }
-
   const r = rng(seed)
   let failOpen = 0
-  let failOpenSilent = 0
   let failClosed = 0
+  let policy = 0
   /** @type {string[]} */
   const samples = []
   for (let i = 0; i < docs; i++) {
     const md = document(r, modelledOnly)
-    const want = oracleH2Lines(cm, md)
-    const got = guardH2Lines(md)
-    const set = new Set(got.lines)
-    const missing = want.filter((l) => !set.has(l))
-    const extra = got.lines.filter((l) => !want.includes(l))
-    if (missing.length > 0) {
+    const want = oracleH2(md)
+    const got = new Set(guardH2Lines(md))
+    const wantLines = new Set(want.map((h) => h.line))
+
+    // A heading the reference produced that the guard does not report. If its
+    // source line is a column-0 `## ` opener that is a genuine fail-OPEN; if it
+    // is indented or setext it is the documented policy.
+    let docFailOpen = false
+    for (const h of want) {
+      if (got.has(h.line)) continue
+      if (h.columnZero) docFailOpen = true
+      else policy++
+    }
+    if (docFailOpen) {
       failOpen++
-      if (!got.warned) failOpenSilent++
       if (samples.length < 5) samples.push(md)
     }
-    if (extra.length > 0) failClosed++
+    // A section the guard reports where the reference produced no heading at all.
+    if ([...got].some((l) => !wantLines.has(l))) failClosed++
   }
 
   console.log(
-    `docs=${docs} seed=${seed} oracle=commonmark@${cm.version ?? '0.31.2'}` +
+    `docs=${docs} seed=${seed} oracle=commonmark@0.31.2` +
       (modelledOnly ? ' scope=modelled-only' : ' scope=all-constructs'),
   )
-  console.log(`fail-OPEN   ${failOpen}  (silent, no WARN: ${failOpenSilent})`)
+  console.log(`fail-OPEN   ${failOpen}`)
   console.log(`fail-CLOSED ${failClosed}`)
+  console.log(`policy      ${policy}  (indented / setext h2 the guard deliberately drops)`)
   if (samples.length > 0) {
     console.log('\nfirst fail-open samples:\n')
     for (const s of samples) console.log(`${'-'.repeat(60)}\n${s}`)
   }
-  process.exitCode = 0
+  process.exitCode = failOpen > 0 ? 1 : 0
 }
 
 main()

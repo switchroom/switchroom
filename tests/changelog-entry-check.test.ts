@@ -21,6 +21,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
+import { parseSections, extractUnreleasedEntries } from "../scripts/check-changelog-entry.mjs";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const CHECK = join(repoRoot, "scripts", "check-changelog-entry.mjs");
@@ -654,10 +655,15 @@ describe("check-changelog-entry — a fenced code block is not a section boundar
     expect(r.out).toContain("## v0.20.11");
   });
 
-  it("WARNs when a code fence is left open at end-of-file", () => {
-    // CommonMark-correct — an unclosed fence runs to EOF — but it means every
-    // `## ` heading below it is code, so the placement rule inspects nothing
-    // down there. That must not read as a confident OK.
+  it("an unclosed fence really does run to EOF: everything below it is code", () => {
+    // This case used to assert a WARN ("I may have masked to EOF, so I might be
+    // blind below this line") — a backstop for the hand-written masker's own
+    // guesswork. The block parse now comes from the reference implementation,
+    // which does not guess: an unclosed fence runs to end-of-document, full
+    // stop. So the assertion is the OUTCOME instead of the hedge. The branch's
+    // one added line lands INSIDE that fence, so it is code, `## Unreleased`
+    // has not grown, and the run FAILs — the fail-CLOSED direction, and the
+    // same answer GitHub renders.
     const UNCLOSED = [
       "# Changelog",
       "",
@@ -678,9 +684,16 @@ describe("check-changelog-entry — a fenced code block is not a section boundar
     f.writeFile("CHANGELOG.md", `${UNCLOSED}- **Branch entry (#2):** staged.\n`);
     f.commit("feat: ship code with an unclosed fence in the changelog");
 
-    const r = f.check();
-    expect(r.out).toContain("code fence opened at line 7 that is never closed");
-    expect(r.out).toContain("the placement rule cannot see anything past it");
+    const r = f.checkStreams();
+    expect(r.code).toBe(1);
+    const blob = `${r.stdout}${r.stderr}`;
+    expect(blob).toContain("check-changelog-entry: FAIL");
+    expect(blob).not.toContain("## Unreleased grew");
+    // The old WARN wording is gone, and nothing replaced it with a hedge.
+    expect(blob).not.toContain("never closed");
+    // `## v0.20.11` sits below the unclosed fence, so it is NOT a section —
+    // the guard and the renderer agree there is exactly one heading in the file.
+    expect(parseSections(`${UNCLOSED}- **Branch entry (#2):** staged.\n`).length).toBe(1);
   });
 });
 
@@ -852,19 +865,15 @@ describe("check-changelog-entry — a `<!--` in prose does not blind the parser"
     expect(r.out).not.toContain("v9.9.9");
   });
 
-  it("WARNs on STDOUT when an HTML comment is left open at end-of-file", () => {
-    // Belt to the anchoring rule's braces. Anchoring makes the fail-open shape
-    // unreachable from prose, but a guard whose entire value proposition is
-    // "does not fail open" has to be LOUD when its own state machine ends in an
-    // unexpected state — the same duty, and the same wording, as the unclosed
-    // fence WARN it sits beside.
-    //
-    // Asserted on stdout ALONE on purpose: `bun run lint` and every `2>/dev/null`
-    // invocation show stdout only, so a WARN written to stderr would be invisible
-    // to the operator it is addressed to. The merged blob cannot tell them apart.
-    // The unclosed comment is in the BASE and trails the file, so the run itself
-    // PASSES — which is the case that matters. A WARN only earns its keep when
-    // the verdict is OK; on a FAIL the operator is already reading the output.
+  it("an unclosed comment trailing the file swallows only what is below it", () => {
+    // This case used to assert a WARN, for the same reason as the unclosed
+    // fence beside it, and it loses its referent for the same reason: the
+    // reference implementation states the block's extent exactly, so there is
+    // nothing to hedge about. What is worth pinning is the OUTCOME — the
+    // trailing opener is the LAST thing in the file, so it swallows nothing
+    // that matters, both sections are still visible, and the branch's staged
+    // entry is still counted. A guard that went quiet here would be the real
+    // regression.
     const UNCLOSED = [
       "# Changelog", //                                                   1
       "", //                                                              2
@@ -896,9 +905,19 @@ describe("check-changelog-entry — a `<!--` in prose does not blind the parser"
 
     const r = f.checkStreams();
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain("HTML comment opened at line 14 that is never closed");
-    expect(r.stdout).toContain("every `## ` heading past it is invisible to");
-    expect(r.stdout).toContain("Close the comment with `-->`");
+    const blob = `${r.stdout}${r.stderr}`;
+    expect(blob).toContain("## Unreleased grew");
+    expect(blob).not.toContain("ALREADY-RELEASED");
+    // The old WARN wording is gone, and nothing replaced it with a hedge.
+    expect(blob).not.toContain("never closed");
+    // Non-vacuity: the trailing opener did not eat the released section, and
+    // the staged entry is genuinely counted as growth.
+    const head = readFileSync(join(f.dir, "CHANGELOG.md"), "utf-8");
+    expect(parseSections(head).map((s) => s.heading)).toEqual([
+      "## Unreleased",
+      "## v0.20.11 — a released section",
+    ]);
+    expect(extractUnreleasedEntries(head)).toContain("- **Branch entry (#2):** staged.");
   });
 });
 
@@ -1383,6 +1402,67 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
     expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
   });
 
+  it("ROUND 7: PROSE ends the container, and a later fence is a fence — not a parity flip", () => {
+    // The blocker that ended the approximation, and the reason this file now
+    // uses the reference implementation instead of a state machine.
+    //
+    // Every earlier container fix armed its dedent latch from the DEDENTING
+    // LINE — it only knew a closer was pending if the line that dedented was
+    // itself fence- or comment-delimiter-shaped. Here PROSE dedents. The latch
+    // is armed with no pending delimiter, so the next bare ``` retires it and
+    // is read as a fresh opener, fence parity inverts, and the masker blanks
+    // every heading below to EOF. Both unclosed-* WARNs stayed null, so the
+    // backstop never fired: a silent exit 0 over a buried entry.
+    //
+    // The shape is this repo's own house style, not a contrivance. Spliced into
+    // the REAL CHANGELOG.md at the previous head it took 429 sections to 179.
+    //
+    // Red-then-green, measured on this exact fixture: `parseSections` at
+    // 91bb46b8 returns ["## Unreleased"]; after the rewrite it returns both
+    // headings, which is what `commonmark@0.31.2` renders.
+    const s = fixture("changelog-container-prose-dedent-", [
+      "",
+      "  ```yaml",
+      "  key: value",
+      "",
+      "Prose back at column zero ends the list item, and the fence with it.",
+      "",
+      "```",
+      "some pasted output",
+      "```",
+    ]).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("ROUND 7, CRLF: the same document with Windows line endings behaves identically", () => {
+    // The normalisation happens once, in `analyze`, before the parse. Pinned
+    // because the round-7 blocker reproduced under CRLF too, and a rewrite that
+    // normalised in only some of its entry points would leave half the guard
+    // reading `\r`-suffixed lines.
+    const f = fixture("changelog-container-prose-dedent-crlf-", [
+      "",
+      "  ```yaml",
+      "  key: value",
+      "",
+      "Prose back at column zero ends the list item, and the fence with it.",
+      "",
+      "```",
+      "some pasted output",
+      "```",
+    ]);
+    const p = join(f.dir, "CHANGELOG.md");
+    writeFileSync(p, readFileSync(p, "utf-8").replace(/\r?\n/g, "\r\n"));
+    f.commit("chore: convert the changelog to CRLF");
+
+    const s = f.checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+  });
+
   it("the dedenting delimiter is the new OPENER, so it cannot also retire the latch", () => {
     // The fence-path twin of the test above, and the one that pins why the
     // dedenting line is consumed (blanked, `continue`) rather than falling
@@ -1416,22 +1496,22 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
     expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
   });
 
-  it("a 4-space-indented ``` is an indented CODE block, not a fence opener", () => {
-    // The `/^ {0,3}(...)/` opener bound, previously unpinned in either
-    // direction: widen it to `/^ {0,4}(...)/` and all 169 tests still passed,
-    // even though indent semantics is this whole change's subject.
+  it("indent is measured against the CONTAINER: 4 spaces under a bullet is a FENCE", () => {
+    // This case previously asserted exit 0, on the claim that "commonmark@0.31.2
+    // agrees the block is an indented code block". It does not, and the claim
+    // was reasoned at document level while the fixture puts the block inside a
+    // list item. `- ` gives that item a content indent of 2, so a 4-space line
+    // is indented 2 RELATIVE to the item — under the 4 an indented code block
+    // needs, and a perfectly ordinary fence opener. The reference renderer emits
+    // `<pre><code>## v9.9.9 …</code></pre>` inside the `<li>`, i.e. the pasted
+    // heading is code, exactly as it would be at 2 spaces or 3.
     //
-    // Direction, honestly: with the container rule in place this mutant is NOT
-    // fail-OPEN — a column-0 heading below dedents out of the phantom fence, so
-    // the heading survives. What it breaks is RULE 1. At document level a
-    // 4-space-indented block is literal code CONTENT, so its lines are real
-    // added lines; read them as a fence and they are masked away, and a PR that
-    // did stage content under `## Unreleased` reds for staging nothing. A false
-    // FAIL, sticky until someone re-indents the block.
-    //
-    // Mutation-proven: `/^ {0,3}(...)/` → `/^ {0,4}(...)/` and this run flips
-    // to exit 1. `commonmark@0.31.2` agrees the block is an indented code block
-    // and renders `## v0.20.11`.
+    // So the PR here adds three lines under `## Unreleased` and every one of
+    // them is inside a code block. `## Unreleased` did NOT grow, and the guard
+    // now says so — a deliberate behaviour change from the approximation, in the
+    // fail-CLOSED direction, agreeing with what GitHub renders. Nothing is
+    // silently relaxed: the doc-level shape the old comment was actually
+    // describing is pinned by the sibling test below, and it still passes.
     const BASE = [
       "# Changelog",
       "",
@@ -1458,10 +1538,61 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
     f.commit("feat: ship code and stage an indented literal block under Unreleased");
 
     const s = f.checkStreams();
+    expect(s.code).toBe(1);
+    const blob = `${s.stdout}${s.stderr}`;
+    expect(blob).toContain("check-changelog-entry: FAIL");
+    expect(blob).not.toContain("## Unreleased grew");
+    // The fence is scoped to its list item, so the released heading below it is
+    // still a section — this is fail-CLOSED on RULE 1, not blindness on RULE 2.
+    const head = readFileSync(join(f.dir, "CHANGELOG.md"), "utf-8");
+    expect(parseSections(head).map((x) => x.heading)).toEqual([
+      "## Unreleased",
+      "## v0.20.11 — a released section",
+    ]);
+  });
+
+  it("at DOCUMENT level a 4-space block is indented CODE, and its lines are entries", () => {
+    // The shape the case above was mis-describing, pinned properly: no list
+    // item, so 4 spaces from column 0 really is an indented code block. The
+    // guard deliberately does NOT mask indented code — a literal block staged
+    // under `## Unreleased` is a legitimate entry body, and this is exactly the
+    // scope the masker it replaced had, so the rewrite changes nothing here.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-doclevel-indent4-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "<!-- staging area; entries land here per-PR -->\n",
+        "<!-- staging area; entries land here per-PR -->\n\n    ## v9.9.9 — pasted release heading\n    more literal text\n",
+      ),
+    );
+    f.commit("feat: ship code and stage a document-level indented literal block");
+
+    const s = f.checkStreams();
     expect(s.code).toBe(0);
-    expect(`${s.stdout}${s.stderr}`).toContain("## Unreleased grew");
-    expect(`${s.stdout}${s.stderr}`).not.toContain("ALREADY-RELEASED");
-    expect(`${s.stdout}${s.stderr}`).not.toContain("WARN");
+    const blob = `${s.stdout}${s.stderr}`;
+    expect(blob).toContain("## Unreleased grew");
+    expect(blob).not.toContain("ALREADY-RELEASED");
+    // And the indented `## v9.9.9` is NOT a section — column-0 anchoring and the
+    // parser both refuse it, so the released heading below stays the only one.
+    const head = readFileSync(join(f.dir, "CHANGELOG.md"), "utf-8");
+    expect(parseSections(head).map((x) => x.heading)).toEqual([
+      "## Unreleased",
+      "## v0.20.11 — a released section",
+    ]);
+    expect(extractUnreleasedEntries(head)).toContain("## v9.9.9 — pasted release heading");
   });
 
   it("does NOT over-correct: a fence under a bullet that CLOSES still hides its `## ` line", () => {
