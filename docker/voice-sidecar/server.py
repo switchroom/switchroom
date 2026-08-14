@@ -63,6 +63,8 @@ HTTP contract
               → 200 audio/ogg  (ONE continuous OGG/Opus stream, mono — ready
                 for Telegram sendVoice, which REQUIRES OGG/Opus). Text of any
                 length is chunked to VOICE_TTS_MAX_CHARS pieces internally,
+                then each piece's PHONEME string is chunked to
+                VOICE_TTS_MAX_PHONEMES so Kokoro never hard-slices it,
                 each synthesized on the GPU, and re-joined into a SINGLE file.
               → 4xx/5xx { ok: false, reason, detail }
   GET  /healthz
@@ -163,6 +165,42 @@ TTS_FORMAT = os.environ.get("VOICE_TTS_FORMAT", "ogg").lower()
 TTS_CONCURRENCY = max(1, int(os.environ.get("VOICE_TTS_CONCURRENCY", "1")))
 TTS_REQUEST_TIMEOUT_S = float(os.environ.get("VOICE_TTS_REQUEST_TIMEOUT_S", "60"))
 TTS_MAX_CHARS = int(os.environ.get("VOICE_TTS_MAX_CHARS", "1200"))
+# ── phoneme-length chunking (#4695) ────────────────────────────────────
+# TTS_MAX_CHARS alone is NOT a correctness bound: kokoro-onnx synthesizes in
+# units of PHONEMES and hard-slices any single batch longer than its
+# MAX_PHONEME_LENGTH = 510 (kokoro_onnx/__init__.py:97-101, verified against the
+# 0.5.0 wheel installed in this image). Kokoro does re-batch a long phoneme
+# string first (Kokoro._split_phonemes), but that splitter breaks ONLY on
+# `.,!?;` — so any punctuation-free run over 510 phonemes still overflows.
+#
+# And the overflow does not merely truncate. Two lines after the slice,
+# `voice = voice[len(tokens)]` (kokoro_onnx/__init__.py:108) indexes a voices
+# array of exactly 510 rows, so a batch that slices to 510 IN-VOCAB phonemes
+# indexes one past the end and RAISES — the whole /tts request 500s and the
+# user gets no voice message at all:
+#     IndexError: index 510 is out of bounds for axis 0 with size 510
+# Reproduced against the real model on a real corpus message (1,545-phoneme
+# batch). All 16 over-510 batches in a 1,679-message production corpus land on
+# that raise, not on a partial read — 15 messages, 0.9%, failing outright.
+#
+# So we chunk on the thing that actually overflows: after G2P we split the
+# phoneme string ourselves to <= TTS_MAX_PHONEMES and hand Kokoro one
+# already-safe batch at a time. Characters remain the COARSE pass (it bounds
+# G2P work and keeps sentence-aware seams); phonemes are the correctness pass.
+#
+# 500, not 510: Kokoro._split_phonemes compares with `>=` MAX_PHONEME_LENGTH,
+# so a break-free chunk of 509 or more makes it emit a leading EMPTY batch
+# (which then synthesizes as a stray blip). 508 is the highest safe value and
+# is enforced as the ceiling regardless of what the env asks for; 500 is the
+# default because a little headroom costs nothing measurable (+1.5% batches on
+# the production corpus) and keeps the seam choice ours.
+#
+# The clamp is silent-by-value but not silent-by-log: an operator who sets 600
+# (or 0) would otherwise never learn the value did not take. main() warns —
+# see _max_phonemes_clamp_warning.
+TTS_MAX_PHONEMES_CEILING = 508
+TTS_MAX_PHONEMES_REQUESTED = int(os.environ.get("VOICE_TTS_MAX_PHONEMES", "500"))
+TTS_MAX_PHONEMES = max(1, min(TTS_MAX_PHONEMES_CEILING, TTS_MAX_PHONEMES_REQUESTED))
 # Defence-in-depth ceiling on the raw JSON body (text is otherwise unbounded,
 # chunked internally). 256KB ≈ ~40k chars of UTF-8 — far above any real reply.
 TTS_MAX_BODY_BYTES = int(os.environ.get("VOICE_TTS_MAX_BODY_BYTES", str(256 * 1024)))
@@ -678,6 +716,118 @@ def _split_text(text: str, max_chars: int) -> list[str]:
     return [p for p in pieces if p]
 
 
+# Kokoro's own phoneme batcher breaks on exactly this set; matching it keeps our
+# seams where Kokoro would have put them when it could.
+_PHONEME_BREAKS = ".,!?;"
+
+
+def _normalize_phonemes(phonemes: str) -> str:
+    """Rebuild a phoneme string exactly the way Kokoro._split_phonemes rebuilds
+    it: every clause stripped, break chars kept flush against the clause they
+    end, a single space between runs.
+
+    Kokoro runs that rebuild on whatever we hand it and it can make the string
+    LONGER — `a,b` comes back as `a, b` — so `len(chunk)` here and the length
+    Kokoro measures are not the same number unless we normalise first (measured:
+    a 500-phoneme chunk re-expanding to 749 on the production corpus, which
+    Kokoro then re-split into 508 + 241).
+
+    That growth cannot by itself cause truncation — it only ever happens at a
+    break char, and break chars are exactly where Kokoro re-batches. What it
+    does cause is Kokoro silently re-splitting chunks we already sized, putting
+    seams somewhere we did not choose and making `batches` in the response meta
+    a lie. Normalising makes Kokoro's rebuild a fixed point: our chunk is the
+    batch, one for one."""
+    import re
+
+    out = ""
+    for part in re.split(r"([.,!?;])", phonemes):
+        part = part.strip()
+        if not part:
+            continue
+        if part in _PHONEME_BREAKS:
+            out += part
+        else:
+            out = (out + " " + part) if out else part
+    return out
+
+
+def _split_phonemes(phonemes: str, max_phonemes: int) -> tuple[list[str], int]:
+    """Split a phoneme string into chunks of at most `max_phonemes`, preferring
+    Kokoro's own break characters (`.,!?;`) then whitespace, so a chunk boundary
+    lands where a clause or word already ends.
+
+    LOSSLESS by construction: every phoneme of the input appears in exactly one
+    chunk (whitespace between chunks is the only thing normalised away). This is
+    the whole point of #4695 — hand Kokoro an over-long run and it discards the
+    tail or (usually) raises; this carries the tail into the next chunk instead.
+
+    Returns (chunks, hard_cuts). `hard_cuts` counts boundaries that had to land
+    MID-WORD because a single run of `max_phonemes` phonemes contained no space
+    and no break char. Those are audible seams, not lost audio, and are rare
+    enough that the caller logs them loudly rather than swallowing them.
+
+    Pure — no Kokoro, no misaki, no globals. Directly unit-testable."""
+    phonemes = _normalize_phonemes(phonemes)
+    if not phonemes:
+        return [], 0
+    if len(phonemes) <= max_phonemes:
+        return [phonemes], 0
+
+    # Units = clauses, each keeping its trailing break char. Concatenating the
+    # units reproduces the input exactly.
+    units: list[str] = []
+    cur = ""
+    for ch in phonemes:
+        cur += ch
+        if ch in _PHONEME_BREAKS:
+            units.append(cur)
+            cur = ""
+    if cur:
+        units.append(cur)
+
+    chunks: list[str] = []
+    hard_cuts = 0
+
+    def _emit(unit: str) -> None:
+        """Append one unit as one or more chunks, breaking on whitespace, and
+        only mid-word when a run leaves no other option."""
+        nonlocal hard_cuts
+        unit = unit.strip()
+        while unit:
+            if len(unit) <= max_phonemes:
+                chunks.append(unit)
+                return
+            head = unit[:max_phonemes]
+            cut = head.rfind(" ")
+            if cut <= 0:
+                # An unbreakable run longer than the cap. Cut it, but keep the
+                # remainder — Kokoro would have thrown the remainder away.
+                chunks.append(head)
+                unit = unit[max_phonemes:].strip()
+                hard_cuts += 1
+                continue
+            chunks.append(head[:cut].strip())
+            unit = unit[cut:].strip()
+
+    for unit in units:
+        stripped = unit.strip()
+        if not stripped:
+            continue
+        # Pack back-to-back clauses into one chunk while they fit, so we do not
+        # emit more synthesis batches than necessary. The separator has to match
+        # Kokoro's rebuild exactly or the chunk stops being a fixed point of it:
+        # Kokoro appends a break char FLUSH ("a" + ";") and space-joins anything
+        # else. Adjacent breaks (";." "?!" ",,") are the case that differs.
+        sep = "" if stripped[0] in _PHONEME_BREAKS else " "
+        if chunks and len(chunks[-1]) + len(sep) + len(stripped) <= max_phonemes:
+            chunks[-1] = (chunks[-1] + sep + stripped).strip()
+            continue
+        _emit(unit)
+
+    return [c for c in chunks if c], hard_cuts
+
+
 TTS_SPEED_MIN = 0.5
 TTS_SPEED_MAX = 2.0
 TTS_SPEED_DEFAULT = 1.0
@@ -765,15 +915,58 @@ def _normalize_text(text: str) -> str:
         return text
 
 
+_espeak_phonemize_warned = False
+
+
+def _espeak_phonemize(piece: str) -> tuple[str, bool]:
+    """Phonemize one text piece with Kokoro's OWN espeak tokenizer, i.e. exactly
+    the call `Kokoro.create()` would make internally for `is_phonemes=False`.
+
+    Doing it here rather than inside create() is what lets the espeak path be
+    phoneme-chunked too (#4695) — otherwise that path keeps chunking on
+    characters and keeps overflowing. The output is identical to what create()
+    would have computed, so this is a batching change, not a voice change.
+
+    Returns (phonemes, True) on success, or (piece, False) when the tokenizer is
+    not reachable (a stub _tts in tests, an unexpected kokoro-onnx layout) or
+    raises — in which case the caller falls back to handing Kokoro raw text and
+    accepts today's character-bounded behaviour. Logged ONCE. Never raises."""
+    global _espeak_phonemize_warned
+    with _tts_lock:
+        tts = _tts
+    tokenizer = getattr(tts, "tokenizer", None)
+    phonemize = getattr(tokenizer, "phonemize", None)
+    if phonemize is None:
+        return piece, False
+    try:
+        phonemes = phonemize(piece, TTS_LANG)
+        if not phonemes:
+            return piece, False
+        return phonemes, True
+    except Exception as exc:  # noqa: BLE001 — degrade to the raw-text path
+        if not _espeak_phonemize_warned:
+            _espeak_phonemize_warned = True
+            _log(
+                f"espeak phonemize failed ({type(exc).__name__}: {exc}); "
+                "falling back to Kokoro's internal text path — a clause past "
+                "510 phonemes will be truncated or fail the request "
+                "(logged once)"
+            )
+        return piece, False
+
+
 def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> tuple[bytes, dict]:
     """The TTS-serialized synthesis. Acquires the TTS semaphore so only
     TTS_CONCURRENCY synths run at once — a separate lane from STT.
 
     Accepts text of ANY length: it is split into pieces ≤ TTS_MAX_CHARS on
-    sentence/paragraph boundaries, each synthesized on the GPU, and the raw
-    24kHz PCM concatenated into ONE stream (with a short inter-piece pad so
-    joins sound natural and never click) before a SINGLE opus encode. The
-    caller therefore always gets one valid, continuous Ogg/Opus file."""
+    sentence/paragraph boundaries, each piece's PHONEME string is then split to
+    ≤ TTS_MAX_PHONEMES (#4695 — a batch past 510 phonemes is truncated by
+    Kokoro or, in practice, raises and fails the whole request), each phoneme
+    chunk synthesized on the GPU, and the raw 24kHz PCM concatenated into ONE
+    stream (with a short inter-piece pad so joins sound natural and never
+    click) before a SINGLE opus encode. The caller therefore always gets one
+    valid, continuous Ogg/Opus file."""
     import numpy as np  # local — only TTS needs numpy
 
     with _tts_sem:
@@ -784,33 +977,82 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
             pieces = [text]
 
         # ~120ms of silence between pieces at 24kHz mono — keeps the cadence
-        # natural across a sentence join without a jarring click.
+        # natural across a sentence join without a jarring click. Applied at
+        # PIECE seams only: phoneme chunks inside one piece are joined flush,
+        # exactly where Kokoro's internal batcher used to join them.
         pad = np.zeros(int(TTS_SAMPLE_RATE * 0.12), dtype=np.float32)
 
         chunks: list[np.ndarray] = []
         sample_rate = TTS_SAMPLE_RATE
+        batches = 0
+        hard_cuts = 0
+        unchunked_pieces = 0
         for i, piece in enumerate(pieces):
             # misaki's POS-aware G2P runs here, INSIDE _tts_sem — so with
             # VOICE_TTS_CONCURRENCY defaulting to 1, spaCy is never called
             # concurrently. On a hit we hand Kokoro the phoneme string
-            # (is_phonemes=True — the heteronym fix); on any miss we hand it the
-            # raw TEXT and Kokoro phonemizes via espeak (today's path). A
+            # (is_phonemes=True — the heteronym fix); on a miss we fall back to
+            # Kokoro's own espeak tokenizer, still as PHONEMES, so the piece can
+            # be phoneme-chunked either way. Only if that also fails do we hand
+            # Kokoro raw TEXT and inherit its 510-phoneme truncation. A
             # regression must never route a phoneme string through the espeak
-            # text path, so the two branches are kept explicit. See
-            # _phonemize_piece / VOICE_TTS_G2P=espeak (rollback lever).
+            # text path, so the branches are kept explicit. See
+            # _phonemize_piece / _espeak_phonemize / VOICE_TTS_G2P=espeak.
             content, is_phonemes = _phonemize_piece(piece)
+            if not is_phonemes:
+                content, is_phonemes = _espeak_phonemize(piece)
+
             if is_phonemes:
-                samples, sample_rate = _tts.create(  # type: ignore[union-attr]
-                    content, voice=voice, speed=speed, is_phonemes=True
-                )
+                piece_chunks, piece_cuts = _split_phonemes(content, TTS_MAX_PHONEMES)
+                hard_cuts += piece_cuts
             else:
+                # Last resort: no phoneme string available for this piece, so it
+                # goes to Kokoro as text and Kokoro may slice it. Log HERE, not
+                # after the loop: the very case this warning exists to report is
+                # the one where Kokoro raises inside the loop (IndexError at
+                # kokoro_onnx/__init__.py:108), and a post-loop log would never
+                # run — the request would 500 as silently as it did pre-#4695.
+                piece_chunks = []
+                unchunked_pieces += 1
+                # Once per REQUEST, not once per piece: both G2P engines being
+                # down is a whole-sidecar condition, and a 40k-char request is
+                # ~34 pieces. Same volume as the post-loop line it replaces,
+                # matching the log-once idiom of _g2p_warned /
+                # _espeak_phonemize_warned. The count still lands in the meta.
+                if unchunked_pieces == 1:
+                    _log(
+                        f"WARNING: TTS could not phonemize piece {i + 1}/"
+                        f"{len(pieces)} ({len(piece)} chars) of a "
+                        f"{len(text)}-char request; handing it to Kokoro as "
+                        "TEXT, so a clause past 510 phonemes is truncated or "
+                        "fails the whole request (IndexError at "
+                        "kokoro_onnx/__init__.py:108). Further unphonemizable "
+                        "pieces in this request are counted in the response "
+                        "meta (unchunkedPieces), not logged."
+                    )
+
+            # `piece_chunks` can also be empty with is_phonemes=True when the
+            # piece phonemises to nothing but punctuation/whitespace. That falls
+            # through to the text path below WITHOUT counting an unchunked
+            # piece: there is no speech to lose, so it is not a degradation.
+
+            if i > 0:
+                chunks.append(pad)
+
+            if not piece_chunks:
                 samples, sample_rate = _tts.create(  # type: ignore[union-attr]
                     piece, voice=voice, speed=speed, lang=TTS_LANG
                 )
-            arr = np.asarray(samples, dtype=np.float32)
-            if i > 0:
-                chunks.append(pad)
-            chunks.append(arr)
+                chunks.append(np.asarray(samples, dtype=np.float32))
+                batches += 1
+                continue
+
+            for phoneme_chunk in piece_chunks:
+                samples, sample_rate = _tts.create(  # type: ignore[union-attr]
+                    phoneme_chunk, voice=voice, speed=speed, is_phonemes=True
+                )
+                chunks.append(np.asarray(samples, dtype=np.float32))
+                batches += 1
 
         all_samples = (
             np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
@@ -825,12 +1067,31 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
             "voice": voice,
             "speed": speed,
             "pieces": len(pieces),
+            "batches": batches,
             "chars": len(text),
+            # Non-zero => audio quality was degraded on this request. Surfaced
+            # in the response so a caller can act on it, not only in the log.
+            "hardCuts": hard_cuts,
+            "unchunkedPieces": unchunked_pieces,
         }
         _log(
             f"synth: {len(text)} chars -> {len(pieces)} piece(s) -> "
-            f"{audio_seconds:.2f}s audio in {elapsed_ms}ms"
+            f"{batches} batch(es) -> {audio_seconds:.2f}s audio in {elapsed_ms}ms"
         )
+        # #4695: the failure mode this replaced surfaced only as a voice
+        # message that never arrived (a 500 from the IndexError) or, where the
+        # slice landed on an out-of-vocab phoneme, audio that stopped
+        # mid-sentence. Both residual degradation paths now shout, at WARN
+        # volume, with enough context to find the offending message. The
+        # unphonemizable-piece warning is emitted in the loop above, where it
+        # still fires if Kokoro then raises on that very piece.
+        if hard_cuts:
+            _log(
+                f"WARNING: TTS split {hard_cuts} unbreakable phoneme run(s) "
+                f"mid-word (> {TTS_MAX_PHONEMES} phonemes with no space or "
+                f"clause break) for a {len(text)}-char request; audio is "
+                "complete but has an audible seam"
+            )
         return ogg, meta
 
 
@@ -1133,9 +1394,25 @@ def _parse_multipart(body: bytes, content_type: str):
     return audio, language
 
 
+def _max_phonemes_clamp_warning() -> str | None:
+    """The warning to emit when VOICE_TTS_MAX_PHONEMES did not take as set, or
+    None when it did. Split out so the message is testable without a boot."""
+    if TTS_MAX_PHONEMES == TTS_MAX_PHONEMES_REQUESTED:
+        return None
+    return (
+        f"WARNING: VOICE_TTS_MAX_PHONEMES={TTS_MAX_PHONEMES_REQUESTED} is out "
+        f"of range and was clamped to {TTS_MAX_PHONEMES}; the ceiling is "
+        f"{TTS_MAX_PHONEMES_CEILING} because kokoro-onnx flushes a batch at "
+        ">= MAX_PHONEME_LENGTH (510) and the floor is 1"
+    )
+
+
 def main() -> int:
     if not SHARED_TOKEN:
         _log("WARNING: VOICE_SIDECAR_TOKEN is empty — every /stt and /tts call will 401")
+    _clamp_warning = _max_phonemes_clamp_warning()
+    if _clamp_warning:
+        _log(_clamp_warning)
     threading.Thread(target=_load_model, daemon=True).start()
     threading.Thread(target=_load_tts, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)
