@@ -31,7 +31,7 @@
  *   - structural: gateway constructs EXACTLY ONE OutboundDedupCache and the
  *     extracted module constructs NONE (the re-`new` hard-fail rule)
  */
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { GrammyError } from 'grammy'
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -213,6 +213,13 @@ function makeHarness(opts?: {
    *  routing kill switch. Default true (the shipped default); pass false to
    *  drive the legacy `resolveThreadId` branch. */
   turnOriginRouting?: boolean
+  /** Backing store for the `resolveThreadId` stub's last-seen fallback — the
+   *  real resolver (`gateway.ts`, `resolveThreadId`) is
+   *  `if (explicit != null) return Number(explicit); return chatThreadMap.get(chat_id)`,
+   *  so a case that cares about what a DROPPED anchor falls through TO must
+   *  populate this. Omitted → empty map → the fallback misses, which is the
+   *  behaviour every pre-existing case here assumes. */
+  chatThreadMap?: Map<string, number>
 }): Harness {
   const { api, calls } = makeFakeBot(opts?.failNext)
   const dedup = opts?.dedup ?? new OutboundDedupCache()
@@ -269,7 +276,12 @@ function makeHarness(opts?: {
     findTurnByOriginId: () => null,
     findTurnByQuotedMessageId: () => null,
     resolveAnswerThreadWithLog: (_c, explicit) => explicit,
-    resolveThreadId: (_c, explicit) => (explicit != null ? Number(explicit) : undefined),
+    // Mirrors the real `resolveThreadId` (`gateway.ts`): explicit wins, else
+    // the chat's LAST-SEEN topic from `chatThreadMap`. The map is per-harness
+    // and chat-scoped, so a dropped cross-chat anchor falls through to the
+    // TARGET chat's own last-seen topic — never to the anchor chat's.
+    resolveThreadId: (c, explicit) =>
+      explicit != null ? Number(explicit) : (opts?.chatThreadMap?.get(c) ?? undefined),
     getLatestInboundMessageId: () => null,
     recordOutbound: () => effects.push('recordOutbound'),
     emissionAuthorityFor: () =>
@@ -2148,6 +2160,16 @@ describe('#4176 — a BACKGROUND SUB-AGENT reply can never silently edit over a 
 // These drive the REAL `sendReply` and assert on the `message_thread_id` the
 // send-path actually put on the wire, so they fail on the bug rather than on a
 // refactor of how the decision is spelled.
+//
+// What the drop resolves TO: dropping the anchor does NOT mean "no thread id".
+// The legacy branch still calls `resolveThreadId`, whose real body
+// (`gateway.ts`) is `explicit ?? chatThreadMap.get(chat_id)` — so a dropped
+// anchor falls through to the TARGET chat's own last-seen topic. That fallback
+// is chat-scoped, so it can only ever yield a topic id valid for chat A; the
+// class of failure the guard closes (chat B's topic on a send into chat A →
+// `400 message thread not found`) stays closed either way. Cases below cover
+// BOTH ends: an empty map (fallback misses → undefined) and a populated one
+// (fallback hits → chat A's topic).
 describe('kill switch SWITCHROOM_TURN_ORIGIN_ROUTING=0 still drops a cross-chat anchor', () => {
   const OTHER_CHAT = '2002'
 
@@ -2164,7 +2186,11 @@ describe('kill switch SWITCHROOM_TURN_ORIGIN_ROUTING=0 still drops a cross-chat 
   const threadOnWire = (h: Harness): unknown =>
     h.calls.filter((c) => c.method === 'sendRichMessage')[0]!.opts.message_thread_id
 
-  it('a reply into chat A pinned to a chat-B forum turn carries NO thread id', async () => {
+  it('a reply into chat A pinned to a chat-B forum turn does NOT carry chat B\'s ' +
+    'topic id — with no last-seen topic for chat A it resolves to no thread', async () => {
+    // Empty `chatThreadMap`: the post-drop `resolveThreadId` fallback misses,
+    // so the wire carries no thread. This is the fallback-misses END of the
+    // behaviour, not the whole of it — see the populated-map case below.
     const h = makeHarness({ turnOriginRouting: false })
     const res = await sendReply(
       h.deps,
@@ -2175,6 +2201,30 @@ describe('kill switch SWITCHROOM_TURN_ORIGIN_ROUTING=0 still drops a cross-chat 
     expect(sends[0]!.chat_id).toBe(CHAT)
     // Pre-fix this is 77 — chat B's topic id on a send into chat A.
     expect(threadOnWire(h)).toBeUndefined()
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+
+  it('the dropped anchor falls through to the TARGET chat\'s last-seen topic, ' +
+    'not to no-thread: chat A last saw topic 12 → the send lands in A/12', async () => {
+    // The production shape the empty-map case above cannot show: the agent is
+    // live in supergroup B (topic 77) and replies into forum chat A, whose
+    // `chatThreadMap` last saw topic 12. Dropping B's anchor hands the decision
+    // to `resolveThreadId`, which is chat-scoped — so the send lands in A's own
+    // topic 12. 77 on the wire here would be the `400 message thread not found`
+    // the guard exists to prevent.
+    const h = makeHarness({
+      turnOriginRouting: false,
+      chatThreadMap: new Map([[CHAT, 12], [OTHER_CHAT, 77]]),
+    })
+    const res = await sendReply(
+      h.deps,
+      req('Late answer into chat A.', {}, turnFor(OTHER_CHAT, 77)),
+    )
+    const sends = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(sends).toHaveLength(1)
+    expect(sends[0]!.chat_id).toBe(CHAT)
+    expect(threadOnWire(h)).toBe(12)
+    expect(threadOnWire(h)).not.toBe(77)
     expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
   })
 
@@ -2200,5 +2250,69 @@ describe('kill switch SWITCHROOM_TURN_ORIGIN_ROUTING=0 still drops a cross-chat 
     const h = makeHarness({ turnOriginRouting: false })
     await sendReply(h.deps, req('Orphaned proactive send.'))
     expect(threadOnWire(h)).toBeUndefined()
+  })
+
+  // ── telemetry parity with the flag-on path ──────────────────────────────
+  //
+  // The flag-ON branch emits `CROSS_CHAT_ANCHOR_DROPPED(...)` through
+  // `resolveAnswerThreadWithLog` → `formatReplyRouteLog`. Without the same line
+  // here, a deployment running `SWITCHROOM_TURN_ORIGIN_ROUTING=0` silently
+  // loses the audit trail the rest of this fix is built on: the drop still
+  // happens, but nothing records that it did. The line is built by the SAME
+  // `formatReplyRouteLog` — there is exactly one authoritative implementation.
+  describe('telemetry: the legacy-branch drop is not silent', () => {
+    const captureStderr = (): { lines: string[]; restore: () => void } => {
+      const lines: string[] = []
+      const spy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(((chunk: unknown) => {
+          lines.push(String(chunk))
+          return true
+        }) as unknown as typeof process.stderr.write)
+      return { lines, restore: () => spy.mockRestore() }
+    }
+
+    it('emits CROSS_CHAT_ANCHOR_DROPPED naming both chats and what it routed to', async () => {
+      const h = makeHarness({
+        turnOriginRouting: false,
+        chatThreadMap: new Map([[CHAT, 12]]),
+      })
+      const cap = captureStderr()
+      try {
+        await sendReply(h.deps, req('Late answer into chat A.', {}, turnFor(OTHER_CHAT, 77)))
+      } finally {
+        cap.restore()
+      }
+      const line = cap.lines.find((l) => l.includes('CROSS_CHAT_ANCHOR_DROPPED('))
+      expect(line).toBeDefined()
+      // Same marker shape the flag-on path emits: target chat, the anchor's
+      // chat + topic, and the thread the send actually routed to.
+      expect(line).toContain('reply-route surface=reply')
+      expect(line).toContain(`chat=${CHAT}`)
+      expect(line).toContain(`live_chat=${OTHER_CHAT}`)
+      expect(line).toContain('live_thread=77')
+      expect(line).toContain('routed→12')
+    })
+
+    // NEGATIVE CONTROL (green against the pre-fix code by construction — the
+    // pre-fix branch emits nothing at all). It earns its place under mutation:
+    // asserting on the whole `reply-route` line rather than just the marker is
+    // what makes it fail an UNCONDITIONAL emit, the plausible wrong shape here.
+    // (Asserting only "no CROSS_CHAT_ANCHOR_DROPPED" would NOT — the formatter
+    // omits the marker for a same-chat anchor anyway, so that weaker assertion
+    // passes for a conditional and an unconditional emit alike.) The legacy
+    // branch is a kill-switch path: it must stay byte-silent on the ordinary
+    // send it exists to serve, and only speak when it drops something.
+    it('stays silent on a SAME-chat anchor — no drop, and no reply-route line at all', async () => {
+      const h = makeHarness({ turnOriginRouting: false })
+      const cap = captureStderr()
+      try {
+        await sendReply(h.deps, req('Same-chat topic reply.', {}, turnFor(CHAT, 77)))
+      } finally {
+        cap.restore()
+      }
+      expect(cap.lines.some((l) => l.includes('CROSS_CHAT_ANCHOR_DROPPED'))).toBe(false)
+      expect(cap.lines.some((l) => l.includes('reply-route surface='))).toBe(false)
+    })
   })
 })

@@ -140,18 +140,30 @@ now an anomaly worth investigating, not the norm.
   B's topic id was attached to the send into A and Telegram rejected the call
   with `400 Bad Request: message thread not found`. A retry fallback resent
   without a thread, so no answer was lost — but every occurrence was a
-  guaranteed-failed first API call. `resolveAnswerThreadId`
-  (`telegram-plugin/gateway/answer-thread-resolve.ts`) now DROPS any anchor
-  whose chat id does not match the send target, before the precedence runs;
-  resolution falls through exactly as if the anchor did not exist. The drop is
-  unconditional across BOTH kill switches (`SWITCHROOM_REPLY_TOPIC_AUTHORITY=0`
-  and `SWITCHROOM_TURN_ORIGIN_ROUTING=0`, whose legacy branch previously passed
-  the live turn's thread through unfiltered): a wrong-chat topic id is an API
-  error, not a routing policy a kill switch should be able to reinstate. The
-  routing, the late-reply recovery tier and the `reply-route` telemetry all
-  derive from the SAME exported `isCrossChatAnchor` predicate, so the log can
-  never disagree with what actually routed. Callers that supply no chat ids are
-  unaffected.
+  guaranteed-failed first API call. The drop is enforced at TWO sites, because
+  the two branches resolve the thread through different code and grepping either
+  function name alone shows only half the fix. (1) `resolveAnswerThreadId`
+  (`telegram-plugin/gateway/answer-thread-resolve.ts`) — the default path and
+  the `SWITCHROOM_REPLY_TOPIC_AUTHORITY=0` path both run through it — now DROPS
+  any anchor whose chat id does not match the send target, before the precedence
+  runs; resolution falls through exactly as if the anchor did not exist. (2) The
+  `SWITCHROOM_TURN_ORIGIN_ROUTING=0` legacy branch never calls that resolver —
+  it passes the pinned turn's thread straight to `resolveThreadId` — so the
+  equivalent guard lives inline in `sendReply`
+  (`telegram-plugin/gateway/outbound-send-path.ts`), on the branch that
+  previously passed the live turn's thread through unfiltered. Net effect: the
+  drop is unconditional across BOTH kill switches — a wrong-chat topic id is an
+  API error, not a routing policy a kill switch should be able to reinstate.
+  Both sites, the late-reply recovery tier and the `reply-route` telemetry
+  derive from the SAME exported `isCrossChatAnchor` predicate, so no second copy
+  of the rule can drift and the log can never disagree with what actually
+  routed; the legacy branch emits the same `CROSS_CHAT_ANCHOR_DROPPED` marker
+  through the same `formatReplyRouteLog` formatter, so a kill-switched
+  deployment keeps the audit trail rather than dropping anchors silently.
+  Note that dropping the anchor does not mean "no thread": the legacy branch
+  still falls through to `resolveThreadId`'s chat-scoped last-seen topic, which
+  can only ever yield a topic valid for the target chat. Callers that supply no
+  chat ids are unaffected.
 
 ### Features
 
