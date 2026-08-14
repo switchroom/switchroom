@@ -132,6 +132,26 @@ now an anomaly worth investigating, not the norm.
   unguaranteeable markup is — which beats a 400 that degrades the whole
   message to plain text. Also locks in the blank-line-separated expandable
   shape, the majority corpus shape, which worked but had no test.
+- **gateway: ignore a reply thread anchor from a different chat** — a reply
+  targeting chat A could be anchored to a turn belonging to chat B: the
+  `origin_turn_id` echo lookup is keyed by turn id alone (not chat-scoped), and
+  the LIVE turn is whatever the session happens to be running, which in a
+  multi-chat agent is frequently another chat. When B was a forum supergroup,
+  B's topic id was attached to the send into A and Telegram rejected the call
+  with `400 Bad Request: message thread not found`. A retry fallback resent
+  without a thread, so no answer was lost — but every occurrence was a
+  guaranteed-failed first API call. `resolveAnswerThreadId`
+  (`telegram-plugin/gateway/answer-thread-resolve.ts`) now DROPS any anchor
+  whose chat id does not match the send target, before the precedence runs;
+  resolution falls through exactly as if the anchor did not exist. The drop is
+  unconditional across BOTH kill switches (`SWITCHROOM_REPLY_TOPIC_AUTHORITY=0`
+  and `SWITCHROOM_TURN_ORIGIN_ROUTING=0`, whose legacy branch previously passed
+  the live turn's thread through unfiltered): a wrong-chat topic id is an API
+  error, not a routing policy a kill switch should be able to reinstate. The
+  routing, the late-reply recovery tier and the `reply-route` telemetry all
+  derive from the SAME exported `isCrossChatAnchor` predicate, so the log can
+  never disagree with what actually routed. Callers that supply no chat ids are
+  unaffected.
 
 ### Features
 
@@ -909,7 +929,6 @@ now an anomaly worth investigating, not the norm.
   `Intl`, since Node's ICU reports a correct UTC even on a corrupted host and
   would mask exactly this defect.
 - **gateway: never evict an approval outcome while anything else is droppable**
-- **gateway: ignore a reply thread anchor from a different chat**
 
 ## v0.21.7 — a Fable-pinned agent boots on Fable, a cron edit stops failing on its first try, and the merge queue stops ejecting innocent PRs
 
