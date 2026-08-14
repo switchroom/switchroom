@@ -256,6 +256,18 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
  * an opener blanks every following line to EOF, which erases the released `## `
  * headings the placement rule exists to check against.
  *
+ * The closer is searched from `start + 2`, NOT `start + 4`, because CommonMark
+ * (0.30+, matching the HTML spec) says `<!-->` and `<!--->` are COMPLETE
+ * comments — the closing `-->` is allowed to reuse the opener's own dashes.
+ * Searching from `start + 4` cannot see either closer, so the scanner called a
+ * closed comment "unterminated"; line-start-anchored (`start === 0`) it then set
+ * `open: true` and masked everything down to the next `-->` in the FILE — which
+ * on this repo's real CHANGELOG.md erased eight released `## v0.21.x` headings
+ * and turned a genuinely buried entry into a silent OK. `start + 2` is exactly
+ * equivalent for every other comment: a `-->` at `start + 2` forces the text to
+ * be `<!-->` and one at `start + 3` forces `<!--->`, so the widened window can
+ * only ever match those two literal forms.
+ *
  * @param {string} s
  * @param {boolean} [allowMultiline] false when `s` is a mid-line TAIL (the text
  *   after a `-->`), where no `<!--` can be line-start-anchored by construction.
@@ -267,7 +279,9 @@ function maskCommentsInLine(s, allowMultiline = true) {
   for (;;) {
     const start = s.indexOf('<!--', i)
     if (start === -1) return { masked: out + s.slice(i), open: false }
-    const end = s.indexOf('-->', start + 4)
+    // `start + 2`, not `start + 4`: `<!-->` and `<!--->` are complete comments
+    // whose closer overlaps the opener's dashes. See the docstring.
+    const end = s.indexOf('-->', start + 2)
     if (end === -1) {
       // Nothing after `start` can close on this line, so every later `<!--` is
       // literal too — emit the remainder in one piece either way.

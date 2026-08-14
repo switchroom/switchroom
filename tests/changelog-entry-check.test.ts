@@ -854,6 +854,123 @@ describe("check-changelog-entry — a `<!--` in prose does not blind the parser"
   });
 });
 
+describe("check-changelog-entry — `<!-->` and `<!--->` are COMPLETE comments", () => {
+  // Round 4 of the same fail-open class, and the one the round-3 WARN backstop
+  // could not catch. CommonMark 0.30+ (matching the HTML spec) says an HTML
+  // comment is `<!-->`, `<!--->`, or `<!--` + text + `-->` — i.e. the closing
+  // `-->` may reuse the opener's own dashes — and HTML block type 2 ends on any
+  // line CONTAINING `-->`, which `<!-->` does. Verified against the reference
+  // implementation in `tests/fixtures/commonmark-mask-cases.mjs`.
+  //
+  // Scanning for the closer from `start + 4` cannot see either form, so the
+  // masker called a CLOSED comment unterminated; at column 0 it passed the
+  // anchoring check, set `open: true`, and blanked on to the next `-->` in the
+  // FILE. Measured on the real CHANGELOG.md at this PR's head, one such prose
+  // line at the end of `## Unreleased` took the parse from 429 sections to 421
+  // — the eight that vanished were `## v0.21.10` down to `## v0.21.3`, exactly
+  // the sections a post-release merge buries an entry in — and
+  // `unclosedCommentLine` stayed NULL, so the unclosed-comment WARN added in
+  // 54c96b6c never fired. Silent OK, exit 0, on a genuinely buried entry.
+
+  /**
+   * As `buriedEntryFixture` above, plus a `trailer` appended AFTER the released
+   * section. The trailer is what makes this the SILENT variant: with an ordinary
+   * `<!-- ... -->` block later in the file (the real CHANGELOG.md has these), the
+   * runaway mask terminates there instead of at EOF, so not even the
+   * unclosed-comment WARN fires.
+   */
+  function fixture(prefix: string, prose: string[], trailer: string[] = []): Fixture {
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      ...prose,
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+      ...trailer,
+    ].join("\n");
+    const f = makeFixture(prefix, BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "- **Something shipped (#1):** prose.\n",
+        "- **Something shipped (#1):** prose.\n- **BURIED ENTRY (#2):** appended under the RELEASED heading.\n",
+      ),
+    );
+    f.commit("feat: ship code and bury the entry under a released heading");
+    return f;
+  }
+
+  const MERGE_GROUP = { GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" };
+  // An ordinary later comment block, as the real CHANGELOG.md carries around
+  // lines 1310 and 1419. Its `-->` is what silences the WARN.
+  const LATER_COMMENT = ["<!-- reviewer note: keep until the next cut -->", ""];
+
+  it("control: the buried entry FAILs with no `<!--`-ish line in prose", () => {
+    // The twin of every case below, same fixture but for one prose line. A guard
+    // that always FAILs cannot pass the whole file (the green cases red), and one
+    // that always passes reds here.
+    const r = fixture("changelog-overlap-control-", [], LATER_COMMENT).check(MERGE_GROUP);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+    expect(r.out).toContain("BURIED ENTRY (#2)");
+  });
+
+  for (const form of ["<!-->", "<!--->"]) {
+    it(`SILENT variant: a line-start \`${form}\` must NOT turn that FAIL into an OK`, () => {
+      // Against `s.indexOf('-->', start + 4)` this run is exit 0 with
+      // "OK — no entry added under a released section" and NO warning at all:
+      // `## v0.20.11` was masked away, and the mask ended at the later comment's
+      // `-->`, so `unclosedCommentLine` is null and the WARN never fires.
+      const r = fixture(`changelog-overlap-silent-${form.length}-`, [form], LATER_COMMENT);
+      const s = r.checkStreams(MERGE_GROUP);
+      expect(s.code).toBe(1);
+      expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+      expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+      expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+      // And it is a CLOSED comment, so it must not be reported as an open one.
+      expect(`${s.stdout}${s.stderr}`).not.toContain("HTML comment opened at line");
+    });
+
+    it(`LOUD variant: \`${form}\` with no later \`-->\` in the file also FAILs`, () => {
+      // The same defect with the WARN backstop reachable. It used to WARN and
+      // still exit 0 — a warning is not a gate, so this had to become a FAIL.
+      const s = fixture(`changelog-overlap-loud-${form.length}-`, [form]).checkStreams(MERGE_GROUP);
+      expect(s.code).toBe(1);
+      expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+      expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+      expect(`${s.stdout}${s.stderr}`).not.toContain("HTML comment opened at line");
+    });
+  }
+
+  it("a `-->` TAIL cannot reopen a multi-line comment, even at its own offset 0", () => {
+    // Pins `maskCommentsInLine(line.slice(idx + 3), false)`: the text after a
+    // closing `-->` is mid-line BY CONSTRUCTION, so no `<!--` in it is
+    // line-start-anchored. Flip that `false` to `true` and the ` <!--` below
+    // looks anchored (offset 1, only spaces before it), the mask runs to the
+    // next `-->` in the file, `## v0.20.11` disappears and this exits 0 — the
+    // fail-open the `allowMultiline` parameter exists to prevent. Per CommonMark
+    // the whole line is the HTML block's END-CONDITION line, i.e. raw HTML, so
+    // nothing in it opens anything either way.
+    const s = fixture(
+      "changelog-overlap-tail-",
+      ["", "<!--", "reviewer note", "--> <!-- and a bare opener in the tail"],
+      LATER_COMMENT,
+    ).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+});
+
 describe("check-changelog-entry — the queue-ref base is authoritative", () => {
   it("FAILs when merge_group's $CHANGELOG_BASE does not resolve, even though `main` does", () => {
     // The guarantee ci-lint.yml claims. The fallback cascade (origin/main, main)
