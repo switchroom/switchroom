@@ -1001,10 +1001,20 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
                 hard_cuts += piece_cuts
             else:
                 # Last resort: no phoneme string available for this piece, so it
-                # goes to Kokoro as text and Kokoro may slice it. Counted and
-                # logged below — never silent.
+                # goes to Kokoro as text and Kokoro may slice it. Log HERE, not
+                # after the loop: the very case this warning exists to report is
+                # the one where Kokoro raises inside the loop (IndexError at
+                # kokoro_onnx/__init__.py:108), and a post-loop log would never
+                # run — the request would 500 as silently as it did pre-#4695.
                 piece_chunks = []
                 unchunked_pieces += 1
+                _log(
+                    f"WARNING: TTS could not phonemize piece {i + 1}/"
+                    f"{len(pieces)} ({len(piece)} chars) of a {len(text)}-char "
+                    "request; handing it to Kokoro as TEXT, so a clause past "
+                    "510 phonemes is truncated or fails the whole request "
+                    "(IndexError at kokoro_onnx/__init__.py:108)"
+                )
 
             # `piece_chunks` can also be empty with is_phonemes=True when the
             # piece phonemises to nothing but punctuation/whitespace. That falls
@@ -1057,21 +1067,15 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
         # message that never arrived (a 500 from the IndexError) or, where the
         # slice landed on an out-of-vocab phoneme, audio that stopped
         # mid-sentence. Both residual degradation paths now shout, at WARN
-        # volume, with enough context to find the offending message.
+        # volume, with enough context to find the offending message. The
+        # unphonemizable-piece warning is emitted in the loop above, where it
+        # still fires if Kokoro then raises on that very piece.
         if hard_cuts:
             _log(
                 f"WARNING: TTS split {hard_cuts} unbreakable phoneme run(s) "
                 f"mid-word (> {TTS_MAX_PHONEMES} phonemes with no space or "
                 f"clause break) for a {len(text)}-char request; audio is "
                 "complete but has an audible seam"
-            )
-        if unchunked_pieces:
-            _log(
-                f"WARNING: TTS could not phonemize {unchunked_pieces} of "
-                f"{len(pieces)} piece(s) for a {len(text)}-char request; those "
-                "went to Kokoro as TEXT, so a clause past 510 phonemes is "
-                "truncated or fails the whole request (IndexError at "
-                "kokoro_onnx/__init__.py:108)"
             )
         return ogg, meta
 

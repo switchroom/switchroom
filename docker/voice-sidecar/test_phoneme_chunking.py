@@ -367,6 +367,24 @@ class LossyPathIsLoudTests(unittest.TestCase):
             msg=f"no loud log emitted; got {self.logged!r}",
         )
 
+    def test_unphonemizable_piece_is_warned_even_when_kokoro_then_raises(self) -> None:
+        # The case the warning exists to report: the unchunked piece really does
+        # overflow, so Kokoro raises mid-loop. A post-loop log would never run
+        # and the request would 500 as silently as it did pre-#4695.
+        server._g2p = None  # _FaithfulKokoro has no .tokenizer either
+        text = "x" * 600  # one piece (< VOICE_TTS_MAX_CHARS), > 510 phonemes
+
+        with self.assertRaises(IndexError):
+            server._run_synthesis(text, voice="af_heart")
+
+        self.assertTrue(
+            any(
+                "WARNING" in line and "could not phonemize" in line
+                for line in self.logged
+            ),
+            msg=f"no loud log emitted before the raise; got {self.logged!r}",
+        )
+
     def test_clean_synthesis_emits_no_warning(self) -> None:
         server._g2p = lambda piece: ("fˈOni:mz", ["tok"])
 
