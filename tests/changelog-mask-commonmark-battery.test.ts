@@ -16,16 +16,35 @@
  *   1. the rendered `<h2>` list matches the committed `commonmarkH2` — the
  *      table cannot drift from the parser it claims to quote;
  *   2. `parseSections` matches the reference implementation's own level-2
- *      headings, filtered to those whose source line is a column-0 `## ` ATX
- *      opener — the guard IS the parser, modulo one documented policy;
+ *      headings, filtered by the documented policy — the guard IS the parser,
+ *      modulo that one filter;
  *   3. that filter is exactly the documented policy and nothing more: the rows
  *      where the two columns differ are precisely the rows carrying an indented
  *      or setext heading;
  *   4. the battery still covers the shapes that cost seven review rounds, so
  *      nobody can neuter it by deleting the interesting rows.
  *
- * Non-vacuity: against the implementation at 91bb46b8 (the last approximation),
- * assertion 2 fails on nine rows.
+ * NON-VACUITY, corrected (review of #4703). This header used to bill assertion 2
+ * as the load-bearing one and cite "fails on nine rows against 91bb46b8". The
+ * citation is about an implementation that no longer exists — 91bb46b8 was the
+ * hand-written approximation — and assertion 2's oracle used to recompute
+ * `sourcepos[0][1] === 1 && /^##\s/.test(raw)`, character-for-character the
+ * predicate in `analyze`. Two copies of one rule is a DRIFT hazard, not an
+ * oracle: the two are edited together, so the test follows the code.
+ *
+ * Measured, precisely, because the obvious claim is too strong. Relax the
+ * guard's anchor to `/^ {0,3}##\s/` and leave the mirror alone: 3 rows red, so
+ * a single-site mutation IS caught. Relax it and update the mirror's copy of the
+ * predicate in the same edit — what an author actually does — and assertion 2
+ * (line ~149) goes green; the 3 rows still red, but only on assertion 3, the
+ * committed `guardH2` column. Assertion 2 had stopped constraining anything and
+ * the fixture column was silently carrying it.
+ *
+ * So the oracle is now derived from the SOURCE TEXT and CommonMark's ATX rule
+ * (`policyClass`), which no edit to the guard's predicate can bring along.
+ * Under that same relaxation, the failing assertion is 2 itself. Assertions 3
+ * (the committed column, plus the divergence test) and 4 were sound throughout
+ * and remain the backstop.
  */
 import { describe, expect, it } from "vitest";
 import { Parser, HtmlRenderer } from "commonmark";
@@ -82,23 +101,44 @@ function renderedH2ViaHtml(md: string): string[] {
 }
 
 /**
- * The oracle the guard is held to: the reference implementation's own level-2
- * heading nodes, restricted to those whose SOURCE line is a column-0 `## ` ATX
- * opener, reported as the guard reports a heading (the raw line, trimmed).
+ * Which documented policy class a rendered level-2 heading falls into, decided
+ * from its SOURCE LINE and CommonMark's ATX rule — not from the guard.
  *
- * Derived from `node.sourcepos`, NOT re-implemented — the point of the rewrite
- * is that there is no second implementation to disagree with.
+ * This used to be `columnZeroH2`, and it computed
+ * `sourcepos[0][1] === 1 && /^##\s/.test(raw)`: character-for-character the
+ * predicate in `check-changelog-entry.mjs` `analyze`. Since `parseSections`
+ * builds its list from the same parser's heading nodes and applies exactly that
+ * predicate, assertion 2 below compared a value against a copy of the code that
+ * produced it and could no longer fail (review of #4703 — the same defect made
+ * `scripts/changelog-mask-differential.mjs` score 0/0 under every mutation).
+ *
+ * These three classes are facts about the TEXT: "1–3 leading spaces before a
+ * `#`" (CommonMark renders it, the guard's anchor drops it), "a column-0 ATX
+ * level-2 opener per the spec — `##` followed by whitespace or end of line",
+ * and "the node exists but its line is neither, so it came from a setext
+ * underline". The divergence test below derives the same split independently
+ * again, from the raw source lines.
  */
-function columnZeroH2(md: string): string[] {
+function policyClass(raw: string): "indented" | "atx2" | "setext" {
+  if (/^ {1,3}#/.test(raw)) return "indented";
+  if (/^##(\s|$)/.test(raw)) return "atx2";
+  return "setext";
+}
+
+/**
+ * The oracle the guard is held to: the reference implementation's own level-2
+ * heading nodes, restricted to the ones the documented policy says the guard
+ * must REPORT, in the shape the guard reports them (the raw line, trimmed).
+ */
+function policyExpectedH2(md: string): string[] {
   const src = md.replace(/\r\n/g, "\n").split("\n");
   const walker = new Parser().parse(md.replace(/\r\n/g, "\n")).walker();
   const out: string[] = [];
   let ev;
   while ((ev = walker.next())) {
     if (!ev.entering || ev.node.type !== "heading" || ev.node.level !== 2) continue;
-    const line = ev.node.sourcepos[0][0];
-    const raw = src[line - 1] ?? "";
-    if (ev.node.sourcepos[0][1] !== 1 || !/^##\s/.test(raw)) continue;
+    const raw = src[ev.node.sourcepos[0][0] - 1] ?? "";
+    if (policyClass(raw) !== "atx2") continue;
     out.push(raw.trim());
   }
   return out;
@@ -111,9 +151,11 @@ describe("check-changelog-entry — CommonMark differential battery", () => {
     expect(renderedH2(c.md)).toEqual(c.commonmarkH2);
     expect(renderedH2ViaHtml(c.md)).toEqual(c.commonmarkH2);
 
-    // 2. The guard agrees with the reference implementation, live.
+    // 2. The guard agrees with the reference implementation, live, modulo the
+    //    documented policy — which is re-derived from the source text rather
+    //    than copied off the implementation. See `policyClass`.
     const guard = parseSections(c.md).map((s) => s.heading);
-    expect(guard).toEqual(columnZeroH2(c.md));
+    expect(guard).toEqual(policyExpectedH2(c.md));
 
     // 3. …and the committed column matches, so a reader of the fixture is not
     //    reading a stale number.

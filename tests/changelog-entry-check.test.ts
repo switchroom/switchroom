@@ -21,7 +21,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
-import { parseSections, extractUnreleasedEntries } from "../scripts/check-changelog-entry.mjs";
+import { analyze, parseSections, extractUnreleasedEntries } from "../scripts/check-changelog-entry.mjs";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const CHECK = join(repoRoot, "scripts", "check-changelog-entry.mjs");
@@ -1438,10 +1438,22 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
   });
 
   it("ROUND 7, CRLF: the same document with Windows line endings behaves identically", () => {
-    // The normalisation happens once, in `analyze`, before the parse. Pinned
-    // because the round-7 blocker reproduced under CRLF too, and a rewrite that
-    // normalised in only some of its entry points would leave half the guard
-    // reading `\r`-suffixed lines.
+    // END-TO-END outcome parity on a CRLF checkout, and that is ALL it claims.
+    //
+    // It used to claim it pinned the `\r\n` → `\n` normalisation in `analyze`.
+    // It does not, and saying so was the vacuous-comment class #4678's mutation
+    // check exists to catch. Measured: delete the `.replace(/\r\n/g, "\n")` at
+    // `check-changelog-entry.mjs`'s `analyze` and all 104 tests in this suite
+    // and the battery stay GREEN — commonmark normalises line endings itself
+    // before parsing, and every consumer of `analyze`'s raw `lines` (`heading`
+    // text, `extractUnreleasedEntries`, `findMisplacedEntries`' `text`) trims,
+    // so a trailing `\r` is unobservable downstream. The normalisation is cheap
+    // insurance, not a load-bearing step, and the test below pins it at its own
+    // boundary rather than pretending an end-to-end run can see it.
+    //
+    // What this case DOES pin is worth keeping: the round-7 blocker reproduced
+    // under CRLF, and a regression that made the block parse line-ending
+    // sensitive would show up here as a silent exit 0.
     const f = fixture("changelog-container-prose-dedent-crlf-", [
       "",
       "  ```yaml",
@@ -1461,6 +1473,40 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
     expect(s.code).toBe(1);
     expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
     expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+  });
+
+  it("CRLF: `analyze` hands its consumers `\\r`-free lines", () => {
+    // The assertion that actually pins the normalisation, at the boundary that
+    // owns it. `analyze` is documented to return the changelog's `lines`, and
+    // every downstream rule reads them; a `\r`-suffixed line is a latent trap
+    // for the next consumer that compares without trimming (the entry-set
+    // difference in `unreleasedGrew` is one bad refactor away from being one).
+    //
+    // RED-THEN-GREEN, measured: delete the `.replace(/\r\n/g, "\n")` in
+    // `analyze` and this case fails on the first assertion (`"# Changelog\r"`)
+    // while all 104 pre-existing tests stay green — which is precisely why it
+    // is here rather than left to the end-to-end case above.
+    const crlf = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "- **Staged entry (#0):** prose.",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+    ].join("\r\n");
+
+    const { lines, headings } = analyze(crlf);
+    expect(lines.some((l: string) => l.includes("\r"))).toBe(false);
+    expect(lines[0]).toBe("# Changelog");
+    expect(headings.map((h: { text: string }) => h.text)).toEqual([
+      "## Unreleased",
+      "## v0.20.11 — a released section",
+    ]);
+    // And the split is on real newlines, not on a mix that leaves `\r` as
+    // content: a CRLF document has as many lines as its LF twin.
+    expect(lines.length).toBe(crlf.replace(/\r\n/g, "\n").split("\n").length);
   });
 
   it("the dedenting delimiter is the new OPENER, so it cannot also retire the latch", () => {
@@ -1664,6 +1710,123 @@ describe("check-changelog-entry — a `## ` heading is recognised at column 0 on
   // is, and both anchor at column 0 rather than honouring CommonMark's ≤3-space
   // tolerance. Both directions of that choice are pinned here.
 
+  it("an indented RELEASED heading is a FAIL, not a silently swallowed section", () => {
+    // The fail-OPEN the column-0 anchor opened, and the reason
+    // `findIndentedHeadings` exists. `parseSections`' comment used to argue the
+    // anchor was safe because the mirror mistake is "merely noisy" — a real
+    // heading someone indents just makes the guard report "no `## Unreleased`
+    // section" and red the PR. That is true only when the indented heading IS
+    // `## Unreleased`. Here it is a RELEASED one, and the failure is silent:
+    //
+    //   - CommonMark renders TWO `<h2>`s; GitHub shows entry #2 under v0.21.9.
+    //   - `parseSections` returns ONE section (`## Unreleased`, to EOF), so
+    //     `findMisplacedEntries` has no released section to check and RULE 2
+    //     reports nothing.
+    //   - `extractUnreleasedEntries` credits the released heading AND both
+    //     entries beneath it as staged Unreleased content, so RULE 1 is happy.
+    //
+    // Net: exit 0 over an entry visibly buried in a shipped section — the exact
+    // corruption this guard exists to catch.
+    //
+    // RED-THEN-GREEN, measured on this fixture: with `findIndentedHeadings`
+    // removed from `evaluate` this run is exit 0 and prints
+    // "OK — ## Unreleased grew". Note the ONE leading space on the v0.21.9 line
+    // — delete it and the fixture stops testing anything.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area -->",
+      "",
+      " ## v0.21.9 — a released section",
+      "",
+      "- **Old entry (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent-released-heading-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", `${BASE}- **My buried entry (#2):** oops.\n`);
+    f.commit("feat: ship code and bury the entry under an INDENTED released heading");
+
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("INDENTED `## ` heading hides a section");
+    expect(r.out).toContain("CHANGELOG.md:7");
+    expect(r.out).toContain("## v0.21.9 — a released section");
+    // And it must not pass off the corruption as growth.
+    expect(r.out).not.toContain("## Unreleased grew");
+  });
+
+  it("the indent FAIL is NOT escapable with [changelog placement ok]", () => {
+    // The placement token asserts "I meant to edit a released section". It says
+    // nothing about the file's block structure, and an indented heading makes
+    // every rule read a different document from the one GitHub renders — so the
+    // token must not switch this off. (It DOES still switch off RULE 2, which
+    // is why this fixture has an added line under the indented heading: without
+    // the separation, the token would hide the whole report.)
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "   ## v0.21.9 — a released section",
+      "",
+      "- **Old entry (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent-not-escapable-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", `${BASE}- **Another entry (#2):** staged.\n`);
+    f.commit("feat: ship code\n\n[changelog placement ok]");
+
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("INDENTED `## ` heading hides a section");
+    expect(r.out).toContain("CHANGELOG.md:5");
+  });
+
+  it("a 4-space-indented `## ` is CODE, so it is not reported as an indented heading", () => {
+    // The false-FAIL bound on `findIndentedHeadings`, and the escape the FAIL
+    // message offers. 4+ spaces is an indented code block: CommonMark emits no
+    // heading node at all, GitHub renders it as literal text, nothing is hidden
+    // — so the indent report must stay silent.
+    //
+    // RED-THEN-GREEN, and note WHICH mutation kills it. Widening the detector's
+    // regex (`/^ {1,3}/` → `/^ {1,}/`) does NOT: the branch only ever sees lines
+    // the parser already turned into a heading NODE, and a 4-space `## ` is
+    // never one. The mutation this pins is the plausible WRONG implementation —
+    // scanning source lines for a heading shape instead of filtering the
+    // parser's heading nodes. Measured: replace `findIndentedHeadings`' body
+    // with a `split('\n')` + `/^ {1,}#{1,6}\s/` scan and 5 tests red, this one
+    // among them, because that implementation cannot tell an indented heading
+    // from a heading-shaped line inside a code block. Which is the whole reason
+    // the guard stopped approximating CommonMark.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "- **Earlier entry (#0):** to cut a release, rename the header:",
+      "",
+      "      ## v0.20.12 — the next cut",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent4-not-a-heading-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", BASE.replace("## v0.20.11", "- **Branch entry (#2):** staged.\n\n## v0.20.11"));
+    f.commit("feat: ship code and stage an entry below a 4-space code example");
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("## Unreleased grew");
+    expect(r.out).not.toContain("INDENTED");
+  });
+
   it("an indented `## Unreleased` inside a released section does not un-release it", () => {
     // The fail-OPEN that indent tolerance in `parseSections` would open: a list
     // line reading `   ## Unreleased` *inside* `## v0.20.11` would start a new,
@@ -1696,14 +1859,30 @@ describe("check-changelog-entry — a `## ` heading is recognised at column 0 on
     expect(r.out).toContain("## v0.20.11");
   });
 
-  it("an indented `## ` inside Unreleased does not TRUNCATE the section", () => {
-    // The third column-0 site, and the only one that had no outcome test: the
-    // section-END scan in `extractUnreleasedEntries`. Loosen it to `/^\s*##\s/`
-    // and the indented prose line below ends `## Unreleased` early, so the entry
-    // beneath it stops counting as growth and this shippable PR reds with
-    // "adds no new entry under `## Unreleased`" — fail-CLOSED, but a false FAIL
-    // on a PR that did exactly what the guard asked. Column 0 keeps the section
-    // END and the section START agreeing on what a heading is.
+  it("an indented `## ` inside Unreleased does not TRUNCATE the section — but IS reported", () => {
+    // The third column-0 site: the section-END scan in
+    // `extractUnreleasedEntries`. Loosen it to `/^\s*##\s/` and the indented
+    // line below ends `## Unreleased` early, so the entry beneath it stops
+    // counting as growth and the run reds with "adds no new entry under
+    // `## Unreleased`". Column 0 keeps the section END and the section START
+    // agreeing on what a heading is, and this still pins that.
+    //
+    // BEHAVIOUR CHANGE (review of #4703). This case previously asserted exit 0
+    // on the claim that an indented pseudo-heading is a false-FAIL risk and
+    // nothing more. Under the reference parser that claim does not survive
+    // contact with the document: `  ## v0.20.12 — the next cut` sits at exactly
+    // the list item's content indent, so CommonMark renders it as a real `<h2>`
+    // and GitHub shows `Branch entry (#2)` filed under a "v0.20.12" section
+    // that was never cut. The guard cannot see that section (column-0 anchor),
+    // which is precisely the fail-OPEN `findIndentedHeadings` now closes — the
+    // same policy hole that, with a RELEASED heading, passes a buried entry at
+    // exit 0. So the outcome is exit 1, and the FAIL names the line rather than
+    // the entry: the defect is the indent, and the fix (fence the example, or
+    // indent it to 4+ spaces) is in the message.
+    //
+    // What did NOT change is the truncation half: the message must still be the
+    // indent report, NOT "adds no new entry under `## Unreleased`", because the
+    // section was not truncated and the entry did land in it.
     const BASE = [
       "# Changelog",
       "",
@@ -1729,9 +1908,13 @@ describe("check-changelog-entry — a `## ` heading is recognised at column 0 on
     f.commit("feat: ship code and stage an entry below an indented pseudo-heading");
 
     const r = f.check();
-    expect(r.code).toBe(0);
-    expect(r.out).toContain("## Unreleased grew");
-    expect(r.out).not.toContain("check-changelog-entry: FAIL");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("INDENTED `## ` heading hides a section");
+    expect(r.out).toContain("CHANGELOG.md:6");
+    expect(r.out).toContain("## v0.20.12 — the next cut");
+    // The truncation half: the section was NOT cut short, so the RULE 1 message
+    // must not appear. Loosening the section-END scan brings it back.
+    expect(r.out).not.toContain("adds no new entry under `## Unreleased`");
   });
 
   it("a 4-space-indented `## Unreleased` is not a staging section for RULE 1 either", () => {

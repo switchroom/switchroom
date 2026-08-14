@@ -136,7 +136,28 @@ import { fileURLToPath } from 'node:url'
 //
 // `commonmark`'s package exports resolve to an ESM entry with NAMED exports
 // only — `import cm from 'commonmark'` throws at load. Import the names.
-import { Parser } from 'commonmark'
+//
+// LOADED DEFENSIVELY, and that is not paranoia about CI. A STATIC
+// `import { Parser } from 'commonmark'` makes any invocation without
+// devDependencies installed die with `ERR_MODULE_NOT_FOUND` before a single
+// line of this script runs — no message this file chose, no exit code it chose,
+// a raw node stack trace. That contradicts the script's whole error posture:
+// every other environment gap here (no base ref, no merge-base, no
+// CHANGELOG.md) SKIPs with a sentence saying why, because the design principle
+// is "skip rather than fail" for things that are not the developer's mistake.
+// A developer running `node scripts/check-changelog-entry.mjs` in a fresh
+// checkout deserves the same treatment. Guarded import plus the SKIP at the top
+// of `run()` restores it. Top-level `await` is legal in an ESM `.mjs` module
+// and every consumer (`bun lint`, vitest, `changelog-mask-differential.mjs`)
+// imports this file, so the await is resolved before any export is touched.
+/** @type {typeof import('commonmark').Parser | null} */
+let Parser = null
+try {
+  ;({ Parser } = await import('commonmark'))
+} catch {
+  // Left null on purpose. `run()` turns it into a SKIP; `analyze` throws a
+  // named error rather than an "undefined is not a constructor" TypeError.
+}
 
 /**
  * Repo-relative path prefixes whose contents ship to users or the fleet. A
@@ -231,13 +252,22 @@ export function isShippable(p) {
  * Cached on the exact input string (one entry): CHANGELOG.md is >1.3 MiB here
  * and a single run parses it several times.
  *
+ * INDENTED HEADINGS are not silently dropped — see `indented` below and
+ * `findIndentedHeadings`.
+ *
  * @param {string} changelog
- * @returns {{lines: string[], prose: boolean[], headings: {line: number, text: string}[]}}
+ * @returns {{lines: string[], prose: boolean[], headings: {line: number, text: string}[], indented: {line: number, text: string}[]}}
  *   `prose[i]` is for 1-based line `i + 1`.
  */
 let analyzeCacheKey = /** @type {string | null} */ (null)
 let analyzeCacheValue = /** @type {any} */ (null)
 export function analyze(changelog) {
+  if (!Parser) {
+    throw new Error(
+      'check-changelog-entry: the `commonmark` devDependency is not installed. ' +
+        'Run `bun install` (CI does this before lint).',
+    )
+  }
   const md = String(changelog).replace(/\r\n/g, '\n')
   if (analyzeCacheKey === md) return analyzeCacheValue
 
@@ -245,6 +275,8 @@ export function analyze(changelog) {
   const prose = new Array(lines.length).fill(true)
   /** @type {{line: number, text: string}[]} */
   const headings = []
+  /** @type {{line: number, text: string}[]} */
+  const indented = []
 
   const walker = new Parser().parse(md).walker()
   let ev
@@ -272,11 +304,18 @@ export function analyze(changelog) {
     const raw = lines[line - 1] ?? ''
     // Column 0 only, and `^##\s` besides — which also excludes a SETEXT h2,
     // whose sourcepos points at its text line, not at the `---` underline.
-    if (pos[0][1] !== 1 || !/^##\s/.test(raw)) continue
+    if (pos[0][1] !== 1 || !/^##\s/.test(raw)) {
+      // An INDENTED ATX h2 (1–3 spaces) is a heading to CommonMark and to
+      // GitHub, and invisible to every rule below. Record it so the guard can
+      // FAIL on it instead of quietly losing the section. See
+      // `findIndentedHeadings` for why silence here is a fail-OPEN.
+      if (/^ {1,3}#{1,6}\s/.test(raw)) indented.push({ line, text: raw.trim() })
+      continue
+    }
     headings.push({ line, text: raw.trim() })
   }
 
-  const value = { lines, prose, headings }
+  const value = { lines, prose, headings, indented }
   analyzeCacheKey = md
   analyzeCacheValue = value
   return value
@@ -341,22 +380,33 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
  * a prose or list line reading `   ## Unreleased` *inside* an already-released
  * section would open a new, NON-released section, and every entry added below
  * it — the whole rest of the file — would silently stop being checked for
- * placement. The mirror mistake is merely noisy: a real heading someone indents
- * by 1–3 spaces is invisible to the parser, which reports "no `## Unreleased`
- * section" and reds the PR until the indent is removed. `extractUnreleasedEntries`
- * anchors at column 0 for the same reason, so the two agree on what a heading is.
- * The real CHANGELOG.md has zero indented `## ` headings (checked repo-wide) —
- * but nothing ENFORCES that, so the policy is load-bearing, not decorative. It
- * is also not hypothetical: `tests/changelog-entry-check.test.ts` pins a case
+ * placement. `extractUnreleasedEntries` anchors at column 0 for the same reason,
+ * so the two agree on what a heading is. It is also not hypothetical:
+ * `tests/changelog-entry-check.test.ts` pins a case
  * where `   ## Unreleased` sits inside a list item in an already-released
  * section. CommonMark renders that as a genuine `<h2>`; honouring the tolerance
  * would un-release the entire rest of the file and turn a real FAIL into a pass.
  *
+ * THE MIRROR DIRECTION IS NOT "MERELY NOISY" — this comment used to claim it
+ * was, and the claim was WRONG. It holds only when the indented heading is
+ * `## Unreleased` itself: the guard then reports "no staging section" and reds
+ * the PR. When the indented heading is a RELEASED one the section VANISHES —
+ * its body is absorbed into whatever section precedes it. A file whose
+ * ` ## v0.21.9` is indented by one space has ONE section as far as this guard
+ * is concerned (`## Unreleased`), so `findMisplacedEntries` finds no released
+ * section to check and an entry that GitHub renders under `## v0.21.9` is
+ * reported OK at exit 0 — the exact corruption RULE 2 exists to catch — while
+ * `extractUnreleasedEntries` simultaneously credits the whole shipped section
+ * as staged content. That is a fail-OPEN, in the direction that matters.
+ *
+ * So the anchor is kept and the zero it depends on is ENFORCED rather than
+ * assumed: `analyze` records every level-2 heading node this filter rejects for
+ * being indented, and `evaluate` FAILs on it. See `findIndentedHeadings`.
+ *
  * Now that the block structure comes from the reference implementation, this is
- * the ONLY place the guard deliberately diverges from CommonMark, it diverges
- * in the fail-CLOSED direction, and it is one filter rather than an
- * approximation: keep the parser's heading nodes whose start column is 1 and
- * whose source line is a literal `## ` ATX opener.
+ * the ONLY place the guard deliberately diverges from CommonMark, and it is one
+ * filter rather than an approximation: keep the parser's heading nodes whose
+ * start column is 1 and whose source line is a literal `## ` ATX opener.
  *
  * @param {string} changelog
  * @returns {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]}
@@ -378,6 +428,46 @@ export function parseSections(changelog) {
     })
   }
   return sections
+}
+
+/**
+ * Every level-2 heading CommonMark renders that `parseSections`' column-0
+ * anchor drops for being indented 1–3 spaces.
+ *
+ * WHY THIS IS A FAIL, not a warning and not a silent drop
+ * ------------------------------------------------------
+ * The column-0 anchor (see `parseSections`) is deliberate and it closes a real
+ * fail-open. What it does NOT do is make an indented heading harmless. Take:
+ *
+ *     ## Unreleased
+ *
+ *      ## v0.21.9 — a released section          <- ONE leading space
+ *
+ *     - **My entry:** oops.
+ *
+ * CommonMark renders two `<h2>`s and GitHub shows the entry under v0.21.9.
+ * `parseSections` sees ONE section, `## Unreleased`, running to EOF. RULE 2
+ * finds no released section, so nothing is misplaced; RULE 1 counts the
+ * released heading and its body as Unreleased content. Exit 0, silently, over
+ * precisely the buried-entry corruption this guard was written for.
+ *
+ * The old comment argued the policy was safe because the mirror mistake is
+ * "merely noisy". That is true for an indented `## Unreleased` and false for an
+ * indented RELEASED heading, and it was the only thing standing in for
+ * enforcement — the file's `grep -c '^ \{1,3\}#\{1,6\} '` → 0 was asserted in
+ * prose and checked by nothing. This makes it a check.
+ *
+ * SCOPE: level-2 headings only, because sections are what the guard reasons
+ * about; an indented `### ` opens no section and hides nothing. The FIX offered
+ * to the author is exact and always available — unindent it (a real heading),
+ * indent it to 4+ spaces, or fence it (an example, which CommonMark then renders
+ * as code and this guard already ignores).
+ *
+ * @param {string} changelog
+ * @returns {{line: number, text: string}[]}
+ */
+export function findIndentedHeadings(changelog) {
+  return analyze(changelog).indented
 }
 
 /**
@@ -591,7 +681,7 @@ export function hasSkipLabel(labels) {
  *   removedChangelogSections?: Set<string>,
  *   placementOnly?: boolean,
  * }} input
- * @returns {{status: 'pass'|'fail', reason: string, shippable?: string[], misplaced?: {section: string, line: number, text: string}[]}}
+ * @returns {{status: 'pass'|'fail', reason: string, shippable?: string[], misplaced?: {section: string, line: number, text: string}[], indentedHeadings?: {line: number, text: string}[]}}
  */
 export function evaluate({
   changedFiles,
@@ -604,10 +694,20 @@ export function evaluate({
   removedChangelogSections = new Set(),
   placementOnly = false,
 }) {
-  // RULE 2 first: a misplaced entry is a corruption of already-shipped release
-  // notes, and it outranks "did Unreleased grow" — which, in exactly this
-  // situation, reports the misleading symptom (`no new entry`) instead of the
-  // cause (`your entry is under ## v0.21.8`).
+  // RULE 0: an indented `## ` heading makes every rule below read a DIFFERENT
+  // document from the one GitHub renders, so it is checked first and it is not
+  // escapable — `[changelog placement ok]` says "I meant to edit a released
+  // section", which is not an assertion about the file's block structure.
+  // Unconditional on the range too: the heading that hides a section may have
+  // been there before this PR, and RULE 2 is just as blind to it either way.
+  const indentedHeadings = findIndentedHeadings(headChangelog)
+
+  // RULE 2: a misplaced entry is a corruption of already-shipped release notes,
+  // and it outranks "did Unreleased grow" — which, in exactly this situation,
+  // reports the misleading symptom (`no new entry`) instead of the cause
+  // (`your entry is under ## v0.21.8`). Reported BEFORE the indent FAIL when
+  // both fire: a named buried entry is the more actionable of the two, and the
+  // indent block is appended to the same report rather than replacing it.
   const placementEscaped =
     hasPlacementToken(prBody) || (commitMessages || []).some((m) => hasPlacementToken(m))
   if (!placementEscaped && addedChangelogLines.size > 0) {
@@ -617,8 +717,16 @@ export function evaluate({
       removedChangelogSections,
     )
     if (misplaced.length > 0) {
-      return { status: 'fail', reason: 'entry added under a released section', misplaced }
+      return {
+        status: 'fail',
+        reason: 'entry added under a released section',
+        misplaced,
+        indentedHeadings,
+      }
     }
+  }
+  if (indentedHeadings.length > 0) {
+    return { status: 'fail', reason: 'an indented `## ` heading hides a section', indentedHeadings }
   }
   if (placementOnly) {
     return { status: 'pass', reason: 'no entry added under a released section' }
@@ -742,6 +850,19 @@ const RECORD = '\x1e'
  * @returns {{status: 'pass'|'fail'|'skip', lines: string[]}}
  */
 export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
+  // No parser, no verdict. SKIP rather than the raw ERR_MODULE_NOT_FOUND stack
+  // a static import would throw — see the guarded import at the top of the file.
+  if (!Parser) {
+    return {
+      status: 'skip',
+      lines: [
+        'check-changelog-entry: SKIP — the `commonmark` devDependency is not installed.',
+        '  This guard parses CHANGELOG.md with the reference CommonMark implementation.',
+        '  Run `bun install` and re-run; CI installs devDependencies before lint.',
+      ],
+    }
+  }
+
   // On a queue ref only RULE 2 (placement) runs — RULE 1's escape hatch lives
   // in the `pull_request` payload, which does not exist here. See the header.
   const placementOnly = env.GITHUB_EVENT_NAME === 'merge_group'
@@ -896,6 +1017,29 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     }
   }
 
+  // The indent report. Appended to the misplaced-entry FAIL when both fire (the
+  // named buried entry is the more actionable half) and stands alone otherwise.
+  const indentReport =
+    verdict.indentedHeadings && verdict.indentedHeadings.length > 0
+      ? [
+          '',
+          'check-changelog-entry: FAIL — an INDENTED `## ` heading hides a section.',
+          '',
+          'CommonMark (and GitHub) render these lines as level-2 headings, but this guard',
+          'anchors headings at column 0, so the section each one opens is INVISIBLE to the',
+          'placement check and its body is credited to the section above it:',
+          '',
+          ...verdict.indentedHeadings.map((h) => `  CHANGELOG.md:${h.line}\n    ${h.text}`),
+          '',
+          'Left alone, an entry added below an indented RELEASED heading is reported OK',
+          'while GitHub shows it buried in a shipped section. Fix the line, not the guard:',
+          '',
+          '  - a real heading  → remove the leading spaces (column 0)',
+          '  - an EXAMPLE of a heading → put it in a fenced code block, or indent it to 4+',
+          '    spaces, either of which CommonMark reads as code rather than a heading',
+        ]
+      : []
+
   if (verdict.misplaced) {
     // Release headings carry a long ` — <summary>` tail; the version token is
     // the part a reader needs, and the full line makes the report unreadable.
@@ -943,8 +1087,13 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
         'If you are deliberately editing an already-released section (fixing a typo in an',
         'old entry, a retroactive backport note), put `[changelog placement ok]` on its',
         'OWN LINE in the PR body or a commit message.',
+        ...indentReport,
       ],
     }
+  }
+
+  if (indentReport.length > 0) {
+    return { status: 'fail', lines: [...warnings, ...indentReport.slice(1)] }
   }
 
   return {

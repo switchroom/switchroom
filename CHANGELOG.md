@@ -202,8 +202,38 @@ now an anomaly worth investigating, not the norm.
   already-released section (an entry quoting the staging header, which is a
   thing this file does) would un-release every section below it and wave a
   buried entry through. Refusing it can at worst invent a section and fail a PR
-  that should have passed: loud and wrong beats silent and wrong. Both
-  directions are pinned by tests.
+  that should have passed: loud and wrong beats silent and wrong. That reasoning
+  only covered ONE of the two directions, and review caught the other: an
+  indented **released** heading is not "loud and wrong", it is silent and wrong.
+  An indented `## v0.21.5` under `## Unreleased` renders as a released section on
+  GitHub, while the guard's anchor drops it, so the section it opens stays folded
+  into `## Unreleased` — an entry pasted below it reads as staged,
+  `findMisplacedEntries` sees no released section to complain about, and the PR
+  passes. The anchor is therefore no longer allowed to discard silently: any
+  level-2..6 ATX heading the reference implementation renders from a
+  1–3-space-indented line is now its own FAIL, naming the line and the three ways
+  out (unindent it, fence it, or indent it to 4+ so it is code). The rule is
+  deliberately NOT escapable with `[changelog placement ok]`, since that hatch
+  exists for a deliberate edit to an old section, not for a heading nobody can
+  see. **This is a behaviour change**: a CHANGELOG.md that used to pass with an
+  indented heading now fails. Today's file has 429 column-0 headings and zero
+  indented ones, so it costs nothing here. Separately, a missing `commonmark`
+  devDependency now degrades to the guard's designed SKIP instead of
+  `ERR_MODULE_NOT_FOUND` — the import is guarded, so a half-installed tree gets
+  "skipped, dependency absent", not a stack trace.
+  Two of the things that were supposed to be PINNING all this were pinning
+  nothing, which is the same defect one layer up.
+  `scripts/changelog-mask-differential.mjs` scored its fail-open and fail-closed
+  columns with an expression character-identical to the implementation it was
+  auditing, so both counters were hard-wired to zero: a mutant that relaxed the
+  anchor and a mutant that disabled fence masking entirely both scored 0/0 and
+  exited 0 over 20,000 documents. Its oracle is now derived from the SOURCE TEXT
+  and from what the reference implementation actually renders; those same two
+  mutants now score 832 and 1,896 and exit 1, and three further mutants (deleting
+  the indent rule, inventing a heading, narrowing the section regex) score 206,
+  2,000 and 616. The battery's second assertion had the same
+  copy-of-the-implementation oracle and is likewise re-derived from the source
+  line and CommonMark's ATX rule.
   The CommonMark evidence these rounds kept being argued from is now committed
   twice over. `tests/fixtures/commonmark-mask-cases.mjs` is a 42-row conformance
   corpus, one row per shape that cost a round, and the battery over it no longer
