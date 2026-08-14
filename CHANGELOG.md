@@ -109,7 +109,29 @@ now an anomaly worth investigating, not the norm.
   placement rule straight back into a confident OK over a buried entry. A
   line-start comment left unclosed at EOF now WARNs alongside the unclosed-fence
   WARN, for the same reason — a guard whose whole value is *does not fail open*
-  has to be loud when its own state machine ends somewhere unexpected.
+  has to be loud when its own state machine ends somewhere unexpected. The
+  anchoring rule alone was not enough, because the scanner also had to agree
+  with CommonMark about where a comment ENDS: `<!-->` and `<!--->` are COMPLETE
+  comments (CommonMark 0.30+, matching the HTML spec — the closing `-->` may
+  reuse the opener's own dashes), but the closer was searched for from four
+  characters in, which cannot see either form. A line-start one was therefore
+  read as an unterminated opener, passed the anchoring check, and blanked
+  everything down to the next `-->` in the FILE: the same 429 → 421 sections and
+  the same eight buried `## v0.21.x` headings as above, except SILENTLY — the
+  unclosed-comment WARN cannot fire, since as far as the state machine is
+  concerned nothing is open at EOF. Searching from two characters in is exactly
+  equivalent for every other comment and closes it. Heading recognition is now
+  column-0 anchored in BOTH parsers (the growth rule used to accept a `##
+  Unreleased` at any indent, including the 4+ spaces CommonMark reads as an
+  indented code block); the ≤3-space tolerance is deliberately not honoured,
+  because an indented `## Unreleased` inside an already-released section would
+  un-release everything below it. And the CommonMark evidence these rounds kept
+  being argued from is now committed as a 31-case differential battery
+  (`tests/fixtures/commonmark-mask-cases.mjs`), each row carrying the reference
+  implementation's answer, so the six unmodelled HTML block types are pinned with
+  their direction (a `## ` inside one is a phantom released section, fail-closed;
+  a line-start `<!--` inside a type-6 block masks a real heading away, fail-open)
+  rather than waved off as "a changelog does not hit them".
 - **telegram/render: a `<pre>` whose body contained ``` shipped an
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
