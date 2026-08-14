@@ -237,12 +237,26 @@ Traps that bite repeatedly:
   applies those mutations itself: for each entry in
   `scripts/mutation-targets.json` whose file or tests the PR touched, it
   perturbs the named symbols and fails if the scoped suite stays green.
-  DIFF-GATED — an unrelated PR runs nothing; the shipped target costs ~8s. Run
-  `npm run lint:mutation-coverage` for every target. Escape hatch (reason
-  mandatory): `// mutation-allow: <reason>` on or above the line, for genuinely
-  equivalent mutants — `src/util/log-rotation.ts:641` is the worked example.
-  Adding a target: name the narrowest `symbols` (an unscoped entry on a
-  6000-line module is hours of CI) and state the blast radius in `why`.
+  Diff-gated ON PULL REQUESTS ONLY, and that caveat is the trap: the gate is
+  `GITHUB_BASE_REF`, which Actions sets for `pull_request` and NOT for
+  `push: main` or `merge_group`, and `check-mutation-coverage.mjs:99-114` treats
+  an unresolvable base as "run everything" (a shallow checkout takes the same
+  fallback). `ci-lint.yml` fires on all three and `lint-run`'s `if:` forces it
+  on push and merge_group, so EVERY merge-queue entry and every push to main
+  runs the WHOLE manifest, not only the touched entries. Budget accordingly: the
+  one shipped target is ~7s, and that is a per-queue-entry cost, not a per-PR
+  one. It also means `ci-lint` now executes vitest, so a flake in any target's
+  scoped suite becomes `BASELINE IS RED` and blocks the merge queue on a job
+  that previously never ran tests — manifest entries must be hermetic (no
+  docker, no network, no host state). Run `npm run lint:mutation-coverage` for
+  every target. Escape hatch (reason mandatory): `// mutation-allow: <reason>`
+  on or above the line, for genuinely equivalent mutants —
+  `src/util/log-rotation.ts:641` is the worked example; it must be real source,
+  not string-literal content. Adding a target: name the narrowest `symbols` (an
+  unscoped entry on a 6000-line module is hours of CI), state the blast radius
+  in `why`, and record the enumerated `mutants` count — that count is a ratchet,
+  because a refactor to a ternary / `&&` / `switch` moves the logic to a site no
+  operator visits and a SHRUNKEN all-killed set still reports a clean pass.
 
 - **`check-agent-attribution-trailers` needs full history.** It diffs
   `origin/<base>..HEAD` and looks for `Switchroom-Agent:` /

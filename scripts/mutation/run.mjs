@@ -16,8 +16,27 @@
  *     function, moved file) silently reduces the target to zero mutants, which
  *     also passes. Zero mutants is a hard error, and unmatched symbols are
  *     named.
+ *   - A SHRINKING MUTANT SET. The operators only visit `if` statements and
+ *     multi-arg calls, so a semantics-preserving refactor — the same branch
+ *     rewritten as a ternary, a `&&` chain, a `switch`, a loop guard — yields
+ *     FEWER mutants at the same site, and a smaller set of mutants that all
+ *     die still reports a clean pass over logic nothing perturbed. Measured on
+ *     this repo's one target: rewriting tier 2 of `selectEvictionVictim` as
+ *     `findIndex` + `staleIdx >= 0 ? … : …`, with 2338c280's test additions
+ *     reverted so the tier is genuinely unasserted, took the run from `4/4` to
+ *     `2/2 mutants killed — OK` at exit 0. So each manifest entry records its
+ *     expected mutant count (`mutants`) and a mismatch is a hard error — the
+ *     same anti-drift shape as `scripts/check-gateway-line-ratchet.mjs`.
  *   - LOST SOURCE. The original text is restored in a `finally`, and the
  *     restore is verified, so an interrupted run cannot leave a mutant on disk.
+ *
+ * What "killed" does and does NOT mean. A mutant is killed when the scoped
+ * suite goes RED — which includes the suite CRASHING, e.g. `drop-last-arg`
+ * producing a `TypeError` before any assertion runs. That is standard
+ * mutation-testing semantics and it is the right default (a crash IS the suite
+ * noticing), but "killed" is a weaker claim than "asserted": it says a test
+ * noticed the change, not that a test describes the behaviour. A green run is
+ * evidence the suite is not vacuous; it is not evidence the suite is complete.
  */
 
 import { enumerateMutants } from "./operators.mjs";
@@ -39,6 +58,11 @@ import { enumerateMutants } from "./operators.mjs";
  * @param {string}   args.file         Repo-relative path (reporting only).
  * @param {string[]} [args.symbols]    Scope mutation to these declarations.
  * @param {string[]} [args.operators]  Restrict the operator set.
+ * @param {number} [args.expectedMutants]  Recorded mutant count for this
+ *        target. A mismatch (in EITHER direction) is a hard error: it is the
+ *        only thing that catches a refactor which moves the logic to a site no
+ *        operator visits. Omitted only on ad-hoc `--file` runs, which have no
+ *        manifest entry to record it in.
  * @param {() => string} args.readSource
  * @param {(text: string) => void} args.writeSource
  * @param {() => ({passed: boolean, detail?: string})} args.runTests
@@ -49,6 +73,7 @@ export function runMutationTarget({
   file,
   symbols,
   operators,
+  expectedMutants,
   readSource,
   writeSource,
   runTests,
@@ -75,6 +100,22 @@ export function runMutationTarget({
           ? ` (${allowedMutants.length} suppressed by mutation-allow)`
           : "") +
         `. A target that produces no mutants asserts nothing.`,
+    );
+  }
+  if (expectedMutants != null && mutants.length !== expectedMutants) {
+    throw new Error(
+      `${file}: MUTANT COUNT DRIFTED — the manifest records ${expectedMutants}, ` +
+        `enumeration produced ${mutants.length}` +
+        (allowedMutants.length > 0
+          ? ` (+${allowedMutants.length} suppressed by mutation-allow)`
+          : "") +
+        `. A SHRINK is the dangerous direction and the reason this is checked: the ` +
+        `operators only visit \`if\` statements and multi-arg calls, so rewriting the ` +
+        `same branch as a ternary, an \`&&\`, a \`switch\` or a loop guard removes ` +
+        `mutants from the site while every remaining mutant still dies — a clean pass ` +
+        `over logic the check never perturbed. A GROWTH is usually benign but is not ` +
+        `assumed. Either way: re-read the target, confirm the logic is still covered, ` +
+        `and update "mutants" in scripts/mutation-targets.json in the SAME commit.`,
     );
   }
 

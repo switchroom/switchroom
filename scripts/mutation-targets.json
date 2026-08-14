@@ -11,7 +11,31 @@
     "Run `node scripts/check-mutation-coverage.mjs --all` locally first: a new",
     "entry with surviving mutants fails CI, and the fix is a test that kills",
     "them (or a `// mutation-allow: <reason>` if the survivor is genuinely",
-    "equivalent — see src/util/log-rotation.ts:641 for what that looks like)."
+    "equivalent — see src/util/log-rotation.ts:641 for what that looks like).",
+    "",
+    "`mutants` is MANDATORY and is a ratchet, not documentation: the check",
+    "hard-errors when enumeration disagrees with it. The operators only visit",
+    "`if` statements and multi-arg calls, so a semantics-preserving refactor to",
+    "a ternary / `&&` / `switch` / loop guard SHRINKS the mutant set at the same",
+    "site and every surviving mutant still dies — a clean pass over logic that",
+    "was never perturbed. Measured: tier 2 of `selectEvictionVictim` rewritten",
+    "as `findIndex` + `staleIdx >= 0 ? … : …`, with the discriminating test",
+    "reverted, went from `4/4` to `2/2 mutants killed — OK` at exit 0. Update",
+    "the number only after re-reading the target and confirming the logic is",
+    "still covered, in the same commit as the refactor.",
+    "",
+    "ADMISSION CRITERIA — an entry costs more than the diff gate suggests:",
+    "  1. HERMETIC SUITES ONLY. No docker, no network, no host state, no",
+    "     wall-clock sleeps. The check runs the scoped suite once per mutant",
+    "     plus a baseline, so a flake anywhere in it becomes `BASELINE IS RED`",
+    "     and blocks the merge queue on a lint job that never ran tests before.",
+    "  2. THE DIFF GATE DOES NOT APPLY ON THE QUEUE PATH. `GITHUB_BASE_REF` is",
+    "     unset on `push: main` and on `merge_group`, and check-mutation-",
+    "     coverage.mjs:99-114 treats an unresolvable base as `run everything`",
+    "     (as does a shallow checkout, via the same fallback). So EVERY entry",
+    "     runs on EVERY merge-queue entry and every push to main, not just on",
+    "     PRs that touch it. Budget the whole manifest at queue time: the one",
+    "     shipped target is ~7s (4 mutants + baseline x ~1.7s scoped vitest)."
   ],
   "runner": "vitest",
   "targets": [
@@ -19,6 +43,7 @@
       "file": "telegram-plugin/gateway/pending-inbound-buffer.ts",
       "symbols": ["selectEvictionVictim"],
       "tests": ["telegram-plugin/tests/pending-inbound-buffer.test.ts"],
+      "mutants": 4,
       "why": "#4663. Victim selection decides whether a synthetic approval outcome — the one inbound class the operator cannot resend, because the Approve tap already happened — is dropped from the pending buffer. Neutralising the tier-2 age bound left all 76 tests green (git show 2338c280); the agent would block forever on a wake-up that is never coming, and nothing in CI would say so."
     }
   ]

@@ -85,13 +85,13 @@ const LOCAL_ZONE = "LOCAL-ZONE-BYTES";
  * the FIRST e2e test in this file, which pays the runner's one-off BuildKit
  * builder warm-up that every later build skips. Two observed CI failures, both
  * this file's first e2e test, both a hair over the default, and both followed
- * by a sibling doing identical work in a quarter of the time:
+ * by a sibling doing identical work in a fraction of the time:
  *
- *   run 31659633813 (main @ 4ae73296)         6063ms → FAIL, sibling 1300ms
+ *   run 31659633813 (main @ 4ae73296)         6063ms → FAIL, sibling  942ms
  *   run 31675696938 (ci/vacuous-test-guard)   5825ms → FAIL, sibling 1352ms
  *
- * BASE is already pulled at collection time (see DOCKER above), so the pull is
- * not the variable — the warm-up is. 30s matches the idiom the other docker
+ * BASE is already pulled at collection time (see `DOCKER` below), so the pull
+ * is not the variable — the warm-up is. 30s matches the idiom the other docker
  * suites here use (hindsight-entrypoint.test.ts:162).
  */
 const DOCKER_TEST_TIMEOUT_MS = 30_000;

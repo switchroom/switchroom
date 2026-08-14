@@ -50,8 +50,19 @@
  *     too slow for PR CI and drowns in equivalent mutants.
  *   - SYMBOL-SCOPED. `src/host-control/server.ts` is 6060 lines; entries name
  *     the function, not the module.
- *   - DIFF-GATED. A PR that touches no target runs nothing at all. The one
- *     shipped target costs ~7s (4 mutants x ~1.7s scoped vitest).
+ *   - DIFF-GATED ON PULL REQUESTS. A PR that touches no target runs nothing at
+ *     all. The one shipped target costs ~7s (4 mutants + baseline x ~1.7s
+ *     scoped vitest). NOT gated on the queue path: `GITHUB_BASE_REF` is unset
+ *     for `push: main` and `merge_group`, and `changedFiles` treats an
+ *     unresolvable base as "run everything" (so does a shallow checkout, via
+ *     the same fallback at the bottom of that function). `ci-lint.yml` fires on
+ *     all three triggers and `lint-run`'s `if:` forces it on push and
+ *     merge_group, so the WHOLE manifest runs on every merge-queue entry and
+ *     every push to main. That is deliberate — the queue ref IS candidate main
+ *     and a path-skipped run would leave the required `lint` context resting on
+ *     nothing — but it means the manifest is a per-queue-entry budget, and that
+ *     `ci-lint` now executes vitest at all. See the admission criteria in
+ *     `scripts/mutation-targets.json`.
  *   - THREE operators, each the literal edit a reviewer made on a real
  *     incident. No general mutation catalogue, no equivalent-mutant swamp.
  *
@@ -161,6 +172,19 @@ function main() {
   } else {
     const manifest = JSON.parse(readFileSync(MANIFEST, "utf8"));
     targets = manifest.targets;
+    // `mutants` is MANDATORY on a manifest entry. Without it the entry loses
+    // the count ratchet, which is the only check that notices a refactor
+    // moving the logic to a site no operator visits (see run.mjs).
+    for (const t of targets) {
+      if (!Number.isInteger(t.mutants) || t.mutants <= 0) {
+        console.error(
+          `check-mutation-coverage: ${t.file} is missing a positive integer ` +
+            `"mutants" count. Run \`node scripts/check-mutation-coverage.mjs --all\` ` +
+            `and record the number it reports.`,
+        );
+        process.exit(2);
+      }
+    }
     if (!args.all) {
       const changed = changedFiles(args.base);
       if (changed) {
@@ -183,28 +207,48 @@ function main() {
   let failed = false;
   for (const t of targets) {
     const abs = join(REPO, t.file);
-    arm(SENTINEL, { file: t.file, path: abs, original: readFileSync(abs, "utf8") });
     console.log(
       `\ncheck-mutation-coverage: ${t.file}` +
         (t.symbols?.length ? ` [${t.symbols.join(", ")}]` : " [whole file]"),
     );
+    // Its own try: a manifest entry whose `file` was renamed or deleted is a
+    // stale manifest, and it must read as one. Unguarded, this read crashed
+    // the process with a raw ENOENT stack naming the script's own line number
+    // instead of the manifest the reader has to edit. Kept separate from the
+    // run below so the diagnosis cannot be pinned on an unrelated ENOENT
+    // thrown from inside the runner.
+    let original;
+    try {
+      original = readFileSync(abs, "utf8");
+    } catch (err) {
+      failed = true;
+      console.error(
+        `\n  ${t.file}: STALE MANIFEST — no such file. A manifest entry whose ` +
+          `file was renamed or deleted must be updated or removed in the same ` +
+          `PR.\n  ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
+    arm(SENTINEL, { file: t.file, path: abs, original });
     let result;
     try {
       result = runMutationTarget({
         file: t.file,
         symbols: t.symbols,
+        expectedMutants: t.mutants,
         readSource: () => readFileSync(abs, "utf8"),
         writeSource: (text) => writeFileSync(abs, text, "utf8"),
         runTests: makeVitestRunner(t.tests),
         log: (m) => console.log(m),
       });
     } catch (err) {
-      // A stale symbol, a red baseline or a zero-mutant target are HARD
-      // failures, not survivors: each one would otherwise let the check report
-      // a clean pass over logic it never actually perturbed. Report the cause
-      // and keep going, so one broken entry does not hide another's survivors.
+      // A missing file, a stale symbol, a red baseline, a zero-mutant target
+      // and a drifted mutant count are all HARD failures, not survivors: each
+      // one would otherwise let the check report a clean pass over logic it
+      // never actually perturbed. Report the cause and keep going, so one
+      // broken entry does not hide another's survivors.
       failed = true;
-      console.error(`\n  ${err instanceof Error ? err.message : err}`);
+      console.error(`\n  ${err instanceof Error ? err.message : String(err)}`);
       continue;
     } finally {
       disarm(SENTINEL);

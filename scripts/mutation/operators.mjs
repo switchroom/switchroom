@@ -53,6 +53,12 @@ export const OPERATORS = ["force-false", "force-true", "drop-last-arg"];
  * A reason is MANDATORY. `// mutation-allow:` with nothing after it does not
  * suppress anything — an escape hatch you can take without saying why is how a
  * guard stops guarding.
+ *
+ * Matched against raw line text, so a hit INSIDE a string or template literal
+ * is rejected (see `literalSpans`): the text `"// mutation-allow: x"` sitting
+ * in a fixture, a log-line template, or a test's inline source must not
+ * suppress a real adjacent site. That is a silent no-op of the guard, which is
+ * exactly the failure mode this whole check exists to make impossible.
  */
 const ALLOW_RE = /\/\/\s*mutation-allow:\s*(\S.*)$/;
 
@@ -108,6 +114,26 @@ function symbolSpans(sourceFile, symbols) {
   return { spans, missing };
 }
 
+/** Absolute `[start, end)` spans of every string / template literal, so an
+ *  `// mutation-allow:` that is really just literal CONTENT cannot suppress a
+ *  site. */
+function literalSpans(sourceFile) {
+  const spans = [];
+  const visit = (node) => {
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isTemplateLiteral(node) ||
+      ts.isRegularExpressionLiteral(node)
+    ) {
+      spans.push([node.getStart(sourceFile), node.getEnd()]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(sourceFile, visit);
+  return spans;
+}
+
 /** Splice `replacement` over `[start, end)` of `text`. */
 function splice(text, start, end, replacement) {
   return text.slice(0, start) + replacement + text.slice(end);
@@ -149,12 +175,20 @@ export function enumerateMutants(fileName, text, opts = {}) {
     spans === null || spans.some(([s, e]) => pos >= s && pos < e);
 
   const lines = text.split("\n");
+  const lineStarts = sourceFile.getLineStarts();
+  const literals = literalSpans(sourceFile);
+  const inLiteral = (pos) => literals.some(([s, e]) => pos >= s && pos < e);
   /** A site is suppressed by `// mutation-allow: <reason>` on its own line or
-   *  the line immediately above it. */
+   *  the line immediately above it — provided the text is real source and not
+   *  the contents of a string or template literal. */
   const allowanceFor = (lineNo /* 1-based */) => {
-    for (const candidate of [lines[lineNo - 1], lines[lineNo - 2]]) {
+    for (const idx of [lineNo - 1, lineNo - 2]) {
+      const candidate = lines[idx];
       const m = candidate?.match(ALLOW_RE);
-      if (m) return m[1].trim();
+      if (!m) continue;
+      const abs = (lineStarts[idx] ?? 0) + m.index;
+      if (inLiteral(abs)) continue;
+      return m[1].trim();
     }
     return null;
   };

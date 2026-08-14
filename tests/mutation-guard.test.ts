@@ -174,6 +174,30 @@ describe("mutation guard — negative space (what it must NOT do)", () => {
     );
   });
 
+  it("ignores a `// mutation-allow:` that is only string-literal CONTENT", () => {
+    // The hatch must be real source, not text. A fixture, a log template, or a
+    // test that embeds the marker in a literal would otherwise switch off a
+    // genuine adjacent site with nobody having written a suppression — a
+    // silent no-op of the guard, which is the one failure mode it exists to
+    // make impossible.
+    const src =
+      `export function f(v: number) {\n` +
+      `  log("// mutation-allow: not a real hatch");\n` +
+      `  if (v < 0) return null;\n` +
+      "  const t = `// mutation-allow: nor is this`;\n" +
+      `  if (v > 100) return null;\n` +
+      `  return v;\n` +
+      `}\n`;
+    const { mutants, allowedMutants } = enumerateMutants("x.ts", src);
+    expect(allowedMutants).toEqual([]);
+    expect(mutants.map((m) => m.id)).toEqual([
+      "force-false@3",
+      "force-true@3",
+      "force-false@5",
+      "force-true@5",
+    ]);
+  });
+
   it("refuses a reasonless `// mutation-allow:` — an unargued hatch suppresses nothing", () => {
     const src = `export function f(v: number) {\n  // mutation-allow:\n  if (v < 0) return null;\n  return v;\n}\n`;
     const { mutants, allowedMutants } = enumerateMutants("x.ts", src);
@@ -227,6 +251,71 @@ describe("mutation guard — refuses to pass for the wrong reason", () => {
     ).toThrow(/enumerated 0 mutants/);
   });
 
+  // The blind spot the recorded count exists to close. The operators only
+  // visit `if` statements and multi-arg calls, so a semantics-preserving
+  // rewrite to a ternary REMOVES mutants from the site rather than surviving
+  // one — and a smaller all-killed set reports a clean pass over logic nothing
+  // perturbed. Reproduced on the real target: tier 2 of `selectEvictionVictim`
+  // as `findIndex` + `staleIdx >= 0 ? … : …`, with 2338c280's test additions
+  // reverted so the tier is genuinely unasserted, ran `2/2 mutants killed —
+  // OK` at exit 0, down from `4/4`.
+  const TWO_IFS =
+    `export function pick(v: number, w: number) {\n` +
+    `  if (v > 0) return 'a';\n` +
+    `  if (w > 0) return 'b';\n` +
+    `  return 'c';\n` +
+    `}\n`;
+  const ONE_IF_ONE_TERNARY =
+    `export function pick(v: number, w: number) {\n` +
+    `  if (v > 0) return 'a';\n` +
+    `  return w > 0 ? 'b' : 'c';\n` +
+    `}\n`;
+
+  it("hard-errors when a semantics-preserving refactor SHRINKS the mutant set", () => {
+    // Same behaviour, half the mutants. Every remaining mutant would still be
+    // killed, so survivors alone cannot see this.
+    expect(enumerateMutants("m.ts", TWO_IFS).mutants.length).toBe(4);
+    expect(enumerateMutants("m.ts", ONE_IF_ONE_TERNARY).mutants.length).toBe(2);
+
+    expect(() =>
+      runMutationTarget({
+        file: "m.ts",
+        expectedMutants: 4,
+        readSource: () => ONE_IF_ONE_TERNARY,
+        writeSource: () => {},
+        runTests: () => ({ passed: true }),
+      }),
+    ).toThrow(/MUTANT COUNT DRIFTED — the manifest records 4, enumeration produced 2/);
+  });
+
+  it("hard-errors on GROWTH too — a new branch is not assumed to be covered", () => {
+    expect(() =>
+      runMutationTarget({
+        file: "m.ts",
+        expectedMutants: 2,
+        readSource: () => TWO_IFS,
+        writeSource: () => {},
+        runTests: () => ({ passed: true }),
+      }),
+    ).toThrow(/MUTANT COUNT DRIFTED — the manifest records 2, enumeration produced 4/);
+  });
+
+  it("runs normally when the count matches", () => {
+    let call = 0;
+    const r = runMutationTarget({
+      file: "m.ts",
+      expectedMutants: 4,
+      readSource: () => TWO_IFS,
+      writeSource: () => {},
+      // First call is the baseline (must be green); every mutant after it is
+      // killed.
+      runTests: () => ({ passed: ++call === 1 }),
+    });
+    expect(r.total).toBe(4);
+    expect(r.killed).toBe(4);
+    expect(r.survivors).toEqual([]);
+  });
+
   it("restores the original source even when a mutant run throws", () => {
     let onDisk = `export function f(v: number) {\n  if (v) return 1;\n  return 0;\n}\n`;
     const original = onDisk;
@@ -245,6 +334,36 @@ describe("mutation guard — refuses to pass for the wrong reason", () => {
       }),
     ).toThrow(/runner exploded/);
     expect(onDisk).toBe(original);
+  });
+});
+
+describe("mutation guard — the check script's own error surface", () => {
+  it("reports a stale target file as a curated error, not a raw ENOENT stack", () => {
+    // A renamed or deleted target is the ordinary way a manifest goes stale.
+    // Before the fix the first `readFileSync` sat outside the try, so this
+    // crashed the process with `Error: ENOENT … at main (…:186:56)` and a
+    // Node version banner — output that names the script's internals instead
+    // of the manifest the reader has to edit. Driven through the ad-hoc
+    // `--file` path, which shares the loop with the manifest path.
+    const r = spawnSync(
+      process.execPath,
+      [
+        join(REPO, "scripts", "check-mutation-coverage.mjs"),
+        "--file",
+        "telegram-plugin/gateway/does-not-exist.ts",
+        "--tests",
+        "tests/mutation-guard.test.ts",
+      ],
+      { cwd: REPO, encoding: "utf8", timeout: 60_000 },
+    );
+    expect(r.status).toBe(1);
+    const err = r.stderr ?? "";
+    expect(err).toContain("STALE MANIFEST — no such file");
+    expect(err).toContain("telegram-plugin/gateway/does-not-exist.ts");
+    // The tell for the unhandled-throw path: a stack frame in the script and
+    // Node's crash banner.
+    expect(err).not.toMatch(/at main \(/);
+    expect(err).not.toMatch(/^Node\.js v/m);
   });
 });
 
@@ -301,6 +420,48 @@ describe("mutation guard — crash recovery (the check writes the real tree)", (
     }
   });
 
+  it("refuses to overwrite a file the developer edited after a killed run", () => {
+    // The data-loss path, and it is an ordinary sequence, not a contrived one:
+    // a run is killed (so the sentinel survives — it dies before `disarm`), the
+    // developer then does real work in that same file, and the next
+    // `npm run lint` starts by "recovering". An unconditional
+    // `writeFileSync(rec.path, rec.original)` silently reverts that work behind
+    // a `console.warn`. Restore only what is demonstrably a mutant.
+    const { dir, sentinel, target } = scratch();
+    try {
+      const pristine = `if (v) return 1;\n`;
+      writeFileSync(target, pristine, "utf8");
+      arm(sentinel, { file: "prod.ts", path: target, original: pristine });
+      // …the run is killed. The developer then edits the file for real.
+      const humanEdit = `if (v) return 2; // a real change, hours of work\n`;
+      writeFileSync(target, humanEdit, "utf8");
+
+      expect(() => recover(sentinel)).toThrow(/would DELETE those edits/);
+      expect(readFileSync(target, "utf8")).toBe(humanEdit);
+      // Left armed on purpose: the human reconciles and deletes it, exactly
+      // like the truncated-sentinel path.
+      expect(existsSync(sentinel)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still restores every operator's mutant, including drop-last-arg", () => {
+    // The recognition set must be the mutants the runner can actually write,
+    // or the guard trades data loss for a refusal to clean up after itself.
+    const { dir, sentinel, target } = scratch();
+    try {
+      const pristine = `f(a, b);\n`;
+      writeFileSync(target, pristine, "utf8");
+      arm(sentinel, { file: "prod.ts", path: target, original: pristine });
+      writeFileSync(target, `f(a, undefined);\n`, "utf8");
+      expect(recover(sentinel)).toEqual({ file: "prod.ts", restored: true });
+      expect(readFileSync(target, "utf8")).toBe(pristine);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses to silently delete a truncated sentinel", () => {
     const { dir, sentinel } = scratch();
     try {
@@ -336,7 +497,13 @@ describe("mutation guard — the curated manifest stays honest", () => {
   const manifest = JSON.parse(
     readFileSync(join(REPO, "scripts", "mutation-targets.json"), "utf8"),
   ) as {
-    targets: Array<{ file: string; symbols?: string[]; tests: string[]; why: string }>;
+    targets: Array<{
+      file: string;
+      symbols?: string[];
+      tests: string[];
+      why: string;
+      mutants: number;
+    }>;
   };
 
   it("every target names a file, a scoped suite, and a reason", () => {
@@ -353,9 +520,13 @@ describe("mutation guard — the curated manifest stays honest", () => {
     }
   });
 
-  it("every target's symbols resolve and produce mutants in the CURRENT source", () => {
-    // The failure this pins: a rename lands, the symbol stops matching, the
-    // target silently drops to zero mutants and CI keeps reporting green.
+  it("every target's symbols resolve and produce EXACTLY the recorded mutant count", () => {
+    // Two failures this pins. A rename lands, the symbol stops matching, the
+    // target silently drops to zero mutants and CI keeps reporting green —
+    // and the subtler one: a semantics-preserving refactor (ternary, `&&`,
+    // `switch`, loop guard) moves the logic to a site no operator visits, so
+    // the count SHRINKS while every remaining mutant still dies. `> 0` cannot
+    // see the second; the recorded count can.
     for (const t of manifest.targets) {
       const src = readFileSync(join(REPO, t.file), "utf8");
       const { mutants, missingSymbols } = enumerateMutants(t.file, src, {
@@ -363,6 +534,27 @@ describe("mutation guard — the curated manifest stays honest", () => {
       });
       expect(missingSymbols).toEqual([]);
       expect(mutants.length).toBeGreaterThan(0);
+      expect({ file: t.file, mutants: mutants.length }).toEqual({
+        file: t.file,
+        mutants: t.mutants,
+      });
     }
+  });
+
+  it("every target records a positive integer mutant count", () => {
+    for (const t of manifest.targets) {
+      expect(Number.isInteger(t.mutants) && t.mutants > 0).toBe(true);
+    }
+  });
+
+  it("the check is still wired into `npm run lint` — the guard must actually run", () => {
+    // This PR's own argument is "a narrow guard that runs beats a broad one
+    // that gets disabled". Everything else here tests the LIBRARY, so deleting
+    // the call from package.json would leave this suite 100% green with the
+    // guard switched off. This is the assertion that notices.
+    const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    expect(pkg.scripts.lint).toContain("node scripts/check-mutation-coverage.mjs");
   });
 });
