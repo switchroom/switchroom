@@ -324,8 +324,15 @@ now an anomaly worth investigating, not the norm.
   ratchet lowered to match, on a green PR that never ran the check once. Both
   keys now match those paths, and a test parses the filter file and re-derives
   the coverage from the directory listing so a rename cannot silently reopen the
-  hole. Three verdict bugs went with it: a mutant killed by `MUTANT_TIMEOUT_MS`
-  scored as *killed* when a timeout is INDETERMINATE (it now has its own bucket
+  hole. Stated honestly, because the filter fix is only half of it: a
+  MANIFEST-ONLY PR can still go green on the PR path, since the PR arm of
+  `ci-tests-core.yml` is `vitest run --changed` (import-graph selection, and the
+  manifest is data no test imports) and the check's own diff gate then reports
+  `no targets to run — OK`; what makes such a PR unlandable is the merge queue,
+  whose `merge_group` arm runs the full suite with no `--changed`, and where
+  `tests/mutation-guard.test.ts` asserts a non-empty manifest with exact
+  per-target `mutants` counts. Three verdict bugs went with it: a mutant killed
+  by `MUTANT_TIMEOUT_MS` scored as *killed* when a timeout is INDETERMINATE (it now has its own bucket
   and fails the run, and a timed-out BASELINE is a hard error rather than a red
   baseline); the `// mutation-allow:` escape hatch's regex silently never
   matched on a CRLF file, disabling the reason requirement; and an

@@ -212,6 +212,33 @@ describe("mutation guard — negative space (what it must NOT do)", () => {
     expect(mutants.map((m) => m.id)).toEqual(["force-false@3", "force-true@3"]);
   });
 
+  it("a reasonless hatch on the site's OWN line does not mask a reasoned one above it", () => {
+    // `allowanceFor` returns on the FIRST line that matches, own line before
+    // the line above. So the `\S` in ALLOW_RE's `(\S.*)` is load-bearing on
+    // more than the reason requirement: widen it to `([\s\S]*)` and a
+    // reasonless own-line marker MATCHES with an empty capture, allowanceFor
+    // returns "" instead of falling through, and the argued suppression on
+    // the line above is silently discarded — the site reappears as a survivor
+    // and the author is told to justify a mutant they already justified. The
+    // reasonless-hatch test above cannot see this: with nothing on the line
+    // above, "" and null are both falsy and the outcome is identical.
+    const src =
+      `export function f(v: number) {\n` +
+      `  // mutation-allow: genuinely equivalent, argued at length\n` +
+      `  if (v) return 1; // mutation-allow:\n` +
+      `  return 0;\n` +
+      `}\n`;
+    const { mutants, allowedMutants } = enumerateMutants("x.ts", src);
+    expect(mutants).toEqual([]);
+    expect(allowedMutants.map((m) => m.id)).toEqual([
+      "force-false@3",
+      "force-true@3",
+    ]);
+    expect(allowedMutants[0]!.allowReason).toBe(
+      "genuinely equivalent, argued at length",
+    );
+  });
+
   it("scopes mutation to the named symbol", () => {
     const src =
       `export function wanted(v: number) {\n  if (v < 0) return 0;\n  return v;\n}\n` +
