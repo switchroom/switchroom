@@ -51,6 +51,39 @@ now an anomaly worth investigating, not the norm.
   the highest safe value — kokoro flushes a batch at `>=` 510), and an
   out-of-range setting is warned about at startup rather than clamped
   silently.
+
+- **telegram/render: the raw-HTML fold deleted prose, not just markup** —
+  #4691 (merged, unreleased) degraded every HTML token it could not fold or
+  pass through by DELETING it. That is right for markup and catastrophic for
+  prose: `Use the <service>/<key> convention`, `switchroom vault get <key>`,
+  `/host-home/.switchroom/logs/<agent>/` and "the `<b>` tag" all shipped with
+  the placeholders silently gone. The discriminator is now MATCHING rather
+  than the tag name — a balanced pair is markup (drop the markup, keep the
+  content), an UNMATCHED marker is prose and survives as literal text with
+  `&`/`<`/`>` HTML-entity-escaped, which Bot API Rich HTML documents as
+  supported named entities, so content is kept without risking the
+  `unsupported start tag` 400. Also in this pass:
+  `<pre>`/`<pre><code class="language-…">` now folds to a real fenced block
+  (it previously became an inline code span wrapping a newline, which
+  Telegram will not parse) and degrades to an inline span only where a fence
+  cannot survive (heading, table cell); structural tags (`<li>`, `<p>`,
+  `<div>`, `<td>`, …) leave a hard line break so
+  `<ul><li>one</li><li>two</li></ul>` no longer glues into `onetwo`; the
+  wire-verified passthrough allowlist (`<u>`, `<sub>`, `<details>`, …) is now
+  balance-checked document-wide before being emitted raw, closing the
+  unbalanced-`<u>` path to the exact `unclosed start tag` 400 the module
+  exists to prevent (whose fallback resends the whole message as PLAIN text);
+  `<br>` inside a heading or table cell degrades to a space instead of
+  breaking the block; a nested `<a>`'s href is kept as literal text instead
+  of being silently dropped; and `escapeLinkHref` percent-encodes ASCII
+  whitespace/control characters, which a backslash cannot rescue because a
+  bare link destination ends at the first whitespace byte.
+  `html-fold.ts`'s "content is never lost" invariant is restated accurately
+  and now names its one residual (a `<` mdast hands over as a TEXT node never
+  reaches this module). Pinned by 31 outcome tests in
+  `telegram-plugin/tests/render/html-dialect-content-loss.test.ts`, every one
+  of which fails on `fa9018a7`.
+
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
   (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)
