@@ -1,4 +1,6 @@
-"""Unit tests for the voice sidecar's TTS speed clamp (server._clamp_speed).
+"""Unit tests for the voice sidecar's HTTP surface — the /tts speed clamp
+(server._clamp_speed), text splitting, multipart parsing, auth, the wedge
+watchdog, and the /tts response headers.
 
 The sidecar accepts an optional `speed` in the /tts JSON body, clamps it to
 [0.5, 2.0], and defaults to 1.0 when absent/invalid (exactly today's
@@ -11,6 +13,8 @@ Run: python3 -m unittest discover -s docker/voice-sidecar -p 'test_*.py'
 
 from __future__ import annotations
 
+import json
+import re
 import unittest
 
 import server
@@ -268,6 +272,170 @@ class WatchdogTests(unittest.TestCase):
         # A late success does NOT un-wedge — we let the restart happen.
         server._note_success()
         self.assertTrue(server._is_wedged())
+
+
+class _FakeTtsHandler:
+    """Drives server.Handler._handle_tts without opening a real socket, and
+    records the response line, headers and body bytes it emits.
+
+    Same unbound-call pattern as _FakeAuthHandler above: the methods under
+    test are the REAL ones, only the socket boundary is faked. `_authed` is
+    the real implementation so the auth contract still holds."""
+
+    _authed = server.Handler._authed
+
+    class _Headers:
+        def __init__(self, d: dict) -> None:
+            self._d = d
+
+        def get(self, name: str, default: str = "") -> str:
+            return self._d.get(name, default)
+
+    class _Rfile:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self, n: int) -> bytes:
+            return self._body[:n]
+
+    class _Wfile:
+        def __init__(self) -> None:
+            self.written = b""
+
+        def write(self, b: bytes) -> None:
+            self.written += b
+
+    def __init__(self, body: bytes, token: str) -> None:
+        self._headers = {
+            "X-Voice-Token": token,
+            "Content-Length": str(len(body)),
+            "Content-Type": "application/json",
+        }
+        self.rfile = self._Rfile(body)
+        self.wfile = self._Wfile()
+        self.status: int | None = None
+        self.sent_headers: list[tuple[str, str]] = []
+        self.json_sent: tuple[int, dict] | None = None
+
+    @property
+    def headers(self):  # noqa: ANN201
+        return self._Headers(self._headers)
+
+    def send_response(self, status: int) -> None:
+        self.status = status
+
+    def send_header(self, name: str, value) -> None:
+        self.sent_headers.append((name, str(value)))
+
+    def end_headers(self) -> None:
+        pass
+
+    def _send_json(self, status: int, body: dict) -> None:
+        self.status = status
+        self.json_sent = (status, body)
+
+    def header(self, name: str) -> str | None:
+        """Case-insensitive lookup, matching how an HTTP client reads them."""
+        for k, v in self.sent_headers:
+            if k.lower() == name.lower():
+                return v
+        return None
+
+
+class _FakeFuture:
+    def __init__(self, value) -> None:
+        self._value = value
+
+    def result(self, timeout=None):  # noqa: ANN001, ANN201, ARG002
+        return self._value
+
+
+class _FakePool:
+    """Stands in for server._tts_pool — runs nothing, returns a canned
+    (ogg, meta) so the header emission is the only thing under test."""
+
+    def __init__(self, value) -> None:
+        self._value = value
+        self.submitted: list[tuple] = []
+
+    def submit(self, _fn, *args):  # noqa: ANN001, ANN201
+        self.submitted.append(args)
+        return _FakeFuture(self._value)
+
+
+class TtsResponseHeaderTests(unittest.TestCase):
+    """#4695 documented the chunking degradation counters as reaching the
+    caller in the /tts response; they only ever reached the meta dict and
+    stderr. These assert the ACTUAL response headers."""
+
+    META = {
+        "audioSeconds": 2.5,
+        "durationMs": 1234,
+        "voice": "af_heart",
+        "speed": 1.0,
+        "pieces": 3,
+        "batches": 5,
+        "chars": 42,
+        "hardCuts": 0,
+        "unchunkedPieces": 0,
+    }
+
+    def setUp(self) -> None:
+        self._orig_token = server.SHARED_TOKEN
+        self._orig_tts = server._tts
+        self._orig_pool = server._tts_pool
+        server.SHARED_TOKEN = "s3cret"
+        server._tts = object()  # "model ready"
+
+    def tearDown(self) -> None:
+        server.SHARED_TOKEN = self._orig_token
+        server._tts = self._orig_tts
+        server._tts_pool = self._orig_pool
+
+    def _synth(self, meta: dict):
+        body = json.dumps({"text": "hello world"}).encode("utf-8")
+        server._tts_pool = _FakePool((b"OGGBYTES", meta))
+        h = _FakeTtsHandler(body, token="s3cret")
+        server.Handler._handle_tts(h)
+        return h
+
+    def test_clean_run_still_emits_both_counters_as_zero(self) -> None:
+        # Always emitted, not only when non-zero: a caller must be able to
+        # tell "no degradation" from "server too old to report it".
+        h = self._synth(dict(self.META))
+
+        self.assertEqual(h.status, 200)
+        self.assertIsNone(h.json_sent)
+        self.assertEqual(h.wfile.written, b"OGGBYTES")
+        self.assertEqual(h.header("X-Voice-Hard-Cuts"), "0")
+        self.assertEqual(h.header("X-Voice-Unchunked-Pieces"), "0")
+
+    def test_degraded_run_reports_the_counts_to_the_caller(self) -> None:
+        h = self._synth({**self.META, "hardCuts": 3, "unchunkedPieces": 2})
+
+        self.assertEqual(h.status, 200)
+        self.assertEqual(h.header("X-Voice-Hard-Cuts"), "3")
+        self.assertEqual(h.header("X-Voice-Unchunked-Pieces"), "2")
+
+    def test_existing_headers_are_unchanged(self) -> None:
+        h = self._synth(dict(self.META))
+
+        self.assertEqual(h.header("Content-Type"), "audio/ogg")
+        self.assertEqual(h.header("Content-Length"), str(len(b"OGGBYTES")))
+        self.assertEqual(h.header("X-Voice-Duration-Ms"), "1234")
+        self.assertEqual(h.header("X-Voice-Audio-Seconds"), "2.5")
+        self.assertEqual(h.header("X-Voice-Voice"), "af_heart")
+
+    def test_counter_header_names_follow_the_meta_key_convention(self) -> None:
+        # Every X-Voice-* header derives from its camelCase meta key
+        # (durationMs -> X-Voice-Duration-Ms). Pins that for the two counters
+        # so renaming one side without the other fails here rather than
+        # silently shipping a header no caller is reading.
+        h = self._synth(dict(self.META))
+        emitted = {k.lower() for k, _ in h.sent_headers}
+        for key in ("hardCuts", "unchunkedPieces"):
+            header = "x-voice-" + re.sub(r"(?<!^)(?=[A-Z])", "-", key).lower()
+            self.assertIn(header, emitted, msg=f"{key} not surfaced as {header}")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,11 @@ HTTP contract
                 then each piece's PHONEME string is chunked to
                 VOICE_TTS_MAX_PHONEMES so Kokoro never hard-slices it,
                 each synthesized on the GPU, and re-joined into a SINGLE file.
+                Response headers: X-Voice-Duration-Ms, X-Voice-Audio-Seconds,
+                X-Voice-Voice, and the #4695 degradation counters
+                X-Voice-Hard-Cuts / X-Voice-Unchunked-Pieces — both ALWAYS
+                sent, "0" on a clean run, so an absent header means an old
+                sidecar rather than a clean request.
               → 4xx/5xx { ok: false, reason, detail }
   GET  /healthz
               → 200 { ok: true, status: "ready", stt: true, tts: true }
@@ -1069,8 +1074,10 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
             "pieces": len(pieces),
             "batches": batches,
             "chars": len(text),
-            # Non-zero => audio quality was degraded on this request. Surfaced
-            # in the response so a caller can act on it, not only in the log.
+            # Non-zero => audio quality was degraded on this request. Emitted
+            # by _handle_tts as the X-Voice-Hard-Cuts /
+            # X-Voice-Unchunked-Pieces response headers (always, including 0)
+            # so a caller can act on it, not only in the log.
             "hardCuts": hard_cuts,
             "unchunkedPieces": unchunked_pieces,
         }
@@ -1359,6 +1366,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Voice-Duration-Ms", str(meta["durationMs"]))
         self.send_header("X-Voice-Audio-Seconds", str(meta["audioSeconds"]))
         self.send_header("X-Voice-Voice", meta["voice"])
+        # Degradation counters (#4695). Emitted ALWAYS, including as "0":
+        # only-when-non-zero would make an absent header ambiguous between
+        # "this request was clean" and "this sidecar is too old to report it",
+        # which is exactly the signal a caller needs to act on.
+        self.send_header("X-Voice-Hard-Cuts", str(meta["hardCuts"]))
+        self.send_header("X-Voice-Unchunked-Pieces", str(meta["unchunkedPieces"]))
         self.end_headers()
         self.wfile.write(ogg)
 
