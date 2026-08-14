@@ -164,6 +164,25 @@ class SplitPhonemesTests(unittest.TestCase):
     def test_cap_is_clamped_below_kokoros_limit(self) -> None:
         self.assertLessEqual(server.TTS_MAX_PHONEMES, MAX_PHONEME_LENGTH)
 
+    def test_our_chunk_is_kokoros_batch_one_for_one(self) -> None:
+        # Kokoro re-inserts a space after every break char, so `a,b` comes back
+        # as `a, b`. Un-normalised, a 500-phoneme comma-dense chunk re-expands
+        # to 749 inside Kokoro and Kokoro re-splits it (508 + 241) — seams we
+        # did not choose, and a `batches` count in the meta that is wrong.
+        for dense in ("a," * 250, "a," * 4000, "ab,cd." * 300):
+            chunks, _ = server._split_phonemes(dense, server.TTS_MAX_PHONEMES)
+            for c in chunks:
+                rebuilt = _FaithfulKokoro._split_phonemes(c)
+                self.assertEqual(
+                    rebuilt, [c], msg=f"Kokoro re-batched our chunk: {c[:40]!r}"
+                )
+                self.assertLessEqual(len(rebuilt[0]), MAX_PHONEME_LENGTH)
+
+    def test_normalize_is_a_fixed_point_of_kokoros_rebuild(self) -> None:
+        for raw in ("a,b.c!d?e;f", "  a ,  b  ", "hˈEloU,wˈ3:ld.", "x"):
+            norm = server._normalize_phonemes(raw)
+            self.assertEqual("".join(_FaithfulKokoro._split_phonemes(norm)), norm)
+
 
 class NoPhonemeLossThroughSynthesisTests(unittest.TestCase):
     """The outcome test. Runs real-shaped input end-to-end through

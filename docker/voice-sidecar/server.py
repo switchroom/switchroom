@@ -703,6 +703,37 @@ def _split_text(text: str, max_chars: int) -> list[str]:
 _PHONEME_BREAKS = ".,!?;"
 
 
+def _normalize_phonemes(phonemes: str) -> str:
+    """Rebuild a phoneme string exactly the way Kokoro._split_phonemes rebuilds
+    it: every clause stripped, break chars kept flush against the clause they
+    end, a single space between runs.
+
+    Kokoro runs that rebuild on whatever we hand it and it can make the string
+    LONGER — `a,b` comes back as `a, b` — so `len(chunk)` here and the length
+    Kokoro measures are not the same number unless we normalise first (measured:
+    a 500-phoneme chunk re-expanding to 749 on the production corpus, which
+    Kokoro then re-split into 508 + 241).
+
+    That growth cannot by itself cause truncation — it only ever happens at a
+    break char, and break chars are exactly where Kokoro re-batches. What it
+    does cause is Kokoro silently re-splitting chunks we already sized, putting
+    seams somewhere we did not choose and making `batches` in the response meta
+    a lie. Normalising makes Kokoro's rebuild a fixed point: our chunk is the
+    batch, one for one."""
+    import re
+
+    out = ""
+    for part in re.split(r"([.,!?;])", phonemes):
+        part = part.strip()
+        if not part:
+            continue
+        if part in _PHONEME_BREAKS:
+            out += part
+        else:
+            out = (out + " " + part) if out else part
+    return out
+
+
 def _split_phonemes(phonemes: str, max_phonemes: int) -> tuple[list[str], int]:
     """Split a phoneme string into chunks of at most `max_phonemes`, preferring
     Kokoro's own break characters (`.,!?;`) then whitespace, so a chunk boundary
@@ -719,7 +750,7 @@ def _split_phonemes(phonemes: str, max_phonemes: int) -> tuple[list[str], int]:
     enough that the caller logs them loudly rather than swallowing them.
 
     Pure — no Kokoro, no misaki, no globals. Directly unit-testable."""
-    phonemes = phonemes.strip()
+    phonemes = _normalize_phonemes(phonemes)
     if not phonemes:
         return [], 0
     if len(phonemes) <= max_phonemes:
