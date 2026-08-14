@@ -476,10 +476,16 @@ describe('speech capture (PR-0) — driven through the REAL sendReply wiring, no
   it('M3: a capture write failure (flag ON, unwritable state dir) never breaks the reply', async () => {
     // The destination is a FILE, not a directory, so appendFileSync fails
     // ENOTDIR every call — the exact swallow path the flag-on window depends
-    // on for 7 days unattended. If a refactor ever made the capture call
-    // async, or moved it past an await (so its rejection reached the
-    // sendReply promise chain instead of being caught in-place), THIS test
-    // is the one that would go red.
+    // on for 7 days unattended. This only pins the CURRENT synchronous,
+    // in-place-caught shape: it proves a swallowed-write-failure reply still
+    // ships, but it would NOT go red if a refactor made the capture call
+    // async and fire-and-forget (unawaited) — that rejection becomes an
+    // unhandled rejection, which this codebase's policy treats as fatal
+    // (see analytics-posthog.ts, chat-lock.ts), strictly worse than the one
+    // lost capture line this test guards against, and this test alone
+    // cannot detect it. The synchronous-return contract that WOULD catch
+    // that mutation is pinned directly on `captureSpeechText` in
+    // `speech-capture.test.ts` ("G1: captureSpeechText returns undefined").
     const dir = mkdtempSync(join(tmpdir(), 'speech-capture-golden-'))
     const notADir = join(dir, 'state-dir-is-actually-a-file')
     writeFileSync(notADir, 'not a directory')
@@ -506,7 +512,16 @@ describe('speech capture (PR-0) — driven through the REAL sendReply wiring, no
       return null
     }
 
-    const raw = '| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```ts\nconst x = 1 | 2\n```\n\nStatus: ✅ done `code` 😀.'
+    // Deliberately includes a spaced em-dash: `normalizeOutboundBody`'s
+    // voice-scrub pass (`scrubVoice`, applied LAST in the pipeline —
+    // outbound-send-path.ts's own docstring: "normalize → redact →
+    // punctuation/bold → voice-scrub") rewrites a mid-prose ` — ` into `. `
+    // plus recapitalizing the following word. A golden fixture with nothing
+    // for the pipeline to transform can't tell "capture reads the
+    // normalised `text`" apart from "capture reads the raw `rawText`" — both
+    // would produce byte-identical output. This fixture makes that
+    // distinction observable (G2).
+    const raw = '| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```ts\nconst x = 1 | 2\n```\n\nStatus update — done. ✅ `code` 😀.'
     await sendReply(h.deps, req(raw))
 
     expect(observedByVoicePlan).not.toBeNull()
@@ -519,6 +534,15 @@ describe('speech capture (PR-0) — driven through the REAL sendReply wiring, no
     // from" resolveVoiceOutPlan's input — it is the SAME string, by identity
     // of value, not by coincidence of two independent pipelines agreeing.
     expect(captured[0]!.text).toBe(observedByVoicePlan)
+    // G2: the captured text is the NORMALISED/scrubbed form, downstream of
+    // `scrubVoice`'s em-dash rewrite — not the raw fixture. A regression
+    // that swapped in the pre-pipeline `rawText` would still satisfy the
+    // identity assertion above (both call sites would agree on SOME
+    // string), so this must check the captured content against the known
+    // transform independently, not just against `observedByVoicePlan`.
+    expect(captured[0]!.text).not.toBe(raw)
+    expect(captured[0]!.text).not.toContain('Status update — done')
+    expect(captured[0]!.text).toContain('Status update, done')
   })
 
   it('flag OFF: sendReply never creates the capture file, even with a writable state dir', async () => {

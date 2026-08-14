@@ -43,6 +43,26 @@ describe('captureSpeechText', () => {
     expect(existsSync(join(stateDir, SPEECH_CAPTURE_FILE_NAME))).toBe(false)
   })
 
+  it('G1: captureSpeechText returns undefined (sync contract), flag on and flag off alike', () => {
+    // Pins the SYNCHRONOUS return contract the swallow-on-write-failure
+    // guarantee depends on. `send-reply-golden.test.ts`'s M3 "write failure
+    // never breaks the reply" test only observes that the reply still ships
+    // — it would NOT go red if a refactor made this function `async` and
+    // fire-and-forget (an unawaited rejection there becomes an unhandled
+    // rejection, which this codebase's policy treats as fatal — see
+    // analytics-posthog.ts and chat-lock.ts). An `async function` always
+    // returns a Promise, never `undefined`, so THIS assertion is the one
+    // that goes red on that mutation, awaited or not.
+    const stateDir = freshDir()
+    expect(captureSpeechText('x', { enabled: false, stateDir })).toBeUndefined()
+    expect(captureSpeechText('x', { enabled: true, stateDir })).toBeUndefined()
+    // Also true on the swallowed-write-failure path (destination collides
+    // with a file, not a dir) — the exact shape M3's golden test exercises.
+    const notADir = join(freshDir(), 'not-a-directory-marker')
+    writeFileSync(notADir, 'not a directory')
+    expect(captureSpeechText('x', { enabled: true, stateDir: notADir })).toBeUndefined()
+  })
+
   it('flag off via env (SWITCHROOM_SPEECH_CAPTURE unset) writes nothing', () => {
     const stateDir = freshDir()
     const prior = process.env.SWITCHROOM_SPEECH_CAPTURE
