@@ -151,16 +151,37 @@ now an anomaly worth investigating, not the norm.
   lines are fence content. Where that guess is wrong the opener was document-level
   and merely indented 1-3 spaces, so the block ends early and at worst invents a
   phantom section — fail-CLOSED by construction, the direction this guard is
-  allowed to be wrong in. Ending a block that way also blocks any new block from
-  opening until the pending closer goes by, so the real closer cannot be misread
-  as a fresh opener and restart the very run-to-EOF this fixes. Differentially
-  fuzzed over 60,000 generated documents against `commonmark@0.31.2`: the fence
-  and comment family goes from 736 fail-open documents to ZERO, and parity on
-  the real CHANGELOG.md is exact at 429 sections against 429 rendered `<h2>`,
-  with nothing lost and nothing invented. `gen-changelog-entry.mjs` learned the
-  same column-0 anchoring for `## Unreleased`, so the writer and the checker
-  cannot disagree about which line is the staging section and stage an entry
-  where the guard will not count it.
+  allowed to be wrong in. A dedent is AMBIGUOUS, though, and getting the
+  ambiguity wrong put the same run-to-EOF fail-open straight back. It has two
+  readings: the CONTAINER one (the item ended, the block ended with it, and this
+  line is a fresh document-level construct) and the DOC-LEVEL one (the opener was
+  merely indented, the block is still open and its own closer is still ahead).
+  So the dedent is now tested BEFORE the closer, without exception — testing the
+  closer first spent a dedented ``` as the indented fence's closer while
+  CommonMark had already ended that fence and was spending the delimiter as a
+  fresh OPENER, which inverts fence parity for the rest of the file and erases
+  every heading the next legitimate opener covers — and ending a block at a
+  dedent blocks any new block from opening until the delimiters BOTH readings
+  still owe have gone by, not just the first of them. The dedenting delimiter
+  itself is blanked rather than emitted: it is punctuation under either reading,
+  and emitting it verbatim would be its own fail-open, since a stray ``` under
+  `## Unreleased` counts as a staged entry and would credit a PR that staged
+  nothing. Parity on the real CHANGELOG.md is exact at 429 sections against 429
+  rendered `<h2>`, with nothing lost and nothing invented. The differential that
+  produced these numbers is now committed as
+  `scripts/changelog-mask-differential.mjs` — seeded, so the counts reproduce —
+  rather than quoted from a throwaway script: over 60,000 generated documents per
+  seed, against `commonmark@0.31.2`, fail-open documents go from 3/4/4/3/4 (seeds
+  1-5) to 1/1/3/1/2, every remaining one WARNs rather than failing silently, and
+  fail-closed moves under 0.1%. Not zero, and an earlier draft of this entry
+  claimed zero: the residue needs a fence marker sharing its line with a
+  container marker (`- > ```yaml`), which the `≤3 spaces` opener anchor cannot
+  see at all, and is out of reach of this approximation rather than one more
+  patch away. `gen-changelog-entry.mjs` learned the same column-0 anchoring for
+  `## Unreleased` — at BOTH ends of the section, the header scan and the scan
+  that finds where it stops — so the writer and the checker cannot disagree about
+  which lines are the staging section and stage an entry where the guard will not
+  count it.
 - **telegram/render: a `<pre>` whose body contained ``` shipped an
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick

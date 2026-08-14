@@ -1207,12 +1207,18 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
   });
 
   it("a dedented closer is CLOSING punctuation, not a staged entry", () => {
-    // The closer is checked BEFORE the dedent rule on purpose: CommonMark lets a
-    // closing fence be indented LESS than its opener, so a column-0 ``` under an
-    // indented opener is that fence's own closer. Check the dedent first and the
-    // line stops being fence punctuation — it survives masking as literal text,
-    // and RULE 1 counts one line of ``` as a staged changelog entry. This PR
-    // stages no entry at all, so the only correct verdict is a red.
+    // A column-0 ``` under an indented opener is fence PUNCTUATION under both
+    // readings of the dedent — the doc-level reading's closer, or the container
+    // reading's fresh opener — so it is blanked either way and is never a
+    // staged entry. Emit it verbatim instead (the natural mistake once the
+    // dedent is tested before the closer, which is what round 6 required) and
+    // RULE 1 counts one line of ``` as a changelog entry. This PR stages no
+    // entry at all, so the only correct verdict is a red.
+    //
+    // NOTE: this comment used to say the closer is checked BEFORE the dedent
+    // "on purpose". That ordering was round 6's fail-OPEN and is gone; the
+    // outcome this test asserts is unchanged, but it is now delivered by
+    // blanking the dedenting delimiter rather than by consuming it as a closer.
     const BASE = [
       "# Changelog",
       "",
@@ -1240,6 +1246,222 @@ describe("check-changelog-entry — a fence or comment under a list item is scop
     expect(r.code).toBe(1);
     expect(r.out).toContain("check-changelog-entry: FAIL");
     expect(r.out).not.toContain("## Unreleased grew");
+  });
+
+  it("the delimiter that RELEASES a container-exit guess is punctuation too", () => {
+    // The twin of the test above, for the other place a delimiter can surface
+    // while the `resync` latch is up. Here the dedent is caused by a prose line,
+    // so the ``` that finally retires the latch arrives several lines later —
+    // and it is still nothing but fence punctuation. Emit it verbatim and RULE 1
+    // credits this PR, whose only added line under `## Unreleased` is that one
+    // ``` closing a block someone else left open, with having staged an entry:
+    // a green on a PR that changed code and staged nothing.
+    //
+    // Mutation-proven: `out.push(m && m[2].trim() === '' ? blank(line) : line)`
+    // → `out.push(line)` and this run flips to exit 0, "## Unreleased grew".
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** with an example block:",
+      "",
+      "  ```yaml",
+      "  key: value",
+      "back at column zero",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-container-resync-closer-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", BASE.replace("back at column zero\n", "back at column zero\n```\n"));
+    f.commit("feat: ship code and close a dangling fence, staging no entry");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+    expect(r.out).not.toContain("## Unreleased grew");
+  });
+
+  it("attack: a BARE dedented fence BEFORE the released heading must not invert fence parity", () => {
+    // Round 6's blocker, and the case the committed container attack above
+    // MISSES on two axes at once: its trailer fence sits AFTER the released
+    // heading and carries an info string. Move the trailer above the heading
+    // and make it bare — the real CHANGELOG.md's dominant style, 29 bare
+    // column-0 fences against 3 with an info string — and the fix that shipped
+    // at 470bee0f delivers zero improvement over the tree before it: `OK`,
+    // exit 0, on a genuinely buried entry.
+    //
+    // The mechanism is fence PARITY, not masking depth. `  ```yaml` opens
+    // inside the bullet; the column-0 ``` below it takes the line OUT of the
+    // container, so CommonMark ends the list item, ends the fence with it, and
+    // reads that line as a FRESH document-level opener whose closer is the
+    // ``` two lines down. Consume it as the indented fence's CLOSER instead
+    // and every later delimiter is off by one: the real closer becomes an
+    // opener and runs to EOF, erasing `## v0.20.11` and the entry under it.
+    //
+    // Mutation-proven: restore the closer-before-dedent order in
+    // `check-changelog-entry.mjs` (the `m && m[1][0] === fence.char ...` test
+    // ahead of `dedents()`) and this run is exit 0, "OK — no entry added under
+    // a released section". `commonmark@0.31.2` renders both `<h2>`s, so the
+    // buried entry is real.
+    const s = fixture("changelog-container-bare-closer-", [
+      "- an entry whose example block is indented under the bullet:",
+      "",
+      "  ```yaml",
+      "  key: value",
+      "",
+      "```",
+      "$ pasted transcript",
+      "```",
+    ]).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("attack: a comment's resync latch must hold until its own `-->`, not the next line", () => {
+    // The `resync` latch releases a container-exit guess only once the block's
+    // real closer has gone by. For a comment that closer is `-->`, and until
+    // this test nothing asserted it: replace the release condition with `true`
+    // and all 169 tests still passed, with the latch lifting on the very next
+    // line and re-enabling fence openers early.
+    //
+    // The shape that makes it observable: the comment is indented ONE space, so
+    // it is document-level (a `- ` item's content starts at column 2) and
+    // CommonMark keeps it open all the way to `tail -->` — every fence
+    // delimiter in between is comment body. Release early and the lone
+    // column-0 ``` becomes a real opener with nothing left to close it, so it
+    // runs to EOF and takes `## v0.20.11` and the buried entry with it.
+    //
+    // Mutation-proven: `line.includes('-->')` → `true` and this run is exit 0.
+    // `commonmark@0.31.2` renders both `<h2>`s.
+    const s = fixture("changelog-container-comment-resync-", [
+      "",
+      " <!-- reviewer note",
+      " more note",
+      "back at column zero",
+      "```",
+      "tail -->",
+    ]).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("a container exit must wait out BOTH readings — a transcript containing `-->` is code", () => {
+    // A dedent is ambiguous, and the latch carries one pending delimiter per
+    // reading. Here the comment under the bullet is dedented out of BY a fence
+    // opener, so under the container reading a fence is now open and its closer
+    // is ahead; under the doc-level reading the comment never ended and its
+    // `-->` is ahead. The transcript happens to contain `-->`, which satisfies
+    // only the second — lift the latch there and the ``` that really closes the
+    // transcript is read as an OPENER, runs to EOF, and buries the entry.
+    //
+    // Mutation-proven: drop the container reading's half of the latch
+    // (`openerOf` → `() => null`) and this run is exit 0. `commonmark@0.31.2`
+    // renders both `<h2>`s: the list item and the comment both end at the
+    // ```console line, which opens a code block that closes normally.
+    const s = fixture("changelog-container-both-readings-", [
+      "- an entry with a note tucked under it:",
+      "  <!-- reviewer note",
+      "  more note",
+      "```console",
+      '$ grep -n -- "-->" index.html',
+      "```",
+    ]).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("the dedenting delimiter is the new OPENER, so it cannot also retire the latch", () => {
+    // The fence-path twin of the test above, and the one that pins why the
+    // dedenting line is consumed (blanked, `continue`) rather than falling
+    // through into the latch. Under the container reading that line IS the
+    // fresh opener; let it retire the pending delimiter it just created and the
+    // container reading's half of the latch cancels itself out on every dedent,
+    // making it dead code.
+    //
+    // Four backticks wrapping a transcript that itself contains ``` is ordinary
+    // markdown, and it separates the two pending delimiters: the inner ```
+    // retires the indented `  ```yaml`'s closer, the final ```` retires the
+    // dedenting opener's. Retire both early and that final ```` opens a fence
+    // to EOF.
+    //
+    // Mutation-proven: change the dedent's `if (m)` consume to `if (false && m)`
+    // and this run is exit 0. `commonmark@0.31.2` renders both `<h2>`s.
+    const s = fixture("changelog-container-dedent-opener-", [
+      "- an entry whose example block is indented under the bullet:",
+      "",
+      "  ```yaml",
+      "  key: value",
+      "````",
+      "$ pasted transcript",
+      "```",
+      "more output",
+      "````",
+    ]).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("a 4-space-indented ``` is an indented CODE block, not a fence opener", () => {
+    // The `/^ {0,3}(...)/` opener bound, previously unpinned in either
+    // direction: widen it to `/^ {0,4}(...)/` and all 169 tests still passed,
+    // even though indent semantics is this whole change's subject.
+    //
+    // Direction, honestly: with the container rule in place this mutant is NOT
+    // fail-OPEN — a column-0 heading below dedents out of the phantom fence, so
+    // the heading survives. What it breaks is RULE 1. At document level a
+    // 4-space-indented block is literal code CONTENT, so its lines are real
+    // added lines; read them as a fence and they are masked away, and a PR that
+    // did stage content under `## Unreleased` reds for staging nothing. A false
+    // FAIL, sticky until someone re-indents the block.
+    //
+    // Mutation-proven: `/^ {0,3}(...)/` → `/^ {0,4}(...)/` and this run flips
+    // to exit 1. `commonmark@0.31.2` agrees the block is an indented code block
+    // and renders `## v0.20.11`.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-container-indent4-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "- **Earlier entry (#0):** already staged.\n",
+        "- **Earlier entry (#0):** already staged.\n\n    ```\n    ## v9.9.9 — pasted release heading\n    more literal text\n",
+      ),
+    );
+    f.commit("feat: ship code and stage an indented literal block under Unreleased");
+
+    const s = f.checkStreams();
+    expect(s.code).toBe(0);
+    expect(`${s.stdout}${s.stderr}`).toContain("## Unreleased grew");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("WARN");
   });
 
   it("does NOT over-correct: a fence under a bullet that CLOSES still hides its `## ` line", () => {

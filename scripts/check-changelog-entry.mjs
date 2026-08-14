@@ -356,18 +356,35 @@ function maskCommentsInLine(s, allowMultiline = true) {
  * the 429 released headings erased, with no WARN, because the state machine
  * still believed it was inside a block CommonMark had already closed. That is
  * the fail-OPEN this guard exists to prevent, so what is modelled here is not
- * the full container stack, only a refusal to mask past a DEDENT.
+ * the full container stack, only a refusal to mask past a DEDENT — and the
+ * dedent is tested BEFORE the closer, without exception. Testing the closer
+ * first was round 6's fail-open: a dedented fence delimiter got spent as this
+ * fence's closer while CommonMark had already ended the fence at the dedent and
+ * was spending that delimiter as a fresh OPENER. Fence parity inverts from
+ * there, and the next legitimate opener erases real headings below it.
  *
  * The approximation: a non-blank line indented LESS than the line that opened
  * the block ends the block. A blank line is not a dedent (blank lines are fence
  * content, and do not end a type-2 comment). Where CommonMark disagrees it is
  * because the opener was document-level and merely indented 1–3 spaces, in which
  * case the block really did stay open — the guard ends it early and may invent a
- * phantom section, the fail-CLOSED direction, by construction. Because the real
- * closer is then still ahead, ending a block this way sets `resync`: masking
- * stays off, but nothing may OPEN until that closer goes by, so the block's own
- * closing delimiter cannot be misread as a fresh opener and restart the very
- * run-to-EOF fail-open this paragraph is about.
+ * phantom section, the fail-CLOSED direction, by construction.
+ *
+ * So a dedent has TWO readings, and indentation alone cannot tell them apart:
+ * the CONTAINER reading (the item ended, the block ended with it, and this line
+ * is a fresh document-level construct) and the DOC-LEVEL reading (the opener was
+ * merely indented, the block is still open, and its own closer is still ahead).
+ * Ending the block is right under the first and premature under the second, so
+ * `resync` covers both: masking stays off, but nothing may OPEN until the
+ * delimiters BOTH readings still owe have gone by — `pending`, the doc-level
+ * block's own closer, and `pendingFence`, the closer of the fence the dedenting
+ * line opens under the container reading. Releasing on whichever arrives first
+ * lets the other reading's delimiter be misread as a fresh opener and restart
+ * the very run-to-EOF fail-open this paragraph is about, so the latch lifts only
+ * once BOTH slots are empty. A line that is nothing but a fence delimiter is
+ * punctuation under both readings and is blanked, never emitted: RULE 1 counts
+ * every non-blank line under `## Unreleased` as a staged entry, so emitting a
+ * stray delimiter verbatim would be its own fail-open.
  *
  * NOT modelled: the other six HTML block types (1, 3, 4, 5, 6, 7), and — beyond
  * the dedent rule above — containers themselves: block quotes, and the list
@@ -399,6 +416,19 @@ function maskCommentsInLine(s, allowMultiline = true) {
  *   EOF, and for the same reason: the anchoring rule above makes the fail-open
  *   shape unreachable from prose, but a guard whose whole value is "does not fail
  *   open" must be LOUD when its own state machine ends in an unexpected state.
+ *
+ *   Both are ADVISORY and report THIS state machine's view, not CommonMark's.
+ *   Measured against `commonmark@0.31.2` over 20,000 generated documents
+ *   (`scripts/changelog-mask-differential.mjs`'s corpus, seed 1): when both the
+ *   guard and the reference end with an unclosed fence they name the SAME opener
+ *   1097 times out of 1103, and all 6 disagreements need a construct the masker
+ *   openly does not model — a tab-indented fence, or a fence sharing its line
+ *   with a list marker (`*       ~~~`), which the ≤3-space anchor cannot see. The
+ *   guard also stays silent on 8463 documents where the reference does have an
+ *   unclosed fence: the container rule ended it early, so the guard shows MORE
+ *   text than CommonMark renders. That is the fail-CLOSED direction — a heading
+ *   that turns out to be code, at worst a false FAIL — which is why a missing
+ *   WARN there is tolerable and a missing WARN over a masked region would not be.
  */
 export function maskNonProseWithState(text) {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n')
@@ -415,9 +445,45 @@ export function maskNonProseWithState(text) {
    * the container-scoping guess above. Masking is off while it is set (that is
    * the fail-closed half); it exists so the block's REAL closer cannot be
    * misread as a fresh opener. See the container note in the docstring.
-   * @type {{kind: 'fence', char: string, len: number} | {kind: 'comment'} | null}
+   *
+   * A dedent has TWO readings and the latch is released only once BOTH are
+   * satisfied, whichever comes later:
+   *
+   *   `pending`      the doc-level reading — the block never ended, so its own
+   *                  closer (a fence delimiter, or `-->` for a comment) is
+   *                  still ahead.
+   *   `pendingFence` the container reading — the block ended at the dedent and
+   *                  the dedenting line was itself a fresh fence OPENER, so
+   *                  that fence's closer is ahead too. Only set when the
+   *                  dedenting line is fence-delimiter-shaped.
+   *
+   * Releasing on the first of the two is the round-6 fail-open: the delimiter
+   * the guard spends on the release is the one CommonMark spends on the
+   * OPENER, fence parity inverts from there, and the next delimiter runs on to
+   * erase real headings.
+   * The latch is `null` exactly when both slots are empty.
+   * @type {{
+   *   pending: {kind: 'fence', char: string, len: number} | {kind: 'comment'} | null,
+   *   pendingFence: {char: string, len: number} | null,
+   * } | null}
    */
   let resync = null
+  /**
+   * The container reading's half of a dedent: if the dedenting line is
+   * fence-delimiter-shaped it opened a fence, whose closer must go by before
+   * the latch may release.
+   * @param {RegExpExecArray | null} mm
+   */
+  const openerOf = (mm) => (mm ? { char: mm[1][0], len: mm[1].length } : null)
+  /**
+   * Is `mm` a bare closing delimiter for `want` — same char, at least as long,
+   * nothing after it but whitespace? A null `want` is vacuously satisfied.
+   * @param {RegExpExecArray | null} mm
+   * @param {{char: string, len: number} | null} want
+   */
+  const closesFence = (mm, want) =>
+    want === null ||
+    Boolean(mm && mm[1][0] === want.char && mm[1].length >= want.len && mm[2].trim() === '')
   /** @type {string[]} */
   const out = []
   for (let i = 0; i < lines.length; i++) {
@@ -433,25 +499,67 @@ export function maskNonProseWithState(text) {
 
     if (fence !== null) {
       // Inside a fence NOTHING else is markup: a `<!--` here is code, not a
-      // comment opener, so `inComment` cannot change. The closer is checked
-      // BEFORE the dedent, because a closer may be indented less than its
-      // opener (CommonMark allows any closer indent up to 3) and is then a
-      // genuine close, not a container exit.
-      if (m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '') {
-        fence = null
-        out.push(blank(line))
-        continue
-      }
+      // comment opener, so `inComment` cannot change.
+      //
+      // The closer is only a closer while the line is STILL INSIDE the block's
+      // container. CommonMark does let a closer be indented less than its
+      // opener — but only down to column 0 of the same container. Once the
+      // lower indent takes the line OUT of the container, the list item ends,
+      // the fence ends with it, and the line is a fresh DOCUMENT-LEVEL
+      // construct, not this fence's closer. Consuming it as a closer inverts
+      // fence parity: the next delimiter is then read as an opener and runs on
+      // to erase real headings. So the dedent is tested FIRST.
+      const closer = Boolean(
+        m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '',
+      )
       if (!dedents(fence.indent)) {
+        if (closer) fence = null
         out.push(blank(line))
         continue
       }
-      resync = { kind: 'fence', char: fence.char, len: fence.len }
+      // A dedent out of a fence is AMBIGUOUS, and this is where round 6's
+      // fail-open lived. Two readings of the same text:
+      //
+      //   container  — the opener was inside a list item, the item ended here,
+      //                and THIS line is a fresh document-level construct.
+      //   doc-level  — the opener was merely indented 1–3 spaces at document
+      //                level, the block is still open, and this line is either
+      //                its closer or its content.
+      //
+      // Under the container reading masking is wrong; under the doc-level
+      // reading opening is wrong. So do neither: end the fence, emit verbatim,
+      // and open nothing until a delimiter has gone by that closes the block
+      // under BOTH readings (`resync`, below).
+      resync = {
+        pending: { kind: 'fence', char: fence.char, len: fence.len },
+        pendingFence: openerOf(m),
+      }
       fence = null
+      if (m) {
+        // The dedenting line is itself fence-delimiter-shaped: a fresh opener
+        // under the container reading, the closer or fence content under the
+        // doc-level one. Punctuation either way, never a heading and never a
+        // changelog entry, so BLANK it — and, critically, do not let it fall
+        // through to the `resync` release below. Releasing on the very line
+        // that set the latch is what let the NEXT delimiter be read as an
+        // opener; under the container reading that next delimiter is this
+        // block's closer, so the latch must survive one more.
+        out.push(blank(line))
+        continue
+      }
     } else if (inComment && dedents(commentIndent)) {
       inComment = false
       commentLine = null
-      resync = { kind: 'comment' }
+      // Same two readings, same latch. `pendingFence` matters here too: a
+      // comment dedented out of by a fence-delimiter line opened a fence under
+      // the container reading, and releasing on the doc-level `-->` alone lets
+      // that fence's CLOSER be read as an opener — the same parity inversion,
+      // reached through the comment path.
+      resync = { pending: { kind: 'comment' }, pendingFence: openerOf(m) }
+      if (m) {
+        out.push(blank(line))
+        continue
+      }
     }
     if (inComment) {
       const idx = line.indexOf('-->')
@@ -476,12 +584,29 @@ export function maskNonProseWithState(text) {
       // because the block's own closing delimiter is still ahead of us and
       // reading it as an OPENER is what turns this into a fail-OPEN: the
       // spurious block then runs on and erases real headings below.
-      const closes =
-        resync.kind === 'fence'
-          ? Boolean(m && m[1][0] === resync.char && m[1].length >= resync.len && m[2].trim() === '')
-          : line.includes('-->')
-      if (closes) resync = null
-      out.push(line)
+      // Each reading's pending delimiter is retired independently, and at most
+      // one per line — a single delimiter cannot both close the container
+      // reading's fence and close the doc-level reading's block. The latch
+      // lifts only once BOTH slots are empty.
+      let { pending, pendingFence } = resync
+      if (pendingFence !== null && closesFence(m, pendingFence)) {
+        pendingFence = null
+      } else if (
+        pending !== null &&
+        (pending.kind === 'fence' ? closesFence(m, pending) : line.includes('-->'))
+      ) {
+        pending = null
+      }
+      resync = pending === null && pendingFence === null ? null : { pending, pendingFence }
+      // A line that is nothing but a fence delimiter is punctuation under both
+      // readings, so blank it rather than emitting it. Emitting it verbatim is
+      // its own fail-OPEN: RULE 1 counts every non-blank line under
+      // `## Unreleased` as a staged entry, and a stray ``` would credit a PR
+      // that staged nothing. Blanking can only SHRINK the section, which is the
+      // fail-closed direction. Everything else — including a prose line that
+      // merely CONTAINS `-->` — is emitted verbatim, because it may legitimately
+      // be, or contain, a heading.
+      out.push(m && m[2].trim() === '' ? blank(line) : line)
       continue
     }
     // An opening fence's info string may not contain a backtick (CommonMark).
