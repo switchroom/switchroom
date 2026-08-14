@@ -83,7 +83,11 @@ export function resolveTscBin() {
 // flag too much pre-existing debt; leave it off for now.
 const DANGEROUS_CODES = ['TS2304', 'TS2552', 'TS2722', 'TS2561']
 
-const tmpConfig = resolve(repoRoot, 'tsconfig.plugin-refcheck.json')
+// Per-process name: the config has to sit at repoRoot (its `extends` and the
+// `include` globs are repo-relative), but two concurrent runs — `npm run lint`
+// alongside the vitest suite, which drives this script end to end — would
+// otherwise share one path and delete each other's file mid-type-check.
+const tmpConfig = resolve(repoRoot, `tsconfig.plugin-refcheck.${process.pid}.json`)
 const tmpConfigBody = {
   extends: './tsconfig.json',
   // Override include so plugin source is in scope. Tests excluded —
