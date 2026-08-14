@@ -20,9 +20,50 @@ import {
   escapeMarkdown,
   splitMarkdownChunks,
   addParagraphSpacers,
+  codeFenceFor,
   PARAGRAPH_SPACER,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
+
+// ---------------------------------------------------------------------------
+// codeFenceFor — the single shared fence-width rule (#4702 follow-up)
+// ---------------------------------------------------------------------------
+
+describe('codeFenceFor', () => {
+  test('defaults to three backticks when the body carries no long run', () => {
+    expect(codeFenceFor('')).toBe('```')
+    expect(codeFenceFor('plain body')).toBe('```')
+    expect(codeFenceFor('a ` b `` c')).toBe('```')
+  })
+
+  test('widens to one longer than the longest run in the body', () => {
+    expect(codeFenceFor('a\n```\nb')).toBe('````')
+    expect(codeFenceFor('a\n````\nb')).toBe('`````')
+    expect(codeFenceFor('` `` ``` ````')).toBe('`````')
+    expect(codeFenceFor('x```y')).toBe('````')
+  })
+
+  test('the delimiter is strictly longer than every run in the body', () => {
+    // The property the wire depends on: with the open/close pair the only
+    // runs of that width, nothing in the body can close the fence early or
+    // leave one open.
+    for (const body of ['no ticks', '`', '```', '``````', 'a ``` b ````` c']) {
+      const fence = codeFenceFor(body)
+      for (const run of body.match(/`+/g) ?? []) {
+        expect(run.length).toBeLessThan(fence.length)
+      }
+    }
+  })
+
+  test('does not blow the stack on a body with very many backtick runs', () => {
+    // The former `Math.max(0, ...runs.map(…))` form passed one argument per
+    // run and threw `RangeError: Maximum call stack size exceeded` from about
+    // 125k runs — inside the render path, on a body well under the wire cap
+    // the renderer sees before chunking.
+    const body = 'x `'.repeat(200_000)
+    expect(codeFenceFor(body)).toBe('```')
+  })
+})
 
 // ---------------------------------------------------------------------------
 // escapeMarkdown — narrowed inline-special escaper (#2669)

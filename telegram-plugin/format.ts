@@ -86,6 +86,47 @@ export function codeSpanSafe(s: string): string {
 }
 
 /**
+ * Compute the delimiter for a fenced code block whose body is `text`.
+ *
+ * Fenced content is verbatim per the formatting guide; the only hazard is a
+ * backtick run inside the body CLOSING the fence early. A hardcoded ``` around
+ * a body that carries its own ``` ships three delimiters instead of two: the
+ * wire opens at the first, closes at the embedded one, reads the remainder as
+ * prose, and the trailing delimiter opens a fence that never terminates —
+ * `can't find end of Pre entity`, a 400, and a whole-message plain-text
+ * resend. Widening the delimiter to one backtick longer than the longest run
+ * already present makes the open/close pair the only runs of that width, so
+ * nothing in the body can match them.
+ *
+ * This is the canonical home for the rule (as `codeSpanSafe` is for the code
+ * SPAN hazard above): the markdown fence (`renderCodeBlock`), the degraded
+ * table fence (`degradeToCodeFence`) and the raw-HTML `<pre>` fold
+ * (`buildPreBlock`, render/parse.ts) all call it, so there is exactly ONE
+ * implementation of the width rule rather than a copy per call site.
+ *
+ * The scan is a LOOP, not `Math.max(0, ...runs.map(…))`. The spread form
+ * (which both former copies of this rule used) passes one argument per run,
+ * and a body with ~125k separate backtick runs — reachable well before the
+ * pre-chunking size ceiling, since render runs on the whole message — blows
+ * the argument limit with `RangeError: Maximum call stack size exceeded`,
+ * throwing out of the render path entirely. Iterating is O(n) either way and
+ * cannot throw.
+ */
+export function codeFenceFor(text: string): string {
+  let longestRun = 0
+  let current = 0
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '`') {
+      current++
+      if (current > longestRun) longestRun = current
+    } else {
+      current = 0
+    }
+  }
+  return '`'.repeat(Math.max(3, longestRun + 1))
+}
+
+/**
  * Make a URL safe to interpolate as the destination of a `[label](href)`
  * inline link.
  *

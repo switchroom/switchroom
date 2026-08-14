@@ -114,6 +114,7 @@ import {
   type HtmlFoldTarget,
   type HtmlTagInfo,
 } from "./html-fold.js";
+import { codeFenceFor } from "../format.js";
 
 /** Copy UTF-16 offsets off an mdast node. Falls back to 0-length when a
  *  synthesized node lacks a position (from-markdown always sets one, but the
@@ -684,7 +685,14 @@ function buildPreBlock(
   if (ctx.noBreaks === true) {
     return [{ type: "code", text: text.replace(/\s*\r?\n\s*/g, " "), ...span }];
   }
-  const fence = "```";
+  // The fence ships as a `raw` node — verbatim wire passthrough, so nothing
+  // downstream will widen it for us. A hardcoded ``` around a body carrying
+  // its own ``` earns `can't find end of Pre entity` and a plain-text resend
+  // of the whole message. Width comes from the same shared rule
+  // `renderCodeBlock` uses (`codeFenceFor`, format.ts): `buildPreBlock`
+  // returns `Inline[]` and so cannot route through `renderCodeBlock` (which
+  // takes a `Block`), but the width rule is SHARED, not copied.
+  const fence = codeFenceFor(text);
   return [
     mkSeparator(ctx, span.start, span.start),
     {

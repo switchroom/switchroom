@@ -32,7 +32,13 @@
 // equivalent entities rather than accidentally re-triggering formatting or
 // breaking out of a code span.
 
-import { escapeMarkdown, codeSpanSafe, escapeLinkHref, RICH_MESSAGE_MAX_CHARS } from "../format.js";
+import {
+  escapeMarkdown,
+  codeSpanSafe,
+  codeFenceFor,
+  escapeLinkHref,
+  RICH_MESSAGE_MAX_CHARS,
+} from "../format.js";
 import type {
   Block,
   BlockquoteNode,
@@ -165,15 +171,11 @@ function renderBlockquote(node: BlockquoteNode): string {
 
 function renderCodeBlock(node: CodeBlockNode): string {
   const lang = node.language ?? "";
-  // Fenced code content is verbatim per the formatting guide; the only
-  // hazard is an embedded ``` closing the fence early. Widen the fence to a
-  // run of backticks one longer than the longest run already present in the
-  // content, mirroring the guide's `preBlock` defusal strategy.
-  const longestRun = Math.max(
-    0,
-    ...(node.text.match(/`+/g) ?? []).map((run) => run.length),
-  );
-  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  // Fenced code content is verbatim per the formatting guide; the only hazard
+  // is an embedded ``` closing the fence early. Width comes from the shared
+  // rule (`codeFenceFor`, format.ts) — one backtick longer than the longest
+  // run in the body — which the `<pre>` fold and `degradeToCodeFence` use too.
+  const fence = codeFenceFor(node.text);
   return `${fence}${lang}\n${node.text}\n${fence}`;
 }
 
@@ -415,11 +417,10 @@ function tableDegradationReason(node: TableNode): string | null {
 
 /** Wrap a block's raw source text in a widened preformatted code fence — the
  *  degraded rendering for a malformed table (content verbatim, no broken
- *  markup). Fence-widening mirrors `renderCodeBlock`. */
+ *  markup). Fence-widening is the shared `codeFenceFor` rule. */
 function degradeToCodeFence(source: string, node: Block): string {
   const raw = source.slice(node.start, node.end);
-  const longestRun = Math.max(0, ...(raw.match(/`+/g) ?? []).map((run) => run.length));
-  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  const fence = codeFenceFor(raw);
   return `${fence}\n${raw}\n${fence}`;
 }
 

@@ -15,6 +15,36 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **telegram/render: a `<pre>` whose body contained ``` shipped an
+  unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
+  `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
+  delimiter as a `raw` node — verbatim wire passthrough, so nothing downstream
+  widened it — without ever inspecting the body. A `<pre>` carrying its own
+  ``` therefore went to the wire with THREE delimiters instead of two:
+  Telegram opens at the first, closes at the embedded one, reads the remainder
+  as prose, and the trailing delimiter opens a fence that never terminates —
+  `can't find end of Pre entity`, a 400, and a plain-text resend of the WHOLE
+  message, which is precisely the denial-of-formatting outcome that module
+  exists to prevent. `fa9018a7` escaped the backticks instead: cosmetically
+  worse, but wire-correct, so the regression traded a cosmetic defect for a
+  400. The fence-width rule now has exactly ONE implementation, `codeFenceFor`
+  (`telegram-plugin/format.ts`) — one backtick longer than the longest run in
+  the body — and all three call sites use it: the `<pre>` fold, plus
+  `renderCodeBlock` and `degradeToCodeFence` (`telegram-plugin/render/render.ts`),
+  which each carried their own copy. Pinned by six outcome tests, five of
+  which fail on `6c120cee`, including a property check that the delimiter run
+  appears on exactly two lines and is strictly longer than every run inside.
+  Consolidating also fixed a latent crash both copies shared: the width scan
+  was `Math.max(0, ...runs.map(…))`, one argument per run, which throws
+  `RangeError: Maximum call stack size exceeded` out of the render path from
+  about 125k backtick runs (~375 KB, measured). That is reachable because
+  `renderOutboundChunks` renders the WHOLE raw body first and only re-splits
+  on overflow (`telegram-plugin/render/rich-render.ts:146`), so the fence scan
+  is not bounded by the 32768-character rich cap. The shared helper scans with
+  a loop instead; same O(n), cannot throw.
+
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 
 ### Bug fixes
@@ -80,11 +110,13 @@ now an anomaly worth investigating, not the norm.
   of being silently dropped; and `escapeLinkHref` percent-encodes ASCII
   whitespace/control characters, which a backslash cannot rescue because a
   bare link destination ends at the first whitespace byte.
-  `html-fold.ts`'s "content is never lost" invariant is restated accurately
-  and now names its one residual (a `<` mdast hands over as a TEXT node never
-  reaches this module). Pinned by 31 outcome tests in
-  `telegram-plugin/tests/render/html-dialect-content-loss.test.ts`, every one
-  of which fails on `fa9018a7`.
+  `html-fold.ts`'s content-loss invariant is restated accurately and now names
+  its residuals (a `<` mdast hands over as a TEXT node never reaches this
+  module; a BALANCED pair of prose angle brackets is dropped as markup, the
+  accepted cost of the matching discriminator). Pinned by outcome tests in
+  `telegram-plugin/tests/render/html-dialect-content-loss.test.ts` — of the 37
+  now in that file, 29 fail on `fa9018a7` and 8 are guards that pass on both
+  revisions.
 
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
