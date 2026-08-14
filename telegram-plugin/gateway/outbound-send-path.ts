@@ -85,6 +85,11 @@ import {
   formatInternalSuppression,
   AUDIENCE_INTERNAL,
 } from '../hooks/audience-classify.mjs'
+// Bug (c) cross-chat anchor guard. Pure module, no cycle — the SAME predicate
+// the routing (`resolveAnswerThreadId`), the gateway's recovery tier and the
+// `reply-route` telemetry use, so the kill-switch branch below cannot drift
+// from them.
+import { isCrossChatAnchor } from './answer-thread-resolve.js'
 import { queueFloodBlockedReply } from './flood-reply-queue.js'
 import { resolveChatIdFallback } from './chat-id-fallback.js'
 import { getBuzzMirror } from './buzz-mirror.js'
@@ -1594,10 +1599,23 @@ export async function sendReply(
       'reply',
     )
   } else {
+    // Cross-chat anchor guard (bug c, `answer-thread-resolve.ts`). This legacy
+    // branch does NOT go through `resolveAnswerThreadWithLog`, so the drop that
+    // `resolveAnswerThreadId` performs above never runs here — without this the
+    // pinned turn's thread is passed through even when the turn belongs to a
+    // DIFFERENT chat, handing chat B's topic id to a send into chat A and
+    // earning a `400 Bad Request: message thread not found`. The kill switch
+    // restores the legacy PRECEDENCE, not the wrong-chat topic id: that is an
+    // API error, not a routing policy a kill switch should be able to
+    // reinstate. Uses the SAME exported predicate as the routing, the recovery
+    // tier and the telemetry, so no second copy of the rule can drift.
+    const anchorThreadId = isCrossChatAnchor(chat_id, turn?.sessionChatId)
+      ? undefined
+      : turn?.sessionThreadId
     threadId = resolveThreadId(
       chat_id,
       (args.message_thread_id as string | undefined) ??
-        (turn?.sessionThreadId != null ? turn.sessionThreadId : undefined),
+        (anchorThreadId != null ? anchorThreadId : undefined),
     )
   }
 

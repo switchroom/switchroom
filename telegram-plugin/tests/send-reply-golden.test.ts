@@ -209,6 +209,10 @@ function makeHarness(opts?: {
   failNext?: Partial<Record<string, unknown[]>>
   voicePlan?: VoiceOutPlan | null
   synth?: (plan: { ttsText: string }) => Promise<Uint8Array | null>
+  /** `SWITCHROOM_TURN_ORIGIN_ROUTING !== '0'` — the gateway's turn-origin
+   *  routing kill switch. Default true (the shipped default); pass false to
+   *  drive the legacy `resolveThreadId` branch. */
+  turnOriginRouting?: boolean
 }): Harness {
   const { api, calls } = makeFakeBot(opts?.failNext)
   const dedup = opts?.dedup ?? new OutboundDedupCache()
@@ -237,7 +241,7 @@ function makeHarness(opts?: {
     getCurrentTurn,
     getLastActiveTurnChatId: () => undefined,
     HISTORY_ENABLED: false,
-    TURN_ORIGIN_ROUTING_ENABLED: true,
+    TURN_ORIGIN_ROUTING_ENABLED: opts?.turnOriginRouting ?? true,
     AUTOCLASSIFY_MIDTURN_SHADOW: false,
     MAX_ATTACHMENT_BYTES: 50 * 1024 * 1024,
     MAX_CHUNK_LIMIT: 4096,
@@ -2125,5 +2129,76 @@ describe('#4176 — a BACKGROUND SUB-AGENT reply can never silently edit over a 
     const sendSrc = readFileSync(new URL('../gateway/outbound-send-path.ts', import.meta.url), 'utf8')
     expect(sendSrc).toContain('subagentReplyAuthority.subagentCouldOwnReply()')
     expect(sendSrc).toContain('subagentCouldOwnReply,')
+  })
+})
+
+// ── cross-chat thread anchor, kill-switch branch (bug c) ──────────────────
+//
+// The default (`TURN_ORIGIN_ROUTING_ENABLED: true`) branch resolves the thread
+// through `resolveAnswerThreadWithLog`, which drops a wrong-chat anchor inside
+// `resolveAnswerThreadId`. The legacy branch (`SWITCHROOM_TURN_ORIGIN_ROUTING=0`)
+// does NOT go through that resolver at all — it passes the pinned turn's
+// `sessionThreadId` straight into `resolveThreadId`. When the pinned turn
+// belongs to a DIFFERENT chat (the routine multi-chat case: one sequential CLI,
+// a singleton live turn, replies fanning out to several chats) that hands chat
+// B's topic id to a send into chat A, and Telegram answers
+// `400 Bad Request: message thread not found` — the exact failure the guard
+// exists to prevent, still reachable behind the switch.
+//
+// These drive the REAL `sendReply` and assert on the `message_thread_id` the
+// send-path actually put on the wire, so they fail on the bug rather than on a
+// refactor of how the decision is spelled.
+describe('kill switch SWITCHROOM_TURN_ORIGIN_ROUTING=0 still drops a cross-chat anchor', () => {
+  const OTHER_CHAT = '2002'
+
+  /** A live turn pinned at executeReply entry, owned by `chatId`. */
+  function turnFor(chatId: string, threadId: number | undefined): CurrentTurn {
+    return {
+      turnId: `turn-${chatId}`,
+      sessionChatId: chatId,
+      sessionThreadId: threadId,
+      replyCalled: false,
+    } as unknown as CurrentTurn
+  }
+
+  const threadOnWire = (h: Harness): unknown =>
+    h.calls.filter((c) => c.method === 'sendRichMessage')[0]!.opts.message_thread_id
+
+  it('a reply into chat A pinned to a chat-B forum turn carries NO thread id', async () => {
+    const h = makeHarness({ turnOriginRouting: false })
+    const res = await sendReply(
+      h.deps,
+      req('The answer to the question asked in chat A.', {}, turnFor(OTHER_CHAT, 77)),
+    )
+    const sends = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(sends).toHaveLength(1)
+    expect(sends[0]!.chat_id).toBe(CHAT)
+    // Pre-fix this is 77 — chat B's topic id on a send into chat A.
+    expect(threadOnWire(h)).toBeUndefined()
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+
+  it('an explicit message_thread_id from the model does NOT rescue a cross-chat ' +
+    'anchor — but it is still honoured on its own', async () => {
+    // Explicit wins in the legacy branch, so it must survive untouched.
+    const h = makeHarness({ turnOriginRouting: false })
+    await sendReply(
+      h.deps,
+      req('Explicit thread.', { message_thread_id: '31' }, turnFor(OTHER_CHAT, 77)),
+    )
+    expect(threadOnWire(h)).toBe(31)
+  })
+
+  it('BACK-COMPAT: a SAME-chat forum turn still lends its topic id (the guard ' +
+    'must not over-fire and strip legitimate topic routing)', async () => {
+    const h = makeHarness({ turnOriginRouting: false })
+    await sendReply(h.deps, req('Same-chat topic reply.', {}, turnFor(CHAT, 77)))
+    expect(threadOnWire(h)).toBe(77)
+  })
+
+  it('BACK-COMPAT: no pinned turn at all → no thread id, unchanged', async () => {
+    const h = makeHarness({ turnOriginRouting: false })
+    await sendReply(h.deps, req('Orphaned proactive send.'))
+    expect(threadOnWire(h)).toBeUndefined()
   })
 })

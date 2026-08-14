@@ -157,6 +157,16 @@ describe('framework-owned origin recovery (determinism residual, 2026-06-05)', (
     // resolver can refuse a foreign anchor (Telegram 400 "message thread not
     // found"). Behaviour is asserted in answer-thread-resolve.test.ts; this
     // pins the WIRING so a refactor cannot silently stop passing them.
+    //
+    // NOT A SAFETY NET — read before relying on it. Like its ~20 siblings in
+    // this file, this is a source-text CALL-SITE RATCHET: it greps gateway.ts
+    // for the argument spellings. Mutating `isCrossChatAnchor` to
+    // `return false` leaves every assertion here GREEN (verified), because the
+    // call site is still spelled the same way. The behavioural oracles are
+    // `answer-thread-resolve.test.ts` (the pure predicate + precedence),
+    // `reply-route-log.test.ts` (the telemetry), and the
+    // `SWITCHROOM_TURN_ORIGIN_ROUTING=0` block in `send-reply-golden.test.ts`
+    // (the legacy branch, at the wire). Those are what fail on a broken guard.
     const fn = gatewaySrc.split('function resolveAnswerThreadWithLog')[1]?.split('\nfunction ')[0] ?? ''
     expect(fn).toMatch(/targetChatId: chatId/)
     expect(fn).toMatch(/originChatId: originTurn\?\.sessionChatId/)
