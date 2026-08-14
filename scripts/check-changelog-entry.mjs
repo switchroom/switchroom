@@ -343,9 +343,27 @@ function maskCommentsInLine(s, allowMultiline = true) {
  * only a line-start-anchored `<!--` (at most 3 spaces of indent — CommonMark
  * HTML block type 2) may open a MULTI-LINE comment. A `<!--` elsewhere on the
  * line is inline raw HTML, which cannot span lines, so an unterminated one stays
- * literal prose. Not modelled, because a changelog does not hit them: the other
- * six HTML block types, and comments opened inside an indented (4-space) code
- * block.
+ * literal prose. `<!-->` and `<!--->` are COMPLETE comments (CommonMark 0.30+,
+ * matching the HTML spec) — see `maskCommentsInLine`. A `<!--` inside an indented
+ * (4-space) code block needs no special case: such a block's lines all carry 4+
+ * spaces, which the ≤3-space anchor already rejects.
+ *
+ * NOT modelled: the other six HTML block types (1, 3, 4, 5, 6, 7). Realism on
+ * THIS file is nil — the real CHANGELOG.md contains zero line-start HTML block
+ * openers — but "not hit in practice" is not the same as "harmless", so the
+ * directions are recorded rather than waved away, and pinned by the committed
+ * differential battery in `tests/fixtures/commonmark-mask-cases.mjs`:
+ *
+ *   - fail-CLOSED: a `## ` line inside a type 1/3/4/5/6 block is raw HTML to
+ *     CommonMark and a heading to this masker, so it becomes a PHANTOM released
+ *     section. Worst case is a false FAIL, and — like the fenced-`## ` case
+ *     above — a sticky, repo-wide one: every later PR appending to the end of
+ *     `## Unreleased` reds until the block is deleted.
+ *   - fail-OPEN: inside a type-6 block a line-start `<!--` is block CONTENT, not
+ *     an opener; this masker treats it as one and blanks on to the next `-->`,
+ *     which can erase a REAL released heading and hide a buried entry. This is
+ *     the direction that matters, and it is the reason to keep the "changelogs
+ *     do not contain raw HTML blocks" assumption honest rather than implicit.
  *
  * @param {string} text
  * @returns {{text: string, unclosedFenceLine: number | null, unclosedCommentLine: number | null}}
