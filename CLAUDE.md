@@ -221,9 +221,42 @@ obligation:
 `check-litellm-config-guard`, `check-release-asset-names`,
 `check-status-pin-single-path`, `check-agent-attribution-trailers`,
 `check-callback-ctx-wrapping`, `check-ctx-send-wrapping`,
-`check-foreign-db-readonly`.
+`check-foreign-db-readonly`, `check-mutation-coverage`.
 
 Traps that bite repeatedly:
+
+- **`check-mutation-coverage` proves the tests constrain something** (v0.21.8
+  post-mortem). Two PRs in one release shipped suites that asserted nothing:
+  #4663's tier-2 age bound in `selectEvictionVictim` was invisible to all 76
+  tests (fixed in `2338c280`), and #4670's tests asserted an injected seam's
+  MIRROR of a variable production passes positionally to `runSwitchroom`, so
+  deleting the real argument left them green (fixed at
+  `tests/host-control/config-propose-edit.test.ts:1439`). Neither is a code
+  shape a linter can see — no `if (false && …)` was ever committed; that string
+  lives only in comments describing a mutation a REVIEWER applied. So the check
+  applies those mutations itself: for each entry in
+  `scripts/mutation-targets.json` whose file or tests the PR touched, it
+  perturbs the named symbols and fails if the scoped suite stays green.
+  Diff-gated ON PULL REQUESTS ONLY, and that caveat is the trap: the gate is
+  `GITHUB_BASE_REF`, which Actions sets for `pull_request` and NOT for
+  `push: main` or `merge_group`, and `check-mutation-coverage.mjs:99-114` treats
+  an unresolvable base as "run everything" (a shallow checkout takes the same
+  fallback). `ci-lint.yml` fires on all three and `lint-run`'s `if:` forces it
+  on push and merge_group, so EVERY merge-queue entry and every push to main
+  runs the WHOLE manifest, not only the touched entries. Budget accordingly: the
+  one shipped target is ~7s, and that is a per-queue-entry cost, not a per-PR
+  one. It also means `ci-lint` now executes vitest, so a flake in any target's
+  scoped suite becomes `BASELINE IS RED` and blocks the merge queue on a job
+  that previously never ran tests — manifest entries must be hermetic (no
+  docker, no network, no host state). Run `npm run lint:mutation-coverage` for
+  every target. Escape hatch (reason mandatory): `// mutation-allow: <reason>`
+  on or above the line, for genuinely equivalent mutants —
+  `src/util/log-rotation.ts:641` is the worked example; it must be real source,
+  not string-literal content. Adding a target: name the narrowest `symbols` (an
+  unscoped entry on a 6000-line module is hours of CI), state the blast radius
+  in `why`, and record the enumerated `mutants` count — that count is a ratchet,
+  because a refactor to a ternary / `&&` / `switch` moves the logic to a site no
+  operator visits and a SHRUNKEN all-killed set still reports a clean pass.
 
 - **`check-agent-attribution-trailers` needs full history.** It diffs
   `origin/<base>..HEAD` and looks for `Switchroom-Agent:` /

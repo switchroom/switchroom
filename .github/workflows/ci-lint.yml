@@ -83,7 +83,22 @@ jobs:
     # PR: gate on changed paths.
     if: github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 15, not 5, since `bun lint` started EXECUTING VITEST via
+    # check-mutation-coverage.mjs. The lint body is ~57s and the one shipped
+    # mutation target is ~7s, so the typical run is nowhere near either number
+    # — the ceiling has to cover the WORST case, which is a mutant that spins.
+    # check-mutation-coverage.mjs bounds each mutant at MUTANT_TIMEOUT_MS =
+    # 120s, and a target runs `mutants + 1` suites (baseline included), so the
+    # 4-mutant target alone can legitimately take 5 x 120s = 10m. At 5m the job
+    # was killed mid-mutant with no report at all: fail-closed (a dead job
+    # fails the required `lint` context and blocks the queue), but it blocks it
+    # with "cancelled after 5 minutes" instead of naming the mutant that hung.
+    # 15m lets the script's own per-mutant ceiling fire first and print that.
+    # Well inside the queue's 60-min check_response_timeout_minutes, and the
+    # same ceiling ci-tests-core.yml's vitest-shard already uses.
+    # Keep in lockstep with ci-full.yml's `lint-full`, which mirrors this job,
+    # and with the budget line in scripts/mutation-targets.json.
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

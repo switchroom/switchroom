@@ -53,7 +53,12 @@ jobs:
   # ─── Lint (mirrors ci-lint.yml lint-run) ──────────────────────────
   lint-full:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Lockstep with ci-lint.yml's `lint-run`, which this job mirrors: `bun
+    # lint` now EXECUTES VITEST via check-mutation-coverage.mjs, whose worst
+    # case is `mutants + 1` scoped suites x MUTANT_TIMEOUT_MS (120s) — 10m for
+    # the one shipped 4-mutant target, against a ~57s lint body. Full
+    # arithmetic in ci-lint.yml.
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
