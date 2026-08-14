@@ -161,8 +161,12 @@ class SplitPhonemesTests(unittest.TestCase):
         for c in chunks[:-1]:
             self.assertTrue(c.endswith(","), msg=repr(c))
 
-    def test_cap_is_clamped_below_kokoros_limit(self) -> None:
-        self.assertLessEqual(server.TTS_MAX_PHONEMES, MAX_PHONEME_LENGTH)
+    def test_cap_leaves_room_for_kokoros_off_by_one(self) -> None:
+        # Kokoro flushes on `>=` MAX_PHONEME_LENGTH, so a break-free chunk of
+        # 509+ makes it emit a leading EMPTY batch. 508 is the highest safe cap.
+        self.assertLessEqual(server.TTS_MAX_PHONEMES, MAX_PHONEME_LENGTH - 2)
+        for size in (server.TTS_MAX_PHONEMES, MAX_PHONEME_LENGTH - 2):
+            self.assertEqual(_FaithfulKokoro._split_phonemes("x" * size), ["x" * size])
 
     def test_our_chunk_is_kokoros_batch_one_for_one(self) -> None:
         # Kokoro re-inserts a space after every break char, so `a,b` comes back
@@ -362,6 +366,43 @@ class EspeakPhonemizeTests(unittest.TestCase):
         server._tts = _TTS()
         self.assertEqual(server._espeak_phonemize("hi"), ("hˈaI", True))
         self.assertEqual(seen, [("hi", server.TTS_LANG)])
+
+    def test_run_synthesis_chunks_the_espeak_path_too(self) -> None:
+        # misaki off (the VOICE_TTS_G2P=espeak rollback lever). The piece must
+        # still be phoneme-chunked, not handed to Kokoro as one long text blob.
+        class _Tok:
+            @staticmethod
+            def phonemize(text, lang):  # noqa: ANN001
+                return "wˈ3:d " * 400  # ~2400 phonemes, well past 510
+
+        tts = _FaithfulKokoro()
+        tts.tokenizer = _Tok()
+
+        orig_g2p, orig_pcm, orig_ogg = (
+            server._g2p, server._pcm_to_wav_bytes, server._wav_to_ogg_opus
+        )
+        prev_numpy = _install_fake_numpy()
+        server._g2p = None
+        server._tts = tts
+        server._pcm_to_wav_bytes = lambda samples, sample_rate: b"WAV"
+        server._wav_to_ogg_opus = lambda wav: b"OGG"
+        try:
+            _ogg, meta = server._run_synthesis("irrelevant", voice="af_heart")
+        finally:
+            server._g2p = orig_g2p
+            server._pcm_to_wav_bytes = orig_pcm
+            server._wav_to_ogg_opus = orig_ogg
+            if prev_numpy is None:
+                sys.modules.pop("numpy", None)
+            else:
+                sys.modules["numpy"] = prev_numpy
+
+        self.assertEqual(tts.truncated_batches, 0)
+        self.assertEqual(meta["unchunkedPieces"], 0)
+        self.assertGreater(meta["batches"], 1)
+        for call in tts.calls:
+            self.assertTrue(call["is_phonemes"])
+            self.assertLessEqual(len(call["text"]), MAX_PHONEME_LENGTH)
 
     def test_raising_tokenizer_degrades_to_text(self) -> None:
         class _Tok:

@@ -10,10 +10,16 @@ past /ɹˈɛd/). These tests pin two contracts:
   1. _phonemize_piece degrades correctly — (piece, False) when misaki is
      absent / disabled / raises, (phonemes, True) only on a real hit.
   2. _run_synthesis ROUTES on that flag: a phoneme string goes to Kokoro
-     with is_phonemes=True, and a fallback goes as raw TEXT with
-     lang=TTS_LANG and NO is_phonemes. A regression that silently routed a
-     phoneme string through the espeak text path (or vice-versa) would be a
-     silent mispronunciation, so it is pinned here.
+     with is_phonemes=True. A regression that silently routed a phoneme
+     string through the espeak text path (or vice-versa) would be a silent
+     mispronunciation, so it is pinned here.
+
+     Since #4695 the misaki MISS is a two-step fallback, not one: the piece is
+     retried through Kokoro's own espeak tokenizer (_espeak_phonemize) so it
+     can still be phoneme-chunked, and only if THAT is unavailable does it go
+     to Kokoro as raw TEXT with lang=TTS_LANG. The fallback cases below use a
+     stub _tts with no `.tokenizer`, so they exercise that last leg. The
+     espeak-tokenizer leg is covered in test_phoneme_chunking.py.
 
 Like test_server.py these run WITHOUT misaki / numpy / onnxruntime / ffmpeg
 installed (the CI voice-sidecar job is stdlib-only): server.py imports

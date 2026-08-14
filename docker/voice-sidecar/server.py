@@ -180,9 +180,12 @@ TTS_MAX_CHARS = int(os.environ.get("VOICE_TTS_MAX_CHARS", "1200"))
 # G2P work and keeps sentence-aware seams); phonemes are the correctness pass.
 #
 # 500, not 510: Kokoro._split_phonemes compares with `>=` MAX_PHONEME_LENGTH,
-# so feeding it a punctuation-free run of exactly 510 makes it emit a leading
-# EMPTY batch. A few phonemes of headroom keeps our chunks a no-op for it.
-TTS_MAX_PHONEMES = max(1, min(510, int(os.environ.get("VOICE_TTS_MAX_PHONEMES", "500"))))
+# so a break-free chunk of 509 or more makes it emit a leading EMPTY batch
+# (which then synthesizes as a stray blip). 508 is the highest safe value and
+# is enforced as the ceiling regardless of what the env asks for; 500 is the
+# default because a little headroom costs nothing measurable (+1.5% batches on
+# the production corpus) and keeps the seam choice ours.
+TTS_MAX_PHONEMES = max(1, min(508, int(os.environ.get("VOICE_TTS_MAX_PHONEMES", "500"))))
 # Defence-in-depth ceiling on the raw JSON body (text is otherwise unbounded,
 # chunked internally). 256KB ≈ ~40k chars of UTF-8 — far above any real reply.
 TTS_MAX_BODY_BYTES = int(os.environ.get("VOICE_TTS_MAX_BODY_BYTES", str(256 * 1024)))

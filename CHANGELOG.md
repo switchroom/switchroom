@@ -17,6 +17,30 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
+- **voice: TTS chunks on phoneme length, not characters — long messages no
+  longer lose audio** (#4695) — the sidecar split text into ≤
+  `VOICE_TTS_MAX_CHARS` (1200) pieces and handed each to kokoro-onnx, but
+  kokoro synthesizes in *phonemes* and hard-slices any single batch past its
+  `MAX_PHONEME_LENGTH` of 510 (`kokoro_onnx/__init__.py:97-101`, verified
+  against the 0.5.0 wheel in the running image). Kokoro does pre-batch a long
+  phoneme string, but only on `.,!?;` — so any punctuation-free run over 510
+  phonemes lost its tail and the listener simply heard the sentence stop.
+  Measured over a 1,679-message production corpus through real misaki:
+  **16 truncated batches, 5,823 phonemes discarded, worst batch 1,545**.
+  `docker/voice-sidecar/server.py` now splits the phoneme string itself
+  (`_split_phonemes`, capped by the new `VOICE_TTS_MAX_PHONEMES`, default 500)
+  and hands Kokoro one already-safe batch at a time; the split is lossless by
+  construction — an over-long run is *carried* into the next batch rather than
+  discarded. Same corpus after: **0 truncated batches, 0 phonemes lost**, at a
+  cost of 6320 → 6413 synthesis batches (+1.5%). The espeak path
+  (`VOICE_TTS_G2P=espeak`, non-English locales) is phonemized through Kokoro's
+  own tokenizer so it is chunked the same way. Characters remain the coarse
+  pass, so `VOICE_TTS_MAX_CHARS` keeps its meaning but is no longer
+  load-bearing for correctness. Both residual degradation paths — a mid-word
+  seam in an unbreakable run, and a piece nothing could phonemize — are now
+  counted into the `/tts` response meta (`hardCuts`, `unchunkedPieces`) and
+  logged at WARNING volume to the sidecar's stderr, so the failure mode stops
+  being invisible.
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
   (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)
