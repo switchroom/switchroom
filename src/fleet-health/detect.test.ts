@@ -438,12 +438,12 @@ describe("#4680 — a working guard is not a failure", () => {
       // A truncated log tail: the alarm and the history reopen survive, the
       // registry lane line does not. Trusting the missing veto line downgrades
       // real, unrecoverable `registry.db` loss to informational.
-      const log = [detect(2, "/state/registry.db"), reopened].join("\n");
+      const log = [detect(1, "/state/registry.db"), reopened].join("\n");
       expect(severityOf(log)).toEqual([3]);
     });
 
     it("keeps severity 3 for an unowned-lane alarm whose lane line is absent", () => {
-      const log = [detect(2, "/state/grants.db"), reopened].join("\n");
+      const log = [detect(1, "/state/grants.db"), reopened].join("\n");
       expect(severityOf(log)).toEqual([3]);
     });
 
