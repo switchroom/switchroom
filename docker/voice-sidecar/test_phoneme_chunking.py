@@ -194,7 +194,19 @@ class SplitPhonemesTests(unittest.TestCase):
         # as `a, b`. Un-normalised, a 500-phoneme comma-dense chunk re-expands
         # to 749 inside Kokoro and Kokoro re-splits it (508 + 241) — seams we
         # did not choose, and a `batches` count in the meta that is wrong.
-        for dense in ("a," * 250, "a," * 4000, "ab,cd." * 300):
+        # The last three carry ADJACENT break chars. Kokoro appends a break char
+        # FLUSH to the batch, so a chunk that re-inserts a space in front of a
+        # lone break unit ("aaaa; ." vs Kokoro's "aaaa;.") is not a fixed point
+        # and gets re-batched — the error is in the safe direction (no overflow)
+        # but the seams and the `batches` count are still not the ones we chose.
+        for dense in (
+            "a," * 250,
+            "a," * 4000,
+            "ab,cd." * 300,
+            "ab;.cd" * 300,
+            "a?!" * 400,
+            "x,,y" * 300,
+        ):
             chunks, _ = server._split_phonemes(dense, server.TTS_MAX_PHONEMES)
             for c in chunks:
                 rebuilt = _FaithfulKokoro._split_phonemes(c)

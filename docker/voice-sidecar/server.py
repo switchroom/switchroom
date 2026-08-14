@@ -809,9 +809,13 @@ def _split_phonemes(phonemes: str, max_phonemes: int) -> tuple[list[str], int]:
         if not stripped:
             continue
         # Pack back-to-back clauses into one chunk while they fit, so we do not
-        # emit more synthesis batches than necessary.
-        if chunks and len(chunks[-1]) + 1 + len(stripped) <= max_phonemes:
-            chunks[-1] = (chunks[-1] + " " + stripped).strip()
+        # emit more synthesis batches than necessary. The separator has to match
+        # Kokoro's rebuild exactly or the chunk stops being a fixed point of it:
+        # Kokoro appends a break char FLUSH ("a" + ";") and space-joins anything
+        # else. Adjacent breaks (";." "?!" ",,") are the case that differs.
+        sep = "" if stripped[0] in _PHONEME_BREAKS else " "
+        if chunks and len(chunks[-1]) + len(sep) + len(stripped) <= max_phonemes:
+            chunks[-1] = (chunks[-1] + sep + stripped).strip()
             continue
         _emit(unit)
 
