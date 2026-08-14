@@ -28,11 +28,18 @@ treatment, including callers that never went through the gateway at all.
 
 DESIGN CONTRACTS (all pinned by tests in test_text_normalize.py)
 ---------------------------------------------------------------
-1. IDEMPOTENCE. `normalize(normalize(x)) == normalize(x)` for every input.
-   Stage A may or may not have already run; a rule that fires twice must be
-   a no-op the second time. This is why, e.g., the currency rule consumes
-   the `$` and emits the word "dollars" (a second pass finds no `$`), and
-   why no rule emits a shape another rule matches.
+1. IDEMPOTENCE. `normalize(normalize(x)) == normalize(x)` for every input
+   without a verbatim span. Stage A may or may not have already run; a rule
+   that fires twice must be a no-op the second time. This is why, e.g., the
+   currency rule consumes the `$` and emits the word "dollars" (a second
+   pass finds no `$`), and why no rule emits a shape another rule matches.
+
+   The verbatim-span exception is inherent, not an oversight: a span is a
+   ONE-SHOT instruction ("do not interpret this region"), and its markers
+   are consumed on the first pass because they must never reach the
+   phonemizer. Re-normalising the output is therefore a different message —
+   the protection was already spent. Production runs exactly one pass, and
+   the property is asserted for every span-free input.
 
 2. NO `\\d.\\p{L}` OUTPUT. A digit immediately followed by a letter is the
    shape that makes misaki spell garbage ("94g" → "ninety-four jee"), so no

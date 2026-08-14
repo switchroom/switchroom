@@ -113,8 +113,15 @@ jobs:
         working-directory: vendor/hindsight-memory
         run: python3 -m pytest tests/ -q
 
-      # Voice sidecar's stdlib-only tests (TTS speed clamp). server.py imports
-      # kokoro lazily, so no ONNX runtime / model is needed here.
+      # Voice sidecar tests. server.py imports kokoro/misaki lazily, so no ONNX
+      # runtime or model is needed — but Stage B token normalisation
+      # (docker/voice-sidecar/text_normalize.py) uses num2words for spoken
+      # numbers, so the suite is no longer strictly stdlib. Pinned to the same
+      # version Dockerfile.voice installs, so CI and the image cannot disagree
+      # about number wording.
+      - name: Install num2words (voice-sidecar Stage B dependency)
+        run: pip install -q "num2words==0.5.14"
+
       - name: Run voice-sidecar unittests
         working-directory: docker/voice-sidecar
         run: python3 -m unittest discover -s . -p 'test_*.py'
