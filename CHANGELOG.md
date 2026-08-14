@@ -114,8 +114,8 @@ now an anomaly worth investigating, not the norm.
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
   delimiter as a `raw` node — verbatim wire passthrough, so nothing downstream
-  widened it — without ever inspecting the body. A `<pre>` carrying its own
-  ``` therefore went to the wire with THREE delimiters instead of two:
+  widened it — without ever inspecting the body. A `<pre>` carrying its own ```
+  therefore went to the wire with THREE delimiters instead of two:
   Telegram opens at the first, closes at the embedded one, and the trailing
   delimiter opens a fence that never terminates: `can't find end of Pre
   entity`, a 400, and a plain-text resend of the WHOLE message — the
