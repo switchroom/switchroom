@@ -62,13 +62,23 @@ one token; magnitude before units so the `M` in `$1.6M` is never "minutes").
 
 from __future__ import annotations
 
+import json
 import os
 import re
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, Iterable, List, NamedTuple, Sequence, Tuple
 
 from num2words import num2words
 
-__all__ = ["normalize", "normalize_enabled", "SPAN_OPEN", "SPAN_CLOSE"]
+__all__ = [
+    "normalize",
+    "normalize_enabled",
+    "SPAN_OPEN",
+    "SPAN_CLOSE",
+    "Override",
+    "OVERRIDES_PATH",
+    "load_overrides",
+    "apply_overrides",
+]
 
 # ---------------------------------------------------------------------------
 # Verbatim-span markers (private use area). See §6 of the design.
@@ -989,3 +999,139 @@ def normalize(text: str) -> str:
 
     working = _unpark_spans(working, parked)
     return _whitespace(working)
+
+
+# ---------------------------------------------------------------------------
+# Pronunciation overrides
+# ---------------------------------------------------------------------------
+#
+# misaki gets a handful of this fleet's vocabulary wrong in ways no amount of
+# text rewriting can fix — "Postgres" comes out "post-gers", "Redis" comes
+# out "ree-dees". misaki accepts an inline per-word phoneme override written
+# `[word](/phonemes/)`, so the fix is a small, reviewable table applied at
+# phonemize time (NOT in normalize(): the markup is misaki-specific and must
+# never reach the espeak fallback path, which would read it as punctuation).
+#
+# Two hard rules, both enforced below rather than by convention:
+#
+#   * Every phoneme string is validated against Kokoro's vocabulary. An
+#     out-of-vocab symbol is dropped SILENTLY by kokoro-onnx's tokenizer
+#     (tokenizer.py:65) — the word would just vanish from the audio, which is
+#     the worst possible failure mode for a pronunciation fix. A rejected
+#     entry is dropped and reported; the rest of the table still loads.
+#
+#   * misaki's alphabet is NOT IPA. Capitals are collapsed diphthongs
+#     (A=eɪ, I=aɪ, W=aʊ, Y=ɔɪ, O=oʊ) and `ᵊ` is a small schwa. Every entry in
+#     overrides.json was produced by running the word through the actual
+#     phonemizer, never by transcribing IPA from a dictionary.
+
+OVERRIDES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overrides.json")
+
+# Registered `condition` predicates, by name. A condition gates an entry on
+# the surrounding sentence (e.g. a POS-sensitive heteronym). Deliberately a
+# NAME REGISTRY and not eval: overrides.json is data, and data must not be
+# able to execute. Empty today — the one candidate (`live`) did not clear its
+# measurement gate.
+_CONDITIONS: Dict[str, Callable[[str, "re.Match[str]"], bool]] = {}
+
+
+class Override(NamedTuple):
+    match: str
+    phonemes: str
+    ci: bool
+    condition: str | None
+
+
+def _vocab_reject(phonemes: str, vocab: Iterable[str] | None) -> str | None:
+    if vocab is None:
+        return None
+    allowed = set(vocab)
+    missing = sorted({c for c in phonemes if c not in allowed})
+    if missing:
+        return "out-of-vocab phoneme(s): " + " ".join(repr(c) for c in missing)
+    return None
+
+
+def load_overrides(
+    path: str | None = None, vocab: Iterable[str] | None = None
+) -> Tuple[List[Override], List[Tuple[str, str]]]:
+    """Load and validate the override table.
+
+    Returns `(accepted, rejected)` where `rejected` is a list of
+    `(match, reason)` pairs. Never raises for a bad table: a malformed
+    overrides.json degrades to "no overrides" (today's behaviour) rather than
+    taking the voice down, and the caller surfaces the reason on /healthz.
+    """
+    target = path or OVERRIDES_PATH
+    accepted: List[Override] = []
+    rejected: List[Tuple[str, str]] = []
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return accepted, rejected
+    except (OSError, ValueError) as exc:
+        return accepted, [("<file>", f"unreadable overrides.json: {exc}")]
+
+    if not isinstance(doc, dict) or not isinstance(doc.get("entries"), list):
+        return accepted, [("<file>", "overrides.json must be {version, entries: []}")]
+
+    seen: set[str] = set()
+    for raw in doc["entries"]:
+        if not isinstance(raw, dict):
+            rejected.append(("<entry>", "not an object"))
+            continue
+        word = raw.get("match")
+        phonemes = raw.get("phonemes")
+        ci = bool(raw.get("ci", False))
+        condition = raw.get("condition")
+        label = word if isinstance(word, str) else "<entry>"
+        if not isinstance(word, str) or not word.strip():
+            rejected.append((label, "missing/empty match"))
+            continue
+        if not isinstance(phonemes, str) or not phonemes.strip():
+            rejected.append((label, "missing/empty phonemes"))
+            continue
+        if condition is not None and condition not in _CONDITIONS:
+            rejected.append((label, f"unknown condition {condition!r}"))
+            continue
+        key = word.lower() if ci else word
+        if key in seen:
+            rejected.append((label, "duplicate match"))
+            continue
+        reason = _vocab_reject(phonemes, vocab)
+        if reason:
+            rejected.append((label, reason))
+            continue
+        seen.add(key)
+        accepted.append(Override(word, phonemes, ci, condition))
+    return accepted, rejected
+
+
+def apply_overrides(text: str, entries: Sequence[Override]) -> str:
+    """Wrap each overridden word in misaki's `[word](/phonemes/)` markup.
+
+    Idempotent: a word already inside override markup is skipped, so a second
+    application is a no-op.
+    """
+    if not entries or not text:
+        return text
+    out = text
+    for entry in entries:
+        flags = re.IGNORECASE if entry.ci else 0
+        pattern = re.compile(r"(?<![\w/])" + re.escape(entry.match) + r"(?![\w/])", flags)
+
+        def repl(m: "re.Match[str]", entry: Override = entry) -> str:
+            start, end = m.start(), m.end()
+            src = m.string
+            if start > 0 and src[start - 1] == "[":
+                return m.group(0)  # already wrapped
+            if src[end : end + 2] == "](":
+                return m.group(0)
+            predicate = _CONDITIONS.get(entry.condition) if entry.condition else None
+            if predicate is not None and not predicate(src, m):
+                return m.group(0)
+            return f"[{m.group(0)}](/{entry.phonemes}/)"
+
+        out = pattern.sub(repl, out)
+    return out

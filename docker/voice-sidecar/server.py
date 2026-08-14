@@ -32,11 +32,24 @@ Kokoro model, and any failure (or VOICE_TTS_G2P=espeak, or a non-English
 locale) leaves _g2p None so synthesis degrades to today's espeak path
 with the sidecar fully healthy. VOICE_TTS_G2P=espeak is the rollback
 lever — no image rebuild. See _load_tts / _phonemize_piece / _run_synthesis.
-FUTURE (not built): misaki also accepts a per-word phoneme override via
-`[word](/phoneme/)` markup — a hook for a caller-supplied pronunciation
-override, but normalizeForSpeech (telegram-plugin/voice-normalize-text.ts)
-currently strips `[text](...)` link markup, so wiring it end-to-end would
-need that pass to pass the `/…/` form through first.
+misaki also accepts a per-word phoneme override via `[word](/phonemes/)`
+markup, and THAT IS NOW WIRED: docker/voice-sidecar/overrides.json is a
+reviewed table of words misaki gets wrong for this fleet (Postgres, Redis,
+…), validated against Kokoro's vocabulary at load and applied inside
+_phonemize_piece — i.e. downstream of everything the gateway does, so no
+gateway pass can strip it. See _load_tts / text_normalize.apply_overrides.
+
+Token normalisation (Stage B)
+-----------------------------
+The sidecar — not the gateway — decides how a token is SPOKEN: "90s" →
+"ninety seconds", "$1.6M" → "one point six million dollars", "#4661" →
+"hash 4661". That lives in text_normalize.py and runs in _run_synthesis
+immediately before the text is split into pieces, so every caller of
+POST /tts gets it, including callers that never went through the gateway.
+The HTTP boundary is unchanged and byte-preserving: callers send the text
+they mean, digits and all. VOICE_TTS_NORMALIZE=0 is the kill switch
+(byte-identical passthrough); it is INDEPENDENT of VOICE_TTS_G2P=espeak,
+which is the phonemizer rollback lever.
 
 HTTP contract
 -------------
@@ -241,6 +254,28 @@ _g2p = None
 # fault degrades quietly to the espeak path instead of flooding the log.
 _g2p_warned = False
 
+# ── Stage B: token normalisation (text_normalize.py) ────────────────────
+# Imported at module scope but NOT allowed to take the service down: if the
+# module or its num2words dependency is missing (a mis-built image), voice
+# still works — it just speaks raw tokens, i.e. the pre-Stage-B behaviour —
+# and /healthz says so. VOICE_TTS_NORMALIZE=0 is the SUPPORTED way to turn
+# normalisation off; this branch is for the image being wrong.
+try:
+    import text_normalize as _norm
+
+    _norm_error: str | None = None
+except Exception as exc:  # noqa: BLE001 — degrade, never fail the sidecar
+    _norm = None  # type: ignore[assignment]
+    _norm_error = f"{type(exc).__name__}: {exc}"
+# Pronunciation overrides (overrides.json), validated against Kokoro's real
+# vocabulary in _load_tts — an out-of-vocab phoneme is dropped SILENTLY by
+# kokoro-onnx's tokenizer, so an unvalidated table deletes words from the
+# audio. Guarded by _tts_lock (same lane as _tts/_g2p).
+_tts_overrides: list = []
+_tts_overrides_rejected: list = []
+# A normalise failure is logged ONCE, same reasoning as _g2p_warned.
+_norm_warned = False
+
 
 def _log(msg: str) -> None:
     sys.stderr.write(f"voice-sidecar: {msg}\n")
@@ -435,6 +470,51 @@ def _build_tts_session(model_path: str):
     return sess
 
 
+def _kokoro_vocab(kokoro) -> "set[str] | None":
+    """Kokoro's phoneme vocabulary, for validating the override table.
+
+    kokoro-onnx builds its tokenizer from a fixed vocab; a symbol outside it
+    is dropped WITHOUT ERROR (kokoro_onnx/tokenizer.py), so an override
+    carrying one silently deletes that word from the audio. Reads the live
+    tokenizer first and falls back to the packaged default; returns None if
+    neither is reachable (validation is then skipped, and said so in the log).
+    """
+    try:
+        vocab = getattr(getattr(kokoro, "tokenizer", None), "vocab", None)
+        if vocab:
+            return set(vocab)
+    except Exception:  # noqa: BLE001 — fall through to the packaged default
+        pass
+    try:
+        from kokoro_onnx.config import DEFAULT_VOCAB
+
+        return set(DEFAULT_VOCAB)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _load_overrides(kokoro) -> None:
+    """Load overrides.json and validate every phoneme against Kokoro's vocab.
+
+    Rejected entries are DROPPED and logged loudly (and surfaced on /healthz)
+    rather than shipped — a bad entry is worse than no entry, because the
+    failure mode is a missing word, not a wrong one.
+    """
+    global _tts_overrides, _tts_overrides_rejected
+    if _norm is None:
+        return
+    vocab = _kokoro_vocab(kokoro)
+    if vocab is None:
+        _log("TTS overrides: Kokoro vocab unavailable — loading table UNVALIDATED")
+    accepted, rejected = _norm.load_overrides(vocab=vocab)
+    with _tts_lock:
+        _tts_overrides = accepted
+        _tts_overrides_rejected = rejected
+    _log(f"TTS pronunciation overrides: {len(accepted)} active, {len(rejected)} rejected")
+    for match, reason in rejected:
+        _log(f"TTS override REJECTED {match!r}: {reason}")
+
+
 def _load_tts() -> None:
     """Fetch-once + load the Kokoro ONNX model. Runs in a background thread
     (like _load_model) so /healthz reports 'not ready' during the cold load
@@ -457,6 +537,7 @@ def _load_tts() -> None:
         with _tts_lock:
             _tts = kokoro
         _log("TTS model ready")
+        _load_overrides(kokoro)
     except Exception as exc:  # noqa: BLE001 — fail closed, report on /healthz
         _tts_error = f"{type(exc).__name__}: {exc}"
         _log(f"TTS model load FAILED: {_tts_error}")
@@ -619,10 +700,20 @@ def _phonemize_piece(piece: str) -> tuple[str, bool]:
     global _g2p_warned
     with _tts_lock:
         g2p = _g2p
+        overrides = _tts_overrides
     if g2p is None:
         return piece, False
     try:
-        phonemes, _tokens = g2p(piece)
+        # Pronunciation overrides are misaki-specific markup, so they are
+        # applied HERE and nowhere earlier: on the espeak fallback path (g2p
+        # is None, above) the `[word](/…/)` markup would be read out as
+        # punctuation. Marked-up text is kept in its own local for exactly
+        # that reason — every failure return below hands back the ORIGINAL
+        # piece, never the markup.
+        marked = piece
+        if overrides and _norm is not None:
+            marked = _norm.apply_overrides(piece, overrides)
+        phonemes, _tokens = g2p(marked)
         if not phonemes:
             return piece, False
         return phonemes, True
@@ -634,6 +725,30 @@ def _phonemize_piece(piece: str) -> tuple[str, bool]:
                 "falling back to espeak text path (logged once)"
             )
         return piece, False
+
+
+def _normalize_text(text: str) -> str:
+    """Stage B — rewrite the request text into its spoken form.
+
+    Runs BEFORE _split_text so the splitter sees final text (a rule that
+    lengthens a piece, e.g. "$1.6M" → five words, must not push a piece past
+    TTS_MAX_CHARS after the split). Never raises: a normaliser bug degrades
+    to the raw text — today's behaviour — instead of failing the synthesis,
+    and is logged once.
+    """
+    global _norm_warned
+    if _norm is None:
+        return text
+    try:
+        return _norm.normalize(text)
+    except Exception as exc:  # noqa: BLE001 — degrade to raw text
+        if not _norm_warned:
+            _norm_warned = True
+            _log(
+                f"text normalisation failed ({type(exc).__name__}: {exc}); "
+                "speaking raw text (logged once)"
+            )
+        return text
 
 
 def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> tuple[bytes, dict]:
@@ -649,6 +764,7 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
 
     with _tts_sem:
         started = time.time()
+        text = _normalize_text(text)
         pieces = _split_text(text, TTS_MAX_CHARS)
         if not pieces:
             pieces = [text]
@@ -740,6 +856,8 @@ class Handler(BaseHTTPRequestHandler):
             stt_ready = _model is not None
         with _tts_lock:
             tts_ready = _tts is not None
+            overrides_active = list(_tts_overrides)
+            overrides_rejected = list(_tts_overrides_rejected)
         # A sticky wedge (too many consecutive GPU timeouts — see the watchdog
         # above) reports unhealthy even when both models loaded, so the compose
         # healthcheck restarts the container to release the stuck permit.
@@ -755,9 +873,25 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
         elif stt_ready and tts_ready:
-            self._send_json(
-                200, {"ok": True, "status": "ready", "stt": True, "tts": True}
-            )
+            body = {
+                "ok": True,
+                "status": "ready",
+                "stt": True,
+                "tts": True,
+                "normalize": _norm is not None and _norm.normalize_enabled(),
+                "overrides": len(overrides_active),
+            }
+            # A rejected override is a word that will be MISSING from the
+            # audio if anyone re-adds it unvalidated, so it is surfaced here
+            # (degraded, not unhealthy — the rest of the table still works).
+            if overrides_rejected or _norm_error:
+                body["degraded"] = {
+                    "overridesRejected": [
+                        {"match": m, "reason": r} for m, r in overrides_rejected
+                    ],
+                    "normalize": _norm_error,
+                }
+            self._send_json(200, body)
         else:
             self._send_json(
                 503,
