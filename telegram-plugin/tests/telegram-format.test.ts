@@ -20,9 +20,61 @@ import {
   escapeMarkdown,
   splitMarkdownChunks,
   addParagraphSpacers,
+  codeFenceFor,
   PARAGRAPH_SPACER,
   RICH_MESSAGE_MAX_CHARS,
 } from '../format.js'
+
+// ---------------------------------------------------------------------------
+// codeFenceFor — the single shared fence-width rule (#4702 follow-up)
+// ---------------------------------------------------------------------------
+
+describe('codeFenceFor', () => {
+  test('defaults to three backticks when the body carries no long run', () => {
+    expect(codeFenceFor('')).toBe('```')
+    expect(codeFenceFor('plain body')).toBe('```')
+    expect(codeFenceFor('a ` b `` c')).toBe('```')
+  })
+
+  test('widens to one longer than the longest run in the body', () => {
+    expect(codeFenceFor('a\n```\nb')).toBe('````')
+    expect(codeFenceFor('a\n````\nb')).toBe('`````')
+    expect(codeFenceFor('` `` ``` ````')).toBe('`````')
+    expect(codeFenceFor('x```y')).toBe('````')
+  })
+
+  test('the delimiter is strictly longer than every run in the body', () => {
+    // The property the wire depends on: with the open/close pair the only
+    // runs of that width, nothing in the body can close the fence early or
+    // leave one open.
+    for (const body of ['no ticks', '`', '```', '``````', 'a ``` b ````` c']) {
+      const fence = codeFenceFor(body)
+      for (const run of body.match(/`+/g) ?? []) {
+        expect(run.length).toBeLessThan(fence.length)
+      }
+    }
+  })
+
+  test('does not blow the stack on a body with very many backtick runs', () => {
+    // The former `Math.max(0, ...runs.map(…))` form passed one argument per
+    // run and threw `RangeError: Maximum call stack size exceeded` past the
+    // engine's argument limit, from inside the render path.
+    //
+    // THE COUNT IS LOAD-BEARING and has to clear the argument limit of EVERY
+    // engine that runs this file, because the limit is engine-dependent and
+    // this file is collected by BOTH runners: `bun test` (the shipping
+    // runtime, via the `tests/` positional in scripts/bun-test-ci.sh) and
+    // vitest/Node. Measured on the pinned toolchain by bisecting the former
+    // spread form on this exact body shape — highest surviving run count is
+    // 638,621 on Bun 1.3.13 and 125,289 on Node 22.23.2. So the 200_000 this
+    // started at passed on Bun WITH the bug reinstated: it asserted nothing
+    // in the shipping runtime. 1M is ~1.57x the higher (Bun) limit, and the
+    // shipping loop scans the resulting 2.9 MB body in single-digit
+    // milliseconds, so the margin is nearly free.
+    const body = 'x `'.repeat(1_000_000)
+    expect(codeFenceFor(body)).toBe('```')
+  })
+})
 
 // ---------------------------------------------------------------------------
 // escapeMarkdown — narrowed inline-special escaper (#2669)

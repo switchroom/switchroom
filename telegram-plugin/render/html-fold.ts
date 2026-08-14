@@ -57,10 +57,28 @@
 //                     angle bracket without tripping `unsupported start tag`.
 //
 // ── The invariant ─────────────────────────────────────────────────────────
-// CONTENT is never lost. Only MARKUP is dropped, and only where dropping it
-// loses no reader-visible text: a matched pair, a comment, a void tag.
-// Anything not demonstrably markup survives to the wire as escaped literal
-// text. (Known residual, NOT introduced by this module and not fixed here: a
+// Only MARKUP is dropped. A token that is not demonstrably markup — an
+// UNMATCHED open/close marker, which is overwhelmingly the shape prose
+// actually takes — always survives to the wire as escaped literal text. That
+// case is protected absolutely. The three shapes classified as markup, and so
+// dropped, are a matched pair, a comment, and a void tag.
+//
+// The invariant is NOT "content is never lost", and must not be read that
+// way. MATCHING is a syntactic discriminator, not a semantic one, so a
+// BALANCED pair of angle brackets in prose is indistinguishable from real
+// markup and is dropped with it:
+//   "Use <key> then later </key> done."      -> "Use  then later  done."
+//   "Wrap it in <b> and close with </b>."    -> "Wrap it in ** and close
+//                                               with **."
+// — author-visible prose is deleted in both, and the second additionally
+// re-wraps the surviving text in the construct the pair named. This is the
+// accepted, deliberate price of the matching discriminator, NOT a defect to
+// fix by weakening it: the alternative (classifying by tag NAME) is what
+// silently deleted every `<service>/<key>` and `<agent>` in this project's own
+// agent output — far more common, and far more damaging, than a balanced pair
+// of brackets in prose.
+//
+// (Second known residual, NOT introduced by this module and not fixed here: a
 // `<` in prose that mdast hands over as a TEXT node rather than an `html` node
 // — the decoded `&lt;c&gt;`, or `response in <1s` — never reaches this module
 // and still ships unescaped. That is a `plain`-node / `escapeMarkdown`

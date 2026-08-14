@@ -86,6 +86,62 @@ export function codeSpanSafe(s: string): string {
 }
 
 /**
+ * Compute the delimiter for a fenced code block whose body is `text`.
+ *
+ * Fenced content is verbatim per the formatting guide; the only hazard is a
+ * backtick run inside the body CLOSING the fence early. A hardcoded ``` around
+ * a body that carries its own ``` ships three delimiters instead of two: the
+ * wire opens at the first, closes at the embedded one, reads the remainder as
+ * prose, and the trailing delimiter opens a fence that never terminates —
+ * `can't find end of Pre entity`, a 400, and a whole-message plain-text
+ * resend. Widening the delimiter to one backtick longer than the longest run
+ * already present makes the open/close pair the only runs of that width, so
+ * nothing in the body can match them.
+ *
+ * This is the canonical home for the rule (as `codeSpanSafe` is for the code
+ * SPAN hazard above): the markdown fence (`renderCodeBlock`), the degraded
+ * table fence (`degradeToCodeFence`) and the raw-HTML `<pre>` fold
+ * (`buildPreBlock`, render/parse.ts) all call it, so there is exactly ONE
+ * implementation of the width rule rather than a copy per call site.
+ *
+ * The scan is a LOOP, not `Math.max(0, ...runs.map(…))`. The spread form
+ * (which both former copies of this rule used) passes one argument per run,
+ * so a body with enough separate backtick runs blows the argument limit with
+ * `RangeError: Maximum call stack size exceeded`, throwing out of the render
+ * path entirely.
+ *
+ * The limit is ENGINE-DEPENDENT, so no single number describes it. The
+ * shipping runtime is Bun (`telegram-plugin/package.json` `start`,
+ * docker/Dockerfile.agent), where it measures at ~639k runs (~1.9 MB body);
+ * this file is also collected by the vitest/Node runner, where it is ~125k
+ * (~375 KB). Both measured on the pinned toolchain (Bun 1.3.13 — the CI
+ * default in .github/actions/setup-switchroom/action.yml — and Node 22), and
+ * both move with an engine upgrade.
+ *
+ * We deliberately do NOT rely on that threshold. Input here is unbounded:
+ * `renderOutboundChunks` renders the WHOLE raw body before any
+ * `splitMarkdownChunks` (render/rich-render.ts:146), so the fence scan is not
+ * bounded by the 32768-character rich cap. Being honest about the size: on
+ * Bun a ~1.9 MB single message is an unlikely body, so there this is a latent
+ * crash rather than a routine one. The loop is O(n) either way and cannot
+ * throw, so correctness costs nothing and the reachability argument does not
+ * have to be won.
+ */
+export function codeFenceFor(text: string): string {
+  let longestRun = 0
+  let current = 0
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '`') {
+      current++
+      if (current > longestRun) longestRun = current
+    } else {
+      current = 0
+    }
+  }
+  return '`'.repeat(Math.max(3, longestRun + 1))
+}
+
+/**
  * Make a URL safe to interpolate as the destination of a `[label](href)`
  * inline link.
  *

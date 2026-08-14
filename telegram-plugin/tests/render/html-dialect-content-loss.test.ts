@@ -1,9 +1,17 @@
 // Outcome tests for the content-loss regressions found in the raw-HTML
 // dialect fold (#4691, merged as fa9018a7, unreleased).
 //
-// Every assertion here FAILS on fa9018a7. They drive the real `renderOutbound`
-// (`parse` -> `renderSafe`), i.e. exactly what the live send path calls, so
-// they assert the WIRE OUTCOME rather than an internal code path.
+// 29 of the 37 tests here fail on fa9018a7 — measured by running this exact
+// file against that revision, not asserted. The other 8 pass on both and are
+// guards: they pin behaviour the fix must not disturb. (An earlier revision of
+// this header claimed "every assertion fails on fa9018a7"; at 31 tests the
+// true figure was 23.) Five of the 29 — the `<pre>` fence-width cases — also
+// fail on 6c120cee, the first fix's own merge commit, which emitted a
+// hardcoded three-backtick fence.
+//
+// They drive the real `renderOutbound` (`parse` -> `renderSafe`), i.e. exactly
+// what the live send path calls, so they assert the WIRE OUTCOME rather than
+// an internal code path.
 //
 // The through-line: fa9018a7's degrade bucket DELETED any token it could not
 // fold or pass through. That is safe for markup but catastrophic for prose —
@@ -110,6 +118,71 @@ describe("MAJOR 1: `<pre>` folds to a fenced block, not a broken code span", () 
     // A fence inside a `#` line or a table cell would end the block/row.
     expect(render("# a <pre>x</pre> b")).toBe("# a `x` b");
     expect(render("| h |\n| --- |\n| <pre>x</pre> |")).toContain("| `x` |");
+  });
+
+  // ── Regression: the fold's fence must be WIDER than its own body ────────
+  // `buildPreBlock` emitted a hardcoded three-backtick delimiter as a `raw`
+  // node (verbatim wire passthrough — nothing downstream widens it). A `<pre>`
+  // whose body carried its own ``` therefore shipped THREE delimiters: the
+  // wire opens at #1, closes at #2, reads the remainder as prose, and #3 opens
+  // a fence that never terminates -> `can't find end of Pre entity` 400 and a
+  // whole-message plain-text resend. `fa9018a7` escaped the backticks instead
+  // — cosmetically worse, but wire-correct; this restores wire-correctness
+  // using the same width rule `renderCodeBlock` already applies.
+  it("widens the fence past a three-backtick run in the body", () => {
+    expect(render("<pre>\na\n```\nb\n</pre>")).toBe("````\na\n```\nb\n````");
+  });
+
+  it("widens the fence past a longer run than three", () => {
+    expect(render("<pre>\na\n````\nb\n</pre>")).toBe("`````\na\n````\nb\n`````");
+    expect(render("<pre>\na\n`````\nb\n</pre>")).toBe(
+      "``````\na\n`````\nb\n``````",
+    );
+  });
+
+  it("widens past a run that shares a line with other text", () => {
+    expect(render("<pre><code>x ``` y</code></pre>")).toBe(
+      "````\nx ``` y\n````",
+    );
+  });
+
+  it("still emits a plain three-backtick fence when the body has no run", () => {
+    // The widening must not inflate the common case.
+    expect(render("<pre>\nplain body\n</pre>")).toBe("```\nplain body\n```");
+    expect(render("<pre>\na ` b `` c\n</pre>")).toBe("```\na ` b `` c\n```");
+  });
+
+  it("keeps the language hint attached to the widened delimiter", () => {
+    expect(
+      render('<pre><code class="language-md">see ```\n</code></pre>'),
+    ).toBe("````md\nsee ```\n````");
+  });
+
+  it("emits a terminating fence for every inner backtick run length", () => {
+    // Outcome, not shape: whatever the body carries, the delimiter run must
+    // appear on exactly TWO lines (open and close) and be strictly longer than
+    // every run inside, so the wire can neither close it early nor leave it
+    // open. This is the property whose violation produced the 400.
+    for (const inner of ["```", "````", "`````", "` `` ```", "a```b", "```` x"]) {
+      const src = `<pre>\nhead\n${inner}\ntail\n</pre>`;
+      const out = render(src);
+      const lines = out.split("\n");
+      const delim = lines[0];
+      expect(delim, `open delimiter for ${JSON.stringify(inner)}`).toMatch(
+        /^`{3,}$/,
+      );
+      expect(lines[lines.length - 1], `close delimiter for ${inner}`).toBe(
+        delim,
+      );
+      // Every backtick run in the BODY is strictly shorter than the delimiter.
+      const body = lines.slice(1, -1).join("\n");
+      for (const run of body.match(/`+/g) ?? []) {
+        expect(
+          run.length,
+          `body run ${JSON.stringify(run)} vs delimiter ${delim}`,
+        ).toBeLessThan(delim.length);
+      }
+    }
   });
 });
 
