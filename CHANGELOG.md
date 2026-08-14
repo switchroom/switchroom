@@ -15,6 +15,8 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
+
 ### Bug fixes
 
 - **voice: TTS chunks on phoneme length, not characters — long messages stop
