@@ -475,6 +475,19 @@ runs `gh issue reopen` — `gh issue edit` refreshes a closed issue's body witho
 reopening it, so without that the board would say "fixed" forever while the
 sensor found the defect every night.
 
+**The reopen path is a one-scan window.** The close-on-zero loop only carries a
+prior key forward when its status is `open` or `resolved-pending-verify`
+(`ledger.ts:283-287`), so a `closed` issue that stays quiet is dropped from the
+ledger on the very NEXT scan and its `gh_issue` number goes with it. A defect
+that returns on the immediately following scan is reopened on the original
+thread; one that returns two or more scans later has nothing left to reopen and
+falls through to `gh-sync`'s create path, filing a FRESH issue for the same
+`dedup_key`. That is deliberate — the alternative is an unbounded tombstone list
+of every key ever closed — and it costs continuity, not correctness: the board
+never claims "fixed" while the defect is live either way. It is stated here
+because the window is invisible in the code, and a change to it silently changes
+which incidents keep their history.
+
 The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
 
 ### Priority score (as implemented)

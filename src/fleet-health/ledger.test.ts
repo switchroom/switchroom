@@ -582,4 +582,41 @@ describe("#4682 — the guard's blind spots", () => {
     expect(reborn.gh_issue).toBe(909);
     expect(reborn.reopened).toBe(true);
   });
+
+  /**
+   * #4682 M2 — pins the DURABILITY WINDOW of the reopen path above, because the
+   * RFC now states it as a contract (`reference/rfcs/fleet-health.md`, "the
+   * reopen path is a one-scan window"). `buildLedger`'s close-on-zero loop only
+   * carries a prior key forward when its status is `open` or
+   * `resolved-pending-verify` (`ledger.ts:283-287`), so a `closed` issue with
+   * no findings is DROPPED on the very next scan and its `gh_issue` number goes
+   * with it. A defect returning two or more scans later therefore cannot
+   * reopen — it falls through to `gh-sync`'s create path and files a fresh
+   * issue. That is deliberate (an unbounded tombstone list is its own problem)
+   * but it is not obvious from the code, and a silent change to the window
+   * would change which incidents keep their thread.
+   */
+  it("B1: the reopen window is exactly one scan — then the GH number is gone", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes")!.gh_issue = 909;
+
+    // Scan 2: no findings — closed, but the number is still carried.
+    const scan2 = buildLedger([], { now: NOW, prior });
+    expect(issueFor(scan2, "deleted-inode-writes")!.gh_issue).toBe(909);
+
+    // Scan 3: still clean — the key is dropped from the ledger entirely.
+    const scan3 = buildLedger([], { now: NOW, prior: scan2 });
+    expect(issueFor(scan3, "deleted-inode-writes")).toBeUndefined();
+
+    // Scan 4: the defect is back, but there is nothing left to reopen. It is a
+    // fresh issue as far as gh-sync is concerned.
+    const scan4 = buildLedger([dbFinding("orphaned-db-handle", 2)], {
+      now: NOW,
+      prior: scan3,
+    });
+    const refiled = issueFor(scan4, "deleted-inode-writes")!;
+    expect(refiled.status).toBe("open");
+    expect(refiled.gh_issue).toBeUndefined();
+    expect(refiled.reopened).toBeUndefined();
+  });
 });

@@ -84,6 +84,98 @@ now an anomaly worth investigating, not the norm.
   reinstated spread form still PASSES under Bun — the guard asserted nothing
   in the shipping runtime.
 
+- **fleet-health: a detector must check an alarm's OUTCOME, not just match
+  it.** Two Layer-0 rules matched an alarm and never asked how it ended, so the
+  nightly ledger booked working safety mechanisms as failures.
+  `represent-escalation` was the bare substring `/obligation escalation/`, which
+  five emitter lines carry — including the per-attempt retry line and
+  `obligation-wiring.ts`'s `deferred — bridge down` line, i.e. the guard
+  deliberately *not* escalating while the Telegram bridge is down. Three of 11
+  live hits were that suppression path, all for the same obligation. It now
+  anchors on the two mutually-exclusive TERMINAL outcomes (`delivered + closed`,
+  `PERMANENTLY undeliverable`), the same attempt-vs-outcome fix #3931 made for
+  `reply-delivery-failure`. `orphaned-db-handle` matched the deleted-inode sweep
+  alarm without checking whether the paired recovery followed; an alarm whose
+  own sweep tick reopened `history.db` and left no lane un-recovered is now
+  `orphaned-db-handle-recovered` (drift, severity 1) instead of a severity-3
+  silent-data-loss incident. `registry.db`, an unowned handle, a FAILED reopen,
+  or a tick the detector cannot see in full all keep severity 3 — every
+  narrowing fails *toward* the alarm.
+
+- **fleet-health: gateway findings count affected turns, and a change of
+  counting unit can no longer auto-close a live GitHub issue.** Matched gateway
+  lines sharing an `origin=` turn id now fold into one finding, so ledger
+  `frequency` counts distinct affected turns rather than log lines (`gw_hits`
+  stays a raw line count for the digest). That is a change of *ruler*, and the
+  ledger's count-drop self-verify closes an issue when the number falls: an open
+  `duplicate-delivery-represent` issue at frequency 8 across 3 turns would have
+  collapsed to 3 on the first scan after merge, flipped to
+  `resolved-pending-verify`, and had the sensor comment "Verified count-drop …
+  Closed by the Fleet Health sensor." on a still-broken issue. Each issue now
+  records the `counting_unit` its frequency was measured in, and the writer
+  holds an issue's status for exactly one scan when that unit changes — a real
+  close is delayed by one scan, never suppressed, and reopening still works.
+
+- **fleet-health: the orphaned-DB verdict no longer depends on when the scan
+  ran, and a reclassified issue no longer claims a fix nobody made.** The
+  recovered/unrecovered split used a 12-line lookahead to find its tick
+  boundary, but sweeps are five minutes apart, so the identical alarm+reopen
+  pair booked severity 1 while it sat at the log tail and severity 3 once
+  ordinary traffic accumulated behind it. The two verdicts carry different
+  signatures, so a flip moved the finding to a different dedup_key and emptied
+  the old one — which the writer reads as a drop to zero, closing a live
+  severity-3 issue with "Verified count-drop … Closed by the Fleet Health
+  sensor." The same lookahead also downgraded a real `registry.db` alarm to
+  informational whenever its lane line fell outside the window. The verdict is
+  now derived from the tick's content — the alarm line names every affected
+  lane, and the first sweep line after it is that tick's history-lane outcome —
+  so it no longer moves with log GROWTH. Truncation is a separate problem and
+  is handled separately (next entry): reading the alarm's lane list is only
+  sound if that list is COMPLETE, which the first cut of this fix did not
+  check. Alongside it: a close caused
+  by findings re-sorting into a sibling signature is recorded as
+  `close_reason: "reclassified"` and commented as such rather than as a
+  verified count-drop; an issue whose defect reappears after closing is now
+  reopened on GitHub instead of staying shut forever; the count-drop arm tests
+  `count < prior.frequency` so an issue held across a counting-unit change can
+  still close (previously it could only ever leave the board at zero, i.e.
+  stale-open however much of it got fixed); and the gateway-signal list that
+  drives the counting-unit guard is built from a `Record<GatewaySignal, true>`
+  so a new derived signal is a compile error rather than a signal silently
+  counted in the wrong unit.
+
+- **fleet-health: a TRUNCATED orphaned-DB alarm can no longer launder silent
+  data loss down to informational.** Deriving the verdict from the alarm line's
+  lane list (previous entry) traded position-dependence for total dependence on
+  that one line arriving intact, which is the same bug class on a different
+  path. The emitter writes `DETECTED <n>` and then exactly one `fd=<n> <target>`
+  pair per orphan, so count and list are 1:1 by construction — but the
+  classifier read the pairs and ignored the count. A short or interleaved
+  `write()` on the supervisor's stderr for an alarm line over `PIPE_BUF` —
+  reachable precisely when many handles are orphaned, i.e. the worst incident —
+  drops the tail of the list, and a surviving `history.db` pair then booked
+  severity 1 on a tick that also lost `registry.db`. The sharp case is that the
+  intact `registry.db … rows written since the last checkpoint are LOST.` line
+  was sitting right there in the log and the classifier never looked at it,
+  because it only ever read the FIRST sweep line after the alarm and the
+  registry lane is emitted after the history lane. Severity 1 migrates the
+  finding's `dedup_key`, empties the severity-3 key, and drives close-on-zero —
+  a real unrecoverable loss closed as fixed. Two guards now: the lane list is
+  cross-checked against the alarm's own count and an incomplete list fails
+  toward the alarm; and a registry/unowned lane line anywhere between an alarm
+  and the NEXT alarm vetoes a recovery outright, restoring the veto the first
+  cut deleted without restoring its line-count window (the scan is bounded by
+  the log's content, so no position-dependence returns). The sticky
+  closed-history and FAILED-reopen lines are deliberately NOT vetoes: both also
+  fire from the no-alarm retry path, so vetoing on them would let a later,
+  unrelated tick flip an earlier recovered verdict — the exact dependence the
+  previous entry removed. Also: the `Record<GatewaySignal, true>` exhaustiveness
+  guard's test was tautological — every runtime view of that set is derived from
+  the same constant, so it passed against the very hand-written array it was
+  filed about; it now asserts against an independently written list, with `tsc`
+  named as the real guarantee. And the RFC now states the ledger reopen path's
+  one-scan durability window, which was true in code and documented nowhere.
+
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 
 ### Bug fixes
@@ -203,61 +295,6 @@ now an anomaly worth investigating, not the norm.
   unguaranteeable markup is — which beats a 400 that degrades the whole
   message to plain text. Also locks in the blank-line-separated expandable
   shape, the majority corpus shape, which worked but had no test.
-
-- **fleet-health: a detector must check an alarm's OUTCOME, not just match
-  it.** Two Layer-0 rules matched an alarm and never asked how it ended, so the
-  nightly ledger booked working safety mechanisms as failures.
-  `represent-escalation` was the bare substring `/obligation escalation/`, which
-  five emitter lines carry — including the per-attempt retry line and
-  `obligation-wiring.ts`'s `deferred — bridge down` line, i.e. the guard
-  deliberately *not* escalating while the Telegram bridge is down. Three of 11
-  live hits were that suppression path, all for the same obligation. It now
-  anchors on the two mutually-exclusive TERMINAL outcomes (`delivered + closed`,
-  `PERMANENTLY undeliverable`), the same attempt-vs-outcome fix #3931 made for
-  `reply-delivery-failure`. `orphaned-db-handle` matched the deleted-inode sweep
-  alarm without checking whether the paired recovery followed; an alarm whose
-  own sweep tick reopened `history.db` and left no lane un-recovered is now
-  `orphaned-db-handle-recovered` (drift, severity 1) instead of a severity-3
-  silent-data-loss incident. `registry.db`, an unowned handle, a FAILED reopen,
-  or a tick the detector cannot see in full all keep severity 3 — every
-  narrowing fails *toward* the alarm.
-- **fleet-health: gateway findings count affected turns, and a change of
-  counting unit can no longer auto-close a live GitHub issue.** Matched gateway
-  lines sharing an `origin=` turn id now fold into one finding, so ledger
-  `frequency` counts distinct affected turns rather than log lines (`gw_hits`
-  stays a raw line count for the digest). That is a change of *ruler*, and the
-  ledger's count-drop self-verify closes an issue when the number falls: an open
-  `duplicate-delivery-represent` issue at frequency 8 across 3 turns would have
-  collapsed to 3 on the first scan after merge, flipped to
-  `resolved-pending-verify`, and had the sensor comment "Verified count-drop …
-  Closed by the Fleet Health sensor." on a still-broken issue. Each issue now
-  records the `counting_unit` its frequency was measured in, and the writer
-  holds an issue's status for exactly one scan when that unit changes — a real
-  close is delayed by one scan, never suppressed, and reopening still works.
-- **fleet-health: the orphaned-DB verdict no longer depends on when the scan
-  ran, and a reclassified issue no longer claims a fix nobody made.** The
-  recovered/unrecovered split used a 12-line lookahead to find its tick
-  boundary, but sweeps are five minutes apart, so the identical alarm+reopen
-  pair booked severity 1 while it sat at the log tail and severity 3 once
-  ordinary traffic accumulated behind it. The two verdicts carry different
-  signatures, so a flip moved the finding to a different dedup_key and emptied
-  the old one — which the writer reads as a drop to zero, closing a live
-  severity-3 issue with "Verified count-drop … Closed by the Fleet Health
-  sensor." The same lookahead also downgraded a real `registry.db` alarm to
-  informational whenever its lane line fell outside the window. The verdict is
-  now derived from the tick's content — the alarm line names every affected
-  lane, and the first sweep line after it is that tick's history-lane outcome —
-  so it is stable under log growth and truncation. Alongside it: a close caused
-  by findings re-sorting into a sibling signature is recorded as
-  `close_reason: "reclassified"` and commented as such rather than as a
-  verified count-drop; an issue whose defect reappears after closing is now
-  reopened on GitHub instead of staying shut forever; the count-drop arm tests
-  `count < prior.frequency` so an issue held across a counting-unit change can
-  still close (previously it could only ever leave the board at zero, i.e.
-  stale-open however much of it got fixed); and the gateway-signal list that
-  drives the counting-unit guard is built from a `Record<GatewaySignal, true>`
-  so a new derived signal is a compile error rather than a signal silently
-  counted in the wrong unit.
 
 ### Features
 

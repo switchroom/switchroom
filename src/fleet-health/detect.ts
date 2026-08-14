@@ -288,10 +288,28 @@ const ORPHANED_DB_SWEEP_LINE_RE = /orphaned-db-sweep /;
  *  ` (deleted)`, which `\S+` naturally stops before. */
 const ORPHANED_DB_ALARM_TARGET_RE = /\bfd=\d+ (\S+)/g;
 
+/** The handle COUNT the alarm declares — the same `\d+` the
+ *  `orphaned-db-handle` signature already requires, so it is present on every
+ *  line that reaches here. `orphaned-db-sweep.ts:211-217` writes
+ *  `DETECTED ${orphans.length}` and then exactly one `fd=` pair per orphan, so
+ *  count and pair list are 1:1 BY CONSTRUCTION and any inequality means the
+ *  list we are reading is not the list the emitter wrote. */
+const ORPHANED_DB_ALARM_COUNT_RE = /DETECTED (\d+) deleted-inode DB handle/;
+
 /**
- * The lanes an alarm line names, as basenames. Returns `null` when the line
- * carries no parseable target at all — an emitter format change must fail
- * toward the alarm, never silently downgrade a data-loss record.
+ * The lanes an alarm line names, as basenames. Returns `null` when the line's
+ * target list is not provably COMPLETE — either nothing parsed at all, or fewer
+ * pairs parsed than the line's own count declares. An emitter format change, a
+ * truncated line, or an interleaved write must fail toward the alarm, never
+ * silently downgrade a data-loss record.
+ *
+ * #4682 B1 follow-up — reading the pairs and ignoring the count made the
+ * verdict depend on the alarm line arriving INTACT. A short `write()` on the
+ * supervisor's stderr for an alarm line over `PIPE_BUF` (reachable precisely
+ * when many fds are orphaned — the worst incident) drops the tail of the list,
+ * and a surviving `history.db` pair then launders a real `registry.db` loss
+ * down to severity 1. The count is at the HEAD of the line, so it survives
+ * exactly the truncations that eat the list.
  */
 function orphanedDbAlarmLanes(alarmLine: string): string[] | null {
   const names: string[] = [];
@@ -299,8 +317,28 @@ function orphanedDbAlarmLanes(alarmLine: string): string[] | null {
     const target = m[1]!;
     names.push(target.slice(target.lastIndexOf("/") + 1));
   }
-  return names.length > 0 ? names : null;
+  if (names.length === 0) return null;
+  const declared = ORPHANED_DB_ALARM_COUNT_RE.exec(alarmLine)?.[1];
+  if (declared === undefined || names.length !== Number(declared)) return null;
+  return names;
 }
+
+/**
+ * Lane lines that state, in this tick, that a lane was left UN-recovered. They
+ * veto a `recovered` verdict no matter what the alarm line's own list said.
+ *
+ * Deliberately only the two lanes the emitter logs AFTER the history lane and
+ * ONLY from inside an alarm's own `orphans.length > 0` block: registry
+ * (`orphaned-db-sweep.ts:231-238`) and unowned (`:242-251`). The sticky
+ * closed-history line (`:255-264`) and `FAILED to reopen` (`:285`) are
+ * excluded on purpose — both also fire from the retry path on a tick with NO
+ * DETECTED line, so vetoing on them would let a LATER, unrelated tick flip an
+ * earlier recovered alarm, which is the log-growth dependence #4682 B1 removed.
+ * This tick's own failed reopen is already caught by the first-sweep-line rule
+ * below, so nothing is lost by excluding them.
+ */
+const ORPHANED_DB_LANE_VETO_RE =
+  /orphaned-db-sweep found (?:an orphaned registry\.db handle|orphaned handle\(s\) on )/;
 
 /**
  * Decide whether an `orphaned-db-sweep DETECTED` alarm at `alarmIdx` was
@@ -318,37 +356,52 @@ function orphanedDbAlarmLanes(alarmLine: string): string[] | null {
  *
  * Two content-derived facts settle it:
  *
- * 1. WHICH LANES the tick hit is stated by the alarm line itself — it
- *    interpolates every orphaned fd's target (`orphaned-db-sweep.ts:213-217`).
- *    `history.db*` (including `-wal`/`-shm`, matching the emitter's own
- *    `startsWith('history.db')` lane test at :219) is the only lane with an
- *    in-process recovery. An alarm naming `registry.db` or an unowned file is
- *    unrecoverable silent loss, full stop — no lookahead may overrule it, and
- *    crucially a truncated log that lost the lane line can no longer launder it
- *    down to severity 1.
+ * 1. WHICH LANES the tick hit is stated by the alarm line itself — it declares
+ *    a handle COUNT and then interpolates one `fd=` pair per orphaned target
+ *    (`orphaned-db-sweep.ts:211-217`). `history.db*` (including `-wal`/`-shm`,
+ *    matching the emitter's own `startsWith('history.db')` lane test at :219)
+ *    is the only lane with an in-process recovery. An alarm naming
+ *    `registry.db` or an unowned file is unrecoverable silent loss, full stop.
+ *    Count and pair list are 1:1 by construction, so `orphanedDbAlarmLanes`
+ *    cross-checks them and refuses to answer from a list it cannot prove
+ *    COMPLETE — a truncated alarm can no longer launder a hidden `registry.db`
+ *    down to severity 1 on the strength of a surviving `history.db` pair.
  * 2. WHETHER the history lane recovered is stated by the first `orphaned-db-sweep`
  *    line after the alarm. The emitter reaches its history lane with no `await`
  *    after the alarm and always logs exactly one of: reopened-and-proved-durable,
  *    no-reopen-wired, or FAILED-to-reopen. Only the first is a recovery; anything
  *    else — including running out of log — keeps the alarm.
+ * 3. Belt and braces: any registry/unowned lane line between this alarm and the
+ *    NEXT alarm vetoes a recovery outright (`ORPHANED_DB_LANE_VETO_RE`). Those
+ *    lines are emitted only from inside an alarm's own block, so the scan window
+ *    is bounded by the log's CONTENT (the next DETECTED line, or EOF) and never
+ *    by a line count — no position-dependence is reintroduced. It exists so an
+ *    intact "rows … are LOST" line in the tick is never overruled by whatever
+ *    the alarm line happens to say, whatever the emitter's format becomes.
  */
 export function classifyOrphanedDbTick(
   lines: readonly string[],
   alarmIdx: number,
 ): "recovered" | "unrecovered" {
   const lanes = orphanedDbAlarmLanes(lines[alarmIdx] ?? "");
-  // Unparseable target list, or any lane without an in-process recovery.
+  // Incomplete target list, or any lane without an in-process recovery.
   if (lanes === null || !lanes.every((n) => n.startsWith("history.db"))) {
     return "unrecovered";
   }
+  let verdict: "recovered" | "unrecovered" | null = null;
   for (let j = alarmIdx + 1; j < lines.length; j++) {
     const line = lines[j];
     if (!line || !ORPHANED_DB_SWEEP_LINE_RE.test(line)) continue;
+    // The next alarm ends this tick — its lane lines are not ours to read.
+    if (GATEWAY_SIGNATURES["orphaned-db-handle"].test(line)) break;
+    // An un-recovered lane anywhere in THIS tick settles it, alarm line or not.
+    if (ORPHANED_DB_LANE_VETO_RE.test(line)) return "unrecovered";
     // The first sweep line after the alarm IS this tick's history-lane verdict.
-    return ORPHANED_DB_RECOVERED_RE.test(line) ? "recovered" : "unrecovered";
+    verdict ??= ORPHANED_DB_RECOVERED_RE.test(line) ? "recovered" : "unrecovered";
+    if (verdict === "unrecovered") return "unrecovered";
   }
-  // The log ended before the lane reported: we cannot prove a recovery.
-  return "unrecovered";
+  // `null` — the log ended before the lane reported: we cannot prove a recovery.
+  return verdict ?? "unrecovered";
 }
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
