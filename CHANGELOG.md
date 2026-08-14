@@ -17,6 +17,8 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.12 — the changelog guard catches an entry buried by a release cut, per-PR changelog.d fragments end the shared `## Unreleased` conflict class, and /tts reports its audio-degradation counters to callers
+
 ### Bug fixes
 
 - **ci: the changelog guard now catches an entry that lands in an
@@ -146,6 +148,36 @@ with every other open PR — prefer a fragment.
   that finds where it stops — so the writer and the checker cannot disagree about
   which lines are the staging section and stage an entry where the guard will not
   count it.
+- **voice: the TTS audio-degradation counters now actually reach the `/tts`
+  caller, as `X-Voice-Hard-Cuts` and `X-Voice-Unchunked-Pieces` (#4716).**
+  #4695 said `hardCuts` / `unchunkedPieces` were "counted into the `/tts`
+  response meta" so the condition "stops being invisible", and the code
+  carried a comment saying the same. Neither was true: `_handle_tts` emitted
+  only `X-Voice-Duration-Ms`, `X-Voice-Audio-Seconds` and `X-Voice-Voice`, and
+  dropped the rest of the meta dict — so a mid-word phoneme cut or an
+  unphonemizable piece reached the container's stderr and nowhere else, and
+  only when non-zero. Found by capturing full response headers on live `/tts`
+  probes during v0.21.11 release validation. Both counters are now sent on
+  every 200, including `0`: an absent header means an old sidecar, never a
+  clean request. No caller was reading them yet, so nothing changes for
+  existing clients.
+
+### Features
+
+- **ci: changelog notes are now per-PR fragment files under `changelog.d/`,
+  killing the `## Unreleased` merge-conflict class.** Every PR staged its entry
+  in the single shared `## Unreleased` section, so any two in-flight PRs
+  conflicted on CHANGELOG.md even when their entries never disagreed — three
+  merge-queue ejections in one day (#4678→#4679, #4679→#4712, #4678→#4712).
+  Now `bun run changelog:generate` writes `changelog.d/<pr>-<slug>.<type>.md`
+  (one file per PR — two PRs can never conflict), `check-changelog-entry.mjs`
+  accepts a NEW fragment as the staged note (a merely-edited one stages
+  nothing, and hand-written `## Unreleased` entries still count during the
+  transition), and the release cut is `bun run changelog:cut -- --version
+  vX.Y.Z --summary "…"` — `scripts/cut-changelog-release.mjs` assembles the
+  fragments (plus anything hand-staged) into the `## vX.Y.Z` section grouped
+  by category, re-seeds an empty `## Unreleased`, deletes the consumed
+  fragments, and refuses an empty or double cut.
 
 ## v0.21.11 — obligation escalations stop nagging over a delivered answer, fleet-health detectors stop laundering silent passes as green, and long messages stop breaking TTS
 
@@ -24974,3 +25006,4 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
