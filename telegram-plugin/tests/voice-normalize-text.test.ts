@@ -193,6 +193,44 @@ describe('normalizeForSpeech — numbers, units & symbols', () => {
     expect(normalizeForSpeech('my5thing works')).toBe('my5thing works')
     expect(normalizeForSpeech('class5 room')).toBe('class5 room')
   })
+
+  // Regression: unit-suffix lookbehind + case sensitivity (prod corpus,
+  // ~250/1679 samples). A decimal seconds value like "0.17s" was matched by
+  // \b re-anchoring between the "." and the following digits, so "17s" alone
+  // got read as "seventeen seconds" and split the decimal apart; and the /i
+  // flag let a bare capital "M" (money shorthand, "$5M") match the "m"
+  // (minute) unit alternative.
+  it('decimal seconds survive intact — no mid-decimal unit match', () => {
+    expect(normalizeForSpeech('latency was 0.17s')).toBe('latency was 0.17s')
+    expect(normalizeForSpeech('took 1.5s to load')).toBe('took 1.5s to load')
+    expect(normalizeForSpeech('waited 2.25s')).toBe('waited 2.25s')
+    expect(normalizeForSpeech('under 0.9s')).toBe('under 0.9s')
+  })
+
+  it('whole-number seconds still expand: 90s → ninety seconds', () => {
+    expect(normalizeForSpeech('done in 90s')).toBe('done in ninety seconds')
+  })
+
+  it('units unaffected by the case-sensitivity fix: 500ms, 5MB, 2GB', () => {
+    expect(normalizeForSpeech('took 500ms')).toBe('took five hundred milliseconds')
+    expect(normalizeForSpeech('a 5MB image')).toBe('a five megabytes image')
+    expect(normalizeForSpeech('a 2GB dump')).toBe('a two gigabytes dump')
+    expect(normalizeForSpeech('run 5m')).toBe('run five minutes')
+  })
+
+  it('bare capital M never reads as minutes (money shorthand, corpus)', () => {
+    expect(normalizeForSpeech('Revenue was 5M this year')).toBe(
+      'Revenue was 5M this year',
+    )
+    expect(normalizeForSpeech('raised $5M in the round')).not.toContain('minutes')
+  })
+
+  it('HTTP-status-shaped input adjacent to a capital letter is not read as a duration', () => {
+    expect(normalizeForSpeech('a 503M error occurred')).toBe(
+      'a 503M error occurred',
+    )
+    expect(normalizeForSpeech('status 503M')).toBe('status 503M')
+  })
 })
 
 describe('normalizeForSpeech — abbreviations (phase 2)', () => {

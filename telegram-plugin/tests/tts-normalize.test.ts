@@ -184,6 +184,45 @@ describe('numbers', () => {
       'rename class5 and my5thing',
     )
   })
+
+  // Regression: unit-suffix lookbehind + case sensitivity (prod corpus,
+  // ~250/1679 samples). A decimal seconds value like "0.17s" was matched by
+  // \b re-anchoring between the "." and the following digits, so "17s" alone
+  // got read as "seventeen seconds" and split the decimal apart; and the /i
+  // flag let a bare capital "M" (money shorthand, "$5M") match the "m"
+  // (metre/minute) unit alternative.
+  test('decimal seconds survive intact — no mid-decimal unit match', () => {
+    expect(normalizeForTts('latency was 0.17s')).toBe('latency was 0.17s')
+    expect(normalizeForTts('took 1.5s to load')).toBe('took 1.5s to load')
+    expect(normalizeForTts('waited 2.25s')).toBe('waited 2.25s')
+    expect(normalizeForTts('under 0.9s')).toBe('under 0.9s')
+  })
+
+  test('whole-number seconds still expand: 90s → ninety seconds', () => {
+    expect(normalizeForTts('done in 90s')).toBe('done in ninety seconds')
+  })
+
+  test('units unaffected by the case-sensitivity fix: 500ms, 5MB, 2GB, 16 m', () => {
+    expect(normalizeForTts('took 500ms')).toBe('took five hundred milliseconds')
+    expect(normalizeForTts('file is 5MB')).toBe('file is five megabytes')
+    expect(normalizeForTts('disk has 2GB')).toBe('disk has two gigabytes')
+    expect(normalizeForTts('ran 16 m')).toBe('ran sixteen metres')
+  })
+
+  test('bare capital M never reads as minutes/metres (money shorthand, corpus)', () => {
+    expect(normalizeForTts('Revenue was 5M this year')).toBe(
+      'Revenue was 5M this year',
+    )
+    expect(normalizeForTts('raised $5M in the round')).not.toContain('minutes')
+    expect(normalizeForTts('raised $5M in the round')).not.toContain('metres')
+  })
+
+  test('HTTP-status-shaped input adjacent to a capital letter is not read as a duration', () => {
+    expect(normalizeForTts('a 503M error occurred')).toBe(
+      'a 503M error occurred',
+    )
+    expect(normalizeForTts('status 503M')).toBe('status 503M')
+  })
 })
 
 describe('URLs', () => {

@@ -350,16 +350,31 @@ export function normalizeForTts(text: string): string {
 
   // -- Number + unit suffix glued to the number (500ms, 5km, 10GB). Only a
   //    known unit bounded by a non-letter, so identifiers never match.
+  //    The leading `(?<![\d.])` lookbehind is load-bearing: without it `\b`
+  //    is satisfied between a decimal point and the following digits (the
+  //    boundary in "0.17s" sits between "." and "1"), so "17s" inside
+  //    "0.17s" would match on its own and mangle the decimal. Multi-letter
+  //    units (ms, GB, …) stay case-insensitive since `5MB`/`500ms` must
+  //    keep working regardless of case; single-letter units (s, m, h, d, g)
+  //    are matched case-sensitively lowercase-only in a second pass — the
+  //    single letter "M" is one keystroke from meaning "million" in prose
+  //    ("$5M", "Revenue was 5M") and must never fall through to "minutes"
+  //    just because the whole alternation ran under /i.
+  const unitReplacer = (m: string, num: string, unitRaw: string): string => {
+    const unit = UNIT_MAP[unitRaw.toLowerCase()]
+    if (!unit) return m
+    const n = Number(num)
+    const w = numberToWords(n)
+    if (!w) return m
+    return `${w} ${n === 1 ? unit.s : unit.p}`
+  }
   s = s.replace(
-    /\b(\d{1,9})\s?(ms|sec|min|km|cm|mm|kg|kb|mb|gb|tb|ghz|mhz|hr|mi|s|m|h|d|g)(?![a-z])/gi,
-    (m, num: string, unitRaw: string) => {
-      const unit = UNIT_MAP[unitRaw.toLowerCase()]
-      if (!unit) return m
-      const n = Number(num)
-      const w = numberToWords(n)
-      if (!w) return m
-      return `${w} ${n === 1 ? unit.s : unit.p}`
-    },
+    /(?<![\d.])\b(\d{1,9})\s?(ms|sec|min|km|cm|mm|kg|kb|mb|gb|tb|ghz|mhz|hr|mi)(?![a-zA-Z])/gi,
+    unitReplacer,
+  )
+  s = s.replace(
+    /(?<![\d.])\b(\d{1,9})\s?(s|m|h|d|g)(?![a-zA-Z])/g,
+    unitReplacer,
   )
 
   // -- Symbols in prose.

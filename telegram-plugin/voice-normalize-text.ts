@@ -561,16 +561,31 @@ export function normalizeForSpeech(input: string): string {
   //     Number + unit suffix → "<number> <unit>" (e.g. 500ms, 2h, 10KB).
   //     Only when the suffix is a known unit glued directly to the number and
   //     bounded by a non-letter (so "my5thing" / "class5" are never touched).
+  //     The leading `(?<![\d.])` lookbehind is load-bearing: without it `\b`
+  //     is satisfied between a decimal point and the following digits (the
+  //     boundary in "0.17s" sits between "." and "1"), so "17s" inside
+  //     "0.17s" would match on its own and mangle the decimal. Multi-letter
+  //     units (ms, GB, …) stay case-insensitive since `5MB`/`500ms` must
+  //     keep working regardless of case; single-letter units (s, m, h, d)
+  //     are matched case-sensitively lowercase-only in a second pass — the
+  //     single letter "M" is one keystroke from meaning "million" in prose
+  //     ("$5M", "Revenue was 5M") and must never fall through to "minutes"
+  //     just because the whole alternation ran under /i.
+  const unitReplacer = (m: string, num: string, unitRaw: string): string => {
+    const unit = UNIT_MAP[unitRaw.toLowerCase()]
+    if (!unit) return m
+    const n = Number(num)
+    const w = numberToWords(n)
+    if (!w) return m
+    return `${w} ${n === 1 ? unit.s : unit.p}`
+  }
   s = s.replace(
-    /\b(\d{1,9})(ms|sec|min|kb|mb|gb|tb|hr|s|m|h|d)(?![a-z])/gi,
-    (m, num, unitRaw) => {
-      const unit = UNIT_MAP[unitRaw.toLowerCase()]
-      if (!unit) return m
-      const n = Number(num)
-      const w = numberToWords(n)
-      if (!w) return m
-      return `${w} ${n === 1 ? unit.s : unit.p}`
-    },
+    /(?<![\d.])\b(\d{1,9})(ms|sec|min|kb|mb|gb|tb|hr)(?![a-zA-Z])/gi,
+    unitReplacer,
+  )
+  s = s.replace(
+    /(?<![\d.])\b(\d{1,9})(s|m|h|d)(?![a-zA-Z])/g,
+    unitReplacer,
   )
   //     Symbols between tokens: standalone & → and, + → plus, = → equals.
   s = s.replace(/(\S)\s*\+\s*(\S)/g, '$1 plus $2')
