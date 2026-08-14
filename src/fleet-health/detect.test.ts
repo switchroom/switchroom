@@ -7,7 +7,10 @@ import {
   extractTs,
   HANG_MS,
   SILENT_NOOP_FLOOR_TS,
+  GATEWAY_SIGNAL_NAMES,
 } from "./detect.js";
+import type { L0Signal } from "./detect.js";
+import { mapSignal, countingUnitFor } from "./mapping.js";
 import { ROUTE_FIELD_SHIP_TS } from "../../telegram-plugin/gateway/turn-record-status.js";
 
 /**
@@ -173,7 +176,9 @@ describe("detectGatewayFindings", () => {
     `2026-07-02T21:03:00Z gateway: represent duplicate-send tid=${CHAT}:_#42`,
     `2026-07-02T21:04:00Z gateway: tg-post method=getUpdates status=err timeout`,
     `2026-07-02T21:05:00Z gateway: tg-post method=sendRichMessage tid=${CHAT}:_#43 status=err`,
-    `2026-07-02T21:06:00Z gateway: obligation escalation tid=${CHAT}:_#44`,
+    // The literal terminal line `escalation-drive.ts:62` emits.
+    `2026-07-02T21:06:00Z telegram gateway: obligation escalation delivered + closed` +
+      ` origin=${CHAT}:_#44`,
   ].join("\n");
 
   it("counts represent-duplicate and reply-delivery-failure, ignores getUpdates blip", () => {
@@ -216,6 +221,500 @@ describe("detectGatewayFindings", () => {
         " detection is DISABLED until it exists and is readable.",
     ].join("\n");
     expect(detectGatewayFindings("alpha", quiet).gw_hits["orphaned-db-handle"]).toBe(0);
+  });
+});
+
+/**
+ * #4680 — two detector rules matched an ALARM without checking its OUTCOME, so
+ * the nightly ledger booked working safety mechanisms as failures. Every fixture
+ * below is the literal line its emitter writes; a fixture that drifts from the
+ * emitter is the failure mode these rules already had once.
+ */
+describe("#4680 — a working guard is not a failure", () => {
+  const ORIGIN = `${CHAT}:_#2198`;
+
+  describe("represent-escalation matches the terminal OUTCOME, not every attempt", () => {
+    // `obligation-wiring.ts:303` — the guard deliberately NOT escalating while
+    // the Telegram bridge is down. This is the suppression path working.
+    const suppressed =
+      `2026-08-12T02:00:00Z telegram gateway: obligation escalation deferred — bridge down` +
+      ` (nudge waits for reconnect) origin=${ORIGIN}`;
+    // `escalation-drive.ts:72` — one line per ATTEMPT, below the retry policy.
+    const retrying =
+      `2026-08-12T02:05:00Z telegram gateway: obligation escalation send failed (attempt 1/3),` +
+      ` retrying next sweep origin=${ORIGIN}: Error: 429`;
+    // `escalation-drive.ts:62` / `:68` — the two mutually-exclusive terminals.
+    const delivered =
+      `2026-08-12T02:10:00Z telegram gateway: obligation escalation delivered + closed` +
+      ` origin=${ORIGIN}`;
+    const undeliverable =
+      `2026-08-12T02:15:00Z telegram gateway: obligation escalation PERMANENTLY undeliverable` +
+      ` after 3 attempts — closing best-effort origin=${ORIGIN}: Error: 403`;
+
+    it("does NOT flag the bridge-down SUPPRESSION line", () => {
+      const { gw_hits, findings } = detectGatewayFindings("carrie", suppressed);
+      expect(gw_hits["represent-escalation"]).toBe(0);
+      expect(findings).toHaveLength(0);
+    });
+
+    it("does NOT flag a retry attempt (the nudge has not resolved yet)", () => {
+      expect(
+        detectGatewayFindings("carrie", retrying).gw_hits["represent-escalation"],
+      ).toBe(0);
+    });
+
+    it("DOES flag a delivered escalation", () => {
+      const { gw_hits, findings } = detectGatewayFindings("carrie", delivered);
+      expect(gw_hits["represent-escalation"]).toBe(1);
+      expect(findings[0]?.turn_id).toBe(ORIGIN);
+    });
+
+    it("DOES flag a permanently-undeliverable escalation", () => {
+      expect(
+        detectGatewayFindings("carrie", undeliverable).gw_hits["represent-escalation"],
+      ).toBe(1);
+    });
+
+    // The live shape: one obligation, four matching lines, of which exactly one
+    // is an escalation that happened. Before the fix this booked 4 findings.
+    it("books ONE finding for one obligation's full retry-then-deliver history", () => {
+      const log = [suppressed, retrying, retrying, delivered].join("\n");
+      const { findings } = detectGatewayFindings("carrie", log);
+      const esc = findings.filter((f) => f.signal === "represent-escalation");
+      expect(esc).toHaveLength(1);
+      expect(esc[0]?.ts).toBe("2026-08-12T02:10:00Z");
+    });
+  });
+
+  describe("orphaned-db-handle splits on whether the sweep RECOVERED", () => {
+    const detect = (n: number, target: string) =>
+      `2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED ${n} deleted-inode` +
+      ` DB handle(s): fd=13 ${target} (deleted) — another process unlinked these files while` +
+      ` we held them open; every row written since the last checkpoint is LOST and further` +
+      ` writes would be lost too.`;
+    const reopened =
+      "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep reopened history.db —" +
+      " writes are durable again (proved by the post-reopen writer self-check); rows" +
+      " written since the last checkpoint are NOT recoverable.";
+
+    /** Severity is what the ledger acts on, so assert THAT, not the signal name. */
+    const severityOf = (log: string): number[] =>
+      detectGatewayFindings("overlord", log).findings.map(
+        (f) => mapSignal(f.signal).severity,
+      );
+
+    it("DETECT + reopen in the same tick is NOT a severity-3 record", () => {
+      const log = [detect(1, "/state/history.db"), reopened].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+      const { gw_hits } = detectGatewayFindings("overlord", log);
+      expect(gw_hits["orphaned-db-handle"]).toBe(0);
+      expect(gw_hits["orphaned-db-handle-recovered"]).toBe(1);
+      // Still reported — the pre-reopen rows really are gone.
+      expect(detectGatewayFindings("overlord", log).findings).toHaveLength(1);
+    });
+
+    it("DETECT with no recovery line STAYS severity 3", () => {
+      expect(severityOf(detect(1, "/state/history.db"))).toEqual([3]);
+    });
+
+    it("a FAILED reopen stays severity 3", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep FAILED to reopen" +
+          " history.db: EACCES — history writes are NOT durable; RESTART the gateway.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("registry.db stays severity 3 even when history recovers in the same tick", () => {
+      // The registry lane has NO in-process recovery — reopening history does
+      // not make those rows durable, so the tick is not recovered.
+      const log = [
+        detect(2, "/state/registry.db"),
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — the turnsDb handle" +
+          " is captured by value into long-lived wiring, so closing it would leave those" +
+          " consumers on a closed handle. RESTART the gateway to recover; subagent/turn" +
+          " rows written since the last checkpoint are LOST.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("an unowned lane stays severity 3 even alongside a history reopen", () => {
+      const log = [
+        detect(2, "/state/grants.db"),
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found orphaned handle(s)" +
+          " on grants.db, which no recovery lane owns — the gateway cannot reopen them in" +
+          " place. RESTART the gateway to recover; rows written to those files since the" +
+          " last checkpoint are LOST.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    // The tick's lane ordering is load-bearing and lives in a DIFFERENT file:
+    // `orphaned-db-sweep.ts` logs the history lane (and therefore the reopen
+    // line, since `attemptHistoryReopen` is synchronous) at :219-229 BEFORE
+    // the registry lane at :231-238. So the line that VETOES a "recovered"
+    // verdict is exactly the one an added `await`, or another subsystem's
+    // interleaved output, pushes past the lookahead cap. Without the
+    // tick-boundary requirement this silently downgrades real `registry.db`
+    // data loss from severity 3 to severity 1 — and no adjacent-lines fixture
+    // above would notice.
+    it("stays severity 3 when the registry lane is pushed past the lookahead cap", () => {
+      const filler = Array.from(
+        { length: 14 },
+        (_, i) => `2026-08-12T03:00:0${i % 10}Z telegram gateway: unrelated chatter #${i}`,
+      );
+      const log = [
+        detect(2, "/state/registry.db"),
+        reopened,
+        ...filler,
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — the turnsDb handle" +
+          " is captured by value into long-lived wiring, so closing it would leave those" +
+          " consumers on a closed handle. RESTART the gateway to recover; subagent/turn" +
+          " rows written since the last checkpoint are LOST.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    // The conservative rule must not swallow the ordinary recovered case: an
+    // alarm + reopen followed by a short quiet tail still ends at EOF inside
+    // the window, so the whole tick IS visible.
+    it("still books severity 1 when the whole tick is visible", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        reopened,
+        ...Array.from(
+          { length: 3 },
+          (_, i) => `2026-08-12T03:00:0${i}Z telegram gateway: unrelated chatter #${i}`,
+        ),
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+    });
+
+    it("a LATER tick's recovery does not launder an earlier unrecovered alarm", () => {
+      const log = [detect(1, "/state/history.db"), detect(1, "/state/history.db"), reopened]
+        .join("\n");
+      expect(severityOf(log)).toEqual([3, 1]);
+    });
+
+    /**
+     * #4682 B1 — the verdict must be a property of the TICK, not of how much
+     * log happened to follow it. A line-count lookahead cap makes it the
+     * latter: the exact same alarm+reopen pair books severity 1 while it sits
+     * at the log tail and severity 3 once ordinary traffic pushes the (absent)
+     * tick boundary out of the window. Sweeps are 5 minutes apart, so in a live
+     * log the next alarm is essentially never within a dozen lines — the
+     * verdict would then depend on WHEN the scan ran, and a signal that flips
+     * with the clock migrates its findings between two dedup_keys and drives
+     * the ledger's close-on-zero path on a defect nobody fixed.
+     */
+    it("books the same severity for one tick no matter how much traffic follows", () => {
+      const tick = [detect(1, "/state/history.db"), reopened];
+      for (const trailing of [0, 1, 5, 11, 12, 13, 60]) {
+        const log = [
+          ...tick,
+          ...Array.from(
+            { length: trailing },
+            (_, i) => `2026-08-12T03:05:00Z telegram gateway: unrelated chatter #${i}`,
+          ),
+        ].join("\n");
+        expect(severityOf(log), `${trailing} trailing lines`).toEqual([1]);
+      }
+    });
+
+    /**
+     * #4682 B1 — the same property in the severity-3 direction. The registry
+     * lane has no in-process recovery, so an alarm naming `registry.db` is
+     * silent data loss whether or not its lane line survived into the scanned
+     * window. The DETECTED line itself interpolates every orphaned target
+     * (`orphaned-db-sweep.ts:213-217`), so the affected LANES are knowable from
+     * the alarm alone and no lookahead may be allowed to overrule it.
+     */
+    it("keeps severity 3 for a registry.db alarm whose lane line is absent", () => {
+      // A truncated log tail: the alarm and the history reopen survive, the
+      // registry lane line does not. Trusting the missing veto line downgrades
+      // real, unrecoverable `registry.db` loss to informational.
+      const log = [detect(1, "/state/registry.db"), reopened].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 for an unowned-lane alarm whose lane line is absent", () => {
+      const log = [detect(1, "/state/grants.db"), reopened].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 when the alarm names history AND registry", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db (deleted), fd=14 /state/registry.db" +
+          " (deleted) — another process unlinked these files while we held them open.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 when the alarm's target list cannot be parsed", () => {
+      // Fail toward the alarm: an emitter format change must never silently
+      // downgrade a data-loss record.
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 1 deleted-inode" +
+          " DB handle(s): <redacted>",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    /**
+     * #4682 B1 follow-up — a PARTIALLY parseable target list must fail toward
+     * the alarm too. The emitter writes `DETECTED <n>` and then exactly one
+     * `fd=<n> <target>` pair per orphan (`orphaned-db-sweep.ts:211-217`), so
+     * the count and the pair list are 1:1 by construction. Reading only the
+     * pairs makes the verdict depend on the alarm line arriving INTACT: a
+     * short/interleaved `write()` on the supervisor's stderr for an alarm line
+     * over `PIPE_BUF` — reachable exactly when many fds are orphaned, i.e. the
+     * worst incident — truncates the list, and the surviving `history.db` pair
+     * then launders a real `registry.db` loss down to severity 1. Cross-checking
+     * the count makes the truncation visible from the alarm line alone.
+     */
+    it("keeps severity 3 when the alarm declares more handles than it lists", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    /**
+     * The sharp case. The emitter logs the history lane BEFORE the registry
+     * lane (`orphaned-db-sweep.ts:219-238`), so the registry veto line lands
+     * AFTER the reopen line. If a truncated alarm hid `registry.db` from the
+     * lane list, a verdict that reads ONLY the first sweep line after the alarm
+     * never sees the intact `registry.db … rows written since the last
+     * checkpoint are LOST.` line sitting right there in the log, and books
+     * severity 1 on unrecoverable loss.
+     */
+    it("keeps severity 3 when a registry lane line follows the reopen line", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db",
+        reopened,
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — the turnsDb handle" +
+          " is captured by value into long-lived wiring, so closing it would leave those" +
+          " consumers on a closed handle. RESTART the gateway to recover; subagent/turn" +
+          " rows written since the last checkpoint are LOST.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 when an unowned lane line follows the reopen line", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db",
+        reopened,
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found orphaned handle(s)" +
+          " on grants.db, which no recovery lane owns — the gateway cannot reopen them in" +
+          " place. RESTART the gateway to recover; rows written to those files since the" +
+          " last checkpoint are LOST.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    /**
+     * Isolates the VETO from the count cross-check: this alarm is entirely
+     * self-consistent (`DETECTED 1` / one `fd=` pair / history lane), so the
+     * count check passes it and only a lane-line veto can keep the severity.
+     * Today's emitter cannot produce this shape — the registry line is emitted
+     * only for a name in the alarm's own list (`orphaned-db-sweep.ts:231-238`)
+     * — which is the point: this is the standing guarantee that an intact
+     * "rows … are LOST" line in the tick is never overruled by whatever the
+     * alarm line happens to say, so an emitter change cannot re-open the
+     * downgrade path a second time.
+     */
+    it("an intact registry lane line vetoes recovery even on a consistent alarm", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        reopened,
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — RESTART the" +
+          " gateway to recover; subagent/turn rows written since the last checkpoint" +
+          " are LOST.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    /**
+     * The count cross-check is a COMPLETENESS test, not a lane test: a full,
+     * self-consistent multi-handle history-only alarm still books severity 1.
+     */
+    it("still books severity 1 for a complete multi-handle history alarm", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db (deleted), fd=14 /state/history.db-wal" +
+          " (deleted) — another process unlinked these files while we held them open.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+    });
+
+    /**
+     * The veto must stay a property of THIS tick. A later tick's own alarm ends
+     * the scan, so its lane lines can never be charged to an earlier, genuinely
+     * recovered one — otherwise the veto would reintroduce exactly the
+     * log-growth dependence #4682 B1 removed.
+     */
+    it("a LATER tick's registry lane does not re-arm an earlier recovered alarm", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        reopened,
+        detect(1, "/state/registry.db"),
+        "2026-08-12T03:05:00Z telegram gateway: orphaned-db-sweep found an orphaned" +
+          " registry.db handle. An in-process reopen is NOT safe here — RESTART the" +
+          " gateway to recover; subagent/turn rows written since the last checkpoint" +
+          " are LOST.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1, 3]);
+    });
+
+    /**
+     * The two lane lines the veto deliberately does NOT carry: the sticky
+     * closed-history line and a FAILED reopen both also fire from the
+     * no-DETECTED retry path (`orphaned-db-sweep.ts:253-264`), so vetoing on
+     * them would let a later, unrelated tick flip an earlier recovered alarm —
+     * log-growth dependence again. This tick's OWN failed reopen is already
+     * caught by the first-sweep-line rule (asserted above), so nothing is lost.
+     */
+    it("a later tick's sticky history failure does not re-arm a recovered alarm", () => {
+      const log = [
+        detect(1, "/state/history.db"),
+        reopened,
+        "2026-08-12T03:05:00Z telegram gateway: orphaned-db-sweep history.db is CLOSED and" +
+          " a previous reopen failed (EACCES) — every history read and write is dead and" +
+          " no fd evidence remains. Retrying the reopen; RESTART the gateway if this keeps" +
+          " repeating.",
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+    });
+
+    it("treats history.db-wal alongside history.db as the history lane", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db (deleted), fd=14 /state/history.db-wal" +
+          " (deleted) — another process unlinked these files while we held them open.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+    });
+  });
+
+  /**
+   * #4682 M2 — `countingUnitFor` decides whether the ledger's count-drop
+   * self-verify may compare two scans at all, and it reads a list of gateway
+   * signal names. A hand-written list can silently omit a new signal, handing
+   * that signal a `log-line` unit it was never counted in.
+   *
+   * The EXHAUSTIVENESS guarantee is `tsc`, not this test: `GATEWAY_SIGNAL_NAMES`
+   * is derived from a `Record<GatewaySignal, true>`, so omitting a member is a
+   * compile error (verified: `detect.ts:251`, TS2741). A runtime test cannot
+   * add to that, because every runtime view of the set — `gw_hits`,
+   * `GATEWAY_SIGNAL_NAMES`, `countingUnitFor`'s `GATEWAY_SIGNAL_SET` — is
+   * derived from that same constant, so comparing them to each other is a
+   * tautology that passes even against the hand-written array this was filed
+   * about (measured).
+   *
+   * What this test IS: a tripwire against an INDEPENDENTLY written list. Adding
+   * a gateway signal turns it red here, which is the prompt to confirm the new
+   * signal's ledger counting unit deliberately rather than inherit one. Keep
+   * the literal hand-written — deriving it from the source under test is
+   * exactly what made the previous version vacuous.
+   */
+  describe("every emittable gateway signal carries the gateway-event unit", () => {
+    const EXPECTED_GATEWAY_SIGNALS = [
+      "duplicate-delivery-represent",
+      "orphaned-db-handle",
+      "orphaned-db-handle-recovered",
+      "reply-delivery-failure",
+      "represent-escalation",
+    ] as const;
+
+    it("is exactly the set this test was written against", () => {
+      expect([...GATEWAY_SIGNAL_NAMES].sort()).toEqual([...EXPECTED_GATEWAY_SIGNALS]);
+      expect(Object.keys(detectGatewayFindings("alpha", "").gw_hits).sort()).toEqual([
+        ...EXPECTED_GATEWAY_SIGNALS,
+      ]);
+    });
+
+    it("counts every one of them in gateway-event, not log-line", () => {
+      for (const signal of EXPECTED_GATEWAY_SIGNALS) {
+        expect(
+          countingUnitFor(signal as L0Signal),
+          `${signal} must be counted in gateway-event`,
+        ).toBe("gateway-event");
+      }
+    });
+  });
+
+  describe("gateway findings dedup by event identity, not by log line", () => {
+    it("folds repeated lines for the same origin into one finding", () => {
+      const log = [
+        `2026-08-12T04:00:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+        `2026-08-12T04:01:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+      ].join("\n");
+      const { findings, gw_hits } = detectGatewayFindings("carrie", log);
+      expect(findings).toHaveLength(1);
+      // gw_hits stays the RAW line count — it is the digest's noise readout.
+      expect(gw_hits["duplicate-delivery-represent"]).toBe(2);
+    });
+
+    // `buildLedger` windows AND ranks on `Finding.ts`, so a folded event that
+    // kept the FIRST line's timestamp could age a still-happening cluster out
+    // of the scan window entirely.
+    it("carries the NEWEST line's timestamp and pointer, not the first's", () => {
+      const log = [
+        `2026-07-01T04:00:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+        `2026-08-12T04:01:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+      ].join("\n");
+      const { findings } = detectGatewayFindings("carrie", log);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ts).toBe("2026-08-12T04:01:00Z");
+      expect(findings[0]?.log_pointer).toBe("logs/carrie/gateway-supervisor.log:2");
+    });
+
+    // `log_pointer` is the line the operator greps to check the `ts` the ledger
+    // windowed and ranked on. If a newest line with an unparseable timestamp
+    // advanced the pointer while `ts` fell back to an earlier line, the finding
+    // would claim line 2 as evidence for a timestamp that only line 1 carries.
+    it("does not advance the pointer past the line its `ts` came from", () => {
+      const log = [
+        `2026-08-12T04:00:00Z gateway: represent duplicate-send origin=${ORIGIN}`,
+        `gateway: represent duplicate-send origin=${ORIGIN}`, // no ISO prefix
+      ].join("\n");
+      const { findings } = detectGatewayFindings("carrie", log);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ts).toBe("2026-08-12T04:00:00Z");
+      expect(findings[0]?.log_pointer).toBe("logs/carrie/gateway-supervisor.log:1");
+    });
+
+    it("keeps DISTINCT origins as distinct findings", () => {
+      const log = [
+        `2026-08-12T04:00:00Z gateway: represent duplicate-send origin=${CHAT}:_#1`,
+        `2026-08-12T04:01:00Z gateway: represent duplicate-send origin=${CHAT}:_#2`,
+      ].join("\n");
+      expect(detectGatewayFindings("carrie", log).findings).toHaveLength(2);
+    });
+
+    it("keeps one-finding-per-line when the line carries NO origin id", () => {
+      const log = [
+        "2026-08-12T04:00:00Z gateway: represent duplicate-send",
+        "2026-08-12T04:01:00Z gateway: represent duplicate-send",
+      ].join("\n");
+      expect(detectGatewayFindings("carrie", log).findings).toHaveLength(2);
+    });
   });
 });
 
@@ -295,7 +794,12 @@ describe("scanAgent escalation decision", () => {
   });
 
   it("does NOT escalate on a represent-escalation alone", () => {
-    const res = scanAgent("alpha", turn(1, {}), "gateway: obligation escalation");
+    const res = scanAgent(
+      "alpha",
+      turn(1, {}),
+      `telegram gateway: obligation escalation delivered + closed origin=${CHAT}:_#44`,
+    );
+    expect(res.gw_hits["represent-escalation"]).toBe(1);
     expect(res.escalate).toBe(false);
   });
 

@@ -11,8 +11,12 @@
  * scoring is arithmetic, exactly as the RFC specifies.
  */
 
-import type { FleetHealthFailureMode } from "../web/fleet-health-read.js";
+import type {
+  FleetHealthCountingUnit,
+  FleetHealthFailureMode,
+} from "../web/fleet-health-read.js";
 import type { L0Signal, Finding } from "./detect.js";
+import { GATEWAY_SIGNAL_NAMES } from "./detect.js";
 
 /** How one L0 signal classifies: its failure mode, severity (1-3), the job
  *  spec it maps to, and the stable dedup-key signature fragment. */
@@ -98,6 +102,22 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     severity: 3,
     job_spec: "survive-reboots-and-real-life",
     signature: "orphaned-db-handle:deleted-inode-writes",
+  },
+  "orphaned-db-handle-recovered": {
+    // #4680 — the same alarm, but the sweep reopened `history.db` in the same
+    // tick and proved the new handle durable (the 2026-08-12 occurrence
+    // recovered in 20ms), with no lane left un-recovered. The rows written
+    // before the reopen are still gone, so the operator is still told — but a
+    // guard that fired and self-healed is not the silent-loss incident severity
+    // 3 describes, and booking it as one is exactly the success-theater
+    // inversion this ledger exists to avoid. severity 1, informational: the
+    // same split `flush-recovered-turn` makes against `silent-no-op-candidate`.
+    // Anything left un-recovered in the tick (registry.db, an unowned handle, a
+    // FAILED reopen) stays `orphaned-db-handle` at severity 3.
+    failure_mode: "drift",
+    severity: 1,
+    job_spec: "survive-reboots-and-real-life",
+    signature: "orphaned-db-handle:recovered-in-tick",
   },
   "hang-long-stalled": {
     failure_mode: "partial",
@@ -227,6 +247,74 @@ export const ALL_JOB_SPECS: readonly string[] = [
 
 export function mapSignal(signal: L0Signal): SignalMapping {
   return SIGNAL_MAP[signal];
+}
+
+const GATEWAY_SIGNAL_SET: ReadonlySet<string> = new Set(GATEWAY_SIGNAL_NAMES);
+
+/** The unit every issue written before #4680 was counted in. A prior ledger
+ *  carries no `counting_unit` field, so this is what its absence means. */
+export const LEGACY_COUNTING_UNIT: FleetHealthCountingUnit = "log-line";
+
+/**
+ * The unit this signal's ledger `frequency` counts in.
+ *
+ * #4680 rule 3 folds gateway findings by event identity, so a gateway signal's
+ * frequency counts distinct affected TURNS wherever the log line carries an
+ * `origin=`/`tid=` turn id, and falls back to one finding per line where it
+ * does not (`detectGatewayFindings`). `gateway-event` names that folded unit —
+ * it is not a promise that every line was folded, only that the count is NOT
+ * comparable with a pre-#4680 `log-line` count. Every non-gateway signal is one
+ * finding per artifact.
+ *
+ * This exists so `buildLedger` can tell a genuine count DROP (someone fixed
+ * the defect) from a change of RULER (the same defect, measured differently).
+ * The two are indistinguishable from the number alone, and conflating them
+ * makes the sensor post "Verified count-drop" on a live GitHub issue nobody
+ * touched — the exact success-theater inversion the ledger exists to catch.
+ */
+export function countingUnitFor(signal: L0Signal): FleetHealthCountingUnit {
+  return GATEWAY_SIGNAL_SET.has(signal) ? "gateway-event" : "log-line";
+}
+
+/**
+ * Signals that are RECLASSIFICATIONS of one another: the same detected
+ * artifact, sorted into a different severity by its OUTCOME. A finding can move
+ * between the members of a group when the detector's classifier changes, or
+ * when a real occurrence's outcome differs from the last one's.
+ *
+ * #4682 B1 — this is what the counting-unit guard cannot see. That guard
+ * compares a prior issue with THIS scan's issue under the SAME dedup_key, but
+ * a reclassification does not shrink a key's count: it EMPTIES the key and
+ * fills a sibling. The old key then falls to `buildLedger`'s close-on-zero
+ * path, which is otherwise the honest "someone fixed it" path, and gh-sync
+ * comments "Verified count-drop … Closed by the Fleet Health sensor." on a
+ * defect that was merely re-filed. Zero occurrences really is zero, so the
+ * close itself is correct — the CLAIM attached to it is not.
+ */
+const RECLASSIFICATION_GROUPS: readonly (readonly L0Signal[])[] = [
+  ["orphaned-db-handle", "orphaned-db-handle-recovered"],
+  ["silent-no-op-candidate", "flush-recovered-turn"],
+];
+
+/** dedup_key → the dedup_keys its findings can reclassify into. Derived from
+ *  `SIGNALS` via `mapSignal`, so a signature or job-spec edit cannot leave a
+ *  stale hand-written key behind. */
+const SIBLING_DEDUP_KEYS: ReadonlyMap<string, readonly string[]> = (() => {
+  const m = new Map<string, string[]>();
+  for (const group of RECLASSIFICATION_GROUPS) {
+    const keys = group.map((s) => {
+      const map = mapSignal(s);
+      return `${map.job_spec}:${map.signature}`;
+    });
+    for (const key of keys) m.set(key, keys.filter((k) => k !== key));
+  }
+  return m;
+})();
+
+/** The dedup_keys `key`'s findings can reclassify into. Empty for a signal
+ *  with no sibling. */
+export function siblingDedupKeys(key: string): readonly string[] {
+  return SIBLING_DEDUP_KEYS.get(key) ?? [];
 }
 
 /** The stable dedup key for a finding: `<job_spec>:<signature>`. One GitHub

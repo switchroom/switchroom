@@ -106,7 +106,13 @@ import {
   runOrphanedDbSweepTick,
   startOrphanedDbSweep,
 } from '../gateway/orphaned-db-sweep.js'
-import { GATEWAY_SIGNATURES } from '../../src/fleet-health/detect.js'
+import { GATEWAY_SIGNATURES, detectGatewayFindings } from '../../src/fleet-health/detect.js'
+import { mapSignal } from '../../src/fleet-health/mapping.js'
+
+/** Severity the fleet-health ledger would book for a real sweep log. */
+function ledgerSeverities(log: string): number[] {
+  return detectGatewayFindings('uat', log).findings.map((f) => mapSignal(f.signal).severity)
+}
 
 /**
  * `/proc/self/fd` is Linux-only. Without this guard every detection test would
@@ -294,6 +300,13 @@ describe.skipIf(!onLinux)('orphaned-db-sweep — history.db recovery', () => {
     // alarm has no consumer.
     expect(GATEWAY_SIGNATURES['orphaned-db-handle'].test(log)).toBe(true)
 
+    // #4680 — but this tick RECOVERED: the reopen landed in the same tick and
+    // the writer self-check proved the handle durable. The ledger must book
+    // that as the informational lane, not a severity-3 silent-loss incident.
+    // Asserted against the REAL sweep output, so a wording change in either the
+    // emitter or the detector fails here instead of drifting silently.
+    expect(ledgerSeverities(log)).toEqual([1])
+
     // 7. THE FIX, half one: the deleted-inode handles are actually GONE. A
     //    close that leaves un-finalized statements behind leaves them open
     //    (measured), so this is the assertion that pins the hard close.
@@ -439,6 +452,9 @@ describe.skipIf(!onLinux)('orphaned-db-sweep — registry.db and unowned lanes',
       expect(log).toContain('registry.db')
       expect(log).toContain('RESTART')
       expect(GATEWAY_SIGNATURES['orphaned-db-handle'].test(log)).toBe(true)
+      // #4680 — the registry lane has NO in-process recovery, so it stays the
+      // severity-3 alarm. This is the half of the split that must not be lost.
+      expect(ledgerSeverities(log)).toEqual([3])
 
       // Detection ONLY: the raw handle is left alone, so its consumers (the
       // by-value `turnsDb` captures in gateway.ts) are never handed a closed DB.

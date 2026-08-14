@@ -405,10 +405,88 @@ the 23 `reference/jobs/*.md`) and a taxonomy class + severity:
 | `killed-incomplete-turn` | missed-trigger | 3 | `steer-or-queue-mid-flight` | the turn was abandoned incomplete while in progress |
 | `represent-escalation` | drift | 1 | `feel-like-a-colleague` | the gateway had to nudge on the agent's behalf — UX-friction, informational (does not alone open a sev-3 issue) |
 
-Note: `represent-escalation` (`/obligation escalation/`) is an added sev-1
-*informational* signal beyond the two precise delivery signatures — it flags
-UX-friction, not a delivery failure, and does not alone open a sev-3 issue, so
-it is not scope creep on the delivery-signature detection.
+Note: `represent-escalation` is an added sev-1 *informational* signal beyond the
+two precise delivery signatures — it flags UX-friction, not a delivery failure,
+and does not alone open a sev-3 issue, so it is not scope creep on the
+delivery-signature detection. Its signature matches the two TERMINAL escalation
+outcomes only (`delivered + closed`, `PERMANENTLY undeliverable`), for the same
+attempt-vs-outcome reason as `reply-delivery-failure` (#3931): the bare
+`/obligation escalation/` substring also matched the per-attempt retry line and
+the `deferred — bridge down` SUPPRESSION line, so the guard *declining* to
+escalate while the bridge was down was booked as a failure.
+
+`orphaned-db-handle` splits on recovery rather than on attempt: an alarm whose
+sweep tick also logged `reopened history.db — writes are durable again`, with no
+lane left un-recovered, is emitted as `orphaned-db-handle-recovered` (drift, sev
+1, `survive-reboots-and-real-life`). A tick that left `registry.db`, an unowned
+handle, or a FAILED reopen behind stays `orphaned-db-handle` at sev 3 — that is
+genuine silent loss.
+
+**The verdict is derived from the tick's CONTENT, never from how many lines
+follow it.** Which lanes a tick hit is stated by the alarm line itself (it
+interpolates every orphaned fd's target), and `history.db*` is the only lane
+with an in-process recovery; whether that lane recovered is stated by the first
+`orphaned-db-sweep` line after the alarm, which the emitter logs with no `await`
+in between. A line-count lookahead would instead make the answer depend on when
+the scan ran — the same alarm+reopen pair reading sev 1 at the log tail and sev
+3 once ordinary traffic accumulated behind it — and because the two verdicts
+carry different signatures, a flip would migrate the finding between dedup_keys
+and empty the old one, which the writer reads as a fix-to-zero.
+
+A gateway finding is one EVENT, not one log line: matched lines carrying the
+same `origin=` turn id fold into a single finding for that signal, so ledger
+`frequency` counts distinct affected turns. Lines with no origin id keep
+one-finding-per-line.
+
+**A change of counting UNIT is not a count-drop.** `frequency` is a count, and
+the count-drop self-verify below closes an issue when it falls — so changing
+what an occurrence *is* makes every open issue on that signal look fixed, with
+nothing fixed. Each issue therefore records the `counting_unit` its `frequency`
+was measured in (`log-line` or `gateway-event`; absent means the legacy
+`log-line`). When the unit differs from the prior ledger's, the writer holds the
+issue's status for exactly one scan instead of advancing it toward closure. The
+issue is rewritten carrying the new unit, so the next scan compares like with
+like and a genuine drop still closes it — a real close is delayed by one scan,
+never suppressed. Reopening is still allowed: a count above the threshold cannot
+produce a false "fixed" claim. Without this the fold above would have flipped
+every live gateway issue to `resolved-pending-verify` on the first post-merge
+scan and had `gh-sync` comment "Verified count-drop … Closed by the Fleet Health
+sensor." on issues nobody touched — the board lying, which is the one failure
+this ledger exists to prevent.
+
+"Never suppressed" is only true because the count-drop arm tests `count <
+prior.frequency`, not `prior.frequency > RESOLVED_THRESHOLD`. The hold REWRITES
+`frequency` to the post-fold count, so an issue held at 3 carries a prior
+frequency of 3 from then on and would never satisfy `> 3` again — under that
+test a held issue could only ever leave the board through the zero path, i.e.
+stale-open on GitHub however much of it got fixed.
+
+**A key emptied by RECLASSIFICATION is not a verified fix either.** The unit
+guard compares a prior issue with this scan's issue under the SAME dedup_key,
+but findings that re-sort into a sibling signature (`orphaned-db-handle` →
+`orphaned-db-handle-recovered`, `silent-no-op-candidate` →
+`flush-recovered-turn`) EMPTY the old key and fill the sibling's, which reads as
+a drop to zero. Zero occurrences really is zero, so the issue does close — but
+the writer records `close_reason: "reclassified"` (naming the sibling keys the
+evidence moved to) and `gh-sync` posts that instead of a "Verified count-drop"
+claim nobody earned. And because any close can turn out to be premature, an
+issue whose defect reappears after closing is marked `reopened` and `gh-sync`
+runs `gh issue reopen` — `gh issue edit` refreshes a closed issue's body without
+reopening it, so without that the board would say "fixed" forever while the
+sensor found the defect every night.
+
+**The reopen path is a one-scan window.** The close-on-zero loop only carries a
+prior key forward when its status is `open` or `resolved-pending-verify`
+(`ledger.ts:283-287`), so a `closed` issue that stays quiet is dropped from the
+ledger on the very NEXT scan and its `gh_issue` number goes with it. A defect
+that returns on the immediately following scan is reopened on the original
+thread; one that returns two or more scans later has nothing left to reopen and
+falls through to `gh-sync`'s create path, filing a FRESH issue for the same
+`dedup_key`. That is deliberate — the alternative is an unbounded tombstone list
+of every key ever closed — and it costs continuity, not correctness: the board
+never claims "fixed" while the defect is live either way. It is stated here
+because the window is invisible in the code, and a change to it silently changes
+which incidents keep their history.
 
 The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
 
