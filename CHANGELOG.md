@@ -86,6 +86,12 @@ now an anomaly worth investigating, not the norm.
   which `Number()` coerces to `0`) is treated as unset, so a stray space in an
   env file cannot silently turn a guard off.
 
+  The router's `answerRouteOverrides.note(...)` write is the whole premise of the
+  reroute fallback, and it is a side effect no pure module carries — so it is now
+  pinned by a test that drives the real gateway router against the real registry
+  (`answer-route-side-effect.test.ts`). Deleting that one call previously left
+  the entire suite green while silently restoring the nag.
+
   **Scope:** this fixes the ESCALATE branch only. It narrows the standing
   duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
   the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped

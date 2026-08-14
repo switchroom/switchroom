@@ -1156,6 +1156,21 @@ describe("obligationSweep escalate branch — nag only when the answer really is
 // This drives BOTH through the REAL router (`resolveAnswerThreadId`), so the
 // routed thread is not a hand-picked constant, and asserts they agree on every
 // combination of authority / explicit topic / anchor chat.
+//
+// TWO THINGS THIS MATRIX DOES NOT PROVE, and where they are proved instead:
+//   1. That the gateway CALLS either side. Every case here re-spells
+//      `resolveAnswerThreadWithLog`'s body and notes on its OWN registry
+//      instance, so deleting `answerRouteOverrides.note(...)` from gateway.ts
+//      leaves all 64 green — see `tests/answer-route-side-effect.test.ts`, which
+//      drives the real gateway function against the real singleton.
+//   2. Individual clauses of the marker's predicate. Driving the REAL router is
+//      what makes the routed thread honest, but it also makes some combinations
+//      unreachable: with authority off (case 8) the router returns the explicit
+//      topic, and a dropped cross-chat anchor falls back to it too, so
+//      `threadId !== explicit` is never true on either arm. Dropping the
+//      `frameworkTopicAuthority` clause, or swapping the filtered anchors for
+//      the raw turns, therefore survives all 64 — both are pinned directly on
+//      the pure formatter in `gateway/reply-route-log.test.ts`.
 describe("the recorded override and the EXPLICIT_OVERRIDDEN marker cannot drift apart", () => {
   const TARGET = "-100999";
   const OTHER = "-100888";

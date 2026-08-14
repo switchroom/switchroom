@@ -3920,8 +3920,13 @@ function resolveReplyOwnerTurn(
  * `originVia` distinguishes how the origin turn was resolved: 'echo' (model
  * echoed origin_turn_id), 'quoted' (framework recovered it from args.reply_to),
  * or null (no origin turn). It only affects the `via` label, never the routing.
+ *
+ * Exported ONLY as a test seam: the `answerRouteOverrides.note()` call below is
+ * a SIDE EFFECT no pure module carries, so nothing else can prove it still
+ * happens (`answer-route-side-effect.test.ts`). No production caller — the
+ * gateway still hands it to `sendReply` through the deps object.
  */
-function resolveAnswerThreadWithLog(
+export function resolveAnswerThreadWithLog(
   chatId: string,
   explicitThreadId: number | undefined,
   originTurn: CurrentTurn | null,
