@@ -15,6 +15,53 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Bug fixes
+
+- **an obligation ESCALATION no longer nags on top of an answer the user
+  already received.** The escalate branch of the obligation sweep sends a
+  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
+  staleness check that is supposed to stand it down when the agent has already
+  answered. Two mechanisms let that check miss a delivered answer, and both fired
+  together on the two confirmed 2026-08-10 incidents. First it was keyed on the
+  obligation's *thread*, while the model can name a topic on its `reply` and have
+  the framework's topic authority override it — the router logs exactly that,
+  `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — so the answer is written to history
+  under a thread the check never queries (06:36:07.921
+  `EXPLICIT_OVERRIDDEN(model→4,routed→635)` for an obligation in thread 4, nag
+  126ms later; 07:52 the same shape with the answer routed to the chat root).
+  Second it is a point-in-time read, and the answer is often still *in flight* at
+  the instant the sweep decides — the reply tool has been invoked but no history
+  row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
+  07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
+  and adds a fallback to *only* the threads the router RECORDED an answer
+  addressed to this obligation's topic as having been routed to (new
+  `answer-route-overrides.ts`), and a new settle gate requires the "unanswered"
+  read to hold across an 8.5s window — derived as 3× the worst observed
+  decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
+  tick so a re-check actually runs — before the nudge goes out. The fallback is
+  deliberately NOT chat-wide: a "did anything long land in this chat" query has
+  no relationship to the obligation, and in a busy forum it would silently close
+  an unanswered obligation in topic A because an unrelated answer landed in topic
+  B — the exact defect `turn-flush-suppression.ts` was written to close, and the
+  exact shape of the 2026-08-13 incident where an answer to a *different*
+  question in another topic would have swallowed a genuinely unanswered message.
+  Both guards stay bounded: a genuinely unanswered obligation still escalates one
+  settle window later (the 2026-08-12 case, whose real answer was 41s away, is
+  unaffected), the settle window is clamped at 60s so a config typo cannot
+  suppress escalation for a day, and a fallback-scope close logs `via=reroute`
+  so its blast radius is measurable in production. New
+  `escalation-staleness.ts` carries the evidence and the derivation; kill switch
+  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0`.
+
+  **Scope:** this fixes the ESCALATE branch only. It narrows the standing
+  duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
+  the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped
+  at both its cutoffs, the #4341 delivery-time backstop in
+  `represent-delivery-guard.ts` forwards that same `threadId` and is therefore
+  cross-topic-blind too, and the represent branch has no settle gate at all, so a
+  re-present can still fire on top of a rerouted or in-flight answer. Tracked in
+  switchroom/switchroom#4700.
+
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 
 ### Bug fixes
@@ -290,51 +337,6 @@ now an anomaly worth investigating, not the norm.
   incident it did catch.
 
 ### Bug fixes
-
-- **an obligation ESCALATION no longer nags on top of an answer the user
-  already received.** The escalate branch of the obligation sweep sends a
-  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
-  staleness check that is supposed to stand it down when the agent has already
-  answered. Two mechanisms let that check miss a delivered answer, and both fired
-  together on the two confirmed 2026-08-10 incidents. First it was keyed on the
-  obligation's *thread*, while the model can name a topic on its `reply` and have
-  the framework's topic authority override it — the router logs exactly that,
-  `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — so the answer is written to history
-  under a thread the check never queries (06:36:07.921
-  `EXPLICIT_OVERRIDDEN(model→4,routed→635)` for an obligation in thread 4, nag
-  126ms later; 07:52 the same shape with the answer routed to the chat root).
-  Second it is a point-in-time read, and the answer is often still *in flight* at
-  the instant the sweep decides — the reply tool has been invoked but no history
-  row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
-  07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
-  and adds a fallback to *only* the threads the router RECORDED an answer
-  addressed to this obligation's topic as having been routed to (new
-  `answer-route-overrides.ts`), and a new settle gate requires the "unanswered"
-  read to hold across an 8.5s window — derived as 3× the worst observed
-  decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
-  tick so a re-check actually runs — before the nudge goes out. The fallback is
-  deliberately NOT chat-wide: a "did anything long land in this chat" query has
-  no relationship to the obligation, and in a busy forum it would silently close
-  an unanswered obligation in topic A because an unrelated answer landed in topic
-  B — the exact defect `turn-flush-suppression.ts` was written to close, and the
-  exact shape of the 2026-08-13 incident where an answer to a *different*
-  question in another topic would have swallowed a genuinely unanswered message.
-  Both guards stay bounded: a genuinely unanswered obligation still escalates one
-  settle window later (the 2026-08-12 case, whose real answer was 41s away, is
-  unaffected), the settle window is clamped at 60s so a config typo cannot
-  suppress escalation for a day, and a fallback-scope close logs `via=reroute`
-  so its blast radius is measurable in production. New
-  `escalation-staleness.ts` carries the evidence and the derivation; kill switch
-  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0`.
-
-  **Scope:** this fixes the ESCALATE branch only. It narrows the standing
-  duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
-  the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped
-  at both its cutoffs, the #4341 delivery-time backstop in
-  `represent-delivery-guard.ts` forwards that same `threadId` and is therefore
-  cross-topic-blind too, and the represent branch has no settle gate at all, so a
-  re-present can still fire on top of a rerouted or in-flight answer. Tracked in
-  switchroom/switchroom#4700.
 
 - **the three Claude CLI version pins are now held in lockstep by an
   executable check, not by prose.** The bundled CLI version is written down in
