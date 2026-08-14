@@ -194,7 +194,13 @@ TTS_MAX_CHARS = int(os.environ.get("VOICE_TTS_MAX_CHARS", "1200"))
 # is enforced as the ceiling regardless of what the env asks for; 500 is the
 # default because a little headroom costs nothing measurable (+1.5% batches on
 # the production corpus) and keeps the seam choice ours.
-TTS_MAX_PHONEMES = max(1, min(508, int(os.environ.get("VOICE_TTS_MAX_PHONEMES", "500"))))
+#
+# The clamp is silent-by-value but not silent-by-log: an operator who sets 600
+# (or 0) would otherwise never learn the value did not take. main() warns —
+# see _max_phonemes_clamp_warning.
+TTS_MAX_PHONEMES_CEILING = 508
+TTS_MAX_PHONEMES_REQUESTED = int(os.environ.get("VOICE_TTS_MAX_PHONEMES", "500"))
+TTS_MAX_PHONEMES = max(1, min(TTS_MAX_PHONEMES_CEILING, TTS_MAX_PHONEMES_REQUESTED))
 # Defence-in-depth ceiling on the raw JSON body (text is otherwise unbounded,
 # chunked internally). 256KB ≈ ~40k chars of UTF-8 — far above any real reply.
 TTS_MAX_BODY_BYTES = int(os.environ.get("VOICE_TTS_MAX_BODY_BYTES", str(256 * 1024)))
@@ -1379,9 +1385,25 @@ def _parse_multipart(body: bytes, content_type: str):
     return audio, language
 
 
+def _max_phonemes_clamp_warning() -> str | None:
+    """The warning to emit when VOICE_TTS_MAX_PHONEMES did not take as set, or
+    None when it did. Split out so the message is testable without a boot."""
+    if TTS_MAX_PHONEMES == TTS_MAX_PHONEMES_REQUESTED:
+        return None
+    return (
+        f"WARNING: VOICE_TTS_MAX_PHONEMES={TTS_MAX_PHONEMES_REQUESTED} is out "
+        f"of range and was clamped to {TTS_MAX_PHONEMES}; the ceiling is "
+        f"{TTS_MAX_PHONEMES_CEILING} because kokoro-onnx flushes a batch at "
+        ">= MAX_PHONEME_LENGTH (510) and the floor is 1"
+    )
+
+
 def main() -> int:
     if not SHARED_TOKEN:
         _log("WARNING: VOICE_SIDECAR_TOKEN is empty — every /stt and /tts call will 401")
+    _clamp_warning = _max_phonemes_clamp_warning()
+    if _clamp_warning:
+        _log(_clamp_warning)
     threading.Thread(target=_load_model, daemon=True).start()
     threading.Thread(target=_load_tts, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler)

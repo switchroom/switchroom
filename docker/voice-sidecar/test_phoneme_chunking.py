@@ -395,6 +395,47 @@ class LossyPathIsLoudTests(unittest.TestCase):
         self.assertFalse([line for line in self.logged if "WARNING" in line])
 
 
+class MaxPhonemesClampTests(unittest.TestCase):
+    """VOICE_TTS_MAX_PHONEMES is clamped to [1, 508]. A clamp that changes the
+    operator's value must say so, or the real ceiling is undiscoverable."""
+
+    def setUp(self) -> None:
+        self._orig = (server.TTS_MAX_PHONEMES_REQUESTED, server.TTS_MAX_PHONEMES)
+
+    def tearDown(self) -> None:
+        server.TTS_MAX_PHONEMES_REQUESTED, server.TTS_MAX_PHONEMES = self._orig
+
+    def _set(self, requested: int) -> None:
+        server.TTS_MAX_PHONEMES_REQUESTED = requested
+        server.TTS_MAX_PHONEMES = max(
+            1, min(server.TTS_MAX_PHONEMES_CEILING, requested)
+        )
+
+    def test_in_range_value_is_not_warned(self) -> None:
+        self._set(500)
+        self.assertIsNone(server._max_phonemes_clamp_warning())
+
+    def test_too_high_is_warned_with_both_numbers(self) -> None:
+        self._set(600)
+        warning = server._max_phonemes_clamp_warning()
+        self.assertIsNotNone(warning)
+        self.assertIn("WARNING", warning)
+        self.assertIn("600", warning)
+        self.assertIn("508", warning)
+
+    def test_zero_is_warned(self) -> None:
+        # 0 clamps to 1, which would hard-cut every single phoneme — the worst
+        # possible silent misconfiguration.
+        self._set(0)
+        warning = server._max_phonemes_clamp_warning()
+        self.assertIsNotNone(warning)
+        self.assertIn("WARNING", warning)
+        self.assertIn("clamped to 1", warning)
+
+    def test_ceiling_matches_kokoros_off_by_one(self) -> None:
+        self.assertEqual(server.TTS_MAX_PHONEMES_CEILING, MAX_PHONEME_LENGTH - 2)
+
+
 class EspeakPhonemizeTests(unittest.TestCase):
     """The espeak path is phonemized here so it can be phoneme-chunked too."""
 
