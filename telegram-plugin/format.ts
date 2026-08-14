@@ -99,9 +99,26 @@ export function codeSpanSafe(s: string): string {
  * `\` first (so we never double-escape a following escape), then BOTH `(` and
  * `)` — the whole URL is preserved balanced and micromark decodes it back to
  * the original href on round-trip. Bot API 10.1 lists `(`/`)` as escapable.
+ *
+ * WHITESPACE and control characters are PERCENT-ENCODED rather than
+ * backslash-escaped. A bare link destination ends at the first ASCII
+ * whitespace character, so a space or a newline inside the href does not just
+ * truncate the URL — the remainder is re-read as a link title, or (for a
+ * newline) the inline link is terminated outright, leaving a structurally
+ * broken construct with URL fragments visible as prose. Backslash cannot
+ * rescue that: whitespace is not escapable in a bare destination. `%20` /
+ * `%0A` are the canonical URL encodings, so the href a client resolves is
+ * equivalent to the one the author wrote.
  */
 export function escapeLinkHref(href: string): string {
-  return href.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)')
+  return href
+    .replace(/\\/g, '\\\\')
+    .replace(/\(/g, '\\(')
+    .replace(/\)/g, '\\)')
+    .replace(
+      /[\x00-\x20\x7f]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`,
+    )
 }
 
 /**
