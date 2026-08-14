@@ -40,6 +40,10 @@ now an anomaly worth investigating, not the norm.
   Correctly expanding a decimal/comma-glued number is out of scope for this
   narrow hotfix and is left for a follow-up.
 
+### Features
+
+- **voice: flag-gated raw-markdown speech capture (PR-0)**
+
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 
 ### Fixed
