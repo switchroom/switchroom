@@ -391,18 +391,35 @@ function findClosingTag(items: HtmlFoldItem[], from: number, name: string): numb
 }
 
 /** Flatten a folded run to literal text, or null when any child carries
- *  structure a code span cannot represent. Used for `<code>`. */
+ *  structure a code span cannot represent. Used for `<code>`. Deliberately
+ *  accepts ONLY `plain`: an inner `code` node's own backticks are not in its
+ *  `text`, so folding it in would silently DELETE them
+ *  (`<code>a `b` c</code>` -> `` `a b c` ``), and a `raw` node's wire bytes
+ *  would be swallowed into a literal span. Both degrade to the children
+ *  instead, which preserves every byte. */
 function inlineLiteralText(nodes: Inline[]): string | null {
   let out = "";
   for (const n of nodes) {
-    if (n.type === "plain" || n.type === "code" || n.type === "raw") out += n.text;
-    else return null;
+    if (n.type !== "plain") return null;
+    out += n.text;
   }
   return out;
 }
 
-/** Apply the three-bucket HTML policy over a mixed tag/inline stream. */
-function foldHtmlItems(items: HtmlFoldItem[]): Inline[] {
+/**
+ * Apply the three-bucket HTML policy over a mixed tag/inline stream.
+ *
+ * `active` carries the emphasis constructs already open in an ANCESTOR fold.
+ * Markdown cannot nest same-kind emphasis — `**a **b** c**` is asterisk soup
+ * on the reader's screen, not nested bold — so a tag whose target is already
+ * active degrades to its children. Combined with the single-child unwrap in
+ * `buildFoldedTag`, `<b>a <b>b</b> c</b>` and `<b>**already**</b>` both come
+ * out as ONE bold run.
+ */
+function foldHtmlItems(
+  items: HtmlFoldItem[],
+  active: ReadonlySet<HtmlFoldTarget> = new Set(),
+): Inline[] {
   const out: Inline[] = [];
   let i = 0;
   while (i < items.length) {
@@ -436,13 +453,17 @@ function foldHtmlItems(items: HtmlFoldItem[]): Inline[] {
     }
     if (target !== undefined && tag.kind === "open") {
       const close = findClosingTag(items, i + 1, tag.name);
-      if (close >= 0) {
-        const inner = foldHtmlItems(items.slice(i + 1, close));
-        const start = it.start;
-        const end = items[close].end;
-        const folded = buildFoldedTag(target, tag, inner, start, end);
+      const closeItem = close >= 0 ? items[close] : undefined;
+      if (closeItem !== undefined && closeItem.kind === "tag") {
+        const nested = new Set(active);
+        nested.add(target);
+        const inner = foldHtmlItems(items.slice(i + 1, close), nested);
+        const folded = active.has(target)
+          ? null
+          : buildFoldedTag(target, tag, inner, it.start, closeItem.end);
         // A tag we cannot represent faithfully (an `<a>` with no href, a
-        // `<code>` wrapping structure) degrades to its CONTENT — bucket 3.
+        // `<code>` wrapping structure, an emphasis already open above)
+        // degrades to its CONTENT — bucket 3.
         out.push(...(folded !== null ? [folded] : inner));
         i = close + 1;
         continue;
@@ -464,11 +485,12 @@ function buildFoldedTag(
 ): Inline | null {
   switch (target) {
     case "bold":
-      return { type: "bold", children, start, end };
     case "italic":
-      return { type: "italic", children, start, end };
     case "strike":
-      return { type: "strike", children, start, end };
+      // Already exactly that construct (`<b>**already**</b>`) — re-wrapping
+      // would emit `****already****`, which reads as literal asterisks.
+      if (children.length === 1 && children[0].type === target) return children[0];
+      return { type: target, children, start, end };
     case "code": {
       const text = inlineLiteralText(children);
       return text === null ? null : { type: "code", text, start, end };
@@ -533,6 +555,26 @@ function foldTableRow(
   return { cells, ...pos(row) };
 }
 
+/** True for a block that would render to the empty string. Only the raw-HTML
+ *  fold can produce one — a block that is nothing but markup we dropped
+ *  (`<!-- comment -->`, `<hr/>`, `<div></div>` on their own line). Left in,
+ *  each would contribute a spurious `\n\n` separator to the rendered document,
+ *  so they are filtered out at the point blocks are collected. */
+function isEmptyBlock(block: Block): boolean {
+  return block.type === "paragraph" && block.children.length === 0;
+}
+
+/** Fold a run of mdast block nodes, dropping any that render to nothing. */
+function foldBlocks(
+  nodes: ReadonlyArray<RootContent>,
+  source: string,
+  expandableLineStarts: Set<number>,
+): Block[] {
+  return nodes
+    .map((n) => foldBlock(n, source, expandableLineStarts))
+    .filter((b) => !isEmptyBlock(b));
+}
+
 function foldBlock(
   node: RootContent,
   source: string,
@@ -555,7 +597,7 @@ function foldBlock(
       const expandable = expandableLineStarts.has(lineStart(source, p.start));
       return {
         type: "blockquote",
-        children: node.children.map((c) => foldBlock(c, source, expandableLineStarts)),
+        children: foldBlocks(node.children, source, expandableLineStarts),
         expandable,
         ...p,
       };
@@ -569,7 +611,7 @@ function foldBlock(
       };
     case "list": {
       const items: ListItem[] = node.children.map((li) => ({
-        children: li.children.map((c) => foldBlock(c, source, expandableLineStarts)),
+        children: foldBlocks(li.children, source, expandableLineStarts),
         checked: li.checked ?? null,
         // mdast `listItem.spread`: whether this item's block children are
         // separated by a blank line. Tight (false) keeps a paragraph and its
@@ -650,8 +692,6 @@ export function parse(markdown: string): Document {
     mdastExtensions: [gfmFromMarkdown()],
   });
   return {
-    blocks: tree.children.map((child) =>
-      foldBlock(child, markdown, expandableLineStarts),
-    ),
+    blocks: foldBlocks(tree.children, markdown, expandableLineStarts),
   };
 }

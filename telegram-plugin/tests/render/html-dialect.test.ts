@@ -135,7 +135,10 @@ describe("markdown-equivalent HTML tags fold to native constructs (defect 3)", (
   });
 
   it("handles same-name nesting without closing on the inner tag", () => {
-    expect(renderOutbound("<b>a <b>b</b> c</b>").text).toBe("**a **b** c**");
+    // Depth tracking matters: matching the FIRST `</b>` would leave a dangling
+    // ` c` outside the bold run. The inner bold collapses into the outer one
+    // (see the asterisk-soup test below) so every byte lands inside `**…**`.
+    expect(renderOutbound("<b>a <b>b</b> c</b>").text).toBe("**a b c**");
   });
 
   it("passes the wire-verified allowlist through raw", () => {
@@ -189,6 +192,29 @@ describe("markdown-equivalent HTML tags fold to native constructs (defect 3)", (
     // Text between tags is still ordinary prose and must be escaped, or a
     // `[`/`*` in it could re-trigger formatting downstream.
     expect(renderOutbound("<b>a [b] c</b>").text).toBe("**a \\[b\\] c**");
+  });
+
+  it("never emits nested same-kind emphasis (asterisk soup)", () => {
+    // `**a **b** c**` renders as literal asterisks on the reader's screen.
+    expect(renderOutbound("<b>**already**</b>").text).toBe("**already**");
+    expect(renderOutbound("<b>a <b>b</b> c</b>").text).toBe("**a b c**");
+    expect(renderOutbound("<i>*x*</i>").text).toBe("*x*");
+    // DIFFERENT kinds still nest, as markdown allows.
+    expect(renderOutbound("<b><i>bi</i></b>").text).toBe("***bi***");
+  });
+
+  it("never swallows an inner code span's backticks into `<code>`", () => {
+    // Folding the inner `code` node's text would DELETE its backticks
+    // (`a b c`). Degrade to the children instead — every byte survives.
+    expect(renderOutbound("<code>a `b` c</code>").text).toBe("a `b` c");
+    expect(renderOutbound("<code><u>x</u></code>").text).toBe("<u>x</u>");
+  });
+
+  it("does not leave a blank-line hole where a dropped block used to be", () => {
+    // A block that is nothing but dropped markup must not contribute an empty
+    // paragraph and a spurious `\n\n` separator.
+    expect(renderOutbound("a\n\n<!-- c -->\n\nb").text).toBe("a\n\nb");
+    expect(renderOutbound("a\n\n<div></div>\n\nb").text).toBe("a\n\nb");
   });
 
   it("does not treat `a < b` as a tag", () => {
