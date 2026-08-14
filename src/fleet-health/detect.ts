@@ -232,18 +232,41 @@ export const GATEWAY_SIGNATURES: Record<LineMatchedGatewaySignal, RegExp> = {
 };
 
 /**
- * Every signal `detectGatewaySignals` can emit — the line-matched ones plus the
- * `orphaned-db-handle-recovered` split it derives. #4680 rule 3 folds these
- * findings by event identity (the `origin=` turn id) instead of one per log
- * line, so this list is also the authoritative set of signals whose ledger
- * COUNTING UNIT is `gateway-event` (see `countingUnitFor` in `mapping.ts`).
- * Single-sourced here so a new gateway signal cannot be added to the detector
- * and silently miss the ledger's counting-unit guard.
+ * Every signal `detectGatewayFindings` can emit — the line-matched ones plus
+ * the splits it derives. #4680 rule 3 folds these findings by event identity
+ * (the `origin=` turn id) instead of one per log line, so this is also the
+ * authoritative set of signals whose ledger COUNTING UNIT is `gateway-event`
+ * (see `countingUnitFor` in `mapping.ts`).
+ *
+ * #4682 M2 — this is a `Record<GatewaySignal, true>`, not a list, and that is
+ * load-bearing. A hand-written array satisfies `readonly GatewaySignal[]` while
+ * MISSING a member, and nothing else in the codebase would object: a DERIVED
+ * signal (one excluded from `LineMatchedGatewaySignal`, as
+ * `orphaned-db-handle-recovered` is) needs no `GATEWAY_SIGNATURES` entry, so
+ * tsc stays green and `countingUnitFor` silently hands the new signal the
+ * `log-line` unit it was never counted in — re-arming the exact false
+ * "Verified count-drop" auto-close the guard exists to stop. A `Record` keyed
+ * by the union makes an omission a compile error.
  */
-export const GATEWAY_SIGNAL_NAMES: readonly GatewaySignal[] = [
-  ...(Object.keys(GATEWAY_SIGNATURES) as LineMatchedGatewaySignal[]),
-  "orphaned-db-handle-recovered",
-];
+const GATEWAY_SIGNAL_MEMBERS: Record<GatewaySignal, true> = {
+  "duplicate-delivery-represent": true,
+  "represent-escalation": true,
+  "reply-delivery-failure": true,
+  "orphaned-db-handle": true,
+  "orphaned-db-handle-recovered": true,
+};
+
+export const GATEWAY_SIGNAL_NAMES: readonly GatewaySignal[] = Object.keys(
+  GATEWAY_SIGNAL_MEMBERS,
+) as GatewaySignal[];
+
+/** Zeroed `gw_hits` accumulator — derived from the same exhaustive record, so a
+ *  new gateway signal cannot be counted under a key that does not exist. */
+function emptyGwHits(): Record<GatewaySignal, number> {
+  const out = {} as Record<GatewaySignal, number>;
+  for (const name of GATEWAY_SIGNAL_NAMES) out[name] = 0;
+  return out;
+}
 
 /** The sweep's in-process recovery line, logged by `attemptHistoryReopen` the
  *  moment the reopened `history.db` handle passes its post-reopen writer
@@ -253,69 +276,79 @@ export const GATEWAY_SIGNAL_NAMES: readonly GatewaySignal[] = [
 const ORPHANED_DB_RECOVERED_RE =
   /orphaned-db-sweep reopened history\.db — writes are durable again/;
 
-/**
- * Lines that say a lane in THIS tick was left un-recovered — each one is real,
- * unrecovered data loss and must keep the severity-3 alarm even if the history
- * lane reopened alongside it. Verbatim from `orphaned-db-sweep.ts`:
- * registry.db (:233), the unowned lane (:247), history-with-no-reopen-wired
- * (:225), the sticky closed-history lane (:260) and a failed reopen (:285).
- */
-const ORPHANED_DB_UNRECOVERED_RE =
-  /orphaned-db-sweep (?:found an orphaned registry\.db handle|found orphaned handle\(s\) on |found an orphaned history\.db handle but no reopen|history\.db is CLOSED and a previous reopen failed|FAILED to reopen history\.db)/;
+/** Any `orphaned-db-sweep` line. The emitter logs an alarm and every lane line
+ *  for one tick synchronously (`runOrphanedDbSweepTick`, no `await` between
+ *  :210 and :251), so the FIRST sweep line after an alarm is that alarm's own
+ *  tick reporting its history lane. This is the tick boundary — a property of
+ *  the log's CONTENT, not of how many lines happen to follow. */
+const ORPHANED_DB_SWEEP_LINE_RE = /orphaned-db-sweep /;
 
-/** Upper bound on the lookahead for a tick's follow-up lines. One tick emits at
- *  most a handful (alarm + up to three lane lines + the recovery line); the cap
- *  keeps a truncated or interleaved log from scanning the whole file. */
-const ORPHANED_DB_TICK_LOOKAHEAD = 12;
+/** Each `fd=<n> <target>` pair the DETECTED line interpolates
+ *  (`orphaned-db-sweep.ts:213-214`). The target may carry a trailing
+ *  ` (deleted)`, which `\S+` naturally stops before. */
+const ORPHANED_DB_ALARM_TARGET_RE = /\bfd=\d+ (\S+)/g;
+
+/**
+ * The lanes an alarm line names, as basenames. Returns `null` when the line
+ * carries no parseable target at all — an emitter format change must fail
+ * toward the alarm, never silently downgrade a data-loss record.
+ */
+function orphanedDbAlarmLanes(alarmLine: string): string[] | null {
+  const names: string[] = [];
+  for (const m of alarmLine.matchAll(ORPHANED_DB_ALARM_TARGET_RE)) {
+    const target = m[1]!;
+    names.push(target.slice(target.lastIndexOf("/") + 1));
+  }
+  return names.length > 0 ? names : null;
+}
 
 /**
  * Decide whether an `orphaned-db-sweep DETECTED` alarm at `alarmIdx` was
  * RECOVERED inside its own sweep tick.
  *
- * `runOrphanedDbSweepTick` logs the alarm and every lane line synchronously,
- * with no `await` between them, so a tick's lines are contiguous. The window
- * therefore runs from the alarm to the next DETECTED line (the next tick's
- * alarm) or `ORPHANED_DB_TICK_LOOKAHEAD` lines, whichever comes first.
+ * #4682 B1 — the verdict is derived from the tick's CONTENT, never from how
+ * many lines follow it. The previous line-count lookahead made the answer
+ * position-dependent: the identical alarm+reopen pair classified `recovered`
+ * while it sat at the log tail and `unrecovered` once twelve lines of ordinary
+ * traffic had accumulated behind it. Sweeps are five minutes apart, so the next
+ * alarm is essentially never inside a dozen lines and the verdict effectively
+ * tracked WHEN the scan ran. That is fatal downstream: the two verdicts carry
+ * different signatures, so a flip migrates the finding between dedup_keys and
+ * empties the old one, which the ledger reads as a fix-to-zero.
  *
- * Recovered means BOTH: the reopen-succeeded line landed, AND no lane in the
- * tick reported itself un-recovered. `registry.db` has no in-process recovery
- * at all, so a tick that reopened history while registry stayed orphaned is
- * still severity-3 silent loss.
+ * Two content-derived facts settle it:
  *
- * The lookahead cap is a safety valve, NOT a tick boundary, and the ordering
- * makes that distinction load-bearing: `runOrphanedDbSweepTick` logs the
- * history lane (and therefore the reopen-succeeded line, since
- * `attemptHistoryReopen` is synchronous) at :219-229 BEFORE the registry lane
- * at :231-238 and the unowned lane at :242-251. So the lines that veto a
- * "recovered" verdict are exactly the ones an interleaved or truncated log
- * pushes out of the window. If the scan runs out of window without reaching a
- * tick boundary — the next tick's DETECTED alarm, or EOF — we have NOT seen
- * the whole tick and cannot prove no lane was left un-recovered, so we fail
- * toward the alarm and report `unrecovered` (severity 3). Without this, an
- * emitter that grew an `await` between the lanes, or 12 interleaved lines from
- * another gateway subsystem, would silently downgrade a real `registry.db`
- * data loss from severity 3 to severity 1.
+ * 1. WHICH LANES the tick hit is stated by the alarm line itself — it
+ *    interpolates every orphaned fd's target (`orphaned-db-sweep.ts:213-217`).
+ *    `history.db*` (including `-wal`/`-shm`, matching the emitter's own
+ *    `startsWith('history.db')` lane test at :219) is the only lane with an
+ *    in-process recovery. An alarm naming `registry.db` or an unowned file is
+ *    unrecoverable silent loss, full stop — no lookahead may overrule it, and
+ *    crucially a truncated log that lost the lane line can no longer launder it
+ *    down to severity 1.
+ * 2. WHETHER the history lane recovered is stated by the first `orphaned-db-sweep`
+ *    line after the alarm. The emitter reaches its history lane with no `await`
+ *    after the alarm and always logs exactly one of: reopened-and-proved-durable,
+ *    no-reopen-wired, or FAILED-to-reopen. Only the first is a recovery; anything
+ *    else — including running out of log — keeps the alarm.
  */
 export function classifyOrphanedDbTick(
   lines: readonly string[],
   alarmIdx: number,
 ): "recovered" | "unrecovered" {
-  let recovered = false;
-  const cap = alarmIdx + 1 + ORPHANED_DB_TICK_LOOKAHEAD;
-  const end = Math.min(lines.length, cap);
-  // EOF inside the window means the log simply ended: the whole tick is visible.
-  let sawTickBoundary = lines.length <= cap;
-  for (let j = alarmIdx + 1; j < end; j++) {
-    const line = lines[j];
-    if (!line) continue;
-    if (GATEWAY_SIGNATURES["orphaned-db-handle"].test(line)) {
-      sawTickBoundary = true; // next tick's alarm — this tick is fully seen
-      break;
-    }
-    if (ORPHANED_DB_UNRECOVERED_RE.test(line)) return "unrecovered";
-    if (ORPHANED_DB_RECOVERED_RE.test(line)) recovered = true;
+  const lanes = orphanedDbAlarmLanes(lines[alarmIdx] ?? "");
+  // Unparseable target list, or any lane without an in-process recovery.
+  if (lanes === null || !lanes.every((n) => n.startsWith("history.db"))) {
+    return "unrecovered";
   }
-  return recovered && sawTickBoundary ? "recovered" : "unrecovered";
+  for (let j = alarmIdx + 1; j < lines.length; j++) {
+    const line = lines[j];
+    if (!line || !ORPHANED_DB_SWEEP_LINE_RE.test(line)) continue;
+    // The first sweep line after the alarm IS this tick's history-lane verdict.
+    return ORPHANED_DB_RECOVERED_RE.test(line) ? "recovered" : "unrecovered";
+  }
+  // The log ended before the lane reported: we cannot prove a recovery.
+  return "unrecovered";
 }
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
@@ -541,13 +574,7 @@ export function detectGatewayFindings(
   logName = `logs/${agent}/gateway-supervisor.log`,
 ): { findings: Finding[]; gw_hits: Record<GatewaySignal, number> } {
   const findings: Finding[] = [];
-  const gw_hits: Record<GatewaySignal, number> = {
-    "duplicate-delivery-represent": 0,
-    "represent-escalation": 0,
-    "reply-delivery-failure": 0,
-    "orphaned-db-handle": 0,
-    "orphaned-db-handle-recovered": 0,
-  };
+  const gw_hits = emptyGwHits();
   const lines = logText.split("\n");
   /** (signal, origin) → index of that event's finding in `findings`. */
   const eventIndex = new Map<string, number>();

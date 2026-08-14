@@ -432,3 +432,154 @@ describe("#4680 — a change of counting UNIT is not a count-drop", () => {
     expect(issueOn(after, DELIVERY).status).toBe("closed");
   });
 });
+
+/**
+ * #4682 — the counting-unit guard's two blind spots.
+ *
+ * M1: the guard rewrites `frequency` to the POST-fold count, and the
+ * count-drop arm required `prior.frequency > RESOLVED_THRESHOLD`. A folded
+ * count of 3 never satisfies that again, so a held issue could only ever leave
+ * the board through the zero path — stale-open forever, not "delayed one
+ * scan".
+ *
+ * B1: the guard only sees a prior issue under the SAME dedup_key. A finding
+ * that reclassifies into a sibling signature (`orphaned-db-handle` →
+ * `orphaned-db-handle-recovered`) empties its old key entirely, which reads as
+ * a fix-to-zero and drives the close-on-zero path — the same false "Verified
+ * count-drop" claim the unit guard exists to prevent, on a key the guard
+ * cannot see.
+ */
+describe("#4682 — the guard's blind spots", () => {
+  const NOW = new Date("2026-07-03T00:00:00Z");
+  const DELIVERY = "talk-to-agents-from-anywhere";
+  const DB_JOB = "survive-reboots-and-real-life";
+
+  const issueFor = (led: ReturnType<typeof buildLedger>, key: string) =>
+    led.records.flatMap((r) => r.issues).find((i) => i.dedup_key.endsWith(key));
+
+  function legacyLedger(findings: Finding[], ghIssue?: number) {
+    const led = buildLedger(findings, { now: NOW });
+    for (const rec of led.records) {
+      for (const iss of rec.issues) {
+        delete (iss as { counting_unit?: unknown }).counting_unit;
+        if (ghIssue !== undefined) iss.gh_issue = ghIssue;
+      }
+    }
+    return led;
+  }
+
+  it("M1: a held issue still closes when its folded count genuinely drops", () => {
+    // Pre-#4680: 8 duplicate-send log lines across 3 turns, GH #4242.
+    const legacy = legacyLedger(
+      [1, 1, 1, 2, 2, 2, 3, 3].map((t, i) =>
+        dupFinding("clerk", t, `2026-07-02T21:0${i}:00Z`),
+      ),
+      4242,
+    );
+    // Scan 1 — the ruler changes, 8 log lines fold to 3 turns. Held open.
+    const held = buildLedger([1, 2, 3].map((t) => dupFinding("clerk", t)), {
+      now: NOW,
+      prior: legacy,
+    });
+    const heldIssue = held.records.find((r) => r.job_spec === DELIVERY)!.issues[0];
+    expect(heldIssue.status).toBe("open");
+    expect(heldIssue.frequency).toBe(3);
+
+    // Scan 2 — someone actually fixes two of the three turns. Same ruler on
+    // both sides now, and the count really dropped. The board must be able to
+    // say so: this is the "delayed one scan, never suppressed" promise.
+    const dropped = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: held });
+    const droppedIssue = dropped.records.find((r) => r.job_spec === DELIVERY)!.issues[0];
+    expect(droppedIssue.frequency).toBe(1);
+    expect(droppedIssue.status).toBe("resolved-pending-verify");
+
+    // Scan 3 — verified, closed.
+    const verified = buildLedger([dupFinding("clerk", 1)], { now: NOW, prior: dropped });
+    expect(
+      verified.records.find((r) => r.job_spec === DELIVERY)!.issues[0].status,
+    ).toBe("closed");
+  });
+
+  it("M1: a count that does NOT drop is never laundered into pending-verify", () => {
+    const legacy = legacyLedger(
+      [1, 1, 1, 2, 2, 2, 3, 3].map((t, i) =>
+        dupFinding("clerk", t, `2026-07-02T21:0${i}:00Z`),
+      ),
+      4242,
+    );
+    const held = buildLedger([1, 2, 3].map((t) => dupFinding("clerk", t)), {
+      now: NOW,
+      prior: legacy,
+    });
+    // Same three broken turns, forever. Nothing dropped, so nothing closes.
+    let led = held;
+    for (let scan = 0; scan < 3; scan++) {
+      led = buildLedger([1, 2, 3].map((t) => dupFinding("clerk", t)), {
+        now: NOW,
+        prior: led,
+      });
+      expect(led.records.find((r) => r.job_spec === DELIVERY)!.issues[0].status).toBe(
+        "open",
+      );
+    }
+  });
+
+  const dbFinding = (signal: Finding["signal"], seq: number): Finding => ({
+    signal,
+    agent: "alpha",
+    turn_id: `alpha:gw#${seq}`,
+    log_pointer: `logs/alpha/gateway-supervisor.log:${seq}`,
+    ts: "2026-07-02T21:03:00Z",
+  });
+
+  it("B1: a reclassification into a sibling signature is not a verified fix", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    const priorIssue = issueFor(prior, "deleted-inode-writes")!;
+    priorIssue.gh_issue = 909;
+    expect(priorIssue.status).toBe("open");
+
+    // The SAME sweep tick, now sorted into the recovered sibling. Nothing was
+    // fixed; the alarm was re-filed.
+    const next = buildLedger([dbFinding("orphaned-db-handle-recovered", 1)], {
+      now: NOW,
+      prior,
+    });
+    const migrated = issueFor(next, "deleted-inode-writes")!;
+    expect(migrated.frequency).toBe(0);
+    expect(migrated.gh_issue).toBe(909);
+    // It IS closed — zero occurrences is zero occurrences — but the ledger must
+    // record WHY, so gh-sync cannot claim a count-drop nobody earned.
+    expect(migrated.status).toBe("closed");
+    expect(migrated.close_reason).toBe("reclassified");
+    // …and the sibling is on the board carrying the evidence.
+    expect(issueFor(next, "recovered-in-tick")!.frequency).toBe(1);
+  });
+
+  it("B1: a genuine drop to zero is still marked as a count-drop", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes")!.gh_issue = 909;
+    // No findings at all this scan — the sweep stopped firing.
+    const next = buildLedger([], { now: NOW, prior });
+    const closed = issueFor(next, "deleted-inode-writes")!;
+    expect(closed.status).toBe("closed");
+    expect(closed.close_reason).toBe("count-drop");
+  });
+
+  it("B1: an issue that comes back after closing is marked for reopening", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes")!.gh_issue = 909;
+    const closed = buildLedger([], { now: NOW, prior });
+    expect(issueFor(closed, "deleted-inode-writes")!.status).toBe("closed");
+
+    // It regresses. A closed GitHub issue that never reopens is the board
+    // lying permanently, which is the one thing this ledger exists to prevent.
+    const back = buildLedger([dbFinding("orphaned-db-handle", 2)], {
+      now: NOW,
+      prior: closed,
+    });
+    const reborn = issueFor(back, "deleted-inode-writes")!;
+    expect(reborn.status).toBe("open");
+    expect(reborn.gh_issue).toBe(909);
+    expect(reborn.reopened).toBe(true);
+  });
+});

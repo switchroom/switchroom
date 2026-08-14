@@ -71,6 +71,20 @@ export interface FleetHealthIssue {
   /** Linked GitHub issue number (identify + resolve system-of-record). */
   gh_issue?: number;
   status: FleetHealthIssueStatus;
+  /** WHY this issue closed (`status: "closed"` only; absent otherwise and on a
+   *  ledger written before #4682). `count-drop` is the honest success path —
+   *  the defect stopped appearing. `reclassified` means the findings moved to a
+   *  SIBLING signature (the same alarm re-sorted by its outcome) and nothing
+   *  was fixed, so gh-sync must not claim a verified count-drop. */
+  close_reason?: "count-drop" | "reclassified";
+  /** The sibling dedup_keys this issue's findings moved into. Present only
+   *  alongside `close_reason: "reclassified"`, so the close comment can name
+   *  where the evidence went. */
+  reclassified_into?: string[];
+  /** Set when a previously CLOSED issue's defect reappeared in this scan.
+   *  `gh issue edit` refreshes a closed issue's body without reopening it, so
+   *  gh-sync needs the explicit signal to run `gh issue reopen`. */
+  reopened?: true;
   /** The unit `frequency` was counted in on the scan that wrote this issue.
    *  Absent on a ledger written before #4680, which means `log-line`. */
   counting_unit?: FleetHealthCountingUnit;

@@ -196,3 +196,86 @@ describe("#4680 — no GitHub issue auto-closes across a counting-unit change", 
     expect(finalIssue.gh_issue).toBe(1841);
   });
 });
+
+/**
+ * #4682 B1 — the GitHub-facing half. The counting-unit guard cannot see a
+ * finding that reclassifies into a SIBLING signature, because that empties the
+ * old dedup_key rather than shrinking it. The old key then takes the
+ * close-on-zero path and `gh-sync` comments "Verified count-drop … Closed by
+ * the Fleet Health sensor." — a fix claim nobody earned — and, with no reopen
+ * path, that close is permanent.
+ */
+describe("#4682 — gh-sync tells the truth about WHY an issue closed", () => {
+  const NOW = new Date("2026-07-03T00:00:00Z");
+
+  const dbFinding = (signal: Finding["signal"], seq: number): Finding => ({
+    signal,
+    agent: "alpha",
+    turn_id: `alpha:gw#${seq}`,
+    log_pointer: `logs/alpha/gateway-supervisor.log:${seq}`,
+    ts: "2026-07-02T21:03:00Z",
+  });
+
+  const issueFor = (led: FleetHealthLedger, key: string) =>
+    led.records.flatMap((r) => r.issues).find((i) => i.dedup_key.endsWith(key))!;
+
+  it("does not claim a verified count-drop when the finding was reclassified", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes").gh_issue = 909;
+    const next = buildLedger([dbFinding("orphaned-db-handle-recovered", 1)], {
+      now: NOW,
+      prior,
+    });
+
+    const { deps, calls } = fakeDeps();
+    syncLedgerIssues(next, "switchroom/switchroom", deps);
+    const close = calls.find((c) => c[0] === "issue" && c[1] === "close")!;
+    expect(close).toBeDefined();
+    expect(close).toContain("909");
+    const comment = close[close.indexOf("--comment") + 1];
+    expect(comment).not.toMatch(/Verified count-drop/);
+    expect(comment).toMatch(/reclassified/i);
+    expect(comment).toMatch(/orphaned-db-handle:recovered-in-tick/);
+  });
+
+  it("still claims a verified count-drop on a genuine drop to zero", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes").gh_issue = 909;
+    const next = buildLedger([], { now: NOW, prior });
+
+    const { deps, calls } = fakeDeps();
+    syncLedgerIssues(next, "switchroom/switchroom", deps);
+    const close = calls.find((c) => c[0] === "issue" && c[1] === "close")!;
+    expect(close[close.indexOf("--comment") + 1]).toMatch(/Verified count-drop/);
+  });
+
+  it("reopens a closed issue whose defect came back", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes").gh_issue = 909;
+    const closed = buildLedger([], { now: NOW, prior });
+    const back = buildLedger([dbFinding("orphaned-db-handle", 2)], {
+      now: NOW,
+      prior: closed,
+    });
+
+    const { deps, calls } = fakeDeps();
+    syncLedgerIssues(back, "switchroom/switchroom", deps);
+    const reopen = calls.find((c) => c[0] === "issue" && c[1] === "reopen");
+    expect(reopen).toBeDefined();
+    expect(reopen).toContain("909");
+    // …and it must not also be closed in the same pass.
+    expect(calls.filter((c) => c[0] === "issue" && c[1] === "close")).toEqual([]);
+  });
+
+  it("does not reopen an issue that was already open", () => {
+    const prior = buildLedger([dbFinding("orphaned-db-handle", 1)], { now: NOW });
+    issueFor(prior, "deleted-inode-writes").gh_issue = 909;
+    const still = buildLedger([dbFinding("orphaned-db-handle", 2)], {
+      now: NOW,
+      prior,
+    });
+    const { deps, calls } = fakeDeps();
+    syncLedgerIssues(still, "switchroom/switchroom", deps);
+    expect(calls.filter((c) => c[0] === "issue" && c[1] === "reopen")).toEqual([]);
+  });
+});

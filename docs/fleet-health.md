@@ -110,7 +110,7 @@ The model-free sensor's explicit, documented mapping (source of truth:
 | `killed-incomplete-turn` (status ∉ complete/no_reply) | missed-trigger | 3 | `steer-or-queue-mid-flight` |
 | `represent-escalation` (`obligation escalation delivered + closed` / `PERMANENTLY undeliverable` — terminal outcomes only; a per-attempt retry and the `deferred — bridge down` suppression line are not escalations) | drift | 1 | `feel-like-a-colleague` |
 | `orphaned-db-handle` (`orphaned-db-sweep DETECTED …` with a lane left un-recovered) | success-theater | 3 | `survive-reboots-and-real-life` |
-| `orphaned-db-handle-recovered` (same alarm, but the tick reopened `history.db` and left no lane un-recovered) | drift | 1 | `survive-reboots-and-real-life` |
+| `orphaned-db-handle-recovered` (same alarm, but the alarm names only `history.db*` targets and the tick's next sweep line is the reopen-succeeded one) | drift | 1 | `survive-reboots-and-real-life` |
 
 Tuned L0 constants (load-bearing; ported verbatim from the validated reference
 detector): `HANG_MS = 360000`, `HANG_MAXTOOLS = 2`, `synthetic-` turn ids

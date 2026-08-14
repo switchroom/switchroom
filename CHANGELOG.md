@@ -234,6 +234,30 @@ now an anomaly worth investigating, not the norm.
   records the `counting_unit` its frequency was measured in, and the writer
   holds an issue's status for exactly one scan when that unit changes — a real
   close is delayed by one scan, never suppressed, and reopening still works.
+- **fleet-health: the orphaned-DB verdict no longer depends on when the scan
+  ran, and a reclassified issue no longer claims a fix nobody made.** The
+  recovered/unrecovered split used a 12-line lookahead to find its tick
+  boundary, but sweeps are five minutes apart, so the identical alarm+reopen
+  pair booked severity 1 while it sat at the log tail and severity 3 once
+  ordinary traffic accumulated behind it. The two verdicts carry different
+  signatures, so a flip moved the finding to a different dedup_key and emptied
+  the old one — which the writer reads as a drop to zero, closing a live
+  severity-3 issue with "Verified count-drop … Closed by the Fleet Health
+  sensor." The same lookahead also downgraded a real `registry.db` alarm to
+  informational whenever its lane line fell outside the window. The verdict is
+  now derived from the tick's content — the alarm line names every affected
+  lane, and the first sweep line after it is that tick's history-lane outcome —
+  so it is stable under log growth and truncation. Alongside it: a close caused
+  by findings re-sorting into a sibling signature is recorded as
+  `close_reason: "reclassified"` and commented as such rather than as a
+  verified count-drop; an issue whose defect reappears after closing is now
+  reopened on GitHub instead of staying shut forever; the count-drop arm tests
+  `count < prior.frequency` so an issue held across a counting-unit change can
+  still close (previously it could only ever leave the board at zero, i.e.
+  stale-open however much of it got fixed); and the gateway-signal list that
+  drives the counting-unit guard is built from a `Record<GatewaySignal, true>`
+  so a new derived signal is a compile error rather than a signal silently
+  counted in the wrong unit.
 
 ### Features
 

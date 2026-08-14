@@ -24,6 +24,7 @@ import {
   issuePriority,
   countingUnitFor,
   LEGACY_COUNTING_UNIT,
+  siblingDedupKeys,
 } from "./mapping.js";
 
 /** Below this occurrence count, a previously-open issue is considered fixed —
@@ -233,12 +234,30 @@ export function buildLedger(
         count <= RESOLVED_THRESHOLD && prior.status === "resolved-pending-verify"
           ? "resolved-pending-verify"
           : "open";
-    } else if (count <= RESOLVED_THRESHOLD && prior && prior.frequency > RESOLVED_THRESHOLD) {
-      // count dropped after a fix → pending verification.
-      status = "resolved-pending-verify";
     } else if (prior?.status === "resolved-pending-verify" && count <= RESOLVED_THRESHOLD) {
+      // The drop held for a second scan in the same unit → verified, close it.
       status = "closed";
+    } else if (prior && count <= RESOLVED_THRESHOLD && count < prior.frequency) {
+      // The count DROPPED to at/below the resolved threshold → pending
+      // verification.
+      //
+      // #4682 M1 — the test is `count < prior.frequency`, NOT
+      // `prior.frequency > RESOLVED_THRESHOLD`. The two are equivalent for an
+      // issue that was never held, but the unit guard above rewrites
+      // `frequency` to the POST-fold count: an issue held at 3 carries a prior
+      // frequency of 3 from then on, which never satisfies `> 3` again. Under
+      // the old test such an issue could only ever leave the board through the
+      // zero path — stale-open on GitHub however much of it got fixed, the
+      // opposite of the "delayed one scan, never suppressed" guarantee the
+      // guard was written to keep.
+      status = "resolved-pending-verify";
     }
+
+    // #4682 B1 — a closed GitHub issue whose defect is back in the scan needs
+    // an explicit reopen: `gh issue edit` refreshes the body of a CLOSED issue
+    // and leaves it closed, so without this the board states "fixed" forever
+    // while the sensor keeps finding the defect every night.
+    const reopened = prior?.status === "closed" && status !== "closed";
 
     const issue: FleetHealthIssue = {
       dedup_key: agg.dedup_key,
@@ -250,6 +269,7 @@ export function buildLedger(
       occurrences: agg.occurrences,
       ...(prior?.gh_issue !== undefined ? { gh_issue: prior.gh_issue } : {}),
       status,
+      ...(reopened ? { reopened: true as const } : {}),
       counting_unit: agg.counting_unit,
     };
     const list = byJob.get(agg.job_spec) ?? [];
@@ -258,15 +278,23 @@ export function buildLedger(
   }
 
   // Close-on-zero: a dedup_key that was open (or pending-verify) in the prior
-  // ledger but produced NO findings this scan has no agg above — the fix drove
-  // its count to zero. Synthesize a zero-frequency `closed` issue carrying the
-  // prior GH issue number so gh-sync runs `gh issue close`. This is the common
-  // success path, not an edge case: without it the issue leaks open forever.
+  // ledger but produced NO findings this scan has no agg above. Synthesize a
+  // zero-frequency `closed` issue carrying the prior GH issue number so gh-sync
+  // runs `gh issue close`. This is the common success path, not an edge case:
+  // without it the issue leaks open forever.
   for (const [dedup_key, prior] of priorIdx) {
     if (aggs.has(dedup_key)) continue;
     if (prior.status !== "open" && prior.status !== "resolved-pending-verify") {
       continue;
     }
+    // WHY the count is zero is not always "someone fixed it". #4682 B1 — a
+    // finding that RECLASSIFIED into a sibling signature (the same alarm sorted
+    // by its outcome: `orphaned-db-handle` → `orphaned-db-handle-recovered`)
+    // empties this key and fills the sibling's. Zero is still zero, so the
+    // close is correct — but the claim gh-sync attaches to it must not be
+    // "Verified count-drop", which asserts a fix nobody made. `close_reason`
+    // carries the distinction to `syncIssue`.
+    const migratedTo = siblingDedupKeys(dedup_key).filter((k) => aggs.has(k));
     const issue: FleetHealthIssue = {
       dedup_key,
       failure_mode: prior.failure_mode,
@@ -277,10 +305,12 @@ export function buildLedger(
       occurrences: [],
       ...(prior.gh_issue !== undefined ? { gh_issue: prior.gh_issue } : {}),
       status: "closed",
-      // Not subject to the unit guard: zero findings means the artifact is
-      // genuinely absent from the window. Folding a non-empty finding set can
-      // shrink a count but can never empty it, so a unit change cannot
-      // manufacture this path.
+      close_reason: migratedTo.length > 0 ? "reclassified" : "count-drop",
+      ...(migratedTo.length > 0 ? { reclassified_into: migratedTo.sort() } : {}),
+      // The counting-unit guard does not apply here: a unit change re-measures
+      // a non-empty finding set, which can shrink a count but never empty it.
+      // Reclassification is the path that CAN empty it, and `close_reason`
+      // above — not the unit guard — is what keeps that honest.
       counting_unit: prior.counting_unit,
     };
     const list = byJob.get(prior.job_spec) ?? [];

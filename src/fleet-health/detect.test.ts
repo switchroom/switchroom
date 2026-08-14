@@ -7,8 +7,10 @@ import {
   extractTs,
   HANG_MS,
   SILENT_NOOP_FLOOR_TS,
+  GATEWAY_SIGNAL_NAMES,
 } from "./detect.js";
-import { mapSignal } from "./mapping.js";
+import type { L0Signal } from "./detect.js";
+import { mapSignal, countingUnitFor } from "./mapping.js";
 import { ROUTE_FIELD_SHIP_TS } from "../../telegram-plugin/gateway/turn-record-status.js";
 
 /**
@@ -397,6 +399,109 @@ describe("#4680 — a working guard is not a failure", () => {
       const log = [detect(1, "/state/history.db"), detect(1, "/state/history.db"), reopened]
         .join("\n");
       expect(severityOf(log)).toEqual([3, 1]);
+    });
+
+    /**
+     * #4682 B1 — the verdict must be a property of the TICK, not of how much
+     * log happened to follow it. A line-count lookahead cap makes it the
+     * latter: the exact same alarm+reopen pair books severity 1 while it sits
+     * at the log tail and severity 3 once ordinary traffic pushes the (absent)
+     * tick boundary out of the window. Sweeps are 5 minutes apart, so in a live
+     * log the next alarm is essentially never within a dozen lines — the
+     * verdict would then depend on WHEN the scan ran, and a signal that flips
+     * with the clock migrates its findings between two dedup_keys and drives
+     * the ledger's close-on-zero path on a defect nobody fixed.
+     */
+    it("books the same severity for one tick no matter how much traffic follows", () => {
+      const tick = [detect(1, "/state/history.db"), reopened];
+      for (const trailing of [0, 1, 5, 11, 12, 13, 60]) {
+        const log = [
+          ...tick,
+          ...Array.from(
+            { length: trailing },
+            (_, i) => `2026-08-12T03:05:00Z telegram gateway: unrelated chatter #${i}`,
+          ),
+        ].join("\n");
+        expect(severityOf(log), `${trailing} trailing lines`).toEqual([1]);
+      }
+    });
+
+    /**
+     * #4682 B1 — the same property in the severity-3 direction. The registry
+     * lane has no in-process recovery, so an alarm naming `registry.db` is
+     * silent data loss whether or not its lane line survived into the scanned
+     * window. The DETECTED line itself interpolates every orphaned target
+     * (`orphaned-db-sweep.ts:213-217`), so the affected LANES are knowable from
+     * the alarm alone and no lookahead may be allowed to overrule it.
+     */
+    it("keeps severity 3 for a registry.db alarm whose lane line is absent", () => {
+      // A truncated log tail: the alarm and the history reopen survive, the
+      // registry lane line does not. Trusting the missing veto line downgrades
+      // real, unrecoverable `registry.db` loss to informational.
+      const log = [detect(2, "/state/registry.db"), reopened].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 for an unowned-lane alarm whose lane line is absent", () => {
+      const log = [detect(2, "/state/grants.db"), reopened].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 when the alarm names history AND registry", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db (deleted), fd=14 /state/registry.db" +
+          " (deleted) — another process unlinked these files while we held them open.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("keeps severity 3 when the alarm's target list cannot be parsed", () => {
+      // Fail toward the alarm: an emitter format change must never silently
+      // downgrade a data-loss record.
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 1 deleted-inode" +
+          " DB handle(s): <redacted>",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([3]);
+    });
+
+    it("treats history.db-wal alongside history.db as the history lane", () => {
+      const log = [
+        "2026-08-12T03:00:00Z telegram gateway: orphaned-db-sweep DETECTED 2 deleted-inode" +
+          " DB handle(s): fd=13 /state/history.db (deleted), fd=14 /state/history.db-wal" +
+          " (deleted) — another process unlinked these files while we held them open.",
+        reopened,
+      ].join("\n");
+      expect(severityOf(log)).toEqual([1]);
+    });
+  });
+
+  /**
+   * #4682 M2 — `countingUnitFor` decides whether the ledger's count-drop
+   * self-verify may compare two scans at all, and it reads a list of gateway
+   * signal names. A hand-written list can silently omit a new signal, handing
+   * that signal a `log-line` unit it was never counted in. The list is now
+   * derived from a `Record<GatewaySignal, true>` so tsc rejects an omission at
+   * compile time; this test asserts the observable consequence — every signal
+   * `detectGatewayFindings` can actually emit is counted in `gateway-event` —
+   * enumerated from the detector's own `gw_hits` record rather than from the
+   * list under test, so the two cannot drift silently.
+   */
+  describe("every emittable gateway signal carries the gateway-event unit", () => {
+    it("agrees with the detector's own gw_hits keys", () => {
+      const { gw_hits } = detectGatewayFindings("alpha", "");
+      const emittable = Object.keys(gw_hits).sort();
+      expect(emittable.length).toBeGreaterThan(0);
+      for (const signal of emittable) {
+        expect(
+          countingUnitFor(signal as L0Signal),
+          `${signal} must be counted in gateway-event`,
+        ).toBe("gateway-event");
+      }
+      expect([...GATEWAY_SIGNAL_NAMES].sort()).toEqual(emittable);
     });
   });
 

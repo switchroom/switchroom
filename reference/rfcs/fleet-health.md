@@ -422,6 +422,17 @@ lane left un-recovered, is emitted as `orphaned-db-handle-recovered` (drift, sev
 handle, or a FAILED reopen behind stays `orphaned-db-handle` at sev 3 — that is
 genuine silent loss.
 
+**The verdict is derived from the tick's CONTENT, never from how many lines
+follow it.** Which lanes a tick hit is stated by the alarm line itself (it
+interpolates every orphaned fd's target), and `history.db*` is the only lane
+with an in-process recovery; whether that lane recovered is stated by the first
+`orphaned-db-sweep` line after the alarm, which the emitter logs with no `await`
+in between. A line-count lookahead would instead make the answer depend on when
+the scan ran — the same alarm+reopen pair reading sev 1 at the log tail and sev
+3 once ordinary traffic accumulated behind it — and because the two verdicts
+carry different signatures, a flip would migrate the finding between dedup_keys
+and empty the old one, which the writer reads as a fix-to-zero.
+
 A gateway finding is one EVENT, not one log line: matched lines carrying the
 same `origin=` turn id fold into a single finding for that signal, so ledger
 `frequency` counts distinct affected turns. Lines with no origin id keep
@@ -442,6 +453,27 @@ every live gateway issue to `resolved-pending-verify` on the first post-merge
 scan and had `gh-sync` comment "Verified count-drop … Closed by the Fleet Health
 sensor." on issues nobody touched — the board lying, which is the one failure
 this ledger exists to prevent.
+
+"Never suppressed" is only true because the count-drop arm tests `count <
+prior.frequency`, not `prior.frequency > RESOLVED_THRESHOLD`. The hold REWRITES
+`frequency` to the post-fold count, so an issue held at 3 carries a prior
+frequency of 3 from then on and would never satisfy `> 3` again — under that
+test a held issue could only ever leave the board through the zero path, i.e.
+stale-open on GitHub however much of it got fixed.
+
+**A key emptied by RECLASSIFICATION is not a verified fix either.** The unit
+guard compares a prior issue with this scan's issue under the SAME dedup_key,
+but findings that re-sort into a sibling signature (`orphaned-db-handle` →
+`orphaned-db-handle-recovered`, `silent-no-op-candidate` →
+`flush-recovered-turn`) EMPTY the old key and fill the sibling's, which reads as
+a drop to zero. Zero occurrences really is zero, so the issue does close — but
+the writer records `close_reason: "reclassified"` (naming the sibling keys the
+evidence moved to) and `gh-sync` posts that instead of a "Verified count-drop"
+claim nobody earned. And because any close can turn out to be premature, an
+issue whose defect reappears after closing is marked `reopened` and `gh-sync`
+runs `gh issue reopen` — `gh issue edit` refreshes a closed issue's body without
+reopening it, so without that the board would say "fixed" forever while the
+sensor found the defect every night.
 
 The dedup key is `<job_spec>:<signature>` (one GitHub issue per key).
 

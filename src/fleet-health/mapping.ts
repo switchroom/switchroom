@@ -258,9 +258,13 @@ export const LEGACY_COUNTING_UNIT: FleetHealthCountingUnit = "log-line";
 /**
  * The unit this signal's ledger `frequency` counts in.
  *
- * #4680 rule 3 folds gateway findings by event identity (the `origin=` turn
- * id), so a gateway signal's frequency counts distinct affected turns, not
- * matching log lines. Every other signal is still one finding per artifact.
+ * #4680 rule 3 folds gateway findings by event identity, so a gateway signal's
+ * frequency counts distinct affected TURNS wherever the log line carries an
+ * `origin=`/`tid=` turn id, and falls back to one finding per line where it
+ * does not (`detectGatewayFindings`). `gateway-event` names that folded unit —
+ * it is not a promise that every line was folded, only that the count is NOT
+ * comparable with a pre-#4680 `log-line` count. Every non-gateway signal is one
+ * finding per artifact.
  *
  * This exists so `buildLedger` can tell a genuine count DROP (someone fixed
  * the defect) from a change of RULER (the same defect, measured differently).
@@ -270,6 +274,47 @@ export const LEGACY_COUNTING_UNIT: FleetHealthCountingUnit = "log-line";
  */
 export function countingUnitFor(signal: L0Signal): FleetHealthCountingUnit {
   return GATEWAY_SIGNAL_SET.has(signal) ? "gateway-event" : "log-line";
+}
+
+/**
+ * Signals that are RECLASSIFICATIONS of one another: the same detected
+ * artifact, sorted into a different severity by its OUTCOME. A finding can move
+ * between the members of a group when the detector's classifier changes, or
+ * when a real occurrence's outcome differs from the last one's.
+ *
+ * #4682 B1 — this is what the counting-unit guard cannot see. That guard
+ * compares a prior issue with THIS scan's issue under the SAME dedup_key, but
+ * a reclassification does not shrink a key's count: it EMPTIES the key and
+ * fills a sibling. The old key then falls to `buildLedger`'s close-on-zero
+ * path, which is otherwise the honest "someone fixed it" path, and gh-sync
+ * comments "Verified count-drop … Closed by the Fleet Health sensor." on a
+ * defect that was merely re-filed. Zero occurrences really is zero, so the
+ * close itself is correct — the CLAIM attached to it is not.
+ */
+const RECLASSIFICATION_GROUPS: readonly (readonly L0Signal[])[] = [
+  ["orphaned-db-handle", "orphaned-db-handle-recovered"],
+  ["silent-no-op-candidate", "flush-recovered-turn"],
+];
+
+/** dedup_key → the dedup_keys its findings can reclassify into. Derived from
+ *  `SIGNALS` via `mapSignal`, so a signature or job-spec edit cannot leave a
+ *  stale hand-written key behind. */
+const SIBLING_DEDUP_KEYS: ReadonlyMap<string, readonly string[]> = (() => {
+  const m = new Map<string, string[]>();
+  for (const group of RECLASSIFICATION_GROUPS) {
+    const keys = group.map((s) => {
+      const map = mapSignal(s);
+      return `${map.job_spec}:${map.signature}`;
+    });
+    for (const key of keys) m.set(key, keys.filter((k) => k !== key));
+  }
+  return m;
+})();
+
+/** The dedup_keys `key`'s findings can reclassify into. Empty for a signal
+ *  with no sibling. */
+export function siblingDedupKeys(key: string): readonly string[] {
+  return SIBLING_DEDUP_KEYS.get(key) ?? [];
 }
 
 /** The stable dedup key for a finding: `<job_spec>:<signature>`. One GitHub
