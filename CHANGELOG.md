@@ -47,7 +47,10 @@ now an anomaly worth investigating, not the norm.
   seam in an unbreakable run, and a piece nothing could phonemize — are now
   counted into the `/tts` response meta (`hardCuts`, `unchunkedPieces`) and
   logged at WARNING volume to the sidecar's stderr, so the failure mode stops
-  being invisible.
+  being invisible. `VOICE_TTS_MAX_PHONEMES` is clamped to `[1, 508]` (508 is
+  the highest safe value — kokoro flushes a batch at `>=` 510), and an
+  out-of-range setting is warned about at startup rather than clamped
+  silently.
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
   (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)
