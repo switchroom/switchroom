@@ -6,9 +6,9 @@
  * "⚠️ I may have missed an earlier message" nudge. That nudge is only correct
  * when the agent genuinely never answered. Two mechanisms in the pre-fix code
  * let it fire on top of an answer the user had already received. Both are
- * reproduced from marko's `gateway-supervisor.log`, chat `-100…471` (the chat id
- * and the message bodies are deliberately NOT reproduced here — only ids,
- * topics and timings, which is all the derivation needs):
+ * reproduced from a production `gateway-supervisor.log` (the chat id and the
+ * message bodies are deliberately NOT reproduced here — only thread ids,
+ * message numbers and timings, which is all the derivation needs):
  *
  *   1. REROUTED ANSWER. The staleness check was keyed on the obligation's
  *      `threadId`. When the model names a topic on its `reply` and the
@@ -131,22 +131,47 @@ export const OBLIGATION_ESCALATE_SETTLE_MS_MAX = 60_000
 /**
  * Slack added to the settle window to get the reroute-match window (below).
  *
- * Two 5,000 ms sweep ticks. The sweep is the only caller, so the decision that
- * consults the override record can only land on a tick boundary: one tick of
- * scheduling slack past the settle deadline, plus one more for a busy tick.
+ * Two 5,000 ms sweep ticks. The window is measured from the settle gate's own
+ * `firstAt` — the instant the decision FIRST read "unanswered" — so this slack
+ * only has to cover the jitter between the routing decision and that first
+ * read: the sweep runs on a 5,000 ms interval, and the read can land anywhere
+ * inside a tick, so one tick of phase plus one more for a busy tick.
+ *
+ * It deliberately does NOT have to cover the gap to the RE-check. That gap is
+ * unbounded in principle — the sweep's earlier gates (`turnInFlightForGate`,
+ * the background-work / session-busy defer, and the escalate/represent graces)
+ * can SKIP ticks entirely, not merely delay them, for minutes at a time — which
+ * is exactly why the anchor is `firstAt` and not the re-check's `now`. See
+ * `EscalationSettleGate.firstAt`.
  */
 export const REROUTE_MATCH_GRACE_MS = 10_000
+
+/**
+ * Hard ceiling on the reroute-match window.
+ *
+ * Same reasoning as `OBLIGATION_ESCALATE_SETTLE_MS_MAX`, mirrored for the other
+ * direction of harm: a fat-fingered `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS`
+ * widens the window in which an unrelated delivery can be mistaken for this
+ * obligation's rerouted answer — i.e. it widens the SILENT-CLOSE exposure, the
+ * one failure this module treats as unacceptable. The ceiling is the largest
+ * value the derivation itself can ever produce (the clamped maximum settle
+ * window plus the grace), so every legitimate tuning fits under it and anything
+ * above it is a typo. Clamped, not rejected, for the same reason as the settle
+ * ceiling: a clamped guard still guards.
+ */
+export const OBLIGATION_REROUTE_MATCH_MS_MAX =
+  OBLIGATION_ESCALATE_SETTLE_MS_MAX + REROUTE_MATCH_GRACE_MS
 
 /**
  * How stale an `EXPLICIT_OVERRIDDEN` record may be and still license a look in
  * the thread it names.
  *
  * This bound is the whole correctness argument for the reroute fallback, so it
- * is derived, not picked. The escalate decision that actually consults the
- * record is the one AFTER the settle gate, so a legitimate override is at most
- * `settleMs` old (the answer was in flight when the first decision deferred),
- * plus up to two sweep ticks of scheduling slack — `REROUTE_MATCH_GRACE_MS`.
- * At the default that is 8,500 + 10,000 = 18,500 ms.
+ * is derived, not picked. Staleness is measured from the settle gate's
+ * `firstAt`, so a legitimate override is at most `settleMs` old (the answer was
+ * in flight when that first decision deferred), plus up to two sweep ticks of
+ * scheduling slack — `REROUTE_MATCH_GRACE_MS`. At the default that is
+ * 8,500 + 10,000 = 18,500 ms.
  *
  * Both justifying incidents sit far inside it (2026-08-10 06:36 override
  * :07.921 → delivery :09.281 = 1.36 s; 07:52 override :36.026 → delivery
@@ -154,13 +179,31 @@ export const REROUTE_MATCH_GRACE_MS = 10_000
  * newest override 03:53:11.225 → the unrelated delivery at 04:02:51.987 =
  * 594.8 s, a 32× margin over the window). Nothing observed lives in between.
  *
+ * KILL SWITCH: `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the reroute
+ * fallback entirely (thread scope only — pre-fix behaviour for this half of the
+ * fix). It is its OWN switch: `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0`
+ * disables the settle gate and NOTHING ELSE. The fallback needs one because it
+ * is the only mechanism here that can close a genuinely unanswered obligation
+ * silently; the settle gate can only ever DELAY a nudge. A non-numeric or
+ * negative value falls back to the derivation rather than silently disabling or
+ * widening the guard; a value above `OBLIGATION_REROUTE_MATCH_MS_MAX` is
+ * clamped.
+ *
  * RESIDUAL, stated plainly: within the window the fallback still cannot tell
  * the rerouted answer from a second ≥200-char delivery that lands in the same
  * thread in those few seconds — the override carries no message id to tie it to
  * one row. The window is what bounds that exposure; it is not eliminated.
  */
-export function resolveRerouteMatchWindowMs(settleMs: number): number {
-  return Math.max(settleMs, 0) + REROUTE_MATCH_GRACE_MS
+export function resolveRerouteMatchWindowMs(
+  settleMs: number,
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const derived = Math.max(settleMs, 0) + REROUTE_MATCH_GRACE_MS
+  const raw = env.SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS
+  if (raw == null || raw === '') return derived
+  const n = Number(raw)
+  if (!(Number.isFinite(n) && n >= 0)) return derived
+  return Math.min(n, OBLIGATION_REROUTE_MATCH_MS_MAX)
 }
 
 /**
@@ -197,10 +240,24 @@ export interface EscalationStalenessDeps {
     threadId?: number | null,
   ) => boolean
   /** The router's explicit-thread override record (answer-route-overrides.ts). */
-  routeOverrides: Pick<AnswerRouteOverrides, 'routedOverridesSince'>
-  /** Decision instant. The reroute fallback is anchored to it, not to `openedAt`. */
-  nowMs: number
-  /** How stale an override may be — `resolveRerouteMatchWindowMs(settleMs)`. */
+  routeOverrides: Pick<AnswerRouteOverrides, 'routedOverridesSince' | 'newestOverrideSince'>
+  /**
+   * The instant the freshness window is measured BACK from — the settle gate's
+   * `firstAt` for this obligation when a settle window is already open, else
+   * this decision's `now`.
+   *
+   * NOT the re-check instant. The sweep's earlier gates can skip ticks outright
+   * (an in-flight turn is unbounded; the background-work/session-busy defer is
+   * bounded at 20 min; the escalate and represent graces add tens of seconds),
+   * so the decision that consults the override record can run minutes after the
+   * one that deferred. Anchored at `now`, a record that was fresh when the
+   * question "has this been answered?" was FIRST asked reads as stale purely
+   * because the sweep was starved — and the nudge fires on top of the answer.
+   * Anchored at `firstAt`, the window means what its derivation says it means.
+   */
+  anchorMs: number
+  /** How stale an override may be — `resolveRerouteMatchWindowMs(settleMs)`.
+   *  `<= 0` disables the reroute fallback entirely (kill switch). */
   rerouteMatchWindowMs: number
 }
 
@@ -219,6 +276,17 @@ export interface AnsweredSinceOpenResult {
   via: AnsweredVia | null
   /** The thread the reroute-scope hit was found in. Only set when `via` is 'reroute'. */
   routedThreadId?: number | null
+  /**
+   * Age (relative to `anchorMs`) of the NEWEST override the freshness bound
+   * rejected, when the fallback found nothing AND a record for this obligation
+   * existed. Absent when there was simply no record.
+   *
+   * Negative-path telemetry: without it "no reroute on record" and "a reroute
+   * was on record and the bound threw it away" are the same silent result, and
+   * the bound — which is the whole correctness argument for the fallback — is
+   * unmeasurable in production. The caller logs it.
+   */
+  staleOverrideAgeMs?: number
 }
 
 /**
@@ -258,9 +326,14 @@ export function answeredSinceOpen(
   if (deps.hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)) {
     return { answered: true, via: 'thread' }
   }
-  // Freshness floor: never older than the window, and never before the
-  // obligation existed. A stale override licenses nothing.
-  const notBefore = Math.max(o.openedAt, deps.nowMs - deps.rerouteMatchWindowMs)
+  // Kill switch. A zero/negative window means "no reroute fallback at all", not
+  // "a zero-width window an override recorded at this very instant slips
+  // through" — an off-switch that still fires for one timing is not one.
+  if (!(deps.rerouteMatchWindowMs > 0)) return NOT_ANSWERED
+  // Freshness floor: never older than the window (measured back from the FIRST
+  // "unanswered" read — see `anchorMs`), and never before the obligation
+  // existed. A stale override licenses nothing.
+  const notBefore = Math.max(o.openedAt, deps.anchorMs - deps.rerouteMatchWindowMs)
   for (const ovr of deps.routeOverrides.routedOverridesSince(o.chatId, o.threadId, notBefore)) {
     // `routedThreadId` is already the history's thread semantics: a number for a
     // topic, `null` for the chat root (`thread_id IS NULL`). Never `undefined`,
@@ -271,6 +344,12 @@ export function answeredSinceOpen(
     if (deps.hasOutboundDeliveredSince(o.chatId, since, ovr.routedThreadId)) {
       return { answered: true, via: 'reroute', routedThreadId: ovr.routedThreadId }
     }
+  }
+  // Nothing matched. Distinguish "no record" from "a record the bound rejected"
+  // so the bound is observable in production (the caller logs the age).
+  const newest = deps.routeOverrides.newestOverrideSince(o.chatId, o.threadId, o.openedAt)
+  if (newest != null && newest.atMs < notBefore) {
+    return { answered: false, via: null, staleOverrideAgeMs: Math.max(0, deps.anchorMs - newest.atMs) }
   }
   return NOT_ANSWERED
 }
@@ -288,6 +367,22 @@ export interface EscalationSettleGate {
    * re-check.
    */
   shouldDefer(id: string, now: number, openedAt: number): boolean
+  /**
+   * The instant this obligation's OPEN settle window started — the decision that
+   * first read "not answered" for this episode. `undefined` when no window is
+   * open for `id` (first decision, gate disabled, or the entry was evicted).
+   *
+   * This is the freshness anchor for the reroute fallback (`anchorMs`). Read
+   * BEFORE `shouldDefer`, so the first decision anchors at its own `now` and
+   * every re-check anchors at that same instant however many ticks were skipped
+   * in between. `openedAt` is matched for the same reason `shouldDefer` matches
+   * it: a re-opened obligation under the same origin id must not inherit the
+   * previous episode's anchor.
+   *
+   * Fails in the safe direction: no entry ⇒ the caller anchors at `now`, which
+   * can only make an override look OLDER, i.e. over-escalate.
+   */
+  firstAt(id: string, openedAt: number): number | undefined
   /** Forget `id` — call on EVERY obligation terminal (silent close, cancel,
    *  escalation driven), so the map never retains closed obligations. */
   clear(id: string): void
@@ -342,6 +437,11 @@ export function createEscalationSettleGate(
         return true
       }
       return now - prev.firstAt < settleMs
+    },
+    firstAt(id: string, openedAt: number): number | undefined {
+      const prev = entries.get(id)
+      if (prev == null || prev.openedAt !== openedAt) return undefined
+      return prev.firstAt
     },
     clear(id: string): void {
       entries.delete(id)

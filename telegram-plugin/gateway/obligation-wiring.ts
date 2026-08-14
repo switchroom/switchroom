@@ -333,11 +333,19 @@ function obligationSweep(): void {
   // that record's own instant — the topic it names. Deliberately neither
   // chat-wide nor cut at `openedAt`: both of those close a genuinely unanswered
   // obligation in silence. Field evidence for each in escalation-staleness.ts.
+  //
+  // FRESHNESS ANCHOR: the settle gate's `firstAt` for this obligation when a
+  // window is already open, else this decision's `now`. NOT the re-check
+  // instant — every gate above (`turnInFlightForGate`, the background-work /
+  // session-busy defer, the escalate and represent graces) can SKIP sweep ticks
+  // outright, so the decision that consults the record may run minutes after the
+  // one that deferred, and a record that was fresh when the question was first
+  // asked would read as stale purely because the sweep was starved.
   const answered = answeredSinceOpen(o, {
     historyEnabled: HISTORY_ENABLED,
     hasOutboundDeliveredSince,
     routeOverrides: answerRouteOverrides,
-    nowMs: now,
+    anchorMs: escalateSettleGate.firstAt(o.originTurnId, o.openedAt) ?? now,
     rerouteMatchWindowMs: rerouteMatchWindowMs,
   })
   if (answered.answered) {
@@ -353,6 +361,17 @@ function obligationSweep(): void {
     escalateSettleGate.clear(o.originTurnId)
     obligationLedger.close(o.originTurnId)
     return
+  }
+  if (answered.staleOverrideAgeMs != null) {
+    // NEGATIVE-PATH telemetry for the freshness bound. A reroute WAS on record
+    // for this obligation and the bound threw it away — indistinguishable from
+    // "no reroute at all" without this line, which makes the bound (the whole
+    // correctness argument for the fallback) unmeasurable in production. A near
+    // miss here is the signal that the window is mis-tuned.
+    process.stderr.write(
+      `telegram gateway: obligation reroute record rejected age=${answered.staleOverrideAgeMs}ms ` +
+        `window=${rerouteMatchWindowMs}ms origin=${o.originTurnId}\n`,
+    )
   }
   // SETTLE. The check above is a point-in-time read, and the answer is often
   // still IN FLIGHT at this instant (reply tool invoked, history row not yet

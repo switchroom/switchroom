@@ -56,11 +56,19 @@ now an anomaly worth investigating, not the norm.
   in the same thread in those few seconds — the override carries no message id.
   Both guards stay bounded: a genuinely unanswered obligation still escalates one
   settle window later (the 2026-08-12 case, whose real answer was 41s away, is
-  unaffected), the settle window is clamped at 60s so a config typo cannot
-  suppress escalation for a day, and a fallback-scope close logs `via=reroute`
-  so its blast radius is measurable in production. New
-  `escalation-staleness.ts` carries the evidence and the derivation; kill switch
-  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0`.
+  unaffected), and both windows are clamped so a config typo cannot silently
+  widen them. The freshness window is measured back from the settle gate's own
+  *first* "unanswered" read, not from whenever the re-check runs — the sweep's
+  earlier gates can skip ticks outright for minutes, and anchoring at the
+  re-check would let a starved sweep age a still-fresh record out of the window
+  and nag on top of the answer anyway. Both paths are logged so the fallback is
+  measurable in production without a rebuild: a fallback-scope close logs
+  `via=reroute`, and a record the freshness bound *rejects* logs
+  `reroute record rejected age=…ms window=…ms`. New `escalation-staleness.ts`
+  carries the evidence and the derivation. Each guard has its OWN kill switch —
+  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` disables the settle gate (and only
+  the settle gate), `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the
+  reroute fallback (and only the fallback); set both for the pre-fix behaviour.
 
   **Scope:** this fixes the ESCALATE branch only. It narrows the standing
   duplicate-reply family (switchroom/switchroom#2472) rather than closing it —

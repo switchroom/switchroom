@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   answeredSinceOpen,
   createEscalationSettleGate,
@@ -6,6 +6,7 @@ import {
   resolveRerouteMatchWindowMs,
   OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT,
   OBLIGATION_ESCALATE_SETTLE_MS_MAX,
+  OBLIGATION_REROUTE_MATCH_MS_MAX,
   REROUTE_MATCH_GRACE_MS,
 } from "../gateway/escalation-staleness.js";
 import {
@@ -93,19 +94,29 @@ function overridesWithReroute(
 
 const NO_OVERRIDES = createAnswerRouteOverrides();
 
+// `answerRouteOverrides` is a process-wide module singleton and the end-to-end
+// scenarios below note real records into it with wall-clock timestamps. Reset it
+// before every test so no scenario inherits (or silently depends on) another's.
+beforeEach(() => {
+  answerRouteOverrides.clear();
+});
+
 /** The reroute-fallback deps, with the freshness window the sweep really uses. */
 function stalenessDeps(over: {
   hasOutboundDeliveredSince: (chatId: string, sinceMs: number, threadId?: number | null) => boolean;
   routeOverrides: Parameters<typeof answeredSinceOpen>[1]["routeOverrides"];
   nowMs?: number;
   historyEnabled?: boolean;
+  rerouteMatchWindowMs?: number;
 }) {
   return {
     historyEnabled: over.historyEnabled ?? true,
     hasOutboundDeliveredSince: over.hasOutboundDeliveredSince,
     routeOverrides: over.routeOverrides,
-    nowMs: over.nowMs ?? 2_000,
-    rerouteMatchWindowMs: resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT),
+    anchorMs: over.nowMs ?? 2_000,
+    rerouteMatchWindowMs:
+      over.rerouteMatchWindowMs ??
+      resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT),
   };
 }
 
@@ -183,6 +194,35 @@ describe("answerRouteOverrides — records only genuine explicit-thread override
     expect(reg.routedOverridesSince(CHAT, 4, 0)).toEqual([{ routedThreadId: 3, atMs: 1000 }]);
     // With a later floor, the earliest SURVIVING record wins.
     expect(reg.routedOverridesSince(CHAT, 4, 1600)).toEqual([{ routedThreadId: 3, atMs: 2000 }]);
+  });
+
+  it("clear() drops every record (the process-wide singleton's test reset)", () => {
+    const reg = overridesWithReroute(4, 635, 1000);
+    expect(reg.routedOverridesSince(CHAT, 4, 0)).toHaveLength(1);
+    reg.clear();
+    expect(reg.routedOverridesSince(CHAT, 4, 0)).toEqual([]);
+    expect(reg.newestOverrideSince(CHAT, 4, 0)).toBeUndefined();
+    expect(reg.size()).toBe(0);
+  });
+
+  it("newestOverrideSince returns the LATEST in-window record, not the earliest", () => {
+    const reg = createAnswerRouteOverrides();
+    for (const atMs of [1000, 1500, 2000]) {
+      reg.note({
+        chatId: CHAT,
+        enabled: true,
+        explicitThreadId: 4,
+        anchored: true,
+        routedThreadId: 3,
+        nowMs: atMs,
+      });
+    }
+    // `routedOverridesSince` deliberately yields the earliest (widest cutoff);
+    // the diagnostic asks the opposite question — how NEAR the miss was.
+    expect(reg.routedOverridesSince(CHAT, 4, 0)[0]?.atMs).toBe(1000);
+    expect(reg.newestOverrideSince(CHAT, 4, 0)).toEqual({ routedThreadId: 3, atMs: 2000 });
+    expect(reg.newestOverrideSince(CHAT, 4, 2500)).toBeUndefined();
+    expect(reg.newestOverrideSince(CHAT, 99, 0)).toBeUndefined();
   });
 
   it("bounds both the key count and the per-key history", () => {
@@ -287,7 +327,10 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
     );
     // Cut at `openedAt` this reads {answered: true, via: "reroute"} and the
     // user's message is dropped in silence.
-    expect(answered).toEqual({ answered: false, via: null });
+    expect(answered.answered).toBe(false);
+    expect(answered.via).toBe(null);
+    // …and the rejection is reported rather than silent (594.6s stale).
+    expect(answered.staleOverrideAgeMs).toBe(NOW - 188_418);
   });
 
   it("DOES follow an override that is still fresh, from the override's own instant", () => {
@@ -367,6 +410,64 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
       }),
     );
     expect(answered.answered).toBe(false);
+  });
+
+  it("reports WHY the fallback found nothing when a record existed but was stale", () => {
+    // Negative-path telemetry. "No override on record" and "an override was on
+    // record and the freshness bound rejected it" are operationally different —
+    // the second is the bound doing its job (or being mis-tuned), and without a
+    // signal the 18.5s window is unmeasurable in production. Same 2026-08-13
+    // shape: newest override 188_418, decision 783_000 → 594.6s stale.
+    const reg = createAnswerRouteOverrides();
+    for (const atMs of [41_394, 100_301, 188_418]) {
+      reg.note({
+        chatId: CHAT,
+        enabled: true,
+        explicitThreadId: OBLIGATION_THREAD,
+        anchored: true,
+        routedThreadId: UNRELATED_THREAD,
+        nowMs: atMs,
+      });
+    }
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 0, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(769_180, UNRELATED_THREAD),
+        routeOverrides: reg,
+        nowMs: 783_000,
+      }),
+    );
+    expect(answered.answered).toBe(false);
+    // The NEWEST rejected record's age — the near-miss the bound must be judged on.
+    expect(answered.staleOverrideAgeMs).toBe(783_000 - 188_418);
+  });
+
+  it("reports NO stale-override age when there was simply no record to reject", () => {
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(2000, UNRELATED_THREAD),
+        routeOverrides: NO_OVERRIDES,
+      }),
+    );
+    expect(answered).toEqual({ answered: false, via: null });
+  });
+
+  it("a ZERO reroute-match window disables the fallback outright (kill switch)", () => {
+    // The fallback is the one new mechanism that can silently close a genuinely
+    // unanswered obligation, so it needs its own off-switch — and the switch
+    // must mean "no fallback", not "a zero-width window an override recorded at
+    // this very instant still slips through".
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 1_000, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(6_000, ROUTED_THREAD),
+        routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, 6_000),
+        nowMs: 6_000,
+        rerouteMatchWindowMs: 0,
+      }),
+    );
+    expect(answered).toEqual({ answered: false, via: null });
   });
 
   it("reports not-answered when history is unavailable (never suppresses on doubt)", () => {
@@ -488,6 +589,45 @@ describe("resolveRerouteMatchWindowMs — how stale an override may be", () => {
     const w = resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT);
     expect(w).toBeGreaterThan(2_809); // worst real override→delivery lag, with margin
     expect(w).toBeLessThan(594_800); // 2026-08-13's stale-override→unrelated-delivery gap
+  });
+
+  it("has its OWN kill switch — SETTLE_MS=0 does not disable the fallback", () => {
+    // The settle gate's kill switch only disables the settle gate. The reroute
+    // fallback is a separate mechanism with a separate failure mode (it can
+    // close a genuinely unanswered obligation SILENTLY), so it gets its own
+    // off-switch. Every sibling guard in this family already has one.
+    expect(
+      resolveRerouteMatchWindowMs(0, { SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS: "0" }),
+    ).toBe(REROUTE_MATCH_GRACE_MS); // still live — the settle switch is not this switch
+    expect(
+      resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT, {
+        SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS: "0",
+      }),
+    ).toBe(0); // and this one really does turn it off
+  });
+
+  it("passes a deliberate override through, and falls back to the derivation on garbage", () => {
+    const derived = resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT);
+    expect(
+      resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT, {
+        SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS: "5000",
+      }),
+    ).toBe(5_000);
+    for (const raw of ["", "soon", "-1", "Infinity"]) {
+      expect(
+        resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT, {
+          SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS: raw,
+        }),
+      ).toBe(derived);
+    }
+  });
+
+  it("clamps an absurd override so a typo cannot widen the silent-close window for a day", () => {
+    expect(
+      resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT, {
+        SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS: "85000000",
+      }),
+    ).toBe(OBLIGATION_REROUTE_MATCH_MS_MAX);
   });
 });
 
@@ -622,6 +762,112 @@ describe("obligationSweep escalate branch — nag only when the answer really is
     }
 
     expect(nudges).toEqual([ORIGIN_D]); // topic 4's message is NOT silently dropped
+  });
+
+  it("every scenario starts from an EMPTY process-wide override registry", () => {
+    // `answerRouteOverrides` is a module singleton and these scenarios write to
+    // it with wall-clock timestamps, so without a reset (b)'s `CHAT:4` record is
+    // still FRESH when (a) and (c) — same topic — run, and (a)/(c) pass only
+    // because their history stubs happen to reject the routed thread. Loosen a
+    // stub and (b) silently changes another test's outcome.
+    expect(answerRouteOverrides.routedOverridesSince(CHAT, OBLIGATION_THREAD, 0)).toEqual([]);
+    expect(answerRouteOverrides.size()).toBe(0);
+  });
+
+  it("(e) a SKIPPED sweep tick does not turn a fresh reroute record stale (freshness anchor)", () => {
+    // The freshness bound must be anchored to the instant the decision FIRST
+    // read "unanswered" — the settle gate's own `firstAt` — not to whenever the
+    // re-check happens to run. A tick is not merely DELAYED, it can be skipped
+    // outright: `turnInFlightForGate()` (unbounded), the background-work /
+    // session-busy defer (bounded at 20 min), and the escalate/represent graces
+    // all sit ABOVE this branch. The 2026-08-13 log shows the sweep deferring
+    // for minutes at a time.
+    //
+    //   T+0      the router reroutes topic 45's answer to thread 635
+    //   T+0.1    first escalate decision — answer still in flight → settle defer
+    //   T+1.4    the rerouted answer lands in thread 635
+    //   T+107    the next decision that actually RUNS (ticks in between skipped)
+    //
+    // Anchored at the re-check, the record is 107s old, the fallback is skipped
+    // and the user is nagged on top of the answer they already have — the exact
+    // bug this PR exists to fix, surviving for that timing.
+    const THREAD_E = 45;
+    const ORIGIN_E = `${CHAT}:${THREAD_E}#5464`;
+    const ledger = new ObligationLedger(2);
+    const base = Date.now();
+    const DELIVERED_AT = base + 1_400;
+    const { wiring, nudges } = makeWiring({
+      ledger,
+      hasOutboundDeliveredSince: (chatId, sinceMs, threadId) =>
+        chatId === CHAT &&
+        (threadId === undefined || threadId === ROUTED_THREAD) &&
+        Date.now() >= DELIVERED_AT &&
+        DELIVERED_AT >= sinceMs,
+    });
+    answerRouteOverrides.note({
+      chatId: CHAT,
+      enabled: true,
+      explicitThreadId: THREAD_E,
+      anchored: true,
+      routedThreadId: ROUTED_THREAD,
+      nowMs: base,
+    });
+    openExhausted(ledger, base - 60_000, ORIGIN_E, THREAD_E);
+
+    const realNow = Date.now;
+    try {
+      Date.now = () => base + 100;
+      wiring.obligationSweep(); // decision 1 — answer in flight → settle
+      expect(nudges).toEqual([]);
+      // …and now the sweep is starved for 107s by the gates above this branch.
+      Date.now = () => base + 107_000;
+      wiring.obligationSweep();
+    } finally {
+      Date.now = realNow;
+    }
+
+    expect(nudges).toEqual([]); // no nag on top of the delivered answer
+    expect(ledger.isOpen(ORIGIN_E)).toBe(false); // closed silently instead
+  });
+
+  it("logs the stale-override rejection so the freshness bound is measurable in production", () => {
+    // The `via=reroute` close is logged because the fallback's blast radius must
+    // be observable without a rebuild. The bound that makes the fallback safe
+    // deserves the same: a rejection currently looks identical to "no record".
+    const THREAD_F = 46;
+    const ORIGIN_F = `${CHAT}:${THREAD_F}#5465`;
+    const ledger = new ObligationLedger(2);
+    const base = Date.now();
+    const { wiring } = makeWiring({
+      ledger,
+      hasOutboundDeliveredSince: historyWithAnswer(base - 14_200, UNRELATED_THREAD),
+    });
+    answerRouteOverrides.note({
+      chatId: CHAT,
+      enabled: true,
+      explicitThreadId: THREAD_F,
+      anchored: true,
+      routedThreadId: UNRELATED_THREAD,
+      nowMs: base - 594_900,
+    });
+    openExhausted(ledger, base - 783_300, ORIGIN_F, THREAD_F);
+
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      wiring.obligationSweep();
+    } finally {
+      process.stderr.write = realWrite;
+    }
+
+    const rejected = lines.find((l) => l.includes("reroute record rejected"));
+    expect(rejected).toBeDefined();
+    expect(rejected).toContain("window=18500ms");
+    expect(rejected).toMatch(/age=59[45]\d{3}ms/);
   });
 
   it("(a) an answer that lands while the first escalate decision is settling suppresses the nudge", () => {

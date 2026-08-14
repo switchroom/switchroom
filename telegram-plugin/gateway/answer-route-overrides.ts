@@ -70,8 +70,31 @@ export interface AnswerRouteOverrides {
     intendedThreadId: number | null | undefined,
     notBeforeMs: number,
   ): AnswerRouteOverride[]
+  /**
+   * The MOST RECENT override recorded for `intendedThreadId` at or after
+   * `notBeforeMs`, or `undefined` if there is none.
+   *
+   * Diagnostic-only, and deliberately separate from `routedOverridesSince`:
+   * that one returns the EARLIEST in-window record per routed thread because a
+   * consumer uses `atMs` as a history cutoff and wants the widest correct one.
+   * A consumer asking "did a record exist that my freshness bound rejected, and
+   * by how much?" wants the other end — the near-miss. Kept as its own method so
+   * answering that can never perturb the accept path's cutoff.
+   */
+  newestOverrideSince(
+    chatId: string,
+    intendedThreadId: number | null | undefined,
+    notBeforeMs: number,
+  ): AnswerRouteOverride | undefined
   /** Live key count. Test/diagnostic surface. */
   size(): number
+  /**
+   * Drop every recorded override. Test surface: the process-wide registry below
+   * is a module singleton, so without a reset one test's records leak into the
+   * next and a scenario silently depends on its neighbours' timestamps. Not
+   * called in production — the bounded eviction owns lifetime there.
+   */
+  clear(): void
 }
 
 function keyFor(chatId: string, threadId: number | null | undefined): string {
@@ -113,8 +136,21 @@ export function createAnswerRouteOverrides(maxKeys = 64, maxPerKey = 8): AnswerR
       }
       return out
     },
+    newestOverrideSince(chatId, intendedThreadId, notBeforeMs): AnswerRouteOverride | undefined {
+      const list = byKey.get(keyFor(chatId, intendedThreadId))
+      if (list == null) return undefined
+      let newest: AnswerRouteOverride | undefined
+      for (const e of list) {
+        if (e.atMs < notBeforeMs) continue
+        if (newest == null || e.atMs > newest.atMs) newest = e
+      }
+      return newest == null ? undefined : { ...newest }
+    },
     size(): number {
       return byKey.size
+    },
+    clear(): void {
+      byKey.clear()
     },
   }
 }
