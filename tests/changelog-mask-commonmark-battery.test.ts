@@ -60,7 +60,7 @@ describe("check-changelog-entry — CommonMark differential battery", () => {
 
   it("keeps covering both divergence directions and both overlapping closers", () => {
     // A battery whose interesting rows have been deleted proves nothing.
-    expect(cases.length).toBeGreaterThanOrEqual(31);
+    expect(cases.length).toBeGreaterThanOrEqual(38);
     expect(cases.filter((c) => c.divergence === "fail-open").length).toBeGreaterThan(0);
     expect(cases.filter((c) => c.divergence === "fail-closed").length).toBeGreaterThan(0);
     for (const form of ["<!-->", "<!--->"]) {
@@ -69,5 +69,23 @@ describe("check-changelog-entry — CommonMark differential battery", () => {
       // It must be a row where the guard AGREES — that is the fixed blocker.
       expect(row?.agrees).toBe(true);
     }
+  });
+
+  it("keeps covering container scoping, in BOTH constructs, as agreeing rows", () => {
+    // The round-5 fail-open: a fence / comment opened inside a list item is
+    // scoped to that item. Both were silently fail-OPEN, and the shape is the
+    // file's own house style, so the battery must not lose either one.
+    const container = cases.filter((c) => c.name.startsWith("CONTAINER:"));
+    expect(container.length).toBeGreaterThanOrEqual(7);
+    const fenced = container.find((c) => c.md.includes("\n  ```yaml\n  key: value\n\n##"));
+    const commented = container.find((c) => c.md.includes("\n- entry\n  <!--\n"));
+    expect(fenced, "no container row for a fence indented under a bullet").toBeTruthy();
+    expect(commented, "no container row for a comment indented under a bullet").toBeTruthy();
+    // Both must AGREE with the reference implementation — that is the fix.
+    expect(fenced?.agrees).toBe(true);
+    expect(commented?.agrees).toBe(true);
+    // And no container row may be fail-OPEN: the whole point of the fix is that
+    // every residual container divergence lands on the fail-CLOSED side.
+    expect(container.filter((c) => c.divergence === "fail-open")).toEqual([]);
   });
 });

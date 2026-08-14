@@ -764,6 +764,54 @@ describe("check-changelog-entry — a `<!--` in prose does not blind the parser"
     expect(r.out).toContain("## v0.20.11");
   });
 
+  it("a 4-space `<!--` at the END of the file opens nothing — no unclosed WARN", () => {
+    // The observable half of the ≤3-space anchor. The test above puts the
+    // 4-space opener above a column-0 heading, and container scoping now ends a
+    // block at that dedent regardless — so that fixture alone no longer
+    // distinguishes `start <= 3` from `start <= 4`, and the boundary would go
+    // unpinned.
+    //
+    // Here the indented code block TRAILS the file, so nothing dedents before
+    // EOF and the only witness is the state machine's own end state: relax the
+    // anchor by one column and this `<!--` opens a comment that never closes,
+    // firing the unclosed-comment WARN on a file that contains no open comment
+    // at all. Correct behaviour is a silent OK.
+    const TRAILING_INDENTED_CODE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+      "The raw markdown of a staging block, as an indented code block:",
+      "",
+      "    <!--",
+      "    ## v0.0.1 — a heading inside indented code",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent4-eof-", TRAILING_INDENTED_CODE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      TRAILING_INDENTED_CODE.replace(
+        "- **Earlier entry (#0):** already staged.\n",
+        "- **Earlier entry (#0):** already staged.\n- **Branch entry (#2):** staged.\n",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry, with indented code trailing the file");
+
+    const r = f.checkStreams();
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("## Unreleased grew");
+    expect(`${r.stdout}${r.stderr}`).not.toContain("never closed");
+  });
+
   it("still masks a GENUINE line-start multi-line comment, `## ` lines and all", () => {
     // The other side of the anchoring rule, and the real use this must not break:
     // a comment that DOES start its own line spans lines exactly as before, so a
@@ -971,6 +1019,293 @@ describe("check-changelog-entry — `<!-->` and `<!--->` are COMPLETE comments",
   });
 });
 
+describe("check-changelog-entry — a fence or comment under a list item is scoped to that item", () => {
+  // Round 5 of the same fail-open class. Both multi-line openers are recognised
+  // at up to 3 spaces of indent ANYWHERE in the document, with no notion of the
+  // block CONTAINER they sit in. CommonMark scopes a fence or HTML block opened
+  // inside a list item TO that list item: a column-0 line ends the list, ends
+  // the block, and is a real heading. A container-blind masker keeps the block
+  // open at document level and blanks straight through it.
+  //
+  // It is the container, not the indent — remove the bullet and the two agree,
+  // because a doc-level `  ```yaml` left unclosed runs to EOF in CommonMark too
+  // (pinned as a fail-CLOSED row in the differential battery).
+  //
+  // This shape is the file's own house style: the real CHANGELOG.md already
+  // ships an entry whose example block is indented under its bullet. Measured on
+  // it at this PR's previous head, one such prose block took the parse from 429
+  // sections to 179 — 250 of 429 released headings erased — and because a
+  // column-0 fence further down eventually closed the runaway fence,
+  // `unclosedFenceLine` stayed NULL and the round-3/4 WARN backstop never fired.
+  // Silent OK, exit 0, on a genuinely buried entry.
+
+  /** As the `<!-->` block's fixture: prose spliced into Unreleased, buried entry at the end. */
+  function fixture(prefix: string, prose: string[], trailer: string[] = []): Fixture {
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      ...prose,
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+      ...trailer,
+    ].join("\n");
+    const f = makeFixture(prefix, BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "- **Something shipped (#1):** prose.\n",
+        "- **Something shipped (#1):** prose.\n- **BURIED ENTRY (#2):** appended under the RELEASED heading.\n",
+      ),
+    );
+    f.commit("feat: ship code and bury the entry under a released heading");
+    return f;
+  }
+
+  const MERGE_GROUP = { GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" };
+  // A column-0 fence further down the file, as the real CHANGELOG.md carries 30+
+  // of. It is what CLOSES a runaway container fence, so not even the
+  // unclosed-fence WARN fires — the silent half of this fail-open.
+  const LATER_FENCE = ["```console", "$ pasted transcript", "```", ""];
+  // Same job for the comment variant.
+  const LATER_COMMENT = ["<!-- reviewer note: keep until the next cut -->", ""];
+
+  // NON-VACUITY, structural: control and attacks are the SAME fixture but for
+  // the prose block, and are asserted to differ in exit code and message.
+  it("control: the buried entry FAILs with no container block in prose", () => {
+    const s = fixture("changelog-container-control-", [], LATER_FENCE).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+  });
+
+  it("attack: a fence indented under a bullet must NOT mask the released heading below", () => {
+    // Mutation-proven: widen the fence opener back to `/^ {0,3}(...)/` without
+    // the container rule and this run is exit 0, "OK — no entry added under a
+    // released section", with NO WARN, because `## v0.20.11` and the buried
+    // entry are both inside a fence the guard thinks is still open.
+    const s = fixture(
+      "changelog-container-fence-",
+      ["- an entry whose example block is indented under the bullet:", "", "  ```yaml", "  key: value"],
+      LATER_FENCE,
+    ).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("attack: a comment indented under a bullet must NOT mask the released heading below", () => {
+    // The same container rule for HTML block type 2. Without it the `  <!--`
+    // runs to the trailer's `-->`, taking `## v0.20.11` with it, and
+    // `unclosedCommentLine` stays null so the WARN backstop is silent too.
+    const s = fixture(
+      "changelog-container-comment-",
+      ["- an entry with a note tucked under it:", "  <!--"],
+      LATER_COMMENT,
+    ).checkStreams(MERGE_GROUP);
+    expect(s.code).toBe(1);
+    expect(`${s.stdout}${s.stderr}`).toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).toContain("BURIED ENTRY (#2)");
+    expect(`${s.stdout}${s.stderr}`).toContain("## v0.20.11");
+  });
+
+  it("does NOT over-correct: a column-0 `<!--` closed by a later `-->` is still comment body", () => {
+    // The other direction, and the one this fix must not break. A line-start
+    // comment at column 0 is CommonMark-correct comment body all the way to its
+    // `-->`, so a `## ` inside it is commentary, not a section — and an entry
+    // appended after it is ordinary Unreleased growth, silently OK. Anchor the
+    // container rule at the wrong place (e.g. end a comment at ANY column-0
+    // line) and this reds with a phantom `## v9.9.9` section.
+    const COMMENTED = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!--",
+      "## v9.9.9 — a heading inside a real comment, not a section",
+      "reviewer note: keep this block until the next cut",
+      "-->",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-container-nofix-", COMMENTED);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      COMMENTED.replace(
+        "- **Earlier entry (#0):** already staged.\n",
+        "- **Earlier entry (#0):** already staged.\n- **Branch entry (#2):** appended under Unreleased.\n",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry below a real HTML comment");
+
+    const s = f.checkStreams();
+    expect(s.code).toBe(0);
+    expect(`${s.stdout}${s.stderr}`).toContain("## Unreleased grew");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("WARN");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("v9.9.9");
+  });
+
+  it("a BLANK line does not end a container block — fence content stays code", () => {
+    // The container rule keys on a DEDENT, and a blank line is not one: a blank
+    // line is fence content, and does not end an HTML block type 2 either. Drop
+    // the `line.trim() !== ''` guard and a blank line (indent 0) dedents every
+    // indented block, so the rest of this pasted transcript stops being masked
+    // — and RULE 1 then counts a line of console output as a staged entry,
+    // reporting "## Unreleased grew" for a PR that staged nothing. Fail-OPEN on
+    // the growth rule, so it is pinned by outcome here: with the guard intact
+    // this shippable PR correctly reds for having no entry.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** with a pasted transcript:",
+      "",
+      "  ```console",
+      "  $ switchroom doctor",
+      "  ok",
+      "",
+      "  $ switchroom status",
+      "  ```",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-container-blankline-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace("  $ switchroom status\n", "  $ switchroom status\n  running\n"),
+    );
+    f.commit("feat: ship code and only extend a pasted transcript");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+    expect(r.out).toContain("src/feature.ts");
+    expect(r.out).not.toContain("## Unreleased grew");
+  });
+
+  it("a dedented closer is CLOSING punctuation, not a staged entry", () => {
+    // The closer is checked BEFORE the dedent rule on purpose: CommonMark lets a
+    // closing fence be indented LESS than its opener, so a column-0 ``` under an
+    // indented opener is that fence's own closer. Check the dedent first and the
+    // line stops being fence punctuation — it survives masking as literal text,
+    // and RULE 1 counts one line of ``` as a staged changelog entry. This PR
+    // stages no entry at all, so the only correct verdict is a red.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-container-closer-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "<!-- staging area; entries land here per-PR -->\n",
+        "<!-- staging area; entries land here per-PR -->\n\n  ```yaml\n  key: value\n```\n",
+      ),
+    );
+    f.commit("feat: ship code and paste a config block, staging no entry");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+    expect(r.out).not.toContain("## Unreleased grew");
+  });
+
+  it("does NOT over-correct: a fence under a bullet that CLOSES still hides its `## ` line", () => {
+    // The house style, written correctly: the closer sits at the opener's own
+    // indent, so the block never dedents and the container rule never fires. A
+    // `## ` inside it must stay code — read it as a heading and every later PR
+    // appending to `## Unreleased` reds against a phantom released section.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "<!-- staging area; entries land here per-PR -->",
+      "",
+      "- **Earlier entry (#0):** shows the release rename:",
+      "",
+      "  ```console",
+      "  ## v9.9.9 — pasted release heading, not a section",
+      "  ```",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-container-closed-fence-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "  ```\n",
+        "  ```\n\n- **Branch entry (#2):** appended under Unreleased, below the block.\n",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry below an indented fenced block");
+
+    const s = f.checkStreams();
+    expect(s.code).toBe(0);
+    expect(`${s.stdout}${s.stderr}`).toContain("## Unreleased grew");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("ALREADY-RELEASED");
+    expect(`${s.stdout}${s.stderr}`).not.toContain("WARN");
+
+    // …and the block's own lines are NOT entries. A `## ` heading indented
+    // inside a fence is invisible to the column-0 `parseSections` either way, so
+    // the observable claim is the entry count: decline to open the indented
+    // fence and this pasted release heading becomes a staged changelog entry,
+    // turning a PR that staged nothing into an OK.
+    const BLOCK = [
+      "  ```console",
+      "  ## v9.9.9 — pasted release heading, not a section",
+      "  ```",
+      "",
+    ].join("\n");
+    const BASE_NO_BLOCK = BASE.replace(`${BLOCK}\n`, "");
+    expect(BASE_NO_BLOCK).not.toContain("```");
+    const g = makeFixture("changelog-container-closed-fence-only-", BASE_NO_BLOCK);
+    g.writeFile("src/feature.ts", "export const feature = 3;\n");
+    g.writeFile("CHANGELOG.md", BASE);
+    g.commit("feat: ship code and only paste a transcript into Unreleased");
+
+    const only = g.check();
+    expect(only.code).toBe(1);
+    expect(only.out).not.toContain("## Unreleased grew");
+  });
+});
+
 describe("check-changelog-entry — a `## ` heading is recognised at column 0 only", () => {
   // `parseSections` and `extractUnreleasedEntries` must agree on what a heading
   // is, and both anchor at column 0 rather than honouring CommonMark's ≤3-space
@@ -1006,6 +1341,44 @@ describe("check-changelog-entry — a `## ` heading is recognised at column 0 on
     expect(r.out).toContain("ALREADY-RELEASED");
     expect(r.out).toContain("BURIED ENTRY (#2)");
     expect(r.out).toContain("## v0.20.11");
+  });
+
+  it("an indented `## ` inside Unreleased does not TRUNCATE the section", () => {
+    // The third column-0 site, and the only one that had no outcome test: the
+    // section-END scan in `extractUnreleasedEntries`. Loosen it to `/^\s*##\s/`
+    // and the indented prose line below ends `## Unreleased` early, so the entry
+    // beneath it stops counting as growth and this shippable PR reds with
+    // "adds no new entry under `## Unreleased`" — fail-CLOSED, but a false FAIL
+    // on a PR that did exactly what the guard asked. Column 0 keeps the section
+    // END and the section START agreeing on what a heading is.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "- **Earlier entry (#0):** to cut a release, rename the header:",
+      "  ## v0.20.12 — the next cut",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent-heading-truncate-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace(
+        "  ## v0.20.12 — the next cut\n",
+        "  ## v0.20.12 — the next cut\n- **Branch entry (#2):** staged below the indented line.\n",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry below an indented pseudo-heading");
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("## Unreleased grew");
+    expect(r.out).not.toContain("check-changelog-entry: FAIL");
   });
 
   it("a 4-space-indented `## Unreleased` is not a staging section for RULE 1 either", () => {

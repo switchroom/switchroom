@@ -159,12 +159,23 @@ export function insertEntry(changelog, entryLine, category) {
 
   // Locate `## Unreleased`. If absent, seed one right after the `# Changelog`
   // title (or at the very top) so there is always a section to stage into.
-  let head = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l.trim()))
+  //
+  // Anchored at column 0, matching `check-changelog-entry`'s `parseSections`
+  // and the `end` scan below (which always was). The writer and the checker
+  // have to agree on WHICH line is the staging section: tolerate an indent here
+  // and an entry gets written under a heading the guard does not count, so a PR
+  // that did stage an entry reds anyway with no visible cause. Residual, and
+  // deliberately not fixed here: this function does not mask fenced or
+  // commented regions, so a column-0 `## Unreleased` inside a code fence is
+  // still a candidate for it and is not one for the guard. The real file has no
+  // such fence, and masking the writer too is a larger change than this
+  // alignment.
+  let head = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l))
   if (head === -1) {
     const titleIdx = lines.findIndex((l) => /^#\s+/.test(l.trim()))
     const at = titleIdx === -1 ? 0 : titleIdx + 1
     lines.splice(at, 0, '', '## Unreleased', '')
-    head = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l.trim()))
+    head = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l))
   }
 
   // Section body spans (head, end): up to the next `## ` heading (NOT `###`).

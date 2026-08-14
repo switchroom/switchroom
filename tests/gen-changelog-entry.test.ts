@@ -25,6 +25,12 @@ import { join, dirname, resolve } from "node:path";
 const repoRoot = resolve(import.meta.dirname, "..");
 const GEN = join(repoRoot, "scripts", "gen-changelog-entry.mjs");
 
+// The guard's own extractor, used to assert writer/checker AGREEMENT rather
+// than re-implementing "what counts as a staged entry" a third time here.
+const { extractUnreleasedEntries } = await import(
+  join(repoRoot, "scripts", "check-changelog-entry.mjs")
+);
+
 const SEED_CHANGELOG = [
   "# Changelog",
   "",
@@ -184,6 +190,44 @@ describe("gen-changelog-entry — derives an entry from the conventional-commit 
     expect(unreleasedBlock(f.readChangelog())).toContain(
       "- **BREAKING** **config: drop the legacy overlay (#99)**",
     );
+  });
+});
+
+describe("gen-changelog-entry — the writer and the checker agree on the section", () => {
+  it("ignores an INDENTED `## Unreleased` and stages where the guard will count it", () => {
+    // `insertEntry` finds the staging section at column 0, exactly like the
+    // guard's `parseSections` / `extractUnreleasedEntries`. Tolerate an indent
+    // and this file's example block becomes the staging target: the bullet gets
+    // written inside an indented code block, the guard counts zero new entries,
+    // and the PR reds for "no changelog entry" while its entry sits in the file.
+    // Asserted through the GUARD's own extractor, because agreement between the
+    // two scripts is the property, not either one's internal notion of a match.
+    const EXAMPLE_ONLY = [
+      "# Changelog",
+      "",
+      "- **Docs (#1):** the staging block is written like this:",
+      "",
+      "      ## Unreleased",
+      "",
+      "      <!-- staging area; entries land here per-PR -->",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("gen-indented-unreleased-", EXAMPLE_ONLY);
+    f.writeFile("src/feature.ts", "export const x = 1;\n");
+    f.commit("feat(cli): add a verb");
+
+    const r = f.gen(["--pr", "42"]);
+    expect(r.code).toBe(0);
+
+    const after = f.readChangelog();
+    const entries = extractUnreleasedEntries(after);
+    expect(entries.join("\n")).toContain("(#42)");
+    // The example block is untouched, and is still not a section.
+    expect(after).toContain("      ## Unreleased");
   });
 });
 

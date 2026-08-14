@@ -348,11 +348,35 @@ function maskCommentsInLine(s, allowMultiline = true) {
  * (4-space) code block needs no special case: such a block's lines all carry 4+
  * spaces, which the ≤3-space anchor already rejects.
  *
- * NOT modelled: the other six HTML block types (1, 3, 4, 5, 6, 7). Realism on
- * THIS file is nil — the real CHANGELOG.md contains zero line-start HTML block
- * openers — but "not hit in practice" is not the same as "harmless", so the
- * directions are recorded rather than waved away, and pinned by the committed
- * differential battery in `tests/fixtures/commonmark-mask-cases.mjs`:
+ * CONTAINERS, approximated. CommonMark scopes a block to the CONTAINER it was
+ * opened in: a fence or comment opened inside a list item ends where that list
+ * item ends, so a column-0 line closes it and IS a real heading. Ignore that and
+ * an unclosed fence indented under a bullet — the file's own house style for an
+ * entry with an example — blanks every heading below it to EOF: measured, 250 of
+ * the 429 released headings erased, with no WARN, because the state machine
+ * still believed it was inside a block CommonMark had already closed. That is
+ * the fail-OPEN this guard exists to prevent, so what is modelled here is not
+ * the full container stack, only a refusal to mask past a DEDENT.
+ *
+ * The approximation: a non-blank line indented LESS than the line that opened
+ * the block ends the block. A blank line is not a dedent (blank lines are fence
+ * content, and do not end a type-2 comment). Where CommonMark disagrees it is
+ * because the opener was document-level and merely indented 1–3 spaces, in which
+ * case the block really did stay open — the guard ends it early and may invent a
+ * phantom section, the fail-CLOSED direction, by construction. Because the real
+ * closer is then still ahead, ending a block this way sets `resync`: masking
+ * stays off, but nothing may OPEN until that closer goes by, so the block's own
+ * closing delimiter cannot be misread as a fresh opener and restart the very
+ * run-to-EOF fail-open this paragraph is about.
+ *
+ * NOT modelled: the other six HTML block types (1, 3, 4, 5, 6, 7), and — beyond
+ * the dedent rule above — containers themselves: block quotes, and the list
+ * marker/indent bookkeeping that would tell a real parser exactly where an item
+ * ends. Realism on THIS file is nil for the HTML types — the real CHANGELOG.md
+ * contains zero line-start HTML block openers — but "not hit in practice" is not
+ * the same as "harmless", so the directions are recorded rather than waved away,
+ * and pinned by the committed differential battery in
+ * `tests/fixtures/commonmark-mask-cases.mjs`:
  *
  *   - fail-CLOSED: a `## ` line inside a type 1/3/4/5/6 block is raw HTML to
  *     CommonMark and a heading to this masker, so it becomes a PHANTOM released
@@ -379,24 +403,55 @@ function maskCommentsInLine(s, allowMultiline = true) {
 export function maskNonProseWithState(text) {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n')
   const blank = (/** @type {string} */ l) => ' '.repeat(l.length)
-  /** @type {{char: string, len: number, line: number} | null} */
+  /** @type {{char: string, len: number, line: number, indent: number} | null} */
   let fence = null
   let inComment = false
   /** @type {number | null} 1-based line the currently-open comment started on. */
   let commentLine = null
+  /** Indent (leading spaces) of the line the open comment started on. */
+  let commentIndent = 0
+  /**
+   * Set when a block was ended by a DEDENT rather than by its own closer, i.e.
+   * the container-scoping guess above. Masking is off while it is set (that is
+   * the fail-closed half); it exists so the block's REAL closer cannot be
+   * misread as a fresh opener. See the container note in the docstring.
+   * @type {{kind: 'fence', char: string, len: number} | {kind: 'comment'} | null}
+   */
+  let resync = null
   /** @type {string[]} */
   const out = []
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+    const indent = /^ */.exec(line)[0].length
+    // CommonMark scopes a block to its CONTAINER: a fence or comment opened
+    // inside a list item ends with that list item, so a line indented LESS than
+    // the opener is outside the block. Blank lines are not a dedent (a blank
+    // line is fence content, and does not end a type-2 comment).
+    const dedents = (/** @type {number} */ openerIndent) =>
+      line.trim() !== '' && indent < openerIndent
+
     if (fence !== null) {
       // Inside a fence NOTHING else is markup: a `<!--` here is code, not a
-      // comment opener, so `inComment` cannot change.
+      // comment opener, so `inComment` cannot change. The closer is checked
+      // BEFORE the dedent, because a closer may be indented less than its
+      // opener (CommonMark allows any closer indent up to 3) and is then a
+      // genuine close, not a container exit.
       if (m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '') {
         fence = null
+        out.push(blank(line))
+        continue
       }
-      out.push(blank(line))
-      continue
+      if (!dedents(fence.indent)) {
+        out.push(blank(line))
+        continue
+      }
+      resync = { kind: 'fence', char: fence.char, len: fence.len }
+      fence = null
+    } else if (inComment && dedents(commentIndent)) {
+      inComment = false
+      commentLine = null
+      resync = { kind: 'comment' }
     }
     if (inComment) {
       const idx = line.indexOf('-->')
@@ -414,15 +469,31 @@ export function maskNonProseWithState(text) {
       out.push(' '.repeat(idx + 3) + tail.masked)
       continue
     }
+    if (resync !== null) {
+      // We guessed a container exit and may be wrong — CommonMark may still be
+      // INSIDE the block. Emit verbatim (so a heading below is visible: worst
+      // case a phantom section, the fail-CLOSED direction) but open nothing,
+      // because the block's own closing delimiter is still ahead of us and
+      // reading it as an OPENER is what turns this into a fail-OPEN: the
+      // spurious block then runs on and erases real headings below.
+      const closes =
+        resync.kind === 'fence'
+          ? Boolean(m && m[1][0] === resync.char && m[1].length >= resync.len && m[2].trim() === '')
+          : line.includes('-->')
+      if (closes) resync = null
+      out.push(line)
+      continue
+    }
     // An opening fence's info string may not contain a backtick (CommonMark).
     if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
-      fence = { char: m[1][0], len: m[1].length, line: i + 1 }
+      fence = { char: m[1][0], len: m[1].length, line: i + 1, indent }
       out.push(blank(line))
       continue
     }
     const masked = maskCommentsInLine(line)
     inComment = masked.open
     commentLine = inComment ? i + 1 : null
+    if (inComment) commentIndent = indent
     out.push(masked.masked)
   }
   return {

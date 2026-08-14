@@ -126,12 +126,41 @@ now an anomaly worth investigating, not the norm.
   indented code block); the ≤3-space tolerance is deliberately not honoured,
   because an indented `## Unreleased` inside an already-released section would
   un-release everything below it. And the CommonMark evidence these rounds kept
-  being argued from is now committed as a 31-case differential battery
+  being argued from is now committed as a 38-case differential battery
   (`tests/fixtures/commonmark-mask-cases.mjs`), each row carrying the reference
   implementation's answer, so the six unmodelled HTML block types are pinned with
   their direction (a `## ` inside one is a phantom released section, fail-closed;
   a line-start `<!--` inside a type-6 block masks a real heading away, fail-open)
   rather than waved off as "a changelog does not hit them".
+  Finally, the masker is now CONTAINER-aware, which is the last and largest
+  fail-open of the set: CommonMark scopes a fence or comment to the container it
+  was opened in, so one opened inside a list item ends WITH that item and a
+  column-0 line below it is a real heading. The scanner tracked neither, kept the
+  block open at document level and blanked straight through — and the shape that
+  triggers it is this file's own house style, an entry with an indented example
+  under its bullet. Measured on the real CHANGELOG.md, a single unclosed fence
+  indented under a bullet erased 250 of the 429 released headings, with no WARN,
+  because as far as the state machine was concerned the block was legitimately
+  still open: end-to-end on a queue ref, a genuinely buried entry came back
+  `OK`, exit 0. It is the CONTAINER and not the indent — remove the bullet and
+  reference and scanner agree — so the fix is not to anchor openers at column 0
+  (measured, that is 2.6x WORSE: declining an indented opener desynchronises
+  fence state, and the fence's own later closer then opens a spurious block that
+  runs to EOF) but to refuse to mask past a DEDENT: a non-blank line indented
+  less than the opener ends the block. A blank line is not a dedent, since blank
+  lines are fence content. Where that guess is wrong the opener was document-level
+  and merely indented 1-3 spaces, so the block ends early and at worst invents a
+  phantom section — fail-CLOSED by construction, the direction this guard is
+  allowed to be wrong in. Ending a block that way also blocks any new block from
+  opening until the pending closer goes by, so the real closer cannot be misread
+  as a fresh opener and restart the very run-to-EOF this fixes. Differentially
+  fuzzed over 60,000 generated documents against `commonmark@0.31.2`: the fence
+  and comment family goes from 736 fail-open documents to ZERO, and parity on
+  the real CHANGELOG.md is exact at 429 sections against 429 rendered `<h2>`,
+  with nothing lost and nothing invented. `gen-changelog-entry.mjs` learned the
+  same column-0 anchoring for `## Unreleased`, so the writer and the checker
+  cannot disagree about which line is the staging section and stage an entry
+  where the guard will not count it.
 - **telegram/render: a `<pre>` whose body contained ``` shipped an
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
