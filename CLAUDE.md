@@ -34,8 +34,8 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
 ## Models
 
 - **Code default** when `model:` is absent or the literal `"default"` is
-  `claude-sonnet-5` (`SWITCHROOM_DEFAULT_MAIN_MODEL`, `src/agents/scaffold.ts:1509`;
-  `resolveMainModel()` at :1525). `"default"` deliberately does NOT mean the
+  `claude-sonnet-5` (`SWITCHROOM_DEFAULT_MAIN_MODEL`, `src/agents/scaffold.ts:1695`;
+  `resolveMainModel()` at :1711). `"default"` deliberately does NOT mean the
   *account* default — claude would pass it through and resolve it to a model
   the account may not have, 4xx'ing every turn. The live fleet's
   `defaults.model` lives in the operator's `switchroom.yaml`, not in this repo.
@@ -43,18 +43,18 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
   ids: an alias tracks the current flagship, a pinned id goes stale. `fable`
   resolves ONLY through the LiteLLM proxy — `normalizeModelAlias()` folds
   `claude-fable-5` → `fable`. **Adding a proxy-only model means editing the
-  repoint `case` in `profiles/_base/start.sh.hbs` (~:1772)** — that is where
-  routing actually moves. `src/agents/compose.ts` bakes `ANTHROPIC_BASE_URL` on
-  model CLASS, so `fable` (a Claude model) starts on the `/anthropic`
-  passthrough and start.sh repoints it to the router root at boot.
-  `declaredRoutingMode()` (`scaffold.ts:1546`) routes nothing: it only encodes
+  repoint `case` in `profiles/_base/start.sh.hbs` (~:2417-2500)** — that is
+  where routing actually moves. `src/agents/compose.ts` bakes
+  `ANTHROPIC_BASE_URL` on model CLASS, so `fable` (a Claude model) starts on
+  the `/anthropic` passthrough and start.sh repoints it to the router root at
+  boot. `declaredRoutingMode()` (`scaffold.ts:1732`) routes nothing: it only encodes
   the POST-repoint intent so `.routing-mode` can compare landed vs declared.
   Change the repoint case and that function together or a healthy boot fires a
   spurious "Routing divergence" alert.
 - **Only PINNED Opus 4.x is covered by the adaptive-thinking risk check.**
   `isAdaptiveThinkingOpus()` (`src/config/thinking-effort-risk.ts`) matches
   `claude-opus-4*` and nothing else; `switchroom doctor` WARNs on those with
-  `thinking_effort` above the `low` floor (`src/cli/doctor.ts:533`). The
+  `thinking_effort` above the `low` floor (`src/cli/doctor.ts:592-605`). The
   documented failure is the upstream claude-CLI interleaved-streaming merge bug
   (#1978): `400 messages.N.content.M: 'thinking' or 'redacted_thinking' blocks
   in the latest assistant message cannot be modified`. It was FIXED in
@@ -103,7 +103,7 @@ Non-negotiable; `reference/vision.md` pillar 3 as an engineering gate.
 bun install                  # deps (bun.lock)
 bun run dev -- <args>        # run CLI from src/ via bin/switchroom.ts
 npm run build                # node scripts/build.mjs → dist/
-npm run lint                 # tsc --noEmit + 16 guard scripts (see Lint gates)
+npm run lint                 # tsc --noEmit + 32 guard scripts (see Lint gates)
 npm test                     # vitest run + bun test <explicit file list>
                              #   NOTE: pretest runs a full build first
 npm run test:vitest          # vitest only (src/ + tests/ + telegram-plugin non-bun)
@@ -212,18 +212,30 @@ obligation:
 `npm run lint` = `tsc --noEmit` plus these guard scripts (most have an
 `npm run lint:<name>` alias; see `package.json`):
 `check-plugin-references`, `check-bot-api-wrapping`,
-`check-bun-test-imports`, `check-bun-module-mock-scope`,
-`check-no-pii-secrets`, `check-vault-test-hermeticity`,
+`check-bun-test-imports`, `check-test-runner-coverage`,
+`check-bun-module-mock-scope`, `check-no-pii-secrets`,
+`check-bench-baseline-anonymised`, `check-vault-test-hermeticity`,
 `check-auth-test-hermeticity`, `check-agent-state-dir-hermeticity`,
+`check-hindsight-bank-hermeticity`, `check-parked-turn-start-hermeticity`,
 `check-no-broadcast-delivery`, `check-stale-tool-descriptions`,
 `check-mcp-instructions-budget`, `check-web-subscription-honest`,
 `check-no-unpinned-npx-playwright`, `check-gateway-line-ratchet`,
+`check-retry-flood-hooks`, `check-callback-ctx-wrapping`,
+`check-ctx-send-wrapping`, `check-status-pin-single-path`,
 `check-litellm-config-guard`, `check-release-asset-names`,
-`check-status-pin-single-path`, `check-agent-attribution-trailers`,
-`check-callback-ctx-wrapping`, `check-ctx-send-wrapping`,
-`check-foreign-db-readonly`, `check-mutation-coverage`.
+`check-foreign-db-readonly`, `check-claude-cli-lockstep`,
+`check-changelog-entry`, `check-agent-attribution-trailers`,
+`check-hindsight-write-redaction`, `check-mutation-coverage`,
+`check-secret-pattern-parity`, `check-hostd-template-guard`.
 
 Traps that bite repeatedly:
+
+- **`check-test-runner-coverage` guards a file running in NEITHER runner**
+  (#3756): the repo has two independently-wired test runners (vitest and
+  `bun test`), and adding a file to vitest's `exclude` to unblock CI — usually
+  because it imports `bun:sqlite` — without also adding it to the bun target
+  list leaves it silently unexecuted by either. See the Tests section's own
+  warning about the same failure mode.
 
 - **`check-mutation-coverage` proves the tests constrain something** (v0.21.8
   post-mortem). Two PRs in one release shipped suites that asserted nothing:
@@ -239,9 +251,9 @@ Traps that bite repeatedly:
   perturbs the named symbols and fails if the scoped suite stays green.
   Diff-gated ON PULL REQUESTS ONLY, and that caveat is the trap: the gate is
   `GITHUB_BASE_REF`, which Actions sets for `pull_request` and NOT for
-  `push: main` or `merge_group`, and `check-mutation-coverage.mjs:99-114` treats
-  an unresolvable base as "run everything" (a shallow checkout takes the same
-  fallback). `ci-lint.yml` fires on all three and `lint-run`'s `if:` forces it
+  `push: main` or `merge_group`, and `scripts/mutation/changed-files.mjs:14-40`
+  treats an unresolvable base as "run everything" (a shallow checkout takes
+  the same fallback). `ci-lint.yml` fires on all three and `lint-run`'s `if:` forces it
   on push and merge_group, so EVERY merge-queue entry and every push to main
   runs the WHOLE manifest, not only the touched entries. Budget accordingly: the
   one shipped target is ~7s, and that is a per-queue-entry cost, not a per-PR
@@ -250,9 +262,11 @@ Traps that bite repeatedly:
   that previously never ran tests — manifest entries must be hermetic (no
   docker, no network, no host state). Run `npm run lint:mutation-coverage` for
   every target. Escape hatch (reason mandatory): `// mutation-allow: <reason>`
-  on or above the line, for genuinely equivalent mutants —
-  `src/util/log-rotation.ts:641` is the worked example; it must be real source,
-  not string-literal content. Adding a target: name the narrowest `symbols` (an
+  on or above the line, for genuinely equivalent mutants; it must be real
+  source, not string-literal content. No live annotation exists in `src/` as
+  of this writing (`grep -rn "mutation-allow:" src/` is empty) — the pattern
+  is exercised only by `tests/mutation-guard.test.ts` and implemented in
+  `scripts/mutation/operators.mjs`. Adding a target: name the narrowest `symbols` (an
   unscoped entry on a 6000-line module is hours of CI), state the blast radius
   in `why`, and record the enumerated `mutants` count — that count is a ratchet,
   because a refactor to a ternary / `&&` / `switch` moves the logic to a site no
@@ -479,7 +493,7 @@ map): `vision.md` (four outcomes: standing team / on the leash /
 subscription-honest / always available), `principles.md` (three checks —
 docs test, defaults test, consistency test; a "no" is a redesign),
 `invariants.md` (hard gates: claude-native, no-self-escalation, on-leash,
-single-tenant, telegram-and-buzz-only, chat-is-source-of-truth), `product-spec.md`
+single-tenant, telegram-and-buzz-only, chat-is-the-single-source-of-truth), `product-spec.md`
 (job index), `jobs/*.md` (outcome-focused job specs — survey with
 `head -7 reference/jobs/*.md`), `rfcs/` (the "how" layer + standing design
 records).
@@ -722,8 +736,9 @@ published to npm because publish wasn't gated. Don't let that recur.
 ## Secrets & safety rails
 
 Dev-host vault is broker-auto-unlocked: `switchroom vault get <key>` needs no
-passphrase. On-disk layout + the 5-state layout migration
-(`src/vault/migrate-layout.ts`) are documented in `docs/vault.md` § Layout.
+passphrase. On-disk layout is documented in `docs/vault.md` § Architecture;
+the 5-state (A–E) layout migration itself lives only in source —
+`src/vault/migrate-layout.ts:149-188` — `docs/vault.md` does not mention it.
 Never mirror the vault to plaintext; never commit tokens. Never
 bypass hooks (`--no-verify`) or force-push `main`. Don't touch `vendor/`,
 `~/.switchroom/vault/`, or private dirs without reason.
