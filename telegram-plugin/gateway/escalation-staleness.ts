@@ -30,8 +30,9 @@
  *      routed to, read from the router's own override record
  *      (`answer-route-overrides.ts`).
  *
- *      NOT a chat-wide fallback, and NOT an open-ended one. Both weaker forms
- *      were tried on this branch and both silently drop a real message:
+ *      NOT a chat-wide fallback, and NOT an open-ended one at EITHER end. Three
+ *      weaker forms were tried on this branch and every one silently drops a
+ *      real message:
  *
  *      (i) CHAT-WIDE ("did anything long land in this chat since openedAt") has
  *      no relationship to the obligation beyond the chat id, so in a busy forum
@@ -56,12 +57,28 @@
  *      genuinely-unanswered message in silence — pre-fix this escalates
  *      correctly, so that shape is a REGRESSION, not a fix.
  *
- *      So the fallback's cutoff is the OVERRIDE'S OWN `atMs`, and an override is
- *      only consulted while it is fresh (`resolveRerouteMatchWindowMs`). An
- *      override licenses a look for the answer THAT routing produced, in the
- *      moments after it — nothing more. On 2026-08-13 the newest override is
- *      594.9 s stale at the decision, so no fallback runs at all and the
- *      escalation fires, as it must.
+ *      (iii) OVERRIDE-GATED, CUT AT `atMs`, BUT OPEN-ENDED FORWARD — "this
+ *      override is fresh, therefore accept anything ≥200 chars delivered in M
+ *      from `atMs` onwards, however long onwards turns out to be" — is the SAME
+ *      defect once more, now leaking out the other end of the window. Freshness
+ *      is judged at the settle gate's `firstAt` (the instant the question was
+ *      FIRST asked) while the history row is read at the RE-CHECK, and the gates
+ *      above this branch can starve the sweep for minutes between the two. So
+ *      the override is fresh, the delivery is not, and they are paired anyway:
+ *      a short reply is rerouted to topic M at T+0, the obligation correctly
+ *      stays open (under the substantive floor), an unrelated ≥200-char answer
+ *      lands in M at T+90, the next sweep runs at T+107 and closes the
+ *      obligation `via=reroute`. Same shape as (ii), reached by a different
+ *      route. Test (f).
+ *
+ *      So the fallback's window is bounded at BOTH ends by the OVERRIDE'S OWN
+ *      `atMs` — `[atMs, atMs + rerouteMatchWindowMs]` — and an override is only
+ *      consulted while it is itself fresh (`resolveRerouteMatchWindowMs`). Both
+ *      ends are absolute instants fixed by the record, so neither moves when the
+ *      sweep is starved. An override licenses a look for the answer THAT routing
+ *      produced, in the moments after it — nothing more. On 2026-08-13 the
+ *      newest override is 594.9 s stale at the decision, so no fallback runs at
+ *      all and the escalation fires, as it must.
  *
  *   2. NO SETTLE. The check is a point-in-time read of history, but the answer
  *      is frequently still IN FLIGHT at the instant the sweep decides: the reply
@@ -189,10 +206,27 @@ export const OBLIGATION_REROUTE_MATCH_MS_MAX =
  * widening the guard; a value above `OBLIGATION_REROUTE_MATCH_MS_MAX` is
  * clamped.
  *
- * RESIDUAL, stated plainly: within the window the fallback still cannot tell
- * the rerouted answer from a second ≥200-char delivery that lands in the same
- * thread in those few seconds — the override carries no message id to tie it to
- * one row. The window is what bounds that exposure; it is not eliminated.
+ * The window bounds the fallback TWICE, and the distinction matters because one
+ * of the two was missing and re-opened the silent close (#4681, form (iii) in
+ * the module header):
+ *
+ *   - it bounds which OVERRIDES are consulted — no record older than the window
+ *     (measured back from `anchorMs`) licenses anything; and
+ *   - it bounds which DELIVERIES a consulted override may be paired with — only
+ *     rows inside `[atMs, atMs + window]`, the interval in which the answer that
+ *     routing produced could actually land.
+ *
+ * The second is not implied by the first. Freshness is judged at `anchorMs` (the
+ * settle gate's `firstAt`) while the history row is read at the re-check, and the
+ * sweep can be starved for minutes in between — so without the delivery bound a
+ * legitimately fresh override reaches arbitrarily far forward.
+ *
+ * RESIDUAL, stated plainly: inside `[atMs, atMs + window]` the fallback still
+ * cannot tell the rerouted answer from a second ≥200-char delivery that lands in
+ * the same thread in those few seconds — the override carries no message id to
+ * tie it to one row. That interval is fixed by the record's own timestamp, so it
+ * does not widen when the sweep is starved; it is what bounds the exposure, and
+ * the exposure is bounded, not eliminated.
  */
 export function resolveRerouteMatchWindowMs(
   settleMs: number,
@@ -200,7 +234,10 @@ export function resolveRerouteMatchWindowMs(
 ): number {
   const derived = Math.max(settleMs, 0) + REROUTE_MATCH_GRACE_MS
   const raw = env.SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS
-  if (raw == null || raw === '') return derived
+  // `.trim()`, not `=== ''`: `Number(' ') === 0`, so a whitespace-only value —
+  // the shape a stray `KEY=" "` in an env file produces — would otherwise read
+  // as a deliberate 0 and silently DISABLE the fallback with no log.
+  if (raw == null || raw.trim() === '') return derived
   const n = Number(raw)
   if (!(Number.isFinite(n) && n >= 0)) return derived
   return Math.min(n, OBLIGATION_REROUTE_MATCH_MS_MAX)
@@ -221,7 +258,9 @@ export function resolveEscalateSettleMs(
   env: Record<string, string | undefined> = process.env,
 ): number {
   const raw = env.SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS
-  if (raw == null || raw === '') return OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT
+  // `.trim()`, not `=== ''` — `Number(' ') === 0`, which would read as the kill
+  // switch and silently disable the gate. See `resolveRerouteMatchWindowMs`.
+  if (raw == null || raw.trim() === '') return OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT
   const n = Number(raw)
   if (!(Number.isFinite(n) && n >= 0)) return OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT
   return Math.min(n, OBLIGATION_ESCALATE_SETTLE_MS_MAX)
@@ -231,12 +270,38 @@ export interface EscalationStalenessDeps {
   /** History available? When false the check reports "not answered" (safe: never suppresses). */
   historyEnabled: boolean
   /**
-   * The history predicate. `threadId === undefined` means CHAT scope (any
-   * thread); an explicit number/null scopes to that thread.
+   * The history predicate, open-ended forward. `threadId === undefined` means
+   * CHAT scope (any thread); an explicit number/null scopes to that thread.
+   *
+   * Used ONLY for the obligation's own topic, where open-ended is correct: that
+   * scope is the obligation itself, so anything substantive delivered there
+   * since it opened is its answer. The reroute fallback must not use this — see
+   * `hasOutboundDeliveredBetween`.
    */
   hasOutboundDeliveredSince: (
     chatId: string,
     sinceMs: number,
+    threadId?: number | null,
+  ) => boolean
+  /**
+   * The same predicate BOUNDED AT BOTH ENDS — `[sinceMs, untilMs]`.
+   *
+   * The reroute fallback's only history call. An `EXPLICIT_OVERRIDDEN` record is
+   * evidence about ONE INSTANT: at `atMs` the router sent this topic's answer
+   * elsewhere. It licenses a look for the delivery THAT routing produced, which
+   * lands within the match window of `atMs` — and for nothing else the routed
+   * topic carries before or after. A forward-open query turns that instant of
+   * evidence into a standing licence over the routed topic, which is precisely
+   * the silent close this module exists to prevent.
+   *
+   * Deliberately a SEPARATE dep rather than an optional argument on the one
+   * above: an optional bound is one a caller — or a test stub — can drop without
+   * anything failing, and the bound is load-bearing.
+   */
+  hasOutboundDeliveredBetween: (
+    chatId: string,
+    sinceMs: number,
+    untilMs: number,
     threadId?: number | null,
   ) => boolean
   /** The router's explicit-thread override record (answer-route-overrides.ts). */
@@ -303,13 +368,15 @@ export interface AnsweredSinceOpenResult {
  *   2. REROUTE — only the topics the router RECORDED an answer addressed to this
  *      obligation's topic as having been routed to
  *      (`EXPLICIT_OVERRIDDEN(model→N,routed→M)`), and only for as long as that
- *      record is FRESH (`rerouteMatchWindowMs` before `nowMs`). Each override is
- *      queried from ITS OWN `atMs`, never from `openedAt`: the record licenses a
- *      look for the answer that routing produced, not for anything the thread
- *      has carried since the obligation opened. No fresh override ⇒ no second
- *      query ⇒ an unrelated message in another topic can never stand this
- *      escalation down. Both weaker cutoffs are counter-exampled in the module
- *      header with the log lines that break them.
+ *      record is FRESH (`rerouteMatchWindowMs` before `anchorMs`). Each override
+ *      is queried across ITS OWN `[atMs, atMs + rerouteMatchWindowMs]` — never
+ *      from `openedAt`, and never open-ended forward: the record licenses a look
+ *      for the answer that routing produced, in the moments after it, not for
+ *      anything the thread has carried since the obligation opened nor for
+ *      anything it carries minutes later. No fresh override ⇒ no second query ⇒
+ *      an unrelated message in another topic can never stand this escalation
+ *      down. All three weaker cutoffs are counter-exampled in the module header
+ *      with the log lines that break them.
  *
  * Both scopes keep the caller's substantive-length floor (200 chars in the
  * escalate branch, so a bare ack never stands an escalation down), and neither
@@ -338,10 +405,16 @@ export function answeredSinceOpen(
     // `routedThreadId` is already the history's thread semantics: a number for a
     // topic, `null` for the chat root (`thread_id IS NULL`). Never `undefined`,
     // which would re-open the chat-wide any-thread query this guard avoids.
-    // The cutoff is the override's OWN instant — see the module header for the
-    // incident that an `openedAt` cutoff regresses.
+    //
+    // BOTH ends of the query are the override's OWN instant ± the match window.
+    // Lower: the delivery cannot predate the routing that produced it (and never
+    // reaches back past `openedAt`) — see the module header for the incident an
+    // `openedAt` cutoff regresses. Upper: the record is evidence about that
+    // instant only, so it licenses a look across the window in which that answer
+    // could land and no further — see the header's form (iii).
     const since = Math.max(ovr.atMs, o.openedAt)
-    if (deps.hasOutboundDeliveredSince(o.chatId, since, ovr.routedThreadId)) {
+    const until = ovr.atMs + deps.rerouteMatchWindowMs
+    if (deps.hasOutboundDeliveredBetween(o.chatId, since, until, ovr.routedThreadId)) {
       return { answered: true, via: 'reroute', routedThreadId: ovr.routedThreadId }
     }
   }

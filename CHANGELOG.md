@@ -35,25 +35,35 @@ now an anomaly worth investigating, not the norm.
   07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
   and adds a fallback to *only* the thread the router RECORDED an answer
   addressed to this obligation's topic as having been routed to (new
-  `answer-route-overrides.ts`), reading history from **that record's own
-  instant** and only while the record is **fresh** (settle window + two sweep
+  `answer-route-overrides.ts`), reading history **only across that record's own
+  instant plus the match window** — bounded at *both* ends, so a delivery in the
+  routed topic can be paired with the record neither before it nor minutes after
+  it — and only while the record is itself **fresh** (settle window + two sweep
   ticks = 18.5s at the default); and a new settle gate requires the "unanswered"
   read to hold across an 8.5s window — derived as 3× the worst observed
   decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
-  tick so a re-check actually runs — before the nudge goes out. Both narrowings
-  on the fallback are load-bearing, and each has a field counter-example: a
-  chat-wide "did anything long land in this chat" query has no relationship to
-  the obligation at all, and an override-gated query cut at `openedAt` is the
-  same defect wearing a gate — on 2026-08-13 obligation `…:4#5462` (thread 4,
-  opened 03:50:02.807, escalated 04:03:06.140) it pairs a stale
-  `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an unrelated
-  295-char delivery in thread 3 at 04:02:51.987 — a *different* question's
-  answer, 594.8s later — and closes a genuinely unanswered message in silence.
-  That is the defect `turn-flush-suppression.ts` was written to close, and it
-  escalates correctly pre-fix, so it would have been a regression. The freshness
-  window rejects it. Residual, stated plainly: inside the window the fallback
-  still cannot tell the rerouted answer from a second ≥200-char delivery landing
-  in the same thread in those few seconds — the override carries no message id.
+  tick so a re-check actually runs — before the nudge goes out. All three
+  narrowings on the fallback are load-bearing, and each has a field
+  counter-example: a chat-wide "did anything long land in this chat" query has no
+  relationship to the obligation at all; an override-gated query cut at
+  `openedAt` is the same defect wearing a gate — on 2026-08-13 obligation
+  `…:4#5462` (thread 4, opened 03:50:02.807, escalated 04:03:06.140) it pairs a
+  stale `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an
+  unrelated 295-char delivery in thread 3 at 04:02:51.987 — a *different*
+  question's answer, 594.8s later — and closes a genuinely unanswered message in
+  silence; and an override-gated query cut at the record's own instant but left
+  *open-ended forward* is that same defect reached from the other side, because
+  freshness is judged at the first "unanswered" read while the history row is
+  read at the re-check, and the sweep can be starved for minutes in between (a
+  short reply rerouted to topic M at T+0 leaves the obligation correctly open,
+  an unrelated ≥200-char answer lands in M at T+90, and the sweep that finally
+  runs at T+107 closes the obligation `via=reroute`). That is the defect
+  `turn-flush-suppression.ts` was written to close, and the 2026-08-13 case
+  escalates correctly pre-fix, so either would have been a regression. Residual,
+  stated plainly: inside `[record, record + window]` the fallback still cannot
+  tell the rerouted answer from a second ≥200-char delivery landing in the same
+  thread in those few seconds — the override carries no message id. That interval
+  is fixed by the record's own timestamp, so a starved sweep cannot widen it.
   Both guards stay bounded: a genuinely unanswered obligation still escalates one
   settle window later (the 2026-08-12 case, whose real answer was 41s away, is
   unaffected), and both windows are clamped so a config typo cannot silently
@@ -61,7 +71,10 @@ now an anomaly worth investigating, not the norm.
   *first* "unanswered" read, not from whenever the re-check runs — the sweep's
   earlier gates can skip ticks outright for minutes, and anchoring at the
   re-check would let a starved sweep age a still-fresh record out of the window
-  and nag on top of the answer anyway. Both paths are logged so the fallback is
+  and nag on top of the answer anyway — which is precisely why the *delivery*
+  needs its own forward bound: that anchor keeps the record readable across the
+  starvation gap, and without an upper bound the query would then reach across
+  the whole of it. Both paths are logged so the fallback is
   measurable in production without a rebuild: a fallback-scope close logs
   `via=reroute`, and a record the freshness bound *rejects* logs
   `reroute record rejected age=…ms window=…ms`. New `escalation-staleness.ts`
@@ -69,6 +82,9 @@ now an anomaly worth investigating, not the norm.
   `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` disables the settle gate (and only
   the settle gate), `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the
   reroute fallback (and only the fallback); set both for the pre-fix behaviour.
+  Both switches read only an explicit `0`: a whitespace-only value (`KEY=" "`,
+  which `Number()` coerces to `0`) is treated as unset, so a stray space in an
+  env file cannot silently turn a guard off.
 
   **Scope:** this fixes the ESCALATE branch only. It narrows the standing
   duplicate-reply family (switchroom/switchroom#2472) rather than closing it —

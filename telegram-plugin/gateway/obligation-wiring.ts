@@ -329,10 +329,11 @@ function obligationSweep(): void {
     return
   }
   // SCOPE: the obligation's own topic, PLUS — only while the router's
-  // `EXPLICIT_OVERRIDDEN(model→N,routed→M)` record is still FRESH, and only from
-  // that record's own instant — the topic it names. Deliberately neither
-  // chat-wide nor cut at `openedAt`: both of those close a genuinely unanswered
-  // obligation in silence. Field evidence for each in escalation-staleness.ts.
+  // `EXPLICIT_OVERRIDDEN(model→N,routed→M)` record is still FRESH, and only
+  // across that record's own instant + the match window — the topic it names.
+  // Deliberately neither chat-wide, nor cut at `openedAt`, nor open-ended
+  // forward: all three close a genuinely unanswered obligation in silence. Field
+  // evidence for each in escalation-staleness.ts.
   //
   // FRESHNESS ANCHOR: the settle gate's `firstAt` for this obligation when a
   // window is already open, else this decision's `now`. NOT the re-check
@@ -340,10 +341,18 @@ function obligationSweep(): void {
   // session-busy defer, the escalate and represent graces) can SKIP sweep ticks
   // outright, so the decision that consults the record may run minutes after the
   // one that deferred, and a record that was fresh when the question was first
-  // asked would read as stale purely because the sweep was starved.
+  // asked would read as stale purely because the sweep was starved. That same
+  // starvation is why the DELIVERY needs its own upper bound: the anchor makes
+  // the override read fresh at a re-check minutes later, and without a forward
+  // bound it would then reach the whole of that gap. See `#4681` / form (iii).
   const answered = answeredSinceOpen(o, {
     historyEnabled: HISTORY_ENABLED,
     hasOutboundDeliveredSince,
+    // The reroute fallback's query, bounded at BOTH ends. `minChars` stays at
+    // the history default (200 — the escalate branch's substantive floor); only
+    // the upper time bound is added.
+    hasOutboundDeliveredBetween: (chatId, sinceMs, untilMs, threadId) =>
+      hasOutboundDeliveredSince(chatId, sinceMs, threadId, undefined, untilMs),
     routeOverrides: answerRouteOverrides,
     anchorMs: escalateSettleGate.firstAt(o.originTurnId, o.openedAt) ?? now,
     rerouteMatchWindowMs: rerouteMatchWindowMs,

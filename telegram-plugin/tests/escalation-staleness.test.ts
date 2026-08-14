@@ -62,14 +62,45 @@ const UNRELATED_THREAD = 3;
 const THREAD_D = 44;
 
 /**
- * Models the real history predicate: an assistant row delivered at `deliveredAt`
- * under `thread`. `threadId === undefined` from the caller means CHAT scope.
+ * The history table as the module sees it. `threadId === undefined` from the
+ * caller means CHAT scope; `untilMs` is the reroute fallback's UPPER bound —
+ * modelled here, not ignored, or every test that depends on it passes vacuously.
  */
-function historyWithAnswer(deliveredAt: number, thread: number | null) {
-  return (chatId: string, sinceMs: number, threadId?: number | null): boolean => {
+type HistoryStub = (
+  chatId: string,
+  sinceMs: number,
+  threadId?: number | null,
+  untilMs?: number,
+) => boolean;
+
+/**
+ * Models the real history predicate: an assistant row delivered at `deliveredAt`
+ * under `thread`.
+ */
+function historyWithAnswer(deliveredAt: number, thread: number | null): HistoryStub {
+  return (chatId, sinceMs, threadId, untilMs): boolean => {
     if (chatId !== CHAT) return false;
     if (threadId !== undefined && threadId !== thread) return false;
+    if (untilMs != null && deliveredAt > untilMs) return false;
     return deliveredAt >= sinceMs;
+  };
+}
+
+/**
+ * Fan ONE history stub out into the two deps `answeredSinceOpen` takes, exactly
+ * as obligation-wiring does: the obligation's own topic is queried open-ended,
+ * the reroute fallback is queried bounded at both ends.
+ */
+function historyDeps(stub: HistoryStub) {
+  return {
+    hasOutboundDeliveredSince: (chatId: string, sinceMs: number, threadId?: number | null) =>
+      stub(chatId, sinceMs, threadId),
+    hasOutboundDeliveredBetween: (
+      chatId: string,
+      sinceMs: number,
+      untilMs: number,
+      threadId?: number | null,
+    ) => stub(chatId, sinceMs, threadId, untilMs),
   };
 }
 
@@ -103,7 +134,7 @@ beforeEach(() => {
 
 /** The reroute-fallback deps, with the freshness window the sweep really uses. */
 function stalenessDeps(over: {
-  hasOutboundDeliveredSince: (chatId: string, sinceMs: number, threadId?: number | null) => boolean;
+  hasOutboundDeliveredSince: HistoryStub;
   routeOverrides: Parameters<typeof answeredSinceOpen>[1]["routeOverrides"];
   nowMs?: number;
   historyEnabled?: boolean;
@@ -111,7 +142,7 @@ function stalenessDeps(over: {
 }) {
   return {
     historyEnabled: over.historyEnabled ?? true,
-    hasOutboundDeliveredSince: over.hasOutboundDeliveredSince,
+    ...historyDeps(over.hasOutboundDeliveredSince),
     routeOverrides: over.routeOverrides,
     anchorMs: over.nowMs ?? 2_000,
     rerouteMatchWindowMs:
@@ -366,6 +397,39 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
     expect(answered.answered).toBe(false);
   });
 
+  it("does NOT accept a delivery that lands long AFTER a still-fresh override", () => {
+    // The other end of the same bound, and the one #4681 was missing. The
+    // override is fresh at `anchorMs` (which is the settle gate's `firstAt`, so
+    // it stays fresh however long the sweep is starved), but the only delivery
+    // in the routed thread landed 90s after that routing decision — far outside
+    // the window in which the answer it produced could have landed. It is
+    // someone else's answer.
+    const WINDOW = resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT);
+    const OVERRIDE_AT = 10_000;
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 1_000, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(OVERRIDE_AT + 90_000, ROUTED_THREAD),
+        routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, OVERRIDE_AT),
+        // Anchored at the first "unanswered" read, so the override IS fresh.
+        nowMs: OVERRIDE_AT + 100,
+      }),
+    );
+    expect(answered.answered).toBe(false);
+    // …and one that lands at the very edge of the window still counts, so the
+    // bound is a bound and not a blanket refusal.
+    expect(
+      answeredSinceOpen(
+        { chatId: CHAT, openedAt: 1_000, threadId: OBLIGATION_THREAD },
+        stalenessDeps({
+          hasOutboundDeliveredSince: historyWithAnswer(OVERRIDE_AT + WINDOW, ROUTED_THREAD),
+          routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, OVERRIDE_AT),
+          nowMs: OVERRIDE_AT + 100,
+        }),
+      ),
+    ).toEqual({ answered: true, via: "reroute", routedThreadId: ROUTED_THREAD });
+  });
+
   it("does NOT follow a reroute recorded for a DIFFERENT topic", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
@@ -570,6 +634,16 @@ describe("resolveEscalateSettleMs", () => {
       20_000,
     );
   });
+  it("treats a WHITESPACE-ONLY value as unset, not as the kill switch", () => {
+    // `Number(' ') === 0`, so a bare `=== ''` check lets a stray `KEY=" "` in an
+    // env file silently disable the guard with no log. Empty and whitespace must
+    // mean the same thing: unset.
+    for (const raw of [" ", "  ", "\t", "\n"]) {
+      expect(resolveEscalateSettleMs({ SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS: raw })).toBe(
+        OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT,
+      );
+    }
+  });
 });
 
 describe("resolveRerouteMatchWindowMs — how stale an override may be", () => {
@@ -613,7 +687,9 @@ describe("resolveRerouteMatchWindowMs — how stale an override may be", () => {
         SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS: "5000",
       }),
     ).toBe(5_000);
-    for (const raw of ["", "soon", "-1", "Infinity"]) {
+    // Whitespace-only is UNSET, not the kill switch: `Number(' ') === 0`, so a
+    // bare `=== ''` check lets a stray `KEY=" "` turn the fallback off silently.
+    for (const raw of ["", " ", "  ", "\t", "\n", "soon", "-1", "Infinity"]) {
       expect(
         resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT, {
           SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS: raw,
@@ -636,10 +712,7 @@ describe("resolveRerouteMatchWindowMs — how stale an override may be", () => {
 describe("obligationSweep escalate branch — nag only when the answer really is missing", () => {
   const ORIGIN = `${CHAT}:${OBLIGATION_THREAD}#5462`;
 
-  function makeWiring(opts: {
-    ledger: ObligationLedger;
-    hasOutboundDeliveredSince: (chatId: string, sinceMs: number, threadId?: number | null) => boolean;
-  }) {
+  function makeWiring(opts: { ledger: ObligationLedger; hasOutboundDeliveredSince: HistoryStub }) {
     const nudges: string[] = [];
     const deps = {
       OBLIGATION_LEDGER_ENABLED: true,
@@ -659,7 +732,16 @@ describe("obligationSweep escalate branch — nag only when the answer really is
       getCurrentTurn: () => null,
       turnInFlightForGate: () => false,
       agentHasInFlightBackgroundWork: () => false,
-      hasOutboundDeliveredSince: opts.hasOutboundDeliveredSince,
+      // The REAL history signature the gateway injects — `minChars` 4th,
+      // `untilMs` 5th — so obligation-wiring's own bounded-query adapter is under
+      // test here, not bypassed by a convenience stub.
+      hasOutboundDeliveredSince: (
+        chatId: string,
+        sinceMs: number,
+        threadId?: number | null,
+        _minChars?: number,
+        untilMs?: number,
+      ) => opts.hasOutboundDeliveredSince(chatId, sinceMs, threadId, untilMs),
       findTurnByOriginId: () => undefined,
       bridgeAlive: () => true,
       sendEscalationNudge: (o: { originTurnId: string }) => {
@@ -764,12 +846,30 @@ describe("obligationSweep escalate branch — nag only when the answer really is
     expect(nudges).toEqual([ORIGIN_D]); // topic 4's message is NOT silently dropped
   });
 
-  it("every scenario starts from an EMPTY process-wide override registry", () => {
-    // `answerRouteOverrides` is a module singleton and these scenarios write to
-    // it with wall-clock timestamps, so without a reset (b)'s `CHAT:4` record is
-    // still FRESH when (a) and (c) — same topic — run, and (a)/(c) pass only
+  // The leak guard is a PAIR, and deliberately so. Asserting "the registry is
+  // empty" on its own passes vacuously the moment the tests that write to the
+  // singleton are moved below it — the guard would then be green precisely when
+  // it has stopped guarding. Pinning its own polluter immediately above it makes
+  // it order-independent: whatever else moves, this assertion always runs one
+  // test after a write it can see.
+  it("leak guard 1/2 — pollute the process-wide override registry", () => {
+    // `answerRouteOverrides` is a module singleton and the scenarios here write
+    // to it with wall-clock timestamps, so without a reset (b)'s `CHAT:4` record
+    // is still FRESH when (a) and (c) — same topic — run, and (a)/(c) pass only
     // because their history stubs happen to reject the routed thread. Loosen a
     // stub and (b) silently changes another test's outcome.
+    answerRouteOverrides.note({
+      chatId: CHAT,
+      enabled: true,
+      explicitThreadId: OBLIGATION_THREAD,
+      anchored: true,
+      routedThreadId: ROUTED_THREAD,
+      nowMs: Date.now(),
+    });
+    expect(answerRouteOverrides.size()).toBe(1);
+  });
+
+  it("leak guard 2/2 — the NEXT scenario still starts from an EMPTY registry", () => {
     expect(answerRouteOverrides.routedOverridesSince(CHAT, OBLIGATION_THREAD, 0)).toEqual([]);
     expect(answerRouteOverrides.size()).toBe(0);
   });
@@ -798,11 +898,12 @@ describe("obligationSweep escalate branch — nag only when the answer really is
     const DELIVERED_AT = base + 1_400;
     const { wiring, nudges } = makeWiring({
       ledger,
-      hasOutboundDeliveredSince: (chatId, sinceMs, threadId) =>
+      hasOutboundDeliveredSince: (chatId, sinceMs, threadId, untilMs) =>
         chatId === CHAT &&
         (threadId === undefined || threadId === ROUTED_THREAD) &&
         Date.now() >= DELIVERED_AT &&
-        DELIVERED_AT >= sinceMs,
+        DELIVERED_AT >= sinceMs &&
+        (untilMs == null || DELIVERED_AT <= untilMs),
     });
     answerRouteOverrides.note({
       chatId: CHAT,
@@ -828,6 +929,84 @@ describe("obligationSweep escalate branch — nag only when the answer really is
 
     expect(nudges).toEqual([]); // no nag on top of the delivered answer
     expect(ledger.isOpen(ORIGIN_E)).toBe(false); // closed silently instead
+  });
+
+  it("(f) a STARVED sweep does not pair a fresh override with a much later unrelated delivery", () => {
+    // The counterpart to (e), and the failure mode the `firstAt` anchor opens if
+    // the DELIVERY is left unbounded. Anchoring the override's freshness at
+    // `firstAt` is correct (see (e)) but it only bounds ONE end: it says the
+    // routing decision was recent WHEN THE QUESTION WAS FIRST ASKED. The history
+    // query is still read at the RE-CHECK, which the gates above this branch can
+    // starve for minutes — so an override that is legitimately fresh licenses a
+    // look at a thread across an arbitrarily long stretch of later traffic.
+    //
+    //   T+0      the model's SHORT reply to topic 47 is rerouted to thread 635.
+    //            Under 200 chars, so it is not a substantive answer and the
+    //            obligation correctly stays open.
+    //   T+0.1    first escalate decision — not answered → settle defer.
+    //            `firstAt` is pinned here for the whole episode.
+    //   T+90     an unrelated >=200-char answer to a DIFFERENT question lands in
+    //            thread 635.
+    //   T+107    the next decision that actually RUNS.
+    //
+    // Anchored at `firstAt` with an open-ended forward query, T+0's override
+    // reads fresh at T+107 and pairs with the T+90 delivery: the obligation is
+    // closed `via=reroute` and topic 47's message is never answered and never
+    // nudged. It must escalate instead. Bounding the delivery to the override's
+    // OWN window keeps (e)'s legitimate 1.4s pairing and kills this 90s one.
+    const THREAD_G = 47;
+    const ORIGIN_G = `${CHAT}:${THREAD_G}#5466`;
+    const ledger = new ObligationLedger(2);
+    const base = Date.now();
+    const UNRELATED_DELIVERED_AT = base + 90_000;
+    const { wiring, nudges } = makeWiring({
+      ledger,
+      // Only the unrelated T+90 row ever exists, and — like the real table — it
+      // is invisible until the instant it is written. Nothing was ever delivered
+      // for topic 47: not in its own thread, not in the routed one.
+      hasOutboundDeliveredSince: (chatId, sinceMs, threadId, untilMs) =>
+        chatId === CHAT &&
+        (threadId === undefined || threadId === ROUTED_THREAD) &&
+        Date.now() >= UNRELATED_DELIVERED_AT &&
+        UNRELATED_DELIVERED_AT >= sinceMs &&
+        (untilMs == null || UNRELATED_DELIVERED_AT <= untilMs),
+    });
+    answerRouteOverrides.note({
+      chatId: CHAT,
+      enabled: true,
+      explicitThreadId: THREAD_G,
+      anchored: true,
+      routedThreadId: ROUTED_THREAD,
+      nowMs: base,
+    });
+    openExhausted(ledger, base - 60_000, ORIGIN_G, THREAD_G);
+
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    const realNow = Date.now;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      Date.now = () => base + 100;
+      wiring.obligationSweep(); // decision 1 — nothing delivered yet → settle
+      expect(nudges).toEqual([]);
+      // …starved for 107s by the gates above this branch, exactly as in (e).
+      Date.now = () => base + 107_000;
+      wiring.obligationSweep();
+    } finally {
+      Date.now = realNow;
+      process.stderr.write = realWrite;
+    }
+
+    expect(nudges).toEqual([ORIGIN_G]); // topic 47's message is NOT dropped in silence
+    // …and specifically NOT via the reroute fallback pairing T+0's override with
+    // the T+90 stranger. (`nudges` alone would not distinguish a silent close
+    // from a send that has not resolved yet — the escalate send is async.)
+    expect(
+      lines.filter((l) => l.includes("closed silently") && l.includes(ORIGIN_G)),
+    ).toEqual([]);
   });
 
   it("logs the stale-override rejection so the freshness bound is measurable in production", () => {
@@ -881,11 +1060,12 @@ describe("obligationSweep escalate branch — nag only when the answer really is
       ledger,
       // Reads false until the in-flight reply is recorded, then true — in the
       // obligation's OWN topic, so no reroute record is needed.
-      hasOutboundDeliveredSince: (chatId, sinceMs, threadId) =>
+      hasOutboundDeliveredSince: (chatId, sinceMs, threadId, untilMs) =>
         answerDelivered &&
         chatId === CHAT &&
         (threadId === undefined || threadId === OBLIGATION_THREAD) &&
-        Date.now() >= sinceMs,
+        Date.now() >= sinceMs &&
+        (untilMs == null || Date.now() <= untilMs),
     });
     openExhausted(ledger, openedAt);
 
