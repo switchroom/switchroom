@@ -54,16 +54,67 @@
  * not inherit a false "grew" from someone else's entry: growth is measured
  * against the PR's own merge-base (`base...HEAD`).
  *
+ * ── RULE 2: PLACEMENT (the post-release silent-corruption guard) ─────────
+ *
+ *   No CHANGELOG line ADDED in this range may land under a RELEASED version
+ *   heading (`## vX.Y.Z …`) — unless that heading was itself added in the same
+ *   range (which is exactly what the release PR does when it renames
+ *   `## Unreleased`).
+ *
+ * Why this exists, and why RULE 1 alone cannot catch it: a PR stages its entry
+ * under `## Unreleased`. A release is cut before it merges, renaming that
+ * header to `## vX.Y.Z`. The merge is then TEXTUALLY CLEAN — git has no idea
+ * the section changed meaning — and the entry lands INSIDE the already-shipped
+ * section. Exit 0, zero conflicts, release notes silently wrong, the entry
+ * buried forever. Four PRs (#4679–#4682) hit this simultaneously behind the
+ * v0.21.9 cut.
+ *
+ * Nothing caught it because the only moment the corruption exists is the
+ * MERGED result, and nothing inspected that:
+ *   - the `pull_request` run measures growth against the PR's OWN merge-base,
+ *     which predates the release, so from the PR's point of view the entry IS
+ *     under `## Unreleased` — green;
+ *   - the merge queue used to SKIP this script outright, so the merged result
+ *     was never re-validated.
+ *
+ * Hence PLACEMENT runs on `merge_group` too (see the merge_group note under
+ * Skips). It needs no GitHub PR context — only the diff — which is precisely
+ * what makes it safe to run on a queue ref where RULE 1's escape hatch is
+ * invisible.
+ *
+ * Placement escape hatch: `[changelog placement ok]` alone on a line in the PR
+ * body or ANY commit message on the branch, for the rare deliberate edit to an
+ * already-released section (fixing a typo in an old entry, a retroactive
+ * backport note). Deliberately NOT the same token as `[skip changelog]`: that
+ * one asserts "this PR needs no entry", which says nothing about where an entry
+ * that DOES exist landed. It is commit-message-reachable on purpose — labels
+ * are invisible on a queue ref.
+ *
  * ── Skips (a skip is a pass, never a silent gate) ────────────────────────
  *
- * - `merge_group` event: the queue builds a synthetic squash commit with no PR
- *   base to diff against; enforcement already happened at the `pull_request`
- *   event via the required `lint` context. Mirrors check-agent-attribution-
- *   trailers.mjs's merge_group skip.
+ * - `merge_group` event: RULE 1 is skipped, because the queue ref carries no
+ *   `pull_request` payload, so the `no-changelog` label / PR-body escape hatch
+ *   cannot be read there and a legitimately-escaped PR would red the train.
+ *   RULE 2 (placement) still RUNS — it reads only the diff. The base is
+ *   `github.event.merge_group.base_sha`, surfaced by ci-lint.yml as
+ *   $CHANGELOG_BASE; it is an ancestor of the queue ref, so the workflow's
+ *   existing `fetch-depth: 0` checkout already has it.
  * - No base ref resolvable (shallow clone, detached checkout): SKIP rather than
- *   fail. CI checks out with fetch-depth: 0 for exactly this reason.
+ *   fail. CI checks out with fetch-depth: 0 for exactly this reason. On
+ *   `merge_group` a $CHANGELOG_BASE that is SET but unresolvable is a FAIL, not
+ *   a skip: that is a workflow misconfiguration silently disarming the only
+ *   check that inspects the merged result.
  * - No merge-base between base and HEAD (unrelated histories): SKIP.
  * - No CHANGELOG.md at HEAD: SKIP (nothing to enforce).
+ *
+ * ── Non-vacuity: the empty-range WARN ────────────────────────────────────
+ *
+ * `base...HEAD` being EMPTY means this run certified nothing. That is normal on
+ * `push: main`, and it is also the local-review trap that cost real reviewer
+ * time: with an UNCOMMITTED merge in the worktree, HEAD is still the base
+ * commit, the range is empty, and `npm run lint` reports a cheerful OK while
+ * the staged merge is corrupt. So an empty range now says so out loud, and
+ * names the fix (commit the merge, then re-run) when the worktree is dirty.
  *
  * Run: `npm run lint:changelog-entry` (also part of `npm run lint`).
  */
@@ -186,6 +237,112 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
 }
 
 /**
+ * Blank out `<!-- ... -->` comment bodies WITHOUT changing the line count, so
+ * a comment can be ignored while 1-based line numbers still address the real
+ * file. `stripHtmlComments` deletes text and therefore shifts every subsequent
+ * line — fine for the growth rule, useless for placement, which maps a diff's
+ * new-file line numbers onto sections.
+ * @param {string} text
+ * @returns {string}
+ */
+export function maskHtmlComments(text) {
+  return String(text).replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '))
+}
+
+/**
+ * Split a changelog into its `## ` sections with 1-based line numbers.
+ *
+ * @param {string} changelog
+ * @returns {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]}
+ *   `start`/`end` bound the section BODY (inclusive); `released` is true for any
+ *   `## ` heading that is not `## Unreleased`.
+ */
+export function parseSections(changelog) {
+  const lines = String(changelog).replace(/\r\n/g, '\n').split('\n')
+  /** @type {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]} */
+  const sections = []
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^##\s/.test(lines[i])) continue
+    const heading = lines[i].trim()
+    if (sections.length > 0) sections[sections.length - 1].end = i // previous line, 1-based
+    sections.push({
+      heading,
+      headingLine: i + 1,
+      start: i + 2,
+      end: lines.length,
+      released: !/^##\s+unreleased\b/i.test(heading),
+    })
+  }
+  return sections
+}
+
+/**
+ * Parse the 1-based NEW-file line numbers of every added line out of a
+ * `git diff -U0` unified diff.
+ *
+ * Line numbers rather than line TEXT on purpose: matching added lines by text
+ * would confuse an added line with an identical line that merely appears
+ * elsewhere as context (changelog entries repeat phrasing constantly), which
+ * could both miss a real hit and invent a false one.
+ *
+ * @param {string} diffText
+ * @returns {Set<number>}
+ */
+export function parseAddedLineNumbers(diffText) {
+  /** @type {Set<number>} */
+  const added = new Set()
+  let next = 0
+  for (const line of String(diffText).replace(/\r\n/g, '\n').split('\n')) {
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line)
+    if (hunk) {
+      next = Number(hunk[1])
+      continue
+    }
+    if (next === 0) continue
+    if (line.startsWith('+++')) continue
+    if (line.startsWith('+')) {
+      added.add(next)
+      next++
+    }
+    // `-` lines and the `\ No newline` marker do not advance the new-file
+    // cursor; with -U0 there are no context lines to account for.
+  }
+  return added
+}
+
+/**
+ * Find entries added in this range that landed under an ALREADY-RELEASED
+ * heading — the post-release silent-corruption signature.
+ *
+ * A section whose own heading line was added in the range is exempt: that is
+ * the release PR renaming `## Unreleased` to `## vX.Y.Z`, where every line
+ * beneath it is legitimately "new" to the diff.
+ *
+ * @param {string} headChangelog CHANGELOG.md text at HEAD
+ * @param {Set<number>} addedLineNumbers 1-based new-file line numbers
+ * @returns {{section: string, line: number, text: string}[]}
+ */
+export function findMisplacedEntries(headChangelog, addedLineNumbers) {
+  const raw = String(headChangelog).replace(/\r\n/g, '\n')
+  const masked = maskHtmlComments(raw).split('\n')
+  const sections = parseSections(raw)
+  /** @type {{section: string, line: number, text: string}[]} */
+  const hits = []
+  for (const s of sections) {
+    if (!s.released) continue
+    if (addedLineNumbers.has(s.headingLine)) continue // section is new (release PR)
+    for (let n = s.start; n <= s.end; n++) {
+      if (!addedLineNumbers.has(n)) continue
+      const text = (masked[n - 1] ?? '').trim()
+      if (!text) continue // blank, or a line that was pure HTML comment
+      if (/^#{1,6}\s/.test(text)) continue // a sub-heading is structure, not an entry
+      hits.push({ section: s.heading, line: n, text: raw.split('\n')[n - 1].trim() })
+    }
+  }
+  return hits
+}
+
+/**
  * Does any text carry the `[skip changelog]` escape token?
  *
  * The token must sit ALONE on its own line (`^\s*[skip changelog]\s*$`,
@@ -201,6 +358,21 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
  */
 export function hasSkipToken(text) {
   return /^[ \t]*\[[ \t]*skip[ \t_-]*changelog[ \t]*\][ \t]*$/im.test(String(text))
+}
+
+/**
+ * Does any text carry the `[changelog placement ok]` escape token?
+ *
+ * Same own-line discipline (and the same reason) as `hasSkipToken`. Kept
+ * SEPARATE from `[skip changelog]`: "this PR needs no entry" and "this PR
+ * deliberately edits an already-released section" are different assertions, and
+ * conflating them would let every escape-hatched PR silently corrupt a released
+ * section too.
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function hasPlacementToken(text) {
+  return /^[ \t]*\[[ \t]*changelog[ \t_-]*placement[ \t_-]*ok[ \t]*\][ \t]*$/im.test(String(text))
 }
 
 /**
@@ -226,8 +398,10 @@ export function hasSkipLabel(labels) {
  *   commitMessages?: string[],
  *   prBody?: string,
  *   prLabels?: string,
+ *   addedChangelogLines?: Set<number>,
+ *   placementOnly?: boolean,
  * }} input
- * @returns {{status: 'pass'|'fail', reason: string, shippable?: string[]}}
+ * @returns {{status: 'pass'|'fail', reason: string, shippable?: string[], misplaced?: {section: string, line: number, text: string}[]}}
  */
 export function evaluate({
   changedFiles,
@@ -236,7 +410,25 @@ export function evaluate({
   commitMessages = [],
   prBody = '',
   prLabels = '',
+  addedChangelogLines = new Set(),
+  placementOnly = false,
 }) {
+  // RULE 2 first: a misplaced entry is a corruption of already-shipped release
+  // notes, and it outranks "did Unreleased grow" — which, in exactly this
+  // situation, reports the misleading symptom (`no new entry`) instead of the
+  // cause (`your entry is under ## v0.21.8`).
+  const placementEscaped =
+    hasPlacementToken(prBody) || (commitMessages || []).some((m) => hasPlacementToken(m))
+  if (!placementEscaped && addedChangelogLines.size > 0) {
+    const misplaced = findMisplacedEntries(headChangelog, addedChangelogLines)
+    if (misplaced.length > 0) {
+      return { status: 'fail', reason: 'entry added under a released section', misplaced }
+    }
+  }
+  if (placementOnly) {
+    return { status: 'pass', reason: 'no entry added under a released section' }
+  }
+
   const shippable = (changedFiles || []).filter(isShippable)
   if (shippable.length === 0) {
     return { status: 'pass', reason: 'no shippable code changed' }
@@ -332,19 +524,28 @@ const RECORD = '\x1e'
  * @returns {{status: 'pass'|'fail'|'skip', lines: string[]}}
  */
 export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
-  if (env.GITHUB_EVENT_NAME === 'merge_group') {
-    return {
-      status: 'skip',
-      lines: [
-        'check-changelog-entry: SKIP — merge_group event.',
-        '  The queue builds a synthetic squash commit with no PR base to diff;',
-        '  the changelog requirement was already enforced at the pull_request event.',
-      ],
-    }
-  }
+  // On a queue ref only RULE 2 (placement) runs — RULE 1's escape hatch lives
+  // in the `pull_request` payload, which does not exist here. See the header.
+  const placementOnly = env.GITHUB_EVENT_NAME === 'merge_group'
 
   const range = resolveRange(cwd, env)
   if (!range) {
+    // A merge_group run with $CHANGELOG_BASE SET but unresolvable is a broken
+    // workflow, not a shallow clone — and silently skipping it re-opens the
+    // exact hole this check exists to close. Fail loudly instead.
+    if (placementOnly && env.CHANGELOG_BASE) {
+      return {
+        status: 'fail',
+        lines: [
+          'check-changelog-entry: FAIL — merge_group base ref is unresolvable.',
+          '',
+          `  $CHANGELOG_BASE=${env.CHANGELOG_BASE} does not resolve in this checkout.`,
+          '  On a queue ref this must be github.event.merge_group.base_sha, and the',
+          '  checkout must use fetch-depth: 0 so that commit is present. Without it',
+          '  the placement check certifies nothing — see .github/workflows/ci-lint.yml.',
+        ],
+      }
+    }
     return {
       status: 'skip',
       lines: [
@@ -389,10 +590,40 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     }
   }
 
+  // Non-vacuity: an empty range certifies nothing. Say so rather than printing
+  // a cheerful OK. Normal on `push: main`; the local-review trap is the dirty-
+  // worktree case, which gets the actionable line.
+  const headSha = gitSoft(['rev-parse', `${range.head}^{commit}`], cwd).trim()
+  /** @type {string[]} */
+  const warnings = []
+  if (headSha && headSha === mergeBase) {
+    const dirty = gitSoft(['status', '--porcelain'], cwd).trim().length > 0
+    warnings.push(
+      `check-changelog-entry: WARN — ${range.base}...${range.head} is an EMPTY range; this run checked nothing.`,
+    )
+    warnings.push(
+      dirty
+        ? '  Your worktree has UNCOMMITTED changes. If you are testing a merge, COMMIT it first —'
+        : '  Normal on a push to main (HEAD is the base). Nothing was validated.',
+    )
+    if (dirty) {
+      warnings.push(
+        '  the guard diffs commits, so an uncommitted merge is invisible to it and passes vacuously.',
+      )
+    }
+  }
+
   const changedFiles = gitSoft(['diff', '--name-only', `${mergeBase}..${range.head}`], cwd)
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
+
+  const addedChangelogLines = parseAddedLineNumbers(
+    gitSoft(
+      ['diff', '-U0', '--no-color', `${mergeBase}..${range.head}`, '--', 'CHANGELOG.md'],
+      cwd,
+    ),
+  )
 
   const baseChangelog = gitSoft(['show', `${mergeBase}:CHANGELOG.md`], cwd)
   const headChangelog = gitSoft(['show', `${range.head}:CHANGELOG.md`], cwd)
@@ -409,18 +640,61 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     commitMessages,
     prBody: env.CHANGELOG_PR_BODY || '',
     prLabels: env.CHANGELOG_PR_LABELS || '',
+    addedChangelogLines,
+    placementOnly,
   })
 
   if (verdict.status === 'pass') {
     return {
       status: 'pass',
-      lines: [`check-changelog-entry: OK — ${verdict.reason} (${range.base}...${range.head}).`],
+      lines: [
+        ...warnings,
+        `check-changelog-entry: OK — ${verdict.reason} (${range.base}...${range.head}).`,
+      ],
+    }
+  }
+
+  if (verdict.misplaced) {
+    // Release headings carry a long ` — <summary>` tail; the version token is
+    // the part a reader needs, and the full line makes the report unreadable.
+    const short = (/** @type {string} */ h) => h.split(' — ')[0].trim()
+    const sections = [...new Set(verdict.misplaced.map((m) => short(m.section)))]
+    return {
+      status: 'fail',
+      lines: [
+        ...warnings,
+        'check-changelog-entry: FAIL — a CHANGELOG entry landed in an ALREADY-RELEASED section.',
+        '',
+        'These lines were added by this change, but they sit under a released version',
+        'heading instead of under `## Unreleased`:',
+        '',
+        ...verdict.misplaced.map(
+          (m) => `  CHANGELOG.md:${m.line}  under \`${short(m.section)}\`\n    ${m.text}`,
+        ),
+        '',
+        'This is almost always the post-release merge trap: you staged the entry under',
+        '`## Unreleased`, a release was cut before this merged (renaming that header to',
+        `${sections.map((s) => `\`${s}\``).join(', ')}), and the merge then applied your entry TEXTUALLY`,
+        'CLEAN into what is now a shipped section. No conflict, no error — just wrong',
+        'release notes and an entry buried where nobody will read it.',
+        '',
+        'Fix: rebase onto the current base, then MOVE your entry back under',
+        '`## Unreleased`. Verify with a COMMITTED merge (an uncommitted one is an empty',
+        'diff range and passes vacuously):',
+        '',
+        '  git fetch origin && git merge origin/main && node scripts/check-changelog-entry.mjs',
+        '',
+        'If you are deliberately editing an already-released section (fixing a typo in an',
+        'old entry, a retroactive backport note), put `[changelog placement ok]` on its',
+        'OWN LINE in the PR body or a commit message.',
+      ],
     }
   }
 
   return {
     status: 'fail',
     lines: [
+      ...warnings,
       'check-changelog-entry: FAIL',
       '',
       'This PR changes shippable code but adds no new entry under `## Unreleased`',

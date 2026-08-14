@@ -18,7 +18,7 @@
  */
 import { describe, expect, it, afterAll } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 
@@ -316,15 +316,221 @@ describe("check-changelog-entry — growth is measured against the merge-base, n
   });
 });
 
+/**
+ * The post-release merge trap, end to end.
+ *
+ * A PR stages its entry under `## Unreleased`. A release is cut before it
+ * merges, renaming that header to `## v0.21.0`. Merging main into the branch is
+ * TEXTUALLY CLEAN — the entry lands inside the shipped section, exit 0, zero
+ * conflicts — and nothing used to notice: the PR-side run measures growth
+ * against the PR's own merge-base (which predates the release, so the entry
+ * still reads as "under Unreleased" there), and the merge queue SKIPped the
+ * script outright.
+ *
+ * Non-vacuity: `trapFixture` asserts the merge is CLEAN and that the entry
+ * really did land under the released heading BEFORE the guard runs, so a
+ * fixture that stopped reproducing the corruption fails loudly instead of
+ * quietly making the red case unreachable.
+ */
+describe("check-changelog-entry — an entry that lands in an already-released section", () => {
+  /**
+   * The fork state. Shaped like the real file: `## Unreleased` already holds a
+   * staged entry, and the branch appends BELOW it — i.e. anchored on the next
+   * `##` heading. That anchoring is what makes the merge clean and the landing
+   * silent, and it is exactly how #4680's entry ended up at CHANGELOG.md:813.
+   */
+  const FORK = [
+    "# Changelog",
+    "",
+    "## Unreleased",
+    "",
+    "<!-- staging area; entries land here per-PR -->",
+    "",
+    "- **Existing staged entry (#0):** already waiting for the next cut.",
+    "",
+    "## v0.20.11 — a released section",
+    "",
+    "- **Something shipped (#1):** prose.",
+    "",
+  ].join("\n");
+
+  /** The branch: appends its entry at the end of Unreleased. */
+  const BRANCH = FORK.replace(
+    "- **Existing staged entry (#0):** already waiting for the next cut.\n",
+    "- **Existing staged entry (#0):** already waiting for the next cut.\n" +
+      "- **Branch entry (#2):** staged under Unreleased, before the release.\n",
+  );
+
+  /**
+   * Main, after the release cut: `## Unreleased` is RENAMED to `## v0.21.0`
+   * (carrying entry #0 with it) and a fresh empty Unreleased is seeded above.
+   * The branch never saw this, and its own edit is far enough down the file
+   * that git merges the two without a murmur.
+   */
+  const AFTER_RELEASE = [
+    "# Changelog",
+    "",
+    "## Unreleased",
+    "",
+    "<!-- staging area; entries land here per-PR -->",
+    "",
+    "## v0.21.0 — the cut that happened while the PR sat open",
+    "",
+    "- **Existing staged entry (#0):** already waiting for the next cut.",
+    "",
+    "## v0.20.11 — a released section",
+    "",
+    "- **Something shipped (#1):** prose.",
+    "",
+  ].join("\n");
+
+  /**
+   * Build the corrupt-but-clean merge: branch stages an entry, main cuts a
+   * release, branch merges main. Leaves the fixture on the merge commit.
+   */
+  function trapFixture(prefix: string): Fixture {
+    const f = makeFixture(prefix, FORK);
+    const git = (args: string[]) => execFileSync("git", args, { cwd: f.dir, encoding: "utf-8" });
+
+    // The branch ships code and stages its entry under `## Unreleased`.
+    f.writeFile("src/feature.ts", "export const feature = 9;\n");
+    f.writeFile("CHANGELOG.md", BRANCH);
+    f.commit("feat: ship code with its entry staged under Unreleased");
+
+    // Main advances: the release renames the header the entry lives under.
+    f.advanceMain({ "CHANGELOG.md": AFTER_RELEASE }, "chore: release v0.21.0");
+
+    // The merge that silently corrupts. It MUST be clean — that is the defect.
+    const merge = spawnSync("git", ["merge", "--no-edit", "main"], {
+      cwd: f.dir,
+      encoding: "utf-8",
+    });
+    expect(merge.status, `the trap requires a CLEAN merge; got:\n${merge.stderr}`).toBe(0);
+
+    // And the entry MUST now sit under the released heading, not Unreleased.
+    const merged = git(["show", "HEAD:CHANGELOG.md"]).split("\n");
+    const entryLine = merged.findIndex((l) => l.includes("Branch entry (#2)"));
+    const releasedLine = merged.findIndex((l) => l.startsWith("## v0.21.0"));
+    expect(entryLine, "fixture no longer reproduces: entry missing").toBeGreaterThan(-1);
+    expect(
+      entryLine,
+      "fixture no longer reproduces: entry did not land under the released heading",
+    ).toBeGreaterThan(releasedLine);
+
+    return f;
+  }
+
+  it("RED on the merge queue: the merged result is caught, naming the section and the fix", () => {
+    const f = trapFixture("changelog-trap-mg-");
+
+    // The queue ref: base is github.event.merge_group.base_sha, surfaced as
+    // $CHANGELOG_BASE by ci-lint.yml. This is the ONLY moment the corruption is
+    // observable, so this assertion is the whole point of the fix.
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("landed in an ALREADY-RELEASED section");
+    // Names the actual problem and the actual fix — not the misleading
+    // "adds no new entry under ## Unreleased" symptom the old guard reported.
+    expect(r.out).toContain("`## v0.21.0`");
+    expect(r.out).toContain("Branch entry (#2)");
+    expect(r.out).toContain("MOVE your entry back under");
+    expect(r.out).not.toContain("adds no new entry");
+  });
+
+  it("RED on the PR event too, once the branch has merged main in", () => {
+    const f = trapFixture("changelog-trap-pr-");
+    const r = f.check({ CHANGELOG_BASE: "main" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("landed in an ALREADY-RELEASED section");
+  });
+
+  it("is escapable with a [changelog placement ok] commit token, for a deliberate old-section edit", () => {
+    const f = trapFixture("changelog-trap-escape-");
+    f.writeFile("src/other.ts", "export const other = 1;\n");
+    f.commit("chore: amend the shipped note\n\n[changelog placement ok]");
+
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" });
+    expect(r.code).toBe(0);
+    expect(r.out).not.toContain("ALREADY-RELEASED");
+  });
+
+  it("does NOT fire on the release PR, which adds the released heading in the same range", () => {
+    // The release PR renames `## Unreleased` to `## v0.21.0`, so every line
+    // beneath that heading reads as "added" to the diff. Exempting a section
+    // whose OWN heading was added in the range is what keeps this green.
+    const f = makeFixture("changelog-release-pr-", FORK);
+    f.writeFile(
+      "CHANGELOG.md",
+      FORK.replace(
+        "<!-- staging area; entries land here per-PR -->\n",
+        "<!-- staging area; entries land here per-PR -->\n\n## v0.21.0 — the cut\n",
+      ),
+    );
+    f.commit("chore: release v0.21.0");
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+    expect(r.out).not.toContain("ALREADY-RELEASED");
+  });
+});
+
+describe("check-changelog-entry — non-vacuity", () => {
+  it("WARNs instead of a bare OK when the range is empty (the uncommitted-merge trap)", () => {
+    // `npm run lint` over an UNCOMMITTED merge sees an empty main...HEAD range
+    // and used to print a cheerful OK — which cost real reviewer time on
+    // exactly the corruption above. It must say it checked nothing.
+    const f = makeFixture("changelog-empty-range-");
+    execFileSync("git", ["checkout", "-q", "main"], { cwd: f.dir, encoding: "utf-8" });
+    f.writeFile("src/uncommitted.ts", "export const x = 1;\n"); // dirty worktree
+
+    const r = f.check({ CHANGELOG_BASE: "main" });
+    expect(r.out).toContain("EMPTY range");
+    expect(r.out).toContain("this run checked nothing");
+    expect(r.out).toContain("COMMIT it first");
+  });
+
+  it("FAILs when merge_group sets a base ref that does not resolve", () => {
+    // A workflow that stops surfacing merge_group.base_sha correctly must break
+    // loudly. Skipping here would silently restore the original blind spot.
+    const f = makeFixture("changelog-mg-badbase-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.commit("feat: ship on a queue ref");
+    execFileSync("git", ["branch", "-m", "main", "detached-away"], {
+      cwd: f.dir,
+      encoding: "utf-8",
+    });
+
+    const r = f.check({
+      GITHUB_EVENT_NAME: "merge_group",
+      CHANGELOG_BASE: "does-not-exist-ref",
+    });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("merge_group base ref is unresolvable");
+  });
+
+  it("ci-lint.yml surfaces merge_group.base_sha as $CHANGELOG_BASE", () => {
+    // Without this env line the queue-side placement check has no base and the
+    // merged result goes uninspected again. Pin it in the workflow itself.
+    const wf = readFileSync(join(repoRoot, ".github", "workflows", "ci-lint.yml"), "utf-8");
+    expect(wf).toMatch(/CHANGELOG_BASE:.*github\.event\.merge_group\.base_sha/);
+  });
+});
+
 describe("check-changelog-entry — skips that must never gate", () => {
-  it("skips (passes) on a merge_group event", () => {
+  it("does not blanket-skip a merge_group event; it runs the placement check", () => {
+    // RULE 1 (an entry must exist) still stands down on a queue ref: the
+    // `no-changelog` label and the PR body are unreadable there, so enforcing it
+    // would red a legitimately-escaped PR and eject the train. RULE 2
+    // (placement) reads only the diff, so it runs — and this must not regress
+    // back into an unconditional skip.
     const f = makeFixture("changelog-skip-mg-");
     f.writeFile("src/feature.ts", "export const feature = 2;\n");
     f.commit("feat: ship without changelog on the queue ref");
 
     const r = f.check({ GITHUB_EVENT_NAME: "merge_group" });
     expect(r.code).toBe(0);
-    expect(r.out).toContain("SKIP — merge_group");
+    expect(r.out).toContain("no entry added under a released section");
+    expect(r.out).not.toContain("SKIP — merge_group");
   });
 
   it("skips (passes) when no base ref is resolvable", () => {

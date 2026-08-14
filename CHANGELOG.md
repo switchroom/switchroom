@@ -157,6 +157,31 @@ now an anomaly worth investigating, not the norm.
   now in that file, 29 fail on `fa9018a7` and 8 are guards that pass on both
   revisions.
 
+- **ci: the changelog guard now catches an entry that lands in an
+  already-released section** — a PR that stages its entry under `## Unreleased`
+  and then has a release cut underneath it merges **textually clean**: git
+  reapplies the entry at the same offset, which is now inside the shipped
+  `## vX.Y.Z` section. Exit 0, zero conflicts, wrong release notes, entry buried
+  forever. Nothing caught it, because the only moment the corruption exists is
+  the MERGED result: the `pull_request` run measures growth against the PR's own
+  merge-base (which predates the release, so the entry still reads as staged),
+  and `check-changelog-entry.mjs` SKIPped `merge_group` outright, so the queue
+  never re-checked. Four PRs (#4679–#4682) hit this simultaneously behind the
+  v0.21.9 cut; a fifth (#4561) landed the same way in August and was repaired by
+  hand at release time. The guard gains a PLACEMENT rule — no line added in the
+  range may land under a released heading, unless that heading was added in the
+  same range (the release PR's own rename) — and it now RUNS on `merge_group`,
+  where `github.event.merge_group.base_sha` supplies the base the old skip note
+  claimed did not exist. The entry-required rule still stands down there, since
+  its `no-changelog` / PR-body escape hatch is unreadable on a queue ref;
+  placement reads only the diff, so it needs no PR context. The message names
+  the real problem and fix (`your entry is under ## v0.21.8, move it back under
+  ## Unreleased`) instead of the misleading `adds no new entry` symptom, a
+  set-but-unresolvable `$CHANGELOG_BASE` on a queue ref now FAILs rather than
+  skipping, and an EMPTY diff range now WARNs that it checked nothing — the
+  local-review trap where `npm run lint` over an *uncommitted* merge printed a
+  cheerful OK. Deliberate old-section edits opt out with
+  `[changelog placement ok]` on its own line.
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
   (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)
