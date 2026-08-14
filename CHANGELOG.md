@@ -39,7 +39,7 @@ now an anomaly worth investigating, not the norm.
   and hands Kokoro one already-safe batch at a time; the split is lossless by
   construction — an over-long run is *carried* into the next batch rather than
   discarded. Same corpus after: **0 over-limit batches, 0 phonemes lost**, at a
-  cost of 6320 → 6413 synthesis batches (+1.5%). The espeak path
+  cost of 6320 → 6412 synthesis batches (+1.5%). The espeak path
   (`VOICE_TTS_G2P=espeak`, non-English locales) is phonemized through Kokoro's
   own tokenizer so it is chunked the same way. Characters remain the coarse
   pass, so `VOICE_TTS_MAX_CHARS` keeps its meaning but is no longer
