@@ -513,14 +513,13 @@ describe('speech capture (PR-0) — driven through the REAL sendReply wiring, no
     }
 
     // Deliberately includes a spaced em-dash: `normalizeOutboundBody`'s
-    // voice-scrub pass (`scrubVoice`, applied LAST in the pipeline —
-    // outbound-send-path.ts's own docstring: "normalize → redact →
-    // punctuation/bold → voice-scrub") rewrites a mid-prose ` — ` into `. `
-    // plus recapitalizing the following word. A golden fixture with nothing
-    // for the pipeline to transform can't tell "capture reads the
-    // normalised `text`" apart from "capture reads the raw `rawText`" — both
-    // would produce byte-identical output. This fixture makes that
-    // distinction observable (G2).
+    // punctuation/bold pass (`normalizePunctuation`, format.ts:695, step 4
+    // of the pipeline — outbound-send-path.ts's own docstring: "normalize →
+    // redact → punctuation/bold → voice-scrub") rewrites a bare/mid-prose
+    // em-dash into `, `. A golden fixture with nothing for the pipeline to
+    // transform can't tell "capture reads the normalised `text`" apart from
+    // "capture reads the raw `rawText`" — both would produce byte-identical
+    // output. This fixture makes that distinction observable (G2).
     const raw = '| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```ts\nconst x = 1 | 2\n```\n\nStatus update — done. ✅ `code` 😀.'
     await sendReply(h.deps, req(raw))
 
@@ -534,12 +533,12 @@ describe('speech capture (PR-0) — driven through the REAL sendReply wiring, no
     // from" resolveVoiceOutPlan's input — it is the SAME string, by identity
     // of value, not by coincidence of two independent pipelines agreeing.
     expect(captured[0]!.text).toBe(observedByVoicePlan)
-    // G2: the captured text is the NORMALISED/scrubbed form, downstream of
-    // `scrubVoice`'s em-dash rewrite — not the raw fixture. A regression
-    // that swapped in the pre-pipeline `rawText` would still satisfy the
-    // identity assertion above (both call sites would agree on SOME
-    // string), so this must check the captured content against the known
-    // transform independently, not just against `observedByVoicePlan`.
+    // G2: the captured text is the NORMALISED form, downstream of
+    // `normalizePunctuation`'s em-dash rewrite — not the raw fixture. A
+    // regression that swapped in the pre-pipeline `rawText` would still
+    // satisfy the identity assertion above (both call sites would agree on
+    // SOME string), so this must check the captured content against the
+    // known transform independently, not just against `observedByVoicePlan`.
     expect(captured[0]!.text).not.toBe(raw)
     expect(captured[0]!.text).not.toContain('Status update — done')
     expect(captured[0]!.text).toContain('Status update, done')
