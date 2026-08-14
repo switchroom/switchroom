@@ -27,6 +27,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   writeFileSync,
   rmSync,
 } from "node:fs";
@@ -34,8 +35,10 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 import { enumerateMutants } from "../scripts/mutation/operators.mjs";
-import { runMutationTarget } from "../scripts/mutation/run.mjs";
+import { runMutationTarget, classifyRun } from "../scripts/mutation/run.mjs";
+import { changedFiles } from "../scripts/mutation/changed-files.mjs";
 import {
   arm,
   disarm,
@@ -119,6 +122,10 @@ describe("mutation guard — #4670 shape (a test asserting a seam's mirror)", ()
     expect(r.survivors[0]!.original).toBe("reconcileEnv");
     expect(r.survivors[0]!.mutated).toBe("undefined");
     expect(r.total).toBe(1);
+    // Pin `killed` too, like the paired seam-real case below. Without it the
+    // claim is only "one mutant, and it survived"; with it the claim is "one
+    // mutant, and NOTHING killed it", which is what the fixture exists to say.
+    expect(r.killed).toBe(0);
   });
 
   it("does NOT flag it once a test drives the un-seamed production path", () => {
@@ -556,5 +563,389 @@ describe("mutation guard — the curated manifest stays honest", () => {
       scripts: Record<string, string>;
     };
     expect(pkg.scripts.lint).toContain("node scripts/check-mutation-coverage.mjs");
+  });
+});
+
+describe("mutation guard — the guard's OWN files must not skip the required gates", () => {
+  // The hole this closes, and it is the guard's own: `scripts/check-*.mjs`
+  // matched the entry point and NOTHING else. `scripts/mutation/**` and
+  // `scripts/mutation-targets.json` matched no pattern in either required
+  // filter key, so a PR touching only the operator set and the manifest — the
+  // exact shape of the filed follow-ups #4704 and #4705 — evaluated to
+  // `lint == 'false'` AND `core == 'false'`. Both sentinels then report
+  // SUCCESS on a skipped body (ci-lint.yml's `lint`, ci-tests-core.yml's
+  // `vitest`), so the operator set could be neutered to a no-op, or the
+  // manifest emptied and its `mutants` ratchet lowered to match, on a fully
+  // green PR that ran zero of these tests and zero mutants. The `mutants`
+  // ratchet cannot save that: it is enforced by the script that would not run
+  // and by this file, which would not run either.
+  //
+  // Asserting the FILTER, not the yaml text, is the point: a rename of
+  // scripts/mutation/ that leaves the patterns behind must fail here.
+  const filters = parseYaml(
+    readFileSync(join(REPO, ".github", "path-filters.yml"), "utf8"),
+  ) as Record<string, unknown>;
+
+  /** dorny/paths-filter flattens nested arrays (the `*ws9f1-security` anchor
+   *  expands to one), so flatten before matching — same as the action does. */
+  const patternsFor = (key: string): string[] =>
+    (filters[key] as unknown[]).flat(Infinity) as string[];
+
+  /**
+   * Minimal glob→RegExp covering the two shapes this filter file actually
+   * uses: literal paths and `*` / `**`. Any pattern containing another glob
+   * metacharacter yields `null` and is treated as NO MATCH — the fail-closed
+   * direction, because an unanalysable pattern can then only turn this test
+   * RED, never green. Verified against picomatch 2.3.1 (the matcher
+   * dorny/paths-filter@ceb8a2b8 compiles with, `{dot: true}`) over every
+   * pattern in the `lint` and `core` keys.
+   */
+  const globToRe = (pattern: string): RegExp | null => {
+    if (/[?![\](){}+@!]/.test(pattern)) return null;
+    const body = pattern
+      .split(/(\*\*\/|\*\*|\*)/)
+      .map((part) => {
+        if (part === "**/") return "(?:.*/)?";
+        if (part === "**") return ".*";
+        if (part === "*") return "[^/]*";
+        return part.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      })
+      .join("");
+    return new RegExp(`^${body}$`);
+  };
+
+  const matches = (key: string, file: string): boolean =>
+    patternsFor(key).some((p) => globToRe(p)?.test(file) ?? false);
+
+  // Every file `bun lint`'s mutation check and this suite actually load.
+  // Derived from the directory, not hand-listed, so a new module added to
+  // scripts/mutation/ is covered the moment it lands.
+  const GUARD_FILES = [
+    "scripts/check-mutation-coverage.mjs",
+    "scripts/mutation-targets.json",
+    ...readdirSync(join(REPO, "scripts", "mutation"))
+      .filter((f) => f.endsWith(".mjs"))
+      .sort()
+      .map((f) => `scripts/mutation/${f}`),
+  ];
+
+  it("enumerates every load-bearing file, including the runner modules", () => {
+    // Guards the guard: if readdirSync ever returns nothing the loop below
+    // passes vacuously over an empty list.
+    expect(GUARD_FILES).toContain("scripts/mutation/operators.mjs");
+    expect(GUARD_FILES).toContain("scripts/mutation/run.mjs");
+    expect(GUARD_FILES).toContain("scripts/mutation/restore-sentinel.mjs");
+    expect(GUARD_FILES).toContain("scripts/mutation/changed-files.mjs");
+    expect(GUARD_FILES.length).toBeGreaterThanOrEqual(6);
+  });
+
+  it("matches every one against `lint` — the key gating the job that RUNS the check", () => {
+    expect(GUARD_FILES.filter((f) => !matches("lint", f))).toEqual([]);
+  });
+
+  it("matches every one against `core` — the key gating the tests that COVER it", () => {
+    expect(GUARD_FILES.filter((f) => !matches("core", f))).toEqual([]);
+  });
+
+  it("would flag the follow-up-PR shape that skipped both gates", () => {
+    // #4704 (extend the operator set) + #4705 (add the #4670 target). Each
+    // required key is an OR over the diff, so this is the whole gate decision
+    // for that PR.
+    const diff = ["scripts/mutation/operators.mjs", "scripts/mutation-targets.json"];
+    expect(diff.some((f) => matches("lint", f))).toBe(true);
+    expect(diff.some((f) => matches("core", f))).toBe(true);
+  });
+
+  it("has not turned the filters into a match-everything (the tests above would pass either way)", () => {
+    // Without this, deleting every pattern and replacing it with `**` would
+    // make the three assertions above green while destroying the path gate.
+    for (const key of ["lint", "core"]) {
+      for (const f of ["README.md", "docs/architecture.md", "CHANGELOG.md"]) {
+        expect({ key, f, matched: matches(key, f) }).toEqual({
+          key,
+          f,
+          matched: false,
+        });
+      }
+    }
+  });
+});
+
+describe("mutation guard — a timed-out mutant is INDETERMINATE, never a kill", () => {
+  it("classifies a real timed-out child as timedOut, not as a red suite", () => {
+    // A real hanging subprocess, not a fabricated spawnSync result: the claim
+    // is about Node's behaviour, so asserting a hand-built
+    // `{status: null, error: {code: 'ETIMEDOUT'}}` would only assert this
+    // test's own assumption.
+    const hung = spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      timeout: 300,
+      encoding: "utf8",
+    });
+    expect(classifyRun(hung)).toEqual({ passed: false, timedOut: true });
+  });
+
+  it("classifies a genuinely red suite as a kill, not a timeout", () => {
+    const red = spawnSync(process.execPath, ["-e", "process.exit(1)"], {
+      timeout: 30_000,
+      encoding: "utf8",
+    });
+    expect(classifyRun(red)).toEqual({ passed: false, timedOut: false });
+  });
+
+  it("classifies a green suite as passed", () => {
+    const green = spawnSync(process.execPath, ["-e", "process.exit(0)"], {
+      timeout: 30_000,
+      encoding: "utf8",
+    });
+    expect(classifyRun(green)).toEqual({ passed: true, timedOut: false });
+  });
+
+  it("keeps a timed-out mutant out of BOTH counts", () => {
+    // The bug: `passed: r.status === 0` made a timeout false, so the mutant was
+    // counted as killed and the target reported `4/4 mutants killed — OK` at
+    // exit 0. A mutation that only makes the suite too slow to finish is then
+    // indistinguishable from one the tests actually caught.
+    let call = 0;
+    const r = runMutationTarget({
+      file: "m.ts",
+      expectedMutants: 4,
+      readSource: () =>
+        `export function pick(v: number, w: number) {\n` +
+        `  if (v > 0) return 'a';\n` +
+        `  if (w > 0) return 'b';\n` +
+        `  return 'c';\n` +
+        `}\n`,
+      writeSource: () => {},
+      // Mutants are emitted in source order: force-false@2, force-true@2,
+      // force-false@3, force-true@3 — so call 1 is the baseline and calls 2..5
+      // are those four in that order.
+      //   1 baseline green | 2 killed | 3 TIMED OUT | 4 survivor | 5 killed
+      runTests: () => {
+        const verdicts = [
+          { passed: true }, // baseline
+          { passed: false }, // force-false@2 — killed
+          { passed: false, timedOut: true }, // force-true@2 — indeterminate
+          { passed: true }, // force-false@3 — survivor
+          { passed: false }, // force-true@3 — killed
+        ];
+        return verdicts[call++]!;
+      },
+    });
+    expect(r.timedOut.map((m: { id: string }) => m.id)).toEqual(["force-true@2"]);
+    expect(r.survivors.map((m: { id: string }) => m.id)).toEqual(["force-false@3"]);
+    expect(r.killed).toBe(2);
+    // The invariant: nothing is silently absorbed into a verdict it did not earn.
+    expect(r.killed + r.survivors.length + r.timedOut.length).toBe(r.total);
+  });
+
+  it("hard-errors when the BASELINE times out — every mutant would too", () => {
+    expect(() =>
+      runMutationTarget({
+        file: "m.ts",
+        readSource: () => `export function f(v: number) {\n  if (v) return 1;\n  return 0;\n}\n`,
+        writeSource: () => {},
+        runTests: () => ({ passed: false, timedOut: true }),
+      }),
+    ).toThrow(/BASELINE TIMED OUT/);
+  });
+});
+
+describe("mutation guard — the diff gate fails towards RUNNING, never towards skipping", () => {
+  // `changedFiles` is the one function whose failure mode is "run nothing":
+  // every other failure in the harness is loud (red baseline, stale symbol,
+  // drifted count, survivor), while getting this wrong prints
+  // `0/1 target(s) touched by this diff` and exits 0 having perturbed nothing.
+  function gitRepo() {
+    const dir = mkdtempSync(join(tmpdir(), "mutation-diff-"));
+    const git = (...args: string[]) => {
+      const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+      return r.stdout;
+    };
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "t");
+    git("config", "commit.gpgsign", "false");
+    writeFileSync(join(dir, "base.txt"), "base\n", "utf8");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    return { dir, git };
+  }
+
+  it("returns exactly the files changed against a resolvable base", () => {
+    const { dir, git } = gitRepo();
+    try {
+      git("checkout", "-qb", "feature");
+      writeFileSync(join(dir, "scripts", "..", "changed.txt"), "x\n", "utf8");
+      git("add", "-A");
+      git("commit", "-qm", "change");
+      // Real git, real subprocess, real fallback chain: `origin/main...HEAD`
+      // fails (no remote), `main...HEAD` succeeds.
+      expect(changedFiles("main", { cwd: dir })).toEqual(new Set(["changed.txt"]));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null — RUN EVERYTHING — when the base ref cannot be resolved", () => {
+    const { dir } = gitRepo();
+    const warnings: string[] = [];
+    try {
+      // Shallow checkout, deleted base branch, renamed default: every one of
+      // these lands here, and every one must run the whole manifest rather
+      // than quietly certifying a diff it could not compute.
+      expect(
+        changedFiles("no-such-base-ref", { cwd: dir, warn: (m: string) => warnings.push(m) }),
+      ).toBeNull();
+      expect(warnings.join("\n")).toContain("could not diff against");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null when no base is given at all (push to main, merge_group, local)", () => {
+    const saved = process.env.GITHUB_BASE_REF;
+    delete process.env.GITHUB_BASE_REF;
+    try {
+      expect(changedFiles(null, { cwd: REPO })).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.GITHUB_BASE_REF;
+      else process.env.GITHUB_BASE_REF = saved;
+    }
+  });
+
+  it("falls back to GITHUB_BASE_REF when no explicit base is passed", () => {
+    const { dir, git } = gitRepo();
+    const saved = process.env.GITHUB_BASE_REF;
+    process.env.GITHUB_BASE_REF = "main";
+    try {
+      git("checkout", "-qb", "feature");
+      writeFileSync(join(dir, "from-env.txt"), "x\n", "utf8");
+      git("add", "-A");
+      git("commit", "-qm", "change");
+      expect(changedFiles(null, { cwd: dir })).toEqual(new Set(["from-env.txt"]));
+    } finally {
+      if (saved === undefined) delete process.env.GITHUB_BASE_REF;
+      else process.env.GITHUB_BASE_REF = saved;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mutation guard — `// mutation-allow:` does not depend on the line ending", () => {
+  it("still suppresses on a CRLF file", () => {
+    // `text.split("\n")` leaves a trailing "\r" on every line of a CRLF file.
+    // "\r" is a JS line terminator, so `.` will not consume it and a
+    // non-multiline `$` will not match before it: `(\S.*)$` failed outright
+    // and the hatch silently stopped suppressing anything on that file.
+    const lf =
+      `export function f(v) {\n` +
+      `  // mutation-allow: inert by construction\n` +
+      `  if (v < 0) return null;\n` +
+      `  return v;\n` +
+      `}\n`;
+    const crlf = lf.replace(/\n/g, "\r\n");
+    const a = enumerateMutants("x.ts", lf);
+    const b = enumerateMutants("x.ts", crlf);
+    expect(a.allowedMutants.map((m: { id: string }) => m.id)).toEqual([
+      "force-false@3",
+      "force-true@3",
+    ]);
+    expect(b.allowedMutants.map((m: { id: string }) => m.id)).toEqual(
+      a.allowedMutants.map((m: { id: string }) => m.id),
+    );
+    expect(b.allowedMutants[0]!.allowReason).toBe("inert by construction");
+    expect(b.mutants).toEqual([]);
+  });
+
+  it("still refuses a reasonless hatch on a CRLF file", () => {
+    // The `m` flag must not turn "\r" itself into the mandatory reason.
+    const crlf = `export function f(v) {\r\n  // mutation-allow:\r\n  if (v < 0) return null;\r\n  return v;\r\n}\r\n`;
+    const { mutants, allowedMutants } = enumerateMutants("x.ts", crlf);
+    expect(allowedMutants).toEqual([]);
+    expect(mutants.map((m: { id: string }) => m.id)).toEqual([
+      "force-false@3",
+      "force-true@3",
+    ]);
+  });
+});
+
+describe("mutation guard — an unrecoverable interrupted run is a curated error", () => {
+  // `recover()` throws two hard errors that are addressed to a human with a
+  // dirty working tree ("unreadable sentinel", "would DELETE those edits"), and
+  // both already say exactly what to do. Thrown out of an unwrapped `main()`
+  // they arrived buried in a raw Node stack plus a crash banner — the same
+  // output shape the STALE MANIFEST read was fixed to avoid, so this was an
+  // internal inconsistency as well as bad UX.
+  const SENTINEL = join(REPO, SENTINEL_NAME);
+
+  it("reports a truncated sentinel without a stack or a crash banner", () => {
+    // Never clobber a real one: a leftover sentinel means the developer's tree
+    // may hold a mutant, and that is exactly what must not be silently eaten.
+    expect(existsSync(SENTINEL)).toBe(false);
+    try {
+      writeFileSync(SENTINEL, `{"file": "prod.ts", "orig`, "utf8");
+      const r = spawnSync(
+        process.execPath,
+        [
+          join(REPO, "scripts", "check-mutation-coverage.mjs"),
+          "--file",
+          "scripts/mutation/operators.mjs",
+          "--tests",
+          "tests/mutation-guard.test.ts",
+        ],
+        { cwd: REPO, encoding: "utf8", timeout: 60_000 },
+      );
+      expect(r.status).toBe(1);
+      const err = r.stderr ?? "";
+      expect(err).toContain("INTERRUPTED RUN NOT RECOVERED");
+      expect(err).toContain("is unreadable");
+      // The instruction the human needs must survive, not be buried.
+      expect(err).toContain("check `git diff`");
+      // The tells for the unhandled-throw path.
+      expect(err).not.toMatch(/at main \(/);
+      expect(err).not.toMatch(/^Node\.js v/m);
+      // Fail closed: the tree may still hold a mutant, so the run must abort
+      // rather than fall through and mutate more source.
+      expect(r.stdout ?? "").not.toContain("mutants killed");
+      // Left armed on purpose — the human reconciles and deletes it.
+      expect(existsSync(SENTINEL)).toBe(true);
+    } finally {
+      rmSync(SENTINEL, { force: true });
+    }
+  });
+
+  it("reports an edited-since-killed-run target the same way", () => {
+    expect(existsSync(SENTINEL)).toBe(false);
+    const target = join(REPO, "scripts", "mutation", "operators.mjs");
+    try {
+      writeFileSync(
+        SENTINEL,
+        JSON.stringify({
+          file: "scripts/mutation/operators.mjs",
+          path: target,
+          original: "// a stale pristine copy that is not the current text\n",
+          armed_at: Date.now(),
+        }),
+        "utf8",
+      );
+      const before = readFileSync(target, "utf8");
+      const r = spawnSync(
+        process.execPath,
+        [join(REPO, "scripts", "check-mutation-coverage.mjs"), "--all"],
+        { cwd: REPO, encoding: "utf8", timeout: 60_000 },
+      );
+      expect(r.status).toBe(1);
+      const err = r.stderr ?? "";
+      expect(err).toContain("INTERRUPTED RUN NOT RECOVERED");
+      expect(err).toContain("would DELETE those edits");
+      expect(err).not.toMatch(/at main \(/);
+      expect(err).not.toMatch(/^Node\.js v/m);
+      // The data-loss path stays shut: the file is untouched.
+      expect(readFileSync(target, "utf8")).toBe(before);
+      expect(existsSync(SENTINEL)).toBe(true);
+    } finally {
+      rmSync(SENTINEL, { force: true });
+    }
   });
 });

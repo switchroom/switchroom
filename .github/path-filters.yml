@@ -67,6 +67,18 @@ lint:
   # shape) is the one that would skip ci-lint and thus skip the only guard
   # that catches it. Same skip→pass hole the install.sh block above closes.
   - 'dependencies.json'
+  # The targeted mutation check's own load-bearing files. `scripts/check-*.mjs`
+  # catches the entry point ONLY: the operator set, the runner, the crash-safe
+  # restore and the curated manifest all live outside that glob and matched
+  # NOTHING here. That is the guard's own skip→pass hole, and it is the exact
+  # shape of its filed follow-ups (#4704 extends the operator set, #4705 adds a
+  # target) — a PR editing just scripts/mutation/operators.mjs +
+  # scripts/mutation-targets.json skipped ci-lint entirely, so the operator set
+  # could be neutered to a no-op, or the manifest emptied and its `mutants`
+  # ratchet lowered to match, on a green PR that never ran the check once.
+  # Same hole the install.sh and dependencies.json blocks above close.
+  - 'scripts/mutation/**'
+  - 'scripts/mutation-targets.json'
   - '.github/actions/setup-switchroom/**'
   - '.github/workflows/ci-lint.yml'
   - *ws9f1-security
@@ -102,6 +114,18 @@ core:
   # above — `scripts/check-*.mjs` is in the `lint` filter only, so without
   # this a PR editing just this script would skip the tests covering it.
   - 'scripts/check-changelog-entry.mjs'
+  # The targeted mutation check. tests/mutation-guard.test.ts IMPORTS
+  # scripts/mutation/{operators,run,restore-sentinel}.mjs directly and SPAWNS
+  # check-mutation-coverage.mjs (asserting its exit code and failure text), and
+  # its manifest suite re-derives every target's recorded `mutants` count from
+  # scripts/mutation-targets.json. None of those four paths matched anything in
+  # THIS filter — `scripts/check-*.mjs` is in `lint` only, and scripts/mutation/**
+  # + the manifest were in neither — so a PR editing just the operator set or
+  # the manifest skipped all 32 tests that cover them. Same reason as the four
+  # scripts above; see the matching block in `lint`.
+  - 'scripts/check-mutation-coverage.mjs'
+  - 'scripts/mutation/**'
+  - 'scripts/mutation-targets.json'
   - 'vitest.config.ts'
   - 'tsconfig.json'
   - 'package.json'

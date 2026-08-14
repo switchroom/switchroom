@@ -259,6 +259,35 @@ now an anomaly worth investigating, not the norm.
   named as the real guarantee. And the RFC now states the ledger reopen path's
   one-scan durability window, which was true in code and documented nowhere.
 
+### CI
+
+- **a targeted mutation check now catches vacuous tests, and it no longer
+  exempts itself from the gates that police it.** `bun lint` mutates a curated
+  set of load-bearing guard expressions (`force-false`, `force-true`,
+  `drop-last-arg`) and fails if the suite that covers them stays green — a test
+  that would not fail on the bug it guards is not a test. The check's own files
+  were the first thing it failed to police: `.github/path-filters.yml` matched
+  `scripts/check-*.mjs` and nothing else, so `scripts/mutation/**` and
+  `scripts/mutation-targets.json` matched NO filter key, and a PR touching only
+  those — the exact shape of the follow-ups this work filed — took `lint ==
+  'false'` and `core == 'false'`, skipped both job bodies, and had the required
+  `lint` / `vitest` sentinels report success on nothing. The operator set could
+  have been neutered to a no-op, or the manifest emptied and its `mutants`
+  ratchet lowered to match, on a green PR that never ran the check once. Both
+  keys now match those paths, and a test parses the filter file and re-derives
+  the coverage from the directory listing so a rename cannot silently reopen the
+  hole. Three verdict bugs went with it: a mutant killed by `MUTANT_TIMEOUT_MS`
+  scored as *killed* when a timeout is INDETERMINATE (it now has its own bucket
+  and fails the run, and a timed-out BASELINE is a hard error rather than a red
+  baseline); the `// mutation-allow:` escape hatch's regex silently never
+  matched on a CRLF file, disabling the reason requirement; and an
+  unrecoverable interrupted run threw out of `main()` as a raw Node stack
+  instead of the curated fail-closed message. `lint-run` in `ci-lint.yml` and
+  `lint-full` in `ci-full.yml` go 5 → 15 minutes, because `bun lint` now
+  EXECUTES vitest and its worst case is `mutants + 1` scoped suites × 120s
+  against a ~57s lint body; the manifest's admission criteria carry that
+  arithmetic so a future target is added against the real budget.
+
 ## v0.21.10 — the Telegram render pipeline stops deleting prose and corrupting fenced code, and TTS stops failing on long messages
 
 ### Bug fixes

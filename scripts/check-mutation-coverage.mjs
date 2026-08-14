@@ -53,9 +53,10 @@
  *   - DIFF-GATED ON PULL REQUESTS. A PR that touches no target runs nothing at
  *     all. The one shipped target costs ~7s (4 mutants + baseline x ~1.7s
  *     scoped vitest). NOT gated on the queue path: `GITHUB_BASE_REF` is unset
- *     for `push: main` and `merge_group`, and `changedFiles` treats an
- *     unresolvable base as "run everything" (so does a shallow checkout, via
- *     the same fallback at the bottom of that function). `ci-lint.yml` fires on
+ *     for `push: main` and `merge_group`, and `changedFiles`
+ *     (`scripts/mutation/changed-files.mjs`) treats an unresolvable base as
+ *     "run everything" — so does a shallow checkout, via the same fallback at
+ *     the bottom of that function. `ci-lint.yml` fires on
  *     all three triggers and `lint-run`'s `if:` forces it on push and
  *     merge_group, so the WHOLE manifest runs on every merge-queue entry and
  *     every push to main. That is deliberate — the queue ref IS candidate main
@@ -81,15 +82,35 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runMutationTarget, formatSurvivors } from "./mutation/run.mjs";
+import {
+  runMutationTarget,
+  formatSurvivors,
+  formatMutants,
+  classifyRun,
+} from "./mutation/run.mjs";
+import { changedFiles } from "./mutation/changed-files.mjs";
 import { arm, disarm, recover, SENTINEL_NAME } from "./mutation/restore-sentinel.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MANIFEST = join(REPO, "scripts", "mutation-targets.json");
 const SENTINEL = join(REPO, SENTINEL_NAME);
 
-/** Per-mutant wall-clock ceiling. A `force-true` on a loop guard can spin;
- *  a timeout is a KILL (the suite did not pass), never a survivor. */
+/**
+ * Per-mutant wall-clock ceiling. A `force-true` on a loop guard can spin.
+ *
+ * A timeout is INDETERMINATE — reported as its own hard failure, never folded
+ * into either verdict. Calling it a survivor would accuse a suite that may
+ * well assert the behaviour perfectly; calling it a kill (which this did
+ * before) scores a real survivor green whenever the mutation only makes the
+ * suite slow, which is exactly the "green for a reason unrelated to the
+ * assertions" shape the whole check exists to refuse.
+ *
+ * Budget note: this ceiling times the JOB budget. `ci-lint.yml`'s
+ * `timeout-minutes` must exceed the lint body plus `(mutants + 1) x` this
+ * value for the largest manifest entry, or a hung mutant kills the job before
+ * the script can report which mutant hung. See the admission criteria in
+ * `scripts/mutation-targets.json`.
+ */
 const MUTANT_TIMEOUT_MS = 120_000;
 
 function parseArgs(argv) {
@@ -105,26 +126,6 @@ function parseArgs(argv) {
   return out;
 }
 
-/** Files changed against the PR base, or null when no base is resolvable
- *  (push to main, local run, merge-queue ref). Null means "run everything". */
-function changedFiles(base) {
-  const ref = base ?? process.env.GITHUB_BASE_REF ?? null;
-  if (!ref) return null;
-  for (const spec of [`origin/${ref}...HEAD`, `${ref}...HEAD`]) {
-    const r = spawnSync("git", ["diff", "--name-only", spec], {
-      cwd: REPO,
-      encoding: "utf8",
-    });
-    if (r.status === 0) {
-      return new Set(r.stdout.split("\n").map((s) => s.trim()).filter(Boolean));
-    }
-  }
-  console.warn(
-    `check-mutation-coverage: could not diff against "${ref}" — running ALL targets`,
-  );
-  return null;
-}
-
 function makeVitestRunner(testPaths) {
   return () => {
     const r = spawnSync(
@@ -137,8 +138,10 @@ function makeVitestRunner(testPaths) {
         env: { ...process.env, CI: "1" },
       },
     );
+    // `classifyRun`, not `r.status === 0`: a timeout must not read as "the
+    // suite went red". See MUTANT_TIMEOUT_MS.
     return {
-      passed: r.status === 0,
+      ...classifyRun(r),
       detail: `${r.stdout ?? ""}\n${r.stderr ?? ""}`.slice(-4000),
     };
   };
@@ -150,7 +153,24 @@ function main() {
   // Recover from a previous run that was killed mid-mutant, BEFORE reading any
   // source. Skipping this would make the next run mutate an already-mutated
   // file and then "restore" the mutant as if it were pristine.
-  const recovered = recover(SENTINEL);
+  let recovered;
+  try {
+    recovered = recover(SENTINEL);
+  } catch (err) {
+    // `recover`'s two hard errors — an unreadable sentinel, and a target
+    // edited since a killed run — are addressed to a human staring at a dirty
+    // working tree, and both already say exactly what to do. Thrown out of an
+    // unwrapped `main()` they arrived wrapped in a raw stack naming THIS
+    // file's line number plus Node's crash banner, burying the instruction:
+    // the same output shape the STALE MANIFEST read below was fixed to avoid.
+    // Fail closed — the tree may still hold a mutant, so this must never fall
+    // through and start mutating more source.
+    console.error(
+      `\ncheck-mutation-coverage: INTERRUPTED RUN NOT RECOVERED\n  ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    process.exit(1);
+  }
   if (recovered) {
     console.warn(
       `check-mutation-coverage: a previous run was killed — ` +
@@ -186,7 +206,7 @@ function main() {
       }
     }
     if (!args.all) {
-      const changed = changedFiles(args.base);
+      const changed = changedFiles(args.base, { cwd: REPO });
       if (changed) {
         const before = targets.length;
         targets = targets.filter(
@@ -271,7 +291,26 @@ function main() {
           `  observable), suppress it with "// mutation-allow: <reason>" on or above\n` +
           `  the line and argue the equivalence — the reason is mandatory.`,
       );
-    } else {
+    }
+    if (result.timedOut.length > 0) {
+      // Not a survivor and not a kill — the suite never finished, so it
+      // returned no verdict at all. Failing here is what stops the previous
+      // behaviour (timeout counted as a kill) from reporting a clean pass over
+      // a mutant that merely made the suite too slow to notice it.
+      failed = true;
+      console.error(
+        `\n  ${result.timedOut.length}/${result.total} mutant(s) TIMED OUT in ${t.file} ` +
+          `after ${MUTANT_TIMEOUT_MS / 1000}s each:\n` +
+          `${formatMutants(t.file, result.timedOut)}\n\n` +
+          `  A timeout is INDETERMINATE, not a kill: the suite returned no verdict,\n` +
+          `  so this mutant may be an unnoticed survivor that only made the suite\n` +
+          `  slow. Either the mutation spins a loop the suite cannot escape (add a\n` +
+          `  bound, or suppress the site with "// mutation-allow: <reason>"), or\n` +
+          `  "${t.tests.join(" ")}" is too slow for this target — see the\n` +
+          `  admission criteria in scripts/mutation-targets.json.`,
+      );
+    }
+    if (result.survivors.length === 0 && result.timedOut.length === 0) {
       console.log(`  ${result.killed}/${result.total} mutants killed — OK`);
     }
   }

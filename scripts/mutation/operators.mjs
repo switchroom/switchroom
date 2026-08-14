@@ -59,8 +59,17 @@ export const OPERATORS = ["force-false", "force-true", "drop-last-arg"];
  * in a fixture, a log-line template, or a test's inline source must not
  * suppress a real adjacent site. That is a silent no-op of the guard, which is
  * exactly the failure mode this whole check exists to make impossible.
+ *
+ * The `m` flag is load-bearing despite matching one line at a time. `text` is
+ * split on "\n", so on a CRLF file every candidate line ends in a stray "\r".
+ * `\r` is a JS line terminator, so `.` will not consume it and a non-multiline
+ * `$` will not match before it — `(\S.*)$` fails outright and the hatch stops
+ * suppressing ANYTHING, silently, on that file. Failing closed (a suppressed
+ * mutant reappears as a survivor) makes it merely confusing rather than
+ * dangerous, and the repo is LF-only today, but "the hatch quietly changes
+ * meaning with the line ending" is not a property to leave in a guard.
  */
-const ALLOW_RE = /\/\/\s*mutation-allow:\s*(\S.*)$/;
+const ALLOW_RE = /\/\/\s*mutation-allow:\s*(\S.*)$/m;
 
 /** Argument node kinds `drop-last-arg` will replace with `undefined`.
  *  Restricted to value-shaped arguments: dropping a callback or an inline
