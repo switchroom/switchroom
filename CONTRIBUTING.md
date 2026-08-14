@@ -118,12 +118,17 @@ your agents are on the latest code.
    "and also" in the PR description, split it.
 3. Add tests for new behavior. Bug fixes should include a regression test
    that would have caught the bug.
-   - **Stage a CHANGELOG entry.** A PR that changes shippable code (`src`,
+   - **Stage a changelog note.** A PR that changes shippable code (`src`,
      `telegram-plugin`, `bin`, `docker`, `profiles`, `skills`, the vendored
-     hindsight tree, or CI workflows) must add a line under the `## Unreleased`
-     header in `CHANGELOG.md`, in the same PR — `npm run lint` (via
-     `scripts/check-changelog-entry.mjs`) fails otherwise. Cutting a release is
-     then just renaming that header. For a docs/chore/test-only PR that ships
+     hindsight tree, or CI workflows) must add a NEW fragment file under
+     `changelog.d/` in the same PR — run `bun run changelog:generate`, or write
+     `changelog.d/<pr>-<slug>.<type>.md` by hand (see `changelog.d/README.md`).
+     `npm run lint` (via `scripts/check-changelog-entry.mjs`) fails otherwise.
+     Per-PR fragment files never conflict with another in-flight PR; a
+     hand-written entry under `## Unreleased` in `CHANGELOG.md` still counts,
+     but it conflicts with every other open PR — prefer the fragment. At
+     release time the fragments are assembled into the `## vX.Y.Z` section
+     (`bun run changelog:cut`). For a docs/chore/test-only PR that ships
      nothing user-visible, opt out with a `no-changelog` label on the PR or a
      `[skip changelog]` token on its own line in the PR body or a commit message.
 4. Run `bun run lint` (tsc noEmit) and `bun run test` before pushing.

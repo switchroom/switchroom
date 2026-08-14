@@ -521,14 +521,18 @@ first.
 3. Implement with tests; validate locally with scoped vitest/bun test +
    `npm run lint`.
 4. Conventional Commits (`feat(scope):` …). **Before pushing a shippable
-   change, stage the CHANGELOG entry author-side:** `bun run
-   changelog:generate` derives a `## Unreleased` entry from your
-   conventional-commit title (idempotent; respects the `no-changelog` /
-   `[skip changelog]` hatches), then commit `CHANGELOG.md` so it rides your own
-   push — #4469's `check-changelog-entry.mjs` stays the CI backstop. Generation
-   is author-side, not a CI commit-back, because a `GITHUB_TOKEN` push can't
-   re-trigger the required checks (see `.github/MERGE-QUEUE.md` § "Author-side
-   changelog generation"). Push the branch to `origin` (canonical-only model,
+   change, stage the changelog note author-side:** `bun run
+   changelog:generate` derives a per-PR FRAGMENT file
+   (`changelog.d/<pr>-<slug>.<type>.md`) from your conventional-commit title
+   (idempotent; respects the `no-changelog` / `[skip changelog]` hatches),
+   then commit the fragment so it rides your own push — #4469's
+   `check-changelog-entry.mjs` stays the CI backstop. Do NOT edit
+   `CHANGELOG.md`'s `## Unreleased` directly: the shared section conflicts
+   with every other in-flight PR, which is what the fragment model exists to
+   kill (see `changelog.d/README.md`). Generation is author-side, not a CI
+   commit-back, because a `GITHUB_TOKEN` push can't re-trigger the required
+   checks (see `.github/MERGE-QUEUE.md` § "Author-side changelog
+   generation"). Push the branch to `origin` (canonical-only model,
    no forks): `gh pr create --repo switchroom/switchroom --base main`. Title
    <70 chars; body: Summary / Why / Test plan / Risk + the job-spec citation.
 5. **Fresh-process review before auto-merge.** The coder can't review its own

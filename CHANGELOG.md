@@ -3,16 +3,18 @@
 ## Unreleased
 
 <!--
-Staging area for the NEXT release. Every PR that changes shippable code adds
-its entry HERE, under this header, in the SAME PR — grouped under `###`
-subheads like the released sections below. `scripts/check-changelog-entry.mjs`
-(part of `npm run lint`) fails a PR that ships code without staging an entry
-here; docs/chore/test-only PRs opt out with a `no-changelog` label or a
-`[skip changelog]` token on its own line (in the PR body or a commit message).
-Cutting a release is then just renaming this header
-to `## vX.Y.Z — <summary>` (see skills/switchroom-release/SKILL.md, Step 1).
-Keep this header present and non-empty; an empty Unreleased at release time is
-now an anomaly worth investigating, not the norm.
+Staging area for the NEXT release. Do NOT add entries here in a PR:
+per-PR notes are FRAGMENT files under changelog.d/ (one file per PR, so
+two in-flight PRs never conflict) — see changelog.d/README.md, or run
+`bun run changelog:generate`. `scripts/check-changelog-entry.mjs` (part of
+`npm run lint`) fails a PR that ships code without staging a note;
+docs/chore/test-only PRs opt out with a `no-changelog` label or a
+`[skip changelog]` token on its own line. Cutting a release assembles the
+fragments into `## vX.Y.Z — <summary>` below this block and re-seeds it:
+`bun run changelog:cut -- --version vX.Y.Z --summary "…"`
+(skills/switchroom-release/SKILL.md, Step 1). Keep this header present;
+hand-written entries under it still count for the guard, but they conflict
+with every other open PR — prefer a fragment.
 -->
 
 ### Bug fixes

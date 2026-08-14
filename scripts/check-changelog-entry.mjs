@@ -16,9 +16,25 @@
  *
  * ── THE RULE (and why a docs/chore/test PR is never blocked) ─────────────
  *
- *   A PR that changes SHIPPABLE code MUST grow the `## Unreleased` section of
- *   CHANGELOG.md — i.e. add at least one entry line under that header that was
- *   not already there on the base branch.
+ *   A PR that changes SHIPPABLE code MUST stage a changelog note in the same
+ *   PR, satisfied by EITHER:
+ *
+ *     (a) adding a NEW fragment file under `changelog.d/` — the preferred
+ *         path; see `isChangelogFragment` and changelog.d/README.md — or
+ *     (b) growing the `## Unreleased` section of CHANGELOG.md, i.e. adding at
+ *         least one entry line under that header that was not already there
+ *         on the base branch (the legacy path, kept open so in-flight PRs and
+ *         deliberate hand-edits keep working).
+ *
+ *   Fragments exist because a single shared `## Unreleased` section makes any
+ *   two in-flight PRs conflict on CHANGELOG.md — three merge-queue ejections
+ *   in one day (#4678→#4679, #4679→#4712, #4678→#4712) over entries that never
+ *   actually disagreed. A per-PR file under `changelog.d/` cannot conflict
+ *   with another PR's file, so the conflict class disappears. The fragment
+ *   must be ADDED in the range (`git diff --diff-filter=A`), not merely
+ *   modified: rewording someone else's fragment stages nothing for THIS PR.
+ *   Fragments are assembled into the `## vX.Y.Z` section (and deleted) at
+ *   release time by `scripts/cut-changelog-release.mjs`.
  *
  *   SHIPPABLE = the real source/runtime/supply-chain paths (see
  *   SHIPPABLE_ROOTS): src, the Telegram plugin, bin, docker, profiles, skills,
@@ -215,6 +231,34 @@ export function isShippable(p) {
   if (!path) return false
   if (EXEMPT_RE.some((re) => re.test(path))) return false
   return SHIPPABLE_ROOTS.some((root) => path.startsWith(root))
+}
+
+/** The per-PR changelog fragment directory. Trailing slash on purpose. */
+export const FRAGMENT_DIR = 'changelog.d/'
+
+/**
+ * Is a path a changelog FRAGMENT — a file whose ADDITION satisfies the staged-
+ * entry requirement?
+ *
+ * Deliberately narrow, and every exclusion fails CLOSED (a non-fragment path
+ * simply does not count; the PR then needs a real fragment or an Unreleased
+ * entry — never the reverse):
+ *   - flat files only: `changelog.d/<name>.md`, no subdirectories, so the
+ *     release-cut assembler's flat readdir and this guard agree on the same
+ *     file set;
+ *   - `.md` only: the fragment body is pasted into CHANGELOG.md verbatim;
+ *   - `README.md` (any case) is the convention doc, never an entry.
+ *
+ * @param {string} p repo-relative path
+ * @returns {boolean}
+ */
+export function isChangelogFragment(p) {
+  const path = String(p).trim()
+  if (!path.startsWith(FRAGMENT_DIR)) return false
+  const name = path.slice(FRAGMENT_DIR.length)
+  if (!name || name.includes('/')) return false
+  if (/^readme\.md$/i.test(name)) return false
+  return /\.md$/i.test(name)
 }
 
 /**
@@ -690,6 +734,7 @@ export function evaluate({
   commitMessages = [],
   prBody = '',
   prLabels = '',
+  addedFiles = [],
   addedChangelogLines = new Set(),
   removedChangelogSections = new Set(),
   placementOnly = false,
@@ -743,10 +788,17 @@ export function evaluate({
   if (escaped) {
     return { status: 'pass', reason: 'escape hatch (no-changelog label / [skip changelog] token)' }
   }
+  // The preferred path: a NEW fragment file under changelog.d/. Checked after
+  // RULE 2 on purpose — a fragment satisfies the staged-entry requirement, it
+  // never buys immunity for corrupting an already-released section.
+  const fragments = (addedFiles || []).filter(isChangelogFragment)
+  if (fragments.length > 0) {
+    return { status: 'pass', reason: `changelog fragment staged (${fragments.join(', ')})` }
+  }
   if (unreleasedGrew(baseChangelog, headChangelog)) {
     return { status: 'pass', reason: '## Unreleased grew' }
   }
-  return { status: 'fail', reason: 'shippable change with no new ## Unreleased entry', shippable }
+  return { status: 'fail', reason: 'shippable change with no staged changelog note', shippable }
 }
 
 // ── git plumbing ───────────────────────────────────────────────────────────
@@ -972,6 +1024,18 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     .map((l) => l.trim())
     .filter(Boolean)
 
+  // Files ADDED in the range, for the changelog.d/ fragment rule. `--no-renames`
+  // keeps this deterministic against `diff.renames` config: a rename must show
+  // as delete+add, so a moved-in fragment still counts and a config difference
+  // between CI and a laptop cannot flip the verdict.
+  const addedFiles = gitSoft(
+    ['diff', '--name-only', '--no-renames', '--diff-filter=A', `${mergeBase}..${range.head}`],
+    cwd,
+  )
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+
   const changelogDiff = gitSoft(
     ['diff', '-U0', '--no-color', `${mergeBase}..${range.head}`, '--', 'CHANGELOG.md'],
     cwd,
@@ -1002,6 +1066,7 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     commitMessages,
     prBody: env.CHANGELOG_PR_BODY || '',
     prLabels: env.CHANGELOG_PR_LABELS || '',
+    addedFiles,
     addedChangelogLines,
     removedChangelogSections,
     placementOnly,
@@ -1102,14 +1167,20 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
       ...warnings,
       'check-changelog-entry: FAIL',
       '',
-      'This PR changes shippable code but adds no new entry under `## Unreleased`',
-      'in CHANGELOG.md. Shippable paths changed:',
+      'This PR changes shippable code but stages no changelog note. Shippable',
+      'paths changed:',
       '',
       ...verdict.shippable.map((p) => `  ${p}`),
       '',
-      'Add a one-line entry under the `## Unreleased` header describing the change,',
-      'in this same PR. Cutting a release then just renames that header to',
-      '`## vX.Y.Z — <summary>` (see skills/switchroom-release/SKILL.md, Step 1).',
+      'Add a NEW fragment file under `changelog.d/` describing the change, in this',
+      'same PR — `bun run changelog:generate` derives one from your conventional-',
+      'commit title, or write `changelog.d/<pr>-<slug>.<type>.md` by hand (see',
+      'changelog.d/README.md). Fragments are per-PR files, so they never conflict',
+      'with another in-flight PR; the release cut assembles them into the',
+      '`## vX.Y.Z` section (skills/switchroom-release/SKILL.md, Step 1).',
+      '',
+      '(A hand-written entry under `## Unreleased` in CHANGELOG.md still counts',
+      'too, but it WILL conflict with every other open PR — prefer the fragment.)',
       '',
       'If this really is a docs/chore/test-only change that ships nothing a user',
       'would read a changelog for, take the escape hatch:',

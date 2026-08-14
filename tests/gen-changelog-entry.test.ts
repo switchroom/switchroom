@@ -2,34 +2,46 @@
  * Outcome tests for `scripts/gen-changelog-entry.mjs` — the author-side
  * complement to `check-changelog-entry.mjs`.
  *
- * The guarantee under test is "given a shippable PR with no staged
- * `## Unreleased` entry, the helper derives one from the PR title / newest
- * conventional commit and writes it under the header — idempotently, and never
- * when an escape hatch is set". Every case builds a REAL git repo with REAL
- * commits and runs the REAL script as a subprocess, then reads the written
- * CHANGELOG.md back and asserts on its content — not on a helper's return value.
+ * The guarantee under test is "given a shippable PR with no staged changelog
+ * note, the helper derives one from the PR title / newest conventional commit
+ * and writes it as a NEW `changelog.d/` fragment file — idempotently, never
+ * touching CHANGELOG.md, and never when an escape hatch is set". Every case
+ * builds a REAL git repo with REAL commits and runs the REAL script as a
+ * subprocess, then reads the written fragment back and asserts on its path and
+ * content — not on a helper's return value.
  *
- * Non-vacuity: the write cases assert the exact derived bullet text (type/scope
- * parsing + `(#n)` suffix) landed under `## Unreleased`; they fail if derivation
- * is wrong or a no-op. The idempotency case runs the script TWICE and asserts
- * the second run adds nothing (a naive append would double it). The escape-hatch
- * cases assert the file is byte-unchanged — they fail if a hatch stops opting
- * out of generation.
+ * CHANGELOG.md must stay byte-identical on EVERY path, including the write
+ * path: the fragment model exists precisely so two in-flight PRs never edit
+ * the same file, and a generator that still wrote CHANGELOG.md would silently
+ * reintroduce the merge-conflict class (#4678→#4679, #4679→#4712, #4678→#4712
+ * were three queue ejections in one day).
+ *
+ * Non-vacuity: the write cases assert the exact derived fragment NAME
+ * (`<pr>-<slug>.<type>.md`) and bullet text; they fail if derivation is wrong
+ * or a no-op. The agreement case feeds the generator's output to the REAL
+ * check script and asserts it passes — writer and checker must agree on what
+ * counts as a staged note (and its red baseline proves the pass comes from the
+ * fragment, not from the fixture). The idempotency cases run the script TWICE
+ * and assert exactly one fragment exists after both. The escape-hatch cases
+ * assert nothing was written at all.
  */
 import { describe, expect, it, afterAll } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const GEN = join(repoRoot, "scripts", "gen-changelog-entry.mjs");
-
-// The guard's own extractor, used to assert writer/checker AGREEMENT rather
-// than re-implementing "what counts as a staged entry" a third time here.
-const { extractUnreleasedEntries } = await import(
-  join(repoRoot, "scripts", "check-changelog-entry.mjs")
-);
+const CHECK = join(repoRoot, "scripts", "check-changelog-entry.mjs");
 
 const SEED_CHANGELOG = [
   "# Changelog",
@@ -51,6 +63,9 @@ interface Fixture {
   writeFile: (rel: string, body: string) => void;
   commit: (message: string) => string;
   readChangelog: () => string;
+  /** Fragment file names under changelog.d/ (empty when the dir is absent). */
+  listFragments: () => string[];
+  readFragment: (name: string) => string;
   /**
    * Run git inside the fixture under its HERMETIC env (pinned identity, no
    * ambient `~/.gitconfig`). Every git call a test makes MUST go through this:
@@ -60,6 +75,8 @@ interface Fixture {
   git: (args: string[]) => string;
   /** Run the real generator over `main...HEAD`; returns exit code + output. */
   gen: (extraArgs?: string[], extraEnv?: Record<string, string>) => { code: number; out: string };
+  /** Run the real GUARD over `main...HEAD` — the writer/checker agreement probe. */
+  check: () => { code: number; out: string };
 }
 
 function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG): Fixture {
@@ -81,6 +98,7 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
   delete env.CHANGELOG_PR_LABELS;
   delete env.CHANGELOG_PR_TITLE;
   delete env.CHANGELOG_PR_NUMBER;
+  delete env.CHANGELOG_BASE;
   // The temp repo has no remote, so `resolvePrNumber`'s `gh pr view` fallback
   // errors out to null — the tests pin the number via --pr only. No PATH games
   // needed (git must stay resolvable).
@@ -113,6 +131,13 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
     readChangelog() {
       return readFileSync(join(dir, "CHANGELOG.md"), "utf-8");
     },
+    listFragments() {
+      const fragDir = join(dir, "changelog.d");
+      return existsSync(fragDir) ? readdirSync(fragDir).sort() : [];
+    },
+    readFragment(name: string) {
+      return readFileSync(join(dir, "changelog.d", name), "utf-8");
+    },
     gen(extraArgs = [], extraEnv = {}) {
       const r = spawnSync(process.execPath, [GEN, "--base", "main", ...extraArgs], {
         cwd: dir,
@@ -121,38 +146,36 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
       });
       return { code: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
     },
+    check() {
+      const r = spawnSync(process.execPath, [CHECK], {
+        cwd: dir,
+        encoding: "utf-8",
+        env: { ...env, CHANGELOG_BASE: "main" } as NodeJS.ProcessEnv,
+      });
+      return { code: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+    },
   };
-}
-
-/** Return only the lines under `## Unreleased`, up to the next `## ` header. */
-function unreleasedBlock(changelog: string): string {
-  const lines = changelog.split("\n");
-  let i = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l.trim()));
-  if (i === -1) return "";
-  const out: string[] = [];
-  for (i += 1; i < lines.length; i++) {
-    if (/^##\s/.test(lines[i])) break;
-    out.push(lines[i]);
-  }
-  return out.join("\n");
 }
 
 afterAll(() => {
   for (const d of scratchRoots) rmSync(d, { recursive: true, force: true });
 });
 
-describe("gen-changelog-entry — derives an entry from the conventional-commit title", () => {
-  it("parses type+scope and writes a scoped bullet under a category with the #PR suffix", () => {
+describe("gen-changelog-entry — derives a fragment from the conventional-commit title", () => {
+  it("writes <pr>-<slug>.<type>.md with a scoped bullet and the #PR suffix", () => {
     const f = makeFixture("gen-feat-");
     f.writeFile("src/memory.ts", "export const m = 2;\n");
     f.commit("fix(memory): stop double-counting recalls");
 
+    const before = f.readChangelog();
     const r = f.gen(["--pr", "4500"]);
     expect(r.code).toBe(0);
-    const block = unreleasedBlock(f.readChangelog());
-    // fix → "Bug fixes" category; scope shown inline; #PR suffix present.
-    expect(block).toContain("### Bug fixes");
-    expect(block).toContain("- **memory: stop double-counting recalls (#4500)**");
+    expect(f.listFragments()).toEqual(["4500-stop-double-counting-recalls.fix.md"]);
+    expect(f.readFragment("4500-stop-double-counting-recalls.fix.md")).toBe(
+      "- **memory: stop double-counting recalls (#4500)**\n",
+    );
+    // The fragment model's core property: CHANGELOG.md is never touched.
+    expect(f.readChangelog()).toBe(before);
   });
 
   it("prefers an explicit --title over the commit subject", () => {
@@ -162,22 +185,21 @@ describe("gen-changelog-entry — derives an entry from the conventional-commit 
 
     const r = f.gen(["--pr", "7", "--title", "feat(cli): add a shiny verb"]);
     expect(r.code).toBe(0);
-    const block = unreleasedBlock(f.readChangelog());
-    expect(block).toContain("### Features");
-    expect(block).toContain("- **cli: add a shiny verb (#7)**");
+    expect(f.listFragments()).toEqual(["7-add-a-shiny-verb.feat.md"]);
+    expect(f.readFragment("7-add-a-shiny-verb.feat.md")).toBe("- **cli: add a shiny verb (#7)**\n");
   });
 
-  it("falls back to a plain bullet (no category, no suffix) for a non-conventional title", () => {
+  it("falls back to `.other.md` and a plain bullet for a non-conventional title", () => {
     const f = makeFixture("gen-plain-");
     f.writeFile("src/thing.ts", "export const t = 1;\n");
     f.commit("just did some stuff");
 
     const r = f.gen(); // no --pr
     expect(r.code).toBe(0);
-    const block = unreleasedBlock(f.readChangelog());
-    expect(block).toContain("- **just did some stuff**");
-    expect(block).not.toContain("(#");
-    expect(block).not.toContain("###");
+    expect(f.listFragments()).toEqual(["just-did-some-stuff.other.md"]);
+    const body = f.readFragment("just-did-some-stuff.other.md");
+    expect(body).toBe("- **just did some stuff**\n");
+    expect(body).not.toContain("(#");
   });
 
   it("marks a breaking change", () => {
@@ -187,140 +209,68 @@ describe("gen-changelog-entry — derives an entry from the conventional-commit 
 
     const r = f.gen(["--pr", "99"]);
     expect(r.code).toBe(0);
-    expect(unreleasedBlock(f.readChangelog())).toContain(
-      "- **BREAKING** **config: drop the legacy overlay (#99)**",
+    expect(f.readFragment("99-drop-the-legacy-overlay.feat.md")).toBe(
+      "- **BREAKING** **config: drop the legacy overlay (#99)**\n",
     );
   });
 });
 
-describe("gen-changelog-entry — the writer and the checker agree on the section", () => {
-  it("ignores an INDENTED `## Unreleased` and stages where the guard will count it", () => {
-    // `insertEntry` finds the staging section at column 0, exactly like the
-    // guard's `parseSections` / `extractUnreleasedEntries`. Tolerate an indent
-    // and this file's example block becomes the staging target: the bullet gets
-    // written inside an indented code block, the guard counts zero new entries,
-    // and the PR reds for "no changelog entry" while its entry sits in the file.
-    // Asserted through the GUARD's own extractor, because agreement between the
-    // two scripts is the property, not either one's internal notion of a match.
-    const EXAMPLE_ONLY = [
-      "# Changelog",
-      "",
-      "- **Docs (#1):** the staging block is written like this:",
-      "",
-      "      ## Unreleased",
-      "",
-      "      <!-- staging area; entries land here per-PR -->",
-      "",
-      "## v0.20.11 — a released section",
-      "",
-      "- **Something shipped (#1):** prose.",
-      "",
-    ].join("\n");
-    const f = makeFixture("gen-indented-unreleased-", EXAMPLE_ONLY);
+describe("gen-changelog-entry — the writer and the checker agree on what is staged", () => {
+  it("the guard passes a shippable PR whose only note is the generated fragment", () => {
+    // Agreement asserted through the REAL check script, not either script's
+    // internals: the property is that gen's output satisfies check's rule.
+    const f = makeFixture("gen-agree-");
     f.writeFile("src/feature.ts", "export const x = 1;\n");
     f.commit("feat(cli): add a verb");
 
-    const r = f.gen(["--pr", "42"]);
-    expect(r.code).toBe(0);
-
-    const after = f.readChangelog();
-    const entries = extractUnreleasedEntries(after);
-    expect(entries.join("\n")).toContain("(#42)");
-    // The example block is untouched, and is still not a section.
-    expect(after).toContain("      ## Unreleased");
-  });
-
-  it("an indented `## ` does not TRUNCATE the staging section either", () => {
-    // The mirror of the test above, for the scan that finds where `## Unreleased`
-    // ENDS. Both ends of the section have to use the same column-0 definition of
-    // a heading as the guard's `extractUnreleasedEntries`, and until this test
-    // only the start was pinned: loosen the end scan to `/^\s*##\s/` and the
-    // section is cut short at the pasted, three-space-indented release heading.
-    // A bullet appended to the last category then lands at that truncated end —
-    // i.e. INSIDE the fenced block, where the guard masks it and counts zero new
-    // entries. The PR reds for "no changelog entry" while its entry sits in the
-    // file: the same silent disagreement between writer and checker that the
-    // START anchor exists to prevent.
-    //
-    // The category heading is load-bearing: it is the `catIdx !== -1` path,
-    // where the insertion point IS `end`, so a wrong `end` is a wrong write.
-    //
-    // Mutation-proven: `gen-changelog-entry.mjs`'s `if (/^##\s/.test(lines[i]))`
-    // end scan → `/^\s*##\s/` and this run fails on the `(#42)` assertion.
-    const INDENTED_TAIL = [
-      "# Changelog",
-      "",
-      "## Unreleased",
-      "",
-      "<!-- staging area; entries land here per-PR -->",
-      "",
-      "### Bug fixes",
-      "",
-      "- **Earlier entry (#0):** shows the release-heading style:",
-      "",
-      "```console",
-      "   ## v9.9.9 — a pasted release heading, indented by three",
-      "```",
-      "",
-      "## v0.20.11 — a released section",
-      "",
-      "- **Something shipped (#1):** prose.",
-      "",
-    ].join("\n");
-    const f = makeFixture("gen-indented-tail-", INDENTED_TAIL);
-    f.writeFile("src/feature.ts", "export const x = 1;\n");
-    f.commit("fix(cli): correct a verb");
+    // Red baseline: without the fragment the guard fails this PR, so the
+    // green below is attributable to the fragment and nothing else.
+    expect(f.check().code).toBe(1);
 
     const r = f.gen(["--pr", "42"]);
     expect(r.code).toBe(0);
+    f.commit("chore: stage changelog fragment");
 
-    const after = f.readChangelog();
-    // The GUARD must see the generated entry: that agreement is the property.
-    expect(extractUnreleasedEntries(after).join("\n")).toContain("(#42)");
-    // The pasted block is left intact — it is example text, not a section break.
-    expect(after).toContain("   ## v9.9.9 — a pasted release heading, indented by three");
+    const after = f.check();
+    expect(after.code).toBe(0);
+    expect(after.out).toContain("changelog fragment staged");
   });
 });
 
 describe("gen-changelog-entry — idempotency", () => {
-  it("running twice does not double-add the entry", () => {
+  it("running twice (with a commit in between) leaves exactly one fragment", () => {
     const f = makeFixture("gen-idem-");
     f.writeFile("src/feature.ts", "export const x = 1;\n");
     f.commit("feat(cli): add a verb");
 
     const first = f.gen(["--pr", "42"]);
     expect(first.code).toBe(0);
-    const afterFirst = f.readChangelog();
-    // Commit the generated entry so the SECOND run sees Unreleased has grown.
-    f.commit("chore: stage changelog");
+    expect(f.listFragments()).toHaveLength(1);
+    f.commit("chore: stage changelog fragment");
 
     const second = f.gen(["--pr", "42"]);
     expect(second.code).toBe(0);
-    const afterSecond = f.readChangelog();
-
-    const count = (s: string) => s.split("add a verb").length - 1;
-    expect(count(afterFirst)).toBe(1);
-    expect(count(afterSecond)).toBe(1);
     expect(second.out).toContain("no change");
+    expect(f.listFragments()).toHaveLength(1);
   });
 
-  it("running twice WITHOUT committing in between still does not double-add", () => {
+  it("running twice WITHOUT committing in between still writes only one fragment", () => {
     const f = makeFixture("gen-idem-nocommit-");
     f.writeFile("src/feature.ts", "export const x = 1;\n");
     f.commit("feat(cli): add a verb");
 
     const first = f.gen(["--pr", "42"]);
     expect(first.code).toBe(0);
-    // No commit here — the generated entry is still an uncommitted work-tree edit.
+    // No commit here — the fragment is an UNTRACKED file the second run must see.
     const second = f.gen(["--pr", "42"]);
     expect(second.code).toBe(0);
     expect(second.out).toContain("no change");
-
-    const count = f.readChangelog().split("add a verb").length - 1;
-    expect(count).toBe(1);
+    expect(f.listFragments()).toHaveLength(1);
   });
 
-  it("does not add when the author already staged an entry (respects hand-written)", () => {
+  it("does not write when the author already staged an entry under ## Unreleased", () => {
+    // The legacy path still counts as staged: a hand-written Unreleased entry
+    // must not gain a duplicate fragment.
     const f = makeFixture("gen-respect-");
     f.writeFile("src/feature.ts", "export const x = 1;\n");
     f.writeFile(
@@ -332,11 +282,10 @@ describe("gen-changelog-entry — idempotency", () => {
     );
     f.commit("feat(cli): add a verb and hand-write the note");
 
-    const before = f.readChangelog();
     const r = f.gen(["--pr", "3"]);
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("already has a new entry");
+    expect(f.listFragments()).toEqual([]);
   });
 });
 
@@ -349,8 +298,9 @@ describe("gen-changelog-entry — escape hatches opt out of generation", () => {
     const before = f.readChangelog();
     const r = f.gen(["--pr", "5"], { CHANGELOG_PR_LABELS: "agent:klanker no-changelog" });
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("escape hatch");
+    expect(f.listFragments()).toEqual([]);
+    expect(f.readChangelog()).toBe(before);
   });
 
   it("writes nothing when a [skip changelog] token is on its own line in a commit", () => {
@@ -358,11 +308,10 @@ describe("gen-changelog-entry — escape hatches opt out of generation", () => {
     f.writeFile("src/chore.ts", "export const c = 1;\n");
     f.commit("chore: rename a var\n\n[skip changelog]");
 
-    const before = f.readChangelog();
     const r = f.gen(["--pr", "5"]);
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("escape hatch");
+    expect(f.listFragments()).toEqual([]);
   });
 
   it("does NOT self-trip: a body that merely mentions the token still generates", () => {
@@ -374,7 +323,7 @@ describe("gen-changelog-entry — escape hatches opt out of generation", () => {
       CHANGELOG_PR_BODY: "This PR adds support for a `[skip changelog]` token.",
     });
     expect(r.code).toBe(0);
-    expect(unreleasedBlock(f.readChangelog())).toContain("(#6)");
+    expect(f.listFragments()).toEqual(["6-document-the-hatch.feat.md"]);
   });
 });
 
@@ -384,11 +333,10 @@ describe("gen-changelog-entry — no-ops that must never write", () => {
     f.writeFile("docs/guide.md", "# guide\n");
     f.commit("docs: update the guide");
 
-    const before = f.readChangelog();
     const r = f.gen(["--pr", "8"]);
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("no shippable code changed");
+    expect(f.listFragments()).toEqual([]);
   });
 
   it("skips on a merge_group event", () => {
@@ -396,11 +344,10 @@ describe("gen-changelog-entry — no-ops that must never write", () => {
     f.writeFile("src/feature.ts", "export const x = 1;\n");
     f.commit("feat(cli): add a verb");
 
-    const before = f.readChangelog();
     const r = f.gen(["--pr", "9"], { GITHUB_EVENT_NAME: "merge_group" });
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("merge_group");
+    expect(f.listFragments()).toEqual([]);
   });
 
   it("skips cleanly when no base ref resolves", () => {
@@ -413,23 +360,22 @@ describe("gen-changelog-entry — no-ops that must never write", () => {
     f.commit("feat(cli): add a verb");
     f.git(["branch", "-m", "main", "detached-away"]);
 
-    const before = f.readChangelog();
     const r = f.gen(["--pr", "11"]);
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("no base ref to diff against");
+    expect(f.listFragments()).toEqual([]);
   });
 
-  it("--dry-run prints the entry but writes nothing", () => {
+  it("--dry-run prints the fragment path + entry but writes nothing", () => {
     const f = makeFixture("gen-dry-");
     f.writeFile("src/feature.ts", "export const x = 1;\n");
     f.commit("feat(cli): add a verb");
 
-    const before = f.readChangelog();
     const r = f.gen(["--pr", "10", "--dry-run"]);
     expect(r.code).toBe(0);
-    expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("DRY RUN");
+    expect(r.out).toContain("changelog.d/10-add-a-verb.feat.md");
     expect(r.out).toContain("(#10)");
+    expect(f.listFragments()).toEqual([]);
   });
 });

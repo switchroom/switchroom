@@ -143,6 +143,19 @@ core:
   # so a PR that widened the sanctioned-id allowlist and nothing else would skip
   # the very tests that prove the allowlist is not vacuous.
   - 'scripts/check-no-pii-secrets.mjs'
+  # …and the release-cut assembler: tests/cut-changelog-release.test.ts SPAWNS
+  # cut-changelog-release.mjs, and the `lint` filter's `scripts/*changelog*.mjs`
+  # glob does not exist in THIS filter, so without this line a PR editing only
+  # the assembler would skip the tests that cover it — the same skip→pass hole
+  # as the two scripts above.
+  - 'scripts/cut-changelog-release.mjs'
+  # The release-notes extractor the assembler round-trips against (and
+  # release.yml's guard job runs for real). tests/release-gate-scripts.test.ts
+  # and tests/cut-changelog-release.test.ts both import it, and it matched no
+  # glob in this file at all — the single-star `scripts/*changelog*.mjs` glob
+  # in `lint` does not cross into the `ci/` directory — so an extractor-only
+  # PR skipped every test covering it.
+  - 'scripts/ci/extract-changelog-section.mjs'
   # The targeted mutation check. tests/mutation-guard.test.ts IMPORTS
   # scripts/mutation/{operators,run,restore-sentinel}.mjs directly and SPAWNS
   # check-mutation-coverage.mjs (asserting its exit code and failure text), and
