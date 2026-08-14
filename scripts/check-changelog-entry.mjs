@@ -204,6 +204,14 @@ export function stripHtmlComments(text) {
  * A missing Unreleased section yields `[]` (not an error): the guard treats
  * "no section" and "empty section" identically — either way it has not grown.
  *
+ * Heading recognition is COLUMN-0 anchored, deliberately, and identically to
+ * `parseSections` (see the indent note there). This used to `.trim()` the line,
+ * which accepted an `## Unreleased` at ANY indent — including the 4+ spaces
+ * CommonMark reads as an indented CODE block. That was both fail-OPEN and
+ * inconsistent: RULE 1 credited growth under a "header" that neither CommonMark
+ * nor `parseSections` considers a heading, while RULE 2, looking at the same
+ * file, reported it as having no staging section at all.
+ *
  * @param {string} changelog full CHANGELOG.md text
  * @returns {string[]}
  */
@@ -215,8 +223,8 @@ export function extractUnreleasedEntries(changelog) {
   const lines = text.split('\n')
   let i = 0
   // Find the `## Unreleased` header (case-insensitive, tolerant of trailing
-  // text like `## Unreleased — staged`).
-  while (i < lines.length && !/^##\s+unreleased\b/i.test(lines[i].trim())) i++
+  // text like `## Unreleased — staged`, column-0 anchored like `parseSections`).
+  while (i < lines.length && !/^##\s+unreleased\b/i.test(lines[i])) i++
   if (i >= lines.length) return []
   i++ // move past the header line
   /** @type {string[]} */
@@ -417,6 +425,18 @@ export function maskNonProse(text) {
 
 /**
  * Split a changelog into its `## ` sections with 1-based line numbers.
+ *
+ * INDENT: a heading is recognised at COLUMN 0 only, even though CommonMark
+ * allows up to 3 spaces of indent. That is deliberate and it is the direction
+ * that fails CLOSED. Honouring the ≤3-space tolerance here would be fail-OPEN:
+ * a prose or list line reading `   ## Unreleased` *inside* an already-released
+ * section would open a new, NON-released section, and every entry added below
+ * it — the whole rest of the file — would silently stop being checked for
+ * placement. The mirror mistake is merely noisy: a real heading someone indents
+ * by 1–3 spaces is invisible to the parser, which reports "no `## Unreleased`
+ * section" and reds the PR until the indent is removed. `extractUnreleasedEntries`
+ * anchors at column 0 for the same reason, so the two agree on what a heading is.
+ * The real CHANGELOG.md has zero indented `## ` headings (checked repo-wide).
  *
  * @param {string} changelog
  * @returns {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]}

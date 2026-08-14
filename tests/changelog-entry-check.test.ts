@@ -971,6 +971,74 @@ describe("check-changelog-entry — `<!-->` and `<!--->` are COMPLETE comments",
   });
 });
 
+describe("check-changelog-entry — a `## ` heading is recognised at column 0 only", () => {
+  // `parseSections` and `extractUnreleasedEntries` must agree on what a heading
+  // is, and both anchor at column 0 rather than honouring CommonMark's ≤3-space
+  // tolerance. Both directions of that choice are pinned here.
+
+  it("an indented `## Unreleased` inside a released section does not un-release it", () => {
+    // The fail-OPEN that indent tolerance in `parseSections` would open: a list
+    // line reading `   ## Unreleased` *inside* `## v0.20.11` would start a new,
+    // NON-released section, and every entry added below it — the rest of the
+    // file — would stop being placement-checked. Loosen the regex to
+    // `/^ {0,3}##\s/` and this run flips to exit 0.
+    const BASE = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "- **Earlier entry (#0):** already staged.",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose. To restore the staging area, add",
+      "   ## Unreleased",
+      "  back above the newest release.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent-heading-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", `${BASE}- **BURIED ENTRY (#2):** below the indented line.\n`);
+    f.commit("feat: ship code and bury the entry under a released heading");
+
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "main" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+    expect(r.out).toContain("BURIED ENTRY (#2)");
+    expect(r.out).toContain("## v0.20.11");
+  });
+
+  it("a 4-space-indented `## Unreleased` is not a staging section for RULE 1 either", () => {
+    // The consistency half. 4 spaces is an indented CODE block to CommonMark and
+    // invisible to `parseSections`, so RULE 1 must not credit growth under it —
+    // which the old `.trim()`-based finder did, passing this shippable PR (exit
+    // 0, "## Unreleased grew") while RULE 2 saw a file with no staging section.
+    const BASE = [
+      "# Changelog",
+      "",
+      "    ## Unreleased",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-indent4-unreleased-", BASE);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      BASE.replace("    ## Unreleased\n", "    ## Unreleased\n\n    - **Branch entry (#2):** staged in a code block.\n"),
+    );
+    f.commit("feat: ship code and stage an entry under an indented pseudo-header");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+    expect(r.out).toContain("src/feature.ts");
+    expect(r.out).not.toContain("## Unreleased grew");
+  });
+});
+
 describe("check-changelog-entry — the queue-ref base is authoritative", () => {
   it("FAILs when merge_group's $CHANGELOG_BASE does not resolve, even though `main` does", () => {
     // The guarantee ci-lint.yml claims. The fallback cascade (origin/main, main)
