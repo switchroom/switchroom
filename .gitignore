@@ -89,3 +89,6 @@ switchroom-assets.tar.gz
 # while a mutation run is in flight; a leftover one is recovered (and deleted)
 # by the next run.
 .mutation-restore.json
+
+# Per-process temp config written by scripts/check-plugin-references.mjs
+tsconfig.plugin-refcheck.*.json
