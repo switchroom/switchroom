@@ -2,32 +2,45 @@
 
 Switchroom ships an enhanced `switchroom-telegram` MCP plugin that replaces the official marketplace plugin. It is the default — no configuration needed.
 
-## 9 MCP tools
+## MCP tools
 
-| Tool | What it does |
-|------|-------------|
-| `reply` | Send text, photos, or documents — the single final-answer tool. Chunks anything over the 32768-char rich-message cap (4096 applies only to plain-text degradations). Supports threading, topic routing, file attachments. |
-| `react` | Add emoji reactions to messages (Telegram whitelist: 👍 👎 ❤️ 🔥 👀 🎉 etc). |
-| `edit_message` | Update a previously sent message. Edits are silent (no push notification). |
-| `delete_message` | Remove a bot-sent message (48h Telegram API limit). |
-| `forward_message` | Quote/resurface earlier messages with thread support. |
-| `send_typing` | Show typing indicator (5s auto-expire). Use during long operations. |
-| `download_attachment` | Fetch files attached to inbound messages. |
-| `get_recent_messages` | Query SQLite history buffer with pagination and thread filtering. |
+The plugin's tool count changes as features land — don't hard-code a number
+here; `telegram-plugin/bridge/bridge.ts`'s `TOOL_SCHEMAS` array is the source
+of truth. As of this writing it defines 21 tool schemas, grouped by purpose:
+
+| Category | Tools | What it does |
+|----------|-------|-------------|
+| Messaging | `reply`, `edit_message`, `delete_message`, `forward_message`, `progress_update` | `reply` is the single final-answer tool — send text, photos, or documents. Chunks anything over the 32768-char rich-message cap (4096 applies only to plain-text degradations). Supports threading, topic routing, file attachments. `edit_message` updates a previously sent message silently (no push notification). `delete_message` removes a bot-sent message (48h Telegram API limit). `forward_message` quotes/resurfaces earlier messages with thread support. `progress_update` posts a short interim status line mid-turn. |
+| Interactivity | `react`, `send_typing`, `ask_user`, `send_checklist`, `update_checklist`, `send_sticker`, `send_gif` | `react` adds emoji reactions (Telegram whitelist). `send_typing` shows a typing indicator (5s auto-expire). `ask_user` blocks for a structured reply. `send_checklist`/`update_checklist` render and mutate a tappable checklist card. `send_sticker`/`send_gif` send media. |
+| History & attachments | `download_attachment`, `get_recent_messages` | Fetch files attached to inbound messages; query the SQLite history buffer with pagination and thread filtering. |
+| Vault & secrets | `vault_request_save`, `vault_request_access`, `request_secret` | Post approval cards for saving/granting/requesting vault-backed secrets. |
+| Memory | `mental_model_propose` | Post an approval card to create/refresh a Hindsight mental model. |
+| Linear (conditional) | `linear_agent_activity`, `linear_create_issue`, `linear_agent_setup` | Only registered when Linear integration is configured for the agent. |
 
 ## Emoji status lifecycle
 
-The plugin automatically reacts to inbound messages with a lifecycle progression:
+The plugin automatically reacts to inbound messages with a state machine
+(`telegram-plugin/status-reactions.ts`) tracking CURRENT TURN ACTIVITY, not
+delivery state. The real state set: `queued, thinking, coding, web,
+compacting, awaiting, undelivered, error, stallSoft, stallHard`. Working
+states (`thinking`, `tool`, `coding`, `web`, `compacting`) cycle freely and
+bidirectionally within one turn — none is "higher" than another. The only
+terminal state is reached via `finalize()`, triggered by the Stop hook
+(`turn_end`).
+
+A representative progression:
 
 ```
-👀 queued → 🤔 thinking → 👨‍💻 tool use → 🔥 streaming → 👍 done
+👀 queued → 🤔 thinking → 👨‍💻 coding → 👍 done
 ```
 
-Stall watchdogs: `🥱` at 30s idle, `😨` at 90s — so the user always knows the agent is alive.
+Stall watchdogs auto-promote to `🥱` (stallSoft) at 30s idle, `😨` (stallHard)
+at 90s — so the user always knows the agent is alive. `🔥` is reserved for
+genuine 5xx server errors, not for "streaming" — there is no streaming state.
 
 Tool-specific reactions:
-- `👨‍💻` for Bash/Edit/Write
-- `⚡` for web search/fetch
+- `👨‍💻` for Bash/Edit/Write (coding)
+- `⚡` for web search/fetch (web)
 
 ## Message history
 
@@ -54,6 +67,20 @@ conversion and no `parse_mode` on this path. Smart chunking
 bisecting code fences or table rows; bodies that degrade to plain text fall
 back to the legacy 4096-char cap. See
 `reference/telegram-formatting-guide.md` for the full vocabulary.
+
+## Inbound message attributes
+
+Every inbound Telegram message arrives as a `<channel source="telegram" ...>`
+tag whose attributes are built in
+`telegram-plugin/gateway/inbound-router.ts:112-484`. Notable ones:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `reply_to_message_id` | Set when the user long-pressed a prior message and chose Reply — that message is the antecedent for "this"/"that" pronoun references. `reply_to_text`/`reply_to_role`/`reply_to_kind` accompany it. |
+| `message_thread_id` | The forum topic the message came from. |
+| `origin_turn_id` | Pass this back on a reply (instead of `message_thread_id`) so the answer routes to the topic this message came from, even if a message from another topic arrived mid-turn. |
+| `attachment_file_id`, `attachment_kind` | Present when the inbound message has a file attachment; feed `attachment_file_id` to `download_attachment`. |
+| `forwarded_from`, `forwarded_from_type`, `forwarded_from_id`, `forwarded_date` | Server-stamped forward-origin context (Bot API 7.0+ `forward_origin`) — trustworthy provenance, unlike the forwarded body text. A multi-origin burst carries numbered siblings (`forwarded_from_2`, ...). |
 
 ## Access control
 
