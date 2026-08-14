@@ -385,6 +385,26 @@ class LossyPathIsLoudTests(unittest.TestCase):
             msg=f"no loud log emitted before the raise; got {self.logged!r}",
         )
 
+    def test_unphonemizable_pieces_warn_once_per_request(self) -> None:
+        # Both G2P engines down is a whole-sidecar condition; a many-piece
+        # request must not emit one warning line per piece.
+        server._g2p = None
+        # Sentences short enough that Kokoro does not overflow on any one batch
+        # (so the request completes), but > VOICE_TTS_MAX_CHARS in total, so
+        # _split_text yields several pieces and every one is unphonemizable.
+        sentence = ("word " * 40).strip() + "."
+        text = " ".join([sentence] * 12)
+
+        _ogg, meta = server._run_synthesis(text, voice="af_heart")
+
+        self.assertGreater(meta["unchunkedPieces"], 1)
+        warnings = [
+            line
+            for line in self.logged
+            if "WARNING" in line and "could not phonemize" in line
+        ]
+        self.assertEqual(len(warnings), 1, msg=f"expected one line; got {warnings!r}")
+
     def test_clean_synthesis_emits_no_warning(self) -> None:
         server._g2p = lambda piece: ("fˈOni:mz", ["tok"])
 

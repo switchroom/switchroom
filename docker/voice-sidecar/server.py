@@ -1014,13 +1014,22 @@ def _run_synthesis(text: str, voice: str, speed: float = TTS_SPEED_DEFAULT) -> t
                 # run — the request would 500 as silently as it did pre-#4695.
                 piece_chunks = []
                 unchunked_pieces += 1
-                _log(
-                    f"WARNING: TTS could not phonemize piece {i + 1}/"
-                    f"{len(pieces)} ({len(piece)} chars) of a {len(text)}-char "
-                    "request; handing it to Kokoro as TEXT, so a clause past "
-                    "510 phonemes is truncated or fails the whole request "
-                    "(IndexError at kokoro_onnx/__init__.py:108)"
-                )
+                # Once per REQUEST, not once per piece: both G2P engines being
+                # down is a whole-sidecar condition, and a 40k-char request is
+                # ~34 pieces. Same volume as the post-loop line it replaces,
+                # matching the log-once idiom of _g2p_warned /
+                # _espeak_phonemize_warned. The count still lands in the meta.
+                if unchunked_pieces == 1:
+                    _log(
+                        f"WARNING: TTS could not phonemize piece {i + 1}/"
+                        f"{len(pieces)} ({len(piece)} chars) of a "
+                        f"{len(text)}-char request; handing it to Kokoro as "
+                        "TEXT, so a clause past 510 phonemes is truncated or "
+                        "fails the whole request (IndexError at "
+                        "kokoro_onnx/__init__.py:108). Further unphonemizable "
+                        "pieces in this request are counted in the response "
+                        "meta (unchunkedPieces), not logged."
+                    )
 
             # `piece_chunks` can also be empty with is_phonemes=True when the
             # piece phonemises to nothing but punctuation/whitespace. That falls
