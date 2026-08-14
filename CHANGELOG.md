@@ -35,7 +35,7 @@ now an anomaly worth investigating, not the norm.
   trade-off (disclosed, not fixed here):** a decimal- or comma-glued
   number+unit token (`27.5s`, `89.5g`, `1,500s`) is now left completely
   unexpanded — the unit goes unspoken — rather than mangled; corpus-measured,
-  samples carrying an unspoken digit-adjacent unit go 65 → 121 (60 samples
+  samples carrying an unspoken digit-adjacent unit go 65 → 122 (61 samples
   change, every one trading a wrong reading for a silently-skipped one).
   Correctly expanding a decimal/comma-glued number is out of scope for this
   narrow hotfix and is left for a follow-up.

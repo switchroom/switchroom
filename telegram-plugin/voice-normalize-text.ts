@@ -581,7 +581,7 @@ export function normalizeForSpeech(input: string): string {
   //     1,500s, 89.5g, 0.7-0.8m) is now left completely UNEXPANDED — the
   //     unit goes unspoken — rather than mangled the way it was before.
   //     Corpus-measured: samples carrying a digit-adjacent unspoken unit go
-  //     65 → 121 (60 samples change under this fix, every one gaining an
+  //     65 → 122 (61 samples change under this fix, every one gaining an
   //     unspoken unit). Correctly expanding a decimal/comma-glued number is
   //     explicitly out of scope for this narrow hotfix — see the pinning
   //     tests below (13.0 GB / 89.5g / 27.5 s) marking the baseline for a

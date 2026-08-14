@@ -197,8 +197,8 @@ describe('normalizeForSpeech — numbers, units & symbols', () => {
   // Regression: unit-suffix lookbehind + case sensitivity. Corpus in
   // /tmp/claude-0/tts/corpus.json (1,679 samples of ALREADY-NORMALIZED
   // production output, not raw input): 146 samples already carry the
-  // shipped mangle artifact this fix removes, 52 carry an unfixed decimal/
-  // comma+unit token (see the "known gap" test below), and 60 samples
+  // shipped mangle artifact this fix removes, 53 carry an unfixed decimal/
+  // comma+unit token (see the "known gap" test below), and 61 samples
   // change under this fix. A decimal seconds value like "0.17s" was matched
   // by \b re-anchoring between the "." and the following digits, so "17s"
   // alone got read as "seventeen seconds" and split the decimal apart; and
@@ -216,7 +216,7 @@ describe('normalizeForSpeech — numbers, units & symbols', () => {
   // the unit-suffix regex in voice-normalize-text.ts): a decimal- or
   // comma-glued number+unit token is now left completely unexpanded (unit
   // unspoken) rather than mangled. Measured: samples carrying an unspoken
-  // digit-adjacent unit go 65 → 121 across the corpus (60 samples change,
+  // digit-adjacent unit go 65 → 122 across the corpus (61 samples change,
   // every one gaining an unspoken unit) — pinned here as the baseline a
   // future decimal-expansion pass should move.
   it('KNOWN GAP: decimal/comma-glued number+unit is left unexpanded, not mangled', () => {
