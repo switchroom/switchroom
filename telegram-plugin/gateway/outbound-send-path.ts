@@ -43,6 +43,7 @@ import {
   isQuoteRejectionError,
   sendOptsHaveQuote,
 } from '../reply-quote.js'
+import { captureSpeechText } from './speech-capture.js'
 
 // ── send-orchestration façade imports (#2996 P2) ──
 // Pure/deterministic helpers are imported; stateful or side-effecting gateway
@@ -1376,6 +1377,12 @@ export async function sendReply(
   // plain-text TTS input); synthesis happens just before the send so a
   // voice-only reply can suppress the text chunk loop on success. Voice is
   // fully best-effort — every failure below falls back to the text reply.
+  // Raw-corpus capture (TTS redesign PR-0, flag-gated, off by default): `text`
+  // here IS Stage A's future input — capture it byte-for-byte BEFORE the
+  // resolve call, ahead of any TTS normalisation, so the redesign's property
+  // tests can validate against real markdown instead of synthetic fixtures
+  // only. See telegram-plugin/gateway/speech-capture.ts.
+  captureSpeechText(text)
   const voiceOutPlan = resolveVoiceOutPlan(access.voice_out, text)
   const configParseMode = access.parseMode ?? 'html'
   const format = (args.format as string | undefined) ?? configParseMode

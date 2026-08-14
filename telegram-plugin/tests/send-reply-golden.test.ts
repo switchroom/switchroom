@@ -31,7 +31,7 @@
  *   - structural: gateway constructs EXACTLY ONE OutboundDedupCache and the
  *     extracted module constructs NONE (the re-`new` hard-fail rule)
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import { GrammyError } from 'grammy'
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -58,6 +58,10 @@ import { createPendingInboundBuffer } from '../gateway/pending-inbound-buffer.js
 import { SubagentReplyAuthority } from '../gateway/subagent-reply-authority.js'
 import { redact } from '../secret-detect/redact.js'
 import type { CurrentTurn, Access } from '../gateway/gateway.js'
+import {
+  SPEECH_CAPTURE_FILE_NAME,
+  __resetSpeechCaptureLogStateForTests,
+} from '../gateway/speech-capture.js'
 
 /**
  * Build the owner-resolution result the gateway's `resolveReplyOwnerTurn`
@@ -454,6 +458,100 @@ describe('sendReply golden harness — file sends', () => {
     await sendReply(h.deps, req('album', { files: [a, b] }))
     expect(h.calls.filter((c) => c.method === 'sendMediaGroup')).toHaveLength(2) // one record per album item
     expect(h.calls.filter((c) => c.method === 'sendPhoto')).toHaveLength(0)
+  })
+})
+
+describe('speech capture (PR-0) — driven through the REAL sendReply wiring, not a synthetic call', () => {
+  const priorCapture = process.env.SWITCHROOM_SPEECH_CAPTURE
+  const priorStateDir = process.env.TELEGRAM_STATE_DIR
+
+  afterEach(() => {
+    if (priorCapture === undefined) delete process.env.SWITCHROOM_SPEECH_CAPTURE
+    else process.env.SWITCHROOM_SPEECH_CAPTURE = priorCapture
+    if (priorStateDir === undefined) delete process.env.TELEGRAM_STATE_DIR
+    else process.env.TELEGRAM_STATE_DIR = priorStateDir
+    __resetSpeechCaptureLogStateForTests()
+  })
+
+  it('M3: a capture write failure (flag ON, unwritable state dir) never breaks the reply', async () => {
+    // The destination is a FILE, not a directory, so appendFileSync fails
+    // ENOTDIR every call — the exact swallow path the flag-on window depends
+    // on for 7 days unattended. This only pins the CURRENT synchronous,
+    // in-place-caught shape: it proves a swallowed-write-failure reply still
+    // ships, but it would NOT go red if a refactor made the capture call
+    // async and fire-and-forget (unawaited) — that rejection becomes an
+    // unhandled rejection, which this codebase's policy treats as fatal
+    // (see analytics-posthog.ts, chat-lock.ts), strictly worse than the one
+    // lost capture line this test guards against, and this test alone
+    // cannot detect it. The synchronous-return contract that WOULD catch
+    // that mutation is pinned directly on `captureSpeechText` in
+    // `speech-capture.test.ts` ("G1: captureSpeechText returns undefined").
+    const dir = mkdtempSync(join(tmpdir(), 'speech-capture-golden-'))
+    const notADir = join(dir, 'state-dir-is-actually-a-file')
+    writeFileSync(notADir, 'not a directory')
+    process.env.SWITCHROOM_SPEECH_CAPTURE = '1'
+    process.env.TELEGRAM_STATE_DIR = notADir
+
+    const h = makeHarness()
+    const res = await sendReply(h.deps, req('The reply must still ship. ✅ done.'))
+    const sends = h.calls.filter((c) => c.method === 'sendRichMessage')
+    expect(sends).toHaveLength(1)
+    expect(sends[0]!.text).toContain('The reply must still ship.')
+    expect(res.content[0]!.text).toMatch(/^sent \(id: \d+\)$/)
+  })
+
+  it('M3: the captured string IS the exact argument passed to resolveVoiceOutPlan — not merely textually adjacent', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'speech-capture-golden-'))
+    process.env.SWITCHROOM_SPEECH_CAPTURE = '1'
+    process.env.TELEGRAM_STATE_DIR = stateDir
+
+    const h = makeHarness()
+    let observedByVoicePlan: string | null = null
+    h.deps.resolveVoiceOutPlan = (_voiceOut, replyText) => {
+      observedByVoicePlan = replyText
+      return null
+    }
+
+    // Deliberately includes a spaced em-dash: `normalizeOutboundBody`'s
+    // punctuation/bold pass (`normalizePunctuation`, format.ts:695, step 4
+    // of the pipeline — outbound-send-path.ts's own docstring: "normalize →
+    // redact → punctuation/bold → voice-scrub") rewrites a bare/mid-prose
+    // em-dash into `, `. A golden fixture with nothing for the pipeline to
+    // transform can't tell "capture reads the normalised `text`" apart from
+    // "capture reads the raw `rawText`" — both would produce byte-identical
+    // output. This fixture makes that distinction observable (G2).
+    const raw = '| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```ts\nconst x = 1 | 2\n```\n\nStatus update — done. ✅ `code` 😀.'
+    await sendReply(h.deps, req(raw))
+
+    expect(observedByVoicePlan).not.toBeNull()
+    const captured = readFileSync(join(stateDir, SPEECH_CAPTURE_FILE_NAME), 'utf8')
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { ts: number; text: string })
+    expect(captured).toHaveLength(1)
+    // The load-bearing assertion: the capture is not "close to" or "derived
+    // from" resolveVoiceOutPlan's input — it is the SAME string, by identity
+    // of value, not by coincidence of two independent pipelines agreeing.
+    expect(captured[0]!.text).toBe(observedByVoicePlan)
+    // G2: the captured text is the NORMALISED form, downstream of
+    // `normalizePunctuation`'s em-dash rewrite — not the raw fixture. A
+    // regression that swapped in the pre-pipeline `rawText` would still
+    // satisfy the identity assertion above (both call sites would agree on
+    // SOME string), so this must check the captured content against the
+    // known transform independently, not just against `observedByVoicePlan`.
+    expect(captured[0]!.text).not.toBe(raw)
+    expect(captured[0]!.text).not.toContain('Status update — done')
+    expect(captured[0]!.text).toContain('Status update, done')
+  })
+
+  it('flag OFF: sendReply never creates the capture file, even with a writable state dir', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'speech-capture-golden-'))
+    delete process.env.SWITCHROOM_SPEECH_CAPTURE
+    process.env.TELEGRAM_STATE_DIR = stateDir
+
+    const h = makeHarness()
+    await sendReply(h.deps, req('Never captured.'))
+    expect(() => readFileSync(join(stateDir, SPEECH_CAPTURE_FILE_NAME), 'utf8')).toThrow()
   })
 })
 

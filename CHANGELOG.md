@@ -64,6 +64,18 @@ now an anomaly worth investigating, not the norm.
   message to plain text. Also locks in the blank-line-separated expandable
   shape, the majority corpus shape, which worked but had no test.
 
+### Features
+
+- **voice: flag-gated raw-markdown speech capture (PR-0)** — `SWITCHROOM_SPEECH_CAPTURE=1`
+  (or `=true`), **off by default**, appends the exact pre-normalisation reply text
+  `sendReply` is about to pass to `resolveVoiceOutPlan` — byte-for-byte, tables/fences/
+  emoji/backticks intact — to `$TELEGRAM_STATE_DIR/speech-capture.jsonl` (`0o600`,
+  owner-only) as a time-boxed corpus for the TTS normalisation redesign. Privacy: while
+  the flag is on, this file holds the full plaintext body of every outbound reply; it is
+  intentionally NOT enabled in any deployed config by this change, and a dated follow-up
+  issue (switchroom/switchroom#4690) tracks disabling/removing the flag once the 7-day
+  capture window closes.
+
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 
 ### Fixed
