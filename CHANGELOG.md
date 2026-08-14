@@ -15,6 +15,36 @@ Keep this header present and non-empty; an empty Unreleased at release time is
 now an anomaly worth investigating, not the norm.
 -->
 
+### Tooling
+
+- **`lint` now rejects any unsanctioned Telegram `-100…` chat id in the tree.**
+  `scripts/check-no-pii-secrets.mjs` previously carried a denylist of specific
+  real ids, which is always one audit behind: three more real supergroup ids had
+  reached `main` as fixtures and doc examples, and one of them was an id the
+  denylist already named — its `\b<digits>\b` matcher could not see the `-100`-
+  prefixed spelling, because the character before the id is then the `0` of
+  `-100`. The rule is now structural: a marked supergroup id (or a `t.me/c/`
+  link) must have a body matching one of a short list of provably-synthetic
+  shapes, or lint fails with the sanctioned alternatives printed. Every
+  degradation — an unreadable file, an empty scan, a widened-to-vacuous
+  allowlist, `git` missing — exits non-zero rather than reporting clean.
+  If a new example id is needed, use `-1001234567890` or `-100<one digit
+  repeated ten times>`.
+  The structural rule only ever sees the *marked* `-100…` spelling, so every
+  known-real id also keeps a literal entry: one `KNOWN_REAL_ID_BODIES` list now
+  feeds both the denylist and the allowlist self-check. That matters for
+  restores — an id written with the `-100` stripped is invisible to the shape
+  rule, so without a literal entry, rebasing a branch cut before a scrub would
+  quietly put the real id back with lint green.
+  The guard also no longer exempts its own source from the scan. Its patterns
+  are assembled from fragments and never match themselves, but the exemption
+  made it the one tracked file where a contiguous real identifier could sit
+  unflagged.
+  A sanctioned shape carrying a `g` or `y` flag is now rejected outright: those
+  flags make `.test()` stateful, so the same body alternates true/false across
+  occurrences and half the legitimate example ids in the tree would be reported
+  as offenders on alternating hits — a nondeterministic lint failure.
+
 ### Bug fixes
 
 - **an obligation ESCALATION no longer nags on top of an answer the user

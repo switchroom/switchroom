@@ -35,7 +35,7 @@ import { expectMessage } from "../assertions.js";
 
 const AGENT = "test-harness";
 
-/** Bot API marked id of the test supergroup, e.g. -1005164217975. */
+/** Bot API marked id of the test supergroup, e.g. -1006666666666. */
 const SUPERGROUP_ID = Number.parseInt(process.env.SWITCHROOM_UAT_CHAT_ID ?? "", 10);
 
 /** A supergroup turn is a full inbound→claude→outbound round-trip; give

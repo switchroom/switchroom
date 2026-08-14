@@ -850,8 +850,8 @@ export function createWorkerActivityFeed(opts: WorkerActivityFeedOpts): WorkerAc
    *
    * The separator and the topic-less sentinel are both load-bearing. This used
    * to be `` `${chatId} ${threadId ?? ''}` ``, which for a topic-less group
-   * rendered as `-1004223464247 ` — a key ending in a bare space. On disk that
-   * became `"pinKey": "wk:group:-1004223464247 "`: trailing whitespace that
+   * rendered as `-1004444444444 ` — a key ending in a bare space. On disk that
+   * became `"pinKey": "wk:group:-1004444444444 "`: trailing whitespace that
    * survives JSON round-trips, is invisible in every log line and grep, and
    * cannot be distinguished by eye from the same chat WITH a topic. Any operator
    * or tool reconciling rows by chat would silently treat the two as one.

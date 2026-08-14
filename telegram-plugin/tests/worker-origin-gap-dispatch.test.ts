@@ -47,7 +47,7 @@ import { decideSubagentHandback } from '../gateway/subagent-handback-inbound-bui
 
 type Db = ReturnType<typeof openTurnsDbInMemory>
 
-const TOPIC_CHAT = '-1004223464247'
+const TOPIC_CHAT = '-1004444444444'
 const TOPIC_THREAD = '77'
 const OWNER_DM = '555'
 

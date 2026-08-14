@@ -85,13 +85,13 @@ function buildHarness() {
  * forward_origin (modern) + legacy forward_from/forward_date siblings +
  * rich_message content, NO top-level text/caption. */
 function makeForwardedRichUpdate(update_id: number, blocks: unknown[]): Update {
-  const originUser = { id: 8500000001, is_bot: true, first_name: 'Klanker', username: 'meken_klanker_bot' }
+  const originUser = { id: 8500000001, is_bot: true, first_name: 'Sidekick', username: 'example_sidekick_bot' }
   return {
     update_id,
     message: {
       message_id: 944,
-      chat: { id: -1004223464247, type: 'supergroup', title: 'ProductOS', is_forum: true },
-      from: { id: 777, is_bot: false, first_name: 'Ken' },
+      chat: { id: -1004444444444, type: 'supergroup', title: 'Example Supergroup', is_forum: true },
+      from: { id: 777, is_bot: false, first_name: 'Alice' },
       date: 1784837003,
       forward_origin: { type: 'user', date: 1784830000, sender_user: originUser },
       forward_from: originUser,
@@ -142,12 +142,12 @@ describe('forwarded rich (bot) message — the row-944 regression oracle', () =>
       (update as unknown as { message: { forward_origin: never } }).message.forward_origin,
     )
     const meta = buildForwardOriginMeta([origin!])
-    expect(meta.forwarded_from).toBe('Klanker (@meken_klanker_bot)')
+    expect(meta.forwarded_from).toBe('Sidekick (@example_sidekick_bot)')
     expect(meta.forwarded_from_type).toBe('user')
     expect(meta.forwarded_date).toBeDefined()
     // Trusted-lane separation (#3162): the delivered BODY carries no
     // provenance strings — those live only in the channel attrs.
-    expect(delivered[0].text).not.toContain('Klanker')
+    expect(delivered[0].text).not.toContain('Sidekick')
   })
 
   it('a rich message with genuinely no extractable text still yields an honest turn', async () => {
@@ -175,7 +175,7 @@ describe('forwarded rich (bot) message — the row-944 regression oracle', () =>
       message: {
         message_id: 950,
         chat: { id: 777, type: 'private' },
-        from: { id: 777, is_bot: false, first_name: 'Ken' },
+        from: { id: 777, is_bot: false, first_name: 'Alice' },
         date: 1784837100,
         rich_message: { blocks: [{ type: 'heading', size: 2, text: 'Release plan' }, { type: 'paragraph', text: 'Ship Friday.' }] },
       },
@@ -196,14 +196,14 @@ describe('working shapes stay unchanged (no regression on existing forwards)', (
     msg.forward_origin = {
       type: 'user',
       date: 1_700_000_000,
-      sender_user: { id: 424242, is_bot: false, first_name: 'Ken', last_name: 'Thompson' },
+      sender_user: { id: 424242, is_bot: false, first_name: 'Alice', last_name: 'Example' },
     }
     await bot.handleUpdate(update)
 
     expect(delivered).toHaveLength(1)
     expect(delivered[0]).toMatchObject({ via: 'text', text: 'here is the brief I forwarded' })
     const meta = buildForwardOriginMeta([parseForwardOrigin(msg.forward_origin as never)!])
-    expect(meta.forwarded_from).toBe('Ken Thompson')
+    expect(meta.forwarded_from).toBe('Alice Example')
     expect(meta.forwarded_date).toBeDefined()
   })
 

@@ -182,7 +182,7 @@ describe('buildSubagentHandbackInbound — meta.chat_id turn registration (msg-6
   it('carries the origin chat as meta.chat_id so the handback turn mints a turn atom', () => {
     const inbound = buildSubagentHandbackInbound({
       ctx: {
-        chatId: '-1004223464247',
+        chatId: '-1004444444444',
         threadId: 77,
         taskDescription: 'Topic-dispatched work',
         resultText: 'done',
@@ -190,7 +190,7 @@ describe('buildSubagentHandbackInbound — meta.chat_id turn registration (msg-6
       },
       nowMs: FIXED_NOW,
     })
-    expect(inbound.meta.chat_id).toBe('-1004223464247')
+    expect(inbound.meta.chat_id).toBe('-1004444444444')
     // The thread carrier must still ride alongside — chat_id + thread_id is
     // the full origin surface the minted turn (and any worker dispatched
     // inside it) inherits.

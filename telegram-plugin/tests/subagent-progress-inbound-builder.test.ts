@@ -364,7 +364,7 @@ describe('buildSubagentProgressInbound — meta.chat_id turn registration (msg-6
   it('carries the origin chat as meta.chat_id', () => {
     const inbound = buildSubagentProgressInbound({
       ctx: {
-        chatId: '-1004223464247',
+        chatId: '-1004444444444',
         threadId: 77,
         subagentJsonlId: 'stem1',
         taskDescription: 'Topic work',
@@ -375,7 +375,7 @@ describe('buildSubagentProgressInbound — meta.chat_id turn registration (msg-6
       },
       nowMs: 1_700_000_000_000,
     })
-    expect(inbound.meta.chat_id).toBe('-1004223464247')
+    expect(inbound.meta.chat_id).toBe('-1004444444444')
     expect(inbound.meta.message_thread_id).toBe('77')
   })
 })
