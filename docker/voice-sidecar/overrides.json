@@ -1,0 +1,98 @@
+{
+  "_comment": [
+    "Pronunciation overrides for the TTS path. Each entry becomes misaki",
+    "`[match](/phonemes/)` markup at phonemize time (text_normalize.apply_overrides).",
+    "",
+    "RULES FOR EDITING THIS FILE:",
+    "1. misaki's alphabet is NOT IPA. Capitals are collapsed diphthongs",
+    "   (A=eI as in 'day', I=aI as in 'my', W=aU as in 'now', Y=OI as in 'boy',",
+    "   O=oU as in 'go') and the small schwa is U+1D4A. Writing IPA here",
+    "   produces silence, not a mispronunciation.",
+    "2. NEVER transcribe by hand. Get the phoneme string out of the real",
+    "   phonemizer: run a respelling misaki already says correctly",
+    "   ('postgress' -> pOstgrEs) and copy the result.",
+    "3. Verify the entry round-trips before committing:",
+    "   g2p('The [Postgres](/pˈOstɡɹɛs/) box.') must contain your string.",
+    "4. Every character must be in Kokoro's vocabulary. An out-of-vocab symbol",
+    "   is dropped SILENTLY by the tokenizer and the word vanishes from the",
+    "   audio. The loader validates this and rejects the entry, but a rejected",
+    "   entry is a bug you shipped, not a safety net you get to lean on.",
+    "",
+    "Every entry below was produced by a live phonemizer run against",
+    "misaki 0.9.4 in switchroom-voice-sidecar and vocab-checked against",
+    "kokoro_onnx.config.DEFAULT_VOCAB.",
+    "",
+    "`ci: true` matches case-insensitively. `condition` names a registered",
+    "predicate in text_normalize._CONDITIONS (none today); an unknown name is",
+    "rejected at load. This file is DATA and is never evaluated as code."
+  ],
+  "version": 1,
+  "entries": [
+    {
+      "match": "Postgres",
+      "ci": true,
+      "phonemes": "pˈOstɡɹɛs",
+      "was": "pˈOstɡəɹz (\"post-gerz\")"
+    },
+    {
+      "match": "PostgreSQL",
+      "ci": true,
+      "phonemes": "pˈOstɡɹɛsˌɛskjˌuˈɛl",
+      "was": "pˈOstɡəɹɹ ˌɛskjˌuˈɛl (\"post-gurr es-queue-el\")"
+    },
+    {
+      "match": "Redis",
+      "ci": true,
+      "phonemes": "ɹˈɛdɪs",
+      "was": "ɹᵻdiz (\"ree-deez\")"
+    },
+    {
+      "match": "kokoro",
+      "ci": true,
+      "phonemes": "kˈOkOɹO",
+      "was": "kəkˈɔɹO (\"kuh-KOR-oh\")"
+    },
+    {
+      "match": "misaki",
+      "ci": true,
+      "phonemes": "mˈisɑki",
+      "was": "mɪsəki (unstressed, \"miss-uh-kee\")"
+    },
+    {
+      "match": "Aug",
+      "ci": false,
+      "phonemes": "ˈɔɡəst",
+      "was": "ˈɔɡ (\"awg\") — the month-abbrev rule only expands Aug when a day number pins it, so a bare Aug still needs this"
+    },
+    {
+      "match": "cuda",
+      "ci": true,
+      "phonemes": "kˈudə",
+      "was": "kjˈudə (\"cue-duh\")"
+    },
+    {
+      "match": "async",
+      "ci": true,
+      "phonemes": "ˈAsɪŋk",
+      "was": "əsˈɪŋk (\"uh-sink\")"
+    },
+    {
+      "match": "dotenv",
+      "ci": true,
+      "phonemes": "dˈɑtˈɛnv",
+      "was": "dˈOtɛnv (\"dote-env\")"
+    },
+    {
+      "match": "systemd",
+      "ci": true,
+      "phonemes": "sˈɪstəmdˌi",
+      "was": "sˈɪstəmd (the trailing d swallowed)"
+    },
+    {
+      "match": "vite",
+      "ci": true,
+      "phonemes": "vˈit",
+      "was": "vˈIt (\"vite\" rhyming with \"kite\")"
+    }
+  ]
+}

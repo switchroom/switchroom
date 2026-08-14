@@ -76,6 +76,36 @@ now an anomaly worth investigating, not the norm.
   issue (switchroom/switchroom#4690) tracks disabling/removing the flag once the 7-day
   capture window closes.
 
+### Features
+
+- **Spoken-form token normalisation moved next to the phonemizer (Stage B)** —
+  the voice sidecar now owns how a token is *pronounced*, in one place:
+  `docker/voice-sidecar/text_normalize.py`. The gateway's two TTS passes had
+  drifted into contradicting each other — one read a bare `m` as "minutes", the
+  other as "metres", and whichever ran last won — with no single place to fix a
+  mispronunciation and nothing covering callers that hit `POST /tts` directly.
+  Stage B runs immediately before the text is split for synthesis and covers
+  units (`90s` → "ninety seconds", glued `m` = minutes / spaced `m` = metres),
+  dates and ISO timestamps, clock times, currency including the `A$7.46` glue
+  that used to say "Aseven dollars", magnitudes, ordinals, `#4661` → "hash
+  4661", acronyms and all-caps lowering, and identifier shapes (file:line,
+  dotted quads, versions, git hashes, snake/camel case). Two contracts are
+  enforced rather than asserted in a comment: the output never contains a digit
+  glued to a letter (the shape that makes misaki spell garbage), and
+  normalising twice equals normalising once — both are gated by
+  `tools/replay_corpus.py` over a captured production corpus, which found eight
+  defects the unit tests had missed. `VOICE_TTS_NORMALIZE=0` is a
+  byte-identical passthrough kill switch. **Gateway behaviour is unchanged by
+  this release** — the legacy passes still run and are removed in a later
+  change.
+- **Pronunciation override table for the TTS path** — `overrides.json` fixes
+  names misaki gets wrong (Postgres, PostgreSQL, Redis, kokoro, misaki, `Aug`,
+  cuda, async, dotenv, systemd, vite). Every entry was verified by an actual
+  phonemizer run and is validated against Kokoro's vocab at load: an entry
+  whose phonemes the model cannot represent is rejected and logged rather than
+  silently mangling an utterance, and `/healthz` reports the active and
+  rejected counts.
+
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 
 ### Fixed
