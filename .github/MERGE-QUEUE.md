@@ -148,9 +148,10 @@ of bug as the #2816 non-main-dispatch follow-up. Queue builds tag
 
 ## Author-side changelog generation (why not a CI commit-back)
 
-#4469 makes a staged `## Unreleased` entry a precondition of the required
-`lint` context (`scripts/check-changelog-entry.mjs`). The obvious way to spare
-authors the round-trip is to have CI derive the entry from the PR title and
+#4469 makes a staged changelog note — a NEW `changelog.d/` fragment file, or
+(legacy) a grown `## Unreleased` — a precondition of the required `lint`
+context (`scripts/check-changelog-entry.mjs`). The obvious way to spare
+authors the round-trip is to have CI derive the note from the PR title and
 **commit it back to the PR branch**. On this repo that is a wedge, not a
 convenience, and the reason is the merge-queue model this file governs.
 
@@ -166,17 +167,20 @@ credential, which the repo deliberately does not carry (only `GITHUB_TOKEN`,
 `NPM_TOKEN` and the UAT Telegram secrets exist).
 
 So generation runs **author-side** instead: `scripts/gen-changelog-entry.mjs`
-(`bun run changelog:generate`) derives the entry from the branch's
-conventional-commit title and appends it under `## Unreleased` in the AUTHOR's
-own commit, before `gh pr create`. That push is an ordinary author push — it
-re-triggers every required check normally, exactly the property the
-commit-back path cannot have. The generator is idempotent (a second run sees
-its own entry as growth and no-ops), skips on `merge_group` (empty PR
-context), no-ops on a non-shippable / release PR, and honours the same escape
-hatches as the check — the `no-changelog` label or a `[skip changelog]` token
-on its own line opts OUT of both enforcement and generation. #4469's check
-remains the deterministic **backstop**: skip the helper and CI still reds
-until an entry exists.
+(`bun run changelog:generate`) derives the note from the branch's
+conventional-commit title and writes it as a per-PR fragment file
+(`changelog.d/<pr>-<slug>.<type>.md`) in the AUTHOR's own commit, before
+`gh pr create`. That push is an ordinary author push — it re-triggers every
+required check normally, exactly the property the commit-back path cannot
+have. The fragment file also cannot conflict with any other in-flight PR,
+which is why the generator no longer touches `CHANGELOG.md` at all (see
+`changelog.d/README.md`). The generator is idempotent (a second run sees its
+own fragment and no-ops), skips on `merge_group` (empty PR context), no-ops
+on a non-shippable / release PR, and honours the same escape hatches as the
+check — the `no-changelog` label or a `[skip changelog]` token on its own
+line opts OUT of both enforcement and generation. #4469's check remains the
+deterministic **backstop**: skip the helper and CI still reds until a note
+exists.
 
 ## Diagnosing a stuck queue
 

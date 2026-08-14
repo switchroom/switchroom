@@ -57,6 +57,7 @@
     "lint:claude-cli-lockstep": "node scripts/check-claude-cli-lockstep.mjs",
     "lint:changelog-entry": "node scripts/check-changelog-entry.mjs",
     "changelog:generate": "node scripts/gen-changelog-entry.mjs",
+    "changelog:cut": "node scripts/cut-changelog-release.mjs",
     "lint:agent-attribution-trailers": "node scripts/check-agent-attribution-trailers.mjs",
     "lint:hostd-template-guard": "bun scripts/check-hostd-template-guard.ts",
     "lint:bench-baseline-anonymised": "node scripts/check-bench-baseline-anonymised.mjs",

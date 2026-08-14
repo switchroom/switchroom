@@ -34,13 +34,17 @@
  *   3. If an escape hatch is present (`no-changelog` label / `[skip changelog]`
  *      token on its own line in the PR body or any commit message) → no-op:
  *      the hatch opts OUT of both enforcement AND generation.
- *   4. If `## Unreleased` has ALREADY grown vs base → no-op: the author (or a
- *      prior run of this script) already staged an entry. This is what makes
- *      the helper IDEMPOTENT — run it twice, the second run sees its own entry
- *      as growth and does nothing.
+ *   4. If a changelog note is ALREADY staged — a `changelog.d/` fragment added
+ *      in the range or sitting uncommitted in the worktree, or a grown
+ *      `## Unreleased` — → no-op. This is what makes the helper IDEMPOTENT:
+ *      run it twice, the second run sees its own fragment and does nothing.
  *   5. Otherwise derive an entry from the PR title / newest conventional-commit
- *      subject, and append it under `## Unreleased` (grouped under a `###`
- *      category subhead when the type maps to one), then write CHANGELOG.md.
+ *      subject and write it as a NEW fragment file,
+ *      `changelog.d/<pr>-<slug>.<type>.md`. It deliberately does NOT touch
+ *      CHANGELOG.md: a per-PR fragment file cannot conflict with another
+ *      in-flight PR, which is the whole point (see changelog.d/README.md).
+ *      The release cut assembles fragments into the `## vX.Y.Z` section via
+ *      `scripts/cut-changelog-release.mjs`.
  *
  * ── ESCAPE HATCHES (identical to check-changelog-entry) ──────────────────
  *
@@ -61,10 +65,12 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import {
   isShippable,
+  isChangelogFragment,
+  FRAGMENT_DIR,
   extractUnreleasedEntries,
   unreleasedGrew,
   hasSkipToken,
@@ -140,112 +146,38 @@ export function buildEntryLine(parsed, prNumber) {
 }
 
 /**
- * Insert `entryLine` under `## Unreleased`, optionally beneath a `### category`
- * subhead (created if absent). Pure string transform — no IO.
- *
- * Placement rules:
- *  - Under an existing matching `### category`, append after its last bullet.
- *  - Else create the `### category` block at the TOP of the section (after the
- *    HTML-comment preamble), so newest work reads first.
- *  - With no category, insert the bullet directly at the top of the section.
- * @param {string} changelog
- * @param {string} entryLine
- * @param {string|null} category
+ * Slug a subject line for a fragment file name: lowercase, alphanumerics
+ * joined by single dashes, bounded so a long PR title cannot mint an
+ * unwieldy path. Deterministic so a second run derives the same name
+ * (idempotency depends on it).
+ * @param {string} subject
  * @returns {string}
  */
-export function insertEntry(changelog, entryLine, category) {
-  const eol = changelog.includes('\r\n') ? '\r\n' : '\n'
-  const lines = changelog.replace(/\r\n/g, '\n').split('\n')
+export function slugify(subject) {
+  return (
+    String(subject)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 48)
+      .replace(/-+$/, '') || 'entry'
+  )
+}
 
-  // Locate `## Unreleased`. If absent, seed one right after the `# Changelog`
-  // title (or at the very top) so there is always a section to stage into.
-  //
-  // Anchored at column 0, matching `check-changelog-entry`'s `parseSections`
-  // and the `end` scan below (which always was). The writer and the checker
-  // have to agree on WHICH line is the staging section: tolerate an indent here
-  // and an entry gets written under a heading the guard does not count, so a PR
-  // that did stage an entry reds anyway with no visible cause. Residual, and
-  // deliberately not fixed here: this function does not mask fenced or
-  // commented regions, so a column-0 `## Unreleased` inside a code fence is
-  // still a candidate for it and is not one for the guard. The real file has no
-  // such fence, and masking the writer too is a larger change than this
-  // alignment.
-  let head = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l))
-  if (head === -1) {
-    const titleIdx = lines.findIndex((l) => /^#\s+/.test(l.trim()))
-    const at = titleIdx === -1 ? 0 : titleIdx + 1
-    lines.splice(at, 0, '', '## Unreleased', '')
-    head = lines.findIndex((l) => /^##\s+unreleased\b/i.test(l))
-  }
-
-  // Section body spans (head, end): up to the next `## ` heading (NOT `###`).
-  let end = lines.length
-  for (let i = head + 1; i < lines.length; i++) {
-    if (/^##\s/.test(lines[i])) {
-      end = i
-      break
-    }
-  }
-
-  // Skip the HTML-comment preamble + leading blanks to find the section's
-  // first real content line (`preambleEnd`).
-  let preambleEnd = head + 1
-  let inComment = false
-  for (let i = head + 1; i < end; i++) {
-    const t = lines[i].trim()
-    if (inComment) {
-      if (/-->/.test(t)) inComment = false
-      preambleEnd = i + 1
-      continue
-    }
-    if (/^<!--/.test(t)) {
-      inComment = !/-->/.test(t)
-      preambleEnd = i + 1
-      continue
-    }
-    if (t === '') {
-      preambleEnd = i + 1
-      continue
-    }
-    break
-  }
-
-  const bullet = entryLine
-
-  if (!category) {
-    // Plain bullet at the top of the section body.
-    lines.splice(preambleEnd, 0, bullet, '')
-    return lines.join(eol)
-  }
-
-  // Find an existing `### <category>` within the section.
-  const catRe = new RegExp(`^###\\s+${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i')
-  let catIdx = -1
-  for (let i = preambleEnd; i < end; i++) {
-    if (catRe.test(lines[i].trim())) {
-      catIdx = i
-      break
-    }
-  }
-
-  if (catIdx !== -1) {
-    // Append after the category's existing bullets (up to next `###`/`##`/end).
-    let insertAt = end
-    for (let i = catIdx + 1; i < end; i++) {
-      if (/^###?\s/.test(lines[i])) {
-        insertAt = i
-        break
-      }
-    }
-    // Back up over trailing blank lines so the bullet joins the list.
-    while (insertAt > catIdx + 1 && lines[insertAt - 1].trim() === '') insertAt--
-    lines.splice(insertAt, 0, bullet)
-    return lines.join(eol)
-  }
-
-  // Create the category block at the top of the section.
-  lines.splice(preambleEnd, 0, `### ${category}`, '', bullet, '')
-  return lines.join(eol)
+/**
+ * Derive the fragment file name for a parsed title + optional PR number:
+ * `<pr>-<slug>.<type>.md` (PR number omitted when unknown, type falling back
+ * to `other` for a non-conventional title). The `.<type>.md` double extension
+ * is what `cut-changelog-release.mjs` maps to a `###` category at release
+ * time; an unknown type simply lands ungrouped, never an error.
+ * @param {{type:string|null, subject:string}} parsed
+ * @param {string|null} prNumber
+ * @returns {string} file name (no directory)
+ */
+export function fragmentFileName(parsed, prNumber) {
+  const type = parsed.type && /^[a-z]+$/.test(parsed.type) ? parsed.type : 'other'
+  const prefix = prNumber ? `${prNumber}-` : ''
+  return `${prefix}${slugify(parsed.subject)}.${type}.md`
 }
 
 // ── git plumbing (minimal; parsing reused from check-changelog-entry.mjs) ──
@@ -355,6 +287,7 @@ export function resolveTitle(args, env, commitSubjects) {
  * Shared by the CLI and the tests so the decision is asserted directly.
  * @param {{
  *   changedFiles: string[],
+ *   addedFiles?: string[],
  *   baseChangelog: string,
  *   headChangelog: string,
  *   title: string,
@@ -364,10 +297,11 @@ export function resolveTitle(args, env, commitSubjects) {
  *   prLabels?: string,
  * }} input
  * @returns {{action:'write'|'skip', reason:string, entryLine?:string,
- *            category?:string|null, changelog?:string}}
+ *            category?:string|null, fragmentPath?:string, fragmentContent?:string}}
  */
 export function plan({
   changedFiles,
+  addedFiles = [],
   baseChangelog,
   headChangelog,
   title,
@@ -387,6 +321,13 @@ export function plan({
   if (escaped) {
     return { action: 'skip', reason: 'escape hatch (no-changelog label / [skip changelog] token)' }
   }
+  // A fragment already staged in the range (or uncommitted in the worktree —
+  // the caller folds both into addedFiles) is the primary idempotency check:
+  // run this helper twice and the second run sees the first run's file.
+  const staged = (addedFiles || []).filter(isChangelogFragment)
+  if (staged.length > 0) {
+    return { action: 'skip', reason: `a changelog fragment is already staged (${staged[0]})` }
+  }
   if (unreleasedGrew(baseChangelog, headChangelog)) {
     return { action: 'skip', reason: '## Unreleased already has a new entry (idempotent no-op)' }
   }
@@ -397,8 +338,9 @@ export function plan({
   const category = categoryForType(parsed.type)
   const entryLine = buildEntryLine(parsed, prNumber)
 
-  // Defence-in-depth idempotency: if a line normalising to the same bullet, or
-  // one already carrying this PR number, is present, do not add a duplicate.
+  // Defence-in-depth idempotency against the LEGACY path: an entry already
+  // hand-staged under ## Unreleased (same bullet, or any bullet carrying this
+  // PR number) must not gain a duplicate fragment.
   const existing = extractUnreleasedEntries(headChangelog)
   const norm = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase()
   if (existing.some((e) => norm(e) === norm(entryLine))) {
@@ -408,8 +350,15 @@ export function plan({
     return { action: 'skip', reason: `an entry for (#${prNumber}) is already present` }
   }
 
-  const changelog = insertEntry(headChangelog, entryLine, category)
-  return { action: 'write', reason: 'staged a derived ## Unreleased entry', entryLine, category, changelog }
+  const fragmentPath = `${FRAGMENT_DIR}${fragmentFileName(parsed, prNumber)}`
+  return {
+    action: 'write',
+    reason: 'staged a changelog fragment',
+    entryLine,
+    category,
+    fragmentPath,
+    fragmentContent: `${entryLine}\n`,
+  }
 }
 
 /**
@@ -452,6 +401,21 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env, arg
     .map((l) => l.trim())
     .filter(Boolean)
 
+  // Files ADDED — committed adds in the range, uncommitted adds vs HEAD, and
+  // untracked files. Fragment idempotency keys on these: a fragment this
+  // helper wrote a minute ago is untracked (or committed), and either way a
+  // re-run must see it and no-op. `--no-renames` matches the checker.
+  const addedFiles = [
+    ...gitSoft(
+      ['diff', '--name-only', '--no-renames', '--diff-filter=A', `${mergeBase}..${range.head}`],
+      cwd,
+    ).split('\n'),
+    ...gitSoft(['diff', '--name-only', '--no-renames', '--diff-filter=A', 'HEAD'], cwd).split('\n'),
+    ...gitSoft(['ls-files', '--others', '--exclude-standard'], cwd).split('\n'),
+  ]
+    .map((l) => l.trim())
+    .filter(Boolean)
+
   const baseChangelog = gitSoft(['show', `${mergeBase}:CHANGELOG.md`], cwd)
   // HEAD content is the WORKING-TREE CHANGELOG.md the author is about to commit,
   // not the committed blob — so an already-staged (or already-generated but
@@ -475,6 +439,7 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env, arg
 
   const verdict = plan({
     changedFiles,
+    addedFiles,
     baseChangelog,
     headChangelog,
     title,
@@ -488,24 +453,25 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env, arg
     return { status: 'skip', lines: [`gen-changelog-entry: no change — ${verdict.reason}.`] }
   }
 
-  const grouped = verdict.category ? ` / ### ${verdict.category}` : ''
   if (args.dryRun) {
     return {
       status: 'skip',
       lines: [
-        `gen-changelog-entry: DRY RUN — would stage under ## Unreleased${grouped}:`,
+        `gen-changelog-entry: DRY RUN — would write ${verdict.fragmentPath}:`,
         `  ${verdict.entryLine}`,
       ],
     }
   }
 
-  writeFileSync(`${resolveRepoRoot(cwd)}/CHANGELOG.md`, verdict.changelog)
+  const root = resolveRepoRoot(cwd)
+  mkdirSync(join(root, FRAGMENT_DIR), { recursive: true })
+  writeFileSync(join(root, verdict.fragmentPath), verdict.fragmentContent)
   return {
     status: 'wrote',
     lines: [
-      `gen-changelog-entry: staged an entry under ## Unreleased${grouped}:`,
+      `gen-changelog-entry: wrote ${verdict.fragmentPath}:`,
       `  ${verdict.entryLine}`,
-      '  Commit CHANGELOG.md in this PR; #4469 stays as the CI backstop.',
+      '  Commit the fragment in this PR; check-changelog-entry stays the CI backstop.',
     ],
   }
 }

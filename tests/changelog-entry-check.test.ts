@@ -2141,3 +2141,98 @@ describe("check-changelog-entry — skips that must never gate", () => {
     expect(r.out).toContain("SKIP — no base ref");
   });
 });
+
+describe("check-changelog-entry — a changelog.d/ fragment satisfies the entry requirement", () => {
+  // The fragment path exists so two in-flight PRs never edit the same file
+  // (every `## Unreleased` edit conflicts with every other one). These are the
+  // outcome pins for that contract: a NEW fragment file is a staged entry; a
+  // touched-but-not-added one is not; and the convention doc never counts.
+
+  it("passes a shippable change that adds a new changelog.d fragment", () => {
+    const f = makeFixture("changelog-frag-green-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.writeFile("changelog.d/4720-add-a-feature.feat.md", "- **feat: add a feature (#4720)**\n");
+    f.commit("feat: add a feature");
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("changelog fragment staged");
+    expect(r.out).toContain("changelog.d/4720-add-a-feature.feat.md");
+  });
+
+  it("fails when the PR only EDITS a fragment that already existed at the base", () => {
+    // "Staged an entry" means a NEW file. Rewording someone else's fragment
+    // (or a leftover) must not certify this PR's own change.
+    const f = makeFixture("changelog-frag-edit-");
+    // Seed a fragment on main BEFORE the branch forks.
+    f.git(["checkout", "-q", "main"]);
+    f.writeFile("changelog.d/1-old.fix.md", "- **an old fix (#1)**\n");
+    f.git(["add", "-A"]);
+    f.git(["commit", "-q", "-m", "chore: seed fragment"]);
+    f.git(["checkout", "-q", "work"]);
+    f.git(["merge", "-q", "main"]);
+
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.writeFile("changelog.d/1-old.fix.md", "- **an old fix, reworded (#1)**\n");
+    f.commit("feat: ship while only rewording an existing fragment");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+  });
+
+  it("does not count changelog.d/README.md or a nested/non-md file as a fragment", () => {
+    const f = makeFixture("changelog-frag-nonfrag-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.writeFile("changelog.d/README.md", "# convention doc, not an entry\n");
+    f.writeFile("changelog.d/nested/4721-x.feat.md", "- **hidden (#4721)**\n");
+    f.writeFile("changelog.d/4722-notes.txt", "- **not markdown (#4722)**\n");
+    f.commit("feat: ship with only non-fragment files under changelog.d");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+  });
+
+  it("names the fragment path as the PRIMARY fix in the failure message", () => {
+    const f = makeFixture("changelog-frag-msg-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.commit("feat: ship and forget the note");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("changelog.d/");
+    expect(r.out).toContain("changelog:generate");
+  });
+
+  it("a fragment does NOT buy placement immunity (RULE 2 still outranks it)", () => {
+    // A PR that stages a fragment AND writes a line into an already-released
+    // CHANGELOG section must still fail placement: the fragment satisfies
+    // RULE 1 only.
+    const f = makeFixture("changelog-frag-placement-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.writeFile("changelog.d/4723-x.fix.md", "- **a fix (#4723)**\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      SEED_CHANGELOG.replace(
+        "- **Something shipped (#1):** prose.",
+        "- **Something shipped (#1):** prose.\n- **smuggled into a released section (#4723)**",
+      ),
+    );
+    f.commit("fix: a fix that also edits a released section");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+  });
+
+  it("still passes via ## Unreleased growth (transitional path stays open)", () => {
+    const f = makeFixture("changelog-frag-transition-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.writeFile("CHANGELOG.md", changelogWithEntry("direct entry still accepted (#4724)"));
+    f.commit("feat: stage directly under Unreleased");
+
+    const r = f.check();
+    expect(r.code).toBe(0);
+  });
+});
