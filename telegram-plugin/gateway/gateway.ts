@@ -738,6 +738,7 @@ import {
 } from './emission-authority.js'
 import { CurrentTurnMap } from './current-turn-map.js'
 import { resolveAnswerThreadId } from './answer-thread-resolve.js'
+import { answerRouteOverrides } from './answer-route-overrides.js'
 import { latestTurnForChat } from './latest-turn-lookup.js'
 import { decideObligationTurnEnd } from './obligation-turn-end.js'
 import { maybeRotate, resolveAgentStateDir, resolveTurnsJsonlPath } from './turns-jsonl-rotate.js'
@@ -3973,12 +3974,11 @@ function resolveAnswerThreadWithLog(
   // Observability: the model passed an explicit topic but a framework anchor
   // (origin/live) overrode it. This is the deterministic correction that fixes
   // the General→CRM misroute; surface it so the model's topic-grabbing is
-  // visible rather than silent.
-  const explicitOverridden =
-    REPLY_TOPIC_AUTHORITY_ENABLED &&
-    explicitThreadId != null &&
-    (originTurn != null || liveTurn != null) &&
-    threadId !== explicitThreadId
+  // visible rather than silent. `note` also RECORDS it — obligation escalation
+  // needs it to tell "topic A's answer landed in B" from "something unrelated
+  // landed in B" (predicate + rationale: answer-route-overrides.ts).
+  const explicitOverridden = answerRouteOverrides.note({ chatId, enabled: REPLY_TOPIC_AUTHORITY_ENABLED,
+    explicitThreadId, anchored: originTurn != null || liveTurn != null, routedThreadId: threadId, nowMs: Date.now() })
   const ownerTurn = originTurn ?? recovered ?? liveTurn
   const isSupergroup = chatId.startsWith('-100')
   // UNROUTED = a supergroup reply that resolved to NO topic with NO owner turn

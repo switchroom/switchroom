@@ -5,38 +5,71 @@
  * The escalate branch of the obligation sweep sends a user-visible
  * "⚠️ I may have missed an earlier message" nudge. That nudge is only correct
  * when the agent genuinely never answered. Two mechanisms in the pre-fix code
- * let it fire on top of an answer the user had already received:
+ * let it fire on top of an answer the user had already received. Both are
+ * reproduced from marko's `gateway-supervisor.log`, chat `-100…471` (the chat id
+ * and the message bodies are deliberately NOT reproduced here — only ids,
+ * topics and timings, which is all the derivation needs):
  *
- *   1. THREAD SCOPING. The staleness check was keyed on the obligation's
- *      `threadId`. The reply router routinely resolves an answer to a DIFFERENT
- *      topic than the obligation's (it logs this explicitly, e.g.
- *      `EXPLICIT_OVERRIDDEN(model→4,routed→635)`), so the delivered answer lives
- *      under another `thread_id` and a thread-keyed query can never see it.
- *      Confirmed on marko 2026-08-13: obligation `<chat>:4#5462`
- *      (thread 4) was answered by message 5494 (295 chars) delivered to thread 3
- *      at 04:02:51.987 — and the nag still fired 14.2s later at 04:03:06.140.
- *      Fix: `answeredSinceOpen` asks CHAT scope, falling back from the thread
- *      scope, so an answer delivered anywhere in the chat counts.
+ *   1. REROUTED ANSWER. The staleness check was keyed on the obligation's
+ *      `threadId`. When the model names a topic on its `reply` and the
+ *      framework's topic authority overrides it — the router logs exactly this,
+ *      `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — the answer is written to
+ *      history under thread M while the obligation lives under thread N, so a
+ *      thread-N query can never see it.
+ *
+ *      2026-08-10 06:36:07.921, obligation `…:4#5191` (thread 4):
+ *      `EXPLICIT_OVERRIDDEN(model→4,routed→635)` — the model was answering the
+ *      thread-4 obligation, the answer went to thread 635, and the nag fired
+ *      126 ms later at 06:36:08.047.
+ *      2026-08-10 07:52:36.026, obligation `…:3#5200` (thread 3):
+ *      `EXPLICIT_OVERRIDDEN(model→3,routed→-)` — answer written with
+ *      `thread_id IS NULL`; the nag had already fired at 07:52:34.400.
+ *
+ *      Fix: `answeredSinceOpen` keeps the thread scope and adds a fallback to
+ *      the threads an answer ADDRESSED TO THIS OBLIGATION'S TOPIC was actually
+ *      routed to, read from the router's own override record
+ *      (`answer-route-overrides.ts`).
+ *
+ *      NOT a chat-wide fallback. A chat-wide "did anything long land since
+ *      openedAt" query has no relationship to the obligation beyond the chat id,
+ *      and in a busy forum it silently closes an obligation in topic A because
+ *      an unrelated answer landed in topic B — dropping the user's message with
+ *      no nudge and no re-present. The repo already states that principle for
+ *      the sibling predicate (`turn-flush-suppression.ts`, "a background
+ *      worker's progress_update … or a reply in a DIFFERENT forum topic all
+ *      suppressed the flush, and the branch then CLOSED the delivery obligation
+ *      — the user's real answer was dropped"). The field data agrees: on
+ *      2026-08-13 obligation `…:4#5462` (thread 4) escalated at 04:03:06.140
+ *      after a 292-char answer landed at 04:02:50.521 — but that answer was
+ *      `via=origin` to turn `…:3#5480`, a DIFFERENT question in topic 3, and no
+ *      override was logged in the whole represent→escalate window. Topic 4's
+ *      message was genuinely unanswered. A chat-wide fallback would have closed
+ *      it silently; the override-gated fallback correctly declines to.
  *
  *   2. NO SETTLE. The check is a point-in-time read of history, but the answer
  *      is frequently still IN FLIGHT at the instant the sweep decides: the reply
  *      tool has been invoked (or is about to be) and its history row does not
- *      exist yet. Confirmed on marko 2026-08-10 06:36 (reply tool invoked at
- *      :07.917, escalation decided at :08.047, answer 5215 delivered at :09.281 —
- *      1.23s AFTER the decision) and 2026-08-10 07:52 (decision :34.400, answer
- *      5232 delivered :37.209 — 2.81s after). A backward-looking widening of the
- *      cutoff cannot fix this: the cutoff is already `openedAt`, minutes in the
- *      past, so a delivered row would have matched. The row simply is not there
- *      yet. Fix: `createEscalationSettleGate` requires the staleness check to
- *      have read "not answered" ACROSS a settle window before the nudge is
- *      allowed out — the escalation is deferred once, re-checked on a later
- *      sweep, and only sent if the answer still has not landed.
+ *      exist yet. Same two 2026-08-10 incidents: 06:36 (reply invoked :07.919,
+ *      escalation decided :08.047, answer delivered :09.281 — 1.23 s AFTER the
+ *      decision) and 07:52 (decision :34.400, reply invoked :36.026, delivered
+ *      :37.209 — 2.81 s after). A backward-looking widening of the cutoff cannot
+ *      fix this: the cutoff is already `openedAt`, minutes in the past, so a
+ *      delivered row would have matched. The row simply is not there yet. Fix:
+ *      `createEscalationSettleGate` requires the staleness check to have read
+ *      "not answered" ACROSS a settle window before the nudge is allowed out —
+ *      the escalation is deferred once, re-checked on a later sweep, and only
+ *      sent if the answer still has not landed.
+ *
+ * Both incidents needed BOTH guards: each answer was rerouted AND still in
+ * flight at the decision instant, so neither guard alone suppresses either nag.
  *
  * Both guards are deliberately bounded: the settle gate delays a genuine
- * escalation by the settle window and no more, and the chat-scoped check keeps
- * the caller's substantive-length floor, so an escalation for a genuinely
- * unanswered message still fires.
+ * escalation by the settle window and no more, the reroute fallback only looks
+ * where the router says this topic's answer went, and both keep the caller's
+ * substantive-length floor — so an escalation for a genuinely unanswered
+ * message still fires.
  */
+import type { AnswerRouteOverrides } from './answer-route-overrides.js'
 
 /**
  * Escalation settle window, in milliseconds.
@@ -44,8 +77,8 @@
  * Derived from the observed decision→delivery lag on the confirmed false
  * escalations where the answer was in flight at decision time:
  *
- *   - marko 2026-08-10 06:36:08.047 decision → 06:36:09.281 delivery = 1,234 ms
- *   - marko 2026-08-10 07:52:34.400 decision → 07:52:37.209 delivery = 2,809 ms
+ *   - 2026-08-10 06:36:08.047 decision → 06:36:09.281 delivery = 1,234 ms
+ *   - 2026-08-10 07:52:34.400 decision → 07:52:37.209 delivery = 2,809 ms
  *
  * The window must (a) exceed the WORST observed lag with real margin — a send
  * can additionally sit behind the per-chat send-gate pacing — and (b) span at
@@ -54,13 +87,29 @@
  * which satisfies both.
  *
  * The upper bound is the genuinely-unanswered case that MUST still escalate:
- * marko 2026-08-12 09:08:14.524 decision → the agent's real answer (5357) at
- * 09:08:56 = 41,331 ms. 8,500 ms sits 4.9× below that, so a settle re-check
- * cannot swallow it.
+ * 2026-08-12 09:08:14.524 decision → the agent's real answer at 09:08:56 =
+ * 41,331 ms. 8,500 ms sits 4.9× below that, so a settle re-check cannot swallow
+ * it.
  *
  * Kill switch: 0 disables the gate (pre-fix, escalate on the first decision).
  */
 export const OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT = 8_500
+
+/**
+ * Hard ceiling on the settle window.
+ *
+ * The gate trades a bounded DELAY of a genuine nudge for suppression of a false
+ * one, and that trade is only honest while the delay stays small next to the
+ * ladder that precedes it. A fat-fingered
+ * `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=85000000` would otherwise silently
+ * suppress every escalation for a day — a config typo turning a guard into an
+ * outage. 60 s is ~7× the derived default and still well under the represent
+ * ladder's own minutes-long cadence, so any legitimate tuning fits under it and
+ * anything above it is a typo, not an intent. Values above the ceiling are
+ * CLAMPED (not rejected): clamping keeps the guard working, whereas falling back
+ * to the default would silently ignore a deliberate 90 s choice.
+ */
+export const OBLIGATION_ESCALATE_SETTLE_MS_MAX = 60_000
 
 /**
  * Resolve the settle window from the environment.
@@ -70,7 +119,8 @@ export const OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT = 8_500
  * headroom, and the ratchet's whole point is that new logic lands in a module.
  * `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` is the kill switch (pre-fix
  * behaviour: escalate on the first decision); a non-numeric or negative value
- * falls back to the default rather than silently disabling the guard.
+ * falls back to the default rather than silently disabling the guard; a value
+ * above `OBLIGATION_ESCALATE_SETTLE_MS_MAX` is clamped to it.
  */
 export function resolveEscalateSettleMs(
   env: Record<string, string | undefined> = process.env,
@@ -78,7 +128,8 @@ export function resolveEscalateSettleMs(
   const raw = env.SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS
   if (raw == null || raw === '') return OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT
   const n = Number(raw)
-  return Number.isFinite(n) && n >= 0 ? n : OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT
+  if (!(Number.isFinite(n) && n >= 0)) return OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT
+  return Math.min(n, OBLIGATION_ESCALATE_SETTLE_MS_MAX)
 }
 
 export interface EscalationStalenessDeps {
@@ -93,6 +144,8 @@ export interface EscalationStalenessDeps {
     sinceMs: number,
     threadId?: number | null,
   ) => boolean
+  /** The router's explicit-thread override record (answer-route-overrides.ts). */
+  routeOverrides: Pick<AnswerRouteOverrides, 'routedThreadsSince'>
 }
 
 export interface EscalationStalenessObligation {
@@ -101,40 +154,59 @@ export interface EscalationStalenessObligation {
   threadId?: number | null
 }
 
+/** How the answer was found — carried into the sweep's log so a reroute-scope
+ *  hit is distinguishable from a plain same-topic hit in production. */
+export type AnsweredVia = 'thread' | 'reroute'
+
+export interface AnsweredSinceOpenResult {
+  answered: boolean
+  via: AnsweredVia | null
+  /** The thread the reroute-scope hit was found in. Only set when `via` is 'reroute'. */
+  routedThreadId?: number | null
+}
+
 /**
- * True when a substantive outbound was delivered to the obligation's CHAT since
- * it was opened — i.e. the agent answered and the nudge would be redundant.
+ * True when a substantive outbound that can be tied to THIS obligation was
+ * delivered since it was opened — i.e. the agent answered and the nudge would be
+ * redundant.
  *
- * Scope is the chat, not the thread. A thread-scoped hit is a strict subset of a
- * chat-scoped hit, so this is the thread check plus the cross-topic fallback the
- * router's `EXPLICIT_OVERRIDDEN(model→N,routed→M)` reroutes demand.
+ * Two scopes, in order:
  *
- * The widening is deliberate but is NOT unbounded: it is still floored by the
- * caller's substantive-length threshold (200 chars in the escalate branch, so a
- * bare ack never stands an escalation down) and by `openedAt`. The residual
- * risk it accepts is a busy multi-topic chat where a long answer to topic B
- * suppresses the nag for an unanswered obligation in topic A. That trade is
- * correct here: the escalate branch only runs after the whole re-present ladder
- * has been exhausted (minutes of re-asking), and a false nag on top of a
- * delivered answer is the user-visible defect, whereas a suppressed nag merely
- * loses one advisory the re-present ladder already made several times.
+ *   1. THREAD — the obligation's own topic. The precise, pre-existing check.
+ *      (An obligation with `threadId === undefined` — a DM, or a turn the
+ *      gateway never resolved a topic for — has always meant "any thread" to
+ *      `hasOutboundDeliveredSince`; that is unchanged.)
+ *   2. REROUTE — only the topics the router RECORDED an answer addressed to this
+ *      obligation's topic as having been routed to
+ *      (`EXPLICIT_OVERRIDDEN(model→N,routed→M)`, since `openedAt`). No override
+ *      on record ⇒ no second query ⇒ an unrelated message in another topic can
+ *      never stand this escalation down. See the module header for the field
+ *      case where a chat-wide fallback would have got that wrong.
  *
- * Falls back to `false` (never suppresses) when history is unavailable.
+ * Both scopes keep the caller's substantive-length floor (200 chars in the
+ * escalate branch, so a bare ack never stands an escalation down) and the
+ * `openedAt` cutoff.
+ *
+ * Falls back to "not answered" (never suppresses) when history is unavailable.
  */
 export function answeredSinceOpen(
   o: EscalationStalenessObligation,
   deps: EscalationStalenessDeps,
-): boolean {
-  if (!deps.historyEnabled) return false
-  // Thread scope first — the precise answer when the reply landed where the
-  // obligation lives. Chat scope second — the cross-topic reroute fallback.
-  if (
-    o.threadId !== undefined &&
-    deps.hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)
-  ) {
-    return true
+): AnsweredSinceOpenResult {
+  const NOT_ANSWERED: AnsweredSinceOpenResult = { answered: false, via: null }
+  if (!deps.historyEnabled) return NOT_ANSWERED
+  if (deps.hasOutboundDeliveredSince(o.chatId, o.openedAt, o.threadId)) {
+    return { answered: true, via: 'thread' }
   }
-  return deps.hasOutboundDeliveredSince(o.chatId, o.openedAt)
+  for (const routed of deps.routeOverrides.routedThreadsSince(o.chatId, o.threadId, o.openedAt)) {
+    // `routed` is already the history's thread semantics: a number for a topic,
+    // `null` for the chat root (`thread_id IS NULL`). Never `undefined`, which
+    // would re-open the chat-wide any-thread query this guard exists to avoid.
+    if (deps.hasOutboundDeliveredSince(o.chatId, o.openedAt, routed)) {
+      return { answered: true, via: 'reroute', routedThreadId: routed }
+    }
+  }
+  return NOT_ANSWERED
 }
 
 export interface EscalationSettleGate {
@@ -142,9 +214,16 @@ export interface EscalationSettleGate {
    * Called each time the sweep reaches the escalate decision for `id` and the
    * staleness check said "not answered". Returns true to DEFER (leave the
    * obligation open; a later sweep re-checks), false to proceed with the nudge.
+   *
+   * `openedAt` is the obligation's open instant, carried as an EPOCH: an
+   * obligation closed and later RE-OPENED under the same origin turn id gets a
+   * new `openedAt`, and a mismatch resets the window — so a stale entry from the
+   * previous episode can never let the new one's first escalation skip its
+   * re-check.
    */
-  shouldDefer(id: string, now: number): boolean
-  /** Forget `id` — call on every terminal (silent close, escalation driven). */
+  shouldDefer(id: string, now: number, openedAt: number): boolean
+  /** Forget `id` — call on EVERY obligation terminal (silent close, cancel,
+   *  escalation driven), so the map never retains closed obligations. */
   clear(id: string): void
   /** Live entry count. Test/diagnostic surface. */
   size(): number
@@ -164,40 +243,45 @@ export interface EscalationSettleGate {
  * a genuinely unanswered obligation still escalates one settle window later.
  * `settleMs <= 0` disables the gate (never defers).
  *
- * The id map is LRU-bounded so a long-lived gateway cannot grow it without
- * limit. Ids are per-message origin turn ids, so an evicted entry can only ever
- * cost one extra settle window, never a wrong decision for another obligation.
+ * The id map is bounded and evicted oldest-INSERTED-first (FIFO — entries are
+ * not re-inserted on access, so this is deliberately not an LRU) so a long-lived
+ * gateway cannot grow it without limit. Ids are per-obligation origin turn ids,
+ * so an evicted entry can only ever cost one extra settle window, never a wrong
+ * decision for another obligation.
  */
 export function createEscalationSettleGate(
   settleMs: number,
   maxKeys = 256,
 ): EscalationSettleGate {
-  const firstDecidedAt = new Map<string, number>()
+  const entries = new Map<string, { firstAt: number; openedAt: number }>()
   return {
-    shouldDefer(id: string, now: number): boolean {
+    shouldDefer(id: string, now: number, openedAt: number): boolean {
       if (!(settleMs > 0)) return false
-      const first = firstDecidedAt.get(id)
-      if (first == null) {
-        firstDecidedAt.set(id, now)
-        if (firstDecidedAt.size > maxKeys) {
-          const oldest = firstDecidedAt.keys().next().value
-          if (oldest !== undefined) firstDecidedAt.delete(oldest)
+      const prev = entries.get(id)
+      // Absent, or belonging to a PREVIOUS episode of the same origin id →
+      // start a fresh window.
+      if (prev == null || prev.openedAt !== openedAt) {
+        entries.set(id, { firstAt: now, openedAt })
+        while (entries.size > maxKeys) {
+          const oldest = entries.keys().next().value
+          if (oldest === undefined) break
+          entries.delete(oldest)
         }
         return true
       }
       // A clock that jumped backwards must not pin the gate open forever:
       // re-anchor and defer exactly one more window.
-      if (now < first) {
-        firstDecidedAt.set(id, now)
+      if (now < prev.firstAt) {
+        entries.set(id, { firstAt: now, openedAt })
         return true
       }
-      return now - first < settleMs
+      return now - prev.firstAt < settleMs
     },
     clear(id: string): void {
-      firstDecidedAt.delete(id)
+      entries.delete(id)
     },
     size(): number {
-      return firstDecidedAt.size
+      return entries.size
     },
   }
 }
