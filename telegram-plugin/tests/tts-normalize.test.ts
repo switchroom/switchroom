@@ -184,6 +184,120 @@ describe('numbers', () => {
       'rename class5 and my5thing',
     )
   })
+
+  // Regression: unit-suffix lookbehind + case sensitivity. Corpus in
+  // /tmp/claude-0/tts/corpus.json (1,679 samples of ALREADY-NORMALIZED
+  // production output, not raw input): 146 samples already carry the
+  // shipped mangle artifact this fix removes, 53 carry an unfixed decimal/
+  // comma+unit token (see the "known gap" test below), and 61 samples
+  // change under this fix. A decimal seconds value like "0.17s" was matched
+  // by \b re-anchoring between the "." and the following digits, so "17s"
+  // alone got read as "seventeen seconds" and split the decimal apart; and
+  // the /i flag let a bare capital letter (money shorthand "5M", a memory
+  // size "4G", a product name "4080S") match a single-letter unit
+  // alternative it was never meant to.
+  test('decimal seconds survive intact — no mid-decimal unit match', () => {
+    expect(normalizeForTts('latency was 0.17s')).toBe('latency was 0.17s')
+    expect(normalizeForTts('took 1.5s to load')).toBe('took 1.5s to load')
+    expect(normalizeForTts('waited 2.25s')).toBe('waited 2.25s')
+    expect(normalizeForTts('under 0.9s')).toBe('under 0.9s')
+  })
+
+  // KNOWN GAP (disclosed, not fixed in this hotfix — see the comment above
+  // the unit-suffix regex in tts-normalize.ts): a decimal- or comma-glued
+  // number+unit token is now left completely unexpanded (unit unspoken)
+  // rather than mangled. This is a real, measured trade-off — corpus
+  // samples carrying an unspoken digit-adjacent unit go 65 → 122 (61
+  // samples change, every one gaining an unspoken unit) — pinned here as
+  // the baseline a future decimal-expansion pass should move.
+  test('KNOWN GAP: decimal/comma-glued number+unit is left unexpanded, not mangled', () => {
+    expect(normalizeForTts('free: 13.0 GB')).toBe('free: 13.0 GB')
+    expect(normalizeForTts('weighs 89.5g')).toBe('weighs 89.5g')
+    expect(normalizeForTts('ran for 27.5 s')).toBe('ran for 27.5 s')
+    expect(normalizeForTts('paused 9.5 min')).toBe('paused 9.5 min')
+    expect(normalizeForTts('spread over 0.7-0.8 m')).toBe('spread over 0.7-0.8 m')
+  })
+
+  // MINOR: comma leak — same defect class as the decimal lookbehind, closed
+  // in the same lookbehind by also excluding `,`. Before this: "1,500s" →
+  // "1,five hundred seconds", "12,000s" → "12,zero seconds", "1,024MB" →
+  // "1,twenty-four megabytes". The lookbehind is adjacency-only so an
+  // ordinary sentence comma ("wait, 5s") still expands correctly — only a
+  // digit glued directly to the comma is blocked.
+  test('comma-glued numbers are left unmangled; a sentence comma still expands', () => {
+    expect(normalizeForTts('rate limited: 1,500s')).toBe('rate limited: 1,500s')
+    expect(normalizeForTts('timeout after 12,000s')).toBe('timeout after 12,000s')
+    expect(normalizeForTts('buffer is 1,024MB')).toBe('buffer is 1,024MB')
+    expect(normalizeForTts('wait, 5s')).toBe('wait, five seconds')
+  })
+
+  test('whole-number seconds still expand: 90s → ninety seconds', () => {
+    expect(normalizeForTts('done in 90s')).toBe('done in ninety seconds')
+  })
+
+  test('units unaffected by the case-sensitivity fix: 500ms, 5MB, 2GB, 16 m', () => {
+    expect(normalizeForTts('took 500ms')).toBe('took five hundred milliseconds')
+    expect(normalizeForTts('file is 5MB')).toBe('file is five megabytes')
+    expect(normalizeForTts('disk has 2GB')).toBe('disk has two gigabytes')
+    expect(normalizeForTts('ran 16 m')).toBe('ran sixteen metres')
+  })
+
+  test('bare capital M never reads as minutes/metres (money shorthand, corpus)', () => {
+    expect(normalizeForTts('Revenue was 5M this year')).toBe(
+      'Revenue was 5M this year',
+    )
+    // Pre-existing quirk, not introduced or fixed here: the currency regex
+    // consumes "$5" before the unit pass ever sees the dangling "M", so this
+    // never read as "minutes" even on unpatched main — pin the ACTUAL output
+    // instead of an assertion that can't fail in either direction.
+    expect(normalizeForTts('raised $5M in the round')).toBe(
+      'raised five dollarsM in the round',
+    )
+  })
+
+  test('HTTP-status-shaped input adjacent to a capital letter is not read as a duration', () => {
+    expect(normalizeForTts('a 503M error occurred')).toBe(
+      'a 503M error occurred',
+    )
+    expect(normalizeForTts('status 503M')).toBe('status 503M')
+  })
+
+  // Corpus wins from the case-sensitivity split (22 samples improved, 14 of
+  // them "G" memory sizes wrongly read as GRAMS, plus an RTX "4080S" wrongly
+  // read as a duration). These already passed after the original fix but
+  // were previously unpinned.
+  test('single-letter units case-split: bare capitals stay untouched (was misread pre-fix)', () => {
+    expect(normalizeForTts('done in 5S')).toBe('done in 5S')
+    expect(normalizeForTts('wait 3H')).toBe('wait 3H')
+    expect(normalizeForTts('ships in 10D')).toBe('ships in 10D')
+    expect(normalizeForTts('needs 2G')).toBe('needs 2G')
+    expect(normalizeForTts('ran 16 M')).toBe('ran 16 M')
+  })
+
+  test('memory-size "G" no longer read as grams (corpus: 4G/12G/97G)', () => {
+    expect(normalizeForTts('upgrade to 4G')).toBe('upgrade to 4G')
+    expect(normalizeForTts('needs 12G')).toBe('needs 12G')
+    expect(normalizeForTts('disk has 97G')).toBe('disk has 97G')
+  })
+
+  test('product name "4080S" (RTX 4080 Super) not read as a duration', () => {
+    expect(normalizeForTts('bought a 4080S')).toBe('bought a 4080S')
+  })
+})
+
+describe('composed pipeline: normalizeForTts(normalizeForSpeech(x))', () => {
+  // Fleet-critical, previously unguarded: production always composes pass 1
+  // (voice-normalize-text.ts, NO \s? between number and unit, "m" → minute)
+  // with pass 2 (tts-normalize.ts, optional \s?, "m" → metre). The
+  // minute-vs-metre reading is an EMERGENT property of that composition, not
+  // a property either pass exhibits alone.
+  test('glued "5m" reads as minutes (pass 1 claims it first, no space)', () => {
+    expect(normalizeForTts(normalizeForSpeech('run 5m'))).toBe('run five minutes')
+  })
+
+  test('spaced "16 m" reads as metres (pass 1 has no \\s?, so pass 2 claims it)', () => {
+    expect(normalizeForTts(normalizeForSpeech('ran 16 m'))).toBe('ran sixteen metres')
+  })
 })
 
 describe('URLs', () => {

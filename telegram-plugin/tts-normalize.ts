@@ -350,16 +350,54 @@ export function normalizeForTts(text: string): string {
 
   // -- Number + unit suffix glued to the number (500ms, 5km, 10GB). Only a
   //    known unit bounded by a non-letter, so identifiers never match.
+  //
+  //    The leading `(?<![\d.,])` lookbehind is load-bearing: without it
+  //    `\b` is satisfied between a decimal point (or thousands comma) and
+  //    the digits that follow, so "17s" inside "0.17s" — or "500s" inside
+  //    "1,500s" — would match on its own and mangle the number ("0.17s" →
+  //    "0.seventeen seconds"; "1,500s" → "1,five hundred seconds"). Excludes
+  //    both `.` and `,` so a glued decimal/thousands-separated number is
+  //    never re-anchored on. Multi-letter units (ms, GB, …) stay
+  //    case-insensitive since `5MB`/`500ms` must keep working regardless of
+  //    case; single-letter units (s, m, h, d, g) are matched
+  //    case-sensitively lowercase-only in a second pass — the single letter
+  //    "M" is one keystroke from meaning "million" in prose ("$5M",
+  //    "Revenue was 5M") and must never fall through to "minutes" just
+  //    because the whole alternation ran under /i.
+  //
+  //    KNOWN GAP, disclosed deliberately (2026-08, hotfix for #2760-derived
+  //    corpus regression): a decimal- or comma-glued number with a unit
+  //    (27.5s, 1,500s, 89.5g, 0.7-0.8m) is now left completely UNEXPANDED —
+  //    the unit goes unspoken — rather than mangled the way it was before.
+  //    Corpus-measured: samples carrying a digit-adjacent unspoken unit go
+  //    65 → 122 (61 samples change under this fix, every one gaining an
+  //    unspoken unit). Correctly expanding a decimal/comma-glued number is
+  //    explicitly out of scope for this narrow hotfix — see the pinning
+  //    tests below (13.0 GB / 89.5g / 27.5 s) marking the baseline for a
+  //    follow-up decimal-expansion pass.
+  //
+  //    ASYMMETRY WITH pass 1 (voice-normalize-text.ts), pre-existing and
+  //    NOT introduced by this fix: this pass allows an optional space
+  //    (`\s?`) between the number and the unit and maps `m` to METRE; pass
+  //    1 has no `\s?` and maps `m` to MINUTE. That accident is exactly what
+  //    makes "5m" (no space) come out of pass 1 as minutes and "16 m"
+  //    (space) come out of pass 2 as metres in the composed pipeline —
+  //    pinned by the composed-pipeline test in the test suite.
+  const unitReplacer = (m: string, num: string, unitRaw: string): string => {
+    const unit = UNIT_MAP[unitRaw.toLowerCase()]
+    if (!unit) return m
+    const n = Number(num)
+    const w = numberToWords(n)
+    if (!w) return m
+    return `${w} ${n === 1 ? unit.s : unit.p}`
+  }
   s = s.replace(
-    /\b(\d{1,9})\s?(ms|sec|min|km|cm|mm|kg|kb|mb|gb|tb|ghz|mhz|hr|mi|s|m|h|d|g)(?![a-z])/gi,
-    (m, num: string, unitRaw: string) => {
-      const unit = UNIT_MAP[unitRaw.toLowerCase()]
-      if (!unit) return m
-      const n = Number(num)
-      const w = numberToWords(n)
-      if (!w) return m
-      return `${w} ${n === 1 ? unit.s : unit.p}`
-    },
+    /(?<![\d.,])\b(\d{1,9})\s?(ms|sec|min|km|cm|mm|kg|kb|mb|gb|tb|ghz|mhz|hr|mi)(?![a-zA-Z])/gi,
+    unitReplacer,
+  )
+  s = s.replace(
+    /(?<![\d.,])\b(\d{1,9})\s?(s|m|h|d|g)(?![a-zA-Z])/g,
+    unitReplacer,
   )
 
   // -- Symbols in prose.

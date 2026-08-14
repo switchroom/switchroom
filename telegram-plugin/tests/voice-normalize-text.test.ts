@@ -193,6 +193,95 @@ describe('normalizeForSpeech — numbers, units & symbols', () => {
     expect(normalizeForSpeech('my5thing works')).toBe('my5thing works')
     expect(normalizeForSpeech('class5 room')).toBe('class5 room')
   })
+
+  // Regression: unit-suffix lookbehind + case sensitivity. Corpus in
+  // /tmp/claude-0/tts/corpus.json (1,679 samples of ALREADY-NORMALIZED
+  // production output, not raw input): 146 samples already carry the
+  // shipped mangle artifact this fix removes, 53 carry an unfixed decimal/
+  // comma+unit token (see the "known gap" test below), and 61 samples
+  // change under this fix. A decimal seconds value like "0.17s" was matched
+  // by \b re-anchoring between the "." and the following digits, so "17s"
+  // alone got read as "seventeen seconds" and split the decimal apart; and
+  // the /i flag let a bare capital letter (money shorthand "5M", a memory
+  // size "4G", a product name "4080S") match a single-letter unit
+  // alternative it was never meant to.
+  it('decimal seconds survive intact — no mid-decimal unit match', () => {
+    expect(normalizeForSpeech('latency was 0.17s')).toBe('latency was 0.17s')
+    expect(normalizeForSpeech('took 1.5s to load')).toBe('took 1.5s to load')
+    expect(normalizeForSpeech('waited 2.25s')).toBe('waited 2.25s')
+    expect(normalizeForSpeech('under 0.9s')).toBe('under 0.9s')
+  })
+
+  // KNOWN GAP (disclosed, not fixed in this hotfix — see the comment above
+  // the unit-suffix regex in voice-normalize-text.ts): a decimal- or
+  // comma-glued number+unit token is now left completely unexpanded (unit
+  // unspoken) rather than mangled. Measured: samples carrying an unspoken
+  // digit-adjacent unit go 65 → 122 across the corpus (61 samples change,
+  // every one gaining an unspoken unit) — pinned here as the baseline a
+  // future decimal-expansion pass should move.
+  it('KNOWN GAP: decimal/comma-glued number+unit is left unexpanded, not mangled', () => {
+    expect(normalizeForSpeech('free: 13.0 GB')).toBe('free: 13.0 GB')
+    expect(normalizeForSpeech('weighs 89.5g')).toBe('weighs 89.5g')
+    expect(normalizeForSpeech('ran for 27.5 s')).toBe('ran for 27.5 s')
+    expect(normalizeForSpeech('paused 9.5 min')).toBe('paused 9.5 min')
+  })
+
+  // MINOR: comma leak — same defect class as the decimal lookbehind, closed
+  // in the same lookbehind by also excluding `,`. Before this: "1,500s" →
+  // "1,five hundred seconds", "12,000s" → "12,zero seconds", "1,024MB" →
+  // "1,twenty-four megabytes". The lookbehind is adjacency-only so an
+  // ordinary sentence comma ("wait, 5s") still expands correctly — only a
+  // digit glued directly to the comma is blocked.
+  it('comma-glued numbers are left unmangled; a sentence comma still expands', () => {
+    expect(normalizeForSpeech('rate limited: 1,500s')).toBe('rate limited: 1,500s')
+    expect(normalizeForSpeech('timeout after 12,000s')).toBe('timeout after 12,000s')
+    expect(normalizeForSpeech('buffer is 1,024MB')).toBe('buffer is 1,024MB')
+    expect(normalizeForSpeech('wait, 5s')).toBe('wait, five seconds')
+  })
+
+  it('whole-number seconds still expand: 90s → ninety seconds', () => {
+    expect(normalizeForSpeech('done in 90s')).toBe('done in ninety seconds')
+  })
+
+  it('units unaffected by the case-sensitivity fix: 500ms, 5MB, 2GB', () => {
+    expect(normalizeForSpeech('took 500ms')).toBe('took five hundred milliseconds')
+    expect(normalizeForSpeech('a 5MB image')).toBe('a five megabytes image')
+    expect(normalizeForSpeech('a 2GB dump')).toBe('a two gigabytes dump')
+    expect(normalizeForSpeech('run 5m')).toBe('run five minutes')
+  })
+
+  it('bare capital M never reads as minutes (money shorthand, corpus)', () => {
+    expect(normalizeForSpeech('Revenue was 5M this year')).toBe(
+      'Revenue was 5M this year',
+    )
+    // Pre-existing quirk, not introduced or fixed here: the currency regex
+    // consumes "$5" before the unit pass ever sees the dangling "M", so this
+    // never read as "minutes" even on unpatched main — pin the ACTUAL output
+    // instead of an assertion that can't fail in either direction.
+    expect(normalizeForSpeech('raised $5M in the round')).toBe(
+      'raised five dollarsM in the round',
+    )
+  })
+
+  it('HTTP-status-shaped input adjacent to a capital letter is not read as a duration', () => {
+    expect(normalizeForSpeech('a 503M error occurred')).toBe(
+      'a 503M error occurred',
+    )
+    expect(normalizeForSpeech('status 503M')).toBe('status 503M')
+  })
+
+  // Corpus wins from the case-sensitivity split (22 samples improved fleet-
+  // wide across both passes, 14 of them "G" memory sizes wrongly read via
+  // pass 2 as GRAMS, plus an RTX "4080S" wrongly read as a duration).
+  // Pass 1 has no "g" in its own UNIT_MAP, so these were already inert here
+  // pre-fix; pinned to lock in the no-op and guard the composed pipeline
+  // (see tts-normalize.test.ts for the pass-2 "grams"/"4080S" regression).
+  it('single-letter units case-split: bare capitals stay untouched', () => {
+    expect(normalizeForSpeech('done in 5S')).toBe('done in 5S')
+    expect(normalizeForSpeech('wait 3H')).toBe('wait 3H')
+    expect(normalizeForSpeech('ships in 10D')).toBe('ships in 10D')
+    expect(normalizeForSpeech('bought a 4080S')).toBe('bought a 4080S')
+  })
 })
 
 describe('normalizeForSpeech — abbreviations (phase 2)', () => {
