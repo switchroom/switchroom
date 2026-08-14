@@ -216,10 +216,6 @@ describe('captureSpeechText', () => {
   })
 
   describe('M2: observability — never silent for the full 7-day window', () => {
-    afterEach(() => {
-      vi.useRealTimers()
-    })
-
     it('logs one stderr line the first time capture actually fires, not on every call', () => {
       const stateDir = freshDir()
       const spy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
@@ -247,8 +243,14 @@ describe('captureSpeechText', () => {
     })
 
     it('logs a write-failure line on the first failure, then rate-limits further failures', () => {
-      vi.useFakeTimers()
-      vi.setSystemTime(0)
+      // Manual Date.now mocking, NOT vi.useFakeTimers()/vi.setSystemTime():
+      // this file runs under both vitest AND `bun test` (telegram-plugin's
+      // bun-test-ci.sh substring-matches the whole tests/ dir), and bun's
+      // vitest shim does not implement `vi.setSystemTime` — see
+      // progress-update.test.ts's note on the same gotcha (CI build #48).
+      // `vi.spyOn` + `mockImplementation` works under both runners.
+      let mockNow = 0
+      const dateSpy = vi.spyOn(Date, 'now').mockImplementation(() => mockNow)
       const parent = freshDir()
       const stateDir = join(parent, 'not-a-directory')
       writeFileSync(stateDir, 'not a directory')
@@ -256,17 +258,18 @@ describe('captureSpeechText', () => {
       try {
         captureSpeechText('one', { enabled: true, stateDir })
         captureSpeechText('two', { enabled: true, stateDir })
-        vi.setSystemTime(1000) // 1s later — still inside the rate-limit window
+        mockNow = 1000 // 1s later — still inside the rate-limit window
         captureSpeechText('three', { enabled: true, stateDir })
         const failLines = spy.mock.calls.filter((c) => String(c[0]).includes('speech-capture: write failed'))
         expect(failLines).toHaveLength(1)
 
-        vi.setSystemTime(6 * 60_000) // past the 5-minute window
+        mockNow = 6 * 60_000 // past the 5-minute window
         captureSpeechText('four', { enabled: true, stateDir })
         const failLinesAfter = spy.mock.calls.filter((c) => String(c[0]).includes('speech-capture: write failed'))
         expect(failLinesAfter).toHaveLength(2)
       } finally {
         spy.mockRestore()
+        dateSpy.mockRestore()
       }
     })
   })
