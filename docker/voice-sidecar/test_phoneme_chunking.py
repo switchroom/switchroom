@@ -348,7 +348,10 @@ class LossyPathIsLoudTests(unittest.TestCase):
 
         self.assertEqual(meta["unchunkedPieces"], 1)
         self.assertTrue(
-            any("WARNING" in line and "DISCARDED" in line for line in self.logged),
+            any(
+                "WARNING" in line and "could not phonemize" in line
+                for line in self.logged
+            ),
             msg=f"no loud log emitted; got {self.logged!r}",
         )
 
