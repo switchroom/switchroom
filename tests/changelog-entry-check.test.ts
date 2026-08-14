@@ -63,7 +63,7 @@ interface Fixture {
   /** As `git`, but non-throwing — returns the exit status and both streams. */
   gitTry: (args: string[]) => { status: number; stdout: string; stderr: string };
   /** Run the real guard over `main...HEAD`; returns exit code + output. */
-  check: (env?: Record<string, string>) => { code: number; out: string };
+  check: (env?: Record<string, string | undefined>) => { code: number; out: string };
 }
 
 function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG): Fixture {
@@ -86,6 +86,11 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
   delete env.GITHUB_BASE_REF;
   delete env.CHANGELOG_PR_BODY;
   delete env.CHANGELOG_PR_LABELS;
+  // `check()` injects `CHANGELOG_BASE: "main"` by default; deleting it here is
+  // what lets a caller pass `CHANGELOG_BASE: undefined` to get it GENUINELY
+  // unset (the `pull_request` shape, where the guard must fall through its
+  // candidate cascade) rather than merely set to an empty string.
+  delete env.CHANGELOG_BASE;
 
   const git = (args: string[]) =>
     execFileSync("git", args, { cwd: dir, encoding: "utf-8", env: env as NodeJS.ProcessEnv });
@@ -134,10 +139,19 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
       return sha;
     },
     check(extraEnv = {}) {
+      const merged: Record<string, string | undefined> = {
+        ...env,
+        CHANGELOG_BASE: "main",
+        ...extraEnv,
+      };
+      // An explicit `undefined` DELETES the key rather than passing the string
+      // "undefined" through to the child, so a test can pin the genuinely-unset
+      // case and not just the set-to-garbage one.
+      for (const [k, v] of Object.entries(merged)) if (v === undefined) delete merged[k];
       const r = spawnSync(process.execPath, [CHECK], {
         cwd: dir,
         encoding: "utf-8",
-        env: { ...env, CHANGELOG_BASE: "main", ...extraEnv } as NodeJS.ProcessEnv,
+        env: merged as NodeJS.ProcessEnv,
       });
       return { code: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
     },
@@ -508,26 +522,8 @@ describe("check-changelog-entry — non-vacuity", () => {
     expect(r.out).toContain("COMMIT it first");
   });
 
-  it("FAILs when merge_group sets a base ref that does not resolve", () => {
-    // A workflow that stops surfacing merge_group.base_sha correctly must break
-    // loudly. Skipping here would silently restore the original blind spot.
-    //
-    // NOTE: no `branch -m main detached-away` here on purpose. Renaming `main`
-    // away made EVERY candidate unresolvable, so this test used to pass via the
-    // generic no-base path and never exercised the stated guarantee at all —
-    // it stayed green against a build where the cascade silently rescued the
-    // queue ref with `origin/main`.
-    const f = makeFixture("changelog-mg-badbase-");
-    f.writeFile("src/feature.ts", "export const feature = 2;\n");
-    f.commit("feat: ship on a queue ref");
-
-    const r = f.check({
-      GITHUB_EVENT_NAME: "merge_group",
-      CHANGELOG_BASE: "does-not-exist-ref",
-    });
-    expect(r.code).toBe(1);
-    expect(r.out).toContain("merge_group base ref is unresolvable");
-  });
+  // NOTE: the unresolvable-queue-base case is NOT duplicated here. It lives in
+  // "the queue-ref base is authoritative" below, which is its subject.
 
   it("ci-lint.yml surfaces merge_group.base_sha as $CHANGELOG_BASE", () => {
     // Without this env line the queue-side placement check has no base and the
@@ -601,6 +597,76 @@ describe("check-changelog-entry — a fenced code block is not a section boundar
     const r = f.check();
     expect(r.out).toContain("## Unreleased grew");
   });
+
+  it("still FLAGS a buried entry when a fence contains an unterminated `<!--`", () => {
+    // The fail-OPEN twin of the case above, and the reason the two masks had to
+    // become ONE stateful pass. Masking HTML comments FIRST let an unterminated
+    // `<!--` *inside* a fence pair with any `-->` appearing later in prose; the
+    // comment mask blanked the fence's own CLOSING ``` on the way, the fence ran
+    // to EOF, every heading below it vanished, and the placement rule reported a
+    // confident OK over a genuinely BURIED entry. Per CommonMark the `<!--` is
+    // code and the fence closes normally. Non-vacuity: this test FAILS (exit 0,
+    // no "ALREADY-RELEASED") against the two-pass `maskFencedCode(maskHtmlComments(x))`
+    // shape and passes only with the interleaved pass.
+    const TRAP = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "- **Earlier entry (#0):** the broken template we hit:",
+      "",
+      "```html",
+      "<!-- unterminated on purpose",
+      "```",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** an --> arrow in prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-fence-comment-", TRAP);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      `${TRAP}- **BURIED ENTRY (#2):** appended under the RELEASED heading.\n`,
+    );
+    f.commit("feat: ship code and bury the entry under a released heading");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("ALREADY-RELEASED");
+    expect(r.out).toContain("BURIED ENTRY (#2)");
+    expect(r.out).toContain("## v0.20.11");
+  });
+
+  it("WARNs when a code fence is left open at end-of-file", () => {
+    // CommonMark-correct — an unclosed fence runs to EOF — but it means every
+    // `## ` heading below it is code, so the placement rule inspects nothing
+    // down there. That must not read as a confident OK.
+    const UNCLOSED = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "- **Earlier entry (#0):** pasting output and forgetting to close it:",
+      "",
+      "```",
+      "oops, never closed",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-unclosed-fence-", UNCLOSED);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile("CHANGELOG.md", `${UNCLOSED}- **Branch entry (#2):** staged.\n`);
+    f.commit("feat: ship code with an unclosed fence in the changelog");
+
+    const r = f.check();
+    expect(r.out).toContain("code fence opened at line 7 that is never closed");
+    expect(r.out).toContain("the placement rule cannot see anything past it");
+  });
 });
 
 describe("check-changelog-entry — the queue-ref base is authoritative", () => {
@@ -631,9 +697,42 @@ describe("check-changelog-entry — the queue-ref base is authoritative", () => 
     f.writeFile("src/feature.ts", "export const feature = 2;\n");
     f.commit("feat: ship on a queue ref");
 
-    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "" });
+    // Both shapes: the variable absent from the environment entirely, and the
+    // GitHub-Actions shape where `${{ github.event.merge_group.base_sha }}`
+    // interpolates to the empty string off a queue ref.
+    for (const CHANGELOG_BASE of [undefined, ""]) {
+      const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE });
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("merge_group ran with no base ref");
+    }
+  });
+
+  it("does NOT apply the authoritative-base rule off the queue: $CHANGELOG_BASE unset still enforces", () => {
+    // The mirror of the two above, and the one that would break a legitimate PR
+    // rather than let a bad one through. On `pull_request` the guard has no
+    // authoritative base to be handed, so it MUST fall through its candidate
+    // cascade (origin/main → main) and keep enforcing. If the merge_group
+    // strictness ever leaks into this path — `if (!env.CHANGELOG_BASE) return
+    // {error:'missing-base'}` hoisted out of the `authoritativeBase` branch, or
+    // the `'main'` tail dropped from the candidate list — this run degrades into
+    // a vacuous SKIP and RULE 1 stops gating anything at all.
+    //
+    // `CHANGELOG_BASE: undefined` here is genuinely unset, not empty-string:
+    // `makeFixture` deletes it from the inherited env and `check()` drops
+    // undefined-valued keys, so nothing reaches the child.
+    const f = makeFixture("changelog-cascade-unset-base-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.commit("feat: ship a feature but forget the changelog");
+
+    const r = f.check({ CHANGELOG_BASE: undefined });
     expect(r.code).toBe(1);
-    expect(r.out).toContain("merge_group ran with no base ref");
+    expect(r.out).toContain("check-changelog-entry: FAIL");
+    expect(r.out).toContain("src/feature.ts");
+    // Proof the cascade actually RESOLVED a base rather than passing vacuously:
+    // the only ways out without one are a SKIP (exit 0) or the merge_group
+    // missing-base FAIL, and this is neither.
+    expect(r.out).not.toContain("SKIP");
+    expect(r.out).not.toContain("no base ref");
   });
 });
 

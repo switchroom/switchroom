@@ -210,7 +210,7 @@ export function stripHtmlComments(text) {
 export function extractUnreleasedEntries(changelog) {
   // Mask (not strip) comments and fenced code so a `## ` line that is merely
   // PASTED OUTPUT inside a fence cannot truncate the section. See
-  // `maskFencedCode` for why that matters here.
+  // `maskNonProseWithState` for why that matters here.
   const text = maskNonProse(String(changelog).replace(/\r\n/g, '\n'))
   const lines = text.split('\n')
   let i = 0
@@ -244,75 +244,123 @@ export function unreleasedGrew(baseChangelog, headChangelog) {
 }
 
 /**
- * Blank out `<!-- ... -->` comment bodies WITHOUT changing the line count, so
- * a comment can be ignored while 1-based line numbers still address the real
- * file. `stripHtmlComments` deletes text and therefore shifts every subsequent
- * line — fine for the growth rule, useless for placement, which maps a diff's
- * new-file line numbers onto sections.
- * @param {string} text
- * @returns {string}
+ * Blank every `<!-- ... -->` pair inside a SINGLE line's text and report
+ * whether a comment is still open when the line ends.
+ * @param {string} s
+ * @returns {{masked: string, open: boolean}}
  */
-export function maskHtmlComments(text) {
-  return String(text).replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, ' '))
+function maskCommentsInLine(s) {
+  let out = ''
+  let i = 0
+  for (;;) {
+    const start = s.indexOf('<!--', i)
+    if (start === -1) return { masked: out + s.slice(i), open: false }
+    out += s.slice(i, start)
+    const end = s.indexOf('-->', start + 4)
+    if (end === -1) return { masked: out + ' '.repeat(s.length - start), open: true }
+    out += ' '.repeat(end + 3 - start)
+    i = end + 3
+  }
 }
 
 /**
- * Blank out the CONTENT of fenced code blocks (``` / ~~~), and the fence lines
- * themselves, WITHOUT changing the line count — same contract as
- * `maskHtmlComments`, for the same reason: 1-based line numbers must keep
- * addressing the real file.
+ * Blank everything that is not changelog PROSE — the CONTENT of fenced code
+ * blocks (``` / ~~~) and their fence lines, AND `<!-- ... -->` comment bodies —
+ * WITHOUT changing the line count, so 1-based line numbers keep addressing the
+ * real file. (`stripHtmlComments` deletes text and therefore shifts every
+ * subsequent line: fine for the growth rule, useless for placement, which maps a
+ * diff's new-file line numbers onto sections.)
  *
- * Why this is load-bearing: `## ` inside a fence is not a heading, it is text.
- * This repo's changelog style pastes CI transcripts and grep output verbatim
- * (CHANGELOG.md already carries 30+ fence markers), so a fenced line reading
- * `## v9.9.9 — sample output` is routine. A fence-blind parser turns that into a
- * phantom RELEASED section, and then EVERY entry appended after it — i.e. every
- * entry written the documented way, at the END of `## Unreleased` — reads as
- * landing under a released heading. That is not a one-PR false FAIL: once such a
- * block lands on main, the placement rule reds every subsequent PR, repo-wide,
+ * Why fence-awareness is load-bearing: `## ` inside a fence is not a heading, it
+ * is text. This repo's changelog style pastes CI transcripts and grep output
+ * verbatim (CHANGELOG.md already carries 30+ fence markers), so a fenced line
+ * reading `## v9.9.9 — sample output` is routine. A fence-blind parser turns that
+ * into a phantom RELEASED section, and then EVERY entry appended after it — i.e.
+ * every entry written the documented way, at the END of `## Unreleased` — reads
+ * as landing under a released heading. That is not a one-PR false FAIL: once such
+ * a block lands on main, the placement rule reds every subsequent PR, repo-wide,
  * until someone deletes the code block. It also truncates
  * `extractUnreleasedEntries`, so a genuinely-staged entry stops counting as
  * growth.
  *
+ * ONE interleaved pass, not two sequential masks, because the two constructs are
+ * mutually exclusive and whichever OPENS first swallows the other. Masking
+ * comments first (the shape this replaced) was fail-OPEN in the other direction:
+ * an unterminated `<!--` *inside* a fence — routine in a changelog that pastes
+ * HTML templates verbatim — paired with any `-->` appearing later in prose, and
+ * the comment mask blanked the fence's own CLOSING delimiter on the way. The
+ * fence then ran to EOF, every heading below it was masked away, `parseSections`
+ * saw only `## Unreleased`, and the placement rule reported OK on a genuinely
+ * BURIED entry. Per CommonMark that `<!--` is code and the fence closes normally.
+ * Masking fences first and comments second is not the fix either: a fence marker
+ * inside a real comment must NOT open a block, which only a single stateful pass
+ * gets right in both directions.
+ *
  * CommonMark rules, minus the cases a changelog will never hit: an opener is
  * three-or-more backticks/tildes indented at most 3 spaces; the closer is the
  * same character, at least as long, with nothing but whitespace after it.
+ *
  * @param {string} text
- * @returns {string}
+ * @returns {{text: string, unclosedFenceLine: number | null}}
+ *   `unclosedFenceLine` is the 1-based line of a fence that was never closed
+ *   before EOF. CommonMark says such a fence runs to the end of the document,
+ *   which silently blinds every section below it — correct, but worth a WARN, so
+ *   callers surface it rather than reporting a confident OK over a blind spot.
  */
-export function maskFencedCode(text) {
+export function maskNonProseWithState(text) {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n')
   const blank = (/** @type {string} */ l) => ' '.repeat(l.length)
-  /** @type {{char: string, len: number} | null} */
-  let open = null
-  return lines
-    .map((line) => {
-      const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
-      if (open === null) {
-        // An opening fence's info string may not contain a backtick (CommonMark).
-        if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
-          open = { char: m[1][0], len: m[1].length }
-          return blank(line)
-        }
-        return line
+  /** @type {{char: string, len: number, line: number} | null} */
+  let fence = null
+  let inComment = false
+  /** @type {string[]} */
+  const out = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+    if (fence !== null) {
+      // Inside a fence NOTHING else is markup: a `<!--` here is code, not a
+      // comment opener, so `inComment` cannot change.
+      if (m && m[1][0] === fence.char && m[1].length >= fence.len && m[2].trim() === '') {
+        fence = null
       }
-      if (m && m[1][0] === open.char && m[1].length >= open.len && m[2].trim() === '') {
-        open = null
+      out.push(blank(line))
+      continue
+    }
+    if (inComment) {
+      const idx = line.indexOf('-->')
+      if (idx === -1) {
+        out.push(blank(line))
+        continue
       }
-      return blank(line)
-    })
-    .join('\n')
+      // The comment closes mid-line. What follows on the SAME line is prose, but
+      // it cannot open a fence (an opener must start its own line, indented at
+      // most 3 spaces) — it may only open another comment.
+      const tail = maskCommentsInLine(line.slice(idx + 3))
+      inComment = tail.open
+      out.push(' '.repeat(idx + 3) + tail.masked)
+      continue
+    }
+    // An opening fence's info string may not contain a backtick (CommonMark).
+    if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+      fence = { char: m[1][0], len: m[1].length, line: i + 1 }
+      out.push(blank(line))
+      continue
+    }
+    const masked = maskCommentsInLine(line)
+    inComment = masked.open
+    out.push(masked.masked)
+  }
+  return { text: out.join('\n'), unclosedFenceLine: fence ? fence.line : null }
 }
 
 /**
- * Blank everything that is not changelog PROSE — HTML comments first (so a
- * fence marker inside a comment cannot open a spurious block), then fenced
- * code. Line-count preserving, so line numbers survive.
+ * `maskNonProseWithState`, text only — the shape every parser here wants.
  * @param {string} text
  * @returns {string}
  */
 export function maskNonProse(text) {
-  return maskFencedCode(maskHtmlComments(text))
+  return maskNonProseWithState(text).text
 }
 
 /**
@@ -326,7 +374,7 @@ export function maskNonProse(text) {
 export function parseSections(changelog) {
   // Fenced code and HTML comments are masked (line-count preserving) first: a
   // `## ` line inside a fence is pasted OUTPUT, not a section boundary. See
-  // `maskFencedCode`.
+  // `maskNonProseWithState`.
   const lines = maskNonProse(String(changelog).replace(/\r\n/g, '\n')).split('\n')
   /** @type {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]} */
   const sections = []
@@ -452,6 +500,18 @@ export function parseRemovedSectionKeys(diffText) {
  * iff its heading line was added AND the range did not remove a heading with
  * the same version token (the rename removes `## Unreleased`; the typo fix
  * removes `## v1.0.0 — teh cut`).
+ *
+ * KNOWN GAP, deliberately left open: because newness keys on the version TOKEN,
+ * an edit that changes the token ITSELF (`## v1.0.0-rc — x` → `## v1.0.0 — x`)
+ * still reads as a brand-new section and blanket-exempts everything under it, so
+ * an entry buried in that same section in that same range goes unreported. This
+ * is inherent to the heuristic, not a bug to patch: a released heading whose
+ * version token was rewritten is textually INDISTINGUISHABLE from a legitimately
+ * new section (which is exactly what the release PR's `## Unreleased` → `## vX.Y.Z`
+ * rename is), so closing it would trade a rare miss for a false FAIL on every
+ * release cut. The token rule is strictly better than the heading-line rule it
+ * replaced — it closes the common case (a typo fix in the heading's summary tail)
+ * — but it does not make the section-newness exemption airtight.
  *
  * @param {string} headChangelog CHANGELOG.md text at HEAD
  * @param {Set<number>} addedLineNumbers 1-based new-file line numbers
@@ -816,6 +876,19 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
 
   const baseChangelog = gitSoft(['show', `${mergeBase}:CHANGELOG.md`], cwd)
   const headChangelog = gitSoft(['show', `${range.head}:CHANGELOG.md`], cwd)
+
+  // A fence left open at EOF is CommonMark-correct — it runs to the end of the
+  // document — but it means every `## ` heading below it is masked away, so the
+  // placement rule inspects nothing down there and would otherwise report a
+  // confident OK over a blind spot. Say so rather than passing silently.
+  const unclosedFence = maskNonProseWithState(headChangelog).unclosedFenceLine
+  if (unclosedFence !== null) {
+    warnings.push(
+      `check-changelog-entry: WARN — CHANGELOG.md has a code fence opened at line ${unclosedFence} that is never closed.`,
+      '  Per CommonMark that fence runs to end-of-file, so every `## ` heading below it is code, not a',
+      '  section — the placement rule cannot see anything past it. Close the fence.',
+    )
+  }
 
   const commitMessages = gitSoft(['log', `--format=%B${RECORD}`, `${mergeBase}..${range.head}`], cwd)
     .split(RECORD)

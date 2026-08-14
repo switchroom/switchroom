@@ -79,7 +79,14 @@ now an anomaly worth investigating, not the norm.
   markers, and a fenced line reading `## v9.9.9 — sample output` used to become
   a phantom released section, which would then have red-flagged EVERY later PR
   appending to the end of `## Unreleased`, repo-wide, until the code block was
-  deleted; (2) on a queue ref `$CHANGELOG_BASE` is **authoritative, with no
+  deleted — fences and HTML comments are masked in ONE interleaved CommonMark
+  pass, because whichever construct opens first swallows the other: masking
+  comments first let an unterminated `<!--` *inside* a fence pair with any `-->`
+  later in prose, blanking the fence's own closing delimiter, so the fence ran to
+  EOF, every heading below it vanished and the guard reported OK over a genuinely
+  buried entry; a fence left genuinely unclosed at EOF is CommonMark-correct but
+  now WARNs, since it blinds the placement rule to everything past it; (2) on a
+  queue ref `$CHANGELOG_BASE` is **authoritative, with no
   `origin/main` fallback**, and both UNSET and set-but-unresolvable FAIL —
   previously the cascade always rescued it (on a `fetch-depth: 0` checkout
   `origin/main` always resolves), so a broken workflow silently diffed the
