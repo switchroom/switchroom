@@ -137,6 +137,12 @@ core:
   # SPAWNS gen-changelog-entry.mjs, and that script matched no glob in this file
   # at all, so a PR editing only it skipped the tests that cover it.
   - 'scripts/gen-changelog-entry.mjs'
+  # tests/check-no-pii-telegram-id.test.ts SPAWNS check-no-pii-secrets.mjs over
+  # throwaway git repos and asserts its exit codes + failure text, including the
+  # fail-closed paths. Same reason again — `scripts/check-*.mjs` is `lint`-only,
+  # so a PR that widened the sanctioned-id allowlist and nothing else would skip
+  # the very tests that prove the allowlist is not vacuous.
+  - 'scripts/check-no-pii-secrets.mjs'
   # The targeted mutation check. tests/mutation-guard.test.ts IMPORTS
   # scripts/mutation/{operators,run,restore-sentinel}.mjs directly and SPAWNS
   # check-mutation-coverage.mjs (asserting its exit code and failure text), and

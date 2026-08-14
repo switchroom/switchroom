@@ -17,121 +17,6 @@ now an anomaly worth investigating, not the norm.
 
 ### Bug fixes
 
-- **an obligation ESCALATION no longer nags on top of an answer the user
-  already received.** The escalate branch of the obligation sweep sends a
-  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
-  staleness check that is supposed to stand it down when the agent has already
-  answered. Two mechanisms let that check miss a delivered answer, and both fired
-  together on the two confirmed 2026-08-10 incidents. First it was keyed on the
-  obligation's *thread*, while the model can name a topic on its `reply` and have
-  the framework's topic authority override it — the router logs exactly that,
-  `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — so the answer is written to history
-  under a thread the check never queries (06:36:07.921
-  `EXPLICIT_OVERRIDDEN(model→4,routed→635)` for an obligation in thread 4, nag
-  126ms later; 07:52 the same shape with the answer routed to the chat root).
-  Second it is a point-in-time read, and the answer is often still *in flight* at
-  the instant the sweep decides — the reply tool has been invoked but no history
-  row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
-  07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
-  and adds a fallback to *only* the thread the router RECORDED an answer
-  addressed to this obligation's topic as having been routed to (new
-  `answer-route-overrides.ts`), reading history **only across that record's own
-  instant plus the match window** — bounded at *both* ends, so a delivery in the
-  routed topic can be paired with the record neither before it nor minutes after
-  it — and only while the record is itself **fresh** (settle window + two sweep
-  ticks = 18.5s at the default); and a new settle gate requires the "unanswered"
-  read to hold across an 8.5s window — derived as 3× the worst observed
-  decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
-  tick so a re-check actually runs — before the nudge goes out. All three
-  narrowings on the fallback are load-bearing, and each has a field
-  counter-example: a chat-wide "did anything long land in this chat" query has no
-  relationship to the obligation at all; an override-gated query cut at
-  `openedAt` is the same defect wearing a gate — on 2026-08-13 obligation
-  `…:4#5462` (thread 4, opened 03:50:02.807, escalated 04:03:06.140) it pairs a
-  stale `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an
-  unrelated 295-char delivery in thread 3 at 04:02:51.987 — a *different*
-  question's answer, 594.8s later — and closes a genuinely unanswered message in
-  silence; and an override-gated query cut at the record's own instant but left
-  *open-ended forward* is that same defect reached from the other side, because
-  freshness is judged at the first "unanswered" read while the history row is
-  read at the re-check, and the sweep can be starved for minutes in between (a
-  short reply rerouted to topic M at T+0 leaves the obligation correctly open,
-  an unrelated ≥200-char answer lands in M at T+90, and the sweep that finally
-  runs at T+107 closes the obligation `via=reroute`). That is the defect
-  `turn-flush-suppression.ts` was written to close, and the 2026-08-13 case
-  escalates correctly pre-fix, so either would have been a regression. Residual,
-  stated plainly: inside `[record, record + window]` the fallback still cannot
-  tell the rerouted answer from a second ≥200-char delivery landing in the same
-  thread in those few seconds — the override carries no message id. That interval
-  is fixed by the record's own timestamp, so a starved sweep cannot widen it.
-  Both guards stay bounded: a genuinely unanswered obligation still escalates one
-  settle window later (the 2026-08-12 case, whose real answer was 41s away, is
-  unaffected), and both windows are clamped so a config typo cannot silently
-  widen them. The freshness window is measured back from the settle gate's own
-  *first* "unanswered" read, not from whenever the re-check runs — the sweep's
-  earlier gates can skip ticks outright for minutes, and anchoring at the
-  re-check would let a starved sweep age a still-fresh record out of the window
-  and nag on top of the answer anyway — which is precisely why the *delivery*
-  needs its own forward bound: that anchor keeps the record readable across the
-  starvation gap, and without an upper bound the query would then reach across
-  the whole of it. Both paths are logged so the fallback is
-  measurable in production without a rebuild: a fallback-scope close logs
-  `via=reroute`, and a record the freshness bound *rejects* logs
-  `reroute record rejected age=…ms window=…ms`. New `escalation-staleness.ts`
-  carries the evidence and the derivation. Each guard has its OWN kill switch —
-  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` disables the settle gate (and only
-  the settle gate), `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the
-  reroute fallback (and only the fallback); set both for the pre-fix behaviour.
-  Both switches read only an explicit `0`: a whitespace-only value (`KEY=" "`,
-  which `Number()` coerces to `0`) is treated as unset, so a stray space in an
-  env file cannot silently turn a guard off.
-
-  The router's `answerRouteOverrides.note(...)` write is the whole premise of the
-  reroute fallback, and it is a side effect no pure module carries — so it is now
-  pinned by a test that drives the real gateway router against the real registry
-  (`answer-route-side-effect.test.ts`). Deleting that one call previously left
-  the entire suite green while silently restoring the nag.
-
-  **Scope:** this fixes the ESCALATE branch only. It narrows the standing
-  duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
-  the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped
-  at both its cutoffs, the #4341 delivery-time backstop in
-  `represent-delivery-guard.ts` forwards that same `threadId` and is therefore
-  cross-topic-blind too, and the represent branch has no settle gate at all, so a
-  re-present can still fire on top of a rerouted or in-flight answer. Tracked in
-  switchroom/switchroom#4700.
-- **gateway: ignore a reply thread anchor from a different chat** — a reply
-  targeting chat A could be anchored to a turn belonging to chat B: the
-  `origin_turn_id` echo lookup is keyed by turn id alone (not chat-scoped), and
-  the LIVE turn is whatever the session happens to be running, which in a
-  multi-chat agent is frequently another chat. When B was a forum supergroup,
-  B's topic id was attached to the send into A and Telegram rejected the call
-  with `400 Bad Request: message thread not found`. A retry fallback resent
-  without a thread, so no answer was lost — but every occurrence was a
-  guaranteed-failed first API call. The drop is enforced at TWO sites, because
-  the two branches resolve the thread through different code and grepping either
-  function name alone shows only half the fix. (1) `resolveAnswerThreadId`
-  (`telegram-plugin/gateway/answer-thread-resolve.ts`) — the default path and
-  the `SWITCHROOM_REPLY_TOPIC_AUTHORITY=0` path both run through it — now DROPS
-  any anchor whose chat id does not match the send target, before the precedence
-  runs; resolution falls through exactly as if the anchor did not exist. (2) The
-  `SWITCHROOM_TURN_ORIGIN_ROUTING=0` legacy branch never calls that resolver —
-  it passes the pinned turn's thread straight to `resolveThreadId` — so the
-  equivalent guard lives inline in `sendReply`
-  (`telegram-plugin/gateway/outbound-send-path.ts`), on the branch that
-  previously passed the live turn's thread through unfiltered. Net effect: the
-  drop is unconditional across BOTH kill switches — a wrong-chat topic id is an
-  API error, not a routing policy a kill switch should be able to reinstate.
-  Both sites, the late-reply recovery tier and the `reply-route` telemetry
-  derive from the SAME exported `isCrossChatAnchor` predicate, so no second copy
-  of the rule can drift and the log can never disagree with what actually
-  routed; the legacy branch emits the same `CROSS_CHAT_ANCHOR_DROPPED` marker
-  through the same `formatReplyRouteLog` formatter, so a kill-switched
-  deployment keeps the audit trail rather than dropping anchors silently.
-  Note that dropping the anchor does not mean "no thread": the legacy branch
-  still falls through to `resolveThreadId`'s chat-scoped last-seen topic, which
-  can only ever yield a topic valid for the target chat. Callers that supply no
-  chat ids are unaffected.
 - **ci: the changelog guard now catches an entry that lands in an
   already-released section** — a PR that stages its entry under `## Unreleased`
   and then has a release cut underneath it merges **textually clean**: git
@@ -259,12 +144,162 @@ now an anomaly worth investigating, not the norm.
   that finds where it stops — so the writer and the checker cannot disagree about
   which lines are the staging section and stage an entry where the guard will not
   count it.
+
+## v0.21.11 — obligation escalations stop nagging over a delivered answer, fleet-health detectors stop laundering silent passes as green, and long messages stop breaking TTS
+
+### Tooling
+
+- **`lint` now rejects any unsanctioned Telegram `-100…` chat id in the tree.**
+  `scripts/check-no-pii-secrets.mjs` previously carried a denylist of specific
+  real ids, which is always one audit behind: three more real supergroup ids had
+  reached `main` as fixtures and doc examples, and one of them was an id the
+  denylist already named — its `\b<digits>\b` matcher could not see the `-100`-
+  prefixed spelling, because the character before the id is then the `0` of
+  `-100`. The rule is now structural: a marked supergroup id (or a `t.me/c/`
+  link) must have a body matching one of a short list of provably-synthetic
+  shapes, or lint fails with the sanctioned alternatives printed. Every
+  degradation — an unreadable file, an empty scan, a widened-to-vacuous
+  allowlist, `git` missing — exits non-zero rather than reporting clean.
+  If a new example id is needed, use `-1001234567890` or `-100<one digit
+  repeated ten times>`.
+  The structural rule only ever sees the *marked* `-100…` spelling, so every
+  known-real id also keeps a literal entry: one `KNOWN_REAL_ID_BODIES` list now
+  feeds both the denylist and the allowlist self-check. That matters for
+  restores — an id written with the `-100` stripped is invisible to the shape
+  rule, so without a literal entry, rebasing a branch cut before a scrub would
+  quietly put the real id back with lint green.
+  The guard also no longer exempts its own source from the scan. Its patterns
+  are assembled from fragments and never match themselves, but the exemption
+  made it the one tracked file where a contiguous real identifier could sit
+  unflagged.
+  A sanctioned shape carrying a `g` or `y` flag is now rejected outright: those
+  flags make `.test()` stateful, so the same body alternates true/false across
+  occurrences and half the legitimate example ids in the tree would be reported
+  as offenders on alternating hits — a nondeterministic lint failure.
+
+### Bug fixes
+
+- **an obligation ESCALATION no longer nags on top of an answer the user
+  already received.** The escalate branch of the obligation sweep sends a
+  user-visible "⚠️ I may have missed an earlier message" nudge, gated on a
+  staleness check that is supposed to stand it down when the agent has already
+  answered. Two mechanisms let that check miss a delivered answer, and both fired
+  together on the two confirmed 2026-08-10 incidents. First it was keyed on the
+  obligation's *thread*, while the model can name a topic on its `reply` and have
+  the framework's topic authority override it — the router logs exactly that,
+  `EXPLICIT_OVERRIDDEN(model→N,routed→M)` — so the answer is written to history
+  under a thread the check never queries (06:36:07.921
+  `EXPLICIT_OVERRIDDEN(model→4,routed→635)` for an obligation in thread 4, nag
+  126ms later; 07:52 the same shape with the answer routed to the chat root).
+  Second it is a point-in-time read, and the answer is often still *in flight* at
+  the instant the sweep decides — the reply tool has been invoked but no history
+  row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
+  07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
+  and adds a fallback to *only* the thread the router RECORDED an answer
+  addressed to this obligation's topic as having been routed to (new
+  `answer-route-overrides.ts`), reading history **only across that record's own
+  instant plus the match window** — bounded at *both* ends, so a delivery in the
+  routed topic can be paired with the record neither before it nor minutes after
+  it — and only while the record is itself **fresh** (settle window + two sweep
+  ticks = 18.5s at the default); and a new settle gate requires the "unanswered"
+  read to hold across an 8.5s window — derived as 3× the worst observed
+  decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
+  tick so a re-check actually runs — before the nudge goes out. All three
+  narrowings on the fallback are load-bearing, and each has a field
+  counter-example: a chat-wide "did anything long land in this chat" query has no
+  relationship to the obligation at all; an override-gated query cut at
+  `openedAt` is the same defect wearing a gate — on 2026-08-13 obligation
+  `…:4#5462` (thread 4, opened 03:50:02.807, escalated 04:03:06.140) it pairs a
+  stale `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an
+  unrelated 295-char delivery in thread 3 at 04:02:51.987 — a *different*
+  question's answer, 594.8s later — and closes a genuinely unanswered message in
+  silence; and an override-gated query cut at the record's own instant but left
+  *open-ended forward* is that same defect reached from the other side, because
+  freshness is judged at the first "unanswered" read while the history row is
+  read at the re-check, and the sweep can be starved for minutes in between (a
+  short reply rerouted to topic M at T+0 leaves the obligation correctly open,
+  an unrelated ≥200-char answer lands in M at T+90, and the sweep that finally
+  runs at T+107 closes the obligation `via=reroute`). That is the defect
+  `turn-flush-suppression.ts` was written to close, and the 2026-08-13 case
+  escalates correctly pre-fix, so either would have been a regression. Residual,
+  stated plainly: inside `[record, record + window]` the fallback still cannot
+  tell the rerouted answer from a second ≥200-char delivery landing in the same
+  thread in those few seconds — the override carries no message id. That interval
+  is fixed by the record's own timestamp, so a starved sweep cannot widen it.
+  Both guards stay bounded: a genuinely unanswered obligation still escalates one
+  settle window later (the 2026-08-12 case, whose real answer was 41s away, is
+  unaffected), and both windows are clamped so a config typo cannot silently
+  widen them. The freshness window is measured back from the settle gate's own
+  *first* "unanswered" read, not from whenever the re-check runs — the sweep's
+  earlier gates can skip ticks outright for minutes, and anchoring at the
+  re-check would let a starved sweep age a still-fresh record out of the window
+  and nag on top of the answer anyway — which is precisely why the *delivery*
+  needs its own forward bound: that anchor keeps the record readable across the
+  starvation gap, and without an upper bound the query would then reach across
+  the whole of it. Both paths are logged so the fallback is
+  measurable in production without a rebuild: a fallback-scope close logs
+  `via=reroute`, and a record the freshness bound *rejects* logs
+  `reroute record rejected age=…ms window=…ms`. New `escalation-staleness.ts`
+  carries the evidence and the derivation. Each guard has its OWN kill switch —
+  `SWITCHROOM_OBLIGATION_ESCALATE_SETTLE_MS=0` disables the settle gate (and only
+  the settle gate), `SWITCHROOM_OBLIGATION_REROUTE_MATCH_MS=0` disables the
+  reroute fallback (and only the fallback); set both for the pre-fix behaviour.
+  Both switches read only an explicit `0`: a whitespace-only value (`KEY=" "`,
+  which `Number()` coerces to `0`) is treated as unset, so a stray space in an
+  env file cannot silently turn a guard off.
+
+  The router's `answerRouteOverrides.note(...)` write is the whole premise of the
+  reroute fallback, and it is a side effect no pure module carries — so it is now
+  pinned by a test that drives the real gateway router against the real registry
+  (`answer-route-side-effect.test.ts`). Deleting that one call previously left
+  the entire suite green while silently restoring the nag.
+
+  **Scope:** this fixes the ESCALATE branch only. It narrows the standing
+  duplicate-reply family (switchroom/switchroom#2472) rather than closing it —
+  the REPRESENT branch is untouched: `represent-guard.ts` is still thread-scoped
+  at both its cutoffs, the #4341 delivery-time backstop in
+  `represent-delivery-guard.ts` forwards that same `threadId` and is therefore
+  cross-topic-blind too, and the represent branch has no settle gate at all, so a
+  re-present can still fire on top of a rerouted or in-flight answer. Tracked in
+  switchroom/switchroom#4700.
+- **gateway: ignore a reply thread anchor from a different chat** — a reply
+  targeting chat A could be anchored to a turn belonging to chat B: the
+  `origin_turn_id` echo lookup is keyed by turn id alone (not chat-scoped), and
+  the LIVE turn is whatever the session happens to be running, which in a
+  multi-chat agent is frequently another chat. When B was a forum supergroup,
+  B's topic id was attached to the send into A and Telegram rejected the call
+  with `400 Bad Request: message thread not found`. A retry fallback resent
+  without a thread, so no answer was lost — but every occurrence was a
+  guaranteed-failed first API call. The drop is enforced at TWO sites, because
+  the two branches resolve the thread through different code and grepping either
+  function name alone shows only half the fix. (1) `resolveAnswerThreadId`
+  (`telegram-plugin/gateway/answer-thread-resolve.ts`) — the default path and
+  the `SWITCHROOM_REPLY_TOPIC_AUTHORITY=0` path both run through it — now DROPS
+  any anchor whose chat id does not match the send target, before the precedence
+  runs; resolution falls through exactly as if the anchor did not exist. (2) The
+  `SWITCHROOM_TURN_ORIGIN_ROUTING=0` legacy branch never calls that resolver —
+  it passes the pinned turn's thread straight to `resolveThreadId` — so the
+  equivalent guard lives inline in `sendReply`
+  (`telegram-plugin/gateway/outbound-send-path.ts`), on the branch that
+  previously passed the live turn's thread through unfiltered. Net effect: the
+  drop is unconditional across BOTH kill switches — a wrong-chat topic id is an
+  API error, not a routing policy a kill switch should be able to reinstate.
+  Both sites, the late-reply recovery tier and the `reply-route` telemetry
+  derive from the SAME exported `isCrossChatAnchor` predicate, so no second copy
+  of the rule can drift and the log can never disagree with what actually
+  routed; the legacy branch emits the same `CROSS_CHAT_ANCHOR_DROPPED` marker
+  through the same `formatReplyRouteLog` formatter, so a kill-switched
+  deployment keeps the audit trail rather than dropping anchors silently.
+  Note that dropping the anchor does not mean "no thread": the legacy branch
+  still falls through to `resolveThreadId`'s chat-scoped last-seen topic, which
+  can only ever yield a topic valid for the target chat. Callers that supply no
+  chat ids are unaffected.
 - **telegram/render: a `<pre>` whose body contained ``` shipped an
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
   delimiter as a `raw` node — verbatim wire passthrough, so nothing downstream
-  widened it — without ever inspecting the body. A `<pre>` carrying its own ```
-  therefore went to the wire with THREE delimiters instead of two:
+  widened it — without ever inspecting the body. A `<pre>` carrying its own
+  ``` therefore went to the wire with THREE delimiters instead of two:
   Telegram opens at the first, closes at the embedded one, and the trailing
   delimiter opens a fence that never terminates: `can't find end of Pre
   entity`, a 400, and a plain-text resend of the WHOLE message — the

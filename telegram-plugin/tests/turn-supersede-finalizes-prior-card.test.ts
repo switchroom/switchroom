@@ -7,7 +7,7 @@
  * card was never finalized, never unpinned (`fg:<statusKey>` stayed claimed
  * forever), froze on its last landed edit, and left NO `turn-lifecycle clear`
  * line to explain it. Proof from the field: carrie's turn
- * `-1004223464247:_#1078` has a `turn-lifecycle set reason=enqueue` at
+ * `-1004444444444:_#1078` has a `turn-lifecycle set reason=enqueue` at
  * 2026-07-28T18:13:37.554Z and no `clear` anywhere in the log; its stale pinned
  * card was still on screen in the operator's screenshot.
  *
