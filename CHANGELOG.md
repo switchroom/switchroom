@@ -33,18 +33,27 @@ now an anomaly worth investigating, not the norm.
   the instant the sweep decides — the reply tool has been invoked but no history
   row exists yet (decision 06:36:08.047 → delivered 06:36:09.281; decision
   07:52:34.400 → delivered 07:52:37.209). The check now keeps its thread scope
-  and adds a fallback to *only* the threads the router RECORDED an answer
+  and adds a fallback to *only* the thread the router RECORDED an answer
   addressed to this obligation's topic as having been routed to (new
-  `answer-route-overrides.ts`), and a new settle gate requires the "unanswered"
+  `answer-route-overrides.ts`), reading history from **that record's own
+  instant** and only while the record is **fresh** (settle window + two sweep
+  ticks = 18.5s at the default); and a new settle gate requires the "unanswered"
   read to hold across an 8.5s window — derived as 3× the worst observed
   decision→delivery lag, rounded up to the next 500ms, and at least one 5s sweep
-  tick so a re-check actually runs — before the nudge goes out. The fallback is
-  deliberately NOT chat-wide: a "did anything long land in this chat" query has
-  no relationship to the obligation, and in a busy forum it would silently close
-  an unanswered obligation in topic A because an unrelated answer landed in topic
-  B — the exact defect `turn-flush-suppression.ts` was written to close, and the
-  exact shape of the 2026-08-13 incident where an answer to a *different*
-  question in another topic would have swallowed a genuinely unanswered message.
+  tick so a re-check actually runs — before the nudge goes out. Both narrowings
+  on the fallback are load-bearing, and each has a field counter-example: a
+  chat-wide "did anything long land in this chat" query has no relationship to
+  the obligation at all, and an override-gated query cut at `openedAt` is the
+  same defect wearing a gate — on 2026-08-13 obligation `…:4#5462` (thread 4,
+  opened 03:50:02.807, escalated 04:03:06.140) it pairs a stale
+  `EXPLICIT_OVERRIDDEN(model→4,routed→3)` from 03:53:11.225 with an unrelated
+  295-char delivery in thread 3 at 04:02:51.987 — a *different* question's
+  answer, 594.8s later — and closes a genuinely unanswered message in silence.
+  That is the defect `turn-flush-suppression.ts` was written to close, and it
+  escalates correctly pre-fix, so it would have been a regression. The freshness
+  window rejects it. Residual, stated plainly: inside the window the fallback
+  still cannot tell the rerouted answer from a second ≥200-char delivery landing
+  in the same thread in those few seconds — the override carries no message id.
   Both guards stay bounded: a genuinely unanswered obligation still escalates one
   settle window later (the 2026-08-12 case, whose real answer was 41s away, is
   unaffected), the settle window is clamped at 60s so a config typo cannot

@@ -3,8 +3,10 @@ import {
   answeredSinceOpen,
   createEscalationSettleGate,
   resolveEscalateSettleMs,
+  resolveRerouteMatchWindowMs,
   OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT,
   OBLIGATION_ESCALATE_SETTLE_MS_MAX,
+  REROUTE_MATCH_GRACE_MS,
 } from "../gateway/escalation-staleness.js";
 import {
   createAnswerRouteOverrides,
@@ -39,18 +41,24 @@ import { createObligationWiring } from "../gateway/obligation-wiring.js";
 //   - 2026-08-12 09:08, where the agent genuinely had not answered — its real
 //     reply landed 41,331 ms after the escalation decision. That obligation must
 //     still escalate.
-//   - 2026-08-13 04:03, where obligation `…:4#5462` (thread 4) escalated at
-//     04:03:06.140 while a 292-char answer had landed at 04:02:50.521 — but that
-//     answer was `via=origin` to turn `…:3#5480`, a DIFFERENT question in topic
-//     3, with NO override logged anywhere in the represent→escalate window.
-//     Topic 4's message was genuinely unanswered. A chat-wide "did anything long
-//     land" fallback would have closed it silently; the override-gated fallback
-//     must not.
+//   - 2026-08-13 04:03, where obligation `…:4#5462` (thread 4, opened
+//     03:50:02.807) escalated at 04:03:06.140. Its window holds THREE
+//     `EXPLICIT_OVERRIDDEN(model→4,routed→3)` records (03:50:44.201,
+//     03:51:43.108, 03:53:11.225) AND a later, unrelated 295-char delivery in
+//     thread 3 at 04:02:51.987 answering a DIFFERENT question (`via=origin` to
+//     turn `…:3#5480`). Topic 4's message was genuinely unanswered, so this
+//     obligation MUST escalate. It is the counter-example that kills both weaker
+//     fallbacks: chat-wide, and override-gated-but-cut-at-`openedAt` (which
+//     pairs the 03:53 override with the 04:02 delivery). The newest override is
+//     594.8 s stale at the decision, so the freshness window rejects it.
 
 const CHAT = "-100999";
 const OBLIGATION_THREAD = 4;
 const ROUTED_THREAD = 635; // the router's `EXPLICIT_OVERRIDDEN(model→4,routed→635)` reroute
 const UNRELATED_THREAD = 3;
+// A separate intended topic for the end-to-end counter-example, so its entries
+// in the process-wide override registry cannot collide with another test's.
+const THREAD_D = 44;
 
 /**
  * Models the real history predicate: an assistant row delivered at `deliveredAt`
@@ -85,6 +93,22 @@ function overridesWithReroute(
 
 const NO_OVERRIDES = createAnswerRouteOverrides();
 
+/** The reroute-fallback deps, with the freshness window the sweep really uses. */
+function stalenessDeps(over: {
+  hasOutboundDeliveredSince: (chatId: string, sinceMs: number, threadId?: number | null) => boolean;
+  routeOverrides: Parameters<typeof answeredSinceOpen>[1]["routeOverrides"];
+  nowMs?: number;
+  historyEnabled?: boolean;
+}) {
+  return {
+    historyEnabled: over.historyEnabled ?? true,
+    hasOutboundDeliveredSince: over.hasOutboundDeliveredSince,
+    routeOverrides: over.routeOverrides,
+    nowMs: over.nowMs ?? 2_000,
+    rerouteMatchWindowMs: resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT),
+  };
+}
+
 describe("answerRouteOverrides — records only genuine explicit-thread overrides", () => {
   it("records the reroute the router logs as EXPLICIT_OVERRIDDEN", () => {
     const reg = createAnswerRouteOverrides();
@@ -98,14 +122,14 @@ describe("answerRouteOverrides — records only genuine explicit-thread override
         nowMs: 1000,
       }),
     ).toBe(true);
-    expect(reg.routedThreadsSince(CHAT, 4, 0)).toEqual([635]);
+    expect(reg.routedOverridesSince(CHAT, 4, 0)).toEqual([{ routedThreadId: 635, atMs: 1000 }]);
   });
 
   it("maps a chat-root routing to an explicit NULL thread, never to 'any thread'", () => {
     // 2026-08-10 07:52: `EXPLICIT_OVERRIDDEN(model→3,routed→-)`; recordOutbound
     // writes `thread_id IS NULL` for a threadless send.
     const reg = overridesWithReroute(3, undefined, 1000);
-    expect(reg.routedThreadsSince(CHAT, 3, 0)).toEqual([null]);
+    expect(reg.routedOverridesSince(CHAT, 3, 0)).toEqual([{ routedThreadId: null, atMs: 1000 }]);
   });
 
   it("does NOT record when the routing agreed with the model", () => {
@@ -120,7 +144,7 @@ describe("answerRouteOverrides — records only genuine explicit-thread override
         nowMs: 1000,
       }),
     ).toBe(false);
-    expect(reg.routedThreadsSince(CHAT, 4, 0)).toEqual([]);
+    expect(reg.routedOverridesSince(CHAT, 4, 0)).toEqual([]);
   });
 
   it("does NOT record when the model named no topic, or no anchor could override it", () => {
@@ -134,13 +158,31 @@ describe("answerRouteOverrides — records only genuine explicit-thread override
 
   it("scopes by chat and by intended thread", () => {
     const reg = overridesWithReroute(4, 635, 1000);
-    expect(reg.routedThreadsSince("-100777", 4, 0)).toEqual([]);
-    expect(reg.routedThreadsSince(CHAT, 3, 0)).toEqual([]);
+    expect(reg.routedOverridesSince("-100777", 4, 0)).toEqual([]);
+    expect(reg.routedOverridesSince(CHAT, 3, 0)).toEqual([]);
   });
 
-  it("ignores an override that predates the cutoff", () => {
+  it("ignores an override older than the caller's freshness floor", () => {
     const reg = overridesWithReroute(4, 635, 1000);
-    expect(reg.routedThreadsSince(CHAT, 4, 5000)).toEqual([]);
+    expect(reg.routedOverridesSince(CHAT, 4, 5000)).toEqual([]);
+  });
+
+  it("returns the EARLIEST in-window record per routed thread (the widest correct cutoff)", () => {
+    // 2026-08-13 shape: three overrides, same intended topic, same routed topic.
+    const reg = createAnswerRouteOverrides();
+    for (const atMs of [1000, 1500, 2000]) {
+      reg.note({
+        chatId: CHAT,
+        enabled: true,
+        explicitThreadId: 4,
+        anchored: true,
+        routedThreadId: 3,
+        nowMs: atMs,
+      });
+    }
+    expect(reg.routedOverridesSince(CHAT, 4, 0)).toEqual([{ routedThreadId: 3, atMs: 1000 }]);
+    // With a later floor, the earliest SURVIVING record wins.
+    expect(reg.routedOverridesSince(CHAT, 4, 1600)).toEqual([{ routedThreadId: 3, atMs: 2000 }]);
   });
 
   it("bounds both the key count and the per-key history", () => {
@@ -166,7 +208,7 @@ describe("answerRouteOverrides — records only genuine explicit-thread override
         nowMs: i,
       });
     }
-    expect(reg.routedThreadsSince(CHAT, 4, 0).length).toBeLessThanOrEqual(2);
+    expect(reg.routedOverridesSince(CHAT, 4, 0).length).toBeLessThanOrEqual(2);
   });
 });
 
@@ -175,11 +217,10 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
     // Pre-fix this asked history for thread 4 only, found nothing, and nagged.
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, ROUTED_THREAD),
         routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, 1500),
-      },
+      }),
     );
     expect(answered).toEqual({ answered: true, via: "reroute", routedThreadId: ROUTED_THREAD });
   });
@@ -187,11 +228,10 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
   it("counts an answer rerouted to the chat ROOT (2026-08-10 07:52)", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: 3 },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, null),
         routeOverrides: overridesWithReroute(3, undefined, 1500),
-      },
+      }),
     );
     expect(answered).toEqual({ answered: true, via: "reroute", routedThreadId: null });
   });
@@ -199,11 +239,10 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
   it("still counts a same-thread answer (the pre-existing behaviour is preserved)", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, OBLIGATION_THREAD),
         routeOverrides: NO_OVERRIDES,
-      },
+      }),
     );
     expect(answered).toEqual({ answered: true, via: "thread" });
   });
@@ -213,24 +252,85 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
     // question must not close topic 4's genuinely-unanswered obligation.
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, UNRELATED_THREAD),
         routeOverrides: NO_OVERRIDES,
-      },
+      }),
     );
     expect(answered).toEqual({ answered: false, via: null });
+  });
+
+  it("does NOT pair a STALE override with a later unrelated delivery (2026-08-13 04:03)", () => {
+    // The real 4#5462 shape, and the one an `openedAt` cutoff gets WRONG.
+    // Opened at 0. Overrides model→4,routed→3 at 41s / 100s / 188s. The
+    // delivery in thread 3 is at 769s — a DIFFERENT question's answer, 594.8s
+    // after the newest override. Decision at 783s.
+    const NOW = 783_000;
+    const reg = createAnswerRouteOverrides();
+    for (const atMs of [41_394, 100_301, 188_418]) {
+      reg.note({
+        chatId: CHAT,
+        enabled: true,
+        explicitThreadId: OBLIGATION_THREAD,
+        anchored: true,
+        routedThreadId: UNRELATED_THREAD,
+        nowMs: atMs,
+      });
+    }
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 0, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(769_180, UNRELATED_THREAD),
+        routeOverrides: reg,
+        nowMs: NOW,
+      }),
+    );
+    // Cut at `openedAt` this reads {answered: true, via: "reroute"} and the
+    // user's message is dropped in silence.
+    expect(answered).toEqual({ answered: false, via: null });
+  });
+
+  it("DOES follow an override that is still fresh, from the override's own instant", () => {
+    // Same shape, but the decision happens while the override is still inside
+    // the window — the 2026-08-10 case, re-checked after a settle deferral.
+    const NOW = 188_418 + OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT + 1_000;
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 0, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(189_800, UNRELATED_THREAD),
+        routeOverrides: overridesWithReroute(OBLIGATION_THREAD, UNRELATED_THREAD, 188_418),
+        nowMs: NOW,
+      }),
+    );
+    expect(answered).toEqual({
+      answered: true,
+      via: "reroute",
+      routedThreadId: UNRELATED_THREAD,
+    });
+  });
+
+  it("does NOT accept a delivery that PREDATES the override it is paired with", () => {
+    // The override is fresh, but the only delivery in the routed thread landed
+    // before that routing decision — it cannot be the answer it produced.
+    const answered = answeredSinceOpen(
+      { chatId: CHAT, openedAt: 1_000, threadId: OBLIGATION_THREAD },
+      stalenessDeps({
+        hasOutboundDeliveredSince: historyWithAnswer(4_999, ROUTED_THREAD),
+        routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, 5_000),
+        nowMs: 6_000,
+      }),
+    );
+    expect(answered.answered).toBe(false);
   });
 
   it("does NOT follow a reroute recorded for a DIFFERENT topic", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, ROUTED_THREAD),
         // The override belongs to topic 3's answer, not topic 4's.
         routeOverrides: overridesWithReroute(UNRELATED_THREAD, ROUTED_THREAD, 1500),
-      },
+      }),
     );
     expect(answered.answered).toBe(false);
   });
@@ -238,11 +338,11 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
   it("does NOT follow a reroute that PREDATES the obligation", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 5000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(6000, ROUTED_THREAD),
         routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, 1500),
-      },
+        nowMs: 6000,
+      }),
     );
     expect(answered.answered).toBe(false);
   });
@@ -250,11 +350,10 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
   it("does NOT count an answer in a DIFFERENT chat", () => {
     const answered = answeredSinceOpen(
       { chatId: "-100777", openedAt: 1000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, ROUTED_THREAD),
         routeOverrides: overridesWithReroute(OBLIGATION_THREAD, ROUTED_THREAD, 1500),
-      },
+      }),
     );
     expect(answered.answered).toBe(false);
   });
@@ -262,11 +361,10 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
   it("does NOT count an answer that PREDATES the obligation", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 5000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: true,
+      stalenessDeps({
         hasOutboundDeliveredSince: historyWithAnswer(2000, OBLIGATION_THREAD),
         routeOverrides: NO_OVERRIDES,
-      },
+      }),
     );
     expect(answered.answered).toBe(false);
   });
@@ -274,11 +372,11 @@ describe("answeredSinceOpen — a REROUTED answer stands the escalation down", (
   it("reports not-answered when history is unavailable (never suppresses on doubt)", () => {
     const answered = answeredSinceOpen(
       { chatId: CHAT, openedAt: 1000, threadId: OBLIGATION_THREAD },
-      {
-        historyEnabled: false,
+      stalenessDeps({
         hasOutboundDeliveredSince: () => true,
         routeOverrides: NO_OVERRIDES,
-      },
+        historyEnabled: false,
+      }),
     );
     expect(answered.answered).toBe(false);
   });
@@ -373,6 +471,26 @@ describe("resolveEscalateSettleMs", () => {
   });
 });
 
+describe("resolveRerouteMatchWindowMs — how stale an override may be", () => {
+  it("tracks the settle window, because the consulting decision comes after it", () => {
+    expect(resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT)).toBe(
+      OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT + REROUTE_MATCH_GRACE_MS,
+    );
+    expect(resolveRerouteMatchWindowMs(20_000)).toBe(20_000 + REROUTE_MATCH_GRACE_MS);
+  });
+
+  it("still allows a window with the settle gate killed (decision is immediate)", () => {
+    expect(resolveRerouteMatchWindowMs(0)).toBe(REROUTE_MATCH_GRACE_MS);
+    expect(resolveRerouteMatchWindowMs(-5_000)).toBe(REROUTE_MATCH_GRACE_MS);
+  });
+
+  it("stays far below the observed false-pairing gap and far above the real ones", () => {
+    const w = resolveRerouteMatchWindowMs(OBLIGATION_ESCALATE_SETTLE_MS_DEFAULT);
+    expect(w).toBeGreaterThan(2_809); // worst real override→delivery lag, with margin
+    expect(w).toBeLessThan(594_800); // 2026-08-13's stale-override→unrelated-delivery gap
+  });
+});
+
 // End-to-end through the real sweep: the assertion is the OUTCOME the user sees —
 // did the "I may have missed this" nudge go out, and was the obligation closed?
 describe("obligationSweep escalate branch — nag only when the answer really is missing", () => {
@@ -416,11 +534,16 @@ describe("obligationSweep escalate branch — nag only when the answer really is
   }
 
   /** Open an obligation whose represent ladder is already exhausted → escalate. */
-  function openExhausted(ledger: ObligationLedger, openedAt: number, origin = ORIGIN): void {
+  function openExhausted(
+    ledger: ObligationLedger,
+    openedAt: number,
+    origin = ORIGIN,
+    threadId = OBLIGATION_THREAD,
+  ): void {
     ledger.openIfAbsent({
       originTurnId: origin,
       chatId: CHAT,
-      threadId: OBLIGATION_THREAD,
+      threadId,
       messageId: 5462,
       text: "synthetic fixture question about the widget report",
       openedAt,
@@ -454,24 +577,42 @@ describe("obligationSweep escalate branch — nag only when the answer really is
     expect(ledger.isOpen(ORIGIN)).toBe(false); // closed silently
   });
 
-  it("(d) an UNRELATED long message in another topic does NOT suppress the nudge (2026-08-13 04:03)", () => {
-    // The blocker this guard exists for. Obligation open in topic 4; a long
-    // assistant message lands in topic 3 answering a DIFFERENT question, with no
-    // reroute on record. A chat-wide fallback closes topic 4's obligation
-    // silently and the user's message is dropped with no nudge and no
-    // re-present. It must escalate instead.
+  it("(d) a STALE reroute record does NOT license an unrelated later delivery (2026-08-13 04:03)", () => {
+    // The blocker this guard exists for, built to the REAL 4#5462 shape — the
+    // overrides the incident actually had, not a scenario without them:
+    //
+    //   opened      03:50:02.807   (T-783.3s from the escalate decision)
+    //   overrides   03:50:44.201 / 03:51:43.108 / 03:53:11.225  model→4,routed→3
+    //   delivery    04:02:51.987   295 chars, thread 3, a DIFFERENT question
+    //   decision    04:03:06.140
+    //
+    // The newest override is 594.8s stale when the sweep decides. Cut at
+    // `openedAt`, the fallback pairs it with that unrelated delivery, closes
+    // topic 4's obligation silently, and the user's message is dropped with no
+    // nudge and no re-present. It must escalate instead.
     const ledger = new ObligationLedger(2);
-    const ORIGIN_D = `${CHAT}:${OBLIGATION_THREAD}#5463`;
+    const ORIGIN_D = `${CHAT}:${THREAD_D}#5463`;
+    const base = Date.now();
     const { wiring, nudges } = makeWiring({
       ledger,
-      // A substantive assistant row exists in topic 3 — and ONLY in topic 3.
-      hasOutboundDeliveredSince: historyWithAnswer(Date.now() - 15_000, UNRELATED_THREAD),
+      // A substantive assistant row in topic 3 — and ONLY in topic 3.
+      hasOutboundDeliveredSince: historyWithAnswer(base - 14_200, UNRELATED_THREAD),
     });
-    openExhausted(ledger, Date.now() - 600_000, ORIGIN_D);
+    // The three real overrides, all long stale by the time the sweep decides.
+    for (const ago of [741_900, 683_000, 594_900]) {
+      answerRouteOverrides.note({
+        chatId: CHAT,
+        enabled: true,
+        explicitThreadId: THREAD_D,
+        anchored: true,
+        routedThreadId: UNRELATED_THREAD,
+        nowMs: base - ago,
+      });
+    }
+    openExhausted(ledger, base - 783_300, ORIGIN_D, THREAD_D);
 
     const realNow = Date.now;
     try {
-      const base = realNow();
       for (const offset of [0, 5_000, 10_000]) {
         Date.now = () => base + offset;
         wiring.obligationSweep();

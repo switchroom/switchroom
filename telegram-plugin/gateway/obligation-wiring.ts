@@ -27,6 +27,7 @@ import {
   answeredSinceOpen,
   createEscalationSettleGate,
   resolveEscalateSettleMs,
+  resolveRerouteMatchWindowMs,
 } from './escalation-staleness.js'
 import { answerRouteOverrides } from './answer-route-overrides.js'
 import { parkedTurnStartCount } from './stream-render.js'
@@ -59,7 +60,12 @@ export function createObligationWiring(deps: ObligationWiringDeps) {
   // Escalation settle gate (see escalation-staleness.ts). One instance per
   // wiring — the sweep is the only caller, and the gate must remember the FIRST
   // escalate decision for an obligation across sweep ticks.
-  const escalateSettleGate = createEscalationSettleGate(resolveEscalateSettleMs())
+  const escalateSettleMs = resolveEscalateSettleMs()
+  const escalateSettleGate = createEscalationSettleGate(escalateSettleMs)
+  // How stale an EXPLICIT_OVERRIDDEN record may be and still license a look in
+  // the thread it names. Derived from the settle window, because the decision
+  // that consults it is the one AFTER the gate. See escalation-staleness.ts.
+  const rerouteMatchWindowMs = resolveRerouteMatchWindowMs(escalateSettleMs)
 
 /**
  * PR2 obligation-ledger CLOSE. Called when a SUBSTANTIVE final answer lands
@@ -322,15 +328,17 @@ function obligationSweep(): void {
     )
     return
   }
-  // SCOPE: the obligation's own topic, PLUS the topics the router recorded an
-  // answer addressed to that topic as actually having been routed to
-  // (`EXPLICIT_OVERRIDDEN(model→N,routed→M)`). Deliberately NOT chat-wide: an
-  // unrelated long message in another topic must not stand this escalation down.
-  // Rationale + field evidence in escalation-staleness.ts.
+  // SCOPE: the obligation's own topic, PLUS — only while the router's
+  // `EXPLICIT_OVERRIDDEN(model→N,routed→M)` record is still FRESH, and only from
+  // that record's own instant — the topic it names. Deliberately neither
+  // chat-wide nor cut at `openedAt`: both of those close a genuinely unanswered
+  // obligation in silence. Field evidence for each in escalation-staleness.ts.
   const answered = answeredSinceOpen(o, {
     historyEnabled: HISTORY_ENABLED,
     hasOutboundDeliveredSince,
     routeOverrides: answerRouteOverrides,
+    nowMs: now,
+    rerouteMatchWindowMs: rerouteMatchWindowMs,
   })
   if (answered.answered) {
     // The two scopes log DISTINGUISHABLY: a `via=reroute` close is the widened

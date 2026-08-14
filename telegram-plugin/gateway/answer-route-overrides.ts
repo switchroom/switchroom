@@ -53,15 +53,23 @@ export interface AnswerRouteOverrides {
    */
   note(args: NoteOverrideArgs): boolean
   /**
-   * Threads that an answer addressed to `intendedThreadId` was actually routed
-   * to, at or after `sinceMs`. Empty when no override was observed — which is
-   * the common case and means "no reason to look outside this topic".
+   * Overrides recorded for `intendedThreadId` at or after `notBeforeMs`, one per
+   * distinct routed thread (the EARLIEST in-window record for that thread wins,
+   * so a consumer using `atMs` as a cutoff gets the widest correct one). Empty
+   * when no override was observed — which is the common case and means "no
+   * reason to look outside this topic".
+   *
+   * The caller MUST use each entry's `atMs` as the lower bound of whatever it
+   * looks up next, and MUST pass a `notBeforeMs` that bounds how old an override
+   * may be. An override only licenses a query for the answer THAT routing
+   * produced; it is not a standing licence to accept anything ever delivered in
+   * that thread. See `escalation-staleness.ts` for the incident that proves it.
    */
-  routedThreadsSince(
+  routedOverridesSince(
     chatId: string,
     intendedThreadId: number | null | undefined,
-    sinceMs: number,
-  ): (number | null)[]
+    notBeforeMs: number,
+  ): AnswerRouteOverride[]
   /** Live key count. Test/diagnostic surface. */
   size(): number
 }
@@ -94,13 +102,14 @@ export function createAnswerRouteOverrides(maxKeys = 64, maxPerKey = 8): AnswerR
       }
       return true
     },
-    routedThreadsSince(chatId, intendedThreadId, sinceMs): (number | null)[] {
+    routedOverridesSince(chatId, intendedThreadId, notBeforeMs): AnswerRouteOverride[] {
       const list = byKey.get(keyFor(chatId, intendedThreadId))
       if (list == null) return []
-      const out: (number | null)[] = []
+      const out: AnswerRouteOverride[] = []
       for (const e of list) {
-        if (e.atMs < sinceMs) continue
-        if (!out.includes(e.routedThreadId)) out.push(e.routedThreadId)
+        if (e.atMs < notBeforeMs) continue
+        if (out.some((seen) => seen.routedThreadId === e.routedThreadId)) continue
+        out.push({ ...e })
       }
       return out
     },
