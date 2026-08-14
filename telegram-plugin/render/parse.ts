@@ -12,7 +12,11 @@
 //     `source.slice(node.start, node.end)` round-trips to the source text.
 //   - Never lose text. Any mdast node type outside the supported palette
 //     degrades to a `plain` inline (or a paragraph wrapping one) carrying the
-//     raw source slice, rather than being dropped.
+//     raw source slice, rather than being dropped. The ONE deliberate
+//     exception is raw-HTML MARKUP: an unrecognised tag has its angle-bracket
+//     token dropped while its content is kept and rendered (see the raw-HTML
+//     note below and `html-fold.ts`). Content is never lost; unguaranteeable
+//     markup is.
 //
 // Underline vs bold (`__…__` vs `**…**`):
 //   Telegram's Bot API 10.1 rich markdown reads a `__…__` double-underscore run
@@ -56,6 +60,25 @@
 //   marker characters differ, and they are never part of quoted content. The
 //   set of line-start offsets that carried the marker is threaded into
 //   `foldBlock` so the matching blockquote nodes get `expandable: true`.
+//
+//   The rewrite is FENCE-AWARE. Every other fold reads the ORIGINAL `markdown`
+//   through `slice()`, so the rewritten bytes never escape — except for the
+//   `code` fold, which must use mdast's `node.value` (the dedented, fence-
+//   stripped content, which offsets alone cannot reconstruct without
+//   re-implementing micromark's fence parser). That made a fenced block
+//   containing a line starting `**>` ship silently corrupted as `  >` —
+//   anyone documenting the legacy syntax got their code altered. Skipping
+//   fenced regions in the pre-pass fixes it at the one place the rewrite is
+//   decided, keeps `code.value` trustworthy for every consumer, and preserves
+//   the length invariant trivially (a skipped line is copied verbatim).
+//
+// Raw HTML handling:
+//   mdast `html` nodes (inline `<b>`/`<a href>` runs and whole HTML blocks)
+//   used to fall through to `plain`, which the renderer `escapeMarkdown`s —
+//   escaping `=` and shipping `<a href\="…">`. They now go through
+//   `html-fold.ts`'s three-bucket policy: fold to the native IR construct,
+//   pass through raw (wire-verified allowlist), or drop the markup and keep
+//   the content. See that module's header for the rationale.
 
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfm } from "micromark-extension-gfm";
@@ -78,6 +101,14 @@ import type {
   TableCell,
   TableRow,
 } from "./ir.js";
+import {
+  HTML_FOLD_TAGS,
+  hrefOf,
+  isPassthroughTag,
+  tokenizeHtml,
+  type HtmlFoldTarget,
+  type HtmlTagInfo,
+} from "./html-fold.js";
 
 /** Copy UTF-16 offsets off an mdast node. Falls back to 0-length when a
  *  synthesized node lacks a position (from-markdown always sets one, but the
@@ -125,13 +156,27 @@ function isTgInlineEntityHref(href: string): boolean {
   return TG_INLINE_ENTITY_HREFS.some((base) => h === base || h.startsWith(`${base}?`));
 }
 
+/** A top-level fenced-code delimiter: 3+ backticks or tildes, indented 0–3
+ *  spaces. Deeper indentation is not a fence, and a fence nested inside a
+ *  blockquote / list item is prefixed by its container's markup — so a
+ *  column-0 `**>` line can only ever be code content inside a fence this
+ *  matches, which is exactly the region the rewrite must not touch. */
+const FENCE_DELIM_RE = /^ {0,3}(`{3,}|~{3,})/;
+
 /** Pre-transform expandable-blockquote markers so mdast can parse them as
  *  ordinary blockquotes, WITHOUT shifting any source offset. Each line that
- *  opens with `**>` has its two `*` characters replaced by two spaces
- *  (`**>` → `  >`), which micromark reads as a normal (optionally
- *  1–3-space-indented) blockquote line. Returns the rewritten text plus the
- *  set of line-start offsets that carried the marker — `foldBlock` uses that
- *  set to flip `expandable: true` on the produced blockquote nodes. */
+ *  opens with `**>` — and is NOT inside a fenced code block — has its two `*`
+ *  characters replaced by two spaces (`**>` → `  >`), which micromark reads as
+ *  a normal (optionally 1–3-space-indented) blockquote line. Returns the
+ *  rewritten text plus the set of line-start offsets that carried the marker —
+ *  `foldBlock` uses that set to flip `expandable: true` on the produced
+ *  blockquote nodes.
+ *
+ *  Fence tracking mirrors CommonMark: an opener is 3+ backticks/tildes at
+ *  0–3 spaces of indent; the block closes on a delimiter of the SAME character
+ *  that is at least as long and carries nothing but whitespace after it, or at
+ *  end of document. Inside such a block every line is copied verbatim, so a
+ *  documented `**> …` example survives byte-identical into `code.value`. */
 function markExpandableQuotes(markdown: string): {
   text: string;
   expandableLineStarts: Set<number>;
@@ -139,8 +184,38 @@ function markExpandableQuotes(markdown: string): {
   const expandableLineStarts = new Set<number>();
   let out = "";
   let offset = 0;
+  /** The open fence's delimiter run, or null outside a fenced block. */
+  let openFence: string | null = null;
   // Split keeping the trailing newline on each line so offsets are exact.
   for (const line of markdown.split(/(?<=\n)/)) {
+    const body = line.replace(/\r?\n$/, "");
+    const fence = FENCE_DELIM_RE.exec(body)?.[1] ?? null;
+    if (openFence !== null) {
+      // Inside a fence: copy verbatim, and close on a matching delimiter.
+      out += line;
+      if (
+        fence !== null &&
+        fence[0] === openFence[0] &&
+        fence.length >= openFence.length &&
+        body.slice(body.indexOf(fence) + fence.length).trim() === ""
+      ) {
+        openFence = null;
+      }
+      offset += line.length;
+      continue;
+    }
+    if (fence !== null) {
+      // A backtick info string may not contain a backtick; such a line is not
+      // a fence opener at all (CommonMark), so only treat it as one when the
+      // rest of the line is clean.
+      const rest = body.slice(body.indexOf(fence) + fence.length);
+      if (!(fence[0] === "`" && rest.includes("`"))) {
+        openFence = fence;
+        out += line;
+        offset += line.length;
+        continue;
+      }
+    }
     if (EXPANDABLE_MARKER_RE.test(line)) {
       expandableLineStarts.add(offset);
       // Replace the leading two `*` chars with two spaces; the `>` and
@@ -290,12 +365,179 @@ function expandPlainNode(node: PlainNode, source: string): Inline[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Raw-HTML tag folding (see html-fold.ts for the policy and its rationale)
+// ---------------------------------------------------------------------------
+
+/** One element of the stream the HTML matcher walks: either a classified HTML
+ *  token or an already-folded IR inline. */
+type HtmlFoldItem =
+  | { kind: "tag"; tag: HtmlTagInfo; start: number; end: number }
+  | { kind: "inline"; node: Inline };
+
+/** Index of the token that closes `name`, honouring same-name nesting, or -1. */
+function findClosingTag(items: HtmlFoldItem[], from: number, name: string): number {
+  let depth = 0;
+  for (let i = from; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind !== "tag" || it.tag.name !== name) continue;
+    if (it.tag.kind === "open") depth++;
+    else if (it.tag.kind === "close") {
+      if (depth === 0) return i;
+      depth--;
+    }
+  }
+  return -1;
+}
+
+/** Flatten a folded run to literal text, or null when any child carries
+ *  structure a code span cannot represent. Used for `<code>`. Deliberately
+ *  accepts ONLY `plain`: an inner `code` node's own backticks are not in its
+ *  `text`, so folding it in would silently DELETE them
+ *  (`<code>a `b` c</code>` -> `` `a b c` ``), and a `raw` node's wire bytes
+ *  would be swallowed into a literal span. Both degrade to the children
+ *  instead, which preserves every byte. */
+function inlineLiteralText(nodes: Inline[]): string | null {
+  let out = "";
+  for (const n of nodes) {
+    if (n.type !== "plain") return null;
+    out += n.text;
+  }
+  return out;
+}
+
+/**
+ * Apply the three-bucket HTML policy over a mixed tag/inline stream.
+ *
+ * `active` carries the emphasis constructs already open in an ANCESTOR fold.
+ * Markdown cannot nest same-kind emphasis — `**a **b** c**` is asterisk soup
+ * on the reader's screen, not nested bold — so a tag whose target is already
+ * active degrades to its children. Combined with the single-child unwrap in
+ * `buildFoldedTag`, `<b>a <b>b</b> c</b>` and `<b>**already**</b>` both come
+ * out as ONE bold run.
+ */
+function foldHtmlItems(
+  items: HtmlFoldItem[],
+  active: ReadonlySet<HtmlFoldTarget> = new Set(),
+): Inline[] {
+  const out: Inline[] = [];
+  let i = 0;
+  while (i < items.length) {
+    const it = items[i];
+    if (it.kind === "inline") {
+      out.push(it.node);
+      i++;
+      continue;
+    }
+    const tag = it.tag;
+    // Bucket 2: wire-verified allowlist — emitted raw and unescaped.
+    if (isPassthroughTag(tag) && tag.kind !== "comment" && tag.kind !== "other") {
+      out.push({ type: "raw", text: tag.raw, start: it.start, end: it.end });
+      i++;
+      continue;
+    }
+    // Bucket 1: fold to the native IR construct.
+    const target = tag.kind === "open" || tag.kind === "selfclose"
+      ? HTML_FOLD_TAGS[tag.name]
+      : undefined;
+    if (target === "break") {
+      // `<br>` / `<br/>`: a GFM HARD break (two spaces + newline), not a bare
+      // `\n`. The renderer runs AFTER `normalizeParagraphBreaks`
+      // (gateway/outbound-send-path.ts stage 1), so a lone `\n` inserted here
+      // would never be promoted and Telegram would collapse it to a space —
+      // silently losing the author's break. Emitted as `raw` so the two
+      // trailing spaces are not touched.
+      out.push({ type: "raw", text: "  \n", start: it.start, end: it.end });
+      i++;
+      continue;
+    }
+    if (target !== undefined && tag.kind === "open") {
+      const close = findClosingTag(items, i + 1, tag.name);
+      const closeItem = close >= 0 ? items[close] : undefined;
+      if (closeItem !== undefined && closeItem.kind === "tag") {
+        const nested = new Set(active);
+        nested.add(target);
+        const inner = foldHtmlItems(items.slice(i + 1, close), nested);
+        const folded = active.has(target)
+          ? null
+          : buildFoldedTag(target, tag, inner, it.start, closeItem.end);
+        // A tag we cannot represent faithfully (an `<a>` with no href, a
+        // `<code>` wrapping structure, an emphasis already open above)
+        // degrades to its CONTENT — bucket 3.
+        out.push(...(folded !== null ? [folded] : inner));
+        i = close + 1;
+        continue;
+      }
+    }
+    // Bucket 3: unknown tag, comment, or an unmatched open/close marker —
+    // drop the markup, keep everything around it.
+    i++;
+  }
+  return out;
+}
+
+function buildFoldedTag(
+  target: HtmlFoldTarget,
+  tag: HtmlTagInfo,
+  children: Inline[],
+  start: number,
+  end: number,
+): Inline | null {
+  switch (target) {
+    case "bold":
+    case "italic":
+    case "strike":
+      // Already exactly that construct (`<b>**already**</b>`) — re-wrapping
+      // would emit `****already****`, which reads as literal asterisks.
+      if (children.length === 1 && children[0].type === target) return children[0];
+      return { type: target, children, start, end };
+    case "code": {
+      const text = inlineLiteralText(children);
+      return text === null ? null : { type: "code", text, start, end };
+    }
+    case "link": {
+      const href = hrefOf(tag);
+      return href === null ? null : { type: "link", href, children, start, end };
+    }
+    default:
+      return null;
+  }
+}
+
+/** Turn a raw HTML string into fold items: tokens stay tokens, the text
+ *  between them becomes `plain` inlines (with spoiler/highlight recognition,
+ *  matching how prose is treated everywhere else). */
+function htmlStringToItems(raw: string, base: number, source: string): HtmlFoldItem[] {
+  return tokenizeHtml(raw, base).flatMap<HtmlFoldItem>((piece) =>
+    piece.kind === "tag"
+      ? [{ kind: "tag", tag: piece.tag, start: piece.start, end: piece.end }]
+      : expandPlainNode(mkPlain(piece.text, piece.start, piece.end), source).map(
+          (node) => ({ kind: "inline", node }) as HtmlFoldItem,
+        ),
+  );
+}
+
 /** Fold a run of mdast phrasing children into IR inlines, then run the
- *  post-parse spoiler/highlight recognition over the produced `plain` nodes. */
+ *  post-parse spoiler/highlight recognition over the produced `plain` nodes,
+ *  then apply the raw-HTML tag policy across the whole run (open/close markers
+ *  are SIBLING mdast `html` nodes, never a parent, so matching has to happen
+ *  at this level). */
 function buildInlines(children: ReadonlyArray<MdastNode>, source: string): Inline[] {
-  return children
-    .map((c) => foldInline(c as PhrasingContent, source))
-    .flatMap((n) => (n.type === "plain" ? expandPlainNode(n, source) : [n]));
+  const items: HtmlFoldItem[] = [];
+  let sawHtml = false;
+  for (const child of children) {
+    if ((child as PhrasingContent).type === "html") {
+      sawHtml = true;
+      const p = pos(child);
+      items.push(...htmlStringToItems(slice(source, child), p.start, source));
+      continue;
+    }
+    const folded = foldInline(child as PhrasingContent, source);
+    const expanded = folded.type === "plain" ? expandPlainNode(folded, source) : [folded];
+    for (const node of expanded) items.push({ kind: "inline", node });
+  }
+  if (!sawHtml) return items.map((it) => (it as { node: Inline }).node);
+  return foldHtmlItems(items);
 }
 
 function foldInlineChildren(node: MdastParent, source: string): Inline[] {
@@ -311,6 +553,26 @@ function foldTableRow(
     ...pos(cell),
   }));
   return { cells, ...pos(row) };
+}
+
+/** True for a block that would render to the empty string. Only the raw-HTML
+ *  fold can produce one — a block that is nothing but markup we dropped
+ *  (`<!-- comment -->`, `<hr/>`, `<div></div>` on their own line). Left in,
+ *  each would contribute a spurious `\n\n` separator to the rendered document,
+ *  so they are filtered out at the point blocks are collected. */
+function isEmptyBlock(block: Block): boolean {
+  return block.type === "paragraph" && block.children.length === 0;
+}
+
+/** Fold a run of mdast block nodes, dropping any that render to nothing. */
+function foldBlocks(
+  nodes: ReadonlyArray<RootContent>,
+  source: string,
+  expandableLineStarts: Set<number>,
+): Block[] {
+  return nodes
+    .map((n) => foldBlock(n, source, expandableLineStarts))
+    .filter((b) => !isEmptyBlock(b));
 }
 
 function foldBlock(
@@ -335,7 +597,7 @@ function foldBlock(
       const expandable = expandableLineStarts.has(lineStart(source, p.start));
       return {
         type: "blockquote",
-        children: node.children.map((c) => foldBlock(c, source, expandableLineStarts)),
+        children: foldBlocks(node.children, source, expandableLineStarts),
         expandable,
         ...p,
       };
@@ -349,7 +611,7 @@ function foldBlock(
       };
     case "list": {
       const items: ListItem[] = node.children.map((li) => ({
-        children: li.children.map((c) => foldBlock(c, source, expandableLineStarts)),
+        children: foldBlocks(li.children, source, expandableLineStarts),
         checked: li.checked ?? null,
         // mdast `listItem.spread`: whether this item's block children are
         // separated by a blank line. Tight (false) keeps a paragraph and its
@@ -391,7 +653,22 @@ function foldBlock(
         children: [{ type: "raw", text: slice(source, node), ...pos(node) }],
         ...pos(node),
       };
-    // Not in the palette (html, definition, …): degrade to a paragraph
+    // A raw HTML BLOCK (`<details>…`, `<div>…`, a bare `<b>alone</b>` line).
+    // mdast hands the whole block over as one opaque string, so tokenize it
+    // and run the same three-bucket policy the inline path uses: the
+    // wire-verified allowlist passes through raw (which is also what stops
+    // `escapeMarkdown` mangling `<details open="x">` into `open\="x"`),
+    // markdown-equivalent tags fold, everything else drops its markup and
+    // keeps its content.
+    case "html": {
+      const p = pos(node);
+      return {
+        type: "paragraph",
+        children: foldHtmlItems(htmlStringToItems(slice(source, node), p.start, source)),
+        ...p,
+      };
+    }
+    // Not in the palette (definition, …): degrade to a paragraph
     // carrying the raw source slice so no content is dropped.
     default:
       return {
@@ -415,8 +692,6 @@ export function parse(markdown: string): Document {
     mdastExtensions: [gfmFromMarkdown()],
   });
   return {
-    blocks: tree.children.map((child) =>
-      foldBlock(child, markdown, expandableLineStarts),
-    ),
+    blocks: foldBlocks(tree.children, markdown, expandableLineStarts),
   };
 }

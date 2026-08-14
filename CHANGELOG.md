@@ -39,6 +39,30 @@ now an anomaly worth investigating, not the norm.
   change, every one trading a wrong reading for a silently-skipped one).
   Correctly expanding a decimal/comma-glued number is out of scope for this
   narrow hotfix and is left for a follow-up.
+- **telegram: fence-aware `**>` repair + raw-HTML dialect folding** — two
+  defects in the outbound render pipeline. (1) `markExpandableQuotes`
+  (`telegram-plugin/render/parse.ts`) rewrote every line opening with the
+  legacy `**>` expandable-blockquote marker *before* micromark parsed, with
+  no fence tracking — so a `**>` line inside a fenced code block was shipped
+  silently corrupted as `  >`, because `renderCodeBlock` emits `code.value`
+  from the rewritten tree. The rewrite is now fence-aware (CommonMark opener
+  and closer rules; inside a fence every line is copied verbatim), preserving
+  the length-preservation invariant the offset-based folds depend on.
+  (2) Raw HTML tags fell through to `plain` nodes and were run through
+  `escapeMarkdown`, which escapes `=` — so `<a href="…">` shipped as
+  `<a href\="…">` and could never render as a link, and unknown tags reached
+  the wire verbatim where Telegram can 400 with `unsupported start tag`,
+  whose fallback resends plain text and puts literal markup on the reader's
+  screen. A new `telegram-plugin/render/html-fold.ts` sorts tags into three
+  buckets: markdown-equivalent tags (`<b>`, `<i>`, `<s>`, `<code>`,
+  `<a href>`, …) fold into their native IR nodes; the wire-verified
+  passthrough allowlist (`<u>`, `<sub>`, `<sup>`, `<details>`/`<summary>`,
+  `<aside>`/`<cite>`) stays raw and unescaped; anything else has its markup
+  dropped and its content kept. **Deliberate behaviour change:** the renderer
+  now discards markup it cannot guarantee. Content is never lost;
+  unguaranteeable markup is — which beats a 400 that degrades the whole
+  message to plain text. Also locks in the blank-line-separated expandable
+  shape, the majority corpus shape, which worked but had no test.
 
 ## v0.21.9 — Telegram rich-markdown guards stop destroying supported constructs, and `tg://` inline entities render
 

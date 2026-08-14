@@ -218,17 +218,21 @@ describe("parse: nested inline", () => {
 });
 
 describe("parse: unsupported construct fallback", () => {
-  it("degrades a raw HTML block to plain text without dropping content", () => {
-    // Raw HTML blocks (mdast `html`) are outside the palette; they must
-    // survive as plain source text.
+  it("degrades an UNRECOGNISED raw HTML block to its content, markup dropped", () => {
+    // Raw HTML blocks (mdast `html`) are outside the palette. An unrecognised
+    // tag is NOT passed through verbatim: nothing establishes that Telegram's
+    // rich parser accepts `<div>`, and `isParseEntitiesError` (rich-send.ts)
+    // shows the wire can 400 with `unsupported start tag` — whose fallback
+    // resends the body as PLAIN TEXT, putting literal `<div class="x">` on the
+    // reader's screen. Degrade by type: markup dropped, content kept.
     const md = "<div class=\"x\">raw</div>";
     const doc = parse(md);
     const block = doc.blocks[0] as any;
     expect(block.type).toBe("paragraph");
     const plain = block.children[0];
     expect(plain.type).toBe("plain");
-    expect(plain.text).toBe(md);
-    expect(md.slice(plain.start, plain.end)).toBe(md);
+    expect(plain.text).toBe("raw");
+    expect(md.slice(plain.start, plain.end)).toBe("raw");
   });
 });
 
