@@ -100,10 +100,14 @@
  *   $CHANGELOG_BASE; it is an ancestor of the queue ref, so the workflow's
  *   existing `fetch-depth: 0` checkout already has it.
  * - No base ref resolvable (shallow clone, detached checkout): SKIP rather than
- *   fail. CI checks out with fetch-depth: 0 for exactly this reason. On
- *   `merge_group` a $CHANGELOG_BASE that is SET but unresolvable is a FAIL, not
- *   a skip: that is a workflow misconfiguration silently disarming the only
- *   check that inspects the merged result.
+ *   fail. CI checks out with fetch-depth: 0 for exactly this reason. This
+ *   applies to the `pull_request` / local path ONLY. On `merge_group`,
+ *   $CHANGELOG_BASE is AUTHORITATIVE — there is no fallback cascade, and both
+ *   "unset" and "set but unresolvable" are a FAIL. The cascade must not rescue a
+ *   queue ref: `origin/main` always resolves on a fetch-depth: 0 checkout, so a
+ *   broken $CHANGELOG_BASE would quietly diff a range that is NOT the merged
+ *   result while reporting OK — a workflow misconfiguration silently disarming
+ *   the only check that inspects that result.
  * - No merge-base between base and HEAD (unrelated histories): SKIP.
  * - No CHANGELOG.md at HEAD: SKIP (nothing to enforce).
  *
@@ -204,7 +208,10 @@ export function stripHtmlComments(text) {
  * @returns {string[]}
  */
 export function extractUnreleasedEntries(changelog) {
-  const text = stripHtmlComments(String(changelog).replace(/\r\n/g, '\n'))
+  // Mask (not strip) comments and fenced code so a `## ` line that is merely
+  // PASTED OUTPUT inside a fence cannot truncate the section. See
+  // `maskFencedCode` for why that matters here.
+  const text = maskNonProse(String(changelog).replace(/\r\n/g, '\n'))
   const lines = text.split('\n')
   let i = 0
   // Find the `## Unreleased` header (case-insensitive, tolerant of trailing
@@ -250,6 +257,65 @@ export function maskHtmlComments(text) {
 }
 
 /**
+ * Blank out the CONTENT of fenced code blocks (``` / ~~~), and the fence lines
+ * themselves, WITHOUT changing the line count — same contract as
+ * `maskHtmlComments`, for the same reason: 1-based line numbers must keep
+ * addressing the real file.
+ *
+ * Why this is load-bearing: `## ` inside a fence is not a heading, it is text.
+ * This repo's changelog style pastes CI transcripts and grep output verbatim
+ * (CHANGELOG.md already carries 30+ fence markers), so a fenced line reading
+ * `## v9.9.9 — sample output` is routine. A fence-blind parser turns that into a
+ * phantom RELEASED section, and then EVERY entry appended after it — i.e. every
+ * entry written the documented way, at the END of `## Unreleased` — reads as
+ * landing under a released heading. That is not a one-PR false FAIL: once such a
+ * block lands on main, the placement rule reds every subsequent PR, repo-wide,
+ * until someone deletes the code block. It also truncates
+ * `extractUnreleasedEntries`, so a genuinely-staged entry stops counting as
+ * growth.
+ *
+ * CommonMark rules, minus the cases a changelog will never hit: an opener is
+ * three-or-more backticks/tildes indented at most 3 spaces; the closer is the
+ * same character, at least as long, with nothing but whitespace after it.
+ * @param {string} text
+ * @returns {string}
+ */
+export function maskFencedCode(text) {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n')
+  const blank = (/** @type {string} */ l) => ' '.repeat(l.length)
+  /** @type {{char: string, len: number} | null} */
+  let open = null
+  return lines
+    .map((line) => {
+      const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+      if (open === null) {
+        // An opening fence's info string may not contain a backtick (CommonMark).
+        if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+          open = { char: m[1][0], len: m[1].length }
+          return blank(line)
+        }
+        return line
+      }
+      if (m && m[1][0] === open.char && m[1].length >= open.len && m[2].trim() === '') {
+        open = null
+      }
+      return blank(line)
+    })
+    .join('\n')
+}
+
+/**
+ * Blank everything that is not changelog PROSE — HTML comments first (so a
+ * fence marker inside a comment cannot open a spurious block), then fenced
+ * code. Line-count preserving, so line numbers survive.
+ * @param {string} text
+ * @returns {string}
+ */
+export function maskNonProse(text) {
+  return maskFencedCode(maskHtmlComments(text))
+}
+
+/**
  * Split a changelog into its `## ` sections with 1-based line numbers.
  *
  * @param {string} changelog
@@ -258,7 +324,10 @@ export function maskHtmlComments(text) {
  *   `## ` heading that is not `## Unreleased`.
  */
 export function parseSections(changelog) {
-  const lines = String(changelog).replace(/\r\n/g, '\n').split('\n')
+  // Fenced code and HTML comments are masked (line-count preserving) first: a
+  // `## ` line inside a fence is pasted OUTPUT, not a section boundary. See
+  // `maskFencedCode`.
+  const lines = maskNonProse(String(changelog).replace(/\r\n/g, '\n')).split('\n')
   /** @type {{heading: string, headingLine: number, start: number, end: number, released: boolean}[]} */
   const sections = []
   for (let i = 0; i < lines.length; i++) {
@@ -293,13 +362,25 @@ export function parseAddedLineNumbers(diffText) {
   const added = new Set()
   let next = 0
   for (const line of String(diffText).replace(/\r\n/g, '\n').split('\n')) {
+    // A new file's header block resets the cursor, so the `+++ b/<path>` /
+    // `--- a/<path>` header lines below are only ever seen with `next === 0`.
+    if (line.startsWith('diff --git ')) {
+      next = 0
+      continue
+    }
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line)
     if (hunk) {
       next = Number(hunk[1])
       continue
     }
+    // Everything before the first hunk of a file — including the `+++`/`---`
+    // file headers — is skipped here. Testing for `+++` INSIDE a hunk body was
+    // a desync bug: `+++foo` there is an added line whose text begins with `+`,
+    // and skipping it without advancing `next` mis-attributed every later added
+    // line in the hunk one line too low — dropping a real entry out of the
+    // placement check, or landing a line number on a heading and exempting the
+    // whole section.
     if (next === 0) continue
-    if (line.startsWith('+++')) continue
     if (line.startsWith('+')) {
       added.add(next)
       next++
@@ -311,32 +392,96 @@ export function parseAddedLineNumbers(diffText) {
 }
 
 /**
+ * The identity of a section, for "is this the SAME section as before?": the
+ * version token, not the whole heading. `## v0.21.0 — a summary` → `v0.21.0`,
+ * so a heading whose ` — summary` tail was edited still resolves to the same
+ * section.
+ * @param {string} heading
+ * @returns {string}
+ */
+function sectionKey(heading) {
+  const m = /^#{1,6}\s+(\S+)/.exec(String(heading).trim())
+  return (m ? m[1] : String(heading).trim()).toLowerCase()
+}
+
+/**
+ * The version tokens of every `## ` heading REMOVED in a `git diff -U0` range.
+ *
+ * Used to tell a heading that was RENAMED (`## Unreleased` → `## v0.21.0`: the
+ * release PR, and a legitimately new section) from one that was merely EDITED
+ * (`## v1.0.0 — teh cut` → `## v1.0.0 — the cut`: a typo fix on a section that
+ * already shipped). Both show the heading line as "added"; only the second one
+ * removes a heading carrying the SAME version token.
+ *
+ * @param {string} diffText
+ * @returns {Set<string>}
+ */
+export function parseRemovedSectionKeys(diffText) {
+  /** @type {Set<string>} */
+  const keys = new Set()
+  let inHunk = false
+  for (const line of String(diffText).replace(/\r\n/g, '\n').split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      inHunk = false
+      continue
+    }
+    if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.test(line)) {
+      inHunk = true
+      continue
+    }
+    if (!inHunk) continue // skips the `--- a/<path>` file header
+    if (!line.startsWith('-')) continue
+    const body = line.slice(1)
+    if (/^##\s/.test(body)) keys.add(sectionKey(body))
+  }
+  return keys
+}
+
+/**
  * Find entries added in this range that landed under an ALREADY-RELEASED
  * heading — the post-release silent-corruption signature.
  *
- * A section whose own heading line was added in the range is exempt: that is
- * the release PR renaming `## Unreleased` to `## vX.Y.Z`, where every line
- * beneath it is legitimately "new" to the diff.
+ * A section that is NEW in this range is exempt: that is the release PR
+ * renaming `## Unreleased` to `## vX.Y.Z`, where every line beneath it is
+ * legitimately "new" to the diff.
+ *
+ * "New" keys on the SECTION, not on the heading LINE. Keying it on the line —
+ * "the heading changed, so exempt everything under it" — meant a one-character
+ * typo fix on an old heading blanket-exempted that entire released section, so
+ * a genuinely buried entry in the same change went unreported. A section is new
+ * iff its heading line was added AND the range did not remove a heading with
+ * the same version token (the rename removes `## Unreleased`; the typo fix
+ * removes `## v1.0.0 — teh cut`).
  *
  * @param {string} headChangelog CHANGELOG.md text at HEAD
  * @param {Set<number>} addedLineNumbers 1-based new-file line numbers
+ * @param {Set<string>} removedSectionKeys from `parseRemovedSectionKeys`
  * @returns {{section: string, line: number, text: string}[]}
  */
-export function findMisplacedEntries(headChangelog, addedLineNumbers) {
+export function findMisplacedEntries(
+  headChangelog,
+  addedLineNumbers,
+  removedSectionKeys = new Set(),
+) {
   const raw = String(headChangelog).replace(/\r\n/g, '\n')
-  const masked = maskHtmlComments(raw).split('\n')
+  // Hoisted: `raw` is >1.3 MiB in this repo, and re-splitting it once per hit
+  // made the report cost quadratic in the number of misplaced lines.
+  const rawLines = raw.split('\n')
+  const masked = maskNonProse(raw).split('\n')
   const sections = parseSections(raw)
   /** @type {{section: string, line: number, text: string}[]} */
   const hits = []
   for (const s of sections) {
     if (!s.released) continue
-    if (addedLineNumbers.has(s.headingLine)) continue // section is new (release PR)
+    const isNewSection =
+      addedLineNumbers.has(s.headingLine) && !removedSectionKeys.has(sectionKey(s.heading))
+    if (isNewSection) continue // release PR: `## Unreleased` renamed to `## vX.Y.Z`
     for (let n = s.start; n <= s.end; n++) {
       if (!addedLineNumbers.has(n)) continue
       const text = (masked[n - 1] ?? '').trim()
-      if (!text) continue // blank, or a line that was pure HTML comment
+      if (!text) continue // blank, an HTML comment, or fenced code
       if (/^#{1,6}\s/.test(text)) continue // a sub-heading is structure, not an entry
-      hits.push({ section: s.heading, line: n, text: raw.split('\n')[n - 1].trim() })
+      hits.push({ section: s.heading, line: n, text: (rawLines[n - 1] ?? '').trim() })
     }
   }
   return hits
@@ -399,6 +544,7 @@ export function hasSkipLabel(labels) {
  *   prBody?: string,
  *   prLabels?: string,
  *   addedChangelogLines?: Set<number>,
+ *   removedChangelogSections?: Set<string>,
  *   placementOnly?: boolean,
  * }} input
  * @returns {{status: 'pass'|'fail', reason: string, shippable?: string[], misplaced?: {section: string, line: number, text: string}[]}}
@@ -411,6 +557,7 @@ export function evaluate({
   prBody = '',
   prLabels = '',
   addedChangelogLines = new Set(),
+  removedChangelogSections = new Set(),
   placementOnly = false,
 }) {
   // RULE 2 first: a misplaced entry is a corruption of already-shipped release
@@ -420,7 +567,11 @@ export function evaluate({
   const placementEscaped =
     hasPlacementToken(prBody) || (commitMessages || []).some((m) => hasPlacementToken(m))
   if (!placementEscaped && addedChangelogLines.size > 0) {
-    const misplaced = findMisplacedEntries(headChangelog, addedChangelogLines)
+    const misplaced = findMisplacedEntries(
+      headChangelog,
+      addedChangelogLines,
+      removedChangelogSections,
+    )
     if (misplaced.length > 0) {
       return { status: 'fail', reason: 'entry added under a released section', misplaced }
     }
@@ -493,12 +644,35 @@ function gitPathExists(treeishPath, cwd) {
 /**
  * Resolve the base ref to diff against. Mirrors the candidate cascade in
  * check-agent-attribution-trailers.mjs.
+ *
+ * `authoritativeBase` disables the cascade: `$CHANGELOG_BASE` is the ONLY
+ * candidate, and its absence is as fatal as its being unresolvable. That is the
+ * queue-ref mode. The cascade cannot be allowed to rescue a merge_group run:
+ * on a `fetch-depth: 0` checkout `origin/main` ALWAYS resolves, so a broken
+ * `$CHANGELOG_BASE` would silently fall through to a range that is NOT the
+ * merged result, and the only check that ever inspects that result would report
+ * a cheerful OK. Distinguishing the two failures matters — deleting the env
+ * line from the workflow leaves the variable UNSET, which a "set but bad" test
+ * would never catch.
+ *
  * @param {string} cwd
  * @param {NodeJS.ProcessEnv} env
- * @returns {{base: string, head: string} | null}
+ * @param {{authoritativeBase?: boolean}} [opts]
+ * @returns {{base: string, head: string} | {error: 'missing-base'|'unresolvable-base'|'no-base'}}
  */
-export function resolveRange(cwd, env = process.env) {
+export function resolveRange(cwd, env = process.env, opts = {}) {
   const head = env.CHANGELOG_HEAD || 'HEAD'
+  if (opts.authoritativeBase) {
+    const base = env.CHANGELOG_BASE
+    if (!base) return { error: 'missing-base' }
+    try {
+      git(['rev-parse', '--verify', '--quiet', `${base}^{commit}`], cwd)
+      git(['merge-base', base, head], cwd)
+      return { base, head }
+    } catch {
+      return { error: 'unresolvable-base' }
+    }
+  }
   const candidates = [
     env.CHANGELOG_BASE,
     env.GITHUB_BASE_REF ? `origin/${env.GITHUB_BASE_REF}` : undefined,
@@ -514,7 +688,7 @@ export function resolveRange(cwd, env = process.env) {
       /* try next candidate */
     }
   }
-  return null
+  return { error: 'no-base' }
 }
 
 const RECORD = '\x1e'
@@ -528,12 +702,27 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
   // in the `pull_request` payload, which does not exist here. See the header.
   const placementOnly = env.GITHUB_EVENT_NAME === 'merge_group'
 
-  const range = resolveRange(cwd, env)
-  if (!range) {
-    // A merge_group run with $CHANGELOG_BASE SET but unresolvable is a broken
-    // workflow, not a shallow clone — and silently skipping it re-opens the
-    // exact hole this check exists to close. Fail loudly instead.
-    if (placementOnly && env.CHANGELOG_BASE) {
+  // On a queue ref $CHANGELOG_BASE is the ONLY acceptable base — no cascade.
+  const range = resolveRange(cwd, env, { authoritativeBase: placementOnly })
+  if ('error' in range) {
+    // A broken merge_group run is a broken workflow, not a shallow clone — and
+    // silently skipping it re-opens the exact hole this check exists to close.
+    // Fail loudly, and name which of the two failures it was.
+    if (range.error === 'missing-base') {
+      return {
+        status: 'fail',
+        lines: [
+          'check-changelog-entry: FAIL — merge_group ran with no base ref.',
+          '',
+          '  $CHANGELOG_BASE is not set. On a queue ref it must carry',
+          '  github.event.merge_group.base_sha — see the `CHANGELOG_BASE:` line in',
+          '  .github/workflows/ci-lint.yml. Falling back to origin/main here would',
+          '  diff the WRONG range (and always succeed on a fetch-depth: 0 checkout),',
+          '  so the placement check would certify nothing while reporting OK.',
+        ],
+      }
+    }
+    if (range.error === 'unresolvable-base') {
       return {
         status: 'fail',
         lines: [
@@ -618,12 +807,12 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     .map((l) => l.trim())
     .filter(Boolean)
 
-  const addedChangelogLines = parseAddedLineNumbers(
-    gitSoft(
-      ['diff', '-U0', '--no-color', `${mergeBase}..${range.head}`, '--', 'CHANGELOG.md'],
-      cwd,
-    ),
+  const changelogDiff = gitSoft(
+    ['diff', '-U0', '--no-color', `${mergeBase}..${range.head}`, '--', 'CHANGELOG.md'],
+    cwd,
   )
+  const addedChangelogLines = parseAddedLineNumbers(changelogDiff)
+  const removedChangelogSections = parseRemovedSectionKeys(changelogDiff)
 
   const baseChangelog = gitSoft(['show', `${mergeBase}:CHANGELOG.md`], cwd)
   const headChangelog = gitSoft(['show', `${range.head}:CHANGELOG.md`], cwd)
@@ -641,6 +830,7 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     prBody: env.CHANGELOG_PR_BODY || '',
     prLabels: env.CHANGELOG_PR_LABELS || '',
     addedChangelogLines,
+    removedChangelogSections,
     placementOnly,
   })
 
@@ -659,6 +849,11 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
     // the part a reader needs, and the full line makes the report unreadable.
     const short = (/** @type {string} */ h) => h.split(' — ')[0].trim()
     const sections = [...new Set(verdict.misplaced.map((m) => short(m.section)))]
+    // The post-release-trap story below is simply wrong when there is no
+    // staging section at all: with no `## Unreleased`, EVERY added line is
+    // necessarily under a released heading, and the fix is to restore the
+    // header, not to rebase. Say which one the reader is looking at.
+    const noUnreleased = !parseSections(headChangelog).some((s) => !s.released)
     return {
       status: 'fail',
       lines: [
@@ -672,6 +867,15 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env) {
           (m) => `  CHANGELOG.md:${m.line}  under \`${short(m.section)}\`\n    ${m.text}`,
         ),
         '',
+        ...(noUnreleased
+          ? [
+              'NOTE: this CHANGELOG.md has NO `## Unreleased` section, so every added line',
+              'necessarily lands under a released heading. Re-add the `## Unreleased` header',
+              'above the newest release and move your entry under it — that section is what',
+              'cutting a release renames, so it must always exist.',
+              '',
+            ]
+          : []),
         'This is almost always the post-release merge trap: you staged the entry under',
         '`## Unreleased`, a release was cut before this merged (renaming that header to',
         `${sections.map((s) => `\`${s}\``).join(', ')}), and the merge then applied your entry TEXTUALLY`,

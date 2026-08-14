@@ -127,8 +127,11 @@ jobs:
         # dorny/paths-filter failure modes .github/MERGE-QUEUE.md warns about,
         # because this is a plain `git diff` inside a job that has already got
         # past checkout. Deleting this line does not make the check skip
-        # quietly: the script FAILs when CHANGELOG_BASE is set-but-unresolvable,
-        # and tests/changelog-entry-check.test.ts asserts this line exists.
+        # quietly: on merge_group the script treats CHANGELOG_BASE as
+        # AUTHORITATIVE — no origin/main fallback — and FAILs both when it is
+        # UNSET (what deleting this line produces) and when it is set but
+        # unresolvable. tests/changelog-entry-check.test.ts pins both, and also
+        # asserts this line exists.
         env:
           CHANGELOG_BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || '' }}
           CHANGELOG_PR_BODY: ${{ github.event_name != 'merge_group' && github.event.pull_request.body || '' }}

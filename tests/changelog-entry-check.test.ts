@@ -511,10 +511,15 @@ describe("check-changelog-entry — non-vacuity", () => {
   it("FAILs when merge_group sets a base ref that does not resolve", () => {
     // A workflow that stops surfacing merge_group.base_sha correctly must break
     // loudly. Skipping here would silently restore the original blind spot.
+    //
+    // NOTE: no `branch -m main detached-away` here on purpose. Renaming `main`
+    // away made EVERY candidate unresolvable, so this test used to pass via the
+    // generic no-base path and never exercised the stated guarantee at all —
+    // it stayed green against a build where the cascade silently rescued the
+    // queue ref with `origin/main`.
     const f = makeFixture("changelog-mg-badbase-");
     f.writeFile("src/feature.ts", "export const feature = 2;\n");
     f.commit("feat: ship on a queue ref");
-    f.git(["branch", "-m", "main", "detached-away"]);
 
     const r = f.check({
       GITHUB_EVENT_NAME: "merge_group",
@@ -529,6 +534,202 @@ describe("check-changelog-entry — non-vacuity", () => {
     // merged result goes uninspected again. Pin it in the workflow itself.
     const wf = readFileSync(join(repoRoot, ".github", "workflows", "ci-lint.yml"), "utf-8");
     expect(wf).toMatch(/CHANGELOG_BASE:.*github\.event\.merge_group\.base_sha/);
+  });
+});
+
+describe("check-changelog-entry — a fenced code block is not a section boundary", () => {
+  // The repo's own changelog style pastes CI/grep output verbatim, so a fenced
+  // block whose CONTENT starts with `## ` is routine (CHANGELOG.md already
+  // carries 30+ fence markers). If the parser treats that as a real heading it
+  // invents a phantom RELEASED section, and every entry appended after it —
+  // i.e. every entry written the documented way, at the end of `## Unreleased`
+  // — reads as landing under a released heading. That is a sticky, repo-wide
+  // false FAIL: once one such fenced block lands, every subsequent PR reds.
+  const FENCED = [
+    "# Changelog",
+    "",
+    "## Unreleased",
+    "",
+    "<!-- staging area; entries land here per-PR -->",
+    "",
+    "- **Earlier entry (#0):** quoting a CI transcript verbatim:",
+    "",
+    "```",
+    "## v9.9.9 — sample output",
+    "- not a real heading, just pasted stdout",
+    "```",
+    "",
+    "## v0.20.11 — a released section",
+    "",
+    "- **Something shipped (#1):** prose.",
+    "",
+  ].join("\n");
+
+  it("does NOT flag an entry appended after a fenced block that contains a `## ` line", () => {
+    const f = makeFixture("changelog-fence-", FENCED);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      FENCED.replace(
+        "```\n\n## v0.20.11",
+        "```\n\n- **Branch entry (#2):** appended at the end of Unreleased.\n\n## v0.20.11",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry below a fenced block");
+
+    const r = f.check();
+    expect(r.out).not.toContain("ALREADY-RELEASED");
+    expect(r.out).not.toContain("v9.9.9");
+    expect(r.code).toBe(0);
+  });
+
+  it("counts an entry below a fenced block as real Unreleased growth", () => {
+    // `extractUnreleasedEntries` shares the blindness: it TRUNCATES the section
+    // at the fenced `## ` line, so an entry appended after the fence is invisible
+    // to RULE 1 and a genuinely-staged PR fails for want of an entry.
+    const f = makeFixture("changelog-fence-growth-", FENCED);
+    f.writeFile("src/feature.ts", "export const feature = 3;\n");
+    f.writeFile(
+      "CHANGELOG.md",
+      FENCED.replace(
+        "```\n\n## v0.20.11",
+        "```\n\n- **Branch entry (#2):** appended at the end of Unreleased.\n\n## v0.20.11",
+      ),
+    );
+    f.commit("feat: ship code and stage an entry below a fenced block");
+
+    const r = f.check();
+    expect(r.out).toContain("## Unreleased grew");
+  });
+});
+
+describe("check-changelog-entry — the queue-ref base is authoritative", () => {
+  it("FAILs when merge_group's $CHANGELOG_BASE does not resolve, even though `main` does", () => {
+    // The guarantee ci-lint.yml claims. The fallback cascade (origin/main, main)
+    // must NOT rescue a queue ref: on a real fetch-depth: 0 checkout `origin/main`
+    // ALWAYS resolves, so a cascade here means a broken workflow silently checks
+    // the wrong range and reports OK. Note there is no `branch -m` here — `main`
+    // is present and resolvable, which is the whole point.
+    const f = makeFixture("changelog-mg-badbase-fallback-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.commit("feat: ship on a queue ref");
+
+    const r = f.check({
+      GITHUB_EVENT_NAME: "merge_group",
+      CHANGELOG_BASE: "does-not-exist-ref",
+    });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("merge_group base ref is unresolvable");
+  });
+
+  it("FAILs when merge_group runs with no $CHANGELOG_BASE at all", () => {
+    // Deleting the `CHANGELOG_BASE:` line from ci-lint.yml leaves the variable
+    // UNSET, not set-to-garbage. That must break loudly too — otherwise the
+    // cascade quietly falls through to `main` and the queue check certifies a
+    // range that is not the merged result.
+    const f = makeFixture("changelog-mg-nobase-");
+    f.writeFile("src/feature.ts", "export const feature = 2;\n");
+    f.commit("feat: ship on a queue ref");
+
+    const r = f.check({ GITHUB_EVENT_NAME: "merge_group", CHANGELOG_BASE: "" });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("merge_group ran with no base ref");
+  });
+});
+
+describe("check-changelog-entry — diff parsing and section newness", () => {
+  it("does not lose added lines after one whose CONTENT starts with `+++`", () => {
+    // In a `-U0` hunk body, `+++foo` is an ADDED LINE whose text begins with
+    // `+`, not the `+++ b/<path>` file header. Treating it as a header without
+    // advancing the new-file cursor mis-attributes every later added line in the
+    // hunk one line too low — which can drop a real entry out of the placement
+    // check entirely (or land a line number on a heading, exempting it).
+    const SEED = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-plusplus-", SEED);
+    f.writeFile(
+      "CHANGELOG.md",
+      SEED.replace(
+        "- **Something shipped (#1):** prose.\n",
+        "- **Something shipped (#1):** prose.\n" +
+          "- **Buried A (#2):** first.\n" +
+          "+++ pasted diff header, still a changelog line\n" +
+          "- **Buried C (#4):** third.\n",
+      ),
+    );
+    f.commit("docs: append three lines under the released section");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    // All three added lines sit under the released heading; all three must be
+    // reported. The `+++` desync drops the LAST one.
+    expect(r.out).toContain("Buried A (#2)");
+    expect(r.out).toContain("Buried C (#4)");
+  });
+
+  it("still catches a buried entry when the released heading itself was edited", () => {
+    // The exemption exists for the release PR, which RENAMES `## Unreleased` to
+    // `## vX.Y.Z`. Keying it on "the heading LINE changed" instead of "the
+    // section is new" means a one-character typo fix on an old heading blanket-
+    // exempts that whole section — and any entry buried in it goes unreported.
+    const SEED = [
+      "# Changelog",
+      "",
+      "## Unreleased",
+      "",
+      "## v0.20.11 — a relesed section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-heading-typo-", SEED);
+    f.writeFile(
+      "CHANGELOG.md",
+      SEED.replace("a relesed section", "a released section").replace(
+        "- **Something shipped (#1):** prose.\n",
+        "- **Something shipped (#1):** prose.\n- **Buried entry (#2):** should be caught.\n",
+      ),
+    );
+    f.commit("docs: fix a typo in an old heading and (wrongly) add an entry under it");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("Buried entry (#2)");
+  });
+
+  it("names the missing-`## Unreleased` case in the FAIL message", () => {
+    // With no `## Unreleased` section at all, EVERY added line is necessarily
+    // under a released heading, and the generic "you staged it under Unreleased
+    // and a release was cut" story is simply wrong. Say the real thing.
+    const SEED = [
+      "# Changelog",
+      "",
+      "## v0.20.11 — a released section",
+      "",
+      "- **Something shipped (#1):** prose.",
+      "",
+    ].join("\n");
+    const f = makeFixture("changelog-no-unreleased-", SEED);
+    f.writeFile(
+      "CHANGELOG.md",
+      SEED.replace(
+        "- **Something shipped (#1):** prose.\n",
+        "- **Something shipped (#1):** prose.\n- **New entry (#2):** nowhere to put it.\n",
+      ),
+    );
+    f.commit("docs: add an entry to a changelog with no Unreleased section");
+
+    const r = f.check();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("has NO `## Unreleased` section");
   });
 });
 

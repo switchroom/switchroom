@@ -415,8 +415,12 @@ export function run(cwd = resolveRepoRoot(process.cwd()), env = process.env, arg
   }
 
   const baseArg = typeof args.base === 'string' ? args.base : undefined
+  // `resolveRange` reports failure as an `{error}` object rather than null (so
+  // its queue-ref caller can tell "base unset" from "base unresolvable"). This
+  // author-side helper skips on either — but it must TEST for the error rather
+  // than for falsiness, since `{error}` is truthy.
   const range = resolveRange(cwd, baseArg ? { ...env, CHANGELOG_BASE: baseArg } : env)
-  if (!range) {
+  if ('error' in range) {
     return { status: 'skip', lines: ['gen-changelog-entry: SKIP — no base ref to diff against.'] }
   }
   const mergeBase = gitSoft(['merge-base', range.base, range.head], cwd).trim()

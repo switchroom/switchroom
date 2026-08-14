@@ -49,6 +49,47 @@ now an anomaly worth investigating, not the norm.
   still falls through to `resolveThreadId`'s chat-scoped last-seen topic, which
   can only ever yield a topic valid for the target chat. Callers that supply no
   chat ids are unaffected.
+- **ci: the changelog guard now catches an entry that lands in an
+  already-released section** — a PR that stages its entry under `## Unreleased`
+  and then has a release cut underneath it merges **textually clean**: git
+  reapplies the entry at the same offset, which is now inside the shipped
+  `## vX.Y.Z` section. Exit 0, zero conflicts, wrong release notes, entry buried
+  forever. Nothing caught it, because the only moment the corruption exists is
+  the MERGED result: the `pull_request` run measures growth against the PR's own
+  merge-base (which predates the release, so the entry still reads as staged),
+  and `check-changelog-entry.mjs` SKIPped `merge_group` outright, so the queue
+  never re-checked. Four PRs (#4679–#4682) hit this simultaneously behind the
+  v0.21.9 cut; a fifth (#4561) landed the same way in August and was repaired by
+  hand at release time. The guard gains a PLACEMENT rule — no line added in the
+  range may land under a released heading, unless that SECTION is new in the
+  same range (the release PR's own `## Unreleased` → `## vX.Y.Z` rename) — and
+  it now RUNS on `merge_group`, where `github.event.merge_group.base_sha`
+  supplies the base the old skip note claimed did not exist. The entry-required
+  rule still stands down there, since its `no-changelog` / PR-body escape hatch
+  is unreadable on a queue ref; placement reads only the diff, so it needs no PR
+  context. The message names the real problem and fix (`your entry is under
+  ## v0.21.8, move it back under ## Unreleased`) instead of the misleading
+  `adds no new entry` symptom, and an EMPTY diff range now WARNs that it checked
+  nothing — the local-review trap where `npm run lint` over an *uncommitted*
+  merge printed a cheerful OK. Deliberate old-section edits opt out with
+  `[changelog placement ok]` on its own line. Four things the parser now gets
+  right, each of which otherwise turns the new rule into a false FAIL or a
+  silent miss: (1) **fenced code is masked** before sections are parsed — this
+  changelog pastes CI transcripts verbatim and already carries 30+ fence
+  markers, and a fenced line reading `## v9.9.9 — sample output` used to become
+  a phantom released section, which would then have red-flagged EVERY later PR
+  appending to the end of `## Unreleased`, repo-wide, until the code block was
+  deleted; (2) on a queue ref `$CHANGELOG_BASE` is **authoritative, with no
+  `origin/main` fallback**, and both UNSET and set-but-unresolvable FAIL —
+  previously the cascade always rescued it (on a `fetch-depth: 0` checkout
+  `origin/main` always resolves), so a broken workflow silently diffed the
+  wrong range and reported OK; (3) a diff line whose CONTENT begins with `+++`
+  no longer desyncs the new-file line cursor, which used to attribute every
+  later added line in the hunk one line too low; and (4) editing a released
+  heading (a typo fix) no longer blanket-exempts that whole section — newness
+  keys on the section's version token, not on the heading line changing. A
+  changelog with no `## Unreleased` section at all now gets a message that says
+  so, instead of the inapplicable post-release-merge story.
 - **telegram/render: a `<pre>` whose body contained ``` shipped an
   unterminated fence** — #4702's `<pre>` fold (`buildPreBlock`,
   `telegram-plugin/render/parse.ts`) emitted a HARDCODED three-backtick
@@ -157,31 +198,6 @@ now an anomaly worth investigating, not the norm.
   now in that file, 29 fail on `fa9018a7` and 8 are guards that pass on both
   revisions.
 
-- **ci: the changelog guard now catches an entry that lands in an
-  already-released section** — a PR that stages its entry under `## Unreleased`
-  and then has a release cut underneath it merges **textually clean**: git
-  reapplies the entry at the same offset, which is now inside the shipped
-  `## vX.Y.Z` section. Exit 0, zero conflicts, wrong release notes, entry buried
-  forever. Nothing caught it, because the only moment the corruption exists is
-  the MERGED result: the `pull_request` run measures growth against the PR's own
-  merge-base (which predates the release, so the entry still reads as staged),
-  and `check-changelog-entry.mjs` SKIPped `merge_group` outright, so the queue
-  never re-checked. Four PRs (#4679–#4682) hit this simultaneously behind the
-  v0.21.9 cut; a fifth (#4561) landed the same way in August and was repaired by
-  hand at release time. The guard gains a PLACEMENT rule — no line added in the
-  range may land under a released heading, unless that heading was added in the
-  same range (the release PR's own rename) — and it now RUNS on `merge_group`,
-  where `github.event.merge_group.base_sha` supplies the base the old skip note
-  claimed did not exist. The entry-required rule still stands down there, since
-  its `no-changelog` / PR-body escape hatch is unreadable on a queue ref;
-  placement reads only the diff, so it needs no PR context. The message names
-  the real problem and fix (`your entry is under ## v0.21.8, move it back under
-  ## Unreleased`) instead of the misleading `adds no new entry` symptom, a
-  set-but-unresolvable `$CHANGELOG_BASE` on a queue ref now FAILs rather than
-  skipping, and an EMPTY diff range now WARNs that it checked nothing — the
-  local-review trap where `npm run lint` over an *uncommitted* merge printed a
-  cheerful OK. Deliberate old-section edits opt out with
-  `[changelog placement ok]` on its own line.
 - **voice: unit-suffix regex lookbehind + case-sensitivity hotfix** — the
   number+unit-suffix regex shared by both TTS normalization passes
   (`telegram-plugin/voice-normalize-text.ts`, `telegram-plugin/tts-normalize.ts`)

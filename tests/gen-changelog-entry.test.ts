@@ -45,6 +45,13 @@ interface Fixture {
   writeFile: (rel: string, body: string) => void;
   commit: (message: string) => string;
   readChangelog: () => string;
+  /**
+   * Run git inside the fixture under its HERMETIC env (pinned identity, no
+   * ambient `~/.gitconfig`). Every git call a test makes MUST go through this:
+   * a bare `execFileSync("git", ...)` inherits the ambient environment, and a
+   * CI runner has no `user.name` / `user.email`.
+   */
+  git: (args: string[]) => string;
   /** Run the real generator over `main...HEAD`; returns exit code + output. */
   gen: (extraArgs?: string[], extraEnv?: Record<string, string>) => { code: number; out: string };
 }
@@ -96,6 +103,7 @@ function makeFixture(prefix: string, initialChangelog: string = SEED_CHANGELOG):
       git(["commit", "-q", "-m", message]);
       return git(["rev-parse", "HEAD"]).trim();
     },
+    git,
     readChangelog() {
       return readFileSync(join(dir, "CHANGELOG.md"), "utf-8");
     },
@@ -298,6 +306,23 @@ describe("gen-changelog-entry — no-ops that must never write", () => {
     expect(r.code).toBe(0);
     expect(f.readChangelog()).toBe(before);
     expect(r.out).toContain("merge_group");
+  });
+
+  it("skips cleanly when no base ref resolves", () => {
+    // `resolveRange` is shared with check-changelog-entry.mjs and reports
+    // failure as an `{error}` OBJECT, not null — a truthiness test here would
+    // sail past the guard and then diff against `undefined..HEAD`, so pin the
+    // skip. Rename `main` away so no candidate in the cascade resolves.
+    const f = makeFixture("gen-nobase-");
+    f.writeFile("src/feature.ts", "export const x = 1;\n");
+    f.commit("feat(cli): add a verb");
+    f.git(["branch", "-m", "main", "detached-away"]);
+
+    const before = f.readChangelog();
+    const r = f.gen(["--pr", "11"]);
+    expect(r.code).toBe(0);
+    expect(f.readChangelog()).toBe(before);
+    expect(r.out).toContain("no base ref to diff against");
   });
 
   it("--dry-run prints the entry but writes nothing", () => {
