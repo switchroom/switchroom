@@ -40,6 +40,10 @@ now an anomaly worth investigating, not the norm.
   are assembled from fragments and never match themselves, but the exemption
   made it the one tracked file where a contiguous real identifier could sit
   unflagged.
+  A sanctioned shape carrying a `g` or `y` flag is now rejected outright: those
+  flags make `.test()` stateful, so the same body alternates true/false across
+  occurrences and half the legitimate example ids in the tree would be reported
+  as offenders on alternating hits — a nondeterministic lint failure.
 
 ### Bug fixes
 

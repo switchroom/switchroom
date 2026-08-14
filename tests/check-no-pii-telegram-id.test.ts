@@ -235,6 +235,57 @@ describe("check-no-pii-secrets — Telegram supergroup id rule", () => {
     expect(r.out).toContain('known-real "user"');
   });
 
+  it("fails closed when a sanctioned shape carries a stateful g/y flag", () => {
+    // `.test()` on a `g`- or `y`-flagged regex advances `lastIndex`, so the
+    // SAME body alternates true/false across calls: `/^(\d)\1+$/g` tested four
+    // times against one repeated-digit body returns true,false,true,false.
+    // `isSanctionedIdBody` calls `.test()` once per id occurrence in the tree,
+    // so every second legitimate repeated-digit id would be reported as an
+    // offender and lint would fail depending on how many such ids happen to
+    // precede it in the scan. The fixture below carries four sanctioned
+    // repeated-digit ids: without the flag check the guard exits 1 reporting
+    // two of them as "unsanctioned Telegram supergroup id" — a false positive
+    // on ids the allowlist explicitly blesses. With the check it exits 1 at
+    // config-validation time instead, naming the offending shape.
+    const f = makeFixture("pii-id-stateful-");
+    const src = execFileSync("cat", [CHECK_ABS], { encoding: "utf-8" });
+    const mutated = src.replace(/re: \/\^\(\\d\)\\1\+\$\//, "re: /^(\\d)\\1+$/g");
+    expect(mutated).not.toBe(src); // the mutation actually applied
+    f.writeFile(CHECK_REL, mutated);
+    f.writeFile(
+      "src/fixture.ts",
+      [
+        "export const A = -1001111111111",
+        "export const B = -1002222222222",
+        "export const C = -1003333333333",
+        "export const D = -1004444444444",
+        "",
+      ].join("\n"),
+    );
+    const r = f.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("FAILED CLOSED");
+    expect(r.out).toContain("stateful flag (g)");
+    expect(r.out).toContain("(\\d)\\1+");
+    // ...and it must NOT have reached the scan and mislabelled sanctioned ids.
+    expect(r.out).not.toContain("unsanctioned Telegram supergroup id");
+  });
+
+  it("fails closed on a sticky-flagged sanctioned shape too", () => {
+    // `y` is stateful for the same reason `g` is — `.test()` advances
+    // `lastIndex` — so it must be rejected on the same terms.
+    const f = makeFixture("pii-id-sticky-");
+    const src = execFileSync("cat", [CHECK_ABS], { encoding: "utf-8" });
+    const mutated = src.replace(/re: \/\^\(\\d\)\\1\+\$\//, "re: /^(\\d)\\1+$/y");
+    expect(mutated).not.toBe(src); // the mutation actually applied
+    f.writeFile(CHECK_REL, mutated);
+    f.writeFile("src/fixture.ts", "export const OK = 1\n");
+    const r = f.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("FAILED CLOSED");
+    expect(r.out).toContain("stateful flag (y)");
+  });
+
   it("scans its own source — a contiguous id in the guard is caught", () => {
     // The guard used to skip its own path. That made it the one tracked file
     // where a contiguous real id could sit unflagged, and one did.

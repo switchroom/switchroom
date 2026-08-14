@@ -21,8 +21,31 @@
  *
  * Patterns are assembled at runtime from fragments so this file itself
  * never contains a contiguous PII literal (same discipline as the
- * token-fixture rule in CLAUDE.md → "Secrets in tests"), which keeps
- * the gate from flagging itself and avoids GitHub Push Protection.
+ * token-fixture rule in CLAUDE.md → "Secrets in tests"), which avoids
+ * GitHub Push Protection. Since #4712 the gate also scans its OWN source,
+ * so that discipline is enforced rather than merely conventional.
+ *
+ * What this gate does NOT catch (a design bound, not a defect):
+ *
+ *   Matching is LINE-SCOPED and LITERAL. Both the denylist `RULES` and the
+ *   structural `-100…` rule are applied to one line at a time, against the
+ *   raw source text. So an identifier is invisible to this gate if it is
+ *   split across a newline, broken up by `_`/spaces/other separators, or
+ *   encoded (base64, hex, char codes). A measured sample of obfuscation
+ *   forms during #4712 review missed 30 of 75 — ALL of them deliberate
+ *   obfuscation, none of them a shape anyone writes by accident.
+ *
+ *   That bound is inherent to a line-based literal denylist and is
+ *   deliberately not chased: this gate defends against the ACCIDENT (an
+ *   agent or contributor pasting a real id back into a fixture, doc, or
+ *   CHANGELOG), not against an author who is actively trying to smuggle
+ *   one past it. It is also the same property that lets this very file
+ *   write its own patterns as `'<first half>' + '<second half>'` fragments
+ *   without tripping itself — the convention and the bound are one
+ *   mechanism, so closing the bound would break the convention. An author
+ *   determined to defeat the gate can also craft a widening of
+ *   `SANCTIONED_ID_SHAPES` that dodges the self-check; the mandatory `why`
+ *   string and code review are the defence there, not more regex.
  *
  * Run: `npm run lint:no-pii` (also part of `npm run lint`).
  */
@@ -96,10 +119,12 @@ function realTelegramId(digits) {
  * is exactly how the "fleet forum" id sat in
  * `tests/scaffold.reconcile-group.test.ts` before #4712 scrubbed it. (Written
  * as a placeholder here on purpose: this file must never carry a contiguous
- * real id, even though it exempts itself from its own scan.) Without a literal
- * entry, anyone rebasing a branch cut before
- * the scrub — or restoring that fixture from a stale checkout — puts the real
- * id back into a public repo with lint green.
+ * real id — and since #4712 it no longer exempts itself from its own scan, so
+ * one written here would be flagged like anywhere else — see the
+ * self-exemption note near the top of the module body.) Without a literal
+ * entry, anyone rebasing a branch
+ * cut before the scrub — or restoring that fixture from a stale checkout —
+ * puts the real id back into a public repo with lint green.
  *
  * Add a body here whenever an id is scrubbed. Never remove one.
  */
@@ -262,6 +287,19 @@ function assertRuleIsLive() {
   for (const s of SANCTIONED_ID_SHAPES) {
     if (!(s.re instanceof RegExp) || typeof s.why !== 'string' || s.why.trim() === '') {
       throw new Error(`SANCTIONED_ID_SHAPES entry missing a regex or a justification: ${JSON.stringify(s)}`)
+    }
+    // A shape carrying `g` or `y` is STATEFUL: `.test()` advances `lastIndex`,
+    // so the same body alternates true/false across calls (`/^(\d)\1+$/g`
+    // against one repeated-digit body four times returns true,false,true,false).
+    // `isSanctionedIdBody` calls `.test()` once per id occurrence in the tree,
+    // so half the legitimate sanctioned ids would be reported as offenders,
+    // and which half depends on scan order: lint fails nondeterministically.
+    // Fail-closed noise rather than a leak, but still wrong. Shapes are
+    // anchored whole-body matchers; they never need either flag.
+    if (s.re.global || s.re.sticky) {
+      throw new Error(
+        `SANCTIONED_ID_SHAPES entry ${s.re} carries a stateful flag (${s.re.global ? 'g' : ''}${s.re.sticky ? 'y' : ''}) — .test() would alternate true/false on repeat bodies; remove the flag`,
+      )
     }
     // A shape that admits any KNOWN-REAL body is a vacuous allowlist. Every
     // body is tested, not a sample: a sample leaves a widening that misses the
