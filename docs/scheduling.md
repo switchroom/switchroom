@@ -166,7 +166,7 @@ agents:
   marko:
     channels:
       telegram:
-        chat_id: "-1003831053471"      # the supergroup marko owns
+        chat_id: "-1001234567890"      # the supergroup this agent posts into
         default_topic_id: 1            # General — where untargeted crons land
         topic_aliases:
           meta: 3                      # "Meta Campaigns"
