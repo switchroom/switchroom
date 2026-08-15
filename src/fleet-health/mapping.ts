@@ -88,6 +88,24 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     job_spec: "talk-to-agents-from-anywhere",
     signature: "reply-delivery-failure:sendRichMessage-err",
   },
+  "reply-delivery-recovered": {
+    // #4735 — the same rejection, but a later rich send to the SAME chat landed
+    // inside the send stack's own recovery window, so one of the gateway's
+    // fallback ladders delivered it (thread-drop, 429 flood sleep, backstop
+    // re-attempt, card re-send). #3931's `status=err` = OUTCOME contract only
+    // holds for sends routed through the retry policy — `willRetryTelegramFailure`
+    // returns `false` whenever the attempt context is absent
+    // (`retry-api-call.ts:207`), so every ladder outside that policy logged a
+    // recovered send as terminal. 12 of the fleet's 16 recorded occurrences
+    // provably delivered. Severity 1, informational: the operator still sees the
+    // rejection (a rising rate is real signal about the wire), but a reply they
+    // already read must not open a severity-3 lost-reply issue. Exactly the
+    // split `orphaned-db-handle-recovered` makes, and for the same reason.
+    failure_mode: "drift",
+    severity: 1,
+    job_spec: "talk-to-agents-from-anywhere",
+    signature: "reply-delivery-recovered:sendRichMessage-err-then-ok",
+  },
   "orphaned-db-handle": {
     // The gateway held a `*.db` handle onto a DELETED inode: every INSERT
     // through it reported success and none of the rows were on disk. That is
@@ -294,6 +312,12 @@ export function countingUnitFor(signal: L0Signal): FleetHealthCountingUnit {
 const RECLASSIFICATION_GROUPS: readonly (readonly L0Signal[])[] = [
   ["orphaned-db-handle", "orphaned-db-handle-recovered"],
   ["silent-no-op-candidate", "flush-recovered-turn"],
+  // #4735 — the existing `reply-delivery-failure` cluster is mostly recovered
+  // sends, so this scan MOVES those findings to the sibling key. Without the
+  // group the old key's drop to (near) zero reads as "someone fixed it" and
+  // gh-sync closes the issue with a "Verified count-drop" claim it cannot
+  // support — the exact false auto-close #4682 B1 documents.
+  ["reply-delivery-failure", "reply-delivery-recovered"],
 ];
 
 /** dedup_key → the dedup_keys its findings can reclassify into. Derived from

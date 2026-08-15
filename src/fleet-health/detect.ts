@@ -14,6 +14,7 @@
  */
 
 import { ROUTE_FIELD_SHIP_TS } from "../../telegram-plugin/gateway/turn-record-status.js";
+import { DEFAULT_MAX_FLOOD_SLEEP_MS } from "../../telegram-plugin/retry-api-call.js";
 
 /** Tuned hang threshold: >6 min (live data p99 = 303 s). Load-bearing —
  *  do not casually change (see RFC "Tuned constants"). */
@@ -104,6 +105,14 @@ export type GatewaySignal =
   // them. `history.db` self-heals in process; `registry.db` and anything else
   // needs a restart — either way a human has to be told, which is what this
   // signal is for. See `telegram-plugin/gateway/orphaned-db-sweep.ts`.
+  // The same `sendRichMessage` rejection, but a later rich send to the SAME
+  // chat landed inside the recovery window: one of the gateway's fallback
+  // ladders (thread-drop, 429 flood sleep, transport re-attempt, card re-send)
+  // put the message in the chat. The user got the answer, so this is not the
+  // severity-3 success-theater incident `reply-delivery-failure` describes —
+  // it is the recovery mechanism working. Informational counterpart, exactly
+  // as `orphaned-db-handle-recovered` is to `orphaned-db-handle`.
+  | "reply-delivery-recovered"
   | "orphaned-db-handle"
   // The same alarm, but the sweep's OWN recovery landed in the same tick: the
   // `history.db` lane reopened and proved the handle durable again, and no
@@ -200,7 +209,7 @@ export interface AgentScanResult {
  *  same sweep tick (see `classifyOrphanedDbTick`). */
 export type LineMatchedGatewaySignal = Exclude<
   GatewaySignal,
-  "orphaned-db-handle-recovered"
+  "orphaned-db-handle-recovered" | "reply-delivery-recovered"
 >;
 
 export const GATEWAY_SIGNATURES: Record<LineMatchedGatewaySignal, RegExp> = {
@@ -252,6 +261,7 @@ const GATEWAY_SIGNAL_MEMBERS: Record<GatewaySignal, true> = {
   "duplicate-delivery-represent": true,
   "represent-escalation": true,
   "reply-delivery-failure": true,
+  "reply-delivery-recovered": true,
   "orphaned-db-handle": true,
   "orphaned-db-handle-recovered": true,
 };
@@ -402,6 +412,124 @@ export function classifyOrphanedDbTick(
   }
   // `null` — the log ended before the lane reported: we cannot prove a recovery.
   return verdict ?? "unrecovered";
+}
+
+/**
+ * Any `tg-post` line for a rich send, whatever its status. This is the set the
+ * recovery scan walks: the failing line and every later ATTEMPT on the same
+ * chat are all members, so an episode is read from the emitter's own attempt
+ * stream rather than from arbitrary neighbouring log traffic.
+ */
+const TG_POST_RICH_LINE_RE = /tg-post method=sendRichMessage /;
+
+/** The `status=` field of a `tg-post` line. Same `(?![a-z])` token pinning as
+ *  `GATEWAY_SIGNATURES["reply-delivery-failure"]`, so `ok` can never match a
+ *  future `ok<suffix>` tier. */
+const TG_POST_STATUS_RE = /\bstatus=(ok|benign|retry|err)(?![a-z])/;
+
+/** The chat the send was addressed to. `-` when the method carries no
+ *  `chat_id` (`bot-runtime.ts:153`), which is never true of `sendRichMessage`
+ *  but is handled rather than assumed. */
+const TG_POST_CHAT_RE = /\bchat=(-?\d+)\b/;
+
+/**
+ * How long after a rejected rich send a later successful rich send to the SAME
+ * chat still counts as THAT send's recovery.
+ *
+ * Derived, not invented: `DEFAULT_MAX_FLOOD_SLEEP_MS` is the ceiling on how
+ * long `createRetryApiCall` will park in-process before re-attempting
+ * (`retry-api-call.ts:662` throws `FLOOD_WAIT_ACTIVE` rather than sleep past
+ * it), and it is the slowest of the gateway's recovery ladders by a wide
+ * margin — the observed thread-drop recovery took 554ms and the observed
+ * edit-flood-fuse deferral ~40s. A gap wider than the send stack's own maximum
+ * recovery wait is a different delivery episode, not a recovery, so the window
+ * moves automatically if that ceiling ever does.
+ */
+export const REPLY_DELIVERY_RECOVERY_WINDOW_MS = DEFAULT_MAX_FLOOD_SLEEP_MS;
+
+/** Millisecond instant of a gateway log line, or null when it carries no
+ *  parseable timestamp. Goes through `extractTs` so the UTC-by-convention
+ *  normalisation (#4622) applies here too — reading the raw match with
+ *  `Date.parse` would misdate a designator-less line by the host's offset. */
+function lineInstantMs(line: string): number | null {
+  const iso = extractTs(line);
+  if (iso === null) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Decide whether a rejected `sendRichMessage` at `failIdx` was RECOVERED by a
+ * later rich send that landed in the same chat.
+ *
+ * #4735 — `status=err` was specified (#3931, `bot-runtime.ts:131-140`) to mean
+ * a TERMINAL outcome: an attempt the retry policy will repeat is labelled
+ * `status=retry` instead. That contract holds only for sends routed through
+ * `createRetryApiCall`, because `willRetryTelegramFailure` returns `false` the
+ * moment `_getTgAttemptContext()` is empty (`retry-api-call.ts:207`). Several
+ * of the gateway's recovery ladders sit ABOVE or OUTSIDE that policy and are
+ * therefore invisible to it:
+ *
+ *   - the THREAD_NOT_FOUND thread-drop ladder, which the policy hands OFF to
+ *     the caller by design (`retry-api-call.ts:693-702` rethrows
+ *     `THREAD_NOT_FOUND`; `outbound-send-path.ts:575-586` drops the thread and
+ *     re-sends) — 4 occurrences, one observed recovering in 554ms;
+ *   - the edit-flood-fuse deferral, which re-issues the send on a later tick,
+ *     off the async chain the attempt context lives on — observed recovering
+ *     in ~40s;
+ *   - `runBackstopDelivery`'s bounded in-turn re-attempt, above the policy;
+ *   - the queued-card re-send after `queued card send failed`
+ *     (`stream-render.ts:393`).
+ *
+ * Of the 16 `status=err` rich sends on the live fleet's gateway logs, 12
+ * provably delivered — the detector was paging the operator about replies they
+ * had already read, which is the success-theater inversion the ledger exists
+ * to avoid.
+ *
+ * The verdict is derived from the log's CONTENT and its own timestamps, never
+ * from how many lines follow — the position-dependence #4682 B1 removed from
+ * `classifyOrphanedDbTick`. Two facts settle it:
+ *
+ * 1. WHICH sends are candidates is stated by the line itself: `chat=<id>` is
+ *    the only identity a `tg-post` line carries (`bot-runtime.ts:170` — the
+ *    `origin=` tag would come from `withTgPostTags`, which is exported and
+ *    imported but never CALLED, so no production line carries one). Only a
+ *    later rich send to the SAME chat can be this send's recovery.
+ * 2. WHETHER it recovered is stated by that send's status: the first `status=ok`
+ *    within `REPLY_DELIVERY_RECOVERY_WINDOW_MS` is the landing. `err`/`retry`/
+ *    `benign` attempts in between are further attempts in the same episode and
+ *    are skipped; running out of window, or out of log, keeps the failure.
+ *
+ * A failing line with no parseable chat or timestamp is UNRECOVERED: an
+ * unprovable recovery must fail toward the alarm, never away from it.
+ *
+ * Deliberately NOT cleared: a `chat not found` rejection whose only later
+ * delivery is to a DIFFERENT chat (the operator-DM fallback). The send to the
+ * addressed chat really did fail terminally and the routing really is broken —
+ * the user being reachable elsewhere does not make that a non-event.
+ */
+export function classifyReplyDeliveryEpisode(
+  lines: readonly string[],
+  failIdx: number,
+): "recovered" | "unrecovered" {
+  const failLine = lines[failIdx] ?? "";
+  const chat = TG_POST_CHAT_RE.exec(failLine)?.[1];
+  if (chat === undefined) return "unrecovered";
+  const failMs = lineInstantMs(failLine);
+  if (failMs === null) return "unrecovered";
+
+  for (let j = failIdx + 1; j < lines.length; j++) {
+    const line = lines[j];
+    if (!line || !TG_POST_RICH_LINE_RE.test(line)) continue;
+    if (TG_POST_CHAT_RE.exec(line)?.[1] !== chat) continue;
+    const ms = lineInstantMs(line);
+    // An undatable attempt cannot be placed inside or outside the window; skip
+    // it rather than let it end the episode or extend it.
+    if (ms === null) continue;
+    if (ms - failMs > REPLY_DELIVERY_RECOVERY_WINDOW_MS) break;
+    if (TG_POST_STATUS_RE.exec(line)?.[1] === "ok") return "recovered";
+  }
+  return "unrecovered";
 }
 
 /** Parse `turns.jsonl` text into records, silently skipping malformed lines
@@ -556,14 +684,23 @@ export function detectTurnFindings(
       t.ts != null &&
       t.ts >= silentNoopFloorTs
     ) {
-      if (route === "flush") {
+      // A message id LANDED on a backstop path. `landed_unconfirmed` is written
+      // only by `runBackstopDelivery`'s read-back accounting
+      // (`turn-record-status.ts:255-269`): it counts ids Telegram ACKED that the
+      // read-back probe could not re-confirm. Its presence is therefore hard,
+      // positive evidence that a send left the gateway and the Bot API took it —
+      // which is exactly the fact "silent no-op" denies. Whatever `route` says
+      // (or fails to say), such a turn is a backstop delivery, not silence.
+      const landedBackstop =
+        typeof t.landed_unconfirmed === "number" && t.landed_unconfirmed > 0;
+      if (route === "flush" || (landedBackstop && route !== "reply" && route !== "stream")) {
         // Answer delivered by a turn-flush / outbox-sweep backstop after the
         // reply tool was bypassed. Informational (LOW sev) — the user got it.
         findings.push({
           signal: "flush-recovered-turn",
           agent,
           turn_id: tid,
-          log_pointer: `turns.jsonl:${tid} tools=0 route=flush`,
+          log_pointer: `turns.jsonl:${tid} tools=0 route=${route ?? "-"} landed_unconfirmed=${t.landed_unconfirmed ?? 0}`,
           ts,
         });
       } else if (route === "reply" || route === "stream") {
@@ -583,6 +720,16 @@ export function detectTurnFindings(
         // (predates the field) so it stops scoring sev-3; but a field-less row
         // AT/AFTER the ship epoch is a regression (the gateway dropped the
         // field) — treat it as `none` so it still surfaces.
+        //
+        // #4735 — the epoch alone was not enough. `ROUTE_FIELD_SHIP_TS` is a
+        // hand-written literal (2026-07-31T00:00:00Z), but the field reached
+        // each agent at ITS OWN container restart, hours later: the earliest
+        // real `route` row fleet-wide carries ts 1785492486 (+10.1h) and the
+        // last agent's first is 1785524964 (+19.2h). Every field-less row in
+        // that gap is a legacy row being read as a regression. The gate above
+        // settles those deterministically — all five recorded occurrences carry
+        // `landed_unconfirmed: 1` — so the constant no longer has to be exactly
+        // right for the detector to be honest.
         if (t.ts >= routeFieldShipTs) {
           findings.push({
             signal: "silent-no-op-candidate",
@@ -646,7 +793,14 @@ export function detectGatewayFindings(
           name === "orphaned-db-handle" &&
           classifyOrphanedDbTick(lines, i) === "recovered"
             ? "orphaned-db-handle-recovered"
-            : name;
+            : // #4735 — a rejected rich send that a later rich send to the same
+              // chat recovered inside the send stack's own recovery window is
+              // the fallback ladder WORKING, not a lost reply. Same split, same
+              // reasoning as the orphaned-DB one above.
+              name === "reply-delivery-failure" &&
+                classifyReplyDeliveryEpisode(lines, i) === "recovered"
+              ? "reply-delivery-recovered"
+              : name;
         gw_hits[signal] += 1;
         const origin = extractTurnId(line);
         const pointer = `${logName}:${i + 1}`;

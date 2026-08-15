@@ -169,6 +169,221 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
     const signals = detectTurnFindings("alpha", routed(undefined)).map((x) => x.signal);
     expect(signals).toContain("silent-no-op-candidate");
   });
+
+  /**
+   * #4735 — `ROUTE_FIELD_SHIP_TS` is a hand-written literal
+   * (`turn-record-status.ts:91` = 2026-07-31T00:00:00Z), but the `route` field
+   * only reached each agent at ITS OWN container restart: the earliest real
+   * `route` row anywhere on the fleet carries ts 1785492486 (+10.1h) and the
+   * last agent's first carries 1785524964 (+19.2h). Every field-less row in
+   * that gap was read as "the gateway dropped the field" — a severity-3
+   * regression — when it was simply a legacy row. All five recorded occurrences
+   * were false, and every one of them carries `landed_unconfirmed: 1`.
+   *
+   * The durable gate is that field, not a bigger constant.
+   * `landed_unconfirmed` is written only by the backstop read-back accounting
+   * (`turn-record-status.ts:255-269`) and counts message ids TELEGRAM ACKED.
+   * Its presence is positive evidence a send left the gateway, which is
+   * precisely what "silent no-op" denies — so it settles the row's class no
+   * matter what the calendar says.
+   */
+  describe("#4735 — a row that LANDED a message id is not a silent no-op", () => {
+    it("THE FALSIFIER: field-less row AT the ship epoch with landed_unconfirmed:1 yields ZERO sev-3", () => {
+      const signals = detectTurnFindings(
+        "alpha",
+        routed(undefined, { landed_unconfirmed: 1 }),
+      ).map((x) => x.signal);
+      expect(signals.filter((s) => s === "silent-no-op-candidate")).toHaveLength(0);
+      expect(signals.filter((s) => s === "flush-recovered-turn")).toHaveLength(1);
+    });
+
+    it("route:none with landed_unconfirmed:1 is a backstop delivery, not silence", () => {
+      const signals = detectTurnFindings(
+        "alpha",
+        routed("none", { landed_unconfirmed: 1 }),
+      ).map((x) => x.signal);
+      expect(signals).not.toContain("silent-no-op-candidate");
+      expect(signals).toContain("flush-recovered-turn");
+    });
+
+    it("landed_unconfirmed:0 does NOT clear the finding — zero landed ids is no evidence", () => {
+      const signals = detectTurnFindings(
+        "alpha",
+        routed("none", { landed_unconfirmed: 0 }),
+      ).map((x) => x.signal);
+      expect(signals).toContain("silent-no-op-candidate");
+    });
+
+    it("a landed row that ALSO routed reply/stream stays finding-free (no phantom flush-recovery)", () => {
+      for (const r of ["reply", "stream"]) {
+        const signals = detectTurnFindings(
+          "alpha",
+          routed(r, { landed_unconfirmed: 1 }),
+        ).map((x) => x.signal);
+        expect(signals).not.toContain("silent-no-op-candidate");
+        expect(signals).not.toContain("flush-recovered-turn");
+      }
+    });
+  });
+});
+
+/**
+ * #4735 — `status=err` on a `tg-post` rich send was specified (#3931) to mean a
+ * TERMINAL outcome, but that contract only holds for sends routed through
+ * `createRetryApiCall`: `willRetryTelegramFailure` returns `false` the moment
+ * the attempt context is absent (`retry-api-call.ts:207`). Every recovery
+ * ladder outside that policy — the THREAD_NOT_FOUND thread-drop the policy
+ * hands OFF to the caller by design, the edit-flood-fuse deferral that
+ * re-issues on a later tick, the backstop re-attempt, the queued-card re-send —
+ * logged a send that DID deliver as terminal. On the live fleet 12 of 16
+ * occurrences provably delivered, i.e. the operator was paged about replies
+ * they had already read.
+ *
+ * These fixtures assert the OUTCOME (which signal the ledger books), not that a
+ * branch ran. Every one of them fails on the pre-fix detector, which books
+ * `reply-delivery-failure` for all of them.
+ */
+describe("#4735 — a recovered rich send is not a delivery failure", () => {
+  const GCHAT = "-1001234567890";
+  const post = (t: string, status: string, desc: string, chat = GCHAT, thread = "-") =>
+    `[2026-08-11T${t}Z] tg-post method=sendRichMessage chat=${chat} thread=${thread}` +
+    ` parse_mode=none bytes=0 hash=- status=${status} err=telegram_400 code=400 desc=${desc}`;
+
+  const signalsOf = (lines: string[]) =>
+    detectGatewayFindings("alpha", lines.join("\n")).findings.map((f) => f.signal);
+
+  it("THE FALSIFIER: thread-drop ladder — thread-not-found then a landed send", () => {
+    // The observed shape (2026-08-10 04:04:20.210, recovered in 554ms): the
+    // first attempt carries the thread, the ladder drops it and re-sends bare.
+    const s = signalsOf([
+      post("04:04:20.210", "err", "Bad Request: message thread not found", GCHAT, "635"),
+      post("04:04:20.764", "ok", "-"),
+    ]);
+    expect(s.filter((x) => x === "reply-delivery-failure")).toHaveLength(0);
+    expect(s.filter((x) => x === "reply-delivery-recovered")).toHaveLength(1);
+  });
+
+  it("edit-flood-fuse / 429 deferral — recovery ~40s later still counts", () => {
+    // The observed shape (2026-08-11 12:40:19.340 → `429 rate limited, waiting
+    // 10s` → fuse deferral → landed). Well inside the window, far outside any
+    // line-count lookahead.
+    const s = signalsOf([
+      post("12:40:19.340", "err", "Too Many Requests: retry after 10"),
+      "[2026-08-11T12:40:19.347Z] telegram gateway: 429 rate limited, waiting 10s",
+      "[2026-08-11T12:40:29.348Z] edit-flood-fuse deferred method=sendRichMessage" +
+        ` key=cs:${GCHAT} class=critical`,
+      post("12:40:59.900", "ok", "-"),
+    ]);
+    expect(s).not.toContain("reply-delivery-failure");
+    expect(s).toContain("reply-delivery-recovered");
+  });
+
+  it("transport re-attempt — a 502 followed by a landed send is recovered", () => {
+    const s = signalsOf([
+      post("22:37:36.770", "err", "Bad Gateway"),
+      post("22:37:38.100", "ok", "-"),
+    ]);
+    expect(s).not.toContain("reply-delivery-failure");
+    expect(s).toContain("reply-delivery-recovered");
+  });
+
+  it("queued-card re-send — invalid message_id then a landed send is recovered", () => {
+    const s = signalsOf([
+      post("11:26:49.563", "err", 'Bad Request: field "message_id" must be a valid Number'),
+      "[2026-08-11T11:26:49.570Z] telegram gateway: queued card send failed: Bad Request",
+      post("11:26:50.100", "ok", "-"),
+    ]);
+    expect(s).not.toContain("reply-delivery-failure");
+    expect(s).toContain("reply-delivery-recovered");
+  });
+
+  it("intervening FAILED attempts do not end the episode — the first ok settles it", () => {
+    const s = signalsOf([
+      post("12:40:19.340", "err", "Too Many Requests: retry after 10"),
+      post("12:40:29.440", "err", "Too Many Requests: retry after 10"),
+      post("12:40:40.000", "ok", "-"),
+    ]);
+    expect(s.filter((x) => x === "reply-delivery-failure")).toHaveLength(0);
+    expect(s.filter((x) => x === "reply-delivery-recovered")).toHaveLength(2);
+  });
+
+  describe("what it must NOT clear", () => {
+    it("a send that never lands stays a severity-3 delivery failure", () => {
+      const s = signalsOf([
+        post("22:37:36.770", "err", "Bad Gateway"),
+        "[2026-08-11T22:37:40.000Z] telegram gateway: send-gate stats: sent=0",
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a landing on a DIFFERENT chat is not this send's recovery (chat-not-found → operator DM)", () => {
+      // The observed 2026-08-13 shape: the group send fails terminally and the
+      // agent re-replies into the operator DM. The addressed chat really is
+      // unreachable — a different chat being reachable does not fix that.
+      const s = signalsOf([
+        post("12:37:16.665", "err", "Bad Request: chat not found"),
+        post("12:37:20.100", "ok", "-", "9876543210"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a landing beyond the recovery window is a different episode", () => {
+      // 121s > REPLY_DELIVERY_RECOVERY_WINDOW_MS (120s, the send stack's own
+      // in-process wait ceiling).
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        post("12:02:01.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("an UNDATABLE failing line fails toward the alarm", () => {
+      const s = signalsOf([
+        `tg-post method=sendRichMessage chat=${GCHAT} thread=- parse_mode=none bytes=0` +
+          " hash=- status=err err=telegram_502 code=502 desc=Bad Gateway",
+        post("12:00:01.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a non-rich landing (sendMessage) does not clear a rich send", () => {
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        `[2026-08-11T12:00:01.000Z] tg-post method=sendMessage chat=${GCHAT} thread=-` +
+          " parse_mode=none bytes=9 hash=abc status=ok err=- code=- desc=-",
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+    });
+
+    it("`status=okay` can never be read as a landing (token pinning)", () => {
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        post("12:00:01.000", "okay", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+  });
+
+  it("the recovered signal is severity 1, the unrecovered one severity 3", () => {
+    expect(mapSignal("reply-delivery-recovered").severity).toBe(1);
+    expect(mapSignal("reply-delivery-failure").severity).toBe(3);
+  });
+
+  it("a recovered-only log does NOT set escalate", () => {
+    const log = [
+      post("04:04:20.210", "err", "Bad Request: message thread not found", GCHAT, "635"),
+      post("04:04:20.764", "ok", "-"),
+    ].join("\n");
+    expect(scanAgent("alpha", "", log).escalate).toBe(false);
+    // …and an unrecovered one still does.
+    const bad = post("04:04:20.210", "err", "Bad Gateway");
+    expect(scanAgent("alpha", "", bad).escalate).toBe(true);
+  });
 });
 
 describe("detectGatewayFindings", () => {
@@ -639,6 +854,12 @@ describe("#4680 — a working guard is not a failure", () => {
       "orphaned-db-handle",
       "orphaned-db-handle-recovered",
       "reply-delivery-failure",
+      // #4735 — the informational counterpart of `reply-delivery-failure`, the
+      // same shape `orphaned-db-handle-recovered` has. It is a DERIVED signal
+      // (no `GATEWAY_SIGNATURES` entry), which is exactly the class this
+      // tripwire exists for: confirmed deliberately as `gateway-event` by the
+      // sibling `it` below.
+      "reply-delivery-recovered",
       "represent-escalation",
     ] as const;
 
