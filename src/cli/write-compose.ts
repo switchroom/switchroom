@@ -25,6 +25,13 @@ import { resolveImageTag, resolveRelease, type ReleaseBlockShape } from "../conf
 import { isDockerRuntime } from "../runtime-mode.js";
 import { resolveOperatorUid } from "./operator-uid.js";
 import { resolveAgentConfig } from "../config/merge.js";
+import { VOICE_SIDECAR_SERVICE } from "../agents/singleton-reconcile.js";
+import {
+  resolveVoiceEngine,
+  isDefaultedVoiceEngine,
+  type VoiceEngineReason,
+  type VoiceEngineResolution,
+} from "../setup/host-capabilities.js";
 
 /** Minimal structural view of a broker structured-get result (see
  *  src/vault/broker/client.ts `getViaBrokerStructured`). We branch on `kind`
@@ -319,6 +326,86 @@ export interface ComputeComposeResult {
   previous: string | null;
   /** The agent image tag previously on disk (for drift logging), or null. */
   previousImageTag: string | null;
+  /**
+   * Set when this generation DROPS an already-emitted `voice-sidecar` because
+   * the voice verdict was defaulted rather than read. Null on every other
+   * path — including a genuine `cloud` verdict, a fresh install with no
+   * previous compose, and any run that keeps the service.
+   */
+  voiceSidecarDrop: VoiceSidecarDrop | null;
+}
+
+/** Why an already-emitted `voice-sidecar` is about to disappear. */
+export interface VoiceSidecarDrop {
+  reason: VoiceEngineReason;
+  /** The verdict path that was attempted. */
+  path: string;
+  /** One-line explanation from the read; empty for `no-verdict`. */
+  detail: string;
+  /** Operator-facing one-liner, identical on every surface. */
+  message: string;
+}
+
+/** Parse the top-level service names out of a generated compose YAML. */
+export function parseComposeServiceNames(compose: string): string[] {
+  const lines = compose.split("\n");
+  const names: string[] = [];
+  let inServices = false;
+  for (const line of lines) {
+    if (/^services:\s*$/.test(line)) {
+      inServices = true;
+      continue;
+    }
+    // A new top-level key (column 0, non-space) ends the services block.
+    if (inServices && /^\S/.test(line)) break;
+    if (!inServices) continue;
+    // Service entries are keyed at exactly two-space indent: `  <name>:`.
+    const m = /^ {2}([A-Za-z0-9_.-]+):\s*$/.exec(line);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
+/**
+ * Build the operator-facing line for a defaulted voice verdict that costs a
+ * running service. Exported so the dry-run report and the write path render
+ * byte-identical text.
+ */
+export function voiceSidecarDropMessage(r: VoiceEngineResolution): string {
+  const why = r.reason === "no-verdict"
+    ? `no verdict file at ${r.path}`
+    : `the verdict at ${r.path} is ${r.reason} — ${r.detail}`;
+  return (
+    `voice-sidecar is being REMOVED because ${why}, so the voice engine ` +
+    "defaulted to `cloud`. This host is not known to lack a GPU — switchroom " +
+    "could not tell. Re-run `switchroom setup` to re-probe before applying, or " +
+    "confirm the removal is intended."
+  );
+}
+
+/**
+ * Decide whether this generation silently drops a running `voice-sidecar`.
+ *
+ * Only fires when ALL of: a previous compose exists and declared the service,
+ * the new content does not, and the engine was DEFAULTED rather than read from
+ * a verdict. A genuine `cloud` verdict is a deliberate operator state and stays
+ * quiet; a fresh install has no previous compose and stays quiet too.
+ */
+export function detectVoiceSidecarDrop(
+  previous: string | null,
+  content: string,
+  resolution: VoiceEngineResolution,
+): VoiceSidecarDrop | null {
+  if (!isDefaultedVoiceEngine(resolution)) return null;
+  if (previous === null) return null;
+  if (!parseComposeServiceNames(previous).includes(VOICE_SIDECAR_SERVICE)) return null;
+  if (parseComposeServiceNames(content).includes(VOICE_SIDECAR_SERVICE)) return null;
+  return {
+    reason: resolution.reason,
+    path: resolution.path,
+    detail: resolution.detail,
+    message: voiceSidecarDropMessage(resolution),
+  };
 }
 
 /**
@@ -361,10 +448,17 @@ export async function computeComposeContent(
   // injection so a key-less agent never boots a dead proxy route (#litellm).
   const litellmConfirmedAgents = await resolveLiteLLMConfirmedAgents(opts.config, previous);
 
+  // Resolve the voice verdict ONCE here and inject it, rather than letting
+  // generateCompose read it again: the drop attribution below must describe
+  // the verdict the emitted compose was actually built from, not a second read
+  // that could disagree with it.
+  const voiceResolution = resolveVoiceEngine();
+
   const content = generateCompose({
     config: opts.config,
     imageTag,
     litellmConfirmedAgents,
+    voiceEngine: voiceResolution.engine,
     buildMode: opts.buildMode ?? "pull",
     buildContext: opts.buildContext,
     // Bake the operator's HOST HOME absolute path into volume sources (avoids
@@ -392,7 +486,27 @@ export async function computeComposeContent(
 
   const previousImageTag = previous ? (AGENT_IMAGE_TAG_RE.exec(previous)?.[1] ?? null) : null;
 
-  return { content, imageTag, previous, previousImageTag };
+  // A defaulted verdict that costs a RUNNING service is the one place the
+  // reader's deliberate silence on `absent` is wrong. Warn once per process,
+  // on every caller of this seam (real apply, dry-run, `agent restart`'s
+  // reconcile, doctor drift) — and return it so callers can render it in
+  // their own report format instead of scraping stderr.
+  const voiceSidecarDrop = detectVoiceSidecarDrop(previous, content, voiceResolution);
+  if (voiceSidecarDrop && !_warnedVoiceDrop) {
+    _warnedVoiceDrop = true;
+    process.stderr.write(`[switchroom] WARNING: ${voiceSidecarDrop.message}\n`);
+  }
+
+  return { content, imageTag, previous, previousImageTag, voiceSidecarDrop };
+}
+
+/** One-time guard for the voice-sidecar drop warning (mirrors the
+ *  host-capabilities reader's own once-per-process memo). */
+let _warnedVoiceDrop = false;
+
+/** Test seam: reset the one-time drop warning. */
+export function _resetVoiceSidecarDropWarning(): void {
+  _warnedVoiceDrop = false;
 }
 
 /** Suffix of the compose backup file. */

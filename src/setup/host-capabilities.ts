@@ -257,3 +257,66 @@ export function loadHostCapabilities(): HostCapabilities | null {
   warnDegradedHostCapabilities(read);
   return read.caps;
 }
+
+/** Why {@link resolveVoiceEngine} answered the way it did. */
+export type VoiceEngineReason =
+  /** A readable verdict file said so — the only NON-default answer. */
+  | "verdict"
+  /** `ENOENT` — never probed, or the wrong HOME. Defaulted to `cloud`. */
+  | "no-verdict"
+  /** Present but unreadable (`EACCES`/…). Defaulted to `cloud`. */
+  | "unreadable"
+  /** Present but not a capabilities document. Defaulted to `cloud`. */
+  | "malformed";
+
+/** The voice-engine verdict plus HOW it was reached. */
+export interface VoiceEngineResolution {
+  engine: VoiceEngine;
+  reason: VoiceEngineReason;
+  /** The verdict path that was attempted, for operator-actionable messages. */
+  path: string;
+  /** One-line human explanation. Empty for `verdict` / `no-verdict`. */
+  detail: string;
+}
+
+/** True when the engine was DEFAULTED rather than read from a verdict. */
+export function isDefaultedVoiceEngine(r: VoiceEngineResolution): boolean {
+  return r.reason !== "verdict";
+}
+
+/**
+ * Resolve the voice engine, reporting whether it came from a verdict or from
+ * the fail-safe default.
+ *
+ * Callers used to do `loadHostCapabilities()?.voice.engine ?? "cloud"`, which
+ * is exactly the collapse {@link loadHostCapabilities}'s own docstring warns
+ * against: it cannot tell "this host has no GPU" from "we could not tell", and
+ * for the voice sidecar that difference is a service being REMOVED from the
+ * generated compose. `absent` stays quiet at the reader layer by design (a
+ * fresh install is indistinguishable from a wrong HOME there) — so the reason
+ * is returned instead, and the one call site where a default is destructive
+ * (dropping an already-emitted `voice-sidecar`) attributes it. See
+ * `computeComposeContent`.
+ */
+export function resolveVoiceEngine(): VoiceEngineResolution {
+  const read = readHostCapabilities();
+  warnDegradedHostCapabilities(read);
+  if (read.status === "ok" && read.caps) {
+    return {
+      engine: read.caps.voice.engine,
+      reason: "verdict",
+      path: read.path,
+      detail: "",
+    };
+  }
+  // `ok` with a null `caps` violates HostCapabilitiesRead's own contract, so
+  // it is not a real state — fold it in with `malformed`: either way the
+  // document could not be used and the engine below is a DEFAULT, not a read.
+  const reason: VoiceEngineReason =
+    read.status === "absent"
+      ? "no-verdict"
+      : read.status === "unreadable"
+        ? "unreadable"
+        : "malformed";
+  return { engine: "cloud", reason, path: read.path, detail: read.detail };
+}

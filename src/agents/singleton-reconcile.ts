@@ -32,7 +32,7 @@ import { readFileSync } from "node:fs";
 
 import { parse as parseYaml } from "yaml";
 
-import { loadHostCapabilities } from "../setup/host-capabilities.js";
+import { resolveVoiceEngine } from "../setup/host-capabilities.js";
 import { composeEnvFileArgs } from "./compose-env.js";
 
 /**
@@ -77,7 +77,7 @@ export type SingletonService = (typeof SINGLETON_SERVICES)[number];
 export function resolveSingletonServices(
   voiceEngine?: "local" | "cloud",
 ): SingletonService[] {
-  const engine = voiceEngine ?? loadHostCapabilities()?.voice.engine ?? "cloud";
+  const engine = voiceEngine ?? resolveVoiceEngine().engine;
   return engine === "local"
     ? [...CORE_SINGLETON_SERVICES, VOICE_SIDECAR_SERVICE]
     : [...CORE_SINGLETON_SERVICES];
