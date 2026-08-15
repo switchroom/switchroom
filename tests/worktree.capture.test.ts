@@ -353,6 +353,41 @@ describe("captureCheckout — edge shapes", () => {
     expect(existsSync(join(repo, "untracked.txt"))).toBe(true);
   });
 
+  it("snapshots the working tree on a host with NO git identity configured", () => {
+    // The hosts this verb runs on are the least likely to have a
+    // `user.email`: a CI runner, a rescue shell, a fresh container. Without an
+    // explicit identity `commit-tree` fails with "Committer identity unknown"
+    // and hazards 1+2 are lost silently — capture would report
+    // `nothing-to-capture` on a repo full of uncommitted work. This
+    // reproduces that host by scrubbing every identity source from the
+    // environment the capture child process inherits.
+    const repo = join(root, "no-identity");
+    makeHazardRepo(repo);
+
+    const saved = { ...process.env };
+    delete process.env.GIT_AUTHOR_NAME;
+    delete process.env.GIT_AUTHOR_EMAIL;
+    delete process.env.GIT_COMMITTER_NAME;
+    delete process.env.GIT_COMMITTER_EMAIL;
+    delete process.env.EMAIL;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+    let result;
+    try {
+      result = captureCheckout({ dir: repo, dest: join(root, "rescue") });
+    } finally {
+      for (const k of Object.keys(process.env)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
+
+    expect(result.ok).toBe(true);
+    expect(result.refs.wip).toBe(true);
+    const restored = join(root, "restored");
+    git(root, "clone", "-q", result.bundle!, restored);
+    expect(readFileSync(join(restored, "untracked.txt"), "utf-8")).toBe("untracked-content\n");
+    expect(readFileSync(join(restored, "tracked.txt"), "utf-8")).toBe("v2-uncommitted\n");
+  });
+
   it("warns that submodule content is not in the bundle", () => {
     const repo = join(root, "with-submodule");
     makeHazardRepo(repo);

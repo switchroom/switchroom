@@ -118,6 +118,22 @@ export const WIP_BRANCH = "refs/heads/rescued-wip";
 /** Where bundles land under the bulk volume / the switchroom home. */
 export const RESCUE_SUBDIR = "switchroom/rescue";
 
+/**
+ * Identity for the working-tree snapshot commit.
+ *
+ * `git commit-tree` refuses to run without one, and it is NOT safe to assume
+ * the host has a `user.email`: a CI runner, a bare rescue shell, and a fresh
+ * container all have none. The snapshot is a machine artefact, not anyone's
+ * authorship, so it gets a fixed synthetic identity on an `.invalid` domain
+ * (RFC 2606) rather than inventing a human's.
+ */
+const SNAPSHOT_IDENTITY: NodeJS.ProcessEnv = {
+  GIT_AUTHOR_NAME: "switchroom worktree capture",
+  GIT_AUTHOR_EMAIL: "capture@switchroom.invalid",
+  GIT_COMMITTER_NAME: "switchroom worktree capture",
+  GIT_COMMITTER_EMAIL: "capture@switchroom.invalid",
+};
+
 /** Generous ceiling: `fsck` over a tree with ~12k unreachable commits. */
 const MAX_BUFFER = 256 * 1024 * 1024;
 
@@ -311,7 +327,12 @@ interface RunResult {
  * unreachable-commit lines we need — throwing them away would lose exactly
  * the commits this module exists to rescue.
  */
-function run(args: string[], input?: string, cwd?: string): RunResult {
+function run(
+  args: string[],
+  input?: string,
+  cwd?: string,
+  env?: NodeJS.ProcessEnv,
+): RunResult {
   try {
     const stdout = execFileSync("git", args, {
       encoding: "utf-8",
@@ -319,6 +340,7 @@ function run(args: string[], input?: string, cwd?: string): RunResult {
       maxBuffer: MAX_BUFFER,
       input,
       cwd,
+      env: env ? { ...process.env, ...env } : undefined,
     });
     return { ok: true, stdout: stdout ?? "", stderr: "" };
   } catch (e) {
@@ -572,6 +594,15 @@ export function captureCheckout(opts: CaptureOptions): CaptureResult {
             msg,
           ),
           undefined,
+          undefined,
+          // `commit-tree` REQUIRES an identity, and the hosts this verb runs on
+          // are exactly the ones least likely to have one: a CI runner, a
+          // rescue shell, a container with no `~/.gitconfig`. Without this the
+          // snapshot dies with "Committer identity unknown" and hazards 1+2 are
+          // silently lost — which is the whole point of the verb. Env vars are
+          // used rather than `-c user.*` so an inherited GIT_COMMITTER_* cannot
+          // override them and reintroduce the failure.
+          SNAPSHOT_IDENTITY,
         );
         if (commit.ok && /^[0-9a-f]{7,64}$/.test(commit.stdout.trim())) {
           wipCommit = commit.stdout.trim();
