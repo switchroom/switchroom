@@ -271,6 +271,48 @@ describe("syncTopics", () => {
     expect(state.topics.finance.topic_id).toBe(102);
   });
 
+  it("repairs a lone surrogate in a topic name instead of 400ing (#4728)", async () => {
+    // createForumTopic POSTs with raw `fetch`, bypassing the grammy bot and
+    // therefore the #4728 API-transformer sanitiser entirely. This transport
+    // answers the way Telegram's decoder does: a body carrying an unpaired
+    // surrogate is rejected with 400 "strings must be encoded in UTF-8".
+    // Without the sanitise call in createForumTopic this test throws
+    // TopicSyncError instead of creating the topic.
+    const LONE_HIGH = "\uD800";
+    const ASTRAL = "\u{1F916}";
+    let sentName: string | undefined;
+    globalThis.fetch = vi.fn(async (_url: any, opts: any) => {
+      const body = JSON.parse(opts.body);
+      sentName = body.name;
+      if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(body.name)) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: strings must be encoded in UTF-8",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response(
+        JSON.stringify({ ok: true, result: { message_thread_id: 501, name: body.name } }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as any;
+
+    const config = makeConfig({
+      health: { topic_name: `Health ${ASTRAL}${LONE_HIGH}` },
+    });
+
+    const results = await syncTopics(config, statePath);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ agent: "health", topic_id: 501, status: "created" });
+    // Repaired in place, and the well-formed astral pair survives untouched.
+    expect(sentName).toBe(`Health ${ASTRAL}�`);
+    expect(loadTopicState(statePath).topics.health.topic_id).toBe(501);
+  });
+
   it("skips agents that already exist in state (idempotency)", async () => {
     globalThis.fetch = vi.fn(async (url: any, opts: any) => {
       const body = JSON.parse(opts.body);

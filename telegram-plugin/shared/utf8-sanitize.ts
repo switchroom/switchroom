@@ -103,9 +103,34 @@ export interface SanitizeStats {
 }
 
 /**
+ * Define `k` as an own enumerable data property of `out`.
+ *
+ * `out[k] = v` would REASSIGN the clone's prototype for the single key
+ * `__proto__` (the `Object.prototype` accessor), silently dropping an own
+ * `__proto__` key from the payload. defineProperty always makes an own data
+ * property, for that key like any other.
+ */
+function defineOwn(out: Record<string, unknown>, k: string, v: unknown): void {
+  Object.defineProperty(out, k, {
+    value: v,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  })
+}
+
+/**
  * Deep-sanitise every string in `value`, CLONE-ON-WRITE: the input is never
- * mutated, and the exact same instance is returned when nothing changed (so
- * the common case allocates nothing).
+ * mutated, and the exact same instance is returned when nothing changed.
+ *
+ * The clone is materialised LAZILY, on the first key/index that actually
+ * changed — so a clean payload allocates no container and performs no
+ * property definition at any depth, it is only walked and handed back by
+ * identity. That matters: this runs on the innermost hop of EVERY `bot.api.*`
+ * call, including the draft-stream `editMessageText` path that edits the same
+ * card several times a second, and the overwhelming majority of payloads are
+ * clean. (Pinned by the "clean nested payload" test, which fails if any
+ * container is rebuilt.)
  *
  * Pass `stats` to collect the repair count.
  */
@@ -118,32 +143,45 @@ export function sanitizePayloadStrings<T>(value: T, depth = 0, stats?: SanitizeS
   if (depth >= MAX_DEPTH || !isWalkable(value)) return value
 
   if (Array.isArray(value)) {
-    let changed = false
-    const out = value.map(item => {
+    let out: unknown[] | undefined
+    for (let i = 0; i < value.length; i++) {
+      const item = value[i]
       const next = sanitizePayloadStrings(item, depth + 1, stats)
-      if (next !== item) changed = true
-      return next
-    })
-    return (changed ? out : value) as unknown as T
+      // First change: copy the already-walked prefix, all of it unchanged.
+      if (out === undefined && next !== item) out = value.slice(0, i)
+      if (out !== undefined) out.push(next)
+    }
+    return (out ?? value) as unknown as T
   }
 
-  let changed = false
-  const out: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(value)) {
+  // `for...in` rather than `Object.entries`, so the clean path allocates no
+  // key/entry array either. The `hasOwnProperty` guard keeps this EXACTLY
+  // equivalent to `Object.entries`: `for...in` also yields INHERITED
+  // enumerable keys, so without it a polluted `Object.prototype` would leak an
+  // extra field into the body we hand to Telegram.
+  const hasOwn = Object.prototype.hasOwnProperty
+  let out: Record<string, unknown> | undefined
+  for (const k in value) {
+    if (!hasOwn.call(value, k)) continue
+    const v = (value as Record<string, unknown>)[k]
     const next = sanitizePayloadStrings(v, depth + 1, stats)
-    if (next !== v) changed = true
-    // `out[k] = next` would REASSIGN the clone's prototype for the single key
-    // `__proto__` (the `Object.prototype` accessor), silently dropping an own
-    // `__proto__` key from the payload. defineProperty always makes an own
-    // data property, for that key like any other.
-    Object.defineProperty(out, k, {
-      value: next,
-      writable: true,
-      enumerable: true,
-      configurable: true,
-    })
+    if (out === undefined && next !== v) {
+      // First change: materialise the clone and backfill the keys already
+      // walked, every one of which came back unchanged. This re-reads those
+      // properties (so an own getter in the prefix is invoked twice), which
+      // only ever happens on the repair path — a payload with an own getter
+      // AND a lone surrogate. Telegram payloads are plain data; a getter that
+      // throws is caught by the fail-open guard in `installUtf8Sanitizer`.
+      out = {}
+      for (const prev in value) {
+        if (prev === k) break
+        if (!hasOwn.call(value, prev)) continue
+        defineOwn(out, prev, (value as Record<string, unknown>)[prev])
+      }
+    }
+    if (out !== undefined) defineOwn(out, k, next)
   }
-  return (changed ? out : value) as unknown as T
+  return (out ?? value) as unknown as T
 }
 
 /** One log line per method per minute. The draft-stream `editMessageText`
@@ -173,7 +211,9 @@ const LOG_THROTTLE_MS = 60_000
  * would otherwise propagate out of every outbound call and wedge the whole
  * gateway. Sending the original payload is never worse than throwing: the
  * worst case is the pre-#4728 behaviour (Telegram 400s that one send), while
- * throwing here breaks sends that had nothing wrong with them.
+ * throwing here breaks sends that had nothing wrong with them. It is not
+ * silent, though: failing open logs its own throttled line naming the method,
+ * so the degraded state stays diagnosable.
  *
  * `now` is an injected clock so the throttle can be driven deterministically
  * from a test: this file runs under BOTH vitest and `bun test`, and bun's
@@ -195,8 +235,23 @@ export function installUtf8Sanitizer(bot: Bot, now: () => number = Date.now): vo
     const stats: SanitizeStats = { repaired: 0 }
     try {
       clean = sanitizePayloadStrings(payload, 0, stats)
-    } catch {
+    } catch (err) {
       clean = payload
+      // Fail open, but never SILENTLY: without this line a future walk bug or
+      // a genuinely throwing getter degrades to a bare Telegram 400 with no
+      // trail back to the sanitiser — precisely the opacity #4728 exists to
+      // end. Throttled on its own budget (a distinct key), so a persistent
+      // walk failure cannot be starved by, or starve, the repair line above.
+      // The error MESSAGE is included because without it the line cannot
+      // diagnose anything; the payload body still never is.
+      if (shouldLogRepair(`${method} sanitize-failed`, now())) {
+        process.stderr.write(
+          `telegram gateway: utf8-sanitize FAILED OPEN method=${method} — ` +
+          `payload sent unrepaired; if it carries a lone surrogate Telegram ` +
+          `will reject it (400 "strings must be encoded in UTF-8"): ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+        )
+      }
     }
     if (clean !== payload && shouldLogRepair(method, now())) {
       process.stderr.write(

@@ -1,6 +1,7 @@
 import type { SwitchroomConfig } from "../config/schema.js";
 import { loadTopicState, saveTopicState, type TopicState, type TopicEntry } from "./state.js";
 import { redactToken } from "./redact-token.js";
+import { sanitizeLoneSurrogates } from "../../telegram-plugin/shared/utf8-sanitize.js";
 
 export interface TopicSyncResult {
   agent: string;
@@ -78,7 +79,14 @@ async function createForumTopic(
 
   const body: Record<string, string> = {
     chat_id: chatId,
-    name,
+    // #4728: this POSTs with raw `fetch`, NOT through the grammy bot, so the
+    // API-transformer sanitiser never sees it. `name` is the only operator-
+    // supplied string on the wire here (`agentConfig.topic_name` from
+    // switchroom.yaml), and a lone surrogate in it 400s the whole request with
+    // "strings must be encoded in UTF-8" — the same failure #4728 fixes for
+    // card sends. `closeForumTopic` needs no such repair: its body carries
+    // only `chat_id` and a numeric `message_thread_id`.
+    name: sanitizeLoneSurrogates(name),
   };
   if (iconCustomEmojiId) {
     body.icon_custom_emoji_id = iconCustomEmojiId;

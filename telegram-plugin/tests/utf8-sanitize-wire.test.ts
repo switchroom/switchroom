@@ -209,6 +209,68 @@ describe('UTF-8 sanitiser — the dropped approval card (#4728)', () => {
     expect(sanitizePayloadStrings(payload)).toBe(payload)
   })
 
+  it('(f2) a clean payload is not rebuilt at ANY depth — no container allocated, no property defined', () => {
+    // (f) only pins the identity of the TOP-level return, which a walk that
+    // clones every nested container and discards the clones still satisfies.
+    // This transformer is the innermost hop of every `bot.api.*` call and the
+    // draft-stream `editMessageText` path runs it several times a second, so
+    // "the clean case rebuilds nothing" is a real contract, not a comment.
+    const button = { text: `Approve ${ASTRAL}`, callback_data: 'perm:allow:1' }
+    const row = [button]
+    const keyboard = [row]
+    const markup = { inline_keyboard: keyboard }
+    const payload = { chat_id: 1, text: `all good ${ASTRAL} 100% ✓`, reply_markup: markup }
+
+    const realDefineProperty = Object.defineProperty
+    let definePropertyCalls = 0
+    Object.defineProperty = ((...args: Parameters<typeof Object.defineProperty>) => {
+      definePropertyCalls++
+      return realDefineProperty(...args)
+    }) as typeof Object.defineProperty
+    let out: typeof payload
+    try {
+      out = sanitizePayloadStrings(payload)
+    } finally {
+      Object.defineProperty = realDefineProperty
+    }
+
+    // Goes RED on an eager clone: the old walk defined one property per key
+    // at every level before deciding nothing had changed.
+    expect(definePropertyCalls).toBe(0)
+    // Every container comes back by identity, top level down to the button.
+    expect(out).toBe(payload)
+    expect(out.reply_markup).toBe(markup)
+    expect(out.reply_markup.inline_keyboard).toBe(keyboard)
+    expect(out.reply_markup.inline_keyboard[0]).toBe(row)
+    expect(out.reply_markup.inline_keyboard[0][0]).toBe(button)
+  })
+
+  it('(f3) a DIRTY payload still rebuilds correctly from the lazily-materialised clone', () => {
+    // The lazy clone backfills the already-walked (clean) prefix. If that
+    // backfill were wrong, keys before the first repair would vanish.
+    const payload = {
+      chat_id: 1,
+      before_a: 'kept a',
+      before_b: 'kept b',
+      text: `boom${LONE_HIGH}`,
+      after: 'kept c',
+      nested: { keep: 'yes', bad: `${LONE_LOW}x` },
+      arr: ['keep 0', 'keep 1', `bad${LONE_HIGH}`, 'keep 3'],
+    }
+    const out = sanitizePayloadStrings(payload)
+    expect(out).not.toBe(payload)
+    expect(Object.keys(out)).toEqual(Object.keys(payload))
+    expect(out.before_a).toBe('kept a')
+    expect(out.before_b).toBe('kept b')
+    expect(out.text).toBe('boom�')
+    expect(out.after).toBe('kept c')
+    expect(out.nested).toEqual({ keep: 'yes', bad: '�x' })
+    expect(out.arr).toEqual(['keep 0', 'keep 1', 'bad�', 'keep 3'])
+    // Clone-on-write: the input itself is untouched.
+    expect(payload.text).toBe(`boom${LONE_HIGH}`)
+    expect(payload.arr[2]).toBe(`bad${LONE_HIGH}`)
+  })
+
   it('(g) a payload whose own enumerable getter THROWS still sends — the sanitiser fails open', async () => {
     // The walk reads own enumerable properties, which invokes getters. This
     // transformer sits on the innermost hop of EVERY `bot.api.*` call, so an
@@ -299,6 +361,29 @@ describe('sanitizeLoneSurrogates / sanitizePayloadStrings — unit contract', ()
     expect(out.photo).toBeInstanceOf(InputFileLike)
   })
 
+  it('does not copy INHERITED enumerable keys into the clone (prototype pollution)', () => {
+    // The walk uses `for...in`, which unlike `Object.entries` also yields
+    // inherited enumerable keys. Without the own-property guard a polluted
+    // `Object.prototype` would add a field to the body sent to Telegram.
+    const proto = Object.prototype as unknown as Record<string, unknown>
+    Object.defineProperty(proto, '__polluted__', {
+      value: `evil${LONE_HIGH}`,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
+    try {
+      const payload = { chat_id: 1, text: `hi${LONE_HIGH}` }
+      const out = sanitizePayloadStrings(payload)
+      expect(out.text).toBe('hi�')
+      expect(Object.prototype.hasOwnProperty.call(out, '__polluted__')).toBe(false)
+      expect(Object.keys(out)).toEqual(['chat_id', 'text'])
+      expect(JSON.stringify(out)).toBe('{"chat_id":1,"text":"hi�"}')
+    } finally {
+      delete proto.__polluted__
+    }
+  })
+
   it('leaves non-string scalars alone', () => {
     const payload = { chat_id: 1, disable_notification: true, x: null, y: undefined }
     expect(sanitizePayloadStrings(payload)).toBe(payload)
@@ -387,6 +472,56 @@ describe('repair logging: real count, throttled per method', () => {
     })
   })
 
+  it('failing open is LOGGED, not silent, and names the method', async () => {
+    // Fail-open is correct (see the docblock) but a silent fail-open turns a
+    // future walk bug into a bare Telegram 400 with no trail back here — the
+    // exact opacity #4728 exists to end. Goes RED on a bare `catch {}`.
+    let clock = 2_000_000
+    await captureSanitizeLog(async lines => {
+      const bot = new Bot('123456:TEST_TOKEN', {
+        botInfo: {
+          id: 123456, is_bot: true, first_name: 'Test', username: 'test_bot',
+          can_join_groups: false, can_read_all_group_messages: false,
+          supports_inline_queries: false, can_connect_to_business: false,
+          has_main_web_app: false,
+        },
+      })
+      bot.api.config.use(async () => ({
+        ok: true,
+        result: { message_id: 7, date: 0, chat: { id: 1, type: 'private' } },
+      } as never))
+      installUtf8Sanitizer(bot, () => clock)
+
+      const explode = (): Record<string, unknown> => {
+        const p: Record<string, unknown> = { chat_id: 1 }
+        Object.defineProperty(p, 'text', {
+          enumerable: true,
+          configurable: true,
+          get() { throw new Error('getter exploded') },
+        })
+        return p
+      }
+
+      // Still sends (fail-open), and says so.
+      const sent = await bot.api.raw.sendMessage(explode() as never)
+      expect(sent.message_id).toBe(7)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('FAILED OPEN')
+      expect(lines[0]).toContain('method=sendMessage')
+      expect(lines[0]).toContain('getter exploded')
+
+      // Throttled on its own budget, like the repair line.
+      clock += 500
+      await bot.api.raw.sendMessage(explode() as never)
+      expect(lines).toHaveLength(1)
+
+      clock += 61_000
+      await bot.api.raw.sendMessage(explode() as never)
+      expect(lines).toHaveLength(2)
+      expect(lines[1]).toContain('FAILED OPEN')
+    })
+  })
+
   it('logs nothing for a clean body', async () => {
     await captureSanitizeLog(async lines => {
       const { bot } = makeTelegramLikeBot()
@@ -428,5 +563,26 @@ describe('boot wiring: the sanitiser is the INNERMOST transformer', () => {
     ]) {
       expect(src.indexOf(later), later).toBeGreaterThan(sanitizer)
     }
+  })
+
+  it('nothing at all is installed between `new Bot(` and the sanitiser', () => {
+    // The named-installer check above is one-sided: it pins four KNOWN
+    // installers as later, but someone adding `installFoo(bot)` between
+    // `new Bot(TOKEN)` and `installUtf8Sanitizer(bot)` composes INNER of the
+    // sanitiser, sends unsanitised, and leaves every test in this file green.
+    // So pin it from the other side: the sanitiser must be the FIRST thing
+    // wired onto the bot, full stop.
+    const botIdx = src.search(/new Bot\(/)
+    expect(botIdx).toBeGreaterThan(-1)
+
+    const WIRING = /install[A-Za-z0-9_]*\(\s*bot\b|\.api\.config\.use\(/g
+    WIRING.lastIndex = botIdx
+    const first = WIRING.exec(src)
+    expect(first, 'no bot wiring found after `new Bot(`').not.toBeNull()
+    expect(
+      first![0],
+      `first bot wiring after \`new Bot(\` was \`${first![0]}\` — the UTF-8 ` +
+      'sanitiser must be installed first so it composes innermost',
+    ).toBe('installUtf8Sanitizer(bot')
   })
 })
