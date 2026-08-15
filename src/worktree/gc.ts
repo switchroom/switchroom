@@ -32,6 +32,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   readFileSync,
@@ -248,6 +249,45 @@ export function isStablePerRepoBranch(branch: string | null): boolean {
   return !!branch && /^agent\/[^/]+\/main$/.test(branch);
 }
 
+/**
+ * True for a checkout parked on a TRUNK branch — a reference clone, not a
+ * disposable task tree.
+ *
+ * This guard is what makes widened discovery (see `discoverAgentCheckouts`)
+ * safe. Before it, the only thing standing between the sweep and a long-lived
+ * reference clone such as `overlord/home/switchroom-clone` was the PR probe
+ * happening to answer `none` for the branch `main` — a preservation that
+ * depended on a NETWORK CALL to `gh` and on GitHub never having a PR whose
+ * head branch is literally `main`. Narrow roots hid that: a reference clone
+ * was never under `home/work` in the first place. Once the scanner finds
+ * checkouts wherever agents actually put them, the distinction has to be
+ * structural.
+ *
+ * A task tree by construction sits on its own task branch (that is the whole
+ * point of a task tree); a tree on trunk is either a reference clone, a
+ * scratch build of `main`, or something an agent means to keep. All three are
+ * cheap to keep and expensive to get wrong, so trunk ⇒ never reaped.
+ */
+export function isReferenceCheckoutBranch(branch: string | null): boolean {
+  return !!branch && ["main", "master", "trunk", "develop"].includes(branch);
+}
+
+/**
+ * Marker file an agent or the operator drops in a checkout to declare it
+ * durable. Its presence makes the tree `skip-protected` unconditionally.
+ *
+ * Every other precious/disposable signal is INFERRED, and inference cannot be
+ * complete: the reference clone `overlord/home/switchroom-clone` sits on a
+ * local scratch branch (`review-merge`, upstream `origin/main`) — neither
+ * trunk nor a reserved path. It survives the sweep today only because that
+ * branch has no PR (`prSignal: "none"` -> `skip-unmerged`) and because it is
+ * touched often enough to stay inside the idle window. Both are true, and both
+ * are accidents. This marker is the deterministic escape valve:
+ * `touch .switchroom-keep` and the tree is off-limits regardless of branch,
+ * age, or PR state — a mechanism, not a heuristic.
+ */
+export const KEEP_MARKER = ".switchroom-keep";
+
 export type TaskTreeVerdict =
   /** clean + pushed + idle + (merged|closed) PR + provably free → reclaim. */
   | "reap"
@@ -271,6 +311,10 @@ export type TaskTreeVerdict =
 export interface TaskTreeClassifyInput {
   isRegistryClaimed: boolean;
   isStablePerRepoTree: boolean;
+  /** Checkout parked on a trunk branch — a reference clone. Never reaped. */
+  isReferenceCheckout?: boolean;
+  /** `.switchroom-keep` present — operator/agent declared it durable. */
+  isKeepMarked?: boolean;
   isEphemeralPath: boolean;
   clean: boolean;
   pushed: PushState;
@@ -286,7 +330,13 @@ export interface TaskTreeClassifyInput {
  * live or dirty-and-in-use tree can never be quarantined.
  */
 export function classifyTaskTree(i: TaskTreeClassifyInput): TaskTreeVerdict {
-  if (i.isRegistryClaimed || i.isStablePerRepoTree || i.isEphemeralPath) {
+  if (
+    i.isRegistryClaimed ||
+    i.isStablePerRepoTree ||
+    i.isReferenceCheckout ||
+    i.isKeepMarked ||
+    i.isEphemeralPath
+  ) {
     return "skip-protected";
   }
   // In-use guards come first: a tree a live process holds is never eligible for
@@ -365,6 +415,8 @@ export interface SkippedDir {
 export interface GcPlan {
   roots: string[];
   taskTreeRoots: string[];
+  /** Explicit task-tree candidate dirs (widened discovery). */
+  taskTreeDirs: string[];
   trashDir: string;
   orphans: OrphanAction[];
   registered: RegisteredAction[];
@@ -545,6 +597,34 @@ function defaultNewestTrackedMtimeMs(
   return newest || Date.now();
 }
 
+/**
+ * Allocate a COLLISION-FREE quarantine destination under `trash` for `dir`.
+ *
+ * The quarantine dest used to be `join(trash, basename(dir))`. That was
+ * already latently wrong across agents (two agents can both own a
+ * `home/work/switchroom`), and widened discovery makes it acute: the incident
+ * layout alone contains three `switchroom` and two `repo` basenames. Two
+ * quarantines in the same dated trash dir would then race for one path — `mv`
+ * would nest the second INSIDE the first, and the operator loses the ability
+ * to tell which agent a recovered tree came from.
+ *
+ * The disambiguator is the SHA-1 of the absolute source path, so it is stable
+ * across runs (a re-run of a dry-run prints the same dest) and short enough to
+ * stay readable. `used` is mutated so one planner run stays internally
+ * consistent.
+ */
+export function allocateTrashDest(trash: string, dir: string, used: Set<string>): string {
+  const name = basename(dir);
+  if (!used.has(name)) {
+    used.add(name);
+    return join(trash, name);
+  }
+  const suffix = createHash("sha1").update(resolve(dir)).digest("hex").slice(0, 8);
+  const unique = `${name}-${suffix}`;
+  used.add(unique);
+  return join(trash, unique);
+}
+
 /** Default trash root. Override via SWITCHROOM_WORKTREE_TRASH for tests. */
 export function trashRoot(): string {
   return resolve(
@@ -566,11 +646,16 @@ export function trashRoot(): string {
  *                       carry different semantics (all tree shapes, the
  *                       `work/` carve-out, the pushed + idle guards, and
  *                       merged-OR-closed eligibility).
+ * @param taskTreeDirs   EXPLICIT task-tree candidate directories, from widened
+ *                       discovery (`discoverAgentCheckouts`). Unioned with the
+ *                       subdirs of `taskTreeRoots` and de-duplicated, so the
+ *                       pre-existing root-based behaviour is unchanged.
  */
 export function planGc(
   roots: string[],
   deps: GcDeps = {},
   taskTreeRoots: string[] = [],
+  taskTreeDirs: string[] = [],
 ): GcPlan {
   const exists = deps.existsSync ?? existsSync;
   const readDir = deps.readDir ?? ((p: string) => readdirSync(p));
@@ -616,6 +701,8 @@ export function planGc(
 
   const orphans: OrphanAction[] = [];
   const skipped: SkippedDir[] = [];
+  // Quarantine basenames already handed out this run (see allocateTrashDest).
+  const usedTrashNames = new Set<string>();
   const ownerRepos = new Set<string>(); // validated repos discovered via orphans
 
   // ── Phase A: orphan attribution + quarantine plan ──
@@ -672,7 +759,7 @@ export function planGc(
       // Orphan ⇔ the admin dir the pointer references is gone. If it still
       // exists the worktree is live/registered → handled by Phase B.
       if (exists(ptr)) continue;
-      orphans.push({ dir, owner: repoRoot, dest: join(trash, name) });
+      orphans.push({ dir, owner: repoRoot, dest: allocateTrashDest(trash, dir, usedTrashNames) });
     }
   }
 
@@ -724,6 +811,17 @@ export function planGc(
   // carve-out is achieved structurally (these roots never reach the blanket
   // `looksLikeAgentWorktree` skip) and all three tree shapes are covered.
   const taskTrees: TaskTreeAction[] = [];
+  // Candidates = immediate subdirs of each blessed root (legacy behaviour)
+  // UNION the explicitly discovered checkouts (widened discovery), keyed by
+  // resolved path so a directory reachable both ways is classified once.
+  const candidates: string[] = [];
+  const seenCandidate = new Set<string>();
+  const pushCandidate = (dir: string) => {
+    const key = resolve(dir);
+    if (seenCandidate.has(key)) return;
+    seenCandidate.add(key);
+    candidates.push(dir);
+  };
   for (const root of taskTreeRoots) {
     if (!exists(root)) continue;
     let entries: string[];
@@ -732,158 +830,166 @@ export function planGc(
     } catch {
       continue;
     }
-    for (const name of entries) {
-      const dir = join(root, name);
-      if (isEphemeralPath(dir)) continue;
-      const dotGit = join(dir, ".git");
-      if (!exists(dotGit)) continue; // not a git tree — leave it
-      let shape: TaskTreeShape;
-      try {
-        shape = stat(dotGit).isDirectory() ? "clone" : "worktree";
-      } catch {
-        continue;
-      }
+    for (const name of entries) pushCandidate(join(root, name));
+  }
+  for (const d of taskTreeDirs) pushCandidate(d);
 
-      // Safety gate: only ever touch a checkout of the canonical switchroom
-      // repo. `git -C <dir> remote get-url origin` works for worktree AND clone.
-      // A FAILED probe is not a negative answer. Both keep the tree, but only
-      // the negative answer means "we looked and it isn't ours"; the failure
-      // means the tree is unreadable and needs the operator's attention.
-      let remoteOk = false;
-      let remoteError: string | null = null;
-      try {
-        remoteOk = isSwitchroomRemote(exec("git", gitArgs(dir, "remote", "get-url", "origin")));
-      } catch (e) {
-        remoteError = describeExecFailure(e);
-      }
-      if (remoteError) {
-        skipped.push({ dir, reason: `git probe failed, kept: ${remoteError}`, kind: "probe-failed" });
-        continue;
-      }
-      if (!remoteOk) {
-        skipped.push({ dir, reason: "not a switchroom task tree", kind: "not-ours" });
-        continue;
-      }
-
-      // Owner repo (for post-reclaim `worktree prune`) — worktree shape only.
-      let ownerRepo: string | null = null;
-      if (shape === "worktree") {
-        try {
-          const ptr = parseGitdirPointer(readFile(dotGit));
-          if (ptr) ownerRepo = repoRootFromWorktreeGitdir(ptr);
-        } catch {
-          ownerRepo = null;
-        }
-      }
-
-      // Branch / detached HEAD.
-      let branch: string | null = null;
-      let detached = false;
-      try {
-        const b = exec("git", gitArgs(dir, "rev-parse", "--abbrev-ref", "HEAD")).trim();
-        if (b === "HEAD") detached = true;
-        else branch = b;
-      } catch {
-        detached = true; // can't read HEAD ⇒ treat as detached ⇒ unpushed ⇒ keep
-      }
-
-      const claimedWt = claimed.has(resolve(dir));
-      const stableTree = isStablePerRepoBranch(branch);
-      const ephemeral = isEphemeralPath(dir);
-      const protectedTree = claimedWt || stableTree || ephemeral;
-
-      // Effective cleanliness (build noise tolerated; anything else ⇒ dirty).
-      let clean = false;
-      try {
-        clean = isEffectivelyClean(exec("git", gitArgs(dir, "status", "--porcelain")).split("\n"));
-      } catch {
-        clean = false; // can't inspect ⇒ assume dirty ⇒ keep
-      }
-
-      // Push state: uncommitted-clean does NOT imply pushed.
-      let upstream: string | null = null;
-      let aheadCount = 0;
-      if (!detached) {
-        try {
-          upstream =
-            exec("git", gitArgs(dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")).trim() ||
-            null;
-        } catch {
-          upstream = null;
-        }
-        if (upstream) {
-          try {
-            aheadCount = parseInt(exec("git", gitArgs(dir, "rev-list", "--count", "@{upstream}..HEAD")).trim(), 10);
-            if (!Number.isFinite(aheadCount)) aheadCount = -1;
-          } catch {
-            aheadCount = -1; // count failed ⇒ error ⇒ keep
-          }
-        }
-      }
-      const pushed = pushStateFrom({ detached, upstream, aheadCount });
-
-      // Idle: newest tracked mtime older than the idle window.
-      let idle = false;
-      let newestMtimeMs: number | null = null;
-      try {
-        newestMtimeMs = newestMtime(dir);
-        idle = (nowMs - newestMtimeMs) / 86_400_000 >= idleDays;
-      } catch {
-        idle = false; // can't tell ⇒ treat as active ⇒ keep
-        newestMtimeMs = null;
-      }
-
-      // Spend the probe + `gh` call only when every cheaper guard has passed
-      // (mirrors Phase B). classifyTaskTree checks in-use/clean/pushed/idle
-      // before the PR signal, so an uncalled `error`/`unavailable` is only ever
-      // consulted when an earlier guard has already decided the verdict.
-      let inUse: PathUseState = "unavailable";
-      let sig: PrSignal = "error";
-      if (!protectedTree) {
-        inUse = probeInUse(dir);
-        if (inUse === "free" && clean && pushed === "pushed" && idle && branch) {
-          sig = prSignal(dir, branch);
-        }
-      }
-
-      const verdict = classifyTaskTree({
-        isRegistryClaimed: claimedWt,
-        isStablePerRepoTree: stableTree,
-        isEphemeralPath: ephemeral,
-        clean,
-        pushed,
-        prSignal: sig,
-        idle,
-        inUse,
-      });
-
-      // Automatic reap, OR — under the operator escape hatch — an IDLE
-      // dirty/unpushed tree (reversible quarantine; never a live/in-use one,
-      // since those resolve to skip-in-use before skip-dirty/skip-unpushed).
-      const willAct =
-        verdict === "reap" ||
-        (escapeHatch && idle && (verdict === "skip-dirty" || verdict === "skip-unpushed"));
-
-      if (willAct && ownerRepo) reposToPrune.add(ownerRepo);
-
-      taskTrees.push({
-        dir,
-        shape,
-        ownerRepo,
-        branch,
-        verdict,
-        prSignal: sig,
-        idle,
-        newestMtimeMs,
-        dest: join(trash, name),
-        willAct,
-      });
+  for (const dir of candidates) {
+    if (isEphemeralPath(dir)) continue;
+    const dotGit = join(dir, ".git");
+    if (!exists(dotGit)) continue; // not a git tree — leave it
+    let shape: TaskTreeShape;
+    try {
+      shape = stat(dotGit).isDirectory() ? "clone" : "worktree";
+    } catch {
+      continue;
     }
+
+    // Safety gate: only ever touch a checkout of the canonical switchroom
+    // repo. `git -C <dir> remote get-url origin` works for worktree AND clone.
+    // A FAILED probe is not a negative answer. Both keep the tree, but only
+    // the negative answer means "we looked and it isn't ours"; the failure
+    // means the tree is unreadable and needs the operator's attention.
+    let remoteOk = false;
+    let remoteError: string | null = null;
+    try {
+      remoteOk = isSwitchroomRemote(exec("git", gitArgs(dir, "remote", "get-url", "origin")));
+    } catch (e) {
+      remoteError = describeExecFailure(e);
+    }
+    if (remoteError) {
+      skipped.push({ dir, reason: `git probe failed, kept: ${remoteError}`, kind: "probe-failed" });
+      continue;
+    }
+    if (!remoteOk) {
+      skipped.push({ dir, reason: "not a switchroom task tree", kind: "not-ours" });
+      continue;
+    }
+
+    // Owner repo (for post-reclaim `worktree prune`) — worktree shape only.
+    let ownerRepo: string | null = null;
+    if (shape === "worktree") {
+      try {
+        const ptr = parseGitdirPointer(readFile(dotGit));
+        if (ptr) ownerRepo = repoRootFromWorktreeGitdir(ptr);
+      } catch {
+        ownerRepo = null;
+      }
+    }
+
+    // Branch / detached HEAD.
+    let branch: string | null = null;
+    let detached = false;
+    try {
+      const b = exec("git", gitArgs(dir, "rev-parse", "--abbrev-ref", "HEAD")).trim();
+      if (b === "HEAD") detached = true;
+      else branch = b;
+    } catch {
+      detached = true; // can't read HEAD ⇒ treat as detached ⇒ unpushed ⇒ keep
+    }
+
+    const claimedWt = claimed.has(resolve(dir));
+    const stableTree = isStablePerRepoBranch(branch);
+    const referenceCheckout = isReferenceCheckoutBranch(branch);
+    const keepMarked = exists(join(dir, KEEP_MARKER));
+    const ephemeral = isEphemeralPath(dir);
+    const protectedTree =
+      claimedWt || stableTree || referenceCheckout || keepMarked || ephemeral;
+
+    // Effective cleanliness (build noise tolerated; anything else ⇒ dirty).
+    let clean = false;
+    try {
+      clean = isEffectivelyClean(exec("git", gitArgs(dir, "status", "--porcelain")).split("\n"));
+    } catch {
+      clean = false; // can't inspect ⇒ assume dirty ⇒ keep
+    }
+
+    // Push state: uncommitted-clean does NOT imply pushed.
+    let upstream: string | null = null;
+    let aheadCount = 0;
+    if (!detached) {
+      try {
+        upstream =
+          exec("git", gitArgs(dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")).trim() ||
+          null;
+      } catch {
+        upstream = null;
+      }
+      if (upstream) {
+        try {
+          aheadCount = parseInt(exec("git", gitArgs(dir, "rev-list", "--count", "@{upstream}..HEAD")).trim(), 10);
+          if (!Number.isFinite(aheadCount)) aheadCount = -1;
+        } catch {
+          aheadCount = -1; // count failed ⇒ error ⇒ keep
+        }
+      }
+    }
+    const pushed = pushStateFrom({ detached, upstream, aheadCount });
+
+    // Idle: newest tracked mtime older than the idle window.
+    let idle = false;
+    let newestMtimeMs: number | null = null;
+    try {
+      newestMtimeMs = newestMtime(dir);
+      idle = (nowMs - newestMtimeMs) / 86_400_000 >= idleDays;
+    } catch {
+      idle = false; // can't tell ⇒ treat as active ⇒ keep
+      newestMtimeMs = null;
+    }
+
+    // Spend the probe + `gh` call only when every cheaper guard has passed
+    // (mirrors Phase B). classifyTaskTree checks in-use/clean/pushed/idle
+    // before the PR signal, so an uncalled `error`/`unavailable` is only ever
+    // consulted when an earlier guard has already decided the verdict.
+    let inUse: PathUseState = "unavailable";
+    let sig: PrSignal = "error";
+    if (!protectedTree) {
+      inUse = probeInUse(dir);
+      if (inUse === "free" && clean && pushed === "pushed" && idle && branch) {
+        sig = prSignal(dir, branch);
+      }
+    }
+
+    const verdict = classifyTaskTree({
+      isRegistryClaimed: claimedWt,
+      isStablePerRepoTree: stableTree,
+      isReferenceCheckout: referenceCheckout,
+      isKeepMarked: keepMarked,
+      isEphemeralPath: ephemeral,
+      clean,
+      pushed,
+      prSignal: sig,
+      idle,
+      inUse,
+    });
+
+    // Automatic reap, OR — under the operator escape hatch — an IDLE
+    // dirty/unpushed tree (reversible quarantine; never a live/in-use one,
+    // since those resolve to skip-in-use before skip-dirty/skip-unpushed).
+    const willAct =
+      verdict === "reap" ||
+      (escapeHatch && idle && (verdict === "skip-dirty" || verdict === "skip-unpushed"));
+
+    if (willAct && ownerRepo) reposToPrune.add(ownerRepo);
+
+    taskTrees.push({
+      dir,
+      shape,
+      ownerRepo,
+      branch,
+      verdict,
+      prSignal: sig,
+      idle,
+      newestMtimeMs,
+      dest: allocateTrashDest(trash, dir, usedTrashNames),
+      willAct,
+    });
   }
 
   return {
     roots,
     taskTreeRoots,
+    taskTreeDirs,
     trashDir: trash,
     orphans,
     registered,
@@ -1081,4 +1187,211 @@ export function defaultTaskTreeRoots(): string[] {
     }
   }
   return roots;
+}
+
+// ── widened discovery — find checkouts where agents ACTUALLY put them ───────
+//
+// `defaultTaskTreeRoots()` above scans exactly two subdirectories per agent
+// (`home/work`, `home/workspace`). The 2026-08 disk incident (root disk 85%
+// full) turned up 41 stale checkouts across the fleet and only a handful were
+// under either root. The real litter was:
+//
+//   <agent>/home/sr-4638              direct child of home/, ad-hoc name
+//   <agent>/home/tmp-build/switchroom nested one level deeper
+//   <agent>/home/.cache/sr-review     inside a DOT directory
+//   <agent>/.work4481/repo            dot directory outside home/ entirely
+//   <agent>/worktrees/b3-…            a sibling of home/, not under it
+//   <agent>/scratchwork/switchroom    outside home/
+//
+// The classifier was never broken — it was aimed at a convention nobody
+// follows. Discovery therefore walks the agent directory itself, bounded, and
+// hands `planGc` explicit candidate DIRECTORIES rather than blessed roots.
+
+/**
+ * Directory names never descended into during discovery.
+ *
+ * Two categories, both load-bearing for the cost bound:
+ *   - `.git` — descending it would treat `.git/modules/<sub>` and
+ *     `.git/worktrees/<name>` admin dirs as independent checkouts. It is also
+ *     the single largest object count on disk.
+ *   - package-manager caches and build output — thousands of directories with
+ *     zero chance of holding a task checkout.
+ *
+ * `.cache` is deliberately ABSENT: the incident found a real stale checkout at
+ * `overlord/home/.cache/sr-review`. Its cost is bounded by the depth cap
+ * instead (measured below), not by a name prune.
+ */
+export const DISCOVERY_PRUNE_DIRS: ReadonlySet<string> = new Set([
+  ".git",
+  "node_modules",
+  ".npm",
+  ".bun",
+  ".cargo",
+  ".rustup",
+  ".nvm",
+  ".pnpm-store",
+  ".yarn",
+  ".venv",
+  "venv",
+  "site-packages",
+  "__pycache__",
+  ".pyenv",
+  ".gradle",
+  ".m2",
+  ".claude",
+  ".local",
+  "target",
+  "dist",
+  ".next",
+  // `~/.cache/uv/sdists-v9/**` contains thousands of unpacked source dists,
+  // many of which carry a real `.git`.
+  "uv",
+  // An agent's `tmp/` is owned by the SEPARATE tmp reaper (`tmp-reaper.ts`,
+  // `switchroom reap-stale-workdirs`). Two reapers racing for the same
+  // directories is worse than either alone, and the reference fleet has live
+  // harness fixtures there (`klanker/tmp/sr-a4b-*/a4b/workspace`). Note this
+  // prunes the exact name `tmp` only: `home/tmp-build/switchroom` was real
+  // incident litter and is still discovered.
+  "tmp",
+]);
+
+/**
+ * True for a directory that must never be descended into during discovery.
+ *
+ * Beyond the fixed name list, `*.git` is pruned by SHAPE: that is the bare-repo
+ * convention (`switchroom.git/`), and a bare repo's internal `worktrees/<name>`
+ * admin directories would otherwise be walked and could be mistaken for
+ * independent checkouts — the same failure the `.git` prune exists to stop, one
+ * layout removed.
+ */
+export function isPrunedDiscoveryDir(name: string): boolean {
+  return DISCOVERY_PRUNE_DIRS.has(name) || name.endsWith(".git");
+}
+
+/**
+ * Paths under an agent directory that are the agent's own durable furniture,
+ * never a disposable task tree. Relative to `<agentsDir>/<agent>`.
+ *
+ * `work` (and its immediate children) is the STABLE per-repo tree documented
+ * at `defaultTaskTreeRoots` — deliberately never scanned. `home/workspace` is
+ * the agent's own workspace: `defaultTaskTreeRoots` scans its CHILDREN as task
+ * trees, but the workspace directory itself, if it is a checkout, is the
+ * agent's and not litter.
+ */
+function reservedAgentPath(relParts: string[]): "container" | "tree" | null {
+  const rel = relParts.join("/");
+  // Containers: never a candidate themselves, but always walked THROUGH — a
+  // stray `.git` in an agent's HOME must not blind the walk to everything
+  // below it.
+  if (rel === "" || rel === "home") return "container";
+  // The agent's own workspace, both spellings seen on the reference fleet:
+  // `<agent>/workspace` (a switchroom checkout on `master`, the host-side
+  // agent workspace) and `<agent>/home/workspace` (whose CHILDREN are the
+  // legacy task-tree root). The directories themselves are durable furniture.
+  if (rel === "workspace") return "tree";
+  if (rel === "home/workspace") return "container";
+  // <agent>/work and <agent>/work/<slug> — the stable per-repo tree
+  // (`defaultTaskTreeRoots` documents it as deliberately not scanned).
+  // Reserved AND terminal: nothing inside it is independent litter.
+  if (relParts[0] === "work" && relParts.length <= 2) return "tree";
+  return null;
+}
+
+export interface DiscoverDeps {
+  readDir?: (p: string) => { name: string; isDirectory: () => boolean; isSymbolicLink: () => boolean }[];
+  existsSync?: (p: string) => boolean;
+  /** Max directory depth below each agent directory. Default 4. */
+  maxDepth?: number;
+  /** Hard ceiling on directories VISITED, fleet-wide. Default 50_000. */
+  maxVisits?: number;
+}
+
+/**
+ * Discover every git checkout under each agent's directory.
+ *
+ * Bounded by construction:
+ *   - **depth** — `maxDepth` levels below `<agentsDir>/<agent>` (default 4;
+ *     the deepest real litter found in the incident was at depth 3).
+ *   - **prune** — `DISCOVERY_PRUNE_DIRS`, plus symlinks (never followed, so a
+ *     symlink loop cannot hang the walk and a symlinked-in project cannot be
+ *     mistaken for the agent's own litter).
+ *   - **short-circuit** — a directory containing `.git` is recorded as a
+ *     candidate and NOT descended into. That is what keeps a checkout's own
+ *     `node_modules`, nested submodules, and nested linked worktrees out of
+ *     the walk: a nested worktree inside a checkout is part of that checkout's
+ *     tree and must never be reaped as an independent one.
+ *   - **visit budget** — `maxVisits` directories fleet-wide, so a pathological
+ *     home cannot turn a GC dry-run into an unbounded traversal.
+ *
+ * Reserved agent furniture (`isReservedAgentPath`) is descended into but never
+ * itself emitted. Everything emitted still runs the full `planGc` Phase C
+ * guard gauntlet — switchroom-origin, trunk-branch, claimed, in-use, dirty,
+ * unpushed, idle, PR state — before anything is reclaimed. Discovery widens
+ * WHERE we look; it relaxes nothing about WHAT may be reaped.
+ */
+export function discoverAgentCheckouts(
+  agentsDir: string,
+  deps: DiscoverDeps = {},
+): string[] {
+  const readDir =
+    deps.readDir ?? ((p: string) => readdirSync(p, { withFileTypes: true }));
+  const exists = deps.existsSync ?? existsSync;
+  const maxDepth = deps.maxDepth ?? 4;
+  const maxVisits = deps.maxVisits ?? 50_000;
+
+  let agents: { name: string; isDirectory: () => boolean; isSymbolicLink: () => boolean }[];
+  try {
+    agents = readDir(agentsDir);
+  } catch {
+    return [];
+  }
+
+  const found: string[] = [];
+  let visits = 0;
+
+  for (const agent of agents.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!agent.isDirectory() || agent.isSymbolicLink()) continue;
+    const agentRoot = join(agentsDir, agent.name);
+    // Breadth-first so the shallow, likely candidates are found before a deep
+    // pathological subtree can exhaust the visit budget.
+    const queue: { dir: string; rel: string[] }[] = [{ dir: agentRoot, rel: [] }];
+    while (queue.length) {
+      const { dir, rel } = queue.shift()!;
+      if (visits >= maxVisits) return found;
+      visits++;
+
+      const reserved = reservedAgentPath(rel);
+      if (reserved === "tree") continue; // stable per-repo tree — stop here
+      // A `.git` entry (file OR directory) marks a checkout. Record it and do
+      // not descend: everything below belongs to that checkout.
+      if (reserved !== "container" && exists(join(dir, ".git"))) {
+        found.push(dir);
+        continue;
+      }
+      if (rel.length >= maxDepth) continue;
+
+      let kids: { name: string; isDirectory: () => boolean; isSymbolicLink: () => boolean }[];
+      try {
+        kids = readDir(dir);
+      } catch {
+        continue; // unreadable (cross-uid, EACCES) — nothing to discover here
+      }
+      for (const k of kids) {
+        if (!k.isDirectory() || k.isSymbolicLink()) continue;
+        if (isPrunedDiscoveryDir(k.name)) continue;
+        queue.push({ dir: join(dir, k.name), rel: [...rel, k.name] });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Default explicit task-tree CANDIDATES — every git checkout discovered under
+ * `~/.switchroom/agents/<name>/`. Complements (does not replace)
+ * `defaultTaskTreeRoots()`: `planGc` unions the two and de-duplicates, so the
+ * pre-existing `home/work` / `home/workspace` behaviour is preserved exactly.
+ */
+export function defaultTaskTreeDirs(deps: DiscoverDeps = {}): string[] {
+  return discoverAgentCheckouts(join(homedir(), ".switchroom", "agents"), deps);
 }

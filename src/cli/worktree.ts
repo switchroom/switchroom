@@ -23,6 +23,7 @@ import {
   applyGc,
   defaultRoots,
   defaultTaskTreeRoots,
+  defaultTaskTreeDirs,
   trashRoot,
   listTrashEntries,
   selectPurgeTargets,
@@ -323,6 +324,10 @@ export function registerWorktreeCommand(program: Command): void {
       [] as string[],
     )
     .option("--no-task-roots", "Skip the per-agent task-tree sweep entirely")
+    .option(
+      "--no-discover",
+      "Skip widened discovery of checkouts outside home/work + home/workspace",
+    )
     .option("--idle-days <days>", "Idle threshold for task trees (default 14)", "14")
     .option(
       "--reclaim-dirty",
@@ -337,6 +342,7 @@ export function registerWorktreeCommand(program: Command): void {
         root: string[];
         taskRoot: string[];
         taskRoots?: boolean;
+        discover?: boolean;
         idleDays: string;
         reclaimDirty?: boolean;
         yes?: boolean;
@@ -378,6 +384,12 @@ export function registerWorktreeCommand(program: Command): void {
             : opts.taskRoot.length > 0
               ? opts.taskRoot
               : defaultTaskTreeRoots();
+        // Widened discovery (2026-08 disk incident): find checkouts wherever
+        // agents actually put them, not only under the two blessed roots.
+        const taskTreeDirs =
+          opts.taskRoots === false || opts.discover === false || opts.taskRoot.length > 0
+            ? []
+            : defaultTaskTreeDirs();
         const parsedIdle = Number(opts.idleDays);
         const idleDays = Number.isFinite(parsedIdle) && parsedIdle >= 0 ? parsedIdle : 14;
         const dateStamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -385,6 +397,7 @@ export function registerWorktreeCommand(program: Command): void {
           roots,
           { dateStamp, idleDays, escapeHatch: opts.reclaimDirty },
           taskTreeRoots,
+          taskTreeDirs,
         );
         const toRemove = plan.registered.filter((r) => r.verdict === "remove");
         const taskReap = plan.taskTrees.filter((t) => t.willAct);
