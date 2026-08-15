@@ -479,10 +479,16 @@ const GATEWAY_FLOOD_LADDER_RE = /429 rate limited|outbox-sweep: deferred/;
  * gateway-wide markers above are handled separately — it was never an
  * argument about this line, which carries the chat in every emission.
  *
- * Deliberately NOT matched: the global token-tier bucket `key=g:<botScope>`
- * (`edit-flood-fuse.ts:825`), which is chatless. A rich send deferred there
- * alone loses its evidence and books the sev-3 — the fail-toward-the-alarm
- * direction this whole classifier is biased in.
+ * The namespace alternation is ENUMERATED rather than written `[a-z]+`, and
+ * that is load-bearing: the fuse's global token-tier bucket is
+ * `key=g:<botScopeKey>` (`edit-flood-fuse.ts:825`) and `deriveBotScopeKey`
+ * (`:338-343`) resolves to the bot's NUMERIC id for a well-formed token
+ * (`key=g:8792631963` on the live fleet). A loose namespace class would parse
+ * that bot id as a chat id — the two live in the same Telegram id space — and
+ * hand a chatless line a chat it does not have. `g:` is deliberately not
+ * evidence: a rich send deferred only on the global tier loses its evidence
+ * and books the sev-3, which is the fail-toward-the-alarm direction this whole
+ * classifier is biased in.
  *
  * Deliberately NOT a marker at all: `queued card send failed`
  * (`stream-render.ts:393`). The pre-review docblock called it "the queued-card
@@ -494,7 +500,7 @@ const GATEWAY_FLOOD_LADDER_RE = /429 rate limited|outbox-sweep: deferred/;
  * nor a method, so it could not be scoped even if it did mean a re-send.
  */
 const FUSE_SEND_DEFERRAL_RE =
-  /\bedit-flood-fuse deferred method=sendRichMessage\b[^\n]*\bkey=[a-z]+:(-?\d+)\b/;
+  /\bedit-flood-fuse deferred method=sendRichMessage\b[^\n]*\bkey=(?:cs|cer|ce|lr|t):(-?\d+)\b/;
 
 /**
  * A rejection whose own error CLASS says the send is in the flood ladder,

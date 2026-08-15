@@ -504,6 +504,23 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
       expect(s).toContain("reply-delivery-recovered");
     });
 
+    it("the fuse's CHATLESS global token bucket is not evidence for any chat", () => {
+      // `key=g:<botScopeKey>` is the fuse's global tier, and `deriveBotScopeKey`
+      // resolves it to the bot's NUMERIC id (live: `key=g:8792631963`) — the
+      // same id space chats live in. A loose `key=[a-z]+:(-?\d+)` parse would
+      // read that bot id as a chat id, so the namespace alternation is
+      // enumerated. Here the bot id is made EQUAL to the failing chat, which is
+      // the only way this can be caught: with the loose parse it clears, with
+      // the enumerated one it does not.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        fuse("12:00:05.000", "sendRichMessage", `g:${GCHAT}`, "critical"),
+        post("12:00:50.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
     it("a send that never lands stays a severity-3 delivery failure", () => {
       const s = signalsOf([
         post("22:37:36.770", "err", "Bad Gateway"),
