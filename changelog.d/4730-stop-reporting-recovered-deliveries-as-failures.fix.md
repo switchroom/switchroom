@@ -1,0 +1,1 @@
+- **fleet-health: stop reporting recovered deliveries as failures (#4730)**

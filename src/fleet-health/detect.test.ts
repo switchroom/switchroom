@@ -171,7 +171,7 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
   });
 
   /**
-   * #4735 — `ROUTE_FIELD_SHIP_TS` is a hand-written literal
+   * #4730 — `ROUTE_FIELD_SHIP_TS` is a hand-written literal
    * (`turn-record-status.ts:91` = 2026-07-31T00:00:00Z), but the `route` field
    * only reached each agent at ITS OWN container restart: the earliest real
    * `route` row anywhere on the fleet carries ts 1785492486 (+10.1h) and the
@@ -187,7 +187,7 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
    * precisely what "silent no-op" denies — so it settles the row's class no
    * matter what the calendar says.
    */
-  describe("#4735 — a row that LANDED a message id is not a silent no-op", () => {
+  describe("#4730 — a row that LANDED a message id is not a silent no-op", () => {
     it("THE FALSIFIER: field-less row AT the ship epoch with landed_unconfirmed:1 yields ZERO sev-3", () => {
       const signals = detectTurnFindings(
         "alpha",
@@ -228,7 +228,7 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
 });
 
 /**
- * #4735 — `status=err` on a `tg-post` rich send was specified (#3931) to mean a
+ * #4730 — `status=err` on a `tg-post` rich send was specified (#3931) to mean a
  * TERMINAL outcome, but that contract only holds for sends routed through
  * `createRetryApiCall`: `willRetryTelegramFailure` returns `false` the moment
  * the attempt context is absent (`retry-api-call.ts:207`). Every recovery
@@ -243,7 +243,7 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
  * branch ran. Every one of them fails on the pre-fix detector, which books
  * `reply-delivery-failure` for all of them.
  */
-describe("#4735 — a recovered rich send is not a delivery failure", () => {
+describe("#4730 — a recovered rich send is not a delivery failure", () => {
   const GCHAT = "-1001234567890";
   const post = (t: string, status: string, desc: string, chat = GCHAT, thread = "-") =>
     `[2026-08-11T${t}Z] tg-post method=sendRichMessage chat=${chat} thread=${thread}` +
@@ -854,7 +854,7 @@ describe("#4680 — a working guard is not a failure", () => {
       "orphaned-db-handle",
       "orphaned-db-handle-recovered",
       "reply-delivery-failure",
-      // #4735 — the informational counterpart of `reply-delivery-failure`, the
+      // #4730 — the informational counterpart of `reply-delivery-failure`, the
       // same shape `orphaned-db-handle-recovered` has. It is a DERIVED signal
       // (no `GATEWAY_SIGNATURES` entry), which is exactly the class this
       // tripwire exists for: confirmed deliberately as `gateway-event` by the

@@ -462,7 +462,7 @@ function lineInstantMs(line: string): number | null {
  * Decide whether a rejected `sendRichMessage` at `failIdx` was RECOVERED by a
  * later rich send that landed in the same chat.
  *
- * #4735 — `status=err` was specified (#3931, `bot-runtime.ts:131-140`) to mean
+ * #4730 — `status=err` was specified (#3931, `bot-runtime.ts:131-140`) to mean
  * a TERMINAL outcome: an attempt the retry policy will repeat is labelled
  * `status=retry` instead. That contract holds only for sends routed through
  * `createRetryApiCall`, because `willRetryTelegramFailure` returns `false` the
@@ -721,7 +721,7 @@ export function detectTurnFindings(
         // AT/AFTER the ship epoch is a regression (the gateway dropped the
         // field) — treat it as `none` so it still surfaces.
         //
-        // #4735 — the epoch alone was not enough. `ROUTE_FIELD_SHIP_TS` is a
+        // #4730 — the epoch alone was not enough. `ROUTE_FIELD_SHIP_TS` is a
         // hand-written literal (2026-07-31T00:00:00Z), but the field reached
         // each agent at ITS OWN container restart, hours later: the earliest
         // real `route` row fleet-wide carries ts 1785492486 (+10.1h) and the
@@ -793,7 +793,7 @@ export function detectGatewayFindings(
           name === "orphaned-db-handle" &&
           classifyOrphanedDbTick(lines, i) === "recovered"
             ? "orphaned-db-handle-recovered"
-            : // #4735 — a rejected rich send that a later rich send to the same
+            : // #4730 — a rejected rich send that a later rich send to the same
               // chat recovered inside the send stack's own recovery window is
               // the fallback ladder WORKING, not a lost reply. Same split, same
               // reasoning as the orphaned-DB one above.

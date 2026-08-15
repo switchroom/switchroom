@@ -89,7 +89,7 @@ export const SIGNAL_MAP: Record<L0Signal, SignalMapping> = {
     signature: "reply-delivery-failure:sendRichMessage-err",
   },
   "reply-delivery-recovered": {
-    // #4735 — the same rejection, but a later rich send to the SAME chat landed
+    // #4730 — the same rejection, but a later rich send to the SAME chat landed
     // inside the send stack's own recovery window, so one of the gateway's
     // fallback ladders delivered it (thread-drop, 429 flood sleep, backstop
     // re-attempt, card re-send). #3931's `status=err` = OUTCOME contract only
@@ -312,7 +312,7 @@ export function countingUnitFor(signal: L0Signal): FleetHealthCountingUnit {
 const RECLASSIFICATION_GROUPS: readonly (readonly L0Signal[])[] = [
   ["orphaned-db-handle", "orphaned-db-handle-recovered"],
   ["silent-no-op-candidate", "flush-recovered-turn"],
-  // #4735 — the existing `reply-delivery-failure` cluster is mostly recovered
+  // #4730 — the existing `reply-delivery-failure` cluster is mostly recovered
   // sends, so this scan MOVES those findings to the sibling key. Without the
   // group the old key's drop to (near) zero reads as "someone fixed it" and
   // gh-sync closes the issue with a "Verified count-drop" claim it cannot
