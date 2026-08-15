@@ -1202,6 +1202,54 @@ Host prerequisites:
 - Python venvs need `python3-venv` (on Debian/Ubuntu: `apt install python3.12-venv`). `switchroom health` reports missing deps.
 - Node envs use `bun` by default. `npm` is available as an alternate installer.
 
+## Scratch volume — keeping caches off the root disk
+
+Every agent's HOME lives on the operator's root disk, and every package
+manager an agent reaches for caches under it: `~/.cache/uv`, `~/.npm`,
+`~/.bun/install/cache`, `~/.cache/puppeteer`, `~/.cache/ms-playwright`, and
+pip's user-site tree. On a working fleet that is tens of gigabytes, and
+sweeping it by hand does not hold — the caches regrow within hours.
+
+If the host has a second, larger device, point the fleet at it:
+
+```yaml
+scratch:
+  enabled: true                # default
+  volume: /mnt/bulkdata        # default. Must already exist.
+  subdir: switchroom/scratch   # default
+```
+
+Each agent gets `<volume>/<subdir>/<agent>` bind-mounted read-write at
+`/scratch` inside its container, created and owned by that agent's container
+uid at `switchroom apply` time, and these environment redirects so the caches
+actually land there:
+
+| Variable | Value | Why it needs its own redirect |
+|---|---|---|
+| `SWITCHROOM_AGENT_SCRATCH` | `/scratch` | How an agent or skill discovers it has scratch space |
+| `XDG_CACHE_HOME` | `/scratch/cache` | uv, pip's HTTP cache, and most XDG-aware tooling |
+| `TMPDIR` | `/scratch/tmp` | Large unpacks; `/tmp` is a RAM-backed tmpfs with a size ceiling |
+| `npm_config_cache` | `/scratch/cache/npm` | npm ignores XDG (`~/.npm`) |
+| `BUN_INSTALL_CACHE_DIR` | `/scratch/cache/bun` | bun ignores XDG |
+| `PYTHONUSERBASE` | `/scratch/python` | The tree `PIP_USER=1` installs into |
+| `PLAYWRIGHT_BROWSERS_PATH` | `/scratch/cache/ms-playwright` | Overrides the image's baked HOME path |
+| `PUPPETEER_CACHE_DIR` | `/scratch/cache/puppeteer` | puppeteer resolves `~/.cache` directly, ignoring XDG |
+
+This is applied to **every** agent by the framework, admin or not — it is not
+routed through the admin-only `bind_mounts:` escalation, because the agents
+that fill a disk with build caches are ordinary non-admin ones. Each agent
+sees only its own directory, never a sibling's and never the shared parent.
+
+**No second disk? Do nothing.** When `volume` does not exist the feature is a
+hard no-op: no mount, no env redirects, byte-identical compose output. A
+`scratch:` block naming a path that is not there warns on `apply` rather than
+silently pretending.
+
+**One-time cost when you turn it on:** `PYTHONUSERBASE` moves python's
+user-site, so packages an agent installed with `pip install` before the
+cutover are no longer importable and need reinstalling once. Package caches
+and browser downloads just re-populate on next use.
+
 ## Multi-Account OAuth (auth-broker)
 
 Authentication is **account-scoped and fleet-wide**, not per-agent. One
