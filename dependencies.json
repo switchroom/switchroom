@@ -5,7 +5,7 @@
     "node": "22.22.2"
   },
   "claude": {
-    "cli": "2.1.229"
+    "cli": "2.1.233"
   },
   "playwright_mcp": "0.0.71",
   "hindsight": {
