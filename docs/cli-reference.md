@@ -209,6 +209,7 @@ switchroom worktree list [--json]
 switchroom worktree release <id> [--json]
 switchroom worktree reap [--dry-run] [--json]
 switchroom worktree reap-report [--json] [--append <file>] [--budget-gb <n>]
+switchroom worktree capture <dir> [--dest <dir> | --out <file>] [--delete] [--json]
 ```
 
 - **`claim <repo>`** claims an isolated checkout for a repo (alias or
@@ -235,6 +236,67 @@ switchroom worktree reap-report [--json] [--append <file>] [--budget-gb <n>]
   `--append <file>` writes one JSON line per run, which is how you build
   a week of evidence that the classifiers are right before considering
   any automatic deletion. Deleting stays a separate, explicit command.
+- **`capture <dir>`** captures a whole checkout — reachable history *and*
+  the four things `git bundle create --all` silently drops — into one
+  verified `.bundle` file, then optionally deletes the checkout. See
+  below.
+
+### `capture` — a real undo before you delete a checkout
+
+`reap` and `gc --reclaim-dirty` are only an undo until someone empties
+the quarantine. `capture` produces the durable artefact: a single file
+you can clone back. It exists because a naive `git bundle create --all`
+loses four things that are invisible to both `git status` and "is HEAD
+pushed?":
+
+1. uncommitted working-tree changes,
+2. untracked files,
+3. **stash reflog entries** — `refs/stash` itself *is* carried by
+   `--all`, but every entry below `stash@{0}` lives only in the reflog,
+   and bundles carry no reflogs,
+4. unreachable commits left by amends and rebases — one fleet checkout
+   held 5,703 of them.
+
+`capture` rescues all four by building a throwaway **bare staging repo**
+that reads the source's object store through `objects/info/alternates`.
+Every rescue ref (`refs/rescued/unreachable/<sha>`,
+`refs/rescued/stash/<n>`, `refs/heads/rescued-wip` for the
+`git add -A` snapshot) is written into the staging repo, never the
+source: the source's refs, HEAD, index and working tree are provably
+untouched, which matters because `capture` is also pointed at
+directories someone is still working in.
+
+Deletion is gated. `--delete` is off by default and is *impossible*
+unless the bundle passed **both** `git bundle verify` **and** a readback
+— a real `git fetch` of every ref into a fresh bare repo, with ref-set
+equality asserted. `bundle verify` alone is not enough: a bundle
+truncated to 200 bytes, and a bundle with one flipped byte inside the
+pack, both report "is okay" and exit 0. If either check fails, the tree
+is left exactly where it was.
+
+Bundles land in the bulk volume by default (`scratch.volume`, default
+`/mnt/bulkdata`) under `switchroom/rescue/` — not the per-agent
+`/scratch` subdir, which is documented as purgeable cache space owned by
+one agent's uid, the wrong lifetime and owner for the only surviving
+copy of someone's work. Override with `SWITCHROOM_RESCUE_DIR`, `--dest`,
+or `--out`. With no bulk volume mounted it falls back to
+`~/.switchroom/rescue` and says so loudly, because that is the root disk
+you were trying to free. A sidecar `<bundle>.json` manifest records the
+source path, HEAD, ref counts and timestamp.
+
+Restoring:
+
+```sh
+# working copy, HEAD as it was:
+git clone /mnt/bulkdata/switchroom/rescue/<name>.bundle <dir>
+# every rescued ref verbatim (unreachable commits, stash entries):
+git clone --mirror /mnt/bulkdata/switchroom/rescue/<name>.bundle <dir>.git
+```
+
+A plain `git clone` only fetches `refs/heads/*` and `refs/tags/*`; use
+`--mirror` when you want the `refs/rescued/*` namespace back. A
+directory that is not a git repo is refused outright (`capture` prints
+the `tar` command to use instead) rather than half-handled.
 
 Typical flow for a non-trivial change on a shared box:
 
@@ -244,7 +306,7 @@ ID=$(switchroom worktree claim switchroom --task fix-card --agent clerk --json |
 switchroom worktree release "$ID"
 ```
 
-*Grounded in:* `src/cli/worktree.ts`, `src/worktree/{claim,release,list,reaper,reap-report,proc-liveness}.ts`.
+*Grounded in:* `src/cli/worktree.ts`, `src/worktree/{claim,release,list,reaper,reap-report,proc-liveness,capture}.ts`.
 
 ## `switchroom web` — local monitoring dashboard
 
