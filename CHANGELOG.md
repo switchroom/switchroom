@@ -17,6 +17,129 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.13 — the worktree reaper stops mistaking live checkouts for garbage and finds the stale trees it was missing, `worktree capture` rescues a checkout to a verified bundle before deletion, agent caches move off the root disk onto a bulk scratch volume, doctor reports disk headroom, and the pinned Claude CLI moves to 2.1.233
+
+### Features
+
+- **agent caches move off the root disk onto a bulk scratch volume (#4723)** —
+  Every agent's package caches lived under its HOME on the operator's root
+  disk (`~/.cache/uv`, `~/.npm`, `~/.bun/install/cache`, `~/.cache/puppeteer`,
+  `~/.cache/ms-playwright`, `~/.local/lib`). On the reference fleet that
+  reached ~20 GiB and pushed the root filesystem to 85% full; a manual sweep
+  reclaimed 32 GiB and the caches regrew within hours. Every agent now gets a
+  per-agent directory on the host's bulk device bind-mounted read-write at
+  `/scratch`, plus the env redirects that make the package managers actually
+  write there (`XDG_CACHE_HOME`, `TMPDIR`, `npm_config_cache`,
+  `BUN_INSTALL_CACHE_DIR`, `PYTHONUSERBASE`, `PLAYWRIGHT_BROWSERS_PATH`,
+  `PUPPETEER_CACHE_DIR`, and `SWITCHROOM_AGENT_SCRATCH` as the discovery
+  contract). The last two are not covered by `XDG_CACHE_HOME` — playwright's
+  path is baked into `Dockerfile.agent` at a HOME location and puppeteer reads
+  `os.homedir()` directly, so an umbrella redirect alone would have left both
+  on the root disk. Configure with `scratch: {enabled, volume, subdir}`;
+  `volume` defaults to `/mnt/bulkdata` and must already exist, so a
+  single-disk machine gets a hard no-op with byte-identical compose output.
+  The mount is **framework-injected** for every agent rather than routed
+  through `bind_mounts:` — that key is an admin-only escalation (#1164) and
+  the biggest cache consumers on a real fleet are ordinary non-admin agents.
+  Directories are pre-created and chowned to each agent's deterministic
+  container uid at apply time, so the read-only-rootfs non-root container can
+  actually write to them. One behaviour change: `PYTHONUSERBASE` moves
+  python's user-site, so packages installed with `pip install` before the
+  cutover need reinstalling once.
+- **doctor: measure free disk space, and check the report-only reap sweep actually runs (#4725)** — a new `Disk headroom` section reports free / total / percent for the filesystem holding the agents directory (not `/`), plus the `scratch:` bulk volume when it is mounted. WARN at 80% used, FAIL at 90%, overridable under a new `disk:` block. Percentages use `df`'s capacity formula so the number reconciles with `df -h`, and a path that does not exist is a `skip`, never a failure. The same section reads the newest record in `worktree reap-report --append`'s evidence log and WARNs when the sweep is unscheduled or stale — a check on the sweep's output, so any scheduler satisfies it and a cron entry that dies every night does not. Before this, doctor named "disk full" only in other checks' error strings and stayed green while the fleet host sat at 85% full.
+- **worktree: `capture` turns a checkout into a verified bundle before anyone deletes it (#4727)** — `switchroom worktree capture <dir> [--dest|--out] [--delete]` rescues the four things `git bundle create --all` silently drops: uncommitted changes, untracked files, stash entries below `stash@{0}` (they live in the stash reflog, which bundles do not carry), and unreachable commits from local amends and rebases — 5,703 of them in one measured fleet checkout. Every write goes to a disposable staging repo that borrows the source's object store, so the source's refs, index, HEAD and working tree are untouched. Deletion is off by default and impossible unless the bundle passes both `git bundle verify` **and** a full readback into a fresh repo — `verify` alone passes a truncated or corrupted bundle. Bundles default to the bulk volume under `switchroom/rescue/`; restore with `git clone <bundle>` or `git clone --mirror <bundle>` for the `refs/rescued/*` namespace.
+
+### Bug fixes
+
+- **skills: parse the real agent-list JSON shape in status.sh (#4719)**
+- **worktree gc: stop swallowing git stderr, and handle cross-uid ownership (#4722)** —
+  GC ran every git probe with stderr discarded, so a git *failure* and a git
+  *negative answer* were the same value. Combined with `fatal: detected dubious
+  ownership` on per-agent trees (owned by each agent's uid, inspected by the
+  operator's), every probe failed and every unreadable tree was silently
+  misfiled as "not a switchroom dir" — a live host reported `Ignored
+  non-switchroom dirs: 67` and classified 2 trees. Git is now invoked with a
+  **scoped** `safe.directory` exception (plus `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null`, without which the ownership bypass would let an
+  agent-writable `.git/config` execute code as the invoking user), and a failed
+  probe is now reported separately as `Unreadable dirs — git probe failed,
+  kept`, never as a negative result. Same host after: 53 trees classified, 12
+  ignored, 4 genuinely-broken dirs surfaced with their real git errors — and
+  nothing newly eligible to be acted on.
+- **worktree reaper: a process working inside a checkout counted as "free" (#4724)** —
+  The in-use probe answered with `fuser <path>` / `lsof -t <path>`, both of
+  which match the path **exactly**. A process whose cwd was a nested
+  subdirectory of a worktree — i.e. an agent actually working in the checkout —
+  was invisible to it, so the probe returned `free` for a live tree. `free` is
+  precisely what clears the reaper's third fail-safe ("an in-use probe can
+  DEFINITIVELY report the path as free"), so anything automating this would have
+  `git worktree remove --force`d live work; the same probe is the idle guard for
+  the task-tree sweep. The probe now walks procfs: a process holds the tree when
+  its **cwd is the root or any directory beneath it**, or when an open **fd**
+  resolves inside it. Because these verbs run host-side while the holders are
+  usually processes inside agent containers (same directory, different path),
+  the cwd test also walks `/proc/<pid>/cwd/..` upward comparing `(dev, ino)`,
+  which the kernel resolves in *our* namespace. A sweep that could not inspect
+  every process now reports `unavailable` (⇒ keep) rather than `free`; `lsof` is
+  invoked with `+D` and `fuser` retained as a positive-only signal.
+- **New `switchroom worktree reap-report` — report-only, deletes nothing (#4724)** —
+  Runs both classifiers on a schedule and prints what they *would* reclaim,
+  grouped per agent against a size budget (`--budget-gb`, default 5 GB, or
+  `SWITCHROOM_AGENT_TREE_BUDGET_GB`) and ordered oldest-first — the eviction
+  order a budget-driven reaper would use (RFC `agent-home-lifecycle.md` §2).
+  Only trees that already clear every safety guard are ever marked over-budget;
+  when the guards keep an agent over, the report says how much stays over rather
+  than widening eligibility. The safety default is structural, not a flag: the
+  module composes only plan-only predicates and imports no removal primitive,
+  and the verb has no `--yes`. Deleting remains the separate, explicit
+  `worktree gc --yes` / `worktree reap`.
+- **worktree gc: the sweeper looked in two directories nobody uses (#4726)** —
+  The fleet root disk hit 85% full with **41 stale git checkouts** scattered
+  across agent homes, and the existing sweeper caught almost none of them.
+  `defaultTaskTreeRoots()` scanned exactly two subdirectories per agent —
+  `home/work` and `home/workspace` — while the real litter sat at
+  `<agent>/home/sr-4638`, `<agent>/home/tmp-build/switchroom`,
+  `<agent>/home/.cache/sr-review`, `<agent>/.work4481/repo`,
+  `<agent>/worktrees/<slug>` and `<agent>/scratchwork/switchroom`. The
+  classifier was never broken; it was aimed at a convention nobody follows.
+  `discoverAgentCheckouts()` now walks each agent's directory and hands `gc`
+  every checkout it finds, wherever the agent put it. The walk is bounded by
+  construction — depth 4 below the agent dir, a package-manager/build prune
+  list, a 50 000-directory visit budget, symlinks never followed, and a hard
+  stop at each checkout boundary so a tree's own `node_modules`, nested
+  submodules and nested linked worktrees are never mistaken for independent
+  trees. Measured on the reference fleet (37 agents, 52 GiB of agent homes):
+  **1 450 `readdir` calls, 32 ms**, 77 checkouts found. Pass `--no-discover` for the old root-only behaviour;
+  `home/work` and `home/workspace` coverage is unioned in and unchanged.
+- **worktree gc: three new guards, because a wider net catches precious things (#4726)** —
+  Widening WHERE gc looks relaxes nothing about WHAT it may reap, but it does
+  put trees in front of the classifier that were previously out of reach, so
+  the precious/disposable line is now drawn explicitly: an agent's own durable
+  furniture (`<agent>/workspace`, `<agent>/home/workspace`, and the stable
+  per-repo tree `<agent>/work/<slug>`) is never a candidate; a checkout parked
+  on a **trunk** branch (`main`/`master`/`trunk`/`develop`) is a reference
+  clone and is `skip-protected` without spending a `gh` call; and a
+  **`.switchroom-keep`** marker file in any checkout protects it
+  unconditionally. A repo whose `origin` is not switchroom's was, and remains,
+  reported `not-ours` and left alone.
+- **worktree gc: two quarantined trees with the same basename collided (#4726)** —
+  The quarantine destination was `<trash>/<basename>`, which two agents could
+  already produce for one dated trash dir (`home/work/switchroom` is not a
+  unique name); widened discovery makes it routine — the incident layout alone
+  carries three `switchroom` and two `repo` basenames. `mv` would have nested
+  the second tree inside the first and lost which agent it came from.
+  Destinations now disambiguate with a stable SHA-1 prefix of the source path.
+
+### Build & CI
+
+- **claude-cli: bump the pinned Claude CLI to 2.1.233 (#4729)** — all three
+  lockstep pins (`docker/Dockerfile.base`, `docker/Dockerfile.hindsight`,
+  `dependencies.json`) move 2.1.229 → 2.1.233. Upstream never published
+  2.1.230. The nightly `claude@latest` canary had not yet seen 2.1.233, so the
+  flag contract was run manually against a real 2.1.233 binary instead; the
+  behavioural check (manual DM + group round-trip) is still required before a
+  fleet roll.
+
 ## v0.21.12 — the changelog guard catches an entry buried by a release cut, per-PR changelog.d fragments end the shared `## Unreleased` conflict class, and /tts reports its audio-degradation counters to callers
 
 ### Bug fixes
@@ -25006,4 +25129,5 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
