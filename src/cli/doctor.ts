@@ -96,6 +96,7 @@ import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
 import { runTimezoneChecks } from "./doctor-timezone.js";
+import { runDiskChecks } from "./doctor-disk.js";
 import { fixSessionModelCarrierDrift } from "./doctor-fix-session-model.js";
 import { runClaudeCliVersionChecks } from "./doctor-claude-cli.js";
 
@@ -4070,6 +4071,14 @@ export function registerDoctorCommand(program: Command): void {
             results: runInlinedSecretChecks(config, { configPath }),
           },
           { title: "Deploy Mounts", results: checkDeployMounts() },
+          {
+            // The fleet host hit 85% root-disk full on 2026-08-15 and nothing
+            // in doctor measured free space — "disk full" appeared only in
+            // other checks' error strings. Measures the filesystem holding
+            // agent homes (not `/`), plus the scratch volume when engaged.
+            title: "Disk headroom",
+            results: runDiskChecks(config),
+          },
           { title: "Legacy State", results: checkLegacyState() },
           { title: "Vault", results: checkVault(config) },
           {

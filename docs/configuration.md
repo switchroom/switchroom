@@ -1250,6 +1250,50 @@ user-site, so packages an agent installed with `pip install` before the
 cutover are no longer importable and need reinstalling once. Package caches
 and browser downloads just re-populate on next use.
 
+## Disk headroom (`disk:`)
+
+The scratch volume above stops the caches from filling the root disk. This
+block is the half that tells you when something *else* did. `switchroom
+doctor` measures free space on the filesystem holding your agents directory
+and reports the real numbers:
+
+```
+✓ free space: agent homes  /home/op/.switchroom/agents — 412.6G free of 1.8T (74% used)
+⚠ free space: agent homes  /home/op/.switchroom/agents — 61.2G free of 468.5G (85% used) — at/over the 80% warn threshold
+```
+
+Defaults WARN at 80% used and FAIL at 90%; override either:
+
+```yaml
+disk:
+  warn_pct: 80        # default
+  fail_pct: 90        # default. Must be greater than warn_pct.
+  reap_report:
+    enabled: true                                    # default
+    log: /var/log/switchroom/reap-report.jsonl       # default
+    max_age_hours: 48                                # default
+```
+
+Notes:
+
+- **It measures the agents filesystem, not `/`.** Agent homes are what fill
+  up, and they do not have to be on the root device. When the `scratch:`
+  volume is mounted it gets its own row — a full bulk device breaks every
+  `npm install` in the fleet. On a host without one, no scratch row appears.
+- **Percentages match `df`.** Capacity is `used / (used + available)`, which
+  excludes the root-reserved blocks — so the number doctor prints is the
+  number `df -h` prints.
+- **A missing path is a `skip`, never a failure.** A machine that has never
+  run `switchroom apply` does not go red.
+- **`reap_report` is a liveness check, not a scheduler.** #4724's
+  `switchroom worktree reap-report --append <file>` is a report-only sweep
+  that deletes nothing; `docs/operators/worktree-gc.md` documents the crontab
+  line. Doctor reads the newest record's timestamp in that JSONL, so it
+  detects the sweep by its **output** — an operator crontab, an `/etc/cron.d`
+  fragment, or a systemd timer all satisfy it, and a schedule that exists but
+  errors out every night does not. It WARNs when the log is missing or stale.
+  Set `enabled: false` on a host that deliberately does not run it.
+
 ## Multi-Account OAuth (auth-broker)
 
 Authentication is **account-scoped and fleet-wide**, not per-agent. One
