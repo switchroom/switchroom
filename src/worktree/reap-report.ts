@@ -293,7 +293,9 @@ export function buildReapReport(deps: ReapReportDeps = {}): ReapReport {
         escapeHatch: false,
       },
       deps.taskTreeRoots ?? defaultTaskTreeRoots(),
-      deps.taskTreeDirs ?? defaultTaskTreeDirs(),
+      // Explicit roots mean the caller has scoped the sweep (and tests inject
+      // them for hermeticity) — do not widen out from under them.
+      deps.taskTreeDirs ?? (deps.taskTreeRoots ? [] : defaultTaskTreeDirs()),
     );
 
   const entries: ReapReportEntry[] = [
