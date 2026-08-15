@@ -340,6 +340,20 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
       expect(s).not.toContain("reply-delivery-recovered");
     });
 
+    it("an unrelated line past the window closes the episode", () => {
+      // The scan is bounded by the FIRST datable line past the window,
+      // whatever it is about — the log is append-ordered, so nothing after it
+      // can be inside the window. A same-chat landing that arrives later must
+      // therefore still read as a separate episode, not a recovery.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        "[2026-08-11T12:05:00.000Z] telegram gateway: unrelated chatter",
+        post("12:05:01.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
     it("an UNDATABLE failing line fails toward the alarm", () => {
       const s = signalsOf([
         `tg-post method=sendRichMessage chat=${GCHAT} thread=- parse_mode=none bytes=0` +

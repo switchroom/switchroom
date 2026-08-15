@@ -520,13 +520,21 @@ export function classifyReplyDeliveryEpisode(
 
   for (let j = failIdx + 1; j < lines.length; j++) {
     const line = lines[j];
-    if (!line || !TG_POST_RICH_LINE_RE.test(line)) continue;
-    if (TG_POST_CHAT_RE.exec(line)?.[1] !== chat) continue;
+    if (!line) continue;
+    // The window is closed by the FIRST datable line past it, whatever that
+    // line is about — not by the first same-chat rich send past it. A gateway
+    // log is append-ordered (the same property `detectGatewayFindings` relies
+    // on when it advances a folded finding to the newest line), so every line
+    // after this one is later still. Bounding on any line keeps the scan
+    // O(window) instead of O(log): a chat whose recovery never arrives would
+    // otherwise walk the remaining ~2.5M lines once per failure. An undatable
+    // line cannot be placed inside or outside the window, so it neither ends
+    // the episode nor extends it.
     const ms = lineInstantMs(line);
-    // An undatable attempt cannot be placed inside or outside the window; skip
-    // it rather than let it end the episode or extend it.
+    if (ms !== null && ms - failMs > REPLY_DELIVERY_RECOVERY_WINDOW_MS) break;
+    if (!TG_POST_RICH_LINE_RE.test(line)) continue;
+    if (TG_POST_CHAT_RE.exec(line)?.[1] !== chat) continue;
     if (ms === null) continue;
-    if (ms - failMs > REPLY_DELIVERY_RECOVERY_WINDOW_MS) break;
     if (TG_POST_STATUS_RE.exec(line)?.[1] === "ok") return "recovered";
   }
   return "unrecovered";
