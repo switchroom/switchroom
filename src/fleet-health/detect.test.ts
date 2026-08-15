@@ -245,9 +245,24 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
  */
 describe("#4730 — a recovered rich send is not a delivery failure", () => {
   const GCHAT = "-1001234567890";
+  /** A `tg-post` line in the live shape. `err=`/`code=` are DERIVED from the
+   *  description rather than hardcoded, because the classifier reads the error
+   *  CLASS and a fixture whose 429 says `code=400` would test nothing real
+   *  (`gateway-supervisor.log` never emits that pair — all 16 live `status=err`
+   *  rich sends carry a class matching their text). */
+  const classOf = (status: string, desc: string): string => {
+    if (status !== "err") return "err=- code=-";
+    if (/Too Many Requests/.test(desc)) return "err=telegram_429 code=429";
+    if (desc === "Bad Gateway") return "err=telegram_502 code=502";
+    if (desc === "Gateway Timeout") return "err=telegram_504 code=504";
+    return "err=telegram_400 code=400";
+  };
   const post = (t: string, status: string, desc: string, chat = GCHAT, thread = "-") =>
     `[2026-08-11T${t}Z] tg-post method=sendRichMessage chat=${chat} thread=${thread}` +
-    ` parse_mode=none bytes=0 hash=- status=${status} err=telegram_400 code=400 desc=${desc}`;
+    ` parse_mode=none bytes=0 hash=- status=${status} ${classOf(status, desc)} desc=${desc}`;
+  /** The fuse's deferral line verbatim (`gateway.ts:22890`). */
+  const fuse = (t: string, method: string, key: string, cls = "cosmetic") =>
+    `[2026-08-11T${t}Z] edit-flood-fuse deferred method=${method} key=${key} class=${cls}`;
 
   const signalsOf = (lines: string[]) =>
     detectGatewayFindings("alpha", lines.join("\n")).findings.map((f) => f.signal);
@@ -270,8 +285,7 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
     const s = signalsOf([
       post("12:40:19.340", "err", "Too Many Requests: retry after 10"),
       "[2026-08-11T12:40:19.347Z] telegram gateway: 429 rate limited, waiting 10s",
-      "[2026-08-11T12:40:29.348Z] edit-flood-fuse deferred method=sendRichMessage" +
-        ` key=cs:${GCHAT} class=critical`,
+      fuse("12:40:29.348", "sendRichMessage", `cs:${GCHAT}`, "critical"),
       post("12:40:59.900", "ok", "-"),
     ]);
     expect(s).not.toContain("reply-delivery-failure");
@@ -287,7 +301,10 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
     expect(s).toContain("reply-delivery-recovered");
   });
 
-  it("queued-card re-send — invalid message_id then a landed send is recovered", () => {
+  it("an immediate re-send after an invalid message_id is recovered on the GAP alone", () => {
+    // 537ms — inside `REPLY_DELIVERY_IMMEDIATE_RESEND_MS`. The intervening
+    // `queued card send failed` line contributes nothing (see the inverse case
+    // below); the round-trip gap is the whole evidence.
     const s = signalsOf([
       post("11:26:49.563", "err", 'Bad Request: field "message_id" must be a valid Number'),
       "[2026-08-11T11:26:49.570Z] telegram gateway: queued card send failed: Bad Request",
@@ -295,6 +312,29 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
     ]);
     expect(s).not.toContain("reply-delivery-failure");
     expect(s).toContain("reply-delivery-recovered");
+  });
+
+  it("a fuse deferral of a rich send FOR THIS CHAT is ladder evidence", () => {
+    const s = signalsOf([
+      post("12:00:00.000", "err", "Bad Gateway"),
+      fuse("12:00:20.000", "sendRichMessage", `cs:${GCHAT}`, "critical"),
+      post("12:00:40.000", "ok", "-"),
+    ]);
+    expect(s).not.toContain("reply-delivery-failure");
+    expect(s).toContain("reply-delivery-recovered");
+  });
+
+  it("reads the chat out of EVERY per-chat fuse bucket namespace", () => {
+    // `edit-flood-fuse.ts` keys a send through `cs:`/`t:` and an edit through
+    // `ce:`/`cer:`/`lr:`; the parse must not be pinned to one prefix.
+    for (const ns of ["cs", "t", "ce", "cer", "lr"]) {
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        fuse("12:00:20.000", "sendRichMessage", `${ns}:${GCHAT}`, "critical"),
+        post("12:00:40.000", "ok", "-"),
+      ]);
+      expect(s, `namespace ${ns}:`).toContain("reply-delivery-recovered");
+    }
   });
 
   it("intervening FAILED attempts do not end the episode — the first ok settles it", () => {
@@ -367,6 +407,101 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
       ]);
       expect(s).toContain("reply-delivery-failure");
       expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("THE COINCIDENCE FALSIFIER: a cosmetic fuse deferral does NOT clear the gymbro shape", () => {
+      // #4730 review B1. The first cut of the ladder-evidence rule matched the
+      // bare phrase `edit-flood-fuse deferred` anywhere in the window. The
+      // fleet emits 34,352 of those for `editMessageText` alone — routine
+      // repaint throttling with no relationship to any send — against 27 for
+      // `sendRichMessage`, so a 26-82% share of random 120s windows contained
+      // one and the "evidence" was a clock, not a fact. This is the exact
+      // injection that proved it: ONE routine cosmetic deferral dropped into
+      // the gymbro:25537 shape (the UTF-8 rejection this file asserts stays
+      // flagged, two `it`s below) flipped it to recovered.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Request: strings must be encoded in UTF-8"),
+        fuse("12:00:05.000", "editMessageText", "ce:-100999"),
+        "[2026-08-11T12:00:49.391Z] telegram gateway: rx update_id=629701703 type=message",
+        post("12:00:50.515", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a cosmetic fuse deferral for THIS chat is still not evidence — the method decides", () => {
+      // Scoping to the chat alone would not have caught B1: the cosmetic
+      // deferrals the fuse emits are overwhelmingly for the SAME busy chat the
+      // reply was lost in. A repaint being throttled says nothing about a send.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        fuse("12:00:05.000", "editMessageText", `ce:${GCHAT}`),
+        post("12:00:50.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a rich-send fuse deferral for a DIFFERENT chat is not this send's evidence", () => {
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        fuse("12:00:05.000", "sendRichMessage", "cs:-1009999999999", "critical"),
+        post("12:00:50.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("`queued card send failed` is not a ladder — the card is abandoned, not re-sent", () => {
+      // #4730 review B1. `openQueuedCard` resolves to `null` on that log line
+      // and its only caller returns immediately (`stream-render.ts:361-363`,
+      // `:1153`) — nothing re-sends. This is the live finn 2026-08-04 episode
+      // with its landing pushed past the immediate re-send window, which is
+      // where the pre-fix marker was doing the work.
+      const s = signalsOf([
+        post("11:26:49.563", "err", 'Bad Request: field "message_id" must be a valid Number'),
+        "[2026-08-11T11:26:49.570Z] telegram gateway: queued card send failed: Bad Request",
+        post("11:26:58.259", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("THE SELF-CERTIFICATION FALSIFIER: a 400 whose desc says `retry after 3` is not a flood", () => {
+      // #4730 review M1. `FLOOD_REJECTION_RE` was tested against the WHOLE
+      // line including Telegram's free-form `desc=`, so a rejection could
+      // grant itself ladder evidence for the entire 120s window by wording.
+      // Pinned to `err=telegram_429` / `code=429`, the error class decides.
+      const s = signalsOf([
+        `[2026-08-11T12:00:00.000Z] tg-post method=sendRichMessage chat=${GCHAT} thread=-` +
+          " parse_mode=none bytes=0 hash=- status=err err=telegram_400 code=400" +
+          " desc=Bad Request: message text is empty, retry after 3 attempts",
+        post("12:01:40.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("…and the same for a desc naming `Too Many Requests` under a non-429 class", () => {
+      const s = signalsOf([
+        `[2026-08-11T12:00:00.000Z] tg-post method=sendRichMessage chat=${GCHAT} thread=-` +
+          " parse_mode=none bytes=0 hash=- status=err err=telegram_400 code=400" +
+          " desc=Bad Request: reply text mentioned Too Many Requests",
+        post("12:01:40.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a REAL 429 still self-certifies for the whole window", () => {
+      // The pinning must not cost the flood ladder the wide window it exists
+      // for: both live 429s carry `err=telegram_429 code=429`.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Too Many Requests: retry after 10"),
+        post("12:01:40.000", "ok", "-"),
+      ]);
+      expect(s).not.toContain("reply-delivery-failure");
+      expect(s).toContain("reply-delivery-recovered");
     });
 
     it("a send that never lands stays a severity-3 delivery failure", () => {
