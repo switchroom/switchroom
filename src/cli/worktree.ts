@@ -9,6 +9,7 @@
  *   switchroom worktree reap-report [--json] [--append <file>] [--budget-gb <n>]
  *   switchroom worktree gc [--root <dir>...] [--yes] [--json]
  *   switchroom worktree gc --purge-trash [--older-than <days>] [--yes]
+ *   switchroom worktree capture <dir> [--dest <dir>|--out <file>] [--delete]
  */
 
 import type { Command } from "commander";
@@ -34,6 +35,12 @@ import {
   buildReapReport,
   formatReapReport,
 } from "../worktree/reap-report.js";
+import {
+  captureCheckout,
+  rescueDestRoot,
+  rescueRootIsFallback,
+  restoreCommands,
+} from "../worktree/capture.js";
 
 export function registerWorktreeCommand(program: Command): void {
   const worktree = program
@@ -480,6 +487,89 @@ export function registerWorktreeCommand(program: Command): void {
           }
           for (const e of result.errors) console.warn(chalk.yellow(e));
           console.log(chalk.dim(`\nQuarantined dirs are recoverable until \`switchroom worktree gc --purge-trash --yes\`.`));
+        }
+      },
+    );
+
+  // ─── capture ──────────────────────────────────────────────────────────────
+
+  worktree
+    .command("capture <dir>")
+    .description(
+      "Capture a checkout into a VERIFIED git bundle before anyone deletes it.\n" +
+        "Carries what `git bundle --all` silently drops: uncommitted changes,\n" +
+        "untracked files, every stash entry (not just stash@{0}), and unreachable\n" +
+        "commits from local amends/rebases. Captures ONLY by default — --delete is\n" +
+        "opt-in and is refused unless the bundle both verifies AND reads back into\n" +
+        "a fresh repo with every ref intact. The source repo is never written to.",
+    )
+    .option("--out <file>", "Write the bundle to this exact path")
+    .option("--dest <dir>", "Directory to write the auto-named bundle into")
+    .option(
+      "--delete",
+      "Delete the checkout AFTER a verified capture (off by default; impossible unless verification passed)",
+    )
+    .option("--json", "Output raw JSON")
+    .action(
+      (dir: string, opts: { out?: string; dest?: string; delete?: boolean; json?: boolean }) => {
+        const result = captureCheckout({
+          dir,
+          out: opts.out,
+          dest: opts.dest,
+          deleteAfter: opts.delete,
+        });
+
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+          if (!result.ok) process.exitCode = 1;
+          return;
+        }
+
+        if (!result.ok) {
+          console.error(chalk.red(`Capture failed (${result.failure}):`), result.error ?? "");
+          console.error(chalk.yellow(`${result.source} was NOT deleted.`));
+          for (const w of result.warnings) console.error(chalk.dim(`  warning: ${w}`));
+          process.exitCode = 1;
+          return;
+        }
+
+        const mb = (result.bytes / (1024 * 1024)).toFixed(1);
+        console.log(chalk.green("Captured and verified"));
+        console.log(`  source:  ${result.source}`);
+        console.log(`  bundle:  ${chalk.bold(result.bundle)}  (${mb} MB)`);
+        console.log(
+          `  refs:    ${result.refs.total} total — ${result.refs.source} from the repo, ` +
+            `${result.refs.unreachable} unreachable commit(s), ${result.refs.stash} stash entry(s)` +
+            `${result.refs.wip ? ", plus a working-tree snapshot" : ""}`,
+        );
+        if (!result.refs.wip) {
+          console.log(chalk.dim("           (no working-tree snapshot — bare repo or empty tree)"));
+        }
+        if (!opts.out && !opts.dest && rescueRootIsFallback(rescueDestRoot())) {
+          console.log(
+            chalk.yellow(
+              "  note:    no bulk volume mounted — this bundle is on the ROOT disk.\n" +
+                "           Pass --dest to put it somewhere with room.",
+            ),
+          );
+        }
+        for (const w of result.warnings) console.log(chalk.yellow(`  warning: ${w}`));
+        console.log(chalk.dim("\nRestore:"));
+        const [plain, mirror] = restoreCommands(result.bundle!);
+        console.log(`  ${plain}`);
+        console.log(chalk.dim("      → working tree back, checked out on branch `rescued-wip`"));
+        console.log(`  ${mirror}`);
+        console.log(
+          chalk.dim(
+            "      → EVERYTHING: refs/stash, refs/rescued/stash/<n>, refs/rescued/unreachable/<sha>",
+          ),
+        );
+        if (result.deleted) {
+          console.log(chalk.green(`\nDeleted ${result.source} (verified capture).`));
+        } else {
+          console.log(
+            chalk.dim(`\n${result.source} was left in place. Pass --delete to remove it.`),
+          );
         }
       },
     );
