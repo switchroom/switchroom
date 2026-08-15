@@ -308,6 +308,67 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
   });
 
   describe("what it must NOT clear", () => {
+    it("THE INVERSE FALSIFIER: unrelated later traffic to the same chat does NOT clear a lost reply", () => {
+      // #4730 review — the masking shape, and the common one in an active chat:
+      // the reply is genuinely LOST, and 90s later an UNRELATED rich send to the
+      // same chat lands (a worker activity card, a progress update, a status
+      // banner, the next turn's reply). Nothing between the two says the send
+      // stack was still working on the failed send: no flood/fuse/queued-card
+      // ladder marker, and the failure's own `desc` names no self-recovering
+      // ladder. Correlating on `chat=` + a 120s ceiling alone booked this as
+      // `reply-delivery-recovered` and stopped paging on a lost reply.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        "[2026-08-11T12:00:05.000Z] telegram gateway: worker-feed: edit feed=" +
+          `${GCHAT}:- chat=${GCHAT} thread=- msgId=42`,
+        post("12:01:30.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a marker-less landing past the immediate re-send window is not a recovery", () => {
+      // The marker-less ladders (thread-drop, quote-drop, plain-text fallback,
+      // the bounded backstop re-attempt) re-send SYNCHRONOUSLY on the same await
+      // chain (`outbound-send-path.ts:575-586`) — one extra Bot API round trip.
+      // A same-chat landing 10s later with no ladder evidence is unrelated
+      // traffic, not that send finally getting through.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        post("12:00:10.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("a landing in a DIFFERENT thread of the same chat is not this send's recovery", () => {
+      // The thread-drop ladder deliberately drops the thread (`thread=-`), so
+      // that direction stays clearing; a landing in some OTHER topic of the
+      // same forum is a different conversation entirely.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Request: message thread not found", GCHAT, "635"),
+        post("12:00:00.500", "ok", "-", GCHAT, "912"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("the live gymbro shape: a UTF-8 rejection cleared by the NEXT turn's reply", () => {
+      // Observed gymbro/gateway-supervisor.log:25537 (2026-07-31T19:40:58.382Z):
+      // a `permission_request` card is rejected, then 49s later a new inbound
+      // starts a new turn whose reply lands at +50.5s. The pre-review detector
+      // read that as the rejected card recovering.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Request: strings must be encoded in UTF-8"),
+        "[2026-08-11T12:00:00.007Z] telegram gateway: permission_request send to" +
+          " 1234567890 failed: GrammyError",
+        "[2026-08-11T12:00:49.391Z] telegram gateway: rx update_id=629701703 type=message",
+        post("12:00:50.515", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
     it("a send that never lands stays a severity-3 delivery failure", () => {
       const s = signalsOf([
         post("22:37:36.770", "err", "Bad Gateway"),
