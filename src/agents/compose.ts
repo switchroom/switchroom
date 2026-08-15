@@ -91,6 +91,14 @@ import { loadHostCapabilities } from "../setup/host-capabilities.js";
 import type { VoiceEngine } from "../setup/gpu-detect.js";
 import { AGENT_UID_MIN, AGENT_UID_MAX, allocateAgentUid } from "./agent-uid.js";
 import { GRANTS_DB_DIRNAME, GRANTS_DB_CONTAINER_DIR } from "../vault/grants-db-path.js";
+import {
+  SCRATCH_CONTAINER_DIR,
+  agentScratchHostDir,
+  ensureAgentScratchDir,
+  resolveScratchConfig,
+  scratchEnv,
+  scratchVolumeAvailable,
+} from "./scratch.js";
 
 // UID derivation lives in agent-uid.ts (a leaf module) so scaffold.ts can
 // import it without a compose ↔ scaffold cycle (compose.ts imports
@@ -2040,6 +2048,24 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // hermetic regardless of the host's active docker context (#3648).
   const dockerSocketPath = opts.dockerSocketPath ?? DEFAULT_DOCKER_SOCKET_PATH;
 
+  // Per-agent scratch volume (see ./scratch.ts). Resolved ONCE per generate:
+  // the availability probe is a filesystem stat and must not vary between
+  // agents inside one compose file. When the operator wrote an explicit
+  // `scratch:` block but the volume isn't there, warn — silently degrading a
+  // configured knob is how a fleet ends up back at 85% full without anyone
+  // noticing. When the block is absent (the single-disk default), stay quiet.
+  const scratchCfg = resolveScratchConfig(config);
+  if (
+    scratchCfg.explicit &&
+    scratchCfg.enabled &&
+    !scratchVolumeAvailable(scratchCfg.volume)
+  ) {
+    warn(
+      `compose: scratch.volume "${scratchCfg.volume}" does not exist on this host — ` +
+      `agent caches stay on the root disk (scratch mount and cache env redirects omitted)`,
+    );
+  }
+
   // ── per-agent services ─────────────────────────────────────────────
   for (const a of describeAgents(config, opts.litellmConfirmedAgents)) {
     if (a.strippedCaps.length > 0) {
@@ -2068,6 +2094,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
       voiceEngine,
       precreateHostDirs,
       dockerSocketPath,
+      agentScratchHostDir(scratchCfg, a.name),
     );
   }
 
@@ -2174,6 +2201,13 @@ function emitAgentService(
   voiceEngine: VoiceEngine,
   precreateHostDirs: boolean,
   dockerSocketPath: string,
+  /**
+   * Host-side per-agent scratch directory, or null when the feature is off
+   * (disabled in config, or the bulk volume isn't mounted on this host).
+   * Resolved once per generate by the caller so the availability probe can't
+   * differ between agents in one file. See ./scratch.ts.
+   */
+  scratchHostDir: string | null,
 ): void {
   lines.push(`  agent-${a.name}:`);
   emitImageOrBuild(lines, "agent", imageTag, buildMode, buildContext);
@@ -2634,6 +2668,21 @@ function emitAgentService(
       env.BUZZ_PUBKEY_NAMES = petnames.map(([k, v]) => `${k}=${v}`).join(",");
     }
   }
+  // Scratch-volume cache redirects. Emitted ONLY when the scratch mount is
+  // emitted (below) — the two are one unit: env pointing at a `/scratch` that
+  // isn't mounted would break every install in the container, and a mount with
+  // no env redirects would be a silently useless empty directory.
+  //
+  // Placed BEFORE the userEnv merge (which only fills `undefined` keys), so
+  // these are authoritative the same way HOME / NPM_CONFIG_PREFIX /
+  // SWITCHROOM_* are. An operator who wants the old layout opts out with
+  // `scratch.enabled: false` rather than by shadowing individual keys — a
+  // half-redirected cache set is worse than either end state.
+  if (scratchHostDir !== null) {
+    for (const [k, v] of Object.entries(scratchEnv(SCRATCH_CONTAINER_DIR))) {
+      env[k] = v;
+    }
+  }
   // Merge operator-declared env vars from the agent's `env:` block.
   // System-managed keys (HOME, NPM_*, SWITCHROOM_*) win on collision —
   // an operator can't override the runtime contract from yaml. A
@@ -2779,6 +2828,45 @@ function emitAgentService(
     lines.push(
       `      - ${homePrefix}/.switchroom/hostd/${a.name}:/run/switchroom/hostd/${a.name}`,
     );
+  }
+  // Per-agent scratch volume — the fleet's build/package caches, moved off
+  // the root disk onto the operator's bulk device (see ./scratch.ts for the
+  // measurements and the full rationale).
+  //
+  // FRAMEWORK-INJECTED, exactly like the root-tier mount set above and the
+  // shared `skills/` mount below, and deliberately NOT routed through the
+  // operator-facing `bind_mounts:` denylist immediately below this block.
+  // That denylist is an ADMIN-ONLY escalation: `bind_mounts` throws for any
+  // agent without `admin: true`. The agents that fill a root disk with npm
+  // and uv caches are ordinary non-admin agents, so routing this through
+  // `bind_mounts:` would break the fleet for exactly the agents the change
+  // exists to fix. Neither source nor target comes from operator yaml here —
+  // the framework picks both (`<volume>/<subdir>/<agent>` → `/scratch`), and
+  // each agent sees only its OWN directory, never the shared parent.
+  //
+  // `:rw` by necessity (the whole point is that package managers write here)
+  // and exempt from the `read_only: true` root fs the same way every other
+  // bind mount is — the daemon applies it before the entrypoint runs.
+  //
+  // Null when the feature is off, which is the entire degradation story: a
+  // single-disk dev machine emits no mount, no env, and byte-identical
+  // output to before this landed.
+  if (scratchHostDir !== null) {
+    // Pre-create host-side so docker doesn't auto-create the bind source as
+    // root:root — that is the EACCES trap this feature would otherwise walk
+    // straight into, because the container runs as a per-agent non-root uid.
+    // Same best-effort shape as the audit / schedule.d pre-creates below.
+    // Apply does this authoritatively ahead of the compose write
+    // (`ensureHostMountSources` in src/cli/apply.ts); this is the guard for a
+    // compose write that did NOT come through apply — e.g. the `agent
+    // restart` reconcile path, which shares writeComposeFile. It calls the
+    // SAME helper rather than a bare mkdir so that path can't leave a
+    // root-owned bind source behind (apply self-elevates to root, and a
+    // root:root scratch dir EACCESes every cache write from the agent uid).
+    if (precreateHostDirs) {
+      ensureAgentScratchDir(scratchHostDir, a.name);
+    }
+    lines.push(`      - ${scratchHostDir}:${SCRATCH_CONTAINER_DIR}:rw`);
   }
   // Operator-declared extra bind-mounts (#1164). ADMIN-ONLY: emitting
   // anything for a non-admin agent is a hard error — bind_mounts is the

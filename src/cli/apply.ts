@@ -71,6 +71,10 @@ import type { VaultAclResult } from "./doctor-mcp-secrets.js";
 import { installUpdatePromptHook } from "./update-prompt-hook.js";
 import { resolveSelfInvocation, type SelfInvokeProbe } from "./self-invoke.js";
 import { allocateAgentUid } from "../agents/compose.js";
+import {
+  ensureAgentScratchDirs,
+  resolveScratchConfig,
+} from "../agents/scratch.js";
 import { LITELLM_MASTER_KEY_STATE_BASENAME } from "../litellm/external-spend.js";
 import { writeComposeFile, computeComposeContent, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
 import { getProfilePath } from "../agents/profiles.js";
@@ -1308,6 +1312,19 @@ export async function ensureHostMountSources(
   for (const dir of dirs) {
     await mkdir(dir, { recursive: true });
   }
+
+  // Per-agent scratch dirs on the bulk volume (src/agents/scratch.ts). These
+  // are NOT under the operator home — they live on a second device — so they
+  // can't join the `dirs` list above. Created here, ahead of the compose
+  // write, so docker never auto-creates the bind source as root:root (which
+  // would EACCES every cache write from the non-root agent uid). No-op when
+  // the volume isn't mounted, which is the whole dev-machine degradation
+  // story. Ownership is aligned to `allocateAgentUid` inside the helper —
+  // `apply` may be running self-elevated as root here.
+  ensureAgentScratchDirs(
+    resolveScratchConfig(config),
+    Object.keys(config.agents),
+  );
 
   // The auto-unlock blob is bind-mounted at
   // `~/.switchroom/vault-auto-unlock`. If the source path is missing,

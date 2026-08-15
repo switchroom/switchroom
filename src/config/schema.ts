@@ -5100,6 +5100,56 @@ export const AutoReleaseCheckSchema = z.object({
     ),
 });
 
+/**
+ * Per-agent scratch volume — where build/package caches live.
+ *
+ * Every agent's HOME sits on the operator's ROOT disk, and every package
+ * manager an agent uses caches under it (`~/.cache/uv`, `~/.npm`,
+ * `~/.bun/install/cache`, `~/.cache/puppeteer`, `~/.cache/ms-playwright`,
+ * `~/.local/lib/python*`). On a busy fleet that is tens of gigabytes that
+ * regrows within hours of any manual sweep. This block points those caches at
+ * a second, larger device instead.
+ *
+ * Hard no-op when `volume` does not exist on the host: no mount, no env
+ * redirects, agents keep their HOME caches. A dev machine with one disk needs
+ * no configuration at all. See `src/agents/scratch.ts`.
+ */
+export const ScratchConfigSchema = z.object({
+  enabled: z
+    .boolean()
+    .default(true)
+    .describe(
+      "Whether agents get a scratch mount at /scratch with their package " +
+      "caches redirected there. Default: true — but the feature only " +
+      "engages when `volume` actually exists on the host, so a single-disk " +
+      "machine is unaffected. Set false to opt out even where it does.",
+    ),
+  volume: z
+    .string()
+    .refine((v) => v.startsWith("/"), {
+      message: "scratch.volume must be an absolute host path",
+    })
+    .default("/mnt/bulkdata")
+    .describe(
+      "Absolute host path of the bulk device's mountpoint. MUST already " +
+      "exist — its presence is the single probe that turns the feature on, " +
+      "so a typo degrades to the pre-existing behaviour rather than " +
+      "quietly relocating caches somewhere that is still the root disk. " +
+      "Default: /mnt/bulkdata.",
+    ),
+  subdir: z
+    .string()
+    .refine((v) => !v.startsWith("/") && !v.split("/").includes(".."), {
+      message: "scratch.subdir must be a relative path without '..' segments",
+    })
+    .default("switchroom/scratch")
+    .describe(
+      "Relative path under `volume` holding the per-agent scratch " +
+      "directories (`<volume>/<subdir>/<agent>`). Default: " +
+      "switchroom/scratch.",
+    ),
+});
+
 export const HostControlConfigSchema = z.object({
   enabled: z
     .boolean()
@@ -5654,6 +5704,16 @@ export const SwitchroomConfigSchema = z.object({
   quota: QuotaConfigSchema.optional().describe(
     "Optional weekly/monthly USD spend budgets rendered in the session " +
     "greeting. Usage is read from ccusage at runtime; no network calls.",
+  ),
+  scratch: ScratchConfigSchema.optional().describe(
+    "Per-agent scratch volume. Relocates every agent's build/package " +
+    "caches (uv, npm, bun, playwright, puppeteer, pip user-site) off the " +
+    "root disk onto a bulk device, bind-mounted at /scratch inside each " +
+    "container. Framework-injected for EVERY agent — not routed through " +
+    "the admin-only `bind_mounts:` escalation, because the biggest cache " +
+    "consumers are ordinary non-admin agents. Omit the block to accept " +
+    "defaults; the feature is a no-op unless `scratch.volume` exists on " +
+    "the host.",
   ),
   host_control: HostControlConfigSchema.default({}).describe(
     "Host-control daemon configuration. Defaults to enabled=true since " +
