@@ -17,7 +17,7 @@
  * `initGatewayBot`) and every `(a)`-`(d)` case below goes RED with the
  * production GrammyError, because the send REJECTS instead of delivering.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
@@ -28,7 +28,6 @@ import {
   sanitizeLoneSurrogates,
   sanitizePayloadStrings,
   hasLoneSurrogate,
-  __resetUtf8SanitizeLogThrottle,
 } from '../shared/utf8-sanitize.js'
 
 /** An unpaired HIGH surrogate — no valid UTF-8 encoding exists for it. */
@@ -55,7 +54,7 @@ interface CapturedCall {
  * A real grammy Bot wired with the production transformer stack, whose
  * transport rejects a non-UTF-8-encodable body the way Telegram does.
  */
-function makeTelegramLikeBot(): { bot: Bot; calls: CapturedCall[] } {
+function makeTelegramLikeBot(now?: () => number): { bot: Bot; calls: CapturedCall[] } {
   const calls: CapturedCall[] = []
   const fakeFetch = (async (url: unknown, init?: { body?: unknown }) => {
     const method = String(url).split('/').pop() ?? ''
@@ -101,7 +100,7 @@ function makeTelegramLikeBot(): { bot: Bot; calls: CapturedCall[] } {
   })
   // Production ordering (initGatewayBot): sanitiser FIRST so it composes
   // INNERMOST and is the last transformer to touch the payload.
-  installUtf8Sanitizer(bot)
+  installUtf8Sanitizer(bot, now)
   installTgPostLogger(bot)
   installRichMarkdownGuard(bot)
   return { bot, calls }
@@ -332,62 +331,68 @@ describe('sanitizeLoneSurrogates / sanitizePayloadStrings — unit contract', ()
 })
 
 describe('repair logging: real count, throttled per method', () => {
-  afterEach(() => {
-    vi.useRealTimers()
-    vi.restoreAllMocks()
-  })
-
-  function captureSanitizeLog(): string[] {
+  /**
+   * Swap `process.stderr.write` directly rather than through `vi`: this file
+   * runs under BOTH vitest and `bun test`, and the mock/timer halves of `vi`
+   * are not equivalent across the two.
+   */
+  async function captureSanitizeLog(fn: (lines: string[]) => Promise<void>): Promise<void> {
     const lines: string[] = []
-    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+    const real = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: unknown) => {
       const s = String(chunk)
       if (s.includes('utf8-sanitize')) lines.push(s)
       return true
-    }) as never)
-    return lines
+    }) as typeof process.stderr.write
+    try {
+      await fn(lines)
+    } finally {
+      process.stderr.write = real
+    }
   }
 
   it('reports how many code units were repaired, and logs once per method per minute', async () => {
-    __resetUtf8SanitizeLogThrottle()
-    vi.useFakeTimers({ toFake: ['Date'] })
-    vi.setSystemTime(new Date('2026-08-15T00:00:00Z'))
-    const lines = captureSanitizeLog()
-    const { bot } = makeTelegramLikeBot()
+    let clock = 1_000_000
+    await captureSanitizeLog(async lines => {
+      const { bot } = makeTelegramLikeBot(() => clock)
 
-    // Two lone surrogates in one body: a high with no follower, a low with no
-    // leader. The docblock promises a count, so the line must carry one.
-    await bot.api.sendMessage(1, `a${LONE_HIGH}b${LONE_LOW}`)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain('repaired 2 lone surrogate(s)')
-    expect(lines[0]).toContain('method=sendMessage')
-    // Never the content itself.
-    expect(lines[0]).not.toContain('a�b')
+      // Two lone surrogates in one body: a high with no follower, a low with
+      // no leader. The docblock promises a count, so the line must carry one.
+      await bot.api.sendMessage(1, `a${LONE_HIGH}b${LONE_LOW}`)
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('repaired 2 lone surrogate(s)')
+      expect(lines[0]).toContain('method=sendMessage')
+      // Never the content itself.
+      expect(lines[0]).not.toContain('a�b')
 
-    // Same method inside the window — a persistently corrupt draft stream must
-    // not emit one line per edit.
-    await bot.api.sendMessage(1, `c${LONE_HIGH}`)
-    await bot.api.sendMessage(1, `d${LONE_HIGH}`)
-    expect(lines).toHaveLength(1)
+      // Same method inside the window — a persistently corrupt draft stream
+      // must not emit one line per edit.
+      clock += 500
+      await bot.api.sendMessage(1, `c${LONE_HIGH}`)
+      clock += 500
+      await bot.api.sendMessage(1, `d${LONE_HIGH}`)
+      expect(lines).toHaveLength(1)
 
-    // A different method has its own budget.
-    await bot.api.editMessageText(1, 1, `e${LONE_HIGH}`)
-    expect(lines).toHaveLength(2)
-    expect(lines[1]).toContain('method=editMessageText')
-    expect(lines[1]).toContain('repaired 1 lone surrogate(s)')
+      // A different method has its own budget.
+      await bot.api.editMessageText(1, 1, `e${LONE_HIGH}`)
+      expect(lines).toHaveLength(2)
+      expect(lines[1]).toContain('method=editMessageText')
+      expect(lines[1]).toContain('repaired 1 lone surrogate(s)')
 
-    // Next window: the corruption is still diagnosable.
-    vi.setSystemTime(new Date('2026-08-15T00:01:01Z'))
-    await bot.api.sendMessage(1, `f${LONE_HIGH}`)
-    expect(lines).toHaveLength(3)
-    expect(lines[2]).toContain('method=sendMessage')
+      // Next window: the corruption is still diagnosable.
+      clock += 61_000
+      await bot.api.sendMessage(1, `f${LONE_HIGH}`)
+      expect(lines).toHaveLength(3)
+      expect(lines[2]).toContain('method=sendMessage')
+    })
   })
 
   it('logs nothing for a clean body', async () => {
-    __resetUtf8SanitizeLogThrottle()
-    const lines = captureSanitizeLog()
-    const { bot } = makeTelegramLikeBot()
-    await bot.api.sendMessage(1, `all good ${ASTRAL}`)
-    expect(lines).toHaveLength(0)
+    await captureSanitizeLog(async lines => {
+      const { bot } = makeTelegramLikeBot()
+      await bot.api.sendMessage(1, `all good ${ASTRAL}`)
+      expect(lines).toHaveLength(0)
+    })
   })
 })
 

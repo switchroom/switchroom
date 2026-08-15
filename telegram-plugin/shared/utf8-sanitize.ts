@@ -151,21 +151,6 @@ export function sanitizePayloadStrings<T>(value: T, depth = 0, stats?: SanitizeS
  * PERSISTENTLY corrupt would otherwise emit a line per edit and drown the
  * gateway log in the exact situation you most need to read it. */
 const LOG_THROTTLE_MS = 60_000
-const lastLoggedAtByMethod = new Map<string, number>()
-
-/** Test seam: drop the throttle state so a suite can observe the first line
- * of a fresh window. Not used in production. */
-export function __resetUtf8SanitizeLogThrottle(): void {
-  lastLoggedAtByMethod.clear()
-}
-
-/** True when this method may log now; records the emission when it may. */
-function shouldLogRepair(method: string, now: number): boolean {
-  const last = lastLoggedAtByMethod.get(method)
-  if (last !== undefined && now - last < LOG_THROTTLE_MS) return false
-  lastLoggedAtByMethod.set(method, now)
-  return true
-}
 
 /**
  * Install the UTF-8 sanitiser as a grammy API transformer.
@@ -189,8 +174,22 @@ function shouldLogRepair(method: string, now: number): boolean {
  * gateway. Sending the original payload is never worse than throwing: the
  * worst case is the pre-#4728 behaviour (Telegram 400s that one send), while
  * throwing here breaks sends that had nothing wrong with them.
+ *
+ * `now` is an injected clock so the throttle can be driven deterministically
+ * from a test: this file runs under BOTH vitest and `bun test`, and bun's
+ * `vi` has no `setSystemTime`.
  */
-export function installUtf8Sanitizer(bot: Bot): void {
+export function installUtf8Sanitizer(bot: Bot, now: () => number = Date.now): void {
+  // Throttle state is per-install, not module-global, so one bot's log budget
+  // cannot be consumed by another (and a test needs no reset hook).
+  const lastLoggedAtByMethod = new Map<string, number>()
+  const shouldLogRepair = (method: string, at: number): boolean => {
+    const last = lastLoggedAtByMethod.get(method)
+    if (last !== undefined && at - last < LOG_THROTTLE_MS) return false
+    lastLoggedAtByMethod.set(method, at)
+    return true
+  }
+
   bot.api.config.use(async (prev, method, payload, signal) => {
     let clean = payload
     const stats: SanitizeStats = { repaired: 0 }
@@ -199,7 +198,7 @@ export function installUtf8Sanitizer(bot: Bot): void {
     } catch {
       clean = payload
     }
-    if (clean !== payload && shouldLogRepair(method, Date.now())) {
+    if (clean !== payload && shouldLogRepair(method, now())) {
       process.stderr.write(
         `telegram gateway: utf8-sanitize repaired ${stats.repaired} lone surrogate(s) ` +
         `method=${method} — body would have been rejected by Telegram ` +
