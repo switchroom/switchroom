@@ -1,0 +1,1 @@
+- **telegram: sanitise lone surrogates before the wire so approval cards deliver (#4728)**
