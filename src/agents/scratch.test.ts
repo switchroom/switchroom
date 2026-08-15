@@ -28,6 +28,7 @@ import {
   SCRATCH_CONTAINER_DIR,
   SCRATCH_SUBDIRS,
   agentScratchHostDir,
+  ensureAgentScratchDir,
   ensureAgentScratchDirs,
   resolveScratchConfig,
   scratchEnv,
@@ -258,6 +259,49 @@ describe("scratch volume — host directory creation and ownership", () => {
     const tmpTarget = join(volume, DEFAULT_SCRATCH_SUBDIR, "carrie", "tmp");
     expect(existsSync(tmpTarget)).toBe(true);
     expect(scratchEnv().TMPDIR).toBe(`${SCRATCH_CONTAINER_DIR}/tmp`);
+  });
+
+  it("the single-agent form (used by the compose pre-create) chowns too — no path may create the bind source root-owned", () => {
+    const chowns: Array<[string, number, number]> = [];
+    const dir = join(volume, DEFAULT_SCRATCH_SUBDIR, "carrie");
+
+    expect(
+      ensureAgentScratchDir(dir, "carrie", (p, uid, gid) => chowns.push([p, uid, gid])),
+    ).toBe(true);
+
+    const uid = allocateAgentUid("carrie");
+    expect(chowns).toContainEqual([dir, uid, uid]);
+    for (const sub of SCRATCH_SUBDIRS) {
+      expect(existsSync(join(dir, sub))).toBe(true);
+      expect(chowns).toContainEqual([join(dir, sub), uid, uid]);
+    }
+  });
+
+  it("a compose write outside apply (precreateHostDirs) still lands the tree, not a bare mount line", () => {
+    // The `agent restart` reconcile path writes compose without going through
+    // ensureHostMountSources. If it emitted the mount without creating the
+    // source, docker would auto-create it root-owned and every cache write
+    // from the agent uid would EACCES.
+    // Point homeDir at a throwaway too: precreateHostDirs also mkdirs the
+    // operator-home mount sources, and a test must not touch a real /home.
+    const fakeHome = mkdtempSync(join(tmpdir(), "switchroom-scratch-home-"));
+    let yaml: string;
+    try {
+      yaml = generateCompose({
+        config: baseConfig({ volume }),
+        homeDir: fakeHome,
+        precreateHostDirs: true,
+        warn: () => {},
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+    const dir = join(volume, DEFAULT_SCRATCH_SUBDIR, "carrie");
+    expect(yaml).toContain(`- ${dir}:${SCRATCH_CONTAINER_DIR}:rw`);
+    expect(existsSync(dir)).toBe(true);
+    for (const sub of SCRATCH_SUBDIRS) {
+      expect(existsSync(join(dir, sub))).toBe(true);
+    }
   });
 
   it("creates nothing when there is no bulk volume", () => {

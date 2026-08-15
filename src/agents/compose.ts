@@ -93,8 +93,8 @@ import { AGENT_UID_MIN, AGENT_UID_MAX, allocateAgentUid } from "./agent-uid.js";
 import { GRANTS_DB_DIRNAME, GRANTS_DB_CONTAINER_DIR } from "../vault/grants-db-path.js";
 import {
   SCRATCH_CONTAINER_DIR,
-  SCRATCH_SUBDIRS,
   agentScratchHostDir,
+  ensureAgentScratchDir,
   resolveScratchConfig,
   scratchEnv,
   scratchVolumeAvailable,
@@ -2856,16 +2856,15 @@ function emitAgentService(
     // root:root — that is the EACCES trap this feature would otherwise walk
     // straight into, because the container runs as a per-agent non-root uid.
     // Same best-effort shape as the audit / schedule.d pre-creates below.
-    // Authoritative creation + the chown to the agent uid happen at apply
-    // time (`ensureHostMountSources` in src/cli/apply.ts); this is only the
-    // guard for a compose write that didn't come through apply.
+    // Apply does this authoritatively ahead of the compose write
+    // (`ensureHostMountSources` in src/cli/apply.ts); this is the guard for a
+    // compose write that did NOT come through apply — e.g. the `agent
+    // restart` reconcile path, which shares writeComposeFile. It calls the
+    // SAME helper rather than a bare mkdir so that path can't leave a
+    // root-owned bind source behind (apply self-elevates to root, and a
+    // root:root scratch dir EACCESes every cache write from the agent uid).
     if (precreateHostDirs) {
-      try {
-        mkdirSync(scratchHostDir, { recursive: true });
-        for (const sub of SCRATCH_SUBDIRS) {
-          mkdirSync(`${scratchHostDir}/${sub}`, { recursive: true });
-        }
-      } catch { /* best-effort */ }
+      ensureAgentScratchDir(scratchHostDir, a.name);
     }
     lines.push(`      - ${scratchHostDir}:${SCRATCH_CONTAINER_DIR}:rw`);
   }

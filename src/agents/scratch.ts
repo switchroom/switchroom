@@ -178,23 +178,40 @@ export function ensureAgentScratchDirs(
   for (const name of agentNames) {
     const dir = agentScratchHostDir(cfg, name);
     if (dir === null) continue;
-    try {
-      const uid = allocateAgentUid(name);
-      const paths = [dir, ...SCRATCH_SUBDIRS.map((s) => join(dir, s))];
-      for (const p of paths) {
-        mkdirSync(p, { recursive: true });
-        try {
-          chown(p, uid, uid);
-        } catch {
-          /* dev host without CAP_CHOWN — leave existing ownership */
-        }
-      }
-      touched.push(dir);
-    } catch {
-      /* best-effort: never fail an apply over a cache directory */
-    }
+    if (ensureAgentScratchDir(dir, name, chown)) touched.push(dir);
   }
   return touched;
+}
+
+/**
+ * Single-agent form of {@link ensureAgentScratchDirs}, for callers that
+ * already hold the resolved host directory (the compose generator's
+ * pre-create). Returns whether the tree is in place.
+ *
+ * Every creation path goes through here so none of them can create the bind
+ * source WITHOUT the chown — a root-owned scratch dir is silently unusable
+ * from inside the container.
+ */
+export function ensureAgentScratchDir(
+  dir: string,
+  agentName: string,
+  chown: (path: string, uid: number, gid: number) => void = chownSync,
+): boolean {
+  try {
+    const uid = allocateAgentUid(agentName);
+    for (const p of [dir, ...SCRATCH_SUBDIRS.map((s) => join(dir, s))]) {
+      mkdirSync(p, { recursive: true });
+      try {
+        chown(p, uid, uid);
+      } catch {
+        /* dev host without CAP_CHOWN — leave existing ownership */
+      }
+    }
+    return true;
+  } catch {
+    /* best-effort: never fail an apply over a cache directory */
+    return false;
+  }
 }
 
 /**
