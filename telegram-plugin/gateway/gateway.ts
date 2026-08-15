@@ -303,6 +303,7 @@ import { installEditFloodFuse, editFloodFuseConfigFromEnv } from '../edit-flood-
 import { createSendGate, sendGateConfigFromEnv, isSendGateShed } from '../send-gate.js'
 import { createStatsLogger, createFloodWindowObserver } from '../send-gate-observability.js'
 import { installTgPostLogger, installRichMarkdownGuard, withTgPostTags, withTgSendContext, installSystemMessageObserver } from '../shared/bot-runtime.js'
+import { installUtf8Sanitizer } from '../shared/utf8-sanitize.js'
 import { installSentTextCapture } from '../shared/sent-text-capture.js'
 import {
   floodStatePath,
@@ -22873,6 +22874,7 @@ async function initGatewayBot(): Promise<void> {
   }
 
   bot = new Bot(TOKEN)
+  installUtf8Sanitizer(bot) // #4728: installed FIRST so it composes INNERMOST — the last thing to touch the payload before serialisation; see installUtf8Sanitizer docblock
   installTgPostLogger(bot); installRichMarkdownGuard(bot) // #3252/#3463: universal fmt guard installed after logger (composes outermost); see installRichMarkdownGuard docblock
   // #4576 follow-up: FALLBACK card body. The observer takes the stored body off
   // the RESPONSE (`rich_message` → `text`/`caption`); this stamps the REQUEST body
