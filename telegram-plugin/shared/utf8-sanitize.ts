@@ -244,7 +244,11 @@ export function installUtf8Sanitizer(bot: Bot, now: () => number = Date.now): vo
       // walk failure cannot be starved by, or starve, the repair line above.
       // The error MESSAGE is included because without it the line cannot
       // diagnose anything; the payload body still never is.
-      if (shouldLogRepair(`${method} sanitize-failed`, now())) {
+      // The separator is written as the ESCAPE "backslash-u-0000", never as a raw NUL
+      // byte: a literal 0x00 in a source file trips the #3676 binary-file
+      // guard (tests/source-files-are-text.test.ts) and blocks the merge
+      // queue. The runtime key is identical either way.
+      if (shouldLogRepair(`${method}\u0000sanitize-failed`, now())) {
         process.stderr.write(
           `telegram gateway: utf8-sanitize FAILED OPEN method=${method} — ` +
           `payload sent unrepaired; if it carries a lone surrogate Telegram ` +
