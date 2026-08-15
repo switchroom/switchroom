@@ -44,6 +44,7 @@ import {
   planGc,
   defaultRoots,
   defaultTaskTreeRoots,
+  defaultTaskTreeDirs,
   type GcPlan,
   type TaskTreeAction,
 } from "./gc.js";
@@ -154,6 +155,8 @@ export interface ReapReportDeps {
   /** Passed through to the default `planGc` call. */
   roots?: string[];
   taskTreeRoots?: string[];
+  /** Explicit task-tree candidates (widened discovery). Default: discovered. */
+  taskTreeDirs?: string[];
   reaperDeps?: ReaperDeps;
 }
 
@@ -290,6 +293,9 @@ export function buildReapReport(deps: ReapReportDeps = {}): ReapReport {
         escapeHatch: false,
       },
       deps.taskTreeRoots ?? defaultTaskTreeRoots(),
+      // Explicit roots mean the caller has scoped the sweep (and tests inject
+      // them for hermeticity) — do not widen out from under them.
+      deps.taskTreeDirs ?? (deps.taskTreeRoots ? [] : defaultTaskTreeDirs()),
     );
 
   const entries: ReapReportEntry[] = [
