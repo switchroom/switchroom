@@ -99,12 +99,6 @@ export type GatewaySignal =
   | "duplicate-delivery-represent"
   | "represent-escalation"
   | "reply-delivery-failure"
-  // The gateway's orphaned-DB-fd sweep found a `*.db` handle pointing at a
-  // DELETED inode under the state dir. Every row written to that handle since
-  // the last checkpoint is gone, and the write path reported success for all of
-  // them. `history.db` self-heals in process; `registry.db` and anything else
-  // needs a restart — either way a human has to be told, which is what this
-  // signal is for. See `telegram-plugin/gateway/orphaned-db-sweep.ts`.
   // The same `sendRichMessage` rejection, but a later rich send to the SAME
   // chat landed inside the recovery window: one of the gateway's fallback
   // ladders (thread-drop, 429 flood sleep, transport re-attempt, card re-send)
@@ -113,6 +107,12 @@ export type GatewaySignal =
   // it is the recovery mechanism working. Informational counterpart, exactly
   // as `orphaned-db-handle-recovered` is to `orphaned-db-handle`.
   | "reply-delivery-recovered"
+  // The gateway's orphaned-DB-fd sweep found a `*.db` handle pointing at a
+  // DELETED inode under the state dir. Every row written to that handle since
+  // the last checkpoint is gone, and the write path reported success for all of
+  // them. `history.db` self-heals in process; `registry.db` and anything else
+  // needs a restart — either way a human has to be told, which is what this
+  // signal is for. See `telegram-plugin/gateway/orphaned-db-sweep.ts`.
   | "orphaned-db-handle"
   // The same alarm, but the sweep's OWN recovery landed in the same tick: the
   // `history.db` lane reopened and proved the handle durable again, and no
