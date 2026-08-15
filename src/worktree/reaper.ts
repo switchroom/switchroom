@@ -15,8 +15,9 @@
  *     2. the worktree has NO uncommitted changes (a hard skip — never a
  *        mere warning: we do not destroy in-flight work), AND
  *     3. an in-use probe can DEFINITIVELY report the path as free.
- *   If the in-use probe is unavailable (neither `fuser` nor `lsof` is
- *   installed) we treat the path as live and keep it — "can't prove it's
+ *   If the in-use probe cannot reach a definitive answer (no readable procfs
+ *   and no `fuser`/`lsof`, or a procfs sweep that could not inspect every
+ *   process) we treat the path as live and keep it — "can't prove it's
  *   idle" must never license a force-remove. A live claim advances its own
  *   heartbeat (see registry.touchHeartbeat, refreshed from the gateway's
  *   watch loop), so a genuinely-abandoned claim is the only thing that
@@ -39,6 +40,7 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { scanProcForHolders, type ProcScanResult } from "./proc-liveness.js";
 import { listRecords, deleteRecord } from "./registry.js";
 import { removeCheckout } from "./remove-checkout.js";
 import type { WorktreeRecord } from "./types.js";
@@ -50,8 +52,10 @@ export const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
  * Result of probing whether a path is held open by a live process.
  *   - "in-use"      — a probe positively found a holder → keep the claim.
  *   - "free"        — a probe ran and found NO holder → safe to consider reap.
- *   - "unavailable" — NO probe tool is installed → we cannot tell, so the
- *                     reaper treats the path as live (fail-safe) and keeps it.
+ *   - "unavailable" — the probe could not reach a definitive answer (no
+ *                     readable procfs and no fuser/lsof, or a procfs sweep
+ *                     that could not inspect every process) → we cannot tell,
+ *                     so the reaper treats the path as live (fail-safe).
  */
 export type PathUseState = "in-use" | "free" | "unavailable";
 
@@ -93,7 +97,7 @@ export type ReapAction =
   | "keep-fresh"
   /** Stale but has uncommitted changes → preserve (never auto-delete dirty). */
   | "skip-dirty"
-  /** Stale + clean but no fuser/lsof to prove it idle → treat as live. */
+  /** Stale + clean but nothing could prove it idle → treat as live. */
   | "skip-probe-unavailable"
   /** Stale + clean but the probe positively found a holder → keep. */
   | "skip-in-use";
@@ -120,35 +124,38 @@ export function reapSkipReasonText(action: ReapAction): string {
 }
 
 /**
- * Probe whether any process holds the worktree path open.
+ * External-tool leg of the probe: `fuser` (Linux/procps), then `lsof`
+ * (macOS/BSD).
  *
- * Tries `fuser` (Linux/procps) first, then `lsof` (macOS/BSD).
+ * `lsof` is invoked with `+D` so it descends the tree — plain `lsof -t <dir>`
+ * matches the directory EXACTLY and misses a process sitting in a nested
+ * subdirectory, which is the bug this module's procfs scan exists to fix.
+ * `fuser` has no recursive mode at all, so it is kept only as a POSITIVE
+ * signal: it can say "in-use", it can never be trusted to say "free".
  *
- * Crucially, this distinguishes "the probe RAN and found nothing" (→ "free")
- * from "the probe tool is not installed" (→ "unavailable"). A missing binary
- * surfaces as a spawn `ENOENT`; a real "path not in use" surfaces as a
- * non-zero *exit* (no `ENOENT`). The reaper must never force-remove on the
- * strength of an "unavailable" result — that was the F1 data-loss hole where
- * a host without fuser/lsof reaped live worktrees.
+ * Distinguishes "the tool RAN and found nothing" (→ "free") from "the tool is
+ * not installed" (→ "unavailable"): a missing binary surfaces as a spawn
+ * `ENOENT`, a real "not in use" as a non-zero *exit*.
  */
-export function probePathInUse(path: string): PathUseState {
+export function probePathInUseWithTools(path: string): PathUseState {
   let probeRan = false;
 
   // fuser: exits 0 when the path is in use; non-zero when not; ENOENT when
-  // the binary itself is missing.
+  // the binary itself is missing. Positive-only — a non-zero exit here does
+  // NOT mark the probe as having answered, because fuser cannot see a holder
+  // in a nested subdirectory.
   try {
     execFileSync("fuser", [path], { stdio: "pipe" });
     return "in-use";
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      // fuser ran and exited non-zero → path not in use (per fuser).
-      probeRan = true;
-    }
+  } catch {
+    /* not in use per fuser, or fuser missing — either way, inconclusive. */
   }
 
-  // lsof: exits 0 with PID output when in use; exits 1 (non-ENOENT) when not.
+  // lsof +D: recurses into the tree and reports every process with an open
+  // file (cwd entries included) at or below it. Exits 0 with PID output when
+  // in use; non-zero (non-ENOENT) when not.
   try {
-    const out = execFileSync("lsof", ["-t", path], {
+    const out = execFileSync("lsof", ["-t", "+D", path], {
       stdio: ["ignore", "pipe", "ignore"],
     })
       .toString()
@@ -157,12 +164,62 @@ export function probePathInUse(path: string): PathUseState {
     if (out.length > 0) return "in-use";
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      // lsof ran and found nothing (exit 1) → not in use (per lsof).
+      // lsof ran and found nothing → not in use (per lsof).
       probeRan = true;
     }
   }
 
   return probeRan ? "free" : "unavailable";
+}
+
+/** Injectable seams for `probePathInUse` (tests / host portability). */
+export interface ProbeDeps {
+  scanProc?: (path: string) => ProcScanResult;
+  probeTools?: (path: string) => PathUseState;
+}
+
+/**
+ * Probe whether any process holds the worktree path open — AT OR BELOW the
+ * tree root.
+ *
+ * Primary mechanism is the procfs scan (`scanProcForHolders`): it matches a
+ * process whose cwd is any directory beneath the tree, and any open fd into
+ * the tree, including across a container mount namespace. See
+ * `proc-liveness.ts` for the failure it fixes — `fuser`/`lsof -t` match the
+ * path exactly, so both reported "free" for a tree an agent was working in.
+ *
+ * Resolution order, safety-first:
+ *   1. procfs found a holder                      → "in-use"
+ *   2. procfs swept EVERY process, found none     → "free"   (definitive)
+ *   3. procfs sweep was PARTIAL (some processes
+ *      unreadable) or procfs is absent            → fall back to the tools;
+ *      a tool hit is still "in-use", but a tool MISS after a partial sweep is
+ *      "unavailable", never "free" — we could not inspect every process and
+ *      the tools cannot see a nested holder, so nothing here proves the tree
+ *      is idle.
+ *
+ * Consequence worth knowing before automating deletion: run as a uid that
+ * cannot read other users' `/proc/<pid>/cwd` (i.e. not the tree owner and not
+ * root), this returns "unavailable" for a tree it cannot clear — the reaper
+ * keeps it. That is the intended posture ("can't prove it's idle" must never
+ * license a force-remove, per this module's fail-safe contract), and the
+ * report-only pass (`reap-report.ts`) surfaces the count so the exposure is
+ * measurable before anyone turns on deletion.
+ */
+export function probePathInUse(path: string, deps: ProbeDeps = {}): PathUseState {
+  const scanProc = deps.scanProc ?? ((p: string) => scanProcForHolders(p));
+  const probeTools = deps.probeTools ?? probePathInUseWithTools;
+
+  const scan = scanProc(path);
+  if (scan.state === "in-use") return "in-use";
+  if (scan.state === "free" && scan.inaccessible === 0) return "free";
+
+  const tool = probeTools(path);
+  if (tool === "in-use") return "in-use";
+  // Partial procfs sweep: a tool miss cannot upgrade it to "free".
+  if (scan.state === "free") return "unavailable";
+  // No procfs at all (non-Linux): the tools are the only evidence there is.
+  return tool;
 }
 
 /**
@@ -261,7 +318,7 @@ export function planReaper(nowMs?: number, deps: ReaperDeps = {}): ReapPlanEntry
     }
 
     // Fail-safe 2: only reap when the path is DEFINITIVELY free. Both
-    // "in-use" and "unavailable" (no fuser/lsof to prove idleness) mean we
+    // "in-use" and "unavailable" (nothing could prove idleness) mean we
     // cannot show the worktree is dead → keep it.
     const use = probeInUse(record.path);
     if (use === "unavailable") {
@@ -270,7 +327,8 @@ export function planReaper(nowMs?: number, deps: ReaperDeps = {}): ReapPlanEntry
         action: "skip-probe-unavailable",
         message:
           `[worktree-reaper] SKIPPED stale worktree — in-use probe ` +
-          `unavailable (neither fuser nor lsof installed); treating as ` +
+          `could not prove the path idle (no readable procfs, no ` +
+          `fuser/lsof, or a partial procfs sweep); treating as ` +
           `live: id=${record.id} path=${record.path}`,
       });
       continue;

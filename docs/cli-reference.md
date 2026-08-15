@@ -208,6 +208,7 @@ switchroom worktree claim <repo> [--task <name>] [--agent <name>] [--json]
 switchroom worktree list [--json]
 switchroom worktree release <id> [--json]
 switchroom worktree reap [--dry-run] [--json]
+switchroom worktree reap-report [--json] [--append <file>] [--budget-gb <n>]
 ```
 
 - **`claim <repo>`** claims an isolated checkout for a repo (alias or
@@ -226,6 +227,14 @@ switchroom worktree reap [--dry-run] [--json]
 - **`reap`** removes stale / orphaned worktrees (no heartbeat for
   >10 min). `--dry-run` prints what *would* be reaped without acting.
   Always sanity-check with `--dry-run` first on a shared host.
+- **`reap-report`** is the scheduled, **report-only** pass: it runs both
+  classifiers — the claim reaper and the per-agent task-tree sweep — and
+  prints what they *would* reclaim, grouped per agent against a size
+  budget (`--budget-gb`, default 5, or `SWITCHROOM_AGENT_TREE_BUDGET_GB`)
+  and ordered oldest-first. It deletes nothing and has no `--yes`.
+  `--append <file>` writes one JSON line per run, which is how you build
+  a week of evidence that the classifiers are right before considering
+  any automatic deletion. Deleting stays a separate, explicit command.
 
 Typical flow for a non-trivial change on a shared box:
 
@@ -235,7 +244,7 @@ ID=$(switchroom worktree claim switchroom --task fix-card --agent clerk --json |
 switchroom worktree release "$ID"
 ```
 
-*Grounded in:* `src/cli/worktree.ts`, `src/worktree/{claim,release,list,reaper}.ts`.
+*Grounded in:* `src/cli/worktree.ts`, `src/worktree/{claim,release,list,reaper,reap-report,proc-liveness}.ts`.
 
 ## `switchroom web` — local monitoring dashboard
 
