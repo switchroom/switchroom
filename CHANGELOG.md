@@ -17,7 +17,7 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
-## v0.21.13 — the worktree reaper stops mistaking live checkouts for garbage and finds the stale trees it was missing, `worktree capture` rescues a checkout to a verified bundle before deletion, agent caches move off the root disk onto a bulk scratch volume, doctor reports disk headroom, and the pinned Claude CLI moves to 2.1.233
+## v0.21.13 — the worktree reaper stops mistaking live checkouts for garbage and finds the stale trees it was missing, `worktree capture` rescues a checkout to a verified bundle before deletion, agent caches move off the root disk onto a bulk scratch volume, doctor reports disk headroom, approval cards survive a lone surrogate on the wire, fleet-health stops paging on deliveries that already recovered, and the pinned Claude CLI moves to 2.1.233
 
 ### Features
 
@@ -129,6 +129,19 @@ with every other open PR — prefer a fragment.
   carries three `switchroom` and two `repo` basenames. `mv` would have nested
   the second tree inside the first and lost which agent it came from.
   Destinations now disambiguate with a stable SHA-1 prefix of the source path.
+- **telegram: sanitise lone surrogates before the wire so approval cards deliver (#4728)** —
+  A JavaScript string is UTF-16 and may carry a LONE SURROGATE, which has no
+  valid UTF-8 encoding; `JSON.stringify` emits it as a `\udXXX` escape rather
+  than throwing, so the bad body reached Telegram, which rejected the whole
+  send with `400 Bad Request: strings must be encoded in UTF-8` — and the
+  approval card was silently dropped, leaving a gated tool call with no human
+  in front of it. The repair now happens once, in the grammy API-transformer
+  layer that every outbound call must transit, over the whole payload (button
+  labels and captions included) rather than at each individual truncation
+  site. Forum-topic creation (`switchroom topics sync`) POSTs outside the bot
+  and so outside that layer, and now repairs the configured `topic_name` the
+  same way instead of failing the whole sync on the same 400.
+- **fleet-health: stop reporting recovered deliveries as failures — without going blind to lost ones (#4730)** — a `tg-post method=sendRichMessage status=err` was read as a terminal delivery failure (sev-3), but four of the gateway's recovery ladders sit above or outside `createRetryApiCall` and re-send anyway: the THREAD_NOT_FOUND thread-drop, the edit-flood-fuse deferral, the bounded backstop re-attempt, and the queued-card re-send. Those now book the informational `reply-delivery-recovered` instead of paging the operator about a reply the user had already read. Clearing a failure requires positive evidence that the send stack was still working on THAT send — same chat, same thread or a deliberate thread-drop, plus either an immediate (<2s) re-send or a ladder marker (`429 rate limited`, `edit-flood-fuse deferred`, `queued card send failed`, `outbox-sweep: deferred`) — so unrelated later traffic in a busy chat (a worker card, a progress update, the next turn's reply) cannot mask a genuinely lost reply. Across the live fleet's 16 rejections: 7 recoveries, 9 failures kept.
 
 ### Build & CI
 
