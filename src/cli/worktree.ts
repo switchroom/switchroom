@@ -6,12 +6,14 @@
  *   switchroom worktree release <id>
  *   switchroom worktree list [--json]
  *   switchroom worktree reap [--dry-run]
+ *   switchroom worktree reap-report [--json] [--append <file>] [--budget-gb <n>]
  *   switchroom worktree gc [--root <dir>...] [--yes] [--json]
  *   switchroom worktree gc --purge-trash [--older-than <days>] [--yes]
  */
 
 import type { Command } from "commander";
 import chalk from "chalk";
+import { appendFileSync } from "node:fs";
 import { claimWorktree } from "../worktree/claim.js";
 import { releaseWorktree } from "../worktree/release.js";
 import { listWorktrees } from "../worktree/list.js";
@@ -26,6 +28,11 @@ import {
   selectPurgeTargets,
   purgeTrash,
 } from "../worktree/gc.js";
+import {
+  agentTreeBudgetBytes,
+  buildReapReport,
+  formatReapReport,
+} from "../worktree/reap-report.js";
 
 export function registerWorktreeCommand(program: Command): void {
   const worktree = program
@@ -231,6 +238,64 @@ export function registerWorktreeCommand(program: Command): void {
         }
       }
     });
+
+  // ─── reap-report (scheduled, report-only) ────────────────────────────────
+
+  worktree
+    .command("reap-report")
+    .description(
+      "REPORT ONLY: what the reaper and the task-tree sweep WOULD reclaim.\n" +
+        "Deletes nothing — there is no --yes on this verb. Built to run from\n" +
+        "cron so a week of evidence exists before any automatic deletion is\n" +
+        "considered. Groups per agent against a size budget, oldest-first.",
+    )
+    .option("--json", "Output the raw report as JSON")
+    .option(
+      "--append <file>",
+      "Append the JSON report as one line to <file> (JSONL evidence log)",
+    )
+    .option("--budget-gb <gb>", "Per-agent task-tree budget in GB (default 5)")
+    .option("--idle-days <days>", "Idle threshold for task trees (default 14)", "14")
+    .option("--no-task-roots", "Skip the per-agent task-tree sweep")
+    .action(
+      (opts: {
+        json?: boolean;
+        append?: string;
+        budgetGb?: string;
+        idleDays: string;
+        taskRoots?: boolean;
+      }) => {
+        const parsedIdle = Number(opts.idleDays);
+        const idleDays = Number.isFinite(parsedIdle) && parsedIdle >= 0 ? parsedIdle : 14;
+        const parsedBudget = opts.budgetGb == null ? NaN : Number(opts.budgetGb);
+        const budgetBytes =
+          Number.isFinite(parsedBudget) && parsedBudget > 0
+            ? Math.round(parsedBudget * 1024 * 1024 * 1024)
+            : agentTreeBudgetBytes();
+
+        const report = buildReapReport({
+          idleDays,
+          budgetBytes,
+          taskTreeRoots: opts.taskRoots === false ? [] : undefined,
+        });
+
+        if (opts.append) {
+          try {
+            appendFileSync(opts.append, JSON.stringify(report) + "\n");
+          } catch (err) {
+            console.error(
+              chalk.yellow(`Could not append to ${opts.append}: ${(err as Error).message}`),
+            );
+          }
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify(report));
+          return;
+        }
+        console.log(formatReapReport(report));
+      },
+    );
 
   // ─── gc ─────────────────────────────────────────────────────────────────
 

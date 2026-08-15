@@ -253,7 +253,7 @@ export type TaskTreeVerdict =
   | "reap"
   /** registry-claimed / stable per-repo tree / ephemeral mount → never touch. */
   | "skip-protected"
-  /** no fuser/lsof to prove it idle → treat as live, keep (fail-safe). */
+  /** nothing could prove it idle (partial procfs sweep / no tools) → keep. */
   | "skip-probe-unavailable"
   /** a live process holds the path open → keep. */
   | "skip-in-use"
@@ -329,6 +329,12 @@ export interface TaskTreeAction {
   verdict: TaskTreeVerdict;
   prSignal: PrSignal;
   idle: boolean;
+  /**
+   * Newest mtime (ms) across the tree's git-TRACKED files — the same signal
+   * `idle` is derived from, surfaced so a reporting pass can order trees
+   * oldest-first. `null` when the probe threw (⇒ treated as active).
+   */
+  newestMtimeMs: number | null;
   /** quarantine destination when this tree is actioned. */
   dest: string;
   /**
@@ -818,10 +824,13 @@ export function planGc(
 
       // Idle: newest tracked mtime older than the idle window.
       let idle = false;
+      let newestMtimeMs: number | null = null;
       try {
-        idle = (nowMs - newestMtime(dir)) / 86_400_000 >= idleDays;
+        newestMtimeMs = newestMtime(dir);
+        idle = (nowMs - newestMtimeMs) / 86_400_000 >= idleDays;
       } catch {
         idle = false; // can't tell ⇒ treat as active ⇒ keep
+        newestMtimeMs = null;
       }
 
       // Spend the probe + `gh` call only when every cheaper guard has passed
@@ -865,6 +874,7 @@ export function planGc(
         verdict,
         prSignal: sig,
         idle,
+        newestMtimeMs,
         dest: join(trash, name),
         willAct,
       });

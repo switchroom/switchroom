@@ -70,6 +70,57 @@ switchroom worktree gc --purge-trash --older-than 14 --yes   # hard-delete ≥14
 Quarantine reclaims space only after `--purge-trash`; until then a quarantined
 worktree can be moved back out of the trash dir.
 
+## Is this tree in use? (the liveness probe)
+
+Every reclaim path asks one question before it touches a tree: is any live
+process sitting in it? The answer comes from `probePathInUse`
+(`src/worktree/reaper.ts` → `src/worktree/proc-liveness.ts`), which walks
+`/proc` and treats a tree as live when a process's **cwd is the tree root or
+any directory beneath it**, or when any open file descriptor points inside it.
+
+This used to be `fuser <path>` / `lsof -t <path>`. Both match the path
+**exactly**, so a process sitting in `<tree>/src/deep` — what an agent working
+in a checkout actually looks like — was reported as *free*, and the tree was
+eligible for a force-remove. Two consequences worth knowing:
+
+- **A partial sweep is never "free".** Reading another uid's
+  `/proc/<pid>/cwd` needs ptrace-read permission. Run as a uid that cannot see
+  the process holding the tree, the probe reports `unavailable` and the tree is
+  KEPT. If `switchroom worktree reap-report` shows a large
+  `could not be proven idle` count, run it as root (or as the tree's owning
+  uid) — do not read it as "nothing is holding these".
+- **Container-side holders count.** The processes that hold agent task trees
+  live inside agent containers, where the same directory has a different path.
+  The probe compares directory inodes as well as path strings, so a holder
+  inside a container is still found from the host.
+
+## Report-only pass (start here before automating anything)
+
+```bash
+switchroom worktree reap-report                       # human-readable
+switchroom worktree reap-report --json                # machine-readable
+switchroom worktree reap-report --budget-gb 5 \
+    --append /var/log/switchroom/reap-report.jsonl    # one JSON line per run
+```
+
+`reap-report` runs both classifiers — the claim reaper and the per-agent
+task-tree sweep — and prints what they *would* reclaim, grouped per agent
+against a per-agent size budget (`--budget-gb`, default 5, or
+`SWITCHROOM_AGENT_TREE_BUDGET_GB`) and ordered **oldest-first**, which is the
+eviction order a budget-driven reaper would use. A tree is only ever marked
+`over-budget` if it already cleared every safety guard; when the guards keep an
+agent over budget the report says how much stays over rather than widening
+eligibility.
+
+It **deletes nothing** and has no `--yes`. Deleting remains the separate,
+explicit `switchroom worktree gc --yes` / `switchroom worktree reap`. Run the
+report daily for a week and read the JSONL before wiring anything automatic:
+
+```cron
+# 03:40 daily — evidence only, deletes nothing
+40 3 * * *  switchroom worktree reap-report --append /var/log/switchroom/reap-report.jsonl >> /var/log/switchroom/reap-report.log 2>&1
+```
+
 ## Weekly cron (safety net)
 
 Run GC weekly so forgotten worktrees self-clean, and purge quarantined dirs
