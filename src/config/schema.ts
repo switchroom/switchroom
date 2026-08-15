@@ -5150,6 +5150,89 @@ export const ScratchConfigSchema = z.object({
     ),
 });
 
+/**
+ * Root-disk headroom — the thresholds `switchroom doctor` measures against.
+ *
+ * On 2026-08-15 the reference fleet's root filesystem hit 85% full: 41 stale
+ * git checkouts across agent homes plus tens of gigabytes of package caches.
+ * `switchroom doctor` mentioned "disk full" in half a dozen error strings and
+ * never once measured free space, so the condition was found only because a
+ * human went looking. These knobs exist so the measurement has an operator-
+ * tunable verdict rather than a hard-coded one.
+ *
+ * Percentages are *used* percentages of the filesystem holding the agents
+ * directory (`switchroom.agents_dir`) — not of `/`, because agent homes are
+ * what fill up and they do not have to live on the root device.
+ */
+export const DiskConfigSchema = z.object({
+  warn_pct: z
+    .number()
+    .int()
+    .min(1)
+    .max(99)
+    .default(80)
+    .describe(
+      "Used-percentage at or above which `switchroom doctor` WARNs about " +
+      "the filesystem holding the agents directory. Default 80 — the " +
+      "reference fleet was at 85% when the condition was found by hand.",
+    ),
+  fail_pct: z
+    .number()
+    .int()
+    .min(2)
+    .max(100)
+    .default(90)
+    .describe(
+      "Used-percentage at or above which `switchroom doctor` FAILs. Must " +
+      "be greater than `warn_pct`. Default 90.",
+    ),
+  reap_report: z
+    .object({
+      enabled: z
+        .boolean()
+        .default(true)
+        .describe(
+          "Whether doctor checks that the report-only worktree sweep " +
+          "(`switchroom worktree reap-report --append <file>`) is actually " +
+          "running. Set false on a host that deliberately does not run it.",
+        ),
+      log: z
+        .string()
+        .min(1)
+        .default("/var/log/switchroom/reap-report.jsonl")
+        .describe(
+          "Path of the JSONL evidence log the scheduled `worktree " +
+          "reap-report --append` writes. Doctor reads the newest record's " +
+          "`generatedAt` — it detects the sweep by its OUTPUT, so it is " +
+          "agnostic about whether an operator crontab, /etc/cron.d, or a " +
+          "systemd timer drives it. Default " +
+          "/var/log/switchroom/reap-report.jsonl (the path documented in " +
+          "docs/operators/worktree-gc.md).",
+        ),
+      max_age_hours: z
+        .number()
+        .int()
+        .min(1)
+        .max(720)
+        .default(48)
+        .describe(
+          "How old the newest record in `log` may be before doctor WARNs " +
+          "that the sweep has stopped running. Default 48 — twice the " +
+          "documented daily cadence, so a single missed run is not noise.",
+        ),
+    })
+    .default({})
+    .describe(
+      "Liveness check for the report-only worktree sweep. REPORT-ONLY by " +
+      "construction: doctor reads an evidence log and never invokes any " +
+      "reclaim path.",
+    ),
+}).refine((v) => v.fail_pct > v.warn_pct, {
+  message: "disk.fail_pct must be greater than disk.warn_pct",
+  path: ["fail_pct"],
+});
+export type DiskConfig = z.infer<typeof DiskConfigSchema>;
+
 export const HostControlConfigSchema = z.object({
   enabled: z
     .boolean()
@@ -5714,6 +5797,12 @@ export const SwitchroomConfigSchema = z.object({
     "consumers are ordinary non-admin agents. Omit the block to accept " +
     "defaults; the feature is a no-op unless `scratch.volume` exists on " +
     "the host.",
+  ),
+  disk: DiskConfigSchema.default({}).describe(
+    "Root-disk headroom thresholds for `switchroom doctor`. Measured " +
+    "against the filesystem holding the agents directory (and the scratch " +
+    "volume when that feature is engaged), not against `/`. Omit the block " +
+    "to accept the defaults (WARN at 80% used, FAIL at 90%).",
   ),
   host_control: HostControlConfigSchema.default({}).describe(
     "Host-control daemon configuration. Defaults to enabled=true since " +

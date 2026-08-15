@@ -121,6 +121,33 @@ report daily for a week and read the JSONL before wiring anything automatic:
 40 3 * * *  switchroom worktree reap-report --append /var/log/switchroom/reap-report.jsonl >> /var/log/switchroom/reap-report.log 2>&1
 ```
 
+### Scheduling is the operator's, but doctor checks it happened
+
+There is deliberately **no** `switchroom worktree reap-report --install-cron`
+and no shipped daemon. The other `/etc/cron.d` installers in this repo
+(`hindsight-watch`, `config-repo`, `openrouter-watch`) arm things that alert
+or sync; this one would arm a pass whose whole reason for existing is to build
+a week of evidence *before* anyone automates deletion, and shipping an
+installer for it would put the automation before the evidence it is supposed
+to justify. Which scheduler you use is yours — crontab, `/etc/cron.d`, a
+systemd timer.
+
+What is **not** left to a doc nobody reads is whether it ran. `switchroom
+doctor` (section *Disk headroom*) reads the newest record in the JSONL and
+WARNs when the log is missing or older than 48h:
+
+```
+⚠ worktree reap sweep (evidence log)  /var/log/switchroom/reap-report.jsonl — no evidence log; the report-only worktree sweep has never run here
+✓ worktree reap sweep (evidence log)  /var/log/switchroom/reap-report.jsonl — last ran 9.4h ago
+```
+
+That is a check on the sweep's **output**, so any scheduler satisfies it, and
+a cron entry that exists but dies at the redirection every night does not.
+Tune the path and window (or turn the check off) under `disk.reap_report:` —
+see [configuration.md](../configuration.md#disk-headroom-disk). The same
+doctor section measures free space on the agents filesystem, which is the
+signal the 2026-08-15 85%-full incident had none of.
+
 ## Weekly cron (safety net)
 
 Run GC weekly so forgotten worktrees self-clean, and purge quarantined dirs
