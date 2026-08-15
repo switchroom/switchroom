@@ -133,6 +133,9 @@ describe("runDiskChecks — free space on the agent-homes filesystem", () => {
     const row = agentsRow(rows);
     expect(row.status).toBe("skip");
     expect(rows.every((r) => r.status !== "fail")).toBe(true);
+    // A tree where nothing exists is not a fleet host — `at === agentsDir`
+    // here only because measurePath falls back to the original path.
+    expect(rows.some((r) => r.name.startsWith("worktree reap sweep"))).toBe(false);
   });
 
   it("skips when statfs is unavailable rather than reporting a bogus verdict", () => {
@@ -246,6 +249,33 @@ describe("worktree reap sweep evidence row (#4724)", () => {
   it("skips (never warns) when the log exists but cannot be parsed", () => {
     const r = reapSweepRow(LOG, { kind: "unreadable", msg: "permission denied" }, 48, NOW);
     expect(r.status).toBe("skip");
+  });
+
+  it("is dropped on a host with no agents directory — nothing to sweep, no noise", () => {
+    const present = new Set(["/", "/home", "/home/op"]);
+    const cfg = configWith({
+      switchroom: { version: 1, agents_dir: "/home/op/.switchroom/agents", skills_dir: "/s" } as never,
+    });
+    const rows = runDiskChecks(
+      cfg,
+      deps(fsAt(10), {
+        exists: (p) => present.has(p),
+        readReapLog: () => ({ kind: "absent" }),
+      }),
+    );
+    expect(rows.some((r) => r.name.startsWith("worktree reap sweep"))).toBe(false);
+    // ...but the free-space row is still there. Disk pressure is measured
+    // everywhere; only the sweep row is fleet-conditional.
+    expect(rows.some((r) => r.name === "free space: agent homes")).toBe(true);
+  });
+
+  it("IS emitted on a host whose agents directory exists", () => {
+    const rows = runDiskChecks(
+      configWith(),
+      deps(fsAt(10), { readReapLog: () => ({ kind: "absent" }) }),
+    );
+    const row = rows.find((r) => r.name.startsWith("worktree reap sweep"));
+    expect(row?.status).toBe("warn");
   });
 
   it("is dropped entirely when disk.reap_report.enabled is false", () => {

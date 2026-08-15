@@ -1292,7 +1292,10 @@ Notes:
   detects the sweep by its **output** — an operator crontab, an `/etc/cron.d`
   fragment, or a systemd timer all satisfy it, and a schedule that exists but
   errors out every night does not. It WARNs when the log is missing or stale.
-  Set `enabled: false` on a host that deliberately does not run it.
+  The row only appears on a host whose agents directory exists — a fresh
+  clone has no `<agents_dir>/*/home/work` trees to sweep, so there is nothing
+  to warn about. Set `enabled: false` on a host that deliberately does not
+  run it.
 
 ## Multi-Account OAuth (auth-broker)
 

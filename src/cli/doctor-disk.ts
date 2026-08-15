@@ -448,8 +448,17 @@ export function runDiskChecks(
   }
 
   // ── report-only worktree sweep ───────────────────────────────────────────
+  // Gated on the agents directory EXISTING. The stale checkouts this sweep
+  // finds live under `<agents_dir>/*/home/work`, so on a fresh clone or a dev
+  // box that has never run `switchroom apply` there is nothing for it to
+  // sweep and a standing WARN would be pure noise — and a noisy check is one
+  // an operator learns to scroll past, which is how the 85%-full host stayed
+  // unnoticed in the first place.
+  // `at === agentsDir` alone is not existence: when NOTHING up the tree
+  // exists, measurePath reports the original path with a null usage.
+  const agentsDirExists = agentsMeasure.usage !== null && agentsMeasure.at === agentsDir;
   const reapCfg = diskCfg?.reap_report;
-  if (reapCfg?.enabled !== false) {
+  if (agentsDirExists && reapCfg?.enabled !== false) {
     const logPath = reapCfg?.log ?? "/var/log/switchroom/reap-report.jsonl";
     const maxAge = reapCfg?.max_age_hours ?? 48;
     const read = (deps.readReapLog ?? readReapLog)(logPath);
