@@ -367,8 +367,20 @@ export function registerWorktreeCommand(program: Command): void {
                 console.log(chalk.dim(`  ${t.verdict.replace("skip-", "")}: ${t.dir} [${t.branch ?? "detached"}] (pr=${t.prSignal})`));
             }
           }
-          if (plan.skipped.length) {
-            console.log(chalk.dim(`\nIgnored non-switchroom dirs: ${plan.skipped.length}`));
+          // A failed git probe is NOT a negative answer — the tree is unreadable
+          // and nothing about it is known. Surfaced separately and loudly, so a
+          // fleet-wide probe failure can never hide inside the bland
+          // "ignored non-switchroom dirs" count again.
+          const probeFailed = plan.skipped.filter((s) => s.kind === "probe-failed");
+          const notOurs = plan.skipped.filter((s) => s.kind !== "probe-failed");
+          if (probeFailed.length) {
+            console.log(
+              chalk.yellow(`\nUnreadable dirs — git probe failed, kept (${probeFailed.length}):`),
+            );
+            for (const s of probeFailed) console.log(chalk.dim(`  ${s.dir}: ${s.reason}`));
+          }
+          if (notOurs.length) {
+            console.log(chalk.dim(`\nIgnored non-switchroom dirs: ${notOurs.length}`));
           }
           console.log(chalk.dim("\nRe-run with --yes to act. Reclaimed trees are MOVED to the trash dir, not deleted."));
           return;

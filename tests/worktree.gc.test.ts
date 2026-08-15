@@ -25,6 +25,9 @@ import {
   pushStateFrom,
   isStablePerRepoBranch,
   classifyTaskTree,
+  gitArgs,
+  describeExecFailure,
+  execCapture,
   type GcDeps,
   type TaskTreeClassifyInput,
 } from "../src/worktree/gc.js";
@@ -704,6 +707,262 @@ describe("applyGc — quarantine move (real fs)", () => {
     expect(result.quarantined).toEqual([tree]);
     expect(existsSync(tree)).toBe(false);
     expect(result.pruned).toEqual([owner]);
-    expect(execCalls).toContainEqual(["git", "-C", owner, "worktree", "prune"]);
+    // Routed through gitArgs so the prune survives a cross-uid owner repo.
+    expect(execCalls).toContainEqual(["git", ...gitArgs(owner, "worktree", "prune")]);
+    const prune = execCalls.find((c) => c.includes("prune"))!;
+    expect(prune).toContain(`safe.directory=${owner}`);
+  });
+});
+
+// ── git probe hardening: stderr capture + cross-uid ownership (bug fix) ──────
+//
+// Two coupled defects made the shipped GC reclaim NOTHING against real agent
+// homes while reporting only a bland "Ignored non-switchroom dirs: 67":
+//
+//   1. `defaultExec` ran with `stdio: [_, _, "ignore"]`, so git's stderr was
+//      discarded and a FAILED probe was indistinguishable from a clean
+//      "this isn't a switchroom checkout" answer at every call site.
+//   2. Agent task trees are owned by each agent's own uid while GC runs as the
+//      operator/root, so every git command died with `fatal: detected dubious
+//      ownership` — silently, because of (1).
+//
+// These tests assert the OUTCOMES: the real cause reaches the plan, an
+// ownership-gated tree is actually classified, and nothing that was previously
+// preserved becomes reclaimable as a result.
+
+describe("gitArgs — cross-uid ownership + config-exec hardening", () => {
+  it("scopes safe.directory to the exact directory (never the global wildcard)", () => {
+    const args = gitArgs("/agents/a1/home/work/fix-1", "status", "--porcelain");
+    expect(args).toContain("safe.directory=/agents/a1/home/work/fix-1");
+    expect(args).not.toContain("safe.directory=*");
+  });
+
+  it("targets the directory and preserves the trailing git subcommand", () => {
+    const args = gitArgs("/d", "rev-list", "--count", "@{upstream}..HEAD");
+    expect(args[args.indexOf("-C") + 1]).toBe("/d");
+    expect(args.slice(-3)).toEqual(["rev-list", "--count", "@{upstream}..HEAD"]);
+  });
+
+  it("neuters config-driven execution — an ownership bypass without this is root RCE", () => {
+    // `core.fsmonitor` is a shell command git runs on `status`. Bypassing
+    // safe.directory makes git read an AGENT-WRITABLE .git/config, so dropping
+    // either flag hands any agent code execution as the invoking (root) user.
+    const args = gitArgs("/d", "status");
+    expect(args).toContain("core.fsmonitor=false");
+    expect(args).toContain("core.hooksPath=/dev/null");
+    // Command-line -c must precede -C so repo config cannot override it.
+    expect(args.indexOf("core.fsmonitor=false")).toBeLessThan(args.indexOf("-C"));
+  });
+});
+
+describe("describeExecFailure", () => {
+  it("prefers the command's stderr first line", () => {
+    const e = Object.assign(new Error("Command failed"), {
+      stderr: "fatal: detected dubious ownership in repository at '/x'\nhint: add an exception\n",
+    });
+    expect(describeExecFailure(e)).toBe("fatal: detected dubious ownership in repository at '/x'");
+  });
+  it("falls back to the message when stderr is empty", () => {
+    expect(describeExecFailure(Object.assign(new Error("boom"), { stderr: "  " }))).toBe("boom");
+  });
+  it("never returns an empty string", () => {
+    expect(describeExecFailure({})).toBe("unknown error");
+  });
+});
+
+describe("execCapture — git stderr reaches the caller (real git)", () => {
+  let tmp: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "sw-gc-exec-"));
+  });
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("surfaces the real git fatal instead of a generic 'Command failed'", () => {
+    // A real broken linked worktree: `.git` points at an admin dir that is gone
+    // (this is `wt-4702-base` on the live host). git fatals on STDERR; with
+    // `stdio[2] = "ignore"` — the bug — that text never reached the caller and
+    // the directory was misfiled as "not a switchroom dir".
+    const tree = join(tmp, "wt-dead");
+    mkdirSync(tree, { recursive: true });
+    writeFileSync(join(tree, ".git"), `gitdir: ${tmp}/gone/.git/worktrees/wt-dead\n`);
+
+    let caught: unknown;
+    try {
+      execCapture("git", gitArgs(tree, "remote", "get-url", "origin"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    // The concrete cause, obtainable ONLY from git's stderr.
+    expect((caught as Error).message).toContain("not a git repository");
+    expect(describeExecFailure(caught)).toContain("not a git repository");
+  });
+
+  it("returns stdout on success", () => {
+    expect(execCapture("git", ["--version"])).toContain("git version");
+  });
+});
+
+describe("planGc — a failed git probe is not a negative answer", () => {
+  const root = "/agents/a1/home/work";
+
+  function depsThatFail(err: unknown): GcDeps {
+    return {
+      dateStamp: "2026-08-15",
+      existsSync: (p: string) => p === root || p === `${root}/wt-dead/.git`,
+      readDir: (p: string) => (p === root ? ["wt-dead"] : []),
+      stat: () => ({ isDirectory: () => false }), // worktree shape
+      readFile: () => "gitdir: /gone/.git/worktrees/wt-dead\n",
+      exec: () => {
+        throw err;
+      },
+    };
+  }
+
+  it("records the git cause as a probe-failed skip, never as 'not a switchroom tree'", () => {
+    const err = Object.assign(new Error("Command failed"), {
+      stderr: `fatal: detected dubious ownership in repository at '${root}/wt-dead'\n`,
+    });
+    const plan = planGc([], depsThatFail(err), [root]);
+
+    const skip = plan.skipped.find((s) => s.dir === `${root}/wt-dead`);
+    expect(skip).toBeDefined();
+    expect(skip!.kind).toBe("probe-failed");
+    expect(skip!.reason).toContain("dubious ownership");
+    // Fail toward preservation: an unreadable tree is never actioned.
+    expect(plan.taskTrees).toHaveLength(0);
+    expect(plan.orphans).toHaveLength(0);
+  });
+
+  it("keeps an unreadable tree even under the operator escape hatch", () => {
+    const err = Object.assign(new Error("Command failed"), {
+      stderr: "fatal: not a git repository: /gone/.git/worktrees/wt-dead\n",
+    });
+    const plan = planGc([], { ...depsThatFail(err), escapeHatch: true }, [root]);
+    expect(plan.taskTrees.filter((t) => t.willAct)).toHaveLength(0);
+    expect(plan.skipped[0]!.kind).toBe("probe-failed");
+  });
+});
+
+describe("planGc — cross-uid task trees are classified, not silently ignored", () => {
+  const NOW = 1_700_000_000_000;
+  const DAY = 86_400_000;
+  const root = "/agents/a1/home/work";
+  const SR = "https://github.com/switchroom/switchroom.git\n";
+
+  interface Spec {
+    status?: string[];
+    branch?: string | null;
+    upstream?: string | null;
+    ahead?: number;
+    mtimeDaysAgo?: number;
+  }
+
+  /**
+   * An exec stub that models git's ACTUAL dubious-ownership behaviour: every
+   * command against a foreign-uid directory fatals unless the invocation
+   * carries `-c safe.directory=<that dir>`. On unfixed code no git call ever
+   * succeeds, so the tree is misfiled as "not a switchroom task tree".
+   */
+  function makeDeps(trees: Record<string, Spec>, escapeHatch = false): GcDeps {
+    const names = Object.keys(trees);
+    const byDir = new Map(names.map((n) => [`${root}/${n}`, trees[n]!]));
+    return {
+      dateStamp: "2026-08-15",
+      idleDays: 14,
+      nowMs: NOW,
+      escapeHatch,
+      existsSync: (p: string) => p === root || byDir.has(p.replace(/\/\.git$/, "")),
+      readDir: (p: string) => {
+        if (p === root) return names;
+        throw new Error("unexpected readDir " + p);
+      },
+      stat: () => ({ isDirectory: () => true }), // clone shape
+      readFile: () => "",
+      probeInUse: () => "free",
+      newestTrackedMtimeMs: (dir: string) => NOW - (byDir.get(dir)?.mtimeDaysAgo ?? 30) * DAY,
+      prSignal: () => "merged",
+      exec: (file: string, args: string[]) => {
+        const dir = args[args.indexOf("-C") + 1]!;
+        const spec = byDir.get(dir);
+        if (!spec) throw new Error("unexpected exec dir " + dir);
+        if (!args.includes(`safe.directory=${dir}`)) {
+          throw Object.assign(new Error("Command failed"), {
+            stderr: `fatal: detected dubious ownership in repository at '${dir}'\n`,
+          });
+        }
+        if (args.includes("remote")) return SR;
+        if (args.includes("status")) return (spec.status ?? []).join("\n");
+        if (args.includes("rev-parse") && !args.includes("@{upstream}")) {
+          return spec.branch === null ? "HEAD\n" : `${spec.branch ?? "feat/x"}\n`;
+        }
+        if (args.includes("rev-parse")) {
+          if (spec.upstream === null) throw new Error("no upstream");
+          return `${spec.upstream ?? "origin/feat/x"}\n`;
+        }
+        if (args.includes("rev-list")) return `${spec.ahead ?? 0}\n`;
+        throw new Error("unexpected exec " + file + " " + args.join(" "));
+      },
+    };
+  }
+
+  const verdictOf = (trees: Record<string, Spec>, name: string, hatch = false) =>
+    planGc([], makeDeps(trees, hatch), [root]).taskTrees.find((t) => t.dir === `${root}/${name}`);
+
+  it("a foreign-uid switchroom tree reaches a real verdict instead of the skipped bucket", () => {
+    const plan = planGc([], makeDeps({ "fix-3019": {} }), [root]);
+    // The bug: this dir landed in `skipped` as "not a switchroom task tree".
+    expect(plan.skipped.map((s) => s.dir)).not.toContain(`${root}/fix-3019`);
+    expect(plan.taskTrees).toHaveLength(1);
+    expect(plan.taskTrees[0]!.verdict).toBe("reap");
+  });
+
+  // Guard the blast radius of the fix: making a tree VISIBLE must not make it
+  // reclaimable. Each of these was preserved before the fix only by accident
+  // (the probe failed); it must now be preserved on purpose (a guard fires).
+  it("a newly-visible DIRTY tree is kept, not reaped", () => {
+    const t = verdictOf({ "fix-a": { status: ["  M src/index.ts"] } }, "fix-a");
+    expect(t?.verdict).toBe("skip-dirty");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("a newly-visible DETACHED-HEAD tree is kept, not reaped", () => {
+    const t = verdictOf({ "fix-b": { branch: null } }, "fix-b");
+    expect(t?.verdict).toBe("skip-unpushed");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("a newly-visible tree with commits ahead of upstream is kept, not reaped", () => {
+    const t = verdictOf({ "fix-c": { ahead: 3 } }, "fix-c");
+    expect(t?.verdict).toBe("skip-unpushed");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("a newly-visible NEVER-PUSHED (no upstream) tree is kept, not reaped", () => {
+    const t = verdictOf({ "fix-d": { upstream: null } }, "fix-d");
+    expect(t?.verdict).toBe("skip-unpushed");
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("a newly-visible RECENTLY-ACTIVE dirty tree is untouched even under the escape hatch", () => {
+    const t = verdictOf({ "fix-e": { status: ["  M x"], mtimeDaysAgo: 1 } }, "fix-e", true);
+    expect(t?.verdict).toBe("skip-dirty");
+    expect(t?.idle).toBe(false);
+    expect(t?.willAct).toBe(false);
+  });
+
+  it("a genuinely foreign repo still reads as a negative answer, not a probe failure", () => {
+    const deps = makeDeps({ "clued-in": {} });
+    const inner = deps.exec!;
+    deps.exec = (file, args, cwd) =>
+      args.includes("remote") && args.includes(`safe.directory=${root}/clued-in`)
+        ? "https://github.com/someone/clued-in.git\n"
+        : inner(file, args, cwd);
+    const plan = planGc([], deps, [root]);
+    const skip = plan.skipped.find((s) => s.dir === `${root}/clued-in`);
+    expect(skip?.kind).toBe("not-ours");
+    expect(plan.taskTrees).toHaveLength(0);
   });
 });

@@ -339,6 +339,23 @@ export interface TaskTreeAction {
   willAct: boolean;
 }
 
+/**
+ * Why a candidate directory was left alone without a verdict.
+ *
+ * `not-ours` is a NEGATIVE RESULT — git answered, and the answer was "this is
+ * not a switchroom checkout". `probe-failed` is an ERROR — git never answered,
+ * so nothing about the directory is known. Both preserve the directory, but
+ * conflating them is what hid the dubious-ownership failure for an entire
+ * release: 67 unreadable trees were reported as "ignored non-switchroom dirs".
+ */
+export type SkipKind = "not-ours" | "probe-failed";
+
+export interface SkippedDir {
+  dir: string;
+  reason: string;
+  kind: SkipKind;
+}
+
 export interface GcPlan {
   roots: string[];
   taskTreeRoots: string[];
@@ -347,7 +364,7 @@ export interface GcPlan {
   registered: RegisteredAction[];
   taskTrees: TaskTreeAction[];
   reposToPrune: string[];
-  skipped: { dir: string; reason: string }[];
+  skipped: SkippedDir[];
 }
 
 export interface GcDeps {
@@ -379,8 +396,92 @@ export interface GcDeps {
   escapeHatch?: boolean;
 }
 
-const defaultExec = (file: string, args: string[], cwd?: string): string =>
-  execFileSync(file, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).toString();
+/**
+ * Build the argv for a git invocation scoped to `dir`.
+ *
+ * Two hardening concerns, both mandatory and both load-bearing:
+ *
+ * 1. **`safe.directory`.** GC runs host-side over `~/.switchroom/agents/<name>/`
+ *    trees owned by each agent's own uid, while the operator (or a root cron)
+ *    invokes it as a DIFFERENT uid. Git then refuses every command with
+ *    `fatal: detected dubious ownership in repository at '<dir>'`. The exception
+ *    is scoped to the exact directory being inspected — never the global `*`
+ *    wildcard — and is passed per-invocation on the command line, so nothing is
+ *    written to any git config file. A linked worktree resolves its ownership
+ *    from the worktree directory, so scoping to `dir` covers both shapes
+ *    (verified against a cross-uid `git worktree add`).
+ * 2. **Config-driven execution.** Bypassing the ownership check means git will
+ *    now read `<dir>/.git/config`, which the agent can write. `core.fsmonitor`
+ *    is a shell command git runs on `status`, so an ownership bypass WITHOUT
+ *    this second half hands any agent arbitrary code execution as the (often
+ *    root) invoking user. `core.fsmonitor=false` and `core.hooksPath=/dev/null`
+ *    neuter both config-driven exec vectors; command-line `-c` beats repo
+ *    config, so the repo cannot override them. Never split these two flags from
+ *    the `safe.directory` exception.
+ */
+export function gitArgs(dir: string, ...rest: string[]): string[] {
+  return [
+    "-c", `safe.directory=${dir}`,
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null",
+    "-C", dir,
+    ...rest,
+  ];
+}
+
+/**
+ * One-line description of a failed `exec`, preferring the command's stderr.
+ *
+ * Callers use this to record WHY a git probe failed instead of silently folding
+ * the failure into a negative result. Pure, so the formatting is unit-testable.
+ */
+export function describeExecFailure(e: unknown): string {
+  const err = e as { stderr?: unknown; message?: unknown } | null;
+  const raw =
+    typeof err?.stderr === "string"
+      ? err.stderr
+      : err?.stderr && typeof (err.stderr as { toString?: () => string }).toString === "function"
+        ? String(err.stderr)
+        : "";
+  const stderr = raw.trim();
+  if (stderr) return stderr.split("\n")[0]!.trim();
+  const msg = typeof err?.message === "string" ? err.message.trim() : "";
+  return msg || "unknown error";
+}
+
+/**
+ * Run a command and return stdout.
+ *
+ * stderr is CAPTURED, not discarded. The previous `stdio[2] = "ignore"` meant a
+ * git failure (dubious ownership, a broken gitdir pointer, a corrupt repo) was
+ * indistinguishable from a clean negative answer at every call site — every
+ * probe failed silently and every unreadable tree was misfiled as "not a
+ * switchroom dir". Capturing it here is what lets `describeExecFailure` surface
+ * the real cause. It is captured rather than inherited so a sweep over dozens of
+ * trees does not spray git fatals across the operator's terminal.
+ *
+ * `maxBuffer` is raised off Node's 1 MB default because stdout and stderr now
+ * share that budget: `git ls-files -z` over a large checkout (~150 KB here, but
+ * unbounded for a repo that tracks vendored trees) plus a verbose fatal could
+ * blow it, and an ENOBUFS throw is indistinguishable from a real git failure.
+ * It would fail toward preservation, but for the wrong reason.
+ */
+export const execCapture = (file: string, args: string[], cwd?: string): string => {
+  try {
+    return execFileSync(file, args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    }).toString();
+  } catch (e) {
+    const err = e as Error & { stderr?: unknown };
+    const detail = describeExecFailure(err);
+    const wrapped = new Error(`${file} ${args.join(" ")}: ${detail}`) as Error & { stderr?: unknown };
+    wrapped.stderr = err?.stderr;
+    throw wrapped;
+  }
+};
 
 function defaultPrSignal(repo: string, branch: string, exec: GcDeps["exec"]): PrSignal {
   try {
@@ -420,7 +521,7 @@ function defaultNewestTrackedMtimeMs(
 ): number {
   let out: string;
   try {
-    out = exec("git", ["-C", dir, "ls-files", "-z"]);
+    out = exec("git", gitArgs(dir, "ls-files", "-z"));
   } catch {
     return Date.now();
   }
@@ -469,7 +570,7 @@ export function planGc(
   const readDir = deps.readDir ?? ((p: string) => readdirSync(p));
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, "utf8"));
   const stat = deps.stat ?? ((p: string) => statSync(p));
-  const exec = deps.exec ?? defaultExec;
+  const exec = deps.exec ?? execCapture;
   const prSignal = deps.prSignal ?? ((repo: string, branch: string) => defaultPrSignal(repo, branch, exec));
   const stamp = deps.dateStamp ?? "undated";
   const trash = join(trashRoot(), stamp);
@@ -487,25 +588,28 @@ export function planGc(
     claimed = new Set();
   }
 
-  // Cache: repoRoot → is a validated switchroom repo?
-  const validatedRepo = new Map<string, boolean>();
-  const isSwitchroomRepo = (repoRoot: string): boolean => {
-    if (validatedRepo.has(repoRoot)) return validatedRepo.get(repoRoot)!;
-    let ok = false;
+  // Cache: repoRoot → validated switchroom repo, foreign repo, or unreadable.
+  // `probe-failed` is deliberately NOT cached as "foreign": it is an absence of
+  // information, and it must stay distinguishable downstream.
+  type RepoProbe = { ok: boolean; error: string | null };
+  const validatedRepo = new Map<string, RepoProbe>();
+  const probeSwitchroomRepo = (repoRoot: string): RepoProbe => {
+    const hit = validatedRepo.get(repoRoot);
+    if (hit) return hit;
+    let res: RepoProbe;
     try {
-      if (exists(repoRoot)) {
-        const url = exec("git", ["-C", repoRoot, "remote", "get-url", "origin"]);
-        ok = isSwitchroomRemote(url);
-      }
-    } catch {
-      ok = false;
+      res = exists(repoRoot)
+        ? { ok: isSwitchroomRemote(exec("git", gitArgs(repoRoot, "remote", "get-url", "origin"))), error: null }
+        : { ok: false, error: null };
+    } catch (e) {
+      res = { ok: false, error: describeExecFailure(e) };
     }
-    validatedRepo.set(repoRoot, ok);
-    return ok;
+    validatedRepo.set(repoRoot, res);
+    return res;
   };
 
   const orphans: OrphanAction[] = [];
-  const skipped: { dir: string; reason: string }[] = [];
+  const skipped: SkippedDir[] = [];
   const ownerRepos = new Set<string>(); // validated repos discovered via orphans
 
   // ── Phase A: orphan attribution + quarantine plan ──
@@ -539,8 +643,23 @@ export function planGc(
       if (!ptr) continue;
       const repoRoot = repoRootFromWorktreeGitdir(ptr);
       if (!repoRoot) continue;
-      if (!isSwitchroomRepo(repoRoot)) {
-        skipped.push({ dir, reason: `gitdir points outside a switchroom repo (${repoRoot})` });
+      const probe = probeSwitchroomRepo(repoRoot);
+      if (probe.error) {
+        // git never answered — we know NOTHING about this dir. Keep it, and say
+        // why, loudly enough that the operator can act on the real cause.
+        skipped.push({
+          dir,
+          reason: `owner repo probe failed, kept (${repoRoot}): ${probe.error}`,
+          kind: "probe-failed",
+        });
+        continue;
+      }
+      if (!probe.ok) {
+        skipped.push({
+          dir,
+          reason: `gitdir points outside a switchroom repo (${repoRoot})`,
+          kind: "not-ours",
+        });
         continue;
       }
       ownerRepos.add(repoRoot);
@@ -557,7 +676,7 @@ export function planGc(
   for (const repo of ownerRepos) {
     let porcelain = "";
     try {
-      porcelain = exec("git", ["-C", repo, "worktree", "list", "--porcelain"]);
+      porcelain = exec("git", gitArgs(repo, "worktree", "list", "--porcelain"));
     } catch {
       continue;
     }
@@ -574,7 +693,7 @@ export function planGc(
         sig = prSignal(repo, wt.branch);
         if (sig === "merged") {
           try {
-            const status = exec("git", ["-C", wt.path, "status", "--porcelain"]);
+            const status = exec("git", gitArgs(wt.path, "status", "--porcelain"));
             clean = isEffectivelyClean(status.split("\n"));
           } catch {
             clean = false;
@@ -621,14 +740,22 @@ export function planGc(
 
       // Safety gate: only ever touch a checkout of the canonical switchroom
       // repo. `git -C <dir> remote get-url origin` works for worktree AND clone.
+      // A FAILED probe is not a negative answer. Both keep the tree, but only
+      // the negative answer means "we looked and it isn't ours"; the failure
+      // means the tree is unreadable and needs the operator's attention.
       let remoteOk = false;
+      let remoteError: string | null = null;
       try {
-        remoteOk = isSwitchroomRemote(exec("git", ["-C", dir, "remote", "get-url", "origin"]));
-      } catch {
-        remoteOk = false;
+        remoteOk = isSwitchroomRemote(exec("git", gitArgs(dir, "remote", "get-url", "origin")));
+      } catch (e) {
+        remoteError = describeExecFailure(e);
+      }
+      if (remoteError) {
+        skipped.push({ dir, reason: `git probe failed, kept: ${remoteError}`, kind: "probe-failed" });
+        continue;
       }
       if (!remoteOk) {
-        skipped.push({ dir, reason: "not a switchroom task tree" });
+        skipped.push({ dir, reason: "not a switchroom task tree", kind: "not-ours" });
         continue;
       }
 
@@ -647,7 +774,7 @@ export function planGc(
       let branch: string | null = null;
       let detached = false;
       try {
-        const b = exec("git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"]).trim();
+        const b = exec("git", gitArgs(dir, "rev-parse", "--abbrev-ref", "HEAD")).trim();
         if (b === "HEAD") detached = true;
         else branch = b;
       } catch {
@@ -662,7 +789,7 @@ export function planGc(
       // Effective cleanliness (build noise tolerated; anything else ⇒ dirty).
       let clean = false;
       try {
-        clean = isEffectivelyClean(exec("git", ["-C", dir, "status", "--porcelain"]).split("\n"));
+        clean = isEffectivelyClean(exec("git", gitArgs(dir, "status", "--porcelain")).split("\n"));
       } catch {
         clean = false; // can't inspect ⇒ assume dirty ⇒ keep
       }
@@ -673,14 +800,14 @@ export function planGc(
       if (!detached) {
         try {
           upstream =
-            exec("git", ["-C", dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).trim() ||
+            exec("git", gitArgs(dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")).trim() ||
             null;
         } catch {
           upstream = null;
         }
         if (upstream) {
           try {
-            aheadCount = parseInt(exec("git", ["-C", dir, "rev-list", "--count", "@{upstream}..HEAD"]).trim(), 10);
+            aheadCount = parseInt(exec("git", gitArgs(dir, "rev-list", "--count", "@{upstream}..HEAD")).trim(), 10);
             if (!Number.isFinite(aheadCount)) aheadCount = -1;
           } catch {
             aheadCount = -1; // count failed ⇒ error ⇒ keep
@@ -774,7 +901,7 @@ export interface ApplyDeps {
 
 /** Execute a plan. Mutates disk/git. Caller gates this behind --yes. */
 export function applyGc(plan: GcPlan, deps: ApplyDeps = {}): GcApplyResult {
-  const exec = deps.exec ?? defaultExec;
+  const exec = deps.exec ?? execCapture;
   const mkdirp = deps.mkdirp ?? ((p: string) => void mkdirSync(p, { recursive: true }));
   // Default move: `mv` handles cross-device (rename would EXDEV); fall back to
   // renameSync only if mv is unavailable.
@@ -826,11 +953,11 @@ export function applyGc(plan: GcPlan, deps: ApplyDeps = {}): GcApplyResult {
         res.removed.push(r.path);
         continue;
       }
-      exec("git", ["-C", r.repo, "worktree", "remove", "--force", r.path]);
+      exec("git", gitArgs(r.repo, "worktree", "remove", "--force", r.path));
       res.removed.push(r.path);
       if (r.branch) {
         try {
-          exec("git", ["-C", r.repo, "branch", "-D", r.branch]);
+          exec("git", gitArgs(r.repo, "branch", "-D", r.branch));
           res.branchesDeleted.push(r.branch);
         } catch {
           /* branch may already be gone; non-fatal */
@@ -843,7 +970,7 @@ export function applyGc(plan: GcPlan, deps: ApplyDeps = {}): GcApplyResult {
 
   for (const repo of plan.reposToPrune) {
     try {
-      exec("git", ["-C", repo, "worktree", "prune"]);
+      exec("git", gitArgs(repo, "worktree", "prune"));
       res.pruned.push(repo);
     } catch (e) {
       res.errors.push(`prune ${repo}: ${(e as Error).message}`);
