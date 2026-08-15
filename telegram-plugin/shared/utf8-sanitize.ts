@@ -58,6 +58,16 @@ export function hasLoneSurrogate(s: string): boolean {
 }
 
 /**
+ * How many unpaired surrogate code units `s` carries. Safe to call on the
+ * shared `/g` regex: `String.prototype.match` with a global pattern resets
+ * `lastIndex` to 0 itself before it collects, so this cannot leak state into
+ * `hasLoneSurrogate`.
+ */
+function countLoneSurrogates(s: string): number {
+  return (s.match(LONE_SURROGATE) ?? []).length
+}
+
+/**
  * Replace every unpaired surrogate in `s` with U+FFFD. Returns the SAME
  * string instance when there is nothing to repair, so callers can use
  * identity to detect a no-op. Idempotent: U+FFFD is not a surrogate.
@@ -85,21 +95,32 @@ function isWalkable(v: unknown): v is Record<string, unknown> | unknown[] {
  * against a pathological or cyclic input, never reached in practice. */
 const MAX_DEPTH = 16
 
+/** Mutable tally threaded through the walk so the caller can log HOW MANY
+ * code units were repaired without ever seeing the content itself. */
+export interface SanitizeStats {
+  /** Total unpaired surrogate code units replaced with U+FFFD. */
+  repaired: number
+}
+
 /**
  * Deep-sanitise every string in `value`, CLONE-ON-WRITE: the input is never
  * mutated, and the exact same instance is returned when nothing changed (so
  * the common case allocates nothing).
+ *
+ * Pass `stats` to collect the repair count.
  */
-export function sanitizePayloadStrings<T>(value: T, depth = 0): T {
+export function sanitizePayloadStrings<T>(value: T, depth = 0, stats?: SanitizeStats): T {
   if (typeof value === 'string') {
-    return sanitizeLoneSurrogates(value) as unknown as T
+    const next = sanitizeLoneSurrogates(value)
+    if (stats && next !== value) stats.repaired += countLoneSurrogates(value)
+    return next as unknown as T
   }
   if (depth >= MAX_DEPTH || !isWalkable(value)) return value
 
   if (Array.isArray(value)) {
     let changed = false
     const out = value.map(item => {
-      const next = sanitizePayloadStrings(item, depth + 1)
+      const next = sanitizePayloadStrings(item, depth + 1, stats)
       if (next !== item) changed = true
       return next
     })
@@ -109,11 +130,41 @@ export function sanitizePayloadStrings<T>(value: T, depth = 0): T {
   let changed = false
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value)) {
-    const next = sanitizePayloadStrings(v, depth + 1)
+    const next = sanitizePayloadStrings(v, depth + 1, stats)
     if (next !== v) changed = true
-    out[k] = next
+    // `out[k] = next` would REASSIGN the clone's prototype for the single key
+    // `__proto__` (the `Object.prototype` accessor), silently dropping an own
+    // `__proto__` key from the payload. defineProperty always makes an own
+    // data property, for that key like any other.
+    Object.defineProperty(out, k, {
+      value: next,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
   }
   return (changed ? out : value) as unknown as T
+}
+
+/** One log line per method per minute. The draft-stream `editMessageText`
+ * path edits the same card many times a second, so an upstream that is
+ * PERSISTENTLY corrupt would otherwise emit a line per edit and drown the
+ * gateway log in the exact situation you most need to read it. */
+const LOG_THROTTLE_MS = 60_000
+const lastLoggedAtByMethod = new Map<string, number>()
+
+/** Test seam: drop the throttle state so a suite can observe the first line
+ * of a fresh window. Not used in production. */
+export function __resetUtf8SanitizeLogThrottle(): void {
+  lastLoggedAtByMethod.clear()
+}
+
+/** True when this method may log now; records the emission when it may. */
+function shouldLogRepair(method: string, now: number): boolean {
+  const last = lastLoggedAtByMethod.get(method)
+  if (last !== undefined && now - last < LOG_THROTTLE_MS) return false
+  lastLoggedAtByMethod.set(method, now)
+  return true
 }
 
 /**
@@ -126,17 +177,33 @@ export function sanitizePayloadStrings<T>(value: T, depth = 0): T {
  * serialised and POSTed. Anything installed after this one can therefore not
  * reintroduce a lone surrogate behind its back.
  *
- * A repair is logged (method + count only — never the body, which may carry
- * operator content) so a corrupt upstream producer stays diagnosable instead
- * of being silently papered over.
+ * A repair is logged with the method and the repaired code-unit COUNT — never
+ * the body, which may carry operator content — so a corrupt upstream producer
+ * stays diagnosable instead of being silently papered over. The line is
+ * throttled to once per method per minute.
+ *
+ * The sanitise call FAILS OPEN. It runs on the innermost hop of every single
+ * `bot.api.*` call, and its object walk reads own enumerable properties —
+ * which invokes getters. A throwing getter, or any future bug in the walk,
+ * would otherwise propagate out of every outbound call and wedge the whole
+ * gateway. Sending the original payload is never worse than throwing: the
+ * worst case is the pre-#4728 behaviour (Telegram 400s that one send), while
+ * throwing here breaks sends that had nothing wrong with them.
  */
 export function installUtf8Sanitizer(bot: Bot): void {
   bot.api.config.use(async (prev, method, payload, signal) => {
-    const clean = sanitizePayloadStrings(payload)
-    if (clean !== payload) {
+    let clean = payload
+    const stats: SanitizeStats = { repaired: 0 }
+    try {
+      clean = sanitizePayloadStrings(payload, 0, stats)
+    } catch {
+      clean = payload
+    }
+    if (clean !== payload && shouldLogRepair(method, Date.now())) {
       process.stderr.write(
-        `telegram gateway: utf8-sanitize repaired lone surrogate(s) method=${method} ` +
-        `— body would have been rejected by Telegram (400 "strings must be encoded in UTF-8")\n`,
+        `telegram gateway: utf8-sanitize repaired ${stats.repaired} lone surrogate(s) ` +
+        `method=${method} — body would have been rejected by Telegram ` +
+        `(400 "strings must be encoded in UTF-8")\n`,
       )
     }
     return prev(method, clean, signal)

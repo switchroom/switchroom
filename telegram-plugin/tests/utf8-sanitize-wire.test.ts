@@ -17,7 +17,7 @@
  * `initGatewayBot`) and every `(a)`-`(d)` case below goes RED with the
  * production GrammyError, because the send REJECTS instead of delivering.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
@@ -28,6 +28,7 @@ import {
   sanitizeLoneSurrogates,
   sanitizePayloadStrings,
   hasLoneSurrogate,
+  __resetUtf8SanitizeLogThrottle,
 } from '../shared/utf8-sanitize.js'
 
 /** An unpaired HIGH surrogate — no valid UTF-8 encoding exists for it. */
@@ -208,6 +209,53 @@ describe('UTF-8 sanitiser — the dropped approval card (#4728)', () => {
     const payload = { chat_id: 1, text: 'clean' }
     expect(sanitizePayloadStrings(payload)).toBe(payload)
   })
+
+  it('(g) a payload whose own enumerable getter THROWS still sends — the sanitiser fails open', async () => {
+    // The walk reads own enumerable properties, which invokes getters. This
+    // transformer sits on the innermost hop of EVERY `bot.api.*` call, so an
+    // exception escaping it would wedge the whole gateway, not one send.
+    //
+    // Ordering here is deliberately inverted relative to production (the
+    // recorder is installed first, so it is INNERMOST and answers without
+    // serialising) purely to isolate what the sanitiser hands downstream.
+    // Production ordering is pinned by the boot-wiring describe below.
+    const seen: unknown[] = []
+    const bot = new Bot('123456:TEST_TOKEN', {
+      botInfo: {
+        id: 123456, is_bot: true, first_name: 'Test', username: 'test_bot',
+        can_join_groups: false, can_read_all_group_messages: false,
+        supports_inline_queries: false, can_connect_to_business: false,
+        has_main_web_app: false,
+      },
+    })
+    bot.api.config.use(async (_prev, _method, payload) => {
+      seen.push(payload)
+      return {
+        ok: true,
+        result: { message_id: 7, date: 0, chat: { id: 1, type: 'private' } },
+      } as never
+    })
+    installUtf8Sanitizer(bot)
+
+    const payload: Record<string, unknown> = { chat_id: 1 }
+    Object.defineProperty(payload, 'text', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error('getter exploded')
+      },
+    })
+
+    // Load-bearing: without the guard in `installUtf8Sanitizer` this is the
+    // exception that would escape into every outbound call.
+    expect(() => sanitizePayloadStrings(payload)).toThrow('getter exploded')
+
+    const sent = await bot.api.raw.sendMessage(payload as never)
+    expect(sent.message_id).toBe(7)
+    // Failed open: the ORIGINAL payload was passed through, not swallowed.
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toBe(payload)
+  })
 })
 
 describe('sanitizeLoneSurrogates / sanitizePayloadStrings — unit contract', () => {
@@ -261,6 +309,86 @@ describe('sanitizeLoneSurrogates / sanitizePayloadStrings — unit contract', ()
     expect(sanitizePayloadStrings(undefined)).toBe(undefined)
     expect(sanitizePayloadStrings(null)).toBe(null)
   })
+
+  it('keeps an own `__proto__` key as an own property of the clone', () => {
+    // `out['__proto__'] = v` hits the Object.prototype accessor and reassigns
+    // the clone's PROTOTYPE instead of creating an own property — the key
+    // would vanish from the payload entirely.
+    const payload: Record<string, unknown> = { chat_id: 1, text: `hi${LONE_HIGH}` }
+    Object.defineProperty(payload, '__proto__', {
+      value: `p${LONE_LOW}`,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
+    const out = sanitizePayloadStrings(payload)
+    expect(Object.prototype.hasOwnProperty.call(out, '__proto__')).toBe(true)
+    expect(Object.getOwnPropertyDescriptor(out, '__proto__')?.value).toBe('p�')
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype)
+    // And it survives serialisation, which is the only thing the wire sees.
+    expect(JSON.stringify(out)).toContain('"__proto__":"p�"')
+    expect(out.text).toBe('hi�')
+  })
+})
+
+describe('repair logging: real count, throttled per method', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  function captureSanitizeLog(): string[] {
+    const lines: string[] = []
+    vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+      const s = String(chunk)
+      if (s.includes('utf8-sanitize')) lines.push(s)
+      return true
+    }) as never)
+    return lines
+  }
+
+  it('reports how many code units were repaired, and logs once per method per minute', async () => {
+    __resetUtf8SanitizeLogThrottle()
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-08-15T00:00:00Z'))
+    const lines = captureSanitizeLog()
+    const { bot } = makeTelegramLikeBot()
+
+    // Two lone surrogates in one body: a high with no follower, a low with no
+    // leader. The docblock promises a count, so the line must carry one.
+    await bot.api.sendMessage(1, `a${LONE_HIGH}b${LONE_LOW}`)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toContain('repaired 2 lone surrogate(s)')
+    expect(lines[0]).toContain('method=sendMessage')
+    // Never the content itself.
+    expect(lines[0]).not.toContain('a�b')
+
+    // Same method inside the window — a persistently corrupt draft stream must
+    // not emit one line per edit.
+    await bot.api.sendMessage(1, `c${LONE_HIGH}`)
+    await bot.api.sendMessage(1, `d${LONE_HIGH}`)
+    expect(lines).toHaveLength(1)
+
+    // A different method has its own budget.
+    await bot.api.editMessageText(1, 1, `e${LONE_HIGH}`)
+    expect(lines).toHaveLength(2)
+    expect(lines[1]).toContain('method=editMessageText')
+    expect(lines[1]).toContain('repaired 1 lone surrogate(s)')
+
+    // Next window: the corruption is still diagnosable.
+    vi.setSystemTime(new Date('2026-08-15T00:01:01Z'))
+    await bot.api.sendMessage(1, `f${LONE_HIGH}`)
+    expect(lines).toHaveLength(3)
+    expect(lines[2]).toContain('method=sendMessage')
+  })
+
+  it('logs nothing for a clean body', async () => {
+    __resetUtf8SanitizeLogThrottle()
+    const lines = captureSanitizeLog()
+    const { bot } = makeTelegramLikeBot()
+    await bot.api.sendMessage(1, `all good ${ASTRAL}`)
+    expect(lines).toHaveLength(0)
+  })
 })
 
 describe('boot wiring: the sanitiser is the INNERMOST transformer', () => {
@@ -272,6 +400,13 @@ describe('boot wiring: the sanitiser is the INNERMOST transformer', () => {
   it('installs it exactly once', () => {
     const hits = src.match(/installUtf8Sanitizer\(bot\)/g) ?? []
     expect(hits.length).toBe(1)
+  })
+
+  it('there is exactly ONE bot instance for that single install to cover', () => {
+    // The ordering assertion below is textual. A second `new Bot(` in
+    // gateway.ts would get no sanitiser at all while every test here stayed
+    // green, so pin the instance count too.
+    expect((src.match(/new Bot\(/g) ?? []).length).toBe(1)
   })
 
   it('installs it BEFORE every other transformer, so it composes innermost', () => {
