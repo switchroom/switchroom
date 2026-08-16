@@ -562,6 +562,124 @@ export function isReflectToolCallFailure(
   return texts.some((t) => t.includes(REFLECT_NO_TOOL_CALL_SIGNATURE));
 }
 
+// ─── Reflect cardinality guard (RFC P9) ────────────────────────────────────
+
+/**
+ * The explicit "no relevant memories" answer the shim substitutes for a
+ * `reflect` synthesis when the engine's returned evidence set is genuinely
+ * empty.
+ *
+ * WHY A SUBSTITUTION AND NOT A PASS-THROUGH: hindsight's reflect agent always
+ * emits SOME prose. On an empty retrieval that prose is a fluent-but-sourceless
+ * answer — the model narrating around nothing — which reads to the calling
+ * agent as a real recalled fact and is exactly the false-positive that defeats
+ * an abstention signal (RFC J2/J7). Replacing it with a flat, machine-legible
+ * absence is the whole point: downstream can branch on "the bank had nothing"
+ * instead of parsing confidence out of prose.
+ *
+ * `isError` is deliberately false on the substituted result — an empty bank is
+ * a valid answer, not a tool failure, and flagging it isError would make the
+ * agent retry a query that will keep returning empty.
+ */
+export const REFLECT_EMPTY_EVIDENCE_TEXT =
+  "No relevant memories: reflect retrieved ZERO evidence from your memory " +
+  "bank for this query — no memories, mental models, or directives matched. " +
+  "This is not an error and not a synthesized answer: the bank has nothing " +
+  "recorded on this topic. Treat it as an explicit absence, not a fact, and " +
+  "do not present the (suppressed) synthesized prose as if it were recalled.";
+
+/**
+ * Total cardinality of a reflect `based_on` evidence map.
+ *
+ * Tolerant of every shape the field takes: the MCP tool result buckets by
+ * fact_type (`world`/`experience`/`opinion`/`observation`, plus `mental-models`
+ * / `directives` when present); the REST model buckets as
+ * `memories`/`mental_models`/`directives`. Both are just an object whose values
+ * are arrays, so summing array lengths over ALL values counts every piece of
+ * evidence regardless of which spelling the pinned engine uses. A non-array
+ * value contributes nothing. Returns `null` when `based_on` is absent or is not
+ * an object — the caller reads that as "could not determine" and never
+ * abstains, which is the false-abstention-safe direction.
+ */
+export function reflectEvidenceCardinality(basedOn: unknown): number | null {
+  if (!basedOn || typeof basedOn !== "object" || Array.isArray(basedOn)) {
+    return null;
+  }
+  let total = 0;
+  for (const v of Object.values(basedOn as Record<string, unknown>)) {
+    if (Array.isArray(v)) total += v.length;
+  }
+  return total;
+}
+
+/**
+ * Post-process a forwarded `reflect` tool result: abstain explicitly when the
+ * engine's returned evidence set is genuinely empty, and strip the evidence set
+ * back out when the shim injected `include_based_on` the caller did not ask for.
+ *
+ * The gate keys off the REAL returned evidence cardinality (`based_on`), NEVER a
+ * heuristic over the synthesized prose. So it fires ONLY when retrieval was
+ * genuinely empty and can never false-abstain on a query the engine actually
+ * had evidence for — the one risk RFC P9 calls out. Whenever the evidence set
+ * cannot be seen (no `based_on`, content not the expected JSON, unexpected
+ * shape), the result is returned UNCHANGED: the safe direction is always "keep
+ * the synthesized answer", never "abstain on a doubt".
+ *
+ * `callerWantedBasedOn` records whether the original tool call asked for the
+ * evidence. The shim forces `include_based_on: true` on the forwarded request so
+ * this gate always has ground truth to read; when the caller did not ask for it
+ * and retrieval was non-empty, the injected `based_on` is removed so the
+ * caller-visible payload is byte-for-byte what it would have been without the
+ * guard. The ONLY observable behaviour change is the empty-retrieval abstention.
+ */
+export function applyReflectCardinalityGuard(
+  result: unknown,
+  callerWantedBasedOn: boolean,
+): unknown {
+  const abstain = {
+    content: [{ type: "text", text: REFLECT_EMPTY_EVIDENCE_TEXT }],
+    isError: false,
+  };
+  if (!result || typeof result !== "object") return result;
+  const res = result as {
+    content?: Array<{ type?: unknown; text?: unknown }>;
+    isError?: unknown;
+  };
+  if (res.isError) return result; // an error result carries no evidence set
+  const content = res.content;
+  if (!Array.isArray(content) || content.length === 0) return result;
+  const first = content[0];
+  if (!first || typeof first.text !== "string") return result;
+  let payload: unknown;
+  try {
+    payload = JSON.parse(first.text);
+  } catch {
+    return result; // not the JSON envelope — leave it exactly as-is
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return result;
+  }
+  const obj = payload as Record<string, unknown>;
+  if (!("based_on" in obj)) return result; // evidence not visible → never abstain
+  const cardinality = reflectEvidenceCardinality(obj.based_on);
+  if (cardinality === null) return result;
+  if (cardinality === 0) return abstain;
+  if (callerWantedBasedOn) return result; // caller asked for it — keep it
+  // Non-empty, but the caller never requested the evidence set; the shim only
+  // injected include_based_on to run this gate. Strip it back out so the
+  // caller-visible payload matches the pre-guard behaviour, preserving every
+  // other field and content entry. 2-space indent mirrors the engine's own
+  // rendering of this envelope.
+  delete obj.based_on;
+  return {
+    ...res,
+    content: [
+      { ...first, text: JSON.stringify(obj, null, 2) },
+      ...content.slice(1),
+    ],
+  };
+}
+
 /**
  * Mask secrets in the string leaves of a tool-call argument object.
  *
@@ -870,6 +988,18 @@ export function guardAndClampToolCall(
               env.HINDSIGHT_SHIM_REFLECT_BUDGET,
               DEFAULT_REFLECT_BUDGET,
             );
+    }
+    // RFC P9: force the reflect evidence set on so the cardinality guard in
+    // toolsCall() has GROUND TRUTH (the real returned evidence) to read rather
+    // than a heuristic over the synthesized prose. Only when the caller omits
+    // it — an explicit include_based_on (true OR false) is the caller's call
+    // and wins, exactly like budget/max_tokens above. When the caller leaves
+    // it false the guard simply cannot see the evidence and never abstains,
+    // which is the false-abstention-safe direction. The injected field is
+    // stripped back out post-response unless the caller asked for it, so this
+    // never bloats the caller-visible payload (see applyReflectCardinalityGuard).
+    if (name === "reflect" && injected.include_based_on === undefined) {
+      injected.include_based_on = true;
     }
     return { ok: true, params: { ...called, arguments: injected } };
   }
@@ -1582,6 +1712,16 @@ export class HindsightShim {
     // READ_ONLY_TOOL_NAMES — the allowlist is the reads, not the writes).
     const forwarded = redactToolCallParams(guarded.params);
     const toolName = (guarded.params as { name?: string } | undefined)?.name;
+    // Whether the ORIGINAL call asked for the evidence set — read from the
+    // caller's params, before guardAndClampToolCall forced include_based_on on
+    // (RFC P9). Drives whether the injected evidence is stripped back out of a
+    // non-empty result.
+    const callerWantedBasedOn =
+      toolName === "reflect" &&
+      Boolean(
+        (called?.arguments as { include_based_on?: unknown } | undefined)
+          ?.include_based_on,
+      );
     const timeoutMs = this.opts.toolsCallTimeoutMs ?? TOOLS_CALL_TIMEOUT_MS;
     try {
       let res = await this.upstream.request("tools/call", forwarded, timeoutMs);
@@ -1612,6 +1752,14 @@ export class HindsightShim {
           ],
           isError: true,
         };
+      }
+      // RFC P9 reflect cardinality guard: substitute an explicit "no relevant
+      // memories" answer when the engine's returned evidence set is genuinely
+      // empty, and strip the shim-injected evidence back out otherwise. A
+      // no-op for every non-reflect tool and for reflect results whose evidence
+      // set cannot be read.
+      if (toolName === "reflect") {
+        return applyReflectCardinalityGuard(res.result, callerWantedBasedOn);
       }
       return res.result;
     } catch (err) {
