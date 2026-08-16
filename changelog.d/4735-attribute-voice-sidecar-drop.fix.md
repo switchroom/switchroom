@@ -1,0 +1,1 @@
+- **compose: a `voice-sidecar` removal caused by a defaulted (missing/unreadable/malformed) host-capabilities verdict is now attributed as a warning in the apply report, instead of appearing as a bare `services removed: voice-sidecar` line that reads as intent (#4735)**

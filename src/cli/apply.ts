@@ -76,7 +76,7 @@ import {
   resolveScratchConfig,
 } from "../agents/scratch.js";
 import { LITELLM_MASTER_KEY_STATE_BASENAME } from "../litellm/external-spend.js";
-import { writeComposeFile, computeComposeContent, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
+import { writeComposeFile, computeComposeContent, parseComposeServiceNames, resolveHostSwitchroomConfigPath, resolveHostHomeForCompose } from "./write-compose.js";
 import { getProfilePath } from "../agents/profiles.js";
 import { detectInstallType } from "./install-detect.js";
 import {
@@ -2284,25 +2284,13 @@ export async function probeVaultProvisioning(
   };
 }
 
-/** Parse the top-level service names out of a generated compose YAML. */
-export function parseComposeServiceNames(compose: string): string[] {
-  const lines = compose.split("\n");
-  const names: string[] = [];
-  let inServices = false;
-  for (const line of lines) {
-    if (/^services:\s*$/.test(line)) {
-      inServices = true;
-      continue;
-    }
-    // A new top-level key (column 0, non-space) ends the services block.
-    if (inServices && /^\S/.test(line)) break;
-    if (!inServices) continue;
-    // Service entries are keyed at exactly two-space indent: `  <name>:`.
-    const m = /^ {2}([A-Za-z0-9_.-]+):\s*$/.exec(line);
-    if (m) names.push(m[1]);
-  }
-  return names;
-}
+/**
+ * Parse the top-level service names out of a generated compose YAML.
+ *
+ * Re-exported from `write-compose.ts`, which needs the same parse to attribute
+ * a dropped `voice-sidecar` and cannot import from here (cycle).
+ */
+export { parseComposeServiceNames };
 
 export interface ApplyDryRunResult {
   /** Conditions that would make a real apply exit non-zero. */
@@ -2472,6 +2460,13 @@ export async function runApplyDryRun(
     }
     if (removedServices.length > 0) {
       info.push(`compose: services removed: ${removedServices.join(", ")}.`);
+    }
+    // An unattributed `services removed: voice-sidecar` reads as intent. When
+    // the removal is only a defaulted verdict, say so — and as a WARNING, not
+    // an info line, because the operator is about to delete a running service
+    // on evidence switchroom does not actually have.
+    if (computed.voiceSidecarDrop) {
+      warnings.push(`compose: ${computed.voiceSidecarDrop.message}`);
     }
     if (previousImageTag !== null && !composeChanged) {
       info.push(`compose: no change (would be byte-identical to the current file).`);

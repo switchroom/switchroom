@@ -87,7 +87,7 @@ import { isClaudeModel } from "../../telegram-plugin/gateway/model-command.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveTimezone } from "../config/timezone.js";
 import { getBundledSkillsPoolDir } from "./reconcile-default-skills.js";
-import { loadHostCapabilities } from "../setup/host-capabilities.js";
+import { resolveVoiceEngine } from "../setup/host-capabilities.js";
 import type { VoiceEngine } from "../setup/gpu-detect.js";
 import { AGENT_UID_MIN, AGENT_UID_MAX, allocateAgentUid } from "./agent-uid.js";
 import { GRANTS_DB_DIRNAME, GRANTS_DB_CONTAINER_DIR } from "../vault/grants-db-path.js";
@@ -526,7 +526,7 @@ export interface ComposeGeneratorOptions {
    * INJECTABLE so the compose-generator stays pure and the snapshot tests
    * can exercise BOTH branches without shelling out to real hardware. When
    * omitted, the generator reads the persisted verdict from
-   * `loadHostCapabilities()` (defaulting to `cloud` if no verdict file
+   * `resolveVoiceEngine()` (defaulting to `cloud` if no verdict file
    * exists yet), so production callers Just Work without threading it.
    */
   voiceEngine?: VoiceEngine;
@@ -1469,7 +1469,7 @@ export function generateCompose(opts: ComposeGeneratorOptions): string {
   // when no verdict file exists — fail-safe: never emit a GPU service on a
   // host we haven't confirmed has a usable GPU.
   const voiceEngine: VoiceEngine =
-    opts.voiceEngine ?? loadHostCapabilities()?.voice.engine ?? "cloud";
+    opts.voiceEngine ?? resolveVoiceEngine().engine;
 
   // Resolve the host's analytics distinct ID once per generator call. The
   // CLI persists this at ~/.switchroom/analytics-id (see
