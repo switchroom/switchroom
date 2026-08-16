@@ -508,7 +508,10 @@ const FUSE_SEND_DEFERRAL_RE =
  * below.
  *
  * Pinned to the structured `err=`/`code=` tokens, never the free-form `desc=`
- * text Telegram controls (#4730 review). Matching `Too Many Requests` or
+ * text Telegram controls (#4730 review) — and never MATCHED against `desc=`
+ * either: always go through `isFloodRejection`, which strips the description
+ * before testing. The pattern alone does not enforce that half (#4733 review).
+ * Matching `Too Many Requests` or
  * `retry after \d` anywhere on the line let a rejection self-certify on its
  * description: `desc=Bad Request: message text is empty, retry after 3 attempts`
  * is a 400 that granted itself ladder evidence for the whole 120s window. The
@@ -519,6 +522,30 @@ const FUSE_SEND_DEFERRAL_RE =
  * 2.23M log lines names a flood in `desc` without the 429 class.
  */
 const FLOOD_REJECTION_RE = /\berr=telegram_429\b|\bcode=429\b/;
+
+/**
+ * Does this `tg-post` line's own error CLASS say it is a flood rejection?
+ *
+ * The split is what makes `FLOOD_REJECTION_RE`'s docblock TRUE: pinning the
+ * pattern to the structured tokens buys nothing while the match runs against
+ * the whole line, because `desc=` is free-form text Telegram controls and it
+ * can contain the literal token. Telegram demonstrably echoes agent-authored
+ * content into it — the live shape is `desc=Bad Request: can't parse entities:
+ * Unsupported start tag "json" at byte offset 4` — so a reply whose own body
+ * carried `code=429` would hand its 400 rejection standing ladder evidence for
+ * the entire 120s window, and the next unrelated same-chat send would clear a
+ * genuinely lost reply (#4733 review).
+ *
+ * ` desc=` is a safe cut point in both directions: it is the LAST field the
+ * emitter writes (`… status=<s> err=<e> code=<c> desc=<free text>`), so every
+ * structured token sits before it, and all 850 live `status=err` `tg-post`
+ * lines carry `err=telegram_429 code=429` ahead of the description on a real
+ * flood — nothing legitimate is lost by ignoring the tail. A line with no
+ * ` desc=` at all is matched whole.
+ */
+function isFloodRejection(line: string): boolean {
+  return FLOOD_REJECTION_RE.test(line.split(" desc=")[0] ?? line);
+}
 
 /**
  * How long after a rejected rich send a MARKER-LESS landing can still be that
@@ -699,7 +726,7 @@ export function classifyReplyDeliveryEpisode(
   // Fact 3: a flood rejection names its own ladder, which re-issues on a later
   // tick — that is standing evidence for the whole window. Every other ladder
   // has to prove itself with a marker line or an immediate re-send.
-  let ladderEvidence = FLOOD_REJECTION_RE.test(failLine);
+  let ladderEvidence = isFloodRejection(failLine);
 
   for (let j = failIdx + 1; j < lines.length; j++) {
     const line = lines[j];
@@ -735,7 +762,7 @@ export function classifyReplyDeliveryEpisode(
       // 2026-08-11 12:40:19) logs two rejections before the fuse releases the
       // send. Evidence is only ever read off a non-landing line, so a landing
       // can never justify itself.
-      if (FLOOD_REJECTION_RE.test(line)) ladderEvidence = true;
+      if (isFloodRejection(line)) ladderEvidence = true;
       continue;
     }
     // The FIRST landing settles the episode: it clears the failure only with

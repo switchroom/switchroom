@@ -234,10 +234,12 @@ describe("honest route splits silent-no-op from flush-recovery", () => {
  * the attempt context is absent (`retry-api-call.ts:207`). Every recovery
  * ladder outside that policy — the THREAD_NOT_FOUND thread-drop the policy
  * hands OFF to the caller by design, the edit-flood-fuse deferral that
- * re-issues on a later tick, the backstop re-attempt, the queued-card re-send —
- * logged a send that DID deliver as terminal. On the live fleet 12 of 16
- * occurrences provably delivered, i.e. the operator was paged about replies
- * they had already read.
+ * re-issues on a later tick, the backstop re-attempt — logged a send that DID
+ * deliver as terminal. On the live fleet 6 of 16 occurrences provably
+ * delivered, i.e. the operator was paged about replies they had already read.
+ * (An earlier revision of this docblock listed a fourth ladder, the
+ * "queued-card re-send", and counted 12 — both were the pre-#4733 numbers,
+ * reached by accepting markers that were a clock rather than a fact.)
  *
  * These fixtures assert the OUTCOME (which signal the ledger books), not that a
  * branch ran. Every one of them fails on the pre-fix detector, which books
@@ -487,6 +489,42 @@ describe("#4730 — a recovered rich send is not a delivery failure", () => {
         `[2026-08-11T12:00:00.000Z] tg-post method=sendRichMessage chat=${GCHAT} thread=-` +
           " parse_mode=none bytes=0 hash=- status=err err=telegram_400 code=400" +
           " desc=Bad Request: reply text mentioned Too Many Requests",
+        post("12:01:40.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("THE ECHO FALSIFIER: a 400 whose desc CONTAINS `code=429` is not a flood", () => {
+      // #4733 review. Pinning the pattern to `err=`/`code=` is not enough on
+      // its own while the test runs against the WHOLE line: `desc=` is the
+      // last field and it is free-form text Telegram controls, and Telegram
+      // demonstrably echoes agent-authored content back into it (the live
+      // shape `desc=Bad Request: can't parse entities: Unsupported start tag
+      // "json" at byte offset 4`). A reply whose own body contained the
+      // literal `code=429` therefore handed its 400 rejection standing ladder
+      // evidence for the full 120s window, and the next unrelated same-chat
+      // send cleared a genuinely lost reply. The line is now split at
+      // ` desc=` before matching, so only the structured prefix can certify.
+      const s = signalsOf([
+        `[2026-08-11T12:00:00.000Z] tg-post method=sendRichMessage chat=${GCHAT} thread=-` +
+          " parse_mode=none bytes=0 hash=- status=err err=telegram_400 code=400" +
+          " desc=Bad Request: can't parse entities: code=429 marker",
+        post("12:01:40.000", "ok", "-"),
+      ]);
+      expect(s).toContain("reply-delivery-failure");
+      expect(s).not.toContain("reply-delivery-recovered");
+    });
+
+    it("THE ECHO FALSIFIER, second site: an INTERVENING attempt echoing `err=telegram_429`", () => {
+      // The same strip has to apply at the second test site: a further failed
+      // attempt inside the episode is read for evidence too, so an echoed
+      // flood token there would certify the episode just as effectively.
+      const s = signalsOf([
+        post("12:00:00.000", "err", "Bad Gateway"),
+        `[2026-08-11T12:00:05.000Z] tg-post method=sendRichMessage chat=${GCHAT} thread=-` +
+          " parse_mode=none bytes=0 hash=- status=err err=telegram_400 code=400" +
+          " desc=Bad Request: can't parse entities: err=telegram_429 marker",
         post("12:01:40.000", "ok", "-"),
       ]);
       expect(s).toContain("reply-delivery-failure");
