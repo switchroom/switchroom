@@ -522,6 +522,9 @@ if [ "${REINDEX_ENABLED}" = "1" ] && [ "${_vacuum_ran}" = "0" ] && mkdir -p "${B
       fi
 
       # Measure each candidate's avg_leaf_density; a freshly built btree is ~90.
+      # pgstatindex reads the whole index, so this costs one sequential pass per
+      # candidate — bounded by the >REINDEX_MIN_MB floor and the weekly interval,
+      # and it is the price of not rebuilding on a guess.
       _rix_tmpf="$(mktemp 2>/dev/null || echo "/tmp/hs-reindex.$$")"
       _rix_bloated="$(mktemp 2>/dev/null || echo "/tmp/hs-reindex-b.$$")"
       printf '%s\n' "${_rix_cands}" > "${_rix_tmpf}"
