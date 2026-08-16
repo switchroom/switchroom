@@ -34,6 +34,9 @@ import {
   isReflectToolCallFailure,
   REFLECT_TOOL_CALL_RETRIES,
   REFLECT_NO_TOOL_CALL_SIGNATURE,
+  REFLECT_EMPTY_EVIDENCE_TEXT,
+  reflectEvidenceCardinality,
+  applyReflectCardinalityGuard,
   type ShimOptions,
 } from "../src/cli/hindsight-mcp-shim.js";
 
@@ -1173,5 +1176,201 @@ describe("synthesized knowledge-page tools", () => {
       ).not.toContain("no dispatch arm");
       expect(result.content[0].text).toContain(`${name} failed:`);
     }
+  });
+});
+
+
+// ─── reflect cardinality guard (RFC P9) ───────────────────────────────────
+
+/**
+ * The engine's reflect tool result: a `content[0].text` JSON envelope of
+ * `{ text, based_on? }`, wrapped in the fastmcp meta the live backend adds.
+ * `basedOn === undefined` reproduces a reflect WITHOUT include_based_on
+ * (no evidence key at all).
+ */
+function reflectResult(
+  text: string,
+  basedOn?: Record<string, unknown[]>,
+): { result: unknown } {
+  const envelope =
+    basedOn === undefined ? { text } : { text, based_on: basedOn };
+  return {
+    result: {
+      _meta: { fastmcp: { wrap_result: true } },
+      content: [{ type: "text", text: JSON.stringify(envelope) }],
+      isError: false,
+    },
+  };
+}
+
+describe("reflectEvidenceCardinality (unit)", () => {
+  it("sums array lengths across every bucket, tolerant of shape", () => {
+    // MCP fact-type bucketing
+    expect(
+      reflectEvidenceCardinality({
+        world: [],
+        experience: [{}],
+        opinion: [],
+        observation: [{}, {}],
+      }),
+    ).toBe(3);
+    // REST memories/mental_models/directives bucketing
+    expect(
+      reflectEvidenceCardinality({
+        memories: [{}, {}],
+        mental_models: [{}],
+        directives: [],
+      }),
+    ).toBe(3);
+  });
+
+  it("is zero for an all-empty evidence map and for {}", () => {
+    expect(
+      reflectEvidenceCardinality({ world: [], observation: [] }),
+    ).toBe(0);
+    expect(reflectEvidenceCardinality({})).toBe(0);
+  });
+
+  it("returns null (undeterminable) for absent / non-object based_on", () => {
+    expect(reflectEvidenceCardinality(undefined)).toBeNull();
+    expect(reflectEvidenceCardinality(null)).toBeNull();
+    expect(reflectEvidenceCardinality([])).toBeNull();
+    expect(reflectEvidenceCardinality("x")).toBeNull();
+  });
+});
+
+describe("applyReflectCardinalityGuard (unit)", () => {
+  it("abstains ONLY when the evidence set is present and empty", () => {
+    const empty = reflectResult("fluent but sourceless", {
+      world: [],
+      observation: [],
+    }).result;
+    const out = applyReflectCardinalityGuard(empty, false) as {
+      content: { text: string }[];
+      isError: boolean;
+    };
+    expect(out.content[0].text).toBe(REFLECT_EMPTY_EVIDENCE_TEXT);
+    expect(out.isError).toBe(false);
+  });
+
+  it("passes through UNCHANGED when based_on is absent (never false-abstains)", () => {
+    const noEvidence = reflectResult("a real answer").result;
+    const out = applyReflectCardinalityGuard(noEvidence, false);
+    expect(out).toBe(noEvidence);
+  });
+
+  it("passes through UNCHANGED when content is not the JSON envelope", () => {
+    const plain = {
+      content: [{ type: "text", text: "not json" }],
+      isError: false,
+    };
+    expect(applyReflectCardinalityGuard(plain, false)).toBe(plain);
+  });
+
+  it("strips injected based_on on a non-empty result the caller did not ask for", () => {
+    const withEvidence = reflectResult("the answer is 42", {
+      observation: [{ id: "a" }, { id: "b" }],
+    }).result;
+    const out = applyReflectCardinalityGuard(withEvidence, false) as {
+      content: { text: string }[];
+    };
+    const parsed = JSON.parse(out.content[0].text) as Record<string, unknown>;
+    expect(parsed.text).toBe("the answer is 42");
+    expect(parsed.based_on).toBeUndefined();
+  });
+
+  it("keeps based_on on a non-empty result the caller DID ask for", () => {
+    const withEvidence = reflectResult("answer", {
+      observation: [{ id: "a" }],
+    }).result;
+    const out = applyReflectCardinalityGuard(withEvidence, true) as {
+      content: { text: string }[];
+    };
+    const parsed = JSON.parse(out.content[0].text) as Record<string, unknown>;
+    expect(parsed.based_on).toBeDefined();
+  });
+});
+
+describe("reflect cardinality guard through the live shim (RFC P9)", () => {
+  let backend: MockBackend;
+  afterEach(async () => {
+    await backend.close();
+  });
+
+  it("ABSTAINS on genuinely-empty retrieval, and forced include_based_on on the forwarded call", async () => {
+    backend = await startMockBackend({
+      onToolsCall: (_i, name) =>
+        name === "reflect"
+          ? reflectResult("The bank clearly says X — a made-up answer.", {
+              world: [],
+              experience: [],
+              opinion: [],
+              observation: [],
+            })
+          : undefined,
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", { name: "reflect", arguments: { query: "q" } }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    // The synthesized prose is SUPPRESSED and replaced with the explicit
+    // absence — this assertion fails if the guard is removed (the raw
+    // "made-up answer" text would come back instead).
+    expect(result.content[0].text).toBe(REFLECT_EMPTY_EVIDENCE_TEXT);
+    expect(result.isError).toBe(false);
+    // The shim forced the evidence set on so the gate had ground truth.
+    const call = backend.requests.find((r) => r.method === "tools/call");
+    const args = call?.params?.arguments as Record<string, unknown>;
+    expect(args.include_based_on).toBe(true);
+  });
+
+  it("does NOT abstain when evidence is present — the synthesized answer is preserved", async () => {
+    backend = await startMockBackend({
+      onToolsCall: (_i, name) =>
+        name === "reflect"
+          ? reflectResult("Ken prefers 8-turn cadence.", {
+              observation: [{ id: "f1" }, { id: "f2" }],
+            })
+          : undefined,
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", { name: "reflect", arguments: { query: "cadence" } }) as never,
+    );
+    const result = res?.result as { content: { text: string }[] };
+    const parsed = JSON.parse(result.content[0].text) as Record<string, unknown>;
+    // Real answer survives; the abstention text NEVER appears when the engine
+    // had evidence — this fails if the gate keys off prose instead of the
+    // returned cardinality.
+    expect(parsed.text).toBe("Ken prefers 8-turn cadence.");
+    expect(result.content[0].text).not.toContain(REFLECT_EMPTY_EVIDENCE_TEXT);
+    // Injected evidence stripped back out (caller did not request it).
+    expect(parsed.based_on).toBeUndefined();
+  });
+
+  it("preserves based_on when the CALLER explicitly requested include_based_on", async () => {
+    backend = await startMockBackend({
+      onToolsCall: (_i, name) =>
+        name === "reflect"
+          ? reflectResult("answer", { observation: [{ id: "f1" }] })
+          : undefined,
+    });
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", {
+        name: "reflect",
+        arguments: { query: "q", include_based_on: true },
+      }) as never,
+    );
+    const result = res?.result as { content: { text: string }[] };
+    const parsed = JSON.parse(result.content[0].text) as Record<string, unknown>;
+    expect(parsed.based_on).toBeDefined();
   });
 });
