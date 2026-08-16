@@ -633,7 +633,7 @@ recommended batch size, E-61). Hardening that rides along:
   guard reproduced as an ordering constraint rather than a new wait
   mechanism (§5 6a).
 
-### 2.5 The REST shim — ALREADY SHIPPED (rev 6 status change), version-pin still owed
+### 2.5 The REST shim — ALREADY SHIPPED (rev 6 status change), version pin implemented in #4739
 
 Rev 5 and earlier specified this as work to build. **It exists and is
 deployed** (E-73): every agent's `hindsight` MCP entry is
@@ -1353,8 +1353,8 @@ Non-token costs, stated: a second store (the rules block + mutation log —
 small, plain, user-readable; accepted because shimming lifecycle onto an
 engine surface with no provenance/no deactivate/no cap is more moving
 parts, E-09/E-29/E-30); the shim's two synthesized REST families — both
-already shipped and fixture-pinned, with the version pin still owed
-(E-73, §2.5); triage
+already shipped and fixture-pinned, with the version pin implemented in
+#4739 (open, E-73, §2.5); triage
 operator-work once per agent; pull-miss risk on turns where the agent
 should have reached and didn't (bounded by the index + guidance; accepted
 as an honest unknown at rev 7 — the quality evidence that used to cover
