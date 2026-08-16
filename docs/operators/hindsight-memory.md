@@ -792,8 +792,9 @@ house-style rule — it makes an explicit call that names the bank:
 
 ```
 mcp__hindsight__retain(
-  content="switchroom's vitest suite must run single-threaded — the shared "
-          "worker pool corrupts the tmpdir scaffold fixtures",
+  content="switchroom's vitest config must set assetsInclude to "
+          "['**/*.yaml'], or a .yaml imported with { type: 'text' } "
+          "fails to resolve under vitest",
   bank_id="switchroom-dev",
   tags=["repo:switchroom", "build"],
 )
@@ -803,8 +804,11 @@ mcp__hindsight__retain(
 (`src/cli/hindsight-mcp-shim.ts`), so no new write path is added — this reuses
 the surface that already exists. Only durable, repo-scoped facts belong here;
 conversation, user preferences, and anything about a person stay in the agent's
-own bank. Every shared write is tagged `repo:<name>` for findability. The read
-side is untouched — ordinary `recall` / `reflect` already reach the bank.
+own bank. Every shared write is tagged `repo:<name>` for findability. Writes are
+always durable and readable by the configured agents; on the read side, ordinary
+`recall` / `reflect` reach the shared bank only for agents that list it in
+`memory.recall.additional_banks` (a handful of dev agents) — for every other
+agent the shared write is write-only from their own recall.
 
 ### The boundary (config half)
 
