@@ -596,10 +596,13 @@ export const REFLECT_EMPTY_EVIDENCE_TEXT =
  * / `directives` when present); the REST model buckets as
  * `memories`/`mental_models`/`directives`. Both are just an object whose values
  * are arrays, so summing array lengths over ALL values counts every piece of
- * evidence regardless of which spelling the pinned engine uses. A non-array
- * value contributes nothing. Returns `null` when `based_on` is absent or is not
- * an object — the caller reads that as "could not determine" and never
- * abstains, which is the false-abstention-safe direction.
+ * evidence regardless of which spelling the pinned engine uses. If ANY bucket
+ * value is not an array the shape is unrecognised, so we return `null` rather
+ * than sum a partial count — a 0 there would be a FALSE abstention. Returns
+ * `null` when `based_on` is absent, is not an object, or has any non-array
+ * bucket — the caller reads that as "could not determine" and never abstains,
+ * which is the false-abstention-safe direction. Abstention (a 0) can only ever
+ * fire on a genuinely-empty, fully-array-shaped evidence set.
  */
 export function reflectEvidenceCardinality(basedOn: unknown): number | null {
   if (!basedOn || typeof basedOn !== "object" || Array.isArray(basedOn)) {
@@ -607,7 +610,8 @@ export function reflectEvidenceCardinality(basedOn: unknown): number | null {
   }
   let total = 0;
   for (const v of Object.values(basedOn as Record<string, unknown>)) {
-    if (Array.isArray(v)) total += v.length;
+    if (!Array.isArray(v)) return null; // any non-array bucket → shape unseen, never abstain
+    total += v.length;
   }
   return total;
 }

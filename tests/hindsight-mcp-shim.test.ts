@@ -1259,6 +1259,29 @@ describe("applyReflectCardinalityGuard (unit)", () => {
     expect(out).toBe(noEvidence);
   });
 
+  it("passes through UNCHANGED when a based_on bucket is not an array (never false-abstains)", () => {
+    // A malformed/unexpected engine shape: `based_on` is an object but a bucket
+    // holds a non-array value. reflectEvidenceCardinality must return null (not
+    // 0), so the guard leaves the synthesized answer intact — the false-
+    // abstention-safe direction that P9 exists to protect.
+    const envelope = { text: "a real, sourced answer", based_on: { world: 3 } };
+    const nonArrayBucket = {
+      _meta: { fastmcp: { wrap_result: true } },
+      content: [{ type: "text", text: JSON.stringify(envelope) }],
+      isError: false,
+    };
+    const out = applyReflectCardinalityGuard(nonArrayBucket, false);
+    // Reference identity: the exact same object flows through, untouched.
+    expect(out).toBe(nonArrayBucket);
+    // And the synthesized text is preserved, not replaced by the abstention.
+    expect(
+      (out as { content: { text: string }[] }).content[0].text,
+    ).toBe(nonArrayBucket.content[0].text);
+    expect(
+      (out as { content: { text: string }[] }).content[0].text,
+    ).not.toBe(REFLECT_EMPTY_EVIDENCE_TEXT);
+  });
+
   it("passes through UNCHANGED when content is not the JSON envelope", () => {
     const plain = {
       content: [{ type: "text", text: "not json" }],
