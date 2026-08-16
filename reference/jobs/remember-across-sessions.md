@@ -41,10 +41,13 @@ were (`design-v2.md` §2).
 
 > [!CAUTION]
 > A rule surface with no retirement is not memory, it is accumulation.
-> Measured across the live fleet: **194 active directives across 14 banks,
-> zero inactive anywhere — nothing has ever been retired, in any bank**
-> (E-42). "Set once and respected" and "retirable, and visibly so" are the
-> same requirement; a surface that only grows fails this job quietly.
+> Measured across the live fleet, all 15 banks, live read-only GETs:
+> **176 active directives across 15 banks, zero inactive anywhere —
+> nothing has ever been retired, in any bank** (E-98, superseding E-42's
+> 194-across-14 snapshot from the same pass — one bank was added between
+> the two counts). "Set once and respected" and "retirable, and visibly
+> so" are the same requirement; a surface that only grows fails this job
+> quietly.
 
 ## Good / bad
 

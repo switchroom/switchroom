@@ -656,10 +656,14 @@ widening page reach, the layer to change is the shim; no engine
 capability is missing. What this section
 still owes from the prior spec: the **engine version pin** from
 `/openapi.json` (E-01's method, prior review MAJOR-4) and a doctor
-contract probe against a throwaway bank — a grep of the shipped shim
-finds no `/openapi.json` reference, so the pin is **not built** and stays
-on the work list (its absence is what the snapshot-fixture test only
-partially covers: names/props, not response shapes). Everything
+contract probe against a throwaway bank. **Implemented in #4739**
+(open, `worker/hindsight-shim-version-pin`): `hindsight-shim-contract.ts`
+pins the route contract against a live `/openapi.json` fetch, wired
+into a new `doctor-hindsight-shim-contract.ts` check registered in
+`doctor.ts`, with fixture and preflight coverage
+(`tests/hindsight-shim-contract.test.ts`,
+`tests/doctor-hindsight-shim-contract.test.ts`,
+`tests/hindsight-mcp-shim-contract-preflight.test.ts`). Everything
 else in this design — correction, mental-model lifecycle, retain, recall,
 reflect — is on the engine MCP surface (E-59; over `POST /mcp` from hook
 contexts), so no shadow client exists beyond the shim's two synthesized
@@ -970,11 +974,14 @@ the two disqualifiers are independent, and both currently stand.
 2. **Directive-deactivate reach: DONE (rev 6, E-73)** — the shim ships
    `deactivate_directive`/`reactivate_directive` on every agent already.
    Remaining in this step: the engine **version pin + doctor contract
-   probe** (§2.5, not built), and the rules tool + mutation log, dark
+   probe** (§2.5, implemented in #4739, open), and the rules tool + mutation log, dark
    (blocks written but root `CLAUDE.md` not yet carrying them / old block
-   still live). Reversible: nothing consumes it yet. *(Ordered before the
-   template hoist so step 3's rollback mechanism — deactivation — exists
-   under the design's own discipline, review m-2.)*
+   still live). Reversible: nothing consumes it yet. *(Originally ordered
+   before the template hoist so step 3's rollback mechanism —
+   deactivation — would exist first, review m-2. Step 3 is REFUTED
+   (E-97): there is no template hoist left to roll back, so this
+   ordering rationale is vestigial and kept only as a record of the
+   original sequencing argument.)*
 3. **Bank template for fleet-common guardrails — REFUTED (this pass,
    E-97).** As specified, this step read: create canonical directives
    from a bank template (E-49), deactivate the 13 per-bank

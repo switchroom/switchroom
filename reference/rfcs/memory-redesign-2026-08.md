@@ -2933,7 +2933,7 @@ running 0.9.0 engine (`127.0.0.1:18888`), re-verified this pass:
 - `/v1/default/banks/{bank_id}/directives` — `get`, `post` only.
 - `/v1/default/banks/{bank_id}/directives/{directive_id}` — `get`,
   `patch`, `delete`.
-- No other path in the 70-path schema contains `template` or takes a
+- No other path in the 65-path (85-operation) schema contains `template` or takes a
   cross-bank directive argument. Directives are per-bank rows, full
   stop; there is no cross-bank shared-directive primitive anywhere in
   the deployed API.
@@ -2956,9 +2956,11 @@ own route table — that primitive doesn't extend to retrofitting live
 banks. The token saving this design counted from step 3 is only
 obtainable through shrinking or retiring directive content (step 4's
 triage), never through cross-bank deduplication. **Sites corrected on
-this entry:** design-v2.md §1 P5, §4.2, §5 step 3, §9's verdict check,
-the status frontmatter (rev 11 correction note); [E-49](#e-49) carries
-an inline correction pointing here. Checked 2026-08-16, live, read-only
+this entry:** design-v2.md §1 P5, §4.2, §5 step 2 (the ordering note at
+`:975-977` citing step 3's rollback mechanism, now vestigial), §5 step 3,
+§9's verdict check, the status frontmatter (rev 11 correction note);
+[E-49](#e-49) carries an inline correction pointing here. Checked
+2026-08-16, live, read-only
 GETs and one probing `POST` against `/v1/bank-template-schema` only (no
 bank state mutated).
 
@@ -3014,11 +3016,11 @@ bank state mutated).
 **C-01 — The job spec's acceptance criteria.**
 `reference/jobs/remember-across-sessions.md`, frontmatter:
 `job: remember across sessions without being re-told`; `serves: standing-team`;
-`invariants: [single-tenant]`. Load-bearing callout at `:24-25`:
+`invariants: [single-tenant]`. Load-bearing callout at `:31-32`:
 
 > Memory the user can't inspect is memory the user won't trust.
 
-"Bad — never ship" (`:46-60`) includes: raw transcript dumping; regurgitating
+"Bad — never ship" (`:141-157`) includes: raw transcript dumping; regurgitating
 old facts unprompted to prove it remembered; **silent forgetting with no way
 to tell**; memory the user cannot inspect/correct/delete; conflating
 topics/specialists into one pool; treating every memory as equally weighted.
