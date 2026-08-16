@@ -194,8 +194,10 @@ export class VaultBroker {
   /**
    * Stamp of the last vault file whose re-open FAILED (a torn/partial write
    * caught mid-flight, or a file re-encrypted under a different passphrase).
-   * Used only to hold the warning to one line per distinct bad file instead
-   * of one per get.
+   * Holds the warning to one line per distinct bad file instead of one per
+   * get, AND suppresses the re-open retry for that same file so a
+   * persistently unusable vault costs no scrypt derivation per read.
+   * Cleared on a successful load, on lock(), and after our own put save.
    */
   private failedVaultStamp: VaultStamp | null = null;
   private config: SwitchroomConfig | null = null;
