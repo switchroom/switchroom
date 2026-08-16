@@ -66,7 +66,12 @@
 #                   builds a full second copy), capped per tick, and never
 #                   run in the same tick as 8a — both take a
 #                   ShareUpdateExclusiveLock on the table and would
-#                   serialize.
+#                   serialize. Note the entrypoint calls this script
+#                   SYNCHRONOUSLY inside its refresh loop, so a long 8a/8b
+#                   pushes that tick's next credential refresh out by its
+#                   own duration — bounded by REINDEX_MAX_PER_RUN, and
+#                   harmless because the fetcher refreshes far ahead of
+#                   token expiry.
 #
 # Everything is best-effort: any failure (pg not up yet, missing creds,
 # psql absent) is logged and swallowed so a bad tick can never wedge the
@@ -532,17 +537,19 @@ if [ "${REINDEX_ENABLED}" = "1" ] && [ "${_vacuum_ran}" = "0" ] && mkdir -p "${B
       done < "${_rix_tmpf}"
       rm -f "${_rix_tmpf}" 2>/dev/null
 
-      _rix_total="$(grep -c . "${_rix_bloated}" 2>/dev/null || echo 0)"
+      _rix_total="$(grep -c . "${_rix_bloated}" 2>/dev/null || true)"
       if [ "${_rix_total:-0}" -gt 0 ] 2>/dev/null; then
         # Worst bloat (lowest density) first, capped per tick.
         _rix_pgdata="$(_sql "SHOW data_directory")"
         [ -n "${_rix_pgdata}" ] && [ -d "${_rix_pgdata}" ] || _rix_pgdata="$(dirname "${PG0_INSTANCE}")"
         sort -t'|' -k1,1n "${_rix_bloated}" | head -n "${REINDEX_MAX_PER_RUN}" > "${_rix_bloated}.pick"
         mv -f "${_rix_bloated}.pick" "${_rix_bloated}" 2>/dev/null
-        _rix_picked="$(grep -c . "${_rix_bloated}" 2>/dev/null || echo 0)"
+        _rix_picked="$(grep -c . "${_rix_bloated}" 2>/dev/null || true)"
         while IFS='|' read -r _dens _ix _ixbytes; do
           [ -n "${_ix}" ] || continue
           # Disk guard: CONCURRENTLY builds a full SECOND copy before swapping.
+          # An unreadable df (path gone) leaves _free_kb empty and the guard
+          # open — the same best-effort posture as the rest of the script.
           _free_kb="$(df -P "${_rix_pgdata}" 2>/dev/null | awk 'NR==2{print $4}')"
           _need_kb=$(( (${_ixbytes:-0} / 1024) * 2 ))
           if [ -n "${_free_kb}" ] && [ "${_free_kb}" -lt "${_need_kb}" ] 2>/dev/null; then
@@ -556,7 +563,7 @@ if [ "${REINDEX_ENABLED}" = "1" ] && [ "${_vacuum_ran}" = "0" ] && mkdir -p "${B
             log "WARNING: reindex: REINDEX INDEX CONCURRENTLY ${_ix} failed after $(( $(date +%s) - _rix_t0 ))s — continuing with the next candidate."
           fi
         done < "${_rix_bloated}"
-        _rix_skipped=$((_rix_total - _rix_picked))
+        _rix_skipped=$(( ${_rix_total:-0} - ${_rix_picked:-0} ))
         if [ "${_rix_skipped}" -gt 0 ] 2>/dev/null; then
           log "reindex: ${_rix_skipped} bloated index(es) left for the next sweep — capped at ${REINDEX_MAX_PER_RUN}/run (SWITCHROOM_HINDSIGHT_REINDEX_MAX_PER_RUN)."
         fi
