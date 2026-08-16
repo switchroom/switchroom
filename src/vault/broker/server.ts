@@ -54,6 +54,12 @@ import {
 } from "./protocol.js";
 import { createAuditLogger, callerFromPeer, type AuditLogger } from "./audit-log.js";
 import { safeVaultPath } from "./test-isolation-guard.js";
+import {
+  readVaultStamp,
+  refreshVaultIfChanged,
+  zeroSecrets,
+  type VaultStamp,
+} from "./vault-refresh.js";
 import { Database } from "bun:sqlite";
 import { mintGrant, validateGrant, validateGrantForWrite, revokeGrant, listGrants, migrateGrantsSchema } from "../grants.js";
 import { reapUnusableGrantToken } from "./reap-token-file.js";
@@ -141,17 +147,6 @@ export interface BrokerTestOpts {
    * DO NOT set outside tests.
    */
   _testAgentName?: string;
-}
-
-/**
- * Identity of the vault file on disk at the moment it was loaded. Compared
- * on every read to detect an out-of-band write (see
- * `VaultBroker._reloadSecretsIfVaultChanged`).
- */
-type VaultStamp = { mtimeNs: bigint; size: bigint; ino: bigint };
-
-function sameVaultStamp(a: VaultStamp, b: VaultStamp): boolean {
-  return a.mtimeNs === b.mtimeNs && a.size === b.size && a.ino === b.ino;
 }
 
 export class VaultBroker {
@@ -476,115 +471,37 @@ export class VaultBroker {
 
   /**
    * Stat the vault file and return its identity stamp, or null when it
-   * cannot be stat'd (deleted, unreadable, mid-rename). MUST NOT throw:
-   * every caller sits on a read path where a stat hiccup must not cost the
-   * fleet its vault access.
+   * cannot be stat'd. See `vault-refresh.ts`.
    */
   private _readVaultStamp(): VaultStamp | null {
-    try {
-      // bigint stats: `mtimeNs` keeps full filesystem timestamp precision.
-      // The float `mtimeMs` is millisecond-rounded, so two writes inside the
-      // same millisecond that also happen to produce equal-size ciphertext
-      // (a same-length value rotation) would be indistinguishable. `ino`
-      // catches it regardless — saveVault() writes tmp+rename, so a fresh
-      // write lands on a NEW inode.
-      const st = statSync(this.vaultPath, { bigint: true });
-      return { mtimeNs: st.mtimeNs, size: st.size, ino: st.ino };
-    } catch {
-      return null;
-    }
+    return readVaultStamp(this.vaultPath);
   }
 
   /**
    * Lazy reload — pick up an out-of-band vault write on the next read.
    *
-   * The broker decrypts once at unlock and serves every `get` from
-   * `this.secrets`. Before this existed nothing ever re-read the file, so an
-   * operator-side `switchroom vault set <key>` wrote `vault.enc` and EVERY
-   * agent kept serving the old value indefinitely — SIGHUP swapped config
-   * only and `docker compose up -d` left a Running broker untouched, so the
-   * sole recovery was `docker restart switchroom-vault-broker`. A write no
-   * reader can observe is the worst failure shape a secret store has.
+   * Called at the top of every op that reads `this.secrets` (get / list /
+   * put / preflight_access). The decision logic, and its regression test,
+   * live in `./vault-refresh.ts` — that module has no `bun:sqlite` import,
+   * so unlike this file it (and its test) run under vitest in CI.
    *
-   * Stat-on-access, no polling and no timers: `get`/`list` compare the
-   * file's (mtime, size, inode) against the stamp of the load in memory and re-open
-   * with the RETAINED passphrase only when it moved. Properties that make
-   * this safe on the hot path:
-   *
-   *  - No-op when locked (`secrets`/`passphrase` null) and when there is no
-   *    stamp to compare (seeded test state) — never re-prompts, never
-   *    unlocks a locked broker.
-   *  - A failed re-open (torn write, or the file re-encrypted under a
-   *    different passphrase) KEEPS the previously loaded secrets, warns
-   *    once, and remembers the bad stamp so every later read does NOT pay
-   *    another scrypt derivation against the same unusable file. The loaded
-   *    stamp is deliberately not advanced, so the moment the file changes
-   *    again — a completing tmp+rename lands a NEW inode and mtime — the
-   *    next read retries and the broker self-heals.
-   *  - The superseded entries are zeroed exactly as `lock()` does, so stale
-   *    plaintext is not left behind on swap.
+   * Stat-on-access, no polling and no timers; no-op when locked; a failed
+   * re-open keeps serving the previously loaded secrets. `force` is the
+   * SIGHUP belt-and-braces path.
    */
   private _reloadSecretsIfVaultChanged(force: boolean = false): void {
-    if (this.secrets === null || this.passphrase === null) return;
-    const known = this.vaultStamp;
-    if (known === null) return;
-
-    const current = this._readVaultStamp();
-    if (current === null) return; // unreadable right now — keep serving
-    if (!force && sameVaultStamp(current, known)) return;
-    // Already tried THIS exact file and it wouldn't open: don't burn a
-    // scrypt derivation per get against an unusable vault. Cleared as soon
-    // as the file changes again (or on a successful load / lock).
-    if (
-      !force &&
-      this.failedVaultStamp !== null &&
-      sameVaultStamp(this.failedVaultStamp, current)
-    ) {
-      return;
-    }
-
-    let next: Record<string, VaultEntry>;
-    try {
-      detectVaultLayoutDrift(this.vaultPath);
-      next = openVault(this.passphrase, this.vaultPath);
-    } catch (err: unknown) {
-      // Never log a secret value — only the path and the error message.
-      const alreadyWarned =
-        this.failedVaultStamp !== null &&
-        sameVaultStamp(this.failedVaultStamp, current);
-      this.failedVaultStamp = current;
-      if (!alreadyWarned) {
-        process.stderr.write(
-          `[vault-broker] WARNING: ${this.vaultPath} changed on disk but ` +
-          `could not be re-opened (${(err as Error)?.message ?? "unknown error"}) — ` +
-          `continuing to serve the previously loaded secrets; will retry when ` +
-          `the file changes again\n`,
-        );
-      }
-      return;
-    }
-
-    const previous = this.secrets;
-    this.secrets = next;
-    this.vaultStamp = current;
-    this.failedVaultStamp = null;
-    this._zeroSecrets(previous);
-  }
-
-  /**
-   * Best-effort overwrite of secret string values before they are dropped.
-   * Strings are immutable in JS — we can't zero the underlying bytes, so we
-   * blank the reference and rely on GC. Known limitation, documented in the
-   * security design notes; shared by lock() and the lazy reload swap.
-   */
-  private _zeroSecrets(secrets: Record<string, VaultEntry>): void {
-    for (const [, entry] of Object.entries(secrets)) {
-      try {
-        if (entry.kind === "string" || entry.kind === "binary") {
-          (entry as { value: string }).value = "";
-        }
-      } catch { /* best-effort */ }
-    }
+    const next = refreshVaultIfChanged(
+      {
+        secrets: this.secrets,
+        passphrase: this.passphrase,
+        loadedStamp: this.vaultStamp,
+        failedStamp: this.failedVaultStamp,
+      },
+      { vaultPath: this.vaultPath, force, beforeOpen: detectVaultLayoutDrift },
+    );
+    this.secrets = next.secrets;
+    this.vaultStamp = next.loadedStamp;
+    this.failedVaultStamp = next.failedStamp;
   }
 
   /**
@@ -655,8 +572,8 @@ export class VaultBroker {
    */
   lock(): void {
     if (this.secrets !== null) {
-      // Best-effort overwrite of string values before GC — see _zeroSecrets().
-      this._zeroSecrets(this.secrets);
+      // Best-effort overwrite of string values before GC — see zeroSecrets().
+      zeroSecrets(this.secrets);
       this.secrets = null;
     }
     // No disk-backed load to compare against any more: a locked broker must
