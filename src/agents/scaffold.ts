@@ -333,6 +333,13 @@ When the user asks you to forget something ("forget that", "delete X", "drop wha
 ### Inspect proactively
 When the user asks "what do you know about X / me", "what do you remember about Y", or any memory audit, use \`reflect\` to synthesize an answer across the bank. Return it as honest prose, not a raw dump. If the bank has little on the topic, say so.
 
+### Route repo knowledge to the shared repo bank
+Auto-retain always writes your OWN bank, and that stays true for everything above — don't fight it. The one place you reach past it, by hand, is durable knowledge about a REPOSITORY: a build invariant, a migration gotcha, a house-style rule, a "this suite only passes single-threaded" trap. That kind of fact is worth having for every agent that touches the repo, not just you — so persist it to the shared repo bank with an explicit \`retain\` that names the bank, in the same turn you learn it:
+
+\`mcp__hindsight__retain(content="switchroom's vitest suite must run single-threaded — the shared worker pool corrupts the tmpdir scaffold fixtures", bank_id="switchroom-dev", tags=["repo:switchroom", "build"])\`
+
+Passing \`bank_id\` is what makes this the exception: auto-retain can't reach a shared bank (it always resolves your own), so if you don't make the call by hand the knowledge stays trapped in your bank. Two rules keep the shared bank clean: route only durable, repo-scoped facts there — never conversation, user preferences, or anything about a person (those stay in your own bank via ordinary retain) — and tag every one \`repo:<name>\` so it is findable. Reading is unchanged: ordinary \`recall\` / \`reflect\` already reach the shared repo bank.
+
 Don't wait for a slash command. Don't ask permission. Memory work is table stakes, like a colleague who takes notes and remembers.`;
 
 /**

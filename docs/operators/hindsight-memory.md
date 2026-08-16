@@ -770,3 +770,61 @@ operator-facing ways to add them, both leash-clean (never a silent self-write):
 See `reference/rfcs/hindsight-phase5-mental-model-curation.md` for the full
 design and the deliberately-deferred follow-ups (cron-driven proposals, any
 fleet-wide default model).
+
+## Shared repo bank (`switchroom-dev`) — repo knowledge
+
+Constraint 2 of the memory-redesign RFC (`reference/rfcs/memory-redesign-2026-08.md`,
+RFC item P6) is that shared memory is **repos only** — not general cross-agent
+memory, not person-profile banks. The mechanism is a single shared bank,
+`switchroom-dev`, that any agent can write durable repository knowledge into so
+every agent that touches the repo inherits it.
+
+### The convention (prompt half)
+
+Auto-retain always resolves the agent's OWN bank (`derive_bank_id`,
+`vendor/hindsight-memory/scripts/lib/bank.py`), and that asymmetry is
+deliberate and unchanged — nothing routes conversation-level auto-retain to a
+shared bank. What is new is fleet guidance (`MEMORY_GUIDANCE` in
+`src/agents/scaffold.ts`, rendered into
+`~/.switchroom/fleet/switchroom-invariants.md`): when an agent learns a durable
+fact **about a repository** — a build invariant, a migration gotcha, a
+house-style rule — it makes an explicit call that names the bank:
+
+```
+mcp__hindsight__retain(
+  content="switchroom's vitest suite must run single-threaded — the shared "
+          "worker pool corrupts the tmpdir scaffold fixtures",
+  bank_id="switchroom-dev",
+  tags=["repo:switchroom", "build"],
+)
+```
+
+`retain` is pre-approved for every agent and accepts `bank_id`
+(`src/cli/hindsight-mcp-shim.ts`), so no new write path is added — this reuses
+the surface that already exists. Only durable, repo-scoped facts belong here;
+conversation, user preferences, and anything about a person stay in the agent's
+own bank. Every shared write is tagged `repo:<name>` for findability. The read
+side is untouched — ordinary `recall` / `reflect` already reach the bank.
+
+### The boundary (config half)
+
+`additional_banks` is recall scoping and explicitly **not** an access boundary
+(`src/config/schema.ts`). The only enforcement point is the bank's own
+`mcp_enabled_tools` allowlist, set via `update_bank(config_updates=…)`
+(`src/cli/hindsight-mcp-shim.ts`). Setting it on `switchroom-dev` to just the
+tool set repo knowledge needs — write plus read — turns constraint 2 from a
+convention into a boundary a prompt-injected agent cannot step past on that
+bank. (This is a live shared-bank mutation, applied out-of-band, not part of
+the repo change that shipped the guidance.)
+
+### Measurement
+
+The prompt half is prompt-dependent, so it is measured, not assumed. The single
+unambiguous number is **writes per week to `switchroom-dev`** (its baseline was
+13 facts total, last written 2026-08-07). Read
+`switchroom memory recall-log` for the read side, and the bank's document/fact
+counts (`get_bank_stats` / `list_documents`, or `switchroom doctor`'s per-bank
+rows) for the write side. If the write rate does not move — fewer than one
+write per agent per week over four weeks — the prompt approach has not landed
+and the convention should be re-scoped to a deterministic trigger rather than
+left running as dead guidance.

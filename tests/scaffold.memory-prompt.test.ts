@@ -65,6 +65,30 @@ describe("Memory prompt guidance (post-#1850)", () => {
     expect(out).toContain("mcp__hindsight__reflect");
   });
 
+  it("renderFleetInvariants() includes the shared repo-bank routing guidance (RFC P6)", () => {
+    // P6: an agent must be TOLD to make an explicit retain into the shared
+    // `switchroom-dev` bank for durable repo knowledge — auto-retain can only
+    // ever reach the agent's own bank (derive_bank_id), so the guidance is the
+    // only thing that produces a shared-bank write. Assert the outcome the
+    // block exists to produce: the bank id, the explicit retain, the tag
+    // convention, and the worked example.
+    const out = renderFleetInvariants();
+    expect(out).toContain("### Route repo knowledge to the shared repo bank");
+    // The write path is the explicit, bank-named retain — not sync/auto.
+    expect(out).toContain('bank_id="switchroom-dev"');
+    expect(out).toContain("mcp__hindsight__retain");
+    // The findability convention: repo:<name> tag on every shared write.
+    expect(out).toContain('tags=["repo:switchroom"');
+    // The asymmetry must be stated, not just implied: auto-retain stays on the
+    // agent's own bank and this is the deliberate exception.
+    expect(out).toMatch(/auto-retain (always writes your OWN bank|can't reach a shared bank)/i);
+    // It lives inside the memory guidance section, after Inspect.
+    const inspectIdx = out.indexOf("### Inspect proactively");
+    const repoIdx = out.indexOf("### Route repo knowledge to the shared repo bank");
+    expect(inspectIdx).toBeGreaterThan(-1);
+    expect(repoIdx).toBeGreaterThan(inspectIdx);
+  });
+
   it("renderFleetInvariants() includes the file-delivery guidance (no local-path dumps)", () => {
     const out = renderFleetInvariants();
     const deliveryIdx = out.indexOf("## Delivering a file to the user");
