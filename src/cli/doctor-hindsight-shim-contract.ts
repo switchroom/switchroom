@@ -156,12 +156,21 @@ export function classifyHindsightShimContract(spec: OpenApiSpec): CheckResult[] 
 /**
  * Best-effort live wrapper: fetch `/openapi.json` and classify it.
  *
- * An unreachable/malformed spec produces NO rows at all — same idiom as
- * `classifyHindsightVersionSkew`'s "live === null → return null" and
- * `checkHindsightContainerHealth`'s "not a local container → return []":
- * reachability itself is already `hindsight` TCP-reach / `hindsight /health`
- * / `hindsight version`'s job in `doctor.ts`, and a second red row for the
- * exact same outage would be noise, not signal.
+ * `doctor.ts` only ever reaches this call AFTER its own TCP-reach + "speaking
+ * Hindsight MCP" probe has already passed (both early-return the whole
+ * `checkHindsight*` pass otherwise) — so by the time this function runs,
+ * total-outage reachability is a settled fact, not something this row needs
+ * to re-establish. That means a null spec here is NOT the same "second red
+ * row for the same outage" case `classifyHindsightVersionSkew`'s
+ * `live === null → return null` idiom exists to avoid: it can only mean the
+ * engine answered MCP but does not serve `/openapi.json` (docs disabled, a
+ * proxy stripping the route, a build with the OpenAPI route pulled) — which
+ * silently switches the route-drift guard AND `ShimContractPin.preflight`'s
+ * loud pre-flight off, with nothing else in doctor able to notice. Emitting
+ * `[]` here made that exact failure mode invisible: the anti-silent-drop
+ * guard would itself go dark, and the only symptom was the ABSENCE of an
+ * `ok` rollup row, which nobody scans for. Emit a `warn` row instead so the
+ * gap is a row to read, not a row to notice is missing.
  */
 export async function runHindsightShimContractCheck(
   mcpUrl: string,
@@ -169,6 +178,30 @@ export async function runHindsightShimContractCheck(
 ): Promise<CheckResult[]> {
   const origin = mcpUrl.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
   const spec = await fetchHindsightOpenApi(origin, opts);
-  if (!spec) return [];
+  if (!spec) {
+    return [
+      {
+        name: `${SHIM_CONTRACT_CHECK_PREFIX}: routes`,
+        status: "warn",
+        detail:
+          `the engine is reachable but /openapi.json did not return a usable ` +
+          `spec — the shim contract guard is INACTIVE: neither this doctor ` +
+          `check nor ShimContractPin's loud call-time preflight (` +
+          `hindsight-mcp-shim.ts) can detect a route rename/removal under the ` +
+          `five synthesized tools (deactivate_directive, reactivate_directive, ` +
+          `search_knowledge_pages, get_knowledge_page, get_knowledge_tree) ` +
+          `right now. Calls degrade to "unknown, proceed" and a route drop ` +
+          `would surface as a bare failed REST call instead of a named refusal.`,
+        fix:
+          "Confirm /openapi.json is served at the engine's origin (FastAPI " +
+          "serves it by default; check for `docs_url`/`openapi_url` disabled " +
+          "in the engine's startup config, or a reverse proxy stripping the " +
+          "route). If OpenAPI docs are deliberately disabled in production, " +
+          "this warning is expected and the route contract is unverifiable " +
+          "by design — the REST layer's own error handling remains the " +
+          "backstop for the five synthesized tools.",
+      },
+    ];
+  }
   return classifyHindsightShimContract(spec);
 }

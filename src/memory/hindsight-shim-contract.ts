@@ -167,25 +167,95 @@ export async function fetchHindsightOpenApi(
  * Loud pre-flight for one synthesized tool call, lazily fetching and
  * memoizing `/openapi.json` for the process lifetime of one shim instance.
  *
- * A FAILED fetch is deliberately NOT cached as failure: the next
- * synthesized call retries, so a backend that was briefly unreachable at
- * the first call does not wedge every later call into permanent "unknown"
- * for the rest of the session — the same per-call-retry philosophy
- * `UpstreamClient` applies to the upstream MCP session.
+ * A FAILED fetch is deliberately NOT cached as PERMANENT failure: a backend
+ * that was briefly unreachable at the first call must not wedge every later
+ * call into permanent "unknown" for the rest of the session — the same
+ * per-call-retry philosophy `UpstreamClient` applies to the upstream MCP
+ * session. But "not permanent" does not mean "never cached" either: against
+ * an engine that genuinely has no `/openapi.json` (docs disabled, an old
+ * build), every synthesized call was re-paying up to `OPENAPI_FETCH_TIMEOUT_MS`
+ * on the tool-call latency path, forever, with no way for the outage to ever
+ * resolve. `negativeCacheMs` (opt-in — `0`/unset preserves the original
+ * always-retry behaviour exactly, which is what the tests below pin) bounds
+ * that tax with a SHORT TTL: long enough to skip the immediate next few
+ * calls' timeout, short enough that a transient outage still clears within
+ * one session rather than needing a shim restart. See `hindsight-mcp-shim.ts`
+ * for the production TTL and the reasoning behind that specific number.
+ *
+ * The same age-check mechanism also plugs the mirror-image staleness case: a
+ * SUCCESSFUL fetch was previously memoized for the whole process lifetime,
+ * so a route missing at the first call but restored by a mid-session engine
+ * upgrade stayed rejected — with `preflight`'s own error text claiming "the
+ * shim confirmed the route is gone", which by then was false — until the
+ * shim was restarted. `positiveCacheMs` (opt-in, same `0`/unset-disables
+ * default) ages the successful cache out too, so a later call re-fetches and
+ * can recover without a restart.
  */
 export class ShimContractPin {
   private cached: OpenApiSpec | null = null;
+  private cachedAt: number | null = null;
+  private failedAt: number | null = null;
 
   constructor(
     private readonly apiBaseUrl: string,
-    private readonly opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
+    private readonly opts: {
+      fetchImpl?: typeof fetch;
+      timeoutMs?: number;
+      /**
+       * How long a FAILED `/openapi.json` fetch is negative-cached before the
+       * next call retries. `0` or unset (the default) disables negative
+       * caching entirely — every call retries immediately, matching this
+       * module's original behaviour byte-for-byte.
+       */
+      negativeCacheMs?: number;
+      /**
+       * How long a SUCCESSFUL `/openapi.json` fetch is cached before the next
+       * call re-fetches. `0` or unset (the default) memoizes for the process
+       * lifetime — this module's original behaviour byte-for-byte.
+       */
+      positiveCacheMs?: number;
+      /** Injectable clock for tests. Defaults to `Date.now`. */
+      now?: () => number;
+    } = {},
   ) {}
 
-  /** The cached/fetched spec, or null if `/openapi.json` has never been reachable. */
+  private now(): number {
+    return this.opts.now ? this.opts.now() : Date.now();
+  }
+
+  /**
+   * The cached/fetched spec, or null when `/openapi.json` is not currently
+   * known-reachable (never fetched successfully, or the last attempt failed
+   * and — with `negativeCacheMs` set — is still within its negative-cache
+   * window).
+   */
   async spec(): Promise<OpenApiSpec | null> {
-    if (this.cached) return this.cached;
+    const positiveCacheMs = this.opts.positiveCacheMs ?? 0;
+    if (this.cached) {
+      const stale =
+        positiveCacheMs > 0 &&
+        this.cachedAt !== null &&
+        this.now() - this.cachedAt >= positiveCacheMs;
+      if (!stale) return this.cached;
+      this.cached = null;
+      this.cachedAt = null;
+    }
+    const negativeCacheMs = this.opts.negativeCacheMs ?? 0;
+    if (
+      negativeCacheMs > 0 &&
+      this.failedAt !== null &&
+      this.now() - this.failedAt < negativeCacheMs
+    ) {
+      return null;
+    }
     const fetched = await fetchHindsightOpenApi(this.apiBaseUrl, this.opts);
-    if (fetched) this.cached = fetched;
+    if (fetched) {
+      this.cached = fetched;
+      this.cachedAt = this.now();
+      this.failedAt = null;
+    } else if (negativeCacheMs > 0) {
+      this.failedAt = this.now();
+    }
     return fetched;
   }
 

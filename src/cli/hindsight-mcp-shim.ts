@@ -1386,6 +1386,18 @@ export class HindsightShim {
    * of backend state, and this probe is best-effort exactly like
    * `directiveAdmin`/`knowledgeAdmin` are — it only ever runs lazily, on the
    * first synthesized call.
+   *
+   * `negativeCacheMs`/`positiveCacheMs` (adversarial review on #4739):
+   * without a negative TTL, an engine with no `/openapi.json` made EVERY
+   * synthesized call re-pay up to `OPENAPI_FETCH_TIMEOUT_MS` (3s) on the
+   * tool-call latency path, forever. 30s bounds that tax to at most one
+   * timeout per 30s of wall-clock regardless of call volume, while still
+   * clearing within a session once the engine comes back — no restart
+   * needed. 5 minutes on the positive side means a route restored by a
+   * mid-session engine upgrade (rare, but the alternative is a stuck
+   * rejection lying about "the shim confirmed the route is gone" until the
+   * shim restarts) is re-checked well inside a typical session rather than
+   * requiring one.
    */
   private contractPinCache: ShimContractPin | null = null;
 
@@ -1393,7 +1405,11 @@ export class HindsightShim {
     if (!this.contractPinCache) {
       this.contractPinCache = new ShimContractPin(
         this.opts.apiBaseUrl ?? this.opts.url.replace(/\/mcp\/?$/, ""),
-        this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {},
+        {
+          ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
+          negativeCacheMs: 30_000,
+          positiveCacheMs: 5 * 60_000,
+        },
       );
     }
     return this.contractPinCache;

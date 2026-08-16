@@ -10,8 +10,14 @@
  *                       rollup `ok` row, not five
  *   • version skew   — older/equal/newer against the pin must classify as
  *                       fail/ok/warn respectively
- *   • quiet on outage — an unreachable /openapi.json must produce NO rows
- *                       (reachability is another check's job), not a fail
+ *   • guard-inactive is loud — by the point `doctor.ts` calls this check,
+ *                       reachability (TCP + speaking MCP) is already an
+ *                       established fact, so a null spec here can only mean
+ *                       the route-drift guard itself is unable to run; that
+ *                       must be a `warn` row an operator can read, never `[]`
+ *                       (adversarial review on #4739 — the prior `[]` made
+ *                       the guard's own failure indistinguishable from a
+ *                       healthy fleet)
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { createServer, type Server } from "node:http";
@@ -152,7 +158,14 @@ describe("runHindsightShimContractCheck", () => {
     expect(rows.every((r) => r.status === "ok")).toBe(true);
   });
 
-  it("returns NO rows when /openapi.json is unreachable — reachability is a different check's job", async () => {
+  it("THE GUARD, FINDING 1: a warn row — not silence — when /openapi.json is unreachable", async () => {
+    // Regression guard for the adversarial-review finding on #4739: doctor
+    // only reaches this check after its own TCP-reach + "speaking MCP" probe
+    // already passed, so a null spec here means the route-drift guard AND
+    // ShimContractPin's call-time preflight are both now unable to detect
+    // drift — an anti-silent-drop guard failing silently. `[]` made that
+    // invisible (only the ABSENCE of an ok row hinted at it); this must
+    // instead be a `warn` row naming the actual consequence.
     const dead = createServer();
     await new Promise<void>((r) => dead.listen(0, "127.0.0.1", r));
     const port = (dead.address() as { port: number }).port;
@@ -161,6 +174,13 @@ describe("runHindsightShimContractCheck", () => {
       `http://127.0.0.1:${port}/mcp/`,
       { timeoutMs: 300 },
     );
-    expect(rows).toEqual([]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("warn");
+    expect(rows[0].name).toBe(`${SHIM_CONTRACT_CHECK_PREFIX}: routes`);
+    // Must name the actual consequence (guard inactive), not just "fetch
+    // failed" — an operator scanning doctor output needs to know WHAT is
+    // silently unprotected, not just that one probe didn't come back.
+    expect(rows[0].detail).toContain("INACTIVE");
+    expect(rows[0].detail.toLowerCase()).toContain("preflight");
   });
 });

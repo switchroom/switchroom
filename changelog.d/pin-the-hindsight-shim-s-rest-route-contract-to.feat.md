@@ -10,4 +10,8 @@
   "proceed" rather than blocking every synthesized tool on a flaky probe.
   `switchroom doctor` gains a matching contract probe: fail rows when a
   synthesized tool's route is missing, and a row comparing the live
-  engine's declared version against the pin.
+  engine's declared version against the pin. Adversarial review: doctor now
+  emits a `warn` row (not silence) when the engine is reachable but
+  `/openapi.json` is not, and `ShimContractPin` gained a short negative/
+  positive cache TTL so a permanently-missing (or later-restored) route no
+  longer re-pays the fetch timeout on every synthesized call forever.

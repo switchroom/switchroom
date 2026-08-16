@@ -300,4 +300,128 @@ describe("ShimContractPin.preflight", () => {
       await flaky.close();
     }
   });
+
+  // ── FINDING 2 (adversarial review, #4739): negativeCacheMs bounds the
+  //    re-fetch tax on a permanently-missing /openapi.json without
+  //    recreating the poisoned-cache problem the test above guards against.
+  describe("negativeCacheMs — bounds the re-fetch tax, still recovers", () => {
+    it("skips the network fetch entirely while within the negative-cache TTL", async () => {
+      let hits = 0;
+      let clock = 0;
+      const down = await startOpenApiServer((res) => {
+        hits += 1;
+        res.writeHead(503).end();
+      });
+      try {
+        const pin = new ShimContractPin(down.url, {
+          timeoutMs: 500,
+          negativeCacheMs: 10_000,
+          now: () => clock,
+        });
+        expect((await pin.preflight("get_knowledge_tree")).ok).toBe(true); // degraded
+        expect(hits).toBe(1); // paid the one real fetch
+
+        // Repeated calls well inside the TTL must NOT re-pay the fetch —
+        // this is the specific cost FINDING 2 exists to bound. Without the
+        // fix, each of these would independently re-pay up to
+        // OPENAPI_FETCH_TIMEOUT_MS on the tool-call latency path.
+        clock += 1_000;
+        await pin.preflight("get_knowledge_tree");
+        clock += 1_000;
+        await pin.preflight("search_knowledge_pages");
+        clock += 1_000;
+        await pin.preflight("deactivate_directive");
+        expect(hits).toBe(1); // still just the one fetch — this is the guard
+      } finally {
+        await down.close();
+      }
+    });
+
+    it("retries once the negative-cache TTL has expired — an outage still clears without a restart", async () => {
+      let hits = 0;
+      let up = false;
+      let clock = 0;
+      const flaky = await startOpenApiServer((res) => {
+        hits += 1;
+        if (!up) {
+          res.writeHead(503).end();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(fullOpenApiSpec()));
+      });
+      try {
+        const pin = new ShimContractPin(flaky.url, {
+          timeoutMs: 500,
+          negativeCacheMs: 10_000,
+          now: () => clock,
+        });
+        expect((await pin.preflight("get_knowledge_tree")).ok).toBe(true); // degraded
+        expect(hits).toBe(1);
+
+        // Still within the TTL: no re-fetch, even though the backend is
+        // actually back up by now — proves the cache is genuinely gating
+        // the call, not incidentally not firing.
+        up = true;
+        clock += 5_000;
+        await pin.preflight("get_knowledge_tree");
+        expect(hits).toBe(1);
+
+        // Past the TTL: the next call must retry and recover — this is the
+        // "not sticky forever" half of FINDING 2, same guarantee the
+        // no-negative-cache test above pins for the TTL-disabled default.
+        clock += 6_000; // total elapsed since the failure: 11s > 10s TTL
+        const recovered = await pin.preflight("get_knowledge_tree");
+        expect(hits).toBe(2);
+        expect(recovered.ok).toBe(true); // route present again — no longer degraded-unknown, genuinely confirmed
+      } finally {
+        await flaky.close();
+      }
+    });
+  });
+
+  // ── Third case folded in from the same TTL mechanism: a route restored by
+  //    a mid-session engine upgrade must not stay rejected until restart.
+  describe("positiveCacheMs — a successful spec ages out and can recover a restored route", () => {
+    it("re-fetches after the positive-cache TTL and un-rejects a route the engine restored", async () => {
+      let hits = 0;
+      let restored = false;
+      let clock = 0;
+      const upgrading = await startOpenApiServer((res) => {
+        hits += 1;
+        const spec = fullOpenApiSpec();
+        if (!restored) {
+          delete spec.paths!["/v1/default/banks/{bank_id}/knowledge-base/tree"];
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(spec));
+      });
+      try {
+        const pin = new ShimContractPin(upgrading.url, {
+          positiveCacheMs: 10_000,
+          now: () => clock,
+        });
+        const first = await pin.preflight("get_knowledge_tree");
+        expect(first.ok).toBe(false); // route genuinely missing
+        expect(hits).toBe(1);
+
+        // Within the TTL, the stale-missing spec stays memoized — no
+        // re-fetch yet, even though the engine has since restored the route.
+        restored = true;
+        clock += 5_000;
+        const stillCached = await pin.preflight("get_knowledge_tree");
+        expect(stillCached.ok).toBe(false);
+        expect(hits).toBe(1);
+
+        // Past the TTL, the cache ages out, the route is re-checked, and the
+        // call recovers WITHOUT a shim restart.
+        clock += 6_000; // total elapsed: 11s > 10s TTL
+        const recovered = await pin.preflight("get_knowledge_tree");
+        expect(recovered.ok).toBe(true);
+        expect(hits).toBe(2);
+      } finally {
+        await upgrading.close();
+      }
+    });
+  });
 });
