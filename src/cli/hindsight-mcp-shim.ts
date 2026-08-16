@@ -93,6 +93,7 @@ import {
   type KnowledgeNode,
 } from "../memory/hindsight-knowledge-admin.js";
 import { redact } from "../secret-detect/redact.js";
+import { ShimContractPin } from "../memory/hindsight-shim-contract.js";
 import { HINDSIGHT_DEFAULT_MCP_URL } from "../setup/hindsight.js";
 
 // ─── Protocol constants ───────────────────────────────────────────────────
@@ -1373,6 +1374,32 @@ export class HindsightShim {
   }
 
   /**
+   * Lazily built, per-instance memoized probe of the live engine's
+   * `/openapi.json` — the engine version pin design-v2.md §2.5 named as
+   * owed (see `../memory/hindsight-shim-contract.ts`'s module header for the
+   * full rationale). Built the same way as {@link directiveAdmin} /
+   * {@link knowledgeAdmin} — same `apiBaseUrl` derivation, same injected
+   * `fetchImpl` — so a test that stubs one stubs all three consistently.
+   *
+   * Never fetched from `initializeResult()` or any other startup path: the
+   * shim's foundational rule is that `initialize` always succeeds regardless
+   * of backend state, and this probe is best-effort exactly like
+   * `directiveAdmin`/`knowledgeAdmin` are — it only ever runs lazily, on the
+   * first synthesized call.
+   */
+  private contractPinCache: ShimContractPin | null = null;
+
+  private get contractPin(): ShimContractPin {
+    if (!this.contractPinCache) {
+      this.contractPinCache = new ShimContractPin(
+        this.opts.apiBaseUrl ?? this.opts.url.replace(/\/mcp\/?$/, ""),
+        this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {},
+      );
+    }
+    return this.contractPinCache;
+  }
+
+  /**
    * Answer a shim-synthesized tool locally. Never touches the upstream MCP
    * session.
    *
@@ -1424,6 +1451,13 @@ export class HindsightShim {
           "there is no bank to pin it to.",
       );
     }
+    // Route-contract preflight (engine version pin, design-v2.md §2.5): a
+    // CONFIRMED-missing route fails loudly here, before the doomed REST call
+    // is even attempted. An unreachable/malformed /openapi.json is treated
+    // as "unknown" and falls through unchanged — see ShimContractPin's
+    // header for why that direction is the safe one.
+    const preflight = await this.contractPin.preflight(name);
+    if (!preflight.ok) return fail(preflight.text);
     try {
       const text = await this.runSynthesized(name, clean);
       return { content: [{ type: "text", text }], isError: false };

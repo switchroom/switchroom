@@ -55,6 +55,7 @@ import { findUnmanagedHindsightEnvKeys } from "../setup/hindsight-perf-defaults.
 import { findUnknownMemoryKeys, type MemoryTier } from "../config/memory-key-drift.js";
 import { inspectBankHealth, staleMentalModels, corruptedMentalModels, recentUnextracted, ageDays } from "../memory/bank-health.js";
 import { checkHindsightContainerHealth, classifyToolContract, checkHindsightHealthEndpoint, checkHindsightVersion, classifyConsolidationBacklog, classifyAsyncOpQueue, classifyDirectiveCount, classifyBankConfigReachability } from "./doctor-memory.js";
+import { runHindsightShimContractCheck } from "./doctor-hindsight-shim-contract.js";
 import { checkAgentRecallHealth } from "./doctor-recall-health.js";
 import { checkHnswPartialIndexes } from "./doctor-hnsw-index.js";
 import { checkObservationScopeSaturation } from "./doctor-observation-scopes.js";
@@ -1844,6 +1845,16 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // and three whole MCP tools reachable by nobody. This is the other direction.
   const versionRow = await checkHindsightVersion(url);
   if (versionRow) results.push(versionRow);
+
+  // Shim contract probe (design-v2.md §2.5, "the pin is not built"): the
+  // two checks above cover the 32 backend MCP tools and the /version scalar.
+  // Neither can see the five shim-SYNTHESIZED tools' underlying REST routes
+  // (deactivate_directive, reactivate_directive, search_knowledge_pages,
+  // get_knowledge_page, get_knowledge_tree) — those are plain REST calls
+  // `tools/list` never touches. Read /openapi.json and diff it against the
+  // route contract those five tools depend on, so a renamed/removed route
+  // surfaces here instead of at an agent's next live call.
+  results.push(...(await runHindsightShimContractCheck(url)));
 
   // Consumer probe (#1245): broker-fed hindsight needs an
   // `auth.consumers[]` entry + a bound per-consumer socket. Replaces
