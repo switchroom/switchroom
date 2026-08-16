@@ -1,0 +1,1 @@
+- **vault-broker: re-read the vault on access so an operator `switchroom vault set` is observable without restarting the broker (#4736)**
