@@ -109,18 +109,10 @@ def _human_turns(messages: list) -> int:
     )
 
 
-def _tail_after(messages: list, last_uuid: str | None) -> list:
-    """Return the transcript entries AFTER the watermark anchor.
-
-    No watermark, or a stale anchor compaction removed → the whole transcript is
-    the gap (a safe re-upsert, never a skip).
-    """
-    if not last_uuid:
-        return list(messages)
-    for i, m in enumerate(messages):
-        if isinstance(m, dict) and m.get("uuid") == last_uuid:
-            return messages[i + 1:]
-    return list(messages)
+# The transcript tail-slice is shared with the incremental SessionEnd sweep
+# (retain.py, memory-RFC P1); the single implementation lives in lib.watermark
+# so there is only ever one copy of this reconcile/watermark-critical slice.
+_tail_after = watermark.tail_after
 
 
 def _session_id_from_path(path: str) -> str:
