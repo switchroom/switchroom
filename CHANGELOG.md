@@ -17,6 +17,88 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.14 — the vault-broker picks up an operator vault set without a restart and refuses to overwrite a vault it cannot read, fleet-health stops laundering a lost reply on a routine repaint deferral, a defaulted host-capabilities verdict no longer silently drops the voice sidecar, recall logs which directives it injected, the hindsight shim rejects synthesized tools whose REST route is missing, and the fleet system prompt is trimmed with tests that actually bite
+
+### Features
+
+- **hindsight: log injected directive IDs on `recall_log` rows (#4738)**
+
+  Memory-redesign step 1 (probes/instrumentation, no behaviour change):
+  `state/recall_log.jsonl` now carries `directive_ids`, the ids of the
+  directives actually injected into `<active_directives>` this turn (the
+  post-cap head-slice, in priority order), alongside the existing
+  `directive_count`/`directives_omitted` volume fields. `null` on a cache-hit
+  row, matching those two fields. Makes directive exposure — including
+  "never once injected" — queryable before any change to what gets
+  injected. `injected_score_min/median/max` (per-memory recall-quality
+  telemetry) and the `recall.py` scores-API comment (E-24) were already
+  correct on `main` — no change needed there.
+- **memory: pin the hindsight shim's REST route contract to /openapi.json (#4739)** —
+  design-v2.md §2.5's engine version pin, previously "not built": the
+  hindsight-mcp-shim's five synthesized tools (`deactivate_directive`,
+  `reactivate_directive`, `search_knowledge_pages`, `get_knowledge_page`,
+  `get_knowledge_tree`) are REST calls that `tools/list`'s existing contract
+  check can never see move. The shim now fetches `/openapi.json` and, when a
+  route is CONFIRMED missing, rejects that tool's call loudly before ever
+  attempting the doomed REST request — consistent with the shim's existing
+  anti-silent-drop guard. An unreachable/malformed spec degrades to
+  "proceed" rather than blocking every synthesized tool on a flaky probe.
+  `switchroom doctor` gains a matching contract probe: fail rows when a
+  synthesized tool's route is missing, and a row comparing the live
+  engine's declared version against the pin. Adversarial review: doctor now
+  emits a `warn` row (not silence) when the engine is reachable but
+  `/openapi.json` is not, and `ShimContractPin` gained a short negative/
+  positive cache TTL so a permanently-missing (or later-restored) route no
+  longer re-pays the fetch timeout on every synthesized call forever.
+
+### Bug fixes
+
+- **fleet-health: scope delivery ladder evidence to the failing send (#4733)** — the ladder-evidence rule from #4730 cleared a delivery failure on markers matched loosely enough to be a clock rather than a fact. The `edit-flood-fuse deferred` marker is now scoped to `method=sendRichMessage` **and** the failing chat (parsed out of the line's `key=<ns>:<chat>` token): the fleet logs 34,936 of those lines and only 27 are rich sends, so a single routine `editMessageText` repaint deferral was enough to launder a genuinely lost reply. `queued card send failed` is dropped as a marker entirely — it names an ABANDONED card, not a pending re-send (`stream-render.ts:361-363`, `:1153`). A flood rejection self-certifying its own ladder is now read off the structured `err=`/`code=` tokens only, with Telegram's free-form `desc=` stripped before matching, so neither a wording (`retry after 3 attempts`) nor an echo of agent-authored text containing `code=429` can grant a 400 evidence for the whole window. The gateway-wide `429 rate limited` and `outbox-sweep: deferred` markers stay unscoped — they carry no chat because they describe process-wide flood state, and at 156 and 10 lifetime occurrences across 2.23M log lines they cannot seed a coincidence.
+- **compose: attribute a `voice-sidecar` drop caused by a defaulted host-capabilities verdict (#4735)** — a `voice-sidecar` removal caused by a defaulted (missing/unreadable/malformed) host-capabilities verdict is now attributed as a warning in the apply report, instead of appearing as a bare `services removed: voice-sidecar` line that reads as intent.
+- **vault-broker: re-read the vault on access so an operator `switchroom vault set` is observable without restarting the broker (#4736)** — the re-read fails open on the READ path (a changed file that will not decrypt keeps the previously loaded secrets serving), and that fail-open is now fenced off everywhere it must not reach: `put` is refused while the file on disk is one the broker could not open, so an agent token rotation can no longer overwrite an operator-restored vault with stale state; a vault-layout-drift throw on the refresh path locks the broker (audited, healthcheck-visible) instead of being downgraded to one stderr warning; and unlock stamps the vault file before the ~50 ms KDF rather than after, so a write racing boot is noticed instead of being recorded as already-loaded.
+
+### Documentation
+
+- **profiles: trim fleet-wide CLAUDE.md system-prompt blocks (#4740)**
+
+  Condensed the vault, root-tier host access, and self-service prose in
+  `profiles/_shared/*.md.hbs` and `profiles/default/CLAUDE.md.hbs`
+  (Memory, Session Continuity, Root-tier host access sections). An
+  admin+root agent's rendered `CLAUDE.md` drops from ~31.5k to ~20k
+  characters (~36%) with no conditional or capability dropped — every
+  `{{#if}}` branch (admin, root, schedule, linearAgentEnabled) still
+  renders. Takes effect fleet-wide on each agent's next `switchroom apply`
+  / scaffold reconcile.
+
+  Review follow-ups, all inside the trimmed budget:
+
+  - The self-service block again names the deferred (ToolSearch-gated)
+    skill tools — `skill_search`, `skill_init_personal`,
+    `skill_clone_to_personal`, `skill_edit_personal` — plus the
+    fork-and-fix trigger, which no tool schema can supply because those
+    schemas aren't loaded until the agent already decided to look.
+  - The cron-prompt future-self framing moved from prompt text into the
+    `schedule_add` `prompt` **schema description**, so the rule is
+    delivered deterministically at call time instead of depending on
+    prompt recall.
+  - Corrected a false claim that a directive-cap overflow is silent and
+    "your only warning": `switchroom doctor` warns above
+    `DIRECTIVE_WARN_THRESHOLD` (24) and fails above `MAX_DIRECTIVES` (30),
+    and `recall_log.directives_omitted` records it
+    (`src/cli/doctor-memory.ts`).
+  - Session-handoff mechanics (`.handoff.md`, `handoff-briefing.sh`,
+    `session_continuity.resume_mode`) now live in the
+    `switchroom-runtime` skill the trimmed template points at, so the
+    pointer resolves.
+  - `profiles.test.ts` now pins the load-bearing rules of the rendered
+    default template — never-exfiltrate-secret-values, announce-before-
+    host-mutation, the `chown --reference` overlay rule, the
+    `MAX_DIRECTIVES` cap, the wake-audit sentinel, the resume branches —
+    and `tests/scaffold.persona.test.ts` matches on whitespace-collapsed
+    text so a template rewrap can neither red a guard nor satisfy a
+    `not.toContain` leak guard vacuously. Byte ratchet lowered
+    30620 → 20555.
+
 ## v0.21.13 — the worktree reaper stops mistaking live checkouts for garbage and finds the stale trees it was missing, `worktree capture` rescues a checkout to a verified bundle before deletion, agent caches move off the root disk onto a bulk scratch volume, doctor reports disk headroom, approval cards survive a lone surrogate on the wire, fleet-health stops paging on deliveries that already recovered, and the pinned Claude CLI moves to 2.1.233
 
 ### Features
@@ -25142,5 +25224,6 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
