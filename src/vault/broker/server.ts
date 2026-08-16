@@ -1189,6 +1189,10 @@ export class VaultBroker {
         );
         return;
       }
+      // Same staleness class as `get`: this answers key-EXISTENCE and
+      // per-entry scope out of `this.secrets`, so without a refresh
+      // `switchroom doctor` would report a just-added key as missing.
+      this._reloadSecretsIfVaultChanged();
       if (this.secrets === null) {
         // Locked → the caller (doctor) maps LOCKED to `skip`, never a
         // false fail. The broker is only locked pre-first-unlock or
