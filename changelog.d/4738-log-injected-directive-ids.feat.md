@@ -1,4 +1,4 @@
-- **hindsight: log injected directive IDs on `recall_log` rows (#0000)**
+- **hindsight: log injected directive IDs on `recall_log` rows (#4738)**
 
   Memory-redesign step 1 (probes/instrumentation, no behaviour change):
   `state/recall_log.jsonl` now carries `directive_ids`, the ids of the
