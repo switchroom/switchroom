@@ -438,34 +438,114 @@ const TG_POST_CHAT_RE = /\bchat=(-?\d+)\b/;
 const TG_POST_THREAD_RE = /\bthread=(\S+)/;
 
 /**
- * Lines that prove the send stack is STILL working on the failed send rather
- * than having moved on to unrelated traffic. Each is emitted by a recovery
- * ladder that sits above or outside `createRetryApiCall`'s attempt context and
- * re-issues the send later:
+ * GATEWAY-WIDE flood ladders: the send stack parked in a flood wait that
+ * re-issues later. Neither line carries a chat id, and that is not an
+ * oversight — both describe process-wide flood state, not one chat's:
  *
- *   - `429 rate limited, waiting Ns` — the retry policy parking on a flood wait
- *     (`retry-api-call.ts`);
- *   - `edit-flood-fuse deferred` — the fuse holding the send for a later tick;
- *   - `outbox-sweep: deferred` — the sweep declining to issue inside an open
- *     flood window;
- *   - `queued card send failed` — the queued-card path about to re-send
- *     (`stream-render.ts:393`).
+ *   - `429 rate limited, waiting Ns` — the retry policy parking on a flood
+ *     wait (`retry-api-call.ts:671`);
+ *   - `outbox-sweep: deferred — Telegram flood window still open` — the sweep
+ *     declining to issue ANY send while the window is open
+ *     (`outbox-sweep.ts:886`).
  *
- * Matched on the whole line, not scoped to the failing chat: `429 rate limited`
- * carries no chat id at all (it is gateway-wide flood state), and the fuse key
- * (`key=cs:<chat>`) is a different token shape from `chat=`. Scoping would drop
- * the flood ladder, which is the one that most needs the wide window.
+ * So these two stay unscoped, and their density is why that is safe rather
+ * than merely necessary: 156 and 10 lifetime occurrences respectively across
+ * the live fleet's 2.23M gateway log lines. A marker that rare cannot seed a
+ * coincidence — unlike the fuse marker below, which is why that one is scoped.
  */
-const RECOVERY_LADDER_MARKER_RE =
-  /429 rate limited|edit-flood-fuse deferred|outbox-sweep: deferred|queued card send failed/;
+const GATEWAY_FLOOD_LADDER_RE = /429 rate limited|outbox-sweep: deferred/;
 
 /**
- * A rejection whose own text says the send is in the flood ladder, which
- * re-issues on a later tick well past the immediate re-send window below. The
- * `err=telegram_429` class is the pinned form; the `desc` text is matched too
- * because a 429 can arrive with the class unset on the transport path.
+ * The edit-flood fuse deferring a RICH SEND, with the chat it deferred it for
+ * in capture group 1. Emitted by `gateway.ts:22890` as
+ * `edit-flood-fuse deferred method=<m> key=<ns>:<chat> class=<cls>`, where the
+ * namespace is one of the fuse's per-chat buckets (`cs:`/`ce:`/`cer:`/`t:`/
+ * `lr:` — `edit-flood-fuse.ts:1205,1436,1504,1534`).
+ *
+ * BOTH scopings are load-bearing, and the #4730 review is why:
+ *
+ *   - by METHOD, because 34,909 of the fleet's 34,936 fuse deferrals are
+ *     cosmetic `editMessageText` (34,352), `sendChatAction` (427),
+ *     `setMessageReaction` (91) and friends — repaint throttling with no
+ *     relationship to any send. Only 27 are `sendRichMessage`. Matching the
+ *     bare phrase made a routine repaint throttle certify an unrelated
+ *     failure as recovered, and at that density it fired often enough that a
+ *     26-82% share of random 120s windows (per agent) contained one.
+ *   - by CHAT, because the fuse is per-chat: a send deferred for chat A says
+ *     nothing about a rejection in chat B.
+ *
+ * The pre-review docblock argued against scoping on the grounds that
+ * `429 rate limited` carries no chat id. That is true, and it is why the
+ * gateway-wide markers above are handled separately — it was never an
+ * argument about this line, which carries the chat in every emission.
+ *
+ * The namespace alternation is ENUMERATED rather than written `[a-z]+`, and
+ * that is load-bearing: the fuse's global token-tier bucket is
+ * `key=g:<botScopeKey>` (`edit-flood-fuse.ts:825`) and `deriveBotScopeKey`
+ * (`:338-343`) resolves to the bot's NUMERIC id for a well-formed token
+ * (`key=g:8792631963` on the live fleet). A loose namespace class would parse
+ * that bot id as a chat id — the two live in the same Telegram id space — and
+ * hand a chatless line a chat it does not have. `g:` is deliberately not
+ * evidence: a rich send deferred only on the global tier loses its evidence
+ * and books the sev-3, which is the fail-toward-the-alarm direction this whole
+ * classifier is biased in.
+ *
+ * Deliberately NOT a marker at all: `queued card send failed`
+ * (`stream-render.ts:393`). The pre-review docblock called it "the queued-card
+ * path about to re-send", and it is not: `openQueuedCard` resolves to `null`
+ * on that path and its only caller returns immediately (`stream-render.ts:361-363`
+ * "a null just means no card, so nothing to adopt or finalize"; the call site's
+ * `if (cardId == null) return` at `:1153`). The line marks a card ABANDONED,
+ * which is the opposite of a recovery ladder. It also carries neither a chat
+ * nor a method, so it could not be scoped even if it did mean a re-send.
  */
-const FLOOD_REJECTION_RE = /\berr=telegram_429\b|Too Many Requests|retry after \d/;
+const FUSE_SEND_DEFERRAL_RE =
+  /\bedit-flood-fuse deferred method=sendRichMessage\b[^\n]*\bkey=(?:cs|cer|ce|lr|t):(-?\d+)\b/;
+
+/**
+ * A rejection whose own error CLASS says the send is in the flood ladder,
+ * which re-issues on a later tick well past the immediate re-send window
+ * below.
+ *
+ * Pinned to the structured `err=`/`code=` tokens, never the free-form `desc=`
+ * text Telegram controls (#4730 review) — and never MATCHED against `desc=`
+ * either: always go through `isFloodRejection`, which strips the description
+ * before testing. The pattern alone does not enforce that half (#4733 review).
+ * Matching `Too Many Requests` or
+ * `retry after \d` anywhere on the line let a rejection self-certify on its
+ * description: `desc=Bad Request: message text is empty, retry after 3 attempts`
+ * is a 400 that granted itself ladder evidence for the whole 120s window. The
+ * free-text arm was justified as covering a 429 arriving with the class unset,
+ * and the live fleet does not corroborate that: all 16 `status=err`
+ * `sendRichMessage` lines carry a class (9×400, 3×502, 2×504, 2×429), both
+ * 429s carry `err=telegram_429 code=429`, and no `tg-post` line anywhere in
+ * 2.23M log lines names a flood in `desc` without the 429 class.
+ */
+const FLOOD_REJECTION_RE = /\berr=telegram_429\b|\bcode=429\b/;
+
+/**
+ * Does this `tg-post` line's own error CLASS say it is a flood rejection?
+ *
+ * The split is what makes `FLOOD_REJECTION_RE`'s docblock TRUE: pinning the
+ * pattern to the structured tokens buys nothing while the match runs against
+ * the whole line, because `desc=` is free-form text Telegram controls and it
+ * can contain the literal token. Telegram demonstrably echoes agent-authored
+ * content into it — the live shape is `desc=Bad Request: can't parse entities:
+ * Unsupported start tag "json" at byte offset 4` — so a reply whose own body
+ * carried `code=429` would hand its 400 rejection standing ladder evidence for
+ * the entire 120s window, and the next unrelated same-chat send would clear a
+ * genuinely lost reply (#4733 review).
+ *
+ * ` desc=` is a safe cut point in both directions: it is the LAST field the
+ * emitter writes (`… status=<s> err=<e> code=<c> desc=<free text>`), so every
+ * structured token sits before it, and all 850 live `status=err` `tg-post`
+ * lines carry `err=telegram_429 code=429` ahead of the description on a real
+ * flood — nothing legitimate is lost by ignoring the tail. A line with no
+ * ` desc=` at all is matched whole.
+ */
+function isFloodRejection(line: string): boolean {
+  return FLOOD_REJECTION_RE.test(line.split(" desc=")[0] ?? line);
+}
 
 /**
  * How long after a rejected rich send a MARKER-LESS landing can still be that
@@ -481,6 +561,17 @@ const FLOOD_REJECTION_RE = /\berr=telegram_429\b|Too Many Requests|retry after \
  * fleet took 483ms, 530ms, 554ms and 955ms. 2s is ~2x the slowest observed
  * round trip — wide enough for a slow API call, far too narrow for the next
  * unrelated card.
+ *
+ * Known weakness, deliberately accepted: four observations at ~2x the slowest
+ * is the ONLY thing pinning this number. Nothing in the send path bounds a
+ * synchronous ladder's round trip — `sendChunk`'s catch re-sends immediately,
+ * but "immediately" is a Bot API call whose latency is Telegram's, so under
+ * load a genuine synchronous recovery CAN exceed 2s and will then book a
+ * false sev-3. That is the fail-toward-the-alarm direction, so it is a
+ * tolerable error and widening it on speculation is not: every extra second
+ * here is a second of unrelated same-chat traffic that can launder a lost
+ * reply. Re-derive it from observations if the false sev-3s ever show up,
+ * never from a hunch.
  */
 export const REPLY_DELIVERY_IMMEDIATE_RESEND_MS = 2_000;
 
@@ -489,19 +580,27 @@ export const REPLY_DELIVERY_IMMEDIATE_RESEND_MS = 2_000;
  * chat still counts as THAT send's recovery.
  *
  * This is the OUTER bound, and it only applies to an episode that has ladder
- * evidence behind it (`RECOVERY_LADDER_MARKER_RE` / `FLOOD_REJECTION_RE`); a
- * marker-less landing has to arrive inside `REPLY_DELIVERY_IMMEDIATE_RESEND_MS`
- * instead. Time alone never clears a failure — see
- * `classifyReplyDeliveryEpisode`.
+ * evidence behind it (`GATEWAY_FLOOD_LADDER_RE` / `FUSE_SEND_DEFERRAL_RE` /
+ * `FLOOD_REJECTION_RE`); a marker-less landing has to arrive inside
+ * `REPLY_DELIVERY_IMMEDIATE_RESEND_MS` instead. Time alone never clears a
+ * failure — see `classifyReplyDeliveryEpisode`.
  *
- * Derived, not invented: `DEFAULT_MAX_FLOOD_SLEEP_MS` is the ceiling on how
- * long `createRetryApiCall` will park in-process before re-attempting
- * (`retry-api-call.ts:662` throws `FLOOD_WAIT_ACTIVE` rather than sleep past
- * it), and it is the slowest of the gateway's recovery ladders by a wide
- * margin — the slowest ladder-evidenced recovery on the live fleet took 40.6s.
- * A gap wider than the send stack's own maximum recovery wait is a different
- * delivery episode, not a recovery, so the window moves automatically if that
- * ceiling ever does.
+ * Derived, not invented — but derived from the PER-ATTEMPT ceiling, and the
+ * distinction matters: `DEFAULT_MAX_FLOOD_SLEEP_MS` bounds ONE in-process
+ * flood-wait sleep (`retry-api-call.ts:542-550`; `:662` throws
+ * `FLOOD_WAIT_ACTIVE` rather than sleep past it), and `createRetryApiCall`
+ * defaults to `maxRetries = 3` (`retry-api-call.ts:566`), so the send stack's
+ * true worst-case in-process block is `maxRetries × 120s` — the 6s→6min the
+ * constant's own docblock names, not 120s.
+ *
+ * The window is deliberately left at the per-attempt ceiling anyway. It is
+ * already ~3x the slowest ladder-evidenced recovery the live fleet has
+ * produced (40.6s), and the error direction is fail-safe: a real recovery that
+ * took longer than 120s books a sev-3 the operator can dismiss, whereas
+ * widening to 6min hands three extra times as much unrelated same-chat traffic
+ * the chance to launder a genuinely lost reply. Widen it only against observed
+ * recoveries past 120s, and re-read this paragraph before assuming the
+ * constant means what its name suggests.
  */
 export const REPLY_DELIVERY_RECOVERY_WINDOW_MS = DEFAULT_MAX_FLOOD_SLEEP_MS;
 
@@ -535,18 +634,26 @@ function lineInstantMs(line: string): number | null {
  *   - the edit-flood-fuse deferral, which re-issues the send on a later tick,
  *     off the async chain the attempt context lives on — observed recovering
  *     in ~40s;
- *   - `runBackstopDelivery`'s bounded in-turn re-attempt, above the policy;
- *   - the queued-card re-send after `queued card send failed`
- *     (`stream-render.ts:393`).
+ *   - `runBackstopDelivery`'s bounded in-turn re-attempt, above the policy.
  *
- * Of the 16 `status=err` rich sends on the live fleet's gateway logs, 7 are
- * provably a ladder recovery (four thread-drops at 483-955ms, two flood
- * deferrals at ~40s, one queued-card re-send at 8.7s) — the detector was paging
- * the operator about replies they had already read, which is the success-theater
- * inversion the ledger exists to avoid. The other 9 keep the sev-3: five never
- * landed at all, one landed on a different chat, and three are followed only by
- * UNRELATED same-chat traffic (see fact 3 below) — a count of 12 was reached by
- * treating those three as recoveries, which they are not.
+ * NOT on that list, though an earlier revision of this docblock put it there:
+ * the queued card. `queued card send failed` names an ABANDONED card, not a
+ * pending re-send — see `FUSE_SEND_DEFERRAL_RE`'s docblock for the call-site
+ * evidence.
+ *
+ * Of the 16 `status=err` rich sends on the live fleet's gateway logs, 6 are
+ * provably a ladder recovery (four thread-drops at 483-955ms and two flood
+ * deferrals at ~40s) — the detector was paging the operator about replies they
+ * had already read, which is the success-theater inversion the ledger exists to
+ * avoid. The other 10 keep the sev-3: five never landed at all, two landed on a
+ * different chat, and three are followed only by UNRELATED same-chat traffic
+ * (see fact 3 below). Two higher counts were reached and discarded on the way
+ * here, both by accepting weaker evidence: 12, by treating same-chat traffic
+ * inside the window as a recovery outright; and 7, by additionally reading
+ * finn's abandoned queued card (`2026-08-04T11:26:49.563Z`) as a re-send — an
+ * episode whose only other "evidence" was a cosmetic `editMessageText` fuse
+ * deferral 5.8s later, which is precisely the coincidence the scoping in
+ * `FUSE_SEND_DEFERRAL_RE` exists to reject.
  *
  * The verdict is derived from the log's CONTENT and its own timestamps, never
  * from how many lines follow — the position-dependence #4682 B1 removed from
@@ -577,9 +684,19 @@ function lineInstantMs(line: string): number | null {
  *    positively says the send stack was still working on THAT send:
  *      - it arrives inside `REPLY_DELIVERY_IMMEDIATE_RESEND_MS` (the
  *        synchronous, marker-less ladders), or
- *      - a `RECOVERY_LADDER_MARKER_RE` line sits between the two, or
+ *      - a gateway-wide flood ladder is open between the two
+ *        (`GATEWAY_FLOOD_LADDER_RE`), or
+ *      - the fuse deferred a rich send FOR THIS CHAT between the two
+ *        (`FUSE_SEND_DEFERRAL_RE`), or
  *      - the rejection itself is a flood rejection (`FLOOD_REJECTION_RE`),
  *        whose ladder re-issues on a later tick.
+ *    Each of those three is scoped as tightly as its line permits, which is
+ *    the whole difference between evidence and coincidence: the review that
+ *    produced this paragraph's first draft also showed that a marker matched
+ *    loosely enough is just a clock. Injecting ONE routine cosmetic
+ *    `edit-flood-fuse deferred method=editMessageText` line — of which the
+ *    fleet logs 34,352 — after gymbro's UTF-8 rejection was enough to clear
+ *    it under the unscoped marker set.
  *    Deliberately NOT used as a disqualifier: an intervening inbound. A real
  *    flood recovery interleaves with them (carrie 2026-08-11 12:40:19 rides two
  *    `rx update_id=… type=callback_query` lines), so vetoing on inbounds would
@@ -609,7 +726,7 @@ export function classifyReplyDeliveryEpisode(
   // Fact 3: a flood rejection names its own ladder, which re-issues on a later
   // tick — that is standing evidence for the whole window. Every other ladder
   // has to prove itself with a marker line or an immediate re-send.
-  let ladderEvidence = FLOOD_REJECTION_RE.test(failLine);
+  let ladderEvidence = isFloodRejection(failLine);
 
   for (let j = failIdx + 1; j < lines.length; j++) {
     const line = lines[j];
@@ -625,7 +742,11 @@ export function classifyReplyDeliveryEpisode(
     // the episode nor extends it.
     const ms = lineInstantMs(line);
     if (ms !== null && ms - failMs > REPLY_DELIVERY_RECOVERY_WINDOW_MS) break;
-    if (RECOVERY_LADDER_MARKER_RE.test(line)) ladderEvidence = true;
+    // A gateway-wide flood ladder needs no scoping (it has no chat to scope
+    // to); a fuse deferral must name THIS chat and a rich SEND, or it is
+    // cosmetic repaint throttling that says nothing about this failure.
+    if (GATEWAY_FLOOD_LADDER_RE.test(line)) ladderEvidence = true;
+    else if (FUSE_SEND_DEFERRAL_RE.exec(line)?.[1] === chat) ladderEvidence = true;
     if (!TG_POST_RICH_LINE_RE.test(line)) continue;
     if (TG_POST_CHAT_RE.exec(line)?.[1] !== chat) continue;
     // Same chat AND (same thread OR the landing dropped the thread). A landing
@@ -641,7 +762,7 @@ export function classifyReplyDeliveryEpisode(
       // 2026-08-11 12:40:19) logs two rejections before the fuse releases the
       // send. Evidence is only ever read off a non-landing line, so a landing
       // can never justify itself.
-      if (FLOOD_REJECTION_RE.test(line)) ladderEvidence = true;
+      if (isFloodRejection(line)) ladderEvidence = true;
       continue;
     }
     // The FIRST landing settles the episode: it clears the failure only with
