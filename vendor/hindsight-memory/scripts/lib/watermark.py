@@ -92,6 +92,33 @@ def _lock_path(session_id: str) -> str:
     return os.path.join(watermark_dir(), f"{_safe_session(session_id)}.lock")
 
 
+def tail_after(messages: list, last_uuid: Optional[str]) -> list:
+    """Return the transcript entries AFTER the committed watermark anchor.
+
+    Pure and IO-free — the single shared slice used by BOTH the boot reconciler
+    (``reconcile_tail``) and the incremental SessionEnd sweep (``retain``, the
+    switchroom memory-RFC P1 change). One implementation, so the reconcile /
+    watermark failure category cannot grow a second, divergent copy.
+
+    Two safety fallbacks, both returning the WHOLE transcript — a safe
+    re-upsert, never a skip, never an empty slice:
+
+    * ``last_uuid`` falsy (no committed watermark) — e.g. a short session that
+      never fired a per-window retain, so the force sweep must flush it whole.
+    * ``last_uuid`` absent from ``messages`` (compaction removed the anchor).
+
+    Callers in the retain seam depend on the whole-transcript fallback: an empty
+    or skipped slice there DELETES a turn rather than degrading it
+    (``retain.py`` §4.3 hazard). Never change a fallback here to return ``[]``.
+    """
+    if not last_uuid:
+        return list(messages)
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("uuid") == last_uuid:
+            return messages[i + 1:]
+    return list(messages)
+
+
 def load(session_id: str) -> Optional[dict]:
     """Return the stored watermark dict for ``session_id``, or ``None``."""
     p = _path(session_id)

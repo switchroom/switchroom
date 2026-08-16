@@ -366,6 +366,7 @@ def select_retain_window(
     overlap_turns: int,
     all_messages: list,
     force: bool = False,
+    since_uuid: str | None = None,
 ) -> tuple:
     """Decide which messages to retain and whether to send as a full window.
 
@@ -396,6 +397,17 @@ def select_retain_window(
     the whole session even if per-turn windowing had an edge. This costs a
     full sweep only ONCE per session (at end), not per turn.
 
+    ``since_uuid`` (memory-RFC P1) makes that final sweep INCREMENTAL: when
+    ``force=True`` and a committed watermark uuid is supplied, only the
+    transcript tail after it is retained, instead of re-storing the whole
+    session on top of the per-window documents that already carry it. The value
+    is resolved by the caller (``run_retain`` reads the watermark, wrapped) and
+    passed in — this function stays pure and IO-free. ``since_uuid=None``
+    reproduces the whole-session sweep exactly, which is what the vendor
+    full-session path and the ``retainEveryNTurns==1`` path pass. The slice
+    degrades to the whole transcript on a missing/compacted anchor
+    (``watermark.tail_after``), so a forced sweep never emits an empty slice.
+
     Durability invariant (jtbd-memory-survives-restart UAT): the window
     always extends to the END of the transcript (``slice_last_turns_by_user_boundary``
     returns ``messages[start:]``), so the turn that just completed — the one
@@ -412,8 +424,21 @@ def select_retain_window(
         window_turns = max(retain_every_n, 1) + overlap_turns
         messages_to_retain = slice_last_turns_by_user_boundary(all_messages, window_turns)
         return messages_to_retain, True
+    # Forced (SessionEnd) chunked sweep with a committed watermark uuid: retain
+    # only the transcript tail after it, instead of re-storing the whole session
+    # on top of the N per-window documents that already carry the same content
+    # (memory-RFC P1). ``since_uuid`` is None on the vendor full-session path and
+    # at retainEveryNTurns==1 (the caller withholds it there — see run_retain),
+    # which preserves today's whole-session behaviour byte-for-byte.
+    #
+    # tail_after is PURE and IO-free (the watermark READ happens in run_retain,
+    # wrapped) and degrades to the whole transcript on a missing/compacted
+    # anchor, so this branch can never emit an empty slice into the retain seam.
+    if force and since_uuid is not None:
+        return watermark.tail_after(all_messages, since_uuid), True
     # Full session: vendor full-session mode, OR a forced (SessionEnd) chunked
-    # sweep. Retain all messages, always as a full window.
+    # sweep with no watermark to slice against. Retain all messages, always as a
+    # full window.
     return list(all_messages), True
 
 
@@ -798,8 +823,37 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     # select_retain_window() for the switchroom-divergence rationale
     # (Phase 6b: chunked window-slicing now works at retainEveryNTurns=1).
     overlap_turns = config.get("retainOverlapTurns", 0)
+
+    # Incremental SessionEnd sweep (memory-RFC P1): a forced chunked sweep at
+    # retainEveryNTurns>1 retains only the transcript tail after the committed
+    # watermark, not the whole session on top of the N per-window documents that
+    # already carry it. The watermark READ is filesystem IO on a JSON file that
+    # could be truncated / permission-broken / absent, so it lives HERE (not in
+    # the pure select_retain_window) inside a catch-all try/except.
+    #
+    # §4.3 HAZARD: this is the one seam where a raise DELETES a turn rather than
+    # degrading it. Every failure mode below MUST degrade to since_uuid=None,
+    # which reproduces today's whole-session sweep exactly. The except catches
+    # Exception (not a named subset) on purpose — any raise here is worse than a
+    # wrong value. The n==1 and full-session paths deliberately never compute a
+    # watermark: on those the document id is {session_id} and a tail slice would
+    # TRUNCATE the stored document (§4.2), so they keep the full-session sweep.
+    since_uuid = None
+    if force and retain_mode == "chunked" and retain_every_n > 1:
+        try:
+            _wm = watermark.load(session_id)
+            since_uuid = _wm.get("last_uuid") if _wm else None
+        except Exception as e:  # noqa: BLE001 - degrade, never raise into this seam
+            print(
+                "[Hindsight] watermark read failed for incremental sweep; "
+                f"falling back to full-session sweep: {e}",
+                file=sys.stderr,
+            )
+            since_uuid = None
+
     messages_to_retain, retain_full_window = select_retain_window(
-        retain_mode, retain_every_n, overlap_turns, all_messages, force=force
+        retain_mode, retain_every_n, overlap_turns, all_messages, force=force,
+        since_uuid=since_uuid,
     )
     if retain_mode == "chunked" and not force:
         window_turns = max(retain_every_n, 1) + overlap_turns
@@ -808,9 +862,11 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
             f"Chunked retain firing (window: {window_turns} human turns, {len(messages_to_retain)} messages)",
         )
     elif retain_mode == "chunked" and force:
+        _swept = "incremental (tail after watermark)" if since_uuid is not None else "full-session"
         debug_log(
             config,
-            f"Chunked retain, forced full-session sweep (SessionEnd): {len(all_messages)} messages",
+            f"Chunked retain, forced {_swept} sweep (SessionEnd): "
+            f"{len(messages_to_retain)}/{len(all_messages)} messages",
         )
     else:
         debug_log(config, f"Full session retain: {len(all_messages)} messages")
