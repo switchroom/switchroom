@@ -28,6 +28,7 @@ import {
   type BrokerResponse,
 } from "./protocol.js";
 import type { VaultEntry } from "../vault.js";
+import { createVault, setStringSecret, getStringSecret } from "../vault.js";
 import { createAuditLogger, type AuditEntry } from "./audit-log.js";
 
 const TEST_SECRETS: Record<string, VaultEntry> = {
@@ -947,4 +948,309 @@ describe("VaultBroker.reload (SIGHUP hot-reload)", () => {
       expect(resp.status.keyCount).toBe(Object.keys(TEST_SECRETS).length);
     }
   });
+});
+
+// ── #4736 follow-up: the stat-on-access refresh fails OPEN, and that must
+//    not leak onto the write path or downgrade the layout-drift fatal ──────────
+//
+// PR #4736 made the broker re-read `vault.enc` when the file changes so that
+// operator writes become visible. `refreshVaultIfChanged` deliberately fails
+// OPEN when the changed file will not decrypt: it warns once and keeps serving
+// the previously loaded dict, so a torn write never costs the fleet its vault
+// access. Defensible for READS. These suites pin the two places it must not
+// reach, plus the unlock stat ordering that decides whether a boot-time race
+// is ever noticed.
+//
+// NOTE: bun-run only (VaultBroker → grants-db → bun:sqlite); this file is
+// vitest-excluded and on the #3756 known-orphan allowlist.
+
+function makeVaultBackedAclConfig(vaultPath: string, keys: string[]) {
+  return {
+    switchroom: { version: 1 },
+    telegram: { bot_token: "test", forum_chat_id: "123" },
+    vault: {
+      path: vaultPath,
+      broker: { socket: "~/.switchroom/vault-broker.sock", enabled: true },
+    },
+    agents: { myagent: { schedule: [{ secrets: keys }] } },
+  } as any;
+}
+
+describe("VaultBroker op:put refuses to persist over a vault it could not re-open (#4736)", () => {
+  const PASSPHRASE = "broker-put-guard-passphrase";
+  const OTHER_PASSPHRASE = "operator-restored-from-backup-passphrase";
+  const KEY = "myagent/rotating-token";
+
+  let broker: VaultBroker;
+  let tmpDir: string;
+  let vaultPath: string;
+  let socketPath: string;
+  let auditPath: string;
+  let prevNonLinuxFlag: string | undefined;
+
+  beforeEach(async () => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-put-guard-"));
+    vaultPath = path.join(tmpDir, "vault.enc");
+    socketPath = path.join(tmpDir, "test.sock");
+    auditPath = path.join(tmpDir, "audit.log");
+
+    createVault(PASSPHRASE, vaultPath);
+    setStringSecret(PASSPHRASE, vaultPath, KEY, "OLD_TOKEN");
+
+    broker = new VaultBroker({
+      // Seeded empty so start() never reaches _tryAutoUnlock (hermeticity);
+      // the unlock below installs the REAL on-disk vault + its stamp.
+      _testSecrets: {},
+      _testConfig: makeVaultBackedAclConfig(vaultPath, [KEY]),
+      _testVaultPath: vaultPath,
+      _testAgentName: "myagent",
+      _testAuditLogger: createAuditLogger({ path: auditPath }),
+    });
+    await broker.start(socketPath, undefined, undefined);
+    broker.unlockFromPassphrase(PASSPHRASE);
+  });
+
+  afterEach(() => {
+    if (broker) broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  // Positive control: with a healthy vault the rotation this guard protects
+  // still works end-to-end. Without this, "refuse everything" would pass.
+  it("persists a normal rotation when the vault on disk is the one it loaded", async () => {
+    const resp = await rpc(socketPath, {
+      v: 1, op: "put", key: KEY, entry: { kind: "string", value: "ROTATED_TOKEN" },
+    });
+    expect(resp.ok).toBe(true);
+    expect(getStringSecret(PASSPHRASE, vaultPath, KEY)).toBe("ROTATED_TOKEN");
+  });
+
+  it("refuses the put — and leaves the operator's file byte-identical — after a failed re-open", async () => {
+    // Operator restores vault.enc from a backup encrypted under a DIFFERENT
+    // passphrase. The broker stats a new inode, cannot decrypt it, warns once
+    // and keeps serving its pre-restore dict (the fail-open read path).
+    fs.rmSync(vaultPath);
+    createVault(OTHER_PASSPHRASE, vaultPath);
+    setStringSecret(OTHER_PASSPHRASE, vaultPath, KEY, "RESTORED_FROM_BACKUP");
+    const bytesBefore = fs.readFileSync(vaultPath);
+
+    const resp = await rpc(socketPath, {
+      v: 1, op: "put", key: KEY, entry: { kind: "string", value: "ROTATED_TOKEN" },
+    });
+
+    // The assertion that actually matters, and it goes FIRST: the operator's
+    // restored file is untouched. Asserting only the error code would still
+    // pass if saveVault had already re-encrypted the stale dict over it.
+    expect(fs.readFileSync(vaultPath).equals(bytesBefore)).toBe(true);
+    expect(getStringSecret(OTHER_PASSPHRASE, vaultPath, KEY)).toBe("RESTORED_FROM_BACKUP");
+
+    // The response is a refusal...
+    expect(resp.ok).toBe(false);
+    if (!resp.ok) {
+      expect(resp.code).toBe("INTERNAL");
+      expect(resp.msg).toContain("put refused");
+      // Never a secret value in an error message.
+      expect(resp.msg).not.toContain("OLD_TOKEN");
+      expect(resp.msg).not.toContain("ROTATED_TOKEN");
+      expect(resp.msg).not.toContain("RESTORED_FROM_BACKUP");
+    }
+
+    // Audited as a refusal, with the key name only.
+    const rows = readAuditLines(auditPath).filter((r) => r.op === "put");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].result).toBe("denied:vault-file-unreadable");
+    expect(JSON.stringify(rows[0])).not.toContain("ROTATED_TOKEN");
+  });
+});
+
+describe("VaultBroker runtime vault-layout drift fails closed, never fail-open (#4736)", () => {
+  const PASSPHRASE = "broker-drift-runtime-passphrase";
+  const KEY = "myagent/rotating-token";
+
+  let broker: VaultBroker;
+  let tmpHome: string;
+  let switchroomDir: string;
+  let vaultPath: string;
+  let legacyPath: string;
+  let socketPath: string;
+  let auditPath: string;
+  let prevNonLinuxFlag: string | undefined;
+
+  beforeEach(async () => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "broker-drift-runtime-"));
+    switchroomDir = path.join(tmpHome, ".switchroom");
+    const vaultDir = path.join(switchroomDir, "vault");
+    fs.mkdirSync(vaultDir, { recursive: true, mode: 0o700 });
+    vaultPath = path.join(vaultDir, "vault.enc");
+    legacyPath = path.join(switchroomDir, "vault.enc");
+    socketPath = path.join(tmpHome, "test.sock");
+    auditPath = path.join(tmpHome, "audit.log");
+
+    createVault(PASSPHRASE, vaultPath);
+    setStringSecret(PASSPHRASE, vaultPath, KEY, "OLD_TOKEN");
+    // Post-migration shape (state D): legacy path is a symlink to the new one.
+    fs.symlinkSync("vault/vault.enc", legacyPath);
+
+    broker = new VaultBroker({
+      _testSecrets: {},
+      _testConfig: makeVaultBackedAclConfig(vaultPath, [KEY]),
+      _testVaultPath: vaultPath,
+      _testAgentName: "myagent",
+      _testAuditLogger: createAuditLogger({ path: auditPath }),
+    });
+    await broker.start(socketPath, undefined, undefined);
+    broker.unlockFromPassphrase(PASSPHRASE);
+  });
+
+  afterEach(() => {
+    if (broker) broker.stop();
+    try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  it("stops serving when the legacy path diverges after unlock", async () => {
+    // Sanity: the broker serves the key before drift appears.
+    const before = await rpc(socketPath, { v: 1, op: "get", key: KEY });
+    expect(before.ok).toBe(true);
+
+    // An older CLI writes the LEGACY path (rename replaces the symlink) with
+    // different content, and the canonical file also moves — broker and CLI
+    // are now writing different files. At unlock this is fatal by design.
+    fs.rmSync(legacyPath);
+    fs.writeFileSync(legacyPath, "divergent-legacy-vault-content", { mode: 0o600 });
+    setStringSecret(PASSPHRASE, vaultPath, KEY, "NEWER_TOKEN");
+
+    const after = await rpc(socketPath, { v: 1, op: "get", key: KEY });
+    // Pre-fix this returned ok with a value: the drift throw was swallowed by
+    // the refresh's generic catch, which warned once and kept serving.
+    expect(after.ok).toBe(false);
+    if (!after.ok) expect(after.code).toBe("LOCKED");
+
+    // Fail-closed for real: the broker dropped its secrets and reports locked.
+    expect(broker._getSecretsRef()).toBeNull();
+    const status = await rpc(socketPath, { v: 1, op: "status" });
+    expect(status.ok).toBe(true);
+    if (status.ok && "status" in status) expect(status.status.unlocked).toBe(false);
+
+    // And the escalation is on the record, without secret material.
+    const rows = readAuditLines(auditPath);
+    const drift = rows.filter((r) => r.result === "error:vault-layout-drift");
+    expect(drift).toHaveLength(1);
+    expect(JSON.stringify(rows)).not.toContain("OLD_TOKEN");
+    expect(JSON.stringify(rows)).not.toContain("NEWER_TOKEN");
+  });
+});
+
+describe("VaultBroker unlock stamps the vault BEFORE decrypting it (#4736)", () => {
+  const PASSPHRASE = "broker-unlock-stamp-passphrase";
+  const KEY = "myagent/rotating-token";
+
+  let broker: VaultBroker;
+  let tmpDir: string;
+  let vaultPath: string;
+  let socketPath: string;
+  let prevNonLinuxFlag: string | undefined;
+  let child: import("node:child_process").ChildProcess | null = null;
+
+  beforeEach(() => {
+    prevNonLinuxFlag = process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = "1";
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "broker-unlock-stamp-"));
+    vaultPath = path.join(tmpDir, "vault.enc");
+    socketPath = path.join(tmpDir, "test.sock");
+  });
+
+  afterEach(() => {
+    if (child) { try { child.kill(); } catch { /* ignore */ } child = null; }
+    if (broker) broker.stop();
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (prevNonLinuxFlag === undefined) {
+      delete process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX;
+    } else {
+      process.env.SWITCHROOM_BROKER_ALLOW_NON_LINUX = prevNonLinuxFlag;
+    }
+  });
+
+  it("sees a write that lands inside the KDF window (apply racing boot)", async () => {
+    // The whole scenario is a race the broker cannot avoid: openVault pays a
+    // ~50ms scrypt derivation, and unlock runs at boot — exactly when
+    // `switchroom apply` may be rewriting the vault. Stamping AFTER the
+    // decrypt records the NEW file's identity against the OLD content, and
+    // the stat-on-access reload then sees "unchanged" and serves the stale
+    // value indefinitely. Stamping first fails the safe way.
+    createVault(PASSPHRASE, vaultPath);
+    setStringSecret(PASSPHRASE, vaultPath, KEY, "OLD_TOKEN");
+
+    // Stage the operator's new vault ahead of time so the racing step is a
+    // bare rename (microseconds) — the test must not depend on a second
+    // scrypt fitting inside the window.
+    const stagedPath = path.join(tmpDir, "staged.enc");
+    createVault(PASSPHRASE, stagedPath);
+    setStringSecret(PASSPHRASE, stagedPath, KEY, "NEW_TOKEN");
+
+    // A separate PROCESS is required: unlockFromPassphrase is synchronous, so
+    // nothing on this event loop can run during the derivation.
+    const goPath = path.join(tmpDir, "go");
+    const donePath = path.join(tmpDir, "done");
+    const readyPath = path.join(tmpDir, "ready");
+    const racerPath = path.join(tmpDir, "racer.mjs");
+    fs.writeFileSync(racerPath, [
+      "import * as fs from 'node:fs';",
+      `fs.writeFileSync(${JSON.stringify(readyPath)}, '');`,
+      "const sleeper = new Int32Array(new SharedArrayBuffer(4));",
+      `while (!fs.existsSync(${JSON.stringify(goPath)})) { Atomics.wait(sleeper, 0, 0, 1); }`,
+      `fs.renameSync(${JSON.stringify(stagedPath)}, ${JSON.stringify(vaultPath)});`,
+      `fs.writeFileSync(${JSON.stringify(donePath)}, String(Date.now()));`,
+    ].join("\n"));
+    const { spawn } = await import("node:child_process");
+    child = spawn(process.execPath, [racerPath], { stdio: "ignore" });
+    const readyDeadline = Date.now() + 10_000;
+    while (!fs.existsSync(readyPath) && Date.now() < readyDeadline) {
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    expect(fs.existsSync(readyPath)).toBe(true);
+
+    broker = new VaultBroker({
+      _testSecrets: {},
+      _testConfig: makeVaultBackedAclConfig(vaultPath, [KEY]),
+      _testVaultPath: vaultPath,
+      _testAgentName: "myagent",
+      _testAuditLogger: createAuditLogger({ path: path.join(tmpDir, "audit.log") }),
+    });
+    await broker.start(socketPath, undefined, undefined);
+
+    // Release the racer, then immediately burn the KDF window.
+    fs.writeFileSync(goPath, "");
+    const startedAt = Date.now();
+    broker.unlockFromPassphrase(PASSPHRASE);
+    const finishedAt = Date.now();
+
+    // The race must actually have landed inside the window, or the test
+    // proves nothing.
+    expect(fs.existsSync(donePath)).toBe(true);
+    const racedAt = Number(fs.readFileSync(donePath, "utf-8"));
+    expect(racedAt).toBeGreaterThanOrEqual(startedAt);
+    expect(racedAt).toBeLessThanOrEqual(finishedAt);
+
+    // Pre-fix: the post-decrypt stat recorded the RENAMED file, so the reload
+    // saw no change and this returned OLD_TOKEN forever.
+    const resp = await rpc(socketPath, { v: 1, op: "get", key: KEY });
+    expect(resp.ok).toBe(true);
+    if (resp.ok && "entry" in resp && resp.entry.kind === "string") {
+      expect(resp.entry.value).toBe("NEW_TOKEN");
+    }
+  }, 30_000);
 });
