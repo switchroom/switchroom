@@ -55,16 +55,23 @@ PROFILE_STATEMENTS = [
     "I prefer dark roast coffee",
     "I'd prefer British spelling in my docs",
     "my preference is tabs over spaces",
-    # --- durable self-facts: "my <thing> is/are …" ---
+    # --- durable self-facts: "my <ATTRIBUTE> is/are …" (tight allow-list) ---
     "my timezone is Australia/Melbourne",
     "my email is ken@example.com",
     "my sister is Lisa",
     "my kids are at school during the day",
+    "my name's Ken",  # contraction form
     # --- identity / situation ---
     "I live in Melbourne",
     "I work at Anthropic",
     "I'm allergic to peanuts",
     "I'm based in Australia",
+    # --- durable identity: diet / abstention / "I'm a <noun>" ---
+    "I'm a vegetarian",
+    "I don't eat meat",
+    "call me Ken",
+    # --- tastes (durable like/dislike framing) ---
+    "I hate em-dashes",
     # --- durable habits ---
     "I always take my coffee black",
     "I usually work late on Thursdays",
@@ -94,13 +101,34 @@ NON_PROFILE = [
     "the project timezone is UTC",
     "please run the tests",
     "what time is it",
-    # --- discourse-marker "my <X> is" — not a durable profile fact ---
+    # --- discourse-marker "my <X> is" — not a durable profile fact. The
+    #     positive arm uses a TIGHT identity allow-list, so a free noun never
+    #     reaches the matcher; these confirm that. ---
     "my guess is the cache is stale",
     "my point is that we should ship it",
     "my concern is the timeout",
+    # --- transient dev state "my <transient> is/are …". These are the exact
+    #     over-fires the free-`\w+` arm produced; the allow-list must NOT fire
+    #     on them (RFC favour-false-negatives constraint on this agent). ---
+    "my container is down",
+    "my build is failing",
+    "my code is broken",
+    "my PR is ready",
+    "my worktree is dirty",
+    "my server is down",
+    "my deploy is stuck",
+    "my tests are green",
+    "my branch is merged",
     # --- pleasantry embedding a bare always/never after "I" ---
     "I always appreciate your help",
     "I never enjoy waiting, but thanks",
+    # --- "I'm a <hedge>" is a transient mood, not an "I'm a <noun>" identity ---
+    "I'm a bit tired",
+    "I'm a little confused about the config",
+    "I'm a big fan of shipping fast",
+    # --- "call me <phrasing>" as a request, not a name form ---
+    "call me back later",
+    "call me when the build finishes",
     # --- the <channel …> envelope wrapper on its own must never trigger ---
     '<channel user="ken" chat_id="123">',
 ]
@@ -135,6 +163,16 @@ class TestProfileDetection(unittest.TestCase):
         self.assertTrue(
             looks_like_profile_statement(
                 "she thinks I'm wrong. my timezone is Melbourne"
+            )
+        )
+
+    def test_attribution_scrub_stops_at_a_comma(self):
+        # The attributed span must stop at a comma, not run to end-of-sentence:
+        # a real self-fact trailing the attributed clause in the SAME sentence
+        # must still reach the positive matcher (MINOR: greedy [^.?!]* → [^.?!,]*).
+        self.assertTrue(
+            looks_like_profile_statement(
+                "she said the deploy failed, my timezone is Melbourne"
             )
         )
 

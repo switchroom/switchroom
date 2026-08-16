@@ -1681,25 +1681,31 @@ _PROFILE_NUDGE_NEGATIVE_RE = re.compile(
       | \b what (?: ['’]? s | \s+ is | \s+ are ) \s+ my \b
       | \b (?: where | when | is | are | was | were ) \s+ my \b
       | \b remind \s+ me \s+ what \b
-      # --- discourse-marker "my <X> is" that is NOT a durable profile fact
-      #     ("my guess is", "my point is") — scrub so the "my … is" positive
-      #     doesn't fire on them. Conservative precision, not correctness. ---
-      | \b my \s+ (?: guess | point | question | understanding | concern | worry
-             | hope | bet | sense | take | assumption | plan | goal | issue
-             | problem | thinking | thought | suggestion | recommendation
-             | advice | answer | response | reply | mistake | fault | apology
-             | apologies | bad ) \b
       # --- attributions: a fact the operator ascribes to someone else (or to
       #     the agent) is not the operator stating his own profile. Scrub the
-      #     attributed clause through end-of-sentence. ---
+      #     attributed clause up to the next clause boundary. Stop at a comma as
+      #     well as sentence-enders so a trailing real fact in the SAME sentence
+      #     ("she said X, my timezone is Melbourne") still reaches the positive
+      #     matcher instead of being swallowed. ---
       | \b (?: he | she | they | you | who | someone | everyone | nobody )
           \s+ (?: said | says | say | claimed | claims | thinks? | thought
                 | told | mentions? | mentioned | asks? | asked | wants? | wanted
                 | wrote | believes? | reckons? )
-          \b [^.?!]*
+          \b [^.?!,]*
       # --- pleasantries that embed a bare always/never after "I". ---
       | \b i \s+ (?: always | never )
           \s+ (?: appreciate | enjoy | 'm \s+ happy | am \s+ happy | love \s+ working ) \b
+      # --- "I'm a <hedge>" is a transient mood/quantifier, not "I'm a <noun>"
+      #     identity ("I'm a bit tired", "I'm a little confused"). Scrub the
+      #     "I'm a/an" lead so the identity arm can't fire on it. ---
+      | \b i (?: \s+ am | \s* ['’] m ) \s+ (?: a | an )
+          \s+ (?: bit | little | lot | tad | touch | bunch | couple | few
+                | fan \b | big \s+ fan ) \b
+      # --- "call me <phone-phrasing>" is a request, not a name form
+      #     ("call me back", "call me later"). Scrub so the name arm ("call me
+      #     Ken") is the only thing left that can fire. ---
+      | \b call \s+ me \s+ (?: back | later | tomorrow | tonight | soon | again
+                | when | if | once | after | before | at | on | in | asap ) \b
     )
     """
 )
@@ -1743,17 +1749,42 @@ def detect_query_timestamp(text, now=None) -> "str | None":
 _PROFILE_NUDGE_RE = re.compile(
     r"""(?ix)
     (?:
-      # --- stated preferences ---
+      # --- stated preferences / tastes ---
         \b i \s+ prefer \b
       | \b i['’]? d \s+ prefer \b
       | \b my \s+ preference \s+ (?: is | are ) \b
-      # --- durable self-facts: "my <thing> is/are/'s <value>" ---
-      | \b my \s+ \w+ (?: \s+ \w+ )? \s+ (?: is | are | ['’] s ) \b
+      | \b i \s+ (?: hate | love | despise | adore | dislike
+                  | can ['’]? t \s+ stand ) \b
+      # --- durable self-facts: "my <ATTRIBUTE> is/are/'s <value>".
+      #     ATTRIBUTE is a TIGHT allow-list of durable identity attributes.
+      #     A free noun ("my build is failing", "my container is down", "my PR
+      #     is ready") is transient dev state, not a profile fact — firing on
+      #     it inverts the RFC's favour-false-negatives constraint on this very
+      #     agent (klanker), so the free-`\w+` arm is deliberately NOT used. ---
+      | \b my \s+
+          (?: name | e-?mail | timezone | time \s+ zone | address
+            | (?: phone | mobile | cell ) (?: \s+ number )? | number
+            | birthday | birthdate | dob | anniversary | age | pronouns?
+            | handle | username | nickname | initials
+            | employer | company | partner | wife | husband | spouse
+            | girlfriend | boyfriend | kids? | children | child | son
+            | daughter | sister | brother | mother | father | mom | dad
+            | parents | dog | cat | pet | diet | allerg(?: y | ies )
+            | location | city | country | hometown )
+          (?: \s+ \w+ )?
+          (?: \s+ (?: is | are ) | \s* ['’] s ) \b
       # --- identity / situation ---
-      | \b i (?: \s+ am | \s* ['’] m ) \s+ (?: a | an )? \s* (?: allergic \s+ to
-            | based \s+ (?: in | at ) | from | located \s+ in ) \b
       | \b i \s+ live \s+ (?: in | at | near ) \b
       | \b i \s+ work \s+ (?: at | as | for | in ) \b
+      | \b i (?: \s+ am | \s* ['’] m ) \s+ (?: allergic \s+ to
+            | based \s+ (?: in | at ) | from | located \s+ in
+            | vegetarian | vegan | pescatarian | teetotal ) \b
+      | \b i (?: \s+ am | \s* ['’] m ) \s+ (?: a | an ) \s+ \w+
+      # --- dietary / abstention identity ("I don't eat meat") ---
+      | \b i \s+ (?: do \s* n['’]? t | don['’]? t | do \s+ not )
+            \s+ (?: eat | drink | use | own | drive ) \b
+      # --- name / address form ("call me Ken") ---
+      | \b call \s+ me \b
       # --- durable habits (first person; questions pre-scrubbed) ---
       | \b i \s+ always \b
       | \b i \s+ usually \b
