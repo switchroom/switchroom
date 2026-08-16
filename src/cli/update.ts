@@ -80,6 +80,7 @@ import {
   type ExecFn,
 } from "./component-versions.js";
 import { reconcileCron } from "../hindsight-watch/install-cron.js";
+import { reconcileCron as reconcileMentalModelRefreshCron } from "../memory/mm-refresh-cron.js";
 import {
   reconcileCron as reconcileConfigSyncCron,
   DEFAULT_INTERVAL_MINUTES as CONFIG_SYNC_DEFAULT_INTERVAL,
@@ -790,6 +791,54 @@ export function planUpdate(opts: UpdateOptions): UpdateStep[] {
         say(chalk.green(`  hindsight-watch cron reconciled at ${res.path}\n`));
       } else {
         say(chalk.gray(`  hindsight-watch cron already current at ${res.path}\n`));
+      }
+    },
+  });
+
+  // reconcile-mental-model-refresh-cron: re-assert the RFC-P10 stale-model
+  // refresh cron definition on every update, so an already-armed host can't
+  // drift (stale binary path, schedule, flags, PATH) — exactly the same
+  // REPAIR-not-ARM contract as reconcile-hindsight-watch-cron above.
+  // `reconcileMentalModelRefreshCron` is a no-op when the fragment is absent
+  // (arming stays the explicit `mental-model-refresh --install-cron` opt-in)
+  // and idempotent when present and current; the operator's `--cron-user` is
+  // preserved. Deferred in hostd-context for the same reason: /etc/cron.d is on
+  // the host, not in the hostd container. Never fatal.
+  steps.push({
+    name: "reconcile-mental-model-refresh-cron",
+    description:
+      "Reconcile /etc/cron.d/mental-model-refresh (binary path / schedule / flags) on already-armed hosts — idempotent; no-op when unarmed or already current",
+    skipReason: hostdContext
+      ? "deferred (hostd-context): /etc/cron.d is on the host, not in the hostd container — finish host-side with `switchroom mental-model-refresh --install-cron`"
+      : undefined,
+    isHostdDeferred: hostdContext,
+    run: () => {
+      const say = opts.stdout ?? ((t: string) => process.stdout.write(t));
+      const binary = process.env.SWITCHROOM_BINARY ?? "/usr/local/bin/switchroom";
+      const fallbackUser =
+        process.env.SUDO_USER ?? process.env.USER ?? process.env.LOGNAME;
+      let res: ReturnType<typeof reconcileMentalModelRefreshCron>;
+      try {
+        res = reconcileMentalModelRefreshCron({ binary, fallbackUser });
+      } catch (e) {
+        say(
+          chalk.yellow(
+            `  mental-model-refresh cron not reconciled: ${(e as Error).message}\n`,
+          ),
+        );
+        return;
+      }
+      if (res.status === "absent") {
+        say(
+          chalk.gray(
+            "  mental-model-refresh cron not armed — skipping reconcile " +
+              "(arm with `switchroom mental-model-refresh --install-cron`)\n",
+          ),
+        );
+      } else if (res.status === "reconciled") {
+        say(chalk.green(`  mental-model-refresh cron reconciled at ${res.path}\n`));
+      } else {
+        say(chalk.gray(`  mental-model-refresh cron already current at ${res.path}\n`));
       }
     },
   });
