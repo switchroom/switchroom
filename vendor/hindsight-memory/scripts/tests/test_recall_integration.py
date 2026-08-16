@@ -470,6 +470,59 @@ class RecallTelemetryLogTests(unittest.TestCase):
         self.assertIsNone(e["injected_score_median"])
         self.assertIsNone(e["injected_score_max"])
 
+    def test_logs_injected_directive_ids(self):
+        """Memory-redesign step 1 (E-45 recommendation (b)): the recall_log
+        row must name WHICH directives were injected, not just how many.
+        `directive_count` alone can't answer "which directives were never
+        once injected" — this makes that queryable.
+        """
+        directives = [
+            _directive("first", "content one", priority=10),
+            _directive("second", "content two", priority=5),
+        ]
+        client = _FakeClient(directives=directives, memories=[])
+        _run_main_with(client)
+        e = self._read_log()[0]
+        self.assertEqual(e["directive_count"], 2)
+        self.assertEqual(e["directive_ids"], ["id-first", "id-second"])
+
+    def test_directive_ids_preserve_priority_order_across_more_than_a_few(self):
+        """Real values across several directives, in the rendered priority
+        order — not just a two-item happy path."""
+        directives = [
+            _directive(f"d{i}", f"c{i}", priority=10 - i) for i in range(6)
+        ]
+        client = _FakeClient(directives=directives, memories=[])
+        _run_main_with(client)
+        e = self._read_log()[0]
+        self.assertEqual(e["directive_count"], 6)
+        self.assertEqual(
+            e["directive_ids"],
+            ["id-d0", "id-d1", "id-d2", "id-d3", "id-d4", "id-d5"],
+        )
+
+    def test_directive_ids_null_on_cache_hit(self):
+        """A cache hit replays a formatted context block, not a fetched
+        directive list — `directive_ids` must be null (schema-uniform with
+        `directive_count`/`directives_omitted`), never a stale prior value.
+
+        Forces the cache-HIT branch directly (rather than relying on a
+        second `main()` call actually persisting a cache entry — the
+        integration harness patches `write_state` to a no-op, so
+        `_cache_store` never lands between calls)."""
+        client = _FakeClient(directives=[_directive("only", "content", priority=5)], memories=[])
+        with patch.object(recall, "_cache_lookup", return_value="[Hindsight] cached context"), \
+                patch.dict(os.environ, {"HINDSIGHT_RECALL_CACHE_TTL_SECS": "300"}):
+            _run_main_with(client)
+        entries = self._read_log()
+        self.assertEqual(len(entries), 1)
+        e = entries[0]
+        self.assertTrue(e["cache_hit"])
+        self.assertIsNone(e["directive_ids"])
+        # Schema-uniform with the fields it mirrors.
+        self.assertIsNone(e["directive_count"])
+        self.assertIsNone(e["directives_omitted"])
+
     def test_no_log_when_plugin_data_unset(self):
         # If CLAUDE_PLUGIN_DATA isn't set, the writer no-ops silently —
         # we don't want a stray log file in the working directory.

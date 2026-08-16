@@ -77,6 +77,7 @@ from lib.directives import (
     count_omitted_directives,
     fetch_active_directives_cached,
     format_active_directives_block,
+    injected_directive_ids,
 )
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.parallel_recall import run_parallel
@@ -1900,6 +1901,10 @@ def main():
                 "directive_count": None,
                 # No directives block is built on a cache hit.
                 "directives_omitted": None,
+                # Same reason — a cache hit replays a formatted context
+                # block, not a fetched directive list, so there is nothing
+                # to derive the injected id set from this turn.
+                "directive_ids": None,
                 "demoted_count": 0,
                 # #3837 score-floor fields, present for a uniformly queryable
                 # schema. A cache hit replays a formatted context block, not a
@@ -2620,6 +2625,15 @@ def main():
         # never reached the agent. >0 here means the bank is over cap and the
         # doctor's directive-count check will be FAILing too.
         "directives_omitted": count_omitted_directives(directives),
+        # Switchroom memory-redesign step 1 (E-45 recommendation (b)) — WHICH
+        # directives actually reached the prompt this turn, in the same
+        # priority-descending order `format_active_directives_block` rendered
+        # them. `directive_count`/`directives_omitted` above are volume-only
+        # (how many fetched, how many the cap dropped); this is the queryable
+        # record of identity, so directive exposure — including "never once
+        # injected" — is measurable before any change to what gets injected.
+        # Purely additive: does not change `directives_block` composition.
+        "directive_ids": injected_directive_ids(directives),
         "demoted_count": demoted_count,
         # Switchroom #3837 — score-floor telemetry, deliberately alongside the
         # `injected_score_*` fields below: those are what the floor was derived

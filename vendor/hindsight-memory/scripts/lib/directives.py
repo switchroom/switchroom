@@ -241,6 +241,24 @@ def count_omitted_directives(directives: list, max_directives: int = MAX_DIRECTI
     return max(0, len(directives) - max_directives)
 
 
+def injected_directive_ids(directives: list, max_directives: int = MAX_DIRECTIVES) -> list:
+    """The `id`s of the directives `format_active_directives_block` would
+    actually INJECT (the `[:max_directives]` head-slice), in the same
+    priority-descending order the block renders them.
+
+    Read-only / additive instrumentation (step 1 of the memory redesign,
+    E-45 recommendation (b)): today a recall_log row records only
+    `directive_count` (how many were fetched) and `directives_omitted` (how
+    many were dropped by the cap), never WHICH directives actually reached
+    the prompt. This makes exposure queryable — e.g. "which directives have
+    never once been injected" — without touching what gets injected. Skips
+    any directive dict missing a truthy `id` rather than raising, so a
+    malformed entry can't take recall telemetry down.
+    """
+    truncated = directives[:max_directives] if directives else []
+    return [d["id"] for d in truncated if isinstance(d, dict) and d.get("id")]
+
+
 def format_active_directives_block(directives: list, max_directives: int = MAX_DIRECTIVES) -> Optional[str]:
     """Format directives into the <active_directives> block string.
 
