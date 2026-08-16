@@ -238,6 +238,38 @@ describe("refreshVaultIfChanged — safety properties", () => {
     KDF_TIMEOUT_MS,
   );
 
+  it("propagates a beforeOpen (layout-drift) throw instead of serving on", () => {
+    // The fail-open above is for DECRYPT failures. `beforeOpen` throwing means
+    // the broker can no longer tell WHICH file is the fleet's vault — at
+    // unlock that is fatal by design (server.ts refuses to unlock). Folding it
+    // into the catch would warn once, set `failedStamp` (which suppresses the
+    // re-check until the file changes again) and serve stale data unbounded:
+    // exactly what the guard exists to prevent.
+    const loaded: VaultRefreshState = {
+      secrets: { k: { kind: "string", value: "v" } },
+      passphrase: PASSPHRASE,
+      loadedStamp: readVaultStamp(vaultPath),
+      failedStamp: null,
+    };
+    let opens = 0;
+    const warnings: string[] = [];
+    expect(() =>
+      refreshVaultIfChanged(loaded, {
+        vaultPath,
+        force: true,
+        beforeOpen: () => { throw new Error("Vault layout divergence detected"); },
+        open: () => { opens++; return {}; },
+        warn: (m) => { warnings.push(m); },
+      }),
+    ).toThrow(/layout divergence/);
+    // No decrypt attempted, no "continuing to serve" warning, and the caller's
+    // state is untouched — the caller decides how to fail closed.
+    expect(opens).toBe(0);
+    expect(warnings).toEqual([]);
+    expect(loaded.failedStamp).toBeNull();
+    expect(loaded.secrets).not.toBeNull();
+  });
+
   it("runs beforeOpen (layout-drift detection) before every re-open", () => {
     const loaded: VaultRefreshState = {
       secrets: { "k": { kind: "string", value: "v" } },
@@ -297,5 +329,60 @@ describe("VaultBroker refreshes before every op that reads secrets", () => {
     expect(idx).toBeGreaterThan(-1);
     const window = src.slice(idx).split("\n").slice(0, 15).join("\n");
     expect(window).toContain("this._reloadSecretsIfVaultChanged(true)");
+  });
+});
+
+/**
+ * Call-site guards for the two server-side halves of the fail-open boundary.
+ *
+ * These are source-text assertions, and deliberately so: the BEHAVIOURAL tests
+ * for both (a `put` refused with the on-disk file proven byte-identical, and a
+ * runtime drift throw locking the broker) need a real `VaultBroker`, which
+ * imports `bun:sqlite` at module scope — bun-only, and the bun CI job runs
+ * only `telegram-plugin/` targets. Those live in `server.test.ts`
+ * (#3756 known-orphan allowlist) and are run with `bun test`. What runs HERE
+ * on every PR is the cheap structural half: if someone deletes the guard or
+ * the escalation, this goes red even though the behavioural suite is not
+ * wired into CI.
+ */
+describe("VaultBroker keeps the read-path fail-open off the write path", () => {
+  const src = fs.readFileSync(
+    path.join(import.meta.dirname, "server.ts"),
+    "utf-8",
+  );
+
+  it("op:put refuses to persist while failedVaultStamp is set", () => {
+    const idx = src.indexOf(`req.op === "put"`);
+    expect(idx).toBeGreaterThan(-1);
+    const branch = src.slice(idx);
+    const guardIdx = branch.indexOf("this.failedVaultStamp !== null");
+    const saveIdx = branch.indexOf("saveVault(this.passphrase");
+    expect(guardIdx, "no failedVaultStamp guard in the put branch").toBeGreaterThan(-1);
+    expect(saveIdx).toBeGreaterThan(-1);
+    // The refusal must come BEFORE the persist, and must return.
+    expect(guardIdx).toBeLessThan(saveIdx);
+    expect(branch.slice(guardIdx, saveIdx)).toContain("denied:vault-file-unreadable");
+  });
+
+  it("a drift throw on the refresh path locks the broker rather than continuing", () => {
+    const idx = src.indexOf("private _reloadSecretsIfVaultChanged(");
+    expect(idx).toBeGreaterThan(-1);
+    const method = src.slice(idx).split("\n").slice(0, 30).join("\n");
+    expect(method).toContain("catch");
+    expect(method).toContain("this._failClosedOnVaultDrift(");
+    const escalation = src.slice(src.indexOf("private _failClosedOnVaultDrift("));
+    expect(escalation.slice(0, 1500)).toContain("this.lock()");
+    expect(escalation.slice(0, 1500)).toContain("error:vault-layout-drift");
+  });
+
+  it("unlock stamps the vault file BEFORE the decrypt", () => {
+    const idx = src.indexOf("unlockFromPassphrase(passphrase: string)");
+    expect(idx).toBeGreaterThan(-1);
+    const body = src.slice(idx, idx + 2500);
+    const stampIdx = body.indexOf("this._readVaultStamp()");
+    const openIdx = body.indexOf("openVault(passphrase, this.vaultPath)");
+    expect(stampIdx).toBeGreaterThan(-1);
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(stampIdx).toBeLessThan(openIdx);
   });
 });

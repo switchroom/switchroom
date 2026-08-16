@@ -33,6 +33,10 @@
  *    stamp is deliberately NOT advanced, so the moment the file changes
  *    again — a completing tmp+rename lands a new inode and mtime — the next
  *    read retries and the broker self-heals.
+ *  - The fail-open above covers DECRYPT failures only. A `beforeOpen`
+ *    (vault-layout-drift) throw is fatal and propagates to the caller —
+ *    server.ts escalates it by locking the broker rather than serving a file
+ *    it can no longer identify as the fleet's vault.
  *  - The superseded entries are zeroed exactly as `lock()` does.
  *  - Never logs a secret value: only the path and the error message.
  */
@@ -99,7 +103,12 @@ export interface VaultRefreshOptions {
   vaultPath: string;
   /** Re-open even when the stamp has not moved (SIGHUP belt-and-braces). */
   force?: boolean;
-  /** Layout-drift check run immediately before the re-open (server.ts supplies it). */
+  /**
+   * Layout-drift check run immediately before the re-open (server.ts supplies
+   * `detectVaultLayoutDrift`). A throw from this callback is FATAL and
+   * PROPAGATES out of `refreshVaultIfChanged` — it is not folded into the
+   * keep-serving path. See the call site for why.
+   */
   beforeOpen?: (vaultPath: string) => void;
   /** Seam for tests; defaults to the real `openVault`. */
   open?: (passphrase: string, vaultPath: string) => Record<string, VaultEntry>;
@@ -142,9 +151,20 @@ export function refreshVaultIfChanged(
     return state;
   }
 
+  // Layout drift is FATAL and must NEVER be folded into the fail-open path
+  // below. `beforeOpen` (server.ts supplies `detectVaultLayoutDrift`) throws
+  // when the broker's vault file and the legacy CLI path are two divergent
+  // regular files — at unlock that throw deliberately aborts the unlock,
+  // because from that moment the broker cannot know which file is the fleet's
+  // vault. Catching it here would downgrade a documented fatal to one stderr
+  // line AND set `failedStamp`, which suppresses the re-check until the file
+  // changes again: precisely the unbounded "serve stale data" outcome the
+  // guard exists to prevent. Deliberately OUTSIDE the try — it propagates to
+  // the caller, which escalates (server.ts locks the broker + audits).
+  opts.beforeOpen?.(vaultPath);
+
   let next: Record<string, VaultEntry>;
   try {
-    opts.beforeOpen?.(vaultPath);
     next = open(passphrase, vaultPath);
   } catch (err: unknown) {
     const alreadyWarned =
