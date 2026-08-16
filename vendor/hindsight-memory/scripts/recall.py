@@ -54,7 +54,7 @@ import re  # noqa: E402
 import socket  # noqa: E402
 import sys  # noqa: E402
 import urllib.error  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
+from datetime import datetime  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1647,6 +1647,17 @@ def detect_query_timestamp(text, now=None) -> "str | None":
     this anchor. ``None`` means "send no field", which keeps the recall body
     byte-identical to a pre-P2 client.
 
+    The anchor carries the LOCAL wall-clock offset (``datetime.now()`` +
+    ``.astimezone()``), NOT UTC. This matters precisely on the dimension P2
+    serves: for a Melbourne evening query "what did we do yesterday", a
+    UTC-stamped anchor (``+00:00``) can be a calendar day ahead of the
+    operator's real day, so the engine would resolve "yesterday"/"last
+    week"/"on the 12th" against the wrong day. ``.astimezone()`` with no
+    argument attaches the process TZ (the container clock is already
+    Australia/Melbourne), which is the operator's actual day. Never
+    ``timezone.utc`` here — that would re-introduce the off-by-one this fix
+    removes.
+
     Returns ``None`` on empty / non-string input so a caller can pass a raw
     prompt without a guard.
     """
@@ -1654,7 +1665,7 @@ def detect_query_timestamp(text, now=None) -> "str | None":
         return None
     if not _TEMPORAL_EXPRESSION_RE.search(text):
         return None
-    anchor = now if now is not None else datetime.now(timezone.utc)
+    anchor = now if now is not None else datetime.now().astimezone()
     return anchor.isoformat()
 
 
@@ -1866,9 +1877,13 @@ def main():
     # from it. Deterministic regex on `_stripped` (same channel-stripped text
     # the nudge uses); no model call, microsecond cost, off the network path.
     # `None` when the prompt has no temporal phrase → the field is never added
-    # to the recall body (byte-identical to pre-P2). Gate lets an operator pin
-    # it off via settings.json `recallQueryTimestamp: false` — the field's
-    # rollback lever ("stop sending the field").
+    # to the recall body (byte-identical to pre-P2). The `recallQueryTimestamp`
+    # key is an IN-CODE guard only — it has NO schema/scaffold/env surface, so
+    # a settings.json edit would be clobbered on the next `switchroom apply`
+    # (the plugin dir is re-copied from vendor/). Per RFC P2 the rollback is
+    # "stop sending the field" = revert the commit; if a runtime knob is ever
+    # wanted, wire it the full schema->scaffold->config->env way
+    # `directiveCaptureNudge` is, not by hand-editing settings.json.
     query_timestamp = None
     if config.get("recallQueryTimestamp", True):
         query_timestamp = detect_query_timestamp(_stripped)
