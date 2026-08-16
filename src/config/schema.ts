@@ -1155,6 +1155,23 @@ export const AgentMemorySchema = z
             "reasoning consolidation model). Higher = more redundant " +
             "context re-sent per fire. Min 0. Cascade: per-field merge.",
           ),
+        tool_calls: z
+          .boolean()
+          .optional()
+          .describe(
+            "Whether auto-retain stores assistant tool_use blocks (with their " +
+            "entire input dict) and tool_result content (up to 2000 chars) " +
+            "alongside the human/assistant turns. Vendor + switchroom default " +
+            "is true — the fleet behaves byte-identically until an operator " +
+            "sets this false. Tool inputs/results are a large fraction of " +
+            "retained volume (RFC memory-redesign P4) but also where evidence " +
+            "lives (a commit SHA, a failing test's output, the diff that " +
+            "fixed something), so the tradeoff is real and per-agent. false is " +
+            "not a new mode: sidechains already force it off " +
+            "(subagent_retain.py). Set false to drop tool exhaust from an " +
+            "agent's retains. Cascade: per-field merge (agent wins over " +
+            "default).",
+          ),
       })
       .optional()
       .describe("Auto-retain (Stop-hook consolidation) cadence knobs"),
@@ -3913,6 +3930,7 @@ const profileFields = {
         .object({
           every_n_turns: z.number().int().min(1).optional(),
           overlap_turns: z.number().int().min(0).optional(),
+          tool_calls: z.boolean().optional(),
         })
         .optional(),
       // Mirrors of AgentMemorySchema.{bank_mission,reflect_mission,

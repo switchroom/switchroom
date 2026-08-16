@@ -418,6 +418,32 @@ on **every** scaffold/reconcile, so the yaml value is authoritative and
 **survives `switchroom apply`** regenerating that file (unlike a hand-edit,
 which reconcile would revert).
 
+### Storing tool calls in retains — `memory.retain.tool_calls`
+
+With `memory.retain.tool_calls: true` (the **default** — fleet behaviour is
+byte-identical until you set it otherwise), each auto-retain stores the
+assistant's `tool_use` blocks (with their entire input dict) and every
+`tool_result` up to 2000 characters, alongside the human/assistant turns. Tool
+inputs and results are a large fraction of retained volume, but they are also
+where evidence lives — a commit SHA, a failing test's output, the diff that
+fixed something — so the tradeoff is real and per-agent.
+
+```yaml
+agents:
+  chatbot:
+    memory:
+      retain:
+        tool_calls: false   # drop tool_use/tool_result exhaust from this bank
+```
+
+Setting `false` is not a new mode: delegated sub-agent (sidechain) retains
+already force it off. Like the cadence knobs, the value is stamped into the
+plugin's `settings.json` on **every** scaffold/reconcile (so it survives
+`switchroom apply`) and carries a matching `HINDSIGHT_RETAIN_TOOL_CALLS` env
+channel, so a `docker exec`'d retain or backfill resolves the same value.
+Cascade: per-field merge (an agent may override this and inherit the cadence
+knobs from `defaults`/profile).
+
 ### Shared / profile recall banks — `memory.recall.additional_banks`
 
 By default an agent recalls only its own bank. Point `additional_banks` at one or more extra Hindsight banks and the recall hook queries them too on every turn, **merging** their hits into the agent's own results (each extra bank gets an 8s timeout and is non-fatal on failure). Use this for a shared operator/household profile every agent should know — preferences, projects, people — kept consistent fleet-wide.
