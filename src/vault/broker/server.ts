@@ -513,9 +513,12 @@ export class VaultBroker {
    *    stamp to compare (seeded test state) — never re-prompts, never
    *    unlocks a locked broker.
    *  - A failed re-open (torn write, or the file re-encrypted under a
-   *    different passphrase) KEEPS the previously loaded secrets and warns
-   *    once per distinct bad stamp. The stamp is deliberately not advanced,
-   *    so the next read retries and a completed write self-heals.
+   *    different passphrase) KEEPS the previously loaded secrets, warns
+   *    once, and remembers the bad stamp so every later read does NOT pay
+   *    another scrypt derivation against the same unusable file. The loaded
+   *    stamp is deliberately not advanced, so the moment the file changes
+   *    again — a completing tmp+rename lands a NEW inode and mtime — the
+   *    next read retries and the broker self-heals.
    *  - The superseded entries are zeroed exactly as `lock()` does, so stale
    *    plaintext is not left behind on swap.
    */
@@ -527,6 +530,16 @@ export class VaultBroker {
     const current = this._readVaultStamp();
     if (current === null) return; // unreadable right now — keep serving
     if (!force && sameVaultStamp(current, known)) return;
+    // Already tried THIS exact file and it wouldn't open: don't burn a
+    // scrypt derivation per get against an unusable vault. Cleared as soon
+    // as the file changes again (or on a successful load / lock).
+    if (
+      !force &&
+      this.failedVaultStamp !== null &&
+      sameVaultStamp(this.failedVaultStamp, current)
+    ) {
+      return;
+    }
 
     let next: Record<string, VaultEntry>;
     try {
@@ -537,13 +550,13 @@ export class VaultBroker {
       const alreadyWarned =
         this.failedVaultStamp !== null &&
         sameVaultStamp(this.failedVaultStamp, current);
+      this.failedVaultStamp = current;
       if (!alreadyWarned) {
-        this.failedVaultStamp = current;
         process.stderr.write(
           `[vault-broker] WARNING: ${this.vaultPath} changed on disk but ` +
           `could not be re-opened (${(err as Error)?.message ?? "unknown error"}) — ` +
-          `continuing to serve the previously loaded secrets; will retry on the ` +
-          `next read\n`,
+          `continuing to serve the previously loaded secrets; will retry when ` +
+          `the file changes again\n`,
         );
       }
       return;
