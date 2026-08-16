@@ -315,12 +315,19 @@ using a throwaway bank `probe-scratch-klanker` for any write test.
 wrong for 0.9.0.** A live recall against bank `klanker` returned
 `"scores":{"final":0.6178,"reranker":0.6171,"keyword":15.02}` on every
 result, identically over REST and MCP. The `RecallScores` schema documents
-`final` / `reranker` / `semantic` / `keyword`. The comment at
-`recall.py:344-345` ("Hindsight's HTTP API does not return similarity
-scores") was presumably true of the version it was written against; it is
-false of what we run. It should be corrected in place — it is currently
-load-bearing misinformation for anyone reading that file. This corroborates
-[E-11](#e-11) from the other direction.
+`final` / `reranker` / `semantic` / `keyword`. The comment that read
+"Hindsight's HTTP API does not return similarity scores" was presumably
+true of the version it was written against; it was false of what we run.
+This corroborates [E-11](#e-11) from the other direction. **Anchor
+correction (design-v2.md §5 step 1(d) fold-in):** the comment is already
+deleted, in commit `70d29067` ("Deleted the stale 'Hindsight's HTTP API
+does not return similarity scores' comment … and rewrote the #475 gate
+rationale"), which predates this document — there was nothing left to
+fix. The original `recall.py:344-345` line anchor has since drifted with
+the file and now points at unrelated recall-cache-lookup code; cite the
+commit `70d29067`, not a line number, for this claim going forward.
+`grep -rn similarity vendor/hindsight-memory/scripts/` returns nothing
+relevant on `main` today. Re-verified against `origin/main` at `4a70ee58`.
 
 <a id="e-25"></a>
 **E-25 — `min_scores` IS functional at the engine.** `{"final":0.99}` → 0
@@ -832,6 +839,31 @@ This is the mechanism [E-43](#e-43)'s divergence problem was crying out for:
 `windows-boxes-access-and-full-stop` drifted into two incompatible copies
 are both *template* problems, and the vendor already ships the template
 primitive. A live template library exists at `/templates` (not fetched).
+
+> [!CAUTION]
+> **Correction (E-97, this pass): this entry read the vendor docs, not
+> the deployed engine, and the docs description does not describe an
+> apply-to-existing-banks operation on our engine.** `GET
+> /openapi.json` on the running 0.9.0 engine (`127.0.0.1:18888`,
+> re-verified live) lists exactly one bank-template route,
+> `/v1/bank-template-schema`, and it is **GET only** — `POST` against it
+> returns 405. It is a schema an agent reads when composing a bank, not
+> a template it can apply to deactivate/replace directives on banks that
+> already exist. Directives remain per-bank rows everywhere else in the
+> schema (`/v1/default/banks/{bank_id}/directives`,
+> `/v1/default/banks/{bank_id}/directives/{directive_id}`) — no
+> cross-bank shared-directive primitive exists at all. "The vendor
+> already ships the template primitive" is true only of the onboarding
+> shape this entry itself named two sentences earlier; it does not carry
+> over to retrofitting live banks, and design-v2.md §5 step 3, which
+> leaned on this entry for exactly that, is REFUTED accordingly. A live
+> audit (E-98) additionally found the `no-confabulation` count here (13)
+> is one short of the deployed count (14 banks; a fifteenth,
+> `switchroom-dev`, carries zero directives) and that all 14 copies are
+> byte-identical — so even the dedup this entry motivated has nothing to
+> dedup. The `windows-boxes-access-and-full-stop` drift stands exactly
+> as measured (E-43) and remains a single-directive fix, not a template
+> one.
 
 <a id="e-50"></a>
 **E-50 — Vendor-stated gotchas a naive integration hits.** Recorded so the
@@ -2883,6 +2915,96 @@ same-named backend tool so behaviour "never silently widens to accept a
 with the fixture test as tripwire. **Sites corrected on this entry:**
 §2.5, §10.2 pt 3, §8's resolved list, §10.6 W-2. Checked 2026-08-16
 (probes/dynamic-banks.md §F5, probes/knowledge-pages-docs.md §3 row 4).
+
+### Post-fold-in refutation, 2026-08-16 (same rev)
+
+<a id="e-97"></a>
+**E-97 — REFUTED: design-v2.md §5 step 3's "bank template for
+fleet-common guardrails" has no primitive to run on. There is no
+apply-a-template-to-existing-banks verb on the deployed engine, and the
+step's claimed `~1KB/injection saved fleet-wide, zero behaviour change`
+is withdrawn.** Live route table, `GET /openapi.json` against the
+running 0.9.0 engine (`127.0.0.1:18888`), re-verified this pass:
+
+- `/v1/bank-template-schema` — **`get` only.** `curl -X POST` against it
+  returns HTTP 405; `curl -X GET` returns 200. It is a schema an agent
+  reads when composing a bank definition, not an operation that mutates
+  an existing bank.
+- `/v1/default/banks/{bank_id}/directives` — `get`, `post` only.
+- `/v1/default/banks/{bank_id}/directives/{directive_id}` — `get`,
+  `patch`, `delete`.
+- No other path in the 70-path schema contains `template` or takes a
+  cross-bank directive argument. Directives are per-bank rows, full
+  stop; there is no cross-bank shared-directive primitive anywhere in
+  the deployed API.
+
+Step 3 as specified — "create canonical directives from the template,
+deactivate the 13 per-bank `no-confabulation` copies … via the step-2
+shim. Standalone win — ~1KB per injection saved fleet-wide immediately,
+zero behaviour change" — cannot be executed against this API, and its
+central premise is backwards: deactivating the per-bank copies with
+nothing replacing them at read time (`recall`'s `based_on.directives`
+count and the reflect-scoped guardrail injection are both computed
+per-bank, live, from that bank's own `directives` rows — [E-27](#e-27))
+leaves every one of those banks carrying **zero** copies of a rule they
+currently all obey. That is a behaviour change — the guardrail stops
+firing — not the claimed zero-risk saving. [E-49](#e-49)'s "the vendor
+already ships the template primitive" was read off vendor docs
+describing bank *onboarding* (`developer/api/bank-templates.mdx`); nailed
+down against the artefact that actually matters — the deployed engine's
+own route table — that primitive doesn't extend to retrofitting live
+banks. The token saving this design counted from step 3 is only
+obtainable through shrinking or retiring directive content (step 4's
+triage), never through cross-bank deduplication. **Sites corrected on
+this entry:** design-v2.md §1 P5, §4.2, §5 step 3, §9's verdict check,
+the status frontmatter (rev 11 correction note); [E-49](#e-49) carries
+an inline correction pointing here. Checked 2026-08-16, live, read-only
+GETs and one probing `POST` against `/v1/bank-template-schema` only (no
+bank state mutated).
+
+<a id="e-98"></a>
+**E-98 — Fleet directive audit, all 15 banks, live, read-only (E-97's
+supporting measurements).** `GET /v1/default/banks` then `GET
+/v1/default/banks/{bank_id}/directives` for each of the 15 deployed
+banks (`assistant`, `carrie`, `finn`, `gymbro`, `kdogg`, `ken-profile`,
+`klanker`, `lawgpt`, `lisa-profile`, `marko`, `overlord`, `reggie`,
+`switchroom-dev`, `test-harness`, `ziggy`):
+
+- **`no-confabulation` is live in 14 of 15 banks, and every copy is
+  byte-identical** — 1,029 chars, `priority: 10`, `is_active: true`,
+  same SHA-256 prefix across all 14. `switchroom-dev` carries zero
+  directives of any kind. [E-43](#e-43)'s "verbatim in all 13 banks" is
+  one bank short of the current count (a bank has been added since);
+  the byte-identical finding is new and confirms there was no drift to
+  reconcile in this directive, contrary to what [E-49](#e-49) assumed
+  when it named `no-confabulation` alongside the genuinely-drifted
+  `windows-boxes` pair as "both *template* problems."
+- **`windows-boxes-access-and-full-stop` is drifted, and it is exactly
+  the 2 copies [E-43](#e-43) already measured** — klanker 2,362 chars,
+  overlord 3,567 chars, both `is_active: true`, overlord's text a
+  strict superset of klanker's. This is the one finding in the old step
+  3 that survives: a single `PATCH` of klanker's directive with
+  overlord's text, via the step-2 shim, is still cheap and still
+  reversible — a single-directive fix, not a template operation, and it
+  saves nothing beyond itself.
+- **176 active directives fleet-wide** (sum of per-bank `is_active`
+  counts): overlord 26, marko 26, assistant 25, klanker 24, reggie 13,
+  gymbro 12, carrie 18, finn 11, lawgpt 11, ziggy 6, `kdogg`/
+  `ken-profile`/`lisa-profile`/`test-harness` 1 each, `switchroom-dev`
+  0. Three banks (overlord, marko, assistant) are already past the
+  doctor `WARN` threshold of 24 (design-v2.md §4.2, `doctor-memory.ts`
+  `MAX_DIRECTIVES`); none is past the `FAIL` threshold of 30 — folded
+  into §4.2's count-watch paragraph as a live instance, not a new claim.
+- **`enable_observations` is `true` on 14 of 15 banks; only
+  `switchroom-dev` is `false`.** `GET
+  /v1/default/banks/{bank_id}/config` for all 15 banks, this pass.
+  **`enable_observation_history` does not exist in the deployed config
+  schema on any bank** — this re-confirms [E-82](#e-82)'s key-name
+  correction live; it is recorded here as corroboration only and does
+  not restate E-82 as new.
+
+Checked 2026-08-16, live, read-only GETs against all 15 banks (no
+bank state mutated).
 
 ---
 
