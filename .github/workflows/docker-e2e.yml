@@ -107,6 +107,13 @@ jobs:
               - 'docker/Dockerfile.auth-broker'
               - 'src/auth/broker/**'
               - 'tests/docker/**'
+              # tests/docker/hindsight-maintenance.test.ts reads this script
+              # with readFileSync and spawns it — neither is an import, so
+              # vitest's module-graph tracing (`--changed` in ci-tests-core)
+              # cannot reach the suite from a script-only edit. Listed here so
+              # the vacuum/reindex/alarm guards actually run for exactly the
+              # change they exist to police.
+              - 'docker/hindsight-maintenance.sh'
               - '.github/workflows/docker-e2e.yml'
             # The hindsight image is NOT built by build-images.sh — it is the
             # pinned upstream image plus baked patches. It gets its own job
