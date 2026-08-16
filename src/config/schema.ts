@@ -665,6 +665,22 @@ export const AgentMemorySchema = z
         "silent hook-side write). Set false to disable per-agent. " +
         "Cascade: override (per-agent wins over default)."
       ),
+    profile_capture_nudge: z
+      .boolean()
+      .optional()
+      .describe(
+        "Deterministic operator-profile capture nudge (RFC phase4 P3, serves " +
+        "the \"save memories about him\" want). When on (switchroom default " +
+        "true), the auto-recall hook regex-detects a first-person durable " +
+        "self-statement by the operator (\"I prefer …\", \"my … is …\", \"I " +
+        "always …\", \"remind me that I …\") and appends a terse advisory to " +
+        "the turn's context telling the model to persist it with an explicit " +
+        "mcp__hindsight__retain tagged `profile:ken` into the agent's OWN bank " +
+        "(not a shared/cross-agent person bank). Detection is pure regex — the " +
+        "model does the judgment in-session and calls retain itself (no model " +
+        "callsite, no silent hook-side write). Set false to disable per-agent. " +
+        "Cascade: override (per-agent wins over default)."
+      ),
     anti_confabulation_directive: AntiConfabulationDirectiveSchema,
     observation_scopes: ObservationScopesSchema,
     observation_scope_strategy: ObservationScopeStrategySchema,
@@ -3833,6 +3849,11 @@ const profileFields = {
       // defaults/profile tier too, so `defaults.memory.directive_capture_nudge:
       // false` can disable the #2848 nudge fleet-wide (per-agent `true` opt-in).
       directive_capture_nudge: z.boolean().optional(),
+      // Mirror of AgentMemorySchema.profile_capture_nudge — accepted at the
+      // defaults/profile tier too, so `defaults.memory.profile_capture_nudge:
+      // false` can disable the RFC P3 nudge fleet-wide (per-agent `true`
+      // opt-in).
+      profile_capture_nudge: z.boolean().optional(),
       // Mirror of AgentMemorySchema.anti_confabulation_directive — accepted at
       // the defaults/profile tier too, so `defaults.memory.
       // anti_confabulation_directive: false` opts a whole fleet out of the
