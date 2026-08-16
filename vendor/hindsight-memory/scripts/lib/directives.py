@@ -47,8 +47,9 @@ from .state import list_state_names, read_state, remove_state, write_state
 # move the doctor thresholds with it.
 #
 # Banks with more active directives than this are pathological; we truncate
-# with an in-prompt footer, a `directives_omitted` field on the recall_log row,
-# and a stderr warning (see `format_active_directives_block`).
+# with a LOUD, operator-directed in-prompt overflow notice (memory-RFC P7 — the
+# in-turn channel), a `directives_omitted` field on the recall_log row, and a
+# stderr warning (see `format_active_directives_block`).
 MAX_DIRECTIVES = 30
 
 # Hard timeout for the list_directives call. The recall hook is on the
@@ -272,6 +273,10 @@ def format_active_directives_block(directives: list, max_directives: int = MAX_D
         1. [P10] <name>: <content>
         2. [P9] <name>: <content>
         ...
+
+        === DIRECTIVE OVERFLOW — ACTION REQUIRED ===
+        <N of TOTAL directives dropped; agent is told to surface it to the
+         operator this turn and merge/retire directives> (only when omitted > 0)
         (+N more, omitted)
         </active_directives>
     """
@@ -301,12 +306,45 @@ def format_active_directives_block(directives: list, max_directives: int = MAX_D
         lines.append(f"{i}. [P{priority}] {name}: {content}")
 
     if omitted > 0:
+        # LOUD in-prompt overflow notice (memory-RFC P7). The prior footer was a
+        # single quiet parenthetical — `(+N more, omitted)` — which the agent
+        # could read past without registering that explicit, operator-authored
+        # instructions had been silently DROPPED from this turn. The three other
+        # signals this module records are either not operator-visible (stderr —
+        # swallowed, see below) or not in-turn (the `directives_omitted`
+        # recall_log row and `switchroom doctor`, both read after the fact). The
+        # in-prompt block is the one channel that is BOTH in-turn and reaches an
+        # operator — indirectly, because the agent relays it in its reply. So we
+        # make the footer loud and explicitly action-directed: state the loss,
+        # name the count and cap, and instruct the agent to surface it to the
+        # operator THIS turn. This is the P7 "loud channel" and is deliberately
+        # NOT a MAX_DIRECTIVES change (raising the cap only moves the silent-drop
+        # point; visibility has to ship first).
+        #
+        # The literal `(+N more, omitted)` marker is retained verbatim so the
+        # existing recall_log/doctor cross-checks and the directive-dedup parser
+        # (`parse_active_directives_block`) keep working unchanged.
         lines.append("")
+        lines.append("=== DIRECTIVE OVERFLOW — ACTION REQUIRED ===")
+        lines.append(
+            f"{omitted} of {total} active directives were DROPPED from this turn's "
+            f"prompt: the bank exceeds MAX_DIRECTIVES={max_directives}, so the "
+            f"{omitted} LOWEST-priority directive(s) are NOT in effect this turn. "
+            "This is silent loss of explicit, operator-authored instructions."
+        )
+        lines.append(
+            "ACTION: tell the operator in your reply this turn that directive "
+            "overflow is dropping rules, then merge or retire duplicate/stale "
+            "directives (mental-model-curator skill) to get the bank back under "
+            "the cap. Do not let this pass unmentioned."
+        )
         lines.append(f"(+{omitted} more, omitted)")
-        # The in-prompt footer above only tells the AGENT. This stderr warn is
-        # the same channel every other operational failure in this module uses
-        # (see `_fetch_directives_with_status`), and it is a LAST-RESORT
-        # breadcrumb only — do NOT rely on it reaching an operator.
+        # The in-prompt notice above is the operator-visible in-turn channel
+        # (P7): the agent reads it every turn the overflow persists and is told
+        # to relay it. This stderr warn is the same channel every other
+        # operational failure in this module uses (see
+        # `_fetch_directives_with_status`), and it is a LAST-RESORT breadcrumb
+        # only — do NOT rely on it reaching an operator.
         #
         # Measured 2026-07-25: `docker logs --tail 20000` across all 12 running
         # agent containers returns ZERO `[Hindsight]` lines, and nothing under
@@ -315,7 +353,7 @@ def format_active_directives_block(directives: list, max_directives: int = MAX_D
         # appears to swallow hook stderr on a zero exit, so hook stderr is not
         # an operator-visible channel.
         #
-        # The channels that DO reach an operator:
+        # The other channels that reach an operator, but only AFTER the turn:
         #   * the `directives_omitted` field on the recall_log row
         #     (state/recall_log.jsonl — see `count_omitted_directives`), and
         #   * `switchroom doctor`'s WARN/FAIL on the bank's active directive

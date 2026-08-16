@@ -243,6 +243,58 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
         # The in-prompt footer is still emitted (agent-facing signal).
         self.assertIn("(+4 more, omitted)", out)
 
+    def test_overflow_footer_is_loud_and_operator_directed(self):
+        """memory-RFC P7 — the in-prompt overflow notice must be LOUD and tell
+        the agent to surface the drop to the operator this turn.
+
+        The pre-P7 block emitted only the quiet `(+N more, omitted)`
+        parenthetical, which reaches the agent but neither states that explicit
+        instructions were dropped nor directs the agent to relay it. This
+        asserts the OUTCOME of the loud in-turn channel: the rendered block, on
+        overflow, names the dropped count, the total, the cap, states the loss
+        in unmistakable terms, and instructs the agent to tell the operator.
+        A test that only checked `(+N more, omitted)` would still pass on the
+        pre-P7 code, so it would not guard this change; these assertions fail
+        without it.
+        """
+        total = MAX_DIRECTIVES + 3
+        directives = [
+            _directive(f"d{i}", f"c{i}", priority=total - i) for i in range(total)
+        ]
+        with patch("sys.stderr", new=StringIO()):
+            out = format_active_directives_block(directives)
+        # A loud, explicitly-labelled overflow banner (not a lone parenthetical).
+        self.assertIn("DIRECTIVE OVERFLOW", out)
+        # Names the loss in unmistakable terms, with count/total/cap.
+        self.assertIn("DROPPED", out)
+        self.assertIn("3 of", out)  # omitted of total
+        self.assertIn(str(total), out)
+        self.assertIn(f"MAX_DIRECTIVES={MAX_DIRECTIVES}", out)
+        # Directs the agent to surface it to the OPERATOR this turn — the
+        # in-turn operator-visible channel P7 adds.
+        self.assertIn("operator", out.lower())
+        self.assertIn("ACTION", out)
+        # The literal marker is retained for the recall_log/doctor cross-checks
+        # and the dedup parser.
+        self.assertIn("(+3 more, omitted)", out)
+
+    def test_no_overflow_banner_when_under_cap(self):
+        """The loud banner must appear ONLY on overflow — an under-cap block is
+        unchanged and carries neither the banner nor the action directive."""
+        directives = [_directive(f"d{i}", f"c{i}", priority=5 - i) for i in range(3)]
+        with patch("sys.stderr", new=StringIO()) as fake_err:
+            out = format_active_directives_block(directives)
+        self.assertNotIn("DIRECTIVE OVERFLOW", out)
+        self.assertNotIn("ACTION", out)
+        self.assertNotIn("more, omitted", out)
+        self.assertEqual(fake_err.getvalue(), "")
+
+    def test_max_directives_is_unchanged_by_p7(self):
+        """P7 is the loud-channel PR only. Raising MAX_DIRECTIVES is a separate,
+        later change (RFC §5 P7: order is non-negotiable). Pin the constant so a
+        cap bump cannot ride in on this change unnoticed."""
+        self.assertEqual(MAX_DIRECTIVES, 30)
+
     def test_count_omitted_directives_matches_the_rendered_footer(self):
         """The recall_log's `directives_omitted` number must equal what the
         block actually dropped — it is the operator-visible record of it."""
