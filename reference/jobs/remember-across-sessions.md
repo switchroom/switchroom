@@ -10,7 +10,7 @@ invariants: [single-tenant]
 
 > A durable Job Spec. The *how* — the four memory surfaces, the injection
 > pipeline, the rules lifecycle, the repo-knowledge build — lives in the
-> design artifact `design-v2.md` (`serves:` this job) and resolves against
+> design artifact `reference/rfcs/design-v2.md` (`serves:` this job) and resolves against
 > the evidence ledger `reference/rfcs/memory-redesign-2026-08.md`, where
 > every `E-nn` / `P-nn` / `C-nn` cited below has an anchor. That design
 > churns; this job does not.
@@ -37,7 +37,7 @@ they fail separately: **standing rules** the user set once; **orientation**
 past fact; and **standing knowledge** about a codebase or a domain. This
 job is met only when all four hold, and holds honestly only when each one
 that is not yet built says so out loud rather than being described as if it
-were (`design-v2.md` §2).
+were (`reference/rfcs/design-v2.md` §2).
 
 > [!CAUTION]
 > A rule surface with no retirement is not memory, it is accumulation.
@@ -58,7 +58,7 @@ were (`design-v2.md` §2).
   not prompt hope: memory is injected on every eligible turn** — off the
   reply path, capped into the band both comparators ship, gated against
   junk. That is where this job lands, not a stage it passes through
-  (`design-v2.md` §1 P1, §5 6a). Retrieval the agent invoked itself stays
+  (`reference/rfcs/design-v2.md` §1 P1, §5 6a). Retrieval the agent invoked itself stays
   available alongside it and remains the inspectability gold-standard
   (C-01); a per-agent **tools-only** arm exists behind an explicit
   evidentiary gate (`memory.injection: tools-only`, §5 6b) and is an
@@ -76,7 +76,7 @@ were (`design-v2.md` §2).
 - The user corrects a stored fact and the correction sticks; the agent
   doesn't reassert the old version later. The correction is explicit — the
   bad fact is invalidated and a superseding fact retained that names what it
-  corrects (`design-v2.md` §2.4). *Scope note, carried honestly:* "true, but
+  corrects (`reference/rfcs/design-v2.md` §2.4). *Scope note, carried honestly:* "true, but
   stop surfacing it" is **not available** on the pinned engine — there is no
   tag-write path for an existing memory (E-20, E-31, confirmed fresh at
   0.9.0) — and age does not fade a memory out of ranking either (recency
@@ -90,12 +90,12 @@ were (`design-v2.md` §2).
   together ≤ 6KB rendered), announced when they change, archived rather than
   vanished when retired, and **retirement is a first-class verb**:
   compaction *applies* a retirement instead of resurrecting the rule
-  (`design-v2.md` §4.4).
+  (`reference/rfcs/design-v2.md` §4.4).
 - That rule surface is tamper-evident. Every legitimate mutation goes
   through one sanctioned writer that appends to a hash-chained mutation log;
   an unexplained delta fails loud and stands until an operator resolves it.
   The threat is honest and named: a prompt-injected turn turning one bad
-  message into *persistent* rule authority (`design-v2.md` §2.1a).
+  message into *persistent* rule authority (`reference/rfcs/design-v2.md` §2.1a).
 - A restart, a compaction, or a new chat window doesn't reset the
   relationship; the agent picks up roughly where it was. The intended
   mechanism is a cron-refreshed **orientation briefing** — a standing
@@ -106,7 +106,7 @@ were (`design-v2.md` §2).
   to read. ***This read is specified and NOT BUILT*** (E-88): nothing in the
   deployment calls it today, and today's post-compaction footing is the
   native summary plus a generic re-seat. Until it ships, this bullet is a
-  target, not a claim (`design-v2.md` §2.2, §5 step 7).
+  target, not a claim (`reference/rfcs/design-v2.md` §2.2, §5 step 7).
 - The user can ask what the agent believes about them and why, and get an
   honest, legible answer. Who the user *is* stays in the dedicated profile
   banks; the orientation briefing excludes identity by construction, because
@@ -120,12 +120,12 @@ were (`design-v2.md` §2).
   pipeline), never receives conversational retains, and is read by every
   granted agent through the already-deployed `additional_banks` fan-out.
   Pages there are **fetched whole** — tree, then page — never used as a
-  precision retrieval path (`design-v2.md` §10.1–10.3).
+  precision retrieval path (`reference/rfcs/design-v2.md` §10.1–10.3).
 - Bank reach is granted, never minted. An agent may *select* among the banks
   an operator granted it and is loudly rejected outside that set; derived /
   dynamic bank ids are explicitly rejected — they solve an isolation problem
   a static operator-owned mapping already solves, and add silent-misroute
-  and ungated lazy-creation failure modes (`design-v2.md` §7, §10.6 W-2;
+  and ungated lazy-creation failure modes (`reference/rfcs/design-v2.md` §7, §10.6 W-2;
   E-89, E-90, E-96).
 - Work handed to a sub-agent is not a memory hole. *Today it is one:* a
   `worker` has **zero memory read path** — no memory tools on its allowlist
@@ -133,7 +133,7 @@ were (`design-v2.md` §2).
   prose into the parent's bank. The fleet delegates implementation to
   exactly the agent type with the blankest memory. This is a named defect
   with a specified fix (read-only pull tools on the worker allowlist plus
-  dispatch-prompt pre-fetch), not an accepted shape (`design-v2.md` §2.6;
+  dispatch-prompt pre-fetch), not an accepted shape (`reference/rfcs/design-v2.md` §2.6;
   E-86).
 - Every failure mode has a name and a visible signal — including the ones
   this design introduces: a dead refresh cron, an unloadable rules block, an
@@ -193,7 +193,7 @@ were (`design-v2.md` §2).
   pinned engine, E-20/E-31/#3772). *Watch:* a corrected memory stops
   surfacing. *Invariant:* a correction the user makes is honoured and not
   silently reverted. *Coverage gap:* no runnable scenario for the shipped
-  correction path — invalidate + supersede (`design-v2.md` §2.4). The
+  correction path — invalidate + supersede (`reference/rfcs/design-v2.md` §2.4). The
   earlier "decays sensibly" half of this row is **withdrawn**: memories do
   not meaningfully fade with age (E-56).
 - **Per-agent banks, no pooling** — `tests/memory.create-bank.test.ts`,
@@ -213,7 +213,7 @@ were (`design-v2.md` §2).
   *Invariant:* the gate is deterministic (envelope tag), never a model
   judgment (E-87).
 - **Retirement survives compaction** — *(coverage gap: the mutate-then-
-  compact canary is specified but UNRUN, `design-v2.md` §5 step 1(f),
+  compact canary is specified but UNRUN, `reference/rfcs/design-v2.md` §5 step 1(f),
   E-81)*. *Watch:* a rule retired mid-session is absent after compaction,
   not resurrected. *Invariant:* compaction applies retirements; it never
   reverts them.
@@ -248,7 +248,7 @@ loud failure, and per-bank isolation hold across all.
   orientation is unbuilt (E-88); the worker read path is a named defect
   (E-86); injection still runs on the reply path at every-Nth retain
   cadence (E-84, E-71); and the repo-knowledge build is gated on two
-  measurements that have not reported (`design-v2.md` §10.6).
+  measurements that have not reported (`reference/rfcs/design-v2.md` §10.6).
 
 ## Production-readiness
 
@@ -268,7 +268,7 @@ loud failure, and per-bank isolation hold across all.
   is asserted**. The new spend (orientation refreshes) has **never been
   measured**; the plausible net ranges from roughly neutral to about a 65%
   reduction, and rollout is gated on the measurement rather than on a
-  guess (`design-v2.md` §6).
+  guess (`reference/rfcs/design-v2.md` §6).
 - *Quality claims, held at their real confidence:* the pattern this design
   serves — synthesis read once, rather than raw fragments pushed every turn
   — is the replicated result (9/9 runs, non-overlapping ranges, E-79). The
@@ -299,7 +299,7 @@ loud failure, and per-bank isolation hold across all.
 
 ---
 
-> **Implementation:** the how lives in `design-v2.md` (frontmatter `serves:`
+> **Implementation:** the how lives in `reference/rfcs/design-v2.md` (frontmatter `serves:`
 > this job), resolving against the evidence ledger
 > `reference/rfcs/memory-redesign-2026-08.md`. Those churn; this Job Spec
 > outlives them.

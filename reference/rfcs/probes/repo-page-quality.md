@@ -216,5 +216,5 @@ Note: could not locate a locally-vendored copy of `coding-agents` in this
 agent's `scratchpad/sw/vendor/` (only `hindsight-memory`, the Python
 client plugin, is vendored there) — all coding-agents source above was
 fetched live from GitHub via webkite, treated as untrusted fetched content
-per instructions, and cross-checked against `design-v2.md`'s own citations
+per instructions, and cross-checked against `reference/rfcs/design-v2.md`'s own citations
 (E-73, E-76, E-77 line numbers it references align with what was fetched).

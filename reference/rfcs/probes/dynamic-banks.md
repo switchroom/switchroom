@@ -1,6 +1,6 @@
 # Probe: dynamic bank IDs — openclaw's mechanism, and whether multi-agent repos should adopt them
 
-Status: REPORT-ONLY probe, 2026-08-16. No edits to design-v2.md, the ledger, or
+Status: REPORT-ONLY probe, 2026-08-16. No edits to reference/rfcs/design-v2.md, the ledger, or
 existing probes. Sources are deployed artefacts per the ledger convention: the
 **published npm package** `@vectorize-io/hindsight-openclaw@0.10.0` (fetched via
 `npm pack` this probe — this IS openclaw's shipped artefact, so the

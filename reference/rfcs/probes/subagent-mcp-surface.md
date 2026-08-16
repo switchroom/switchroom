@@ -171,7 +171,7 @@ before anyone treats it as an actionable migration precondition.
   `6979a932` at 2026-08-10 03:51:51 +1000, six days stale against today
   (2026-08-16); a sibling checkout `/host/~/code/switchroom` is
   at a different, older commit (`d8e9d246`, 2026-08-09). Did not check
-  `git status`/diff between them or against `origin/main` — if `design-v2.md`
+  `git status`/diff between them or against `origin/main` — if `reference/rfcs/design-v2.md`
   or the RFC ledger assume a newer unmerged change to the shim or hooks, this
   probe would miss it.
 - `enable_observation_history` was checked against exactly one bank's live

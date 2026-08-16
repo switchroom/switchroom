@@ -77,7 +77,7 @@ memory units. It was **not measured on `search_knowledge_pages`**. As a claim ab
 rerank-free RRF ordering costs at 300-candidate fact-retrieval scale, it is real and the
 ledger's recorded vendor caveats (lexically-biased ground truth, one conversation, wide
 CIs) don't erase an order-of-magnitude gap. As a number attached to page search
-(design-v2.md:1031 "`search_knowledge_pages` ... rerank-free: 6.7% R@1") it is an
+(reference/rfcs/design-v2.md:1031 "`search_knowledge_pages` ... rerank-free: 6.7% R@1") it is an
 **upper-bound analogy**: page search is doc-level over typically ≤10s of pages, a regime
 where the rerank-free penalty is far smaller and where the design itself says browse
 beats search. The design's *discipline* (P4: fetch pages whole; §10.3: search only for

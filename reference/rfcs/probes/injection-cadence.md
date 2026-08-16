@@ -22,7 +22,7 @@ against the deployed plugin and live recall log, not the repo or the RFC ledger.
   (`.claude/plugins/data/hindsight-memory-inline/state/recall_log.jsonl`,
   5000 rows, 882 with `duration_ms`): **min 50ms, p50 1282ms, p90 5522ms,
   max 9162ms**. The five most recent turns: 1419/1301/1129/1132/1407ms.
-  design-v2.md cites "0.6–0.75s" four times (lines 143, 170, 406, 810) —
+  reference/rfcs/design-v2.md cites "0.6–0.75s" four times (lines 143, 170, 406, 810) —
   E-28's number describes the single-bank MCP recall tool, not the deployed
   3-bank-parallel hook that is actually on the reply path. The hot-path cost
   being argued about is ~2x understated at median and ~7x at p90.
@@ -70,12 +70,12 @@ fetched 2026-08-16; docs page hindsight.vectorize.io/sdks/integrations/openclaw)
 
 ### F1. The question as posed is already half-moot: design-v2's fleet default IS every-turn injection
 
-Step 6a (design-v2.md:790–830) keeps per-turn injection as the fleet default —
+Step 6a (reference/rfcs/design-v2.md:790–830) keeps per-turn injection as the fleet default —
 hardened to the comparator shape (async off-reply-path prefetch, per-turn delta
 retain with read-after-write ordering, observation-lean). `memory.injection:
-hybrid-hardened` is the default tier value (design-v2.md:832–845). Only 6b
+hybrid-hardened` is the default tier value (reference/rfcs/design-v2.md:832–845). Only 6b
 removes injection, per-agent, explicitly "gated on evidence we do not have"
-(design-v2.md:868). So the operator's steer is substantially already conceded
+(reference/rfcs/design-v2.md:868). So the operator's steer is substantially already conceded
 in the spec. The residual dispute is (a) whether tools-only remains the framed
 destination, and (b) Surface B's once-per-session cadence.
 
@@ -84,22 +84,22 @@ destination, and (b) Surface B's once-per-session cadence.
 openclaw states the mechanism plainly (quote above): pull tools are not
 reliably used. Hermes's hybrid default and its config prose say the same by
 construction. This is not cargo cult — it is the exact failure mode design-v2
-itself names as "pull-miss risk... real and accepted" (design-v2.md:450–458)
+itself names as "pull-miss risk... real and accepted" (reference/rfcs/design-v2.md:450–458)
 and mitigates only with an index block plus prompt guidance, i.e. the
 model-dependent mechanism the fleet's own dev protocol says to avoid when a
 deterministic one exists. Injection IS the deterministic mechanism for "memory
 is present". The design's own honest position on the tools-only flip is "loses
-tokens, gains trust, quality sign unknown" (design-v2.md:456–458) — that is not
+tokens, gains trust, quality sign unknown" (reference/rfcs/design-v2.md:456–458) — that is not
 a case, it is an absence of one.
 
 ### F3. What actually still holds the anti-injection position up, post-E-57
 
-- **Token cost:** §6 (design-v2.md:915–981) honestly brackets the net as
+- **Token cost:** §6 (reference/rfcs/design-v2.md:915–981) honestly brackets the net as
   "roughly neutral to ~65% reduction" — and the solid, measured deletion is the
   *directive* block (~49M/30d), which is orthogonal to recall-injection cadence.
   The recall block's share is unmeasured (bounded ~27M) and survives 6a anyway.
   Cost does not decide the injection question. Weak.
-- **Benchmark:** E-57 downgraded to noise (design-v2.md:1117–1137). Dead.
+- **Benchmark:** E-57 downgraded to noise (reference/rfcs/design-v2.md:1117–1137). Dead.
 - **Grab-bag quality:** live-verified this probe (score min 0.0001, median
   0.0243, floor not applied, 42% of turns capped at 16). Real — but it is an
   indictment of *our block's tuning*, not of every-turn cadence: Hermes ships
@@ -112,7 +112,7 @@ a case, it is an absence of one.
 Net: nothing that survives argues for *removing* every-turn injection; the
 surviving arguments all argue for *hardening* it — which is what 6a does. The
 design's own text reaches this conclusion; its framing ("per-turn pushed
-fragment injection is removed regardless", design-v2.md:336; tools-only as the
+fragment injection is removed regardless", reference/rfcs/design-v2.md:336; tools-only as the
 6b destination) outruns its evidence.
 
 ### F4. Yes — ours is worse than theirs at the same job, and the distinction is load-bearing
@@ -129,20 +129,20 @@ Verified deltas of our deployed block vs both comparators:
 
 "Our per-turn block is noisy and slow" generalised into "the shape is bad" is
 exactly the blur the probe brief suspected — and rev 9's own correction
-(design-v2.md:138–150) already partially concedes it (withdrew "our instance is
+(reference/rfcs/design-v2.md:138–150) already partially concedes it (withdrew "our instance is
 raw-fragment-defective", kept the timing/cadence residue). But note rev 9's
 claim that our block "already injects the consolidated observation tier" is
 only one-third true: we inject all three types at 6144 tokens with no floor,
 which is materially noisier than either comparator's shipped shape.
 
-**Factual error found:** design-v2.md:1146 claims "the variant both chat-domain
+**Factual error found:** reference/rfcs/design-v2.md:1146 claims "the variant both chat-domain
 comparators actually ship — observation-only, **1024-token-capped**". Hermes's
 default is **4096** (`__init__.py:848,1704`). Small, but it's the kind of
 comparator misstatement this ledger was just burned by.
 
 ### F5. The strongest surviving attack: Surface B drops the benchmarked half of its own winning arm
 
-§8.2a (design-v2.md:1163–1174) admits the E-79 winning arm "re-injected the
+§8.2a (reference/rfcs/design-v2.md:1163–1174) admits the E-79 winning arm "re-injected the
 cached reflect synthesis **every turn**", and that once-per-session is a
 post-benchmark refinement resting on the vendor's engineering judgment ("random
 noise once the session drifts"), not measurement. So the design's headline

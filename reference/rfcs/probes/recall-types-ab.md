@@ -74,4 +74,4 @@ This is directionally consistent with the RFC's stated 0–65% cost-range langua
 
 ## Files/evidence
 
-- All findings above are from live `mcp__hindsight__recall` / `mcp__hindsight__get_bank_stats` / `mcp__hindsight__list_memories` tool calls against `127.0.0.1:18888` in this session (2026-08-16). No files were read; this probe is standalone and does not depend on `design-v2.md` or the RFC (both left untouched, per instruction).
+- All findings above are from live `mcp__hindsight__recall` / `mcp__hindsight__get_bank_stats` / `mcp__hindsight__list_memories` tool calls against `127.0.0.1:18888` in this session (2026-08-16). No files were read; this probe is standalone and does not depend on `reference/rfcs/design-v2.md` or the RFC (both left untouched, per instruction).
