@@ -426,6 +426,15 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RETAIN_OVERLAP_TURNS": ("retainOverlapTurns", int),
     "HINDSIGHT_RETAIN_CONTEXT": ("retainContext", str),
     "HINDSIGHT_RETAIN_TAGS": ("retainTags", list),
+    # `retainToolCalls` (RFC memory-redesign P4): whether retain stores tool_use
+    # inputs + tool_result content. Had a DEFAULTS entry (True) but — like the
+    # cadence knobs before them — no env channel and no scaffold stamp, so an
+    # operator could not opt an agent out and a docker-exec'd retain/backfill
+    # could not be steered. Adding the env key mirrors the yaml surface
+    # (`memory.retain.tool_calls`) and closes the same drift class. `false`
+    # (via `false`/`0`/`no`) resolves to Python False and lands over the True
+    # default; unset keeps True, byte-identical.
+    "HINDSIGHT_RETAIN_TOOL_CALLS": ("retainToolCalls", bool),
     # Switchroom-local: per-row observation scope on retains. Set by start.sh
     # from agents.<name>.memory.observation_scopes (cascading through
     # defaults.memory.observation_scopes) ONLY when the operator set it; unset

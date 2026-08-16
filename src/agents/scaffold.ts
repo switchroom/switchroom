@@ -3550,11 +3550,18 @@ export function installHindsightPlugin(
  */
 const HINDSIGHT_DEFAULT_RETAIN_EVERY_N_TURNS = 3;
 const HINDSIGHT_DEFAULT_RETAIN_OVERLAP_TURNS = 1;
+// Whether auto-retain stores tool_use inputs + tool_result content. Vendor
+// default is True (lib/config.py `retainToolCalls`); switchroom keeps it True
+// so the fleet behaves byte-identically until an operator opts an agent out
+// via memory.retain.tool_calls (RFC memory-redesign P4 — the setter only, no
+// behaviour change on the default).
+const HINDSIGHT_DEFAULT_RETAIN_TOOL_CALLS = true;
 
 /** Resolved auto-retain cadence for an agent (post-cascade, defaults applied). */
 interface HindsightRetainConfig {
   everyNTurns: number;
   overlapTurns: number;
+  toolCalls: boolean;
 }
 
 /**
@@ -3591,6 +3598,7 @@ function resolveHindsightRetainConfig(
   return {
     everyNTurns: retain?.every_n_turns ?? HINDSIGHT_DEFAULT_RETAIN_EVERY_N_TURNS,
     overlapTurns: retain?.overlap_turns ?? HINDSIGHT_DEFAULT_RETAIN_OVERLAP_TURNS,
+    toolCalls: retain?.tool_calls ?? HINDSIGHT_DEFAULT_RETAIN_TOOL_CALLS,
   };
 }
 
@@ -3807,6 +3815,8 @@ const HINDSIGHT_RECALL_MIN_SCORE_SCOPE_DEFAULT = "degraded";
  * Currently overrides:
  *   - `retainEveryNTurns`: 10 → configured (default 3; `memory.retain.every_n_turns`)
  *   - `retainOverlapTurns`: 2 → configured (default 1; `memory.retain.overlap_turns`)
+ *   - `retainToolCalls`: true → configured (default true; `memory.retain.tool_calls`;
+ *     setter only, default byte-identical — RFC memory-redesign P4)
  *   - `retainMode`: full-session → chunked (Phase 6b: window, not whole
  *     transcript, re-consolidated per fire; paired with the vendor
  *     retain.py divergence)
@@ -3906,6 +3916,19 @@ function renderHindsightSettingsOverrides(
   // retainOverlapTurns from the cascaded config (default 1) → window =
   // overlap_turns + every_n_turns recent turns per fire (default 1 + 3 = 4).
   settings.retainOverlapTurns = retainConfig.overlapTurns;
+  // retainToolCalls from the cascaded config (default true — byte-identical to
+  // the fleet's current behaviour). With it on, every assistant tool_use block
+  // is stored with its entire input dict and every tool_result up to 2000 chars
+  // (vendor lib/content.py). This exposes the setter (RFC memory-redesign P4):
+  // the vendor default `retainToolCalls: true` had a DEFAULTS entry but no
+  // scaffold stamp and no env channel, so an operator could not reach it — the
+  // exact drift class the retainEveryNTurns/OverlapTurns stamps close. Setting
+  // memory.retain.tool_calls: false drops the tool exhaust from an agent's
+  // retains; it is not a new mode (subagent_retain.py already forces it off for
+  // sidechains). Stamped here so a docker-exec'd retain/backfill that does NOT
+  // inherit the supervised env still resolves the operator's value, matching
+  // the paired ENV_OVERRIDES entry in lib/config.py.
+  settings.retainToolCalls = retainConfig.toolCalls;
   // Provenance on auto-retained transcript content. The vendor default is
   // `["{session_id}"]` — a bare session UUID, which is filterable but carries
   // no meaning, so nothing downstream could ask "did a human assert this, or
