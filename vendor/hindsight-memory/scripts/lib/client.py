@@ -178,6 +178,7 @@ class HindsightClient:
         tags_match: Optional[str] = None,
         tag_groups: Optional[object] = None,
         prefer_observations: Optional[bool] = None,
+        query_timestamp: Optional[str] = None,
         timeout: int = 10,
     ) -> dict:
         """Recall memories from a bank.
@@ -190,6 +191,17 @@ class HindsightClient:
         `prefer_observations=True` asks the engine to prefer deduped
         observation statements over the raw facts they supersede, backfilling
         the freed slots — denser coverage inside the same token/count budget.
+
+        ``query_timestamp`` is an ISO 8601 datetime naming when the query is
+        being asked, from the user's perspective. The engine uses it as the
+        anchor for resolving relative temporal expressions in the query ("last
+        week", "yesterday") and for recency scoring; absent, the server's own
+        current time is the anchor. Sent only when non-empty, so a ``None``
+        (the default) leaves the wire body byte-identical to a pre-field
+        client — the additive-field invariant switchroom P2 depends on. The
+        REST recall body validates this field's format (a malformed value
+        400s: "Invalid query_timestamp format. Expected ISO format"), so the
+        caller is responsible for passing a well-formed ISO string.
         """
         path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/memories/recall"
         body = {
@@ -208,6 +220,8 @@ class HindsightClient:
             body["tag_groups"] = tag_groups
         if prefer_observations is not None:
             body["prefer_observations"] = prefer_observations
+        if query_timestamp:
+            body["query_timestamp"] = query_timestamp
         return self._request("POST", path, body, timeout=timeout)
 
     def retain(

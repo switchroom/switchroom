@@ -54,6 +54,7 @@ import re  # noqa: E402
 import socket  # noqa: E402
 import sys  # noqa: E402
 import urllib.error  # noqa: E402
+from datetime import datetime  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1578,6 +1579,96 @@ def looks_like_standing_rule(text) -> bool:
     return bool(_DIRECTIVE_NUDGE_RE.search(scrubbed))
 
 
+# ── Temporal-expression detection for the recall `query_timestamp` anchor ──
+# Switchroom P2 (memory-redesign RFC §5). When the inbound prompt asks a
+# time-relative question ("what did we work on last week", "on the 12th"),
+# the recall body carries an explicit `query_timestamp` anchor so the engine
+# resolves the relative expression and anchors recency scoring against the
+# real ask-time. The anchor is ALWAYS the current wall clock — that is the
+# documented semantics ("when the query is being asked, from the user's
+# perspective", https://hindsight.vectorize.io/developer/api/recall) — the
+# regex only GATES whether the field is sent, it does not resolve the phrase
+# itself (the engine does that server-side against the anchor we supply).
+#
+# Deterministic regex only — NO model call (claude-native invariant, same as
+# the directive-capture nudge above). The match is a cheap substring scan on
+# the already-stripped prompt, so it never extends the recall hook's critical
+# path (the 12s ceiling / parallel deadline live entirely on the network I/O
+# below). Detection is deliberately conservative: it requires a preposition or
+# quantifier around ambiguous tokens (bare weekday / month / "may") so an
+# ordinary sentence does not fire the field. A false negative merely omits an
+# anchor the server would default to anyway; a false positive sends the true
+# ask-time, which is the correct anchor regardless — so both error directions
+# degrade to today's behaviour.
+_TEMPORAL_EXPRESSION_RE = re.compile(
+    r"""(?ix)
+    (?:
+      # --- absolute-relative day words ---
+        \b (?: yesterday | tonight | tomorrow ) \b
+      | \b last \s+ night \b
+      # --- this/last/next + period ---
+      | \b (?: this | last | next | past ) \s+
+            (?: week | month | year | quarter | fortnight | weekend
+              | morning | afternoon | evening | night | decade ) \b
+      # --- earlier / other-day framings ---
+      | \b the \s+ other \s+ (?: day | week | night ) \b
+      | \b earlier \s+ (?: today | this \s+ (?: week | month | year ) ) \b
+      | \b a \s+ (?: while | moment ) \s+ ago \b
+      # --- "<N> <unit> ago" (worded or digit quantifier) ---
+      | \b (?: a | an | one | two | three | four | five | six | seven | eight
+            | nine | ten | \d+ | couple \s+ of | few ) \s+
+            (?: second | minute | hour | day | week | month | year ) s? \s+ ago \b
+      # --- weekday, only with a temporal preposition/qualifier ---
+      | \b (?: this | last | next | on | since | by ) \s+
+            (?: monday | tuesday | wednesday | thursday | friday
+              | saturday | sunday ) \b
+      # --- ordinal day-of-month ("on the 12th", "by the 3rd") ---
+      | \b (?: on | by | since | before | after | around ) \s+ the \s+
+            \d{1,2} (?: st | nd | rd | th ) \b
+      # --- month name, only with a temporal preposition ---
+      | \b (?: in | on | since | during | back \s+ in | early | late ) \s+
+            (?: january | february | march | april | may | june | july
+              | august | september | october | november | december ) \b
+    )
+    """
+)
+
+
+def detect_query_timestamp(text, now=None) -> "str | None":
+    """Return an ISO 8601 ask-time anchor when ``text`` carries a temporal
+    expression, else ``None``.
+
+    Deterministic and IO-free — a single regex scan, no model call and no
+    clock dependency the caller cannot control (``now`` is injectable so the
+    behaviour is unit-testable to the exact output string). When a temporal
+    phrase is present the anchor returned is the CURRENT time, because
+    ``query_timestamp`` is defined by the engine as *when the query is asked*,
+    not the period the phrase names — the engine resolves the phrase against
+    this anchor. ``None`` means "send no field", which keeps the recall body
+    byte-identical to a pre-P2 client.
+
+    The anchor carries the LOCAL wall-clock offset (``datetime.now()`` +
+    ``.astimezone()``), NOT UTC. This matters precisely on the dimension P2
+    serves: for a Melbourne evening query "what did we do yesterday", a
+    UTC-stamped anchor (``+00:00``) can be a calendar day ahead of the
+    operator's real day, so the engine would resolve "yesterday"/"last
+    week"/"on the 12th" against the wrong day. ``.astimezone()`` with no
+    argument attaches the process TZ (the container clock is already
+    Australia/Melbourne), which is the operator's actual day. Never
+    ``timezone.utc`` here — that would re-introduce the off-by-one this fix
+    removes.
+
+    Returns ``None`` on empty / non-string input so a caller can pass a raw
+    prompt without a guard.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if not _TEMPORAL_EXPRESSION_RE.search(text):
+        return None
+    anchor = now if now is not None else datetime.now().astimezone()
+    return anchor.isoformat()
+
+
 def _combine_context(base, nudge) -> str:
     """Join the recall/directives context with the directive-capture nudge,
     skipping empties. Either may be None/empty. The nudge is kept OUT of the
@@ -1780,6 +1871,25 @@ def main():
         nudge_block = _DIRECTIVE_CAPTURE_NUDGE
         debug_log(config, "Directive-capture nudge: inbound looks like a standing rule")
 
+    # Switchroom P2 (memory-redesign RFC §5) — anchor recall to the ask-time
+    # when the inbound prompt is time-relative, so the engine resolves "last
+    # week"/"yesterday"/"on the 12th" against the real now and scores recency
+    # from it. Deterministic regex on `_stripped` (same channel-stripped text
+    # the nudge uses); no model call, microsecond cost, off the network path.
+    # `None` when the prompt has no temporal phrase → the field is never added
+    # to the recall body (byte-identical to pre-P2). The `recallQueryTimestamp`
+    # key is an IN-CODE guard only — it has NO schema/scaffold/env surface, so
+    # a settings.json edit would be clobbered on the next `switchroom apply`
+    # (the plugin dir is re-copied from vendor/). Per RFC P2 the rollback is
+    # "stop sending the field" = revert the commit; if a runtime knob is ever
+    # wanted, wire it the full schema->scaffold->config->env way
+    # `directiveCaptureNudge` is, not by hand-editing settings.json.
+    query_timestamp = None
+    if config.get("recallQueryTimestamp", True):
+        query_timestamp = detect_query_timestamp(_stripped)
+        if query_timestamp:
+            debug_log(config, "Recall query_timestamp anchor: inbound is time-relative")
+
     session_id = hook_input.get("session_id") or ""
 
     # Switchroom #303 — push a "📚 recalling memories" status to the
@@ -1962,6 +2072,12 @@ def main():
                 "active_topic_alias": active_topic_alias,
                 "topic_filter_mode": _topic_filter_mode(),
                 "directive_nudge": bool(nudge_block),
+                # Switchroom P2 — the ISO ask-time anchor sent to recall, or
+                # null when the inbound had no temporal phrase. Logged on cache
+                # hits too (no bank ran, so nothing was sent this turn) for a
+                # uniformly queryable schema and to measure the firing rate
+                # from day one (precedent: `directive_nudge` above).
+                "query_timestamp": query_timestamp,
                 # E1 / PR8 (#3369) — no banks ran on a cache hit, so the
                 # transcript fallback never fires; carry the zeroed fields for a
                 # uniformly queryable schema.
@@ -2107,6 +2223,12 @@ def main():
 
     def _make_bank_task(target_bank_id, b_tags, b_tags_match, b_tag_groups, timeout_override=None):
         def _bank_task():
+            # Switchroom P2 — include the ask-time anchor ONLY when the prompt
+            # was time-relative. Passing it conditionally (not as `=None`) keeps
+            # the client CALL — not just the wire body — byte-identical on the
+            # common non-temporal turn, so a caller/fake with a narrower recall
+            # signature is never handed a kwarg it did not have before.
+            qts_kwarg = {"query_timestamp": query_timestamp} if query_timestamp else {}
             return client.recall(
                 bank_id=target_bank_id,
                 query=search_query,
@@ -2148,6 +2270,8 @@ def main():
                     if timeout_override is None
                     else timeout_override
                 ),
+                # Switchroom P2 — present only on a time-relative turn (see above).
+                **qts_kwarg,
             )
         return _bank_task
 
@@ -2735,6 +2859,11 @@ def main():
         "topic_filter_mode": topic_filter_mode,
         "topic_dropped": topic_dropped,
         "directive_nudge": bool(nudge_block),
+        # Switchroom P2 — the ISO ask-time anchor actually sent to recall this
+        # turn (null when the inbound had no temporal phrase), so the field's
+        # firing rate is measurable from day one against the RFC's falsification
+        # window (precedent: `directive_nudge` above).
+        "query_timestamp": query_timestamp,
         # Switchroom hindsight-leverage E1 / PR8 (#3369) — transcript-grep
         # fallback telemetry so its firing (and its bounds) are visible per turn
         # in recall_log.jsonl. `transcript_fallback` True only on an all-zero,
