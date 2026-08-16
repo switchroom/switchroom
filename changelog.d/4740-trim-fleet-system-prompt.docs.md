@@ -1,4 +1,4 @@
-- **profiles: trim fleet-wide CLAUDE.md system-prompt blocks (#4750)**
+- **profiles: trim fleet-wide CLAUDE.md system-prompt blocks (#4740)**
 
   Condensed the vault, root-tier host access, and self-service prose in
   `profiles/_shared/*.md.hbs` and `profiles/default/CLAUDE.md.hbs`
