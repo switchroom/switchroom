@@ -28,6 +28,7 @@ from lib.directives import (  # noqa: E402
     fetch_active_directives,
     fetch_active_directives_cached,
     format_active_directives_block,
+    injected_directive_ids,
     invalidate_directives_cache,
     parse_active_directives_block,
     rule_already_captured,
@@ -259,6 +260,51 @@ class FormatActiveDirectivesBlockTests(unittest.TestCase):
         self.assertNotIn("more, omitted", format_active_directives_block(under))
         # Honours a custom cap the same way the formatter does.
         self.assertEqual(count_omitted_directives(directives, max_directives=5), total - 5)
+
+    def test_injected_directive_ids_matches_the_rendered_block(self):
+        """Memory-redesign step 1 (E-45 recommendation (b)): the id list
+        `recall.py` puts on the recall_log row must name exactly the
+        directives `format_active_directives_block` actually rendered —
+        not the full fetched set, and in the same priority order."""
+        total = MAX_DIRECTIVES + 4
+        directives = [
+            _directive(f"d{i}", f"c{i}", priority=total - i) for i in range(total)
+        ]
+        with patch("sys.stderr", new=StringIO()):
+            out = format_active_directives_block(directives)
+        ids = injected_directive_ids(directives)
+        self.assertEqual(len(ids), MAX_DIRECTIVES)
+        # Real, concrete values — the head-slice in priority order, not a
+        # placeholder or a count.
+        self.assertEqual(ids, [f"id-d{i}" for i in range(MAX_DIRECTIVES)])
+        # Every injected id is actually present in the rendered block...
+        for i in range(MAX_DIRECTIVES):
+            self.assertIn(f"d{i}: c{i}", out)
+        # ...and the omitted tail's ids are excluded.
+        for i in range(MAX_DIRECTIVES, total):
+            self.assertNotIn(f"id-d{i}", ids)
+            self.assertNotIn(f"d{i}: c{i}", out)
+
+    def test_injected_directive_ids_under_cap_returns_all(self):
+        directives = [_directive(f"d{i}", f"c{i}", priority=5 - i) for i in range(3)]
+        self.assertEqual(injected_directive_ids(directives), ["id-d0", "id-d1", "id-d2"])
+
+    def test_injected_directive_ids_empty_list(self):
+        self.assertEqual(injected_directive_ids([]), [])
+
+    def test_injected_directive_ids_skips_malformed_entries(self):
+        directives = [
+            _directive("good", "content", priority=9),
+            {"priority": 5},  # no id — must not crash or contribute a None
+            "not-a-dict",
+        ]
+        self.assertEqual(injected_directive_ids(directives), ["id-good"])
+
+    def test_injected_directive_ids_honours_custom_cap(self):
+        directives = [_directive(f"d{i}", f"c{i}", priority=10 - i) for i in range(5)]
+        self.assertEqual(
+            injected_directive_ids(directives, max_directives=2), ["id-d0", "id-d1"]
+        )
 
     def test_no_warning_when_nothing_is_truncated(self):
         directives = [_directive("only", "single", priority=5)]
