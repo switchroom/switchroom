@@ -284,7 +284,18 @@ export const TOOLS = [
       required: ["cron_expr", "prompt"],
       properties: {
         cron_expr: { type: "string" },
-        prompt: { type: "string", minLength: 1, maxLength: 4000 },
+        prompt: {
+          type: "string",
+          minLength: 1,
+          maxLength: 4000,
+          description:
+            "The inbound turn YOU receive when this cron fires — not a message " +
+            "sent to the user. Phrase it from your future-self's perspective " +
+            "(\"Time for the daily digest — pull yesterday's GitHub activity and " +
+            "DM the summary to chat 12345\"), not as a request to you (\"please " +
+            "send the digest\"). Include any ids/context that future turn will " +
+            "need, since a Tier-1 fire has no conversation context.",
+        },
         secrets: { type: "array", items: { type: "string" } },
         name: { type: "string", pattern: "^[a-z0-9-]{1,40}$" },
         model: {

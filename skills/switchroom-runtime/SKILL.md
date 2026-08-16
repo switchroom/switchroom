@@ -54,6 +54,38 @@ This skill holds the runtime protocols that fire on specific boot signals or use
 
 ---
 
+## Session handoff — what actually survives a restart
+
+By default every restart starts a **fresh `claude` session**: the in-flight
+transcript is NOT carried over (`session_continuity.resume_mode: handoff`, the
+default since switchroom #362 — `auto`/`continue` are opt-in). Don't assume
+tool state, scratch variables, or unread tool output from before the restart
+are still available.
+
+What survives, and how it reaches you:
+
+- **`.handoff.md`** — on a clean shutdown the Stop hook writes a bounded raw
+  transcript tail of the prior session into your agent dir. `start.sh` merges
+  it into `--append-system-prompt` at boot, so it's already in your context —
+  read it to reorient.
+- **`.handoff-briefing.md`** — when `.handoff.md` is missing or stale (fresh
+  agent, or a hard crash that never fired the Stop hook, or a session that ran
+  *after* the briefing was written), `start.sh` runs `handoff-briefing.sh`,
+  which assembles a briefing from recent Telegram messages, Hindsight recall,
+  and today's daily memory file. Whichever is fresher is injected; if both
+  exist they're injected together, separated by a divider.
+- **Hindsight memory** — auto-recall fires on inbound user messages (minus the
+  skip cases) and surfaces memories from past sessions. Long-term facts,
+  decisions, and mental models live here, not in the transcript.
+- **Telegram history** — the gateway's SQLite buffer keeps every inbound and
+  outbound message. `mcp__switchroom-telegram__get_recent_messages` recovers
+  recent chat context the briefing didn't cover.
+
+If your context feels thin (post-compaction or any fresh session), recall from
+Hindsight before proceeding rather than guessing at what you were doing.
+
+---
+
 ## Resume protocol — interrupted turns
 
 **You do not poll for this.** When your previous turn was interrupted, the gateway wakes you on its own at boot by injecting a synthesized inbound — it arrives as your first turn, tagged `<channel source="resume_interrupted">` or `<channel source="resume_watchdog_timeout">`. The inbound text carries the specifics (elapsed time, the original request, tool-call count); this section is the *why* behind the two shapes so you handle each correctly. The policy is decided by how the prior turn ended, not by you.
