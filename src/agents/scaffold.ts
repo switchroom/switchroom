@@ -4023,6 +4023,15 @@ function renderHindsightSettingsOverrides(
   // =false (exported as HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE only when overridden;
   // the env value wins over this settings.json default).
   settings.directiveCaptureNudge = true;
+  // RFC phase4 P3: deterministic operator-profile capture nudge ON by default.
+  // Serves the "save memories about him" want — recall.py regex-detects a
+  // first-person durable self-statement by the operator and nudges the model
+  // to persist it with an explicit retain tagged `profile:ken` into the agent's
+  // OWN bank (the model does the judgment in-session; no model callsite).
+  // Operators opt OUT per-agent via memory.profile_capture_nudge=false
+  // (exported as HINDSIGHT_PROFILE_CAPTURE_NUDGE only when overridden; the env
+  // value wins over this settings.json default).
+  settings.profileCaptureNudge = true;
   // hindsight-leverage PR5 — recall-side weight for sidechain (sub-agent)
   // memories. The paired SubagentStop retain (vendor .../subagent_retain.py)
   // tags delegated worker process-facts `sidechain`; this down-weights their
@@ -4248,6 +4257,9 @@ interface BuildWorkspaceContextArgs {
   // #2848 Stage B — directive-capture nudge opt-out. Stringified bool,
   // undefined unless the operator overrode the switchroom default (on).
   hindsightDirectiveCaptureNudge?: string;
+  // RFC P3 — operator-profile capture nudge opt-out. Stringified bool,
+  // undefined unless the operator overrode the switchroom default (on).
+  hindsightProfileCaptureNudge?: string;
   // Per-row observation scope. undefined unless the operator set
   // memory.observation_scopes; exported only when set.
   hindsightObservationScopes?: string;
@@ -4303,6 +4315,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
+    hindsightProfileCaptureNudge,
     hindsightObservationScopes,
     hindsightObservationScopeStrategy,
     hindsightTopicAliasesJson,
@@ -4408,6 +4421,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
+    hindsightProfileCaptureNudge,
     hindsightObservationScopesQ: hindsightObservationScopes
       ? shellSingleQuote(hindsightObservationScopes)
       : undefined,
@@ -5444,6 +5458,15 @@ export function scaffoldAgent(
     agentConfig.memory?.directive_capture_nudge === undefined
       ? undefined
       : String(agentConfig.memory.directive_capture_nudge);
+  // RFC P3 — operator-profile capture nudge cascade. undefined unless the
+  // operator overrode the switchroom default (on). Exported only when set
+  // (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force. Top-level memory.* knob (not under
+  // memory.recall) — it gates a profile-detection nudge, not recall tuning.
+  const hindsightProfileCaptureNudge =
+    agentConfig.memory?.profile_capture_nudge === undefined
+      ? undefined
+      : String(agentConfig.memory.profile_capture_nudge);
   // Per-row observation scope (memory.observation_scopes cascade). undefined
   // unless the operator set it — exported only when set (see start.sh.hbs), so
   // the default retain body never carries the field and the engine default
@@ -5522,6 +5545,7 @@ export function scaffoldAgent(
     hindsightRecallTypes,
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
+    hindsightProfileCaptureNudge,
     hindsightObservationScopes,
     hindsightObservationScopeStrategy,
     hindsightTopicAliasesJson,
@@ -8136,6 +8160,15 @@ function reconcileAgentInner(
     agentConfig.memory?.directive_capture_nudge === undefined
       ? undefined
       : String(agentConfig.memory.directive_capture_nudge);
+  // RFC P3 — operator-profile capture nudge cascade. undefined unless the
+  // operator overrode the switchroom default (on). Exported only when set
+  // (see start.sh.hbs), so an unset value leaves the on-by-default
+  // settings.json override in force. Top-level memory.* knob (not under
+  // memory.recall) — it gates a profile-detection nudge, not recall tuning.
+  const hindsightProfileCaptureNudge =
+    agentConfig.memory?.profile_capture_nudge === undefined
+      ? undefined
+      : String(agentConfig.memory.profile_capture_nudge);
   // Per-row observation scope (memory.observation_scopes cascade). undefined
   // unless the operator set it — exported only when set (see start.sh.hbs), so
   // the default retain body never carries the field and the engine default
@@ -8246,6 +8279,7 @@ function reconcileAgentInner(
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
+      hindsightProfileCaptureNudge,
       hindsightObservationScopesQ: hindsightObservationScopes
         ? shellSingleQuote(hindsightObservationScopes)
         : undefined,
@@ -9077,6 +9111,7 @@ function reconcileAgentInner(
       hindsightRecallTypes,
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
+      hindsightProfileCaptureNudge,
       hindsightObservationScopes,
       hindsightObservationScopeStrategy,
       hindsightTopicAliasesJson,

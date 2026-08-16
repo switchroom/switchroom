@@ -1634,6 +1634,77 @@ _TEMPORAL_EXPRESSION_RE = re.compile(
 )
 
 
+# RFC phase4 P3 — deterministic operator-profile capture nudge.
+#
+# Ken's first stated want is "save memories about him" (RFC §0 constraint 5a).
+# Auto-retain does store transcript facts, but there is no deterministic signal
+# that a durable *profile fact* about the operator himself just went by, so
+# capture-as-profile is left to model discretion — the same per-agent lottery
+# Stage A measured for directives. This mirrors the shipped directive-capture
+# nudge (recall.py #2848): a POSITIVE regex detects a first-person durable
+# self-statement ("I prefer …", "my … is …", "I always …", "remind me that
+# I …"); a NEGATIVE regex scrubs the two shapes that would otherwise misfire —
+# questions ("do I prefer …?", "what's my …?") and third-/second-party
+# attributions ("you said I prefer …", "she claims my …") — BEFORE the positive
+# match. On a hit the hook appends a terse advisory telling the model to persist
+# the fact with an explicit mcp__hindsight__retain carrying a `profile:ken` tag
+# into THIS AGENT'S OWN bank. Pure regex — NO model callsite (the claude-native
+# invariant forbids a classifier call); the model makes the judgment in-session
+# and calls retain itself (chat-legible). The hook NEVER writes on its own.
+#
+# On by default; operators opt out per-agent via memory.profile_capture_nudge
+# =false → HINDSIGHT_PROFILE_CAPTURE_NUDGE (recall.py falls back to True).
+#
+# ROUTING CONSTRAINT (RFC §0 constraint 2, §7 Q3): the fact goes to the agent's
+# OWN bank, NOT a shared/cross-agent person bank (ken-profile/lisa-profile).
+# The tag makes the facts cheap to find and retire later if Q3 is answered
+# differently. The `profile:ken` operator identity is intentionally literal —
+# this fleet has a single named operator (Ken); a multi-operator deployment
+# would parameterise the tag, which is out of scope for P3.
+#
+# CONSERVATISM (RFC §7 Q1, unanswered): the RFC flags that this regex set is
+# derived from an ASSUMPTION that the profile facts Ken wants are
+# preference-/identity-shaped. Until Q1 is answered from a real instance, the
+# positive set is deliberately TIGHT (favouring false negatives) — only clearly
+# durable first-person framings, not bare "I like"/"I use" reactions that are
+# usually one-off. If Q1's answer is not preference-shaped, this set is wrong
+# and should be re-derived before it is relied on.
+_PROFILE_NUDGE_NEGATIVE_RE = re.compile(
+    r"""(?ix)
+    (?:
+      # --- interrogatives: a question ABOUT the operator is not a statement
+      #     OF a durable fact. Scrub the "<wh|aux> [do] I" / "<aux> my" lead so
+      #     the following "I prefer" / "my X is" can't fire. ---
+        \b (?: what | which | where | when | why | how | do | did | does
+             | should | would | could | can | are | is | was | were )
+          \s+ (?: do \s+ )? i \b
+      | \b what (?: ['’]? s | \s+ is | \s+ are ) \s+ my \b
+      | \b (?: where | when | is | are | was | were ) \s+ my \b
+      | \b remind \s+ me \s+ what \b
+      # --- discourse-marker "my <X> is" that is NOT a durable profile fact
+      #     ("my guess is", "my point is") — scrub so the "my … is" positive
+      #     doesn't fire on them. Conservative precision, not correctness. ---
+      | \b my \s+ (?: guess | point | question | understanding | concern | worry
+             | hope | bet | sense | take | assumption | plan | goal | issue
+             | problem | thinking | thought | suggestion | recommendation
+             | advice | answer | response | reply | mistake | fault | apology
+             | apologies | bad ) \b
+      # --- attributions: a fact the operator ascribes to someone else (or to
+      #     the agent) is not the operator stating his own profile. Scrub the
+      #     attributed clause through end-of-sentence. ---
+      | \b (?: he | she | they | you | who | someone | everyone | nobody )
+          \s+ (?: said | says | say | claimed | claims | thinks? | thought
+                | told | mentions? | mentioned | asks? | asked | wants? | wanted
+                | wrote | believes? | reckons? )
+          \b [^.?!]*
+      # --- pleasantries that embed a bare always/never after "I". ---
+      | \b i \s+ (?: always | never )
+          \s+ (?: appreciate | enjoy | 'm \s+ happy | am \s+ happy | love \s+ working ) \b
+    )
+    """
+)
+
+
 def detect_query_timestamp(text, now=None) -> "str | None":
     """Return an ISO 8601 ask-time anchor when ``text`` carries a temporal
     expression, else ``None``.
@@ -1667,6 +1738,65 @@ def detect_query_timestamp(text, now=None) -> "str | None":
         return None
     anchor = now if now is not None else datetime.now().astimezone()
     return anchor.isoformat()
+
+
+_PROFILE_NUDGE_RE = re.compile(
+    r"""(?ix)
+    (?:
+      # --- stated preferences ---
+        \b i \s+ prefer \b
+      | \b i['’]? d \s+ prefer \b
+      | \b my \s+ preference \s+ (?: is | are ) \b
+      # --- durable self-facts: "my <thing> is/are/'s <value>" ---
+      | \b my \s+ \w+ (?: \s+ \w+ )? \s+ (?: is | are | ['’] s ) \b
+      # --- identity / situation ---
+      | \b i (?: \s+ am | \s* ['’] m ) \s+ (?: a | an )? \s* (?: allergic \s+ to
+            | based \s+ (?: in | at ) | from | located \s+ in ) \b
+      | \b i \s+ live \s+ (?: in | at | near ) \b
+      | \b i \s+ work \s+ (?: at | as | for | in ) \b
+      # --- durable habits (first person; questions pre-scrubbed) ---
+      | \b i \s+ always \b
+      | \b i \s+ usually \b
+      | \b i \s+ normally \b
+      | \b i \s+ never \b
+      # --- explicit memory framing about the operator himself ---
+      | \b remember \s+ that \s+ i \b
+      | \b remind \s+ me \s+ that \s+ i \b
+    )
+    """
+)
+
+# Terse, advisory. The model decides IN-SESSION whether this is a durable
+# operator-profile fact and, if so, calls retain itself (chat-legible),
+# tagging it `profile:ken` and routing it to the agent's OWN bank. Kept short
+# so it costs a handful of tokens on a false positive.
+_PROFILE_CAPTURE_NUDGE = (
+    "<profile_capture_check>\n"
+    "The latest user message states a durable fact about the operator himself "
+    '(e.g. a preference "I prefer …", an identity/situation fact "my … is …", '
+    'a habit "I always …", or "remind me that I …") — NOT an instruction about '
+    "how you should behave (that is the directive path). If it is a DURABLE "
+    "fact worth remembering about him across sessions — not a one-off for this "
+    "task — persist it NOW with mcp__hindsight__retain, in his own words, "
+    'tagged ["profile:ken"], into THIS AGENT\'S OWN bank (the default bank — do '
+    "NOT route it to a shared or cross-agent person bank). If an equivalent "
+    "fact is already stored, do not duplicate it. If it is only a passing "
+    "remark, ignore this note and just answer.\n"
+    "</profile_capture_check>"
+)
+
+
+def looks_like_profile_statement(text) -> bool:
+    """Deterministic (regex-only) test for an operator durable-profile shape.
+
+    Question and attribution shapes ("do I prefer …?", "what's my …?", "you
+    said I prefer …") are scrubbed BEFORE the positive match so they can't trip
+    the first-person signals. Returns False on empty / non-string input. No
+    model call — the model does the actual judgment in-session (RFC P3)."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    scrubbed = _PROFILE_NUDGE_NEGATIVE_RE.sub(" ", text)
+    return bool(_PROFILE_NUDGE_RE.search(scrubbed))
 
 
 def _combine_context(base, nudge) -> str:
@@ -1890,6 +2020,23 @@ def main():
         if query_timestamp:
             debug_log(config, "Recall query_timestamp anchor: inbound is time-relative")
 
+    # RFC phase4 P3 — operator-profile capture nudge. Independent second nudge
+    # class: deterministic (regex) detection of a first-person durable
+    # self-statement by the operator; when it fires we append a terse advisory
+    # telling the model to persist it with an explicit retain carrying a
+    # `profile:ken` tag into the agent's OWN bank (RFC §0 constraint 2 forbids a
+    # cross-agent person bank). Computed on `_stripped` like the directive
+    # nudge, so the `<channel …>` wrapper never trips it. Both nudges may fire
+    # on one turn (e.g. "I prefer …" is both preference and profile-shaped) —
+    # they give different advice (create_directive vs profile:ken retain) and
+    # are combined independently at emit time. On by default;
+    # HINDSIGHT_PROFILE_CAPTURE_NUDGE=false (or memory.profile_capture_nudge:
+    # false) turns it off. No model callsite (claude-native invariant).
+    profile_nudge_block = None
+    if config.get("profileCaptureNudge", True) and looks_like_profile_statement(_stripped):
+        profile_nudge_block = _PROFILE_CAPTURE_NUDGE
+        debug_log(config, "Profile-capture nudge: inbound states a durable operator fact")
+
     session_id = hook_input.get("session_id") or ""
 
     # Switchroom #303 — push a "📚 recalling memories" status to the
@@ -1999,7 +2146,11 @@ def main():
             # #2848 — append the nudge to the cached context at emit time
             # (the cache stores nudge-free context; the nudge is re-derived
             # from the current prompt, so a hit can't replay a stale one).
-            _emit_cached_context(_combine_context(cached_context, nudge_block))
+            _emit_cached_context(
+                _combine_context(
+                    _combine_context(cached_context, nudge_block), profile_nudge_block
+                )
+            )
             _write_recall_log({
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "session_id": (session_id or "")[:32],
@@ -2078,6 +2229,9 @@ def main():
                 # uniformly queryable schema and to measure the firing rate
                 # from day one (precedent: `directive_nudge` above).
                 "query_timestamp": query_timestamp,
+                # RFC P3 — profile-capture nudge firing rate, measurable from
+                # day one (mirrors the directive_nudge precedent).
+                "profile_nudge": bool(profile_nudge_block),
                 # E1 / PR8 (#3369) — no banks ran on a cache hit, so the
                 # transcript fallback never fires; carry the zeroed fields for a
                 # uniformly queryable schema.
@@ -2864,6 +3018,9 @@ def main():
         # firing rate is measurable from day one against the RFC's falsification
         # window (precedent: `directive_nudge` above).
         "query_timestamp": query_timestamp,
+        # RFC P3 — profile-capture nudge firing rate, measurable from day one
+        # (mirrors the directive_nudge precedent).
+        "profile_nudge": bool(profile_nudge_block),
         # Switchroom hindsight-leverage E1 / PR8 (#3369) — transcript-grep
         # fallback telemetry so its firing (and its bounds) are visible per turn
         # in recall_log.jsonl. `transcript_fallback` True only on an all-zero,
@@ -2904,10 +3061,19 @@ def main():
     # is precisely the turn on which the agent must not assume it remembers.
     # #3837: so is a set the score floor withheld entirely.
     if not directives_block and not memories_block and not transcript_fallback_block:
-        if degraded_block or withheld_block or nudge_block:
+        if degraded_block or withheld_block or nudge_block or profile_nudge_block:
             _emit_cached_context(
                 "\n\n".join(
-                    [b for b in (degraded_block, withheld_block, nudge_block) if b]
+                    [
+                        b
+                        for b in (
+                            degraded_block,
+                            withheld_block,
+                            nudge_block,
+                            profile_nudge_block,
+                        )
+                        if b
+                    ]
                 )
             )
         return
@@ -2965,9 +3131,13 @@ def main():
             "hookEventName": "UserPromptSubmit",
             "additionalContext": _combine_context(
                 _combine_context(
-                    _combine_context(degraded_block, withheld_block), context_message
+                    _combine_context(
+                        _combine_context(degraded_block, withheld_block),
+                        context_message,
+                    ),
+                    nudge_block,
                 ),
-                nudge_block,
+                profile_nudge_block,
             ),
         }
     }

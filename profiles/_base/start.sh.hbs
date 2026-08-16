@@ -1189,6 +1189,15 @@ export HINDSIGHT_RECALL_SKIP_TRIVIAL={{hindsightRecallSkipTrivial}}
 {{#if hindsightDirectiveCaptureNudge}}
 export HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE={{hindsightDirectiveCaptureNudge}}
 {{/if}}
+# RFC phase4 P3 — operator-profile capture nudge (memory.profile_capture_nudge
+# cascade). On by default (plugin settings.json): recall.py regex-detects a
+# first-person durable self-statement by the operator and nudges the model to
+# persist it with an explicit retain tagged `profile:ken` into the agent's own
+# bank. Export only when the operator overrode it; set false to disable the
+# nudge for this agent.
+{{#if hindsightProfileCaptureNudge}}
+export HINDSIGHT_PROFILE_CAPTURE_NUDGE={{hindsightProfileCaptureNudge}}
+{{/if}}
 # Per-row observation scope (memory.observation_scopes cascade). Stamped on
 # every retain — Stop hook, sidechain, boot reconcile, queue drain, backfill.
 # "shared" makes consolidation pool this agent's observations into ONE global

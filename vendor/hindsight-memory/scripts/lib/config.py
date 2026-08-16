@@ -122,6 +122,14 @@ DEFAULTS = {
     # out per-agent via memory.directive_capture_nudge=false →
     # HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE (disables BOTH hooks).
     "directiveCaptureNudge": True,
+    # RFC phase4 P3 — operator-profile capture nudge (recall.py,
+    # UserPromptSubmit). Regex-detects a first-person durable self-statement by
+    # the operator and appends a terse advisory telling the model to persist it
+    # with an explicit retain tagged `profile:ken` into the agent's OWN bank.
+    # Pure detection — no model callsite, no silent hook-side write. Operators
+    # opt out per-agent via memory.profile_capture_nudge=false →
+    # HINDSIGHT_PROFILE_CAPTURE_NUDGE.
+    "profileCaptureNudge": True,
     # Switchroom #2873/#2903 Fix 6.2 — the BLOCKING half (Stage C
     # directive_verify.py Stop hook) split out from the advisory nudge. When
     # True (default) the verifier may block the stop once to re-prompt capture;
@@ -488,6 +496,11 @@ ENV_OVERRIDES = {
     # the operator overrode it; the switchroom default is on (settings.json
     # pins true; recall.py falls back to True).
     "HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE": ("directiveCaptureNudge", bool),
+    # RFC phase4 P3: operator-profile capture nudge on/off. Set by start.sh from
+    # agents.<name>.memory.profile_capture_nudge only when the operator overrode
+    # it; the switchroom default is on (settings.json pins true; recall.py falls
+    # back to True).
+    "HINDSIGHT_PROFILE_CAPTURE_NUDGE": ("profileCaptureNudge", bool),
     # Switchroom #2873/#2903 Fix 6.2: the Stage C block on/off, independent of
     # the Stage B nudge. Set by start.sh from
     # agents.<name>.memory.directive_capture_verify only when the operator
