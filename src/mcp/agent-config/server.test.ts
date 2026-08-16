@@ -61,6 +61,28 @@ describe("TOOLS export", () => {
       expect(t.description.length).toBeGreaterThan(10);
     }
   });
+
+  it("schedule_add.prompt carries the future-self framing in its schema (#4740)", () => {
+    // The cron-prompt perspective rule ("the prompt is what YOU receive
+    // when the cron fires — write it from your future self's point of
+    // view, not as a request to you") used to live only in the
+    // always-loaded CLAUDE.md self-service block. Prompt text is
+    // model-dependent; the schema is deterministic and arrives at call
+    // time, so the rule lives here. Without it agents author
+    // second-person prompts ("please send the digest") that read as
+    // someone else's instruction on fire.
+    const scheduleAdd = TOOLS.find((t) => t.name === "schedule_add");
+    expect(scheduleAdd).toBeDefined();
+    const props = scheduleAdd!.inputSchema.properties as Record<
+      string,
+      { description?: string }
+    >;
+    const promptDesc = props.prompt?.description ?? "";
+    expect(promptDesc.length).toBeGreaterThan(40);
+    expect(promptDesc.toLowerCase()).toContain("future-self");
+    // It must say the prompt is delivered TO the agent, not to the user.
+    expect(promptDesc.toLowerCase()).toMatch(/you receive|not a message sent to the user/);
+  });
 });
 
 describe("dispatchTool — happy path", () => {

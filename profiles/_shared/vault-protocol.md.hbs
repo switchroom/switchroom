@@ -2,65 +2,20 @@
 
 ## Vault & secrets
 
-Secrets (API keys, tokens, credentials) live in the encrypted vault.
-You read them via the vault-broker — never via direct file IO, never
-from an env file on disk, never by asking the operator to paste them
-into chat.
+Secrets live in the encrypted vault, read only via the vault-broker — never
+direct file IO (e.g. `~/.switchroom/credentials/*.env` — if code does this,
+it's a bug, not a fallback), never asking the operator to paste one into
+chat (the scrub hooks redact it anyway, but it's already leaked to history).
+Reference as `vault:<key>` in config; `switchroom vault get <key>` in a
+shell script. Never add `--no-broker` — the vault file isn't mounted in
+here, so it always fails; that flag is host-only, for the operator.
 
-### The reference syntax
+On `VAULT-BROKER-DENIED` (or a tool/sub-agent reporting a service as
+"inaccessible" — same wall, infer the likely `<service>/<key>`): if you have
+a `chat_id`, call `vault_request_access` and end your turn cleanly — a fresh
+inbound wakes you on approval. In a non-interactive context (cron, no
+operator chat), don't spam a card into an empty topic — degrade gracefully
+and note the gap for your next interactive turn.
 
-In `switchroom.yaml` and config files, secrets are referenced as
-`vault:<key>` (e.g. `vault:fatsecret/client_id`). The cascade resolver
-expands those at startup. In a shell script, fetch with:
-
-```bash
-switchroom vault get <key>
-```
-
-The CLI tries the broker first. From inside this agent, that's the
-only path that can work — the vault file itself is not mounted into
-the container.
-
-### When you hit `VAULT-BROKER-DENIED`
-
-You don't have a grant for that key yet. Recovery depends on whether
-there's an operator in the loop:
-
-- **Interactive context** (you're handling an inbound chat message,
-  i.e. you have a `chat_id` available): call the
-  `vault_request_access` MCP tool with `key='<key>'`, `scope='read'`,
-  and a one-line `reason`. This renders a `[✅ Approve] [🚫 Deny]`
-  card in the chat. After firing the tool, **end your turn cleanly** —
-  the gateway will inject a fresh inbound (`<channel source="vault_grant_approved">`)
-  when the operator approves, kicking off a new turn where you can
-  resume the task.
-
-- **Non-interactive context** (cron fire, `meta.source="cron"`, no
-  operator chat): do **not** spam approval cards into an empty topic.
-  Log the missing capability in your output, degrade gracefully
-  (clearly-marked estimates / a "skipped — needs vault grant" status
-  / etc.), and continue. The operator will see the gap in your next
-  interactive turn and can grant access then.
-
-### What never works from inside the agent
-
-- `switchroom vault get --no-broker <key>` — the vault file isn't
-  mounted; this exits with `VAULT-SANDBOX-CONTEXT`. The flag exists
-  for the operator on the host, not for you.
-- Reading a credentials env file from disk (e.g.
-  `~/.switchroom/credentials/<service>.env`). If you see code that
-  does this, treat it as a bug to fix, not a fallback to rely on —
-  unencrypted secrets on disk defeat the whole vault model.
-- Asking the operator to paste the secret into Telegram. The secret-
-  scrub hooks will redact it, and you've leaked it to chat history
-  along the way. Always use the `vault_request_access` flow.
-
-### When a sub-agent or tool reports a service/API/credential as "inaccessible"
-
-That's the broker wall surfacing as prose — treat it as `VAULT-BROKER-DENIED`. Don't ask the operator to paste credentials or open a dashboard: infer the likely key name (`<service>/<key>` convention — e.g. `coolify/api-token`, `github/token`, `<repo>/DATABASE_URL`), call `vault_request_access` with it, `scope='read'`, and a one-line reason, then end your turn cleanly and resume on the grant. Escalate only if the grant is explicitly denied or you can't infer a plausible key name.
-
-### Hint: the deny stderr tells you the exact recovery
-
-The CLI emits a marker + actionable hint on every vault failure. Read
-the **second line** — it names the right tool for your situation,
-sandbox-aware. Trust it instead of guessing.
+Every vault CLI failure's stderr line 2 names the exact recovery for your
+situation — trust it over guessing.

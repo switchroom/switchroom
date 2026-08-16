@@ -20,6 +20,17 @@ const telegramConfig: TelegramConfig = {
   forum_chat_id: "-1001234567890",
 };
 
+/**
+ * Collapse whitespace so an assertion pins the CLAIM, not the current line
+ * breaks. The profile templates hard-wrap at ~78 cols, so a rewrap alone
+ * used to turn these pins red — and worse, silently satisfy the
+ * `not.toContain` leak guards below (a vacuous pass). Normalising both
+ * sides keeps the guard honest in both directions.
+ */
+function flat(md: string): string {
+  return md.replace(/\s+/g, " ");
+}
+
 function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
     extends: "default",
@@ -188,31 +199,36 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     //    tools it has. What IS true: the agent's OWN shell (docker, /host,
     //    /host-home) is un-tapped, while hostd verbs still block on an
     //    operator approval card.
-    expect(claudeMd).not.toContain("supersedes the \"Admin surface\" section");
-    expect(claudeMd).toContain("How this composes with the Admin surface above — by path, not by rank");
-    expect(claudeMd).toContain("standing and un-tapped");
-    expect(claudeMd).toContain("still wired for you and still gated");
+    expect(flat(claudeMd)).not.toContain("supersedes the \"Admin surface\" section");
+    // The CLAIM, not the sentence: the agent's own shell is standing and
+    // un-tapped, while the hostd verbs remain wired AND operator-gated.
+    expect(flat(claudeMd)).toMatch(/standing (and )?un-tapped/);
+    expect(flat(claudeMd)).toMatch(/`hostd`[^.]*still[^.]*(gated|card)/);
+    expect(flat(claudeMd)).toContain("prefer your own shell");
+    expect(flat(claudeMd)).toContain("`root: true` forces admin semantics");
     // 2. Correct host-side per-agent log path (NOT the in-container
     //    /var/log/switchroom path, which doesn't exist under /host).
     expect(claudeMd).toContain("/host-home/.switchroom/logs/<agent>/");
     expect(claudeMd).not.toContain("/host/var/log/switchroom/");
     // 3. No claim that a full `switchroom apply` runs from the container
     //    (compose dir isn't mounted) — it's flagged as a host operation.
-    expect(claudeMd).toContain("hand the `apply` to the operator");
+    expect(flat(claudeMd)).toMatch(/`switchroom apply`[^.]*operator|hand the `apply` to the operator/);
     // 4. The "test before you claim a limit" reflex renders for a root
     //    agent: the fleet Sandbox primer tells EVERY agent "read-only /
     //    not root / operator action", but compose.ts emits `user: "0:0"`
     //    and skips read_only/cap_drop for root agents, so that framing is
     //    factually wrong for THIS tier. The reflex tells the root agent to
     //    TEST via its root shell before asserting a limit.
-    expect(claudeMd).toContain("Test before you claim a limit");
+    expect(flat(claudeMd)).toMatch(/Test before you claim a limit|Test limits live/);
+    expect(flat(claudeMd)).toContain("never assert \"operator-only\"");
     // 5. The no-exfil carve-out explicitly covers a peer's env via
     //    `docker exec`/`docker inspect` — the reflex sends the agent to
     //    inspect peers, and `docker inspect` PRINTS injected secret values,
     //    so "just testing" must not become a secret-exfil loophole.
-    expect(claudeMd).toContain('"just testing" is no exception');
-    expect(claudeMd).toContain("docker inspect");
-    expect(claudeMd).toContain("credentials/*.env");
+    expect(flat(claudeMd)).toContain('"just testing" is no exception');
+    expect(flat(claudeMd)).toMatch(/`docker exec`\/(`)?inspect|docker inspect/);
+    expect(flat(claudeMd)).toContain("credentials/*.env");
+    expect(flat(claudeMd)).toMatch(/prints injected secrets/i);
   });
 
   it("a non-root agent never renders the root-tier block (reflex must not leak)", () => {
@@ -222,7 +238,10 @@ describe("scaffoldAgent — persona (Phase 2)", () => {
     // The "try docker / /host" reflex would be actively wrong for a
     // non-root agent (no host socket, read-only rootfs), so it must be
     // gated to the root block and never reach a non-root agent.
-    expect(claudeMd).not.toContain("Test before you claim a limit");
-    expect(claudeMd).not.toContain('"just testing" is no exception');
+    // Normalised, so a rewrap of the root block can't make these guards
+    // pass vacuously.
+    expect(flat(claudeMd)).not.toMatch(/Test before you claim a limit|Test limits live/);
+    expect(flat(claudeMd)).not.toContain('"just testing" is no exception');
+    expect(flat(claudeMd)).not.toContain("/host-home/.switchroom/");
   });
 });
