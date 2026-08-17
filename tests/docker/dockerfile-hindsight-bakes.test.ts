@@ -1469,6 +1469,20 @@ describe("Dockerfile.hindsight shape", () => {
     expect(dockerfile).toMatch(
       /switchroom hindsight mcp-recall-token-budget patch: MCP recall now serializes /,
     );
+    // E-86: the max_tokens floor and the loud truncation marker. Without a
+    // floor, the tail-trim loop above can pop every ranked result and return
+    // a structurally valid, silently-empty {"results": []} — see
+    // tests/docker/hindsight-recall-budget-reflect-grounding-patches.test.ts
+    // for the behavioural RED/GREEN proof.
+    expect(dockerfile).toMatch(/_MCP_RECALL_MIN_MAX_TOKENS = 256/);
+    expect(dockerfile).toMatch(
+      /effective_max_tokens = max\(max_tokens, _MCP_RECALL_MIN_MAX_TOKENS\)/,
+    );
+    expect(dockerfile).toMatch(/def _mark_recall_truncated\(/);
+    expect(dockerfile).toMatch(
+      /assert "_MCP_RECALL_MIN_MAX_TOKENS = 256" in t,/,
+    );
+    expect(dockerfile).toMatch(/assert "def _mark_recall_truncated\(" in t,/);
   });
 
   it("keeps the reflect-temperature fix (assert-guarded, fail-loud)", () => {

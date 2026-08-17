@@ -4051,7 +4051,23 @@ HELPER = '''
 # fact TEXT (correct for the auto-recall hook, which injects only text); the
 # MCP tool then serialized with indent=2 and explicit nulls, measured live at
 # 6.7x the text cost. See docker/Dockerfile.hindsight for the full rationale.
+#
+# E-86 FOOTGUN FIX. The tail-trim loop below originally had no floor on
+# max_tokens: at a small enough caller-supplied value (empirically ~50-200
+# tokens depending on result size) it popped EVERY ranked result and returned
+# a structurally valid, silently-empty {"results": []} -- indistinguishable
+# from "the bank has nothing relevant" (measured live: HTTP returned 2 hits
+# for the identical query/bank/budget, MCP recall(max_tokens=50) returned
+# zero). Mirrors the floor create_mental_model already enforces one function
+# away (_validate_mental_model_inputs: 256 <= max_tokens <= 8192):
+#   1. Clamp an under-floor max_tokens UP to _MCP_RECALL_MIN_MAX_TOKENS before
+#      budgeting, so the crater case cannot happen at all.
+#   2. Whenever the trim loop actually drops a result, stamp the envelope
+#      truncated=true / dropped_count=N (additive top-level fields) so "empty
+#      because nothing matched" can never be confused with "empty (or
+#      shortened) because the budget popped hits".
 _MCP_RECALL_BUDGET_MODE_ENV = "HINDSIGHT_MCP_RECALL_BUDGET_MODE"
+_MCP_RECALL_MIN_MAX_TOKENS = 256
 
 
 def _mcp_recall_budget_mode() -> str:
@@ -4068,15 +4084,40 @@ def _mcp_recall_budget_mode() -> str:
     return "legacy" if raw == "legacy" else "envelope"
 
 
+def _mark_recall_truncated(payload: str, dropped_count: int) -> str:
+    """Stamp an additive truncation marker onto a compact recall payload.
+
+    Additive-only (new top-level keys), so it is safe for every existing
+    caller: one that ignores unknown fields sees the identical
+    results/entities/... it always did. dropped_count is the number of
+    ranked results the tail-trim popped to fit max_tokens, so a caller can
+    tell "nothing matched" (no truncated key at all) apart from "the budget
+    popped hits" (truncated=true, dropped_count>0) -- the failure this patch
+    exists to make loud instead of silent.
+    """
+    import json as _json
+
+    obj = _json.loads(payload)
+    obj["truncated"] = True
+    obj["dropped_count"] = dropped_count
+    return _json.dumps(obj, separators=(",", ":"))
+
+
 def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
     """Serialize a RecallResult compactly and enforce max_tokens on the result.
 
     Compact + exclude_none first (pure encoding win, no information loss).
-    If the serialized envelope still exceeds the caller's budget, drop results
-    from the tail — the engine returns them ranked, so the lowest-ranked go
-    first — pruning source_facts entries owned by dropped results, until the
-    payload fits. Worst case (envelope alone exceeds the budget with zero
-    results left) returns the minimal envelope rather than failing the call.
+    max_tokens is floored at _MCP_RECALL_MIN_MAX_TOKENS before any budgeting
+    runs, so a too-small caller value can no longer crater the trim loop to
+    zero results (E-86). If the serialized envelope still exceeds the
+    (floored) budget, drop results from the tail -- the engine returns them
+    ranked, so the lowest-ranked go first -- pruning source_facts entries
+    owned by dropped results, until the MARKED payload fits (the marker's own
+    ~2 extra tokens are checked against the budget too, so stamping the
+    truncation flag can never itself push the wire payload over max_tokens --
+    that would silently reopen the over-delivery bug PR #4125 fixed). An
+    untrimmed payload is returned byte-identical to before (no marker added
+    when nothing was dropped).
     """
     if _mcp_recall_budget_mode() == "legacy":
         return recall_result.model_dump_json(indent=2)
@@ -4085,11 +4126,17 @@ def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
 
     encoding = get_token_encoding()
 
+    effective_max_tokens = max(max_tokens, _MCP_RECALL_MIN_MAX_TOKENS)
+
+    def fits(candidate: str) -> bool:
+        return len(encoding.encode(candidate)) <= effective_max_tokens
+
     payload = recall_result.model_dump_json(exclude_none=True)
-    if len(encoding.encode(payload)) <= max_tokens:
+    if fits(payload):
         return payload
 
     results = list(recall_result.results)
+    original_count = len(results)
     while results:
         results.pop()
         recall_result.results = results
@@ -4104,9 +4151,10 @@ def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
                 k: v for k, v in recall_result.source_facts.items() if k in keep
             } or None
         payload = recall_result.model_dump_json(exclude_none=True)
-        if len(encoding.encode(payload)) <= max_tokens:
-            return payload
-    return payload
+        marked = _mark_recall_truncated(payload, original_count - len(results))
+        if fits(marked):
+            return marked
+    return _mark_recall_truncated(payload, original_count)
 
 
 '''
@@ -4160,6 +4208,21 @@ assert "for fid in (r.source_fact_ids or [])" in t, (
     "source_fact_ids — keying on result ids deletes the source facts of RETAINED "
     "observations (source_facts is keyed by source fact id, a disjoint id space)"
 )
+# E-86 floor + loud-truncation-marker assertions:
+assert "_MCP_RECALL_MIN_MAX_TOKENS = 256" in t, (
+    f"{TAG}: the E-86 max_tokens floor is missing — recall(max_tokens=<tiny>) can "
+    "crater the tail-trim loop to zero results again"
+)
+assert "effective_max_tokens = max(max_tokens, _MCP_RECALL_MIN_MAX_TOKENS)" in t, (
+    f"{TAG}: max_tokens is no longer clamped to the floor before budgeting"
+)
+assert "def _mark_recall_truncated(" in t, (
+    f"{TAG}: the truncation marker helper is missing — a trimmed recall payload "
+    "is indistinguishable from an honest empty result again"
+)
+assert 'obj["truncated"] = True' in t and 'obj["dropped_count"] = dropped_count' in t, (
+    f"{TAG}: the truncation marker no longer stamps truncated/dropped_count"
+)
 # Deliberate scope guards — these must stay untouched:
 assert "reflect_result.model_dump_json(indent=2)" in t, (
     f"{TAG}: the reflect tool's serialization changed — this patch is scoped to recall only"
@@ -4174,9 +4237,12 @@ assert "text_tokens = len(encoding.encode(text))" in me, (
 print(
     "switchroom hindsight mcp-recall-token-budget patch: MCP recall now serializes "
     "compact with exclude_none and enforces max_tokens over the serialized payload "
-    "(tail-trim of ranked results); the shared engine selector and the reflect tool "
-    "are untouched; HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy restores upstream's exact "
-    "returns on both branches"
+    "(tail-trim of ranked results), floors max_tokens at 256 so a too-small budget "
+    "can no longer crater results to empty (E-86), and stamps truncated=true/"
+    "dropped_count=N on any payload the trim loop actually shortened; the shared "
+    "engine selector and the reflect tool are untouched; "
+    "HINDSIGHT_MCP_RECALL_BUDGET_MODE=legacy restores upstream's exact returns on "
+    "both branches"
 )
 PYEOF
 

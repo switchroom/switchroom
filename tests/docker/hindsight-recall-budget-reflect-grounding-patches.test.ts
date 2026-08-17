@@ -18,6 +18,20 @@
  *     `temperature`, and the litellm provider omits the kwarg when None — so
  *     the provider default (~1.0) applied to factual synthesis.
  *
+ * A THIRD defect (E-86) lives inside fix 1's own trim loop and is asserted
+ * within the `hasattr(mcp_tools, "_recall_payload_within_budget")` guard
+ * below (patched-only, no upstream analogue): the tail-trim loop that fix 1
+ * introduced had no floor on the caller's `max_tokens`, so a small enough
+ * value (empirically ~50-200 tokens, live-reproduced at `max_tokens: 50`)
+ * popped EVERY ranked result and returned a structurally valid, silently
+ * empty `{"results": []}` — indistinguishable from "the bank has nothing
+ * relevant". The fix mirrors `create_mental_model`'s existing
+ * `256 <= max_tokens <= 8192` floor (`mcp_tools.py:1345-1346`): clamp
+ * `max_tokens` up to `_MCP_RECALL_MIN_MAX_TOKENS` (256) before budgeting, and
+ * stamp `truncated: true` / `dropped_count: N` on any payload the trim loop
+ * actually shortened, so a trimmed result can never be mistaken for "no
+ * memories".
+ *
  * (A third patch — a relevance gate on the reflect mental-model
  * short-circuit — was authored and then dropped from this PR: re-probing the
  * live bank showed every mental model on the reported failing query scored
@@ -337,6 +351,89 @@ async def drive():
                 "model_dump() - python objects in trace were coerced through JSON"
             )
 
+        # ---------------------------------------------------------- E-86
+        # Live reproduction (2026-08-17 root-cause pass): identical
+        # query/bank/budget via MCP recall(budget="low", max_tokens=50)
+        # returned {"results": []} while direct HTTP against the same engine
+        # state returned 2 ranked hits - a silent, structurally-valid empty
+        # indistinguishable from "the bank has nothing relevant". The MCP
+        # tail-trim loop had no floor on max_tokens, so a small enough value
+        # popped every ranked result. This must not be reproducible: either
+        # the floor keeps a non-empty ranked prefix, or (if a single result
+        # alone still can't fit) the drop is loud (truncated/dropped_count),
+        # never a bare silent {"results": []}.
+        E86_MAX_TOKENS = 50  # the exact value that crashed to zero live
+        e86 = await fn(query="what do we know", budget="low", max_tokens=E86_MAX_TOKENS)
+        e86_parsed = json.loads(e86)
+        e86_results = e86_parsed.get("results", [])
+        e86_silent_empty = len(e86_results) == 0 and "truncated" not in e86_parsed
+        print(
+            "E86_RESULTS",
+            len(e86_results),
+            "TRUNCATED",
+            e86_parsed.get("truncated"),
+            "DROPPED_COUNT",
+            e86_parsed.get("dropped_count"),
+            "SILENT_EMPTY",
+            e86_silent_empty,
+        )
+        if e86_silent_empty:
+            failures.append(
+                "E-86: recall(budget='low', max_tokens=%d) against a bank with real "
+                "hits returned a silent empty {'results': []} - no truncation marker, "
+                "indistinguishable from 'nothing matched'" % E86_MAX_TOKENS
+            )
+        # The floor itself: a query known to have hits must come back non-empty
+        # at ANY caller-supplied max_tokens, however small - the crater case
+        # this patch exists to close outright.
+        for tiny in (1, 10, 50, 200):
+            e86_floor = await fn(query="what do we know", budget="low", max_tokens=tiny)
+            n = len(json.loads(e86_floor).get("results", []))
+            print("E86_FLOOR_MAX_TOKENS", tiny, "RESULTS", n)
+            if n == 0:
+                failures.append(
+                    "E-86: recall(max_tokens=%d) against a bank with real hits still "
+                    "craters to zero results - the max_tokens floor is not effective"
+                    % tiny
+                )
+
+        # A single result too large to fit even after flooring must still be
+        # loud (truncated marker), not a silent empty - the residual case the
+        # floor alone cannot close.
+        def build_oversized_single_result():
+            huge_text = "one huge fact: " + ("detail " * 400)  # far > any floor
+            return RecallResult(
+                results=[MemoryFact(id="huge-0", text=huge_text, fact_type="world")],
+                trace={"query": "q"},
+            )
+
+        class OversizedMemory:
+            async def recall_async(self, **kwargs):
+                return build_oversized_single_result()
+
+        mcp4 = FastMCP("probe-e86-oversized")
+        cfg4 = mcp_tools.MCPToolsConfig(
+            bank_id_resolver=lambda: "probe-bank",
+            include_bank_id_param=True,
+        )
+        mcp_tools._register_recall(mcp4, OversizedMemory(), cfg4)
+        fn4 = (await mcp4.get_tool("recall")).fn
+        oversized = await fn4(query="q", max_tokens=mcp_tools._MCP_RECALL_MIN_MAX_TOKENS)
+        oversized_parsed = json.loads(oversized)
+        print(
+            "E86_OVERSIZED_RESULTS",
+            len(oversized_parsed.get("results", [])),
+            "TRUNCATED",
+            oversized_parsed.get("truncated"),
+            "DROPPED_COUNT",
+            oversized_parsed.get("dropped_count"),
+        )
+        if len(oversized_parsed.get("results", [])) == 0 and not oversized_parsed.get("truncated"):
+            failures.append(
+                "E-86: an oversized single result trimmed to zero without a "
+                "truncated/dropped_count marker - silent empty, not loud"
+            )
+
 
 asyncio.run(drive())
 # ------------------------------------------------------------------ fix 2
@@ -625,6 +722,17 @@ describe.skipIf(!dockerOk || !imageOk)(
       expect(stdout).toContain("RESOLVED 0.1 0.3 None");
       expect(stdout).toContain("REFLECT_CALL_SITES 6 WIRED 6");
       expect(stdout).toContain("PROVIDER_FORWARDS 0.1 OMITS_WHEN_NONE True");
+
+      // Fix 3 (E-86): the exact live-reproduced footgun — budget:"low" +
+      // max_tokens:50 against a bank with real hits — must never come back
+      // as a silent empty; the max_tokens floor must hold at every tiny
+      // value; and a single oversized result must still be loud, not silent.
+      expect(stdout).toContain("SILENT_EMPTY False");
+      expect(stdout).toMatch(/E86_FLOOR_MAX_TOKENS 1 RESULTS [1-9]\d*/);
+      expect(stdout).toMatch(/E86_FLOOR_MAX_TOKENS 10 RESULTS [1-9]\d*/);
+      expect(stdout).toMatch(/E86_FLOOR_MAX_TOKENS 50 RESULTS [1-9]\d*/);
+      expect(stdout).toMatch(/E86_FLOOR_MAX_TOKENS 200 RESULTS [1-9]\d*/);
+      expect(stdout).toMatch(/E86_OVERSIZED_RESULTS 0 TRUNCATED True DROPPED_COUNT 1/);
     }, 240_000);
   },
 );
