@@ -150,11 +150,38 @@ export interface EquivalenceReport {
  * preserves the obligation without the literal token — demanding it survive is
  * a condensation artifact with no safety loss (every rule in the block is
  * already mandatory by construction).
+ *
+ * SATISFACTION IS SPAN-SCOPED, not whole-rule (PR #4771 adversarial review,
+ * MAJOR 1). A satisfy token counts only when it GOVERNS THE SAME SPAN the modal
+ * governed in the directive — i.e. it sits within a bounded window of a content
+ * word the directive used near its trigger (see {@link ruleSatisfiesModal}).
+ * Matching a satisfy token ANYWHERE in the ~400B rule let an INVERTED
+ * condensation pass: "Never call Ian the executor without a grant" → "Ian is
+ * the executor without a grant" dropped the negation yet satisfied `neg` via the
+ * surviving, unrelated "without". Two changes close that:
+ *   (a) `without` is removed from `neg.satisfy`. It is a PREPOSITION, not a
+ *       clausal polarity marker — it modifies its own object ("without a grant")
+ *       and carries no reliable sentence polarity, so it survived the inversion
+ *       sitting beside the SAME span the lost "never" governed, defeating any
+ *       proximity check. No genuine condensation relies on a bare "without" as
+ *       its ONLY negation marker (faithful ones keep "no"/"not"/"never"/"don't").
+ *   (b) the span/proximity check above (the robust mechanism).
+ *
+ * NOTE — the review's fallback also proposed dropping `no`/`nor`/`none`/`avoid`
+ * (neg) and `just`/`alone`/`purely` (only). Validation against the 5 real M2→M3
+ * drafts CONTRADICTED that: carrie condenses "does NOT want …"/"don't ship …"/
+ * "No employer-bashing"/"no public URL" into rules that carry the negation as
+ * "no X" — 6 FAITHFUL condensations. Dropping `no` re-flagged all 6, reviving the
+ * exact false-positive class this gate exists to kill. With the span/proximity
+ * check now scoping satisfaction, those reliable negators no longer need
+ * dropping (a relocated survivor no longer satisfies), so only the one proven
+ * falsifier-enabler (`without`) is removed. Evidence: triage/carrie + the
+ * `adversarial false-negatives` acceptance tests.
  */
 const MODAL_CLASSES = {
   neg: {
     trigger: ["never", "cannot", "can't", "don't", "do not", "won't", "must not", "may not", "shall not"],
-    satisfy: ["never", "no", "not", "don't", "dont", "cannot", "can't", "cant", "won't", "wont", "shan't", "none", "nor", "without", "avoid", "refuse", "neither", "prohibit", "forbid", "ban"],
+    satisfy: ["never", "no", "not", "don't", "dont", "cannot", "can't", "cant", "won't", "wont", "shan't", "none", "nor", "avoid", "refuse", "neither", "prohibit", "forbid", "ban"],
   },
   only: {
     trigger: ["only", "sole", "solely", "exclusively", "nothing but"],
@@ -207,9 +234,18 @@ const CODE_ACRONYM_NUM_RE = /\b[A-Z]{2,5}(?:\s+\d{2,}){1,}\b/g;
  *  before a fact match ⇒ the fact is a SAMPLE, not an asserted guardrail. No
  *  trailing `\b` — markers ending in `.` ("e.g.") have no word boundary before
  *  the following space — and the run after the marker forbids sentence
- *  terminators (`.?!:;`) so the marker must be in the SAME clause as the fact. */
+ *  terminators (`.?!:;`) so the marker must be in the SAME clause as the fact.
+ *
+ *  `like` and `including` are DELIBERATELY EXCLUDED (PR #4771 adversarial
+ *  review, MAJOR 2). Both are far too broad to reliably mark an illustrative
+ *  sample: "handle probate cases including S CAV 2026 00037" and "parties like
+ *  GARY DAVID BROWN" name LOAD-BEARING facts, not examples. Treating anything
+ *  after them as illustrative silently stopped demanding those facts, so a rule
+ *  that dropped the code/name PASSED the gate. Only the reliable, unambiguous
+ *  example cues remain (`e.g.`, `i.e.`, `such as`, `for example`,
+ *  `for instance`, `example(s)`). */
 const EXAMPLE_CONTEXT_RE =
-  /(?:\be\.?\s?g\.?|\bi\.?\s?e\.?|\bsuch as|\bfor example|\bfor instance|\bexamples?\b|\bincluding\b|\blike\b)[^.?!:;]{0,48}$/i;
+  /(?:\be\.?\s?g\.?|\bi\.?\s?e\.?|\bsuch as|\bfor example|\bfor instance|\bexamples?\b)[^.?!:;]{0,48}$/i;
 
 /** Common English words a directive may SHOUT for emphasis rather than name.
  *  An ALL-CAPS run containing any of these is emphasis, not a party name.
@@ -298,6 +334,12 @@ export interface Keyword {
   value: string;
   /** For `kind === "modal"`: which synonym class must survive. */
   modalClass?: ModalClass;
+  /** For `kind === "modal"`: the content words the directive used near its
+   *  trigger — the SPAN the modal governed. A surviving satisfy token in the
+   *  rule counts only when it sits within a bounded window of one of these (see
+   *  {@link ruleSatisfiesModal}). Empty ⇒ fall back to whole-rule containment
+   *  (the directive gave no usable anchor, e.g. a bare "Never x."). */
+  anchors?: string[];
 }
 
 function normalize(s: string): string {
@@ -326,9 +368,126 @@ function directiveTriggersModal(normalizedContent: string, cls: ModalClass): boo
   return MODAL_CLASSES[cls].trigger.some((w) => containsWord(normalizedContent, w));
 }
 
-/** True when the rule satisfies `cls` (contains any of its satisfy words). */
-function ruleSatisfiesModal(normalizedRuleText: string, cls: ModalClass): boolean {
-  return MODAL_CLASSES[cls].satisfy.some((w) => containsWord(normalizedRuleText, w));
+// --- Span/proximity scoping for modal satisfaction (PR #4771 MAJOR 1) --------
+//
+// A modal obligation is satisfied only when a surviving satisfy token GOVERNS
+// THE SAME SPAN it governed in the directive. We approximate "same span" by the
+// content words the directive used within a window of its trigger (the modal's
+// ANCHORS); the satisfy token in the rule must sit within a window of one of
+// those anchors. Generous windows: the goal is to catch an inverted/relocated
+// negation, not to re-introduce condensation false positives — a faithful
+// reword keeps the modal beside the thing it negates/scopes.
+
+/** Half-width, in characters, of the proximity window on both the directive
+ *  (anchor harvest) and rule (satisfy match) sides. ~One clause of a ~400B
+ *  rule; wide enough that a faithful reword passes, tight enough that a modal
+ *  relocated to an unrelated clause does not. */
+const MODAL_SPAN_WINDOW = 120;
+
+/** Function/scaffolding words that make poor anchors — too common to pin a span
+ *  and prone to spurious matches. Anchors must be DISTINCTIVE content words. */
+const ANCHOR_STOPWORDS = new Set([
+  "this", "that", "these", "those", "with", "without", "from", "into", "onto",
+  "your", "their", "there", "here", "then", "than", "them", "they", "some",
+  "such", "each", "every", "which", "what", "when", "where", "while", "about",
+  "before", "after", "over", "under", "above", "below", "must", "should",
+  "would", "could", "shall", "will", "have", "been", "being", "does", "done",
+  "also", "only", "just", "very", "much", "more", "most", "less", "least",
+  "any", "all", "both", "either", "neither", "none", "unless", "until",
+]);
+
+/** The character offset of `cls`'s first trigger occurrence in the (normalized)
+ *  directive, or -1. `only` uses the refined, sense-aware matcher. */
+function firstTriggerIndex(normalizedContent: string, cls: ModalClass): number {
+  if (cls === "only") {
+    const m = ONLY_TRIGGER_RE.exec(normalizedContent);
+    return m ? m.index : -1;
+  }
+  let best = -1;
+  for (const w of MODAL_CLASSES[cls].trigger) {
+    const stem = normalize(w).replace(/['’]/g, "'");
+    const re = new RegExp(`(?:^|[^a-z0-9])(${escapeRe(stem)})(?:[^a-z0-9]|$)`);
+    const m = re.exec(normalizedContent);
+    if (m) {
+      const idx = m.index + m[0].indexOf(m[1]);
+      if (best === -1 || idx < best) best = idx;
+    }
+  }
+  return best;
+}
+
+/** Distinctive content words (≥4 chars, not a stopword) within
+ *  ±MODAL_SPAN_WINDOW of `centerIdx` — the span the modal governs. */
+function anchorsAround(normalizedContent: string, centerIdx: number): string[] {
+  if (centerIdx < 0) return [];
+  const lo = Math.max(0, centerIdx - MODAL_SPAN_WINDOW);
+  const hi = Math.min(normalizedContent.length, centerIdx + MODAL_SPAN_WINDOW);
+  const window = normalizedContent.slice(lo, hi);
+  const words = window.match(/[a-z0-9]{4,}/g) ?? [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const w of words) {
+    if (ANCHOR_STOPWORDS.has(w) || seen.has(w)) continue;
+    seen.add(w);
+    out.push(w);
+  }
+  return out;
+}
+
+/** Anchors for a triggered modal class: the span words around its trigger. */
+function modalAnchors(normalizedContent: string, cls: ModalClass): string[] {
+  return anchorsAround(normalizedContent, firstTriggerIndex(normalizedContent, cls));
+}
+
+/** All character offsets at which `word` occurs as a whole word in `text`. */
+function wordOffsets(text: string, word: string): number[] {
+  const stem = normalize(word).replace(/['’]/g, "'");
+  const offsets: number[] = [];
+  if (/\s/.test(stem)) {
+    let i = text.indexOf(stem);
+    while (i !== -1) {
+      offsets.push(i);
+      i = text.indexOf(stem, i + 1);
+    }
+    return offsets;
+  }
+  const re = new RegExp(`(^|[^a-z0-9])(${escapeRe(stem)})([^a-z0-9]|$)`, "g");
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    offsets.push(m.index + m[1].length);
+    re.lastIndex = m.index + 1; // allow overlapping / adjacent matches
+  }
+  return offsets;
+}
+
+/**
+ * True when the rule satisfies `cls`. A satisfy token must both (i) be present
+ * as a whole word and (ii) sit within ±MODAL_SPAN_WINDOW of one of the modal's
+ * `anchors` — the span the directive's modal governed. When `anchors` is empty
+ * (the directive gave no distinctive span word, e.g. a bare "Never x."), it
+ * falls back to whole-rule containment so short guardrails still match.
+ *
+ * This is the fix for PR #4771 MAJOR 1: whole-rule containment let an unrelated
+ * same-class survivor (a relocated "without"/"not") satisfy a modal whose actual
+ * proposition the condensation had dropped or inverted.
+ */
+function ruleSatisfiesModal(
+  normalizedRuleText: string,
+  cls: ModalClass,
+  anchors: readonly string[] = [],
+): boolean {
+  const tokens = MODAL_CLASSES[cls].satisfy;
+  if (anchors.length === 0) {
+    return tokens.some((w) => containsWord(normalizedRuleText, w));
+  }
+  for (const tok of tokens) {
+    for (const at of wordOffsets(normalizedRuleText, tok)) {
+      const lo = Math.max(0, at - MODAL_SPAN_WINDOW);
+      const hi = Math.min(normalizedRuleText.length, at + tok.length + MODAL_SPAN_WINDOW);
+      const window = normalizedRuleText.slice(lo, hi);
+      if (anchors.some((a) => window.includes(a))) return true;
+    }
+  }
+  return false;
 }
 
 /** First trigger word the directive used for `cls`, for readable reporting. */
@@ -357,9 +516,17 @@ export function extractKeywords(content: string): Keyword[] {
   const norm = normalize(content);
 
   // (1) Modal synonym classes — guardrail. One keyword per triggered class.
+  //     `anchors` pin the span the modal governed so satisfaction is span-scoped
+  //     (a relocated same-class survivor no longer satisfies) — PR #4771 MAJOR 1.
   for (const cls of Object.keys(MODAL_CLASSES) as ModalClass[]) {
     if (directiveTriggersModal(norm, cls)) {
-      push({ kind: "modal", klass: "guardrail", value: firstTrigger(norm, cls), modalClass: cls });
+      push({
+        kind: "modal",
+        klass: "guardrail",
+        value: firstTrigger(norm, cls),
+        modalClass: cls,
+        anchors: modalAnchors(norm, cls),
+      });
     }
   }
 
@@ -401,7 +568,7 @@ export function extractKeywords(content: string): Keyword[] {
 function ruleContainsKeyword(normalizedRuleText: string, kw: Keyword): boolean {
   if (kw.klass === "illustrative") return true;
   if (kw.kind === "modal" && kw.modalClass) {
-    return ruleSatisfiesModal(normalizedRuleText, kw.modalClass);
+    return ruleSatisfiesModal(normalizedRuleText, kw.modalClass, kw.anchors ?? []);
   }
   const needle = normalize(kw.value);
   if (/\s/.test(needle)) return normalizedRuleText.includes(needle);

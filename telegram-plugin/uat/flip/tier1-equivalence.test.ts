@@ -362,6 +362,46 @@ describe("tier1 calibration — STILL FAILS on a genuinely dropped guardrail", (
   });
 });
 
+describe("tier1 calibration — adversarial false-negatives (PR #4771 review)", () => {
+  // MAJOR 1 (review of PR #4771): a modal class must not be satisfied by an
+  // unrelated same-class survivor token. The directive NEGATES the proposition
+  // ("Never call Ian the executor …"); the condensed rule INVERTS it ("Ian is
+  // the executor …") while an unrelated "without" survives. Before the fix the
+  // neg class matched "without" anywhere in the rule and the inversion PASSED —
+  // the exact drop-through the gate exists to catch. It MUST FAIL.
+  it("negation dropped, meaning inverted, unrelated 'without' survives ⇒ FAIL", () => {
+    const directives = [
+      directive("d1", "no-ian", "Never call Ian the executor without a documentary grant of probate."),
+    ];
+    const rep = compareDirectivesToRules(
+      directives,
+      parsed([rule("R-01", "Ian is the executor without a documentary grant.")]),
+      { d1: "R-01" },
+    );
+    expect(rep.pass).toBe(false);
+    expect(rep.truncated_or_drifted[0]).toMatchObject({ id: "d1", ruleId: "R-01" });
+    expect(rep.truncated_or_drifted[0].missingKeywords).toContain("never");
+  });
+
+  // MAJOR 2 (review of PR #4771): EXAMPLE_CONTEXT_RE included `like`/`including`,
+  // which reclassified a load-bearing fact sitting after those words as an
+  // illustrative sample and stopped demanding it. A rule that DROPS the caveat
+  // code then PASSED. With `like`/`including` removed from the example markers
+  // the code stays a guardrail and the drop MUST FAIL.
+  it("load-bearing case code after 'including' dropped by the rule ⇒ FAIL", () => {
+    const directives = [
+      directive("d1", "caveat", "Handle probate cases including S CAV 2026 00037 with the sealed-file protocol."),
+    ];
+    const rep = compareDirectivesToRules(
+      directives,
+      parsed([rule("R-01", "Handle probate cases with the sealed-file protocol.")]),
+      { d1: "R-01" },
+    );
+    expect(rep.pass).toBe(false);
+    expect(rep.truncated_or_drifted[0].missingKeywords).toContain("CAV 2026 00037");
+  });
+});
+
 describe("tier1 calibration — now PASSES real synonym-preserving condensations", () => {
   it("negation synonym: directive 'don't' → rule 'NEVER' preserves the guardrail ⇒ PASS", () => {
     const directives = [directive("d1", "confirm-external", "Don't send letters to solicitors without Ken's approval.")];
