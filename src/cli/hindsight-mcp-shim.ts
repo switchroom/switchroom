@@ -922,9 +922,115 @@ function unknownArgMessage(
 }
 
 /**
+ * Forwarded tools whose caller-supplied `bank_id` is bank-scope-guarded to
+ * the caller's own bank (M6/E-86 red-team §1 — the "TOP FINDING", widened by
+ * red-team Major 2).
+ *
+ * Every `FALLBACK_TOOL_TABLE` tool that (a) is READ-ONLY against the engine
+ * and (b) declares `bank_id` as an accepted argument that the engine honors
+ * verbatim with no grant validation of its own is listed here. Fleet bank
+ * names are effectively the agent names (`klanker`, `overlord`, `marko`,
+ * …), low-entropy and guessable, so an attacker-steered caller (a
+ * prompt-injected main agent, or a prompt injection landing in a worker
+ * sub-agent) could pass `bank_id: "overlord"` to any of these and read
+ * another agent's memory wholesale — `reflect(bank_id:"overlord")` or
+ * `list_memories(bank_id:"overlord", q:"credentials")` are just as much an
+ * exfil path as `recall`. Read-only does not contain that: the caller can
+ * still write what it read into its handback, a file, or an outbound
+ * request.
+ *
+ * The guarded set, audited against the full `FALLBACK_TOOL_TABLE` surface:
+ *   `recall`, `reflect`, `get_mental_model`, `get_memory`, `list_memories`,
+ *   `list_directives`, `get_bank`, `get_bank_stats`, `get_document`,
+ *   `get_operation`, `list_documents`, `list_mental_models`,
+ *   `list_operations`, `list_tags`.
+ * (The three knowledge-base read tools — `get_knowledge_tree`,
+ * `get_knowledge_page`, `search_knowledge_pages` — are shim-SYNTHESIZED and
+ * already have no `bank_id` property at all, see
+ * {@link SYNTHESIZED_TOOL_TABLE}. `list_banks` takes no arguments at all.)
+ *
+ * DELIBERATELY NOT every bank_id-accepting table tool: WRITE/mutating tools
+ * (`retain`, `sync_retain`, `create_directive`, `create_bank`,
+ * `create_mental_model`, `delete_bank`, `delete_directive`,
+ * `delete_document`, `delete_mental_model`, `clear_memories`,
+ * `clear_mental_model`, `update_bank`, `update_memory`,
+ * `update_mental_model`, `refresh_mental_model`, `invalidate_memory`,
+ * `cancel_operation`) are excluded from this guard. `retain` in particular
+ * has a real, current, documented cross-bank use — the fleet's own memory
+ * guidance (`MEMORY_GUIDANCE` in `src/agents/scaffold.ts`) routes durable
+ * repo knowledge to a shared bank with
+ * `mcp__hindsight__retain(..., bank_id="switchroom-dev", ...)`. Guarding
+ * writes too would break that legitimate flow; closing the write-side
+ * exfil/tamper class needs a real allowlist (e.g. `{own, switchroom-dev}`)
+ * rather than this tool's own-bank-only rule, and is tracked as a separate
+ * follow-up rather than folded in here.
+ */
+export const BANK_SCOPE_GUARDED_TOOLS = new Set([
+  "recall",
+  "reflect",
+  "get_mental_model",
+  "get_memory",
+  "list_memories",
+  "list_directives",
+  "get_bank",
+  "get_bank_stats",
+  "get_document",
+  "get_operation",
+  "list_documents",
+  "list_mental_models",
+  "list_operations",
+  "list_tags",
+]);
+
+/**
+ * Reject a caller-supplied `bank_id` that does not match the shim's own
+ * pinned bank, for tools in {@link BANK_SCOPE_GUARDED_TOOLS}.
+ *
+ * Full grant-set validation against an operator-provisioned allowlist (M7 /
+ * W-2's bank selector) is not built yet. This is the MINIMAL deterministic
+ * guard that can ship today: a caller may only ever target its OWN bank.
+ * `bank_id` omitted (defaults to own bank via the `X-Bank-Id` header) or
+ * `bank_id` equal to the own bank both pass unchanged; anything else is
+ * REJECTED LOUDLY — never silently coerced to the caller's own bank, because
+ * a silent rewrite would hide the attempt from whoever reads the tool
+ * result/transcript.
+ *
+ * No-op when the shim itself has no bank pinned (`ownBankId` empty, i.e.
+ * `HINDSIGHT_BANK_ID` unset). Every real deployment sets it
+ * ({@link resolveShimOptionsFromEnv}'s fallback is the only place it can be
+ * empty), so this only affects a genuinely unconfigured shim — never
+ * production — rather than reaching for a "reject if we can't tell" rule
+ * that would make an already-permissive default behave inconsistently with
+ * every other guard in this file.
+ *
+ * Exported for direct unit coverage; wired in from
+ * {@link guardAndClampToolCall} only for names in
+ * {@link BANK_SCOPE_GUARDED_TOOLS}.
+ */
+export function guardBankScope(
+  name: string,
+  args: Record<string, unknown>,
+  ownBankId: string,
+): { ok: true } | { ok: false; text: string } {
+  if (!BANK_SCOPE_GUARDED_TOOLS.has(name)) return { ok: true };
+  if (!ownBankId) return { ok: true };
+  const requested = args.bank_id;
+  if (requested === undefined) return { ok: true };
+  if (requested === ownBankId) return { ok: true };
+  return {
+    ok: false,
+    text:
+      `${name}: bank_id ${JSON.stringify(requested)} is not your own bank ` +
+      `(${JSON.stringify(ownBankId)}). Cross-bank reads are not permitted ` +
+      "through this tool — omit bank_id (or pass your own) to read your " +
+      "own memory.",
+  };
+}
+
+/**
  * Guard + clamp a `tools/call` params object before it is forwarded upstream.
  *
- * Two jobs, both closing holes the engine leaves open (it declares
+ * Three jobs, all closing holes the engine leaves open (it declares
  * `additionalProperties:false` but does NOT enforce it — an unknown arg is
  * dropped SILENTLY with isError:false, so the agent believes a cap/filter
  * applied when it did not):
@@ -935,16 +1041,33 @@ function unknownArgMessage(
  *     unknown key returns a loud, self-correcting error instead of a silent
  *     drop. Tools not in the table are passed through unvalidated (no ground
  *     truth to validate against).
- *  2. DEFAULT BUDGET CLAMP — for `recall`/`reflect` only, inject
+ *  2. BANK-SCOPE GUARD — for the tools in {@link BANK_SCOPE_GUARDED_TOOLS}
+ *     (every read-only table tool that accepts `bank_id`: `recall`,
+ *     `reflect`, `get_mental_model`, `get_memory`, `list_memories`,
+ *     `list_directives`, `get_bank`, `get_bank_stats`, `get_document`,
+ *     `get_operation`, `list_documents`, `list_mental_models`,
+ *     `list_operations`, `list_tags`), reject a caller-supplied `bank_id`
+ *     that is not the caller's own bank. See {@link guardBankScope} for why
+ *     this excludes WRITE tools (`retain`'s cross-bank write is a real,
+ *     legitimate case).
+ *  3. DEFAULT BUDGET CLAMP — for `recall`/`reflect` only, inject
  *     max_tokens (env-tunable) + budget (env-tunable; recall low, reflect
  *     mid) when the caller OMITS them. Explicit caller values ALWAYS win (a
  *     deliberate max_tokens:4096 passes untouched).
+ *
+ * `ownBankId` defaults to `env.HINDSIGHT_BANK_ID` so existing two-arg
+ * call sites (and every prior unit test) keep working unchanged; the shim's
+ * own call site passes `this.opts.bankId` explicitly — the same value
+ * already pinned onto the `X-Bank-Id` header for this shim instance, which
+ * is the correct source of truth even when it diverges from process.env
+ * (as it deliberately can in tests).
  *
  * Returns the (possibly rewritten) params to forward, or a loud error text.
  */
 export function guardAndClampToolCall(
   params: unknown,
   env: NodeJS.ProcessEnv,
+  ownBankId: string = env.HINDSIGHT_BANK_ID || "",
 ): { ok: true; params: unknown } | { ok: false; text: string } {
   const called = params as
     | { name?: string; arguments?: unknown }
@@ -965,6 +1088,16 @@ export function guardAndClampToolCall(
   const unknownKeys = Object.keys(args).filter((k) => !allowed.has(k));
   if (unknownKeys.length > 0) {
     return { ok: false, text: unknownArgMessage(name, unknownKeys, allowed) };
+  }
+
+  {
+    // guardBankScope itself narrows to BANK_SCOPE_GUARDED_TOOLS (the
+    // read-only bank_id-accepting tools) — calling it unconditionally here
+    // (rather than re-testing `allowed.has("bank_id")`) keeps the single
+    // source of truth for "which tools are bank-scope-guarded" inside the
+    // function, not duplicated at each call site.
+    const scoped = guardBankScope(name, args, ownBankId);
+    if (!scoped.ok) return scoped;
   }
 
   if (name === "recall" || name === "reflect") {
@@ -1704,7 +1837,11 @@ export class HindsightShim {
     // budget defaults the engine otherwise leaves fat (see
     // guardAndClampToolCall). Runs before redaction so the injected budget is
     // covered by the same forward path.
-    const guarded = guardAndClampToolCall(params, process.env);
+    const guarded = guardAndClampToolCall(
+      params,
+      process.env,
+      this.opts.bankId,
+    );
     if (!guarded.ok) {
       return { content: [{ type: "text", text: guarded.text }], isError: true };
     }

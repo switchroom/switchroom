@@ -28,6 +28,8 @@ import {
   SYNTHESIZED_TOOL_TABLE,
   coerceSynthesizedArg,
   guardAndClampToolCall,
+  guardBankScope,
+  BANK_SCOPE_GUARDED_TOOLS,
   DEFAULT_RECALL_MAX_TOKENS,
   DEFAULT_RECALL_BUDGET,
   DEFAULT_REFLECT_BUDGET,
@@ -771,6 +773,10 @@ describe("guardAndClampToolCall (unit)", () => {
   // fixture pin (FALLBACK_TOOL_TABLE ≡ snapshot) already guards call-time
   // validation against drift, in both directions.
   it("accepts EVERY prop the table declares for recall, and only those", () => {
+    // No own bank is pinned here (env {} / no 3rd arg), so the M6 bank-scope
+    // guard below is a deliberate no-op and bank_id:"v" is accepted like any
+    // other prop — this test is purely about the accepted-KEY union, not
+    // about bank-scope enforcement, which gets its own describe block below.
     const [required, optional] = FALLBACK_TOOL_TABLE.recall;
     for (const prop of [...required, ...optional]) {
       const res = guardAndClampToolCall(
@@ -785,6 +791,241 @@ describe("guardAndClampToolCall (unit)", () => {
       {},
     );
     expect(bogus.ok).toBe(false);
+  });
+});
+
+// ─── M6/E-86 bank-scope guard (red-team §1 TOP FINDING) ───────────────────
+//
+// recall (and get_mental_model, and every other FALLBACK_TOOL_TABLE tool
+// that accepts bank_id) forwards a caller-supplied bank_id to the engine
+// with no grant validation of its own. Fleet bank names are effectively
+// agent names (low-entropy, guessable), so an attacker-steered caller could
+// read another agent's memory bank wholesale. This is the minimal
+// deterministic fix: a caller may only ever target its own bank.
+describe("guardBankScope / bank-scope enforcement in guardAndClampToolCall", () => {
+  it("rejects a recall targeting a foreign bank_id", () => {
+    const res = guardAndClampToolCall(
+      {
+        name: "recall",
+        arguments: { query: "credentials api key vault", bank_id: "overlord" },
+      },
+      {},
+      "klanker",
+    );
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected rejection");
+    expect(res.text).toContain("overlord");
+    expect(res.text).toContain("klanker");
+    expect(res.text.toLowerCase()).toContain("own");
+  });
+
+  it("rejects get_mental_model targeting a foreign bank_id", () => {
+    const res = guardAndClampToolCall(
+      { name: "get_mental_model", arguments: { mental_model_id: "x", bank_id: "overlord" } },
+      {},
+      "klanker",
+    );
+    expect(res.ok).toBe(false);
+  });
+
+  it("allows recall with bank_id omitted (defaults to own bank)", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x" } },
+      {},
+      "klanker",
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("allows recall with bank_id explicitly equal to the caller's own bank", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", bank_id: "klanker" } },
+      {},
+      "klanker",
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error("unexpected rejection");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.bank_id).toBe("klanker"); // not silently coerced/dropped
+  });
+
+  it("reads ownBankId from env.HINDSIGHT_BANK_ID when the 3rd arg is omitted", () => {
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", bank_id: "overlord" } },
+      { HINDSIGHT_BANK_ID: "klanker" },
+    );
+    expect(res.ok).toBe(false);
+  });
+
+  it("is a no-op when the shim has no own bank pinned (empty ownBankId)", () => {
+    // Never true in production (resolveShimOptionsFromEnv always resolves
+    // HINDSIGHT_BANK_ID), but must not throw or reject with nothing to
+    // compare against.
+    const res = guardAndClampToolCall(
+      { name: "recall", arguments: { query: "x", bank_id: "overlord" } },
+      {},
+      "",
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("does not touch tools that don't accept bank_id at all", () => {
+    // list_banks has no accepted arguments at all (per FALLBACK_TOOL_TABLE);
+    // guardBankScope must never run against it, and an (unknown, since the
+    // tool takes none) bank_id arg is rejected by the ordinary unknown-key
+    // check, not the bank-scope guard.
+    expect(FALLBACK_TOOL_TABLE.list_banks[1]).not.toContain("bank_id");
+    const res = guardAndClampToolCall(
+      { name: "list_banks", arguments: {} },
+      {},
+      "klanker",
+    );
+    expect(res.ok).toBe(true);
+  });
+
+  it("guardBankScope (unit): equal, omitted, foreign, unpinned", () => {
+    expect(guardBankScope("recall", { bank_id: "klanker" }, "klanker").ok).toBe(true);
+    expect(guardBankScope("recall", {}, "klanker").ok).toBe(true);
+    expect(guardBankScope("recall", { bank_id: "" }, "").ok).toBe(true);
+    const foreign = guardBankScope("recall", { bank_id: "overlord" }, "klanker");
+    expect(foreign.ok).toBe(false);
+  });
+
+  it("does NOT guard retain — the legitimate shared-repo-bank write pattern " +
+    "(mcp__hindsight__retain(..., bank_id=\"switchroom-dev\", ...), documented " +
+    "in MEMORY_GUIDANCE / src/agents/scaffold.ts) must still reach a bank " +
+    "other than the caller's own", () => {
+    // Unit level: guardBankScope is a no-op for any tool outside
+    // BANK_SCOPE_GUARDED_TOOLS, retain included.
+    expect(guardBankScope("retain", { content: "x", bank_id: "switchroom-dev" }, "klanker").ok)
+      .toBe(true);
+
+    // Through the full guardAndClampToolCall path too, with the caller's
+    // own bank ("klanker") different from the explicit target
+    // ("switchroom-dev") — this must pass unmodified, not be rejected.
+    const res = guardAndClampToolCall(
+      {
+        name: "retain",
+        arguments: { content: "durable repo fact", bank_id: "switchroom-dev" },
+      },
+      {},
+      "klanker",
+    );
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error("unexpected rejection of legitimate cross-bank retain");
+    const args = (res.params as { arguments: Record<string, unknown> }).arguments;
+    expect(args.bank_id).toBe("switchroom-dev"); // untouched, not coerced to "klanker"
+  });
+});
+
+// ─── Major 2 — the guard widened to the whole read-tool surface ───────────
+//
+// recall/get_mental_model were never the only forwarded, bank_id-accepting
+// tools reachable by a prompt-injected caller. `reflect(bank_id:"overlord")`
+// or `list_memories(bank_id:"overlord", q:"credentials")` are just as much
+// an exfil path — main agents (unlike the M6 worker grant) can reach the
+// full FALLBACK_TOOL_TABLE surface. Every READ tool that accepts bank_id
+// must be guarded; only WRITE tools (retain, create_directive, …) are
+// deliberately left open, per a real cross-bank write pattern.
+describe("guardBankScope — Major 2: every read-only bank_id-accepting tool is guarded", () => {
+  // [tool name, minimal valid required-args (sans bank_id)] — mirrors each
+  // tool's required-arg tuple in FALLBACK_TOOL_TABLE so a call with a
+  // correct bank_id is otherwise well-formed and would succeed but for the
+  // guard.
+  const guardedReadTools: [string, Record<string, unknown>][] = [
+    ["recall", { query: "x" }],
+    ["reflect", { query: "x" }],
+    ["get_mental_model", { mental_model_id: "mm-1" }],
+    ["get_memory", { memory_id: "mem-1" }],
+    ["list_memories", {}],
+    ["list_directives", {}],
+    ["get_bank", {}],
+    ["get_bank_stats", {}],
+    ["get_document", { document_id: "doc-1" }],
+    ["get_operation", { operation_id: "op-1" }],
+    ["list_documents", {}],
+    ["list_mental_models", {}],
+    ["list_operations", {}],
+    ["list_tags", {}],
+  ];
+
+  it("BANK_SCOPE_GUARDED_TOOLS is exactly this set (no drift either direction)", () => {
+    const expected = new Set(guardedReadTools.map(([name]) => name));
+    expect(BANK_SCOPE_GUARDED_TOOLS).toEqual(expected);
+  });
+
+  it.each(guardedReadTools)(
+    "rejects %s targeting a foreign bank_id",
+    (name, baseArgs) => {
+      const res = guardAndClampToolCall(
+        { name, arguments: { ...baseArgs, bank_id: "overlord" } },
+        {},
+        "klanker",
+      );
+      expect(res.ok).toBe(false);
+      if (res.ok) throw new Error(`expected ${name} to reject a foreign bank_id`);
+      expect(res.text).toContain("overlord");
+      expect(res.text).toContain("klanker");
+    },
+  );
+
+  it.each(guardedReadTools)(
+    "allows %s with bank_id equal to the caller's own bank",
+    (name, baseArgs) => {
+      const res = guardAndClampToolCall(
+        { name, arguments: { ...baseArgs, bank_id: "klanker" } },
+        {},
+        "klanker",
+      );
+      expect(res.ok).toBe(true);
+      if (!res.ok) throw new Error(`unexpected rejection of ${name} own-bank call`);
+    },
+  );
+
+  it.each(guardedReadTools)(
+    "allows %s with bank_id omitted (defaults to own bank)",
+    (name, baseArgs) => {
+      const res = guardAndClampToolCall(
+        { name, arguments: { ...baseArgs } },
+        {},
+        "klanker",
+      );
+      expect(res.ok).toBe(true);
+      if (!res.ok) throw new Error(`unexpected rejection of ${name} with bank_id omitted`);
+    },
+  );
+
+  it("every FALLBACK_TOOL_TABLE READ tool accepting bank_id is in the guarded set " +
+    "(nothing new slips through unguarded)", () => {
+    // WRITE/mutating verbs are the deliberate carve-out (see
+    // BANK_SCOPE_GUARDED_TOOLS's doc comment) — they must NOT be guarded.
+    const writeTools = new Set([
+      "cancel_operation",
+      "clear_memories",
+      "clear_mental_model",
+      "create_bank",
+      "create_directive",
+      "create_mental_model",
+      "delete_bank",
+      "delete_directive",
+      "delete_document",
+      "delete_mental_model",
+      "invalidate_memory",
+      "refresh_mental_model",
+      "retain",
+      "sync_retain",
+      "update_bank",
+      "update_memory",
+      "update_mental_model",
+    ]);
+    for (const [name, [, optional]] of Object.entries(FALLBACK_TOOL_TABLE)) {
+      if (!optional.includes("bank_id")) continue;
+      if (writeTools.has(name)) {
+        expect(BANK_SCOPE_GUARDED_TOOLS.has(name)).toBe(false);
+        continue;
+      }
+      expect(BANK_SCOPE_GUARDED_TOOLS.has(name)).toBe(true);
+    }
   });
 });
 
@@ -856,6 +1097,45 @@ describe("tools/call clamp + rejection through the live shim", () => {
     expect(result.content[0].text).toContain("max_tokens");
     // The silent-drop is prevented: no tools/call was forwarded at all.
     expect(backend.requests.some((r) => r.method === "tools/call")).toBe(false);
+  });
+
+  it("recall with a foreign bank_id is rejected loudly and NEVER reaches the backend", async () => {
+    // makeShim() pins bankId: "test-bank" — this exercises the real
+    // toolsCall() wiring (this.opts.bankId), not just the pure function.
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", {
+        name: "recall",
+        arguments: { query: "credentials", bank_id: "overlord" },
+      }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("overlord");
+    expect(result.content[0].text).toContain("test-bank");
+    expect(backend.requests.some((r) => r.method === "tools/call")).toBe(false);
+  });
+
+  it("recall with bank_id equal to the shim's own bank reaches the backend", async () => {
+    backend = await startMockBackend();
+    const shim = makeShim({ url: backend.url, cacheDir });
+    await shim.handle(rpc(1, "initialize", { protocolVersion: "2025-06-18" }) as never);
+
+    const res = await shim.handle(
+      rpc(2, "tools/call", {
+        name: "recall",
+        arguments: { query: "x", bank_id: "test-bank" },
+      }) as never,
+    );
+    const result = res?.result as { isError?: boolean };
+    expect(result?.isError).not.toBe(true);
+    const call = backend.requests.find((r) => r.method === "tools/call");
+    expect(call).toBeDefined();
+    const args = call?.params?.arguments as Record<string, unknown>;
+    expect(args.bank_id).toBe("test-bank");
   });
 });
 
