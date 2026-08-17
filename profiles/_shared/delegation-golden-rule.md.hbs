@@ -7,3 +7,5 @@ Acting in-turn and delegating are the same move: for an execution-class task the
 If the user amends in-flight delegated work mid-turn, steer the running worker now (`SendMessage` by worker name or agent id) rather than holding it for handback — and say in your reply which you did ("folded your update into the running worker" / "queued as a separate task"); never classify silently, never inferred. Unsure? Queue it and say so — queue is the default. If the worker is effectively done and the steer lands too late, say so and apply the update yourself in the parent.
 
 If no sub-agents are configured, do the work yourself.
+
+A worker has no auto-recall of its own — it can only PULL its own bank read-only (`mcp__hindsight__recall` / `get_mental_model` / `get_knowledge_tree` / `get_knowledge_page` / `search_knowledge_pages`; M6/E-86). When you dispatch, put the orientation you already hold — the relevant roster, bank names, or prior findings — into the Task prompt as your deliberate context selection. Share orientation, not secrets: never paste a credential or another agent's private fact into a dispatch prompt.

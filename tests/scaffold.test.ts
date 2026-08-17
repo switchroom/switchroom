@@ -5110,6 +5110,174 @@ describe("sub-agent file generation", () => {
     expect(content).toContain("You are a worker. Implement the task.");
   });
 
+  // ─── M6/E-86: worker read-only Hindsight memory pull ──────────────────
+  //
+  // The worker subagent's tools are fleet-config-driven
+  // (defaults.subagents.worker.tools in switchroom.yaml); this fixture
+  // mirrors that block so the render path (scaffold.ts's frontmatter
+  // builder, `tools: saDef.tools.join(", ")`) is under test the same way
+  // the deployed worker.md is produced. carve-M6.md §2 / §4a.
+  const M6_WORKER_TOOLS = [
+    "Read",
+    "Edit",
+    "Write",
+    "Bash",
+    "Grep",
+    "Glob",
+    "TodoWrite",
+    "WebSearch",
+    "mcp__webkite__*",
+    "mcp__switchroom-telegram__progress_update",
+    "mcp__hindsight__recall",
+    "mcp__hindsight__get_mental_model",
+    "mcp__hindsight__get_knowledge_tree",
+    "mcp__hindsight__get_knowledge_page",
+    "mcp__hindsight__search_knowledge_pages",
+  ];
+
+  const M6_READ_TOOLS = [
+    "mcp__hindsight__recall",
+    "mcp__hindsight__get_mental_model",
+    "mcp__hindsight__get_knowledge_tree",
+    "mcp__hindsight__get_knowledge_page",
+    "mcp__hindsight__search_knowledge_pages",
+  ];
+
+  // Anti-vacuity guard (redteam-M6.md §4): every hindsight write/mutation
+  // verb that must stay UNREACHABLE from a worker. If this list were empty
+  // or wrong, the "none of these appear" assertions below would pass
+  // vacuously — encoding the deny set explicitly is the point.
+  const WRITE_VERBS = [
+    "retain",
+    "sync_retain",
+    "reflect",
+    "create_bank",
+    "create_directive",
+    "create_mental_model",
+    "update_bank",
+    "update_memory",
+    "update_mental_model",
+    "delete_document",
+    "delete_bank",
+    "delete_mental_model",
+    "delete_directive",
+    "clear_memories",
+    "clear_mental_model",
+    "invalidate_memory",
+    "deactivate_directive",
+    "reactivate_directive",
+  ];
+
+  function renderM6WorkerFixture(promptExtra = ""): { content: string; tools: string[] } {
+    const agentConfig = makeAgentConfig({
+      subagents: {
+        worker: {
+          description: "Handles implementation tasks",
+          model: "sonnet",
+          background: true,
+          color: "blue",
+          tools: M6_WORKER_TOOLS,
+          prompt:
+            "You are a worker sub-agent. Implement the task described in " +
+            "your prompt precisely and completely." +
+            promptExtra,
+        },
+      },
+    });
+    const switchroomConfig: SwitchroomConfig = {
+      switchroom: { version: 1, agents_dir: tmpDir },
+      telegram: telegramConfig,
+      agents: { "m6-worker-agent": agentConfig },
+    } as SwitchroomConfig;
+
+    const result = scaffoldAgent(
+      "m6-worker-agent",
+      agentConfig,
+      tmpDir,
+      telegramConfig,
+      switchroomConfig,
+    );
+    const mdPath = join(result.agentDir, ".claude", "agents", "worker.md");
+    const content = readFileSync(mdPath, "utf-8");
+    const toolsLine = content
+      .split("\n")
+      .find((l) => l.startsWith("tools:"));
+    if (!toolsLine) throw new Error("no tools: line in rendered frontmatter");
+    const tools = toolsLine
+      .slice("tools:".length)
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    return { content, tools };
+  }
+
+  it("worker frontmatter carries exactly the 5 M6 read-only Hindsight tools (UAT-1)", () => {
+    const { tools } = renderM6WorkerFixture();
+
+    // Anti-vacuity: the parse actually found tokens, and specifically the
+    // hindsight subset is non-empty and exactly the 5 expected — guards
+    // against a frontmatter-parse regression turning every "absent" check
+    // below into a vacuous pass (redteam-M6.md §4.1).
+    expect(tools.length).toBeGreaterThan(0);
+    const hindsightTools = tools.filter((t) => t.startsWith("mcp__hindsight"));
+    expect(hindsightTools.sort()).toEqual([...M6_READ_TOOLS].sort());
+
+    // Positive: every read tool present, by exact token (not a substring
+    // scan — redteam-M6.md §4.2).
+    for (const readTool of M6_READ_TOOLS) {
+      expect(tools).toContain(readTool);
+    }
+  });
+
+  it("worker frontmatter contains NO hindsight write/mutation verb (UAT-4, negative)", () => {
+    const { tools } = renderM6WorkerFixture();
+    for (const verb of WRITE_VERBS) {
+      expect(tools, `mcp__hindsight__${verb} must be absent`).not.toContain(
+        `mcp__hindsight__${verb}`,
+      );
+    }
+  });
+
+  it("worker frontmatter carries NO mcp__hindsight__* wildcard or bare-prefix blanket (UAT-4, anti-smuggling)", () => {
+    const { tools } = renderM6WorkerFixture();
+    expect(tools).not.toContain("mcp__hindsight__*");
+    expect(tools).not.toContain("mcp__hindsight__");
+    expect(tools).not.toContain("mcp__hindsight");
+    // Every hindsight token present must be one of the 5 named read tools —
+    // a superset (e.g. a stray write verb OR a wildcard) fails this.
+    const hindsightTools = tools.filter((t) => t.startsWith("mcp__hindsight"));
+    for (const t of hindsightTools) {
+      expect(M6_READ_TOOLS, `unexpected hindsight tool ${t}`).toContain(t);
+    }
+  });
+
+  it("worker prompt body names the read-only pull tools and the trimmed-retry guidance (UAT-3)", () => {
+    const { content } = renderM6WorkerFixture(
+      "\n\nYou have READ-ONLY memory pull: mcp__hindsight__recall (use tool " +
+        "defaults; a trimmed/empty result is inconclusive, retry with " +
+        "defaults before concluding the bank is empty), plus " +
+        "get_mental_model / get_knowledge_tree / get_knowledge_page / " +
+        "search_knowledge_pages. You have no write verbs.",
+    );
+    expect(content).toContain("mcp__hindsight__recall");
+    expect(content).toContain("get_mental_model");
+    expect(content).toContain("get_knowledge_tree");
+    expect(content).toContain("get_knowledge_page");
+    expect(content).toContain("search_knowledge_pages");
+    expect(content.toLowerCase()).toContain("inconclusive");
+    expect(content.toLowerCase()).toContain("no write verbs");
+  });
+
+  // UAT test-plan (d) — SubagentStop write→read round-trip. Per
+  // carve-M6.md §5: no SubagentStop retain hook exists in the wiring
+  // (Stop only), so a worker never self-retains today and this round-trip
+  // is not achievable as the epic originally stated. Left as test.todo
+  // pending Ken's ruling rather than shipped vacuous/always-skipped and
+  // labelled passing.
+  it.todo(
+    "a SubagentStop retain from a worker is later recallable by a worker (blocked — carve-M6.md §5, no SubagentStop retain hook exists)",
+  );
+
   it("merges defaults.subagents with agent.subagents by name", () => {
     const agentConfig = makeAgentConfig({
       subagents: {
