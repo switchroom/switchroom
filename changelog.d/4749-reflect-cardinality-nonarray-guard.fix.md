@@ -1,1 +1,0 @@
-- **memory: harden the reflect cardinality guard so a `based_on` object with any non-array bucket returns "undeterminable" (`null`) instead of `0`, so the empty-evidence abstention can only ever fire on a genuinely-empty, fully array-shaped evidence set — never a false abstention on an unrecognised shape (RFC P9 follow-up to #4748) (#4749)**
