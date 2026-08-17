@@ -228,6 +228,66 @@ describe("memory directive mark-rules-block — argument validation", () => {
   });
 });
 
+describe("memory directive mark-rules-block — own-agent guard", () => {
+  const envKey = "SWITCHROOM_AGENT_NAME";
+  let prevEnv: string | undefined;
+
+  beforeEach(() => {
+    prevEnv = process.env[envKey];
+  });
+
+  afterEach(() => {
+    if (prevEnv === undefined) delete process.env[envKey];
+    else process.env[envKey] = prevEnv;
+  });
+
+  it("refuses a foreign <agent> when SWITCHROOM_AGENT_NAME is set, before ever reaching the API", () => {
+    process.env[envKey] = "some-other-agent";
+    // Hindsight is pointed at a closed port (beforeEach config). If the
+    // guard did NOT fire first, this call would fail with a connection
+    // error (matching /✗/ too) rather than the guard's own message — the
+    // distinguishing assertion below is the refusal text, which can only
+    // appear if the guard ran before any network call was attempted.
+    const { status, stderr } = run(
+      ["memory", "directive", "mark-rules-block", "clerk", "some-id"],
+      { expectError: true },
+    );
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/own bank/);
+    expect(stderr).toContain("some-other-agent");
+    expect(stderr).toContain("clerk");
+  });
+
+  it("--json refusal for a foreign agent carries the machine-readable error envelope", () => {
+    process.env[envKey] = "some-other-agent";
+    const { status, stdout } = run(
+      ["memory", "directive", "mark-rules-block", "clerk", "some-id", "--json"],
+      { expectError: true },
+    );
+    expect(status).toBe(1);
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "{}") as {
+      ok: boolean;
+      error: string;
+    };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/own bank/);
+  });
+
+  it("still attempts the call for the agent's OWN bank when SWITCHROOM_AGENT_NAME matches — guard does not block legitimate use", () => {
+    process.env[envKey] = "clerk";
+    // Same closed-port config as the un-guarded test above: reaching the
+    // network-failure `✗` (not the guard's refusal text) proves the guard
+    // passed the own-agent call through to DirectiveAdmin.markRulesBlock.
+    const { status, stderr } = run(
+      ["memory", "directive", "mark-rules-block", "clerk", "some-id"],
+      { expectError: true },
+    );
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/✗/);
+    expect(stderr).not.toMatch(/own bank/);
+  });
+});
+
 /**
  * The actual TDD regression test for the gap this verb closes: a rules-block
  * directive taken through the INTERACTIVE path — never through
@@ -384,6 +444,43 @@ describe("memory directive mark-rules-block — closes the interactive-path gap 
     expect(bank[0]!.is_active).not.toBe(false);
   });
 
+  it("--json emits a machine-readable success envelope on a successful stamp", async () => {
+    expect(bank[0]!.tags).not.toContain(RULES_BLOCK_MARKER_TAG);
+
+    let stdout: string;
+    try {
+      const result = await execFileAsync(BUN, [
+        CLI,
+        "--config",
+        interactiveCfgPath,
+        "memory",
+        "directive",
+        "mark-rules-block",
+        "clerk",
+        "d-rules-block",
+        "--json",
+      ]);
+      stdout = result.stdout;
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string };
+      throw new Error(`CLI failed. stdout=${err.stdout ?? ""} stderr=${err.stderr ?? ""}`);
+    }
+
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "{}") as {
+      ok: boolean;
+      agent: string;
+      id: string;
+      message: string;
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.agent).toBe("clerk");
+    expect(parsed.id).toBe("d-rules-block");
+    expect(typeof parsed.message).toBe("string");
+    expect(parsed.message.length).toBeGreaterThan(0);
+
+    expect(bank[0]!.tags).toContain(RULES_BLOCK_MARKER_TAG);
+  });
+
   it("without ever calling mark-rules-block, the same directive is NOT protected — demonstrates the gap this verb closes", async () => {
     // No CLI call this time — this is the pre-fix interactive-path shape:
     // the skill classifies the directive rules-block in its own reasoning
@@ -392,5 +489,42 @@ describe("memory directive mark-rules-block — closes the interactive-path gap 
     const result = await admin.deactivate({ name: "rules-block-row" });
     expect(result).toMatch(/Deactivated/);
     expect(bank[0]!.is_active).toBe(false);
+  });
+
+  it("own-agent guard: a foreign SWITCHROOM_AGENT_NAME never reaches the API, so the bank is never stamped", async () => {
+    expect(bank[0]!.tags).not.toContain(RULES_BLOCK_MARKER_TAG);
+
+    let stdout = "";
+    let stderr = "";
+    let status = 0;
+    try {
+      const result = await execFileAsync(
+        BUN,
+        [
+          CLI,
+          "--config",
+          interactiveCfgPath,
+          "memory",
+          "directive",
+          "mark-rules-block",
+          "clerk",
+          "d-rules-block",
+        ],
+        { env: { ...process.env, SWITCHROOM_AGENT_NAME: "some-other-agent" } },
+      );
+      stdout = result.stdout;
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string; code?: number };
+      stdout = err.stdout ?? "";
+      stderr = err.stderr ?? "";
+      status = err.code ?? 1;
+    }
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/own bank/);
+    void stdout;
+
+    // The refusal happened before any bank write — no marker landed, unlike
+    // the own-agent case above.
+    expect(bank[0]!.tags).not.toContain(RULES_BLOCK_MARKER_TAG);
   });
 });

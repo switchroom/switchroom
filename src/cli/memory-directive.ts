@@ -149,6 +149,31 @@ export function registerMemoryDirectiveCommand(memory: Command, program: Command
     .option("--json", "Machine-readable output")
     .action(
       withConfigError(async (agent: string, id: string, opts: { json?: boolean }) => {
+        // Own-agent guard: the marker this verb stamps has no exposed unmark
+        // path (recovery needs operator REST surgery), so a confused or
+        // prompt-injected curator run must not be able to freeze a PEER
+        // agent's directives against retirement. `SWITCHROOM_AGENT_NAME` is
+        // set container-wide inside a running agent, so when it's present
+        // and disagrees with `<agent>` we positively know this is a
+        // cross-agent call and refuse it outright. When the env var is
+        // ABSENT (e.g. an operator running this CLI by hand on the host,
+        // outside any agent container) we have no self identity to compare
+        // against, so we allow the call through unchanged rather than
+        // breaking that legitimate operator path.
+        const selfAgent = process.env.SWITCHROOM_AGENT_NAME;
+        if (selfAgent && selfAgent !== agent) {
+          const msg =
+            `Refusing: mark-rules-block may only target the running agent's ` +
+            `own bank ("${selfAgent}"), not "${agent}". This marker has no ` +
+            `unmark path — stamping a peer's bank would freeze their ` +
+            `directives against retirement with no in-band recovery.`;
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, error: msg }));
+          } else {
+            console.error(chalk.red(`✗ ${msg}`));
+          }
+          process.exit(1);
+        }
         const admin = resolveDirectiveAdmin(program, agent);
         try {
           const message = await admin.markRulesBlock({ id });
