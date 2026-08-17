@@ -9,11 +9,12 @@ description: >
   "review my memory bank", "what standing models should I have", "bootstrap
   mental models", "suggest mental models from my bank", "audit my mental models",
   "what recurring questions do I keep re-deriving", and typos like "propose
-  knowlege models". ALSO owns the directive merge/retire pass — triggers like
-  "audit my directives", "merge my directives", "retire stale directives", "my
-  directives are overlapping", "too many active directives", "clean up my
-  guardrails", and when switchroom doctor FLAGs a bank over the directive WARN/FAIL
-  threshold. Do NOT use for storing a single fact/preference/decision —
+  knowlege models". ALSO owns the directive TRIAGE pass (Memory v2 M2) —
+  triggers like "audit my directives", "triage my directives", "merge my
+  directives", "retire stale directives", "my directives are overlapping", "too
+  many active directives", "clean up my guardrails", and when switchroom doctor
+  FLAGs a bank over the directive WARN/FAIL threshold. Do NOT use for storing a
+  single fact/preference/decision —
   that is retain, not a mental model. Do NOT use for identity or "who is the
   user" — that lives in profile banks, so never propose an identity model here
   (the operator's review of the card, not any code guard, is the only gate — so
@@ -22,7 +23,7 @@ description: >
   whose shape you know, PROPOSE it through the approve/deny card — never call
   create_mental_model directly (it is not pre-approved; the propose card is the
   only sanctioned write path, Fix 1.2 / #2903).
-allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__list_directives mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose
+allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__list_directives mcp__hindsight__deactivate_directive mcp__hindsight__reactivate_directive mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose Bash(switchroom memory directive mark-rules-block *)
 ---
 
 # mental-model-curator — Propose standing knowledge models from your own bank
@@ -58,9 +59,11 @@ models. Propose the few that are earned; let the operator ratify.
   (name + source_query + one-line reason) and STOP. Do NOT call
   `mental_model_propose` in this mode. This is the safe way to run against any
   bank.
-- **Directive merge/retire pass:** a separate job — see "Directive merge/retire
-  pass" below. It is always proposal-only (text out; the operator taps to enact),
-  and runs independently of the mental-model modes above.
+- **Directive triage pass:** a separate job — see "Directive triage pass (Memory
+  v2 M2)" below. It renders one consolidated card as text, then requires an
+  explicit operator go-ahead before ANY deactivation executes — never enacts on
+  the same turn the card is shown — and runs independently of the mental-model
+  modes above.
 
 ## Workflow
 
@@ -152,23 +155,87 @@ empty topic at 3am is useless and noisy. If invoked from a scheduled sweep,
 the next interactive turn instead of firing cards unattended. Treat live-turn,
 operator-present proposing as the only supported path for now.
 
-## Directive merge/retire pass
+## Directive triage pass (Memory v2 M2)
 
-A second, independent job of this skill: keep the bank's **active directives**
-lean. Directives are hard rules applied on every `reflect` — but the bank caps
-active directives at **`MAX_DIRECTIVES=30`**. Past the cap, the lowest-priority
-directives are **truncated** from the `<active_directives>` recall block and never
-reach the agent (recorded as `directives_omitted` on the recall_log row — the
-recall hook's stderr warning is swallowed by Claude Code, so don't look there) — so an
-overloaded, overlapping, or stale directive set doesn't just add noise, it drops
-your real guardrails. Fleet doctor WARNs at >24 active and FAILs at >30
-(workstream C2), and its fix text points
-here — this pass is the durable path it names.
+A second, independent job of this skill: sort the bank's **active directives**
+into E-45's five categories and clear the four heavy banks off the WARN line.
+Directives are hard rules applied on every `reflect` — but the bank caps active
+directives at **`MAX_DIRECTIVES=30`**. Past the cap, the lowest-priority
+directives are **truncated** from the `<active_directives>` recall block and
+never reach the agent (recorded as `directives_omitted` on the recall_log row
+— the recall hook's stderr warning is swallowed by Claude Code, so don't look
+there). Fleet doctor WARNs at >24 active and FAILs at >30 (`doctor-memory.ts`,
+`DIRECTIVE_WARN_THRESHOLD`), and its fix text points here.
 
-**You PROPOSE; you never delete.** `delete_directive` is deliberately NOT
-pre-approved (#2911) — it falls through to a per-call operator approval card, and
-that human tap is the only gate that retires a standing guardrail. So this pass
-outputs a plan; it does not enact retirements itself.
+**Honest framing (do not oversell):** as of the M2 measurement pass, NOTHING is
+currently being silently dropped fleet-wide — zero directives have ever been
+retired, and `directives_omitted` has fired zero times. This is a **budget +
+hygiene** pass, not a rescue from silent drops. Say it that way; overstating the
+urgency is its own failure.
+
+**The five categories every active directive sorts into (E-45):**
+
+| Category | Meaning | What happens in THIS pass |
+|---|---|---|
+| `reflect-directive` | A genuine compliance guardrail (§4.2's designed role) | KEEP — no change |
+| `rules-block` | A standing preference that belongs in the CLAUDE.md rules block (M1) | **STAGE ONLY — stays ACTIVE.** See the hard rule below. |
+| `disposition` | Better expressed as `disposition_*` bank config (E-40) | Deactivate; note the config change separately for the operator — do NOT auto-apply it |
+| `retire` | Superseded or mechanized — dead weight | Deactivate (record `superseded_by` when a winner exists) |
+| `retain-as-memory` | A fact filed as a directive by mistake (category error) | Deactivate — verify the fact already exists as a memory in the bank BEFORE proposing this; don't assert it, check it |
+
+**Retirement signals are deterministic and bounded (E-45).** A directive is
+ONLY a retirement candidate when you can point to one of: (a) it is tagged
+`superseded-by:<name>` (or you would tag it that way, naming the winner), or
+(b) a mechanization reference (a named commit/PR/scaffold rule that now does
+this automatically), or (c) a documented category error you can verify against
+the bank's own memories/config. **Citation counts are NEVER a signal** (a rule
+that works quietly gets zero citations). **Age alone is NEVER sufficient.** A
+directive with none of these signals is `reflect-directive` — KEEP — by
+default. Never propose retiring a directive because it "seems old" or "looks
+unused."
+
+### HARD RULE — never deactivate a `rules-block`-category directive in this pass
+
+If a directive's behaviour is destined for the CLAUDE.md rules block (M1), its
+migration happens at **M3 flip time**, when that surface goes live for this
+agent — not now. M1 shipped dark (`memory.rules_block` off on every agent
+today); deactivating a `rules-block`-category directive before that flip would
+leave the agent with **neither** the directive (deactivated) **nor** the rule
+(block not live) — a silent guardrail gap for however long the M2→M3 interval
+runs. So: **for every directive you categorise `rules-block`, call
+`list_directives` to confirm it, but do NOT call `deactivate_directive` on it
+in this pass, ever** — only stage its text (mention it in the card as staged,
+count it, and leave it exactly as-is) for the M3 flip to pick up later
+(`rule add`, once `memory.rules_block` is on for this agent).
+
+**This is not just a prose rule you have to remember — it is now also code-
+enforced, but ONLY once you complete the mandatory step below.**
+`DirectiveAdmin` (`src/memory/hindsight-directive-admin.ts` —
+`deactivate`/`deactivateById`/`deactivateByIdWithTag`) refuses to deactivate
+ANY directive carrying the persisted `triage-category:rules-block` marker
+tag, on every call path, including this skill's own `deactivate_directive`
+calls. But that refusal only ever fires for a directive that actually
+CARRIES the tag — and nothing stamps the tag automatically just because you,
+in your own reasoning, decided a directive is `rules-block`. **You must
+stamp it yourself, immediately, as part of classification — not as an
+afterthought before presenting the card:**
+
+> For every directive you classify `rules-block` in step 2 below, before you
+> move on to the next directive, run:
+> ```
+> switchroom memory directive mark-rules-block <agent> <id>
+> ```
+> (`src/cli/memory-directive.ts` — this calls the exact same
+> `DirectiveAdmin.markRulesBlock` write the batch triage executor uses, so
+> the chokepoint above keys off it identically). Idempotent — re-running it
+> on an already-marked directive is a no-op, so it is always safe to call
+> even if you are not sure whether a prior pass already marked this one.
+
+Do this for EVERY rules-block row before step 3's card renders, not just the
+ones you personally plan to leave alone — the whole point is that the code
+guard, not your own discipline in this pass or a future one, is what refuses
+a later deactivation attempt (including a mistaken one, or one made by a
+different pass that never saw this reasoning).
 
 ### When to run it
 
@@ -178,40 +245,104 @@ outputs a plan; it does not enact retirements itself.
 
 ### Workflow
 
-1. **List the active set.** `mcp__hindsight__list_directives` (active only). If
-   the count is comfortably under the WARN threshold (≤24) AND nothing reads
+1. **List every directive, active and inactive context.** `mcp__hindsight__list_directives`
+   (active only is fine for triage — inactive ones are already off). If the
+   active count is comfortably under the WARN threshold (≤24) AND nothing reads
    stale/overlapping, STOP and report "directive set is healthy (N active) —
-   nothing to merge or retire." Don't manufacture churn.
-2. **Cluster for overlap.** Group directives that encode substantially the same
-   rule (even reworded) or that are strict specializations of a broader one. Each
-   cluster of 2+ is a **merge candidate**: one crisp consolidated directive that
-   subsumes the group, with the retirements it replaces named.
-3. **Flag the stale.** A directive is a **retire candidate** when it's obsoleted
-   by a newer rule, references a decision/tool/project that no longer exists, or
-   contradicts a directive you're keeping. Contradictions are the priority — a
-   live contradictory pair makes `reflect` nondeterministic.
-4. **Present the plan as text — do NOT enact.** Output, ranked by how much it
-   reduces the active count and risk:
-   - **Merges:** the proposed consolidated directive text + the exact directives
-     (by name/id) it would retire.
-   - **Retirements:** each stale directive (name/id) + one-line reason.
-   - The resulting active count vs `MAX_DIRECTIVES`, so the operator sees whether
-     the plan clears the cap.
-   Then STOP. The operator decides. Enacting a merge is a follow-up: the
-   consolidated `create_directive` is autonomous, but **each** retirement fires
-   its own `delete_directive` approval card — that per-card human tap is the
-   deterministic backstop, not something this skill routes around.
+   nothing to triage." Don't manufacture churn.
+2. **Classify every directive — no drops.** For each one, assign exactly one of
+   the five categories above, with the deterministic signal that justifies it
+   (or "no signal — KEEP" for the default case). Do this for the FULL set —
+   the card is worthless if a directive silently doesn't appear on it.
+   **The moment you classify a directive `rules-block`, run
+   `switchroom memory directive mark-rules-block <agent> <id>` for it right
+   then** (see the HARD RULE above) — do not defer this to a later step or
+   batch it at the end; every rules-block row must be stamped before you move
+   to step 3.
+3. **Render ONE consolidated card as text.** Two sections, KEEP/staged first,
+   retirement candidates second — never interleaved, so a skim of "the bottom
+   half" cannot land on a live guardrail:
+   - **Keep / staged (N):** every `reflect-directive` and `rules-block` row,
+     each showing priority + category + signal (or "no signal — default KEEP").
+   - **Retirement candidates (N):** every `disposition` / `retire` /
+     `retain-as-memory` row, each showing priority + category + the
+     deterministic signal — never a bare category with no rationale.
+   - The resulting active count vs `MAX_DIRECTIVES` if the retirements land.
+4. **STOP. Get an explicit operator go-ahead before touching anything.** Do not
+   deactivate on the same turn the card is shown. The card is the operator's
+   one look before a batch of guardrails changes state.
+5. **On go-ahead, retire ONE AT A TIME with a human tap PER retirement — never
+   a single blanket go-ahead for the whole batch.** `deactivate_directive` is
+   pre-approved fleet-wide (`scaffold.ts`'s 2026-07-29 amendment,
+   `HINDSIGHT_MCP_TOOLS`) — unlike `delete_directive`, calling it does NOT
+   raise a Telegram permission card by itself. That is exactly why this skill
+   must supply the per-call gate `delete_directive`'s card would otherwise
+   have given: present the NEXT retirement candidate (name, priority, signal,
+   proposed `superseded_by`) on its own, then **STOP and end the turn** —
+   do not proceed to it, and do not queue the next one, until the operator's
+   reply for THIS ONE arrives. Only after an explicit per-row confirmation do
+   you call `mcp__hindsight__deactivate_directive` for that single directive.
+   Then present the next candidate the same way. A single "yes, go ahead" that
+   covers the whole retirement list is NOT sufficient — that collapses back
+   to the batch-level prose go-ahead this per-row loop exists to replace, and
+   silently trades away the human tap `delete_directive`'s approval card used
+   to guarantee for every one of these retirements (see PR #4760 review B2).
+   Pass `superseded_by` when you named a winner. After the LAST retirement in
+   the plan lands, `list_directives` again and report the new active count
+   against `MAX_DIRECTIVES`, plus which directives moved where.
+6. **Disposition rows are a note, not an auto-edit.** When you deactivate a
+   `disposition`-category directive, separately flag to the operator which
+   `disposition_*` bank config change it corresponds to — do NOT edit bank
+   config yourself in this pass (E-40: audit before leaning on it).
+
+### windows-boxes-class fixes (a drifted directive with a peer's superset text) — special-cased, rare
+
+Do NOT attempt this as an ordinary retirement. If a directive on this bank has
+drifted from a peer agent's superset/reconciled version of the "same" rule
+(content differs but the two should say the same thing), that is NOT
+expressible as a `content`-PATCH — the shim deliberately refuses to PATCH
+directive `content` (`hindsight-directive-admin.ts` — a directive body is the
+guardrail itself; there is no history table to recover a bad rewrite from).
+It is also NOT safely expressible as plain `create_directive` +
+`deactivate_directive` calls from this skill: once the new copy is created
+carrying the SAME name, `deactivate_directive`'s name-resolution sees two
+directives sharing that name and refuses as ambiguous. Use
+`reconcileDirectiveSuperset` (`src/memory/directive-triage-executor.ts`) for
+this instead — it resolves the old copy's id BEFORE creating the new one and
+retires it by id, so the name collision never becomes an ambiguity error. This
+is NOT a bare MCP tool call from this skill (no MCP tool exposes an
+id-targeted deactivate) — it runs via
+`switchroom memory directive reconcile <agent> <name> <content...>`
+(`src/cli/memory-directive.ts`), an operator or repo-authorized CLI/script
+invocation, not something this skill invokes autonomously. Flag any drift you
+notice to the operator rather than improvising a fix.
 
 ### Directive-pass anti-patterns
 
-- ❌ Calling `delete_directive` from this skill — it proposes; the operator's tap
-  on the per-call card is the only sanctioned retire path.
-- ❌ Merging directives that only look similar — a merge that drops a real
-  distinction silently weakens a guardrail. When unsure, propose retire-nothing.
-- ❌ Manufacturing merges on a healthy small set just to "tidy" — run the pass
-  when it's earned (bloat, overlap, staleness, or a doctor flag), not reflexively.
-- ❌ Leaving a live contradictory pair in place — surface it as the top retire
-  candidate; it's what makes `reflect` nondeterministic.
+- ❌ Deactivating a `rules-block`-category directive before M3 flips this
+  agent — opens a guardrail gap; see the hard rule above.
+- ❌ Classifying a directive `rules-block` without immediately calling
+  `switchroom memory directive mark-rules-block <agent> <id>` for it — an
+  unmarked directive gets NO code-level protection from the
+  `DirectiveAdmin` chokepoint; the classification in your head is not
+  enough.
+- ❌ Retiring on age or citation count alone — E-45 refuses both as signals.
+- ❌ Calling `deactivate_directive` in parallel / without awaiting each one —
+  sequential only (tag-write race).
+- ❌ Executing on the same turn the card is shown — the card review is the
+  gate; always stop for an explicit go-ahead first.
+- ❌ Treating one blanket "yes, go ahead" as clearance for the whole
+  retirement list — `deactivate_directive` is pre-approved (no Telegram card
+  per call), so this skill's own per-retirement stop-and-confirm loop IS the
+  human tap; batching it away silently weakens the guardrail (review B2).
+- ❌ Auto-editing bank config for a `disposition` row — flag it, don't apply it.
+- ❌ Treating a drifted/superset-text directive as an ordinary retirement —
+  see the windows-boxes-class section above.
+- ❌ Manufacturing retirements on a healthy small set just to "tidy" — run the
+  pass when it's earned (bloat, overlap, staleness, or a doctor flag), not
+  reflexively.
+- ❌ Leaving a live contradictory pair in place — surface it as the top
+  retirement candidate; it's what makes `reflect` nondeterministic.
 
 ## Anti-patterns
 

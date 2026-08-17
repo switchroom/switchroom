@@ -124,6 +124,53 @@ export function supersedesTag(retiredName: string): string {
   return `supersedes:${retiredName}`;
 }
 
+/**
+ * Marker tag stamped on a directive that Memory v2 M2 triage has classified
+ * `rules-block` (E-45). This is the ONE chokepoint {@link DirectiveAdmin}
+ * checks before any deactivation — not the triage card's per-call
+ * `category` field, which a caller (buggy classifier, hand-rolled row, a
+ * stale `superseded-by` tag racing a real rules-block classification) can
+ * get wrong. Once a directive carries this tag, `deactivate`/`deactivateById`
+ * refuse it unconditionally, regardless of what name/id/pairing the caller
+ * passes — an invariant read from the directive's OWN persisted state, not
+ * from anything the caller asserts about it (M2 redteam B1/B2).
+ *
+ * Decision 3 (M2, Ken-approved): rules-block directives stay ACTIVE, staged
+ * + measured only, until M3 flips the agent's rules-block replacement live.
+ * Removing the marker (an operator/M3 action, not exposed here) is what
+ * unlocks a subsequent deactivation.
+ */
+export const RULES_BLOCK_MARKER_TAG = "triage-category:rules-block";
+
+/** True when `tags` carries the rules-block marker. */
+export function hasRulesBlockMarker(tags: string[] | undefined): boolean {
+  return (tags ?? []).includes(RULES_BLOCK_MARKER_TAG);
+}
+
+/**
+ * Thrown by {@link DirectiveAdmin.deactivate} / `deactivateById` /
+ * `deactivateByIdWithTag` when the target directive carries
+ * {@link RULES_BLOCK_MARKER_TAG}. This is the code-enforced form of Decision
+ * 3 — it fires from directive STATE, not from a caller's classification, so
+ * it cannot be routed around by a card generator bug, a stale tag, or a
+ * hand-built row.
+ */
+export class RulesBlockDeactivationRefusedError extends Error {
+  constructor(readonly directiveName: string) {
+    super(
+      `Refusing to deactivate '${directiveName}': it carries the ` +
+        `${RULES_BLOCK_MARKER_TAG} marker. M2 leaves rules-block-category ` +
+        "directives ACTIVE (staged + measured only) until M3 flips this " +
+        "agent's rules-block replacement live — deactivating one now would " +
+        "open a guardrail gap with nothing enforcing the behaviour in " +
+        "between. This is enforced inside DirectiveAdmin itself, on every " +
+        "call path (MCP shim, apply-batch executor, reconcile) — not left " +
+        "to a caller's classification. Do not route around it.",
+    );
+    this.name = "RulesBlockDeactivationRefusedError";
+  }
+}
+
 export interface DirectiveAdminOptions {
   /** REST base, e.g. `http://127.0.0.1:18888` (no trailing slash). */
   apiBaseUrl: string;
@@ -286,6 +333,27 @@ export class DirectiveAdmin {
     return hits[0];
   }
 
+  /**
+   * Id resolution — never ambiguous (ids are unique), and unaffected by a
+   * name collision (e.g. an in-flight windows-boxes-class reconcile, where
+   * two directives briefly share a name). Callers that already hold a row's
+   * `id` (the triage card, the reconcile path) should resolve this way, not
+   * by name — see M1/redteam-M2.md.
+   */
+  private resolveById(
+    all: HindsightDirective[],
+    id: string,
+    label: string,
+  ): HindsightDirective {
+    const hit = all.find((d) => d.id === id);
+    if (!hit) {
+      throw new Error(
+        `no directive with id '${id}' in bank '${this.opts.bankId}' (${label}).`,
+      );
+    }
+    return hit;
+  }
+
   /** Union that preserves existing order and never duplicates. */
   private withTag(existing: string[] | undefined, tag: string): string[] {
     const tags = [...(existing ?? [])];
@@ -294,8 +362,30 @@ export class DirectiveAdmin {
   }
 
   /**
-   * Set `is_active: false` on `name`, optionally recording that
-   * `supersededBy` replaces it.
+   * The rules-block refusal chokepoint (Decision 3, M2 redteam B2). Every
+   * deactivation path (`deactivate`, `deactivateById`,
+   * `deactivateByIdWithTag`) routes through this one check, reading the
+   * marker straight off `target.tags` as fetched by `list()` — never off a
+   * caller-supplied classification. There is no way to reach a `patch()`
+   * call that flips `is_active: false` on a rules-block-marked directive
+   * without going through this function first.
+   */
+  private refuseIfRulesBlock(target: HindsightDirective): void {
+    if (hasRulesBlockMarker(target.tags)) {
+      throw new RulesBlockDeactivationRefusedError(target.name);
+    }
+  }
+
+  /**
+   * Shared core for `deactivate`/`deactivateById`: `target` is already
+   * resolved (by name or by id — the resolution strategy is the only thing
+   * that differs between the two public entry points).
+   *
+   * Set `is_active: false` on `target`, optionally recording that
+   * `supersededBy` replaces it (resolved BY NAME — only safe when the
+   * winner's name cannot collide with `target`'s; the windows-boxes-class
+   * reconcile path, where old and new share a name, uses
+   * `deactivateByIdWithTag` instead, which never resolves a winner by name).
    *
    * Ordering is the atomicity mechanism. The winner (B) is tagged FIRST
    * because that write is non-destructive and leaves the retiring directive
@@ -305,14 +395,14 @@ export class DirectiveAdmin {
    * {@link DirectivePairInconsistentError}, which states the residue
    * explicitly. There is no path that returns success on a half-written pair.
    */
-  async deactivate(args: {
-    name: string;
-    supersededBy?: string;
-  }): Promise<string> {
-    const all = await this.list();
-    const target = this.resolve(all, args.name, "the directive to deactivate");
+  private async deactivateResolved(
+    all: HindsightDirective[],
+    target: HindsightDirective,
+    supersededBy?: string,
+  ): Promise<string> {
+    this.refuseIfRulesBlock(target);
 
-    if (!args.supersededBy) {
+    if (!supersededBy) {
       await this.patch(target.id, { isActive: false });
       return (
         `Deactivated directive '${target.name}' in bank '${this.opts.bankId}'. ` +
@@ -321,10 +411,10 @@ export class DirectiveAdmin {
       );
     }
 
-    const winner = this.resolve(all, args.supersededBy, "the superseding directive");
+    const winner = this.resolve(all, supersededBy, "the superseding directive");
     if (winner.id === target.id) {
       throw new Error(
-        `'${args.name}' cannot supersede itself — pass the name of the ` +
+        `'${target.name}' cannot supersede itself — pass the name of the ` +
           `directive that REPLACES it as superseded_by.`,
       );
     }
@@ -366,6 +456,61 @@ export class DirectiveAdmin {
     );
   }
 
+  /**
+   * Set `is_active: false` on `name`, optionally recording that
+   * `supersededBy` replaces it. See {@link deactivateResolved} for the
+   * mechanism and the rules-block refusal.
+   */
+  async deactivate(args: {
+    name: string;
+    supersededBy?: string;
+  }): Promise<string> {
+    const all = await this.list();
+    const target = this.resolve(all, args.name, "the directive to deactivate");
+    return this.deactivateResolved(all, target, args.supersededBy);
+  }
+
+  /**
+   * Same as {@link deactivate}, but resolves the target by `id` rather than
+   * `name` (M2 redteam M1). Callers that already hold a row's `id` — the
+   * triage apply-batch executor in particular — MUST use this, not
+   * `deactivate({name})`: once a windows-boxes-class reconcile has run, two
+   * directives can briefly share a name, and `deactivate({name})` would hit
+   * `resolve()`'s "ambiguous" error and abort mid-batch, discarding partial
+   * progress.
+   */
+  async deactivateById(args: {
+    id: string;
+    supersededBy?: string;
+  }): Promise<string> {
+    const all = await this.list();
+    const target = this.resolveById(all, args.id, "the directive to deactivate");
+    return this.deactivateResolved(all, target, args.supersededBy);
+  }
+
+  /**
+   * Deactivate `id` and append one arbitrary provenance `tag` — no winner
+   * pairing, no by-name resolution anywhere. For callers like the
+   * windows-boxes-class reconcile, where the "winner" (the new superset
+   * copy) shares `target`'s exact name, so resolving it by name would hit
+   * the ambiguous-name error this whole by-id surface exists to avoid.
+   * Still refuses on the rules-block marker, same chokepoint as every other
+   * deactivation path.
+   */
+  async deactivateByIdWithTag(args: { id: string; tag: string }): Promise<string> {
+    const all = await this.list();
+    const target = this.resolveById(all, args.id, "the directive to deactivate");
+    this.refuseIfRulesBlock(target);
+    await this.patch(target.id, {
+      isActive: false,
+      tags: this.withTag(target.tags, args.tag),
+    });
+    return (
+      `Deactivated directive '${target.name}' (id ${target.id}) in bank ` +
+      `'${this.opts.bankId}', tagged ${args.tag}.`
+    );
+  }
+
   /** Set `is_active: true` on `name`. Nothing else changes. */
   async reactivate(args: { name: string }): Promise<string> {
     const all = await this.list();
@@ -376,5 +521,71 @@ export class DirectiveAdmin {
       `It is injected as a hard rule again. Any superseded-by tag was left ` +
       `in place as a record — clear it manually if the supersession is off.`
     );
+  }
+
+  /**
+   * Stamp {@link RULES_BLOCK_MARKER_TAG} on `id` — the durable, persisted
+   * form of a triage pass's "this directive is rules-block category"
+   * classification (M2 redteam B2). Once stamped, EVERY future
+   * deactivation attempt against this directive is refused by
+   * {@link refuseIfRulesBlock}, regardless of what any later triage pass,
+   * card, or row believes about it. Idempotent: re-stamping an
+   * already-marked directive is a no-op.
+   */
+  async markRulesBlock(args: { id: string }): Promise<string> {
+    const all = await this.list();
+    const target = this.resolveById(all, args.id, "the directive to mark rules-block");
+    if (hasRulesBlockMarker(target.tags)) {
+      return (
+        `'${target.name}' already carries ${RULES_BLOCK_MARKER_TAG} — no change.`
+      );
+    }
+    await this.patch(target.id, {
+      tags: this.withTag(target.tags, RULES_BLOCK_MARKER_TAG),
+    });
+    return (
+      `Marked '${target.name}' rules-block in bank '${this.opts.bankId}'. ` +
+      `deactivate_directive now refuses it until the marker is removed ` +
+      `(an M3-flip action, not exposed here).`
+    );
+  }
+
+  /**
+   * Create a new directive in the pinned bank. Public so callers like the
+   * windows-boxes-class reconcile never need their own raw fetch/REST-path
+   * plumbing — `apiBaseUrl`/`bankId` stay pinned to THIS instance, the same
+   * guarantee every other method on this class already gives (M2 redteam
+   * M3: Shape α by construction, not by caller discipline).
+   */
+  async create(args: {
+    name: string;
+    content: string;
+    isActive?: boolean;
+    priority?: number;
+    tags?: string[];
+  }): Promise<HindsightDirective> {
+    const body: Record<string, unknown> = {
+      name: args.name,
+      content: args.content,
+      is_active: args.isActive ?? true,
+    };
+    if (args.priority !== undefined) body.priority = args.priority;
+    if (args.tags !== undefined) body.tags = [...args.tags];
+    const res = await this.send(this.directivesPath(), {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `creating directive '${args.name}' in bank '${this.opts.bankId}' failed: HTTP ${res.status}`,
+      );
+    }
+    return (await res.json()) as HindsightDirective;
+  }
+
+  /** The bank this instance is pinned to — read-only, for error messages
+   *  and callers that need it for display, never for redirecting a request. */
+  get bankId(): string {
+    return this.opts.bankId;
   }
 }
