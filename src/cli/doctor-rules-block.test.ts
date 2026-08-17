@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { runRulesBlockChecks } from "./doctor-rules-block.js";
+import { runRulesBlockChecks, runDirectiveFlipChecks } from "./doctor-rules-block.js";
 import { renderIndexBlock } from "../memory/rules-block.js";
 import { createRule } from "../memory/rules-store.js";
 import type { SwitchroomConfig } from "../config/schema.js";
@@ -244,6 +244,90 @@ describe("bank dedup — one bank shared by several agents", () => {
     expect(bRow.status).toBe("fail");
     expect(bRow.detail).toContain("sentinel mismatch");
     expect(bRow.fix).toContain("switchroom memory rule verify bot-b");
+  });
+});
+
+describe("Memory v2 M3 — directive-flip suppress-flag cross-check", () => {
+  function flipConfig(
+    agents: Record<string, { rules_block?: boolean; inject_directives?: boolean }>,
+  ): SwitchroomConfig {
+    const out: Record<string, unknown> = {};
+    for (const [name, opts] of Object.entries(agents)) {
+      out[name] = {
+        memory: {
+          rules_block: opts.rules_block,
+          inject_directives: opts.inject_directives,
+        },
+      };
+    }
+    return { agents: out } as unknown as SwitchroomConfig;
+  }
+
+  function seedPopulatedRulesBlock(agentsDir: string, agentName: string): string {
+    const dir = join(agentsDir, agentName);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "CLAUDE.md"), `# Managed\n\n${MARKER}\n\nfree text\n`, "utf-8");
+    createRule(dir, { text: "Never send email without approval.", source: "reflect-directive", actor: "klanker" });
+    return dir;
+  }
+
+  it("produces NO rows for an agent that is not flipped", () => {
+    const agentsDir = freshRoot();
+    seedPopulatedRulesBlock(agentsDir, "ziggy");
+    const results = runDirectiveFlipChecks(
+      flipConfig({ ziggy: { rules_block: true, inject_directives: true } }),
+      { agentsDir },
+    );
+    expect(results).toEqual([]);
+  });
+
+  it("is OK for a flipped agent whose rules block carries rules (the ziggy canary)", () => {
+    const agentsDir = freshRoot();
+    seedPopulatedRulesBlock(agentsDir, "ziggy");
+    const results = runDirectiveFlipChecks(
+      flipConfig({ ziggy: { rules_block: true, inject_directives: false } }),
+      { agentsDir },
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe("ok");
+    expect(results[0].detail).toContain("1 rule");
+  });
+
+  it("FAILs a flipped agent with an EMPTY rules block (guardrail-less flip)", () => {
+    const agentsDir = freshRoot();
+    // Enable the toolchain but add NO rule → empty block.
+    const dir = join(agentsDir, "ziggy");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "CLAUDE.md"), `# Managed\n\n${MARKER}\n\nfree text\n`, "utf-8");
+    const results = runDirectiveFlipChecks(
+      flipConfig({ ziggy: { rules_block: true, inject_directives: false } }),
+      { agentsDir },
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe("fail");
+    expect(results[0].detail).toContain("empty");
+  });
+
+  it("FAILs a flipped agent whose rules_block flag is not even on (two-flag ordering)", () => {
+    const agentsDir = freshRoot();
+    seedPopulatedRulesBlock(agentsDir, "ziggy");
+    const results = runDirectiveFlipChecks(
+      flipConfig({ ziggy: { rules_block: false, inject_directives: false } }),
+      { agentsDir },
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe("fail");
+    expect(results[0].detail).toContain("rules_block is not true");
+  });
+
+  it("FAILs a flipped agent whose CLAUDE.md is missing entirely", () => {
+    const agentsDir = freshRoot();
+    const results = runDirectiveFlipChecks(
+      flipConfig({ ziggy: { rules_block: true, inject_directives: false } }),
+      { agentsDir },
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe("fail");
   });
 });
 

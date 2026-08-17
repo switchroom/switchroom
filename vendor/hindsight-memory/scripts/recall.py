@@ -157,6 +157,110 @@ def _topic_filter_mode() -> str:
     return "soft-preamble"
 
 
+# ── Memory v2 M3 (Surface-A) — directive-injection flip guard ───────────────
+#
+# Once an agent has migrated its standing directives into the CLAUDE.md rules
+# block (Memory v2 M1) AND flipped `injectDirectives` OFF, this hook stops
+# injecting the `<active_directives>` block on every turn: the rules block
+# already carries the same guarantees inline, so re-injecting the directives is
+# ~pure token waste (the whole point of M3 — ~49M directive-tokens/30d saved
+# fleet-wide once the heavy agents follow ziggy).
+#
+# `injectDirectives` defaults TRUE (lib/config.py DEFAULTS); an agent is only
+# flipped when switchroom.yaml sets `memory.inject_directives: false`, which
+# plumbs to `HINDSIGHT_INJECT_DIRECTIVES=false` (lib/config.py ENV_OVERRIDES).
+#
+# The flip is DELIBERATELY guarded on physical evidence, not the flag alone:
+# suppression fires IFF the flag is off AND a non-empty rules block is actually
+# present in CLAUDE.md. If the flag is off but no rules block exists (mis-
+# sequenced flip, or M1 not yet run for this agent), we FAIL SAFE — keep
+# injecting directives and surface a one-line degraded-canary notice — rather
+# than strip every guardrail the agent has. A mis-sequenced flip is therefore
+# loud and non-destructive, never silently memory-less. Suppress-only: this
+# NEVER deletes a directive, it only stops re-injecting it. Format-locked to
+# src/memory/rules-block.ts (a golden-fixture test guards against TS drift).
+# See carve-M3.md §2/§4.
+RULES_BLOCK_BEGIN_MARKER = "<!-- switchroom:rules:begin -->"
+RULES_BLOCK_END_MARKER = "<!-- switchroom:rules:end -->"
+
+# A rendered rule line looks like `- **R-01** (source: X, added Y): text`. The
+# literal `(none)` placeholder an empty block renders must NOT count as a rule
+# (that is exactly the empty-block case we fail-safe on). Anchored, no
+# unbounded alternation.
+_RULES_BLOCK_RULE_LINE_RE = re.compile(r"^- \*\*R-", re.MULTILINE)
+
+# config.py DEFAULTS key + settings.json field name for the flip flag.
+INJECT_DIRECTIVES_CONFIG_KEY = "injectDirectives"
+
+_DIRECTIVE_FLIP_DEGRADED_NOTICE = (
+    "⚠️ memory config: injectDirectives is OFF for this agent but no CLAUDE.md "
+    "rules block was found — still injecting <active_directives> this turn to "
+    "avoid a guardrail-less turn. Run the M1 rules-block migration (or "
+    "re-enable injectDirectives) to clear this notice."
+)
+
+
+def _recall_project_dir(hook_input: dict) -> str | None:
+    """Resolve the agent's project directory (where CLAUDE.md lives).
+
+    Prefers `CLAUDE_PROJECT_DIR` (set by Claude Code for hook subprocesses);
+    falls back to the hook payload's `cwd`. Returns None when neither is a
+    usable directory, so callers treat "can't locate the project dir" the same
+    as "no rules block" — fail-safe, keep injecting.
+    """
+    for candidate in (os.environ.get("CLAUDE_PROJECT_DIR"), hook_input.get("cwd")):
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def rules_block_present(project_dir: str | None) -> bool:
+    """True iff CLAUDE.md in `project_dir` carries a NON-EMPTY rules block.
+
+    Non-empty means: the `switchroom:rules:begin/end` markers are both present
+    AND at least one rendered rule line (`- **R-…`) sits between them. The
+    `(none)` placeholder an empty block renders does NOT count. Any IO error →
+    False (fail-safe: absence of proof of a rules block keeps injection on).
+    """
+    if not project_dir:
+        return False
+    path = os.path.join(project_dir, "CLAUDE.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    begin = text.find(RULES_BLOCK_BEGIN_MARKER)
+    if begin == -1:
+        return False
+    end = text.find(RULES_BLOCK_END_MARKER, begin)
+    if end == -1:
+        return False
+    inner = text[begin + len(RULES_BLOCK_BEGIN_MARKER):end]
+    return _RULES_BLOCK_RULE_LINE_RE.search(inner) is not None
+
+
+def directive_injection_decision(config: dict, hook_input: dict) -> tuple[bool, str | None]:
+    """Decide whether to inject the `<active_directives>` block this turn.
+
+    Returns `(inject, degraded_notice)`:
+      * flag ON (default)                    → (True, None)   inject normally
+      * flag OFF and rules block present     → (False, None)  SUPPRESS (M3 flip)
+      * flag OFF but NO rules block present  → (True, notice) FAIL SAFE: still
+        inject AND surface a one-line degraded-canary notice, so a mis-
+        sequenced flip is loud instead of silently guardrail-less.
+
+    Central to all three recall emit surfaces (main path, prefetch fast path,
+    task-notification directives-only path) so a flipped agent cannot leak
+    directives on a cache hit. Suppress-only — never deletes a directive.
+    """
+    if config.get(INJECT_DIRECTIVES_CONFIG_KEY, True):
+        return True, None
+    if rules_block_present(_recall_project_dir(hook_input)):
+        return False, None
+    return True, _DIRECTIVE_FLIP_DEGRADED_NOTICE
+
+
 def _filter_by_active_topic(results: list, active_thread_id: str | None) -> tuple[list, int]:
     """When hard-filter mode is on AND we know the active thread, drop
     any memory whose stored metadata.thread_id is set to a different
@@ -471,9 +575,17 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
         debug_log(config, f"Prefetch buffer: directive fetch failed: {exc}")
         directives_block = None
 
+    # Memory v2 M3 (Surface-A) — apply the directive-injection flip decision on
+    # the fast path too, so a flipped agent does not leak `<active_directives>`
+    # on a prefetch/cache hit. Suppress iff flag off AND rules block present;
+    # else keep injecting (and carry the degraded-canary notice, if any).
+    _inject_directives, _dir_notice = directive_injection_decision(config, hook_input)
+    if not _inject_directives:
+        directives_block = None
+
     if payload is not None:
         memories_block = payload.get("context") or ""
-        parts = [b for b in (directives_block, memories_block) if b]
+        parts = [b for b in (_dir_notice, directives_block, memories_block) if b]
         if not parts:
             return False
         _emit_cached_context("\n\n".join(parts))
@@ -486,13 +598,13 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
     last = read_state(LAST_RECALL_STATE) or {}
     stale_memories = last.get("memories_context") or ""
     stale_block = stale_recall_notice(stale_memories)
-    parts = [b for b in (directives_block, stale_block) if b]
+    parts = [b for b in (_dir_notice, directives_block, stale_block) if b]
     if parts:
         _emit_cached_context("\n\n".join(parts))
         return True
 
-    if directives_block:
-        _emit_cached_context(directives_block)
+    if directives_block or _dir_notice:
+        _emit_cached_context("\n\n".join([b for b in (_dir_notice, directives_block) if b]))
         return True
 
     # Nothing fresh, nothing stale, nothing cached — say so explicitly
@@ -534,8 +646,15 @@ def _emit_directives_only(config: dict, hook_input: dict) -> None:
         debug_log(config, f"Task-notification skip: directive fetch failed: {exc}")
         return
 
-    if directives_block:
-        _emit_cached_context(directives_block)
+    # Memory v2 M3 (Surface-A) — apply the flip decision here too, so a flipped
+    # agent's directives-only fast path (task-notification junk gate) also
+    # suppresses `<active_directives>` once the rules block carries them.
+    _inject_directives, _dir_notice = directive_injection_decision(config, hook_input)
+    if not _inject_directives:
+        directives_block = None
+
+    if directives_block or _dir_notice:
+        _emit_cached_context("\n\n".join([b for b in (_dir_notice, directives_block) if b]))
 
 
 def _is_demoted_memory(memory) -> bool:
@@ -2829,6 +2948,16 @@ def main():
     bank_errored = any(bt.get("errored") for bt in bank_timings)
 
     directives_block = format_active_directives_block(directives) if directives else None
+
+    # Memory v2 M3 (Surface-A) — directive-injection flip decision. Suppress the
+    # `<active_directives>` block iff this agent is flipped (injectDirectives
+    # OFF) AND a non-empty CLAUDE.md rules block physically carries the same
+    # guarantees; else keep injecting and carry a degraded-canary notice. This
+    # is the primary (synchronous) surface; the two fast paths above mirror it.
+    _inject_directives, directive_flip_notice = directive_injection_decision(config, hook_input)
+    if not _inject_directives:
+        directives_block = None
+
     if directives_block:
         debug_log(config, f"Injecting {len(directives)} active directives")
 
@@ -3267,12 +3396,13 @@ def main():
     # is precisely the turn on which the agent must not assume it remembers.
     # #3837: so is a set the score floor withheld entirely.
     if not directives_block and not memories_block and not transcript_fallback_block:
-        if degraded_block or withheld_block or nudge_block or profile_nudge_block:
+        if degraded_block or withheld_block or nudge_block or profile_nudge_block or directive_flip_notice:
             _emit_cached_context(
                 "\n\n".join(
                     [
                         b
                         for b in (
+                            directive_flip_notice,
                             degraded_block,
                             withheld_block,
                             nudge_block,
@@ -3346,14 +3476,17 @@ def main():
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": _combine_context(
+                directive_flip_notice,
                 _combine_context(
                     _combine_context(
-                        _combine_context(degraded_block, withheld_block),
-                        context_message,
+                        _combine_context(
+                            _combine_context(degraded_block, withheld_block),
+                            context_message,
+                        ),
+                        nudge_block,
                     ),
-                    nudge_block,
+                    profile_nudge_block,
                 ),
-                profile_nudge_block,
             ),
         }
     }

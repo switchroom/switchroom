@@ -94,7 +94,7 @@ import {
   runApprovalAttributionChecks,
 } from "./doctor-approval-attribution.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
-import { runRulesBlockChecks } from "./doctor-rules-block.js";
+import { runRulesBlockChecks, runDirectiveFlipChecks } from "./doctor-rules-block.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
 import { runTimezoneChecks } from "./doctor-timezone.js";
@@ -1902,6 +1902,12 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // (Blocker 2 fix: a reachable-but-empty engine response is never read
   // as content-divergence tampering — see doctor-rules-block.ts header).
   results.push(...(await runRulesBlockChecks(config, url)));
+
+  // Memory v2 M3 (Surface-A) — for any agent flipped to
+  // memory.inject_directives:false, FAIL if no non-empty CLAUDE.md rules block
+  // carries the migrated directives (a mis-sequenced flip recall.py fails safe
+  // on at runtime, but the operator must fix). Synchronous, no network.
+  results.push(...runDirectiveFlipChecks(config));
 
   // The bank-config API those missions are seeded through must actually be
   // reachable: since #3529 retain-mission seeding is fail-closed, so a disabled
