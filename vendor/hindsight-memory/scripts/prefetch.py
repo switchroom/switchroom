@@ -80,6 +80,16 @@ def run_prefetch(hook_input: dict, config: dict) -> bool:
         debug_log(config, "Prefetch: task-notification turn, skipping")
         return False
 
+    # Step 0 — MUTATION INVALIDATION (red-team-M3 R2, BLOCKER). This turn is
+    # about to retain (step 1) — a memory mutation. Drop any buffer left from a
+    # prior turn BEFORE recalling, so that if this turn's fresh recall fails or
+    # returns empty (steps 2-3 below bail without overwriting), the consumer
+    # cannot resurrect the pre-mutation snapshot: with no sentinel it falls to
+    # the explicitly stale-marked LAST_RECALL_STATE / degraded notice instead of
+    # serving a stale buffer as fresh. A successful recall repopulates the buffer
+    # with the post-mutation snapshot at step 3. Never raises.
+    recall_buffer.invalidate(session_id)
+
     # Step 1 — delta retain (Fix A: content-derived document_id, never the
     # bare {session_id} document; never truncates).
     try:
