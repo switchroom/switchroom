@@ -67,6 +67,8 @@ __pycache__/
 *.pyc
 coverage/
 spike/results/
+# M3 directive-flip Tier-2 probe runner output (flip/results/<agent>.<phase>.json)
+telegram-plugin/uat/flip/results/
 switchroom-linux-*
 switchroom-macos-*
 switchroom-checksums.txt

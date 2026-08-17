@@ -1,0 +1,15 @@
+{
+  "agent": "test-harness",
+  "description": "Tier-2 probe suite for test-harness. Enumerating active directives from directives_cache.test-harness.json found NONE — the file does not exist and the agent's memory state carries zero active directives (it is the UAT scratch agent, auto_recall: false). There is therefore no migrated guardrail to exercise. This suite holds a single transport-only LIVENESS probe: it proves the driver can connect, resolve the bot, DM it, and observe + score a coherent reply — the safe smoke path. If test-harness is later seeded with directives, add positive/negative probes here per the kdogg suite pattern.",
+  "probes": [
+    {
+      "id": "liveness.reachable",
+      "directiveId": "",
+      "kind": "liveness",
+      "prompt": "Reachability check for the UAT harness: please reply with a short confirmation that you're online.",
+      "passPattern": "[a-z]{2,}",
+      "passFlags": "i",
+      "rationale": "test-harness has zero active directives, so there is no guardrail to probe. This liveness probe only confirms transport: any coherent (non-empty, alphabetic) reply passes; a timeout/empty reply fails. Pure question — no side effect."
+    }
+  ]
+}
