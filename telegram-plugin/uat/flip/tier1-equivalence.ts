@@ -26,10 +26,15 @@
  *       reflect-directive) appears in `mapping`, mapped to a PRESENT rule id
  *       or an explicit `retired:<reason>`. Unmapped, or mapped to an absent
  *       rule / an empty retirement reason ⇒ `missing_from_rules`.
- *   (b) for each directive→rule pair, the normalized rule text contains every
- *       negation/scope keyword the directive carries (quoted strings, proper
- *       nouns, modals never/always/don't/only/must) and is not truncated ⇒
- *       `truncated_or_drifted`.
+ *   (b) for each directive→rule pair, the normalized rule text preserves every
+ *       GUARDRAIL the directive carries — its polarity/scope modals (matched by
+ *       synonym class, so "don't"≡"NEVER" and "only"≡"sole"), its load-bearing
+ *       facts (ALL-CAPS names, case/instrument codes), and any required-verbatim
+ *       quoted line — and is not truncated ⇒ `truncated_or_drifted`. ILLUSTRATIVE
+ *       tokens (sample toasts/commands the directive quoted as examples, incidental
+ *       prose proper nouns) are NOT demanded; requiring them verbatim in a ~400B
+ *       rule condensed from a ~10KB directive is a condensation artifact, not a
+ *       dropped guardrail. See the tokenizer section for the exact class split.
  *   (c) the rendered rules block is ≤ 6144 bytes AND the sentinel's rule count
  *       equals the actual rule count.
  *   (d) reverse: no rule lacks a mapping source ⇒ `unsourced_rules`.
@@ -114,37 +119,185 @@ export interface EquivalenceReport {
 }
 
 // ---------------------------------------------------------------------------
-// Fixed tokenizer — negation / scope keywords a rule must preserve
+// Calibrated tokenizer — GUARDRAIL vs ILLUSTRATIVE keyword classes
 // ---------------------------------------------------------------------------
+//
+// M2→M3 triage condenses a ~10KB verbose directive into a ~400B rule. The old
+// tokenizer demanded every quoted phrase / proper noun / exact modal token
+// survive verbatim, which false-flagged ~100% of valid condensed drafts (a
+// "don't"→"NEVER" reword, a "only"→"sole" reword, a dropped illustrative
+// example). This tokenizer separates what a guardrail actually IS (polarity,
+// scope, load-bearing named facts, required-verbatim wording) from the prose
+// the directive used to explain it (samples, incidental proper nouns), and
+// demands only the former. The failure mode we refuse to introduce is the
+// inverse: a calibration so loose it greenlights a genuinely dropped guardrail.
+// The `truncated_or_drifted` acceptance tests pin that boundary.
 
-/** Common capitalized sentence-openers / imperatives that are NOT proper
- *  nouns — excluded so the proper-noun scan doesn't demand them of the rule
- *  text. Deliberately small and fixed (deterministic), not a dictionary. */
-const PROPER_NOUN_STOPWORDS = new Set(
-  [
-    "The", "A", "An", "This", "That", "These", "Those", "It", "Its", "If",
-    "When", "While", "Do", "Don", "Set", "Use", "Never", "Always", "Only",
-    "Must", "Not", "No", "Every", "Each", "Any", "All", "For", "And", "But",
-    "Or", "So", "Then", "Prefer", "Avoid", "Ask", "Refuse", "Keep", "Treat",
-    "Read", "Write", "Run", "Call", "Send", "Reply", "You", "Your", "We",
-    "I", "Before", "After",
-  ].map((w) => w),
-);
+/**
+ * Synonym classes for the scope/polarity modals a guardrail cannot lose. A
+ * class is TRIGGERED when the directive uses one of its `trigger` words; the
+ * obligation is SATISFIED when the rule contains ANY of the (broader) `satisfy`
+ * words. So "don't send" ≡ "NEVER send" ≡ "do not send" (all `neg`), and
+ * "only Ken" ≡ "Ken alone" via "sole"/"solely" (`only`). Deliberately small,
+ * explicit, and documented — not a thesaurus.
+ *
+ * Trigger sets are the DISTINCTIVE, unambiguous scope/polarity words only
+ * (never/cannot/only/always/…), NOT incidental "no"/"not"/"all"/"each" which
+ * appear constantly in non-scope senses and would over-trigger. Satisfy sets
+ * are broad so any faithful reword counts. Plain obligation "must"/"shall" is
+ * intentionally NOT a class: it marks obligation strength, not polarity or
+ * scope, and an imperative reword ("Always call X" / "Confirm before Y")
+ * preserves the obligation without the literal token — demanding it survive is
+ * a condensation artifact with no safety loss (every rule in the block is
+ * already mandatory by construction).
+ */
+const MODAL_CLASSES = {
+  neg: {
+    trigger: ["never", "cannot", "can't", "don't", "do not", "won't", "must not", "may not", "shall not"],
+    satisfy: ["never", "no", "not", "don't", "dont", "cannot", "can't", "cant", "won't", "wont", "shan't", "none", "nor", "without", "avoid", "refuse", "neither", "prohibit", "forbid", "ban"],
+  },
+  only: {
+    trigger: ["only", "sole", "solely", "exclusively", "nothing but"],
+    satisfy: ["only", "sole", "solely", "exclusively", "just", "alone", "purely"],
+  },
+  universal: {
+    // Trigger only on EXPLICIT scope phrases, NOT bare "always". Bare "always"
+    // is, like plain "must", usually emphasis on a rule that is already
+    // unconditional by construction ("always format X" ⇒ "X"), and condensation
+    // legitimately drops it — flagging that is a false positive with no safety
+    // loss. Deliberate scope phrases ("in all cases", "without exception") ARE
+    // load-bearing and stay mandatory, matched by any universal synonym.
+    trigger: ["whenever", "every time", "in all cases", "all cases", "at all times", "in every case", "without exception", "no exception"],
+    satisfy: ["always", "every", "each", "all", "everything", "whenever", "any", "must", "never", "no exception", "without exception"],
+  },
+} as const;
 
-const MODAL_RE = /\b(never|always|only|must)\b/gi;
-// NON-global on purpose: used only with `.test()`. A `/g` regex advances its
-// `lastIndex` on each `.test()` and, because this constant is module-level and
-// reused across calls, that persisted offset would make a later
-// `extractKeywords` miss a "don't" at position 0. `.test()` on a non-global
-// regex is stateless.
-const DONT_RE = /\bdon['’]?t\b/i;
-const QUOTE_RES = [/"([^"]+)"/g, /'([^']+)'/g, /`([^`]+)`/g];
+type ModalClass = keyof typeof MODAL_CLASSES;
+
+/** Strong required-verbatim cues. A double-quoted string counts as a GUARDRAIL
+ *  (must survive verbatim) only when one of these immediately precedes it — the
+ *  directive is telling the agent to emit that exact wording (e.g. a deferral
+ *  line "…MUST end with exactly:"). Absent a cue, a quoted string is a SAMPLE
+ *  (toast text, example message) and is illustrative. Kept narrow on purpose:
+ *  loose cues like "say"/"append" would wrongly promote sample toasts. */
+const VERBATIM_CUE_RE =
+  /(?:\bexactly\b|\bverbatim\b|\bword[- ]for[- ]word\b|\bverbatim wording\b|\bliteral(?:ly)?\b|\bthe exact (?:line|wording|text|phrase|words|sentence)\b|\bthese exact words\b|\bexact wording\b)\s*[:,]?\s*["“]?$/i;
+
+/** Load-bearing named facts that condensation MUST carry through:
+ *  - ALL-CAPS name runs (2+ consecutive ALL-CAPS words) — directives SHOUT
+ *    these because they are load-bearing parties/executors: "GARY DAVID BROWN",
+ *    "IAN THOMAS GOODFELLOW". Directives ALSO shout for EMPHASIS ("NO HTML",
+ *    "THREE REFERENCE NUMBERS", "THE VIBE"), so a run is treated as a name only
+ *    when NONE of its words is a common English word (see EMPHASIS_STOPWORDS).
+ *    This is an NER-lite pre-filter, not a dictionary; a name built entirely
+ *    from common words is inherently ambiguous and left to human adjudication.
+ *  - case / instrument reference codes — a contiguous alnum token mixing an
+ *    uppercase letter and a digit (AG779131P, TR10399), or a STRUCTURED
+ *    acronym+number run with ≥2 numeric groups or a ≥5-digit group
+ *    ("CAV 2026 00037"). Bare acronym+single-small-number ("PR 286") is an
+ *    incidental reference, not a case code, and is excluded.
+ *  Both are dropped to ILLUSTRATIVE when they sit in an example context
+ *  ("e.g. AG779131P", "such as …") — a directive listing sample formats is not
+ *  asserting a fact the rule must carry. */
+const ALLCAPS_NAME_RE = /\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,}\b/g;
+const CODE_TOKEN_RE = /\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{4,}\b/g;
+const CODE_ACRONYM_NUM_RE = /\b[A-Z]{2,5}(?:\s+\d{2,}){1,}\b/g;
+
+/** An `e.g.`/`such as`/`for example` marker in the ~48 chars immediately
+ *  before a fact match ⇒ the fact is a SAMPLE, not an asserted guardrail. No
+ *  trailing `\b` — markers ending in `.` ("e.g.") have no word boundary before
+ *  the following space — and the run after the marker forbids sentence
+ *  terminators (`.?!:;`) so the marker must be in the SAME clause as the fact. */
+const EXAMPLE_CONTEXT_RE =
+  /(?:\be\.?\s?g\.?|\bi\.?\s?e\.?|\bsuch as|\bfor example|\bfor instance|\bexamples?\b|\bincluding\b|\blike\b)[^.?!:;]{0,48}$/i;
+
+/** Common English words a directive may SHOUT for emphasis rather than name.
+ *  An ALL-CAPS run containing any of these is emphasis, not a party name.
+ *  Explicit and bounded on purpose — extend as new emphasis vocabulary shows
+ *  up in triage, never with plausible surname tokens (BROWN/DAVID/THOMAS stay
+ *  OUT so real names survive). */
+const EMPHASIS_STOPWORDS = new Set([
+  "THE", "A", "AN", "AND", "OR", "BUT", "NOR", "FOR", "SO", "IF", "OF", "TO",
+  "IN", "ON", "AT", "BY", "AS", "IS", "ARE", "BE", "NOT", "NO", "ALL", "ANY",
+  "EACH", "EVERY", "THIS", "THAT", "IT", "WE", "YOU", "DO", "USE", "PER",
+  "VIA", "YES", "NOW", "THEN", "HERE", "WITH", "WITHOUT", "ONLY", "NEVER",
+  "ALWAYS", "MUST", "OVER", "UNDER", "ONE", "TWO", "THREE", "FOUR", "FIVE",
+  "REFERENCE", "NUMBER", "NUMBERS", "DAILY", "WEEKLY", "MONTHLY", "ROLLING",
+  "IMPACT", "VIBE", "LINE", "LINES", "BREAK", "BREAKS", "ROW", "ROWS", "HTML",
+  "CSS", "JSON", "YAML", "CODE", "VERBATIM", "LITERAL", "LITERALLY", "AUTO",
+  "TOTAL", "NET", "TARGET", "BURN", "FIXED", "RECORDS", "WIN", "SEND",
+]);
+
+/** True when an ALL-CAPS run reads as a load-bearing proper NAME rather than
+ *  shouted emphasis. Requires ≥3 words (full legal names — "GARY DAVID BROWN",
+ *  "IAN THOMAS GOODFELLOW" — clear this; two-word ALL-CAPS is far more often
+ *  emphasis, e.g. "NO HTML"/"THE VIBE"/"COACHING FRAME", so it is treated as
+ *  illustrative) AND no word in the common-emphasis stopword set (rejects
+ *  three-word emphasis like "THREE REFERENCE NUMBERS"/"ROLLING WEEKLY IMPACT").
+ *  A load-bearing two-word name must survive via a Titlecase mention or a
+ *  required-verbatim quote (as "Fiona Jessep" does in the deferral line), not
+ *  this ALL-CAPS pre-filter. */
+function isNameRun(run: string): boolean {
+  const words = run.split(/\s+/);
+  return words.length >= 3 && words.every((w) => !EMPHASIS_STOPWORDS.has(w));
+}
+
+/** True when a structured case/instrument code (≥2 numeric groups or a ≥5-digit
+ *  group), so an incidental "PR 286" reference does not read as a case number. */
+function isStructuredCode(run: string): boolean {
+  const groups = run.match(/\d{2,}/g) ?? [];
+  return groups.length >= 2 || groups.some((g) => g.length >= 5);
+}
+
+/** True when the char span before `index` is an example-listing context. */
+function inExampleContext(content: string, index: number): boolean {
+  return EXAMPLE_CONTEXT_RE.test(content.slice(0, index));
+}
+
+/** Exclusivity "only"/"sole"/… as a real scope word. Excludes the three ways
+ *  "only" over-triggered on real drafts, none of which is exclusivity scope:
+ *   - the "-only" of a compound/directive name ("fiona-facts-only", "step-only");
+ *   - the temporal "only until/once/then/…" ("lasts only until restart");
+ *   - the quantifier "only <number>" ("only 2.7% apart", "only 3 items"). */
+const ONLY_TRIGGER_RE =
+  /(?<![-\w'’])(?:only|solely|exclusively|sole)\b(?!\s+(?:until|when|once|then|after|before|if|while|as|because|since|about|around|some|roughly|approximately|\d|a\s+few|[½¼¾]))/i;
+
+/** Incidental Titlecase proper nouns (Buildkite, Ken, Playwright, Twitter).
+ *  Extracted so the tokenizer surface stays inspectable, but classed
+ *  ILLUSTRATIVE and never demanded — the biggest source of the old
+ *  false-positive rate. A genuinely load-bearing name relies on the ALL-CAPS /
+ *  code fact patterns above, or on surviving inside a required-verbatim quote. */
+const PROPER_NOUN_STOPWORDS = new Set([
+  "The", "A", "An", "This", "That", "These", "Those", "It", "Its", "If",
+  "When", "While", "Do", "Don", "Set", "Use", "Never", "Always", "Only",
+  "Must", "Not", "No", "Every", "Each", "Any", "All", "For", "And", "But",
+  "Or", "So", "Then", "Prefer", "Avoid", "Ask", "Refuse", "Keep", "Treat",
+  "Read", "Write", "Run", "Call", "Send", "Reply", "You", "Your", "We",
+  "I", "Before", "After",
+]);
 const PROPER_NOUN_RE = /\b[A-Z][a-zA-Z0-9_.-]*[a-z][a-zA-Z0-9_.-]*\b/g;
 
+/** Double-quote (straight + curly) and backtick only. Single-quote extraction
+ *  is DELETED on purpose: `'…'` matched contraction apostrophes ("Ken's own
+ *  session … don't") and captured enormous spurious "quotes" — the single
+ *  largest artifact source in the baseline. Real single-quoted phrases do not
+ *  occur in these directives; the risk is not worth it. */
+const DOUBLE_QUOTE_RE = /["“]([^"”]+)["”]/g;
+const BACKTICK_RE = /`([^`]+)`/g;
+
 export interface Keyword {
-  kind: "quote" | "modal" | "proper";
-  /** The token as it should be searched for (already trimmed). */
+  /** `modal` = a synonym-classed polarity/scope obligation; `quote` = a quoted
+   *  string; `fact` = a load-bearing named fact; `proper` = an incidental
+   *  proper noun. */
+  kind: "quote" | "modal" | "fact" | "proper";
+  /** Whether the rule MUST preserve this. Only `guardrail` keywords are
+   *  enforced; `illustrative` keywords are extracted but never demanded. */
+  klass: "guardrail" | "illustrative";
+  /** The token as it should be searched for / reported (already trimmed). For
+   *  modals this is the directive's own trigger word (for readable reports). */
   value: string;
+  /** For `kind === "modal"`: which synonym class must survive. */
+  modalClass?: ModalClass;
 }
 
 function normalize(s: string): string {
@@ -155,49 +308,104 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** Word-boundary containment for a single alnum-ish token (apostrophes treated
+ *  as punctuation, so `cannot` is not satisfied by `cannon` and `never` is not
+ *  satisfied by `nevertheless`). */
+function containsWord(normalizedText: string, word: string): boolean {
+  const stem = normalize(word).replace(/['’]/g, "'");
+  if (/\s/.test(stem)) return normalizedText.includes(stem);
+  const re = new RegExp(`(^|[^a-z0-9])${escapeRe(stem)}([^a-z0-9]|$)`);
+  return re.test(normalizedText);
+}
+
+/** True when the directive triggers `cls` (uses one of its trigger words). The
+ *  `only` class uses a refined matcher that ignores "-only" compounds and
+ *  temporal "only until/once/…" (both over-triggered on real drafts). */
+function directiveTriggersModal(normalizedContent: string, cls: ModalClass): boolean {
+  if (cls === "only") return ONLY_TRIGGER_RE.test(normalizedContent);
+  return MODAL_CLASSES[cls].trigger.some((w) => containsWord(normalizedContent, w));
+}
+
+/** True when the rule satisfies `cls` (contains any of its satisfy words). */
+function ruleSatisfiesModal(normalizedRuleText: string, cls: ModalClass): boolean {
+  return MODAL_CLASSES[cls].satisfy.some((w) => containsWord(normalizedRuleText, w));
+}
+
+/** First trigger word the directive used for `cls`, for readable reporting. */
+function firstTrigger(normalizedContent: string, cls: ModalClass): string {
+  return MODAL_CLASSES[cls].trigger.find((w) => containsWord(normalizedContent, w)) ?? cls;
+}
+
 /**
- * Extract the fixed keyword set from a directive's content. Deterministic:
- * quoted phrases (verbatim), the modals never/always/don't/only/must, and
- * proper nouns (a capitalized word with at least one interior lowercase,
- * minus a fixed stopword set). Exported for direct unit testing.
+ * Extract the calibrated keyword set from a directive's content. Deterministic.
+ * Each keyword carries a GUARDRAIL/ILLUSTRATIVE class; only guardrail keywords
+ * are enforced against the rule (see {@link ruleContainsKeyword} and the drift
+ * loop). Exported for direct unit testing.
  */
 export function extractKeywords(content: string): Keyword[] {
   const out: Keyword[] = [];
   const seen = new Set<string>();
-  const push = (kind: Keyword["kind"], raw: string) => {
-    const value = raw.trim();
+  const push = (kw: Keyword) => {
+    const value = kw.value.trim();
     if (value.length === 0) return;
-    const key = `${kind}:${value.toLowerCase()}`;
+    const key = `${kw.kind}:${value.toLowerCase()}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ kind, value });
+    out.push({ ...kw, value });
   };
 
-  for (const re of QUOTE_RES) {
-    for (const m of content.matchAll(re)) push("quote", m[1]);
+  const norm = normalize(content);
+
+  // (1) Modal synonym classes — guardrail. One keyword per triggered class.
+  for (const cls of Object.keys(MODAL_CLASSES) as ModalClass[]) {
+    if (directiveTriggersModal(norm, cls)) {
+      push({ kind: "modal", klass: "guardrail", value: firstTrigger(norm, cls), modalClass: cls });
+    }
   }
-  for (const m of content.matchAll(MODAL_RE)) push("modal", m[1].toLowerCase());
-  if (DONT_RE.test(content)) push("modal", "don't");
+
+  // (2) Quoted strings. Backtick = code sample ⇒ illustrative. Double-quote =
+  //     guardrail only when a required-verbatim cue immediately precedes it.
+  for (const m of content.matchAll(DOUBLE_QUOTE_RE)) {
+    const before = content.slice(0, m.index ?? 0);
+    const cued = VERBATIM_CUE_RE.test(before);
+    push({ kind: "quote", klass: cued ? "guardrail" : "illustrative", value: m[1] });
+  }
+  for (const m of content.matchAll(BACKTICK_RE)) {
+    push({ kind: "quote", klass: "illustrative", value: m[1] });
+  }
+
+  // (3) Load-bearing facts — guardrail: ALL-CAPS proper-name runs and
+  //     case/instrument codes a condensed rule cannot silently drop. Emphasis
+  //     ALL-CAPS, incidental "PR 286" refs, and example-listed codes are
+  //     downgraded to illustrative (see the helpers above).
+  const fact = (value: string, index: number, guardrail: boolean) =>
+    push({ kind: "fact", klass: guardrail && !inExampleContext(content, index) ? "guardrail" : "illustrative", value });
+  for (const m of content.matchAll(ALLCAPS_NAME_RE)) fact(m[0], m.index ?? 0, isNameRun(m[0]));
+  for (const m of content.matchAll(CODE_TOKEN_RE)) fact(m[0], m.index ?? 0, true);
+  for (const m of content.matchAll(CODE_ACRONYM_NUM_RE)) fact(m[0], m.index ?? 0, isStructuredCode(m[0]));
+
+  // (4) Incidental Titlecase proper nouns — illustrative (extracted, not demanded).
   for (const m of content.matchAll(PROPER_NOUN_RE)) {
     const w = m[0];
     if (PROPER_NOUN_STOPWORDS.has(w)) continue;
-    push("proper", w);
+    push({ kind: "proper", klass: "illustrative", value: w });
   }
   return out;
 }
 
-/** True when `ruleText` (normalized) contains the keyword. Quoted phrases are
- *  substring-matched; single-word modals/proper-nouns are word-boundary
- *  matched so `must` doesn't spuriously satisfy on `mustard`. */
+/** True when `ruleText` (normalized) preserves the GUARDRAIL keyword. Modals
+ *  are satisfied by any member of their synonym class; quoted/fact phrases are
+ *  substring-matched (case-insensitive); single tokens are word-boundary
+ *  matched. Illustrative keywords are always treated as preserved (never
+ *  demanded). */
 function ruleContainsKeyword(normalizedRuleText: string, kw: Keyword): boolean {
-  const needle = normalize(kw.value);
-  if (kw.kind === "quote" || /\s/.test(needle)) {
-    return normalizedRuleText.includes(needle);
+  if (kw.klass === "illustrative") return true;
+  if (kw.kind === "modal" && kw.modalClass) {
+    return ruleSatisfiesModal(normalizedRuleText, kw.modalClass);
   }
-  // don't → the apostrophe is punctuation; match the stem.
-  const stem = needle.replace(/['’]/g, "'");
-  const re = new RegExp(`(^|[^a-z0-9])${escapeRe(stem)}([^a-z0-9]|$)`);
-  return re.test(normalizedRuleText);
+  const needle = normalize(kw.value);
+  if (/\s/.test(needle)) return normalizedRuleText.includes(needle);
+  return containsWord(normalizedRuleText, needle);
 }
 
 /** A rule text looks truncated when it ends in an ellipsis, or is a strict
