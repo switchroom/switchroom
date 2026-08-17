@@ -76,7 +76,14 @@ AGENT_NAME="$(basename "${CLAUDE_PROJECT_DIR:-}")"
 VERIFY_OUT="$(switchroom memory rule verify "$AGENT_NAME" 2>&1)"
 VERIFY_EXIT=$?
 
-if [ "$VERIFY_EXIT" -eq 0 ]; then
+# Exit-code contract (memory-rules.ts `verify`):
+#   0 = clean; 2 = GENUINE TAMPER; any other non-zero = an ENVIRONMENT
+#   failure (config unreadable, agent-dir mismatch, withConfigError exit 1,
+#   `switchroom` bug). Only code 2 warrants injecting a tamper notice into
+#   the model's context — an environment failure that hard-injected "tamper
+#   FAILED" would cry wolf on every broken boot and erode the signal. Degrade
+#   silently on everything that is not an unambiguous tamper.
+if [ "$VERIFY_EXIT" -ne 2 ]; then
   exit 0
 fi
 

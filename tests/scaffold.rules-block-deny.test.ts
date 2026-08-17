@@ -153,6 +153,38 @@ describe("Blocker 1 — end-to-end: flag OFF leaves an ALREADY-DEPLOYED agent's 
     expect(denyAfterReconcile).not.toContain(`Write(${claudeMdPath})`);
   });
 
+  it("flag OFF: settings.json carries NO rules-sentinel SessionStart hook entry (MINOR)", () => {
+    const config = makeAgentConfig(); // memory.rules_block unset — the fleet default
+    const r = scaffoldAgent(
+      "a",
+      config,
+      tmpDir,
+      telegramConfig,
+      makeSwitchroomConfig("a", config),
+    );
+    const settingsPath = join(r.agentDir, ".claude", "settings.json");
+    const raw = readFileSync(settingsPath, "utf-8");
+    expect(raw).not.toContain("rules-sentinel-hook.sh");
+    expect(raw).not.toContain("hook:rules-sentinel");
+
+    reconcileAgent("a", config, tmpDir, telegramConfig, makeSwitchroomConfig("a", config));
+    const rawAfter = readFileSync(settingsPath, "utf-8");
+    expect(rawAfter).not.toContain("rules-sentinel-hook.sh");
+  });
+
+  it("flag ON: settings.json DOES carry the rules-sentinel SessionStart hook entry (control — proves the assertion above is not vacuous)", () => {
+    const config = makeAgentConfig({ memory: { rules_block: true } });
+    const r = scaffoldAgent(
+      "a",
+      config,
+      tmpDir,
+      telegramConfig,
+      makeSwitchroomConfig("a", config),
+    );
+    const settingsPath = join(r.agentDir, ".claude", "settings.json");
+    expect(readFileSync(settingsPath, "utf-8")).toContain("rules-sentinel-hook.sh");
+  });
+
   it("flag ON: settings.permissions.deny DOES carry the exact Edit/Write(CLAUDE.md) entries after reconcile (control — proves the assertion above is not vacuous)", () => {
     const config = makeAgentConfig({ memory: { rules_block: true } });
     const r = scaffoldAgent(

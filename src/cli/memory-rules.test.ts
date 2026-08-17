@@ -12,7 +12,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Command } from "commander";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerMemoryRuleCommand } from "./memory-rules.js";
@@ -72,11 +72,17 @@ beforeEach(() => {
       "agents:",
       "  bot:",
       '    topic_name: "bot"',
+      "    memory:",
+      "      collection: bot-bank",
+      "      rules_block: true",
+      "  dark:",
+      '    topic_name: "dark"',
       "",
     ].join("\n"),
     "utf-8",
   );
   seedAgent("bot");
+  seedAgent("dark");
 
   savedAgentsDirEnv = process.env.SWITCHROOM_AGENTS_DIR;
   process.env.SWITCHROOM_AGENTS_DIR = agentsDir;
@@ -99,6 +105,46 @@ describe("memory rule add — announcement string", () => {
 
     const printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(printed).toContain("added standing rule R-01: Always confirm destructive ops.");
+  });
+});
+
+describe("memory rule write verbs — darkness gate (flag off)", () => {
+  it("add refuses with a clean error, exits non-zero, and writes nothing for a flag-off agent", async () => {
+    const claudeMdPath = join(agentsDir, "dark", "CLAUDE.md");
+    const before = readFileSync(claudeMdPath, "utf-8");
+    const logPath = join(agentsDir, "dark", "memory", "rules-mutation.log");
+
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((_code?: number) => {
+      throw new Error("__process_exit__");
+    }) as never);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["rule", "add", "dark", "Should", "not", "land."])).rejects.toThrow(
+      "__process_exit__",
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const printed = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(printed).toContain("memory.rules_block is off");
+
+    // Byte-identical: no block rendered, no mutation log created.
+    expect(readFileSync(claudeMdPath, "utf-8")).toBe(before);
+    expect(existsSync(logPath)).toBe(false);
+  });
+
+  it("edit-yours also refuses for a flag-off agent", async () => {
+    const claudeMdPath = join(agentsDir, "dark", "CLAUDE.md");
+    const before = readFileSync(claudeMdPath, "utf-8");
+    vi.spyOn(process, "exit").mockImplementation(((_code?: number) => {
+      throw new Error("__process_exit__");
+    }) as never);
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["rule", "edit-yours", "dark", "new", "notes"])).rejects.toThrow(
+      "__process_exit__",
+    );
+    const printed = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    expect(printed).toContain("memory.rules_block is off");
+    expect(readFileSync(claudeMdPath, "utf-8")).toBe(before);
   });
 });
 

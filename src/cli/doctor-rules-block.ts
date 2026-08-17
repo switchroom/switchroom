@@ -109,21 +109,30 @@ export async function runRulesBlockChecks(
     const label = `bank ${bankId} rules block` +
       (entry.agents.length > 1 ? ` (${entry.agents.join(", ")})` : "");
 
-    // --- 1. Local integrity ---------------------------------------------
-    if (agentsDir && existsSync(join(agentsDir, firstAgent))) {
-      const integrity = verifyIntegrity(join(agentsDir, firstAgent));
-      results.push({
-        name: `${label} — integrity`,
-        status: integrity.ok ? "ok" : "fail",
-        detail: integrity.detail,
-        ...(integrity.ok ? {} : { fix: `Run: switchroom memory rule verify ${firstAgent}` }),
-      });
-    } else {
-      results.push({
-        name: `${label} — integrity`,
-        status: "warn",
-        detail: "could not resolve the agent directory to verify",
-      });
+    // --- 1. Local integrity (per-agent) ---------------------------------
+    // Each agent in a shared bank has its OWN CLAUDE.md + mutation log, so
+    // integrity is checked for EVERY agent, not just entry.agents[0]: a
+    // tampered block on the second agent of a shared-collection bank would
+    // otherwise pass silently (MEDIUM fix). Only the index-divergence probe
+    // below is legitimately per-bank (it compares against the shared engine
+    // bank, which all agents in the bank point at).
+    for (const agentName of entry.agents) {
+      const perAgentSuffix = entry.agents.length > 1 ? ` (${agentName})` : "";
+      if (agentsDir && existsSync(join(agentsDir, agentName))) {
+        const integrity = verifyIntegrity(join(agentsDir, agentName));
+        results.push({
+          name: `${label} — integrity${perAgentSuffix}`,
+          status: integrity.ok ? "ok" : "fail",
+          detail: integrity.detail,
+          ...(integrity.ok ? {} : { fix: `Run: switchroom memory rule verify ${agentName}` }),
+        });
+      } else {
+        results.push({
+          name: `${label} — integrity${perAgentSuffix}`,
+          status: "warn",
+          detail: "could not resolve the agent directory to verify",
+        });
+      }
     }
 
     // --- 2. Index divergence ---------------------------------------------

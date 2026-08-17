@@ -188,8 +188,8 @@ describe("T3 (doctor half) — local integrity check surfaces tamper with a quot
   });
 });
 
-describe("bank dedup — one bank shared by several agents produces one row set", () => {
-  it("groups agents sharing memory.collection into a single bank label", async () => {
+describe("bank dedup — one bank shared by several agents", () => {
+  it("dedups index divergence per-bank but checks integrity per-agent", async () => {
     const agentsDir = freshRoot();
     seedAgentWithIndex(agentsDir, "bot-a", []);
     seedAgentWithIndex(agentsDir, "bot-b", []);
@@ -201,10 +201,49 @@ describe("bank dedup — one bank shared by several agents produces one row set"
       "http://engine.invalid",
       { agentsDir, fetchImpl: stubFetch({ items: [] }) },
     );
+    // Index divergence is a per-BANK probe (shared engine bank) → one row.
+    const divergenceRows = results.filter((r) => r.name.includes("index divergence"));
+    expect(divergenceRows).toHaveLength(1);
+    expect(divergenceRows[0].name).toContain("bot-a");
+    expect(divergenceRows[0].name).toContain("bot-b");
+    // Integrity is per-AGENT (each has its own CLAUDE.md) → one row each.
     const integrityRows = results.filter((r) => r.name.includes("integrity"));
-    expect(integrityRows).toHaveLength(1);
-    expect(integrityRows[0].name).toContain("bot-a");
-    expect(integrityRows[0].name).toContain("bot-b");
+    expect(integrityRows).toHaveLength(2);
+    expect(integrityRows.some((r) => r.name.includes("(bot-a)"))).toBe(true);
+    expect(integrityRows.some((r) => r.name.includes("(bot-b)"))).toBe(true);
+  });
+
+  it("FAILs integrity for the SECOND agent when only its block is tampered (MEDIUM regression)", async () => {
+    const agentsDir = freshRoot();
+    // bot-a: clean rule block. bot-b: rule block then hand-edited out-of-band.
+    const dirA = join(agentsDir, "bot-a");
+    const dirB = join(agentsDir, "bot-b");
+    mkdirSync(dirA, { recursive: true });
+    mkdirSync(dirB, { recursive: true });
+    writeFileSync(join(dirA, "CLAUDE.md"), `# Managed\n\n${MARKER}\n\nfree text\n`, "utf-8");
+    writeFileSync(join(dirB, "CLAUDE.md"), `# Managed\n\n${MARKER}\n\nfree text\n`, "utf-8");
+    createRule(dirA, { text: "Keep tests green.", source: "telegram", actor: "klanker" });
+    createRule(dirB, { text: "Keep tests green.", source: "telegram", actor: "klanker" });
+
+    // Tamper ONLY bot-b's block (the non-first agent).
+    const bPath = join(dirB, "CLAUDE.md");
+    const beforeB = readFileSync(bPath, "utf-8");
+    writeFileSync(bPath, beforeB.replace("Keep tests green.", "Tampered."), "utf-8");
+
+    const results = await runRulesBlockChecks(
+      config({
+        "bot-a": { rules_block: true, collection: "shared-bank" },
+        "bot-b": { rules_block: true, collection: "shared-bank" },
+      }),
+      "http://engine.invalid",
+      { agentsDir, fetchImpl: stubFetch({ items: [] }) },
+    );
+    const aRow = results.find((r) => r.name.includes("integrity") && r.name.includes("(bot-a)"))!;
+    const bRow = results.find((r) => r.name.includes("integrity") && r.name.includes("(bot-b)"))!;
+    expect(aRow.status).toBe("ok");
+    expect(bRow.status).toBe("fail");
+    expect(bRow.detail).toContain("sentinel mismatch");
+    expect(bRow.fix).toContain("switchroom memory rule verify bot-b");
   });
 });
 

@@ -114,7 +114,18 @@ export function canonicalizeRules(rules: Rule[]): string {
   return JSON.stringify(shaped);
 }
 
-/** sha256 hex + count over the canonical rule-set serialization. */
+/**
+ * sha256 hex + count over the canonical rule-set serialization.
+ *
+ * ACCEPTED LIMITATION (M1, carve-M1.md §3): this sentinel and the mutation
+ * log's hash chain are UNKEYED and live in files the agent can write. They
+ * detect ACCIDENTAL or out-of-band edits (a stray `sed -i`, a hand-edit, an
+ * `apply` reflow false-positive) — NOT a determined attacker with Bash, who
+ * could recompute a matching sentinel and rewrite the chain head. Raising
+ * the bar to a keyed MAC (a secret the agent process can't read) is a
+ * deliberate post-M1 concern; M1's threat model is integrity-signalling,
+ * not tamper-proofing.
+ */
 export function computeSentinel(rules: Rule[]): RulesSentinel {
   const canonical = canonicalizeRules(rules);
   const hash = createHash("sha256").update(canonical).digest("hex");

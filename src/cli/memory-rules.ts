@@ -17,6 +17,7 @@ import chalk from "chalk";
 import { join } from "node:path";
 import { withConfigError, getConfig } from "./helpers.js";
 import { resolveAgentsDir } from "../config/loader.js";
+import { resolveAgentConfig } from "../config/merge.js";
 import {
   createRule,
   retireRule,
@@ -26,6 +27,8 @@ import {
   BudgetExceededError,
   NoYoursMarkerError,
   MarkerBlockOverlapError,
+  InvalidRuleError,
+  RulesBlockDisabledError,
 } from "../memory/rules-store.js";
 
 function resolveAgentDir(program: Command, agent: string): string {
@@ -35,6 +38,27 @@ function resolveAgentDir(program: Command, agent: string): string {
     process.exit(1);
   }
   return join(resolveAgentsDir(config), agent);
+}
+
+/**
+ * Darkness gate for WRITE verbs (add/retire/edit-yours). Resolves the target
+ * agent's effective `memory.rules_block` flag through the full defaults →
+ * profile → agent cascade and throws {@link RulesBlockDisabledError} when it
+ * is not `true`. Enforced here in the CLI layer — the single chokepoint BOTH
+ * the `agent-config` MCP tools (which shell out to these verbs) AND direct
+ * CLI callers pass through — so a flag-off agent can never render a rules
+ * block into its live CLAUDE.md, matching the changelog's "off ⇒ no write"
+ * contract. Read verbs (list/verify) intentionally do NOT call this.
+ */
+function assertRulesBlockEnabled(program: Command, agent: string): void {
+  const config = getConfig(program);
+  const agentConfig = config.agents[agent];
+  const resolved = agentConfig
+    ? resolveAgentConfig(config.defaults, config.profiles, agentConfig)
+    : undefined;
+  if (resolved?.memory?.rules_block !== true) {
+    throw new RulesBlockDisabledError(agent);
+  }
 }
 
 export function registerMemoryRuleCommand(memory: Command, program: Command): void {
@@ -66,6 +90,7 @@ export function registerMemoryRuleCommand(memory: Command, program: Command): vo
             process.exit(1);
           }
           try {
+            assertRulesBlockEnabled(program, agent);
             const { rule: newRule, possibleDuplicateOf } = createRule(agentDir, {
               text,
               source: opts.source,
@@ -88,7 +113,12 @@ export function registerMemoryRuleCommand(memory: Command, program: Command): vo
               );
             }
           } catch (e) {
-            if (e instanceof BudgetExceededError || e instanceof NoYoursMarkerError) {
+            if (
+              e instanceof BudgetExceededError ||
+              e instanceof NoYoursMarkerError ||
+              e instanceof InvalidRuleError ||
+              e instanceof RulesBlockDisabledError
+            ) {
               if (opts.json) {
                 console.error(JSON.stringify({ ok: false, error: e.message }));
               } else {
@@ -117,6 +147,7 @@ export function registerMemoryRuleCommand(memory: Command, program: Command): vo
         ) => {
           const agentDir = resolveAgentDir(program, agent);
           try {
+            assertRulesBlockEnabled(program, agent);
             retireRule(agentDir, ruleId, {
               actor: opts.actor,
               supersededBy: opts.supersededBy,
@@ -192,6 +223,7 @@ export function registerMemoryRuleCommand(memory: Command, program: Command): vo
           const agentDir = resolveAgentDir(program, agent);
           const text = textWords.join(" ").trim();
           try {
+            assertRulesBlockEnabled(program, agent);
             editYoursContent(agentDir, text, { actor: opts.actor });
             if (opts.json) {
               console.log(JSON.stringify({ ok: true, agent }));
@@ -199,7 +231,11 @@ export function registerMemoryRuleCommand(memory: Command, program: Command): vo
             }
             console.log(chalk.green(`✓ updated Yours content for "${agent}"`));
           } catch (e) {
-            if (e instanceof MarkerBlockOverlapError || e instanceof NoYoursMarkerError) {
+            if (
+              e instanceof MarkerBlockOverlapError ||
+              e instanceof NoYoursMarkerError ||
+              e instanceof RulesBlockDisabledError
+            ) {
               if (opts.json) {
                 console.error(JSON.stringify({ ok: false, error: e.message }));
               } else {
@@ -223,8 +259,13 @@ export function registerMemoryRuleCommand(memory: Command, program: Command): vo
         if (result.ok) {
           console.log(chalk.green(`✓ ${result.detail}`));
         } else {
+          // Exit code 2 = GENUINE TAMPER (distinct from 1 = env/config error
+          // such as an unreadable config or an agent-dir mismatch). The
+          // SessionStart sentinel hook (bin/rules-sentinel-hook.sh) alerts the
+          // model ONLY on 2, so a broken environment never masquerades as a
+          // tamper notice in the agent's context.
           console.error(chalk.red(`✗ ${result.detail}`));
-          process.exit(1);
+          process.exit(2);
         }
       }),
     );

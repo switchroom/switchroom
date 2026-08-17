@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyAuditChain, CHAIN_GENESIS } from "../util/audit-hashchain.js";
-import { parseRulesBlock } from "./rules-block.js";
+import { parseRulesBlock, RULES_BLOCK_BEGIN, RULES_BLOCK_END } from "./rules-block.js";
 import {
   createRule,
   retireRule,
@@ -12,6 +12,7 @@ import {
   listRules,
   BudgetExceededError,
   MarkerBlockOverlapError,
+  InvalidRuleError,
 } from "./rules-store.js";
 
 const MARKER = "# --- Yours (preserved across apply) ---";
@@ -204,5 +205,109 @@ describe("T6 — edit-Yours guard", () => {
     editYoursContent(agentDir, "Updated free text.", { actor: "operator" });
     const rules = listRules(agentDir);
     expect(rules).toEqual([rule]);
+  });
+});
+
+describe("MAJOR — whole-block deletion is detected as tamper (not dark)", () => {
+  it("verifyIntegrity FAILs when the block markers are sed-deleted but the log head records a non-empty rule set", () => {
+    createRule(agentDir, { text: "Do not delete me.", source: "telegram", actor: "klanker" });
+    // Sanity: clean before tamper.
+    expect(verifyIntegrity(agentDir).ok).toBe(true);
+
+    // Tamper: delete the ENTIRE rules block (both markers + body), the exact
+    // `sed -i` "delete the whole block" bypass. The mutation log is untouched,
+    // so its head still records the non-empty rule set.
+    const before = readFileSync(claudeMdPath(), "utf-8");
+    const b = before.indexOf(RULES_BLOCK_BEGIN);
+    const e = before.indexOf(RULES_BLOCK_END) + RULES_BLOCK_END.length;
+    const stripped = before.slice(0, b) + before.slice(e);
+    expect(stripped).not.toContain(RULES_BLOCK_BEGIN);
+    writeFileSync(claudeMdPath(), stripped, "utf-8");
+
+    const result = verifyIntegrity(agentDir);
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("deleted");
+  });
+
+  it("stays dark (ok) when there is genuinely no block and no logged non-empty state", () => {
+    // No rule ever created → no log, no block → nothing to verify.
+    expect(verifyIntegrity(agentDir).ok).toBe(true);
+  });
+});
+
+describe("MAJOR — text/source normalization prevents false tamper", () => {
+  it("a rule added with an embedded newline verifies OK (stored == rendered == parsed)", () => {
+    createRule(agentDir, {
+      text: "First line.\n\nSecond   line with   double spaces.",
+      source: "telegram",
+      actor: "klanker",
+    });
+    const result = verifyIntegrity(agentDir);
+    expect(result.ok).toBe(true);
+    // The stored/rendered text is the flattened form.
+    const rules = listRules(agentDir);
+    expect(rules[0].text).toBe("First line. Second line with double spaces.");
+  });
+
+  it("a rule whose SOURCE contains a comma verifies OK (source is validated/rejected, not silently dropped)", () => {
+    // A comma in source would truncate ruleLineRe and drop the rule at parse
+    // → false tamper. It must be REFUSED at ingestion instead.
+    expect(() =>
+      createRule(agentDir, { text: "Rule text.", source: "telegram, urgent", actor: "klanker" }),
+    ).toThrow(InvalidRuleError);
+    // Nothing written.
+    expect(existsSync(mutationLogPath())).toBe(false);
+  });
+
+  it("a legal source (no delimiter chars) round-trips and verifies OK", () => {
+    createRule(agentDir, { text: "Rule text.", source: "telegram-urgent", actor: "klanker" });
+    expect(verifyIntegrity(agentDir).ok).toBe(true);
+    expect(listRules(agentDir)[0].source).toBe("telegram-urgent");
+  });
+
+  it("rejects rule text containing the literal end-marker substring, file byte-identical", () => {
+    const before = readFileSync(claudeMdPath(), "utf-8");
+    expect(() =>
+      createRule(agentDir, {
+        text: `sneaky ${RULES_BLOCK_END} truncation`,
+        source: "telegram",
+        actor: "klanker",
+      }),
+    ).toThrow(InvalidRuleError);
+    expect(readFileSync(claudeMdPath(), "utf-8")).toBe(before);
+    expect(existsSync(mutationLogPath())).toBe(false);
+  });
+});
+
+describe("MEDIUM — over-budget --supersedes must not archive before the budget check", () => {
+  it("createRule with supersedes over budget throws, writes NO archive entry, no log row, file byte-identical", () => {
+    // Seed a small first rule to supersede.
+    const first = createRule(agentDir, {
+      text: "Original small rule.",
+      source: "telegram",
+      actor: "klanker",
+    }).rule;
+
+    const before = readFileSync(claudeMdPath(), "utf-8");
+    const logBefore = readFileSync(mutationLogPath(), "utf-8");
+    const archiveExistedBefore = existsSync(archivePath());
+
+    const hugeText = "x".repeat(7000);
+    expect(() =>
+      createRule(agentDir, {
+        text: hugeText,
+        source: "telegram",
+        actor: "klanker",
+        supersedes: first.id,
+      }),
+    ).toThrow(BudgetExceededError);
+
+    // File + log unchanged; NO archive entry created (the retire was not
+    // committed because the budget check refused the whole mutation).
+    expect(readFileSync(claudeMdPath(), "utf-8")).toBe(before);
+    expect(readFileSync(mutationLogPath(), "utf-8")).toBe(logBefore);
+    expect(existsSync(archivePath())).toBe(archiveExistedBefore);
+    // The first rule is still ACTIVE (not phantom-retired).
+    expect(listRules(agentDir).map((r) => r.id)).toEqual([first.id]);
   });
 });

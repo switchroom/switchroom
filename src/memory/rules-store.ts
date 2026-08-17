@@ -86,6 +86,64 @@ export class MarkerBlockOverlapError extends Error {
   }
 }
 
+/** The target agent's `memory.rules_block` flag is not `true`, so no write
+ *  (add/retire/supersede/edit-yours) is permitted — the rules-block toolchain
+ *  is dark for this agent. Read verbs (list/verify) stay open. Refused before
+ *  any IO, so nothing is written. */
+export class RulesBlockDisabledError extends Error {
+  constructor(agent: string) {
+    super(
+      `memory.rules_block is off for agent "${agent}" — the rules-block ` +
+        `toolchain is dark; no rule/edit-yours write is permitted until the ` +
+        `flag is flipped (M3 rollout). Read verbs (list/verify) stay open.`,
+    );
+    this.name = "RulesBlockDisabledError";
+  }
+}
+
+/** A rule's `text` or `source` contains characters that would break the
+ *  single-line rules-block render/parse round-trip (a marker comment, or a
+ *  source char that trips `ruleLineRe`). Refused at ingestion — the file is
+ *  never touched. */
+export class InvalidRuleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidRuleError";
+  }
+}
+
+/**
+ * A rule's `source` must survive `renderRuleLine`/`ruleLineRe`'s
+ * `(source: <src>, added ...)` framing. `,` and the delimiters `(` `)` `*`
+ * (and any newline) either truncate or drop the whole rule line at parse —
+ * yielding a false "tamper" on the next verify. Reject them at ingestion.
+ */
+const SAFE_SOURCE_RE = /^[^,()*\n\r]+$/;
+
+/** Reject any switchroom marker substring in caller-supplied rule content
+ *  (mirrors editYoursContent's guard): a rule that embeds the end-marker
+ *  would truncate `parseRulesBlock` and hide every rule after it. */
+function assertNoMarkers(s: string, what: string): void {
+  if (
+    s.includes(RULES_BLOCK_BEGIN) ||
+    s.includes(RULES_BLOCK_END) ||
+    s.includes(INDEX_BLOCK_BEGIN) ||
+    s.includes(INDEX_BLOCK_END)
+  ) {
+    throw new InvalidRuleError(
+      `Rule ${what} must not contain a switchroom marker comment.`,
+    );
+  }
+}
+
+/** Flatten whitespace to a single space and trim — the SAME normalization
+ *  `renderRuleLine` applies, done ONCE at ingestion so the stored text is
+ *  byte-identical to what renders and parses back (no false tamper on a
+ *  rule added with a newline or double space). */
+function flattenWhitespace(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
 function memoryDir(agentDir: string): string {
   return join(agentDir, "memory");
 }
@@ -148,6 +206,21 @@ function appendMutationRow(agentDir: string, entry: RuleMutationEntry): void {
   atomicWriteFileSync(logPath, before + line, 0o600);
 }
 
+/** The `blockHash` recorded by the mutation log's LAST row (the head of the
+ *  hash chain), or `undefined` if the log is empty/unparseable. The chain
+ *  itself is verified separately by `verifyAuditChain` before this is trusted. */
+function lastLoggedBlockHash(logText: string): string | undefined {
+  const rows = logText.split("\n").filter((l) => l.length > 0);
+  const lastRow = rows[rows.length - 1];
+  if (!lastRow) return undefined;
+  try {
+    const parsed = JSON.parse(lastRow) as { blockHash?: string };
+    return parsed.blockHash;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface VerifyIntegrityResult {
   ok: boolean;
   /** Present when the mutation log itself is internally broken. */
@@ -180,14 +253,39 @@ export function verifyIntegrity(agentDir: string): VerifyIntegrityResult {
     };
   }
 
+  // The mutation log's last recorded blockHash — the ground truth for what
+  // the block SHOULD hash to. Used both to cross-check a present block and
+  // to detect a whole-block deletion (markers gone, but the log says the
+  // last sanctioned state was a non-empty rule set).
+  const loggedHead = lastLoggedBlockHash(logText);
+  const emptyHash = computeSentinel([]).hash;
+  const blockDeletedFail = (context: string): VerifyIntegrityResult => ({
+    ok: false,
+    blockVsLogMismatch: true,
+    detail:
+      `${context} but the mutation log's last recorded hash ` +
+      `(sha256=${loggedHead}) records a non-empty rule set. The block was ` +
+      `deleted without a corresponding logged mutation.`,
+  });
+
   let fullText: string;
   try {
     fullText = readClaudeMd(agentDir);
   } catch {
+    // No CLAUDE.md at all. Genuinely dark only if the log never recorded a
+    // non-empty block; otherwise the whole file (block included) was removed.
+    if (loggedHead && loggedHead !== emptyHash) {
+      return blockDeletedFail("No CLAUDE.md present,");
+    }
     return { ok: true, detail: "No CLAUDE.md present — nothing to verify (dark)." };
   }
   const parsed = parseRulesBlock(fullText);
   if (!parsed) {
+    // Markers absent. Dark only if the log agrees the last state was empty;
+    // a logged non-empty head means the block was sed-deleted out of band.
+    if (loggedHead && loggedHead !== emptyHash) {
+      return blockDeletedFail("No rules block present,");
+    }
     return { ok: true, detail: "No rules block present — nothing to verify (dark)." };
   }
   const recomputed = computeSentinel(parsed.rules);
@@ -203,26 +301,18 @@ export function verifyIntegrity(agentDir: string): VerifyIntegrityResult {
     };
   }
 
-  // Log-head vs block cross-check: find the last row's blockHash.
-  const rows = logText.split("\n").filter((l) => l.length > 0);
-  const lastRow = rows[rows.length - 1];
-  if (lastRow) {
-    try {
-      const parsedRow = JSON.parse(lastRow) as { blockHash?: string };
-      if (parsedRow.blockHash && parsedRow.blockHash !== recomputed.hash) {
-        return {
-          ok: false,
-          blockVsLogMismatch: true,
-          detail:
-            `Rules block hash (sha256=${recomputed.hash}) does not match the ` +
-            `mutation log's last recorded hash (sha256=${parsedRow.blockHash}). ` +
-            `The block was edited outside the memory rule tool without a ` +
-            `corresponding logged mutation.`,
-        };
-      }
-    } catch {
-      /* row already flagged by chainResult above if malformed */
-    }
+  // Log-head vs block cross-check: the last row's blockHash must match the
+  // recomputed on-disk block hash.
+  if (loggedHead && loggedHead !== recomputed.hash) {
+    return {
+      ok: false,
+      blockVsLogMismatch: true,
+      detail:
+        `Rules block hash (sha256=${recomputed.hash}) does not match the ` +
+        `mutation log's last recorded hash (sha256=${loggedHead}). ` +
+        `The block was edited outside the memory rule tool without a ` +
+        `corresponding logged mutation.`,
+    };
   }
 
   return { ok: true, detail: "Rules block sentinel and mutation log agree." };
@@ -300,11 +390,28 @@ export interface CreateRuleOptions {
  *  budget overflow (T4: file byte-identical, no log row). */
 export function createRule(agentDir: string, opts: CreateRuleOptions): CreateRuleResult {
   const now = opts.now ?? (() => new Date().toISOString());
+
+  // Normalize + validate ONCE at ingestion (before any IO), so stored ==
+  // rendered == parsed and no illegal char can survive to a false tamper.
+  assertNoMarkers(opts.text, "text");
+  assertNoMarkers(opts.source, "source");
+  const text = flattenWhitespace(opts.text);
+  const source = flattenWhitespace(opts.source);
+  if (text.length === 0) {
+    throw new InvalidRuleError("Rule text must not be empty.");
+  }
+  if (!SAFE_SOURCE_RE.test(source)) {
+    throw new InvalidRuleError(
+      "Rule source contains characters that would break the rules block " +
+        "format — avoid a comma, parentheses, and `*`.",
+    );
+  }
+
   const full = readClaudeMd(agentDir);
   const { yours } = extractYours(full);
   const existing = parseRulesBlock(yours)?.rules ?? [];
 
-  const contradiction = checkContradiction(opts.text, existing);
+  const contradiction = checkContradiction(text, existing);
 
   let active = existing;
   if (opts.supersedes) {
@@ -313,25 +420,30 @@ export function createRule(agentDir: string, opts: CreateRuleOptions): CreateRul
 
   const rule: Rule = {
     id: nextRuleId(active),
-    text: opts.text,
-    source: opts.source,
+    text,
+    source,
     created_at: now(),
   };
   const nextRules = [...active, rule];
+
+  // Budget + file write FIRST — writeBlocksAndLog throws BudgetExceededError
+  // before touching disk. Archiving the superseded rule only AFTER that
+  // succeeds (MEDIUM fix): an over-budget `--supersedes` add must not leave a
+  // "retired" archive entry orphaned while the rule stays active with no log
+  // row. On the happy path this is one logical mutation, one file write.
+  writeBlocksAndLog(agentDir, nextRules, {
+    id: rule.id,
+    action: "create",
+    actor: opts.actor,
+    source,
+    ts: rule.created_at,
+  });
 
   if (opts.supersedes) {
     // Archive the superseded rule as part of the same logical mutation.
     const superseded = existing.find((r) => r.id === opts.supersedes);
     if (superseded) appendArchiveEntry(agentDir, superseded, now(), rule.id);
   }
-
-  writeBlocksAndLog(agentDir, nextRules, {
-    id: rule.id,
-    action: "create",
-    actor: opts.actor,
-    source: opts.source,
-    ts: rule.created_at,
-  });
 
   return { rule, possibleDuplicateOf: contradiction.duplicateOf };
 }
