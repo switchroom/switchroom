@@ -923,40 +923,64 @@ function unknownArgMessage(
 
 /**
  * Forwarded tools whose caller-supplied `bank_id` is bank-scope-guarded to
- * the caller's own bank (M6/E-86 red-team §1 — the "TOP FINDING").
+ * the caller's own bank (M6/E-86 red-team §1 — the "TOP FINDING", widened by
+ * red-team Major 2).
  *
- * `recall` and `get_mental_model` both declare `bank_id` as an accepted
- * OPTIONAL argument that the engine honors verbatim with no grant
- * validation of its own — fleet bank names are effectively the agent names
- * (`klanker`, `overlord`, `marko`, …), low-entropy and guessable, so an
- * attacker-steered caller (a prompt injection landing in a worker sub-agent,
- * say) could pass `bank_id: "overlord"` and read another agent's memory
- * wholesale. Read-only does not contain that: the caller can still write
- * what it read into its handback, a file, or an outbound request. These are
- * exactly the two forwarded, bank_id-accepting tools M6 grants to workers
- * (the other three read tools — `get_knowledge_tree`, `get_knowledge_page`,
- * `search_knowledge_pages` — are shim-SYNTHESIZED and already have no
- * `bank_id` property at all, see {@link SYNTHESIZED_TOOL_TABLE}).
+ * Every `FALLBACK_TOOL_TABLE` tool that (a) is READ-ONLY against the engine
+ * and (b) declares `bank_id` as an accepted argument that the engine honors
+ * verbatim with no grant validation of its own is listed here. Fleet bank
+ * names are effectively the agent names (`klanker`, `overlord`, `marko`,
+ * …), low-entropy and guessable, so an attacker-steered caller (a
+ * prompt-injected main agent, or a prompt injection landing in a worker
+ * sub-agent) could pass `bank_id: "overlord"` to any of these and read
+ * another agent's memory wholesale — `reflect(bank_id:"overlord")` or
+ * `list_memories(bank_id:"overlord", q:"credentials")` are just as much an
+ * exfil path as `recall`. Read-only does not contain that: the caller can
+ * still write what it read into its handback, a file, or an outbound
+ * request.
  *
- * DELIBERATELY NOT every bank_id-accepting table tool: `retain` also
- * accepts `bank_id`, and the fleet's own memory guidance
- * (`MEMORY_GUIDANCE` in `src/agents/scaffold.ts`) has a real, current,
- * documented cross-bank use of it — routing durable repo knowledge to a
- * shared bank with
+ * The guarded set, audited against the full `FALLBACK_TOOL_TABLE` surface:
+ *   `recall`, `reflect`, `get_mental_model`, `get_memory`, `list_memories`,
+ *   `list_directives`, `get_bank`, `get_bank_stats`, `get_document`,
+ *   `get_operation`, `list_documents`, `list_mental_models`,
+ *   `list_operations`, `list_tags`.
+ * (The three knowledge-base read tools — `get_knowledge_tree`,
+ * `get_knowledge_page`, `search_knowledge_pages` — are shim-SYNTHESIZED and
+ * already have no `bank_id` property at all, see
+ * {@link SYNTHESIZED_TOOL_TABLE}. `list_banks` takes no arguments at all.)
+ *
+ * DELIBERATELY NOT every bank_id-accepting table tool: WRITE/mutating tools
+ * (`retain`, `sync_retain`, `create_directive`, `create_bank`,
+ * `create_mental_model`, `delete_bank`, `delete_directive`,
+ * `delete_document`, `delete_mental_model`, `clear_memories`,
+ * `clear_mental_model`, `update_bank`, `update_memory`,
+ * `update_mental_model`, `refresh_mental_model`, `invalidate_memory`,
+ * `cancel_operation`) are excluded from this guard. `retain` in particular
+ * has a real, current, documented cross-bank use — the fleet's own memory
+ * guidance (`MEMORY_GUIDANCE` in `src/agents/scaffold.ts`) routes durable
+ * repo knowledge to a shared bank with
  * `mcp__hindsight__retain(..., bank_id="switchroom-dev", ...)`. Guarding
- * `retain` too would break that legitimate flow for every main agent that
- * uses it; nothing in the codebase or fleet prompts shows an equivalent
- * legitimate explicit `bank_id` on `recall`/`reflect`/`get_mental_model`
- * (the shared bank's READ side is reached via the separate
- * `memory.recall.additional_banks` / `additional_bank_filters` auto-recall
- * config, not a caller-supplied MCP argument — see
- * `src/setup/hindsight-recall-passthrough.ts`). `reflect` is left
- * unguarded for the same reason — it is not in the worker's tool grant and
- * carries no found legitimate explicit-bank_id use either way, but keeping
- * the guard's blast radius exactly at the two tools this PR actually widens
- * worker reach to is the more conservative, auditable scope.
+ * writes too would break that legitimate flow; closing the write-side
+ * exfil/tamper class needs a real allowlist (e.g. `{own, switchroom-dev}`)
+ * rather than this tool's own-bank-only rule, and is tracked as a separate
+ * follow-up rather than folded in here.
  */
-export const BANK_SCOPE_GUARDED_TOOLS = new Set(["recall", "get_mental_model"]);
+export const BANK_SCOPE_GUARDED_TOOLS = new Set([
+  "recall",
+  "reflect",
+  "get_mental_model",
+  "get_memory",
+  "list_memories",
+  "list_directives",
+  "get_bank",
+  "get_bank_stats",
+  "get_document",
+  "get_operation",
+  "list_documents",
+  "list_mental_models",
+  "list_operations",
+  "list_tags",
+]);
 
 /**
  * Reject a caller-supplied `bank_id` that does not match the shim's own
@@ -1018,10 +1042,14 @@ export function guardBankScope(
  *     drop. Tools not in the table are passed through unvalidated (no ground
  *     truth to validate against).
  *  2. BANK-SCOPE GUARD — for the tools in {@link BANK_SCOPE_GUARDED_TOOLS}
- *     (`recall`, `get_mental_model`), reject a caller-supplied `bank_id`
+ *     (every read-only table tool that accepts `bank_id`: `recall`,
+ *     `reflect`, `get_mental_model`, `get_memory`, `list_memories`,
+ *     `list_directives`, `get_bank`, `get_bank_stats`, `get_document`,
+ *     `get_operation`, `list_documents`, `list_mental_models`,
+ *     `list_operations`, `list_tags`), reject a caller-supplied `bank_id`
  *     that is not the caller's own bank. See {@link guardBankScope} for why
- *     this is deliberately narrower than "every table tool that accepts
- *     bank_id" (`retain`'s cross-bank write is a real, legitimate case).
+ *     this excludes WRITE tools (`retain`'s cross-bank write is a real,
+ *     legitimate case).
  *  3. DEFAULT BUDGET CLAMP — for `recall`/`reflect` only, inject
  *     max_tokens (env-tunable) + budget (env-tunable; recall low, reflect
  *     mid) when the caller OMITS them. Explicit caller values ALWAYS win (a
@@ -1063,11 +1091,11 @@ export function guardAndClampToolCall(
   }
 
   {
-    // guardBankScope itself narrows to BANK_SCOPE_GUARDED_TOOLS (recall,
-    // get_mental_model) — calling it unconditionally here (rather than
-    // re-testing `allowed.has("bank_id")`) keeps the single source of
-    // truth for "which tools are bank-scope-guarded" inside the function,
-    // not duplicated at each call site.
+    // guardBankScope itself narrows to BANK_SCOPE_GUARDED_TOOLS (the
+    // read-only bank_id-accepting tools) — calling it unconditionally here
+    // (rather than re-testing `allowed.has("bank_id")`) keeps the single
+    // source of truth for "which tools are bank-scope-guarded" inside the
+    // function, not duplicated at each call site.
     const scoped = guardBankScope(name, args, ownBankId);
     if (!scoped.ok) return scoped;
   }

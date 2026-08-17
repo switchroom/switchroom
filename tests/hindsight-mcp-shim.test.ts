@@ -29,6 +29,7 @@ import {
   coerceSynthesizedArg,
   guardAndClampToolCall,
   guardBankScope,
+  BANK_SCOPE_GUARDED_TOOLS,
   DEFAULT_RECALL_MAX_TOKENS,
   DEFAULT_RECALL_BUDGET,
   DEFAULT_REFLECT_BUDGET,
@@ -914,6 +915,117 @@ describe("guardBankScope / bank-scope enforcement in guardAndClampToolCall", () 
     if (!res.ok) throw new Error("unexpected rejection of legitimate cross-bank retain");
     const args = (res.params as { arguments: Record<string, unknown> }).arguments;
     expect(args.bank_id).toBe("switchroom-dev"); // untouched, not coerced to "klanker"
+  });
+});
+
+// ─── Major 2 — the guard widened to the whole read-tool surface ───────────
+//
+// recall/get_mental_model were never the only forwarded, bank_id-accepting
+// tools reachable by a prompt-injected caller. `reflect(bank_id:"overlord")`
+// or `list_memories(bank_id:"overlord", q:"credentials")` are just as much
+// an exfil path — main agents (unlike the M6 worker grant) can reach the
+// full FALLBACK_TOOL_TABLE surface. Every READ tool that accepts bank_id
+// must be guarded; only WRITE tools (retain, create_directive, …) are
+// deliberately left open, per a real cross-bank write pattern.
+describe("guardBankScope — Major 2: every read-only bank_id-accepting tool is guarded", () => {
+  // [tool name, minimal valid required-args (sans bank_id)] — mirrors each
+  // tool's required-arg tuple in FALLBACK_TOOL_TABLE so a call with a
+  // correct bank_id is otherwise well-formed and would succeed but for the
+  // guard.
+  const guardedReadTools: [string, Record<string, unknown>][] = [
+    ["recall", { query: "x" }],
+    ["reflect", { query: "x" }],
+    ["get_mental_model", { mental_model_id: "mm-1" }],
+    ["get_memory", { memory_id: "mem-1" }],
+    ["list_memories", {}],
+    ["list_directives", {}],
+    ["get_bank", {}],
+    ["get_bank_stats", {}],
+    ["get_document", { document_id: "doc-1" }],
+    ["get_operation", { operation_id: "op-1" }],
+    ["list_documents", {}],
+    ["list_mental_models", {}],
+    ["list_operations", {}],
+    ["list_tags", {}],
+  ];
+
+  it("BANK_SCOPE_GUARDED_TOOLS is exactly this set (no drift either direction)", () => {
+    const expected = new Set(guardedReadTools.map(([name]) => name));
+    expect(BANK_SCOPE_GUARDED_TOOLS).toEqual(expected);
+  });
+
+  it.each(guardedReadTools)(
+    "rejects %s targeting a foreign bank_id",
+    (name, baseArgs) => {
+      const res = guardAndClampToolCall(
+        { name, arguments: { ...baseArgs, bank_id: "overlord" } },
+        {},
+        "klanker",
+      );
+      expect(res.ok).toBe(false);
+      if (res.ok) throw new Error(`expected ${name} to reject a foreign bank_id`);
+      expect(res.text).toContain("overlord");
+      expect(res.text).toContain("klanker");
+    },
+  );
+
+  it.each(guardedReadTools)(
+    "allows %s with bank_id equal to the caller's own bank",
+    (name, baseArgs) => {
+      const res = guardAndClampToolCall(
+        { name, arguments: { ...baseArgs, bank_id: "klanker" } },
+        {},
+        "klanker",
+      );
+      expect(res.ok).toBe(true);
+      if (!res.ok) throw new Error(`unexpected rejection of ${name} own-bank call`);
+    },
+  );
+
+  it.each(guardedReadTools)(
+    "allows %s with bank_id omitted (defaults to own bank)",
+    (name, baseArgs) => {
+      const res = guardAndClampToolCall(
+        { name, arguments: { ...baseArgs } },
+        {},
+        "klanker",
+      );
+      expect(res.ok).toBe(true);
+      if (!res.ok) throw new Error(`unexpected rejection of ${name} with bank_id omitted`);
+    },
+  );
+
+  it("every FALLBACK_TOOL_TABLE READ tool accepting bank_id is in the guarded set " +
+    "(nothing new slips through unguarded)", () => {
+    // WRITE/mutating verbs are the deliberate carve-out (see
+    // BANK_SCOPE_GUARDED_TOOLS's doc comment) — they must NOT be guarded.
+    const writeTools = new Set([
+      "cancel_operation",
+      "clear_memories",
+      "clear_mental_model",
+      "create_bank",
+      "create_directive",
+      "create_mental_model",
+      "delete_bank",
+      "delete_directive",
+      "delete_document",
+      "delete_mental_model",
+      "invalidate_memory",
+      "refresh_mental_model",
+      "retain",
+      "sync_retain",
+      "update_bank",
+      "update_memory",
+      "update_mental_model",
+    ]);
+    for (const [name, [, optional]] of Object.entries(FALLBACK_TOOL_TABLE)) {
+      if (!optional.includes("bank_id")) continue;
+      if (writeTools.has(name)) {
+        expect(BANK_SCOPE_GUARDED_TOOLS.has(name)).toBe(false);
+        continue;
+      }
+      expect(BANK_SCOPE_GUARDED_TOOLS.has(name)).toBe(true);
+    }
   });
 });
 
