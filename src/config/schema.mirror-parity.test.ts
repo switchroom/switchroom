@@ -78,6 +78,15 @@ const INTENTIONAL_MEMORY_MIRROR_EXCLUSIONS = new Set<string>([
   // defaults-tier value would silently multiply token spend across every agent.
   // See AgentMemorySchema.orientation_reinject_turns.
   "orientation_reinject_turns",
+  // Per-agent ONLY by design (Memory v2 M3 Surface-A directive-injection
+  // switch): flipping directive injection OFF is a deliberate per-agent M3
+  // rollout step, never fleet-seeded from the defaults/profile tier. Excluding
+  // it from the profile mirror is both correct AND a darkness safeguard — a
+  // defaults-tier value could otherwise suppress `<active_directives>` across
+  // the whole fleet at once (a mass-memoryless event if any agent's rules
+  // block were empty). If this exclusion is ever removed, mirror the field AND
+  // drop it from this set. See AgentMemorySchema.inject_directives.
+  "inject_directives",
 ]);
 
 describe("profileFields mirror ↔ per-agent schema parity (class-killer)", () => {

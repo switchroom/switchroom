@@ -689,6 +689,33 @@ export const AgentMemorySchema = z
         "unlike `orientation`/`_reinject_turns` it IS accepted at the " +
         "defaults/profile tier."
       ),
+    inject_directives: z
+      .boolean()
+      .optional()
+      .describe(
+        "Memory v2 M3 Surface-A directive-injection switch (default TRUE — " +
+        "on-by-default via the plugin settings.json stamp + config.py " +
+        "DEFAULTS). When left unset the agent keeps injecting the " +
+        "`<active_directives>` block on every turn, byte-identical to pre-M3. " +
+        "Set FALSE to SUPPRESS that injection for this agent — its standing " +
+        "rules are then served from the live rules block (memory.rules_block) " +
+        "instead of re-injected directives, which is the change that collapses " +
+        "the always-on directive-token spend (E-41). The suppression is " +
+        "fail-safe and re-checked every turn in recall.py: it fires ONLY when " +
+        "a non-empty rules block is physically present in the agent's " +
+        "CLAUDE.md — a false flag with an empty/absent block keeps injecting " +
+        "AND emits a degraded-canary notice, so a zero-standing-rules turn is " +
+        "unreachable. Requires memory.rules_block=true first (the block must " +
+        "be live before injection is turned off — enforce the ordering with " +
+        "`switchroom memory flip`, never a bare flag flip). Coordinates with " +
+        "M4's memory.recall prefetch (memoryPrefetchEnabled): the same guard " +
+        "gates all three recall.py emit sites so a flipped agent leaks no " +
+        "directive on a cache/prefetch hit. Cascade: override, per-agent ONLY " +
+        "(never fleet-seeded from the defaults/profile tier — each flip is a " +
+        "deliberate staggered M3 rollout step, same darkness safeguard as " +
+        "rules_block). Default-true is the fail-safe direction under the " +
+        "Zod-strip footgun: a stripped/misread key keeps the agent injecting."
+      ),
     disposition: z
       .object({
         skepticism: z

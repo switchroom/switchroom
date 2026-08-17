@@ -30,7 +30,7 @@
  */
 
 import { getJson, type FetchOpts } from "../memory/bank-health.js";
-import { parseIndexBlock } from "../memory/rules-block.js";
+import { parseIndexBlock, parseRulesBlock } from "../memory/rules-block.js";
 import { verifyIntegrity } from "../memory/rules-store.js";
 import { resolveAgentConfig } from "../config/merge.js";
 import { resolveAgentsDir } from "../config/loader.js";
@@ -82,6 +82,88 @@ function readClaudeMdSafe(
   } catch {
     return null;
   }
+}
+
+/**
+ * Memory v2 M3 (Surface-A) suppress-flag cross-check — synchronous, no network.
+ *
+ * An agent flipped to `memory.inject_directives: false` has its
+ * `<active_directives>` recall block SUPPRESSED by `recall.py`'s guard — but
+ * ONLY when a non-empty rules block physically carries the migrated guardrails.
+ * If the flip is on while CLAUDE.md has no (or an empty) rules block, the
+ * Python guard fails SAFE at runtime (keeps injecting + emits a degraded-canary
+ * notice), but that is a misconfiguration the operator must fix, not a healthy
+ * steady state. This check surfaces it as a FAIL so `switchroom doctor` catches
+ * a mis-sequenced flip fleet-wide.
+ *
+ * FAIL conditions for an `inject_directives === false` agent:
+ *   - `memory.rules_block` is not also true (two-flag ordering violated), or
+ *   - CLAUDE.md is unreadable / has no rules block / the block has zero rules.
+ * Otherwise ok. Agents that are NOT flipped produce no rows.
+ */
+export function runDirectiveFlipChecks(
+  config: SwitchroomConfig,
+  deps: RulesBlockCheckDeps = {},
+): CheckResult[] {
+  const readFileFn = deps.readFileFn ?? ((p: string) => readFileSync(p, "utf-8"));
+  let agentsDir = deps.agentsDir;
+  if (agentsDir === undefined) {
+    try {
+      agentsDir = resolveAgentsDir(config);
+    } catch {
+      agentsDir = undefined;
+    }
+  }
+
+  const results: CheckResult[] = [];
+  for (const [agentName, agentConfig] of Object.entries(config.agents)) {
+    const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+    if (resolved.memory?.inject_directives !== false) continue; // not flipped
+
+    const name = `agent ${agentName} directive flip (inject_directives=false)`;
+
+    if (resolved.memory?.rules_block !== true) {
+      results.push({
+        name,
+        status: "fail",
+        detail:
+          "inject_directives is false but memory.rules_block is not true — the " +
+          "rules block that must carry the migrated directives is not even " +
+          "enabled. recall.py fails safe (keeps injecting), but fix the config: " +
+          "enable rules_block and migrate, or re-enable inject_directives.",
+        fix: `Set memory.rules_block: true for ${agentName} (and migrate its directives) before flipping.`,
+      });
+      continue;
+    }
+
+    const claudeMd = readClaudeMdSafe(agentsDir, agentName, readFileFn);
+    const parsed = claudeMd ? parseRulesBlock(claudeMd) : null;
+    const ruleCount = parsed?.rules.length ?? 0;
+
+    if (ruleCount === 0) {
+      results.push({
+        name,
+        status: "fail",
+        detail:
+          claudeMd === null
+            ? "inject_directives is false but the agent's CLAUDE.md could not be " +
+              "read to confirm a rules block carries the migrated directives."
+            : "inject_directives is false but the CLAUDE.md rules block is empty " +
+              "(no `- **R-…` rule lines). Every directive would be suppressed with " +
+              "nothing carrying its guarantee. recall.py fails safe at runtime, but " +
+              "fix the config: migrate the directives into the rules block, or " +
+              "re-enable inject_directives.",
+        fix: `Migrate ${agentName}'s directives into the rules block (memory rule add) or re-enable inject_directives.`,
+      });
+    } else {
+      results.push({
+        name,
+        status: "ok",
+        detail: `flipped, and the rules block carries ${ruleCount} rule(s) — directive injection safely suppressed.`,
+      });
+    }
+  }
+  return results;
 }
 
 export async function runRulesBlockChecks(

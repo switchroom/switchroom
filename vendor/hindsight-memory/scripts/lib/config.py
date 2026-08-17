@@ -130,6 +130,20 @@ DEFAULTS = {
     # opt out per-agent via memory.profile_capture_nudge=false →
     # HINDSIGHT_PROFILE_CAPTURE_NUDGE.
     "profileCaptureNudge": True,
+    # Switchroom Memory v2 M3 Surface-A — directive-injection switch. When True
+    # (default), recall.py injects the `<active_directives>` block on every
+    # UserPromptSubmit at all three emit sites (main + prefetch/cache fast
+    # paths). When False (a flipped M3 canary), that injection is SUPPRESSED —
+    # the agent's standing rules come from the live rules block instead, which
+    # is the change that collapses the always-on directive-token spend (E-41).
+    # Suppression is fail-safe and re-checked every turn: it fires ONLY when a
+    # non-empty rules block is physically present in CLAUDE.md; a False flag
+    # with an empty/absent block keeps injecting AND emits a degraded-canary
+    # notice, so a zero-standing-rules turn is unreachable. Operators flip a
+    # canary per-agent via memory.inject_directives=false →
+    # HINDSIGHT_INJECT_DIRECTIVES; the ordered flip (rules_block live → migrate
+    # → this flag off) is enforced by `switchroom memory flip`.
+    "injectDirectives": True,
     # Switchroom #2873/#2903 Fix 6.2 — the BLOCKING half (Stage C
     # directive_verify.py Stop hook) split out from the advisory nudge. When
     # True (default) the verifier may block the stop once to re-prompt capture;
@@ -527,6 +541,13 @@ ENV_OVERRIDES = {
     # it; the switchroom default is on (settings.json pins true; recall.py falls
     # back to True).
     "HINDSIGHT_PROFILE_CAPTURE_NUDGE": ("profileCaptureNudge", bool),
+    # Switchroom Memory v2 M3 Surface-A: directive-injection switch on/off. Set
+    # by start.sh from agents.<name>.memory.inject_directives only when the
+    # operator overrode it; the switchroom default is on (settings.json pins
+    # true; recall.py falls back to True). False SUPPRESSES the
+    # <active_directives> injection for a flipped canary, fail-safe on a live
+    # rules block (see recall.py directive_injection_decision).
+    "HINDSIGHT_INJECT_DIRECTIVES": ("injectDirectives", bool),
     # Switchroom #2873/#2903 Fix 6.2: the Stage C block on/off, independent of
     # the Stage B nudge. Set by start.sh from
     # agents.<name>.memory.directive_capture_verify only when the operator

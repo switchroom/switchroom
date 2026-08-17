@@ -1198,6 +1198,17 @@ export HINDSIGHT_DIRECTIVE_CAPTURE_NUDGE={{hindsightDirectiveCaptureNudge}}
 {{#if hindsightProfileCaptureNudge}}
 export HINDSIGHT_PROFILE_CAPTURE_NUDGE={{hindsightProfileCaptureNudge}}
 {{/if}}
+# Memory v2 M3 Surface-A — directive-injection switch (memory.inject_directives
+# cascade). On by default (plugin settings.json): recall.py injects the
+# <active_directives> block every turn. Export only when the operator overrode
+# it; set false to SUPPRESS injection for this agent (a flipped M3 canary) — its
+# standing rules then come from the live rules block instead. recall.py keeps
+# the suppression fail-safe: it drops injection ONLY when a non-empty rules
+# block is physically present in CLAUDE.md, else it keeps injecting and emits a
+# degraded-canary notice. Flip via `switchroom memory flip`, never a bare edit.
+{{#if hindsightInjectDirectives}}
+export HINDSIGHT_INJECT_DIRECTIVES={{hindsightInjectDirectives}}
+{{/if}}
 # Per-row observation scope (memory.observation_scopes cascade). Stamped on
 # every retain — Stop hook, sidechain, boot reconcile, queue drain, backfill.
 # "shared" makes consolidation pool this agent's observations into ONE global

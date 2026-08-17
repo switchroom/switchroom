@@ -4164,6 +4164,20 @@ function renderHindsightSettingsOverrides(
   // (exported as HINDSIGHT_PROFILE_CAPTURE_NUDGE only when overridden; the env
   // value wins over this settings.json default).
   settings.profileCaptureNudge = true;
+  // Memory v2 M3 Surface-A — directive-injection switch ON by default. This is
+  // the on-by-default value for every agent on every install; recall.py reads
+  // config.get("injectDirectives", True) and injects the <active_directives>
+  // block. An operator flips a canary OFF per-agent via
+  // memory.inject_directives=false, exported as HINDSIGHT_INJECT_DIRECTIVES
+  // only when overridden (start.sh.hbs) — the env value wins over this
+  // settings.json default. Suppression is guarded: recall.py drops injection
+  // only when a non-empty rules block is physically present (fail-safe), so an
+  // agent flipped without a live block keeps injecting + emits a canary. The
+  // ordered flip (rules_block live → migrate → this flag off) is enforced by
+  // `switchroom memory flip`. Coordinates with M4's memoryPrefetchEnabled: the
+  // same guard gates the prefetch/cache emit sites so a flipped agent leaks no
+  // directive on a cache hit.
+  settings.injectDirectives = true;
   // hindsight-leverage PR5 — recall-side weight for sidechain (sub-agent)
   // memories. The paired SubagentStop retain (vendor .../subagent_retain.py)
   // tags delegated worker process-facts `sidechain`; this down-weights their
@@ -4409,6 +4423,10 @@ interface BuildWorkspaceContextArgs {
   // RFC P3 — operator-profile capture nudge opt-out. Stringified bool,
   // undefined unless the operator overrode the switchroom default (on).
   hindsightProfileCaptureNudge?: string;
+  // Memory v2 M3 Surface-A — directive-injection switch. Stringified bool,
+  // undefined unless the operator overrode the switchroom default (on).
+  // Exported as HINDSIGHT_INJECT_DIRECTIVES only when set (start.sh.hbs).
+  hindsightInjectDirectives?: string;
   // Per-row observation scope. undefined unless the operator set
   // memory.observation_scopes; exported only when set.
   hindsightObservationScopes?: string;
@@ -4465,6 +4483,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
     hindsightProfileCaptureNudge,
+    hindsightInjectDirectives,
     hindsightObservationScopes,
     hindsightObservationScopeStrategy,
     hindsightTopicAliasesJson,
@@ -4572,6 +4591,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
     hindsightProfileCaptureNudge,
+    hindsightInjectDirectives,
     hindsightObservationScopesQ: hindsightObservationScopes
       ? shellSingleQuote(hindsightObservationScopes)
       : undefined,
@@ -5617,6 +5637,17 @@ export function scaffoldAgent(
     agentConfig.memory?.profile_capture_nudge === undefined
       ? undefined
       : String(agentConfig.memory.profile_capture_nudge);
+  // Memory v2 M3 Surface-A — directive-injection switch cascade. undefined
+  // unless the operator overrode the switchroom default (on). Exported as
+  // HINDSIGHT_INJECT_DIRECTIVES only when set (see start.sh.hbs), so an unset
+  // value leaves the on-by-default settings.json stamp in force. Top-level
+  // memory.* knob (per-agent ONLY, never fleet-seeded): set false to SUPPRESS
+  // the <active_directives> injection for a flipped canary — recall.py still
+  // fail-safes to injection when no live rules block is present.
+  const hindsightInjectDirectives =
+    agentConfig.memory?.inject_directives === undefined
+      ? undefined
+      : String(agentConfig.memory.inject_directives);
   // Per-row observation scope (memory.observation_scopes cascade). undefined
   // unless the operator set it — exported only when set (see start.sh.hbs), so
   // the default retain body never carries the field and the engine default
@@ -5696,6 +5727,7 @@ export function scaffoldAgent(
     hindsightRecallSkipTrivial,
     hindsightDirectiveCaptureNudge,
     hindsightProfileCaptureNudge,
+    hindsightInjectDirectives,
     hindsightObservationScopes,
     hindsightObservationScopeStrategy,
     hindsightTopicAliasesJson,
@@ -8346,6 +8378,17 @@ function reconcileAgentInner(
     agentConfig.memory?.profile_capture_nudge === undefined
       ? undefined
       : String(agentConfig.memory.profile_capture_nudge);
+  // Memory v2 M3 Surface-A — directive-injection switch cascade. undefined
+  // unless the operator overrode the switchroom default (on). Exported as
+  // HINDSIGHT_INJECT_DIRECTIVES only when set (see start.sh.hbs), so an unset
+  // value leaves the on-by-default settings.json stamp in force. Top-level
+  // memory.* knob (per-agent ONLY, never fleet-seeded): set false to SUPPRESS
+  // the <active_directives> injection for a flipped canary — recall.py still
+  // fail-safes to injection when no live rules block is present.
+  const hindsightInjectDirectives =
+    agentConfig.memory?.inject_directives === undefined
+      ? undefined
+      : String(agentConfig.memory.inject_directives);
   // Per-row observation scope (memory.observation_scopes cascade). undefined
   // unless the operator set it — exported only when set (see start.sh.hbs), so
   // the default retain body never carries the field and the engine default
@@ -8457,6 +8500,7 @@ function reconcileAgentInner(
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
       hindsightProfileCaptureNudge,
+      hindsightInjectDirectives,
       hindsightObservationScopesQ: hindsightObservationScopes
         ? shellSingleQuote(hindsightObservationScopes)
         : undefined,
@@ -9289,6 +9333,7 @@ function reconcileAgentInner(
       hindsightRecallSkipTrivial,
       hindsightDirectiveCaptureNudge,
       hindsightProfileCaptureNudge,
+      hindsightInjectDirectives,
       hindsightObservationScopes,
       hindsightObservationScopeStrategy,
       hindsightTopicAliasesJson,
