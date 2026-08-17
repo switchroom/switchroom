@@ -98,9 +98,20 @@ jobs:
       - name: Validate recall query set
         run: python3 evals/recall/validate_queryset.py
 
+      # ── Decisive-relative-gap regression set (RFC memory-redesign P11) ──
+      # Guards the ranking rule HINDSIGHT_CE_DECISIVE_RELATIVE_GAP controls. The
+      # fixture lint cross-checks every expected top against the faithful ranker,
+      # and the self-check proves that lint can fail. Zero model cost, fork-safe.
+      - name: Decisive-gap fixture lint self-check (must fire)
+        run: python3 evals/recall/decisive_gap/validate_fixtures.py --selftest
+
+      - name: Validate decisive-gap fixture set
+        run: python3 evals/recall/decisive_gap/validate_fixtures.py
+
       - name: Recall-quality scorer unit tests
         # Includes the non-vacuity proof (#4479 AC1): an ablated run must score
-        # worse and drive the regression gate red, asserted offline.
+        # worse and drive the regression gate red, asserted offline. Discovery
+        # also picks up the decisive-gap (P11) tests under decisive_gap/.
         run: python3 -m unittest discover -s evals/recall -p 'test_*.py' -t .
 
   # ─── Trigger routing eval ────────────────────────────────────────

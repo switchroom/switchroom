@@ -1,0 +1,224 @@
+# Decisive-relative-gap ranking regression set — version 1
+#
+# RFC memory-redesign item P11 (`HINDSIGHT_CE_DECISIVE_RELATIVE_GAP`). See
+# ../README.md for the mechanic, the threshold provenance, and how to add a case.
+# Rules that bind every entry:
+#
+#   1. NO REAL USER OR BANK TEXT. This repo is public; the banks are a live
+#      operator's private memory. Every `text` below is authored flavour, present
+#      only to make a case legible. The ASSERTION is on the candidate scores and
+#      the expected top id, never on the wording.
+#   2. Each candidate is reduced to the fields the gap decision actually consumes:
+#      `ce` (cross_encoder_score_normalized, [0,1]) and the three boost SIGNALS
+#      `recency` / `temporal` / `proof` in [0,1], each feeding `1 + alpha*(s-0.5)`.
+#      Upstream decay curves that map age/proof_count onto those signals are out
+#      of scope (RFC constraint 1) and deliberately not modelled here.
+#   3. `gap` is the per-case value of HINDSIGHT_CE_DECISIVE_RELATIVE_GAP. It is
+#      explicit on every case so the set is reproducible regardless of the host
+#      env, and so the eventual implementer can sweep it. The shipped default is
+#      0.02 (docker/Dockerfile.hindsight:343).
+
+schema_version: 1
+fixtureset_version: "v1"
+fixtureset_id: p11-decisive-gap-v1
+
+provenance:
+  method: authored-derived
+  derives_from:
+    # The ranking function under regression is the switchroom CE-saturation
+    # patch baked into the pinned Hindsight image. These anchors are what the
+    # expected outcomes are computed against; ../ranker.py reproduces them and
+    # ../test_decisive_gap.py cross-checks that reproduction against the
+    # constants the docker probe pins on the *baked* code.
+    ranker_patch: docker/Dockerfile.hindsight (CE-saturation patch, ~L324-436)
+    boost_authority: docker/Dockerfile.hindsight ~L400
+    damped_combined_score: docker/Dockerfile.hindsight ~L435
+    docker_probe: tests/docker/hindsight-search-patches.test.ts (SATURATED_ORDER, GAP_*)
+    rfc_item: workspace/memory-redesign/phase4-rfc.md:789 (P11), :807 (§6.1), :46 (constraint 4)
+  production_alphas: [0.2, 0.2, 0.1]   # recency, temporal, proof_count
+  default_gap: 0.02                     # HINDSIGHT_CE_DECISIVE_RELATIVE_GAP unset
+  clamp_threshold: 0.6510721247563356   # gap >= this clamps k->1.0 = upstream
+  notes: >-
+    The knob is a ranking-damping knob, NOT an abstain/"no confident answer"
+    gate. There is no abstention anywhere in the engine or shim and P11 adds
+    none, so this set has no `abstain` class. "Decisive" means the cross-encoder
+    ordering is preserved; "bunched" means the CE scores are close enough that
+    the boosts decide, and recency wins there (constraint 4). The `1+gap` band is
+    a WORST-CASE guarantee (all three boosts maxed in opposition); the gap at
+    which a specific pair actually flips is tighter and depends on which signals
+    differ — see the bnd-* cases.
+
+classes:
+  decisive: >-
+    One candidate's CE score leads by more than the worst-case boost span, so the
+    CE order holds no matter how the boosts fall. Expect the high-CE candidate.
+  bunched: >-
+    CE scores are close enough that the present boost differential decides.
+    Recency has the most authority (alpha 0.2), so the fresher memory wins —
+    constraint 4. Expect the fresher candidate, not the higher-CE or higher-proof
+    one.
+  boundary: >-
+    Straddles a flip point. Includes the worst-case `1+gap` band edge and the
+    pair-specific gap at which the canonical fresh-CE vs old-proof pair flips as
+    the operator widens the knob.
+  rollback: >-
+    Gap widened to/above the ~0.651 clamp threshold. k clamps to 1.0, i.e.
+    byte-for-byte upstream scoring with the patch inert. The undamped boosts
+    decide again and the old, heavily-proven memory outranks the fresher one —
+    the pre-patch defect, reproduced as the documented rollback path.
+
+cases:
+  # ── decisive: CE lead survives any boost configuration ───────────
+  - id: dg-dec-001
+    cls: decisive
+    text: "which database are we using for the memory backend"
+    gap: 0.02
+    candidates:
+      - {id: A_highce,  ce: 0.95, recency: 0.1, temporal: 0.1, proof: 0.1}
+      - {id: B_boosted, ce: 0.80, recency: 0.9, temporal: 0.9, proof: 0.9}
+    expect_top: A_highce
+    note: "15pt CE lead; the boosted-but-irrelevant row must not win."
+
+  - id: dg-dec-002
+    cls: decisive
+    text: "what turn budget did we settle on for the small model"
+    gap: 0.02
+    candidates:
+      - {id: fresh_pin, ce: 0.99, recency: 0.5, temporal: 0.5, proof: 0.1}
+      - {id: old_pin,   ce: 0.95, recency: 0.5, temporal: 0.5, proof: 0.9}
+    expect_top: fresh_pin
+    note: "The current decision (high CE, single-source) beats a superseded, heavily-cited one."
+
+  - id: dg-dec-003
+    cls: decisive
+    text: "how does reciprocal rank fusion combine the arms"
+    gap: 0.02
+    candidates:
+      - {id: hi,  ce: 0.90, recency: 0.1, temporal: 0.1, proof: 0.1}
+      - {id: mid, ce: 0.70, recency: 0.9, temporal: 0.5, proof: 0.9}
+      - {id: lo,  ce: 0.50, recency: 0.9, temporal: 0.9, proof: 0.9}
+    expect_top: hi
+    note: "Well-spread CE; full CE order preserved despite inverted boosts."
+
+  - id: dg-dec-004
+    cls: decisive
+    text: "which redis version did we pin in the compose file"
+    gap: 0.02
+    candidates:
+      - {id: redis_new, ce: 0.97, recency: 0.6, temporal: 0.5, proof: 0.2}
+      - {id: redis_old, ce: 0.90, recency: 0.2, temporal: 0.5, proof: 0.9}
+    expect_top: redis_new
+    note: "Version fact: the newer pin wins on CE; the old well-corroborated pin does not resurface."
+
+  # ── bunched: CE saturated, recency breaks the tie ────────────────
+  - id: dg-bun-001
+    cls: bunched
+    text: "what did we decide about the retain cadence last week"
+    gap: 0.02
+    candidates:
+      - {id: fresh, ce: 0.9900, recency: 0.9, temporal: 0.5, proof: 0.5}
+      - {id: stale, ce: 0.9950, recency: 0.1, temporal: 0.5, proof: 0.5}
+    expect_top: fresh
+    note: "Fresher wins over a 0.5pt-higher-CE stale row within the band. Constraint 4."
+
+  - id: dg-bun-002
+    cls: bunched
+    text: "what is the current policy on running claude programmatically"
+    gap: 0.02
+    candidates:
+      - {id: fresh_dec,   ce: 0.9820, recency: 0.9, temporal: 0.5, proof: 0.1}
+      - {id: proven_old,  ce: 0.9840, recency: 0.1, temporal: 0.5, proof: 0.9}
+    expect_top: fresh_dec
+    note: "Recency (alpha 0.2) outweighs proof_count (alpha 0.1) when CE is near-tied."
+
+  - id: dg-bun-003
+    cls: bunched
+    text: "where do worker sub-agents write their scratch files"
+    gap: 0.02
+    candidates:
+      - {id: noise_stale, ce: 0.9800001, recency: 0.02, temporal: 0.5, proof: 0.02}
+      - {id: real_fresh,  ce: 0.9800000, recency: 0.99, temporal: 0.5, proof: 0.9}
+    expect_top: real_fresh
+    note: "A 1e-7 CE difference is encoder noise, not signal; recency+proof must decide, not the noise."
+
+  - id: dg-bun-004
+    cls: bunched
+    text: "what is lisa's current email address"
+    gap: 0.02
+    candidates:
+      - {id: lisa_new, ce: 0.985, recency: 0.9, temporal: 0.5, proof: 0.5}
+      - {id: lisa_old, ce: 0.990, recency: 0.1, temporal: 0.5, proof: 0.5}
+    expect_top: lisa_new
+    note: "Person fact: the recently-updated contact beats a slightly-higher-CE stale one."
+
+  # ── boundary: flip points, straddled ─────────────────────────────
+  - id: dg-bnd-001
+    cls: boundary
+    text: "saturated-band worst case: fresh high-CE vs old high-proof"
+    gap: 0.02
+    candidates:
+      - {id: fresh_hce,  ce: 0.9999, recency: 0.5, temporal: 0.5, proof: 0.1}
+      - {id: old_hproof, ce: 0.9800, recency: 0.5, temporal: 0.5, proof: 0.9}
+    expect_top: fresh_hce
+    note: "CE ratio 1.0203 just exceeds the 1+gap=1.02 worst-case band, so at the default gap the fix holds and the fresh row wins. Mirrors the docker probe's SATURATED_ORDER."
+
+  - id: dg-bnd-002
+    cls: boundary
+    text: "recency flip, just inside: fresher wins by a whisker"
+    gap: 0.02
+    candidates:
+      - {id: fresh, ce: 0.9950, recency: 0.9, temporal: 0.5, proof: 0.5}
+      - {id: old,   ce: 0.9990, recency: 0.1, temporal: 0.5, proof: 0.5}
+    expect_top: fresh
+    note: "0.4pt CE gap is under the ~0.8% recency-only flip point at gap 0.02, so recency flips it."
+
+  - id: dg-bnd-003
+    cls: boundary
+    text: "recency flip, just outside: CE lead survives"
+    gap: 0.02
+    candidates:
+      - {id: fresh, ce: 0.9900, recency: 0.9, temporal: 0.5, proof: 0.5}
+      - {id: old,   ce: 0.9990, recency: 0.1, temporal: 0.5, proof: 0.5}
+    expect_top: old
+    note: "0.9pt CE gap exceeds the recency-only flip point, so the higher-CE row holds. Straddles dg-bnd-002."
+
+  - id: dg-bnd-004
+    cls: boundary
+    text: "widening the knob, just below the pair's flip: fix still holds"
+    gap: 0.13
+    candidates:
+      - {id: fresh_hce,  ce: 0.9999, recency: 0.5, temporal: 0.5, proof: 0.1}
+      - {id: old_hproof, ce: 0.9800, recency: 0.5, temporal: 0.5, proof: 0.9}
+    expect_top: fresh_hce
+    note: "For THIS pair the fresh row wins until gap ~0.134 (a pair-specific flip, NOT the 0.651 clamp). At 0.13 it still wins."
+
+  - id: dg-bnd-005
+    cls: boundary
+    text: "widening the knob, just above the pair's flip: proof reclaims"
+    gap: 0.14
+    candidates:
+      - {id: fresh_hce,  ce: 0.9999, recency: 0.5, temporal: 0.5, proof: 0.1}
+      - {id: old_hproof, ce: 0.9800, recency: 0.5, temporal: 0.5, proof: 0.9}
+    expect_top: old_hproof
+    note: "Just past the ~0.134 flip for this pair, the undamped-enough proof boost overturns the 2% CE lead."
+
+  # ── rollback: gap >= clamp threshold, upstream behaviour ─────────
+  - id: dg-rbk-001
+    cls: rollback
+    text: "full rollback: gap 1.0, damping off"
+    gap: 1.0
+    candidates:
+      - {id: fresh_hce,  ce: 0.9999, recency: 0.5, temporal: 0.5, proof: 0.1}
+      - {id: old_hproof, ce: 0.9800, recency: 0.5, temporal: 0.5, proof: 0.9}
+    expect_top: old_hproof
+    note: "k clamps to 1.0 = byte-for-byte upstream. The old high-proof row wins again — the pre-patch defect, on purpose. Mirrors the docker probe's GAP_ROLLBACK."
+
+  - id: dg-rbk-002
+    cls: rollback
+    text: "just above the clamp threshold: still upstream"
+    gap: 0.657583
+    candidates:
+      - {id: fresh_hce,  ce: 0.9999, recency: 0.5, temporal: 0.5, proof: 0.1}
+      - {id: old_hproof, ce: 0.9800, recency: 0.5, temporal: 0.5, proof: 0.9}
+    expect_top: old_hproof
+    note: "clamp_threshold * 1.01. Anything at/above ~0.651 is exactly upstream scoring, so the old row still wins."
