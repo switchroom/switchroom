@@ -90,6 +90,7 @@ import { resolveAgentsDir } from "../config/loader.js";
 import YAML from "yaml";
 import type { SwitchroomConfig } from "../config/schema.js";
 import { normalizeHindsightVersionTag } from "../setup/hindsight.js";
+import { registerMemoryRuleCommand } from "./memory-rules.js";
 
 /**
  * Read-modify-write switchroom.yaml to set `memory.config.url` (and
@@ -2301,4 +2302,6 @@ export function registerMemoryCommand(program: Command): void {
         },
       ),
     );
+
+  registerMemoryRuleCommand(memory, program);
 }

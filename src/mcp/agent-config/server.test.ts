@@ -38,6 +38,10 @@ describe("TOOLS export", () => {
       "config_get",
       "cron_doctor",          // read-only cron health report
       "cron_list",
+      "memory_edit_yours",     // Memory v2 M1 (built dark)
+      "memory_rule_add",       // Memory v2 M1 (built dark)
+      "memory_rule_list",      // Memory v2 M1 (built dark)
+      "memory_rule_retire",    // Memory v2 M1 (built dark)
       "peers_list",            // identity / peer-awareness
       "schedule_add",
       "schedule_remove",
@@ -168,6 +172,118 @@ describe("dispatchTool — happy path", () => {
     // Ensure --limit was forwarded as a string.
     const [, args] = spawnSyncMock.mock.calls[0]!;
     expect(args).toEqual(["audit", "tail", "--limit", "5"]);
+  });
+
+  // Memory v2 M1 (built dark) — these tools shell straight to
+  // `switchroom memory rule ...` with `--json`; the flag-gating that
+  // makes M1 "dark" lives entirely inside the CLI/store, not here.
+  it("memory_rule_add shells `memory rule add <agent> <text> --json`", () => {
+    const rule = { id: "r1", text: "Keep tests green.", source: "telegram" };
+    okCall(JSON.stringify({ ok: true, rule }) + "\n");
+    const res = dispatchTool("memory_rule_add", {
+      agent: "a",
+      text: "Keep tests green.",
+      source: "telegram",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual({ ok: true, rule });
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual([
+      "memory",
+      "rule",
+      "add",
+      "a",
+      "Keep tests green.",
+      "--json",
+      "--source",
+      "telegram",
+    ]);
+  });
+
+  it("memory_rule_add forwards --supersedes when set", () => {
+    okCall(JSON.stringify({ ok: true, rule: { id: "r2", text: "x" } }) + "\n");
+    dispatchTool("memory_rule_add", { agent: "a", text: "x", supersedes: "r1" });
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual(["memory", "rule", "add", "a", "x", "--json", "--supersedes", "r1"]);
+  });
+
+  it("memory_rule_add errors without invoking the CLI when text is missing", () => {
+    const res = dispatchTool("memory_rule_add", { agent: "a" });
+    expect(res.isError).toBe(true);
+    expect(spawnSyncMock).not.toHaveBeenCalled();
+  });
+
+  it("memory_rule_add defaults agent from SWITCHROOM_AGENT_NAME when omitted", () => {
+    const prev = process.env.SWITCHROOM_AGENT_NAME;
+    process.env.SWITCHROOM_AGENT_NAME = "klanker";
+    try {
+      okCall(JSON.stringify({ ok: true, rule: { id: "r1", text: "x" } }) + "\n");
+      dispatchTool("memory_rule_add", { text: "x" });
+      const [, args] = spawnSyncMock.mock.calls[0]!;
+      expect(args).toEqual(["memory", "rule", "add", "klanker", "x", "--json"]);
+    } finally {
+      if (prev === undefined) delete process.env.SWITCHROOM_AGENT_NAME;
+      else process.env.SWITCHROOM_AGENT_NAME = prev;
+    }
+  });
+
+  it("memory_rule_retire shells `memory rule retire <agent> <id> --json`", () => {
+    okCall(JSON.stringify({ ok: true, ruleId: "r1" }) + "\n");
+    const res = dispatchTool("memory_rule_retire", {
+      agent: "a",
+      rule_id: "r1",
+      superseded_by: "r2",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual({ ok: true, ruleId: "r1" });
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual([
+      "memory",
+      "rule",
+      "retire",
+      "a",
+      "r1",
+      "--json",
+      "--superseded-by",
+      "r2",
+    ]);
+  });
+
+  it("memory_rule_retire errors without invoking the CLI when rule_id is missing", () => {
+    const res = dispatchTool("memory_rule_retire", { agent: "a" });
+    expect(res.isError).toBe(true);
+    expect(spawnSyncMock).not.toHaveBeenCalled();
+  });
+
+  it("memory_rule_list shells `memory rule list <agent> --json`", () => {
+    okCall(JSON.stringify({ ok: true, agent: "a", rules: [] }) + "\n");
+    const res = dispatchTool("memory_rule_list", { agent: "a" });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual({ ok: true, agent: "a", rules: [] });
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual(["memory", "rule", "list", "a", "--json"]);
+  });
+
+  it("memory_edit_yours shells `memory rule edit-yours <agent> <text> --json`", () => {
+    okCall(JSON.stringify({ ok: true, agent: "a" }) + "\n");
+    const res = dispatchTool("memory_edit_yours", { agent: "a", text: "New free-text notes." });
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content[0]!.text)).toEqual({ ok: true, agent: "a" });
+    const [, args] = spawnSyncMock.mock.calls[0]!;
+    expect(args).toEqual([
+      "memory",
+      "rule",
+      "edit-yours",
+      "a",
+      "New free-text notes.",
+      "--json",
+    ]);
+  });
+
+  it("memory_edit_yours errors without invoking the CLI when text is missing", () => {
+    const res = dispatchTool("memory_edit_yours", { agent: "a" });
+    expect(res.isError).toBe(true);
+    expect(spawnSyncMock).not.toHaveBeenCalled();
   });
 });
 

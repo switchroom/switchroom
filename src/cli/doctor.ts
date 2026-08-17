@@ -94,6 +94,7 @@ import {
   runApprovalAttributionChecks,
 } from "./doctor-approval-attribution.js";
 import { runAuditIntegrityChecks } from "./doctor-audit-integrity.js";
+import { runRulesBlockChecks } from "./doctor-rules-block.js";
 import { runAgentSmokeChecks } from "./doctor-agent-smoke.js";
 import { runVaultBrokerDurabilityChecks } from "./doctor-vault-broker-durability.js";
 import { runTimezoneChecks } from "./doctor-timezone.js";
@@ -1894,6 +1895,13 @@ async function checkHindsight(config: SwitchroomConfig): Promise<CheckResult[]> 
   // and invisible everywhere else, which is how the whole fleet ran the
   // engine's stock consolidation mission unnoticed (see the function's doc).
   results.push(...(await checkBankObservationsMissions(config, url)));
+
+  // Memory v2 M1 — built dark: only agents with memory.rules_block:true
+  // (default false, flipped per-agent by M3) produce any rows here.
+  // Local hash-chain/sentinel integrity + index-block-vs-engine divergence
+  // (Blocker 2 fix: a reachable-but-empty engine response is never read
+  // as content-divergence tampering — see doctor-rules-block.ts header).
+  results.push(...(await runRulesBlockChecks(config, url)));
 
   // The bank-config API those missions are seeded through must actually be
   // reachable: since #3529 retain-mission seeding is fail-closed, so a disabled

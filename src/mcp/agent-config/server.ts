@@ -16,6 +16,15 @@
  *   audit_tail  → `switchroom audit tail [--agent <n>] [--limit N]`
  *   peers_list  → `switchroom peers list [--agent <n>]`  (live-sourced)
  *
+ *   memory_rule_add     → `switchroom memory rule add <agent> <text> --json`
+ *   memory_rule_retire  → `switchroom memory rule retire <agent> <id> --json`
+ *   memory_rule_list    → `switchroom memory rule list <agent> --json`
+ *   memory_edit_yours   → `switchroom memory rule edit-yours <agent> <text> --json`
+ *   (Memory v2 M1, built dark — see rules-store.ts / rules-block.ts.
+ *   These tools always exist and always write the rules block; only the
+ *   CLAUDE.md Edit/Write deny is gated behind the per-agent
+ *   `memory.rules_block` go-live flag, default off.)
+ *
  * Each tool exec's the CLI, captures stdout, parses JSON (or JSONL
  * for audit_tail), and returns it as the tool result.
  */
@@ -174,6 +183,11 @@ interface ToolArgs {
   tier?: string;
   // (`source?: string` for skill_install + skill_clone_to_personal is
   // declared above.)
+  // Memory v2 M1 — rules-block tools (built dark; see rules-store.ts).
+  text?: string;
+  rule_id?: string;
+  supersedes?: string;
+  superseded_by?: string;
 }
 
 function buildArgs(base: string[], a: ToolArgs): string[] {
@@ -564,6 +578,84 @@ export const TOOLS = [
       },
     },
   },
+  // Memory v2 M1 — rules-block self-service (carve-M1.md). BUILT DARK:
+  // these tools always exist, but every write they drive is a no-op on
+  // the agent's rendered CLAUDE.md permissions until the per-agent
+  // `memory.rules_block` go-live flag (default false, M3) is flipped —
+  // the rules block itself (marker-delimited text + hash-chained audit
+  // log) is written regardless of the flag; only the Edit/Write deny is
+  // gated. Shell out to the same `switchroom memory rule ...` CLI verbs
+  // `src/cli/memory-rules.ts` exposes, with `--json` for machine parsing.
+  {
+    name: "memory_rule_add",
+    description:
+      "Add a new standing rule to the agent's marker-delimited rules block " +
+      "in CLAUDE.md. Hash-chained, budget-capped (~6KB rendered). Returns " +
+      "the created rule id/text, or a possibleDuplicateOf hint (non-blocking) " +
+      "if an existing rule looks similar. Fails with a budget-exceeded error " +
+      "if the block would exceed its byte cap — the file is left untouched " +
+      "on that failure.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["text"],
+      properties: {
+        agent: { type: "string" },
+        text: { type: "string", minLength: 1, description: "The rule text." },
+        source: {
+          type: "string",
+          description: "Where the rule came from (e.g. telegram). Default: cli.",
+        },
+        supersedes: {
+          type: "string",
+          description: "Retire this rule id as part of the same mutation.",
+        },
+      },
+    },
+  },
+  {
+    name: "memory_rule_retire",
+    description:
+      "Retire a standing rule by id — archived (never re-loaded into the " +
+      "live block), not deleted. Recorded in the hash-chained mutation log.",
+    inputSchema: {
+      type: "object" as const,
+      required: ["rule_id"],
+      properties: {
+        agent: { type: "string" },
+        rule_id: { type: "string" },
+        superseded_by: {
+          type: "string",
+          description: "Rule id this retirement was superseded by, if any.",
+        },
+      },
+    },
+  },
+  {
+    name: "memory_rule_list",
+    description: "List the agent's active standing rules. Read-only.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "memory_edit_yours",
+    description:
+      "Replace the free-text 'Yours' section of the agent's CLAUDE.md — the " +
+      "operator-preserved area below the managed template. Rejected if the " +
+      "new text would overlap a rules/index marker block (file left " +
+      "untouched on that failure).",
+    inputSchema: {
+      type: "object" as const,
+      required: ["text"],
+      properties: {
+        agent: { type: "string" },
+        text: { type: "string" },
+      },
+    },
+  },
 ];
 
 export function dispatchTool(
@@ -728,6 +820,54 @@ export function dispatchTool(
       if (a.agent) base.push("--agent", a.agent);
       if (a.name) base.push("--name", a.name);
       cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    // Memory v2 M1 — rules-block tools. `agent` is a required positional
+    // on the underlying CLI verbs (not a `--agent` flag like the other
+    // tools here), so default it to the env-pinned identity ourselves
+    // when the caller omits it, mirroring what the CLI's own `--agent`
+    // defaulting does for the flag-based tools above.
+    case "memory_rule_add": {
+      const a = args as ToolArgs;
+      const agent = a.agent ?? process.env.SWITCHROOM_AGENT_NAME;
+      if (!agent) return errorText("memory_rule_add: agent is required (no env-pinned identity)");
+      if (!a.text) return errorText("memory_rule_add: text is required");
+      const base = ["memory", "rule", "add", agent, a.text, "--json"];
+      if (a.source) base.push("--source", a.source);
+      if (a.supersedes) base.push("--supersedes", a.supersedes);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    case "memory_rule_retire": {
+      const a = args as ToolArgs;
+      const agent = a.agent ?? process.env.SWITCHROOM_AGENT_NAME;
+      if (!agent)
+        return errorText("memory_rule_retire: agent is required (no env-pinned identity)");
+      if (!a.rule_id) return errorText("memory_rule_retire: rule_id is required");
+      const base = ["memory", "rule", "retire", agent, a.rule_id, "--json"];
+      if (a.superseded_by) base.push("--superseded-by", a.superseded_by);
+      cliArgs = base;
+      parseMode = "json";
+      break;
+    }
+    case "memory_rule_list": {
+      const a = args as ToolArgs;
+      const agent = a.agent ?? process.env.SWITCHROOM_AGENT_NAME;
+      if (!agent)
+        return errorText("memory_rule_list: agent is required (no env-pinned identity)");
+      cliArgs = ["memory", "rule", "list", agent, "--json"];
+      parseMode = "json";
+      break;
+    }
+    case "memory_edit_yours": {
+      const a = args as ToolArgs;
+      const agent = a.agent ?? process.env.SWITCHROOM_AGENT_NAME;
+      if (!agent)
+        return errorText("memory_edit_yours: agent is required (no env-pinned identity)");
+      if (a.text === undefined) return errorText("memory_edit_yours: text is required");
+      cliArgs = ["memory", "rule", "edit-yours", agent, a.text, "--json"];
       parseMode = "json";
       break;
     }
