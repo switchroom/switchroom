@@ -31,26 +31,73 @@ import type { DirectiveInjectionDelta } from "./recall-log.js";
 // ---------------------------------------------------------------------------
 
 /**
- * TODO(Tier-2): result envelope the (not-yet-built) mtcute behavioural probe
- * runner will produce — a baseline-vs-postflip diff proving the flipped agent
- * still HONOURS each migrated guardrail in live conversation (the model-in-the-
- * loop half the deterministic checks can't cover).
+ * Result envelope the mtcute behavioural probe runner produces — a
+ * baseline-vs-postflip diff proving the flipped agent still HONOURS each
+ * migrated guardrail in live conversation (the model-in-the-loop half the
+ * deterministic checks can't cover).
  *
- * This interface is a placeholder shape so the gate can fold Tier-2 in
- * additively once the runner exists. Only `pass` is load-bearing today; the
- * rest are indicative and WILL change when the runner is designed. Nothing in
- * this PR produces a value of this type.
+ * The runner that fills this lives in `tier2-probe-runner.ts`; it emits one
+ * value of this type per phase to `flip/results/<agent>.<phase>.json`. The gate
+ * stays minimal against it: only `pass` is load-bearing HERE (the gate folds
+ * that single boolean into the verdict). The remaining fields are the runner's
+ * own richer accounting — every one is OPTIONAL so the gate's placeholder
+ * fixtures (`{ pass, probes: [{ directiveId, held }] }`) still conform and the
+ * gate never has to know the probe runner's internal shape to stay compilable.
  */
-export interface Tier2ProbeResults {
-  /** Overall behavioural verdict. */
+
+/** One phase of the flip: the pre-flip baseline, or the post-flip re-run. */
+export type ProbePhase = "baseline" | "postflip";
+
+/** Traffic-light for a probe over its k repeats: 3/3 GREEN, 2/3 AMBER, ≤1/3 RED. */
+export type ProbeVerdict = "GREEN" | "AMBER" | "RED";
+
+/** One send→reply→score round of a probe. `reply` is verbatim (trimmed). */
+export interface Tier2ProbeAttempt {
+  /** Verbatim reply text the agent sent (empty for timeout/error). */
+  reply: string;
+  /** Whether the reply matched the probe's deterministic passPattern. */
+  observedMatch: boolean;
+  /** Whether the guardrail BEHAVED CORRECTLY this round (match-vs-expectation). */
   pass: boolean;
-  /** Per-guardrail probe outcomes (shape TBD by the probe runner). */
-  probes?: ReadonlyArray<{
-    directiveId: string;
-    /** The guardrail still held under probing. */
-    held: boolean;
-    detail?: string;
-  }>;
+  /** Wall-clock ms from send to observed reply (or to timeout). */
+  durationMs: number;
+  outcome: "pass" | "fail" | "timeout" | "error";
+  errorMessage?: string;
+}
+
+/** Per-probe outcome, folded over the k repeats. */
+export interface Tier2ProbeOutcome {
+  /** The directive this probe exercises ("" / "none" for a transport-only
+   *  liveness probe against an agent with no active directives). */
+  directiveId: string;
+  /** The guardrail held under probing (verdict is GREEN or AMBER). Load-bearing
+   *  for a human reader; the gate itself reads only {@link Tier2ProbeResults.pass}. */
+  held: boolean;
+  detail?: string;
+  // ---- richer accounting emitted by the runner (all optional) ----
+  probeId?: string;
+  directiveName?: string;
+  /** positive = a benign question that SHOULD trip the guardrail; negative =
+   *  an adjacent-but-allowed message that must NOT over-trip; liveness =
+   *  transport-only (no directive to exercise). */
+  kind?: "positive" | "negative" | "liveness";
+  k?: number;
+  passCount?: number;
+  verdict?: ProbeVerdict;
+  attempts?: ReadonlyArray<Tier2ProbeAttempt>;
+}
+
+export interface Tier2ProbeResults {
+  /** Overall behavioural verdict — the only field the gate folds. */
+  pass: boolean;
+  agent?: string;
+  phase?: ProbePhase;
+  /** ISO-8601 generation timestamp. */
+  generatedAt?: string;
+  /** The probe-suite file this phase ran. */
+  suite?: string;
+  /** Per-guardrail probe outcomes. */
+  probes?: ReadonlyArray<Tier2ProbeOutcome>;
 }
 
 // ---------------------------------------------------------------------------

@@ -60,7 +60,7 @@ export function scoreReply(
  * whitespace. Permissive on purpose — the scorer's regex matches
  * against words, not formatting.
  */
-function stripMarkdown(s: string): string {
+export function stripMarkdown(s: string): string {
   return s
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`([^`]+)`/g, "$1")
