@@ -53,24 +53,35 @@ function renderInjectedLine(index: number, directive: HindsightDirective): strin
 /**
  * Measure one agent's post-triage residue.
  *
- * `directivesByName` supplies the full `content` text (triage rows don't
+ * `directivesById` supplies the full `content` text (triage rows don't
  * carry it — the card generator deliberately works off the lighter
  * `HindsightDirective` shape) so the estimate is computed against real
- * rendered bytes, not a row-count proxy.
+ * rendered bytes, not a row-count proxy. Keyed by `id`, not `name` (M2
+ * redteam LOW): a name is not unique once a windows-boxes-class reconcile
+ * is in flight, and an id-keyed map is the only shape that stays correct
+ * in that state.
+ *
+ * Only ACTIVE rows are counted (M2 redteam LOW): an inactive directive is
+ * never injected by the recall hook, so counting one would inflate M3's
+ * rules budget with bytes that are not actually part of the always-on
+ * residue.
  */
 export function measureDirectiveResidue(
   agent: string,
   rows: readonly DirectiveTriageRow[],
-  directivesByName: ReadonlyMap<string, HindsightDirective>,
+  directivesById: ReadonlyMap<string, HindsightDirective>,
 ): DirectiveResidueMeasurement {
-  const residueRows = rows.filter((r) => RESIDUE_CATEGORIES.has(r.category));
+  const residueRows = rows.filter(
+    (r) => r.isActive && RESIDUE_CATEGORIES.has(r.category),
+  );
 
   const lines = residueRows.map((row, i) => {
-    const directive = directivesByName.get(row.name);
+    const directive = directivesById.get(row.id);
     if (!directive) {
       throw new Error(
-        `measureDirectiveResidue: row '${row.name}' has no matching directive ` +
-          "in directivesByName — pass the SAME list the rows were built from.",
+        `measureDirectiveResidue: row '${row.name}' (id ${row.id}) has no ` +
+          "matching directive in directivesById — pass the SAME list the " +
+          "rows were built from.",
       );
     }
     return renderInjectedLine(i + 1, directive);

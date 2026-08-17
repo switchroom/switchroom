@@ -29,13 +29,13 @@ describe("measureDirectiveResidue — counts only rules-block + reflect-directiv
       directive({ id: "4", name: "disp", content: "D" }),
     ];
     const overrides = new Map<string, DirectiveTriageOverride>([
-      ["staged-rule", { category: "rules-block", signal: "destined for rules block" }],
-      ["disp", { category: "disposition", signal: "belongs in disposition config" }],
+      ["2", { category: "rules-block", signal: "destined for rules block" }],
+      ["4", { category: "disposition", signal: "belongs in disposition config" }],
     ]);
     const rows = buildDirectiveTriageRows(directives, overrides);
-    const byName = new Map(directives.map((d) => [d.name, d]));
+    const byId = new Map(directives.map((d) => [d.id, d]));
 
-    const measurement = measureDirectiveResidue("test-agent", rows, byName);
+    const measurement = measureDirectiveResidue("test-agent", rows, byId);
 
     expect(measurement.residueDirectiveCount).toBe(2); // keep-guardrail + staged-rule
     expect(measurement.totalDirectiveCount).toBe(4);
@@ -43,13 +43,26 @@ describe("measureDirectiveResidue — counts only rules-block + reflect-directiv
     expect(measurement.residueTokensEstimate).toBeGreaterThan(0);
   });
 
+  it("counts ACTIVE rows only — an inactive rules-block/reflect-directive row does not inflate the budget (M2 redteam LOW)", () => {
+    const directives: HindsightDirective[] = [
+      directive({ id: "1", name: "active-guardrail", content: "A", is_active: true }),
+      directive({ id: "2", name: "inactive-guardrail", content: "B", is_active: false }),
+    ];
+    const rows = buildDirectiveTriageRows(directives);
+    const byId = new Map(directives.map((d) => [d.id, d]));
+
+    const measurement = measureDirectiveResidue("test-agent", rows, byId);
+
+    expect(measurement.residueDirectiveCount).toBe(1);
+  });
+
   it("anti-vacuity: an all-retired set produces a ZERO residue, not a silently-passing empty measurement", () => {
     const directives: HindsightDirective[] = [
       directive({ id: "1", name: "only-one", content: "X", tags: ["superseded-by:elsewhere"] }),
     ];
     const rows = buildDirectiveTriageRows(directives);
-    const byName = new Map(directives.map((d) => [d.name, d]));
-    const measurement = measureDirectiveResidue("test-agent", rows, byName);
+    const byId = new Map(directives.map((d) => [d.id, d]));
+    const measurement = measureDirectiveResidue("test-agent", rows, byId);
     expect(measurement.residueDirectiveCount).toBe(0);
     expect(measurement.residueBytes).toBe(0);
     expect(measurement.residueTokensEstimate).toBe(0);

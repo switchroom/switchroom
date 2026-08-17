@@ -37,7 +37,10 @@
  *    land on a guardrail.
  */
 
-import type { HindsightDirective } from "./hindsight-directive-admin.js";
+import {
+  hasRulesBlockMarker,
+  type HindsightDirective,
+} from "./hindsight-directive-admin.js";
 
 /** E-45's five triage buckets. Every directive lands in exactly one. */
 export type DirectiveTriageCategory =
@@ -98,14 +101,53 @@ export interface DirectiveTriageRow {
 const SUPERSEDED_BY_TAG_RE = /^superseded-by:(.+)$/;
 
 /**
- * Classify one directive. Deterministic tag scan takes priority over any
- * caller-supplied override (a directive already marked superseded IS
- * retired, regardless of what an agent's classification pass thinks).
+ * Classify one directive.
+ *
+ * Priority order (M2 redteam B1 — fixed from the original "tag scan always
+ * wins" ordering, which let a stale `superseded-by:` tag mask a genuine
+ * rules-block classification and silently disarm the executor's guard):
+ *
+ *   1. A persisted {@link hasRulesBlockMarker} tag, or a caller override
+ *      naming `category: "rules-block"`, wins over EVERYTHING else,
+ *      including a conflicting `superseded-by:` tag. Reachable mundanely:
+ *      `DirectiveAdmin.reactivate()` leaves a stale `superseded-by` tag in
+ *      place, and tags are settable via PATCH/`create_directive` — so a
+ *      genuinely rules-block directive can end up carrying both signals.
+ *   2. An already-inactive directive never comes out `action: "retire"`
+ *      (M2 redteam M1) — there is nothing left to retire, and re-running
+ *      `deactivate` on it would be a wasted/misleading call.
+ *   3. The deterministic `superseded-by:` tag scan.
+ *   4. A caller-supplied non-rules-block override with a real signal.
+ *   5. Default-KEEP.
  */
 export function classifyDirective(
   directive: HindsightDirective,
   override?: DirectiveTriageOverride,
 ): Pick<DirectiveTriageRow, "category" | "signal" | "action" | "supersededBy"> {
+  const isActive = directive.is_active !== false;
+  const overrideSignal = override?.signal.trim();
+
+  // 1. Rules-block wins over everything — marker tag, then override.
+  if (hasRulesBlockMarker(directive.tags)) {
+    return {
+      category: "rules-block",
+      signal: "carries the rules-block marker tag — staged for M3, never retired",
+      action: "stage-for-m3",
+    };
+  }
+  if (override && overrideSignal && override.category === "rules-block") {
+    // Decision 3, enforced at classification time too (defense in depth
+    // alongside the apply-batch executor's own refusal): a rules-block
+    // row can NEVER come out of this function as `action: "retire"`.
+    return {
+      category: "rules-block",
+      signal: overrideSignal,
+      action: "stage-for-m3",
+    };
+  }
+
+  // 2/3. Deterministic supersession-tag scan (only meaningful for an
+  // ACTIVE directive — an inactive one has nothing left to retire).
   const supersessionTag = (directive.tags ?? [])
     .map((t) => SUPERSEDED_BY_TAG_RE.exec(t))
     .find((m): m is RegExpExecArray => m !== null);
@@ -113,32 +155,30 @@ export function classifyDirective(
     const winner = supersessionTag[1];
     return {
       category: "retire",
-      signal: `superseded by '${winner}' (superseded-by tag)`,
-      action: "retire",
+      signal: isActive
+        ? `superseded by '${winner}' (superseded-by tag)`
+        : `superseded by '${winner}' (superseded-by tag) — already inactive, nothing to retire`,
+      action: isActive ? "retire" : "keep",
       supersededBy: winner,
     };
   }
 
-  const signal = override?.signal.trim();
-  if (override && signal) {
-    if (override.category === "rules-block") {
-      // Decision 3, enforced at classification time too (defense in depth
-      // alongside the apply-batch executor's own refusal): a rules-block
-      // row can NEVER come out of this function as `action: "retire"`.
-      return {
-        category: "rules-block",
-        signal,
-        action: "stage-for-m3",
-      };
-    }
+  // 4. Caller-supplied override (non-rules-block).
+  if (override && overrideSignal) {
     if (override.category === "reflect-directive") {
-      return { category: "reflect-directive", signal, action: "keep" };
+      return { category: "reflect-directive", signal: overrideSignal, action: "keep" };
     }
     // disposition / retire / retain-as-memory
-    return { category: override.category, signal, action: "retire" };
+    return {
+      category: override.category,
+      signal: isActive
+        ? overrideSignal
+        : `${overrideSignal} — already inactive, nothing to retire`,
+      action: isActive ? "retire" : "keep",
+    };
   }
 
-  // No deterministic signal at all — default-KEEP (redteam-M2.md §4).
+  // 5. No deterministic signal at all — default-KEEP (redteam-M2.md §4).
   return {
     category: "reflect-directive",
     signal: "no deterministic signal — defaults to KEEP",
@@ -149,13 +189,18 @@ export function classifyDirective(
 /**
  * Build one row per input directive. Preserves input order and count
  * 1:1 — no directive is dropped, deduped, or synthesized.
+ *
+ * `overrides` is keyed by directive `id`, not `name` (M2 redteam LOW): a
+ * name is not unique once a windows-boxes-class reconcile is in flight (old
+ * + new superset copy briefly share a name), and an id-keyed map is the
+ * only shape that stays correct in that state.
  */
 export function buildDirectiveTriageRows(
   directives: readonly HindsightDirective[],
   overrides?: ReadonlyMap<string, DirectiveTriageOverride>,
 ): DirectiveTriageRow[] {
   return directives.map((d) => {
-    const classified = classifyDirective(d, overrides?.get(d.name));
+    const classified = classifyDirective(d, overrides?.get(d.id));
     return {
       id: d.id,
       name: d.name,

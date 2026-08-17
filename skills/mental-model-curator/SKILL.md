@@ -241,21 +241,26 @@ guard, not as an optional style note.
    - The resulting active count vs `MAX_DIRECTIVES` if the retirements land.
 4. **STOP. Get an explicit operator go-ahead before touching anything.** Do not
    deactivate on the same turn the card is shown. The card is the operator's
-   one look before a batch of guardrails changes state — treat it exactly like
-   the mental-model propose flow's "end the turn cleanly" rule, just without
-   the inline-button card infrastructure (deactivation here is on your own
-   pre-approved `deactivate_directive`, not gated per-call, so the card review
-   itself IS the gate — don't skip it by reasoning that the tool is
-   pre-approved).
-5. **On go-ahead, execute sequentially — retirement candidates only.** For each
-   row marked for retirement (never a `rules-block` row — see the hard rule
-   above), call `mcp__hindsight__deactivate_directive` one at a time, passing
-   `superseded_by` when you named a winner. Do not batch these as parallel
-   tool calls — sequential, awaited, one at a time (the tag write is
-   read-modify-write with no compare-and-swap; concurrent writes to the same
-   winner can lose a tag). After the batch, `list_directives` again and report
-   the new active count against `MAX_DIRECTIVES`, plus which directives moved
-   where.
+   one look before a batch of guardrails changes state.
+5. **On go-ahead, retire ONE AT A TIME with a human tap PER retirement — never
+   a single blanket go-ahead for the whole batch.** `deactivate_directive` is
+   pre-approved fleet-wide (`scaffold.ts`'s 2026-07-29 amendment,
+   `HINDSIGHT_MCP_TOOLS`) — unlike `delete_directive`, calling it does NOT
+   raise a Telegram permission card by itself. That is exactly why this skill
+   must supply the per-call gate `delete_directive`'s card would otherwise
+   have given: present the NEXT retirement candidate (name, priority, signal,
+   proposed `superseded_by`) on its own, then **STOP and end the turn** —
+   do not proceed to it, and do not queue the next one, until the operator's
+   reply for THIS ONE arrives. Only after an explicit per-row confirmation do
+   you call `mcp__hindsight__deactivate_directive` for that single directive.
+   Then present the next candidate the same way. A single "yes, go ahead" that
+   covers the whole retirement list is NOT sufficient — that collapses back
+   to the batch-level prose go-ahead this per-row loop exists to replace, and
+   silently trades away the human tap `delete_directive`'s approval card used
+   to guarantee for every one of these retirements (see PR #4760 review B2).
+   Pass `superseded_by` when you named a winner. After the LAST retirement in
+   the plan lands, `list_directives` again and report the new active count
+   against `MAX_DIRECTIVES`, plus which directives moved where.
 6. **Disposition rows are a note, not an auto-edit.** When you deactivate a
    `disposition`-category directive, separately flag to the operator which
    `disposition_*` bank config change it corresponds to — do NOT edit bank
@@ -276,9 +281,12 @@ directives sharing that name and refuses as ambiguous. Use
 `reconcileDirectiveSuperset` (`src/memory/directive-triage-executor.ts`) for
 this instead — it resolves the old copy's id BEFORE creating the new one and
 retires it by id, so the name collision never becomes an ambiguity error. This
-needs an operator or a repo-authorized script run (not a bare MCP tool call
-from this skill), because no MCP tool exposes an id-targeted deactivate today.
-Flag any drift you notice to the operator rather than improvising a fix.
+is NOT a bare MCP tool call from this skill (no MCP tool exposes an
+id-targeted deactivate) — it runs via
+`switchroom memory directive reconcile <agent> <name> <content...>`
+(`src/cli/memory-directive.ts`), an operator or repo-authorized CLI/script
+invocation, not something this skill invokes autonomously. Flag any drift you
+notice to the operator rather than improvising a fix.
 
 ### Directive-pass anti-patterns
 
@@ -289,6 +297,10 @@ Flag any drift you notice to the operator rather than improvising a fix.
   sequential only (tag-write race).
 - ❌ Executing on the same turn the card is shown — the card review is the
   gate; always stop for an explicit go-ahead first.
+- ❌ Treating one blanket "yes, go ahead" as clearance for the whole
+  retirement list — `deactivate_directive` is pre-approved (no Telegram card
+  per call), so this skill's own per-retirement stop-and-confirm loop IS the
+  human tap; batching it away silently weakens the guardrail (review B2).
 - ❌ Auto-editing bank config for a `disposition` row — flag it, don't apply it.
 - ❌ Treating a drifted/superset-text directive as an ordinary retirement —
   see the windows-boxes-class section above.

@@ -16,7 +16,10 @@ import {
   DIRECTIVE_TRIAGE_CATEGORIES,
   type DirectiveTriageOverride,
 } from "../src/memory/directive-triage.js";
-import type { HindsightDirective } from "../src/memory/hindsight-directive-admin.js";
+import {
+  RULES_BLOCK_MARKER_TAG,
+  type HindsightDirective,
+} from "../src/memory/hindsight-directive-admin.js";
 
 function directive(overrides: Partial<HindsightDirective> & { id: string; name: string }): HindsightDirective {
   return {
@@ -52,10 +55,12 @@ describe("buildDirectiveTriageRows — completeness (anti-vacuity)", () => {
   });
 
   it("never drops a directive even when every row is a distinct category", () => {
+    // Keyed by id, not name (M2 redteam LOW) — a name is not unique once a
+    // windows-boxes-class reconcile is in flight.
     const overrides = new Map<string, DirectiveTriageOverride>([
-      ["disp", { category: "disposition", signal: "belongs in disposition_verbosity config" }],
-      ["mem", { category: "retain-as-memory", signal: "a fact, already held as memory #m-1" }],
-      ["rb", { category: "rules-block", signal: "standing preference, destined for CLAUDE.md rules block" }],
+      ["1", { category: "disposition", signal: "belongs in disposition_verbosity config" }],
+      ["2", { category: "retain-as-memory", signal: "a fact, already held as memory #m-1" }],
+      ["3", { category: "rules-block", signal: "standing preference, destined for CLAUDE.md rules block" }],
     ]);
     const input: HindsightDirective[] = [
       directive({ id: "1", name: "disp" }),
@@ -82,7 +87,7 @@ describe("classifyDirective — deterministic supersession signal", () => {
     expect(result.signal).toMatch(/new-rule/);
   });
 
-  it("tag-based signal wins over a conflicting override", () => {
+  it("tag-based signal wins over a conflicting non-rules-block override", () => {
     const d = directive({ id: "1", name: "old-rule", tags: ["superseded-by:new-rule"] });
     const result = classifyDirective(d, {
       category: "reflect-directive",
@@ -90,6 +95,65 @@ describe("classifyDirective — deterministic supersession signal", () => {
     });
     expect(result.category).toBe("retire");
     expect(result.action).toBe("retire");
+  });
+});
+
+describe("classifyDirective — rules-block wins over the superseded-by tag scan (M2 redteam B1)", () => {
+  it("a rules-block OVERRIDE wins over a conflicting superseded-by tag — never comes out 'retire'", () => {
+    // Reachable mundanely: DirectiveAdmin.reactivate() leaves a stale
+    // superseded-by tag in place, and tags are settable via PATCH/
+    // create_directive — so a genuinely rules-block directive can carry
+    // BOTH signals at once. The tag scan must NOT win here: a rules-block
+    // classification (whether from an override or a persisted marker) is
+    // load-bearing for whether the executor's guard fires at all.
+    const d = directive({
+      id: "1",
+      name: "standing-pref",
+      tags: ["superseded-by:new-rule"],
+    });
+    const result = classifyDirective(d, {
+      category: "rules-block",
+      signal: "standing user preference, destined for CLAUDE.md rules block at M3 flip",
+    });
+    expect(result.category).toBe("rules-block");
+    expect(result.action).toBe("stage-for-m3");
+    expect(result.action).not.toBe("retire");
+  });
+
+  it("a persisted rules-block MARKER tag wins over a conflicting superseded-by tag, with no override at all", () => {
+    const d = directive({
+      id: "1",
+      name: "standing-pref",
+      tags: ["superseded-by:new-rule", RULES_BLOCK_MARKER_TAG],
+    });
+    const result = classifyDirective(d);
+    expect(result.category).toBe("rules-block");
+    expect(result.action).toBe("stage-for-m3");
+    expect(result.action).not.toBe("retire");
+  });
+});
+
+describe("classifyDirective — an already-inactive directive is never re-retired (M2 redteam M1)", () => {
+  it("a superseded-by tag on an INACTIVE directive keeps action:keep, not retire", () => {
+    const d = directive({
+      id: "1",
+      name: "old-rule",
+      is_active: false,
+      tags: ["superseded-by:new-rule"],
+    });
+    const result = classifyDirective(d);
+    expect(result.action).toBe("keep");
+    expect(result.action).not.toBe("retire");
+  });
+
+  it("a retire override on an INACTIVE directive keeps action:keep, not retire", () => {
+    const d = directive({ id: "1", name: "mechanized", is_active: false });
+    const result = classifyDirective(d, {
+      category: "retire",
+      signal: "mechanized by scaffold.ts:900 — no longer needs a directive",
+    });
+    expect(result.action).toBe("keep");
+    expect(result.action).not.toBe("retire");
   });
 });
 
@@ -142,7 +206,7 @@ describe("renderDirectiveTriageCard — visual separation and defaults", () => {
         directive({ id: "4", name: "rb" }),
       ],
       new Map([
-        ["rb", { category: "rules-block", signal: "destined for rules block" } satisfies DirectiveTriageOverride],
+        ["4", { category: "rules-block", signal: "destined for rules block" } satisfies DirectiveTriageOverride],
       ]),
     );
     const card = renderDirectiveTriageCard(rows);
