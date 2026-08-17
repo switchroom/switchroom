@@ -616,6 +616,22 @@ export const AgentMemorySchema = z
         "Steers what the observation-consolidation LLM synthesises from raw " +
         "facts (the higher-order 'what patterns matter' lens). Cascade: override."
       ),
+    rules_block: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Memory v2 M3 go-live flag (M1 only DEFINES this, default false; " +
+        "M3 flips it per agent). When true, the sanctioned rules/index " +
+        "blocks render live in this agent's CLAUDE.md (marker-delimited, " +
+        "below the `# --- Yours ---` line) AND the permission deny for " +
+        "direct Edit/Write of the agent's own CLAUDE.md is seeded — the " +
+        "flag couples deny + tools together so a live deny never orphans " +
+        "the invited free-text edit path (the `memory_edit_yours` verb is " +
+        "the only sanctioned writer once flipped). Unset/false ⇒ byte-" +
+        "identical to pre-M1 behaviour: no blocks, no deny, dark build. " +
+        "Cascade: override (per-agent wins over default; never fleet-" +
+        "seeded — each agent's flip is a deliberate M3 rollout step)."
+      ),
     disposition: z
       .object({
         skepticism: z

@@ -1674,6 +1674,40 @@ function webkiteDenyForAgent(agentConfig: AgentConfig): string[] {
 }
 
 /**
+ * Memory v2 M1/M3 — single source of truth for the rules-block deny.
+ *
+ * Direct `Edit`/`Write` of an agent's own root `CLAUDE.md` is denied
+ * ONLY when `memory.rules_block` is true for that agent (the M3
+ * go-live flag; M1 only defines it, default false). This is
+ * deliberately the ONE function both deny-render sites read from —
+ * {@link buildWorkspaceContext}'s `toolsDeny` (fresh-scaffold path)
+ * and `reconcileAgentInner`'s `desiredDeny` (the path that runs on
+ * EVERY `switchroom apply` against every already-deployed agent).
+ *
+ * Red-team M1 blocker 1: the fresh-scaffold deny site is skipped for
+ * already-deployed agents (`writeIfMissing`), so gating ONLY that site
+ * would look green in a scaffold-only test while the reconcile path
+ * (which DOES run against live agents on every apply) leaked the deny
+ * fleet-wide — reproducing the 2026-07-12 approval-card storm. Both
+ * call sites MUST read this one function; do not inline the flag
+ * check at either site.
+ *
+ * `claudeMdPath` is the CONTAINER-local absolute path to the agent's
+ * `CLAUDE.md` (i.e. `join(agentDir, "CLAUDE.md")` using the same
+ * `agentDir` value the filesystem write path uses) — Claude Code
+ * evaluates `Edit(<path>)`/`Write(<path>)` deny specifiers against the
+ * path it sees running inside the container, not any host-side
+ * conversion (`toHostHomePath`).
+ */
+export function rulesBlockDenyForAgent(
+  agentConfig: AgentConfig,
+  claudeMdPath: string,
+): string[] {
+  if (agentConfig.memory?.rules_block !== true) return [];
+  return [`Edit(${claudeMdPath})`, `Write(${claudeMdPath})`];
+}
+
+/**
  * Switchroom-shipped default model + thinking effort for main agents.
  *
  * Sonnet 5 + effort=low is the right starting point for the
@@ -4369,6 +4403,7 @@ function buildWorkspaceContext(args: BuildWorkspaceContextArgs): Record<string, 
       ...(tools.deny ?? []),
       ...webkiteDenyForAgent(agentConfig),
       ...INTERACTIVE_TUI_FLEET_DENY_TOOLS,
+      ...rulesBlockDenyForAgent(agentConfig, join(agentDir, "CLAUDE.md")),
     ]),
     permissionAllow,
     // settings.json permissions.defaultMode. Decoupled from the `[all]` tools
@@ -7777,6 +7812,32 @@ export function buildSettingsHooksBlock(p: HooksBlockParams): Record<string, unk
         },
       ],
     },
+    // Memory v2 M1 rules-block tamper sentinel (bin/rules-sentinel-hook.sh).
+    // Gated on the SAME per-agent flag that gates the CLAUDE.md Edit/Write
+    // deny (rulesBlockDenyForAgent) — dark build: unset/false means no
+    // hook entry at all, not a hook that no-ops. Deliberately NO matcher
+    // (diverges from the "compact"-only precedent above): the sentinel is
+    // a single cheap local file read, and a tamper edit made between a
+    // fresh boot and the first compaction must not go unnoticed for the
+    // whole session — see bin/rules-sentinel-hook.sh's header for the
+    // full rationale (also documents why stdout, not stderr, and why
+    // strictly read-only).
+    ...(agentConfig.memory?.rules_block === true
+      ? [
+          {
+            hooks: [
+              {
+                type: "command",
+                command: wrap(
+                  "hook:rules-sentinel",
+                  `bash "${join(DOCKER_BIN_PATH, "rules-sentinel-hook.sh")}"`,
+                ),
+                timeout: 8,
+              },
+            ],
+          },
+        ]
+      : []),
   ];
 
   // Combine user hooks + switchroom-owned hooks
@@ -8083,6 +8144,7 @@ function reconcileAgentInner(
     ...(tools.deny ?? []),
     ...webkiteDenyForAgent(agentConfig),
     ...INTERACTIVE_TUI_FLEET_DENY_TOOLS,
+    ...rulesBlockDenyForAgent(agentConfig, join(agentDir, "CLAUDE.md")),
   ]);
 
   // Resolve topic ID for the start.sh template and session greeting

@@ -55,6 +55,14 @@ const INTENTIONAL_MEMORY_MIRROR_EXCLUSIONS = new Set<string>([
   // the defaults/profile tier (see AgentMemorySchema.mental_models). If this
   // exclusion is ever removed, mirror the field AND drop it from this set.
   "mental_models",
+  // Per-agent ONLY by design (Memory v2 M1/M3 go-live flag): the rules-block
+  // rollout is a deliberate per-agent step, never fleet-seeded from the
+  // defaults/profile tier. Excluding it from the profile mirror is both
+  // correct AND a darkness safeguard — a defaults-tier value could otherwise
+  // flip the flag (and seed the CLAUDE.md deny + tools) across the whole
+  // fleet at once. If this exclusion is ever removed, mirror the field AND
+  // drop it from this set. See AgentMemorySchema.rules_block.
+  "rules_block",
 ]);
 
 describe("profileFields mirror ↔ per-agent schema parity (class-killer)", () => {
