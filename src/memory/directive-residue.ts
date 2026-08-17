@@ -25,8 +25,14 @@ import { estimateTokens } from "../cli/debug.js";
 import type { DirectiveTriageRow } from "./directive-triage.js";
 import type { HindsightDirective } from "./hindsight-directive-admin.js";
 
-/** Categories counted into the always-on residue (design-v2.md §8.6). */
-const RESIDUE_CATEGORIES = new Set(["rules-block", "reflect-directive"]);
+/** Categories counted into the always-on residue (design-v2.md §8.6).
+ *  Exported so the M3 UAT equivalence check (`telegram-plugin/uat/flip/
+ *  tier1-equivalence.ts`) filters to the SAME residue set this harness
+ *  measures, rather than re-declaring the category list and drifting. */
+export const RESIDUE_CATEGORIES: ReadonlySet<string> = new Set([
+  "rules-block",
+  "reflect-directive",
+]);
 
 export interface DirectiveResidueMeasurement {
   agent: string;

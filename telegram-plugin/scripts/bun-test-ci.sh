@@ -82,6 +82,12 @@ else
     uat/load-env.test.ts
     uat/uat-driver.test.ts
     uat/runners/
+    # M3 directive-flip UAT — deterministic (no-model, no-network) gate half.
+    # Same rationale as uat/runners/: vitest excludes all of uat/**, and these
+    # import `vitest` (bun runs them via its vitest-compat shim) — so they run
+    # on the BUN side. Directory match (trailing slash) never widens into
+    # uat/scenarios/. Fenced by scripts/check-test-runner-coverage.mjs.
+    uat/flip/
   )
 fi
 
