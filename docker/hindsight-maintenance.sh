@@ -3,7 +3,8 @@
 # entrypoint's background loop (so it executes alongside a live pg,
 # unlike the entrypoint body which runs before start-all.sh boots pg).
 #
-# Three best-effort jobs, all idempotent and safe to run on every tick:
+# Best-effort jobs, all idempotent and safe to run on every tick (the
+# numbering below is the order they were added, not the order they run):
 #
 #   1. Backup     — rotated `pg_dump -Fc` of the embedded pg to a volume
 #                   SEPARATE from the data volume, so a data-volume loss
@@ -24,6 +25,53 @@
 #                   never reads again; left unbounded they accumulate
 #                   (tens of thousands carrying transcript JSON).
 #                   failed/pending/processing rows are NEVER touched.
+#
+#   8a. Vacuum    — periodic `VACUUM (ANALYZE)` of the whole database, at
+#                   most once per VACUUM_INTERVAL_MIN. Belt to autovacuum's
+#                   braces: on this deployment pg's CUMULATIVE STATS DO NOT
+#                   SURVIVE A CONTAINER RECREATE — minutes after a roll,
+#                   pg_stat_database.stats_reset is NULL and last_autovacuum
+#                   is empty for every table. Autovacuum fires off n_dead_tup
+#                   in exactly those stats, so every image roll resets its
+#                   counters toward zero and autovacuum can go unfired for
+#                   long stretches; job #2's scale-factor tuning lowers the
+#                   threshold but cannot fix a counter that keeps restarting
+#                   at 0. The payoff measured on the live host is the
+#                   VISIBILITY MAP, not disk space: before a manual vacuum,
+#                   entity_cooccurrences was 35.1% all-visible,
+#                   observation_history 25.2%, memory_links 86.3%; after a
+#                   25-SECOND `vacuumdb -j 8 --analyze` of the whole 19 GB
+#                   database, 99.0% / 100% / 99.2%. A low all-visible
+#                   fraction forces heap fetches instead of index-only
+#                   scans — one observed graph-maintenance query was doing
+#                   1.15 MILLION heap fetches. NEVER `VACUUM FULL`: it takes
+#                   an ACCESS EXCLUSIVE lock and would freeze fleet memory
+#                   for the duration.
+#   8b. Reindex   — conditional `REINDEX INDEX CONCURRENTLY`, at most once
+#                   per REINDEX_INTERVAL_MIN, and MEASURED not guessed:
+#                   pgstatindex().avg_leaf_density below
+#                   REINDEX_MIN_DENSITY (a freshly built btree is ~90).
+#                   Measured on the live host: idx_memory_links_unique 73.5%
+#                   density / 29.1% leaf fragmentation,
+#                   idx_memory_links_to_type_weight 68.7% / 35.3%,
+#                   idx_memory_links_from_type_weight 69.6% / 34.3%,
+#                   pk_entity_cooccurrences 67.4% / 44.6%. Candidates come
+#                   from the CATALOG (pg_am.amname='btree', public schema,
+#                   larger than REINDEX_MIN_MB), never a hardcoded list —
+#                   this DB also carries hnsw (pgvector) and bm25
+#                   (pg_search) indexes, where pgstatindex ERRORS outright
+#                   and a rebuild is enormously expensive and not a bloat
+#                   fix. CONCURRENTLY always (a bare REINDEX takes an
+#                   exclusive lock). Guarded by free disk (CONCURRENTLY
+#                   builds a full second copy), capped per tick, and never
+#                   run in the same tick as 8a — both take a
+#                   ShareUpdateExclusiveLock on the table and would
+#                   serialize. Note the entrypoint calls this script
+#                   SYNCHRONOUSLY inside its refresh loop, so a long 8a/8b
+#                   pushes that tick's next credential refresh out by its
+#                   own duration — bounded by REINDEX_MAX_PER_RUN, and
+#                   harmless because the fetcher refreshes far ahead of
+#                   token expiry.
 #
 # Everything is best-effort: any failure (pg not up yet, missing creds,
 # psql absent) is logged and swallowed so a bad tick can never wedge the
@@ -56,6 +104,18 @@
 #   SWITCHROOM_HINDSIGHT_API_URL / _API_TOKEN  override the loopback engine API base
 #                                             URL / bearer token for the requeue POST
 #                                             (else http://127.0.0.1:${HINDSIGHT_API_PORT:-9077})
+#   SWITCHROOM_HINDSIGHT_VACUUM               job 8a master switch. 1=on (default), 0=off
+#   SWITCHROOM_HINDSIGHT_VACUUM_INTERVAL_MIN  min minutes between vacuums. default 360 (6h)
+#   SWITCHROOM_HINDSIGHT_VACUUM_JOBS          vacuumdb -j parallelism. default 4 (the host
+#                                             is not assumed to be big)
+#   SWITCHROOM_HINDSIGHT_REINDEX              job 8b master switch. 1=on (default), 0=off
+#   SWITCHROOM_HINDSIGHT_REINDEX_INTERVAL_MIN min minutes between reindex sweeps.
+#                                             default 10080 (weekly)
+#   SWITCHROOM_HINDSIGHT_REINDEX_MIN_DENSITY  rebuild only below this avg_leaf_density
+#                                             percent. default 70 (fresh btree is ~90)
+#   SWITCHROOM_HINDSIGHT_REINDEX_MIN_MB       ignore indexes smaller than this. default 256
+#   SWITCHROOM_HINDSIGHT_REINDEX_MAX_PER_RUN  max indexes rebuilt per sweep, lowest density
+#                                             first. default 3 (the skipped count is LOGGED)
 set -u
 
 MAINT_ENABLED="${SWITCHROOM_HINDSIGHT_MAINTENANCE:-1}"
@@ -97,6 +157,15 @@ STUCK_OP_WARN_S="${SWITCHROOM_HINDSIGHT_STUCK_OP_WARN_S:-3600}"
 DEAD_LETTER_WARN_S="${SWITCHROOM_HINDSIGHT_DEAD_LETTER_WARN_S:-21600}"
 REQUEUE_DEAD_LETTERS="${SWITCHROOM_HINDSIGHT_REQUEUE_DEAD_LETTERS:-0}"
 REQUEUE_MAX="${SWITCHROOM_HINDSIGHT_REQUEUE_MAX:-100}"
+# Job 8a/8b — periodic vacuum + conditional reindex (see the header block).
+VACUUM_ENABLED="${SWITCHROOM_HINDSIGHT_VACUUM:-1}"
+VACUUM_INTERVAL_MIN="${SWITCHROOM_HINDSIGHT_VACUUM_INTERVAL_MIN:-360}"
+VACUUM_JOBS="${SWITCHROOM_HINDSIGHT_VACUUM_JOBS:-4}"
+REINDEX_ENABLED="${SWITCHROOM_HINDSIGHT_REINDEX:-1}"
+REINDEX_INTERVAL_MIN="${SWITCHROOM_HINDSIGHT_REINDEX_INTERVAL_MIN:-10080}"
+REINDEX_MIN_DENSITY="${SWITCHROOM_HINDSIGHT_REINDEX_MIN_DENSITY:-70}"
+REINDEX_MIN_MB="${SWITCHROOM_HINDSIGHT_REINDEX_MIN_MB:-256}"
+REINDEX_MAX_PER_RUN="${SWITCHROOM_HINDSIGHT_REINDEX_MAX_PER_RUN:-3}"
 
 log() { echo "switchroom-hindsight-maintenance: $*" >&2; }
 
@@ -108,6 +177,9 @@ log() { echo "switchroom-hindsight-maintenance: $*" >&2; }
 _bindir="$(ls -d /home/hindsight/.pg0/installation/*/bin 2>/dev/null | head -1)"
 PSQL="$(command -v psql 2>/dev/null || echo "${_bindir:-/nonexistent}/psql")"
 PG_DUMP="$(command -v pg_dump 2>/dev/null || echo "${_bindir:-/nonexistent}/pg_dump")"
+# vacuumdb gives job 8a table-level parallelism; absent, 8a falls back to
+# per-table `VACUUM (ANALYZE)` over the same connection psql already uses.
+VACUUMDB="$(command -v vacuumdb 2>/dev/null || echo "${_bindir:-/nonexistent}/vacuumdb")"
 [ -x "${PSQL}" ] || exit 0
 
 # Pull connection fields from the descriptor without a JSON dep in sh.
@@ -127,6 +199,14 @@ PGPASSWORD="${PGPW_}" "${PSQL}" -U "${PGUSER_}" -h /tmp -p "${PGPORT_}" -d "${PG
 _sql() {
   PGPASSWORD="${PGPW_}" "${PSQL}" -U "${PGUSER_}" -h /tmp -p "${PGPORT_}" -d "${PGDB_}" \
     -v ON_ERROR_STOP=0 -tAc "$1" 2>/dev/null
+}
+
+# Same connection, but ON_ERROR_STOP=1 so the CALLER can branch on failure.
+# `_sql` deliberately swallows errors (exit 0) — a DDL statement whose outcome
+# we report on (job 8b's REINDEX / DROP INDEX) must not silently "succeed".
+_sql_x() {
+  PGPASSWORD="${PGPW_}" "${PSQL}" -U "${PGUSER_}" -h /tmp -p "${PGPORT_}" -d "${PGDB_}" \
+    -v ON_ERROR_STOP=1 -tAc "$1" >/dev/null 2>&1
 }
 
 # --- 2. Autovacuum tuning (idempotent; ALTER is a no-op if unchanged) ---
@@ -356,6 +436,142 @@ if [ "${REQUEUE_DEAD_LETTERS}" = "1" ]; then
       else
         log "dead-letter requeue: ${_ok} requeued, ${_fail} failed (bounded at ${REQUEUE_MAX}/tick)."
       fi
+    fi
+  fi
+fi
+
+# --- 8a. Periodic VACUUM (ANALYZE) — belt to autovacuum's braces ---
+# Cumulative stats do NOT survive a container recreate on this deployment
+# (pg_stat_database.stats_reset NULL, last_autovacuum empty for every table
+# minutes after a roll), so autovacuum's n_dead_tup trigger keeps restarting
+# from zero and can go unfired for long stretches. The measured win is the
+# visibility map: 35.1% / 25.2% all-visible before, 99.0% / 100% after — a low
+# all-visible fraction forces heap fetches instead of index-only scans (one
+# graph-maintenance query observed doing 1.15M heap fetches).
+#
+# PLAIN VACUUM ONLY. `VACUUM FULL` takes an ACCESS EXCLUSIVE lock and would
+# freeze every agent's memory for the whole rewrite; it is never issued here.
+#
+# The throttle marker lives in BACKUP_DIR because that is a SEPARATE
+# PERSISTENT volume — a marker under the pg data dir or /tmp would vanish on
+# a container recreate and the vacuum would re-run on every roll.
+_vacuum_ran=0
+if [ "${VACUUM_ENABLED}" = "1" ] && mkdir -p "${BACKUP_DIR}" 2>/dev/null; then
+  _vac_marker="${BACKUP_DIR}/.vacuum-last"
+  if [ -z "$(find "${_vac_marker}" -maxdepth 0 -mmin "-${VACUUM_INTERVAL_MIN}" 2>/dev/null)" ]; then
+    # Claim the window BEFORE the work: a vacuum that dies mid-way (container
+    # stop) must not re-run on every subsequent tick.
+    touch "${_vac_marker}" 2>/dev/null
+    _vacuum_ran=1
+    _vac_t0="$(date +%s)"
+    if [ -x "${VACUUMDB}" ]; then
+      if PGPASSWORD="${PGPW_}" "${VACUUMDB}" -U "${PGUSER_}" -h /tmp -p "${PGPORT_}" \
+           -d "${PGDB_}" -j "${VACUUM_JOBS}" --analyze >/dev/null 2>&1; then
+        log "vacuum (analyze) completed in $(( $(date +%s) - _vac_t0 ))s (vacuumdb -j ${VACUUM_JOBS})"
+      else
+        log "vacuum (analyze) FAILED via vacuumdb after $(( $(date +%s) - _vac_t0 ))s (will retry in ${VACUUM_INTERVAL_MIN}m)"
+      fi
+    else
+      # No vacuumdb in the image — serial per-table fallback over psql.
+      _vac_tables="$(_sql "SELECT quote_ident(schemaname)||'.'||quote_ident(relname) FROM pg_stat_user_tables WHERE schemaname='public' ORDER BY relname")"
+      _vac_n=0
+      if [ -n "${_vac_tables}" ]; then
+        _vac_tmpf="$(mktemp 2>/dev/null || echo "/tmp/hs-vacuum.$$")"
+        printf '%s\n' "${_vac_tables}" > "${_vac_tmpf}"
+        while IFS= read -r _vt; do
+          [ -n "${_vt}" ] || continue
+          _sql "VACUUM (ANALYZE) ${_vt}" >/dev/null 2>&1
+          _vac_n=$((_vac_n + 1))
+        done < "${_vac_tmpf}"
+        rm -f "${_vac_tmpf}" 2>/dev/null
+      fi
+      log "vacuum (analyze) completed in $(( $(date +%s) - _vac_t0 ))s (${_vac_n} table(s), per-table fallback — vacuumdb absent)"
+    fi
+  fi
+fi
+
+# --- 8b. Conditional REINDEX INDEX CONCURRENTLY — measured, not guessed ---
+# Skipped entirely in a tick where 8a ran: VACUUM and REINDEX CONCURRENTLY both
+# take a ShareUpdateExclusiveLock on the table and would simply serialize.
+if [ "${REINDEX_ENABLED}" = "1" ] && [ "${_vacuum_ran}" = "0" ] && mkdir -p "${BACKUP_DIR}" 2>/dev/null; then
+  _rix_marker="${BACKUP_DIR}/.reindex-last"
+  if [ -z "$(find "${_rix_marker}" -maxdepth 0 -mmin "-${REINDEX_INTERVAL_MIN}" 2>/dev/null)" ]; then
+    touch "${_rix_marker}" 2>/dev/null
+    # pgstattuple supplies pgstatindex(); best-effort, same shape as amcheck.
+    _sql "CREATE EXTENSION IF NOT EXISTS pgstattuple" >/dev/null 2>&1
+    # Candidates from the CATALOG: btree ONLY. This DB carries hnsw (pgvector)
+    # and bm25 (pg_search) indexes — pgstatindex errors on those AMs and
+    # rebuilding them is enormously expensive and not a bloat fix.
+    _rix_cands="$(_sql "SELECT c.oid::regclass::text||'|'||pg_relation_size(c.oid) FROM pg_class c JOIN pg_am am ON am.oid=c.relam JOIN pg_index i ON i.indexrelid=c.oid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE c.relkind='i' AND am.amname='btree' AND n.nspname='public' AND i.indisvalid AND pg_relation_size(c.oid) > ${REINDEX_MIN_MB}*1024*1024 ORDER BY pg_relation_size(c.oid) DESC")"
+    if [ -n "${_rix_cands}" ]; then
+      # Residue sweep: a CANCELLED `REINDEX ... CONCURRENTLY` leaves an INVALID
+      # index behind that still costs writes. Drop only the ones matching pg's
+      # own `_ccnew` suffix — a user index that is invalid for some other reason
+      # is NOT ours to remove.
+      _rix_dead="$(_sql "SELECT c.oid::regclass::text FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE NOT i.indisvalid AND n.nspname='public' AND c.relname LIKE '%\\_ccnew%'")"
+      if [ -n "${_rix_dead}" ]; then
+        _rix_dtmp="$(mktemp 2>/dev/null || echo "/tmp/hs-ccnew.$$")"
+        printf '%s\n' "${_rix_dead}" > "${_rix_dtmp}"
+        while IFS= read -r _di; do
+          [ -n "${_di}" ] || continue
+          if _sql_x "DROP INDEX CONCURRENTLY IF EXISTS ${_di}"; then
+            log "reindex: dropped leftover INVALID index ${_di} (residue of a cancelled REINDEX CONCURRENTLY)"
+          fi
+        done < "${_rix_dtmp}"
+        rm -f "${_rix_dtmp}" 2>/dev/null
+      fi
+
+      # Measure each candidate's avg_leaf_density; a freshly built btree is ~90.
+      # pgstatindex reads the whole index, so this costs one sequential pass per
+      # candidate — bounded by the >REINDEX_MIN_MB floor and the weekly interval,
+      # and it is the price of not rebuilding on a guess.
+      _rix_tmpf="$(mktemp 2>/dev/null || echo "/tmp/hs-reindex.$$")"
+      _rix_bloated="$(mktemp 2>/dev/null || echo "/tmp/hs-reindex-b.$$")"
+      printf '%s\n' "${_rix_cands}" > "${_rix_tmpf}"
+      : > "${_rix_bloated}"
+      while IFS='|' read -r _ix _ixbytes; do
+        [ -n "${_ix}" ] || continue
+        _dens="$(_sql "SELECT round(avg_leaf_density)::int FROM pgstatindex('${_ix}')")"
+        # Unreadable density (non-btree slipped through, extension missing,
+        # index vanished) => leave it alone rather than rebuild blind.
+        [ -n "${_dens}" ] || continue
+        [ "${_dens}" -lt "${REINDEX_MIN_DENSITY}" ] 2>/dev/null || continue
+        printf '%s|%s|%s\n' "${_dens}" "${_ix}" "${_ixbytes:-0}" >> "${_rix_bloated}"
+      done < "${_rix_tmpf}"
+      rm -f "${_rix_tmpf}" 2>/dev/null
+
+      _rix_total="$(grep -c . "${_rix_bloated}" 2>/dev/null || true)"
+      if [ "${_rix_total:-0}" -gt 0 ] 2>/dev/null; then
+        # Worst bloat (lowest density) first, capped per tick.
+        _rix_pgdata="$(_sql "SHOW data_directory")"
+        [ -n "${_rix_pgdata}" ] && [ -d "${_rix_pgdata}" ] || _rix_pgdata="$(dirname "${PG0_INSTANCE}")"
+        sort -t'|' -k1,1n "${_rix_bloated}" | head -n "${REINDEX_MAX_PER_RUN}" > "${_rix_bloated}.pick"
+        mv -f "${_rix_bloated}.pick" "${_rix_bloated}" 2>/dev/null
+        _rix_picked="$(grep -c . "${_rix_bloated}" 2>/dev/null || true)"
+        while IFS='|' read -r _dens _ix _ixbytes; do
+          [ -n "${_ix}" ] || continue
+          # Disk guard: CONCURRENTLY builds a full SECOND copy before swapping.
+          # An unreadable df (path gone) leaves _free_kb empty and the guard
+          # open — the same best-effort posture as the rest of the script.
+          _free_kb="$(df -P "${_rix_pgdata}" 2>/dev/null | awk 'NR==2{print $4}')"
+          _need_kb=$(( (${_ixbytes:-0} / 1024) * 2 ))
+          if [ -n "${_free_kb}" ] && [ "${_free_kb}" -lt "${_need_kb}" ] 2>/dev/null; then
+            log "reindex: SKIPPED ${_ix} (density ${_dens}%) — only $((_free_kb/1024))MB free on ${_rix_pgdata}, CONCURRENTLY needs $((_need_kb/1024))MB (2x the index)."
+            continue
+          fi
+          _rix_t0="$(date +%s)"
+          if _sql_x "REINDEX INDEX CONCURRENTLY ${_ix}"; then
+            log "reindex: rebuilt ${_ix} (avg_leaf_density was ${_dens}% < ${REINDEX_MIN_DENSITY}%) in $(( $(date +%s) - _rix_t0 ))s"
+          else
+            log "WARNING: reindex: REINDEX INDEX CONCURRENTLY ${_ix} failed after $(( $(date +%s) - _rix_t0 ))s — continuing with the next candidate."
+          fi
+        done < "${_rix_bloated}"
+        _rix_skipped=$(( ${_rix_total:-0} - ${_rix_picked:-0} ))
+        if [ "${_rix_skipped}" -gt 0 ] 2>/dev/null; then
+          log "reindex: ${_rix_skipped} bloated index(es) left for the next sweep — capped at ${REINDEX_MAX_PER_RUN}/run (SWITCHROOM_HINDSIGHT_REINDEX_MAX_PER_RUN)."
+        fi
+      fi
+      rm -f "${_rix_bloated}" 2>/dev/null
     fi
   fi
 fi

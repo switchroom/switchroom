@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   rmSync,
   accessSync,
+  utimesSync,
   constants as fsConstants,
 } from "node:fs";
 import { resolve, join } from "node:path";
@@ -74,6 +75,19 @@ case "$sql" in
   *"status='failed'"*"ORDER BY created_at"*)
     # Requeue candidate select (#3795): "bank|operation_id" lines.
     [ -n "\${FAKE_DL_CANDS:-}" ] && printf '%s\\n' "\$FAKE_DL_CANDS"; exit 0 ;;
+  *"amname='btree'"*)
+    # Job 8b candidate select: "index|size_bytes" lines.
+    [ -n "\${FAKE_IDX_CANDS:-}" ] && printf '%s\\n' "\$FAKE_IDX_CANDS"; exit 0 ;;
+  *_ccnew*)
+    # Job 8b invalid-index residue sweep: bare index names.
+    [ -n "\${FAKE_IDX_INVALID:-}" ] && printf '%s\\n' "\$FAKE_IDX_INVALID"; exit 0 ;;
+  *pgstatindex*)
+    # Density lookup. FAKE_IDX_DENSITY is "name=NN;name2=NN".
+    ix="\$(printf '%s' "\$sql" | sed "s/.*pgstatindex('\\([^']*\\)').*/\\1/")"
+    for pair in \$(printf '%s' "\${FAKE_IDX_DENSITY:-}" | tr ';' ' '); do
+      case "\$pair" in "\$ix="*) printf '%s\\n' "\${pair#*=}" ;; esac
+    done
+    exit 0 ;;
   *) exit 0 ;;
 esac
 `,
@@ -95,6 +109,22 @@ url=""
 for a in "$@"; do url="$a"; done
 [ -n "\${FAKE_CURL_LOG:-}" ] && printf '%s\\n' "$url" >> "$FAKE_CURL_LOG"
 printf '%s' "\${FAKE_CURL_CODE:-200}"
+`,
+    { mode: 0o755 },
+  );
+}
+
+/**
+ * Write a fake `vacuumdb` beside the fake `psql`. It appends its full argv to
+ * `$FAKE_VACUUMDB_LOG` so a test can assert WHAT was asked of it (e.g.
+ * `--analyze`, `-j N`, and never a full-rewrite flag).
+ */
+function installFakeVacuumdb(binDir: string): void {
+  writeFileSync(
+    join(binDir, "vacuumdb"),
+    `#!/bin/sh
+[ -n "\${FAKE_VACUUMDB_LOG:-}" ] && printf '%s\\n' "$*" >> "$FAKE_VACUUMDB_LOG"
+exit "\${FAKE_VACUUMDB_EXIT:-0}"
 `,
     { mode: 0o755 },
   );
@@ -554,5 +584,297 @@ describe("hindsight-maintenance.sh", () => {
     expect(raw).toMatch(/Authorization: Bearer \$\{_tok\}/);
     // The requeue must NOT reach into the queue table with a raw UPDATE.
     expect(raw).not.toMatch(/UPDATE async_operations SET status='pending'/);
+  });
+
+  // ── Job 8a/8b: periodic VACUUM (ANALYZE) + conditional REINDEX ──────────
+  //
+  // Driven with a fake psql/vacuumdb; every assertion is on an OUTCOME — what
+  // the script actually executed and logged — not on the presence of code.
+  describe("job #8 vacuum + conditional reindex", () => {
+    /** One maintenance tick against the fakes in `binDir`, state under `dir`. */
+    function runTick(binDir: string, dir: string, env: Record<string, string>) {
+      return spawnSync("sh", [SCRIPT], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          SWITCHROOM_HINDSIGHT_PG0_INSTANCE: join(dir, "instance.json"),
+          SWITCHROOM_HINDSIGHT_BACKUP_DIR: join(dir, "backups"),
+          ...env,
+        },
+        encoding: "utf-8",
+        timeout: 20_000,
+      });
+    }
+
+    /** Fresh (dir, binDir) with a pg descriptor + fake psql/vacuumdb. */
+    function setup(): { dir: string; binDir: string } {
+      const dir = mkdtempSync(join(tmpdir(), "swr-hsi-vac-"));
+      const binDir = installFakePsql();
+      installFakeVacuumdb(binDir);
+      writePgInstance(join(dir, "instance.json"));
+      return { dir, binDir };
+    }
+
+    function teardown(dir: string, binDir: string): void {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+
+    function lines(path: string): string[] {
+      try {
+        return readFileSync(path, "utf-8").split("\n").filter(Boolean);
+      } catch {
+        return [];
+      }
+    }
+
+    it("8a vacuums once per interval: throttled inside the window, permitted after it", () => {
+      const { dir, binDir } = setup();
+      try {
+        const vlog = join(dir, "vacuumdb.log");
+        const env = {
+          FAKE_VACUUMDB_LOG: vlog,
+          SWITCHROOM_HINDSIGHT_REINDEX: "0",
+          SWITCHROOM_HINDSIGHT_VACUUM_INTERVAL_MIN: "360",
+        };
+
+        const r1 = runTick(binDir, dir, env);
+        expect(r1.status).toBe(0);
+        expect(r1.stderr).toMatch(/vacuum \(analyze\) completed in \d+s \(vacuumdb -j 4\)/);
+        expect(lines(vlog)).toHaveLength(1);
+        expect(lines(vlog)[0]).toContain("--analyze");
+        expect(lines(vlog)[0]).toMatch(/-j 4\b/);
+
+        // Second tick inside the window: the throttle must SUPPRESS it.
+        const r2 = runTick(binDir, dir, env);
+        expect(r2.status).toBe(0);
+        expect(r2.stderr).not.toMatch(/vacuum \(analyze\) completed/);
+        expect(lines(vlog)).toHaveLength(1);
+
+        // Age the marker past the window: the next tick must vacuum again.
+        const marker = join(dir, "backups", ".vacuum-last");
+        const old = new Date(Date.now() - 7 * 3600_000);
+        utimesSync(marker, old, old);
+        const r3 = runTick(binDir, dir, env);
+        expect(r3.status).toBe(0);
+        expect(r3.stderr).toMatch(/vacuum \(analyze\) completed/);
+        expect(lines(vlog)).toHaveLength(2);
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8a NEVER issues VACUUM FULL (it would take an ACCESS EXCLUSIVE lock)", () => {
+      const { dir, binDir } = setup();
+      try {
+        const vlog = join(dir, "vacuumdb.log");
+        const sqlLog = join(dir, "psql-sql.log");
+        const r = runTick(binDir, dir, {
+          FAKE_VACUUMDB_LOG: vlog,
+          FAKE_PSQL_LOG: sqlLog,
+          FAKE_IDX_CANDS: "idx_low|1048576",
+          FAKE_IDX_DENSITY: "idx_low=60",
+        });
+        expect(r.status).toBe(0);
+        // Nothing the script executed — via psql or vacuumdb — was a full vacuum.
+        for (const l of [...lines(vlog), ...lines(sqlLog)]) {
+          expect(l).not.toMatch(/VACUUM\s+FULL/i);
+          expect(l).not.toMatch(/(^|\s)(-f|--full)(\s|$)/);
+        }
+        // ...and the source carries no full-vacuum call site at all (the only
+        // permitted mention is the comment explaining why it is banned).
+        const code = readFileSync(SCRIPT, "utf-8")
+          .split("\n")
+          .filter((l) => !l.trimStart().startsWith("#"));
+        expect(code.join("\n")).not.toMatch(/VACUUM\s+FULL/i);
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8a and 8b no-op when their master switch is 0", () => {
+      const { dir, binDir } = setup();
+      try {
+        const vlog = join(dir, "vacuumdb.log");
+        const sqlLog = join(dir, "psql-sql.log");
+        const r = runTick(binDir, dir, {
+          SWITCHROOM_HINDSIGHT_VACUUM: "0",
+          SWITCHROOM_HINDSIGHT_REINDEX: "0",
+          FAKE_VACUUMDB_LOG: vlog,
+          FAKE_PSQL_LOG: sqlLog,
+          FAKE_IDX_CANDS: "idx_low|1048576",
+          FAKE_IDX_DENSITY: "idx_low=10",
+        });
+        expect(r.status).toBe(0);
+        expect(lines(vlog)).toHaveLength(0);
+        expect(r.stderr).not.toMatch(/vacuum \(analyze\)/);
+        const sql = lines(sqlLog).join("\n");
+        expect(sql).not.toMatch(/REINDEX/);
+        expect(sql).not.toMatch(/VACUUM/);
+        // Neither job claimed its throttle window.
+        expect(lines(join(dir, "backups", ".vacuum-last"))).toHaveLength(0);
+        expect(() => readFileSync(join(dir, "backups", ".reindex-last"))).toThrow();
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8a and 8b no-op (exit 0, no markers) when psql is absent", () => {
+      const { dir, binDir } = setup();
+      try {
+        // A PATH with the fake vacuumdb but NO psql at all: the script must
+        // bail at the client-resolution guard before touching anything.
+        const noPsqlBin = execTmpDir("swr-maint-nopsql-");
+        installFakeVacuumdb(noPsqlBin);
+        const vlog = join(dir, "vacuumdb.log");
+        const r = spawnSync("/bin/sh", [SCRIPT], {
+          env: {
+            ...process.env,
+            PATH: noPsqlBin, // no psql anywhere on PATH
+            SWITCHROOM_HINDSIGHT_PG0_INSTANCE: join(dir, "instance.json"),
+            SWITCHROOM_HINDSIGHT_BACKUP_DIR: join(dir, "backups"),
+            FAKE_VACUUMDB_LOG: vlog,
+          },
+          encoding: "utf-8",
+          timeout: 20_000,
+        });
+        expect(r.status).toBe(0);
+        // No maintenance log line at all — the script's own logs are prefixed.
+        expect(r.stderr).not.toMatch(/switchroom-hindsight-maintenance:/);
+        expect(lines(vlog)).toHaveLength(0);
+        expect(() => readFileSync(join(dir, "backups", ".vacuum-last"))).toThrow();
+        rmSync(noPsqlBin, { recursive: true, force: true });
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8b rebuilds ONLY the below-threshold index, always CONCURRENTLY, and clears _ccnew residue", () => {
+      const { dir, binDir } = setup();
+      try {
+        const sqlLog = join(dir, "psql-sql.log");
+        const r = runTick(binDir, dir, {
+          FAKE_PSQL_LOG: sqlLog,
+          // 8a would otherwise hold the ShareUpdateExclusiveLock window.
+          SWITCHROOM_HINDSIGHT_VACUUM: "0",
+          FAKE_IDX_CANDS: "idx_low|1048576\nidx_high|1048576",
+          FAKE_IDX_DENSITY: "idx_low=60;idx_high=85",
+          FAKE_IDX_INVALID: "idx_low_ccnew",
+        });
+        expect(r.status).toBe(0);
+        const sql = lines(sqlLog);
+        // The candidate query ACTUALLY SENT to postgres filters on the access
+        // method — an hnsw/bm25 index can never enter the candidate set.
+        const candidateSql = sql.filter((l) => /FROM pg_class c JOIN pg_am/.test(l));
+        expect(candidateSql).toHaveLength(1);
+        expect(candidateSql[0]).toContain("am.amname='btree'");
+        // The bloated one was rebuilt; the healthy one was left alone.
+        expect(r.stderr).toMatch(/reindex: rebuilt idx_low \(avg_leaf_density was 60% < 70%\)/);
+        expect(r.stderr).not.toMatch(/rebuilt idx_high/);
+        expect(sql).toContain("REINDEX INDEX CONCURRENTLY idx_low");
+        expect(sql.join("\n")).not.toMatch(/REINDEX[^\n]*idx_high/);
+        // EVERY reindex issued is CONCURRENTLY — a bare REINDEX would take an
+        // exclusive lock on a live fleet-memory table.
+        for (const l of sql.filter((s) => /REINDEX/.test(s))) {
+          expect(l).toMatch(/^REINDEX INDEX CONCURRENTLY /);
+        }
+        // Residue of a cancelled CONCURRENTLY build was dropped concurrently.
+        expect(sql).toContain("DROP INDEX CONCURRENTLY IF EXISTS idx_low_ccnew");
+        expect(r.stderr).toMatch(/dropped leftover INVALID index idx_low_ccnew/);
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8b caps the work per tick and LOGS how many candidates it skipped", () => {
+      const { dir, binDir } = setup();
+      try {
+        const sqlLog = join(dir, "psql-sql.log");
+        const r = runTick(binDir, dir, {
+          FAKE_PSQL_LOG: sqlLog,
+          SWITCHROOM_HINDSIGHT_VACUUM: "0",
+          FAKE_IDX_CANDS: ["a|1048576", "b|1048576", "c|1048576", "d|1048576"].join("\n"),
+          FAKE_IDX_DENSITY: "a=50;b=55;c=60;d=65",
+        });
+        expect(r.status).toBe(0);
+        const rebuilt = lines(sqlLog).filter((l) => /^REINDEX/.test(l));
+        expect(rebuilt).toHaveLength(3); // default REINDEX_MAX_PER_RUN
+        // Worst bloat first: a (50) / b (55) / c (60), never d (65).
+        expect(rebuilt.join("\n")).not.toMatch(/\bd\b/);
+        // The cap is LOUD — a silent cap reads as "did everything".
+        expect(r.stderr).toMatch(
+          /reindex: 1 bloated index\(es\) left for the next sweep — capped at 3\/run/,
+        );
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8b skips an index when free disk is under 2x its size (CONCURRENTLY doubles it)", () => {
+      const { dir, binDir } = setup();
+      try {
+        const sqlLog = join(dir, "psql-sql.log");
+        const r = runTick(binDir, dir, {
+          FAKE_PSQL_LOG: sqlLog,
+          SWITCHROOM_HINDSIGHT_VACUUM: "0",
+          // 1 PB index: no CI runner has 2 PB free.
+          FAKE_IDX_CANDS: "idx_huge|1000000000000000",
+          FAKE_IDX_DENSITY: "idx_huge=40",
+        });
+        expect(r.status).toBe(0);
+        expect(r.stderr).toMatch(/reindex: SKIPPED idx_huge \(density 40%\)[^\n]*free/);
+        expect(lines(sqlLog).join("\n")).not.toMatch(/REINDEX/);
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8b never runs in the same tick as 8a (lock contention), but runs on the next one", () => {
+      const { dir, binDir } = setup();
+      try {
+        const sqlLog = join(dir, "psql-sql.log");
+        const vlog = join(dir, "vacuumdb.log");
+        const env = {
+          FAKE_PSQL_LOG: sqlLog,
+          FAKE_VACUUMDB_LOG: vlog,
+          FAKE_IDX_CANDS: "idx_low|1048576",
+          FAKE_IDX_DENSITY: "idx_low=60",
+        };
+        // Tick 1: 8a runs (fresh marker) ⇒ 8b must stand down.
+        const r1 = runTick(binDir, dir, env);
+        expect(r1.status).toBe(0);
+        expect(lines(vlog)).toHaveLength(1);
+        expect(lines(sqlLog).join("\n")).not.toMatch(/REINDEX/);
+        // Tick 2: 8a is throttled ⇒ 8b gets the table to itself.
+        const r2 = runTick(binDir, dir, env);
+        expect(r2.status).toBe(0);
+        expect(lines(vlog)).toHaveLength(1);
+        expect(lines(sqlLog)).toContain("REINDEX INDEX CONCURRENTLY idx_low");
+        expect(r2.stderr).toMatch(/reindex: rebuilt idx_low/);
+      } finally {
+        teardown(dir, binDir);
+      }
+    });
+
+    it("8b candidate selection is btree-ONLY and catalog-driven (hnsw/bm25 can never be picked)", () => {
+      // Comment lines are stripped: the header block legitimately DISCUSSES
+      // btree/hnsw/bm25, and a guard satisfied by prose guards nothing.
+      const raw = readFileSync(SCRIPT, "utf-8")
+        .split("\n")
+        .filter((l) => !l.trimStart().startsWith("#"))
+        .join("\n");
+      // The candidate query joins pg_am and filters to btree — pgstatindex
+      // ERRORS on hnsw/bm25 and rebuilding them is not a bloat fix.
+      expect(raw).toMatch(/JOIN pg_am am ON am\.oid=c\.relam/);
+      expect(raw).toMatch(/am\.amname='btree'/);
+      // No hardcoded index list, and the size floor comes from the knob.
+      expect(raw).toMatch(/pg_relation_size\(c\.oid\) > \$\{REINDEX_MIN_MB\}\*1024\*1024/);
+      // Invalid-index residue is scoped to pg's own _ccnew suffix — a user
+      // index that is invalid for another reason is not ours to drop.
+      expect(raw).toMatch(/NOT i\.indisvalid[^\n]*relname LIKE '%\\\\_ccnew%'/);
+      // Throttle markers live on the PERSISTENT backup volume, not pg data/tmp.
+      expect(raw).toMatch(/_vac_marker="\$\{BACKUP_DIR\}\/\.vacuum-last"/);
+      expect(raw).toMatch(/_rix_marker="\$\{BACKUP_DIR\}\/\.reindex-last"/);
+    });
   });
 });
