@@ -17,6 +17,36 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.17 — Memory-redesign v2: orientation-at-boot, directive-injection flip canary, and cross-bank knowledge-page reads
+
+### Features
+
+- **memory(M5): orientation-at-boot (Surface B), shipped dark behind a per-agent kill switch (#4765).** A new matcher-less `SessionStart` hook (`vendor/hindsight-memory/scripts/orientation.py`) injects the agent's cron-refreshed `orientation` mental model into context at boot and re-seats it after every compaction, deterministically and with zero tool call. Entirely gated by `memory.orientation` (per-agent, default **false** — an un-flipped agent boots byte-identically to pre-M5: the hook reads the flag off and no-ops before any bank resolve or network call). Enablement is per-agent ONLY (never fleet-seeded from `defaults`/profiles), so a single config value can never flip injection on across the fleet. The briefing is capped at 2048 tokens with rule-aware, visibly-marked truncation; the staleness guard is per-tier (`memory.orientation_cadence_hours`, default 48 — a safe cost/tiering knob that IS mirrored fleet-wide), so a stale model is injected with a visible prefix, a degraded/undated one degrades to a visible cold notice, and boot is never blocked on the read.
+- **memory: Memory v2 M3 (Surface-A) — per-agent directive-injection flip (#4766)**
+  Adds a `memory.inject_directives` flag (default true). Flipped off, the
+  recall hook stops injecting the always-on `<active_directives>` block once
+  the agent's CLAUDE.md rules block carries the same guardrails — suppressing
+  at all three emit surfaces, gated deterministically on the 6144-byte
+  rules-block budget, and failing safe (keeps injecting + a degraded-canary
+  notice) if a rules block is missing. `switchroom doctor` gains an M3
+  cross-check. Per-agent, default-off fleet-wide; ziggy is the designated
+  canary.
+- **memory: M7/W-2 — knowledge-page reads accept an operator-granted `bank_id` selector**
+
+  The three shim-synthesized knowledge-page reads
+  (`search_knowledge_pages` / `get_knowledge_page` / `get_knowledge_tree`)
+  now carry an optional `bank_id` argument, so a dev agent can read a shared
+  repo knowledge bank's curated pages instead of only its own. Omitted, every
+  read still targets the agent's own bank (unchanged default). A named bank is
+  honoured only when the operator has granted it — the grant set is rendered
+  at apply from the same `memory.recall.additional_banks` that already fans the
+  recall hook out to those banks, threaded to the shim as
+  `HINDSIGHT_KNOWLEDGE_EXTRA_BANKS`; there is no tool-call path that widens it.
+  An ungranted bank is rejected loudly at the shim layer before any network
+  I/O, never silently coerced to the agent's own bank. Writes are unaffected:
+  the directive tools carry no selector and stay own-pinned, and the
+  knowledge surface remains GET-only.
+
 ## v0.21.16 — RFC memory-redesign phase 5: M1 rules-block toolchain (dark), M2 directive-triage card + apply-batch executor, M4 async recall-prefetch buffer (dark), M6 worker read-only recall + cross-bank shim guard; hindsight periodic VACUUM/REINDEX maintenance loop, recall max_tokens floor
 
 ### Features
@@ -25363,6 +25393,7 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
 
