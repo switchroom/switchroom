@@ -64,6 +64,7 @@ from lib.directives import (  # noqa: E402
     parse_active_directives_block,
     rule_already_captured,
 )
+from lib import recall_buffer  # noqa: E402
 
 # Reuse Stage B's pleasantry scrub so "as always" / "always happy to help"
 # can't trip the high-confidence detector either. Imported lazily-safe: if
@@ -387,6 +388,37 @@ def invalidate_cache_on_directive_write(messages: list, config: dict) -> None:
         debug_log(config, f"Directives cache invalidation skipped (error): {e}")
 
 
+def invalidate_prefetch_buffer_on_directive_write(messages: list, config: dict, session_id: str) -> None:
+    """Drop this session's pending M4 prefetch buffer if this turn wrote a
+    directive (create/update/delete/retire).
+
+    red-team-M3 R2 (BLOCKER): the A4 cache invalidation above keeps the fresh
+    <active_directives> block current, but the M4 prefetch buffer carries a
+    RECALLED memories block captured at a prior turn's Stop — and a rule/
+    directive that was just retired can survive in that snapshot as recalled
+    text. Without this, a buffer prefetched while the rule was active would
+    re-inject the retired rule on the next turn (the exact §4.4 resurrection
+    failure), and `run_prefetch` bailing on an empty recall would leave that
+    stale buffer to be served on later turns too. Deleting the buffer + sentinel
+    here forces the consumer to fall to the synchronous, always-current path
+    (or the explicitly stale-marked fallback) instead of resurrecting it.
+
+    Only fires when `memoryPrefetchEnabled` is on (the buffer only exists then)
+    — a cheap no-op statting two absent files otherwise, so gated to avoid it.
+    Self-guarded; never raises (a Stop hook must not wedge a turn).
+    """
+    try:
+        if not messages or not config.get("memoryPrefetchEnabled", False):
+            return
+        idx, _text = find_last_human_turn(messages)
+        start = idx if idx is not None else -1
+        if turn_contains_directive_write(messages, start):
+            recall_buffer.invalidate(session_id or "unknown")
+            debug_log(config, "Prefetch buffer invalidated — turn wrote a directive (R2 resurrection guard)")
+    except Exception as e:  # pragma: no cover - defensive; Stop must not wedge
+        debug_log(config, f"Prefetch-buffer invalidation skipped (error): {e}")
+
+
 def read_transcript(transcript_path: str) -> list:
     """Read a JSONL transcript into a list of message dicts (role/content).
 
@@ -508,6 +540,7 @@ def main():
     #     and this is not an already-blocked re-fire.
     ttl = config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS)
     cache_on = isinstance(ttl, (int, float)) and ttl > 0
+    prefetch_on = bool(config.get("memoryPrefetchEnabled", False))
     verify_maybe = (
         config.get("directiveCaptureNudge", True)
         and config.get("directiveCaptureVerify", True)
@@ -515,7 +548,7 @@ def main():
     )
 
     messages: list = []
-    if cache_on or verify_maybe:
+    if cache_on or verify_maybe or prefetch_on:
         messages = read_transcript(hook_input.get("transcript_path", ""))
 
     # A4: invalidate the directives cache when this turn wrote a directive, so
@@ -523,6 +556,15 @@ def main():
     # capture-verify decision below and self-guarded — runs on every Stop.
     if cache_on:
         invalidate_cache_on_directive_write(messages, config)
+
+    # R2 (BLOCKER): invalidate this session's M4 prefetch buffer when this turn
+    # wrote/retired a directive, so a stale pre-retire snapshot can never
+    # resurrect the retired rule on a later turn. Self-guarded no-op when
+    # prefetch is off.
+    if prefetch_on:
+        invalidate_prefetch_buffer_on_directive_write(
+            messages, config, hook_input.get("session_id") or "unknown"
+        )
 
     try:
         reason = evaluate(hook_input, config, messages=messages)

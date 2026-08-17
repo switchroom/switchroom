@@ -210,6 +210,35 @@ def read_if_fresh(session_id: str, last_consumed_token: Optional[int]) -> tuple:
     return {"context": payload.get("context", ""), "telemetry": payload.get("telemetry", {})}, token
 
 
+def invalidate(session_id: str) -> None:
+    """Drop any pending prefetch buffer + sentinel for ``session_id``.
+
+    Called at MUTATION sites — a rule/directive retire (``directive_verify``)
+    or a retain (``prefetch.run_prefetch`` before it re-recalls) — so a buffer
+    captured BEFORE the mutation can never be consumed AFTER it. This closes
+    the resurrection class the M3 red-team (R2, BLOCKER) flagged at the
+    M3/M4 intersection: a rule retired mid-session must not re-inject from a
+    buffer prefetched while the rule was still active. It is the read-after-
+    write ordering the producer already builds for the happy path, extended
+    to the mutation path — NOT a reliance on the buffer's TTL (timing, not
+    correctness).
+
+    The SENTINEL is removed FIRST so a partial invalidation still fails
+    closed: ``read_if_fresh`` checks the sentinel before the payload, so once
+    the sentinel is gone the reader returns ``None`` regardless of whether the
+    payload unlink also succeeded — an orphaned payload is never served as
+    fresh. Best-effort and idempotent: a missing file is a no-op, and the
+    function NEVER raises (a failed unlink must not break the turn).
+    """
+    for path in (_sentinel_path(session_id), _buffer_path(session_id)):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
 def poll_for_sentinel(session_id: str, last_consumed_token: Optional[int], cap_ms: int) -> bool:
     """Clock-bounded poll for a fresh sentinel. Never busy-spins.
 
