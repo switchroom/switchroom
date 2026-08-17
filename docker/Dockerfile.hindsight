@@ -4100,7 +4100,7 @@ def _mark_recall_truncated(payload: str, dropped_count: int) -> str:
     obj = _json.loads(payload)
     obj["truncated"] = True
     obj["dropped_count"] = dropped_count
-    return _json.dumps(obj, separators=(",", ":"))
+    return _json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
 def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
@@ -4154,7 +4154,7 @@ def _recall_payload_within_budget(recall_result, max_tokens: int) -> str:
         marked = _mark_recall_truncated(payload, original_count - len(results))
         if fits(marked):
             return marked
-    return _mark_recall_truncated(payload, original_count)
+    return payload if original_count == 0 else _mark_recall_truncated(payload, original_count)
 
 
 '''
