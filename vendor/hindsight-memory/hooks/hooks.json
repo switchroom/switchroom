@@ -42,6 +42,16 @@
             "async": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/prefetch.py\"",
+            "timeout": 20,
+            "async": true
+          }
+        ]
       }
     ],
     "SubagentStop": [
