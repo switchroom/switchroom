@@ -39,16 +39,35 @@
  * Page authorship stays where it already is: the operator-approved
  * `mental_model_propose` card.
  *
- * ## The bank pin is a USABILITY AND PROVENANCE boundary, NOT A SECURITY ONE
+ * ## The bank selector is a USABILITY AND PROVENANCE boundary, NOT A SECURITY ONE
  *
- * `bankId` is pinned here from the agent's own `HINDSIGHT_BANK_ID` and the
- * tool schemas expose no `bank_id` property, so a *tool call* physically
- * cannot read another agent's pages. That is the entire extent of the
- * guarantee — the REST transport is unauthenticated, so raw curl from an
- * agent's Bash bypasses this module entirely. The full statement is in the
- * header of `src/memory/hindsight-directive-admin.ts`; nothing here changes
- * it, and these being READS makes the residual exposure strictly smaller than
- * the directive path's.
+ * `bankId` pins the agent's OWN bank (from `HINDSIGHT_BANK_ID`) and remains the
+ * default for every read. `extraBanks` is the operator-granted set of ADDITIONAL
+ * banks this agent may read — rendered per agent at apply time from the same
+ * `memory.recall.additional_banks` config that already fans the recall hook out
+ * to those banks (design-v2 §10, W-2). A read may name a bank via the tool's
+ * optional `bank_id` selector, and {@link KnowledgeAdmin.resolveBank} validates
+ * it against `{own} ∪ extraBanks`:
+ *
+ *   - omitted / own bank        → own bank (unchanged default);
+ *   - a bank in `extraBanks`    → that bank (the granted cross-bank read);
+ *   - anything else             → LOUD rejection ({@link KnowledgeBankNotGrantedError}),
+ *                                 never silently coerced to the agent's own bank.
+ *
+ * The invariant this preserves is narrow and the one that matters: a caller may
+ * SELECT among operator-granted banks; it can never MINT reach. `extraBanks`
+ * comes only from constructor options (operator config); there is no parameter
+ * path from a tool call to that set. Rev-11/E-95: this is a shim-layer
+ * relaxation of OUR own designed pin, not a platform capability — the engine's
+ * knowledge-base REST routes are already bank-parameterised.
+ *
+ * That is the entire extent of the guarantee — the REST transport is
+ * unauthenticated, so raw curl from an agent's Bash bypasses this module
+ * entirely. The full statement is in the header of
+ * `src/memory/hindsight-directive-admin.ts`; nothing here changes it, and these
+ * being READS makes the residual exposure strictly smaller than the directive
+ * path's. WRITES stay fully pinned — this module has no write, and directive
+ * writes elsewhere keep their own-bank pin (W-2 pt 2).
  */
 
 /** One hybrid-search hit (`KnowledgePageSearchResult` upstream). */
@@ -134,14 +153,52 @@ export interface KnowledgeAdminOptions {
   /** REST base, e.g. `http://127.0.0.1:18888` (no trailing slash). */
   apiBaseUrl: string;
   /**
-   * The agent's OWN bank. Pinned: every request path this module builds
-   * embeds this value, and no caller-supplied input can reach it.
+   * The agent's OWN bank and the default target of every read. A read reaches
+   * a DIFFERENT bank only when a caller-supplied `bank_id` names one in
+   * {@link KnowledgeAdminOptions.extraBanks}; anything else is loud-rejected.
    */
   bankId: string;
+  /**
+   * Operator-granted ADDITIONAL banks this agent may read (design-v2 §10, W-2).
+   * The ONLY source of cross-bank reach: it comes from operator config
+   * (rendered into `HINDSIGHT_KNOWLEDGE_EXTRA_BANKS` at apply from
+   * `memory.recall.additional_banks`), never from a tool call. Empty/undefined
+   * ⇒ own-bank-only, i.e. the pre-W-2 behaviour exactly.
+   */
+  extraBanks?: readonly string[];
   /** Injectable fetch (tests). Defaults to global fetch. */
   fetchImpl?: typeof fetch;
   /** Per-request timeout. */
   timeoutMs?: number;
+}
+
+/**
+ * Thrown when a caller-supplied `bank_id` is neither the agent's own bank nor
+ * one of the operator-granted {@link KnowledgeAdminOptions.extraBanks}.
+ *
+ * A distinct type so the shim can render it as a clean, loud VALIDATION
+ * rejection (the ungranted bank is named, the grant set is named) rather than
+ * as a generic "tool failed" — the anti-silent-drop property W-2 pt 1 requires:
+ * an ungranted bank is rejected loudly, never coerced to the caller's own.
+ */
+export class KnowledgeBankNotGrantedError extends Error {
+  constructor(
+    readonly requested: string,
+    readonly ownBankId: string,
+    readonly grantedBanks: readonly string[],
+  ) {
+    super(
+      grantedBanks.length > 0
+        ? `bank_id '${requested}' is not a bank you can read. You may read your ` +
+            `own bank ('${ownBankId}') or an operator-granted bank ` +
+            `(${grantedBanks.map((b) => `'${b}'`).join(", ")}); '${requested}' ` +
+            `is none of these. Omit bank_id to read your own memory bank.`
+        : `bank_id '${requested}' is not your own bank ('${ownBankId}'), and ` +
+            `this agent has not been granted any other bank to read. Omit ` +
+            `bank_id to read your own memory bank.`,
+    );
+    this.name = "KnowledgeBankNotGrantedError";
+  }
 }
 
 export const KNOWLEDGE_ADMIN_TIMEOUT_MS = 15_000;
@@ -180,20 +237,44 @@ export class KnowledgeAdmin {
   }
 
   /**
-   * Base path for THIS agent's knowledge base. The bank segment comes from
-   * `opts.bankId` only — there is no parameter, so no caller can redirect it.
+   * Resolve the bank a read targets, validating a caller-supplied selector
+   * against `{own} ∪ extraBanks`. The single authority for cross-bank reach:
+   *
+   *   - `undefined` / `""` / the own bank → own bank (unchanged default);
+   *   - a bank in `extraBanks`            → that bank (operator-granted read);
+   *   - anything else                     → throws {@link KnowledgeBankNotGrantedError}.
+   *
+   * `extraBanks` is read from constructor options only, so no tool call can
+   * widen the set — a caller SELECTS among grants, it never MINTS reach.
    */
-  private knowledgeBasePath(): string {
+  private resolveBank(requested?: string): string {
+    const own = this.opts.bankId;
+    if (requested === undefined || requested === "" || requested === own) {
+      return own;
+    }
+    if ((this.opts.extraBanks ?? []).includes(requested)) return requested;
+    throw new KnowledgeBankNotGrantedError(requested, own, [
+      ...(this.opts.extraBanks ?? []),
+    ]);
+  }
+
+  /**
+   * Base path for a knowledge base. The bank segment is the ALREADY-RESOLVED
+   * bank ({@link KnowledgeAdmin.resolveBank}), so no un-validated caller input
+   * can reach it.
+   */
+  private knowledgeBasePath(bankId: string): string {
     const base = this.opts.apiBaseUrl.replace(/\/+$/, "");
-    return `${base}/v1/default/banks/${encodeURIComponent(this.opts.bankId)}/knowledge-base`;
+    return `${base}/v1/default/banks/${encodeURIComponent(bankId)}/knowledge-base`;
   }
 
   /**
    * The ONLY network primitive in this class, and it takes no method
    * parameter. A write would need a second primitive alongside it, which is
-   * the reviewable act.
+   * the reviewable act. `bankId` is the resolved target, echoed into the
+   * advisory header.
    */
-  private async get(url: string): Promise<Response> {
+  private async get(url: string, bankId: string): Promise<Response> {
     const ctl = new AbortController();
     const timer = setTimeout(
       () => ctl.abort(),
@@ -205,8 +286,9 @@ export class KnowledgeAdmin {
         headers: {
           accept: "application/json",
           // Advisory only — the REST layer ignores it. Sent for parity with
-          // the shim's MCP path and so request logs carry the intent.
-          ...(this.opts.bankId ? { "X-Bank-Id": this.opts.bankId } : {}),
+          // the shim's MCP path and so request logs carry the intent. Reflects
+          // the RESOLVED target bank, not necessarily the agent's own.
+          ...(bankId ? { "X-Bank-Id": bankId } : {}),
         },
         signal: ctl.signal,
       });
@@ -225,15 +307,20 @@ export class KnowledgeAdmin {
   async search(args: {
     query: string;
     limit?: number;
+    bankId?: string;
   }): Promise<KnowledgePageSearchResponse> {
+    const bank = this.resolveBank(args.bankId);
     const params = new URLSearchParams({
       q: args.query,
       limit: String(clampKnowledgeSearchLimit(args.limit)),
     });
-    const res = await this.get(`${this.knowledgeBasePath()}/search?${params}`);
+    const res = await this.get(
+      `${this.knowledgeBasePath(bank)}/search?${params}`,
+      bank,
+    );
     if (!res.ok) {
       throw new Error(
-        `searching knowledge pages in bank '${this.opts.bankId}' failed: HTTP ${res.status}`,
+        `searching knowledge pages in bank '${bank}' failed: HTTP ${res.status}`,
       );
     }
     const parsed = (await res.json()) as Partial<KnowledgePageSearchResponse>;
@@ -256,7 +343,7 @@ export class KnowledgeAdmin {
    * consolidation run. Staleness is reported by {@link KnowledgeAdmin.tree}
    * instead.
    */
-  async getPage(args: { page_id: string }): Promise<KnowledgePage> {
+  async getPage(args: { page_id: string; bankId?: string }): Promise<KnowledgePage> {
     if (!KNOWLEDGE_PAGE_ID_PATTERN.test(args.page_id)) {
       throw new Error(
         `'${args.page_id}' is not a knowledge page id. Ids look like ` +
@@ -264,19 +351,21 @@ export class KnowledgeAdmin {
           `search_knowledge_pages or get_knowledge_tree.`,
       );
     }
+    const bank = this.resolveBank(args.bankId);
     const res = await this.get(
-      `${this.knowledgeBasePath()}/pages/${encodeURIComponent(args.page_id)}`,
+      `${this.knowledgeBasePath(bank)}/pages/${encodeURIComponent(args.page_id)}`,
+      bank,
     );
     if (res.status === 404) {
       throw new Error(
-        `no knowledge page '${args.page_id}' in bank '${this.opts.bankId}'. ` +
+        `no knowledge page '${args.page_id}' in bank '${bank}'. ` +
           `Page ids come from search_knowledge_pages or get_knowledge_tree.`,
       );
     }
     if (!res.ok) {
       throw new Error(
         `reading knowledge page '${args.page_id}' in bank ` +
-          `'${this.opts.bankId}' failed: HTTP ${res.status}`,
+          `'${bank}' failed: HTTP ${res.status}`,
       );
     }
     const page = (await res.json()) as Partial<KnowledgePage>;
@@ -287,7 +376,7 @@ export class KnowledgeAdmin {
     // i.e. a read that silently failed. Fail loudly and name the page instead.
     if (typeof page.markdown !== "string") {
       throw new Error(
-        `knowledge page '${args.page_id}' in bank '${this.opts.bankId}' came ` +
+        `knowledge page '${args.page_id}' in bank '${bank}' came ` +
           `back with no markdown body — the response had no string 'markdown' ` +
           `field, so there is nothing to read.`,
       );
@@ -295,12 +384,16 @@ export class KnowledgeAdmin {
     return page as KnowledgePage;
   }
 
-  /** The pinned bank's folder/page tree, including per-page `is_stale`. */
-  async tree(): Promise<KnowledgeTree> {
-    const res = await this.get(`${this.knowledgeBasePath()}/tree`);
+  /**
+   * A bank's folder/page tree, including per-page `is_stale`. Defaults to the
+   * agent's own bank; `bankId` may name an operator-granted bank.
+   */
+  async tree(args: { bankId?: string } = {}): Promise<KnowledgeTree> {
+    const bank = this.resolveBank(args.bankId);
+    const res = await this.get(`${this.knowledgeBasePath(bank)}/tree`, bank);
     if (!res.ok) {
       throw new Error(
-        `listing the knowledge tree in bank '${this.opts.bankId}' failed: HTTP ${res.status}`,
+        `listing the knowledge tree in bank '${bank}' failed: HTTP ${res.status}`,
       );
     }
     const parsed = (await res.json()) as Partial<KnowledgeTree>;
@@ -339,6 +432,9 @@ export const KNOWLEDGE_ADMIN_MEMBERS = [
   "get",
   "getPage",
   "knowledgeBasePath",
+  // Bank-selector validation (W-2). A pure read helper — issues no request, so
+  // the GET-only behavioural assertion stays green.
+  "resolveBank",
   "search",
   "tree",
 ];

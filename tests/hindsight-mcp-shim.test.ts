@@ -1313,9 +1313,27 @@ describe("synthesized knowledge-page tools", () => {
       "page_id",
     ]);
     expect(byName.get("get_knowledge_tree")!.inputSchema.required).toEqual([]);
+    // The bank_id SELECTOR is advertised on all three reads, and is optional
+    // (never in `required`) — W-2.
+    for (const n of [
+      "search_knowledge_pages",
+      "get_knowledge_page",
+      "get_knowledge_tree",
+    ]) {
+      expect(
+        byName.get(n)!.inputSchema.properties.bank_id,
+        `${n} must advertise the optional bank_id selector`,
+      ).toMatchObject({ type: "string" });
+      expect(byName.get(n)!.inputSchema.required).not.toContain("bank_id");
+    }
   });
 
-  it("rejects an unknown argument locally, naming bank_id explicitly", async () => {
+  it("rejects an UNGRANTED bank_id locally with a loud grant-wall, no network", async () => {
+    // bank_id is now a DECLARED selector, so this is no longer an unknown-arg
+    // rejection: it is the grant check. makeShim pins bankId:"test-bank" with
+    // no extraBanks, so any other bank is ungranted and rejected loudly — the
+    // backend is dead, and the answer still comes from the shim, not the
+    // forwarded "temporarily unavailable" path.
     const shim = makeShim({ url: await deadUrl(), cacheDir });
     const res = await shim.handle(
       rpc(2, "tools/call", {
@@ -1325,11 +1343,47 @@ describe("synthesized knowledge-page tools", () => {
     );
     const result = res?.result as { isError: boolean; content: { text: string }[] };
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("bank_id");
-    expect(result.content[0].text).toContain("your own memory bank");
-    // NOT the forwarded "memory is temporarily unavailable" path: the backend
-    // is dead and the answer still came from the shim.
+    expect(result.content[0].text).toContain("someone-elses-bank");
+    expect(result.content[0].text).toContain("test-bank");
     expect(result.content[0].text).not.toMatch(/temporarily unavailable/i);
+  });
+
+  it("an unknown argument (not bank_id) is still rejected as unknown", async () => {
+    // The unknown-arg guard is intact for genuinely-undeclared keys.
+    const shim = makeShim({ url: await deadUrl(), cacheDir });
+    const res = await shim.handle(
+      rpc(2, "tools/call", {
+        name: "get_knowledge_tree",
+        arguments: { collection: "someone-elses-bank" },
+      }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("collection");
+    expect(result.content[0].text).toMatch(/does not accept/);
+  });
+
+  it("a GRANTED bank_id passes the shim's local validation (reaches the REST path)", async () => {
+    // With the bank granted, the local grant check passes and the call
+    // proceeds to the REST layer. The backend here is dead, so it surfaces as
+    // an honest failure — NOT the grant-wall, proving the selector was
+    // accepted rather than rejected.
+    const shim = makeShim({
+      url: await deadUrl(),
+      cacheDir,
+      extraBanks: ["shared-repo-bank"],
+    });
+    const res = await shim.handle(
+      rpc(2, "tools/call", {
+        name: "get_knowledge_tree",
+        arguments: { bank_id: "shared-repo-bank" },
+      }) as never,
+    );
+    const result = res?.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    // The grant check did NOT fire — no "not a bank you can read" text.
+    expect(result.content[0].text).not.toMatch(/not a bank you can read/);
+    expect(result.content[0].text).not.toMatch(/has not been granted/);
   });
 
   it("requires the declared required argument", async () => {

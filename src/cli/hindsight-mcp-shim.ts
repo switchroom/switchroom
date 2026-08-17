@@ -47,10 +47,16 @@
  *     no knowledge MCP tools at all, so an agent's own curated pages were
  *     unreachable from a tool call. Backed by {@link KnowledgeAdmin}, which is
  *     GET-only: page authorship and deletion stay off this surface entirely.
+ *     These three carry an optional `bank_id` SELECTOR: omitted they read the
+ *     agent's own bank; they may name an operator-granted bank (from
+ *     `HINDSIGHT_KNOWLEDGE_EXTRA_BANKS`) and any other bank is loud-rejected —
+ *     a caller SELECTS among grants, it never MINTS reach (design-v2 §10, W-2).
+ *     The directive tools carry no such selector; their writes stay own-pinned.
  *
- * That pin is a usability and provenance boundary, NOT a security one — the
- * REST API is unauthenticated and raw curl bypasses the shim entirely. See the
- * header of `src/memory/hindsight-directive-admin.ts` for the full statement.
+ * That pin (and the selector's grant set) is a usability and provenance
+ * boundary, NOT a security one — the REST API is unauthenticated and raw curl
+ * bypasses the shim entirely. See the header of
+ * `src/memory/hindsight-directive-admin.ts` for the full statement.
  *
  * Escape hatch: `memory.config.mcp_transport: "http"` in switchroom.yaml
  * reverts the scaffolded entry to the old direct `type: "http"` form (see
@@ -63,7 +69,13 @@
  *   HINDSIGHT_MCP_URL         backend Streamable HTTP endpoint
  *   HINDSIGHT_BANK_ID         X-Bank-Id header value (agent's collection),
  *                             and the PINNED bank for the synthesized
- *                             directive tools
+ *                             directive tools and the DEFAULT for the
+ *                             knowledge-page reads
+ *   HINDSIGHT_KNOWLEDGE_EXTRA_BANKS
+ *                             comma-separated operator-granted banks the
+ *                             knowledge-page reads may target via their
+ *                             optional `bank_id` selector (W-2); empty ⇒
+ *                             own-bank-only. Never sourced from a tool call.
  *   HINDSIGHT_SHIM_CACHE_DIR  where the cached tools/list manifest lives
  *   HINDSIGHT_SHIM_RECALL_MAX_TOKENS / HINDSIGHT_SHIM_REFLECT_MAX_TOKENS
  *                             per-tool max_tokens injected when the caller
@@ -87,6 +99,7 @@ import {
 } from "../memory/hindsight-directive-admin.js";
 import {
   KnowledgeAdmin,
+  KnowledgeBankNotGrantedError,
   KNOWLEDGE_SEARCH_LIMIT_DEFAULT,
   KNOWLEDGE_SEARCH_LIMIT_MAX,
   KNOWLEDGE_SEARCH_LIMIT_MIN,
@@ -257,11 +270,35 @@ export const FALLBACK_TOOL_TABLE: Record<string, [string[], string[]]> = {
  * own `minimum`/`maximum` here rather than forwarded, because the upstream
  * endpoint answers a 422 the calling model cannot act on.
  *
- * NOTE the deliberate absence of a `bank_id` property. The bank is pinned from
- * `HINDSIGHT_BANK_ID`; a caller cannot name one. That is a usability and
+ * NOTE the directive tools (`deactivate_directive` / `reactivate_directive`)
+ * deliberately carry NO `bank_id` property — directive WRITES stay pinned to
+ * `HINDSIGHT_BANK_ID` (W-2 pt 2). The three knowledge-page READS carry an
+ * OPTIONAL `bank_id` selector ({@link KNOWLEDGE_BANK_SELECTOR_PROP}): a caller
+ * may name an operator-granted bank, validated in {@link KnowledgeAdmin}
+ * against `{own} ∪ extraBanks`, and anything else is loud-rejected. A caller
+ * SELECTS among grants; it never MINTS reach. That is a usability and
  * provenance boundary, not a security one — see
  * `src/memory/hindsight-directive-admin.ts`.
  */
+
+/**
+ * The optional `bank_id` selector shared by the three knowledge-page reads.
+ *
+ * Advertised on every deployment (static schema = single pinned source of
+ * truth, fixture-contract-checked); its VALUE is validated at call time, not by
+ * the schema, because the operator-granted set is per-agent runtime config. An
+ * agent with no grants can only ever name its own bank; any other value is
+ * rejected loudly — the same effective guarantee as the pre-W-2 pin.
+ */
+export const KNOWLEDGE_BANK_SELECTOR_PROP = {
+  type: "string" as const,
+  description:
+    "Optional. Which memory bank to read. Omit to read YOUR OWN bank (the " +
+    "default). You may name another bank ONLY if your operator has granted " +
+    "it to you (e.g. a shared repo knowledge bank); naming any other bank is " +
+    "rejected.",
+};
+
 export const SYNTHESIZED_TOOL_TABLE: Record<
   string,
   { description: string; required: string[]; props: Record<string, unknown> }
@@ -304,13 +341,14 @@ export const SYNTHESIZED_TOOL_TABLE: Record<
   },
   search_knowledge_pages: {
     description:
-      "Search YOUR OWN knowledge pages — the curated, continuously-refreshed " +
-      "summaries of what this bank knows — with hybrid full-text + semantic " +
+      "Search knowledge pages — the curated, continuously-refreshed " +
+      "summaries of what a bank knows — with hybrid full-text + semantic " +
       "search. Reach for this before re-deriving a standing answer from raw " +
       "recall: a page is already synthesized, where recall returns fragments. " +
       "Returns ranked hits with a relevance snippet and a page id; read the " +
-      "whole page with get_knowledge_page. Read-only, and only ever your own " +
-      "memory bank. An empty knowledge base returns no results, not an error.",
+      "whole page with get_knowledge_page. Read-only. Defaults to your own " +
+      "bank; pass bank_id to search an operator-granted bank. An empty " +
+      "knowledge base returns no results, not an error.",
     required: ["query"],
     props: {
       query: {
@@ -325,15 +363,18 @@ export const SYNTHESIZED_TOOL_TABLE: Record<
           `Maximum hits to return (${KNOWLEDGE_SEARCH_LIMIT_MIN}-` +
           `${KNOWLEDGE_SEARCH_LIMIT_MAX}, default ${KNOWLEDGE_SEARCH_LIMIT_DEFAULT}).`,
       },
+      bank_id: KNOWLEDGE_BANK_SELECTOR_PROP,
     },
   },
   get_knowledge_page: {
     description:
-      "Read one of YOUR OWN knowledge pages in full, by the page id returned " +
-      "by search_knowledge_pages or get_knowledge_tree. Returns the complete " +
+      "Read one knowledge page in full, by the page id returned by " +
+      "search_knowledge_pages or get_knowledge_tree. Returns the complete " +
       "markdown document (YAML frontmatter + synthesized body). Prefer this " +
       "over rebuilding the same understanding from scratch. Read-only: it " +
-      "returns the page as it currently stands and never triggers a refresh.",
+      "returns the page as it currently stands and never triggers a refresh. " +
+      "Defaults to your own bank; pass bank_id (matching the tree/search call " +
+      "the id came from) to read from an operator-granted bank.",
     required: ["page_id"],
     props: {
       page_id: {
@@ -342,17 +383,21 @@ export const SYNTHESIZED_TOOL_TABLE: Record<
           "Id of the page to read, from search_knowledge_pages or " +
           "get_knowledge_tree.",
       },
+      bank_id: KNOWLEDGE_BANK_SELECTOR_PROP,
     },
   },
   get_knowledge_tree: {
     description:
-      "List YOUR OWN knowledge base as a folder/page tree — every page's id, " +
+      "List a knowledge base as a folder/page tree — every page's id, " +
       "name, source query, tags and staleness flag. Call this to see what " +
-      "this bank already knows before reading anything else; is_stale=true " +
+      "a bank already knows before reading anything else; is_stale=true " +
       "means the page MAY be behind newer memories, not that it is wrong. " +
-      "Read-only, and only ever your own memory bank.",
+      "Read-only. Defaults to your own bank; pass bank_id to list an " +
+      "operator-granted bank.",
     required: [],
-    props: {},
+    props: {
+      bank_id: KNOWLEDGE_BANK_SELECTOR_PROP,
+    },
   },
 };
 
@@ -1186,6 +1231,16 @@ export interface ShimOptions {
   url: string;
   /** X-Bank-Id header threaded onto every backend request (may be ""). */
   bankId: string;
+  /**
+   * Operator-granted ADDITIONAL banks the synthesized knowledge-page reads may
+   * target via their optional `bank_id` selector (design-v2 §10, W-2). Rendered
+   * at apply from `memory.recall.additional_banks` into
+   * `HINDSIGHT_KNOWLEDGE_EXTRA_BANKS`; NEVER sourced from a tool call. Empty ⇒
+   * own-bank-only reads (the pre-W-2 behaviour). Passed straight through to
+   * {@link KnowledgeAdmin}, which is the single authority that validates a
+   * caller-supplied `bank_id` against `{own} ∪ extraBanks`.
+   */
+  extraBanks?: readonly string[];
   /** Directory for the persisted tools/list cache. Created on demand. */
   cacheDir: string;
   /**
@@ -1632,8 +1687,13 @@ export class HindsightShim {
       this.knowledgeAdminCache = new KnowledgeAdmin({
         apiBaseUrl:
           this.opts.apiBaseUrl ?? this.opts.url.replace(/\/mcp\/?$/, ""),
-        // PINNED. There is no parameter path from a tool call to this value.
+        // PINNED. There is no parameter path from a tool call to this value —
+        // it is the agent's OWN bank and the default target of every read.
         bankId: this.opts.bankId,
+        // Operator-granted cross-bank reach, from config only (W-2). A
+        // caller-supplied bank_id is validated against {own} ∪ extraBanks by
+        // KnowledgeAdmin.resolveBank; there is no tool-call path that widens it.
+        ...(this.opts.extraBanks ? { extraBanks: this.opts.extraBanks } : {}),
         ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),
       });
     }
@@ -1734,6 +1794,27 @@ export class HindsightShim {
           "there is no bank to pin it to.",
       );
     }
+    // Bank-selector grant check at the SHIM layer, before ANY network I/O
+    // (the /openapi.json preflight below included). An ungranted bank_id is a
+    // pure argument-vs-config validation failure — deterministic, needing no
+    // backend — so it rejects here rather than deep in KnowledgeAdmin. That
+    // resolveBank check remains as the backstop (two-layer arg discipline: the
+    // shim validates against the schema+grants the model saw; KnowledgeAdmin
+    // is the last line). Only knowledge tools declare bank_id; a directive
+    // tool's bank_id was already rejected as an unknown arg above.
+    if (typeof clean.bank_id === "string") {
+      const requested = clean.bank_id;
+      const granted =
+        requested === this.opts.bankId ||
+        (this.opts.extraBanks ?? []).includes(requested);
+      if (!granted) {
+        return fail(
+          new KnowledgeBankNotGrantedError(requested, this.opts.bankId, [
+            ...(this.opts.extraBanks ?? []),
+          ]).message,
+        );
+      }
+    }
     // Route-contract preflight (engine version pin, design-v2.md §2.5): a
     // CONFIRMED-missing route fails loudly here, before the doomed REST call
     // is even attempted. An unreachable/malformed /openapi.json is treated
@@ -1745,6 +1826,14 @@ export class HindsightShim {
       const text = await this.runSynthesized(name, clean);
       return { content: [{ type: "text", text }], isError: false };
     } catch (err) {
+      // An ungranted bank_id is a caller-input VALIDATION failure, not a
+      // backend fault: surface the KnowledgeAdmin message verbatim (it names
+      // the ungranted bank and the grant set) rather than wrapping it in the
+      // generic "<tool> failed:" prefix. This is the loud-reject half of W-2
+      // pt 1 — the ungranted read never silently coerces to the own bank.
+      if (err instanceof KnowledgeBankNotGrantedError) {
+        return fail(err.message);
+      }
       if (err instanceof DirectivePairInconsistentError) {
         this.log(`[hindsight-shim] ${err.message}`);
       }
@@ -1784,12 +1873,16 @@ export class HindsightShim {
         const res = await this.knowledgeAdmin.search({
           query: args.query as string,
           ...(typeof args.limit === "number" ? { limit: args.limit } : {}),
+          ...(typeof args.bank_id === "string" ? { bankId: args.bank_id } : {}),
         });
         if (res.results.length === 0) {
           // An empty bank is a normal answer, not a failure — say so in words
           // so the model does not read `[]` as a broken tool and retry.
           return (
-            "No knowledge pages matched that query in your memory bank. " +
+            "No knowledge pages matched that query in " +
+            (typeof args.bank_id === "string"
+              ? `bank '${args.bank_id}'. `
+              : "your memory bank. ") +
             "The bank may have no pages yet — get_knowledge_tree lists what " +
             "exists."
           );
@@ -1804,16 +1897,19 @@ export class HindsightShim {
       case "get_knowledge_page": {
         const page = await this.knowledgeAdmin.getPage({
           page_id: args.page_id as string,
+          ...(typeof args.bank_id === "string" ? { bankId: args.bank_id } : {}),
         });
         return capKnowledgeResponse(page.markdown);
       }
       case "get_knowledge_tree": {
-        const tree = await this.knowledgeAdmin.tree();
+        const tree = await this.knowledgeAdmin.tree(
+          typeof args.bank_id === "string" ? { bankId: args.bank_id } : {},
+        );
         if (tree.roots.length === 0) {
-          return (
-            "Your knowledge base has no pages yet. Pages are synthesized from " +
-            "mental models — propose one to start it."
-          );
+          return typeof args.bank_id === "string"
+            ? `Bank '${args.bank_id}' has no knowledge pages yet.`
+            : "Your knowledge base has no pages yet. Pages are synthesized " +
+                "from mental models — propose one to start it.";
         }
         return renderKnowledgeTree(tree.roots);
       }
@@ -2020,9 +2116,18 @@ export function resolveShimOptionsFromEnv(
   env: NodeJS.ProcessEnv,
 ): ShimOptions {
   const home = env.HOME && env.HOME !== "/" ? env.HOME : tmpdir();
+  // Operator-granted cross-bank reach for the knowledge-page reads (W-2).
+  // Comma-separated, rendered at apply from `memory.recall.additional_banks`.
+  // Trim, drop empties, and drop the agent's own bank (own is always readable
+  // and listing it here would be redundant, not a grant).
+  const extraBanks = (env.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS ?? "")
+    .split(",")
+    .map((b) => b.trim())
+    .filter((b) => b.length > 0 && b !== (env.HINDSIGHT_BANK_ID || ""));
   return {
     url: env.HINDSIGHT_MCP_URL || HINDSIGHT_DEFAULT_MCP_URL,
     bankId: env.HINDSIGHT_BANK_ID || "",
+    ...(extraBanks.length > 0 ? { extraBanks } : {}),
     cacheDir:
       env.HINDSIGHT_SHIM_CACHE_DIR || join(home, ".hindsight-shim"),
   };

@@ -131,6 +131,39 @@ describe("generateHindsightMcpConfig", () => {
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
   });
+
+  it("threads knowledgeExtraBanks into HINDSIGHT_KNOWLEDGE_EXTRA_BANKS (comma-joined)", () => {
+    const memConfig = makeMemoryConfig();
+    const result = generateHindsightMcpConfig("my-collection", memConfig, {
+      knowledgeExtraBanks: ["switchroom-dev", "shared-repo-bank"],
+    });
+    expect(result.env?.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS).toBe(
+      "switchroom-dev,shared-repo-bank",
+    );
+  });
+
+  it("drops the agent's own bank and dupes from the grant set, emitting no key when nothing is left", () => {
+    const memConfig = makeMemoryConfig();
+    // Own bank + a dupe: after filtering, the grant set is empty, so the env
+    // key is omitted entirely rather than emitted as "" (which would read as a
+    // grant of the empty bank).
+    const onlyOwn = generateHindsightMcpConfig("my-collection", memConfig, {
+      knowledgeExtraBanks: ["my-collection", "my-collection"],
+    });
+    expect(onlyOwn.env?.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS).toBeUndefined();
+
+    // Own bank mixed with a real grant: only the grant survives.
+    const mixed = generateHindsightMcpConfig("my-collection", memConfig, {
+      knowledgeExtraBanks: ["my-collection", "switchroom-dev", "switchroom-dev"],
+    });
+    expect(mixed.env?.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS).toBe("switchroom-dev");
+  });
+
+  it("omits the knowledge-banks env when the grant set is unset (minimal env)", () => {
+    const memConfig = makeMemoryConfig();
+    const result = generateHindsightMcpConfig("my-collection", memConfig, {});
+    expect(result.env?.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS).toBeUndefined();
+  });
 });
 
 describe("getHindsightSettingsEntry reflect cascade", () => {
@@ -193,6 +226,24 @@ describe("getHindsightSettingsEntry reflect cascade", () => {
 
     const absent = configWith({ agents: { foo: {} } });
     expect(envOf(absent, "foo")?.HINDSIGHT_SHIM_REFLECT_MAX_TOKENS).toBeUndefined();
+  });
+
+  it("threads memory.recall.additional_banks into the knowledge-page grant env", () => {
+    // The SAME config that fans the recall hook out to a shared bank grants the
+    // knowledge-page reads' bank_id selector for that bank (W-2, design-v2 §10).
+    const config = configWith({
+      agents: {
+        foo: { memory: { recall: { additional_banks: ["switchroom-dev"] } } },
+      },
+    });
+    expect(envOf(config, "foo")?.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS).toBe(
+      "switchroom-dev",
+    );
+  });
+
+  it("emits no knowledge-page grant env for an agent with no additional_banks", () => {
+    const config = configWith({ agents: { foo: {} } });
+    expect(envOf(config, "foo")?.HINDSIGHT_KNOWLEDGE_EXTRA_BANKS).toBeUndefined();
   });
 });
 

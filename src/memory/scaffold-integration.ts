@@ -1,5 +1,6 @@
 import { resolveAgentConfig } from "../config/merge.js";
 import type { SwitchroomConfig } from "../config/schema.js";
+import { resolveUsers } from "../config/users.js";
 import {
   generateHindsightMcpConfig,
   getCollectionForAgent,
@@ -39,9 +40,17 @@ export function getHindsightSettingsEntry(
     config.profiles,
     config.agents[agentName] ?? {},
   );
+  // The knowledge-page reads' cross-bank selector is granted from the SAME
+  // set that fans the recall hook out to shared banks (design-v2 §10, W-2):
+  // resolveUsers unions users.*.knows profile banks with explicit
+  // memory.recall.additional_banks. An agent can thus READ a shared repo
+  // knowledge bank's pages exactly when its ordinary recall already reaches
+  // that bank — no parallel grant key, no new surface for the operator.
+  const { additionalBanks } = resolveUsers(config, agentName);
   const mcpConfig = generateHindsightMcpConfig(collection, memoryConfig, {
     reflectBudget: resolved.memory?.reflect_budget,
     reflectMaxTokens: resolved.memory?.reflect_max_tokens,
+    knowledgeExtraBanks: additionalBanks,
   });
 
   // Defer hindsight's 32 MCP tools via tool search. Auto-recall (recall.py
