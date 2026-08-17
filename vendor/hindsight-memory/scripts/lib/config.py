@@ -140,6 +140,23 @@ DEFAULTS = {
     # per-agent via memory.directive_capture_verify=false →
     # HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY.
     "directiveCaptureVerify": True,
+    # Memory v2 M5 — orientation-at-boot (Surface B). All four fail-safe by
+    # default so a stripped/absent key (the Zod-strip footgun, carve §1) boots
+    # exactly as pre-M5. `memoryOrientationEnabled` is the per-agent kill switch,
+    # default OFF (dark build — the orientation SessionStart hook no-ops before
+    # any bank resolve or network call when off). `memoryOrientationModel` is the
+    # mental-model NAME the hook resolves to an id (the agent's OWN bank).
+    # `memoryOrientationCadenceHours` is the per-agent refresh cadence tier
+    # (klanker/overlord 24, everyone else 48) the staleness guard's per-tier
+    # thresholds (1.5×/3×) key on. `memoryOrientationReinjectTurns` is the
+    # epic's optional per-turn re-inject knob, default 0 = SessionStart+compaction
+    # only (the cheap path; N>0 is the ~55M/30d-at-every-turn expensive variant,
+    # which is why it defaults off). Delivered per-agent via the scaffold
+    # settings.json stamp and overridable via the HINDSIGHT_ORIENTATION_* env.
+    "memoryOrientationEnabled": False,
+    "memoryOrientationModel": "orientation",
+    "memoryOrientationCadenceHours": 48,
+    "memoryOrientationReinjectTurns": 0,
     # Switchroom hindsight-leverage A4 — TTL (seconds) for the directives-list
     # cache on the recall critical path (see lib/directives.py). The list is
     # re-fetched at most once per TTL window for no-write turns; in-session
@@ -515,6 +532,15 @@ ENV_OVERRIDES = {
     # agents.<name>.memory.directive_capture_verify only when the operator
     # overrode it; the switchroom default is on.
     "HINDSIGHT_DIRECTIVE_CAPTURE_VERIFY": ("directiveCaptureVerify", bool),
+    # Memory v2 M5 — orientation-at-boot. Env override channel for the four
+    # orientation knobs (settings.json carries the per-agent value; env wins for
+    # a docker-exec'd hook or an agent `env:` map). `memoryOrientationEnabled`
+    # is the per-agent kill switch (default off); the model NAME, cadence tier,
+    # and reinject count follow. See DEFAULTS above and carve-M5 §4.
+    "HINDSIGHT_ORIENTATION_ENABLED": ("memoryOrientationEnabled", bool),
+    "HINDSIGHT_ORIENTATION_MODEL": ("memoryOrientationModel", str),
+    "HINDSIGHT_ORIENTATION_CADENCE_HOURS": ("memoryOrientationCadenceHours", int),
+    "HINDSIGHT_ORIENTATION_REINJECT_TURNS": ("memoryOrientationReinjectTurns", int),
     # Switchroom hindsight-leverage A4 — directives-list cache TTL (seconds).
     # 0 disables the cache (rollback lever).
     "HINDSIGHT_DIRECTIVES_CACHE_TTL_SECONDS": ("directivesCacheTtlSeconds", int),

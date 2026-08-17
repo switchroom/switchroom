@@ -73,7 +73,16 @@ def build_hooks(plugin_root: str) -> dict:
                         "timeout": 5,
                     }
                 ]
-            }
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{plugin_root}/scripts/orientation.py"',
+                        "timeout": 8,
+                    }
+                ]
+            },
         ],
         "SessionEnd": [
             {

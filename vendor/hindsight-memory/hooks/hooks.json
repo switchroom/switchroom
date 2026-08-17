@@ -10,6 +10,15 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/orientation.py\"",
+            "timeout": 8
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

@@ -3470,6 +3470,15 @@ export function installHindsightPlugin(
     agentName,
     resolvedAgentConfig,
   );
+  // Memory v2 M5: orientation-at-boot knobs (kill switch + model + cadence +
+  // reinject), from the CASCADED config. Stamped onto the deployed plugin below
+  // so the orientation SessionStart hook resolves the operator's per-agent value
+  // and `switchroom apply` RE-ASSERTS it. DARK by default (enabled→false).
+  const orientationSettings = resolveHindsightOrientationSettings(
+    switchroomConfig,
+    agentName,
+    resolvedAgentConfig,
+  );
   // Recall latency envelope (hook ceiling / parallel deadline / per-bank
   // timeout) from the CASCADED config. Stamped onto the deployed plugin below
   // so `switchroom apply` RE-ASSERTS these values instead of reverting them —
@@ -3499,6 +3508,7 @@ export function installHindsightPlugin(
         recallTunables,
         recallCaps,
         observationScopeSettings,
+        orientationSettings,
       );
       if (expectedSettings != null) contentOverrides["settings.json"] = expectedSettings;
     }
@@ -3563,6 +3573,7 @@ export function installHindsightPlugin(
     recallTunables,
     recallCaps,
     observationScopeSettings,
+    orientationSettings,
   );
   // Stamp the UserPromptSubmit recall-hook ceiling into the deployed
   // hooks/hooks.json. Claude Code reads this file directly and does NOT expand
@@ -3700,6 +3711,60 @@ function resolveHindsightObservationScopeSettings(
   return {
     observationScopes: memory?.observation_scopes,
     observationScopeStrategy: memory?.observation_scope_strategy,
+  };
+}
+
+/**
+ * Memory v2 M5 (Surface B: orientation-at-boot). Carries the four
+ * orientation knobs from the cascaded config to the settings.json stamp so the
+ * orientation SessionStart hook (vendor .../scripts/orientation.py) resolves the
+ * operator's per-agent value. `enabled` is the red-team kill switch: DARK by
+ * default (undefined ⇒ false), never fleet-seeded — see the mirror-parity
+ * exclusion for `orientation`. Stamped into settings.json (config.py reads it
+ * first) so a docker-exec'd invocation that does NOT inherit start.sh's env
+ * resolves the same value the supervised session does — the #3915 discipline.
+ */
+interface HindsightOrientationSettings {
+  enabled: boolean;
+  model: string;
+  cadenceHours: number;
+  reinjectTurns: number;
+}
+
+/**
+ * Resolve the orientation settings for an agent, honouring the cascade
+ * (defaults → profile → agent). Only `orientation_cadence_hours` cascades from
+ * the defaults/profile tier (a safe cost/tiering knob); `orientation` (the kill
+ * switch) and `orientation_reinject_turns` are per-agent-only by schema, so a
+ * defaults-tier value for them is stripped before it reaches here and can never
+ * flip the fleet on. Fail-safe fallbacks: enabled→false (dark), model→
+ * "orientation", cadenceHours→48 (cheaper tier), reinjectTurns→0 (off).
+ */
+export function resolveHindsightOrientationSettings(
+  switchroomConfig: SwitchroomConfig | undefined,
+  agentName: string,
+  resolvedAgentConfig?: AgentConfig,
+): HindsightOrientationSettings {
+  const memory = resolvedAgentConfig
+    ? resolvedAgentConfig.memory
+    : switchroomConfig
+      ? resolveAgentConfig(
+          switchroomConfig.defaults,
+          switchroomConfig.profiles,
+          switchroomConfig.agents[agentName] ?? ({} as AgentConfig),
+        )?.memory
+      : undefined;
+  return {
+    enabled: memory?.orientation === true,
+    model: "orientation",
+    cadenceHours:
+      typeof memory?.orientation_cadence_hours === "number"
+        ? memory.orientation_cadence_hours
+        : 48,
+    reinjectTurns:
+      typeof memory?.orientation_reinject_turns === "number"
+        ? memory.orientation_reinject_turns
+        : 0,
   };
 }
 
@@ -3880,6 +3945,7 @@ function applyHindsightSettingsOverrides(
   recallTunables: HindsightRecallTunables,
   recallCaps: HindsightRecallCaps,
   observationScopeSettings: HindsightObservationScopeSettings,
+  orientationSettings: HindsightOrientationSettings,
 ): void {
   const settingsPath = join(pluginDestPath, "settings.json");
   if (!existsSync(settingsPath)) return; // vendor structure changed; bail safely
@@ -3896,6 +3962,7 @@ function applyHindsightSettingsOverrides(
     recallTunables,
     recallCaps,
     observationScopeSettings,
+    orientationSettings,
   );
   if (next == null) return; // malformed settings; don't make it worse
   writeFileSyncIfChanged(settingsPath, next);
@@ -3916,6 +3983,7 @@ function renderHindsightSettingsOverrides(
   recallTunables: HindsightRecallTunables,
   recallCaps: HindsightRecallCaps,
   observationScopeSettings: HindsightObservationScopeSettings,
+  orientationSettings: HindsightOrientationSettings,
 ): string | null {
   let settings: Record<string, unknown>;
   try {
@@ -4164,6 +4232,23 @@ function renderHindsightSettingsOverrides(
   if (typeof observationScopeStrategy === "string" && observationScopeStrategy.length > 0) {
     settings.observationScopeStrategy = observationScopeStrategy;
   }
+  // Memory v2 M5 (Surface B: orientation-at-boot). Stamp the four orientation
+  // knobs so the orientation SessionStart hook (vendor .../scripts/orientation.py)
+  // resolves the operator's cascaded per-agent value. UNLIKE the observation
+  // scopes above, `memoryOrientationEnabled` is stamped UNCONDITIONALLY (even the
+  // default false) — the hook's kill switch must be present and explicit on
+  // every install so a stale hand-edit or a missing key can never accidentally
+  // read as enabled; a dark agent boots byte-identically to pre-M5 because the
+  // hook reads `false` and no-ops before any bank resolve or network call. The
+  // stamp is the authoritative per-agent value and, being re-stamped on every
+  // scaffold/reconcile, survives `switchroom apply` regenerating this file.
+  // config.py reads it first and the paired HINDSIGHT_ORIENTATION_* env (when an
+  // operator overrides) wins in the supervised session — the same two-channel
+  // agreement the retain/observation stamps rely on.
+  settings.memoryOrientationEnabled = orientationSettings.enabled;
+  settings.memoryOrientationModel = orientationSettings.model;
+  settings.memoryOrientationCadenceHours = orientationSettings.cadenceHours;
+  settings.memoryOrientationReinjectTurns = orientationSettings.reinjectTurns;
   return JSON.stringify(settings, null, 2) + "\n";
 }
 

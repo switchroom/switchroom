@@ -63,6 +63,21 @@ const INTENTIONAL_MEMORY_MIRROR_EXCLUSIONS = new Set<string>([
   // fleet at once. If this exclusion is ever removed, mirror the field AND
   // drop it from this set. See AgentMemorySchema.rules_block.
   "rules_block",
+  // Per-agent ONLY by design (Memory v2 M5 go-live flag, Surface B: orientation
+  // -at-boot): enabling orientation is a deliberate per-agent canary step gated
+  // on the agent's own m2-residue measurement + an operator-created `orientation`
+  // model (carve-M5 §7), never fleet-seeded. Same darkness safeguard as
+  // rules_block — a defaults-tier value could otherwise flip the injection on
+  // for the whole fleet at once. NOTE: the sibling `orientation_cadence_hours`
+  // IS mirrored (it is a safe cost/tiering knob); only enablement is excluded.
+  // If this exclusion is ever removed, mirror the field AND drop it from this set.
+  "orientation",
+  // Per-agent ONLY by design (Memory v2 M5): the optional per-turn re-inject
+  // cadence is a per-agent cost dial (~55M tok/30d at every-turn) that only a
+  // measured late-session-loss case should ever set. Never fleet-seeded — a
+  // defaults-tier value would silently multiply token spend across every agent.
+  // See AgentMemorySchema.orientation_reinject_turns.
+  "orientation_reinject_turns",
 ]);
 
 describe("profileFields mirror ↔ per-agent schema parity (class-killer)", () => {
