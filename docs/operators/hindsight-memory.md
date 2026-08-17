@@ -810,16 +810,26 @@ always durable and readable by the configured agents; on the read side, ordinary
 `memory.recall.additional_banks` (a handful of dev agents) — for every other
 agent the shared write is write-only from their own recall.
 
-### The boundary (config half)
+### Not an enforced boundary — routing is a convention (config half)
 
 `additional_banks` is recall scoping and explicitly **not** an access boundary
-(`src/config/schema.ts`). The only enforcement point is the bank's own
-`mcp_enabled_tools` allowlist, set via `update_bank(config_updates=…)`
-(`src/cli/hindsight-mcp-shim.ts`). Setting it on `switchroom-dev` to just the
-tool set repo knowledge needs — write plus read — turns constraint 2 from a
-convention into a boundary a prompt-injected agent cannot step past on that
-bank. (This is a live shared-bank mutation, applied out-of-band, not part of
-the repo change that shipped the guidance.)
+(`src/config/schema.ts`). Nor is anything else: routing repo knowledge to
+`switchroom-dev` is a **convention** that dev agents follow because
+`MEMORY_GUIDANCE` tells them to — it is prompt-driven, not tool-enforced. Any
+agent *can* write to any bank by passing `bank_id`; the shared bank is simply
+where repo-scoped facts *should* go by convention.
+
+A bank's `mcp_enabled_tools` allowlist looks like it could turn that convention
+into a hard boundary, but it is **inert for this use case**. The engine keys
+the tool-enablement filter on the CALLER's session/home bank
+(`config.bank_id_resolver()`), not on the per-call `bank_id` argument. No agent
+has `switchroom-dev` as its home or session bank — it appears only in some
+agents' `memory.recall.additional_banks` — so an allowlist set on
+`switchroom-dev` never sees a matching caller context and never gates a
+cross-bank write. (A gate relying on this was tried during P6 verification and
+reverted once the keying was confirmed inert.) Treat constraint 2 as a
+convention a well-behaved agent follows, not a boundary a prompt-injected agent
+cannot step past.
 
 ### Measurement
 
