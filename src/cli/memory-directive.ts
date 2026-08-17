@@ -15,6 +15,20 @@
  * No business logic lives here — `reconcileDirectiveSuperset` does the work
  * (create-first ordering, idempotent retry, by-id deactivation). This file
  * only resolves `<agent>` to a bank-pinned `DirectiveAdmin` and plumbs argv.
+ *
+ * `mark-rules-block` (added post-#4760-merge, independent verification pass)
+ * closes a second gap the same review left open: `DirectiveAdmin`'s
+ * rules-block refusal chokepoint only fires once a directive carries
+ * `RULES_BLOCK_MARKER_TAG`, and the ONLY code path that ever stamped that
+ * tag was the batch triage executor (`applyDirectiveTriageBatch`). The
+ * mental-model-curator skill's interactive triage pass never calls that
+ * executor — it drives `list_directives`/`deactivate_directive` directly —
+ * so a rules-block directive classified only through the interactive path
+ * carried no marker and the chokepoint never armed. This verb is the
+ * missing write path: a thin wrapper over
+ * `DirectiveAdmin.markRulesBlock` (`src/memory/hindsight-directive-admin.ts`),
+ * the exact same method the batch executor calls, so the chokepoint keys
+ * off one write path regardless of which caller reaches it.
  */
 
 import type { Command } from "commander";
@@ -115,5 +129,43 @@ export function registerMemoryDirectiveCommand(memory: Command, program: Command
           }
         },
       ),
+    );
+
+  directive
+    .command("mark-rules-block <agent> <id>")
+    .description(
+      "Stamp the persisted rules-block marker tag on directive <id> in " +
+        "<agent>'s bank — the SAME DirectiveAdmin.markRulesBlock write path " +
+        "the batch triage executor uses. Once stamped, deactivate_directive " +
+        "(and every other DirectiveAdmin deactivation path) refuses this " +
+        "directive unconditionally until an M3-flip action removes the " +
+        "marker. This is the real entry point the mental-model-curator " +
+        "skill's interactive triage pass calls for every directive it " +
+        "classifies rules-block, BEFORE presenting the card — that skill " +
+        "has no other write path to this marker (no MCP tool exposes it), " +
+        "so without this call the code-level refusal never actually " +
+        "arms itself on the interactive path (PR #4760 review follow-up).",
+    )
+    .option("--json", "Machine-readable output")
+    .action(
+      withConfigError(async (agent: string, id: string, opts: { json?: boolean }) => {
+        const admin = resolveDirectiveAdmin(program, agent);
+        try {
+          const message = await admin.markRulesBlock({ id });
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: true, agent, id, message }));
+            return;
+          }
+          console.log(chalk.green(`✓ ${message}`));
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (opts.json) {
+            console.log(JSON.stringify({ ok: false, error: msg }));
+          } else {
+            console.error(chalk.red(`✗ ${msg}`));
+          }
+          process.exit(1);
+        }
+      }),
     );
 }

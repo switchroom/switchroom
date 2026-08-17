@@ -23,7 +23,7 @@ description: >
   whose shape you know, PROPOSE it through the approve/deny card — never call
   create_mental_model directly (it is not pre-approved; the propose card is the
   only sanctioned write path, Fix 1.2 / #2903).
-allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__list_directives mcp__hindsight__deactivate_directive mcp__hindsight__reactivate_directive mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose
+allowed-tools: mcp__hindsight__list_banks mcp__hindsight__get_bank_stats mcp__hindsight__list_mental_models mcp__hindsight__get_mental_model mcp__hindsight__list_directives mcp__hindsight__deactivate_directive mcp__hindsight__reactivate_directive mcp__hindsight__reflect mcp__hindsight__recall mcp__switchroom-telegram__mental_model_propose Bash(switchroom memory directive mark-rules-block *)
 ---
 
 # mental-model-curator — Propose standing knowledge models from your own bank
@@ -206,15 +206,36 @@ runs. So: **for every directive you categorise `rules-block`, call
 `list_directives` to confirm it, but do NOT call `deactivate_directive` on it
 in this pass, ever** — only stage its text (mention it in the card as staged,
 count it, and leave it exactly as-is) for the M3 flip to pick up later
-(`rule add`, once `memory.rules_block` is on for this agent). This mirrors the
-code-level refusal in `DirectiveAdmin` itself
-(`src/memory/hindsight-directive-admin.ts` — `deactivate`/`deactivateById`/
-`deactivateByIdWithTag` all refuse a directive carrying the persisted
-rules-block marker tag, the one chokepoint every call path shares, including
-this skill's own `deactivate_directive` calls) — you are the enforcement
-point when running this pass interactively through the MCP tools directly, so
-treat this instruction with the same weight as that code guard, not as an
-optional style note.
+(`rule add`, once `memory.rules_block` is on for this agent).
+
+**This is not just a prose rule you have to remember — it is now also code-
+enforced, but ONLY once you complete the mandatory step below.**
+`DirectiveAdmin` (`src/memory/hindsight-directive-admin.ts` —
+`deactivate`/`deactivateById`/`deactivateByIdWithTag`) refuses to deactivate
+ANY directive carrying the persisted `triage-category:rules-block` marker
+tag, on every call path, including this skill's own `deactivate_directive`
+calls. But that refusal only ever fires for a directive that actually
+CARRIES the tag — and nothing stamps the tag automatically just because you,
+in your own reasoning, decided a directive is `rules-block`. **You must
+stamp it yourself, immediately, as part of classification — not as an
+afterthought before presenting the card:**
+
+> For every directive you classify `rules-block` in step 2 below, before you
+> move on to the next directive, run:
+> ```
+> switchroom memory directive mark-rules-block <agent> <id>
+> ```
+> (`src/cli/memory-directive.ts` — this calls the exact same
+> `DirectiveAdmin.markRulesBlock` write the batch triage executor uses, so
+> the chokepoint above keys off it identically). Idempotent — re-running it
+> on an already-marked directive is a no-op, so it is always safe to call
+> even if you are not sure whether a prior pass already marked this one.
+
+Do this for EVERY rules-block row before step 3's card renders, not just the
+ones you personally plan to leave alone — the whole point is that the code
+guard, not your own discipline in this pass or a future one, is what refuses
+a later deactivation attempt (including a mistaken one, or one made by a
+different pass that never saw this reasoning).
 
 ### When to run it
 
@@ -233,6 +254,11 @@ optional style note.
    the five categories above, with the deterministic signal that justifies it
    (or "no signal — KEEP" for the default case). Do this for the FULL set —
    the card is worthless if a directive silently doesn't appear on it.
+   **The moment you classify a directive `rules-block`, run
+   `switchroom memory directive mark-rules-block <agent> <id>` for it right
+   then** (see the HARD RULE above) — do not defer this to a later step or
+   batch it at the end; every rules-block row must be stamped before you move
+   to step 3.
 3. **Render ONE consolidated card as text.** Two sections, KEEP/staged first,
    retirement candidates second — never interleaved, so a skim of "the bottom
    half" cannot land on a live guardrail:
@@ -295,6 +321,11 @@ notice to the operator rather than improvising a fix.
 
 - ❌ Deactivating a `rules-block`-category directive before M3 flips this
   agent — opens a guardrail gap; see the hard rule above.
+- ❌ Classifying a directive `rules-block` without immediately calling
+  `switchroom memory directive mark-rules-block <agent> <id>` for it — an
+  unmarked directive gets NO code-level protection from the
+  `DirectiveAdmin` chokepoint; the classification in your head is not
+  enough.
 - ❌ Retiring on age or citation count alone — E-45 refuses both as signals.
 - ❌ Calling `deactivate_directive` in parallel / without awaiting each one —
   sequential only (tag-write race).
