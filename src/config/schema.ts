@@ -632,6 +632,63 @@ export const AgentMemorySchema = z
         "Cascade: override (per-agent wins over default; never fleet-" +
         "seeded — each agent's flip is a deliberate M3 rollout step)."
       ),
+    orientation: z
+      .boolean()
+      .optional()
+      .describe(
+        "Memory v2 M5 go-live flag (Surface B: orientation-at-boot), " +
+        "effective default false — dark build (unset ⇒ OFF, applied by the " +
+        "scaffold resolver, NOT a Zod .default() — a hard default here would " +
+        "shadow the per-agent value in the cascade the way it does every other " +
+        "memory knob). When true, the orientation SessionStart " +
+        "hook injects this agent's cron-refreshed `orientation` mental model " +
+        "into context at boot AND re-seats it after every compaction (E-88), " +
+        "deterministically and with zero tool call. Unset/false ⇒ byte-" +
+        "identical to pre-M5 behaviour: the hook no-ops before any bank " +
+        "resolve or network call. Per-agent ONLY (never fleet-seeded — a " +
+        "flip is a deliberate canary/rollout step gated on the agent's " +
+        "m2-residue measurement + operator-created model, carve-M5 §7). " +
+        "Cascade: override (per-agent wins over default)."
+      ),
+    orientation_reinject_turns: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe(
+        "Memory v2 M5 optional per-turn re-inject cadence, effective default " +
+        "0 = off (unset ⇒ 0, applied by the scaffold resolver, not a Zod " +
+        ".default() — same cascade-shadowing reason as `orientation`). At 0 the " +
+        "briefing is injected only at SessionStart + compaction (the cheap " +
+        "path). N>0 " +
+        "would additionally re-inject the orientation briefing every N turns; " +
+        "priced at ~55M tok/30d at every-turn, which is WHY it defaults off " +
+        "(carve-M5 §2/§4). Only late-session context loss should ever set it, " +
+        "per-agent, measured. A stripped/absent value fails to 0 (fail-safe " +
+        "AND fail-cheap). Per-agent ONLY. Cascade: override."
+      ),
+    orientation_cadence_hours: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "Memory v2 M5 per-agent refresh cadence tier (hours), effective " +
+        "default 48 (unset ⇒ 48, applied by the scaffold resolver, not a Zod " +
+        ".default() — a hard default would shadow a `defaults.memory." +
+        "orientation_cadence_hours` fleet value in the cascade). " +
+        "The fast-churning agents (klanker, overlord) set 24; everyone else " +
+        "inherits 48 (carve-M5 §6, Ken's locked tiered cadence). Drives BOTH " +
+        "the out-of-session refresh scheduler AND the staleness guard's " +
+        "per-tier thresholds (stale prefix at 1.5× cadence, cold degrade at " +
+        "3×) — so a fixed 36h can never mislabel a 48h-tier agent as stale a " +
+        "day early. Modelled as an explicit int (not a hard-coded name list) " +
+        "so the tiering is data-driven and auditable. A cost knob, not an " +
+        "enablement knob: a stripped/absent value failing to 48 is safe " +
+        "(the cheaper tier). Cascade: override (per-agent wins over default); " +
+        "unlike `orientation`/`_reinject_turns` it IS accepted at the " +
+        "defaults/profile tier."
+      ),
     disposition: z
       .object({
         skepticism: z
@@ -3870,6 +3927,15 @@ const profileFields = {
       // false` can disable the RFC P3 nudge fleet-wide (per-agent `true`
       // opt-in).
       profile_capture_nudge: z.boolean().optional(),
+      // Mirror of AgentMemorySchema.orientation_cadence_hours — accepted at the
+      // defaults/profile tier too, so `defaults.memory.orientation_cadence_hours:
+      // 48` pins the fleet's baseline refresh tier and the 24h agents override
+      // per-agent (carve-M5 §6). Deliberately mirrored while `orientation` and
+      // `orientation_reinject_turns` are NOT: cadence is a cost/tiering knob
+      // that is safe to seed fleet-wide, whereas enablement must stay a
+      // per-agent canary step (see INTENTIONAL_MEMORY_MIRROR_EXCLUSIONS in
+      // schema.mirror-parity.test.ts).
+      orientation_cadence_hours: z.number().int().min(1).optional(),
       // Mirror of AgentMemorySchema.anti_confabulation_directive — accepted at
       // the defaults/profile tier too, so `defaults.memory.
       // anti_confabulation_directive: false` opts a whole fleet out of the

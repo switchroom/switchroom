@@ -519,3 +519,38 @@ class HindsightClient:
         if retain_mission:
             updates["retain_mission"] = retain_mission
         return self._request("PATCH", path, {"updates": updates}, timeout=timeout)
+
+    def list_mental_models(self, bank_id: str, timeout: int = 5) -> dict:
+        """List the mental models for a bank (Memory v2 M5 — orientation-at-boot).
+
+        The orientation SessionStart hook knows the orientation model by NAME
+        (the configured `memoryOrientationModel`), not by its `mm-…` id, so it
+        lists the bank's models and matches on name → id before reading content
+        (carve-M5 §0d/§3). Read-only GET on the ungated engine REST surface;
+        m5-0-probe measured the own-bank read at ~4ms on klanker.
+
+        REST: ``GET /v1/default/banks/{bank_id}/mental-models``. Returns the raw
+        response dict, expected to carry an ``items`` list where each item has at
+        least ``id`` and ``name``.
+        """
+        path = f"/v1/default/banks/{urllib.parse.quote(bank_id, safe='')}/mental-models"
+        return self._request("GET", path, timeout=timeout)
+
+    def get_mental_model(
+        self, bank_id: str, model_id: str, detail: str = "full", timeout: int = 5
+    ) -> dict:
+        """Read one mental model's content + freshness watermark (M5).
+
+        REST: ``GET /v1/default/banks/{bank_id}/mental-models/{model_id}?detail=full``
+        (m5-0-probe Q3/Q4 proved this returns ``content`` + the
+        ``last_refreshed_at`` watermark the staleness guard keys on, ~4ms warm).
+        Read-only; ungated. The caller wraps this in a generous read-timeout and
+        degrades to the cold notice on any error — a slow/failed read must never
+        block boot (carve §3 fail-safe).
+        """
+        bank = urllib.parse.quote(bank_id, safe="")
+        model = urllib.parse.quote(model_id, safe="")
+        path = f"/v1/default/banks/{bank}/mental-models/{model}"
+        if detail:
+            path = f"{path}?{urllib.parse.urlencode({'detail': detail})}"
+        return self._request("GET", path, timeout=timeout)
