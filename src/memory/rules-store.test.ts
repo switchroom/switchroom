@@ -277,6 +277,46 @@ describe("MAJOR — text/source normalization prevents false tamper", () => {
     expect(readFileSync(claudeMdPath(), "utf-8")).toBe(before);
     expect(existsSync(mutationLogPath())).toBe(false);
   });
+
+  it("rejects a marker that only APPEARS after whitespace-flattening (guard runs on the flattened value)", () => {
+    // The raw text does NOT contain the literal end marker as a substring —
+    // it has DOUBLE spaces inside the comment — but `flattenWhitespace`
+    // collapses it into the exact `<!-- switchroom:rules:end -->` marker. If
+    // the guard ran on the raw input this would slip through, render the end
+    // marker twice, and false-trip the sentinel on the next verify. Guarding
+    // the flattened value must REJECT it (throw, byte-identical, no log row).
+    const doubleSpacedEndMarker = "<!--  switchroom:rules:end  -->";
+    // Precondition: the raw variant is NOT a literal marker substring...
+    expect(doubleSpacedEndMarker.includes(RULES_BLOCK_END)).toBe(false);
+    // ...but it flattens to exactly the marker.
+    expect(doubleSpacedEndMarker.replace(/\s+/g, " ").trim()).toBe(RULES_BLOCK_END);
+
+    const before = readFileSync(claudeMdPath(), "utf-8");
+    expect(() =>
+      createRule(agentDir, {
+        text: `sneaky ${doubleSpacedEndMarker} truncation`,
+        source: "telegram",
+        actor: "klanker",
+      }),
+    ).toThrow(InvalidRuleError);
+    expect(readFileSync(claudeMdPath(), "utf-8")).toBe(before);
+    expect(existsSync(mutationLogPath())).toBe(false);
+  });
+
+  it("rejects a begin-marker variant with internal newlines that flattens into a marker", () => {
+    const newlineBeginMarker = "<!--\nswitchroom:rules:begin\n-->";
+    expect(newlineBeginMarker.includes(RULES_BLOCK_BEGIN)).toBe(false);
+    const before = readFileSync(claudeMdPath(), "utf-8");
+    expect(() =>
+      createRule(agentDir, {
+        text: `prefix ${newlineBeginMarker} suffix`,
+        source: "telegram",
+        actor: "klanker",
+      }),
+    ).toThrow(InvalidRuleError);
+    expect(readFileSync(claudeMdPath(), "utf-8")).toBe(before);
+    expect(existsSync(mutationLogPath())).toBe(false);
+  });
 });
 
 describe("MEDIUM — over-budget --supersedes must not archive before the budget check", () => {

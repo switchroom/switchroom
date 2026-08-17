@@ -393,10 +393,16 @@ export function createRule(agentDir: string, opts: CreateRuleOptions): CreateRul
 
   // Normalize + validate ONCE at ingestion (before any IO), so stored ==
   // rendered == parsed and no illegal char can survive to a false tamper.
-  assertNoMarkers(opts.text, "text");
-  assertNoMarkers(opts.source, "source");
+  // Flatten FIRST, then guard the FLATTENED values: whitespace collapse can
+  // fabricate a marker the raw text never literally contained (e.g.
+  // `<!--  switchroom:rules:end  -->` → the exact end marker), so guarding the
+  // raw input would let that through to be rendered/stored verbatim and then
+  // false-trip the sentinel on the very next verify. Guard what actually gets
+  // written, not what was typed.
   const text = flattenWhitespace(opts.text);
   const source = flattenWhitespace(opts.source);
+  assertNoMarkers(text, "text");
+  assertNoMarkers(source, "source");
   if (text.length === 0) {
     throw new InvalidRuleError("Rule text must not be empty.");
   }

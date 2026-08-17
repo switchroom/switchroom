@@ -579,13 +579,16 @@ export const TOOLS = [
     },
   },
   // Memory v2 M1 — rules-block self-service (carve-M1.md). BUILT DARK:
-  // these tools always exist, but every write they drive is a no-op on
-  // the agent's rendered CLAUDE.md permissions until the per-agent
-  // `memory.rules_block` go-live flag (default false, M3) is flipped —
-  // the rules block itself (marker-delimited text + hash-chained audit
-  // log) is written regardless of the flag; only the Edit/Write deny is
-  // gated. Shell out to the same `switchroom memory rule ...` CLI verbs
-  // `src/cli/memory-rules.ts` exposes, with `--json` for machine parsing.
+  // these tools always exist, but until the per-agent `memory.rules_block`
+  // go-live flag (default false, M3) is flipped they cannot mutate the
+  // agent's CLAUDE.md — the underlying CLI write verbs
+  // (`src/cli/memory-rules.ts`, `assertRulesBlockEnabled`) REFUSE
+  // add/retire/edit-yours with a "memory.rules_block is off" error when the
+  // flag is not true, so no rules block is ever rendered for a flag-off
+  // agent (and the Edit/Write deny is likewise gated). Read verbs
+  // (list/verify) stay open. These tools shell out to the same `switchroom
+  // memory rule ...` CLI verbs, with `--json` for machine parsing, so that
+  // single CLI-layer gate covers both callers.
   {
     name: "memory_rule_add",
     description:
