@@ -131,6 +131,27 @@ describe("classifyDirective — rules-block wins over the superseded-by tag scan
     expect(result.action).toBe("stage-for-m3");
     expect(result.action).not.toBe("retire");
   });
+
+  it("a rules-block override with an EMPTY signal still wins over a conflicting superseded-by tag — fails CLOSED, not open (review low #1)", () => {
+    // Every other category's empty-signal override falls through to
+    // default-KEEP (fail-safe: "no override" is treated as "no signal at
+    // all"). rules-block must NOT take that path — an empty-signal
+    // rules-block override falling through here would let the conflicting
+    // superseded-by tag win and classify `retire`. Not independently
+    // exploitable (DirectiveAdmin's marker-tag chokepoint still refuses
+    // the actual deactivate call), but the classifier itself should never
+    // assert `retire` for a directive its own caller just called
+    // rules-block.
+    const d = directive({
+      id: "1",
+      name: "standing-pref",
+      tags: ["superseded-by:new-rule"],
+    });
+    const result = classifyDirective(d, { category: "rules-block", signal: "   " });
+    expect(result.category).toBe("rules-block");
+    expect(result.action).toBe("stage-for-m3");
+    expect(result.action).not.toBe("retire");
+  });
 });
 
 describe("classifyDirective — an already-inactive directive is never re-retired (M2 redteam M1)", () => {

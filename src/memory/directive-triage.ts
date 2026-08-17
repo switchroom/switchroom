@@ -109,10 +109,16 @@ const SUPERSEDED_BY_TAG_RE = /^superseded-by:(.+)$/;
  *
  *   1. A persisted {@link hasRulesBlockMarker} tag, or a caller override
  *      naming `category: "rules-block"`, wins over EVERYTHING else,
- *      including a conflicting `superseded-by:` tag. Reachable mundanely:
- *      `DirectiveAdmin.reactivate()` leaves a stale `superseded-by` tag in
- *      place, and tags are settable via PATCH/`create_directive` — so a
- *      genuinely rules-block directive can end up carrying both signals.
+ *      including a conflicting `superseded-by:` tag — and unlike every
+ *      other category below, a rules-block override wins EVEN WITH AN
+ *      EMPTY/WHITESPACE `signal`. Every other category's empty-signal
+ *      override falls through to default-KEEP (fail-safe); rules-block
+ *      fails CLOSED instead, because falling through here would let a
+ *      stale `superseded-by:` tag win and classify `retire`. Reachable
+ *      mundanely: `DirectiveAdmin.reactivate()` leaves a stale
+ *      `superseded-by` tag in place, and tags are settable via
+ *      PATCH/`create_directive` — so a genuinely rules-block directive
+ *      can end up carrying both signals.
  *   2. An already-inactive directive never comes out `action: "retire"`
  *      (M2 redteam M1) — there is nothing left to retire, and re-running
  *      `deactivate` on it would be a wasted/misleading call.
@@ -135,13 +141,26 @@ export function classifyDirective(
       action: "stage-for-m3",
     };
   }
-  if (override && overrideSignal && override.category === "rules-block") {
+  if (override && override.category === "rules-block") {
     // Decision 3, enforced at classification time too (defense in depth
-    // alongside the apply-batch executor's own refusal): a rules-block
-    // row can NEVER come out of this function as `action: "retire"`.
+    // alongside the DirectiveAdmin-level chokepoint and the apply-batch
+    // executor's own pre-check): a rules-block row can NEVER come out of
+    // this function as `action: "retire"`. Deliberately does NOT gate on
+    // `overrideSignal` being non-empty the way every other category below
+    // does — "default to KEEP on an empty signal" is the right fail-safe
+    // for every OTHER category, but rules-block must fail CLOSED: an
+    // empty-signal rules-block override falling through to the tag scan
+    // below would let a stale `superseded-by:` tag on a genuinely
+    // rules-block directive classify as `retire` at this layer (the
+    // DirectiveAdmin marker backstop still refuses the actual deactivate
+    // call, so this was never independently exploitable — but the
+    // classifier itself should never assert `retire` for a directive its
+    // own caller just told it is rules-block).
     return {
       category: "rules-block",
-      signal: overrideSignal,
+      signal:
+        overrideSignal ||
+        "rules-block override with no signal text — staged for M3, never retired",
       action: "stage-for-m3",
     };
   }

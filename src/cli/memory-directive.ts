@@ -103,7 +103,11 @@ export function registerMemoryDirectiveCommand(memory: Command, program: Command
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             if (opts.json) {
-              console.error(JSON.stringify({ ok: false, error: msg }));
+              // Machine-readable envelope belongs on stdout, matching the
+              // success path above — stderr is for the human-readable `✗`
+              // line only. A caller parsing `--json` output should never
+              // have to know which stream the outcome landed on.
+              console.log(JSON.stringify({ ok: false, error: msg }));
             } else {
               console.error(chalk.red(`✗ ${msg}`));
             }

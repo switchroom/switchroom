@@ -207,11 +207,14 @@ runs. So: **for every directive you categorise `rules-block`, call
 in this pass, ever** — only stage its text (mention it in the card as staged,
 count it, and leave it exactly as-is) for the M3 flip to pick up later
 (`rule add`, once `memory.rules_block` is on for this agent). This mirrors the
-code-level refusal in `src/memory/directive-triage-executor.ts`
-(`applyDirectiveTriageBatch` throws/skips on any `rules-block` row) — you are
-the enforcement point when running this pass interactively through the MCP
-tools directly, so treat this instruction with the same weight as that code
-guard, not as an optional style note.
+code-level refusal in `DirectiveAdmin` itself
+(`src/memory/hindsight-directive-admin.ts` — `deactivate`/`deactivateById`/
+`deactivateByIdWithTag` all refuse a directive carrying the persisted
+rules-block marker tag, the one chokepoint every call path shares, including
+this skill's own `deactivate_directive` calls) — you are the enforcement
+point when running this pass interactively through the MCP tools directly, so
+treat this instruction with the same weight as that code guard, not as an
+optional style note.
 
 ### When to run it
 
