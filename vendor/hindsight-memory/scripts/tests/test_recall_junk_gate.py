@@ -1,10 +1,15 @@
 """M4 P-REC test (d) — junk gate for `<task-notification>` envelopes.
 
 carve-M4.md packet P-REC, test (d): a `<task-notification>`-prefixed prompt
-must never reach the network — no `client.recall`, no `client.list_directives`,
-no `<hindsight_memories>`/additionalContext in the emitted transport. Asserts
-on TRANSPORT (stdout emptiness + a client that raises if touched), not on an
-internal flag, per the red-team's "assert transport, not a flag" rule.
+must not run the noisy NON-directive recall — no `client.recall`, and no
+non-directive memory in the emitted transport.
+
+#4756 F2 directive exemption: DIRECTIVES are the one memory class that must
+SURVIVE the gate — an agent's standing rules apply on every turn, synthetic or
+not. So a gated turn STILL fetches + injects the `<active_directives>` block
+(`client.list_directives`), while the `recall` result set stays suppressed.
+Asserts on TRANSPORT (what reaches stdout + which client methods are touched),
+not on an internal flag, per the red-team's "assert transport, not a flag" rule.
 
 Distinct from the gateway's `<channel source=...>` envelope (a real human
 message) — this only matches the CLI-native task-notification wrapper.
@@ -26,14 +31,31 @@ if SCRIPTS_DIR not in sys.path:
 import recall  # noqa: E402
 
 
-class _RaisingClient:
-    """Any network touch is a test failure — this client raises on use."""
+class _DirectiveExemptClient:
+    """Models a gated task-notification turn after the #4756 F2 fix.
 
-    def list_directives(self, *a, **kw):
-        raise AssertionError("junk-gated turn must never call list_directives")
+    `list_directives` answers with one active directive (which MUST survive the
+    gate and be injected). `recall` returns a real memory but records that it
+    was called — the gate must NEVER call it, so a hit on `recall_called` (or
+    the memory text appearing in transport) is a regression to the pre-fix
+    behavior where the gate dropped directives too.
+    """
 
-    def recall(self, *a, **kw):
-        raise AssertionError("junk-gated turn must never call recall")
+    def __init__(self):
+        self.recall_called = False
+
+    def list_directives(self, bank_id, active_only=True, timeout=2):
+        return {"items": [{
+            "id": "d1", "name": "always-sign-off", "priority": 10,
+            "content": "always end replies with a wave",
+        }]}
+
+    def recall(self, bank_id, query, **kwargs):
+        self.recall_called = True
+        return {"results": [{
+            "text": "a real memory", "type": "fact", "mentioned_at": "2026-01-01",
+            "id": "m1", "scores": {"final": 0.9},
+        }]}
 
 
 class _AnsweringClient:
@@ -90,12 +112,43 @@ class JunkGateTests(unittest.TestCase):
             recall.main()
         return stdout.getvalue()
 
-    def test_task_notification_prompt_never_touches_the_network_or_emits_context(self):
+    def test_task_notification_gate_injects_directives_but_suppresses_recall(self):
+        # #4756 F2: on a gated task-notification turn, DIRECTIVES must be
+        # injected while the non-directive `recall` result set is suppressed.
+        # A test that would pass under the OLD bug (gate emits nothing) is
+        # invalid — so assert the directive text is PRESENT (the bug emitted
+        # ""), the memory text is ABSENT, and `recall` was never called.
+        client = _DirectiveExemptClient()
         out = self._run(
             "<task-notification>a background task finished</task-notification>",
-            _RaisingClient(),
+            client,
         )
-        self.assertEqual(out, "", "junk-gated turn must emit no transport output at all")
+        self.assertTrue(out, "gated turn must still emit the directives block")
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("<active_directives>", ctx)
+        self.assertIn("always end replies with a wave", ctx)
+        self.assertNotIn(
+            "a real memory", ctx,
+            "gate must suppress the non-directive recall result set",
+        )
+        self.assertFalse(
+            client.recall_called,
+            "gated turn must never run the memory recall HTTP call",
+        )
+
+    def test_task_notification_gate_with_no_directives_emits_nothing(self):
+        # No active directives → no empty wrapper, no recall: the gate stays a
+        # true no-op on the transport (byte-identical to pre-fix when the bank
+        # has nothing to inject).
+        client = _AnsweringClient()  # list_directives returns items: []
+        out = self._run(
+            "<task-notification>a background task finished</task-notification>",
+            client,
+        )
+        self.assertEqual(
+            out, "",
+            "gated turn with no directives must emit no transport output",
+        )
 
     def test_ordinary_prompt_with_task_notification_substring_midstring_is_not_gated(self):
         # Only a PREFIX match gates — a real user prompt that happens to

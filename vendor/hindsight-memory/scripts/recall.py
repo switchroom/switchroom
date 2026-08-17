@@ -502,6 +502,42 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
     return True
 
 
+def _emit_directives_only(config: dict, hook_input: dict) -> None:
+    """#4756 F2 — directive exemption for the task-notification junk gate.
+
+    The M4 P-REC junk gate skips synchronous recall on synthetic
+    `<task-notification>` turns to avoid burning latency/cost on
+    machine-generated noise. But DIRECTIVES are the one memory class that must
+    survive that gate: an agent's standing rules apply on EVERY turn, synthetic
+    or not, and suppressing them on a sub-agent-handback turn is a behavior
+    change that should not ride along with the noise gate. So the gate drops
+    the non-directive classes (observations/world/etc. — the whole `recall`
+    result set) but still fetches and injects the active directives block,
+    exactly as the prefetch fast path does (M3 directive-decoupling rule).
+
+    Emits nothing when the bank has no active directives (no empty wrapper).
+    Failure-safe: any error → emit nothing rather than break the turn, matching
+    `fetch_active_directives_cached`'s never-raise contract. Deliberately does
+    NOT run the memory `recall` HTTP call — only `list_directives` is touched.
+    """
+    try:
+        bank_id = derive_bank_id(hook_input, config)
+        api_url = get_api_url(config)
+        client = HindsightClient(api_url, config.get("hindsightApiToken"))
+        directives = fetch_active_directives_cached(
+            client,
+            bank_id,
+            ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS),
+        )
+        directives_block = format_active_directives_block(directives) if directives else None
+    except Exception as exc:  # pragma: no cover - defensive, directives are best-effort here
+        debug_log(config, f"Task-notification skip: directive fetch failed: {exc}")
+        return
+
+    if directives_block:
+        _emit_cached_context(directives_block)
+
+
 def _is_demoted_memory(memory) -> bool:
     """Return True if the memory has any demote-from-recall tag.
 
@@ -2088,7 +2124,13 @@ def main():
     # default (`recallSkipTaskNotification`); flips off for an agent that
     # deliberately wants recall on these turns.
     if config.get("recallSkipTaskNotification", True) and prompt.startswith("<task-notification"):
-        debug_log(config, "Prompt is a task-notification envelope, skipping recall")
+        # #4756 F2: skip the noisy NON-directive recall, but directives are
+        # exempt — they are HARD RULES that apply on every turn, synthetic or
+        # not, so still fetch + inject the active directives block. Only the
+        # observation/world memory classes (the `recall` result set) are
+        # suppressed here; `_emit_directives_only` never touches `recall`.
+        debug_log(config, "Prompt is a task-notification envelope, skipping recall (directives exempt)")
+        _emit_directives_only(config, hook_input)
         return
 
     # M4 P-REC Fix C (consumer side) — the whole prefetch-buffer mechanism
