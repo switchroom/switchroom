@@ -17,6 +17,50 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.15 — RFC memory-redesign phase 4: incremental SessionEnd retain, temporal recall anchoring, operator-profile capture nudge, retain.tool_calls setter, reflect cardinality guards, shared repo-knowledge bank, loud directive-overflow notice, scheduled mental-model refresh
+
+### Features
+
+- **memory: pass a `query_timestamp` anchor on time-relative recall turns (RFC memory-redesign P2) (#4744)** — when the inbound prompt is time-relative ("last week", "yesterday", "on the 12th") the recall REST body now carries an explicit ask-time `query_timestamp` so the engine resolves the relative expression and scores recency against the real now. `detect_query_timestamp()` is a deterministic, IO-free, model-free regex over the channel-stripped prompt (`recall.py:1714`), run off the network path; it only gates whether the field is sent, and the anchor is the current wall clock. The field reaches the wire via an additive `query_timestamp` kwarg on `HindsightClient.recall`, sent only when non-empty so an untriggered turn's wire body is byte-identical (`lib/client.py:181,223-224`). Gated by `recallQueryTimestamp` (default on) as the rollback lever (`recall.py:2049`), and logged on the `recall_log` row (`query_timestamp`) so the firing rate is measurable. Additive — no stored data changes.
+- **memory: operator-profile capture nudge (RFC phase4 P3) (#4745)** — the auto-recall hook now runs a second deterministic regex over the inbound message; when it looks like a durable first-person profile fact (`I prefer …`, `my … is …`, `I always …`, `remind me that I …`) it appends a terse advisory telling the model to persist it with an explicit `retain` tagged `profile:ken` into the agent's own bank. Pure regex — no model call, no silent hook-side write. Questions and third-party attributions are scrubbed first. On by default; opt out per-agent via `memory.profile_capture_nudge: false`. Firing rate is logged on the `recall_log` row (`profile_nudge`).
+- **memory: loud in-turn directive-overflow notice (RFC memory-redesign P7) (#4746)** — when a bank exceeds `MAX_DIRECTIVES` (30) and `format_active_directives_block` drops the lowest-priority directives from the prompt, the only in-turn signal used to be a single quiet `(+N more, omitted)` parenthetical the agent could read straight past (the stderr breadcrumb is swallowed by Claude Code on a zero exit; `directives_omitted`/doctor are after-the-fact). On overflow the block now renders a LOUD, operator-directed banner inside `<active_directives>` that states explicit operator-authored instructions were DROPPED, names the dropped count / total / cap, and instructs the agent to surface it to the operator in its reply this turn and merge/retire directives (`lib/directives.py:308-320`). The literal `(+N more, omitted)` marker is kept verbatim so the recall_log/doctor cross-checks and the `parse_active_directives_block` dedup parser are unaffected. `MAX_DIRECTIVES` stays at 30 (`lib/directives.py:53`) — the cap raise is a separate later change, pinned against riding in on this PR by a test. Only `lib/directives.py` changed; no `retain.py`/`recall()` collision.
+- **memory: expose `memory.retain.tool_calls` to opt an agent out of storing tool_use inputs / tool_result content in auto-retains (RFC memory-redesign P4). Setter only — default stays `true`, so fleet behaviour is byte-identical until an operator sets it `false`; cascades and is stamped into the plugin `settings.json` like the cadence knobs, with a matching `HINDSIGHT_RETAIN_TOOL_CALLS` env channel so a docker-exec'd retain/backfill resolves the same value (#4747)**
+- **memory: reflect cardinality guard in the hindsight shim (#4748)** —
+  memory-redesign RFC P9. On the `reflect` `tools/call` path the
+  hindsight-mcp-shim now returns an explicit "no relevant memories" answer
+  instead of the engine's synthesized prose when the returned evidence set is
+  genuinely empty, so an empty retrieval produces a machine-legible absence
+  rather than a fluent-but-sourceless answer (the false-positive that defeats
+  the abstention signal). The gate keys off the REAL returned evidence
+  cardinality, not a heuristic: the shim forces `include_based_on:true` onto
+  the forwarded call (the caller's explicit value still wins) and abstains only
+  when `based_on` is present and totals zero across every bucket; when the
+  evidence set cannot be seen the synthesized answer passes through unchanged,
+  and on a non-empty result the injected evidence is stripped back out unless
+  the caller asked for it. Shim-only — no engine, retain, or recall change.
+- **memory: route durable repository knowledge into the shared `switchroom-dev` bank (RFC memory-redesign P6). Fleet `MEMORY_GUIDANCE` now tells an agent that a durable fact ABOUT A REPOSITORY (a build invariant, a migration gotcha, a house-style rule) belongs in the shared repo bank via an explicit `retain(bank_id="switchroom-dev", tags=["repo:switchroom", …])` — reusing the already-pre-approved retain path, no new write path. Auto-retain is unchanged: it still always resolves the agent's own bank, and that asymmetry is deliberate. Guidance/doc half only — this routing is a convention driven by prompt guidance, not a tool-enforced boundary (#4750)**
+- **memory: scheduled stale mental-model refresh cron (#4751)** —
+  memory-redesign RFC P10. Mental models are hindsight's only synthesis layer
+  and nothing refreshed them unattended (the doctor WARNs at `>7d since
+  refresh` but cannot fix). New model-free host verb `switchroom
+  mental-model-refresh`, armed via `/etc/cron.d` (`--install-cron`, mirroring
+  the `hindsight-watch` pattern: `flock -n`, pre-created log, logrotate,
+  reconcile-on-`update`), runs off-peak and daily. Per tick it lists each
+  bank's models, selects only those past the staleness interval (default 7d,
+  `--stale-days`) using the same `staleMentalModels` selector the doctor
+  reports, and refreshes each via one `refresh_mental_model` MCP `tools/call`
+  over `/mcp/` — one bank at a time. NOT a `switchroom.yaml` `schedule:` entry
+  (the `action` engine is egress-only and cannot reach the loopback `/mcp/`; a
+  `prompt` entry would wake a model for deterministic work) and NOT
+  `trigger.refresh_cron` (not on the MCP surface). Zero model tokens. Never
+  throws; exits `1` only when every bank fails inspection (engine
+  unreachable) — individual per-model refresh failures are logged, not fatal.
+
+### Bug fixes
+
+- **memory: incremental SessionEnd retain sweep (RFC memory-redesign P1) (#4743)** — the forced SessionEnd sweep no longer re-retains the whole transcript on every session. `select_retain_window` gains an optional `since_uuid` watermark (`retain.py:369`): when `force=True`, `chunked`, `every_n > 1` and a committed watermark uuid exists, the sweep returns only the transcript tail after that uuid via the shared, pure/IO-free `watermark.tail_after` (`retain.py:437-438`, `lib/watermark.py:95`) instead of the whole session, killing the duplicate whole-session document that previously grew with session length. The watermark READ lives in `run_retain` inside a catch-all `try/except` that degrades to `since_uuid=None` (today's full-session sweep) on any failure (`retain.py:841-852`), because that seam is the one place a raise would DELETE a turn. The `every_n_turns == 1` path (document id `{session_id}`) is untouched — a tail slice there would truncate the stored document. No stored data changes.
+- **memory: harden the reflect cardinality guard so a `based_on` object with any non-array bucket returns "undeterminable" (`null`) instead of `0`, so the empty-evidence abstention can only ever fire on a genuinely-empty, fully array-shaped evidence set — never a false abstention on an unrecognised shape (RFC P9 follow-up to #4748) (#4749)**
+
 ## v0.21.14 — the vault-broker picks up an operator vault set without a restart and refuses to overwrite a vault it cannot read, fleet-health stops laundering a lost reply on a routine repaint deferral, a defaulted host-capabilities verdict no longer silently drops the voice sidecar, recall logs which directives it injected, the hindsight shim rejects synthesized tools whose REST route is missing, and the fleet system prompt is trimmed with tests that actually bite
 
 ### Features
@@ -25224,6 +25268,7 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
 
