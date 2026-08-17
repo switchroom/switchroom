@@ -17,6 +17,101 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.16 — RFC memory-redesign phase 5: M1 rules-block toolchain (dark), M2 directive-triage card + apply-batch executor, M4 async recall-prefetch buffer (dark), M6 worker read-only recall + cross-bank shim guard; hindsight periodic VACUUM/REINDEX maintenance loop, recall max_tokens floor
+
+### Features
+
+- **hindsight: periodic `VACUUM (ANALYZE)` and measured conditional `REINDEX` (#4742)**
+
+  The hindsight maintenance loop now runs a throttled whole-database
+  `VACUUM (ANALYZE)` (default every 6h, `vacuumdb -j 4 --analyze` where
+  available) and a weekly, measurement-gated
+  `REINDEX INDEX CONCURRENTLY` sweep. Postgres' cumulative stats do not
+  survive a container recreate on this deployment — `stats_reset` is NULL
+  and `last_autovacuum` empty for every table minutes after a roll — so
+  autovacuum's dead-tuple trigger keeps restarting from zero and can go
+  unfired for long stretches. The payoff is the visibility map, not disk:
+  three hot tables measured 35.1% / 25.2% / 86.3% all-visible before a
+  manual vacuum and 99.0% / 100% / 99.2% after a 25-second run, and a low
+  all-visible fraction forces heap fetches instead of index-only scans.
+  The reindex rebuilds only btree indexes whose measured
+  `avg_leaf_density` is below 70% (hnsw/bm25 indexes are excluded from
+  the catalog query — `pgstatindex` errors on them and a rebuild is not a
+  bloat fix), always CONCURRENTLY, guarded on free disk, capped at 3 per
+  tick with the skipped count logged, and never in the same tick as the
+  vacuum. `VACUUM FULL` is never issued. Off-switchable with
+  `SWITCHROOM_HINDSIGHT_VACUUM=0` / `SWITCHROOM_HINDSIGHT_REINDEX=0`.
+- **hindsight: M4 async recall-prefetch buffer + delta-retain fix, dark-by-default (#4756)**
+
+  Lands the M4 6a hardening pass for the memory-v2 async prefetch mechanism:
+  a producer/consumer buffer that lets `retain.py`'s Stop hook kick off a
+  recall prefetch for the next turn instead of paying the recall latency
+  synchronously, plus a fix to the delta-retain path it shares. The entire
+  mechanism is internal-only and gated end-to-end behind
+  `memoryPrefetchEnabled`, which defaults to off — with the flag unset (the
+  fleet default for every agent today), `retain.py` and `recall.py` take the
+  exact code paths they did before this PR, and `prefetch.py` is a hard
+  no-op. No agent-visible behavior changes at the default flag value; this
+  fragment exists to satisfy the changelog gate ahead of a separate,
+  tracked pre-flip hardening pass before `memoryPrefetchEnabled` is turned
+  on anywhere.
+
+  One exception is NOT dark and ships live on merge: `recall.py`'s
+  task-notification junk gate (`recallSkipTaskNotification`, default on),
+  which skips recall on synthetic `<task-notification>` / sub-agent-handback
+  turns. It is independent of `memoryPrefetchEnabled` and takes effect
+  immediately. To keep that live change honest, the gate is now scoped to
+  the noisy classes only: **active DIRECTIVES are exempt** — a gated turn
+  still fetches and injects the `<active_directives>` block (an agent's
+  standing rules apply on every turn, synthetic or not), and only the
+  non-directive `recall` result set (observations/world/etc.) is suppressed.
+- **memory: Memory v2 M1 — rules-block toolchain, built dark (#4758)** — a marker-delimited, hash-chained standing-rules block for CLAUDE.md (`switchroom memory rule add|retire|list|edit-yours|verify`, four matching `agent-config` MCP tools, a doctor integrity/divergence check, and a read-only SessionStart tamper sentinel). Gated by `memory.rules_block` (default `false`): off, the agent's rendered CLAUDE.md is byte-identical to pre-M1 — no rendered block, no CLAUDE.md Edit/Write deny, zero doctor rows, sentinel hook fast-no-ops — AND every write verb (`add`/`retire`/`edit-yours`, via both the CLI and the MCP tools) refuses with a clean "memory.rules_block is off" error, so a flag-off agent can never render a block into its live CLAUDE.md; read verbs (`list`/`verify`) stay open. Only a future M3 rollout flips the flag per agent. Integrity signalling is unkeyed (sentinel + hash-chain live in agent-writable files): it detects accidental or out-of-band edits — including a whole-block deletion cross-checked against the mutation log — not a determined attacker with a shell; a keyed MAC is a deliberate post-M1 concern.
+- **memory: M6 worker read-only Hindsight recall + cross-bank guard (#4759)**
+
+  Worker sub-agents now carry a small, read-only Hindsight tool grant
+  (`recall`, `get_mental_model`, `get_knowledge_tree`, `get_knowledge_page`,
+  `search_knowledge_pages`) on the default worker allowlist, so a delegated
+  worker can pull its own bank's prior context instead of only inheriting
+  whatever the parent pasted into the dispatch prompt. No write verb
+  (`retain`, `create_directive`, …) and no `mcp__hindsight__*` wildcard are
+  granted.
+
+  Because `recall`, `get_mental_model`, and every other read-only Hindsight
+  MCP tool that accepts a caller-supplied `bank_id` (`reflect`, `get_memory`,
+  `list_memories`, `list_directives`, `get_bank`, `get_bank_stats`,
+  `get_document`, `get_operation`, `list_documents`, `list_mental_models`,
+  `list_operations`, `list_tags`) forward it to the engine verbatim with no
+  grant validation of their own (M6/E-86 red-team §1 — low-entropy,
+  agent-name-shaped bank ids make cross-bank reads guessable, and this
+  applies to any prompt-injected caller of the shim, worker or main agent),
+  **over the stdio MCP transport** (the fleet default) the shim now rejects
+  any `bank_id` on those read tools that does not match the caller's own
+  pinned bank (`guardBankScope` / `BANK_SCOPE_GUARDED_TOOLS` in
+  `src/cli/hindsight-mcp-shim.ts`). The guard is deliberately scoped to
+  READ tools only — `retain`'s documented cross-bank write pattern
+  (`bank_id="switchroom-dev"`, routing durable repo knowledge to the shared
+  repo bank) is untouched, and any other write tool's `bank_id` is likewise
+  unguarded.
+
+  **This guard does not cover a hypothetical `mcp_transport: http`
+  deployment.** Under stdio, every `tools/call` this shim's process makes
+  passes through `guardAndClampToolCall`. If an operator instead sets
+  `mcp_transport: http`, agents talk to the Hindsight engine directly over
+  HTTP with an `X-Bank-Id` header and never touch this shim process at all,
+  so the guard is bypassed entirely. Not exploitable today — the fleet's
+  default (and every current deployment) is stdio — but must be closed
+  before http transport is enabled for any agent. Tracked as a follow-up.
+- **memory: Memory v2 M2 — directive-triage card generator + apply-batch executor (#4760)** — `renderDirectiveTriageCard` sorts a bank's directives into E-45's five categories (rules-block / reflect-directive / disposition / retire / retain-as-memory), defaults every row to KEEP, shows the deterministic per-row signal and priority, and visually separates live guardrails from retirement candidates. `applyDirectiveTriageBatch` runs a triaged card's retirements sequentially against the calling agent's OWN bank via the shipped, pre-approved `deactivate_directive`/`reactivate_directive` (Shape α — bank-pinned, no cross-bank reach). Decision 3 (rules-block stays ACTIVE until M3) is enforced at the one chokepoint every call path shares: `DirectiveAdmin.deactivate*` itself refuses any directive carrying a persisted `RULES_BLOCK_MARKER_TAG`, independent of a caller's own classification — not just this executor's own defense-in-depth pre-check. `reconcileDirectiveSuperset` re-specifies the windows-boxes-class drift fix as create-the-superset-copy-first, deactivate-the-old-copies-second, resolved exclusively by id (never a by-name "ambiguous" resolution) and idempotent/recoverable across a deactivate-step failure retry (the epic's original single-directive content-PATCH is unbuildable — the shim deliberately refuses to PATCH `content`, unchanged by this PR). A real entry point ships for it: `switchroom memory directive reconcile <agent> <name> <content...>`. A new `measureDirectiveResidue`/`writeDirectiveResidueArtifact` harness emits the per-agent always-on residue token estimate (`m2-residue.md`, active rows only) that sets M3's Surface-A rules budget. The `mental-model-curator` skill's interactive retirement pass keeps a human tap per retirement (`deactivate_directive` is pre-approved fleet-wide with no per-call Telegram card, so the skill's own stop-and-confirm loop is that gate — a single batch-level go-ahead is not enough). No live agent bank was triaged by this PR — the four heavy-bank retirement passes run per-agent, later, via that skill.
+
+### Bug fixes
+
+- **hindsight: floor MCP recall's `max_tokens` and mark trimmed payloads loud (#4755)**
+  A too-small `max_tokens` could crater `recall`'s tail-trim loop to a
+  silent, structurally-valid `{"results": []}` — indistinguishable from
+  "nothing matched" (E-86). `max_tokens` is now floored at 256, and any
+  payload the trim loop actually shortens is stamped
+  `truncated: true` / `dropped_count: N`.
+
 ## v0.21.15 — RFC memory-redesign phase 4: incremental SessionEnd retain, temporal recall anchoring, operator-profile capture nudge, retain.tool_calls setter, reflect cardinality guards, shared repo-knowledge bank, loud directive-overflow notice, scheduled mental-model refresh
 
 ### Features
@@ -25268,6 +25363,7 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
 
