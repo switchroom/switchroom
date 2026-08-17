@@ -82,6 +82,7 @@ from lib.directives import (
 )
 from lib.gateway_ipc import extract_chat_id_from_prompt, extract_topic_from_prompt, extract_user_from_prompt, update_placeholder
 from lib.parallel_recall import run_parallel
+from lib import recall_buffer
 from lib.state import read_state, write_state
 
 # Cost of everything above, charged against the hook ceiling (see
@@ -393,6 +394,112 @@ def _emit_cached_context(context: str) -> None:
         },
         sys.stdout,
     )
+
+
+_PREFETCH_DEGRADED_NOTICE = (
+    "⏳ prefetch not ready and no prior recall is cached for this session — "
+    "proceeding without injected memory this turn."
+)
+
+
+def stale_recall_notice(memories_context: str) -> str:
+    """Wrap a PRIOR turn's cached memories-only block in an explicit
+    staleness marker for the M4 prefetch-buffer fallback path.
+
+    M4 P-REC Fix B (red-team BINDING, MUST NOT regress): `memories_context`
+    must NEVER contain a directives block — the caller is required to pass
+    `LAST_RECALL_STATE`'s `memories_context` field (directives-free by
+    construction, see the write site near `context_message`), never its
+    sibling `context` field (which bundles `directives_block`). Directives
+    stay on the synchronous, always-current fetch path only (M3's
+    directive-decoupling rule) — a stale directives block re-injected from a
+    prior turn could resurrect a rule the user rescinded moments ago.
+    """
+    if not memories_context:
+        return ""
+    return (
+        "⏳ stale (prefetch not ready this turn) — the memories below are "
+        "from the PREVIOUS turn's recall, not this turn's. Treat them as a "
+        "hint, not a confirmed current fact.\n\n" + memories_context
+    )
+
+
+def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool:
+    """M4 P-REC Fix C (consumer side) — join the Stop-hook producer's
+    prefetch buffer for this session instead of running recall
+    synchronously.
+
+    Gated entirely by `config.get("memoryPrefetchEnabled", False)` at the
+    caller; this function assumes the flag is already on. Returns True iff
+    it emitted an `additionalContext` payload (fresh hit, stale fallback, or
+    the explicit degraded notice) and the caller should return without
+    running the synchronous path. Returns False on a clean no-op miss (flag
+    effectively off / nothing to say) so the caller falls through.
+
+    Never raises past this function's own boundary in normal operation —
+    every internal step is wrapped so a bug here degrades to "fall through
+    to synchronous recall", never a broken turn. (The caller additionally
+    wraps this call in its own try/except as defence in depth.)
+    """
+    session_id = hook_input.get("session_id") or "unknown"
+
+    # Cold-start short-circuit (red-team MAJOR finding): if this session has
+    # NEVER produced a sentinel, polling the full cap on every single
+    # session-open turn would cost ~the poll cap on every fresh session —
+    # the opposite of M4's latency goal. Only poll when a sentinel already
+    # exists (a producer has run at least once for this session).
+    if not recall_buffer.sentinel_exists(session_id):
+        debug_log(config, "Prefetch buffer: no sentinel ever written for this session, cold-start skip")
+    else:
+        cap_ms = int(config.get("memoryPrefetchPollCapMs", 400))
+        recall_buffer.poll_for_sentinel(session_id, last_consumed_token=None, cap_ms=cap_ms)
+
+    payload, _token = recall_buffer.read_if_fresh(session_id, last_consumed_token=None)
+
+    # Directives stay on the synchronous, always-fresh path (M3 rule) even
+    # in the fast path — fetched here directly, never from the buffer.
+    directives_block = None
+    try:
+        bank_id = derive_bank_id(hook_input, config)
+        api_url = get_api_url(config)
+        client = HindsightClient(api_url)
+        directives = fetch_active_directives_cached(
+            client, bank_id, ttl_seconds=config.get("directivesCacheTtlSeconds", DIRECTIVES_CACHE_TTL_SECONDS)
+        )
+        directives_block = format_active_directives_block(directives) if directives else None
+    except Exception as exc:  # pragma: no cover - defensive, directives are best-effort here
+        debug_log(config, f"Prefetch buffer: directive fetch failed: {exc}")
+        directives_block = None
+
+    if payload is not None:
+        memories_block = payload.get("context") or ""
+        parts = [b for b in (directives_block, memories_block) if b]
+        if not parts:
+            return False
+        _emit_cached_context("\n\n".join(parts))
+        return True
+
+    # Miss: no fresh buffer. Fall back to the LAST_RECALL_STATE's
+    # directives-FREE `memories_context` field (Fix B) if one exists for
+    # this session, explicitly marked stale. Never `context` (directive-
+    # contaminated).
+    last = read_state(LAST_RECALL_STATE) or {}
+    stale_memories = last.get("memories_context") or ""
+    stale_block = stale_recall_notice(stale_memories)
+    parts = [b for b in (directives_block, stale_block) if b]
+    if parts:
+        _emit_cached_context("\n\n".join(parts))
+        return True
+
+    if directives_block:
+        _emit_cached_context(directives_block)
+        return True
+
+    # Nothing fresh, nothing stale, nothing cached — say so explicitly
+    # rather than silently emitting no context (so a degraded turn is
+    # legible, matching the #3619 degraded-disclosure precedent).
+    _emit_cached_context(_PREFETCH_DEGRADED_NOTICE)
+    return True
 
 
 def _is_demoted_memory(memory) -> bool:
@@ -1971,6 +2078,32 @@ def main():
         debug_log(config, "Prompt too short for recall, skipping")
         return
 
+    # M4 P-REC junk gate: `<task-notification>` is the CLI-native envelope a
+    # sub-agent's own scheduler/harness prepends on a synthetic follow-up
+    # turn — distinct from the gateway's `<channel source=...>` wrapper
+    # (a real user message) and from `is_synthetic_inbound`. Recall on a
+    # task-notification turn burns latency/cost on a turn no human is
+    # waiting on and whose "query" is machine-generated noise, not intent.
+    # Deterministic prefix check only — never a content classifier. On by
+    # default (`recallSkipTaskNotification`); flips off for an agent that
+    # deliberately wants recall on these turns.
+    if config.get("recallSkipTaskNotification", True) and prompt.startswith("<task-notification"):
+        debug_log(config, "Prompt is a task-notification envelope, skipping recall")
+        return
+
+    # M4 P-REC Fix C (consumer side) — the whole prefetch-buffer mechanism
+    # is gated by `memoryPrefetchEnabled`, default OFF/falsy. When on, try
+    # the buffer-join fast path first; on any hit (fresh or stale-fallback)
+    # it emits and returns, short-circuiting the synchronous recall below.
+    # A miss (disabled, cold-start, buffer absent, or any internal error)
+    # falls through to the existing synchronous path untouched.
+    if config.get("memoryPrefetchEnabled", False):
+        try:
+            if _handle_prefetch_buffer(config, hook_input, prompt):
+                return
+        except Exception as exc:  # pragma: no cover - defensive, never break recall
+            debug_log(config, f"Prefetch buffer join failed, falling back to sync recall: {exc}")
+
     # Switchroom-local: skip recall on conversational acks.
     #
     # The 5-char short-circuit catches `ok`/`yes`/`no`/`ty` but passes
@@ -3134,6 +3267,16 @@ def main():
         LAST_RECALL_STATE,
         {
             "context": context_message,
+            # M4 P-REC Fix B (red-team BINDING): a directives-FREE sibling of
+            # `context`, memories/transcript-fallback only. The stale-buffer
+            # fallback (`_handle_prefetch_buffer`) reads THIS field, never
+            # `context` — `context` bundles `directives_block` (M3's
+            # directive-decoupling rule forbids re-injecting stale directives
+            # from a prior turn's cache; directives stay on the synchronous,
+            # always-fresh fetch path only).
+            "memories_context": "\n\n".join(
+                [b for b in (memories_block, transcript_fallback_block) if b]
+            ),
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "bank_id": bank_id,
             "result_count": len(results),

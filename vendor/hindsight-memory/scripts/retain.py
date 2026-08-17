@@ -727,7 +727,7 @@ def build_retain_payload(
     }
 
 
-def run_retain(hook_input: dict, force: bool = False) -> dict:
+def run_retain(hook_input: dict, force: bool = False, delta: bool = False) -> dict:
     """Run the auto-retain flow.
 
     Returns a status dict::
@@ -742,6 +742,22 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     process (the SessionStart drainer, see ``drain_pending.py`` and
     ``lib/pending.py``). ``status="skipped"`` is the normal early-exit
     cases (auto-retain disabled, empty transcript, throttled chunk).
+
+    ``delta`` (M4 P-RET, per-turn delta retain — called ONLY from
+    ``prefetch.py``, itself gated on the ``memoryPrefetchEnabled`` kill
+    switch, default off): bypasses ``retainEveryNTurns`` entirely (the
+    caller already decided this turn fires) and slices ONLY the
+    transcript tail after the committed watermark. Ignored when
+    ``force=True`` (SessionEnd always takes the force path below).
+
+    **Document-id safety invariant (red-team M4 Finding A, BINDING):** a
+    delta retain is ALWAYS posted under a distinct, content-derived
+    ``document_id`` — the SAME strategy the ``retainEveryNTurns>1``
+    chunked path already uses — and NEVER under the bare ``{session_id}``
+    id the full-session/n==1 path reserves. Posting a tail slice under
+    ``{session_id}`` would UPSERT-OVERWRITE the whole session's stored
+    memory with just the latest turn on every successful turn (see
+    ``retain.py`` §4.3 note below and ``tests/test_retain_delta.py``).
     """
     # /private-mode enforcement (switchroom privacy PR1) — FIRST, before
     # load_config(). An OPEN private interval means the operator is discussing
@@ -810,66 +826,109 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     retain_every_n = max(1, config.get("retainEveryNTurns", 1))
     retain_full_window = False
     messages_to_retain = all_messages
-
-    # Respect retainEveryNTurns in both modes, unless force=True (SessionEnd final retain)
-    if retain_every_n > 1 and not force:
-        turn_count = increment_turn_count(session_id)
-        if turn_count % retain_every_n != 0:
-            next_at = ((turn_count // retain_every_n) + 1) * retain_every_n
-            debug_log(config, f"Turn {turn_count}/{retain_every_n}, skipping retain (next at turn {next_at})")
-            return {"status": "skipped", "reason": "throttled"}
-
-    # Window selection is decoupled from the throttle above — see
-    # select_retain_window() for the switchroom-divergence rationale
-    # (Phase 6b: chunked window-slicing now works at retainEveryNTurns=1).
-    overlap_turns = config.get("retainOverlapTurns", 0)
-
-    # Incremental SessionEnd sweep (memory-RFC P1): a forced chunked sweep at
-    # retainEveryNTurns>1 retains only the transcript tail after the committed
-    # watermark, not the whole session on top of the N per-window documents that
-    # already carry it. The watermark READ is filesystem IO on a JSON file that
-    # could be truncated / permission-broken / absent, so it lives HERE (not in
-    # the pure select_retain_window) inside a catch-all try/except.
-    #
-    # §4.3 HAZARD: this is the one seam where a raise DELETES a turn rather than
-    # degrading it. Every failure mode below MUST degrade to since_uuid=None,
-    # which reproduces today's whole-session sweep exactly. The except catches
-    # Exception (not a named subset) on purpose — any raise here is worse than a
-    # wrong value. The n==1 and full-session paths deliberately never compute a
-    # watermark: on those the document id is {session_id} and a tail slice would
-    # TRUNCATE the stored document (§4.2), so they keep the full-session sweep.
     since_uuid = None
-    if force and retain_mode == "chunked" and retain_every_n > 1:
+    # True only for the per-turn delta path (M4 P-RET) — threads a distinct,
+    # content-derived document_id below (Finding A) instead of the
+    # retainEveryNTurns>1 / n==1 strategy.
+    delta_document_id_override = False
+
+    if delta and not force:
+        # M4 P-RET — per-turn delta retain, called ONLY from prefetch.py
+        # (itself gated on memoryPrefetchEnabled, default off). Bypasses the
+        # retainEveryNTurns throttle entirely: the caller already decided
+        # this turn fires, every turn, superseding the P5 cadence on a
+        # flipped agent (config comment mandated at the switchroom.yaml
+        # seam — see P-CFG). Slices ONLY the transcript tail after the
+        # committed watermark; the §4.3 HAZARD discipline applies here too —
+        # any watermark-read failure MUST degrade to the full window, never
+        # raise, never emit an empty slice.
         try:
             _wm = watermark.load(session_id)
             since_uuid = _wm.get("last_uuid") if _wm else None
         except Exception as e:  # noqa: BLE001 - degrade, never raise into this seam
             print(
-                "[Hindsight] watermark read failed for incremental sweep; "
-                f"falling back to full-session sweep: {e}",
+                "[Hindsight] watermark read failed for delta retain; "
+                f"falling back to full-window slice: {e}",
                 file=sys.stderr,
             )
             since_uuid = None
-
-    messages_to_retain, retain_full_window = select_retain_window(
-        retain_mode, retain_every_n, overlap_turns, all_messages, force=force,
-        since_uuid=since_uuid,
-    )
-    if retain_mode == "chunked" and not force:
-        window_turns = max(retain_every_n, 1) + overlap_turns
+        messages_to_retain = watermark.tail_after(all_messages, since_uuid)
+        retain_full_window = True
+        delta_document_id_override = True
         debug_log(
             config,
-            f"Chunked retain firing (window: {window_turns} human turns, {len(messages_to_retain)} messages)",
-        )
-    elif retain_mode == "chunked" and force:
-        _swept = "incremental (tail after watermark)" if since_uuid is not None else "full-session"
-        debug_log(
-            config,
-            f"Chunked retain, forced {_swept} sweep (SessionEnd): "
-            f"{len(messages_to_retain)}/{len(all_messages)} messages",
+            f"Delta retain firing (since_uuid={since_uuid!r}, "
+            f"{len(messages_to_retain)}/{len(all_messages)} messages)",
         )
     else:
-        debug_log(config, f"Full session retain: {len(all_messages)} messages")
+        # Respect retainEveryNTurns in both modes, unless force=True (SessionEnd final retain)
+        if retain_every_n > 1 and not force:
+            turn_count = increment_turn_count(session_id)
+            if turn_count % retain_every_n != 0:
+                next_at = ((turn_count // retain_every_n) + 1) * retain_every_n
+                debug_log(config, f"Turn {turn_count}/{retain_every_n}, skipping retain (next at turn {next_at})")
+                return {"status": "skipped", "reason": "throttled"}
+
+        # Window selection is decoupled from the throttle above — see
+        # select_retain_window() for the switchroom-divergence rationale
+        # (Phase 6b: chunked window-slicing now works at retainEveryNTurns=1).
+        overlap_turns = config.get("retainOverlapTurns", 0)
+
+        # Incremental SessionEnd sweep (memory-RFC P1): a forced chunked sweep at
+        # retainEveryNTurns>1 retains only the transcript tail after the committed
+        # watermark, not the whole session on top of the N per-window documents that
+        # already carry it. The watermark READ is filesystem IO on a JSON file that
+        # could be truncated / permission-broken / absent, so it lives HERE (not in
+        # the pure select_retain_window) inside a catch-all try/except.
+        #
+        # §4.3 HAZARD: this is the one seam where a raise DELETES a turn rather than
+        # degrading it. Every failure mode below MUST degrade to since_uuid=None,
+        # which reproduces today's whole-session sweep exactly. The except catches
+        # Exception (not a named subset) on purpose — any raise here is worse than a
+        # wrong value. The n==1 and full-session paths deliberately never compute a
+        # watermark UNLESS the M4 delta mechanism is enabled for this agent
+        # (``memoryPrefetchEnabled`` — red-team Finding A2): with the mechanism off
+        # (the fleet default) the document id is {session_id} and a tail slice
+        # would TRUNCATE the stored document (§4.2), so they keep the full-session
+        # sweep. With it ON, a per-turn delta retain has already been posting
+        # content-derived slice documents and advancing this same watermark every
+        # turn, so the force sweep MUST also go incremental — otherwise it
+        # blindly re-posts the whole session under {session_id} on top of the
+        # per-turn delta documents (redundant storage, not the destructive
+        # truncation Finding A guards, but still wrong for cadence-1 agents).
+        if force and retain_mode == "chunked" and (
+            retain_every_n > 1 or config.get("memoryPrefetchEnabled")
+        ):
+            try:
+                _wm = watermark.load(session_id)
+                since_uuid = _wm.get("last_uuid") if _wm else None
+            except Exception as e:  # noqa: BLE001 - degrade, never raise into this seam
+                print(
+                    "[Hindsight] watermark read failed for incremental sweep; "
+                    f"falling back to full-session sweep: {e}",
+                    file=sys.stderr,
+                )
+                since_uuid = None
+
+        messages_to_retain, retain_full_window = select_retain_window(
+            retain_mode, retain_every_n, overlap_turns, all_messages, force=force,
+            since_uuid=since_uuid,
+        )
+        if retain_mode == "chunked" and not force:
+            window_turns = max(retain_every_n, 1) + overlap_turns
+            debug_log(
+                config,
+                f"Chunked retain firing (window: {window_turns} human turns, {len(messages_to_retain)} messages)",
+            )
+        elif retain_mode == "chunked" and force:
+            _swept = "incremental (tail after watermark)" if since_uuid is not None else "full-session"
+            debug_log(
+                config,
+                f"Chunked retain, forced {_swept} sweep (SessionEnd): "
+                f"{len(messages_to_retain)}/{len(all_messages)} messages",
+            )
+        else:
+            debug_log(config, f"Full session retain: {len(all_messages)} messages")
 
     # Resolve API URL
     def _dbg(*a):
@@ -909,7 +968,14 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
     # - Full-session mode / n==1: unchanged — a stable ``session_id`` base with
     #   a compaction chunk counter so a shrinking transcript doesn't overwrite
     #   the pre-compaction document with a shorter one.
-    if retain_mode == "chunked" and retain_every_n > 1:
+    if delta_document_id_override:
+        # M4 P-RET (red-team Finding A, BINDING): a delta retain ALWAYS gets
+        # a content-derived slice id — mirroring the retainEveryNTurns>1
+        # strategy — and must NEVER fall through to the bare {session_id}
+        # id below, which the full-session/n==1 path reserves and which a
+        # tail-slice POST would silently truncate.
+        document_id = None  # build_retain_payload computes the content-derived id
+    elif retain_mode == "chunked" and retain_every_n > 1:
         document_id = None  # build_retain_payload computes the content-derived id
     else:
         chunk_index, compacted = track_retention(session_id, len(all_messages))
@@ -1009,6 +1075,23 @@ def run_retain(hook_input: dict, force: bool = False) -> dict:
 
 
 def main():
+    # M4 P-WIRE — when the prefetch mechanism is on for this agent,
+    # `prefetch.py`'s OWN Stop-hook entry already performs a delta retain
+    # every turn (see `prefetch.run_prefetch`, step 1). Running THIS Stop
+    # hook's own (non-delta) retain as well would double-retain the same
+    # turn: two independent POSTs, and at `retainEveryNTurns > 1` two
+    # independent `increment_turn_count` calls drifting the cadence
+    # throttle out of sync with itself. Skip here — flag OFF (the default,
+    # every agent today) leaves this function's behaviour byte-identical to
+    # pre-M4; this check is the ONLY new code on that path.
+    try:
+        _cfg = load_config()
+        if _cfg.get("memoryPrefetchEnabled", False):
+            debug_log(_cfg, "Stop retain: memoryPrefetchEnabled, delegating to prefetch.py")
+            return
+    except Exception:  # pragma: no cover - defensive, never block the legacy path
+        pass
+
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError):
