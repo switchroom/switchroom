@@ -74,7 +74,21 @@ export const HINDSIGHT_SHIM_AGENT_HOME = "/state/agent/home";
 export function generateHindsightMcpConfig(
   collection: string,
   memoryConfig: MemoryBackendConfig,
-  opts: { reflectBudget?: "low" | "mid" | "high"; reflectMaxTokens?: number } = {},
+  opts: {
+    reflectBudget?: "low" | "mid" | "high";
+    reflectMaxTokens?: number;
+    /**
+     * Operator-granted ADDITIONAL banks the synthesized knowledge-page reads
+     * may target via their optional `bank_id` selector (design-v2 §10, W-2).
+     * Sourced from the same `memory.recall.additional_banks` that fans the
+     * recall hook out to those banks — see getHindsightSettingsEntry. Threaded
+     * into HINDSIGHT_KNOWLEDGE_EXTRA_BANKS ONLY when non-empty (an unconfigured
+     * agent keeps the minimal env and reads own-bank-only). Shim-only: under
+     * mcp_transport:"http" the knowledge tools are not synthesized at all, so
+     * the selector — and this env — simply do not exist on that path.
+     */
+    knowledgeExtraBanks?: readonly string[];
+  } = {},
 ): McpServerConfig {
   const url = (memoryConfig.config?.url as string | undefined)
     ?? HINDSIGHT_DEFAULT_MCP_URL;
@@ -93,6 +107,13 @@ export function generateHindsightMcpConfig(
       },
     };
   }
+  // Drop the agent's own bank (always readable; not a grant) and dedupe, so
+  // an own-only or empty grant set emits no env key at all.
+  const grantedBanks = [
+    ...new Set(
+      (opts.knowledgeExtraBanks ?? []).filter((b) => b && b !== collection),
+    ),
+  ];
   return {
     type: "stdio",
     command: HINDSIGHT_SHIM_CLI_PATH,
@@ -103,6 +124,12 @@ export function generateHindsightMcpConfig(
     env: {
       HINDSIGHT_MCP_URL: url,
       HINDSIGHT_BANK_ID: collection,
+      // Operator-granted cross-bank reach for the knowledge-page reads (W-2).
+      // Comma-separated; emitted only when the grant set is non-empty so an
+      // unconfigured agent keeps the minimal env and reads own-bank-only.
+      ...(grantedBanks.length > 0
+        ? { HINDSIGHT_KNOWLEDGE_EXTRA_BANKS: grantedBanks.join(",") }
+        : {}),
       HINDSIGHT_SHIM_CACHE_DIR: `${HINDSIGHT_SHIM_AGENT_HOME}/.hindsight-shim`,
       HOME: HINDSIGHT_SHIM_AGENT_HOME,
       ...(opts.reflectBudget

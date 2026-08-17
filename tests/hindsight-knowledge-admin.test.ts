@@ -201,13 +201,22 @@ afterEach(async () => {
   await api.close();
 });
 
-function admin(bankId = OWN_BANK): KnowledgeAdmin {
-  return new KnowledgeAdmin({ apiBaseUrl: api.baseUrl, bankId, timeoutMs: 5_000 });
+function admin(
+  bankId = OWN_BANK,
+  extraBanks?: readonly string[],
+): KnowledgeAdmin {
+  return new KnowledgeAdmin({
+    apiBaseUrl: api.baseUrl,
+    bankId,
+    ...(extraBanks ? { extraBanks } : {}),
+    timeoutMs: 5_000,
+  });
 }
 
 async function withShim<T>(
   bankId: string,
   fn: (shim: HindsightShim) => Promise<T>,
+  extraBanks?: readonly string[],
 ): Promise<T> {
   const cacheDir = mkdtempSync(join(tmpdir(), "shim-knowledge-test-"));
   try {
@@ -217,6 +226,7 @@ async function withShim<T>(
         // touches the MCP transport, only the REST endpoints.
         url: `${api.baseUrl}/mcp/`,
         bankId,
+        ...(extraBanks ? { extraBanks } : {}),
         cacheDir,
         toolsListTimeoutMs: 500,
         logger: () => undefined,
@@ -311,10 +321,10 @@ describe("GET-only — no write verb is reachable", () => {
   });
 });
 
-// ─── 2. the bank pin ──────────────────────────────────────────────────────
+// ─── 2. the bank selector: own by default, granted banks on request ───────
 
-describe("bank pinning — every path embeds the agent's own bank", () => {
-  it("builds all three URLs under the pinned bank", async () => {
+describe("bank selector — own bank is the default, no grant is a wall", () => {
+  it("builds all three URLs under the own bank when no bank_id is given", async () => {
     await admin().search({ query: "Use" });
     await admin().getPage({ page_id: "pg-conventions" });
     await admin().tree();
@@ -369,7 +379,10 @@ describe("bank pinning — every path embeds the agent's own bank", () => {
     });
   });
 
-  it("the tool schemas expose no bank_id, and a bank_id argument is REJECTED", async () => {
+  it("the three knowledge tools advertise the optional bank_id selector", async () => {
+    // The selector is ALWAYS advertised (static schema = single source of
+    // truth); the grant check is a runtime value check, not a schema one, so
+    // an agent with no grants sees the same schema as one with grants.
     await withShim(OWN_BANK, async (shim) => {
       const list = (await shim.handle({
         jsonrpc: "2.0",
@@ -383,25 +396,128 @@ describe("bank pinning — every path embeds the agent's own bank", () => {
       ]) {
         const tool = list.result.tools.find((t) => t.name === name)!;
         expect(tool, `${name} is not advertised`).toBeDefined();
+        const props = Object.keys(
+          (tool.inputSchema as { properties: Record<string, unknown> })
+            .properties,
+        );
+        expect(props, `${name} must expose bank_id`).toContain("bank_id");
+      }
+    });
+    // The directive tools, by contrast, carry NO bank_id — their writes stay
+    // own-pinned (W-2 pt 2).
+    await withShim(OWN_BANK, async (shim) => {
+      const list = (await shim.handle({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+      })) as { result: { tools: { name: string; inputSchema: unknown }[] } };
+      for (const name of ["deactivate_directive", "reactivate_directive"]) {
+        const tool = list.result.tools.find((t) => t.name === name);
+        if (!tool) continue; // only present when the backend advertises them
         expect(
           Object.keys(
             (tool.inputSchema as { properties: Record<string, unknown> })
               .properties,
           ),
+          `${name} must NOT expose bank_id`,
         ).not.toContain("bank_id");
       }
+    });
+  });
 
+  it("an UNGRANTED bank_id is rejected loudly and reads nothing", async () => {
+    // The agent's default is OWN_BANK, with NO extraBanks — so naming PEER_BANK
+    // is neither its own nor a grant. The wall must be loud (isError, the bank
+    // named) and total (not one byte read from anywhere), never a silent
+    // coercion to the own bank.
+    await withShim(OWN_BANK, async (shim) => {
       const mark = api.seen.length;
       const res = await callTool(shim, "search_knowledge_pages", {
         query: "Peer",
         bank_id: PEER_BANK,
       });
       expect(res.isError).toBe(true);
-      expect(res.text).toContain("bank_id");
-      expect(res.text).toContain("your own memory bank");
-      // Nothing was read from anywhere.
+      expect(res.text).toContain(PEER_BANK);
+      expect(res.text).toContain(OWN_BANK);
+      // Not coerced to the own bank, not read from the peer — nothing at all.
       expect(api.seen.slice(mark)).toEqual([]);
     });
+    // Same wall at the KnowledgeAdmin layer, as a typed error.
+    await expect(
+      admin(OWN_BANK).search({ query: "Peer", bankId: PEER_BANK }),
+    ).rejects.toThrow(/not a bank you can read|not your own bank/);
+  });
+
+  it("a GRANTED bank_id reads that peer bank, from an agent whose default is OWN", async () => {
+    // The OUTCOME W-2 exists for: a page written to PEER_BANK is readable via
+    // bank_id=PEER_BANK by an agent whose OWN bank is OWN_BANK, because the
+    // operator granted PEER_BANK. Prove it through the full shim tool path.
+    await withShim(
+      OWN_BANK,
+      async (shim) => {
+        const mark = api.seen.length;
+        const page = await callTool(shim, "get_knowledge_page", {
+          page_id: "pg-secret",
+          bank_id: PEER_BANK,
+        });
+        expect(page.isError).toBe(false);
+        expect(page.text).toContain("PEER ONLY");
+        // The request landed on the PEER bank, not the own bank.
+        const paths = api.seen.slice(mark).map((r) => r.path.split("?")[0]);
+        expect(paths).toContain(
+          `/v1/default/banks/${PEER_BANK}/knowledge-base/pages/pg-secret`,
+        );
+        expect(
+          paths.some((p) => p.includes(`/banks/${OWN_BANK}/`)),
+        ).toBe(false);
+
+        // search and tree honour the same grant.
+        const hits = await callTool(shim, "search_knowledge_pages", {
+          query: "Peer",
+          bank_id: PEER_BANK,
+        });
+        expect(hits.isError).toBe(false);
+        expect(hits.text).toContain("pg-secret");
+
+        const tree = await callTool(shim, "get_knowledge_tree", {
+          bank_id: PEER_BANK,
+        });
+        expect(tree.isError).toBe(false);
+        expect(tree.text).toContain("pg-secret");
+      },
+      [PEER_BANK],
+    );
+  });
+
+  it("naming the OWN bank explicitly is accepted, not treated as a foreign bank", async () => {
+    // Passing your own bank_id is a no-op selector, never a rejection.
+    await withShim(OWN_BANK, async (shim) => {
+      const res = await callTool(shim, "get_knowledge_tree", {
+        bank_id: OWN_BANK,
+      });
+      expect(res.isError).toBe(false);
+      expect(res.text).toContain("Conventions");
+    });
+  });
+
+  it("a grant to bank A does not open bank B", async () => {
+    // extraBanks is an allowlist, not a blanket cross-bank switch: granting
+    // 'empty-bank' must not make PEER_BANK reachable.
+    await withShim(
+      OWN_BANK,
+      async (shim) => {
+        const mark = api.seen.length;
+        const res = await callTool(shim, "get_knowledge_tree", {
+          bank_id: PEER_BANK,
+        });
+        expect(res.isError).toBe(true);
+        expect(res.text).toContain(PEER_BANK);
+        // The granted bank IS reachable; the ungranted one is not.
+        expect(res.text).toContain("empty-bank");
+        expect(api.seen.slice(mark)).toEqual([]);
+      },
+      ["empty-bank"],
+    );
   });
 
   it("refuses to act when the agent has no pinned bank", async () => {
