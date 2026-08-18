@@ -171,6 +171,28 @@ export class RulesBlockDeactivationRefusedError extends Error {
   }
 }
 
+/** One directive row in a {@link DeactivateByNameResult}. */
+export interface DeactivateByNameRow {
+  id: string;
+  name: string;
+  /** Priority as it stood when read — the directive is never re-prioritised. */
+  priority?: number;
+}
+
+/** Outcome of {@link DirectiveAdmin.deactivateAllActiveByName}. */
+export interface DeactivateByNameResult {
+  /**
+   * Directives deactivated this call — or, when `dryRun`, the ones that
+   * WOULD be. Empty on an idempotent no-op re-run where every same-name copy
+   * was already inactive.
+   */
+  deactivated: DeactivateByNameRow[];
+  /** Same-name copies already inactive before this call — skipped, not an error. */
+  alreadyInactive: DeactivateByNameRow[];
+  /** True when `dryRun` was requested: the plan was computed, nothing mutated. */
+  dryRun: boolean;
+}
+
 export interface DirectiveAdminOptions {
   /** REST base, e.g. `http://127.0.0.1:18888` (no trailing slash). */
   apiBaseUrl: string;
@@ -509,6 +531,82 @@ export class DirectiveAdmin {
       `Deactivated directive '${target.name}' (id ${target.id}) in bank ` +
       `'${this.opts.bankId}', tagged ${args.tag}.`
     );
+  }
+
+  /**
+   * Deactivate EVERY active directive named `name` in the pinned bank.
+   *
+   * The M3 directive-placement campaign entry point: once a guardrail has
+   * been relocated into an agent's always-loaded `CLAUDE.md`, its migrated
+   * in-bank copy (or copies — a windows-boxes-class reconcile can leave more
+   * than one active directive sharing a name) must be DEACTIVATED, never
+   * deleted, so the move stays reversible. This is the by-name, deactivate-
+   * every-active-copy counterpart to `reconcileDirectiveSuperset`'s
+   * "every ACTIVE directive named <name>" selection — a plain `deactivate`
+   * ({name}) would instead hit `resolve()`'s "ambiguous" error the moment
+   * two active copies share a name.
+   *
+   * Guarantees:
+   *   • Reversible — only `is_active: false` is ever PATCHed (via
+   *     `deactivateResolved`); no delete, no `content`/`name`/`priority`
+   *     rewrite. A deactivated directive still EXISTS and is reactivatable
+   *     with {@link reactivate}.
+   *   • Rules-block-safe — every active target is checked against
+   *     {@link refuseIfRulesBlock} BEFORE any mutation. If even one active
+   *     same-name copy carries {@link RULES_BLOCK_MARKER_TAG}, the whole
+   *     operation is refused with {@link RulesBlockDeactivationRefusedError}
+   *     and nothing is deactivated — a rules-block copy can never be left
+   *     active while its siblings are retired. The marker is NOT stripped:
+   *     removing it is the M3-flip / `mark-rules-block` job, not this one.
+   *   • Idempotent — same-name copies that are already inactive are reported
+   *     in `alreadyInactive` and skipped. A re-run after a full deactivation
+   *     is a clean no-op (empty `deactivated`), not an error. Only a name
+   *     with NO directive at all (active or inactive) throws.
+   *   • `dryRun` — computes the exact same plan (including the rules-block
+   *     refusal) but issues no PATCH; `deactivated` then lists what WOULD be
+   *     retired.
+   */
+  async deactivateAllActiveByName(args: {
+    name: string;
+    dryRun?: boolean;
+  }): Promise<DeactivateByNameResult> {
+    const all = await this.list();
+    const named = all.filter((d) => d.name === args.name);
+    if (named.length === 0) {
+      const known = all
+        .map((d) => d.name)
+        .sort()
+        .join(", ");
+      throw new Error(
+        `no directive named '${args.name}' in bank '${this.opts.bankId}' ` +
+          `(the directive to deactivate). Known directives: ${known || "(none)"}`,
+      );
+    }
+
+    const active = named.filter((d) => d.is_active !== false);
+    const alreadyInactive = named
+      .filter((d) => d.is_active === false)
+      .map((d) => ({ id: d.id, name: d.name, priority: d.priority }));
+
+    // Pre-scan the rules-block chokepoint across EVERY active target before
+    // mutating any of them: refuse the whole operation if even one active
+    // same-name copy carries the marker, so a partial run can never leave
+    // some copies retired and a rules-block copy still active. Reuses the
+    // same `refuseIfRulesBlock` invariant every other deactivation path
+    // routes through — read off the directive's own persisted tags, never a
+    // caller assertion.
+    for (const d of active) this.refuseIfRulesBlock(d);
+
+    const deactivated: DeactivateByNameRow[] = [];
+    for (const d of active) {
+      // `deactivateResolved` (no `supersededBy`) is the SAME single-field
+      // `is_active: false` PATCH every other path uses, and re-checks the
+      // rules-block chokepoint itself — defense in depth over the pre-scan.
+      if (!args.dryRun) await this.deactivateResolved(all, d);
+      deactivated.push({ id: d.id, name: d.name, priority: d.priority });
+    }
+
+    return { deactivated, alreadyInactive, dryRun: args.dryRun ?? false };
   }
 
   /** Set `is_active: true` on `name`. Nothing else changes. */

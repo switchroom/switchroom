@@ -132,6 +132,86 @@ export function registerMemoryDirectiveCommand(memory: Command, program: Command
     );
 
   directive
+    .command("deactivate <agent> <name>")
+    .description(
+      "Deactivate every ACTIVE directive named <name> in <agent>'s bank by " +
+        "flipping is_active=false — the M3 directive-placement campaign entry " +
+        "point for retiring a guardrail's in-bank copy once it has been " +
+        "relocated to the agent's always-loaded CLAUDE.md. Matches by NAME " +
+        "(mirrors reconcile's 'every ACTIVE directive named <name>' selection); " +
+        "if multiple active copies share the name, all are deactivated. " +
+        "REVERSIBLE — only is_active is touched, never a delete or a " +
+        "content/priority rewrite, so it can be reactivated. Idempotent: a " +
+        "re-run over already-inactive copies is a clean no-op, not an error. " +
+        "REFUSES any directive carrying the rules-block marker tag (that stays " +
+        "active until an M3-flip removes the marker) — the whole call is " +
+        "refused if even one active copy carries it, mutating nothing.",
+    )
+    .option("--dry-run", "Print what WOULD deactivate without mutating anything")
+    .option("--json", "Machine-readable output")
+    .action(
+      withConfigError(
+        async (
+          agent: string,
+          name: string,
+          opts: { dryRun?: boolean; json?: boolean },
+        ) => {
+          const admin = resolveDirectiveAdmin(program, agent);
+          try {
+            const result = await admin.deactivateAllActiveByName({
+              name,
+              ...(opts.dryRun ? { dryRun: true } : {}),
+            });
+            if (opts.json) {
+              console.log(JSON.stringify({ ok: true, agent, name, ...result }));
+              return;
+            }
+            const verb = result.dryRun ? "would deactivate" : "deactivated";
+            if (result.deactivated.length === 0) {
+              console.log(
+                chalk.yellow(
+                  `• no-op: no ACTIVE directive named "${name}" in ${agent}'s bank ` +
+                    `(${result.alreadyInactive.length} already-inactive ` +
+                    `cop${result.alreadyInactive.length === 1 ? "y" : "ies"} left ` +
+                    `untouched). Nothing to do.`,
+                ),
+              );
+              return;
+            }
+            for (const d of result.deactivated) {
+              console.log(
+                chalk.green(
+                  `  ${result.dryRun ? "[dry-run] " : "✓ "}${verb} "${d.name}" ` +
+                    `(id ${d.id}, prior priority ${d.priority ?? "unset"})`,
+                ),
+              );
+            }
+            const n = result.deactivated.length;
+            console.log(
+              chalk.green(
+                `${result.dryRun ? "[dry-run] " : "✓ "}${verb} ${n} directive` +
+                  `${n === 1 ? "" : "s"} named "${name}" in ${agent}'s bank` +
+                  (result.alreadyInactive.length > 0
+                    ? ` (${result.alreadyInactive.length} already-inactive ` +
+                      `cop${result.alreadyInactive.length === 1 ? "y" : "ies"} skipped)`
+                    : "") +
+                  (result.dryRun ? " — nothing was mutated" : ". Reverse with reactivate."),
+              ),
+            );
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (opts.json) {
+              console.log(JSON.stringify({ ok: false, error: msg }));
+            } else {
+              console.error(chalk.red(`✗ ${msg}`));
+            }
+            process.exit(1);
+          }
+        },
+      ),
+    );
+
+  directive
     .command("mark-rules-block <agent> <id>")
     .description(
       "Stamp the persisted rules-block marker tag on directive <id> in " +
