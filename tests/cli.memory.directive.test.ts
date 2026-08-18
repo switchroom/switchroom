@@ -183,6 +183,60 @@ describe("memory directive reconcile — happy-path wiring", () => {
   });
 });
 
+describe("memory directive deactivate — argument validation", () => {
+  it("--help lists the verb and its arguments", () => {
+    const { stdout, status } = run(["memory", "directive", "deactivate", "--help"]);
+    expect(status).toBe(0);
+    expect(stdout).toContain("deactivate");
+    expect(stdout).toContain("agent");
+    expect(stdout).toContain("name");
+    expect(stdout).toContain("--dry-run");
+  });
+
+  it("rejects unknown agent with non-zero exit and helpful stderr", () => {
+    const { status, stderr } = run(
+      ["memory", "directive", "deactivate", "ghost-agent", "some-name"],
+      { expectError: true },
+    );
+    expect(status).toBe(1);
+    expect(stderr).toContain("ghost-agent");
+    expect(stderr).toMatch(/not defined in switchroom\.yaml/);
+  });
+
+  it("commander rejects when name positional is missing", () => {
+    const { status, stderr } = run(["memory", "directive", "deactivate", "clerk"], {
+      expectError: true,
+    });
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/missing required argument|usage/i);
+  });
+
+  it("attempts the API call when agent + name are valid (network failure surfaces cleanly)", () => {
+    // Hindsight pointed at a closed port (beforeEach config) — proves the
+    // dispatcher reaches DirectiveAdmin.deactivateAllActiveByName.
+    const { status, stderr } = run(
+      ["memory", "directive", "deactivate", "clerk", "some-name"],
+      { expectError: true },
+    );
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/✗/);
+  });
+
+  it("--json emits a machine-readable error envelope on failure", () => {
+    const { status, stdout } = run(
+      ["memory", "directive", "deactivate", "clerk", "some-name", "--json"],
+      { expectError: true },
+    );
+    expect(status).toBe(1);
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "{}") as {
+      ok: boolean;
+      error: string;
+    };
+    expect(parsed.ok).toBe(false);
+    expect(typeof parsed.error).toBe("string");
+  });
+});
+
 describe("memory directive mark-rules-block — argument validation", () => {
   it("--help lists the verb and its arguments", () => {
     const { stdout, status } = run(["memory", "directive", "mark-rules-block", "--help"]);
@@ -526,5 +580,235 @@ describe("memory directive mark-rules-block — closes the interactive-path gap 
     // The refusal happened before any bank write — no marker landed, unlike
     // the own-agent case above.
     expect(bank[0]!.tags).not.toContain(RULES_BLOCK_MARKER_TAG);
+  });
+});
+
+/**
+ * End-to-end tests for `switchroom memory directive deactivate <agent>
+ * <name>` — the M3 directive-placement campaign entry point — driven through
+ * the REAL built CLI against a hermetic mock hindsight REST server, exactly
+ * as an operator's `switchroom memory directive deactivate ...` invocation
+ * would run. Assert the STATE the mock server ends up in (is_active flags),
+ * not just that the CLI exited 0.
+ */
+describe("memory directive deactivate — end-to-end against a mock REST server", () => {
+  interface MockApi {
+    baseUrl: string;
+    server: Server;
+    close: () => Promise<void>;
+  }
+
+  let api: MockApi;
+  let eeCfgDir: string;
+  let eeCfgPath: string;
+  const BANK = "clerk";
+  let bank: HindsightDirective[];
+
+  async function startMockApi(): Promise<MockApi> {
+    const server = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const path = req.url ?? "";
+        const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : undefined;
+        const send = (status: number, payload: unknown) => {
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+        const rawPath = path.split("?")[0] ?? "";
+        const m = /^\/v1\/default\/banks\/([^/]+)\/directives(?:\/([^/]+))?$/.exec(rawPath);
+        if (!m) return send(404, { detail: "not found" });
+        const bankId = decodeURIComponent(m[1]!);
+        const directiveId = m[2] ? decodeURIComponent(m[2]) : undefined;
+        if (bankId !== BANK) return send(404, { detail: "no such bank" });
+        if (req.method === "GET" && !directiveId) {
+          return send(200, { items: bank });
+        }
+        if (req.method === "PATCH" && directiveId) {
+          const target = bank.find((d) => d.id === directiveId);
+          if (!target) return send(404, { detail: "no such directive" });
+          for (const key of Object.keys(body ?? {})) {
+            (target as Record<string, unknown>)[key] = (body as Record<string, unknown>)[key];
+          }
+          return send(200, target);
+        }
+        return send(405, { detail: "method not allowed" });
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    return {
+      baseUrl: `http://127.0.0.1:${port}`,
+      server,
+      close: () => new Promise((r) => server.close(() => r())),
+    };
+  }
+
+  beforeEach(async () => {
+    bank = [
+      {
+        id: "d-1",
+        name: "relocated-guardrail",
+        content: "First active copy.",
+        priority: 6,
+        is_active: true,
+        tags: [],
+      },
+      {
+        id: "d-2",
+        name: "relocated-guardrail",
+        content: "Second active copy.",
+        priority: 4,
+        is_active: true,
+        tags: [],
+      },
+      {
+        id: "d-rb",
+        name: "rules-block-guardrail",
+        content: "Staged until M3 flip.",
+        priority: 8,
+        is_active: true,
+        tags: [RULES_BLOCK_MARKER_TAG],
+      },
+    ];
+    api = await startMockApi();
+    eeCfgDir = mkdtempSync(join(tmpdir(), "memory-directive-deactivate-cli-"));
+    eeCfgPath = join(eeCfgDir, "switchroom.yaml");
+    writeFileSync(
+      eeCfgPath,
+      [
+        "switchroom:",
+        "  version: 1",
+        "telegram:",
+        '  bot_token: "vault:telegram-bot-token"',
+        '  forum_chat_id: "-100"',
+        "memory:",
+        "  backend: hindsight",
+        "  config:",
+        `    url: ${api.baseUrl}/mcp/`,
+        "agents:",
+        "  clerk:",
+        '    topic_name: "Test"',
+        "",
+      ].join("\n"),
+    );
+  });
+
+  afterEach(async () => {
+    await api.close();
+    rmSync(eeCfgDir, { recursive: true, force: true });
+  });
+
+  async function cli(args: string[]): Promise<{ stdout: string; stderr: string }> {
+    try {
+      return await execFileAsync(BUN, [CLI, "--config", eeCfgPath, ...args]);
+    } catch (e) {
+      const err = e as { stdout?: string; stderr?: string };
+      throw new Error(`CLI failed. stdout=${err.stdout ?? ""} stderr=${err.stderr ?? ""}`);
+    }
+  }
+
+  it("deactivates every active copy sharing the name via the real CLI, flipping is_active", async () => {
+    expect(bank.every((d) => d.is_active)).toBe(true);
+    const { stdout } = await cli([
+      "memory",
+      "directive",
+      "deactivate",
+      "clerk",
+      "relocated-guardrail",
+    ]);
+    expect(stdout).toMatch(/✓/);
+    expect(bank.find((d) => d.id === "d-1")!.is_active).toBe(false);
+    expect(bank.find((d) => d.id === "d-2")!.is_active).toBe(false);
+    // The rules-block directive is untouched.
+    expect(bank.find((d) => d.id === "d-rb")!.is_active).toBe(true);
+  });
+
+  it("--json reports the deactivated rows and leaves the directives reactivatable", async () => {
+    const { stdout } = await cli([
+      "memory",
+      "directive",
+      "deactivate",
+      "clerk",
+      "relocated-guardrail",
+      "--json",
+    ]);
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "{}") as {
+      ok: boolean;
+      deactivated: Array<{ id: string; priority?: number }>;
+      dryRun: boolean;
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.dryRun).toBe(false);
+    expect(parsed.deactivated.map((d) => d.id).sort()).toEqual(["d-1", "d-2"]);
+    // Reversible: rows still present in the bank, not deleted.
+    expect(bank.map((d) => d.id)).toContain("d-1");
+    expect(bank.map((d) => d.id)).toContain("d-2");
+  });
+
+  it("REFUSES a rules-block directive via the real CLI, exit non-zero, nothing mutated", async () => {
+    let stderr = "";
+    let status = 0;
+    try {
+      await execFileAsync(BUN, [
+        CLI,
+        "--config",
+        eeCfgPath,
+        "memory",
+        "directive",
+        "deactivate",
+        "clerk",
+        "rules-block-guardrail",
+      ]);
+    } catch (e) {
+      const err = e as { stderr?: string; code?: number };
+      stderr = err.stderr ?? "";
+      status = err.code ?? 1;
+    }
+    expect(status).not.toBe(0);
+    expect(stderr).toMatch(/rules-block|triage-category:rules-block/);
+    expect(bank.find((d) => d.id === "d-rb")!.is_active).toBe(true);
+  });
+
+  it("is idempotent: a second deactivate over already-inactive copies is a clean no-op (exit 0)", async () => {
+    await cli(["memory", "directive", "deactivate", "clerk", "relocated-guardrail"]);
+    // Second run — every copy is inactive now. Exit 0, no-op message.
+    const { stdout } = await cli([
+      "memory",
+      "directive",
+      "deactivate",
+      "clerk",
+      "relocated-guardrail",
+      "--json",
+    ]);
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "{}") as {
+      ok: boolean;
+      deactivated: unknown[];
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.deactivated).toEqual([]);
+  });
+
+  it("--dry-run reports what WOULD deactivate but mutates nothing", async () => {
+    const { stdout } = await cli([
+      "memory",
+      "directive",
+      "deactivate",
+      "clerk",
+      "relocated-guardrail",
+      "--dry-run",
+      "--json",
+    ]);
+    const parsed = JSON.parse(stdout.trim().split("\n").pop() ?? "{}") as {
+      ok: boolean;
+      dryRun: boolean;
+      deactivated: Array<{ id: string }>;
+    };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.dryRun).toBe(true);
+    expect(parsed.deactivated.map((d) => d.id).sort()).toEqual(["d-1", "d-2"]);
+    // Nothing was mutated on the bank.
+    expect(bank.find((d) => d.id === "d-1")!.is_active).toBe(true);
+    expect(bank.find((d) => d.id === "d-2")!.is_active).toBe(true);
   });
 });

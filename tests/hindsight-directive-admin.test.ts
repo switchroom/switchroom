@@ -23,6 +23,8 @@ import { join } from "node:path";
 import {
   DirectiveAdmin,
   DirectivePairInconsistentError,
+  RulesBlockDeactivationRefusedError,
+  RULES_BLOCK_MARKER_TAG,
   buildDirectivePatchBody,
   type HindsightDirective,
 } from "../src/memory/hindsight-directive-admin.js";
@@ -522,5 +524,184 @@ describe("shim wiring", () => {
     } finally {
       rmSync(cacheDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ─── deactivateAllActiveByName — M3 directive-placement campaign entry ─────
+//
+// Each test asserts the STATE the mock server ends up in (is_active flags,
+// which directives survive) and that the row STILL EXISTS after retirement —
+// not merely that a code path ran. The rules-block guard test would pass even
+// if the marker were ignored, so it asserts BOTH the throw AND that no PATCH
+// touched the bank; the reversibility test would pass on a delete-based
+// implementation, so it asserts the row is still listable and reactivatable.
+
+describe("deactivateAllActiveByName — M3 campaign deactivate", () => {
+  const BANK = "m3-bank";
+  let byName: MockApi;
+
+  function m3Fixture(): Record<string, HindsightDirective[]> {
+    return {
+      [BANK]: [
+        {
+          id: "d-a1",
+          name: "relocated-guardrail",
+          content: "First active copy.",
+          priority: 6,
+          is_active: true,
+          tags: ["style"],
+        },
+        {
+          id: "d-a2",
+          name: "relocated-guardrail",
+          content: "Second active copy (windows-boxes-class duplicate).",
+          priority: 4,
+          is_active: true,
+          tags: [],
+        },
+        {
+          id: "d-off",
+          name: "relocated-guardrail",
+          content: "A copy already retired by a prior pass.",
+          priority: 0,
+          is_active: false,
+          tags: ["superseded-by:relocated-guardrail"],
+        },
+        {
+          id: "d-rb",
+          name: "rules-block-guardrail",
+          content: "Belongs in CLAUDE.md rules block, staged until M3 flip.",
+          priority: 8,
+          is_active: true,
+          tags: [RULES_BLOCK_MARKER_TAG],
+        },
+        {
+          id: "d-solo",
+          name: "solo-guardrail",
+          content: "One active copy.",
+          priority: 5,
+          is_active: true,
+          tags: [],
+        },
+      ],
+    };
+  }
+
+  beforeEach(async () => {
+    byName = await startMockApi(m3Fixture());
+  });
+  afterEach(async () => {
+    await byName.close();
+  });
+
+  const m3Admin = () =>
+    new DirectiveAdmin({ apiBaseUrl: byName.baseUrl, bankId: BANK, timeoutMs: 2000 });
+
+  const row = (id: string) => byName.banks[BANK].find((d) => d.id === id)!;
+
+  it("flips is_active=false on the active copy, and it drops out of active-only listing", async () => {
+    const admin = m3Admin();
+    const result = await admin.deactivateAllActiveByName({ name: "solo-guardrail" });
+
+    expect(result.deactivated.map((d) => d.id)).toEqual(["d-solo"]);
+    expect(result.deactivated[0].priority).toBe(5);
+    // State: the directive is now inactive on the server.
+    expect(row("d-solo").is_active).toBe(false);
+    // And gone from an active-only listing (what the recall hook injects).
+    const active = await admin.list();
+    expect(active.filter((d) => d.is_active).map((d) => d.id)).not.toContain("d-solo");
+  });
+
+  it("deactivates EVERY active copy sharing the name, skipping the already-inactive one", async () => {
+    const result = await m3Admin().deactivateAllActiveByName({
+      name: "relocated-guardrail",
+    });
+    expect(result.deactivated.map((d) => d.id).sort()).toEqual(["d-a1", "d-a2"]);
+    expect(result.alreadyInactive.map((d) => d.id)).toEqual(["d-off"]);
+    expect(row("d-a1").is_active).toBe(false);
+    expect(row("d-a2").is_active).toBe(false);
+    // The already-inactive copy was never re-PATCHed.
+    expect(byName.seen.some((r) => r.method === "PATCH" && r.path.endsWith("/d-off"))).toBe(
+      false,
+    );
+  });
+
+  it("is REVERSIBLE: a deactivated directive still exists and can be reactivated", async () => {
+    const admin = m3Admin();
+    await admin.deactivateAllActiveByName({ name: "solo-guardrail" });
+    expect(row("d-solo").is_active).toBe(false);
+
+    // Still present in the bank (not deleted) — visible with active_only=false.
+    const all = await admin.list();
+    expect(all.map((d) => d.id)).toContain("d-solo");
+
+    // And reactivatable — the whole point of deactivate-not-delete.
+    await admin.reactivate({ name: "solo-guardrail" });
+    expect(row("d-solo").is_active).toBe(true);
+  });
+
+  it("only is_active is PATCHed — never content/name/priority (no guardrail-text rewrite)", async () => {
+    await m3Admin().deactivateAllActiveByName({ name: "solo-guardrail" });
+    const patch = byName.seen.find((r) => r.method === "PATCH" && r.path.endsWith("/d-solo"));
+    expect(patch).toBeDefined();
+    expect(patch!.body).toEqual({ is_active: false });
+    // Content and priority survived untouched on the server row.
+    expect(row("d-solo").content).toBe("One active copy.");
+    expect(row("d-solo").priority).toBe(5);
+  });
+
+  it("REFUSES a rules-block-marked directive and mutates nothing", async () => {
+    const admin = m3Admin();
+    await expect(
+      admin.deactivateAllActiveByName({ name: "rules-block-guardrail" }),
+    ).rejects.toBeInstanceOf(RulesBlockDeactivationRefusedError);
+    // Still active — the refusal fired before any PATCH.
+    expect(row("d-rb").is_active).toBe(true);
+    expect(byName.seen.some((r) => r.method === "PATCH")).toBe(false);
+    // The marker was NOT stripped — that is the M3-flip / mark-rules-block job.
+    expect(row("d-rb").tags).toContain(RULES_BLOCK_MARKER_TAG);
+  });
+
+  it("idempotent: re-running after full deactivation is a clean no-op, not an error", async () => {
+    const admin = m3Admin();
+    const first = await admin.deactivateAllActiveByName({ name: "relocated-guardrail" });
+    expect(first.deactivated).toHaveLength(2);
+
+    // Second run: every copy is now inactive. No throw, empty deactivated,
+    // and NO further PATCH reaches the server.
+    const patchesBefore = byName.seen.filter((r) => r.method === "PATCH").length;
+    const second = await admin.deactivateAllActiveByName({ name: "relocated-guardrail" });
+    expect(second.deactivated).toEqual([]);
+    expect(second.alreadyInactive.map((d) => d.id).sort()).toEqual(["d-a1", "d-a2", "d-off"]);
+    const patchesAfter = byName.seen.filter((r) => r.method === "PATCH").length;
+    expect(patchesAfter).toBe(patchesBefore);
+  });
+
+  it("throws only when NO directive (active or inactive) carries the name", async () => {
+    await expect(
+      m3Admin().deactivateAllActiveByName({ name: "never-existed" }),
+    ).rejects.toThrow(/no directive named 'never-existed'/);
+  });
+
+  it("dry-run computes the plan but issues no PATCH", async () => {
+    const admin = m3Admin();
+    const result = await admin.deactivateAllActiveByName({
+      name: "relocated-guardrail",
+      dryRun: true,
+    });
+    expect(result.dryRun).toBe(true);
+    expect(result.deactivated.map((d) => d.id).sort()).toEqual(["d-a1", "d-a2"]);
+    // Nothing mutated.
+    expect(row("d-a1").is_active).toBe(true);
+    expect(row("d-a2").is_active).toBe(true);
+    expect(byName.seen.some((r) => r.method === "PATCH")).toBe(false);
+  });
+
+  it("dry-run still surfaces the rules-block refusal without mutating", async () => {
+    await expect(
+      m3Admin().deactivateAllActiveByName({ name: "rules-block-guardrail", dryRun: true }),
+    ).rejects.toBeInstanceOf(RulesBlockDeactivationRefusedError);
+    expect(row("d-rb").is_active).toBe(true);
+    expect(byName.seen.some((r) => r.method === "PATCH")).toBe(false);
   });
 });
