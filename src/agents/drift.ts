@@ -54,7 +54,11 @@ import {
   type RecallCapInput,
 } from "../setup/hindsight-recall-tunables.js";
 import { VERSION } from "../build-info.js";
-import { buildSettingsHooksBlock, detectHooksDrift } from "./scaffold.js";
+import {
+  buildSettingsHooksBlock,
+  detectHooksDrift,
+  resolveHindsightVendorResolution,
+} from "./scaffold.js";
 import { containerName } from "./lifecycle.js";
 import { computeConfigHash, detectStampDrift } from "./generation-stamp.js";
 
@@ -645,6 +649,153 @@ export function detectPrefetchAsyncTimeoutDrift(
   ];
 }
 
+/**
+ * Hash every source file under a plugin `scripts/` tree into a
+ * `relPath → sha256hex` map. Walks recursively (so `scripts/lib/` is
+ * included) and skips build/edit exhaust — `__pycache__/`, `*.pyc`, and
+ * `*.bak*` — so a stray compiled cache or a hand-edit backup is not itself
+ * reported as drift (a stale `recall.py.bak` on the live test-harness tree
+ * is exactly the kind of cruft that would otherwise noise the row).
+ *
+ * Returns null when the root does not exist. Deterministic: the caller does a
+ * set/content comparison, not an order-dependent one.
+ */
+function hashPluginScriptsTree(scriptsRoot: string): Map<string, string> | null {
+  if (!existsSync(scriptsRoot)) return null;
+  const out = new Map<string, string>();
+  const skipDir = (n: string): boolean => n === "__pycache__";
+  const skipFile = (n: string): boolean => n.endsWith(".pyc") || n.includes(".bak");
+  const walk = (dir: string, rel: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const childRel = rel === "" ? ent.name : `${rel}/${ent.name}`;
+      const childAbs = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (skipDir(ent.name)) continue;
+        walk(childAbs, childRel);
+      } else if (ent.isFile()) {
+        if (skipFile(ent.name)) continue;
+        try {
+          out.set(childRel, createHash("sha256").update(readFileSync(childAbs)).digest("hex"));
+        } catch {
+          // Unreadable file — record a sentinel so it reads as changed rather
+          // than silently matching.
+          out.set(childRel, "unreadable");
+        }
+      }
+    }
+  };
+  walk(scriptsRoot, "");
+  return out;
+}
+
+/**
+ * #4779 — vendored hindsight-memory plugin BUILD drift.
+ *
+ * The manifest `version` in `.claude-plugin/plugin.json` sat at `0.4.0`
+ * across the entire M4/M5 plugin rewrite, so a version-string comparison
+ * could not tell a June pre-M4 tree from the shipped build. `test-harness`
+ * carried the June tree indefinitely (no `prefetch.py`, no
+ * `lib/recall_buffer.py`) while every recall-enabled agent was re-vendored —
+ * invisible to every existing check because they all early-out on
+ * `auto_recall: false`.
+ *
+ * This detector closes that hole by HASHING the deployed `scripts/` tree
+ * (which contains `scripts/lib/`) against the release vendor build's
+ * `scripts/` tree, file by file. It deliberately does NOT gate on
+ * `auto_recall` or `isHindsightEnabled`: a divergent plugin tree on disk is
+ * drift no matter why it is there. It fires whenever the agent has a plugin
+ * tree at all — so after the self-healing vendor fix
+ * (`removeVendoredHindsightPlugin`), a recall-off agent has no tree and this
+ * is a clean no-op, while a pre-fix or hand-copied stale tree lights up.
+ *
+ * `settings.json` / `hooks/hooks.json` are intentionally OUT of scope here —
+ * they are per-agent stamped (see `detectHindsightRecallTunableDrift`), so
+ * they legitimately differ from the vendor and are guarded by their own row.
+ * Only the executable `scripts/` code must match the release byte for byte.
+ */
+export function detectHindsightPluginTreeDrift(
+  name: string,
+  agentDir: string,
+): DriftFinding[] {
+  const pluginDir = join(agentDir, ".claude", "plugins", "hindsight-memory");
+  // No vendored plugin on disk — nothing to compare. A recall-off agent that
+  // apply has self-healed lands here (correctly clean).
+  if (!existsSync(pluginDir)) return [];
+
+  const releaseResolution = resolveHindsightVendorResolution();
+  if (releaseResolution.path === null) {
+    // Release build not resolvable (e.g. probing from an image without the
+    // vendor payload). Can't compare; the missing-vendor condition is already
+    // surfaced loudly by installHindsightPlugin. Don't invent a finding.
+    return [];
+  }
+
+  const releaseScripts = join(releaseResolution.path, "scripts");
+  const deployedScripts = join(pluginDir, "scripts");
+
+  const releaseHashes = hashPluginScriptsTree(releaseScripts);
+  if (releaseHashes === null || releaseHashes.size === 0) {
+    // Release build has no scripts/ tree to compare against — anomalous, not
+    // an agent-side drift signal.
+    return [];
+  }
+  const deployedHashes = hashPluginScriptsTree(deployedScripts) ?? new Map<string, string>();
+
+  const missing: string[] = []; // in release, absent from the agent
+  const changed: string[] = []; // present in both, content differs
+  const extra: string[] = []; // in the agent, not in release
+
+  for (const [rel, hash] of releaseHashes) {
+    const got = deployedHashes.get(rel);
+    if (got === undefined) missing.push(rel);
+    else if (got !== hash) changed.push(rel);
+  }
+  for (const rel of deployedHashes.keys()) {
+    if (!releaseHashes.has(rel)) extra.push(rel);
+  }
+
+  if (missing.length === 0 && changed.length === 0 && extra.length === 0) {
+    return [];
+  }
+
+  const parts: string[] = [];
+  const summarise = (label: string, items: string[]): void => {
+    if (items.length === 0) return;
+    const shown = items.slice(0, 6).sort();
+    const more = items.length > shown.length ? ` (+${items.length - shown.length} more)` : "";
+    parts.push(`${label}: ${shown.join(", ")}${more}`);
+  };
+  summarise("missing", missing);
+  summarise("changed", changed);
+  summarise("stale-extra", extra);
+
+  return [
+    {
+      surface: "memory-plugin-build",
+      agent: name,
+      detail:
+        `vendored hindsight-memory plugin scripts/ tree does NOT match the ` +
+        `release build (manifest version is not a reliable signal — it can ` +
+        `sit unchanged across builds): ${parts.join("; ")}`,
+      fix:
+        "Re-vendor the plugin: `switchroom apply` re-copies the release " +
+        "`scripts/` tree into this agent (or removes it entirely when the " +
+        "agent has memory turned off), then restart the agent " +
+        "(`switchroom agent restart " +
+        name +
+        "`). A tree that keeps drifting after apply means the agent's memory " +
+        "config and its on-disk plugin disagree — check memory.backend / " +
+        "memory.auto_recall for this agent.",
+    },
+  ];
+}
+
 // ─── Aggregation + per-agent report file (boot-card handoff) ────────────────
 
 /** Basename of the per-agent drift report the boot-card probe reads. */
@@ -722,6 +873,11 @@ export function detectAgentDrift(
   findings.push(
     ...detectPrefetchAsyncTimeoutDrift(name, agentConfig, agentDir, config),
   );
+  // #4779 — plugin BUILD drift (hash of scripts/ vs the release vendor tree).
+  // Deliberately NOT gated on auto_recall: a stale/divergent tree on disk is
+  // drift regardless of whether the agent has memory enabled, and that gating
+  // is exactly why the earlier rows missed test-harness's frozen pre-M4 tree.
+  findings.push(...detectHindsightPluginTreeDrift(name, agentDir));
   if (!opts.skipContainerProbes) {
     findings.push(
       ...detectHookScriptDrift(name, {
