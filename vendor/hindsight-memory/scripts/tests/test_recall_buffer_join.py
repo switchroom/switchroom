@@ -189,5 +189,75 @@ class KillSwitchOffTests(BufferJoinBase):
         self.assertNotIn("a prefetched memory", ctx)
 
 
+class StaleBufferTokenTests(BufferJoinBase):
+    """F3 — a buffer consumed on turn N must NOT be re-served as fresh on
+    turns N+1..N+k when no strictly-newer sentinel has been produced."""
+
+    def test_consumed_buffer_is_not_reserved_as_fresh_next_turn(self):
+        recall_buffer.write_buffer(SESSION, "- a prefetched memory", {})
+        recall_buffer.write_sentinel(SESSION)
+        cfg = self._config(prefetch_enabled=True)
+
+        # Turn N+1: fresh hit — the buffer is consumed and its token recorded.
+        out1 = self._run(cfg, _DirectiveClient())
+        ctx1 = json.loads(out1)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("a prefetched memory", ctx1)
+
+        # Turn N+2: the producer did NOT run again (no new sentinel). The same
+        # on-disk buffer must now read as STALE (already-consumed token), so its
+        # memory must NOT be injected again. On the pre-fix code — which hard-
+        # wired last_consumed_token=None — read_if_fresh reported the old
+        # sentinel "fresh" and re-injected the turn-N memory here.
+        out2 = self._run(cfg, _DirectiveClient())
+        ctx2 = json.loads(out2)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn(
+            "a prefetched memory", ctx2,
+            "a buffer consumed on a prior turn must not be re-served as fresh",
+        )
+
+    def test_a_newer_sentinel_is_served_after_consumption(self):
+        # Positive control: once the producer writes a STRICTLY-NEWER sentinel,
+        # the fresh path serves again — the token gate rejects only re-reads of
+        # an ALREADY-consumed sentinel, never a genuinely new one.
+        recall_buffer.write_buffer(SESSION, "- memory one", {})
+        recall_buffer.write_sentinel(SESSION)
+        cfg = self._config(prefetch_enabled=True)
+
+        out1 = self._run(cfg, _DirectiveClient())
+        self.assertIn("memory one", json.loads(out1)["hookSpecificOutput"]["additionalContext"])
+
+        # New turn's producer output.
+        recall_buffer.write_buffer(SESSION, "- memory two", {})
+        recall_buffer.write_sentinel(SESSION)
+        out2 = self._run(cfg, _DirectiveClient())
+        ctx2 = json.loads(out2)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("memory two", ctx2)
+
+
+class ColdSessionSyncRecallTests(BufferJoinBase):
+    """F4 — a flag-on cold session's first turn (no sentinel ever, no prior
+    recall, no directives) must fall through to SYNCHRONOUS recall, not emit a
+    degraded banner and short-circuit it."""
+
+    class _MemClient:
+        def list_directives(self, bank_id, active_only=True, timeout=2):
+            return {"items": []}
+
+        def recall(self, bank_id, query, **kwargs):
+            return {"results": [{
+                "text": "sync recalled memory", "type": "fact",
+                "mentioned_at": "2026-01-01", "id": "s1", "scores": {"final": 0.9},
+            }]}
+
+    def test_cold_session_with_no_directives_runs_synchronous_recall(self):
+        out = self._run(self._config(prefetch_enabled=True), self._MemClient())
+        self.assertTrue(out)
+        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            "sync recalled memory", ctx,
+            "cold session's first turn must run synchronous recall, not a degraded no-op",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

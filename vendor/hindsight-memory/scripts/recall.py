@@ -92,6 +92,13 @@ _IMPORT_ELAPSED_SECONDS = time.monotonic() - _IMPORT_START_MONOTONIC
 
 LAST_RECALL_STATE = "last_recall.json"
 RECALL_CACHE_STATE = "recall_cache.json"
+# M4 P-REC F3 — the last prefetch-buffer sentinel token this session has
+# already CONSUMED, keyed by session_id. Persisted across turns so a buffer
+# produced at turn N and consumed at N+1 is not re-served as "fresh" at
+# N+2..N+k when no newer sentinel has landed (the stale-buffer-served-as-fresh
+# class). A dict {session_id: token}; capped like the other per-session state.
+PREFETCH_CONSUMED_STATE = "prefetch_consumed.json"
+_PREFETCH_CONSUMED_MAX_SESSIONS = 10000
 
 # Switchroom hindsight-leverage A3 — label for the directives fetch slot in the
 # parallel fan-out. Distinct from any bank_id (banks can't start with "__") so a
@@ -500,12 +507,6 @@ def _emit_cached_context(context: str) -> None:
     )
 
 
-_PREFETCH_DEGRADED_NOTICE = (
-    "⏳ prefetch not ready and no prior recall is cached for this session — "
-    "proceeding without injected memory this turn."
-)
-
-
 def stale_recall_notice(memories_context: str) -> str:
     """Wrap a PRIOR turn's cached memories-only block in an explicit
     staleness marker for the M4 prefetch-buffer fallback path.
@@ -528,6 +529,100 @@ def stale_recall_notice(memories_context: str) -> str:
     )
 
 
+def _read_consumed_token(session_id: str) -> "int | None":
+    """Return the last prefetch sentinel token this session already consumed,
+    or None if none is recorded. Failure-tolerant — any read/parse error
+    returns None (treat as "nothing consumed yet", the fail-open direction that
+    at worst re-serves once, never suppresses forever)."""
+    state = read_state(PREFETCH_CONSUMED_STATE, {}) or {}
+    if not isinstance(state, dict):
+        return None
+    token = state.get(session_id)
+    return int(token) if isinstance(token, (int, float)) else None
+
+
+def _write_consumed_token(session_id: str, token: int) -> None:
+    """Persist `token` as the last sentinel this session has consumed. Bounded
+    to `_PREFETCH_CONSUMED_MAX_SESSIONS` entries. Best-effort — write_state
+    never raises."""
+    state = read_state(PREFETCH_CONSUMED_STATE, {}) or {}
+    if not isinstance(state, dict):
+        state = {}
+    state[session_id] = int(token)
+    if len(state) > _PREFETCH_CONSUMED_MAX_SESSIONS:
+        # Drop the numerically-smallest tokens (oldest producers) first.
+        for k in sorted(
+            state.keys(),
+            key=lambda k: state[k] if isinstance(state[k], (int, float)) else 0,
+        )[: len(state) - _PREFETCH_CONSUMED_MAX_SESSIONS]:
+            state.pop(k, None)
+    write_state(PREFETCH_CONSUMED_STATE, state)
+
+
+def curate_recall_results(results, config, bank_id):
+    """M4 F5 — the SHARED recall curation pipeline, so the async prefetch
+    producer (`prefetch.py`) can never drift from the guarantees the
+    synchronous recall path enforces.
+
+    Applies, in order, the exact same module-level primitives the synchronous
+    path composes inline: drop demote-tagged memories (`_is_demoted_memory`),
+    sort by engine relevance (`_sort_by_final_score`), apply the optional
+    absolute score floor when it is configured for ALL turns
+    (`_filter_by_min_score`; the `degraded`-scope floor is a synchronous-path
+    concept the speculative single-bank prefetch cannot evaluate, so it is
+    honoured here only when `recallMinScoreScope` is `all`, matching what the
+    sync path does on a healthy own-bank turn), and finally the
+    `recallMaxMemories` head cap with per-bank slot reservation
+    (`_reserve_bank_slots`).
+
+    Returns the curated result list. Never mutates the caller's list in a way
+    that changes its length before returning (it rebinds internally). Pure —
+    no I/O, no network — so it is safe to call from the producer hook.
+    """
+    if not results:
+        return results
+
+    # 1) demote-from-recall drop (Switchroom #432 4.4) — before any cap so the
+    #    cap fills with non-demoted hits.
+    results = [m for m in results if not _is_demoted_memory(m)]
+
+    # 2) relevance sort (Phase-1 bank-starvation fix) — in place on our copy.
+    _sort_by_final_score(results)
+
+    # 3) optional absolute score floor (#3837). The sync path binds this on
+    #    `all` scope always, and on `degraded` scope only when the own-bank
+    #    read degraded. A prefetch is a healthy speculative read (no degraded
+    #    signal), so we bind only the `all` scope here — identical to the sync
+    #    path's decision on a non-degraded turn.
+    min_score_floor = config.get("recallMinScore", 0.0)
+    if isinstance(min_score_floor, bool) or not isinstance(min_score_floor, (int, float)):
+        min_score_floor = 0.0
+    min_score_floor = float(min_score_floor)
+    min_score_scope = config.get("recallMinScoreScope", "degraded")
+    if min_score_floor > 0 and min_score_scope == "all":
+        results, _dropped = _filter_by_min_score(results, min_score_floor)
+
+    # 4) recallMaxMemories head cap + per-bank slot reservation. `_reserve_
+    #    bank_slots` is a passthrough when cap<=0 or the set already fits, and
+    #    with the fleet-default 0/0 floors on a single-bank prefetch it reduces
+    #    to a plain head-slice — the same slice the sync path takes.
+    recall_max_memories = config.get("recallMaxMemories", 0)
+    if (
+        isinstance(recall_max_memories, int)
+        and recall_max_memories > 0
+        and len(results) > recall_max_memories
+    ):
+        results, _own, _add = _reserve_bank_slots(
+            results,
+            recall_max_memories,
+            bank_id,
+            config.get("recallOwnBankMinSlots", 0),
+            config.get("recallAdditionalBankMinSlots", 0),
+        )
+
+    return results
+
+
 def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool:
     """M4 P-REC Fix C (consumer side) — join the Stop-hook producer's
     prefetch buffer for this session instead of running recall
@@ -535,10 +630,12 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
 
     Gated entirely by `config.get("memoryPrefetchEnabled", False)` at the
     caller; this function assumes the flag is already on. Returns True iff
-    it emitted an `additionalContext` payload (fresh hit, stale fallback, or
-    the explicit degraded notice) and the caller should return without
-    running the synchronous path. Returns False on a clean no-op miss (flag
-    effectively off / nothing to say) so the caller falls through.
+    it emitted an `additionalContext` payload (fresh buffer hit, stale
+    fallback, or a directives-only block) and the caller should return
+    without running the synchronous path. Returns False on a miss with
+    nothing to serve — cold start, no fresh buffer, no stale prior recall,
+    no directives — so the caller falls through to SYNCHRONOUS recall (M4
+    F4: the first turn of a fresh/post-restart session must still recall).
 
     Never raises past this function's own boundary in normal operation —
     every internal step is wrapped so a bug here degrades to "fall through
@@ -546,6 +643,13 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
     wraps this call in its own try/except as defence in depth.)
     """
     session_id = hook_input.get("session_id") or "unknown"
+
+    # M4 F3 — the sentinel token this session has ALREADY consumed on a prior
+    # turn. Threaded into both `poll_for_sentinel` and `read_if_fresh` so a
+    # buffer produced at turn N and consumed at N+1 is treated as STALE (not
+    # re-served as fresh) at N+2..N+k until a strictly-newer sentinel lands.
+    # None on a cold session (nothing consumed yet).
+    last_consumed = _read_consumed_token(session_id)
 
     # Cold-start short-circuit (red-team MAJOR finding): if this session has
     # NEVER produced a sentinel, polling the full cap on every single
@@ -556,9 +660,9 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
         debug_log(config, "Prefetch buffer: no sentinel ever written for this session, cold-start skip")
     else:
         cap_ms = int(config.get("memoryPrefetchPollCapMs", 400))
-        recall_buffer.poll_for_sentinel(session_id, last_consumed_token=None, cap_ms=cap_ms)
+        recall_buffer.poll_for_sentinel(session_id, last_consumed_token=last_consumed, cap_ms=cap_ms)
 
-    payload, _token = recall_buffer.read_if_fresh(session_id, last_consumed_token=None)
+    payload, _token = recall_buffer.read_if_fresh(session_id, last_consumed_token=last_consumed)
 
     # Directives stay on the synchronous, always-fresh path (M3 rule) even
     # in the fast path — fetched here directly, never from the buffer.
@@ -584,6 +688,12 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
         directives_block = None
 
     if payload is not None:
+        # M4 F3 — record this token as consumed BEFORE emitting, so the next
+        # turn's `read_if_fresh` rejects the same buffer as stale unless the
+        # producer has since written a strictly-newer sentinel. `_token` is the
+        # sentinel token `read_if_fresh` just validated as fresh.
+        if _token is not None:
+            _write_consumed_token(session_id, _token)
         memories_block = payload.get("context") or ""
         parts = [b for b in (_dir_notice, directives_block, memories_block) if b]
         if not parts:
@@ -607,11 +717,15 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
         _emit_cached_context("\n\n".join([b for b in (_dir_notice, directives_block) if b]))
         return True
 
-    # Nothing fresh, nothing stale, nothing cached — say so explicitly
-    # rather than silently emitting no context (so a degraded turn is
-    # legible, matching the #3619 degraded-disclosure precedent).
-    _emit_cached_context(_PREFETCH_DEGRADED_NOTICE)
-    return True
+    # M4 F4 — nothing fresh, nothing stale, nothing cached (the cold-start /
+    # first-turn / no-prior-recall case). Return False so the caller runs the
+    # SYNCHRONOUS recall path, which is exactly the path that should run on a
+    # turn where no prefetch could possibly exist yet. Emitting a degraded
+    # notice and returning True here (the previous behaviour) short-circuited
+    # sync recall and handed a fresh/post-restart session ZERO memories plus a
+    # degraded banner on its very first turn — the opposite of the docstring's
+    # "a miss falls through to sync recall" contract.
+    return False
 
 
 def _emit_directives_only(config: dict, hook_input: dict) -> None:
