@@ -93,13 +93,27 @@ def _sentinel_path(session_id: str) -> str:
     return os.path.join(buffer_dir(), f"{_safe_session(session_id)}.buffer.done")
 
 
-def write_buffer(session_id: str, context: str, telemetry: Optional[dict] = None) -> None:
+def write_buffer(
+    session_id: str,
+    context: str,
+    telemetry: Optional[dict] = None,
+    query: Optional[str] = None,
+) -> None:
     """Write the prefetched recall payload for ``session_id``.
 
     Atomic (temp file + ``os.replace`` within the same directory). Does NOT
     write the sentinel — the caller MUST call ``write_sentinel`` after this,
     and only once the payload write has returned, to preserve the
     read-after-write ordering guarantee.
+
+    ``query`` (#4778) is the speculative query the producer used to build this
+    buffer. It is stored verbatim so the consumer can gate the join on topical
+    similarity between it and turn N+1's ACTUAL prompt — the buffer is keyed by
+    ``session_id`` alone and, without this, a fresh buffer built for the prior
+    turn is served on a topic pivot regardless of relevance. A ``None``/absent
+    query is stored as ``""``, which the consumer treats as "cannot establish a
+    topic match" and falls through to synchronous recall (fail-safe; also the
+    backward-compat behaviour for buffers written before this field existed).
     """
     d = _ensure_dir()
     final = _buffer_path(session_id)
@@ -108,6 +122,7 @@ def write_buffer(session_id: str, context: str, telemetry: Optional[dict] = None
         "schema": SCHEMA,
         "session_id": session_id,
         "context": context,
+        "query": query or "",
         "telemetry": telemetry or {},
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -187,7 +202,11 @@ def sentinel_exists(session_id: str) -> bool:
 def read_if_fresh(session_id: str, last_consumed_token: Optional[int]) -> tuple:
     """Return ``(payload_dict | None, current_token)``.
 
-    ``payload_dict`` (when present) is ``{"context": str, "telemetry": dict}``.
+    ``payload_dict`` (when present) is
+    ``{"context": str, "query": str, "telemetry": dict}``. ``query`` (#4778) is
+    the speculative query the buffer was built for — the consumer uses it to
+    gate the join on topical similarity to turn N+1's prompt. It is ``""`` for a
+    legacy buffer written before the field existed.
 
     Returns ``(None, token_or_last_consumed)`` when:
       * no sentinel exists yet (nothing has been produced this session), or
@@ -207,7 +226,11 @@ def read_if_fresh(session_id: str, last_consumed_token: Optional[int]) -> tuple:
         # Torn write: sentinel landed but payload didn't (or is corrupt).
         # Fail-closed — never serve this as fresh.
         return None, token
-    return {"context": payload.get("context", ""), "telemetry": payload.get("telemetry", {})}, token
+    return {
+        "context": payload.get("context", ""),
+        "query": payload.get("query", ""),
+        "telemetry": payload.get("telemetry", {}),
+    }, token
 
 
 def invalidate(session_id: str) -> None:

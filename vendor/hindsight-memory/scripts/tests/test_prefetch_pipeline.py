@@ -147,7 +147,7 @@ class CallOrderTests(PrefetchPipelineBase):
             order.append("retain")
             return {"status": "ok"}
 
-        def _spy_write_buffer(session_id, context, telemetry=None):
+        def _spy_write_buffer(session_id, context, telemetry=None, query=None):
             order.append("buffer")
 
         def _spy_write_sentinel(session_id):

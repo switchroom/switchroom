@@ -99,7 +99,10 @@ class BufferJoinBase(unittest.TestCase):
 
 class FreshHitTests(BufferJoinBase):
     def test_fresh_buffer_hit_is_rendered_with_directives_layered_on(self):
-        recall_buffer.write_buffer(SESSION, "- a prefetched memory", {})
+        # #4778 — the buffered query must be on-topic with the consumer prompt
+        # (default "what did we decide about deploys") for the join to fire;
+        # here it is identical, so the topic guard passes and the warm hit lands.
+        recall_buffer.write_buffer(SESSION, "- a prefetched memory", {}, query="what did we decide about deploys")
         recall_buffer.write_sentinel(SESSION)
 
         out = self._run(self._config(prefetch_enabled=True), _DirectiveClient())
@@ -194,7 +197,7 @@ class StaleBufferTokenTests(BufferJoinBase):
     turns N+1..N+k when no strictly-newer sentinel has been produced."""
 
     def test_consumed_buffer_is_not_reserved_as_fresh_next_turn(self):
-        recall_buffer.write_buffer(SESSION, "- a prefetched memory", {})
+        recall_buffer.write_buffer(SESSION, "- a prefetched memory", {}, query="what did we decide about deploys")
         recall_buffer.write_sentinel(SESSION)
         cfg = self._config(prefetch_enabled=True)
 
@@ -219,7 +222,7 @@ class StaleBufferTokenTests(BufferJoinBase):
         # Positive control: once the producer writes a STRICTLY-NEWER sentinel,
         # the fresh path serves again — the token gate rejects only re-reads of
         # an ALREADY-consumed sentinel, never a genuinely new one.
-        recall_buffer.write_buffer(SESSION, "- memory one", {})
+        recall_buffer.write_buffer(SESSION, "- memory one", {}, query="what did we decide about deploys")
         recall_buffer.write_sentinel(SESSION)
         cfg = self._config(prefetch_enabled=True)
 
@@ -227,7 +230,7 @@ class StaleBufferTokenTests(BufferJoinBase):
         self.assertIn("memory one", json.loads(out1)["hookSpecificOutput"]["additionalContext"])
 
         # New turn's producer output.
-        recall_buffer.write_buffer(SESSION, "- memory two", {})
+        recall_buffer.write_buffer(SESSION, "- memory two", {}, query="what did we decide about deploys")
         recall_buffer.write_sentinel(SESSION)
         out2 = self._run(cfg, _DirectiveClient())
         ctx2 = json.loads(out2)["hookSpecificOutput"]["additionalContext"]
