@@ -75,8 +75,18 @@ def run_prefetch(hook_input: dict, config: dict) -> bool:
     that could take the Stop hook (and thus the turn) down with it."""
     session_id = hook_input.get("session_id") or "unknown"
 
-    prompt = (hook_input.get("prompt") or hook_input.get("user_prompt") or "").strip()
-    if prompt.startswith("<task-notification"):
+    # F6 — junk gate derived from the TRANSCRIPT's last human turn, not from a
+    # `hook_input["prompt"]` field. A Stop hook's input carries only
+    # session_id/transcript_path/stop_hook_active — never `prompt`/`user_prompt`
+    # — so the old `hook_input.get("prompt")` gate was permanently empty and
+    # NEVER fired, meaning prefetch would run on `<task-notification>` turns once
+    # lit. `_last_human_prompt` reads the same last-human turn the speculative
+    # query is derived from, so the gate now fires on exactly the synthetic
+    # follow-up turns `recall.py`'s synchronous gate skips (honouring the same
+    # `recallSkipTaskNotification` switch).
+    transcript_path = hook_input.get("transcript_path") or ""
+    query = _last_human_prompt(transcript_path)
+    if config.get("recallSkipTaskNotification", True) and query.startswith("<task-notification"):
         debug_log(config, "Prefetch: task-notification turn, skipping")
         return False
 
@@ -97,9 +107,8 @@ def run_prefetch(hook_input: dict, config: dict) -> bool:
     except Exception as exc:  # pragma: no cover - defensive
         debug_log(config, f"Prefetch: delta retain failed, continuing without it: {exc}")
 
-    # Step 2 — speculative recall.
-    transcript_path = hook_input.get("transcript_path") or ""
-    query = _last_human_prompt(transcript_path)
+    # Step 2 — speculative recall (query derived above from the transcript's
+    # last human turn).
     if not query:
         debug_log(config, "Prefetch: no usable query, nothing to prefetch")
         return False
@@ -121,6 +130,25 @@ def run_prefetch(hook_input: dict, config: dict) -> bool:
 
     if not results:
         debug_log(config, "Prefetch: no candidates, nothing to buffer")
+        return False
+
+    # F5 — CURATE before buffering, through the SAME pipeline the synchronous
+    # recall path enforces (demote-drop, relevance sort, score floor, and the
+    # `recallMaxMemories` cap). Calling recall's shared helper — rather than
+    # `format_memories(results)` on the raw set — is what stops a demoted or
+    # uncapped memory from reaching the buffer and bypassing curation the sync
+    # path applies (carve §6.1 sharing requirement). Imported lazily so the
+    # flag-off no-op in `main()` never pays recall.py's import cost.
+    try:
+        import recall  # noqa: PLC0415 - lazy, kept off the flag-off no-op path
+
+        results = recall.curate_recall_results(results, config, bank_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        debug_log(config, f"Prefetch: curation failed, skipping buffer: {exc}")
+        return False
+
+    if not results:
+        debug_log(config, "Prefetch: all candidates filtered by curation, nothing to buffer")
         return False
 
     from lib.content import format_memories
