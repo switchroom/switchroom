@@ -27,6 +27,7 @@ import {
 } from '../llm-error-present.js'
 import { truncateDetailPreservingRequestId } from '../raw-error-scrub.js'
 import { projectTranscriptLine, detectErrorInTranscriptLine } from '../session-tail.js'
+import { isConnectionDropText } from '../connection-drop.js'
 import { renderOperatorEvent, type OperatorEvent } from '../operator-events.js'
 import { redact } from '../secret-detect/redact.js'
 
@@ -134,6 +135,188 @@ describe('parseLlmError — classification table', () => {
     expect(p.model).toBe('claude-opus-4-8')
     expect(p.requestId).toBe('req_abc123')
     assertNoRawBytes(p.coreText)
+  })
+})
+
+// ─── Connection-drop classification (PR 0: unify drop classification) ─────────
+//
+// The two classifiers historically disagreed about a mid-stream connection /
+// SSE drop: Path A (`parseLlmError`) mapped it to a transient/network error,
+// while Path B (`detectErrorInTranscriptLine`) let a drop-worded line whose
+// wording `classifyClaudeError` did not recognise fall through to a generic
+// `unknown-*` terminal. These blocks assert the SAME line is now identifiable
+// as a connection drop on BOTH paths — and, critically, that auth / quota /
+// overload / provider-credit walls are NEVER flagged as drops on either path
+// (the greedy-matcher failure mode that would later cause a wrong auto-resume).
+
+const OPENROUTER_402_CREDIT =
+  'litellm.APIError: OpenrouterException - {"error":{"code":402,"message":"Your account or API key has insufficient credits. Add more credits and retry the request.","metadata":{"provider_name":"openrouter"}}}'
+
+/** Build the v2.1.x `isApiErrorMessage` synthetic-assistant transcript line. */
+function apiErrorLine(text: string, opts: { error?: string; status?: number } = {}): string {
+  return JSON.stringify({
+    type: 'assistant',
+    message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text }] },
+    isApiErrorMessage: true,
+    ...(opts.error != null ? { error: opts.error } : { error: '' }),
+    ...(opts.status != null ? { apiErrorStatus: opts.status } : {}),
+  })
+}
+
+describe('connection-drop — identifiable on BOTH classification paths', () => {
+  // The canonical mid-stream abort shape: isApiErrorMessage + error:"server_error",
+  // NO status. Path A sees the worded string; Path B sees the transcript line.
+  it('a "Connection closed mid-response" line is a connection-drop on Path A AND Path B', () => {
+    const wording = 'API Error: Connection closed mid-response'
+
+    // Path A
+    const a = parseLlmError(wording)
+    expect(a.connectionDrop).toBe(true)
+    expect(a.kind).toBe('transient')
+    expect(a.source).toBe('network')
+
+    // Path B
+    const b = detectErrorInTranscriptLine(apiErrorLine(wording, { error: 'server_error' }))
+    expect(b).not.toBeNull()
+    expect(b!.connectionDrop).toBe(true)
+    expect(b!.kind).toBe('transport-transient')
+  })
+
+  // The exact Path-B bug: a drop-worded line whose wording `classifyClaudeError`
+  // does NOT recognise (no server_error type, no status) fell through to
+  // unknown-5xx. It must STILL be flagged a connection-drop.
+  it('a "socket hang up" line unknown to classifyClaudeError is still a connection-drop on both paths', () => {
+    const wording = 'API Error: socket hang up'
+
+    const a = parseLlmError(wording)
+    expect(a.connectionDrop).toBe(true)
+
+    const b = detectErrorInTranscriptLine(apiErrorLine(wording))
+    expect(b).not.toBeNull()
+    expect(b!.kind).toBe('unknown-5xx') // classifyClaudeError does not recognise the wording…
+    expect(b!.connectionDrop).toBe(true) // …yet the drop is identified anyway.
+  })
+
+  // The wrapper-error line shape (`type:"error"`, nested error object).
+  it('a server_error wrapper line carrying a drop wording is a connection-drop on Path B', () => {
+    const line = JSON.stringify({
+      type: 'error',
+      error: { type: 'server_error', message: 'Connection closed mid-response' },
+    })
+    const b = detectErrorInTranscriptLine(line)
+    expect(b).not.toBeNull()
+    expect(b!.kind).toBe('transport-transient')
+    expect(b!.connectionDrop).toBe(true)
+  })
+
+  // EPIPE is a genuine drop wording that `detectModelUnavailable` does not
+  // classify as network — Path A lands it on `unknown`, but it must still be a
+  // connection-drop (proving the discriminator is NOT tied to source:'network').
+  it('EPIPE is a connection-drop on Path A even though its kind stays unknown', () => {
+    const a = parseLlmError('write EPIPE: half-dead socket')
+    expect(a.kind).toBe('unknown')
+    expect(a.connectionDrop).toBe(true)
+  })
+})
+
+describe('connection-drop — negatives (auth / quota / overload / provider-credit are NEVER drops)', () => {
+  it('auth is not a connection-drop on either path', () => {
+    const a = parseLlmError('authentication_error: OAuth token expired, please refresh')
+    expect(a.kind).toBe('auth')
+    expect(a.connectionDrop).toBe(false)
+
+    const b = detectErrorInTranscriptLine(
+      apiErrorLine('authentication_error: OAuth token expired', { error: 'authentication_error', status: 401 }),
+    )
+    expect(b).not.toBeNull()
+    expect(b!.connectionDrop).toBe(false)
+  })
+
+  it('quota_wall is not a connection-drop on either path', () => {
+    const a = parseLlmError("You've hit your limit · resets 5pm")
+    expect(a.kind).toBe('quota_wall')
+    expect(a.connectionDrop).toBe(false)
+
+    const b = detectErrorInTranscriptLine(
+      apiErrorLine("You've hit your limit · resets 5pm", { error: 'rate_limit_error', status: 429 }),
+    )
+    expect(b).not.toBeNull()
+    expect(b!.kind).toBe('quota-exhausted')
+    expect(b!.connectionDrop).toBe(false)
+  })
+
+  it('overload_529 is not a connection-drop on either path', () => {
+    const a = parseLlmError('Overloaded (overloaded_error) — HTTP 529')
+    expect(a.kind).toBe('overload_529')
+    expect(a.connectionDrop).toBe(false)
+
+    const b = detectErrorInTranscriptLine(apiErrorLine('Overloaded', { error: 'overloaded_error' }))
+    expect(b).not.toBeNull()
+    expect(b!.connectionDrop).toBe(false)
+  })
+
+  it('provider_credit is not a connection-drop on either path', () => {
+    const a = parseLlmError(OPENROUTER_402_CREDIT)
+    expect(a.kind).toBe('provider_credit')
+    expect(a.connectionDrop).toBe(false)
+
+    const b = detectErrorInTranscriptLine(apiErrorLine(OPENROUTER_402_CREDIT, { status: 402 }))
+    expect(b).not.toBeNull()
+    expect(b!.kind).toBe('provider-credit-exhausted')
+    expect(b!.connectionDrop).toBe(false)
+  })
+
+  // The single highest-risk case: a wrapped auth/quota wall whose OUTER text
+  // coincidentally carries a drop wording ("fetch failed") must NOT be flagged a
+  // drop — the classification wins over the wording, on both paths.
+  it('a wrapped auth error whose outer text says "fetch failed" is NOT a connection-drop', () => {
+    const a = parseLlmError('authentication_error: invalid api key (underlying: fetch failed)')
+    expect(a.kind).toBe('auth')
+    expect(a.connectionDrop).toBe(false)
+
+    const b = detectErrorInTranscriptLine(
+      JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'invalid api key; underlying: fetch failed' },
+      }),
+    )
+    expect(b).not.toBeNull()
+    expect(b!.kind).toBe('credentials-invalid')
+    expect(b!.connectionDrop).toBe(false)
+  })
+})
+
+describe('isConnectionDropText — the canonical matcher is conservative', () => {
+  it('matches the canonical drop wordings', () => {
+    for (const s of [
+      'socket hang up',
+      'read ECONNRESET',
+      'connect ECONNREFUSED 1.2.3.4:443',
+      'write EPIPE',
+      'fetch failed',
+      'network error',
+      'Connection closed mid-response',
+      'connection lost',
+      'Premature close',
+      'the stream disconnected unexpectedly',
+    ]) {
+      expect(isConnectionDropText(s)).toBe(true)
+    }
+  })
+
+  it('does NOT over-match "upstream"/"downstream"/"terminated" or auth/quota wording', () => {
+    for (const s of [
+      'the upstream provider returned a result',
+      'downstream consumer finished',
+      'the worker terminated cleanly',
+      'authentication_error: invalid api key',
+      "You've hit your usage limit",
+      'overloaded_error',
+      'insufficient credits',
+      '',
+    ]) {
+      expect(isConnectionDropText(s)).toBe(false)
+    }
   })
 })
 
