@@ -17,6 +17,12 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.18 — Memory v2 M3 directive-flip release tooling: flip-preflight count/budget gate, Tier-1 directive-equivalence drift check, Tier-2 behavioural probe runner
+
+### Features
+
+- **memory(M3): deterministic directive-flip UAT scaffold (#4769)** — new `switchroom memory flip-preflight <agent> [--json]` CLI wires the flip-readiness library (measure live post-triage residue, check it fits the 6144B rules-block budget and that `memory.rules_block` is on) and prints READY + the exact switchroom.yaml stanza, or NOT-READY + why (exit 2). Adds the no-model, no-network half of the flip UAT gate under `telegram-plugin/uat/flip/`: a Tier-1 directive⇄rules equivalence check (nothing dropped/truncated/invented, budget + sentinel integrity), a crash-safe allowlist add/remove/sweep helper, a recall_log injection-delta reader, and a combined gate + markdown report with a typed seam left for the (not-yet-built) Tier-2 behavioural probes. Never mutates agent config or bank state.
+
 ## v0.21.17 — Memory-redesign v2: orientation-at-boot, directive-injection flip canary, and cross-bank knowledge-page reads
 
 ### Features
@@ -25393,6 +25399,7 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
 
