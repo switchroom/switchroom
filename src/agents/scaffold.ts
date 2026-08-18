@@ -3345,11 +3345,38 @@ Thumbs.db
  * resolved to `/vendor/hindsight-memory` inside a `bun build --compile`
  * binary, where `import.meta.dirname` is the bunfs virtual root.
  */
-function resolveHindsightVendorResolution(): ShippedAssetResolution {
+export function resolveHindsightVendorResolution(): ShippedAssetResolution {
   return resolveShippedAsset(HINDSIGHT_VENDOR_ASSET, {
     bundleDir: import.meta.dirname,
     execPath: process.execPath,
   });
+}
+
+/**
+ * Remove a previously-vendored hindsight-memory plugin tree from an agent.
+ *
+ * Called on the DELIBERATE memory-off paths of `installHindsightPlugin`
+ * (backend != hindsight, or `memory.auto_recall: false`). Those paths used
+ * to `return null` and leave whatever plugin tree happened to be on disk
+ * UNTOUCHED — so an agent that once had hindsight, then had it turned off,
+ * kept a frozen plugin tree that `switchroom apply` never refreshed OR
+ * removed. That is the #4779 bug: `test-harness` (`auto_recall: false`,
+ * "No Hindsight for test-harness") carried a June-dated pre-M4 plugin tree
+ * indefinitely while every recall-enabled agent was re-vendored to the M4
+ * build. The tree is inert (start.sh wires no `--plugin-dir` for it) but its
+ * mere presence is drift, and the comment on the backend-none early-out
+ * already worried a stray re-copy could re-activate the hooks.
+ *
+ * Making the disable path self-heal — remove the tree rather than ignore it —
+ * turns `apply` into a fixed point: after it, an agent either has the current
+ * vendored plugin (recall on) or NO plugin tree (recall off), never a stale
+ * one. Idempotent: a no-op when the tree is already absent.
+ */
+function removeVendoredHindsightPlugin(agentDir: string): void {
+  const destPath = join(agentDir, ".claude", "plugins", "hindsight-memory");
+  if (existsSync(destPath)) {
+    rmSync(destPath, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -3399,7 +3426,13 @@ export function installHindsightPlugin(
   // reconcile/restart, so a config-only check would re-copy the
   // hindsight plugin tree (re-activating its memory hooks) on a
   // `none` install (install-validation 2026-05-17, R2 review round 3).
-  if (!isHindsightEnabled(switchroomConfig)) return null;
+  if (!isHindsightEnabled(switchroomConfig)) {
+    // Memory backend is not hindsight — self-heal any tree a prior
+    // hindsight-enabled config left behind so a `none` install cannot keep
+    // running (or, per the note above, silently re-activate) a stale plugin.
+    removeVendoredHindsightPlugin(agentDir);
+    return null;
+  }
   // isHindsightEnabled true ⇒ memory.backend === "hindsight" ⇒ memory
   // is defined. Explicit narrowing for the type-checker (the old
   // `memory?.backend !== "hindsight"` gate used to provide it).
@@ -3414,6 +3447,13 @@ export function installHindsightPlugin(
   // resolveHindsightRecallConfig documents why re-deriving from the raw entry is
   // not equivalent to the caller's already-cascaded config.
   if (resolveHindsightAutoRecall(switchroomConfig, agentName, resolvedAgentConfig) === false) {
+    // auto_recall is off for this agent (cascaded). The plugin will not be
+    // wired into start.sh, so any tree on disk is inert drift — remove it
+    // rather than freeze it. Without this, `test-harness` (#4779) kept a
+    // stale pre-M4 plugin tree that `apply` refreshed for every other agent
+    // but never touched here, because this early-out ran before the
+    // vendor-copy below.
+    removeVendoredHindsightPlugin(agentDir);
     return null;
   }
 

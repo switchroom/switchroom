@@ -1,6 +1,26 @@
 # Changelog
 
+> **Versioning scheme (switchroom, #4779).** The manifest `version` in
+> `.claude-plugin/plugin.json` MUST be bumped on every substantive change to
+> this vendored tree — new/removed `scripts/`, changed hook wiring, or any
+> behaviour an agent would observe. It sat frozen at `0.4.0` across the entire
+> M4/M5 async-recall-prefetch rewrite, so a version-string check could not tell
+> a June pre-M4 tree from the shipped build and `test-harness` silently ran the
+> stale one. The version is only a COARSE signal, though — the authoritative
+> drift guard is the `scripts/`-tree hash in
+> `detectHindsightPluginTreeDrift` (`src/agents/drift.ts`), surfaced by
+> `switchroom doctor` and the gateway boot-card. Bump the version AND rely on
+> the hash; never the version alone.
+
 ## [Unreleased]
+
+### Changed (switchroom divergence)
+
+- **Manifest version bumped `0.4.0` → `0.5.0`** to reflect the M4/M5
+  async-recall-prefetch tree (adds `scripts/prefetch.py`,
+  `scripts/lib/recall_buffer.py`, `scripts/orientation.py`, and the
+  `memoryPrefetch*` settings). Per the scheme note above this is the first
+  bump of the discipline that stops build drift from going invisible (#4779).
 
 ### Added (switchroom divergence)
 
