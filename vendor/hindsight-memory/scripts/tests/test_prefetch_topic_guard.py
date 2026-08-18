@@ -49,6 +49,28 @@ SYNC_RECALL_TEXT = "sync recalled: Melbourne weekend outlook is sunny"
 # An on-topic FOLLOW-UP that reuses the salient nouns of the producer query.
 ONTOPIC_PROMPT = "and is the us-east-1 primary still the rollback target"
 
+# --- #4778 review MAJOR: SHORT-PROMPT Jaccard floor -------------------------
+# Jaccard is probabilistic on short prompts. The producer built a buffer for a
+# 2-content-token "call mom" turn; its block is a mom-topic reminder. Turn N+1 is
+# "call ended" — a SHARP pivot that shares only the incidental "call". Raw
+# Jaccard = |{call}| / |{call, mom, ended}| = 1/3 = 0.333 >= 0.30, so the
+# pre-floor guard WRONGLY serves the mom buffer. The small-set intersection floor
+# (either side < 3 tokens => demand >= 2 shared tokens) rejects it.
+SHORT_PRODUCER_QUERY = "call mom"
+SHORT_BUFFERED_BLOCK = "- Reminder: call mom about her dentist appointment"
+SHORT_PIVOT_PROMPT = "call ended"
+SHORT_BUFFER_MARKER = "dentist"
+
+# Positive control: two SHORT prompts that LEGITIMATELY share >= 2 content tokens
+# still join the warm buffer. Buffer query has 3 content tokens (restart, klanker,
+# agent — "the" is a stop word); the follow-up "restart klanker" is 2 tokens, so
+# the small-set floor applies, but the intersection {restart, klanker} = 2 clears
+# it and Jaccard = 2/3 = 0.667 clears the ratio. Served, no synchronous recall.
+SHORT_ONTOPIC_PRODUCER_QUERY = "restart the klanker agent"
+SHORT_ONTOPIC_BLOCK = "- Runbook: restart klanker with docker restart switchroom-klanker"
+SHORT_ONTOPIC_PROMPT = "restart klanker"
+SHORT_ONTOPIC_MARKER = "docker"
+
 
 class _SyncClient:
     """Directive-free client whose synchronous recall returns a marker distinct
@@ -168,6 +190,70 @@ class LegacyBufferFailsSafeTests(TopicGuardBase):
         ctx = self._run(self._config(), _SyncClient(), PIVOT_PROMPT)
         self.assertNotIn("us-east-1", ctx)
         self.assertIn(SYNC_RECALL_TEXT, ctx)
+
+
+class ShortPromptFloorTests(TopicGuardBase):
+    def test_short_pivot_sharing_one_incidental_token_is_not_served(self):
+        # RED without the small-set floor: "call mom" buffer + "call ended" turn
+        # gives raw Jaccard 1/3 = 0.333 >= 0.30, so the mom-topic block is served
+        # on an unrelated turn. GREEN with the floor: either side has < 3 tokens
+        # and the intersection is only {call} = 1 < 2, so the guard rejects and
+        # the turn falls through to synchronous recall.
+        recall_buffer.write_buffer(SESSION, SHORT_BUFFERED_BLOCK, {}, query=SHORT_PRODUCER_QUERY)
+        recall_buffer.write_sentinel(SESSION)
+
+        ctx = self._run(self._config(), _SyncClient(), SHORT_PIVOT_PROMPT)
+
+        self.assertNotIn(
+            SHORT_BUFFER_MARKER, ctx,
+            "a short-prompt pivot sharing one incidental token must NOT be served the buffer",
+        )
+        self.assertIn(
+            SYNC_RECALL_TEXT, ctx,
+            "a short-prompt pivot must fall through to synchronous recall",
+        )
+
+    def test_short_ontopic_sharing_two_tokens_still_gets_the_warm_buffer(self):
+        # Positive control: the floor must not kill a legitimate short warm hit.
+        # "restart klanker" (2 tokens) vs "restart the klanker agent" shares
+        # {restart, klanker} = 2, clearing both the small-set floor and the ratio;
+        # served WITHOUT any synchronous recall.
+        class _ExplodingRecallClient:
+            def list_directives(self, bank_id, active_only=True, timeout=2):
+                return {"items": []}
+
+            def recall(self, bank_id, query, **kwargs):
+                raise AssertionError("short on-topic warm hit must not fall through to sync recall")
+
+        recall_buffer.write_buffer(SESSION, SHORT_ONTOPIC_BLOCK, {}, query=SHORT_ONTOPIC_PRODUCER_QUERY)
+        recall_buffer.write_sentinel(SESSION)
+
+        ctx = self._run(self._config(), _ExplodingRecallClient(), SHORT_ONTOPIC_PROMPT)
+        self.assertIn(
+            SHORT_ONTOPIC_MARKER, ctx,
+            "a short on-topic follow-up sharing >= 2 tokens must still join the warm buffer",
+        )
+
+    def test_short_floor_unit_boundaries(self):
+        cfg = self._config()
+        # Short pivot, one incidental shared token -> floor rejects despite ratio.
+        self.assertFalse(recall._prefetch_topic_matches(SHORT_PIVOT_PROMPT, SHORT_PRODUCER_QUERY, cfg))
+        # Short on-topic, two shared tokens -> floor and ratio both clear.
+        self.assertTrue(
+            recall._prefetch_topic_matches(SHORT_ONTOPIC_PROMPT, SHORT_ONTOPIC_PRODUCER_QUERY, cfg)
+        )
+        # The reviewer's borderline case: "kill process 4080" / "process 4080 logs"
+        # shares two tokens (both sides 3 tokens) -> served, unaffected by floor.
+        self.assertTrue(
+            recall._prefetch_topic_matches("kill process 4080", "process 4080 logs", cfg)
+        )
+        # Full-containment exemption: an identical single-content-token query
+        # ("what did we decide" -> {decide} both sides) is wholly shared, not a
+        # divergent pivot -> the floor must NOT reject it. Guards the regression
+        # the naive floor caused in test_prefetch_invalidation's short queries.
+        self.assertTrue(recall._prefetch_topic_matches("what did we decide", "what did we decide", cfg))
+        # Subset/narrowing short query is likewise exempt from the floor.
+        self.assertTrue(recall._prefetch_topic_matches("call mom please", "call mom", cfg))
 
 
 class TopicMatchUnitTests(TopicGuardBase):

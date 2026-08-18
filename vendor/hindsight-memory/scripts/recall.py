@@ -905,6 +905,25 @@ def _overlap_tokens(text) -> set:
 
 _PREFETCH_TOPIC_OVERLAP_DEFAULT = 0.3
 
+# #4778 review MAJOR — short-prompt Jaccard floor. Jaccard is probabilistic, not
+# absolute, on SHORT prompts: two ~2-content-token turns that share ONE incidental
+# token while EACH carries a divergent token give 1/3 = 0.333 >= 0.30 and wrongly
+# clear the ratio bar ("call mom" buffer served on a "call ended" turn — the pivot
+# signature). When either token set is small (fewer than ``MIN_SMALL_SET_TOKENS``)
+# such a partial overlap must supply at least ``_PREFETCH_MIN_SMALL_SET_INTERSECTION``
+# shared tokens, not just clear the ratio.
+#
+# The floor fires ONLY on that divergent-on-both-sides shape. It deliberately
+# EXEMPTS full containment (``intersection == min(|A|, |B|)`` — the smaller set is
+# wholly shared: identical or subset/narrowing queries like "decide" vs "decide",
+# or "restart klanker" vs "restart the klanker agent"), which is a legitimate
+# topical match regardless of brevity and must still be served. Long prompts (both
+# sides at or above ``MIN_SMALL_SET_TOKENS``) skip the floor entirely and use the
+# Jaccard ratio exactly as before. The floor only ever ANDs a stricter condition
+# onto the ratio — it can reject, never serve.
+MIN_SMALL_SET_TOKENS = 3
+_PREFETCH_MIN_SMALL_SET_INTERSECTION = 2
+
 
 def _prefetch_topic_matches(prompt, buffered_query, config) -> bool:
     """#4778 — True iff turn N+1's ``prompt`` is topically close enough to the
@@ -933,6 +952,17 @@ def _prefetch_topic_matches(prompt, buffered_query, config) -> bool:
         return False
     intersection = len(now_tokens & buf_tokens)
     if intersection == 0:
+        return False
+    # Short-prompt floor (#4778 review MAJOR): when either side is small, a single
+    # incidental shared token must not clear the guard on the Jaccard ratio alone.
+    # Exempt full containment (intersection == smaller set) — identical/subset
+    # queries are a legitimate topical match, never the divergent-on-both-sides
+    # pivot this floor targets. ANDed with the ratio check below: stricter, never
+    # looser, and long prompts (both sides >= MIN_SMALL_SET_TOKENS) are untouched.
+    min_set = min(len(now_tokens), len(buf_tokens))
+    if min_set < MIN_SMALL_SET_TOKENS \
+            and intersection < min_set \
+            and intersection < _PREFETCH_MIN_SMALL_SET_INTERSECTION:
         return False
     union = len(now_tokens | buf_tokens)
     threshold = config.get("memoryPrefetchMinTopicOverlap", _PREFETCH_TOPIC_OVERLAP_DEFAULT)
