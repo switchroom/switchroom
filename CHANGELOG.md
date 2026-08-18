@@ -17,6 +17,20 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.19 — M4 async recall-prefetch hardening, directive-deactivate CLI, connection-drop classification
+
+### Features
+
+- **memory: add `switchroom memory directive deactivate <agent> <name>` (#4774)** — deactivates every ACTIVE directive named `<name>` in an agent's bank (is_active=false, never deleted, reactivatable), the M3 directive-placement campaign entry point for retiring a guardrail's in-bank copy once it's relocated to the agent's CLAUDE.md. Refuses rules-block-marked directives, is idempotent, and supports `--dry-run` / `--json`.
+
+### Bug fixes
+
+- **hindsight/async-prefetch: close the M4 pre-flip gate bugs (#4776)** — hardens the async recall-prefetch path so it is safe to enable later; every change stays dark behind `memoryPrefetchEnabled` (default off) and is inert on today's fleet. The Stop-hook producer now gates junk turns off the transcript's last human turn instead of a phantom `prompt` field (F6) and curates candidates through the shared recall pipeline — demote-drop, relevance sort, score floor, `recallMaxMemories` cap — before buffering (F5). The consumer no longer re-serves an already-consumed buffer as fresh across later turns (F3), and a cold/first turn with no warm buffer now falls through to synchronous recall instead of emitting a degraded banner with zero memories (F4). Adds a dark-by-default doctor check (`detectPrefetchAsyncTimeoutDrift`) that flags an unsafe async-timeout envelope once an agent enables prefetch. No flag is flipped.
+
+### Refactoring
+
+- **error-classification: unify connection-drop detection across both classifier paths (PR 0)** — a mid-stream connection / SSE drop is now identifiable as such on BOTH `parseLlmError` (the LLM-error presentation path) and `detectErrorInTranscriptLine` (the sub-agent transcript path), via one canonical `isConnectionDropText` matcher. Both paths expose a new `connectionDrop` boolean, gated to the transient/unknown/transport families so an auth/quota/overload/provider-credit wall is never mislabelled a drop. Classification only — no auto-resume or retry behaviour changes; this is groundwork for two later PRs.
+
 ## v0.21.18 — Memory v2 M3 directive-flip release tooling: flip-preflight count/budget gate, Tier-1 directive-equivalence drift check, Tier-2 behavioural probe runner
 
 ### Features
@@ -25399,6 +25413,7 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
 
