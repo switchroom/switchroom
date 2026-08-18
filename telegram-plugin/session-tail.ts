@@ -42,6 +42,7 @@ function isMultiAgentEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 import { classifyClaudeError, type OperatorEventKind } from './operator-events.js'
 import { isLitellmProxyLocal429, isTransientUpstreamSignal } from './model-unavailable.js'
+import { isConnectionDropText } from './connection-drop.js'
 import { createToolLabelSidecar, type ToolLabelSidecar, type SidecarOptions } from './tool-label-sidecar.js'
 import { isModelSentinel } from './model-label.js'
 
@@ -960,6 +961,25 @@ function extractRetryState(obj: Record<string, unknown>): {
   }
 }
 
+/**
+ * The OperatorEventKinds on which a connection-drop wording may be flagged as a
+ * genuine transport drop. INCLUSION (not exclusion) by design: a positively
+ * classified auth/quota/credit/rate-limit/overload wall is NEVER in this set,
+ * so a wrapped terminal error whose outer text coincidentally carries a drop
+ * wording is never mislabelled a drop. `transport-transient` is the natural
+ * mid-stream-abort kind; `unknown-4xx`/`unknown-5xx` is where a drop-worded
+ * line lands when `classifyClaudeError` does not recognise its wording (the
+ * exact Path-B bug this closes). Mirrors Path A's `transient`/`unknown` gate in
+ * `parseLlmError`, keeping the two classifiers in agreement.
+ */
+const CONNECTION_DROP_ELIGIBLE_KINDS: ReadonlySet<OperatorEventKind> =
+  new Set<OperatorEventKind>(['transport-transient', 'unknown-5xx', 'unknown-4xx'])
+
+/** True when `kind` may carry the connection-drop flag AND the text is a drop wording. */
+function isConnectionDrop(kind: OperatorEventKind, scanText: string): boolean {
+  return CONNECTION_DROP_ELIGIBLE_KINDS.has(kind) && isConnectionDropText(scanText)
+}
+
 export function detectErrorInTranscriptLine(
   line: string,
 ): {
@@ -972,6 +992,15 @@ export function detectErrorInTranscriptLine(
    *  error mid-retry is `transient:true, terminal:false`; the caller
    *  suppresses it (no operator card until the failure is terminal). */
   terminal: boolean
+  /**
+   * True when this line is a mid-stream connection / SSE drop (a transport
+   * connection loss), per the canonical `isConnectionDropText` matcher, gated
+   * to the transport/unknown kinds. Set consistently with `parseLlmError`'s
+   * `ParsedLlmError.connectionDrop` so a later PR can gate auto-resume on ONE
+   * reliable discriminator across both classification paths. Classification
+   * only in this PR; no caller acts on it yet.
+   */
+  connectionDrop: boolean
 } | null {
   if (!line || line.length > 2 * 1024 * 1024) return null
   let obj: Record<string, unknown>
@@ -1042,6 +1071,7 @@ export function detectErrorInTranscriptLine(
       detail: text || errStr || 'api error',
       transient: kind === 'rate-limited',
       terminal: true,
+      connectionDrop: isConnectionDrop(kind, `${text}\n${errStr}`),
     }
   }
 
@@ -1089,7 +1119,14 @@ export function detectErrorInTranscriptLine(
       ? retry.retryAttempt >= retry.maxRetries
       : isErrorLine
 
-  return { kind, raw, detail, transient, terminal }
+  return {
+    kind,
+    raw,
+    detail,
+    transient,
+    terminal,
+    connectionDrop: isConnectionDrop(kind, `${detail}\n${String(type ?? '')}`),
+  }
 }
 
 function extractDetailMessage(obj: Record<string, unknown> | null): string | null {

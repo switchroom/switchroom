@@ -41,6 +41,7 @@ import {
   type ProviderCreditEntry,
 } from './provider-credit.js'
 import { classifyClaudeError } from './operator-events.js'
+import { isConnectionDropText } from './connection-drop.js'
 import { stripRawErrorBytes, extractRequestId } from './raw-error-scrub.js'
 import { fmtLocalClock, tzAbbrev } from './shared/local-time.js'
 
@@ -94,6 +95,18 @@ export interface ParsedLlmError {
    */
   providerId?: string
   source: LlmErrorSource
+  /**
+   * True when this error is a mid-stream connection / SSE drop (a transport
+   * connection loss), per the canonical {@link isConnectionDropText} matcher.
+   * Set consistently on BOTH classification paths (here and
+   * `detectErrorInTranscriptLine`) so a later PR can gate auto-resume on ONE
+   * reliable discriminator. Only ever true for the `transient`/`unknown`
+   * families — never for a positively-identified auth/quota/overload/credit
+   * wall (guarded below), so it can never trigger a wrong auto-resume of a
+   * genuinely terminal error. Classification only in this PR; no consumer acts
+   * on it yet.
+   */
+  connectionDrop: boolean
   /** True when the harness is still retrying this error internally (mid-retry). */
   autoRetrying: boolean
   /** True when the failure is final (NOT an in-flight retry). */
@@ -169,6 +182,17 @@ export function parseLlmError(
     }
   }
 
+  // Connection-drop discriminator. Gated to the transient/unknown families so a
+  // positively-classified auth/quota/overload/credit wall is NEVER flagged as a
+  // drop, even if its raw text coincidentally carries a drop wording (e.g. a
+  // LiteLLM-wrapped 401 whose outer text says "fetch failed"). The gate mirrors
+  // Path B's inclusion set (`transport-transient`/`unknown-*`), keeping the two
+  // classifiers in agreement. `source==='network'` is not required: a drop
+  // wording that `detectModelUnavailable` does not recognise (e.g. `EPIPE`)
+  // lands on `unknown` here, and must still be identifiable as a drop.
+  const connectionDrop =
+    (kind === 'transient' || kind === 'unknown') && isConnectionDropText(text)
+
   return {
     kind,
     coreText: buildCoreText(kind, source),
@@ -178,6 +202,7 @@ export function parseLlmError(
     ...(requestId != null ? { requestId } : {}),
     ...(providerId != null ? { providerId } : {}),
     source,
+    connectionDrop,
     autoRetrying,
     terminal,
   }
