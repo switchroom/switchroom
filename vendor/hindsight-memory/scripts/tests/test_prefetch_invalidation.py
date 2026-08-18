@@ -278,7 +278,9 @@ class NoDuplicateInjectionTests(InvalidationBase):
         config = self._config(prefetch_enabled=True)
         marker = "- unique-fact-abc123 decided at standup"
 
-        recall_buffer.write_buffer(SESSION, marker, {})
+        # #4778 — on-topic with the `_consume` prompt ("what did we decide") so
+        # the topic guard passes and this stays a genuine warm-buffer hit.
+        recall_buffer.write_buffer(SESSION, marker, {}, query="what did we decide")
         recall_buffer.write_sentinel(SESSION)
 
         # Turn N+1: consumer injects the buffered block once.
@@ -311,7 +313,10 @@ class ReplyPathDoesNotBlockOnRecallTests(InvalidationBase):
 
     def test_fresh_buffer_served_without_calling_recall(self):
         config = self._config(prefetch_enabled=True)
-        recall_buffer.write_buffer(SESSION, "- a prefetched memory xyz", {})
+        # #4778 — on-topic with the `_consume` prompt so the topic guard passes;
+        # the point of THIS test is that a matched fresh buffer never blocks on a
+        # synchronous recall, so the query must clear the guard.
+        recall_buffer.write_buffer(SESSION, "- a prefetched memory xyz", {}, query="what did we decide")
         recall_buffer.write_sentinel(SESSION)
 
         class _ExplodingRecallClient:

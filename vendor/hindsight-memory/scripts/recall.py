@@ -664,6 +664,21 @@ def _handle_prefetch_buffer(config: dict, hook_input: dict, prompt: str) -> bool
 
     payload, _token = recall_buffer.read_if_fresh(session_id, last_consumed_token=last_consumed)
 
+    # #4778 — TOPIC-RELEVANCE GUARD. `read_if_fresh` only proves the buffer is
+    # FRESH (a strictly-newer sentinel this session), never that it is ON TOPIC:
+    # the producer built it from turn N's last human prompt, so on a topic PIVOT
+    # a perfectly-fresh buffer holds the WRONG-topic memories. Gate the join on
+    # topical similarity between the buffered query and turn N+1's ACTUAL prompt
+    # BEFORE the directive fetch below; a mismatch marks the token consumed (so
+    # it is never reconsidered) and falls through to SYNCHRONOUS recall — which
+    # fetches correct, current-topic memories AND re-injects directives itself.
+    # This is layered ON TOP of the F3 freshness machinery, not a replacement.
+    if payload is not None and not _prefetch_topic_matches(prompt, payload.get("query", ""), config):
+        if _token is not None:
+            _write_consumed_token(session_id, _token)
+        debug_log(config, "Prefetch buffer: topic mismatch vs current prompt, falling through to synchronous recall")
+        return False
+
     # Directives stay on the synchronous, always-fresh path (M3 rule) even
     # in the fast path — fetched here directly, never from the buffer.
     directives_block = None
@@ -886,6 +901,78 @@ def _overlap_tokens(text) -> set:
         if len(tok) > 1 and tok not in _OVERLAP_STOPWORDS:
             out.add(tok)
     return out
+
+
+_PREFETCH_TOPIC_OVERLAP_DEFAULT = 0.3
+
+# #4778 review MAJOR — short-prompt Jaccard floor. Jaccard is probabilistic, not
+# absolute, on SHORT prompts: two ~2-content-token turns that share ONE incidental
+# token while EACH carries a divergent token give 1/3 = 0.333 >= 0.30 and wrongly
+# clear the ratio bar ("call mom" buffer served on a "call ended" turn — the pivot
+# signature). When either token set is small (fewer than ``MIN_SMALL_SET_TOKENS``)
+# such a partial overlap must supply at least ``_PREFETCH_MIN_SMALL_SET_INTERSECTION``
+# shared tokens, not just clear the ratio.
+#
+# The floor fires ONLY on that divergent-on-both-sides shape. It deliberately
+# EXEMPTS full containment (``intersection == min(|A|, |B|)`` — the smaller set is
+# wholly shared: identical or subset/narrowing queries like "decide" vs "decide",
+# or "restart klanker" vs "restart the klanker agent"), which is a legitimate
+# topical match regardless of brevity and must still be served. Long prompts (both
+# sides at or above ``MIN_SMALL_SET_TOKENS``) skip the floor entirely and use the
+# Jaccard ratio exactly as before. The floor only ever ANDs a stricter condition
+# onto the ratio — it can reject, never serve.
+MIN_SMALL_SET_TOKENS = 3
+_PREFETCH_MIN_SMALL_SET_INTERSECTION = 2
+
+
+def _prefetch_topic_matches(prompt, buffered_query, config) -> bool:
+    """#4778 — True iff turn N+1's ``prompt`` is topically close enough to the
+    ``buffered_query`` the M4 producer used to build the warm buffer.
+
+    Jaccard overlap (``|A∩B| / |A∪B|``) on ``_overlap_tokens`` — the same
+    stop-word-stripped, digit-preserving, dependency-free tokenizer the
+    transcript-fallback keyword match uses (unicode-safe via ``str.isalnum``,
+    characterised in ``tests/test_overlap_tokens.py``) — against
+    ``memoryPrefetchMinTopicOverlap`` (default 0.3). Jaccard, not the overlap
+    coefficient: both score 0 on a true pivot (disjoint content tokens), so the
+    correctness guarantee is identical, but Jaccard cannot be driven to 1.0 by a
+    single incidental shared token in a short prompt — it biases the residual
+    error toward a harmless false-MISS (sync recall, slower) rather than a
+    false-HIT (wrong-topic memories, the bug).
+
+    Fail-safe: an empty token set on EITHER side — a contentless prompt, or a
+    legacy/torn buffer whose ``query`` is ``""`` — returns False, so the caller
+    falls through to synchronous recall. A miss only ever costs latency; it can
+    never serve wrong-topic memories. Both sides are stripped of the ``<channel>``
+    envelope first, matching the producer's own query derivation.
+    """
+    now_tokens = _overlap_tokens(strip_channel_envelope(prompt or ""))
+    buf_tokens = _overlap_tokens(strip_channel_envelope(buffered_query or ""))
+    if not now_tokens or not buf_tokens:
+        return False
+    intersection = len(now_tokens & buf_tokens)
+    if intersection == 0:
+        return False
+    # Short-prompt floor (#4778 review MAJOR): when either side is small, a single
+    # incidental shared token must not clear the guard on the Jaccard ratio alone.
+    # Exempt full containment (intersection == smaller set) — identical/subset
+    # queries are a legitimate topical match, never the divergent-on-both-sides
+    # pivot this floor targets. ANDed with the ratio check below: stricter, never
+    # looser, and long prompts (both sides >= MIN_SMALL_SET_TOKENS) are untouched.
+    min_set = min(len(now_tokens), len(buf_tokens))
+    if min_set < MIN_SMALL_SET_TOKENS \
+            and intersection < min_set \
+            and intersection < _PREFETCH_MIN_SMALL_SET_INTERSECTION:
+        return False
+    union = len(now_tokens | buf_tokens)
+    threshold = config.get("memoryPrefetchMinTopicOverlap", _PREFETCH_TOPIC_OVERLAP_DEFAULT)
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = _PREFETCH_TOPIC_OVERLAP_DEFAULT
+    if not (0.0 <= threshold <= 1.0):
+        threshold = _PREFETCH_TOPIC_OVERLAP_DEFAULT
+    return (intersection / union) >= threshold
 
 
 def _result_final_score(m) -> float:

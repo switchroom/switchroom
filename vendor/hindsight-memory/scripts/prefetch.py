@@ -159,7 +159,13 @@ def run_prefetch(hook_input: dict, config: dict) -> bool:
 
     # Step 3 — write payload THEN sentinel, strictly in that order.
     try:
-        recall_buffer.write_buffer(session_id, memories_block, {"result_count": len(results)})
+        # #4778 — persist the speculative `query` alongside the buffer so the
+        # consumer can gate the turn-N+1 join on topical similarity, not just
+        # session freshness. Without it a fresh buffer built for THIS turn's
+        # prompt is served on next turn's prompt even after a topic pivot.
+        recall_buffer.write_buffer(
+            session_id, memories_block, {"result_count": len(results)}, query=query
+        )
         recall_buffer.write_sentinel(session_id)
     except Exception as exc:  # pragma: no cover - defensive
         debug_log(config, f"Prefetch: buffer write failed: {exc}")
