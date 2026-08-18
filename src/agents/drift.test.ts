@@ -24,6 +24,7 @@ import {
   detectComposeDrift,
   detectHookScriptDrift,
   detectHooksSurfaceDrift,
+  detectPrefetchAsyncTimeoutDrift,
   detectSkillsDrift,
 } from "./drift.js";
 
@@ -269,5 +270,110 @@ describe("detectHookScriptDrift", () => {
       },
     });
     expect(r).toEqual([]);
+  });
+});
+
+// ─── M4 deviation-5: async prefetch timeout doctor check ─────────────────────
+
+describe("detectPrefetchAsyncTimeoutDrift", () => {
+  const config = {
+    memory: { backend: "hindsight" },
+    agents: { bot: {} },
+  } as unknown as SwitchroomConfig;
+
+  function resolved() {
+    return resolveAgentConfig(config.defaults, config.profiles, config.agents["bot"]);
+  }
+
+  const PLUGIN = [".claude", "plugins", "hindsight-memory"];
+
+  function writePlugin(opts: {
+    settings: Record<string, unknown>;
+    stopHook?: Record<string, unknown> | null; // null → omit the prefetch hook
+  }): void {
+    const pluginDir = join(dir, ...PLUGIN);
+    mkdirSync(join(pluginDir, "hooks"), { recursive: true });
+    writeFileSync(join(pluginDir, "settings.json"), JSON.stringify(opts.settings, null, 2));
+    const stop: unknown[] = [
+      { hooks: [{ type: "command", command: "python3 retain.py", timeout: 15, async: true }] },
+    ];
+    if (opts.stopHook !== null) {
+      stop.push({
+        hooks: [
+          opts.stopHook ?? {
+            type: "command",
+            command: 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/prefetch.py"',
+            timeout: 20,
+            async: true,
+          },
+        ],
+      });
+    }
+    writeFileSync(
+      join(pluginDir, "hooks", "hooks.json"),
+      JSON.stringify({ hooks: { Stop: stop } }, null, 2),
+    );
+  }
+
+  it("prefetch OFF (dark) → no findings even with a broken async config", () => {
+    writePlugin({
+      settings: { memoryPrefetchEnabled: false },
+      // non-async, no timeout: would be flagged IF the flag were on
+      stopHook: { type: "command", command: "python3 prefetch.py" },
+    });
+    expect(detectPrefetchAsyncTimeoutDrift("bot", resolved(), dir, config)).toEqual([]);
+  });
+
+  it("prefetch ON with the vendor default (async:true, timeout 20) → no findings", () => {
+    writePlugin({ settings: { memoryPrefetchEnabled: true } });
+    expect(detectPrefetchAsyncTimeoutDrift("bot", resolved(), dir, config)).toEqual([]);
+  });
+
+  it("prefetch ON but the Stop hook is not async → wedge finding", () => {
+    writePlugin({
+      settings: { memoryPrefetchEnabled: true },
+      stopHook: {
+        type: "command",
+        command: 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/prefetch.py"',
+        timeout: 20,
+      },
+    });
+    const r = detectPrefetchAsyncTimeoutDrift("bot", resolved(), dir, config);
+    expect(r).toHaveLength(1);
+    expect(r[0].surface).toBe("memory-prefetch");
+    expect(r[0].agent).toBe("bot");
+    expect(r[0].detail).toContain('"async": true');
+  });
+
+  it("prefetch ON but the prefetch Stop hook is missing entirely → finding", () => {
+    writePlugin({ settings: { memoryPrefetchEnabled: true }, stopHook: null });
+    const r = detectPrefetchAsyncTimeoutDrift("bot", resolved(), dir, config);
+    expect(r).toHaveLength(1);
+    expect(r[0].detail).toContain("registers no Stop hook for prefetch.py");
+  });
+
+  it("prefetch ON but memoryPrefetchTimeoutSeconds >= async ceiling → torn-buffer finding", () => {
+    writePlugin({
+      settings: { memoryPrefetchEnabled: true, memoryPrefetchTimeoutSeconds: 25 },
+      // ceiling 20 < recall timeout 25
+    });
+    const r = detectPrefetchAsyncTimeoutDrift("bot", resolved(), dir, config);
+    expect(r).toHaveLength(1);
+    expect(r[0].detail).toContain("async hook ceiling");
+  });
+
+  it("prefetch ON but async ceiling above the max → finding", () => {
+    writePlugin({
+      settings: { memoryPrefetchEnabled: true },
+      stopHook: {
+        type: "command",
+        command: 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/prefetch.py"',
+        timeout: 120,
+        async: true,
+      },
+    });
+    const r = detectPrefetchAsyncTimeoutDrift("bot", resolved(), dir, config);
+    expect(r).toHaveLength(1);
+    expect(r[0].detail).toContain("maximum");
   });
 });

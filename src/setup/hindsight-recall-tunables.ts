@@ -350,6 +350,126 @@ export function renderHindsightHooksOverrides(
   return JSON.stringify(root, null, 2) + "\n";
 }
 
+/** Marker identifying the async prefetch-producer hook command in hooks.json. */
+const PREFETCH_HOOK_COMMAND_MARKER = "prefetch.py";
+
+/**
+ * Vendor/shipped async ceiling for the Stop-hook prefetch producer (seconds).
+ * Claude Code kills the async `prefetch.py` Stop hook at this bound — the
+ * "20s-timeout prefetch" the M4 carve names.
+ */
+export const DEFAULT_PREFETCH_ASYNC_TIMEOUT_SECONDS = 20;
+
+/**
+ * Upper bound on a sane prefetch async ceiling. A Stop hook that can run this
+ * long holds a background slot for the whole window if the producer wedges;
+ * beyond it the "wedged 20s prefetch" becomes a multi-minute wedge. Matches
+ * the session_start async hook's own 30s ceiling.
+ */
+export const MAX_PREFETCH_ASYNC_TIMEOUT_SECONDS = 30;
+
+/** The observed shape of the prefetch Stop hook in a deployed hooks.json. */
+export interface PrefetchHookShape {
+  /** A Stop hook whose command references prefetch.py is registered. */
+  present: boolean;
+  /** That hook carries `"async": true`. */
+  async: boolean;
+  /** Its timeout in seconds, or null when absent / non-numeric. */
+  timeout: number | null;
+}
+
+/**
+ * Read the async prefetch producer's Stop-hook shape out of a deployed
+ * `hooks.json` (M4 deviation-5). Scans the Stop matchers for the entry whose
+ * command references `prefetch.py` and reports whether it is registered,
+ * marked `"async": true`, and its timeout ceiling. Never throws — malformed
+ * JSON or a missing hook yields `{present:false,...}` so the caller can treat
+ * absence as "nothing to validate" rather than a crash.
+ */
+export function readHooksPrefetchAsyncTimeout(raw: string): PrefetchHookShape {
+  const absent: PrefetchHookShape = { present: false, async: false, timeout: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return absent;
+  }
+  const hooks = (parsed as Record<string, unknown> | null)?.hooks;
+  if (hooks == null || typeof hooks !== "object") return absent;
+  const matchers = (hooks as Record<string, unknown>).Stop;
+  if (!Array.isArray(matchers)) return absent;
+  for (const matcher of matchers) {
+    const inner = (matcher as Record<string, unknown> | null)?.hooks;
+    if (!Array.isArray(inner)) continue;
+    for (const hook of inner) {
+      const h = hook as Record<string, unknown> | null;
+      if (h == null || typeof h.command !== "string") continue;
+      if (!h.command.includes(PREFETCH_HOOK_COMMAND_MARKER)) continue;
+      return {
+        present: true,
+        async: h.async === true,
+        timeout: typeof h.timeout === "number" ? h.timeout : null,
+      };
+    }
+  }
+  return absent;
+}
+
+/**
+ * Validate the async prefetch producer's timeout envelope (M4 deviation-5).
+ * Returns a list of human-readable problems; empty means the async-timeout
+ * config is coherent. Detects the ways a prefetch can WEDGE a turn:
+ *
+ *   - the Stop hook is missing entirely (nothing to reap),
+ *   - it is NOT `async`, so it blocks every turn's completion for its timeout,
+ *   - it has no positive timeout, so a wedged producer is never killed,
+ *   - the timeout exceeds {@link MAX_PREFETCH_ASYNC_TIMEOUT_SECONDS}, or
+ *   - the producer's own recall timeout (`memoryPrefetchTimeoutSeconds`) meets
+ *     or exceeds the hook ceiling, so the producer can outlive its hook and be
+ *     SIGKILLed mid buffer-write, leaving a torn buffer.
+ */
+export function validatePrefetchAsyncTimeout(
+  shape: PrefetchHookShape,
+  prefetchRecallTimeoutSeconds: number,
+): string[] {
+  const problems: string[] = [];
+  if (!shape.present) {
+    problems.push(
+      "hooks/hooks.json registers no Stop hook for prefetch.py (the async " +
+        "recall-prefetch producer)",
+    );
+    return problems; // nothing further is checkable
+  }
+  if (!shape.async) {
+    problems.push(
+      'the prefetch.py Stop hook is not marked `"async": true` — a synchronous ' +
+        "prefetch blocks every turn's completion for up to its timeout",
+    );
+  }
+  if (shape.timeout === null || shape.timeout <= 0) {
+    problems.push(
+      "the prefetch.py Stop hook has no positive `timeout` (async ceiling) — a " +
+        "wedged producer would never be reaped",
+    );
+    return problems; // the numeric comparisons below need a real ceiling
+  }
+  if (shape.timeout > MAX_PREFETCH_ASYNC_TIMEOUT_SECONDS) {
+    problems.push(
+      `the prefetch.py async ceiling is ${shape.timeout}s, above the ` +
+        `${MAX_PREFETCH_ASYNC_TIMEOUT_SECONDS}s maximum — a wedged producer holds a ` +
+        `background slot for that long`,
+    );
+  }
+  if (prefetchRecallTimeoutSeconds >= shape.timeout) {
+    problems.push(
+      `memoryPrefetchTimeoutSeconds ${prefetchRecallTimeoutSeconds}s is >= the ` +
+        `${shape.timeout}s async hook ceiling — the producer's own recall can outlive ` +
+        `its hook and be SIGKILLed mid buffer-write, leaving a torn buffer`,
+    );
+  }
+  return problems;
+}
+
 /**
  * Read the effective UserPromptSubmit recall-hook ceiling out of a deployed
  * `hooks.json`. Returns `null` when the file is malformed or carries no

@@ -233,14 +233,105 @@ class KillSwitchOffTests(PrefetchPipelineBase):
 
 
 class JunkGateTests(PrefetchPipelineBase):
-    def test_task_notification_turn_is_skipped(self):
-        _write_transcript(self.transcript_path, [("user", "irrelevant")])
-        with patch("prefetch.retain_module.run_retain", side_effect=AssertionError("must not retain a task-notification turn")):
-            wrote = prefetch.run_prefetch(
-                self._hook_input("<task-notification>done</task-notification>"), self._config()
-            )
+    def test_task_notification_in_transcript_skips_before_retain(self):
+        # F6 (regression guard): a real Stop-hook input carries NO `prompt`
+        # field — only session_id / transcript_path / stop_hook_active — so the
+        # junk gate MUST derive from the transcript's last human turn. When that
+        # turn is a `<task-notification>` envelope, prefetch skips ENTIRELY:
+        # no delta retain, no recall, no buffer. This fails on the pre-fix code,
+        # whose `hook_input.get("prompt")` gate is permanently empty on real
+        # input and therefore lets retain run on a task-notification turn.
+        _write_transcript(
+            self.transcript_path,
+            [("user", "<task-notification>sub-agent done</task-notification>")],
+        )
+        real_stop_input = {
+            "session_id": SESSION,
+            "transcript_path": self.transcript_path,
+            "stop_hook_active": True,
+            "cwd": "/tmp",
+        }  # deliberately NO `prompt` / `user_prompt` key — mirrors real input
+        retain_spy = mock.Mock(return_value={"status": "ok"})
+        with patch("prefetch.retain_module.run_retain", retain_spy):
+            wrote = prefetch.run_prefetch(real_stop_input, self._config())
         self.assertFalse(wrote)
+        retain_spy.assert_not_called()
         self.assertFalse(os.path.isfile(recall_buffer._buffer_path(SESSION)))
+        self.assertFalse(os.path.isfile(recall_buffer._sentinel_path(SESSION)))
+
+    def test_gate_keys_off_transcript_not_a_phantom_prompt_field(self):
+        # The mirror of the above: a genuine human turn in the transcript with
+        # a STRAY `prompt="<task-notification>"` on the hook input (the shape the
+        # old harness faked). The gate must key off the transcript (a real turn)
+        # and PROCEED, proving it no longer reads `hook_input["prompt"]`. Fails
+        # on the pre-fix code, which reads the phantom field and wrongly skips.
+        _write_transcript(self.transcript_path, [("user", "we shipped the release on friday")])
+        client = mock.Mock()
+        client.recall.side_effect = lambda *a, **kw: {"results": [
+            {"text": "we shipped the release on friday", "type": "fact",
+             "mentioned_at": "2026-01-01", "id": "r1", "scores": {"final": 0.9}},
+        ]}
+        hook_input = {
+            "session_id": SESSION,
+            "transcript_path": self.transcript_path,
+            "prompt": "<task-notification>phantom</task-notification>",
+            "cwd": "/tmp",
+        }
+        with patch("prefetch.retain_module.run_retain", return_value={"status": "ok"}), \
+                patch("prefetch.HindsightClient", return_value=client), \
+                patch("prefetch.get_api_url", return_value="http://fake"):
+            wrote = prefetch.run_prefetch(hook_input, self._config())
+        self.assertTrue(wrote)
+        self.assertTrue(os.path.isfile(recall_buffer._buffer_path(SESSION)))
+
+
+class CurationSharingTests(PrefetchPipelineBase):
+    """F5 — the producer must run recalled candidates through recall's shared
+    curation pipeline (demote-drop + `recallMaxMemories` cap) BEFORE buffering,
+    so the buffer path cannot inject what the synchronous path would filter."""
+
+    def _run_with_results(self, results, config):
+        _write_transcript(self.transcript_path, [("user", "what do you remember about deploys")])
+        client = mock.Mock()
+        client.recall.side_effect = lambda *a, **kw: {"results": [dict(m) for m in results]}
+        with patch("prefetch.retain_module.run_retain", return_value={"status": "ok"}), \
+                patch("prefetch.HindsightClient", return_value=client), \
+                patch("prefetch.get_api_url", return_value="http://fake"):
+            wrote = prefetch.run_prefetch(self._hook_input("what do you remember about deploys"), config)
+        buffered = ""
+        if wrote:
+            payload = recall_buffer._read_buffer_payload(SESSION) or {}
+            buffered = payload.get("context") or ""
+        return wrote, buffered
+
+    def test_demote_tagged_memory_is_dropped_before_buffering(self):
+        results = [
+            {"text": "keep me visible", "type": "fact", "mentioned_at": "2026-01-01",
+             "id": "k1", "scores": {"final": 0.9}},
+            {"text": "secret demoted note", "type": "fact", "mentioned_at": "2026-01-01",
+             "id": "d1", "scores": {"final": 0.8}, "tags": ["demote-from-recall"]},
+        ]
+        _wrote, buffered = self._run_with_results(results, self._config())
+        self.assertIn("keep me visible", buffered)
+        self.assertNotIn(
+            "secret demoted note", buffered,
+            "a demote-from-recall memory must never reach the prefetch buffer",
+        )
+
+    def test_candidate_set_above_cap_is_truncated_before_buffering(self):
+        results = [
+            {"text": f"candidate {i}", "type": "fact", "mentioned_at": "2026-01-01",
+             "id": f"m{i}", "scores": {"final": 1.0 - i * 0.01}}
+            for i in range(12)
+        ]
+        config = self._config()
+        config["recallMaxMemories"] = 8
+        _wrote, buffered = self._run_with_results(results, config)
+        injected = sum(1 for i in range(12) if f"candidate {i}" in buffered)
+        self.assertEqual(
+            injected, 8,
+            "the prefetch buffer must honour recallMaxMemories, same as the sync path",
+        )
 
 
 if __name__ == "__main__":
