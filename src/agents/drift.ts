@@ -48,6 +48,8 @@ import {
   resolveHindsightRecallTunables,
   resolveHindsightRecallCaps,
   readHooksRecallTimeout,
+  readHooksPrefetchAsyncTimeout,
+  validatePrefetchAsyncTimeout,
   type RecallTunableInput,
   type RecallCapInput,
 } from "../setup/hindsight-recall-tunables.js";
@@ -560,6 +562,89 @@ export function detectHindsightRecallTunableDrift(
   return findings;
 }
 
+/**
+ * M4 deviation-5 — async prefetch timeout doctor check.
+ *
+ * The async recall-prefetch producer runs as a `Stop` hook (`prefetch.py`,
+ * `"async": true`, `"timeout": 20`). A misconfigured async ceiling is the
+ * "wedged 20s-timeout prefetch" the M4 hardening carve names: a prefetch that
+ * is not async blocks the turn; one with no/too-large a ceiling is never
+ * reaped; one whose ceiling sits under its own recall timeout gets SIGKILLed
+ * mid buffer-write and leaves a torn buffer.
+ *
+ * PRE-FLIP / DARK BY DEFAULT: the whole async-prefetch mechanism is inert
+ * until an agent flips `memoryPrefetchEnabled` on in its deployed settings.json
+ * (there is no fleet default and no yaml channel yet). This check reads that
+ * deployed flag and returns NO findings while it is off — so it is a complete
+ * no-op on today's fleet, exactly like the runtime path it guards. It only
+ * fires once an agent has actually enabled prefetch AND its async-timeout
+ * config is unsafe.
+ */
+export function detectPrefetchAsyncTimeoutDrift(
+  name: string,
+  agentConfig: AgentConfig,
+  agentDir: string,
+  config: SwitchroomConfig,
+): DriftFinding[] {
+  if (!isHindsightEnabled(config)) return [];
+
+  const resolved = resolveAgentConfig(config.defaults, config.profiles, agentConfig);
+  if (resolved.memory?.auto_recall === false) return [];
+
+  const pluginDir = join(agentDir, ".claude", "plugins", "hindsight-memory");
+  if (!existsSync(pluginDir)) return [];
+
+  const settingsPath = join(pluginDir, "settings.json");
+  if (!existsSync(settingsPath)) return [];
+  let settings: Record<string, unknown> | null = null;
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return []; // the recall-tunable drift row owns settings.json malformed
+  }
+  // Dark-by-default gate: nothing to validate unless prefetch is actually on
+  // for this agent. This is what keeps the check inert pre-flip.
+  if (settings?.memoryPrefetchEnabled !== true) return [];
+
+  const hooksPath = join(pluginDir, "hooks", "hooks.json");
+  if (!existsSync(hooksPath)) return []; // absence is the hooks drift row's job
+
+  let shape;
+  try {
+    shape = readHooksPrefetchAsyncTimeout(readFileSync(hooksPath, "utf-8"));
+  } catch {
+    return [];
+  }
+
+  // The producer's own recall HTTP timeout (prefetch.py:
+  // config.get("memoryPrefetchTimeoutSeconds", 5)). Must fit UNDER the async
+  // hook ceiling so the producer can't outlive its own hook.
+  const rawPrefetchTimeout = settings.memoryPrefetchTimeoutSeconds;
+  const prefetchRecallTimeout =
+    typeof rawPrefetchTimeout === "number" && Number.isFinite(rawPrefetchTimeout) && rawPrefetchTimeout > 0
+      ? rawPrefetchTimeout
+      : 5;
+
+  const problems = validatePrefetchAsyncTimeout(shape, prefetchRecallTimeout);
+  if (problems.length === 0) return [];
+
+  return [
+    {
+      surface: "memory-prefetch",
+      agent: name,
+      detail:
+        `async recall-prefetch (memoryPrefetchEnabled) is ON but its async-timeout ` +
+        `config is unsafe: ${problems.join("; ")}`,
+      fix:
+        "Re-stamp the plugin (`switchroom apply`) so hooks.json carries the " +
+        '`prefetch.py` Stop hook with `"async": true` and a timeout above ' +
+        "memoryPrefetchTimeoutSeconds, or set memoryPrefetchEnabled off until the " +
+        "async ceiling is corrected — a wedged prefetch either blocks the turn or " +
+        "is killed mid buffer-write.",
+    },
+  ];
+}
+
 // ─── Aggregation + per-agent report file (boot-card handoff) ────────────────
 
 /** Basename of the per-agent drift report the boot-card probe reads. */
@@ -633,6 +718,9 @@ export function detectAgentDrift(
   findings.push(...detectSkillsDrift(name, agentDir));
   findings.push(
     ...detectHindsightRecallTunableDrift(name, agentConfig, agentDir, config),
+  );
+  findings.push(
+    ...detectPrefetchAsyncTimeoutDrift(name, agentConfig, agentDir, config),
   );
   if (!opts.skipContainerProbes) {
     findings.push(
