@@ -17,6 +17,13 @@ hand-written entries under it still count for the guard, but they conflict
 with every other open PR — prefer a fragment.
 -->
 
+## v0.21.20 — M4 prefetch topic-relevance guard + hindsight plugin build-drift doctor check
+
+### Bug fixes
+
+- **memory: gate the M4 async recall-prefetch buffer join on topic relevance (#4778).** The async prefetch warms a recall buffer at the end of turn N keyed on that turn's prompt; turn N+1 could join it purely on session-freshness, so a topic pivot ("kill the deploy" → "what's for dinner") served the previous turn's memories. `recall.py` now runs a Jaccard topic-overlap gate (`memoryPrefetchMinTopicOverlap`, default `0.3`) between the buffer's originating query and the current prompt before serving, with a small-set intersection floor so a single incidental shared token can't clear the bar on very short prompts (while still exempting an identical or narrowing follow-up). Any miss falls through to synchronous recall — never a wrong-topic serve, never a crashed turn. M4 remains off by default (`memoryPrefetchEnabled`).
+- **doctor: detect vendored hindsight-memory plugin BUILD drift by hashing the `scripts/` tree, not the manifest version (#4779).** The plugin manifest `version` sat at `0.4.0` across the entire M4/M5 rewrite, so a version-string check could not tell a June pre-M4 tree from the shipped build — `test-harness` (`auto_recall: false`) silently kept a frozen pre-M4 plugin tree that `apply` refreshed for every recall-enabled agent but never touched. A new `switchroom doctor` / boot-card drift row (`detectHindsightPluginTreeDrift`) hashes each agent's deployed plugin `scripts/`+`lib/` tree against the release vendor build and warns on any missing / changed / stale-extra file, regardless of `auto_recall`. `installHindsightPlugin` now self-heals: the memory-off early-outs remove any stale tree instead of ignoring it, so `apply` becomes a fixed point (current plugin when recall is on, no tree when off — never stale). Plugin manifest bumped `0.4.0` → `0.5.0` with a documented per-change bump scheme.
+
 ## v0.21.19 — M4 async recall-prefetch hardening, directive-deactivate CLI, connection-drop classification
 
 ### Features
@@ -25413,6 +25420,7 @@ foundations (#624, #627) are inherited from v0.5.0 unchanged.
 ## v0.2.0 — 2026-04-23
 
 Bumps the package to v0.2.0 and threads build provenance through to the greeting card so users can see which release each agent is running and how stale it is.
+
 
 
 
