@@ -266,7 +266,7 @@ jobs:
         # "pull access denied" against the (non-existent)
         # docker.io/switchroom/base image.
         if: steps.img-cache.outputs.cache-hit != 'true'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
         with:
           driver: docker
 
@@ -468,7 +468,7 @@ jobs:
         # steps are `RUN python3 - <<'PYEOF'` heredocs, which the legacy builder
         # silently no-ops (feeding python empty stdin), leaving every patch
         # unapplied.
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
         with:
           driver: docker
 
