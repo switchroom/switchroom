@@ -485,7 +485,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) base ${{ matrix.arch }}
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: docker/Dockerfile.base
@@ -758,7 +758,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) ${{ matrix.image.name }} ${{ matrix.arch }}
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: ${{ matrix.image.file }}
@@ -912,7 +912,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) ${{ matrix.image.name }} ${{ matrix.arch }}
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: ${{ matrix.image.file }}
@@ -1095,7 +1095,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) hindsight ${{ matrix.arch }}
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: docker/Dockerfile.hindsight
@@ -1270,7 +1270,7 @@ jobs:
           fi
 
       - name: Build (and push on main/tag) voice
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: docker/Dockerfile.voice
