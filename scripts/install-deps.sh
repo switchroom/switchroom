@@ -38,6 +38,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 main() {
 
+# macOS has no getent and no apt. Fail here, before either command, so the
+# error is the missing Linux installer rather than "getent: command not found".
+if [ "$(uname -s)" = "Darwin" ]; then
+  die "install-deps.sh uses apt and only runs on Linux. On macOS use ./install.sh for the CLI, and install Docker Desktop plus Node.js 20.11+ yourself (nodejs.org or a user prefix; Homebrew is optional)."
+fi
+
 # Resolve the invoking user even when called via `sudo`. The bun install
 # writes to ~/.bun, which must end up in the operator's home, not /root.
 target_user="${SUDO_USER:-$(id -un)}"
