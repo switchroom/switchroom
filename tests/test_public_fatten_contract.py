@@ -153,9 +153,27 @@ class PublicFattenContractTests(unittest.TestCase):
             DOCKERFILE.read_text(encoding="utf-8"),
             r"(?m)^\s*COPY\s+.*linear-agents\.json",
         )
+        # package.json and the plugin contract are machine inputs, not prose: the
+        # bare product name has no reason to be there, so keep the strict check.
+        for relative in ("package.json", "contracts/plugins.json"):
+            with self.subTest(path=relative):
+                self.assertNotIn(
+                    "switch" + "room", (ROOT / relative).read_text(encoding="utf-8").lower()
+                )
         contract = json.loads(PLUGINS_CONTRACT.read_text(encoding="utf-8"))
-        self.assertNotIn("honcho", json.dumps(contract).lower())
+        # Honcho is a reviewed default (upstream image by digest); its source and
+        # deployment identity stay out of the contract.
+        honcho = [
+            d for d in contract["public_base"]["default_set"] if "honcho" in json.dumps(d).lower()
+        ]
+        self.assertEqual([d["id"] for d in honcho], ["honcho-memory"])
+        self.assertIs(honcho[0]["source"]["vendored"], False)
+        self.assertNotIn("honcho", json.dumps(contract["components"]).lower())
+        for token in ("workspace_id", "honcho_api_key"):
+            self.assertNotIn(token, json.dumps(contract).lower())
+        # Nothing ships default-on until the starter overlay enables it.
         self.assertFalse(any(item["default_enabled"] for item in contract["components"]))
+        self.assertTrue(all(d["status"] == "planned" for d in contract["public_base"]["default_set"]))
 
     def test_inherited_runtime_keeps_entrypoint_and_requires_uid_1000(self) -> None:
         text = (ROOT / "scripts/verify-inherited-runtime-config.py").read_text(

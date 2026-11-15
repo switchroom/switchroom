@@ -15,7 +15,7 @@ Principles are the gradient half of "built well" (defaults, ceremony, evidence, 
 
 Sensible defaults. Security through **enforced boundaries**, not warning-heavy configuration copy.
 
-Nobody wants to learn Fleet. They want to run Hermes without one agent taking down another. The product should be usable without reading `docs/` first. Errors say what to do next. Optional plugins stay off until the operator turns them on.
+Nobody wants to learn Fleet. They want to run Hermes without one agent taking down another. The product should be usable without reading `docs/` first. Errors say what to do next. Only the reviewed default set ([rfcs/default-on-distribution.md](rfcs/default-on-distribution.md)) may be on by default; everything else stays off until the operator turns it on. A default degrades cleanly when its credential is missing and adds no paid path the principal did not grant.
 
 ### Check
 
@@ -25,7 +25,8 @@ Nobody wants to learn Fleet. They want to run Hermes without one agent taking do
 
 ### Examples
 
-- Good: one container, volume, and network per profile, Docker socket off, plugins disabled by default.
+- Good: one container, volume, and network per profile, Docker socket off, only reviewed defaults on, and a default with no credential turning itself off and saying so instead of blocking startup.
+- Bad: a default that silently falls back to an API key, or an unreviewed plugin switched on by default.
 - Bad: a long README of "make sure you don't share credentials" with a shared network still on.
 
 ## 2. Ceremony matches user-visible change

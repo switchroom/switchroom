@@ -170,8 +170,15 @@ class PublicProductTests(unittest.TestCase):
         self.assertEqual(image["runtime"]["network"]["default"], "dedicated_per_profile_bridge")
         self.assertEqual(config["desired_state"]["unknown_key_policy"], "fail_closed")
         self.assertEqual(config["desired_state"]["secret_value_policy"], "reject")
-        self.assertEqual(plugins["public_base"]["default_enabled_plugins"], [])
+        # Reviewed default set (reference/rfcs/default-on-distribution.md). Nothing
+        # is shipped yet, so nothing is on today; tests/test_default_on_contract.py
+        # pins the exact list, degrade behaviour and billing.
+        self.assertEqual(plugins["public_base"]["policy"], "reviewed_default_set")
+        self.assertTrue(all(d["status"] == "planned" for d in plugins["public_base"]["default_set"]))
         self.assertTrue(all(not item["default_enabled"] for item in plugins["components"]))
+        self.assertTrue(
+            all(item["default_role"] in {"default", "opt_in", "off"} for item in plugins["components"])
+        )
         contract_text = "\n".join(
             (ROOT / relative).read_text(encoding="utf-8").lower()
             for relative in ("contracts/image.json", "contracts/config.json", "contracts/plugins.json")
@@ -179,12 +186,21 @@ class PublicProductTests(unittest.TestCase):
         for prohibited in (
             "private_house",
             "runtime_secret_broker",
-            "honcho",
             "secret-broker",
             "house-policy",
+            # Honcho is a reviewed default now; its deployment identity is not.
+            "workspace_id",
+            "honcho_api_key",
         ):
             with self.subTest(prohibited=prohibited):
                 self.assertNotIn(prohibited, contract_text)
+        # Honcho may appear only in plugins.json as the upstream-image memory
+        # default, never in the image or config contracts.
+        for relative in ("contracts/image.json", "contracts/config.json"):
+            self.assertNotIn("honcho", (ROOT / relative).read_text(encoding="utf-8").lower())
+        honcho = [d for d in plugins["public_base"]["default_set"] if "honcho" in json.dumps(d).lower()]
+        self.assertEqual([d["id"] for d in honcho], ["honcho-memory"])
+        self.assertIs(honcho[0]["source"]["vendored"], False)
         self.assertEqual(image["publication"]["implementation_state"], "protected_release_workflow")
 
     def test_tracked_public_text_has_no_household_profile_identities(self) -> None:
