@@ -161,20 +161,28 @@ def audit_map(secret_map: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def _yaml_loader() -> Any:
+    try:
+        import yaml  # type: ignore
+        return yaml.safe_load
+    except ImportError:
+        pass
+    try:
+        from ruamel.yaml import YAML  # type: ignore
+    except ImportError as exc:
+        raise MapError("reading config.yaml needs PyYAML or ruamel.yaml") from exc
+    return YAML(typ="safe").load
+
+
 def _load_config(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
-    if path.suffix == ".json":
-        data = json.loads(text)
-    else:
-        try:
-            import yaml  # type: ignore
-            data = yaml.safe_load(text)
-        except ImportError:
-            try:
-                from ruamel.yaml import YAML  # type: ignore
-            except ImportError as exc:
-                raise MapError("reading config.yaml needs PyYAML or ruamel.yaml") from exc
-            data = YAML(typ="safe").load(text)
+    load = json.loads if path.suffix == ".json" else _yaml_loader()
+    try:
+        data = load(text)
+    except Exception as exc:  # noqa: BLE001 - every parser error, not just ValueError
+        # Parser messages quote the offending source line, which may hold a
+        # pasted secret. Name the exception type only, and drop the chain.
+        raise MapError(f"{path.name} could not be parsed: {type(exc).__name__}") from None
     return data if isinstance(data, dict) else {}
 
 
@@ -220,7 +228,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise MapError(f"--agent-config must be AGENT=PATH for an agent in the map: {agent or raw!r}")
             try:
                 config = _load_config(Path(path))
-            except (OSError, ValueError) as exc:
+            except MapError as exc:
+                raise MapError(f"cannot read the config for {agent}: {exc}") from None
+            except Exception as exc:  # noqa: BLE001 - the message may quote config content
                 raise MapError(f"cannot read the config for {agent}: {type(exc).__name__}") from None
             findings.extend(audit_config(secret_map, agent, config))
             checked.append(agent)

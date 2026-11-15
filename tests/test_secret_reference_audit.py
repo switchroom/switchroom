@@ -13,6 +13,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -147,6 +148,64 @@ class SecretReferenceAuditTests(unittest.TestCase):
             "HERMES_KOKORO_SIDECAR_TOKEN": ref("example-shared", "voice-sidecar", "token")}}}}))
         rc, out = run_cli("--map", str(EXAMPLE), "--agent-config", f"ops={path}")
         self.assertEqual(rc, 0, out["text"])
+
+    def _malformed_config(self, suffix: str = ".yaml") -> Path:
+        # An unterminated quoted scalar on the line that holds the value: the
+        # parser's error mark quotes exactly that line.
+        path = self.base / f"config{suffix}"
+        path.write_text("secrets:\n  onepassword:\n    env:\n"
+                        f"      PERPLEXITY_API_KEY: \"{VALUE_MARKER}\n    other: [\n")
+        return path
+
+    def _assert_parse_error_is_quiet(self, path: Path) -> None:
+        rc, out = run_cli("--map", str(EXAMPLE), "--agent-config", f"ops={path}")
+        self.assertEqual(rc, 2, out["text"])
+        self.assertEqual(out["json"]["result"], "error")
+        self.assertNotIn(VALUE_MARKER, out["text"])
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_malformed_config_yaml_is_not_echoed_under_pyyaml(self) -> None:
+        path = self._malformed_config()
+        # Precondition: PyYAML's own message quotes the secret-bearing line.
+        with self.assertRaises(yaml.YAMLError) as caught:
+            yaml.safe_load(path.read_text())
+        self.assertNotIsInstance(caught.exception, ValueError)
+        self.assertIn(VALUE_MARKER, str(caught.exception))
+        self._assert_parse_error_is_quiet(path)
+
+    def test_malformed_config_yaml_is_not_echoed_under_ruamel(self) -> None:
+        try:
+            import ruamel.yaml  # type: ignore  # noqa: F401
+        except ImportError:
+            self.skipTest("ruamel.yaml not installed")
+        with mock.patch.dict(sys.modules, {"yaml": None}):  # force the ruamel path
+            self._assert_parse_error_is_quiet(self._malformed_config())
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_malformed_config_leaves_no_traceback_on_stderr(self) -> None:
+        # The real process boundary: exit code and both streams.
+        path = self._malformed_config()
+        proc = subprocess.run([sys.executable, str(SCRIPT), "--map", str(EXAMPLE), "--agent-config", f"ops={path}"],
+                              capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertNotIn(VALUE_MARKER, proc.stdout + proc.stderr)
+
+    def test_any_parser_exception_is_reduced_to_its_type(self) -> None:
+        # Parser-independent: whatever a loader raises, ValueError or not,
+        # only the exception type may reach the output.
+        class ParserBoom(Exception):
+            pass
+
+        def boom(_text: str) -> None:
+            raise ParserBoom(f"line 4: {VALUE_MARKER}")
+
+        with mock.patch.object(audit, "_yaml_loader", return_value=boom):
+            rc, out = run_cli("--map", str(EXAMPLE), "--agent-config", f"ops={self._malformed_config()}")
+        self.assertEqual(rc, 2, out["text"])
+        self.assertIn("ParserBoom", out["json"]["reason"])
+        self.assertNotIn(VALUE_MARKER, out["text"])
+        self._assert_parse_error_is_quiet(self._malformed_config(".json"))
 
     def test_rejects_bad_maps_without_echoing_them(self) -> None:
         path = self.base / "bad.json"
