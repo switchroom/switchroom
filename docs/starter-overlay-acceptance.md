@@ -1,12 +1,13 @@
 # Starter overlay acceptance in real containers
 
-This records the first run of the starter overlay, its sidecars and the rollout
-runner in real, throwaway Docker containers. Every agent was synthetic: no real
-credentials, no chat platform tokens, no vault, no messaging and no published
-host ports. Everything was torn down afterwards.
+This records two runs of the starter overlay, its sidecars and the rollout
+runner in real, throwaway Docker containers: the first run, and a
+[rerun after the real-boot fixes](#rerun-after-the-real-boot-fixes). Every
+agent was synthetic: no real credentials, no chat platform tokens, no vault, no
+messaging and no published host ports. Everything was torn down afterwards.
 
 A default in [`contracts/plugins.json`](../contracts/plugins.json) moves from
-`planned` to `shipped` only when this run proved it working in a running
+`planned` to `shipped` only when a run below proved it working in a running
 container. The rest stay `planned`, and the reason is given below.
 
 ## What ran
@@ -45,8 +46,8 @@ also started and stayed healthy.
 | `gateway-per-agent` | **shipped** | `gateway.multiplex_profiles: false` in the effective config. Each container runs its own single default gateway under s6. |
 | `quota` | **shipped** | The pinned plugin (3.0.0, git source) is enabled. The gateway mounted its routes at `/api/plugins/quota/`. Agent tool override is denied (`capability=tools.override decision=deny`). |
 | `session-reset-policy` | **shipped** | The pinned plugin logged `session-reset-policy v0.3.0 armed (pre_gateway_dispatch)`. The effective `session_reset` is `{mode: idle, idle_minutes: 240}`. |
-| `security-guidance` | planned | The image's `security-guidance` plugin is enabled in the effective config. This run did not observe it loaded with its hook registered, or a dangerous-pattern write producing its warning, so it is not proven working. HF-713's container rerun will prove it. |
-| `disk-cleanup` | planned | The mounted plugin's files match every `files_sha256` in its `UPSTREAM.json`, with patch `manual-delete-guard`. The plugin's own reader returns `session_end_mode: report_only` and `allow_manual_delete: false`. This shows the right files and settings, but the run did not observe the plugin loaded in the gateway, `/disk-cleanup quick` and `deep` refused in the container, or a session-end report that deletes nothing, so it is not proven working. HF-713's container rerun will prove it. |
+| `security-guidance` | planned | The image's `security-guidance` plugin is enabled in the effective config. This run did not observe it loaded with its hook registered, or a dangerous-pattern write producing its warning, so it is not proven working in this run. Proven in the [rerun](#rerun-after-the-real-boot-fixes). |
+| `disk-cleanup` | planned | The mounted plugin's files match every `files_sha256` in its `UPSTREAM.json`, with patch `manual-delete-guard`. The plugin's own reader returns `session_end_mode: report_only` and `allow_manual_delete: false`. This shows the right files and settings, but the run did not observe the plugin loaded in the gateway, `/disk-cleanup quick` and `deep` refused in the container, or a session-end report that deletes nothing, so it is not proven working in this run. Proven in the [rerun](#rerun-after-the-real-boot-fixes). |
 | `shared-skill-pack` | planned | The pack mounts read-only and `skills.external_dirs` is in the merged config. But Hermes's skill search reads `skills.external_dirs` only from the agent's own `config.yaml`, not from the managed file, so the search roots are only the profile's skills directory. The setup check reports `on` anyway. |
 | `secrets-connect` | planned | Off as designed: the setup check said `using the env file`. The Connect path was not run (see Sidecars). |
 | `coding-clis` | planned | Claude Code 2.1.323, Codex 0.167.2, Grok 1.0.77 and OpenCode 1.19.5 are on the path. With no logins the setup check reports each one off. Turning on needs a real login. |
@@ -112,5 +113,105 @@ the same `main`.
 - Honcho from the shipped compose, until the tiktoken cache or another fix
   lands.
 - The shared skill pack being found by Hermes's skill search.
-- `security-guidance` and `disk-cleanup` working in the running gateway (configuration and file checks only); HF-713's container rerun will prove both.
+- `security-guidance` and `disk-cleanup` working in the running gateway (configuration and file checks only); the [rerun](#rerun-after-the-real-boot-fixes) proved both.
 - Chat delivery on any platform: none was configured.
+
+## Rerun after the real-boot fixes
+
+The second run re-tested what the first run could not prove, after the fixes
+for the defects above landed, and re-checked the defaults already shipped. The
+same rules applied: synthetic agents, fake or missing credentials only, no
+messaging, no published host ports, and everything torn down afterwards.
+
+| Item | Value |
+| --- | --- |
+| Fleet source | `main` at `86c2167e8f941cdaa8e40a81108360916bd203be` |
+| Agent image | `ghcr.io/mekenthompson/hermes-fleet-public@sha256:efbdce603e15814909a1ddb0f370a42552916b8c05994ccadde85b244e6cd49c` (Fleet revision `79ef9e7`) |
+| Overlay | `examples/overlay-repo/` copied as is; `vendor/` fetched with `scripts/fetch-overlay-vendor.py --fleet-revision 86c2167…` |
+| Sidecars | `compose.sidecars.yaml` as is: Kokoro-FastAPI CPU, the one-time tokenizer fetch, Honcho and its database, all by digest |
+| Overrides | one, acceptance only: a gateway healthcheck. No extra Python modules and no Honcho fix |
+
+`86c2167` changed no image input, so no image was published for it, and the
+newest image (`79ef9e7`) has the same image inputs. The Kokoro plugin and the
+renderer and setup check that this run needed are mounted from `vendor/`, so
+`vendor/` was fetched at `86c2167`, not at the image's revision. Fetching at
+the image's revision, as the quick start says, would mount the Kokoro plugin
+and scripts from before the fixes. The first image whose revision includes
+them is the next published one.
+
+The checks ran in sibling containers that share the running agent's image,
+volumes, mounts and env file, through Hermes's own code: the plugin manager's
+discovery (`get_plugin_manager().discover_and_load()`, the same discovery the
+gateway runs, which found the same 67 plugins with 63 enabled as the gateway
+log), the agent loop's tool dispatch (`model_tools.handle_function_call`,
+which runs `pre_tool_call`, the real tool, `post_tool_call` and
+`transform_tool_result`), the gateway's plugin command call
+(`invoke_plugin_command` on the handler from `get_plugin_command_handler`),
+and `invoke_hook` for session end. No chat platform or model was configured,
+so slash commands were not typed into a chat.
+
+Both agents and every sidecar stayed up for the whole run with no restarts,
+no GPU requested, and no fatal or segfault lines in their logs.
+
+| Default | Result | Evidence |
+| --- | --- | --- |
+| `security-guidance` | **shipped** | Loaded and enabled with both hooks registered (`pre_tool_call`, `transform_tool_result`). A `write_file` of code calling `pickle.loads`, through the tool dispatch, wrote the file and returned `⚠️ Security guidance — 1 pattern matched (pickle_deserialization)`. A harmless write returned no warning. |
+| `disk-cleanup` | **shipped** | Loaded and enabled with its three hooks and the `/disk-cleanup` command. A `test_*.py` file written through the tool dispatch was tracked by the plugin's own hook. Through the registered command handler, `quick` and `deep` each returned `refused: session_end_mode is report_only ... Nothing was deleted.` The `on_session_end` hook returned `{mode: report_only, auto_candidates: 1, prompt_candidates: 0}`. The tracked file and every other file were still there afterwards. |
+| `voice` | planned (proven working, held) | Held at `planned` only because `voice` covers the `voice-provider` component, and the contract still pins that no component is on (`default_enabled`) and no shipped default covers one. Marking it shipped needs that rule decided first. What this run proved: the Kokoro CPU sidecar started with no GPU and stayed up. With the voice variables set, the effective `tts.provider` is `kokoro`, and Hermes's `text_to_speech` tool returned success from provider `kokoro` with an Ogg (`OggS`) file of about 32 KB. On CPU there is no transcription: the provider reports `this Kokoro server has no transcription`, Hermes's transcription reports the `kokoro_sidecar` provider unavailable, and nothing falls back to a hosted service. With voice off (`worker`), the effective `tts.provider` is the local `text-only` command engine and the only TTS provider configured, `tts` is in `agent.disabled_toolsets`, automatic voice replies and transcription are off, and `text_to_speech` fails from `text-only` with no hosted engine tried. |
+| `honcho-memory` | **shipped** | From the shipped compose: the one-time tokenizer fetch filled its volume and exited 0, then Honcho started with no egress network and no restarts. A synthetic message round-tripped through Honcho from both agents' own network namespaces, and `hermes memory status` showed `honcho` active and available. |
+| `shared-skill-pack` | planned (defect) | Found now: the search root is the agent's skills directory, Hermes's `skills_list` tool lists all four pack skills, and `skill_view` loads one. But Docker creates that skills directory as root (mode `755`) on a fresh state volume to hold the pack's mount point, so the agent can no longer write it: `skill_manage create` fails with `Permission denied` on the skills lock directory. The pack is found, but agents lose the ability to save their own skills. |
+| `claude-subscription-directsdk` | planned | Off with no login file and with an empty `.credentials.json`. The host render, the in-container render with `--check-files` and the setup check agree (`no Claude login found in CLAUDE_CONFIG_DIR`). The in-container render equals the host render. No model provider, fallback or Claude plugin is set or enabled, so nothing is half-on. Turning it on needs a real login. |
+| `claude-acp-connectors` | planned | Same as above, and `claude-account-connectors` has `settings.enabled: false`. Turning it on needs a real login. |
+| `model-roles` | planned | The renderer and the setup check both say off (`no granted model provider is available`), matching both providers being off. The effective model setting is Hermes's own, with no fallbacks. Turning it on needs a granted provider with a login. |
+| `linear` | planned | Off with fake IDs and a missing or empty token file; `settings.enabled: false` and the plugin is not enabled. For an empty token file the reason says the file `does not exist`, which is the wrong wording. Turning it on needs a real authorization. |
+| `coding-clis` | planned | Inside the container each CLI reports off with no login. An empty Claude login file makes `coding-clis.claude` report on, while the Claude defaults call the same file no login. Turning it on needs real logins. |
+
+The four defaults already shipped still hold on both agents: the 834-character
+doctrine prompt with smart approvals and cron, unattended and single-query runs
+denied, queue-first input and verify-on-stop; `gateway.multiplex_profiles:
+false`; the quota plugin enabled with its routes mounted and tool override
+denied; and `session-reset-policy v0.3.0 armed` with `session_reset` idle after
+240 minutes.
+
+The setup check and the renderer ran inside the image with its own `python3`
+and nothing added: `import yaml` fails there, both scripts read YAML with the
+image's `ruamel.yaml`, and both exited 0.
+
+### Isolation
+
+| From | To | Result |
+| --- | --- | --- |
+| `ops` (voice consumer) | `voice:8880/health` | HTTP 200 |
+| `ops` | speech, no token or a wrong token | HTTP 401 |
+| `worker` (voice off) | `voice` | name does not resolve |
+| new container on Docker's default bridge or on `worker`'s own network | `voice` | name does not resolve |
+| `voice` | the internet | name does not resolve (no egress) |
+| `ops` and `worker` (Honcho consumers) | `honcho:8000` | HTTP 200 |
+| `ops` (not a database consumer) | `honcho-db` | name does not resolve |
+| `honcho` | the internet | name does not resolve (no egress) |
+| new container on Docker's default bridge or on `ops`'s own network | `honcho` | name does not resolve |
+
+The voice sidecar is now on its internal `voice` network only. Only the
+tokenizer fetch joins `honcho-tiktoken-egress`, and no agent does. No container
+published a port.
+
+### Other defect found
+
+The agent's workspace volume comes up owned by root (mode `755`), so the agent
+cannot write its own workspace: `write_file` there fails with
+`Permission denied`. This is not one of the defaults, but it affects every
+agent the starter overlay starts.
+
+### Not proven in the rerun
+
+- Any default whose on-state needs a real credential: Claude logins, Linear
+  authorization, a Perplexity key, a Connect token.
+- Transcription: the CPU server has none, and the GPU variant was not run.
+  The `voice` summary in the contract still says local transcription, which
+  holds only for the GPU sidecar.
+- The gateway process's own plugin list over its API, which needs an
+  `API_SERVER_KEY` the starter does not set; plugin loading was shown through
+  the same discovery code with the same files and settings.
+- Slash commands and voice notes typed into a chat platform: none was
+  configured.
+- 1Password Connect, for the reason given above.

@@ -171,10 +171,11 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertNotIn("honcho", json.dumps(contract["components"]).lower())
         for token in ("workspace_id", "honcho_api_key"):
             self.assertNotIn(token, json.dumps(contract).lower())
-        # No component is on in the bare image, and Honcho stays planned until the
-        # shipped compose starts it (docs/starter-overlay-acceptance.md).
+        # No component is on in the bare image. Honcho is shipped: the shipped
+        # compose started it in real containers (docs/starter-overlay-acceptance.md,
+        # rerun after the real-boot fixes).
         self.assertFalse(any(item["default_enabled"] for item in contract["components"]))
-        self.assertEqual(honcho[0]["status"], "planned")
+        self.assertEqual(honcho[0]["status"], "shipped")
 
     def test_inherited_runtime_keeps_entrypoint_and_requires_uid_1000(self) -> None:
         text = (ROOT / "scripts/verify-inherited-runtime-config.py").read_text(
