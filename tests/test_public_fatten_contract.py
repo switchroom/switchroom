@@ -171,9 +171,10 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertNotIn("honcho", json.dumps(contract["components"]).lower())
         for token in ("workspace_id", "honcho_api_key"):
             self.assertNotIn(token, json.dumps(contract).lower())
-        # Nothing ships default-on until the starter overlay enables it.
+        # No component is on in the bare image, and Honcho stays planned until the
+        # shipped compose starts it (docs/starter-overlay-acceptance.md).
         self.assertFalse(any(item["default_enabled"] for item in contract["components"]))
-        self.assertTrue(all(d["status"] == "planned" for d in contract["public_base"]["default_set"]))
+        self.assertEqual(honcho[0]["status"], "planned")
 
     def test_inherited_runtime_keeps_entrypoint_and_requires_uid_1000(self) -> None:
         text = (ROOT / "scripts/verify-inherited-runtime-config.py").read_text(
