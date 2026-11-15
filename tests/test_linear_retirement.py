@@ -16,13 +16,17 @@ class LinearRetirementTests(unittest.TestCase):
         self.assertNotIn('verify-linear-policy-trust.py', dockerfile + workflow)
         self.assertNotIn('plugins/linear-agent,dst=', workflow)
 
-    def test_native_linear_remains_optional_and_documented(self):
+    def test_native_linear_is_a_planned_default_and_documented(self):
         contract = json.loads((ROOT / 'contracts/plugins.json').read_text())
         ids = [item['id'] for item in contract['components']]
         self.assertNotIn('linear-agent', ids)
         native = [item for item in contract['components'] if item['id'] == 'linear']
         self.assertEqual(len(native), 1)
         self.assertIs(native[0]['default_enabled'], False)
+        self.assertEqual(native[0]['default_role'], 'default')
+        default = [d for d in contract['public_base']['default_set'] if 'linear' in d['covers']]
+        self.assertEqual([d['id'] for d in default], ['linear'])
+        self.assertEqual(default[0]['status'], 'planned')
         self.assertIn('kanban_owns_execution', native[0]['conditions'])
         self.assertTrue((ROOT / 'plugins/linear/plugin.yaml').is_file())
         self.assertIn('plugins/linear/README.md', (ROOT / 'README.md').read_text())

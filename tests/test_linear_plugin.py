@@ -131,7 +131,13 @@ class LinearPluginUnitTests(unittest.TestCase):
         self.assertEqual((on.cli_commands, on.commands), (["linear"], ["linear-status"]))
         self.assertEqual((idle.cli_commands, idle.commands), ([], []))
         contract = json.loads((ROOT / "contracts" / "plugins.json").read_text(encoding="utf-8"))
-        self.assertFalse(next(c for c in contract["components"] if c["id"] == "linear")["default_enabled"])
+        component = next(c for c in contract["components"] if c["id"] == "linear")
+        # Reviewed default, planned: off until the starter overlay enables it, and
+        # registers nothing without its authorization (the idle case above).
+        self.assertFalse(component["default_enabled"])
+        self.assertEqual(component["default_role"], "default")
+        default = next(d for d in contract["public_base"]["default_set"] if d["id"] == "linear")
+        self.assertEqual((default["status"], default["degrade"]["behaviour"]), ("planned", "disable_and_report"))
 
     def test_production_file_inventory(self) -> None:
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),

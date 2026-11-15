@@ -60,6 +60,9 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["target"], "standalone_public_plugin")
         self.assertFalse(matches[0]["default_enabled"])
+        # Browser handoff stays opt-in, outside the reviewed default set.
+        self.assertEqual(matches[0]["default_role"], "opt_in")
+        self.assertIn("browser-handoff", [o["id"] for o in contract["public_base"]["opt_in"]])
 
     def test_readonly_source_is_generic_and_disabled(self) -> None:
         manifest = (READONLY / "plugin.yaml").read_text(encoding="utf-8")
@@ -86,7 +89,14 @@ class PublicGenericPluginTests(unittest.TestCase):
         matches = [item for item in contract["components"] if item["id"] == "voice-provider"]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["target"], "standalone_public_plugin")
+        # Reviewed default, planned: not on until the starter overlay enables it,
+        # and text-only when the sidecar URL is missing.
         self.assertFalse(matches[0]["default_enabled"])
+        self.assertEqual(matches[0]["default_role"], "default")
+        voice = [d for d in contract["public_base"]["default_set"] if "voice-provider" in d["covers"]]
+        self.assertEqual([d["id"] for d in voice], ["voice"])
+        self.assertEqual(voice[0]["status"], "planned")
+        self.assertEqual(voice[0]["degrade"]["behaviour"], "text_only_and_report")
         source = (KOKORO / "__init__.py").read_text(encoding="utf-8")
         self.assertNotIn("hermes-kokoro-sidecar", source)
         self.assertIn('parsed.scheme not in {"http", "https"}', source)
@@ -121,6 +131,13 @@ class PublicGenericPluginTests(unittest.TestCase):
         entry = [item for item in contract["components"] if item["id"] == "claude-subscription-directsdk-provider"]
         self.assertEqual(len(entry), 1)
         self.assertFalse(entry[0]["default_enabled"])
+        self.assertEqual(entry[0]["default_role"], "default")
+        default = [d for d in contract["public_base"]["default_set"] if d["id"] == "claude-subscription-directsdk"]
+        self.assertEqual(len(default), 1)
+        self.assertEqual(default[0]["covers"], ["claude-subscription-directsdk-provider"])
+        self.assertEqual(default[0]["status"], "planned")
+        self.assertIs(default[0]["api_key_fallback"], False)
+        self.assertEqual(default[0]["upstream_label"], "experimental")
         self.assertNotIn("COPY plugins/claude-subscription-directsdk/", DOCKERFILE.read_text(encoding="utf-8"))
 
 

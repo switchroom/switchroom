@@ -70,6 +70,7 @@ class PerplexityProviderTests(unittest.TestCase):
                 "id": "perplexity-web-provider",
                 "target": "standalone_public_plugin",
                 "default_enabled": False,
+                "default_role": "default",
                 "conditions": [
                     "generic_configuration",
                     "search_only",
@@ -79,6 +80,12 @@ class PerplexityProviderTests(unittest.TestCase):
                 ],
             }
         ])
+        web = [d for d in contract["public_base"]["default_set"] if "perplexity-web-provider" in d["covers"]]
+        self.assertEqual([d["id"] for d in web], ["web-search"])
+        # Paid only when the operator supplied the key; otherwise the default backend.
+        self.assertEqual(web[0]["billing"], "operator_supplied_key")
+        self.assertEqual(web[0]["degrade"]["behaviour"], "default_web_backend_and_report")
+        self.assertEqual(web[0]["status"], "planned")
         self.assertIn("author: Hermes Fleet Contributors", metadata)
 
     def test_search_only_contract_is_generic(self):

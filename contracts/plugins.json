@@ -2,8 +2,309 @@
   "schema_version": 1,
   "status": "public_product_skeleton",
   "public_base": {
-    "policy": "minimal",
-    "default_enabled_plugins": [],
+    "policy": "reviewed_default_set",
+    "decision_record": "reference/rfcs/default-on-distribution.md",
+    "starter_overlay": "planned",
+    "default_statuses": [
+      "planned",
+      "shipped"
+    ],
+    "billing_values": [
+      "none",
+      "principal_plan_login",
+      "operator_supplied_key"
+    ],
+    "opt_out": "one_line_per_agent",
+    "missing_credential": "disable_report_in_setup_check_never_block_start",
+    "default_set": [
+      {
+        "id": "doctrine-config",
+        "status": "planned",
+        "summary": "Working doctrine config: system prompt, smart approvals, queue-first chat, verify-on-stop.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "gateway-per-agent",
+        "status": "planned",
+        "summary": "One gateway per agent, pinned with gateway.multiplex_profiles: false.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false,
+        "pinned_config": {
+          "gateway.multiplex_profiles": false
+        }
+      },
+      {
+        "id": "secrets-connect",
+        "status": "planned",
+        "summary": "1Password Connect secrets per container, with an env-file fallback.",
+        "covers": [],
+        "credential": {
+          "kind": "per_agent_connect_token",
+          "fallback": "env_file"
+        },
+        "degrade": {
+          "when": "connect_unset",
+          "behaviour": "use_env_file_and_report"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "coding-clis",
+        "status": "planned",
+        "summary": "Pinned coding CLIs in the image, each using the agent's own login.",
+        "covers": [],
+        "credential": {
+          "kind": "per_agent_cli_login"
+        },
+        "degrade": {
+          "when": "login_missing",
+          "behaviour": "disable_and_report"
+        },
+        "billing": "principal_plan_login",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "model-roles",
+        "status": "planned",
+        "summary": "Model roles with fallback chains built only from providers the principal granted.",
+        "covers": [],
+        "credential": {
+          "kind": "granted_providers_only"
+        },
+        "degrade": {
+          "when": "provider_missing",
+          "behaviour": "drop_from_chain_and_report"
+        },
+        "billing": "principal_plan_login",
+        "blocks_agent_start": false,
+        "adds_ungranted_provider": false
+      },
+      {
+        "id": "claude-subscription-directsdk",
+        "status": "planned",
+        "summary": "Default model provider: the Claude subscription through the profile's own Claude Code login.",
+        "covers": [
+          "claude-subscription-directsdk-provider"
+        ],
+        "credential": {
+          "kind": "per_agent_claude_login"
+        },
+        "degrade": {
+          "when": "login_missing",
+          "behaviour": "disable_and_report"
+        },
+        "billing": "principal_plan_login",
+        "blocks_agent_start": false,
+        "default_model_provider": true,
+        "api_key_fallback": false,
+        "upstream_label": "experimental"
+      },
+      {
+        "id": "claude-acp-connectors",
+        "status": "planned",
+        "summary": "Claude ACP provider plus claude-account-connectors for Claude account connectors.",
+        "covers": [
+          "claude-acp-provider",
+          "claude-account-connectors"
+        ],
+        "credential": {
+          "kind": "per_agent_claude_login"
+        },
+        "degrade": {
+          "when": "login_missing",
+          "behaviour": "disable_and_report"
+        },
+        "billing": "principal_plan_login",
+        "blocks_agent_start": false,
+        "api_key_fallback": false,
+        "qualification": "read_only"
+      },
+      {
+        "id": "linear",
+        "status": "planned",
+        "summary": "Linear work tracking on native Kanban.",
+        "covers": [
+          "linear"
+        ],
+        "credential": {
+          "kind": "per_agent_linear_authorization"
+        },
+        "degrade": {
+          "when": "credential_missing",
+          "behaviour": "disable_and_report"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "voice",
+        "status": "planned",
+        "summary": "Local Kokoro voice replies and local transcription.",
+        "covers": [
+          "voice-provider"
+        ],
+        "credential": {
+          "kind": "local_sidecar_url"
+        },
+        "degrade": {
+          "when": "sidecar_unset",
+          "behaviour": "text_only_and_report"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "honcho-memory",
+        "status": "planned",
+        "summary": "Honcho long-term memory through the upstream Honcho image, referenced by digest and never vendored.",
+        "covers": [],
+        "credential": {
+          "kind": "honcho_endpoint"
+        },
+        "degrade": {
+          "when": "endpoint_missing",
+          "behaviour": "builtin_memory_and_report"
+        },
+        "billing": "none",
+        "blocks_agent_start": false,
+        "source": {
+          "vendored": false,
+          "license": "AGPL-3.0",
+          "distribution": "upstream_image_by_digest"
+        }
+      },
+      {
+        "id": "web-search",
+        "status": "planned",
+        "summary": "Web search; the search-only Perplexity provider is used when its key exists.",
+        "covers": [
+          "web-provider",
+          "perplexity-web-provider"
+        ],
+        "credential": {
+          "kind": "optional_operator_key"
+        },
+        "degrade": {
+          "when": "key_missing",
+          "behaviour": "default_web_backend_and_report"
+        },
+        "billing": "operator_supplied_key",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "quota",
+        "status": "planned",
+        "summary": "Quota checks before long tasks and on rate limits.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "session-reset-policy",
+        "status": "planned",
+        "summary": "Session reset policy.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "security-guidance",
+        "status": "planned",
+        "summary": "Security guidance.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
+        "id": "disk-cleanup",
+        "status": "planned",
+        "summary": "Disk cleanup in report-only mode.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false,
+        "mode": "report_only"
+      },
+      {
+        "id": "shared-skill-pack",
+        "status": "planned",
+        "summary": "Shared skill pack.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      }
+    ],
+    "opt_in": [
+      {
+        "id": "browser-handoff",
+        "covers": [
+          "browser-handoff"
+        ],
+        "reason": "needs a public origin and a browser sidecar"
+      },
+      {
+        "id": "agent-to-agent",
+        "covers": [],
+        "reason": "cross-agent trust is a per-deployment decision"
+      },
+      {
+        "id": "artifact-publishing",
+        "covers": [],
+        "reason": "publishes outside the agent's box"
+      }
+    ],
     "bundled_capabilities": [
       "generic_healthcheck",
       "generic_provenance_verification",
@@ -19,6 +320,7 @@
       "id": "web-provider",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "default",
       "conditions": [
         "generic_configuration",
         "independent_tests",
@@ -30,6 +332,7 @@
       "id": "perplexity-web-provider",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "default",
       "conditions": [
         "generic_configuration",
         "search_only",
@@ -42,6 +345,7 @@
       "id": "work-tracker",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "off",
       "conditions": [
         "remove_deployment_policy",
         "synthetic_examples_only",
@@ -53,6 +357,7 @@
       "id": "linear",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "default",
       "conditions": [
         "kanban_owns_execution",
         "overlay_config_only",
@@ -66,6 +371,7 @@
       "id": "claude-acp-provider",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "default",
       "conditions": [
         "generic_configuration",
         "independent_tests",
@@ -77,6 +383,7 @@
       "id": "claude-subscription-directsdk-provider",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "default",
       "conditions": [
         "generic_configuration",
         "independent_tests",
@@ -86,9 +393,23 @@
       ]
     },
     {
+      "id": "claude-account-connectors",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "default_role": "default",
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity",
+        "read_only_qualified"
+      ]
+    },
+    {
       "id": "browser-handoff",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "opt_in",
       "conditions": [
         "env_skinned_public_origin",
         "generic_configuration",
@@ -101,6 +422,7 @@
       "id": "readonly-source",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "off",
       "conditions": [
         "generic_configuration",
         "independent_tests",
@@ -112,6 +434,7 @@
       "id": "tooling-policy-hook",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "off",
       "conditions": [
         "generic_configuration",
         "independent_tests",
@@ -122,6 +445,7 @@
       "id": "voice-provider",
       "target": "standalone_public_plugin",
       "default_enabled": false,
+      "default_role": "default",
       "conditions": [
         "generic_configuration",
         "independent_tests",

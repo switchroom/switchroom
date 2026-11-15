@@ -31,7 +31,7 @@ North Star is **trusted unsupervised turns**: work the principal did not sit thr
 
 **No shared credentials.** The child image includes the 1Password CLI with no vault config. The overlay injects Connect host, token, and allowed origins per container. Vault item bindings stay in that overlay. Two agents never share a Connect token or an OAuth login. Recreating a profile or borrowing another agent's secrets to get past a blocker is out of product.
 
-**Plugins stay off until the overlay turns them on.** The Fleet-owned plugin source trees live in this repository but are not baked into the child image. A deployment mounts one immutable, read-only copy at each expected plugin path and enables it per profile; the image still includes pinned CLI/runtime dependencies. Without the mount, a pruned plugin is absent rather than silently falling back to a baked copy. Default-enabled is empty for optional Fleet plugins; enabling one without its policy or origin fails closed.
+**A reviewed default set, on by default, opt out per agent.** What the reference deployment runs daily (Claude Subscription DirectSDK as the default model path, Claude ACP connectors, Linear, voice, Honcho memory, web search and the working doctrine config) becomes the default, and anything outside that list stays off. Plugin source stays mounted read-only, not baked into the image. A default with a missing credential turns itself off and says so in a setup check instead of blocking startup, and no default adds a model or paid path you did not grant. The starter overlay that turns these on is still coming, so nothing is on by default yet; every default is `planned` in [`contracts/plugins.json`](contracts/plugins.json). Decision: [`reference/rfcs/default-on-distribution.md`](reference/rfcs/default-on-distribution.md).
 
 **Digest or it did not happen.** Consume `ghcr.io/mekenthompson/hermes-fleet-public@sha256:<digest>`. Mutable tags are not a supported interface. Built, published, and deployed are different claims. A green unit run is not publication. Publication is not a production rollout.
 
@@ -53,7 +53,7 @@ The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay
 
 ## Plugins, and why they exist
 
-Optional, **disabled by default**. They exist so isolation does not mean a dumb agent.
+**Disabled by default today.** Most are in the reviewed default set and will be on once the starter overlay lands; browser handoff stays opt-in. They exist so isolation does not mean a dumb agent.
 
 ### Linear
 

@@ -33,7 +33,7 @@ Ceremony matches user-visible change. Not every patch is a launch. Lighter evide
 - Do not add credentials, vault URIs, OAuth state, sessions, memories, logs, or live topology.
 - Do not add household names, private hostnames, or real profile identities.
 - Do not vendor private binaries or unpublished local CLIs. Private binaries belong in the private overlay repository, with a hashed manifest and a COPY+sha256sum install.
-- Do not enable optional plugins by default.
+- Do not enable anything by default outside the reviewed default set in `contracts/plugins.json` and `reference/rfcs/default-on-distribution.md`. A default must degrade cleanly when its credential is missing, never block an agent from starting, and add no model or paid path the principal did not grant. Mark a default `shipped` only when the starter overlay actually enables it.
 - Do not treat a green unittest run as publication approval. Image publication still requires the Fleet image workflow.
 - Do not bounce, start, or pin live household services from this repository.
 
@@ -45,7 +45,7 @@ compose.example.yaml       Synthetic example, not a production baseline
 contracts/                 Public product boundaries
 docs/                      Human docs for public behavior
 examples/overlay-repo/     Placeholder overlay repository
-plugins/                   Optional, default-disabled plugins
+plugins/                   Mounted plugin source; reviewed defaults planned, none on yet
 release/                   Pinned Agent parent handoff
 scripts/                   Build, compose, and verification wrappers
 sidecars/                  Independent sidecar source and image workflows
