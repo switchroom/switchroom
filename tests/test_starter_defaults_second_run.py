@@ -128,7 +128,9 @@ class VoiceContractGuardTests(unittest.TestCase):
     def test_without_the_guard_or_with_a_stale_bit_it_is_refused(self) -> None:
         self.assertTrue(sd.component_default_problems(self.flipped(guard=False)))
         self.assertTrue(sd.component_default_problems(self.flipped(provider_on=False)))
+        # Voice is shipped now; a component left on after voice goes back to planned is refused.
         document = copy.deepcopy(contract())
+        next(d for d in document["public_base"]["default_set"] if d["id"] == "voice")["status"] = "planned"
         next(c for c in document["components"] if c["id"] == "voice-provider")["default_enabled"] = True
         problems = sd.component_default_problems(document)
         self.assertEqual(problems, ["component voice-provider is default_enabled but no shipped default covers it"])

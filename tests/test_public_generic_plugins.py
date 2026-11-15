@@ -89,13 +89,16 @@ class PublicGenericPluginTests(unittest.TestCase):
         matches = [item for item in contract["components"] if item["id"] == "voice-provider"]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["target"], "standalone_public_plugin")
-        # Reviewed default, planned: not on until the starter overlay enables it,
-        # and text-only when the sidecar URL is missing.
-        self.assertFalse(matches[0]["default_enabled"])
+        # Reviewed default, shipped after the container rerun (docs/starter-overlay-acceptance.md):
+        # on only under the enable guard (sidecar configured and reachable, no hosted fallback),
+        # still mounted from vendor/ rather than baked into the image, and text-only when the
+        # sidecar is missing or does not answer.
+        self.assertTrue(matches[0]["default_enabled"])
         self.assertEqual(matches[0]["default_role"], "default")
         voice = [d for d in contract["public_base"]["default_set"] if "voice-provider" in d["covers"]]
         self.assertEqual([d["id"] for d in voice], ["voice"])
-        self.assertEqual(voice[0]["status"], "planned")
+        self.assertEqual(voice[0]["status"], "shipped")
+        self.assertEqual(voice[0]["enable_guard"], {"sidecar": "configured_and_reachable", "hosted_fallback": False})
         self.assertEqual(voice[0]["degrade"]["behaviour"], "text_only_and_report")
         source = (KOKORO / "__init__.py").read_text(encoding="utf-8")
         self.assertNotIn("hermes-kokoro-sidecar", source)

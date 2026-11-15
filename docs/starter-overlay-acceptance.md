@@ -1,8 +1,9 @@
 # Starter overlay acceptance in real containers
 
-This records two runs of the starter overlay, its sidecars and the rollout
-runner in real, throwaway Docker containers: the first run, and a
-[rerun after the real-boot fixes](#rerun-after-the-real-boot-fixes). Every
+This records three runs of the starter overlay, its sidecars and the rollout
+runner in real, throwaway Docker containers: the first run, a
+[rerun after the real-boot fixes](#rerun-after-the-real-boot-fixes), and a
+[short rerun of voice and the skill pack](#short-rerun-of-voice-and-the-skill-pack). Every
 agent was synthetic: no real credentials, no chat platform tokens, no vault, no
 messaging and no published host ports. Everything was torn down afterwards.
 
@@ -204,9 +205,9 @@ agent the starter overlay starts.
 
 ### Fixed after the rerun, not yet re-run in containers
 
-These changes landed after this run, with unit tests only. A short container
-rerun of voice and the skill pack is still needed before either is marked
-`shipped`.
+These changes landed after this run, with unit tests only. The
+[short rerun](#short-rerun-of-voice-and-the-skill-pack) then proved voice and
+the skill pack in containers.
 
 - **Voice guard.** A component may now be on only under a `shipped` default
   that carries the enable guard (`enable_guard`: sidecar configured and
@@ -239,3 +240,64 @@ The root-owned workspace volume is a separate defect and is not fixed here.
 - Slash commands and voice notes typed into a chat platform: none was
   configured.
 - 1Password Connect, for the reason given above.
+
+## Short rerun of voice and the skill pack
+
+The third run re-tested only voice and the shared skill pack after the fixes
+listed above, and re-checked the seven defaults already shipped. Same rules:
+synthetic agents `ops` and `worker`, fake or missing credentials only, no
+messaging, no host ports except the Linear receiver's loopback port, and
+everything torn down afterwards.
+
+| Item | Value |
+| --- | --- |
+| Fleet source | `main` at `689fea031abd35a2f7d9002cdb737fdf15a9b403` |
+| Agent image | `ghcr.io/mekenthompson/hermes-fleet-public@sha256:50175d9daa68ac436c97eadf10dcae6570cbce91224e7260ed15c24c0f3a7930` (Fleet revision `689fea0`, the image published for that commit) |
+| Overlay | `examples/overlay-repo/` copied as is; `vendor/` fetched with `scripts/fetch-overlay-vendor.py --fleet-revision 689fea0…`, the image's own revision, as the quick start says |
+| Compose | `compose.yaml` and `compose.sidecars.yaml` as is, from fresh volumes. No overrides |
+
+The Linear receiver printed `linear-receiver: off: LINEAR_RECEIVER_PUBLIC_URL
+is not set` and exited 0, as designed. Every service stayed up for the whole
+run with no restarts, no GPU requested, and no fatal or segfault lines in any
+log. Checks ran in sibling containers sharing the running agent's image,
+volumes, mounts and env file as the agent user, through Hermes's own code
+(`model_tools.handle_function_call` for tools), as in the rerun.
+
+| Default | Result | Evidence |
+| --- | --- | --- |
+| `shared-skill-pack` | **shipped** | `ops-skills-init` and `worker-skills-init` (the agent image, the agent user, no network, read-only root, all capabilities dropped) exited 0 before their agents started. On the fresh state volumes `/opt/data/skills` is owned by the agent user. On both agents Hermes's `skills_list` tool lists all four pack skills, `skill_view` loads one, and `skill_manage create` of a synthetic skill succeeds in the agent's own skills directory, not in the pack; `skills_list` then lists it. The pack mount is `ro`: a direct write fails with `Read-only file system`, and so does `write_file` through the tool dispatch. The gateway logs show no read-only or permission errors. The in-container setup check prints `shared-skill-pack: on`. |
+| `voice` | **shipped** | A host render leaves voice off with `the voice sidecar was not checked`. The quick start's step 7 render inside the container (both compose files, `--check-files`) turns it on because the CPU Kokoro sidecar answers: `tts.provider: kokoro`, `stt.provider: kokoro_sidecar`. After the step 7 recreate, Hermes's `text_to_speech` tool returned success from provider `kokoro` with an Ogg (`OggS`) file of about 32 KB. Transcription reports the `kokoro_sidecar` provider unavailable (`this Kokoro server has no transcription`), and nothing falls back to a hosted service. The same render with the sidecar unreachable turns voice off, text-only, with `the voice sidecar named by HERMES_KOKORO_SIDECAR_URL does not answer`: `tts.provider` is the local `text-only` engine, `tts` is in `agent.disabled_toolsets`, transcription and automatic voice replies are off, and the Kokoro plugin is not enabled. The setup check agrees in each case. `worker` (opted out) stays text-only, and `text_to_speech` fails from `text-only` with no hosted engine tried. |
+
+How the voice-off case was made: the sidecar was not stopped. The tool
+running this test refused to stop the container, so the same step 7 render ran
+in a sibling of `ops` with no network, so the renderer's health probe could not
+reach the sidecar. An identical sibling on `ops`'s own network, with the
+sidecar running, rendered voice on. Reachability was the only difference. The
+renderer sees an unreachable sidecar and a stopped one the same way: its
+health request fails.
+
+The seven defaults already shipped still hold on both agents:
+`doctrine-config` (the 834-character prompt, smart approvals, cron, unattended
+and single-query runs denied, queue-first input, verify-on-stop);
+`gateway-per-agent` (`gateway.multiplex_profiles: false`); `quota` (enabled,
+routes mounted, tool override denied); `session-reset-policy` (`v0.3.0 armed`,
+idle after 240 minutes); `security-guidance` (loaded with both hooks; a
+`pickle.loads` write returned its warning and a harmless write did not);
+`disk-cleanup` (loaded with three hooks; `quick` and `deep` refused, the
+session-end report counted one candidate and deleted nothing); and
+`honcho-memory` (`memory.provider: honcho`; a synthetic message round-tripped
+from both agents).
+
+Isolation held as in the rerun: only `ops` resolves `voice`, speech without a
+token or with a wrong one returns 401, `worker` and new containers on Docker's
+default bridge or on `worker`'s own network cannot resolve `voice`, and `voice`
+has no egress.
+
+### Still open after the short rerun
+
+- The agent's workspace volume still comes up owned by root, so `write_file`
+  into the workspace fails. It is not one of the defaults.
+- Transcription on CPU: the CPU server has none. The GPU sidecar was not run.
+- Stopping the voice sidecar itself was not run, for the reason above.
+- Defaults whose on-state needs a real credential, chat platforms, and
+  1Password Connect, as in the rerun.

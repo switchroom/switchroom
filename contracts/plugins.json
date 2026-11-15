@@ -174,7 +174,7 @@
       },
       {
         "id": "voice",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Local Kokoro voice replies. The CPU Kokoro server has no transcription; local transcription needs the GPU Fleet Kokoro sidecar.",
         "covers": [
@@ -327,7 +327,7 @@
       },
       {
         "id": "shared-skill-pack",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Shared skill pack from skills/, mounted read-only from the same release as the image.",
         "covers": [],
@@ -500,7 +500,7 @@
     {
       "id": "voice-provider",
       "target": "standalone_public_plugin",
-      "default_enabled": false,
+      "default_enabled": true,
       "default_role": "default",
       "conditions": [
         "generic_configuration",
