@@ -379,15 +379,22 @@ def recreate_and_wait(docker: Docker, service: str, image: str, image_id: str, t
     if code:
         record.update(ok=False, reason=f"compose up failed: {stderr}")
     else:
-        record.update(wait_healthy(docker, service, image_id, timeout, poll, clock))
+        try:
+            record.update(wait_healthy(docker, service, image_id, timeout, poll, clock))
+        except Exception as exc:  # noqa: BLE001 - a Docker error while waiting is a failed agent
+            record.update(ok=False, reason=f"health wait failed: {type(exc).__name__}: {exc}")
     record["finished_at"] = now()
     return record
 
 
 def rollout(docker: Docker, plan: Plan, *, timeout: float, poll: float, pull: bool,
-            clock: Clock | None = None, log: Callable[[str], None] = print) -> dict[str, Any]:
+            clock: Clock | None = None, log: Callable[[str], None] = print,
+            report: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Roll ``plan``. Fills ``report`` in place, so a caller that catches an
+    unexpected exception still has what was recorded up to that point."""
     clock = clock or Clock()
-    report: dict[str, Any] = {
+    report = {} if report is None else report
+    report.update({
         "schema": SCHEMA,
         "status": "running",
         "image": plan.image,
@@ -396,7 +403,7 @@ def rollout(docker: Docker, plan: Plan, *, timeout: float, poll: float, pull: bo
         "skipped": plan.skipped,
         "started_at": now(),
         "agents": {},
-    }
+    })
     if pull:
         log(f"pulling {plan.image}")
         docker.pull(plan.image)
@@ -416,9 +423,12 @@ def rollout(docker: Docker, plan: Plan, *, timeout: float, poll: float, pull: bo
             log(f"{name}: already on target ({index}/{len(plan.order)})")
             continue
         log(f"{name}: recreating ({index}/{len(plan.order)})")
+        # Recorded until this agent is settled, so an aborted report names it.
+        report["in_flight"] = name
         record = recreate_and_wait(docker, name, plan.image, target_id, timeout, poll, clock)
         report["agents"][name] = record
         if record.get("ok"):
+            del report["in_flight"]
             log(f"{name}: healthy")
             continue
         log(f"{name}: FAILED: {record.get('reason')}; rolling back to {previous[name]['image']}")
@@ -429,6 +439,7 @@ def rollout(docker: Docker, plan: Plan, *, timeout: float, poll: float, pull: bo
             record["rollback"] = recreate_and_wait(docker, name, back["image"], back["image_id"],
                                                    timeout, poll, clock)
         rolled = record["rollback"].get("ok")
+        del report["in_flight"]
         log(f"{name}: " + ("rolled back" if rolled else f"rollback FAILED: {record['rollback'].get('reason')}"))
         report.update(status="failed", failed_agent=name, failure_reason=record.get("reason"),
                       rolled_back=bool(rolled),
@@ -506,15 +517,17 @@ def main(argv: list[str] | None = None, docker: Docker | None = None, clock: Clo
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 raise Refused("another rollout for this project is running") from None
+            report: dict[str, Any] = {}
             try:
-                report = rollout(docker, plan, timeout=args.timeout, poll=args.poll,
-                                 pull=not args.no_pull, clock=clock)
+                rollout(docker, plan, timeout=args.timeout, poll=args.poll,
+                        pull=not args.no_pull, clock=clock, report=report)
             except Refused:
                 raise
             except Exception as exc:  # noqa: BLE001 - always leave a report
-                report = {"schema": SCHEMA, "status": "aborted", "image": plan.image,
-                          "order": plan.order, "failure_reason": f"{type(exc).__name__}: {exc}",
-                          "finished_at": now()}
+                # Keep whatever was recorded (previous_images, agents, in_flight)
+                # so the operator knows what to restore.
+                report.update(schema=SCHEMA, status="aborted", image=plan.image, order=plan.order,
+                              failure_reason=f"{type(exc).__name__}: {exc}", finished_at=now())
             write_report(report, report_path)
         print(f"rollout {report['status']}; report: {report_path}")
         return EXIT_OK if report["status"] == "passed" else EXIT_FAILED

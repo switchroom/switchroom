@@ -45,7 +45,7 @@ Exit codes: `0` every selected agent is healthy on the target; `1` the rollout f
 2. Selects agents, skips any that are not running (a stopped agent is never started), and orders them alphabetically with the controller last.
 3. Pulls the target (unless `--no-pull`) and refuses if any selected agent has no container healthcheck, either in Compose or in the image.
 4. Records each agent's current image: a repository digest of the running image ID when one exists, otherwise the image ID itself. Both are immutable.
-5. For each agent in turn: recreates only that service with `docker compose up --detach --no-deps --force-recreate --pull never -- <service>`, using a temporary override file that sets only that service's `image`. It then polls until the new container runs the target image ID and its healthcheck says `healthy`. `unhealthy`, `exited` or `dead` fail at once; anything else fails at the timeout. An agent already on the target image ID is left alone.
+5. For each agent in turn: recreates only that service with `docker compose up --detach --no-deps --force-recreate --pull never -- <service>`, using a temporary override file that sets only that service's `image`. It then polls until the new container runs the target image ID and its healthcheck says `healthy`. `unhealthy`, `exited` or `dead` fail at once; anything else fails at the timeout. A Docker command that errors or times out while recreating or waiting counts as a failure of that agent. An agent already on the target image ID is left alone.
 6. On the first failure it recreates that agent on its recorded previous image, waits for it to be healthy again, writes the report and exits `1`. Agents after it are listed as `not_started` and are never touched, so the controller is untouched whenever another agent fails.
 
 One lock file per project, next to the report, stops two runners overlapping.
@@ -71,6 +71,8 @@ One lock file per project, next to the report, stops two runners overlapping.
 
 A refusal (exit `2`) and a dry-run write no report.
 
+`aborted` (exit `1`) means the runner itself hit an unexpected error rather than an agent failing. The report keeps everything recorded up to that point, including `previous_images` and, if an agent was mid-change, `in_flight` naming it. That agent may be on either image and was not rolled back; restore it from `previous_images`.
+
 ## What it guarantees
 
 - Only a digest-pinned target is ever applied.
@@ -87,4 +89,4 @@ A refusal (exit `2`) and a dry-run write no report.
 - It does not drain in-flight work before recreating an agent. Run it when agents are idle.
 - It does not prove credentials, plugins, model access or chat delivery. Those are separate checks after the rollout.
 - It does not roll back agents that already passed. Rollback is per-agent, for the one that failed. To undo a whole rollout, run it again with the previous digest as the target.
-- If the rollback itself fails, it reports that and stops; it does not retry or guess.
+- If the rollback itself fails, including a Docker error during it, it reports `rolled_back: false`, stops and exits `1`; it does not retry or guess.

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("switchroom_rollout", ROOT / "scripts/switchroom-rollout.py")
@@ -54,6 +55,10 @@ class FakeDocker:
         self.health: dict[tuple[str, str], list[str]] = {}
         self.fail_recreate: set[tuple[str, str]] = set()
         self.exit_after_recreate: set[tuple[str, str]] = set()
+        # (service, image_id) -> exception raised when a recreated container on it is inspected
+        self.raise_on_inspect: dict[tuple[str, str], BaseException] = {}
+        # (service, image) -> exception raised by that recreate
+        self.raise_on_recreate: dict[tuple[str, str], BaseException] = {}
         self.serial = 0
 
     @staticmethod
@@ -73,6 +78,9 @@ class FakeDocker:
         for name, container in self.containers.items():
             if container["id"] == container_id:
                 self.events.append(("inspect", name))
+                failure = self.raise_on_inspect.get((name, container["image_id"]))
+                if failure is not None and container["id"] != f"{name}-0":  # recreated containers only
+                    raise failure
                 if container["polls"]:
                     container["health"] = container["polls"].pop(0) if len(container["polls"]) > 1 else container["polls"][0]
                 return {k: container[k] for k in ("image_id", "image_ref", "status", "running", "health", "restart_count")}
@@ -92,6 +100,8 @@ class FakeDocker:
 
     def recreate(self, service, image):
         self.events.append(("recreate", service, image))
+        if (service, image) in self.raise_on_recreate:
+            raise self.raise_on_recreate[(service, image)]
         if (service, image) in self.fail_recreate:
             return 1, "simulated compose failure"
         self.serial += 1
@@ -280,6 +290,63 @@ class HealthAndRollbackTests(unittest.TestCase):
         self.assertEqual(code, rollout.EXIT_FAILED)
         self.assertFalse(report["rolled_back"])
         self.assertFalse(report["agents"]["alpha"]["rollback"]["ok"])
+
+    def test_docker_error_during_health_wait_is_rolled_back(self):
+        # e.g. `docker container inspect` timing out right after bravo moved to NEW.
+        for failure in (subprocess.TimeoutExpired(["docker", "container", "inspect"], 30),
+                        json.JSONDecodeError("Expecting value", "", 0)):
+            with self.subTest(failure=type(failure).__name__):
+                docker = FakeDocker()
+                docker.raise_on_inspect[("bravo", NEW_ID)] = failure
+                code, report = self.roll(docker, "--controller", "alpha")
+                self.assertEqual(code, rollout.EXIT_FAILED)
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(docker.recreated(), [("bravo", NEW), ("bravo", OLD)])
+                self.assertEqual(docker.containers["bravo"]["image_id"], OLD_ID)
+                self.assertEqual(docker.containers["alpha"]["image_id"], OLD_ID)
+                self.assertEqual(docker.containers["charlie"]["image_id"], OLD_ID)
+                self.assertEqual(report["failed_agent"], "bravo")
+                self.assertTrue(report["rolled_back"])
+                self.assertIn("health wait failed", report["agents"]["bravo"]["reason"])
+                self.assertTrue(report["agents"]["bravo"]["rollback"]["ok"])
+                self.assertEqual(report["not_started"], ["charlie", "alpha"])
+                self.assertNotIn("in_flight", report)
+
+    def test_docker_error_during_rollback_is_reported_not_restored(self):
+        for where in ("wait", "recreate"):
+            with self.subTest(where=where):
+                docker = FakeDocker()
+                docker.raise_on_inspect[("alpha", NEW_ID)] = subprocess.TimeoutExpired(["docker"], 30)
+                if where == "wait":
+                    docker.raise_on_inspect[("alpha", OLD_ID)] = subprocess.TimeoutExpired(["docker"], 30)
+                else:
+                    docker.raise_on_recreate[("alpha", OLD)] = subprocess.TimeoutExpired(["docker"], 600)
+                code, report = self.roll(docker, "--controller", "charlie")
+                self.assertEqual(code, rollout.EXIT_FAILED)
+                self.assertEqual(report["status"], "failed")
+                self.assertFalse(report["rolled_back"])
+                self.assertFalse(report["agents"]["alpha"]["rollback"]["ok"])
+                self.assertEqual(report["not_started"], ["bravo", "charlie"])
+                self.assertEqual([s for s, _ in docker.recreated()], ["alpha", "alpha"])
+                self.assertEqual(report["previous_images"]["alpha"], {"image": OLD, "image_id": OLD_ID})
+
+    def test_unexpected_error_mid_rollout_keeps_restore_information(self):
+        docker = FakeDocker()
+        real = rollout.recreate_and_wait
+
+        def explode(docker_, service, *args, **kwargs):
+            if service == "bravo":
+                raise RuntimeError("bug")
+            return real(docker_, service, *args, **kwargs)
+
+        with mock.patch.object(rollout, "recreate_and_wait", explode):
+            code, report = self.roll(docker)
+        self.assertEqual(code, rollout.EXIT_FAILED)
+        self.assertEqual(report["status"], "aborted")
+        self.assertEqual(report["in_flight"], "bravo")
+        self.assertEqual(report["previous_images"]["bravo"], {"image": OLD, "image_id": OLD_ID})
+        self.assertTrue(report["agents"]["alpha"]["ok"])
+        self.assertIn("RuntimeError: bug", report["failure_reason"])
 
     def test_missing_healthcheck_is_refused_before_any_recreate(self):
         docker = FakeDocker(image_health=False)
