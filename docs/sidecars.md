@@ -56,8 +56,11 @@ Isolation rules, enforced by `tests/test_starter_overlay_sidecars.py`:
   agent joins: the one-time Honcho tokenizer fetch, and 1Password Connect to
   sync with 1Password. The CPU voice server has its weights built in and gets
   none.
-- No host networking, privileged mode, Docker socket or published ports.
-  Agents reach sidecars by service name.
+- No host networking, privileged mode or Docker socket. Agents reach sidecars
+  by service name. The only published port is the Linear webhook receiver's,
+  bound to `127.0.0.1` for your tunnel or reverse proxy; its network
+  (`linear-receiver-ingress`) is not internal, because Docker publishes ports
+  only from a non-internal network, and no agent joins it.
 - Every image is pinned by digest. Secrets come from files under `secrets/`,
   which the overlay's `.gitignore` keeps out of git.
 
@@ -67,6 +70,16 @@ Isolation rules, enforced by `tests/test_starter_overlay_sidecars.py`:
 | `honcho`, `honcho-db` | upstream `ghcr.io/plastic-labs/honcho`, `pgvector/pgvector` | `honcho-memory` default | AGPL-3.0, not vendored |
 | `honcho-tiktoken` | the same Honcho image | `honcho-memory` default | one-time tokenizer fetch, then exits |
 | `onepassword-connect-api`, `onepassword-connect-sync` | `1password/connect-api`, `1password/connect-sync` | `secrets-connect` default | optional profile `onepassword` |
+| `linear-receiver`, `linear-inbox-init` | upstream `python` (Alpine), running `sidecars/linear-receiver/receiver.py` from the pinned Fleet checkout | assigning work from Linear | off until configured; see [Linear setup, Part 2](linear-setup.md#part-2-assign-from-linear) |
+
+**Linear webhook receiver.** It accepts Linear's webhooks and files each
+verified one in the agent's own inbox volume, which the agent mounts at the
+Linear plugin's default `/opt/data/workspace/linear`. It runs as UID 1000 with
+every capability dropped and a read-only root filesystem, holds no OAuth token
+and never calls Linear. `linear-inbox-init` runs first, with no network and
+only the chown capability, to hand each new inbox volume to UID 1000, then
+exits. Without `LINEAR_RECEIVER_PUBLIC_URL` and a signing secret in
+`secrets/linear-receiver.env` the receiver prints why it is off and exits.
 
 **Kokoro.** The CPU default is the upstream CPU build of
 [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) (`v0.10.0`,

@@ -8,7 +8,8 @@ agent names, and config values. Do not copy secrets into git.
 
 ```text
 compose.yaml                 Digest-pinned Fleet child, read-only plugin mounts. No secrets.
-compose.sidecars.yaml        Kokoro, Honcho and optional 1Password Connect sidecars
+compose.sidecars.yaml        Kokoro, Honcho, optional 1Password Connect, and the Linear webhook receiver
+linear-receiver.json         Each agent's Linear workspace, app and allowed people for the receiver (no secrets)
 vendor.lock.json             Exact commits for the skill pack and plugins compose mounts
 fleet-config/schema.yaml     Allowlisted desired-state keys
 fleet-config/defaults.yaml   Shared defaults and the starter defaults

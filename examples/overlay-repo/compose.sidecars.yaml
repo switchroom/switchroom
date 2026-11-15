@@ -7,8 +7,9 @@
 # Isolation: each sidecar has its own internal network, and only the agents
 # that use it join that network. A sidecar that must reach the internet gets a
 # separate egress network that no agent joins. No host networking, no
-# privileged mode, no Docker socket and no published ports: agents reach
-# sidecars by service name.
+# privileged mode and no Docker socket. Agents reach sidecars by service name.
+# The one published port is the Linear webhook receiver's, bound to loopback
+# for your tunnel or reverse proxy; no agent joins its network.
 #
 # Secrets come from files under secrets/, which .gitignore keeps out of git.
 # Every image is pinned by digest. Replace a digest only with one you reviewed.
@@ -187,15 +188,88 @@ services:
     networks:
       - onepassword-egress
 
+  # Linear webhook receiver (docs/linear-setup.md, Part 2). It is what makes
+  # delegating or @mentioning an agent in Linear start work. Stdlib Python from
+  # the pinned Fleet checkout, run on the digest-pinned upstream Python image;
+  # nothing is installed. It checks each delivery's signature, timestamp,
+  # delivery id and the agent's own workspace, app and allowed people, then
+  # files it in that agent's inbox volume. It holds no OAuth token and never
+  # calls Linear.
+  #
+  # Off by default: it prints "linear-receiver: off: <reason>" and exits until
+  # secrets/linear-receiver.env sets LINEAR_RECEIVER_PUBLIC_URL (https) and at
+  # least one agent's signing secret, named by secret_env in
+  # linear-receiver.json. Then `docker compose ... up -d` starts it.
+  linear-receiver:
+    image: docker.io/library/python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a
+    restart: on-failure
+    depends_on:
+      linear-inbox-init:
+        condition: service_completed_successfully
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    env_file:
+      - path: ./secrets/linear-receiver.env
+        required: false
+    command: ["python", "-I", "/app/receiver.py", "serve", "--config", "/config/linear-receiver.json",
+              "--inbox-root", "/inbox"]
+    volumes:
+      - ./vendor/hermes-fleet/sidecars/linear-receiver:/app:ro
+      - ./linear-receiver.json:/config/linear-receiver.json:ro
+      - ops-linear-inbox:/inbox/ops
+      - worker-linear-inbox:/inbox/worker
+    # Loopback only: point a tunnel or reverse proxy at it.
+    ports:
+      - "127.0.0.1:${LINEAR_RECEIVER_PORT:-8646}:8646"
+    networks:
+      - linear-receiver-ingress
+
+  # Makes each new inbox volume writable by UID 1000 (the receiver and the
+  # agent), then exits. Root with only the chown capability and no network.
+  linear-inbox-init:
+    image: docker.io/library/python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a
+    restart: "no"
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    network_mode: none
+    entrypoint:
+      - python
+      - -I
+      - -c
+      - |
+        import os
+        for name in sorted(os.listdir("/inbox")):
+            path = os.path.join("/inbox", name)
+            info = os.lstat(path)
+            if info.st_uid == 1000 and info.st_gid == 1000:
+                continue
+            os.chmod(path, 0o700)
+            os.chown(path, 1000, 1000)
+            print(f"inbox {name} prepared")
+    volumes:
+      - ops-linear-inbox:/inbox/ops
+      - worker-linear-inbox:/inbox/worker
+
   # Agents join only the sidecar networks they use. The worker turns voice off
   # (fleet-config/agents/worker.yaml), so it does not join the voice network.
+  # Each agent reads its own Linear inbox where the plugin looks by default;
+  # the receiver writes it, and no agent joins the receiver's network.
   ops:
+    volumes:
+      - ops-linear-inbox:/opt/data/workspace/linear
     networks:
       - voice
       - honcho
       - onepassword
 
   worker:
+    volumes:
+      - worker-linear-inbox:/opt/data/workspace/linear
     networks:
       - honcho
       - onepassword
@@ -204,6 +278,8 @@ volumes:
   honcho-tiktoken:
   honcho-pgdata:
   onepassword-data:
+  ops-linear-inbox:
+  worker-linear-inbox:
 
 networks:
   voice:
@@ -217,4 +293,8 @@ networks:
   onepassword:
     internal: true
   onepassword-egress:
+    driver: bridge
+  # Not internal: Docker publishes a port only from a non-internal network.
+  # Only the receiver is on it.
+  linear-receiver-ingress:
     driver: bridge

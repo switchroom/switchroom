@@ -24,7 +24,11 @@ CONTRACT = ROOT / "contracts" / "plugins.json"
 LOCK = OVERLAY / "vendor.lock.json"
 FETCH = ROOT / "scripts" / "fetch-overlay-vendor.py"
 DIGEST_REF = re.compile(r"^[a-z0-9.-]+(?:/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$")
-SIDECARS = {"voice", "honcho", "honcho-tiktoken", "honcho-db", "onepassword-connect-api", "onepassword-connect-sync"}
+SIDECARS = {"voice", "honcho", "honcho-tiktoken", "honcho-db", "onepassword-connect-api", "onepassword-connect-sync",
+            "linear-receiver", "linear-inbox-init"}
+# The only published port: the Linear webhook receiver, on loopback, for a tunnel or reverse proxy.
+RECEIVER_PORTS = ["127.0.0.1:${LINEAR_RECEIVER_PORT:-8646}:8646"]
+RECEIVER_NETWORK = "linear-receiver-ingress"
 AGENTS = {"ops", "worker"}
 # Plugins the Fleet image itself ships, so the overlay need not mount them.
 IN_IMAGE = {"security-guidance"}
@@ -252,18 +256,53 @@ class SidecarComposeTests(unittest.TestCase):
                 self.assertRegex(self.image(name), DIGEST_REF)
         self.assertNotIn(":latest", self.text)
 
-    def test_no_host_network_privilege_socket_or_published_ports(self) -> None:
+    def test_no_host_network_privilege_socket_or_extra_published_ports(self) -> None:
         self.assertNotIn("docker.sock", self.text)
+        allowed = {
+            # One loopback port for the Linear webhook receiver.
+            "linear-receiver": {"ports": RECEIVER_PORTS},
+            # A one-shot with no network that only chowns new inbox volumes.
+            "linear-inbox-init": {"network_mode": "none", "cap_add": ["CHOWN"]},
+        }
         for name, service in self.services.items():
             with self.subTest(service=name):
                 for key in ("ports", "network_mode", "privileged", "cap_add", "pid", "ipc", "devices"):
-                    self.assertNotIn(key, service)
+                    if key in allowed.get(name, {}):
+                        self.assertEqual(service[key], allowed[name][key])
+                    else:
+                        self.assertNotIn(key, service)
+
+    def test_linear_receiver_is_unprivileged_and_reads_only_what_it_needs(self) -> None:
+        receiver, init = self.services["linear-receiver"], self.services["linear-inbox-init"]
+        for service in (receiver, init):
+            self.assertEqual(service["cap_drop"], ["ALL"])
+            self.assertIn("no-new-privileges:true", service["security_opt"])
+            self.assertIs(service["read_only"], True)
+        self.assertEqual(receiver["user"], "1000:1000")
+        # Off means the process exits 0; on-failure keeps it down until reconfigured.
+        self.assertEqual(receiver["restart"], "on-failure")
+        self.assertEqual(receiver["env_file"], [{"path": "./secrets/linear-receiver.env", "required": False}])
+        self.assertEqual(receiver["networks"], [RECEIVER_NETWORK])
+        binds = {target: (source, mode) for source, target, mode in _binds(receiver)}
+        self.assertEqual(binds, {"/app": ("./vendor/hermes-fleet/sidecars/linear-receiver", "ro"),
+                                 "/config/linear-receiver.json": ("./linear-receiver.json", "ro")})
+        self.assertTrue((OVERLAY / "linear-receiver.json").is_file())
+        self.assertTrue((ROOT / "sidecars" / "linear-receiver" / "receiver.py").is_file())
+        # Each agent reads only its own inbox, at the plugin's default path; the
+        # receiver and the init step see exactly those volumes and nothing of the agents' state.
+        inboxes = {f"{agent}-linear-inbox:/inbox/{agent}" for agent in AGENTS}
+        for service in (receiver, init):
+            named = {v for v in service["volumes"] if not v.startswith(".")}
+            self.assertEqual(named, inboxes)
+        for agent in AGENTS:
+            self.assertEqual(self.services[agent]["volumes"], [f"{agent}-linear-inbox:/opt/data/workspace/linear"])
+            self.assertNotIn(RECEIVER_NETWORK, self.services[agent]["networks"])
 
     def test_each_sidecar_network_is_internal_and_joined_only_by_its_consumers(self) -> None:
         egress = {n for n in self.networks if n.endswith("-egress")}
         for name, network in self.networks.items():
             with self.subTest(network=name):
-                self.assertIs(network.get("internal", False), name not in egress)
+                self.assertIs(network.get("internal", False), name not in egress | {RECEIVER_NETWORK})
         members: dict[str, set[str]] = {}
         for name, service in self.services.items():
             for network in service.get("networks", []):
@@ -272,6 +311,7 @@ class SidecarComposeTests(unittest.TestCase):
         self.assertEqual(members["honcho"], {"honcho", "ops", "worker"})
         self.assertEqual(members["honcho-db"], {"honcho", "honcho-db"})
         self.assertEqual(members["onepassword"], {"onepassword-connect-api", "ops", "worker"})
+        self.assertEqual(members[RECEIVER_NETWORK], {"linear-receiver"})
         for network in egress:
             self.assertFalse(members[network] & AGENTS, network)
         # Honcho gets no egress, so it cannot reach a model provider at all.

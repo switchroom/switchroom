@@ -31,6 +31,8 @@ PREFIXES = {
     'plugins/claude-account-connectors/': 'claude',
     'plugins/browser-handoff/': 'browser',
     'plugins/web/perplexity/': 'perplexity',
+    # Before 'sidecars/': the receiver's tests are test_linear_receiver.py.
+    'sidecars/linear-receiver/': 'linear',
     'sidecars/': 'sidecars',
     'tests/linear_': 'linear',
     'tests/fixtures/claude_': 'claude',

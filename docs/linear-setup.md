@@ -9,8 +9,8 @@ on and check it works. It has two parts:
    work as a native Kanban task, and reports checkpoints and the result on the issue. **This needs
    only the agent's Linear OAuth app.** No webhook receiver, public URL or inbound port.
 2. **[Assign from Linear](#part-2-assign-from-linear)**: a person assigns or @mentions the agent
-   in Linear and it picks the work up. **This also needs a webhook receiver that is not published
-   in this repository yet.** Those steps are marked *not yet published*.
+   in Linear and it picks the work up. **This also needs the webhook receiver** from the starter
+   overlay's sidecars, and a public HTTPS URL for it (a tunnel or reverse proxy).
 
 [Part 3](#part-3-handoff-between-two-agents) covers taking work over from another agent, which
 also runs without the receiver.
@@ -28,7 +28,8 @@ with your own in your overlay, never in this repository. How the plugin behaves 
 | Scopes `read,write,app:assignable` | yes | yes |
 | Scope `app:mentionable` | no | yes, for @mentions |
 | Webhooks on the OAuth app | **off** | on: Agent session events, Issues |
-| Webhook receiver writing the agent's Linear inbox | no | yes (*not yet published*) |
+| Webhook receiver writing the agent's Linear inbox | no | yes (`linear-receiver` sidecar) |
+| A public HTTPS URL that reaches the receiver | no | yes |
 | The agent's gateway running (the plugin's reporting service lives there) | yes | yes |
 | A Fleet image from this repository's pinned Agent release (guarded native admission) | yes | yes |
 | `platforms.linear` gateway platform | no | yes |
@@ -219,24 +220,94 @@ Restart that agent's gateway. Then, inside the agent's container:
 Assigning (delegating) an issue to the agent, or @mentioning it, reaches the agent as a Linear
 webhook. The plugin does not listen on a port. It reads verified deliveries from a local SQLite
 inbox, by default `/opt/data/workspace/linear/ingress.db`, and skips the inbox entirely when that
-file does not exist. A separate **webhook receiver** must accept Linear's HTTPS webhooks, check
-the `linear-signature` HMAC with the app's webhook signing secret and the one-minute timestamp
-window, and write each delivery into that inbox for the right agent.
+file does not exist. The **webhook receiver** (`linear-receiver` in the starter overlay's
+`compose.sidecars.yaml`, source in [`sidecars/linear-receiver/`](../sidecars/linear-receiver/))
+accepts Linear's webhooks and writes each verified one into that inbox for the right agent.
 
-*Not yet published*: that receiver. It is shipping next as its own component. Until then the steps
-below describe what it will need, so you can plan, but assignment from Linear does not work with
-this repository alone.
+### What the receiver accepts
+
+For every delivery, in this order:
+
+| Check | Fails as |
+| --- | --- |
+| The URL path is exactly `/linear/<agent>` for an agent in `linear-receiver.json` whose signing secret is set | 404 |
+| `linear-signature` is the HMAC-SHA256 of the exact raw body with that agent's signing secret (constant-time compare) | 401 |
+| A `Linear-Delivery` id is present | 400 |
+| The signed `webhookTimestamp` is within one minute of the receiver's clock | 401 |
+| The delivery id was not seen before; a repeat is acknowledged and never filed twice, the same id with other content is refused | 200 `duplicate` / 400 |
+| `organizationId` is the agent's workspace, and `oauthClientId` its app if you set `oauth_client_id` | 200 `ignored` |
+| An Agent Session event names the agent's own app user (`appUserId`), is `created` or `prompted`, and comes from a person in `allowed_actor_ids` (`agentSession.creatorId` or `agentActivity.userId`) | 200 `ignored` |
+| An Issue event delegates or assigns to, or used to delegate or assign to, this app | 200 `ignored` |
+
+Only then is the raw body committed to the agent's inbox, before the receiver answers 200.
+"Ignored" deliveries are answered 200 so Linear does not retry them, and are dropped: they never
+reach the agent. Nothing in a payload adds permission; it only has to match what you configured.
+The receiver holds no OAuth token and never calls Linear. A session Linear opens with no person
+behind it, or with the agent itself as the actor (for example when the agent delegates an issue
+to itself from chat), is dropped, so chat-started work keeps reporting through issue comments.
+
+Unknown event types (comments, projects and so on) are dropped too. The plugin still checks every
+person against `platforms.linear.allowed_users` and rereads the session from Linear before it
+acts; the receiver's allowlist is an outer gate, not a replacement.
+
+### Steps
 
 1. Add `app:mentionable` to the scopes and install again with `update_scopes_on_existing_token=true`
    on the authorize URL; Linear then issues a new refresh token, which replaces the one in your
    1Password item.
-2. On the OAuth app, turn webhooks on with the receiver's public URL and select **Agent session
-   events** and **Issues**. Store the webhook signing secret for the receiver only; the agent
-   never needs it.
-3. Run the receiver (*not yet published*) and give the agent's container its inbox at
-   `/opt/data/workspace/linear/ingress.db`. Set `ingress_profile` only if the receiver files this
-   agent's deliveries under a different name than its profile.
-4. Turn on the Linear gateway platform in the profile config, with the Linear user IDs allowed to
+2. **Give the receiver a public HTTPS URL.** Linear must reach it from the internet; the
+   receiver only listens on `127.0.0.1:8646` on the Docker host (change the host port with
+   `LINEAR_RECEIVER_PORT`). Put a tunnel or a reverse proxy in front of it and forward only
+   the `/linear/` paths. With a tunnel such as Cloudflare Tunnel, a public hostname
+   `linear-hooks.example.com` with service `http://localhost:8646`. With a reverse proxy, for
+   example Caddy on the same host:
+
+   ```text
+   linear-hooks.example.com {
+       handle /linear/* {
+           reverse_proxy 127.0.0.1:8646
+       }
+       respond 404
+   }
+   ```
+
+   Keep TLS at the tunnel or proxy, and do not let it rewrite or re-encode the request body:
+   the signature covers the exact bytes Linear sent.
+3. **Configure the receiver** in your overlay, one entry per agent, in `linear-receiver.json`
+   beside the compose files (synthetic values):
+
+   ```json
+   {
+     "agents": [
+       {
+         "name": "ops",
+         "organization_id": "example-workspace-id",
+         "app_user_id": "example-ops-app-user-id",
+         "allowed_actor_ids": ["example-linear-user-id"],
+         "secret_env": "LINEAR_WEBHOOK_SECRET_OPS"
+       }
+     ]
+   }
+   ```
+
+   `name` is the agent's profile and inbox name, `organization_id` and `app_user_id` are the
+   `organization.id` and `viewer.id` from [step 4](#4-find-the-apps-ids), and
+   `allowed_actor_ids` are the Linear user IDs of the people who may start or steer work (the
+   same people as `allowed_users` below). Optional `oauth_client_id` also pins the app's client
+   ID. Unknown keys, duplicates and an empty allowlist turn the receiver off.
+4. **On the OAuth app**, turn webhooks on with the URL `https://linear-hooks.example.com/linear/ops`
+   (your hostname, then `/linear/<name>`) and select **Agent session events** and **Issues**.
+   Copy the webhook signing secret into `secrets/linear-receiver.env`, which `.gitignore` keeps
+   out of git, together with the public URL:
+
+   ```bash
+   LINEAR_RECEIVER_PUBLIC_URL=https://linear-hooks.example.com
+   LINEAR_WEBHOOK_SECRET_OPS=<the app's webhook signing secret>
+   ```
+
+   Each agent has its own app, so each has its own secret and its own variable. Only the
+   receiver gets this file; the agent never needs the signing secret.
+5. Turn on the Linear gateway platform in the profile config, with the Linear user IDs allowed to
    talk to the agent:
 
    ```yaml
@@ -248,12 +319,37 @@ this repository alone.
      linear: [linear, kanban]
    ```
 
-5. Check: delegate a test issue to the agent. Within seconds the Agent Session shows a thought,
-   the plugin starts one native task (`session.admit` in the logs) and the session reports
-   progress. Repeating the delegation never starts a second task.
+6. **Start it**: `docker compose -f compose.yaml -f compose.sidecars.yaml up -d`. The compose
+   file gives each agent its own inbox volume at `/opt/data/workspace/linear`, and only the
+   receiver can write to it from outside the agent. Set the plugin's `ingress_profile` only if
+   the receiver files this agent's deliveries under a different name than its profile.
+7. **Check the setup.** Run the setup check with the receiver config:
 
-Once the receiver runs, chat-started work also gets an Agent Session: Linear opens one when the
-plugin delegates the issue to the app, and the running work adopts it.
+   ```bash
+   # from the Fleet checkout, as in the overlay README's setup check
+   python3 scripts/switchroom-doctor.py \
+     --config ~/my-fleet-overlay/managed/ops.yaml \
+     --linear-receiver-config ~/my-fleet-overlay/linear-receiver.json
+   ```
+
+   It reads `secrets/linear-receiver.env` beside that file (or `--linear-receiver-env`) and never
+   prints a secret.
+
+   It prints `linear-receiver: on`, or `linear-receiver: off: <reason>` (for example
+   `LINEAR_RECEIVER_PUBLIC_URL is not set` or `no agent has its webhook signing secret set`), plus
+   a `linear-receiver.<agent>: off: ...` line for each agent without its secret. The receiver
+   prints the same line when it starts (`docker compose logs linear-receiver`), with the webhook
+   URL for each agent it serves, and exits when it is off.
+8. **Check it end to end**: delegate a test issue to the agent. The receiver logs nothing for a
+   filed delivery and one `outcome=...` line for anything it refused or ignored. Within seconds
+   the plugin starts one native task (`session.admit` in `gateway.log`). Repeating the
+   delegation never starts a second task.
+
+What is proven so far: the receiver's checks above are covered by unit tests over real HTTP
+(`tests/test_linear_receiver.py`), its inbox has the exact table the plugin drains, and
+`docker compose config` accepts the layered files. Not yet checked: the receiver in running
+containers against a live Linear workspace, so the Agent Session panel showing progress
+(step 8) is what the plugin is built to do, not yet something this guide has observed.
 
 ## Part 3: handoff between two agents
 
@@ -286,5 +382,9 @@ The full flow and its limits are in
 | `... must be a regular file owned by this user with mode 600` | Fix ownership (UID 1000) and mode of `.op.env`, the token file or the cache. |
 | `reason=auth_unavailable` (on `service.start` or `auth.reauth_required` in `gateway.log`) | Linear refused the refresh token: revoked, expired or rotated by another process. Repeat step 3 and update the item. |
 | The chat says the delegate update is held | Usually `app:assignable` is missing, or a person changed the issue's routing first. The work still runs. |
-| Assigning in Linear does nothing | Expected without the receiver (Part 2). |
+| Assigning in Linear does nothing | Without the receiver this is expected (Part 2). With it, run the setup check (Part 2, step 7) and read `docker compose logs linear-receiver`. |
+| `outcome=refused:bad_signature` | The secret in `secrets/linear-receiver.env` is not this app's webhook signing secret, or the proxy changed the body. |
+| `outcome=refused:stale_or_missing_timestamp` | The host clock is more than a minute off, or something is replaying old deliveries. |
+| `outcome=ignored:unknown_actor` | The person is not in `allowed_actor_ids`, or Linear opened the session without a person behind it. |
+| `outcome=ignored:unknown_workspace` / `unknown_app` | `organization_id`, `app_user_id` or `oauth_client_id` in `linear-receiver.json` does not match this app (step 4 of Part 1). |
 | `context_or_service_unavailable` from the tool | The gateway, and with it the reporting service, is not running for this profile. |
