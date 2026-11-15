@@ -55,7 +55,8 @@ class UpstreamProvenanceTests(unittest.TestCase):
         for name, digest in upstream["files_sha256"].items():
             with self.subTest(file=name):
                 self.assertEqual(hashlib.sha256((PLUGIN / name).read_bytes()).hexdigest(), digest)
-        self.assertEqual(sorted(p.name for p in PLUGIN.iterdir()),
+        # Bytecode from another test importing the plugin is not source.
+        self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.name != "__pycache__"),
                          sorted([*upstream["files_sha256"], "UPSTREAM.json", upstream["license_file"]]))
 
     def test_licence_and_attribution_are_kept(self) -> None:
