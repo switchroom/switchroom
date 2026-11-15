@@ -75,6 +75,7 @@ CODING_CLI_LOGINS: dict[str, tuple[str | None, str, str]] = {
 BUNDLED_PLUGINS = "/opt/hermes/plugins"
 OP_BINARY = "/usr/local/bin/op"
 DISK_CLEANUP_MODE = "report_only"
+DISK_CLEANUP_MANUAL_DELETE = "plugins.config.disk-cleanup.allow_manual_delete"
 SESSION_RESET_MODES = frozenset({"idle", "daily", "both"})
 # Plugin each default needs on disk inside the container, for --check-files:
 # (directory the plugin lives in, relative to "bundled" or "user" plugins).
@@ -345,6 +346,14 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
         if reserved in owned:
             raise DefaultsError(f"defaults.yaml: {reserved} is built by the renderer; do not set it here")
     order = {default_id: index for index, default_id in enumerate(contract_ids)}
+    # The shared defaults must never opt every agent into manual deletion;
+    # only one agent's own file may set it, and the setup check warns.
+    for label, leaves in [("values", shared)] + [
+            (f"defaults.{default_id}.{kind}", entry[kind])
+            for default_id, entry in parsed.items() for kind in ("values", "off_values")]:
+        if manual_delete_allowed(_unflatten(leaves)):
+            raise DefaultsError(f"defaults.yaml {label}: {DISK_CLEANUP_MANUAL_DELETE} may only be set "
+                                "in one agent's own file")
     return {"values": shared, "granted_providers": granted,
             "defaults": dict(sorted(parsed.items(), key=lambda item: order[item[0]]))}
 
@@ -579,6 +588,15 @@ def disk_cleanup_problem(config: Mapping[str, Any]) -> str | None:
     return None
 
 
+def manual_delete_allowed(config: Mapping[str, Any]) -> bool:
+    """Whether a config lets chat users run the deleting /disk-cleanup quick and deep.
+
+    The Fleet copy of the plugin refuses them in report_only unless this is
+    exactly true (plugins/disk-cleanup/UPSTREAM.json, manual-delete-guard).
+    """
+    return _get(config, DISK_CLEANUP_MANUAL_DELETE) is True
+
+
 def _settings_problem(default_id: str, config: Mapping[str, Any]) -> str | None:
     """Why a plugin would refuse, or silently ignore, the settings of a default that is on."""
     if default_id == "linear":
@@ -744,6 +762,9 @@ def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_pat
             decision = Decision(True) if any(logged_in) else Decision(False, f"{degrade}: no coding CLI login found")
         else:
             decision = Decision(True)
+        if default_id == "disk-cleanup" and state and manual_delete_allowed(config):
+            extra.append(f"warning: disk-cleanup: {DISK_CLEANUP_MANUAL_DELETE} is true; any allowed chat "
+                         "user can run /disk-cleanup quick or deep, which delete tracked files")
         lines.append(decision.line(default_id))
         lines.extend(extra)
     if granted is not None:

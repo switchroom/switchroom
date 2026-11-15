@@ -1,16 +1,19 @@
 """The published disk-cleanup plugin and the starter overlay's report-only default.
 
-plugins/disk-cleanup is copied byte-for-byte from the Hermes Agent revision
-the Fleet image is built on (UPSTREAM.json). The starter overlay renders
+plugins/disk-cleanup is copied from the Hermes Agent revision the Fleet image
+is built on (UPSTREAM.json), plus one recorded, removable fleet patch
+(manual-delete-guard). The starter overlay renders
 ``plugins.config.disk-cleanup.session_end_mode: report_only``; these tests run
-that rendered config through the plugin's own mode reader and its session-end
-hook, and prove nothing is deleted.
+that rendered config through the plugin's own mode reader, its session-end
+hook and its /disk-cleanup quick and deep commands, and prove nothing is
+deleted unless an agent opts in with ``allow_manual_delete: true``.
 """
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import types
@@ -49,15 +52,44 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return merged
 
 
+def _strip_fleet_patch(text: str, patch_id: str) -> str:
+    """The file as upstream shipped it: drop the one marked fleet block and the blank lines after it."""
+    marker = re.escape(f"hermes-fleet patch: {patch_id}")
+    block = re.compile(rf"^[^\n]*{marker}.*?end {marker}[^\n]*\n\n*", re.S | re.M)
+    stripped, count = block.subn("", text, count=1)
+    if count != 1:
+        raise AssertionError(f"no {patch_id} block")
+    return stripped
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 class UpstreamProvenanceTests(unittest.TestCase):
-    def test_files_match_the_recorded_upstream_hashes(self) -> None:
+    def test_files_match_the_recorded_hashes(self) -> None:
         upstream = json.loads((PLUGIN / "UPSTREAM.json").read_text(encoding="utf-8"))
         for name, digest in upstream["files_sha256"].items():
             with self.subTest(file=name):
-                self.assertEqual(hashlib.sha256((PLUGIN / name).read_bytes()).hexdigest(), digest)
+                self.assertEqual(_sha256((PLUGIN / name).read_bytes()), digest)
+        self.assertEqual(set(upstream["upstream_files_sha256"]), set(upstream["files_sha256"]))
         # Bytecode from another test importing the plugin is not source.
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.name != "__pycache__"),
                          sorted([*upstream["files_sha256"], "UPSTREAM.json", upstream["license_file"]]))
+
+    def test_every_change_from_upstream_is_a_recorded_removable_patch(self) -> None:
+        upstream = json.loads((PLUGIN / "UPSTREAM.json").read_text(encoding="utf-8"))
+        patched = {name: patch["id"] for patch in upstream["patches"] for name in patch["files"]}
+        self.assertEqual([p["id"] for p in upstream["patches"]], ["manual-delete-guard"])
+        for name, original in upstream["upstream_files_sha256"].items():
+            with self.subTest(file=name):
+                current = (PLUGIN / name).read_bytes()
+                if name not in patched:
+                    self.assertEqual(_sha256(current), original)
+                    continue
+                self.assertNotEqual(_sha256(current), original)
+                restored = _strip_fleet_patch(current.decode("utf-8"), patched[name])
+                self.assertEqual(_sha256(restored.encode("utf-8")), original)
 
     def test_licence_and_attribution_are_kept(self) -> None:
         upstream = json.loads((PLUGIN / "UPSTREAM.json").read_text(encoding="utf-8"))
@@ -169,15 +201,98 @@ class ReportOnlyDefaultTests(unittest.TestCase):
         self.plugin._on_session_end(session_id="task")
         self.assertFalse(target.exists())
 
-    def test_register_wires_hooks_and_the_operator_command(self) -> None:
+    def test_register_wires_hooks_and_the_slash_command(self) -> None:
         ctx = mock.Mock()
         self.plugin.register(ctx)
         hooks = {call.args[0] for call in ctx.register_hook.call_args_list}
         self.assertEqual(hooks, {"pre_tool_call", "post_tool_call", "on_session_end"})
-        # The only deleting paths left are an operator typing /disk-cleanup
-        # quick or deep; no tool is registered for the model to call.
+        # No tool is registered for the model to call. The slash command is
+        # open to any allowed chat user, so its deleting subcommands are
+        # guarded below.
         ctx.register_tool.assert_not_called()
         self.assertEqual(ctx.register_command.call_args.args[0], "disk-cleanup")
+        handler = ctx.register_command.call_args.kwargs["handler"]
+        self.assertIn("refused", handler("quick"))
+
+    # -- manual-delete-guard: /disk-cleanup quick and deep -----------------
+
+    def deletable_state(self) -> tuple[Path, Path]:
+        """A tracked test file quick would delete, and an empty dir its sweep would remove."""
+        target = self.create_tracked_test_file()
+        empty = self.home / "scratch-area" / "empty"
+        empty.mkdir(parents=True)
+        return target, empty
+
+    def snapshot(self) -> dict[str, bytes | None]:
+        return {str(p.relative_to(self.home)): (None if p.is_dir() else p.read_bytes())
+                for p in sorted(self.home.rglob("*"))}
+
+    def set_disk_cleanup(self, **settings) -> None:
+        config = json.loads(json.dumps(self.rendered))
+        config["plugins"]["config"]["disk-cleanup"].update(settings)
+        self.write_managed(config)
+
+    def test_starter_config_does_not_opt_in(self) -> None:
+        self.assertNotIn("allow_manual_delete", self.rendered["plugins"]["config"]["disk-cleanup"])
+        self.assertFalse(self.plugin._manual_delete_allowed())
+
+    def test_quick_and_deep_refuse_and_delete_nothing_in_report_only(self) -> None:
+        target, empty = self.deletable_state()
+        self.assertEqual(len(self.plugin.dg.dry_run()[0]), 1)
+        before = self.snapshot()
+        for sub in ("quick", "deep"):
+            with self.subTest(subcommand=sub):
+                reply = self.plugin._handle_slash(sub)
+                self.assertIn(f"`/disk-cleanup {sub}` refused", reply)
+                self.assertIn("Nothing was deleted", reply)
+                self.assertEqual(self.snapshot(), before)
+        self.assertTrue(target.exists())
+        self.assertTrue(empty.is_dir())
+
+    def test_only_an_exact_true_opts_in(self) -> None:
+        target, empty = self.deletable_state()
+        before = self.snapshot()
+        for value in (False, "true", 1, None):
+            with self.subTest(allow_manual_delete=value):
+                self.set_disk_cleanup(allow_manual_delete=value)
+                self.assertIn("refused", self.plugin._handle_slash("quick"))
+                self.assertEqual(self.snapshot(), before)
+
+    def test_disabled_and_unreadable_config_also_refuse(self) -> None:
+        target, empty = self.deletable_state()
+        before = self.snapshot()
+        self.set_disk_cleanup(session_end_mode="disabled")
+        self.assertIn("session_end_mode is disabled", self.plugin._handle_slash("quick"))
+        (self.managed_dir / "config.yaml").write_text("plugins: [unclosed\n", encoding="utf-8")
+        self.assertIn("refused", self.plugin._handle_slash("deep"))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_with_the_opt_in_quick_deletes_as_upstream(self) -> None:
+        target, empty = self.deletable_state()
+        self.set_disk_cleanup(allow_manual_delete=True)
+        reply = self.plugin._handle_slash("quick")
+        self.assertTrue(reply.startswith("[disk-cleanup] Cleaned 1 files + "), reply)
+        self.assertFalse(target.exists())
+        self.assertFalse(empty.exists())
+
+    def test_with_the_opt_in_deep_deletes_as_upstream(self) -> None:
+        target, empty = self.deletable_state()
+        self.set_disk_cleanup(allow_manual_delete=True)
+        reply = self.plugin._handle_slash("deep")
+        self.assertTrue(reply.startswith("[disk-cleanup] Cleaned 1 files + "), reply)
+        self.assertFalse(target.exists())
+
+    def test_cleanup_mode_keeps_the_upstream_commands(self) -> None:
+        target, _ = self.deletable_state()
+        self.set_disk_cleanup(session_end_mode="cleanup")
+        self.assertTrue(self.plugin._handle_slash("quick").startswith("[disk-cleanup] Cleaned 1 files"))
+        self.assertFalse(target.exists())
+
+    def test_read_only_subcommands_are_not_guarded(self) -> None:
+        target, _ = self.deletable_state()
+        self.assertIn("Dry-run preview", self.plugin._handle_slash("dry-run"))
+        self.assertNotIn("refused", self.plugin._handle_slash("status"))
+        self.assertTrue(target.exists())
 
 
 if __name__ == "__main__":

@@ -646,6 +646,37 @@ class StarterOverlayWave1bDefaultsTests(unittest.TestCase):
             result = run(DOCTOR, "--config", str(path), "--no-process-env")
         self.assertEqual(result.returncode, 1)
 
+    def test_manual_delete_opt_in_is_refused_in_the_shared_defaults(self) -> None:
+        opt_in = "        session_end_mode: report_only\n        allow_manual_delete: true\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = _overlay_copy(tmp, lambda t: t.replace("        session_end_mode: report_only\n", opt_in))
+            self.assertIn("allow_manual_delete: true", (config_dir / "defaults.yaml").read_text(encoding="utf-8"))
+            with self.assertRaisesRegex(self.sd.DefaultsError, "allow_manual_delete may only be set"):
+                self.render(config_dir=config_dir)
+        rendered = self.render().config
+        self.assertNotIn("allow_manual_delete", rendered["plugins"]["config"]["disk-cleanup"])
+        lines, problems = self.sd.diagnose(rendered, FULL_ENV, CONTRACT)
+        self.assertFalse([line for line in lines if line.startswith("warning:")], lines)
+
+    def test_one_agent_may_opt_in_and_the_setup_check_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = _overlay_copy(tmp, agent_body="values:\n  plugins.config.disk-cleanup:\n"
+                                                       "    session_end_mode: report_only\n"
+                                                       "    allow_manual_delete: true\n")
+            config = self.render(config_dir=config_dir).config
+        self.assertIs(config["plugins"]["config"]["disk-cleanup"]["allow_manual_delete"], True)
+        lines, problems = self.sd.diagnose(config, FULL_ENV, CONTRACT)
+        self.assertEqual(problems, [])
+        index = lines.index("disk-cleanup: on")
+        self.assertTrue(lines[index + 1].startswith(
+            "warning: disk-cleanup: plugins.config.disk-cleanup.allow_manual_delete is true"), lines)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            result = run(DOCTOR, "--config", str(path), "--no-process-env")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: disk-cleanup:", result.stdout)
+
     def test_session_reset_values_the_plugin_would_ignore_are_reported_off(self) -> None:
         config = self.render().config
         lines, _ = self.sd.diagnose(config, FULL_ENV, CONTRACT)

@@ -52,7 +52,7 @@ the reviewed set from `contracts/plugins.json`:
 | `quota` | the quota plugin, pinned in `vendor.lock.json` | never (not fetched: absent and reported) |
 | `session-reset-policy` | `session_reset` idle after 240 minutes, through the pinned `hermes-session-reset-policy` plugin | never (not fetched: absent and reported) |
 | `security-guidance` | the `security-guidance` plugin in the Hermes image | never |
-| `disk-cleanup` | `plugins/disk-cleanup` with `session_end_mode: report_only` | never |
+| `disk-cleanup` | `plugins/disk-cleanup` with `session_end_mode: report_only` | never (not fetched: absent and reported) |
 | `shared-skill-pack` | `skills/` mounted read-only at `/opt/skill-packs/shared`, listed in `skills.external_dirs` | never (not fetched: absent and reported) |
 
 A default whose variable is not set is rendered off, so the agent still
@@ -72,9 +72,17 @@ Notes on the newer defaults:
   makes no model calls; its optional Agent Monitor stays off.
 - **Disk cleanup.** The plugin treats a missing mode as `cleanup`, so the
   renderer refuses a config without `report_only` and the setup check flags it
-  as a problem. At session end it only counts candidates. The only deleting
-  paths are the operator's own `/disk-cleanup quick` and `/disk-cleanup deep`
-  commands; the model has no tool for them.
+  as a problem. At session end it only counts candidates. The plugin also
+  registers `/disk-cleanup quick` and `/disk-cleanup deep`, gateway slash
+  commands any allowed chat user can run, which delete tracked files
+  upstream. The Fleet copy has a small recorded patch
+  (`plugins/disk-cleanup/UPSTREAM.json`) that refuses both, deleting nothing,
+  unless `plugins.config.disk-cleanup.allow_manual_delete: true` is set. The
+  starter defaults never set it and the renderer refuses it in
+  `defaults.yaml`. One agent's own file may set it; the setup check then
+  prints a `warning:` line. The model has no tool for either command. The
+  plugin is mounted from `vendor/`, so if that was never fetched it is
+  absent and the setup check reports it.
 - **Coding CLIs.** The image already installs them. The overlay declares the
   expected set under `_switchroom`, a top-level key Hermes ignores, so the
   setup check can report each login.

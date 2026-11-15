@@ -6,6 +6,10 @@ Prints one line per default in contracts/plugins.json:
     <default>: on
     <default>: off: <reason>
 
+and a `warning: <default>: ...` line for a risky per-agent choice that is
+allowed (today: an agent that sets
+plugins.config.disk-cleanup.allow_manual_delete: true).
+
 A missing credential or sidecar is a degraded default, not a failure: the
 exit status stays 0. Exit 1 means a contract problem (for example an
 ungranted model provider in the chain, or disk cleanup in a deleting mode);

@@ -173,7 +173,9 @@ defaults:
 
   # Tracks ephemeral files and only reports them at session end. The plugin
   # treats a missing mode as "cleanup", so report_only must stay set; the
-  # renderer and setup check refuse anything else.
+  # renderer and setup check refuse anything else. /disk-cleanup quick and
+  # deep stay refused unless allow_manual_delete: true, which the renderer
+  # refuses here; only one agent's own file may set it.
   disk-cleanup:
     plugins: [disk-cleanup]
     values:
