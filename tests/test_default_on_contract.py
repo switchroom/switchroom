@@ -46,7 +46,8 @@ DEFAULT_COMPONENTS = {
 }
 OPT_IN_COMPONENTS = {"browser-handoff"}
 # Shipped only when the starter overlay actually enables a default. Wave 0 ships none.
-SHIPPED: set[str] = set()
+# Proven in real containers: docs/starter-overlay-acceptance.md.
+SHIPPED: set[str] = {"doctrine-config", "gateway-per-agent", "quota", "session-reset-policy", "security-guidance", "disk-cleanup"}
 GRANTED_BILLING = {"none", "principal_plan_login", "operator_supplied_key"}
 DEGRADE_BEHAVIOURS = {
     "always_on",
@@ -143,6 +144,13 @@ class DefaultOnContractTests(unittest.TestCase):
                 expected = "shipped" if entry["id"] in SHIPPED else "planned"
                 self.assertEqual(entry["status"], expected)
 
+    def test_every_shipped_default_has_container_evidence(self) -> None:
+        evidence = (ROOT / "docs" / "starter-overlay-acceptance.md").read_text(encoding="utf-8")
+        for entry in load()["public_base"]["default_set"]:
+            with self.subTest(default=entry["id"]):
+                row = f"| `{entry['id']}` | **shipped** |"
+                self.assertEqual(row in evidence, entry["status"] == "shipped")
+
     def test_components_outside_the_list_stay_off(self) -> None:
         contract = load()
         covered = {cid for d in contract["public_base"]["default_set"] for cid in d["covers"]}
@@ -184,7 +192,8 @@ class DefaultOnContractTests(unittest.TestCase):
         self.assertIn("Nothing is on by default yet", record)
         for opt in ("Browser handoff", "A2A", "artifact publishing"):
             self.assertIn(opt, record)
-        self.assertIn("nothing is on by default yet", readme)
+        self.assertIn("The bare image still turns nothing on", readme)
+        self.assertIn("docs/starter-overlay-acceptance.md", readme)
         self.assertNotIn("Plugins stay off until the overlay turns them on", readme)
         self.assertIn("reference/rfcs/default-on-distribution.md", readme)
         self.assertNotIn("Do not enable optional plugins by default.", agents)

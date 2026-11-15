@@ -2,7 +2,7 @@
 
 `scripts/switchroom-rollout.py` moves the agents of one Docker Compose project onto one digest-pinned Fleet image, one agent at a time, with a chosen controller last. If an agent does not come back healthy, the runner puts that agent back on the image it was running and stops.
 
-**Status: proven by unit tests with a fake Docker only** (`tests/test_rollout_runner.py`). It has not yet been run against real containers from this repository. Treat the first real run as a trial on a disposable two-agent project, not as a fleet upgrade.
+**Status: proven by unit tests with a fake Docker** (`tests/test_rollout_runner.py`) **and by one run on a disposable two-agent project of real containers**: a forward roll with the controller last, then a forced health failure that rolled the failed agent back and stopped ([starter-overlay-acceptance.md](starter-overlay-acceptance.md#rollout-runner)). It has not been used for a fleet upgrade.
 
 Publishing an image does not authorise a rollout (see [image-release.md](image-release.md)). This runner is the deploy step, and it only ever reports what it did to the containers it touched.
 

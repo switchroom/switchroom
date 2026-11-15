@@ -23,7 +23,7 @@
     "default_set": [
       {
         "id": "doctrine-config",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Working doctrine config: system prompt, smart approvals, queue-first chat, verify-on-stop.",
         "covers": [],
@@ -39,7 +39,7 @@
       },
       {
         "id": "gateway-per-agent",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "One gateway per agent, pinned with gateway.multiplex_profiles: false.",
         "covers": [],
@@ -232,7 +232,7 @@
       },
       {
         "id": "quota",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Quota checks before long tasks and on rate limits, through the third-party quota plugin pinned by exact commit.",
         "covers": [],
@@ -256,7 +256,7 @@
       },
       {
         "id": "session-reset-policy",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Fresh conversation after 240 idle minutes, through the third-party hermes-session-reset-policy plugin pinned by exact commit.",
         "covers": [],
@@ -279,7 +279,7 @@
       },
       {
         "id": "security-guidance",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Security warnings on dangerous patterns in file writes, from the Hermes Agent security-guidance plugin in the image.",
         "covers": [],
@@ -300,7 +300,7 @@
       },
       {
         "id": "disk-cleanup",
-        "status": "planned",
+        "status": "shipped",
         "starter_overlay": "configured",
         "summary": "Disk cleanup in report-only mode: tracks ephemeral files and reports them at session end, never deleting; the deleting quick and deep slash commands are refused unless an agent opts in with allow_manual_delete.",
         "covers": [],

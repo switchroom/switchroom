@@ -45,7 +45,7 @@ compose.example.yaml       Synthetic example, not a production baseline
 contracts/                 Public product boundaries
 docs/                      Human docs for public behavior
 examples/overlay-repo/     Placeholder overlay repository
-plugins/                   Mounted plugin source; reviewed defaults planned, none on yet
+plugins/                   Mounted plugin source; off in the bare image, reviewed defaults via the overlay
 release/                   Pinned Agent parent handoff
 scripts/                   Build, compose, and verification wrappers
 sidecars/                  Independent sidecar source and image workflows

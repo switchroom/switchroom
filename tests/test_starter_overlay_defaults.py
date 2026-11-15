@@ -531,8 +531,12 @@ class StarterOverlayContractTests(unittest.TestCase):
                               True if entry["id"] in declared else None)
 
     def test_configuring_a_default_does_not_ship_it(self) -> None:
+        # Configured is not shipped: only a default with real-container evidence
+        # is shipped (docs/starter-overlay-acceptance.md).
+        evidence = (ROOT / "docs" / "starter-overlay-acceptance.md").read_text(encoding="utf-8")
         for entry in contract_defaults():
-            self.assertEqual(entry["status"], "planned", entry["id"])
+            proven = f"| `{entry['id']}` | **shipped** |" in evidence
+            self.assertEqual(entry["status"], "shipped" if proven else "planned", entry["id"])
 
     def test_model_defaults_bill_only_the_principals_plan(self) -> None:
         doc = self.sd.load_yaml(FLEET_CONFIG / "defaults.yaml")
