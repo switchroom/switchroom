@@ -16,9 +16,15 @@ ungranted model provider in the chain, or disk cleanup in a deleting mode);
 exit 2 means unreadable input. Variable values, file contents and 1Password
 references are never printed, only names and paths.
 
+After the model-roles line come one `model-roles.plan.<plan>` line per
+subscription plan (claude, chatgpt, grok) and one `model-roles.<role>` line
+per task role (main, coding, fast, approvals, compression), on with the route
+or off with the reason.
+
 With --check-files (inside the agent container) it also requires the login
-files, the mounted plugins and skill pack, and the 1Password mapping, and
-prints one `coding-clis.<cli>` line per coding CLI.
+files (including Hermes' own ChatGPT and SuperGrok logins in auth.json), the
+mounted plugins and skill pack, and the 1Password mapping, and prints one
+`coding-clis.<cli>` line per coding CLI.
 
 With --linear-receiver-config (the overlay's linear-receiver.json) it also
 prints `linear-receiver: on` or `linear-receiver: off: <reason>` for the Linear

@@ -14,11 +14,17 @@ values:
   terminal.cwd: /opt/data/workspace
   web.use_gateway: false
 
-# Model providers this operator has granted. A model chain only ever uses
-# these. Remove a provider here and it drops out of every agent's chain.
+# Model providers this operator has granted. A model role only ever uses
+# these. Remove a provider here and it drops out of every agent's routes.
+# Each one bills a subscription plan the agent logs in to, never an API key:
+#   claude-subscription-directsdk-experimental, claude-acp  the Claude plan
+#   openai-codex                                            the ChatGPT plan
+#   xai-oauth                                               the SuperGrok plan
 granted_providers:
   - claude-subscription-directsdk-experimental
   - claude-acp
+  - openai-codex
+  - xai-oauth
 
 # The reviewed default set (contracts/plugins.json public_base.default_set).
 # An entry is applied when every `requires_env` variable is set. When one is
@@ -79,10 +85,53 @@ defaults:
         model: sonnet
         timeout: 90
 
-  # Main model first, then fallbacks, taken from the `model` of each listed
-  # default that is on and whose provider is granted.
+  # Which subscription plan each task role uses (docs/choose-your-plans.md).
+  # A plan is used only when its login exists inside the agent container and
+  # its provider is granted above; otherwise it is left out, never half on.
+  # Each role uses its lead plan's models first, then falls back to the other
+  # plans in the order listed under `plans`.
   model-roles:
-    chain: [claude-subscription-directsdk, claude-acp-connectors]
+    # The plan for the main chat model. Switch the lead plan in one line:
+    # claude, chatgpt or grok. This changes the main model only.
+    primary_plan: claude
+    # The lead plan for every other role.
+    #   coding       delegated subagents (delegation.*)
+    #   fast         titles, profile blurbs, group-chat routing (auxiliary.*)
+    #   approvals    the smart-approval classifier (auxiliary.approval)
+    #   compression  context compression (auxiliary.compression)
+    roles:
+      coding: claude
+      fast: claude
+      approvals: claude
+      compression: claude
+    plans:
+      # Claude plan: this agent's own Claude Code login (the two Claude defaults).
+      claude:
+        main:
+          - {provider: claude-subscription-directsdk-experimental, model: opus}
+          - {provider: claude-acp, model: sonnet}
+        coding:
+          - {provider: claude-subscription-directsdk-experimental, model: opus}
+          - {provider: claude-acp, model: sonnet}
+        fast: [{provider: claude-subscription-directsdk-experimental, model: haiku}]
+        approvals: [{provider: claude-subscription-directsdk-experimental, model: haiku}]
+        compression: [{provider: claude-subscription-directsdk-experimental, model: sonnet}]
+      # ChatGPT plan through Hermes' openai-codex provider. Log in inside the
+      # agent container: hermes auth add openai-codex --type oauth
+      chatgpt:
+        main: [{provider: openai-codex, model: gpt-6-sol}]
+        coding: [{provider: openai-codex, model: gpt-6-sol}]
+        fast: [{provider: openai-codex, model: gpt-6-luna}]
+        approvals: [{provider: openai-codex, model: gpt-6-luna}]
+        compression: [{provider: openai-codex, model: gpt-6-luna}]
+      # SuperGrok plan through Hermes' xai-oauth provider. Log in inside the
+      # agent container: hermes auth add xai-oauth --type oauth
+      grok:
+        main: [{provider: xai-oauth, model: grok-4.6}]
+        coding: [{provider: xai-oauth, model: grok-composer-2.5-fast}]
+        fast: [{provider: xai-oauth, model: grok-composer-2.5-fast}]
+        approvals: [{provider: xai-oauth, model: grok-composer-2.5-fast}]
+        compression: [{provider: xai-oauth, model: grok-4.6}]
 
   # Linear needs the app's token and the two IDs it is bound to (viewer.id and
   # organization.id from docs/linear-setup.md step 4). The plugin refuses to

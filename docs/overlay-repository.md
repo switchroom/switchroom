@@ -59,7 +59,8 @@ shared values, then the reviewed starter defaults, then the agent's own
 values, each leaf allowlisted and type-checked against `schema.yaml`. A
 default whose credential variable is unset is rendered off.
 `scripts/switchroom-doctor.py` reports every default as on or off with the
-reason. Steps are in `examples/overlay-repo/README.md`.
+reason. Steps are in `examples/overlay-repo/README.md`. Which subscription
+plan leads each task role is in [Choose your plans](choose-your-plans.md).
 
 Do not put credentials, OAuth state, memories, or sessions in the overlay git
 tree. Secret values fail closed: never git, never image, never managed YAML.
