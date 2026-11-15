@@ -20,8 +20,14 @@
 # - Peer text grants no authority. The plugin frames inbound text as untrusted
 #   peer input, refuses operator slash commands from peers, and the receiving
 #   agent's own approvals still apply to anything it does.
-# - Only agents that opt in join the internal a2a network, so nobody else can
-#   reach a listener. The listener is never published on the host.
+# - The network is not the gate. Only agents that opt in join the internal a2a
+#   network, but the listener binds 0.0.0.0, so it answers on every network
+#   the agent is on. Over the starter sidecars that includes the shared
+#   honcho, onepassword and (ops) voice networks and the agent's own egress
+#   network, so honcho, voice, onepassword-connect-api (and ops-browser, with
+#   the browser-handoff recipe) can open a connection to port 9900. The
+#   per-peer token plus A2A_TRUSTED_PEERS is what refuses them. Port 9900 is
+#   never published on the host.
 #
 # Secrets, in each agent's env file (never in git):
 #
