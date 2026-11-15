@@ -216,26 +216,93 @@ class RecipeIsolationTests(unittest.TestCase):
         for volume in ops["volumes"]:
             self.assertNotIn("review", volume)
 
-    @unittest.skipUnless(shutil.which("docker"), "docker compose is not installed")
-    def test_docker_compose_config_accepts_each_layered_combination(self) -> None:
-        probe = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, check=False)
-        if probe.returncode != 0:
-            self.skipTest("docker compose plugin is not available")
+    def _require_compose(self) -> None:
+        # CI must run the composed checks; only a local run without Docker may skip.
+        available = shutil.which("docker") is not None and subprocess.run(
+            ["docker", "compose", "version"], capture_output=True, text=True, check=False).returncode == 0
+        if not available:
+            if os.environ.get("CI"):
+                self.fail("docker compose is required in CI for the composed recipe checks")
+            self.skipTest("docker compose is not available")
+
+    def _compose(self, overlay: Path, fragments: list[Path], tail: list[str]) -> subprocess.CompletedProcess:
         env = dict(os.environ, HERMES_FLEET_IMAGE="ghcr.io/example/hermes-fleet@sha256:" + "0" * 64)
+        args = ["docker", "compose", "-f", "compose.yaml", "-f", "compose.sidecars.yaml"]
+        for path in fragments:
+            args += ["-f", str(path)]
+        return subprocess.run(args + tail, cwd=overlay, env=env, capture_output=True, text=True, check=False,
+                              timeout=120)
+
+    def _overlay(self, tmp: str) -> Path:
+        overlay = Path(tmp) / "overlay"
+        shutil.copytree(OVERLAY, overlay)
+        (overlay / "secrets").mkdir(exist_ok=True)
+        (overlay / "secrets" / "ops-browser.env").write_text("", encoding="utf-8")
+        return overlay
+
+    def test_docker_compose_config_accepts_each_layered_combination(self) -> None:
+        self._require_compose()
         with tempfile.TemporaryDirectory() as tmp:
-            overlay = Path(tmp) / "overlay"
-            shutil.copytree(OVERLAY, overlay)
-            (overlay / "secrets").mkdir(exist_ok=True)
-            (overlay / "secrets" / "ops-browser.env").write_text("", encoding="utf-8")
+            overlay = self._overlay(tmp)
             combos = [[p] for p in FRAGMENTS.values()] + [list(FRAGMENTS.values())]
             for combo in combos:
-                args = ["docker", "compose", "-f", "compose.yaml", "-f", "compose.sidecars.yaml"]
-                for path in combo:
-                    args += ["-f", str(path)]
                 with self.subTest(combo=[p.name for p in combo]):
-                    result = subprocess.run(args + ["config", "-q"], cwd=overlay, env=env, capture_output=True,
-                                            text=True, check=False, timeout=120)
+                    result = self._compose(overlay, combo, ["config", "-q"])
                     self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a2a_listener_reach_matches_the_documented_boundary(self) -> None:
+        """The A2A listener answers on every network its agent is on, never on the host.
+
+        recipes/a2a/README.md and the compose.a2a.yaml header name exactly which
+        starter sidecars share a network with each agent, and so can open a
+        connection to 9900 and be refused only by the token and
+        A2A_TRUSTED_PEERS. Compose the documented layering (with the optional
+        1Password profile on, so every sidecar is present) and hold the docs to it.
+        """
+        self._require_compose()
+        shared = {"ops": {"worker", "honcho", "voice", "onepassword-connect-api"},
+                  "worker": {"ops", "honcho", "onepassword-connect-api"}}
+        combos = {
+            "a2a": ([FRAGMENTS["agent-to-agent"]], shared),
+            "all recipes": (list(FRAGMENTS.values()),
+                            {"ops": shared["ops"] | {"ops-browser"}, "worker": shared["worker"]}),
+        }
+        docs = {
+            "README": (RECIPES / "a2a" / "README.md").read_text(encoding="utf-8"),
+            "compose header": FRAGMENTS["agent-to-agent"].read_text(encoding="utf-8").split("\nx-a2a-listener")[0],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay = self._overlay(tmp)
+            for label, (fragments, expected) in combos.items():
+                with self.subTest(combo=label):
+                    result = self._compose(overlay, fragments, ["--profile", "onepassword", "config", "--format", "json"])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    services = json.loads(result.stdout)["services"]
+                    for agent, neighbours in expected.items():
+                        service = services[agent]
+                        self.assertEqual(service["environment"]["A2A_HOST"], "0.0.0.0")
+                        self.assertEqual(service["environment"]["A2A_PORT"], "9900")
+                        self.assertNotIn("ports", service, f"{agent} must publish nothing on the host")
+                        nets = set(service.get("networks") or {})
+                        self.assertIn("a2a", nets)
+                        reach = {name for name, other in services.items()
+                                 if name != agent and nets & set(other.get("networks") or {})}
+                        self.assertEqual(reach, neighbours, f"who can reach {agent}:9900 changed; update the docs")
+                    for name, service in services.items():
+                        for port in service.get("ports") or []:
+                            self.assertNotIn(str(port.get("target")), {"9900"}, name)
+                            self.assertNotIn(str(port.get("published")), {"9900"}, name)
+        named = set().union(*shared.values(), {"ops-browser"}) - set(AGENTS)
+        for doc, text in docs.items():
+            with self.subTest(doc=doc):
+                for claim in ("Reachable only by peers", "nobody else can"):
+                    self.assertNotIn(claim, text)
+                for sidecar in named:
+                    self.assertIn(sidecar, text, f"{doc} must name {sidecar} as able to reach 9900")
+                for network in ("honcho", "onepassword", "voice"):
+                    self.assertIn(network, text)
+                self.assertIn("A2A_TRUSTED_PEERS", text)
+                self.assertRegex(text, r"never\s+(?:#\s+)?published on the host")
 
 
 class ArtifactOriginTests(unittest.TestCase):

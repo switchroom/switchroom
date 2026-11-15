@@ -26,8 +26,18 @@ the `a2a` network and no peer is trusted.
   says the same, and operator slash commands in peer text are not run. Peer
   text cannot approve a command, change config or widen access: the receiving
   agent's own approvals apply to everything it does in an A2A turn.
-- **Reachable only by peers.** Only agents that opt in join the internal `a2a`
-  network. The listener (`9900`) is never published on the host.
+- **The network is not the gate; the token is.** Only agents that opt in join
+  the internal `a2a` network, but the listener binds `0.0.0.0:9900`, so it
+  answers on every network the agent is on. Layered over
+  `compose.sidecars.yaml`, that includes the shared `honcho`, `onepassword`
+  and (for `ops`) `voice` networks and the agent's own egress network. So
+  `honcho`, `voice`, `onepassword-connect-api` (and `ops-browser`, with the
+  browser-handoff recipe), or any container you attach to one of those
+  networks, can open a connection to `9900`. The per-peer token plus
+  `A2A_TRUSTED_PEERS` refuses them with `401`/`403`. The listener is never
+  published on the host. `tests/test_recipes.py` composes the starter overlay
+  with this recipe and fails if that set of neighbours changes or `9900`
+  gets published.
 - **Audited.** Each agent logs every A2A exchange, with the authenticated
   peer name, to `a2a_audit.jsonl` in its state volume.
 
