@@ -302,7 +302,7 @@
         "id": "disk-cleanup",
         "status": "planned",
         "starter_overlay": "configured",
-        "summary": "Disk cleanup in report-only mode: tracks ephemeral files and reports them at session end, never deleting.",
+        "summary": "Disk cleanup in report-only mode: tracks ephemeral files and reports them at session end, never deleting; the deleting quick and deep slash commands are refused unless an agent opts in with allow_manual_delete.",
         "covers": [],
         "credential": {
           "kind": "none"

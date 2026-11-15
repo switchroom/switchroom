@@ -307,6 +307,39 @@ _SUBCOMMANDS: dict[str, Callable[[list[str]], str]] = {
     "forget": _cmd_forget}
 
 
+# --- hermes-fleet patch: manual-delete-guard (recorded in UPSTREAM.json) ---
+# `/disk-cleanup quick` and `deep` are gateway slash commands any allowed chat
+# user can run, and both delete tracked files. Unless the automatic mode is
+# `cleanup`, they refuse without touching the filesystem until the operator
+# sets plugins.config.disk-cleanup.allow_manual_delete: true. `disabled` is
+# included because unreadable or malformed config also reads as disabled.
+def _manual_delete_allowed() -> bool:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = (((load_config_readonly() or {}).get("plugins") or {}).get("config") or {}).get("disk-cleanup")
+        return isinstance(value, dict) and value.get("allow_manual_delete") is True
+    except Exception:
+        return False
+
+
+def _guard_manual_delete(name: str, handler: Callable[[list[str]], str]) -> Callable[[list[str]], str]:
+    def guarded(argv: list[str]) -> str:
+        mode = _session_end_mode()
+        if mode != "cleanup" and not _manual_delete_allowed():
+            return (f"[disk-cleanup] `/disk-cleanup {name}` refused: session_end_mode is {mode} and "
+                    "plugins.config.disk-cleanup.allow_manual_delete is not true. Nothing was deleted. "
+                    "Use `/disk-cleanup dry-run` to preview.")
+        return handler(argv)
+    return guarded
+
+
+for _name in ("quick", "deep"):
+    _SUBCOMMANDS[_name] = _guard_manual_delete(_name, _SUBCOMMANDS[_name])
+del _name
+# --- end hermes-fleet patch: manual-delete-guard ---
+
+
 def _handle_slash(raw_args: str) -> Optional[str]:
     argv = raw_args.strip().split()
     if not argv or argv[0] in {"help", "-h", "--help"}:

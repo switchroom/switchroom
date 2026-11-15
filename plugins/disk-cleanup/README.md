@@ -39,6 +39,16 @@ Unknown, malformed, or unreadable configured modes fail closed as `disabled`. Th
 the automatic lifecycle hook; explicit `/disk-cleanup quick` and `/disk-cleanup deep` commands retain
 their existing behavior.
 
+<!-- hermes-fleet patch: manual-delete-guard (recorded in UPSTREAM.json) -->
+**Hermes Fleet copy.** The sentence above is upstream behavior. In this copy,
+`/disk-cleanup quick` and `/disk-cleanup deep` are refused, with nothing
+deleted, unless `session_end_mode` is `cleanup` or
+`plugins.config.disk-cleanup.allow_manual_delete: true` is set. They are
+gateway slash commands any allowed chat user can run, so `report_only` (and
+`disabled`, which unreadable config also reads as) would otherwise still
+leave a deleting path. `status`, `dry-run`, `track` and `forget` are unchanged.
+<!-- end hermes-fleet patch: manual-delete-guard -->
+
 For this hook, a missing `config.yaml` retains the historical `cleanup` default. A present file must
 parse to a YAML mapping before that default can be used: malformed YAML, a null/non-mapping root, an
 unreadable file, or a malformed `plugins` subtree disables automatic action. This is a plugin-local
