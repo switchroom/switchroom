@@ -1,0 +1,17 @@
+# Example only. Daily storage report for every agent in monitors.json.
+# Report-only: it never deletes anything.
+[Unit]
+Description=Switchroom agent storage monitor (report-only)
+Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/monitors.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-storage-monitor.py check --config /etc/switchroom/monitors.json --report /var/lib/switchroom-monitors/storage/latest.json
+# The full JSON report is in --report; keep it out of the journal.
+StandardOutput=null
+# For a webhook sink, put SWITCHROOM_ALERT_WEBHOOK_URL=... in a root-only file:
+# EnvironmentFile=/etc/switchroom/monitors.env
+UMask=0077
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=2G

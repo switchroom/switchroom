@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fixture <fixture@example.invalid>
+Date: Mon, 16 Nov 2026 07:05:25 +1100
+Subject: [PATCH] synthetic: add the patch probe
+
+---
+ switchroom_patch_probe.py      |  5 +++++
+ switchroom_patch_probe_test.py | 12 ++++++++++++
+ 2 files changed, 17 insertions(+)
+ create mode 100644 switchroom_patch_probe.py
+ create mode 100644 switchroom_patch_probe_test.py
+
+diff --git a/switchroom_patch_probe.py b/switchroom_patch_probe.py
+new file mode 100644
+index 0000000..4ebb62f
+--- /dev/null
++++ b/switchroom_patch_probe.py
+@@ -0,0 +1,5 @@
++"""Synthetic overlay patch used by the daily upstream patch test."""
++
++
++def greeting() -> str:
++    return "patched"
+diff --git a/switchroom_patch_probe_test.py b/switchroom_patch_probe_test.py
+new file mode 100644
+index 0000000..15e1d78
+--- /dev/null
++++ b/switchroom_patch_probe_test.py
+@@ -0,0 +1,12 @@
++import unittest
++
++import switchroom_patch_probe
++
++
++class ProbeTest(unittest.TestCase):
++    def test_patch_is_present(self) -> None:
++        self.assertEqual(switchroom_patch_probe.greeting(), "patched")
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,11 @@
+# Example only: systemctl enable --now switchroom-ownership-audit.timer
+[Unit]
+Description=Daily Switchroom agent ownership audit
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

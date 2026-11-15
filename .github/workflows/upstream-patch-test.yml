@@ -1,0 +1,61 @@
+name: Daily upstream patch test
+
+# Re-applies a patch series on the latest Hermes Agent upstream and runs its
+# tests. Read-only by construction: the token can only read this repository,
+# no secret is passed, and no step pushes, publishes, pins an image, edits a
+# Compose file or starts a rollout. See docs/upstream-patch-test.md.
+
+on:
+  schedule:
+    - cron: '41 19 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Hermes Agent branch to test against'
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-patch-test
+  cancel-in-progress: false
+
+jobs:
+  patch-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check the requested branch name
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          set -eu
+          if ! printf '%s' "$UPSTREAM_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$' \
+             || printf '%s' "$UPSTREAM_REF" | grep -q '\.\.'; then
+            echo "invalid upstream branch name" >&2
+            exit 2
+          fi
+      - name: Starter overlay series (zero patches)
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          python3 scripts/switchroom-upstream-patch-test.py \
+            --series examples/overlay-repo/patches/series.json \
+            --upstream-ref "$UPSTREAM_REF" \
+            --report "$RUNNER_TEMP/starter-overlay.json"
+      - name: Synthetic patch set on the real upstream
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          python3 scripts/switchroom-upstream-patch-test.py \
+            --series tests/fixtures/upstream-patches/series.json \
+            --upstream-ref "$UPSTREAM_REF" \
+            --report "$RUNNER_TEMP/synthetic.json"

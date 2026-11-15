@@ -1,0 +1,30 @@
+{
+  "schema": "switchroom-secret-references/1",
+  "description": "Synthetic map with exactly one deliberate violation: worker reads LINEAR_TOKEN from the vault ops owns, and that item is not shared.",
+  "agents": {
+    "ops": {
+      "vaults": ["example-ops"],
+      "references": {
+        "LINEAR_TOKEN": {"vault": "example-ops", "item": "linear", "field": "token"},
+        "HONCHO_API_KEY": {"vault": "example-shared", "item": "honcho", "field": "credential"}
+      }
+    },
+    "worker": {
+      "vaults": ["example-worker"],
+      "references": {
+        "PERPLEXITY_API_KEY": {"vault": "example-worker", "item": "perplexity", "field": "credential"},
+        "LINEAR_TOKEN": {"vault": "example-ops", "item": "linear", "field": "token"},
+        "HONCHO_API_KEY": {"vault": "example-shared", "item": "honcho", "field": "credential"}
+      }
+    },
+    "reviewer": {
+      "vaults": ["example-reviewer"],
+      "references": {
+        "GITHUB_TOKEN": {"vault": "example-reviewer", "item": "github", "section": "review", "field": "token"}
+      }
+    }
+  },
+  "shared": [
+    {"vault": "example-shared", "item": "honcho", "readers": ["ops", "worker"], "reason": "one memory service"}
+  ]
+}

@@ -23,6 +23,9 @@ your-fleet-overlay/
   managed/
     ops.yaml                   Optional /etc/hermes/config.yaml mount
   image/                       Optional unpublished binaries + hashed manifest
+  patches/series.json          Optional Hermes Agent patches (docs/upstream-patch-test.md)
+  ops-kit/                     Optional host monitors and secret-reference map (docs/monitors.md,
+                               docs/secret-reference-audit.md)
   secrets/                     Not in git. Runtime injection only.
 ```
 
