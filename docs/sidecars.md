@@ -143,6 +143,13 @@ gets its own `OP_CONNECT_HOST=http://onepassword-connect-api:8080` and
 from the agent's env file directly. See the overlay README for the one-time
 mapping step.
 
+## Opt-in recipes
+
+Browser handoff (Camofox plus a loopback VNC forwarder), gated A2A and
+reviewed artifact publishing are not starter sidecars. Each is a fragment in
+[`recipes/`](../recipes/) that you layer over the same overlay compose files,
+under the same isolation rules. Without the fragment nothing changes.
+
 ## Out of scope
 
 Household compose, identities, secret names, and live digest pins stay in the

@@ -1,0 +1,58 @@
+# Opt-in recipe: publish reviewed artifacts through a read-only origin.
+#
+# Layer it over the starter overlay, from the overlay directory:
+#
+#   docker compose -f compose.yaml -f compose.sidecars.yaml \
+#     -f vendor/hermes-fleet/recipes/artifact-publishing/compose.artifact-publishing.yaml config
+#
+# Without this file nothing changes: no agent gets an outbox, no origin runs
+# and no port is published.
+#
+# The ops agent writes finished files into its outbox. A human reviews a file
+# and approves it with review_artifact.py, which records its SHA-256 in
+# artifacts/review/reviewed.json. The origin serves /artifact/<uuid>/ only for
+# approved entries, and only while the file still has the approved bytes.
+#
+# - The agent mounts its outbox read-write and never mounts the manifest, so
+#   it cannot approve its own work.
+# - The origin mounts both read-only, runs as nobody with no capabilities and
+#   a read-only root, and joins only artifact-ingress. No agent joins that
+#   network, so agents cannot reach the origin.
+# - The one published port is bound to loopback for your tunnel or reverse
+#   proxy. artifact-ingress is not internal because Docker publishes ports
+#   only from a non-internal network.
+#
+# Prepare the directories once, before the first `up`:
+#
+#   install -d -m 0755 artifacts artifacts/review
+#   install -d -m 0755 -o 1000 -g 1000 artifacts/outbox/ops
+#   printf '{"schema_version": 1, "artifacts": {}}\n' > artifacts/review/reviewed.json
+
+services:
+  ops:
+    volumes:
+      - ./artifacts/outbox/ops:/opt/data/workspace/outbox
+
+  artifact-origin:
+    image: docker.io/library/python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a
+    restart: unless-stopped
+    user: "65534:65534"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    command: ["python", "-I", "/app/origin_proxy.py", "--outbox", "/outbox", "--manifest", "/review/reviewed.json",
+              "--port", "8647"]
+    volumes:
+      - ./vendor/hermes-fleet/recipes/artifact-publishing:/app:ro
+      - ./artifacts/outbox/ops:/outbox:ro
+      # The directory, not the file: review_artifact.py replaces the manifest
+      # atomically, and a single-file bind mount would keep the old copy.
+      - ./artifacts/review:/review:ro
+    ports:
+      - "127.0.0.1:${ARTIFACT_ORIGIN_PORT:-8647}:8647"
+    networks:
+      - artifact-ingress
+
+networks:
+  artifact-ingress:
+    driver: bridge

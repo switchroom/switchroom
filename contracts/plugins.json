@@ -348,17 +348,20 @@
         "covers": [
           "browser-handoff"
         ],
-        "reason": "needs a public origin and a browser sidecar"
+        "reason": "needs a public origin and a browser sidecar",
+        "recipe": "recipes/browser-handoff/"
       },
       {
         "id": "agent-to-agent",
         "covers": [],
-        "reason": "cross-agent trust is a per-deployment decision"
+        "reason": "cross-agent trust is a per-deployment decision",
+        "recipe": "recipes/a2a/"
       },
       {
         "id": "artifact-publishing",
         "covers": [],
-        "reason": "publishes outside the agent's box"
+        "reason": "publishes outside the agent's box",
+        "recipe": "recipes/artifact-publishing/"
       }
     ],
     "bundled_capabilities": [

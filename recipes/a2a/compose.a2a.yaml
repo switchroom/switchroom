@@ -1,0 +1,62 @@
+# Opt-in recipe: gated A2A between two agents, ops and worker.
+#
+# Layer it over the starter overlay, from the overlay directory:
+#
+#   docker compose -f compose.yaml -f compose.sidecars.yaml \
+#     -f vendor/hermes-fleet/recipes/a2a/compose.a2a.yaml config
+#
+# Without this file nothing changes: no agent opens an A2A listener, joins the
+# a2a network or trusts a peer.
+#
+# Uses the A2A plugin bundled in the Hermes image (plugins/platforms/a2a).
+# Setting A2A_PORT turns its inbound listener on. Trust is explicit on both
+# sides:
+#
+# - Each agent gives every caller its own token (A2A_PEER_TOKENS, secret, in
+#   the agent's env file) and names the callers it accepts in
+#   A2A_TRUSTED_PEERS. A token alone is not enough: an authenticated name that
+#   is not in A2A_TRUSTED_PEERS is refused with 403, a missing or wrong token
+#   with 401. A2A_ALLOW_ALL_USERS stays false.
+# - Peer text grants no authority. The plugin frames inbound text as untrusted
+#   peer input, refuses operator slash commands from peers, and the receiving
+#   agent's own approvals still apply to anything it does.
+# - Only agents that opt in join the internal a2a network, so nobody else can
+#   reach a listener. The listener is never published on the host.
+#
+# Secrets, in each agent's env file (never in git):
+#
+#   secrets/ops.env:     A2A_PEER_TOKENS=worker:<token worker uses to call ops>
+#                        A2A_TOKEN_TO_WORKER=<token ops uses to call worker>
+#   secrets/worker.env:  A2A_PEER_TOKENS=ops:<token ops uses to call worker>
+#                        A2A_TOKEN_TO_OPS=<token worker uses to call ops>
+#
+# The outbound peer entries (a2a_agents) go in each agent's own config; see
+# recipes/a2a/README.md.
+
+x-a2a-listener: &a2a-listener
+  A2A_HOST: 0.0.0.0
+  A2A_PORT: "9900"
+  A2A_ALLOW_ALL_USERS: "false"
+  # Equal to the caller's a2a_agents timeout, so a long reply is not cut off.
+  A2A_REPLY_TIMEOUT: "600"
+
+services:
+  ops:
+    environment:
+      <<: *a2a-listener
+      A2A_AGENT_NAME: ops
+      A2A_TRUSTED_PEERS: worker
+    networks:
+      - a2a
+
+  worker:
+    environment:
+      <<: *a2a-listener
+      A2A_AGENT_NAME: worker
+      A2A_TRUSTED_PEERS: ops
+    networks:
+      - a2a
+
+networks:
+  a2a:
+    internal: true

@@ -71,7 +71,7 @@ The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay
 
 ### Browser handoff
 
-The agent can run an isolated browser and hand the live session to the human when a login or a visual check needs a person. Cookies and origin stay on that profile's broker and sidecar. The public origin comes from `HERMES_BROWSER_HANDOFF_PUBLIC_HOST` at deploy time, not from this git tree. Sidecar images (broker, Camofox) publish separately; the Fleet child does not bake them in.
+The agent can run an isolated browser and hand the live session to the human when a login or a visual check needs a person. Cookies and origin stay on that profile's broker and sidecar. The public origin comes from `HERMES_BROWSER_HANDOFF_PUBLIC_HOST` at deploy time, not from this git tree. Sidecar images (broker, Camofox) publish separately; the Fleet child does not bake them in. The opt-in [browser handoff recipe](recipes/browser-handoff/) layers a digest-pinned Camofox browser and a loopback-only VNC viewer over the starter overlay.
 
 ### Claude ACP
 
@@ -211,6 +211,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`plugins/linear/`](plugins/linear/) — optional Linear integration on core Kanban (staged, disabled)
 - [`plugins/kokoro-voice/`](plugins/kokoro-voice/) — optional local Kokoro sidecar TTS
 - [`plugins/browser-handoff/`](plugins/browser-handoff/) — optional browser handoff
+- [`recipes/`](recipes/) — opt-in Compose recipes: browser handoff with loopback VNC, gated A2A, reviewed artifact publishing ([acceptance run](docs/opt-in-recipes-acceptance.md))
 - [`plugins/readonly-source/`](plugins/readonly-source/) — optional allowlisted read-only snapshot tools
 - [`scripts/tooling-policy-hook`](scripts/tooling-policy-hook) — optional overlay install-policy hook
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting and public boundary
