@@ -39,7 +39,7 @@ default set from `contracts/plugins.json` that is pure configuration:
 | `claude-subscription-directsdk` | main model provider, no API-key fallback | `CLAUDE_CONFIG_DIR` unset |
 | `claude-acp-connectors` | Claude ACP provider plus `claude-account-connectors` | `CLAUDE_CONFIG_DIR` unset |
 | `model-roles` | main model then fallbacks, granted providers only | no granted provider has its login |
-| `linear` | Linear plugin with a token file | `LINEAR_TOKEN_FILE` unset |
+| `linear` | Linear plugin with a token file, bound to the app's user and workspace IDs ([Linear setup](../../docs/linear-setup.md) steps 4 and 5) | `LINEAR_TOKEN_FILE`, `LINEAR_VIEWER_ID` or `LINEAR_ORGANIZATION_ID` unset |
 | `voice` | Kokoro voice replies and local transcription | `HERMES_KOKORO_SIDECAR_URL` or `HERMES_KOKORO_SIDECAR_TOKEN` unset |
 | `honcho-memory` | `memory.provider: honcho` | `HONCHO_BASE_URL` unset |
 | `web-search` | Perplexity search | `PERPLEXITY_API_KEY` unset |
@@ -67,6 +67,8 @@ mkdir -p ~/my-fleet-overlay/secrets
 cat > ~/my-fleet-overlay/secrets/ops.env <<'EOF'
 CLAUDE_CONFIG_DIR=/opt/data/.claude
 LINEAR_TOKEN_FILE=/opt/data/secrets/linear-token
+LINEAR_VIEWER_ID=replace-with-viewer.id
+LINEAR_ORGANIZATION_ID=replace-with-organization.id
 HERMES_KOKORO_SIDECAR_URL=http://voice:8880
 HERMES_KOKORO_SIDECAR_TOKEN=replace-me
 HONCHO_BASE_URL=http://honcho:8000

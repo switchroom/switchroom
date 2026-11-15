@@ -84,12 +84,18 @@ defaults:
   model-roles:
     chain: [claude-subscription-directsdk, claude-acp-connectors]
 
+  # Linear needs the app's token and the two IDs it is bound to (viewer.id and
+  # organization.id from docs/linear-setup.md step 4). The plugin refuses to
+  # start without the IDs, so all three must be set or Linear stays off.
   linear:
-    requires_env: [LINEAR_TOKEN_FILE]
+    requires_env: [LINEAR_TOKEN_FILE, LINEAR_VIEWER_ID, LINEAR_ORGANIZATION_ID]
     plugins: [linear]
     values:
       plugins.entries.linear.settings:
         enabled: true
+        identity:
+          viewer_id: ${LINEAR_VIEWER_ID}
+          organization_id: ${LINEAR_ORGANIZATION_ID}
         credentials:
           mode: token_file
           path: ${LINEAR_TOKEN_FILE}
