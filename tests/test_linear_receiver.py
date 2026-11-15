@@ -233,6 +233,48 @@ class ReplayTests(ReceiverHarness):
         self.assertEqual(self.post(other)[0], 400)
         self.assertEqual(len(self.filed()), 1)
 
+    # Linear signs the body, not the Linear-Delivery header: a captured body
+    # re-posted under fresh ids must not take a new inbox row each time.
+    def test_the_same_body_under_new_delivery_ids_is_filed_once(self) -> None:
+        body = encode(session_event())
+        self.assertEqual(self.post(body, delivery="example-delivery-1"), (200, "filed"))
+        for index in range(2, 6):
+            with self.subTest(delivery=index):
+                self.assertEqual(self.post(body, delivery=f"example-delivery-{index}"), (200, "duplicate"))
+        self.assertEqual([row[1] for row in self.filed()], ["example-delivery-1"])
+
+    def test_the_cache_refuses_a_body_under_a_new_id_after_the_row_was_pruned(self) -> None:
+        body = encode(session_event())
+        self.assertEqual(self.post(body), (200, "filed"))
+        with contextlib.closing(sqlite3.connect(self.inbox)) as db:
+            db.execute("DELETE FROM deliveries")  # processed and pruned
+            db.commit()
+        self.assertEqual(self.post(body, delivery="example-delivery-2"), (200, "duplicate"))
+        self.assertEqual(self.filed(), [])
+
+    def test_the_inbox_refuses_a_body_under_a_new_id_the_cache_has_forgotten(self) -> None:
+        body = encode(session_event())
+        self.assertEqual(self.post(body), (200, "filed"))
+        self.receiver.seen = rx.SeenDeliveries()  # a restarted receiver
+        self.assertEqual(self.post(body, delivery="example-delivery-2"), (200, "duplicate"))
+        self.assertEqual(len(self.filed()), 1)
+
+    def test_different_bodies_under_different_ids_are_all_filed(self) -> None:
+        stamp = int(time.time() * 1000)
+        for index in range(3):
+            event = session_event(action="prompted", stamp_ms=stamp)
+            event["agentActivity"]["id"] = f"example-activity-{index}"
+            self.assertEqual(self.post(encode(event), delivery=f"example-delivery-{index}"), (200, "filed"))
+        self.assertEqual(len(self.filed()), 3)
+
+    def test_the_body_cache_forgets_after_the_replay_window(self) -> None:
+        seen = rx.SeenDeliveries(window_seconds=120)
+        seen.remember("ops", "example-delivery-1", "d" * 64, now=1000.0)
+        self.assertEqual(seen.check("ops", "example-delivery-2", "d" * 64, now=1100.0), "duplicate")
+        self.assertIsNone(seen.check("other", "example-delivery-2", "d" * 64, now=1100.0))
+        self.assertIsNone(seen.check("ops", "example-delivery-2", "d" * 64, now=1121.0))
+        self.assertEqual(seen._digests, {})
+
     def test_a_delivery_without_an_id_is_rejected(self) -> None:
         body = encode(session_event())
         for delivery in (None, "", "../x", "a" * 300):
@@ -308,6 +350,19 @@ class InboxContractTests(unittest.TestCase):
             rx.Inbox(ours)
             IngressStore(theirs)
             self.assertEqual(columns(ours), columns(theirs))
+
+    def test_the_digest_lookup_is_indexed_on_an_existing_inbox(self) -> None:
+        sys.path.insert(0, str(ROOT / "tests"))
+        from linear_ingress_fixture import IngressStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "ingress.db"
+            IngressStore(database)  # an inbox created before the index existed
+            rx.Inbox(database)
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                plan = db.execute("EXPLAIN QUERY PLAN SELECT 1 FROM deliveries WHERE logical_agent = ? "
+                                  "AND payload_sha256 = ? LIMIT 1", ("ops", "d" * 64)).fetchall()
+            self.assertIn("deliveries_by_digest", " ".join(str(row[-1]) for row in plan))
 
 
 class OauthClientTests(ReceiverHarness):

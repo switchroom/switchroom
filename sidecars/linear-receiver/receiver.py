@@ -9,9 +9,11 @@ This receiver is the only thing that listens for those posts. For each one it:
 2. checks the ``linear-signature`` HMAC-SHA256 of the raw body with that
    agent's own webhook signing secret, in constant time (401 on mismatch);
 3. requires the signed ``webhookTimestamp`` to be within one minute of now and
-   a ``Linear-Delivery`` id it has not already filed (stale is 401, a repeated
-   id is acknowledged and never filed twice, a reused id with other content
-   is 400);
+   a ``Linear-Delivery`` id and body it has not already filed (stale is 401,
+   a repeated id or a repeated body under a new id is acknowledged and never
+   filed twice, a reused id with other content is 400). The delivery id is
+   not signed, so the body digest is what stops a captured delivery being
+   re-posted under fresh ids;
 4. checks that the delivery is for that agent's own Linear workspace and app,
    and that a session event comes from a person on the agent's allowlist.
    Anything else is acknowledged with 200 and dropped, so it never starts work;
@@ -88,6 +90,10 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS deliveries (
     attempts INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (logical_agent, delivery_id)
 )"""
+# Not unique: an inbox written before this index existed may already hold a
+# replayed copy, and refusing to open it would stop every delivery.
+DIGEST_INDEX = ("CREATE INDEX IF NOT EXISTS deliveries_by_digest "
+                "ON deliveries (logical_agent, payload_sha256)")
 
 
 class ConfigError(ValueError):
@@ -326,6 +332,7 @@ class Inbox:
         with self._connect(5.0) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute(SCHEMA)
+            db.execute(DIGEST_INDEX)
 
     def _connect(self, timeout: float = SQLITE_BUSY_SECONDS):
         db = sqlite3.connect(self.database, timeout=timeout, isolation_level=None)
@@ -333,7 +340,11 @@ class Inbox:
         return _Closing(db)
 
     def file(self, agent: Agent, delivery_id: str, body: bytes, received_at: int) -> str:
-        """Commit once. ``filed``, ``duplicate``, or ValueError for a reused id."""
+        """Commit once. ``filed``, ``duplicate``, or ValueError for a reused id.
+
+        A body already filed for this agent under another delivery id is a
+        ``duplicate`` too: the id header is unsigned, the body is not.
+        """
         digest = hashlib.sha256(body).hexdigest()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -344,6 +355,10 @@ class Inbox:
                     db.execute("ROLLBACK")
                     if row[0] != digest:
                         raise ValueError("delivery id reused with different content")
+                    return "duplicate"
+                if db.execute("SELECT 1 FROM deliveries WHERE logical_agent = ? AND payload_sha256 = ? LIMIT 1",
+                              (agent.name, digest)).fetchone() is not None:
+                    db.execute("ROLLBACK")
                     return "duplicate"
                 pending = db.execute("SELECT COUNT(*) FROM deliveries WHERE status = 'pending'").fetchone()[0]
                 if pending >= MAX_PENDING_DELIVERIES:
@@ -374,30 +389,37 @@ class _Closing:
 
 
 class SeenDeliveries:
-    """In-memory delivery-id cache over the replay window.
+    """In-memory delivery-id and body-digest cache over the replay window.
 
-    The inbox's primary key is the durable record; this cache also refuses a
-    replay after the plugin has processed and pruned the row, and costs no
-    database work on a hot replay.
+    The inbox's primary key and digest index are the durable record; this
+    cache also refuses a replay after the plugin has processed and pruned the
+    row, and costs no database work on a hot replay. Linear signs the body,
+    not the ``Linear-Delivery`` header, so a body seen under any id counts.
+    The window covers the whole span a signed timestamp stays fresh.
     """
 
     def __init__(self, window_seconds: float = 2 * MAX_CLOCK_SKEW_MS / 1000) -> None:
         self.window = window_seconds
         self._seen: dict[tuple[str, str], tuple[float, str]] = {}
+        self._digests: dict[tuple[str, str], float] = {}
         self._lock = threading.Lock()
 
     def check(self, agent: str, delivery_id: str, digest: str, now: float) -> str | None:
         with self._lock:
             for key in [k for k, (at, _) in self._seen.items() if now - at > self.window]:
                 del self._seen[key]
+            for key in [k for k, at in self._digests.items() if now - at > self.window]:
+                del self._digests[key]
             seen = self._seen.get((agent, delivery_id))
-        if seen is None:
-            return None
-        return "duplicate" if seen[1] == digest else "reused"
+            body_seen = (agent, digest) in self._digests
+        if seen is not None:
+            return "duplicate" if seen[1] == digest else "reused"
+        return "duplicate" if body_seen else None
 
     def remember(self, agent: str, delivery_id: str, digest: str, now: float) -> None:
         with self._lock:
             self._seen.setdefault((agent, delivery_id), (now, digest))
+            self._digests.setdefault((agent, digest), now)
 
 
 # --- the request path -------------------------------------------------------
