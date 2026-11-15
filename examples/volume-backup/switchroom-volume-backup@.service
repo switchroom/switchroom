@@ -1,0 +1,24 @@
+# Example only. Encrypted backup of one Switchroom agent volume.
+# Instance name = agent name; config at /etc/switchroom/volume-backup/<agent>.json.
+# Nothing runs until you install this file and enable the matching timer.
+[Unit]
+Description=Encrypted volume backup of Switchroom agent %i
+Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/volume-backup.md
+After=local-fs.target network-online.target
+Wants=network-online.target
+# Uncomment and set to your destination mount so a missing mount fails fast:
+# RequiresMountsFor=/mnt/switchroom-backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-volume-backup.py backup --config /etc/switchroom/volume-backup/%i.json
+# Any non-zero exit fails the unit, including 3 ("disabled in the config"), so
+# a timer enabled without a working config is visible rather than silent.
+UMask=0077
+Nice=15
+IOSchedulingClass=idle
+# Database snapshots are held in memory; keep plaintext out of swap and core dumps.
+MemorySwapMax=0
+LimitCORE=0
+TimeoutStartSec=3h
+# OnFailure=your-alert@%i.service

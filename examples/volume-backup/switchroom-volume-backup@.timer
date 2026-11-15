@@ -1,0 +1,12 @@
+# Example only. Nightly backup of one agent: systemctl enable --now switchroom-volume-backup@<agent>.timer
+[Unit]
+Description=Nightly encrypted volume backup of Switchroom agent %i
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=switchroom-volume-backup@%i.service
+
+[Install]
+WantedBy=timers.target
