@@ -9,7 +9,8 @@ Reporting remains compatible with official Hermes `ff294849385e433dd40a993b4f076
 Automatic assignment admission additionally requires native block/unblock task-event guards
 and guarded-resume event receipts for response-loss reconciliation.
 No fork-specific invocation context, lifecycle controller, approval reservation or chat recovery
-API is required. The plugin is disabled by default.
+API is required. The plugin is off in the bare image; the starter overlay
+(`examples/overlay-repo/`) turns it on when the agent's Linear token file is set.
 
 ## Tools
 

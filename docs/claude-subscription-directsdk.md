@@ -1,6 +1,6 @@
 # Claude Subscription DirectSDK (experimental)
 
-Fleet vendors the official Nous Research `claude-subscription-directsdk` plugin as an optional, default-disabled source plugin. It is not installed in the Fleet image and is not enabled or routed by this repository. Enablement is a separate operator decision.
+Fleet vendors the official Nous Research `claude-subscription-directsdk` plugin as a mounted source plugin. It is off in the bare image: it is not installed in the Fleet image, and the image alone neither enables nor routes it. The starter overlay (`examples/overlay-repo/`) turns it on as the default main model provider when the agent's `CLAUDE_CONFIG_DIR` login is set, with no API-key fallback. Without that login the overlay renders it off and the setup check (`scripts/switchroom-doctor.py`) reports it. Nous Research labels the provider experimental.
 
 The plugin uses the official Claude Code CLI and its own logged-in Claude account for that profile. Install and authenticate the CLI separately. Hermes profile isolation must remain intact: do not copy login state between profiles. This plugin does not provide API-key billing fallback; resolve CLI login or entitlement errors at the CLI/account boundary rather than switching to an API key.
 

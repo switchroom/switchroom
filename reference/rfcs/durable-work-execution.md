@@ -15,7 +15,7 @@ An operator alignment interview on 2026-09-20 ratified the job and operating bou
 
 ### Decision
 
-Linear is the primary human-facing work record and cross-gateway handoff interface for this delivery. Gateway-local Kanban owns durable execution; delegates provide bounded, ephemeral assistance. The Linear integration remains optional and default-disabled in the public distribution. Existing chat-only installations do not acquire an unconfigured tracker dependency; Linear-backed coordination is claimed only when configured.
+Linear is the primary human-facing work record and cross-gateway handoff interface for this delivery. Gateway-local Kanban owns durable execution; delegates provide bounded, ephemeral assistance. The Linear integration is off in the bare image and turned on by the starter overlay ([default-on-distribution.md](default-on-distribution.md)). Without the agent's Linear authorization the overlay renders it off, so a chat-only installation never acquires an unconfigured tracker dependency; Linear-backed coordination is claimed only when configured.
 
 Start with one profile per gateway. Multiple specialist profiles are a future-compatible option, not a prerequisite or part of this delivery. A repository is a persistent workspace; delivery projects are finite scoped outcomes. Several projects may use one repository without sharing writer workspaces.
 

@@ -1,6 +1,5 @@
 profile: ops
 role: operator
 apply_mode: merge
-values:
-  model.provider: example-provider
-  model.default: example-model
+# Every reviewed default from defaults.yaml applies. Nothing to opt out of.
+values: {}

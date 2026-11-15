@@ -9,6 +9,10 @@
       "planned",
       "shipped"
     ],
+    "starter_overlay_values": [
+      "configured",
+      "not_configured"
+    ],
     "billing_values": [
       "none",
       "principal_plan_login",
@@ -20,6 +24,7 @@
       {
         "id": "doctrine-config",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Working doctrine config: system prompt, smart approvals, queue-first chat, verify-on-stop.",
         "covers": [],
         "credential": {
@@ -35,6 +40,7 @@
       {
         "id": "gateway-per-agent",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "One gateway per agent, pinned with gateway.multiplex_profiles: false.",
         "covers": [],
         "credential": {
@@ -53,6 +59,7 @@
       {
         "id": "secrets-connect",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "1Password Connect secrets per container, with an env-file fallback.",
         "covers": [],
         "credential": {
@@ -69,6 +76,7 @@
       {
         "id": "coding-clis",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "Pinned coding CLIs in the image, each using the agent's own login.",
         "covers": [],
         "credential": {
@@ -84,6 +92,7 @@
       {
         "id": "model-roles",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Model roles with fallback chains built only from providers the principal granted.",
         "covers": [],
         "credential": {
@@ -100,6 +109,7 @@
       {
         "id": "claude-subscription-directsdk",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Default model provider: the Claude subscription through the profile's own Claude Code login.",
         "covers": [
           "claude-subscription-directsdk-provider"
@@ -120,6 +130,7 @@
       {
         "id": "claude-acp-connectors",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Claude ACP provider plus claude-account-connectors for Claude account connectors.",
         "covers": [
           "claude-acp-provider",
@@ -140,6 +151,7 @@
       {
         "id": "linear",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Linear work tracking on native Kanban.",
         "covers": [
           "linear"
@@ -157,6 +169,7 @@
       {
         "id": "voice",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Local Kokoro voice replies and local transcription.",
         "covers": [
           "voice-provider"
@@ -174,6 +187,7 @@
       {
         "id": "honcho-memory",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Honcho long-term memory through the upstream Honcho image, referenced by digest and never vendored.",
         "covers": [],
         "credential": {
@@ -194,6 +208,7 @@
       {
         "id": "web-search",
         "status": "planned",
+        "starter_overlay": "configured",
         "summary": "Web search; the search-only Perplexity provider is used when its key exists.",
         "covers": [
           "web-provider",
@@ -212,6 +227,7 @@
       {
         "id": "quota",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "Quota checks before long tasks and on rate limits.",
         "covers": [],
         "credential": {
@@ -227,6 +243,7 @@
       {
         "id": "session-reset-policy",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "Session reset policy.",
         "covers": [],
         "credential": {
@@ -242,6 +259,7 @@
       {
         "id": "security-guidance",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "Security guidance.",
         "covers": [],
         "credential": {
@@ -257,6 +275,7 @@
       {
         "id": "disk-cleanup",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "Disk cleanup in report-only mode.",
         "covers": [],
         "credential": {
@@ -273,6 +292,7 @@
       {
         "id": "shared-skill-pack",
         "status": "planned",
+        "starter_overlay": "not_configured",
         "summary": "Shared skill pack.",
         "covers": [],
         "credential": {

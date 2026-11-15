@@ -52,6 +52,13 @@ Desired-state precedence in that contract is `shared` → `role` → `profile` �
 `fleet-config/` is renderer input in the overlay repo. Compose does not mount
 it. Compose only shows the optional managed policy file.
 
+`scripts/render-overlay-config.py` renders one agent from `fleet-config/`:
+shared values, then the reviewed starter defaults, then the agent's own
+values, each leaf allowlisted and type-checked against `schema.yaml`. A
+default whose credential variable is unset is rendered off.
+`scripts/switchroom-doctor.py` reports every default as on or off with the
+reason. Steps are in `examples/overlay-repo/README.md`.
+
 Do not put credentials, OAuth state, memories, or sessions in the overlay git
 tree. Secret values fail closed: never git, never image, never managed YAML.
 Pin images by `@sha256:...`. Mutable tags are not a supported interface.
