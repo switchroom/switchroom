@@ -13,7 +13,9 @@ Decisions: [rfcs/successor-vision.md](rfcs/successor-vision.md), [rfcs/switchroo
 
 Switchroom: an opinionated Hermes Agent distribution. Opinionated isolated Hermes. One agent per container and gateway. No shared credentials.
 
-Public headline: "Hermes, run as a team. Each agent in its own box." A standing team of specialists you text is an outcome. It leads the headline only alongside isolation, never alone.
+Public headline: "Hermes agents that work your projects, not just your chats." Sub-line: "One box per agent. Linear holds the thread. Tuned for the Claude plan you already pay for." Four proofs, in order: works your projects (Linear), safe to leave running (isolation, per-agent vaulted credentials, agent-to-agent only as an explicit opt-in), tuned for your Claude plan (Claude-first, not Claude-only), runs like infrastructure. Chat surfaces are standard Hermes, not a differentiator. A standing team of specialists is an outcome, not the headline. Decision: the 2026-11-15 amendment in [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md).
+
+What is real today: the digest-pinned child image is published, and this repository holds the source for the Linear, Claude ACP and connector plugins plus a vendored copy of the Nous Research DirectSDK plugin (not installed in the image). Every plugin is off in the bare image. The reviewed default set in [rfcs/default-on-distribution.md](rfcs/default-on-distribution.md) is `planned`; nothing is on by default yet.
 
 ## North Star
 
@@ -53,7 +55,15 @@ Signal: first-class surface hold rate. Shape: after an isolation, restart, or in
 
 Claude stays on the granted plan login (ACP/OAuth), not a silent API meter. Other billed subscriptions follow the same rule: the principal's granted plan is the ceiling unless they opt a specific account into overage.
 
+Claude-first, not Claude-only: Claude Subscription DirectSDK is the planned default model path, but the rule is the same for every plan the principal brings.
+
 Signal: off-plan model-call rate. Shape: share of turns that billed a path the principal did not grant. Now: unmeasured. Target: to validate. Guardrail: do not "make it work" by dropping to an API key.
+
+### works-your-projects – Works your projects
+
+A person running many parallel pieces of work across several agents can see, per project and issue, who owns it, what was done and what is next, without reading chat history. Long-running work has one owning agent and one durable task per issue. Checkpoints land on the issue. A follow-up from any chat reaches the same task. Several agents can work one project and hand an issue from one to another without the person relaying context. Linear is the human work record; native Hermes owns execution.
+
+Signal: readable-issue rate. Shape: of active issues with agent work, the share where a person who did not watch the chat can state the owning agent, the latest checkpoint and the next action from the issue alone, and that state matches the native work. Now: unmeasured. Target: to validate. Guardrail: do not meet it by mirroring every internal step or chat turn into the tracker, and do not let a tracker record stand in for verified work.
 
 ## The customer model
 
@@ -72,6 +82,8 @@ The principal already pays the model plan. Fleet is not a second invoice. The op
 - Pull: isolated specialists you text; recover one without touching the rest; stay on the granted plan. Evidence: same interview.
 - Anxiety: isolation that breaks chat, voice, or login; an upgrade they cannot see; a surface that works in Telegram and dies on Slack or Desktop. Evidence: interview surfaces and non-goals.
 - Habit: keep the private snowflake, or keep the old Claude-native specialist runtime, because it already works. [GUESS] for public adopters.
+
+*2026-11-15 note:* the job lines above are the 2026-09-12 evidence as recorded. The Linear-first amendment in [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md) reads "a standing team they can text" as one entry point, not the value: the principal's harder struggle is following many pieces of work across several agents, which `works-your-projects` names. That reading is [GUESS] for public adopters.
 
 **The workaround.** Hand-assembled runtime, copied env files, "I know what's running because I just deployed it," and a single chat app treated as the product.
 
@@ -100,7 +112,7 @@ The principal already pays the model plan. Fleet is not a second invoice. The op
 
 ## How it functions, at a high level
 
-Each specialist stays independently bounded. The principal reaches them on Telegram, Slack, or Desktop. A change is supposed to land on one of them and leave the others alone. Claude stays on the granted plan. Deployment identity stays outside the public product. Runtime and packaging live in `docs/` and `contracts/`.
+Each specialist stays independently bounded. The principal hands it work through Linear or reaches it on Telegram, Slack, or Desktop; longer work is followed on its Linear issue rather than in chat. A change is supposed to land on one of them and leave the others alone. Claude stays on the granted plan. Deployment identity stays outside the public product. Runtime and packaging live in `docs/` and `contracts/`.
 
 ## The job index
 
@@ -110,15 +122,19 @@ Only jobs with a Job Spec are indexed.
 
 - [understand-what-is-running.md](jobs/understand-what-is-running.md) – share of intended changes where a fresh-process reader can state the target's live state and whether it matches intent. Job metric: unmeasured. Rolls into on-a-leash's Signal. **Specified.** Retargeted from `change-recoverable` by [rfcs/successor-vision.md](rfcs/successor-vision.md).
 
+### works-your-projects
+
+- [entrust-ongoing-work.md](jobs/entrust-ongoing-work.md) – share of interrupted approved outcomes recoverable without human reconstruction or duplicate effects. Job metric: unmeasured. Rolls into works-your-projects' readable-issue rate. **Specified; implementation and outcome UAT unverified.** Delivery direction: [durable-work-execution.md](rfcs/durable-work-execution.md). `serves:` retargeted from `there-when-you-reach` by the 2026-11-15 amendment in [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md); its recovery and cross-surface cases still have to hold there-when-you-reach's bar.
+
 ### there-when-you-reach
 
-- [entrust-ongoing-work.md](jobs/entrust-ongoing-work.md) – share of interrupted approved outcomes recoverable without human reconstruction or duplicate effects. Job metric: unmeasured. Rolls into there-when-you-reach's Signal. **Specified; implementation and outcome UAT unverified.** Delivery direction: [durable-work-execution.md](rfcs/durable-work-execution.md).
+No Job Spec yet.
 
 Further jobs are not indexed until they have Job Specs. The successor interview named work that is still unwritten; it lives in the decision record, not here.
 
 ## Evidence & confidence
 
-Evidence: 2026-11-15 positioning interview (name, category line, headline, public adopter, model framing); 2026-09-12 successor interview (one-liner, four outcomes, TUTR, surfaces, audience); Switchroom vision/JTBD as the prior vehicle, not copied wholesale; public contracts and README isolation model.
+Evidence: 2026-11-15 positioning interview (name, category line, headline, public adopter, model framing) and its same-day Linear-first amendment (headline, four proofs, works-your-projects, Claude-first); 2026-09-12 successor interview (one-liner, four outcomes, TUTR, surfaces, audience); Switchroom vision/JTBD as the prior vehicle, not copied wholesale; public contracts and README isolation model.
 
 Confidence: 2. The dogfood principal+operator ratified the sentence. Public adopter demand is unmeasured. TUTR is uninstrumented.
 

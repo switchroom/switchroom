@@ -1,16 +1,25 @@
 # Switchroom
 
-**An opinionated Hermes Agent distribution.** Hermes, run as a team. Each agent in its own box: one agent per container and gateway, no shared credentials.
+**An opinionated Hermes Agent distribution.**
 
-Site: [switchroom.ai](https://switchroom.ai). Built on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research; not affiliated with Nous Research. This repository keeps its working name, `hermes-fleet`, until it moves to the `switchroom` org. Early access: there is no quickstart yet. Naming and positioning: [`reference/rfcs/switchroom-positioning.md`](reference/rfcs/switchroom-positioning.md).
+**Hermes agents that work your projects, not just your chats.** One box per agent. Linear holds the thread. Tuned for the Claude plan you already pay for.
 
-The public distribution is a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout. A standing team of specialists you text is an outcome; isolation stays in the sentence.
+Site: [switchroom.ai](https://switchroom.ai). Built on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research; not affiliated with Nous Research, and not endorsed by Nous Research or Anthropic. This repository keeps its working name, `hermes-fleet`, until it moves to the `switchroom` org. Early access: there is no quickstart yet. Naming and positioning: [`reference/rfcs/switchroom-positioning.md`](reference/rfcs/switchroom-positioning.md).
+
+1. **Works your projects.** The [Linear plugin](plugins/linear/README.md) gives long-running work one owning agent and one durable task per issue, posts checkpoints as issue comments, routes a follow-up from any chat to the same task, and lets several agents work one project with handoff between them. You see who owns what, what was done and what is next on the issue, not in a chat scroll. The plugin source is here and disabled in the bare image; end-to-end outcome evidence is still to validate.
+2. **Safe to leave running.** One container and one gateway per agent, per-agent vaulted credentials, isolated by default. Agent-to-agent (A2A) stays an explicit opt-in per deployment, never a default.
+3. **Tuned for your Claude plan.** Claude-first, not Claude-only. The planned default model path is Claude Subscription DirectSDK, a Nous Research plugin its author labels experimental, on each agent's own Claude login with no API-key fallback. Claude ACP provides claude.ai connectors, qualified read-only so far. Other plans and keys work under the same rule.
+4. **Runs like infrastructure.** A digest-pinned child of an exact Hermes Agent image, config as code, and a private overlay for identity and secrets.
+
+Chat is standard Hermes: Telegram on the run, Slack or Desktop at your desk, and Linear keeps you from losing the thread across issues, projects and agents.
+
+The public distribution is a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout.
 
 ## Why this exists
 
 Hermes Agent is one process. That is the wrong blast radius for a team. Upstream `hermes update` now folds multi-profile installs into one multiplexed gateway. Switchroom deliberately keeps one container and one gateway per agent, so a bad change, leak or upgrade stays inside one box.
 
-Switchroom is many named specialists, each with its own container, gateway, writable state, workspace, Docker network, memory, and credentials. You text the same person back. A change to one leaves the others alone. Failed upgrades recover without taking the rest down.
+Switchroom is many named specialists, each with its own container, gateway, writable state, workspace, Docker network, memory, and credentials. You get the same specialist back, and longer work stays on its Linear issue. A change to one leaves the others alone. Failed upgrades recover without taking the rest down.
 
 The public product proves that pattern without shipping anyone's credentials, deployment identities, private binaries, or live topology.
 
@@ -21,7 +30,8 @@ These are the product outcomes. If a change advances none of them, it does not b
 - **Standing team.** Named specialists, each independently addressable, with unshared memory and credentials. Not one generalist wearing hats.
 - **On a leash.** One agent cannot see another's files, network, or vault. An intended change lands on the target and every other in-scope agent is still independently working.
 - **There when you reach.** Telegram, Slack, and Hermes Desktop have the same bar. A restart does not drop identity, tools, or sessions. Persistence includes working tools, not just surviving files.
-- **Subscription-honest.** Claude stays on the granted plan login, not a silent API meter. Other billed plans follow the same rule.
+- **Subscription-honest.** Claude-first, not Claude-only. Claude stays on the granted plan login, not a silent API meter. Other billed plans follow the same rule.
+- **Works your projects.** Someone running many pieces of work across several agents can see, per project and issue, who owns it, what was done and what is next, without reading chat history. Unmeasured.
 
 North Star is **trusted unsupervised turns**: work the principal did not sit through, that finished without a rescue, stayed inside granted tools, and made no off-plan model call. Isolation that strips the integrations that make Hermes useful is a loss.
 
@@ -47,7 +57,7 @@ Copy [`examples/overlay-repo/`](examples/overlay-repo) into a private overlay re
 - secret injection (1Password Connect, not files in git)
 - plugin policy maps (Linear workers, browser origin, voice sidecar URL)
 
-Each compose service is one specialist. The operator changes one service. The principal texts Telegram, Slack, or Desktop and gets that specialist back, on the model plan they already pay for.
+Each compose service is one specialist. The operator changes one service. The principal hands work to that specialist through Linear or any chat and gets it back, on the model plan they already pay for.
 
 The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay-repository.md`](docs/overlay-repository.md).
 
