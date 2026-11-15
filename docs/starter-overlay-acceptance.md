@@ -202,6 +202,30 @@ cannot write its own workspace: `write_file` there fails with
 `Permission denied`. This is not one of the defaults, but it affects every
 agent the starter overlay starts.
 
+### Fixed after the rerun, not yet re-run in containers
+
+These changes landed after this run, with unit tests only. A short container
+rerun of voice and the skill pack is still needed before either is marked
+`shipped`.
+
+- **Voice guard.** A component may now be on only under a `shipped` default
+  that carries the enable guard (`enable_guard`: sidecar configured and
+  reachable, no hosted fallback). `voice` carries it. Voice turns on only when
+  the in-container render (`--check-files`) sees the sidecar answer its health
+  route; a host render leaves it off as not checked. Voice on must name
+  `stt.provider: kokoro_sidecar`. The contract summary now says the CPU server
+  has no transcription and the GPU sidecar is the option for it.
+- **Skill pack mount point.** Each agent has a one-shot `<agent>-skills-init`
+  service that creates `/opt/data/skills/switchroom-shared` as the agent user
+  before the agent starts, so Docker no longer creates the skills directory as
+  root. The setup check reports the pack off if the agent cannot write its
+  skills directory.
+- **`coding-clis.claude`** uses the same real-login check as the Claude
+  defaults, so an empty login file is off.
+- **Linear.** An empty token file is reported as `is empty`.
+
+The root-owned workspace volume is a separate defect and is not fixed here.
+
 ### Not proven in the rerun
 
 - Any default whose on-state needs a real credential: Claude logins, Linear

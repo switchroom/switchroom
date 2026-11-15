@@ -4,7 +4,8 @@
 starter defaults look for with ``--check-files``: the mounted plugins, the
 shared skill pack inside HERMES_HOME/skills, the op binary and a 1Password
 mapping, a Claude login, the Linear token file and one coding-CLI login. Every
-file is synthetic and empty of real credentials.
+file is synthetic and empty of real credentials. ``healthy_voice`` stands in
+for a voice sidecar that answers.
 """
 from __future__ import annotations
 
@@ -18,6 +19,16 @@ PLUGINS = (("opt/hermes/plugins", "security-guidance"), ("opt/hermes/plugins", "
 # The shape Claude Code writes on login; the values are placeholders.
 CLAUDE_LOGIN = {"claudeAiOauth": {"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh",
                                   "expiresAt": 0, "scopes": ["user:inference"]}}
+
+
+def healthy_voice(url: str) -> None:
+    """A voice probe for tests whose sidecar is up: the speech sidecar answers."""
+    return None
+
+
+def unreachable_voice(url: str) -> str:
+    """A voice probe for tests whose sidecar does not answer."""
+    return "the voice sidecar named by HERMES_KOKORO_SIDECAR_URL does not answer (URLError)"
 
 
 def write(path: Path, text: str) -> Path:

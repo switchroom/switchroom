@@ -54,7 +54,8 @@ fixture = _fixture()
 
 def full_paths(sd, tmp, env: dict, **kwargs):
     """ContainerPaths for a synthetic agent container holding every login and mount."""
-    return sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), env, **kwargs), hermes_home="/opt/data")
+    return sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), env, **kwargs), hermes_home="/opt/data",
+                             voice_probe=fixture.healthy_voice)
 
 
 # Secret-looking values. None may ever appear in output.
@@ -426,7 +427,17 @@ class SwitchroomDoctorTests(unittest.TestCase):
             result = run(DOCTOR, "--config", str(config), "--env-file", str(self.env_file(tmp, FULL_ENV)),
                          "--no-process-env")
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(self.lines(result)["voice"], "off: turned off in this agent's config")
+        # On the host the voice sidecar cannot be reached, so the setup check
+        # cannot tell an opt-out from a sidecar that does not answer.
+        self.assertEqual(self.lines(result)["voice"],
+                         "off: text-only replies: the voice sidecar was not checked; " + self.sd.CHECK_FILES_HINT)
+        # Inside the container, with the sidecar answering, the opt-out is reported as one.
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = full_paths(self.sd, tmp, FULL_ENV)
+            config = self.sd.render(FLEET_CONFIG, "worker", self.sd.env_names(FULL_ENV), CONTRACT,
+                                    environ=FULL_ENV, paths=paths).config
+            lines, _ = self.sd.diagnose(config, FULL_ENV, CONTRACT, check_files=True, paths=paths)
+        self.assertIn("voice: off: turned off in this agent's config", lines)
 
     def test_check_files_requires_the_login_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -786,7 +797,9 @@ class StarterOverlayWave1bDefaultsTests(unittest.TestCase):
             root = self.container_root(tmp, mapping={"PERPLEXITY_API_KEY": secret_ref})
             claude = root / env["CLAUDE_CONFIG_DIR"].lstrip("/")
             claude.mkdir(parents=True)
-            (claude / ".credentials.json").write_text("{}", encoding="utf-8")
+            # A real-shaped synthetic login: coding-clis.claude uses the same
+            # real-login check as the Claude defaults, so "{}" would be off.
+            (claude / ".credentials.json").write_text(json.dumps(fixture.CLAUDE_LOGIN), encoding="utf-8")
             (root / "opt/data/home/.codex").mkdir(parents=True)
             (root / "opt/data/home/.codex/auth.json").write_text("{}", encoding="utf-8")
             lines = self.lines_for(config, env, root)

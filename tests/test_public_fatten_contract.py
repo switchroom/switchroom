@@ -171,10 +171,16 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertNotIn("honcho", json.dumps(contract["components"]).lower())
         for token in ("workspace_id", "honcho_api_key"):
             self.assertNotIn(token, json.dumps(contract).lower())
-        # No component is on in the bare image. Honcho is shipped: the shipped
-        # compose started it in real containers (docs/starter-overlay-acceptance.md,
+        # A component is on only under a shipped default carrying the enable
+        # guard (local sidecar configured and reachable, no hosted fallback);
+        # Honcho covers no component. Honcho is shipped: the shipped compose
+        # started it in real containers (docs/starter-overlay-acceptance.md,
         # rerun after the real-boot fixes).
-        self.assertFalse(any(item["default_enabled"] for item in contract["components"]))
+        guard = {"sidecar": "configured_and_reachable", "hosted_fallback": False}
+        guarded = {cid for d in contract["public_base"]["default_set"]
+                   if d["status"] == "shipped" and d.get("enable_guard") == guard for cid in d["covers"]}
+        self.assertTrue(all(item["id"] in guarded for item in contract["components"] if item["default_enabled"]))
+        self.assertEqual(honcho[0]["covers"], [])
         self.assertEqual(honcho[0]["status"], "shipped")
 
     def test_inherited_runtime_keeps_entrypoint_and_requires_uid_1000(self) -> None:

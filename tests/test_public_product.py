@@ -171,14 +171,20 @@ class PublicProductTests(unittest.TestCase):
         self.assertEqual(config["desired_state"]["unknown_key_policy"], "fail_closed")
         self.assertEqual(config["desired_state"]["secret_value_policy"], "reject")
         # Reviewed default set (reference/rfcs/default-on-distribution.md). Only
-        # defaults proven in real containers are shipped, and none of them covers a
-        # component, so no component is on in the bare image;
-        # tests/test_default_on_contract.py pins the exact list, degrade behaviour
-        # and billing.
+        # defaults proven in real containers are shipped. A shipped default may
+        # cover a component only with the enable guard (its local sidecar
+        # configured and reachable, no hosted fallback), and only such a
+        # component may be on; tests/test_default_on_contract.py pins the exact
+        # list, degrade behaviour and billing.
         self.assertEqual(plugins["public_base"]["policy"], "reviewed_default_set")
         self.assertTrue(all(d["status"] in {"planned", "shipped"} for d in plugins["public_base"]["default_set"]))
-        self.assertTrue(all(not d["covers"] for d in plugins["public_base"]["default_set"] if d["status"] == "shipped"))
-        self.assertTrue(all(not item["default_enabled"] for item in plugins["components"]))
+        guard = {"sidecar": "configured_and_reachable", "hosted_fallback": False}
+        guarded = set()
+        for d in plugins["public_base"]["default_set"]:
+            if d["status"] == "shipped" and d["covers"]:
+                self.assertEqual(d.get("enable_guard"), guard, d["id"])
+                guarded.update(d["covers"])
+        self.assertTrue(all(item["id"] in guarded for item in plugins["components"] if item["default_enabled"]))
         self.assertTrue(
             all(item["default_role"] in {"default", "opt_in", "off"} for item in plugins["components"])
         )
