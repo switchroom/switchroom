@@ -45,6 +45,9 @@ def _module():
 FULL_ENV = {
     "CLAUDE_CONFIG_DIR": "/opt/data/.claude-login-dir-value",
     "LINEAR_TOKEN_FILE": "/opt/data/secrets/linear-token-value",
+    # Synthetic IDs, deliberately fake UUIDs: no deployment identity.
+    "LINEAR_VIEWER_ID": "00000000-0000-4000-8000-0000000fa4e1",
+    "LINEAR_ORGANIZATION_ID": "00000000-0000-4000-8000-0000000fa4e2",
     "HERMES_KOKORO_SIDECAR_URL": "http://voice-sidecar-value:8880",
     "HERMES_KOKORO_SIDECAR_TOKEN": "voice-token-SECRET-value",
     "HONCHO_BASE_URL": "http://honcho-endpoint-value:8000",
@@ -257,7 +260,8 @@ class StarterOverlayRenderTests(unittest.TestCase):
             path.write_text(text + "  browser-handoff:\n    values:\n      terminal.cwd: /tmp\n", encoding="utf-8")
             with self.assertRaisesRegex(self.sd.DefaultsError, "not in the reviewed default set"):
                 self.render(config_dir=config_dir)
-            path.write_text(text.replace("requires_env: [LINEAR_TOKEN_FILE]", "requires_env: []"), encoding="utf-8")
+            path.write_text(text.replace("requires_env: [LINEAR_TOKEN_FILE, LINEAR_VIEWER_ID, LINEAR_ORGANIZATION_ID]",
+                                         "requires_env: []"), encoding="utf-8")
             with self.assertRaisesRegex(self.sd.DefaultsError, "requires_env"):
                 self.render(config_dir=config_dir)
 
@@ -393,6 +397,99 @@ class SwitchroomDoctorTests(unittest.TestCase):
         self.assertEqual(bad.returncode, 1)
         self.assertIn("problem: model provider claude-acp is not in the granted list", bad.stdout)
         self.assertEqual(unreadable.returncode, 2)
+
+
+def expand_env(value, environ: dict):
+    """Expand ${NAME} the way Hermes does when it loads config.yaml."""
+    if isinstance(value, str):
+        return re.sub(r"\$\{(?:env:)?([^}]*)\}", lambda m: environ[m.group(1)], value)
+    if isinstance(value, dict):
+        return {k: expand_env(v, environ) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env(v, environ) for v in value]
+    return value
+
+
+@unittest.skipUnless(HAVE_YAML, "PyYAML is required for overlay YAML")
+class RenderedSettingsPluginValidationTests(unittest.TestCase):
+    """A default rendered on must pass its own plugin's settings validation.
+
+    The renderer only knows variable names; the plugin decides whether the
+    settings it is given can start. Each plugin that validates its settings
+    is fed the rendered, env-expanded settings here, so a default can never
+    be rendered on and then refused at gateway start.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sd = _module()
+        sys.path.insert(0, str(ROOT / "tests"))
+        from linear_fake_api import load_plugin
+        cls.linear = load_plugin()
+        from hermes_fleet_linear_plugin import oauth
+        cls.linear_oauth = oauth
+
+    def settings(self, plugin: str, env: dict = FULL_ENV) -> dict:
+        rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(env), CONTRACT)
+        self.assertIn(plugin, rendered.leaves["plugins.enabled"])
+        return expand_env(rendered.leaves[f"plugins.entries.{plugin}.settings"], env)
+
+    def start_linear(self, raw: dict, home: Path):
+        """The plugin's own start-up validation, as _reporting_loop runs it."""
+        settings = {key: raw[key] for key in self.linear.SETTINGS if raw.get(key) is not None}
+        self.linear.validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
+        self.linear.validate_ingress_profile(settings.get("ingress_profile"))
+        api = self.linear.BoundLinearAPI(lambda: "", identity=settings.get("identity"),
+                                         specialist_scope=settings.get("specialist_scope"),
+                                         rate_limit_path=self.linear.rate_limit_path(settings.get("state_database"), home))
+        return api, self.linear_oauth.token_provider(settings, home)
+
+    def test_rendered_linear_settings_pass_the_plugins_start_up_validation(self) -> None:
+        raw = self.settings("linear")
+        self.assertIs(raw["enabled"], True)
+        with tempfile.TemporaryDirectory() as tmp:
+            api, token = self.start_linear(raw, Path(tmp))
+        self.assertEqual(api.identity, {"viewer_id": FULL_ENV["LINEAR_VIEWER_ID"],
+                                        "organization_id": FULL_ENV["LINEAR_ORGANIZATION_ID"]})
+        self.assertIsInstance(token, self.linear_oauth.TokenFile)
+        self.assertEqual(str(token.path), FULL_ENV["LINEAR_TOKEN_FILE"])
+
+    def test_linear_settings_without_identity_are_refused_by_plugin_and_doctor(self) -> None:
+        raw = self.settings("linear")
+        for broken in ({k: v for k, v in raw.items() if k != "identity"},
+                       dict(raw, identity={"viewer_id": FULL_ENV["LINEAR_VIEWER_ID"]}),
+                       dict(raw, identity={"viewer_id": " ", "organization_id": FULL_ENV["LINEAR_ORGANIZATION_ID"]})):
+            with self.subTest(identity=broken.get("identity")), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, "identity needs viewer_id and organization_id"):
+                    self.start_linear(broken, Path(tmp))
+                config = {"plugins": {"enabled": ["linear"], "entries": {"linear": {"settings": broken}}}}
+                lines, _ = self.sd.diagnose(config, FULL_ENV, CONTRACT)
+                self.assertIn("linear: off: disabled: plugins.entries.linear.settings.identity needs "
+                              "viewer_id and organization_id", lines)
+
+    def test_linear_is_omitted_when_any_identity_variable_is_missing(self) -> None:
+        for name in self.sd.REQUIREMENTS["linear"]:
+            with self.subTest(missing=name):
+                env = {k: v for k, v in FULL_ENV.items() if k != name}
+                rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(env), CONTRACT)
+                self.assertEqual(rendered.decisions["linear"].reason, f"{name} not set")
+                self.assertNotIn("linear", rendered.leaves["plugins.enabled"])
+                self.assertEqual(rendered.leaves["plugins.entries.linear.settings"], {"enabled": False})
+                lines, _ = self.sd.diagnose(rendered.config, env, CONTRACT)
+                self.assertIn(f"linear: off: disabled: {name} not set", lines)
+
+    def test_rendered_connector_settings_pass_the_plugins_validation(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "starter_connectors_under_test", ROOT / "plugins" / "claude-account-connectors" / "plugin.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        raw = self.settings("claude-account-connectors")
+        self.assertIs(raw["enabled"], True)
+        # Same arguments register() passes; a stub ACP keeps this credential-free.
+        backend = module.NativeBackend(raw.get("model", "sonnet"), raw.get("timeout", 90), acp=object())
+        self.assertEqual((backend.model, backend.timeout), (raw["model"], raw["timeout"]))
+        with self.assertRaises(ValueError):
+            module.NativeBackend("not-a-model", raw["timeout"], acp=object())
 
 
 @unittest.skipUnless(HAVE_YAML, "PyYAML is required for overlay YAML")

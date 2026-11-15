@@ -42,7 +42,7 @@ REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "model-roles": (),
     "claude-subscription-directsdk": ("CLAUDE_CONFIG_DIR",),
     "claude-acp-connectors": ("CLAUDE_CONFIG_DIR",),
-    "linear": ("LINEAR_TOKEN_FILE",),
+    "linear": ("LINEAR_TOKEN_FILE", "LINEAR_VIEWER_ID", "LINEAR_ORGANIZATION_ID"),
     "voice": ("HERMES_KOKORO_SIDECAR_URL", "HERMES_KOKORO_SIDECAR_TOKEN"),
     "honcho-memory": ("HONCHO_BASE_URL",),
     "web-search": ("PERPLEXITY_API_KEY",),
@@ -484,6 +484,17 @@ def configured_on(default_id: str, config: Mapping[str, Any]) -> bool | None:
     return None if check is None else bool(check())
 
 
+def _settings_problem(default_id: str, config: Mapping[str, Any]) -> str | None:
+    """Why a plugin would refuse the settings of a default that is turned on, or None."""
+    if default_id == "linear":
+        identity = _get(config, "plugins.entries.linear.settings.identity")
+        if not isinstance(identity, dict) or any(
+                not isinstance(identity.get(key), str) or not identity[key].strip()
+                for key in ("viewer_id", "organization_id")):
+            return "plugins.entries.linear.settings.identity needs viewer_id and organization_id"
+    return None
+
+
 def _file_probe_failed(default_id: str, environ: Mapping[str, str]) -> str | None:
     probe = FILE_PROBES.get(default_id)
     if probe is None:
@@ -525,6 +536,8 @@ def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_pat
             decision = Decision(False, f"{degrade}: {', '.join(missing)} not set")
         elif not state:
             decision = Decision(False, "turned off in this agent's config")
+        elif settings_problem := _settings_problem(default_id, config):
+            decision = Decision(False, f"{degrade}: {settings_problem}")
         elif check_files and (failed := _file_probe_failed(default_id, environ)):
             decision = Decision(False, f"{degrade}: {failed}")
         else:
