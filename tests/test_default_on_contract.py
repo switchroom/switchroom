@@ -50,6 +50,7 @@ OPT_IN_COMPONENTS = {"browser-handoff"}
 SHIPPED: set[str] = {
     "doctrine-config", "gateway-per-agent", "quota", "session-reset-policy",
     "security-guidance", "disk-cleanup", "honcho-memory",
+    "voice", "shared-skill-pack",
 }
 GRANTED_BILLING = {"none", "principal_plan_login", "operator_supplied_key"}
 DEGRADE_BEHAVIOURS = {
