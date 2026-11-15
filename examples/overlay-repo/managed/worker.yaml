@@ -1,0 +1,4 @@
+security:
+  redact_secrets: true
+terminal:
+  backend: local

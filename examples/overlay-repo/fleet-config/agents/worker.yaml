@@ -13,4 +13,11 @@ defaults:
   # linear: false
   # honcho-memory: false
   # web-search: false
+  # secrets-connect: false
+  # coding-clis: false
+  # quota: false
+  # session-reset-policy: false
+  # security-guidance: false
+  # disk-cleanup: false
+  # shared-skill-pack: false
 values: {}

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "name": "hermes-fleet",
+      "path": "vendor/hermes-fleet",
+      "repository": "https://github.com/mekenthompson/hermes-fleet.git",
+      "commit": "image_revision",
+      "license": "MIT",
+      "provides": [
+        "shared-skill-pack",
+        "disk-cleanup",
+        "linear",
+        "voice",
+        "web-search",
+        "claude-subscription-directsdk",
+        "claude-acp-connectors"
+      ],
+      "note": "Same release as the image: pass the image's org.opencontainers.image.revision label as --fleet-revision."
+    },
+    {
+      "name": "hermes-quota-plugin",
+      "path": "vendor/hermes-quota-plugin",
+      "repository": "https://github.com/mekenthompson/hermes-quota-plugin.git",
+      "commit": "41fea5a9e1c57e2eae43e9b0e2b4c9f80dfd6f2a",
+      "license": "MIT",
+      "upstream": "https://github.com/rarf/hermes-quota-plugin",
+      "provides": [
+        "quota"
+      ],
+      "note": "Public fork of the upstream quota plugin; version 3.0.0 in its plugin.yaml."
+    },
+    {
+      "name": "hermes-session-reset-policy",
+      "path": "vendor/hermes-session-reset-policy",
+      "repository": "https://github.com/fastfinge/hermes-session-reset-policy.git",
+      "commit": "493df020496d2782d3fe15308cc3b6672c2224c4",
+      "license": "MIT",
+      "provides": [
+        "session-reset-policy"
+      ],
+      "note": "Community plugin that re-arms the session_reset policy Hermes core no longer acts on; version 0.3.0 in its plugin.yaml."
+    }
+  ]
+}

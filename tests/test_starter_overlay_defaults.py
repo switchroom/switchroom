@@ -52,10 +52,18 @@ FULL_ENV = {
     "HERMES_KOKORO_SIDECAR_TOKEN": "voice-token-SECRET-value",
     "HONCHO_BASE_URL": "http://honcho-endpoint-value:8000",
     "PERPLEXITY_API_KEY": "pplx-SECRET-key-value",
+    "OP_CONNECT_HOST": "http://connect-host-value:8080",
+    "OP_CONNECT_TOKEN": "connect-token-SECRET-value",
 }
 CONFIGURED = [
-    "doctrine-config", "gateway-per-agent", "model-roles", "claude-subscription-directsdk",
-    "claude-acp-connectors", "linear", "voice", "honcho-memory", "web-search",
+    "doctrine-config", "gateway-per-agent", "secrets-connect", "coding-clis", "model-roles",
+    "claude-subscription-directsdk", "claude-acp-connectors", "linear", "voice", "honcho-memory",
+    "web-search", "quota", "session-reset-policy", "security-guidance", "disk-cleanup", "shared-skill-pack",
+]
+# Defaults that need no credential and are always on unless an agent opts out.
+ALWAYS_ON = [
+    "doctrine-config", "gateway-per-agent", "coding-clis", "quota", "session-reset-policy",
+    "security-guidance", "disk-cleanup", "shared-skill-pack",
 ]
 PLUGINS_BY_DEFAULT = {
     "claude-subscription-directsdk": ["claude-subscription-directsdk-experimental"],
@@ -63,6 +71,10 @@ PLUGINS_BY_DEFAULT = {
     "linear": ["linear"],
     "voice": ["kokoro-voice"],
     "web-search": ["web-perplexity"],
+    "quota": ["quota"],
+    "session-reset-policy": ["hermes-session-reset-policy"],
+    "security-guidance": ["security-guidance"],
+    "disk-cleanup": ["disk-cleanup"],
 }
 
 
@@ -173,10 +185,12 @@ class StarterOverlayRenderTests(unittest.TestCase):
 
     def test_no_credentials_at_all_still_renders_a_startable_config(self) -> None:
         rendered = self.render(env={})
-        self.assertEqual([d for d, x in rendered.decisions.items() if x.on], ["doctrine-config", "gateway-per-agent"])
+        self.assertEqual([d for d, x in rendered.decisions.items() if x.on], ALWAYS_ON)
         self.assertNotIn("model.provider", rendered.leaves)
         self.assertNotIn("fallback_providers", rendered.leaves)
-        self.assertNotIn("plugins.enabled", rendered.leaves)
+        self.assertEqual(rendered.leaves["plugins.enabled"],
+                         ["quota", "hermes-session-reset-policy", "security-guidance", "disk-cleanup"])
+        self.assertEqual(rendered.leaves["_switchroom.secrets_source"], "env_file")
         self.assert_starts_cleanly(rendered, {})
 
     def assert_starts_cleanly(self, rendered, env: dict) -> None:
@@ -361,6 +375,9 @@ class SwitchroomDoctorTests(unittest.TestCase):
         self.assertTrue(lines["web-search"].startswith("off: using the default web backend"))
         self.assertTrue(lines["linear"].startswith("off: disabled"))
         self.assertTrue(lines["model-roles"].startswith("off: no granted model provider"))
+        self.assertEqual(lines["secrets-connect"], "off: using the env file: OP_CONNECT_HOST, OP_CONNECT_TOKEN not set")
+        for default_id in ALWAYS_ON:
+            self.assertEqual(lines[default_id], "on", default_id)
         self.assertEqual(lines["doctrine-config"], "on")
 
     def test_opt_out_is_reported_as_turned_off(self) -> None:
@@ -526,6 +543,203 @@ class StarterOverlayContractTests(unittest.TestCase):
                     self.assertEqual(by_id[default_id]["billing"], "principal_plan_login")
                     self.assertIs(by_id[default_id]["api_key_fallback"], False)
                     self.assertIn(entry["model"]["provider"], doc["granted_providers"])
+
+
+def _overlay_copy(tmp: str, defaults_edit=None, agent_body: str | None = None) -> Path:
+    config_dir = Path(tmp) / "fleet-config"
+    shutil.copytree(FLEET_CONFIG, config_dir)
+    if defaults_edit is not None:
+        path = config_dir / "defaults.yaml"
+        path.write_text(defaults_edit(path.read_text(encoding="utf-8")), encoding="utf-8")
+    if agent_body is not None:
+        (config_dir / "agents" / "ops.yaml").write_text(
+            "profile: ops\nrole: operator\napply_mode: merge\n" + agent_body, encoding="utf-8")
+    return config_dir
+
+
+@unittest.skipUnless(HAVE_YAML, "PyYAML is required for overlay YAML")
+class StarterOverlayWave1bDefaultsTests(unittest.TestCase):
+    """secrets-connect, coding-clis, quota, session-reset-policy,
+    security-guidance, disk-cleanup and shared-skill-pack."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.sd = _module()
+
+    def render(self, env: dict = FULL_ENV, config_dir: Path = FLEET_CONFIG, agent: str = "ops"):
+        return self.sd.render(config_dir, agent, self.sd.env_names(env), CONTRACT)
+
+    def test_new_defaults_render_their_reviewed_settings(self) -> None:
+        leaves = self.render().leaves
+        self.assertEqual(leaves["session_reset"], {"mode": "idle", "idle_minutes": 240})
+        self.assertEqual(leaves["plugins.config.disk-cleanup"], {"session_end_mode": "report_only"})
+        self.assertEqual(leaves["skills.external_dirs"], ["/opt/skill-packs/shared"])
+        self.assertEqual(leaves["_switchroom.secrets_source"], "onepassword_connect")
+        expected = next(d for d in contract_defaults() if d["id"] == "coding-clis")["expected"]
+        self.assertEqual(leaves["_switchroom.coding_clis"], expected)
+        for plugin in ("quota", "hermes-session-reset-policy", "security-guidance", "disk-cleanup"):
+            self.assertIn(plugin, leaves["plugins.enabled"])
+        # Hermes reads secrets.onepassword only from the agent's own config.yaml,
+        # so a managed render that set it would be silently ignored.
+        self.assertNotIn("secrets", self.render().config)
+
+    def test_coding_clis_match_the_image_lockfile(self) -> None:
+        packages = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["dependencies"]
+        image_clis = {"@anthropic-ai/claude-code": "claude", "@openai/codex": "codex",
+                      "@xai-official/grok": "grok", "opencode-ai": "opencode"}
+        self.assertTrue(set(image_clis) <= set(packages))
+        expected = next(d for d in contract_defaults() if d["id"] == "coding-clis")["expected"]
+        self.assertEqual(sorted(expected), sorted(image_clis.values()))
+        self.assertEqual(sorted(self.sd.CODING_CLI_LOGINS), sorted(expected))
+
+    def test_connect_supplies_only_the_names_it_lists_and_only_while_it_is_on(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = _overlay_copy(tmp, lambda t: t.replace(
+                "_switchroom.connect_provides: []", "_switchroom.connect_provides: [PERPLEXITY_API_KEY]"))
+            without_key = {k: v for k, v in FULL_ENV.items() if k != "PERPLEXITY_API_KEY"}
+            rendered = self.render(without_key, config_dir)
+            self.assertTrue(rendered.decisions["web-search"].on)
+            lines, problems = self.sd.diagnose(rendered.config, without_key, CONTRACT)
+            self.assertIn("web-search: on", lines)
+            self.assertIn("secrets-connect: on", lines)
+            self.assertEqual(problems, [])
+            no_connect = {k: v for k, v in without_key.items() if not k.startswith("OP_CONNECT")}
+            rendered = self.render(no_connect, config_dir)
+            self.assertFalse(rendered.decisions["web-search"].on)
+            self.assertEqual(rendered.leaves["_switchroom.secrets_source"], "env_file")
+            lines, _ = self.sd.diagnose(rendered.config, no_connect, CONTRACT)
+            self.assertIn("secrets-connect: off: using the env file: OP_CONNECT_HOST, OP_CONNECT_TOKEN not set", lines)
+            self.assertIn("web-search: off: using the default web backend: PERPLEXITY_API_KEY not set", lines)
+            opted_out = _overlay_copy(tmp + "/b", lambda t: t.replace(
+                "_switchroom.connect_provides: []", "_switchroom.connect_provides: [PERPLEXITY_API_KEY]"),
+                "defaults:\n  secrets-connect: false\nvalues: {}\n")
+            self.assertFalse(self.render(without_key, opted_out).decisions["web-search"].on)
+
+    def test_connect_leaves_are_owned_by_the_connect_default(self) -> None:
+        cases = {
+            "agent value": (None, "values:\n  _switchroom.connect_provides: [PERPLEXITY_API_KEY]\n"),
+            "other default": (lambda t: t.replace("      _switchroom.coding_clis: [claude, codex, grok, opencode]",
+                                                  "      _switchroom.coding_clis: [claude]\n"
+                                                  "      _switchroom.connect_provides: [PERPLEXITY_API_KEY]"), None),
+            "own requirement": (lambda t: t.replace("_switchroom.connect_provides: []",
+                                                    "_switchroom.connect_provides: [OP_CONNECT_TOKEN]"), None),
+            "unknown cli": (lambda t: t.replace("[claude, codex, grok, opencode]", "[claude, aider]"), None),
+        }
+        for label, (edit, agent) in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(self.sd.DefaultsError):
+                    self.render(config_dir=_overlay_copy(tmp, edit, agent))
+
+    def test_disk_cleanup_never_renders_or_passes_in_a_deleting_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = _overlay_copy(tmp, agent_body="values:\n  plugins.config.disk-cleanup:\n"
+                                                       "    session_end_mode: cleanup\n")
+            with self.assertRaisesRegex(self.sd.DefaultsError, "would delete"):
+                self.render(config_dir=config_dir)
+        config = self.render().config
+        del config["plugins"]["config"]
+        lines, problems = self.sd.diagnose(config, FULL_ENV, CONTRACT)
+        self.assertTrue(any("would delete" in p for p in problems), problems)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            result = run(DOCTOR, "--config", str(path), "--no-process-env")
+        self.assertEqual(result.returncode, 1)
+
+    def test_session_reset_values_the_plugin_would_ignore_are_reported_off(self) -> None:
+        config = self.render().config
+        lines, _ = self.sd.diagnose(config, FULL_ENV, CONTRACT)
+        self.assertIn("session-reset-policy: on", lines)
+        for broken, reason in (({"mode": "idle", "idle_minutes": "240"}, "idle_minutes"),
+                               ({"mode": "idle", "idle_minutes": 0}, "idle_minutes"),
+                               ({"mode": "sometimes", "idle_minutes": 240}, "mode"),
+                               ({"mode": "daily"}, "at_hour")):
+            with self.subTest(policy=broken):
+                config["session_reset"] = broken
+                lines, _ = self.sd.diagnose(config, FULL_ENV, CONTRACT)
+                status = next(line for line in lines if line.startswith("session-reset-policy: "))
+                self.assertTrue(status.startswith("session-reset-policy: off: disabled: session_reset."), status)
+                self.assertIn(reason, status)
+
+    def container_root(self, tmp: str, *, plugins: bool = True, skills: bool = True, op: bool = True,
+                       mapping: dict | None = None) -> Path:
+        root = Path(tmp) / "root"
+        if plugins:
+            for base, name in (("opt/hermes/plugins", "security-guidance"), ("opt/hermes/plugins", "disk-cleanup"),
+                               ("opt/data/plugins", "quota"), ("opt/data/plugins", "hermes-session-reset-policy")):
+                (root / base / name).mkdir(parents=True)
+                (root / base / name / "plugin.yaml").write_text(f"name: {name}\n", encoding="utf-8")
+        if skills:
+            (root / "opt/skill-packs/shared/example-skill").mkdir(parents=True)
+            (root / "opt/skill-packs/shared/example-skill/SKILL.md").write_text("---\nname: x\n---\n", encoding="utf-8")
+        if op:
+            (root / "usr/local/bin").mkdir(parents=True)
+            (root / "usr/local/bin/op").write_text("", encoding="utf-8")
+        if mapping is not None:
+            (root / "opt/data").mkdir(parents=True, exist_ok=True)
+            (root / "opt/data/config.yaml").write_text(yaml.safe_dump(
+                {"secrets": {"onepassword": {"enabled": True, "env": mapping}}}), encoding="utf-8")
+        return root
+
+    def lines_for(self, config: dict, env: dict, root: Path) -> dict[str, str]:
+        lines, _ = self.sd.diagnose(config, env, CONTRACT, check_files=True,
+                                    paths=self.sd.ContainerPaths(root=root, hermes_home="/opt/data"))
+        return dict(line.split(": ", 1) for line in lines)
+
+    def test_check_files_requires_mounts_skills_connect_mapping_and_cli_logins(self) -> None:
+        secret_ref = "vault-ref-SECRET-value"
+        # The Perplexity key comes only from Connect here, never the env file.
+        env = dict({k: v for k, v in FULL_ENV.items() if k != "PERPLEXITY_API_KEY"}, HOME="/opt/data/home")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = _overlay_copy(tmp, lambda t: t.replace(
+                "_switchroom.connect_provides: []", "_switchroom.connect_provides: [PERPLEXITY_API_KEY]"))
+            config = self.render(env, config_dir).config
+            root = self.container_root(tmp, mapping={"PERPLEXITY_API_KEY": secret_ref})
+            claude = root / env["CLAUDE_CONFIG_DIR"].lstrip("/")
+            claude.mkdir(parents=True)
+            (claude / ".credentials.json").write_text("{}", encoding="utf-8")
+            (root / "opt/data/home/.codex").mkdir(parents=True)
+            (root / "opt/data/home/.codex/auth.json").write_text("{}", encoding="utf-8")
+            lines = self.lines_for(config, env, root)
+            for default_id in ("quota", "session-reset-policy", "security-guidance", "disk-cleanup",
+                               "shared-skill-pack", "secrets-connect", "coding-clis"):
+                self.assertEqual(lines[default_id], "on", default_id)
+            self.assertEqual(lines["web-search"], "on")
+            self.assertEqual(lines["coding-clis.claude"], "on")
+            self.assertEqual(lines["coding-clis.codex"], "on")
+            self.assertEqual(lines["coding-clis.grok"], "off: disabled: no grok login found")
+            self.assertEqual(lines["coding-clis.opencode"], "off: disabled: no opencode login found")
+            self.assertNotIn(secret_ref, "\n".join(lines.values()))
+
+            bare = self.container_root(tmp + "/bare", plugins=False, skills=False, op=False)
+            lines = self.lines_for(config, {k: v for k, v in env.items() if k != "CLAUDE_CONFIG_DIR"}, bare)
+            self.assertEqual(lines["quota"], "off: disabled: plugin quota is not present at /opt/data/plugins/quota")
+            self.assertTrue(lines["disk-cleanup"].startswith("off: disabled: plugin disk-cleanup is not present"))
+            self.assertTrue(lines["shared-skill-pack"].startswith("off: disabled: no skills found in /opt/skill-packs/shared"))
+            self.assertEqual(lines["secrets-connect"], "off: using the env file: the op CLI is not at /usr/local/bin/op")
+            self.assertTrue(lines["web-search"].startswith("off: using the default web backend"))
+            self.assertEqual(lines["coding-clis"], "off: disabled: no coding CLI login found")
+
+            unmapped = self.container_root(tmp + "/unmapped", mapping={})
+            lines = self.lines_for(config, env, unmapped)
+            self.assertEqual(lines["secrets-connect"],
+                             "off: using the env file: no 1Password reference mapped for PERPLEXITY_API_KEY")
+            self.assertTrue(lines["web-search"].startswith("off: "))
+
+    def test_doctor_cli_root_flag_and_no_values_printed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "ops.yaml"
+            config.write_text(self.sd.dump_config(self.render()), encoding="utf-8")
+            env_file = Path(tmp) / "ops.env"
+            env_file.write_text("".join(f"{k}={v}\n" for k, v in FULL_ENV.items()), encoding="utf-8")
+            root = self.container_root(tmp, mapping={})
+            result = run(DOCTOR, "--config", str(config), "--env-file", str(env_file), "--no-process-env",
+                         "--check-files", "--root", str(root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("quota: on", result.stdout)
+        self.assertIn("coding-clis: off: disabled: no coding CLI login found", result.stdout)
+        for value in FULL_ENV.values():
+            self.assertNotIn(value, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

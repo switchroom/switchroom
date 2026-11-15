@@ -1,6 +1,8 @@
 .env
 .env.*
 secrets/
+vendor/
+rendered/
 *.pem
 auth.json
 credentials.json

@@ -9,21 +9,69 @@ x-hermes-agent: &hermes-agent
     TZ: UTC
   command: ["gateway", "run"]
 
+# Read-only mounts for the starter defaults. Sources come from vendor/, which
+# scripts/fetch-overlay-vendor.py fills at the commits vendor.lock.json pins:
+# the Fleet repository at the image's own revision (skill pack and Fleet
+# plugins) and the two third-party plugins. A source that was never fetched
+# mounts as an empty directory: that default is absent, the setup check
+# (--check-files) reports it, and the agent still starts.
+x-starter-mounts:
+  - &skill-pack ./vendor/hermes-fleet/skills:/opt/skill-packs/shared:ro
+  - &plugin-linear ./vendor/hermes-fleet/plugins/linear:/opt/hermes/plugins/linear:ro
+  - &plugin-kokoro ./vendor/hermes-fleet/plugins/kokoro-voice:/opt/hermes/plugins/kokoro-voice:ro
+  - &plugin-perplexity ./vendor/hermes-fleet/plugins/web/perplexity:/opt/hermes/plugins/web/perplexity:ro
+  - &plugin-claude-acp ./vendor/hermes-fleet/plugins/model-providers/claude-acp:/opt/hermes/plugins/model-providers/claude-acp:ro
+  - &plugin-directsdk ./vendor/hermes-fleet/plugins/claude-subscription-directsdk:/opt/hermes/plugins/model-providers/claude-subscription-directsdk:ro
+  - &plugin-connectors ./vendor/hermes-fleet/plugins/claude-account-connectors:/opt/hermes/plugins/claude-account-connectors:ro
+  - &plugin-disk-cleanup ./vendor/hermes-fleet/plugins/disk-cleanup:/opt/hermes/plugins/disk-cleanup:ro
+  - &plugin-quota ./vendor/hermes-quota-plugin:/opt/data/plugins/quota:ro
+  - &plugin-session-reset ./vendor/hermes-session-reset-policy:/opt/data/plugins/hermes-session-reset-policy:ro
+
 services:
   ops:
     <<: *hermes-agent
+    # The env-file fallback for secrets (and the Connect token when you use
+    # 1Password Connect). A missing file is fine: each default whose variable
+    # is missing turns itself off.
+    env_file:
+      - path: ./secrets/ops.env
+        required: false
     volumes:
       - ops-state:/opt/data
       - ops-workspace:/opt/data/workspace
       - ./managed/ops.yaml:/etc/hermes/config.yaml:ro
+      - *skill-pack
+      - *plugin-linear
+      - *plugin-kokoro
+      - *plugin-perplexity
+      - *plugin-claude-acp
+      - *plugin-directsdk
+      - *plugin-connectors
+      - *plugin-disk-cleanup
+      - *plugin-quota
+      - *plugin-session-reset
     networks:
       - ops-network
 
   worker:
     <<: *hermes-agent
+    env_file:
+      - path: ./secrets/worker.env
+        required: false
+    # No Kokoro mount: agents/worker.yaml turns voice off.
     volumes:
       - worker-state:/opt/data
       - worker-workspace:/opt/data/workspace
+      - ./managed/worker.yaml:/etc/hermes/config.yaml:ro
+      - *skill-pack
+      - *plugin-linear
+      - *plugin-perplexity
+      - *plugin-claude-acp
+      - *plugin-directsdk
+      - *plugin-connectors
+      - *plugin-disk-cleanup
+      - *plugin-quota
+      - *plugin-session-reset
     networks:
       - worker-network
 

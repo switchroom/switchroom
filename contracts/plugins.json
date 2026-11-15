@@ -59,7 +59,7 @@
       {
         "id": "secrets-connect",
         "status": "planned",
-        "starter_overlay": "not_configured",
+        "starter_overlay": "configured",
         "summary": "1Password Connect secrets per container, with an env-file fallback.",
         "covers": [],
         "credential": {
@@ -76,7 +76,7 @@
       {
         "id": "coding-clis",
         "status": "planned",
-        "starter_overlay": "not_configured",
+        "starter_overlay": "configured",
         "summary": "Pinned coding CLIs in the image, each using the agent's own login.",
         "covers": [],
         "credential": {
@@ -87,7 +87,13 @@
           "behaviour": "disable_and_report"
         },
         "billing": "principal_plan_login",
-        "blocks_agent_start": false
+        "blocks_agent_start": false,
+        "expected": [
+          "claude",
+          "codex",
+          "grok",
+          "opencode"
+        ]
       },
       {
         "id": "model-roles",
@@ -227,56 +233,8 @@
       {
         "id": "quota",
         "status": "planned",
-        "starter_overlay": "not_configured",
-        "summary": "Quota checks before long tasks and on rate limits.",
-        "covers": [],
-        "credential": {
-          "kind": "none"
-        },
-        "degrade": {
-          "when": "never_missing",
-          "behaviour": "always_on"
-        },
-        "billing": "none",
-        "blocks_agent_start": false
-      },
-      {
-        "id": "session-reset-policy",
-        "status": "planned",
-        "starter_overlay": "not_configured",
-        "summary": "Session reset policy.",
-        "covers": [],
-        "credential": {
-          "kind": "none"
-        },
-        "degrade": {
-          "when": "never_missing",
-          "behaviour": "always_on"
-        },
-        "billing": "none",
-        "blocks_agent_start": false
-      },
-      {
-        "id": "security-guidance",
-        "status": "planned",
-        "starter_overlay": "not_configured",
-        "summary": "Security guidance.",
-        "covers": [],
-        "credential": {
-          "kind": "none"
-        },
-        "degrade": {
-          "when": "never_missing",
-          "behaviour": "always_on"
-        },
-        "billing": "none",
-        "blocks_agent_start": false
-      },
-      {
-        "id": "disk-cleanup",
-        "status": "planned",
-        "starter_overlay": "not_configured",
-        "summary": "Disk cleanup in report-only mode.",
+        "starter_overlay": "configured",
+        "summary": "Quota checks before long tasks and on rate limits, through the third-party quota plugin pinned by exact commit.",
         "covers": [],
         "credential": {
           "kind": "none"
@@ -287,13 +245,87 @@
         },
         "billing": "none",
         "blocks_agent_start": false,
-        "mode": "report_only"
+        "source": {
+          "vendored": false,
+          "license": "MIT",
+          "distribution": "overlay_pinned_commit",
+          "repository": "https://github.com/mekenthompson/hermes-quota-plugin",
+          "upstream": "https://github.com/rarf/hermes-quota-plugin",
+          "commit": "41fea5a9e1c57e2eae43e9b0e2b4c9f80dfd6f2a"
+        }
+      },
+      {
+        "id": "session-reset-policy",
+        "status": "planned",
+        "starter_overlay": "configured",
+        "summary": "Fresh conversation after 240 idle minutes, through the third-party hermes-session-reset-policy plugin pinned by exact commit.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false,
+        "source": {
+          "vendored": false,
+          "license": "MIT",
+          "distribution": "overlay_pinned_commit",
+          "repository": "https://github.com/fastfinge/hermes-session-reset-policy",
+          "commit": "493df020496d2782d3fe15308cc3b6672c2224c4"
+        }
+      },
+      {
+        "id": "security-guidance",
+        "status": "planned",
+        "starter_overlay": "configured",
+        "summary": "Security warnings on dangerous patterns in file writes, from the Hermes Agent security-guidance plugin in the image.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false,
+        "source": {
+          "vendored": false,
+          "license": "Apache-2.0 patterns, MIT port",
+          "distribution": "agent_parent_image"
+        }
+      },
+      {
+        "id": "disk-cleanup",
+        "status": "planned",
+        "starter_overlay": "configured",
+        "summary": "Disk cleanup in report-only mode: tracks ephemeral files and reports them at session end, never deleting.",
+        "covers": [],
+        "credential": {
+          "kind": "none"
+        },
+        "degrade": {
+          "when": "never_missing",
+          "behaviour": "always_on"
+        },
+        "billing": "none",
+        "blocks_agent_start": false,
+        "mode": "report_only",
+        "source": {
+          "vendored": true,
+          "license": "MIT",
+          "distribution": "public_plugin",
+          "path": "plugins/disk-cleanup"
+        }
       },
       {
         "id": "shared-skill-pack",
         "status": "planned",
-        "starter_overlay": "not_configured",
-        "summary": "Shared skill pack.",
+        "starter_overlay": "configured",
+        "summary": "Shared skill pack from skills/, mounted read-only from the same release as the image.",
         "covers": [],
         "credential": {
           "kind": "none"
