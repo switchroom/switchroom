@@ -47,7 +47,10 @@ DEFAULT_COMPONENTS = {
 OPT_IN_COMPONENTS = {"browser-handoff"}
 # Shipped only when the starter overlay actually enables a default. Wave 0 ships none.
 # Proven in real containers: docs/starter-overlay-acceptance.md.
-SHIPPED: set[str] = {"doctrine-config", "gateway-per-agent", "quota", "session-reset-policy"}
+SHIPPED: set[str] = {
+    "doctrine-config", "gateway-per-agent", "quota", "session-reset-policy",
+    "security-guidance", "disk-cleanup", "honcho-memory",
+}
 GRANTED_BILLING = {"none", "principal_plan_login", "operator_supplied_key"}
 DEGRADE_BEHAVIOURS = {
     "always_on",
