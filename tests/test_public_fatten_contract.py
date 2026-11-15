@@ -132,8 +132,14 @@ class PublicFattenContractTests(unittest.TestCase):
             self.assertTrue(path.is_file(), relative)
             tracked.append(path.read_text(encoding="utf-8").lower())
         blob = "\n".join(tracked)
+        # Switchroom is the public product name (reference/rfcs/switchroom-positioning.md).
+        # Deployment identifiers under that name stay out.
         for token in (
-            "switchroom",
+            "browser.switchroom",
+            "switchroom-ai",
+            "switchroom-config",
+            "switchroom-artifacts",
+            "switchroom.ai/artifact",
             "melbourne",
             "o" + "p://",
             "au.com.kenthompson",

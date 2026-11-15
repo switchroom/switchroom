@@ -1,17 +1,19 @@
 ---
-title: Hermes Fleet product spec
-last_reviewed: 2026-09-12
+title: Switchroom product spec
+last_reviewed: 2026-11-15
 ---
 
-# Hermes Fleet product spec
+# Switchroom product spec
 
 The product-level layer between the anchors ([vision](vision.md) / [principles](principles.md) / [invariants](invariants.md)) and the Job Specs. Job Specs `serves:` one of the outcome slugs named here.
 
-Decision: [rfcs/successor-vision.md](rfcs/successor-vision.md).
+Decisions: [rfcs/successor-vision.md](rfcs/successor-vision.md), [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md).
 
 ## The product, in one line
 
-Opinionated isolated Hermes. One agent per container and gateway. No shared credentials. A standing team of specialists you text is an outcome, not the tagline.
+Switchroom: an opinionated Hermes Agent distribution. Opinionated isolated Hermes. One agent per container and gateway. No shared credentials.
+
+Public headline: "Hermes, run as a team. Each agent in its own box." A standing team of specialists you text is an outcome. It leads the headline only alongside isolation, never alone.
 
 ## North Star
 
@@ -75,6 +77,8 @@ The principal already pays the model plan. Fleet is not a second invoice. The op
 
 **Behaviour.** The principal texts and expects the same specialist back. The operator reads live state when they distrust docs. Zero tolerance for "deployed" when the profile is still on the previous intended state, and for a turn that billed the wrong plan.
 
+**Public adopter.** A technical self-hoster, GitHub-led, early access. They compare Switchroom with plain Hermes profiles. Their question is "what does this add to Hermes, and what is real today?" Evidence: 2026-11-15 positioning interview. Demand is [GUESS].
+
 **Language and the buying committee.** Dogfood words: "what's running", "don't disturb the others", "on a leash", "the plan we already pay for." The dogfood human is both champion and signer. Public-adopter committee unknown. [GUESS]
 
 **Their economics.** Fleet is not a paid product. The principal already pays the model plan. A bad month is a change that takes more than one agent down, a "success" that was only published, or an off-plan bill.
@@ -114,7 +118,7 @@ Further jobs are not indexed until they have Job Specs. The successor interview 
 
 ## Evidence & confidence
 
-Evidence: 2026-09-12 successor interview (one-liner, four outcomes, TUTR, surfaces, audience); Switchroom vision/JTBD as the prior vehicle, not copied wholesale; public contracts and README isolation model.
+Evidence: 2026-11-15 positioning interview (name, category line, headline, public adopter, model framing); 2026-09-12 successor interview (one-liner, four outcomes, TUTR, surfaces, audience); Switchroom vision/JTBD as the prior vehicle, not copied wholesale; public contracts and README isolation model.
 
 Confidence: 2. The dogfood principal+operator ratified the sentence. Public adopter demand is unmeasured. TUTR is uninstrumented.
 
@@ -124,4 +128,5 @@ Confidence: 2. The dogfood principal+operator ratified the sentence. Public adop
 - [principles.md](principles.md)
 - [invariants.md](invariants.md)
 - [rfcs/successor-vision.md](rfcs/successor-vision.md)
+- [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md)
 - Linear: [HF-282](https://linear.app/switchroom-ai/issue/HF-282/retarget-public-fleet-vision-as-switchroom-successor)

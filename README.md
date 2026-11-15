@@ -1,14 +1,16 @@
-# Hermes Fleet
+# Switchroom
 
-Opinionated isolated Hermes. One agent per container and gateway. No shared credentials.
+**An opinionated Hermes Agent distribution.** Hermes, run as a team. Each agent in its own box: one agent per container and gateway, no shared credentials.
 
-The public distribution is a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout. A standing team of specialists you text is an outcome, not the tagline.
+Site: [switchroom.ai](https://switchroom.ai). Built on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by Nous Research; not affiliated with Nous Research. This repository keeps its working name, `hermes-fleet`, until it moves to the `switchroom` org. Early access: there is no quickstart yet. Naming and positioning: [`reference/rfcs/switchroom-positioning.md`](reference/rfcs/switchroom-positioning.md).
+
+The public distribution is a provenance-bound child image, independent sidecar images, and the contracts that keep deployment identity out of the runtime. Pin every image by digest. Source or image publication is not a production rollout. A standing team of specialists you text is an outcome; isolation stays in the sentence.
 
 ## Why this exists
 
-Hermes Agent is one process. That is the wrong blast radius for a team.
+Hermes Agent is one process. That is the wrong blast radius for a team. Upstream `hermes update` now folds multi-profile installs into one multiplexed gateway. Switchroom deliberately keeps one container and one gateway per agent, so a bad change, leak or upgrade stays inside one box.
 
-Fleet is many named specialists, each with its own container, gateway, writable state, workspace, Docker network, memory, and credentials. You text the same person back. A change to one leaves the others alone. Failed upgrades recover without taking the rest down.
+Switchroom is many named specialists, each with its own container, gateway, writable state, workspace, Docker network, memory, and credentials. You text the same person back. A change to one leaves the others alone. Failed upgrades recover without taking the rest down.
 
 The public product proves that pattern without shipping anyone's credentials, deployment identities, private binaries, or live topology.
 
@@ -91,7 +93,7 @@ Optional overlay binary that gates extra installs. Disabled until the overlay wi
 Hermes Agent image  (exact digest)
         |
         v
-Hermes Fleet child  (this repo)
+Switchroom child image  (this repo, hermes-fleet)
         |
         +-- profile A container + state volume + workspace + network
         +-- profile B container + state volume + workspace + network

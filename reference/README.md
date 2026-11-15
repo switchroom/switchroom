@@ -1,4 +1,6 @@
-# Hermes Fleet product reference
+# Switchroom product reference
+
+Switchroom is the public name of this repository's product. `hermes-fleet` is the working repository name. See [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md).
 
 ProductOS shapes copied into this repository. ProductOS is not a dependency to install.
 

@@ -1,11 +1,13 @@
 ---
-title: Hermes Fleet product vision
-last_reviewed: 2026-09-12
+title: Switchroom product vision
+last_reviewed: 2026-11-15
 ---
 
-# Hermes Fleet product vision
+# Switchroom product vision
 
-Opinionated isolated Hermes. One agent per container and gateway. No shared credentials.
+Switchroom is an opinionated Hermes Agent distribution. Opinionated isolated Hermes: one agent per container and gateway, no shared credentials.
+
+Public headline: "Hermes, run as a team. Each agent in its own box." Name and positioning: [rfcs/switchroom-positioning.md](rfcs/switchroom-positioning.md). This repository keeps the working name `hermes-fleet` until it moves to the `switchroom` org.
 
 The public product is that isolation layer. A standing team of specialists you text is an **outcome**, not the tagline. A private deployment may dogfood it. The household is not the product.
 
@@ -13,6 +15,7 @@ The public product is that isolation layer. A standing team of specialists you t
 
 - **Principal.** Lives with the team. Texts specialists, expects the same one back, on the plan they already pay for, asking before consequences. Success: Trusted turns they did not sit through.
 - **Operator.** Stands the team up, isolates them, changes one without touching the others. Often the same human on a different day. Success: after an intended change, every in-scope agent still independently working and the target has the change.
+- **Public adopter.** A technical self-hoster who reads the repository before running anything. Early access: no quickstart yet. Success: they can tell what Switchroom adds to Hermes, and what is shipped versus aimed at, without asking.
 
 ## North Star
 
@@ -39,7 +42,7 @@ Outcome and Signal pairs. No numeric targets. Signals are defined in the product
 - **standing-team.** Named specialists, each with its own identity, memory, tools, and credentials. Signal: share of in-scope specialists that a principal can address as themselves, with unshared memory and credentials.
 - **on-a-leash.** One agent cannot see another's secrets; a change to A leaves B alone; failed upgrades recover without touching the others. Signal: intended-change hold rate.
 - **there-when-you-reach.** Telegram, Slack, and Desktop all work; a move or restart does not drop identity, tools, or sessions. Signal: first-class surface hold rate.
-- **subscription-honest.** Claude stays on the granted plan login, not a silent API meter. Signal: off-plan model-call rate.
+- **subscription-honest.** Bring your own plans and keys. Claude stays on the granted plan login, not a silent API meter, and every other plan follows the same rule. Signal: off-plan model-call rate.
 
 ## What losing looks like
 
@@ -55,6 +58,7 @@ Outcome and Signal pairs. No numeric targets. Signals are defined in the product
 
 - Household identity, live topology, bot tokens, or vault IDs in the public tree.
 - Buzz as a Hermes surface.
-- Another Hermes. Fleet isolates and operates it.
+- Another Hermes. Switchroom isolates and operates it.
+- An official Nous Research product, or a name that implies one ("Hermes Fleet" is not the public name).
 - A control-plane UI, ledger, or scoreboard.
 - Telegram-only, or Slack replacing Telegram.

@@ -39,8 +39,14 @@ class OverlayRepositoryExampleTests(unittest.TestCase):
         files = [DOCS, ROOT / "README.md", ROOT / "AGENTS.md"]
         files.extend(path for path in OVERLAY.rglob("*") if path.is_file())
         blob = "\n".join(path.read_text(encoding="utf-8").lower() for path in files)
+        # Switchroom is the public product name (reference/rfcs/switchroom-positioning.md).
+        # Deployment identifiers under that name stay out.
         for token in (
-            "switch" + "room",
+            "browser." + "switch" + "room",
+            "switch" + "room-ai",
+            "switch" + "room-config",
+            "switch" + "room-artifacts",
+            "switch" + "room.ai/artifact",
             "mel" + "bourne",
             "o" + "p://",
             "web" + "kite",

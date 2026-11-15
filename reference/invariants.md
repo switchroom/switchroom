@@ -1,9 +1,9 @@
 ---
-title: Hermes Fleet invariants
+title: Switchroom invariants
 last_reviewed: 2026-09-12
 ---
 
-# Hermes Fleet invariants
+# Switchroom invariants
 
 The third anchor, beside [vision.md](vision.md) (the why) and [principles.md](principles.md) (the built-well standards).
 
