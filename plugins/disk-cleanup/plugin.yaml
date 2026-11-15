@@ -1,0 +1,8 @@
+name: disk-cleanup
+version: 2.0.1
+description: "Auto-track ephemeral session files; session-end cleanup can be cleanup, report_only, or disabled via plugins.config.disk-cleanup.session_end_mode."
+author: "@LVT382009 (original), NousResearch (plugin port)"
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_end

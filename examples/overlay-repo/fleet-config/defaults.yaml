@@ -131,3 +131,56 @@ defaults:
     plugins: [web-perplexity]
     values:
       web.search_backend: perplexity
+
+  # 1Password Connect supplies this agent's secrets; without it the agent's
+  # env file does. Hermes reads its 1Password settings only from the agent's
+  # own config.yaml, so they are set once inside the container (README,
+  # "Secrets"), not rendered here. List in connect_provides the variables you
+  # mapped there: while Connect is set they count as present for the defaults
+  # above. Names only, never references or values.
+  secrets-connect:
+    requires_env: [OP_CONNECT_HOST, OP_CONNECT_TOKEN]
+    values:
+      _switchroom.secrets_source: onepassword_connect
+      _switchroom.connect_provides: []
+    off_values:
+      _switchroom.secrets_source: env_file
+
+  # Coding CLIs installed in the image. Each uses this agent's own login; the setup
+  # check reports a CLI without one. Hermes ignores the _switchroom block.
+  coding-clis:
+    values:
+      _switchroom.coding_clis: [claude, codex, grok, opencode]
+
+  # Quota checks (third-party plugin, MIT). vendor.lock.json pins its commit;
+  # compose.yaml mounts it read-only.
+  quota:
+    plugins: [quota]
+
+  # Fresh conversation after 4 idle hours. Hermes core no longer acts on
+  # session_reset by itself; the pinned hermes-session-reset-policy plugin
+  # (MIT, vendor.lock.json) reads this block.
+  session-reset-policy:
+    plugins: [hermes-session-reset-policy]
+    values:
+      session_reset:
+        mode: idle
+        idle_minutes: 240
+
+  # Warnings on dangerous patterns in file writes. Ships in the Hermes image.
+  security-guidance:
+    plugins: [security-guidance]
+
+  # Tracks ephemeral files and only reports them at session end. The plugin
+  # treats a missing mode as "cleanup", so report_only must stay set; the
+  # renderer and setup check refuse anything else.
+  disk-cleanup:
+    plugins: [disk-cleanup]
+    values:
+      plugins.config.disk-cleanup:
+        session_end_mode: report_only
+
+  # The shared skill pack, mounted read-only from the pinned release.
+  shared-skill-pack:
+    values:
+      skills.external_dirs: [/opt/skill-packs/shared]

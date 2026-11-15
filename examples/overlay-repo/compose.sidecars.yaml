@@ -1,0 +1,150 @@
+# Sidecars for the starter overlay. Layer it over compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.sidecars.yaml config
+#   docker compose -f compose.yaml -f compose.sidecars.yaml up -d
+#   docker compose -f compose.yaml -f compose.sidecars.yaml --profile onepassword up -d
+#
+# Isolation: each sidecar has its own internal network, and only the agents
+# that use it join that network. A sidecar that must reach the internet gets a
+# separate egress network that no agent joins. No host networking, no
+# privileged mode, no Docker socket and no published ports: agents reach
+# sidecars by service name.
+#
+# Secrets come from files under secrets/, which .gitignore keeps out of git.
+# Every image is pinned by digest. Replace a digest only with one you reviewed.
+
+services:
+  # Kokoro voice and local transcription, CPU-only by default. Point the
+  # agents at it with HERMES_KOKORO_SIDECAR_URL=http://voice:8126 and the same
+  # token as VOICE_SIDECAR_TOKEN in secrets/voice.env.
+  #
+  # GPU variant (optional): add `gpus: all` here and set VOICE_STT_DEVICE to
+  # cuda and VOICE_STT_COMPUTE_TYPE to float16. Text-to-speech uses the GPU on
+  # its own when one is visible.
+  voice:
+    image: ${HERMES_FLEET_KOKORO_IMAGE:-ghcr.io/mekenthompson/hermes-fleet-kokoro@sha256:d69414ba021f8f5ee5c915d2a5a5b95d9ad579dd2c1054b1f7ab4a63e2dff540}
+    restart: unless-stopped
+    user: "65532:65532"
+    env_file:
+      - path: ./secrets/voice.env
+        required: false
+    environment:
+      VOICE_STT_DEVICE: cpu
+      VOICE_STT_COMPUTE_TYPE: int8
+      VOICE_STT_PORT: "8126"
+      VOICE_MODEL_CACHE: /models
+    volumes:
+      - voice-models:/models
+    networks:
+      - voice
+      # Model weights download once on first start; nothing else uses it.
+      - voice-egress
+
+  # Honcho memory: the upstream image (plastic-labs/honcho v3.6.1), referenced
+  # by digest and never vendored. Honcho is AGPL-3.0.
+  #
+  # Honcho's summariser, deriver, dreaming and embeddings call a language
+  # model. That model must come from a provider the operator granted, or those
+  # features stay off. The starter grants none, so all of them are off below,
+  # no model key is set, and Honcho has no egress network to reach one. To
+  # turn one on, set that feature's flag and model to a provider you granted,
+  # put its key in secrets/honcho.env and give Honcho an egress network.
+  honcho:
+    image: ghcr.io/plastic-labs/honcho@sha256:2ced1a958f14c128ddb05e68deb549f9281681e44595a7a3c34adebf5b432b16
+    restart: unless-stopped
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      honcho-db:
+        condition: service_healthy
+    # DB_CONNECTION_URI, with the same password as secrets/honcho-db.env.
+    env_file:
+      - path: ./secrets/honcho.env
+        required: false
+    environment:
+      # Only the agents on the honcho network can reach the API.
+      AUTH_USE_AUTH: "false"
+      CACHE_ENABLED: "false"
+      DERIVER_ENABLED: "false"
+      SUMMARY_ENABLED: "false"
+      DREAM_ENABLED: "false"
+      PEER_CARD_ENABLED: "false"
+      EMBED_MESSAGES: "false"
+    networks:
+      - honcho
+      - honcho-db
+
+  honcho-db:
+    image: pgvector/pgvector@sha256:e0b617fffc06dd37323ee99873c7a8683f19f1dce34633670262b0113ce32638
+    restart: unless-stopped
+    # POSTGRES_USER, POSTGRES_PASSWORD and POSTGRES_DB.
+    env_file:
+      - path: ./secrets/honcho-db.env
+        required: false
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - honcho-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:-postgres}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - honcho-db
+
+  # 1Password Connect, optional (profile "onepassword"). Agents use it with
+  # OP_CONNECT_HOST=http://onepassword-connect-api:8080 and their own
+  # OP_CONNECT_TOKEN in secrets/<agent>.env. Without it, agents read the same
+  # variables from their env file.
+  onepassword-connect-api:
+    image: 1password/connect-api@sha256:0f74924c55c9156b8116f59f485223b2c2d30a5148d362562aa27838159bdffa
+    profiles: ["onepassword"]
+    restart: unless-stopped
+    volumes:
+      - ./secrets/1password-credentials.json:/home/opuser/.op/1password-credentials.json:ro
+      - onepassword-data:/home/opuser/.op/data
+    networks:
+      - onepassword
+      - onepassword-egress
+
+  onepassword-connect-sync:
+    image: 1password/connect-sync@sha256:ca34850f2a20ca302e688a9347cdb696f29ce3bfc011d2554eff338e315c9089
+    profiles: ["onepassword"]
+    restart: unless-stopped
+    volumes:
+      - ./secrets/1password-credentials.json:/home/opuser/.op/1password-credentials.json:ro
+      - onepassword-data:/home/opuser/.op/data
+    networks:
+      - onepassword-egress
+
+  # Agents join only the sidecar networks they use. The worker turns voice off
+  # (fleet-config/agents/worker.yaml), so it does not join the voice network.
+  ops:
+    networks:
+      - voice
+      - honcho
+      - onepassword
+
+  worker:
+    networks:
+      - honcho
+      - onepassword
+
+volumes:
+  voice-models:
+  honcho-pgdata:
+  onepassword-data:
+
+networks:
+  voice:
+    internal: true
+  voice-egress:
+    driver: bridge
+  honcho:
+    internal: true
+  honcho-db:
+    internal: true
+  onepassword:
+    internal: true
+  onepassword-egress:
+    driver: bridge

@@ -1,0 +1,15 @@
+{
+  "commit": "3fa36cdcf46ac7a3852a136c42750b5a6ae716f9",
+  "files_sha256": {
+    "README.md": "34d397346b7e4532b307020aa6044954cd21ec95a75b2ae360e8d20dca3531d5",
+    "__init__.py": "fb216416785f30572f728bc744c5b6af9bd4e0524ef10837f0a8c6e516ec2827",
+    "disk_cleanup.py": "96a89e5d986e0d5757ba28175b6edbea9a18e5e9a3f1968c82c72f1e8d480dbe",
+    "plugin.yaml": "869befdaf179b62ac12c0696d3fed65a96635a2e2ff3fff727dcb073f3c2bd32"
+  },
+  "license": "MIT",
+  "license_file": "UPSTREAM_LICENSE",
+  "license_sha256": "821556e6336796450ab852d375117b48a4887e71d255794fd6318d99982a5ab6",
+  "path": "plugins/disk-cleanup",
+  "repository": "https://github.com/mekenthompson/hermes-agent.git",
+  "tree": "236d543d80a7e353c051f62342f4a262ba37a15a"
+}

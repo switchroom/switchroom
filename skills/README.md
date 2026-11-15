@@ -14,9 +14,12 @@ deployment does. They contain no credentials, identities or topology.
 ## Status
 
 This pack is the `shared-skill-pack` entry in [`contracts/plugins.json`](../contracts/plugins.json).
-It is **not on by default yet**. Publishing the source here is the first step; the starter
-overlay will mount it in a follow-up change, and only then does the contract entry move to
-`shipped`. Until then an operator who wants it mounts it by hand, as below.
+It is **not on by default** in the bare image. The starter overlay in
+[`examples/overlay-repo/`](../examples/overlay-repo/) configures it: it
+mounts this directory read-only from a checkout pinned to the image's own revision
+(`vendor.lock.json`) and lists it in `skills.external_dirs`. The contract entry stays `planned`
+until a real container boot proves it, and only then moves to `shipped`. Without the starter
+overlay, mount it by hand as below.
 
 ## Mounting
 

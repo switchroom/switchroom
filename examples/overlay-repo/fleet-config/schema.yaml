@@ -4,6 +4,11 @@ schema_version: 1
 # Types: str, bool, int, list[str], list[provider] ({provider, model} entries)
 # and dict (a nested mapping with no null values).
 managed_leaves:
+  # Overlay declarations for the setup check. Hermes ignores top-level keys
+  # that start with an underscore.
+  _switchroom.coding_clis: list[str]
+  _switchroom.connect_provides: list[str]
+  _switchroom.secrets_source: str
   agent.system_prompt: str
   agent.verify_on_stop: bool
   approvals.cron_mode: str
@@ -18,9 +23,12 @@ managed_leaves:
   model.default: str
   model.provider: str
   plugins.enabled: list[str]
+  plugins.config.disk-cleanup: dict
   plugins.entries.claude-account-connectors.settings: dict
   plugins.entries.linear.settings: dict
   prompt_caching.cache_ttl: str
+  session_reset: dict
+  skills.external_dirs: list[str]
   stt.enabled: bool
   stt.provider: str
   terminal.cwd: str

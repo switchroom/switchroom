@@ -12,6 +12,8 @@ This repository does not contain a real overlay. Copy
 ```text
 your-fleet-overlay/
   compose.yaml                 Digest-pinned images. No secrets.
+  compose.sidecars.yaml        Sidecars the starter defaults use (docs/sidecars.md)
+  vendor.lock.json             Exact commits for mounted plugins and the skill pack
   fleet-config/
     schema.yaml                Allowlisted desired-state keys
     defaults.yaml              Shared defaults (every agent)

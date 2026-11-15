@@ -39,6 +39,8 @@ PROFILE_TOKEN = "{profile}"
 REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "doctrine-config": (),
     "gateway-per-agent": (),
+    "secrets-connect": ("OP_CONNECT_HOST", "OP_CONNECT_TOKEN"),
+    "coding-clis": (),
     "model-roles": (),
     "claude-subscription-directsdk": ("CLAUDE_CONFIG_DIR",),
     "claude-acp-connectors": ("CLAUDE_CONFIG_DIR",),
@@ -46,6 +48,41 @@ REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "voice": ("HERMES_KOKORO_SIDECAR_URL", "HERMES_KOKORO_SIDECAR_TOKEN"),
     "honcho-memory": ("HONCHO_BASE_URL",),
     "web-search": ("PERPLEXITY_API_KEY",),
+    "quota": (),
+    "session-reset-policy": (),
+    "security-guidance": (),
+    "disk-cleanup": (),
+    "shared-skill-pack": (),
+}
+# Overlay-only declarations live under one top-level key Hermes treats as
+# internal (a leading underscore) and never reads.
+CONNECT_DEFAULT = "secrets-connect"
+SECRETS_SOURCE_LEAF = "_switchroom.secrets_source"
+CONNECT_PROVIDES_LEAF = "_switchroom.connect_provides"
+CODING_CLIS_LEAF = "_switchroom.coding_clis"
+CONNECT_SOURCE = "onepassword_connect"
+ENV_FILE_SOURCE = "env_file"
+# Coding CLIs installed in the Fleet image (package.json), and where each keeps its
+# login file: inside the directory a variable names when that variable is set,
+# else at a HOME-relative path. A login file is evidence, not proof, of a
+# working login.
+CODING_CLI_LOGINS: dict[str, tuple[str | None, str, str]] = {
+    "claude": ("CLAUDE_CONFIG_DIR", ".credentials.json", ".claude/.credentials.json"),
+    "codex": ("CODEX_HOME", "auth.json", ".codex/auth.json"),
+    "grok": (None, "", ".grok/auth.json"),
+    "opencode": ("XDG_DATA_HOME", "opencode/auth.json", ".local/share/opencode/auth.json"),
+}
+BUNDLED_PLUGINS = "/opt/hermes/plugins"
+OP_BINARY = "/usr/local/bin/op"
+DISK_CLEANUP_MODE = "report_only"
+SESSION_RESET_MODES = frozenset({"idle", "daily", "both"})
+# Plugin each default needs on disk inside the container, for --check-files:
+# (directory the plugin lives in, relative to "bundled" or "user" plugins).
+PLUGIN_PROBES: dict[str, tuple[str, str]] = {
+    "quota": ("user", "quota"),
+    "session-reset-policy": ("user", "hermes-session-reset-policy"),
+    "security-guidance": ("bundled", "security-guidance"),
+    "disk-cleanup": ("bundled", "disk-cleanup"),
 }
 # Optional file probes for the doctor's --check-files mode: (env var, file
 # relative to the directory it names, or "" for the file it names itself).
@@ -285,6 +322,14 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
         if model is not None and (not isinstance(model, dict) or set(model) != {"provider", "model"}
                                   or any(type(v) is not str or not v for v in model.values())):
             raise DefaultsError(f"{label}.model: needs provider and model strings")
+        if CONNECT_PROVIDES_LEAF in off_values or (CONNECT_PROVIDES_LEAF in values and default_id != CONNECT_DEFAULT):
+            raise DefaultsError(f"{label}: only {CONNECT_DEFAULT} may set {CONNECT_PROVIDES_LEAF}")
+        if CONNECT_PROVIDES_LEAF in values:
+            provided = values[CONNECT_PROVIDES_LEAF]
+            if any(not ENV_NAME.fullmatch(name) for name in provided) or set(provided) & set(requires):
+                raise DefaultsError(f"{label}: {CONNECT_PROVIDES_LEAF} must list other variable names")
+        if CODING_CLIS_LEAF in values and not set(values[CODING_CLIS_LEAF]) <= set(CODING_CLI_LOGINS):
+            raise DefaultsError(f"{label}: {CODING_CLIS_LEAF} may only name {sorted(CODING_CLI_LOGINS)}")
         chain = entry.get("chain")
         if chain is not None:
             chain = _str_list(chain, f"{label}.chain")
@@ -294,6 +339,8 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
         for member in entry["chain"] or []:
             if parsed.get(member, {}).get("model") is None:
                 raise DefaultsError(f"defaults.yaml defaults.{default_id}.chain: {member} has no model")
+    if CONNECT_PROVIDES_LEAF in shared or SECRETS_SOURCE_LEAF in shared:
+        raise DefaultsError(f"defaults.yaml values: {CONNECT_DEFAULT} owns the secret-source leaves")
     for reserved in ("model.provider", "model.default", "fallback_providers", "plugins.enabled"):
         if reserved in owned:
             raise DefaultsError(f"defaults.yaml: {reserved} is built by the renderer; do not set it here")
@@ -315,6 +362,8 @@ def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults
     values = _validate_leaves(doc.get("values"), schema, f"{source} values")
     if _env_refs(values):
         raise DefaultsError(f"{source} values: must not reference environment variables")
+    if CONNECT_PROVIDES_LEAF in values or SECRETS_SOURCE_LEAF in values:
+        raise DefaultsError(f"{source} values: {CONNECT_DEFAULT} owns the secret-source leaves")
     opt = doc.get("defaults", {}) or {}
     if not isinstance(opt, dict):
         raise DefaultsError(f"{source} defaults: must map a default id to true or false")
@@ -368,6 +417,13 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
     defaults = load_defaults(config_dir, schema, contract)
     spec = load_agent(config_dir, agent, schema, defaults)
     granted = spec["granted_providers"] if spec["granted_providers"] is not None else defaults["granted_providers"]
+
+    # Variables 1Password Connect supplies at start count as set while Connect
+    # itself is on, so the defaults that need them are rendered on.
+    connect = defaults["defaults"].get(CONNECT_DEFAULT)
+    if (connect is not None and spec["defaults"].get(CONNECT_DEFAULT) is not False
+            and all(name in names for name in connect["requires_env"])):
+        names = names | frozenset(connect["values"].get(CONNECT_PROVIDES_LEAF, []))
 
     leaves: dict[str, Any] = dict(defaults["values"])
     provenance = {path: "defaults.yaml values" for path in leaves}
@@ -434,7 +490,10 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
     unresolved = _env_refs(leaves) - names
     if unresolved:
         raise DefaultsError(f"rendered config references unset variables: {sorted(unresolved)}")
-    return Rendered(agent, _unflatten(leaves), leaves, decisions, provenance)
+    config = _unflatten(leaves)
+    if problem := disk_cleanup_problem(config):
+        raise DefaultsError(problem)
+    return Rendered(agent, config, leaves, decisions, provenance)
 
 
 def dump_config(rendered: Rendered) -> str:
@@ -471,6 +530,8 @@ def configured_on(default_id: str, config: Mapping[str, Any]) -> bool | None:
         and all(_get(config, f"approvals.{k}") == "deny" for k in ("cron_mode", "unattended_mode", "single_query_mode"))
         and _get(config, "display.busy_input_mode") == "queue",
         "gateway-per-agent": lambda: _get(config, "gateway.multiplex_profiles") is False,
+        "secrets-connect": lambda: _get(config, SECRETS_SOURCE_LEAF) == CONNECT_SOURCE,
+        "coding-clis": lambda: bool(_coding_clis(config)),
         "model-roles": lambda: isinstance(_get(config, "model.provider"), str) and bool(_get(config, "model.provider")),
         "claude-subscription-directsdk": lambda: DIRECTSDK_PROVIDER in plugins,
         "claude-acp-connectors": lambda: "claude-acp-provider" in plugins and "claude-account-connectors" in plugins
@@ -479,19 +540,72 @@ def configured_on(default_id: str, config: Mapping[str, Any]) -> bool | None:
         "voice": lambda: "kokoro-voice" in plugins and _get(config, "tts.provider") == "kokoro",
         "honcho-memory": lambda: _get(config, "memory.provider") == "honcho",
         "web-search": lambda: "web-perplexity" in plugins and _get(config, "web.search_backend") == "perplexity",
+        "quota": lambda: "quota" in plugins,
+        "session-reset-policy": lambda: "hermes-session-reset-policy" in plugins,
+        "security-guidance": lambda: "security-guidance" in plugins,
+        "disk-cleanup": lambda: "disk-cleanup" in plugins,
+        "shared-skill-pack": lambda: bool(_skill_dirs(config)),
     }
     check = checks.get(default_id)
     return None if check is None else bool(check())
 
 
+def _coding_clis(config: Mapping[str, Any]) -> list[str]:
+    value = _get(config, CODING_CLIS_LEAF)
+    return [c for c in value if isinstance(c, str)] if isinstance(value, list) else []
+
+
+def _skill_dirs(config: Mapping[str, Any]) -> list[str]:
+    value = _get(config, "skills.external_dirs")
+    return [d for d in value if isinstance(d, str) and d] if isinstance(value, list) else []
+
+
+def _connect_provides(config: Mapping[str, Any]) -> list[str]:
+    value = _get(config, CONNECT_PROVIDES_LEAF)
+    return [n for n in value if isinstance(n, str) and ENV_NAME.fullmatch(n)] if isinstance(value, list) else []
+
+
+def disk_cleanup_problem(config: Mapping[str, Any]) -> str | None:
+    """A problem when disk-cleanup is on but could delete files at session end.
+
+    The plugin treats a missing setting as its historical ``cleanup`` mode, so
+    the starter overlay must always render ``report_only`` next to it.
+    """
+    if "disk-cleanup" not in _plugins(config):
+        return None
+    if _get(config, "plugins.config.disk-cleanup.session_end_mode") != DISK_CLEANUP_MODE:
+        return ("disk-cleanup is on without plugins.config.disk-cleanup.session_end_mode: report_only; "
+                "it would delete files at session end")
+    return None
+
+
 def _settings_problem(default_id: str, config: Mapping[str, Any]) -> str | None:
-    """Why a plugin would refuse the settings of a default that is turned on, or None."""
+    """Why a plugin would refuse, or silently ignore, the settings of a default that is on."""
     if default_id == "linear":
         identity = _get(config, "plugins.entries.linear.settings.identity")
         if not isinstance(identity, dict) or any(
                 not isinstance(identity.get(key), str) or not identity[key].strip()
                 for key in ("viewer_id", "organization_id")):
             return "plugins.entries.linear.settings.identity needs viewer_id and organization_id"
+    if default_id == "session-reset-policy":
+        # The plugin skips a policy it cannot read instead of failing, which
+        # would leave it loaded but never resetting.
+        policy = _get(config, "session_reset")
+        if not isinstance(policy, dict) or policy.get("mode") not in SESSION_RESET_MODES:
+            return "session_reset.mode must be idle, daily or both"
+        minutes = policy.get("idle_minutes")
+        if policy["mode"] in ("idle", "both") and (
+                type(minutes) not in (int, float) or isinstance(minutes, bool) or minutes <= 0):
+            return "session_reset.idle_minutes must be a positive number"
+        hour = policy.get("at_hour")
+        if policy["mode"] in ("daily", "both") and (type(hour) is not int or not 0 <= hour <= 23):
+            return "session_reset.at_hour must be an hour from 0 to 23"
+    if default_id == "shared-skill-pack" and any(not d.startswith("/") for d in _skill_dirs(config)):
+        return "skills.external_dirs entries must be absolute container paths"
+    if default_id == "coding-clis":
+        unknown = sorted(set(_coding_clis(config)) - set(CODING_CLI_LOGINS))
+        if unknown:
+            return f"no login check for {', '.join(unknown)}"
     return None
 
 
@@ -505,17 +619,94 @@ def _file_probe_failed(default_id: str, environ: Mapping[str, str]) -> str | Non
     return None if target.is_file() else message
 
 
+@dataclass
+class ContainerPaths:
+    """Where the doctor looks inside the agent container (``--check-files``).
+
+    ``root`` prefixes every absolute path, so tests can point it at a
+    temporary directory laid out like the container.
+    """
+
+    root: Path = Path("/")
+    hermes_home: str = "/opt/data"
+
+    def at(self, path: str | Path) -> Path:
+        return self.root / str(path).lstrip("/")
+
+    def plugin_dir(self, where: str, name: str) -> Path:
+        base = BUNDLED_PLUGINS if where == "bundled" else f"{self.hermes_home}/plugins"
+        return self.at(f"{base}/{name}")
+
+
+def _path_probe_failed(default_id: str, config: Mapping[str, Any], paths: ContainerPaths) -> str | None:
+    """File checks for defaults that need a mounted plugin or directory."""
+    probe = PLUGIN_PROBES.get(default_id)
+    if probe is not None:
+        where, name = probe
+        target = paths.plugin_dir(where, name)
+        if not (target / "plugin.yaml").is_file():
+            base = BUNDLED_PLUGINS if where == "bundled" else f"{paths.hermes_home}/plugins"
+            return f"plugin {name} is not present at {base}/{name}"
+    if default_id == "shared-skill-pack":
+        for directory in _skill_dirs(config):
+            base = paths.at(directory)
+            if not base.is_dir() or not any(base.glob("*/SKILL.md")):
+                return f"no skills found in {directory}; mount the pinned skill pack there"
+    return None
+
+
+def _connect_probe_failed(environ: Mapping[str, str], config: Mapping[str, Any], paths: ContainerPaths) -> str | None:
+    """Connect needs the op binary and a mapping for every variable it should supply.
+
+    Hermes reads ``secrets.onepassword`` only from the agent's own config.yaml,
+    so that is the file checked. Mapped references are never printed.
+    """
+    if not paths.at(OP_BINARY).is_file():
+        return f"the op CLI is not at {OP_BINARY}"
+    user_config = paths.at(f"{paths.hermes_home}/config.yaml")
+    try:
+        document = load_yaml(user_config, "agent config.yaml")
+    except DefaultsError:
+        document = {}
+    onepassword = _get(document, "secrets.onepassword")
+    if not isinstance(onepassword, dict) or onepassword.get("enabled") is not True:
+        return "secrets.onepassword is not enabled in the agent's own config.yaml"
+    mapped = onepassword.get("env") if isinstance(onepassword.get("env"), dict) else {}
+    unmapped = [name for name in _connect_provides(config)
+                if not isinstance(mapped.get(name), str) or not mapped[name].strip()]
+    if unmapped:
+        return f"no 1Password reference mapped for {', '.join(unmapped)}"
+    return None
+
+
+def _cli_login(cli: str, environ: Mapping[str, str], paths: ContainerPaths) -> bool:
+    variable, inside, home_relative = CODING_CLI_LOGINS[cli]
+    directory = str(environ.get(variable, "")).strip() if variable else ""
+    if directory:
+        return paths.at(Path(directory) / inside).is_file()
+    home = str(environ.get("HOME", "")).strip() or f"{paths.hermes_home}/home"
+    return paths.at(Path(home) / home_relative).is_file()
+
+
 def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_path: Path = CONTRACT,
-             *, check_files: bool = False, granted: Iterable[str] | None = None) -> tuple[list[str], list[str]]:
+             *, check_files: bool = False, granted: Iterable[str] | None = None,
+             paths: ContainerPaths | None = None) -> tuple[list[str], list[str]]:
     """Return (one status line per contract default, hard problems).
 
-    Hard problems are contract violations, not degraded defaults.
+    Hard problems are contract violations, not degraded defaults. With
+    ``check_files`` the coding-clis line is followed by one line per CLI.
     """
     if not isinstance(config, dict):
         raise DefaultsError("rendered config must be a mapping")
+    paths = paths or ContainerPaths()
     names = env_names(environ)
     lines: list[str] = []
     problems: list[str] = []
+    connect_on = (configured_on(CONNECT_DEFAULT, config)
+                  and set(REQUIREMENTS[CONNECT_DEFAULT]) <= names
+                  and not (check_files and _connect_probe_failed(environ, config, paths)))
+    if connect_on:
+        names = names | frozenset(_connect_provides(config))
     for entry in load_contract(contract_path):
         default_id = entry["id"]
         state = configured_on(default_id, config)
@@ -525,6 +716,7 @@ def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_pat
             lines.append(Decision(False, "not configured by the starter overlay yet").line(default_id))
             continue
         missing = [name for name in REQUIREMENTS.get(default_id, ()) if name not in names]
+        extra: list[str] = []
         if default_id == "model-roles":
             if state:
                 decision = Decision(True)
@@ -535,14 +727,25 @@ def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_pat
         elif missing:
             decision = Decision(False, f"{degrade}: {', '.join(missing)} not set")
         elif not state:
-            decision = Decision(False, "turned off in this agent's config")
+            prefix = f"{degrade}: " if default_id == CONNECT_DEFAULT else ""
+            decision = Decision(False, f"{prefix}turned off in this agent's config")
         elif settings_problem := _settings_problem(default_id, config):
             decision = Decision(False, f"{degrade}: {settings_problem}")
-        elif check_files and (failed := _file_probe_failed(default_id, environ)):
+        elif check_files and (failed := _file_probe_failed(default_id, environ)
+                              or _path_probe_failed(default_id, config, paths)
+                              or (default_id == CONNECT_DEFAULT and _connect_probe_failed(environ, config, paths))):
             decision = Decision(False, f"{degrade}: {failed}")
+        elif default_id == "coding-clis" and check_files:
+            logged_in = []
+            for cli in _coding_clis(config):
+                ok = _cli_login(cli, environ, paths)
+                logged_in.append(ok)
+                extra.append(Decision(ok, f"{degrade}: no {cli} login found").line(f"coding-clis.{cli}"))
+            decision = Decision(True) if any(logged_in) else Decision(False, f"{degrade}: no coding CLI login found")
         else:
             decision = Decision(True)
         lines.append(decision.line(default_id))
+        lines.extend(extra)
     if granted is not None:
         allowed = set(granted)
         providers = [_get(config, "model.provider")]
@@ -554,6 +757,8 @@ def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_pat
                 problems.append(f"model provider {provider} is not in the granted list")
     if _get(config, "gateway.multiplex_profiles") is True:
         problems.append("gateway.multiplex_profiles is true; each agent must run its own gateway")
+    if cleanup := disk_cleanup_problem(config):
+        problems.append(cleanup)
     return lines, problems
 
 
