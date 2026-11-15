@@ -45,8 +45,8 @@ also started and stayed healthy.
 | `gateway-per-agent` | **shipped** | `gateway.multiplex_profiles: false` in the effective config. Each container runs its own single default gateway under s6. |
 | `quota` | **shipped** | The pinned plugin (3.0.0, git source) is enabled. The gateway mounted its routes at `/api/plugins/quota/`. Agent tool override is denied (`capability=tools.override decision=deny`). |
 | `session-reset-policy` | **shipped** | The pinned plugin logged `session-reset-policy v0.3.0 armed (pre_gateway_dispatch)`. The effective `session_reset` is `{mode: idle, idle_minutes: 240}`. |
-| `security-guidance` | planned | The image's `security-guidance` plugin is enabled in the effective config. This run did not observe it loaded with its hook registered, or a dangerous-pattern write producing its warning, so it is not proven working. |
-| `disk-cleanup` | planned | The mounted plugin's files match every `files_sha256` in its `UPSTREAM.json`, with patch `manual-delete-guard`. The plugin's own reader returns `session_end_mode: report_only` and `allow_manual_delete: false`. This shows the right files and settings, but the run did not observe the plugin loaded in the gateway, `/disk-cleanup quick` and `deep` refused in the container, or a session-end report that deletes nothing, so it is not proven working. |
+| `security-guidance` | planned | The image's `security-guidance` plugin is enabled in the effective config. This run did not observe it loaded with its hook registered, or a dangerous-pattern write producing its warning, so it is not proven working. HF-713's container rerun will prove it. |
+| `disk-cleanup` | planned | The mounted plugin's files match every `files_sha256` in its `UPSTREAM.json`, with patch `manual-delete-guard`. The plugin's own reader returns `session_end_mode: report_only` and `allow_manual_delete: false`. This shows the right files and settings, but the run did not observe the plugin loaded in the gateway, `/disk-cleanup quick` and `deep` refused in the container, or a session-end report that deletes nothing, so it is not proven working. HF-713's container rerun will prove it. |
 | `shared-skill-pack` | planned | The pack mounts read-only and `skills.external_dirs` is in the merged config. But Hermes's skill search reads `skills.external_dirs` only from the agent's own `config.yaml`, not from the managed file, so the search roots are only the profile's skills directory. The setup check reports `on` anyway. |
 | `secrets-connect` | planned | Off as designed: the setup check said `using the env file`. The Connect path was not run (see Sidecars). |
 | `coding-clis` | planned | Claude Code 2.1.323, Codex 0.167.2, Grok 1.0.77 and OpenCode 1.19.5 are on the path. With no logins the setup check reports each one off. Turning on needs a real login. |
@@ -112,5 +112,5 @@ the same `main`.
 - Honcho from the shipped compose, until the tiktoken cache or another fix
   lands.
 - The shared skill pack being found by Hermes's skill search.
-- `security-guidance` and `disk-cleanup` working in the running gateway (configuration and file checks only).
+- `security-guidance` and `disk-cleanup` working in the running gateway (configuration and file checks only); HF-713's container rerun will prove both.
 - Chat delivery on any platform: none was configured.
