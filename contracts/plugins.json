@@ -176,10 +176,14 @@
         "id": "voice",
         "status": "planned",
         "starter_overlay": "configured",
-        "summary": "Local Kokoro voice replies and local transcription.",
+        "summary": "Local Kokoro voice replies. The CPU Kokoro server has no transcription; local transcription needs the GPU Fleet Kokoro sidecar.",
         "covers": [
           "voice-provider"
         ],
+        "enable_guard": {
+          "sidecar": "configured_and_reachable",
+          "hosted_fallback": false
+        },
         "credential": {
           "kind": "local_sidecar_url"
         },

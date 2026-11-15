@@ -30,9 +30,38 @@ x-starter-mounts:
   - &plugin-quota ./vendor/hermes-quota-plugin:/opt/data/plugins/quota:ro
   - &plugin-session-reset ./vendor/hermes-session-reset-policy:/opt/data/plugins/hermes-session-reset-policy:ro
 
+# Creates the skill pack's mount point as the agent user before the agent
+# starts. Without it, Docker creates /opt/data/skills on a fresh state volume
+# as root to hold the read-only pack mount, and the agent can no longer save
+# its own skills there. It runs the agent's own image, so the state volume is
+# first filled from the same image contents as before, and it only makes one
+# directory: no network, no capabilities, read-only root, then it exits.
+x-skills-init: &skills-init
+  image: ${HERMES_FLEET_IMAGE:?set a digest-pinned Fleet image, for example ghcr.io/example/hermes-fleet@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+  user: "${HERMES_UID:-1000}:${HERMES_GID:-1000}"
+  entrypoint: ["mkdir", "-p", "/opt/data/skills/switchroom-shared"]
+  command: []
+  network_mode: none
+  cap_drop: [ALL]
+  read_only: true
+  restart: "no"
+
 services:
+  ops-skills-init:
+    <<: *skills-init
+    volumes:
+      - ops-state:/opt/data
+
+  worker-skills-init:
+    <<: *skills-init
+    volumes:
+      - worker-state:/opt/data
+
   ops:
     <<: *hermes-agent
+    depends_on:
+      ops-skills-init:
+        condition: service_completed_successfully
     # The env-file fallback for secrets (and the Connect token when you use
     # 1Password Connect). A missing file is fine: each default whose variable
     # is missing turns itself off.
@@ -58,6 +87,9 @@ services:
 
   worker:
     <<: *hermes-agent
+    depends_on:
+      worker-skills-init:
+        condition: service_completed_successfully
     env_file:
       - path: ./secrets/worker.env
         required: false

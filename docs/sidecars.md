@@ -89,12 +89,24 @@ weights are built into the image, so it runs with `DOWNLOAD_MODEL=false` and no
 egress network. Agents use `HERMES_KOKORO_SIDECAR_URL=http://voice:8880/v1` (a
 URL ending in `/v1` selects this server's OpenAI-compatible speech route in
 the `kokoro-voice` plugin) and the same token the server lists in `API_KEYS`
-(a JSON list in `secrets/voice.env`). This server only speaks: on CPU the
-agents get Kokoro voice replies and no transcription, and the explicit
-`stt.provider: kokoro_sidecar` keeps Hermes from falling back to a hosted one.
+(a JSON list in `secrets/voice.env`). This server only speaks. **The CPU
+server has no transcription**: agents get Kokoro voice replies and voice notes
+are not transcribed. The explicit `stt.provider: kokoro_sidecar` keeps Hermes
+from falling back to a hosted transcription service, and the renderer and the
+setup check refuse a voice-on config that names any other transcription
+provider.
+
+Voice turns on only when its sidecar is configured and answers. The renderer
+asks the sidecar's health route (`/health` for a URL ending in `/v1`, else
+`/healthz`, the same routes the `kokoro-voice` plugin reads) and keeps voice
+text-only if it does not answer healthy. Only the agent's own network can see
+the sidecar, so this check runs with `--check-files` inside the agent
+container (quick start step 7). A render on the host leaves voice off with
+`the voice sidecar was not checked`, the same way it treats the Claude logins.
 
 The Fleet image `ghcr.io/mekenthompson/hermes-fleet-kokoro` is the GPU
-variant. It adds local faster-whisper transcription and needs an NVIDIA GPU:
+variant, and the option for local transcription. It adds local
+faster-whisper transcription and needs an NVIDIA GPU:
 its speech engine loads the CUDA runtime at start and crashes without one.
 To use it, replace the `voice` service image with its digest, add `gpus: all`
 and `user: "65532:65532"`, set `VOICE_STT_DEVICE=cuda`,

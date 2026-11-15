@@ -15,9 +15,12 @@ import copy
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "contracts" / "plugins.json"
@@ -97,6 +100,9 @@ LOGIN_PROBES: dict[str, tuple[str, str, str, str]] = {
                               "no Claude login found in CLAUDE_CONFIG_DIR", "the Claude login"),
     "linear": ("LINEAR_TOKEN_FILE", "", "the file named by LINEAR_TOKEN_FILE does not exist", "the Linear token file"),
 }
+# Why a credential file that does exist is still not usable, by default id.
+LOGIN_EMPTY = {"linear": "the file named by LINEAR_TOKEN_FILE is empty"}
+LOGIN_TOO_LARGE = {"linear": "the file named by LINEAR_TOKEN_FILE is too large to be a token"}
 CHECK_FILES_HINT = "run with --check-files where the agent's files are visible (inside its container)"
 MAX_LOGIN_BYTES = 1024 * 1024
 MODEL_CHAIN_MEMBERS = ("claude-subscription-directsdk", "claude-acp-connectors")
@@ -114,6 +120,20 @@ DEFAULT_SKILL_PACK = "/opt/data/skills/switchroom-shared"
 SKILL_WALK_EXCLUDED = frozenset({
     ".git", ".github", ".hub", ".archive", ".curator_backups", ".locks", ".venv", "venv", "node_modules",
     "site-packages", "__pycache__", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+# Voice is on only when its speech sidecar answers, and only the agent's own
+# network can see it (inside its container, --check-files). These are the
+# health routes the kokoro-voice plugin uses: a URL ending in /v1 names an
+# OpenAI-compatible server (the CPU Kokoro-FastAPI build, speech only) that
+# answers {"status": "healthy"} on /health; the Fleet GPU sidecar answers
+# {"ok": true, "tts": true, ...} on /healthz.
+VOICE_URL_VAR = "HERMES_KOKORO_SIDECAR_URL"
+VOICE_PROBE_TIMEOUT = 3.0
+VOICE_STT_PROVIDER = "kokoro_sidecar"
+VOICE_UNCHECKED = "the voice sidecar was not checked"
+# The contract guard a default must carry before a component it covers may be
+# on: its local sidecar is configured and reachable, and nothing falls back to
+# a hosted service.
+ENABLE_GUARD = {"sidecar": "configured_and_reachable", "hosted_fallback": False}
 # Hermes text-to-speech engines that send text to a hosted service. With voice
 # off none of them may be the configured engine, and an unset tts.provider
 # means Hermes' own default, edge, which is hosted.
@@ -252,7 +272,47 @@ def load_contract(path: Path = CONTRACT) -> list[dict[str, Any]]:
         raise DefaultsError(f"{path}: unreadable default-on contract") from exc
     if not isinstance(entries, list) or not all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in entries):
         raise DefaultsError(f"{path}: default_set must be a list of entries with ids")
+    if problems := component_default_problems(document):
+        raise DefaultsError(f"{path}: {problems[0]}")
     return entries
+
+
+def component_default_problems(document: Any) -> list[str]:
+    """The contract rule for components that are on (``default_enabled``).
+
+    A component may be on only when a ``shipped`` default covers it and every
+    shipped default covering it carries :data:`ENABLE_GUARD`: its local
+    sidecar must be configured and reachable before it turns on, and nothing
+    falls back to a hosted service. ``default_enabled`` is the truthful "on
+    today" bit, so a component a guarded shipped default covers must say
+    ``true``, and every other component ``false``.
+    """
+    problems: list[str] = []
+    base = document.get("public_base") if isinstance(document, dict) else None
+    defaults = base.get("default_set") if isinstance(base, dict) else None
+    components = document.get("components", []) if isinstance(document, dict) else None
+    if not isinstance(defaults, list) or not isinstance(components, list):
+        return problems
+    covering: dict[str, list[dict[str, Any]]] = {}
+    for entry in defaults:
+        if isinstance(entry, dict) and entry.get("status") == "shipped":
+            for cid in entry.get("covers") or []:
+                covering.setdefault(cid, []).append(entry)
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        cid = str(component.get("id"))
+        owners = covering.get(cid, [])
+        unguarded = [str(e.get("id")) for e in owners if e.get("enable_guard") != ENABLE_GUARD]
+        if not owners:
+            if component.get("default_enabled") is not False:
+                problems.append(f"component {cid} is default_enabled but no shipped default covers it")
+        elif unguarded:
+            problems.append(f"component {cid} is covered by shipped default {', '.join(unguarded)} without "
+                            "the enable guard (sidecar configured_and_reachable, no hosted fallback)")
+        elif component.get("default_enabled") is not True:
+            problems.append(f"component {cid} is covered by a guarded shipped default but default_enabled is not true")
+    return problems
 
 
 def env_names(environ: Mapping[str, str]) -> frozenset[str]:
@@ -698,8 +758,20 @@ def hosted_speech_problem(config: Mapping[str, Any]) -> str | None:
     synthesises with whatever ``tts.provider`` names when a voice reply is
     asked for, so voice off must name a local engine and disable the tts
     toolset. Only checked when the config has the starter's voice setting.
+
+    Voice on means the local sidecar only: transcription, unless turned off,
+    must name the sidecar's own provider, so Hermes never picks a hosted one.
+    The CPU Kokoro server has no transcription and reports it unavailable;
+    that is the end of it, not a fallback.
     """
-    if configured_on("voice", config) or _get(config, "stt.enabled") is not False:
+    if configured_on("voice", config):
+        stt = _get(config, "stt.provider")
+        if _get(config, "stt.enabled") is not False and stt != VOICE_STT_PROVIDER:
+            shown = stt if isinstance(stt, str) and stt.strip() else "unset"
+            return (f"voice is on but stt.provider is {shown}, not {VOICE_STT_PROVIDER}; "
+                    "transcription could fall back to a hosted service")
+        return None
+    if _get(config, "stt.enabled") is not False:
         return None
     provider = _get(config, "tts.provider")
     engine = provider.strip().lower() if isinstance(provider, str) and provider.strip() else HERMES_DEFAULT_TTS
@@ -752,6 +824,9 @@ class ContainerPaths:
 
     root: Path = Path("/")
     hermes_home: str = "/opt/data"
+    # How the voice sidecar is asked whether it answers: given its URL, None
+    # when it is healthy, else why not. Default: a real HTTP health request.
+    voice_probe: Callable[[str], str | None] | None = None
 
     def at(self, path: str | Path) -> Path:
         return self.root / str(path).lstrip("/")
@@ -797,32 +872,101 @@ def discovered_skills(paths: ContainerPaths, directory: str) -> list[Path]:
     return sorted(found)
 
 
-def _login_present(default_id: str, environ: Mapping[str, str], paths: ContainerPaths) -> bool:
-    """Whether the login file a default needs exists. Contents are never printed.
+def claude_login_present(target: Path) -> bool:
+    """Whether ``target`` is a real Claude Code login. Contents are never printed.
 
-    A Claude login is the OAuth record Claude Code keeps in
-    ``$CLAUDE_CONFIG_DIR/.credentials.json``; an empty or placeholder file is
-    not a login. The Linear token file must be a non-empty file.
+    A login is the OAuth record Claude Code keeps in ``.credentials.json``
+    with an access or refresh token; an empty, oversized or placeholder file
+    is not one. The ONE check behind both Claude defaults and
+    ``coding-clis.claude``.
     """
-    name, relative, _, _ = LOGIN_PROBES[default_id]
-    raw = str(environ.get(name, "")).strip()
-    if not raw:
-        return False
-    target = paths.at(Path(raw) / relative if relative else raw)
     try:
         if not target.is_file():
             return False
         size = target.stat().st_size
         if size == 0 or size > MAX_LOGIN_BYTES:
             return False
-        if relative != ".credentials.json":
-            return True
         record = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeError):
         return False
     oauth = record.get("claudeAiOauth") if isinstance(record, dict) else None
     return isinstance(oauth, dict) and any(
         isinstance(oauth.get(key), str) and oauth[key].strip() for key in ("accessToken", "refreshToken"))
+
+
+def _login_problem(default_id: str, environ: Mapping[str, str], paths: ContainerPaths) -> str | None:
+    """Why the login file a default needs is not usable, or None. Contents are never printed.
+
+    A Claude login must pass :func:`claude_login_present`. The Linear token
+    file must exist and be non-empty; an empty file is reported as empty.
+    """
+    name, relative, absent, _ = LOGIN_PROBES[default_id]
+    raw = str(environ.get(name, "")).strip()
+    if not raw:
+        return absent
+    target = paths.at(Path(raw) / relative if relative else raw)
+    if relative == ".credentials.json":
+        return None if claude_login_present(target) else absent
+    try:
+        if not target.is_file():
+            return absent
+        size = target.stat().st_size
+    except OSError:
+        return absent
+    if size == 0:
+        return LOGIN_EMPTY.get(default_id, absent)
+    if size > MAX_LOGIN_BYTES:
+        return LOGIN_TOO_LARGE.get(default_id, absent)
+    return None
+
+
+def voice_health_url(url: str) -> str:
+    """The health route the kokoro-voice plugin itself reads for this sidecar URL."""
+    base = url.strip().rstrip("/")
+    if urllib.parse.urlparse(base).path.rstrip("/").endswith("/v1"):
+        return base[: -len("/v1")] + "/health"
+    return base + "/healthz"
+
+
+def probe_voice_sidecar(url: str, timeout: float = VOICE_PROBE_TIMEOUT) -> str | None:
+    """None when the speech sidecar at ``url`` answers healthy for speech, else why not.
+
+    Like every other reason, it names the variable, never its value. No token
+    is sent: both health routes are open, as the kokoro-voice plugin expects.
+    """
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        return f"{VOICE_URL_VAR} is not an http(s) host URL"
+    # Straight to the sidecar on the agent's own network, never through a proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(voice_health_url(url), timeout=timeout) as response:
+            body = json.loads(response.read(64 * 1024).decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, UnicodeError) as exc:
+        return f"the voice sidecar named by {VOICE_URL_VAR} does not answer ({type(exc).__name__})"
+    healthy = isinstance(body, dict) and (
+        body.get("status") == "healthy" or (body.get("ok") is True and body.get("tts") is True))
+    return None if healthy else f"the voice sidecar named by {VOICE_URL_VAR} is not healthy for speech"
+
+
+def _skills_dir_problem(paths: ContainerPaths) -> str | None:
+    """The agent must keep write access to its own skills directory.
+
+    A read-only pack mounted inside it must not cost the agent its own
+    skills: if Docker created the mount point's parent, it is root's and
+    ``skill_manage`` fails. Checked as the user running the check, which
+    inside the agent container is the agent user.
+    """
+    skills = _hermes_skills_dir(paths.hermes_home)
+    target = paths.at(skills)
+    try:
+        info = target.stat()
+    except OSError:
+        return None
+    if os.access(target, os.W_OK | os.X_OK):
+        return None
+    return (f"the agent cannot write {skills} (owned by uid {info.st_uid}), so it cannot save its own skills; "
+            "create the pack's mount point as the agent user before it starts (the overlay's skills-init)")
 
 
 def _connect_probe_failed(provides: Iterable[str], paths: ContainerPaths) -> str | None:
@@ -852,9 +996,15 @@ def _cli_login(cli: str, environ: Mapping[str, str], paths: ContainerPaths) -> b
     variable, inside, home_relative = CODING_CLI_LOGINS[cli]
     directory = str(environ.get(variable, "")).strip() if variable else ""
     if directory:
-        return paths.at(Path(directory) / inside).is_file()
-    home = str(environ.get("HOME", "")).strip() or f"{paths.hermes_home}/home"
-    return paths.at(Path(home) / home_relative).is_file()
+        target = paths.at(Path(directory) / inside)
+    else:
+        home = str(environ.get("HOME", "")).strip() or f"{paths.hermes_home}/home"
+        target = paths.at(Path(home) / home_relative)
+    if cli == "claude":
+        # The same real-login check the Claude defaults use: a 0-byte or
+        # placeholder file is not a login.
+        return claude_login_present(target)
+    return target.is_file()
 
 
 def readiness(default_id: str, names: Iterable[str], *, environ: Mapping[str, str] | None = None,
@@ -884,8 +1034,17 @@ def readiness(default_id: str, names: Iterable[str], *, environ: Mapping[str, st
         _, _, absent, what = LOGIN_PROBES[default_id]
         if paths is None:
             return Decision(False, f"{what} was not checked; {CHECK_FILES_HINT}", checked=False)
-        if not _login_present(default_id, environ, paths):
-            return Decision(False, absent)
+        if problem := _login_problem(default_id, environ, paths):
+            return Decision(False, problem)
+    if default_id == "voice":
+        # Configured is not enough: voice is on only when the local sidecar
+        # answers, seen from the agent's own network. A render that cannot
+        # look (on the host) leaves voice off, text-only, never hosted.
+        if paths is None:
+            return Decision(False, f"{VOICE_UNCHECKED}; {CHECK_FILES_HINT}", checked=False)
+        ask = paths.voice_probe or probe_voice_sidecar
+        if problem := ask(str(environ.get(VOICE_URL_VAR, ""))):
+            return Decision(False, problem)
     if paths is None:
         return Decision(True)
     probe = PLUGIN_PROBES.get(default_id)
@@ -899,6 +1058,8 @@ def readiness(default_id: str, names: Iterable[str], *, environ: Mapping[str, st
         pack = skill_pack or DEFAULT_SKILL_PACK
         if not discovered_skills(paths, pack):
             return Decision(False, f"Hermes finds no skills in {pack}; mount the pinned skill pack there")
+        if problem := _skills_dir_problem(paths):
+            return Decision(False, problem)
     if default_id == CONNECT_DEFAULT and (failed := _connect_probe_failed(connect_provides, paths)):
         return Decision(False, failed)
     if default_id == "coding-clis":

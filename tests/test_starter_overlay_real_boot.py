@@ -90,7 +90,8 @@ def run(script: Path, *args: str, python: list[str] | None = None) -> subprocess
 
 
 def full_paths(tmp, env: dict = FULL_ENV, **kwargs):
-    return sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), env, **kwargs), hermes_home="/opt/data")
+    return sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), env, **kwargs), hermes_home="/opt/data",
+                             voice_probe=fixture.healthy_voice)
 
 
 def render(env: dict = FULL_ENV, agent: str = "ops", paths=None, config_dir: Path = FLEET_CONFIG):
@@ -481,10 +482,16 @@ class DoctorWithoutPyYAMLTests(unittest.TestCase):
                               capture_output=True, check=False, timeout=60)
 
     def test_render_and_doctor_run_with_only_ruamel(self) -> None:
+        # Voice is on only when its sidecar answers: a real local stand-in.
+        server = http.server.ThreadingHTTPServer(("localhost", 0), _KokoroServer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        env = dict(FULL_ENV, HERMES_KOKORO_SIDECAR_URL=f"http://localhost:{server.server_address[1]}/v1")
         with tempfile.TemporaryDirectory() as tmp:
             env_file = Path(tmp) / "ops.env"
-            env_file.write_text("".join(f"{k}={v}\n" for k, v in FULL_ENV.items()), encoding="utf-8")
-            root = fixture.full_container_root(Path(tmp), FULL_ENV)
+            env_file.write_text("".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
+            root = fixture.full_container_root(Path(tmp), env)
             out = Path(tmp) / "ops.yaml"
             rendered = self.run_without_pyyaml(RENDER, "--fleet-config", str(FLEET_CONFIG), "--agent", "ops",
                                                "--env-file", str(env_file), "--output", str(out),

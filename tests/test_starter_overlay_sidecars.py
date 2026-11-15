@@ -209,7 +209,8 @@ class StarterComposeMountTests(unittest.TestCase):
                 # Rendered where every login is visible, so every plugin is on.
                 fixture = _fixture_module()
                 with tempfile.TemporaryDirectory() as tmp:
-                    paths = self.sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), FULL_ENV))
+                    paths = self.sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), FULL_ENV),
+                                                   voice_probe=fixture.healthy_voice)
                     rendered = self.sd.render(OVERLAY / "fleet-config", agent, self.sd.env_names(FULL_ENV), CONTRACT,
                                               environ=FULL_ENV, paths=paths)
                 self.assertIn("claude-subscription-directsdk-experimental", rendered.leaves["plugins.enabled"])
