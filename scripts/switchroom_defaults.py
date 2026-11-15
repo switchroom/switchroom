@@ -28,9 +28,9 @@ MAX_INPUT_BYTES = 1024 * 1024
 
 SCHEMA_TYPES = {"str", "bool", "int", "list[str]", "list[provider]", "dict"}
 DEFAULTS_DOC_KEYS = {"values", "granted_providers", "defaults"}
-DEFAULT_ENTRY_KEYS = {"values", "off_values", "requires_env", "plugins", "model", "chain"}
+DEFAULT_ENTRY_KEYS = {"values", "off_values", "requires_env", "plugins", "model", "primary_plan", "roles", "plans"}
 AGENT_REQUIRED_KEYS = {"profile", "role", "apply_mode", "values"}
-AGENT_OPTIONAL_KEYS = {"defaults", "granted_providers"}
+AGENT_OPTIONAL_KEYS = {"defaults", "granted_providers", "primary_plan", "roles"}
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
 ENV_REF = re.compile(r"\$\{(?:env:)?([^}]*)\}")
 PROFILE_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -99,17 +99,71 @@ LOGIN_PROBES: dict[str, tuple[str, str, str, str]] = {
     "claude-acp-connectors": ("CLAUDE_CONFIG_DIR", ".credentials.json",
                               "no Claude login found in CLAUDE_CONFIG_DIR", "the Claude login"),
     "linear": ("LINEAR_TOKEN_FILE", "", "the file named by LINEAR_TOKEN_FILE does not exist", "the Linear token file"),
+    # The Claude plan is the same login the two Claude defaults use.
+    "model-roles.plan.claude": ("CLAUDE_CONFIG_DIR", ".credentials.json",
+                                "no Claude login found in CLAUDE_CONFIG_DIR", "the Claude login"),
 }
 # Why a credential file that does exist is still not usable, by default id.
 LOGIN_EMPTY = {"linear": "the file named by LINEAR_TOKEN_FILE is empty"}
 LOGIN_TOO_LARGE = {"linear": "the file named by LINEAR_TOKEN_FILE is too large to be a token"}
+# Variables a plan needs before its login is looked at (plans are not
+# contract defaults, so they are not in REQUIREMENTS).
+PLAN_REQUIREMENTS: dict[str, tuple[str, ...]] = {"model-roles.plan.claude": ("CLAUDE_CONFIG_DIR",)}
+
+
+def plan_id(plan: str) -> str:
+    """The setup-check line, and readiness id, for one subscription plan."""
+    return f"{MODEL_ROLES}.plan.{plan}"
+
+
+def role_id(role: str) -> str:
+    return f"{MODEL_ROLES}.{role}"
 CHECK_FILES_HINT = "run with --check-files where the agent's files are visible (inside its container)"
 MAX_LOGIN_BYTES = 1024 * 1024
-MODEL_CHAIN_MEMBERS = ("claude-subscription-directsdk", "claude-acp-connectors")
 DIRECTSDK_PROVIDER = "claude-subscription-directsdk-experimental"
 # Main-model provider -> the default that turns it on.
 MODEL_PROVIDER_DEFAULTS = {DIRECTSDK_PROVIDER: "claude-subscription-directsdk", "claude-acp": "claude-acp-connectors"}
 NO_MODEL_PROVIDER = "no granted model provider is available; Hermes keeps its own model setting"
+# Subscription plans the model roles route between, and the Hermes providers
+# that bill each one. The Claude plan is the agent's own Claude Code login
+# (the two Claude defaults above). ChatGPT and SuperGrok are Hermes core's
+# own OAuth providers, logged in inside the agent container with
+# `hermes auth add <provider> --type oauth` (or `hermes model`); Hermes keeps
+# that login in HERMES_HOME/auth.json. Neither has an API-key path here.
+MODEL_ROLES = "model-roles"
+PLANS = ("claude", "chatgpt", "grok")
+PLAN_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "claude": (DIRECTSDK_PROVIDER, "claude-acp"),
+    "chatgpt": ("openai-codex",),
+    "grok": ("xai-oauth",),
+}
+PROVIDER_PLAN = {provider: plan for plan, providers in PLAN_PROVIDERS.items() for provider in providers}
+# Plans whose login is a Hermes OAuth record: plan -> (provider, what it is).
+PLAN_LOGINS: dict[str, tuple[str, str]] = {
+    "chatgpt": ("openai-codex", "ChatGPT login"),
+    "grok": ("xai-oauth", "SuperGrok login"),
+}
+AUTH_STORE = "auth.json"
+# Task roles and the Hermes settings each one drives: (provider, model,
+# fallback chain) per target. `main` is the chat model; `coding` is delegated
+# subagents; the rest are Hermes auxiliary tasks (hermes_cli/config_defaults_auxiliary.py).
+ROLES = ("main", "coding", "fast", "approvals", "compression")
+FAST_TASKS = ("title_generation", "profile_describer", "group_router")
+ROLE_TARGETS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "main": (("model.provider", "model.default", "fallback_providers"),),
+    "coding": (("delegation.provider", "delegation.model", "delegation.fallback_providers"),),
+    "fast": tuple((f"auxiliary.{task}.provider", f"auxiliary.{task}.model", f"auxiliary.{task}.fallback_chain")
+                  for task in FAST_TASKS),
+    "approvals": (("auxiliary.approval.provider", "auxiliary.approval.model", "auxiliary.approval.fallback_chain"),),
+    "compression": (("auxiliary.compression.provider", "auxiliary.compression.model",
+                     "auxiliary.compression.fallback_chain"),),
+}
+ROLE_LEAVES = frozenset(leaf for targets in ROLE_TARGETS.values() for target in targets for leaf in target)
+# The routing the overlay asked for, so the setup check can tell "no plan for
+# this role" from "this agent turned model roles off". Hermes ignores it.
+PRIMARY_PLAN_LEAF = "_switchroom.primary_plan"
+ROLE_PLANS_LEAF = "_switchroom.role_plans"
+NO_ROLE_MODEL = "no granted plan with a login has a model for this role; Hermes uses its own setting"
 # Where the shared skill pack is mounted. Hermes searches HERMES_HOME/skills
 # recursively and reads skills.external_dirs only from the agent's own
 # config.yaml (agent/skill_utils.py), never from the managed layer, so the pack
@@ -159,9 +213,13 @@ class Decision:
     reason: str = ""
     # False when the decision is "off" only because a file could not be looked at.
     checked: bool = True
+    # What an "on" line adds, for example the models a role routes to.
+    detail: str = ""
 
     def line(self, default_id: str) -> str:
-        return f"{default_id}: on" if self.on else f"{default_id}: off: {self.reason}"
+        if self.on:
+            return f"{default_id}: on: {self.detail}" if self.detail else f"{default_id}: on"
+        return f"{default_id}: off: {self.reason}"
 
 
 @dataclass
@@ -171,6 +229,18 @@ class Rendered:
     leaves: dict[str, Any]
     decisions: dict[str, Decision]
     provenance: dict[str, str] = field(default_factory=dict)
+    # One per subscription plan and per task role (model-roles.plan.<plan>, model-roles.<role>).
+    plan_decisions: dict[str, Decision] = field(default_factory=dict)
+    role_decisions: dict[str, Decision] = field(default_factory=dict)
+
+    def report_lines(self) -> list[str]:
+        lines: list[str] = []
+        for default_id, decision in self.decisions.items():
+            lines.append(decision.line(default_id))
+            if default_id == MODEL_ROLES:
+                lines.extend(d.line(plan_id(p)) for p, d in self.plan_decisions.items())
+                lines.extend(d.line(role_id(r)) for r, d in self.role_decisions.items())
+        return lines
 
 
 # ---------------------------------------------------------------- loading
@@ -467,18 +537,28 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
                 raise DefaultsError(f"{label}: {CONNECT_PROVIDES_LEAF} must list other variable names")
         if CODING_CLIS_LEAF in values and not set(values[CODING_CLIS_LEAF]) <= set(CODING_CLI_LOGINS):
             raise DefaultsError(f"{label}: {CODING_CLIS_LEAF} may only name {sorted(CODING_CLI_LOGINS)}")
-        chain = entry.get("chain")
-        if chain is not None:
-            chain = _str_list(chain, f"{label}.chain")
+        routing = None
+        if {"primary_plan", "roles", "plans"} & set(entry):
+            if default_id != MODEL_ROLES:
+                raise DefaultsError(f"{label}: only {MODEL_ROLES} routes models between plans")
+            routing = _parse_model_routing(entry, label, schema)
         parsed[default_id] = {"requires_env": requires, "plugins": plugins, "values": values,
-                              "off_values": off_values, "model": model, "chain": chain}
-    for default_id, entry in parsed.items():
-        for member in entry["chain"] or []:
-            if parsed.get(member, {}).get("model") is None:
-                raise DefaultsError(f"defaults.yaml defaults.{default_id}.chain: {member} has no model")
+                              "off_values": off_values, "model": model, "routing": routing}
+    if MODEL_ROLES in parsed and parsed[MODEL_ROLES]["routing"] is None:
+        raise DefaultsError(f"defaults.yaml defaults.{MODEL_ROLES}: needs primary_plan, roles and plans")
+    routing = (parsed.get(MODEL_ROLES) or {}).get("routing")
+    if routing is not None:
+        # A Claude-plan model must name a provider a configured Claude default turns on.
+        for role, models in routing["plans"].get("claude", {}).items():
+            for item in models:
+                owner = MODEL_PROVIDER_DEFAULTS[item["provider"]]
+                owner_model = (parsed.get(owner) or {}).get("model")
+                if owner_model is None or owner_model["provider"] != item["provider"]:
+                    raise DefaultsError(f"defaults.yaml defaults.{MODEL_ROLES}.plans.claude.{role}: "
+                                        f"{item['provider']} needs the {owner} default")
     if CONNECT_PROVIDES_LEAF in shared or SECRETS_SOURCE_LEAF in shared:
         raise DefaultsError(f"defaults.yaml values: {CONNECT_DEFAULT} owns the secret-source leaves")
-    for reserved in ("model.provider", "model.default", "fallback_providers", "plugins.enabled"):
+    for reserved in sorted(ROLE_LEAVES | {"plugins.enabled", PRIMARY_PLAN_LEAF, ROLE_PLANS_LEAF}):
         if reserved in owned:
             raise DefaultsError(f"defaults.yaml: {reserved} is built by the renderer; do not set it here")
     order = {default_id: index for index, default_id in enumerate(contract_ids)}
@@ -494,6 +574,64 @@ def load_defaults(config_dir: Path, schema: Mapping[str, str], contract: list[di
             "defaults": dict(sorted(parsed.items(), key=lambda item: order[item[0]]))}
 
 
+def _plan_name(value: Any, label: str, allowed: Iterable[str]) -> str:
+    allowed = tuple(allowed)
+    if type(value) is not str or value not in allowed:
+        raise DefaultsError(f"{label}: must be one of {', '.join(allowed)}")
+    return value
+
+
+def _role_plans(value: Any, label: str, plans: Iterable[str], *, complete: bool) -> dict[str, str]:
+    """``roles:``: each task role other than main -> the plan that leads it."""
+    others = [role for role in ROLES if role != "main"]
+    if not isinstance(value, dict):
+        raise DefaultsError(f"{label}: must map a role to a plan")
+    unknown = [role for role in value if role not in others]
+    if unknown:
+        hint = "; main follows primary_plan" if "main" in unknown else ""
+        raise DefaultsError(f"{label}: unknown role {unknown[0]!r} (roles: {', '.join(others)}){hint}")
+    if complete and set(value) != set(others):
+        raise DefaultsError(f"{label}: must name a plan for every role: {', '.join(others)}")
+    return {role: _plan_name(value[role], f"{label}.{role}", plans) for role in others if role in value}
+
+
+def _parse_model_routing(entry: Mapping[str, Any], label: str, schema: Mapping[str, str]) -> dict[str, Any]:
+    """model-roles: which plan leads, which plan leads each role, and each plan's models per role.
+
+    A plan's models may only use that plan's own providers, so a role can never
+    reach a provider the plan does not bill.
+    """
+    plans_raw = entry.get("plans")
+    if not isinstance(plans_raw, dict) or not plans_raw:
+        raise DefaultsError(f"{label}.plans: must map a plan to its models per role")
+    plans: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for plan, table in plans_raw.items():
+        plan = _plan_name(plan, f"{label}.plans", PLANS)
+        if not isinstance(table, dict) or not table:
+            raise DefaultsError(f"{label}.plans.{plan}: must map a role to a list of models")
+        plans[plan] = {}
+        for role, models in table.items():
+            where = f"{label}.plans.{plan}.{role}"
+            if role not in ROLES:
+                raise DefaultsError(f"{where}: unknown role (roles: {', '.join(ROLES)})")
+            if not isinstance(models, list) or not models:
+                raise DefaultsError(f"{where}: must be a non-empty list of {{provider, model}}")
+            _check_type(where, models, "list[provider]")
+            for item in models:
+                if item["provider"] not in PLAN_PROVIDERS[plan]:
+                    raise DefaultsError(f"{where}: provider {item['provider']} does not bill the {plan} plan "
+                                        f"(use {', '.join(PLAN_PROVIDERS[plan])})")
+            if len({(m["provider"], m["model"]) for m in models}) != len(models):
+                raise DefaultsError(f"{where}: lists a model twice")
+            plans[plan][role] = [dict(m) for m in models]
+    primary = _plan_name(entry.get("primary_plan"), f"{label}.primary_plan", plans)
+    roles = _role_plans(entry.get("roles"), f"{label}.roles", plans, complete=True)
+    missing = sorted(leaf for leaf in ROLE_LEAVES | {PRIMARY_PLAN_LEAF, ROLE_PLANS_LEAF} if leaf not in schema)
+    if missing:
+        raise DefaultsError(f"schema.yaml: model roles need {', '.join(missing)} in managed_leaves")
+    return {"primary_plan": primary, "roles": roles, "plans": plans}
+
+
 def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults: Mapping[str, Any]) -> dict[str, Any]:
     if not PROFILE_NAME.fullmatch(agent):
         raise DefaultsError(f"invalid agent name {agent!r}")
@@ -501,7 +639,8 @@ def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults
     doc = load_yaml(config_dir / "agents" / f"{agent}.yaml", source)
     keys = set(doc)
     if not AGENT_REQUIRED_KEYS <= keys or not keys <= AGENT_REQUIRED_KEYS | AGENT_OPTIONAL_KEYS:
-        raise DefaultsError(f"{source}: needs profile, role, apply_mode and values (optional: defaults, granted_providers)")
+        raise DefaultsError(f"{source}: needs profile, role, apply_mode and values "
+                            "(optional: defaults, granted_providers, primary_plan, roles)")
     if doc["profile"] != agent:
         raise DefaultsError(f"{source}: profile must be {agent!r}")
     values = _validate_leaves(doc.get("values"), schema, f"{source} values")
@@ -523,7 +662,24 @@ def load_agent(config_dir: Path, agent: str, schema: Mapping[str, str], defaults
         extra = set(granted) - set(defaults["granted_providers"])
         if extra:
             raise DefaultsError(f"{source} granted_providers: may only narrow the shared grant, not add {sorted(extra)}")
-    return {"values": values, "defaults": dict(opt), "granted_providers": granted, "source": source}
+    # While model roles are on, a role's Hermes leaves come only from the
+    # routing, so an agent value cannot slip an ungranted model past it. An
+    # agent that turns model-roles off chooses its own models in values.
+    owned_by_roles = {PRIMARY_PLAN_LEAF, ROLE_PLANS_LEAF} | (ROLE_LEAVES if opt.get(MODEL_ROLES) is not False else set())
+    if any(leaf in values for leaf in owned_by_roles):
+        raise DefaultsError(f"{source} values: model roles are routed with primary_plan and roles, "
+                            f"not by setting their Hermes leaves (or turn {MODEL_ROLES} off for this agent)")
+    routing = (defaults["defaults"].get(MODEL_ROLES) or {}).get("routing")
+    primary = roles = None
+    if ("primary_plan" in doc or "roles" in doc) and routing is None:
+        raise DefaultsError(f"{source}: primary_plan and roles need {MODEL_ROLES} in defaults.yaml")
+    known_plans = routing["plans"] if routing is not None else {}
+    if "primary_plan" in doc:
+        primary = _plan_name(doc["primary_plan"], f"{source} primary_plan", known_plans)
+    if "roles" in doc:
+        roles = _role_plans(doc["roles"], f"{source} roles", known_plans, complete=False)
+    return {"values": values, "defaults": dict(opt), "granted_providers": granted, "source": source,
+            "primary_plan": primary, "roles": roles or {}}
 
 
 # --------------------------------------------------------------- rendering
@@ -591,10 +747,9 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
     provenance = {path: "defaults.yaml values" for path in leaves}
     decisions: dict[str, Decision] = {}
     plugins: list[str] = []
-    models: dict[str, dict[str, str]] = {}
 
     for default_id, entry in defaults["defaults"].items():
-        if entry["chain"] is not None:
+        if entry["routing"] is not None:
             continue
         model = entry["model"]
         if spec["defaults"].get(default_id) is False:
@@ -612,30 +767,79 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
             provenance[path] = f"defaults.yaml defaults.{default_id}" + ("" if decision.on else " (off)")
         if decision.on:
             plugins.extend(p for p in entry["plugins"] if p not in plugins)
-            if model is not None:
-                models[default_id] = model
 
-    for default_id, entry in defaults["defaults"].items():
-        if entry["chain"] is None:
-            continue
-        chain = [models[member] for member in entry["chain"] if member in models]
+    plan_decisions: dict[str, Decision] = {}
+    role_decisions: dict[str, Decision] = {}
+    entry = defaults["defaults"].get(MODEL_ROLES)
+    if entry is not None:
+        routing = entry["routing"]
+        source = f"defaults.yaml defaults.{MODEL_ROLES}"
+
+        def plan_decision(plan: str) -> Decision:
+            if plan == "claude":
+                owners = [MODEL_PROVIDER_DEFAULTS[p] for p in PLAN_PROVIDERS["claude"]]
+                if any(decisions.get(owner, Decision(False)).on for owner in owners):
+                    return Decision(True)
+                reasons = [decisions[o].reason for o in owners if o in decisions]
+                return Decision(False, reasons[0] if reasons else "no Claude default is configured")
+            provider, _ = PLAN_LOGINS[plan]
+            if plan not in routing["plans"]:
+                return Decision(False, "no models are configured for this plan")
+            if provider not in granted:
+                return Decision(False, f"provider {provider} is not granted")
+            return readiness(plan_id(plan), names, environ=environ, paths=paths)
+
+        plan_decisions = {plan: plan_decision(plan) for plan in PLANS}
+
+        def usable(item: Mapping[str, str]) -> bool:
+            """A model is used only when its provider is granted and its plan's login is on."""
+            provider = item["provider"]
+            if provider not in granted:
+                return False
+            owner = MODEL_PROVIDER_DEFAULTS.get(provider)
+            if owner is not None:
+                return decisions.get(owner, Decision(False)).on
+            return plan_decisions[PROVIDER_PLAN[provider]].on
+
+        lead = {"main": spec["primary_plan"] or routing["primary_plan"], **routing["roles"], **spec["roles"]}
         # Opting out of model roles hands model selection back to the agent's
-        # own values: no main model or fallbacks are rendered.
-        opted_out = spec["defaults"].get(default_id) is False
-        if chain and not opted_out:
-            leaves["model.provider"] = chain[0]["provider"]
-            leaves["model.default"] = chain[0]["model"]
-            provenance["model.provider"] = provenance["model.default"] = f"defaults.yaml defaults.{default_id}"
-            fallbacks = [dict(m) for m in chain[1:]]
-            if fallbacks:
-                leaves["fallback_providers"] = fallbacks
-                provenance["fallback_providers"] = f"defaults.yaml defaults.{default_id}"
+        # own values: nothing is rendered for any role.
+        opted_out = spec["defaults"].get(MODEL_ROLES) is False
+        for role in ROLES:
+            # The role's lead plan first, then every other configured plan in
+            # the order defaults.yaml lists them; only usable models survive.
+            order = [lead[role]] + [plan for plan in routing["plans"] if plan != lead[role]]
+            chain = [dict(item, plan=plan) for plan in order
+                     for item in routing["plans"][plan].get(role, []) if usable(item)]
+            if opted_out:
+                role_decisions[role] = Decision(False, f"turned off in {spec['source']}")
+                continue
+            if not chain:
+                role_decisions[role] = Decision(False, NO_ROLE_MODEL if role != "main" else NO_MODEL_PROVIDER)
+                continue
+            route = [{"provider": item["provider"], "model": item["model"]} for item in chain]
+            for provider_leaf, model_leaf, fallback_leaf in ROLE_TARGETS[role]:
+                leaves[provider_leaf] = route[0]["provider"]
+                leaves[model_leaf] = route[0]["model"]
+                provenance[provider_leaf] = provenance[model_leaf] = source
+                if len(route) > 1:
+                    leaves[fallback_leaf] = [dict(m) for m in route[1:]]
+                    provenance[fallback_leaf] = source
+            role_decisions[role] = Decision(True, detail=route_text(chain))
+        if not opted_out:
+            leaves[PRIMARY_PLAN_LEAF] = lead["main"]
+            leaves[ROLE_PLANS_LEAF] = {role: lead[role] for role in ROLES}
+            provenance[PRIMARY_PLAN_LEAF] = provenance[ROLE_PLANS_LEAF] = source
         if opted_out:
-            decisions[default_id] = Decision(False, f"turned off in {spec['source']}")
-        elif not chain:
-            decisions[default_id] = Decision(False, NO_MODEL_PROVIDER)
+            decisions[MODEL_ROLES] = Decision(False, f"turned off in {spec['source']}")
+        elif not role_decisions["main"].on:
+            decisions[MODEL_ROLES] = Decision(False, NO_MODEL_PROVIDER)
         else:
-            decisions[default_id] = Decision(True)
+            decisions[MODEL_ROLES] = Decision(True)
+        # Belt and braces: whatever the routing, no role reaches an ungranted provider.
+        stray = sorted({p for p in rendered_role_providers(_unflatten(leaves)) if p not in granted})
+        if stray:
+            raise DefaultsError(f"model roles would use ungranted providers: {stray}")
 
     if plugins:
         leaves["plugins.enabled"] = plugins
@@ -655,7 +859,40 @@ def render(config_dir: Path, agent: str, environ_names: Iterable[str], contract_
     for problem in (disk_cleanup_problem(config), hosted_speech_problem(config)):
         if problem:
             raise DefaultsError(problem)
-    return Rendered(agent, config, leaves, decisions, provenance)
+    return Rendered(agent, config, leaves, decisions, provenance, plan_decisions, role_decisions)
+
+
+def route_text(chain: Iterable[Mapping[str, str]]) -> str:
+    """``chatgpt openai-codex/gpt-6-sol, then claude claude-acp/sonnet``."""
+    return ", then ".join(f"{item['plan']} {item['provider']}/{item['model']}" for item in chain)
+
+
+def role_route(config: Mapping[str, Any], role: str) -> list[dict[str, str]]:
+    """The provider/model route a rendered config gives a role: its first target, then fallbacks."""
+    provider_leaf, model_leaf, fallback_leaf = ROLE_TARGETS[role][0]
+    provider, model = _get(config, provider_leaf), _get(config, model_leaf)
+    if not isinstance(provider, str) or not provider.strip():
+        return []
+    route = [{"provider": provider, "model": model if isinstance(model, str) else ""}]
+    fallbacks = _get(config, fallback_leaf)
+    if isinstance(fallbacks, list):
+        route.extend({"provider": str(item.get("provider")), "model": str(item.get("model"))}
+                     for item in fallbacks if isinstance(item, dict) and item.get("provider"))
+    return route
+
+
+def rendered_role_providers(config: Mapping[str, Any]) -> list[str]:
+    """Every model provider any role target or fallback names, in order."""
+    providers: list[str] = []
+    for targets in ROLE_TARGETS.values():
+        for provider_leaf, _, fallback_leaf in targets:
+            provider = _get(config, provider_leaf)
+            if provider is not None:
+                providers.append(provider)
+            fallbacks = _get(config, fallback_leaf)
+            if isinstance(fallbacks, list):
+                providers.extend(item.get("provider") for item in fallbacks if isinstance(item, dict))
+    return [p for p in providers if p is not None]
 
 
 def dump_config(rendered: Rendered) -> str:
@@ -969,6 +1206,55 @@ def _skills_dir_problem(paths: ContainerPaths) -> str | None:
             "create the pack's mount point as the agent user before it starts (the overlay's skills-init)")
 
 
+@dataclass
+class PlanLogin:
+    """What HERMES_HOME/auth.json holds for one provider. Token values are never kept."""
+
+    oauth: bool = False
+    api_key: bool = False
+
+
+def _token_pair(record: Any) -> bool:
+    return isinstance(record, dict) and all(
+        isinstance(record.get(key), str) and record[key].strip() for key in ("access_token", "refresh_token"))
+
+
+def plan_login(provider: str, paths: ContainerPaths) -> PlanLogin:
+    """Whether Hermes' own auth store holds a subscription (OAuth) login for ``provider``.
+
+    Mirrors Hermes core (hermes_cli/auth_codex.py, auth_xai.py): the login is
+    ``providers.<provider>.tokens`` with an access and a refresh token, or an
+    OAuth ``credential_pool`` entry (``hermes auth add <provider> --type oauth``).
+    An API-key pool entry is never a plan login; it is reported separately
+    because it would bill the provider's API instead of the plan.
+    """
+    target = paths.at(f"{paths.hermes_home.rstrip('/')}/{AUTH_STORE}")
+    try:
+        if target.is_symlink() or not target.is_file() or not 0 < target.stat().st_size <= MAX_LOGIN_BYTES:
+            return PlanLogin()
+        store = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return PlanLogin()
+    if not isinstance(store, dict):
+        return PlanLogin()
+    found = PlanLogin()
+    providers = store.get("providers")
+    state = providers.get(provider) if isinstance(providers, dict) else None
+    if isinstance(state, dict) and _token_pair(state.get("tokens")):
+        found.oauth = True
+    pool = store.get("credential_pool")
+    entries = pool.get(provider) if isinstance(pool, dict) else None
+    for item in entries if isinstance(entries, list) else ():
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("auth_type") or "api_key")
+        if kind == "oauth" and _token_pair(item):
+            found.oauth = True
+        elif kind != "oauth" and isinstance(item.get("access_token"), str) and item["access_token"].strip():
+            found.api_key = True
+    return found
+
+
 def _connect_probe_failed(provides: Iterable[str], paths: ContainerPaths) -> str | None:
     """Connect needs the op binary and a mapping for every variable it should supply.
 
@@ -1022,7 +1308,8 @@ def readiness(default_id: str, names: Iterable[str], *, environ: Mapping[str, st
     """
     names = frozenset(names)
     environ = environ or {}
-    required = tuple(REQUIREMENTS.get(default_id, ()) if requires is None else requires)
+    required = tuple(REQUIREMENTS.get(default_id, PLAN_REQUIREMENTS.get(default_id, ()))
+                     if requires is None else requires)
     missing = [name for name in required if name not in names]
     if missing:
         return Decision(False, f"{', '.join(missing)} not set")
@@ -1045,6 +1332,14 @@ def readiness(default_id: str, names: Iterable[str], *, environ: Mapping[str, st
         ask = paths.voice_probe or probe_voice_sidecar
         if problem := ask(str(environ.get(VOICE_URL_VAR, ""))):
             return Decision(False, problem)
+    plan = next((p for p in PLAN_LOGINS if plan_id(p) == default_id), None)
+    if plan is not None:
+        provider, what = PLAN_LOGINS[plan]
+        if paths is None:
+            return Decision(False, f"the {what} was not checked; {CHECK_FILES_HINT}", checked=False)
+        if not plan_login(provider, paths).oauth:
+            return Decision(False, f"no {what} in {paths.hermes_home.rstrip('/')}/{AUTH_STORE}; "
+                                   f"run hermes auth add {provider} --type oauth inside the agent container")
     if paths is None:
         return Decision(True)
     probe = PLUGIN_PROBES.get(default_id)
@@ -1069,20 +1364,81 @@ def readiness(default_id: str, names: Iterable[str], *, environ: Mapping[str, st
     return Decision(True)
 
 
-def _model_roles_line(config: Mapping[str, Any], decisions: Mapping[str, Decision], degrade: str) -> Decision:
+def _model_roles_line(config: Mapping[str, Any], decisions: Mapping[str, Decision],
+                     plans: Mapping[str, Decision], degrade: str) -> Decision:
     """model-roles is on only when the main provider Hermes will use is itself on."""
-    members_on = [member for member in MODEL_CHAIN_MEMBERS if decisions.get(member, Decision(False)).on]
     main = _get(config, "model.provider")
-    if not members_on:
+    if not any(decision.on for decision in plans.values()):
         return Decision(False, NO_MODEL_PROVIDER)
     if not isinstance(main, str) or not main:
         return Decision(False, "turned off in this agent's config")
-    owner = MODEL_PROVIDER_DEFAULTS.get(main)
-    if owner is None:
+    plan = PROVIDER_PLAN.get(main)
+    if plan is None:
         return Decision(False, "turned off in this agent's config")
-    if owner not in members_on:
+    owner = MODEL_PROVIDER_DEFAULTS.get(main)
+    if owner is not None and not decisions.get(owner, Decision(False)).on:
         return Decision(False, f"{degrade}: the main provider {main} is off ({owner})")
+    if not plans[plan].on:
+        return Decision(False, f"{degrade}: the main provider {main} is off (the {plan} plan)")
     return Decision(True)
+
+
+def _plan_and_role_lines(config: Mapping[str, Any], environ: Mapping[str, str], names: frozenset[str],
+                         evidence: ContainerPaths | None, decisions: Mapping[str, Decision],
+                         degrade: str) -> tuple[dict[str, Decision], list[str]]:
+    """One line per subscription plan and per task role, from the shared readiness check.
+
+    A plan is on when its login is there. Without --check-files a plan the
+    config routes to is trusted (the renderer only routes to a plan after
+    seeing its login); an unused plan stays off, unchecked. A role is on when
+    the config routes it and its lead model's plan is on.
+    """
+    used = {PROVIDER_PLAN.get(p) for p in rendered_role_providers(config)} - {None}
+    plans: dict[str, Decision] = {}
+    lines: list[str] = []
+    warnings: list[str] = []
+    for plan in PLANS:
+        ready = readiness(plan_id(plan), names, environ=environ, paths=evidence)
+        if plan == "claude" and ready.on:
+            # The two Claude defaults gate the Claude providers; both off is the plan off.
+            owners = [MODEL_PROVIDER_DEFAULTS[p] for p in PLAN_PROVIDERS["claude"]]
+            if owners and not any(decisions.get(o, Decision(True)).on for o in owners):
+                ready = Decision(False, decisions[owners[0]].reason)
+        if not ready.on and not ready.checked and plan in used:
+            decision = Decision(True)
+        elif not ready.on:
+            decision = Decision(False, ready.reason)
+        else:
+            decision = Decision(True, detail="" if plan in used else "logged in; no role routes to it")
+        plans[plan] = decision
+        lines.append(decision.line(plan_id(plan)))
+        if plan in PLAN_LOGINS and evidence is not None and plan in used:
+            provider, _ = PLAN_LOGINS[plan]
+            if plan_login(provider, evidence).api_key:
+                warnings.append(f"warning: {plan_id(plan)}: {AUTH_STORE} also holds an API key for {provider}; "
+                                "Hermes can bill that key instead of the plan. Remove it with hermes auth remove")
+    routing = _get(config, ROLE_PLANS_LEAF)
+    for role in ROLES:
+        route = role_route(config, role)
+        if not route:
+            if not isinstance(routing, dict):
+                decision = Decision(False, "turned off in this agent's config")
+            else:
+                decision = Decision(False, f"{degrade}: {NO_MODEL_PROVIDER if role == 'main' else NO_ROLE_MODEL}")
+        else:
+            lead = PROVIDER_PLAN.get(route[0]["provider"])
+            chain = [dict(item, plan=PROVIDER_PLAN.get(item["provider"], "not a plan")) for item in route]
+            if lead is None:
+                decision = Decision(True, detail=f"set by this agent's own values: {route_text(chain)}")
+            elif not plans[lead].on:
+                decision = Decision(False, f"{degrade}: its lead model {route[0]['provider']}/{route[0]['model']} "
+                                           f"needs the {lead} plan, which is off")
+            else:
+                off = sorted({item["plan"] for item in chain if item["plan"] in plans and not plans[item["plan"]].on})
+                detail = route_text(chain) + (f" (fallbacks on {', '.join(off)} are off)" if off else "")
+                decision = Decision(True, detail=detail)
+        lines.append(decision.line(role_id(role)))
+    return plans, lines + warnings
 
 
 def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_path: Path = CONTRACT,
@@ -1149,19 +1505,18 @@ def diagnose(config: Mapping[str, Any], environ: Mapping[str, str], contract_pat
         if entry.get("starter_overlay") != "configured" or state is None:
             lines.append(Decision(False, "not configured by the starter overlay yet").line(default_id))
             continue
-        if default_id == "model-roles":
+        if default_id == MODEL_ROLES:
             behaviour = (entry.get("degrade") or {}).get("behaviour", "disable_and_report")
-            decisions[default_id] = _model_roles_line(config, decisions, DEGRADE_TEXT.get(behaviour, "disabled"))
+            degrade = DEGRADE_TEXT.get(behaviour, "disabled")
+            plans, extras[default_id] = _plan_and_role_lines(config, environ, names, evidence, decisions, degrade)
+            decisions[default_id] = _model_roles_line(config, decisions, plans, degrade)
         lines.append(decisions[default_id].line(default_id))
         lines.extend(extras.get(default_id, []))
     if granted is not None:
         allowed = set(granted)
-        providers = [_get(config, "model.provider")]
-        fallbacks = _get(config, "fallback_providers")
-        if isinstance(fallbacks, list):
-            providers.extend(item.get("provider") for item in fallbacks if isinstance(item, dict))
-        for provider in providers:
-            if provider is not None and provider not in allowed:
+        # Every role, not only the main model: a coding or auxiliary route is billed too.
+        for provider in dict.fromkeys(rendered_role_providers(config)):
+            if provider not in allowed:
                 problems.append(f"model provider {provider} is not in the granted list")
     if _get(config, "gateway.multiplex_profiles") is True:
         problems.append("gateway.multiplex_profiles is true; each agent must run its own gateway")

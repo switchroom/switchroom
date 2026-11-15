@@ -20,4 +20,10 @@ defaults:
   # security-guidance: false
   # disk-cleanup: false
   # shared-skill-pack: false
+# Route this agent's models differently from the shared defaults. Uncomment
+# to lead its main chat model with the ChatGPT plan and its coding with
+# SuperGrok; fallbacks still use only granted plans that are logged in.
+# primary_plan: chatgpt
+# roles:
+#   coding: grok
 values: {}

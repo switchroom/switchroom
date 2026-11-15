@@ -8,6 +8,8 @@ managed_leaves:
   # that start with an underscore.
   _switchroom.coding_clis: list[str]
   _switchroom.connect_provides: list[str]
+  _switchroom.primary_plan: str
+  _switchroom.role_plans: dict
   _switchroom.secrets_source: str
   _switchroom.skill_pack: str
   agent.disabled_toolsets: list[str]
@@ -17,6 +19,24 @@ managed_leaves:
   approvals.mode: str
   approvals.single_query_mode: str
   approvals.unattended_mode: str
+  auxiliary.approval.fallback_chain: list[provider]
+  auxiliary.approval.model: str
+  auxiliary.approval.provider: str
+  auxiliary.compression.fallback_chain: list[provider]
+  auxiliary.compression.model: str
+  auxiliary.compression.provider: str
+  auxiliary.group_router.fallback_chain: list[provider]
+  auxiliary.group_router.model: str
+  auxiliary.group_router.provider: str
+  auxiliary.profile_describer.fallback_chain: list[provider]
+  auxiliary.profile_describer.model: str
+  auxiliary.profile_describer.provider: str
+  auxiliary.title_generation.fallback_chain: list[provider]
+  auxiliary.title_generation.model: str
+  auxiliary.title_generation.provider: str
+  delegation.fallback_providers: list[provider]
+  delegation.model: str
+  delegation.provider: str
   display.busy_input_mode: str
   display.busy_text_mode: str
   fallback_providers: list[provider]
