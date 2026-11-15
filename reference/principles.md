@@ -1,9 +1,9 @@
 ---
-title: Hermes Fleet product principles
+title: Switchroom product principles
 last_reviewed: 2026-09-12
 ---
 
-# Hermes Fleet product principles
+# Switchroom product principles
 
 These are product engineering standards, applied in every PR and release. They are how we test whether a change serves the vision.
 
