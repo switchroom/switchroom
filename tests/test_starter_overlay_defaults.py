@@ -41,6 +41,22 @@ def _module():
     return module
 
 
+def _fixture():
+    spec = importlib.util.spec_from_file_location("starter_overlay_fixture", ROOT / "tests" / "starter_overlay_fixture.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fixture = _fixture()
+
+
+def full_paths(sd, tmp, env: dict, **kwargs):
+    """ContainerPaths for a synthetic agent container holding every login and mount."""
+    return sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), env, **kwargs), hermes_home="/opt/data")
+
+
 # Secret-looking values. None may ever appear in output.
 FULL_ENV = {
     "CLAUDE_CONFIG_DIR": "/opt/data/.claude-login-dir-value",
@@ -93,8 +109,16 @@ class StarterOverlayRenderTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.sd = _module()
 
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        # Every login and mount exists inside the synthetic container; a test
+        # that removes a variable shows which defaults that turns off.
+        self.paths = full_paths(self.sd, self._tmp.name, FULL_ENV)
+
     def render(self, agent: str = "ops", env: dict | None = None, config_dir: Path = FLEET_CONFIG):
-        return self.sd.render(config_dir, agent, self.sd.env_names(FULL_ENV if env is None else env), CONTRACT)
+        env = FULL_ENV if env is None else env
+        return self.sd.render(config_dir, agent, self.sd.env_names(env), CONTRACT, environ=env, paths=self.paths)
 
     def test_full_environment_turns_every_configured_default_on(self) -> None:
         rendered = self.render()
@@ -139,8 +163,13 @@ class StarterOverlayRenderTests(unittest.TestCase):
         self.assertFalse(worker.decisions["voice"].on)
         self.assertIn("agents/worker.yaml", worker.decisions["voice"].reason)
         self.assertNotIn("kokoro-voice", worker.leaves["plugins.enabled"])
-        self.assertNotIn("tts.provider", worker.leaves)
+        # Off is text-only: a local engine that never speaks, never Hermes' hosted default.
+        self.assertEqual(worker.leaves["tts.provider"], "text-only")
+        self.assertEqual(worker.leaves["tts.providers.text-only"], {"type": "command", "command": "false"})
+        self.assertEqual(worker.leaves["agent.disabled_toolsets"], ["tts"])
+        self.assertIs(worker.leaves["voice.auto_tts"], False)
         self.assertIs(worker.leaves["stt.enabled"], False)
+        self.assertIsNone(self.sd.hosted_speech_problem(worker.config))
         for default_id in CONFIGURED:
             if default_id != "voice":
                 self.assertTrue(worker.decisions[default_id].on, default_id)
@@ -163,7 +192,8 @@ class StarterOverlayRenderTests(unittest.TestCase):
                 self.assertFalse(rendered.decisions[default_id].on)
                 for plugin in PLUGINS_BY_DEFAULT.get(default_id, []):
                     self.assertNotIn(plugin, rendered.leaves.get("plugins.enabled", []))
-                lines, problems = self.sd.diagnose(rendered.config, FULL_ENV, CONTRACT)
+                lines, problems = self.sd.diagnose(rendered.config, FULL_ENV, CONTRACT,
+                                                   check_files=True, paths=self.paths)
                 self.assertIn(f"{default_id}: off: ", "\n".join(lines))
                 self.assertEqual(problems, [])
 
@@ -214,7 +244,8 @@ class StarterOverlayRenderTests(unittest.TestCase):
         self.assertTrue({p for p in providers if p} <= granted)
         if "CLAUDE_CONFIG_DIR" not in env:
             self.assertEqual([p for p in providers if p], [])
-        lines, problems = self.sd.diagnose(rendered.config, env, CONTRACT, granted=granted)
+        lines, problems = self.sd.diagnose(rendered.config, env, CONTRACT, granted=granted,
+                                           check_files=True, paths=self.paths)
         self.assertEqual(problems, [])
 
     def test_fallback_chain_uses_only_granted_providers(self) -> None:
@@ -295,7 +326,14 @@ class StarterOverlayRenderTests(unittest.TestCase):
                          "--env-file", str(env_file), "--output", str(out), "--report")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("honcho-memory: off: HONCHO_BASE_URL not set", result.stderr)
-            self.assertIn("linear: on", result.stderr)
+            # On the host the token file cannot be seen, so Linear stays off.
+            self.assertIn("linear: off: the Linear token file was not checked", result.stderr)
+            checked = run(RENDER, "--fleet-config", str(FLEET_CONFIG), "--agent", "ops",
+                          "--env-file", str(env_file), "--output", str(out), "--report",
+                          "--check-files", "--root", str(self.paths.root))
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertIn("linear: on", checked.stderr)
+            self.assertIn("claude-subscription-directsdk: on", checked.stderr)
             rendered = self.sd.load_yaml(out)
             self.assertNotIn("memory", rendered)
             for value in FULL_ENV.values():
@@ -311,7 +349,9 @@ class SwitchroomDoctorTests(unittest.TestCase):
         cls.sd = _module()
 
     def rendered_file(self, tmp: str, env: dict, agent: str = "ops") -> Path:
-        rendered = self.sd.render(FLEET_CONFIG, agent, self.sd.env_names(env), CONTRACT)
+        # Rendered where the agent's files are visible, as inside its container.
+        paths = full_paths(self.sd, Path(tmp) / f"render-{agent}", env)
+        rendered = self.sd.render(FLEET_CONFIG, agent, self.sd.env_names(env), CONTRACT, environ=env, paths=paths)
         path = Path(tmp) / f"{agent}.yaml"
         path.write_text(self.sd.dump_config(rendered), encoding="utf-8")
         return path
@@ -397,11 +437,16 @@ class SwitchroomDoctorTests(unittest.TestCase):
             lines = self.lines(self.doctor(tmp, env, "--check-files"))
             self.assertTrue(lines["claude-subscription-directsdk"].startswith("off: disabled: no Claude login"))
             self.assertTrue(lines["linear"].startswith("off: disabled: the file"))
+            # An empty record is not a login.
             (claude / ".credentials.json").write_text("{}", encoding="utf-8")
             token.write_text("x", encoding="utf-8")
             lines = self.lines(self.doctor(tmp, env, "--check-files"))
-            self.assertEqual(lines["claude-subscription-directsdk"], "on")
+            self.assertTrue(lines["claude-subscription-directsdk"].startswith("off: disabled: no Claude login"))
             self.assertEqual(lines["linear"], "on")
+            (claude / ".credentials.json").write_text(json.dumps(fixture.CLAUDE_LOGIN), encoding="utf-8")
+            lines = self.lines(self.doctor(tmp, env, "--check-files"))
+            self.assertEqual(lines["claude-subscription-directsdk"], "on")
+            self.assertEqual(lines["claude-acp-connectors"], "on")
 
     def test_ungranted_model_provider_is_a_problem(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -447,7 +492,9 @@ class RenderedSettingsPluginValidationTests(unittest.TestCase):
         cls.linear_oauth = oauth
 
     def settings(self, plugin: str, env: dict = FULL_ENV) -> dict:
-        rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(env), CONTRACT)
+        with tempfile.TemporaryDirectory() as tmp:
+            rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(env), CONTRACT, environ=env,
+                                      paths=full_paths(self.sd, tmp, env))
         self.assertIn(plugin, rendered.leaves["plugins.enabled"])
         return expand_env(rendered.leaves[f"plugins.entries.{plugin}.settings"], env)
 
@@ -488,7 +535,9 @@ class RenderedSettingsPluginValidationTests(unittest.TestCase):
         for name in self.sd.REQUIREMENTS["linear"]:
             with self.subTest(missing=name):
                 env = {k: v for k, v in FULL_ENV.items() if k != name}
-                rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(env), CONTRACT)
+                with tempfile.TemporaryDirectory() as tmp:
+                    rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(env), CONTRACT, environ=env,
+                                              paths=full_paths(self.sd, tmp, FULL_ENV))
                 self.assertEqual(rendered.decisions["linear"].reason, f"{name} not set")
                 self.assertNotIn("linear", rendered.leaves["plugins.enabled"])
                 self.assertEqual(rendered.leaves["plugins.entries.linear.settings"], {"enabled": False})
@@ -523,7 +572,9 @@ class StarterOverlayContractTests(unittest.TestCase):
             self.assertIn(entry["starter_overlay"], base["starter_overlay_values"])
         overlay = set(self.sd.load_yaml(FLEET_CONFIG / "defaults.yaml")["defaults"])
         self.assertEqual(declared, overlay)
-        rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(FULL_ENV), CONTRACT)
+        with tempfile.TemporaryDirectory() as tmp:
+            rendered = self.sd.render(FLEET_CONFIG, "ops", self.sd.env_names(FULL_ENV), CONTRACT, environ=FULL_ENV,
+                                      paths=full_paths(self.sd, tmp, FULL_ENV))
         self.assertEqual({d for d, x in rendered.decisions.items() if x.on}, declared)
         for entry in base["default_set"]:
             with self.subTest(default=entry["id"]):
@@ -577,7 +628,9 @@ class StarterOverlayWave1bDefaultsTests(unittest.TestCase):
         leaves = self.render().leaves
         self.assertEqual(leaves["session_reset"], {"mode": "idle", "idle_minutes": 240})
         self.assertEqual(leaves["plugins.config.disk-cleanup"], {"session_end_mode": "report_only"})
-        self.assertEqual(leaves["skills.external_dirs"], ["/opt/skill-packs/shared"])
+        self.assertEqual(leaves["_switchroom.skill_pack"], "/opt/data/skills/switchroom-shared")
+        # Hermes reads skills.external_dirs only from the agent's own config.yaml.
+        self.assertNotIn("skills", self.render().config)
         self.assertEqual(leaves["_switchroom.secrets_source"], "onepassword_connect")
         expected = next(d for d in contract_defaults() if d["id"] == "coding-clis")["expected"]
         self.assertEqual(leaves["_switchroom.coding_clis"], expected)
@@ -705,8 +758,9 @@ class StarterOverlayWave1bDefaultsTests(unittest.TestCase):
                 (root / base / name).mkdir(parents=True)
                 (root / base / name / "plugin.yaml").write_text(f"name: {name}\n", encoding="utf-8")
         if skills:
-            (root / "opt/skill-packs/shared/example-skill").mkdir(parents=True)
-            (root / "opt/skill-packs/shared/example-skill/SKILL.md").write_text("---\nname: x\n---\n", encoding="utf-8")
+            (root / "opt/data/skills/switchroom-shared/example-skill").mkdir(parents=True)
+            (root / "opt/data/skills/switchroom-shared/example-skill/SKILL.md").write_text(
+                "---\nname: x\n---\n", encoding="utf-8")
         if op:
             (root / "usr/local/bin").mkdir(parents=True)
             (root / "usr/local/bin/op").write_text("", encoding="utf-8")
@@ -750,7 +804,8 @@ class StarterOverlayWave1bDefaultsTests(unittest.TestCase):
             lines = self.lines_for(config, {k: v for k, v in env.items() if k != "CLAUDE_CONFIG_DIR"}, bare)
             self.assertEqual(lines["quota"], "off: disabled: plugin quota is not present at /opt/data/plugins/quota")
             self.assertTrue(lines["disk-cleanup"].startswith("off: disabled: plugin disk-cleanup is not present"))
-            self.assertTrue(lines["shared-skill-pack"].startswith("off: disabled: no skills found in /opt/skill-packs/shared"))
+            self.assertTrue(lines["shared-skill-pack"].startswith(
+                "off: disabled: Hermes finds no skills in /opt/data/skills/switchroom-shared"), lines["shared-skill-pack"])
             self.assertEqual(lines["secrets-connect"], "off: using the env file: the op CLI is not at /usr/local/bin/op")
             self.assertTrue(lines["web-search"].startswith("off: using the default web backend"))
             self.assertEqual(lines["coding-clis"], "off: disabled: no coding CLI login found")

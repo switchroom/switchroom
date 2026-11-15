@@ -9,6 +9,8 @@ managed_leaves:
   _switchroom.coding_clis: list[str]
   _switchroom.connect_provides: list[str]
   _switchroom.secrets_source: str
+  _switchroom.skill_pack: str
+  agent.disabled_toolsets: list[str]
   agent.system_prompt: str
   agent.verify_on_stop: bool
   approvals.cron_mode: str
@@ -28,10 +30,11 @@ managed_leaves:
   plugins.entries.linear.settings: dict
   prompt_caching.cache_ttl: str
   session_reset: dict
-  skills.external_dirs: list[str]
   stt.enabled: bool
   stt.provider: str
   terminal.cwd: str
   tts.provider: str
+  tts.providers.text-only: dict
+  voice.auto_tts: bool
   web.search_backend: str
   web.use_gateway: bool

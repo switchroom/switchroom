@@ -7,6 +7,12 @@ whose credential variable is not set is rendered off, never left half on.
 
 Only the names of set variables are used. Values are never read into the
 output; the config refers to them as ${NAME} for Hermes to expand at start.
+
+A default whose credential is a file inside the agent container (a Claude
+login, the Linear token file) renders on only when that file was seen: run
+with --check-files inside the agent container (or with --root pointing at a
+copy of its layout). On the host, without --check-files, those defaults
+render off and --report says why. The setup check makes the same decision.
 """
 from __future__ import annotations
 
@@ -30,10 +36,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="write config YAML here instead of stdout")
     parser.add_argument("--report", action="store_true", help="print one line per default to stderr")
     parser.add_argument("--provenance", type=Path, help="write leaf provenance JSON here")
+    parser.add_argument("--check-files", action="store_true",
+                        help="look at the login files, mounted plugins and skill pack (run inside the agent "
+                             "container); without it, login-backed defaults render off")
+    parser.add_argument("--hermes-home", default=None,
+                        help="the agent's HERMES_HOME inside the container (default: $HERMES_HOME or /opt/data)")
+    parser.add_argument("--root", type=Path, default=Path("/"),
+                        help="treat this directory as the container root for --check-files (testing)")
     args = parser.parse_args(argv)
     try:
-        names = sd.env_names(sd.environ_from(args.env_file, args.process_env))
-        rendered = sd.render(args.fleet_config, args.agent, names, args.contract)
+        environ = sd.environ_from(args.env_file, args.process_env)
+        names = sd.env_names(environ)
+        paths = None
+        if args.check_files:
+            hermes_home = args.hermes_home or str(environ.get("HERMES_HOME", "")).strip() or "/opt/data"
+            paths = sd.ContainerPaths(root=args.root, hermes_home=hermes_home)
+        rendered = sd.render(args.fleet_config, args.agent, names, args.contract, environ=environ, paths=paths)
         text = sd.dump_config(rendered)
         if args.output:
             args.output.write_text(text, encoding="utf-8")

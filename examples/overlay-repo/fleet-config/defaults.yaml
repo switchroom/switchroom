@@ -109,6 +109,9 @@ defaults:
         enabled: false
 
   # Kokoro voice replies and local transcription from the voice sidecar.
+  # Off means text-only: no text_to_speech tool, no automatic voice replies,
+  # and no hosted engine. Hermes' own default engine (edge) is a hosted
+  # service, so off names a local command engine that never succeeds.
   voice:
     requires_env: [HERMES_KOKORO_SIDECAR_URL, HERMES_KOKORO_SIDECAR_TOKEN]
     plugins: [kokoro-voice]
@@ -118,6 +121,12 @@ defaults:
       stt.provider: kokoro_sidecar
     off_values:
       stt.enabled: false
+      tts.provider: text-only
+      tts.providers.text-only:
+        type: command
+        command: "false"
+      agent.disabled_toolsets: [tts]
+      voice.auto_tts: false
 
   # Self-hosted Honcho. Without the endpoint Hermes keeps its built-in memory.
   honcho-memory:
@@ -182,7 +191,10 @@ defaults:
       plugins.config.disk-cleanup:
         session_end_mode: report_only
 
-  # The shared skill pack, mounted read-only from the pinned release.
+  # The shared skill pack, mounted read-only from the pinned release inside the
+  # agent's own skills directory. Hermes walks HERMES_HOME/skills recursively
+  # and reads skills.external_dirs only from the agent's own config.yaml, never
+  # from this managed file, so the pack must live under /opt/data/skills.
   shared-skill-pack:
     values:
-      skills.external_dirs: [/opt/skill-packs/shared]
+      _switchroom.skill_pack: /opt/data/skills/switchroom-shared

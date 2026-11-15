@@ -17,16 +17,22 @@ This pack is the `shared-skill-pack` entry in [`contracts/plugins.json`](../cont
 It is **not on by default** in the bare image. The starter overlay in
 [`examples/overlay-repo/`](../examples/overlay-repo/) configures it: it
 mounts this directory read-only from a checkout pinned to the image's own revision
-(`vendor.lock.json`) and lists it in `skills.external_dirs`. The contract entry stays `planned`
+(`vendor.lock.json`) inside the agent's own skills directory. The contract entry stays `planned`
 until a real container boot proves it, and only then moves to `shipped`. Without the starter
 overlay, mount it by hand as below.
 
 ## Mounting
 
-The pack is mounted **read-only** into each agent container and listed in Hermes'
-`skills.external_dirs`. Agents can load these skills but cannot edit them. A local profile
-skill with the same name takes precedence, so a deployment can override one skill without
-forking the pack.
+The pack is mounted **read-only** into each agent container, inside the agent's own skills
+directory (`$HERMES_HOME/skills`, `/opt/data/skills` in the Fleet image). Hermes walks that
+directory recursively, so it finds the pack with no config. Agents can load these skills but
+cannot edit them.
+
+Do not list the pack in `skills.external_dirs` in the managed config
+(`/etc/hermes/config.yaml`): Hermes reads `skills.external_dirs` only from the agent's own
+`$HERMES_HOME/config.yaml`, so a managed entry is silently ignored. Because the pack shares the
+agent's skills directory, a local skill with the same name as a pack skill is ambiguous to
+Hermes, which refuses to guess; rename one of them.
 
 In an overlay `compose.yaml` (paths are examples):
 
@@ -34,15 +40,7 @@ In an overlay `compose.yaml` (paths are examples):
 services:
   ops:
     volumes:
-      - ./vendor/hermes-fleet/skills:/opt/skill-packs/shared:ro
-```
-
-In the managed Hermes config for that agent:
-
-```yaml
-skills:
-  external_dirs:
-    - /opt/skill-packs/shared
+      - ./vendor/hermes-fleet/skills:/opt/data/skills/switchroom-shared:ro
 ```
 
 Pin the pack the same way you pin the image: check out an exact commit of this repository in

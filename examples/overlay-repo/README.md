@@ -42,18 +42,18 @@ the reviewed set from `contracts/plugins.json`:
 | `gateway-per-agent` | `gateway.multiplex_profiles: false` | never |
 | `secrets-connect` | 1Password Connect for this agent's secrets ([Secrets](#secrets)) | `OP_CONNECT_HOST` or `OP_CONNECT_TOKEN` unset: the env file is used |
 | `coding-clis` | Claude Code, Codex, Grok and OpenCode from the image, each on this agent's own login | a CLI has no login (setup check, `--check-files`) |
-| `claude-subscription-directsdk` | main model provider, no API-key fallback | `CLAUDE_CONFIG_DIR` unset |
-| `claude-acp-connectors` | Claude ACP provider plus `claude-account-connectors` | `CLAUDE_CONFIG_DIR` unset |
+| `claude-subscription-directsdk` | main model provider, no API-key fallback | no Claude login in `CLAUDE_CONFIG_DIR`, or the login was not checked ([Logins](#logins)) |
+| `claude-acp-connectors` | Claude ACP provider plus `claude-account-connectors` | the same |
 | `model-roles` | main model then fallbacks, granted providers only | no granted provider has its login |
-| `linear` | Linear plugin with a token file, bound to the app's user and workspace IDs ([Linear setup](../../docs/linear-setup.md) steps 4 and 5) | `LINEAR_TOKEN_FILE`, `LINEAR_VIEWER_ID` or `LINEAR_ORGANIZATION_ID` unset |
-| `voice` | Kokoro voice replies and local transcription | `HERMES_KOKORO_SIDECAR_URL` or `HERMES_KOKORO_SIDECAR_TOKEN` unset |
+| `linear` | Linear plugin with a token file, bound to the app's user and workspace IDs ([Linear setup](../../docs/linear-setup.md) steps 4 and 5) | `LINEAR_TOKEN_FILE`, `LINEAR_VIEWER_ID` or `LINEAR_ORGANIZATION_ID` unset, or the token file missing or not checked |
+| `voice` | Kokoro voice replies; local transcription with the GPU sidecar ([docs/sidecars.md](../../docs/sidecars.md)) | `HERMES_KOKORO_SIDECAR_URL` or `HERMES_KOKORO_SIDECAR_TOKEN` unset: text-only, no hosted speech |
 | `honcho-memory` | `memory.provider: honcho` | `HONCHO_BASE_URL` unset |
 | `web-search` | Perplexity search | `PERPLEXITY_API_KEY` unset |
 | `quota` | the quota plugin, pinned in `vendor.lock.json` | never (not fetched: absent and reported) |
 | `session-reset-policy` | `session_reset` idle after 240 minutes, through the pinned `hermes-session-reset-policy` plugin | never (not fetched: absent and reported) |
 | `security-guidance` | the `security-guidance` plugin in the Hermes image | never |
 | `disk-cleanup` | `plugins/disk-cleanup` with `session_end_mode: report_only` | never (not fetched: absent and reported) |
-| `shared-skill-pack` | `skills/` mounted read-only at `/opt/skill-packs/shared`, listed in `skills.external_dirs` | never (not fetched: absent and reported) |
+| `shared-skill-pack` | `skills/` mounted read-only at `/opt/data/skills/switchroom-shared`, inside the skills directory Hermes searches | never (not fetched: absent and reported) |
 
 A default whose variable is not set is rendered off, so the agent still
 starts. `granted_providers` in `defaults.yaml` lists the model providers you
@@ -61,6 +61,18 @@ granted; the model chain uses nothing else. An agent file may narrow that
 list, never widen it.
 
 Notes on the newer defaults:
+
+- **Voice off.** Text-only replies and no hosted speech: the `tts` toolset is
+  disabled, automatic voice replies are off, and `tts.provider` names a local
+  command engine that never succeeds. Hermes' own default engine, `edge`, is a
+  hosted service, so leaving `tts.provider` unset would not be off. The
+  renderer refuses, and the setup check reports as a problem, a voice-off
+  config that leaves a hosted engine.
+- **Skill pack.** Hermes walks `/opt/data/skills` recursively and reads
+  `skills.external_dirs` only from the agent's own `config.yaml`, never from
+  the managed file, so the pack is mounted inside the agent's skills
+  directory. With `--check-files` the setup check walks that directory the
+  way Hermes does and reports the pack off if Hermes would not find it.
 
 - **Session reset.** Hermes core no longer rotates conversations on a timer;
   it only reads `session_reset` through the community
@@ -104,6 +116,25 @@ The Fleet checkout follows the image, so the skills and Fleet plugins come
 from the same release as the image you run. A source that was never fetched
 mounts as an empty directory: that default is absent, the setup check reports
 it, and the agent still starts.
+
+## Logins
+
+The Claude defaults and Linear need a file inside the agent container: the
+Claude login (`$CLAUDE_CONFIG_DIR/.credentials.json`, written by `claude`
+when you log in) and the Linear token file. A variable naming the place is
+not a login, so the renderer turns these defaults on only when it can see the
+file, and the setup check makes the same decision with the same check:
+
+- Rendered on the host (no `--check-files`), they render off with
+  `off: the Claude login was not checked; run with --check-files ...`. The
+  agent still starts, with no Claude provider and no Linear plugin half on.
+- After logging in inside the container, render again there with
+  `--check-files` (step 7 of the quick start). A login that is missing or
+  empty keeps them off with `no Claude login found in CLAUDE_CONFIG_DIR`.
+
+This is a render-time gate, not a start-time one, on purpose: the managed
+config is a reviewed, read-only file that only changes when you render it, and
+an agent with a missing login still starts cleanly.
 
 ## Secrets
 
@@ -160,7 +191,7 @@ CLAUDE_CONFIG_DIR=/opt/data/.claude
 LINEAR_TOKEN_FILE=/opt/data/secrets/linear-token
 LINEAR_VIEWER_ID=replace-with-viewer.id
 LINEAR_ORGANIZATION_ID=replace-with-organization.id
-HERMES_KOKORO_SIDECAR_URL=http://voice:8126
+HERMES_KOKORO_SIDECAR_URL=http://voice:8880/v1
 HERMES_KOKORO_SIDECAR_TOKEN=replace-me
 HONCHO_BASE_URL=http://honcho:8000
 PERPLEXITY_API_KEY=replace-me
@@ -185,11 +216,25 @@ python3 scripts/switchroom-doctor.py \
 cd ~/my-fleet-overlay
 docker compose -f compose.yaml -f compose.sidecars.yaml config -q
 docker compose -f compose.yaml -f compose.sidecars.yaml up -d
+
+# 7. Log in inside the agent (for example `claude` for the Claude login), then
+#    render again inside the container, where the login is visible, and
+#    restart the agent. The image's own Python runs both scripts.
+docker compose run --rm --no-deps -T --entrypoint python3 \
+  -v ./vendor/hermes-fleet:/opt/switchroom/fleet:ro \
+  -v ./fleet-config:/opt/switchroom/fleet-config:ro \
+  ops /opt/switchroom/fleet/scripts/render-overlay-config.py \
+  --fleet-config /opt/switchroom/fleet-config --agent ops \
+  --process-env --check-files --report > managed/ops.yaml.new \
+  && mv managed/ops.yaml.new managed/ops.yaml
+docker compose -f compose.yaml -f compose.sidecars.yaml up -d --force-recreate ops
 ```
 
-The renderer and the setup check need PyYAML. They read only which variables
-are set, never print a value, and write `${NAME}` references that Hermes
-expands at start. `secrets/` and `vendor/` are in `.gitignore`.
+The renderer and the setup check read YAML with PyYAML or, inside the agent
+container, with the `ruamel.yaml` the Hermes image ships; they need nothing
+the image lacks. They never print a value, and write `${NAME}` references
+that Hermes expands at start. With `--check-files` they look at login files
+only to see that a login exists. `secrets/` and `vendor/` are in `.gitignore`.
 
 The setup check prints `<default>: on` or `<default>: off: <reason>` for every
 default in the contract. Missing credentials are reported, not fatal: it exits
