@@ -1,11 +1,29 @@
 schema_version: 1
-# Allowlisted desired-state keys for fleet-config/*.yaml.
+# Allowlisted desired-state keys for fleet-config/*.yaml, with their types.
 # This is not /etc/hermes/config.yaml (the managed policy layer).
+# Types: str, bool, int, list[str], list[provider] ({provider, model} entries)
+# and dict (a nested mapping with no null values).
 managed_leaves:
+  agent.system_prompt: str
+  agent.verify_on_stop: bool
+  approvals.cron_mode: str
+  approvals.mode: str
+  approvals.single_query_mode: str
+  approvals.unattended_mode: str
+  display.busy_input_mode: str
+  display.busy_text_mode: str
+  fallback_providers: list[provider]
+  gateway.multiplex_profiles: bool
   memory.provider: str
   model.default: str
   model.provider: str
+  plugins.enabled: list[str]
+  plugins.entries.claude-account-connectors.settings: dict
+  plugins.entries.linear.settings: dict
   prompt_caching.cache_ttl: str
+  stt.enabled: bool
+  stt.provider: str
   terminal.cwd: str
+  tts.provider: str
   web.search_backend: str
   web.use_gateway: bool

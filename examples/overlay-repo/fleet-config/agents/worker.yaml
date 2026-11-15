@@ -1,6 +1,16 @@
 profile: worker
 role: worker
 apply_mode: merge
-values:
-  model.provider: example-provider
-  model.default: example-model
+# One line per default turns it off for this agent only. Uncomment any line
+# to opt out; `voice` is already off here as the example.
+defaults:
+  voice: false
+  # doctrine-config: false
+  # gateway-per-agent: false
+  # model-roles: false
+  # claude-subscription-directsdk: false
+  # claude-acp-connectors: false
+  # linear: false
+  # honcho-memory: false
+  # web-search: false
+values: {}

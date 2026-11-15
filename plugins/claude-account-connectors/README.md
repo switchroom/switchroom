@@ -1,6 +1,6 @@
 # Claude account connectors (experimental)
 
-Optional Hermes tools using the existing Claude ACP subscription runtime, independent of the main model provider. Disabled by default. Controlled read-only acceptance has demonstrated discovery, empty and nonempty exact arguments, altered/other/repeated-call rejection, and thread-scoped Stop through the Hermes tool registry. This is not blanket production or write qualification; installation acceptance and account-specific policy checks remain required.
+Optional Hermes tools using the existing Claude ACP subscription runtime, independent of the main model provider. Off in the bare image; the starter overlay (`examples/overlay-repo/`) turns it on when the agent has its own Claude login. Controlled read-only acceptance has demonstrated discovery, empty and nonempty exact arguments, altered/other/repeated-call rejection, and thread-scoped Stop through the Hermes tool registry. This is not blanket production or write qualification; installation acceptance and account-specific policy checks remain required.
 
 - `claude_connector_search(query)` returns actual native `tool_reference` names filtered by existing profile authority. It does not export or invent JSON Schemas.
 - `claude_connector_call(tool, arguments)` requests one exact native tool and JSON argument object. Claude Code owns schema validation. The host compares type-sensitive argument values and consumes a single permission budget before selecting the offered `allow_once` option.
