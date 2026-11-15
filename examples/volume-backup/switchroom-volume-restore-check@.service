@@ -1,0 +1,17 @@
+# Example only. Decrypts the newest backup of one agent into scratch and verifies it.
+[Unit]
+Description=Restore check of the newest Switchroom volume backup for agent %i
+Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/volume-backup.md
+After=local-fs.target network-online.target
+# RequiresMountsFor=/mnt/switchroom-backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-volume-backup.py restore-check --config /etc/switchroom/volume-backup/%i.json
+UMask=0077
+Nice=15
+IOSchedulingClass=idle
+MemorySwapMax=0
+LimitCORE=0
+TimeoutStartSec=3h
+# OnFailure=your-alert@%i.service

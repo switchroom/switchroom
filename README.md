@@ -9,7 +9,7 @@ Site: [switchroom.ai](https://switchroom.ai). Built on [Hermes Agent](https://gi
 1. **Works your projects.** The [Linear plugin](plugins/linear/README.md) gives long-running work one owning agent and one durable task per issue, posts checkpoints as issue comments, routes a follow-up from any chat to the same task, and lets several agents work one project with handoff between them. You see who owns what, what was done and what is next on the issue, not in a chat scroll. The plugin source is here and disabled in the bare image; end-to-end outcome evidence is still to validate.
 2. **Safe to leave running.** One container and one gateway per agent, per-agent vaulted credentials, isolated by default. Agent-to-agent (A2A) stays an explicit opt-in per deployment, never a default.
 3. **Tuned for your Claude plan.** Claude-first, not Claude-only. The planned default model path is Claude Subscription DirectSDK, a Nous Research plugin its author labels experimental, on each agent's own Claude login with no API-key fallback. Claude ACP provides claude.ai connectors, qualified read-only so far. Other plans and keys work under the same rule.
-4. **Runs like infrastructure.** A digest-pinned child of an exact Hermes Agent image, config as code, and a private overlay for identity and secrets.
+4. **Runs like infrastructure.** A digest-pinned child of an exact Hermes Agent image, config as code, a private overlay for identity and secrets, and optional [encrypted volume backups with a restore check](docs/volume-backup.md).
 
 Chat is standard Hermes: Telegram on the run, Slack or Desktop at your desk, and Linear keeps you from losing the thread across issues, projects and agents.
 
@@ -204,6 +204,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`docs/image-release.md`](docs/image-release.md) — image bake, scan, and publication
 - [`plugins/linear/README.md`](plugins/linear/README.md) — native Linear and Kanban integration
 - [`docs/perplexity.md`](docs/perplexity.md) — optional search provider
+- [`docs/volume-backup.md`](docs/volume-backup.md) — optional encrypted per-agent volume backups with a restore check (off by default)
 - [`plugins/linear/`](plugins/linear/) — optional Linear integration on core Kanban (staged, disabled)
 - [`plugins/kokoro-voice/`](plugins/kokoro-voice/) — optional local Kokoro sidecar TTS
 - [`plugins/browser-handoff/`](plugins/browser-handoff/) — optional browser handoff

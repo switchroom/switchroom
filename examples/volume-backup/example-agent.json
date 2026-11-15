@@ -1,0 +1,21 @@
+{
+  "enabled": false,
+  "name": "example-agent",
+  "roots": {
+    "state": "/srv/switchroom/state/example-agent",
+    "workspace": "/srv/switchroom/workspace/example-agent"
+  },
+  "exclude": {
+    "state": ["cache/*", "lazy-packages", ".venvs", "home/.cache"],
+    "workspace": ["*/node_modules", "*/.venv"]
+  },
+  "destination": "/mnt/switchroom-backup/agents/example-agent",
+  "destination_mount": "/mnt/switchroom-backup",
+  "recipient_files": ["/etc/switchroom/volume-backup/keys/recovery-public.asc"],
+  "recipient_fingerprints": [],
+  "check_gnupg_home": "/etc/switchroom/volume-backup/check-gnupg",
+  "retention": {"daily": 7, "weekly": 4},
+  "state_dir": "/var/lib/switchroom-volume-backup/example-agent",
+  "scratch_dir": "/var/lib/switchroom-volume-backup/example-agent/restore-check",
+  "min_free_bytes": 1073741824
+}
