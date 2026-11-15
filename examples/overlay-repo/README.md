@@ -45,7 +45,7 @@ the reviewed set from `contracts/plugins.json`:
 | `coding-clis` | Claude Code, Codex, Grok and OpenCode from the image, each on this agent's own login | a CLI has no login (setup check, `--check-files`) |
 | `claude-subscription-directsdk` | main model provider, no API-key fallback | no Claude login in `CLAUDE_CONFIG_DIR`, or the login was not checked ([Logins](#logins)) |
 | `claude-acp-connectors` | Claude ACP provider plus `claude-account-connectors` | the same |
-| `model-roles` | main model then fallbacks, granted providers only | no granted provider has its login |
+| `model-roles` | each task role (main, coding, fast, approvals, compression) on its lead subscription plan, then the other granted plans ([Choose your plans](../../docs/choose-your-plans.md)) | no granted plan has its login |
 | `linear` | Linear plugin with a token file, bound to the app's user and workspace IDs ([Linear setup](../../docs/linear-setup.md) steps 4 and 5) | `LINEAR_TOKEN_FILE`, `LINEAR_VIEWER_ID` or `LINEAR_ORGANIZATION_ID` unset, or the token file missing or not checked |
 | `voice` | Kokoro voice replies; local transcription with the GPU sidecar ([docs/sidecars.md](../../docs/sidecars.md)) | `HERMES_KOKORO_SIDECAR_URL` or `HERMES_KOKORO_SIDECAR_TOKEN` unset: text-only, no hosted speech |
 | `honcho-memory` | `memory.provider: honcho` | `HONCHO_BASE_URL` unset |
@@ -58,8 +58,9 @@ the reviewed set from `contracts/plugins.json`:
 
 A default whose variable is not set is rendered off, so the agent still
 starts. `granted_providers` in `defaults.yaml` lists the model providers you
-granted; the model chain uses nothing else. An agent file may narrow that
-list, never widen it.
+granted; no model role uses anything else. An agent file may narrow that
+list, never widen it. `primary_plan` picks the plan for the main model; see
+[Choose your plans](../../docs/choose-your-plans.md).
 
 Notes on the newer defaults:
 

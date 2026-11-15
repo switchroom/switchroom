@@ -3,7 +3,8 @@
 ``full_container_root`` lays out, under a temporary directory, everything the
 starter defaults look for with ``--check-files``: the mounted plugins, the
 shared skill pack inside HERMES_HOME/skills, the op binary and a 1Password
-mapping, a Claude login, the Linear token file and one coding-CLI login. Every
+mapping, a Claude login, the Linear token file and one coding-CLI login, and on
+request Hermes' own ChatGPT or SuperGrok login in HERMES_HOME/auth.json. Every
 file is synthetic and empty of real credentials.
 """
 from __future__ import annotations
@@ -18,6 +19,28 @@ PLUGINS = (("opt/hermes/plugins", "security-guidance"), ("opt/hermes/plugins", "
 # The shape Claude Code writes on login; the values are placeholders.
 CLAUDE_LOGIN = {"claudeAiOauth": {"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh",
                                   "expiresAt": 0, "scopes": ["user:inference"]}}
+# Hermes core's subscription providers (hermes_cli/auth_codex.py, auth_xai.py).
+PLAN_PROVIDERS = {"chatgpt": "openai-codex", "grok": "xai-oauth"}
+
+
+def auth_store(plans=(), *, pooled=(), api_keys=()) -> dict:
+    """An auth.json shaped like Hermes writes it. ``plans`` get a provider-state
+    OAuth login, ``pooled`` an OAuth credential-pool entry (``hermes auth add``),
+    ``api_keys`` an API-key pool entry, which is never a plan login."""
+    store: dict = {"version": 1, "providers": {}, "credential_pool": {}}
+    for plan in plans:
+        store["providers"][PLAN_PROVIDERS[plan]] = {
+            "tokens": {"access_token": f"synthetic-{plan}-access", "refresh_token": f"synthetic-{plan}-refresh"},
+            "last_refresh": "2026-01-01T00:00:00Z", "auth_mode": "chatgpt" if plan == "chatgpt" else "oauth_device_code"}
+    for plan in pooled:
+        store["credential_pool"].setdefault(PLAN_PROVIDERS[plan], []).append({
+            "id": f"pool-{plan}", "source": "manual:device_code", "auth_type": "oauth",
+            "access_token": f"synthetic-{plan}-pool-access", "refresh_token": f"synthetic-{plan}-pool-refresh"})
+    for plan in api_keys:
+        store["credential_pool"].setdefault(PLAN_PROVIDERS[plan], []).append({
+            "id": f"key-{plan}", "source": "manual:api_key", "auth_type": "api_key",
+            "access_token": f"synthetic-{plan}-api-key"})
+    return store
 
 
 def write(path: Path, text: str) -> Path:
@@ -28,7 +51,7 @@ def write(path: Path, text: str) -> Path:
 
 def full_container_root(base: Path, env: dict, *, plugins: bool = True, skills: bool = True, op: bool = True,
                         mapping: dict | None = None, claude_login: bool = True, linear_token: bool = True,
-                        cli_login: bool = True) -> Path:
+                        cli_login: bool = True, plans=(), pooled=(), api_keys=()) -> Path:
     root = Path(base) / "root"
     root.mkdir(parents=True, exist_ok=True)
     if plugins:
@@ -47,4 +70,7 @@ def full_container_root(base: Path, env: dict, *, plugins: bool = True, skills: 
     if cli_login:
         home = env.get("HOME") or f"{HERMES_HOME}/home"
         write(root / home.lstrip("/") / ".codex" / "auth.json", "{}")
+    if plans or pooled or api_keys:
+        write(root / HERMES_HOME.lstrip("/") / "auth.json",
+              json.dumps(auth_store(plans, pooled=pooled, api_keys=api_keys)))
     return root

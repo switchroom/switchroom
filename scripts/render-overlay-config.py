@@ -13,6 +13,11 @@ login, the Linear token file) renders on only when that file was seen: run
 with --check-files inside the agent container (or with --root pointing at a
 copy of its layout). On the host, without --check-files, those defaults
 render off and --report says why. The setup check makes the same decision.
+
+Model roles route each task role (main, coding, fast, approvals, compression)
+to a subscription plan (claude, chatgpt, grok) with fallbacks across the other
+granted plans; --report prints one model-roles.plan.<plan> and one
+model-roles.<role> line. A plan renders on only when its login was seen.
 """
 from __future__ import annotations
 
@@ -61,8 +66,8 @@ def main(argv: list[str] | None = None) -> int:
             args.provenance.write_text(json.dumps({"fields": rendered.provenance}, indent=2, sort_keys=True) + "\n",
                                        encoding="utf-8")
         if args.report:
-            for default_id, decision in rendered.decisions.items():
-                print(decision.line(default_id), file=sys.stderr)
+            for line in rendered.report_lines():
+                print(line, file=sys.stderr)
         return 0
     except (sd.DefaultsError, OSError) as exc:
         print(f"render-overlay-config: {exc}", file=sys.stderr)

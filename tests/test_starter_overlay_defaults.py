@@ -314,7 +314,16 @@ class StarterOverlayRenderTests(unittest.TestCase):
         doc = self.sd.load_yaml(FLEET_CONFIG / "defaults.yaml")
         declared = {d: tuple(e.get("requires_env", [])) for d, e in doc["defaults"].items()}
         self.assertEqual(declared, self.sd.REQUIREMENTS)
-        self.assertEqual(tuple(doc["defaults"]["model-roles"]["chain"]), self.sd.MODEL_CHAIN_MEMBERS)
+        # Each plan's models use only that plan's providers; the Claude plan's
+        # providers are the ones the two Claude defaults turn on.
+        plans = doc["defaults"]["model-roles"]["plans"]
+        self.assertEqual(list(plans), list(self.sd.PLANS))
+        for plan, roles in plans.items():
+            for models in roles.values():
+                self.assertTrue({m["provider"] for m in models} <= set(self.sd.PLAN_PROVIDERS[plan]), plan)
+        claude = {m["provider"] for models in plans["claude"].values() for m in models}
+        self.assertEqual({self.sd.MODEL_PROVIDER_DEFAULTS[p] for p in claude},
+                         {"claude-subscription-directsdk", "claude-acp-connectors"})
 
     def test_renderer_cli_writes_config_and_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -378,6 +387,11 @@ class SwitchroomDoctorTests(unittest.TestCase):
             result = self.doctor(tmp, FULL_ENV)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = self.lines(result)
+        # model-roles is followed by one line per subscription plan and task role.
+        sub = [key for key in lines if key.startswith("model-roles.")]
+        self.assertEqual(sub, [f"model-roles.plan.{p}" for p in self.sd.PLANS]
+                         + [f"model-roles.{r}" for r in self.sd.ROLES])
+        lines = {key: status for key, status in lines.items() if key not in sub}
         self.assertEqual(list(lines), [d["id"] for d in contract_defaults()])
         for entry in contract_defaults():
             expected = "on" if entry["id"] in CONFIGURED else "off: not configured by the starter overlay yet"
