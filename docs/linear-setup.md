@@ -234,7 +234,7 @@ For every delivery, in this order:
 | `linear-signature` is the HMAC-SHA256 of the exact raw body with that agent's signing secret (constant-time compare) | 401 |
 | A `Linear-Delivery` id is present | 400 |
 | The signed `webhookTimestamp` is within one minute of the receiver's clock | 401 |
-| The delivery id was not seen before; a repeat is acknowledged and never filed twice, the same id with other content is refused | 200 `duplicate` / 400 |
+| Neither the delivery id nor the body was seen before for this agent; a repeat, or the same signed body under a new id (the id header is not signed), is acknowledged and never filed twice, the same id with other content is refused | 200 `duplicate` / 400 |
 | `organizationId` is the agent's workspace, and `oauthClientId` its app if you set `oauth_client_id` | 200 `ignored` |
 | An Agent Session event names the agent's own app user (`appUserId`), is `created` or `prompted`, and comes from a person in `allowed_actor_ids` (`agentSession.creatorId` or `agentActivity.userId`) | 200 `ignored` |
 | An Issue event delegates or assigns to, or used to delegate or assign to, this app | 200 `ignored` |
