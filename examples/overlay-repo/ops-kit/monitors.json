@@ -1,0 +1,60 @@
+{
+  "description": "Switchroom host monitors. Every monitor is off until you set its enabled to true. Paths are the starter overlay's named volumes; change them to your own.",
+  "agents": {
+    "ops": {
+      "roots": {
+        "state": "/var/lib/docker/volumes/hermes-fleet-overlay-example_ops-state/_data",
+        "workspace": "/var/lib/docker/volumes/hermes-fleet-overlay-example_ops-workspace/_data"
+      }
+    },
+    "worker": {
+      "roots": {
+        "state": "/var/lib/docker/volumes/hermes-fleet-overlay-example_worker-state/_data",
+        "workspace": "/var/lib/docker/volumes/hermes-fleet-overlay-example_worker-workspace/_data"
+      }
+    }
+  },
+  "alert": {
+    "sink": "stdout",
+    "url_env": "SWITCHROOM_ALERT_WEBHOOK_URL",
+    "timeout_seconds": 10
+  },
+  "ownership": {
+    "enabled": false,
+    "uid": 1000,
+    "gid": 1000,
+    "private_files": [
+      ".env",
+      "auth.json",
+      ".claude/.credentials.json"
+    ]
+  },
+  "memory": {
+    "enabled": false,
+    "low_available_bytes": 4294967296,
+    "psi_full_avg60": 5.0,
+    "psi_some_avg60": 20.0,
+    "sustain_seconds": 300,
+    "repeat_seconds": 21600,
+    "pids_warn_ratio": 0.8,
+    "state_dir": "/var/lib/switchroom-monitors/memory"
+  },
+  "storage": {
+    "enabled": false,
+    "filesystem_warn_used_percent": 85.0,
+    "filesystem_warn_available_bytes": 21474836480,
+    "agent_warn_bytes": 10737418240,
+    "agent_warn_overrides": {},
+    "cache_warn_bytes": 2147483648,
+    "cache_paths": {
+      "state": [
+        ".cache",
+        "cache",
+        "home/.cache",
+        "home/.npm"
+      ]
+    },
+    "scan_timeout_seconds": 600,
+    "dormant_agents": []
+  }
+}

@@ -1,0 +1,14 @@
+# Example only: the plain cron alternative to the systemd units. Install into
+# root's crontab (crontab -e). Every monitor is report-only and stays disabled
+# (exit 3) until its "enabled" is true in /etc/switchroom/monitors.json.
+#
+# Exit codes: 0 ok, 1 problems found or an incomplete scan, 2 config error,
+#             3 disabled in the config.
+SHELL=/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Only with "sink": "webhook" in monitors.json:
+# SWITCHROOM_ALERT_WEBHOOK_URL=https://alerts.example.invalid/hook
+
+* * * * * umask 077; /usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-memory-alert.py check --config /etc/switchroom/monitors.json >/dev/null || echo "memory alert check failed (exit $?)"
+30 3 * * * umask 077; /usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-ownership-audit.py audit --config /etc/switchroom/monitors.json --report /var/lib/switchroom-monitors/ownership/latest.json >/dev/null || echo "ownership audit found problems (exit $?)"
+15 4 * * * umask 077; /usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-storage-monitor.py check --config /etc/switchroom/monitors.json --report /var/lib/switchroom-monitors/storage/latest.json >/dev/null || echo "storage monitor incomplete (exit $?)"

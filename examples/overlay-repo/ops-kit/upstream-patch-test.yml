@@ -1,0 +1,67 @@
+# Opt-in template. Copy to .github/workflows/upstream-patch-test.yml in your
+# overlay repository to re-apply patches/series.json on the latest Hermes Agent
+# upstream every day. Set the repository variable SWITCHROOM_FLEET_REVISION to
+# the full commit of mekenthompson/hermes-fleet whose script you trust (the
+# revision of the image you run is a good choice).
+#
+# Read-only by construction: the token can only read this repository, no
+# secret is passed, and no step pushes, publishes, pins an image, edits a
+# Compose file or starts a rollout. See docs/upstream-patch-test.md.
+name: Daily upstream patch test
+
+on:
+  schedule:
+    - cron: '41 19 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Hermes Agent branch to test against'
+        type: string
+        default: 'main'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-patch-test
+  cancel-in-progress: false
+
+jobs:
+  patch-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check inputs
+        env:
+          FLEET_REVISION: ${{ vars.SWITCHROOM_FLEET_REVISION }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          set -eu
+          printf '%s' "$FLEET_REVISION" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "set the SWITCHROOM_FLEET_REVISION repository variable to a full commit" >&2; exit 2; }
+          if ! printf '%s' "$UPSTREAM_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$' \
+             || printf '%s' "$UPSTREAM_REF" | grep -q '\.\.'; then
+            echo "invalid upstream branch name" >&2
+            exit 2
+          fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: mekenthompson/hermes-fleet
+          ref: ${{ vars.SWITCHROOM_FLEET_REVISION }}
+          path: .switchroom-fleet
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Re-apply patches on the latest upstream and run their tests
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          python3 .switchroom-fleet/scripts/switchroom-upstream-patch-test.py \
+            --series patches/series.json \
+            --upstream-ref "$UPSTREAM_REF" \
+            --report "$RUNNER_TEMP/upstream-patch-test.json"

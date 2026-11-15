@@ -15,6 +15,8 @@ fleet-config/schema.yaml     Allowlisted desired-state keys
 fleet-config/defaults.yaml   Shared defaults and the starter defaults
 fleet-config/agents/         One YAML file per agent
 managed/                     /etc/hermes/config.yaml mounts (the rendered config goes here)
+patches/series.json          This overlay's own Hermes Agent patches (none in the starter)
+ops-kit/                     Opt-in host monitors, secret-reference map, upstream patch test template
 vendor/                      Pinned checkouts, fetched, not committed
 secrets/                     Env files and credentials, not committed
 ```
@@ -267,6 +269,21 @@ default in the contract. Missing credentials are reported, not fatal: it exits
 `--check-files` to also require the login files, the mounted plugins, the skill
 pack and the 1Password mapping. That mode adds one `coding-clis.<cli>` line per
 CLI; a login file is evidence of a login, not proof that it still works.
+
+## Ops kit (opt-in)
+
+Not part of the default set and off until you turn each one on. Nothing in
+`compose.yaml` runs them.
+
+| Piece | Files | Turn on | Docs |
+| --- | --- | --- | --- |
+| Host monitors: ownership audit, memory pressure alert, storage monitor | `ops-kit/monitors.json` (every monitor `"enabled": false`), `ops-kit/systemd/`, `ops-kit/crontab.example` | install on the Docker host, set `"enabled": true`, enable a timer | [docs/monitors.md](../../docs/monitors.md) |
+| Daily upstream patch test | `patches/series.json` (no patches), `ops-kit/upstream-patch-test.yml` | copy the template into `.github/workflows/` and set `SWITCHROOM_FLEET_REVISION` | [docs/upstream-patch-test.md](../../docs/upstream-patch-test.md) |
+| 1Password secret-reference audit | `ops-kit/secret-reference-map.json` (synthetic), `ops-kit/secret-reference-map.schema.json` | replace the names with yours and run the audit | [docs/secret-reference-audit.md](../../docs/secret-reference-audit.md) |
+
+All of them are report-only. Alerts go to stdout or to a webhook you name;
+there is no built-in chat. The upstream patch test never pins an image or
+starts a rollout, and the secret audit never resolves a reference.
 
 ## Turning a default off for one agent
 

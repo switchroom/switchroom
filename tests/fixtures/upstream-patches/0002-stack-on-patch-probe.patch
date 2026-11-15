@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fixture <fixture@example.invalid>
+Date: Mon, 16 Nov 2026 07:05:25 +1100
+Subject: [PATCH] synthetic: stack a second patch on the first
+
+---
+ switchroom_patch_probe.py      | 4 ++++
+ switchroom_patch_probe_test.py | 3 +++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/switchroom_patch_probe.py b/switchroom_patch_probe.py
+index 4ebb62f..1663acd 100644
+--- a/switchroom_patch_probe.py
++++ b/switchroom_patch_probe.py
+@@ -3,3 +3,7 @@
+ 
+ def greeting() -> str:
+     return "patched"
++
++
++def second() -> str:
++    return "stacked"
+diff --git a/switchroom_patch_probe_test.py b/switchroom_patch_probe_test.py
+index 15e1d78..8724657 100644
+--- a/switchroom_patch_probe_test.py
++++ b/switchroom_patch_probe_test.py
+@@ -7,6 +7,9 @@ class ProbeTest(unittest.TestCase):
+     def test_patch_is_present(self) -> None:
+         self.assertEqual(switchroom_patch_probe.greeting(), "patched")
+ 
++    def test_second_patch_is_stacked(self) -> None:
++        self.assertEqual(switchroom_patch_probe.second(), "stacked")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

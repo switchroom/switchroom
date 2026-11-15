@@ -1,0 +1,11 @@
+# Example only: systemctl enable --now switchroom-storage-monitor.timer
+[Unit]
+Description=Daily Switchroom agent storage monitor
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

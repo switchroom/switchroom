@@ -1,0 +1,14 @@
+{
+  "schema": "switchroom-upstream-patches/1",
+  "description": "This overlay's own patches to Hermes Agent, applied in order. The starter has none. Add a git format-patch file here and list it to have the daily upstream patch test re-apply it.",
+  "upstream": {
+    "repository": "https://github.com/NousResearch/hermes-agent.git",
+    "ref": "main"
+  },
+  "patches": [],
+  "tests": {
+    "command": [],
+    "when": "patched",
+    "timeout_seconds": 1800
+  }
+}

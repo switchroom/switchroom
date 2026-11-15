@@ -1,0 +1,25 @@
+{
+  "schema": "switchroom-upstream-patches/1",
+  "description": "Synthetic patch set for the daily upstream patch test. Both patches only add files, so they apply to any upstream; the second depends on the first.",
+  "upstream": {
+    "repository": "https://github.com/NousResearch/hermes-agent.git",
+    "ref": "main"
+  },
+  "patches": [
+    {
+      "id": "add-patch-probe",
+      "file": "0001-add-patch-probe.patch",
+      "outcome": "A tiny module whose test proves the patch landed."
+    },
+    {
+      "id": "stack-on-patch-probe",
+      "file": "0002-stack-on-patch-probe.patch",
+      "outcome": "A second patch that only applies on top of the first."
+    }
+  ],
+  "tests": {
+    "command": ["python3", "-m", "unittest", "-v", "switchroom_patch_probe_test"],
+    "when": "patched",
+    "timeout_seconds": 300
+  }
+}

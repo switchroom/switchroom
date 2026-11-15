@@ -1,0 +1,19 @@
+# Example only. Daily ownership audit of every agent in monitors.json.
+# Report-only: it never changes a file. Repair is a separate, manual command
+# (docs/monitors.md). Nothing runs until you install this and enable the timer.
+[Unit]
+Description=Switchroom agent ownership audit (report-only)
+Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/monitors.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-ownership-audit.py audit --config /etc/switchroom/monitors.json --report /var/lib/switchroom-monitors/ownership/latest.json
+# Exit 1 (problems found) and 3 (disabled in the config) fail the unit on
+# purpose, so a timer enabled without a working config is visible.
+# For a webhook sink, put SWITCHROOM_ALERT_WEBHOOK_URL=... in a root-only file:
+# EnvironmentFile=/etc/switchroom/monitors.env
+UMask=0077
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=2G
+# OnFailure=your-alert.service

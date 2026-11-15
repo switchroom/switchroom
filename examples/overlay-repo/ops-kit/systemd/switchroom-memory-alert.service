@@ -1,0 +1,12 @@
+# Example only. One memory-pressure and container task-limit sample.
+# Report-only: it never restarts or kills anything.
+[Unit]
+Description=Switchroom host memory pressure alert (report-only)
+Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/monitors.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/switchroom/scripts/switchroom-memory-alert.py check --config /etc/switchroom/monitors.json
+# For a webhook sink, put SWITCHROOM_ALERT_WEBHOOK_URL=... in a root-only file:
+# EnvironmentFile=/etc/switchroom/monitors.env
+UMask=0077
