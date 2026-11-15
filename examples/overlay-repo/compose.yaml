@@ -16,7 +16,10 @@ x-hermes-agent: &hermes-agent
 # mounts as an empty directory: that default is absent, the setup check
 # (--check-files) reports it, and the agent still starts.
 x-starter-mounts:
-  - &skill-pack ./vendor/hermes-fleet/skills:/opt/skill-packs/shared:ro
+  # The skill pack goes inside the agent's own skills directory: Hermes walks
+  # /opt/data/skills recursively and never reads skills.external_dirs from the
+  # managed config.
+  - &skill-pack ./vendor/hermes-fleet/skills:/opt/data/skills/switchroom-shared:ro
   - &plugin-linear ./vendor/hermes-fleet/plugins/linear:/opt/hermes/plugins/linear:ro
   - &plugin-kokoro ./vendor/hermes-fleet/plugins/kokoro-voice:/opt/hermes/plugins/kokoro-voice:ro
   - &plugin-perplexity ./vendor/hermes-fleet/plugins/web/perplexity:/opt/hermes/plugins/web/perplexity:ro

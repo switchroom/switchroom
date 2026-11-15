@@ -24,7 +24,7 @@ CONTRACT = ROOT / "contracts" / "plugins.json"
 LOCK = OVERLAY / "vendor.lock.json"
 FETCH = ROOT / "scripts" / "fetch-overlay-vendor.py"
 DIGEST_REF = re.compile(r"^[a-z0-9.-]+(?:/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$")
-SIDECARS = {"voice", "honcho", "honcho-db", "onepassword-connect-api", "onepassword-connect-sync"}
+SIDECARS = {"voice", "honcho", "honcho-tiktoken", "honcho-db", "onepassword-connect-api", "onepassword-connect-sync"}
 AGENTS = {"ops", "worker"}
 # Plugins the Fleet image itself ships, so the overlay need not mount them.
 IN_IMAGE = {"security-guidance"}
@@ -42,7 +42,7 @@ PLUGIN_TARGETS = {
 }
 FULL_ENV = {
     "CLAUDE_CONFIG_DIR": "/opt/data/.claude", "LINEAR_TOKEN_FILE": "/opt/data/secrets/linear-token",
-    "LINEAR_VIEWER_ID": "v", "LINEAR_ORGANIZATION_ID": "o", "HERMES_KOKORO_SIDECAR_URL": "http://voice:8126",
+    "LINEAR_VIEWER_ID": "v", "LINEAR_ORGANIZATION_ID": "o", "HERMES_KOKORO_SIDECAR_URL": "http://voice:8880/v1",
     "HERMES_KOKORO_SIDECAR_TOKEN": "t", "HONCHO_BASE_URL": "http://honcho:8000", "PERPLEXITY_API_KEY": "k",
     "OP_CONNECT_HOST": "http://onepassword-connect-api:8080", "OP_CONNECT_TOKEN": "t",
 }
@@ -52,6 +52,13 @@ try:
     HAVE_YAML = True
 except ImportError:  # pragma: no cover - the CI source-tests venv has PyYAML
     HAVE_YAML = False
+
+
+def _fixture_module():
+    spec = importlib.util.spec_from_file_location("starter_overlay_fixture", ROOT / "tests" / "starter_overlay_fixture.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load(path: Path) -> dict:
@@ -195,15 +202,20 @@ class StarterComposeMountTests(unittest.TestCase):
         lock_paths = {e["path"] for e in json.loads(LOCK.read_text(encoding="utf-8"))["entries"]}
         for agent in AGENTS:
             with self.subTest(agent=agent):
-                rendered = self.sd.render(OVERLAY / "fleet-config", agent, self.sd.env_names(FULL_ENV), CONTRACT)
+                # Rendered where every login is visible, so every plugin is on.
+                fixture = _fixture_module()
+                with tempfile.TemporaryDirectory() as tmp:
+                    paths = self.sd.ContainerPaths(root=fixture.full_container_root(Path(tmp), FULL_ENV))
+                    rendered = self.sd.render(OVERLAY / "fleet-config", agent, self.sd.env_names(FULL_ENV), CONTRACT,
+                                              environ=FULL_ENV, paths=paths)
+                self.assertIn("claude-subscription-directsdk-experimental", rendered.leaves["plugins.enabled"])
                 binds = _binds(self.compose["services"][agent])
                 targets = {target: (source, mode) for source, target, mode in binds}
                 for plugin in rendered.leaves["plugins.enabled"]:
                     if plugin in IN_IMAGE:
                         continue
                     self.assertIn(PLUGIN_TARGETS[plugin], targets, plugin)
-                for directory in rendered.leaves["skills.external_dirs"]:
-                    self.assertIn(directory, targets)
+                self.assertIn(rendered.leaves["_switchroom.skill_pack"], targets)
                 for source, target, mode in binds:
                     self.assertEqual(mode, "ro", target)
                     if source.startswith("./vendor/"):
@@ -272,7 +284,8 @@ class SidecarComposeTests(unittest.TestCase):
 
     def test_kokoro_defaults_to_cpu(self) -> None:
         voice = self.services["voice"]
-        self.assertEqual(voice["environment"]["VOICE_STT_DEVICE"], "cpu")
+        # The upstream CPU build: no CUDA runtime in the image at all.
+        self.assertIn("ghcr.io/remsky/kokoro-fastapi-cpu@sha256:", voice["image"])
         self.assertNotIn("gpus", voice)
         self.assertNotIn("deploy", voice)
         self.assertIn("GPU variant (optional)", self.text)

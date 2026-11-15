@@ -14,31 +14,95 @@
 # Every image is pinned by digest. Replace a digest only with one you reviewed.
 
 services:
-  # Kokoro voice and local transcription, CPU-only by default. Point the
-  # agents at it with HERMES_KOKORO_SIDECAR_URL=http://voice:8126 and the same
-  # token as VOICE_SIDECAR_TOKEN in secrets/voice.env.
+  # Kokoro voice replies on CPU: the upstream Kokoro-FastAPI CPU build
+  # (remsky/Kokoro-FastAPI v0.10.0, Apache-2.0), referenced by its multi-arch
+  # index digest and never vendored. It ships no CUDA libraries, so nothing
+  # tries a GPU, and its model weights are built into the image, so it needs no
+  # egress network. Point the agents at it with
+  # HERMES_KOKORO_SIDECAR_URL=http://voice:8880/v1 and put the same token in
+  # HERMES_KOKORO_SIDECAR_TOKEN and in API_KEYS (a JSON list) in
+  # secrets/voice.env. This server speaks only; on CPU the agents get no
+  # transcription, and nothing falls back to a hosted service.
   #
-  # GPU variant (optional): add `gpus: all` here and set VOICE_STT_DEVICE to
-  # cuda and VOICE_STT_COMPUTE_TYPE to float16. Text-to-speech uses the GPU on
-  # its own when one is visible.
+  # GPU variant (optional): the Fleet Kokoro image adds local faster-whisper
+  # transcription and needs an NVIDIA GPU. Use
+  #   image: ghcr.io/mekenthompson/hermes-fleet-kokoro@sha256:d69414ba021f8f5ee5c915d2a5a5b95d9ad579dd2c1054b1f7ab4a63e2dff540
+  #   gpus: all
+  #   user: "65532:65532"
+  #   environment: VOICE_STT_DEVICE=cuda, VOICE_STT_COMPUTE_TYPE=float16,
+  #     VOICE_STT_PORT=8126, VOICE_MODEL_CACHE=/models, and VOICE_SIDECAR_TOKEN
+  #     in secrets/voice.env
+  #   volumes: a model cache at /models
+  #   networks: voice, plus an egress network no agent joins for the one-time
+  #     weight download
+  # and point the agents at http://voice:8126. Do not run that image without a
+  # GPU: its speech engine loads the CUDA runtime at start and crashes.
   voice:
-    image: ${HERMES_FLEET_KOKORO_IMAGE:-ghcr.io/mekenthompson/hermes-fleet-kokoro@sha256:d69414ba021f8f5ee5c915d2a5a5b95d9ad579dd2c1054b1f7ab4a63e2dff540}
+    image: ${HERMES_FLEET_KOKORO_IMAGE:-ghcr.io/remsky/kokoro-fastapi-cpu@sha256:f54c5960c2b9387f6349080a9944f8bc7e8cdb98a4ef9238cb0b0f9ff9795f44}
     restart: unless-stopped
-    user: "65532:65532"
+    # API_KEYS='["<the agents' HERMES_KOKORO_SIDECAR_TOKEN>"]'
     env_file:
       - path: ./secrets/voice.env
         required: false
     environment:
-      VOICE_STT_DEVICE: cpu
-      VOICE_STT_COMPUTE_TYPE: int8
-      VOICE_STT_PORT: "8126"
-      VOICE_MODEL_CACHE: /models
-    volumes:
-      - voice-models:/models
+      # The weights are already in the image; never fetch at start.
+      DOWNLOAD_MODEL: "false"
+      ENABLE_WEBSOCKET_TTS: "false"
     networks:
       - voice
-      # Model weights download once on first start; nothing else uses it.
-      - voice-egress
+
+  # One-time fetch of the tokenizer file Honcho loads at import (tiktoken
+  # o200k_base). Honcho has no egress, so this step fills the honcho-tiktoken
+  # volume before Honcho starts, refuses any file whose SHA-256 differs from
+  # the pin below, and exits. It is the only service on the egress network,
+  # runs Honcho's own image (its Python, stdlib only), with every capability
+  # dropped and a read-only root filesystem. A cache that already matches the
+  # pin is kept and nothing is fetched.
+  honcho-tiktoken:
+    image: ghcr.io/plastic-labs/honcho@sha256:2ced1a958f14c128ddb05e68deb549f9281681e44595a7a3c34adebf5b432b16
+    restart: "no"
+    # Root inside the container only to write the fresh volume; no capabilities.
+    user: "0:0"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    environment:
+      TIKTOKEN_URL: https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+      TIKTOKEN_SHA256: 446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d
+      TIKTOKEN_CACHE: /tiktoken-cache
+    entrypoint:
+      - python
+      - -c
+      - |
+        import hashlib, os, sys, urllib.request
+        url, want, cache = os.environ["TIKTOKEN_URL"], os.environ["TIKTOKEN_SHA256"], os.environ["TIKTOKEN_CACHE"]
+        # tiktoken names a cached file by the SHA-1 of its source URL.
+        dest = os.path.join(cache, hashlib.sha1(url.encode()).hexdigest())
+        def matches(data):
+            return hashlib.sha256(data).hexdigest() == want
+        try:
+            with open(dest, "rb") as f:
+                if matches(f.read()):
+                    print("tiktoken cache already matches the pin")
+                    sys.exit(0)
+        except OSError:
+            pass
+        with urllib.request.urlopen(url, timeout=120) as response:
+            data = response.read(16 * 1024 * 1024 + 1)
+        if len(data) > 16 * 1024 * 1024 or not matches(data):
+            sys.exit("refusing the tokenizer file: it does not match the pinned SHA-256")
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+        print("tiktoken cache filled")
+    volumes:
+      - honcho-tiktoken:/tiktoken-cache
+    networks:
+      - honcho-tiktoken-egress
 
   # Honcho memory: the upstream image (plastic-labs/honcho v3.6.1), referenced
   # by digest and never vendored. Honcho is AGPL-3.0.
@@ -56,6 +120,8 @@ services:
     depends_on:
       honcho-db:
         condition: service_healthy
+      honcho-tiktoken:
+        condition: service_completed_successfully
     # DB_CONNECTION_URI, with the same password as secrets/honcho-db.env.
     env_file:
       - path: ./secrets/honcho.env
@@ -69,6 +135,10 @@ services:
       DREAM_ENABLED: "false"
       PEER_CARD_ENABLED: "false"
       EMBED_MESSAGES: "false"
+      # Filled once by honcho-tiktoken; tiktoken reads it and never fetches.
+      TIKTOKEN_CACHE_DIR: /tiktoken-cache
+    volumes:
+      - honcho-tiktoken:/tiktoken-cache:ro
     networks:
       - honcho
       - honcho-db
@@ -131,19 +201,19 @@ services:
       - onepassword
 
 volumes:
-  voice-models:
+  honcho-tiktoken:
   honcho-pgdata:
   onepassword-data:
 
 networks:
   voice:
     internal: true
-  voice-egress:
-    driver: bridge
   honcho:
     internal: true
   honcho-db:
     internal: true
+  honcho-tiktoken-egress:
+    driver: bridge
   onepassword:
     internal: true
   onepassword-egress:
