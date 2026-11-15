@@ -1,7 +1,7 @@
 ---
 title: Entrust ongoing work without losing control
 job: entrust-ongoing-work
-serves: there-when-you-reach
+serves: works-your-projects
 outcome: A principal can assign or take over approved work through Linear or chat, steer the same durable work across supported interfaces, and receive a verified result after interruptions without reconstructing progress or authorizing the same work twice.
 stakes: full
 invariants:
@@ -13,6 +13,8 @@ invariants:
 ---
 
 # Job Spec: entrust ongoing work without losing control
+
+`serves:` retargeted from `there-when-you-reach` to `works-your-projects` by the 2026-11-15 amendment in [../rfcs/switchroom-positioning.md](../rfcs/switchroom-positioning.md). The job statement is unchanged.
 
 ## The job
 
@@ -59,7 +61,7 @@ This job assumes principals will delegate ongoing work when its ownership, decis
 
 Mechanism: durable ownership and reconciled progress let the principal leave execution without reconstructing context. Leading indicators: work resumes without human reconstruction; steering changes the existing work rather than creating a competing execution; delivered results match the agreed destination.
 
-The job metric is the share of interrupted approved outcomes recoverable without reconstruction or duplicate effects. It rolls into **there-when-you-reach** and its first-class surface hold rate, supporting trusted unsupervised turns. Baseline and target are unmeasured; instrumentation belongs in the RFC.
+The job metric is the share of interrupted approved outcomes recoverable without reconstruction or duplicate effects. It rolls into **works-your-projects** and its readable-issue rate, supporting trusted unsupervised turns. The cross-surface and restart cases must still meet **there-when-you-reach**'s bar. Baseline and target are unmeasured; instrumentation belongs in the RFC.
 
 ## Good / bad
 
