@@ -52,6 +52,16 @@ def main():
                     guard.deny("gateway/model bootstrap import: " + fullname)
                 return None
         sys.meta_path.insert(0, NoGatewayBootstrap())
+        # Core's Telegram dm_threads key derivation resolves a live runner through
+        # `from gateway.run import _gateway_runner_ref` when a source has no adapter ref. The proof
+        # runs no gateway, so that lookup's honest answer is "no runner" (Core's own import-time
+        # default, `lambda: None`). Seed exactly that one name as a stub module instead of allowing
+        # the real gateway.run, whose import is the model/gateway bootstrap this guard forbids.
+        # sys.modules hits never reach the finder above, so every other gateway.run name still fails.
+        import types
+        gateway_run_stub = types.ModuleType("gateway.run")
+        gateway_run_stub._gateway_runner_ref = lambda: None
+        sys.modules["gateway.run"] = gateway_run_stub
         # Packaged Hermes carries build provenance; a source checkout would probe git while
         # importing provider declarations. Use the already verified immutable fixture identity.
         sys.path.insert(0, str(source))

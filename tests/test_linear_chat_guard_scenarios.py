@@ -56,7 +56,11 @@ class ChatGuardCoreFireSiteTests(unittest.TestCase):
         self.addCleanup(delivery.stop)
         self.agent = SimpleNamespace(session_id="sess-1", model="m", platform="slack", _parent_session_id=None,
                                      _user_id="U1", _persist_disabled=False, _current_turn_id="",
-                                     _current_api_request_id="")
+                                     _current_api_request_id="",
+                                     # Core's post_llm_call review_signals contract reads these counters.
+                                     _iters_since_skill=0, _turns_since_memory=0,
+                                     _skill_nudge_interval=0, _memory_nudge_interval=0,
+                                     valid_tool_names=set())
 
     def end_turn(self, message: str, turn_id: str) -> None:
         import logging
