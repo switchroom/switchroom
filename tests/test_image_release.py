@@ -475,6 +475,14 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn("Verify promoted SHA tag resolves to staged digest", publish)
         self.assertIn("promoted SHA tag does not resolve to staged digest", publish)
 
+    def test_image_bake_jobs_pin_the_docker_classic_store_runner(self) -> None:
+        # ubuntu-latest (26.04) uses the containerd image store; docker save then no
+        # longer binds the archive to the inspected image ID and the scan fails closed.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        for job in ("preflight_bake", "publish"):
+            runs_on = re.search(r"(?m)^    runs-on: (\S+)$", text.split(f"\n  {job}:\n", 1)[1]).group(1)
+            self.assertEqual(runs_on, "ubuntu-24.04", job)
+
     def test_publishing_dispatch_does_not_duplicate_build_and_scans(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         preflight = text.split("\n  preflight_bake:\n", 1)[1].split("    runs-on:", 1)[0]

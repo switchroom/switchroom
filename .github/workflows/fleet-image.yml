@@ -84,7 +84,9 @@ jobs:
       (github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
       github.repository == 'switchroom/switchroom'
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, whose containerd image store breaks the
+    # docker-save config binding that scripts/scan-fleet-image.py enforces.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -450,7 +452,9 @@ jobs:
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, whose containerd image store breaks the
+    # docker-save config binding that scripts/scan-fleet-image.py enforces.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: fleet-image-publish
     permissions:
