@@ -7,25 +7,25 @@ not baked into the agent child image. Deployments pin an immutable digest.
 
 | Sidecar | Image | Status |
 |---|---|---|
-| REST lock-proxy | `ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy` | publishing |
-| TCP / noVNC proxy | `ghcr.io/mekenthompson/hermes-fleet-tcp-proxy` | publishing |
-| Browser broker | `ghcr.io/mekenthompson/hermes-fleet-browser-broker` | publishing |
-| Kokoro | `ghcr.io/mekenthompson/hermes-fleet-kokoro` | publishing |
-| Camofox | `ghcr.io/mekenthompson/hermes-fleet-camofox` | publishing |
+| REST lock-proxy | `ghcr.io/switchroom/rest-lock-proxy` | publishing |
+| TCP / noVNC proxy | `ghcr.io/switchroom/tcp-proxy` | publishing |
+| Browser broker | `ghcr.io/switchroom/browser-broker` | publishing |
+| Kokoro | `ghcr.io/switchroom/kokoro` | publishing |
+| Camofox | `ghcr.io/switchroom/camofox` | publishing |
 
 Pin form:
 
 ```text
-ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256:<64 lowercase hex>
+ghcr.io/switchroom/rest-lock-proxy@sha256:<64 lowercase hex>
 ```
 
-`scripts/sidecar_image_ref.py` rejects tags and unprefixed legacy names.
+`scripts/sidecar_image_ref.py` rejects tags and unprefixed private names. Digests published before the move under `ghcr.io/mekenthompson/hermes-fleet-<sidecar>` remain accepted, because existing deployments pin them.
 
 ## Layout
 
 - `sidecars/packages.json` is the machine-readable package list. It is not
   copied into the Fleet child image, so sidecar-only changes do not rebuild
-  `hermes-fleet-public`.
+  the Fleet child image.
 - Source lives under `sidecars/<sidecar>/`.
 - Path-filtered workflows under `.github/workflows/sidecar-*.yml` bake only that
   sidecar directory and its workflow file. Shared catalog files
@@ -104,7 +104,7 @@ the sidecar, so this check runs with `--check-files` inside the agent
 container (quick start step 7). A render on the host leaves voice off with
 `the voice sidecar was not checked`, the same way it treats the Claude logins.
 
-The Fleet image `ghcr.io/mekenthompson/hermes-fleet-kokoro` is the GPU
+The Fleet image `ghcr.io/switchroom/kokoro` is the GPU
 variant, and the option for local transcription. It adds local
 faster-whisper transcription and needs an NVIDIA GPU:
 its speech engine loads the CUDA runtime at start and crashes without one.

@@ -2,7 +2,7 @@
 # Report-only: it never deletes anything.
 [Unit]
 Description=Switchroom agent storage monitor (report-only)
-Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/monitors.md
+Documentation=https://github.com/switchroom/switchroom/blob/main/docs/monitors.md
 
 [Service]
 Type=oneshot

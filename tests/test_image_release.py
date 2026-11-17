@@ -324,9 +324,8 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn("needs.scope.outputs.image == 'true'", bake_if)
         self.assertIn("group: fleet-image-${{ github.event.pull_request.number || github.sha }}", text)
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
-        self.assertIn("github.repository == 'mekenthompson/hermes-fleet-public'", text)
-        self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", text)
-        self.assertIn("ghcr.io/mekenthompson/hermes-fleet-public", text)
+        self.assertIn("github.repository == 'switchroom/switchroom'", text)
+        self.assertIn("ghcr.io/switchroom/switchroom", text)
         self.assertIn("github.ref == 'refs/heads/main'", text)
         self.assertIn("environment: fleet-image-publish", text)
         self.assertIn("platforms: linux/amd64", text)
@@ -447,7 +446,7 @@ class FleetImageReleaseTests(unittest.TestCase):
     def test_push_digest_extractor_accepts_real_docker_push_summary(self) -> None:
         digest = "sha256:" + "a" * 64
         push_log = (
-            "The push refers to repository [ghcr.io/mekenthompson/hermes-fleet-public]\n"
+            "The push refers to repository [ghcr.io/switchroom/switchroom]\n"
             "a0b1c2d3e4f5: Pushed\n"
             "fleet-stage-123-1: digest: " + digest + " size: 742\n"
         )
@@ -475,6 +474,14 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertNotIn("imagetools inspect --format '{{.Digest}}'", publish)
         self.assertIn("Verify promoted SHA tag resolves to staged digest", publish)
         self.assertIn("promoted SHA tag does not resolve to staged digest", publish)
+
+    def test_image_bake_jobs_pin_the_docker_classic_store_runner(self) -> None:
+        # ubuntu-latest (26.04) uses the containerd image store; docker save then no
+        # longer binds the archive to the inspected image ID and the scan fails closed.
+        text = WORKFLOW.read_text(encoding="utf-8")
+        for job in ("preflight_bake", "publish"):
+            runs_on = re.search(r"(?m)^    runs-on: (\S+)$", text.split(f"\n  {job}:\n", 1)[1]).group(1)
+            self.assertEqual(runs_on, "ubuntu-24.04", job)
 
     def test_publishing_dispatch_does_not_duplicate_build_and_scans(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -563,7 +570,7 @@ class FleetImageReleaseTests(unittest.TestCase):
                     "python3",
                     str(EMIT_MANIFEST),
                     "--repository",
-                    "ghcr.io/mekenthompson/hermes-fleet-public",
+                    "ghcr.io/switchroom/switchroom",
                     "--revision",
                     "b" * 40,
                     "--digest",
@@ -581,8 +588,8 @@ class FleetImageReleaseTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(data["schema_version"], 1)
-            self.assertEqual(data["fleet"]["immutable_ref"], f"ghcr.io/mekenthompson/hermes-fleet-public@{digest}")
-            self.assertEqual(data["fleet"]["source_repository"], "https://github.com/mekenthompson/hermes-fleet")
+            self.assertEqual(data["fleet"]["immutable_ref"], f"ghcr.io/switchroom/switchroom@{digest}")
+            self.assertEqual(data["fleet"]["source_repository"], "https://github.com/switchroom/switchroom")
             self.assertEqual(data["agent"]["immutable_ref"], AGENT_REF)
             self.assertEqual(output.read_text(encoding="utf-8"), json.dumps(data, indent=2, sort_keys=True) + "\n")
 

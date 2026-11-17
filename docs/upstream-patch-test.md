@@ -100,7 +100,7 @@ not as an active workflow. To opt in:
 
 1. Copy it to `.github/workflows/upstream-patch-test.yml` in your overlay.
 2. Set the repository variable `SWITCHROOM_FLEET_REVISION` to the full commit
-   of `mekenthompson/hermes-fleet` whose script you want to run (the revision
+   of `switchroom/switchroom` whose script you want to run (the revision
    of the image you run is a good choice). The workflow refuses anything that
    is not a 40-character commit.
 3. Run it once with **Run workflow** and read the job summary.

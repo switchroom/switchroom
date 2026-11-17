@@ -20,11 +20,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy
+  IMAGE_REPOSITORY: ghcr.io/switchroom/rest-lock-proxy
 
 jobs:
   test:
-    if: github.repository == 'mekenthompson/hermes-fleet'
+    if: github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -37,7 +37,7 @@ jobs:
 
   bake:
     needs: test
-    if: github.repository == 'mekenthompson/hermes-fleet'
+    if: github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

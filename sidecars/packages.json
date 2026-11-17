@@ -1,38 +1,38 @@
 {
   "schema_version": 1,
-  "source_repository": "https://github.com/mekenthompson/hermes-fleet",
+  "source_repository": "https://github.com/switchroom/switchroom",
   "require_digest_pin": true,
   "packages": {
     "rest-lock-proxy": {
-      "image": "ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy",
+      "image": "ghcr.io/switchroom/rest-lock-proxy",
       "context": "sidecars/rest-lock-proxy",
       "visibility": "public",
       "require_digest_pin": true,
       "status": "publishing"
     },
     "tcp-proxy": {
-      "image": "ghcr.io/mekenthompson/hermes-fleet-tcp-proxy",
+      "image": "ghcr.io/switchroom/tcp-proxy",
       "context": "sidecars/tcp-proxy",
       "visibility": "public",
       "require_digest_pin": true,
       "status": "publishing"
     },
     "browser-broker": {
-      "image": "ghcr.io/mekenthompson/hermes-fleet-browser-broker",
+      "image": "ghcr.io/switchroom/browser-broker",
       "context": "sidecars/browser-broker",
       "visibility": "public",
       "require_digest_pin": true,
       "status": "publishing"
     },
     "kokoro": {
-      "image": "ghcr.io/mekenthompson/hermes-fleet-kokoro",
+      "image": "ghcr.io/switchroom/kokoro",
       "context": "sidecars/kokoro",
       "visibility": "public",
       "require_digest_pin": true,
       "status": "publishing"
     },
     "camofox": {
-      "image": "ghcr.io/mekenthompson/hermes-fleet-camofox",
+      "image": "ghcr.io/switchroom/camofox",
       "context": "sidecars/camofox",
       "visibility": "public",
       "require_digest_pin": true,

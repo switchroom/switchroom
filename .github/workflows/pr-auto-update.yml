@@ -26,20 +26,20 @@ concurrency:
 jobs:
   update:
     name: Update auto-merge PRs that are behind main
-    if: github.repository == 'mekenthompson/hermes-fleet'
+    if: github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
     steps:
-      - name: Mint a release bot token scoped to hermes-fleet
+      - name: Mint a release bot token scoped to switchroom/switchroom
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           # GitHub accepts the numeric App ID as the JWT issuer wherever a client ID is expected.
           client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
-          owner: mekenthompson
-          repositories: hermes-fleet
+          owner: switchroom
+          repositories: switchroom
           permission-contents: write
           permission-pull-requests: write
           # Lets update-branch merge main into a PR when that brings in .github/workflows changes.

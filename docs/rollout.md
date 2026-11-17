@@ -14,13 +14,13 @@ Run it on the Docker host, from outside any agent container. Pass the same proje
 # See the plan. Read-only: inspects containers, prints the order, writes nothing.
 python3 scripts/switchroom-rollout.py \
   --project my-fleet --file compose.yaml \
-  --image ghcr.io/mekenthompson/hermes-fleet-public@sha256:<64 hex> \
+  --image ghcr.io/switchroom/switchroom@sha256:<64 hex> \
   --controller operator --dry-run
 
 # Roll for real and keep a report.
 python3 scripts/switchroom-rollout.py \
   --project my-fleet --file compose.yaml \
-  --image ghcr.io/mekenthompson/hermes-fleet-public@sha256:<64 hex> \
+  --image ghcr.io/switchroom/switchroom@sha256:<64 hex> \
   --controller operator --report rollout-report.json
 ```
 

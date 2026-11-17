@@ -1,7 +1,7 @@
 # Example only. Decrypts the newest backup of one agent into scratch and verifies it.
 [Unit]
 Description=Restore check of the newest Switchroom volume backup for agent %i
-Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/volume-backup.md
+Documentation=https://github.com/switchroom/switchroom/blob/main/docs/volume-backup.md
 After=local-fs.target network-online.target
 # RequiresMountsFor=/mnt/switchroom-backup
 

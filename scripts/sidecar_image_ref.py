@@ -10,6 +10,13 @@ from image_ref import require_digest_reference
 
 ALLOWED_REPOSITORIES = frozenset(
     {
+        "ghcr.io/switchroom/rest-lock-proxy",
+        "ghcr.io/switchroom/tcp-proxy",
+        "ghcr.io/switchroom/browser-broker",
+        "ghcr.io/switchroom/kokoro",
+        "ghcr.io/switchroom/camofox",
+        # Digests published before the repository moved to switchroom/switchroom
+        # stay valid: running deployments are pinned to them by digest.
         "ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy",
         "ghcr.io/mekenthompson/hermes-fleet-tcp-proxy",
         "ghcr.io/mekenthompson/hermes-fleet-browser-broker",
@@ -27,6 +34,6 @@ def require_sidecar_image(value: str) -> str:
     repository = pinned.split("@", 1)[0]
     if repository not in ALLOWED_REPOSITORIES:
         raise ValueError(
-            "sidecar image must be one of the public hermes-fleet-* packages at a digest"
+            "sidecar image must be one of the public Switchroom sidecar packages at a digest"
         )
     return pinned

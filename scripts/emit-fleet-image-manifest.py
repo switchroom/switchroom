@@ -48,7 +48,7 @@ def main() -> int:
     if agent_data.get("immutable_ref") != agent["immutable_ref"]:
         raise SystemExit("Agent immutable_ref mismatch")
     fleet = image_identity(args.repository, args.revision, args.digest)
-    fleet["source_repository"] = "https://github.com/mekenthompson/hermes-fleet"
+    fleet["source_repository"] = "https://github.com/switchroom/switchroom"
     manifest = {
         "schema_version": 1,
         "agent": agent,

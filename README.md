@@ -43,7 +43,7 @@ North Star is **trusted unsupervised turns**: work the principal did not sit thr
 
 **A reviewed default set, on by default, opt out per agent.** What the reference deployment runs daily (Claude Subscription DirectSDK as the default model path, Claude ACP connectors, Linear, voice, Honcho memory, web search and the working doctrine config) becomes the default, and anything outside that list stays off. Plugin source stays mounted read-only, not baked into the image. A default with a missing credential turns itself off and says so in a setup check instead of blocking startup, and no default adds a model or paid path you did not grant. The starter overlay in [`examples/overlay-repo/`](examples/overlay-repo/) turns them on. The bare image still turns nothing on. A default is `shipped` in [`contracts/plugins.json`](contracts/plugins.json) only after it was proven in real containers ([`docs/starter-overlay-acceptance.md`](docs/starter-overlay-acceptance.md)); the rest stay `planned`. Decision: [`reference/rfcs/default-on-distribution.md`](reference/rfcs/default-on-distribution.md).
 
-**Digest or it did not happen.** Consume `ghcr.io/mekenthompson/hermes-fleet-public@sha256:<digest>`. Mutable tags are not a supported interface. Built, published, and deployed are different claims. A green unit run is not publication. Publication is not a production rollout.
+**Digest or it did not happen.** Consume `ghcr.io/switchroom/switchroom@sha256:<digest>`. Mutable tags are not a supported interface. Built, published, and deployed are different claims. A green unit run is not publication. Publication is not a production rollout.
 
 **Identity stays in the overlay.** This repository has synthetic examples. Household names, bot tokens, vault URIs, OAuth state, and live compose do not belong here. `scripts/verify-public-tree.py` fail-closes on the obvious cases. It is a shape check, not a secret scanner.
 
@@ -103,7 +103,7 @@ Optional overlay binary that gates extra installs. Disabled until the overlay wi
 Hermes Agent image  (exact digest)
         |
         v
-Switchroom child image  (this repo, hermes-fleet)
+Switchroom child image  (this repo, switchroom/switchroom)
         |
         +-- profile A container + state volume + workspace + network
         +-- profile B container + state volume + workspace + network
@@ -114,7 +114,7 @@ Sidecar source lives under `sidecars/`. Each sidecar publishes its own GHCR imag
 
 ## What's in the image
 
-The published child, `ghcr.io/mekenthompson/hermes-fleet-public`, is a digest-pinned child of an exact Hermes Agent image. It currently bundles:
+The published child, `ghcr.io/switchroom/switchroom`, is a digest-pinned child of an exact Hermes Agent image. It currently bundles:
 
 - UID/GID 1000 for the `hermes` account so profile containers can start with no-new-privileges
 - GitHub CLI 2.104.0 from the official release tarball
@@ -127,7 +127,7 @@ The published child, `ghcr.io/mekenthompson/hermes-fleet-public`, is a digest-pi
 Consume it only as:
 
 ```text
-ghcr.io/mekenthompson/hermes-fleet-public@sha256:<digest>
+ghcr.io/switchroom/switchroom@sha256:<digest>
 ```
 
 ## What's not in this repository

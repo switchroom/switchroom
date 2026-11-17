@@ -105,7 +105,8 @@ class PublicProductTests(unittest.TestCase):
         self.assertIn(
             remote_url,
             {
-                "https://github.com/mekenthompson/hermes-fleet-public.git",
+                "https://github.com/switchroom/switchroom.git",
+                # Clones made before the move keep the redirecting legacy URL.
                 "https://github.com/mekenthompson/hermes-fleet.git",
             },
         )
@@ -113,7 +114,7 @@ class PublicProductTests(unittest.TestCase):
     def test_dockerfile_is_a_minimal_digest_parameterized_child(self) -> None:
         text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
-            'org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet"',
+            'org.opencontainers.image.source="https://github.com/switchroom/switchroom"',
             text,
         )
         op_image = (

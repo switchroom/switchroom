@@ -3,7 +3,7 @@
 # Nothing runs until you install this file and enable the matching timer.
 [Unit]
 Description=Encrypted volume backup of Switchroom agent %i
-Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/volume-backup.md
+Documentation=https://github.com/switchroom/switchroom/blob/main/docs/volume-backup.md
 After=local-fs.target network-online.target
 Wants=network-online.target
 # Uncomment and set to your destination mount so a missing mount fails fast:

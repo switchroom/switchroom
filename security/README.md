@@ -84,7 +84,7 @@ source-mounted prototype alone is not deployment acceptance.
 
 The original reviewed implementation is commit
 `68583c9a82761469282dcbbefeab68aa8f813e6d` in
-[PR #244](https://github.com/mekenthompson/hermes-fleet/pull/244), authored by
+[PR #244](https://github.com/switchroom/switchroom/pull/244), authored by
 Ken Thompson with GPT-6 Astra; independent source/security review used GPT-6 Luna.
 The squash commit retained the policy bytes but escaped the intended co-author
 trailer as literal text. This record preserves attribution without rewriting

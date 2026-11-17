@@ -27,7 +27,7 @@ jobs:
       && github.event.workflow_run.event == 'push'
       && github.event.workflow_run.head_branch == 'main'
       && github.event.workflow_run.head_repository.full_name == github.repository
-      && github.repository == 'mekenthompson/hermes-fleet'
+      && github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -3,7 +3,7 @@
 # (docs/monitors.md). Nothing runs until you install this and enable the timer.
 [Unit]
 Description=Switchroom agent ownership audit (report-only)
-Documentation=https://github.com/mekenthompson/hermes-fleet/blob/main/docs/monitors.md
+Documentation=https://github.com/switchroom/switchroom/blob/main/docs/monitors.md
 
 [Service]
 Type=oneshot

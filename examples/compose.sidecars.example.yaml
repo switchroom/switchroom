@@ -3,7 +3,7 @@
 
 services:
   example-rest-lock:
-    image: ${HERMES_FLEET_REST_LOCK_PROXY_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256 digest}
+    image: ${HERMES_FLEET_REST_LOCK_PROXY_IMAGE:?Set a reviewed ghcr.io/switchroom/rest-lock-proxy@sha256 digest}
     user: "65532:65532"
     read_only: true
     environment:
@@ -13,14 +13,14 @@ services:
     tmpfs:
       - /tmp
   example-tcp-proxy:
-    image: ${HERMES_FLEET_TCP_PROXY_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-tcp-proxy@sha256 digest}
+    image: ${HERMES_FLEET_TCP_PROXY_IMAGE:?Set a reviewed ghcr.io/switchroom/tcp-proxy@sha256 digest}
     user: "65534:65534"
     read_only: true
     environment:
       LISTEN_PORT: "6080"
       TARGET: "example-browser:6080"
   example-browser-broker:
-    image: ${HERMES_FLEET_BROWSER_BROKER_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-browser-broker@sha256 digest}
+    image: ${HERMES_FLEET_BROWSER_BROKER_IMAGE:?Set a reviewed ghcr.io/switchroom/browser-broker@sha256 digest}
     user: "65532:65532"
     read_only: true
     environment:
@@ -31,12 +31,12 @@ services:
       BROKER_PORT: "9131"
       ADMIN_PORT: "9134"
   example-kokoro:
-    image: ${HERMES_FLEET_KOKORO_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-kokoro@sha256 digest}
+    image: ${HERMES_FLEET_KOKORO_IMAGE:?Set a reviewed ghcr.io/switchroom/kokoro@sha256 digest}
     user: "65532:65532"
     environment:
       VOICE_BIND: "0.0.0.0"
       VOICE_PORT: "8126"
   example-camofox:
-    image: ${HERMES_FLEET_CAMOFOX_IMAGE:?Set a reviewed ghcr.io/mekenthompson/hermes-fleet-camofox@sha256 digest}
+    image: ${HERMES_FLEET_CAMOFOX_IMAGE:?Set a reviewed ghcr.io/switchroom/camofox@sha256 digest}
     environment:
       CAMOFOX_BIND_HOST: "0.0.0.0"
