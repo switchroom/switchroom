@@ -150,7 +150,8 @@ class BrowserBrokerPublicTests(unittest.TestCase):
             "KEN-",
         )
         for path in root.rglob("*"):
-            if not path.is_file():
+            # CI writes __pycache__ beside sources; bytecode embeds the checkout path.
+            if not path.is_file() or "__pycache__" in path.parts:
                 continue
             # The OCI source label names the public product repository; nothing else may.
             text = path.read_text(encoding="utf-8", errors="ignore").replace(PUBLIC_SOURCE_URL, "")
@@ -597,7 +598,8 @@ class KokoroPublicTests(unittest.TestCase):
         )
         root = ROOT / "sidecars/kokoro"
         for path in sorted(root.rglob("*")):
-            if not path.is_file():
+            # CI writes __pycache__ beside sources; bytecode embeds the checkout path.
+            if not path.is_file() or "__pycache__" in path.parts:
                 continue
             # The OCI source label names the public product repository; nothing else may.
             text = path.read_text(encoding="utf-8", errors="ignore").lower().replace(PUBLIC_SOURCE_URL, "")
