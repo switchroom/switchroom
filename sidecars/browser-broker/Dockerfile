@@ -4,7 +4,7 @@ FROM python:3.13.15-alpine3.24@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1a
 ARG VCS_REF
 LABEL org.opencontainers.image.title="hermes-fleet-browser-broker" \
       org.opencontainers.image.description="Canonical agent-isolated browser handoff broker" \
-      org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet" \
+      org.opencontainers.image.source="https://github.com/switchroom/switchroom" \
       org.opencontainers.image.revision="$VCS_REF"
 
 WORKDIR /

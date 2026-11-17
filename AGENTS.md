@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Instructions for humans and coding agents working in `mekenthompson/hermes-fleet`.
+Instructions for humans and coding agents working in `switchroom/switchroom`.
 
 This is the **public** Hermes Fleet distribution. It owns generic implementation, the opinionated Fleet child image, independent sidecar source, and public GHCR publication. Deployment overlays, identities, and private binaries live elsewhere.
 

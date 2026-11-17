@@ -4,7 +4,7 @@
     {
       "name": "hermes-fleet",
       "path": "vendor/hermes-fleet",
-      "repository": "https://github.com/mekenthompson/hermes-fleet.git",
+      "repository": "https://github.com/switchroom/switchroom.git",
       "commit": "image_revision",
       "license": "MIT",
       "provides": [

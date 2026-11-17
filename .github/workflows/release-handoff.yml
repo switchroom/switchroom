@@ -36,7 +36,7 @@ jobs:
       && github.event.workflow_run.event != 'pull_request'
       && github.event.workflow_run.head_branch == 'main'
       && github.event.workflow_run.head_repository.full_name == github.repository
-      && github.repository == 'mekenthompson/hermes-fleet'
+      && github.repository == 'switchroom/switchroom'
     permissions:
       actions: read
       contents: read
@@ -87,7 +87,7 @@ jobs:
               sys.exit(f"workflow_run head_sha {expected!r} is not a commit SHA")
           if revision != expected:
               sys.exit(f"handoff fleet.revision {revision!r} != published head_sha {expected}")
-          if fleet.get("source_repository") != "https://github.com/mekenthompson/hermes-fleet":
+          if fleet.get("source_repository") != "https://github.com/switchroom/switchroom":
               sys.exit(f"handoff fleet.source_repository {fleet.get('source_repository')!r} is not this repository")
           print(f"handoff bound to Fleet {expected}: {fleet.get('immutable_ref')}")
           PY

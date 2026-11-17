@@ -170,7 +170,7 @@ class ScopedWorkflowTests(unittest.TestCase):
                 condition = job["if"]
                 self.assertTrue(condition.startswith("!cancelled() &&"), condition)
                 self.assertIn("(needs.scope.outputs.image == 'true' || needs.scope.result == 'failure')", condition)
-                self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", condition)
+                self.assertIn("github.repository == 'switchroom/switchroom'", condition)
         self.assertIn("github.ref == 'refs/heads/main'", self.jobs["publish"]["if"])
         self.assertNotIn("paths:", self.text.split("jobs:", 1)[0])
         self.assertNotIn("paths-ignore:", self.text)
@@ -227,7 +227,7 @@ class ScopedWorkflowTests(unittest.TestCase):
                 "needs.scope.result": scope_result,
                 "github.event.inputs.publish": publish,
                 "github.event_name": event,
-                "github.repository": "mekenthompson/hermes-fleet",
+                "github.repository": "switchroom/switchroom",
                 "github.ref": "refs/heads/main",
             }
             condition = condition.replace("!cancelled()", str(not cancelled))

@@ -39,7 +39,7 @@ FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c040
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="hermes-fleet-kokoro" \
       org.opencontainers.image.description="Hermes local GPU speech sidecar (faster-whisper STT + Kokoro TTS)" \
-      org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet" \
+      org.opencontainers.image.source="https://github.com/switchroom/switchroom" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="Hermes Fleet"

@@ -14,17 +14,18 @@ from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PUBLIC_SOURCE_URL = "https://github.com/switchroom/switchroom"
 CONTRACT = ROOT / "sidecars/packages.json"
 IMAGE_REF = ROOT / "scripts/sidecar_image_ref.py"
 SCOPE = ROOT / "scripts/fleet-image-change-scope.py"
 FLEET_WORKFLOW = ROOT / ".github/workflows/fleet-image.yml"
 
 PUBLIC_PACKAGES = {
-    "rest-lock-proxy": "ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy",
-    "tcp-proxy": "ghcr.io/mekenthompson/hermes-fleet-tcp-proxy",
-    "browser-broker": "ghcr.io/mekenthompson/hermes-fleet-browser-broker",
-    "kokoro": "ghcr.io/mekenthompson/hermes-fleet-kokoro",
-    "camofox": "ghcr.io/mekenthompson/hermes-fleet-camofox",
+    "rest-lock-proxy": "ghcr.io/switchroom/rest-lock-proxy",
+    "tcp-proxy": "ghcr.io/switchroom/tcp-proxy",
+    "browser-broker": "ghcr.io/switchroom/browser-broker",
+    "kokoro": "ghcr.io/switchroom/kokoro",
+    "camofox": "ghcr.io/switchroom/camofox",
 }
 
 RETIRED_PRIVATE_PACKAGES = (
@@ -82,7 +83,7 @@ class SidecarContractTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(
             payload["source_repository"],
-            "https://github.com/mekenthompson/hermes-fleet",
+            "https://github.com/switchroom/switchroom",
         )
         packages = payload["packages"]
         for key, image in PUBLIC_PACKAGES.items():
@@ -111,7 +112,7 @@ class SidecarContractTests(unittest.TestCase):
             dockerfile = ROOT / "sidecars" / name / "Dockerfile"
             with self.subTest(name=name):
                 text = dockerfile.read_text(encoding="utf-8")
-                self.assertIn("org.opencontainers.image.source=\"https://github.com/mekenthompson/hermes-fleet\"", text)
+                self.assertIn("org.opencontainers.image.source=\"https://github.com/switchroom/switchroom\"", text)
                 self.assertIn(f"org.opencontainers.image.title=\"hermes-fleet-{name}\"", text)
                 self.assertNotIn("hermes-fleet-private", text)
                 self.assertNotIn("KEN-", text)
@@ -125,7 +126,7 @@ class BrowserBrokerPublicTests(unittest.TestCase):
         self.assertTrue(dockerfile.is_file(), dockerfile)
         text = dockerfile.read_text(encoding="utf-8")
         self.assertIn(
-            'org.opencontainers.image.source="https://github.com/mekenthompson/hermes-fleet"',
+            'org.opencontainers.image.source="https://github.com/switchroom/switchroom"',
             text,
         )
         self.assertIn('org.opencontainers.image.title="hermes-fleet-browser-broker"', text)
@@ -151,7 +152,8 @@ class BrowserBrokerPublicTests(unittest.TestCase):
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            # The OCI source label names the public product repository; nothing else may.
+            text = path.read_text(encoding="utf-8", errors="ignore").replace(PUBLIC_SOURCE_URL, "")
             lowered = text.lower()
             for ident in prohibited:
                 with self.subTest(path=str(path.relative_to(ROOT)), ident=ident):
@@ -447,8 +449,8 @@ class BrowserBrokerPublicTests(unittest.TestCase):
         path = ROOT / ".github/workflows/sidecar-browser-broker.yml"
         self.assertTrue(path.is_file(), path)
         text = path.read_text(encoding="utf-8")
-        self.assertIn("ghcr.io/mekenthompson/hermes-fleet-browser-broker", text)
-        self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", text)
+        self.assertIn("ghcr.io/switchroom/browser-broker", text)
+        self.assertIn("github.repository == 'switchroom/switchroom'", text)
         self.assertNotIn("hermes-fleet-private", text)
         self.assertNotIn("ghcr.io/mekenthompson/hermes-browser-broker", text)
         self.assertIn("sidecars/browser-broker/**", text)
@@ -463,13 +465,17 @@ class SidecarImageRefTests(unittest.TestCase):
         cls.ref = load(IMAGE_REF, "sidecar_image_ref")
 
     def test_accepts_digest_pin_for_allowed_public_package(self) -> None:
+        value = f"ghcr.io/switchroom/rest-lock-proxy@sha256:{DIGEST}"
+        self.assertEqual(self.ref.require_sidecar_image(value), value)
+
+    def test_accepts_digest_pin_for_legacy_package_name(self) -> None:
         value = f"ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy@sha256:{DIGEST}"
         self.assertEqual(self.ref.require_sidecar_image(value), value)
 
     def test_rejects_mutable_tag(self) -> None:
         with self.assertRaises(ValueError):
             self.ref.require_sidecar_image(
-                "ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy:latest"
+                "ghcr.io/switchroom/rest-lock-proxy:latest"
             )
 
     def test_rejects_unprefixed_private_package_even_with_digest(self) -> None:
@@ -481,7 +487,7 @@ class SidecarImageRefTests(unittest.TestCase):
     def test_rejects_agent_child_package(self) -> None:
         with self.assertRaises(ValueError):
             self.ref.require_sidecar_image(
-                f"ghcr.io/mekenthompson/hermes-fleet-public@sha256:{DIGEST}"
+                f"ghcr.io/switchroom/switchroom@sha256:{DIGEST}"
             )
 
 
@@ -526,8 +532,8 @@ class SidecarScopeIsolationTests(unittest.TestCase):
         for name, path in mapping.items():
             text = path.read_text(encoding="utf-8")
             with self.subTest(name=name):
-                self.assertIn(f"ghcr.io/mekenthompson/hermes-fleet-{name}", text)
-                self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", text)
+                self.assertIn(f"ghcr.io/switchroom/{name}", text)
+                self.assertIn("github.repository == 'switchroom/switchroom'", text)
                 self.assertNotIn("hermes-fleet-private", text)
                 self.assertNotIn(f"ghcr.io/mekenthompson/hermes-{name}", text)
                 self.assertIn(f"sidecars/{name}/**", text)
@@ -593,7 +599,8 @@ class KokoroPublicTests(unittest.TestCase):
         for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+            # The OCI source label names the public product repository; nothing else may.
+            text = path.read_text(encoding="utf-8", errors="ignore").lower().replace(PUBLIC_SOURCE_URL, "")
             for needle in prohibited:
                 with self.subTest(path=str(path.relative_to(ROOT)), needle=needle):
                     self.assertNotIn(needle.lower(), text)
@@ -687,9 +694,9 @@ class CamofoxPublicTests(unittest.TestCase):
     def test_docs_and_example_require_reviewed_digest(self) -> None:
         docs = (ROOT / "docs/sidecars.md").read_text(encoding="utf-8")
         example = (ROOT / "examples/compose.sidecars.example.yaml").read_text(encoding="utf-8")
-        self.assertIn("`ghcr.io/mekenthompson/hermes-fleet-camofox` | publishing", docs)
+        self.assertIn("`ghcr.io/switchroom/camofox` | publishing", docs)
         self.assertIn("HERMES_FLEET_CAMOFOX_IMAGE", example)
-        self.assertIn("ghcr.io/mekenthompson/hermes-fleet-camofox@sha256", example)
+        self.assertIn("ghcr.io/switchroom/camofox@sha256", example)
 
 
 class RestLockBehaviorTests(unittest.TestCase):

@@ -149,7 +149,7 @@ class VoiceContractGuardTests(unittest.TestCase):
     def test_docs_say_the_cpu_server_has_no_transcription_and_keep_the_gpu_variant(self) -> None:
         sidecars = (ROOT / "docs" / "sidecars.md").read_text(encoding="utf-8")
         self.assertIn("has no transcription", sidecars)
-        self.assertIn("ghcr.io/mekenthompson/hermes-fleet-kokoro", sidecars)
+        self.assertIn("ghcr.io/switchroom/kokoro", sidecars)
         self.assertIn("the option for local transcription", sidecars)
         self.assertIn("configured and answers", sidecars)
 

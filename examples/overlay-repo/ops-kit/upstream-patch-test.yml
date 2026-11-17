@@ -1,7 +1,7 @@
 # Opt-in template. Copy to .github/workflows/upstream-patch-test.yml in your
 # overlay repository to re-apply patches/series.json on the latest Hermes Agent
 # upstream every day. Set the repository variable SWITCHROOM_FLEET_REVISION to
-# the full commit of mekenthompson/hermes-fleet whose script you trust (the
+# the full commit of switchroom/switchroom whose script you trust (the
 # revision of the image you run is a good choice).
 #
 # Read-only by construction: the token can only read this repository, no
@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          repository: mekenthompson/hermes-fleet
+          repository: switchroom/switchroom
           ref: ${{ vars.SWITCHROOM_FLEET_REVISION }}
           path: .switchroom-fleet
           persist-credentials: false

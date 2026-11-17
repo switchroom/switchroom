@@ -28,7 +28,7 @@ class PrAutoUpdateWorkflowTests(unittest.TestCase):
         self.assertRegex(on, r'cron: "\*/(5|10|15) \* \* \* \*"')
         for trigger in ("pull_request", "pull_request_target", "workflow_run:"):
             self.assertNotIn(trigger, on)
-        self.assertIn("if: github.repository == 'mekenthompson/hermes-fleet'", self.text)
+        self.assertIn("if: github.repository == 'switchroom/switchroom'", self.text)
 
     def test_one_sweep_at_a_time(self) -> None:
         self.assertIn("concurrency:\n", self.text)
@@ -47,13 +47,13 @@ class PrAutoUpdateWorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/checkout", self.text)
 
     def test_app_token_is_this_repository_only_with_least_privilege(self) -> None:
-        mint = step(self.text, "Mint a release bot token scoped to hermes-fleet")
+        mint = step(self.text, "Mint a release bot token scoped to switchroom/switchroom")
         self.assertIn("id: app-token", mint)
         self.assertRegex(mint, r"uses: actions/create-github-app-token@[0-9a-f]{40}")
         self.assertIn("client-id: ${{ vars.RELEASE_BOT_APP_ID }}", mint)
         self.assertIn("private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}", mint)
-        self.assertIn("owner: mekenthompson", mint)
-        self.assertIn("repositories: hermes-fleet\n", mint)
+        self.assertIn("owner: switchroom", mint)
+        self.assertIn("repositories: switchroom\n", mint)
         self.assertNotIn("hermes-fleet-private", mint)
         self.assertIn("permission-contents: write", mint)
         self.assertIn("permission-pull-requests: write", mint)

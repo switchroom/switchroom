@@ -193,6 +193,7 @@ class KokoroCpuSidecarTests(unittest.TestCase):
 
     def test_gpu_variant_stays_documented(self) -> None:
         self.assertIn("GPU variant (optional)", self.text)
+        # The reviewed GPU digest was published before the move, under the legacy name.
         self.assertIn("ghcr.io/mekenthompson/hermes-fleet-kokoro@sha256:", self.text)
         docs = (ROOT / "docs" / "sidecars.md").read_text(encoding="utf-8")
         self.assertIn("kokoro-fastapi-cpu", docs)

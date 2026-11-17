@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+PUBLIC_SOURCE_URL = "https://github.com/switchroom/switchroom"
 DOCKERFILE = ROOT / "Dockerfile"
 PACKAGE = ROOT / "package.json"
 PLUGINS_CONTRACT = ROOT / "contracts" / "plugins.json"
@@ -78,7 +79,8 @@ class PublicFattenContractTests(unittest.TestCase):
         self.assertIn("5c7d24b32d275bce38daedbe81feaebc31393587", text)
         self.assertIn("62193f2f98d8ae53b4fd7aab4162d312a918f27cdb214b1d7146884812c7b2d0", text)
         self.assertIn("/opt/hermes/plugins/memory/honcho", text)
-        lowered = text.lower()
+        # The OCI source label names the public product repository; nothing else may.
+        lowered = text.lower().replace(PUBLIC_SOURCE_URL, "")
         for token in ("workspace_id", "switchroom", "kenthompson.com.au"):
             self.assertNotIn(token, lowered)
 

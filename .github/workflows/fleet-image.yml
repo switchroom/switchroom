@@ -22,8 +22,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-public
-  TEST_IMAGE: ghcr.io/mekenthompson/hermes-fleet-public:sha-${{ github.sha }}
+  IMAGE_REPOSITORY: ghcr.io/switchroom/switchroom
+  TEST_IMAGE: ghcr.io/switchroom/switchroom:sha-${{ github.sha }}
   ONEPASSWORD_CLI_IMAGE: docker.io/1password/op@sha256:b0d7eebcb09bdc9d5862af91533e1851c968d4f969270c906f5da8c574f87e93
   CLAUDE_CODE_VERSION: "2.1.323"
   CLAUDE_AGENT_ACP_VERSION: "0.106.0"
@@ -46,8 +46,7 @@ jobs:
     # Manual dispatches and any range git cannot resolve (new branch, force push) fail open to
     # "run"; see scripts/fleet-image-change-scope.py.
     if: >-
-      github.repository == 'mekenthompson/hermes-fleet-public' ||
-      github.repository == 'mekenthompson/hermes-fleet'
+      github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -84,8 +83,7 @@ jobs:
       (needs.scope.outputs.image == 'true' || needs.scope.result == 'failure') &&
       (github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
-      (github.repository == 'mekenthompson/hermes-fleet-public' ||
-      github.repository == 'mekenthompson/hermes-fleet')
+      github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -401,8 +399,7 @@ jobs:
       always() &&
       (github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish != 'true')) &&
-      (github.repository == 'mekenthompson/hermes-fleet-public' ||
-      github.repository == 'mekenthompson/hermes-fleet')
+      github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -449,8 +446,7 @@ jobs:
     if: >-
       !cancelled() &&
       (needs.scope.outputs.image == 'true' || needs.scope.result == 'failure') &&
-      (github.repository == 'mekenthompson/hermes-fleet-public' ||
-      github.repository == 'mekenthompson/hermes-fleet') &&
+      github.repository == 'switchroom/switchroom' &&
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))

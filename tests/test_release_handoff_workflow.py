@@ -46,7 +46,7 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertIn("github.event.workflow_run.head_branch == 'main'", header)
         self.assertIn("github.event.workflow_run.event != 'pull_request'", header)
         self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", header)
-        self.assertIn("github.repository == 'mekenthompson/hermes-fleet'", header)
+        self.assertIn("github.repository == 'switchroom/switchroom'", header)
         self.assertIn("group: release-handoff-stage-a", self.text)
         self.assertIn("cancel-in-progress: false", self.text)
 
@@ -62,7 +62,7 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         bind = step(self.text, "Bind the handoff to the published head_sha")
         self.assertIn('if revision != expected:', bind)
         self.assertIn('os.environ["FLEET_SHA"]', bind)
-        self.assertIn("https://github.com/mekenthompson/hermes-fleet", bind)
+        self.assertIn("https://github.com/switchroom/switchroom", bind)
         # github.sha is main's HEAD under workflow_run, never the published commit: it must not be used.
         self.assertNotIn("github.sha", self.text)
         self.assertNotIn("github.ref", self.text)

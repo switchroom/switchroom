@@ -20,12 +20,12 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  IMAGE_REPOSITORY: ghcr.io/mekenthompson/hermes-fleet-camofox
+  IMAGE_REPOSITORY: ghcr.io/switchroom/camofox
   CAMOFOX_COMMIT: 39c82094013480b373df6600d44c7f036f58356e
 
 jobs:
   test:
-    if: github.repository == 'mekenthompson/hermes-fleet'
+    if: github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -38,7 +38,7 @@ jobs:
 
   bake:
     needs: test
-    if: github.repository == 'mekenthompson/hermes-fleet'
+    if: github.repository == 'switchroom/switchroom'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
