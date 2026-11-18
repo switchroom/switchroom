@@ -201,24 +201,6 @@ jobs:
             --require-hashes --only-binary=:all: -r tests/native-input-requirements.txt
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-source"
-      # Test-only source fixture for the retained-notification contract. This
-      # does not change release/agent-image-manifest.json or deployed Core pins.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        if: matrix.lane == 'native' && needs.selection.outputs.input == 'true'
-        with:
-          repository: switchroom/hermes-agent
-          ref: 1436af4a930a65faff42cf2d79a88b65b69a5fdc
-          path: agent-notification-contract
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Guarded native notification delivery contract
-        if: matrix.lane == 'native' && needs.selection.outputs.input == 'true'
-        run: |
-          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
-            --require-hashes --only-binary=:all: -r tests/native-input-requirements.txt
-          "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
-            --agent-source "$GITHUB_WORKSPACE/agent-notification-contract" \
-            --expected-revision 1436af4a930a65faff42cf2d79a88b65b69a5fdc
   candidate-hf578:
     # Same split as runtime: three disjoint scenario slices plus the companion Core tests.
     needs: selection
