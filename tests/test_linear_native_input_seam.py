@@ -246,16 +246,16 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             return db.execute("SELECT profile,payload,status,attempts FROM deliveries WHERE delivery_id=?", (identity,)).fetchone()
 
     def rows(self):
-        from hermes_state_runtime import list_session_admissions
+        from linear_native_db import list_session_admissions
         return [row for sid in self.authority.sessions
-                for row in list_session_admissions(self.authority.db, session_id=sid, pending_only=False)]
+                for row in list_session_admissions(self.authority.persistence, session_id=sid, pending_only=False)]
 
     def enable_owned_worker(self, task_id):
         """Only the finite model endpoint is fake; claim/drain/steer stay native."""
         from gateway.session_authority import SessionAuthority
         from gateway.session_results import execution_result
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import get_session_admission
+        from linear_native_db import get_session_admission
         fixture = self
         self.workers = []
         self.worker_started = asyncio.Event()
@@ -296,7 +296,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                 endpoint.wake.clear()
                 while endpoint.instructions:
                     ticket = endpoint.instructions.pop(0)
-                    instruction = get_session_admission(self.authority.db, admission_id=ticket)
+                    instruction = get_session_admission(self.authority.persistence, admission_id=ticket)
                     timestamp = datetime.fromisoformat(instruction["payload"]["native_text_v1"]["timestamp"]).timestamp() * 1000
                     await asyncio.to_thread(self.bridge.followup, self.ISSUE,
                         instruction["payload"]["text"], instruction["request_id"], source_ms=timestamp)

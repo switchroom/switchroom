@@ -57,23 +57,21 @@ def reference(value: Any) -> dict:
 def _projection(home: Path, profile: str, current: dict, declared: dict,
                 context: WorkContext | None) -> tuple[dict, str]:
     """Coordinates come ONLY from the owner's saved policy. No file snapshots or raw DB reads."""
-    from hermes_state import SessionDB
-    from hermes_state_local import local_receipt
-    from hermes_state_runtime import get_session_admission
+    from . import native_store
+    from .native_store import local_receipt, local_identity
     from .origin_state import current_admission
     from gateway.session_policy import restore_policy
-    from hermes_state_keys import local_identity
     from hermes_cli.sqlite_safe_read import connect_tracked
     from hermes_cli.profiles import resolve_profile_env
     sid = current["session_id"]
-    with SessionDB(home / "state.db", read_only=True) as db:
+    with native_store.reader(home) as db:
         saved = local_receipt(db, sid)
         policy = restore_policy(saved["policy"])
         if policy.source != "kanban" or not policy.kanban_json or saved["profile_id"] != str(home):
             _refuse()
         frozen = native_json_object(policy.kanban_json)
         requested = native_json_object(policy.request_json)
-        row = get_session_admission(db, admission_id=current["admission_id"])
+        row = native_store.get_admission(db, current["admission_id"])
         header = current_admission(row)
         if header != current["admission_header"]:
             _refuse()

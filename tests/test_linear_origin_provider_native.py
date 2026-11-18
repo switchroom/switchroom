@@ -145,11 +145,11 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
         context = replace(transport.capture_context(), user_id="foreign")
         with self.assertRaises(transport.Unavailable):
             await asyncio.to_thread(origin.current, context, self.settings, api=self.api)
-        row = self.authority.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
+        row = self.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
                                          (self.admission,))
         payload = json.loads(row[0])
         payload["native_text_v1"]["event"]["structured_control"] = "stop"
-        self.authority.db._execute_write(lambda conn: conn.execute(
+        self.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
         with self.assertRaises(transport.Unavailable):
             await self.current()
@@ -157,7 +157,7 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_bot_automation_missing_actor_and_command_flags_cannot_supply_human_origin(self):
         await self.linear()
-        row = self.authority.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
+        row = self.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
                                          (self.admission,))
         original = json.loads(row[0])
         self.provider.requests.clear()
@@ -168,7 +168,7 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
         for change in cases:
             payload = json.loads(json.dumps(original))
             change(payload)
-            self.authority.db._execute_write(lambda conn: conn.execute(
+            self.db._execute_write(lambda conn: conn.execute(
                 "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
             with self.subTest(change=change), self.assertRaises(transport.Unavailable):
                 await self.current()
@@ -176,12 +176,12 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_original_provider_id_needs_verification_without_inventing_one(self):
         await self.linear()
-        row = self.authority.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
+        row = self.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
                                          (self.admission,))
         payload = json.loads(row[0])
         payload["native_text_v1"]["event"]["message_id"] = None
         payload["native_text_v1"]["source"].pop("message_id")
-        self.authority.db._execute_write(lambda conn: conn.execute(
+        self.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
         self.provider.requests.clear()
         result = await self.current()

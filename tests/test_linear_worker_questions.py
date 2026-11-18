@@ -206,7 +206,7 @@ class WorkerQuestions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([strip_recommended(choice) for choice in pending.choices], ['Blue', 'Green'])
         self.assertEqual(pending.producer['session_id'], ref.session_id)
         from gateway.session_kanban_prompts import require_consumer
-        from hermes_state_runtime import RuntimeStoreError
+        from linear_native_db import RuntimeStoreError
         fixture.fixture.allowed.remove(fixture.USER)
         with self.assertRaises(RuntimeStoreError):
             await require_consumer(fixture.authority, policy)

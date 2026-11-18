@@ -336,7 +336,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.inbox_row("first")[2] == "imported")
         final = queue_reply(self.bridge, self.ISSUE, self.SESSION, "first", "Finished first.")
         before = len(self.provider.mutations)
-        with patch("hermes_state_runtime.list_session_admissions", side_effect=OSError("fixture state unavailable")):
+        with patch("hermes_fleet_linear_plugin.native_store.list_admissions", side_effect=OSError("fixture state unavailable")):
             await asyncio.to_thread(self.bridge.flush, only_id=final)
         self.assertEqual(len(self.provider.mutations), before)
         self.assertEqual(self.bridge.store.outbox_row(final)["state"], "pending")
@@ -359,7 +359,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_unfinished_and_unresolved_admissions_cannot_publish_completion(self):
         from gateway.session_authority import SessionAuthority
         from hermes_fleet_linear_plugin.native_input import queue_reply
-        from hermes_state_runtime import list_session_admissions
+        from linear_native_db import list_session_admissions
         started, release = asyncio.Event(), asyncio.Event()
         self.addCleanup(release.set)
         async def model(event):
@@ -380,7 +380,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status):
                 held = queue_reply(self.bridge, self.ISSUE, self.SESSION, "first", "A later update " + status)
                 unresolved = {**actual, "status": status, "outcome": None}
-                with patch("hermes_state_runtime.list_session_admissions", return_value=[unresolved]):
+                with patch("hermes_fleet_linear_plugin.native_store.list_admissions", return_value=[unresolved]):
                     await asyncio.to_thread(self.bridge.flush, only_id=held)
                 self.assertEqual(len(self.provider.mutations), before)
                 self.assertEqual(self.bridge.store.outbox_row(held)["state"], "pending")

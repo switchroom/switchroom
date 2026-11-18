@@ -424,11 +424,12 @@ def verified_consumer_anchor(adapter, bridge, issue_id, session_id, expected):
         anchor = bridge.store.conversation_input(issue_id, session_id)
         return anchor["admission_id"] if anchor else None
     from gateway.session_authorities import authority_for_home, require_serving
-    from hermes_state_runtime import get_session_admission
+    from gateway.session_persistence import authority_persistence
+    from .native_store import get_admission
     runner = getattr(adapter._message_handler, "__self__", None) or adapter.gateway_runner
     authority = authority_for_home(runner, bridge.profile_home)
     require_serving(authority)
-    row = get_session_admission(authority.db, admission_id=expected)
+    row = get_admission(authority_persistence(authority), expected)
     envelope = (row or {}).get("payload", {}).get("native_text_v1", {})
     source = envelope.get("source", {})
     if (row is None or row["status"] == "unknown" or envelope.get("event", {}).get("structured_control")
@@ -443,7 +444,8 @@ def verified_consumer_anchor(adapter, bridge, issue_id, session_id, expected):
 def worker_prompt_state(adapter, bridge, prompt):
     from tools.clarify_gateway import get_pending
     from gateway.session_authorities import authority_for_home, require_serving
-    from hermes_state_runtime import get_session_admission
+    from gateway.session_persistence import authority_persistence
+    from .native_store import get_admission
     pending = get_pending(prompt.get("clarify_id"))
     if not _clarify_prompt_matches(prompt, pending):
         return False
@@ -453,7 +455,7 @@ def worker_prompt_state(adapter, bridge, prompt):
     runner = getattr(adapter._message_handler, "__self__", None) or adapter.gateway_runner
     authority = authority_for_home(runner, bridge.profile_home)
     require_serving(authority)
-    row = get_session_admission(authority.db, admission_id=producer["admission_id"])
+    row = get_admission(authority_persistence(authority), producer["admission_id"])
     live = authority.sessions.get(producer["session_id"])
     if live is None:
         return False
@@ -487,7 +489,8 @@ def committed_conversation_state(adapter, bridge, payload) -> dict:
     if runner is None:
         raise LinearError("Native conversation owner is unavailable")
     from gateway.session_authorities import authority_for_home, admission_owner, require_serving
-    from hermes_state_runtime import get_session_admission, list_session_admissions
+    from gateway.session_persistence import authority_persistence
+    from .native_store import get_admission, list_admissions
     try:
         authority = authority_for_home(runner, bridge.profile_home)
         if authority is None:
@@ -496,7 +499,7 @@ def committed_conversation_state(adapter, bridge, payload) -> dict:
         anchor = bridge.store.conversation_input(payload["issue_id"], payload["session_id"])
         targets, receipt = [], None
         if anchor:
-            receipt = get_session_admission(authority.db, admission_id=anchor["admission_id"])
+            receipt = get_admission(authority_persistence(authority), anchor["admission_id"])
             if receipt is None:
                 raise ValueError("native conversation receipt is unavailable")
             targets.append(receipt["target_session_id"])
@@ -524,7 +527,7 @@ def committed_conversation_state(adapter, bridge, payload) -> dict:
                 targets.append(target)  # The current route takes precedence over the older owner.
         live, latest, turn_live = False, None, None
         for target in targets:
-            rows = list_session_admissions(authority.db, session_id=target, pending_only=False)
+            rows = list_admissions(authority_persistence(authority), target, pending_only=False)
             if receipt and receipt["target_session_id"] == target and not any(
                     row["admission_id"] == receipt["admission_id"] for row in rows):
                 rows.append(receipt)  # Core's compacted terminal receipt remains canonical.

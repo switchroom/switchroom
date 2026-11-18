@@ -43,7 +43,7 @@ class Handoff(base.OriginScenarios):
         ``native_stop_getter`` keeps core's own ``process_stop_pending`` (the stop lock that
         ``record_process_stop`` writes) instead of the fixture's synthetic getter."""
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
+        from linear_native_db import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
         from hermes_fleet_linear_plugin.store import Store
         from gateway import session_ancillary
@@ -52,10 +52,10 @@ class Handoff(base.OriginScenarios):
             executor = "admission-worker:" + self.admission
             args = dict(epoch=self.authority.epoch, execution_id=executor, session_id=self.sid,
                         generation=self.row["generation"])
-            register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-handoff")
-            adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-handoff")
-            mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
-            settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+            register_worker_execution(self.db, **args, kind="compute", adoption_secret="fixture-handoff")
+            adopt_worker_execution(self.db, **args, adoption_secret="fixture-handoff")
+            mutate_worker_execution(self.db, **args, sequence=1, operation="execution.finish", payload={})
+            settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                                  generation=self.row["generation"], outcome="interrupted")
         with kb.write_txn(self.board):
             self.board.execute("UPDATE task_events SET payload=? WHERE kind='worker_bound' AND task_id=?",
@@ -73,7 +73,7 @@ class Handoff(base.OriginScenarios):
         if native_stop_getter:
             return
         getter = patch.object(session_ancillary, "process_stop_pending",
-            lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True)
+            lambda db, sid: db.state_meta.get("fixture.pending.stop." + sid), create=True)
         getter.start()
         self.addCleanup(getter.stop)
 
@@ -190,12 +190,12 @@ class Handoff(base.OriginScenarios):
     # -- HF-629: the stopped worker reports back after the gateway gave up on it ------------------
     def adopt_worker(self):
         """The card attempt's managed worker, registered and adopted by core as at spawn."""
-        from hermes_state_runtime import register_worker_execution, adopt_worker_execution
+        from linear_native_db import register_worker_execution, adopt_worker_execution
         self.executor = "admission-worker:" + self.admission
         args = dict(epoch=self.authority.epoch, execution_id=self.executor, session_id=self.sid,
                     generation=self.row["generation"])
-        register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-handoff")
-        adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-handoff")
+        register_worker_execution(self.db, **args, kind="compute", adoption_secret="fixture-handoff")
+        adopt_worker_execution(self.db, **args, adoption_secret="fixture-handoff")
 
     async def lose_worker(self):
         """Core's own "Managed worker lost: managed_worker_stopped" path once the worker missed
@@ -204,8 +204,8 @@ class Handoff(base.OriginScenarios):
         from gateway.session_kanban_stop import retain_failed_stop
         from gateway.session_managed_worker import _settle_lost
         from gateway.session_policy import restore_policy
-        from hermes_state_local import local_receipt
-        policy = restore_policy(local_receipt(self.authority.db, self.sid)["policy"])
+        from linear_native_db import local_receipt
+        policy = restore_policy(local_receipt(self.db, self.sid)["policy"])
         await retain_failed_stop(self.authority, self.ref, self.row, policy)
         await _settle_lost(self.authority, self.row, {"epoch": self.authority.epoch, "generation": self.row["generation"],
                                                       "execution_id": self.executor}, None)
@@ -218,12 +218,12 @@ class Handoff(base.OriginScenarios):
         self.on_stop = lose
 
     def admission_row(self):
-        from hermes_state_runtime import get_session_admission
-        return get_session_admission(self.authority.db, admission_id=self.admission)
+        from linear_native_db import get_session_admission
+        return get_session_admission(self.db, admission_id=self.admission)
 
     def stop_lock(self):
         from gateway.session_ancillary import process_stop_pending
-        return process_stop_pending(self.authority.db, self.sid)
+        return process_stop_pending(self.db, self.sid)
 
     def resolves(self):
         return [params for method, params in self.calls if method == "prompt.resolve_unknown"]
@@ -398,7 +398,7 @@ class Handoff(base.OriginScenarios):
         from hermes_cli import kanban_db as kb
         await self.stopped_issue()
         kb.edit_task(self.board, self.task_id, body=MARKER)
-        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")  # Native Stop still in flight.
+        self.db.set_meta("fixture.pending.stop." + self.sid, "pending")  # Native Stop still in flight.
         before = self.snapshot()
         result = await self.hand_off()
         self.assertEqual((result["handed_off"], result["state"]), (False, "unchanged"))

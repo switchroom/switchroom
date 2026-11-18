@@ -1143,7 +1143,7 @@ foreign payloads remain outside these checks. Runtime ownership selectors must r
 native TEXT types before ownership filters; BLOB or other ambiguous selectors report
 `native_runtime_ownership_key_unreadable` for native-owner reconciliation. Execution/session
 IDs in the runtime worker ledger and admission targets use the native runtime identity
-validator, including its empty-value and length rules. Broader SessionDB/metadata text fields
+validator, including its empty-value and length rules. Broader session-store and metadata text fields
 and optional empty/NULL values retain their own writer contracts. Values are never stripped,
 normalized or decoded into identity or authority. Only fixed selector columns are checked; valid foreign
 TEXT scope and unrelated payloads remain outside the check. The native read snapshot is

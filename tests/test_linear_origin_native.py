@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 from linear_fake_api import load_plugin
+from linear_native_db import NativeDb
 
 SOURCE = os.environ.get("HERMES_AGENT_SRC")
 GUARDED_ROOT = os.environ.get("HERMES_LINEAR_ORIGIN_TEST_ROOT")
@@ -59,8 +60,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                               "allowed_requester_ids": ["requester"]}}
         self.config = {"model": {"default": "fixture"}, "platform_toolsets": {"cli": [], "desktop": []}}
         self.store = SessionStore(self.home / "sessions", GatewayConfig())
-        self.addCleanup(self.store._db.close)
-        self.runner = SimpleNamespace(session_store=self.store, _session_db=self.store._db, adapters={},
+        persistence = self.store._scoped_persistence()
+        self.addCleanup(persistence.close)
+        self.db = NativeDb(persistence, self.home)
+        self.addCleanup(self.db.close)
+        self.runner = SimpleNamespace(session_store=self.store, _session_db=persistence, adapters={},
                                       _draining=False, config=GatewayConfig(), _cached_agent_for=lambda key: None,
                                       _peek_session_state=lambda key: None, _primary_profile_name="default")
         self.runner._adapter_for_source = lambda source: self.runner.adapters.get(source.platform)
@@ -113,9 +117,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         from gateway.session_contract import SessionRef
         from gateway.session_lifecycle import _now
         from gateway.session_policy import LocalSessionPolicy, SURFACES
-        from hermes_state_local import commit_local_session
-        from hermes_state_keys import local_identity
-        from hermes_state_runtime import admit_session_input
+        from linear_native_db import commit_local_session
+        from linear_native_db import local_identity
+        from linear_native_db import admit_session_input
         # Build synthetic fixture policy through the native immutable type/atomic writer.
         # The launch planner also initializes profile credentials; no launch occurs in this proof.
         request_id = ("kanban:" + json.dumps([work_context[k] for k in ("board", "task_id", "run_id")], separators=(",", ":"))
@@ -132,7 +136,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                       user_id=self.conn.actor.subject, chat_type="dm")
         route = self.store._generate_session_key(native_source)
         entry = SessionEntry(route, self.sid, _now(), _now(), origin=native_source, platform=Platform.LOCAL)
-        commit_local_session(self.authority.db, epoch=self.authority.epoch, receipt={
+        commit_local_session(self.db, epoch=self.authority.epoch, receipt={
             "profile_id": str(self.home), "principal_id": self.conn.actor.subject, "request_id": request_id,
             "session_id": self.sid, "route": route, "entry": entry.to_dict(), "policy": asdict(policy)})
         self.ref = self.authority._publish_route(native_source, self.sid, route)
@@ -142,7 +146,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             payload.update(admit_cli_turn(extra))
         if work_context:
             payload["kanban_card_v1"] = {k: work_context[k] for k in ("board", "task_id", "run_id")}
-        row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        row = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid,
             request_id=request_id if work_context else "request-1", payload=payload, intent=intent)
         self.admission = row["admission_id"]
@@ -152,8 +156,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.bind("local", self.sid, source="kanban")
 
     def claim(self):
-        from hermes_state_runtime import claim_session_input
-        self.row = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
+        from linear_native_db import claim_session_input
+        self.row = claim_session_input(self.db, epoch=self.authority.epoch, session_id=self.sid)
         self.authority.executing[self.sid] = self.row["generation"]
 
     def bind(self, platform, sid, *, source=None, key=None, user="uid:1000", chat="", thread="", scope=""):
@@ -179,12 +183,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def api(self, *, session_id="api-session", request_id="api-request"):
         from gateway.session_api import bind_api_session
         from gateway.session_contract import SessionRef
-        from hermes_state_runtime import admit_session_input
+        from linear_native_db import admit_session_input
         self.sid = session_id
         self.ref = bind_api_session(self.authority, self.sid)
         payload = {"text": "Take over ABC-1", "api_turn_v1": {"history": None, "settings": {},
             "transfer_auth": {"principal": "principal:fixture:" + "a" * 32, "transport_family": "local-api"}}}
-        row = admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="api",
+        row = admit_session_input(self.db, epoch=self.authority.epoch, principal_id="api",
                                   session_id=self.sid, request_id=request_id, payload=payload)
         self.admission = row["admission_id"]
         self.claim()
@@ -197,7 +201,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         keeps its ``desktop`` label; its turns bind ``source=desktop`` and the conversation as chat.
         (Adoption itself loads the gateway model bootstrap, which this proof forbids importing.)"""
         await self.local(source="gui")
-        self.authority.db._execute_write(lambda c: c.execute("UPDATE sessions SET source='desktop' WHERE id=?", (self.sid,)))
+        self.db._execute_write(lambda c: c.execute("UPDATE sessions SET source='desktop' WHERE id=?", (self.sid,)))
         self.bind("local", self.sid, source="desktop", chat=self.sid)
 
     async def current(self):
@@ -279,9 +283,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
 
     async def test_registered_origin_tool_on_async_provider_loop_refuses_settled_admission(self):
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.local()
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="completed")
         result = await self.async_registered_tool("origin_reference")
         self.assertFalse(result["ok"])
@@ -299,7 +303,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 result = await self.async_registered_tool(action)
                 self.assertFalse(result["ok"])
                 self.assertNotIn("reference", result)
-                self.assertIsNotNone(session_ancillary.process_stop_pending(self.authority.db, self.sid))
+                self.assertIsNotNone(session_ancillary.process_stop_pending(self.db, self.sid))
 
     def during_origin_readback(self, change):
         """Run a finite fixture writer during the second actual owner receipt."""
@@ -313,10 +317,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     def retained_origin_payload(self, change):
         """Explicit retained-row fault, not a supported mutation of immutable input."""
-        payload = json.loads(self.authority.db._read_one(
+        payload = json.loads(self.db._read_one(
             "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0])
         change(payload)
-        self.authority.db._execute_write(lambda conn: conn.execute(
+        self.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
 
     async def test_origin_readback_rechecks_native_messaging_workspace(self):
@@ -324,12 +328,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             with self.subTest(platform=platform):
                 await self.messaging(platform)
                 before, after = str(self.home / "before"), str(self.home / "after")
-                self.authority.db.update_session_cwd(self.sid, before)
+                self.db.update_session_cwd(self.sid, before)
                 ref = (await self.current())["reference"]
-                self.during_origin_readback(lambda: self.authority.db.update_session_cwd(self.sid, after))
+                self.during_origin_readback(lambda: self.db.update_session_cwd(self.sid, after))
                 with self.assertRaises(transport.Unavailable):
                     await self.inspected(ref)
-                self.assertEqual(self.authority.db.get_session(self.sid)["cwd"], after)
+                self.assertEqual(self.db.get_session(self.sid)["cwd"], after)
                 self.before_rpc = None
                 evidence = await self.inspected(ref)
                 self.assertEqual(evidence["policy"]["cwd"], after)
@@ -355,21 +359,21 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(evidence["permission_granted"])
 
     async def test_origin_readback_rechecks_consumed_local_policy(self):
-        from hermes_state_local import POLICY_PREFIX, local_receipt
+        from linear_native_db import POLICY_PREFIX, local_receipt
         from gateway.session_policy import restore_policy
         await self.local()
         ref = (await self.current())["reference"]
         def change():
             # Explicit fault in the otherwise immutable native creation receipt;
             # the actual native decoder must project its new workspace/tool policy.
-            receipt = local_receipt(self.authority.db, self.sid)
+            receipt = local_receipt(self.db, self.sid)
             receipt["policy"]["cwd"] = str(self.home / "different workspace")
             for field, key in (("terminal_json", "TERMINAL_CWD"), ("request_json", "cwd")):
                 value = json.loads(receipt["policy"][field])
                 value[key] = receipt["policy"]["cwd"]
                 receipt["policy"][field] = json.dumps(value)
             self.assertEqual(restore_policy(receipt["policy"]).cwd, receipt["policy"]["cwd"])
-            self.authority.db.set_meta(POLICY_PREFIX + self.sid, json.dumps(receipt))
+            self.db.set_meta(POLICY_PREFIX + self.sid, json.dumps(receipt))
         self.during_origin_readback(change)
         with self.assertRaises(transport.Unavailable):
             await self.inspected(ref)
@@ -387,7 +391,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # Pinned fae lacks the optional getter. Its adapter reads real native meta;
         # compatibility Core exercises the actual native checkpoint writer/getter.
         adapter = patch.object(session_ancillary, "process_stop_pending",
-            lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True)
+            lambda db, sid: db.state_meta.get("fixture.pending.stop." + sid), create=True)
         if not supported:
             adapter.start()
             self.addCleanup(adapter.stop)
@@ -395,20 +399,20 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             if supported:
                 session_ancillary.record_process_stop(self.authority, self.ref, self.row["generation"])
             else:
-                self.authority.db.set_meta(key, "pending")
+                self.db.set_meta(key, "pending")
         self.during_origin_readback(stop)
         with self.assertRaises(transport.Unavailable):
             await self.inspected(ref)
-        self.assertIsNotNone(session_ancillary.process_stop_pending(self.authority.db, self.sid))
+        self.assertIsNotNone(session_ancillary.process_stop_pending(self.db, self.sid))
 
     async def test_origin_readback_preserves_native_text_and_decoded_policy(self):
         await self.messaging("telegram")
         cwd = " workspace with spaces/\u00e9:unchanged "
-        self.authority.db.update_session_cwd(self.sid, cwd)
+        self.db.update_session_cwd(self.sid, cwd)
         ref = (await self.current())["reference"]
         # A native writer running with the exact same value is not a changed
         # projection; do not add path grammar or normalize native TEXT.
-        self.during_origin_readback(lambda: self.authority.db.update_session_cwd(self.sid, cwd))
+        self.during_origin_readback(lambda: self.db.update_session_cwd(self.sid, cwd))
         evidence = await self.inspected(ref)
         self.assertEqual(evidence["policy"]["cwd"], cwd)
         self.assertFalse(evidence["permission_granted"])
@@ -509,16 +513,16 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_delegated_worker_progress_cannot_borrow_later_unrelated_admission(self):
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import settle_session_input, admit_session_input
+        from linear_native_db import settle_session_input, admit_session_input
         from hermes_fleet_linear_plugin import worker_progress
         await self.kanban()
         task = kb.get_task(self.board, self.task_id)
         events = [kb.Event.from_row(row) for row in self.board.execute(
             "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task.id,))]
         adapter = SimpleNamespace(profile_home=self.home, board="default", history=lambda *args: events)
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
             generation=self.row["generation"], outcome="completed")
-        admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid, request_id="unrelated-later-input",
             payload={"text": "An unrelated local conversation"}, intent="queue")
         self.claim()
@@ -551,7 +555,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def stopped_issue(self, *, existing=False, idempotency_key=None, review_stop=False,
                             claimer="fixture-host:CLAIM_PRIVATE_SENTINEL"):
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
+        from linear_native_db import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
         from hermes_fleet_linear_plugin.store import Store
         from gateway import session_ancillary
@@ -561,10 +565,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         executor = "admission-worker:" + self.admission
         args = dict(epoch=self.authority.epoch, execution_id=executor, session_id=self.sid,
                     generation=self.row["generation"])
-        register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-adoption-private")
-        adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-adoption-private")
-        mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        register_worker_execution(self.db, **args, kind="compute", adoption_secret="fixture-adoption-private")
+        adopt_worker_execution(self.db, **args, adoption_secret="fixture-adoption-private")
+        mutate_worker_execution(self.db, **args, sequence=1, operation="execution.finish", payload={})
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with kb.write_txn(self.board):
             self.board.execute("UPDATE task_events SET payload=? WHERE kind='worker_bound' AND task_id=?",
@@ -590,7 +594,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # Optional corrective-core getter adapter, explicitly synthetic on pinned fae; it
         # executes a real native read-only meta lookup, not an unconditional success stub.
         getter = patch.object(session_ancillary, "process_stop_pending",
-            lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True)
+            lambda db, sid: db.state_meta.get("fixture.pending.stop." + sid), create=True)
         getter.start()
         self.addCleanup(getter.stop)
 
@@ -603,7 +607,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def triage_cleanup_issue(self, *, control_only=False, settle_admission=True):
         """Reach the recurrence fence with real native writers in the guarded fixture."""
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import (register_worker_execution, adopt_worker_execution,
+        from linear_native_db import (register_worker_execution, adopt_worker_execution,
             mutate_worker_execution, settle_session_input)
         await self.stopped_issue()
         self.first_stop_id = self.stop_id
@@ -612,11 +616,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             await self.kanban(existing=True)
             args = dict(epoch=self.authority.epoch, execution_id="admission-worker:" + self.admission,
                         session_id=self.sid, generation=self.row["generation"])
-            register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-loop-adoption")
-            adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-loop-adoption")
-            mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
+            register_worker_execution(self.db, **args, kind="compute", adoption_secret="fixture-loop-adoption")
+            adopt_worker_execution(self.db, **args, adoption_secret="fixture-loop-adoption")
+            mutate_worker_execution(self.db, **args, sequence=1, operation="execution.finish", payload={})
             if settle_admission:
-                settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+                settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                                      generation=self.row["generation"], outcome="interrupted")
             with kb.write_txn(self.board):
                 # Preserve the first attempt's claim and every retained worker.
@@ -650,7 +654,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         result_id = kb.list_events(self.board, self.task_id)[-1].id
         before = {table: [tuple(row) for row in self.board.execute("SELECT * FROM " + table)]
                   for table in ("tasks", "task_runs", "task_events")}
-        admissions = self.authority.db._read_all("SELECT * FROM session_admissions")
+        admissions = self.db._read_all("SELECT * FROM session_admissions")
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
         self.assertFalse(evidence["permission_granted"])
@@ -663,7 +667,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(rejected["permission_granted"])
         for table, rows in before.items():
             self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM " + table)], rows)
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), admissions)
+        self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), admissions)
 
     async def test_cleanup_triage_queued_loop_recognizes_only_strict_control_cohort(self):
         loop = await self.triage_cleanup_issue(control_only=True)
@@ -722,13 +726,13 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(held["permission_granted"])
 
     async def test_cleanup_triage_loop_still_requires_canonical_admission_settlement(self):
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.triage_cleanup_issue(settle_admission=False)
         held = await self.cleanup_inspected()
         self.assertFalse(held["quiescence_proven"])
         self.assertFalse(held["permission_granted"])
         self.assertEqual(held["reason"], "native_admission_not_settled")
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
@@ -801,7 +805,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_host_namespace_disposition_keeps_fresh_native_stop_and_scope_checks(self):
         from gateway.drain_control import current_instantiation_epoch
         from test_linear_namespace_dispositions import receipt_fixture, root_metadata
-        from hermes_state_runtime import admit_session_input
+        from linear_native_db import admit_session_input
         from hermes_cli import kanban_db as kb
         await self.stopped_issue(review_stop=True, claimer=kb._host_prefix() + "CLAIM_PRIVATE_SENTINEL")
         self.reap_fixture_terminal_workers()
@@ -828,9 +832,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(worker["fate"] == "namespace_disposed"
                                 for attempt in proven["attempts"] for worker in attempt["workers"]))
             self.assertFalse((await self.cleanup_inspected(stop_id=self.stop_id - 1, ingress=ingress))["quiescence_proven"])
-            self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+            self.db.set_meta("fixture.pending.stop." + self.sid, "pending")
             self.assertFalse((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
-            self.authority.db.set_meta("fixture.pending.stop." + self.sid, None)
+            self.db.set_meta("fixture.pending.stop." + self.sid, None)
             def changed_receipt(_method, _params):
                 self.before_rpc = None
                 leaf.chmod(0o640)
@@ -845,7 +849,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             leaf.chmod(0o440)
             self.assertTrue((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
             # A disposed old namespace never settles newly queued native work.
-            admit_session_input(self.authority.db, epoch=self.authority.epoch,
+            admit_session_input(self.db, epoch=self.authority.epoch,
                 principal_id=self.conn.actor.subject, session_id=self.sid, request_id="still-pending",
                 payload={"text": "Do not run this source fixture"})
             self.assertFalse((await self.cleanup_inspected(ingress=ingress))["quiescence_proven"])
@@ -957,12 +961,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         principal/request/payload/status and NULL generation; no prompt or worker exists.
         The target is the logical owner_admitted session, never a physical worker SID.
         """
-        from hermes_state_runtime import admit_session_input, cancel_session_input
+        from linear_native_db import admit_session_input, cancel_session_input
         identity = json.dumps(["completion", "fixture-process", 123.0], separators=(",", ":"))
-        row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        row = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id="native-process-stop", session_id=self.sid, request_id=identity,
             payload={"process_completion": identity, "route": "fixture-process-route"})
-        row = cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+        row = cancel_session_input(self.db, epoch=self.authority.epoch,
                                    admission_id=row["admission_id"])
         self.assertEqual((row["status"], row["outcome"], row["generation"]),
                          ("terminal", "cancelled", None))
@@ -1028,7 +1032,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(evidence["permission_granted"])
 
     async def test_stop_control_receipt_is_never_origin_or_requester_authority(self):
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.local()
         control = self.cancelled_control()
         captured = await self.current()
@@ -1039,7 +1043,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         forged = dict(captured["reference"], admission_id=control["admission_id"])
         with self.assertRaises(transport.Unavailable):
             await self.inspected(forged)
-        settle_session_input(self.authority.db, epoch=self.authority.epoch,
+        settle_session_input(self.db, epoch=self.authority.epoch,
             admission_id=self.admission, generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.current()
@@ -1047,14 +1051,14 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_terminal_stop_controls_are_data_not_execution_or_proof(self):
         await self.stopped_issue()
         control = self.cancelled_control()
-        before = self.authority.db._read_all("SELECT * FROM session_admissions")
+        before = self.db._read_all("SELECT * FROM session_admissions")
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
         self.assertFalse(evidence["permission_granted"])
         self.assertNotIn(control["request_id"], json.dumps(evidence))
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), before)
+        self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), before)
         # A terminal cancellation is never a substitute for a clear native Stop checkpoint.
-        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+        self.db.set_meta("fixture.pending.stop." + self.sid, "pending")
         pending = await self.cleanup_inspected()
         self.assertFalse(pending["quiescence_proven"])
         self.assertEqual(pending["reason"], "native_stop_checkpoint_pending")
@@ -1064,9 +1068,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         import argparse
         from agent import runtime_session_store
         await self.stopped_issue()
-        self.authority.db.append_message(self.sid, "user", "PRIVATE_TRANSCRIPT_SENTINEL")
+        self.db.append_message(self.sid, "user", "PRIVATE_TRANSCRIPT_SENTINEL")
         before = [tuple(r) for r in self.board.execute("SELECT * FROM task_events")]
-        native = self.authority.db._read_all("SELECT * FROM session_admissions")
+        native = self.db._read_all("SELECT * FROM session_admissions")
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
         self.assertFalse(evidence["permission_granted"])
@@ -1074,7 +1078,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         for private in ("CLAIM_PRIVATE_SENTINEL", "PRIVATE_TRANSCRIPT_SENTINEL", str(self.board_path), "fixture-adoption-private"):
             self.assertNotIn(private, json.dumps(evidence))
         self.assertEqual([tuple(r) for r in self.board.execute("SELECT * FROM task_events")], before)
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), native)
+        self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), native)
         parser = argparse.ArgumentParser()
         ops.setup(parser)
         args = parser.parse_args(["inspect-cleanup", "issue-one", "--expected-stop-event-id", str(self.stop_id)])
@@ -1098,7 +1102,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(control["started_at"], control["ended_at"])
         board_before = {table: [tuple(row) for row in self.board.execute("SELECT * FROM " + table)]
                         for table in ("tasks", "task_runs", "task_events")}
-        native_before = self.authority.db._read_all("SELECT * FROM session_admissions")
+        native_before = self.db._read_all("SELECT * FROM session_admissions")
         evidence = await self.cleanup_inspected()
         self.assertTrue(evidence["quiescence_proven"], evidence)
         self.assertFalse(evidence["permission_granted"])
@@ -1106,7 +1110,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["control_only_runs"], [control["id"]])
         for table, before in board_before.items():
             self.assertEqual([tuple(row) for row in self.board.execute("SELECT * FROM " + table)], before)
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), native_before)
+        self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), native_before)
         event = self.board.execute("SELECT * FROM task_events WHERE run_id=?", (control["id"],)).fetchone()
         def changed_control(_method, _params):
             self.before_rpc = None
@@ -1181,9 +1185,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ambiguous["quiescence_proven"])
         self.assertEqual(ambiguous["reason"], "attempt_native_admission_missing_or_ambiguous")
         self.board.execute("UPDATE task_events SET kind='claimed',payload=? WHERE id=?", (claimed["payload"], claimed["id"]))
-        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+        self.db.set_meta("fixture.pending.stop." + self.sid, "pending")
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
-        self.authority.db.set_meta("fixture.pending.stop." + self.sid, None)
+        self.db.set_meta("fixture.pending.stop." + self.sid, None)
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
     async def test_cleanup_optional_native_event_absence_is_compatible_and_scoped(self):
@@ -1345,31 +1349,31 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         with patch.object(session_ancillary, "process_stop_pending", None):
             result = await self.cleanup_inspected()
         self.assertEqual(result["reason"], "native_stop_checkpoint_unsupported")
-        self.authority.db.set_meta("fixture.pending.stop." + self.sid, "pending")
+        self.db.set_meta("fixture.pending.stop." + self.sid, "pending")
         result = await self.cleanup_inspected()
         self.assertFalse(result["quiescence_proven"])
         self.assertEqual(result["reason"], "native_stop_checkpoint_pending")
-        self.authority.db._execute_write(lambda c: c.execute("DELETE FROM state_meta WHERE key=?", ("fixture.pending.stop." + self.sid,)))
-        self.authority.db._execute_write(lambda c: c.execute("UPDATE session_admissions SET status='started',outcome=NULL WHERE admission_id=?", (self.admission,)))
+        self.db._execute_write(lambda c: c.execute("DELETE FROM state_meta WHERE key=?", ("fixture.pending.stop." + self.sid,)))
+        self.db._execute_write(lambda c: c.execute("UPDATE session_admissions SET status='started',outcome=NULL WHERE admission_id=?", (self.admission,)))
         result = await self.cleanup_inspected()
         self.assertFalse(result["quiescence_proven"])
         self.assertEqual(result["reason"], "native_admission_not_settled")
 
     async def test_cleanup_unknown_workers_or_missing_executor_never_become_settlement(self):
-        from hermes_state_runtime import register_worker_execution
+        from linear_native_db import register_worker_execution
         await self.stopped_issue()
         executor = "admission-worker:" + self.admission
-        self.authority.db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='unknown' WHERE execution_id=?", (executor,)))
+        self.db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='unknown' WHERE execution_id=?", (executor,)))
         result = await self.cleanup_inspected()
         self.assertEqual(result["reason"], "native_worker_or_spawner_unsettled")
-        self.authority.db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='terminal' WHERE execution_id=?", (executor,)))
+        self.db._execute_write(lambda c: c.execute("UPDATE worker_executions SET status='terminal' WHERE execution_id=?", (executor,)))
         child = self.sid + "-child"
-        self.authority.db.create_session(child, source="subagent", parent_session_id=self.sid)
-        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id=executor + "/child:fixture",
+        self.db.create_session(child, source="subagent", parent_session_id=self.sid)
+        register_worker_execution(self.db, epoch=self.authority.epoch, execution_id=executor + "/child:fixture",
             session_id=child, generation=0, kind="child", adoption_secret="fixture-child-private")
         self.assertEqual((await self.cleanup_inspected())["reason"], "native_child_spawner_unsettled")
-        self.authority.db._execute_write(lambda c: c.execute("DELETE FROM worker_executions WHERE execution_id=?", (executor + "/child:fixture",)))
-        self.authority.db._execute_write(lambda c: (c.execute("DELETE FROM worker_receipts WHERE execution_id=?", (executor,)),
+        self.db._execute_write(lambda c: c.execute("DELETE FROM worker_executions WHERE execution_id=?", (executor + "/child:fixture",)))
+        self.db._execute_write(lambda c: (c.execute("DELETE FROM worker_receipts WHERE execution_id=?", (executor,)),
             c.execute("DELETE FROM worker_executions WHERE execution_id=?", (executor,))))
         result = await self.cleanup_inspected()
         self.assertEqual(result["reason"], "native_executor_settlement_missing")
@@ -1435,7 +1439,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_cleanup_stop_changes_during_receipt_or_owner_restart_are_unknown(self):
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import begin_runtime_epoch
+        from linear_native_db import begin_runtime_epoch
         await self.stopped_issue()
         def stop(method, params):
             self.before_rpc = None
@@ -1443,7 +1447,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.before_rpc = stop
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
         self.stop_id = kb.list_events(self.board, self.task_id)[-1].id
-        self.authority.epoch = begin_runtime_epoch(self.authority.db, instance_id="different-owner")
+        self.authority.epoch = begin_runtime_epoch(self.db, instance_id="different-owner")
         # Endpoint still reports old instance: independently read epoch/instance must refuse.
         self.assertEqual((await self.cleanup_inspected())["reason"], "native_owner_changed")
 
@@ -1579,13 +1583,13 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.cleanup_inspected())["reason"], "issue_scope_fenced")
 
     async def test_cleanup_primary_payload_native_mapping_validation_precedes_access(self):
-        from hermes_state_runtime import find_session_admission, _json, RuntimeStoreError
+        from linear_native_db import find_session_admission, _json, RuntimeStoreError
         await self.stopped_issue()
-        original = json.loads(self.authority.db._read_one(
+        original = json.loads(self.db._read_one(
             "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0])
         def retained(payload):
             encoded = json.dumps(payload)
-            self.authority.db._execute_write(lambda conn: conn.execute(
+            self.db._execute_write(lambda conn: conn.execute(
                 "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (encoded, self.admission)))
             return encoded
         for payload in ([], None, "scalar", True, 1, 0.5):
@@ -1593,7 +1597,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(RuntimeStoreError):
                     _json(payload)
                 encoded = retained(payload)  # Explicit fault in an actual settled native row.
-                decoded = find_session_admission(self.authority.db, principal_id=self.row["principal_id"],
+                decoded = find_session_admission(self.db, principal_id=self.row["principal_id"],
                     session_id=self.sid, request_id=self.row["request_id"])
                 self.assertEqual(decoded["payload"], payload)
                 evidence = await self.cleanup_inspected()
@@ -1601,7 +1605,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(evidence["reason"], "native_admission_state_unreadable")
                 self.assertFalse(evidence["quiescence_proven"])
                 self.assertFalse(evidence["permission_granted"])
-                self.assertEqual(self.authority.db._read_one(
+                self.assertEqual(self.db._read_one(
                     "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0], encoded)
         # Valid mappings retain the native payload contract; a mapping alone
         # does not replace the independently required Kanban attempt binding.
@@ -1618,7 +1622,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         await self.stopped_issue()
         def arriving(_method, _params):
             self.before_rpc = None
-            self.authority.db._execute_write(lambda conn: conn.execute(
+            self.db._execute_write(lambda conn: conn.execute(
                 "UPDATE session_admissions SET payload_json='[]' WHERE admission_id=?", (self.admission,)))
         self.before_rpc = arriving
         evidence = await self.cleanup_inspected()
@@ -1627,10 +1631,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(evidence["permission_granted"])
 
     async def test_cleanup_native_policy_context_mapping_is_checked_before_access(self):
-        from hermes_state_local import local_receipt, POLICY_PREFIX
+        from linear_native_db import local_receipt, POLICY_PREFIX
         from gateway.session_policy import restore_policy
         await self.stopped_issue()
-        original = local_receipt(self.authority.db, self.sid)
+        original = local_receipt(self.db, self.sid)
         def context(value):
             receipt = json.loads(json.dumps(original))
             receipt["policy"]["kanban_json"] = json.dumps(value)
@@ -1638,7 +1642,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             # encoded value; cleanup must decode its consumed mapping itself.
             self.assertEqual(restore_policy(receipt["policy"]).kanban_json, json.dumps(value))
             encoded = json.dumps(receipt)
-            self.authority.db.set_meta(POLICY_PREFIX + self.sid, encoded)
+            self.db.set_meta(POLICY_PREFIX + self.sid, encoded)
             return encoded
         for value in ([], None, "scalar", True, 1, 0.5):
             with self.subTest(value=value):
@@ -1647,7 +1651,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(evidence["state"], "unknown")
                 self.assertFalse(evidence["quiescence_proven"])
                 self.assertFalse(evidence["permission_granted"])
-                self.assertEqual(self.authority.db.get_meta(POLICY_PREFIX + self.sid), encoded)
+                self.assertEqual(self.db.get_meta(POLICY_PREFIX + self.sid), encoded)
         saved = json.loads(original["policy"]["kanban_json"])
         for value in (saved, {**saved, "opaque": {"nested": [None, {}, []]}}):
             context(value)
@@ -1692,10 +1696,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_work_current_preserves_unknown_requester_and_selective_privacy(self):
         from hermes_cli import kanban_db as kb
         await self.kanban()
-        self.authority.db.append_message(self.sid, "user", "UNRELATED_PRIVATE_HISTORY")
+        self.db.append_message(self.sid, "user", "UNRELATED_PRIVATE_HISTORY")
         kb.create_task(self.board, title="UNRELATED_PRIVATE_CARD", assignee="default")
         before = [tuple(r) for r in self.board.execute("SELECT * FROM tasks")]
-        admission_before = self.authority.db._read_all("SELECT * FROM session_admissions")
+        admission_before = self.db._read_all("SELECT * FROM session_admissions")
         result = await self.work_current()
         evidence = await self.work_inspected(result["reference"])
         self.assertEqual(evidence["requester"], {"kind": "native_dispatcher", "original_requester": "unknown"})
@@ -1707,7 +1711,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                         "UNRELATED_PRIVATE_CARD", str(self.board_path), self.conn.actor.subject):
             self.assertNotIn(private, json.dumps(evidence))
         self.assertEqual([tuple(r) for r in self.board.execute("SELECT * FROM tasks")], before)
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), admission_before)
+        self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), admission_before)
         with self.assertRaises(transport.Unavailable):
             await self.current()  # Interactive origin rules remain unchanged for producers.
 
@@ -1754,7 +1758,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         from gateway.session_kanban import bind_worker_context
         from gateway.session_context import reset_session_vars, set_current_session_id
         from gateway.session_policy import policy_scope, restore_policy
-        from hermes_state_local import local_receipt
+        from linear_native_db import local_receipt
         from hermes_fleet_linear_plugin import chat
         await self.kanban()
         original_schema = json.loads(json.dumps(chat.SCHEMA))
@@ -1763,7 +1767,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # Same native ordering as managed_worker.execute: adopted process marker,
         # validated claim binding, discovery, then AIAgent's current session ID.
         reset_session_vars()
-        policy_data = local_receipt(self.authority.db, self.sid)["policy"]
+        policy_data = local_receipt(self.db, self.sid)["policy"]
         bind_worker_context({"policy": policy_data})
         manager, registry = self.registered_linear()
         names = {"linear", "linear_work_reference"}
@@ -1815,7 +1819,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         from agent import runtime_session_store
         from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
         from gateway.session_policy import policy_scope, restore_policy
-        from hermes_state_local import local_receipt
+        from linear_native_db import local_receipt
         from hermes_fleet_linear_plugin import chat
         await self.local()
         original_schema = json.loads(json.dumps(chat.SCHEMA))
@@ -1828,7 +1832,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # Ordinary managed coordinators also adopt; stray task hints are not identity.
         with patch.object(runtime_session_store, "_worker_process", True), patch.dict(os.environ, {"HERMES_KANBAN_TASK": "stray"}):
             ordinary_inventory()
-            policy = restore_policy(local_receipt(self.authority.db, self.sid)["policy"])
+            policy = restore_policy(local_receipt(self.db, self.sid)["policy"])
             for source in ("gui", "slack", "telegram"):
                 with policy_scope(replace(policy, source=source)):
                     ordinary_inventory()
@@ -1836,7 +1840,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "forged"}), patch.object(runtime_session_store, "_worker_process", False):
             ordinary_inventory()
         await self.kanban()
-        policy = restore_policy(local_receipt(self.authority.db, self.sid)["policy"])
+        policy = restore_policy(local_receipt(self.db, self.sid)["policy"])
         with policy_scope(policy):
             self.assertEqual([d["function"]["name"] for d in registry.get_definitions(names)], ["linear_work_reference"])
             for execution in (delegated_child_context(), non_dispatcher_owned_context()):
@@ -1851,7 +1855,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         manager.unload()
 
     async def test_selected_admission_native_constructor_and_known_header_controls(self):
-        from hermes_state_runtime import admit_session_input, cancel_session_input, RuntimeStoreError
+        from linear_native_db import admit_session_input, cancel_session_input, RuntimeStoreError
 
         await self.local()
         params = {"epoch": self.authority.epoch, "principal_id": self.conn.actor.subject,
@@ -1859,17 +1863,17 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         for key in ("principal_id", "session_id", "request_id"):
             for value in (None, "", "x" * 1025, True):
                 with self.subTest(key=key, value=value), self.assertRaises(RuntimeStoreError):
-                    admit_session_input(self.authority.db, **{**params, key: value})
+                    admit_session_input(self.db, **{**params, key: value})
         for intent in (None, "", "future-native-intent", 1):
             with self.subTest(intent=intent), self.assertRaises(RuntimeStoreError):
-                admit_session_input(self.authority.db, **params, intent=intent)
+                admit_session_input(self.db, **params, intent=intent)
         for payload in ([], None, {"value": float("nan")}):
             # Core93 checks native Stop membership before _json; None fails there.
             errors = (RuntimeStoreError, TypeError) if payload is None else RuntimeStoreError
             with self.subTest(payload=payload), self.assertRaises(errors):
-                admit_session_input(self.authority.db, **{**params, "payload": payload})
+                admit_session_input(self.db, **{**params, "payload": payload})
         # A valid maximum-length native ID is not trimmed or given a new grammar.
-        admit_session_input(self.authority.db, **{**params, "request_id": " " * 1024})
+        admit_session_input(self.db, **{**params, "request_id": " " * 1024})
         for native_work in (False, True):
             for intent in ("queue", "steer", "redirect"):
                 with self.subTest(native_work=native_work, intent=intent):
@@ -1879,13 +1883,13 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                     ref = (await current())["reference"]
                     self.assertFalse((await inspected(ref))["permission_granted"])
                     # Historical and foreign malformed headers are outside this selected claim.
-                    history = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                    history = admit_session_input(self.db, epoch=self.authority.epoch,
                         principal_id=self.conn.actor.subject, session_id=self.sid,
                         request_id="historical", payload={"text": "unused"})
-                    cancel_session_input(self.authority.db, epoch=self.authority.epoch,
+                    cancel_session_input(self.db, epoch=self.authority.epoch,
                                          admission_id=history["admission_id"])
-                    self.authority.db.create_session("foreign-header", source="gui")
-                    foreign = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                    self.db.create_session("foreign-header", source="gui")
+                    foreign = admit_session_input(self.db, epoch=self.authority.epoch,
                         principal_id="foreign", session_id="foreign-header",
                         request_id="foreign-" + self.admission, payload={"text": "unused"})
                     def damage(conn):
@@ -1896,10 +1900,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                              ("future-native-intent", row["admission_id"]))
                         finally:
                             conn.execute("PRAGMA ignore_check_constraints=OFF")
-                    self.authority.db._execute_write(damage)
+                    self.db._execute_write(damage)
                     self.assertFalse((await inspected(ref))["permission_granted"])
                     for row in (history, foreign):
-                        self.assertEqual(self.authority.db._read_one(
+                        self.assertEqual(self.db._read_one(
                             "SELECT intent FROM session_admissions WHERE admission_id=?", (row["admission_id"],))[0],
                             "future-native-intent")
 
@@ -1917,8 +1921,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             args = parser.parse_args(["inspect-work" if native_work else "inspect-origin",
                                       "--reference-json", json.dumps(ref)])
             long_target = "x" * 1025
-            if self.authority.db.get_session(long_target) is None:
-                self.authority.db.create_session(long_target, source="gui")
+            if self.db.get_session(long_target) is None:
+                self.db.create_session(long_target, source="gui")
             faults = {"admission_id": ("", "x" * 1025), "request_id": ("", "x" * 1025),
                       "principal_id": ("", "x" * 1025), "target_session_id": (long_target,),
                       "intent": ("future-native-intent", ""), "seq": (0, -1),
@@ -1928,7 +1932,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             for column, values in faults.items():
                 selector, identity = (("admission_id", self.admission) if column == "target_session_id"
                                       else ("target_session_id", self.sid))
-                original = self.authority.db._read_one(
+                original = self.db._read_one(
                     f"SELECT {column} FROM session_admissions WHERE {selector}=?", (identity,))[0]
                 for value in values:
                     def update(value):
@@ -1939,7 +1943,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                              (value, identity))
                             finally:
                                 conn.execute("PRAGMA ignore_check_constraints=OFF")
-                        self.authority.db._execute_write(write)
+                        self.db._execute_write(write)
                     with self.subTest(native_work=native_work, column=column, value=value):
                         update(value)
                         try:
@@ -1954,7 +1958,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(code, 1)
                             self.assertFalse(result["ok"])
                             self.assertFalse(result["permission_granted"])
-                            self.assertEqual(self.authority.db._read_one(
+                            self.assertEqual(self.db._read_one(
                                 f"SELECT {column} FROM session_admissions WHERE {selector}=?", (identity,))[0], value)
                         finally:
                             update(original)
@@ -1969,7 +1973,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                   ("principal_id", "different-valid-native-principal")):
                 original = self.row[column]
                 def update(value):
-                    self.authority.db._execute_write(lambda conn: conn.execute(
+                    self.db._execute_write(lambda conn: conn.execute(
                         f"UPDATE session_admissions SET {column}=? WHERE admission_id=?", (value, self.admission)))
                 with self.subTest(native_work=native_work, column=column):
                     ref = (await current())["reference"]
@@ -2046,14 +2050,14 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_work_stop_and_successor_need_a_fresh_reference(self):
         from hermes_cli import kanban_db as kb
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.kanban()
         old = (await self.work_current())["reference"]
         token = kb.list_events(self.board, self.task_id)[-1].id
         self.assertTrue(kb.block_task(self.board, self.task_id, kind="needs_input", reason="Stop", expected_event_id=token))
         with self.assertRaises(transport.Unavailable):
             await self.work_inspected(old)
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         self.assertTrue(kb.unblock_task(self.board, self.task_id))
         await self.kanban(existing=True)
@@ -2112,7 +2116,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_checkpoint_capability_distinguishes_unknown_clear_and_pending(self):
         from gateway import session_ancillary
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.local()
         interactive = (await self.current())["reference"]
         supported = callable(getattr(session_ancillary, "process_stop_pending", None))
@@ -2129,7 +2133,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             evidence = await self.inspected(interactive)
             self.assertEqual(evidence["stop_evidence"]["state"], "unknown")
             self.assertFalse(evidence["stop_evidence"]["quiescence_proven"])
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.inspected(interactive)
@@ -2139,16 +2143,16 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         # The corrective core's existing getter reads a single native meta checkpoint. Test
         # that optional ABI against real native RO state, without changing the pinned core.
         key = "fixture.pending.stop." + self.sid
-        with patch.object(session_ancillary, "process_stop_pending", lambda db, sid: db.get_meta("fixture.pending.stop." + sid), create=True):
+        with patch.object(session_ancillary, "process_stop_pending", lambda db, sid: db.state_meta.get("fixture.pending.stop." + sid), create=True):
             clear = (await self.work_current())["reference"]
             self.assertEqual((await self.work_inspected(clear))["stop_evidence"]["state"], "clear")
-            self.authority.db.set_meta(key, "1:1")
+            self.db.set_meta(key, "1:1")
             with self.assertRaises(transport.Unavailable):
                 await self.work_inspected(clear)
             with self.assertRaises(transport.Unavailable):
                 await self.work_current()
             await self.local()
-            self.authority.db.set_meta("fixture.pending.stop." + self.sid, "1:1")
+            self.db.set_meta("fixture.pending.stop." + self.sid, "1:1")
             with self.assertRaises(transport.Unavailable):
                 await self.current()
 
@@ -2167,14 +2171,14 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             await self.work_inspected(ref)
 
     async def test_work_restart_and_settlement_invalidate_without_invented_requester(self):
-        from hermes_state_runtime import begin_runtime_epoch, settle_session_input
+        from linear_native_db import begin_runtime_epoch, settle_session_input
         await self.kanban()
         ref = (await self.work_current())["reference"]
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.work_inspected(ref)
-        self.authority.epoch = begin_runtime_epoch(self.authority.db, instance_id="new-owner")
+        self.authority.epoch = begin_runtime_epoch(self.db, instance_id="new-owner")
         self.authority.instance_id = "new-owner"
         with self.assertRaises(transport.Unavailable):
             await self.work_inspected(ref)
@@ -2218,12 +2222,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(evidence["permission_granted"])
 
     async def test_desktop_label_without_the_native_owner_is_still_refused(self):
-        from hermes_state_runtime import admit_session_input, settle_session_input
+        from linear_native_db import admit_session_input, settle_session_input
         await self.desktop()
         # Input admitted for someone other than the conversation's authenticated owner.
-        settle_session_input(self.authority.db, epoch=self.authority.epoch,
+        settle_session_input(self.db, epoch=self.authority.epoch,
             admission_id=self.admission, generation=self.row["generation"], outcome="interrupted")
-        row = admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="uid:someone-else",
+        row = admit_session_input(self.db, epoch=self.authority.epoch, principal_id="uid:someone-else",
                                   session_id=self.sid, request_id="foreign-request", payload={"text": "Take over ABC-1"})
         self.admission = row["admission_id"]
         self.claim()
@@ -2236,7 +2240,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_messaging_input_cannot_borrow_a_desktop_label(self):
         await self.messaging("telegram")
-        self.authority.db._execute_write(lambda c: c.execute("UPDATE sessions SET source='desktop' WHERE id=?", (self.sid,)))
+        self.db._execute_write(lambda c: c.execute("UPDATE sessions SET source='desktop' WHERE id=?", (self.sid,)))
         with self.assertRaises(transport.Unavailable):
             await self.current()
 
@@ -2281,7 +2285,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_queued_input_and_other_history_are_not_dumped(self):
         from gateway.session_contract import Submission
         await self.local()
-        self.authority.db.append_message(self.sid, "user", "UNRELATED_PRIVATE_HISTORY")
+        self.db.append_message(self.sid, "user", "UNRELATED_PRIVATE_HISTORY")
         await self.authority.submit(self.conn.actor, Submission("queued", self.ref, {"text": "QUEUED_PRIVATE_TEXT"}, "queue"))
         evidence = await self.inspected((await self.current())["reference"])
         serialized = json.dumps(evidence)
@@ -2302,16 +2306,16 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             await self.inspected(ref)
 
     async def test_stop_or_settlement_between_reference_and_inspection_invalidates(self):
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.local()
         ref = (await self.current())["reference"]
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.inspected(ref)
 
     async def test_stop_during_read_is_rechecked(self):
-        from hermes_state_runtime import settle_session_input
+        from linear_native_db import settle_session_input
         await self.local()
         resume_count = 0
         def stop(method, params):
@@ -2319,7 +2323,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             if method == "prompt.receipt":
                 resume_count += 1
                 if resume_count == 2:
-                    settle_session_input(self.authority.db, epoch=self.authority.epoch,
+                    settle_session_input(self.db, epoch=self.authority.epoch,
                         admission_id=self.admission, generation=self.row["generation"], outcome="interrupted")
         self.before_rpc = stop
         with self.assertRaises(transport.Unavailable):
@@ -2344,7 +2348,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                      {"principal": "opaque-unknown", "transport_family": "remote-api"}):
             with self.subTest(auth=auth):
                 payload["api_turn_v1"]["transfer_auth"] = auth
-                self.authority.db._execute_write(lambda c: c.execute(
+                self.db._execute_write(lambda c: c.execute(
                     "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
                 with self.assertRaises(transport.Unavailable):
                     await self.current()
@@ -2358,7 +2362,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(origin.current, replace(context, user_id="forged"), self.settings)
         payload = self.row["payload"]
         payload["native_text_v1"]["source"]["is_bot"] = True
-        self.authority.db._execute_write(lambda c: c.execute(
+        self.db._execute_write(lambda c: c.execute(
             "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(payload), self.admission)))
         with self.assertRaises(transport.Unavailable):
             await self.current()
@@ -2373,9 +2377,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 else:
                     await self.messaging(platform)
                 original = (await self.current())["reference"]
-                stored = self.authority.db.get_session(self.sid)
+                stored = self.db.get_session(self.sid)
                 tip = self.sid + "-compressed"
-                self.authority.db.publish_compression_child(parent_session_id=self.sid, child_session_id=tip,
+                self.db.publish_compression_child(parent_session_id=self.sid, child_session_id=tip,
                     source=stored["source"], messages=[{"role": "user", "content": "Synthetic compression checkpoint"}],
                     require_compression_lease=False)
                 from gateway.session_context import set_current_session_id
@@ -2386,38 +2390,37 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def reset_current_origin(self, *, compress_before=False, compress_after=False):
         from gateway.session_context import set_current_session_id
-        from hermes_state_local import local_receipt
-        from hermes_state_local_lineage import reset_local_target, local_physical_target
-        from hermes_state_runtime import settle_session_input, admit_session_input
+        from linear_native_db import local_receipt
+        from linear_native_db import reset_local_target, local_physical_target
+        from linear_native_db import settle_session_input, admit_session_input
         await self.local()
         old = (await self.current())["reference"]
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="completed")
         self.authority.executing.pop(self.sid, None)
         parent = self.sid
         if compress_before:
             parent = self.sid + "-compressed"
-            self.authority.db.publish_compression_child(parent_session_id=self.sid, child_session_id=parent,
+            self.db.publish_compression_child(parent_session_id=self.sid, child_session_id=parent,
                 source="gui", messages=[{"role": "user", "content": "Native checkpoint before reset"}],
                 require_compression_lease=False)
-        saved = local_receipt(self.authority.db, self.sid)
+        saved = local_receipt(self.db, self.sid)
         tip = parent + "-reset"
-        reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=parent,
+        reset_local_target(self.db, epoch=self.authority.epoch, parent_session_id=parent,
                            entry={**saved["entry"], "session_id": tip})
         if compress_after:
             compressed = tip + "-compressed"
-            self.authority.db.publish_compression_child(parent_session_id=tip, child_session_id=compressed,
+            self.db.publish_compression_child(parent_session_id=tip, child_session_id=compressed,
                 source="gui", messages=[{"role": "user", "content": "Native checkpoint after reset"}],
                 require_compression_lease=False)
             tip = compressed
-        row = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        row = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid, request_id="request-after-reset",
             payload={"text": "Take over remaining work after reset"})
         self.admission = row["admission_id"]
         self.claim()
         set_current_session_id(tip)
-        with self.authority.db._read_ctx() as conn:
-            self.assertEqual(local_physical_target(conn, self.sid), tip)
+        self.assertEqual(local_physical_target(self.db, self.sid), tip)
         return old, tip
 
     async def test_origin_native_reset_and_compression_resolve_the_current_logical_admission(self):
@@ -2428,8 +2431,8 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             with self.subTest(compress_before=before, compress_after=after):
                 old, tip = await self.reset_current_origin(compress_before=before, compress_after=after)
                 self.assertEqual(admission_owner(self.authority, tip), self.sid)
-                self.assertNotEqual(self.authority.db.get_compression_lineage(tip)[0], self.sid)
-                retained = self.authority.db._read_all("SELECT * FROM session_admissions")
+                self.assertNotEqual(self.db.get_compression_lineage(tip)[0], self.sid)
+                retained = self.db._read_all("SELECT * FROM session_admissions")
                 result = await self.current()
                 ref = result["reference"]
                 self.assertEqual(ref["admission_id"], self.admission)
@@ -2447,22 +2450,22 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                                                    "default", origin_settings=self.settings)
                 self.assertEqual(code, 0)
                 self.assertFalse(json.loads(printed.call_args.args[0])["permission_granted"])
-                self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), retained)
+                self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), retained)
 
     async def test_origin_native_reset_preserves_readback_stop_and_active_mutation_guards(self):
         from gateway import session_ancillary
-        from hermes_state_local import local_receipt
-        from hermes_state_local_lineage import reset_local_target
-        from hermes_state_runtime import RuntimeStoreError, settle_session_input
+        from linear_native_db import local_receipt
+        from linear_native_db import reset_local_target
+        from linear_native_db import RuntimeStoreError, settle_session_input
         _, tip = await self.reset_current_origin(compress_after=True)
         ref = (await self.current())["reference"]
-        saved = local_receipt(self.authority.db, self.sid)
+        saved = local_receipt(self.db, self.sid)
         with self.assertRaises(RuntimeStoreError):
-            reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=tip,
+            reset_local_target(self.db, epoch=self.authority.epoch, parent_session_id=tip,
                                entry={**saved["entry"], "session_id": tip + "-forbidden"})
-        self.assertEqual(local_receipt(self.authority.db, self.sid), saved)
+        self.assertEqual(local_receipt(self.db, self.sid), saved)
         self.assertFalse((await self.inspected(ref))["permission_granted"])
-        original = self.authority.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
+        original = self.db._read_one("SELECT payload_json FROM session_admissions WHERE admission_id=?",
                                              (self.admission,))[0]
         self.during_origin_readback(lambda: self.retained_origin_payload(
             lambda payload: payload.update(text="Changed during post-reset owner receipt")))
@@ -2471,7 +2474,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 await self.inspected(ref)
         finally:
             self.before_rpc = None
-            self.authority.db._execute_write(lambda conn: conn.execute(
+            self.db._execute_write(lambda conn: conn.execute(
                 "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (original, self.admission)))
         self.assertFalse((await self.inspected(ref))["permission_granted"])
         self.authority.adopt_agent(self.sid, self.row["generation"], SimpleNamespace(interrupt=lambda *args: None))
@@ -2481,87 +2484,87 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 await self.inspected(ref)
         else:
             self.assertEqual((await self.inspected(ref))["stop_evidence"]["state"], "unknown")
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.inspected(ref)
 
     async def test_work_native_compression_keeps_its_admission_and_reset_remains_guarded(self):
         from gateway.session_context import set_current_session_id
-        from hermes_state_local import local_receipt
-        from hermes_state_local_lineage import reset_local_target
-        from hermes_state_runtime import RuntimeStoreError
+        from linear_native_db import local_receipt
+        from linear_native_db import reset_local_target
+        from linear_native_db import RuntimeStoreError
         await self.kanban()
         ref = (await self.work_current())["reference"]
-        saved = local_receipt(self.authority.db, self.sid)
+        saved = local_receipt(self.db, self.sid)
         with self.assertRaises(RuntimeStoreError):
-            reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=self.sid,
+            reset_local_target(self.db, epoch=self.authority.epoch, parent_session_id=self.sid,
                                entry={**saved["entry"], "session_id": self.sid + "-forbidden"})
-        self.assertEqual(local_receipt(self.authority.db, self.sid), saved)
+        self.assertEqual(local_receipt(self.db, self.sid), saved)
         tip = self.sid + "-compressed"
-        self.authority.db.publish_compression_child(parent_session_id=self.sid, child_session_id=tip,
+        self.db.publish_compression_child(parent_session_id=self.sid, child_session_id=tip,
             source="kanban", messages=[{"role": "user", "content": "Native worker compression checkpoint"}],
             require_compression_lease=False)
         set_current_session_id(tip)
         self.assertEqual((await self.work_current())["reference"], ref)
         self.assertFalse((await self.work_inspected(ref))["permission_granted"])
-        saved = local_receipt(self.authority.db, self.sid)
+        saved = local_receipt(self.db, self.sid)
         with self.assertRaises(RuntimeStoreError):
-            reset_local_target(self.authority.db, epoch=self.authority.epoch, parent_session_id=tip,
+            reset_local_target(self.db, epoch=self.authority.epoch, parent_session_id=tip,
                                entry={**saved["entry"], "session_id": tip + "-forbidden"})
-        self.assertEqual(local_receipt(self.authority.db, self.sid), saved)
+        self.assertEqual(local_receipt(self.db, self.sid), saved)
         self.assertFalse((await self.work_inspected(ref))["permission_granted"])
 
     async def test_owner_restart_invalidates_a_previously_valid_reference(self):
-        from hermes_state_runtime import begin_runtime_epoch
+        from linear_native_db import begin_runtime_epoch
         await self.local()
         ref = (await self.current())["reference"]
-        self.authority.epoch = begin_runtime_epoch(self.authority.db, instance_id="restarted")
+        self.authority.epoch = begin_runtime_epoch(self.db, instance_id="restarted")
         self.authority.instance_id = "restarted"
         with self.assertRaises(transport.Unavailable):
             await self.inspected(ref)
 
     async def test_origin_projection_does_not_change_native_state(self):
         await self.local()
-        before = self.authority.db._read_all("SELECT * FROM session_admissions")
-        sessions = self.authority.db._read_all("SELECT * FROM sessions")
+        before = self.db._read_all("SELECT * FROM session_admissions")
+        sessions = self.db._read_all("SELECT * FROM sessions")
         evidence = await self.inspected((await self.current())["reference"])
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM session_admissions"), before)
-        self.assertEqual(self.authority.db._read_all("SELECT * FROM sessions"), sessions)
+        self.assertEqual(self.db._read_all("SELECT * FROM session_admissions"), before)
+        self.assertEqual(self.db._read_all("SELECT * FROM sessions"), sessions)
         self.assertFalse(evidence["permission_granted"])
 
     async def test_native_steering_transfer_is_ambiguous(self):
-        from hermes_state_runtime import admit_session_input, steer_session_input
+        from linear_native_db import admit_session_input, steer_session_input
         await self.local()
-        queued = admit_session_input(self.authority.db, epoch=self.authority.epoch, principal_id="operator",
+        queued = admit_session_input(self.db, epoch=self.authority.epoch, principal_id="operator",
             session_id=self.sid, request_id="steer", payload={"text": "different instruction"})
-        steer_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=queued["admission_id"],
+        steer_session_input(self.db, epoch=self.authority.epoch, admission_id=queued["admission_id"],
                             generation=self.row["generation"])
         with self.assertRaises(transport.Unavailable):
             await self.current()
 
     async def test_unknown_execution_does_not_become_requester_authority(self):
         await self.local()
-        self.authority.db._execute_write(lambda c: c.execute(
+        self.db._execute_write(lambda c: c.execute(
             "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (self.admission,)))
         with self.assertRaises(transport.Unavailable):
             await self.current()
 
     async def test_native_reconciled_unknown_history_does_not_block_a_new_request(self):
-        from hermes_state_runtime import (admit_session_input, begin_runtime_epoch, claim_session_input,
+        from linear_native_db import (admit_session_input, begin_runtime_epoch, claim_session_input,
             recover_session_inputs, resolve_unknown_session_input, RuntimeStoreError)
         await self.local()
         old_id, old_generation = self.admission, self.row["generation"]
-        self.authority.epoch = begin_runtime_epoch(self.authority.db, instance_id="recovered")
+        self.authority.epoch = begin_runtime_epoch(self.db, instance_id="recovered")
         self.authority.instance_id = "recovered"
-        recover_session_inputs(self.authority.db, epoch=self.authority.epoch)
-        new = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        recover_session_inputs(self.db, epoch=self.authority.epoch)
+        new = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid, request_id="new-request",
             payload={"text": "Take over a new increment of ABC-1"})
         # The native owner itself prohibits execution behind unresolved uncertainty.
         with self.assertRaisesRegex(RuntimeStoreError, "unknown_execution"):
-            claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
-        resolve_unknown_session_input(self.authority.db, epoch=self.authority.epoch,
+            claim_session_input(self.db, epoch=self.authority.epoch, session_id=self.sid)
+        resolve_unknown_session_input(self.db, epoch=self.authority.epoch,
                                       admission_id=old_id, generation=old_generation)
         self.admission = new["admission_id"]
         self.claim()
@@ -2570,17 +2573,17 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(evidence["reference"]["admission_id"], old_id)
 
     async def test_old_steering_history_does_not_block_the_current_generation(self):
-        from hermes_state_runtime import admit_session_input, steer_session_input, settle_session_input
+        from linear_native_db import admit_session_input, steer_session_input, settle_session_input
         await self.local()
         old_generation = self.row["generation"]
-        steering = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        steering = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid, request_id="old-steer",
             payload={"text": "Earlier bounded clarification"})
-        steer_session_input(self.authority.db, epoch=self.authority.epoch,
+        steer_session_input(self.db, epoch=self.authority.epoch,
                             admission_id=steering["admission_id"], generation=old_generation)
-        settle_session_input(self.authority.db, epoch=self.authority.epoch, admission_id=self.admission,
+        settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
             generation=old_generation, outcome="completed", _transfers={steering["admission_id"]: True})
-        later = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        later = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid, request_id="later",
             payload={"text": "Take over the remaining work on ABC-1"})
         self.admission = later["admission_id"]
@@ -3057,60 +3060,60 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_cleanup_accepts_actual_settled_admission_and_control_outcomes(self):
-        from hermes_state_runtime import (admit_session_input, claim_session_input,
+        from linear_native_db import (admit_session_input, claim_session_input,
             list_session_admissions, settle_session_input, steer_session_input)
         await self.stopped_issue()
         self.cancelled_control()
         for outcome in ("completed", "interrupted", "rejected", "failed"):
             with self.subTest(outcome=outcome):
-                receiving = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                receiving = admit_session_input(self.db, epoch=self.authority.epoch,
                     principal_id=self.conn.actor.subject, session_id=self.sid, request_id="settled-history-" + outcome,
                     payload={"text": "Finite native history outcome"})
-                claimed = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
+                claimed = claim_session_input(self.db, epoch=self.authority.epoch, session_id=self.sid)
                 self.assertEqual(claimed["admission_id"], receiving["admission_id"])
-                transferred = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                transferred = admit_session_input(self.db, epoch=self.authority.epoch,
                     principal_id=self.conn.actor.subject, session_id=self.sid, request_id="transfer-history-" + outcome,
                     payload={"text": "Finite bounded clarification"})
-                steer_session_input(self.authority.db, epoch=self.authority.epoch,
+                steer_session_input(self.db, epoch=self.authority.epoch,
                     admission_id=transferred["admission_id"], generation=claimed["generation"])
                 # A terminal row carrying a live native steering transfer is still held.
                 self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
-                settle_session_input(self.authority.db, epoch=self.authority.epoch,
+                settle_session_input(self.db, epoch=self.authority.epoch,
                     admission_id=receiving["admission_id"], generation=claimed["generation"], outcome=outcome,
                     _transfers={transferred["admission_id"]: True})
                 self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
-        retained = list_session_admissions(self.authority.db, session_id=self.sid, pending_only=False)
+        retained = list_session_admissions(self.db, session_id=self.sid, pending_only=False)
         self.assertEqual({row["outcome"] for row in retained},
                          {"completed", "interrupted", "rejected", "failed", "cancelled", "steered"})
 
     async def test_cleanup_malformed_or_independent_unknown_admission_outcome_is_held(self):
-        from hermes_state_runtime import (admit_session_input, claim_session_input,
+        from linear_native_db import (admit_session_input, claim_session_input,
             list_session_admissions, settle_session_input)
         await self.stopped_issue()
         control = self.cancelled_control()
         for outcome in (None, "unknown", "unrecognized-state", "steering", "", "COMPLETED", b"completed", b"\xff", 123):
             with self.subTest(outcome=outcome):
-                self.authority.db._execute_write(lambda conn: conn.execute(
+                self.db._execute_write(lambda conn: conn.execute(
                     "UPDATE session_admissions SET outcome=? WHERE admission_id=?", (outcome, control["admission_id"])))
                 result = await self.cleanup_inspected()
                 self.assertFalse(result["quiescence_proven"])
                 self.assertEqual(result["reason"], "native_session_has_unsettled_work")
                 self.assertFalse(result["permission_granted"])
         # A later legitimate completion cannot discharge an independently unknown row.
-        self.authority.db._execute_write(lambda conn: conn.execute(
+        self.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET outcome='unknown' WHERE admission_id=?", (control["admission_id"],)))
-        valid = admit_session_input(self.authority.db, epoch=self.authority.epoch,
+        valid = admit_session_input(self.db, epoch=self.authority.epoch,
             principal_id=self.conn.actor.subject, session_id=self.sid, request_id="later-valid-history",
             payload={"text": "Finite later native completion"})
-        claimed = claim_session_input(self.authority.db, epoch=self.authority.epoch, session_id=self.sid)
+        claimed = claim_session_input(self.db, epoch=self.authority.epoch, session_id=self.sid)
         self.assertEqual(claimed["admission_id"], valid["admission_id"])
-        settle_session_input(self.authority.db, epoch=self.authority.epoch,
+        settle_session_input(self.db, epoch=self.authority.epoch,
             admission_id=valid["admission_id"], generation=claimed["generation"], outcome="completed")
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
-        self.authority.db._execute_write(lambda conn: conn.execute(
+        self.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET status='unknown' WHERE admission_id=?", (control["admission_id"],)))
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
-        bad = [row for row in list_session_admissions(self.authority.db, session_id=self.sid, pending_only=False)
+        bad = [row for row in list_session_admissions(self.db, session_id=self.sid, pending_only=False)
                if row["admission_id"] == control["admission_id"]]
         self.assertEqual((bad[0]["status"], bad[0]["outcome"]), ("unknown", "unknown"))
 
@@ -3169,16 +3172,16 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_cleanup_corrupted_retained_owned_worker_statuses_are_unknown(self):
         import sqlite3
-        from hermes_state_runtime import register_worker_execution
+        from linear_native_db import register_worker_execution
         await self.stopped_issue()
         extra = "retained-owned-compute"
-        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id=extra,
+        register_worker_execution(self.db, epoch=self.authority.epoch, execution_id=extra,
             session_id=self.sid, generation=self.row["generation"], kind="compute", adoption_secret="fixture-extra")
         self.assertFalse((await self.cleanup_inspected())["quiescence_proven"])
         # Ordinary native storage rejects these states. The fault below models
         # corrupted retained state explicitly, never a valid native write path.
         with self.assertRaises(sqlite3.IntegrityError):
-            self.authority.db._execute_write(lambda conn: conn.execute(
+            self.db._execute_write(lambda conn: conn.execute(
                 "UPDATE worker_executions SET status='unreadable' WHERE execution_id=?", (extra,)))
         for status in ("unreadable", "", b"running", b"\xff", 123):
             with self.subTest(status=status):
@@ -3188,31 +3191,31 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                         conn.execute("UPDATE worker_executions SET status=? WHERE execution_id=?", (status, extra))
                     finally:
                         conn.execute("PRAGMA ignore_check_constraints=OFF")
-                self.authority.db._execute_write(corrupt)
-                before = self.authority.db._execute_write(lambda conn: conn.execute(
+                self.db._execute_write(corrupt)
+                before = self.db._execute_write(lambda conn: conn.execute(
                     "SELECT status FROM worker_executions WHERE execution_id=?", (extra,)).fetchone()[0])
                 result = await self.cleanup_inspected()
                 self.assertFalse(result["quiescence_proven"])
                 self.assertEqual(result["reason"], "native_worker_state_unreadable")
                 self.assertFalse(result["permission_granted"])
-                after = self.authority.db._execute_write(lambda conn: conn.execute(
+                after = self.db._execute_write(lambda conn: conn.execute(
                     "SELECT status FROM worker_executions WHERE execution_id=?", (extra,)).fetchone()[0])
                 self.assertEqual(before, after)
 
     async def test_cleanup_valid_extra_terminal_workers_and_foreign_scope_remain_readable(self):
-        from hermes_state_runtime import register_worker_execution, adopt_worker_execution, mutate_worker_execution
+        from linear_native_db import register_worker_execution, adopt_worker_execution, mutate_worker_execution
         await self.stopped_issue()
         owned = dict(epoch=self.authority.epoch, execution_id="retained-terminal-compute",
                      session_id=self.sid, generation=self.row["generation"])
-        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="fixture-owned")
+        register_worker_execution(self.db, **owned, kind="compute", adoption_secret="fixture-owned")
         self.assertEqual((await self.cleanup_inspected())["reason"], "native_worker_or_spawner_unsettled")
-        adopt_worker_execution(self.authority.db, **owned, adoption_secret="fixture-owned")
+        adopt_worker_execution(self.db, **owned, adoption_secret="fixture-owned")
         self.assertEqual((await self.cleanup_inspected())["reason"], "native_worker_or_spawner_unsettled")
-        mutate_worker_execution(self.authority.db, **owned, sequence=1, operation="execution.finish", payload={})
+        mutate_worker_execution(self.db, **owned, sequence=1, operation="execution.finish", payload={})
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         foreign = self.sid + "-unrelated-worker-scope"
-        self.authority.db.create_session(foreign, source="local")
-        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id="unrelated-compute",
+        self.db.create_session(foreign, source="local")
+        register_worker_execution(self.db, epoch=self.authority.epoch, execution_id="unrelated-compute",
             session_id=foreign, generation=0, kind="compute", adoption_secret="fixture-foreign")
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         def corrupt_foreign(conn):
@@ -3221,29 +3224,33 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 conn.execute("UPDATE worker_executions SET status='unreadable' WHERE execution_id='unrelated-compute'")
             finally:
                 conn.execute("PRAGMA ignore_check_constraints=OFF")
-        self.authority.db._execute_write(corrupt_foreign)
+        self.db._execute_write(corrupt_foreign)
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
 
     async def test_cleanup_runtime_selector_types_hold_encoded_retained_keys_without_repair(self):
-        from hermes_state_runtime import register_worker_execution, adopt_worker_execution, mutate_worker_execution
-        from hermes_state_local import local_receipt
+        from linear_native_db import register_worker_execution, adopt_worker_execution, mutate_worker_execution
+        from linear_native_db import local_receipt
         await self.stopped_issue()
         owned = dict(epoch=self.authority.epoch, execution_id="selector-proof-worker", session_id=self.sid,
                      generation=self.row["generation"])
-        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="fixture-selector")
-        adopt_worker_execution(self.authority.db, **owned, adoption_secret="fixture-selector")
-        mutate_worker_execution(self.authority.db, **owned, sequence=1, operation="execution.finish", payload={})
+        register_worker_execution(self.db, **owned, kind="compute", adoption_secret="fixture-selector")
+        adopt_worker_execution(self.db, **owned, adoption_secret="fixture-selector")
+        mutate_worker_execution(self.db, **owned, sequence=1, operation="execution.finish", payload={})
         control = self.cancelled_control()
         foreign = self.sid + "-selector-foreign"
-        self.authority.db.create_session(foreign, source="local")
-        self.authority.db.set_meta("selector-proof-meta", "opaque unrelated payload")
-        def same_snapshot(db, *args, **kwargs):
-            with db._read_ctx() as conn:
-                self.assertTrue(conn.in_transaction)
-            return local_receipt(db, *args, **kwargs)
-        with patch("hermes_state_local.local_receipt", same_snapshot):
+        self.db.create_session(foreign, source="local")
+        self.db.set_meta("selector-proof-meta", "opaque unrelated payload")
+        reads = []
+        def counted(store, *args, **kwargs):
+            reads.append(args)
+            return real_receipt(store, *args, **kwargs)
+        from hermes_fleet_linear_plugin import native_store
+        real_receipt = native_store.local_receipt
+        # Receipts come through the storage interface; the evidence's own two-snapshot digest is the stability proof.
+        with patch.object(native_store, "local_receipt", counted):
             self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
+        self.assertTrue(reads)
         cases = (("worker_executions", "execution_id", "execution_id", owned["execution_id"]),
                  ("worker_executions", "session_id", "execution_id", owned["execution_id"]),
                  ("session_admissions", "target_session_id", "admission_id", control["admission_id"]),
@@ -3253,25 +3260,25 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                  ("state_meta", "key", "key", "selector-proof-meta"))
         for table, column, selector, value in cases:
             with self.subTest(table=table, column=column):
-                row = self.authority.db._execute_write(lambda conn: conn.execute(
+                row = self.db._execute_write(lambda conn: conn.execute(
                     f"SELECT rowid AS native_rowid,{column} FROM {table} WHERE {selector}=?", (value,)).fetchone())
                 original = row[column]
                 damaged = (original or self.sid).encode()
                 def update_key(raw):
                     # Explicit corruption/restoration of this isolated fixture;
                     # production inspection never disables constraints or repairs.
-                    self.authority.db._conn.execute("PRAGMA foreign_keys=OFF")
+                    self.db._conn.execute("PRAGMA foreign_keys=OFF")
                     try:
-                        self.authority.db._execute_write(lambda conn: conn.execute(
+                        self.db._execute_write(lambda conn: conn.execute(
                             f"UPDATE {table} SET {column}=? WHERE rowid=?", (raw, row["native_rowid"])))
                     finally:
-                        self.authority.db._conn.execute("PRAGMA foreign_keys=ON")
+                        self.db._conn.execute("PRAGMA foreign_keys=ON")
                 update_key(damaged)
                 try:
                     result = await self.cleanup_inspected()
                     self.assertFalse(result["quiescence_proven"])
                     self.assertEqual(result["reason"], "native_runtime_ownership_key_unreadable")
-                    retained = self.authority.db._execute_write(lambda conn: conn.execute(
+                    retained = self.db._execute_write(lambda conn: conn.execute(
                         f"SELECT {column} FROM {table} WHERE rowid=?", (row["native_rowid"],)).fetchone()[0])
                     self.assertEqual(retained, damaged)
                 finally:
@@ -3279,11 +3286,11 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
     async def test_cleanup_runtime_key_snapshot_rechecks_rpc_race_and_ignores_foreign_payload(self):
-        from hermes_state_runtime import register_worker_execution
+        from linear_native_db import register_worker_execution
         await self.stopped_issue()
         foreign = self.sid + "-unrelated-scope"
-        self.authority.db.create_session(foreign, source="local")
-        register_worker_execution(self.authority.db, epoch=self.authority.epoch, execution_id="foreign-selector-proof",
+        self.db.create_session(foreign, source="local")
+        register_worker_execution(self.db, epoch=self.authority.epoch, execution_id="foreign-selector-proof",
             session_id=foreign, generation=0, kind="compute", adoption_secret="fixture-foreign-selector")
         def foreign_corruption(conn):
             conn.execute("PRAGMA ignore_check_constraints=ON")
@@ -3292,12 +3299,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 conn.execute("UPDATE sessions SET model_config='not-json' WHERE id=?", (foreign,))
             finally:
                 conn.execute("PRAGMA ignore_check_constraints=OFF")
-        self.authority.db._execute_write(foreign_corruption)
-        self.authority.db.set_meta("unrelated-payload", "not-json")
+        self.db._execute_write(foreign_corruption)
+        self.db.set_meta("unrelated-payload", "not-json")
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
         def arriving(method, params):
             self.before_rpc = None
-            self.authority.db._execute_write(lambda conn: conn.execute(
+            self.db._execute_write(lambda conn: conn.execute(
                 "UPDATE state_meta SET key=? WHERE key='unrelated-payload'",
                 (("fixture.pending.stop." + self.sid).encode(),)))
         self.before_rpc = arriving
@@ -3307,20 +3314,20 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_cleanup_runtime_bounded_identity_contract_rejects_empty_and_oversize_selectors(self):
-        from hermes_state_runtime import (RuntimeStoreError, register_worker_execution,
+        from linear_native_db import (RuntimeStoreError, register_worker_execution,
             adopt_worker_execution, mutate_worker_execution, admit_session_input)
         await self.stopped_issue()
         owned = dict(epoch=self.authority.epoch, execution_id="bounded-selector-worker", session_id=self.sid,
                      generation=self.row["generation"])
-        register_worker_execution(self.authority.db, **owned, kind="compute", adoption_secret="fixture-bounds")
-        adopt_worker_execution(self.authority.db, **owned, adoption_secret="fixture-bounds")
-        mutate_worker_execution(self.authority.db, **owned, sequence=1, operation="execution.finish", payload={})
+        register_worker_execution(self.db, **owned, kind="compute", adoption_secret="fixture-bounds")
+        adopt_worker_execution(self.db, **owned, adoption_secret="fixture-bounds")
+        mutate_worker_execution(self.db, **owned, sequence=1, operation="execution.finish", payload={})
         control = self.cancelled_control()
         cases = (("worker_executions", "execution_id", "execution_id", owned["execution_id"]),
                  ("worker_executions", "session_id", "execution_id", owned["execution_id"]),
                  ("session_admissions", "target_session_id", "admission_id", control["admission_id"]))
         for table, column, selector, value in cases:
-            original = self.authority.db._execute_write(lambda conn: conn.execute(
+            original = self.db._execute_write(lambda conn: conn.execute(
                 f"SELECT rowid AS native_rowid,{column} FROM {table} WHERE {selector}=?", (value,)).fetchone())
             for bad in ("", "x" * 1025):
                 with self.subTest(table=table, column=column, length=len(bad)):
@@ -3328,26 +3335,26 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                     # second implementation of their identity grammar.
                     with self.assertRaisesRegex(RuntimeStoreError, "invalid_params"):
                         if column == "target_session_id":
-                            admit_session_input(self.authority.db, epoch=self.authority.epoch,
+                            admit_session_input(self.db, epoch=self.authority.epoch,
                                 principal_id=self.conn.actor.subject, session_id=bad, request_id="bad-target",
                                 payload={"text": "Finite native identity refusal"})
                         else:
-                            register_worker_execution(self.authority.db,
+                            register_worker_execution(self.db,
                                 **{**owned, column: bad}, kind="compute", adoption_secret="fixture-bounds")
                     def update_key(raw):
                         # Corrupt/restore only this isolated retained-state fixture.
-                        self.authority.db._conn.execute("PRAGMA foreign_keys=OFF")
+                        self.db._conn.execute("PRAGMA foreign_keys=OFF")
                         try:
-                            self.authority.db._execute_write(lambda conn: conn.execute(
+                            self.db._execute_write(lambda conn: conn.execute(
                                 f"UPDATE {table} SET {column}=? WHERE rowid=?", (raw, original["native_rowid"])))
                         finally:
-                            self.authority.db._conn.execute("PRAGMA foreign_keys=ON")
+                            self.db._conn.execute("PRAGMA foreign_keys=ON")
                     update_key(bad)
                     try:
                         result = await self.cleanup_inspected()
                         self.assertFalse(result["quiescence_proven"])
                         self.assertEqual(result["reason"], "native_runtime_ownership_key_unreadable")
-                        retained = self.authority.db._execute_write(lambda conn: conn.execute(
+                        retained = self.db._execute_write(lambda conn: conn.execute(
                             f"SELECT {column} FROM {table} WHERE rowid=?", (original["native_rowid"],)).fetchone()[0])
                         self.assertEqual(retained, bad)
                     finally:
@@ -3355,28 +3362,28 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
 
     async def test_cleanup_preserves_actual_native_identity_and_broader_text_contracts(self):
-        from hermes_state_runtime import register_worker_execution, adopt_worker_execution, mutate_worker_execution, admit_session_input
+        from linear_native_db import register_worker_execution, adopt_worker_execution, mutate_worker_execution, admit_session_input
         await self.stopped_issue()
         for execution_id in (" ", "e" * 1024):
             args = dict(epoch=self.authority.epoch, execution_id=execution_id,
                         session_id=self.sid, generation=self.row["generation"])
-            register_worker_execution(self.authority.db, **args, kind="compute", adoption_secret="fixture-valid-bound")
-            adopt_worker_execution(self.authority.db, **args, adoption_secret="fixture-valid-bound")
-            mutate_worker_execution(self.authority.db, **args, sequence=1, operation="execution.finish", payload={})
+            register_worker_execution(self.db, **args, kind="compute", adoption_secret="fixture-valid-bound")
+            adopt_worker_execution(self.db, **args, adoption_secret="fixture-valid-bound")
+            mutate_worker_execution(self.db, **args, sequence=1, operation="execution.finish", payload={})
         for index, foreign in enumerate((" ", "s" * 1024)):
-            self.authority.db.create_session(foreign, source="local", chat_id="")
-            admit_session_input(self.authority.db, epoch=self.authority.epoch,
+            self.db.create_session(foreign, source="local", chat_id="")
+            admit_session_input(self.db, epoch=self.authority.epoch,
                 principal_id=self.conn.actor.subject, session_id=foreign, request_id="valid-bound-" + str(index),
                 payload={"text": "Unrelated valid native work"})
-            register_worker_execution(self.authority.db, epoch=self.authority.epoch,
+            register_worker_execution(self.db, epoch=self.authority.epoch,
                 execution_id="foreign-bound-" + str(index), session_id=foreign, generation=0,
                 kind="compute", adoption_secret="fixture-foreign-bound")
         # SessionDB's constructor and metadata writer have broader TEXT
         # contracts. Do not import RuntimeStore's identifier bound into them.
         for session in ("", "w" * 2048):
-            self.authority.db.create_session(session, source="local", chat_id="")
-        self.authority.db.create_session("foreign-wide-parent", source="local", parent_session_id="w" * 2048,
+            self.db.create_session(session, source="local", chat_id="")
+        self.db.create_session("foreign-wide-parent", source="local", parent_session_id="w" * 2048,
                                          chat_id="c" * 2048)
-        self.authority.db.set_meta("", "opaque metadata")
-        self.authority.db.set_meta("native-prefix:" + "m" * 2048, "opaque metadata")
+        self.db.set_meta("", "opaque metadata")
+        self.db.set_meta("native-prefix:" + "m" * 2048, "opaque metadata")
         self.assertTrue((await self.cleanup_inspected())["quiescence_proven"])
