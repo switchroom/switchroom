@@ -418,9 +418,7 @@ def _lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, 
     for the same agent; a person's pause or another agent's never qualifies), and the row is that
     run's Kanban card attempt.
     Any other row (``started``, terminal, foreign, missing) is None: nothing is resolved."""
-    from hermes_state import SessionDB
-    from hermes_state_local import local_receipt
-    from hermes_state_runtime import find_session_admission
+    from .native_store import reader, local_receipt, find_admission
     task = adapter.require_task(task_id)
     if task.status != "blocked" or task.current_run_id is not None or task.block_kind != "needs_input":
         return None
@@ -443,11 +441,11 @@ def _lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, 
     if (not isinstance(sid, str) or not sid or marker.get("request_id") != request
             or Path(str(marker.get("db") or "")).resolve() != home / "state.db"):
         return None
-    with SessionDB(home / "state.db", read_only=True) as db:
+    with reader(home) as db:
         saved = local_receipt(db, sid)
         if saved.get("request_id") != request:
             return None
-        row = find_session_admission(db, principal_id=saved["principal_id"], session_id=sid, request_id=request)
+        row = find_admission(db, principal_id=saved["principal_id"], session_id=sid, request_id=request)
     if (row is None or row.get("status") != "unknown" or row.get("target_session_id") != sid
             or type(row.get("generation")) is not int or not isinstance(row.get("payload"), dict)
             or row["payload"].get("kanban_card_v1") != {"board": bound["board"], "task_id": task_id, "run_id": run_id}):

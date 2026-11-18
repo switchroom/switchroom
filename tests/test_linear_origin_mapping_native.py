@@ -14,20 +14,20 @@ BAD = ([], [1], "scalar", "", True, False, 1, 0, 0.5)
 
 class MappingScenarios(base.OriginScenarios):
     def payload(self):
-        return json.loads(self.authority.db._read_one(
+        return json.loads(self.db._read_one(
             "SELECT payload_json FROM session_admissions WHERE admission_id=?", (self.admission,))[0])
 
     def write_payload(self, value):
-        self.authority.db._execute_write(lambda conn: conn.execute(
+        self.db._execute_write(lambda conn: conn.execute(
             "UPDATE session_admissions SET payload_json=? WHERE admission_id=?", (json.dumps(value), self.admission)))
 
     def policy(self):
-        from hermes_state_local import local_receipt
-        return local_receipt(self.authority.db, self.sid)
+        from linear_native_db import local_receipt
+        return local_receipt(self.db, self.sid)
 
     def write_policy(self, value):
-        from hermes_state_local import POLICY_PREFIX
-        self.authority.db.set_meta(POLICY_PREFIX + self.sid, json.dumps(value))
+        from linear_native_db import POLICY_PREFIX
+        self.db.set_meta(POLICY_PREFIX + self.sid, json.dumps(value))
 
     async def owner_cli_refused(self, action, ref):
         parser = argparse.ArgumentParser()
@@ -40,7 +40,7 @@ class MappingScenarios(base.OriginScenarios):
         self.assertFalse(json.loads(printed.call_args.args[0])["ok"])
 
     async def test_mapping_origin_primary_payloads_and_owner_cli(self):
-        from hermes_state_runtime import _json, RuntimeStoreError
+        from linear_native_db import _json, RuntimeStoreError
         await self.local()
         ref = (await self.current())["reference"]
         original = self.payload()

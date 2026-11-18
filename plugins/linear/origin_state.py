@@ -15,9 +15,9 @@ def stop_evidence(home: Path, session_id: str) -> dict:
     getter = getattr(session_ancillary, "process_stop_pending", None)
     if getter is None:
         return {"state": "unknown", "source": "native_stop_checkpoint_unavailable", "quiescence_proven": False}
-    from hermes_state import SessionDB
-    with SessionDB(home / "state.db", read_only=True) as db:
-        pending = getter(db, session_id)
+    from . import native_store
+    with native_store.reader(home) as store:
+        pending = getter(store, session_id)
     if pending is not None:
         _refuse("The native owner has a pending Stop checkpoint; current origin evidence is refused.")
     return {"state": "clear", "source": "native_process_stop_checkpoint", "quiescence_proven": False}
@@ -29,12 +29,12 @@ def _refuse(message="The originating native request is not current and independe
 
 def current_admission(row: dict | None) -> dict:
     """Validate only the selected active row against its native writer/claim contract."""
-    from hermes_state_runtime import _text, _json
+    from .native_store import text, json_object
     if row is None:
         _refuse()
     for key in ("admission_id", "request_id", "principal_id", "target_session_id"):
-        _text(row[key])
-    _json(row["payload"])
+        text(row[key])
+    json_object(row["payload"])
     if (row["intent"] not in ("queue", "steer", "redirect")
             or any(type(row[key]) is not int or row[key] < 1 for key in ("seq", "owner_epoch", "generation"))
             or row["status"] != "started" or row["outcome"] is not None):
@@ -45,10 +45,9 @@ def current_admission(row: dict | None) -> dict:
 
 def resolve_reference(home: Path, ref: dict) -> str:
     """Resolve private logical coordinates only from this owner's exact native admission."""
-    from hermes_state import SessionDB
-    from hermes_state_runtime import get_session_admission
-    with SessionDB(home / "state.db", read_only=True) as db:
-        row = get_session_admission(db, admission_id=ref["admission_id"])
+    from . import native_store
+    with native_store.reader(home) as db:
+        row = native_store.get_admission(db, ref["admission_id"])
         current_admission(row)
         if (row["owner_epoch"] != ref["authority_epoch"]
                 or row["generation"] != ref["execution_generation"]):
@@ -59,7 +58,7 @@ def resolve_reference(home: Path, ref: dict) -> str:
 def _policy(db, session_id: str, platform: str) -> dict:
     if platform != "local":
         return {"source": platform}
-    from hermes_state_local import local_receipt
+    from .native_store import local_receipt
     from gateway.session_policy import restore_policy
     policy = restore_policy(local_receipt(db, session_id)["policy"])
     if policy.source not in INTERACTIVE_SOURCES:
@@ -71,13 +70,13 @@ def _policy(db, session_id: str, platform: str) -> dict:
 def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
               context: NativeContext | None) -> dict:
     """Read exactly one native admission, using the owner's native read-only state API."""
-    from hermes_state import SessionDB
-    from hermes_state_runtime import get_session_admission, _json
+    from . import native_store
+    from .native_store import json_object as _json
     from gateway.session_operator import is_viewer_input
     from agent.turn_author import parse_turn_author
-    with SessionDB(home / "state.db", read_only=True) as db:
+    with native_store.reader(home) as db:
         sid = current["session_id"]
-        row = get_session_admission(db, admission_id=ref["admission_id"])
+        row = native_store.get_admission(db, ref["admission_id"])
         if current_admission(row) != current["admission_header"]:
             _refuse()
         if (row["target_session_id"] != sid
@@ -147,7 +146,7 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
             if context and context.platform != platform:
                 _refuse()
         elif is_viewer_input(row):
-            from hermes_state_local import local_receipt
+            local_receipt = native_store.local_receipt
             platform = "local"
             stamp = payload.get("local_operator_v1")
             owner = local_receipt(db, sid)
@@ -160,7 +159,7 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
                 _refuse()
         else:
             _refuse("The admission is not ordinary native requester input.")
-        stored = db.get_session(sid)
+        stored = native_store.session_row(db, sid)
         if not stored or stored.get("source") not in ({platform} if platform != "local" else INTERACTIVE_SOURCES | {"local"}):
             _refuse("The stored session is not an eligible requester surface.")
         policy = _policy(db, sid, platform)
@@ -173,21 +172,16 @@ def _evidence(home: Path, ref: dict, current: dict, declared_scope: dict,
 
 def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
     """Only this session's lineage and admission state; no transcript, config or tool inventory."""
-    from hermes_state import SessionDB
-    from hermes_state_local import local_lineage_owner
-    from hermes_state_runtime import list_session_admissions
-    with SessionDB(home / "state.db", read_only=True) as db:
-        lineage = db.get_compression_lineage(session_id)
-        canonical = lineage[0] if lineage else session_id
+    from . import native_store
+    with native_store.reader(home) as db:
         # Match the native admission owner: compression root, then local reset owner.
-        with db._read_ctx() as conn:
-            canonical = local_lineage_owner(conn, canonical)
-        session = db.get_session(canonical)
+        canonical = native_store.canonical_owner(db, session_id)
+        session = native_store.session_row(db, canonical)
         if session is None:
             _refuse()
         # Native steering transfers are terminal rows held against the active generation.
         # The native list API includes them only with pending_only=False. Never return them.
-        rows = list_session_admissions(db, session_id=canonical, pending_only=False)
+        rows = native_store.list_admissions(db, canonical, pending_only=False)
         generation = session.get("runtime_generation")
         started = [r for r in rows if r["status"] == "started" and r.get("generation") == generation]
         if type(generation) is not int or generation < 1 or len(started) != 1:

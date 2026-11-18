@@ -27,8 +27,7 @@ _SETTLED_RUN_STATUSES = frozenset({
 })
 
 
-# Native hermes_state_runtime writers: settle_session_input,
-# cancel_session_input and settle_steer_transfers. STEERING is in-flight even
+# Native admission writers (the storage interface's settle, cancel and steer transfers). STEERING is in-flight even
 # though its row is terminal; unknown or future outcomes are not settlement.
 _SETTLED_ADMISSION_OUTCOMES = frozenset({
     "completed", "interrupted", "rejected", "failed", "cancelled", "steered",
@@ -422,16 +421,15 @@ def _checkpoint(home, owners):
     return {"scoped_records": 0, "recycled_records": 0}
 
 
-def _lineage_inputs(native, session_id):
+def _lineage_inputs(store, native, session_id):
     """Prevalidate only mapping fields consumed by native runtime_lineage."""
-    from hermes_state_local import POLICY_PREFIX
+    from . import native_store
     observed = {"receipts": {}, "reset_models": {}}
     row = native.execute("SELECT chat_id FROM sessions WHERE id=?", (session_id,)).fetchone()
     for logical in dict.fromkeys([session_id, *([row[0]] if row and row[0] else [])]):
-        saved = native.execute("SELECT value FROM state_meta WHERE key=?", (POLICY_PREFIX + logical,)).fetchone()
-        if saved is None:
+        if not store.bindings.binding_marks(logical).policy:
             continue
-        receipt = native_json_object(saved[0])
+        receipt = native_store.local_receipt(store, logical)
         observed["receipts"][logical] = receipt
         if logical != session_id and session_id not in receipt.get("lineage", [logical]):
             continue
@@ -447,17 +445,17 @@ def _lineage_inputs(native, session_id):
     return observed
 
 
-def _runtime_scope(native, session_id, execution_id):
+def _runtime_scope(store, native, session_id, execution_id):
     """Close over retained native sessions and executions inside one read snapshot."""
-    from hermes_state_runtime_workers import runtime_lineage, descendant_range
+    from .native_store import runtime_lineage, descendant_range
     sessions, workers, children, inspected, lineage_inputs = set(), {}, {}, set(), {}
     pending_sessions, pending_roots = {session_id}, {execution_id}
     columns = "execution_id,session_id,status,kind,owner_epoch,generation,last_sequence"
     while pending_sessions or pending_roots:
         discovered = set()
         for target in sorted(pending_sessions):
-            lineage_inputs[target] = _lineage_inputs(native, target)
-            discovered.update(runtime_lineage(native, target))
+            lineage_inputs[target] = _lineage_inputs(store, native, target)
+            discovered.update(runtime_lineage(store, target))
         discovered.difference_update(sessions)
         sessions.update(discovered)
         for row in native.execute(f"SELECT {columns} FROM worker_executions "
@@ -483,7 +481,7 @@ def _runtime_scope(native, session_id, execution_id):
 
 
 def _require_owned_workers(native, workers, epoch):
-    from hermes_state_runtime import _session, _linked_worker_admission
+    from .native_store import session_row_raw as _session, linked_worker_admission as _linked_worker_admission
     # worker_executions' native CHECK/NOT NULL contract and the actual writers:
     # register binds an integer epoch/generation; begin_runtime_epoch starts at
     # one, session generations start at zero and only advance, and receipt
@@ -505,7 +503,8 @@ def _require_owned_workers(native, workers, epoch):
 
 
 def _require_owned_admissions(native, rows, epoch):
-    from hermes_state_runtime import RuntimeStoreError, _text, _json, _session
+    from .native_store import refusal_type, text as _text, json_object as _json, session_row_raw as _session
+    RuntimeStoreError = refusal_type()
     for row in rows:
         try:
             for key in ("admission_id", "request_id", "principal_id", "target_session_id"):
@@ -528,11 +527,10 @@ def _require_owned_admissions(native, rows, epoch):
 
 def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, declared, metadata, ingress=None):
     from hermes_cli import kanban_db as kb
-    from hermes_state import SessionDB
-    from hermes_state_local import local_receipt
-    from hermes_state_keys import local_identity
-    from hermes_state_runtime import (RuntimeStoreError, _text as runtime_identity, _json as runtime_payload,
-                                      find_session_admission, list_session_admissions)
+    from . import native_store
+    from .native_store import (local_receipt, local_identity, text as runtime_identity, json_object as runtime_payload,
+                               find_admission as find_session_admission, list_admissions as list_session_admissions)
+    RuntimeStoreError = native_store.refusal_type()
     from gateway.session_policy import restore_policy
     from gateway import session_ancillary
     getter = getattr(session_ancillary, "process_stop_pending", None)
@@ -553,13 +551,12 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
             namespace_evidence[epoch] = _namespace_disposition(ingress, home, binding_profile, native_profile, epoch)
         return True
     disposition = disposed if ingress is not None else None
-    with reader.history_conn(path, snapshot=True) as board, SessionDB(home / "state.db", read_only=True) as db:
+    with reader.history_conn(path, snapshot=True) as board, native_store.reader(home) as db:
         from .bridge import task_issue_match, require_task_issue_scope, native_text_row, native_event_payload
         from .api import LinearError
-        with db._read_ctx() as native:
-            # Pin this existing mode=ro connection for the preflight and all
-            # subsequent native helper reads. No owner RPC runs in this scope.
-            native.execute("BEGIN")
+        with native_store.read_ctx(home) as native:
+            # Pin this mode=ro connection (its read transaction is open) for the preflight.
+            # No owner RPC runs in this scope.
             # Runtime identities are TEXT, unlike Kanban's legacy decoding.
             # A malformed selector has no proved foreign attribution: hold it
             # before WHERE can hide it, never decode it into identity/authority.
@@ -672,7 +669,10 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                      and Path(frozen.get("db", "")).resolve() == path and policy.cwd == frozen.get("workspace")
                      and saved["request_id"] == request and marker["request_id"] == request
                      and sid == local_identity(str(home), saved["principal_id"], request), "native_attempt_binding_mismatch")
-            admission = find_session_admission(db, principal_id=saved["principal_id"], session_id=sid, request_id=request)
+            try:
+                admission = find_session_admission(db, principal_id=saved["principal_id"], session_id=sid, request_id=request)
+            except ValueError as exc:  # a stored row the storage interface cannot decode is unreadable, not absent
+                raise Unknown("native_admission_state_unreadable") from exc
             try:
                 if admission is not None:
                     runtime_payload(admission["payload"])
@@ -688,8 +688,8 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                 return proof["reason"]
             if run["worker_pid"] is not None or run["worker_started_at"] is not None:
                 _pid_gone(run["worker_pid"], run["worker_started_at"], marker, replaced=replaced, disposition=disposition)
-            with db._read_ctx() as native:
-                lineage, native_workers, children, lineage_inputs = _runtime_scope(native, sid, "admission-worker:" + admission["admission_id"])
+            with native_store.read_ctx(home) as native:
+                lineage, native_workers, children, lineage_inputs = _runtime_scope(db, native, sid, "admission-worker:" + admission["admission_id"])
                 epoch = native.execute("SELECT epoch,instance_id FROM runtime_epoch WHERE singleton=1").fetchone()
                 _require(epoch is not None and type(epoch[0]) is int and epoch[0] > 0, "native_owner_unknown")
                 runtime_identity(epoch[1])
@@ -700,11 +700,14 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                                           ("admission-worker:" + admission["admission_id"],)).fetchone()
                 _require(executor and tuple(executor) == ("terminal", admission["owner_epoch"], admission["generation"]),
                          "native_executor_settlement_missing")
-            retained = [row for target in sorted(lineage)
-                        for row in list_session_admissions(db, session_id=target, pending_only=False)]
+            try:
+                retained = [row for target in sorted(lineage)
+                            for row in list_session_admissions(db, session_id=target, pending_only=False)]
+            except ValueError as exc:
+                raise Unknown("native_admission_state_unreadable") from exc
             _require(all(row["status"] == "terminal" and row.get("outcome") in _SETTLED_ADMISSION_OUTCOMES
                          for row in retained), "native_session_has_unsettled_work")
-            with db._read_ctx() as native:
+            with native_store.read_ctx(home) as native:
                 _require_owned_admissions(native, retained, epoch[0])
             _require(all(getter(db, target) is None for target in lineage), "native_stop_checkpoint_pending")
             native_lineages.append({"sessions": sorted(lineage), "admissions": retained,

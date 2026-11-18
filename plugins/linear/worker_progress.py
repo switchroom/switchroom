@@ -16,12 +16,10 @@ from .transport import Unavailable
 
 
 async def _read(home, adapter, task, session_id):
-    from hermes_state import SessionDB
-    from hermes_state_local import local_receipt
-    from hermes_state_keys import local_identity
+    from .native_store import reader, local_receipt, local_identity
     from gateway.session_policy import restore_policy
     from .origin_state import stop_evidence
-    with SessionDB(home / "state.db", read_only=True) as db:
+    with reader(home) as db:
         saved = local_receipt(db, session_id)
         policy = restore_policy(saved["policy"])
     frozen = json.loads(policy.kanban_json or "null")
