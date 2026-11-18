@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 import unittest
 from contextlib import closing
 from unittest.mock import patch
@@ -59,19 +60,29 @@ class BoardValidationScenarios(unittest.TestCase):
         # checkpoint below really moves pages into the database file and empties the WAL.
         with closing(connect_tracked(self.database)) as keeper:
             keeper.execute("SELECT count(*) FROM tasks").fetchone()
-            with self.board.conn() as conn:
-                native.kb.add_comment(conn, self.task_id, "operator", "a later native note")
-            self.read()
-            self.assertEqual(len(self.checks), 1)
-            self.read()
-            self.assertEqual(len(self.checks), 1)
-            self.assertGreater(os.stat(str(self.database) + "-wal").st_size, 0)
-            keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            self.assertEqual(os.stat(str(self.database) + "-wal").st_size, 0)
-            self.read()
-            self.assertEqual(len(self.checks), 2)
-            self.read()
-            self.assertEqual(len(self.checks), 2)
+            # Core picks the journal mode (a rollback journal on SQLite builds with the WAL-reset bug).
+            wal = keeper.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+            for n in range(2):
+                # A same-size rewrite is told apart by mtime/ctime, so let the clock tick past
+                # coarse filesystem timestamp granularity (a few ms) since the cached stat.
+                time.sleep(0.05)
+                with self.board.conn() as conn:
+                    native.kb.add_comment(conn, self.task_id, "operator", f"a later native note {n}")
+                self.read()
+                self.assertEqual(len(self.checks), n + 1)
+                self.read()
+                self.assertEqual(len(self.checks), n + 1)
+            if wal:
+                self.assertGreater(os.stat(str(self.database) + "-wal").st_size, 0)
+                time.sleep(0.05)
+                keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                self.assertEqual(os.stat(str(self.database) + "-wal").st_size, 0)
+                self.read()
+                self.assertEqual(len(self.checks), 3)
+                self.read()
+                self.assertEqual(len(self.checks), 3)
+            else:
+                self.assertFalse(os.path.exists(str(self.database) + "-wal"))
 
     def test_validation_expires(self):
         later = bridge_module.time.monotonic() + bridge_module.NATIVE_VALIDATION_MAX_AGE + 1
