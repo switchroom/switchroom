@@ -1367,10 +1367,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         # The blocker sentence is captured with the event; the state is reconciled after the batch
         # and delivered first (the sentence waits on it).
         rows = self.store.pending(ISSUE)
-        self.assertEqual([row["kind"] for row in rows], ["activity", "comment", "status"])
-        self.assertEqual(rows[0]["payload"]["requires_status_id"], rows[2]["id"])
-        self.assertEqual(rows[1]["payload"]["requires_status_id"], rows[2]["id"])
-        self.assertIs(rows[1]["payload"]["native_issue_comment"], True)
+        # The session's elicitation is the blocker's one thread record; no issue comment repeats it.
+        self.assertEqual([row["kind"] for row in rows], ["activity", "status"])
+        self.assertEqual(rows[0]["payload"]["content"]["type"], "elicitation")
+        self.assertEqual(rows[0]["payload"]["requires_status_id"], rows[1]["id"])
+        self.assertEqual(rows[0]["payload"]["native_progress_states"], ["blocked"])
 
     def test_all_specialist_effects_recheck_the_authoritative_resource_before_mutation(self):
         for name, action in (
@@ -1485,7 +1486,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertFalse(any("issueUpdate" in query for query in self.authority.mutations))
 
 
-    def test_worker_heartbeat_stays_ephemeral_and_only_checkpoint_becomes_human_activity(self):
+    def test_worker_heartbeat_stays_ephemeral_and_only_checkpoint_becomes_human_comment(self):
         from types import SimpleNamespace
         self.bridge.handle_webhook(self.session_event())
         self.authority.issues[ISSUE]["delegate"] = {"id": VIEWER}
@@ -1508,7 +1509,10 @@ class SessionRequesterTests(unittest.TestCase):
         self.assertEqual(actions[-1]["content"], {"type": "action", "action": "Working", "parameter": "Reading the stock report"})
         self.assertTrue(actions[-1]["ephemeral"])
         self.assertEqual(len(actions), 1)
-        self.assertIn("Checked the Sydney stock file", thoughts)
+        # The checkpoint is one issue comment, not also a session thought.
+        self.assertNotIn("Checked the Sydney stock file", thoughts)
+        self.assertEqual([item["payload"]["body"] for item in self.store.pending() if item["kind"] == "comment"
+                          and item["payload"].get("native_history_event_id") == 12], ["Checked the Sydney stock file"])
 
     def test_comment_resolver_uses_core_strip_contract_and_skips_bridge_authors(self):
         from types import SimpleNamespace

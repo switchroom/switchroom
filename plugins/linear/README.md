@@ -59,8 +59,8 @@ parked under the shared `create:<issue>` intent and `linear:<issue>` retry key, 
 and admits it against its creation event token. The webhook from this app's own delegation
 finds that admission and starts no second task or worker. Work bound with no Agent Session
 (started from chat, by `take_over` or a `track`/`work_on` link) adopts the session Linear
-opens for it: one thought says this is the work already running, then Started, checkpoints,
-heartbeats and the keepalive post there as activities. Completion posts one full,
+opens for it: one thought says this is the work already running, then Started, heartbeats
+and the keepalive post there as activities, while checkpoints stay issue comments. Completion posts one full,
 regular top-level issue comment preserving the worker's supplied result, evidence
 and remaining work, then a short Agent Session response points to that comment. The session response
 waits for exact comment readback, including this app's author and no parent;
@@ -275,9 +275,12 @@ what changed, what is next and any blocker or decision needed, using the same re
 body on retry. Checkpoints are meaningful milestones, not periodic heartbeat messages.
 
 The issue also receives a concise start note and meaningful native review, wait and blocker
-milestones. The session keeps its existing checkpoints, live steps, heartbeats, questions and lifecycle updates.
-Each checkpoint has one regular issue comment and retains its existing session note; retries
-do not create another comment or another session note. A checkpoint captured before
+milestones. Each checkpoint and milestone appears once in the issue thread. A checkpoint is
+only its regular issue comment, with no repeated session thought. With a session, a milestone
+Linear shows as a thread reply (an elicitation such as "Waiting on you", a response or an error)
+is only that activity, which keeps the comment's phase recheck; a session-only thought milestone
+(review, wait, dependency) is only the issue comment. The session keeps live steps, heartbeats,
+questions and lifecycle updates. Retries do not create another comment or activity. A checkpoint captured before
 a session opens keeps its original issue-comment identity when the session adopts the work;
 adoption does not replay that earlier checkpoint into the new session.
 Unattempted lifecycle comments recheck their native phase before publication; obsolete progress

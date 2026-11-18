@@ -269,10 +269,10 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [task_id])
         self.assertEqual((before.status, before.current_run_id), (after.status, after.current_run_id))
         answers = [record for record in self.authority.activity_records if record["agentSessionId"] == "echo-session"]
-        # The session now reports the work (the checkpoint read after it opened lands there too).
-        self.assertEqual([a["content"]["type"] for a in answers], ["thought", "thought"])  # a response would close it
+        # The session now reports the work; the checkpoint is its one issue comment, not a session note.
+        self.assertEqual([a["content"]["type"] for a in answers], ["thought"])  # a response would close it
         self.assertIn("Continuing the existing work on this issue, continued from chat", answers[0]["content"]["body"])
-        self.assertEqual(answers[1]["content"]["body"], "Proxy deployed to staging.")
+        self.assertEqual(self.issue_comments(NEW_ISSUE).count("Proxy deployed to staging."), 1)
 
     # -- HF-630: chat-started work adopts the Agent Session Linear opens for our delegate write --
     def said(self, session_id):
@@ -340,7 +340,8 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertIn(("action", "Started"), [(c["type"], c.get("action")) for c in contents])
         self.assertIn("Reading the proxy config", [c.get("parameter") for c in contents if c["type"] == "action"])
         self.assertTrue(any(r.get("ephemeral") for r in self.said(session_id) if r["content"].get("action") == "Working"))
-        self.assertIn("Proxy deployed to staging.", [c.get("body") for c in contents if c["type"] == "thought"])
+        # The checkpoint is one issue comment (checked below), never repeated as a session thought.
+        self.assertNotIn("Proxy deployed to staging.", [c.get("body") for c in contents])
         # The keepalive beats Linear's 30-minute stale mark on the adopted session.
         start = time.time()
         self.bridge.clock = lambda: start + 26 * 60
@@ -531,7 +532,10 @@ class ChatEntrustScenarios(unittest.TestCase):
     def test_adoption_during_checkpoint_capture_retries_with_current_owner(self):
         self.check_adoption_during_capture(terminal=False)
 
-    def check_adoption_during_capture(self, *, terminal):
+    def test_adoption_during_progress_capture_retries_with_current_owner(self):
+        self.check_adoption_during_capture(terminal=False, progress=True)
+
+    def check_adoption_during_capture(self, *, terminal, progress=False):
         task_id = self.create(start_work=True)["native"]["task_id"]
         self.flush()
         self.claim(task_id)
@@ -540,6 +544,8 @@ class ChatEntrustScenarios(unittest.TestCase):
         if terminal:
             with self.board.conn() as conn:
                 kb.complete_task(conn, task_id, summary=body, result="Local checks passed.")
+        elif progress:
+            self.native_event(task_id, "spawned", {"pid": 4242})
         else:
             self.checkpoint(task_id, body)
         prior_cursor = self.bridge.store.get(NEW_ISSUE)["last_event_id"]
@@ -565,9 +571,14 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assert_normal_closeout(NEW_ISSUE, task_id, "echo-session", comments, body)
             self.assertFalse(any(body in r["content"].get("body", "") for r in said),
                              "The full result belongs to the regular comment, not a duplicate session response")
+        elif progress:
+            # A session-routed report is recomputed for the adopted owner and lands there once.
+            self.assertEqual([r["content"].get("action") for r in said if r["content"]["type"] == "action"], ["Started"])
+            self.assertEqual(sum(c.startswith("Started:") for c in self.issue_comments(NEW_ISSUE)[len(comments):]), 1)
         else:
+            # A checkpoint is one issue comment whoever owns the session; it is not repeated there.
             self.assertEqual(self.issue_comments(NEW_ISSUE), comments + [body])
-            self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 1)
+            self.assertEqual(sum(body in r["content"].get("body", "") for r in said), 0)
         self.assertEqual([r["content"]["type"] for r in said].count("response"), int(terminal))
         self.assertEqual(self.tasks(), [task_id])
 
@@ -781,14 +792,15 @@ class ChatEntrustScenarios(unittest.TestCase):
         other.profile_home = self.home
         adopt, raced = self.bridge.store.adopt_session, []
         def reopen_then_adopt(*args, **kwargs):
-            self.checkpoint(task_id, "The old owner has newly reported work.")
+            # The old owner newly reports session work (its Started step; checkpoints are issue comments).
+            self.native_event(task_id, "spawned", {"pid": 4242})
             other.pump_kanban()
             if publication == "sent":
                 other.flush()
             elif publication == "unknown":
                 checkpoint = next(row for row in other.store.pending(NEW_ISSUE)
-                    if row["kind"] == "activity" and row["payload"].get("content", {}).get("body") ==
-                    "The old owner has newly reported work.")
+                    if row["kind"] == "activity" and row["payload"].get("session_id") == "old-session"
+                    and row["payload"].get("content", {}).get("action") == "Started")
                 self.assertTrue(other.store.admit_mutation(checkpoint["id"]))
                 other.store.mark(checkpoint["id"], "failed", "Unknown publication after durable transport admission")
             raced.append(True)
@@ -806,10 +818,11 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.claim(task_id)
         self.echo(NEW_ISSUE, "old-session")
         self.flush()
-        self.checkpoint(task_id, "Unknown older checkpoint.")
+        self.native_event(task_id, "spawned", {"pid": 4242})  # an older session step, not a checkpoint comment
         self.bridge.pump_kanban()
         checkpoint = next(row for row in self.bridge.store.pending(NEW_ISSUE)
-            if row["kind"] == "activity" and row["payload"].get("content", {}).get("body") == "Unknown older checkpoint.")
+            if row["kind"] == "activity" and row["payload"].get("session_id") == "old-session"
+            and row["payload"].get("content", {}).get("action") == "Started")
         self.assertTrue(self.bridge.store.admit_mutation(checkpoint["id"]))
         self.bridge.store.mark(checkpoint["id"], "failed", "Unknown publication after durable transport admission")
         self.bridge._decline(NEW_ISSUE, "old-session", "Later response.")

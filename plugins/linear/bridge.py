@@ -707,6 +707,9 @@ def _stopped_sentence(reason: str) -> str:
 # words mention a handover, keeps its ordinary wording.
 _HANDOFF_PAUSE = re.compile(r"Paused for a handover to (?P<to>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}) "
                             r"\[handoff:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\]")
+# Agent Session activity types Linear also posts as a reply comment in the issue thread.
+# Thoughts and actions stay inside the session panel.
+THREAD_ACTIVITY_TYPES = frozenset({"elicitation", "response", "error"})
 def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
     kind = payload.get("kind")
@@ -3591,9 +3594,8 @@ class Bridge:
         elif event.kind == "checkpoint":
             if (isinstance(payload.get("body"), str) and isinstance(payload.get("request_id"), str)
                     and payload["request_id"] and (body := _readable(payload["body"]))):
+                # One record: the regular issue comment. A session thought would repeat it.
                 writes = [issue_note(body)]
-                if row.get("owner_ref"):
-                    writes.append(message("thought", body))
         activity = next((write["content"] for kind, write in writes if kind == "activity"), None)
         if activity and event.kind != "checkpoint" and not (writes and writes[0][1].get("ephemeral")):
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
@@ -3604,7 +3606,17 @@ class Bridge:
                 "review_reopened", "scheduled", "dependency_wait", "descendant_invalidated", "promoted"}
                 and not (event.kind == "blocked" and payload.get("reason") == "initial_status")):
             if row.get("owner_ref"):
-                writes.append(issue_note(activity["body"], milestone_states))
+                # One record per milestone. Linear already shows an elicitation, response or
+                # error activity as a reply in the session's issue thread; a session-only
+                # thought becomes the regular issue comment instead.
+                if activity.get("type") in THREAD_ACTIVITY_TYPES:
+                    # The activity is that record, so it carries the comment's phase recheck.
+                    for kind, report in writes:
+                        if kind == "activity":
+                            report.update(native_progress=True, native_progress_states=sorted(milestone_states))
+                else:
+                    writes = [w for w in writes if w[0] != "activity"]
+                    writes.append(issue_note(activity["body"], milestone_states))
             else:
                 # The activity becomes the issue comment when no session owns reporting.
                 for kind, report in writes:

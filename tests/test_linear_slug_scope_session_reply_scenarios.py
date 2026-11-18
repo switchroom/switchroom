@@ -50,9 +50,10 @@ class SlugScopeAndSessionReplyScenarios(unittest.TestCase):
         self.issue.update(title="QA-11 Synthetic issue", url=RENAMED_URL)
 
     def outbox_bodies(self):
+        """Queued session activity and issue comment text (a checkpoint is an issue comment)."""
         with self.store._tx() as db:
-            rows = db.execute("SELECT payload FROM outbox WHERE kind='activity'").fetchall()
-        return [(json.loads(row[0]).get("content") or {}).get("body") for row in rows]
+            rows = db.execute("SELECT payload FROM outbox WHERE kind IN ('activity','comment')").fetchall()
+        return [(json.loads(row[0]).get("content") or {}).get("body") or json.loads(row[0]).get("body") for row in rows]
 
     def test_title_edit_after_creation_does_not_hold_created_event(self):
         task_id = self.session_task()
