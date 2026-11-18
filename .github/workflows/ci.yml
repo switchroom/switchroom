@@ -147,7 +147,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         if: steps.leg.outputs.selected == 'true'
         with:
-          repository: mekenthompson/hermes-agent
+          repository: switchroom/hermes-agent
           ref: ${{ steps.agent.outputs.AGENT_REVISION }}
           path: agent-source
           persist-credentials: false
@@ -206,7 +206,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         if: matrix.lane == 'native' && needs.selection.outputs.input == 'true'
         with:
-          repository: mekenthompson/hermes-agent
+          repository: switchroom/hermes-agent
           ref: 1436af4a930a65faff42cf2d79a88b65b69a5fdc
           path: agent-notification-contract
           persist-credentials: false
@@ -248,7 +248,7 @@ jobs:
       # checkpoint/origin test instead of retrying its older racy fixture.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          repository: mekenthompson/hermes-agent
+          repository: switchroom/hermes-agent
           ref: a4ea122cc09134a7d79edb1467cb534a820c6689
           path: agent-candidate
           persist-credentials: false

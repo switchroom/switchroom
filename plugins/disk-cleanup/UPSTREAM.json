@@ -20,7 +20,7 @@
     }
   ],
   "path": "plugins/disk-cleanup",
-  "repository": "https://github.com/mekenthompson/hermes-agent.git",
+  "repository": "https://github.com/switchroom/hermes-agent.git",
   "tree": "236d543d80a7e353c051f62342f4a262ba37a15a",
   "upstream_files_sha256": {
     "README.md": "34d397346b7e4532b307020aa6044954cd21ec95a75b2ae360e8d20dca3531d5",
