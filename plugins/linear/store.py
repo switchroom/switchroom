@@ -1661,13 +1661,21 @@ class Store:
                  (payload.get('turn_final') is True or payload['content']['type'] == 'elicitation')))
 
     def unsettled_native_session_history(self, issue_id: str, session_id: str) -> bool:
-        """Retained notes order this session's lifecycle, never its ordinary issue comments."""
+        """Retained notes order this session's lifecycle, never its ordinary issue comments.
+
+        A checkpoint this session reported is only its issue comment, so it orders the session's
+        later question or closing pointer as its session note did.
+        """
         with self._tx() as db:
-            rows = db.execute("SELECT state,attempts,hold_reason,payload FROM outbox WHERE kind='activity' "
-                "AND state IN ('pending','failed') AND json_extract(payload,'$.native_history')=1 "
+            rows = db.execute("SELECT state,attempts,hold_reason,payload FROM outbox WHERE "
+                "state IN ('pending','failed') AND json_extract(payload,'$.native_history')=1 "
                 "AND COALESCE(json_extract(payload,'$.ephemeral'),0)!=1 "
                 "AND json_type(payload,'$.applied') IS NULL AND json_extract(payload,'$.issue_id')=? "
-                "AND json_extract(payload,'$.session_id')=?", (issue_id, session_id)).fetchall()
+                "AND ((kind='activity' AND json_extract(payload,'$.session_id')=?) OR "
+                "(kind='comment' AND json_extract(payload,'$.native_report_owner')=? "
+                "AND json_extract(payload,'$.native_issue_comment')=1 "
+                "AND json_type(payload,'$.native_progress') IS NULL))",
+                (issue_id, session_id, session_id)).fetchall()
             for row in rows:
                 payload = json.loads(row['payload'])
                 attempted = (payload.get('write_started') is True or

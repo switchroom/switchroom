@@ -57,9 +57,28 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(self.bridge.pump_kanban)
 
     def checkpoint_row(self, body):
+        # A checkpoint is one issue comment; it is never repeated as a session note.
+        self.assertFalse(any(row['kind'] == 'activity' and row['payload'].get('content', {}).get('body') == body
+                             for row in self.bridge.store.pending(self.ISSUE)))
         return next(row for row in self.bridge.store.pending(self.ISSUE)
-            if row['kind'] == 'activity' and row['payload'].get('native_history') is True
-            and row['payload'].get('content', {}).get('body') == body)
+            if row['kind'] == 'comment' and row['payload'].get('native_history') is True
+            and row['payload'].get('body') == body)
+
+    def observe_effects(self):
+        """Record delivered comments and activities in provider order: (type, body)."""
+        order, transport = [], self.bridge.api.transport
+        def observe(url, body, headers):
+            result = transport(url, body, headers)
+            request = json.loads(body)
+            fields = request.get('variables', {}).get('input', {})
+            if 'commentCreate' in request.get('query', ''):
+                order.append(('comment', fields.get('body')))
+            elif 'agentActivityCreate' in request.get('query', ''):
+                content = fields.get('content', {})
+                order.append((content.get('type'), content.get('body')))
+            return result
+        self.bridge.api.transport = observe
+        return order
 
     async def question(self, name):
         from tools import clarify_gateway as clarify
@@ -70,7 +89,7 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
             shown.clarify_id, key, metadata={'thread_id': self.SESSION})
         return key, shown, sent
 
-    async def test_direct_question_waits_for_delayed_checkpoint_thought_across_restart(self):
+    async def test_direct_question_waits_for_delayed_checkpoint_comment_across_restart(self):
         await self.check_question_history_order(capture=True)
 
     async def test_direct_question_waits_for_checkpoint_not_yet_captured(self):
@@ -93,6 +112,7 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         await self.checkpoint(task, body, capture=capture)
         if capture:
             self.bridge.store.defer(self.checkpoint_row(body)['id'], wall + 30)
+        effects = self.observe_effects()
         _, shown, sent = await self.question('checkpoint-order-' + str(capture))
         self.assertFalse(sent.success)
         self.assertTrue(sent.retryable)
@@ -110,34 +130,33 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(self.bridge.flush)
         self.bridge.clock = lambda: wall + 120
         await asyncio.to_thread(self.bridge.flush)
-        activities = [a['content'] for a in self.provider.activities.values() if 'content' in a]
-        checkpoint = next(i for i, a in enumerate(activities) if a.get('body') == body)
-        question = next(i for i, a in enumerate(activities) if a['type'] == 'elicitation')
+        # The checkpoint comment still lands before the question, once, and never as a session note.
+        checkpoint = effects.index(('comment', body))
+        question = next(i for i, (kind, _) in enumerate(effects) if kind == 'elicitation')
         self.assertLess(checkpoint, question)
+        activities = [a['content'] for a in self.provider.activities.values() if 'content' in a]
         self.assertEqual(activities[-1]['type'], 'elicitation')
-        self.assertEqual(sum(a.get('body') == body for a in activities), 1)
+        self.assertFalse(any(a.get('body') == body for a in activities))
+        self.assertEqual(sum(c['body'] == body for c in self.provider.comment_records.values()), 1)
         self.assertEqual(self.bridge.store.outbox_row(sent.message_id)['state'], 'sent')
         self.assertIsNone(shown.response)
 
-    async def test_shown_question_holds_late_history_but_not_its_issue_comment(self):
+    async def test_shown_question_does_not_hold_a_late_checkpoint_issue_comment(self):
         from tools import clarify_gateway as clarify
         task, _, _ = await self.held_worker()
-        wall = self.bridge.clock()
         key, shown, sent = await self.question('checkpoint-after-shown-question')
         self.assertTrue(sent.success, sent.error)
         body = 'Retained checkpoint from the earlier work.'
         await self.checkpoint(task, body)
         history = self.checkpoint_row(body)
         await asyncio.to_thread(self.bridge.flush)
-        self.assertEqual(self.bridge.store.outbox_row(history['id'])['state'], 'pending')
-        self.assertIs(self.bridge.store.outbox_row(history['id'])['payload']['write_started'], False)
-        self.assertTrue(any(c['body'] == body for c in self.provider.comment_records.values()))
+        # The checkpoint is only its issue comment: nothing reopens the shown question.
+        self.assertEqual(self.bridge.store.outbox_row(history['id'])['state'], 'sent')
+        self.assertEqual(sum(c['body'] == body for c in self.provider.comment_records.values()), 1)
         self.assertEqual(list(self.provider.activities.values())[-1]['content']['type'], 'elicitation')
+        self.assertFalse(any(a['content'].get('body') == body for a in self.provider.activities.values() if 'content' in a))
         self.assertIsNone(shown.response)
         clarify.clear_session(key)
-        self.bridge.clock = lambda: wall + 60
-        await asyncio.to_thread(self.bridge.flush)
-        self.assertEqual(self.bridge.store.outbox_row(history['id'])['state'], 'sent')
 
     async def test_unknown_checkpoint_effect_holds_question_without_replaying_history(self):
         task, _, _ = await self.held_worker()
@@ -157,16 +176,18 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.bridge.store.outbox_row(history['id'])['payload']['write_started'], True)
         self.assertFalse(any(a['content']['type'] == 'elicitation' or a['content'].get('body') == body
             for a in self.provider.activities.values() if 'content' in a))
-        self.assertTrue(any(c['body'] == body for c in self.provider.comment_records.values()))
+        # The uncertain checkpoint comment is not replayed under a new identity.
+        self.assertFalse(any(c['body'] == body for c in self.provider.comment_records.values()))
         self.assertIsNone(shown.response)
 
-    async def test_native_closing_pointer_follows_retained_checkpoint_thought(self):
+    async def test_native_closing_pointer_follows_retained_checkpoint_comment(self):
         task, _, _ = await self.held_worker()
         wall = self.bridge.clock()
         body = 'The bounded stage is verified.'
         await self.checkpoint(task, body)
         history = self.checkpoint_row(body)
         self.bridge.store.defer(history['id'], wall + 30)
+        effects = self.observe_effects()
         summary = 'Completed the bounded verification; no work remains.'
         with self.board.conn() as conn:
             self.assertTrue(self.board.kb.complete_task(conn, task.id, summary=summary,
@@ -175,7 +196,8 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(self.bridge.flush)
         self.assertFalse(any(a['content']['type'] == 'response'
             for a in self.provider.activities.values() if 'content' in a))
-        self.assertTrue(any(summary in c['body'] for c in self.provider.comment_records.values()))
+        # The full result follows the retained checkpoint comment in the thread.
+        self.assertFalse(any(summary in c['body'] for c in self.provider.comment_records.values()))
         self.bridge.clock = lambda: wall + 60
         await asyncio.to_thread(self.bridge.flush)
         self.bridge.clock = lambda: wall + 120
@@ -183,7 +205,11 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         activities = [a['content'] for a in self.provider.activities.values() if 'content' in a]
         self.assertEqual(activities[-1]['type'], 'response')
         self.assertEqual(sum(a['type'] == 'response' for a in activities), 1)
-        self.assertLess(next(i for i,a in enumerate(activities) if a.get('body') == body), len(activities)-1)
+        # Checkpoint comment, then the full result comment, then the session's only response.
+        result = next(i for i, (kind, text) in enumerate(effects) if kind == 'comment' and summary in (text or ''))
+        self.assertLess(effects.index(('comment', body)), result)
+        self.assertLess(result, next(i for i, (kind, _) in enumerate(effects) if kind == 'response'))
+        self.assertFalse(any(a.get('body') == body for a in activities))
 
     async def lose_step(self, binding):
         from hermes_fleet_linear_plugin import worker_progress
@@ -471,12 +497,12 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(self.bridge.pump_kanban)
         await asyncio.to_thread(self.bridge.flush)
         self.assertEqual(self.board.get(task.id).status, 'blocked')
-        self.assertEqual(len(self.provider.comment_records), 1)
-        stopped = next(iter(self.provider.comment_records.values()))
-        self.assertEqual(stopped['body'], 'Stopped by requester. It stays stopped until someone asks the agent to resume.')
-        self.assertIsNone(stopped['parent'])
-        self.assertEqual(stopped['user']['id'], self.provider.viewer)
-        self.assertEqual(stopped['issue']['id'], self.ISSUE)
+        # The stop note is the session's response, which Linear shows in the issue thread;
+        # no top-level comment repeats it.
+        stopped_note = 'Stopped by requester. It stays stopped until someone asks the agent to resume.'
+        self.assertEqual(self.provider.comment_records, {})
+        said = [a['content'] for a in self.provider.activities.values() if a.get('content', {}).get('body') == stopped_note]
+        self.assertEqual([c['type'] for c in said], ['response'])
         with self.bridge.store._tx() as db:
             reports = [json.loads(row[0]) for row in db.execute('SELECT payload FROM outbox')]
         self.assertFalse(any(p.get('native_outcome_comment') or p.get('native_outcome_pointer') for p in reports))
