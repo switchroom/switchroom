@@ -6,6 +6,30 @@ This is the **public** Hermes Fleet distribution. It owns generic implementation
 
 Product decisions live in [`reference/`](reference/). Read that before changing behaviour that operators will feel.
 
+`CLAUDE.md` only imports this file. Edit `AGENTS.md`, not `CLAUDE.md`.
+
+## Where this repo sits
+
+```text
+NousResearch/hermes-agent            upstream runtime
+  -> switchroom/hermes-agent         fork plus Switchroom add-ons
+  -> Agent image                     pinned in release/agent-image-manifest.json
+  -> switchroom/switchroom           this repo: public distro
+  -> ghcr.io/switchroom/switchroom   Fleet child image, plus ghcr.io/switchroom/<sidecar>
+  -> private overlay Stage A PR      .github/workflows/release-handoff.yml
+  -> private candidate image and host-run rollout (outside this repo)
+```
+
+The Agent image's new home is `ghcr.io/switchroom/hermes-agent`. Until the fork publishes there, `release/agent-image-manifest.json` keeps pinning a `ghcr.io/mekenthompson/hermes-agent` digest. Deployments pin by digest, and digests published under the old `ghcr.io/mekenthompson/*` names stay valid; never delete or retag them. Publication and handoff: `docs/image-release.md`. Rollout: `docs/rollout.md`.
+
+Old names: this repo moved from `mekenthompson/hermes-fleet`, and the fork moved from `mekenthompson/hermes-agent`, on 2026-11-18. GitHub redirects both. Never create a repository at either old name, because that breaks the redirect. `switchroom/switchroom-classic` is the archived Claude Code harness; do not build on it.
+
+Hermes is the runtime and Switchroom is the opinionated layer on top. Do not rename `HERMES_*` variables, `hermes-<profile>` container names, or `~/.hermes` paths.
+
+## GitHub access
+
+The `switchroom` organization rejects fine-grained personal access tokens with a lifetime over 366 days. A long-lived token that works on other owners gets a 403 here, which is not a broken login. Use an org-approved token for `switchroom/*`. Moving a repository between owners is a web-UI action by an org owner, not something an agent can do.
+
 ## Product contract
 
 A change ships only when **all** hold:
@@ -68,7 +92,9 @@ If you change the Dockerfile or anything it copies, also expect `.github/workflo
 ## Pull requests
 
 - Small, one topic. Rebase onto current `main`.
-- Independent review before merge. Reviewers are read-only.
+- Independent cold review before merge, by a fresh session that did not write the change. Reviewers are read-only.
+- Merge only when required CI is green on the exact reviewed head.
+- Before any commit, scan the diff for household names, emails, chat IDs, and profile registries. `python3 scripts/verify-public-tree.py` and `tests/test_public_product.py` catch some of it, not all.
 - Public repo merges with rebase. Do not force-push `main`.
 - Do not add reviewers, do not merge on failed CI, do not publish from a PR.
 
