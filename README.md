@@ -202,6 +202,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`reference/`](reference/) — vision, principles, invariants, product spec, jobs
 - [`docs/overlay-repository.md`](docs/overlay-repository.md) — overlay repo layout, config layers, sample files
 - [`docs/image-release.md`](docs/image-release.md) — image bake, scan, and publication
+- [`docs/downstream-patches.md`](docs/downstream-patches.md) — build-time patches to third-party source, each with its upstream report and removal condition
 - [`plugins/linear/README.md`](plugins/linear/README.md) — native Linear and Kanban integration
 - [`docs/perplexity.md`](docs/perplexity.md) — optional search provider
 - [`docs/volume-backup.md`](docs/volume-backup.md) — optional encrypted per-agent volume backups with a restore check (off by default)
