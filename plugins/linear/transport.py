@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 MAX_BYTES = 65536
+OWNED = 'A Linear gateway service already owns this profile'
 CONTEXT_FIELDS = ('home', 'profile', 'platform', 'source', 'session_key', 'session_id', 'message_id',
                   'user_id', 'user_id_alt', 'chat_id', 'chat_type', 'thread_id', 'scope_id',
                   'ui_session_id', 'delegated_child', 'native_board', 'native_db_path',
@@ -232,10 +233,13 @@ class Server:
                 probe.settimeout(1.0)
                 try:
                     probe.connect(str(self.path))
-                except ConnectionRefusedError:
-                    self.path.unlink()
+                except (ConnectionRefusedError, FileNotFoundError):
+                    self.path.unlink(missing_ok=True)  # Nobody listens: a stale socket file.
+                except (BlockingIOError, TimeoutError):
+                    # A live listener whose accept backlog is full (a busy or exiting gateway).
+                    raise Unavailable(OWNED) from None
                 else:
-                    raise Unavailable('A Linear gateway service already owns this profile')
+                    raise Unavailable(OWNED)
         scope = contextvars.copy_context()
         slots = threading.BoundedSemaphore(8)
         def handle(payload, peer_pid):

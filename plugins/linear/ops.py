@@ -38,9 +38,21 @@ def _dismissed(db: sqlite3.Connection) -> set[str]:
     return {row["key"][len(Store.DISMISSED):] for row in
             _rows(db, "SELECT key FROM metadata WHERE key LIKE ?", Store.DISMISSED + "%")}
 
+RETAINED = "Use a new authorized request for any further change."
+NOTHING = "Nothing to do."
+HISTORY_ACTIONS = frozenset({RETAINED, NOTHING})  # retained records: shown as one count line
+AGE_LIMIT = 7 * 86_400  # undelivered writes older than this are no longer listed one by one
+
 def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) -> list[dict[str, Any]]:
     """Every item holding an issue or a delivery, oldest first. `act` marks the ones only an operator can clear."""
-    now, items, dismissed = time.time() if now is None else now, [], set()
+    return _scan(state, ingress, profile, now)[0]
+
+def aged_out(state: Path, ingress: Path, profile: str, now: float | None = None) -> int:
+    """Undelivered writes past AGE_LIMIT that stuck() no longer lists; counted so they stay visible."""
+    return _scan(state, ingress, profile, now)[1]
+
+def _scan(state: Path, ingress: Path, profile: str, now: float | None = None) -> tuple[list[dict[str, Any]], int]:
+    now, items, dismissed, aged = time.time() if now is None else now, [], set(), 0
     def add(issue: str, ref: str, since: float, why: str, action: str, act: bool = False) -> None:
         items.append({"issue": issue or "-", "ref": ref, "age_s": max(0, int(now - since)), "why": why,
                       "action": action, "act": act})
@@ -68,7 +80,7 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 if reason:
                     if payload.get("reconciliation"):
                         add(issue, row["id"], since, "Reconciled delivery history is retained; automatic replay remains disabled",
-                            "Use a new authorized request for any further change.")
+                            RETAINED)
                     else:
                         action = (RESOLVE.format(id=row["id"]) if row["kind"] in ("status", "description", "delegate") else
                                   "Inspect the retained request and native/external effects. Do not replay it; use a new authorized request after reconciliation.")
@@ -84,13 +96,16 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                     add(issue, row["id"], since, f"{row['kind']} write is {'held unsent' if late else 'being sent'}; it holds "
                         "this issue", "Check the gateway log for what holds it." if late else "Settles on its next send.", late)
                 elif (row["kind"] == "delegate" and row["state"] == "failed" and not payload.get("reconciliation") and
-                      applied.get((issue, payload.get("target_delegate_id")), -1) > row["seq"] and now - since < 7 * 86_400):
+                      applied.get((issue, payload.get("target_delegate_id")), -1) > row["seq"] and now - since < AGE_LIMIT):
                     add(issue, row["id"], since, "delegate write was not delivered; a later write already set the same delegate",
-                        "Nothing to do.")
-                elif row["state"] == "failed" and not payload.get("reconciliation") and now - since < 7 * 86_400:
+                        NOTHING)
+                elif row["state"] == "failed" and not payload.get("reconciliation") and now - since < AGE_LIMIT:
                     add(issue, row["id"], since, f"{row['kind']} write was not delivered",
                         "Retried after the next successful write." if row["attempts"] else "Not retried: redo the step.",
                         not row["attempts"])
+                elif (row["state"] == "failed" and not payload.get("reconciliation") and not (
+                        row["kind"] == "delegate" and applied.get((issue, payload.get("target_delegate_id")), -1) > row["seq"])):
+                    aged += 1  # Past AGE_LIMIT: no longer listed, but still counted in the report.
             for row in _rows(db, "SELECT * FROM specialist_scope_fence"):
                 add(row["issue_id"], "fence", row["fenced_at"], "outside specialist scope",
                     "Permanent by policy; recover only through an approved procedure.")
@@ -134,21 +149,37 @@ def stuck(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 if parked and f"{row['logical_agent']}:{row['delivery_id']}" in dismissed:
                     add(issue or "", row["delivery_id"], row["received_at"],
                         f"Linear delivery parked after {row['attempts']} failed attempt(s) was dismissed by an operator; "
-                        "its history is retained", "Use a new authorized request for any further change.")
+                        "its history is retained", RETAINED)
                     continue
                 add(issue or "", row["delivery_id"], row["received_at"],
                     f"Linear delivery {'parked' if parked else 'retrying'} after {row['attempts']} failed attempt(s)",
                     PARKED.format(id=row["delivery_id"]) if parked
                     else "Backing off; a restart retries it at once.", parked)
-    return sorted(items, key=lambda item: -item["age_s"])
+    return sorted(items, key=lambda item: -item["age_s"]), aged
 
-def report(items: list[dict[str, Any]]) -> str:
+def report(items: list[dict[str, Any]], *, show_all: bool = False, aged: int = 0) -> str:
+    """Operator items first, then in-flight ones; retained history is one count line unless show_all."""
+    def lines_for(item):
+        return [f"- {'ACT ' if item['act'] else ''}{item['issue']} [{item['ref']}] {item['age_s'] / 3600:.1f}h: "
+                f"{item['why']}", f"  {item['action']}"]
+    old = f"{aged} write(s) that failed more than 7 days ago are no longer listed individually." if aged else ""
     if not items:
-        return "Linear: nothing is held."
-    lines = [f"Linear: {len(items)} item(s) held, {sum(i['act'] for i in items)} need an operator."]
-    for item in items:
-        lines += [f"- {'ACT ' if item['act'] else ''}{item['issue']} [{item['ref']}] {item['age_s'] / 3600:.1f}h: "
-                  f"{item['why']}", f"  {item['action']}"]
+        return "Linear: nothing is held." + (f"\n{old}" if old else "")
+    act = [i for i in items if i["act"]]
+    history = [i for i in items if not i["act"] and i["action"] in HISTORY_ACTIONS]
+    moving = [i for i in items if not i["act"] and i not in history]
+    if show_all:
+        lines = [f"Linear: {len(items)} item(s) held, {len(act)} need an operator."]
+        for item in items:
+            lines += lines_for(item)
+    else:
+        lines = [f"Linear: {len(act)} item(s) need an operator, {len(moving)} in progress."]
+        for item in act + moving:
+            lines += lines_for(item)
+        if history:
+            lines.append(f"{len(history)} retained record(s), no action needed (hermes linear status --all lists them).")
+    if old:
+        lines.append(old)
     return "\n".join(lines)
 
 def _parked(ingress: Path, profile: str, delivery_id: str) -> str:
@@ -185,7 +216,9 @@ def dismiss(state: Path, ingress: Path, profile: str, delivery_id: str, evidence
 
 def setup(parser: Any) -> None:
     sub = parser.add_subparsers(dest="linear_command", required=True)
-    sub.add_parser("status", help="List held Linear work and the next step").add_argument("--json", action="store_true")
+    status = sub.add_parser("status", help="List held Linear work and the next step")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--all", action="store_true", help="Also list retained records that need no action")
     resolve = sub.add_parser("resolve", help="Record the verified outcome of an uncertain status, description or delegate write")
     resolve.add_argument("row_id")
     resolve.add_argument("outcome", choices=("applied", "not_applied"))
@@ -255,8 +288,8 @@ def run(args: Any, state: Path, ingress: Path, profile: str, *, origin_settings:
         print(json.dumps({"ok": True, **result}))
         return 0
     if args.linear_command == "status":
-        items = stuck(state, ingress, profile)
-        print(json.dumps(items, indent=2) if args.json else report(items))
+        items, aged = _scan(state, ingress, profile)
+        print(json.dumps(items, indent=2) if args.json else report(items, show_all=getattr(args, "all", False), aged=aged))
         return 1 if any(item["act"] for item in items) else 0
     if args.linear_command == "resolve":
         store = Store(state) if state.is_file() else None
