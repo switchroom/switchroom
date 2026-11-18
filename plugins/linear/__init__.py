@@ -529,13 +529,21 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
     ingress = Path(settings.get("ingress_database") or home / "workspace" / "linear" / "ingress.db")
     server = None
     try:
+        waiting_since = logged_at = None
         while server is None and not stop_requested.is_set():
             try:
                 server = transport.Server(home, profile_name,
                                           lambda args, context: chat.handle(bridge, args, context))
             except transport.Unavailable as exc:
-                if "already owns" not in str(exc):
+                if str(exc) != transport.OWNED:
                     raise
+                # During a gateway replace the old owner is still listening (possibly too busy to
+                # accept): wait for it to exit, visibly, instead of crashing or giving up.
+                now = time.monotonic()
+                waiting_since = now if waiting_since is None else waiting_since
+                if logged_at is None or now - logged_at >= 60:
+                    logged_at = now
+                    diag.warn("service.start", "retry", "socket_owned", waited_s=int(now - waiting_since))
                 await asyncio.sleep(0.25)
         if server is None:
             return

@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import logging
 import math
+import os
 import re
 import sqlite3
 import threading
@@ -255,6 +256,40 @@ def native_text_row(row, *columns):
             if column in row.keys() and isinstance(row[column], bytes):
                 row[column].decode("utf-8")
     return row
+
+# Whole-file native board validation (integrity_check and whole-table key passes) is a pure
+# function of the file bytes. Repeat it only when the file identity, size, times or WAL
+# generation changed, and at least every NATIVE_VALIDATION_MAX_AGE seconds. Only a pass is
+# remembered; a failure is never cached. Chat threads and the reporting thread share this.
+NATIVE_VALIDATION_MAX_AGE = 600.0
+_native_validation_lock = threading.Lock()
+_native_validated: dict[str, tuple[tuple, float]] = {}            # resolved path -> (fingerprint, checked)
+_native_keys_validated: dict[tuple[str, str], tuple[tuple, float]] = {}  # (path, table) -> (fingerprint, checked)
+_native_snapshots: dict[int, tuple[str, tuple]] = {}               # open read conn -> (path, stable fingerprint)
+
+def native_file_fingerprint(path: Path) -> tuple | None:
+    """Identity of a board file and its WAL; None when it cannot be read (never cached).
+
+    Stat only: opening and closing a database fd in this process would drop SQLite's
+    POSIX locks held by other connections to the same file.
+    """
+    parts = []
+    for item, wal in ((path, False), (Path(str(path) + "-wal"), True)):
+        try:
+            info = os.stat(item)
+        except FileNotFoundError:
+            if not wal:
+                return None
+            parts.append(None)
+            continue
+        except OSError:
+            return None
+        parts.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+    return tuple(parts)
+
+def _native_still_valid(entry: tuple[tuple, float] | None, fingerprint: tuple) -> bool:
+    return (entry is not None and entry[0] == fingerprint
+            and 0 <= time.monotonic() - entry[1] < NATIVE_VALIDATION_MAX_AGE)
 
 def event_ms(event: dict[str, Any]) -> float:
     """When the human action happened (not when the webhook was sent), in epoch ms."""
@@ -875,7 +910,9 @@ class Kanban:
         try:
             if any(source.is_symlink() for source in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm"))):
                 raise ValueError("native history path is a symlink")
-            with closing(connect_tracked(path.resolve(strict=True).as_uri() + "?mode=ro",
+            resolved = path.resolve(strict=True)
+            key, before = str(resolved), native_file_fingerprint(resolved)
+            with closing(connect_tracked(resolved.as_uri() + "?mode=ro",
                                          tracking_path=path, uri=True, timeout=0.1)) as conn:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA query_only=ON")
@@ -883,9 +920,26 @@ class Kanban:
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if not {"tasks", "task_events", "task_runs", "task_comments"} <= tables:
                     raise ValueError("existing database has no native task schema")
-                if [row[0] for row in conn.execute("PRAGMA integrity_check")] != ["ok"]:
-                    raise ValueError("existing native database failed integrity inspection")
-                yield conn
+                # The read snapshot starts at that first read: when the file is unchanged from
+                # before opening until now, the snapshot is exactly the fingerprinted bytes.
+                after = native_file_fingerprint(resolved)
+                stable = before is not None and before == after
+                with _native_validation_lock:
+                    validated = stable and _native_still_valid(_native_validated.get(key), after)
+                if not validated:
+                    if not self.native_integrity_ok(conn):
+                        raise ValueError("existing native database failed integrity inspection")
+                    if stable:
+                        with _native_validation_lock:
+                            _native_validated[key] = (after, time.monotonic())
+                if stable:
+                    with _native_validation_lock:
+                        _native_snapshots[id(conn)] = (key, after)
+                try:
+                    yield conn
+                finally:
+                    with _native_validation_lock:
+                        _native_snapshots.pop(id(conn), None)
         except (OSError, ValueError, TypeError, OverflowError, IndexError, KeyError, RecursionError, sqlite3.Error) as exc:
             raise LinearError("Existing native history is unavailable; inspect it before admitting replacement work", retryable=False) from exc
     def for_board(self, board: str):
@@ -921,12 +975,30 @@ class Kanban:
         # Admission/recovery inspect every row and refuse ambiguity; neither
         # priority nor creation time chooses an executor from this collection.
         return [self.task_from_row(row) for row in conn.execute("SELECT * FROM tasks")]
+    def quiescence_index(self) -> dict:
+        """Each task's status and newest event id, from one read snapshot of this board."""
+        with self.read_conn() as conn:
+            return {row["id"]: (row["status"], row["newest"]) for row in conn.execute(
+                "SELECT t.id AS id, t.status AS status, m.newest AS newest FROM tasks t LEFT JOIN "
+                "(SELECT task_id, MAX(id) AS newest FROM task_events GROUP BY task_id) m ON m.task_id = t.id")}
+    @staticmethod
+    def native_integrity_ok(conn) -> bool:
+        return [row[0] for row in conn.execute("PRAGMA integrity_check")] == ["ok"]
     def task_keys(self, conn, table: str):
         # Callers supply fixed native table names. Inspect only the predicate
         # key before WHERE can hide it, not unrelated historical payloads.
         # Leave BLOB/numeric/null comparison and affinity to native SQLite.
+        # A read snapshot of unchanged file bytes already passed this exact pass.
+        with _native_validation_lock:
+            snapshot = _native_snapshots.get(id(conn))
+            if snapshot is not None and _native_still_valid(
+                    _native_keys_validated.get((snapshot[0], table)), snapshot[1]):
+                return
         for row in conn.execute(f"SELECT task_id FROM {table}"):
             native_text_row(row, "task_id")
+        if snapshot is not None:
+            with _native_validation_lock:
+                _native_keys_validated[(snapshot[0], table)] = (snapshot[1], time.monotonic())
     def subscribe(self, task_id: str, issue_id: str, *, issue: dict | None = None) -> None:
         """Final issue-scope check at the reporting boundary; no core notify subscription.
 
@@ -3137,10 +3209,48 @@ class Bridge:
         extra = f" Also stopped {len(started)} task(s) it had started." if started else ""
         self._decline(issue_id, session_id, STOPPED_NOTICE + extra, activity_id=activity_id)
         return diag.because("-", True)
+    def _pump_quiescent(self, row: dict, boards: dict) -> bool:
+        """A finished, fully reported binding with no newer native event has nothing to pump.
+
+        Every pump step is then a proven no-op: worker progress and PR-park resume need live or
+        parked work, status reconciliation and delegate recovery stop at a captured Done closeout
+        (or archived work already shown as Todo), and acceptance recheck needs a GitHub wait.
+        Status and the newest event id are read fresh from the board once per tick, so any native
+        change runs the full pump; the local closeout decision is reused only while the store's
+        quiet version stands still. Unsure means pump.
+        """
+        issue_id = row["issue_id"]
+        known = self.__dict__.setdefault("_quiescent", {})  # issue -> (store version, work, adapter, native)
+        try:
+            if row.get("origin") != "native" or not row.get("task_id") or not row.get("last_event_id"):
+                return False
+            # Read before deciding: a write after this read can only make the memo miss later.
+            version, work = self.store.quiet_version(), (row["task_id"], row["last_event_id"])
+            memo = known.pop(issue_id, None)
+            same_store = version is not None and memo is not None and memo[:2] == (version, work)
+            adapter = memo[2] if same_store else self._binding_adapter(issue_id)
+            if adapter.board not in boards:
+                boards[adapter.board] = {}  # An unreadable board skips nothing this tick.
+                boards[adapter.board] = adapter.quiescence_index()
+            native = boards[adapter.board].get(row["task_id"], (None, None))
+            status, newest = native
+            if status not in ("done", "archived") or type(newest) is not int or newest != row["last_event_id"]:
+                return False
+            if not (same_store and memo[3] == native) and not self.store.quiescent_closeout(
+                    issue_id, row["task_id"], archived=status == "archived"):
+                return False
+            if version is not None:
+                known[issue_id] = (version, work, adapter, native)
+            return True
+        except Exception:  # noqa: BLE001 - the full pump below owns every error report
+            return False
     def pump_kanban(self) -> None:
+        boards: dict = {}  # board -> {task id: (status, newest event id)}, read once per tick
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
                 if not self._pump_authorize(row["issue_id"]):
+                    continue
+                if self._pump_quiescent(row, boards):
                     continue
                 # Loading or iterating one task's native history can fail just
                 # like decoding its task row. Keep that entire read/capture path

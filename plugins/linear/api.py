@@ -291,6 +291,111 @@ def markdown_matches(actual: object, expected: str) -> bool:
         line == wanted or ('<' not in expected and prose and expected_prose and _bare_host_line_matches(line, wanted))
         for (line, prose), (wanted, expected_prose) in zip(received, authored))
 
+# Create readback only (never write settlement): two more rewrites Linear's editor makes on save.
+# An authored bare URL or host/path comes back autolinked, and bold is split around inline code.
+_AUTOLINK = re.compile(r'\[([^\[\]\s`]+)\]\((?:<([^\s<>]+)>|([^\s<>()]+))\)')
+_FULL_URL = re.compile(r'https?://[^\s<>]+')
+_HOST_PATH = re.compile(r'(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?:/[^\s<>]*)?')
+_CODE_SPAN = re.compile(r'(`+)(.+?)(?<!`)\1(?!`)')
+
+def _outside_code(text: str, rewrite: Callable[[str], str | None]) -> str:
+    """Apply ``rewrite`` to each prose line, keeping fenced, indented and inline code exact.
+
+    ``rewrite`` returns None to mean "this line cannot be canonicalised"; the line stays as is.
+    """
+    out, fence = [], None
+    for line in text.split('\n'):
+        marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+        if marker:
+            run = marker.group(1)
+            if fence is None: fence = (run[0], len(run))
+            elif run[0] == fence[0] and len(run) >= fence[1]: fence = None
+            out.append(line)
+            continue
+        if fence is not None or line.expandtabs(4).startswith('    '):
+            out.append(line)
+            continue
+        rewritten = rewrite(line)
+        out.append(line if rewritten is None else rewritten)
+    return '\n'.join(out)
+
+def _code_split(line: str) -> list[tuple[str, bool]] | None:
+    """Prose and inline-code pieces of one line; None when a backtick run is left open."""
+    pieces, offset = [], 0
+    for match in _CODE_SPAN.finditer(line):
+        pieces += [(line[offset:match.start()], False), (match.group(), True)]
+        offset = match.end()
+    pieces.append((line[offset:], False))
+    return None if any('`' in text for text, code in pieces if not code) else pieces
+
+def _unlink_autolinks(actual: str, expected: str) -> str:
+    """Undo Linear's autolink of a token the author wrote bare: ``[T](<T>)`` for a full http(s)
+    URL, ``[T](<http://T>)`` for a bare host or host/path. The label and target must be exactly
+    the authored token; any other link (changed target, https for http, added path, query,
+    fragment or port) is kept and still differs."""
+    def bare(token: str) -> bool:
+        return re.search(r'(?<![\w\[</:.@-])(?<!\]\()' + re.escape(token) + r'(?![\w/?#&=%~+:@-])(?!\.\w)',
+                         expected) is not None
+    def unlink(match: re.Match) -> str:
+        label, target = match.group(1), match.group(2) or match.group(3)
+        if ((_FULL_URL.fullmatch(label) and target == label) or
+                (_HOST_PATH.fullmatch(label) and target == 'http://' + label)) and bare(label):
+            return label
+        return match.group()
+    def line_rewrite(line: str) -> str | None:
+        pieces = _code_split(line)
+        if pieces is None:
+            return None
+        return ''.join(text if code else _AUTOLINK.sub(unlink, text) for text, code in pieces)
+    return _outside_code(actual, line_rewrite)
+
+def _canonical_bold(text: str) -> str:
+    """Compare emphasis as which characters are bold, not where ``**`` sits.
+
+    Linear writes ``**a (**`b`**, c**`` for ``**a (`b`, c)**``: the same characters are bold.
+    Whitespace and code spans carry no bold of their own (they take the preceding character's),
+    code stays byte-exact, and a line with unbalanced, tripled or escaped ``**`` is left exact.
+    """
+    def line_rewrite(line: str) -> str | None:
+        pieces = _code_split(line)
+        if pieces is None:
+            return None
+        prose = [text for text, code in pieces if not code]
+        if not any('**' in text for text in prose):
+            return line
+        if (any('***' in text or re.search(r'\\\*', text) for text in prose)
+                or sum(text.count('**') for text in prose) % 2):
+            return None
+        units, bold = [], False  # (text, bold flag or None for neutral)
+        for text, code in pieces:
+            if code:
+                units.append((text, None))
+                continue
+            for part in re.split(r'(\*\*)', text):
+                if part == '**':
+                    bold = not bold
+                else:
+                    units.extend((char, None if char.isspace() else bold) for char in part)
+        flags = [flag for _, flag in units if flag is not None]
+        current, out, open_ = flags[0] if flags else False, [], False
+        for unit, flag in units:
+            current = current if flag is None else flag
+            if current != open_:
+                out.append('**')
+                open_ = current
+            out.append(unit)
+        return ''.join(out) + ('**' if open_ else '')
+    return _outside_code(text, line_rewrite)
+
+def created_markdown_matches(actual: object, expected: str) -> bool:
+    """Readback of a just-created description: markdown_matches plus Linear's autolink and bold
+    rewrites. Write settlement keeps the stricter markdown_matches."""
+    if markdown_matches(actual, expected):
+        return True
+    if not isinstance(actual, str):
+        return False
+    return markdown_matches(_canonical_bold(_unlink_autolinks(actual, expected)), _canonical_bold(expected))
+
 # Fields Linear stores as sent. On a same-id replay a difference here means the id was already used
 # for something else, not that the editor rewrote it.
 _IDENTITY_FIELDS = frozenset({"title", "name", "team", "teams", "project", "parent"})
@@ -316,7 +421,7 @@ def _created(entity: dict[str, Any], kind: str, replayed: bool, differs: dict[st
                           "otherwise create with a new id.", retryable=False)
     diag.evt("content.write", "applied", "readback_differs", level=logging.WARNING, kind=f"{kind}_create",
              iss=str(entity.get("id") or "")[:8] or None,
-             issue=identifier if isinstance(identifier, str) else None)
+             issue=identifier if isinstance(identifier, str) else None, fields=",".join(fields))
     return {**entity, "readback_differences": fields}
 
 class LinearAPI:
@@ -900,7 +1005,7 @@ class LinearAPI:
         return _created(issue, "issue", replayed, {
             "title": issue.get("title") != title,
             "team": team_id not in {team.get("id"), team.get("key")},
-            "description": description is not None and not markdown_matches(issue.get("description"), description),
+            "description": description is not None and not created_markdown_matches(issue.get("description"), description),
             "assignee": issue.get("assignee") is not None, "delegate": issue.get("delegate") is not None,
             "project": project_id is not None and project.get("id") != project_id,
             "parent": parent_id is not None and parent.get("id") != parent_id})

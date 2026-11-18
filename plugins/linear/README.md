@@ -35,9 +35,13 @@ API is required. The plugin is off in the bare image; the starter overlay
 
 Creates read the new issue or project back under its UUID. Linear's editor rewrites Markdown as
 it stores it: it backslash-escapes punctuation such as `~`, writes `*` for `-` bullets and drops
-trailing spaces and repeated blank lines. Outside code those count as the same text. A create
+trailing spaces and repeated blank lines. Outside code those count as the same text. A new
+issue's description also comes back with a bare URL or host/path the author wrote autolinked
+(`[T](<T>)`, or `[T](<http://T>)` for a host) and with bold split around inline code; the
+create readback accepts exactly those, with the same token and target and the same bold
+characters. Description and comment writes still settle on the stricter comparison. A create
 whose readback still differs is reported as created, with `readback_differences` naming the
-fields and a `content.write` `readback_differs` warning; it is never refused, because a refusal
+fields and a `content.write` `readback_differs` warning (`fields=` names them); it is never refused, because a refusal
 invites a retry under a new id, which is how duplicates happen. Escapes that change structure
 (code ticks, link brackets, HTML angle brackets, an escaped block marker at the start of a line)
 and hard line breaks still count. A readback that fails or finds nothing is refused as
@@ -722,7 +726,9 @@ mutation responses remain subject to reconciliation.
 The local outbox preserves UUIDs and uncertain external effects. Use the profile CLI:
 
 ```bash
-hermes linear status
+hermes linear status          # items needing an operator, then in-flight ones, then one count line
+hermes linear status --all    # also every retained record that needs no action
+hermes linear status --json   # every item, with `act` marking the operator ones; exits 1 when any is set
 hermes linear resolve <row> applied|not_applied --evidence "verified remote outcome"
 hermes linear replay <delivery>
 hermes linear dismiss <delivery> --evidence "Linear already shows its answer"

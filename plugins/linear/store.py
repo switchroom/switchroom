@@ -51,6 +51,63 @@ CREATE TABLE IF NOT EXISTS chat_admissions (
   state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
   reason_code TEXT, route TEXT);
 """
+# The legacy hold scan is a pure function of outbox rows, work identity and native bindings.
+# SQLite triggers count every change to those inputs, in every writing process, so the scan
+# reruns only after one. Bump HOLD_RULES_VERSION whenever the hold rules change.
+HOLD_RULES_VERSION = 1
+HOLD_INPUTS, HOLD_SCANNED = "hold-inputs-version", "hold-scanned-version"
+# Send bookkeeping that the hold rules never read; a change only to these keys is not an input.
+_HOLD_VOLATILE = "'$.write_started','$.mutation_attempt_id','$.conversation_attempt_id','$.last_error','$.attempts'"
+_HOLD_BUMP = (f"INSERT INTO metadata(key,value) VALUES ('{HOLD_INPUTS}','1') ON CONFLICT(key) DO UPDATE SET "
+              "value=CAST(CAST(value AS INTEGER)+1 AS TEXT)")
+_HOLD_PAYLOAD_CHANGED = (
+    "(CASE WHEN json_valid(OLD.payload) AND json_valid(NEW.payload) "
+    f"THEN json_remove(OLD.payload,{_HOLD_VOLATILE}) IS NOT json_remove(NEW.payload,{_HOLD_VOLATILE}) "
+    "ELSE OLD.payload IS NOT NEW.payload END)")
+_SCANNED_STATES = "('pending','failed','sent')"
+HOLD_TRIGGERS = f"""
+CREATE TRIGGER IF NOT EXISTS hold_inputs_outbox_insert AFTER INSERT ON outbox BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_outbox_delete AFTER DELETE ON outbox BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_outbox_update AFTER UPDATE OF kind, payload, state, hold_reason ON outbox
+WHEN OLD.kind IS NOT NEW.kind OR OLD.hold_reason IS NOT NEW.hold_reason
+  OR (OLD.state IN {_SCANNED_STATES}) IS NOT (NEW.state IN {_SCANNED_STATES}) OR {_HOLD_PAYLOAD_CHANGED}
+BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_work_insert AFTER INSERT ON work BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_work_delete AFTER DELETE ON work BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_work_update AFTER UPDATE OF issue_id, origin, task_id ON work
+BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_binding_insert AFTER INSERT ON metadata
+WHEN NEW.key LIKE 'native-binding:%' BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_binding_delete AFTER DELETE ON metadata
+WHEN OLD.key LIKE 'native-binding:%' BEGIN {_HOLD_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS hold_inputs_binding_update AFTER UPDATE ON metadata
+WHEN OLD.key LIKE 'native-binding:%' OR NEW.key LIKE 'native-binding:%' BEGIN {_HOLD_BUMP}; END;
+"""
+# Any change to reporting rows, work, bindings or settled acceptance waits. A finished binding's
+# pump skip (Bridge._pump_quiescent) is reused only while this counter stands still.
+QUIET_INPUTS = "quiet-inputs-version"
+_QUIET_BUMP = _HOLD_BUMP.replace(HOLD_INPUTS, QUIET_INPUTS)
+_QUIET_KEYS = "(key LIKE 'native-binding:%' OR key LIKE 'acceptance-recheck-settled:%')"
+QUIET_TRIGGERS = f"""
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_outbox_insert AFTER INSERT ON outbox BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_outbox_update AFTER UPDATE ON outbox BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_outbox_delete AFTER DELETE ON outbox BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_work_insert AFTER INSERT ON work BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_work_update AFTER UPDATE ON work BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_work_delete AFTER DELETE ON work BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_metadata_insert AFTER INSERT ON metadata
+WHEN {_QUIET_KEYS.replace('key', 'NEW.key')} BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_metadata_update AFTER UPDATE ON metadata
+WHEN {_QUIET_KEYS.replace('key', 'OLD.key')} OR {_QUIET_KEYS.replace('key', 'NEW.key')} BEGIN {_QUIET_BUMP}; END;
+CREATE TRIGGER IF NOT EXISTS quiet_inputs_metadata_delete AFTER DELETE ON metadata
+WHEN {_QUIET_KEYS.replace('key', 'OLD.key')} BEGIN {_QUIET_BUMP}; END;
+"""
+# Retained outbox history grows without bound and nearly every per-issue or per-task lookup
+# filters on these payload fields; without an index each one parses every payload.
+OUTBOX_INDEXES = """
+CREATE INDEX IF NOT EXISTS outbox_payload_issue ON outbox(json_extract(payload, '$.issue_id'));
+CREATE INDEX IF NOT EXISTS outbox_payload_task ON outbox(json_extract(payload, '$.task_id'));
+"""
 # Final replies keep normal delivery even when projected as thoughts. Unattempted one-try
 # notes can retire, but an attempted native message retains readback and lifecycle repair.
 # Worker actions stay optional/nonblocking in this classification; their uncertain
@@ -81,6 +138,14 @@ class Store:
             if "hold_reason" not in outbox_columns:
                 db.execute("ALTER TABLE outbox ADD COLUMN hold_reason TEXT")
             db.commit()
+            db.executescript(HOLD_TRIGGERS)
+            db.executescript(QUIET_TRIGGERS)
+            db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?, '1')", (QUIET_INPUTS,))
+            db.commit()
+            try:
+                db.executescript(OUTBOX_INDEXES)
+            except sqlite3.Error:
+                pass  # Lookups stay correct, only slower, if a retained payload cannot be indexed.
             columns = {row[1] for row in db.execute("PRAGMA table_info(work)")}
             for name in ("linear_session_id", "panel_note", "pending_resume"):
                 if name not in columns:
@@ -387,8 +452,27 @@ class Store:
             if kind != "project_update" and payload["task_id"] != work["task_id"]:
                 return "Native reporting binding does not match the retained delivery; reconcile before migration"
         return None if matched_task else "Native report has no matching task binding; reconcile before migration"
+    @staticmethod
+    def _hold_marker(db: sqlite3.Connection) -> str | None:
+        row = db.execute("SELECT value FROM metadata WHERE key=?", (HOLD_INPUTS,)).fetchone()
+        return f"{HOLD_RULES_VERSION}:{row[0]}" if row else None
     @classmethod
     def _hold_legacy_outbox(cls, db: sqlite3.Connection) -> None:
+        # The scan is idempotent and holds are monotone, so with unchanged inputs it changes
+        # nothing. The marker lives in this transaction, so it rolls back with the scan.
+        marker = cls._hold_marker(db)
+        if marker is not None:
+            scanned = db.execute("SELECT value FROM metadata WHERE key=?", (HOLD_SCANNED,)).fetchone()
+            if scanned is not None and scanned[0] == marker:
+                return
+        cls._hold_scan(db)
+        if cls._hold_marker(db) is None:
+            db.execute(_HOLD_BUMP)  # A database with no recorded change yet starts counting here.
+        # The scan's own hold_reason writes bump the counter: record the value after them.
+        db.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (HOLD_SCANNED, cls._hold_marker(db)))
+    @classmethod
+    def _hold_scan(cls, db: sqlite3.Connection) -> None:
         # Preserve request/effect history exactly: holding changes only this nullable column.
         # Historical sent rows stay sent, but cannot become current native receipts.
         rows = db.execute("SELECT id,kind,payload FROM outbox WHERE state IN ('pending','failed','sent') AND hold_reason IS NULL").fetchall()
@@ -1248,6 +1332,18 @@ class Store:
                                    "json_extract(payload, '$.terminal')=1 AND "
                                    "json_extract(payload, '$.admission_id') IS NULL LIMIT 1",
                                    (task_id, issue_id, issue_id, state, state)).fetchone())
+    def quiet_version(self) -> str | None:
+        """Changes on every write to the inputs of quiescent_closeout and the native binding."""
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (QUIET_INPUTS,)).fetchone()
+            return row[0] if row else None
+    def quiescent_closeout(self, issue_id: str, task_id: str, *, archived: bool) -> bool:
+        """The finished task's reporting is settled locally: the same checks the pump's status,
+        delegate and acceptance steps stop at, read in one transaction."""
+        with self._tx():
+            if self.terminal_captured(task_id, issue_id=issue_id, state="done"):
+                return archived or not self.acceptance_recheck(issue_id, task_id)
+            return archived and (self.latest_status(issue_id) or {}).get("state") == "todo"
     # A Blocked closeout written before unverified acceptance showed In Review: its own message
     # (acceptance_refusal) names the PR and a receipt class meaning GitHub refused or did not answer.
     _UNVERIFIED_CLOSEOUT = re.compile(r"could not be verified as ready \((https://github\.com/[A-Za-z0-9_.-]+/"

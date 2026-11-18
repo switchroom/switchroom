@@ -118,7 +118,7 @@ REASONS = frozenset({
     "local_work_not_runnable", "takeover_not_admitted", "takeover_already_here",
     "takeover_routing_unfinished", "takeover_local_unknown", "resume_refused", "resume_uncertain",
     # service / api / config
-    "shutdown", "crash", "identity_unavailable", "tick_exception", "duplicate_create",
+    "shutdown", "crash", "identity_unavailable", "socket_owned", "tick_exception", "duplicate_create",
     "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",
     # tool replies (chat.py codes)
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
@@ -152,7 +152,9 @@ FIELDS: dict[str, re.Pattern | None] = {  # None means integer
     "ver": re.compile(r"[0-9]{1,4}(?:\.[0-9A-Za-z-]{1,16}){0,3}"), "sha": re.compile(r"[0-9a-f]{7,40}"),
     "commit": re.compile(r"[0-9a-f]{7,40}"), "lvl": re.compile(r"detail"),
     "detail": re.compile(r"on|off"), "suppressed": None, "next_s": None, "tick_s": None,
-    "recheck_s": None, "oldest_pending_s": None, "max_tick_ms": None,
+    "recheck_s": None, "oldest_pending_s": None, "max_tick_ms": None, "waited_s": None,
+    # Comma-separated field names (create readback differences), never field values.
+    "fields": re.compile(r"[a-z][a-z_]{0,23}(?:,[a-z][a-z_]{0,23}){0,7}"),
 }
 for _name in ("bindings", "pending", "held", "failed_unreported", "events", "status_q", "delegate_q",
               "sent", "refused", "skipped", "retry", "failed", "deliveries", "ignored", "suppressed_info",
