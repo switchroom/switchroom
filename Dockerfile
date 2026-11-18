@@ -83,6 +83,11 @@ COPY scripts/patch-honcho-gateway-turn-filter.py /tmp/patch-honcho-gateway-turn-
 RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-gateway-turn-filter.py /opt/hermes/plugins/memory/honcho/__init__.py \
     && /opt/hermes/.venv/bin/python -c "import py_compile; py_compile.compile('/opt/hermes/plugins/memory/honcho/__init__.py', doraise=True)" \
     && rm -f /tmp/patch-honcho-gateway-turn-filter.py
+# The pinned plugin still imports two names from their pre-persistence homes; repoint them.
+COPY scripts/patch-honcho-core-imports.py /tmp/patch-honcho-core-imports.py
+RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-core-imports.py /opt/hermes/plugins/memory/honcho \
+    && /opt/hermes/.venv/bin/python -m py_compile /opt/hermes/plugins/memory/honcho/__init__.py /opt/hermes/plugins/memory/honcho/client.py \
+    && rm -f /tmp/patch-honcho-core-imports.py
 # The plugin imports Agent core modules at load time; fail the bake if the parent Agent lacks one.
 COPY --chmod=0755 scripts/verify-honcho-plugin-core-seams.py /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py
 RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py /opt/hermes/plugins/memory/honcho /opt/hermes
