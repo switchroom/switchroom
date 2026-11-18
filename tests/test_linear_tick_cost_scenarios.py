@@ -54,19 +54,24 @@ class BoardValidationScenarios(unittest.TestCase):
         self.assertEqual(self.checks, [])
 
     def test_any_write_or_checkpoint_validates_again(self):
-        with self.board.conn() as conn:
-            native.kb.add_comment(conn, self.task_id, "operator", "a later native note")
-        count = len(self.checks)
-        self.read()
-        self.assertEqual(len(self.checks), count + 1)
-        with closing(sqlite3.connect(self.database)) as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        self.read()
-        self.assertGreater(len(self.checks), count + 1)
-        self.read()  # Closing the checkpointing connection removed the WAL; the read settles it.
-        count = len(self.checks)
-        self.read()
-        self.assertEqual(len(self.checks), count)
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        # An open reader keeps the write's frames in the WAL (no checkpoint on last close), so the
+        # checkpoint below really moves pages into the database file and empties the WAL.
+        with closing(connect_tracked(self.database)) as keeper:
+            keeper.execute("SELECT count(*) FROM tasks").fetchone()
+            with self.board.conn() as conn:
+                native.kb.add_comment(conn, self.task_id, "operator", "a later native note")
+            self.read()
+            self.assertEqual(len(self.checks), 1)
+            self.read()
+            self.assertEqual(len(self.checks), 1)
+            self.assertGreater(os.stat(str(self.database) + "-wal").st_size, 0)
+            keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(os.stat(str(self.database) + "-wal").st_size, 0)
+            self.read()
+            self.assertEqual(len(self.checks), 2)
+            self.read()
+            self.assertEqual(len(self.checks), 2)
 
     def test_validation_expires(self):
         later = bridge_module.time.monotonic() + bridge_module.NATIVE_VALIDATION_MAX_AGE + 1
