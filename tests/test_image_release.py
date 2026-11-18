@@ -16,12 +16,15 @@ READ_MANIFEST = ROOT / "scripts/read-agent-image-manifest.py"
 EMIT_MANIFEST = ROOT / "scripts/emit-fleet-image-manifest.py"
 COMPACT_SBOM = ROOT / "scripts/compact-spdx-sbom.py"
 EXTRACT_PUSH_DIGEST = ROOT / "scripts/extract-pushed-image-digest.py"
-AGENT_REPOSITORY = "ghcr.io/mekenthompson/hermes-agent"
+# The Agent fork moved to switchroom/hermes-agent. Images published before the move
+# stay valid under the old namespace, so either may be the pinned parent.
+AGENT_REPOSITORIES = ("ghcr.io/switchroom/hermes-agent", "ghcr.io/mekenthompson/hermes-agent")
 # The Agent revision and digest are read from the committed handoff manifest rather than
 # pinned here, so a release PR that bumps the manifest never needs a matching test edit.
 # The structural checks below (40-hex revision, sha256 digest, immutable_ref binding) are
 # what keep this from degrading into "the manifest equals itself".
 _AGENT_MANIFEST_DATA = json.loads(AGENT_MANIFEST.read_text(encoding="utf-8"))
+AGENT_REPOSITORY = _AGENT_MANIFEST_DATA["repository"]
 AGENT_REVISION = _AGENT_MANIFEST_DATA["revision"]
 AGENT_DIGEST = _AGENT_MANIFEST_DATA["digest"]
 AGENT_REF = f"{AGENT_REPOSITORY}@{AGENT_DIGEST}"
@@ -66,6 +69,7 @@ class FleetImageReleaseTests(unittest.TestCase):
 
     def test_agent_handoff_is_exact_and_validator_is_fail_closed(self) -> None:
         manifest = json.loads(AGENT_MANIFEST.read_text(encoding="utf-8"))
+        self.assertIn(AGENT_REPOSITORY, AGENT_REPOSITORIES)
         self.assertRegex(AGENT_REVISION, r"^[0-9a-f]{40}$")
         self.assertRegex(AGENT_DIGEST, r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(manifest["immutable_ref"], f"{manifest['repository']}@{manifest['digest']}")

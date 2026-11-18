@@ -104,7 +104,15 @@ class UpstreamProvenanceTests(unittest.TestCase):
         upstream = json.loads((PLUGIN / "UPSTREAM.json").read_text(encoding="utf-8"))
         agent = json.loads(AGENT_MANIFEST.read_text(encoding="utf-8"))
         self.assertEqual(upstream["commit"], agent["revision"])
-        self.assertEqual(upstream["repository"], "https://github.com/mekenthompson/hermes-agent.git")
+        # The Agent fork moved from mekenthompson/hermes-agent to switchroom/hermes-agent.
+        # Both names are the same repository (the old one redirects) and the old image
+        # namespace stays valid for pins published before the move.
+        expected = {
+            "ghcr.io/switchroom/hermes-agent": "https://github.com/switchroom/hermes-agent.git",
+            "ghcr.io/mekenthompson/hermes-agent": "https://github.com/mekenthompson/hermes-agent.git",
+        }
+        self.assertIn(agent["repository"], expected)
+        self.assertIn(upstream["repository"], set(expected.values()))
 
 
 @unittest.skipUnless(HAVE_YAML, "PyYAML is required for overlay YAML")
