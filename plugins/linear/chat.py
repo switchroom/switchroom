@@ -163,6 +163,61 @@ def markdown_link(item: Any) -> str | None:
     return None
 
 
+TASK_LINK_HOOK = "kanban_task_link"
+
+
+def task_link(state_path, *, task_id: str, board: str, title: str, body: str = "", **_: Any) -> dict | None:
+    """Core's ``kanban_task_link`` answer, ``{"url", "text"}``, for a task this profile tracks.
+
+    Tracked means a native binding on that board in this profile's state database, read
+    read-only. The URL comes from the task's own ``Linear issue <KEY>: <url>`` line (the
+    bridge writes it at creation), and only when exactly one such line names a Linear issue
+    URL for that key. Anything else is no answer, and Core keeps the plain title.
+    """
+    import sqlite3
+    from pathlib import Path
+    from .bridge import ISSUE_MARKER, issue_url_identity
+    path = Path(state_path)
+    if not path.is_file():
+        return None
+    try:
+        with contextlib.closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)) as db:
+            rows = db.execute("SELECT m.value FROM work w JOIN metadata m ON m.key = 'native-binding:' || w.issue_id "
+                              "WHERE w.task_id = ? AND w.origin = 'native'", (task_id,)).fetchall()
+    except sqlite3.Error:
+        return None
+    if not any(_binding_names(value, task_id, board) for (value,) in rows):
+        return None
+    lines = {match.groups() for line in str(body or "").splitlines() if (match := ISSUE_MARKER.fullmatch(line.strip()))}
+    if len(lines) != 1:
+        return None
+    [(key, url)] = lines
+    identity = issue_url_identity(url)
+    if identity is None or identity[0] != "https" or identity[3] != key.upper():
+        return None
+    title = str(title or "")
+    rest = title[len(key) + 1:] if title.startswith(f"{key}:") else title
+    return {"url": url, "text": " ".join(part for part in (key, rest.strip()) if part)}
+
+
+def _binding_names(value: str, task_id: str, board: str) -> bool:
+    try:
+        binding = json.loads(value)
+    except ValueError:
+        return False
+    return isinstance(binding, dict) and binding.get("task_id") == task_id and binding.get("board") == board
+
+
+def register_task_link(ctx: Any, state_path) -> None:
+    """Answer ``kanban_task_link`` when Core has it; an older Core keeps plain-title pings."""
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+    except ImportError:
+        return
+    if TASK_LINK_HOOK in VALID_HOOKS:
+        ctx.register_hook(TASK_LINK_HOOK, lambda **kwargs: task_link(state_path(), **kwargs))
+
+
 def _with_links(value: Any, depth: int = 0) -> Any:
     """Add ``markdown_link`` beside every issue and project the reply names; nothing else changes."""
     if depth > 6:

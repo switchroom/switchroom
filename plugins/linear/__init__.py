@@ -654,6 +654,8 @@ def register(ctx: Any) -> None:
     # (settings chat_guard: false turns this off).
     from . import guard
     guard.register(ctx)
+    # Kanban chat pings name a tracked task as its linked Linear issue (Core kanban_task_link).
+    chat.register_task_link(ctx, lambda: paths()[0])
 
     stop_requested = threading.Event()
 
