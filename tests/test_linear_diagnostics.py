@@ -7,19 +7,22 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import collections
 import contextlib
 import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from linear_fake_api import ROOT, load_plugin
 
@@ -193,6 +196,159 @@ class VolumeTests(DiagCase):
         summaries = [line for line in self.capture.lines() if "reconcile.summary" in line]
         self.assertEqual(len(summaries), 2)
         self.assertIn("n_events=", summaries[0])
+
+
+class TickTimingTests(DiagCase):
+    """reconcile.summary splits the slowest tick into Linear request time and local work."""
+
+    def api(self, seconds: float = 1.5, statuses=None):
+        statuses = list(statuses or [])
+        def transport(url, body, headers):
+            self.now[0] += seconds  # the request itself takes this long
+            return (statuses.pop(0) if statuses else 200), {}, b'{"data": {"viewer": {"id": "v"}}}'
+        return linear_api.LinearAPI(lambda: "token", transport=transport)
+
+    def summary(self) -> dict[str, int]:
+        lines = [line for line in self.capture.lines() if "reconcile.summary" in line]
+        self.assertEqual(len(lines), 1, lines)
+        return {key: int(value) for key, value in re.findall(r" ((?:max_tick|n)_[a-z_]+)=(\d+)", lines[0])}
+
+    def flush_summary(self) -> None:
+        diag.count("events")
+        self.now[0] += diag.SUMMARY_EVERY_S
+        diag.tick_done(self.now[0])
+
+    def tick(self, api, *, local: float, requests: int) -> None:
+        started = self.now[0]
+        diag.tick_begin()
+        self.now[0] += local / 2
+        for _ in range(requests):
+            api.graphql("query Viewer { viewer { id } }")
+        self.now[0] += local / 2
+        diag.tick_done(started)
+
+    def test_summary_splits_api_and_local_time_and_counts_requests(self) -> None:
+        api = self.api(seconds=1.5)
+        self.tick(api, local=0.5, requests=2)   # 3.5 s: 3.0 s Linear, 0.5 s local, 2 requests
+        self.tick(api, local=1.2, requests=0)   # 1.2 s, all local
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual(values["max_tick_ms"], 3500)
+        self.assertEqual(values["max_tick_api_ms"], 3000)
+        self.assertEqual(values["max_tick_local_ms"], 1200)  # the slowest local part, from the second tick
+        self.assertEqual(values["max_tick_api_calls"], 2)
+        self.assertEqual(values["n_api_calls"], 2)
+
+    def test_a_credential_retry_is_a_second_request(self) -> None:
+        refreshed = []
+        api = self.api(seconds=0.25, statuses=[401, 200])
+        token = Mock(return_value="token")
+        token.invalidate = lambda: refreshed.append(True)
+        api.token = token
+        self.tick(api, local=0.0, requests=1)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual(refreshed, [True])
+        self.assertEqual((values["max_tick_api_calls"], values["max_tick_api_ms"]), (2, 500))
+
+    def test_requests_outside_the_ticking_thread_are_not_counted(self) -> None:
+        api = self.api(seconds=2.0)
+        api.graphql("query Viewer { viewer { id } }")  # before any tick: not counted
+        started = self.now[0]
+        diag.tick_begin()
+        worker = threading.Thread(target=api.graphql, args=("query Viewer { viewer { id } }",))
+        worker.start()
+        worker.join()  # a chat tool's request on its own thread, while this tick runs
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual(values["max_tick_ms"], 2000)
+        self.assertEqual(values["max_tick_api_ms"], 0)
+        self.assertEqual(values["max_tick_local_ms"], 2000)
+        self.assertEqual(values["n_api_calls"], 0)
+
+    def test_nested_requests_are_timed_once(self) -> None:
+        started = self.now[0]
+        diag.tick_begin()
+        with diag.api_time():
+            self.now[0] += 1.0
+            with diag.api_time():
+                diag.api_sent()
+                self.now[0] += 1.0
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_ms"], values["max_tick_api_ms"], values["max_tick_local_ms"]),
+                         (2000, 2000, 0))
+
+    def test_requests_alone_never_trigger_a_summary(self) -> None:
+        api = self.api(seconds=0.1)
+        for _ in range(100):
+            self.tick(api, local=0.0, requests=3)
+            self.now[0] += 2
+        self.assertEqual(self.capture.lines(), [])
+
+    def test_time_blocked_on_an_issue_lock_held_elsewhere_is_wait_not_local(self) -> None:
+        bridge = Bridge.__new__(Bridge)
+        bridge._guard, bridge._locks = threading.Lock(), collections.defaultdict(threading.RLock)
+        holding, release = threading.Event(), threading.Event()
+        def chat_tool() -> None:
+            with bridge.lock(ISSUE):
+                holding.set()
+                release.wait(5)
+        holder = threading.Thread(target=chat_tool)
+        holder.start()
+        holding.wait(5)
+        started = self.now[0]
+        diag.tick_begin()
+        threading.Timer(0.05, lambda: (self.now.__setitem__(0, self.now[0] + 3.0), release.set())).start()
+        with bridge.lock(ISSUE):            # blocks until the chat tool lets go, 3 s later
+            with bridge.lock(ISSUE):        # re-entry on the same thread never waits
+                self.assertTrue(bridge.lock(ISSUE)._is_owned())
+                self.now[0] += 0.25         # own work under the lock
+        diag.tick_done(started)
+        holder.join(5)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_ms"], values["max_tick_wait_ms"], values["max_tick_local_ms"],
+                          values["max_tick_api_ms"]), (3250, 3000, 250, 0))
+
+    def test_time_blocked_on_the_store_write_lock_is_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.db")
+            other = sqlite3.connect(Path(tmp) / "state.db", isolation_level=None, check_same_thread=False)
+            self.addCleanup(other.close)
+            other.execute("BEGIN IMMEDIATE")  # another process is mid-write
+            def commit_later() -> None:
+                self.now[0] += 2.0
+                other.execute("COMMIT")
+            threading.Timer(0.05, commit_later).start()
+            started = self.now[0]
+            diag.tick_begin()
+            store.diag_counts(self.wall[0])
+            diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_wait_ms"], values["max_tick_local_ms"]), (2000, 0))
+
+    def test_bridge_tick_reports_its_own_split(self) -> None:
+        api = self.api(seconds=4.0)
+        bridge = Bridge.__new__(Bridge)
+        bridge.store = SimpleNamespace(diag_counts=lambda now: {"n_bindings": 1})
+        bridge.clock = lambda: self.wall[0]
+        def pump() -> None:
+            self.now[0] += 0.75  # local work
+            api.graphql("query Viewer { viewer { id } }")
+        bridge._recover_admissions = lambda: None
+        bridge.pump_kanban = pump
+        bridge.recheck = lambda: api.graphql("query Viewer { viewer { id } }")
+        bridge.flush = lambda: None
+        with patch.object(time, "monotonic", lambda: self.now[0]):
+            bridge.tick()
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_ms"], values["max_tick_api_ms"], values["max_tick_local_ms"],
+                          values["max_tick_api_calls"]), (8750, 8000, 750, 2))
 
 
 class DetailSettingTests(DiagCase):

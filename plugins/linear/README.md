@@ -43,9 +43,10 @@ Creates read the new issue or project back under its UUID. Linear's editor rewri
 it stores it: it backslash-escapes punctuation such as `~`, writes `*` for `-` bullets and drops
 trailing spaces and repeated blank lines. Outside code those count as the same text. A new
 issue's description also comes back with a bare URL or host/path the author wrote autolinked
-(`[T](<T>)`, or `[T](<http://T>)` for a host) and with bold split around inline code; the
-create readback accepts exactly those, with the same token and target and the same bold
-characters. Description and comment writes still settle on the stricter comparison. A create
+(`[T](<T>)`, or `[T](<http://T>)` for a host), with bold split around inline code, and with
+bold closed before a link that ends it (`**see [X](u)**` comes back `**see** [X](u)`); the
+create readback accepts exactly those, with the same token, the same link label and target,
+and the same bold prose characters. Description and comment writes still settle on the stricter comparison. A create
 whose readback still differs is reported as created, with `readback_differences` naming the
 fields and a `content.write` `readback_differs` warning (`fields=` names them); it is never refused, because a refusal
 invites a retry under a new id, which is how duplicates happen. Escapes that change structure
@@ -702,7 +703,12 @@ outlives log rotation.
 
 Volume: at idle the plugin writes nothing. With linked work it writes one `service.health` line
 per hour. Under load it writes one `reconcile.summary` line per minute, and only when something
-happened. A WARNING repeats at most once per 15 minutes per issue and reason, and the next one
+happened. The summary splits tick time: `max_tick_ms` is the slowest tick, `max_tick_api_ms`
+the most time one tick spent inside Linear requests (request lock, credentials, HTTP),
+`max_tick_wait_ms` the most it spent blocked on a per-issue lock or the store's write lock held
+by another thread or process, `max_tick_local_ms` the most of its own work, and
+`max_tick_api_calls` / `n_api_calls` the most HTTP requests in one tick and the total. Chat-tool
+requests on other threads are not counted. A WARNING repeats at most once per 15 minutes per issue and reason, and the next one
 carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Each
 `linear` tool call logs one `tool.result` line whose `reason` is the reply's code
 (`request_refused`, `project_required`, `ambiguous_project`, `unknown_team`, `not_found`,

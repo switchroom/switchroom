@@ -305,6 +305,16 @@ class CreateReadbackTests(unittest.TestCase):
         "all_together": ("## Work\n- **A.** see `x` at https://a.example/y and ghcr.io/s\n```\nhttps://raw\n```",
                          "## Work\n\n* **A.** see `x` at [https://a.example/y](<https://a.example/y>) and "
                          "[ghcr.io/s](<http://ghcr.io/s>)\n```\nhttps://raw\n```"),
+        # Linear closes bold before a link that ends the bold run (synthetic reduction of a live create).
+        "bold_closed_before_link": ("5. **Wait for [OPS-9](https://a.example/i/OPS-9)** (the other job): then go.",
+                                    "5. **Wait for** [OPS-9](https://a.example/i/OPS-9) (the other job): then go."),
+        "bold_opened_after_link": ("**[OPS-9](https://a.example/i/OPS-9) is done**",
+                                   "[OPS-9](https://a.example/i/OPS-9) **is done**"),
+        "bold_link_angle_target": ("**see [OPS-9](<https://a.example/i/OPS-9>)** now",
+                                   "**see** [OPS-9](<https://a.example/i/OPS-9>) now"),
+        # The other live create: a blank line added between a paragraph and the checklist under it.
+        "blank_line_before_list": ("## Phase\nDo this first.\n- [ ] one\n- [ ] two",
+                                   "## Phase\n\nDo this first.\n\n- [ ] one\n- [ ] two"),
     }
     REJECTED = {
         "bold_removed": ("**NOT** this", "NOT this"),
@@ -324,6 +334,18 @@ class CreateReadbackTests(unittest.TestCase):
         "link_inside_code": ("run `curl https://a.example/x`", "run `curl [https://a.example/x](<https://a.example/x>)`"),
         "link_inside_fence": ("```\nhttps://a.example/x\n```", "```\n[https://a.example/x](<https://a.example/x>)\n```"),
         "authored_link_removed": ("[https://a.example/x](https://a.example/x)", "https://a.example/x"),
+        # Bold moved off a link is tolerated; a changed link, word or bold prose is not.
+        "bold_link_target_changed": ("**Wait for [OPS-9](https://a.example/i/OPS-9)** now",
+                                     "**Wait for** [OPS-9](https://a.example/i/OPS-8) now"),
+        "bold_link_label_changed": ("**Wait for [OPS-9](https://a.example/i/OPS-9)** now",
+                                    "**Wait for** [OPS-8](https://a.example/i/OPS-9) now"),
+        "bold_link_dropped": ("**Wait for [OPS-9](https://a.example/i/OPS-9)** now", "**Wait for** OPS-9 now"),
+        "bold_link_word_changed": ("**Wait for [OPS-9](https://a.example/i/OPS-9)** now",
+                                   "**Wait on** [OPS-9](https://a.example/i/OPS-9) now"),
+        "bold_prose_lost_beside_link": ("**NOT** [OPS-9](https://a.example/i/OPS-9) yet",
+                                        "NOT [OPS-9](https://a.example/i/OPS-9) yet"),
+        "bold_prose_grew_beside_link": ("**Wait** for [OPS-9](https://a.example/i/OPS-9)",
+                                        "**Wait for** [OPS-9](https://a.example/i/OPS-9)"),
     }
 
     def test_linear_rewrites_on_create_compare_equal(self):
@@ -338,7 +360,8 @@ class CreateReadbackTests(unittest.TestCase):
                 self.assertFalse(api.markdown_matches(stored, authored))
 
     def test_settlement_comparator_stays_strict(self):
-        for name in ("full_url", "bare_host_path", "bold_split_around_code"):
+        for name in ("full_url", "bare_host_path", "bold_split_around_code", "bold_closed_before_link",
+                     "bold_opened_after_link"):
             authored, stored = self.ACCEPTED[name]
             with self.subTest(name):
                 self.assertFalse(api.markdown_matches(stored, authored))

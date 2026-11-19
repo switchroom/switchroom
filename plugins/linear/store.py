@@ -14,6 +14,7 @@ from collections import Counter
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from . import diag
 from .api import backoff_delay
 from .acceptance import DELIVERY_REFUSAL
 MIN_BACKOFF, MAX_BACKOFF, GIVE_UP_AFTER = 60.0, 3600.0, 86_400.0
@@ -170,7 +171,8 @@ class Store:
             return
         with closing(sqlite3.connect(self.path, timeout=90, isolation_level=None)) as db:
             db.row_factory = sqlite3.Row
-            db.execute("BEGIN IMMEDIATE")
+            with diag.wait_time():  # blocks while another thread or process holds the write lock
+                db.execute("BEGIN IMMEDIATE")
             self._local.db = db
             try:
                 yield db

@@ -23,6 +23,7 @@ import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -154,12 +155,14 @@ FIELDS: dict[str, re.Pattern | None] = {  # None means integer
     "commit": re.compile(r"[0-9a-f]{7,40}"), "lvl": re.compile(r"detail"),
     "detail": re.compile(r"on|off"), "suppressed": None, "next_s": None, "tick_s": None,
     "recheck_s": None, "oldest_pending_s": None, "max_tick_ms": None, "waited_s": None,
+    # Slowest tick parts (own work, Linear requests, blocked on another holder) and most requests in one tick.
+    "max_tick_local_ms": None, "max_tick_api_ms": None, "max_tick_wait_ms": None, "max_tick_api_calls": None,
     # Comma-separated field names (create readback differences), never field values.
     "fields": re.compile(r"[a-z][a-z_]{0,23}(?:,[a-z][a-z_]{0,23}){0,7}"),
 }
 for _name in ("bindings", "pending", "held", "failed_unreported", "events", "status_q", "delegate_q",
               "sent", "refused", "skipped", "retry", "failed", "deliveries", "ignored", "suppressed_info",
-              "content", "minor"):
+              "content", "minor", "api_calls"):
     FIELDS["n_" + _name] = None
 ORDER = ("agent", "profile", "issue", "iss", "task", "sess", "evt", "row", "attempt", "ms")
 # Optional fields are written in this order after the fixed ones.
@@ -174,10 +177,11 @@ EXEMPT = frozenset({"service.start", "service.stop", "service.health", "reconcil
 CONSEQUENTIAL = frozenset({"claimed", "spawned", "crashed", "gave_up", "timed_out", "reclaimed", "blocked",
                            "block_loop_detected", "unblocked", "completed", "archived", "review_requested"})
 SUMMARY_COUNTERS = ("events", "status_q", "delegate_q", "sent", "refused", "skipped", "retry", "failed", "held",
-                    "deliveries", "ignored", "content", "minor")
-# Routine background work (applied comments and keepalives, heartbeats) is shown but never
-# triggers a summary on its own, so steadily running work stays near zero lines per hour.
-SUMMARY_TRIGGERS = frozenset(SUMMARY_COUNTERS) - {"content", "minor"}
+                    "deliveries", "ignored", "content", "minor", "api_calls")
+# Routine background work (applied comments and keepalives, heartbeats, the requests they make) is
+# shown but never triggers a summary on its own, so steadily running work stays near zero lines per hour.
+SUMMARY_TRIGGERS = frozenset(SUMMARY_COUNTERS) - {"content", "minor", "api_calls"}
+TICK_MAXIMA = ("max_tick_ms", "max_tick_local_ms", "max_tick_api_ms", "max_tick_wait_ms", "max_tick_api_calls")
 
 
 def _now() -> float:
@@ -200,7 +204,7 @@ class _State:
         self.window_count = 0
         self.throttled = 0
         self.counters: dict[str, int] = {}
-        self.max_tick_ms = 0
+        self.maxima: dict[str, int] = dict.fromkeys(TICK_MAXIMA, 0)
         self.last_summary = None
         self.last_health = None
 
@@ -559,11 +563,65 @@ def native_event(kind: Any, **fields: Any) -> None:
         detail("native.event", "skipped", "-", kind=kind if isinstance(kind, str) else None, **fields)
 
 
+# -- tick timing ---------------------------------------------------------------
+# A slow reporting tick is mostly waiting. The ticking thread adds up three things:
+# - api: wall time inside Linear requests (the shared request lock, credentials, HTTP, decoding
+#   the answer) and how many HTTP requests went out;
+# - wait: time blocked on a lock another thread or process held (a per-issue bridge lock, the
+#   reporting store's write lock), which is neither Linear nor this tick's own work;
+# - local: the rest, the tick's own work.
+# Other threads (chat tools) are not part of the tick and are not counted.
+
+def tick_begin() -> None:
+    _tls.tick_api = [0.0, 0, 0.0]  # seconds inside Linear requests, HTTP requests sent, seconds blocked
+
+
+@contextmanager
+def _timed(slot: int):
+    depth = getattr(_tls, "api_depth", 0)
+    _tls.api_depth = depth + 1
+    started = _now()
+    try:
+        yield
+    finally:
+        _tls.api_depth = depth
+        tick = getattr(_tls, "tick_api", None)
+        if depth == 0 and tick is not None:  # time inside an outer request is the request's
+            tick[slot] += _now() - started
+
+
+def api_time():
+    """Time one Linear request on this thread; a nested request is counted once, by the outermost."""
+    return _timed(0)
+
+
+def wait_time():
+    """Time blocking on a lock held elsewhere; inside a Linear request it counts as the request."""
+    return _timed(2)
+
+
+def api_sent() -> None:
+    """One HTTP request is about to go to Linear (a credential retry is a second one)."""
+    tick = getattr(_tls, "tick_api", None)
+    if tick is not None:
+        tick[1] += 1
+
+
 def tick_done(started: float, gauges: Callable[[], dict[str, Any]] | None = None) -> None:
     """End of one reporting tick: at most one summary per 60 s when something happened, one hourly health line."""
     now = _now()
+    api_s, calls, wait_s = getattr(_tls, "tick_api", None) or (0.0, 0, 0.0)
+    _tls.tick_api = None
     with _state.lock:
-        _state.max_tick_ms = max(_state.max_tick_ms, int((now - started) * 1000))
+        total_ms = int((now - started) * 1000)
+        api_ms = max(0, min(total_ms, int(api_s * 1000)))
+        wait_ms = max(0, min(total_ms - api_ms, int(wait_s * 1000)))
+        for name, value in (("max_tick_ms", total_ms), ("max_tick_local_ms", total_ms - api_ms - wait_ms),
+                            ("max_tick_api_ms", api_ms), ("max_tick_wait_ms", wait_ms),
+                            ("max_tick_api_calls", calls)):
+            _state.maxima[name] = max(_state.maxima[name], value)
+        if calls:
+            _state.counters["api_calls"] = _state.counters.get("api_calls", 0) + calls
         if _state.last_summary is None:
             _state.last_summary = now
         if _state.last_health is None:
@@ -573,8 +631,9 @@ def tick_done(started: float, gauges: Callable[[], dict[str, Any]] | None = None
         health_due = now - _state.last_health >= HEALTH_EVERY_S
         if summary_due:
             counters = {f"n_{name}": _state.counters.get(name, 0) for name in SUMMARY_COUNTERS}
-            counters["max_tick_ms"] = _state.max_tick_ms
-            _state.counters, _state.max_tick_ms, _state.last_summary = {}, 0, now
+            counters.update(_state.maxima)
+            _state.counters, _state.last_summary = {}, now
+            _state.maxima = dict.fromkeys(TICK_MAXIMA, 0)
         if health_due:
             _state.last_health = now
     if not (summary_due or health_due):
