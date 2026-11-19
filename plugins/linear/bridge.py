@@ -1383,6 +1383,25 @@ class Kanban:
         if not self.executor_profile or task.assignee != self.executor_profile:
             raise LinearError("Native task belongs to a different or unverified profile", retryable=False)
         return task
+
+
+class _IssueLock:
+    """A per-issue reporting lock. Time spent blocked on it, because a chat tool or another
+    reporting path holds it, is counted as tick wait, not as the tick's own work."""
+    __slots__ = ("_lock",)
+    def __init__(self, lock: threading.RLock) -> None:
+        self._lock = lock
+    def __enter__(self) -> "_IssueLock":
+        if not self._lock.acquire(blocking=False):
+            with diag.wait_time():
+                self._lock.acquire()
+        return self
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+    def _is_owned(self) -> bool:
+        return self._lock._is_owned()  # type: ignore[attr-defined]
+
+
 class Bridge:
     def __init__(self, store: Store, api: LinearAPI, kanban: Kanban, *, profile: str,
                  settings: dict[str, Any] | None = None,
@@ -1451,9 +1470,9 @@ class Bridge:
                 binding.get("requester_session_id") != work.get("owner_ref")):
             return None
         return binding.get("requester_activity_id")
-    def lock(self, issue_id: str) -> threading.Lock:
+    def lock(self, issue_id: str) -> "_IssueLock":
         with self._guard:
-            return self._locks[issue_id]
+            return _IssueLock(self._locks[issue_id])
     def state_name(self, issue: dict[str, Any], key: str) -> str | None:
         """Per-team state name; ``None`` means leave the status alone (the message still posts)."""
         team = issue.get("team") or {}
@@ -5395,6 +5414,7 @@ class Bridge:
                            "AND delivery_id = ?", (status, agent, delivery))
     def tick(self, ingress: Path | None = None) -> None:
         started = time.monotonic()
+        diag.tick_begin()
         try:
             if ingress is not None:
                 self.drain_ingress(ingress)

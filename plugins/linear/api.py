@@ -359,17 +359,38 @@ def _unlink_autolinks(actual: str, expected: str) -> str:
         return ''.join(text if code else _AUTOLINK.sub(unlink, text) for text, code in pieces)
     return _outside_code(actual, line_rewrite)
 
+# An inline link whose label has no emphasis, code or nested brackets of its own.
+_PLAIN_LINK = re.compile(r'\[[^\[\]`*\\]+\]\((?:<[^\s<>]+>|[^\s<>()]+)\)')
+
+def _link_split(pieces: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    """Split prose pieces further so each plain inline link is its own exact unit, like code."""
+    out = []
+    for text, exact in pieces:
+        if exact:
+            out.append((text, True))
+            continue
+        offset = 0
+        for match in _PLAIN_LINK.finditer(text):
+            out += [(text[offset:match.start()], False), (match.group(), True)]
+            offset = match.end()
+        out.append((text[offset:], False))
+    return out
+
 def _canonical_bold(text: str) -> str:
     """Compare emphasis as which characters are bold, not where ``**`` sits.
 
     Linear writes ``**a (**`b`**, c**`` for ``**a (`b`, c)**``: the same characters are bold.
-    Whitespace and code spans carry no bold of their own (they take the preceding character's),
-    code stays byte-exact, and a line with unbalanced, tripled or escaped ``**`` is left exact.
+    It also closes bold before a link that ends it: ``**see [X](u)** now`` comes back as
+    ``**see** [X](u) now`` (seen live on a chat-created issue, 2026-11-19).
+    Whitespace, code spans and plain links carry no bold of their own (they take the preceding
+    character's), code and links stay byte-exact (label and target), and a line with unbalanced,
+    tripled or escaped ``**`` is left exact.
     """
     def line_rewrite(line: str) -> str | None:
         pieces = _code_split(line)
         if pieces is None:
             return None
+        pieces = _link_split(pieces)
         prose = [text for text, code in pieces if not code]
         if not any('**' in text for text in prose):
             return line
@@ -616,16 +637,17 @@ class LinearAPI:
     def _graphql(self, query: str, variables: dict[str, Any] | None = None, *,
                  token_provider: Callable[[], str] | None = None,
                  verify_credential: Callable[[Callable[[], str]], tuple[Callable[[], str], str]] | None = None) -> dict[str, Any]:
-        left = self._deadline_left()
-        if left is None:
-            with self._request_lock:
+        with diag.api_time():  # The reporting tick reports this apart from its local work.
+            left = self._deadline_left()
+            if left is None:
+                with self._request_lock:
+                    return self._request(query, variables, token_provider=token_provider, verify_credential=verify_credential)
+            if not self._request_lock.acquire(timeout=max(0.0, left - REQUEST_TIMEOUT_SECONDS)):
+                raise LinearError("Linear is answering too slowly to finish this in time")
+            try:
                 return self._request(query, variables, token_provider=token_provider, verify_credential=verify_credential)
-        if not self._request_lock.acquire(timeout=max(0.0, left - REQUEST_TIMEOUT_SECONDS)):
-            raise LinearError("Linear is answering too slowly to finish this in time")
-        try:
-            return self._request(query, variables, token_provider=token_provider, verify_credential=verify_credential)
-        finally:
-            self._request_lock.release()
+            finally:
+                self._request_lock.release()
     def _request(self, query, variables, *, token_provider, verify_credential):
         if self.clock() < self._pause_state():
             raise RateLimited(self.paused_until)
@@ -649,6 +671,7 @@ class LinearAPI:
                     raise LinearError("Linear credentials unavailable") from exc
                 raise LinearError("Linear credentials unavailable") from None
             try:
+                diag.api_sent()
                 with guard() if guard else nullcontext():
                     status, response_headers, raw = self.transport(self.endpoint, body, headers)
             except (OSError, TimeoutError) as exc:
