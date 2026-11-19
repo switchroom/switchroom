@@ -233,6 +233,10 @@ def _editor_text(line: str) -> str:
     # Two or more trailing spaces are a hard line break; any other trailing whitespace is noise.
     return text.rstrip() + ("  " if re.search(r'\S {2,}$', text) else "")
 
+_LIST_START = re.compile(r'(?:[-*+]|1[.)])[ \t]+\S')
+_LIST_ITEM = re.compile(r'[ \t]*(?:[-*+]|[0-9]+[.)])(?:[ \t]|$)')
+_PARAGRAPH_LINE = re.compile(r'[^\s#>|`~<]')
+
 def markdown_matches(actual: object, expected: str) -> bool:
     """Accept narrow editor rewrites, including bare-host autolinks; preserve code/text."""
     if not isinstance(actual, str):
@@ -258,6 +262,12 @@ def markdown_matches(actual: object, expected: str) -> bool:
                     continue  # Linear keeps one blank line, none after a heading or at the start
                 result.append(("", False))
                 continue
+            if (len(result) >= 2 and result[-1] == ("", False) and _LIST_START.match(line)
+                    and _PARAGRAPH_LINE.match(result[-2][0]) and not _LIST_ITEM.match(result[-2][0])):
+                # Linear adds a blank line between a paragraph and the list that follows it (seen
+                # live on an agent plan section, 2026-11-19). A bullet list, or one starting at 1,
+                # interrupts a paragraph anyway, so both spellings render the same.
+                result.pop()
             after_heading = bool(re.match(r'^#{1,6} +', line))
             # A bare-looking host on a later line may still be inside inline
             # code, a link label/destination, or an HTML tag opened earlier.
