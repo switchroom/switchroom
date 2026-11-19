@@ -68,6 +68,24 @@ class PlanSectionTests(unittest.TestCase):
             self.assertEqual(plan_section(body), "", body)
         self.assertEqual(plan_comment(section), "**Plan and progress**\n\nStatus: waiting on review\n\n- [x] Plan\n- [ ] Merge")
 
+    def test_linear_stored_section_still_reads_as_ours(self):
+        # Shape Linear stored for a live plan section (2026-11-19): blank lines after the heading
+        # and before the list, [X] for a ticked item and <url> link destinations.
+        from hermes_fleet_linear_plugin.api import markdown_matches
+        sent = (f"{PLAN_HEADING}\nStatus: live; waiting on review.\n- [x] Merged in [repo#1](https://github.example/pr/1)\n"
+                "- [ ] Live check")
+        stored = (f"{PLAN_HEADING}\n\nStatus: live; waiting on review.\n\n- [X] Merged in [repo#1](<https://github.example/pr/1>)\n"
+                  "- [ ] Live check")
+        self.assertTrue(markdown_matches(stored, sent))
+        self.assertTrue(markdown_matches(sent, sent.replace("review.\n-", "review.\n\n-")))
+        for changed in (stored.replace("- [ ] Live", "- [x] Live"), stored.replace("review.", "Sam."),
+                        stored.replace("\n\n- [X]", "\n\n  - [X]"), stored.replace("Status: live; waiting on review.\n\n", "")):
+            self.assertFalse(markdown_matches(changed, sent), changed)
+        # Only a paragraph followed by a list loses its blank line; other blocks keep theirs.
+        for expected in ("- a\n\n- b", "- a\n  more\n\n- b", "```\ncode\n```\n\n- b", "> quote\n\n- b",
+                         "Text\n\n2. second", "Text\n\nMore text", "| a |\n\n- b"):
+            self.assertFalse(markdown_matches(expected.replace("\n\n", "\n"), expected), expected)
+
     def test_split_finds_the_last_heading_outside_code(self):
         human = f"Outcome\n\n```\n{PLAN_HEADING}\n```\n"
         section = f"{PLAN_HEADING}\nStatus: x\n- [ ] a"

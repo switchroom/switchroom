@@ -2103,6 +2103,34 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.plan_update(clock, reporter, task_id, self.PLAN_B)
         self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_B)
 
+    def test_plan_section_survives_linears_own_markdown_rewrite(self):
+        # Live 2026-11-19: Linear stored the section with blank lines after the heading and before
+        # the list, [X] ticks and <url> links. That is still the agent's section: ticks stay silent
+        # description edits, with no retry, no comment and no switch to comments.
+        import re
+        clock, remote, reporter, task_id = self.plan_fixture("plan-linear-rewrite")
+        original = remote._apply
+        def linear_editor(query, variables):
+            status, payload = original(query, variables)
+            fields = (variables or {}).get("input") or {}
+            if "issueUpdate" in query and isinstance(fields.get("description"), str):
+                text = re.sub(r"^(## .+)\n(?!\n)", r"\1\n\n", fields["description"], flags=re.M)
+                text = re.sub(r"^([^\s#>\-].*)\n(- )", r"\1\n\n\2", text, flags=re.M)
+                text = re.sub(r"\]\((https?://[^)\s]+)\)", r"](<\1>)", text.replace("- [x]", "- [X]"))
+                remote.issues[variables["id"]]["description"] = text
+            return status, payload
+        remote._apply = linear_editor
+        plan_a = self.PLAN_A.replace("anyone\n\n-", "anyone\n-")
+        for section in (plan_a, self.PLAN_B, self.PLAN_C):
+            self.plan_update(clock, reporter, task_id, section)
+            description = remote.issues[ISSUE]["description"]
+            self.assertTrue(description.startswith(self.HUMAN_TEXT + "\n\n## Plan and progress (agent)\n\nStatus: "))
+            self.assertEqual(description.count("## Plan and progress (agent)"), 1)
+            self.assertEqual(remote.comments, [])
+            self.assertFalse(reporter.store.pending())
+        self.assertIn("- [X] PR merged", remote.issues[ISSUE]["description"])
+        self.assertFalse(reporter.store.plan_state(ISSUE).get("backoff"))
+
     def test_plan_update_from_another_author_or_closed_issue_changes_nothing(self):
         clock, remote, reporter, task_id = self.plan_fixture("plan-foreign")
         self.plan_update(clock, reporter, task_id, self.PLAN_A, author="someone-else")
