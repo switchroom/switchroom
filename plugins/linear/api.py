@@ -383,8 +383,10 @@ def _canonical_bold(text: str) -> str:
     It also closes bold before a link that ends it: ``**see [X](u)** now`` comes back as
     ``**see** [X](u) now`` (seen live on a chat-created issue, 2026-11-19).
     Whitespace, code spans and plain links carry no bold of their own (they take the preceding
-    character's), code and links stay byte-exact (label and target), and a line with unbalanced,
-    tripled or escaped ``**`` is left exact.
+    character's). Linear stores bold code alone as plain code (``**`x`**`` comes back `` `x` ``),
+    but nothing shows it doing that to a link, so a bold run holding only links and no prose keeps
+    their bold: dropping it from ``**[X](u)**`` still differs. Code and links stay byte-exact
+    (label and target), and a line with unbalanced, tripled or escaped ``**`` is left exact.
     """
     def line_rewrite(line: str) -> str | None:
         pieces = _code_split(line)
@@ -397,16 +399,23 @@ def _canonical_bold(text: str) -> str:
         if (any('***' in text or re.search(r'\\\*', text) for text in prose)
                 or sum(text.count('**') for text in prose) % 2):
             return None
-        units, bold = [], False  # (text, bold flag or None for neutral)
+        units, bold = [], False  # [text, bold flag or None for neutral]
+        run_links, run_prose = [], False  # link units inside the open bold run; prose seen in it
         for text, code in pieces:
             if code:
-                units.append((text, None))
+                units.append([text, None])
+                if bold and text.startswith('['):
+                    run_links.append(units[-1])
                 continue
             for part in re.split(r'(\*\*)', text):
                 if part == '**':
-                    bold = not bold
+                    if bold and not run_prose:
+                        for unit in run_links:
+                            unit[1] = True  # a bold run of only links (and code) keeps the links bold
+                    bold, run_links, run_prose = not bold, [], False
                 else:
-                    units.extend((char, None if char.isspace() else bold) for char in part)
+                    units.extend([char, None if char.isspace() else bold] for char in part)
+                    run_prose = run_prose or (bold and not part.isspace() and part != '')
         flags = [flag for _, flag in units if flag is not None]
         current, out, open_ = flags[0] if flags else False, [], False
         for unit, flag in units:
