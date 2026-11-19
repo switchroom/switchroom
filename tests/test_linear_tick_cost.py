@@ -312,6 +312,8 @@ class CreateReadbackTests(unittest.TestCase):
                                    "[OPS-9](https://a.example/i/OPS-9) **is done**"),
         "bold_link_angle_target": ("**see [OPS-9](<https://a.example/i/OPS-9>)** now",
                                    "**see** [OPS-9](<https://a.example/i/OPS-9>) now"),
+        # Linear stores bold code alone as plain code (seen live; accepted before this change too).
+        "bold_only_code_dropped": ("- **`org/repo`**: has notes.", "* `org/repo`: has notes."),
         # The other live create: a blank line added between a paragraph and the checklist under it.
         "blank_line_before_list": ("## Phase\nDo this first.\n- [ ] one\n- [ ] two",
                                    "## Phase\n\nDo this first.\n\n- [ ] one\n- [ ] two"),
@@ -346,6 +348,14 @@ class CreateReadbackTests(unittest.TestCase):
                                         "NOT [OPS-9](https://a.example/i/OPS-9) yet"),
         "bold_prose_grew_beside_link": ("**Wait** for [OPS-9](https://a.example/i/OPS-9)",
                                         "**Wait for** [OPS-9](https://a.example/i/OPS-9)"),
+        # A bold run that holds only a link or code is that link's or code's own bold.
+        "bold_only_link_dropped": ("**[OPS-9](https://a.example/i/OPS-9)**", "[OPS-9](https://a.example/i/OPS-9)"),
+        "bold_only_link_dropped_mid_line": ("a **[OPS-9](https://a.example/i/OPS-9)** b",
+                                            "a [OPS-9](https://a.example/i/OPS-9) b"),
+        "bold_only_link_added": ("a [OPS-9](https://a.example/i/OPS-9) b",
+                                 "a **[OPS-9](https://a.example/i/OPS-9)** b"),
+        "bold_only_link_beside_code_dropped": ("**`v1` [OPS-9](https://a.example/i/OPS-9)**",
+                                               "`v1` [OPS-9](https://a.example/i/OPS-9)"),
     }
 
     def test_linear_rewrites_on_create_compare_equal(self):
