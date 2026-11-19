@@ -424,6 +424,71 @@ class CoreContractScenarios(unittest.TestCase):
         self.assertEqual(len(seen), 1, "Core no longer calls adapter.kanban_prompt_consumer")
         self.assertTrue({"board", "task_id", "run_id", "db"} <= set(seen[0]), seen[0])
 
+    def _registered_hooks(self, state: Path) -> dict:
+        sys.path.insert(0, str(ROOT / "tests"))
+        from linear_fake_api import load_plugin
+        plugin = load_plugin()
+
+        class Context:
+            def __init__(self):
+                self.hooks: dict = {}
+
+            def get_config(self, key, default=None):
+                return {"enabled": True, "chat_guard": True, "state_database": str(state)}.get(key, default)
+
+            def register_hook(self, name, callback):
+                self.hooks.setdefault(name, []).append(callback)
+
+            def __getattr__(self, name):
+                if name.startswith("register_") or name == "on_unload":
+                    return lambda *args, **kwargs: None
+                raise AttributeError(name)
+
+        context = Context()
+        # A foreground (non-worker, non-gateway) load: every hook, no reporting service thread.
+        with patch.dict(os.environ, {"_HERMES_GATEWAY": "0"}):
+            os.environ.pop("HERMES_KANBAN_TASK", None)
+            plugin.register(context)
+        return context.hooks
+
+    def test_every_hook_the_plugin_registers_is_a_core_hook(self):
+        """A hook Core does not know is stored but never fired: a rename would silently drop it."""
+        from hermes_cli.plugins import VALID_HOOKS
+        with tempfile.TemporaryDirectory() as temp:
+            hooks = self._registered_hooks(Path(temp, "state.db"))
+        self.assertIn("on_kanban_dispatch_tick", hooks)  # the collector saw the registration path
+        self.assertEqual(sorted(set(hooks) - VALID_HOOKS), [])
+
+    def test_core_notifier_names_a_tracked_task_as_its_linked_issue(self):
+        """gateway.kanban_watchers_notifier._task_link -> kanban_task_link (chat.task_link).
+
+        A Core without the hook gets no registration and keeps plain titles; a Core with it
+        renders [KEY Title](url) for the bound task and nothing for an untracked one.
+        """
+        from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+        url = "https://linear.app/acme/issue/HF-123/fix-the-thing"
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp, "state.db")
+            hooks = self._registered_hooks(state)
+            from hermes_fleet_linear_plugin.bridge import TASK_BODY
+            from hermes_fleet_linear_plugin.store import Store
+            Store(state).bind_native("issue-uuid-1", "t_tracked", "alpha", "default", at=100)
+            if "kanban_task_link" not in VALID_HOOKS:
+                self.assertNotIn("kanban_task_link", hooks)
+                return
+            from gateway.kanban_watchers_notifier import _task_link
+            manager = get_plugin_manager()
+            saved = {name: list(callbacks) for name, callbacks in manager._hooks.items()}
+            manager._hooks["kanban_task_link"] = list(hooks["kanban_task_link"])
+            try:
+                body = TASK_BODY.format(ident="HF-123", url=url, context="context")
+                tracked = types.SimpleNamespace(id="t_tracked", title="HF-123: Fix the thing", body=body)
+                untracked = types.SimpleNamespace(id="t_other", title="HF-123: Fix the thing", body=body)
+                self.assertEqual(_task_link(tracked, "default"), f"[HF-123 Fix the thing]({url})")
+                self.assertIsNone(_task_link(untracked, "default"))
+            finally:
+                manager._hooks = saved
+
 
 if SOURCE and not RELEASE_CORE:
     del CoreContractScenarios
