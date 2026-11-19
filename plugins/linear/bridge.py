@@ -159,16 +159,30 @@ How to work this task:
    evidence is reported to Linear as unfinished.
 3. If you need a human decision, use clarify when available and wait for the actual answer.
    If the question cannot be delivered, kanban_block with kind needs_input and say exactly what you need.
-4. Keep the people following this issue informed without noise. At each meaningful milestone or blocker, call
-   kanban_comment on this task with human_checkpoint=true and a new stable request_id (reuse it on
-   retry with the same body). These become regular issue comments, including while an Agent Session
-   is running. Keep tool activity and heartbeats in that session, not in checkpoints. Write each
-   checkpoint for a person: a few complete sentences in Linear Markdown saying what changed,
-   what is next and any blocker. Never post reasoning, tool output, logs, process IDs or raw errors,
-   and keep task ids, board names, run numbers and internal states (fences, quiescence) out of Linear.
-5. Your kanban_complete summary is the closing note people read in Linear. Write it in Linear Markdown
+4. Keep the plan current in the issue description. When work starts, and each time a stage is
+   verified, call kanban_comment on this task WITHOUT human_checkpoint, with a body whose first line
+   is exactly "## Plan and progress (agent)", then "Status: ..." (one line: where it stands and who
+   it waits on), then a "- [ ]" / "- [x]" checklist built from the acceptance criteria, with PRs and
+   related issues as linked text. Send the whole section each time. It silently replaces the agent
+   section at the end of the description; text people wrote above it is never changed. If someone
+   edits that section, updates are posted as comments instead.
+5. Comment on the issue only when the stage changes: plan validated, PR open, merged, live, blocked or
+   needs someone, done. Call kanban_comment with human_checkpoint=true and a new stable request_id
+   (reuse it on retry with the same body). Write a bold stage title, then up to three lines:
+   **What happened:** (what was done and verified, key numbers, linked PRs and issues), **Why:** (one
+   sentence, only for a real decision, failed approach or change of plan) and **Next:** (the next step
+   and who it waits on). About 40 to 100 words; no Details blocks, logs, long lists, commands or
+   commit SHAs. A blocker says who needs to do what and why in one or two plain sentences; keep
+   commands and operator detail on this task. Heartbeats and routine progress are not comments.
+   Never post reasoning, tool output, process IDs or raw errors, and keep task ids, board names,
+   run numbers and internal states (fences, quiescence) out of Linear.
+6. Name every Linear issue and project as linked text, [HF-123 Short title](https://linear.app/...),
+   in Linear, Telegram, Slack and Desktop; never a bare key or bare URL.
+7. Your kanban_complete summary is the closing note people read in Linear. First send the final plan
+   section (all items ticked, or the remaining ones left open). Write the summary in Linear Markdown
    with three short sections: **Delivered** (what changed, in plain words), **Evidence** (PR, CI,
-   deploy and live check links or results) and **Remaining** (what is left, or "Nothing").
+   deploy and live check links or results) and **Remaining** (what is left, or "Nothing"), plus one
+   "How we got here" sentence only when there was a key decision or dead end.
    Include the requested results and what the checks proved; omit raw commands, logs and internal
    bookkeeping unless the person requested them. The existing completion projection publishes this
    as the issue comment; do not create a second closing comment yourself.
@@ -710,8 +724,35 @@ _HANDOFF_PAUSE = re.compile(r"Paused for a handover to (?P<to>[A-Za-z0-9][A-Za-z
 # Agent Session activity types Linear also posts as a reply comment in the issue thread.
 # Thoughts and actions stay inside the session panel.
 THREAD_ACTIVITY_TYPES = frozenset({"elicitation", "response", "error"})
+# A blocker reason is written for the task's operator; people on the issue read who needs to do
+# what and why. Code, commands, command lines, paths and commit SHAs stay in native history.
+_FENCED_BLOCK = re.compile(r"(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)\n?")
+_COMMIT_SHA = re.compile(r"(?i)\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,64}\b")
+_COMMAND_TEXT = re.compile(
+    r"(?i)(?:^|[\s(`'\"])(?:sudo|host-root|docker|systemctl|journalctl|kubectl|git|gh|hermes|python3?|pip|npm|"
+    r"curl|ssh|bash|chmod|chown|rm|mv|cp)[ \t]+[-\w./:]|(?:^|\s)\$[ \t]|(?:^|\s)--[a-z][\w-]+|"
+    r"(?:^|[\s(`'\"])/(?:opt|etc|var|usr|srv|home|root|tmp|run)/")
+_EMPTY_LEAD = re.compile(r"(?i)^(?:then )?(?:run|use|execute|via|with|try)\b[\s:]*[.!?]?$")
+BLOCKER_FALLBACK = "The agent needs an operator to act; the details are on the agent's task."
+def _human_reason(text: str, limit: int = 2) -> str:
+    """At most ``limit`` plain sentences of a blocker reason, without code, commands or commit SHAs."""
+    text = _FENCED_BLOCK.sub(" ", str(text or ""))
+    kept: list[str] = []
+    for sentence in _split_sentences(" ".join(text.split())):
+        sentence = sentence.strip()
+        spans = re.findall(r"`([^`\n]*)`", sentence)
+        if (not sentence or _COMMAND_TEXT.search(sentence) or _COMMIT_SHA.search(sentence)
+                or any(re.search(r"[\s/=]", span) for span in spans)):
+            continue  # Commands, paths and commit SHAs are for the operator, not the reader of the issue.
+        sentence = sentence.strip(" ,;:")
+        if len(sentence.rstrip(".!?")) < 3 or _EMPTY_LEAD.match(sentence):
+            continue
+        kept.append(_sentence(sentence))
+        if len(kept) == limit:
+            break
+    return " ".join(kept)
 def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
-    """A blocker as one plain sentence: what happened, and what is next or needed from whom."""
+    """A blocker as a bold stage line, who needs to do what and why in plain words, then what is next."""
     kind = payload.get("kind")
     internal = kind in {"capability", "transient"}  # Malformed native kinds fail this event, scoped.
     raw = str(payload.get("reason") or "").strip()
@@ -727,18 +768,53 @@ def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     if internal:
         return "error", ("Paused by a technical problem on the agent's side. Nothing is needed from you; "
                          "the same task continues once the problem is cleared.")
-    reason = _project_summary(payload.get("reason") or "", 400, one_line=True)
+    reason = _project_summary(_human_reason(payload.get("reason") or ""), 400, one_line=True)
     if kind != "dependency" and _STOP_REASON.search(reason) and "?" not in reason:
         # A person stopped or handed off this work: nothing is being asked of the reader.
         return "response", _stopped_sentence(reason)
     if kind == "dependency":
-        return "thought", _sentence(f"Waiting for a dependency: {reason or 'earlier work must finish first'}") + \
-            " Work continues when it is done."
+        return "thought", ("**Waiting for a dependency**\n\n" + _sentence(reason or "Earlier work must finish first")
+                           + "\n\n**Next:** work continues when it is done.")
     if kind == "needs_input":
-        return "elicitation", _sentence(f"Waiting on you: {reason or 'the agent needs a decision'}") + \
-            " Once this is answered, ask the agent to resume and it continues the same task."
-    return "elicitation", _sentence(f"Paused: {reason or 'work was stopped'}") + \
-        " Ask the agent to resume when ready and it continues the same task."
+        asked = reason or (BLOCKER_FALLBACK if raw else "The agent needs a decision.")
+        return "elicitation", ("**Waiting on you**\n\n" + _sentence(asked) + "\n\n**Next:** once "
+                               "this is answered, ask the agent to resume and it continues the same task.")
+    return "elicitation", ("**Paused**\n\n" + _sentence(reason or "Work was stopped") +
+                           "\n\n**Next:** ask the agent to resume when ready and it continues the same task.")
+# The agent-owned living plan at the end of the issue description. A worker sends the whole section as
+# one native comment whose first line is this heading; the bridge replaces only that trailing section,
+# and only while it is still exactly what the bridge last wrote there.
+PLAN_HEADING = "## Plan and progress (agent)"
+PLAN_SECTION_LIMIT = 8000
+_FENCE_LINE = re.compile(r" {0,3}(`{3,}|~{3,})")
+def plan_section(body) -> str:
+    """The normalized plan section a worker comment carries, or "" when it is not one."""
+    if not isinstance(body, str):
+        return ""
+    text = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    first, _, rest = text.partition("\n")
+    if first.rstrip() != PLAN_HEADING or not rest.strip() or len(text) > PLAN_SECTION_LIMIT:
+        return ""
+    if plan_split(rest)[1] is not None:
+        return ""  # One section per update; a second heading would make ownership ambiguous.
+    return f"{PLAN_HEADING}\n{rest.strip()}"
+def plan_split(description) -> tuple[str, str | None]:
+    """(text before the agent section, the section to the end) at the last heading outside code."""
+    text = description if isinstance(description, str) else ""
+    lines, fence, at, offset = text.split("\n"), None, None, 0
+    for line in lines:
+        marker = _FENCE_LINE.match(line)
+        if fence is None and marker:
+            fence = marker.group(1)
+        elif fence is not None and marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence):
+            fence = None
+        elif fence is None and line.rstrip() == PLAN_HEADING:
+            at = offset
+        offset += len(line) + 1
+    return (text, None) if at is None else (text[:at], text[at:])
+def plan_comment(section: str) -> str:
+    """The same update as a regular comment, for when the description section is not the agent's to edit."""
+    return "**Plan and progress**\n\n" + section.partition("\n")[2].strip()
 def acceptance_cause(receipt, url: str = "") -> str:
     """Bounded refusal cause. Never include the check dump or gh stderr."""
     if isinstance(receipt, dict) and receipt:
@@ -3548,6 +3624,11 @@ class Bridge:
             if states is not None:
                 payload.update(native_progress=True, native_progress_states=sorted(states))
             return "comment", payload
+        def plan_note(section: str) -> tuple[str, dict[str, Any]]:
+            # Delivered as a silent edit of the agent's description section; ``body`` is the same
+            # update as a comment, used only when that section is not the agent's to edit.
+            kind, note = issue_note(plan_comment(section))
+            return kind, {**note, "native_plan_section": section}
         milestone_states = {task_status}
         if event.kind in ("blocked", "block_loop_detected") and str(payload.get("reason") or "").startswith(OWN):
             # Record the control on the issue too; this does not claim effects have settled.
@@ -3581,12 +3662,11 @@ class Bridge:
                 milestone_states = allowed
                 detail = _project_summary(payload.get(field) or "", 240) if field else ""
                 writes = [message("thought", _sentence(f"{label}: {detail or fallback}"))]
-        elif (event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED
+        elif (event.kind == "spawned" and task_status not in NATIVE_PROGRESS_SUPERSEDED and row.get("owner_ref")
               and not self.store.progress_reported(issue_id, row["task_id"], "Started")):
-            # Started is said once per binding; retries and restarts spawn again silently.
+            # Started is said once per binding, as a session step only: In Progress and the agent's
+            # plan section already show the start, so the issue thread gets no "Started" comment.
             writes = [self._progress_activity(row, route, "Started", "Reading the ticket")]
-            if row.get("owner_ref"):
-                writes.append(issue_note("Started: Work has begun. I’m checking the ticket and existing work.", {"running"}))
         elif event.kind == "heartbeat" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
             note = _progress_text(payload.get("note"))
             if note:
@@ -3595,7 +3675,18 @@ class Bridge:
             if (isinstance(payload.get("body"), str) and isinstance(payload.get("request_id"), str)
                     and payload["request_id"] and (body := _readable(payload["body"]))):
                 # One record: the regular issue comment. A session thought would repeat it.
-                writes = [issue_note(body)]
+                section = plan_section(body)
+                writes = [plan_note(section) if section else issue_note(body)]
+        elif event.kind == "commented" and task_status != "archived":
+            # A plan update is an ordinary comment by the task's own agent, so chat subscribers are
+            # not pinged for it; every other native comment stays native.
+            author = str(payload.get("author") or "").strip()
+            task = self._binding_adapter(issue_id).get(row["task_id"])
+            if author and author == str(getattr(task, "assignee", "") or "").strip() and isinstance(payload.get("len"), int):
+                section = plan_section(_readable(self._binding_adapter(issue_id).comment_text(
+                    row["task_id"], payload.get("author"), payload["len"], int(event.created_at))))
+                if section:
+                    writes = [plan_note(section)]
         activity = next((write["content"] for kind, write in writes if kind == "activity"), None)
         if activity and event.kind != "checkpoint" and not (writes and writes[0][1].get("ephemeral")):
             key = (activity.get("type"), activity.get("body") or activity.get("parameter"))
@@ -4861,6 +4952,60 @@ class Bridge:
             row["payload"] = {**payload, "content": content}
         return None
 
+    def _send_plan_section(self, row: dict[str, Any]) -> bool:
+        """Edit the agent's section at the end of the issue description silently, or post it as a comment.
+
+        The section is the agent's only while it is what this bridge last wrote there, or what this
+        same row may have written before a lost response. When a person edited or removed it, or the
+        guarded replacement is refused, the plan goes back to people: this and later updates are
+        regular comments (an unchanged update is not repeated) and the description is left alone.
+        Text above the section is never rewritten."""
+        payload = row["payload"]
+        issue_id, section, fallback = payload["issue_id"], payload["native_plan_section"], payload["body"]
+        chosen: dict[str, str] = {}
+        def as_comment(state: dict) -> None:
+            if state.get("last_comment") == section and state.get("comment_row") != row["id"]:
+                chosen["mode"] = "unchanged"
+                return
+            self.store.plan_record(issue_id, backoff=True, last_comment=section, comment_row=row["id"])
+            chosen["mode"] = "comment"
+            self.api.create_comment(row["id"], issue_id, fallback)
+        def write() -> None:
+            state = self.store.plan_state(issue_id)
+            if state.get("backoff"):
+                return as_comment(state)
+            current = self.api.issue(issue_id)
+            if not isinstance(current, dict) or current.get("id") != issue_id:
+                raise LinearError("Description target could not be verified")
+            description = current.get("description") or ""
+            human, tail = plan_split(description)
+            if tail is not None and markdown_matches(tail, section):
+                chosen["mode"] = "description"  # Already there, including after a lost response.
+                self.store.plan_record(issue_id, written=section, pending=None, pending_row=None)
+                return
+            written, pending = state.get("written"), state.get("pending") if state.get("pending_row") == row["id"] else None
+            ours = (not written) if tail is None else bool(
+                (written and markdown_matches(tail, written)) or (pending and markdown_matches(tail, pending)))
+            if not ours:
+                diag.evt("content.write", "skipped", "plan_section_human_edit", iss=issue_id[:8])
+                return as_comment(state)
+            text = f"{human.rstrip()}\n\n{section}" if human.strip() else section
+            self.store.plan_record(issue_id, pending=section, pending_row=row["id"])
+            try:
+                self.api.replace_description(issue_id, description, text)
+            except LinearError as exc:
+                if exc.retryable:
+                    raise
+                diag.evt("content.write", "skipped", "plan_section_guard", iss=issue_id[:8])
+                return as_comment(self.store.plan_state(issue_id))
+            chosen["mode"] = "description"
+            self.store.plan_record(issue_id, written=section, pending=None, pending_row=None)
+        self._mutate_outbox(row["id"], write)
+        if chosen.get("mode") == "comment":
+            verify = getattr(self.api, "verify_comment", None)
+            if callable(verify) and not verify(row["id"], issue_id, fallback):
+                raise LinearError("Comment target/body readback did not match; reconcile before retrying")
+        return True
     def _send(self, row: dict[str, Any]) -> bool:
         if not self.store.delivery_allowed(row["id"]):
             raise ProjectUpdateDeferred
@@ -5035,6 +5180,8 @@ class Bridge:
                     raise LinearError("Release write was not verified; reconcile before further work")
             return True  # a configured null status is an intentional, accepted no-op
         elif kind == "comment":
+            if payload.get("native_plan_section"):
+                return self._send_plan_section(row)
             if payload.get("content_action") and payload.get("work_owner") and not payload.get("unlinked_content"):
                 work = self.store.get(payload["issue_id"])
                 if (not work or work.get("ownership_id") != payload.get("work_owner") or

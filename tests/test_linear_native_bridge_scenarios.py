@@ -581,32 +581,47 @@ class NativeBridgeScenarios(unittest.TestCase):
                 kb._append_event(conn, task_id, "spawned", {"pid": 654321},
                                  run_id=self.board.get(task_id).current_run_id)
 
-    def test_started_is_posted_once_across_respawns_and_restarts(self):
-        from hermes_fleet_linear_plugin.api import LinearAPI
-        clock, remote, reporter, task_id = self.reporting_fixture("started-once")
+    @staticmethod
+    def started_steps(remote):
+        return sum(a["content"].get("action") == "Started" for a in remote.activities)
+
+    def test_started_is_a_session_step_once_across_respawns_and_restarts(self):
+        clock, remote, reporter, task_id = self.session_reporting_fixture("started-once")
         reporter.flush()
         self.native_progress(clock, task_id)
         reporter.pump_kanban()
         clock.now += 10
         reporter.flush()
-        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        self.assertEqual(self.started_steps(remote), 1)
         # A retry respawns the worker before the reporter restarts, then again after.
         self.respawn(clock, task_id)
         reporter.pump_kanban()
-        reporter = Bridge(Store(reporter.store.path), LinearAPI(lambda: "synthetic", endpoint=remote.url, clock=clock),
-                          self.board, profile="default", clock=clock)
+        reporter = Bridge(Store(reporter.store.path), reporter.api, self.board, profile="default", clock=clock)
         self.respawn(clock, task_id)
         reporter.recover()
         reporter.pump_kanban()
         clock.now += 10
         reporter.flush()
-        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        self.assertEqual(self.started_steps(remote), 1)
+        # The thread carries no fixed "Started" comment: In Progress already shows the start.
+        self.assertFalse(any(body.startswith("Started") for body in thread_bodies(remote, ISSUE)))
         self.assertEqual(self.board.get(task_id).status, "running")
+
+    def test_sessionless_start_posts_no_comment(self):
+        clock, remote, reporter, task_id = self.reporting_fixture("started-sessionless")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        self.assertEqual(remote.state(ISSUE), "In Progress")
+        self.assertEqual(remote.comments, [])
+        self.assertEqual(remote.activities, [])
 
     def test_started_superseded_before_send_is_posted_on_the_next_spawn(self):
         # A Started coalesced unsent (task blocked before the flush) never reached Linear,
         # so the respawn after unblocking must still say Started, exactly once.
-        clock, remote, reporter, task_id = self.reporting_fixture("started-superseded")
+        clock, remote, reporter, task_id = self.session_reporting_fixture("started-superseded")
         reporter.flush()
         self.native_progress(clock, task_id)
         reporter.pump_kanban()
@@ -616,7 +631,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                                          expected_run_id=self.board.get(task_id).current_run_id))
         clock.now += 10
         reporter.flush()
-        self.assertFalse(any(body.startswith("Started") for body in remote.bodies(ISSUE)))
+        self.assertEqual(self.started_steps(remote), 0)
         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
             self.assertTrue(kb.unblock_task(conn, task_id))
         reporter.pump_kanban()
@@ -624,12 +639,12 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.pump_kanban()
         clock.now += 10
         reporter.flush()
-        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        self.assertEqual(self.started_steps(remote), 1)
         self.respawn(clock, task_id)
         reporter.pump_kanban()
         clock.now += 10
         reporter.flush()
-        self.assertEqual(sum(body.startswith("Started") for body in remote.bodies(ISSUE)), 1)
+        self.assertEqual(self.started_steps(remote), 1)
 
     def test_runtime_block_posts_one_plain_sentence_without_raw_error(self):
         raw = "pid 1591346 exited with code 130 [owner admission settled interrupted]"
@@ -663,8 +678,8 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.pump_kanban()
         clock.now += 10
         reporter.flush()
-        self.assertIn("Waiting on you: Which region should the CI/CD job deploy to? Once this is answered, "
-                      "ask the agent to resume and it continues the same task.", remote.bodies(ISSUE))
+        self.assertIn("**Waiting on you**\n\nWhich region should the CI/CD job deploy to?\n\n**Next:** once this is "
+                      "answered, ask the agent to resume and it continues the same task.", remote.bodies(ISSUE))
 
     def test_closing_summary_keeps_markdown_line_breaks_and_words(self):
         result = ("**Delivered**\n\nCI/CD passed.\n\nNext: read/write split, and/or deploy.\n\n"
@@ -709,6 +724,28 @@ class NativeBridgeScenarios(unittest.TestCase):
                 kb._append_event(conn, task_id, "spawned", {"pid": 123456}, run_id=claimed.current_run_id)
             self.assertTrue(heartbeat_worker(conn, task_id, note="Checkpoint B remains absent",
                                            expected_run_id=claimed.current_run_id))
+
+    def review_progress(self, clock, task_id):
+        """A session-less native progress comment: the review milestone of a running attempt.
+
+        Session-less work has no Started comment, so its own milestone carries the phase recheck."""
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            claimed = kb.claim_task(conn, task_id, claimer="reporting-scenario")
+            self.assertIsNotNone(claimed)
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "spawned", {"pid": 123456}, run_id=claimed.current_run_id)
+            self.assertTrue(kb.request_review(conn, task_id, summary="Reading the ticket found the cause",
+                                              reviewer="default", expected_run_id=claimed.current_run_id))
+
+    def running_review_progress(self, clock, task_id):
+        """The same milestone progress with the attempt running again, so a native halt can supersede it."""
+        self.review_progress(clock, task_id)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.reopen_review_task(conn, task_id))
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="reporting-scenario"))
+        self.assertEqual(self.board.get(task_id).status, "running")
 
     def halt_reported_task(self, clock, task_id, state):
         for index in range(kb.BLOCK_RECURRENCE_LIMIT if state == "triage" else 1):
@@ -956,7 +993,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 self.assertEqual(remote.state(ISSUE), "Blocked")
                 asked = [body for body in remote.bodies(ISSUE) if "Please choose Blue or Green" in body]
                 self.assertEqual(len(asked), 1, remote.bodies(ISSUE))
-                self.assertTrue(asked[0].startswith("Waiting on you:"))
+                self.assertTrue(asked[0].startswith("**Waiting on you**\n\n"))
                 self.assertEqual(sum("Please choose Blue or Green" in body for body in thread_bodies(remote, ISSUE)), 1)
                 if session_owned:
                     # The session's elicitation is the one record; no issue comment repeats it.
@@ -991,8 +1028,9 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.native_progress(clock, task_id)
         reporter.pump_kanban()
         reporter.flush()
-        self.assertEqual(sum(c["body"].startswith("Started:") for c in remote.comments), 1)
-        self.assertTrue(any(a["content"].get("action") == "Started" for a in remote.activities))
+        # The start is the session step and In Progress; the issue thread gets no Started comment.
+        self.assertFalse(any(c["body"].startswith("Started") for c in remote.comments))
+        self.assertEqual(sum(a["content"].get("action") == "Started" for a in remote.activities), 1)
         self.assertTrue(any(a.get("ephemeral") for a in remote.activities))
         self.assertFalse(any("Checkpoint B remains absent" in c["body"] for c in remote.comments))
 
@@ -1375,7 +1413,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                     remote.comment_updates_issue = True
                     reporter.flush()
                     if progress:
-                        self.native_progress(clock, task_id)
+                        (self.native_progress if session_route else self.running_review_progress)(clock, task_id)
                     else:
                         clock.now += 1
                         with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
@@ -1465,7 +1503,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 clock, remote, reporter, task_id = self.reporting_fixture("halt-http-" + state)
                 remote.comment_updates_issue = True
                 reporter.flush()
-                self.native_progress(clock, task_id)
+                self.running_review_progress(clock, task_id)
                 reporter.pump_kanban()
                 create = reporter.api.create_comment
                 def halt_before_http(*args, **kwargs):
@@ -1544,7 +1582,8 @@ class NativeBridgeScenarios(unittest.TestCase):
     def test_halted_task_preserves_attempted_progress_uuid_and_exact_readback(self):
         for state in ("blocked", "triage"):
             with self.subTest(state=state):
-                clock, remote, reporter, task_id, progress_id = self.crash_after_progress_publication("halted-attempt-" + state)
+                clock, remote, reporter, task_id, progress_id = self.crash_after_progress_publication(
+                    "halted-attempt-" + state, running=True)
                 self.halt_reported_task(clock, task_id, state)
                 clock.now += 10
                 reporter.recover()
@@ -1559,7 +1598,8 @@ class NativeBridgeScenarios(unittest.TestCase):
     def test_running_ready_and_unknown_phases_do_not_silently_drop_progress(self):
         for state in ("running", "ready", "future-native-phase"):
             with self.subTest(state=state):
-                clock, remote, reporter, task_id = self.reporting_fixture("active-phase-" + state)
+                # The session's Started step is the running-phase progress record.
+                clock, remote, reporter, task_id = self.session_reporting_fixture("active-phase-" + state)
                 reporter.flush()
                 self.native_progress(clock, task_id)
                 native = copy.copy(self.board.get(task_id))
@@ -1569,7 +1609,8 @@ class NativeBridgeScenarios(unittest.TestCase):
                     reporter.pump_kanban()
                     reporter.flush()
                 self.assertTrue(any("Reading the ticket" in body for body in remote.bodies(ISSUE)))
-                self.assertFalse(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
+                # The heartbeat stays an ephemeral session step, never a thread record.
+                self.assertFalse(any("Checkpoint B remains absent" in body for body in thread_bodies(remote, ISSUE)))
 
     def test_native_operator_stop_survives_reporting_catchup_without_reactivation(self):
         clock, remote, reporter, task_id = self.reporting_fixture("stopped-progress")
@@ -1598,7 +1639,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 clock, remote, reporter, task_id = self.reporting_fixture("gap-progress-" + str(captured))
                 remote.comment_updates_issue = True
                 reporter.flush()
-                self.native_progress(clock, task_id)
+                self.review_progress(clock, task_id)
                 if captured:
                     reporter.pump_kanban()
                     self.assertTrue(any(row["kind"] == "comment" for row in reporter.store.pending()))
@@ -1625,7 +1666,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock, remote, reporter, task_id = self.reporting_fixture("progress-http-boundary")
         remote.comment_updates_issue = True
         reporter.flush()
-        self.native_progress(clock, task_id)
+        self.review_progress(clock, task_id)
         reporter.pump_kanban()
         create = reporter.api.create_comment
         def complete_before_http(*args, **kwargs):
@@ -1691,7 +1732,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         clock, remote, reporter, task_id = self.reporting_fixture("uncertain-native-progress")
         remote.comment_updates_issue = True
         reporter.flush()
-        self.native_progress(clock, task_id)
+        self.review_progress(clock, task_id)
         reporter.pump_kanban()
         self.deliver_status(reporter)  # In Progress lands first; the next write is the progress message
         remote.lose_next_response = True
@@ -1712,11 +1753,11 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertFalse(any("Checkpoint B remains absent" in body for body in remote.bodies(ISSUE)))
         self.assertEqual(remote.state(ISSUE), "Done")
 
-    def crash_after_progress_publication(self, name):
+    def crash_after_progress_publication(self, name, *, running=False):
         clock, remote, reporter, task_id = self.reporting_fixture(name)
         remote.comment_updates_issue = True
         reporter.flush()
-        self.native_progress(clock, task_id)
+        (self.running_review_progress if running else self.review_progress)(clock, task_id)
         reporter.pump_kanban()
         progress = next(row for row in reporter.store.pending() if row["payload"].get("native_progress")
                         and not row["payload"].get("ephemeral"))
@@ -1956,6 +1997,144 @@ class NativeBridgeScenarios(unittest.TestCase):
         reporter.flush()
         self.assertEqual(remote.state(ISSUE), "In Progress")
         self.assertEqual(self.board.get(task_id).status, "blocked")
+
+    # HF-748: the agent's living plan in the description, milestone wording and blocker detail.
+    HUMAN_TEXT = "### Outcome\n\nShip the fix.\n\n### Acceptance\n\n- [ ] Live on every agent"
+    PLAN_A = "## Plan and progress (agent)\nStatus: in progress, nothing needed from anyone\n\n- [ ] Plan reviewed\n- [ ] PR merged"
+    PLAN_B = ("## Plan and progress (agent)\nStatus: waiting on review\n\n- [x] Plan reviewed\n"
+              "- [ ] PR merged ([PR 12](https://github.example/pr/12))")
+    PLAN_C = "## Plan and progress (agent)\nStatus: done\n\n- [x] Plan reviewed\n- [x] PR merged"
+
+    def plan_fixture(self, name, session_owned=False):
+        fixture = self.session_reporting_fixture if session_owned else self.reporting_fixture
+        clock, remote, reporter, task_id = fixture(name)
+        remote.issues[ISSUE]["description"] = self.HUMAN_TEXT
+        self.native_progress(clock, task_id)
+        reporter.pump_kanban()
+        reporter.flush()
+        return clock, remote, reporter, task_id
+
+    def plan_update(self, clock, reporter, task_id, section, *, author="default", checkpoint=False):
+        """The worker's plan update: an ordinary native comment, so chat subscribers are not pinged."""
+        import uuid
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            if checkpoint:
+                kb.add_comment(conn, task_id, author, section, human_checkpoint=True, request_id=str(uuid.uuid4()))
+            else:
+                kb.add_comment(conn, task_id, author, section)
+        reporter.pump_kanban()
+        clock.now += 1
+        reporter.flush()
+
+    def test_plan_section_is_a_silent_description_edit_that_ticks_in_place(self):
+        for session_owned in (False, True):
+            with self.subTest(session_owned=session_owned):
+                clock, remote, reporter, task_id = self.plan_fixture("plan-ticks-" + str(session_owned), session_owned)
+                before = list(thread_bodies(remote, ISSUE))
+                self.plan_update(clock, reporter, task_id, self.PLAN_A)
+                self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_A)
+                self.plan_update(clock, reporter, task_id, self.PLAN_B)
+                self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_B)
+                # A checkpoint-shaped plan update is the same silent edit, never a second record.
+                self.plan_update(clock, reporter, task_id, self.PLAN_C, checkpoint=True)
+                self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_C)
+                self.assertTrue(remote.issues[ISSUE]["description"].startswith(self.HUMAN_TEXT))
+                # Edits are silent: no comment and no session activity carries the plan.
+                self.assertEqual(thread_bodies(remote, ISSUE), before)
+                self.assertFalse(any("Plan and progress" in body for body in remote.bodies(ISSUE)))
+                self.assertFalse(reporter.store.pending())
+                restarted = Bridge(Store(reporter.store.path), reporter.api, self.board, profile="default", clock=clock)
+                restarted.recover()
+                restarted.flush()
+                self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_C)
+
+    def test_human_edit_of_the_plan_section_moves_updates_to_comments(self):
+        from hermes_fleet_linear_plugin.bridge import plan_comment
+        for edit in ("section", "removed", "appended"):
+            with self.subTest(edit=edit):
+                clock, remote, reporter, task_id = self.plan_fixture("plan-human-" + edit)
+                self.plan_update(clock, reporter, task_id, self.PLAN_A)
+                written = remote.issues[ISSUE]["description"]
+                human = {"section": written.replace("- [ ] PR merged", "- [x] PR merged (Sam checked)"),
+                         "removed": self.HUMAN_TEXT, "appended": written + "\n\nSam: please keep the old index."}[edit]
+                remote.issues[ISSUE]["description"] = human
+                self.plan_update(clock, reporter, task_id, self.PLAN_B)
+                self.assertEqual(remote.issues[ISSUE]["description"], human)
+                self.assertEqual([c["body"] for c in remote.comments], [plan_comment(self.PLAN_B)])
+                # Later updates stay comments; an unchanged update is not repeated.
+                self.plan_update(clock, reporter, task_id, self.PLAN_C)
+                self.plan_update(clock, reporter, task_id, self.PLAN_C)
+                self.assertEqual(remote.issues[ISSUE]["description"], human)
+                self.assertEqual([c["body"] for c in remote.comments], [plan_comment(self.PLAN_B), plan_comment(self.PLAN_C)])
+
+    def test_human_edit_above_the_plan_section_is_kept(self):
+        clock, remote, reporter, task_id = self.plan_fixture("plan-human-above")
+        self.plan_update(clock, reporter, task_id, self.PLAN_A)
+        edited = self.HUMAN_TEXT.replace("Ship the fix.", "Ship the fix before Friday.")
+        remote.issues[ISSUE]["description"] = remote.issues[ISSUE]["description"].replace(self.HUMAN_TEXT, edited)
+        self.plan_update(clock, reporter, task_id, self.PLAN_B)
+        self.assertEqual(remote.issues[ISSUE]["description"], edited + "\n\n" + self.PLAN_B)
+        self.assertEqual(remote.comments, [])
+
+    def test_refused_plan_edit_falls_back_to_one_comment(self):
+        from hermes_fleet_linear_plugin.bridge import plan_comment
+        clock, remote, reporter, task_id = self.plan_fixture("plan-guard")
+        refused = LinearError("Description changed or could not be verified; no replacement made", retryable=False)
+        with patch.object(reporter.api, "replace_description", side_effect=refused) as attempted:
+            self.plan_update(clock, reporter, task_id, self.PLAN_A)
+        self.assertEqual(attempted.call_count, 1)
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT)
+        self.assertEqual([c["body"] for c in remote.comments], [plan_comment(self.PLAN_A)])
+        self.plan_update(clock, reporter, task_id, self.PLAN_B)
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT)
+        self.assertEqual(len(remote.comments), 2)
+
+    def test_lost_plan_edit_response_settles_without_a_second_append(self):
+        clock, remote, reporter, task_id = self.plan_fixture("plan-lost")
+        remote.lose_next_response = True
+        self.plan_update(clock, reporter, task_id, self.PLAN_A)
+        clock.now += 120
+        reporter.recover()
+        reporter.flush()
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_A)
+        self.assertEqual(remote.comments, [])
+        self.assertFalse(reporter.store.pending())
+        self.plan_update(clock, reporter, task_id, self.PLAN_B)
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT + "\n\n" + self.PLAN_B)
+
+    def test_plan_update_from_another_author_or_closed_issue_changes_nothing(self):
+        clock, remote, reporter, task_id = self.plan_fixture("plan-foreign")
+        self.plan_update(clock, reporter, task_id, self.PLAN_A, author="someone-else")
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT)
+        self.assertEqual(remote.comments, [])
+        remote.set_state(ISSUE, "Canceled")
+        self.plan_update(clock, reporter, task_id, self.PLAN_A)
+        self.assertEqual(remote.issues[ISSUE]["description"], self.HUMAN_TEXT)
+        self.assertEqual(remote.comments, [])
+
+    def test_blocker_keeps_commands_shas_and_paths_on_the_native_task(self):
+        raw = ("Sam needs to approve the rollout in a live chat, because the parked agents run an older "
+               "image. Then run `host-root host -- sudo -n /opt/fleet/launch.sh --digest sha256:abc` at "
+               "8ecc939e1efdd497a8a9e49ee00117a672684b45.\n```\nsudo systemctl restart hermes-worker\n```\n"
+               "Approved head 8ecc939e is green.")
+        clock, remote, reporter, task_id = self.reporting_fixture("blocker-commands")
+        reporter.flush()
+        self.native_progress(clock, task_id)
+        clock.now += 1
+        with self.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=clock()):
+            self.assertTrue(kb.block_task(conn, task_id, reason=raw, kind="needs_input",
+                                         expected_run_id=self.board.get(task_id).current_run_id))
+        reporter.pump_kanban()
+        clock.now += 10
+        reporter.flush()
+        [body] = [body for body in thread_bodies(remote, ISSUE) if "Waiting on you" in body]
+        self.assertTrue(body.startswith("**Waiting on you**\n\nSam needs to approve the rollout in a live chat, "
+                                        "because the parked agents run an older image."), body)
+        self.assertIn("**Next:**", body)
+        for leaked in ("sudo", "host-root", "systemctl", "/opt", "--digest", "8ecc939", "sha256", "```", "`"):
+            self.assertNotIn(leaked, body)
+        self.assertTrue(any((event.payload or {}).get("reason") == raw for event in self.board.history(task_id, 0)))
 
     def test_human_state_and_reporting_outage_never_control_native_worker(self):
         task_id = self.create()

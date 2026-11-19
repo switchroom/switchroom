@@ -922,7 +922,7 @@ class TakeoverWording(unittest.TestCase):
             with self.subTest(reason=reason):
                 kind, body = _block_message({"kind": "needs_input", "reason": reason}, "blocked")
                 self.assertEqual(kind, "elicitation")
-                self.assertTrue(body.startswith("Waiting on you"), body)
+                self.assertTrue(body.startswith("**Waiting on you**"), body)
 
 
 class TakeoverSettings(unittest.TestCase):

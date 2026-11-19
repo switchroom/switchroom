@@ -33,6 +33,12 @@ API is required. The plugin is off in the bare image; the starter overlay
 | `update_description` with `issue`, UUIDv4 `id`, `description`, `expected_description` | Queue a description replacement after checking the exact previous text. |
 | `add_comment` with `issue`, UUIDv4 `id`, `body` | Queue a Linear comment. |
 
+Every reply adds `markdown_link` beside each issue and project it names, for example
+`[HF-744 Linear plugin CPU fix](https://linear.app/...)` or `[Project name](https://linear.app/.../project/...)`.
+Agents name issues and projects with that linked text in every channel. It is the plain
+`[text](url)` form, which Linear, Telegram and Slack all render as a link; Telegram drops the URL
+of the angle-bracket `[text](<url>)` form. Brackets in a title become parentheses.
+
 Creates read the new issue or project back under its UUID. Linear's editor rewrites Markdown as
 it stores it: it backslash-escapes punctuation such as `~`, writes `*` for `-` bullets and drops
 trailing spaces and repeated blank lines. Outside code those count as the same text. A new
@@ -272,10 +278,29 @@ Ordinary native comments and heartbeat notes stay internal. An explicit native h
 checkpoint with a stable request ID is always projected to a regular top-level issue comment,
 preserving its authored Markdown, including when an Agent Session is running. Workers explain
 what changed, what is next and any blocker or decision needed, using the same request ID and
-body on retry. Checkpoints are meaningful milestones, not periodic heartbeat messages.
+body on retry. Checkpoints are milestone comments posted only when the stage changes (plan
+validated, PR open, merged, live, blocked or needs someone, done): a bold stage title, then
+**What happened:**, **Why:** (only for a real decision, failed approach or change of plan) and
+**Next:**, about 40 to 100 words, with no logs, commands or commit SHAs. They are not periodic
+heartbeat messages.
 
-The issue also receives a concise start note and meaningful native review, wait and blocker
-milestones. Each checkpoint and milestone appears once in the issue thread. A checkpoint is
+**Living plan.** The issue description ends with an agent-owned section headed
+`## Plan and progress (agent)`: a one-line status and a checklist from the acceptance criteria.
+The worker sends the whole section as an ordinary native comment from its own profile (not a
+human checkpoint, so chat subscribers are not pinged) whose first line is that heading. The
+bridge replaces only that trailing section, using the exact current description as the guard,
+and only while the section is still exactly what the bridge last wrote there (or what the same
+outbox row may have written before a lost response). Text above it is never rewritten, and the
+edit is silent. When a person edits or removes the section, adds text below it, or the guarded
+replacement is refused, the bridge stops editing it for that issue and posts each changed update
+as a regular comment instead. A comment from anyone other than the task's own profile is never
+treated as a plan update.
+
+The issue thread has no fixed "Started" comment: In Progress and the plan section show the
+start, and a running Agent Session shows Started as a session step. It receives meaningful
+native review, wait and blocker milestones. A blocker has a bold title, who needs to do what
+and why in at most two plain sentences, and **Next:**; code, commands, paths and commit SHAs in
+the native reason stay in native history. Each checkpoint and milestone appears once in the issue thread. A checkpoint is
 only its regular issue comment, with no repeated session thought. With a session, a milestone
 Linear shows as a thread reply (an elicitation such as "Waiting on you", a response or an error)
 is only that activity, which keeps the comment's phase recheck; a session-only thought milestone

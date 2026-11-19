@@ -979,6 +979,26 @@ class Store:
                     return False
             db.execute("UPDATE work SET last_event_id=MAX(last_event_id,?) WHERE issue_id=?", (event_id, issue_id))
             return True
+    PLAN_KEYS = frozenset({"written", "pending", "pending_row", "backoff", "last_comment", "comment_row"})
+    def plan_state(self, issue_id: str) -> dict[str, Any]:
+        """What this bridge last wrote in the issue's agent plan section, and whether it backed off."""
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (f"plan-section:{issue_id}",)).fetchone()
+        return json.loads(row[0]) if row else {}
+    def plan_record(self, issue_id: str, **updates: Any) -> dict[str, Any]:
+        """Merge plan-section bookkeeping; a backed-off section stays backed off."""
+        if not issue_id or not updates or set(updates) - self.PLAN_KEYS:
+            raise ValueError("plan section record needs an issue and known fields")
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (f"plan-section:{issue_id}",)).fetchone()
+            state = json.loads(row[0]) if row else {}
+            state.update({key: value for key, value in updates.items() if value is not None})
+            for key in [key for key, value in updates.items() if value is None]:
+                state.pop(key, None)
+            state["backoff"] = bool(state.get("backoff")) or bool(updates.get("backoff"))
+            db.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (f"plan-section:{issue_id}", json.dumps(state)))
+            return state
     def native_intent(self, key: str) -> dict[str, Any] | None:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-intent:{key}",)).fetchone()
@@ -1052,9 +1072,10 @@ class Store:
             "AND COALESCE(json_extract(payload,'$.assessment'),0)=0 ORDER BY rowid", (issue_id, task_id)).fetchall()
         for row in rows:
             prior = json.loads(row["payload"])
-            permanent = prior.get("native_issue_comment") is True
-            if permanent and not prior.get("native_report_content"):
-                continue  # An issue milestone never becomes a disposable session fallback.
+            if prior.get("native_issue_comment") is True:
+                # An issue milestone stays its one issue comment: never a disposable session
+                # fallback, and never repeated as a session activity (one record per event).
+                continue
             content = prior.get("native_report_content") or {"type": "thought", "body": prior["body"]}
             payload = {key: value for key, value in prior.items() if key not in
                        ("id", "body", "session_key", "work_owner", "enqueued_at", "native_report_content", "native_issue_comment")}
@@ -1063,8 +1084,7 @@ class Store:
                 raise ValueError("Adopted native progress could not be queued")
             # This transaction also serializes transport admission: an already-attempted
             # identity never qualifies, and an unattempted sender cannot publish after retirement.
-            if not permanent:
-                db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?", (row["id"],))
+            db.execute("UPDATE outbox SET state='sent', payload=json_set(payload,'$.applied',0) WHERE id=?", (row["id"],))
 
     def adopt_session(self, issue_id: str, task_id: str, session_id: str, *, expected_owner: str,
                       notice: dict | None = None, at: float | None = None) -> bool:

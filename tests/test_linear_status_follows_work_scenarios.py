@@ -158,9 +158,9 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
                     expected_run_id=run)
         self.ticks()
         self.assertEqual(self.state(), "Blocked")
-        said = [body for body in self.remote.bodies("issue-1") if body.startswith("Waiting on you")]
-        self.assertEqual(said, ["Waiting on you: Pick the staging or production database. Once this is answered, "
-                                "ask the agent to resume and it continues the same task."])
+        said = [body for body in self.remote.bodies("issue-1") if body.startswith("**Waiting on you**")]
+        self.assertEqual(said, ["**Waiting on you**\n\nPick the staging or production database.\n\n**Next:** once this "
+                                "is answered, ask the agent to resume and it continues the same task."])
 
     def test_team_without_blocked_keeps_its_state_and_still_posts_the_sentence(self):
         self.states[:] = [s for s in self.states if s["name"] not in ("Blocked", "In Review")]

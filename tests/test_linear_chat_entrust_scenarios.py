@@ -351,7 +351,8 @@ class ChatEntrustScenarios(unittest.TestCase):
                       [r["content"].get("parameter") for r in self.said(session_id) if r.get("ephemeral")])
         milestones = self.issue_comments(issue_id)[len(comments):]
         self.assertEqual(milestones.count("Proxy deployed to staging."), 1)
-        self.assertEqual(sum(c.startswith("Started:") for c in milestones), 1)
+        # The start is the session's Started step only; the thread gets no fixed Started comment.
+        self.assertFalse(any(c.startswith("Started") for c in milestones))
         self.assertFalse(any("Reading the proxy config" in c for c in milestones))
         comments = list(self.issue_comments(issue_id))  # Completion adds only its own full result.
         self.assertNotIn("response", [c["type"] for c in contents])
@@ -545,7 +546,8 @@ class ChatEntrustScenarios(unittest.TestCase):
             with self.board.conn() as conn:
                 kb.complete_task(conn, task_id, summary=body, result="Local checks passed.")
         elif progress:
-            self.native_event(task_id, "spawned", {"pid": 4242})
+            # Session-less progress is a milestone (a sessionless start posts nothing).
+            self.request_review(task_id, summary=body)
         else:
             self.checkpoint(task_id, body)
         prior_cursor = self.bridge.store.get(NEW_ISSUE)["last_event_id"]
@@ -572,9 +574,11 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.assertFalse(any(body in r["content"].get("body", "") for r in said),
                              "The full result belongs to the regular comment, not a duplicate session response")
         elif progress:
-            # A session-routed report is recomputed for the adopted owner and lands there once.
-            self.assertEqual([r["content"].get("action") for r in said if r["content"]["type"] == "action"], ["Started"])
-            self.assertEqual(sum(c.startswith("Started:") for c in self.issue_comments(NEW_ISSUE)[len(comments):]), 1)
+            # The report is recomputed for the adopted owner and lands once: a thought milestone
+            # is only its issue comment, never repeated in the session.
+            added = self.issue_comments(NEW_ISSUE)[len(comments):]
+            self.assertEqual(sum(body in c for c in added), 1, added)
+            self.assertEqual(sum(body in (r["content"].get("body") or "") for r in said), 0)
         else:
             # A checkpoint is one issue comment whoever owns the session; it is not repeated there.
             self.assertEqual(self.issue_comments(NEW_ISSUE), comments + [body])
@@ -649,23 +653,44 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.issue_comments(NEW_ISSUE).count(body), 1)
         self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
-    def test_queued_started_progress_preserves_native_action_when_adopted(self):
+    def request_review(self, task_id, summary="Ready for an independent review"):
+        with self.board.conn() as conn:
+            self.assertTrue(kb.request_review(conn, task_id, summary=summary, reviewer="default",
+                                              expected_run_id=self.board.get(task_id).current_run_id))
+
+    def test_sessionless_start_queues_nothing_and_adoption_adds_no_started_comment(self):
         task_id = self.create(start_work=True)["native"]["task_id"]
         self.flush()
         self.claim(task_id)
         self.flush()
         self.native_event(task_id, "spawned", {"pid": 4242})
         self.bridge.pump_kanban()
-        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
-                      if r["kind"] == "comment" and r["payload"].get("native_progress"))
-        original = source["payload"]["native_report_content"]
-        self.assertEqual(original["type"], "action")
-        comments = len(self.issue_comments(NEW_ISSUE))
+        # In Progress already shows the start: no Started comment or fallback is queued.
+        self.assertFalse([r for r in self.bridge.store.pending(NEW_ISSUE) if r["kind"] in ("comment", "activity")])
+        comments = list(self.issue_comments(NEW_ISSUE))
         self.echo(NEW_ISSUE, "echo-session")
         for _ in range(3):
             self.flush()
-        self.assertEqual(sum(r["content"] == original for r in self.said("echo-session")), 1)
-        self.assertEqual(len(self.issue_comments(NEW_ISSUE)), comments + 1)
+        self.assertFalse(any(c.startswith("Started") for c in self.issue_comments(NEW_ISSUE)[len(comments):]))
+        self.assertFalse(any(r["content"].get("action") == "Started" for r in self.said("echo-session")))
+
+    def test_queued_sessionless_milestone_keeps_one_issue_comment_when_adopted(self):
+        task_id = self.create(start_work=True)["native"]["task_id"]
+        self.flush()
+        self.claim(task_id)
+        self.flush()
+        self.request_review(task_id)
+        self.bridge.pump_kanban()
+        source = next(r for r in self.bridge.store.pending(NEW_ISSUE)
+                      if r["kind"] == "comment" and r["payload"].get("native_progress"))
+        self.assertEqual(source["payload"]["native_report_content"]["type"], "thought")
+        comments = list(self.issue_comments(NEW_ISSUE))
+        self.echo(NEW_ISSUE, "echo-session")
+        for _ in range(3):
+            self.flush()
+        added = self.issue_comments(NEW_ISSUE)[len(comments):]
+        self.assertEqual(sum("Review requested" in c for c in added), 1, added)
+        self.assertFalse(any("Review requested" in (r["content"].get("body") or "") for r in self.said("echo-session")))
         retained = self.bridge.store.outbox_row(source["id"])
         self.assertEqual((retained["state"], retained["payload"]["applied"]), ("sent", 1))
 
@@ -930,7 +955,8 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.checkpoint(task_id, "Proxy deployed to staging.")
         self.flush()
         comments = self.issue_comments(NEW_ISSUE)
-        self.assertTrue(any(body.startswith("Started") for body in comments), comments)
+        # In Progress shows the start; the thread carries the milestone, not a fixed Started note.
+        self.assertFalse(any(body.startswith("Started") for body in comments), comments)
         self.assertIn("Proxy deployed to staging.", comments)
         self.assertFalse(any(r.get("agentSessionId") for r in self.authority.activity_records))
 

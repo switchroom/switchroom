@@ -218,6 +218,8 @@ class FakeLinear:
             if "delegateId" in fields:
                 issue["delegate"] = (None if fields["delegateId"] is None else
                                      {"id": SELF, "name": "This Agent"} if fields["delegateId"] == SELF else OTHER)
+            if "description" in fields:
+                issue["description"] = fields["description"]
             issue["updatedAt"] = self.clock.iso()
             self.record_history(issue["id"], SELF, before, issue)
             return 200, {"data": {"issueUpdate": {"success": True, "issue": json.loads(json.dumps(issue))}}}
