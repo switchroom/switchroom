@@ -299,15 +299,15 @@ class BlockerWordingTests(unittest.TestCase):
     def test_a_request_that_starts_with_stopped_still_waits_on_the_person(self):
         kind, body = _block_message({"kind": "needs_input", "reason":
                                      "Stopped at the login page; I need the staging account name from Sam."}, "blocked")
-        self.assertEqual((kind, body), ("elicitation", "Waiting on you: Stopped at the login page; I need the staging "
-                                                       "account name from Sam. Once this is answered, ask the agent "
-                                                       "to resume and it continues the same task."))
+        self.assertEqual((kind, body), ("elicitation", "**Waiting on you**\n\nStopped at the login page; I need the "
+                                                       "staging account name from Sam.\n\n**Next:** once this is "
+                                                       "answered, ask the agent to resume and it continues the same task."))
 
     def test_a_real_question_still_waits_on_the_person(self):
         kind, body = _block_message({"kind": "needs_input", "reason": "Stopped at login: which account should I use?"},
                                     "blocked")
         self.assertEqual(kind, "elicitation")
-        self.assertTrue(body.startswith("Waiting on you: Stopped at login: which account should I use?"))
+        self.assertTrue(body.startswith("**Waiting on you**\n\nStopped at login: which account should I use?"))
 
 
 class FakeReplyBridge:

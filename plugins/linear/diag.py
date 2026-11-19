@@ -63,6 +63,7 @@ REASONS = frozenset({
     "unlinked_content_required", "not_applied",
     # status skip
     "same_state", "human_started_state", "app_not_last_mover", "no_state_mapping",
+    "plan_section_human_edit", "plan_section_guard",
     # delegate recovery / delegate write
     "session_owned", "agent_session_scope", "binding_mismatch", "already_decided", "not_running",
     "human_delegate", "human_edit", "moot_before_write", "binding_recovery", "already_delegate",

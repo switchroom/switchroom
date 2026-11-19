@@ -175,10 +175,30 @@ class PlainBlockerTests(unittest.TestCase):
     def test_human_blocks_say_what_is_needed_from_whom(self):
         kind, body = _block_message({"kind": "needs_input", "reason": "Which region?\nUse /opt/data/x"}, "blocked")
         self.assertEqual(kind, "elicitation")
-        self.assertEqual(body, "Waiting on you: Which region? Use `x`. Once this is answered, "
+        # The path is the operator's detail; the reader gets the question.
+        self.assertEqual(body, "**Waiting on you**\n\nWhich region?\n\n**Next:** once this is answered, "
                                "ask the agent to resume and it continues the same task.")
         _, body = _block_message({"kind": "dependency", "reason": ""}, "blocked")
-        self.assertEqual(body, "Waiting for a dependency: earlier work must finish first. Work continues when it is done.")
+        self.assertEqual(body, "**Waiting for a dependency**\n\nEarlier work must finish first.\n\n"
+                               "**Next:** work continues when it is done.")
+
+    def test_blockers_keep_commands_shas_and_code_off_the_issue(self):
+        from hermes_fleet_linear_plugin.bridge import BLOCKER_FALLBACK, _human_reason
+        reason = ("Sam needs to approve the scoped rollout because the parked agents are on an older image. "
+                  "Run `host-root host -- sudo -n /opt/x/launch.sh` now. Merged at 8ecc939e1efd.\n"
+                  "```\nsystemctl restart hermes\n```\nThe reviewer passed `fix-branch`.")
+        self.assertEqual(_human_reason(reason), "Sam needs to approve the scoped rollout because the parked agents "
+                                                "are on an older image. The reviewer passed `fix-branch`.")
+        self.assertEqual(_human_reason(reason, limit=1), "Sam needs to approve the scoped rollout because the "
+                                                         "parked agents are on an older image.")
+        for command in ("sudo -n systemctl restart x", "Run: docker compose up -d", "$ hermes kanban show t_1",
+                        "Approve 0123abcd4567.", "Use --force-recreate"):
+            self.assertEqual(_human_reason(command), "", command)
+        _, body = _block_message({"kind": "needs_input", "reason": "sudo -n systemctl restart hermes"}, "blocked")
+        self.assertEqual(body, f"**Waiting on you**\n\n{BLOCKER_FALLBACK}\n\n**Next:** once this is answered, "
+                               "ask the agent to resume and it continues the same task.")
+        _, body = _block_message({"kind": "needs_input", "reason": ""}, "blocked")
+        self.assertTrue(body.startswith("**Waiting on you**\n\nThe agent needs a decision."))
 
 
 class WorkerPromptTests(unittest.TestCase):
@@ -189,6 +209,14 @@ class WorkerPromptTests(unittest.TestCase):
         for section in ("**Delivered**", "**Evidence**", "**Remaining**"):
             self.assertIn(section, TASK_BODY)
         TASK_BODY.format(ident="ABC-1", url="https://linear.app/x/issue/ABC-1", context="")
+
+    def test_workers_get_the_plan_section_milestone_shape_and_link_rules(self):
+        from hermes_fleet_linear_plugin.bridge import PLAN_HEADING
+        for phrase in (f'"{PLAN_HEADING}"', "WITHOUT human_checkpoint", "only when the stage changes",
+                       "**What happened:**", "**Why:**", "**Next:**", "40 to 100 words", "commit SHAs",
+                       "linked text", "How we got here"):
+            self.assertIn(phrase, TASK_BODY)
+        self.assertNotIn("Started", TASK_BODY)
 
 
 if __name__ == "__main__":

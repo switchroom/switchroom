@@ -72,6 +72,12 @@ SCHEMA = {
         "Write for the human reading Linear: lead with current outcome/status, remaining work and next action. "
         "Use actual newlines, short headings, bullets and acceptance checklists where useful, not a long single paragraph. "
         "Short one-sentence updates are fine. Setup or monitoring verified is not an unresolved outcome completed. "
+        "Add an issue comment only when the stage changes (plan validated, PR open, merged, live, blocked or needs "
+        "someone, done): a bold stage title, then What happened, Why (one sentence, only for a real decision, failed "
+        "approach or change of plan) and Next (who it waits on), about 40 to 100 words, with no logs, commands or "
+        "commit SHAs. Current plan and checklist belong in the description, not in repeated comments. "
+        "Replies carry markdown_link for each issue and project: name issues and projects with that linked text "
+        "in every channel (Linear, Telegram, Slack, Desktop), never a bare key or bare URL. "
         "Formatting tips are advisory: preserve authored content, code and links; never silently rewrite it."),
     "parameters": {"type": "object", "properties": {
         "action": {"type": "string", "enum": ["track", "status", "followup", "delegate_self", "create_issue", "work_on", "take_over", "resume_owner", "create_project", "link_issue", "update_description", "add_comment", "origin_reference", "work_reference"]},
@@ -134,8 +140,46 @@ WORK_SCHEMA = {
 }
 
 
+def _link_text(text: str) -> str:
+    # Telegram and Slack find a link's text up to the first "]", so brackets in a title become parentheses.
+    return " ".join(str(text).replace("[", "(").replace("]", ")").split())[:160]
+
+
+def markdown_link(item: Any) -> str | None:
+    """A ready-made Markdown link for a Linear issue or project dict, or None.
+
+    The plain [text](url) form is the one Linear, Telegram and Slack all render as linked text;
+    Telegram shows only the text of the angle-bracket [text](<url>) form, so it is not used."""
+    if not isinstance(item, dict):
+        return None
+    url = item.get("url")
+    if not isinstance(url, str) or not url.startswith("https://") or any(c in url for c in " ()<>\n"):
+        return None
+    if isinstance(item.get("identifier"), str) and item["identifier"]:
+        title = item.get("title") if isinstance(item.get("title"), str) else ""
+        return f"[{_link_text(' '.join(part for part in (item['identifier'], title) if part))}]({url})"
+    if isinstance(item.get("name"), str) and item["name"].strip() and "/project/" in url:
+        return f"[{_link_text(item['name'])}]({url})"
+    return None
+
+
+def _with_links(value: Any, depth: int = 0) -> Any:
+    """Add ``markdown_link`` beside every issue and project the reply names; nothing else changes."""
+    if depth > 6:
+        return value
+    if isinstance(value, list):
+        return [_with_links(item, depth + 1) for item in value]
+    if not isinstance(value, dict):
+        return value
+    linked = {key: _with_links(item, depth + 1) for key, item in value.items()}
+    link = markdown_link(value)
+    if link and "markdown_link" not in value:
+        linked["markdown_link"] = link
+    return linked
+
+
 def _reply(ok: bool, message: str, **details: Any) -> str:
-    return json.dumps({"ok": ok, "message": message, **details})
+    return json.dumps({"ok": ok, "message": message, **_with_links(details)})
 
 PROGRESS_WINDOW = 20
 PROGRESS_BODY_LIMIT = 4000
@@ -618,7 +662,7 @@ TAKEOVER_NOTE = ("{owner} worked on this issue before and stopped so this agent 
 
 
 def _issue_ref(issue: dict) -> dict:
-    return {"id": issue["id"], "identifier": issue.get("identifier"), "url": issue.get("url")}
+    return {"id": issue["id"], "identifier": issue.get("identifier"), "title": issue.get("title"), "url": issue.get("url")}
 
 
 def _takeover_peer(bridge: Any, issue: dict, owner_id: str | None) -> tuple[dict | None, str, str]:
@@ -977,8 +1021,10 @@ def _expected_missing(bridge: Any):
 
 def _choice(item: dict) -> dict:
     state = item.get("state") if isinstance(item.get("state"), dict) else {}
-    return {"issue": item["identifier"], "title": item["title"][:120], "team": (item.get("team") or {}).get("key"),
-            "state": state.get("name"), "state_type": state.get("type")}
+    choice = {"issue": item["identifier"], "title": item["title"][:120], "team": (item.get("team") or {}).get("key"),
+              "state": state.get("name"), "state_type": state.get("type")}
+    link = markdown_link({"identifier": item["identifier"], "title": item["title"][:120], "url": item.get("url")})
+    return {**choice, "url": item["url"], "markdown_link": link} if link else choice
 
 
 def _lookup_issue(bridge: Any, ref: str, action: str) -> tuple[Any, dict | None]:
@@ -1134,8 +1180,7 @@ def _issue_action(bridge: Any, args: dict[str, Any], action: str, context: Any, 
         if action == "work_on":
             _, record = _entrust_request(args, action, context)
             result = _entrust(bridge, issue, record, context)
-            return _reply(not result["native"].get("not_started_reason"), _entrust_message(result), issue={"id": issue_id, "identifier": issue.get("identifier"),
-                                                                 "url": issue.get("url")}, **result)
+            return _reply(not result["native"].get("not_started_reason"), _entrust_message(result), issue=_issue_ref(issue), **result)
         if action == "delegate_self":
             if context.delegated_child:
                 return _reply(False, "Return routing changes to the parent agent.", code="native_scope_refused")

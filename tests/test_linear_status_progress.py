@@ -118,7 +118,11 @@ class StatusProgressTests(unittest.TestCase):
         before = self.snapshot()
         result = self.invoke()
         self.assertTrue(result["ok"], result)
-        self.assertEqual(result["issue"], before[0]["issue-1"])
+        # The issue is returned unchanged, plus its ready-made linked name.
+        issue = dict(result["issue"])
+        link = issue.pop("markdown_link")
+        self.assertEqual(issue, before[0]["issue-1"])
+        self.assertEqual(link, f"[{issue['identifier']} {issue['title']}]({issue['url']})")
         self.assertIn("native", result)
         progress = result["progress"]
         self.assertEqual([c["id"] for c in progress["thread"]], [f"comment-{i}" for i in range(66, 46, -1)])
