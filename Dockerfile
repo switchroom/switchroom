@@ -88,6 +88,13 @@ COPY scripts/patch-honcho-core-imports.py /tmp/patch-honcho-core-imports.py
 RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-core-imports.py /opt/hermes/plugins/memory/honcho \
     && /opt/hermes/.venv/bin/python -m py_compile /opt/hermes/plugins/memory/honcho/__init__.py /opt/hermes/plugins/memory/honcho/client.py \
     && rm -f /tmp/patch-honcho-core-imports.py
+# HF-757: profile environments resolve the SDK this image ships, and Kanban briefs are saved but never derived.
+COPY release/honcho-sdk-requirements.txt /tmp/honcho-sdk-requirements.txt
+COPY scripts/patch-honcho-sdk-floor.py scripts/patch-honcho-kanban-observation.py /tmp/
+RUN /opt/hermes/.venv/bin/python /tmp/patch-honcho-sdk-floor.py /opt/hermes/plugins/memory/honcho /tmp/honcho-sdk-requirements.txt \
+    && /opt/hermes/.venv/bin/python /tmp/patch-honcho-kanban-observation.py /opt/hermes/plugins/memory/honcho/__init__.py \
+    && /opt/hermes/.venv/bin/python -m py_compile /opt/hermes/plugins/memory/honcho/__init__.py \
+    && rm -f /tmp/honcho-sdk-requirements.txt /tmp/patch-honcho-sdk-floor.py /tmp/patch-honcho-kanban-observation.py
 # The plugin imports Agent core modules at load time; fail the bake if the parent Agent lacks one.
 COPY --chmod=0755 scripts/verify-honcho-plugin-core-seams.py /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py
 RUN /opt/hermes/.venv/bin/python /opt/hermes-fleet/bin/verify-honcho-plugin-core-seams.py /opt/hermes/plugins/memory/honcho /opt/hermes
