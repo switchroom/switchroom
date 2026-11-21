@@ -190,7 +190,9 @@ RUN --mount=type=secret,id=github_token,required=false set -eu; \
 # camofox-browser, the REST server the official camofox plugin drives: the integrity-pinned npm
 # tarball (no repository fork) plus one registered downstream patch (release/camoufox.lock.json),
 # installed from a committed lock with no install scripts. Telemetry and the default-addon download
-# are disabled by the service, which also points it at /opt/camoufox.
+# are disabled by the service, which also points it at /opt/camoufox. The official camoufox package
+# generates fingerprints from fpgen's model, which it would download on first launch; it is baked
+# here, sha256-checked against the pin fpgen-js ships and the lock, so a launch needs no network.
 COPY release/camofox-browser/ /tmp/camofox-browser-release/
 RUN set -eu; \
     lock=/opt/hermes-fleet/release/camoufox.lock.json; \
@@ -208,6 +210,12 @@ RUN set -eu; \
     test "$(node -p 'require("./node_modules/camoufox/package.json").version')" = "0.5.9"; \
     test ! -e node_modules/camoufox-js; \
     node --check server.js; \
+    model() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["camofox_browser"]["fingerprint_model"][sys.argv[2]])' "$lock" "$1"; }; \
+    test "$(node -p 'require("./node_modules/fpgen-js/package.json").version')" = "$(model package_version)"; \
+    CAMOUFOX_FPGEN_DATA="$(model install_dir)" node --input-type=module -e 'const m = await import("fpgen-js"); const [sha, size, url] = process.argv.slice(1); if (m.MODEL_PIN.sha256 !== sha || m.MODEL_PIN.size !== Number(size) || m.MODEL_PIN.url !== url) throw new Error("fpgen-js model pin differs from the lock"); await m.ensureModel({ dir: process.env.CAMOUFOX_FPGEN_DATA });' "$(model sha256)" "$(model size)" "$(model url)"; \
+    test "$(cat "$(model install_dir)/.pinned-model")" = "$(model sha256)"; \
+    test -s "$(model install_dir)/values.dat"; \
+    rm -rf "$(model install_dir)/.install.lock"; \
     rm -rf "$tarball" /tmp/camofox-browser-release /root/.npm; \
     chmod -R a+rX,go-w /opt/camofox-browser
 COPY --chmod=0755 docker/camofox-browser/service-run /usr/local/lib/camofox-browser/service-run
@@ -219,6 +227,7 @@ RUN chmod 0755 /etc/s6-overlay/s6-rc.d/camofox-browser/run
 # key is per container and lives in <HERMES_HOME>/camofox-browser/access-key. s6 waits up to 50 s at
 # container stop (default 3 s) so the browser server can checkpoint its logins.
 ENV CAMOFOX_URL=http://127.0.0.1:9377 \
+    CAMOUFOX_FPGEN_DATA=/opt/camofox-browser/fpgen \
     S6_SERVICES_GRACETIME=50000
 
 # Fleet plugins are mounted read-only by deployment, never baked into the image.

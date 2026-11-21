@@ -42,6 +42,19 @@ class LockTests(unittest.TestCase):
         self.assertTrue((ROOT / patch["file"]).is_file())
         self.assertIn("jo-inc/camofox-browser", patch["upstream"])
 
+    def test_fingerprint_model_is_baked_from_the_fpgen_pin(self):
+        m = LOCK["camofox_browser"]["fingerprint_model"]
+        lock = json.loads((ROOT / LOCK["camofox_browser"]["npm_lock"]).read_text(encoding="utf-8"))
+        self.assertEqual(lock["packages"]["node_modules/fpgen-js"]["version"], m["package_version"])
+        self.assertRegex(m["sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(m["url"].startswith("https://github.com/scrapfly/fingerprint-generator/releases/download/"))
+        self.assertEqual(m["install_dir"], "/opt/camofox-browser/fpgen")
+        for token in ("m.MODEL_PIN.sha256 !== sha", "await m.ensureModel({ dir: process.env.CAMOUFOX_FPGEN_DATA })",
+                      "CAMOUFOX_FPGEN_DATA=/opt/camofox-browser/fpgen"):
+            with self.subTest(token=token):
+                self.assertIn(token, DOCKERFILE)
+        self.assertIn("export CAMOUFOX_FPGEN_DATA=${CAMOUFOX_FPGEN_DATA:-/opt/camofox-browser/fpgen}", SERVICE)
+
     def test_npm_lock_resolves_the_official_package_only(self):
         lock = json.loads((ROOT / LOCK["camofox_browser"]["npm_lock"]).read_text(encoding="utf-8"))
         packages = lock["packages"]

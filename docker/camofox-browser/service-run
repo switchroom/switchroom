@@ -51,6 +51,7 @@ export CAMOFOX_BIND_HOST=127.0.0.1
 export CAMOFOX_ACCESS_KEY="$access_key" CAMOFOX_API_KEY="$access_key"
 export CAMOFOX_INTERACTIVE=desktop
 export CAMOUFOX_EXECUTABLE=${CAMOUFOX_EXECUTABLE:-/opt/camoufox/camoufox-bin}
+export CAMOUFOX_FPGEN_DATA=${CAMOUFOX_FPGEN_DATA:-/opt/camofox-browser/fpgen}
 export CAMOFOX_PROFILE_DIR="$state/profiles" CAMOFOX_COOKIES_DIR="$state/cookies"
 export CAMOFOX_UPLOADS_DIR="$state/uploads" CAMOFOX_TRACES_DIR="$state/traces"
 export CAMOFOX_CRASH_REPORT_ENABLED=false SENTRY_DSN= PROMETHEUS_ENABLED=false

@@ -32,7 +32,17 @@
         "description": "Drive Camoufox through the maintainers' official camoufox@0.5.9 npm package instead of camoufox-js@0.11.5 (which stops at beta.31), pin the browser to 158.0.1-beta.41, keep playwright-core below 1.63 as camoufox requires, and launch an external executable in place so the official package finds its addons and application.ini. Drop this patch when camofox-browser ships the same change.",
         "upstream": "https://github.com/jo-inc/camofox-browser/issues/15333"
       }
-    ]
+    ],
+    "fingerprint_model": {
+      "package": "fpgen-js",
+      "package_version": "1.3.0",
+      "tag": "model-2/2026",
+      "asset": "model-release.zip",
+      "url": "https://github.com/scrapfly/fingerprint-generator/releases/download/model-2/2026/model-release.zip",
+      "size": 1564571,
+      "sha256": "6530b8322cdaa4ec042921c8d9a0369a0e6e0269ba636c01a7203e4a2f109936",
+      "install_dir": "/opt/camofox-browser/fpgen"
+    }
   },
   "service": {
     "bind": "127.0.0.1",
