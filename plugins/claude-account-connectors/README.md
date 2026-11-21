@@ -18,7 +18,7 @@ These guarantees require qualification on the pinned native runtime. Posthoc res
 
 ## Configuration after qualification
 
-Install beside the Fleet ACP provider. Explicit plugin settings are `enabled: true`, `model` (default `sonnet`; also `haiku`, `opus`, `opus[1m]`) and `timeout` (1–180 seconds, default 90). Registration reads settings through Hermes `ctx.get_config`; it never accepts a callable backend in configuration. The `claude_account_connectors` toolset must be selected for the intended surface. Enabling the plugin does not create connector grants or log in an account.
+Install beside the Fleet ACP provider. Explicit plugin settings are `enabled: true`, `worker_model` (default `sonnet`; also `haiku`, `opus`, `opus[1m]`) and `timeout` (1–180 seconds, default 90). The setting is `worker_model`, not `model`: Hermes reserves `model`, `plugins`, `security` and `settings` as roots a plugin cannot use as a settings key, so a `model` key makes registration fail and neither tool loads. Registration reads settings through Hermes `ctx.get_config`; it never accepts a callable backend in configuration. The `claude_account_connectors` toolset must be selected for the intended surface. Enabling the plugin does not create connector grants or log in an account.
 
 ## Verification
 

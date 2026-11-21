@@ -258,7 +258,9 @@ class ConnectorTools:
 def register(ctx):
     if ctx.get_config('enabled', False) is not True:
         return
-    tools = ConnectorTools(NativeBackend(ctx.get_config('model', 'sonnet'), ctx.get_config('timeout', 90)))
+    # Not 'model': Hermes reserves model/plugins/security/settings as roots for plugin-relative settings
+    # keys, so ctx.get_config('model') raises ValueError and register() would never finish (HF-793).
+    tools = ConnectorTools(NativeBackend(ctx.get_config('worker_model', 'sonnet'), ctx.get_config('timeout', 90)))
     def search(args, **kwargs):
         return json.dumps(tools.claude_connector_search((args or {}).get('query')))
     def call(args, **kwargs):
