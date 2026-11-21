@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Dock launcher: open or raise this agent's own Camoufox session on the Bot Desktop.
+
+The window belongs to the container's camofox-browser service (the one the agent's browser_* tools
+drive), so the human lands in the agent's cookie jar instead of a second, empty browser. Running it
+twice raises the same window; it never starts a second Camoufox.
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import camoufox_local  # noqa: E402
+
+
+def notify(message: str) -> None:
+    try:
+        subprocess.run(["xmessage", "-center", "-timeout", "8", message], timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    print(message, file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--user", default=camoufox_local.DEFAULT_USER_ID)
+    parser.add_argument("--url", default=None, help="page to open when the session has no window yet")
+    parser.add_argument("--wait", type=float, default=20.0, help="seconds to wait for the service")
+    args = parser.parse_args(argv)
+
+    client = camoufox_local.Client()
+    deadline = time.monotonic() + args.wait
+    while not client.healthy():
+        if time.monotonic() > deadline:
+            notify("Camoufox is not running yet (camofox-browser service is down). Try again shortly.")
+            return 1
+        time.sleep(1)
+    try:
+        tab = client.open_or_raise(args.user, args.url)
+    except Exception as exc:  # noqa: BLE001 - shown to the human, never silent
+        notify(f"Camoufox could not open the session: {exc}")
+        return 1
+    print(tab)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

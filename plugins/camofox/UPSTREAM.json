@@ -1,0 +1,27 @@
+{
+  "commit": "269ddcbc8598ece2dc5bb82115ac68954bc4024f",
+  "files_sha256": {
+    "LICENSE": "5f79d321c17de8ef6e5f34967dc5b484afebeeefd87180890d9741941f6b815f",
+    "README.md": "4704038118889e8235e8e3636cd7261354b6720b6ac6a135265b635f56aa586f",
+    "__init__.py": "5cca7414c569535c227ead728ba6f3435141f0ba68d4c3b6f68bf4da88bf75d3",
+    "camofox_cli.py": "2a04ec3d0cb05b519a0e36d7fb198ce6852e64b6209e577dc8773f73789edd2c",
+    "camofox_client.py": "5e9841fe9e697829f4b8e62d5de8e366719b783ac63769cbf03739f836eb94a9",
+    "camofox_policy.py": "50b9349375d93e0709c5a691fbd938cfbabd9f9f4322bcf3f668b79e567cf89c",
+    "camofox_schemas.py": "b929fd2d15a505bdd9eb630f280199b99096410ec6400020be87fc44f75b2562",
+    "camofox_tools.py": "db5db697310a70de431d8ced72b23999805f085664fe214d20686b6001f72d61",
+    "camofox_vault.py": "0ceea73ac7d98c4583a55be7a74efba16de67200d3574b2f6c3d2fe3a8a58527",
+    "plugin.yaml": "c11661359d29f60b17f255e3c7cdc475e872cfbbd856ca59deff074099fb43a9"
+  },
+  "license": "MIT",
+  "license_file": "LICENSE",
+  "omitted": [
+    "pyproject.toml",
+    "pytest.ini",
+    "tests/"
+  ],
+  "patches": [],
+  "path": "camofox",
+  "repository": "https://github.com/NousResearch/hermes-official-plugins.git",
+  "tree": "fa1aff3d5fc6030e3a3eccf582edc3f6cc0e399b",
+  "version": "1.2.0"
+}

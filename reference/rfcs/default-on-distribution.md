@@ -45,12 +45,15 @@ No default may add a model or paid path the principal did not grant. [`no-off-pl
 | Kokoro voice and local transcription | local sidecar URL | text-only replies, reported |
 | Honcho memory | Honcho endpoint | built-in memory, reported |
 | Web search, with Perplexity when a key exists | optional operator key | default web backend, reported |
+| Camoufox browser on the Bot Desktop (in-image service, official `camofox` plugin, `camoufox-desktop`), Chromium `browser_exec` as backup | per-container local key, created on first start | Chromium only, reported |
 | Quota, session-reset-policy, security-guidance, disk-cleanup (report-only) | none | always on |
 | Shared skill pack | none | always on |
 
 ### Opt-in, not default
 
-Browser handoff and Camofox, A2A between agents, and artifact publishing stay opt-in. Each one reaches outside the agent's box (a public browser origin, another agent's trust, a publication target), so it remains an explicit per-deployment decision.
+Browser handoff (the sidecar Camofox with a public origin and VNC proxies), A2A between agents, and artifact publishing stay opt-in. Each one reaches outside the agent's box (a public browser origin, another agent's trust, a publication target), so it remains an explicit per-deployment decision.
+
+Amendment 2026-11-21 (HF-773, decided by the principal): Camoufox inside the agent's own container is a default. It stays inside the box: the camofox-browser service binds loopback only, needs a per-container access key, sends no telemetry, and its window is on the agent's own Bot Desktop behind the existing Take over lease. The bare image installs it and supervises the service, which costs nothing until something browses; the camofox and camoufox-desktop plugins stay off until an overlay enables them.
 
 ### Honest status
 
