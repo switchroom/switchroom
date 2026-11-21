@@ -91,6 +91,11 @@ class ImageTests(unittest.TestCase):
             "tigervnc-standalone-server", "xfce4-panel", "chromium", "adwaita-icon-theme-legacy",
             "libdbus-glib-1-2", "libegl1", "fonts-noto-core", "fonts-noto-color-emoji", "locales",
             "en_AU.UTF-8 UTF-8", "LANG=en_AU.UTF-8", "BH_TAB_MARKER=0",
+            # en-AU resolves to Chromium's en-GB UI locale; without that pak pages run en-US.
+            "chromium chromium-l10n", "path-exclude=/usr/lib/chromium/locales/*",
+            "path-include=/usr/lib/chromium/locales/en-GB.pak",
+            "path-include=/usr/lib/chromium/locales/en-US.pak",
+            "= 'en-GB.pak en-US.pak '",
             "COPY release/camoufox.lock.json /opt/hermes-fleet/release/camoufox.lock.json",
             "gh attestation verify", "--signer-workflow", "unzip -q \"$archive\" -d /opt/camoufox",
             "/opt/camoufox/.hermes-fleet-provenance.json", "/usr/share/icons/hicolor/${size}x${size}/apps/camoufox.png",

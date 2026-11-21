@@ -126,15 +126,22 @@ COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-a
 # only *-symbolic legacy names, so the dock's launchers rendered as blank squares without it.
 # Camoufox's runtime libraries (libdbus-glib-1-2, libegl1), unzip for its release archive, a normal
 # font set, and the en_AU.UTF-8 locale.
-RUN apt-get -o Acquire::Retries=3 update \
+# chromium-l10n supplies en-GB.pak, the UI locale Chromium resolves en-AU to. Without it --lang=en-AU
+# falls back to en-US and every page's Intl default formats dates month-first. A dpkg path filter keeps
+# only en-GB and en-US of its ~117 MB of locale paks.
+RUN printf '%s\n' 'path-exclude=/usr/lib/chromium/locales/*' \
+      'path-include=/usr/lib/chromium/locales/en-GB.pak' 'path-include=/usr/lib/chromium/locales/en-US.pak' \
+      > /etc/dpkg/dpkg.cfg.d/chromium-locales \
+    && apt-get -o Acquire::Retries=3 update \
     && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
       tigervnc-standalone-server xfce4-panel xfwm4 xfdesktop4 xfce4-settings xfce4-terminal \
-      dbus-x11 at-spi2-core x11-xserver-utils x11-utils x11-xkb-utils xauth fonts-dejavu-core chromium \
+      dbus-x11 at-spi2-core x11-xserver-utils x11-utils x11-xkb-utils xauth fonts-dejavu-core chromium chromium-l10n \
       adwaita-icon-theme-legacy \
       libdbus-glib-1-2 libegl1 unzip locales \
       fonts-liberation fonts-noto-core fonts-noto-color-emoji \
     && sed -i 's/^# *\(en_AU.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
     && locale-gen \
+    && test "$(ls /usr/lib/chromium/locales | sort | tr '\n' ' ')" = 'en-GB.pak en-US.pak ' \
     && rm -rf /var/lib/apt/lists/*
 # The dock's Browser launcher names internet-web-browser, which no installed theme ships
 # (AdwaitaLegacy has only web-browser). Alias it to the Chromium icon that launcher opens;
