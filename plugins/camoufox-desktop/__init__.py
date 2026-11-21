@@ -10,6 +10,9 @@ the desktop. This plugin adds, without patching either:
   and stamps activity, so idle-stop does not close a window the agent is using;
 * hand-back: the first turn after the human hands back is told so, and the session's cookies are
   checkpointed then (Camofox only writes them to disk at a checkpoint);
+* a periodic checkpoint while the screen is in use: stopping the Bot Desktop (idle-stop, a crash)
+  takes Camoufox down with its display, without the shutdown checkpoint, so recent logins would
+  otherwise be lost;
 * steering: Camoufox (``browser_*``) is the primary browser; Chromium ``browser_exec`` is the backup
   and the engine for CDP-only work;
 * a dock icon that opens or raises the agent's own Camoufox session.
@@ -20,10 +23,13 @@ Camofox ``userId`` so the agent, its crons and the human share one cookie jar.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import threading
+import time
+import urllib.error
 from pathlib import Path
 from typing import Any, Optional
 
@@ -139,13 +145,29 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         if not _is_fenced(tool_name, args):
             return None
         from tools.bot_desktop import lease, runtime
+    except Exception as exc:  # noqa: BLE001 - no Bot Desktop support here: nobody can take over
+        logger.warning("camoufox-desktop: pre_tool_call: %s", exc)
+        return None
+    try:
+        started = time.monotonic()
+        screen_was_up = bool(_published_env().get("DISPLAY"))
         _start_desktop_bounded(runtime)
-        try:
-            lease.assert_agent_may_act()
-        except lease.HumanHasControl as exc:
-            _mark_waiting(session_id)
-            return {"action": "block", "message": json.dumps(
-                {"success": False, "code": "human_has_control", "error": str(exc)})}
+        if not screen_was_up:
+            _wait_for_service(started + SERVICE_WAIT_SECONDS)
+        _retry_access_key()
+    except Exception as exc:  # noqa: BLE001 - liveness helpers must not take the browser away
+        logger.warning("camoufox-desktop: pre_tool_call: %s", exc)
+    try:
+        lease.assert_agent_may_act()
+    except lease.HumanHasControl as exc:
+        _mark_waiting(session_id)
+        return _block("human_has_control", str(exc))
+    except Exception as exc:  # noqa: BLE001 - fail closed: the agent must not type over a human
+        logger.warning("camoufox-desktop: lease check failed: %s", exc)
+        return _block("screen_control_unknown",
+                      f"Could not confirm that the agent holds the Bot Desktop ({exc}); not acting. "
+                      "Use browser_exec, or ask the human to check the Bot Screen.")
+    try:
         runtime.touch_activity()
         _maybe_dock(_published_env())
     except Exception as exc:  # noqa: BLE001 - our bug must not take the browser away
@@ -153,10 +175,37 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
     return None
 
 
+def _block(code: str, error: str) -> dict:
+    return {"action": "block", "message": json.dumps({"success": False, "code": code, "error": error})}
+
+
+def _retry_access_key() -> None:
+    """Pick up the access key if it could not be read at register time (the service repairs an
+    empty or short key on its next start); the camofox plugin reads the env on every request."""
+    if (os.environ.get("CAMOFOX_URL") or "").strip() and not (os.environ.get("CAMOFOX_API_KEY") or "").strip():
+        configure_environment()
+
+
 # Core runs plugin hooks under plugins.hook_callback_timeout (30 s by default) and fails a tool call
 # closed when a hook overruns, so the screen start is waited on for at most this long; the start
 # keeps going in the background and the camofox tool waits for the browser itself.
 DESKTOP_START_WAIT_SECONDS = 15.0
+# The service starts its server only once the screen's X display is up, so after starting the
+# screen the hook also waits for the server to answer, up to this long from the hook's start.
+SERVICE_WAIT_SECONDS = 20.0
+
+
+def _wait_for_service(deadline: float) -> bool:
+    if not (os.environ.get("CAMOFOX_URL") or "").strip() or not _published_env().get("DISPLAY"):
+        return False
+    client = camoufox_local.Client(key=os.environ.get("CAMOFOX_API_KEY") or "")
+    while True:
+        if client.healthy():
+            return True
+        if time.monotonic() >= deadline:
+            logger.info("camoufox-desktop: camofox-browser not answering yet; the tool will retry")
+            return False
+        time.sleep(0.5)
 
 
 def _start_desktop_bounded(runtime: Any, wait: Optional[float] = None) -> None:
@@ -194,6 +243,83 @@ def _checkpoint_async() -> None:
     threading.Thread(target=run, name="camoufox-checkpoint", daemon=True).start()
 
 
+# Periodic checkpoint. Camofox writes cookies to disk only at a checkpoint, and a Bot Desktop stop
+# (idle-stop, a crash, a manual stop) takes Camoufox down with its X display before any shutdown
+# checkpoint can run. So while the screen is in use, checkpoint every CHECKPOINT_SECONDS; idle-stop
+# comes long after the last use (bot_desktop.idle_stop_minutes), so the last state is on disk by then.
+CHECKPOINT_SECONDS = 300.0
+_checkpointer = {"started": False}
+
+
+def checkpoint_interval() -> float:
+    raw = (os.environ.get("CAMOFOX_CHECKPOINT_SECONDS") or "").strip()
+    try:
+        return float(raw) if raw else CHECKPOINT_SECONDS
+    except ValueError:
+        return CHECKPOINT_SECONDS
+
+
+def checkpoint_due(activity_mtime: Optional[float], now: float, interval: float) -> bool:
+    """True while the screen was used recently: for two intervals after the last activity stamp, so
+    a call still running at one tick (the stamp is taken when it starts) is caught by the next."""
+    return activity_mtime is not None and now - activity_mtime <= 2 * interval
+
+
+def _activity_mtime(home: Path) -> Optional[float]:
+    try:
+        return (home / "bot-desktop" / "activity").stat().st_mtime
+    except OSError:
+        return None
+
+
+def periodic_checkpoint_once(home: Path, now: Optional[float] = None) -> str:
+    """One checkpoint tick; returns what happened, for logs and tests."""
+    if not _published_env().get("DISPLAY"):
+        return "screen_down"
+    if not checkpoint_due(_activity_mtime(home), time.time() if now is None else now, checkpoint_interval()):
+        return "idle"
+    client = camoufox_local.Client(key=os.environ.get("CAMOFOX_API_KEY") or None, timeout=60)
+    try:
+        client.checkpoint(user_id())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return "no_session"  # the agent's session is not open: nothing in memory to lose
+        raise
+    return "checkpointed"
+
+
+def _start_checkpointer(home: Path) -> None:
+    interval = checkpoint_interval()
+    if interval <= 0 or _checkpointer["started"]:
+        return
+    # One checkpointer per profile: the gateway, the dashboard and one-off CLI runs all load plugins.
+    lock_path = camoufox_local.state_dir(home) / ".checkpointer.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        logger.info("camoufox-desktop: periodic checkpoint off: %s", exc)
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)  # another process of this profile already checkpoints
+        return
+    _checkpointer["started"] = True  # the lock fd stays open for the life of the process
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                result = periodic_checkpoint_once(home)
+                if result == "checkpointed":
+                    logger.debug("camoufox-desktop: periodic checkpoint written")
+            except Exception as exc:  # noqa: BLE001 - best effort; try again next tick
+                logger.info("camoufox-desktop: periodic checkpoint skipped: %s", exc)
+
+    threading.Thread(target=loop, name="camoufox-checkpointer", daemon=True).start()
+
+
 def pre_llm_call(session_id: str = "", **_: Any):
     if not session_id:
         return None
@@ -224,8 +350,10 @@ def register(ctx) -> None:
             ctx.register_system_prompt_section("camoufox-desktop.browsers", STEERING, position="after_memory")
         except Exception as exc:  # noqa: BLE001 - steering is advisory
             logger.info("camoufox-desktop: steering not registered: %s", exc)
-    if (os.environ.get("CAMOFOX_URL") or "").strip() and not _published_env().get("DISPLAY"):
-        _maybe_dock(None)  # screen stopped: a direct, cache-free panel edit is safe now
+    if (os.environ.get("CAMOFOX_URL") or "").strip():
+        if not _published_env().get("DISPLAY"):
+            _maybe_dock(None)  # screen stopped: a direct, cache-free panel edit is safe now
+        _start_checkpointer(_hermes_home())
 
 
 __all__ = ["register", "pre_tool_call", "pre_llm_call", "configure_environment", "user_id"]
