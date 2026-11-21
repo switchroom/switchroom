@@ -368,6 +368,21 @@ class ActionsFallbackTests(unittest.TestCase):
         self.assertEqual(acceptance.settle(receipt, URL, gh=FakeGitHub(state="closed", merged=False))["classification"], "closed")
         self.assertEqual(acceptance.settle(receipt, URL, gh=FakeGitHub())["classification"], "infra")
 
+    def test_merged_pr_with_unreadable_checks_is_marked_merged_but_never_accepted(self):
+        # HF-794: the PR merged while core could not read it; the wait has nothing left to wait for.
+        receipt = {"ok": False, "classification": "infra", "head_sha": None, "checks": [],
+                   "detail": "GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry."}
+        merged = acceptance.settle(receipt, URL, gh=FakeGitHub())
+        self.assertIs(merged["pr_merged"], True)
+        self.assertIs(merged["ok"], False)
+        self.assertTrue(acceptance.unverified(merged))
+        for github in (FakeGitHub(state="open", merged=False), FakeGitHub(state="closed", merged=False),
+                       FakeGitHub(state="closed", merged=1)):
+            self.assertNotIn("pr_merged", acceptance.settle(receipt, URL, gh=github))
+        github = FakeGitHub()
+        github.refuse["repos/"] = acceptance.Unavailable("GitHub did not answer")
+        self.assertEqual(acceptance.settle(receipt, URL, gh=github), receipt)
+
     def test_accepted_and_definite_core_receipts_pass_through_untouched(self):
         github = FakeGitHub()
         for receipt in ({"ok": True, "classification": "success", "head_sha": SHA},

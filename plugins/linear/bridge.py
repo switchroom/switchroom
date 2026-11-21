@@ -1534,10 +1534,12 @@ class Bridge:
         diag.warn("auth.reauth_required", "held", "auth_unavailable")
     def accepted_evidence(self, links: list[str], contract: str = "local-only", *,
                           heads: dict[str, str] | None = None, failures: list[str] | None = None,
-                          unverified: list[tuple[str, str, str]] | None = None) -> bool:
+                          unverified: list[tuple[str, str, str]] | None = None,
+                          merged: list[str] | None = None) -> bool:
         """``unverified`` receives (url, class, head) when the refusal is GitHub not answering, else class "".
 
-        ``head`` is the PR head the verifier saw (empty when unknown)."""
+        ``head`` is the PR head the verifier saw (empty when unknown). ``merged`` receives the url of a
+        refused PR that GitHub reports merged: its checks are still unproved, but nothing is left to wait for."""
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
             failures is not None and failures.append("evidence link is not a pull request")
@@ -1553,6 +1555,8 @@ class Bridge:
                 unverified is not None and unverified.append(
                     (url, receipt["classification"] if acceptance.unverified(receipt) else "",
                      str(receipt.get("head_sha") or "") if isinstance(receipt, dict) else ""))
+                if merged is not None and isinstance(receipt, dict) and receipt.get("pr_merged") is True:
+                    merged.append(url)
                 return False
             if heads is not None: heads[url] = receipt["head_sha"]
         return True
@@ -3863,8 +3867,9 @@ class Bridge:
             return
         evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
         issue_id = row["issue_id"]
-        heads, failures, waiting = {}, [], []
-        accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures, unverified=waiting)
+        heads, failures, waiting, merged = {}, [], [], []
+        accepted = self.accepted_evidence(evidence, contract, heads=heads, failures=failures, unverified=waiting,
+                                          merged=merged)
         # Paths, secrets and task ids are not a result, however they are shown to people.
         residue = re.sub(r"[\W_]+", "", re.sub(r"\[(?:local artifact|redacted)\]", "", _TASK_ID.sub("", _LOCAL_PATH.sub(
             "", _public(raw_summary or ""))), flags=re.IGNORECASE)).casefold()
@@ -3874,7 +3879,8 @@ class Bridge:
                           and bool(waiting) and all(cls for _url, cls, _head in waiting))
             if recheck is not None:
                 if unverified:
-                    return "unverified"
+                    # A merged PR ends the wait: no later check result can change it.
+                    return "merged" if waiting[-1][0] in merged else "unverified"
                 if recheck.get("kind") == "blocked":
                     return "failed"  # The Blocked closeout already says why; nothing new to report.
             elif unverified:
@@ -4039,6 +4045,10 @@ class Bridge:
         # (Linear budget, an error) or a Done refused at send cannot turn into GitHub reads per tick.
         until = self.store.backoff_fail(key, now, base=ACCEPTANCE_RECHECK_BASE, cap=ACCEPTANCE_RECHECK_CAP)
         outcome = self._finished(row, event_id=completed.id, recheck=wait)
+        if outcome == "merged":
+            self._settle_merged_acceptance(row, wait)
+            diag.transition("status.write", "skipped", "acceptance_merged", key=marker, **fields)
+            return
         if outcome == "unverified" or not outcome:
             diag.transition("status.write", "held", "acceptance_unverified" if outcome else "effect_unresolved",
                             key=marker, next_s=int(until - now), **fields)
@@ -4052,6 +4062,23 @@ class Bridge:
             return
         diag.count("status_q")
         diag.transition("status.write", "queued", "acceptance_verified", key=marker, state="done", **fields)
+    def _settle_merged_acceptance(self, row: dict[str, Any], wait: dict) -> None:
+        """The PR merged while its checks stayed unreadable: stop asking, and say so once.
+
+        Not Done (the checks are still unproved) and not Blocked (nothing is wrong with the work): the
+        issue stays as it is for a person to close. Settled before the one sentence is queued, so a
+        failed enqueue can lose that sentence but never restart the wait or its keepalives.
+        """
+        self.store.settle_acceptance_recheck(wait["status_id"])
+        if wait["kind"] != "in_review" or not self.authorize_specialist_effect(row["issue_id"]):
+            return  # An older Blocked closeout already told the person what to check.
+        body = (f"The pull request was merged ({wait.get('url') or 'its link'}), but its required checks could "
+                "not be read, so the agent has stopped checking them. The issue stays In Review; move it to Done "
+                "if the merge completes the work.")
+        for kind, payload in self._report_writes(row, [("activity", {
+                "issue_id": row["issue_id"], "session_id": row["owner_ref"], "task_id": row["task_id"],
+                **self._alert_route(row), "content": {"type": "thought", "body": body}})]):
+            self.store.enqueue(kind, payload, at=self.clock())
     def _expire_acceptance(self, row: dict[str, Any], event_id: int, wait: dict) -> str | None:
         """No answer within ACCEPTANCE_MAX_WAIT: In Review becomes Blocked with one sentence; an older
         Blocked closeout already says so and stands. Returns "failed" once settled."""
@@ -4319,7 +4346,16 @@ class Bridge:
                 if task.status not in RECHECKED_STATUSES and not self._pending_session_acceptance(row):
                     return  # Finished or parked work: no Linear polling while nothing can change our report.
                 issue = self._effect_issue(row["issue_id"])
-                if (issue.get("state") or {}).get("type") not in CLOSED and self._report_delegate_allowed(issue):
+                if (issue.get("state") or {}).get("type") in CLOSED:
+                    # Closed (by a person or an integration): no PR check result can change that, so the
+                    # acceptance wait ends here instead of rechecking GitHub until the 7-day cap.
+                    wait = self.store.acceptance_recheck(row["issue_id"], row.get("task_id") or "")
+                    if wait:
+                        self.store.settle_acceptance_recheck(wait["status_id"])
+                        diag.transition("status.write", "skipped", "acceptance_issue_closed",
+                                        key=("acceptance", row["issue_id"], wait.get("event_id")),
+                                        iss=row["issue_id"], task=row.get("task_id"))
+                elif self._report_delegate_allowed(issue):
                     self._keepalive(row, issue)
             except RateLimited:
                 raise
