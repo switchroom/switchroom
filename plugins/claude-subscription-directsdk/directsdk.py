@@ -65,6 +65,18 @@ class ClaudeAPIError(RuntimeError):
         self.request_id = request_id
 
 
+# hermes-fleet patch: closed-client-transport-error
+class ClaudeClientClosed(ConnectionError, RuntimeError):
+    """A call reached a client that was already closed (Hermes' cache closed it, or a loop tore down).
+
+    Hermes' error classifier treats ``ConnectionError`` as a transport failure, so the auxiliary
+    ladder falls back and evicts the cached dead client; the plain ``RuntimeError`` this used to be
+    classified as an unknown error and the same closed client was reused forever. Still a
+    ``RuntimeError`` for callers that caught the old type.
+    """
+# end hermes-fleet patch: closed-client-transport-error
+
+
 # Native's own error codes for errors it answers without a relayed upstream status.
 NATIVE_ERROR_STATUS = {
     'rate_limit': 429,  # plan/session limit ("You've hit your session limit")
@@ -751,7 +763,7 @@ class Client:
         request = Request(self)
         with self._lock:
             if self._closed:
-                raise RuntimeError('Claude client is closed')
+                raise ClaudeClientClosed('Claude client is closed')  # hermes-fleet patch: closed-client-transport-error
             self._requests.add(request)
         return request
 

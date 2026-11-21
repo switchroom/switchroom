@@ -77,12 +77,12 @@ defaults:
     values:
       plugins.entries.claude-account-connectors.settings:
         enabled: true
-        model: sonnet
+        worker_model: sonnet
         timeout: 90
     off_values:
       plugins.entries.claude-account-connectors.settings:
         enabled: false
-        model: sonnet
+        worker_model: sonnet
         timeout: 90
 
   # Which subscription plan each task role uses (docs/choose-your-plans.md).
