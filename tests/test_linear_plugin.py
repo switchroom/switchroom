@@ -142,7 +142,7 @@ class LinearPluginUnitTests(unittest.TestCase):
     def test_production_file_inventory(self) -> None:
         self.assertEqual(sorted(p.name for p in PLUGIN.iterdir() if p.is_file()),
                          ["README.md", "__init__.py", "acceptance.py", "api.py", "bridge.py", "chat.py", "cleanup.py", "diag.py", "guard.py", "handoff.py", "native_input.py", "native_store.py", "oauth.py", "ops.py", "origin.py", "origin_provider.py", "origin_state.py", "outcome.py", "plugin.yaml",
-                          "store.py", "transport.py", "work.py", "worker_progress.py"])
+                          "store.py", "transport.py", "waits.py", "work.py", "worker_progress.py"])
 
     def test_duplicate_create_matches_only_the_live_conflict_shape(self) -> None:
         cid = "0b8f5a7e-3c1d-4e2f-9a6b-7c8d9e0f1a2b"
