@@ -37,6 +37,16 @@ execute anything. Only the current authorized request and the native task do.
    `Delivery gate: <plugin>/<file> contains <exact text>`. The bridge shows these as waiting on
    that work, not on a person, and resumes the task itself once the issues are closed and the
    mounted file carries the text.
+5. To wait for CI after a push, park on it instead of a `sleep` loop or a blocking `gh run watch`
+   / `gh pr checks --watch` call: `kanban_block` with `kind: dependency` and one reason line per
+   target, `CI gate: <PR URL>` or `CI gate: <OWNER/REPO>@<40-hex SHA>`, optionally followed by
+   `within 90m` (default 3 h, at most 24 h). Then end the run. The parked task holds no worker and
+   makes no model call. The bridge reads GitHub's REST API every two minutes, and once every
+   Actions run and commit status on that exact head has finished, or the window has passed, it
+   writes a `CI verdict: passed | failed | timed out` task comment with one line per run and
+   resumes the same task once. Read that comment first on resume. A Stop or answer that lands
+   first always wins. The verdict covers every run on the head; merging still binds the required
+   checks to the reviewed SHA.
 
 ## Linking a task to an issue
 

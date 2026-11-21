@@ -59,6 +59,23 @@ def standing_pr_park(events: list):
     if last is None or last.kind != "blocked" or native_event_payload(last).get("source") != PR_PARK_SOURCE:
         return None
     return last
+def standing_wait(events: list):
+    """(event, wait) for a worker's dependency wait that is the newest block-lifecycle event, else (event, None).
+
+    Core's block-loop breaker records a repeated wait as ``block_loop_detected`` (triage) with the
+    same payload; it is still that wait."""
+    last = next((event for event in reversed(events) if event.kind in PARK_LIFECYCLE), None)
+    if last is None or last.kind not in ("blocked", "block_loop_detected"):
+        return last, None
+    return last, waits.parse(native_event_payload(last))
+def ci_check(gate: dict) -> dict:
+    """``waits.ci_state`` over the ambient ``gh`` login; a refused or failed read is ``unreadable``."""
+    try:
+        return waits.ci_state(gate, acceptance.gh_api)
+    except (acceptance.Denied, acceptance.Unavailable) as exc:
+        return {"state": "unreadable", "lines": [f"GitHub could not be read: {exc}"]}
+    except (KeyError, TypeError, ValueError, IndexError):
+        return {"state": "unreadable", "lines": ["GitHub returned an incomplete answer"]}
 def pr_park_notice(payload: dict) -> str:
     """The one plain sentence for a guard park: nothing is asked of the reader."""
     number = _PARK_PR_NUMBER.search(str(payload.get("reason") or ""))
@@ -196,9 +213,12 @@ How to work this task:
    Include the requested results and what the checks proved; omit raw commands, logs and internal
    bookkeeping unless the person requested them. The existing completion projection publishes this
    as the issue comment; do not create a second closing comment yourself.
-8. Wait without sleep loops. For CI, make one blocking terminal call per wait (timeout up to 600):
-   gh run watch on the runs for the head commit with its output discarded, or arm
-   gh pr merge --auto --match-head-commit where the repository allows it. Run a long test or build
+8. Wait without sleep loops or watch calls. To wait for CI after a push, park on it: call
+   kanban_block with kind dependency and a reason line "CI gate: <PR URL or OWNER/REPO@SHA>"
+   (optionally "within 90m"; the default window is 3 hours), then end the run. The task holds no
+   worker and resumes by itself once CI on that head finishes or the window passes, with the
+   verdict as a task comment. A reviewer may instead arm gh pr merge --auto --match-head-commit
+   where the repository allows it. Run a long test or build
    as one long foreground call or as a background process with process_manage wait. For something
    due later, finish or hand off this stage and schedule the follow-up check with cronjob.
 """
@@ -777,15 +797,17 @@ def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
         return "response", (f"Paused for a handover to {to}. Nothing is needed from you: {to} continues this work "
                             f"once the handover is confirmed. If it doesn't complete, {to} says so here and this work "
                             f"stays paused until someone asks {to} to let this agent continue or to take it over again.")
+    wait = waits.parse(payload)
+    if wait:
+        # Waiting on other issues, a delivery or CI, not on a person. A repeated wait lands in
+        # triage through the block-loop breaker and still resumes by itself.
+        return "thought", waits.notice(wait)
     if task_status == "triage":
         return "error", ("Paused after the same problem came back several times. An operator needs to check "
                          "the task on the agent's board before work continues.")
     if internal:
         return "error", ("Paused by a technical problem on the agent's side. Nothing is needed from you; "
                          "the same task continues once the problem is cleared.")
-    wait = waits.parse(payload)
-    if wait:
-        return "thought", waits.notice(wait)  # Waiting on other issues or a delivery, not on a person.
     reason = _project_summary(_human_reason(payload.get("reason") or ""), 400, one_line=True)
     if kind != "dependency" and _STOP_REASON.search(reason) and "?" not in reason:
         # A person stopped or handed off this work: nothing is being asked of the reader.
@@ -3618,6 +3640,8 @@ class Bridge:
         status, payload = task.status, native_event_payload(last) if last else {}
         if status == "blocked" and standing_pr_park(adapter.history(task.id, 0)) is not None:
             return "in_review"  # Core's open-PR guard parked it: it waits on that PR, not on a person.
+        if status in ("blocked", "triage") and (standing_wait(adapter.history(task.id, 0))[1] or {}).get("ci"):
+            return "in_review"  # Parked on CI (HF-800): it resumes by itself with the verdict.
         if status in ("blocked", "triage"):
             # Native creation parks a new task until admission: that is queued, not stopped.
             queued = (getattr(last, "kind", None) == "blocked" and payload.get("reason") == "initial_status"
@@ -4172,16 +4196,23 @@ class Bridge:
         Satisfied: one guarded core unblock of exactly that block event, decided once per block (a
         durable marker written before the call, never replayed). Anything unreadable or still open
         leaves it blocked; a newer Stop or answer changes the newest event, so it is never overridden.
+
+        A CI gate (HF-800) is satisfied once CI on its head has finished or its window has passed.
+        The verdict is written as a native task comment first and the unblock is guarded on that
+        comment being the only event since the block, so the resumed worker reads the verdict and a
+        Stop that lands in between still wins. A second park on the same task trips core's
+        block-loop breaker into triage; that ``block_loop_detected`` carries the same wait and
+        resumes the same way, up to ``waits.CI_MAX_PARKS`` CI parks per task.
         """
         if not row or row.get("origin") != "native" or not getattr(adapter, "guarded_controls", False):
             return
         task = adapter.require_task(row["task_id"])
-        if task.status != "blocked":
+        if task.status not in ("blocked", "triage"):
             return
         events = adapter.history(task.id, 0)
-        last = next((event for event in reversed(events) if event.kind in PARK_LIFECYCLE), None)
-        wait = waits.parse(native_event_payload(last)) if last is not None and last.kind == "blocked" else None
-        if wait is None or last.id > row["last_event_id"] or events[-1].id != last.id:
+        last, wait = standing_wait(events)
+        if (last is None or wait is None or last.id > row["last_event_id"] or events[-1].id != last.id
+                or task.status != ("triage" if last.kind == "block_loop_detected" else "blocked")):
             return
         issue_id = row["issue_id"]
         marker, fields = f"external-wait-resume:{issue_id}:{task.id}:{last.id}", {"iss": issue_id, "task": task.id, "evt": last.id}
@@ -4190,8 +4221,15 @@ class Bridge:
         key, now = f"external_wait_recheck:{issue_id}:{task.id}:{last.id}", self.clock()
         if not self.store.backoff_ready(key, now):
             return
+        gap = waits.CI_WAIT_GAP if wait["ci"] else waits.EXTERNAL_WAIT_GAP
         self.store.backoff_clear(key)
-        self.store.backoff_fail(key, now, base=waits.EXTERNAL_WAIT_GAP, cap=waits.EXTERNAL_WAIT_GAP)
+        self.store.backoff_fail(key, now, base=gap, cap=gap)
+        if wait["ci"] and sum(1 for event in events if event.kind in ("blocked", "block_loop_detected")
+                              and (waits.parse(native_event_payload(event)) or {}).get("ci")) > waits.CI_MAX_PARKS:
+            diag.transition("external_wait.resume", "skipped", "ci_park_limit", key=marker, **fields)
+            return
+        if not self.authorize_specialist_effect(issue_id):
+            return  # Revoked or out of scope: the wait stays as it is for a person.
         for ref in wait["issues"]:
             try:
                 other = self.api.issue(ref)
@@ -4206,22 +4244,40 @@ class Bridge:
         if not all(waits.gate_met(self.plugins_root, path, text) for path, text in wait["gates"]):
             diag.transition("external_wait.resume", "skipped", "delivery_pending", key=marker, **fields)
             return
+        verdict = waits.ci_verdict(wait["ci"], float(last.created_at), now, ci_check) if wait["ci"] else None
+        if wait["ci"] and verdict is None:
+            diag.transition("external_wait.resume", "skipped", "ci_pending", key=marker, **fields)
+            return
         latest = adapter.history(task.id, 0)
-        if adapter.require_task(task.id).status != "blocked" or latest[-1].id != last.id:
+        if adapter.require_task(task.id).status != task.status or latest[-1].id != last.id:
             diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
             return
         _, first = self.store.native_intent_prepare(marker, {"issue_id": issue_id, "task_id": task.id, "block_event_id": last.id})
         if not first:
             return
+        token = last.id
         try:
-            accepted = adapter.activate(task.id, last.id)
+            if verdict is not None:
+                adapter.comment(task.id, waits.verdict_comment(verdict), marker=marker)
+                since = adapter.history(task.id, last.id)
+                if len(since) != 1 or since[0].kind != "commented":
+                    # Something else happened beside the verdict (a Stop, an answer): it wins.
+                    self.store.native_intent_settle(marker, {"state": "applied", "accepted": False})
+                    diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
+                    return
+                token = since[0].id
+            accepted = adapter.activate(task.id, token)
         except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
             self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
             diag.warn("external_wait.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
             return
-        self.store.native_intent_settle(marker, {"state": "applied", "accepted": bool(accepted)})
+        self.store.native_intent_settle(marker, {"state": "applied", "accepted": bool(accepted),
+                                                 **({"ci": verdict["overall"]} if verdict else {})})
         if accepted:
             body = "What this work waited on is done. The agent continues."
+            if verdict is not None:
+                targets = ", ".join(waits.ci_label(gate) for gate in wait["ci"])
+                body = f"CI {verdict['overall']} on {targets}. The agent continues with that result."
             if row.get("owner_ref"):
                 self.activity(issue_id, row["owner_ref"], "thought", body, row=row)
             else:

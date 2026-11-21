@@ -54,7 +54,7 @@ class WaitsParse(unittest.TestCase):
 
     def test_gate_lines_parse_and_stay_inside_the_plugins_directory(self):
         wait = waits.parse(self.rekinded("Merged.\nDelivery gate: linear/bridge.py contains _resume_external_wait"))
-        self.assertEqual(wait, {"issues": [], "gates": [("linear/bridge.py", "_resume_external_wait")]})
+        self.assertEqual(wait, {"issues": [], "gates": [("linear/bridge.py", "_resume_external_wait")], "ci": []})
         with tempfile.TemporaryDirectory() as root:
             (Path(root) / "p").mkdir()
             (Path(root) / "p" / "f.py").write_text("x = 1\n")

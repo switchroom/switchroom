@@ -146,7 +146,8 @@ class WorkerTemplateTests(unittest.TestCase):
                 self.assertIn(phrase, TASK_BODY)
 
     def test_workers_are_told_to_wait_without_sleep_loops(self):
-        for phrase in ("Wait without sleep loops", "gh run watch", "--auto --match-head-commit",
+        for phrase in ("Wait without sleep loops", "CI gate: <PR URL or OWNER/REPO@SHA>", "kind dependency",
+                       "end the run", "--auto --match-head-commit",
                        "process_manage wait", "cronjob"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, TASK_BODY)
