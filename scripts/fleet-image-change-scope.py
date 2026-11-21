@@ -31,6 +31,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "package-lock.json",
         "package.json",
         "release/agent-image-manifest.json",
+        "release/camoufox.lock.json",
         "release/honcho-requirements.in",
         "release/honcho-requirements.txt",
         "release/honcho-sdk-requirements.txt",
@@ -58,12 +59,16 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "scripts/verify-exact-main-ci.py",
         "scripts/verify-inherited-runtime-config.py",
         "scripts/verify-trivy-vex.py",
+        "scripts/verify-camoufox-runtime.py",
+        "security/chromium-seccomp.json",
     }
 )
 
 # Directories the Dockerfile copies wholesale.
 IMAGE_INPUT_PREFIXES: tuple[str, ...] = (
     "contracts/",
+    "docker/",
+    "release/camofox-browser/",
 )
 
 

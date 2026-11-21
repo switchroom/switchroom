@@ -144,7 +144,11 @@ class PublicProductTests(unittest.TestCase):
         self.assertNotRegex(text, r"(?m)^\s*(?:ENTRYPOINT|CMD)\b")
         self.assertIn("USER root", text)
         self.assertRegex(text, r"(?m)^USER 1000:1000$")
-        self.assertNotIn("apt-get", text)
+        # One reviewed apt layer only: the Bot Desktop, Chromium and Camoufox runtime (HF-773).
+        self.assertEqual(text.count("apt-get -o Acquire::Retries=3 install"), 1)
+        self.assertEqual(text.count("apt-get"), 2)
+        self.assertIn("install -y --no-install-recommends", text)
+        self.assertIn("rm -rf /var/lib/apt/lists/*", text)
         self.assertIn("curl -fsSL", text)
         self.assertNotIn("wget ", text)
         self.assertNotIn("core_runtime_paths", text)

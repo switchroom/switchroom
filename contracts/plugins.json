@@ -235,6 +235,25 @@
         "blocks_agent_start": false
       },
       {
+        "id": "camoufox-browser",
+        "status": "planned",
+        "starter_overlay": "not_configured",
+        "summary": "Camoufox headed on each agent's Bot Desktop as the primary browser: the image's pinned, attested Camoufox and its supervised loopback camofox-browser service, the official camofox plugin, and camoufox-desktop (Take over fence, hand-back note, steering, dock icon). Chromium browser_exec stays as the backup.",
+        "covers": [
+          "camofox",
+          "camoufox-desktop"
+        ],
+        "credential": {
+          "kind": "per_container_local_key"
+        },
+        "degrade": {
+          "when": "service_unreachable",
+          "behaviour": "chromium_only_and_report"
+        },
+        "billing": "none",
+        "blocks_agent_start": false
+      },
+      {
         "id": "quota",
         "status": "shipped",
         "starter_overlay": "configured",
@@ -504,6 +523,30 @@
       "id": "voice-provider",
       "target": "standalone_public_plugin",
       "default_enabled": true,
+      "default_role": "default",
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
+      "id": "camofox",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
+      "default_role": "default",
+      "conditions": [
+        "generic_configuration",
+        "independent_tests",
+        "license_review",
+        "no_deployment_identity"
+      ]
+    },
+    {
+      "id": "camoufox-desktop",
+      "target": "standalone_public_plugin",
+      "default_enabled": false,
       "default_role": "default",
       "conditions": [
         "generic_configuration",
