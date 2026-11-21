@@ -650,8 +650,20 @@ is Done or Canceled and every gate holds it makes one guarded core unblock of ex
 decided once per block. A newer event on the task, an unreadable issue or a dependency block naming
 nothing checkable leaves it blocked. A delegate write held as uncertain is settled as applied when a
 fresh read of the issue shows the delegate it intended (the operator's `resolve ... applied`, with
-that readback as evidence). Done comes only from
-verified completion. A PR named as evidence is verified by core's exact-head required-check
+that readback as evidence).
+
+A worker parks on CI (HF-800) the same way, with one reason line per target: `CI gate: <PR URL>`
+or `CI gate: <OWNER/REPO>@<sha>`, optionally `within 90m` (default 3 h, at most 24 h). Linear
+shows it In Review, "Waiting for CI on ...". The parked task holds no worker and makes no model
+call. Every two minutes the plugin reads the PR head, the exact-head Actions runs and the commit
+statuses over `gh api repos/...` (so per-owner token routing applies), and once all of them have
+finished or the window has passed it writes a native `CI verdict: passed | failed | timed out`
+comment with one line per run, then makes one guarded unblock bound to that comment being the only
+event since the block. A Stop or answer that lands first wins, and the comment stays as
+information. A repeated park on the same task lands in triage through core's block-loop breaker;
+it carries the same wait and resumes the same way, up to 20 CI parks per task.
+
+Done comes only from verified completion. A PR named as evidence is verified by core's exact-head required-check
 verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
 token without `checks:read`), the same requirements are proved from exact-head GitHub Actions
 jobs instead (`acceptance.py`: every requirement pinned to the Actions app, trusted runs of the

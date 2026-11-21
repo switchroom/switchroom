@@ -50,7 +50,11 @@ The reviewer starts with no author context and is read-only on the branch.
 1. Fetch the PR yourself. Confirm the head SHA matches the brief. If it moved, stop.
 2. Review the diff against the acceptance criteria. Do not trust the author's summary; run the
    tests yourself where you can.
-3. Wait for required checks on that exact head. Pending is not green.
+3. Wait for required checks on that exact head. Pending is not green. Do not hold a worker in a
+   `sleep` loop or a blocking watch call: where the repository allows auto-merge, arm it bound to
+   the reviewed SHA once the review passes (`gh pr merge <url> --auto --match-head-commit <sha>
+   --<method>`); inside a native task, park on CI with a `CI gate:` block (see
+   `linear-work-tracking`) and continue from its verdict when the task resumes.
 4. **PASS:** merge with the repository's required method (rebase, squash or merge commit, from
    repository settings or `AGENTS.md`), bound to the reviewed commit:
 
