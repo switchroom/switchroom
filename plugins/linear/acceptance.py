@@ -106,26 +106,30 @@ def settle(receipt: Any, url: str, *, gh: Callable[..., Any] | None = None) -> A
     """Core's receipt, completed from Actions when only the Checks read was refused.
 
     An unverified receipt is also told apart from a PR closed without merging,
-    which is a definite answer (core reports it as unavailable evidence).
+    which is a definite answer (core reports it as unavailable evidence), and
+    from a merged PR: still unverified (``ok`` stays false), but marked
+    ``pr_merged`` because no later check result can change what is waited for.
     """
     gh = gh or gh_api
     if checks_read_denied(receipt, url):
         return actions_fallback(receipt, url, gh=gh)
     if unverified(receipt):
-        return _closed_unmerged(receipt, url, gh)
+        return _pr_ended(receipt, url, gh)
     return receipt
 
 
-def _closed_unmerged(receipt: dict, url: str, gh: Callable[..., Any]) -> dict:
+def _pr_ended(receipt: dict, url: str, gh: Callable[..., Any]) -> dict:
     match = _PR.fullmatch(url or "")
     if not match:
         return receipt
     try:
         pr = gh(f"repos/{match[1]}/pulls/{int(match[2])}")
-        closed = pr["state"] == "closed" and not pr.get("merged")
+        closed, merged = pr["state"] == "closed", pr.get("merged")
     except (Denied, Unavailable, KeyError, TypeError, ValueError):
         return receipt
-    if not closed:
+    if closed and merged is True:
+        return {**receipt, "pr_merged": True}
+    if not closed or merged:
         return receipt
     return {**receipt, "ok": False, "classification": "closed",
             "detail": "the pull request was closed without being merged"}

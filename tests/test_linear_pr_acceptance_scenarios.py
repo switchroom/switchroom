@@ -36,6 +36,7 @@ class FakeGh:
         self.pr_state, self.merged, self.sha, self.head_repo = "closed", True, SHA, REPO
         self.job = ("completed", "success")
         self.actions_refused = False
+        self.graphql_refused = False  # an organization token policy refuses GraphQL; REST still answers
         self.fail_jobs_reads: set[int] = set()  # which jobs reads (1-based) GitHub answers with a 502
         self.real_run = subprocess.run
 
@@ -44,6 +45,12 @@ class FakeGh:
             return self.real_run(command, *args, **kwargs)
         endpoint = command[2]
         self.calls.append(endpoint)
+        if endpoint == "graphql" and self.graphql_refused:
+            # The live shape: gh exits 1 with a policy message and no HTTP code, so core reports
+            # infra with no head commit and nothing for the Actions fallback to start from.
+            raise subprocess.CalledProcessError(1, command, output="", stderr=(
+                "gh: The organization forbids access via a fine-grained personal access token "
+                "if the token's lifetime is greater than 366 days."))
         reply = self.reply(endpoint)
         if isinstance(reply, int):
             raise subprocess.CalledProcessError(1, command, output="", stderr=(
@@ -462,6 +469,84 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
                 self.ticks(3, after=4000)
                 self.assertEqual(self.state(), "Blocked")
                 self.assertEqual(sum("/jobs" in call for call in self.gh.calls), jobs_reads)
+
+    # -- HF-794: a wait whose condition already cleared ---------------------------
+
+    def finish_in_session(self, session="review-session"):
+        """Finished work reported in an adopted Agent Session, whose PR checks GitHub will not show."""
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.assertEqual(self.state(), "In Progress")
+        self.remote.session_records[session] = {"id": session, "creator": None,
+                                                "appUser": {"id": SELF}, "issue": {"id": "issue-1"}}
+        event = self.remote.session_event("created", "issue-1", session, creator=None)
+        event["agentSession"].pop("creatorId")
+        self.assertTrue(self.bridge.handle_webhook(event))
+        self.bridge.flush()
+        self.assertEqual(self.bridge.store.get("issue-1")["owner_ref"], session)
+        self.gh.graphql_refused = True
+        self.assertTrue(self.native("complete_task", task, summary=SUMMARY, expected_run_id=run))
+        self.ticks()
+        self.assertEqual(self.state(), "In Review")
+        self.assertIsNotNone(self.bridge.store.acceptance_recheck("issue-1", task))
+        return task
+
+    def verifying(self):
+        return [a for a in self.remote.activities
+                if a.get("issueId") == "issue-1" and a["content"].get("action") == "Verifying"]
+
+    def keepalive_pass(self):
+        """Half an hour on: the recheck pump, then the full recheck pass that owns keepalives."""
+        self.ticks(1, after=30 * 60)
+        self.bridge.recheck(force=True)
+        self.bridge.flush()
+
+    def test_merged_pr_whose_checks_cannot_be_read_stops_verifying(self):
+        task = self.finish_in_session()
+        self.keepalive_pass()
+        self.assertIsNone(self.bridge.store.acceptance_recheck("issue-1", task))
+        for _ in range(4):
+            self.keepalive_pass()
+        self.assertEqual(self.verifying(), [])
+        merged = [body for body in self.said() if "was merged" in body]
+        self.assertEqual(len(merged), 1, self.said())
+        self.assertIn(PR, merged[0])
+        # Settled for good: no further GitHub reads, and no Blocked at the 7-day cap.
+        calls = len(self.gh.calls)
+        self.ticks(3, after=8 * 86400)
+        self.assertEqual(len(self.gh.calls), calls)
+        self.assertEqual(self.state(), "In Review")
+        self.assertFalse(any("could not be confirmed within 7 days" in body for body in self.said()))
+        self.assertEqual(self.failed(), [])
+
+    def test_open_pr_whose_checks_cannot_be_read_still_says_verifying(self):
+        self.gh.pr_state, self.gh.merged = "open", False
+        task = self.finish_in_session()
+        self.keepalive_pass()
+        self.assertEqual(self.state(), "In Review")
+        self.assertIsNotNone(self.bridge.store.acceptance_recheck("issue-1", task))
+        self.assertEqual(len(self.verifying()), 1)
+        self.assertFalse(any("was merged" in body for body in self.said()))
+
+    def test_issue_closed_by_a_person_settles_the_wait(self):
+        for state, merged in (("Done", False), ("Canceled", False), ("Done", True)):
+            with self.subTest(state=state, merged=merged):
+                self.setUp()
+                self.gh.pr_state, self.gh.merged = ("closed", True) if merged else ("open", False)
+                task = self.finish_in_session()
+                self.clock.now = max(self.clock.now, time.time()) + 5
+                self.set_state(state)
+                writes = len(self.mutations())
+                self.keepalive_pass()
+                self.assertIsNone(self.bridge.store.acceptance_recheck("issue-1", task))
+                self.assertEqual(self.verifying(), [])
+                calls = len(self.gh.calls)
+                for _ in range(3):
+                    self.keepalive_pass()
+                self.ticks(3, after=8 * 86400)
+                self.assertEqual(len(self.gh.calls), calls)
+                self.assertEqual((self.state(), len(self.mutations())), (state, writes))
+                self.assertEqual(self.verifying(), [])
 
     def test_a_wait_that_cannot_write_is_settled_at_the_cap(self):
         # A recheck that keeps ending as effect_unresolved still stops after 7 days.

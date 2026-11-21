@@ -129,7 +129,7 @@ REASONS = frozenset({
     "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias", "alias_closed",
     # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)
     "acceptance_unverified", "acceptance_verified", "acceptance_failed", "acceptance_expired",
-    "acceptance_head_moved",
+    "acceptance_head_moved", "acceptance_merged", "acceptance_issue_closed",
     # work core's open-PR guard parked, resumed once that PR merges or closes (_resume_pr_park)
     "pr_park_resolved", "pr_park_resumed", "pr_park_changed", "pr_park_no_pr", "pr_open", "pr_unreadable",
     "external_wait_resumed", "issue_open", "issue_unreadable", "delivery_pending", "wait_changed", "readback_matches",
