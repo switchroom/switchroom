@@ -132,6 +132,7 @@ REASONS = frozenset({
     "acceptance_head_moved",
     # work core's open-PR guard parked, resumed once that PR merges or closes (_resume_pr_park)
     "pr_park_resolved", "pr_park_resumed", "pr_park_changed", "pr_park_no_pr", "pr_open", "pr_unreadable",
+    "external_wait_resumed", "issue_open", "issue_unreadable", "delivery_pending", "wait_changed", "readback_matches",
 })
 _OPEN_REASON = re.compile(r"(?:native|graphql)_[a-z0-9_]{1,32}")
 
