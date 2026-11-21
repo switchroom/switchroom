@@ -639,7 +639,18 @@ of exactly that park, decided once per park; the PR is asked about on a persiste
 (2 minutes doubling to an hour, taken before asking). An open PR, GitHub refusing or not
 answering, or any newer event on the task leaves it parked; core's own release after 24 hours
 is not followed by another unblock. People's blocks, Stops and handoff pauses are never
-touched. Done comes only from
+touched.
+
+A worker's `kanban_block` of `kind: dependency` on work that is not a native parent (core re-kinds
+it to `needs_input` with `requested_kind: dependency`) shows as "Waiting for a dependency ... Blocked
+on LIFE-646" when its reason names Linear issue keys or carries one `Delivery gate: <plugin>/<file>
+contains <text>` line (`waits.py`), never as "Waiting on you". Every five minutes the plugin reads
+the named issues (read-only) and checks the gate against the mounted plugin files; once every issue
+is Done or Canceled and every gate holds it makes one guarded core unblock of exactly that block,
+decided once per block. A newer event on the task, an unreadable issue or a dependency block naming
+nothing checkable leaves it blocked. A delegate write held as uncertain is settled as applied when a
+fresh read of the issue shows the delegate it intended (the operator's `resolve ... applied`, with
+that readback as evidence). Done comes only from
 verified completion. A PR named as evidence is verified by core's exact-head required-check
 verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
 token without `checks:read`), the same requirements are proved from exact-head GitHub Actions
