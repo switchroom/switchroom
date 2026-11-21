@@ -157,6 +157,9 @@ FIELDS: dict[str, re.Pattern | None] = {  # None means integer
     "recheck_s": None, "oldest_pending_s": None, "max_tick_ms": None, "waited_s": None,
     # Slowest tick parts (own work, Linear requests, blocked on another holder) and most requests in one tick.
     "max_tick_local_ms": None, "max_tick_api_ms": None, "max_tick_wait_ms": None, "max_tick_api_calls": None,
+    # The part of the local time this thread was actually running; the rest of local is off-CPU
+    # (waiting for the interpreter lock or for disk).
+    "max_tick_local_cpu_ms": None,
     # Comma-separated field names (create readback differences), never field values.
     "fields": re.compile(r"[a-z][a-z_]{0,23}(?:,[a-z][a-z_]{0,23}){0,7}"),
 }
@@ -181,7 +184,8 @@ SUMMARY_COUNTERS = ("events", "status_q", "delegate_q", "sent", "refused", "skip
 # Routine background work (applied comments and keepalives, heartbeats, the requests they make) is
 # shown but never triggers a summary on its own, so steadily running work stays near zero lines per hour.
 SUMMARY_TRIGGERS = frozenset(SUMMARY_COUNTERS) - {"content", "minor", "api_calls"}
-TICK_MAXIMA = ("max_tick_ms", "max_tick_local_ms", "max_tick_api_ms", "max_tick_wait_ms", "max_tick_api_calls")
+TICK_MAXIMA = ("max_tick_ms", "max_tick_local_ms", "max_tick_api_ms", "max_tick_wait_ms", "max_tick_api_calls",
+               "max_tick_local_cpu_ms")
 
 
 def _now() -> float:
@@ -190,6 +194,10 @@ def _now() -> float:
 
 def _wall() -> float:
     return time.time()
+
+
+def _cpu() -> float:
+    return time.thread_time()
 
 
 class _State:
@@ -569,18 +577,22 @@ def native_event(kind: Any, **fields: Any) -> None:
 #   the answer) and how many HTTP requests went out;
 # - wait: time blocked on a lock another thread or process held (a per-issue bridge lock, the
 #   reporting store's write lock), which is neither Linear nor this tick's own work;
-# - local: the rest, the tick's own work.
+# - local: the rest, the tick's own work. local_cpu is the part of it this thread spent running
+#   (thread CPU time outside api and wait); local minus local_cpu is time it was runnable or
+#   reading but not running: the interpreter lock held by other threads, or disk.
 # Other threads (chat tools) are not part of the tick and are not counted.
 
 def tick_begin() -> None:
-    _tls.tick_api = [0.0, 0, 0.0]  # seconds inside Linear requests, HTTP requests sent, seconds blocked
+    # seconds inside Linear requests, HTTP requests sent, seconds blocked, thread CPU inside both
+    _tls.tick_api = [0.0, 0, 0.0, 0.0]
+    _tls.tick_cpu = _cpu()
 
 
 @contextmanager
 def _timed(slot: int):
     depth = getattr(_tls, "api_depth", 0)
     _tls.api_depth = depth + 1
-    started = _now()
+    started, cpu = _now(), _cpu()
     try:
         yield
     finally:
@@ -588,6 +600,7 @@ def _timed(slot: int):
         tick = getattr(_tls, "tick_api", None)
         if depth == 0 and tick is not None:  # time inside an outer request is the request's
             tick[slot] += _now() - started
+            tick[3] += _cpu() - cpu
 
 
 def api_time():
@@ -610,15 +623,19 @@ def api_sent() -> None:
 def tick_done(started: float, gauges: Callable[[], dict[str, Any]] | None = None) -> None:
     """End of one reporting tick: at most one summary per 60 s when something happened, one hourly health line."""
     now = _now()
-    api_s, calls, wait_s = getattr(_tls, "tick_api", None) or (0.0, 0, 0.0)
-    _tls.tick_api = None
+    api_s, calls, wait_s, timed_cpu_s = getattr(_tls, "tick_api", None) or (0.0, 0, 0.0, 0.0)
+    cpu_started = getattr(_tls, "tick_cpu", None)
+    cpu_s = 0.0 if cpu_started is None else _cpu() - cpu_started - timed_cpu_s
+    _tls.tick_api = _tls.tick_cpu = None
     with _state.lock:
         total_ms = int((now - started) * 1000)
         api_ms = max(0, min(total_ms, int(api_s * 1000)))
         wait_ms = max(0, min(total_ms - api_ms, int(wait_s * 1000)))
-        for name, value in (("max_tick_ms", total_ms), ("max_tick_local_ms", total_ms - api_ms - wait_ms),
+        local_ms = total_ms - api_ms - wait_ms
+        local_cpu_ms = max(0, min(local_ms, int(cpu_s * 1000)))
+        for name, value in (("max_tick_ms", total_ms), ("max_tick_local_ms", local_ms),
                             ("max_tick_api_ms", api_ms), ("max_tick_wait_ms", wait_ms),
-                            ("max_tick_api_calls", calls)):
+                            ("max_tick_api_calls", calls), ("max_tick_local_cpu_ms", local_cpu_ms)):
             _state.maxima[name] = max(_state.maxima[name], value)
         if calls:
             _state.counters["api_calls"] = _state.counters.get("api_calls", 0) + calls

@@ -709,7 +709,9 @@ per hour. Under load it writes one `reconcile.summary` line per minute, and only
 happened. The summary splits tick time: `max_tick_ms` is the slowest tick, `max_tick_api_ms`
 the most time one tick spent inside Linear requests (request lock, credentials, HTTP),
 `max_tick_wait_ms` the most it spent blocked on a per-issue lock or the store's write lock held
-by another thread or process, `max_tick_local_ms` the most of its own work, and
+by another thread or process, `max_tick_local_ms` the most of its own work,
+`max_tick_local_cpu_ms` the most of that own work the thread was actually running (the rest is
+off-CPU: waiting for the interpreter lock other gateway threads hold, or for disk), and
 `max_tick_api_calls` / `n_api_calls` the most HTTP requests in one tick and the total. Chat-tool
 requests on other threads are not counted. A WARNING repeats at most once per 15 minutes per issue and reason, and the next one
 carries `suppressed=N`. A refusal that is re-evaluated repeats at most once per hour. Each

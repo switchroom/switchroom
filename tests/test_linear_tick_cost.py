@@ -187,6 +187,106 @@ class HoldMemoTests(unittest.TestCase):
                 self.assertIn(f"outbox_payload_{field.split('_')[0]}", plan)
 
 
+class StoreConnectionTests(unittest.TestCase):
+    """The store reuses one connection per thread, and a transaction still leaves no lock behind."""
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.path = Path(temp.name) / "state.db"
+        self.store = Store(self.path)
+        self.other = sqlite3.connect(self.path, isolation_level=None, timeout=0, check_same_thread=False)
+        self.addCleanup(self.other.close)
+        self.addCleanup(self.store._drop_thread_connection)
+
+    def unlocked(self) -> bool:
+        """Another process can take the write lock right now, without waiting."""
+        try:
+            self.other.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError:
+            return False
+        self.other.execute("COMMIT")
+        return True
+
+    def seed(self, rows: int = 50) -> None:
+        with self.store._tx() as db:
+            db.executemany("INSERT INTO metadata(key, value) VALUES (?, '1')", [(f"k{n}",) for n in range(rows)])
+
+    def test_transactions_on_one_thread_share_a_connection(self):
+        with self.store._tx() as first:
+            pass
+        with self.store._tx() as second:
+            pass
+        self.assertIs(first, second)
+        self.assertIsNone(getattr(self.store._local, "db", None))
+        self.assertTrue(self.unlocked())
+
+    def test_each_thread_has_its_own_connection(self):
+        with self.store._tx() as mine:
+            pass
+        theirs = []
+        def other_thread():
+            with self.store._tx() as db:
+                theirs.append(db)
+            self.store._drop_thread_connection()
+        worker = threading.Thread(target=other_thread)
+        worker.start()
+        worker.join(5)
+        self.assertEqual(len(theirs), 1)
+        self.assertIsNot(theirs[0], mine)
+
+    def test_a_part_read_cursor_holds_no_lock_after_its_transaction(self):
+        self.seed()
+        with self.store._tx() as db:
+            cursor = db.execute("SELECT key FROM metadata")
+            cursor.fetchone()  # left part-read, and still referenced below
+        self.assertTrue(self.unlocked())
+        with self.assertRaises(sqlite3.ProgrammingError):
+            cursor.fetchone()  # as with a closed connection, a cursor never outlives its transaction
+
+    def test_a_part_read_generator_holds_no_lock_after_its_transaction(self):
+        self.seed()
+        def keys():
+            with self.store._tx() as db:
+                rows = db.execute("SELECT key FROM metadata")
+            yield from rows
+        reader = keys()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            next(reader)
+        self.assertTrue(self.unlocked())
+
+    def test_a_failed_transaction_rolls_back_and_reconnects(self):
+        with self.store._tx() as before:
+            pass
+        with self.assertRaises(RuntimeError):
+            with self.store._tx() as db:
+                db.execute("INSERT INTO metadata(key, value) VALUES ('lost', '1')")
+                raise RuntimeError("boom")
+        self.assertTrue(self.unlocked())
+        with self.store._tx() as after:
+            self.assertIsNone(after.execute("SELECT 1 FROM metadata WHERE key='lost'").fetchone())
+        self.assertIsNot(after, before)
+
+    def test_a_replaced_database_file_gets_a_new_connection(self):
+        with self.store._tx() as before:
+            before.execute("INSERT INTO metadata(key, value) VALUES ('old', '1')")
+        replacement = self.path.with_name("restored.db")
+        with closing(sqlite3.connect(self.path)) as source, closing(sqlite3.connect(replacement)) as target:
+            source.backup(target)
+            target.execute("INSERT INTO metadata(key, value) VALUES ('restored', '1')")
+            target.commit()
+        replacement.replace(self.path)  # an operator restores a backup over the live file
+        with self.store._tx() as after:
+            self.assertIsNotNone(after.execute("SELECT 1 FROM metadata WHERE key='restored'").fetchone())
+        self.assertIsNot(after, before)
+
+    def test_writes_from_another_process_are_seen_on_the_reused_connection(self):
+        with self.store._tx() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM metadata WHERE key='theirs'").fetchone())
+        self.other.execute("INSERT INTO metadata(key, value) VALUES ('theirs', '1')")
+        with self.store._tx() as db:
+            self.assertIsNotNone(db.execute("SELECT 1 FROM metadata WHERE key='theirs'").fetchone())
+
+
 class BusyListenerTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()

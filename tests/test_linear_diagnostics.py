@@ -60,7 +60,8 @@ class DiagCase(unittest.TestCase):
         diag.reset()
         self.now = [1000.0]
         self.wall = [1_900_000_000.0]
-        for name, source in (("_now", self.now), ("_wall", self.wall)):
+        self.cpu = [50.0]  # this thread's CPU time
+        for name, source in (("_now", self.now), ("_wall", self.wall), ("_cpu", self.cpu)):
             patcher = patch.object(diag, name, lambda source=source: source[0])
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -349,6 +350,36 @@ class TickTimingTests(DiagCase):
         values = self.summary()
         self.assertEqual((values["max_tick_ms"], values["max_tick_api_ms"], values["max_tick_local_ms"],
                           values["max_tick_api_calls"]), (8750, 8000, 750, 2))
+
+
+    def test_local_time_separates_running_from_waiting_to_run(self) -> None:
+        """local_cpu is the thread's own CPU outside requests; the rest of local is off-CPU."""
+        def transport(url, body, headers):
+            self.now[0] += 1.0   # a request: 1 s wall,
+            self.cpu[0] += 0.2   # 0.2 s of it decoding on this thread, which is the request's
+            return 200, {}, b'{"data": {"viewer": {"id": "v"}}}'
+        api = linear_api.LinearAPI(lambda: "token", transport=transport)
+        started = self.now[0]
+        diag.tick_begin()
+        self.now[0] += 1.0
+        self.cpu[0] += 0.5       # own work actually running
+        api.graphql("query Viewer { viewer { id } }")
+        self.now[0] += 2.0       # runnable but not running: another thread held the interpreter
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_ms"], values["max_tick_api_ms"], values["max_tick_local_ms"],
+                          values["max_tick_local_cpu_ms"]), (4000, 1000, 3000, 500))
+
+    def test_local_cpu_never_exceeds_local_time(self) -> None:
+        started = self.now[0]
+        diag.tick_begin()
+        self.now[0] += 0.5
+        self.cpu[0] += 0.75       # a clock skew between the two timers is clamped, never reported as more
+        diag.tick_done(started)
+        self.flush_summary()
+        values = self.summary()
+        self.assertEqual((values["max_tick_local_ms"], values["max_tick_local_cpu_ms"]), (500, 500))
 
 
 class DetailSettingTests(DiagCase):

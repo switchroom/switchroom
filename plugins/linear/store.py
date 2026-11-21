@@ -5,11 +5,13 @@ The database records reporting and uncertain delivery. It never grants execution
 from __future__ import annotations
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from collections import Counter
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -128,6 +130,32 @@ def advisory(row: dict[str, Any]) -> bool:
                                               payload.get("write_started") is not False)))
 
 
+class _StoreConnection(sqlite3.Connection):
+    """A reused store connection that closes every cursor a transaction opened when it ends.
+
+    A cursor left part-read would otherwise keep a shared lock on the file after COMMIT and
+    block every other writer; closing them gives the same guarantee closing the connection did
+    (a cursor used after its transaction fails).
+    """
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._cursors: weakref.WeakSet = weakref.WeakSet()
+    def cursor(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        cursor = super().cursor(*args, **kwargs)
+        self._cursors.add(cursor)
+        return cursor
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        return self.cursor().execute(sql, parameters)
+    def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
+        return self.cursor().executemany(sql, parameters)
+    def executescript(self, script: str, /) -> sqlite3.Cursor:
+        return self.cursor().executescript(script)
+    def close_cursors(self) -> None:
+        for cursor in list(self._cursors):
+            cursor.close()
+        self._cursors.clear()
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -169,8 +197,8 @@ class Store:
         if active is not None:
             yield active
             return
-        with closing(sqlite3.connect(self.path, timeout=90, isolation_level=None)) as db:
-            db.row_factory = sqlite3.Row
+        db = self._thread_connection()
+        try:
             with diag.wait_time():  # blocks while another thread or process holds the write lock
                 db.execute("BEGIN IMMEDIATE")
             self._local.db = db
@@ -182,6 +210,44 @@ class Store:
                 raise
             finally:
                 self._local.db = None
+                db.close_cursors()
+        except BaseException:
+            self._drop_thread_connection()  # never reuse a connection whose state is in doubt
+            raise
+    def _thread_connection(self) -> sqlite3.Connection:
+        """This thread's connection to the store, reused across transactions.
+
+        Opening a connection re-reads and parses the schema; an idle reporting tick runs about
+        1,500 short transactions, so a fresh connection each time was most of its own CPU. The
+        connection is used only by its thread and only between BEGIN and COMMIT/ROLLBACK, so it
+        holds no lock between transactions, and SQLite revalidates its cache at every BEGIN. A
+        replaced or removed database file gets a new connection.
+        """
+        cached = getattr(self._local, "conn", None)
+        try:
+            stat = os.stat(self.path)
+            identity = (stat.st_dev, stat.st_ino)
+        except OSError:
+            identity = None
+        if cached is not None and identity is not None and cached[1] == identity:
+            return cached[0]
+        self._drop_thread_connection()
+        db = sqlite3.connect(self.path, timeout=90, isolation_level=None, factory=_StoreConnection)
+        db.row_factory = sqlite3.Row
+        try:
+            stat = os.stat(self.path)
+            self._local.conn = (db, (stat.st_dev, stat.st_ino))
+        except OSError:
+            self._local.conn = (db, None)  # never matches, so the next transaction reconnects
+        return db
+    def _drop_thread_connection(self) -> None:
+        cached = getattr(self._local, "conn", None)
+        self._local.conn = None
+        if cached is not None:
+            try:
+                cached[0].close()
+            except sqlite3.Error:
+                pass
     @staticmethod
     def unlinked_content(kind: str, payload: dict[str, Any]) -> bool:
         """An ordinary content request carries no retained execution identity."""
