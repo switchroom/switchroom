@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import ipaddress
 import json
 import os
-import shutil
 import signal
 import socketserver
 import subprocess
@@ -75,6 +75,29 @@ def check_install(lock_path: Path, server: Path) -> dict:
     pkg = json.loads((server / "node_modules" / "camoufox" / "package.json").read_text())
     return {"camoufox": f"{version['version']}-{version['build']}", "camoufox_npm": pkg["version"],
             "attestation": provenance["attestation"]}
+
+
+def listening_addresses(port: int) -> set[str]:
+    """Local addresses with a TCP listener on `port`, read from /proc (no iproute2 needed)."""
+    found: set[str] = set()
+    for table, width in (("/proc/net/tcp", 8), ("/proc/net/tcp6", 32)):
+        try:
+            rows = Path(table).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            local, state = fields[1], fields[3]
+            address, port_hex = local.split(":")
+            if state != "0A" or int(port_hex, 16) != port:  # 0A = LISTEN
+                continue
+            raw = bytes.fromhex(address)
+            if width == 8:
+                found.add(".".join(str(b) for b in raw[::-1]))
+            else:
+                words = [raw[i:i + 4][::-1] for i in range(0, 16, 4)]
+                found.add(str(ipaddress.IPv6Address(b"".join(words))))
+    return found
 
 
 class _Page(http.server.BaseHTTPRequestHandler):
@@ -153,9 +176,10 @@ def main() -> int:
             fail("an unauthenticated request was accepted")
         except urllib.error.HTTPError as exc:
             summary["unauthenticated_status"] = exc.code
-        ss = subprocess.run(["ss", "-ltnH"], capture_output=True, text=True).stdout if shutil.which("ss") else ""
-        if ss and ":19377" in ss and "127.0.0.1:19377" not in ss:
-            fail(f"camofox-browser is not bound to loopback only: {ss}")
+        listeners = listening_addresses(19377)
+        if listeners != {"127.0.0.1"}:
+            fail(f"camofox-browser must listen on 127.0.0.1 only, found: {sorted(listeners)}")
+        summary["listen"] = sorted(listeners)
 
         started = time.monotonic()
         _, raw = request(base + "/tabs", "POST", {"userId": "smoke", "sessionKey": "smoke", "url": page},

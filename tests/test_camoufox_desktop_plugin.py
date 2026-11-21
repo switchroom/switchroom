@@ -206,6 +206,16 @@ class PluginTests(unittest.TestCase):
         with mock.patch.object(self.plugin, "_checkpoint_async"):
             self.assertIn("context", self.plugin.pre_llm_call(session_id="s2"))
 
+    def test_a_slow_desktop_start_does_not_hold_the_hook_past_its_bound(self):
+        release = __import__("threading").Event()
+        self.runtime.ensure_started_for_tool = lambda: release.wait(10)
+        self.plugin.DESKTOP_START_WAIT_SECONDS = 0.2
+        started = __import__("time").monotonic()
+        self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))
+        self.assertLess(__import__("time").monotonic() - started, 2)
+        self.assertEqual(self.runtime.touched, 1)
+        release.set()
+
     def test_a_broken_runtime_never_takes_the_browser_away(self):
         self.runtime.ensure_started_for_tool = mock.Mock(side_effect=RuntimeError("no display"))
         self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))

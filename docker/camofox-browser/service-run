@@ -14,20 +14,33 @@ state=${CAMOFOX_STATE_DIR:-$home_dir/camofox-browser}
 desktop_env=$home_dir/bot-desktop/env
 install_dir=${CAMOFOX_SERVER_DIR:-/opt/camofox-browser}
 
+# s6 restarts a failed run at once; an unusable state directory (a read-only or not-yet-owned
+# volume) would otherwise spin and flood the log, so wait before giving up.
+backoff_exit() {
+  echo "camofox-browser: $1; retrying in 30 s" >&2
+  sleep 30
+  exit 1
+}
+
 umask 077
-mkdir -p "$state/profiles" "$state/cookies" "$state/uploads" "$state/traces" "$state/home"
-chmod 0700 "$state"
+mkdir -p "$state/profiles" "$state/cookies" "$state/uploads" "$state/traces" "$state/home" \
+  || backoff_exit "cannot create $state"
+chmod 0700 "$state" || backoff_exit "cannot secure $state"
 
 key=$state/access-key
 if [ ! -s "$key" ]; then
-  tmp=$(mktemp "$state/.access-key.XXXXXX")
+  tmp=$(mktemp "$state/.access-key.XXXXXX") || backoff_exit "cannot write in $state"
   od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$tmp"
   printf '\n' >> "$tmp"
-  ln "$tmp" "$key" 2>/dev/null || true
-  rm -f "$tmp"
+  if [ -e "$key" ] && [ ! -s "$key" ]; then
+    mv -f "$tmp" "$key"  # an empty key left by a crash or full disk: replace it
+  else
+    ln "$tmp" "$key" 2>/dev/null || true  # first writer wins against the plugin
+    rm -f "$tmp"
+  fi
 fi
 access_key=$(tr -d '[:space:]' < "$key")
-[ "${#access_key}" -ge 32 ] || { echo "camofox-browser: access key at $key is too short" >&2; exit 1; }
+[ "${#access_key}" -ge 32 ] || backoff_exit "access key at $key is too short"
 
 published_display() {
   [ -r "$desktop_env" ] || return 0
