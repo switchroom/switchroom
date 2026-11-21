@@ -77,10 +77,13 @@ def check_install(lock_path: Path, server: Path) -> dict:
             "attestation": provenance["attestation"]}
 
 
-def listening_addresses(port: int) -> set[str]:
+TCP_TABLES = (("/proc/net/tcp", 8), ("/proc/net/tcp6", 32))
+
+
+def listening_addresses(port: int, tables: tuple[tuple[str, int], ...] = TCP_TABLES) -> set[str]:
     """Local addresses with a TCP listener on `port`, read from /proc (no iproute2 needed)."""
     found: set[str] = set()
-    for table, width in (("/proc/net/tcp", 8), ("/proc/net/tcp6", 32)):
+    for table, width in tables:
         try:
             rows = Path(table).read_text().splitlines()[1:]
         except OSError:

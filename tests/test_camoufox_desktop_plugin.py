@@ -128,7 +128,8 @@ class PluginTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home),
-                                                "CAMOFOX_URL": "http://127.0.0.1:9377"}, clear=False)
+                                                "CAMOFOX_URL": "http://127.0.0.1:9377",
+                                                "CAMOFOX_CHECKPOINT_SECONDS": "0"}, clear=False)
         self.env.start()
         for name in ("CAMOFOX_API_KEY", "CAMOFOX_USER_ID"):
             os.environ.pop(name, None)
@@ -221,6 +222,119 @@ class PluginTests(unittest.TestCase):
         self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))
         self.lease.take_over()
         self.assertEqual(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1")["action"], "block")
+
+    def test_an_unreadable_lease_fails_closed(self):
+        self.lease.assert_agent_may_act = mock.Mock(side_effect=OSError("lease.json: permission denied"))
+        blocked = self.plugin.pre_tool_call("browser_click", {"ref": "e1"}, session_id="s1")
+        self.assertEqual(blocked["action"], "block")
+        message = json.loads(blocked["message"])
+        self.assertEqual(message["code"], "screen_control_unknown")
+        self.assertIn("browser_exec", message["error"])
+        self.assertEqual(self.runtime.touched, 0)
+        self.assertIsNone(self.plugin.pre_tool_call("terminal", {"command": "ls"}, session_id="s1"))
+
+    def test_no_bot_desktop_support_means_no_fence(self):
+        with mock.patch.dict(sys.modules, {"tools.bot_desktop": None}):
+            self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))
+
+    def test_a_key_unreadable_at_register_is_picked_up_on_the_next_call(self):
+        key_file = self.home / "camofox-browser" / "access-key"
+        key_file.parent.mkdir(parents=True)
+        key_file.write_text("short\n")
+        self.plugin.configure_environment(self.home)
+        self.assertNotIn("CAMOFOX_API_KEY", os.environ)
+        key_file.write_text("r" * 64 + "\n")  # the service replaced the unusable key
+        self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))
+        self.assertEqual(os.environ["CAMOFOX_API_KEY"], "r" * 64)
+
+    def test_after_starting_the_screen_the_hook_waits_for_the_service(self):
+        def start():
+            self.runtime.env = {"DISPLAY": ":20"}
+        self.runtime.ensure_started_for_tool = start
+        answers = iter([False, False, True])
+        with mock.patch.object(self.plugin.camoufox_local.Client, "healthy", lambda _self: next(answers)), \
+                mock.patch.object(self.plugin.time, "sleep"):
+            self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))
+        self.assertIsNone(next(answers, None))  # all three answers consumed
+        # Screen already up: no health probe at all.
+        with mock.patch.object(self.plugin.camoufox_local.Client, "healthy", side_effect=AssertionError):
+            self.assertIsNone(self.plugin.pre_tool_call("browser_navigate", {}, session_id="s1"))
+
+    def test_the_service_wait_is_bounded(self):
+        self.runtime.env = {"DISPLAY": ":20"}
+        with mock.patch.object(self.plugin.camoufox_local.Client, "healthy", return_value=False):
+            started = __import__("time").monotonic()
+            self.assertFalse(self.plugin._wait_for_service(started + 0.6))
+            self.assertLess(__import__("time").monotonic() - started, 3)
+
+
+class PeriodicCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.env = mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home), "CAMOFOX_URL": "http://127.0.0.1:9377",
+                                                "CAMOFOX_API_KEY": "k" * 64, "CAMOFOX_USER_ID": "ops-main"})
+        self.env.start()
+        self.plugin, self.lease, self.runtime, self.patcher = load_plugin(self.home)
+        self.activity = self.home / "bot-desktop" / "activity"
+        self.activity.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_due_for_two_intervals_after_the_last_use(self):
+        due = self.plugin.checkpoint_due
+        self.assertFalse(due(None, 1000.0, 300.0))
+        self.assertTrue(due(1000.0, 1000.0, 300.0))
+        self.assertTrue(due(1000.0, 1600.0, 300.0))
+        self.assertFalse(due(1000.0, 1601.0, 300.0))
+
+    def test_a_tick_checkpoints_only_a_recently_used_screen(self):
+        tick = self.plugin.periodic_checkpoint_once
+        with mock.patch.object(self.plugin.camoufox_local.Client, "checkpoint") as checkpoint:
+            self.assertEqual(tick(self.home), "screen_down")
+            self.runtime.env = {"DISPLAY": ":20"}
+            self.assertEqual(tick(self.home), "idle")  # never used
+            self.activity.write_text("")
+            self.assertEqual(tick(self.home), "checkpointed")
+            checkpoint.assert_called_once_with("ops-main")
+            stamp = self.activity.stat().st_mtime
+            self.assertEqual(tick(self.home, now=stamp + 3 * self.plugin.CHECKPOINT_SECONDS), "idle")
+            self.assertEqual(checkpoint.call_count, 1)
+
+    def test_no_open_session_is_not_an_error(self):
+        import urllib.error
+        self.runtime.env = {"DISPLAY": ":20"}
+        self.activity.write_text("")
+        gone = urllib.error.HTTPError("u", 404, "no session", None, None)  # type: ignore[arg-type]
+        with mock.patch.object(self.plugin.camoufox_local.Client, "checkpoint", side_effect=gone):
+            self.assertEqual(self.plugin.periodic_checkpoint_once(self.home), "no_session")
+
+    def test_one_checkpointer_per_profile(self):
+        os.environ["CAMOFOX_CHECKPOINT_SECONDS"] = "3600"
+        threads = []
+        with mock.patch.object(self.plugin.threading, "Thread") as thread:
+            thread.side_effect = lambda **kw: threads.append(kw) or mock.Mock()
+            self.plugin._start_checkpointer(self.home)
+            second, _, _, patcher = load_plugin(self.home)  # another process of the profile (own lock fd)
+            try:
+                with mock.patch.object(second.threading, "Thread", side_effect=AssertionError("second")):
+                    second._start_checkpointer(self.home)
+            finally:
+                patcher.stop()  # before tearDown's, so sys.modules unwinds in order
+            self.plugin._start_checkpointer(self.home)  # and never twice in one process
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["name"], "camoufox-checkpointer")
+        lock = self.home / "camofox-browser" / ".checkpointer.lock"
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+
+    def test_zero_interval_turns_it_off(self):
+        os.environ["CAMOFOX_CHECKPOINT_SECONDS"] = "0"
+        with mock.patch.object(self.plugin.threading, "Thread", side_effect=AssertionError("started")):
+            self.plugin._start_checkpointer(self.home)
+        self.assertFalse((self.home / "camofox-browser" / ".checkpointer.lock").exists())
 
 
 class DockTests(unittest.TestCase):

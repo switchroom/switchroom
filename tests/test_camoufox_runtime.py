@@ -150,7 +150,19 @@ class ImageTests(unittest.TestCase):
 class ServiceRunKeyTests(unittest.TestCase):
     """Run the real service-run up to its exec, with a stand-in server that reports its env."""
 
-    def run_service(self, home: Path) -> dict:
+    # Report the environment, then stop the run the way s6 does (SIGTERM), after the trap is set.
+    REPORT_AND_STOP = '#!/bin/sh\nenv\nsleep 0.5\nkill -TERM "$PPID"\n'
+
+    def x_table(self, *displays: int) -> None:
+        """A /proc/net/unix stand-in with the given X displays bound (as Xvnc binds them)."""
+        rows = ["Num       RefCount Protocol Flags    Type St Inode Path"]
+        for n in displays:
+            rows.append(f"0000000000000000: 00000002 00000000 00010000 0001 01 1142{n} /tmp/.X11-unix/X{n}")
+            rows.append(f"0000000000000000: 00000003 00000000 00000000 0001 03 1141{n} @/tmp/.X11-unix/X{n}")
+        rows.append("0000000000000000: 00000002 00000000 00010000 0001 01 99 /run/dbus/system_bus_socket")
+        self.table.write_text("\n".join(rows) + "\n")
+
+    def start_service(self, home: Path, node: str = REPORT_AND_STOP, **extra: str):
         import os
         import subprocess
         import tempfile
@@ -158,23 +170,28 @@ class ServiceRunKeyTests(unittest.TestCase):
         (server / "server.js").write_text("")
         bindir = Path(tempfile.mkdtemp(dir=home.parent))
         fake = bindir / "node"
-        # Report the environment, then stop the run the way s6 does (SIGTERM), after the trap is set.
-        fake.write_text('#!/bin/sh\nenv\nsleep 0.5\nkill -TERM "$PPID"\n')
+        fake.write_text(node)
         fake.chmod(0o755)
-        env = {"PATH": f"{bindir}:/usr/bin:/bin", "HERMES_HOME": str(home), "CAMOFOX_SERVER_DIR": str(server)}
-        stdout, stderr = home.parent / "service.out", home.parent / "service.err"
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "HERMES_HOME": str(home), "CAMOFOX_SERVER_DIR": str(server),
+               "CAMOFOX_X_SOCKET_TABLE": str(self.table), **extra}
+        self.stdout, self.stderr = home.parent / "service.out", home.parent / "service.err"
         # Files, not pipes: the watch loop's background sleep outlives the run and would hold a pipe open.
-        with stdout.open("w") as out, stderr.open("w") as err:
-            code = subprocess.run(["bash", str(ROOT / "docker" / "camofox-browser" / "service-run")], env=env,
-                                  stdout=out, stderr=err, timeout=20).returncode
-        self.assertEqual(code, 0, stderr.read_text())
-        return dict(line.split("=", 1) for line in stdout.read_text().splitlines() if "=" in line)
+        with self.stdout.open("w") as out, self.stderr.open("w") as err:
+            return subprocess.Popen(["bash", str(ROOT / "docker" / "camofox-browser" / "service-run")], env=env,
+                                    stdout=out, stderr=err)
+
+    def run_service(self, home: Path, expect: int = 0, **extra: str) -> dict:
+        code = self.start_service(home, **extra).wait(timeout=20)
+        self.assertEqual(code, expect, self.stderr.read_text())
+        return dict(line.split("=", 1) for line in self.stdout.read_text().splitlines() if "=" in line)
 
     def setUp(self):
         import tempfile
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
         self.home.mkdir()
+        self.table = Path(self.tmp.name) / "net-unix"
+        self.x_table(20)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -199,12 +216,95 @@ class ServiceRunKeyTests(unittest.TestCase):
         self.assertRegex(env["CAMOFOX_ACCESS_KEY"], r"^[0-9a-f]{64}$")
         self.assertEqual((state / "access-key").read_text().strip(), env["CAMOFOX_ACCESS_KEY"])
 
+    def test_a_short_key_nothing_can_use_is_replaced(self):
+        state = self.home / "camofox-browser"
+        state.mkdir(mode=0o700)
+        (state / "access-key").write_text("abc\n")
+        env = self.run_service(self.home)
+        self.assertRegex(env["CAMOFOX_ACCESS_KEY"], r"^[0-9a-f]{64}$")
+        self.assertEqual((state / "access-key").read_text().strip(), env["CAMOFOX_ACCESS_KEY"])
+        self.assertIn("replacing an unusable access key", self.stderr.read_text())
+        self.assertEqual(sorted(p.name for p in state.glob(".access-key.*")), [])
+
+    def test_an_unusable_state_directory_backs_off_then_fails(self):
+        (self.home / "blocked").write_text("a file, not a directory")
+        env = self.run_service(self.home, expect=1, CAMOFOX_STATE_DIR=str(self.home / "blocked" / "state"),
+                               CAMOFOX_BACKOFF_SECONDS="0")
+        self.assertEqual(env, {})  # the server never started
+        self.assertIn("cannot create", self.stderr.read_text())
+        self.assertIn("retrying in 0 s", self.stderr.read_text())
+
     def test_the_published_display_is_used(self):
         desktop = self.home / "bot-desktop"
         desktop.mkdir()
         (desktop / "env").write_text("DISPLAY=:23\nXAUTHORITY=/x/auth\n")
+        self.x_table(23)
         env = self.run_service(self.home)
         self.assertEqual((env["DISPLAY"], env["XAUTHORITY"]), (":23", "/x/auth"))
+
+    def test_the_server_waits_for_the_screen_instead_of_retrying_a_dead_display(self):
+        import time
+        desktop = self.home / "bot-desktop"
+        desktop.mkdir()
+        # A stale env file (it survives a container recreate) is not a live screen.
+        (desktop / "env").write_text("DISPLAY=:20\n")
+        self.x_table()
+        service = self.start_service(self.home)
+        time.sleep(2.5)
+        self.assertIsNone(service.poll())
+        self.assertNotIn("CAMOFOX_ACCESS_KEY=", self.stdout.read_text())  # node not started
+        self.assertIn("waiting for the Bot Desktop (:20)", self.stderr.read_text())
+        # The screen comes up on another display: the server starts there.
+        (desktop / "env").write_text("DISPLAY=:21\nXAUTHORITY=/x/a21\n")
+        self.x_table(21)
+        self.assertEqual(service.wait(timeout=10), 0, self.stderr.read_text())
+        env = dict(line.split("=", 1) for line in self.stdout.read_text().splitlines() if "=" in line)
+        self.assertEqual((env["DISPLAY"], env["XAUTHORITY"]), (":21", "/x/a21"))
+
+    def test_a_waiting_service_stops_cleanly_on_sigterm(self):
+        import signal
+        import time
+        self.x_table()
+        service = self.start_service(self.home)
+        time.sleep(1.5)
+        service.send_signal(signal.SIGTERM)
+        self.assertEqual(service.wait(timeout=10), 0)
+
+    def test_the_server_is_stopped_when_the_screen_goes_away(self):
+        import time
+        marker = self.home.parent / "node-got-term"
+        node = f'#!/bin/sh\ntrap \'touch {marker}; exit 0\' TERM\nwhile :; do sleep 0.1; done\n'
+        service = self.start_service(self.home, node=node, CAMOFOX_WATCH_SECONDS="0.2")
+        time.sleep(1.0)
+        self.assertIsNone(service.poll())
+        self.x_table()  # Bot Desktop stopped (idle-stop): its X server is gone
+        self.assertEqual(service.wait(timeout=10), 0, self.stderr.read_text())
+        self.assertTrue(marker.exists(), "the server was not sent SIGTERM")
+        self.assertIn("Bot Desktop (:20) stopped", self.stderr.read_text())
+
+
+class SmokeHelperTests(unittest.TestCase):
+    def test_listening_addresses_reads_ipv4_and_ipv6_listeners_only(self):
+        import importlib.util
+        import tempfile
+        spec = importlib.util.spec_from_file_location("verify_camoufox_runtime",
+                                                      ROOT / "scripts" / "verify-camoufox-runtime.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            tcp, tcp6 = Path(tmp) / "tcp", Path(tmp) / "tcp6"
+            tcp.write_text(header
+                           + "   0: 0100007F:4BB1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 1\n"
+                           + "   1: 00000000:4BB1 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000 0 2\n"
+                           + "   2: 00000000:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 3\n")
+            tcp6.write_text(header + "   0: 00000000000000000000000001000000:4BB1 "
+                            "00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000"
+                            "  1000 0 4\n")
+            tables = ((str(tcp), 8), (str(tcp6), 32))
+            self.assertEqual(mod.listening_addresses(19377, tables), {"127.0.0.1", "::1"})
+            self.assertEqual(mod.listening_addresses(80, tables), {"0.0.0.0"})
+            self.assertEqual(mod.listening_addresses(19377, ((str(Path(tmp) / "missing"), 8),)), set())
 
 
 class VendoredPluginTests(unittest.TestCase):

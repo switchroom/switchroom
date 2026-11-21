@@ -4,21 +4,26 @@
 # One Node process on loopback, opening Camoufox headed on the profile's Bot Desktop. The browser
 # itself starts lazily on the first request, so the service costs ~40 MB until something browses.
 # DISPLAY/XAUTHORITY come from the screen's published env file, falling back to the display a
-# single-profile container's screen gets (:20); when the screen comes back on a different display
-# the service exits and s6 restarts it on the new one. SIGTERM is forwarded so camofox-browser
-# writes its cookie checkpoint before exiting.
+# single-profile container's screen gets (:20). The server runs only while that display's X server
+# is up: while the Bot Desktop is stopped (idle-stop, or not started yet after a container start)
+# this waits instead of letting the server retry a browser launch every 30 s against a dead display.
+# When the screen stops or comes back on a different display the service exits and s6 restarts it.
+# SIGTERM is forwarded so camofox-browser writes its cookie checkpoint before exiting.
 set -euo pipefail
 
 home_dir=${HERMES_HOME:-/opt/data}
 state=${CAMOFOX_STATE_DIR:-$home_dir/camofox-browser}
 desktop_env=$home_dir/bot-desktop/env
 install_dir=${CAMOFOX_SERVER_DIR:-/opt/camofox-browser}
+# The kernel's table of bound Unix sockets (tests point it at a fixture).
+x_socket_table=${CAMOFOX_X_SOCKET_TABLE:-/proc/net/unix}
+backoff_seconds=${CAMOFOX_BACKOFF_SECONDS:-30}
 
 # s6 restarts a failed run at once; an unusable state directory (a read-only or not-yet-owned
 # volume) would otherwise spin and flood the log, so wait before giving up.
 backoff_exit() {
-  echo "camofox-browser: $1; retrying in 30 s" >&2
-  sleep 30
+  echo "camofox-browser: $1; retrying in ${backoff_seconds} s" >&2
+  sleep "$backoff_seconds"
   exit 1
 }
 
@@ -28,12 +33,20 @@ mkdir -p "$state/profiles" "$state/cookies" "$state/uploads" "$state/traces" "$s
 chmod 0700 "$state" || backoff_exit "cannot secure $state"
 
 key=$state/access-key
-if [ ! -s "$key" ]; then
+key_usable() {
+  [ -s "$key" ] && [ "$(tr -d '[:space:]' < "$key" | wc -c)" -ge 32 ]
+}
+if ! key_usable; then
   tmp=$(mktemp "$state/.access-key.XXXXXX") || backoff_exit "cannot write in $state"
-  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$tmp"
-  printf '\n' >> "$tmp"
-  if [ -e "$key" ] && [ ! -s "$key" ]; then
-    mv -f "$tmp" "$key"  # an empty key left by a crash or full disk: replace it
+  if ! od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$tmp" || ! printf '\n' >> "$tmp"; then
+    rm -f "$tmp"
+    backoff_exit "cannot generate an access key"
+  fi
+  if [ -e "$key" ]; then
+    # An empty key left by a crash or a full disk, or a short one nothing can use (the plugin
+    # refuses keys under 32 characters too): replace it.
+    echo "camofox-browser: replacing an unusable access key" >&2
+    mv -f "$tmp" "$key"
   else
     ln "$tmp" "$key" 2>/dev/null || true  # first writer wins against the plugin
     rm -f "$tmp"
@@ -47,8 +60,30 @@ published_display() {
   sed -n 's/^DISPLAY=//p' "$desktop_env" | head -n1
 }
 
-display=$(published_display)
-display=${display:-${CAMOFOX_DISPLAY:-:20}}
+current_display() {
+  local d
+  d=$(published_display)
+  printf '%s' "${d:-${CAMOFOX_DISPLAY:-:20}}"
+}
+
+# A running X server keeps /tmp/.X11-unix/X<n> (and its abstract twin) bound for its whole life.
+# The env file alone is not proof: it outlives the screen across a container recreate.
+x_live() {
+  local n=${1#*:}
+  n=${n%%.*}
+  [ -n "$n" ] && grep -qE " @?/tmp/\.X11-unix/X${n}\$" "$x_socket_table" 2>/dev/null
+}
+
+trap 'exit 0' TERM INT
+display=$(current_display)
+if ! x_live "$display"; then
+  echo "camofox-browser: waiting for the Bot Desktop ($display) before starting" >&2
+  until x_live "$display"; do
+    sleep 1 & wait $! || true
+    display=$(current_display)
+  done
+fi
+
 xauth=$home_dir/bot-desktop/Xauthority
 if [ -r "$desktop_env" ]; then
   published_xauth=$(sed -n 's/^XAUTHORITY=//p' "$desktop_env" | head -n1)
@@ -91,10 +126,14 @@ stop() {
 trap stop TERM INT
 
 while kill -0 "$child" 2>/dev/null; do
-  sleep 15 & wait $! || true
+  sleep "${CAMOFOX_WATCH_SECONDS:-15}" & wait $! || true
   now=$(published_display)
   if [ -n "$now" ] && [ "$now" != "$display" ]; then
     echo "camofox-browser: Bot Desktop moved from $display to $now; restarting on the new display" >&2
+    stop
+  fi
+  if ! x_live "$display"; then
+    echo "camofox-browser: Bot Desktop ($display) stopped; waiting for it to return" >&2
     stop
   fi
 done

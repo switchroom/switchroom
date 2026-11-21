@@ -4,8 +4,9 @@ Standard library only. The Hermes plugin and the dock launcher (``bin/camoufox-o
 Xfce panel outside Hermes) both import it, so the agent, its crons and the human share one key and
 one Camofox ``userId``: whatever the human logs in to in the window, the agent's tools see.
 
-The image's s6 service (``docker/s6/camofox-browser``) creates the same key file the same way, so it
-does not matter which side starts first.
+The image's s6 service (``docker/s6-rc.d/camofox-browser``, which runs
+``docker/camofox-browser/service-run``) creates the same key file the same way, so it does not
+matter which side starts first. Only the service repairs an empty or short key; this side reads it.
 """
 from __future__ import annotations
 

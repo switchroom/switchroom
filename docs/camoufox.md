@@ -30,21 +30,29 @@ the apt layer. Everything fetched from outside Debian is pinned by digest.
   `<HERMES_HOME>/camofox-browser/access-key` (0600, created on first start by whichever side starts
   first). The `camoufox-desktop` plugin hands the same key to the `camofox` plugin.
 - Opens Camoufox headed (`CAMOFOX_INTERACTIVE=desktop`) on the Bot Desktop's display, read from
-  `<HERMES_HOME>/bot-desktop/env`, and restarts itself if the screen comes back on another display.
+  `<HERMES_HOME>/bot-desktop/env`. The server runs only while that display's X server is up: while
+  the screen is stopped (idle-stop, or not yet started after a container start) the service waits,
+  and it stops the server when the screen stops or comes back on another display. A camofox tool
+  call starts the screen and waits for the server. A REST client outside Hermes (a CLI, a cron
+  script) must start the screen first, or it gets connection refused.
 - No telemetry: crash reports, Sentry and Prometheus are off; the default addon is not downloaded.
 - Logins persist in `<HERMES_HOME>/camofox-browser/profiles`, on the profile volume, so they survive
   restarts and container recreates. camofox-browser writes them at a checkpoint: a graceful stop
-  (SIGTERM), a session close, or the hand-back checkpoint below. A `kill -9` or an out-of-memory
-  kill loses changes since the last checkpoint.
+  (SIGTERM), a session close, the hand-back checkpoint, and the plugin's periodic checkpoint
+  below. A `kill -9`, an out-of-memory kill or a Bot Desktop stop (the browser dies with its
+  display) loses changes since the last checkpoint.
 - Graceful stop needs time on both sides. Inside the container s6 waits up to 50 s
   (`S6_SERVICES_GRACETIME`) and the server gives itself 40 s. Outside it, Docker's default stop
   timeout is 10 s before SIGKILL, so give the agent service `stop_grace_period: 60s` or more (the
   example compose files do). With the default 10 s, logins since the last checkpoint can be lost.
 - If the state directory cannot be written (a read-only or not-yet-owned volume), the service waits
-  30 s before s6 retries it, instead of restarting every second.
+  30 s before s6 retries it, instead of restarting every second. An empty or short access key is
+  replaced on the next start; the plugin picks the new key up on the next tool call.
 - A session never expires on idleness and a quiet window stays open for 8 hours, because a human
-  may be using it. The browser itself starts on the first request and stops when no session is
-  left, so an idle service costs about 40 MB.
+  may be using it. The browser itself starts on the first request (about 4 s) and, because sessions
+  do not expire, runs until the Bot Desktop stops (`bot_desktop.idle_stop_minutes`). Measured: about
+  0.6 GB for the browser with a few light pages, plus about 0.2 GB per heavy news page, on top of
+  about 0.15 GB for Node and 0.16 GB for the desktop.
 
 ## The plugins
 
@@ -60,6 +68,11 @@ adds the Bot Desktop behaviour without patching it:
 - The fence is checked when each call starts. A human who takes over during a call that has already
   started sees that one call finish; the next one is refused.
 - The first turn after the human hands back is told so, and the cookies are checkpointed then.
+- While the screen is in use (its `activity` stamp is under two intervals old), the agent's session
+  is checkpointed every 5 minutes (`CAMOFOX_CHECKPOINT_SECONDS`, `0` turns it off), so idle-stop,
+  which comes long after the last use, does not lose a login. One process per profile does this.
+- If the lease cannot be read, the camofox tools are refused (`screen_control_unknown`) rather than
+  risk typing over a human; Chromium `browser_exec` still works.
 - A short system-prompt section steers the model: Camoufox first, Chromium for CDP-only jobs, and a
   CAPTCHA or challenge always goes to the human.
 - The dock gets a Camoufox icon. It opens or raises the agent's own session (the same Camofox
@@ -69,8 +82,23 @@ Both plugins are mounted by the overlay; the bare image enables neither.
 
 ## Known limits
 
-- A tab a human opens with Ctrl+T is not tracked by camofox-browser and is closed within a minute.
-  Use links from the agent's page or the dock icon.
-- The fingerprint is regenerated on every browser launch; cookies persist, the device fingerprint
-  does not.
-- Typing through `browser_type` fills fields at once; only cursor movement is humanised.
+Measured on a live agent after the first rollout:
+
+- A tab or window a human opens with Ctrl+T or Ctrl+N is outside the agent's cookie jar: it is a
+  separate, empty browser context that is not checkpointed, and the agent cannot see it. Logins
+  made there are lost. Use the dock icon, or links and popups from the agent's own pages (those are
+  tracked and share the agent's logins).
+- JavaScript dialogs (`alert`, `confirm`, `prompt`) are dismissed at once and never shown, even
+  when a human clicks: `confirm()` returns false. A site that needs a confirmation cannot be
+  completed in Camoufox; use Chromium `browser_exec` (`browser_dialog`).
+- The fingerprint (screen size, canvas, WebGL renderer) is regenerated on every browser launch,
+  so a site sees a different device after each Bot Desktop restart; cookies persist. The window is
+  also a few pixels wider than the reported screen under the Xfce frame.
+- `navigator.language` stays `en-US` while `Intl` follows the container locale (`en_AU.UTF-8`) and
+  time zone, an incoherence some bot checks look at.
+- Typing through `browser_type` fills fields at once; only cursor movement is humanised (a click
+  moves the pointer along a curved path for about half a second).
+- An interactive Cloudflare Turnstile widget waits at "Verify you are human"; that is the human's
+  step. A plain Cloudflare challenge page passed on its own in testing.
+- File chooser and downloads: a human can use the file picker in the window; the agent's tools
+  have no upload or download tool (the server has the routes).
