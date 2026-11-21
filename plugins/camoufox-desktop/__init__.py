@@ -139,10 +139,7 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         if not _is_fenced(tool_name, args):
             return None
         from tools.bot_desktop import lease, runtime
-        try:
-            runtime.ensure_started_for_tool()  # start the screen (auto_start) or stamp activity
-        except Exception as exc:  # noqa: BLE001 - the tool reports a missing display itself
-            logger.info("camoufox-desktop: desktop start skipped: %s", exc)
+        _start_desktop_bounded(runtime)
         try:
             lease.assert_agent_may_act()
         except lease.HumanHasControl as exc:
@@ -154,6 +151,26 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
     except Exception as exc:  # noqa: BLE001 - our bug must not take the browser away
         logger.warning("camoufox-desktop: pre_tool_call: %s", exc)
     return None
+
+
+# Core runs plugin hooks under plugins.hook_callback_timeout (30 s by default) and fails a tool call
+# closed when a hook overruns, so the screen start is waited on for at most this long; the start
+# keeps going in the background and the camofox tool waits for the browser itself.
+DESKTOP_START_WAIT_SECONDS = 15.0
+
+
+def _start_desktop_bounded(runtime: Any, wait: Optional[float] = None) -> None:
+    def run() -> None:
+        try:
+            runtime.ensure_started_for_tool()  # start the screen (auto_start) or stamp activity
+        except Exception as exc:  # noqa: BLE001 - the tool reports a missing display itself
+            logger.info("camoufox-desktop: desktop start skipped: %s", exc)
+
+    worker = threading.Thread(target=run, name="camoufox-desktop-start", daemon=True)
+    worker.start()
+    worker.join(DESKTOP_START_WAIT_SECONDS if wait is None else wait)
+    if worker.is_alive():
+        logger.info("camoufox-desktop: desktop still starting; not holding the tool call")
 
 
 def _mark_waiting(session_id: str) -> None:
