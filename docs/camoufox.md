@@ -20,6 +20,10 @@ The downstream patch (`release/camofox-browser/official-camoufox.patch`) moves c
 the browser it is stamped with. It is the same change offered upstream; drop it when camofox-browser
 ships it. There is no repository fork.
 
+Debian packages (the desktop, Chromium, fonts, runtime libraries) are not version-pinned: they come
+from the digest-pinned parent's Debian release and are covered by the image scans, like the rest of
+the apt layer. Everything fetched from outside Debian is pinned by digest.
+
 ## The service
 
 - Binds `127.0.0.1` only and requires the per-container access key in
@@ -30,8 +34,14 @@ ships it. There is no repository fork.
 - No telemetry: crash reports, Sentry and Prometheus are off; the default addon is not downloaded.
 - Logins persist in `<HERMES_HOME>/camofox-browser/profiles`, on the profile volume, so they survive
   restarts and container recreates. camofox-browser writes them at a checkpoint: a graceful stop
-  (SIGTERM; s6 waits up to 50 s), a session close, or the hand-back checkpoint below. A `kill -9`
-  or an out-of-memory kill loses changes since the last checkpoint.
+  (SIGTERM), a session close, or the hand-back checkpoint below. A `kill -9` or an out-of-memory
+  kill loses changes since the last checkpoint.
+- Graceful stop needs time on both sides. Inside the container s6 waits up to 50 s
+  (`S6_SERVICES_GRACETIME`) and the server gives itself 40 s. Outside it, Docker's default stop
+  timeout is 10 s before SIGKILL, so give the agent service `stop_grace_period: 60s` or more (the
+  example compose files do). With the default 10 s, logins since the last checkpoint can be lost.
+- If the state directory cannot be written (a read-only or not-yet-owned volume), the service waits
+  30 s before s6 retries it, instead of restarting every second.
 - A session never expires on idleness and a quiet window stays open for 8 hours, because a human
   may be using it. The browser itself starts on the first request and stops when no session is
   left, so an idle service costs about 40 MB.
@@ -44,7 +54,11 @@ adds the Bot Desktop behaviour without patching it:
 - While a human holds Take over, the camofox tools and `browser_vault` writes are refused, so the
   agent waits instead of typing over the human.
 - A camofox call starts the screen when it is down (with `bot_desktop.auto_start`) and counts as
-  desktop activity, so idle-stop does not close a window the agent is using.
+  desktop activity, so idle-stop does not close a window the agent is using. The hook waits at most
+  15 s for the screen (Hermes fails a tool call closed when a hook overruns its 30 s limit); a slower
+  start carries on in the background and the tool waits for the browser itself.
+- The fence is checked when each call starts. A human who takes over during a call that has already
+  started sees that one call finish; the next one is refused.
 - The first turn after the human hands back is told so, and the cookies are checkpointed then.
 - A short system-prompt section steers the model: Camoufox first, Chromium for CDP-only jobs, and a
   CAPTCHA or challenge always goes to the human.

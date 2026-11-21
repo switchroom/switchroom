@@ -131,6 +131,7 @@ class ImageTests(unittest.TestCase):
             "trap stop TERM INT",
             'kill -TERM "$child"',
             "unset ENABLE_VNC",
+            'backoff_exit "cannot create $state"',
         ):
             with self.subTest(token=token):
                 self.assertIn(token, SERVICE)
@@ -144,6 +145,66 @@ class ImageTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertGreaterEqual(WORKFLOW.count(token), 2)
         self.assertEqual(WORKFLOW.count("name: camoufox-smoke-${{ github.sha }}-${{ github.job }}"), 2)
+
+
+class ServiceRunKeyTests(unittest.TestCase):
+    """Run the real service-run up to its exec, with a stand-in server that reports its env."""
+
+    def run_service(self, home: Path) -> dict:
+        import os
+        import subprocess
+        import tempfile
+        server = Path(tempfile.mkdtemp(dir=home.parent))
+        (server / "server.js").write_text("")
+        bindir = Path(tempfile.mkdtemp(dir=home.parent))
+        fake = bindir / "node"
+        # Report the environment, then stop the run the way s6 does (SIGTERM), after the trap is set.
+        fake.write_text('#!/bin/sh\nenv\nsleep 0.5\nkill -TERM "$PPID"\n')
+        fake.chmod(0o755)
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "HERMES_HOME": str(home), "CAMOFOX_SERVER_DIR": str(server)}
+        stdout, stderr = home.parent / "service.out", home.parent / "service.err"
+        # Files, not pipes: the watch loop's background sleep outlives the run and would hold a pipe open.
+        with stdout.open("w") as out, stderr.open("w") as err:
+            code = subprocess.run(["bash", str(ROOT / "docker" / "camofox-browser" / "service-run")], env=env,
+                                  stdout=out, stderr=err, timeout=20).returncode
+        self.assertEqual(code, 0, stderr.read_text())
+        return dict(line.split("=", 1) for line in stdout.read_text().splitlines() if "=" in line)
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_first_start_creates_a_private_key_and_reuses_it(self):
+        env = self.run_service(self.home)
+        key = self.home / "camofox-browser" / "access-key"
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.home / "camofox-browser").stat().st_mode & 0o777, 0o700)
+        self.assertRegex(env["CAMOFOX_ACCESS_KEY"], r"^[0-9a-f]{64}$")
+        self.assertEqual(env["CAMOFOX_API_KEY"], env["CAMOFOX_ACCESS_KEY"])
+        self.assertEqual(env["CAMOFOX_BIND_HOST"], "127.0.0.1")
+        self.assertEqual(env["CAMOFOX_INTERACTIVE"], "desktop")
+        self.assertEqual(self.run_service(self.home)["CAMOFOX_ACCESS_KEY"], env["CAMOFOX_ACCESS_KEY"])
+        self.assertEqual(sorted(p.name for p in (self.home / "camofox-browser").glob(".access-key.*")), [])
+
+    def test_an_empty_key_left_by_a_crash_is_replaced(self):
+        state = self.home / "camofox-browser"
+        state.mkdir(mode=0o700)
+        (state / "access-key").write_text("")
+        env = self.run_service(self.home)
+        self.assertRegex(env["CAMOFOX_ACCESS_KEY"], r"^[0-9a-f]{64}$")
+        self.assertEqual((state / "access-key").read_text().strip(), env["CAMOFOX_ACCESS_KEY"])
+
+    def test_the_published_display_is_used(self):
+        desktop = self.home / "bot-desktop"
+        desktop.mkdir()
+        (desktop / "env").write_text("DISPLAY=:23\nXAUTHORITY=/x/auth\n")
+        env = self.run_service(self.home)
+        self.assertEqual((env["DISPLAY"], env["XAUTHORITY"]), (":23", "/x/auth"))
 
 
 class VendoredPluginTests(unittest.TestCase):
