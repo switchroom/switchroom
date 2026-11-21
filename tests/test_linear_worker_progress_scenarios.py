@@ -27,10 +27,9 @@ class WorkerProgressScenarios(unittest.TestCase):
         return claimed
 
     def projection(self, task):
-        from agent.display import build_status_phrase
         return {"worker_session_id": "kanbanCore-worker", "execution_generation": 1,
                 "admission_id": "worker-admission", "run_id": task.current_run_id,
-                "phrase": build_status_phrase("terminal", None)}
+                "phrase": "in the terminal"}
 
     def worker_rows(self):
         with self.bridge.store._tx() as db:
