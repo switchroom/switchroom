@@ -306,7 +306,10 @@ only its regular issue comment, with no repeated session thought. With a session
 Linear shows as a thread reply (an elicitation such as "Waiting on you", a response or an error)
 is only that activity, which keeps the comment's phase recheck; a session-only thought milestone
 (review, wait, dependency) is only the issue comment. The session keeps live steps, heartbeats,
-questions and lifecycle updates. A session's later question or closing pointer still waits for
+questions and lifecycle updates. A live step reads as plain words after Linear's "Working"
+(for example "Working in the terminal"); it names only the kind of tool, never an argument or a
+custom tool name. A worker's own `kanban_heartbeat` note stays on the session for ten minutes
+before a generic tool step may replace it, so workers send one per sub-step. A session's later question or closing pointer still waits for
 its unsettled checkpoint comment, as it waited for the session note. Retries do not create
 another comment or activity. A checkpoint captured before
 a session opens keeps its original issue-comment identity when the session adopts the work;

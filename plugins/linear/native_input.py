@@ -675,20 +675,50 @@ def question_publication_guard(payload):
         raise LinearError("Linear question has no supported Core request", retryable=False)
 
 
+# Linear shows an action activity as "<action> <parameter>", and every live step's action is
+# "Working". Core's status phrase ("is running…") is written to follow a bot's display name, so it
+# read "Working is running…". These read as plain words after "Working" and still name only the
+# kind of tool, never an argument preview or a custom tool name (HF-775).
+STEP_PARAMETERS = {
+    # web_extract and read_file share Core's phrase ("is reading…"), so they share one step.
+    "web_search": "on a web search", "web_extract": "on reading",
+    "browser_navigate": "in the browser", "browser_click": "in the browser", "browser_type": "in the browser",
+    "read_file": "on reading", "write_file": "on a file", "patch": "on a file", "search_files": "through files",
+    "terminal": "in the terminal", "execute_code": "on code",
+    "image_generate": "on an image", "video_generate": "on a video", "text_to_speech": "on audio",
+    "vision_analyze": "on an image", "session_search": "through past sessions",
+    "skill_view": "from a skill", "skills_list": "from a skill", "skill_manage": "on a skill",
+    "delegate_task": "with a helper", "cronjob_manage": "on a schedule", "clarify": "on a question",
+    "memory": "on memory", "todo_list": "on the task list",
+}
+STEP_FALLBACK = "on your request"
+# Earlier phrases already queued or frozen before an upgrade still deliver as written.
+LEGACY_STEP_FALLBACK = "Working on your request."
+
+
 def step_phrase(text):
-    """Emit only a known Core verb; never copy an argument preview or custom tool name."""
+    """Map a Core status phrase to a known plain step; never copy an argument preview or custom tool name."""
     from agent.display import build_status_phrase, tool_verb_connector
-    tools = ("web_search", "web_extract", "browser_navigate", "browser_click", "browser_type",
-             "read_file", "write_file", "patch", "search_files", "terminal", "execute_code",
-             "image_generate", "video_generate", "text_to_speech", "vision_analyze", "session_search",
-             "skill_view", "skills_list", "skill_manage", "delegate_task", "cronjob_manage", "clarify",
-             "memory", "todo_list")
-    for tool in tools:
-        brief = build_status_phrase(tool, None)
-        if brief and isinstance(text, str) and (text == brief or
-                text.startswith(brief.removesuffix("…") + tool_verb_connector(tool))):
-            return brief
-    return "Working on your request."
+    if not isinstance(text, str):
+        return STEP_FALLBACK
+    if text in STEP_PARAMETERS.values() or text == STEP_FALLBACK:
+        return text
+    briefs = [(tool, parameter, build_status_phrase(tool, None)) for tool, parameter in STEP_PARAMETERS.items()]
+    # Exact phrases first: "is reading skill…" must not fall to the shorter "is reading" prefix.
+    for _, parameter, brief in briefs:
+        if brief and text == brief:
+            return parameter
+    for tool, parameter, brief in briefs:
+        if brief and text.startswith(brief.removesuffix("…") + tool_verb_connector(tool)):
+            return parameter
+    return STEP_FALLBACK
+
+
+def legacy_step_phrase(text):
+    """True for a step phrase an earlier build queued: a bare Core verb phrase or the old fallback."""
+    from agent.display import build_status_phrase
+    return isinstance(text, str) and (text == LEGACY_STEP_FALLBACK or
+                                      text in {build_status_phrase(tool, None) for tool in STEP_PARAMETERS})
 
 
 def queue_reply(bridge, issue_id, session_id, message_id, body, *, kind=None, **options):
@@ -1449,7 +1479,7 @@ def create_adapter(config, running):
                     or key in self._step_tasks):
                 return
             with self._relay_lock:
-                phrase = self._step_phrases.get((*key, source)) or "Working on your request."
+                phrase = self._step_phrases.get((*key, source)) or STEP_FALLBACK
             now = time.monotonic()
             last = self._step_attempts.get(key)
             if last and (now - last[0] < 60 or

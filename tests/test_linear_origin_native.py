@@ -486,8 +486,7 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(step["worker_session_id"], self.sid)
         self.assertEqual(step["run_id"], task.current_run_id)
         self.assertEqual(step["execution_generation"], generation)
-        from agent.display import build_status_phrase
-        self.assertEqual(step["phrase"], build_status_phrase("terminal", None))
+        self.assertEqual(step["phrase"], "in the terminal")
         self.assertNotIn("SECRET_ARGUMENT_SENTINEL", json.dumps(step))
         self.assertTrue(any(method == "session.info" and fields.get("execution_only") is True
                             for method, fields in self.calls))

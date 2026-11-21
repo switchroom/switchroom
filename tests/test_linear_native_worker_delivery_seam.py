@@ -24,7 +24,6 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
     start_live_for_delivery = delivery.FinalDeliveryAdmissionScenarios.start_live_for_delivery
 
     async def held_worker(self, *, before_claim_checkpoint=None):
-        from agent.display import build_status_phrase
         await self.start_live_for_delivery()
         self.adapter.set_authorization_check(lambda actor, *_a, **_k: actor == self.USER)
         issue = self.provider.issues[self.ISSUE]
@@ -39,7 +38,7 @@ class WorkerDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
             at=self.bridge.clock()))
         step = {'worker_session_id': 'actual-delegated-owner', 'execution_generation': 1,
                 'admission_id': 'same-native-worker-admission', 'run_id': task.current_run_id,
-                'phrase': build_status_phrase('terminal', None)}
+                'phrase': 'in the terminal'}
         return task, self.bridge.store.get(self.ISSUE), step
 
     async def checkpoint(self, task, body, *, capture=True):

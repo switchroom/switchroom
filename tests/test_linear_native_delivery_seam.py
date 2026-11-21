@@ -103,7 +103,6 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
         from gateway.session_authority import SessionAuthority
         from gateway.session_results import execution_result
         from gateway.run_turn_runner import TurnRunner
-        from agent.display import build_status_phrase
         tools = {"first": "read_file", "second": "terminal"}
         started = {name: asyncio.Event() for name in ("first", "second")}
         release = {name: asyncio.Event() for name in started}
@@ -151,7 +150,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["first"]["_linear_status_source"], "first")
             await step(captured["first"], 1000)
             self.assertEqual([(x["source_activity"], x["content"]["parameter"]) for x in actions()],
-                             [("first", build_status_phrase("read_file", None))])
+                             [("first", "on reading")])
             await self.deliver("second", "Summarize instead")
             await self.until(lambda: self.inbox_row("second")[2] == "imported")
             self.assertEqual([row["status"] for row in self.rows()], ["started", "queued"])
@@ -163,7 +162,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(captured["second"]["_linear_status_source"], "second")
             await step(captured["second"], 3000)
             self.assertEqual([(x["source_activity"], x["content"]["parameter"]) for x in actions()],
-                             [("first", build_status_phrase("read_file", None)), ("second", build_status_phrase("terminal", None))],
+                             [("first", "on reading"), ("second", "in the terminal")],
                              (self.adapter._inputs, self.adapter._step_closed, self.bridge.store.pending()))
 
     async def test_committed_input_before_receipt_projection(self):
@@ -448,7 +447,6 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_worker_action_returns_after_genuine_question_with_same_admission_and_phrase(self):
         from tools import clarify_gateway as clarify
         from hermes_fleet_linear_plugin import worker_progress
-        from agent.display import build_status_phrase
         await self.start_live_for_delivery()
         self.adapter.set_authorization_check(lambda actor, *_a, **_k: actor == self.USER)
         issue = self.provider.issues[self.ISSUE]
@@ -461,7 +459,7 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
         binding = self.bridge.store.get(self.ISSUE)
         step = {"worker_session_id": "actual-delegated-owner", "execution_generation": 1,
                 "admission_id": "same-native-worker-admission", "run_id": task.current_run_id,
-                "phrase": build_status_phrase("terminal", None)}
+                "phrase": "in the terminal"}
         phase = [step]
         wall = self.bridge.clock()
         async def publish(at):
