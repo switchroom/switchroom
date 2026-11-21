@@ -326,6 +326,32 @@ jobs:
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
 
+      - name: Headed Camoufox smoke (UID 1000, fleet seccomp, no-new-privileges)
+        # One local page, headed on a private Xvnc display, through the supervised service runner,
+        # with no network: pinned + attested build, loopback-only service with an access key,
+        # snapshot, screenshot, a real window on the display, and the SIGTERM cookie checkpoint.
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/camoufox-smoke"
+          mkdir -p "$out"
+          chmod 0777 "$out"
+          docker run --rm --network none --user 1000:1000 \
+            --security-opt no-new-privileges \
+            --security-opt seccomp=security/chromium-seccomp.json \
+            --shm-size 1g \
+            --mount "type=bind,src=$out,dst=/smoke" \
+            --entrypoint python3 "$TEST_IMAGE" \
+            /opt/hermes-fleet/bin/verify-camoufox-runtime.py --out /smoke
+
+      - name: Upload Camoufox smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: camoufox-smoke-${{ github.sha }}-${{ github.job }}
+          path: ${{ runner.temp }}/camoufox-smoke
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Export built candidate and start SBOM generation
         # One docker-save of the candidate, bound to its local config ID. Syft runs detached from
         # here on (its status is collected fail-closed below) while Trivy scans the same archive.
@@ -696,6 +722,32 @@ jobs:
           '
           docker run --rm --network none "$TEST_IMAGE" python3 -c 'import os; assert os.getuid() != 0'
           docker run --rm --entrypoint hermes "$TEST_IMAGE" --version
+
+      - name: Headed Camoufox smoke (UID 1000, fleet seccomp, no-new-privileges)
+        # One local page, headed on a private Xvnc display, through the supervised service runner,
+        # with no network: pinned + attested build, loopback-only service with an access key,
+        # snapshot, screenshot, a real window on the display, and the SIGTERM cookie checkpoint.
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/camoufox-smoke"
+          mkdir -p "$out"
+          chmod 0777 "$out"
+          docker run --rm --network none --user 1000:1000 \
+            --security-opt no-new-privileges \
+            --security-opt seccomp=security/chromium-seccomp.json \
+            --shm-size 1g \
+            --mount "type=bind,src=$out,dst=/smoke" \
+            --entrypoint python3 "$TEST_IMAGE" \
+            /opt/hermes-fleet/bin/verify-camoufox-runtime.py --out /smoke
+
+      - name: Upload Camoufox smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: camoufox-smoke-${{ github.sha }}-${{ github.job }}
+          path: ${{ runner.temp }}/camoufox-smoke
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Export scanned publish candidate and start SBOM generation
         # One docker-save of the candidate, bound to its local config ID. Syft runs detached from

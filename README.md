@@ -69,6 +69,10 @@ The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay
 
 `plugins/linear/` links meaningful outcomes to native Hermes tasks and reports their progress through a durable outbox. Human checkpoints and meaningful lifecycle milestones appear as regular issue comments, while Agent Sessions retain live steps and heartbeats. A completed internal stage does not close the human issue; outcome completion remains bound to the accepted native specification. Native Hermes owns execution, permissions, worker claims, recovery and Stop. Ordinary chat and authorized issue operations need no Linear claim or task link. Cross-channel follow-ups reach the existing native task without transfer phrases or another executor. The mounted plugin can also expose and independently inspect one exact current native request without granting control permission. It preserves legacy records and uncertain effects for reconciliation. It remains disabled by default; identities, scopes and reporting routes are overlay configuration. Details: [`plugins/linear/README.md`](plugins/linear/README.md).
 
+### Camoufox browser
+
+The image installs Camoufox (pinned and attested) with a supervised, loopback-only camofox-browser service that opens it headed on the agent's own Bot Desktop. The official `camofox` plugin and `plugins/camoufox-desktop/` (Take over fence, hand-back note, steering, dock icon) make it the agent's primary browser once the overlay mounts and enables them; Chromium `browser_exec` stays as the backup. Details: [`docs/camoufox.md`](docs/camoufox.md).
+
 ### Browser handoff
 
 The agent can run an isolated browser and hand the live session to the human when a login or a visual check needs a person. Cookies and origin stay on that profile's broker and sidecar. The public origin comes from `HERMES_BROWSER_HANDOFF_PUBLIC_HOST` at deploy time, not from this git tree. Sidecar images (broker, Camofox) publish separately; the Fleet child does not bake them in. The opt-in [browser handoff recipe](recipes/browser-handoff/) layers a digest-pinned Camofox browser and a loopback-only VNC viewer over the starter overlay.

@@ -1,0 +1,6 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# camofox-browser: the agent's Camoufox browser server (loopback only). See
+# /usr/local/lib/camofox-browser/service-run. Skips the privilege drop when already non-root.
+[ "$(id -u)" = 0 ] || exec /usr/local/lib/camofox-browser/service-run
+exec s6-setuidgid hermes /usr/local/lib/camofox-browser/service-run

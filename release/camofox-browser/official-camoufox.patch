@@ -1,0 +1,131 @@
+diff -ruN a/lib/camoufox-download.js b/lib/camoufox-download.js
+--- a/lib/camoufox-download.js
++++ b/lib/camoufox-download.js
+@@ -1,34 +1,30 @@
+-import { DefaultAddons, maybeDownloadAddons } from 'camoufox-js/dist/addons.js';
+-import { ALLOW_GEOIP, downloadMMDB } from 'camoufox-js/dist/locale.js';
+-import { CamoufoxFetcher } from 'camoufox-js/dist/pkgman.js';
++import { CamoufoxFetcher } from 'camoufox';
++import { allowGeoip, downloadMmdb } from 'camoufox/dist/geolocation.js';
+ import { pathToFileURL } from 'node:url';
+ 
+-// Keep the latest stable browser release tested with camoufox-js@0.11.5.
+-// beta.34 rejects navigator.product; beta.28 fails viewport E2E on Playwright 1.58.
+-export const BUNDLED_CAMOUFOX_RELEASE = '152.0.4-beta.30';
++// The browser release the official camoufox@0.5.9 package is stamped with
++// (its browser-pin.json). Each browser release bundles its default addons.
++export const BUNDLED_CAMOUFOX_RELEASE = '158.0.1-beta.41';
+ 
+ export class CompatibleCamoufoxFetcher extends CamoufoxFetcher {
+-  checkAsset(asset) {
++  checkAsset(asset, release) {
+     if (!asset.name.startsWith(`camoufox-${BUNDLED_CAMOUFOX_RELEASE}-`)) return null;
+-    return super.checkAsset(asset);
++    return super.checkAsset(asset, release);
+   }
+ }
+ 
+-// camoufox-js does not currently expose its fetch command from the public
+-// entrypoint. Keep its pinned version in package.json while using the same
+-// downloader implementation as `npx camoufox-js fetch`, without spawning a
+-// shell or a second Node process during this package's lifecycle hook.
++// Use the same downloader implementation as `npx camoufox fetch`, without
++// spawning a shell or a second Node process during this package's lifecycle
++// hook. Releases bundle their default addons, so none are downloaded.
+ export async function downloadBundledCamoufox({
+   createFetcher = () => new CompatibleCamoufoxFetcher(),
+-  shouldDownloadGeoIp = ALLOW_GEOIP,
+-  downloadGeoIp = downloadMMDB,
+-  downloadAddons = maybeDownloadAddons,
++  shouldDownloadGeoIp = allowGeoip,
++  downloadGeoIp = downloadMmdb,
+ } = {}) {
+-  const fetcher = createFetcher();
++  const fetcher = await createFetcher().init();
+   await fetcher.install();
+ 
+-  if (shouldDownloadGeoIp) downloadGeoIp();
+-  await downloadAddons(DefaultAddons);
++  if (shouldDownloadGeoIp()) await downloadGeoIp();
+ }
+ 
+ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+diff -ruN a/lib/camoufox-executable.js b/lib/camoufox-executable.js
+--- a/lib/camoufox-executable.js
++++ b/lib/camoufox-executable.js
+@@ -237,10 +237,13 @@
+     return { executablePath: resolvedExecutable, resourceDir };
+   }
+ 
+-  ensureCamoufoxJsCache(resourceDir, cacheDir, resolvedExecutable);
+-
+-  return {
+-    executablePath: ensureLaunchShim(resolvedExecutable, resourceDir),
+-    resourceDir,
+-  };
++  for (const name of ['properties.json', 'version.json', 'fontconfig']) {
++    if (!existsSync(join(resourceDir, name))) {
++      throw new Error(
++        `External Camoufox bundle at ${resourceDir} must include properties.json, version.json, and fontconfig/`
++      );
++    }
++  }
++  void cacheDir;
++  return { executablePath: resolvedExecutable, resourceDir };
+ }
+diff -ruN a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -32,7 +32,7 @@
+     "transcript"
+   ],
+   "engines": {
+-    "node": ">=22"
++    "node": ">=22.15"
+   },
+   "files": [
+     "server.js",
+@@ -217,9 +217,9 @@
+   },
+   "dependencies": {
+     "better-sqlite3": "13.0.1",
+-    "camoufox-js": "0.11.5",
++    "camoufox": "0.5.9",
+     "express": "^5.2.1",
+-    "playwright-core": "^1.58.0",
++    "playwright-core": ">=1.58.0 <1.63",
+     "prom-client": "^15.1.3",
+     "swagger-jsdoc": "^6.2.8"
+   },
+diff -ruN a/server.js b/server.js
+--- a/server.js
++++ b/server.js
+@@ -1,5 +1,4 @@
+-import { Camoufox, launchOptions } from 'camoufox-js';
+-import { VirtualDisplay } from 'camoufox-js/dist/virtdisplay.js';
++import { Camoufox, launchOptions, VirtualDisplay } from 'camoufox';
+ import { firefox } from 'playwright-core';
+ import express from 'express';
+ import crypto from 'crypto';
+@@ -953,10 +952,10 @@
+ 
+ // Detects errors that retrying cannot recover from (e.g., Camoufox binary
+ // missing because postinstall was skipped). The user must run
+-// `npx camoufox-js fetch` and restart; looping on this wastes resources
++// `npx camoufox fetch` and restart; looping on this wastes resources
+ // and buries the actionable error under noise.
+ //
+-// Sentinel: matches the human-readable message thrown by camoufox-js's
++// Sentinel: matches the human-readable message thrown by camoufox's
+ // FileNotFoundError in dist/pkgman.js (Version.fromPath). FileNotFoundError
+ // is not exported from the public API, so substring matching is the only
+ // available hook. If the upstream message changes, this regex needs an
+@@ -969,7 +968,7 @@
+   if (CONFIG.camoufoxExecutablePath) {
+     return 'verify CAMOUFOX_EXECUTABLE points to a Camoufox bundle with properties.json, version.json, and fontconfig/';
+   }
+-  return 'run `npx camoufox-js fetch` then restart the server';
++  return 'run `npx camoufox fetch` then restart the server';
+ }
+ 
+ function scheduleBrowserWarmRetry(delayMs = 5000) {

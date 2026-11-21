@@ -1,0 +1,88 @@
+#!/bin/bash
+# Supervised camofox-browser for this container (s6 longrun "camofox-browser").
+#
+# One Node process on loopback, opening Camoufox headed on the profile's Bot Desktop. The browser
+# itself starts lazily on the first request, so the service costs ~40 MB until something browses.
+# DISPLAY/XAUTHORITY come from the screen's published env file, falling back to the display a
+# single-profile container's screen gets (:20); when the screen comes back on a different display
+# the service exits and s6 restarts it on the new one. SIGTERM is forwarded so camofox-browser
+# writes its cookie checkpoint before exiting.
+set -euo pipefail
+
+home_dir=${HERMES_HOME:-/opt/data}
+state=${CAMOFOX_STATE_DIR:-$home_dir/camofox-browser}
+desktop_env=$home_dir/bot-desktop/env
+install_dir=${CAMOFOX_SERVER_DIR:-/opt/camofox-browser}
+
+umask 077
+mkdir -p "$state/profiles" "$state/cookies" "$state/uploads" "$state/traces" "$state/home"
+chmod 0700 "$state"
+
+key=$state/access-key
+if [ ! -s "$key" ]; then
+  tmp=$(mktemp "$state/.access-key.XXXXXX")
+  od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$tmp"
+  printf '\n' >> "$tmp"
+  ln "$tmp" "$key" 2>/dev/null || true
+  rm -f "$tmp"
+fi
+access_key=$(tr -d '[:space:]' < "$key")
+[ "${#access_key}" -ge 32 ] || { echo "camofox-browser: access key at $key is too short" >&2; exit 1; }
+
+published_display() {
+  [ -r "$desktop_env" ] || return 0
+  sed -n 's/^DISPLAY=//p' "$desktop_env" | head -n1
+}
+
+display=$(published_display)
+display=${display:-${CAMOFOX_DISPLAY:-:20}}
+xauth=$home_dir/bot-desktop/Xauthority
+if [ -r "$desktop_env" ]; then
+  published_xauth=$(sed -n 's/^XAUTHORITY=//p' "$desktop_env" | head -n1)
+  xauth=${published_xauth:-$xauth}
+  bus=$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' "$desktop_env" | head -n1)
+  [ -n "$bus" ] && export DBUS_SESSION_BUS_ADDRESS="$bus"
+fi
+
+export HOME="$state/home"
+export DISPLAY="$display" XAUTHORITY="$xauth"
+export CAMOFOX_PORT=${CAMOFOX_PORT:-9377}
+export CAMOFOX_BIND_HOST=127.0.0.1
+export CAMOFOX_ACCESS_KEY="$access_key" CAMOFOX_API_KEY="$access_key"
+export CAMOFOX_INTERACTIVE=desktop
+export CAMOUFOX_EXECUTABLE=${CAMOUFOX_EXECUTABLE:-/opt/camoufox/camoufox-bin}
+export CAMOUFOX_FPGEN_DATA=${CAMOUFOX_FPGEN_DATA:-/opt/camofox-browser/fpgen}
+export CAMOFOX_PROFILE_DIR="$state/profiles" CAMOFOX_COOKIES_DIR="$state/cookies"
+export CAMOFOX_UPLOADS_DIR="$state/uploads" CAMOFOX_TRACES_DIR="$state/traces"
+export CAMOFOX_CRASH_REPORT_ENABLED=false SENTRY_DSN= PROMETHEUS_ENABLED=false
+export CAMOFOX_DISABLE_DEFAULT_ADDONS=${CAMOFOX_DISABLE_DEFAULT_ADDONS:-1}
+export CAMOFOX_OS=${CAMOFOX_OS:-linux}
+# A human shares these windows: never expire a session on idleness, keep a quiet tab for 8 h
+# (0 is not "off" for TAB_INACTIVITY_MS), and let the browser use more memory before a restart.
+export SESSION_TIMEOUT_MS=${SESSION_TIMEOUT_MS:-0}
+export TAB_INACTIVITY_MS=${TAB_INACTIVITY_MS:-28800000}
+export BROWSER_RSS_RESTART_THRESHOLD_MB=${BROWSER_RSS_RESTART_THRESHOLD_MB:-3000}
+export CAMOFOX_SHUTDOWN_TIMEOUT_MS=${CAMOFOX_SHUTDOWN_TIMEOUT_MS:-40000}
+export NODE_ENV=production
+unset ENABLE_VNC
+
+cd "$install_dir"
+node --max-old-space-size=256 server.js &
+child=$!
+
+stop() {
+  kill -TERM "$child" 2>/dev/null || true
+  wait "$child" 2>/dev/null || true
+  exit 0
+}
+trap stop TERM INT
+
+while kill -0 "$child" 2>/dev/null; do
+  sleep 15 & wait $! || true
+  now=$(published_display)
+  if [ -n "$now" ] && [ "$now" != "$display" ]; then
+    echo "camofox-browser: Bot Desktop moved from $display to $now; restarting on the new display" >&2
+    stop
+  fi
+done
+wait "$child"

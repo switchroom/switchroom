@@ -27,6 +27,7 @@ REVIEWED_DEFAULTS = [
     "voice",
     "honcho-memory",
     "web-search",
+    "camoufox-browser",
     "quota",
     "session-reset-policy",
     "security-guidance",
@@ -43,6 +44,8 @@ DEFAULT_COMPONENTS = {
     "voice-provider",
     "web-provider",
     "perplexity-web-provider",
+    "camofox",
+    "camoufox-desktop",
 }
 OPT_IN_COMPONENTS = {"browser-handoff"}
 # Shipped only when the starter overlay actually enables a default. Wave 0 ships none.
@@ -61,6 +64,7 @@ DEGRADE_BEHAVIOURS = {
     "text_only_and_report",
     "builtin_memory_and_report",
     "default_web_backend_and_report",
+    "chromium_only_and_report",
 }
 
 

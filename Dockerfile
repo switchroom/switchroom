@@ -120,6 +120,116 @@ RUN npm ci --omit=dev --prefix /opt/coding-clis --ignore-scripts --no-audit --no
 ENV CLAUDE_CODE_EXECUTABLE=/opt/coding-clis/node_modules/.bin/claude
 COPY --chmod=0755 scripts/claude-acp-subscription /usr/local/bin/hermes-claude-acp-subscription
 
+# Bot Desktop and browsers (HF-773). The upstream Bot Screen desktop packages (moved here from the
+# private overlay, HF-550) plus Chromium, so every agent has a screen; nothing starts at
+# boot. No xfce4 metapackage (screensaver/power/polkit). adwaita-icon-theme-legacy: Adwaita 48 ships
+# only *-symbolic legacy names, so the dock's launchers rendered as blank squares without it.
+# Camoufox's runtime libraries (libdbus-glib-1-2, libegl1), unzip for its release archive, a normal
+# font set, and the en_AU.UTF-8 locale.
+RUN apt-get -o Acquire::Retries=3 update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+      tigervnc-standalone-server xfce4-panel xfwm4 xfdesktop4 xfce4-settings xfce4-terminal \
+      dbus-x11 at-spi2-core x11-xserver-utils x11-utils x11-xkb-utils xauth fonts-dejavu-core chromium \
+      adwaita-icon-theme-legacy \
+      libdbus-glib-1-2 libegl1 unzip locales \
+      fonts-liberation fonts-noto-core fonts-noto-color-emoji \
+    && sed -i 's/^# *\(en_AU.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
+    && locale-gen \
+    && rm -rf /var/lib/apt/lists/*
+# The dock's Browser launcher names internet-web-browser, which no installed theme ships
+# (AdwaitaLegacy has only web-browser). Alias it to the Chromium icon that launcher opens;
+# hicolor is every theme's fallback.
+RUN for d in /usr/share/icons/hicolor/*/apps; do \
+      if [ -f "$d/chromium.png" ]; then ln -sf chromium.png "$d/internet-web-browser.png"; fi; \
+    done \
+    && test -e /usr/share/icons/hicolor/48x48/apps/internet-web-browser.png \
+    && gtk-update-icon-cache -f -q /usr/share/icons/hicolor
+ENV LANG=en_AU.UTF-8 \
+    LANGUAGE=en_AU:en \
+    BH_TAB_MARKER=0
+
+# Camoufox, pinned and attested (release/camoufox.lock.json), unpacked once into /opt/camoufox,
+# never into the per-profile tool store. The release archive bundles its fonts and default addons;
+# version.json (what the official camoufox package's fetcher writes beside a build) comes from the lock.
+# The Sigstore build attestation is verified whenever the build has a GitHub token (CI always does);
+# the bake verifier refuses an image whose marker does not say "verified".
+COPY release/camoufox.lock.json /opt/hermes-fleet/release/camoufox.lock.json
+COPY --chmod=0755 scripts/fetch-pinned-release-asset.sh /tmp/fetch-pinned-release-asset.sh
+RUN --mount=type=secret,id=github_token,required=false set -eu; \
+    lock=/opt/hermes-fleet/release/camoufox.lock.json; \
+    field() { python3 -c 'import functools,json,sys; print(functools.reduce(lambda v, k: v[k], sys.argv[2].split("."), json.load(open(sys.argv[1]))["camoufox"]))' "$lock" "$1"; }; \
+    repo=$(field repository); tag=$(field tag); asset=$(field asset); \
+    archive=/tmp/camoufox.zip; \
+    if [ -s /run/secrets/github_token ]; then GH_TOKEN="$(cat /run/secrets/github_token)"; export GH_TOKEN; fi; \
+    /tmp/fetch-pinned-release-asset.sh "$repo" "$(field asset_id)" "$(field size)" "$(field sha256)" \
+      "https://github.com/$repo/releases/download/$tag/$asset" "$archive"; \
+    if [ -n "${GH_TOKEN:-}" ]; then \
+      gh attestation verify "$archive" --repo "$repo" \
+        --signer-workflow "$(field attestation.signer_workflow)" \
+        --predicate-type "$(field attestation.predicate_type)" >/dev/null; \
+      attested=verified; \
+    else \
+      echo "no GitHub token: Camoufox attestation not verified (local build)" >&2; attested=unverified-local-build; \
+    fi; \
+    unset GH_TOKEN; \
+    mkdir -p /opt/camoufox; \
+    unzip -q "$archive" -d /opt/camoufox; \
+    rm -f "$archive" /tmp/fetch-pinned-release-asset.sh; \
+    chmod -R a+rX,go-w /opt/camoufox; \
+    test -x /opt/camoufox/camoufox-bin; \
+    grep -qx "Version=$(field version)-$(field build)" /opt/camoufox/application.ini; \
+    python3 -c 'import json,sys; l=json.load(open(sys.argv[1]))["camoufox"]; json.dump({"version": l["version"], "build": l["build"], "prerelease": False, "asset_id": l["asset_id"], "asset_size": l["size"], "sha256": l["sha256"], "interface": l["interface"]}, open("/opt/camoufox/version.json", "w")); print()' "$lock"; \
+    chmod 0444 /opt/camoufox/version.json; \
+    printf '{"sha256":"%s","attestation":"%s"}\n' "$(field sha256)" "$attested" > /opt/camoufox/.hermes-fleet-provenance.json; \
+    chmod 0444 /opt/camoufox/.hermes-fleet-provenance.json; \
+    for size in 16 32 48 64 128; do \
+      install -D -m 0644 "/opt/camoufox/browser/chrome/icons/default/default${size}.png" \
+        "/usr/share/icons/hicolor/${size}x${size}/apps/camoufox.png"; \
+    done; \
+    gtk-update-icon-cache -f -q /usr/share/icons/hicolor
+# camofox-browser, the REST server the official camofox plugin drives: the integrity-pinned npm
+# tarball (no repository fork) plus one registered downstream patch (release/camoufox.lock.json),
+# installed from a committed lock with no install scripts. Telemetry and the default-addon download
+# are disabled by the service, which also points it at /opt/camoufox. The official camoufox package
+# generates fingerprints from fpgen's model, which it would download on first launch; it is baked
+# here, sha256-checked against the pin fpgen-js ships and the lock, so a launch needs no network.
+COPY release/camofox-browser/ /tmp/camofox-browser-release/
+RUN set -eu; \
+    lock=/opt/hermes-fleet/release/camoufox.lock.json; \
+    field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["camofox_browser"][sys.argv[2]])' "$lock" "$1"; }; \
+    tarball=/tmp/camofox-browser.tgz; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 "$(field tarball)" -o "$tarball"; \
+    python3 -c 'import base64,hashlib,sys; want=sys.argv[2]; got="sha512-"+base64.b64encode(hashlib.sha512(open(sys.argv[1],"rb").read()).digest()).decode(); sys.exit(0 if got==want else "camofox-browser tarball integrity mismatch: "+got)' "$tarball" "$(field integrity)"; \
+    mkdir -p /opt/camofox-browser; \
+    tar -xzf "$tarball" -C /opt/camofox-browser --strip-components=1 --no-same-owner; \
+    cd /opt/camofox-browser; \
+    git apply --whitespace=nowarn /tmp/camofox-browser-release/official-camoufox.patch; \
+    cp /tmp/camofox-browser-release/package-lock.json package-lock.json; \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
+    test "$(node -p 'require("./package.json").version')" = "$(field version)"; \
+    test "$(node -p 'require("./node_modules/camoufox/package.json").version')" = "0.5.9"; \
+    test ! -e node_modules/camoufox-js; \
+    node --check server.js; \
+    model() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["camofox_browser"]["fingerprint_model"][sys.argv[2]])' "$lock" "$1"; }; \
+    test "$(node -p 'require("./node_modules/fpgen-js/package.json").version')" = "$(model package_version)"; \
+    CAMOUFOX_FPGEN_DATA="$(model install_dir)" node --input-type=module -e 'const m = await import("fpgen-js"); const [sha, size, url] = process.argv.slice(1); if (m.MODEL_PIN.sha256 !== sha || m.MODEL_PIN.size !== Number(size) || m.MODEL_PIN.url !== url) throw new Error("fpgen-js model pin differs from the lock"); await m.ensureModel({ dir: process.env.CAMOUFOX_FPGEN_DATA });' "$(model sha256)" "$(model size)" "$(model url)"; \
+    test "$(cat "$(model install_dir)/.pinned-model")" = "$(model sha256)"; \
+    test -s "$(model install_dir)/values.dat"; \
+    rm -rf "$(model install_dir)/.install.lock"; \
+    rm -rf "$tarball" /tmp/camofox-browser-release /root/.npm; \
+    chmod -R a+rX,go-w /opt/camofox-browser
+COPY --chmod=0755 docker/camofox-browser/service-run /usr/local/lib/camofox-browser/service-run
+COPY docker/s6-rc.d/camofox-browser/ /etc/s6-overlay/s6-rc.d/camofox-browser/
+COPY docker/s6-rc.d/user/contents.d/camofox-browser /etc/s6-overlay/s6-rc.d/user/contents.d/camofox-browser
+COPY --chmod=0755 scripts/verify-camoufox-runtime.py /opt/hermes-fleet/bin/verify-camoufox-runtime.py
+RUN chmod 0755 /etc/s6-overlay/s6-rc.d/camofox-browser/run
+# The camofox plugin reads CAMOFOX_URL from the process environment; it is not a secret. The access
+# key is per container and lives in <HERMES_HOME>/camofox-browser/access-key. s6 waits up to 50 s at
+# container stop (default 3 s) so the browser server can checkpoint its logins.
+ENV CAMOFOX_URL=http://127.0.0.1:9377 \
+    CAMOUFOX_FPGEN_DATA=/opt/camofox-browser/fpgen \
+    S6_SERVICES_GRACETIME=50000
+
 # Fleet plugins are mounted read-only by deployment, never baked into the image.
 # Keep each absence check in a separate layer so deleting a prune fails the bake.
 # Do not assert absence in a running gateway: the mount makes the path exist.
