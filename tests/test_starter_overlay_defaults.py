@@ -577,8 +577,9 @@ class RenderedSettingsPluginValidationTests(unittest.TestCase):
         raw = self.settings("claude-account-connectors")
         self.assertIs(raw["enabled"], True)
         # Same arguments register() passes; a stub ACP keeps this credential-free.
-        backend = module.NativeBackend(raw.get("model", "sonnet"), raw.get("timeout", 90), acp=object())
-        self.assertEqual((backend.model, backend.timeout), (raw["model"], raw["timeout"]))
+        self.assertNotIn("model", raw)  # reserved by Hermes core: register() would fail (HF-793)
+        backend = module.NativeBackend(raw.get("worker_model", "sonnet"), raw.get("timeout", 90), acp=object())
+        self.assertEqual((backend.model, backend.timeout), (raw["worker_model"], raw["timeout"]))
         with self.assertRaises(ValueError):
             module.NativeBackend("not-a-model", raw["timeout"], acp=object())
 

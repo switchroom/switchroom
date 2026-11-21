@@ -16,7 +16,7 @@
     "assets/card.png": "14548a1d57e6820daf124bf0646380b1d0fe20c0eb698964d87036186f21e562",
     "assets/hero-technohellenic.png": "54cce1379348091e3efb363a005a60c00ee4ec90cda745e8f09f9dd6e357d7a3",
     "conftest.py": "e2d15b4ee035f536e2605f40f0c06f8ae9ae19a4186b221a143c09427c9d973f",
-    "directsdk.py": "8dbc5a92eaf73b2005bc8c514e2648d368ab11426e8add59118f1556cd654c20",
+    "directsdk.py": "4bac0b0b5967177d90cdcfe08e7051ad034946dc1fcd5ac2fca3d6dcdb26372f",
     "directsdk_setup.py": "43291daf28ed4679562537cb8252d6195c4a68534f7f9880d072b071b94cec82",
     "evals/ci.sh": "dce7a996c059f4309b241ce9ad92230902e616dddd17c7219161c8d698be53c2",
     "evals/directsdk_admission.py": "766dccb8d1e795db372c3399fe60fb2905ef02c5c616e2212fa9fe4aa638cfe9",
@@ -65,5 +65,19 @@
     "tests/test_lifecycle_regressions.py": "33ed60eb5f267e8d87a32eb1fff8c1e760483021031143d51ac4484e95ed9f7e",
     "tests/test_native_progress_liveness.py": "0c9756b8e4aeb7474902a3b3564e96757fd6a4cd406400db2060ccc9c25973c2"
   },
-  "tree_sha256": "0f3db410f3a926fcb4564be968cb0754b6714d0b42969ced8816666186616b89"
+  "upstream_files_sha256": {
+    "directsdk.py": "8dbc5a92eaf73b2005bc8c514e2648d368ab11426e8add59118f1556cd654c20"
+  },
+  "patches": [
+    {
+      "id": "closed-client-transport-error",
+      "description": "A call on a closed Client raised a plain RuntimeError('Claude client is closed'), which Hermes' error classifier files as an unknown error: the auxiliary ladder never fell back and the cached closed client was never evicted, so every later call failed the same way. It now raises ClaudeClientClosed(ConnectionError, RuntimeError), which classifies as a transport/connection failure (reason timeout, error_context transport=connection) so the call falls back and the cache drops the dead client; still a RuntimeError for callers that caught the old type. One marked class block plus one marked raise line in directsdk.py; removing the block and restoring that one line gives the upstream bytes (upstream_files_sha256).",
+      "files": [
+        "directsdk.py"
+      ],
+      "upstream_candidate": true
+    }
+  ],
+  "tree_sha256": "0f3db410f3a926fcb4564be968cb0754b6714d0b42969ced8816666186616b89",
+  "tree_sha256_note": "tree_sha256 describes the pinned upstream tree at source_revision; the one file patched is listed in patches and upstream_files_sha256."
 }
