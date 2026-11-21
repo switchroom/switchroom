@@ -3,6 +3,8 @@ name: hermes-fleet-example
 x-hermes-agent: &hermes-agent
   image: ${HERMES_FLEET_IMAGE:?set a digest-pinned Fleet image}
   restart: unless-stopped
+  # Longer than the image's 50 s s6 grace, so the browser can checkpoint its logins on stop.
+  stop_grace_period: 60s
   environment:
     HERMES_UID: ${HERMES_UID:-1000}
     HERMES_GID: ${HERMES_GID:-1000}
