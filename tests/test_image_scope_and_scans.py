@@ -49,7 +49,7 @@ class ChangeScopeDecisionTests(unittest.TestCase):
 
     def test_docs_and_tests_only_changes_skip_the_bake(self):
         for paths in (["README.md"], ["docs/image-release.md", "tests/test_image_release.py"], [".github/workflows/ci.yml"],
-                      ["plugins/model-providers/claude-acp/client.py", "plugins/browser-handoff/__init__.py",
+                      ["plugins/model-providers/claude-acp/client.py",
                        "plugins/kokoro-voice/__init__.py", "plugins/readonly-source/__init__.py",
                        "plugins/web/perplexity/provider.py"],
                       ["scripts/verify-public-tree.py", "compose.example.yaml", "examples/operator-managed.yaml"], []):

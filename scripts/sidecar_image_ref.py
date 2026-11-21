@@ -14,14 +14,14 @@ ALLOWED_REPOSITORIES = frozenset(
         "ghcr.io/switchroom/tcp-proxy",
         "ghcr.io/switchroom/browser-broker",
         "ghcr.io/switchroom/kokoro",
-        "ghcr.io/switchroom/camofox",
         # Digests published before the repository moved to switchroom/switchroom
         # stay valid: running deployments are pinned to them by digest.
         "ghcr.io/mekenthompson/hermes-fleet-rest-lock-proxy",
         "ghcr.io/mekenthompson/hermes-fleet-tcp-proxy",
         "ghcr.io/mekenthompson/hermes-fleet-browser-broker",
         "ghcr.io/mekenthompson/hermes-fleet-kokoro",
-        "ghcr.io/mekenthompson/hermes-fleet-camofox",
+        # Camofox is no longer a sidecar: Camoufox runs in the Fleet image on the
+        # agent's Bot Desktop. Its published digests stay in GHCR untouched.
     }
 )
 

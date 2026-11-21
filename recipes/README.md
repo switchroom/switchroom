@@ -1,15 +1,13 @@
 # Opt-in recipes
 
-Three pieces stay out of the reviewed default set because each reaches
-outside an agent's own box: a browser a person can take over, another agent's
-trust, and a publication target
+Two pieces stay out of the reviewed default set because each reaches outside
+an agent's own box: another agent's trust, and a publication target
 ([decision record](../reference/rfcs/default-on-distribution.md#opt-in-not-default)).
 Each is a Compose fragment you layer over the starter overlay
 (`examples/overlay-repo/`). Without the fragment nothing changes.
 
 | Recipe | Fragment | Adds |
 | --- | --- | --- |
-| [Browser handoff](browser-handoff/) | `compose.browser-handoff.yaml` | a Camofox browser for one agent, VNC takeover on loopback |
 | [Gated A2A](a2a/) | `compose.a2a.yaml` | A2A between allowlisted agents on an internal network |
 | [Artifact publishing](artifact-publishing/) | `compose.artifact-publishing.yaml` | a read-only origin that serves only reviewed files |
 

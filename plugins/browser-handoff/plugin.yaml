@@ -1,5 +1,0 @@
-name: browser-handoff
-kind: standalone
-version: 0.1.0
-description: Isolated browser handoff on a configured public origin
-author: Hermes Fleet Contributors

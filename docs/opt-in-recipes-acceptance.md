@@ -11,6 +11,12 @@ other containers kept the same IDs and start times throughout.
 A recipe is opt-in, not a default: none of this changes a `planned` or
 `shipped` status in [`contracts/plugins.json`](../contracts/plugins.json).
 
+Since this run, the browser handoff recipe, its plugin and the Camofox sidecar
+image were retired: Camoufox now runs inside the Fleet image on each agent's
+own Bot Desktop, with Take over ([camoufox.md](camoufox.md)). The browser
+handoff section below is kept as the record of that run, not as a recipe you
+can layer today.
+
 ## What ran
 
 | Item | Value |

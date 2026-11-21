@@ -11,7 +11,6 @@ not baked into the agent child image. Deployments pin an immutable digest.
 | TCP / noVNC proxy | `ghcr.io/switchroom/tcp-proxy` | publishing |
 | Browser broker | `ghcr.io/switchroom/browser-broker` | publishing |
 | Kokoro | `ghcr.io/switchroom/kokoro` | publishing |
-| Camofox | `ghcr.io/switchroom/camofox` | publishing |
 
 Pin form:
 
@@ -145,8 +144,7 @@ mapping step.
 
 ## Opt-in recipes
 
-Browser handoff (Camofox plus a loopback VNC forwarder), gated A2A and
-reviewed artifact publishing are not starter sidecars. Each is a fragment in
+Gated A2A and reviewed artifact publishing are not starter sidecars. Each is a fragment in
 [`recipes/`](../recipes/) that you layer over the same overlay compose files,
 under the same isolation rules. Without the fragment nothing changes.
 
@@ -161,6 +159,6 @@ The Fleet Kokoro image is a CUDA runtime image for GPU hosts; its model
 weights are not baked in. The starter overlay's CPU voice server is the
 upstream Kokoro-FastAPI CPU build instead.
 
-Camofox bakes pinned `jo-inc/camofox-browser` `v1.18.1` plus window, screen,
-media, and Camoufox `152.0.4-beta.30` patches from `sidecars/camofox`. Overlay
-entrypoints and secret loaders stay private.
+Camoufox is not a sidecar. It runs inside the Fleet image on each agent's own
+Bot Desktop ([camoufox.md](camoufox.md)). The Camofox sidecar image and its
+browser-handoff recipe were retired; digests already published stay in GHCR.

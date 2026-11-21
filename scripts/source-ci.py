@@ -19,7 +19,6 @@ PUBLIC = ('test_public_*.py', 'test_image_scope_and_scans.py')
 COMPONENTS = {
     'linear': ('test_linear_*.py', 'test_ci_linear_scenarios.py'),
     'claude': ('test_claude_*.py',),
-    'browser': ('test_browser_*.py', 'test_sidecar_packages.py'),
     'sidecars': ('test_sidecar_packages.py', 'test_browser_*.py',
                  'test_chromium_sandbox_*.py'),
     'perplexity': ('test_perplexity_provider.py',),
@@ -29,7 +28,6 @@ PREFIXES = {
     'plugins/linear/': 'linear',
     'plugins/model-providers/claude-acp/': 'claude',
     'plugins/claude-account-connectors/': 'claude',
-    'plugins/browser-handoff/': 'browser',
     'plugins/web/perplexity/': 'perplexity',
     # Before 'sidecars/': the receiver's tests are test_linear_receiver.py.
     'sidecars/linear-receiver/': 'linear',

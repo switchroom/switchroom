@@ -70,7 +70,7 @@ contracts/                 Public product boundaries
 docs/                      Human docs for public behavior
 examples/overlay-repo/     Placeholder overlay repository
 plugins/                   Mounted plugin source; off in the bare image, reviewed defaults via the overlay
-recipes/                   Opt-in Compose fragments (browser handoff, gated A2A, artifact publishing); off unless layered
+recipes/                   Opt-in Compose fragments (gated A2A, artifact publishing); off unless layered
 release/                   Pinned Agent parent handoff
 scripts/                   Build, compose, and verification wrappers
 sidecars/                  Independent sidecar source and image workflows

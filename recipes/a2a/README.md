@@ -31,9 +31,8 @@ the `a2a` network and no peer is trusted.
   answers on every network the agent is on. Layered over
   `compose.sidecars.yaml`, that includes the shared `honcho`, `onepassword`
   and (for `ops`) `voice` networks and the agent's own egress network. So
-  `honcho`, `voice`, `onepassword-connect-api` (and `ops-browser`, with the
-  browser-handoff recipe), or any container you attach to one of those
-  networks, can open a connection to `9900`. The per-peer token plus
+  `honcho`, `voice`, `onepassword-connect-api`, or any container you attach
+  to one of those networks, can open a connection to `9900`. The per-peer token plus
   `A2A_TRUSTED_PEERS` refuses them with `401`/`403`. The listener is never
   published on the host. `tests/test_recipes.py` composes the starter overlay
   with this recipe and fails if that set of neighbours changes or `9900`
