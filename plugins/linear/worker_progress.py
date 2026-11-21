@@ -14,6 +14,10 @@ from . import origin
 from .api import LinearError
 from .transport import Unavailable
 
+# How long a worker's own kanban_heartbeat note stays on the Agent Session before a generic
+# tool step may replace it. Workers are asked for a note per sub-step (HF-775).
+NOTE_HOLD_SECONDS = 600
+
 
 async def _read(home, adapter, task, session_id):
     from .native_store import reader, local_receipt, local_identity
@@ -98,6 +102,8 @@ def queue(bridge, row, adapter):
     last = bridge.store.latest_session_action(row["issue_id"], row["owner_ref"])
     if last and now - last["enqueued_at"] < 60:
         return
+    if last and last.get("heartbeat_note") and now - last["enqueued_at"] < NOTE_HOLD_SECONDS:
+        return  # A generic tool step must not replace the worker's own fresher note.
     if bridge.store.unsettled_worker_action(row['issue_id'], row['owner_ref']):
         return  # Keep one uncertain optional status; questions and real closeout retain their own paths.
     with bridge.api.optional_work():

@@ -156,7 +156,11 @@ How to work this task:
    there; never redo an external action that already happened.
 2. Finish with kanban_complete and put the evidence in the result: the PR URL (also as
    metadata.published_pr), the merged commit, the deploy check, or the findings link. A run without
-   evidence is reported to Linear as unfinished.
+   evidence is reported to Linear as unfinished. For a code change, open the PR and call
+   kanban_request_review instead, naming only the repo, PR URL, exact head SHA and the acceptance
+   criteria. A fresh reviewer run on this same task reviews it cold, merges it only after the
+   required checks pass on that head, and completes with that evidence.
+   Never create a separate review task for the same PR.
 3. If you need a human decision, use clarify when available and wait for the actual answer.
    If the question cannot be delivered, kanban_block with kind needs_input and say exactly what you need.
 4. Keep the plan current in the issue description. When work starts, and each time a stage is
@@ -165,7 +169,12 @@ How to work this task:
    it waits on), then a "- [ ]" / "- [x]" checklist built from the acceptance criteria, with PRs and
    related issues as linked text. Send the whole section each time. It silently replaces the agent
    section at the end of the description; text people wrote above it is never changed. If someone
-   edits that section, updates are posted as comments instead.
+   edits that section, updates are posted as comments instead. Keep it moving between stages:
+   items like "PR merged" can stay open for hours, so the Status line says what is happening now
+   and what is next, and the current item has indented sub-steps ("  - [x] prototype passes").
+   Resend the section when a sub-step finishes and at least every 15 minutes of work. When each
+   sub-step begins, call kanban_heartbeat with a one-line plain note (what you are doing and why);
+   people see it live in the agent session, and it never becomes a comment.
 5. Comment on the issue only when the stage changes: plan validated, PR open, merged, live, blocked or
    needs someone, done. Call kanban_comment with human_checkpoint=true and a new stable request_id
    (reuse it on retry with the same body). Write a bold stage title, then up to three lines:
@@ -186,6 +195,11 @@ How to work this task:
    Include the requested results and what the checks proved; omit raw commands, logs and internal
    bookkeeping unless the person requested them. The existing completion projection publishes this
    as the issue comment; do not create a second closing comment yourself.
+8. Wait without sleep loops. For CI, make one blocking terminal call per wait (timeout up to 600):
+   gh run watch on the runs for the head commit with its output discarded, or arm
+   gh pr merge --auto --match-head-commit where the repository allows it. Run a long test or build
+   as one long foreground call or as a background process with process_manage wait. For something
+   due later, finish or hand off this stage and schedule the follow-up check with cronjob.
 """
 ASSESSMENT_NOTE = "4. This is a specialist assessment. kanban_complete metadata.issue_comment must be the human issue comment: Linear markdown, 40 to 12000 characters, with a newline, and no Project status update heading. The bridge posts that text on the issue. Do not call the linear tool. A completion without that field is unfinished.\n"
 
@@ -3689,7 +3703,9 @@ class Bridge:
         elif event.kind == "heartbeat" and task_status not in NATIVE_PROGRESS_SUPERSEDED:
             note = _progress_text(payload.get("note"))
             if note:
-                writes = [self._progress_activity(row, route, "Working", note, ephemeral=True)]
+                kind, report = self._progress_activity(row, route, "Working", note, ephemeral=True)
+                # The worker's own words: worker_progress leaves it showing for a while (HF-775).
+                writes = [(kind, {**report, "heartbeat_note": True})]
         elif event.kind == "checkpoint":
             if (isinstance(payload.get("body"), str) and isinstance(payload.get("request_id"), str)
                     and payload["request_id"] and (body := _readable(payload["body"]))):
@@ -4899,9 +4915,10 @@ class Bridge:
 
     @staticmethod
     def _conversation_step_safe(payload: dict) -> bool:
-        from .native_input import step_phrase
+        from .native_input import legacy_step_phrase, step_phrase
         content = payload["content"]
-        return content.get("action") == "Working" and step_phrase(content.get("parameter")) == content.get("parameter")
+        parameter = content.get("parameter")
+        return content.get("action") == "Working" and (step_phrase(parameter) == parameter or legacy_step_phrase(parameter))
 
     def _conversation_interim_finished(self, payload: dict) -> bool:
         is_step = payload.get("content", {}).get("type") == "action"

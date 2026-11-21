@@ -337,7 +337,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.bridge.api,'transport',side_effect=transport):
             await self.step(build_status_phrase('read_file',{'path':'PRIVATE_CANARY'}))
         self.assertTrue(observed); self.assertTrue(all(flag for flag,_ in observed))
-        self.assertEqual(self.posted[-1]['content']['parameter'],build_status_phrase('read_file',None))
+        self.assertEqual(self.posted[-1]['content']['parameter'],'on reading')  # HF-775 plain step
         print('FULL_ACTION_REQUESTS',len(observed),'all capped optional',flush=True)
 
     async def test_budget_drop_during_transport_admission_sends_nothing(self):
@@ -421,7 +421,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             with self.elapsed_time(1000 + index * 60):
                 await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
             await asyncio.gather(*list(self.adapter._step_tasks.values()))
-            expected = "Working on your request." if index == 2 else build_status_phrase(tool, None)
+            expected = "on your request" if index == 2 else {"read_file": "on reading", "terminal": "in the terminal"}.get(tool, tool)
             self.assertEqual(self.posted[-1]["content"]["parameter"], expected)
         self.assertNotIn("PRIVATE_CANARY", json.dumps(self.posted))
 
@@ -560,7 +560,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
                                 "Working on your request.", kind="action", one_try=True, source_cursor=cursor)
         self.assertTrue(fresh)
         await asyncio.to_thread(restarted.flush, only_id=fresh)
-        self.assertEqual([p["content"].get("parameter") for p in self.posted], ["Working on your request."])
+        self.assertEqual([p["content"].get("parameter") for p in self.posted], ["on your request"])
 
     @requires_status_metadata
     async def test_real_approval_timeout_does_not_resume_over_a_different_pending_approval(self):
@@ -713,7 +713,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until_posted(3)
         self.assertNotIn(native.ISSUE, self.adapter._typing_paused)
         self.assertNotIn((native.ISSUE, native.SESSION), self.adapter._step_paused)
-        self.assertEqual(self.posted[-1]["content"]["parameter"], phrase)
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "on reading")
 
     @requires_status_metadata
     async def test_real_clarify_withdrawal_retires_pause_and_restores_work(self):
@@ -969,15 +969,14 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             await self.adapter.send_typing(native.ISSUE, metadata=second_meta)
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
         self.assertEqual({p["agentSessionId"]: p["content"]["parameter"] for p in self.posted}, {
-            native.SESSION: build_status_phrase("read_file", None),
-            session: build_status_phrase("terminal", None)})
+            native.SESSION: "on reading",
+            session: "in the terminal"})
         self.owned_status(None, first, lambda: runners[0]._progress_live_status("tool.completed", "read_file", {}))
-        self.assertEqual(self.adapter._step_phrases[(native.ISSUE, session, activity)],
-                         build_status_phrase("terminal", None))
+        self.assertEqual(self.adapter._step_phrases[(native.ISSUE, session, activity)], "in the terminal")
         with self.elapsed_time(2000):
             await self.adapter.send_typing(native.ISSUE, metadata=first_meta)
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
-        self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "on your request")
 
     @requires_status_metadata
     async def test_unowned_core_callback_cannot_borrow_environment_identity(self):
@@ -993,7 +992,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             runner._progress_live_status("tool.started", "terminal", {"command": "echo unproven"})
         await self.adapter.send_typing(native.ISSUE, metadata=self.status_metadata())
         await asyncio.gather(*list(self.adapter._step_tasks.values()))
-        self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "on your request")
 
     @requires_status_metadata
     async def test_live_step_throttles_changed_phrases_and_keeps_chat_alive(self):
@@ -1002,7 +1001,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.start_turn()  # No native task exists: ordinary chat needs its own keepalive.
         await self.step(first)
         self.assertEqual(self.posted[-1]["content"], {
-            "type": "action", "action": "Working", "parameter": first})
+            "type": "action", "action": "Working", "parameter": "on reading"})
         self.assertIs(self.posted[-1]["ephemeral"], True)
         await self.step(second, at=1059)
         self.assertEqual(len(self.posted), 1)
@@ -1028,7 +1027,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         await self.step(at=1060)
         self.assertEqual([p["content"]["type"] for p in self.posted],
                          ["action", "response", "action"])
-        self.assertEqual(self.posted[-1]["content"]["parameter"], "Working on your request.")
+        self.assertEqual(self.posted[-1]["content"]["parameter"], "on your request")
         await self.step(at=1659)
         self.assertEqual(len(self.posted), 3)  # Same turn still has the ten-minute keepalive.
         with self.elapsed_time(1660):
