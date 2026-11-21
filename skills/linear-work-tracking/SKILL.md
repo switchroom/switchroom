@@ -32,6 +32,11 @@ execute anything. Only the current authorized request and the native task do.
 4. Use native controls for their purpose: schedule for a planned wait, request review for a
    finished stage awaiting acceptance, block for a genuine blocker (missing input, access or
    capability). A Stop stays stopped until a current authorized resume.
+   To wait on other Linear issues, `kanban_block` with `kind: dependency` and name each issue key
+   in the reason. To wait on a plugin change reaching the running agents, add one reason line
+   `Delivery gate: <plugin>/<file> contains <exact text>`. The bridge shows these as waiting on
+   that work, not on a person, and resumes the task itself once the issues are closed and the
+   mounted file carries the text.
 
 ## Linking a task to an issue
 

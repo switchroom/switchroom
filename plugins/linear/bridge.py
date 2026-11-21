@@ -24,6 +24,7 @@ from .store import Store, advisory
 from . import transport
 from . import diag
 from . import acceptance
+from . import waits
 log = logging.getLogger(diag.LOGGER_NAME)
 class ProjectUpdateDeferred(Exception):
     """The quiet period or another sender moved this batch before publication."""
@@ -782,6 +783,9 @@ def _block_message(payload: dict, task_status: str) -> tuple[str, str]:
     if internal:
         return "error", ("Paused by a technical problem on the agent's side. Nothing is needed from you; "
                          "the same task continues once the problem is cleared.")
+    wait = waits.parse(payload)
+    if wait:
+        return "thought", waits.notice(wait)  # Waiting on other issues or a delivery, not on a person.
     reason = _project_summary(_human_reason(payload.get("reason") or ""), 400, one_line=True)
     if kind != "dependency" and _STOP_REASON.search(reason) and "?" not in reason:
         # A person stopped or handed off this work: nothing is being asked of the reader.
@@ -1048,6 +1052,9 @@ class Kanban:
     def create(self, **fields: Any):
         if self.executor_profile is not None:
             fields["assignee"] = self.executor_profile
+        if (fields.get("initial_status") == "blocked"
+                and "transient_hold" in inspect.signature(self.kb.create_task).parameters):
+            fields["transient_hold"] = True  # Admission lifts this hold within a second: not a block anyone answers.
         with self.conn() as conn:
             task_id = self.kb.create_task(conn, board=self.board, **fields)
         return self.get(task_id)
@@ -3392,7 +3399,8 @@ class Bridge:
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
                     diag.warn("binding.held", "held", diag.exc_reason(exc), kind="pump", iss=issue_id, task=task_id, evt=event_id, exc=type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
-                for step in (self._worker_progress, self._recheck_acceptance, self._resume_pr_park, self._reconcile_status,
+                for step in (self._worker_progress, self._recheck_acceptance, self._resume_pr_park, self._resume_external_wait,
+                             self._settle_held_delegate, self._reconcile_status,
                              self._recover_binding_delegate) if caught_up else ():
                     # These steps read Linear; a refusal or error waits (15 s doubling to 1 h, persisted)
                     # instead of repeating the same reads every tick.
@@ -4127,6 +4135,104 @@ class Bridge:
                                                  "pr": "merged" if merged else "closed"})
         diag.transition("pr_park.resume", "applied" if accepted else "skipped",
                         "pr_park_resumed" if accepted else "pr_park_changed", key=marker, **fields)
+    plugins_root = waits.PLUGINS_ROOT
+    def _resume_external_wait(self, row: dict | None, adapter) -> None:
+        """Resume a worker's dependency block once the other issues are closed and any delivery gate holds.
+
+        Only the worker's own block (the newest block-lifecycle event, re-kinded by core for lack of a
+        native parent; see waits.py), already reported, with no later event. Local reads until the
+        persisted gap has passed; then one read per named issue and one local file check per gate.
+        Satisfied: one guarded core unblock of exactly that block event, decided once per block (a
+        durable marker written before the call, never replayed). Anything unreadable or still open
+        leaves it blocked; a newer Stop or answer changes the newest event, so it is never overridden.
+        """
+        if not row or row.get("origin") != "native" or not getattr(adapter, "guarded_controls", False):
+            return
+        task = adapter.require_task(row["task_id"])
+        if task.status != "blocked":
+            return
+        events = adapter.history(task.id, 0)
+        last = next((event for event in reversed(events) if event.kind in PARK_LIFECYCLE), None)
+        wait = waits.parse(native_event_payload(last)) if last is not None and last.kind == "blocked" else None
+        if wait is None or last.id > row["last_event_id"] or events[-1].id != last.id:
+            return
+        issue_id = row["issue_id"]
+        marker, fields = f"external-wait-resume:{issue_id}:{task.id}:{last.id}", {"iss": issue_id, "task": task.id, "evt": last.id}
+        if self.store.native_intent(marker):
+            return
+        key, now = f"external_wait_recheck:{issue_id}:{task.id}:{last.id}", self.clock()
+        if not self.store.backoff_ready(key, now):
+            return
+        self.store.backoff_clear(key)
+        self.store.backoff_fail(key, now, base=waits.EXTERNAL_WAIT_GAP, cap=waits.EXTERNAL_WAIT_GAP)
+        for ref in wait["issues"]:
+            try:
+                other = self.api.issue(ref)
+            except RateLimited:
+                raise
+            except LinearError:
+                diag.transition("external_wait.resume", "skipped", "issue_unreadable", key=marker, **fields)
+                return
+            if other.get("id") != issue_id and (other.get("state") or {}).get("type") not in CLOSED:
+                diag.transition("external_wait.resume", "skipped", "issue_open", key=marker, **fields)
+                return
+        if not all(waits.gate_met(self.plugins_root, path, text) for path, text in wait["gates"]):
+            diag.transition("external_wait.resume", "skipped", "delivery_pending", key=marker, **fields)
+            return
+        latest = adapter.history(task.id, 0)
+        if adapter.require_task(task.id).status != "blocked" or latest[-1].id != last.id:
+            diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
+            return
+        _, first = self.store.native_intent_prepare(marker, {"issue_id": issue_id, "task_id": task.id, "block_event_id": last.id})
+        if not first:
+            return
+        try:
+            accepted = adapter.activate(task.id, last.id)
+        except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
+            self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
+            diag.warn("external_wait.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
+            return
+        self.store.native_intent_settle(marker, {"state": "applied", "accepted": bool(accepted)})
+        if accepted:
+            body = "What this work waited on is done. The agent continues."
+            if row.get("owner_ref"):
+                self.activity(issue_id, row["owner_ref"], "thought", body, row=row)
+            else:
+                self.comment(issue_id, body, row=row)
+        diag.transition("external_wait.resume", "applied" if accepted else "skipped",
+                        "external_wait_resumed" if accepted else "wait_changed", key=marker, **fields)
+    def _settle_held_delegate(self, row: dict | None, adapter) -> None:
+        """Settle a held delegate write once a fresh readback shows the delegate it intended.
+
+        A delegate write whose outcome was uncertain stays held until someone records the result, and
+        kept the issue's writes refused with "needs an operator" long after Linear already showed the
+        intended delegate. The check is local until such a row exists; then one issue read per gap.
+        Only this app's own routing write (target is the app's own id), same issue, still unresolved.
+        The record is the operator's own ``resolve ... applied`` with the readback as its evidence.
+        """
+        if not row or row.get("origin") != "native":
+            return
+        issue_id = row["issue_id"]
+        held = [item for item in self.store.issue_reconciliation_blocked(issue_id) if item["kind"] == "delegate"]
+        if not held:
+            return
+        key, now = f"delegate_settle:{issue_id}", self.clock()
+        if not self.store.backoff_ready(key, now):
+            return
+        self.store.backoff_clear(key)
+        self.store.backoff_fail(key, now, base=waits.EXTERNAL_WAIT_GAP, cap=waits.EXTERNAL_WAIT_GAP)
+        issue = self._effect_issue(issue_id)
+        current = (issue.get("delegate") or {}).get("id")
+        for item in held:
+            payload = (self.store.outbox_row(item["id"]) or {}).get("payload") or {}
+            target = payload.get("target_delegate_id")
+            if (payload.get("delegate_routing_version") != 1 or payload.get("issue_id") != issue_id
+                    or payload.get("reconciliation") or not target
+                    or target != self.api.viewer_id() or target != current):
+                continue
+            evidence = f"Automatic: a fresh Linear readback shows delegate {target} on the issue (updatedAt {issue.get('updatedAt')})"
+            if self.store.reconcile_terminal(item["id"], outcome="applied", evidence=evidence, at=now):
+                diag.transition("delegate.write", "applied", "readback_matches", key=item["id"], iss=issue_id, task=row.get("task_id"))
     def _report_delegate_allowed(self, issue: dict, payload: dict | None = None) -> bool:
         delegate = (issue.get("delegate") or {}).get("id")
         if delegate == self.api.viewer_id():
