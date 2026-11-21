@@ -143,7 +143,8 @@ class PluginTests(unittest.TestCase):
     def test_register_wires_hooks_steering_key_and_identity(self):
         ctx = Ctx()
         self.plugin.register(ctx)
-        self.assertEqual(set(ctx.hooks), {"pre_tool_call", "pre_llm_call"})
+        # No tool_execution middleware on this stand-in core: the password scrub falls back to the hook.
+        self.assertEqual(set(ctx.hooks), {"pre_tool_call", "pre_llm_call", "transform_tool_result"})
         (section_id, text, position), = ctx.sections
         self.assertEqual(section_id, "camoufox-desktop.browsers")
         self.assertEqual(position, "after_memory")

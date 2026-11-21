@@ -1,14 +1,18 @@
 name: camoufox-desktop
-version: 0.2.0
+version: 0.3.0
 description: >
   Bot Desktop glue for the official camofox plugin and the image's local camofox-browser
   service: the camofox browser tools and browser_vault writes wait while a human holds Take over,
   Camoufox use keeps the desktop awake and starts it when needed, the agent is told once when the
   human hands back, cookies are checkpointed while the screen is in use, Camoufox is steered as
   the primary browser (Chromium browser_exec stays the backup for CDP-only jobs), and the dock
-  gets a Camoufox icon that opens the agent's own session.
+  gets a Camoufox icon that opens the agent's own session. Password-field values (type=password,
+  autocomplete current-password/new-password) are removed from what the page-reading camofox
+  tools return, whoever typed them (tool_execution middleware; transform_tool_result on an
+  older core).
 author: Hermes Fleet Contributors
 kind: standalone
 provides_hooks:
   - pre_tool_call
   - pre_llm_call
+  - transform_tool_result
