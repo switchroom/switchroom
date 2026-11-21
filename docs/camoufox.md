@@ -73,6 +73,19 @@ adds the Bot Desktop behaviour without patching it:
   which comes long after the last use, does not lose a login. One process per profile does this.
 - If the lease cannot be read, the camofox tools are refused (`screen_control_unknown`) rather than
   risk typing over a human; Chromium `browser_exec` still works.
+- Password fields stay out of the model's context. The Camofox snapshot prints every input's value,
+  and the camofox plugin only scrubs vault values and token-like text, so a password a human typed
+  during Take over would otherwise show up in the next snapshot. After `browser_navigate`,
+  `browser_snapshot`, `browser_console`, `browser_vision` and `browser_get_images`, the plugin asks
+  each of the agent's tabs for the values of its password fields (`type=password`, or `autocomplete`
+  `current-password` / `new-password`, including open shadow roots and same-origin frames) and
+  removes them from the output and from the stored full-snapshot file. It fails closed: if the scan
+  cannot run, every textbox value in the snapshot is masked and a `browser_console` result is
+  withheld; if the page has a frame of another origin, textbox values inside the snapshot's iframe
+  sections are masked. This runs as `tool_execution` middleware (no hook timeout to fail open on).
+  `scripts/camoufox-password-smoke.py` proves it on a live agent: a throwaway identity, a password
+  typed with XTest key events on the Bot Desktop, then the three read tools through the real
+  middleware chain (`--plugin-b64` tests a candidate before it is delivered).
 - A short system-prompt section steers the model: Camoufox first, Chromium for CDP-only jobs, and a
   CAPTCHA or challenge always goes to the human.
 - The dock gets a Camoufox icon. It opens or raises the agent's own session (the same Camofox

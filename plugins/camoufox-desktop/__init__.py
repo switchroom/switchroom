@@ -15,7 +15,9 @@ the desktop. This plugin adds, without patching either:
   otherwise be lost;
 * steering: Camoufox (``browser_*``) is the primary browser; Chromium ``browser_exec`` is the backup
   and the engine for CDP-only work;
-* a dock icon that opens or raises the agent's own Camoufox session.
+* a dock icon that opens or raises the agent's own Camoufox session;
+* password fields: what the page-reading camofox tools return to the model never carries a password
+  field's value, whoever typed it (``password_scrub``; the snapshot prints every input's value).
 
 It also points the camofox plugin at the local service: the access key (shared with the service via
 ``<HERMES_HOME>/camofox-browser/access-key``) and, when the profile sets no identity, one fixed
@@ -33,7 +35,7 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Optional
 
-from . import camoufox_local, dock
+from . import camoufox_local, dock, password_scrub
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,10 @@ def configure_environment(home: Optional[Path] = None) -> None:
 def _is_fenced(tool_name: str, args: Any) -> bool:
     if tool_name == "browser_vault":
         return isinstance(args, dict) and str(args.get("action") or "") in VAULT_WRITES
+    return _is_camofox_tool(tool_name)
+
+
+def _is_camofox_tool(tool_name: str) -> bool:
     try:
         from tools.registry import registry
         toolset = registry.get_toolset_for_tool(tool_name)
@@ -341,10 +347,51 @@ def pre_llm_call(session_id: str = "", **_: Any):
     return {"context": HANDBACK_NOTE}
 
 
+def _scrubs(tool_name: str) -> bool:
+    return (tool_name in password_scrub.PAGE_READ_TOOLS and _is_camofox_tool(tool_name)
+            and bool((os.environ.get("CAMOFOX_URL") or "").strip()))
+
+
+def _scan() -> password_scrub.Scan:
+    return password_scrub.scan([user_id()])
+
+
+def scrub_passwords(tool_name: str = "", next_call: Any = None, **_: Any) -> Any:
+    """``tool_execution`` middleware: run the tool, then take password-field values out of its output.
+    Middleware wraps the dispatch itself, so unlike a ``transform_tool_result`` hook it has no
+    callback timeout to fail open on and no other plugin's result can win over it."""
+    result = next_call()  # a tool failure propagates unchanged
+    if not _scrubs(tool_name):
+        return result
+    return password_scrub.scrub_tool_output(tool_name, result, _scan)
+
+
+def transform_tool_result(tool_name: str = "", result: Any = None, **_: Any) -> Optional[str]:
+    """Fallback for a core without ``tool_execution`` middleware."""
+    if not _scrubs(tool_name):
+        return None
+    cleaned = password_scrub.scrub_tool_output(tool_name, result, _scan)
+    return cleaned if isinstance(cleaned, str) else json.dumps(cleaned, ensure_ascii=False, default=str)
+
+
+def _middleware_supported(ctx) -> bool:
+    if not hasattr(ctx, "register_middleware"):
+        return False
+    try:
+        from hermes_cli.middleware import VALID_MIDDLEWARE
+        return "tool_execution" in VALID_MIDDLEWARE
+    except Exception:  # noqa: BLE001 - an older core
+        return False
+
+
 def register(ctx) -> None:
     configure_environment()
     ctx.register_hook("pre_tool_call", pre_tool_call)
     ctx.register_hook("pre_llm_call", pre_llm_call)
+    if _middleware_supported(ctx):
+        ctx.register_middleware("tool_execution", scrub_passwords)
+    else:
+        ctx.register_hook("transform_tool_result", transform_tool_result)
     if hasattr(ctx, "register_system_prompt_section"):
         try:
             ctx.register_system_prompt_section("camoufox-desktop.browsers", STEERING, position="after_memory")
@@ -356,4 +403,5 @@ def register(ctx) -> None:
         _start_checkpointer(_hermes_home())
 
 
-__all__ = ["register", "pre_tool_call", "pre_llm_call", "configure_environment", "user_id"]
+__all__ = ["register", "pre_tool_call", "pre_llm_call", "configure_environment", "user_id", "scrub_passwords",
+           "transform_tool_result"]
