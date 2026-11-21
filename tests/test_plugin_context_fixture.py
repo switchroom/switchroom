@@ -6,7 +6,7 @@ Three guards:
 * when ``hermes_cli`` is importable, the vendored copy and the real validator agree on every key,
   so the copy cannot drift in an environment that has core;
 * every literal key a public plugin passes to ``get_config`` / ``set_config`` is valid, so the
-  failure mode that kept Aggie's connectors from loading cannot recur through another plugin.
+  failure mode that kept a deployed profile's connectors from loading cannot recur through another plugin.
 """
 
 from __future__ import annotations
