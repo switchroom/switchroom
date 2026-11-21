@@ -36,7 +36,3 @@ services:
     environment:
       VOICE_BIND: "0.0.0.0"
       VOICE_PORT: "8126"
-  example-camofox:
-    image: ${HERMES_FLEET_CAMOFOX_IMAGE:?Set a reviewed ghcr.io/switchroom/camofox@sha256 digest}
-    environment:
-      CAMOFOX_BIND_HOST: "0.0.0.0"

@@ -363,14 +363,6 @@
     ],
     "opt_in": [
       {
-        "id": "browser-handoff",
-        "covers": [
-          "browser-handoff"
-        ],
-        "reason": "needs a public origin and a browser sidecar",
-        "recipe": "recipes/browser-handoff/"
-      },
-      {
         "id": "agent-to-agent",
         "covers": [],
         "reason": "cross-agent trust is a per-deployment decision",
@@ -481,19 +473,6 @@
         "license_review",
         "no_deployment_identity",
         "read_only_qualified"
-      ]
-    },
-    {
-      "id": "browser-handoff",
-      "target": "standalone_public_plugin",
-      "default_enabled": false,
-      "default_role": "opt_in",
-      "conditions": [
-        "env_skinned_public_origin",
-        "generic_configuration",
-        "independent_tests",
-        "license_review",
-        "no_deployment_identity"
       ]
     },
     {

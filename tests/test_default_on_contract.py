@@ -34,7 +34,7 @@ REVIEWED_DEFAULTS = [
     "disk-cleanup",
     "shared-skill-pack",
 ]
-REVIEWED_OPT_IN = ["browser-handoff", "agent-to-agent", "artifact-publishing"]
+REVIEWED_OPT_IN = ["agent-to-agent", "artifact-publishing"]
 # Components a reviewed default covers. Everything else must stay off.
 DEFAULT_COMPONENTS = {
     "claude-subscription-directsdk-provider",
@@ -47,7 +47,8 @@ DEFAULT_COMPONENTS = {
     "camofox",
     "camoufox-desktop",
 }
-OPT_IN_COMPONENTS = {"browser-handoff"}
+# The sidecar-era browser-handoff plugin was the only opt-in component; HF-773 retired it.
+OPT_IN_COMPONENTS: set[str] = set()
 # Shipped only when the starter overlay actually enables a default. Wave 0 ships none.
 # Proven in real containers: docs/starter-overlay-acceptance.md.
 SHIPPED: set[str] = {

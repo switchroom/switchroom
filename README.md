@@ -63,7 +63,7 @@ The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay
 
 ## Plugins, and why they exist
 
-**Disabled by default today.** Most are in the reviewed default set and will be on once the starter overlay lands; browser handoff stays opt-in. They exist so isolation does not mean a dumb agent.
+**Disabled by default today.** Most are in the reviewed default set and will be on once the starter overlay lands. They exist so isolation does not mean a dumb agent.
 
 ### Linear
 
@@ -72,10 +72,6 @@ The example profiles in `compose.example.yaml` are synthetic. See [`docs/overlay
 ### Camoufox browser
 
 The image installs Camoufox (pinned and attested) with a supervised, loopback-only camofox-browser service that opens it headed on the agent's own Bot Desktop. The official `camofox` plugin and `plugins/camoufox-desktop/` (Take over fence, hand-back note, steering, dock icon) make it the agent's primary browser once the overlay mounts and enables them; Chromium `browser_exec` stays as the backup. Details: [`docs/camoufox.md`](docs/camoufox.md).
-
-### Browser handoff
-
-The agent can run an isolated browser and hand the live session to the human when a login or a visual check needs a person. Cookies and origin stay on that profile's broker and sidecar. The public origin comes from `HERMES_BROWSER_HANDOFF_PUBLIC_HOST` at deploy time, not from this git tree. Sidecar images (broker, Camofox) publish separately; the Fleet child does not bake them in. The opt-in [browser handoff recipe](recipes/browser-handoff/) layers a digest-pinned Camofox browser and a loopback-only VNC viewer over the starter overlay.
 
 ### Claude ACP
 
@@ -111,7 +107,7 @@ Switchroom child image  (this repo, switchroom/switchroom)
         |
         +-- profile A container + state volume + workspace + network
         +-- profile B container + state volume + workspace + network
-        +-- independent sidecar images (browser broker, proxies, Camofox, Kokoro)
+        +-- independent sidecar images (browser broker, proxies, Kokoro)
 ```
 
 Sidecar source lives under `sidecars/`. Each sidecar publishes its own GHCR image through a dedicated workflow.
@@ -215,8 +211,7 @@ Coding agents should start at [`AGENTS.md`](AGENTS.md). Product scope is [`refer
 - [`docs/secret-reference-audit.md`](docs/secret-reference-audit.md) — check each agent reads only its own 1Password references; never resolves a value
 - [`plugins/linear/`](plugins/linear/) — optional Linear integration on core Kanban (staged, disabled)
 - [`plugins/kokoro-voice/`](plugins/kokoro-voice/) — optional local Kokoro sidecar TTS
-- [`plugins/browser-handoff/`](plugins/browser-handoff/) — optional browser handoff
-- [`recipes/`](recipes/) — opt-in Compose recipes: browser handoff with loopback VNC, gated A2A, reviewed artifact publishing ([acceptance run](docs/opt-in-recipes-acceptance.md))
+- [`recipes/`](recipes/) — opt-in Compose recipes: gated A2A, reviewed artifact publishing ([acceptance run](docs/opt-in-recipes-acceptance.md))
 - [`plugins/readonly-source/`](plugins/readonly-source/) — optional allowlisted read-only snapshot tools
 - [`scripts/tooling-policy-hook`](scripts/tooling-policy-hook) — optional overlay install-policy hook
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting and public boundary

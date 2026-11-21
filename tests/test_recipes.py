@@ -1,4 +1,4 @@
-"""Opt-in recipes: browser handoff, gated A2A and reviewed artifact publishing.
+"""Opt-in recipes: gated A2A and reviewed artifact publishing.
 
 Each recipe is a Compose fragment layered over the starter overlay. These
 tests hold the isolation rules from docs/sidecars.md for every fragment, keep
@@ -31,12 +31,11 @@ ARTIFACT = RECIPES / "artifact-publishing"
 DIGEST_REF = re.compile(r"^[a-z0-9.-]+(?:/[a-z0-9._-]+)+@sha256:[0-9a-f]{64}$")
 AGENTS = {"ops", "worker"}
 FRAGMENTS = {
-    "browser-handoff": RECIPES / "browser-handoff" / "compose.browser-handoff.yaml",
     "agent-to-agent": RECIPES / "a2a" / "compose.a2a.yaml",
     "artifact-publishing": ARTIFACT / "compose.artifact-publishing.yaml",
 }
 # Which starter agents each recipe may touch. Everyone else stays unchanged.
-OPTED_IN = {"browser-handoff": {"ops"}, "agent-to-agent": {"ops", "worker"}, "artifact-publishing": {"ops"}}
+OPTED_IN = {"agent-to-agent": {"ops", "worker"}, "artifact-publishing": {"ops"}}
 UUID_A = "1b4e28ba-2fa1-4d2b-883f-0016d3cca427"
 UUID_B = "6fa459ea-ee8a-4ca4-894e-db77e160355e"
 
@@ -88,13 +87,13 @@ class RecipeContractTests(unittest.TestCase):
         # recipe's services, networks or variables.
         for name in ("compose.yaml", "compose.sidecars.yaml"):
             text = (OVERLAY / name).read_text(encoding="utf-8")
-            for needle in ("ops-browser", "CAMOFOX", "A2A_", r"\ba2a\b", "artifact-origin", "artifacts/", "recipes/"):
+            for needle in ("A2A_", r"\ba2a\b", "artifact-origin", "artifacts/", "recipes/"):
                 with self.subTest(file=name, needle=needle):
                     self.assertIsNone(re.search(needle, text))
 
     def test_evidence_records_each_recipe_and_its_limits(self) -> None:
         evidence = EVIDENCE.read_text(encoding="utf-8")
-        for heading in ("## Browser handoff", "## A2A", "## Artifact publishing", "## Not proven here"):
+        for heading in ("## A2A", "## Artifact publishing", "## Not proven here"):
             self.assertIn(heading, evidence)
         for recipe in FRAGMENTS.values():
             self.assertIn("opt-in-recipes-acceptance.md", (recipe.parent / "README.md").read_text(encoding="utf-8"))
@@ -135,7 +134,6 @@ class RecipeIsolationTests(unittest.TestCase):
 
     def test_internal_networks_are_joined_only_by_their_consumers(self) -> None:
         expected = {
-            "browser-handoff": {"ops-browser": {"ops", "ops-browser"}, "ops-browser-viewer": {"ops-browser", "ops-browser-vnc"}},
             "agent-to-agent": {"a2a": {"ops", "worker"}},
         }
         for recipe, networks in expected.items():
@@ -157,30 +155,6 @@ class RecipeIsolationTests(unittest.TestCase):
                         joined = {n for n, s in data["services"].items() if net in _networks(s)}
                         if not data["networks"][net].get("internal"):
                             self.assertEqual(joined, {name}, f"{net} must hold only the publishing service")
-
-    def test_browser_is_keyed_and_vnc_is_loopback_only(self) -> None:
-        data = _load(FRAGMENTS["browser-handoff"])
-        browser = data["services"]["ops-browser"]
-        self.assertIn("hermes-fleet-camofox@sha256:", browser["image"])
-        self.assertEqual(browser["env_file"], [{"path": "./secrets/ops-browser.env", "required": True}])
-        self.assertNotIn("ports", browser)
-        self.assertNotIn("ops-browser-vnc-ingress", _networks(browser))
-        env = browser["environment"]
-        self.assertEqual(env["VNC_RFB_BIND"], "127.0.0.1")
-        self.assertEqual(env["ENABLE_VNC"], "1")
-        for reaper in ("TAB_INACTIVITY_MS", "SESSION_TIMEOUT_MS", "BROWSER_IDLE_TIMEOUT_MS"):
-            self.assertEqual(env[reaper], "2147483647")
-        for secret in ("CAMOFOX_API_KEY", "CAMOFOX_ACCESS_KEY", "VNC_PASSWORD"):
-            self.assertNotIn(secret, env)
-        vnc = data["services"]["ops-browser-vnc"]
-        self.assertIn("hermes-fleet-tcp-proxy@sha256:", vnc["image"])
-        self.assertEqual(vnc["ports"], ["127.0.0.1:${OPS_BROWSER_VNC_PORT:-6080}:6080"])
-        self.assertEqual(vnc["environment"]["TARGET"], "ops-browser:6080")
-        self.assertIs(vnc["read_only"], True)
-        self.assertEqual(vnc["cap_drop"], ["ALL"])
-        ops = data["services"]["ops"]
-        self.assertEqual(ops["environment"], {"CAMOFOX_URL": "http://ops-browser:9377"})
-        self.assertEqual(_networks(ops), {"ops-browser"})
 
     def test_a2a_trusts_only_named_peers(self) -> None:
         data = _load(FRAGMENTS["agent-to-agent"])
@@ -237,7 +211,6 @@ class RecipeIsolationTests(unittest.TestCase):
         overlay = Path(tmp) / "overlay"
         shutil.copytree(OVERLAY, overlay)
         (overlay / "secrets").mkdir(exist_ok=True)
-        (overlay / "secrets" / "ops-browser.env").write_text("", encoding="utf-8")
         return overlay
 
     def test_docker_compose_config_accepts_each_layered_combination(self) -> None:
@@ -265,7 +238,7 @@ class RecipeIsolationTests(unittest.TestCase):
         combos = {
             "a2a": ([FRAGMENTS["agent-to-agent"]], shared),
             "all recipes": (list(FRAGMENTS.values()),
-                            {"ops": shared["ops"] | {"ops-browser"}, "worker": shared["worker"]}),
+                            shared),
         }
         docs = {
             "README": (RECIPES / "a2a" / "README.md").read_text(encoding="utf-8"),
@@ -292,7 +265,7 @@ class RecipeIsolationTests(unittest.TestCase):
                         for port in service.get("ports") or []:
                             self.assertNotIn(str(port.get("target")), {"9900"}, name)
                             self.assertNotIn(str(port.get("published")), {"9900"}, name)
-        named = set().union(*shared.values(), {"ops-browser"}) - set(AGENTS)
+        named = set().union(*shared.values()) - set(AGENTS)
         for doc, text in docs.items():
             with self.subTest(doc=doc):
                 for claim in ("Reachable only by peers", "nobody else can"):

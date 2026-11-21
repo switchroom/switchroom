@@ -47,22 +47,22 @@ class PublicGenericPluginTests(unittest.TestCase):
         self.assertNotIn("COPY plugins/model-providers/claude-acp/", DOCKERFILE.read_text(encoding="utf-8"))
         self.assertIn("RUN test ! -e /opt/hermes/plugins/model-providers/claude-acp", DOCKERFILE.read_text(encoding="utf-8"))
 
-    def test_browser_handoff_is_env_skinned(self) -> None:
-        text = (HANDOFF / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn("HERMES_BROWSER_HANDOFF_PUBLIC_HOST", text)
-        self.assertIn("HERMES_BROWSER_HANDOFF_TZ", text)
-        self.assertNotIn("Australia/", text)
+    def test_sidecar_era_browser_handoff_is_retired(self) -> None:
+        # Camoufox on the agent's own Bot Desktop (with Take over) replaced the
+        # sidecar browser, its handoff plugin and recipe (HF-773).
+        self.assertFalse(HANDOFF.exists())
+        self.assertFalse((ROOT / "recipes" / "browser-handoff").exists())
+        self.assertFalse((ROOT / "sidecars" / "camofox").exists())
+        self.assertFalse((ROOT / ".github" / "workflows" / "sidecar-camofox.yml").exists())
         dockerfile = DOCKERFILE.read_text(encoding="utf-8")
         self.assertNotIn("COPY plugins/browser-handoff/", dockerfile)
+        # The bake still prunes any inherited copy and proves it is gone.
         self.assertIn("RUN test ! -e /opt/hermes/plugins/browser-handoff", dockerfile)
         contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
-        matches = [item for item in contract["components"] if item["id"] == "browser-handoff"]
-        self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0]["target"], "standalone_public_plugin")
-        self.assertFalse(matches[0]["default_enabled"])
-        # Browser handoff stays opt-in, outside the reviewed default set.
-        self.assertEqual(matches[0]["default_role"], "opt_in")
-        self.assertIn("browser-handoff", [o["id"] for o in contract["public_base"]["opt_in"]])
+        self.assertNotIn("browser-handoff", [item["id"] for item in contract["components"]])
+        self.assertNotIn("browser-handoff", [o["id"] for o in contract["public_base"]["opt_in"]])
+        packages = json.loads((ROOT / "sidecars" / "packages.json").read_text(encoding="utf-8"))
+        self.assertNotIn("camofox", packages["packages"])
 
     def test_readonly_source_is_generic_and_disabled(self) -> None:
         manifest = (READONLY / "plugin.yaml").read_text(encoding="utf-8")

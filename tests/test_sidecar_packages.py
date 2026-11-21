@@ -25,7 +25,6 @@ PUBLIC_PACKAGES = {
     "tcp-proxy": "ghcr.io/switchroom/tcp-proxy",
     "browser-broker": "ghcr.io/switchroom/browser-broker",
     "kokoro": "ghcr.io/switchroom/kokoro",
-    "camofox": "ghcr.io/switchroom/camofox",
 }
 
 RETIRED_PRIVATE_PACKAGES = (
@@ -96,7 +95,6 @@ class SidecarContractTests(unittest.TestCase):
         self.assertEqual(packages["tcp-proxy"]["status"], "publishing")
         self.assertEqual(packages["browser-broker"]["status"], "publishing")
         self.assertEqual(packages["kokoro"]["status"], "publishing")
-        self.assertEqual(packages["camofox"]["status"], "publishing")
         self.assertFalse((ROOT / "services").exists())
 
     def test_sidecar_contract_does_not_publish_unprefixed_private_names(self) -> None:
@@ -505,8 +503,6 @@ class SidecarScopeIsolationTests(unittest.TestCase):
             "sidecars/browser-broker/public_config.py",
             "sidecars/kokoro/Dockerfile",
             "sidecars/kokoro/server.py",
-            "sidecars/camofox/lock.json",
-            ".github/workflows/sidecar-camofox.yml",
             ".github/workflows/sidecar-rest-lock-proxy.yml",
             ".github/workflows/sidecar-tcp-proxy.yml",
             ".github/workflows/sidecar-browser-broker.yml",
@@ -528,7 +524,6 @@ class SidecarScopeIsolationTests(unittest.TestCase):
             "tcp-proxy": ROOT / ".github/workflows/sidecar-tcp-proxy.yml",
             "browser-broker": ROOT / ".github/workflows/sidecar-browser-broker.yml",
             "kokoro": ROOT / ".github/workflows/sidecar-kokoro.yml",
-            "camofox": ROOT / ".github/workflows/sidecar-camofox.yml",
         }
         for name, path in mapping.items():
             text = path.read_text(encoding="utf-8")
@@ -554,7 +549,6 @@ class SidecarScopeIsolationTests(unittest.TestCase):
             "tcp-proxy": ROOT / ".github/workflows/sidecar-tcp-proxy.yml",
             "browser-broker": ROOT / ".github/workflows/sidecar-browser-broker.yml",
             "kokoro": ROOT / ".github/workflows/sidecar-kokoro.yml",
-            "camofox": ROOT / ".github/workflows/sidecar-camofox.yml",
         }
         for name, path in mapping.items():
             header = path.read_text(encoding="utf-8").split("jobs:", 1)[0]
@@ -608,97 +602,32 @@ class KokoroPublicTests(unittest.TestCase):
                     self.assertNotIn(needle.lower(), text)
 
 
-class CamofoxPublicTests(unittest.TestCase):
-    COMMIT = "39c82094013480b373df6600d44c7f036f58356e"
-    TAG = "v1.18.1"
-    GIT = "https://github.com/jo-inc/camofox-browser.git"
+class CamofoxSidecarRetiredTests(unittest.TestCase):
+    """Camoufox runs in the Fleet image on each agent's Bot Desktop (HF-773).
 
-    def test_lock_pins_upstream_commit_without_household_state(self) -> None:
-        lock_path = ROOT / "sidecars/camofox/lock.json"
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["schema_version"], 1)
-        self.assertEqual(payload["git"], self.GIT)
-        self.assertEqual(payload["commit"], self.COMMIT)
-        self.assertEqual(payload["tag"], self.TAG)
-        self.assertEqual(payload["window"], [1920, 1080])
-        self.assertEqual(payload["camoufox"], {"version": "152.0.4", "release": "beta.30"})
-        text = lock_path.read_text(encoding="utf-8").lower()
-        for needle in ("mar" + "ko", "over" + "lord", "klank" + "er", "hermes-fleet-private", "sha256:"):
-            self.assertNotIn(needle, text)
-        self.assertNotIn("156.0.1", text)
+    The sidecar build is gone. Published digests stay in GHCR; nothing here
+    deletes or retags them.
+    """
 
-    def test_patches_pin_window_screen_and_media_runtime(self) -> None:
-        window = (ROOT / "sidecars/camofox/patches/camofox-window-1920x1080.patch").read_text(
-            encoding="utf-8"
-        )
-        media = (ROOT / "sidecars/camofox/patches/camofox-media-runtime.patch").read_text(
-            encoding="utf-8"
-        )
-        browser = (ROOT / "sidecars/camofox/patches/camofox-camoufox-beta30.patch").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("window: [1920, 1080]", window)
-        self.assertIn(
-            "screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }",
-            window,
-        )
-        self.assertIn("locale: launchLocale", window)
-        self.assertIn("ffmpeg", media)
-        self.assertIn("fonts-noto-cjk", media)
-        self.assertIn("ARG CAMOUFOX_RELEASE=beta.30", browser)
-        self.assertNotIn("156.0.1", browser)
+    def test_no_camofox_sidecar_source_workflow_or_package(self) -> None:
+        self.assertFalse((ROOT / "sidecars/camofox").exists())
+        self.assertFalse((ROOT / ".github/workflows/sidecar-camofox.yml").exists())
+        packages = json.loads(CONTRACT.read_text(encoding="utf-8"))["packages"]
+        self.assertNotIn("camofox", packages)
 
-    def test_workflow_bakes_locked_upstream_to_public_package(self) -> None:
-        workflow = (ROOT / ".github/workflows/sidecar-camofox.yml").read_text(encoding="utf-8")
-        lock = json.loads((ROOT / "sidecars/camofox/lock.json").read_text(encoding="utf-8"))
-        self.assertIn(lock["commit"], workflow)
-        self.assertIn("ref: ${{ env.CAMOFOX_COMMIT }}", workflow)
-        self.assertIn("jo-inc/camofox-browser", workflow)
-        self.assertIn("camofox-browser/Dockerfile", workflow)
-        self.assertIn("sidecars/camofox/patches/camofox-window-1920x1080.patch", workflow)
-        self.assertIn("sidecars/camofox/patches/camofox-media-runtime.patch", workflow)
-        self.assertIn("sidecars/camofox/patches/camofox-camoufox-beta30.patch", workflow)
-        self.assertIn("ARG CAMOUFOX_RELEASE=beta.30", workflow)
-        self.assertIn("screen: { minWidth: 1920, maxWidth: 1920, minHeight: 1080, maxHeight: 1080 }", workflow)
-        self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main'", workflow)
-        self.assertNotIn("load-secrets", workflow)
-        self.assertNotIn("MAR" + "KO_", workflow)
-        self.assertNotIn("workflow_call", workflow)
-        self.assertNotIn("771b610", workflow)
+    def test_sidecar_refs_no_longer_accept_camofox(self) -> None:
+        ref = load(IMAGE_REF, "sidecar_image_ref_retired")
+        for repository in ("ghcr.io/switchroom/camofox", "ghcr.io/mekenthompson/hermes-fleet-camofox"):
+            with self.subTest(repository=repository), self.assertRaises(ValueError):
+                ref.require_sidecar_image(f"{repository}@sha256:{DIGEST}")
 
-    def test_public_camofox_tree_has_no_household_or_secret_files(self) -> None:
-        root = ROOT / "sidecars/camofox"
-        names = {path.name for path in root.rglob("*") if path.is_file()}
-        self.assertNotIn("load-secrets.sh", names)
-        self.assertNotIn("bind-entrypoint.sh", names)
-        prohibited = (
-            "car" + "rie",
-            "over" + "lord",
-            "klank" + "er",
-            "gr" + "unt",
-            "cl" + "erk",
-            "gym" + "bro",
-            "mar" + "ko",
-            "law" + "gpt",
-            "ag" + "gie",
-            "switch" + "room",
-            "hermes-fleet-private",
-            "hermes-camofox",
-        )
-        for path in sorted(root.rglob("*")):
-            if not path.is_file():
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore").lower()
-            for needle in prohibited:
-                with self.subTest(path=str(path.relative_to(ROOT)), needle=needle):
-                    self.assertNotIn(needle.lower(), text)
-
-    def test_docs_and_example_require_reviewed_digest(self) -> None:
+    def test_docs_and_example_drop_the_camofox_sidecar(self) -> None:
         docs = (ROOT / "docs/sidecars.md").read_text(encoding="utf-8")
         example = (ROOT / "examples/compose.sidecars.example.yaml").read_text(encoding="utf-8")
-        self.assertIn("`ghcr.io/switchroom/camofox` | publishing", docs)
-        self.assertIn("HERMES_FLEET_CAMOFOX_IMAGE", example)
-        self.assertIn("ghcr.io/switchroom/camofox@sha256", example)
+        self.assertNotIn("ghcr.io/switchroom/camofox", docs)
+        self.assertNotIn("sidecars/camofox", docs)
+        self.assertNotIn("HERMES_FLEET_CAMOFOX_IMAGE", example)
+        self.assertNotIn("camofox", example.lower())
 
 
 class RestLockBehaviorTests(unittest.TestCase):

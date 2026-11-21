@@ -30,13 +30,6 @@
       "visibility": "public",
       "require_digest_pin": true,
       "status": "publishing"
-    },
-    "camofox": {
-      "image": "ghcr.io/switchroom/camofox",
-      "context": "sidecars/camofox",
-      "visibility": "public",
-      "require_digest_pin": true,
-      "status": "publishing"
     }
   }
 }

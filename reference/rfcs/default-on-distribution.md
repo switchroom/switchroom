@@ -55,6 +55,8 @@ Browser handoff (the sidecar Camofox with a public origin and VNC proxies), A2A 
 
 Amendment 2026-11-21 (HF-773, decided by the principal): Camoufox inside the agent's own container is a default. It stays inside the box: the camofox-browser service binds loopback only, needs a per-container access key, sends no telemetry, and its window is on the agent's own Bot Desktop behind the existing Take over lease. The bare image installs it and supervises the service, which costs nothing until something browses; the camofox and camoufox-desktop plugins stay off until an overlay enables them.
 
+Follow-on (HF-773, same decision): with Take over on the agent's own Bot Desktop, the sidecar-era browser handoff (Camofox sidecar image, its handoff plugin and recipe) is retired rather than kept opt-in. A2A and artifact publishing remain the opt-in recipes.
+
 ### Honest status
 
 - **Nothing is on by default yet.** Every default is `planned` until the starter overlay actually enables it. Only then may it be marked `shipped`. In this decision, nothing is `shipped`.
