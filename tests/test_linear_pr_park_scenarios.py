@@ -1,13 +1,14 @@
 """Work the open-PR respawn guard parks after a restart (HF-628).
 
-Core's dispatcher parks a ready card whose comments name a GitHub PR from the
-last 24 h: status ``blocked`` with a ``blocked`` event ``{kind: needs_input,
+Older Core dispatchers park a ready card whose comments name a GitHub PR from
+the last 24 h: status ``blocked`` with a ``blocked`` event ``{kind: needs_input,
 source: respawn_guard}``. Nothing is needed from a person, so Linear shows In
 Review, not Blocked, and once the PR merges or closes the plugin lets the card
 run with one guarded unblock of exactly that park. Real pinned Core tasks, the
 plugin Store and the HTTP fake Linear run the current entrypoints; a fake
 ``gh`` answers at the subprocess boundary.
 """
+import inspect
 import json
 import os
 import subprocess
@@ -27,7 +28,7 @@ PARKED = ("Paused after a restart while PR #7 is open. It resumes by itself when
 
 
 def core_guard_wait():
-    """Core's open-PR park module, or None on a Core that predates it (the rows are then written as it would)."""
+    """Core's respawn guard module, if available."""
     try:
         from hermes_cli import kanban_db_guard_wait
     except ImportError:
@@ -108,19 +109,38 @@ class PrParkScenarios(unittest.TestCase):
         return task
 
     def park(self, task):
-        """What core's dispatcher does to that ready card while the PR comment is fresh."""
+        """Create the legacy park state Linear can encounter after an upgrade."""
         guard_wait = core_guard_wait()
+        reason = "waiting for PR #7 to merge"
         with self.board.conn() as db:
-            if guard_wait:
-                guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
-            else:  # An older Core (CI's companion candidate) has no park: write the rows it writes.
+            if guard_wait is None:  # Core predates the park writer.
                 with self.board.kb.write_txn(db):
                     db.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task,))
                     self.board.kb._append_event(db, task, "blocked", {
-                        "reason": "waiting for PR #7 to merge", "kind": "needs_input", "source": "respawn_guard"})
+                        "reason": reason, "kind": "needs_input", "source": "respawn_guard"})
+            elif "lane" in inspect.signature(guard_wait.record_respawn_guard).parameters:
+                guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
+            else:
+                from hermes_cli.kanban_db_controls import _block_task
+
+                # Recreate the legacy task, event and run via the original park writer's block path.
+                last_event_id = db.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task,)).fetchone()[0]
+                self.assertTrue(_block_task(
+                    db, task, reason=reason, kind="needs_input", expected_run_id=None,
+                    expected_event_id=last_event_id, stops=[], count_recurrence=False, source="respawn_guard",
+                ))
         park = self.events(task)[-1]
-        self.assertEqual((park.kind, park.payload.get("source"), self.board.get(task).status),
+        blocked_task = self.board.get(task)
+        self.assertEqual((park.kind, park.payload.get("source"), blocked_task.status),
                          ("blocked", "respawn_guard", "blocked"))
+        if guard_wait is not None:
+            self.assertEqual((blocked_task.block_kind, blocked_task.block_recurrences), ("needs_input", 0))
+            self.assertEqual((park.payload.get("source_status"), park.payload.get("recurrences")), ("ready", 0))
+            self.assertIsNotNone(park.run_id)
+            run = self.native("get_run", park.run_id)
+            self.assertIsNotNone(run)
+            self.assertEqual((run.task_id, run.status, run.outcome), (task, "blocked", "blocked"))
+            self.assertIsNotNone(run.ended_at)
         return park
 
     def parked(self):
