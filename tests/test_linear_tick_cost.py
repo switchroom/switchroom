@@ -614,6 +614,43 @@ class IdleTickTests(unittest.TestCase):
         bridge._ingress_between()
         bridge.drain_ingress.assert_called_once()
 
+    def test_a_recheck_inside_a_drain_never_starts_a_second_drain(self):
+        # Review of F21: an Issue webhook's recheck ran the mid-pass check while the drain that
+        # delivered it still held unmarked rows, so later deliveries were handled twice.
+        from linear_ingress_fixture import IngressStore, Route
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        from hermes_fleet_linear_plugin.bridge import Bridge
+        producer, store = IngressStore(self.inbox), Store(self.home / "state.db")
+        store.put("iss-1", "chat", "owner")
+        route = Route("default", "default", "/webhook/default", self.home / "unused", self.inbox)
+        for tag, event in (("d1", {"type": "unused"}), ("d2", {"type": "Issue", "action": "update",
+                           "data": {"id": "iss-1"}, "actor": {"id": "human"}}), ("d3", {"type": "unused"})):
+            producer.enqueue(route, f"{tag}-delivery", json.dumps({**event, "tag": tag}).encode())
+        bridge = Bridge(store, SimpleNamespace(), SimpleNamespace(executor_profile="default"), profile="default")
+        bridge._own_viewer = lambda: "app"
+        handled, real = [], bridge.handle_webhook
+        def handle(event, **kwargs):
+            handled.append(event.get("tag"))
+            return real(event, **kwargs) if event.get("type") == "Issue" else None
+        bridge.handle_webhook = handle
+        bridge._recheck_row = lambda row: None
+        bridge.sweep_unbound = lambda: None
+        bridge._last_recheck = time.time()  # only the dirty issue is rechecked
+        bridge._ingress_path, bridge._ingress_seen = self.inbox, bridge_module.file_signature(self.inbox)
+        with patch.object(bridge_module, "INGRESS_CHECK_S", 0):
+            bridge.drain_ingress(self.inbox)
+        self.assertEqual(handled, ["d1", "d2", "d3"])
+
+    def test_a_tool_call_wakes_the_loop_for_its_queued_writes(self):
+        async def run():
+            wake = asyncio.Event()
+            running = {"loop": asyncio.get_running_loop(), "wake": wake}
+            reply = await asyncio.to_thread(plugin._handled, running, "reply")
+            await asyncio.wait_for(wake.wait(), 1)
+            return reply
+        self.assertEqual(asyncio.run(run()), "reply")
+        self.assertEqual(plugin._handled({}, "reply"), "reply")  # before the loop runs: nothing to wake
+
     def test_a_tick_that_did_nothing_reports_idle(self):
         from hermes_fleet_linear_plugin import diag
         bridge = self.bridge()

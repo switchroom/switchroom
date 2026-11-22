@@ -478,6 +478,17 @@ class BoundLinearAPI(LinearAPI):
         left, right = self.issue(issue_id), self.issue(related_issue_id)
         return super().link_issue(left["id"], right["id"], relation)
 
+def _handled(running: dict, reply: Any) -> Any:
+    """A tool call may have queued Linear writes: wake the loop so an idle wait does not delay them."""
+    loop, wake = running.get("loop"), running.get("wake")
+    if loop is not None and wake is not None:
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            pass
+    return reply
+
+
 IDLE_TICK_MAX_S = 15.0  # an idle service ticks at least this often; webhooks and board writes wake it at once
 WATCH_POLL_S = 0.25
 
@@ -566,8 +577,7 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
         waiting_since = logged_at = None
         while server is None and not stop_requested.is_set():
             try:
-                server = transport.Server(home, profile_name,
-                                          lambda args, context: chat.handle(bridge, args, context))
+                server = transport.Server(home, profile_name, lambda args, context: _handled(running, chat.handle(bridge, args, context)))
             except transport.Unavailable as exc:
                 if str(exc) != transport.OWNED:
                     raise

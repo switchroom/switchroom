@@ -3394,11 +3394,12 @@ class Bridge:
             status, newest = native
             if type(newest) is not int or newest != row["last_event_id"]:
                 return False
+            inputs = (version, work, native, self._session_turn_active(issue_id))  # a turn is in-memory state
             if status not in ("done", "archived"):
-                return self._pump_unchanged(issue_id, (version, work, native), status)
+                return self._pump_unchanged(issue_id, inputs, status)
             if not (same_store and memo[3] == native) and not self.store.quiescent_closeout(
                     issue_id, row["task_id"], archived=status == "archived"):
-                return self._pump_unchanged(issue_id, (version, work, native), status)
+                return self._pump_unchanged(issue_id, inputs, status)
             if version is not None:
                 known[issue_id] = (version, work, adapter, native)
             return True
@@ -5617,6 +5618,14 @@ class Bridge:
                           (self.ingress_profile, due_at, due_at)).fetchall()
     def drain_ingress(self, database: Path, limit: int = 50, *, retry_now: bool = False) -> None:
         """Consume verified deliveries the host ingress wrote to this profile's inbox."""
+        # A delivery's handler can run a recheck pass, whose mid-pass check (_ingress_between) must
+        # not start a second drain over rows this one has read but not yet marked: that handles them twice.
+        self._draining = getattr(self, "_draining", 0) + 1
+        try:
+            self._drain_ingress(database, limit, retry_now=retry_now)
+        finally:
+            self._draining -= 1
+    def _drain_ingress(self, database: Path, limit: int, *, retry_now: bool) -> None:
         if not Path(database).exists():
             return
         now = math.inf if retry_now else self.clock()
@@ -5696,7 +5705,8 @@ class Bridge:
         One stat of the inbox files per check, at most every INGRESS_CHECK_S; drain only on a change."""
         ingress = getattr(self, "_ingress_path", None)
         now = time.monotonic()
-        if ingress is None or now - getattr(self, "_ingress_checked", -math.inf) < INGRESS_CHECK_S:
+        if (ingress is None or getattr(self, "_draining", 0)
+                or now - getattr(self, "_ingress_checked", -math.inf) < INGRESS_CHECK_S):
             return
         self._ingress_checked = now
         seen = file_signature(ingress)

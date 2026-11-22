@@ -628,7 +628,9 @@ doubles the gap up to 15 s. A write to the webhook inbox ends the wait at once a
 drained between bindings of a long pass, so a webhook never waits out a full pass; a write to a
 bound native board ends it no sooner than `tick_seconds`. A done, blocked or triage binding whose
 last full pump changed nothing is skipped until the store or its board changes, or for at most
-60 s; running work is always pumped. `takeover` lists the agents this one may
+60 s; running work is always pumped. A `linear` tool call wakes the loop, so its queued writes
+go out at once; other time-based work (a due issue recheck, an outbox retry) can run up to 15 s
+later than before while the loop is idle. `takeover` lists the agents this one may
 [take over from](#take-over-from-another-agent): each entry's `command` is an argv list (no shell)
 that runs that agent's own `hermes` CLI in its own profile, never through `ssh` or `sh -c`;
 invalid entries are dropped and logged.
