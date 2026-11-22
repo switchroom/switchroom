@@ -253,6 +253,29 @@ class QuarantineRetryTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertNotIn("::warning", out)
 
+    def test_retried_ids_persist_in_the_job_summary_and_the_retries_log(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        loader = self.runner.unittest.defaultTestLoader
+        real = loader.discover
+        def discover(start_dir, pattern):
+            suite = real(start_dir=start_dir, pattern=pattern)
+            return unittest.TestSuite(t for t in self.runner.flatten(suite) if t.id() != self.module + ".Q.test_always_red")
+        summary, log = self.root / "summary.md", self.root / "out" / "retries.jsonl"
+        with patch.object(loader, "discover", side_effect=discover), \
+                patch.object(self.runner, "SUMMARY", str(summary)), patch.object(self.runner, "RETRIES_LOG", str(log)):
+            code, _ = self.run_with([flaky], self.module + ".py")
+        self.assertEqual(code, 0)
+        self.assertIn(f"`{flaky}` (HF-test)", summary.read_text(encoding="utf-8"))
+        self.assertEqual([json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()],
+                         [{"id": flaky, "tracking": "HF-test"}])
+
+    def test_ci_uploads_the_retries_log_from_every_runtime_leg(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl", workflow)
+        self.assertIn("path: ${{ runner.temp }}/quarantine-retries.jsonl", workflow)
+        self.assertIn("if-no-files-found: ignore", workflow)
+
     def test_any_unquarantined_or_repeated_failure_stays_red(self):
         flaky = self.module + ".Q.test_flaky_once"
         red = self.module + ".Q.test_always_red"

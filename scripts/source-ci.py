@@ -245,7 +245,11 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         log('reuse: no exact before/after range')
         return None
     try:
-        merged = [pr for pr in api(f'repos/{repository}/commits/{sha}/pulls')
+        candidates = api(f'repos/{repository}/commits/{sha}/pulls?per_page=100')
+        if not isinstance(candidates, list) or len(candidates) >= 100:
+            log(f'reuse: cannot read every PR of {sha} in one page')
+            return None
+        merged = [pr for pr in candidates
                   if pr.get('merged_at') and pr.get('merge_commit_sha') == sha
                   and (pr.get('base') or {}).get('ref') == 'main']
         if len(merged) != 1:
@@ -265,8 +269,10 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
             return None
         # Only this repository's branch for this PR: never a fork run, nor another PR that shares
         # the head commit against a different base.
-        sharing = [p for p in api(f'repos/{repository}/commits/{head}/pulls') if (p.get('head') or {}).get('sha') == head]
-        if [p.get('number') for p in sharing] != [pr['number']]:
+        # A full page may hide another PR on the same head: treat it as not unique.
+        listed = api(f'repos/{repository}/commits/{head}/pulls?per_page=100')
+        sharing = [p for p in listed if (p.get('head') or {}).get('sha') == head]
+        if len(listed) >= 100 or [p.get('number') for p in sharing] != [pr['number']]:
             log(f'reuse: head {head} is not unique to PR #{pr["number"]}')
             return None
         branch = (pr.get('head') or {}).get('ref')
@@ -300,8 +306,7 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
             return None
         log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
         return run.get('html_url') or str(run['id'])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired) as exc:
+    except Exception as exc:  # Any surprise in an optimisation must fall back, never fail selection.
         log(f'reuse: lookup failed ({type(exc).__name__}); running the normal selection')
         return None
 

@@ -105,6 +105,8 @@ def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "tes
 
 QUARANTINE = ROOT / "tests/ci-quarantine.json"
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")  # Read before the run isolates the environment.
+# JSON lines of retried quarantine ids; CI uploads it as an artifact so retries outlive the run's annotations.
+RETRIES_LOG = os.environ.get("LINEAR_QUARANTINE_RETRIES")
 
 
 def quarantined(path: Path = QUARANTINE) -> dict[str, str]:
@@ -134,6 +136,10 @@ def retry_quarantined(result: unittest.TestResult, known: dict[str, str]) -> boo
         if SUMMARY:
             with open(SUMMARY, "a", encoding="utf-8") as stream:
                 stream.write(f"- quarantined flake retried: `{test_id}` ({known[test_id]})\n")
+        if RETRIES_LOG:
+            Path(RETRIES_LOG).parent.mkdir(parents=True, exist_ok=True)
+            with open(RETRIES_LOG, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"id": test_id, "tracking": known[test_id]}) + "\n")
     return True
 
 

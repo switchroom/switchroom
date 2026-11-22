@@ -209,6 +209,32 @@ class PruneTests(unittest.TestCase):
         base = "orgs/switchroom/packages/container/switchroom/versions"
         self.assertEqual(deleted, [f"{base}/1", f"{base}/2"])
 
+    def test_one_failed_delete_logs_and_the_prune_continues(self) -> None:
+        import contextlib, io
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(1, 4)]
+        base = "orgs/switchroom/packages/container/switchroom/versions"
+        deleted: list[str] = []
+        def delete(path: str) -> None:
+            if path.endswith("/2"):
+                raise promote.Refused("gh api --method DELETE exited 1: HTTP 403")
+            deleted.append(path)
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(promote.prune(args, api_lines=lambda _path: versions, delete=delete, now=NOW), 2)
+        self.assertEqual(deleted, [f"{base}/1", f"{base}/3"])
+        self.assertIn("::warning title=Prune delete failed::version 2", out.getvalue())
+        self.assertIn("pruned 2 stage-only version(s); 1 delete(s) failed", out.getvalue())
+
+    def test_prune_fails_only_when_every_delete_fails(self) -> None:
+        import contextlib, io
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(1, 3)]
+        def delete(path: str) -> None:
+            raise OSError("network down")
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(promote.Refused):
+            promote.prune(args, api_lines=lambda _path: versions, delete=delete, now=NOW)
+
     def test_dry_run_and_cap(self) -> None:
         versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(5)]
         deleted: list[str] = []

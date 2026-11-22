@@ -390,15 +390,26 @@ def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str,
         def delete(path: str) -> None:
             run(["gh", "api", "--method", "DELETE", path])
     targets = prunable(api_lines(f"{base}?per_page=100"), now)[: args.max_deletions]
+    failed = 0
     for version in targets:
         tags = version["metadata"]["container"]["tags"]
         if args.dry_run:
             print(f"would delete version {version['id']} {tags} (updated {version.get('updated_at')})")
-        else:
+            continue
+        try:
             delete(f"{base}/{int(version['id'])}")
-            print(f"deleted version {version['id']} {tags} (updated {version.get('updated_at')})")
-    print(f"{'would prune' if args.dry_run else 'pruned'} {len(targets)} stage-only version(s)")
-    return len(targets)
+        except Exception as exc:  # One refused delete must not stop the day's prune.
+            failed += 1
+            print(f"::warning title=Prune delete failed::version {version['id']} {tags}: "
+                  f"{type(exc).__name__}: {str(exc)[:300]}", flush=True)
+            continue
+        print(f"deleted version {version['id']} {tags} (updated {version.get('updated_at')})")
+    done = len(targets) - failed
+    print(f"{'would prune' if args.dry_run else 'pruned'} {done} stage-only version(s)"
+          + (f"; {failed} delete(s) failed" if failed else ""))
+    if targets and failed == len(targets):
+        raise Refused(f"every one of {failed} delete(s) failed")
+    return done
 
 
 def prune_command(args: argparse.Namespace) -> None:

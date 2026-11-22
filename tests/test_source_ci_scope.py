@@ -380,10 +380,10 @@ class PushReuseTests(unittest.TestCase):
 
     def responses(self, **override):
         r = {
-            f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
+            f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
                 {'number': 7, 'merged_at': '2026-11-22T00:00:00Z', 'merge_commit_sha': self.SHA,
                  'base': {'ref': 'main'}, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
-            f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
+            f'repos/{self.REPO}/commits/{self.HEAD}/pulls?per_page=100': [
                 {'number': 7, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
             f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': 't' * 40}},
             f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 't' * 40}},
@@ -439,21 +439,26 @@ class PushReuseTests(unittest.TestCase):
             'aggregate red': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
                 'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
             'aggregate missing': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {'jobs': []}},
-            'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': []},
+            'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': []},
             'fork run': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
                 head_repository={'full_name': 'someone/fork'})]}},
             'run of another branch': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
                 head_branch='other')]}},
-            'head shared with another PR': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
+            'head shared with another PR': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls?per_page=100': [
                 {'number': 7, 'head': {'sha': self.HEAD}}, {'number': 9, 'head': {'sha': self.HEAD}}]},
             # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
             'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
             'events unreadable in one page': {f'repos/{self.REPO}/issues/7/events?per_page=100':
                 [{'event': 'labeled', 'created_at': '2026-11-20T00:00:00Z'}] * 100},
-            'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
-                dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls'][0], merge_commit_sha='d' * 40)]},
+            'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
+                dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100'][0], merge_commit_sha='d' * 40)]},
             'malformed': {f'repos/{self.REPO}/git/commits/{self.SHA}': {}},
+            'full page of PRs on the head': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls?per_page=100':
+                [{'number': 7, 'head': {'sha': self.HEAD}}] + [{'number': 100 + i, 'head': {'sha': 'e' * 40}} for i in range(99)]},
+            'full page of PRs on the merge': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100':
+                base[f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100'] * 100},
+            'PR list not a list': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': {'message': 'x'}},
         }
         for name, override in cases.items():
             with self.subTest(name=name):
@@ -465,6 +470,16 @@ class PushReuseTests(unittest.TestCase):
         self.assertIsNone(self.find(missing)[0])
         self.assertIsNone(self.find(self.responses(), before='0' * 40)[0])
         self.assertIsNone(self.find(self.responses(), before='')[0])
+
+    def test_unexpected_exception_in_lookup_falls_back(self):
+        module = load_selector()
+        for error in (RuntimeError('boom'), LookupError('x'), ZeroDivisionError()):
+            with self.subTest(error=type(error).__name__):
+                def api(path, error=error):
+                    raise error
+                logs = []
+                self.assertIsNone(module.find_reuse(self.REPO, self.SHA, self.BEFORE, api=api, log=logs.append))
+                self.assertIn(type(error).__name__, logs[-1])
 
     def test_reused_plan_passes_gate_only_with_tests_and_runtime_skipped(self):
         module = load_selector()
