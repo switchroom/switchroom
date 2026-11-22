@@ -59,7 +59,9 @@ class PublicFattenContractTests(unittest.TestCase):
         fallback = gh_step[gh_step.index('if [ "$api_ok" != 1 ]'):]
         self.assertNotIn("curl_auth", fallback)
         workflow = (ROOT / ".github/workflows/fleet-image.yml").read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("github_token=${{ github.token }}"), 2)
+        # One BuildKit secret per build step: preflight, the cached publish build and its fallback.
+        self.assertEqual(workflow.count("github_token=${{ github.token }}"), 3)
+        self.assertEqual(workflow.count("uses: docker/build-push-action@"), 3)
         self.assertNotIn("GITHUB_TOKEN=", workflow.split("build-args:", 1)[1].split("secrets:", 1)[0])
         self.assertIn('test "$(gh --version | awk \'NR==1{print $3}\')" = "${GH_VERSION}"', text)
         self.assertNotIn("4c5f90f0198e28652d2c111e5c529e2a9901a7b2f20808b1cbd3a64d2a93a8d6", text)
