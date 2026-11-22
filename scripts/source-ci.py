@@ -2,7 +2,8 @@
 """Small, conservative source-CI selector and fail-closed required aggregate.
 
 PRs compare merge-base; pushes compare the exact before/after trees. Unknown
-inputs and ambiguous history run everything. Image selection is independent.
+inputs run every unit module; runtime inputs and ambiguous history run
+everything. Image selection is independent.
 """
 import argparse
 import fnmatch
@@ -39,6 +40,15 @@ EXACT = {'scripts/claude-acp-subscription': 'claude',
          'scripts/tooling-policy-hook': 'tooling',
          'scripts/sidecar_image_ref.py': 'sidecars'}
 SELECTOR_INPUTS = {'scripts/source-ci.py', 'tests/test_source_ci_scope.py'}
+# Unmapped paths the real-Agent legs read: the pinned Core, its environments, the runners and
+# any shared test helper or fixture. Only these (or an unknown change set) widen runtime.
+RUNTIME_INPUTS = {
+    'release/agent-image-manifest.json', 'release/linear-scenario-requirements.txt',
+    'tests/native-input-requirements.txt', 'scripts/read-agent-image-manifest.py',
+    'scripts/run-linear-scenarios.py', 'scripts/run-linear-input-scenarios.py',
+    'scripts/run-linear-origin-scenarios.py', 'scripts/check-linear-origin-guard.py',
+}
+RUNTIME_INPUT_PREFIXES = ('tests/',)
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -61,13 +71,40 @@ def inventory():
     return sorted(str(p.relative_to(ROOT)) for p in (ROOT / 'tests').glob('test_*.py'))
 
 
+def _lanes_for(tests):
+    lanes = {lane: False for lane in LANES}
+    for path in tests:
+        name = Path(path).name
+        if fnmatch.fnmatch(name, 'test_linear_*scenarios.py'):
+            lanes['linear'] = True
+        if fnmatch.fnmatch(name, 'test_linear_origin*_native.py'):
+            lanes['origin'] = True
+        if name == 'test_claude_acp_context.py':
+            lanes['acp'] = True
+        if fnmatch.fnmatch(name, 'test_linear_native_*seam.py'):
+            lanes['input'] = True
+        if name in {'test_linear_native_work_journey.py', 'test_linear_worker_questions.py'}:
+            lanes['journey'] = True
+    return lanes
+
+
+def is_runtime_input(path):
+    """Positive allowlist of inputs the real-Agent legs consume outside a mapped component."""
+    return path in RUNTIME_INPUTS or path.startswith(RUNTIME_INPUT_PREFIXES)
+
+
 def select(paths, full=False, reason='changed paths'):
+    """`units_full` runs every unit module; `runtime_full` also runs every real-Agent leg.
+
+    An unmapped path broadens units only. Runtime broadens only for a listed runtime input,
+    a selector or workflow input, or an unknown change set (`full`).
+    """
     available = inventory()
     tests = set()
-    lanes = {lane: False for lane in LANES}
+    units_full = runtime_full = full
     for path in paths:
         if path in SELECTOR_INPUTS or path.startswith('.github/'):
-            full = True
+            units_full = runtime_full = True
         elif path in available:
             tests.add(path)
             if Path(path).name in SHARED_TESTS:
@@ -81,35 +118,28 @@ def select(paths, full=False, reason='changed paths'):
                 if path.startswith(prefix):
                     component = name
                     break
-            if component is None:
-                full = True
-            else:
+            if component is not None:
                 patterns = COMPONENTS[component] + PUBLIC
                 tests.update(p for p in available if any(fnmatch.fnmatch(Path(p).name, pat) for pat in patterns))
-    if full:
+            elif is_runtime_input(path):
+                units_full = runtime_full = True
+            else:
+                units_full = True
+    lanes = {lane: True for lane in LANES} if runtime_full else _lanes_for(tests)
+    if units_full:
         tests = set(available)
-        lanes = {lane: True for lane in LANES}
-        reason = 'full: requested or uncertain input'
-    else:
-        for path in tests:
-            name = Path(path).name
-            if fnmatch.fnmatch(name, 'test_linear_*scenarios.py'):
-                lanes['linear'] = True
-            if fnmatch.fnmatch(name, 'test_linear_origin*_native.py'):
-                lanes['origin'] = True
-            if name == 'test_claude_acp_context.py':
-                lanes['acp'] = True
-            if fnmatch.fnmatch(name, 'test_linear_native_*seam.py'):
-                lanes['input'] = True
-            if name in {'test_linear_native_work_journey.py', 'test_linear_worker_questions.py'}:
-                lanes['journey'] = True
+    if runtime_full:
+        reason = 'full: requested, uncertain or runtime input'
+    elif units_full:
+        reason = 'units_full: unmapped non-runtime input; real-Agent legs scoped'
     return {'tests': sorted(tests), **lanes,
-            'runtime': any(lanes[k] for k in ('linear', 'acp', 'origin', 'input', 'journey')),
-            'full': full, 'reason': reason}
+            'runtime': any(lanes[k] for k in LANES),
+            'full': runtime_full, 'units_full': units_full, 'runtime_full': runtime_full,
+            'reason': reason}
 
 
 def changed_paths(repo, event, base, head):
-    """None means uncertain: preserve status and refuse rename/delete narrowing."""
+    """None means uncertain. Renames and copies route by both paths, deletes by the old path."""
     if event not in ('push', 'pull_request'):
         return None
     if not all(re.fullmatch(r'[0-9a-f]{40}', value or '') and value != '0' * 40 for value in (base, head)):
@@ -119,13 +149,18 @@ def changed_paths(repo, event, base, head):
         raw = subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-status',
                                        '-z', '--find-renames', *args, '--'], stderr=subprocess.PIPE)
         fields = raw.decode('utf-8').split('\0')
-        if fields.pop() != '' or len(fields) % 2:
+        if fields.pop() != '':
             return None
         paths = []
-        for status, path in zip(fields[::2], fields[1::2]):
-            if status not in ('A', 'M') or not path:
+        while fields:
+            status = fields.pop(0)
+            width = 2 if status[:1] in ('R', 'C') else 1
+            if status[:1] not in ('A', 'M', 'D', 'T', 'R', 'C') or len(fields) < width:
                 return None
-            paths.append(path)
+            names = [fields.pop(0) for _ in range(width)]
+            if not all(names):
+                return None
+            paths.extend(names)
         return paths
     except (OSError, UnicodeError, subprocess.CalledProcessError):
         return None

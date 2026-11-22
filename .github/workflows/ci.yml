@@ -93,8 +93,9 @@ jobs:
 
   runtime:
     # One leg per independent real-Agent proof, so the slowest proof (not their sum) sets wall
-    # clock. Kanban and origin proofs are split into disjoint round-robin test slices whose union
-    # is the whole suite. The aggregate sees a single `runtime` result: success only if every leg
+    # clock. Input, kanban and origin proofs are split into disjoint round-robin test slices whose
+    # union is the whole suite. Legs are listed longest first so they start first when runners
+    # are contended. The aggregate sees a single `runtime` result: success only if every leg
     # succeeds. fail-fast is off so one run reports every failing proof.
     needs: selection
     if: needs.selection.outputs.runtime == 'true'
@@ -104,6 +105,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - {lane: input, shard: 1/3}
+          - {lane: input, shard: 2/3}
+          - {lane: input, shard: 3/3}
           - {lane: kanban, shard: 1/3}
           - {lane: kanban, shard: 2/3}
           - {lane: kanban, shard: 3/3}
@@ -126,7 +130,8 @@ jobs:
           case "$LANE" in
             kanban) selected="$LINEAR" ;;
             origin) selected="$ORIGIN" ;;
-            native) [[ "$ACP" == true || "$INPUT" == true || "$JOURNEY" == true ]] && selected=true || selected=false ;;
+            input) selected="$INPUT" ;;
+            native) [[ "$ACP" == true || "$JOURNEY" == true ]] && selected=true || selected=false ;;
             *) echo "unknown runtime lane: $LANE" >&2; exit 1 ;;
           esac
           echo "selected=$selected" >> "$GITHUB_OUTPUT"
@@ -194,12 +199,14 @@ jobs:
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-origin-scenarios.py \
             --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"
       - name: Guarded native input against release Core
-        if: matrix.lane == 'native' && needs.selection.outputs.input == 'true'
+        if: matrix.lane == 'input' && needs.selection.outputs.input == 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
             --require-hashes --only-binary=:all: -r tests/native-input-requirements.txt
           "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
-            --agent-source "$GITHUB_WORKSPACE/agent-source"
+            --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"
 
   history-root:
     runs-on: ubuntu-latest

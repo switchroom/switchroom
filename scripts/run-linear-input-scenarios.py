@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from importlib import util
 from pathlib import Path
 import subprocess
 import sys
@@ -14,11 +15,27 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _scenario_runner():
+    """Reuse run-linear-scenarios.py's K/N parser and round-robin slicer (one definition)."""
+    spec = util.spec_from_file_location("linear_scenario_runner", ROOT / "scripts/run-linear-scenarios.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the scenario runner")
+    module = util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agent-source", type=Path, required=True)
     parser.add_argument("--expected-revision", help="Explicit immutable candidate Core revision; default is the release manifest pin")
+    parser.add_argument("--shard", help="K/N: run only the K-th of N round-robin test slices (CI parallelism)")
     args = parser.parse_args()
+    runner = _scenario_runner()
+    try:
+        shard = runner.parse_shard(args.shard)
+    except ValueError as exc:
+        parser.error(str(exc))
     source = args.agent_source.resolve(strict=True)
     manifest = json.loads((ROOT / "release/agent-image-manifest.json").read_text())
     actual = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
@@ -54,7 +71,11 @@ def main():
         sys.path.insert(0, str(source))
         from hermes_cli import version_info
         version_info._cached_version_info = version_info.VersionInfo("fixture", "fixture", 0, actual, None, "ci")
-        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_linear_native_*seam.py")
+        suite = runner.select_shard(unittest.defaultTestLoader.discover(
+            str(ROOT / "tests"), pattern="test_linear_native_*seam.py"), shard)
+        if not suite.countTestCases():
+            print("Native input proof selected zero tests", file=sys.stderr)
+            return 1
         result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
         if guard.violations:
             print("Forbidden operations attempted: " + json.dumps(guard.violations), file=sys.stderr)
