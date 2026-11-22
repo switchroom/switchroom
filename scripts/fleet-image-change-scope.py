@@ -110,6 +110,7 @@ def git_changed_paths(base: str, head: str, *, cwd: Path, merge_base: bool) -> l
 
 def decide(
     event: str, base: str, head: str, changed: Callable[[str, str, bool], list[str] | None],
+    exists: Callable[[str], bool] = lambda _path: True,
 ) -> tuple[bool, str, list[str]]:
     """Return (run_image_jobs, reason, matched_inputs); unknown ranges fail open."""
     if event == "pull_request":
@@ -120,7 +121,7 @@ def decide(
         return True, f"{event or 'unknown'} event always bakes the image", []
     if paths is None:
         return True, f"changed range {base[:12] or '?'}..{head[:12] or '?'} cannot be determined; failing open", []
-    if event == "pull_request" and paths and all(is_pin_path(path) for path in paths):
+    if event == "pull_request" and paths and all(is_pin_path(path) and exists(path) for path in paths):
         return False, "pin-only PR: the main push bakes, scans and publishes after full CI", []
     matched = image_inputs(paths)
     if matched:
@@ -141,7 +142,8 @@ def main() -> int:
         return git_changed_paths(base, head, cwd=args.repo_root, merge_base=merge_base)
 
     try:
-        run, reason, matched = decide(args.event, args.base, args.head, changed)
+        run, reason, matched = decide(args.event, args.base, args.head, changed,
+                                      lambda path: (args.repo_root / path).is_file())
     except Exception as exc:  # noqa: BLE001 - scoping must never block a bake
         run, reason, matched = True, f"scope script failed ({exc}); failing open", []
     print(f"fleet image scope: {'run' if run else 'skip'} ({reason})")

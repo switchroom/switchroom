@@ -79,6 +79,9 @@ class ChangeScopeDecisionTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 run, _, _ = self.scope.decide("pull_request", "a" * 40, "b" * 40, lambda *_: [*pin, extra])
                 self.assertTrue(run, extra)
+        run, _, _ = self.scope.decide("pull_request", "a" * 40, "b" * 40, lambda *_: list(pin),
+                                      lambda path: path != pin[1])
+        self.assertTrue(run, "a deleted pin file must not narrow the bake")
 
     def test_pull_request_diffs_against_the_merge_base_and_push_against_before(self):
         calls = []

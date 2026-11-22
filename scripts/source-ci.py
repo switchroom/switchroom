@@ -45,7 +45,7 @@ SELECTOR_INPUTS = {'scripts/source-ci.py', 'tests/test_source_ci_scope.py'}
 # runtime lanes run once, on the main push, and that exact-SHA run gates publication
 # (fleet-image.yml "Verify exact main CI gate"). Pushes are never narrowed this way.
 PIN_FILES = {'release/agent-image-manifest.json'}
-PIN_PATTERNS = ('plugins/*/UPSTREAM.json',)
+PIN_PATTERN = re.compile(r'^plugins/[^/]+/UPSTREAM\.json$')
 PIN_TESTS = (
     'tests/test_camoufox_runtime.py', 'tests/test_disk_cleanup_plugin.py',
     'tests/test_image_release.py', 'tests/test_image_scope_and_scans.py',
@@ -75,7 +75,7 @@ def inventory():
 
 def is_pin_only(paths):
     return bool(paths) and all(
-        p in PIN_FILES or any(fnmatch.fnmatch(p, pat) for pat in PIN_PATTERNS) for p in paths)
+        p in PIN_FILES or PIN_PATTERN.fullmatch(p) for p in paths)
 
 
 def select(paths, full=False, reason='changed paths', event='push'):

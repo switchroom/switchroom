@@ -109,6 +109,7 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertIn('tests/test_image_release.py', plan['tests'])
         self.assertTrue(self.select(*pin, extra=('--event', 'push'))['full'])
         self.assertTrue(self.select(*pin, 'Dockerfile', extra=('--event', 'pull_request'))['full'])
+        self.assertTrue(self.select(pin[0], 'plugins/a/b/UPSTREAM.json', extra=('--event', 'pull_request'))['full'])
         mixed = self.select(*pin, 'plugins/linear/plugin.py', extra=('--event', 'pull_request'))
         self.assertTrue(mixed['runtime'])
 
