@@ -58,7 +58,7 @@ FAST_LANE_PREFIXES = ('plugins/linear/',)
 # plugin manifest and registration stay fully gated before merge even inside the plugin.
 FAST_LANE_GATED = frozenset('plugins/linear/' + name for name in (
     '__init__.py', 'plugin.yaml', 'oauth.py', 'guard.py', 'transport.py', 'api.py', 'bridge.py',
-    'handoff.py', 'origin.py', 'origin_provider.py', 'origin_state.py'))
+    'handoff.py', 'origin.py', 'origin_provider.py', 'origin_state.py', 'native_store.py'))
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -155,13 +155,17 @@ def select(paths, full=False, reason='changed paths', event='push', added=()):
 def fast_lane_eligible(paths, added=()):
     """Only Linear plugin behaviour, existing test modules and prose may defer real-Agent legs.
 
-    A test module added by the change is not yet proven and stays gated, as do the plugin's
-    credential, authority, identity and manifest files (FAST_LANE_GATED) and everything else
+    A test module or plugin file added (or renamed/deleted) by the change is not yet proven and
+    stays gated, as do the plugin's credential, authority, identity and manifest files
+    (FAST_LANE_GATED) and everything else
     (image inputs, the agent pin, workflows, the selector, runners, helpers, other code).
     """
     available = set(inventory()) - set(added)
     def plugin(p):
-        return p.startswith(FAST_LANE_PREFIXES) and p not in FAST_LANE_GATED
+        # Allowlist, not deny list: only a file that already existed and still exists, outside the
+        # gated set. A new, renamed or deleted plugin file stays gated.
+        return (p.startswith(FAST_LANE_PREFIXES) and p not in FAST_LANE_GATED and p not in added
+                and (ROOT / p).is_file())
     def prose(p):
         return p.endswith('.md') and not is_runtime_input(p)
     return bool(paths) and any(plugin(p) for p in paths) and all(
