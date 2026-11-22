@@ -212,6 +212,71 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertTrue(select('push', moved, gone)['runtime_full'])
 
 
+class FastLaneTests(unittest.TestCase):
+    def select(self, *paths, event='pull_request'):
+        result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', event, '--files', *paths],
+                                cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_linear_plugin_pr_defers_component_legs_to_push(self):
+        pr = self.select('plugins/linear/api.py', 'plugins/linear/README.md')
+        push = self.select('plugins/linear/api.py', 'plugins/linear/README.md', event='push')
+        self.assertFalse(pr['runtime'])
+        self.assertEqual(pr['tests'], push['tests'])
+        self.assertTrue(push['runtime'])
+        deferred = [lane for lane in ('linear', 'acp', 'origin', 'input', 'journey') if push[lane]]
+        self.assertEqual(pr['deferred_on_pr'], sorted(deferred))
+        self.assertEqual(push['deferred_on_pr'], sorted(deferred))
+        self.assertIn('fast lane', pr['reason'])
+
+    def test_touched_scenario_files_keep_their_legs_before_merge(self):
+        pr = self.select('plugins/linear/api.py', 'tests/test_linear_native_input_seam.py')
+        self.assertTrue(pr['input'])
+        self.assertFalse(pr['linear'])
+        self.assertNotIn('input', pr['deferred_on_pr'])
+        pr = self.select('plugins/linear/api.py', 'tests/test_linear_active_recovery_scenarios.py')
+        self.assertTrue(pr['linear'])
+        self.assertFalse(pr['input'])
+
+    def test_gated_inputs_never_defer(self):
+        for other in ('release/agent-image-manifest.json', 'Dockerfile', '.github/workflows/ci.yml',
+                      'scripts/source-ci.py', 'scripts/run-linear-scenarios.py', 'tests/linear_fake_api.py',
+                      'sidecars/linear-receiver/server.py', 'plugins/disk-cleanup/plugin.py', 'unknown.file'):
+            with self.subTest(other=other):
+                plan = self.select('plugins/linear/api.py', other)
+                self.assertEqual(plan['deferred_on_pr'], [])
+                self.assertNotIn('fast lane', plan['reason'])
+        # Tests-only and docs-only changes have nothing to defer: they already run exactly theirs.
+        self.assertEqual(self.select('tests/test_linear_ci_wait_scenarios.py')['deferred_on_pr'], [])
+        self.assertEqual(self.select('README.md')['deferred_on_pr'], [])
+        for event in ('workflow_dispatch', 'schedule'):
+            plan = self.select('plugins/linear/api.py', event=event)
+            self.assertTrue(plan['full'])
+            self.assertEqual(plan['deferred_on_pr'], [])
+
+    def test_deferred_push_never_consults_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], text=True).strip()
+            git('init', '-q')
+            Path(tmp, 'plugins/linear').mkdir(parents=True)
+            Path(tmp, 'plugins/linear/api.py').write_text('a')
+            git('add', '-A'); git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'a')
+            before = git('rev-parse', 'HEAD')
+            Path(tmp, 'plugins/linear/api.py').write_text('b')
+            git('add', '-A'); git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'b')
+            after = git('rev-parse', 'HEAD')
+            result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', 'push', '--repo', tmp,
+                                     '--base', before, '--head', after, '--reuse-repository', 'example/none'],
+                                    cwd=ROOT, capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = json.loads(result.stdout)
+            self.assertTrue(plan['runtime'])
+            self.assertNotIn('reused_from', plan)
+            self.assertNotIn('reuse:', result.stderr)
+
+
 class WorkflowContractTests(unittest.TestCase):
     def test_all_work_is_bound_to_selection_and_aggregate(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()

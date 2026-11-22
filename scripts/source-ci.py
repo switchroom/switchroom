@@ -49,6 +49,11 @@ RUNTIME_INPUTS = {
     'scripts/run-linear-origin-scenarios.py', 'scripts/check-linear-origin-guard.py',
 }
 RUNTIME_INPUT_PREFIXES = ('tests/',)
+# Defer-CI fast lane (PR only): a change made only of these, existing test modules and prose
+# runs units plus the real-Agent legs of the test files it touches before merge; main push CI
+# runs the component's full legs, a red push is auto-reverted, and nothing delivers until
+# main is green (scripts/auto-revert.py, plugin-pin-handoff.yml, fleet-image.yml).
+FAST_LANE_PREFIXES = ('plugins/linear/',)
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -93,7 +98,7 @@ def is_runtime_input(path):
     return path in RUNTIME_INPUTS or path.startswith(RUNTIME_INPUT_PREFIXES)
 
 
-def select(paths, full=False, reason='changed paths'):
+def select(paths, full=False, reason='changed paths', event='push'):
     """`units_full` runs every unit module; `runtime_full` also runs every real-Agent leg.
 
     An unmapped path broadens units only. Runtime broadens only for a listed runtime input,
@@ -132,10 +137,33 @@ def select(paths, full=False, reason='changed paths'):
         reason = 'full: requested, uncertain or runtime input'
     elif units_full:
         reason = 'units_full: unmapped non-runtime input; real-Agent legs scoped'
+    deferred = [] if full else deferrable_lanes(paths, lanes)
+    if event == 'pull_request' and deferred:
+        lanes = {lane: lanes[lane] and lane not in deferred for lane in LANES}
+        reason = 'fast lane: real-Agent legs ' + ', '.join(deferred) + ' run after merge on main push'
     return {'tests': sorted(tests), **lanes,
             'runtime': any(lanes[k] for k in LANES),
             'full': runtime_full, 'units_full': units_full, 'runtime_full': runtime_full,
-            'reason': reason}
+            'deferred_on_pr': deferred, 'reason': reason}
+
+
+def fast_lane_eligible(paths):
+    """Only Linear plugin source, existing test modules and prose may defer real-Agent legs.
+
+    Everything else (image inputs, the agent pin, workflows, the selector, runners, helpers,
+    other code) stays fully gated before merge.
+    """
+    available = set(inventory())
+    return bool(paths) and any(p.startswith(FAST_LANE_PREFIXES) for p in paths) and all(
+        p.startswith(FAST_LANE_PREFIXES) or p in available or p.endswith('.md') for p in paths)
+
+
+def deferrable_lanes(paths, lanes):
+    """Lanes a fast-lane PR skips: those selected only by the component, not by a touched test."""
+    if not fast_lane_eligible(paths):
+        return []
+    touched = _lanes_for(p for p in paths if p in set(inventory()))
+    return sorted(lane for lane in LANES if lanes[lane] and not touched[lane])
 
 
 def changed_paths(repo, event, base, head):
@@ -245,7 +273,7 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
 
 def reused_plan(url):
     return {'tests': [], **{lane: False for lane in LANES}, 'runtime': False, 'full': False,
-            'units_full': False, 'runtime_full': False, 'reused_from': url,
+            'units_full': False, 'runtime_full': False, 'deferred_on_pr': [], 'reused_from': url,
             'reason': 'reused: identical tree already green in ' + url}
 
 
@@ -288,13 +316,14 @@ def main():
     args = parser.parse_args()
     if args.command == 'select':
         paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head)
-        reuse = None
-        if args.event == 'push' and args.reuse_repository and args.files is None:
+        plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'),
+                      event=args.event)
+        # A fast-lane PR deferred legs to this push, so its run cannot stand in for it.
+        if (args.event == 'push' and args.reuse_repository and args.files is None
+                and not plan['deferred_on_pr']):
             reuse = find_reuse(args.reuse_repository, args.head, args.base)
-        if reuse is not None:
-            plan = reused_plan(reuse)
-        else:
-            plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'))
+            if reuse is not None:
+                plan = reused_plan(reuse)
         encoded = json.dumps(plan, separators=(',', ':'))
         print(encoded)
         if args.github_output:
