@@ -41,7 +41,7 @@ class LinearProviderOriginScenarios(unittest.IsolatedAsyncioTestCase):
         message = SESSION if assignment else ACTIVITY
         source = SessionSource(platform=Platform("linear"), chat_id=ISSUE, thread_id=SESSION,
                                scope_id=ORG, user_id=USER, message_id=message, is_bot=False)
-        self.runner.adapters[source.platform] = SimpleNamespace(requires_durable_input_ack=True)
+        self.runner.adapters[source.platform] = SimpleNamespace()
         # This is the consumer author's frozen NativeInput.message contract.
         # The authoritative sender and provider IDs are then read independently
         # from the actual committed native owner row, not from this test object.
