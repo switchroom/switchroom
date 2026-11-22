@@ -9,12 +9,33 @@ from .transport import NativeContext, Unavailable
 INTERACTIVE_SOURCES = frozenset({"cli", "tui", "gui", "desktop", "acp"})
 
 
-def stop_evidence(home: Path, session_id: str) -> dict:
-    """Read the existing core cleanup checkpoint when supported; absence is never false."""
+def _no_stop_checkpoint(_store, _session_id) -> None:
+    return None
+
+
+def stop_checkpoint_reader():
+    """Core's pending-Stop reader, or None when this core cannot answer.
+
+    A core with the durable process-Stop fence exposes ``process_stop_pending``. A core whose Stop is
+    the native interrupt plus a best-effort kill (``stop_session_processes``, no fence) never has a
+    pending checkpoint, so it reads as clear. A core with neither cannot answer: absence is never false.
+    """
     from gateway import session_ancillary
     getter = getattr(session_ancillary, "process_stop_pending", None)
+    if getter is not None:
+        return getter
+    if callable(getattr(session_ancillary, "stop_session_processes", None)):
+        return _no_stop_checkpoint
+    return None
+
+
+def stop_evidence(home: Path, session_id: str) -> dict:
+    """Read the existing core cleanup checkpoint when supported; absence is never false."""
+    getter = stop_checkpoint_reader()
     if getter is None:
         return {"state": "unknown", "source": "native_stop_checkpoint_unavailable", "quiescence_proven": False}
+    if getter is _no_stop_checkpoint:
+        return {"state": "clear", "source": "native_stop_without_checkpoint", "quiescence_proven": False}
     from . import native_store
     with native_store.reader(home) as store:
         pending = getter(store, session_id)

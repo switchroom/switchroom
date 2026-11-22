@@ -532,8 +532,8 @@ def _snapshot(home, state, issue, binding_profile, native_profile, stop_id, decl
                                find_admission as find_session_admission, list_admissions as list_session_admissions)
     RuntimeStoreError = native_store.refusal_type()
     from gateway.session_policy import restore_policy
-    from gateway import session_ancillary
-    getter = getattr(session_ancillary, "process_stop_pending", None)
+    from .origin_state import stop_checkpoint_reader
+    getter = stop_checkpoint_reader()
     _require(getter is not None, "native_stop_checkpoint_unsupported")
     # The ingress/deployment routing label can differ from the executor's native profile
     # (isolated fleet homes use default). It must never select a home or reject its valid link.
