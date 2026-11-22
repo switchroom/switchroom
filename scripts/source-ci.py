@@ -169,7 +169,10 @@ def changed_paths(repo, event, base, head):
 def gate(plan, needs):
     if not isinstance(plan, dict) or type(plan.get('runtime')) is not bool:
         return False
-    required = {'selection': True, 'source-tests': True, 'runtime': plan['runtime']}
+    reused = plan.get('reused_from') is not None
+    if reused and plan['runtime']:
+        return False
+    required = {'selection': True, 'source-tests': not reused, 'runtime': plan['runtime']}
     if set(needs) != set(required):
         return False
     for job, selected in required.items():
@@ -177,6 +180,73 @@ def gate(plan, needs):
         if state != ('success' if selected else 'skipped'):
             return False
     return True
+
+
+WORKFLOW_PATH = '.github/workflows/ci.yml'
+
+
+def gh_api(path):
+    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE))
+
+
+def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
+    """URL of a green PR CI run that already proved this push's exact tree, else None.
+
+    All three must hold: tree(sha) == tree(pr.head); `before` is an ancestor of (or equal
+    to) pr.head, so the PR was current with main; and the newest CI pull_request run for
+    pr.head concluded success with its `source-checks` aggregate green. Any doubt or API
+    error answers None, which runs the normal selection.
+    """
+    sha_re = r'[0-9a-f]{40}'
+    if not all(re.fullmatch(sha_re, v or '') and v != '0' * 40 for v in (sha, before)):
+        log('reuse: no exact before/after range')
+        return None
+    try:
+        merged = [pr for pr in api(f'repos/{repository}/commits/{sha}/pulls')
+                  if pr.get('merged_at') and pr.get('merge_commit_sha') == sha
+                  and (pr.get('base') or {}).get('ref') == 'main']
+        if len(merged) != 1:
+            log(f'reuse: {len(merged)} merged PRs for {sha}')
+            return None
+        pr = merged[0]
+        head = (pr.get('head') or {}).get('sha') or ''
+        if not re.fullmatch(sha_re, head):
+            return None
+        trees = [api(f'repos/{repository}/git/commits/{c}')['tree']['sha'] for c in (sha, head)]
+        if trees[0] != trees[1]:
+            log(f'reuse: tree of {sha} differs from PR #{pr["number"]} head {head}')
+            return None
+        status = api(f'repos/{repository}/compare/{before}...{head}').get('status')
+        if status not in ('ahead', 'identical'):
+            log(f'reuse: {before} is not an ancestor of PR head {head} ({status})')
+            return None
+        runs = [r for r in api(f'repos/{repository}/actions/workflows/ci.yml/runs'
+                               f'?event=pull_request&head_sha={head}&per_page=100')['workflow_runs']
+                if r.get('head_sha') == head and r.get('path') == WORKFLOW_PATH
+                and r.get('event') == 'pull_request']
+        if not runs:
+            log(f'reuse: no PR CI run for {head}')
+            return None
+        run = max(runs, key=lambda r: (str(r.get('created_at', '')), int(r.get('id', 0))))
+        if run.get('status') != 'completed' or run.get('conclusion') != 'success':
+            log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
+            return None
+        jobs = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
+        aggregate = [j for j in jobs if j.get('name') == 'source-checks']
+        if len(aggregate) != 1 or aggregate[0].get('conclusion') != 'success':
+            log(f'reuse: source-checks of {run.get("html_url")} is not a single success')
+            return None
+        log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
+        return run.get('html_url') or str(run['id'])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError) as exc:
+        log(f'reuse: lookup failed ({type(exc).__name__}); running the normal selection')
+        return None
+
+
+def reused_plan(url):
+    return {'tests': [], **{lane: False for lane in LANES}, 'runtime': False, 'full': False,
+            'units_full': False, 'runtime_full': False, 'reused_from': url,
+            'reason': 'reused: identical tree already green in ' + url}
 
 
 def run_units(plan):
@@ -208,6 +278,8 @@ def main():
     choose.add_argument('--head', default='')
     choose.add_argument('--repo', type=Path, default=ROOT)
     choose.add_argument('--github-output', type=Path)
+    choose.add_argument('--reuse-repository', default='',
+                        help='push only: owner/repo to look up a green PR run of the identical tree')
     for command in ('gate', 'units'):
         runner = sub.add_parser(command)
         runner.add_argument('--plan', required=True)
@@ -216,7 +288,13 @@ def main():
     args = parser.parse_args()
     if args.command == 'select':
         paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head)
-        plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'))
+        reuse = None
+        if args.event == 'push' and args.reuse_repository and args.files is None:
+            reuse = find_reuse(args.reuse_repository, args.head, args.base)
+        if reuse is not None:
+            plan = reused_plan(reuse)
+        else:
+            plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'))
         encoded = json.dumps(plan, separators=(',', ':'))
         print(encoded)
         if args.github_output:
@@ -224,6 +302,7 @@ def main():
                 stream.write('plan=' + encoded + '\n')
                 for key in (*LANES, 'runtime'):
                     stream.write(f'{key}={str(plan[key]).lower()}\n')
+                stream.write(f"reused={str(plan.get('reused_from') is not None).lower()}\n")
         return 0
     plan = json.loads(args.plan)
     if args.command == 'units':

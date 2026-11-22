@@ -6,7 +6,9 @@ on:
     branches: [main]
   workflow_dispatch: # Always full validation, without publication.
   schedule:
-    - cron: '23 4 * * 1' # Weekly full regression backstop for the explicit map.
+    # Nightly full regression on main HEAD: the backstop for scoped PR plans and for pushes
+    # that reuse an identical-tree PR run, and the only full-matrix run on most days.
+    - cron: '23 4 * * *'
 
 permissions:
   contents: read
@@ -19,7 +21,13 @@ jobs:
   selection:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # Push only: find the merged PR and its CI run to reuse an identical, proven tree.
+      pull-requests: read
+      actions: read
     outputs:
+      reused: ${{ steps.select.outputs.reused }}
       plan: ${{ steps.select.outputs.plan }}
       runtime: ${{ steps.select.outputs.runtime }}
       linear: ${{ steps.select.outputs.linear }}
@@ -34,12 +42,16 @@ jobs:
           fetch-depth: 0
       - id: select
         # Pass event data as quoted arguments, never interpolate it into shell source.
+        # On push, a green PR run of the identical tree (current with main, source-checks green)
+        # is reused instead of re-testing it; any doubt runs the normal selection.
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/source-ci.py select --event "$GITHUB_EVENT_NAME" \
-            --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT"
+            --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT" \
+            --reuse-repository "$GITHUB_REPOSITORY"
 
   source-checks:
     needs: [selection, source-tests, runtime]
@@ -59,6 +71,7 @@ jobs:
 
   source-tests:
     needs: selection
+    if: needs.selection.outputs.reused != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
