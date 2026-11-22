@@ -426,6 +426,7 @@ class PushReuseTests(unittest.TestCase):
     def test_any_failed_condition_or_doubt_falls_back(self):
         base = self.responses()
         runs_key = f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100'
+        jobs_key = f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100'
         newest_red = {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], id=3, conclusion='failure',
                                              created_at='2026-11-23T00:00:00Z')] + base[runs_key]['workflow_runs']}
         cases = {
@@ -433,6 +434,8 @@ class PushReuseTests(unittest.TestCase):
             'not current with main': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'diverged'}},
             'behind': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'behind'}},
             'newest run red': {runs_key: newest_red},
+            'incomplete run page': {runs_key: dict(base[runs_key], total_count=101)},
+            'incomplete job page': {jobs_key: dict(base[jobs_key], total_count=101)},
             'no run': {runs_key: {'workflow_runs': []}},
             'other workflow': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], path='.github/workflows/x.yml')]}},
             'in progress': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], status='in_progress', conclusion=None)]}},

@@ -273,8 +273,29 @@ class QuarantineRetryTests(unittest.TestCase):
     def test_ci_uploads_the_retries_log_from_every_runtime_leg(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl", workflow)
-        self.assertIn("path: ${{ runner.temp }}/quarantine-retries.jsonl", workflow)
-        self.assertIn("if-no-files-found: ignore", workflow)
+        upload = workflow.split("- name: Keep retried quarantine ids", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("path: ${{ runner.temp }}/quarantine-retries.jsonl", upload)
+        self.assertIn("if-no-files-found: ignore", upload)
+        self.assertIn("continue-on-error: true", upload)
+        self.assertIn("${{ github.run_attempt }}", upload)
+
+    def test_reporting_failure_does_not_fail_a_recovered_retry(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        loader = self.runner.unittest.defaultTestLoader
+        discover = loader.discover
+
+        def flaky_only(start_dir, pattern):
+            suite = discover(start_dir=start_dir, pattern=pattern)
+            return unittest.TestSuite(test for test in self.runner.flatten(suite) if test.id() == flaky)
+
+        with patch.object(loader, "discover", side_effect=flaky_only), \
+                patch.object(self.runner, "SUMMARY", str(self.root)), \
+                patch.object(self.runner, "RETRIES_LOG", str(self.root)):
+            code, out = self.run_with([flaky], self.module + ".py")
+        self.assertEqual(code, 0)
+        self.assertIn("Could not save quarantine retry records", out)
+        self.assertIn("Could not update quarantine retry summary", out)
 
     def test_any_unquarantined_or_repeated_failure_stays_red(self):
         from unittest.mock import patch

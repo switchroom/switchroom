@@ -227,9 +227,10 @@ jobs:
             --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"
       - name: Keep retried quarantine ids
         if: always() && steps.leg.outputs.selected == 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: quarantine-retries-${{ matrix.lane }}-${{ strategy.job-index }}
+          name: quarantine-retries-${{ matrix.lane }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/quarantine-retries.jsonl
           if-no-files-found: ignore
           retention-days: 30

@@ -131,18 +131,24 @@ def retry_quarantined(result: unittest.TestResult, known: dict[str, str]) -> boo
     retried = unittest.TextTestRunner(verbosity=2).run(rerun)
     if RETRIES_LOG:
         retry_log = Path(RETRIES_LOG)
-        retry_log.parent.mkdir(parents=True, exist_ok=True)
-        with retry_log.open("a", encoding="utf-8") as stream:
-            for test_id in ids:
-                stream.write(json.dumps({"id": test_id, "tracking": known[test_id]}) + "\n")
+        try:
+            retry_log.parent.mkdir(parents=True, exist_ok=True)
+            with retry_log.open("a", encoding="utf-8") as stream:
+                for test_id in ids:
+                    stream.write(json.dumps({"id": test_id, "tracking": known[test_id]}) + "\n")
+        except OSError as exc:
+            print(f"::warning::Could not save quarantine retry records ({type(exc).__name__})", flush=True)
     if not retried.wasSuccessful() or retried.skipped:
         return False
     for test_id in ids:
         print(f"::warning title=Quarantined flake retried::{test_id} failed once and passed on retry ({known[test_id]})",
               flush=True)
         if SUMMARY:
-            with open(SUMMARY, "a", encoding="utf-8") as stream:
-                stream.write(f"- quarantined flake retried: `{test_id}` ({known[test_id]})\n")
+            try:
+                with open(SUMMARY, "a", encoding="utf-8") as stream:
+                    stream.write(f"- quarantined flake retried: `{test_id}` ({known[test_id]})\n")
+            except OSError as exc:
+                print(f"::warning::Could not update quarantine retry summary ({type(exc).__name__})", flush=True)
     return True
 
 

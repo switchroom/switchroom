@@ -232,6 +232,13 @@ def gh_api(path):
     return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
 
 
+def complete_action_page(response, field):
+    items = response[field]
+    if not isinstance(items, list) or len(items) >= 100 or response.get('total_count', len(items)) != len(items):
+        raise ValueError(f'incomplete GitHub Actions {field} page')
+    return items
+
+
 def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
     """URL of a green PR CI run that already proved this push's exact tree, else None.
 
@@ -276,8 +283,9 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
             log(f'reuse: head {head} is not unique to PR #{pr["number"]}')
             return None
         branch = (pr.get('head') or {}).get('ref')
-        runs = [r for r in api(f'repos/{repository}/actions/workflows/ci.yml/runs'
-                               f'?event=pull_request&head_sha={head}&per_page=100')['workflow_runs']
+        run_page = api(f'repos/{repository}/actions/workflows/ci.yml/runs'
+                       f'?event=pull_request&head_sha={head}&per_page=100')
+        runs = [r for r in complete_action_page(run_page, 'workflow_runs')
                 if r.get('head_sha') == head and r.get('path') == WORKFLOW_PATH
                 and r.get('event') == 'pull_request' and branch and r.get('head_branch') == branch
                 and (r.get('head_repository') or {}).get('full_name') == repository]
@@ -299,7 +307,8 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if any(when >= str(run.get('created_at', '')) for when in retargets):
             log(f'reuse: PR #{pr["number"]} was retargeted after {run.get("html_url")} started')
             return None
-        jobs = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
+        job_page = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')
+        jobs = complete_action_page(job_page, 'jobs')
         aggregate = [j for j in jobs if j.get('name') == 'source-checks']
         if len(aggregate) != 1 or aggregate[0].get('conclusion') != 'success':
             log(f'reuse: source-checks of {run.get("html_url")} is not a single success')
