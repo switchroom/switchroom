@@ -129,7 +129,6 @@ class ImageTests(unittest.TestCase):
             "export CAMOFOX_INTERACTIVE=desktop",
             "export CAMOFOX_CRASH_REPORT_ENABLED=false SENTRY_DSN= PROMETHEUS_ENABLED=false",
             "CAMOFOX_DISABLE_DEFAULT_ADDONS=${CAMOFOX_DISABLE_DEFAULT_ADDONS:-1}",
-            "export CAMOFOX_LOCALE=${CAMOFOX_LOCALE:-en-AU} CAMOFOX_TIMEZONE=${CAMOFOX_TIMEZONE:-Australia/Melbourne}",
             'state=${CAMOFOX_STATE_DIR:-$home_dir/camofox-browser}',
             'export CAMOFOX_PROFILE_DIR="$state/profiles"',
             "SESSION_TIMEOUT_MS=${SESSION_TIMEOUT_MS:-0}",
@@ -214,19 +213,44 @@ class ServiceRunKeyTests(unittest.TestCase):
         self.assertEqual(self.run_service(self.home)["CAMOFOX_ACCESS_KEY"], env["CAMOFOX_ACCESS_KEY"])
         self.assertEqual(sorted(p.name for p in (self.home / "camofox-browser").glob(".access-key.*")), [])
 
-    def test_locale_and_time_zone_are_always_exported_together(self):
-        # camofox-browser (lib/config.js directBrowserIdentity) refuses one without the other;
-        # with both, navigator.language matches Intl instead of staying en-US.
-        env = self.run_service(self.home)
-        self.assertEqual((env["CAMOFOX_LOCALE"], env["CAMOFOX_TIMEZONE"]), ("en-AU", "Australia/Melbourne"))
-        for extra in ({"CAMOFOX_LOCALE": "en-GB"}, {"CAMOFOX_TIMEZONE": "Europe/London"},
-                      {"CAMOFOX_LOCALE": "", "CAMOFOX_TIMEZONE": ""}):
+    def identity(self, **extra: str) -> tuple:
+        """Run the service and return the (CAMOFOX_LOCALE, CAMOFOX_TIMEZONE) it exported (None if unset)."""
+        extra.setdefault("CAMOFOX_TIMEZONE_FILE", str(Path(self.tmp.name) / "no-timezone-file"))
+        env = self.run_service(self.home, **extra)
+        return env.get("CAMOFOX_LOCALE"), env.get("CAMOFOX_TIMEZONE")
+
+    def test_locale_and_time_zone_follow_the_container(self):
+        # camofox-browser (lib/config.js directBrowserIdentity) takes both or neither; with both,
+        # navigator.language matches Intl instead of staying en-US.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="Australia/Sydney"), ("en-AU", "Australia/Sydney"))
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC"), ("en-AU", "UTC"))
+        self.assertEqual(self.identity(LANG="de_DE.UTF-8@euro", TZ=":Europe/Berlin"), ("de-DE", "Europe/Berlin"))
+
+    def test_lc_all_beats_lang(self):
+        self.assertEqual(self.identity(LC_ALL="fr_CA.UTF-8", LANG="en_AU.UTF-8", TZ="UTC"), ("fr-CA", "UTC"))
+
+    def test_time_zone_falls_back_to_the_timezone_file(self):
+        tzfile = Path(self.tmp.name) / "timezone"
+        tzfile.write_text("Europe/Lisbon\n")
+        self.assertEqual(self.identity(LANG="en_GB.UTF-8", CAMOFOX_TIMEZONE_FILE=str(tzfile)),
+                         ("en-GB", "Europe/Lisbon"))
+        self.assertEqual(self.identity(LANG="en_GB.UTF-8", TZ="UTC", CAMOFOX_TIMEZONE_FILE=str(tzfile)),
+                         ("en-GB", "UTC"))
+
+    def test_explicit_values_win_and_pass_through_unpaired(self):
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_LOCALE="en-GB",
+                                       CAMOFOX_TIMEZONE="Europe/London"), ("en-GB", "Europe/London"))
+        # Half a pair is the operator's own: passed through as given, so camofox-browser refuses it.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_LOCALE="en-GB"), ("en-GB", None))
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_TIMEZONE="Europe/London"),
+                         (None, "Europe/London"))
+
+    def test_half_a_derived_pair_exports_neither(self):
+        for extra in ({"LANG": "C", "TZ": "UTC"}, {"LANG": "POSIX", "TZ": "UTC"}, {"LANG": "C.UTF-8", "TZ": "UTC"},
+                      {"TZ": "UTC"}, {"LANG": "en_AU.UTF-8"}, {"LANG": "en_AU.UTF-8", "TZ": ""},
+                      {"LANG": "en_AU.UTF-8", "TZ": ":"}, {"LC_ALL": "C", "LANG": "en_AU.UTF-8", "TZ": "UTC"}):
             with self.subTest(extra=extra):
-                env = self.run_service(self.home, **extra)
-                self.assertTrue(env["CAMOFOX_LOCALE"] and env["CAMOFOX_TIMEZONE"])
-                for name, value in extra.items():
-                    if value:
-                        self.assertEqual(env[name], value)
+                self.assertEqual(self.identity(**extra), (None, None))
 
     def test_an_empty_key_left_by_a_crash_is_replaced(self):
         state = self.home / "camofox-browser"

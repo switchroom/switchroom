@@ -111,11 +111,14 @@ Measured on a live agent after the first rollout:
   so a site sees a different device after each Bot Desktop restart; cookies persist. The window is
   also a few pixels wider than the reported screen under the Xfce frame.
 - `navigator.language` stayed `en-US` while `Intl` followed the container locale (`en_AU.UTF-8`)
-  and time zone, an incoherence some bot checks look at. Since then `service-run` sets the
-  browser's language and time zone together, `CAMOFOX_LOCALE` (default `en-AU`) and
-  `CAMOFOX_TIMEZONE` (default `Australia/Melbourne`), so the two should agree; that is not yet
-  re-measured on a live agent. They do not follow the container's `LANG` or `TZ`: for a deployment
-  elsewhere set both in the agent's environment, to match where its traffic exits.
+  and time zone, an incoherence some bot checks look at. Since then `service-run` gives the browser
+  the container's own pair, so the two should agree; that is not yet re-measured on a live agent.
+  The locale comes from `LC_ALL`, else `LANG`, without its charset or modifier (`en_AU.UTF-8`
+  becomes `en-AU`; `C` and `POSIX` count as unset). The time zone comes from `TZ` (a leading `:`
+  is dropped), else `/etc/timezone`. The pair is passed only when both resolve; otherwise neither
+  is, and the browser keeps its own default. Set `CAMOFOX_LOCALE` and `CAMOFOX_TIMEZONE` to choose
+  the pair explicitly; set both, because camofox-browser refuses to start with only one. Keep the
+  time zone consistent with where the agent's traffic exits.
 - Typing through `browser_type` fills fields at once; only cursor movement is humanised (a click
   moves the pointer along a curved path for about half a second).
 - An interactive Cloudflare Turnstile widget waits at "Verify you are human"; that is the human's

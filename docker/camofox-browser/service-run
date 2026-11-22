@@ -17,6 +17,8 @@ desktop_env=$home_dir/bot-desktop/env
 install_dir=${CAMOFOX_SERVER_DIR:-/opt/camofox-browser}
 # The kernel's table of bound Unix sockets (tests point it at a fixture).
 x_socket_table=${CAMOFOX_X_SOCKET_TABLE:-/proc/net/unix}
+# The time-zone fallback when TZ is empty (tests point it at a fixture).
+timezone_file=${CAMOFOX_TIMEZONE_FILE:-/etc/timezone}
 backoff_seconds=${CAMOFOX_BACKOFF_SECONDS:-30}
 
 # s6 restarts a failed run at once; an unusable state directory (a read-only or not-yet-owned
@@ -105,9 +107,27 @@ export CAMOFOX_UPLOADS_DIR="$state/uploads" CAMOFOX_TRACES_DIR="$state/traces"
 export CAMOFOX_CRASH_REPORT_ENABLED=false SENTRY_DSN= PROMETHEUS_ENABLED=false
 export CAMOFOX_DISABLE_DEFAULT_ADDONS=${CAMOFOX_DISABLE_DEFAULT_ADDONS:-1}
 export CAMOFOX_OS=${CAMOFOX_OS:-linux}
-# One browser identity: without these the browser reports navigator.language en-US while Intl follows
-# the container locale. camofox-browser refuses one without the other, so both always get a value.
-export CAMOFOX_LOCALE=${CAMOFOX_LOCALE:-en-AU} CAMOFOX_TIMEZONE=${CAMOFOX_TIMEZONE:-Australia/Melbourne}
+# One browser identity from the container's own locale and time zone: without the pair the browser
+# reports navigator.language en-US while Intl follows the container. camofox-browser takes both or
+# neither (it refuses half a pair at start), so explicit values pass through as given, and derived
+# ones are exported only when both resolve.
+if [ -z "${CAMOFOX_LOCALE:-}" ] && [ -z "${CAMOFOX_TIMEZONE:-}" ]; then
+  derived_locale=${LC_ALL:-${LANG:-}}
+  derived_locale=${derived_locale%%.*}
+  derived_locale=${derived_locale%%@*}
+  derived_locale=${derived_locale//_/-}
+  case "$derived_locale" in C | POSIX) derived_locale= ;; esac
+  derived_timezone=${TZ:-}
+  derived_timezone=${derived_timezone#:}
+  if [ -z "$derived_timezone" ] && [ -r "$timezone_file" ]; then
+    derived_timezone=$(head -n1 "$timezone_file" | tr -d '[:space:]')
+  fi
+  if [ -n "$derived_locale" ] && [ -n "$derived_timezone" ]; then
+    export CAMOFOX_LOCALE="$derived_locale" CAMOFOX_TIMEZONE="$derived_timezone"
+  else
+    unset CAMOFOX_LOCALE CAMOFOX_TIMEZONE
+  fi
+fi
 # A human shares these windows: never expire a session on idleness, keep a quiet tab for 8 h
 # (0 is not "off" for TAB_INACTIVITY_MS), and let the browser use more memory before a restart.
 export SESSION_TIMEOUT_MS=${SESSION_TIMEOUT_MS:-0}
