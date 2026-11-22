@@ -17,7 +17,8 @@ def brand() -> str:
 
 
 def local_tz() -> str:
-    return _strip("LOCAL_TZ") or "UTC"
+    """Zone for times shown to humans: LOCAL_TZ, else TZ, else "" (the system's local zone)."""
+    return _strip("LOCAL_TZ") or _strip("TZ")
 
 
 def canonical_public_url() -> str:
