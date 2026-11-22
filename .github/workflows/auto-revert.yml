@@ -1,0 +1,114 @@
+name: Auto-revert
+
+# Fast-lane PRs merge after cheap checks and defer some real-Agent legs to main
+# push CI. When that push run fails, scripts/auto-revert.py decides: a
+# fast-lane commit whose parent was green is reverted by a PR with squash
+# auto-merge armed (pushed with the release bot App so its CI runs); anything
+# else is only reported. Either way an issue records it. Nothing is delivered
+# meanwhile: pin handoff and Fleet Image publish need a green exact-SHA run.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-revert
+  cancel-in-progress: false
+
+jobs:
+  revert:
+    name: Revert a red fast-lane merge
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && github.repository == 'switchroom/switchroom'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python3 scripts/auto-revert.py --repository "$GITHUB_REPOSITORY" \
+            --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
+
+      - name: Mint a release bot token scoped to switchroom/switchroom
+        if: steps.decide.outputs.action == 'revert'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # GitHub accepts the numeric App ID as the JWT issuer wherever a client ID is expected.
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: switchroom
+          repositories: switchroom
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the revert PR and arm auto-merge
+        if: steps.decide.outputs.action == 'revert'
+        id: revert
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHA: ${{ steps.decide.outputs.sha }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          branch="auto-revert/${SHA:0:12}"
+          git config user.name "hermes-release-bot"
+          git config user.email "41898282+hermes-release-bot@users.noreply.github.com"
+          git checkout -q -b "$branch" origin/main
+          if ! git revert --no-edit "$SHA"; then
+            git revert --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Auto-revert conflicted::$SHA no longer reverts cleanly onto main."
+            exit 0
+          fi
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$branch"
+          url="$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --title "Revert ${SHA:0:12}: main CI went red after a fast-lane merge" \
+            --body "Automatic revert. ${REASON}. Failed main run: ${RUN_URL}. Re-land with the fix and the deferred legs green on the PR.")"
+          gh pr merge --auto --squash -R "$GITHUB_REPOSITORY" "$url"
+          echo "pr=$url" >> "$GITHUB_OUTPUT"
+
+      - name: File an issue
+        if: steps.decide.outputs.action != 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          SHA: ${{ steps.decide.outputs.sha }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          PR: ${{ steps.revert.outputs.pr }}
+          CONFLICT: ${{ steps.revert.outputs.conflict }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+          title="main CI red at ${SHA:0:12}"
+          if gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q .; then
+            echo "Issue already open for $SHA."; exit 0
+          fi
+          body="Run: ${RUN_URL}
+          Decision: ${ACTION}: ${REASON}
+          Revert PR: ${PR:-none}${CONFLICT:+ (revert conflicted; fix forward)}
+          Nothing from this commit is delivered until main CI is green."
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"
