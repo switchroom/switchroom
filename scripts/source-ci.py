@@ -611,7 +611,7 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
             if rest is None or moved['runtime'] or moved['runtime_full']:
                 log(f'pin reuse: switchroom changed real-Agent inputs since {commit}: {since}')
                 return None
-            log(f'pin reuse: switchroom moved since {commit} only in pin files or non-runtime paths {since}')
+            log(f'pin reuse: switchroom moved since {commit} only in the manifest or non-runtime paths {since}')
         log(f'pin reuse: Agent {revision} with switchroom tree {tree} already proved by {url}')
         return url or str(run_id), run_id, attempt
     except Exception as exc:  # Any uncertainty runs the complete pin suite.
