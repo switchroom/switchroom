@@ -19,7 +19,6 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from linear_fake_api import load_plugin
@@ -113,8 +112,8 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.turns = []
 
         async def model_turn(event):  # finite endpoint; real-ledger qualification is in worker_questions
-            await self.adapter.on_message_admitted(event, SimpleNamespace(admission_id=event.message_id,
-                sequence=len(self.turns) + 1, status="queued", control=None))
+            await self.adapter._admitted(event, {"admission_id": event.message_id,
+                "seq": len(self.turns) + 1, "status": "queued"})
             self.turns.append(event)
         self.adapter.handle_message = model_turn
         self.inbox = IngressStore(self.home / "inbox.db")

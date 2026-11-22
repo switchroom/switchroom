@@ -122,20 +122,23 @@ class NativeInput:
         )
 
     def control_message(self, adapter):
-        """A verified provider Stop is a typed native control, never slash text."""
+        """A verified provider Stop is Core's own ``/stop`` command for this chat.
+
+        Only the provider's Stop signal builds it: a person's typed Linear text never
+        gets gateway control (``message`` sets ``allow_gateway_control=False``).
+        """
         if self.signal != "stop":
             raise LinearError("Linear input is not a structured Stop", retryable=False)
-        from gateway.platforms.event import MessageEvent, StructuredControl
+        from gateway.platforms.event import MessageEvent
         source = adapter.build_source(
             chat_id=self.issue_id, thread_id=self.session_id,
             user_id=self.actor_id, message_id=self.message_id,
             scope_id=self.organization_id, is_bot=False,
         )
         return MessageEvent(
-            text=self.text, source=source, user_id=self.actor_id, message_id=self.message_id,
+            text="/stop", source=source, user_id=self.actor_id, message_id=self.message_id,
             timestamp=datetime.fromtimestamp(self.timestamp_ms / 1000, tz=timezone.utc),
-            internal=False, allow_gateway_control=False, metadata={},
-            structured_control=StructuredControl.STOP,
+            internal=False, allow_gateway_control=True, metadata={},
         )
 
 
@@ -883,17 +886,28 @@ def _approval_confirmation(choice, count, reason):
     return t(f"gateway.approve.{choice}_{number}", count=count)
 
 
+# Core commits a handed-over input within milliseconds; a busy chat's input waits for its
+# FIFO position first. Past the deadline the delivery stays pending and is redelivered.
+COMMIT_POLL_SECONDS = 0.05
+COMMIT_TIMEOUT_SECONDS = 120.0
+
+
 def native_supported():
-    """Passive capability check; never bootstrap an owner or discover accounts."""
+    """Passive capability check; never bootstrap an owner or discover accounts.
+
+    Only upstream Hermes APIs: the shared-runtime admission ledger (read back to
+    acknowledge the provider inbox) and Base's processing lifecycle.
+    """
     try:
         from gateway.platforms.base import BasePlatformAdapter
-        from gateway.platforms.event import StructuredControl
-        from gateway.session_contract import ControlAcceptance
+        from gateway.session_authorities import require_active_authority
+        from gateway.session_envelope import prepare_native, restore_native_source
+        from persistence.authority.admissions import AdmissionRepository
     except ImportError:
         return False
-    return (hasattr(BasePlatformAdapter, "requires_durable_input_ack")
-            and callable(getattr(BasePlatformAdapter, "on_message_admitted", None))
-            and StructuredControl.STOP.value == "stop" and ControlAcceptance is not None)
+    return (callable(getattr(BasePlatformAdapter, "on_processing_complete", None))
+            and callable(getattr(AdmissionRepository, "match", None))
+            and all(callable(item) for item in (require_active_authority, prepare_native, restore_native_source)))
 
 
 def create_adapter(config, running):
@@ -902,7 +916,8 @@ def create_adapter(config, running):
     from gateway.platforms.base import BasePlatformAdapter, SendResult
 
     class LinearAdapter(BasePlatformAdapter):
-        requires_durable_input_ack = True
+        # Upstream messaging input: Core commits it; this adapter reads the committed
+        # admission back (``_committed_receipt``) before it acknowledges the provider inbox.
         supports_status_text = True
 
         def __init__(self):
@@ -928,6 +943,8 @@ def create_adapter(config, running):
             self._step_paused = set()
             self._observed_approvals = set()
             self._step_session_keys = {}
+            self._completed = {}  # event key -> set once Base or the producer lifecycle ends its turn
+            self._stop_activities = {}  # recent provider Stop activities (ordered); the bridge posts their notice
 
         async def connect(self, *, is_reconnect=False):
             if not native_supported():
@@ -1024,6 +1041,9 @@ def create_adapter(config, running):
                      else projected.message(self))
             if getattr(event.source, "profile_route_rejected", False):
                 raise LinearError("Native Linear source is outside this receiver's profile route", retryable=False)
+            if projected.signal == "stop":
+                await self._stop(bridge, delivery, projected, original, event)
+                return
             if projected.signal is None and projected.source is None and await self._answer(bridge, projected, event):
                 # The answer went to the waiting clarify/approval, as a typed reply does on other platforms.
                 await asyncio.to_thread(delivery.acknowledge)
@@ -1050,6 +1070,13 @@ def create_adapter(config, running):
                 if current and current[0][1] != projected:
                     raise LinearError("Linear Activity was redelivered with conflicting input", retryable=False)
                 current.append((delivery, projected, original))
+            # A redelivery of input Core already committed (a crash or failed ACK after the
+            # commit) is answered from the ledger. It never re-enters busy steer/interrupt.
+            if (existing := await self._committed_receipt(event, refused_is_absent=True)) is not None:
+                await self._admitted(event, existing)
+                return
+            with self._relay_lock:
+                self._completed[key] = asyncio.Event()
                 if projected.turn_in_progress:
                     self._turns[key] = projected.issue_id
             if projected.turn_in_progress:
@@ -1057,12 +1084,105 @@ def create_adapter(config, running):
                 bridge.session_turn(projected.issue_id, True)
             try:
                 await self.handle_message(event)
+                receipt = await self._await_commit(event)
             except BaseException:
                 self._end_turn(key)
                 raise
-            # Busy input may still be committing after Base returns. Its local
-            # accepted flag is not a receipt or an authoritative refusal.
-            # The committed hook ACKs; lifecycle completion handles refusal.
+            if receipt is None:
+                with self._relay_lock:
+                    if key not in self._pending:
+                        return  # already anchored and acknowledged from this same row
+                # Core refused or never committed it: the provider delivery stays pending.
+                self._end_turn(key)
+                self._refused(event)
+                return
+            await self._admitted(event, receipt)
+
+        async def _stop(self, bridge, delivery, projected, original, event):
+            """Core's native ``/stop`` for this chat, then the bridge's Stop of the linked task.
+
+            Both are idempotent: an unverified bridge Stop leaves the delivery pending, and
+            its retry repeats them. The bridge posts the person-facing Stop notice.
+            """
+            with self._relay_lock:
+                self._stop_activities[projected.message_id] = None
+                while len(self._stop_activities) > 256:
+                    self._stop_activities.pop(next(iter(self._stop_activities)))
+            # One provider Stop activity stops Core's turn once: a late redelivery of the
+            # same activity must never cancel work a person started after it.
+            key = f"core-stop:{projected.issue_id}:{projected.session_id}:{projected.message_id}"
+            saved, first = await asyncio.to_thread(bridge.store.native_intent_prepare, key,
+                {"kind": "core_stop", "issue_id": projected.issue_id, "session_id": projected.session_id})
+            if first or saved.get("state") == "reconcile":
+                try:
+                    await self.handle_message(event)
+                except BaseException:
+                    await asyncio.to_thread(bridge.store.native_intent_settle, key, {"state": "reconcile"})
+                    raise
+                await asyncio.to_thread(bridge.store.native_intent_settle, key, {"state": "applied"})
+            await asyncio.to_thread(_handle_control, bridge, original, projected)
+            await asyncio.to_thread(delivery.acknowledge)
+            with self._relay_lock:
+                self._submitted.pop(self._delivery_key(delivery), None)
+
+        async def _committed_receipt(self, event, *, refused_is_absent=False):
+            """Core's committed admission of this exact Linear input, else ``None``.
+
+            Read through upstream's ledger (``admissions.match``) under the same principal
+            and request id that ``SessionAuthority._admit_native`` commits with.
+            """
+            runner = getattr(self._message_handler, "__self__", None) or self.gateway_runner
+            if runner is None:
+                return None  # standalone adapter fixtures have no native authority
+            from gateway.session_authorities import require_active_authority
+            from gateway.session_envelope import prepare_native, restore_native_source
+            from gateway.session_persistence import authority_persistence
+            from .native_store import admission_row
+            scope = getattr(runner, "_async_profile_scope_for_source", None)
+            if not callable(scope) and getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+                raise LinearError("Native Linear receipt profile is unavailable")
+            try:
+                async with scope(event.source) if callable(scope) else nullcontext():
+                    authority = require_active_authority(runner)
+                    payload = await prepare_native(runner, event)
+            except Exception as exc:
+                from persistence.core.errors import AuthorityRefusal
+                if refused_is_absent and isinstance(exc, AuthorityRefusal):
+                    return None  # Core's own admission refuses (and answers) it the same way.
+                raise
+            source = restore_native_source(payload)
+            principal = "messaging:" + json.dumps([source.profile, source.platform.value, source.chat_id,
+                                                    source.thread_id, source.user_id], separators=(",", ":"))
+            request = str(payload["native_text_v1"]["event"]["message_id"] or "")
+            if not request:
+                return None
+            records = await asyncio.to_thread(authority_persistence(authority).admissions.match,
+                                              principal_id=principal, request_id=request, include_retired=True)
+            if len(records) > 1:
+                raise LinearError("Linear Activity has more than one native admission", retryable=False)
+            return admission_row(records[0]) if records else None
+
+        async def _await_commit(self, event, timeout=COMMIT_TIMEOUT_SECONDS):
+            """Wait for Core to commit this input; ``None`` once its turn ended without a row."""
+            completed = self._completed.get(self._event_key(event))
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            try:
+                while True:
+                    done = completed is not None and completed.is_set()
+                    if (receipt := await self._committed_receipt(event, refused_is_absent=True)) is not None:
+                        return receipt
+                    if done or loop.time() >= deadline:
+                        return None
+                    try:
+                        await asyncio.wait_for(completed.wait(), COMMIT_POLL_SECONDS) if completed else \
+                            await asyncio.sleep(COMMIT_POLL_SECONDS)
+                    except TimeoutError:
+                        pass
+            finally:
+                with self._relay_lock:
+                    if self._completed.get(self._event_key(event)) is completed:
+                        self._completed.pop(self._event_key(event), None)
 
         def _end_turn(self, key):
             with self._relay_lock:
@@ -1077,33 +1197,28 @@ def create_adapter(config, running):
                     self._failed[self._delivery_key(delivery)] = LinearError(
                         "Native input acknowledgment is incomplete; provider delivery remains pending")
 
-        async def on_message_admitted(self, event, receipt):
+        async def _admitted(self, event, receipt):
+            """Core committed this input (``receipt`` is its admission row): anchor it, then ACK."""
             key = self._event_key(event)
             with self._relay_lock:
                 pending = list(self._pending.get(key, []))
             for delivery, projected, original in pending:
-                if projected.signal == "stop":
-                    control = getattr(receipt, "control", None)
-                    if control is None or control.kind != "stop" or not control.request_consumed:
-                        raise LinearError("Native Stop has no committed control receipt")
-                    await asyncio.to_thread(_handle_control, running["bridge"], original, projected)
-                else:
-                    bridge = running["bridge"]
-                    def remember_input():
-                        with bridge.lock(projected.issue_id):
-                            anchor = bridge.store.remember_conversation_input(
-                                projected.issue_id, projected.session_id, projected.message_id,
-                                receipt.admission_id, receipt.sequence, receipt.status == "terminal",
-                                self._core_session_keys(event.source))
-                            if projected.source == "delegation":
-                                activity = projected.message_id if projected.message_id != projected.session_id else None
-                                with bridge.api.requester_session(projected.session_id, activity_id=activity):
-                                    bridge._assignment_activation(bridge.store.get(projected.issue_id))
-                            return anchor
-                    anchor = await asyncio.to_thread(remember_input)
-                    self._cache_input(projected.issue_id, projected.session_id, anchor)
-                    with self._relay_lock:
-                        self._ordinary.add((projected.issue_id, projected.session_id, projected.message_id))
+                bridge = running["bridge"]
+                def remember_input():
+                    with bridge.lock(projected.issue_id):
+                        anchor = bridge.store.remember_conversation_input(
+                            projected.issue_id, projected.session_id, projected.message_id,
+                            receipt["admission_id"], receipt["seq"], receipt["status"] == "terminal",
+                            self._core_session_keys(event.source))
+                        if projected.source == "delegation":
+                            activity = projected.message_id if projected.message_id != projected.session_id else None
+                            with bridge.api.requester_session(projected.session_id, activity_id=activity):
+                                bridge._assignment_activation(bridge.store.get(projected.issue_id))
+                        return anchor
+                anchor = await asyncio.to_thread(remember_input)
+                self._cache_input(projected.issue_id, projected.session_id, anchor)
+                with self._relay_lock:
+                    self._ordinary.add((projected.issue_id, projected.session_id, projected.message_id))
                 await asyncio.to_thread(delivery.acknowledge)
                 with self._relay_lock:
                     values = self._pending.get(key, [])
@@ -1116,7 +1231,10 @@ def create_adapter(config, running):
         async def on_processing_complete(self, event, outcome):
             self._close_steps(event.source.chat_id, event.source.thread_id, event.message_id)
             self._end_turn(self._event_key(event))
-            self._refused(event)  # No effect once the committed-input hook ACKed.
+            with self._relay_lock:
+                completed = self._completed.get(self._event_key(event))
+            if completed is not None:
+                completed.set()  # ``_await_commit`` reads the ledger once more, then decides.
 
         def _core_session_keys(self, source):
             """The core session keys for this Linear chat, as the runner and Base derive them."""
@@ -1206,24 +1324,12 @@ def create_adapter(config, running):
             return result
 
         async def _ordinary_receipt(self, event):
-            """Ask Core's owning authority; its receipts and tombstones survive adapter replacement."""
-            runner = getattr(self._message_handler, "__self__", None) or self.gateway_runner
-            if runner is None:
-                return False  # standalone adapter fixtures have no native authority
-            from gateway.session_authorities import require_active_authority
-            from gateway.session_envelope import prepare_native
-            from gateway.session_native_delivery import find, identity
-            scope = getattr(runner, "_async_profile_scope_for_source", None)
-            if not callable(scope) and getattr(getattr(runner, "config", None), "multiplex_profiles", False):
-                raise LinearError("Native Linear receipt profile is unavailable")
-            async with scope(event.source) if callable(scope) else nullcontext():
-                authority = require_active_authority(runner)
-                payload = await prepare_native(runner, event)
-                principal, request = identity(event.source, payload)
-                # Core validates the exact source/content, current authorization and runtime epoch.
-                # An unreadable or conflicting receipt is a refusal, never permission to answer.
-                return await asyncio.to_thread(find, authority, principal, request, payload,
-                                               getattr(event, "raw_message", None)) is not None
+            """Ask Core's owning ledger; its receipts and tombstones survive adapter replacement.
+
+            ``prepare_native`` reauthorizes the exact source/content first. An unreadable or
+            ambiguous receipt is a refusal, never permission to answer.
+            """
+            return await self._committed_receipt(event) is not None
 
         async def _answer(self, bridge, projected, event):
             """Consume one provider activity before publishing any answer confirmation."""
@@ -1551,6 +1657,11 @@ def create_adapter(config, running):
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             metadata = metadata or {}
+            with self._relay_lock:
+                stop_reply = reply_to is not None and reply_to in self._stop_activities
+            if stop_reply:
+                # Core's ``/stop`` answer; the bridge already told the person what Stop did.
+                return SendResult(success=True, message_id=None)
             session_id = metadata.get("thread_id")
             bridge = running.get("bridge")
             question = metadata.get("is_approval_prompt") is True
@@ -1644,7 +1755,7 @@ def register_platform(ctx, running):
     ctx.register_platform(
         "linear", "Linear", lambda config: create_adapter(config, running), native_supported,
         allowed_users_env="LINEAR_ALLOWED_USERS",
-        install_hint="Use a Core release with durable provider input and structured Stop support.",
+        install_hint="Use a Core release with the shared session runtime (admission ledger).",
     )
     from hermes_cli.config import load_config_readonly
     platforms = (load_config_readonly() or {}).get("platforms") or {}
