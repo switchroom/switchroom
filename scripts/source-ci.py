@@ -54,6 +54,11 @@ RUNTIME_INPUT_PREFIXES = ('tests/',)
 # runs the component's full legs, a red push is auto-reverted, and nothing delivers until
 # main is green (scripts/auto-revert.py, plugin-pin-handoff.yml, fleet-image.yml).
 FAST_LANE_PREFIXES = ('plugins/linear/',)
+# Credentials, authority (tool guard, approvals, allowlists), identity, handoff/origin and the
+# plugin manifest and registration stay fully gated before merge even inside the plugin.
+FAST_LANE_GATED = frozenset('plugins/linear/' + name for name in (
+    '__init__.py', 'plugin.yaml', 'oauth.py', 'guard.py', 'transport.py', 'api.py', 'bridge.py',
+    'handoff.py', 'origin.py', 'origin_provider.py', 'origin_state.py'))
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -98,7 +103,7 @@ def is_runtime_input(path):
     return path in RUNTIME_INPUTS or path.startswith(RUNTIME_INPUT_PREFIXES)
 
 
-def select(paths, full=False, reason='changed paths', event='push'):
+def select(paths, full=False, reason='changed paths', event='push', added=()):
     """`units_full` runs every unit module; `runtime_full` also runs every real-Agent leg.
 
     An unmapped path broadens units only. Runtime broadens only for a listed runtime input,
@@ -115,7 +120,7 @@ def select(paths, full=False, reason='changed paths', event='push'):
             if Path(path).name in SHARED_TESTS:
                 group = 'linear' if Path(path).name.startswith('test_linear_') else 'claude'
                 tests.update(p for p in available if any(fnmatch.fnmatch(Path(p).name, pat) for pat in COMPONENTS[group]))
-        elif path.endswith('.md'):
+        elif path.endswith('.md') and not is_runtime_input(path):
             continue
         else:
             component = EXACT.get(path)
@@ -137,7 +142,7 @@ def select(paths, full=False, reason='changed paths', event='push'):
         reason = 'full: requested, uncertain or runtime input'
     elif units_full:
         reason = 'units_full: unmapped non-runtime input; real-Agent legs scoped'
-    deferred = [] if full else deferrable_lanes(paths, lanes)
+    deferred = [] if full else deferrable_lanes(paths, lanes, added)
     if event == 'pull_request' and deferred:
         lanes = {lane: lanes[lane] and lane not in deferred for lane in LANES}
         reason = 'fast lane: real-Agent legs ' + ', '.join(deferred) + ' run after merge on main push'
@@ -147,27 +152,35 @@ def select(paths, full=False, reason='changed paths', event='push'):
             'deferred_on_pr': deferred, 'reason': reason}
 
 
-def fast_lane_eligible(paths):
-    """Only Linear plugin source, existing test modules and prose may defer real-Agent legs.
+def fast_lane_eligible(paths, added=()):
+    """Only Linear plugin behaviour, existing test modules and prose may defer real-Agent legs.
 
-    Everything else (image inputs, the agent pin, workflows, the selector, runners, helpers,
-    other code) stays fully gated before merge.
+    A test module added by the change is not yet proven and stays gated, as do the plugin's
+    credential, authority, identity and manifest files (FAST_LANE_GATED) and everything else
+    (image inputs, the agent pin, workflows, the selector, runners, helpers, other code).
     """
-    available = set(inventory())
-    return bool(paths) and any(p.startswith(FAST_LANE_PREFIXES) for p in paths) and all(
-        p.startswith(FAST_LANE_PREFIXES) or p in available or p.endswith('.md') for p in paths)
+    available = set(inventory()) - set(added)
+    def plugin(p):
+        return p.startswith(FAST_LANE_PREFIXES) and p not in FAST_LANE_GATED
+    def prose(p):
+        return p.endswith('.md') and not is_runtime_input(p)
+    return bool(paths) and any(plugin(p) for p in paths) and all(
+        plugin(p) or p in available or prose(p) for p in paths)
 
 
-def deferrable_lanes(paths, lanes):
+def deferrable_lanes(paths, lanes, added=()):
     """Lanes a fast-lane PR skips: those selected only by the component, not by a touched test."""
-    if not fast_lane_eligible(paths):
+    if not fast_lane_eligible(paths, added):
         return []
     touched = _lanes_for(p for p in paths if p in set(inventory()))
     return sorted(lane for lane in LANES if lanes[lane] and not touched[lane])
 
 
-def changed_paths(repo, event, base, head):
-    """None means uncertain. Renames and copies route by both paths, deletes by the old path."""
+def changed_paths(repo, event, base, head, added=None):
+    """None means uncertain. Renames and copies route by both paths, deletes by the old path.
+
+    `added` (a set) collects paths that did not exist at base: additions and rename/copy targets.
+    """
     if event not in ('push', 'pull_request'):
         return None
     if not all(re.fullmatch(r'[0-9a-f]{40}', value or '') and value != '0' * 40 for value in (base, head)):
@@ -188,6 +201,8 @@ def changed_paths(repo, event, base, head):
             names = [fields.pop(0) for _ in range(width)]
             if not all(names):
                 return None
+            if added is not None and status[:1] in ('A', 'R', 'C'):
+                added.add(names[-1])
             paths.extend(names)
         return paths
     except (OSError, UnicodeError, subprocess.CalledProcessError):
@@ -214,7 +229,7 @@ WORKFLOW_PATH = '.github/workflows/ci.yml'
 
 
 def gh_api(path):
-    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE))
+    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
 
 
 def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
@@ -259,6 +274,17 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if run.get('status') != 'completed' or run.get('conclusion') != 'success':
             log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
             return None
+        # The run must have tested this PR against main, not a stacked parent branch the PR was
+        # later retargeted from (GitHub clears run.pull_requests once a PR merges, so read the
+        # PR's own retarget events). Any retarget at or after the run's creation: no reuse.
+        events = api(f'repos/{repository}/issues/{int(pr["number"])}/events?per_page=100')
+        if not isinstance(events, list) or len(events) >= 100:
+            log(f'reuse: cannot read every event of PR #{pr["number"]}')
+            return None
+        retargets = [str(e.get('created_at', '')) for e in events if e.get('event') == 'base_ref_changed']
+        if any(when >= str(run.get('created_at', '')) for when in retargets):
+            log(f'reuse: PR #{pr["number"]} was retargeted after {run.get("html_url")} started')
+            return None
         jobs = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
         aggregate = [j for j in jobs if j.get('name') == 'source-checks']
         if len(aggregate) != 1 or aggregate[0].get('conclusion') != 'success':
@@ -266,7 +292,8 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
             return None
         log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
         return run.get('html_url') or str(run['id'])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
         log(f'reuse: lookup failed ({type(exc).__name__}); running the normal selection')
         return None
 
@@ -301,6 +328,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     choose = sub.add_parser('select')
     choose.add_argument('--files', nargs='*', default=None, help='explicit paths for local routing proof')
+    choose.add_argument('--added', nargs='*', default=[], help='with --files: which of them are new files')
     choose.add_argument('--event', default='push')
     choose.add_argument('--base', default='')
     choose.add_argument('--head', default='')
@@ -315,9 +343,10 @@ def main():
             runner.add_argument('--needs', required=True)
     args = parser.parse_args()
     if args.command == 'select':
-        paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head)
+        added = set(args.added)
+        paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head, added)
         plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'),
-                      event=args.event)
+                      event=args.event, added=added)
         # A fast-lane PR deferred legs to this push, so its run cannot stand in for it.
         if (args.event == 'push' and args.reuse_repository and args.files is None
                 and not plan['deferred_on_pr']):
