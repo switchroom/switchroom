@@ -47,7 +47,8 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-          GH_TOKEN: ${{ github.token }}
+          # Only a push looks anything up; other events never see a token here.
+          GH_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
         run: |
           python3 scripts/source-ci.py select --event "$GITHUB_EVENT_NAME" \
             --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT" \

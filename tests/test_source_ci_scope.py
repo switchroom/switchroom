@@ -89,7 +89,7 @@ class SourceSelectionTests(unittest.TestCase):
                      '.github/workflows/ci.yml', '.github/workflows/fleet-image.yml',
                      'scripts/source-ci.py', 'tests/test_source_ci_scope.py',
                      'scripts/run-linear-input-scenarios.py', 'scripts/read-agent-image-manifest.py',
-                     'tests/unknown_helper.py', 'tests/fixtures/anything.json'):
+                     'tests/unknown_helper.py', 'tests/fixtures/anything.json', 'tests/fixtures/reply.md'):
             with self.subTest(path=path):
                 plan = self.select(path)
                 self.assertTrue(plan['full'])
@@ -238,6 +238,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("    - cron: '23 4 * * *'", text)
         self.assertIn("reused: ${{ steps.select.outputs.reused }}", jobs['selection'])
         self.assertIn('--reuse-repository "$GITHUB_REPOSITORY"', jobs['selection'])
+        self.assertIn("GH_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}", jobs['selection'])
         for grant in ('contents: read', 'pull-requests: read', 'actions: read'):
             self.assertIn(grant, jobs['selection'])
         self.assertIn("if: needs.selection.outputs.reused != 'true'", jobs['source-tests'])
@@ -271,6 +272,9 @@ class PushReuseTests(unittest.TestCase):
                     {'id': 2, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
                      'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success',
                      'html_url': 'https://x/runs/2'}]},
+            f'repos/{self.REPO}/issues/7/events?per_page=100': [
+                {'event': 'base_ref_changed', 'created_at': '2026-11-21T12:00:00Z'},
+                {'event': 'labeled', 'created_at': '2026-11-22T00:30:00Z'}],
             f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
                 'jobs': [{'name': 'source-checks', 'conclusion': 'success'},
                          {'name': 'runtime (input 1/3)', 'conclusion': 'success'}]},
@@ -312,6 +316,11 @@ class PushReuseTests(unittest.TestCase):
                 'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
             'aggregate missing': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {'jobs': []}},
             'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': []},
+            # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
+            'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
+                {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
+            'events unreadable in one page': {f'repos/{self.REPO}/issues/7/events?per_page=100':
+                [{'event': 'labeled', 'created_at': '2026-11-20T00:00:00Z'}] * 100},
             'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
                 dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls'][0], merge_commit_sha='d' * 40)]},
             'malformed': {f'repos/{self.REPO}/git/commits/{self.SHA}': {}},

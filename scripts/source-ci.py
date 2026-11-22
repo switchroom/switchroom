@@ -110,7 +110,7 @@ def select(paths, full=False, reason='changed paths'):
             if Path(path).name in SHARED_TESTS:
                 group = 'linear' if Path(path).name.startswith('test_linear_') else 'claude'
                 tests.update(p for p in available if any(fnmatch.fnmatch(Path(p).name, pat) for pat in COMPONENTS[group]))
-        elif path.endswith('.md'):
+        elif path.endswith('.md') and not is_runtime_input(path):
             continue
         else:
             component = EXACT.get(path)
@@ -186,7 +186,7 @@ WORKFLOW_PATH = '.github/workflows/ci.yml'
 
 
 def gh_api(path):
-    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE))
+    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
 
 
 def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
@@ -231,6 +231,17 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if run.get('status') != 'completed' or run.get('conclusion') != 'success':
             log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
             return None
+        # The run must have tested this PR against main, not a stacked parent branch the PR was
+        # later retargeted from (GitHub clears run.pull_requests once a PR merges, so read the
+        # PR's own retarget events). Any retarget at or after the run's creation: no reuse.
+        events = api(f'repos/{repository}/issues/{int(pr["number"])}/events?per_page=100')
+        if not isinstance(events, list) or len(events) >= 100:
+            log(f'reuse: cannot read every event of PR #{pr["number"]}')
+            return None
+        retargets = [str(e.get('created_at', '')) for e in events if e.get('event') == 'base_ref_changed']
+        if any(when >= str(run.get('created_at', '')) for when in retargets):
+            log(f'reuse: PR #{pr["number"]} was retargeted after {run.get("html_url")} started')
+            return None
         jobs = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
         aggregate = [j for j in jobs if j.get('name') == 'source-checks']
         if len(aggregate) != 1 or aggregate[0].get('conclusion') != 'success':
@@ -238,7 +249,8 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
             return None
         log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
         return run.get('html_url') or str(run['id'])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as exc:
         log(f'reuse: lookup failed ({type(exc).__name__}); running the normal selection')
         return None
 
