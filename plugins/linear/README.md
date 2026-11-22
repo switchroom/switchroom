@@ -671,6 +671,10 @@ PR's own repository, the base branch's own workflow for each required job, lates
 counted run passing, a failed or unfinished required job in any Actions run on the head refusing, full pagination, and a final re-read showing the same head;
 merged counts, closed unmerged does not). Where Actions cannot stand in for the checks (they
 are not Actions jobs, the PR is from a fork, or only untrusted runs exist) the answer is final.
+A PR GitHub reports merged while its checks cannot be read (for example GraphQL refused for the
+gateway's token) is accepted on the merge at the head it merged, since GitHub merges only once the
+base branch's required checks pass; the Done comment says so. Without a readable head the wait
+stops with one sentence and the issue stays In Review.
 When GitHub cannot be asked (refused, unreachable, or checks not finished, including CI not
 started on an open PR), finished work shows In Review with one plain sentence instead of
 Blocked, and the PR is asked about again on a persisted gap (2 minutes doubling to an hour):

@@ -107,8 +107,10 @@ def settle(receipt: Any, url: str, *, gh: Callable[..., Any] | None = None) -> A
 
     An unverified receipt is also told apart from a PR closed without merging,
     which is a definite answer (core reports it as unavailable evidence), and
-    from a merged PR: still unverified (``ok`` stays false), but marked
-    ``pr_merged`` because no later check result can change what is waited for.
+    from a merged PR. GitHub merges only once the base branch's required checks
+    pass, so a merged PR whose checks could not be read is accepted on that merge,
+    at the head it merged (``evidence_source`` "merged"). Without a readable head
+    it stays unverified, marked ``pr_merged``: no later result can change it.
     """
     gh = gh or gh_api
     if checks_read_denied(receipt, url):
@@ -128,6 +130,11 @@ def _pr_ended(receipt: dict, url: str, gh: Callable[..., Any]) -> dict:
     except (Denied, Unavailable, KeyError, TypeError, ValueError):
         return receipt
     if closed and merged is True:
+        head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
+        if isinstance(head, str) and _SHA.fullmatch(head):
+            return {**receipt, "ok": True, "classification": "success", "head_sha": head, "pr_merged": True,
+                    "evidence_source": "merged",
+                    "detail": "the pull request was merged, which its required checks gate"}
         return {**receipt, "pr_merged": True}
     if not closed or merged:
         return receipt

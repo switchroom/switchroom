@@ -501,22 +501,32 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         self.bridge.recheck(force=True)
         self.bridge.flush()
 
-    def test_merged_pr_whose_checks_cannot_be_read_stops_verifying(self):
+    def test_merged_pr_whose_checks_cannot_be_read_ends_in_done(self):
+        # F28: GraphQL refused (the live org-token policy) while REST shows the PR merged. The merge is
+        # the acceptance: Done once, with the merged head recorded, and no more GitHub reads after.
+        self.gh.pr_state, self.gh.merged = "open", False
         task = self.finish_in_session()
+        self.gh.pr_state, self.gh.merged = "closed", True
         self.keepalive_pass()
+        self.assertEqual(self.state(), "Done")
         self.assertIsNone(self.bridge.store.acceptance_recheck("issue-1", task))
-        for _ in range(4):
-            self.keepalive_pass()
-        self.assertEqual(self.verifying(), [])
-        merged = [body for body in self.said() if "was merged" in body]
-        self.assertEqual(len(merged), 1, self.said())
-        self.assertIn(PR, merged[0])
-        # Settled for good: no further GitHub reads, and no Blocked at the 7-day cap.
+        self.assertTrue(any("which its required checks gate" in body for body in self.said()), self.said())
+        self.assertFalse(any("move it to Done" in body for body in self.said()))
         calls = len(self.gh.calls)
         self.ticks(3, after=8 * 86400)
         self.assertEqual(len(self.gh.calls), calls)
-        self.assertEqual(self.state(), "In Review")
+        self.assertEqual(self.state(), "Done")
         self.assertFalse(any("could not be confirmed within 7 days" in body for body in self.said()))
+        self.assertEqual(self.failed(), [])
+
+    def test_a_pr_merged_before_the_work_finished_is_done_without_a_wait(self):
+        task, run = self.task(claim=True)
+        self.ticks()
+        self.gh.graphql_refused = True  # PR fake defaults to merged
+        self.assertTrue(self.native("complete_task", task, summary=SUMMARY, expected_run_id=run))
+        self.ticks()
+        self.assertEqual(self.state(), "Done")
+        self.assertIsNone(self.bridge.store.acceptance_recheck("issue-1", task))
         self.assertEqual(self.failed(), [])
 
     def test_open_pr_whose_checks_cannot_be_read_still_says_verifying(self):
@@ -532,8 +542,10 @@ class PrAcceptanceFallbackScenarios(unittest.TestCase):
         for state, merged in (("Done", False), ("Canceled", False), ("Done", True)):
             with self.subTest(state=state, merged=merged):
                 self.setUp()
-                self.gh.pr_state, self.gh.merged = ("closed", True) if merged else ("open", False)
+                self.gh.pr_state, self.gh.merged = "open", False
                 task = self.finish_in_session()
+                if merged:  # merged after the wait began (merged at completion is Done at once)
+                    self.gh.pr_state, self.gh.merged = "closed", True
                 self.clock.now = max(self.clock.now, time.time()) + 5
                 self.set_state(state)
                 writes = len(self.mutations())

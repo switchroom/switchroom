@@ -350,7 +350,7 @@ class ActionsFallbackTests(unittest.TestCase):
         self.assertTrue(acceptance.unverified(receipt))
 
     def test_other_refusals_do_not_open_the_fallback(self):
-        github = FakeGitHub()
+        github = FakeGitHub(state="open", merged=False)  # an open PR: no merge to accept either
         for detail in ("GitHub refused the acceptance read (HTTP 404 on graphql acme/app) as the ambient gh login",
                        f"GitHub refused the acceptance read (HTTP 403 on repos/{REPO}/commits/{SHA}/statuses)",
                        f"GitHub refused the acceptance read (HTTP 403 on repos/other/app/commits/{SHA}/check-runs)",
@@ -366,16 +366,28 @@ class ActionsFallbackTests(unittest.TestCase):
         receipt = {"ok": False, "classification": "infra", "head_sha": None, "checks": [],
                    "detail": "GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry."}
         self.assertEqual(acceptance.settle(receipt, URL, gh=FakeGitHub(state="closed", merged=False))["classification"], "closed")
-        self.assertEqual(acceptance.settle(receipt, URL, gh=FakeGitHub())["classification"], "infra")
+        self.assertEqual(acceptance.settle(receipt, URL, gh=FakeGitHub(state="open", merged=False))["classification"], "infra")
+        self.assertEqual(acceptance.settle(receipt, URL, gh=FakeGitHub())["classification"], "success")  # merged
 
-    def test_merged_pr_with_unreadable_checks_is_marked_merged_but_never_accepted(self):
-        # HF-794: the PR merged while core could not read it; the wait has nothing left to wait for.
+    def test_merged_pr_with_unreadable_checks_is_accepted_on_its_merge(self):
+        # F28 (RCA 22 Nov 2026): 18 waits sat In Review for up to 4 days on merged PRs whose checks core
+        # could not read (GraphQL refused). GitHub merges only once required checks pass: accept the merge.
         receipt = {"ok": False, "classification": "infra", "head_sha": None, "checks": [],
                    "detail": "GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry."}
         merged = acceptance.settle(receipt, URL, gh=FakeGitHub())
         self.assertIs(merged["pr_merged"], True)
-        self.assertIs(merged["ok"], False)
-        self.assertTrue(acceptance.unverified(merged))
+        self.assertIs(merged["ok"], True)
+        self.assertEqual((merged["head_sha"], merged["evidence_source"]), (SHA, "merged"))
+        self.assertFalse(acceptance.unverified(merged))
+        for head in (None, "short", {"sha": "not-a-sha"}):  # no readable head: unverified, nothing to wait for
+            github = FakeGitHub()
+            github.pr["head"] = head if not isinstance(head, dict) else head
+            headless = acceptance.settle(receipt, URL, gh=github)
+            self.assertIs(headless["pr_merged"], True)
+            self.assertIs(headless["ok"], False)
+            self.assertTrue(acceptance.unverified(headless))
+        failed = {**receipt, "classification": "failure", "head_sha": SHA}  # a definite verdict is never overridden
+        self.assertEqual(acceptance.settle(failed, URL, gh=FakeGitHub()), failed)
         for github in (FakeGitHub(state="open", merged=False), FakeGitHub(state="closed", merged=False),
                        FakeGitHub(state="closed", merged=1)):
             self.assertNotIn("pr_merged", acceptance.settle(receipt, URL, gh=github))

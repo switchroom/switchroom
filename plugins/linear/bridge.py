@@ -1561,7 +1561,8 @@ class Bridge:
         """``unverified`` receives (url, class, head) when the refusal is GitHub not answering, else class "".
 
         ``head`` is the PR head the verifier saw (empty when unknown). ``merged`` receives the url of a
-        refused PR that GitHub reports merged: its checks are still unproved, but nothing is left to wait for."""
+        merged PR whose checks could not be read: accepted on the merge (acceptance.settle), or, without
+        a readable head, refused with nothing left to wait for."""
         prs = [url for url in links if PR_URL.fullmatch(url)]
         if any(any(marker in url.lower() for marker in OTHER_PR_PATHS) and not PR_URL.fullmatch(url) for url in links):
             failures is not None and failures.append("evidence link is not a pull request")
@@ -1581,6 +1582,8 @@ class Bridge:
                     merged.append(url)
                 return False
             if heads is not None: heads[url] = receipt["head_sha"]
+            if merged is not None and receipt.get("evidence_source") == "merged":
+                merged.append(url)  # accepted on its merge: its check results could not be read
         return True
     def status(self, issue_id: str, state: str, *, claim: bool = False, seen: str | None = None,
                row: dict[str, Any] | None = None, terminal: bool = False,
@@ -3948,6 +3951,9 @@ class Bridge:
                      sha=heads[moved[0]][:12])
         head_note = (f"\n\nThe pull request changed after the work finished; its required checks passed on its "
                      f"latest commit {heads[moved[0]][:12]}." if moved else "")
+        if merged:
+            head_note += ("\n\nGitHub would not show the pull request's check results to the agent, but it "
+                          "merged the pull request, which its required checks gate.")
         completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
                         key=lambda event: event.id)
         completion = {"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
