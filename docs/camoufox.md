@@ -115,7 +115,9 @@ Measured on a live agent after the first rollout:
   the container's own pair, so the two should agree; that is not yet re-measured on a live agent.
   The locale comes from `LC_ALL`, else `LANG`, without its charset or modifier (`en_AU.UTF-8`
   becomes `en-AU`; `C` and `POSIX` count as unset). The time zone comes from `TZ` (a leading `:`
-  is dropped), else `/etc/timezone`. The pair is passed only when both resolve; otherwise neither
+  is dropped), else `/etc/timezone`, and must name a file under `/usr/share/zoneinfo` (the image's
+  tzdata): a POSIX value such as `AEST-10` would stop camofox-browser starting, so it is dropped
+  with one line in the service log. The pair is passed only when both resolve; otherwise neither
   is, and the browser keeps its own default. Set `CAMOFOX_LOCALE` and `CAMOFOX_TIMEZONE` to choose
   the pair explicitly; set both, because camofox-browser refuses to start with only one. Keep the
   time zone consistent with where the agent's traffic exits.

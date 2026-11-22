@@ -213,9 +213,20 @@ class ServiceRunKeyTests(unittest.TestCase):
         self.assertEqual(self.run_service(self.home)["CAMOFOX_ACCESS_KEY"], env["CAMOFOX_ACCESS_KEY"])
         self.assertEqual(sorted(p.name for p in (self.home / "camofox-browser").glob(".access-key.*")), [])
 
+    def zoneinfo(self) -> Path:
+        """A zoneinfo stand-in holding the zones these tests name (UTC as a link, as Debian ships it)."""
+        root = Path(self.tmp.name) / "zoneinfo"
+        for zone in ("Etc/UTC", "Australia/Sydney", "Europe/Berlin", "Europe/Lisbon"):
+            (root / zone).parent.mkdir(parents=True, exist_ok=True)
+            (root / zone).write_bytes(b"TZif")
+        if not (root / "UTC").exists():
+            (root / "UTC").symlink_to("Etc/UTC")
+        return root
+
     def identity(self, **extra: str) -> tuple:
         """Run the service and return the (CAMOFOX_LOCALE, CAMOFOX_TIMEZONE) it exported (None if unset)."""
         extra.setdefault("CAMOFOX_TIMEZONE_FILE", str(Path(self.tmp.name) / "no-timezone-file"))
+        extra.setdefault("CAMOFOX_ZONEINFO_DIR", str(self.zoneinfo()))
         env = self.run_service(self.home, **extra)
         return env.get("CAMOFOX_LOCALE"), env.get("CAMOFOX_TIMEZONE")
 
@@ -244,6 +255,20 @@ class ServiceRunKeyTests(unittest.TestCase):
         self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_LOCALE="en-GB"), ("en-GB", None))
         self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_TIMEZONE="Europe/London"),
                          (None, "Europe/London"))
+
+    def test_a_zone_that_is_not_in_zoneinfo_exports_neither(self):
+        # camofox-browser refuses a non-IANA zone at start, and s6 would restart it in a loop.
+        (Path(self.tmp.name) / "outside").write_bytes(b"TZif")
+        for tz in ("AEST-10", "Mars/Olympus", "../outside", "Europe/../../outside", "/etc/localtime"):
+            with self.subTest(tz=tz):
+                self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ=tz), (None, None))
+                self.assertIn(f"time zone '{tz}' is not a zone in", self.stderr.read_text())
+        tzfile = Path(self.tmp.name) / "timezone"
+        tzfile.write_text("AEST-10\n")
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", CAMOFOX_TIMEZONE_FILE=str(tzfile)), (None, None))
+        # A zone the fixture holds exports; explicit values are the operator's and are not checked.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="Europe/Lisbon"), ("en-AU", "Europe/Lisbon"))
+        self.assertEqual(self.identity(CAMOFOX_LOCALE="en-AU", CAMOFOX_TIMEZONE="AEST-10"), ("en-AU", "AEST-10"))
 
     def test_half_a_derived_pair_exports_neither(self):
         for extra in ({"LANG": "C", "TZ": "UTC"}, {"LANG": "POSIX", "TZ": "UTC"}, {"LANG": "C.UTF-8", "TZ": "UTC"},
