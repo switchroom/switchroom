@@ -168,6 +168,13 @@ class TwoAgents(unittest.TestCase):
             self.assertTrue(started["ok"], started)
             self.owner.flush()
             self.owner_task = self.owner.store.get(ISSUE)["task_id"]
+        # Atlas's work began well before anyone asks Nova to take it over. Linear's record of
+        # that (Atlas delegating itself) must not sit inside the whole second Kanban stamps on
+        # Nova's new task, which is the fence delegate recovery uses for a receipt-only admission.
+        earlier = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        for node in self.linear.history.get(ISSUE, []):
+            node["createdAt"] = earlier
+        self.linear.issues[ISSUE]["updatedAt"] = earlier
         # Nova's A2A requests reach Atlas authenticated as the peer "nova".
         self.a2a_context = NativeContext(home=str(self.owner_home), profile="default", platform="a2a", source="a2a",
                                          session_key="a2a:nova", session_id="a2a-session", user_id="nova", chat_id="nova")
