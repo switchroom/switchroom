@@ -333,6 +333,20 @@ class Store:
                 db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self.ISSUE_PROJECT + team, project_id))
 
+    TAKEOVER_FROM = "takeover-from:"  # issue id -> the delegate this agent last asked to hand over
+
+    def takeover_from(self, issue_id: str) -> str | None:
+        """The delegate this agent last asked to hand the issue over (resume_owner's target once that
+        owner has removed itself as delegate)."""
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?", (self.TAKEOVER_FROM + issue_id,)).fetchone()
+            return row[0] if row else None
+
+    def remember_takeover(self, issue_id: str, delegate_id: str) -> None:
+        with self._tx() as db:
+            db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self.TAKEOVER_FROM + issue_id, delegate_id))
+
     def conversation_input(self, issue_id: str, session_id: str) -> dict | None:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?",

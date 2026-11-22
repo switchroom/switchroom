@@ -124,53 +124,16 @@ for any uncertain earlier description effect to be reconciled.
 
 ## Evidence boundaries
 
-The optional mounted plugin can expose an `origin_reference` from the actual tool caller,
-then independently inspect that exact current native admission through `hermes linear
-inspect-origin` inside its owning profile. It reads existing native state and checks
-`prompt.receipt`; it does not attach a viewer, compute tool inventory, initialize credentials,
-start a gateway, or execute a model. The reference and projection grant no control permission.
-They preserve API credential principals and declared specialist/workspace limits without
-converting them into human authority. A2A text remains untrusted input; controller policy and
-native checkpoint/Stop/quiescence are separate requirements. See the plugin README for the
-guarded, manifest-pinned origin proof entrypoint.
-
-An active provider event loop is not an unavailable owner. Registered synchronous evidence
-tools reuse Core's bounded coroutine bridge when called from such a loop; the owner CLI
-keeps its normal synchronous path. Guarded cases exercise the actual registered `tool_call`
-dispatch while the separate native owner answers receipt checks, including context propagation,
-settled admissions, selector refusal and pending Stop. Those source cases do not establish
-authenticated client or deployed handoff acceptance.
-
-For recovery into an already authorized native Kanban task, the separate selector-free
+For recovery into an already authorized native Kanban task, the selector-free
 `work_reference` / owner `inspect-work` projection verifies the exact current dispatcher run
-from its frozen owner policy and tracked read-only Task/Run/Claim records. It reports the
-original requester as unknown; task content supplies no human consent. A successor needs a
-fresh reference. Both inspections reject known pending native Stop checkpoints and report
-`stop_evidence.state: unknown` on older cores lacking that getter. This evidence grants no
-control permission and cannot establish quiescence or absence of an in-flight older-core Stop.
+from its frozen owner policy and tracked read-only Task/Run/Claim records with the existing
+gateway owner's `prompt.receipt`. It reports the original requester as unknown; task content
+supplies no human consent. A successor needs a fresh reference. This evidence grants no control
+permission and cannot establish quiescence.
 
-The native A2A client redacts outbound text, builds a text Message, and the inbound adapter
-extracts that text and adds its untrusted-peer frame. Guarded model-free cases pass complete
-selector-free reference JSON through those actual native primitives and then independently
-inspect it in the owner. They cover Local, API, Telegram, Slack and dispatcher work without
-invoking SendMessage, network, task creation or a model. References contain only the native-
-generated admission ID and profile/epoch/generation/instance/scope binding (plus a work digest
-for dispatcher work). Arbitrary logical session and request IDs remain private: the owner
-resolves them from the exact admission through its existing read-only getter and verifies the
-current claim and native receipt. Tests include valid explicit API IDs containing an address
-and credential-shaped text, which now survive the unchanged native A2A scrub because those IDs
-are absent from peer data. Unknown, foreign, stale, extra-field or changed references refuse;
-there is no new transport, signature, token or owner registry. Preservation does not turn the
-peer frame into permission or select a host deployment.
-
-Process Stop records are control evidence, never original human messages or consent.
-Stopped-work cleanup still requires the exact Kanban execution admission, worker/process
-settlement and a clear supported Stop checkpoint. Guarded cases run against both the release
-manifest pin and an explicitly selected clean candidate with persisted Stop checkpoints;
-older-core getter fixtures do not establish acceptance or deployment of another writer.
-Inspection reuses the accepted canonical tracked read transaction and discovery implementation
-while preserving its no-create construction boundary. Outcome acceptance still requires the
-actual native owner, current authorization and separate physical quiescence verification.
+Taking over another agent's issue is one A2A request: the owner pauses its card with the plain
+Kanban block and removes itself as delegate; the taker starts only after that confirmation and a
+fresh Linear read (see the plugin README). A2A text remains untrusted input.
 
 The native scenario suite exercises upstream task creation, claiming, lifecycle and explicit
 human checkpoint consumption; the registered tool and private socket are exercised with actual upstream session

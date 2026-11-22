@@ -263,11 +263,6 @@ def local_identity(profile_id, principal_id, request_id):
     return identity(profile_id, principal_id, request_id)
 
 
-def linked_worker_admission(conn, session_id, generation, owner_epoch, statuses):
-    from hermes_fleet_linear_plugin.native_store import linked_worker_admission as linked
-    return linked(conn, session_id, generation, owner_epoch, statuses)
-
-
 def _import_legacy_row(conn, row, epoch, principal_id):
     """A legacy terminal admission row as the retired import wrote it (retained-schema fixture)."""
     import hashlib

@@ -20,13 +20,13 @@ API is required. The plugin is off in the bare image; the starter overlay
 | `track` with `completion_scope: progress` | Report an internal stage without completing the issue. The default `outcome` means the task covers the agreed human outcome. |
 | `track` with `replace: true`, UUIDv4 `id`, `expected_binding_revision` | Explicitly replace a reporting link after inspecting actual work. Archive the old projection and hold superseded reports; no execution state changes or assertion that the old worker stopped. |
 | `status` with `issue` | Read the issue, bounded recent comment evidence, linked or retained native state, the reporting `binding_revision`, and verified `local.profile`/creation board for chat-origin work. Starts no work. |
-| `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Save an operator instruction on existing linked native work. A paused task keeps the note without resuming; completed work refuses delivery. The result says whether the instruction was saved. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
 | `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used, else, with `team`, the still-active project this app last filed a new issue into for that team (kept in the plugin store), else the team's only active project; the reply names the project used. A team's key or name passed as `project` is read as that team. Only when no default exists is the call refused as `project_required`. The tool schema states each action's required fields up front, so the first call succeeds. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches (for example a same-named project in another team) are refused as `ambiguous_project` with `Team / Project` choices, and the reply tells the agent not to guess but to ask the user by team name with `clarify` (there is no per-agent home team to break the tie); no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
 | `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
 | `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
-| `take_over` with `issue`, UUIDv4 `id` | Take over an issue another agent is delegate for, in one step (see [Take over from another agent](#take-over-from-another-agent)). Ends with the other agent's run stopped, proven ended and this agent continuing as one task with this app as delegate, or with nothing changed and a plain reason. `work_on` refuses an issue delegated elsewhere and points here. |
+| `take_over` with `issue`, UUIDv4 `id` | Take over an issue another agent is delegate for, in one step (see [Take over from another agent](#take-over-from-another-agent)). Asks the other agent over A2A to pause its work and stop being the delegate, then continues here as one task with this app as delegate, or changes nothing and says why. `work_on` refuses an issue delegated elsewhere and points here. |
+| `hand_off` with `issue`, `to`, UUIDv4 `id`, optional `resume` | The owner side of a takeover, called when a configured peer asks over A2A: pause this agent's task for the issue and stop being its delegate, or with `resume: true` lift exactly such a pause and become the delegate again. |
 | `create_issue` or `work_on` with `record_done: true`, `summary`, optional `evidence` links | Link work already finished in chat and close it: the native task is created parked and completed with that evidence in one call, never runnable; verified completion sets Done with the closing summary. Refused when the issue already has native work. |
 | `create_project` with UUIDv4 `id`, `name`, `team` | Create a project. |
 | `link_issue` with `issue`, `related`, `relation` | Relate existing issues. |
@@ -292,118 +292,79 @@ publication, and earlier request coordinates and receipts remain intact.
 
 ### Take over from another agent
 
-"Take over HF-9 from Atlas" is one `take_over` call on the requesting agent. The rule: two
-agents never run the same work. When a handover can't complete after the owner stopped, the
-owner stays paused and the user and the Linear issue are told so plainly; nothing resumes it
-automatically.
+"Take over HF-9 from Atlas" is one `take_over` call on the requesting agent. Two rules hold:
+two agents never run the same issue's work, and nobody running is never silent. When a handover
+can't complete after the owner may have paused, the owner stays paused and the user and the
+Linear issue are told so plainly; nothing resumes it automatically.
 
 1. The requester checks everything it could refuse later (issue open and fully read, its own
-   authorization, executor, board pin and guarded controls) before the owner is touched. While a
-   task for the issue is ready or running here, the owner is never asked for anything: a task
-   here from an earlier takeover from the same delegate means the takeover already happened, so
-   the reply says so and only the Linear delegate update is retried, whatever the request `id`.
-   Any other local work refuses with the owner untouched: running work (a person decides which
-   agent continues), and finished or paused work (it would leave nobody running the work once
-   the owner stops). An issue with no agent delegate is not a takeover (`not_delegated`: use
-   `work_on`); one delegated to this app is plain `work_on`. One `take_over` or `resume_owner`
-   per issue runs at a time on an agent (`takeover_in_progress`).
-2. It runs the owner's own `hermes linear hand-off` through the operator-configured command for
-   that delegate (`takeover.agents`, below). No configured command: `takeover_unavailable`,
-   nothing changed. The plugin never improvises a route into another profile.
-3. The owner, in code: refuses before stopping anything when the proof cannot hold (no
-   reporting link here, not exactly one task, issue scope conflict, started tasks still open,
-   no guarded controls or native Stop getter, and the parts of `inspect-cleanup` a Stop cannot
-   change); pauses the task with one guarded native Stop whose reason is
-   `Paused for a handover to <name> [handoff:<request id>]` (never pushed into the recurrence
-   fence); and waits up to `wait_seconds` for `inspect-cleanup` to prove the stopped run ended
-   (`state: handed_off`). If the stopped worker reported back after the gateway gave up on it,
-   core leaves that attempt `unknown` and nothing in the gateway's lifetime settles it; when the
-   proof holds on exactly that row under a handover pause for the same agent (this request's or
-   an earlier one's; blocked, no current run, the row is the stopped run's card attempt), the
-   owner asks core once to resolve it (`prompt.resolve_unknown`, the same call as a person's
-   Discard, which first re-runs core's process-stop cleanup) and proves again. A `started` row is
-   waited on and asked about once it turns `unknown`; a person's pause or a pause for another
-   agent is never resolved, and a refused resolve leaves the work paused. It never
-   resumes anything by itself: if the proof fails, the work stays
-   paused (`state: paused`, with a plain reason). A task already paused for a handover to the same
-   agent (a retry with the same `id`, or a new request) is proven again, never stopped twice. A
-   task paused by someone else is only proven, never changed (`state: unchanged`); one paused for
-   a handover to a different agent is refused. One hand-off or resume runs per issue at a time on
-   the owner (a lock beside its state database, waited on for at most 10 seconds).
-4. On proof the requester creates its one native task, whose text says to continue from the
-   old owner's progress in the Linear thread, and admits it in the same call, while Linear still
-   shows exactly the old delegate and no person has changed its state, assignee or delegate since
-   this `take_over` asked the owner (the same check as `work_on`; the old delegate app reporting its
-   pause, moving the issue to Blocked, is not a person). Each new `take_over` is the authority for
-   its own start: a change before it does not hold it, a change after it does. It then replaces
-   that delegate (guarded on it) with this app and subscribes the chat to checkpoints and the
-   result. The old delegate app's pause report
-   never holds that update; a person's routing change, or the old delegate app reporting a
-   resume, does. A held update is retried by delegate recovery.
-5. If anything fails once the owner may be paused (no readable reply, a proof that failed, or a
-   start here that failed), what runs here decides. A task ready or running here (admitted before
-   a later step failed) means the handover stands: the reply is a success that names the
-   unfinished Linear update. Otherwise the reply is `takeover_paused`, and the same words are
-   posted on the issue: "Atlas's work on HF-9 is paused for a handover to Nova that didn't
-   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." The
-   reason is named plainly (for example a person changing the issue's status, assignee or delegate
-   while the task was being set up). 'take over HF-9' is offered only when a new `take_over` would
-   ask the owner again; after a Stop from Linear, or a start that couldn't be confirmed, only
-   'resume HF-9' is offered, and a later `take_over` refuses without asking the owner, saying
-   Atlas was not asked again and how to resume it if it is still paused. If meanwhile someone
-   delegated the issue to another agent, to this agent by hand, or removed the delegate, resuming
-   is not offered: the message says who has it now, and that Atlas continues only after the issue
-   is delegated back to it and a person says 'resume HF-9'. That message stays true: a takeover task
-   is admitted only by the `take_over` call that has just proven the owner's run ended, never
-   later by the service, an assignment echo or `work_on`. A task created here whose start failed
-   stays parked; saying 'take over HF-9' again proves the owner's pause again (it is never stopped
-   twice) and starts it, also when the first start lost to a person's change made before that new
-   request. An admission that did land before a lost reply or a crash is only
-   recognised by its native receipt, never repeated.
-6. `resume_owner` is the one supported way to let the owner continue (a person saying "resume
-   HF-9"). The owner it resumes is Linear's current delegate, never an earlier one: if the issue
-   is now delegated to someone else, or to nobody, it refuses (`resume_refused`) and changes
-   nothing. It also refuses while this agent runs or ran the work. Otherwise it runs the owner's
-   `hand-off --resume`, which lifts only that exact guarded handover pause for this agent,
-   guarded on its latest event. A lost reply is `resume_uncertain`: nothing starts here, and
-   asking again is safe. A parked takeover task here never starts after a resume; only a new
-   `take_over` (which asks the owner to stop again) starts it.
+   authorization, executor, board pin and guarded admission) before the owner is asked. While a
+   task for the issue is ready or running here, the owner is never asked: a task from an earlier
+   takeover from the same delegate means the takeover already happened, and any other local work
+   refuses with the owner untouched. An issue with no agent delegate is not a takeover
+   (`not_delegated`: use `work_on`); one delegated to this app is plain `work_on`. A delegate
+   with no `takeover.agents` entry is `takeover_unavailable`, nothing changed. One `take_over` or
+   `resume_owner` per issue runs at a time in a gateway (`takeover_in_progress`).
+2. It sends one A2A message through core's own `a2a_call` tool to the owner's configured peer
+   (`a2a`, a name in core's `a2a_agents`). The message asks the owner to call its `linear` tool
+   `{"action": "hand_off", "issue": "<KEY>", "to": "<this agent's name>", "id": "<uuid>"}` and to
+   reply with that tool's JSON unchanged. It waits at most `wait_seconds` for the answer. An
+   answer that certainly never reached the owner (A2A not set up, unknown peer, auth refused) is
+   `takeover_unavailable`, nothing changed.
+3. The owner's `hand_off`, in code: finds its one bound native task for the issue and refuses
+   plainly, changing nothing, when there is none, it already finished, or it is waiting on
+   something else (paused, a dependency, review). A running or ready task is paused with the
+   plain Kanban `block_task(reason="Paused for a handover to <name> [handoff:<id>]",
+   kind="needs_input")`. A task already paused for a handover to the same agent (a retry with the
+   same `id`, or a new request) counts as paused, never paused twice. It then removes itself as
+   the issue's delegate in Linear (a direct write, checked by a fresh read), drops its own unsent
+   delegate writes and records that it will not re-add itself, and answers
+   `{"ok": true, "handed_off": true, "paused": true, "issue_id": ..., "request_id": ..., "message": ...}`.
+   If the delegate write fails after the pause, the answer is `paused: true, handed_off: false`.
+4. The requester starts only after the owner confirmed the handover AND a fresh Linear read shows
+   the owner is no longer the delegate. It then creates its one native task (whose text says to
+   continue from the owner's progress in the Linear thread), admits it in the same call through
+   the same guarded chat admission as `work_on`, and queues this app as delegate. A person's
+   routing change after the owner's confirmation holds the start; the owner app reporting its
+   pause (moving the issue to Blocked) does not.
+5. Anything else once the owner may be paused (no answer in time, an answer that is not the
+   tool's strict JSON, an owner that paused but is still the delegate in Linear, a start here that
+   failed) leaves nothing running here and answers `takeover_paused`. The same words are posted
+   as a comment on the issue: "Atlas's work on HF-9 is paused for a handover to Nova that didn't
+   complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." ("may be
+   paused" when the owner's answer never came.) If meanwhile someone delegated the issue to
+   another agent, the message says who has it and that Atlas continues only after the issue is
+   delegated back to it and a person says 'resume HF-9'. A task created here whose start failed
+   stays parked; saying 'take over HF-9' again asks the owner again (it is never paused twice)
+   and starts it.
+6. `resume_owner` is the one supported way to let the owner continue. Its target is the issue's
+   delegate when that is a configured peer, else (the owner removed itself) the agent this one
+   last asked to hand the issue over. It refuses while this agent runs or ran the work. The owner's
+   `hand_off` with `resume: true` lifts only a pause for a handover to this agent with the plain
+   `unblock_task`, refuses while the issue is delegated to someone else, and makes itself the
+   delegate again. An unconfirmed answer is `resume_uncertain`: nothing starts here, and asking
+   again is safe.
 
-Known limits, by design rather than more machinery:
+Known limits, by design:
 
-- After a successful takeover the owner's task stays paused on the owner's board for good; it is
-  not closed, because the owner's app would report that ending on the issue under this agent, and
-  closing it would take a second cross-agent step that can itself fail. Nothing
-  in this flow resumes it, but a person or the owner's own orchestrator could still resume it
-  with native Kanban controls (the owner's tool text forbids `kanban unblock` for handover
-  pauses, which is guidance, not a lock). Doing so would run both agents; archive the owner's
-  task by hand if that risk matters. A pause a person made before the takeover is proven but
-  keeps its original wording.
-- If someone resumes the owner by hand on its own board in the moment between its proof and the
-  start here, on a Linear workflow with no Blocked state (so the owner's resume writes no state
-  change), the start here does not detect it. That window is one call long.
-- The owner recognises a retried handover by the requester's configured `name` in the pause
-  reason. Give each agent a distinct `takeover.name`; two requesters with the same name could
-  prove each other's pause.
+- The owner's pause is a card pause. Its worker's current turn is stopped by core's own
+  block handling; the requester does not wait for a proof that the worker process exited.
+- After a successful takeover the owner's task stays paused on the owner's board. A person
+  resuming it there by hand would run both agents; archive it if that risk matters.
+- The owner recognises a retried handover by the requester's `name` in the pause reason. Give
+  each agent a distinct `takeover.name`.
+- A person's request reaches the owner as A2A text that its model turns into the `hand_off`
+  call; the requester trusts only the tool's strict JSON plus its own fresh Linear read.
 
 The owner's Linear thread shows the pause as "Paused for a handover to <name>. Nothing is needed
-from you ...", never "Waiting on you"; only that exact guarded reason is worded this way, and
-any other pause keeps its ordinary wording. Output lines before the JSON reply (secret loaders,
-banners) are ignored, and a reply for another issue is not a handover.
+from you ...", never "Waiting on you"; only that exact reason is worded this way.
 
-The owner command runs without a shell and passes each argument through unchanged; the
-`--issue-json` argument is a JSON object and `--to` may contain spaces. Point `command` at
-something that executes argv as given (`docker exec ...`, a host bridge that forwards argv).
-Never wrap it in `ssh host ...` or `sh -c ...`: both join the arguments into one string and
-re-split it, which breaks the JSON payload. One `take_over` takes this side's Linear reads
-before the owner is asked (a 40-second Linear deadline), one owner call (bounded by a
-`wait_seconds` plus 60 second subprocess timeout) and one start here (a 60-second Linear
-deadline; a Linear request that could not finish inside a deadline is not started).
-`wait_seconds` is capped at 120, so the whole call ends inside the chat client's 300-second
-timeout.
+One `take_over` takes this side's Linear reads before the owner is asked (a 40-second Linear
+deadline), the A2A wait (`wait_seconds`, at most 300) and one start here (a 60-second Linear
+deadline). The chat client's timeout covers that sum.
 
-For a manual or older takeover, first inspect the current owner and native work, coordinate
-its Stop and verify cleanup, then link the existing task or a deliberately created remainder
+For a manual takeover, first coordinate with the current owner so its work is paused, then
+link the existing task or a deliberately created remainder
 on the receiving agent. Read `status` and pass its exact binding revision, delegate ID
 (including null) and issue timestamp to `delegate_self`. Confirm Linear delivery before
 using current native controls to resume the remainder. Assignment echoes see the existing
@@ -557,9 +518,8 @@ plugins:
           agents:
             - name: Example-A
               delegate_id: example-a-app-user-id
-              # Runs Example-A's own hermes CLI; the plugin appends `linear hand-off ...`.
-              command: [example-host-bridge, profile, example-a, --, hermes, --profile, default]
-              wait_seconds: 90     # how long Example-A waits for its stopped run to end (capped at 120)
+              a2a: example-a       # Example-A's peer name in core's `a2a_agents` config
+              wait_seconds: 120    # how long to wait for Example-A's A2A answer (at most 300)
 ```
 
 `token_file` credentials with `path` are also supported. OAuth and token caches remain private
@@ -576,9 +536,11 @@ last full pump changed nothing is skipped until the store or its board changes, 
 60 s; running work is always pumped. A `linear` tool call wakes the loop, so its queued writes
 go out at once; other time-based work (a due issue recheck, an outbox retry) can run up to 15 s
 later than before while the loop is idle. `takeover` lists the agents this one may
-[take over from](#take-over-from-another-agent): each entry's `command` is an argv list (no shell)
-that runs that agent's own `hermes` CLI in its own profile, never through `ssh` or `sh -c`;
-invalid entries are dropped and logged.
+[take over from](#take-over-from-another-agent): each entry's `a2a` names that agent's peer in
+core's `a2a_agents` config (the A2A client tools must be available on this agent, and the A2A
+platform on the owner); invalid entries are dropped and logged once (`takeover_unavailable`).
+The older `command` key (a host argv into the owner's container) is no longer read: an entry
+with only `command` is dropped, so replace it with `a2a`.
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not
@@ -929,77 +891,7 @@ JTBD outcome cases still require actual Linear, Desktop, Slack and Telegram evid
 The guarded finite-model task test does not establish a gateway-spawned actorless
 worker or live client acceptance; that case remains a release acceptance check.
 
-## Native origin evidence
-
-The registered `linear` tool accepts `{"action":"origin_reference"}` with no other fields.
-It captures the current host-bound caller, resolves its native compression lineage, and
-checks its ordinary active admission with the existing gateway owner. It returns a reference
-and `permission_granted: false`; it does not contact another agent or transfer execution.
-The reference contains the native-generated admission ID and profile/owner/epoch/generation/
-scope binding only. Arbitrary session and request IDs stay inside the owner, where the
-read-only admission getter resolves them. Work references use the same minimal coordinates.
-This lets native A2A privacy redaction remain enabled even for explicit API IDs containing
-addresses or credential-shaped text; neither requester principals nor original input leave
-the owner in a cross-agent reference.
-Delegated children, bots, automation, ambiguous steering, unknown execution and stale owners
-cannot supply this reference. Unsupported native hosts fail closed.
-Desktop is a chat surface like Telegram and Slack: a Desktop chat on the native local owner,
-including one adopted from main that keeps its stored `desktop` label, supplies a reference
-for its authenticated owner. A Desktop chat still on a legacy host has no owner receipt and is
-refused by name. Kanban subscriptions from such a turn target the same native local
-conversation, so results return to the Desktop chat that asked.
-
-Provider SDKs can invoke the registered synchronous tool from their own asyncio loop.
-Origin and work evidence use Core's existing bounded coroutine bridge on that path,
-preserving the native profile and turn context while the gateway owner answers receipt
-checks on its separate loop. The owner CLI keeps its ordinary synchronous entrypoint.
-This changes neither the reference contract nor authorization, Stop or current-owner checks.
-
-An already-authorized operator can independently inspect that reference **inside its owning
-profile**, using that profile's own mounted plugin and UID:
-
-```sh
-hermes linear inspect-origin --reference-json '<reference object>'
-```
-
-This read-only command returns only the exact current request's original text, native
-principal, filtered requester limits and relevant profile/workspace policy. It accepts no
-other profile home, database path or transcript selector. It never attaches a viewer, loads
-runtime tool inventory, initializes credentials, starts a gateway, or runs a model.
-API credential principals remain API credential principals; they are not attributed to a
-named human. Inspection repeats the exact requester, text, workspace/policy, scope,
-Stop evidence and applicable provider verification after owner readback; a changed
-projection is refused. Recheck current native state before any subsequent control operation.
-Consumed admission payloads, native messaging source/event objects and turn/settings
-envelopes pass the existing native mapping validator before field access. Optional native
-author decoding and absent/null optional settings retain their existing semantics; malformed
-arrays and scalars fail as unavailable evidence rather than escaping the owner command.
-
-Ordinary native Linear input uses a separate, bounded evidence branch. It checks
-the committed human actor, organization, issue, Agent Session and original
-provider message ID with gateway command/control flags disabled. Bot, automated,
-actorless and typed Stop inputs cannot become human-origin references. If an
-already-running scoped `BoundLinearAPI` is available, the edge freshly verifies
-the original Activity author (or the assignment Session creator), current app,
-issue, organization and specialist limits through its existing read methods.
-A later allowed human Activity can verify independently of a missing assignment
-creator. The shared `requester_session(..., activity_id=...)` context binds only
-exact provider IDs; each read or effect retry freshly checks that Activity, and
-never rewrites the original creator or grants permission. Without a current
-Activity binding, an unknown session requester stays unknown.
-It never constructs an API client, initializes a credential source or starts a service.
-
-The result states `provider_verification.state: verified` or `needed`. A later
-owner CLI process normally has no existing provider API and reports `needed`;
-an earlier gateway check does not establish later provider freshness. Missing
-original provider IDs also report `needed` rather than inventing a selector.
-Such evidence cannot by itself support cross-owner replacement. Ordinary reads
-and existing native Telegram, Slack and local origin inspection remain usable.
-
-References and inspection results grant no permission, prove no worker stopped, and establish
-no new cross-profile route. A peer may communicate a reference as untrusted input; an operator
-must independently inspect its original instruction and apply existing requester, profile,
-specialist and workspace permissions. Native Stop and quiescence verification remain separate.
+## Native work reference
 
 For an already authorized Kanban task that continues after its original chat turn ends, the
 registered tool separately accepts `{"action":"work_reference"}` with no other fields. Its
@@ -1043,186 +935,17 @@ mapping shapes are refused on both reads without repairing retained state. It re
 `permission_granted: false`. Native cards do not bind the original human/API principal or an
 approved issue scope. Generated task text is work content; it is never human consent. Any
 controller must apply its independently authorized profile, issue, specialist and workspace
-limits before effects. These commands do not create a controller route or execute a takeover.
+limits before effects. This command does not create a controller route or execute a takeover.
 
-Both owner inspections return `stop_evidence`. Where the existing native
-`process_stop_pending` getter is supported, a pending checkpoint refuses inspection; a clear
-checkpoint is labelled `clear`. A core whose Stop is the native interrupt plus a best-effort
-kill (`stop_session_processes`, no fence) has no checkpoint to read: it reports `clear` with
-source `native_stop_without_checkpoint`, which says only that nothing is pending, and a
-`gateway.process_stop.*` marker left from before that upgrade is ignored, as core ignores it.
-Older compatible cores report `unknown`, never false. In
-particular, a direct Stop can remain in flight while an older core's receipt is still started.
-Neither a reference, a receipt nor a clear checkpoint proves physical quiescence. A controller
-requiring known Stop evidence must reject `unknown` before effects and separately verify
-checkpoint, native Stop, settlement and process quiescence using its authorized control path.
-
-For the stopped task's final cleanup observation, an already authorized operator can run
-the owner-only command inside the old work's fixed approved deployment:
-
-```sh
-hermes --profile default linear inspect-cleanup <issue-id> --expected-stop-event-id <stop-event-id>
-```
-
-The selector can be the issue id or its key (`OPS-9`) when `--issue-json` carries the issue's
-`id`, `identifier` and `url`. Tasks the bridge creates name their issue by key and link, so
-without that link a marker can be neither matched nor refuted: the hold is `issue_metadata_required`
-(with a `needed` sentence), never a scope conflict. A key without `--issue-json` is held the
-same way, because native records are keyed by issue id.
-
-Use the latest native `blocked` or `block_loop_detected` pause event as the anchor;
-a later `worker_result` is settlement evidence, not the pause. A needs-input
-recurrence guard can leave the task in TRIAGE. Inspection recognizes only that
-verified native loop pause, with matching counters and a settled blocked run,
-and retains every admission, process and scope check. Leave the TRIAGE fence in
-place while inspecting; cleanup evidence grants no execution permission.
-
-It derives the board/task from the current saved native reporting link. If the link is absent
-or retained legacy data, it inspects existing native history using the same issue-matching
-rules as ordinary discovery, without creating or adopting a reporting link. Optional
-`--issue-json '{"id":"...","identifier":"...","url":"..."}'` supplies independently read
-issue metadata for explicit marker matching; it is discovery data and grants no authority.
-Ambiguous, foreign, archived, unreadable or scope-fenced results remain unknown. Existing
-saved links never skip native discovery across retained boards. Another matching executor,
-including archived work, holds proof. The selected board's strict SDK history, current task
-issue-scope check, predicate-key preflight and native event decoding share one tracked read
-transaction. An explicit conflicting issue marker stays unknown even when a saved link or
-idempotency key selects that task. Marker-free
-authorized manual links and repeated matching canonical ID/identifier aliases remain valid.
-Native-normalized owned keys must agree with SQLite's actual task/run predicates before filtering; a readable
-BLOB alias is unknown rather than an omitted attempt. The checks preserve raw SQLite
-equality/order and unrelated readable foreign records, without repairing any keys.
-No filtered-out opaque key or conflicting event/run ownership is positive foreign evidence.
-
-A worker recorded in an earlier instance of this host (after a container restart or a reboot)
-is proven gone by core's own evidence first, with no host receipt: the worker's recorded
-instance must be well-formed and earlier than this one (same boot: an earlier PID 1 start;
-another boot id: a reboot), the gateway process that admitted the attempt must be gone, and
-core's `attempt_instance_replaced` (hermes-agent #217) must accept every worker the run
-recorded. Its fate is then `instance_replaced`; every admission, Stop, executor, scope and
-checkpoint check below still applies. A worker that may still be alive keeps the hold, with a
-plain `needed` sentence: `old_worker_alive` (a live worker of this instance),
-`old_gateway_alive` (a live process here may be the admitting gateway), `worker_instance_not_earlier`
-(another running copy), `old_instance_unproven` (core cannot yet prove it),
-`restart_proof_unsupported` (a core without #217) or `worker_identity_unreadable` (this
-instance's identity cannot be read). Each hold is logged as `action=cleanup.inspect outcome=held`.
-
-The host receipt below is read only when core's proof does not hold, which in practice means an
-older core without it. Like core, this check assumes one live instance per home (each container
-its own volume, as in `compose.example.yaml`); a home shared by two live containers is
-unsupported, and a receipt does not make it safe. A present receipt that fails its checks still
-holds with its own reason.
-
-The optional host namespace-disposal transport is the existing protected ingress directory's
-`namespace-dispositions/<sha256(epoch UTF-8)>.json` sibling directory. Every ancestor must be
-root-owned, nonwritable by group/others and nonsymlink. The receipt directory is `root:1000`
-mode `0750`; each single-link regular receipt is `root:1000` mode `0440`, opened without
-following symlinks and limited to 16 KiB. Neither the group-writable ingress SQLite bytes, plugin metadata, model
-arguments nor an arbitrary file can provide this proof. No new mount or credential is needed.
-
-Version 1 has exactly these fields (all identifiers below are synthetic):
-
-```json
-{"version":1,"kind":"pid_namespace_disposed","deployment_profile":"specialist","native_profile":"default","home":"/opt/data","home_dev":123,"home_ino":456,"epoch":"00000000-0000-0000-0000-000000000001:12345","container_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","host_pid1":23456,"pid1_start_ticks":12345,"pid_namespace_inode":34567,"host_pid_namespace_inode":45678,"pid_mode":"private","old_instance_disposed":true,"pid1_gone":true}
-```
-
-The host producer captures the selected old service/container, its live PID1 birth and private
-PID namespace, and the declared profile's actual bind-volume identity **before** stopping it.
-The host and old container must agree on `/opt/data` device/inode. It publishes atomically only
-after proving that exact old host PID1 birth gone under isolated PID mode. The old container
-may be absent, present stopped, or restarted with a distinct new PID1/private namespace and
-consistent profile/home binding. Contradictory Docker/kernel state, a name change, failed
-inspection or unreadable identity is insufficient. Gateway-only restart keeps PID1 and needs no receipt.
-Linux terminates a PID namespace's remaining processes when its init exits and prevents new
-processes entering that dead namespace; see [pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html).
-It never overwrites a conflicting receipt. The epoch's final integer equals `pid1_start_ticks`;
-the two namespace inodes must differ. Integer fields exclude booleans; `home_dev` is nonnegative,
-other integer identities are positive. `old_instance_disposed` and `pid1_gone` are literal true.
-
-The consumer binds the protected inbox/deployment profile, current native profile and canonical
-home, actual current home device/inode, and exact retained worker epoch. It still performs all
-current Stop, admission, scope, descendant and effect checks. A namespace disposition proves
-only physical fate; it cannot mark an external effect successful or authorize more work.
-Legacy observations made before this producer existed are not automatically imported or backdated.
-
-`quiescence_proven: true` requires the exact current blocked `needs_input` Stop, no current
-claim, matching frozen owner/run/admission/executor records for every retained task attempt,
-terminal native admissions with recognized settled outcomes and worker/child ledger,
-confirmed clear native Stop checkpoints, and recorded interpreter and
-submitter identities proven gone or recycled. A native Stop on an unclaimed ready or Review
-card can also record a control-only blocked run. The inspector lists it in `control_only_runs`
-only when its exact zero-duration row has no step, claim, lease, process, heartbeat, runtime, metadata or error fields
-and has exactly one matching native block event, with no execution events. Such a row
-does not replace an executed attempt's admission or worker evidence. Any other row stays
-subject to the full execution checks, including missing or ambiguous owner evidence.
-Admission and Stop checks cover the native
-compression lineage of every attempt, every retained execution in that scope and all of
-their descendant session lineages. The read repeats that discovery until no new session or
-execution remains; terminal extra compute roots participate too. Before native lineage resolution, only
-the relevant local receipt (or its chat-linked receipt) and explicit reset-child mapping
-metadata are decoded in the same pinned snapshot. Native helpers retain topology and
-semantic validation. Those consumed inputs join the repeated digest; unrelated model
-configuration and foreign receipts remain outside this check. A settled parent does not
-discharge queued or unknown child work. Those session identities, admissions and every
-retained worker identity/state participate in the repeated evidence digest, including
-settled arrivals during the owner read. Every consumed owned worker field must satisfy
-its native schema and writer contract, including kind, counters and referenced session.
-Historical terminal epochs/generations and terminal sequence zero remain valid; malformed
-retained records remain unknown. Selected admission records use the native identity and
-JSON validators before primary payload field access, recognized intents and native counter
-contracts, preserving resultless controls and nullable legacy terminal metadata. Frozen
-Kanban context and saved binding metadata pass the existing JSON-object decoder before
-field access; arrays, null and scalars stay unknown without state repair. The native worker/admission physical-lineage
-join also checks for started or unknown claims whose logical target differs. Unrelated
-foreign payloads remain outside these checks. Runtime ownership selectors must retain
-native TEXT types before ownership filters; BLOB or other ambiguous selectors report
-`native_runtime_ownership_key_unreadable` for native-owner reconciliation. Execution/session
-IDs in the runtime worker ledger and admission targets use the native runtime identity
-validator, including its empty-value and length rules. Broader session-store and metadata text fields
-and optional empty/NULL values retain their own writer contracts. Values are never stripped,
-normalized or decoded into identity or authority. Only fixed selector columns are checked; valid foreign
-TEXT scope and unrelated payloads remain outside the check. The native read snapshot is
-closed before owner RPC and read again afterward. A terminal label with a missing, unknown or
-unrecognized outcome remains held; native cancelled and settled steering histories do not
-clear any other run, worker, scope or Stop obligation. Worker births use the actual current native
-instantiation epoch and native birth validation/comparison. Positive reuse of a live PID
-also requires this exact attempt's fully matched original native `owner_admitted` PID and
-`worker_birth` receipt. A legacy fingerprint cannot distinguish historical Linux boot ticks
-from a clock-adjusted epoch fallback. Without a trustworthy original monotonic witness,
-a living legacy PID stays unknown even if its current fingerprint differs; a genuinely
-gone PID remains positive evidence. Current native births and identity are read repeatedly;
-unreadable or changing evidence cannot prove reuse. Unknown run states remain unsettled
-even when an end timestamp exists. Missing, malformed, unreadable
-or unproved older-epoch witnesses stay unknown for native-owner reconciliation. Scoped process checkpoints must also contain
-no live or unconfirmed scope. A retained checkpoint symlink, including a dangling link,
-or unreadable metadata stays unknown; only genuine absence is empty. Duplicate JSON
-keys are rejected before checkpoint ownership classification.
-Only positively foreign records are excluded;
-missing, partial or conflicting route/owner attribution remains unknown. An attempt that
-spawned before native admission, orphan worker events, or any unverified older attempt also
-remain unknown; a later admitted attempt cannot hide them. Any attributed retained process checkpoint,
-including a legacy host process or native job scope, stays unknown even if its leader is gone
-or recycled or an affirmative-looking exit file exists. Only the native owner can retire
-that checkpoint after scope cleanup, reader finalization and durable ownership/output settlement. Reconcile through that owner's existing native
-Stop/recovery path; this read-only command never performs retirement. Reads use native tracked SQLite
-transactions, never database copies. Receipts and the entire scoped observation are checked
-again before returning. A newer Stop, unblock, late worker binding, owner change or changed
-reporting link invalidates the old observation. Reinspect immediately before later effects.
-
-Unknown evidence returns `quiescence_proven: false`, `state: unknown` and exit code 1. This
-includes a missing old-core Stop getter, missing worker identity or executor settlement,
-pending cleanup, queued/unknown admission or inaccessible history. A Stop ACK, receipt or
-second successful `kanban block` alone is insufficient. Output excludes transcript contents,
-claim tokens, process commands and unrelated records. This command is not an agent-tool action,
-does not stop/recover processes or mutate state, and always returns `permission_granted: false`.
-The pinned older-core tests label corrective getter adapters explicitly; they are not proof
-of deployed corrective-core behavior or production takeover acceptance.
+Provider SDKs can invoke the registered synchronous tool from their own asyncio loop. Work
+evidence uses Core's existing bounded coroutine bridge on that path, preserving the native
+profile and turn context while the gateway owner answers receipt checks on its separate loop.
+A reference, a receipt or an inspection grants no permission and proves no worker stopped.
 
 The isolated source proof is `python scripts/run-linear-origin-scenarios.py --agent-source
 <clean manifest-pinned Agent checkout>`. Its guard is installed before native imports and
 rejects credential/model activation, external processes/network, real-user config access and
-writes outside its temporary root. This source proof does not establish deployed client or
-handoff readiness.
+writes outside its temporary root.
 
 ## Linear API budget
 

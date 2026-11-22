@@ -2,7 +2,6 @@
 import argparse
 import json
 from pathlib import Path
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -31,38 +30,24 @@ class OriginEdgeTests(unittest.TestCase):
                                      "specialist_scope": None})
         self.assertNotIn("SECRET_SENTINEL", json.dumps(projected))
 
-    def test_registered_action_has_no_context_selectors_and_needs_no_linear_service(self):
-        handlers = {}
-        ctx = SimpleNamespace(get_config=lambda key, default=None: True if key == "enabled" else default,
-                              register_tool=lambda **kwargs: handlers.update({kwargs["name"]: kwargs["handler"]}),
-                              register_hook=lambda *args: None)
-        with patch.dict("os.environ", {"_HERMES_GATEWAY": ""}):
-            plugin.register(ctx)
-        context = transport.NativeContext(home="/synthetic", profile="default", platform="local", source="gui",
-                                           session_key="key", session_id="session")
-        with patch.object(transport, "capture_context", return_value=context), patch.object(origin, "current", return_value={
-                "reference": {"admission_id": "current"}, "permission_granted": False}) as current:
-            result = json.loads(handlers["linear"]({"action": "origin_reference"}))
-            self.assertTrue(result["ok"])
-            self.assertFalse(result["permission_granted"])
-            self.assertEqual(current.call_args.args[0], context)
-            for selector in ("session_id", "profile", "home", "issue", "task_id", "body"):
-                result = json.loads(handlers["linear"]({"action": "origin_reference", selector: "forged"}))
-                self.assertFalse(result["ok"])
-            self.assertEqual(current.call_count, 1)
-
-    def test_child_is_refused_before_any_owner_or_state_access(self):
-        context = transport.NativeContext(home="/synthetic", profile="default", platform="local", source="gui",
-                                           session_key="key", session_id="session", delegated_child=True)
-        with patch.object(origin, "_run") as run, self.assertRaises(transport.Unavailable):
-            origin.current(context, {})
-        run.assert_not_called()
-
-    def test_owner_cli_only_accepts_one_complete_reference(self):
+    def test_tool_and_owner_cli_offer_only_the_work_reference(self):
+        actions = plugin.chat.SCHEMA["parameters"]["properties"]["action"]["enum"]
+        self.assertIn("work_reference", actions)
+        self.assertNotIn("origin_reference", actions)
         parser = argparse.ArgumentParser()
         ops.setup(parser)
-        args = parser.parse_args(["inspect-origin", "--reference-json", '{"admission_id":"one"}'])
-        with (patch.object(origin, "inspect", return_value={"original_message": "one request", "permission_granted": False}) as inspect_origin,
+        commands = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction)).choices
+        self.assertIn("inspect-work", commands)
+        for retired in ("inspect-origin", "inspect-cleanup", "hand-off"):
+            self.assertNotIn(retired, commands)
+
+    def test_owner_cli_inspects_only_one_complete_work_reference(self):
+        parser = argparse.ArgumentParser()
+        ops.setup(parser)
+        args = parser.parse_args(["inspect-work", "--reference-json", '{"admission_id":"one"}'])
+        from hermes_fleet_linear_plugin import work
+        with (patch.object(work, "inspect", return_value={"requester": {"kind": "native_dispatcher"},
+                                                           "permission_granted": False}) as inspect_work,
               patch("builtins.print")):
             self.assertEqual(ops.run(args, Path("unused"), Path("unused"), "default"), 0)
-        inspect_origin.assert_called_once_with({"admission_id": "one"}, {})
+        inspect_work.assert_called_once_with({"admission_id": "one"}, {})

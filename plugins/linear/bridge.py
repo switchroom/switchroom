@@ -751,7 +751,7 @@ def _stopped_sentence(reason: str) -> str:
         elif not re.search(r"(?i)\b(?:do not|don't) resume\b|\bkeep (?:this|the) (?:task|work) stopped\b", sentence):
             kept.append(_sentence(sentence))
     return " ".join(kept + [until or "It stays stopped until someone asks the agent to resume."]).strip()
-# The guarded pause a takeover writes (handoff.HANDOFF_REASON, matched exactly). It asks the
+# The pause a takeover's hand_off writes (takeover.HANDOFF_REASON, matched exactly). It asks the
 # reader for nothing, so it never reads as "Waiting on you". Any other pause, even one whose
 # words mention a handover, keeps its ordinary wording.
 _HANDOFF_PAUSE = re.compile(r"Paused for a handover to (?P<to>[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}) "
@@ -1464,8 +1464,8 @@ class Bridge:
         settings = settings or {}
         self.store, self.api, self.kanban, self.profile, self.clock = store, api, kanban, profile, clock
         self.ingress_profile = validate_ingress_profile(settings.get("ingress_profile")) or profile
-        from .handoff import takeover_settings
-        self.takeover = takeover_settings(settings.get("takeover"), default_name=self.ingress_profile)
+        from . import takeover
+        self.takeover = takeover.settings(settings.get("takeover"), default_name=self.ingress_profile)
         cutoff = validate_activation_cutoff_ms(settings.get("activation_cutoff_ms"))
         self.activation_cutoff_ms = store.activation_cutoff_ms(cutoff)
         self.states = {"todo": "Todo", "in_progress": "In Progress", "in_review": "In Review", "done": "Done",
@@ -2578,8 +2578,8 @@ class Bridge:
                 # Another agent is delegate: its assignment owns the work. Nothing is created or bound.
                 diag.evt("chat.entrust", "refused", "delegated_elsewhere", iss=issue_id)
                 raise LinearError("This issue is delegated to another agent, so nothing was started here and that "
-                                  "agent was not touched. To move the work here, use take_over: it stops that agent's "
-                                  "run, confirms it has ended, and continues here as one task", retryable=False)
+                                  "agent was not touched. To move the work here, use take_over: it asks that agent to "
+                                  "pause its work and hand it over, then continues here as one task", retryable=False)
             row = self.store.get(issue_id)
             if row is not None and row.get("origin") != "native":
                 raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)

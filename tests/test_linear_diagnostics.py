@@ -677,25 +677,6 @@ class ReasonCoverageTests(unittest.TestCase):
         self.assertEqual(len(logs.output), 4)
         self.assertTrue(all("reason=request_refused" in line for line in logs.output))
 
-    def test_cleanup_hold_reasons_log_by_name(self) -> None:
-        # Every takeover-cleanup hold names its code in the log line, never "?".
-        tree = ast.parse((ROOT / "plugins/linear/cleanup.py").read_text())
-        codes = {"cleanup_evidence_unavailable"}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", None) in {"Unknown", "_require", "birth"}:
-                index = 0 if node.func.id == "Unknown" else 1
-                if len(node.args) > index and isinstance(node.args[index], ast.Constant):
-                    codes.add(node.args[index].value)
-            if isinstance(node, ast.FunctionDef) and node.name in {"_native_restart_reason", "_attempt_replaced"}:
-                codes.update(sub.value for sub in ast.walk(node)
-                             if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and " " not in sub.value)
-        from hermes_fleet_linear_plugin import cleanup
-        codes = {code for code in codes if "_" in code and not code.startswith("_")} | set(cleanup.HOLD_FACTS)
-        self.assertIn("old_gateway_alive", codes)
-        self.assertEqual(sorted(code for code in codes if diag._reason(code) != code), [])
-        line = diag.render("cleanup.inspect", "held", "old_gateway_alive", evt=7)
-        self.assertIn("action=cleanup.inspect outcome=held reason=old_gateway_alive", line)
-
     def test_decision_functions_have_no_silent_refusals(self) -> None:
         tree = ast.parse(self.SOURCE)
         silent = []

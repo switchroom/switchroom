@@ -22,7 +22,6 @@ NOTE_HOLD_SECONDS = 600
 async def _read(home, adapter, task, session_id):
     from .native_store import reader, local_receipt, local_identity
     from gateway.session_policy import restore_policy
-    from .origin_state import stop_evidence
     with reader(home) as db:
         saved = local_receipt(db, session_id)
         policy = restore_policy(saved["policy"])
@@ -42,14 +41,12 @@ async def _read(home, adapter, task, session_id):
                 or current["admission_header"]["principal_id"] != saved["principal_id"]
                 or current["admission_header"]["target_session_id"] != before["session_id"]):
             return None
-        await asyncio.to_thread(stop_evidence, home, session_id)
         info = await client.rpc("session.info", session_id=session_id, execution_only=True)
         progress = info.get("execution_progress") or {}
         if (progress.get("execution_generation") != before["execution_generation"]
                 or not isinstance(progress.get("tool"), str) or not progress["tool"]):
             return None  # Older Core, a completed call, Stop or a pending question.
         after, latest = await origin._snapshot(client, home, session_id)
-        await asyncio.to_thread(stop_evidence, home, session_id)
         if after != before or latest != current:
             return None
         from agent.display import build_status_phrase
