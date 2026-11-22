@@ -582,7 +582,7 @@ invalid entries are dropped and logged.
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not
-verified shows In Review (it awaits review, CI or merge; never Todo). A task core's open-PR
+verified (a finished progress-scope stage, not the issue's agreed outcome) shows In Review (never Todo). A task core's open-PR
 guard parked after a restart (blocked, its newest block, unblock or release event being the
 guard's own block) also shows In Review, with one plain sentence instead of "Waiting on you".
 Once that PR has merged or closed, the plugin lets the task run with one guarded core unblock

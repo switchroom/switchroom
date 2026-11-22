@@ -220,5 +220,53 @@ class NativeDoneIsLinearDoneScenarios(unittest.TestCase):
         self.assertEqual(self.state(), "Todo")
 
 
+    def test_a_legacy_wait_whose_done_the_older_build_refused_at_send_settles_with_the_same_comment(self):
+        # Review of #424: the outcome comment's identity includes its text; a retry must not re-read
+        # the PR state into a different body ("Native outcome comment identity conflicts").
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        from hermes_fleet_linear_plugin.store import Store
+        task = self.finish_with_pr()
+        self.legacy_closeout(task, "in_review")
+        wait = self.bridge.store.legacy_closeout("issue-1", task)
+        with patch.object(bridge_module, "pr_state", lambda *a, **k: None):  # the older build's text
+            self.assertTrue(self.bridge._finished(self.bridge.store.get("issue-1"),
+                                                  event_id=self.completed_event(task), recheck=wait))
+        with self.bridge.store._tx() as db:  # ... whose send-time PR re-verify refused that Done
+            db.execute("UPDATE outbox SET state='failed', attempts=3, payload=json_set(json_set(payload,"
+                       "'$.failure_kind','rejected'), '$.last_error', ?) WHERE kind='status' "
+                       "AND json_extract(payload,'$.state')='done'", (Store.DELIVERY_REFUSAL + " (x)",))
+        comment = next(row for row in self.bridge.store.pending("issue-1")
+                       if row["payload"].get("native_outcome_comment"))
+        self.assertIsNotNone(self.bridge.store.legacy_closeout("issue-1", task))
+        self.gh.pr_state, self.gh.merged = "closed", True  # GitHub's answer has changed since
+        self.ticks()
+        self.assertEqual(self.state(), "Done")
+        self.assertEqual(self.bridge.store.outbox_row(comment["id"])["payload"]["body"], comment["payload"]["body"])
+        self.assertIsNone(self.bridge.store.legacy_closeout("issue-1", task))
+        self.assertEqual([row for row in self.failed() if json.loads(row[1]).get("state") != "done"], [])
+
+    def test_a_wait_the_older_build_settled_is_still_closed_out_as_done(self):
+        # An older build settled a merged PR's wait and left the issue In Review for a person.
+        task = self.finish_with_pr()
+        self.legacy_closeout(task, "in_review")
+        wait = self.bridge.store.legacy_closeout("issue-1", task)
+        with self.bridge.store._tx() as db:
+            db.execute("INSERT INTO metadata(key, value) VALUES (?, ?)",
+                       (f"acceptance-recheck-settled:{wait['status_id']}", json.dumps({"settled": True})))
+        self.ticks()
+        self.assertEqual(self.state(), "Done")
+
+    def test_a_person_who_moved_a_legacy_in_review_keeps_their_state(self):
+        task = self.finish_with_pr()
+        self.legacy_closeout(task, "in_review")
+        self.bridge.flush()
+        self.clock.now = max(self.clock.now, time.time()) + 5
+        self.set_state("Todo")
+        self.ticks()
+        self.assertEqual(self.state(), "Todo")
+        self.ticks(3, after=4000)
+        self.assertEqual(self.state(), "Todo")
+
+
 if __name__ == "__main__":
     unittest.main()

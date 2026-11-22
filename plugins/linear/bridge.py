@@ -3643,12 +3643,12 @@ class Bridge:
             return "todo" if queued else "blocked"
         if status == "review" or (status == "ready" and getattr(last, "kind", None) == "respawn_guarded"
                                   and payload.get("reason") == "active_pr"):
-            return "in_review"  # A finished stage awaits review, CI or merge.
+            return "in_review"  # A finished stage that is not the agreed outcome.
         if status in ("ready", "todo", "scheduled"):
             return "todo"
         if status == "done":
             # The work finished but its outcome is not verified at the destination (_finished alone
-            # sets Done): it awaits review, CI or merge. Completed work never shows Todo.
+            # sets Done): the outcome is not complete yet. Completed work never shows Todo.
             return "in_review"
         return None
     @staticmethod
@@ -3923,12 +3923,20 @@ class Bridge:
                                   recheck=recheck)
                 return ("failed" if written else None) if recheck is not None else None
         binding = self.store.native_binding(issue_id)
-        head_note = _pr_lines(evidence)
         completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
                         key=lambda event: event.id)
         completion = {"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
                       "scope": binding["completion_scope"], "event_id": completed.id,
                       "run_id": getattr(completed, "run_id", None)}
+        # The outcome comment's identity is its completion and its exact text: a retry, a repair or an
+        # older build's closeout of this completion keeps the text it already has (no new PR read).
+        from .outcome import captured_body
+        prior_body = None if assessment else captured_body(self.store, issue_id, completion)
+        expected = _done_body(summary, evidence)
+        if prior_body is not None and not (prior_body == expected or (
+                prior_body.startswith(expected + "\n\nPull request: ") and "\n\n" not in prior_body[len(expected) + 2:])):
+            prior_body = None  # not this result's text: the identity check refuses it, as before
+        head_note = "" if prior_body is not None else _pr_lines(evidence)
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],
                               "evidence": evidence, "native_completion": completion}),
                   ("activity", {"issue_id": issue_id, "session_id": row["owner_ref"], "task_id": row["task_id"],
@@ -3957,7 +3965,7 @@ class Bridge:
                     **({"completion_reconcile_request_id": reconcile_request_id} if reconcile_request_id else {})}))
         from .outcome import prepare
         writes = prepare(writes, issue_id=issue_id, owner=row.get("owner_ref"), completion=completion,
-                         summary=summary, evidence=evidence, head_note=head_note,
+                         summary=summary, evidence=evidence, head_note=head_note, body=prior_body,
                          assessment_id=(prior_id or comment_id) if assessment else None)
         if not self.authorize_specialist_effect(issue_id): return
         return self._finish_work(issue_id, [(kind, {**payload, "terminal": True, "owner_issue_id": issue_id})
@@ -3988,7 +3996,9 @@ class Bridge:
         if not self.store.effect_admitted(row["issue_id"]):
             return
         outcome = self._finished(row, event_id=completed.id, recheck=wait)
-        if outcome is not None:  # written (Done), or an evidence-less Blocked that stands
+        current = self.store.legacy_closeout(row["issue_id"], task.id)
+        if outcome is True or outcome == "failed" or (outcome is False and (current or {}).get("status_id") != wait["status_id"]):
+            # Done written, an evidence-less Blocked that stands, or a newer closeout replaced this one.
             self.store.settle_legacy_closeout(wait["status_id"])
         diag.transition("status.write", "queued" if outcome is True else "skipped", "legacy_closeout",
                         key=("legacy", row["issue_id"], completed.id), iss=row["issue_id"], task=task.id,

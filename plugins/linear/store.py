@@ -1497,7 +1497,10 @@ class Store:
         return None
     @staticmethod
     def _settled_key(status_id: str) -> str:
-        return f"acceptance-recheck-settled:{status_id}"  # key kept: older settles stay settled
+        # v2: an older build's settles (a merged PR left In Review, a Blocked after a failure or the
+        # 7-day cap) are revisited, since native Done is now Linear Done. Same prefix, so existing
+        # stores' quiet-input triggers still count it.
+        return f"acceptance-recheck-settled:v2:{status_id}"
     def settle_legacy_closeout(self, status_id: str) -> None:
         """This older closeout has been closed out again: never revisit it."""
         with self._tx() as db:
