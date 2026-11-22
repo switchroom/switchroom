@@ -857,6 +857,11 @@ def plan_split(description) -> tuple[str, str | None]:
 def plan_comment(section: str) -> str:
     """The same update as a regular comment, for when the description section is not the agent's to edit."""
     return "**Plan and progress**\n\n" + section.partition("\n")[2].strip()
+# What may follow a completion's own text in its captured outcome comment: an older build's
+# "head moved" note, then this build's PR state lines. Nothing else is accepted as the same result.
+_CAPTURED_TAIL = re.compile(r"(?:\n\nThe pull request changed after the work finished; its required checks passed on "
+                            r"its latest commit [0-9a-f]{7,40}\.)?(?:\n\nPull request: \S+(?: \([a-z ,]+\))?"
+                            r"(?:\nPull request: \S+(?: \([a-z ,]+\))?)*)?")
 _PR_PARTS = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 def pr_state(url: str, gh: Callable[..., Any] | None = None) -> str | None:
     """A PR's state for the closing note: merged, closed without merging, or open with its checks.
@@ -3933,8 +3938,8 @@ class Bridge:
         from .outcome import captured_body
         prior_body = None if assessment else captured_body(self.store, issue_id, completion)
         expected = _done_body(summary, evidence)
-        if prior_body is not None and not (prior_body == expected or (
-                prior_body.startswith(expected + "\n\nPull request: ") and "\n\n" not in prior_body[len(expected) + 2:])):
+        if prior_body is not None and not (prior_body.startswith(expected)
+                                           and _CAPTURED_TAIL.fullmatch(prior_body[len(expected):])):
             prior_body = None  # not this result's text: the identity check refuses it, as before
         head_note = "" if prior_body is not None else _pr_lines(evidence)
         writes = [("status", {"issue_id": issue_id, "state": "done", "task_id": row["task_id"],

@@ -223,12 +223,19 @@ class NativeDoneIsLinearDoneScenarios(unittest.TestCase):
     def test_a_legacy_wait_whose_done_the_older_build_refused_at_send_settles_with_the_same_comment(self):
         # Review of #424: the outcome comment's identity includes its text; a retry must not re-read
         # the PR state into a different body ("Native outcome comment identity conflicts").
+        for note in ("", f"\n\nThe pull request changed after the work finished; its required checks passed on its "
+                         f"latest commit {SHA[:12]}."):
+            with self.subTest(head_moved_note=bool(note)):
+                self.setUp()
+                self.check_refused_at_send(note)
+
+    def check_refused_at_send(self, note):
         from hermes_fleet_linear_plugin import bridge as bridge_module
         from hermes_fleet_linear_plugin.store import Store
         task = self.finish_with_pr()
         self.legacy_closeout(task, "in_review")
         wait = self.bridge.store.legacy_closeout("issue-1", task)
-        with patch.object(bridge_module, "pr_state", lambda *a, **k: None):  # the older build's text
+        with patch.object(bridge_module, "_pr_lines", lambda *a, **k: note):  # the older build's text
             self.assertTrue(self.bridge._finished(self.bridge.store.get("issue-1"),
                                                   event_id=self.completed_event(task), recheck=wait))
         with self.bridge.store._tx() as db:  # ... whose send-time PR re-verify refused that Done
