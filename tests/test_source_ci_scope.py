@@ -371,16 +371,18 @@ class PushReuseTests(unittest.TestCase):
         r = {
             f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
                 {'number': 7, 'merged_at': '2026-11-22T00:00:00Z', 'merge_commit_sha': self.SHA,
-                 'base': {'ref': 'main'}, 'head': {'sha': self.HEAD}}],
+                 'base': {'ref': 'main'}, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
+            f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
+                {'number': 7, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
             f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': 't' * 40}},
             f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 't' * 40}},
             f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'ahead'},
             f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100': {
                 'workflow_runs': [
-                    {'id': 1, 'created_at': '2026-11-21T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
+                    {'id': 1, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-21T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
                      'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'failure',
                      'html_url': 'https://x/runs/1'},
-                    {'id': 2, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
+                    {'id': 2, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
                      'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success',
                      'html_url': 'https://x/runs/2'}]},
             f'repos/{self.REPO}/issues/7/events?per_page=100': [
@@ -427,6 +429,12 @@ class PushReuseTests(unittest.TestCase):
                 'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
             'aggregate missing': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {'jobs': []}},
             'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': []},
+            'fork run': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
+                head_repository={'full_name': 'someone/fork'})]}},
+            'run of another branch': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
+                head_branch='other')]}},
+            'head shared with another PR': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
+                {'number': 7, 'head': {'sha': self.HEAD}}, {'number': 9, 'head': {'sha': self.HEAD}}]},
             # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
             'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
