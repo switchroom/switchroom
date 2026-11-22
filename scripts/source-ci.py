@@ -263,10 +263,18 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if status not in ('ahead', 'identical'):
             log(f'reuse: {before} is not an ancestor of PR head {head} ({status})')
             return None
+        # Only this repository's branch for this PR: never a fork run, nor another PR that shares
+        # the head commit against a different base.
+        sharing = [p for p in api(f'repos/{repository}/commits/{head}/pulls') if (p.get('head') or {}).get('sha') == head]
+        if [p.get('number') for p in sharing] != [pr['number']]:
+            log(f'reuse: head {head} is not unique to PR #{pr["number"]}')
+            return None
+        branch = (pr.get('head') or {}).get('ref')
         runs = [r for r in api(f'repos/{repository}/actions/workflows/ci.yml/runs'
                                f'?event=pull_request&head_sha={head}&per_page=100')['workflow_runs']
                 if r.get('head_sha') == head and r.get('path') == WORKFLOW_PATH
-                and r.get('event') == 'pull_request']
+                and r.get('event') == 'pull_request' and branch and r.get('head_branch') == branch
+                and (r.get('head_repository') or {}).get('full_name') == repository]
         if not runs:
             log(f'reuse: no PR CI run for {head}')
             return None
