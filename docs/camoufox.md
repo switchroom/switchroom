@@ -112,15 +112,18 @@ Measured on a live agent after the first rollout:
   also a few pixels wider than the reported screen under the Xfce frame.
 - `navigator.language` stayed `en-US` while `Intl` followed the container locale (`en_AU.UTF-8`)
   and time zone, an incoherence some bot checks look at. Since then `service-run` gives the browser
-  the container's own pair, so the two should agree; that is not yet re-measured on a live agent.
+  the container's own pair, and the bake smoke checks `navigator.language` and the page's `Intl`
+  time zone against `LANG` and `TZ`; a live agent has not been re-measured yet.
   The locale comes from `LC_ALL`, else `LANG`, without its charset or modifier (`en_AU.UTF-8`
   becomes `en-AU`; `C` and `POSIX` count as unset). The time zone comes from `TZ` (a leading `:`
-  is dropped), else `/etc/timezone`, and must name a file under `/usr/share/zoneinfo` (the image's
-  tzdata): a POSIX value such as `AEST-10` would stop camofox-browser starting, so it is dropped
-  with one line in the service log. The pair is passed only when both resolve; otherwise neither
-  is, and the browser keeps its own default. Set `CAMOFOX_LOCALE` and `CAMOFOX_TIMEZONE` to choose
-  the pair explicitly; set both, because camofox-browser refuses to start with only one. Keep the
-  time zone consistent with where the agent's traffic exits.
+  is dropped). `TZ` is the real source: the fallback, `/etc/timezone`, is not shipped by Debian 13's
+  tzdata, so it is used only if an image adds it. Before the pair is passed, node checks it the way
+  camofox-browser does (`Intl.getCanonicalLocales`, an `Intl.DateTimeFormat` time zone), because a
+  value it rejects, such as `LANG=UTF-8` or `TZ=AEST-10`, would stop camofox-browser starting. A
+  rejected pair (logged in one line) or an incomplete one is not passed at all, and the browser
+  keeps its own default. Set `CAMOFOX_LOCALE` and `CAMOFOX_TIMEZONE` to choose the pair
+  explicitly (they are not checked); set both, because camofox-browser refuses to start with only
+  one. Keep the time zone consistent with where the agent's traffic exits.
 - Typing through `browser_type` fills fields at once; only cursor movement is humanised (a click
   moves the pointer along a curved path for about half a second).
 - An interactive Cloudflare Turnstile widget waits at "Verify you are human"; that is the human's

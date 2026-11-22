@@ -19,7 +19,6 @@ install_dir=${CAMOFOX_SERVER_DIR:-/opt/camofox-browser}
 x_socket_table=${CAMOFOX_X_SOCKET_TABLE:-/proc/net/unix}
 # The time-zone fallback when TZ is empty (tests point it at a fixture).
 timezone_file=${CAMOFOX_TIMEZONE_FILE:-/etc/timezone}
-zoneinfo_dir=${CAMOFOX_ZONEINFO_DIR:-/usr/share/zoneinfo}
 backoff_seconds=${CAMOFOX_BACKOFF_SECONDS:-30}
 
 # s6 restarts a failed run at once; an unusable state directory (a read-only or not-yet-owned
@@ -110,9 +109,9 @@ export CAMOFOX_DISABLE_DEFAULT_ADDONS=${CAMOFOX_DISABLE_DEFAULT_ADDONS:-1}
 export CAMOFOX_OS=${CAMOFOX_OS:-linux}
 # One browser identity from the container's own locale and time zone: without the pair the browser
 # reports navigator.language en-US while Intl follows the container. camofox-browser takes both or
-# neither, and refuses half a pair or a zone that is not IANA at start (s6 would restart-loop it), so
-# explicit values pass through as given, and derived ones are exported only when both resolve and the
-# zone is a real zoneinfo file.
+# neither, and refuses half a pair or a value Intl rejects at start (s6 would restart-loop it), so
+# explicit values pass through as given, and derived ones are exported only when both resolve and pass
+# the same Intl checks camofox-browser makes (lib/config.js directBrowserIdentity).
 if [ -z "${CAMOFOX_LOCALE:-}" ] && [ -z "${CAMOFOX_TIMEZONE:-}" ]; then
   derived_locale=${LC_ALL:-${LANG:-}}
   derived_locale=${derived_locale%%.*}
@@ -121,21 +120,22 @@ if [ -z "${CAMOFOX_LOCALE:-}" ] && [ -z "${CAMOFOX_TIMEZONE:-}" ]; then
   case "$derived_locale" in C | POSIX) derived_locale= ;; esac
   derived_timezone=${TZ:-}
   derived_timezone=${derived_timezone#:}
-  if [ -z "$derived_timezone" ] && [ -r "$timezone_file" ]; then
+  if [ -z "$derived_timezone" ] && [ -f "$timezone_file" ] && [ -r "$timezone_file" ]; then
     derived_timezone=$(head -n1 "$timezone_file" | tr -d '[:space:]')
   fi
-  if [ -n "$derived_timezone" ]; then
-    case "$derived_timezone" in
-      /* | *..*) derived_zone_ok= ;;
-      *) [ -f "$zoneinfo_dir/$derived_timezone" ] && derived_zone_ok=1 || derived_zone_ok= ;;
-    esac
-    if [ -z "$derived_zone_ok" ]; then
-      echo "camofox-browser: time zone '$derived_timezone' is not a zone in $zoneinfo_dir;" \
-        "leaving the browser locale and time zone to camofox-browser" >&2
-      derived_timezone=
-    fi
-  fi
+  derived_ok=
   if [ -n "$derived_locale" ] && [ -n "$derived_timezone" ]; then
+    case "$derived_timezone" in
+      /* | *..*) ;;
+      *) node -e 'try { Intl.getCanonicalLocales(process.argv[1]);
+                        new Intl.DateTimeFormat("en-US", { timeZone: process.argv[2] }); }
+                  catch { process.exit(1); }' "$derived_locale" "$derived_timezone" 2>/dev/null \
+           && derived_ok=1 ;;
+    esac
+    [ -n "$derived_ok" ] || echo "camofox-browser: locale '$derived_locale' with time zone" \
+      "'$derived_timezone' is not valid for the browser; leaving both to camofox-browser" >&2
+  fi
+  if [ -n "$derived_ok" ]; then
     export CAMOFOX_LOCALE="$derived_locale" CAMOFOX_TIMEZONE="$derived_timezone"
   else
     unset CAMOFOX_LOCALE CAMOFOX_TIMEZONE

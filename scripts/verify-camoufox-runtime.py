@@ -34,6 +34,9 @@ from pathlib import Path
 LOCK = Path("/opt/hermes-fleet/release/camoufox.lock.json")
 SERVICE = "/usr/local/lib/camofox-browser/service-run"
 MARKER = "hermes-fleet-camoufox-smoke"
+# The browser identity the service must derive: the image sets LANG=en_AU.UTF-8, the smoke sets TZ.
+SMOKE_LANG = "en-AU"
+SMOKE_TZ = "Australia/Sydney"
 DISPLAY_NUM = 87
 
 
@@ -156,7 +159,10 @@ def main() -> int:
     page = f"http://127.0.0.1:{httpd.server_address[1]}/"
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("CAMOFOX_")}
-    env.update(HERMES_HOME=str(home), CAMOFOX_PORT="19377", CAMOFOX_SERVER_DIR=args.server_dir)
+    # The service derives the browser's locale and time zone from the container: LANG is the image's
+    # en_AU.UTF-8, and TZ is set as a deployment's compose would.
+    env.update(HERMES_HOME=str(home), CAMOFOX_PORT="19377", CAMOFOX_SERVER_DIR=args.server_dir,
+               TZ=SMOKE_TZ)
     log = open(out / "camofox-browser.log", "w")
     service = subprocess.Popen([args.service], env=env, stdout=log, stderr=subprocess.STDOUT)
     base = "http://127.0.0.1:19377"
@@ -201,7 +207,8 @@ def main() -> int:
         _, raw = request(f"{base}/tabs/{tab_id}/evaluate", "POST", {
             "userId": "smoke",
             "expression": "JSON.stringify({ua: navigator.userAgent, webdriver: navigator.webdriver, "
-                          "lang: navigator.language, w: outerWidth, h: outerHeight})",
+                          "lang: navigator.language, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, "
+                          "w: outerWidth, h: outerHeight})",
         }, key=key, timeout=60)
         page_facts = json.loads(json.loads(raw)["result"])
         summary["page"] = page_facts
@@ -209,6 +216,9 @@ def main() -> int:
             fail(f"unexpected user agent {page_facts['ua']}")
         if page_facts["webdriver"]:
             fail("navigator.webdriver is true")
+        if (page_facts["lang"], page_facts["tz"]) != (SMOKE_LANG, SMOKE_TZ):
+            fail(f"browser identity is {page_facts['lang']} / {page_facts['tz']}, "
+                 f"expected {SMOKE_LANG} / {SMOKE_TZ} from the container's LANG and TZ")
         tree = subprocess.run(["xwininfo", "-root", "-tree"], env={**os.environ, "DISPLAY": f":{DISPLAY_NUM}",
                               "XAUTHORITY": str(xauth)}, capture_output=True, text=True, timeout=20).stdout
         (out / "xwininfo.txt").write_text(tree)

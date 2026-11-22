@@ -30,7 +30,8 @@
         "id": "official-camoufox",
         "file": "release/camofox-browser/official-camoufox.patch",
         "description": "Drive Camoufox through the maintainers' official camoufox@0.5.9 npm package instead of camoufox-js@0.11.5 (which stops at beta.31), pin the browser to 158.0.1-beta.41, keep playwright-core below 1.63 as camoufox requires, and launch an external executable in place so the official package finds its addons and application.ini. Drop this patch when camofox-browser ships the same change.",
-        "upstream": "https://github.com/jo-inc/camofox-browser/issues/15333"
+        "upstream": "https://github.com/jo-inc/camofox-browser/pull/15715",
+        "upstream_issue": "https://github.com/jo-inc/camofox-browser/issues/15333"
       }
     ],
     "fingerprint_model": {
