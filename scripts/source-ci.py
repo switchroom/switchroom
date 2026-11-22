@@ -49,16 +49,15 @@ RUNTIME_INPUTS = {
     'scripts/run-linear-origin-scenarios.py', 'scripts/check-linear-origin-guard.py',
 }
 RUNTIME_INPUT_PREFIXES = ('tests/',)
-# Defer-CI fast lane (PR only): a change made only of these, existing test modules and prose
-# runs units plus the real-Agent legs of the test files it touches before merge; main push CI
-# runs the component's full legs, a red push is auto-reverted, and nothing delivers until
-# main is green (scripts/auto-revert.py, plugin-pin-handoff.yml, fleet-image.yml).
-FAST_LANE_PREFIXES = ('plugins/linear/',)
-# Credentials, authority (tool guard, approvals, allowlists), identity, handoff/origin and the
-# plugin manifest and registration stay fully gated before merge even inside the plugin.
-FAST_LANE_GATED = frozenset('plugins/linear/' + name for name in (
-    '__init__.py', 'plugin.yaml', 'oauth.py', 'guard.py', 'transport.py', 'api.py', 'bridge.py',
-    'handoff.py', 'origin.py', 'origin_provider.py', 'origin_state.py', 'native_store.py'))
+# Defer-CI fast lane (PR only): a change made only of these Linear plugin files, existing test
+# modules and prose runs units plus the real-Agent legs of the test files it touches before
+# merge; main push CI runs the component's full legs, a red push is auto-reverted, and nothing
+# delivers until main is green (scripts/auto-revert.py, plugin-pin-handoff.yml, fleet-image.yml).
+# An explicit allowlist of existing files with no sender, permission, identity or credential
+# logic. Every other plugin file (most of it is authority code) stays fully gated before merge;
+# widening this list is itself a reviewed selector change.
+FAST_LANE_FILES = frozenset('plugins/linear/' + name for name in (
+    'acceptance.py', 'outcome.py', 'waits.py'))
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -156,16 +155,13 @@ def fast_lane_eligible(paths, added=()):
     """Only Linear plugin behaviour, existing test modules and prose may defer real-Agent legs.
 
     A test module or plugin file added (or renamed/deleted) by the change is not yet proven and
-    stays gated, as do the plugin's credential, authority, identity and manifest files
-    (FAST_LANE_GATED) and everything else
+    stays gated, as does every plugin file outside FAST_LANE_FILES and everything else
     (image inputs, the agent pin, workflows, the selector, runners, helpers, other code).
     """
     available = set(inventory()) - set(added)
     def plugin(p):
-        # Allowlist, not deny list: only a file that already existed and still exists, outside the
-        # gated set. A new, renamed or deleted plugin file stays gated.
-        return (p.startswith(FAST_LANE_PREFIXES) and p not in FAST_LANE_GATED and p not in added
-                and (ROOT / p).is_file())
+        # Only an allowlisted file that already existed and still exists.
+        return p in FAST_LANE_FILES and p not in added and (ROOT / p).is_file()
     def prose(p):
         return p.endswith('.md') and not is_runtime_input(p)
     return bool(paths) and any(plugin(p) for p in paths) and all(
