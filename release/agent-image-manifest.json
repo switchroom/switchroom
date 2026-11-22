@@ -1,7 +1,7 @@
 {
-  "digest": "sha256:1a5432d08f3bf4ba475bea78f83832677248d8c3ec2e457d97f81c99ac8682c3",
-  "immutable_ref": "ghcr.io/switchroom/hermes-agent@sha256:1a5432d08f3bf4ba475bea78f83832677248d8c3ec2e457d97f81c99ac8682c3",
+  "digest": "sha256:1344c7e52b0c299abf51a1177762de32981db0019368b6c95cb8b1160bebf55e",
+  "immutable_ref": "ghcr.io/switchroom/hermes-agent@sha256:1344c7e52b0c299abf51a1177762de32981db0019368b6c95cb8b1160bebf55e",
   "repository": "ghcr.io/switchroom/hermes-agent",
-  "revision": "416b9ae2a1ff8d17aed46277456cd5e141987963",
+  "revision": "5f9f0bbae426bf735048e617b4e4890f0c9b73c6",
   "schema_version": 1
 }
