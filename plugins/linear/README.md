@@ -885,13 +885,15 @@ each effect verifies the current provider actor, app, issue and organization aga
 
 Provider retries preserve original actor, Activity, Agent Session, text and source
 time. Inbox acknowledgment follows the committed admission. A redelivery of an input
-Core already committed resolves to that row. Linear input is never steered into a
-running turn or merged with another Activity: a follow-up sent while a turn runs is
-queued as its own turn.
-A provider Stop is Core's own `/stop` for the chat, sent once per Stop Activity (a late
-redelivery cannot stop newer work), then the bridge's Stop of the linked task; the
-bridge posts the Stop notice, so Core's `/stop` reply is not repeated. Neither proves
-physical cleanup. Replies
+Core already committed resolves to that row, and Activities are never merged. A
+follow-up sent while a turn runs follows Core's `busy_input_mode` for producer input
+(queued as its own turn, or steered into / interrupting the running turn). Input Core
+takes without a row is acknowledged once and recorded, so a repeated webhook for that
+Activity never reaches Core again.
+A provider Stop from a sender on the platform allowlist is Core's own `/stop` for the
+chat, handed over once per Stop Activity (a late redelivery cannot stop newer work),
+then the bridge's Stop of the linked task; the bridge posts the Stop notice, so Core's
+`/stop` reply is not repeated. Neither proves physical cleanup. Replies
 remain queued until the existing scoped sender confirms publication. Linear completes an
 Agent Session on a `response`, so while tracked native work this same session started is
 unfinished, a reply goes out as a `thought` with the same text and the work's own closeout
