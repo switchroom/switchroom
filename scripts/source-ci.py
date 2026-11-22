@@ -13,6 +13,8 @@ import re
 import subprocess
 import sys
 import unittest
+import zipfile
+import io
 
 ROOT = Path(__file__).resolve().parents[1]
 LANES = ('linear', 'acp', 'origin', 'input', 'journey')
@@ -47,6 +49,7 @@ RUNTIME_INPUTS = {
     'tests/native-input-requirements.txt', 'scripts/read-agent-image-manifest.py',
     'scripts/run-linear-scenarios.py', 'scripts/run-linear-input-scenarios.py',
     'scripts/run-linear-origin-scenarios.py', 'scripts/check-linear-origin-guard.py',
+    'scripts/run-runtime-leg.sh',
 }
 RUNTIME_INPUT_PREFIXES = ('tests/',)
 # Defer-CI fast lane (PR only): a change made only of these Linear plugin files, existing test
@@ -74,6 +77,33 @@ SHARED_TESTS = {
     'test_linear_status_follows_work_scenarios.py',
     'test_claude_acp_connector_hydration.py',
 }
+
+
+# The real-Agent runtime matrix, as (lane, shard). CI's `runtime` job lists exactly these legs
+# (tests/test_source_ci_scope.py holds the two equal) and the Agent repository's
+# fleet-integration workflow reads them from `source-ci.py legs`, so both run the same proofs
+# through scripts/run-runtime-leg.sh.
+RUNTIME_LEGS = (
+    ('input', '1/3'), ('input', '2/3'), ('input', '3/3'),
+    ('kanban', '1/3'), ('kanban', '2/3'), ('kanban', '3/3'),
+    ('origin', '1/3'), ('origin', '2/3'), ('origin', '3/3'),
+    ('native', ''),
+)
+# A pin PR (release/pin-agent-<sha>) changes only these. Its runtime legs can be reused from the
+# Agent repository's fleet-integration push run of the pinned revision; see find_pin_reuse.
+PIN_MANIFEST = 'release/agent-image-manifest.json'
+PIN_UPSTREAM = re.compile(r'^plugins/[^/]+/UPSTREAM\.json$')
+AGENT_REPOSITORY = 'switchroom/hermes-agent'
+FLEET_WORKFLOW = 'fleet-integration.yml'
+FLEET_WORKFLOW_PATH = '.github/workflows/' + FLEET_WORKFLOW
+FLEET_PASS_JOB = 'Fleet integration pass'
+FLEET_ARTIFACT = 'fleet-integration-result'
+FLEET_RESULT_FILE = 'fleet-integration.json'
+FLEET_SCHEMA = 'fleet-integration/v1'
+
+
+def leg_name(lane, shard):
+    return f'{lane} {shard}' if shard else lane
 
 
 def inventory():
@@ -213,7 +243,10 @@ def gate(plan, needs):
     if not isinstance(plan, dict) or type(plan.get('runtime')) is not bool:
         return False
     reused = plan.get('reused_from') is not None
-    if reused and plan['runtime']:
+    runtime_reused = plan.get('runtime_reused_from') is not None
+    if (reused or runtime_reused) and plan['runtime']:
+        return False
+    if reused and runtime_reused:
         return False
     required = {'selection': True, 'source-tests': not reused, 'runtime': plan['runtime']}
     if set(needs) != set(required):
@@ -230,6 +263,14 @@ WORKFLOW_PATH = '.github/workflows/ci.yml'
 
 def gh_api(path):
     return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
+
+
+def gh_api_bytes(path):
+    return subprocess.check_output(['gh', 'api', path], stderr=subprocess.PIPE, timeout=60)
+
+
+def git_out(repo, *args):
+    return subprocess.check_output(['git', '-C', str(repo), *args], text=True, stderr=subprocess.PIPE, timeout=60).strip()
 
 
 def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
@@ -306,6 +347,114 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         return None
 
 
+def is_pin_only(paths):
+    """A pin change set: the Agent manifest plus, optionally, plugin UPSTREAM.json records."""
+    return bool(paths) and PIN_MANIFEST in paths and all(
+        p == PIN_MANIFEST or PIN_UPSTREAM.match(p) for p in paths)
+
+
+def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSITORY, api=gh_api,
+                   download=gh_api_bytes, git=git_out, log=lambda m: print(m, file=sys.stderr)):
+    """URL of the Agent repository's green fleet-integration run that already proved this pin PR.
+
+    `base` is the PR base commit and `tested` the merge commit CI checked out. Every one must hold:
+    tested differs from base only in pin files; the newest fleet-integration run (that workflow
+    file, push event, main branch of the Agent repository itself, newest attempt) for exactly the
+    pinned revision completed green with its aggregate and every RUNTIME_LEGS leg job green; its
+    one result artifact names that run, that revision, this repository, and every leg a success;
+    and the switchroom commit it ran is in this history with the recorded tree, and that tree is
+    the base tree, or an ancestor of base whose diff to base selects no real-Agent leg at all.
+    Any doubt or API error answers None, which runs the full matrix.
+    """
+    sha_re = r'[0-9a-f]{40}'
+    if not all(re.fullmatch(sha_re, v or '') and v != '0' * 40 for v in (base, tested)):
+        log('pin reuse: no exact base/merge commits')
+        return None
+    try:
+        tested_paths = [p for p in git(repo, 'diff', '--name-only', '-z', base, tested, '--').split('\0') if p]
+        if not is_pin_only(tested_paths):
+            log(f'pin reuse: merge commit changes more than pin files: {tested_paths}')
+            return None
+        revision = json.loads(git(repo, 'show', f'{tested}:{PIN_MANIFEST}'))['revision']
+        if not (isinstance(revision, str) and re.fullmatch(sha_re, revision)):
+            log('pin reuse: pinned revision is not an exact commit')
+            return None
+        runs = [r for r in api(f'repos/{agent_repository}/actions/workflows/{FLEET_WORKFLOW}/runs'
+                               f'?event=push&branch=main&head_sha={revision}&per_page=100')['workflow_runs']
+                if r.get('head_sha') == revision and r.get('path') == FLEET_WORKFLOW_PATH
+                and r.get('event') == 'push' and r.get('head_branch') == 'main'
+                and (r.get('head_repository') or {}).get('full_name') == agent_repository
+                and (r.get('repository') or {}).get('full_name') == agent_repository]
+        if not runs:
+            log(f'pin reuse: no fleet-integration push run for Agent {revision}')
+            return None
+        run = max(runs, key=lambda r: (str(r.get('created_at', '')), int(r.get('id', 0))))
+        url = run.get('html_url') or ''
+        if run.get('status') != 'completed' or run.get('conclusion') != 'success':
+            log(f'pin reuse: newest fleet-integration run {url} is {run.get("status")}/{run.get("conclusion")}')
+            return None
+        run_id = int(run['id'])
+        jobs = api(f'repos/{agent_repository}/actions/runs/{run_id}/jobs?filter=latest&per_page=100')['jobs']
+        want = [FLEET_PASS_JOB] + [f'fleet leg ({leg_name(*leg)})' for leg in RUNTIME_LEGS]
+        for name in want:
+            found = [j for j in jobs if j.get('name') == name]
+            if len(found) != 1 or found[0].get('conclusion') != 'success':
+                log(f'pin reuse: job {name!r} of {url} is not a single success')
+                return None
+        artifacts = [a for a in api(f'repos/{agent_repository}/actions/runs/{run_id}/artifacts?per_page=100')['artifacts']
+                     if a.get('name') == FLEET_ARTIFACT]
+        if len(artifacts) != 1 or artifacts[0].get('expired') or int(artifacts[0].get('size_in_bytes', 0)) > 65536:
+            log(f'pin reuse: {url} has no single unexpired result artifact')
+            return None
+        archive = download(f'repos/{agent_repository}/actions/artifacts/{int(artifacts[0]["id"])}/zip')
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            if bundle.getinfo(FLEET_RESULT_FILE).file_size > 65536:
+                raise ValueError('oversized fleet result')
+            result = json.loads(bundle.read(FLEET_RESULT_FILE))
+        legs = {leg_name(*leg): 'success' for leg in RUNTIME_LEGS}
+        expected = {'schema': FLEET_SCHEMA, 'result': 'success', 'event': 'push', 'ref': 'refs/heads/main',
+                    'agent_repository': agent_repository, 'agent_commit': revision, 'run_id': run_id,
+                    'workflow': FLEET_WORKFLOW_PATH, 'switchroom_repository': repository, 'legs': legs}
+        wrong = sorted(k for k, v in expected.items() if result.get(k) != v)
+        if wrong:
+            log(f'pin reuse: result artifact of {url} disagrees on {wrong}')
+            return None
+        commit, tree = result.get('switchroom_commit'), result.get('switchroom_tree')
+        if not all(isinstance(v, str) and re.fullmatch(sha_re, v) for v in (commit, tree)):
+            log(f'pin reuse: result artifact of {url} has no exact switchroom commit and tree')
+            return None
+        if git(repo, 'rev-parse', '--verify', '--quiet', f'{commit}^{{tree}}') != tree:
+            log(f'pin reuse: switchroom {commit} is unknown here or its tree is not {tree}')
+            return None
+        if git(repo, 'rev-parse', f'{base}^{{tree}}') != tree:
+            # Main moved since the Agent run. Still proven only if that switchroom commit is an
+            # ancestor of base and nothing since then is a real-Agent input by the same rules
+            # that scope PR runtime legs (the pin PR still runs every unit module).
+            if subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', commit, base],
+                              capture_output=True, timeout=60).returncode != 0:
+                log(f'pin reuse: switchroom {commit} of {url} is not an ancestor of base {base}')
+                return None
+            since = changed_paths(repo, 'push', commit, base)
+            moved = select(since or [], full=since is None, event='push')
+            if since is None or moved['runtime'] or moved['runtime_full']:
+                log(f'pin reuse: switchroom changed real-Agent inputs since {commit}: {since}')
+                return None
+            log(f'pin reuse: switchroom moved since {commit} only in non-runtime paths {since}')
+        log(f'pin reuse: Agent {revision} with switchroom tree {tree} already proved by {url}')
+        return url or str(run_id)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, zipfile.BadZipFile,
+            subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log(f'pin reuse: lookup failed ({type(exc).__name__}); running the full matrix')
+        return None
+
+
+def pin_reused_plan(plan, url):
+    """Units as selected; every real-Agent leg reused from the Agent repository's run."""
+    return {**plan, **{lane: False for lane in LANES}, 'runtime': False, 'deferred_on_pr': [],
+            'full': False, 'runtime_full': False, 'runtime_reused_from': url,
+            'reason': 'pin: real-Agent legs reused from fleet integration ' + url + '; units run'}
+
+
 def reused_plan(url):
     return {'tests': [], **{lane: False for lane in LANES}, 'runtime': False, 'full': False,
             'units_full': False, 'runtime_full': False, 'deferred_on_pr': [], 'reused_from': url,
@@ -343,7 +492,11 @@ def main():
     choose.add_argument('--repo', type=Path, default=ROOT)
     choose.add_argument('--github-output', type=Path)
     choose.add_argument('--reuse-repository', default='',
-                        help='push only: owner/repo to look up a green PR run of the identical tree')
+                        help='owner/repo: on push, look up a green PR run of the identical tree; on a '
+                             'pin-only PR, the Agent fleet-integration run of the pinned revision')
+    choose.add_argument('--tested', default='', help='pull_request: the merge commit CI checked out')
+    choose.add_argument('--agent-repository', default=AGENT_REPOSITORY)
+    sub.add_parser('legs', help='the runtime matrix as JSON, for the Agent fleet-integration workflow')
     for command in ('gate', 'units'):
         runner = sub.add_parser(command)
         runner.add_argument('--plan', required=True)
@@ -361,6 +514,12 @@ def main():
             reuse = find_reuse(args.reuse_repository, args.head, args.base)
             if reuse is not None:
                 plan = reused_plan(reuse)
+        if (args.event == 'pull_request' and args.reuse_repository and args.files is None
+                and is_pin_only(paths or [])):
+            reuse = find_pin_reuse(args.repo, args.reuse_repository, args.base, args.tested,
+                                   args.agent_repository)
+            if reuse is not None:
+                plan = pin_reused_plan(plan, reuse)
         encoded = json.dumps(plan, separators=(',', ':'))
         print(encoded)
         if args.github_output:
@@ -369,6 +528,11 @@ def main():
                 for key in (*LANES, 'runtime'):
                     stream.write(f'{key}={str(plan[key]).lower()}\n')
                 stream.write(f"reused={str(plan.get('reused_from') is not None).lower()}\n")
+                stream.write(f"runtime_reused={str(plan.get('runtime_reused_from') is not None).lower()}\n")
+        return 0
+    if args.command == 'legs':
+        print(json.dumps([{'lane': lane, 'shard': shard, 'name': leg_name(lane, shard)}
+                          for lane, shard in RUNTIME_LEGS], separators=(',', ':')))
         return 0
     plan = json.loads(args.plan)
     if args.command == 'units':

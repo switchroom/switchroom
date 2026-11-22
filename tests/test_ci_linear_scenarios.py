@@ -184,17 +184,21 @@ class LinearScenarioLaneTests(unittest.TestCase):
         self.assertEqual(legs[:3], ["- {lane: input, shard: 1/3}", "- {lane: input, shard: 2/3}",
                                     "- {lane: input, shard: 3/3}"])
         self.assertEqual(legs[-1], "- {lane: native, shard: ''}")
-        self.assertIn("input) selected=\"$INPUT\" ;;", runtime)
-        self.assertIn('run-linear-input-scenarios.py \\\n            --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"', runtime)
-        self.assertIn("if: matrix.lane == 'input' && needs.selection.outputs.input == 'true'", runtime)
+        self.assertIn('input) [[ "$INPUT" == true ]] && proofs+=(input) ;;', runtime)
+        self.assertIn("INPUT: ${{ needs.selection.outputs.input == 'true' }}", runtime)
+        self.assertIn('scripts/run-runtime-leg.sh "$LANE" "$SHARD" "$GITHUB_WORKSPACE/agent-source" $PROOFS', runtime)
+        leg = (ROOT / "scripts/run-runtime-leg.sh").read_text(encoding="utf-8")
+        self.assertIn('scripts/run-linear-input-scenarios.py --agent-source "$agent" --shard "$shard"', leg)
 
     def test_ci_provisions_manifest_revision_and_runs_separately(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         source_job = workflow.split("  runtime:\n", 1)[1].split("\n  history-root:", 1)[0]
         self.assertIn("scripts/read-agent-image-manifest.py", source_job)
         self.assertIn("ref: ${{ steps.agent.outputs.AGENT_REVISION }}", source_job)
-        self.assertIn("scripts/run-linear-scenarios.py", source_job)
-        self.assertIn("HERMES_AGENT_SRC", source_job)
+        self.assertIn('"$GITHUB_WORKSPACE/agent-source"', source_job)
+        leg = (ROOT / "scripts/run-runtime-leg.sh").read_text(encoding="utf-8")
+        for runner in ("run-linear-scenarios.py", "run-linear-origin-scenarios.py", "run-linear-input-scenarios.py"):
+            self.assertIn("scripts/" + runner + " ", leg)
         policy_job = workflow.split("  source-tests:\n", 1)[1].split("\n  runtime:", 1)[0]
         self.assertIn("scripts/verify-public-tree.py", policy_job)
 
