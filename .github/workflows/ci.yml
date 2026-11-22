@@ -23,7 +23,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      # Push only: find the merged PR and its CI run to reuse an identical, proven tree.
+      # Push: find the merged PR and its CI run to reuse an identical, proven tree. Pin-only PR:
+      # find the Agent repository's fleet-integration run of the pinned revision.
       pull-requests: read
       actions: read
       checks: read
@@ -45,14 +46,19 @@ jobs:
         # Pass event data as quoted arguments, never interpolate it into shell source.
         # On push, a green PR run of the identical tree (current with main, source-checks green)
         # is reused instead of re-testing it; any doubt runs the normal selection.
+        # A pin-only PR (the Agent manifest and plugin UPSTREAM.json records, nothing else) reuses
+        # the Agent repository's green fleet-integration push run of the pinned revision for the
+        # real-Agent legs when it ran this same switchroom tree; units still run. Any doubt runs all.
+        # To reuse that PR on push, recheck its exact Agent run and attempt alongside the PR proof.
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-          # Only a push looks anything up; other events never see a token here.
-          GH_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}
+          TESTED: ${{ github.sha }}
+          # Only a push or pull_request looks anything up (read-only); other events see no token.
+          GH_TOKEN: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.token || '' }}
         run: |
           python3 scripts/source-ci.py select --event "$GITHUB_EVENT_NAME" \
-            --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT" \
+            --base "$BASE" --head "$HEAD" --tested "$TESTED" --github-output "$GITHUB_OUTPUT" \
             --reuse-repository "$GITHUB_REPOSITORY"
 
   source-checks:
@@ -137,21 +143,26 @@ jobs:
         id: leg
         env:
           LANE: ${{ matrix.lane }}
-          LINEAR: ${{ needs.selection.outputs.linear }}
-          ACP: ${{ needs.selection.outputs.acp }}
-          ORIGIN: ${{ needs.selection.outputs.origin }}
-          INPUT: ${{ needs.selection.outputs.input }}
-          JOURNEY: ${{ needs.selection.outputs.journey }}
+          LINEAR: ${{ needs.selection.outputs.linear == 'true' }}
+          ACP: ${{ needs.selection.outputs.acp == 'true' }}
+          ORIGIN: ${{ needs.selection.outputs.origin == 'true' }}
+          INPUT: ${{ needs.selection.outputs.input == 'true' }}
+          JOURNEY: ${{ needs.selection.outputs.journey == 'true' }}
         run: |
+          proofs=()
           case "$LANE" in
-            kanban) selected="$LINEAR" ;;
-            origin) selected="$ORIGIN" ;;
-            input) selected="$INPUT" ;;
-            native) [[ "$ACP" == true || "$JOURNEY" == true ]] && selected=true || selected=false ;;
+            kanban) [[ "$LINEAR" == true ]] && proofs+=(linear) ;;
+            origin) [[ "$ORIGIN" == true ]] && proofs+=(origin) ;;
+            input) [[ "$INPUT" == true ]] && proofs+=(input) ;;
+            native)
+              [[ "$ACP" == true ]] && proofs+=(acp)
+              [[ "$JOURNEY" == true ]] && proofs+=(journey) ;;
             *) echo "unknown runtime lane: $LANE" >&2; exit 1 ;;
           esac
+          (( ${#proofs[@]} )) && selected=true || selected=false
           echo "selected=$selected" >> "$GITHUB_OUTPUT"
-          echo "runtime leg $LANE selected=$selected"
+          echo "proofs=${proofs[*]}" >> "$GITHUB_OUTPUT"
+          echo "runtime leg $LANE selected=$selected proofs=${proofs[*]}"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         if: steps.leg.outputs.selected == 'true'
         with:
@@ -176,57 +187,17 @@ jobs:
         if: steps.leg.outputs.selected == 'true'
         with:
           python-version: '3.14.7'
-      - name: Prepare real Agent test environment
+      # The same script runs these legs in the Agent repository's fleet-integration workflow.
+      - name: Real-Agent proofs (${{ steps.leg.outputs.proofs }})
         if: steps.leg.outputs.selected == 'true'
-        run: |
-          python -m venv "$RUNNER_TEMP/linear-scenarios"
-          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
-            --require-hashes --only-binary=:all: -r release/linear-scenario-requirements.txt
-      - name: Real Agent Kanban scenarios
-        if: matrix.lane == 'kanban' && needs.selection.outputs.linear == 'true'
         env:
-          HERMES_AGENT_SRC: ${{ github.workspace }}/agent-source
+          LANE: ${{ matrix.lane }}
           LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl
           SHARD: ${{ matrix.shard }}
+          PROOFS: ${{ steps.leg.outputs.proofs }}
         run: |
-          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
-            --agent-source "$HERMES_AGENT_SRC" --shard "$SHARD"
-      - name: Real Agent Claude ACP context resolution
-        if: matrix.lane == 'native' && needs.selection.outputs.acp == 'true'
-        env:
-          HERMES_AGENT_SRC: ${{ github.workspace }}/agent-source
-          LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl
-        run: |
-          "$RUNNER_TEMP/linear-scenarios/bin/python" scripts/run-linear-scenarios.py \
-            --agent-source "$HERMES_AGENT_SRC" --pattern test_claude_acp_context.py
-      - name: Real native worker journeys
-        if: matrix.lane == 'native' && needs.selection.outputs.journey == 'true'
-        env:
-          LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl
-        run: |
-          (cd agent-source && python -m pm.build_env --source . \
-            --out "$RUNNER_TEMP/journey-env" --group dev --group test --extra all --ci)
-          "$RUNNER_TEMP/journey-env/bin/python" scripts/run-linear-scenarios.py \
-            --agent-source "$GITHUB_WORKSPACE/agent-source" --pattern test_linear_native_work_journey.py
-          "$RUNNER_TEMP/journey-env/bin/python" scripts/run-linear-scenarios.py \
-            --agent-source "$GITHUB_WORKSPACE/agent-source" --pattern test_linear_worker_questions.py
-      - name: Guarded native origin evidence
-        if: matrix.lane == 'origin' && needs.selection.outputs.origin == 'true'
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          python3 -I -S scripts/check-linear-origin-guard.py
-          "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-origin-scenarios.py \
-            --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"
-      - name: Guarded native input against release Core
-        if: matrix.lane == 'input' && needs.selection.outputs.input == 'true'
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          "$RUNNER_TEMP/linear-scenarios/bin/python" -m pip install \
-            --require-hashes --only-binary=:all: -r tests/native-input-requirements.txt
-          "$RUNNER_TEMP/linear-scenarios/bin/python" -I scripts/run-linear-input-scenarios.py \
-            --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"
+          # shellcheck disable=SC2086 # PROOFS is a space-separated list of fixed proof names.
+          scripts/run-runtime-leg.sh "$LANE" "$SHARD" "$GITHUB_WORKSPACE/agent-source" $PROOFS
       - name: Keep retried quarantine ids
         if: always() && steps.leg.outputs.selected == 'true'
         continue-on-error: true
