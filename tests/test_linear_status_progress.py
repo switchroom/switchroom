@@ -276,7 +276,7 @@ class StatusProgressTests(unittest.TestCase):
         for state in ("unlinked", "retained", "blocked", "done"):
             with self.subTest(state=state):
                 if state == "retained":
-                    self.store.put("issue-1", "chat", "old", run_generation=1)
+                    self.store.put("issue-1", "chat", "old")
                 elif state in ("blocked", "done"):
                     self.kanban.tasks["task-1"] = SimpleNamespace(id="task-1", status=state, assignee="synthetic",
                         current_run_id=None, title="ABC-1: task", result="", completion_contract=None)

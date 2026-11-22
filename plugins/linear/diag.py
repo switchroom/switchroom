@@ -101,6 +101,7 @@ REASONS = frozenset({
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "socket_owned", "tick_exception", "duplicate_create",
     "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",
+    "retired_table_kept",  # store open: a retired legacy table still has rows, so it was not dropped
     # tool replies (chat.py codes)
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
     "authorization_unavailable", "native_scope_refused", "description_conflict",

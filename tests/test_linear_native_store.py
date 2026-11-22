@@ -11,6 +11,7 @@ from pathlib import Path
 from linear_fake_api import load_plugin
 
 load_plugin()
+from hermes_fleet_linear_plugin import diag
 from hermes_fleet_linear_plugin.store import Store
 
 
@@ -145,8 +146,7 @@ class NativeStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.native_binding("issue-1", "beta", "default"))
         self.assertIsNone(self.store.native_binding("issue-1", "alpha", "other-board"))
         self.assertEqual(self.store.native_binding("issue-1")["task_id"], "task-1")
-        self.assertIsNone(self.store.get("issue-1")["ownership_id"])
-        self.assertTrue(self.store.put("legacy", "chat", "old-conversation", run_generation=3))
+        self.assertTrue(self.store.put("legacy", "chat", "old-conversation"))
         before = self.store.get("legacy")
         self.assertFalse(self.bind("legacy"))
         self.assertEqual(self.store.get("legacy"), before)
@@ -182,23 +182,12 @@ class NativeStoreTests(unittest.TestCase):
 
     def test_explicit_replacement_archives_legacy_history_and_preserves_effect_guards(self):
         self.assertTrue(self.store.put("issue-1", "kanban_chat", "old-session", task_id="old-task",
-                                       project_id="old-project", last_updated_at=70, run_generation=4))
-        with sqlite3.connect(self.path) as db:
-            db.execute("UPDATE work SET stop_requested_at=75,resume_fence_at=74,ownership_id='old-owner',"
-                       "release_pending=1,pending_resume='saved resume',panel_note='saved note' WHERE issue_id='issue-1'")
-            db.execute("INSERT INTO retirement VALUES ('old-task','issue-1','original retirement')")
-            db.execute("INSERT INTO chat_stop VALUES ('stop-1','alpha','issue-1','old-linear','activity-1',"
-                       "'old-key',4,'accepted','unknown',NULL,NULL)")
-            db.execute("INSERT INTO chat_admissions VALUES ('admission-1','issue-1','alpha','/old-home',"
-                       "'old-key','old-session',4,'old-owner','old-task','ambiguous',NULL,NULL)")
-            db.execute("INSERT INTO metadata VALUES ('chat-transfer:old',?)",
-                       (json.dumps({"issue_id": "issue-1", "state": "prepared"}),))
+                                       project_id="old-project", last_updated_at=70))
         self.outbox("uncertain", "status", {"issue_id": "issue-1", "task_id": "old-task",
                                             "terminal": True, "write_started": True}, state="failed", attempts=3)
         self.outbox("independent", "comment", {"issue_id": "issue-1", "body": "New discussion",
                                                 "content_action": True, "unlinked_content": True})
         original = self.store.get("issue-1")
-        retained = {table: self.rows(table) for table in ("retirement", "chat_stop", "chat_admissions")}
         uncertain = self.store.issue_reconciliation_blocked("issue-1")
         request_id = str(uuid.uuid4())
         self.assertFalse(self.bind())  # Ordinary tracking still cannot adopt legacy work.
@@ -207,11 +196,6 @@ class NativeStoreTests(unittest.TestCase):
         self.assertEqual(receipt["payload"]["previous"]["work"], original)
         self.assertIsNone(receipt["payload"]["previous"]["native_binding"])
         self.assertEqual(receipt["state"], "applied")
-        for table, before in retained.items():
-            self.assertEqual(self.rows(table), before)
-        with sqlite3.connect(self.path) as db:
-            self.assertEqual(json.loads(db.execute("SELECT value FROM metadata WHERE key='chat-transfer:old'").fetchone()[0]),
-                             {"issue_id": "issue-1", "state": "prepared"})
         self.assertEqual(self.store.issue_reconciliation_blocked("issue-1"), uncertain)
         self.assertTrue(self.store.admit_mutation("independent"))
         self.assertEqual(self.store.get("issue-1")["last_event_id"], 0)
@@ -245,14 +229,13 @@ class NativeStoreTests(unittest.TestCase):
 
     def test_native_history_is_archived_and_same_target_preserves_cursor(self):
         self.assertTrue(self.bind())
-        self.store.update("issue-1", last_event_id=12, panel_note="old note")
+        self.store.update("issue-1", last_event_id=12)
         original = self.store.get("issue-1")
         with sqlite3.connect(self.path) as db:
             raw_binding = db.execute("SELECT value FROM metadata WHERE key='native-binding:issue-1'").fetchone()[0]
         request_id = str(uuid.uuid4())
         self.assertTrue(self.replace(task="task-1", request_id=request_id))
         self.assertEqual(self.store.get("issue-1")["last_event_id"], 12)
-        self.assertEqual(self.store.get("issue-1")["panel_note"], "old note")
         receipt = self.store.native_intent(f"track:issue-1:{request_id}")
         self.assertEqual(receipt["payload"]["previous"], {"work": original, "native_binding": raw_binding})
         self.assertTrue(self.replace(task="new-target"))
@@ -272,8 +255,6 @@ class NativeStoreTests(unittest.TestCase):
         self.assertTrue(self.store.bind_native("issue-1", "task-1", "alpha", "default",
             owner_ref="provider-session", requester_activity="original-activity", at=100))
         self.store.update("issue-1", last_event_id=9)
-        with self.store._tx() as db:
-            db.execute("UPDATE work SET stop_requested_at=110,resume_fence_at=109 WHERE issue_id='issue-1'")
         self.outbox("old-activity-report", "comment", {"issue_id": "issue-1", "task_id": "task-1",
             "body": "Frozen original outcome", "requester_sessions": {"issue-1": "provider-session"},
             "requester_activities": {"issue-1": "original-activity"}})
@@ -284,7 +265,7 @@ class NativeStoreTests(unittest.TestCase):
             expected_revision=self.store.binding_revision("issue-1"), request_id=str(uuid.uuid4()), at=200)
         self.assertTrue(result)
         after = self.store.get("issue-1")
-        for field in ("task_id", "last_event_id", "stop_requested_at", "resume_fence_at"):
+        for field in ("task_id", "last_event_id"):
             self.assertEqual(after[field], before[field])
         self.assertEqual(self.store.native_binding("issue-1")["requester_activity_id"], "later-activity")
         retained = self.store.outbox_row("old-activity-report")
@@ -375,7 +356,7 @@ class NativeStoreTests(unittest.TestCase):
     def test_native_event_cursor_and_remote_intents_commit_together_and_keep_binding(self):
         self.assertTrue(self.bind())
         writes = [("comment", {"issue_id": "issue-1", "body": "Verified native result", "task_id": "task-1"})]
-        self.assertTrue(self.store.capture_event("issue-1", 4, writes, at=101, forget=True))
+        self.assertTrue(self.store.capture_event("issue-1", 4, writes, at=101))
         self.assertIsNotNone(self.store.native_binding("issue-1"))
         self.assertEqual(self.store.get("issue-1")["last_event_id"], 4)
         self.assertFalse(self.store.capture_event("issue-1", 4, writes, at=102))
@@ -387,8 +368,6 @@ class NativeStoreTests(unittest.TestCase):
 
     def test_unlinked_content_ignores_chat_claims_but_preserves_uncertain_effects(self):
         self.store.put("legacy", "chat", "original-chat")
-        with sqlite3.connect(self.path) as db:
-            db.execute("UPDATE work SET stop_requested_at=100,release_pending=1 WHERE issue_id='legacy'")
         before = self.store.get("legacy")
         row = self.store.enqueue("comment", {"issue_id": "legacy", "body": "Status question", "id": "new-comment",
                                              "content_action": True, "unlinked_content": True}, at=101)
@@ -402,20 +381,30 @@ class NativeStoreTests(unittest.TestCase):
         self.assertEqual(self.store.enqueue("description", {"issue_id": "unlinked", "body": "Retry", "id": "edit-2",
                                                             "content_action": True}, at=102), "")
 
-    def test_legacy_records_and_intents_are_preserved_without_activating_protocols(self):
-        self.store.put("legacy", "kanban_chat", "original-chat", task_id="legacy-task")
+    def test_opening_drops_empty_retired_tables_and_keeps_one_with_rows(self):
         with sqlite3.connect(self.path) as db:
-            db.execute("INSERT INTO retirement VALUES ('legacy-task','legacy','{}')")
-            db.execute("INSERT INTO metadata VALUES ('chat-transfer:old',?)", (json.dumps({"issue_id": "legacy", "state": "prepared"}),))
-            before = list(db.iterdump())
+            db.execute("CREATE TABLE retirement (task_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, snapshot TEXT NOT NULL)")
+            db.execute("CREATE TABLE chat_admissions (request_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL)")
+            db.execute("CREATE TABLE chat_stop (id TEXT PRIMARY KEY, issue_id TEXT NOT NULL)")
+            db.execute("INSERT INTO chat_stop VALUES ('stop-1','legacy')")
+        diag.reset()
+        with self.assertLogs(diag.LOGGER_NAME, "WARNING") as logs:
+            Store(self.path)
+        self.assertEqual([line for line in logs.output if "retired_table_kept" in line and "fields=chat_stop" in line],
+                         logs.output)
+        self.assertEqual(len(logs.output), 1)
+        with sqlite3.connect(self.path) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(db.execute("SELECT * FROM chat_stop").fetchall(), [("stop-1", "legacy")])
+        self.assertIn("chat_stop", tables)
+        self.assertFalse({"retirement", "chat_admissions"} & tables)
+        self.assertIn("specialist_scope_fence", tables)  # a live safety fence, never retired
+        with sqlite3.connect(self.path) as db:
+            db.execute("DELETE FROM chat_stop")
         Store(self.path)
         with sqlite3.connect(self.path) as db:
-            self.assertEqual(list(db.iterdump()), before)
-        for removed in ("prepare_chat_transfer", "commit_chat_transfer", "resume_chat_transfer", "capture_chat_stop",
-                        "prepare_chat_admission", "activate_task", "mark_recovery_delivered"):
-            self.assertFalse(hasattr(self.store, removed), removed)
-        self.assertFalse(self.bind("legacy"))
-
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='chat_stop'").fetchone())
+        self.assertTrue(self.bind("legacy"))
 
 if __name__ == "__main__":
     unittest.main()

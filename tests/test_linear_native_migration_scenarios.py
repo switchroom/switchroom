@@ -66,8 +66,6 @@ class NativeMigrationTests(unittest.TestCase):
 
     def stopped_work(self):
         self.assertTrue(self.store.put(ISSUE, "chat", "retained-old-chat"))
-        with sqlite3.connect(self.path) as db:
-            db.execute("UPDATE work SET ownership_id='old-owner',stop_requested_at=1,release_pending=1 WHERE issue_id=?", (ISSUE,))
         return self.store.get(ISSUE)
 
     def old_delivery(self, kind="status", *, attempts=0, delivery_state="pending", **fields):
@@ -330,16 +328,13 @@ class NativeMigrationTests(unittest.TestCase):
         uncertain = self.old_delivery("status", attempts=1, state="blocked", terminal=True, release=True,
                                       write_started=True, work_owner="old-owner")
         uncertain_before = self.history(uncertain)
-        with sqlite3.connect(self.path) as db:
-            db.execute("INSERT INTO metadata(key,value) VALUES('chat-transfer:retained',?)",
-                       (json.dumps({"issue_id": ISSUE, "state": "prepared"}),))
         self.bridge = Bridge(Store(self.path), BoundLinearAPI(lambda: "synthetic", endpoint=self.remote.url, clock=self.clock,
                              identity={"viewer_id": SELF, "organization_id": "synthetic-org"}),
                              SimpleNamespace(), profile="default", clock=self.clock)
         event = self.remote.session_event("prompted", ISSUE, "verified-session", body="What is the current state?")
         self.bridge.handle_webhook(event)
         fresh = next(row for row in self.store.pending() if row["payload"].get("reporting_notice_version") == 1)
-        self.assertIsNone(fresh["payload"]["work_owner"])
+        self.assertIsNone(fresh["payload"].get("work_owner"))
         self.assertEqual(fresh["payload"]["reporting_notice_version"], 1)
         self.assertEqual(self.bridge.flush(), 1)
         self.assertEqual(len(self.remote.activities), 1)

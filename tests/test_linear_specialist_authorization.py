@@ -935,7 +935,6 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
         self.kanban.create = checked_create
         self.bridge.handle_webhook(self.session_event())
         self.assertEqual(self.store.get(ISSUE)["origin"], "native")
-        self.assertIsNone(self.store.get(ISSUE)["ownership_id"])
 
 
     def test_restart_after_binding_keeps_native_task_and_never_recreates(self):
@@ -1268,16 +1267,14 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 self.assertEqual(self.authority.mutations, [])
 
     def test_history_capture_refuses_persisted_fence_atomically(self):
-        for forget in (False, True):
-            with self.subTest(archived=forget):
-                issue_id = f"{ISSUE}-{forget}"
-                self.store.bind_native(issue_id, "task", "synthetic", "default", owner_ref=SESSION, project_id=PROJECT, at=0)
-                self.store.enqueue("comment", {"issue_id": issue_id, "body": "preserved", "task_id": "task"}, at=1)
-                before, pending = self.store.get(issue_id), self.store.pending(issue_id)
-                self.store.fence_scope(issue_id, "permanent denial", at=1.0)
-                self.assertFalse(self.store.capture_event(issue_id, 2, [("status", {"issue_id": issue_id, "state": "done"})], at=2.0, forget=forget))
-                self.assertEqual(self.store.get(issue_id), before)
-                self.assertEqual(self.store.pending(issue_id), pending)
+        issue_id = ISSUE
+        self.store.bind_native(issue_id, "task", "synthetic", "default", owner_ref=SESSION, project_id=PROJECT, at=0)
+        self.store.enqueue("comment", {"issue_id": issue_id, "body": "preserved", "task_id": "task"}, at=1)
+        before, pending = self.store.get(issue_id), self.store.pending(issue_id)
+        self.store.fence_scope(issue_id, "permanent denial", at=1.0)
+        self.assertFalse(self.store.capture_event(issue_id, 2, [("status", {"issue_id": issue_id, "state": "done"})], at=2.0))
+        self.assertEqual(self.store.get(issue_id), before)
+        self.assertEqual(self.store.pending(issue_id), pending)
 
     def test_terminal_capture_refuses_persisted_fence_atomically(self):
         self.store.put(ISSUE, "chat", "owner", project_id=PROJECT)

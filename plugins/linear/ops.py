@@ -109,21 +109,6 @@ def _scan(state: Path, ingress: Path, profile: str, now: float | None = None) ->
             for row in _rows(db, "SELECT * FROM specialist_scope_fence"):
                 add(row["issue_id"], "fence", row["fenced_at"], "outside specialist scope",
                     "Permanent by policy; recover only through an approved procedure.")
-            for row in _rows(db, "SELECT * FROM chat_admissions WHERE state IN ('claiming', 'ambiguous')"):
-                add(row["issue_id"], row["request_id"], now, f"chat-to-worker admission is {row['state']}"
-                    + (f" for task {row['task_id']}" if row["task_id"] else ""),
-                    "Confirm the task and delegate in Linear and Kanban before new work on this issue.",
-                    row["state"] == "ambiguous")
-            for row in _rows(db, "SELECT issue_id, last_updated_at FROM work WHERE release_pending = 1"):
-                add(row["issue_id"], "release", (row["last_updated_at"] or now * 1000) / 1000,
-                    "retained legacy release needs reconciliation", "Inspect native and Linear state; no automatic replay.", True)
-            for row in _rows(db, "SELECT issue_id,origin,task_id,last_updated_at FROM work WHERE origin != 'native'"):
-                add(row["issue_id"], row["task_id"] or "legacy", (row["last_updated_at"] or now * 1000) / 1000,
-                    f"retained {row['origin']} record; execution state is unknown",
-                    "Inspect existing native work, checkpoints and external effects before migration. No automatic adoption.", True)
-            for row in _rows(db, "SELECT task_id, issue_id FROM retirement"):
-                add(row["issue_id"], row["task_id"], now, f"waiting for Kanban task {row['task_id']} to exit",
-                    "Inspect native worker and effect state; historical retirement is not proof of worker liveness.", True)
             for row in _rows(db, "SELECT key,value FROM metadata WHERE key LIKE 'native-intent:%'"):
                 saved = json.loads(row["value"])
                 if saved.get("state") == "applied":
@@ -132,9 +117,6 @@ def _scan(state: Path, ingress: Path, profile: str, now: float | None = None) ->
                 add(request.get("issue_id") or "", row["key"], now,
                     f"native {request.get('kind') or 'delivery'} outcome needs reconciliation",
                     "Inspect native task/comment/run and external state. Reuse the original request; never blindly replay.", True)
-            for row in _rows(db, "SELECT id,issue_id,status FROM chat_stop WHERE status IN ('requested','accepted')"):
-                add(row["issue_id"], row["id"], now, "retained chat Stop outcome is unverified",
-                    "Inspect the actual native process/effect state. The retired plugin protocol will not retry it.", True)
     if ingress.is_file():
         with closing(_read(ingress)) as db:
             for row in _rows(db, "SELECT logical_agent, delivery_id, payload, received_at, status, attempts FROM deliveries WHERE "

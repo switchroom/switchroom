@@ -85,7 +85,7 @@ class DescriptionSettlementTests(unittest.TestCase):
         self.remote.add_issue('issue-1', 'ABC-1', project=None)
         self.remote.set_delegate('issue-1', {'id': SELF})
         self.store = Store(self.path)
-        self.store.put('issue-1', 'chat', 'chat', run_generation=1)
+        self.store.put('issue-1', 'chat', 'chat')
         self.notes: list[tuple[str, str]] = []
         self.api = LinearAPI(lambda: 'synthetic', endpoint=self.remote.url)
         self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock)
