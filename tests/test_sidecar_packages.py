@@ -281,16 +281,34 @@ class BrowserBrokerPublicTests(unittest.TestCase):
             else:
                 os.environ["BRAND"] = previous
 
-    def test_local_tz_defaults_to_utc(self) -> None:
-        previous = os.environ.pop("LOCAL_TZ", None)
+    def test_local_tz_falls_back_to_tz_env_never_utc_default(self) -> None:
+        saved = {k: os.environ.pop(k, None) for k in ("LOCAL_TZ", "TZ")}
         try:
             config = load(ROOT / "sidecars/browser-broker/public_config.py", "public_config_tz_default")
-            self.assertEqual(config.local_tz(), "UTC")
+            self.assertEqual(config.local_tz(), "")
+            os.environ["TZ"] = "Australia/Melbourne"
+            self.assertEqual(config.local_tz(), "Australia/Melbourne")
+            os.environ["LOCAL_TZ"] = "Australia/Sydney"
+            self.assertEqual(config.local_tz(), "Australia/Sydney")
         finally:
-            if previous is None:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_expiry_renders_in_local_zone_with_abbreviation(self) -> None:
+        saved = os.environ.get("LOCAL_TZ")
+        os.environ["LOCAL_TZ"] = "Australia/Melbourne"
+        try:
+            ux = load(ROOT / "sidecars/browser-broker/ux.py", "ux_tz_render")
+            # 2026-11-22 03:05 UTC == 2:05pm AEDT
+            self.assertEqual(ux._local_time(1795316700.0), "2:05pm AEDT")
+        finally:
+            if saved is None:
                 os.environ.pop("LOCAL_TZ", None)
             else:
-                os.environ["LOCAL_TZ"] = previous
+                os.environ["LOCAL_TZ"] = saved
 
     def test_viewer_page_uses_brand_env(self) -> None:
         previous = os.environ.get("BRAND")

@@ -142,7 +142,10 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         workflows = sorted(WORKFLOWS.glob("*.yml")) + sorted(WORKFLOWS.glob("*.yaml"))
         pin_handoff = WORKFLOWS / "plugin-pin-handoff.yml"
         pr_auto_update = WORKFLOWS / "pr-auto-update.yml"
-        allowed = {HANDOFF, pin_handoff, pr_auto_update}
+        # The auto-revert bot pushes its revert branch with the App so the revert PR's CI runs.
+        auto_revert = WORKFLOWS / "auto-revert.yml"
+        allowed = {HANDOFF, pin_handoff, pr_auto_update, auto_revert}
+        self.assertIn(auto_revert, workflows)
         self.assertIn(HANDOFF, workflows)
         self.assertIn(pin_handoff, workflows)
         self.assertIn(pr_auto_update, workflows)

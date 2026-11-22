@@ -199,6 +199,132 @@ class LinearScenarioLaneTests(unittest.TestCase):
         self.assertIn("scripts/verify-public-tree.py", policy_job)
 
 
+class QuarantineRetryTests(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.tests = self.root / "qtests"
+        self.tests.mkdir()
+        spec = importlib.util.spec_from_file_location("scenario_quarantine_runner", RUNNER)
+        self.runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.runner)
+        self.marker = self.root / "attempted"
+        import uuid
+        self.module = "test_linear_q" + uuid.uuid4().hex[:8] + "_scenarios"
+        self.addCleanup(sys.modules.pop, self.module, None)
+        (self.tests / (self.module + ".py")).write_text(
+            "import pathlib, unittest\n"
+            f"MARKER = pathlib.Path({str(self.marker)!r})\n"
+            "class Q(unittest.TestCase):\n"
+            "    def test_flaky_once(self):\n"
+            "        first = not MARKER.exists()\n"
+            "        MARKER.touch()\n"
+            "        self.assertFalse(first, 'first attempt flakes')\n"
+            "    def test_always_red(self):\n"
+            "        self.fail('real failure')\n"
+            "    def test_green(self):\n"
+            "        pass\n", encoding="utf-8")
+
+    def run_with(self, ids, pattern):
+        import contextlib, io
+        quarantine = self.root / "quarantine.json"
+        quarantine.write_text(json.dumps({"tests": [{"id": i, "tracking": "HF-test"} for i in ids]}), encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.runner.run_suite(self.tests, pattern, quarantine=quarantine)
+        return code, out.getvalue()
+
+    def test_quarantined_flake_is_retried_once_with_a_warning(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        loader = self.runner.unittest.defaultTestLoader
+        real = loader.discover
+        def discover(start_dir, pattern):
+            suite = real(start_dir=start_dir, pattern=pattern)
+            return unittest.TestSuite(t for t in self.runner.flatten(suite) if t.id() != self.module + ".Q.test_always_red")
+        with patch.object(loader, "discover", side_effect=discover):
+            code, out = self.run_with([flaky], self.module + ".py")
+            self.assertEqual(code, 0)
+            self.assertIn("::warning title=Quarantined flake retried::" + flaky, out)
+            self.marker.unlink()
+            code, out = self.run_with([], self.module + ".py")
+            self.assertEqual(code, 1)
+            self.assertNotIn("::warning", out)
+
+    def test_retried_ids_persist_in_the_job_summary_and_the_retries_log(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        loader = self.runner.unittest.defaultTestLoader
+        real = loader.discover
+        def discover(start_dir, pattern):
+            suite = real(start_dir=start_dir, pattern=pattern)
+            return unittest.TestSuite(t for t in self.runner.flatten(suite) if t.id() != self.module + ".Q.test_always_red")
+        summary, log = self.root / "summary.md", self.root / "out" / "retries.jsonl"
+        with patch.object(loader, "discover", side_effect=discover), \
+                patch.object(self.runner, "SUMMARY", str(summary)), patch.object(self.runner, "RETRIES_LOG", str(log)):
+            code, _ = self.run_with([flaky], self.module + ".py")
+        self.assertEqual(code, 0)
+        self.assertIn(f"`{flaky}` (HF-test)", summary.read_text(encoding="utf-8"))
+        self.assertEqual([json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()],
+                         [{"id": flaky, "tracking": "HF-test"}])
+
+    def test_ci_uploads_the_retries_log_from_every_runtime_leg(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl", workflow)
+        upload = workflow.split("- name: Keep retried quarantine ids", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("path: ${{ runner.temp }}/quarantine-retries.jsonl", upload)
+        self.assertIn("if-no-files-found: ignore", upload)
+        self.assertIn("continue-on-error: true", upload)
+        self.assertIn("${{ github.run_attempt }}", upload)
+
+    def test_reporting_failure_does_not_fail_a_recovered_retry(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        loader = self.runner.unittest.defaultTestLoader
+        discover = loader.discover
+
+        def flaky_only(start_dir, pattern):
+            suite = discover(start_dir=start_dir, pattern=pattern)
+            return unittest.TestSuite(test for test in self.runner.flatten(suite) if test.id() == flaky)
+
+        with patch.object(loader, "discover", side_effect=flaky_only), \
+                patch.object(self.runner, "SUMMARY", str(self.root)), \
+                patch.object(self.runner, "RETRIES_LOG", str(self.root)):
+            code, out = self.run_with([flaky], self.module + ".py")
+        self.assertEqual(code, 0)
+        self.assertIn("Could not save quarantine retry records", out)
+        self.assertIn("Could not update quarantine retry summary", out)
+
+    def test_any_unquarantined_or_repeated_failure_stays_red(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        red = self.module + ".Q.test_always_red"
+        log = self.root / "out" / "retries.jsonl"
+        with patch.object(self.runner, "RETRIES_LOG", str(log)):
+            code, out = self.run_with([flaky], self.module + ".py")
+            self.assertEqual(code, 1)
+            self.assertNotIn("::warning", out)
+            self.assertFalse(log.exists())
+            self.marker.unlink()
+            code, out = self.run_with([flaky, red], self.module + ".py")
+        self.assertEqual(code, 1)
+        self.assertNotIn("::warning", out)
+        self.assertCountEqual([json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()],
+                              [{"id": flaky, "tracking": "HF-test"}, {"id": red, "tracking": "HF-test"}])
+
+    def test_repository_quarantine_names_existing_tests_with_tracking(self):
+        entries = json.loads((ROOT / "tests/ci-quarantine.json").read_text(encoding="utf-8"))["tests"]
+        self.assertLessEqual(len(entries), 3, "the quarantine is a short-lived list, not a skip file")
+        for entry in entries:
+            module, cls, method = entry["id"].split(".")
+            source = (ROOT / "tests" / (module + ".py")).read_text(encoding="utf-8")
+            self.assertIn(f"class {cls}(", source)
+            self.assertIn(f"def {method}(", source)
+            self.assertTrue(entry["tracking"].strip())
+
+
 class HistoricalCoreQualificationTests(unittest.TestCase):
     def run_skip(self, revision, *, reason=None, identity=None, capability=False):
         import contextlib

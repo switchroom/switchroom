@@ -6,13 +6,17 @@ inputs run every unit module; runtime inputs and ambiguous history run
 everything. Image selection is independent.
 """
 import argparse
+from datetime import datetime
 import fnmatch
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import unittest
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 LANES = ('linear', 'acp', 'origin', 'input', 'journey')
@@ -49,6 +53,15 @@ RUNTIME_INPUTS = {
     'scripts/run-linear-origin-scenarios.py', 'scripts/check-linear-origin-guard.py',
 }
 RUNTIME_INPUT_PREFIXES = ('tests/',)
+# Defer-CI fast lane (PR only): a change made only of these Linear plugin files, existing test
+# modules and prose runs units plus the real-Agent legs of the test files it touches before
+# merge; main push CI runs the component's full legs, a red push is auto-reverted, and nothing
+# delivers until main is green (scripts/auto-revert.py, plugin-pin-handoff.yml, fleet-image.yml).
+# An explicit allowlist of existing files with no sender, permission, identity or credential
+# logic. Every other plugin file (most of it is authority code) stays fully gated before merge;
+# widening this list is itself a reviewed selector change.
+FAST_LANE_FILES = frozenset('plugins/linear/' + name for name in (
+    'acceptance.py', 'outcome.py', 'waits.py'))
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -93,7 +106,7 @@ def is_runtime_input(path):
     return path in RUNTIME_INPUTS or path.startswith(RUNTIME_INPUT_PREFIXES)
 
 
-def select(paths, full=False, reason='changed paths'):
+def select(paths, full=False, reason='changed paths', event='push', added=()):
     """`units_full` runs every unit module; `runtime_full` also runs every real-Agent leg.
 
     An unmapped path broadens units only. Runtime broadens only for a listed runtime input,
@@ -132,14 +145,46 @@ def select(paths, full=False, reason='changed paths'):
         reason = 'full: requested, uncertain or runtime input'
     elif units_full:
         reason = 'units_full: unmapped non-runtime input; real-Agent legs scoped'
+    deferred = [] if full else deferrable_lanes(paths, lanes, added)
+    if event == 'pull_request' and deferred:
+        lanes = {lane: lanes[lane] and lane not in deferred for lane in LANES}
+        reason = 'fast lane: real-Agent legs ' + ', '.join(deferred) + ' run after merge on main push'
     return {'tests': sorted(tests), **lanes,
             'runtime': any(lanes[k] for k in LANES),
             'full': runtime_full, 'units_full': units_full, 'runtime_full': runtime_full,
-            'reason': reason}
+            'deferred_on_pr': deferred, 'reason': reason}
 
 
-def changed_paths(repo, event, base, head):
-    """None means uncertain. Renames and copies route by both paths, deletes by the old path."""
+def fast_lane_eligible(paths, added=()):
+    """Only Linear plugin behaviour, existing test modules and prose may defer real-Agent legs.
+
+    A test module or plugin file added (or renamed/deleted) by the change is not yet proven and
+    stays gated, as does every plugin file outside FAST_LANE_FILES and everything else
+    (image inputs, the agent pin, workflows, the selector, runners, helpers, other code).
+    """
+    available = set(inventory()) - set(added)
+    def plugin(p):
+        # Only an allowlisted file that already existed and still exists.
+        return p in FAST_LANE_FILES and p not in added and (ROOT / p).is_file()
+    def prose(p):
+        return p.endswith('.md') and not is_runtime_input(p)
+    return bool(paths) and any(plugin(p) for p in paths) and all(
+        plugin(p) or p in available or prose(p) for p in paths)
+
+
+def deferrable_lanes(paths, lanes, added=()):
+    """Lanes a fast-lane PR skips: those selected only by the component, not by a touched test."""
+    if not fast_lane_eligible(paths, added):
+        return []
+    touched = _lanes_for(p for p in paths if p in set(inventory()))
+    return sorted(lane for lane in LANES if lanes[lane] and not touched[lane])
+
+
+def changed_paths(repo, event, base, head, added=None):
+    """None means uncertain. Renames and copies route by both paths, deletes by the old path.
+
+    `added` (a set) collects paths that did not exist at base: additions and rename/copy targets.
+    """
     if event not in ('push', 'pull_request'):
         return None
     if not all(re.fullmatch(r'[0-9a-f]{40}', value or '') and value != '0' * 40 for value in (base, head)):
@@ -160,6 +205,8 @@ def changed_paths(repo, event, base, head):
             names = [fields.pop(0) for _ in range(width)]
             if not all(names):
                 return None
+            if added is not None and status[:1] in ('A', 'R', 'C'):
+                added.add(names[-1])
             paths.extend(names)
         return paths
     except (OSError, UnicodeError, subprocess.CalledProcessError):
@@ -183,62 +230,141 @@ def gate(plan, needs):
 
 
 WORKFLOW_PATH = '.github/workflows/ci.yml'
+PROOF_TITLE = 'source-ci-reuse-proof'
+PROOF_PATH = 'scripts/source-ci.py'
+SHA_RE = r'[0-9a-f]{40}'
+POSITIVE_ID = r'[1-9][0-9]*'
+GITHUB_TIMESTAMP = '%Y-%m-%dT%H:%M:%SZ'
+
+
+def source_proof(plan, *, repository, pr, base, head, tested, tree, run_id, attempt):
+    coverage = {key: plan[key] for key in ('tests', 'runtime', *LANES)}
+    encoded = json.dumps(coverage, separators=(',', ':')).encode()
+    return {'version': 1, 'repository': repository, 'pr': pr, 'base': base, 'head': head,
+            'tested': tested, 'tree': tree, 'run_id': run_id, 'attempt': attempt,
+            'coverage': hashlib.sha256(encoded).hexdigest()}
+
+
+def emit_pr_proof(plan):
+    """Record what this successful source-checks job proved for a same-repository PR to main."""
+    if os.environ.get('GITHUB_EVENT_NAME') != 'pull_request' or plan.get('reused_from'):
+        return
+    try:
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+        pr = event['pull_request']
+        repository = os.environ['GITHUB_REPOSITORY']
+        if pr['base']['ref'] != 'main' or any(pr[side]['repo']['full_name'] != repository
+                                             for side in ('base', 'head')):
+            return
+        number = str(pr['number'])
+        run_id = os.environ['GITHUB_RUN_ID']
+        attempt = os.environ['GITHUB_RUN_ATTEMPT']
+        base, head = (pr[side]['sha'] for side in ('base', 'head'))
+        tested, tree, parents = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'show', '-s', '--format=%H%n%T%n%P', 'HEAD'],
+            text=True, stderr=subprocess.PIPE, timeout=10,
+        ).splitlines()
+        if (tested != os.environ['GITHUB_SHA'] or parents.split() != [base, head]
+                or not all(re.fullmatch(SHA_RE, sha) for sha in (tested, tree, base, head))
+                or not all(re.fullmatch(POSITIVE_ID, value) for value in (number, run_id, attempt))):
+            return
+        proof = source_proof(plan, repository=repository, pr=number, base=base, head=head,
+                             tested=tested, tree=tree, run_id=run_id, attempt=attempt)
+        print(f'::notice file={PROOF_PATH},line=1,title={PROOF_TITLE}::' + json.dumps(proof, separators=(',', ':')))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f'reuse: could not record PR source proof ({type(exc).__name__})', file=sys.stderr)
 
 
 def gh_api(path):
-    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
+    # Leave time within the selection job for the normal plan after a slow lookup.
+    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=20))
 
 
-def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
+def complete_action_page(response, field):
+    items = response[field]
+    count = response['total_count']
+    if not isinstance(items, list) or len(items) >= 100 or type(count) is not int or count != len(items):
+        raise ValueError(f'incomplete GitHub Actions {field} page')
+    return items
+
+
+def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
     """URL of a green PR CI run that already proved this push's exact tree, else None.
 
-    All three must hold: tree(sha) == tree(pr.head); `before` is an ancestor of (or equal
-    to) pr.head, so the PR was current with main; and the newest CI pull_request run for
-    pr.head concluded success with its `source-checks` aggregate green. Any doubt or API
-    error answers None, which runs the normal selection.
+    The newest run must have a successful source-checks job. Its proof must identify
+    the merged PR and show that it tested this tree with the same selection against
+    the exact pre-push base. Missing or uncertain evidence runs the normal selection.
     """
-    sha_re = r'[0-9a-f]{40}'
-    if not all(re.fullmatch(sha_re, v or '') and v != '0' * 40 for v in (sha, before)):
+    if not all(re.fullmatch(SHA_RE, v or '') and v != '0' * 40 for v in (sha, before)):
         log('reuse: no exact before/after range')
         return None
     try:
-        merged = [pr for pr in api(f'repos/{repository}/commits/{sha}/pulls')
-                  if pr.get('merged_at') and pr.get('merge_commit_sha') == sha
-                  and (pr.get('base') or {}).get('ref') == 'main']
+        candidates = api(f'repos/{repository}/commits/{sha}/pulls?per_page=100')
+        if not isinstance(candidates, list) or len(candidates) >= 100:
+            log(f'reuse: cannot read every PR of {sha} in one page')
+            return None
+        merged = [pr for pr in candidates
+                  if pr['merged_at'] and pr['merge_commit_sha'] == sha and pr['base']['ref'] == 'main']
         if len(merged) != 1:
             log(f'reuse: {len(merged)} merged PRs for {sha}')
             return None
         pr = merged[0]
-        head = (pr.get('head') or {}).get('sha') or ''
-        if not re.fullmatch(sha_re, head):
+        if any(pr[side]['repo']['full_name'] != repository for side in ('base', 'head')):
+            log(f'reuse: PR #{pr["number"]} does not have both branches in {repository}')
+            return None
+        head = pr['head']['sha']
+        if not re.fullmatch(SHA_RE, head):
             return None
         trees = [api(f'repos/{repository}/git/commits/{c}')['tree']['sha'] for c in (sha, head)]
-        if trees[0] != trees[1]:
+        if not re.fullmatch(SHA_RE, trees[0]) or trees[0] != trees[1]:
             log(f'reuse: tree of {sha} differs from PR #{pr["number"]} head {head}')
             return None
         status = api(f'repos/{repository}/compare/{before}...{head}').get('status')
         if status not in ('ahead', 'identical'):
             log(f'reuse: {before} is not an ancestor of PR head {head} ({status})')
             return None
-        # Only this repository's branch for this PR: never a fork run, nor another PR that shares
-        # the head commit against a different base.
-        sharing = [p for p in api(f'repos/{repository}/commits/{head}/pulls') if (p.get('head') or {}).get('sha') == head]
-        if [p.get('number') for p in sharing] != [pr['number']]:
-            log(f'reuse: head {head} is not unique to PR #{pr["number"]}')
-            return None
         branch = (pr.get('head') or {}).get('ref')
-        runs = [r for r in api(f'repos/{repository}/actions/workflows/ci.yml/runs'
-                               f'?event=pull_request&head_sha={head}&per_page=100')['workflow_runs']
-                if r.get('head_sha') == head and r.get('path') == WORKFLOW_PATH
-                and r.get('event') == 'pull_request' and branch and r.get('head_branch') == branch
-                and (r.get('head_repository') or {}).get('full_name') == repository]
+        if not isinstance(branch, str) or not branch:
+            return None
+        run_page = api(f'repos/{repository}/actions/workflows/ci.yml/runs'
+                       f'?event=pull_request&head_sha={head}&per_page=100')
+        runs = []
+        # A run with missing identity may be newer than the one we would otherwise reuse.
+        for candidate in complete_action_page(run_page, 'workflow_runs'):
+            head_repository = candidate['head_repository']['full_name']
+            if (candidate['repository']['full_name'] != repository
+                    or not re.fullmatch(SHA_RE, candidate['head_sha'])
+                    or not all(isinstance(value, str) and value for value in
+                               (head_repository, candidate['path'], candidate['event'], candidate['head_branch']))):
+                raise ValueError('incomplete GitHub Actions workflow run identity')
+            if (candidate['head_sha'] == head and candidate['path'] == WORKFLOW_PATH
+                    and candidate['event'] == 'pull_request' and candidate['head_branch'] == branch
+                    and head_repository == repository):
+                runs.append(candidate)
         if not runs:
             log(f'reuse: no PR CI run for {head}')
             return None
-        run = max(runs, key=lambda r: (str(r.get('created_at', '')), int(r.get('id', 0))))
+        run = max(runs, key=lambda r: (datetime.strptime(r['created_at'], GITHUB_TIMESTAMP), int(r['id'])))
         if run.get('status') != 'completed' or run.get('conclusion') != 'success':
             log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
             return None
+        # GitHub may clear run associations after merge. If so, the branch must have exactly
+        # one PR across every state, including closed PRs against other bases.
+        associated = run.get('pull_requests')
+        if not isinstance(associated, list):
+            log(f'reuse: PR association missing for {run.get("html_url")}')
+            return None
+        if associated:
+            if len(associated) != 1 or associated[0].get('number') != pr['number'] or (
+                    (associated[0].get('base') or {}).get('ref') != 'main'):
+                log(f'reuse: {run.get("html_url")} does not name only PR #{pr["number"]} against main')
+                return None
+        else:
+            branch_label = quote(f'{repository.split("/", 1)[0]}:{branch}', safe=':')
+            listed = api(f'repos/{repository}/pulls?state=all&head={branch_label}&per_page=100')
+            if not isinstance(listed, list) or [p.get('number') for p in listed] != [pr['number']]:
+                log(f'reuse: branch {branch} is not unique to PR #{pr["number"]}')
+                return None
         # The run must have tested this PR against main, not a stacked parent branch the PR was
         # later retargeted from (GitHub clears run.pull_requests once a PR merges, so read the
         # PR's own retarget events). Any retarget at or after the run's creation: no reuse.
@@ -246,26 +372,67 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if not isinstance(events, list) or len(events) >= 100:
             log(f'reuse: cannot read every event of PR #{pr["number"]}')
             return None
-        retargets = [str(e.get('created_at', '')) for e in events if e.get('event') == 'base_ref_changed']
-        if any(when >= str(run.get('created_at', '')) for when in retargets):
+        started_at = datetime.strptime(run['created_at'], GITHUB_TIMESTAMP)
+        if any(datetime.strptime(e['created_at'], GITHUB_TIMESTAMP) >= started_at
+               for e in events if e['event'] == 'base_ref_changed'):
             log(f'reuse: PR #{pr["number"]} was retargeted after {run.get("html_url")} started')
             return None
-        jobs = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')['jobs']
-        aggregate = [j for j in jobs if j.get('name') == 'source-checks']
-        if len(aggregate) != 1 or aggregate[0].get('conclusion') != 'success':
+        run_id, attempt = run['id'], run['run_attempt']
+        if not all(type(value) is int and value > 0 for value in (run_id, attempt)):
+            log('reuse: missing a valid run or attempt ID')
+            return None
+        job_page = api(f'repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')
+        jobs = complete_action_page(job_page, 'jobs')
+        aggregate = [j for j in jobs if j['name'] == 'source-checks']
+        if (len(aggregate) != 1 or aggregate[0].get('status') != 'completed'
+                or aggregate[0].get('conclusion') != 'success'):
             log(f'reuse: source-checks of {run.get("html_url")} is not a single success')
+            return None
+        job = aggregate[0]
+        check_id = job['id']
+        api_repo = f'{os.environ.get("GITHUB_API_URL", "https://api.github.com")}/repos/{repository}'
+        if (type(check_id) is not int or check_id <= 0
+                or type(job['run_id']) is not int or job['run_id'] != run_id
+                or type(job['run_attempt']) is not int or job['run_attempt'] != attempt
+                or job['head_sha'] != head
+                or job['run_url'] != f'{api_repo}/actions/runs/{run_id}'
+                or job['check_run_url'] != f'{api_repo}/check-runs/{check_id}'):
+            log('reuse: source-checks job does not match the PR run and attempt')
+            return None
+        annotations = api(f'repos/{repository}/check-runs/{check_id}/annotations?per_page=100')
+        if not isinstance(annotations, list) or len(annotations) >= 100:
+            log(f'reuse: cannot read every source-checks annotation of {run.get("html_url")}')
+            return None
+        proofs = [note for note in annotations if note.get('title') == PROOF_TITLE]
+        if len(proofs) != 1 or proofs[0].get('annotation_level') != 'notice' or proofs[0].get('path') != PROOF_PATH:
+            log(f'reuse: no single source proof for {run.get("html_url")}')
+            return None
+        message = proofs[0]['message']
+        if not isinstance(message, str) or len(message) > 1024:
+            log(f'reuse: invalid source proof in {run.get("html_url")}')
+            return None
+        proof = json.loads(message)
+        tested = proof['tested']
+        expected = source_proof(plan, repository=repository, pr=str(pr['number']), base=before, head=head,
+                                tested=tested, tree=trees[0], run_id=str(run_id), attempt=str(attempt))
+        if not re.fullmatch(SHA_RE, tested) or proof != expected:
+            log(f'reuse: source proof does not cover this push in {run.get("html_url")}')
+            return None
+        merge = api(f'repos/{repository}/git/commits/{tested}')
+        if (merge['sha'] != tested or merge['tree']['sha'] != trees[0]
+                or [parent['sha'] for parent in merge['parents']] != [before, head]):
+            log(f'reuse: tested merge commit {tested} does not match this push and PR')
             return None
         log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
         return run.get('html_url') or str(run['id'])
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired) as exc:
+    except Exception as exc:  # Any surprise in an optimisation must fall back, never fail selection.
         log(f'reuse: lookup failed ({type(exc).__name__}); running the normal selection')
         return None
 
 
 def reused_plan(url):
     return {'tests': [], **{lane: False for lane in LANES}, 'runtime': False, 'full': False,
-            'units_full': False, 'runtime_full': False, 'reused_from': url,
+            'units_full': False, 'runtime_full': False, 'deferred_on_pr': [], 'reused_from': url,
             'reason': 'reused: identical tree already green in ' + url}
 
 
@@ -293,6 +460,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     choose = sub.add_parser('select')
     choose.add_argument('--files', nargs='*', default=None, help='explicit paths for local routing proof')
+    choose.add_argument('--added', nargs='*', default=[], help='with --files: which of them are new files')
     choose.add_argument('--event', default='push')
     choose.add_argument('--base', default='')
     choose.add_argument('--head', default='')
@@ -305,16 +473,19 @@ def main():
         runner.add_argument('--plan', required=True)
         if command == 'gate':
             runner.add_argument('--needs', required=True)
+            runner.add_argument('--record-pr-proof', action='store_true')
     args = parser.parse_args()
     if args.command == 'select':
-        paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head)
-        reuse = None
-        if args.event == 'push' and args.reuse_repository and args.files is None:
-            reuse = find_reuse(args.reuse_repository, args.head, args.base)
-        if reuse is not None:
-            plan = reused_plan(reuse)
-        else:
-            plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'))
+        added = set(args.added)
+        paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head, added)
+        plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'),
+                      event=args.event, added=added)
+        # A fast-lane PR deferred legs to this push, so its run cannot stand in for it.
+        if (args.event == 'push' and args.reuse_repository and args.files is None and paths is not None
+                and not plan['deferred_on_pr']):
+            reuse = find_reuse(args.reuse_repository, args.head, args.base, plan)
+            if reuse is not None:
+                plan = reused_plan(reuse)
         encoded = json.dumps(plan, separators=(',', ':'))
         print(encoded)
         if args.github_output:
@@ -329,6 +500,8 @@ def main():
         return run_units(plan)
     passed = gate(plan, json.loads(args.needs))
     print('Source CI aggregate: ' + ('PASS' if passed else 'FAIL'))
+    if passed and args.record_pr_proof:
+        emit_pr_proof(plan)
     return 0 if passed else 1
 
 

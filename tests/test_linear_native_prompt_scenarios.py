@@ -720,6 +720,15 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         key = self.session_key(await self.start_turn())
         waiter = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
         await self.until_posted(1)
+        # The transport sees the card before the outbox records it as sent; withdraw only after
+        # that, so retirement takes its sent-card path rather than the unknown-create readback.
+        def card_sent():
+            with self.bridge.store._tx() as db:
+                return db.execute("SELECT count(*) FROM outbox WHERE state='sent' AND "
+                                  "json_extract(payload,'$.native_prompt.kind')='clarify'").fetchone()[0] == 1
+        async with asyncio.timeout(10):
+            while not card_sent():
+                await asyncio.sleep(0.01)
         self.assertEqual(clarify.clear_session(key), 1)
         self.assertFalse((await self.answer_later(key, waiter, clarify.clear_session))[1])
         await self.until_posted(2)

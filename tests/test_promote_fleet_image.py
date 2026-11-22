@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -189,6 +192,34 @@ class PruneTests(unittest.TestCase):
     def version(vid: int, tags: list, updated: str) -> dict:
         return {"id": vid, "updated_at": updated, "metadata": {"container": {"tags": tags}}}
 
+    def test_cli_keeps_string_rows_serialized_through_the_gh_wrapper(self) -> None:
+        old = "2000-01-01T00:00:00Z"
+        rows = [
+            self.version(1, ["fleet-pr-stage-1-1"], old),
+            "malformed\u2028row",
+            json.dumps(self.version(99, ["fleet-pr-stage-99-1"], old)),
+            self.version(2, ["fleet-pr-stage-2-1"], old),
+        ]
+        base = "orgs/switchroom/packages/container/switchroom/versions"
+        delete_paths = []
+
+        def gh(args, **_kwargs):
+            if args[:3] == ["gh", "api", "--paginate"]:
+                self.assertEqual(args, ["gh", "api", "--paginate", f"{base}?per_page=100",
+                                        "--jq", ".[] | @json"])
+                # gh prints each @json string raw, with one newline as the row separator.
+                stdout = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+                return subprocess.CompletedProcess(args, 0, stdout, "")
+            self.assertEqual(args[:4], ["gh", "api", "--method", "DELETE"])
+            delete_paths.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        argv = [str(SCRIPT), "prune", "--org", "switchroom", "--package", "switchroom"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(subprocess, "run", side_effect=gh), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(promote.main(), 0)
+        self.assertEqual(delete_paths, [f"{base}/1", f"{base}/2"])
+
     def test_only_expired_stage_only_versions_are_deleted(self) -> None:
         old, new = "2026-11-10T00:00:00Z", "2026-11-20T00:00:00Z"
         versions = [
@@ -209,8 +240,71 @@ class PruneTests(unittest.TestCase):
         base = "orgs/switchroom/packages/container/switchroom/versions"
         self.assertEqual(deleted, [f"{base}/1", f"{base}/2"])
 
+    def test_one_failed_delete_logs_and_the_prune_continues(self) -> None:
+        import contextlib, io
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(1, 4)]
+        base = "orgs/switchroom/packages/container/switchroom/versions"
+        deleted: list[str] = []
+        def delete(path: str) -> None:
+            if path.endswith("/2"):
+                raise promote.Refused("gh api --method DELETE exited 1: HTTP 403")
+            deleted.append(path)
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(promote.prune(args, api_lines=lambda _path: versions, delete=delete, now=NOW), 2)
+        self.assertEqual(deleted, [f"{base}/1", f"{base}/3"])
+        self.assertIn("::warning title=Prune delete failed::version 2", out.getvalue())
+        self.assertIn("pruned 2 stage-only version(s); 1 delete(s) failed", out.getvalue())
+
+    def test_prune_fails_only_when_every_delete_fails(self) -> None:
+        import contextlib, io
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(1, 3)]
+        def delete(path: str) -> None:
+            raise OSError("network down")
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(promote.Refused):
+            promote.prune(args, api_lines=lambda _path: versions, delete=delete, now=NOW)
+
+    def test_prune_continues_without_deleting_versions_with_missing_or_malformed_ids(self) -> None:
+        import contextlib, io
+        old = "2026-11-01T00:00:00Z"
+        missing = self.version(1, ["fleet-pr-stage-1-1"], old)
+        del missing["id"]
+        malformed = dict(self.version(2, ["fleet-pr-stage-2-1"], old), id=1.5)
+        valid = self.version(3, ["fleet-pr-stage-3-1"], old)
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=1, dry_run=False)
+        deleted = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(promote.prune(args, api_lines=lambda _: [missing, malformed, valid],
+                                           delete=deleted.append, now=NOW), 1)
+        self.assertEqual(deleted, ["orgs/switchroom/packages/container/switchroom/versions/3"])
+        self.assertEqual(out.getvalue().count("expected a positive integer version ID"), 2)
+
+    def test_malformed_version_metadata_and_timestamps_do_not_block_later_deletions(self) -> None:
+        import contextlib, io
+        old = "2026-11-01T00:00:00Z"
+        missing = self.version(1, ["fleet-pr-stage-1-1"], old)
+        del missing["updated_at"]
+        versions = [
+            missing,
+            self.version(2, ["fleet-pr-stage-2-1"], "not a timestamp"),
+            self.version(3, ["fleet-pr-stage-3-1"], "2026-11-01T00:00:00"),
+            dict(self.version(4, ["fleet-pr-stage-4-1"], old), metadata="bad metadata"),
+            dict(self.version(5, ["fleet-pr-stage-5-1"], old), metadata={"container": ["bad container"]}),
+            self.version(6, ["fleet-pr-stage-6-1"], old),
+        ]
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=1, dry_run=False)
+        deleted = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(promote.prune(args, api_lines=lambda _: versions, delete=deleted.append, now=NOW), 1)
+        self.assertEqual(deleted, ["orgs/switchroom/packages/container/switchroom/versions/6"])
+        self.assertEqual(out.getvalue().count("has an invalid updated_at"), 3)
+
     def test_dry_run_and_cap(self) -> None:
-        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(5)]
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(1, 6)]
         deleted: list[str] = []
         args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=3, dry_run=True)
         self.assertEqual(promote.prune(args, api_lines=lambda _path: versions, delete=deleted.append, now=NOW), 3)

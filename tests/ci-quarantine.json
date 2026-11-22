@@ -1,0 +1,9 @@
+{
+  "_comment": "Known real-Agent flakes retried once by scripts/run-linear-scenarios.py with a ::warning:: annotation. Remove an entry in the PR that fixes it; an empty list is the goal. Never add a test to make a real failure green.",
+  "tests": [
+    {
+      "id": "test_linear_native_work_journey.NativeWorkJourneyTests.test_operator_handoff_waits_for_old_worker_exit_and_executes_only_remainder",
+      "tracking": "CI speed review SR-5 (b): `kanban block` intermittently refused with managed_worker_lost while the old worker waits at the model boundary; 3 hits 11-17..11-21 (44955734205, 44888814681, 44698958150); not reproduced locally in 8 runs"
+    }
+  ]
+}
