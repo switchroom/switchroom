@@ -17,8 +17,11 @@ Chromium `browser_exec` stays installed as the backup and for CDP-only work (`cd
 
 The downstream patch (`release/camofox-browser/official-camoufox.patch`) moves camofox-browser from
 `camoufox-js` (which stops at beta.31) to the maintainers' official `camoufox@0.5.9` npm package and
-the browser it is stamped with. It is the same change offered upstream; drop it when camofox-browser
-ships it. There is no repository fork.
+the browser it is stamped with. The same change lives on the `official-camoufox` branch of the fork
+[mekenthompson/camofox-browser](https://github.com/mekenthompson/camofox-browser) and is offered
+upstream as [jo-inc/camofox-browser#15715](https://github.com/jo-inc/camofox-browser/pull/15715).
+The image installs the published npm release plus this patch, not the fork. Once a camofox-browser
+release includes the change, the patch and the Dockerfile steps that apply it go away.
 
 Debian packages (the desktop, Chromium, fonts, runtime libraries) are not version-pinned: they come
 from the digest-pinned parent's Debian release and are covered by the image scans, like the rest of
@@ -107,8 +110,12 @@ Measured on a live agent after the first rollout:
 - The fingerprint (screen size, canvas, WebGL renderer) is regenerated on every browser launch,
   so a site sees a different device after each Bot Desktop restart; cookies persist. The window is
   also a few pixels wider than the reported screen under the Xfce frame.
-- `navigator.language` stays `en-US` while `Intl` follows the container locale (`en_AU.UTF-8`) and
-  time zone, an incoherence some bot checks look at.
+- `navigator.language` stayed `en-US` while `Intl` followed the container locale (`en_AU.UTF-8`)
+  and time zone, an incoherence some bot checks look at. Since then `service-run` sets the
+  browser's language and time zone together, `CAMOFOX_LOCALE` (default `en-AU`) and
+  `CAMOFOX_TIMEZONE` (default `Australia/Melbourne`), so the two should agree; that is not yet
+  re-measured on a live agent. They do not follow the container's `LANG` or `TZ`: for a deployment
+  elsewhere set both in the agent's environment, to match where its traffic exits.
 - Typing through `browser_type` fills fields at once; only cursor movement is humanised (a click
   moves the pointer along a curved path for about half a second).
 - An interactive Cloudflare Turnstile widget waits at "Verify you are human"; that is the human's

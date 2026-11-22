@@ -105,6 +105,9 @@ export CAMOFOX_UPLOADS_DIR="$state/uploads" CAMOFOX_TRACES_DIR="$state/traces"
 export CAMOFOX_CRASH_REPORT_ENABLED=false SENTRY_DSN= PROMETHEUS_ENABLED=false
 export CAMOFOX_DISABLE_DEFAULT_ADDONS=${CAMOFOX_DISABLE_DEFAULT_ADDONS:-1}
 export CAMOFOX_OS=${CAMOFOX_OS:-linux}
+# One browser identity: without these the browser reports navigator.language en-US while Intl follows
+# the container locale. camofox-browser refuses one without the other, so both always get a value.
+export CAMOFOX_LOCALE=${CAMOFOX_LOCALE:-en-AU} CAMOFOX_TIMEZONE=${CAMOFOX_TIMEZONE:-Australia/Melbourne}
 # A human shares these windows: never expire a session on idleness, keep a quiet tab for 8 h
 # (0 is not "off" for TAB_INACTIVITY_MS), and let the browser use more memory before a restart.
 export SESSION_TIMEOUT_MS=${SESSION_TIMEOUT_MS:-0}

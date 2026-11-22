@@ -129,6 +129,7 @@ class ImageTests(unittest.TestCase):
             "export CAMOFOX_INTERACTIVE=desktop",
             "export CAMOFOX_CRASH_REPORT_ENABLED=false SENTRY_DSN= PROMETHEUS_ENABLED=false",
             "CAMOFOX_DISABLE_DEFAULT_ADDONS=${CAMOFOX_DISABLE_DEFAULT_ADDONS:-1}",
+            "export CAMOFOX_LOCALE=${CAMOFOX_LOCALE:-en-AU} CAMOFOX_TIMEZONE=${CAMOFOX_TIMEZONE:-Australia/Melbourne}",
             'state=${CAMOFOX_STATE_DIR:-$home_dir/camofox-browser}',
             'export CAMOFOX_PROFILE_DIR="$state/profiles"',
             "SESSION_TIMEOUT_MS=${SESSION_TIMEOUT_MS:-0}",
@@ -212,6 +213,20 @@ class ServiceRunKeyTests(unittest.TestCase):
         self.assertEqual(env["CAMOFOX_INTERACTIVE"], "desktop")
         self.assertEqual(self.run_service(self.home)["CAMOFOX_ACCESS_KEY"], env["CAMOFOX_ACCESS_KEY"])
         self.assertEqual(sorted(p.name for p in (self.home / "camofox-browser").glob(".access-key.*")), [])
+
+    def test_locale_and_time_zone_are_always_exported_together(self):
+        # camofox-browser (lib/config.js directBrowserIdentity) refuses one without the other;
+        # with both, navigator.language matches Intl instead of staying en-US.
+        env = self.run_service(self.home)
+        self.assertEqual((env["CAMOFOX_LOCALE"], env["CAMOFOX_TIMEZONE"]), ("en-AU", "Australia/Melbourne"))
+        for extra in ({"CAMOFOX_LOCALE": "en-GB"}, {"CAMOFOX_TIMEZONE": "Europe/London"},
+                      {"CAMOFOX_LOCALE": "", "CAMOFOX_TIMEZONE": ""}):
+            with self.subTest(extra=extra):
+                env = self.run_service(self.home, **extra)
+                self.assertTrue(env["CAMOFOX_LOCALE"] and env["CAMOFOX_TIMEZONE"])
+                for name, value in extra.items():
+                    if value:
+                        self.assertEqual(env[name], value)
 
     def test_an_empty_key_left_by_a_crash_is_replaced(self):
         state = self.home / "camofox-browser"

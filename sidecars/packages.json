@@ -3,27 +3,6 @@
   "source_repository": "https://github.com/switchroom/switchroom",
   "require_digest_pin": true,
   "packages": {
-    "rest-lock-proxy": {
-      "image": "ghcr.io/switchroom/rest-lock-proxy",
-      "context": "sidecars/rest-lock-proxy",
-      "visibility": "public",
-      "require_digest_pin": true,
-      "status": "publishing"
-    },
-    "tcp-proxy": {
-      "image": "ghcr.io/switchroom/tcp-proxy",
-      "context": "sidecars/tcp-proxy",
-      "visibility": "public",
-      "require_digest_pin": true,
-      "status": "publishing"
-    },
-    "browser-broker": {
-      "image": "ghcr.io/switchroom/browser-broker",
-      "context": "sidecars/browser-broker",
-      "visibility": "public",
-      "require_digest_pin": true,
-      "status": "publishing"
-    },
     "kokoro": {
       "image": "ghcr.io/switchroom/kokoro",
       "context": "sidecars/kokoro",
