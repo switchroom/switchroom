@@ -1,13 +1,14 @@
 """Work the open-PR respawn guard parks after a restart (HF-628).
 
-Core's dispatcher parks a ready card whose comments name a GitHub PR from the
-last 24 h: status ``blocked`` with a ``blocked`` event ``{kind: needs_input,
+Older Core dispatchers park a ready card whose comments name a GitHub PR from
+the last 24 h: status ``blocked`` with a ``blocked`` event ``{kind: needs_input,
 source: respawn_guard}``. Nothing is needed from a person, so Linear shows In
 Review, not Blocked, and once the PR merges or closes the plugin lets the card
 run with one guarded unblock of exactly that park. Real pinned Core tasks, the
 plugin Store and the HTTP fake Linear run the current entrypoints; a fake
 ``gh`` answers at the subprocess boundary.
 """
+import inspect
 import json
 import os
 import subprocess
@@ -27,7 +28,7 @@ PARKED = ("Paused after a restart while PR #7 is open. It resumes by itself when
 
 
 def core_guard_wait():
-    """Core's open-PR park module, or None on a Core that predates it (the rows are then written as it would)."""
+    """Core's respawn guard module, if available."""
     try:
         from hermes_cli import kanban_db_guard_wait
     except ImportError:
@@ -108,12 +109,12 @@ class PrParkScenarios(unittest.TestCase):
         return task
 
     def park(self, task):
-        """What core's dispatcher does to that ready card while the PR comment is fresh."""
+        """Create the legacy park state Linear can encounter after an upgrade."""
         guard_wait = core_guard_wait()
         with self.board.conn() as db:
-            if guard_wait:
+            if guard_wait and "lane" in inspect.signature(guard_wait.record_respawn_guard).parameters:
                 guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
-            else:  # An older Core (CI's companion candidate) has no park: write the rows it writes.
+            else:  # Seed the rows an earlier Core would have left in the board database.
                 with self.board.kb.write_txn(db):
                     db.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task,))
                     self.board.kb._append_event(db, task, "blocked", {
