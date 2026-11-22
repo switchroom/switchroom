@@ -305,8 +305,8 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
         adapter = _adapter(home, bound["board"], native_profile)
         if not getattr(adapter, "guarded_controls", False):
             return _refuse("controls_unsupported", owner)
-        from gateway import session_ancillary
-        if getattr(session_ancillary, "process_stop_pending", None) is None:
+        from .origin_state import stop_checkpoint_reader
+        if stop_checkpoint_reader() is None:
             return _refuse("controls_unsupported", owner)
         task = adapter.require_task(bound["task_id"])
         try:
@@ -464,10 +464,10 @@ async def _resolve_unknown(home: Path, row: dict) -> None:
 def _resolve_lost_attempt(home: Path, adapter, bound: dict, task_id: str, stop_id: int, to: str) -> bool | None:
     """Ask core to settle our stopped attempt's ``unknown`` row: True when it was asked and
     answered, False when it was asked and refused (or unreachable), None when nothing was asked
-    (no such row yet, e.g. still ``started``, or unreadable evidence). Never raises. Core re-runs
-    its process-stop cleanup first and refuses (``process_stop_unknown``) when owned processes
-    can't be proven gone; then the row stays
-    ``unknown``, the proof keeps holding and the work stays paused. The proof, not this answer,
+    (no such row yet, e.g. still ``started``, or unreadable evidence). Never raises. A core with
+    the durable process-Stop fence re-runs its cleanup first and refuses (``process_stop_unknown``)
+    when owned processes can't be proven gone, leaving the row ``unknown``; a native-Stop core
+    settles the row, and the scoped process checkpoint below keeps the proof holding instead. The proof, not this answer,
     decides the handover: it still checks worker processes, the executor row, lineage, the Stop
     checkpoint and the scoped process checkpoint."""
     import asyncio
