@@ -13,8 +13,6 @@ import re
 import subprocess
 import sys
 import unittest
-import zipfile
-import io
 
 ROOT = Path(__file__).resolve().parents[1]
 LANES = ('linear', 'acp', 'origin', 'input', 'journey')
@@ -98,7 +96,6 @@ FLEET_WORKFLOW = 'fleet-integration.yml'
 FLEET_WORKFLOW_PATH = '.github/workflows/' + FLEET_WORKFLOW
 FLEET_PASS_JOB = 'Fleet integration pass'
 FLEET_ARTIFACT = 'fleet-integration-result'
-FLEET_RESULT_FILE = 'fleet-integration.json'
 FLEET_SCHEMA = 'fleet-integration/v1'
 
 
@@ -265,10 +262,6 @@ def gh_api(path):
     return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
 
 
-def gh_api_bytes(path):
-    return subprocess.check_output(['gh', 'api', path], stderr=subprocess.PIPE, timeout=60)
-
-
 def git_out(repo, *args):
     return subprocess.check_output(['git', '-C', str(repo), *args], text=True, stderr=subprocess.PIPE, timeout=60).strip()
 
@@ -354,14 +347,15 @@ def is_pin_only(paths):
 
 
 def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSITORY, api=gh_api,
-                   download=gh_api_bytes, git=git_out, log=lambda m: print(m, file=sys.stderr)):
+                   git=git_out, log=lambda m: print(m, file=sys.stderr)):
     """URL of the Agent repository's green fleet-integration run that already proved this pin PR.
 
     `base` is the PR base commit and `tested` the merge commit CI checked out. Every one must hold:
     tested differs from base only in pin files; the newest fleet-integration run (that workflow
     file, push event, main branch of the Agent repository itself, newest attempt) for exactly the
     pinned revision completed green with its aggregate and every RUNTIME_LEGS leg job green; its
-    one result artifact names that run, that revision, this repository, and every leg a success;
+    one result record (a notice annotation on the aggregate's check run, mirroring the
+    `fleet-integration-result` artifact) names that run, that revision, this repository, and every leg a success;
     and the switchroom commit it ran is in this history with the recorded tree, and that tree is
     the base tree, or an ancestor of base whose diff to base selects no real-Agent leg at all.
     Any doubt or API error answers None, which runs the full matrix.
@@ -401,16 +395,18 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
             if len(found) != 1 or found[0].get('conclusion') != 'success':
                 log(f'pin reuse: job {name!r} of {url} is not a single success')
                 return None
-        artifacts = [a for a in api(f'repos/{agent_repository}/actions/runs/{run_id}/artifacts?per_page=100')['artifacts']
-                     if a.get('name') == FLEET_ARTIFACT]
-        if len(artifacts) != 1 or artifacts[0].get('expired') or int(artifacts[0].get('size_in_bytes', 0)) > 65536:
-            log(f'pin reuse: {url} has no single unexpired result artifact')
+        # The pass job also publishes its result record as one notice annotation on its own check
+        # run. Annotations of a public repository read with any token; another repository's
+        # artifact downloads do not accept this repository's workflow token.
+        passing = [j for j in jobs if j.get('name') == FLEET_PASS_JOB][0]
+        notes = [n for n in api(f'repos/{agent_repository}/check-runs/{int(passing["id"])}/annotations?per_page=100')
+                 if n.get('title') == FLEET_ARTIFACT]
+        if len(notes) != 1 or notes[0].get('annotation_level') != 'notice' or len(str(notes[0].get('message', ''))) > 65536:
+            log(f'pin reuse: {url} has no single result record')
             return None
-        archive = download(f'repos/{agent_repository}/actions/artifacts/{int(artifacts[0]["id"])}/zip')
-        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-            if bundle.getinfo(FLEET_RESULT_FILE).file_size > 65536:
-                raise ValueError('oversized fleet result')
-            result = json.loads(bundle.read(FLEET_RESULT_FILE))
+        result = json.loads(notes[0]['message'])
+        if not isinstance(result, dict):
+            raise ValueError('fleet result is not an object')
         legs = {leg_name(*leg): 'success' for leg in RUNTIME_LEGS}
         expected = {'schema': FLEET_SCHEMA, 'result': 'success', 'event': 'push', 'ref': 'refs/heads/main',
                     'agent_repository': agent_repository, 'agent_commit': revision, 'run_id': run_id,
@@ -442,7 +438,7 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
             log(f'pin reuse: switchroom moved since {commit} only in non-runtime paths {since}')
         log(f'pin reuse: Agent {revision} with switchroom tree {tree} already proved by {url}')
         return url or str(run_id)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, zipfile.BadZipFile,
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError,
             subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         log(f'pin reuse: lookup failed ({type(exc).__name__}); running the full matrix')
         return None

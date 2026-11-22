@@ -571,39 +571,39 @@ class PinReuseTests(unittest.TestCase):
         r.update(override)
         return r
 
+    NOTES = 'repos/switchroom/hermes-agent/check-runs/900/annotations?per_page=100'
+
+    def note(self, result=None, **override):
+        n = {'title': 'fleet-integration-result', 'annotation_level': 'notice',
+             'message': json.dumps(self.result() if result is None else result)}
+        n.update(override)
+        return n
+
     def responses(self, **override):
-        jobs = [{'name': 'Fleet integration pass', 'conclusion': 'success'}] + [
+        jobs = [{'name': 'Fleet integration pass', 'conclusion': 'success', 'id': 900}] + [
             {'name': f'fleet leg ({self.module.leg_name(*leg)})', 'conclusion': 'success'} for leg in self.module.RUNTIME_LEGS]
         r = {
             f'repos/{self.AGENT}/actions/workflows/fleet-integration.yml/runs?event=push&branch=main&head_sha={self.REV}&per_page=100':
                 {'workflow_runs': [self.run_entry(id=49, conclusion='failure', created_at='2026-11-22T04:00:00Z'),
                                    self.run_entry()]},
             f'repos/{self.AGENT}/actions/runs/50/jobs?filter=latest&per_page=100': {'jobs': jobs},
-            f'repos/{self.AGENT}/actions/runs/50/artifacts?per_page=100': {'artifacts': [
-                {'id': 7, 'name': 'fleet-integration-result', 'expired': False, 'size_in_bytes': 900}]},
+            self.NOTES: [{'title': 'other', 'annotation_level': 'notice', 'message': 'x'}, self.note()],
         }
         r.update(override)
         return r
 
-    def find(self, responses=None, result=None, base=None, tested=None, archive=None):
-        import io, zipfile
+    def find(self, responses=None, result=None, base=None, tested=None):
         responses = self.responses() if responses is None else responses
+        if result is not None:
+            responses = dict(responses, **{self.NOTES: [self.note(result)]})
         def api(path):
             if path not in responses:
                 raise subprocess.CalledProcessError(1, ['gh', 'api', path])
             return responses[path]
-        def download(path):
-            self.assertEqual(path, f'repos/{self.AGENT}/actions/artifacts/7/zip')
-            if archive is not None:
-                return archive
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, 'w') as z:
-                z.writestr('fleet-integration.json', json.dumps(self.result() if result is None else result))
-            return buf.getvalue()
         logs = []
         url = self.module.find_pin_reuse(self.root, self.REPO, self.base if base is None else base,
                                          self.tested if tested is None else tested,
-                                         api=api, download=download, log=logs.append)
+                                         api=api, log=logs.append)
         return url, logs
 
     def test_pin_only_paths(self):
@@ -648,7 +648,6 @@ class PinReuseTests(unittest.TestCase):
         base = self.responses()
         runs = f'repos/{self.AGENT}/actions/workflows/fleet-integration.yml/runs?event=push&branch=main&head_sha={self.REV}&per_page=100'
         jobs = f'repos/{self.AGENT}/actions/runs/50/jobs?filter=latest&per_page=100'
-        arts = f'repos/{self.AGENT}/actions/runs/50/artifacts?per_page=100'
         good_jobs = base[jobs]['jobs']
         response_cases = {
             'no run': {runs: {'workflow_runs': []}},
@@ -665,16 +664,20 @@ class PinReuseTests(unittest.TestCase):
             'failed leg': {jobs: {'jobs': good_jobs[:-1] + [dict(good_jobs[-1], conclusion='failure')]}},
             'skipped leg': {jobs: {'jobs': good_jobs[:-1] + [dict(good_jobs[-1], conclusion='skipped')]}},
             'duplicate leg': {jobs: {'jobs': good_jobs + [dict(good_jobs[-1], conclusion='failure')]}},
-            'no artifact': {arts: {'artifacts': []}},
-            'expired artifact': {arts: {'artifacts': [dict(base[arts]['artifacts'][0], expired=True)]}},
-            'two artifacts': {arts: {'artifacts': base[arts]['artifacts'] * 2}},
+            'no record': {self.NOTES: []},
+            'record not a notice': {self.NOTES: [self.note(annotation_level='warning')]},
+            'two records': {self.NOTES: [self.note(), self.note()]},
+            'record not json': {self.NOTES: [self.note(message='not json')]},
+            'record not an object': {self.NOTES: [self.note(message='[1]')]},
+            'annotations unreadable': {self.NOTES: None},
             'api error': {runs: None},
         }
         for name, override in response_cases.items():
             with self.subTest(name=name):
                 responses = self.responses(**override)
-                if override.get(runs, 0) is None:
-                    del responses[runs]
+                for key in (runs, self.NOTES):
+                    if key in override and override[key] is None:
+                        del responses[key]
                 url, logs = self.find(responses)
                 self.assertIsNone(url)
                 self.assertTrue(logs)
@@ -694,7 +697,6 @@ class PinReuseTests(unittest.TestCase):
         for name, override in result_cases.items():
             with self.subTest(name=name):
                 self.assertIsNone(self.find(result=self.result(**override))[0])
-        self.assertIsNone(self.find(archive=b'not a zip')[0])
 
     def test_merge_commit_must_change_only_pin_files_to_an_exact_revision(self):
         self.assertIsNone(self.find(tested=self.pin(self.base, extra='README.md'))[0])
@@ -723,7 +725,9 @@ class PinReuseTests(unittest.TestCase):
             return subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', event, '--repo', str(self.root),
                                    '--base', self.base, '--head', tested, '--tested', tested,
                                    '--reuse-repository', self.REPO],
-                                  capture_output=True, text=True, env={'PATH': '/usr/bin:/bin', 'GH_TOKEN': ''})
+                                  capture_output=True, text=True,
+                                  env={'PATH': '/usr/bin:/bin', 'GH_TOKEN': '', 'HOME': str(self.root / 'home'),
+                                       'XDG_CONFIG_HOME': str(self.root / 'home'), 'XDG_STATE_HOME': str(self.root / 'home')})
         pin = run('pull_request', self.tested)
         self.assertEqual(pin.returncode, 0, pin.stderr)
         self.assertIn('pin reuse:', pin.stderr)  # consulted, and with no API it runs everything

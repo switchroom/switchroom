@@ -23,7 +23,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      # Push only: find the merged PR and its CI run to reuse an identical, proven tree.
+      # Push: find the merged PR and its CI run to reuse an identical, proven tree. Pin-only PR:
+      # find the Agent repository's fleet-integration run of the pinned revision.
       pull-requests: read
       actions: read
     outputs:
