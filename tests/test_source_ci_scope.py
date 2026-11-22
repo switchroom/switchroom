@@ -89,7 +89,7 @@ class SourceSelectionTests(unittest.TestCase):
                      '.github/workflows/ci.yml', '.github/workflows/fleet-image.yml',
                      'scripts/source-ci.py', 'tests/test_source_ci_scope.py',
                      'scripts/run-linear-input-scenarios.py', 'scripts/read-agent-image-manifest.py',
-                     'tests/unknown_helper.py', 'tests/fixtures/anything.json'):
+                     'tests/unknown_helper.py', 'tests/fixtures/anything.json', 'tests/fixtures/reply.md'):
             with self.subTest(path=path):
                 plan = self.select(path)
                 self.assertTrue(plan['full'])
@@ -235,7 +235,132 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('github.event.pull_request.base.sha || github.event.before', jobs['selection'])
         self.assertIn('github.event.pull_request.head.sha || github.sha', jobs['selection'])
         self.assertIn('workflow_dispatch:', text)
-        self.assertIn('schedule:', text)
+        self.assertIn("    - cron: '23 4 * * *'", text)
+        self.assertIn("reused: ${{ steps.select.outputs.reused }}", jobs['selection'])
+        self.assertIn('--reuse-repository "$GITHUB_REPOSITORY"', jobs['selection'])
+        self.assertIn("GH_TOKEN: ${{ github.event_name == 'push' && github.token || '' }}", jobs['selection'])
+        for grant in ('contents: read', 'pull-requests: read', 'actions: read'):
+            self.assertIn(grant, jobs['selection'])
+        self.assertIn("if: needs.selection.outputs.reused != 'true'", jobs['source-tests'])
+
+
+def load_selector():
+    spec = importlib.util.spec_from_file_location('source_ci_reuse', SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class PushReuseTests(unittest.TestCase):
+    SHA, BEFORE, HEAD = 'a' * 40, 'b' * 40, 'c' * 40
+    REPO = 'switchroom/switchroom'
+
+    def responses(self, **override):
+        r = {
+            f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
+                {'number': 7, 'merged_at': '2026-11-22T00:00:00Z', 'merge_commit_sha': self.SHA,
+                 'base': {'ref': 'main'}, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
+            f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
+                {'number': 7, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
+            f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': 't' * 40}},
+            f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 't' * 40}},
+            f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'ahead'},
+            f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100': {
+                'workflow_runs': [
+                    {'id': 1, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-21T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
+                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'failure',
+                     'html_url': 'https://x/runs/1'},
+                    {'id': 2, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
+                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success',
+                     'html_url': 'https://x/runs/2'}]},
+            f'repos/{self.REPO}/issues/7/events?per_page=100': [
+                {'event': 'base_ref_changed', 'created_at': '2026-11-21T12:00:00Z'},
+                {'event': 'labeled', 'created_at': '2026-11-22T00:30:00Z'}],
+            f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
+                'jobs': [{'name': 'source-checks', 'conclusion': 'success'},
+                         {'name': 'runtime (input 1/3)', 'conclusion': 'success'}]},
+        }
+        r.update(override)
+        return r
+
+    def find(self, responses, sha=None, before=None):
+        before = self.BEFORE if before is None else before
+        module = load_selector()
+        def api(path):
+            if path not in responses:
+                raise subprocess.CalledProcessError(1, ['gh', 'api', path])
+            return responses[path]
+        logs = []
+        return module.find_reuse(self.REPO, sha or self.SHA, before, api=api, log=logs.append), logs
+
+    def test_all_three_conditions_reuse_the_newest_green_run(self):
+        url, _ = self.find(self.responses())
+        self.assertEqual(url, 'https://x/runs/2')
+        url, _ = self.find(self.responses(**{
+            f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'identical'}}))
+        self.assertEqual(url, 'https://x/runs/2')
+
+    def test_any_failed_condition_or_doubt_falls_back(self):
+        base = self.responses()
+        runs_key = f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100'
+        newest_red = {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], id=3, conclusion='failure',
+                                             created_at='2026-11-23T00:00:00Z')] + base[runs_key]['workflow_runs']}
+        cases = {
+            'tree differs': {f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 'u' * 40}}},
+            'not current with main': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'diverged'}},
+            'behind': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'behind'}},
+            'newest run red': {runs_key: newest_red},
+            'no run': {runs_key: {'workflow_runs': []}},
+            'other workflow': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], path='.github/workflows/x.yml')]}},
+            'in progress': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], status='in_progress', conclusion=None)]}},
+            'aggregate red': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
+                'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
+            'aggregate missing': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {'jobs': []}},
+            'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': []},
+            'fork run': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
+                head_repository={'full_name': 'someone/fork'})]}},
+            'run of another branch': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
+                head_branch='other')]}},
+            'head shared with another PR': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
+                {'number': 7, 'head': {'sha': self.HEAD}}, {'number': 9, 'head': {'sha': self.HEAD}}]},
+            # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
+            'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
+                {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
+            'events unreadable in one page': {f'repos/{self.REPO}/issues/7/events?per_page=100':
+                [{'event': 'labeled', 'created_at': '2026-11-20T00:00:00Z'}] * 100},
+            'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
+                dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls'][0], merge_commit_sha='d' * 40)]},
+            'malformed': {f'repos/{self.REPO}/git/commits/{self.SHA}': {}},
+        }
+        for name, override in cases.items():
+            with self.subTest(name=name):
+                url, logs = self.find(self.responses(**override))
+                self.assertIsNone(url)
+                self.assertTrue(logs)
+        missing = self.responses()
+        del missing[f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}']
+        self.assertIsNone(self.find(missing)[0])
+        self.assertIsNone(self.find(self.responses(), before='0' * 40)[0])
+        self.assertIsNone(self.find(self.responses(), before='')[0])
+
+    def test_reused_plan_passes_gate_only_with_tests_and_runtime_skipped(self):
+        module = load_selector()
+        plan = module.reused_plan('https://x/runs/2')
+        skipped = {'selection': {'result': 'success'}, 'source-tests': {'result': 'skipped'},
+                   'runtime': {'result': 'skipped'}}
+        self.assertTrue(module.gate(plan, skipped))
+        self.assertFalse(module.gate(plan, {**skipped, 'selection': {'result': 'failure'}}))
+        self.assertFalse(module.gate(dict(plan, runtime=True), skipped))
+        self.assertFalse(module.gate({k: v for k, v in plan.items() if k != 'reused_from'}, skipped))
+
+    def test_reuse_is_never_consulted_for_pr_dispatch_or_explicit_files(self):
+        for extra in (('--event', 'pull_request'), ('--event', 'workflow_dispatch'), ('--files', 'README.md')):
+            result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--reuse-repository', 'example/none',
+                                     '--base', self.BEFORE, '--head', self.SHA, *extra],
+                                    cwd=ROOT, capture_output=True, text=True, env={'PATH': '/nonexistent'})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('reused_from', json.loads(result.stdout))
 
 
 class AggregateTests(unittest.TestCase):
