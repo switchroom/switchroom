@@ -6,7 +6,7 @@ import html
 import json
 import sys
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from public_config import brand, canonical_public_url, local_tz
@@ -565,7 +565,15 @@ def _local_time(expires_at: float | None) -> str:
     if not expires_at:
         return ""
     try:
-        return datetime.fromtimestamp(float(expires_at), ZoneInfo(local_tz())).strftime("%-I:%M %p")
+        try:
+            zone = ZoneInfo(local_tz()) if local_tz() else None
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = None  # unknown name: fall back to the system's local zone, never UTC
+        moment = datetime.fromtimestamp(float(expires_at), zone)
+        if zone is None:
+            moment = moment.astimezone()
+        # Humans never see bare UTC: "2:05pm AEDT".
+        return moment.strftime("%-I:%M%p").lower() + " " + moment.strftime("%Z")
     except (OverflowError, OSError, ValueError):
         return ""
 
