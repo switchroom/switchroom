@@ -1,11 +1,13 @@
 name: Auto-revert
 
 # Fast-lane PRs merge after cheap checks and defer some real-Agent legs to main
-# push CI. When that push run fails, scripts/auto-revert.py decides: a
-# fast-lane commit whose parent was green is reverted by a PR with squash
-# auto-merge armed (pushed with the release bot App so its CI runs); anything
-# else is only reported. Either way an issue records it. Nothing is delivered
-# meanwhile: pin handoff and Fleet Image publish need a green exact-SHA run.
+# push CI. When that push run fails, scripts/auto-revert.py finds the oldest
+# commit of the red streak and, if it was a fast-lane merge that failed in its
+# test steps (not a revert, not already reverted, no newer main run pending or
+# green), reverts it by a PR with squash auto-merge armed (pushed with the
+# release bot App so its CI runs); anything else is only reported. Either way
+# an issue records it. Nothing is delivered meanwhile: pin handoff and Fleet
+# Image publish need a green exact-SHA run.
 
 on:
   workflow_run:
@@ -92,7 +94,8 @@ jobs:
           echo "pr=$url" >> "$GITHUB_OUTPUT"
 
       - name: File an issue
-        if: steps.decide.outputs.action != 'none'
+        # Also when the revert step failed (e.g. a push the App may not make), so it is never silent.
+        if: always() && steps.decide.outputs.action != '' && steps.decide.outputs.action != 'none'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTION: ${{ steps.decide.outputs.action }}
