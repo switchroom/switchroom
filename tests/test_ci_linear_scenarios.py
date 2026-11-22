@@ -165,6 +165,29 @@ class LinearScenarioLaneTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("shard", result.stderr)
 
+    def test_input_runner_shards_with_the_shared_slicer_and_refuses_invalid_specs(self):
+        runner = ROOT / "scripts/run-linear-input-scenarios.py"
+        self.assertIn('runner.select_shard(', runner.read_text(encoding="utf-8"))
+        for spec in ("0/3", "4/3", "1", "a/b"):
+            with self.subTest(spec=spec):
+                result = subprocess.run(
+                    [sys.executable, "-I", str(runner), "--agent-source", str(self.source), "--shard", spec],
+                    cwd=ROOT, capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("shard", result.stderr)
+
+    def test_runtime_matrix_shards_input_and_lists_longest_legs_first(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        runtime = workflow.split("  runtime:\n", 1)[1].split("\n  history-root:", 1)[0]
+        legs = [line.strip() for line in runtime.splitlines() if line.strip().startswith("- {lane:")]
+        self.assertEqual(legs[:3], ["- {lane: input, shard: 1/3}", "- {lane: input, shard: 2/3}",
+                                    "- {lane: input, shard: 3/3}"])
+        self.assertEqual(legs[-1], "- {lane: native, shard: ''}")
+        self.assertIn("input) selected=\"$INPUT\" ;;", runtime)
+        self.assertIn('run-linear-input-scenarios.py \\\n            --agent-source "$GITHUB_WORKSPACE/agent-source" --shard "$SHARD"', runtime)
+        self.assertIn("if: matrix.lane == 'input' && needs.selection.outputs.input == 'true'", runtime)
+
     def test_ci_provisions_manifest_revision_and_runs_separately(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         source_job = workflow.split("  runtime:\n", 1)[1].split("\n  history-root:", 1)[0]
