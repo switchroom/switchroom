@@ -95,6 +95,7 @@ Required checks: `source-checks` (aggregate of `selection`, `source-tests` and e
 - **Flakes:** known flaky real-Agent tests live only in `tests/ci-quarantine.json`; the runner retries those once with a `::warning::`. Anything else that fails twice is a bug: fix the test's race with a bounded wait-until on the condition, never product code to suit an old Core.
 - **Workflow shape is tested:** edit `tests/test_source_ci_scope.py`, `tests/test_ci_linear_scenarios.py`, `tests/test_release_handoff_workflow.py` and `tests/test_image_scope_and_scans.py` together with `ci.yml`, `source-ci.py`, the runners or `fleet-image-change-scope.py`.
 - **Main push CI** reuses the PR's green run when the merged tree is identical and the PR was current with main; a nightly run covers everything. Never wait on or poll a pipeline by hand.
+- **Agent pin PRs** (only `release/agent-image-manifest.json` and `plugins/<name>/UPSTREAM.json`) reuse the real-Agent legs from the Agent repository's green `fleet-integration.yml` push run of the pinned revision when it ran this same switchroom tree (or one whose later changes select no real-Agent leg); units still run, anything else runs the full matrix. Both sides run the legs through `scripts/run-runtime-leg.sh` and the matrix in `RUNTIME_LEGS` (`scripts/source-ci.py`).
 
 If you change the Dockerfile or anything it copies, also expect `.github/workflows/fleet-image.yml` to bake. Keep `scripts/fleet-image-change-scope.py` in sync with every `COPY` source.
 
