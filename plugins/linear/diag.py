@@ -92,7 +92,8 @@ REASONS = frozenset({
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",
     # agent-to-agent takeover over A2A (takeover.py owner hand_off, chat.py take_over requester side)
-    "handed_off", "handoff_resumed", "handoff_unchanged",
+    "handed_off", "handoff_resumed", "handoff_unchanged", "handoff_not_allowed", "handoff_closed", "handoff_unproven",
+    "started_other_tasks",
     "not_bound_here", "task_finished_here", "task_not_handable", "changed_during_handoff",
     "takeover_unavailable", "takeover_refused", "takeover_paused", "takeover_notice_unsent", "not_delegated",
     "takeover_in_progress", "local_work_not_runnable", "takeover_not_admitted", "takeover_already_here",

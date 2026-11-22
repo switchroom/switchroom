@@ -311,44 +311,55 @@ Linear issue are told so plainly; nothing resumes it automatically.
    reply with that tool's JSON unchanged. It waits at most `wait_seconds` for the answer. An
    answer that certainly never reached the owner (A2A not set up, unknown peer, auth refused) is
    `takeover_unavailable`, nothing changed.
-3. The owner's `hand_off`, in code: finds its one bound native task for the issue and refuses
-   plainly, changing nothing, when there is none, it already finished, or it is waiting on
-   something else (paused, a dependency, review). A running or ready task is paused with the
-   plain Kanban `block_task(reason="Paused for a handover to <name> [handoff:<id>]",
-   kind="needs_input")`. A task already paused for a handover to the same agent (a retry with the
-   same `id`, or a new request) counts as paused, never paused twice. It then removes itself as
-   the issue's delegate in Linear (a direct write, checked by a fresh read), drops its own unsent
-   delegate writes and records that it will not re-add itself, and answers
+3. The owner's `hand_off`, in code. It acts only on an A2A turn whose authenticated peer is the
+   one its `takeover.allow` lists for that `to` name; anything else (its own chat, a Linear
+   thread, another peer, an unlisted name) is refused with nothing changed. A peer's message is
+   input, not authority. It finds its one bound native task for the issue and refuses plainly,
+   changing nothing, when there is none, it already finished, it is waiting on something else
+   (paused, a dependency, review) or it started tasks that are still open. A running or ready
+   task is paused with the plain Kanban `block_task(reason="Paused for a handover to <name>
+   [handoff:<id>]", kind="needs_input")`, and the owner posts its own plain comment on the issue
+   ("Atlas paused its work on HF-9 for a handover to Nova. If Nova doesn't start it, ask Nova to
+   'resume HF-9' ..."), so a pause is never silent even if the requester vanishes. A task already
+   paused for a handover to the same agent counts as paused, never paused twice. It then waits up
+   to 45 seconds for the stopped run's worker to exit (the run row ended and its recorded worker
+   process gone); until then it stays the delegate and answers `paused: true, handed_off: false`.
+   After that it removes itself as the issue's delegate (a direct write, checked by a fresh read),
+   drops its own unsent delegate writes, records that it will not re-add itself, and answers
    `{"ok": true, "handed_off": true, "paused": true, "issue_id": ..., "request_id": ..., "message": ...}`.
-   If the delegate write fails after the pause, the answer is `paused: true, handed_off: false`.
+   A request id it refused or resumed is answered for good: a late copy of it changes nothing.
 4. The requester starts only after the owner confirmed the handover AND a fresh Linear read shows
    the owner is no longer the delegate. It then creates its one native task (whose text says to
    continue from the owner's progress in the Linear thread), admits it in the same call through
    the same guarded chat admission as `work_on`, and queues this app as delegate. A person's
-   routing change after the owner's confirmation holds the start; the owner app reporting its
-   pause (moving the issue to Blocked) does not.
+   routing change after the owner was asked holds the start; the owner app's own handover steps
+   (moving the issue to Blocked, removing itself as delegate) do not.
 5. Anything else once the owner may be paused (no answer in time, an answer that is not the
    tool's strict JSON, an owner that paused but is still the delegate in Linear, a start here that
    failed) leaves nothing running here and answers `takeover_paused`. The same words are posted
    as a comment on the issue: "Atlas's work on HF-9 is paused for a handover to Nova that didn't
    complete. Say 'resume HF-9' to let Atlas continue, or 'take over HF-9' to try again." ("may be
-   paused" when the owner's answer never came.) If meanwhile someone delegated the issue to
+   paused" when the owner's answer never came.) Taking over again is offered only when a new
+   `take_over` would ask the owner again; on a closed issue it says to reopen first, and when the
+   start here can't be retried (a Stop from Linear, an unconfirmed start) only 'resume HF-9' is
+   offered, and a later `take_over` says the owner may still be paused. If meanwhile someone delegated the issue to
    another agent, the message says who has it and that Atlas continues only after the issue is
    delegated back to it and a person says 'resume HF-9'. A task created here whose start failed
    stays parked; saying 'take over HF-9' again asks the owner again (it is never paused twice)
    and starts it.
 6. `resume_owner` is the one supported way to let the owner continue. Its target is the issue's
    delegate when that is a configured peer, else (the owner removed itself) the agent this one
-   last asked to hand the issue over. It refuses while this agent runs or ran the work. The owner's
-   `hand_off` with `resume: true` lifts only a pause for a handover to this agent with the plain
-   `unblock_task`, refuses while the issue is delegated to someone else, and makes itself the
-   delegate again. An unconfirmed answer is `resume_uncertain`: nothing starts here, and asking
-   again is safe.
+   last asked to hand the issue over; that memory is cleared once the work starts here. It refuses
+   while this agent runs or ran the work, and carries the id of the handover it reverses. The
+   owner's `hand_off` with `resume: true` (only from that same A2A peer) lifts only a pause for a
+   handover to this agent with the plain `unblock_task`, refuses while the issue is delegated to
+   someone else, and makes itself the delegate again. The owner's own chat can never resume it.
+   An unconfirmed answer is `resume_uncertain`: nothing starts here, and asking again is safe.
 
 Known limits, by design:
 
-- The owner's pause is a card pause. Its worker's current turn is stopped by core's own
-  block handling; the requester does not wait for a proof that the worker process exited.
+- The worker-exit check reads the run's recorded worker PID in the owner's own process
+  namespace; a recycled PID reads as still running (the handover then waits, it never starts early).
 - After a successful takeover the owner's task stays paused on the owner's board. A person
   resuming it there by hand would run both agents; archive it if that risk matters.
 - The owner recognises a retried handover by the requester's `name` in the pause reason. Give
@@ -520,6 +531,9 @@ plugins:
               delegate_id: example-a-app-user-id
               a2a: example-a       # Example-A's peer name in core's `a2a_agents` config
               wait_seconds: 120    # how long to wait for Example-A's A2A answer (at most 300)
+          allow:                   # owner side: who may take work over from this agent
+            - name: Example-C      # that agent's takeover.name
+              a2a: example-c       # the peer name its A2A requests authenticate as here
 ```
 
 `token_file` credentials with `path` are also supported. OAuth and token caches remain private
@@ -540,7 +554,10 @@ later than before while the loop is idle. `takeover` lists the agents this one m
 core's `a2a_agents` config (the A2A client tools must be available on this agent, and the A2A
 platform on the owner); invalid entries are dropped and logged once (`takeover_unavailable`).
 The older `command` key (a host argv into the owner's container) is no longer read: an entry
-with only `command` is dropped, so replace it with `a2a`.
+with only `command` is dropped, so replace it with `a2a`. `takeover.allow` is the owner side:
+`hand_off` acts only on an A2A request whose authenticated peer (core's `A2A_PEER_TOKENS` name)
+is the `a2a` listed for the `to` name it carries; without it nobody can take work over from
+this agent.
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not

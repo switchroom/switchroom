@@ -369,8 +369,20 @@ longer the delegate. Both agents need core's A2A set up: the taking agent lists 
               wait_seconds: 120
 ```
 
-Give every agent a distinct `takeover.name`. Without this block `take_over` refuses and changes
+On the owner (`Example-A`), list who may take work over from it, by `takeover.name` and the peer
+name its A2A requests authenticate as (its `A2A_PEER_TOKENS` name):
+
+```yaml
+        takeover:
+          name: Example-A
+          allow:
+            - name: Example-B
+              a2a: example-b
+```
+
+Give every agent a distinct `takeover.name`. Without these blocks `take_over` refuses and changes
 nothing. The older `command` key is no longer read; an entry with only `command` is dropped.
+Keep `wait_seconds` above about 90: the owner waits up to 45 seconds for its stopped run to end.
 The full flow and its limits are in
 [Take over from another agent](../plugins/linear/README.md#take-over-from-another-agent).
 

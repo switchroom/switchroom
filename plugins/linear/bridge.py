@@ -3088,14 +3088,21 @@ class Bridge:
         are not a human decision about who works on the issue or its status.
         History is read page by page back to since_ms; an unprovable answer
         (more than HISTORY_PAGES pages newer than since_ms) counts as changed.
-        ``pause_of`` (actor, Blocked state id) ignores only that app moving the issue to Blocked,
-        with no assignee or delegate change: its own pause report, never its resume.
+        ``pause_of`` (actor, Blocked state id) ignores only that old delegate app's own handover
+        steps, with no assignee change: moving the issue to Blocked (its pause report) and removing
+        itself as delegate (its hand_off). Never its resume, nor any other change.
         """
         viewer = self.api.viewer_id()
         def pause_report(node):
-            return (pause_of is not None and pause_of[1] is not None and node.get("actorId") == pause_of[0]
-                    and node.get("toStateId") == pause_of[1] and node.get("fromAssigneeId") == node.get("toAssigneeId")
-                    and (node.get("fromDelegate") or {}).get("id") == (node.get("toDelegate") or {}).get("id"))
+            if (pause_of is None or node.get("actorId") != pause_of[0]
+                    or node.get("fromAssigneeId") != node.get("toAssigneeId")):
+                return False
+            before, after = (node.get("fromDelegate") or {}).get("id"), (node.get("toDelegate") or {}).get("id")
+            moved_state = node.get("fromStateId") != node.get("toStateId")
+            if before == after:
+                return pause_of[1] is not None and moved_state and node.get("toStateId") == pause_of[1]
+            return (before == pause_of[0] and after is None
+                    and (not moved_state or (pause_of[1] is not None and node.get("toStateId") == pause_of[1])))
         def human(node):
             return (iso_ms(node.get("createdAt")) > since_ms and self._routed(node) and node.get("actorId") != viewer
                     and not pause_report(node))
@@ -3566,7 +3573,7 @@ class Bridge:
                  and (issue.get("state") or {}).get("type") not in CLOSED
                  and (iso_ms(issue.get("updatedAt")) <= claim_ms
                       or not self._human_routing_changed(
-                          issue_id, claim_ms, pause_of=(old, self.state_id(issue, "blocked")) if replacing else None)))
+                          issue_id, claim_ms, pause_of=(old, self.state_id(issue, "blocked")) if old is not None else None)))
         payload = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear-binding-recovery:{issue_id}:{revision}")),
                    "issue_id": issue_id, "delegate_routing_version": 1, "write_started": False,
                    "target_delegate_id": self.api.viewer_id(), "expected_delegate_id": current if replacing else None,

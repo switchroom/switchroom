@@ -333,19 +333,31 @@ class Store:
                 db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self.ISSUE_PROJECT + team, project_id))
 
-    TAKEOVER_FROM = "takeover-from:"  # issue id -> the delegate this agent last asked to hand over
+    TAKEOVER_FROM = "takeover-from:"  # issue id -> {"owner", "request_id"} of this agent's last take_over ask
+    HANDOFF_CLOSED = "handoff-closed:"  # request id the owner answered for good (refused or resumed)
 
-    def takeover_from(self, issue_id: str) -> str | None:
-        """The delegate this agent last asked to hand the issue over (resume_owner's target once that
-        owner has removed itself as delegate)."""
+    def takeover_from(self, issue_id: str) -> dict | None:
+        """The owner this agent last asked to hand the issue over, and that request's id
+        (resume_owner's target once the owner has removed itself as delegate)."""
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?", (self.TAKEOVER_FROM + issue_id,)).fetchone()
-            return row[0] if row else None
+            return json.loads(row[0]) if row else None
 
-    def remember_takeover(self, issue_id: str, delegate_id: str) -> None:
+    def remember_takeover(self, issue_id: str, delegate_id: str | None, request_id: str = "") -> None:
         with self._tx() as db:
-            db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self.TAKEOVER_FROM + issue_id, delegate_id))
+            if delegate_id is None:
+                db.execute("DELETE FROM metadata WHERE key=?", (self.TAKEOVER_FROM + issue_id,))
+                return
+            db.execute("INSERT INTO metadata(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (self.TAKEOVER_FROM + issue_id, json.dumps({"owner": delegate_id, "request_id": request_id})))
+
+    def handoff_closed(self, request_id: str) -> bool:
+        with self._tx() as db:
+            return db.execute("SELECT 1 FROM metadata WHERE key=?", (self.HANDOFF_CLOSED + request_id,)).fetchone() is not None
+
+    def close_handoff(self, request_id: str) -> None:
+        with self._tx() as db:
+            db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?, '1')", (self.HANDOFF_CLOSED + request_id,))
 
     def conversation_input(self, issue_id: str, session_id: str) -> dict | None:
         with self._tx() as db:

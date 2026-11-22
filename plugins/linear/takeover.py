@@ -7,6 +7,12 @@ delegate and answers with that tool's JSON. The requester starts its task only a
 confirmation AND a fresh Linear read showing the owner is no longer the delegate. Whenever
 the owner may be paused and nothing runs here, the chat reply and a Linear comment say so
 plainly. Nothing resumes the owner automatically: only a person's ``resume_owner``.
+
+The owner answers ``hand_off`` only on an A2A turn from a peer it lists in ``takeover.allow``
+(the authenticated A2A peer name must match), refuses while its task has open child tasks,
+waits a bounded time for the stopped run's worker to exit before it stops being the delegate,
+and posts its own plain Linear comment whenever it pauses. A request id it has answered with a
+refusal or a resume is never acted on again, so a late message cannot pause the work later.
 """
 from __future__ import annotations
 
@@ -14,8 +20,10 @@ import concurrent.futures
 from contextlib import contextmanager
 import contextvars
 import json
+import os
 import re
 import threading
+import time
 from typing import Any, Callable
 
 from . import diag
@@ -30,6 +38,10 @@ MAX_WAIT_SECONDS = 300.0
 BEFORE_ASK_SECONDS = 40.0  # this side's Linear reads before the owner is asked
 START_SECONDS = 60.0  # the fresh read and the start here, after the owner answered
 CLIENT_TIMEOUT_SECONDS = BEFORE_ASK_SECONDS + MAX_WAIT_SECONDS + START_SECONDS + 20.0
+# How long the owner waits for its stopped run's worker to exit before it stops being the
+# delegate. Keep the requester's wait_seconds above this plus the owner's model turn.
+EXIT_WAIT_SECONDS = 45.0
+EXIT_POLL_SECONDS = 1.0
 
 ASK = ("Linear handover request from {to}. Call your linear tool once with exactly these arguments: {args} "
        "Then reply with that tool's JSON result exactly as it returned it, and nothing else. "
@@ -60,13 +72,15 @@ def busy(issue_id: str):
 
 
 def settings(raw: Any, *, default_name: str) -> dict:
-    """``takeover: {name, agents: [{name, delegate_id, a2a, wait_seconds}]}``.
+    """``takeover: {name, agents: [{name, delegate_id, a2a, wait_seconds}], allow: [{name, a2a}]}``.
 
-    ``a2a`` names the owner's peer in core's ``a2a_agents`` config. Invalid entries are dropped
-    (one diag config line each) rather than failing the service: an agent without a valid entry
-    simply cannot take over from that delegate. ``command`` is no longer read."""
+    ``agents`` (requester side): whom this agent may take over from; ``a2a`` names that owner's
+    peer in core's ``a2a_agents`` config. ``allow`` (owner side): who may take over from this
+    agent; ``name`` is that agent's ``takeover.name`` and ``a2a`` the peer name its A2A requests
+    authenticate as here. Invalid entries are dropped (one diag config line each) rather than
+    failing the service. ``command`` is no longer read."""
     if not isinstance(raw, dict):
-        return {"name": default_name, "agents": {}}
+        return {"name": default_name, "agents": {}, "allow": {}}
     name = raw.get("name") if isinstance(raw.get("name"), str) and NAME.fullmatch(raw["name"]) else default_name
     agents = {}
     for entry in raw.get("agents") or []:
@@ -79,7 +93,15 @@ def settings(raw: Any, *, default_name: str) -> dict:
             diag.evt("diag.config", "skipped", "takeover_unavailable")
             continue
         agents[entry["delegate_id"]] = {"name": entry["name"], "a2a": entry["a2a"].strip(), "wait_seconds": float(wait)}
-    return {"name": name, "agents": agents}
+    allow = {}
+    for entry in raw.get("allow") or []:
+        entry = entry if isinstance(entry, dict) else {}
+        if not (isinstance(entry.get("name"), str) and NAME.fullmatch(entry["name"])
+                and isinstance(entry.get("a2a"), str) and 0 < len(entry["a2a"].strip()) <= 128):
+            diag.evt("diag.config", "skipped", "takeover_unavailable")
+            continue
+        allow[entry["name"]] = entry["a2a"].strip()
+    return {"name": name, "agents": agents, "allow": allow}
 
 
 def a2a_call(agent: str, message: str) -> Any:
@@ -155,9 +177,72 @@ def _live_pause_for(events: list) -> str | None:
     return made.group("to") if made else None
 
 
+def _started_open(adapter, task_id: str) -> bool:
+    """Has this task started tasks that are still open? Pausing it would not stop them."""
+    with adapter.read_conn() as conn:
+        children = []
+        for row in conn.execute("SELECT task_id, payload FROM task_events WHERE kind='created'"):
+            try:
+                payload = json.loads(row["payload"] or "null")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and payload.get("creator_task_id") == task_id:
+                children.append(row["task_id"])
+    return any((child := adapter.get(child_id)) is not None and child.status not in ("done", "archived")
+               for child_id in children)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _worker_exited(adapter, task_id: str) -> bool:
+    """The task's latest run has ended and the worker it recorded is gone (upstream task_runs)."""
+    with adapter.read_conn() as conn:
+        run = conn.execute("SELECT ended_at, worker_pid FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                           (task_id,)).fetchone()
+    if run is None:
+        return True  # Never claimed: no worker ever ran.
+    pid = run["worker_pid"]
+    return run["ended_at"] is not None and not (isinstance(pid, int) and pid > 0 and _alive(pid))
+
+
+def _wait_for_exit(adapter, task_id: str, clock=time.monotonic, sleep=time.sleep) -> bool:
+    deadline = clock() + EXIT_WAIT_SECONDS
+    while not _worker_exited(adapter, task_id):
+        if clock() >= deadline:
+            return False
+        sleep(EXIT_POLL_SECONDS)
+    return True
+
+
+def _post_pause_notice(bridge, context, issue: dict, me: str, to: str, pause_id: int) -> None:
+    """The owner's own plain comment: a pause is never silent, even if the requester vanishes."""
+    from .bridge import stable_uuid4
+    from .chat import _content_requester
+    issue_id, key = issue["id"], issue.get("identifier") or issue["id"]
+    body = (f"{me} paused its work on {key} for a handover to {to}. If {to} doesn't start it, ask {to} to "
+            f"'resume {key}' to let {me} continue. Nothing resumes it automatically.")
+    row_id = stable_uuid4("linear-handoff-pause", issue_id, str(pause_id))
+    try:
+        payload = {"issue_id": issue_id, "body": body, "id": row_id, "content_action": True, "unlinked_content": True,
+                   "write_started": False, "caller_context": context.to_wire(),
+                   **_content_requester(bridge, issue_id, bridge.store.outbox_row(row_id))}
+        bridge.store.enqueue("comment", payload, at=bridge.clock())
+    except Exception as exc:  # noqa: BLE001 - the requester's reply and comment still say it
+        diag.evt("handoff.decision", "failed", "takeover_notice_unsent", iss=issue_id, exc=type(exc).__name__)
+
+
 def hand_off(bridge, args: dict, context, issue: dict, reply: Callable[..., str]) -> str:
     """Pause this agent's one task for the issue and stop being its delegate, or with
-    ``resume: true`` lift exactly such a pause and become the delegate again."""
+    ``resume: true`` lift exactly such a pause and become the delegate again. Only an A2A
+    request from the agent the issue is handed to (``takeover.allow``) is ever acted on."""
     from .chat import _uuid
     issue_id, key = issue["id"], issue.get("identifier") or issue["id"]
     to, resume = args.get("to"), args.get("resume", False)
@@ -167,24 +252,31 @@ def hand_off(bridge, args: dict, context, issue: dict, reply: Callable[..., str]
     me = bridge.takeover["name"]
     base = {"issue_id": issue_id, "request_id": request_id, "handed_off": False, "paused": False, "resumed": False}
 
-    def answer(ok: bool, message: str, reason: str, **extra: Any) -> str:
+    def answer(ok: bool, message: str, reason: str, *, close: bool = False, **extra: Any) -> str:
+        if close:  # Answered for good: the same request id is never acted on again.
+            bridge.store.close_handoff(request_id)
         diag.evt("handoff.decision", "applied" if ok else "refused", reason, iss=issue_id)
         return reply(ok, message, **{**base, **extra})
 
-    if context.delegated_child:
-        return answer(False, "Native delegated children cannot change work; return the request to the parent agent.",
-                      "native_scope_refused")
+    peer = (bridge.takeover.get("allow") or {}).get(to)
+    if (context.delegated_child or context.platform != "a2a" or peer is None or context.user_id != peer):
+        return answer(False, f"{me} hands work over only when {to} itself asks over A2A and is allowed to take "
+                      "over from it, so nothing was changed.", "handoff_not_allowed")
+    if not resume and bridge.store.handoff_closed(request_id):
+        return answer(False, f"This handover request for {key} was already answered, so nothing was changed. "
+                      "Ask again with a new request.", "handoff_closed")
     viewer = bridge.api.viewer_id()
     with bridge.lock(issue_id):
         row = bridge.store.get(issue_id)
         if not row or row.get("origin") != "native" or not row.get("task_id"):
             return answer(False, f"{me} has no tracked work linked to {key}, so there was nothing to hand over.",
-                          "not_bound_here")
+                          "not_bound_here", close=True)
         adapter = bridge._binding_adapter(issue_id)
         task = adapter.require_task(row["task_id"])
         pause = _live_pause_for(adapter.history(task.id, 0)) if task.status in ("blocked", "triage") else None
         delegate = (issue.get("delegate") or {}).get("id")
         if resume:
+            bridge.store.close_handoff(request_id)  # Whatever happens next, a late pause with this id is refused.
             if pause != to:
                 return answer(False, f"{me}'s work on {key} isn't paused for a handover to {to}, so it was left "
                               "as it is.", "handoff_unchanged")
@@ -205,25 +297,41 @@ def hand_off(bridge, args: dict, context, issue: dict, reply: Callable[..., str]
             pass  # Already paused for a handover to this agent (a retry): never paused twice.
         elif task.status in ("done", "archived"):
             return answer(False, f"{me}'s work on {key} has already finished, so there was nothing to hand over.",
-                          "task_finished_here")
+                          "task_finished_here", close=True)
         elif task.status not in ("running", "ready"):
             return answer(False, f"{me}'s work on {key} is {'paused' if task.status in ('blocked', 'triage') else 'waiting on something else'}, "
-                          "so it was left as it is and nothing was handed over.", "task_not_handable")
+                          "so it was left as it is and nothing was handed over.", "task_not_handable", close=True)
+        elif _started_open(adapter, task.id):
+            return answer(False, f"{me}'s work on {key} started other tasks that are still open, so it was left "
+                          "running; those need to finish or be stopped first.", "started_other_tasks", close=True)
         else:
             reason = HANDOFF_REASON.format(to=to, request_id=request_id)
             try:
                 adapter.block(task.id, reason, issue=issue)
             except Exception as exc:  # noqa: BLE001 - history, not the exception, says what happened
                 diag.evt("handoff.decision", "failed", "block_failed", iss=issue_id, exc=type(exc).__name__)
-            if _live_pause_for(adapter.history(task.id, 0)) != to:
+            events = adapter.history(task.id, 0)
+            if _live_pause_for(events) != to:
                 after = adapter.require_task(task.id).status
                 if after in ("running", "ready"):
                     return answer(False, f"{me}'s work on {key} couldn't be paused, so it keeps running and nothing "
-                                  "was handed over.", "block_failed")
+                                  "was handed over.", "block_failed", close=True)
                 return answer(False, f"{me}'s work on {key} changed while it was being paused, so it was left as "
                               "someone set it and nothing was handed over.", "changed_during_handoff",
                               paused=after in ("blocked", "triage"))
+            _post_pause_notice(bridge, context, issue, me, to,
+                               next(e.id for e in reversed(events) if e.kind in ("blocked", "block_loop_detected")))
+    # Outside the issue lock: the reporting loop keeps running while the stopped worker winds down.
+    if not _wait_for_exit(adapter, task.id):
+        # Paused is not stopped yet: stay the delegate, so the requester starts nothing.
+        return answer(False, f"{me}'s work on {key} is paused for a handover to {to}, but its run hadn't "
+                      f"finished stopping yet, so {me} is still the delegate.", "handoff_unproven", paused=True)
+    with bridge.lock(issue_id):
+        if _live_pause_for(adapter.history(task.id, 0)) != to:
+            return answer(False, f"{me}'s work on {key} changed while it was being handed over, so it was left as "
+                          "someone set it and nothing was handed over.", "changed_during_handoff")
         _no_delegate_recovery(bridge, issue_id, task.id)
+        delegate = (bridge._effect_issue(issue_id).get("delegate") or {}).get("id")  # fresh after the wait
         if delegate == viewer and not _set_delegate(bridge, issue_id, None, viewer):
             return answer(False, f"{me}'s work on {key} is paused for a handover to {to}, but {me} couldn't remove "
                           "itself as the issue's delegate in Linear.", "takeover_paused", paused=True)
