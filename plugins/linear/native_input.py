@@ -886,20 +886,21 @@ def _approval_confirmation(choice, count, reason):
     return t(f"gateway.approve.{choice}_{number}", count=count)
 
 
-# Core commits a handed-over input within milliseconds; a busy chat's input waits for its
-# FIFO position first. Past the deadline the delivery stays pending and is redelivered.
-COMMIT_POLL_SECONDS = 0.05
-COMMIT_TIMEOUT_SECONDS = 120.0
+# Core refusals a redelivery would meet again (upstream relay's permanent set): the
+# provider delivery is not retried. Any other refusal leaves it pending.
+PERMANENT_REFUSALS = frozenset({"permission_denied", "invalid_params", "admission_conflict",
+                                "profile_mismatch", "not_found"})
 
 
 def native_supported():
     """Passive capability check; never bootstrap an owner or discover accounts.
 
-    Only upstream Hermes APIs: the shared-runtime admission ledger (read back to
-    acknowledge the provider inbox) and Base's processing lifecycle.
+    Only upstream Hermes APIs: producer ingress (``admit_producer``), the admission
+    ledger (``admissions.match``) and Base's processing lifecycle.
     """
     try:
         from gateway.platforms.base import BasePlatformAdapter
+        from gateway.platforms.webhook_ingress import admit_producer
         from gateway.session_authorities import require_active_authority
         from gateway.session_envelope import prepare_native, restore_native_source
         from persistence.authority.admissions import AdmissionRepository
@@ -907,7 +908,8 @@ def native_supported():
         return False
     return (callable(getattr(BasePlatformAdapter, "on_processing_complete", None))
             and callable(getattr(AdmissionRepository, "match", None))
-            and all(callable(item) for item in (require_active_authority, prepare_native, restore_native_source)))
+            and all(callable(item) for item in (admit_producer, require_active_authority, prepare_native,
+                                                restore_native_source)))
 
 
 def create_adapter(config, running):
@@ -916,8 +918,8 @@ def create_adapter(config, running):
     from gateway.platforms.base import BasePlatformAdapter, SendResult
 
     class LinearAdapter(BasePlatformAdapter):
-        # Upstream messaging input: Core commits it; this adapter reads the committed
-        # admission back (``_committed_receipt``) before it acknowledges the provider inbox.
+        # Upstream producer ingress (``admit_producer``): each provider input commits its own
+        # admission, and its receipt anchors the input before the provider inbox is ACKed.
         supports_status_text = True
 
         def __init__(self):
@@ -943,7 +945,6 @@ def create_adapter(config, running):
             self._step_paused = set()
             self._observed_approvals = set()
             self._step_session_keys = {}
-            self._completed = {}  # event key -> set once Base or the producer lifecycle ends its turn
             self._stop_activities = {}  # recent provider Stop activities (ordered); the bridge posts their notice
 
         async def connect(self, *, is_reconnect=False):
@@ -1070,33 +1071,61 @@ def create_adapter(config, running):
                 if current and current[0][1] != projected:
                     raise LinearError("Linear Activity was redelivered with conflicting input", retryable=False)
                 current.append((delivery, projected, original))
-            # A redelivery of input Core already committed (a crash or failed ACK after the
-            # commit) is answered from the ledger. It never re-enters busy steer/interrupt.
-            if (existing := await self._committed_receipt(event, refused_is_absent=True)) is not None:
-                await self._admitted(event, existing)
-                return
-            with self._relay_lock:
-                self._completed[key] = asyncio.Event()
                 if projected.turn_in_progress:
                     self._turns[key] = projected.issue_id
             if projected.turn_in_progress:
                 # In Progress while this session's turn runs on the admitted work.
                 bridge.session_turn(projected.issue_id, True)
             try:
-                await self.handle_message(event)
-                receipt = await self._await_commit(event)
+                receipt = await self._admit(event)
             except BaseException:
                 self._end_turn(key)
+                with self._relay_lock:  # nothing committed: this delivery stays pending
+                    values = self._pending.get(key, [])
+                    if (delivery, projected, original) in values:
+                        values.remove((delivery, projected, original))
+                    if not values:
+                        self._pending.pop(key, None)
                 raise
             if receipt is None:
-                with self._relay_lock:
-                    if key not in self._pending:
-                        return  # already anchored and acknowledged from this same row
-                # Core refused or never committed it: the provider delivery stays pending.
+                # A plugin hook or the chat's live prompt consumed it; nothing was committed.
                 self._end_turn(key)
-                self._refused(event)
+                if reply := getattr(event, "_consumer_reply", None):
+                    from gateway.session_ingress import deliver_response
+                    task = asyncio.create_task(deliver_response(
+                        self, event, self._event_session_key(event), reply))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                await self._acknowledge_pending(key)
                 return
             await self._admitted(event, receipt)
+
+        async def _admit(self, event):
+            """Commit this input as its own row through upstream's producer ingress.
+
+            ``admit_producer`` is the relay/webhook path: every provider delivery commits its
+            own admission before the ACK, a replay of a committed delivery resolves to its row,
+            and nothing steers, merges or answers before that commit. The executor brackets the
+            turn (typing, ``on_processing_start``/``on_processing_complete``).
+            """
+            from gateway.platforms.webhook_ingress import admit_producer
+            from persistence.core.errors import AuthorityRefusal
+            try:
+                receipt = await admit_producer(self, event)
+            except AuthorityRefusal as exc:
+                raise LinearError(f"Core refused this Linear input ({exc.reason})",
+                                  retryable=exc.reason not in PERMANENT_REFUSALS) from exc
+            if receipt is None:
+                return None
+            return {"admission_id": receipt.admission_id, "seq": receipt.sequence, "status": receipt.status}
+
+        async def _acknowledge_pending(self, key):
+            with self._relay_lock:
+                pending = self._pending.pop(key, [])
+            for delivery, _projected, _original in pending:
+                await asyncio.to_thread(delivery.acknowledge)
+                with self._relay_lock:
+                    self._submitted.pop(self._delivery_key(delivery), None)
 
         async def _stop(self, bridge, delivery, projected, original, event):
             """Core's native ``/stop`` for this chat, then the bridge's Stop of the linked task.
@@ -1162,43 +1191,12 @@ def create_adapter(config, running):
                 raise LinearError("Linear Activity has more than one native admission", retryable=False)
             return admission_row(records[0]) if records else None
 
-        async def _await_commit(self, event, timeout=COMMIT_TIMEOUT_SECONDS):
-            """Wait for Core to commit this input; ``None`` once its turn ended without a row."""
-            completed = self._completed.get(self._event_key(event))
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            try:
-                while True:
-                    with self._relay_lock:
-                        if self._event_key(event) not in self._pending:
-                            return None  # already anchored and acknowledged from its committed row
-                    done = completed is not None and completed.is_set()
-                    if (receipt := await self._committed_receipt(event, refused_is_absent=True)) is not None:
-                        return receipt
-                    if done or loop.time() >= deadline:
-                        return None
-                    try:
-                        await asyncio.wait_for(completed.wait(), COMMIT_POLL_SECONDS) if completed else \
-                            await asyncio.sleep(COMMIT_POLL_SECONDS)
-                    except TimeoutError:
-                        pass
-            finally:
-                with self._relay_lock:
-                    if self._completed.get(self._event_key(event)) is completed:
-                        self._completed.pop(self._event_key(event), None)
-
         def _end_turn(self, key):
             with self._relay_lock:
                 issue_id = self._turns.pop(key, None)
             bridge = running.get("bridge")
             if issue_id and bridge is not None:
                 bridge.session_turn(issue_id, False)
-
-        def _refused(self, event):
-            with self._relay_lock:
-                for delivery, _projected, _original in self._pending.pop(self._event_key(event), []):
-                    self._failed[self._delivery_key(delivery)] = LinearError(
-                        "Native input acknowledgment is incomplete; provider delivery remains pending")
 
         async def _admitted(self, event, receipt):
             """Core committed this input (``receipt`` is its admission row): anchor it, then ACK."""
@@ -1231,13 +1229,13 @@ def create_adapter(config, running):
                         self._pending.pop(key, None)
                     self._submitted.pop(self._delivery_key(delivery), None)
 
+        async def on_processing_start(self, event):
+            """Opts in to the executor's bracket of producer-admitted turns, so their
+            ``on_processing_complete`` runs (``_followup_processing_hooks_apply``)."""
+
         async def on_processing_complete(self, event, outcome):
             self._close_steps(event.source.chat_id, event.source.thread_id, event.message_id)
             self._end_turn(self._event_key(event))
-            with self._relay_lock:
-                completed = self._completed.get(self._event_key(event))
-            if completed is not None:
-                completed.set()  # ``_await_commit`` reads the ledger once more, then decides.
 
         def _core_session_keys(self, source):
             """The core session keys for this Linear chat, as the runner and Base derive them."""

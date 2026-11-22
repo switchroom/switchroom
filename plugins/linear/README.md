@@ -869,10 +869,10 @@ platform_toolsets:
   linear: [linear, kanban]
 ```
 
-This route uses only upstream Hermes messaging: the shared session runtime commits
-each input, and the adapter reads that committed admission back from Core's ledger
-before it acknowledges the provider inbox. It sets no durable-input opt-in and uses no
-committed-input hook. Capability checks leave it unavailable on a Core without the
+This route uses only upstream Hermes ingress: each provider input is committed as its
+own admission through Core's producer ingress (`admit_producer`, the relay/webhook path),
+and its receipt anchors the input before the provider inbox is acknowledged. It sets no
+durable-input opt-in and uses no committed-input hook. Capability checks leave it unavailable on a Core without the
 shared runtime; ordinary plugin reads
 and native reporting remain separate. No injection flag, shared credentials or
 trusted-inbound authorization bypass is used. Creator-null automatic assignments
@@ -885,11 +885,13 @@ each effect verifies the current provider actor, app, issue and organization aga
 
 Provider retries preserve original actor, Activity, Agent Session, text and source
 time. Inbox acknowledgment follows the committed admission. A redelivery of an input
-Core already committed is answered from that row and never re-enters busy handling.
+Core already committed resolves to that row. Linear input is never steered into a
+running turn or merged with another Activity: a follow-up sent while a turn runs is
+queued as its own turn.
 A provider Stop is Core's own `/stop` for the chat, sent once per Stop Activity (a late
 redelivery cannot stop newer work), then the bridge's Stop of the linked task; the
 bridge posts the Stop notice, so Core's `/stop` reply is not repeated. Neither proves
-physical cleanup. A follow-up sent while a turn runs follows Core's busy-input mode. Replies
+physical cleanup. Replies
 remain queued until the existing scoped sender confirms publication. Linear completes an
 Agent Session on a `response`, so while tracked native work this same session started is
 unfinished, a reply goes out as a `thought` with the same text and the work's own closeout
