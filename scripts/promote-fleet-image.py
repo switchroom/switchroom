@@ -393,17 +393,20 @@ def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str,
     failed = 0
     for version in targets:
         tags = version["metadata"]["container"]["tags"]
+        version_id = version.get("id")
         if args.dry_run:
-            print(f"would delete version {version['id']} {tags} (updated {version.get('updated_at')})")
+            print(f"would delete version {version_id} {tags} (updated {version.get('updated_at')})")
             continue
         try:
-            delete(f"{base}/{int(version['id'])}")
+            if type(version_id) is not int or version_id <= 0:
+                raise Refused("expected a positive integer version ID")
+            delete(f"{base}/{version_id}")
         except Exception as exc:  # One refused delete must not stop the day's prune.
             failed += 1
-            print(f"::warning title=Prune delete failed::version {version['id']} {tags}: "
+            print(f"::warning title=Prune delete failed::version {version_id!r} {tags}: "
                   f"{type(exc).__name__}: {str(exc)[:300]}", flush=True)
             continue
-        print(f"deleted version {version['id']} {tags} (updated {version.get('updated_at')})")
+        print(f"deleted version {version_id} {tags} (updated {version.get('updated_at')})")
     done = len(targets) - failed
     print(f"{'would prune' if args.dry_run else 'pruned'} {done} stage-only version(s)"
           + (f"; {failed} delete(s) failed" if failed else ""))

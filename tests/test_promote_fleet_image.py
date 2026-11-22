@@ -235,6 +235,22 @@ class PruneTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(promote.Refused):
             promote.prune(args, api_lines=lambda _path: versions, delete=delete, now=NOW)
 
+    def test_prune_continues_without_deleting_versions_with_missing_or_malformed_ids(self) -> None:
+        import contextlib, io
+        old = "2026-11-01T00:00:00Z"
+        missing = self.version(1, ["fleet-pr-stage-1-1"], old)
+        del missing["id"]
+        malformed = dict(self.version(2, ["fleet-pr-stage-2-1"], old), id=1.5)
+        valid = self.version(3, ["fleet-pr-stage-3-1"], old)
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        deleted = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(promote.prune(args, api_lines=lambda _: [missing, malformed, valid],
+                                           delete=deleted.append, now=NOW), 1)
+        self.assertEqual(deleted, ["orgs/switchroom/packages/container/switchroom/versions/3"])
+        self.assertEqual(out.getvalue().count("expected a positive integer version ID"), 2)
+
     def test_dry_run_and_cap(self) -> None:
         versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(5)]
         deleted: list[str] = []

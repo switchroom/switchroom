@@ -26,6 +26,7 @@ jobs:
       # Push only: find the merged PR and its CI run to reuse an identical, proven tree.
       pull-requests: read
       actions: read
+      checks: read
     outputs:
       reused: ${{ steps.select.outputs.reused }}
       plan: ${{ steps.select.outputs.plan }}
@@ -63,12 +64,13 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          fetch-depth: 1
+          # The PR proof verifies both parents of the checked-out merge result.
+          fetch-depth: 2
       - name: Enforce selected work
         env:
           PLAN: ${{ needs.selection.outputs.plan }}
           RESULTS: ${{ toJSON(needs) }}
-        run: python3 scripts/source-ci.py gate --plan "$PLAN" --needs "$RESULTS"
+        run: python3 scripts/source-ci.py gate --plan "$PLAN" --needs "$RESULTS" --record-pr-proof
 
   source-tests:
     needs: selection

@@ -6,8 +6,11 @@ inputs run every unit module; runtime inputs and ambiguous history run
 everything. Image selection is independent.
 """
 import argparse
+from datetime import datetime
 import fnmatch
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -227,6 +230,48 @@ def gate(plan, needs):
 
 
 WORKFLOW_PATH = '.github/workflows/ci.yml'
+PROOF_TITLE = 'source-ci-reuse-proof'
+PROOF_PATH = 'scripts/source-ci.py'
+SHA_RE = r'[0-9a-f]{40}'
+POSITIVE_ID = r'[1-9][0-9]*'
+
+
+def source_proof(plan, *, repository, pr, base, head, tested, tree, run_id, attempt):
+    coverage = {key: plan[key] for key in ('tests', 'runtime', *LANES)}
+    encoded = json.dumps(coverage, separators=(',', ':')).encode()
+    return {'version': 1, 'repository': repository, 'pr': pr, 'base': base, 'head': head,
+            'tested': tested, 'tree': tree, 'run_id': run_id, 'attempt': attempt,
+            'coverage': hashlib.sha256(encoded).hexdigest()}
+
+
+def emit_pr_proof(plan):
+    """Record what this successful source-checks job proved for a same-repository PR to main."""
+    if os.environ.get('GITHUB_EVENT_NAME') != 'pull_request' or plan.get('reused_from'):
+        return
+    try:
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+        pr = event['pull_request']
+        repository = os.environ['GITHUB_REPOSITORY']
+        if pr['base']['ref'] != 'main' or any(pr[side]['repo']['full_name'] != repository
+                                             for side in ('base', 'head')):
+            return
+        number = str(pr['number'])
+        run_id = os.environ['GITHUB_RUN_ID']
+        attempt = os.environ['GITHUB_RUN_ATTEMPT']
+        base, head = (pr[side]['sha'] for side in ('base', 'head'))
+        tested, tree, parents = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'show', '-s', '--format=%H%n%T%n%P', 'HEAD'],
+            text=True, stderr=subprocess.PIPE, timeout=10,
+        ).splitlines()
+        if (tested != os.environ['GITHUB_SHA'] or parents.split() != [base, head]
+                or not all(re.fullmatch(SHA_RE, sha) for sha in (tested, tree, base, head))
+                or not all(re.fullmatch(POSITIVE_ID, value) for value in (number, run_id, attempt))):
+            return
+        proof = source_proof(plan, repository=repository, pr=number, base=base, head=head,
+                             tested=tested, tree=tree, run_id=run_id, attempt=attempt)
+        print(f'::notice file={PROOF_PATH},line=1,title={PROOF_TITLE}::' + json.dumps(proof, separators=(',', ':')))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f'reuse: could not record PR source proof ({type(exc).__name__})', file=sys.stderr)
 
 
 def gh_api(path):
@@ -240,16 +285,14 @@ def complete_action_page(response, field):
     return items
 
 
-def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
+def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m, file=sys.stderr)):
     """URL of a green PR CI run that already proved this push's exact tree, else None.
 
-    All three must hold: tree(sha) == tree(pr.head); `before` is an ancestor of (or equal
-    to) pr.head, so the PR was current with main; and the newest CI pull_request run for
-    pr.head concluded success with its `source-checks` aggregate green. Any doubt or API
-    error answers None, which runs the normal selection.
+    The newest run must have a successful source-checks job. Its proof must identify
+    the merged PR and show that it tested this tree with the same selection against
+    the exact pre-push base. Missing or uncertain evidence runs the normal selection.
     """
-    sha_re = r'[0-9a-f]{40}'
-    if not all(re.fullmatch(sha_re, v or '') and v != '0' * 40 for v in (sha, before)):
+    if not all(re.fullmatch(SHA_RE, v or '') and v != '0' * 40 for v in (sha, before)):
         log('reuse: no exact before/after range')
         return None
     try:
@@ -265,10 +308,10 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
             return None
         pr = merged[0]
         head = (pr.get('head') or {}).get('sha') or ''
-        if not re.fullmatch(sha_re, head):
+        if not re.fullmatch(SHA_RE, head):
             return None
         trees = [api(f'repos/{repository}/git/commits/{c}')['tree']['sha'] for c in (sha, head)]
-        if trees[0] != trees[1]:
+        if not re.fullmatch(SHA_RE, trees[0]) or trees[0] != trees[1]:
             log(f'reuse: tree of {sha} differs from PR #{pr["number"]} head {head}')
             return None
         status = api(f'repos/{repository}/compare/{before}...{head}').get('status')
@@ -287,7 +330,7 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if not runs:
             log(f'reuse: no PR CI run for {head}')
             return None
-        run = max(runs, key=lambda r: (str(r.get('created_at', '')), int(r.get('id', 0))))
+        run = max(runs, key=lambda r: (datetime.strptime(r['created_at'], '%Y-%m-%dT%H:%M:%SZ'), int(r['id'])))
         if run.get('status') != 'completed' or run.get('conclusion') != 'success':
             log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
             return None
@@ -319,11 +362,39 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if any(when >= str(run.get('created_at', '')) for when in retargets):
             log(f'reuse: PR #{pr["number"]} was retargeted after {run.get("html_url")} started')
             return None
-        job_page = api(f'repos/{repository}/actions/runs/{int(run["id"])}/jobs?filter=latest&per_page=100')
+        run_id, attempt = str(run['id']), str(run['run_attempt'])
+        if not all(re.fullmatch(POSITIVE_ID, value) for value in (run_id, attempt)):
+            log('reuse: missing a valid run or attempt ID')
+            return None
+        job_page = api(f'repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')
         jobs = complete_action_page(job_page, 'jobs')
         aggregate = [j for j in jobs if j.get('name') == 'source-checks']
-        if len(aggregate) != 1 or aggregate[0].get('conclusion') != 'success':
+        if (len(aggregate) != 1 or aggregate[0].get('status') != 'completed'
+                or aggregate[0].get('conclusion') != 'success'):
             log(f'reuse: source-checks of {run.get("html_url")} is not a single success')
+            return None
+        check_id = str(aggregate[0]['id'])
+        if not re.fullmatch(POSITIVE_ID, check_id):
+            log('reuse: missing a valid source-checks check run ID')
+            return None
+        annotations = api(f'repos/{repository}/check-runs/{check_id}/annotations?per_page=100')
+        if not isinstance(annotations, list) or len(annotations) >= 100:
+            log(f'reuse: cannot read every source-checks annotation of {run.get("html_url")}')
+            return None
+        proofs = [note for note in annotations if note.get('title') == PROOF_TITLE]
+        if len(proofs) != 1 or proofs[0].get('annotation_level') != 'notice' or proofs[0].get('path') != PROOF_PATH:
+            log(f'reuse: no single source proof for {run.get("html_url")}')
+            return None
+        message = proofs[0]['message']
+        if not isinstance(message, str) or len(message) > 1024:
+            log(f'reuse: invalid source proof in {run.get("html_url")}')
+            return None
+        proof = json.loads(message)
+        tested = proof['tested']
+        expected = source_proof(plan, repository=repository, pr=str(pr['number']), base=before, head=head,
+                                tested=tested, tree=trees[0], run_id=run_id, attempt=attempt)
+        if not re.fullmatch(SHA_RE, tested) or proof != expected:
+            log(f'reuse: source proof does not cover this push in {run.get("html_url")}')
             return None
         log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
         return run.get('html_url') or str(run['id'])
@@ -375,6 +446,7 @@ def main():
         runner.add_argument('--plan', required=True)
         if command == 'gate':
             runner.add_argument('--needs', required=True)
+            runner.add_argument('--record-pr-proof', action='store_true')
     args = parser.parse_args()
     if args.command == 'select':
         added = set(args.added)
@@ -382,9 +454,9 @@ def main():
         plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'),
                       event=args.event, added=added)
         # A fast-lane PR deferred legs to this push, so its run cannot stand in for it.
-        if (args.event == 'push' and args.reuse_repository and args.files is None
+        if (args.event == 'push' and args.reuse_repository and args.files is None and paths is not None
                 and not plan['deferred_on_pr']):
-            reuse = find_reuse(args.reuse_repository, args.head, args.base)
+            reuse = find_reuse(args.reuse_repository, args.head, args.base, plan)
             if reuse is not None:
                 plan = reused_plan(reuse)
         encoded = json.dumps(plan, separators=(',', ':'))
@@ -401,6 +473,8 @@ def main():
         return run_units(plan)
     passed = gate(plan, json.loads(args.needs))
     print('Source CI aggregate: ' + ('PASS' if passed else 'FAIL'))
+    if passed and args.record_pr_proof:
+        emit_pr_proof(plan)
     return 0 if passed else 1
 
 
