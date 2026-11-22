@@ -24,6 +24,12 @@ what main needs to rebuild cheaply:
   inputs match. It then seeds Trivy's layer cache and reports the staged digest
   for ``cache-from``.
 
+* ``prune`` (scheduled) deletes registry versions whose every tag is a
+  ``fleet-pr-stage-<run>-<attempt>`` ref and that are older than the 7-day
+  artifact window (``locate`` already ignores runs older than 72 hours). Versions
+  carrying any other tag, and untagged versions (attestations, published
+  digests), are never touched.
+
 Main still builds, runtime-checks, exports, Trivy/VEX-scans, SBOMs, pushes and
 attests its own candidate; the staged image is only build cache, and the seeded
 Trivy cache only skips re-analysing layers whose content digests (diff IDs) are
@@ -59,6 +65,8 @@ ARTIFACT_PREFIX = "fleet-image-staged-"
 WORKFLOW = "fleet-image.yml"
 WORKFLOW_PATH = ".github/workflows/fleet-image.yml"
 MAX_AGE = dt.timedelta(hours=72)
+PRUNE_AGE = dt.timedelta(days=7)
+STAGE_TAG_RE = re.compile(r"^fleet-pr-stage-[0-9]+-[0-9]+$")
 # Build inputs that live in the workflow env rather than in a tracked file. The tree
 # check already binds them (the workflow file is part of the tree); recording them
 # lets the promotion compare the values it would pass with the ones the PR used.
@@ -316,6 +324,9 @@ def locate(args: argparse.Namespace, *, api: Callable[[str], Any] = gh_json,
         "run_id": run_id,
         "build_args": build_args_from_env(),
     }
+    # A re-run attempt that did not itself stage leaves an older attempt's artifact behind;
+    # only the attempt that decided the run's conclusion counts.
+    expected["run_attempt"] = int(pr_run.get("run_attempt", 0))
     for key, value in expected.items():
         if staged.get(key) != value:
             raise Refused(f"staged {key} {staged.get(key)!r} != expected {value!r}")
@@ -351,6 +362,50 @@ def locate_command(args: argparse.Namespace) -> None:
         with args.github_output.open("a", encoding="utf-8") as handle:
             for key, value in outputs.items():
                 handle.write(f"{key}={value.replace(chr(10), ' ')}\n")
+
+
+# --- prune ------------------------------------------------------------------------
+
+
+def stage_only(version: dict[str, Any]) -> bool:
+    tags = ((version.get("metadata") or {}).get("container") or {}).get("tags")
+    return isinstance(tags, list) and bool(tags) and all(isinstance(tag, str) and STAGE_TAG_RE.fullmatch(tag)
+                                                          for tag in tags)
+
+
+def prunable(versions: list[dict[str, Any]], now: dt.datetime) -> list[dict[str, Any]]:
+    return [v for v in versions if isinstance(v, dict) and stage_only(v)
+            and now - parse_time(v.get("updated_at")) > PRUNE_AGE]
+
+
+def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str, Any]]] | None = None,
+          delete: Callable[[str], None] | None = None, now: dt.datetime | None = None) -> int:
+    now = now or dt.datetime.now(dt.timezone.utc)
+    base = f"orgs/{args.org}/packages/container/{args.package}/versions"
+    if api_lines is None:
+        def api_lines(path: str) -> list[dict[str, Any]]:
+            out = run(["gh", "api", "--paginate", path, "--jq", ".[]"], timeout=300)
+            return [json.loads(line) for line in out.splitlines() if line.strip()]
+    if delete is None:
+        def delete(path: str) -> None:
+            run(["gh", "api", "--method", "DELETE", path])
+    targets = prunable(api_lines(f"{base}?per_page=100"), now)[: args.max_deletions]
+    for version in targets:
+        tags = version["metadata"]["container"]["tags"]
+        if args.dry_run:
+            print(f"would delete version {version['id']} {tags} (updated {version.get('updated_at')})")
+        else:
+            delete(f"{base}/{int(version['id'])}")
+            print(f"deleted version {version['id']} {tags} (updated {version.get('updated_at')})")
+    print(f"{'would prune' if args.dry_run else 'pruned'} {len(targets)} stage-only version(s)")
+    return len(targets)
+
+
+def prune_command(args: argparse.Namespace) -> None:
+    try:
+        prune(args)
+    except Refused as exc:
+        fail(str(exc))
 
 
 # --- cli -------------------------------------------------------------------------
@@ -390,7 +445,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--repo-root", type=Path, default=Path("."))
     p.add_argument("--docker", default="docker")
-    p.add_argument("--timeout-seconds", type=float, default=900)
+    # Bounded so a slow staging push cannot hold the required preflight context; on timeout
+    # nothing is staged and main rebuilds.
+    p.add_argument("--timeout-seconds", type=float, default=240)
     p.add_argument("--poll-seconds", type=float, default=2.0)
     p.set_defaults(func=record)
 
@@ -405,6 +462,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo-root", type=Path, default=Path("."))
     p.add_argument("--github-output", type=Path, default=None)
     p.set_defaults(func=locate_command)
+
+    p = commands.add_parser("prune", help="delete stage-only registry versions older than the artifact window")
+    p.add_argument("--org", required=True)
+    p.add_argument("--package", required=True)
+    p.add_argument("--max-deletions", type=int, default=100)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=prune_command)
     return parser
 
 

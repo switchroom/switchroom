@@ -58,7 +58,8 @@ class LocateTests(unittest.TestCase):
         self.head_tree = TREE
         self.runs = [{"id": 99, "head_sha": HEAD, "event": "pull_request", "path": promote.WORKFLOW_PATH,
                       "head_repository": {"full_name": REPO}, "status": "completed", "conclusion": "success",
-                      "created_at": "2026-11-22T09:00:00Z", "html_url": "https://example.invalid/run/99"}]
+                      "created_at": "2026-11-22T09:00:00Z", "html_url": "https://example.invalid/run/99",
+                      "run_attempt": 1}]
         self.staged_overrides: dict = {}
         self.fanal_members: dict[str, bytes] | None = None
         env = mock.patch.dict(os.environ, BUILD_ENV)
@@ -84,6 +85,7 @@ class LocateTests(unittest.TestCase):
         self.assertEqual((repository, run_id, artifact), (REPO, 99, f"fleet-image-staged-{HEAD}"))
         sha = fanal_archive(dest / promote.FANAL_ARCHIVE, self.fanal_members)
         staged = {"schema_version": 1, "repository": IMAGE, "head_sha": HEAD, "tree": TREE, "run_id": 99,
+                  "run_attempt": 1,
                   "build_args": BUILD_ENV, "digest": DIGEST, "immutable_ref": f"{IMAGE}@{DIGEST}",
                   "fanal_sha256": sha, **self.staged_overrides}
         (dest / promote.STAGED_MANIFEST).write_text(json.dumps(staged), encoding="utf-8")
@@ -152,6 +154,7 @@ class LocateTests(unittest.TestCase):
             {"tree": "f" * 40},
             {"head_sha": "f" * 40},
             {"run_id": 98},
+            {"run_attempt": 2},
             {"repository": "ghcr.io/other/image"},
             {"build_args": {**BUILD_ENV, "CODEX_VERSION": "0.0.1"}},
             {"schema_version": 2},
@@ -179,6 +182,49 @@ class LocateTests(unittest.TestCase):
         text = output.read_text(encoding="utf-8")
         self.assertIn("found=false\n", text)
         self.assertIn("reason=no stage here\n", text)
+
+
+class PruneTests(unittest.TestCase):
+    @staticmethod
+    def version(vid: int, tags: list, updated: str) -> dict:
+        return {"id": vid, "updated_at": updated, "metadata": {"container": {"tags": tags}}}
+
+    def test_only_expired_stage_only_versions_are_deleted(self) -> None:
+        old, new = "2026-11-10T00:00:00Z", "2026-11-20T00:00:00Z"
+        versions = [
+            self.version(1, ["fleet-pr-stage-44968668829-1"], old),
+            self.version(2, ["fleet-pr-stage-1-1", "fleet-pr-stage-2-1"], old),
+            self.version(3, ["fleet-pr-stage-3-1"], new),
+            self.version(4, ["fleet-pr-stage-4-1", "sha-" + "a" * 40], old),
+            self.version(5, [], old),
+            self.version(6, ["sha256-" + "f" * 64], old),
+            self.version(7, ["fleet-stage-123-1"], old),
+            self.version(8, ["fleet-pr-stage-x-1"], old),
+            self.version(9, ["latest"], old),
+        ]
+        deleted: list[str] = []
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        count = promote.prune(args, api_lines=lambda _path: versions, delete=deleted.append, now=NOW)
+        self.assertEqual(count, 2)
+        base = "orgs/switchroom/packages/container/switchroom/versions"
+        self.assertEqual(deleted, [f"{base}/1", f"{base}/2"])
+
+    def test_dry_run_and_cap(self) -> None:
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(5)]
+        deleted: list[str] = []
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=3, dry_run=True)
+        self.assertEqual(promote.prune(args, api_lines=lambda _path: versions, delete=deleted.append, now=NOW), 3)
+        self.assertEqual(deleted, [])
+
+    def test_prune_workflow_is_scheduled_least_privilege_and_dispatch_defaults_to_dry_run(self) -> None:
+        workflow = yaml.safe_load((ROOT / ".github/workflows/fleet-image-stage-prune.yml").read_text(encoding="utf-8"))
+        triggers = workflow[True] if True in workflow else workflow["on"]
+        self.assertIn("schedule", triggers)
+        self.assertIs(triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"], True)
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        job = workflow["jobs"]["prune"]
+        self.assertEqual(job["permissions"], {"contents": "read", "packages": "write"})
+        self.assertIn("promote-fleet-image.py prune", job["steps"][-1]["run"])
 
 
 class StartPushTests(unittest.TestCase):
