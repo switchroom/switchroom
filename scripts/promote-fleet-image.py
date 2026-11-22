@@ -368,37 +368,67 @@ def locate_command(args: argparse.Namespace) -> None:
 
 
 def stage_only(version: dict[str, Any]) -> bool:
-    tags = ((version.get("metadata") or {}).get("container") or {}).get("tags")
+    metadata = version.get("metadata")
+    container = metadata.get("container") if isinstance(metadata, dict) else None
+    tags = container.get("tags") if isinstance(container, dict) else None
     return isinstance(tags, list) and bool(tags) and all(isinstance(tag, str) and STAGE_TAG_RE.fullmatch(tag)
                                                           for tag in tags)
 
 
-def prunable(versions: list[dict[str, Any]], now: dt.datetime) -> list[dict[str, Any]]:
-    return [v for v in versions if isinstance(v, dict) and stage_only(v)
-            and now - parse_time(v.get("updated_at")) > PRUNE_AGE]
+def prunable(versions: list[Any], now: dt.datetime) -> list[dict[str, Any]]:
+    targets = []
+    for version in versions:
+        if not isinstance(version, dict) or not stage_only(version):
+            continue
+        version_id = version.get("id")
+        if type(version_id) is not int or version_id <= 0:
+            print(f"::warning title=Prune candidate skipped::version {version_id!r}: "
+                  "expected a positive integer version ID", flush=True)
+            continue
+        try:
+            age = now - parse_time(version.get("updated_at"))
+        except (Refused, ValueError, TypeError, OverflowError):
+            print(f"::warning title=Prune candidate skipped::version {version_id} has an invalid updated_at", flush=True)
+            continue
+        if age > PRUNE_AGE:
+            targets.append(version)
+    return targets
 
 
-def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str, Any]]] | None = None,
+def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[Any]] | None = None,
           delete: Callable[[str], None] | None = None, now: dt.datetime | None = None) -> int:
     now = now or dt.datetime.now(dt.timezone.utc)
     base = f"orgs/{args.org}/packages/container/{args.package}/versions"
     if api_lines is None:
-        def api_lines(path: str) -> list[dict[str, Any]]:
-            out = run(["gh", "api", "--paginate", path, "--jq", ".[]"], timeout=300)
-            return [json.loads(line) for line in out.splitlines() if line.strip()]
+        def api_lines(path: str) -> list[Any]:
+            # gh prints jq strings raw. Encode every row as JSON to preserve its type.
+            out = run(["gh", "api", "--paginate", path, "--jq", ".[] | @json"], timeout=300)
+            return [json.loads(line) for line in out.split("\n") if line.strip()]
     if delete is None:
         def delete(path: str) -> None:
             run(["gh", "api", "--method", "DELETE", path])
     targets = prunable(api_lines(f"{base}?per_page=100"), now)[: args.max_deletions]
+    failed = 0
     for version in targets:
         tags = version["metadata"]["container"]["tags"]
+        version_id = version["id"]
         if args.dry_run:
-            print(f"would delete version {version['id']} {tags} (updated {version.get('updated_at')})")
-        else:
-            delete(f"{base}/{int(version['id'])}")
-            print(f"deleted version {version['id']} {tags} (updated {version.get('updated_at')})")
-    print(f"{'would prune' if args.dry_run else 'pruned'} {len(targets)} stage-only version(s)")
-    return len(targets)
+            print(f"would delete version {version_id} {tags} (updated {version.get('updated_at')})")
+            continue
+        try:
+            delete(f"{base}/{version_id}")
+        except Exception as exc:  # One refused delete must not stop the day's prune.
+            failed += 1
+            print(f"::warning title=Prune delete failed::version {version_id!r} {tags}: "
+                  f"{type(exc).__name__}: {str(exc)[:300]}", flush=True)
+            continue
+        print(f"deleted version {version_id} {tags} (updated {version.get('updated_at')})")
+    done = len(targets) - failed
+    print(f"{'would prune' if args.dry_run else 'pruned'} {done} stage-only version(s)"
+          + (f"; {failed} delete(s) failed" if failed else ""))
+    if targets and failed == len(targets):
+        raise Refused(f"every one of {failed} delete(s) failed")
+    return done
 
 
 def prune_command(args: argparse.Namespace) -> None:
