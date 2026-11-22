@@ -416,7 +416,13 @@ class CoreContractScenarios(unittest.TestCase):
             with closing(sqlite3.connect(db)):
                 pass
             context = {"board": "default", "task_id": "t_0123abcd", "run_id": 7, "db": str(db)}
-            with patch("gateway.session_kanban_stop.require_current_claim", lambda conn, ctx: None), \
+            # Core with the process-Stop fence keeps the claim check in session_kanban_stop; Core
+            # without it (Stop is the native interrupt) moved it into session_kanban.
+            try:
+                import gateway.session_kanban_stop as claim_home
+            except ImportError:
+                import gateway.session_kanban as claim_home
+            with patch.object(claim_home, "require_current_claim", lambda conn, ctx: None), \
                     patch("gateway.session_local_recovery.local_adapter_map", lambda authority: {"a": Adapter()}):
                 result = asyncio.run(session_kanban_prompts.consumer(object(), context))
         self.assertIsNone(result)

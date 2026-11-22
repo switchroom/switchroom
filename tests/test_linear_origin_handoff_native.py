@@ -28,6 +28,39 @@ R2 = "0b8f5a7e-3c1d-4e2f-9a6b-7c8d9e0f1a2b"
 R3 = "3d4e5f6a-7b8c-4d9e-8f0a-1b2c3d4e5f6a"
 
 
+def native_stop_delivery(delivered):
+    """Observe the Stop a card block delivers to the card's running worker, on either Core.
+
+    Fence Core: ``block_task`` asks ``kanban_process_stop.request_native_stop`` for the run it ended.
+    Native-Stop Core: no RPC from the block; the worker's run watch
+    (``gateway.session_kanban._watch_submitter``) sees its run aborted (a status outside
+    running/done/review/scheduled) and sends its ``kanban_stop`` frame for the managed interrupt. The
+    fixture has no live worker process, so it applies that watch's exact test right after the block.
+    """
+    try:
+        from hermes_cli import kanban_process_stop
+    except ImportError:
+        kanban_process_stop = None
+    if kanban_process_stop is not None:
+        return patch.object(kanban_process_stop, "request_native_stop", delivered)
+    import functools
+    from hermes_cli import kanban_db as kb
+    real = kb.block_task
+
+    @functools.wraps(real)
+    def block_task(conn, task_id, *args, **kwargs):
+        before = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        changed = real(conn, task_id, *args, **kwargs)
+        if changed and before is not None and before[0] is not None:
+            run = conn.execute("SELECT status FROM task_runs WHERE id=?", (before[0],)).fetchone()
+            if run is not None and run[0] not in {"running", "done", "review", "scheduled"}:
+                event = conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind='blocked' "
+                                     "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+                delivered(conn, task_id, event[0])
+        return changed
+    return patch.object(kb, "block_task", block_task)
+
+
 def load_tests(loader, tests, pattern):
     # Only this module's scenarios; the base fixture's own tests run from their module.
     return loader.loadTestsFromNames(sorted(
@@ -88,14 +121,12 @@ class Handoff(base.OriginScenarios):
     async def hand_off(self, *, issue="issue-one", metadata=META, request_id=REQUEST, wait_seconds=0, resume=False,
                        to="Nova", **extra):
         from agent import runtime_session_store
-        from hermes_cli import kanban_process_stop
         def delivered(conn, task_id, event_id):
             self.delivered.append((task_id, event_id))  # The owner's Stop reaches its worker.
             if getattr(self, "on_stop", None):
                 self.on_stop()
         self.delivered = getattr(self, "delivered", [])
-        with patch.object(runtime_session_store, "_worker_process", False), \
-                patch.object(kanban_process_stop, "request_native_stop", delivered):
+        with patch.object(runtime_session_store, "_worker_process", False), native_stop_delivery(delivered):
             if resume:
                 return await asyncio.to_thread(handoff.resume, self.linear_state, issue, "default", metadata,
                                                to=to, request_id=request_id, owner_name="Atlas")
@@ -199,14 +230,16 @@ class Handoff(base.OriginScenarios):
 
     async def lose_worker(self):
         """Core's own "Managed worker lost: managed_worker_stopped" path once the worker missed
-        STOP_ACK_SECONDS: retain_failed_stop records the stop lock, _settle_lost marks the
-        attempt's admission ``unknown``. Nothing in this gateway lifetime settles it after that."""
-        from gateway.session_kanban_stop import retain_failed_stop
+        STOP_ACK_SECONDS: a fence Core's retain_failed_stop records the stop lock (a native-Stop
+        Core records nothing), then _settle_lost marks the attempt's admission ``unknown``. Nothing
+        in this gateway lifetime settles it after that."""
         from gateway.session_managed_worker import _settle_lost
-        from gateway.session_policy import restore_policy
-        from linear_native_db import local_receipt
-        policy = restore_policy(local_receipt(self.db, self.sid)["policy"])
-        await retain_failed_stop(self.authority, self.ref, self.row, policy)
+        if base.core_stop_fence():
+            from gateway.session_kanban_stop import retain_failed_stop
+            from gateway.session_policy import restore_policy
+            from linear_native_db import local_receipt
+            policy = restore_policy(local_receipt(self.db, self.sid)["policy"])
+            await retain_failed_stop(self.authority, self.ref, self.row, policy)
         await _settle_lost(self.authority, self.row, {"epoch": self.authority.epoch, "generation": self.row["generation"],
                                                       "execution_id": self.executor}, None)
 
@@ -222,8 +255,17 @@ class Handoff(base.OriginScenarios):
         return get_session_admission(self.db, admission_id=self.admission)
 
     def stop_lock(self):
-        from gateway.session_ancillary import process_stop_pending
-        return process_stop_pending(self.db, self.sid)
+        """Core's own process-Stop checkpoint; a native-Stop Core has none to hold."""
+        from gateway import session_ancillary
+        getter = getattr(session_ancillary, "process_stop_pending", None)
+        return getter(self.db, self.sid) if callable(getter) else None
+
+    def assert_lost_stop_lock(self):
+        """A lost worker's Stop: a fence Core holds its stop lock; a native-Stop Core persists nothing."""
+        if base.core_stop_fence():
+            self.assertIsNotNone(self.stop_lock())
+        else:
+            self.assertIsNone(self.stop_lock())
 
     def resolves(self):
         return [params for method, params in self.calls if method == "prompt.resolve_unknown"]
@@ -262,7 +304,7 @@ class Handoff(base.OriginScenarios):
             result = await self.hand_off()
         self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
         self.assertEqual(self.admission_row()["status"], "unknown")
-        self.assertIsNotNone(self.stop_lock())
+        self.assert_lost_stop_lock()
         held = await self.inspected("issue-one", META, [e for e in self.owner_events() if e.kind == "blocked"][-1].id)
         self.assertEqual(held["reason"], "native_admission_not_settled")
         self.assertEqual(self.resolves(), [])
@@ -279,7 +321,11 @@ class Handoff(base.OriginScenarios):
 
     async def test_handoff_lost_attempt_with_a_live_owned_process_stays_paused(self):
         # A background process the attempt started may still be running (its checkpoint is not
-        # provably stopped): core refuses the resolve (process_stop_unknown) and nothing is handed over.
+        # provably stopped): a fence Core refuses the resolve (process_stop_unknown); a native-Stop
+        # Core settles the row (its kill is best-effort and gates nothing), but the proof's own
+        # scoped process checkpoint still holds. Either way nothing is handed over.
+        fence = base.core_stop_fence()
+        settled = ("unknown",) if fence else ("terminal", "interrupted")
         await self.lost_attempt_issue()
         route = self.authority.sessions[self.sid].route
         (self.home / "processes.json").write_text(json.dumps([{
@@ -289,13 +335,18 @@ class Handoff(base.OriginScenarios):
         result = await self.hand_off()
         self.assertFalse(result["handed_off"], result)
         self.assertEqual((result["state"], result["reason"]), ("paused", "proof_timeout"), result)
-        self.assertEqual(len(self.resolves()), 1)  # Asked once, refused by core.
-        self.assertEqual(self.admission_row()["status"], "unknown")
-        self.assertIsNotNone(self.stop_lock())
+        self.assertEqual(len(self.resolves()), 1)  # Asked once: refused by a fence Core.
+        row = self.admission_row()
+        self.assertEqual((row["status"], row["outcome"])[:len(settled)], settled)
+        self.assert_lost_stop_lock()
         self.assertEqual(self.status(), "blocked")
+        if not fence:
+            held = await self.inspected("issue-one", META, [e for e in self.owner_events() if e.kind == "blocked"][-1].id)
+            self.assertFalse(held["quiescence_proven"])
+            self.assertEqual(held["reason"], "scoped_process_cleanup_unknown")
         retry = await self.hand_off()  # Still the same answer; never handed over.
         self.assertEqual(retry["state"], "paused", retry)
-        self.assertEqual(self.admission_row()["status"], "unknown")
+        self.assertEqual(self.admission_row()["status"], settled[0])
 
     async def test_handoff_never_resolves_a_lost_attempt_under_a_persons_pause(self):
         from hermes_cli import kanban_db as kb
@@ -439,7 +490,6 @@ class Handoff(base.OriginScenarios):
     async def test_handoff_owner_cli_command(self):
         import argparse
         from agent import runtime_session_store
-        from hermes_cli import kanban_process_stop
         from hermes_fleet_linear_plugin import ops
         await self.running_issue()
         parser = argparse.ArgumentParser()
@@ -447,8 +497,7 @@ class Handoff(base.OriginScenarios):
         args = parser.parse_args(["hand-off", "ABC-1", "--issue-json", json.dumps(META), "--to", "Nova",
                                   "--from-name", "Atlas", "--request-id", REQUEST, "--wait-seconds", "5"])
         with patch.object(runtime_session_store, "_worker_process", False), \
-                patch.object(kanban_process_stop, "request_native_stop", lambda *a: None), \
-                patch("builtins.print") as printed:
+                native_stop_delivery(lambda *a: None), patch("builtins.print") as printed:
             rc = await asyncio.to_thread(ops.run, args, self.linear_state, self.home / "unused", "default",
                                          origin_settings=self.settings)
         reply = json.loads(printed.call_args.args[0])
@@ -523,7 +572,6 @@ class Handoff(base.OriginScenarios):
         ``linear hand-off`` CLI entry in-process, against Atlas's own native board and receipts."""
         import argparse
         from agent import runtime_session_store
-        from hermes_cli import kanban_process_stop
         from hermes_fleet_linear_plugin import chat, ops
         from hermes_fleet_linear_plugin.bridge import Bridge, Kanban
         from hermes_fleet_linear_plugin.store import Store
@@ -577,7 +625,7 @@ class Handoff(base.OriginScenarios):
         def take_over(request_id=REQUEST, action="take_over"):
             with self.nova_kanban, patch.object(subprocess, "run", owner_cli), \
                     patch.object(runtime_session_store, "_worker_process", False), \
-                    patch.object(kanban_process_stop, "request_native_stop", delivered):
+                    native_stop_delivery(delivered):
                 return json.loads(chat.handle(self.nova, {"action": action, "issue": ISSUE, "id": request_id},
                                               self.nova_context))
         self.take_over = take_over
