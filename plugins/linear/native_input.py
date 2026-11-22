@@ -1169,6 +1169,9 @@ def create_adapter(config, running):
             deadline = loop.time() + timeout
             try:
                 while True:
+                    with self._relay_lock:
+                        if self._event_key(event) not in self._pending:
+                            return None  # already anchored and acknowledged from its committed row
                     done = completed is not None and completed.is_set()
                     if (receipt := await self._committed_receipt(event, refused_is_absent=True)) is not None:
                         return receipt
