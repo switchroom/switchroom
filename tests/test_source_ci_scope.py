@@ -213,15 +213,15 @@ class SourceSelectionTests(unittest.TestCase):
 
 
 class FastLaneTests(unittest.TestCase):
-    def select(self, *paths, event='pull_request'):
-        result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', event, '--files', *paths],
-                                cwd=ROOT, capture_output=True, text=True)
+    def select(self, *paths, event='pull_request', added=()):
+        result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', event, '--files', *paths,
+                                 '--added', *added], cwd=ROOT, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
     def test_linear_plugin_pr_defers_component_legs_to_push(self):
-        pr = self.select('plugins/linear/api.py', 'plugins/linear/README.md')
-        push = self.select('plugins/linear/api.py', 'plugins/linear/README.md', event='push')
+        pr = self.select('plugins/linear/work.py', 'plugins/linear/README.md')
+        push = self.select('plugins/linear/work.py', 'plugins/linear/README.md', event='push')
         self.assertFalse(pr['runtime'])
         self.assertEqual(pr['tests'], push['tests'])
         self.assertTrue(push['runtime'])
@@ -231,11 +231,11 @@ class FastLaneTests(unittest.TestCase):
         self.assertIn('fast lane', pr['reason'])
 
     def test_touched_scenario_files_keep_their_legs_before_merge(self):
-        pr = self.select('plugins/linear/api.py', 'tests/test_linear_native_input_seam.py')
+        pr = self.select('plugins/linear/work.py', 'tests/test_linear_native_input_seam.py')
         self.assertTrue(pr['input'])
         self.assertFalse(pr['linear'])
         self.assertNotIn('input', pr['deferred_on_pr'])
-        pr = self.select('plugins/linear/api.py', 'tests/test_linear_active_recovery_scenarios.py')
+        pr = self.select('plugins/linear/work.py', 'tests/test_linear_active_recovery_scenarios.py')
         self.assertTrue(pr['linear'])
         self.assertFalse(pr['input'])
 
@@ -244,16 +244,62 @@ class FastLaneTests(unittest.TestCase):
                       'scripts/source-ci.py', 'scripts/run-linear-scenarios.py', 'tests/linear_fake_api.py',
                       'sidecars/linear-receiver/server.py', 'plugins/disk-cleanup/plugin.py', 'unknown.file'):
             with self.subTest(other=other):
-                plan = self.select('plugins/linear/api.py', other)
+                plan = self.select('plugins/linear/work.py', other)
                 self.assertEqual(plan['deferred_on_pr'], [])
                 self.assertNotIn('fast lane', plan['reason'])
         # Tests-only and docs-only changes have nothing to defer: they already run exactly theirs.
         self.assertEqual(self.select('tests/test_linear_ci_wait_scenarios.py')['deferred_on_pr'], [])
         self.assertEqual(self.select('README.md')['deferred_on_pr'], [])
         for event in ('workflow_dispatch', 'schedule'):
-            plan = self.select('plugins/linear/api.py', event=event)
+            plan = self.select('plugins/linear/work.py', event=event)
             self.assertTrue(plan['full'])
             self.assertEqual(plan['deferred_on_pr'], [])
+
+    def test_added_test_modules_and_authority_files_stay_gated(self):
+        new_test = 'tests/test_linear_active_recovery_scenarios.py'
+        self.assertEqual(self.select('plugins/linear/api_helpers.py', new_test, added=[new_test])['deferred_on_pr'], [])
+        self.assertNotEqual(self.select('plugins/linear/work.py', new_test)['deferred_on_pr'], [])
+        module = load_selector()
+        self.assertTrue(module.FAST_LANE_GATED)
+        for gated in sorted(module.FAST_LANE_GATED):
+            with self.subTest(gated=gated):
+                self.assertEqual(self.select(gated)['deferred_on_pr'], [])
+                self.assertEqual(self.select('plugins/linear/work.py', gated)['deferred_on_pr'], [])
+        for name in ('oauth.py', 'guard.py', 'plugin.yaml', 'handoff.py', 'bridge.py', 'origin.py'):
+            self.assertIn('plugins/linear/' + name, module.FAST_LANE_GATED)
+        self.assertEqual(self.select('plugins/linear/work.py', 'tests/fixtures/reply.md')['deferred_on_pr'], [])
+        self.assertNotEqual(self.select('plugins/linear/work.py', 'plugins/linear/README.md')['deferred_on_pr'], [])
+
+    def test_git_range_marks_added_and_renamed_tests_as_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def git(*args):
+                return subprocess.check_output(['git', '-C', tmp, *args], text=True).strip()
+            def commit(name):
+                git('add', '-A'); git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', name)
+                return git('rev-parse', 'HEAD')
+            git('init', '-q')
+            Path(tmp, 'plugins/linear').mkdir(parents=True)
+            Path(tmp, 'tests').mkdir()
+            Path(tmp, 'plugins/linear/work.py').write_text('a')
+            Path(tmp, 'tests/test_linear_plugin.py').write_text('x = 1\n' * 20)
+            base = commit('base')
+            Path(tmp, 'plugins/linear/work.py').write_text('b')
+            Path(tmp, 'tests/test_linear_status_progress.py').write_text('new')
+            head = commit('add a test')
+            def select(before, after):
+                result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', 'pull_request', '--repo', tmp,
+                                         '--base', before, '--head', after], cwd=ROOT, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+            self.assertEqual(select(base, head)['deferred_on_pr'], [])
+            git('rm', '-q', 'tests/test_linear_status_progress.py')
+            git('mv', 'tests/test_linear_plugin.py', 'tests/test_linear_task_link.py')
+            renamed = commit('rename into another existing name')
+            self.assertEqual(select(head, renamed)['deferred_on_pr'], [])
+            Path(tmp, 'plugins/linear/work.py').write_text('c')
+            Path(tmp, 'tests/test_linear_task_link.py').write_text('edited ' * 20)
+            edited = commit('edit existing')
+            self.assertNotEqual(select(renamed, edited)['deferred_on_pr'], [])
 
     def test_deferred_push_never_consults_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,10 +307,10 @@ class FastLaneTests(unittest.TestCase):
                 return subprocess.check_output(['git', '-C', tmp, *args], text=True).strip()
             git('init', '-q')
             Path(tmp, 'plugins/linear').mkdir(parents=True)
-            Path(tmp, 'plugins/linear/api.py').write_text('a')
+            Path(tmp, 'plugins/linear/work.py').write_text('a')
             git('add', '-A'); git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'a')
             before = git('rev-parse', 'HEAD')
-            Path(tmp, 'plugins/linear/api.py').write_text('b')
+            Path(tmp, 'plugins/linear/work.py').write_text('b')
             git('add', '-A'); git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'b')
             after = git('rev-parse', 'HEAD')
             result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', 'push', '--repo', tmp,
