@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -458,7 +459,8 @@ class DefaultProjectTests(ResolveBase):
         reply = self.create(team="hf")
         self.assertTrue(reply["ok"], reply)
         self.assertEqual(self.remote.created[-1]["projectId"], "proj-fleet-qa")
-        self.assertIn("'Fleet QA'", reply["message"])
+        self.assertIn("'Fleet QA', the active project this agent last filed", reply["message"])
+        self.assertIn("tell the user", reply["message"])
         self.assertEqual(self.create(team="KEN")["code"], "project_required")  # remembered per team only
 
     def test_the_team_name_given_as_project_uses_that_teams_default(self) -> None:
@@ -478,15 +480,25 @@ class DefaultProjectTests(ResolveBase):
     def test_a_team_with_one_active_project_needs_no_project(self) -> None:
         self.remote.add_team("team-solo", "SOLO", "Solo")
         self.remote.add_project("proj-solo", "Solo Work", ["team-solo"])
-        self.assertTrue(self.create(team="SOLO")["ok"])
+        reply = self.create(team="SOLO")
+        self.assertTrue(reply["ok"])
         self.assertEqual(self.remote.created[-1]["projectId"], "proj-solo")
+        self.assertIn("the team's only active project", reply["message"])
+        self.assertNotIn("last filed", reply["message"])
+
+    def test_an_unreadable_or_missing_store_only_loses_the_default(self) -> None:
+        self.assertTrue(self.create(team="HF", project="Fleet QA")["ok"])
+        with patch.object(self.store, "issue_project", side_effect=sqlite3.OperationalError("locked")):
+            self.assertEqual(self.create(team="HF")["code"], "project_required")
+        self.bridge.store = None
+        self.assertEqual(self.create(team="HF")["code"], "project_required")
 
     def test_project_none_is_not_remembered(self) -> None:
         self.assertTrue(self.create(team="HF", project="none")["ok"])
         self.assertEqual(self.create(team="HF")["code"], "project_required")
 
     def test_the_schema_states_create_requirements_up_front(self) -> None:
-        self.assertIn("create_issue id and title, plus team or project", chat.SCHEMA["description"])
+        self.assertIn("create_issue id and title, plus team, project or parent", chat.SCHEMA["description"])
         project = chat.SCHEMA["parameters"]["properties"]["project"]["description"]
         self.assertIn("last filed a new issue into", project)
         self.assertNotIn("If unsure, omit it", project)
