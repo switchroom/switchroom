@@ -17,8 +17,11 @@ Chromium `browser_exec` stays installed as the backup and for CDP-only work (`cd
 
 The downstream patch (`release/camofox-browser/official-camoufox.patch`) moves camofox-browser from
 `camoufox-js` (which stops at beta.31) to the maintainers' official `camoufox@0.5.9` npm package and
-the browser it is stamped with. It is the same change offered upstream; drop it when camofox-browser
-ships it. There is no repository fork.
+the browser it is stamped with. The same change lives on the `official-camoufox` branch of the fork
+[mekenthompson/camofox-browser](https://github.com/mekenthompson/camofox-browser) and is offered
+upstream as [jo-inc/camofox-browser#15715](https://github.com/jo-inc/camofox-browser/pull/15715).
+The image installs the published npm release plus this patch, not the fork. Once a camofox-browser
+release includes the change, the patch and the Dockerfile steps that apply it go away.
 
 Debian packages (the desktop, Chromium, fonts, runtime libraries) are not version-pinned: they come
 from the digest-pinned parent's Debian release and are covered by the image scans, like the rest of
@@ -107,8 +110,20 @@ Measured on a live agent after the first rollout:
 - The fingerprint (screen size, canvas, WebGL renderer) is regenerated on every browser launch,
   so a site sees a different device after each Bot Desktop restart; cookies persist. The window is
   also a few pixels wider than the reported screen under the Xfce frame.
-- `navigator.language` stays `en-US` while `Intl` follows the container locale (`en_AU.UTF-8`) and
-  time zone, an incoherence some bot checks look at.
+- `navigator.language` stayed `en-US` while `Intl` followed the container locale (`en_AU.UTF-8`)
+  and time zone, an incoherence some bot checks look at. Since then `service-run` gives the browser
+  the container's own pair, and the bake smoke checks `navigator.language` and the page's `Intl`
+  time zone against `LANG` and `TZ`; a live agent has not been re-measured yet.
+  The locale comes from `LC_ALL`, else `LANG`, without its charset or modifier (`en_AU.UTF-8`
+  becomes `en-AU`; `C` and `POSIX` count as unset). The time zone comes from `TZ` (a leading `:`
+  is dropped). `TZ` is the real source: the fallback, `/etc/timezone`, is not shipped by Debian 13's
+  tzdata, so it is used only if an image adds it. Before the pair is passed, node checks it the way
+  camofox-browser does (`Intl.getCanonicalLocales`, an `Intl.DateTimeFormat` time zone), because a
+  value it rejects, such as `LANG=UTF-8` or `TZ=AEST-10`, would stop camofox-browser starting. A
+  rejected pair (logged in one line) or an incomplete one is not passed at all, and the browser
+  keeps its own default. Set `CAMOFOX_LOCALE` and `CAMOFOX_TIMEZONE` to choose the pair
+  explicitly (they are not checked); set both, because camofox-browser refuses to start with only
+  one. Keep the time zone consistent with where the agent's traffic exits.
 - Typing through `browser_type` fills fields at once; only cursor movement is humanised (a click
   moves the pointer along a curved path for about half a second).
 - An interactive Cloudflare Turnstile widget waits at "Verify you are human"; that is the human's

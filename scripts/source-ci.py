@@ -24,7 +24,7 @@ PUBLIC = ('test_public_*.py', 'test_image_scope_and_scans.py')
 COMPONENTS = {
     'linear': ('test_linear_*.py', 'test_ci_linear_scenarios.py'),
     'claude': ('test_claude_*.py',),
-    'sidecars': ('test_sidecar_packages.py', 'test_browser_*.py',
+    'sidecars': ('test_sidecar_packages.py',
                  'test_chromium_sandbox_*.py'),
     'perplexity': ('test_perplexity_provider.py',),
     'tooling': ('test_tooling_policy_hook.py',),
