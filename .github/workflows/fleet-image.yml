@@ -75,8 +75,12 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
   preflight_bake:
-    # Read-only PR and manual bakes never receive package write credentials or write a registry ref.
-    # Pushes to main skip preflight: the publish job rebuilds and re-scans the exact commit itself.
+    # PR and manual bakes never publish. A same-repository PR bake whose merge tree equals its head
+    # tree pushes its candidate to a run-unique fleet-pr-stage-* ref that nothing deploys; once every
+    # gate below has passed it uploads a staged.json binding that digest, the tree and the build
+    # inputs. Main publish uses it only as build cache and Trivy layer cache for the same tree and
+    # still builds, scans and attests its own candidate (scripts/promote-fleet-image.py).
+    # Fork PRs get a read-only token, so they never stage. Pushes to main skip preflight.
     needs: scope
     if: >-
       !cancelled() &&
@@ -90,7 +94,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: read
+      packages: write # fleet-pr-stage-* build cache only; same-repository PRs only (see above)
     steps:
       - name: Checkout exact workflow revision
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -153,6 +157,8 @@ jobs:
           echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
           echo "$dir" >> "$GITHUB_PATH"
+          # Outside the build context; the layer-analysis cache (fanal) is staged from PR to main.
+          echo "TRIVY_CACHE_DIR=$RUNNER_TEMP/trivy-cache" >> "$GITHUB_ENV"
           "$dir/trivy" --version
 
       - name: Install pinned Syft
@@ -209,6 +215,8 @@ jobs:
           load: true
           push: false
           tags: ${{ env.TEST_IMAGE }}
+          # Inline cache metadata lets main reuse these layers when it builds the same tree.
+          cache-to: type=inline
           build-args: |
             AGENT_IMAGE=${{ steps.agent.outputs.AGENT_IMAGE }}
             ONEPASSWORD_CLI_IMAGE=${{ env.ONEPASSWORD_CLI_IMAGE }}
@@ -370,6 +378,27 @@ jobs:
             --output fleet-image.spdx.json \
             --state "$SBOM_STATE"
 
+      - name: Start staging push of the PR candidate
+        # Best effort and never consumed unless the gates below pass and record it: overlaps Trivy
+        # and Syft. Refuses (notice, no push) when the merge tree differs from the PR head tree.
+        id: stage_push
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STAGING_IMAGE: ${{ env.IMAGE_REPOSITORY }}:fleet-pr-stage-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote-fleet-image.py start-push \
+            --image "$TEST_IMAGE" \
+            --staging-image "$STAGING_IMAGE" \
+            --repository "$GITHUB_REPOSITORY" \
+            --head-sha "$HEAD_SHA" \
+            --state "$RUNNER_TEMP/stage-push"
+
       - name: Scan critical image vulnerabilities
         # CRITICAL, fixed-only vulnerability scan of the exported archive with the prefetched database.
         run: |
@@ -404,6 +433,41 @@ jobs:
             --schema release/spdx-2.3-schema.json \
             fleet-image.spdx.json \
             fleet-image.attestation.spdx.json
+
+      - name: Record staged candidate for main
+        # Only reached when every gate above passed. Binds the pushed digest to the scanned config,
+        # the tree and the build inputs, and packages Trivy's layer-analysis cache.
+        id: stage
+        if: steps.stage_push.outcome == 'success'
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STAGING_IMAGE: ${{ env.IMAGE_REPOSITORY }}:fleet-pr-stage-${{ github.run_id }}-${{ github.run_attempt }}
+          SCANNED_CONFIG_ID: ${{ steps.export.outputs.config-id }}
+          AGENT_IMAGE: ${{ steps.agent.outputs.AGENT_IMAGE }}
+        run: |
+          set -euo pipefail
+          python3 scripts/promote-fleet-image.py record \
+            --state "$RUNNER_TEMP/stage-push" \
+            --repository "$IMAGE_REPOSITORY" \
+            --staging-image "$STAGING_IMAGE" \
+            --config-id "$SCANNED_CONFIG_ID" \
+            --source-sha "$GITHUB_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --trivy-cache-dir "$TRIVY_CACHE_DIR" \
+            --output-dir "$RUNNER_TEMP/staged"
+
+      - name: Upload staged candidate record
+        if: steps.stage.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fleet-image-staged-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/staged
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload pre-publication evidence
         if: always()
@@ -551,6 +615,8 @@ jobs:
           echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tgz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/trivy.tgz" -C "$dir" trivy
           echo "$dir" >> "$GITHUB_PATH"
+          # Outside the build context; the layer-analysis cache (fanal) is staged from PR to main.
+          echo "TRIVY_CACHE_DIR=$RUNNER_TEMP/trivy-cache" >> "$GITHUB_ENV"
           "$dir/trivy" --version
 
       - name: Install pinned Syft
@@ -581,11 +647,35 @@ jobs:
           "$dir/syft" version
           echo "cmd=$dir/syft" >> "$GITHUB_OUTPUT"
 
-      - name: Pull exact Agent parent and prefetch scan tooling
-        # The multi-GB parent pull is network-bound; the Trivy database download and the hashed
-        # SPDX validator install ride alongside it. Every background job is waited on and fails closed.
+      - name: Locate tree-identical PR stage
+        # Fail open: anything short of a verified same-tree, same-inputs, all-gates-green PR stage
+        # reports found=false and the candidate is built from scratch. Seeds Trivy's layer cache.
+        id: stage
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          python3 scripts/promote-fleet-image.py locate \
+            --repository "$GITHUB_REPOSITORY" \
+            --image-repository "$IMAGE_REPOSITORY" \
+            --sha "$GITHUB_SHA" \
+            --before "$BEFORE" \
+            --trivy-cache-dir "$TRIVY_CACHE_DIR" \
+            --workdir "$RUNNER_TEMP" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Pull exact Agent parent and prefetch scan tooling
+        # The multi-GB parent pull is network-bound; the Trivy database download and the hashed
+        # SPDX validator install ride alongside it. Every background job is waited on and fails closed,
+        # except the optional PR stage pull, which only warms the build cache.
+        env:
+          STAGED_REF: ${{ steps.stage.outputs.found == 'true' && steps.stage.outputs.ref || '' }}
+        run: |
+          set -euo pipefail
+          staged_pull=""
+          if [ -n "$STAGED_REF" ]; then docker pull "$STAGED_REF" & staged_pull=$!; fi
           docker pull "$AGENT_IMAGE" & agent_pull=$!
           docker pull "$ONEPASSWORD_CLI_IMAGE" & op_pull=$!
           python3 scripts/scan-fleet-image.py prefetch-db & trivy_db=$!
@@ -597,8 +687,41 @@ jobs:
           wait "$op_pull"
           wait "$trivy_db"
           wait "$pip_install"
+          if [ -n "$staged_pull" ]; then
+            wait "$staged_pull" || echo "::warning::PR stage pull failed; the build falls back to its own layers"
+          fi
+
+      - name: Build exact publish candidate reusing the PR stage as cache
+        # Same Dockerfile, context and build args; only the FLEET_GIT_SHA-stamped tail misses the
+        # cache. Any failure falls through to the from-scratch build below.
+        id: build_cached
+        if: steps.stage.outputs.found == 'true'
+        continue-on-error: true
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.TEST_IMAGE }}
+          cache-from: type=registry,ref=${{ steps.stage.outputs.ref }}
+          build-args: |
+            AGENT_IMAGE=${{ env.AGENT_IMAGE }}
+            ONEPASSWORD_CLI_IMAGE=${{ env.ONEPASSWORD_CLI_IMAGE }}
+            CLAUDE_CODE_VERSION=${{ env.CLAUDE_CODE_VERSION }}
+            CLAUDE_AGENT_ACP_VERSION=${{ env.CLAUDE_AGENT_ACP_VERSION }}
+            CODEX_VERSION=${{ env.CODEX_VERSION }}
+            GROK_VERSION=${{ env.GROK_VERSION }}
+            CLAUDE_ACP_PLUGIN_SOURCE=${{ env.CLAUDE_ACP_PLUGIN_SOURCE }}
+            CLAUDE_ACP_PLUGIN_REVISION=${{ env.CLAUDE_ACP_PLUGIN_REVISION }}
+            FLEET_GIT_SHA=${{ github.sha }}
+            FLEET_IMAGE_IDENTITY=${{ env.IMAGE_REPOSITORY }}
+          secrets: |
+            github_token=${{ github.token }}
 
       - name: Build and scan exact publish candidate
+        if: steps.stage.outputs.found != 'true' || steps.build_cached.outcome != 'success'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
