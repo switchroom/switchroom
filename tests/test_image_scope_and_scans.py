@@ -68,6 +68,18 @@ class ChangeScopeDecisionTests(unittest.TestCase):
                     self.assertTrue(run)
                     self.assertEqual(matched, [path])
 
+    def test_pin_only_pull_requests_skip_the_bake_but_pushes_still_bake(self):
+        pin = ["release/agent-image-manifest.json", "plugins/disk-cleanup/UPSTREAM.json"]
+        run, reason, _ = self.scope.decide("pull_request", "a" * 40, "b" * 40, lambda *_: list(pin))
+        self.assertFalse(run)
+        self.assertIn("pin-only", reason)
+        run, _, _ = self.scope.decide("push", "a" * 40, "b" * 40, lambda *_: list(pin))
+        self.assertTrue(run)
+        for extra in ("Dockerfile", "plugins/disk-cleanup/__init__.py", "plugins/a/b/UPSTREAM.json"):
+            with self.subTest(extra=extra):
+                run, _, _ = self.scope.decide("pull_request", "a" * 40, "b" * 40, lambda *_: [*pin, extra])
+                self.assertTrue(run, extra)
+
     def test_pull_request_diffs_against_the_merge_base_and_push_against_before(self):
         calls = []
         self.scope.decide("pull_request", "base", "head", lambda b, h, m: calls.append((b, h, m)) or [])

@@ -39,6 +39,18 @@ EXACT = {'scripts/claude-acp-subscription': 'claude',
          'scripts/tooling-policy-hook': 'tooling',
          'scripts/sidecar_image_ref.py': 'sidecars'}
 SELECTOR_INPUTS = {'scripts/source-ci.py', 'tests/test_source_ci_scope.py'}
+# A PR that only moves the Agent pin (the release bot's "release: pin Agent" PRs) is
+# already proven upstream: the Agent commit passed its own CI before it was published.
+# Its PR runs only the pin/provenance contract tests; the full suite and the real-Agent
+# runtime lanes run once, on the main push, and that exact-SHA run gates publication
+# (fleet-image.yml "Verify exact main CI gate"). Pushes are never narrowed this way.
+PIN_FILES = {'release/agent-image-manifest.json'}
+PIN_PATTERNS = ('plugins/*/UPSTREAM.json',)
+PIN_TESTS = (
+    'tests/test_camoufox_runtime.py', 'tests/test_disk_cleanup_plugin.py',
+    'tests/test_image_release.py', 'tests/test_image_scope_and_scans.py',
+    'tests/test_public_product.py', 'tests/test_source_ci_scope.py',
+)
 # These test modules also supply fixtures to other modules. Broaden to their
 # component rather than maintaining a second, fragile per-test import graph.
 SHARED_TESTS = {
@@ -61,8 +73,17 @@ def inventory():
     return sorted(str(p.relative_to(ROOT)) for p in (ROOT / 'tests').glob('test_*.py'))
 
 
-def select(paths, full=False, reason='changed paths'):
+def is_pin_only(paths):
+    return bool(paths) and all(
+        p in PIN_FILES or any(fnmatch.fnmatch(p, pat) for pat in PIN_PATTERNS) for p in paths)
+
+
+def select(paths, full=False, reason='changed paths', event='push'):
     available = inventory()
+    if not full and event == 'pull_request' and is_pin_only(paths):
+        lanes = {lane: False for lane in LANES}
+        return {'tests': sorted(t for t in PIN_TESTS if t in available), **lanes, 'runtime': False,
+                'full': False, 'reason': 'pin-only PR: full suite runs on the main push that gates publication'}
     tests = set()
     lanes = {lane: False for lane in LANES}
     for path in paths:
@@ -184,7 +205,8 @@ def main():
     args = parser.parse_args()
     if args.command == 'select':
         paths = args.files if args.files is not None else changed_paths(args.repo, args.event, args.base, args.head)
-        plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'))
+        plan = select(paths or [], full=paths is None or args.event not in ('push', 'pull_request'),
+                      event=args.event)
         encoded = json.dumps(plan, separators=(',', ':'))
         print(encoded)
         if args.github_output:

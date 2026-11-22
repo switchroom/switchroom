@@ -72,6 +72,16 @@ IMAGE_INPUT_PREFIXES: tuple[str, ...] = (
 )
 
 
+# The release bot's Agent pin PRs change only these. The main push still bakes, scans and
+# publishes the image after its exact-SHA CI run is green, so a PR bake of the same bytes
+# is a duplicate. Only pull_request events are narrowed; pushes always bake.
+PIN_FILES: frozenset[str] = frozenset({"release/agent-image-manifest.json"})
+
+
+def is_pin_path(path: str) -> bool:
+    return path in PIN_FILES or (path.startswith("plugins/") and path.endswith("/UPSTREAM.json") and path.count("/") == 2)
+
+
 def is_image_input(path: str) -> bool:
     return path in IMAGE_INPUT_FILES or any(path.startswith(prefix) for prefix in IMAGE_INPUT_PREFIXES)
 
@@ -110,6 +120,8 @@ def decide(
         return True, f"{event or 'unknown'} event always bakes the image", []
     if paths is None:
         return True, f"changed range {base[:12] or '?'}..{head[:12] or '?'} cannot be determined; failing open", []
+    if event == "pull_request" and paths and all(is_pin_path(path) for path in paths):
+        return False, "pin-only PR: the main push bakes, scans and publishes after full CI", []
     matched = image_inputs(paths)
     if matched:
         return True, f"{len(matched)} of {len(paths)} changed path(s) are Fleet image inputs", matched

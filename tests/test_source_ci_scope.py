@@ -99,6 +99,19 @@ class SourceSelectionTests(unittest.TestCase):
                 self.assertTrue(plan['candidate'])
                 self.assertTrue(plan['runtime'])
 
+    def test_pin_only_pull_request_runs_contract_tests_and_push_stays_full(self):
+        pin = ('release/agent-image-manifest.json', 'plugins/disk-cleanup/UPSTREAM.json')
+        plan = self.select(*pin, extra=('--event', 'pull_request'))
+        self.assertFalse(plan['full'])
+        self.assertFalse(plan['runtime'])
+        self.assertFalse(plan['candidate'])
+        self.assertIn('tests/test_disk_cleanup_plugin.py', plan['tests'])
+        self.assertIn('tests/test_image_release.py', plan['tests'])
+        self.assertTrue(self.select(*pin, extra=('--event', 'push'))['full'])
+        self.assertTrue(self.select(*pin, 'Dockerfile', extra=('--event', 'pull_request'))['full'])
+        mixed = self.select(*pin, 'plugins/linear/plugin.py', extra=('--event', 'pull_request'))
+        self.assertTrue(mixed['runtime'])
+
     def test_manual_and_schedule_are_full_inventory(self):
         inventory = sorted(str(p.relative_to(ROOT)) for p in (ROOT / 'tests').glob('test_*.py'))
         for event in ('workflow_dispatch', 'schedule'):
