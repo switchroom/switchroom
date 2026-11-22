@@ -36,6 +36,7 @@ IMAGE_INPUT_FILES: frozenset[str] = frozenset(
         "release/honcho-requirements.txt",
         "release/honcho-sdk-requirements.txt",
         "scripts/patch-honcho-core-imports.py",
+        "scripts/promote-fleet-image.py",
         "scripts/patch-honcho-gateway-turn-filter.py",
         "scripts/patch-honcho-kanban-observation.py",
         "scripts/patch-honcho-sdk-floor.py",
