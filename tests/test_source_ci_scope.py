@@ -22,7 +22,7 @@ class SourceSelectionTests(unittest.TestCase):
         plan = self.select('security/README.md', 'docs/image-release.md', 'README.md',
                            'plugins/linear/README.md', 'plugins/claude-account-connectors/README.md')
         self.assertEqual(plan['tests'], [])
-        for lane in ('linear', 'acp', 'origin', 'input', 'journey', 'candidate', 'runtime'):
+        for lane in ('linear', 'acp', 'origin', 'input', 'journey', 'runtime'):
             self.assertFalse(plan[lane], lane)
 
     def test_test_only_selects_exact_module_and_required_runner(self):
@@ -37,7 +37,7 @@ class SourceSelectionTests(unittest.TestCase):
                 self.assertEqual(plan['runtime'], lane is not None)
                 if lane:
                     self.assertTrue(plan[lane])
-        self.assertTrue(self.select('tests/test_linear_existing_work_scenarios.py')['candidate'])
+        self.assertTrue(self.select('tests/test_linear_existing_work_scenarios.py')['linear'])
 
     def test_shared_test_modules_select_transitive_consumers(self):
         for path, consumer in (
@@ -55,11 +55,6 @@ class SourceSelectionTests(unittest.TestCase):
         self.assertTrue(self.select('tests/test_linear_native_work_journey.py')['journey'])
         self.assertTrue(self.select('tests/test_linear_worker_questions.py')['runtime'])
         self.assertTrue(self.select('tests/test_linear_worker_questions.py')['journey'])
-
-    def test_candidate_fixture_is_not_lost(self):
-        plan = self.select('tests/candidate_hf578.py')
-        self.assertTrue(plan['candidate'])
-        self.assertFalse(plan['runtime'])
 
     def test_components_and_transitive_contracts(self):
         cases = {
@@ -96,7 +91,6 @@ class SourceSelectionTests(unittest.TestCase):
             with self.subTest(path=path):
                 plan = self.select(path)
                 self.assertTrue(plan['full'])
-                self.assertTrue(plan['candidate'])
                 self.assertTrue(plan['runtime'])
 
     def test_manual_and_schedule_are_full_inventory(self):
@@ -190,15 +184,15 @@ class WorkflowContractTests(unittest.TestCase):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         import re
         jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', text.split('jobs:\n', 1)[1], re.M | re.S))
-        self.assertEqual(set(jobs), {'selection', 'source-tests', 'runtime', 'candidate-hf578', 'source-checks', 'history-root'})
-        self.assertIn('needs: [selection, source-tests, runtime, candidate-hf578]', jobs['source-checks'])
+        self.assertEqual(set(jobs), {'selection', 'source-tests', 'runtime', 'source-checks', 'history-root'})
+        self.assertIn('needs: [selection, source-tests, runtime]', jobs['source-checks'])
         self.assertIn('if: always()', jobs['source-checks'])
         self.assertIn('source-ci.py gate', jobs['source-checks'])
         self.assertIn('toJSON(needs)', jobs['source-checks'])
         self.assertIn('needs.selection.outputs.plan', jobs['source-checks'])
-        for job, flag in [('runtime', 'runtime'), ('candidate-hf578', 'candidate')]:
-            self.assertIn('needs: selection', jobs[job])
-            self.assertIn("needs.selection.outputs." + flag + " == 'true'", jobs[job])
+        self.assertIn('needs: selection', jobs['runtime'])
+        self.assertIn("needs.selection.outputs.runtime == 'true'", jobs['runtime'])
+        self.assertNotIn('candidate-hf578', text)
         self.assertIn('source-ci.py units', jobs['source-tests'])
         self.assertIn('needs.selection.outputs.plan', jobs['source-tests'])
         for flag in ('linear', 'acp', 'origin', 'input', 'journey'):
@@ -218,17 +212,16 @@ class AggregateTests(unittest.TestCase):
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        import itertools
-        for selected, candidate in itertools.product((False, True), repeat=2):
-            plan = {'runtime': selected, 'candidate': candidate}
+        for selected in (False, True):
+            plan = {'runtime': selected}
             good = {'selection': {'result': 'success'}, 'source-tests': {'result': 'success'},
-                    'runtime': {'result': 'success' if selected else 'skipped'},
-                    'candidate-hf578': {'result': 'success' if candidate else 'skipped'}}
+                    'runtime': {'result': 'success' if selected else 'skipped'}}
             self.assertTrue(module.gate(plan, good))
             self.assertFalse(module.gate(plan, {}))
+            self.assertFalse(module.gate(plan, {**good, 'candidate-hf578': {'result': 'success'}}))
             for job in good:
                 for state in ('failure', 'cancelled', 'skipped', None):
-                    if state == 'skipped' and ((job == 'runtime' and not selected) or (job == 'candidate-hf578' and not candidate)):
+                    if state == 'skipped' and job == 'runtime' and not selected:
                         continue
                     broken = {k: dict(v) for k, v in good.items()}
                     if state is None:

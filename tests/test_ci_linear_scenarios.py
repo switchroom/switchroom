@@ -167,7 +167,7 @@ class LinearScenarioLaneTests(unittest.TestCase):
 
     def test_ci_provisions_manifest_revision_and_runs_separately(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        source_job = workflow.split("  runtime:\n", 1)[1].split("\n  candidate-hf578:", 1)[0]
+        source_job = workflow.split("  runtime:\n", 1)[1].split("\n  history-root:", 1)[0]
         self.assertIn("scripts/read-agent-image-manifest.py", source_job)
         self.assertIn("ref: ${{ steps.agent.outputs.AGENT_REVISION }}", source_job)
         self.assertIn("scripts/run-linear-scenarios.py", source_job)
