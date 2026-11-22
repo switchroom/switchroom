@@ -125,9 +125,10 @@ class PrParkScenarios(unittest.TestCase):
 
                 # Recreate the legacy task, event and run via the original park writer's block path.
                 last_event_id = db.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task,)).fetchone()[0]
+                stop_kwargs = {"stops": []} if "stops" in inspect.signature(_block_task).parameters else {}
                 self.assertTrue(_block_task(
                     db, task, reason=reason, kind="needs_input", expected_run_id=None,
-                    expected_event_id=last_event_id, stops=[], count_recurrence=False, source="respawn_guard",
+                    expected_event_id=last_event_id, count_recurrence=False, source="respawn_guard", **stop_kwargs,
                 ))
         park = self.events(task)[-1]
         blocked_task = self.board.get(task)
