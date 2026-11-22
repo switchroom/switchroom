@@ -160,6 +160,9 @@ class FinalDeliveryAdmissionScenarios(unittest.IsolatedAsyncioTestCase):
             release["first"].set()
             await asyncio.wait_for(started["second"].wait(), 10)
             self.assertEqual(captured["second"]["_linear_status_source"], "second")
+            # The queued turn can start before the first turn's final reply closes the first
+            # producer's steps; that close invalidates any step scheduled before it. Step after it.
+            await self.until(lambda: (self.ISSUE, self.SESSION, "first") in self.adapter._step_closed)
             await step(captured["second"], 3000)
             self.assertEqual([(x["source_activity"], x["content"]["parameter"]) for x in actions()],
                              [("first", "on reading"), ("second", "in the terminal")],
