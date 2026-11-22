@@ -160,6 +160,17 @@ class CleanupLineage(base.OriginScenarios):
         getter = getattr(session_ancillary, "process_stop_pending", None)
         await self.stopped_issue()
         tip = self.compressed(self.sid, "-compressed")
+        if getter is None and base.core_native_stop():
+            # Native-Stop Core: no fixture getter, Core's own reader. A Stop of the lineage tip is a
+            # best-effort kill that persists nothing, so no marker holds the proof.
+            self.enterContext(patch.object(session_ancillary, "process_stop_pending", None, create=True))
+            await session_ancillary.stop_session_processes(
+                self.authority, SessionRef(profile_id=str(self.home), session_id=tip))
+            evidence = await self.cleanup_inspected()
+            self.assertTrue(evidence["quiescence_proven"], evidence)
+            self.assertEqual(evidence["stop_checkpoint"], "clear")
+            self.assertNoProcessStopCheckpoint()
+            return
         if getter is not None:
             self.enterContext(patch.object(session_ancillary, "process_stop_pending", getter))
             ref = SessionRef(profile_id=str(self.home), session_id=tip)

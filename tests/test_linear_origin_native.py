@@ -26,6 +26,18 @@ plugin = load_plugin()
 from hermes_fleet_linear_plugin import origin, transport, work, cleanup
 
 
+def core_stop_fence():
+    """Does this Core persist the process-Stop fence (``record_process_stop``/``process_stop_pending``)?"""
+    from gateway import session_ancillary
+    return callable(getattr(session_ancillary, "record_process_stop", None))
+
+
+def core_native_stop():
+    """Is this Core's Stop the native interrupt plus a best-effort kill, with no checkpoint to read?"""
+    from gateway import session_ancillary
+    return not core_stop_fence() and callable(getattr(session_ancillary, "stop_session_processes", None))
+
+
 @unittest.skipUnless(SOURCE and GUARDED_ROOT, "requires the guarded manifest-pinned origin proof entrypoint")
 class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -293,17 +305,33 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
 
     async def test_registered_evidence_tools_on_async_provider_loop_preserve_pending_stop(self):
         from gateway import session_ancillary
+        fence = core_stop_fence()
         for action in ("origin_reference", "work_reference"):
             with self.subTest(action=action):
                 if action == "origin_reference":
                     await self.local()
                 else:
                     await self.kanban()
-                session_ancillary.record_process_stop(self.authority, self.ref, self.row["generation"])
-                result = await self.async_registered_tool(action)
-                self.assertFalse(result["ok"])
-                self.assertNotIn("reference", result)
-                self.assertIsNotNone(session_ancillary.process_stop_pending(self.db, self.sid))
+                if fence:
+                    session_ancillary.record_process_stop(self.authority, self.ref, self.row["generation"])
+                    result = await self.async_registered_tool(action)
+                    self.assertFalse(result["ok"])
+                    self.assertNotIn("reference", result)
+                    self.assertIsNotNone(session_ancillary.process_stop_pending(self.db, self.sid))
+                else:
+                    # Native Stop: a best-effort kill that persists nothing, so no checkpoint holds the read.
+                    await session_ancillary.stop_session_processes(self.authority, self.ref)
+                    result = await self.async_registered_tool(action)
+                    self.assertTrue(result["ok"], result)
+                    self.assertIn("reference", result)
+                    self.assertNoProcessStopCheckpoint()
+
+    def assertNoProcessStopCheckpoint(self):
+        """A native-Stop Core never persists a process-Stop fence key for this session."""
+        from gateway import session_ancillary
+        self.assertFalse(callable(getattr(session_ancillary, "process_stop_pending", None)))
+        keys = [row[0] for row in self.db._read_all("SELECT key FROM state_meta")]
+        self.assertFalse([key for key in keys if isinstance(key, str) and key.startswith("gateway.process_stop")], keys)
 
     def during_origin_readback(self, change):
         """Run a finite fixture writer during the second actual owner receipt."""
@@ -387,6 +415,16 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         await self.messaging("telegram")
         ref = (await self.current())["reference"]
         supported = callable(getattr(session_ancillary, "process_stop_pending", None))
+        if not supported and core_native_stop():
+            # Native-Stop Core: a Stop during the readback is a best-effort kill with no checkpoint,
+            # so the current origin still reads, its Stop evidence clear (never proof of quiescence).
+            await session_ancillary.stop_session_processes(self.authority, self.ref)
+            evidence = await self.inspected(ref)
+            self.assertEqual(evidence["stop_evidence"]["state"], "clear")
+            self.assertFalse(evidence["stop_evidence"]["quiescence_proven"])
+            self.assertFalse(evidence["permission_granted"])
+            self.assertNoProcessStopCheckpoint()
+            return
         key = "fixture.pending.stop." + self.sid
         # Pinned fae lacks the optional getter. Its adapter reads real native meta;
         # compatibility Core exercises the actual native checkpoint writer/getter.
@@ -1345,12 +1383,12 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_unsupported_pending_and_live_admission_are_unknown(self):
         from gateway import session_ancillary
         await self.stopped_issue()
-        with patch.object(session_ancillary, "process_stop_pending", None), \
+        with patch.object(session_ancillary, "process_stop_pending", None, create=True), \
                 patch.object(session_ancillary, "stop_session_processes", None, create=True):
             result = await self.cleanup_inspected()
         self.assertEqual(result["reason"], "native_stop_checkpoint_unsupported")
         # A core whose Stop is the native interrupt plus a best-effort kill has no Stop checkpoint at all.
-        with patch.object(session_ancillary, "process_stop_pending", None), \
+        with patch.object(session_ancillary, "process_stop_pending", None, create=True), \
                 patch.object(session_ancillary, "stop_session_processes", lambda *a, **k: None, create=True):
             result = await self.cleanup_inspected()
         self.assertNotIn(result.get("reason"), ("native_stop_checkpoint_unsupported", "native_stop_checkpoint_pending"))
@@ -2125,8 +2163,10 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
         await self.local()
         interactive = (await self.current())["reference"]
         supported = callable(getattr(session_ancillary, "process_stop_pending", None))
+        native = not supported and core_native_stop()
         # An in-flight Stop retains a started receipt. A supported pending
-        # checkpoint refuses; the older ABI reports unknown, never clear.
+        # checkpoint refuses; a native-Stop Core has no checkpoint, so it reads
+        # clear (never quiescence); the older ABI reports unknown, never clear.
         # Adopt only a finite interrupt endpoint so the older Core does not
         # need its unrelated gateway bootstrap to inspect a cached-agent slot.
         self.authority.adopt_agent(self.sid, self.row["generation"], SimpleNamespace(interrupt=lambda *args: None))
@@ -2136,15 +2176,17 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
                 await self.inspected(interactive)
         else:
             evidence = await self.inspected(interactive)
-            self.assertEqual(evidence["stop_evidence"]["state"], "unknown")
+            self.assertEqual(evidence["stop_evidence"]["state"], "clear" if native else "unknown")
             self.assertFalse(evidence["stop_evidence"]["quiescence_proven"])
+            if native:
+                self.assertNoProcessStopCheckpoint()
         settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
             await self.inspected(interactive)
         await self.kanban()
         current = (await self.work_current())["reference"]
-        self.assertEqual((await self.work_inspected(current))["stop_evidence"]["state"], "clear" if supported else "unknown")
+        self.assertEqual((await self.work_inspected(current))["stop_evidence"]["state"], "clear" if supported or native else "unknown")
         # The corrective core's existing getter reads a single native meta checkpoint. Test
         # that optional ABI against real native RO state, without changing the pinned core.
         key = "fixture.pending.stop." + self.sid
@@ -2488,7 +2530,9 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(transport.Unavailable):
                 await self.inspected(ref)
         else:
-            self.assertEqual((await self.inspected(ref))["stop_evidence"]["state"], "unknown")
+            # A native-Stop Core has no checkpoint to read: clear, never quiescence; older ABI: unknown.
+            self.assertEqual((await self.inspected(ref))["stop_evidence"]["state"],
+                             "clear" if core_native_stop() else "unknown")
         settle_session_input(self.db, epoch=self.authority.epoch, admission_id=self.admission,
                              generation=self.row["generation"], outcome="interrupted")
         with self.assertRaises(transport.Unavailable):
