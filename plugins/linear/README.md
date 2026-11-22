@@ -1096,7 +1096,11 @@ limits before effects. These commands do not create a controller route or execut
 
 Both owner inspections return `stop_evidence`. Where the existing native
 `process_stop_pending` getter is supported, a pending checkpoint refuses inspection; a clear
-checkpoint is labelled `clear`. Older compatible cores report `unknown`, never false. In
+checkpoint is labelled `clear`. A core whose Stop is the native interrupt plus a best-effort
+kill (`stop_session_processes`, no fence) has no checkpoint to read: it reports `clear` with
+source `native_stop_without_checkpoint`, which says only that nothing is pending, and a
+`gateway.process_stop.*` marker left from before that upgrade is ignored, as core ignores it.
+Older compatible cores report `unknown`, never false. In
 particular, a direct Stop can remain in flight while an older core's receipt is still started.
 Neither a reference, a receipt nor a clear checkpoint proves physical quiescence. A controller
 requiring known Stop evidence must reject `unknown` before effects and separately verify
