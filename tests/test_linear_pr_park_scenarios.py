@@ -111,17 +111,36 @@ class PrParkScenarios(unittest.TestCase):
     def park(self, task):
         """Create the legacy park state Linear can encounter after an upgrade."""
         guard_wait = core_guard_wait()
+        reason = "waiting for PR #7 to merge"
         with self.board.conn() as db:
-            if guard_wait and "lane" in inspect.signature(guard_wait.record_respawn_guard).parameters:
-                guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
-            else:  # Seed the rows an earlier Core would have left in the board database.
+            if guard_wait is None:  # Core predates the park writer.
                 with self.board.kb.write_txn(db):
                     db.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task,))
                     self.board.kb._append_event(db, task, "blocked", {
-                        "reason": "waiting for PR #7 to merge", "kind": "needs_input", "source": "respawn_guard"})
+                        "reason": reason, "kind": "needs_input", "source": "respawn_guard"})
+            elif "lane" in inspect.signature(guard_wait.record_respawn_guard).parameters:
+                guard_wait.record_respawn_guard(db, task, "active_pr", lane="ready")
+            else:
+                from hermes_cli.kanban_db_controls import _block_task
+
+                # Recreate the legacy task, event and run via the original park writer's block path.
+                last_event_id = db.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task,)).fetchone()[0]
+                self.assertTrue(_block_task(
+                    db, task, reason=reason, kind="needs_input", expected_run_id=None,
+                    expected_event_id=last_event_id, stops=[], count_recurrence=False, source="respawn_guard",
+                ))
         park = self.events(task)[-1]
-        self.assertEqual((park.kind, park.payload.get("source"), self.board.get(task).status),
+        blocked_task = self.board.get(task)
+        self.assertEqual((park.kind, park.payload.get("source"), blocked_task.status),
                          ("blocked", "respawn_guard", "blocked"))
+        if guard_wait is not None:
+            self.assertEqual((blocked_task.block_kind, blocked_task.block_recurrences), ("needs_input", 0))
+            self.assertEqual((park.payload.get("source_status"), park.payload.get("recurrences")), ("ready", 0))
+            self.assertIsNotNone(park.run_id)
+            run = self.native("get_run", park.run_id)
+            self.assertIsNotNone(run)
+            self.assertEqual((run.task_id, run.status, run.outcome), (task, "blocked", "blocked"))
+            self.assertIsNotNone(run.ended_at)
         return park
 
     def parked(self):
