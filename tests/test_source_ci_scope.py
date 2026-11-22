@@ -84,14 +84,35 @@ class SourceSelectionTests(unittest.TestCase):
             self.assertGreater(len(plan['tests']), 1)
 
     def test_uncertainty_and_selection_changes_broaden(self):
-        for path in ('unknown.file', 'release/agent-image-manifest.json',
-                     'release/linear-scenario-requirements.txt', '.github/workflows/ci.yml',
+        for path in ('release/agent-image-manifest.json',
+                     'release/linear-scenario-requirements.txt', 'tests/native-input-requirements.txt',
+                     '.github/workflows/ci.yml', '.github/workflows/fleet-image.yml',
                      'scripts/source-ci.py', 'tests/test_source_ci_scope.py',
-                     'tests/unknown_helper.py', 'Dockerfile'):
+                     'scripts/run-linear-input-scenarios.py', 'scripts/read-agent-image-manifest.py',
+                     'tests/unknown_helper.py', 'tests/fixtures/anything.json'):
             with self.subTest(path=path):
                 plan = self.select(path)
                 self.assertTrue(plan['full'])
+                self.assertTrue(plan['units_full'])
+                self.assertTrue(plan['runtime_full'])
                 self.assertTrue(plan['runtime'])
+
+    def test_unmapped_non_runtime_inputs_run_every_unit_but_no_real_agent_leg(self):
+        inventory = sorted(str(p.relative_to(ROOT)) for p in (ROOT / 'tests').glob('test_*.py'))
+        for path in ('unknown.file', 'Dockerfile', 'docker/entrypoint.sh', 'plugins/disk-cleanup/plugin.py',
+                     'scripts/scan-fleet-image.py', 'skills/example/SKILL.yaml'):
+            with self.subTest(path=path):
+                plan = self.select(path)
+                self.assertTrue(plan['units_full'])
+                self.assertFalse(plan['runtime_full'])
+                self.assertFalse(plan['full'])
+                self.assertFalse(plan['runtime'])
+                self.assertEqual(plan['tests'], inventory)
+        # A mapped Linear change alongside still selects exactly its own real-Agent legs.
+        plan = self.select('Dockerfile', 'tests/test_linear_active_recovery_scenarios.py')
+        self.assertTrue(plan['units_full'])
+        self.assertTrue(plan['linear'])
+        self.assertFalse(plan['input'])
 
     def test_manual_and_schedule_are_full_inventory(self):
         inventory = sorted(str(p.relative_to(ROOT)) for p in (ROOT / 'tests').glob('test_*.py'))
@@ -168,15 +189,27 @@ class SourceSelectionTests(unittest.TestCase):
                                         capture_output=True, text=True, cwd=ROOT)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 return json.loads(result.stdout)
-            self.assertFalse(select('pull_request', base, head)['full'])
-            self.assertTrue(select('push', base, head)['full'])
+            self.assertFalse(select('pull_request', base, head)['units_full'])
+            # base..head on push removes unknown.file: a delete routes by its old path.
+            pushed = select('push', base, head)
+            self.assertTrue(pushed['units_full'])
+            self.assertFalse(pushed['runtime_full'])
             self.assertTrue(select('push', 'invalid', head)['full'])
             git('mv', 'README.md', 'OTHER.md')
             renamed = commit('rename')
-            self.assertTrue(select('push', head, renamed)['full'])
+            self.assertFalse(select('push', head, renamed)['units_full'])
             Path(tmp, 'OTHER.md').unlink()
             deleted = commit('delete')
-            self.assertTrue(select('push', renamed, deleted)['full'])
+            self.assertFalse(select('push', renamed, deleted)['units_full'])
+            Path(tmp, 'tests').mkdir()
+            Path(tmp, 'notes.md').write_text('x' * 200)
+            moved_from = commit('notes')
+            git('mv', 'notes.md', 'tests/helper.md.py')
+            moved = commit('rename into a runtime input')
+            self.assertTrue(select('push', moved_from, moved)['runtime_full'])
+            Path(tmp, 'tests/helper.md.py').unlink()
+            gone = commit('delete runtime input')
+            self.assertTrue(select('push', moved, gone)['runtime_full'])
 
 
 class WorkflowContractTests(unittest.TestCase):
