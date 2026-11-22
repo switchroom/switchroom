@@ -242,7 +242,7 @@ class PruneTests(unittest.TestCase):
         del missing["id"]
         malformed = dict(self.version(2, ["fleet-pr-stage-2-1"], old), id=1.5)
         valid = self.version(3, ["fleet-pr-stage-3-1"], old)
-        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=100, dry_run=False)
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=1, dry_run=False)
         deleted = []
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -251,8 +251,29 @@ class PruneTests(unittest.TestCase):
         self.assertEqual(deleted, ["orgs/switchroom/packages/container/switchroom/versions/3"])
         self.assertEqual(out.getvalue().count("expected a positive integer version ID"), 2)
 
+    def test_malformed_version_metadata_and_timestamps_do_not_block_later_deletions(self) -> None:
+        import contextlib, io
+        old = "2026-11-01T00:00:00Z"
+        missing = self.version(1, ["fleet-pr-stage-1-1"], old)
+        del missing["updated_at"]
+        versions = [
+            missing,
+            self.version(2, ["fleet-pr-stage-2-1"], "not a timestamp"),
+            self.version(3, ["fleet-pr-stage-3-1"], "2026-11-01T00:00:00"),
+            dict(self.version(4, ["fleet-pr-stage-4-1"], old), metadata="bad metadata"),
+            dict(self.version(5, ["fleet-pr-stage-5-1"], old), metadata={"container": ["bad container"]}),
+            self.version(6, ["fleet-pr-stage-6-1"], old),
+        ]
+        args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=1, dry_run=False)
+        deleted = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(promote.prune(args, api_lines=lambda _: versions, delete=deleted.append, now=NOW), 1)
+        self.assertEqual(deleted, ["orgs/switchroom/packages/container/switchroom/versions/6"])
+        self.assertEqual(out.getvalue().count("has an invalid updated_at"), 3)
+
     def test_dry_run_and_cap(self) -> None:
-        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(5)]
+        versions = [self.version(i, [f"fleet-pr-stage-{i}-1"], "2026-11-01T00:00:00Z") for i in range(1, 6)]
         deleted: list[str] = []
         args = argparse.Namespace(org="switchroom", package="switchroom", max_deletions=3, dry_run=True)
         self.assertEqual(promote.prune(args, api_lines=lambda _path: versions, delete=deleted.append, now=NOW), 3)

@@ -368,14 +368,31 @@ def locate_command(args: argparse.Namespace) -> None:
 
 
 def stage_only(version: dict[str, Any]) -> bool:
-    tags = ((version.get("metadata") or {}).get("container") or {}).get("tags")
+    metadata = version.get("metadata")
+    container = metadata.get("container") if isinstance(metadata, dict) else None
+    tags = container.get("tags") if isinstance(container, dict) else None
     return isinstance(tags, list) and bool(tags) and all(isinstance(tag, str) and STAGE_TAG_RE.fullmatch(tag)
                                                           for tag in tags)
 
 
 def prunable(versions: list[dict[str, Any]], now: dt.datetime) -> list[dict[str, Any]]:
-    return [v for v in versions if isinstance(v, dict) and stage_only(v)
-            and now - parse_time(v.get("updated_at")) > PRUNE_AGE]
+    targets = []
+    for version in versions:
+        if not isinstance(version, dict) or not stage_only(version):
+            continue
+        version_id = version.get("id")
+        if type(version_id) is not int or version_id <= 0:
+            print(f"::warning title=Prune candidate skipped::version {version_id!r}: "
+                  "expected a positive integer version ID", flush=True)
+            continue
+        try:
+            age = now - parse_time(version.get("updated_at"))
+        except (Refused, ValueError, TypeError, OverflowError):
+            print(f"::warning title=Prune candidate skipped::version {version_id} has an invalid updated_at", flush=True)
+            continue
+        if age > PRUNE_AGE:
+            targets.append(version)
+    return targets
 
 
 def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str, Any]]] | None = None,
@@ -393,13 +410,11 @@ def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str,
     failed = 0
     for version in targets:
         tags = version["metadata"]["container"]["tags"]
-        version_id = version.get("id")
+        version_id = version["id"]
         if args.dry_run:
             print(f"would delete version {version_id} {tags} (updated {version.get('updated_at')})")
             continue
         try:
-            if type(version_id) is not int or version_id <= 0:
-                raise Refused("expected a positive integer version ID")
             delete(f"{base}/{version_id}")
         except Exception as exc:  # One refused delete must not stop the day's prune.
             failed += 1

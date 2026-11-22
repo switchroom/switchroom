@@ -275,7 +275,8 @@ def emit_pr_proof(plan):
 
 
 def gh_api(path):
-    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=30))
+    # Leave time within the selection job for the normal plan after a slow lookup.
+    return json.loads(subprocess.check_output(['gh', 'api', path], text=True, stderr=subprocess.PIPE, timeout=20))
 
 
 def complete_action_page(response, field):
@@ -395,6 +396,11 @@ def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m,
                                 tested=tested, tree=trees[0], run_id=run_id, attempt=attempt)
         if not re.fullmatch(SHA_RE, tested) or proof != expected:
             log(f'reuse: source proof does not cover this push in {run.get("html_url")}')
+            return None
+        merge = api(f'repos/{repository}/git/commits/{tested}')
+        if (merge['sha'] != tested or merge['tree']['sha'] != trees[0]
+                or [parent['sha'] for parent in merge['parents']] != [before, head]):
+            log(f'reuse: tested merge commit {tested} does not match this push and PR')
             return None
         log(f'reuse: tree {trees[0]} already proved by PR #{pr["number"]} run {run.get("html_url")}')
         return run.get('html_url') or str(run['id'])

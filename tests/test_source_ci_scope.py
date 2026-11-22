@@ -383,6 +383,7 @@ class PushReuseTests(unittest.TestCase):
     REPO = 'switchroom/switchroom'
     JOBS = f'repos/{REPO}/actions/runs/2/attempts/1/jobs?per_page=100'
     NOTES = f'repos/{REPO}/check-runs/202/annotations?per_page=100'
+    MERGE = f'repos/{REPO}/git/commits/{TESTED}'
 
     def setUp(self):
         self.module = load_selector()
@@ -405,6 +406,8 @@ class PushReuseTests(unittest.TestCase):
             f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100': [{'number': 7}],
             f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': self.TREE}},
             f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': self.TREE}},
+            self.MERGE: {'sha': self.TESTED, 'tree': {'sha': self.TREE},
+                         'parents': [{'sha': self.BEFORE}, {'sha': self.HEAD}]},
             f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'ahead'},
             f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100': {
                 'total_count': 2,
@@ -511,6 +514,25 @@ class PushReuseTests(unittest.TestCase):
         for plan in (dict(self.plan, tests=[]), dict(self.plan, linear=True, runtime=True)):
             with self.subTest(plan=plan):
                 self.assertIsNone(self.find(self.responses(), plan=plan)[0])
+
+    def test_proof_needs_independently_verified_merge_tree_and_ordered_parents(self):
+        responses = self.responses()
+        merge = responses[self.MERGE]
+        for change in ({'tree': {'sha': self.HEAD}}, {'parents': list(reversed(merge['parents']))},
+                       {'parents': [{'sha': self.HEAD}]}, {'sha': self.SHA}):
+            with self.subTest(change=change):
+                self.assertIsNone(self.find(self.responses(**{self.MERGE: dict(merge, **change)}))[0])
+        wrong = self.SHA
+        responses = self.responses(**{
+            self.NOTES: [self.notice(tested=wrong)],
+            f'repos/{self.REPO}/git/commits/{wrong}': {
+                'sha': wrong, 'tree': {'sha': self.TREE}, 'parents': [{'sha': self.BEFORE}],
+            },
+        })
+        self.assertIsNone(self.find(responses)[0])
+        responses = self.responses()
+        del responses[self.MERGE]
+        self.assertIsNone(self.find(responses)[0])
 
     def test_run_proof_must_be_a_single_complete_notice_on_the_green_attempt(self):
         valid = self.notice()
