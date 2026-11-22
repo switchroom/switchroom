@@ -544,5 +544,87 @@ class StatusTextTests(unittest.TestCase):
         self.assertIn(str(row), self.cli("status")[1])
 
 
+class IdleTickTests(unittest.TestCase):
+    """F21 (turn-waste RCA 22 Nov 2026): one serial loop walked every binding every 2 s inside the gateway
+    (about 15% of a core on the busiest agent) and a webhook waited out a whole pass (p90 12 s, max 30 s)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.inbox = self.home / "ingress.db"
+
+    def test_idle_ticks_back_off_and_busy_ticks_keep_the_short_tick(self):
+        self.assertEqual(plugin.idle_wait(2.0, 0), 2.0)
+        self.assertEqual([plugin.idle_wait(2.0, n) for n in (1, 2, 3, 30)], [4.0, 8.0, plugin.IDLE_TICK_MAX_S,
+                                                                             plugin.IDLE_TICK_MAX_S])
+        self.assertEqual(plugin.idle_wait(20.0, 5), 20.0)  # a longer configured tick is never shortened
+
+    def wait(self, timeout, watched, baseline, *, wake_after=None, board_gap=0.0):
+        async def run():
+            wake = asyncio.Event()
+            if wake_after is not None:
+                asyncio.get_running_loop().call_later(wake_after, wake.set)
+            started = time.monotonic()
+            await plugin._wait_for_change(wake, timeout, watched, baseline, board_gap=board_gap)
+            return time.monotonic() - started
+        return asyncio.run(run())
+
+    def test_a_webhook_written_to_the_inbox_ends_the_wait_at_once(self):
+        board = self.home / "kanban.db"
+        watched = lambda: (plugin.file_signature(self.inbox), (plugin.file_signature(board),))
+        baseline = watched()
+        threading.Timer(0.1, lambda: self.inbox.write_bytes(b"delivery")).start()
+        self.assertLess(self.wait(10.0, watched, baseline, board_gap=5.0), 2.0)
+
+    def test_a_board_write_wakes_the_loop_no_sooner_than_the_tick(self):
+        board = self.home / "kanban.db"
+        watched = lambda: (plugin.file_signature(self.inbox), (plugin.file_signature(board),))
+        baseline = watched()
+        threading.Timer(0.05, lambda: board.write_bytes(b"heartbeat")).start()
+        waited = self.wait(10.0, watched, baseline, board_gap=1.0)
+        self.assertGreaterEqual(waited, 1.0)
+        self.assertLess(waited, 3.0)
+
+    def test_a_native_hint_ends_the_wait_and_nothing_waits_the_full_timeout(self):
+        self.assertLess(self.wait(10.0, lambda: ((), ()), ((), ()), wake_after=0.1), 2.0)
+        self.assertGreaterEqual(self.wait(0.3, lambda: ((), ()), ((), ())), 0.29)
+        self.assertGreaterEqual(self.wait(0.3, lambda: None, None), 0.29)  # no watch: timed tick only
+
+    def bridge(self):
+        from hermes_fleet_linear_plugin.bridge import Bridge
+        bridge = Bridge.__new__(Bridge)
+        bridge.drain_ingress = Mock()
+        return bridge
+
+    def test_a_webhook_arriving_mid_pass_is_drained_between_bindings(self):
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        bridge = self.bridge()
+        bridge._ingress_path, bridge._ingress_seen = self.inbox, bridge_module.file_signature(self.inbox)
+        with patch.object(bridge_module, "INGRESS_CHECK_S", 0):
+            bridge._ingress_between()
+            bridge.drain_ingress.assert_not_called()  # nothing new: one stat, no inbox read
+            self.inbox.write_bytes(b"delivery")
+            bridge._ingress_between()
+            bridge.drain_ingress.assert_called_once_with(self.inbox)
+            bridge._ingress_between()
+            bridge.drain_ingress.assert_called_once()
+        bridge._ingress_path = None  # outside a tick nothing is drained
+        self.inbox.write_bytes(b"another")
+        bridge._ingress_between()
+        bridge.drain_ingress.assert_called_once()
+
+    def test_a_tick_that_did_nothing_reports_idle(self):
+        from hermes_fleet_linear_plugin import diag
+        bridge = self.bridge()
+        bridge._recover_admissions = bridge.pump_kanban = bridge.recheck = bridge.flush = Mock()
+        bridge.store = Mock()
+        self.assertFalse(bridge.tick(self.inbox))
+        bridge.pump_kanban = Mock(side_effect=lambda: diag.count("events"))
+        self.assertTrue(bridge.tick(self.inbox))
+        bridge.pump_kanban = Mock(side_effect=diag.api_sent)
+        self.assertTrue(bridge.tick(None))
+
+
 if __name__ == "__main__":
     unittest.main()

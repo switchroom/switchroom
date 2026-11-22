@@ -622,7 +622,13 @@ profile state. The immutable viewer/workspace binding is revalidated on requests
 `identity.teams` and `identity.projects` restrict issue access and writes. `state_database`
 defaults to `<profile home>/linear/state.db`; optional `board` selects the destination for
 Linear-origin task creation. `api_url`, `tick_seconds` (default 2), `team_states` and
-`completion_contracts` retain their existing meanings. `takeover` lists the agents this one may
+`completion_contracts` retain their existing meanings. `tick_seconds` is the gap while the
+reporting loop has work; each tick that did nothing (no counted outcome, no Linear request)
+doubles the gap up to 15 s. A write to the webhook inbox ends the wait at once and is also
+drained between bindings of a long pass, so a webhook never waits out a full pass; a write to a
+bound native board ends it no sooner than `tick_seconds`. A done, blocked or triage binding whose
+last full pump changed nothing is skipped until the store or its board changes, or for at most
+60 s; running work is always pumped. `takeover` lists the agents this one may
 [take over from](#take-over-from-another-agent): each entry's `command` is an argv list (no shell)
 that runs that agent's own `hermes` CLI in its own profile, never through `ssh` or `sh -c`;
 invalid entries are dropped and logged.
