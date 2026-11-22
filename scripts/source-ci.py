@@ -498,7 +498,8 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
     one result record (a notice annotation on the aggregate's check run, mirroring the
     `fleet-integration-result` artifact) names that run, that revision, this repository, and every leg a success;
     and the switchroom commit it ran is in this history with the recorded tree, and that tree is
-    the base tree, or an ancestor of base whose diff to base selects no real-Agent leg at all.
+    the base tree, or an ancestor of base whose diff to base, apart from edits to existing pin
+    files, selects no real-Agent leg at all.
     Any doubt or API error answers None, which runs the full matrix.
     """
     if not all(re.fullmatch(SHA_RE, v or '') and v != '0' * 40 for v in (base, tested)):
@@ -600,12 +601,19 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
                               capture_output=True, timeout=60).returncode != 0:
                 log(f'pin reuse: switchroom {commit} of {url} is not an ancestor of base {base}')
                 return None
-            since = changed_paths(repo, 'push', commit, base)
-            moved = select(since or [], full=since is None, event='push')
-            if since is None or moved['runtime'] or moved['runtime_full']:
+            added = set()
+            since = changed_paths(repo, 'push', commit, base, added=added)
+            # An earlier pin that merged after the Agent run checked out switchroom moves only pin
+            # files, and this pin PR overwrites the manifest again; the tested tree then differs from
+            # the proven one in pin files only, as when the tree is unchanged. A pin path added
+            # since (a new UPSTREAM.json) is not such an edit and still selects by the usual rules.
+            rest = None if since is None else [
+                p for p in since if p in added or not (p == PIN_MANIFEST or PIN_UPSTREAM.match(p))]
+            moved = select(rest or [], full=rest is None, event='push')
+            if rest is None or moved['runtime'] or moved['runtime_full']:
                 log(f'pin reuse: switchroom changed real-Agent inputs since {commit}: {since}')
                 return None
-            log(f'pin reuse: switchroom moved since {commit} only in non-runtime paths {since}')
+            log(f'pin reuse: switchroom moved since {commit} only in pin files or non-runtime paths {since}')
         log(f'pin reuse: Agent {revision} with switchroom tree {tree} already proved by {url}')
         return url or str(run_id), run_id, attempt
     except Exception as exc:  # Any uncertainty runs the complete pin suite.
