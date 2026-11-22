@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -87,13 +86,10 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(pending, approval._gateway_queues[key])
 
     async def asyncSetUp(self):
-        # Reuse Core's finite settings/agent boundary, never GatewayRunner.
-        spec = importlib.util.spec_from_file_location("finite_native_retry_fixture",
-            Path(SOURCE) / "tests/gateway/test_native_inbound_retry.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        self.finite_agent_type = module.FiniteAgent
-        self.fixture = module.NativeInboundRetryTests()
+        # Our finite settings/agent boundary over Core's runtime, never GatewayRunner.
+        from linear_native_runtime_fixture import FiniteAgent, NativeRuntimeFixture
+        self.finite_agent_type = FiniteAgent
+        self.fixture = NativeRuntimeFixture()
         await self.fixture.asyncSetUp()
         self.addCleanup(self.fixture.doCleanups)
         self.home, self.runner, self.authority = self.fixture.home, self.fixture.runner, self.fixture.authority
@@ -139,22 +135,29 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry.allowed_users_env, "LINEAR_ALLOWED_USERS")
         self.assertTrue(entry.check_fn())
         self.adapter = entry.adapter_factory(PlatformConfig(enabled=True, typing_indicator=False))
-        self.assertIs(self.adapter.requires_durable_input_ack, True)
+        # Upstream messaging input only: no fork durable-ACK opt-in or committed-input hook.
+        self.assertIsNot(getattr(self.adapter, "requires_durable_input_ack", False), True)
+        self.assertNotIn("on_message_admitted", type(self.adapter).__dict__)
         self.assertTrue(await self.adapter.connect())
         self.runner.adapters[self.adapter.platform] = self.adapter
         self.runner._intake_adapter_for = lambda source: self.adapter
         self.runner._delivery_adapter_for = lambda source: self.adapter
         self.runner._is_session_running = lambda key: False
         self.receipts, self.events, self.decisions = [], [], []
-        admitted = self.adapter.on_message_admitted
+        admitted = self.adapter._admitted
         async def receipt(event, value):
             await admitted(event, value)
             self.receipts.append((event, value))
-        self.adapter.on_message_admitted = receipt
+        self.adapter._admitted = receipt
         async def handle(runner, event):
             from gateway.run_inbound import GatewayInboundMixin
             from gateway.session_ingress import executing_admission
             self.events.append(event)
+            if event.get_command() == "stop":
+                # The runner's own messaging /stop step (``_handle_stop_command``) on its owner turn.
+                route = self.fixture.store._generate_session_key(event.source)
+                await GatewayInboundMixin._hm_stop_owner_turn(runner, route)
+                return "Stopped."
             if executing_admission.get():
                 # The finite host binds only the actual restored native source
                 # and real owner session, just as a gateway producer does.
@@ -175,6 +178,16 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                 event.source, self.fixture.store._generate_session_key(event.source), False)
             return reply
         self.runner._handle_message = MethodType(handle, self.runner)
+        # Production resolves the producer's profile home through the runner (``producer_scope``);
+        # this finite host serves one profile, so its scope is that profile's authority.
+        from contextlib import asynccontextmanager
+        from gateway.platforms import webhook_ingress
+        @asynccontextmanager
+        async def finite_producer_scope(adapter, event):
+            yield self.authority
+        producer_scope = patch.object(webhook_ingress, "producer_scope", finite_producer_scope)
+        producer_scope.start()
+        self.addCleanup(producer_scope.stop)
         self.adapter.set_message_handler(self.runner._handle_message)
         self.adapter.set_session_store(self.fixture.store)
         self.bridge.native_ingress = lambda delivery: native_input.route_delivery(self.running, delivery)
@@ -345,6 +358,19 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(intent["state"], "applied")
         self.assertIn("expected_event_id", intent["payload"])
         self.assertIsNone(self.provider.sessions[self.SESSION]["creator"])
+
+    async def test_stop_from_a_sender_outside_the_platform_allowlist_changes_nothing(self):
+        task_id = self.fixture_task()
+        self.specialist_bridge(session_requester=True)
+        before = self.board.get(task_id).status
+        self.fixture.allowed.discard(self.USER)
+        await self.deliver_raw("unlisted-stop", self.event("unlisted-stop", "stop", signal="stop"))
+        await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+        self.assertEqual(self.board.get(task_id).status, before)
+        self.assertIsNone(self.bridge.store.native_intent(f"stop:{self.ISSUE}:unlisted-stop"))
+        self.assertIsNone(self.bridge.store.native_intent(f"core-stop:{self.ISSUE}:{self.SESSION}:unlisted-stop"))
+        self.assertNotIn("unlisted-stop", [event.message_id for event in self.events])
+        self.assertEqual(self.inbox_row("unlisted-stop")[2], "pending")
 
     async def test_fresh_authorized_discussion_reads_and_replies_without_thawing_old_effect_fence(self):
         from gateway.session_authority import SessionAuthority
@@ -524,35 +550,117 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.store.native_intent(key)["payload"], original)
         self.assertEqual(self.inbox_row("unavailable-stop-redelivery")[2], "pending")
 
-    async def test_running_worker_consumes_one_followup_without_another_model_or_native_run(self):
+    async def test_running_worker_followup_queues_as_its_own_turn_without_steering_or_replay(self):
+        """Upstream producer ingress: a follow-up never steers the running turn. It commits and
+        ACKs as its own queued row, a redelivery resolves to that row, and it runs once, after."""
+        from gateway.session_results import execution_result
         task_id = self.fixture_task()
         self.enable_owned_worker(task_id)
+        worker_model, followups = self.model, []
+        async def model(event):
+            if event.message_id != "active-followup":
+                return await worker_model(event)
+            followups.append(event.text)
+            execution_result.get()["result"] = {"completed": True, "final_response": "Noted."}
+            return "Noted."
+        self.model = model
         await self.deliver("active-opening", "Inspect the existing bounded native remainder.")
         await self.until(lambda: len(self.workers) == 1)
         worker = self.workers[0]
         original_run = worker.claim.current_run_id
         await self.deliver("active-followup", "  Preserve the completed effects; do only the remainder.\n")
-        await asyncio.wait_for(self.instruction_consumed.wait(), 10)
-        with self.board.conn() as conn:
-            comments = self.board.kb.list_comments_after(conn, task_id)
-        self.assertEqual(len(comments), 1)
-        self.assertEqual(comments[0].body, "Preserve the completed effects; do only the remainder.")
+        await self.until(lambda: self.inbox_row("active-followup")[2] == "imported")
+        followup = next(row for row in self.rows() if row["request_id"] == "active-followup")
+        self.assertEqual(followup["status"], "queued")
+        self.assertEqual(worker.effects, [])  # never steered into the running worker
         self.assertEqual(self.board.get(task_id).current_run_id, original_run)
-        self.assertEqual(len(self.decisions), 1)
-        self.assertIs(self.workers[0], worker)
         # A distinct webhook delivery can repeat the same immutable Activity.
         await self.deliver_raw("active-followup-redelivery", self.event("active-followup",
             "  Preserve the completed effects; do only the remainder.\n"))
         await self.until(lambda: self.inbox_row("active-followup-redelivery")[2] == "imported")
-        with self.board.conn() as conn:
-            self.assertEqual(len(self.board.kb.list_comments_after(conn, task_id)), 1)
         self.assertEqual(len([row for row in self.rows() if row["request_id"] == "active-followup"]), 1)
         worker.release.set()
         worker.wake.set()
         await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
         self.assertEqual(self.board.get(task_id).status, "done")
+        self.assertEqual(followups, ["  Preserve the completed effects; do only the remainder.\n"])
+        self.assertEqual(len(self.decisions), 1)
 
-    async def test_typed_stop_controls_conversation_and_task_without_late_retry_cancelling_new_work(self):
+    async def test_queued_followups_commit_their_own_rows_and_never_merge(self):
+        """Queue-mode text never merges Linear Activities: each commits, ACKs and runs once."""
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        started, release, seen = asyncio.Event(), asyncio.Event(), []
+        async def model(event):
+            seen.append((event.message_id, event.text))
+            if event.message_id == "first":
+                started.set()
+                await release.wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "ok " + event.message_id}
+            return "ok " + event.message_id
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        self.addCleanup(release.set)
+        self.fixture.mode = "steer"
+        self.runner._effective_busy_text_mode = lambda source: "queue"
+        self.adapter._busy_text_mode = "queue"
+        await self.deliver("first", "Do the first task.")
+        await asyncio.wait_for(started.wait(), 10)
+        second = await self.deliver("second", "Second note.")
+        await self.deliver("third", "Third note.")
+        await self.until(lambda: all(self.inbox_row(identity)[2] == "imported" for identity in ("second", "third")))
+        texts = {row["request_id"]: row["payload"]["text"] for row in self.rows()}
+        self.assertEqual(texts, {"first": "Do the first task.", "second": "Second note.", "third": "Third note."})
+        await self.deliver_raw("second-redelivery", json.loads(second))
+        await self.until(lambda: self.inbox_row("second-redelivery")[2] == "imported")
+        self.assertEqual(len(self.rows()), 3)
+        release.set()
+        await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
+        self.assertEqual(sorted(seen), [("first", "Do the first task."), ("second", "Second note."),
+                                        ("third", "Third note.")])
+
+    async def test_followup_core_steers_into_the_running_turn_is_acknowledged_and_never_reapplied(self):
+        """Core may take a busy follow-up without a row (busy steer). It is ACKed once, and a
+        repeated webhook for that Activity never reaches Core again."""
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        started, release = asyncio.Event(), asyncio.Event()
+        async def model(event):
+            started.set()
+            await release.wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "ok"}
+            return "ok"
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        self.addCleanup(release.set)
+        await self.deliver("first", "Do the first task.")
+        await asyncio.wait_for(started.wait(), 10)
+        steered = []
+        async def steer(event, source, key):
+            steered.append(event.message_id)
+            return True  # Core's busy steer landed the text in the running turn
+        async def not_an_approval(event, key):
+            return False
+        self.runner._is_session_running = lambda key: True
+        self.runner._route_plaintext_approval_while_busy = not_an_approval
+        self.runner._hm_busy_preempt = steer
+        # Two webhook deliveries of one Activity reach the same drain: admitted concurrently.
+        raw = json.dumps(self.event("steered", "Also check the logs."), separators=(",", ":")).encode()
+        with patch("linear_ingress_fixture.time.time", return_value=self.bridge.clock()):
+            self.inbox.enqueue(self.inbox_route, "steered", raw)
+            self.inbox.enqueue(self.inbox_route, "steered-concurrent", raw)
+        await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database)
+        await self.until(lambda: all(self.inbox_row(identity)[2] == "imported"
+                                     for identity in ("steered", "steered-concurrent")))
+        await self.deliver_raw("steered-redelivery", json.loads(raw))
+        await self.until(lambda: self.inbox_row("steered-redelivery")[2] == "imported")
+        self.assertEqual(steered, ["steered"])
+        self.assertEqual([row["request_id"] for row in self.rows()], ["first"])
+        self.runner._is_session_running = lambda key: False
+        release.set()
+        await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
+
+    async def test_provider_stop_controls_conversation_and_task_without_late_retry_cancelling_new_work(self):
         from hermes_cli import kanban_db as kb
         task_id = self.fixture_task()
         self.enable_owned_worker(task_id)
@@ -564,13 +672,15 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.deliver_raw("typed-stop", stop)
         await self.until(lambda: self.inbox_row("typed-stop")[2] == "imported")
         await self.until(lambda: self.board.get(task_id).status == "blocked")
-        await self.until(lambda: any(event.message_id == "typed-stop" for event, _ in self.receipts))
         await self.until(lambda: next(row for row in self.rows() if row["request_id"] == "stop-opening")["status"] == "terminal")
         self.assertTrue(first.stopped)
-        controls = [(event, receipt) for event, receipt in self.receipts if event.message_id == "typed-stop"]
-        self.assertTrue(controls)
-        self.assertEqual(controls[0][1].control.kind, "stop")
-        self.assertTrue(controls[0][1].control.request_consumed)
+        # The provider Stop is Core's own /stop command: it reached the runner as a command,
+        # was never admitted as model input, and its reply is the bridge's, not Core's.
+        stops = [event for event in self.events if event.message_id == "typed-stop"]
+        self.assertTrue(stops)
+        self.assertTrue(all(event.get_command() == "stop" for event in stops))
+        self.assertNotIn("typed-stop", [row["request_id"] for row in self.rows()])
+        self.assertNotIn("typed-stop", [event.message_id for event, _ in self.receipts])
         self.assertNotIn("typed-stop", [identity for identity, _ in self.decisions])
         await self.deliver("after-stop", "Resume only the reconciled native remainder.")
         await self.until(lambda: len(self.workers) == 2)
@@ -585,7 +695,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.board.get(task_id).current_run_id, second.claim.current_run_id)
         self.assertEqual(self.board.get(task_id).status, "running")
         self.assertEqual([identity for identity, _ in self.decisions], ["stop-opening", "after-stop"])
-        self.assertEqual(len(self.rows()), 3)
+        self.assertEqual(len(self.rows()), 2)  # /stop is a command, never an admitted row
         second.release.set()
         second.wake.set()
         await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
@@ -967,7 +1077,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         question = "@agent is the rollout finished, or is anything still waiting?"
         seen = []
         completion_started, replay_receipt_started, completion_finished = (asyncio.Event() for _ in range(3))
-        admitted, completed = self.adapter.on_message_admitted, self.adapter.on_processing_complete
+        admitted, completed = self.adapter._admitted, self.adapter.on_processing_complete
         receipt_count = 0
         async def overlap_receipt(event, receipt):
             nonlocal receipt_count
@@ -986,7 +1096,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                     completion_finished.set()
             else:
                 await completed(event, outcome)
-        self.adapter.on_message_admitted = overlap_receipt
+        self.adapter._admitted = overlap_receipt
         self.adapter.on_processing_complete = overlap_completion
         async def answer(event):
             # The acknowledgment is already visible in Linear before any model turn.
@@ -1021,19 +1131,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(completion_started.is_set)
         await self.deliver_raw("human-mention-redelivery", event)
         await self.until(completion_finished.is_set)
-        delivery_key = ("default", "provider-fixture", "human-mention-redelivery")
-        await self.until(lambda: delivery_key in self.adapter._failed and
-                         self.adapter._submitted[delivery_key].done())
-        self.assertEqual(self.inbox_row("human-mention-redelivery")[2], "pending")
-        # Original completion can overlap a replay's committed callback. The finite
-        # host must run the real reporting retry loop, as the service does, before
-        # demanding its inbox ACK; sleeping cannot drive that recovery.
-        retry_at = self.bridge.clock() + 3600
-        self.bridge.clock = lambda: retry_at  # Advance beyond the reporting retry backoff.
-        async with asyncio.timeout(10):
-            while self.inbox_row("human-mention-redelivery")[2] != "imported":
-                await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database)
-                await asyncio.sleep(0.01)
+        # The replay overlapped the original completion; it resolves to the committed row and ACKs.
+        await self.until(lambda: self.inbox_row("human-mention-redelivery")[2] == "imported")
         self.assertEqual(len(self.rows()), 1)
         await asyncio.to_thread(self.bridge.flush)
         self.assertEqual(activity_creates(), activities)
@@ -1095,7 +1194,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(event.source.platform.value, "linear")
             self.assertEqual((event.source.chat_id, event.source.thread_id, event.source.user_id,
                               event.source.scope_id), (self.ISSUE, self.SESSION, self.USER, self.provider.organization))
-            self.assertEqual(receipt.admission_id, row["admission_id"])
+            self.assertEqual(receipt["admission_id"], row["admission_id"])
         self.assertEqual(self.board.discover(self.provider.issues[self.ISSUE]), [])
         self.assertEqual(self.decisions, [])
 
@@ -1409,10 +1508,13 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
                 metadata={"thread_id": self.SESSION})
         self.assertTrue(sent.success, sent.error)
         if unreadable:
-            with patch("gateway.session_native_delivery.find", side_effect=sqlite3.OperationalError("receipt unavailable")):
+            with patch.object(type(self.authority.persistence.admissions), "match",
+                              side_effect=sqlite3.OperationalError("receipt unavailable")):
                 await self.deliver_raw("ordinary-redelivery", original)
                 await self.until(lambda: all(f.done() for f in self.adapter._submitted.values()))
-            self.assertEqual(self.inbox_row("ordinary-redelivery")[2], "pending")
+            # The plugin's own ledger read is unavailable, but the replay is not consent: its stored
+            # disposition is ordinary, and Core's admission resolves it to its committed row.
+            self.assertEqual(self.inbox_row("ordinary-redelivery")[2], "imported")
         else:
             await self.deliver_raw("ordinary-redelivery", original)
             await self.until(lambda: self.inbox_row("ordinary-redelivery")[2] == "imported")
@@ -1515,12 +1617,12 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         key = self.fixture.store._generate_session_key(self.receipts[0][0].source)
         old = self.adapter
         reached, release = asyncio.Event(), asyncio.Event()
-        handle = old.handle_message
+        admit = old._admit
         async def paused(event):
             reached.set()
             await release.wait()
-            await handle(event)
-        old.handle_message = paused
+            return await admit(event)
+        old._admit = paused
         raw = self.event("ordinary-answer", "approve" if kind == "approval" else "staging")
         await self.deliver_raw("ordinary-first", raw)
         await asyncio.wait_for(reached.wait(), 10)
