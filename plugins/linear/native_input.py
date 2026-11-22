@@ -1076,6 +1076,13 @@ def create_adapter(config, running):
             if projected.turn_in_progress:
                 # In Progress while this session's turn runs on the admitted work.
                 bridge.session_turn(projected.issue_id, True)
+            consumed_key = f"core-consumed:{projected.issue_id}:{projected.session_id}:{projected.message_id}"
+            if await asyncio.to_thread(bridge.store.native_intent, consumed_key) is not None:
+                # Core already took this Activity without a row (a steer, a live prompt answer, a
+                # plugin consumer). A repeated webhook for it must never apply that effect twice.
+                self._end_turn(key)
+                await self._acknowledge_pending(key)
+                return
             try:
                 receipt = await self._admit(event)
             except BaseException:
@@ -1088,7 +1095,10 @@ def create_adapter(config, running):
                         self._pending.pop(key, None)
                 raise
             if receipt is None:
-                # A plugin hook or the chat's live prompt consumed it; nothing was committed.
+                # Core consumed it without committing a row: a steer into the running turn, the
+                # chat's live prompt, or a plugin consumer. Remember that before the ACK.
+                await asyncio.to_thread(bridge.store.native_intent_prepare, consumed_key,
+                    {"kind": "core_consumed", "issue_id": projected.issue_id, "session_id": projected.session_id})
                 self._end_turn(key)
                 if reply := getattr(event, "_consumer_reply", None):
                     from gateway.session_ingress import deliver_response
