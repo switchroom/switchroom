@@ -573,8 +573,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(followups, ["  Preserve the completed effects; do only the remainder.\n"])
         self.assertEqual(len(self.decisions), 1)
 
-    async def test_busy_followups_commit_their_own_rows_in_steer_and_queue_text_modes(self):
-        """A busy chat never steers or merges Linear input: each Activity commits, ACKs, runs once."""
+    async def test_queued_followups_commit_their_own_rows_and_never_merge(self):
+        """Queue-mode text never merges Linear Activities: each commits, ACKs and runs once."""
         from gateway.session_authority import SessionAuthority
         from gateway.session_results import execution_result
         started, release, seen = asyncio.Event(), asyncio.Event(), []
@@ -605,6 +605,41 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
         self.assertEqual(sorted(seen), [("first", "Do the first task."), ("second", "Second note."),
                                         ("third", "Third note.")])
+
+    async def test_followup_core_steers_into_the_running_turn_is_acknowledged_and_never_reapplied(self):
+        """Core may take a busy follow-up without a row (busy steer). It is ACKed once, and a
+        repeated webhook for that Activity never reaches Core again."""
+        from gateway.session_authority import SessionAuthority
+        from gateway.session_results import execution_result
+        started, release = asyncio.Event(), asyncio.Event()
+        async def model(event):
+            started.set()
+            await release.wait()
+            execution_result.get()["result"] = {"completed": True, "final_response": "ok"}
+            return "ok"
+        self.model = model
+        self.authority._schedule = MethodType(SessionAuthority._schedule, self.authority)
+        self.addCleanup(release.set)
+        await self.deliver("first", "Do the first task.")
+        await asyncio.wait_for(started.wait(), 10)
+        steered = []
+        async def steer(event, source, key):
+            steered.append(event.message_id)
+            return True  # Core's busy steer landed the text in the running turn
+        async def not_an_approval(event, key):
+            return False
+        self.runner._is_session_running = lambda key: True
+        self.runner._route_plaintext_approval_while_busy = not_an_approval
+        self.runner._hm_busy_preempt = steer
+        raw = await self.deliver("steered", "Also check the logs.")
+        await self.until(lambda: self.inbox_row("steered")[2] == "imported")
+        await self.deliver_raw("steered-redelivery", json.loads(raw))
+        await self.until(lambda: self.inbox_row("steered-redelivery")[2] == "imported")
+        self.assertEqual(steered, ["steered"])
+        self.assertEqual([row["request_id"] for row in self.rows()], ["first"])
+        self.runner._is_session_running = lambda key: False
+        release.set()
+        await self.until(lambda: all(row["status"] == "terminal" for row in self.rows()))
 
     async def test_provider_stop_controls_conversation_and_task_without_late_retry_cancelling_new_work(self):
         from hermes_cli import kanban_db as kb
