@@ -856,6 +856,11 @@ def _take_over_free(bridge: Any, context: Any, issue: dict, key: str, request_id
     def paused(why: str, **details: Any) -> str:
         return _paused(bridge, context, issue, owner_id, owner, name, request_id, why, **details)
 
+    # One open request per owner: while an earlier ask's outcome is unknown (or left the owner
+    # paused), a retry reuses its id, so a resume that carries that id closes every copy of it.
+    remembered = bridge.store.takeover_from(issue_id) or {}
+    if remembered.get("owner") == owner_id and remembered.get("request_id"):
+        request_id = remembered["request_id"]
     # resume_owner's target (and this request's id) once the owner stops being the delegate.
     bridge.store.remember_takeover(issue_id, owner_id, request_id)
     # This request is the authority for the start: a person's routing change from now on wins. The
@@ -864,6 +869,7 @@ def _take_over_free(bridge: Any, context: Any, issue: dict, key: str, request_id
     asked = takeover.ask(peer, issue, to=name, request_id=request_id)
     if not asked["sent"]:
         diag.evt("chat.entrust", "refused", "takeover_unavailable", iss=issue_id)
+        bridge.store.remember_takeover(issue_id, owner_id, "")  # Never delivered: no copy can land later.
         return _reply(False, f"Not taken over: {owner} couldn't be reached, so nothing was changed and {owner} keeps "
                       f"working on {key}.", code="takeover_unavailable", issue=_issue_ref(issue))
     reply = asked["reply"]
@@ -873,6 +879,7 @@ def _take_over_free(bridge: Any, context: Any, issue: dict, key: str, request_id
         if not reply["handed_off"]:
             if reply.get("paused"):
                 return paused(f"Not taken over: {reply['message']}")
+            bridge.store.remember_takeover(issue_id, owner_id, "")  # The owner answered this id for good.
             return _reply(False, f"Not taken over. {reply['message']}", code="takeover_refused", issue=_issue_ref(issue))
         # The owner says it paused. Start only when Linear itself shows it is no longer the delegate.
         try:
@@ -995,6 +1002,10 @@ def _resume_owner(bridge: Any, args: dict, context: Any, issue: dict) -> str:
     agents = (getattr(bridge, "takeover", None) or {}).get("agents") or {}
     remembered = bridge.store.takeover_from(issue_id) or {}
     owner_id = delegate if delegate in agents else remembered.get("owner") if delegate is None else None
+    if owner_id is None and delegate is None and len(agents) == 1:
+        # Nothing remembered (say the owner was asked directly): the one owner this agent takes
+        # over from is asked; it resumes only a pause for a handover to this agent.
+        owner_id = next(iter(agents))
     peer, name = _takeover_peer(bridge, owner_id)
     if peer is None:
         now = ("isn't delegated to any agent" if delegate is None else "is delegated to this agent"
@@ -1022,6 +1033,7 @@ def _resume_owner(bridge: Any, args: dict, context: Any, issue: dict) -> str:
     if not asked["sent"] or reply is None:
         return _reply(False, f"{owner} didn't confirm, so it isn't known whether {owner} continues {key}. Nothing "
                       "will start here. Ask again to retry.", code="resume_uncertain", issue=_issue_ref(issue))
+    bridge.store.remember_takeover(issue_id, owner_id, "")  # Answered: that handover request is closed.
     if not reply.get("resumed"):
         return _reply(False, f"Nothing was resumed. {reply['message']}", code="resume_refused", issue=_issue_ref(issue))
     diag.evt("chat.entrust", "applied", "handoff_resumed", iss=issue_id)

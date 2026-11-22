@@ -253,6 +253,11 @@ class Server:
                 args = payload.get('args')
                 if not isinstance(args, dict):
                     raise ValueError('Linear request args must be an object')
+                if args.get('action') == 'hand_off':
+                    # Its caller context is client-supplied here; hand_off is answered only on an
+                    # in-process A2A turn, whose identity the gateway itself bound.
+                    return json.dumps({'ok': False, 'code': 'handoff_not_allowed', 'message':
+                                       'hand_off is answered only on an A2A request, so nothing was changed.'})
                 return chat(args, context)
             raise ValueError('Unknown Linear transport operation')
         class Handler(socketserver.StreamRequestHandler):

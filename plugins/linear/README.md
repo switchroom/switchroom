@@ -310,7 +310,9 @@ Linear issue are told so plainly; nothing resumes it automatically.
    `{"action": "hand_off", "issue": "<KEY>", "to": "<this agent's name>", "id": "<uuid>"}` and to
    reply with that tool's JSON unchanged. It waits at most `wait_seconds` for the answer. An
    answer that certainly never reached the owner (A2A not set up, unknown peer, auth refused) is
-   `takeover_unavailable`, nothing changed.
+   `takeover_unavailable`, nothing changed. While an earlier ask to the same owner is still open
+   (its outcome unknown, or it left the owner paused), a retry reuses that request's id, so one
+   resume closes every copy of it.
 3. The owner's `hand_off`, in code. It acts only on an A2A turn whose authenticated peer is the
    one its `takeover.allow` lists for that `to` name; anything else (its own chat, a Linear
    thread, another peer, an unlisted name) is refused with nothing changed. A peer's message is
@@ -322,12 +324,15 @@ Linear issue are told so plainly; nothing resumes it automatically.
    ("Atlas paused its work on HF-9 for a handover to Nova. If Nova doesn't start it, ask Nova to
    'resume HF-9' ..."), so a pause is never silent even if the requester vanishes. A task already
    paused for a handover to the same agent counts as paused, never paused twice. It then waits up
-   to 45 seconds for the stopped run's worker to exit (the run row ended and its recorded worker
+   to 45 seconds for the stopped run's worker to exit, and checks again that no task it started is
+   open (the run row ended and its recorded worker
    process gone); until then it stays the delegate and answers `paused: true, handed_off: false`.
    After that it removes itself as the issue's delegate (a direct write, checked by a fresh read),
    drops its own unsent delegate writes, records that it will not re-add itself, and answers
    `{"ok": true, "handed_off": true, "paused": true, "issue_id": ..., "request_id": ..., "message": ...}`.
    A request id it refused or resumed is answered for good: a late copy of it changes nothing.
+   `hand_off` arriving over the plugin's local socket (whose caller context the client supplies)
+   is refused; only the gateway's own A2A turns reach it.
 4. The requester starts only after the owner confirmed the handover AND a fresh Linear read shows
    the owner is no longer the delegate. It then creates its one native task (whose text says to
    continue from the owner's progress in the Linear thread), admits it in the same call through
@@ -349,7 +354,8 @@ Linear issue are told so plainly; nothing resumes it automatically.
    and starts it.
 6. `resume_owner` is the one supported way to let the owner continue. Its target is the issue's
    delegate when that is a configured peer, else (the owner removed itself) the agent this one
-   last asked to hand the issue over; that memory is cleared once the work starts here. It refuses
+   last asked to hand the issue over, else (nothing remembered, no delegate) the one agent it is
+   configured to take over from; that memory is cleared once the work starts here. It refuses
    while this agent runs or ran the work, and carries the id of the handover it reverses. The
    owner's `hand_off` with `resume: true` (only from that same A2A peer) lifts only a pause for a
    handover to this agent with the plain `unblock_task`, refuses while the issue is delegated to

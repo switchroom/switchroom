@@ -330,6 +330,10 @@ def hand_off(bridge, args: dict, context, issue: dict, reply: Callable[..., str]
         if _live_pause_for(adapter.history(task.id, 0)) != to:
             return answer(False, f"{me}'s work on {key} changed while it was being handed over, so it was left as "
                           "someone set it and nothing was handed over.", "changed_during_handoff")
+        if _started_open(adapter, task.id):
+            # A task it started before the pause landed is still open: that work runs on here.
+            return answer(False, f"{me}'s work on {key} is paused for a handover to {to}, but a task it started is "
+                          f"still open, so {me} is still the delegate.", "handoff_unproven", paused=True)
         _no_delegate_recovery(bridge, issue_id, task.id)
         delegate = (bridge._effect_issue(issue_id).get("delegate") or {}).get("id")  # fresh after the wait
         if delegate == viewer and not _set_delegate(bridge, issue_id, None, viewer):
