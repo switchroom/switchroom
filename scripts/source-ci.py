@@ -498,8 +498,8 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
     one result record (a notice annotation on the aggregate's check run, mirroring the
     `fleet-integration-result` artifact) names that run, that revision, this repository, and every leg a success;
     and the switchroom commit it ran is in this history with the recorded tree, and that tree is
-    the base tree, or an ancestor of base whose diff to base, apart from edits to existing pin
-    files, selects no real-Agent leg at all.
+    the base tree, or an ancestor of base whose diff to base, apart from an edit to the existing
+    manifest, selects no real-Agent leg at all.
     Any doubt or API error answers None, which runs the full matrix.
     """
     if not all(re.fullmatch(SHA_RE, v or '') and v != '0' * 40 for v in (base, tested)):
@@ -603,12 +603,10 @@ def find_pin_reuse(repo, repository, base, tested, agent_repository=AGENT_REPOSI
                 return None
             added = set()
             since = changed_paths(repo, 'push', commit, base, added=added)
-            # An earlier pin that merged after the Agent run checked out switchroom moves only pin
-            # files, and this pin PR overwrites the manifest again; the tested tree then differs from
-            # the proven one in pin files only, as when the tree is unchanged. A pin path added
-            # since (a new UPSTREAM.json) is not such an edit and still selects by the usual rules.
-            rest = None if since is None else [
-                p for p in since if p in added or not (p == PIN_MANIFEST or PIN_UPSTREAM.match(p))]
+            # An earlier pin that merged after the Agent run checked out switchroom moved the
+            # manifest, which this pin PR overwrites again (the Agent run rewrote its revision too).
+            # Every other path, UPSTREAM.json records included, still selects by the usual rules.
+            rest = None if since is None else [p for p in since if p != PIN_MANIFEST or p in added]
             moved = select(rest or [], full=rest is None, event='push')
             if rest is None or moved['runtime'] or moved['runtime_full']:
                 log(f'pin reuse: switchroom changed real-Agent inputs since {commit}: {since}')
