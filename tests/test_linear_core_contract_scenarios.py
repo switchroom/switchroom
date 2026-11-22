@@ -14,8 +14,8 @@ It runs in the CI ``runtime (kanban K/3)`` legs through scripts/run-linear-scena
 which checks out ``switchroom/hermes-agent`` at release/agent-image-manifest.json's
 revision and refuses skips. A manifest change selects the full suite, so every
 Core pin bump runs it. The Core contract class exists only when HERMES_AGENT_SRC is
-at that release revision; the test-only companion candidate lane runs just the
-Core-free ``CollectorProof``, which also runs in source-tests.
+at that release revision; elsewhere only the Core-free ``CollectorProof`` runs,
+which also runs in source-tests.
 """
 from __future__ import annotations
 
@@ -59,8 +59,7 @@ def _source_revision(source: str) -> str | None:
 
 
 # The contract is a claim about the Core this plugin ships against: the release manifest pin.
-# Other lanes (the test-only companion candidate checkout) carry a different, older Core and
-# make their own narrower claim, so the Core contract class is not defined there at all
+# A checkout at any other revision makes no such claim, so the Core contract class is not defined there at all
 # rather than skipped (the scenario runner refuses skips).
 RELEASE_CORE = bool(SOURCE) and _source_revision(SOURCE) == _release_revision()
 

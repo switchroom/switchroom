@@ -14,7 +14,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-LANES = ('linear', 'acp', 'origin', 'input', 'journey', 'candidate')
+LANES = ('linear', 'acp', 'origin', 'input', 'journey')
 PUBLIC = ('test_public_*.py', 'test_image_scope_and_scans.py')
 COMPONENTS = {
     'linear': ('test_linear_*.py', 'test_ci_linear_scenarios.py'),
@@ -68,8 +68,6 @@ def select(paths, full=False, reason='changed paths'):
     for path in paths:
         if path in SELECTOR_INPUTS or path.startswith('.github/'):
             full = True
-        elif path == 'tests/candidate_hf578.py':
-            lanes['candidate'] = True
         elif path in available:
             tests.add(path)
             if Path(path).name in SHARED_TESTS:
@@ -96,7 +94,7 @@ def select(paths, full=False, reason='changed paths'):
         for path in tests:
             name = Path(path).name
             if fnmatch.fnmatch(name, 'test_linear_*scenarios.py'):
-                lanes['linear'] = lanes['candidate'] = True
+                lanes['linear'] = True
             if fnmatch.fnmatch(name, 'test_linear_origin*_native.py'):
                 lanes['origin'] = True
             if name == 'test_claude_acp_context.py':
@@ -134,10 +132,9 @@ def changed_paths(repo, event, base, head):
 
 
 def gate(plan, needs):
-    if not isinstance(plan, dict) or any(type(plan.get(k)) is not bool for k in ('runtime', 'candidate')):
+    if not isinstance(plan, dict) or type(plan.get('runtime')) is not bool:
         return False
-    required = {'selection': True, 'source-tests': True,
-                'runtime': plan['runtime'], 'candidate-hf578': plan['candidate']}
+    required = {'selection': True, 'source-tests': True, 'runtime': plan['runtime']}
     if set(needs) != set(required):
         return False
     for job, selected in required.items():

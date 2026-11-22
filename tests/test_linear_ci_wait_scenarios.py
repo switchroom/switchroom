@@ -312,13 +312,6 @@ class CiWaitScenarios(unittest.TestCase):
         self.assertEqual(self.remote.state(ISSUE), "In Review")
         self.github.run(2, "CI", sha="c" * 40)
         self.pump_after_gap()
-        from hermes_cli import kanban_db_controls
-        if not hasattr(kanban_db_controls, "_triaged_by_block_loop"):
-            # An older Core cannot unblock a block-loop triage: the guarded unblock is refused and
-            # the task stays where it is; nothing is forced.
-            self.assertEqual(self.task().status, "triage")
-            self.assertEqual(self.events()[-1].kind, "commented")
-            return
         self.assertEqual(self.task().status, "ready")
         verdicts = self.verdicts()
         self.assertEqual(len(verdicts), 2)
