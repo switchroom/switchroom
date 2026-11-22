@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import unittest
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[1]
 LANES = ('linear', 'acp', 'origin', 'input', 'journey')
@@ -234,7 +235,7 @@ def gh_api(path):
 
 def complete_action_page(response, field):
     items = response[field]
-    if not isinstance(items, list) or len(items) >= 100 or response.get('total_count', len(items)) != len(items):
+    if not isinstance(items, list) or len(items) >= 100 or response['total_count'] != len(items):
         raise ValueError(f'incomplete GitHub Actions {field} page')
     return items
 
@@ -274,15 +275,9 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if status not in ('ahead', 'identical'):
             log(f'reuse: {before} is not an ancestor of PR head {head} ({status})')
             return None
-        # Only this repository's branch for this PR: never a fork run, nor another PR that shares
-        # the head commit against a different base.
-        # A full page may hide another PR on the same head: treat it as not unique.
-        listed = api(f'repos/{repository}/commits/{head}/pulls?per_page=100')
-        sharing = [p for p in listed if (p.get('head') or {}).get('sha') == head]
-        if len(listed) >= 100 or [p.get('number') for p in sharing] != [pr['number']]:
-            log(f'reuse: head {head} is not unique to PR #{pr["number"]}')
-            return None
         branch = (pr.get('head') or {}).get('ref')
+        if not isinstance(branch, str) or not branch:
+            return None
         run_page = api(f'repos/{repository}/actions/workflows/ci.yml/runs'
                        f'?event=pull_request&head_sha={head}&per_page=100')
         runs = [r for r in complete_action_page(run_page, 'workflow_runs')
@@ -296,6 +291,23 @@ def find_reuse(repository, sha, before, api=gh_api, log=lambda m: print(m, file=
         if run.get('status') != 'completed' or run.get('conclusion') != 'success':
             log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
             return None
+        # GitHub may clear run associations after merge. If so, the branch must have exactly
+        # one PR across every state, including closed PRs against other bases.
+        associated = run.get('pull_requests')
+        if not isinstance(associated, list):
+            log(f'reuse: PR association missing for {run.get("html_url")}')
+            return None
+        if associated:
+            if len(associated) != 1 or associated[0].get('number') != pr['number'] or (
+                    (associated[0].get('base') or {}).get('ref') != 'main'):
+                log(f'reuse: {run.get("html_url")} does not name only PR #{pr["number"]} against main')
+                return None
+        else:
+            branch_label = quote(f'{repository.split("/", 1)[0]}:{branch}', safe=':')
+            listed = api(f'repos/{repository}/pulls?state=all&head={branch_label}&per_page=100')
+            if not isinstance(listed, list) or [p.get('number') for p in listed] != [pr['number']]:
+                log(f'reuse: branch {branch} is not unique to PR #{pr["number"]}')
+                return None
         # The run must have tested this PR against main, not a stacked parent branch the PR was
         # later retargeted from (GitHub clears run.pull_requests once a PR merges, so read the
         # PR's own retarget events). Any retarget at or after the run's creation: no reuse.

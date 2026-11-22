@@ -383,23 +383,24 @@ class PushReuseTests(unittest.TestCase):
             f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
                 {'number': 7, 'merged_at': '2026-11-22T00:00:00Z', 'merge_commit_sha': self.SHA,
                  'base': {'ref': 'main'}, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
-            f'repos/{self.REPO}/commits/{self.HEAD}/pulls?per_page=100': [
-                {'number': 7, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
+            f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100': [{'number': 7}],
             f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': 't' * 40}},
             f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 't' * 40}},
             f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'ahead'},
             f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100': {
+                'total_count': 2,
                 'workflow_runs': [
                     {'id': 1, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-21T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
-                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'failure',
+                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'failure', 'pull_requests': [],
                      'html_url': 'https://x/runs/1'},
                     {'id': 2, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
-                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success',
+                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success', 'pull_requests': [],
                      'html_url': 'https://x/runs/2'}]},
             f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-21T12:00:00Z'},
                 {'event': 'labeled', 'created_at': '2026-11-22T00:30:00Z'}],
             f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
+                'total_count': 2,
                 'jobs': [{'name': 'source-checks', 'conclusion': 'success'},
                          {'name': 'runtime (input 1/3)', 'conclusion': 'success'}]},
         }
@@ -427,8 +428,14 @@ class PushReuseTests(unittest.TestCase):
         base = self.responses()
         runs_key = f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100'
         jobs_key = f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100'
-        newest_red = {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], id=3, conclusion='failure',
-                                             created_at='2026-11-23T00:00:00Z')] + base[runs_key]['workflow_runs']}
+        branch_prs_key = f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100'
+
+        def run_page(*runs):
+            return {'total_count': len(runs), 'workflow_runs': list(runs)}
+
+        green = base[runs_key]['workflow_runs'][1]
+        newest_red = run_page(dict(green, id=3, conclusion='failure', created_at='2026-11-23T00:00:00Z'),
+                              *base[runs_key]['workflow_runs'])
         cases = {
             'tree differs': {f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 'u' * 40}}},
             'not current with main': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'diverged'}},
@@ -436,19 +443,20 @@ class PushReuseTests(unittest.TestCase):
             'newest run red': {runs_key: newest_red},
             'incomplete run page': {runs_key: dict(base[runs_key], total_count=101)},
             'incomplete job page': {jobs_key: dict(base[jobs_key], total_count=101)},
-            'no run': {runs_key: {'workflow_runs': []}},
-            'other workflow': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], path='.github/workflows/x.yml')]}},
-            'in progress': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], status='in_progress', conclusion=None)]}},
-            'aggregate red': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
-                'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
-            'aggregate missing': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {'jobs': []}},
+            'run count missing': {runs_key: {'workflow_runs': [green]}},
+            'no run': {runs_key: run_page()},
+            'other workflow': {runs_key: run_page(dict(green, path='.github/workflows/x.yml'))},
+            'in progress': {runs_key: run_page(dict(green, status='in_progress', conclusion=None))},
+            'aggregate red': {jobs_key: {'total_count': 1,
+                                          'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
+            'aggregate missing': {jobs_key: {'total_count': 0, 'jobs': []}},
             'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': []},
-            'fork run': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
-                head_repository={'full_name': 'someone/fork'})]}},
-            'run of another branch': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
-                head_branch='other')]}},
-            'head shared with another PR': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls?per_page=100': [
-                {'number': 7, 'head': {'sha': self.HEAD}}, {'number': 9, 'head': {'sha': self.HEAD}}]},
+            'fork run': {runs_key: run_page(dict(green, head_repository={'full_name': 'someone/fork'}))},
+            'run of another branch': {runs_key: run_page(dict(green, head_branch='other'))},
+            'run of another PR': {runs_key: run_page(dict(green, pull_requests=[{'number': 9, 'base': {'ref': 'main'}}]))},
+            'run against another base': {runs_key: run_page(dict(green, pull_requests=[{'number': 7, 'base': {'ref': 'stacked'}}]))},
+            'branch has another historical PR': {branch_prs_key: [
+                {'number': 7}, {'number': 9, 'state': 'closed', 'head': {'sha': 'e' * 40}}]},
             # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
             'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
@@ -457,8 +465,8 @@ class PushReuseTests(unittest.TestCase):
             'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
                 dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100'][0], merge_commit_sha='d' * 40)]},
             'malformed': {f'repos/{self.REPO}/git/commits/{self.SHA}': {}},
-            'full page of PRs on the head': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls?per_page=100':
-                [{'number': 7, 'head': {'sha': self.HEAD}}] + [{'number': 100 + i, 'head': {'sha': 'e' * 40}} for i in range(99)]},
+            'full page of PRs on the branch': {branch_prs_key:
+                [{'number': 7}] + [{'number': 100 + i} for i in range(99)]},
             'full page of PRs on the merge': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100':
                 base[f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100'] * 100},
             'PR list not a list': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': {'message': 'x'}},
