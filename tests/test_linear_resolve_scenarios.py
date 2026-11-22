@@ -448,5 +448,49 @@ class RefusalLogTests(ResolveBase):
         self.assertIn("issue=HF-622", self.result_lines()[-1])
 
 
+class DefaultProjectTests(ResolveBase):
+    """F29 (turn-waste RCA 22 Nov 2026): 35 of 46 project_required refusals in 14 days were create_issue with a
+    team and no project; the retry 8-36s later named the project the agent always files into."""
+
+    def test_a_team_without_project_files_into_the_project_last_used_for_that_team(self) -> None:
+        self.assertEqual(self.create(team="HF")["code"], "project_required")  # no history yet: two active projects
+        self.assertTrue(self.create(team="HF", project="Fleet QA")["ok"])
+        reply = self.create(team="hf")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.remote.created[-1]["projectId"], "proj-fleet-qa")
+        self.assertIn("'Fleet QA'", reply["message"])
+        self.assertEqual(self.create(team="KEN")["code"], "project_required")  # remembered per team only
+
+    def test_the_team_name_given_as_project_uses_that_teams_default(self) -> None:
+        self.assertTrue(self.create(team="HF", project="Roadmap")["ok"])
+        reply = self.create(project="Hermes Fleet")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(self.remote.created[-1]["projectId"], "proj-roadmap-hf")
+
+    def test_a_finished_remembered_project_is_not_reused(self) -> None:
+        self.assertTrue(self.create(team="HF", project="Fleet QA")["ok"])
+        for done in ("proj-fleet-qa", "proj-roadmap-hf"):
+            next(p for p in self.remote.projects if p["id"] == done)["completedAt"] = "2026-11-01T00:00:00Z"
+        self.remote.add_project("proj-dec", "Fleet Dec", ["team-hf"])
+        self.remote.add_project("proj-ops", "Fleet Ops", ["team-hf"])
+        self.assertEqual(self.create(team="HF")["code"], "project_required")
+
+    def test_a_team_with_one_active_project_needs_no_project(self) -> None:
+        self.remote.add_team("team-solo", "SOLO", "Solo")
+        self.remote.add_project("proj-solo", "Solo Work", ["team-solo"])
+        self.assertTrue(self.create(team="SOLO")["ok"])
+        self.assertEqual(self.remote.created[-1]["projectId"], "proj-solo")
+
+    def test_project_none_is_not_remembered(self) -> None:
+        self.assertTrue(self.create(team="HF", project="none")["ok"])
+        self.assertEqual(self.create(team="HF")["code"], "project_required")
+
+    def test_the_schema_states_create_requirements_up_front(self) -> None:
+        self.assertIn("create_issue id and title, plus team or project", chat.SCHEMA["description"])
+        project = chat.SCHEMA["parameters"]["properties"]["project"]["description"]
+        self.assertIn("last filed a new issue into", project)
+        self.assertNotIn("If unsure, omit it", project)
+
+
 if __name__ == "__main__":
     unittest.main()

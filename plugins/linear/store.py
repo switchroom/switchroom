@@ -318,6 +318,21 @@ class Store:
     def _conversation_input_key(issue_id: str, session_id: str) -> str:
         return "native-reply-anchor:" + json.dumps([issue_id, session_id], separators=(",", ":"))
 
+    ISSUE_PROJECT = "issue-project:"  # team id or key, casefolded -> the project this app last filed into
+
+    def issue_project(self, team: str) -> str | None:
+        """The project this app last filed a new issue into for ``team`` (id or key), if any."""
+        with self._tx() as db:
+            row = db.execute("SELECT value FROM metadata WHERE key=?",
+                             (self.ISSUE_PROJECT + str(team).casefold(),)).fetchone()
+            return row[0] if row else None
+
+    def remember_issue_project(self, teams: list[str], project_id: str) -> None:
+        with self._tx() as db:
+            for team in {str(name).casefold() for name in teams if name}:
+                db.execute("INSERT INTO metadata(key,value) VALUES (?,?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (self.ISSUE_PROJECT + team, project_id))
+
     def conversation_input(self, issue_id: str, session_id: str) -> dict | None:
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key=?",

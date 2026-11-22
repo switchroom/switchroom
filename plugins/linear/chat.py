@@ -49,7 +49,10 @@ SCHEMA = {
         "work_reference accepts only action and identifies the current native dispatcher-owned work; "
         "its original requester is unknown and it grants no permission. "
         "create_issue, create_project, link_issue, update_description and add_comment work without "
-        "a task link or chat claim. Description replacement requires the exact expected_description. "
+        "a task link or chat claim. Required fields, so the first call succeeds: create_issue id and title, plus team or "
+        "project (an omitted project defaults as described under project); create_project id, name and team; "
+        "link_issue issue, related and relation; update_description issue, id, description and expected_description; "
+        "add_comment issue, id and body. Description replacement requires the exact expected_description. "
         "Questions, status checks and short commands need no issue: just answer in the conversation. "
         "When the user asks you to do a longer outcome, create_issue with start_work=true (or work_on for an existing issue): "
         "one native task starts on this agent's board, this app becomes the Linear delegate (the human assignee is kept), "
@@ -92,10 +95,10 @@ SCHEMA = {
         "expected_updated_at": {"type": "string", "description": "delegate_self: exact issue.updatedAt from a fresh status read; optimistic preflight, not remote compare-and-swap."},
         "id": {"type": "string", "description": "Caller UUIDv4 for creates, delegate_self, take_over, resume_owner, update_description, add_comment and followup; reuse with identical content after an uncertain response."},
         "title": {"type": "string"}, "name": {"type": "string"},
-        "team": {"type": "string", "description": "Team key. create_issue: optional when project names an active project; the project picks its team. A team that does not own the named project is corrected and the reply says so."},
+        "team": {"type": "string", "description": "Team key. create_issue needs team or project (or a parent). With project, team is optional: the project picks its team, and a team that does not own it is corrected in the reply. create_project requires team."},
         "description": {"type": "string", "description": "Human-readable issue description or concise project summary. For detailed issue content use Linear Markdown with actual newlines, headings, bullets and acceptance checklists. Preserve authored text and distinguish setup from remaining outcomes."},
         "expected_description": {"type": "string", "description": "Exact current description for replacement preflight; this is not remote compare-and-swap."},
-        "project": {"type": "string", "description": "create_issue: project id, exact project name or URL slug, in any team this app can see. Required unless parent has a project, which is then used. If unsure, omit it: the reply lists the active projects; pick the one that fits the work and retry. Use \"none\" only when the work fits no project. Never ask the user for project ids."},
+        "project": {"type": "string", "description": "create_issue: project id, exact project name or URL slug of an active project, in any team this app can see; names are matched exactly (ignoring case), never by part of a name. Omitted: the parent's project, else the active project this agent last filed a new issue into for team (or the team's only active project); the reply names the project used. Only when none of those exists is the call refused with the team's active projects to choose from. Use \"none\" (with team) only when the work fits no project. Never ask the user for project ids."},
         "start_work": {"type": "boolean", "description": "create_issue: true when the user asked for a longer outcome to be carried out now; starts one native task, delegates the issue to this app and reports back to this chat. false (default) for a quick note or someone else's issue. work_on always starts."},
         "record_done": {"type": "boolean", "description": "create_issue or work_on: link and close work already finished in this chat; requires summary. Nothing is started or re-run."},
         "summary": {"type": "string", "description": "record_done: what was delivered and what remains, for the closing Linear summary."},
@@ -506,9 +509,12 @@ def _issue_destination(bridge: Any, team: str, project: str, parent: str | None)
         inherited = (parent_issue.get("project") or {}).get("id")
         if not project and inherited and team:
             return team, inherited, "", ""
-    if not team:
-        if project and not none:
+    if not team and project and not none:
+        named = _team_named(bridge, project)
+        if named is None:
             return _project_led(bridge, project)
+        team, project = named, ""  # the team's name given as project ("Hermes Fleet"): use its default project
+    if not team:
         directory = _directory(bridge)
         if none:
             return None, None, "", _reply(False, "project \"none\" needs a team. Teams this app can use: "
@@ -545,10 +551,43 @@ def _issue_destination(bridge: Any, team: str, project: str, parent: str | None)
             return _project_led(bridge, project, team, team_projects=active)
         message = f"Several active projects in this team are named {project!r}."
     else:
+        default = _default_project(bridge, team, active)
+        if default is not None:
+            return team, default["id"], (f"Filed in project {default['name']!r}, the active project this agent last "
+                                         "filed a new issue into for this team."), ""
         message = "A new issue needs a project so it shows up in the right Linear view."
     return None, None, "", _reply(False, message + " Choose the project from this list that fits the work and retry with "
                                   "its id or exact name, or project \"none\" if it fits none. Decide from the conversation; "
                                   "do not ask the user for ids.", code="project_required", projects=active)
+
+
+def _default_project(bridge: Any, team: str, active: list[dict]) -> dict | None:
+    """The still-active project this app last filed a new issue into for ``team``, else the team's only one."""
+    remembered = getattr(getattr(bridge, "store", None), "issue_project", None)
+    last = remembered(team) if callable(remembered) else None
+    found = next((row for row in active if row["id"] == last), None) if last else None
+    return found or (active[0] if len(active) == 1 else None)
+
+
+def _team_named(bridge: Any, name: str) -> str | None:
+    """Team id when ``name`` is no active project but exactly a visible team's key or name."""
+    try:
+        directory = _directory(bridge)
+    except LinearError:
+        return None
+    if _find_projects(directory, name):
+        return None
+    row = _find_team(directory, name)
+    return row["id"] if row else None
+
+
+def _remember_project(bridge: Any, team: str, created: dict) -> None:
+    project = (created.get("project") or {}).get("id")
+    remember = getattr(getattr(bridge, "store", None), "remember_issue_project", None)
+    if isinstance(project, str) and project and callable(remember):
+        owner = created.get("team") or {}
+        with contextlib.suppress(Exception):  # a missed default only costs one refusal later
+            remember([team, owner.get("id"), owner.get("key")], project)
 
 
 def _entrust_request(args: dict, action: str, context: Any) -> tuple[bool, dict | None]:
@@ -1022,6 +1061,7 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
             if not _missing_team(directory, row):
                 raise
             return _unknown_team(directory, team)
+        _remember_project(bridge, team, created)
         if not entrust:
             return _reply(True, note + "Created an undelegated issue." + _stored_differently(created)
                           + _formatting_tip(args.get("description")), issue=created)
