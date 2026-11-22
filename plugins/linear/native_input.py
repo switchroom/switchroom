@@ -886,6 +886,10 @@ def _approval_confirmation(choice, count, reason):
     return t(f"gateway.approve.{choice}_{number}", count=count)
 
 
+# Marks a SendResult whose reply the plugin's durable outbox now owns (``_send_retry_is_final``).
+OUTBOX_OWNED = "linear_outbox_owned"
+
+
 def native_supported():
     """Passive capability check; never bootstrap an owner or discover accounts.
 
@@ -1083,8 +1087,9 @@ def create_adapter(config, running):
                     lock = self._admission_locks[key] = asyncio.Lock()
                     while len(self._admission_locks) > 1024:
                         oldest = next(iter(self._admission_locks))
-                        if self._admission_locks[oldest].locked():
-                            break
+                        held = self._admission_locks[oldest]
+                        if held.locked() or getattr(held, "_waiters", None):
+                            break  # held, or released to a waiter that has not woken yet
                         self._admission_locks.pop(oldest)
                 return lock
 
@@ -1187,7 +1192,7 @@ def create_adapter(config, running):
             with self._relay_lock:
                 self._submitted.pop(self._delivery_key(delivery), None)
 
-        async def _committed_receipt(self, event, *, refused_is_absent=False):
+        async def _committed_receipt(self, event):
             """Core's committed admission of this exact Linear input, else ``None``.
 
             Read through upstream's ledger (``admissions.match``) under the same principal
@@ -1203,15 +1208,9 @@ def create_adapter(config, running):
             scope = getattr(runner, "_async_profile_scope_for_source", None)
             if not callable(scope) and getattr(getattr(runner, "config", None), "multiplex_profiles", False):
                 raise LinearError("Native Linear receipt profile is unavailable")
-            try:
-                async with scope(event.source) if callable(scope) else nullcontext():
-                    authority = require_active_authority(runner)
-                    payload = await prepare_native(runner, event)
-            except Exception as exc:
-                from persistence.core.errors import AuthorityRefusal
-                if refused_is_absent and isinstance(exc, AuthorityRefusal):
-                    return None  # Core's own admission refuses (and answers) it the same way.
-                raise
+            async with scope(event.source) if callable(scope) else nullcontext():
+                authority = require_active_authority(runner)
+                payload = await prepare_native(runner, event)
             source = restore_native_source(payload)
             principal = "messaging:" + json.dumps([source.profile, source.platform.value, source.chat_id,
                                                     source.thread_id, source.user_id], separators=(",", ":"))
@@ -1686,8 +1685,13 @@ def create_adapter(config, running):
             # A queued question is retried by the outbox: possibly delivered, so core keeps it armed
             # and sends no second copy.
             return SendResult(success=False, message_id=row_id, retryable=True,
-                              raw_response={"ambiguous": True} if question else None,
+                              raw_response={"ambiguous": True, OUTBOX_OWNED: True} if question else {OUTBOX_OWNED: True},
                               error="Linear reply queued; publication is not confirmed")
+
+        def _send_retry_is_final(self, result):
+            """The durable outbox already retries a queued reply. Core's inline retry would only
+            re-queue it and, on a producer turn, hold the next queued input behind its backoff."""
+            return bool((getattr(result, "raw_response", None) or {}).get(OUTBOX_OWNED))
 
         async def send(self, chat_id, content, reply_to=None, metadata=None):
             metadata = metadata or {}

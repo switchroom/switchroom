@@ -368,6 +368,8 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
         self.assertEqual(self.board.get(task_id).status, before)
         self.assertIsNone(self.bridge.store.native_intent(f"stop:{self.ISSUE}:unlisted-stop"))
+        self.assertIsNone(self.bridge.store.native_intent(f"core-stop:{self.ISSUE}:{self.SESSION}:unlisted-stop"))
+        self.assertNotIn("unlisted-stop", [event.message_id for event in self.events])
         self.assertEqual(self.inbox_row("unlisted-stop")[2], "pending")
 
     async def test_fresh_authorized_discussion_reads_and_replies_without_thawing_old_effect_fence(self):
