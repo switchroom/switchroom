@@ -1,6 +1,7 @@
 """Source selection and required-check contract, exercised through the real CLI."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -343,6 +344,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('needs: [selection, source-tests, runtime]', jobs['source-checks'])
         self.assertIn('if: always()', jobs['source-checks'])
         self.assertIn('source-ci.py gate', jobs['source-checks'])
+        self.assertIn('--record-pr-proof', jobs['source-checks'])
+        self.assertIn('fetch-depth: 2', jobs['source-checks'])
         self.assertIn('toJSON(needs)', jobs['source-checks'])
         self.assertIn('needs.selection.outputs.plan', jobs['source-checks'])
         self.assertIn('needs: selection', jobs['runtime'])
@@ -365,7 +368,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn('TESTED: ${{ github.sha }}', jobs['selection'])
         self.assertIn('scripts/run-runtime-leg.sh "$LANE" "$SHARD"', jobs['runtime'])
         self.assertNotIn('run-linear-', jobs['runtime'], 'runtime proofs live in run-runtime-leg.sh only')
-        for grant in ('contents: read', 'pull-requests: read', 'actions: read'):
+        for grant in ('contents: read', 'pull-requests: read', 'actions: read', 'checks: read'):
             self.assertIn(grant, jobs['selection'])
         self.assertIn("if: needs.selection.outputs.reused != 'true'", jobs['source-tests'])
 
@@ -397,47 +400,76 @@ def load_selector():
 
 class PushReuseTests(unittest.TestCase):
     SHA, BEFORE, HEAD = 'a' * 40, 'b' * 40, 'c' * 40
+    TESTED, TREE = 'd' * 40, 'e' * 40
     REPO = 'switchroom/switchroom'
+    API_REPO = f'https://api.github.com/repos/{REPO}'
+    RUNS = f'repos/{REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={HEAD}&per_page=100'
+    JOBS = f'repos/{REPO}/actions/runs/2/attempts/1/jobs?per_page=100'
+    NOTES = f'repos/{REPO}/check-runs/202/annotations?per_page=100'
+    MERGE = f'repos/{REPO}/git/commits/{TESTED}'
+
+    def setUp(self):
+        self.module = load_selector()
+        self.plan = self.module.select(['tests/test_perplexity_provider.py'])
+
+    def proof(self, **override):
+        proof = self.module.source_proof(self.plan, repository=self.REPO, pr='7', base=self.BEFORE, head=self.HEAD,
+                                         tested=self.TESTED, tree=self.TREE, run_id='2', attempt='1')
+        return dict(proof, **override)
+
+    def notice(self, **override):
+        return {'title': 'source-ci-reuse-proof', 'annotation_level': 'notice', 'path': 'scripts/source-ci.py',
+                'message': json.dumps(self.proof(**override))}
 
     def responses(self, **override):
+        repo = {'full_name': self.REPO}
+        run = {'head_branch': 'feature', 'repository': repo, 'head_repository': repo,
+               'head_sha': self.HEAD, 'event': 'pull_request', 'path': '.github/workflows/ci.yml',
+               'status': 'completed', 'pull_requests': [], 'run_attempt': 1}
         r = {
-            f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
+            f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
                 {'number': 7, 'merged_at': '2026-11-22T00:00:00Z', 'merge_commit_sha': self.SHA,
-                 'base': {'ref': 'main'}, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
-            f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
-                {'number': 7, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
-            f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': 't' * 40}},
-            f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 't' * 40}},
+                 'base': {'ref': 'main', 'repo': repo},
+                 'head': {'sha': self.HEAD, 'ref': 'feature', 'repo': repo}}],
+            f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100': [{'number': 7}],
+            f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': self.TREE}},
+            f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': self.TREE}},
+            self.MERGE: {'sha': self.TESTED, 'tree': {'sha': self.TREE},
+                         'parents': [{'sha': self.BEFORE}, {'sha': self.HEAD}]},
             f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'ahead'},
-            f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100': {
+            self.RUNS: {
+                'total_count': 2,
                 'workflow_runs': [
-                    {'id': 1, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-21T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
-                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'failure',
-                     'html_url': 'https://x/runs/1'},
-                    {'id': 2, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
-                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success',
-                     'html_url': 'https://x/runs/2'}]},
+                    dict(run, id=1, created_at='2026-11-21T00:00:00Z', conclusion='failure',
+                         html_url='https://x/runs/1'),
+                    dict(run, id=2, created_at='2026-11-22T00:00:00Z', conclusion='success',
+                         html_url='https://x/runs/2')]},
             f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-21T12:00:00Z'},
                 {'event': 'labeled', 'created_at': '2026-11-22T00:30:00Z'}],
-            f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
-                'jobs': [{'name': 'source-checks', 'conclusion': 'success'},
+            self.JOBS: {
+                'total_count': 2,
+                'jobs': [{'id': 202, 'name': 'source-checks', 'status': 'completed', 'conclusion': 'success',
+                          'run_id': 2, 'run_attempt': 1, 'head_sha': self.HEAD,
+                          'run_url': f'{self.API_REPO}/actions/runs/2',
+                          'check_run_url': f'{self.API_REPO}/check-runs/202'},
                          {'name': 'runtime (input 1/3)', 'conclusion': 'success'}]},
+            self.NOTES: [{'title': 'unrelated notice'}, self.notice()],
         }
         r.update(override)
         return r
 
-    def find(self, responses, sha=None, before=None):
+    def find(self, responses, sha=None, before=None, plan=None):
         before = self.BEFORE if before is None else before
-        module = load_selector()
+        plan = self.plan if plan is None else plan
         def api(path):
             if path not in responses:
                 raise subprocess.CalledProcessError(1, ['gh', 'api', path])
             return responses[path]
         logs = []
-        return module.find_reuse(self.REPO, sha or self.SHA, before, api=api, log=logs.append), logs
+        return self.module.find_reuse(self.REPO, sha or self.SHA, before, plan, api=api, log=logs.append), logs
 
-    def test_all_three_conditions_reuse_the_newest_green_run(self):
+    def test_covered_push_reuses_the_newest_green_run(self):
         url, _ = self.find(self.responses())
         self.assertEqual(url, 'https://x/runs/2')
         url, _ = self.find(self.responses(**{
@@ -446,35 +478,53 @@ class PushReuseTests(unittest.TestCase):
 
     def test_any_failed_condition_or_doubt_falls_back(self):
         base = self.responses()
-        runs_key = f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100'
-        newest_red = {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], id=3, conclusion='failure',
-                                             created_at='2026-11-23T00:00:00Z')] + base[runs_key]['workflow_runs']}
+        runs_key = self.RUNS
+        jobs_key = self.JOBS
+        branch_prs_key = f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100'
+
+        def run_page(*runs):
+            return {'total_count': len(runs), 'workflow_runs': list(runs)}
+
+        green = base[runs_key]['workflow_runs'][1]
+        newest_red = run_page(dict(green, id=3, conclusion='failure', created_at='2026-11-23T00:00:00Z'),
+                              *base[runs_key]['workflow_runs'])
         cases = {
-            'tree differs': {f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 'u' * 40}}},
+            'tree differs': {f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': 'f' * 40}}},
             'not current with main': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'diverged'}},
             'behind': {f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'behind'}},
             'newest run red': {runs_key: newest_red},
-            'no run': {runs_key: {'workflow_runs': []}},
-            'other workflow': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], path='.github/workflows/x.yml')]}},
-            'in progress': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1], status='in_progress', conclusion=None)]}},
-            'aggregate red': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {
-                'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
-            'aggregate missing': {f'repos/{self.REPO}/actions/runs/2/jobs?filter=latest&per_page=100': {'jobs': []}},
-            'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': []},
-            'fork run': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
-                head_repository={'full_name': 'someone/fork'})]}},
-            'run of another branch': {runs_key: {'workflow_runs': [dict(base[runs_key]['workflow_runs'][1],
-                head_branch='other')]}},
-            'head shared with another PR': {f'repos/{self.REPO}/commits/{self.HEAD}/pulls': [
-                {'number': 7, 'head': {'sha': self.HEAD}}, {'number': 9, 'head': {'sha': self.HEAD}}]},
+            'cannot order matching runs': {runs_key: run_page(green, dict(green, id=3, created_at=None))},
+            'incomplete run page': {runs_key: dict(base[runs_key], total_count=101)},
+            'incomplete job page': {jobs_key: dict(base[jobs_key], total_count=101)},
+            'run count missing': {runs_key: {'workflow_runs': [green]}},
+            'no run': {runs_key: run_page()},
+            'other workflow': {runs_key: run_page(dict(green, path='.github/workflows/x.yml'))},
+            'in progress': {runs_key: run_page(dict(green, status='in_progress', conclusion=None))},
+            'aggregate red': {jobs_key: {'total_count': 1,
+                                          'jobs': [{'name': 'source-checks', 'conclusion': 'failure'}]}},
+            'aggregate missing': {jobs_key: {'total_count': 0, 'jobs': []}},
+            'no merged PR': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': []},
+            'fork run': {runs_key: run_page(dict(green, head_repository={'full_name': 'someone/fork'}))},
+            'run of another branch': {runs_key: run_page(dict(green, head_branch='other'))},
+            'run of another PR': {runs_key: run_page(dict(green, pull_requests=[{'number': 9, 'base': {'ref': 'main'}}]))},
+            'run against another base': {runs_key: run_page(dict(green, pull_requests=[{'number': 7, 'base': {'ref': 'stacked'}}]))},
+            'branch has another historical PR': {branch_prs_key: [
+                {'number': 7}, {'number': 9, 'state': 'closed', 'head': {'sha': 'e' * 40}}]},
             # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
             'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
+            'retarget has no timestamp': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
+                {'event': 'base_ref_changed'}]},
             'events unreadable in one page': {f'repos/{self.REPO}/issues/7/events?per_page=100':
                 [{'event': 'labeled', 'created_at': '2026-11-20T00:00:00Z'}] * 100},
-            'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls': [
-                dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls'][0], merge_commit_sha='d' * 40)]},
+            'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
+                dict(base[f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100'][0], merge_commit_sha='d' * 40)]},
             'malformed': {f'repos/{self.REPO}/git/commits/{self.SHA}': {}},
+            'full page of PRs on the branch': {branch_prs_key:
+                [{'number': 7}] + [{'number': 100 + i} for i in range(99)]},
+            'full page of PRs on the merge': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100':
+                base[f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100'] * 100},
+            'PR list not a list': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': {'message': 'x'}},
         }
         for name, override in cases.items():
             with self.subTest(name=name):
@@ -486,6 +536,122 @@ class PushReuseTests(unittest.TestCase):
         self.assertIsNone(self.find(missing)[0])
         self.assertIsNone(self.find(self.responses(), before='0' * 40)[0])
         self.assertIsNone(self.find(self.responses(), before='')[0])
+
+    def test_incomplete_newer_run_cannot_be_discarded(self):
+        base = self.responses()[self.RUNS]['workflow_runs']
+        red = dict(base[-1], id=3, created_at='2026-11-23T00:00:00Z', conclusion='failure')
+        for field in ('repository', 'head_repository', 'head_sha', 'path', 'event', 'head_branch'):
+            with self.subTest(field=field):
+                incomplete = dict(red)
+                del incomplete[field]
+                page = {'total_count': 3, 'workflow_runs': [*base, incomplete]}
+                self.assertIsNone(self.find(self.responses(**{self.RUNS: page}))[0])
+        fork = dict(red, head_repository={'full_name': 'other/fork'})
+        page = {'total_count': 3, 'workflow_runs': [*base, fork]}
+        self.assertEqual(self.find(self.responses(**{self.RUNS: page}))[0], 'https://x/runs/2')
+
+    def test_source_job_identity_must_match_the_selected_run(self):
+        fields = {
+            'id': 303,
+            'run_id': 99,
+            'run_attempt': 2,
+            'head_sha': self.BEFORE,
+            'run_url': f'{self.API_REPO}/actions/runs/99',
+            'check_run_url': 'https://api.github.com/repos/other/repo/check-runs/202',
+        }
+        for field, value in fields.items():
+            for missing in (False, True):
+                with self.subTest(field=field, missing=missing):
+                    responses = self.responses()
+                    job = responses[self.JOBS]['jobs'][0]
+                    if missing:
+                        del job[field]
+                    else:
+                        job[field] = value
+                    self.assertIsNone(self.find(responses)[0])
+
+    def test_run_proof_must_cover_this_push(self):
+        for proof_change in ({'base': '0' * 40}, {'head': self.BEFORE}, {'tree': self.HEAD}, {'pr': '8'},
+                             {'tested': ''}, {'repository': 'other/repo'}, {'run_id': '1'}, {'attempt': '2'}):
+            with self.subTest(proof_change=proof_change):
+                self.assertIsNone(self.find(self.responses(**{self.NOTES: [self.notice(**proof_change)]}))[0])
+        for plan in (dict(self.plan, tests=[]), dict(self.plan, linear=True, runtime=True)):
+            with self.subTest(plan=plan):
+                self.assertIsNone(self.find(self.responses(), plan=plan)[0])
+
+    def test_proof_needs_independently_verified_merge_tree_and_ordered_parents(self):
+        responses = self.responses()
+        merge = responses[self.MERGE]
+        for change in ({'tree': {'sha': self.HEAD}}, {'parents': list(reversed(merge['parents']))},
+                       {'parents': [{'sha': self.HEAD}]}, {'sha': self.SHA}):
+            with self.subTest(change=change):
+                self.assertIsNone(self.find(self.responses(**{self.MERGE: dict(merge, **change)}))[0])
+        wrong = self.SHA
+        responses = self.responses(**{
+            self.NOTES: [self.notice(tested=wrong)],
+            f'repos/{self.REPO}/git/commits/{wrong}': {
+                'sha': wrong, 'tree': {'sha': self.TREE}, 'parents': [{'sha': self.BEFORE}],
+            },
+        })
+        self.assertIsNone(self.find(responses)[0])
+        responses = self.responses()
+        del responses[self.MERGE]
+        self.assertIsNone(self.find(responses)[0])
+
+    def test_run_proof_must_be_a_single_complete_notice_on_the_green_attempt(self):
+        valid = self.notice()
+        for notes in ([], [valid, valid], [valid] + [{'title': 'other'}] * 99, {'wrong': valid},
+                      [dict(valid, path='README.md')], [dict(valid, annotation_level='warning')],
+                      [dict(valid, message='x' * 1025)], [dict(valid, message='bad JSON')]):
+            with self.subTest(count=len(notes)):
+                self.assertIsNone(self.find(self.responses(**{self.NOTES: notes}))[0])
+        responses = self.responses()
+        responses[self.RUNS]['workflow_runs'][-1]['run_attempt'] = 2
+        self.assertIsNone(self.find(responses)[0])  # Attempt 1's success is insufficient.
+
+    def test_missing_push_diff_keeps_full_plan_without_reuse(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), 'select', '--event', 'push',
+                                 '--base', self.BEFORE, '--head', self.SHA, '--reuse-repository', self.REPO],
+                                cwd=ROOT, capture_output=True, text=True, env={'PATH': '/nonexistent'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertTrue(plan['full'])
+        self.assertNotIn('reused_from', plan)
+        self.assertNotIn('reuse:', result.stderr)
+
+    def test_selector_reuses_only_the_covered_push_plan_and_attempt(self):
+        import contextlib
+        import functools
+        import io
+        from unittest import mock
+
+        argv = [str(SCRIPT), 'select', '--event', 'push', '--base', self.BEFORE, '--head', self.SHA,
+                '--reuse-repository', self.REPO]
+        for job_attempt in (1, 2):
+            with self.subTest(job_attempt=job_attempt):
+                responses = self.responses()
+                responses[self.JOBS]['jobs'][0]['run_attempt'] = job_attempt
+                lookup = functools.partial(self.module.find_reuse, api=responses.__getitem__)
+                out = io.StringIO()
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(self.module, 'changed_paths', return_value=['tests/test_perplexity_provider.py']), \
+                        mock.patch.object(self.module, 'find_reuse', side_effect=lookup), contextlib.redirect_stdout(out):
+                    self.assertEqual(self.module.main(), 0)
+                plan = json.loads(out.getvalue())
+                if job_attempt == 1:
+                    self.assertEqual(plan['reused_from'], 'https://x/runs/2')
+                else:
+                    self.assertEqual(plan, self.plan)
+
+    def test_unexpected_exception_in_lookup_falls_back(self):
+        module = load_selector()
+        for error in (RuntimeError('boom'), LookupError('x'), ZeroDivisionError()):
+            with self.subTest(error=type(error).__name__):
+                def api(path, error=error):
+                    raise error
+                logs = []
+                self.assertIsNone(module.find_reuse(self.REPO, self.SHA, self.BEFORE, self.plan, api=api, log=logs.append))
+                self.assertIn(type(error).__name__, logs[-1])
 
     def test_reused_plan_passes_gate_only_with_tests_and_runtime_skipped(self):
         module = load_selector()
@@ -511,6 +677,10 @@ class PinReuseTests(unittest.TestCase):
     AGENT = 'switchroom/hermes-agent'
     REPO = 'switchroom/switchroom'
     REV = 'e' * 40
+    AGENT_TREE = 'f' * 40
+    RUNS = f'repos/{AGENT}/actions/workflows/fleet-integration.yml/runs?event=push&branch=main&head_sha={REV}&per_page=100'
+    JOBS = f'repos/{AGENT}/actions/runs/50/attempts/1/jobs?per_page=100'
+    AGENT_COMMIT = f'repos/{AGENT}/git/commits/{REV}'
 
     def setUp(self):
         self.module = load_selector()
@@ -556,7 +726,8 @@ class PinReuseTests(unittest.TestCase):
 
     def result(self, **override):
         r = {'schema': 'fleet-integration/v1', 'result': 'success', 'event': 'push', 'ref': 'refs/heads/main',
-             'agent_repository': self.AGENT, 'agent_commit': self.REV, 'agent_tree': 'f' * 40, 'run_id': 50,
+             'agent_repository': self.AGENT, 'agent_commit': self.REV, 'agent_tree': self.AGENT_TREE,
+             'run_id': 50, 'run_attempt': 1, 'ran_legs': True, 'scope': 'success',
              'workflow': '.github/workflows/fleet-integration.yml', 'switchroom_repository': self.REPO,
              'switchroom_commit': self.switchroom, 'switchroom_tree': self.git('rev-parse', self.switchroom + '^{tree}'),
              'legs': {self.module.leg_name(*leg): 'success' for leg in self.module.RUNTIME_LEGS}}
@@ -566,7 +737,7 @@ class PinReuseTests(unittest.TestCase):
     def run_entry(self, **override):
         r = {'id': 50, 'head_sha': self.REV, 'path': '.github/workflows/fleet-integration.yml', 'event': 'push',
              'head_branch': 'main', 'head_repository': {'full_name': self.AGENT},
-             'repository': {'full_name': self.AGENT}, 'status': 'completed', 'conclusion': 'success',
+             'repository': {'full_name': self.AGENT}, 'status': 'completed', 'conclusion': 'success', 'run_attempt': 1,
              'created_at': '2026-11-22T05:00:00Z', 'html_url': 'https://github.com/x/runs/50'}
         r.update(override)
         return r
@@ -579,14 +750,26 @@ class PinReuseTests(unittest.TestCase):
         n.update(override)
         return n
 
+    @staticmethod
+    def run_page(*runs):
+        return {'total_count': len(runs), 'workflow_runs': list(runs)}
+
+    @staticmethod
+    def jobs_page(*jobs):
+        return {'total_count': len(jobs), 'jobs': list(jobs)}
+
     def responses(self, **override):
-        jobs = [{'name': 'Fleet integration pass', 'conclusion': 'success', 'id': 900}] + [
-            {'name': f'fleet leg ({self.module.leg_name(*leg)})', 'conclusion': 'success'} for leg in self.module.RUNTIME_LEGS]
+        job_names = ['Fleet integration pass'] + [
+            f'fleet leg ({self.module.leg_name(*leg)})' for leg in self.module.RUNTIME_LEGS]
+        api_repo = f'https://api.github.com/repos/{self.AGENT}'
+        jobs = [dict(id=job_id, name=name, status='completed', conclusion='success', run_id=50, run_attempt=1,
+                     head_sha=self.REV, run_url=f'{api_repo}/actions/runs/50', check_run_url=f'{api_repo}/check-runs/{job_id}')
+                for job_id, name in enumerate(job_names, start=900)]
         r = {
-            f'repos/{self.AGENT}/actions/workflows/fleet-integration.yml/runs?event=push&branch=main&head_sha={self.REV}&per_page=100':
-                {'workflow_runs': [self.run_entry(id=49, conclusion='failure', created_at='2026-11-22T04:00:00Z'),
-                                   self.run_entry()]},
-            f'repos/{self.AGENT}/actions/runs/50/jobs?filter=latest&per_page=100': {'jobs': jobs},
+            self.RUNS: self.run_page(self.run_entry(id=49, conclusion='failure', created_at='2026-11-22T04:00:00Z'),
+                                     self.run_entry()),
+            self.JOBS: self.jobs_page(*jobs),
+            self.AGENT_COMMIT: {'sha': self.REV, 'tree': {'sha': self.AGENT_TREE}},
             self.NOTES: [{'title': 'other', 'annotation_level': 'notice', 'message': 'x'}, self.note()],
         }
         r.update(override)
@@ -617,13 +800,13 @@ class PinReuseTests(unittest.TestCase):
             self.assertFalse(pin(['release/agent-image-manifest.json', other]), other)
 
     def test_green_run_of_the_same_switchroom_tree_is_reused(self):
-        url, logs = self.find()
-        self.assertEqual(url, 'https://github.com/x/runs/50', logs)
+        proof, logs = self.find()
+        self.assertEqual(proof, ('https://github.com/x/runs/50', 50, 1), logs)
 
     def test_main_moved_only_in_non_runtime_paths_is_still_reused(self):
         self.base = self.advance_main('docs/notes.md')
-        url, logs = self.find(tested=self.pin(self.base))
-        self.assertEqual(url, 'https://github.com/x/runs/50', logs)
+        proof, logs = self.find(tested=self.pin(self.base))
+        self.assertEqual(proof, ('https://github.com/x/runs/50', 50, 1), logs)
 
     def test_stale_switchroom_tree_runs_everything(self):
         for moved in ('plugins/linear/acceptance.py', 'tests/test_linear_x_scenarios.py',
@@ -646,25 +829,40 @@ class PinReuseTests(unittest.TestCase):
 
     def test_any_failed_condition_or_doubt_runs_everything(self):
         base = self.responses()
-        runs = f'repos/{self.AGENT}/actions/workflows/fleet-integration.yml/runs?event=push&branch=main&head_sha={self.REV}&per_page=100'
-        jobs = f'repos/{self.AGENT}/actions/runs/50/jobs?filter=latest&per_page=100'
-        good_jobs = base[jobs]['jobs']
+        runs, jobs = self.RUNS, self.JOBS
+        good_jobs = base[self.JOBS]['jobs']
+        good_run = self.run_entry()
+        incomplete_newer = self.run_entry(id=51, created_at='2026-11-22T06:00:00Z', status='queued', conclusion=None)
+        del incomplete_newer['head_repository']
         response_cases = {
-            'no run': {runs: {'workflow_runs': []}},
-            'newest run red': {runs: {'workflow_runs': [self.run_entry(), self.run_entry(id=51, conclusion='failure',
-                                                                                      created_at='2026-11-22T06:00:00Z')]}},
-            'in progress': {runs: {'workflow_runs': [self.run_entry(status='in_progress', conclusion=None)]}},
-            'fork run': {runs: {'workflow_runs': [self.run_entry(head_repository={'full_name': 'someone/hermes-agent'})]}},
-            'pull_request run': {runs: {'workflow_runs': [self.run_entry(event='pull_request')]}},
-            'other branch': {runs: {'workflow_runs': [self.run_entry(head_branch='feature')]}},
-            'other workflow': {runs: {'workflow_runs': [self.run_entry(path='.github/workflows/ci.yaml')]}},
-            'different agent sha': {runs: {'workflow_runs': [self.run_entry(head_sha='d' * 40)]}},
-            'aggregate red': {jobs: {'jobs': [dict(good_jobs[0], conclusion='failure')] + good_jobs[1:]}},
-            'missing leg': {jobs: {'jobs': good_jobs[:-1]}},
-            'failed leg': {jobs: {'jobs': good_jobs[:-1] + [dict(good_jobs[-1], conclusion='failure')]}},
-            'skipped leg': {jobs: {'jobs': good_jobs[:-1] + [dict(good_jobs[-1], conclusion='skipped')]}},
-            'duplicate leg': {jobs: {'jobs': good_jobs + [dict(good_jobs[-1], conclusion='failure')]}},
+            'no run': {runs: self.run_page()},
+            'incomplete run page': {runs: dict(base[runs], total_count=3)},
+            'unidentifiable newer run': {runs: self.run_page(incomplete_newer, good_run)},
+            'newest run red': {runs: self.run_page(good_run, self.run_entry(id=51, conclusion='failure',
+                                                                          created_at='2026-11-22T06:00:00Z'))},
+            'in progress': {runs: self.run_page(self.run_entry(status='in_progress', conclusion=None))},
+            'fork run': {runs: self.run_page(self.run_entry(head_repository={'full_name': 'someone/hermes-agent'}))},
+            'pull_request run': {runs: self.run_page(self.run_entry(event='pull_request'))},
+            'other branch': {runs: self.run_page(self.run_entry(head_branch='feature'))},
+            'other workflow': {runs: self.run_page(self.run_entry(path='.github/workflows/ci.yaml'))},
+            'different agent sha': {runs: self.run_page(self.run_entry(head_sha='d' * 40))},
+            'aggregate red': {jobs: self.jobs_page(dict(good_jobs[0], conclusion='failure'), *good_jobs[1:])},
+            'missing leg': {jobs: self.jobs_page(*good_jobs[:-1])},
+            'incomplete job page': {jobs: dict(base[jobs], total_count=len(good_jobs) + 1)},
+            'failed leg': {jobs: self.jobs_page(*good_jobs[:-1], dict(good_jobs[-1], conclusion='failure'))},
+            'skipped leg': {jobs: self.jobs_page(*good_jobs[:-1], dict(good_jobs[-1], conclusion='skipped'))},
+            'duplicate leg': {jobs: self.jobs_page(*good_jobs, dict(good_jobs[-1], conclusion='failure'))},
+            'stale attempt': {jobs: self.jobs_page(*good_jobs[:-1], dict(good_jobs[-1], run_attempt=2))},
+            'other job revision': {jobs: self.jobs_page(*good_jobs[:-1], dict(good_jobs[-1], head_sha='d' * 40))},
+            'other job run': {jobs: self.jobs_page(*good_jobs[:-1], dict(good_jobs[-1], run_id=49))},
+            'aggregate check belongs elsewhere': {jobs: self.jobs_page(
+                dict(good_jobs[0], check_run_url='https://api.github.com/repos/elsewhere/check-runs/900'), *good_jobs[1:])},
+            'duplicate check identity': {jobs: self.jobs_page(
+                *good_jobs[:-1], dict(good_jobs[-1], id=900, check_run_url=good_jobs[0]['check_run_url']))},
+            'missing Agent tree': {self.AGENT_COMMIT: {'sha': self.REV}},
+            'wrong Agent tree': {self.AGENT_COMMIT: {'sha': self.REV, 'tree': {'sha': 'a' * 40}}},
             'no record': {self.NOTES: []},
+            'annotation page full': {self.NOTES: [self.note()] + [{'title': 'unrelated'}] * 99},
             'record not a notice': {self.NOTES: [self.note(annotation_level='warning')]},
             'two records': {self.NOTES: [self.note(), self.note()]},
             'record not json': {self.NOTES: [self.note(message='not json')]},
@@ -684,7 +882,11 @@ class PinReuseTests(unittest.TestCase):
         legs = self.result()['legs']
         result_cases = {
             'different agent commit': {'agent_commit': 'd' * 40},
+            'different agent tree': {'agent_tree': 'd' * 40},
             'other run': {'run_id': 49},
+            'other attempt': {'run_attempt': 2},
+            'not actually ran': {'ran_legs': False},
+            'scope failure': {'scope': 'failure'},
             'other switchroom repository': {'switchroom_repository': 'someone/switchroom'},
             'pull_request record': {'event': 'pull_request'},
             'failed leg': {'legs': dict(legs, native='failure')},
@@ -698,6 +900,18 @@ class PinReuseTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIsNone(self.find(result=self.result(**override))[0])
 
+    def test_full_re_run_requires_its_own_jobs_and_result(self):
+        responses = self.responses()
+        prior_jobs = responses.pop(self.JOBS)['jobs']
+        current_jobs_key = self.JOBS.replace('/attempts/1/', '/attempts/2/')
+        responses[self.RUNS] = self.run_page(self.run_entry(run_attempt=2))
+        responses[current_jobs_key] = self.jobs_page(*(dict(job, run_attempt=2) for job in prior_jobs))
+        self.assertIsNone(self.find(responses=responses)[0])
+        proof, logs = self.find(responses=responses, result=self.result(run_attempt=2))
+        self.assertEqual(proof, ('https://github.com/x/runs/50', 50, 2), logs)
+        responses[current_jobs_key] = self.jobs_page(dict(prior_jobs[0], run_attempt=2))
+        self.assertIsNone(self.find(responses=responses, result=self.result(run_attempt=2))[0])
+
     def test_merge_commit_must_change_only_pin_files_to_an_exact_revision(self):
         self.assertIsNone(self.find(tested=self.pin(self.base, extra='README.md'))[0])
         self.assertIsNone(self.find(tested=self.pin(self.base, revision='main'))[0])
@@ -705,13 +919,20 @@ class PinReuseTests(unittest.TestCase):
         self.assertIsNone(self.find(tested=self.base)[0])
         self.assertIsNone(self.find(base='', tested=self.tested)[0])
 
+    def test_non_pin_file_renamed_to_a_pin_path_is_rejected(self):
+        self.git('checkout', '-q', '--detach', self.tested)
+        (self.root / 'plugins' / 'local').mkdir()
+        self.git('mv', 'README.md', 'plugins/local/UPSTREAM.json')
+        self.assertIsNone(self.find(tested=self.commit('rename README into pin path'))[0])
+
     def test_plan_skips_runtime_runs_units_and_gate_requires_tests(self):
         selected = self.module.select(['release/agent-image-manifest.json', 'plugins/disk-cleanup/UPSTREAM.json'],
                                       event='pull_request')
         self.assertTrue(selected['runtime'])
-        plan = self.module.pin_reused_plan(selected, 'https://x/runs/50')
+        plan = self.module.pin_reused_plan(selected, ('https://x/runs/50', 50, 1))
         self.assertFalse(plan['runtime'])
         self.assertEqual(plan['tests'], selected['tests'])
+        self.assertEqual(plan['runtime_proof'], '50/1')
         self.assertIn('tests/test_disk_cleanup_plugin.py', plan['tests'])
         self.assertIn('tests/test_image_release.py', plan['tests'])
         ok = {'selection': {'result': 'success'}, 'source-tests': {'result': 'success'}, 'runtime': {'result': 'skipped'}}
@@ -736,8 +957,188 @@ class PinReuseTests(unittest.TestCase):
         other = run('pull_request', self.pin(self.base, extra='README.md'))
         self.assertNotIn('pin reuse:', other.stderr)
 
+    def test_pin_pr_proof_and_exact_squash_push_reuse_the_same_agent_attempt(self):
+        # A GitHub-style PR merge checkout and eventual squash have different commits but the same tree.
+        self.write('scripts/source-ci.py', SCRIPT.read_text())
+        self.write('tests/test_disk_cleanup_plugin.py', '')
+        self.write('tests/test_image_release.py', '')
+        self.base = self.commit('install CI in test repository')
+        head = self.pin(self.base)
+        self.git('checkout', '-q', '--detach', self.base)
+        self.git('merge', '-q', '--no-ff', '-m', 'synthetic PR merge', head)
+        tested = self.git('rev-parse', 'HEAD')
+        tree = self.git('rev-parse', 'HEAD^{tree}')
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--squash', head)
+        pushed = self.commit('squash pin onto main')
+        self.assertNotEqual(tested, pushed)
+        self.assertEqual(self.git('rev-parse', 'HEAD^{tree}'), tree)
+
+        # Only the transport is substituted. The CLI plans, gates and writes its real annotation.
+        self.write('bin/gh', '#!/usr/bin/env python3\nimport json, os, sys\n'
+                   'with open(os.environ["ACTION_RESPONSES"]) as f: responses = json.load(f)\n'
+                   'assert sys.argv[1] == "api"\n'
+                   'path = sys.argv[2]\n'
+                   'if path not in responses: sys.exit(1)\n'
+                   'print(json.dumps(responses[path]))\n')
+        (self.root / 'bin' / 'gh').chmod(0o755)
+        responses_path = self.root / 'action-responses.json'
+        event_path = self.root / 'event.json'
+        api_repo = f'https://api.github.com/repos/{self.REPO}'
+        scoped_agent_result = self.result(switchroom_commit=self.base,
+                                          switchroom_tree=self.git('rev-parse', f'{self.base}^{{tree}}'))
+        agent = self.responses(**{self.NOTES: [self.note(scoped_agent_result)]})
+        executable = self.root / 'scripts' / 'source-ci.py'
+        env = dict(os.environ, PATH=f'{self.root / "bin"}:{os.defpath}', ACTION_RESPONSES=str(responses_path),
+                   GITHUB_API_URL='https://api.github.com')
+
+        def select(event, after, checked, responses):
+            responses_path.write_text(json.dumps(responses))
+            result = subprocess.run([sys.executable, str(executable), 'select', '--event', event,
+                                     '--base', self.base, '--head', after, '--tested', checked,
+                                     '--reuse-repository', self.REPO], capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout), result.stderr
+
+        repo = {'full_name': self.REPO}
+        pr = {'number': 7, 'base': {'ref': 'main', 'sha': self.base, 'repo': repo},
+              'head': {'ref': 'release/pin-agent', 'sha': head, 'repo': repo}}
+        event_path.write_text(json.dumps({'pull_request': pr}))
+        self.git('checkout', '-q', '--detach', tested)
+        pr_plan, _ = select('pull_request', head, tested, agent)
+        self.assertEqual(pr_plan['tests'], ['tests/test_disk_cleanup_plugin.py', 'tests/test_image_release.py',
+                                            'tests/test_linear_x_scenarios.py'])
+        self.assertEqual(pr_plan['runtime_proof'], '50/1')
+        self.assertFalse(pr_plan['runtime'])
+
+        def emit(plan):
+            needs = {job: {'result': result} for job, result in (
+                ('selection', 'success'), ('source-tests', 'success'),
+                ('runtime', 'success' if plan['runtime'] else 'skipped'))}
+            gate_env = dict(env, GITHUB_EVENT_NAME='pull_request', GITHUB_EVENT_PATH=str(event_path),
+                            GITHUB_REPOSITORY=self.REPO, GITHUB_SHA=tested, GITHUB_RUN_ID='60', GITHUB_RUN_ATTEMPT='1')
+            gate = subprocess.run([sys.executable, str(executable), 'gate', '--plan', json.dumps(plan),
+                                   '--needs', json.dumps(needs), '--record-pr-proof'],
+                                  capture_output=True, text=True, env=gate_env)
+            self.assertEqual(gate.returncode, 0, gate.stderr)
+            return {'title': 'source-ci-reuse-proof', 'path': 'scripts/source-ci.py', 'annotation_level': 'notice',
+                    'message': gate.stdout.split('title=source-ci-reuse-proof::')[1].strip()}
+
+        note = emit(pr_plan)
+        local_pr_plan, _ = select('pull_request', head, tested, {})
+        self.assertTrue(local_pr_plan['runtime'])
+        local_note = emit(local_pr_plan)
+        self.git('checkout', '-q', 'main')
+
+        source_notes = f'repos/{self.REPO}/check-runs/901/annotations?per_page=100'
+        source_url = 'https://github.com/switchroom/switchroom/actions/runs/60'
+        source = {
+            f'repos/{self.REPO}/commits/{pushed}/pulls?per_page=100':
+                [dict(pr, merged_at='2026-11-22T05:30:00Z', merge_commit_sha=pushed)],
+            f'repos/{self.REPO}/git/commits/{pushed}': {'tree': {'sha': tree}},
+            f'repos/{self.REPO}/git/commits/{head}': {'tree': {'sha': tree}},
+            f'repos/{self.REPO}/git/commits/{tested}':
+                {'sha': tested, 'tree': {'sha': tree}, 'parents': [{'sha': self.base}, {'sha': head}]},
+            f'repos/{self.REPO}/compare/{self.base}...{head}': {'status': 'ahead'},
+            f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&per_page=100':
+                self.run_page(self.run_entry(id=60, head_sha=head, path='.github/workflows/ci.yml',
+                                             event='pull_request', head_branch=pr['head']['ref'],
+                                             head_repository=repo, repository=repo, pull_requests=[pr], html_url=source_url)),
+            f'repos/{self.REPO}/issues/7/events?per_page=100': [],
+            f'repos/{self.REPO}/actions/runs/60/attempts/1/jobs?per_page=100':
+                self.jobs_page(dict(id=901, name='source-checks', status='completed', conclusion='success',
+                                    run_id=60, run_attempt=1, head_sha=head, run_url=f'{api_repo}/actions/runs/60',
+                                    check_run_url=f'{api_repo}/check-runs/901')),
+            source_notes: [note],
+        }
+        push, logs = select('push', pushed, pushed, {**source, **agent})
+        self.assertEqual(push.get('reused_from'), source_url, logs)
+        self.assertFalse(push['runtime'])
+        self.assertEqual(push['tests'], [])
+
+        new_agent = dict(agent, **{self.RUNS: self.run_page(self.run_entry(run_attempt=2))})
+        old_jobs = new_agent.pop(self.JOBS)['jobs']
+        new_agent[self.JOBS.replace('/attempts/1/', '/attempts/2/')] = self.jobs_page(
+            *(dict(job, run_attempt=2) for job in old_jobs))
+        new_agent[self.NOTES] = [self.note(dict(scoped_agent_result, run_attempt=2))]
+        for reason, responses in {'Agent evidence missing': source, 'PR evidence missing': agent,
+                                  'Agent attempt replaced': {**source, **new_agent},
+                                  'PR notice changed': {**source, **agent, source_notes: []}}.items():
+            with self.subTest(reason=reason):
+                full, _ = select('push', pushed, pushed, responses)
+                self.assertTrue(full['runtime_full'])
+                self.assertTrue(all(full[lane] for lane in self.module.LANES))
+                self.assertEqual(full['tests'], pr_plan['tests'])
+                self.assertNotIn('reused_from', full)
+
+        local_push, logs = select('push', pushed, pushed, dict(source, **{source_notes: [local_note]}))
+        self.assertEqual(local_push.get('reused_from'), source_url, logs)
+        self.assertNotIn('pin reuse:', logs)
+
 
 class AggregateTests(unittest.TestCase):
+    def test_records_the_pr_event_and_the_checked_out_merge_result_only_after_a_green_gate(self):
+        module = load_selector()
+        plan = module.select(['README.md'], event='pull_request')
+        needs = {'selection': {'result': 'success'}, 'source-tests': {'result': 'success'},
+                 'runtime': {'result': 'skipped'}}
+        repository = 'switchroom/switchroom'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            origin, checkout = root / 'origin', root / 'checkout'
+            origin.mkdir()
+
+            def git(*args):
+                return subprocess.check_output(
+                    ['git', '-C', str(origin), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', *args],
+                    text=True,
+                ).strip()
+
+            git('init', '-q', '-b', 'main')
+            (origin / 'scripts').mkdir()
+            (origin / 'scripts/source-ci.py').write_bytes(SCRIPT.read_bytes())
+            git('add', '-A')
+            git('commit', '-qm', 'base')
+            base = git('rev-parse', 'HEAD')
+            git('checkout', '-qb', 'feature')
+            (origin / 'README.md').write_text('PR docs')
+            git('add', '-A')
+            git('commit', '-qm', 'PR head')
+            head = git('rev-parse', 'HEAD')
+            git('checkout', '-q', 'main')
+            git('merge', '-q', '--no-ff', '-m', 'PR test merge', 'feature')
+            tested = git('rev-parse', 'HEAD')
+            tree = git('rev-parse', 'HEAD^{tree}')
+            git('clone', '-q', '--depth=2', origin.as_uri(), str(checkout))
+            event_path = root / 'event.json'
+            event = {'pull_request': {'number': 7,
+                                      'base': {'ref': 'main', 'sha': base, 'repo': {'full_name': repository}},
+                                      'head': {'sha': head, 'repo': {'full_name': repository}}}}
+            event_path.write_text(json.dumps(event))
+            env = dict(os.environ, GITHUB_EVENT_NAME='pull_request', GITHUB_EVENT_PATH=str(event_path),
+                       GITHUB_REPOSITORY=repository, GITHUB_SHA=tested, GITHUB_RUN_ID='2', GITHUB_RUN_ATTEMPT='1')
+
+            def gate(results):
+                return subprocess.run([sys.executable, str(checkout / 'scripts/source-ci.py'), 'gate',
+                                       '--plan', json.dumps(plan), '--needs', json.dumps(results), '--record-pr-proof'],
+                                      env=env, capture_output=True, text=True)
+
+            green = gate(needs)
+            self.assertEqual(green.returncode, 0, green.stderr)
+            proof_text = green.stdout.split('title=source-ci-reuse-proof::', 1)[1]
+            self.assertEqual(json.loads(proof_text), module.source_proof(
+                plan, repository=repository, pr='7', base=base, head=head,
+                tested=tested, tree=tree, run_id='2', attempt='1',
+            ))
+            failed = gate(dict(needs, selection={'result': 'failure'}))
+            self.assertEqual(failed.returncode, 1, failed.stderr)
+            self.assertNotIn('source-ci-reuse-proof', failed.stdout)
+            event['pull_request']['base']['sha'] = 'b' * 40
+            event_path.write_text(json.dumps(event))
+            mismatched = gate(needs)
+            self.assertEqual(mismatched.returncode, 0, mismatched.stderr)
+            self.assertNotIn('source-ci-reuse-proof', mismatched.stdout)
+
     def test_truth_table_missing_failed_cancelled_skipped(self):
         self.assertTrue(SCRIPT.is_file(), 'source CI aggregate is not implemented')
         spec = importlib.util.spec_from_file_location('source_ci', SCRIPT)

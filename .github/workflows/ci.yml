@@ -27,6 +27,7 @@ jobs:
       # find the Agent repository's fleet-integration run of the pinned revision.
       pull-requests: read
       actions: read
+      checks: read
     outputs:
       reused: ${{ steps.select.outputs.reused }}
       plan: ${{ steps.select.outputs.plan }}
@@ -48,6 +49,7 @@ jobs:
         # A pin-only PR (the Agent manifest and plugin UPSTREAM.json records, nothing else) reuses
         # the Agent repository's green fleet-integration push run of the pinned revision for the
         # real-Agent legs when it ran this same switchroom tree; units still run. Any doubt runs all.
+        # To reuse that PR on push, recheck its exact Agent run and attempt alongside the PR proof.
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -68,12 +70,13 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-          fetch-depth: 1
+          # The PR proof verifies both parents of the checked-out merge result.
+          fetch-depth: 2
       - name: Enforce selected work
         env:
           PLAN: ${{ needs.selection.outputs.plan }}
           RESULTS: ${{ toJSON(needs) }}
-        run: python3 scripts/source-ci.py gate --plan "$PLAN" --needs "$RESULTS"
+        run: python3 scripts/source-ci.py gate --plan "$PLAN" --needs "$RESULTS" --record-pr-proof
 
   source-tests:
     needs: selection
@@ -189,11 +192,21 @@ jobs:
         if: steps.leg.outputs.selected == 'true'
         env:
           LANE: ${{ matrix.lane }}
+          LINEAR_QUARANTINE_RETRIES: ${{ runner.temp }}/quarantine-retries.jsonl
           SHARD: ${{ matrix.shard }}
           PROOFS: ${{ steps.leg.outputs.proofs }}
         run: |
           # shellcheck disable=SC2086 # PROOFS is a space-separated list of fixed proof names.
           scripts/run-runtime-leg.sh "$LANE" "$SHARD" "$GITHUB_WORKSPACE/agent-source" $PROOFS
+      - name: Keep retried quarantine ids
+        if: always() && steps.leg.outputs.selected == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quarantine-retries-${{ matrix.lane }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quarantine-retries.jsonl
+          if-no-files-found: ignore
+          retention-days: 30
 
   history-root:
     runs-on: ubuntu-latest

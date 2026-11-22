@@ -105,6 +105,8 @@ def run(agent_source: Path, manifest: Path, tests_dir: Path, pattern: str = "tes
 
 QUARANTINE = ROOT / "tests/ci-quarantine.json"
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")  # Read before the run isolates the environment.
+# JSON lines of retried quarantine ids; CI uploads it as an artifact so retries outlive the run's annotations.
+RETRIES_LOG = os.environ.get("LINEAR_QUARANTINE_RETRIES")
 
 
 def quarantined(path: Path = QUARANTINE) -> dict[str, str]:
@@ -118,22 +120,35 @@ def quarantined(path: Path = QUARANTINE) -> dict[str, str]:
 def retry_quarantined(result: unittest.TestResult, known: dict[str, str]) -> bool:
     """Re-run, once and visibly, failures that are all quarantined; True if all then pass.
 
-    Any non-quarantined failure, error or unexpected success fails at once. A retried test
-    emits a ::warning:: annotation and a job-summary line, never a silent pass.
+    Any non-quarantined failure, error or unexpected success fails at once. The retries log
+    records every ID in the retry batch. If all retries pass, each ID also gets a warning
+    annotation and a job-summary line.
     """
     ids = [test.id() for test, _ in (*result.failures, *result.errors)]
     if not ids or result.unexpectedSuccesses or any(test_id not in known for test_id in ids):
         return False
     rerun = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(test_id) for test_id in ids)
     retried = unittest.TextTestRunner(verbosity=2).run(rerun)
+    if RETRIES_LOG:
+        retry_log = Path(RETRIES_LOG)
+        try:
+            retry_log.parent.mkdir(parents=True, exist_ok=True)
+            with retry_log.open("a", encoding="utf-8") as stream:
+                for test_id in ids:
+                    stream.write(json.dumps({"id": test_id, "tracking": known[test_id]}) + "\n")
+        except OSError as exc:
+            print(f"::warning::Could not save quarantine retry records ({type(exc).__name__})", flush=True)
     if not retried.wasSuccessful() or retried.skipped:
         return False
     for test_id in ids:
         print(f"::warning title=Quarantined flake retried::{test_id} failed once and passed on retry ({known[test_id]})",
               flush=True)
         if SUMMARY:
-            with open(SUMMARY, "a", encoding="utf-8") as stream:
-                stream.write(f"- quarantined flake retried: `{test_id}` ({known[test_id]})\n")
+            try:
+                with open(SUMMARY, "a", encoding="utf-8") as stream:
+                    stream.write(f"- quarantined flake retried: `{test_id}` ({known[test_id]})\n")
+            except OSError as exc:
+                print(f"::warning::Could not update quarantine retry summary ({type(exc).__name__})", flush=True)
     return True
 
 
