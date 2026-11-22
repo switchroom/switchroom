@@ -268,6 +268,13 @@ class FastLaneTests(unittest.TestCase):
         for name in ('oauth.py', 'guard.py', 'plugin.yaml', 'handoff.py', 'bridge.py', 'origin.py'):
             self.assertIn('plugins/linear/' + name, module.FAST_LANE_GATED)
         self.assertEqual(self.select('plugins/linear/work.py', 'tests/fixtures/reply.md')['deferred_on_pr'], [])
+        # New, renamed-in or deleted plugin files stay gated: the class is an allowlist.
+        self.assertEqual(self.select('plugins/linear/credentials2.py', added=['plugins/linear/credentials2.py'])['deferred_on_pr'], [])
+        self.assertEqual(self.select('plugins/linear/work.py', 'plugins/linear/new_helper.py',
+                                     added=['plugins/linear/new_helper.py'])['deferred_on_pr'], [])
+        self.assertEqual(self.select('plugins/linear/no_longer_here.py')['deferred_on_pr'], [])
+        self.assertEqual(self.select('plugins/linear/work.py', added=['plugins/linear/work.py'])['deferred_on_pr'], [])
+        self.assertIn('plugins/linear/native_store.py', module.FAST_LANE_GATED)
         self.assertNotEqual(self.select('plugins/linear/work.py', 'plugins/linear/README.md')['deferred_on_pr'], [])
 
     def test_git_range_marks_added_and_renamed_tests_as_new(self):
