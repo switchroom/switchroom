@@ -21,7 +21,7 @@ from . import diag
 log = logging.getLogger(diag.LOGGER_NAME)
 SETTINGS = ("identity", "credentials", "states", "team_states", "completion_contracts", "quiet_minutes", "recheck_minutes",
             "api_url", "board", "ingress_database", "ingress_profile", "state_database", "tick_seconds", "activation_cutoff_ms",
-            "specialist_scope", "diagnostics", "chat_guard", "takeover")
+            "specialist_scope", "diagnostics", "takeover")
 IDENTITY_TTL = 600.0  # seconds a verified credential->actor/workspace binding is reused for reads
 HISTORY_CURSOR_TTL = 600.0
 def rate_limit_path(state_database: Any, home: Path) -> Path:
@@ -700,10 +700,6 @@ def register(ctx: Any) -> None:
     for event in ("on_kanban_worker_spawned", "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
                   "on_kanban_task_updated", "on_kanban_dispatch_tick"):
         ctx.register_hook(event, native_hint)
-    # Chat turns asking for Linear-tracked work start native work instead of doing it inline
-    # (settings chat_guard: false turns this off).
-    from . import guard
-    guard.register(ctx)
     # Kanban chat pings name a tracked task as its linked Linear issue (Core kanban_task_link).
     chat.register_task_link(ctx, lambda: paths()[0])
 

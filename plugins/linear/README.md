@@ -23,7 +23,7 @@ API is required. The plugin is off in the bare image; the starter overlay
 | `origin_reference` with no other fields | Obtain the current ordinary native admission reference for independent owner inspection. Grants no permission. |
 | `followup` with `issue`, `body`, UUIDv4 `id` | Save an operator instruction on existing linked native work. A paused task keeps the note without resuming; completed work refuses delivery. The result says whether the instruction was saved. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
-| `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches (for example a same-named project in another team) are refused as `ambiguous_project` with `Team / Project` choices, and the reply tells the agent not to guess but to ask the user by team name with `clarify` (there is no per-agent home team to break the tie); no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
+| `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used, else, with `team`, the still-active project this app last filed a new issue into for that team (kept in the plugin store), else the team's only active project; the reply names the project used. A team's key or name passed as `project` is read as that team. Only when no default exists is the call refused as `project_required`. The tool schema states each action's required fields up front, so the first call succeeds. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches (for example a same-named project in another team) are refused as `ambiguous_project` with `Team / Project` choices, and the reply tells the agent not to guess but to ask the user by team name with `clarify` (there is no per-agent home team to break the tie); no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
 | `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
 | `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
 | `take_over` with `issue`, UUIDv4 `id` | Take over an issue another agent is delegate for, in one step (see [Take over from another agent](#take-over-from-another-agent)). Ends with the other agent's run stopped, proven ended and this agent continuing as one task with this app as delegate, or with nothing changed and a plain reason. `work_on` refuses an issue delegated elsewhere and points here. |
@@ -95,61 +95,6 @@ delegate after the chat request while no delegate write of ours is pending. Exis
 reported, never duplicated. An unlinked task already on the board is adopted only when its
 definition of done matches the project's, and then as progress: it never closes the issue by
 itself. Delegated children return the request to their parent.
-
-#### Chat guard: tracked work is started, not done inline
-
-`guard.py` turns that rule into code. It is on by default; `chat_guard: false` (also `"false"`,
-`"off"`, `"0"`, `"no"`) in the plugin's `settings` block turns it off (read at gateway start).
-It *arms* a turn only when all of these hold:
-
-- the turn is a person's chat turn: not the `linear`, `cron`, `a2a`, `subagent` or webhook
-  platforms, not a subagent session, not a native Kanban worker, and not a machine-authored
-  prompt (`[kanban]` wakes, `[Heartbeat — recurring instruction ...]`, core system notes);
-- what the person typed asks this agent for Linear-tracked work. Only the typed text counts:
-  the reply pointer (`[Replying to ...: "..."]`, stripped up to its last `"]`), channel history
-  before core's `[New message]` marker (Slack thread context, Discord recent channel messages),
-  the sender tag, attached-document notes and inlined documents, `@`-reference footers, code
-  blocks, inline code and quoted lines are removed first. Then one rule must hold, each needing
-  an *imperative request*: a clause that starts with the verb, optionally after `please`, `now`,
-  `hey <name>`, `can you`, `I need you to` or similar. Not requests: questions (other than "can
-  you ...?"), negations ("don't do it until HF-12 merges"), other subjects ("Atlas is working on
-  HF-9", "I'll take over HF-9"), conditional sentences ("If Atlas fails, take over HF-9"),
-  messages addressed to someone else (a leading `Atlas:` or `@atlas`, unless that name is this
-  agent's profile or `ingress_profile`) and messages that retract themselves ("... Actually no,
-  wait").
-  1. `track it` / `track this` / `track the work` / `track progress` (not `track ... down`), with
-     an issue key or Linear as the destination in the message;
-  2. a work verb (research, write, build, fix, implement, investigate, finish, take over, work on,
-     continue, ...) with Linear as the tracking *destination*: `track`/`log`/`file`/`record`/`put`
-     followed by it/this/the work/progress/results `... in Linear`, `create`/`open`/`file a
-     Linear issue`, `as a Linear project`. Linear as the subject of the work ("fix the Linear
-     issue sync bug", "the Linear project picker", "fix the bug where comments don't post to
-     Linear", "linear.app/ links", "the linear plugin", "linear regression") does not count;
-  3. take over, finish, complete, work on, continue, pick up, carry on, resume, `do it` or `get
-     HF-1 done` in a sentence with an issue key (`[A-Z]{2,6}-\d+`, case-sensitive, not
-     `SHA-256`/`UTF-8`/`CVE-...`).
-
-  `don't track`, `no tracking` and `do it here` keep that turn's work in chat;
-- the turn's platform can reach the `linear` tool: core's toolset resolution for that platform
-  (`platform_toolsets`, Desktop/TUI under `cli`) includes it, its registry entry and availability
-  check pass, and the process is neither a native worker nor a delegated child. When it cannot,
-  that turn logs `chat.guard outcome=skipped reason=linear_unreachable` and runs unguarded. When
-  reachability cannot be determined the guard arms, and its block message says what to do if the
-  tool is missing.
-
-An armed turn may use `GRACE_TOOL_CALLS` (6) non-coordination tool calls within
-`GRACE_SECONDS` (60 s, counted from the first one). After that, every tool except `linear`,
-`linear_work_reference`, `kanban_*`, `a2a_*`, `message_agent`, `clarify`, `tool_search`,
-`tool_describe` and `tool_call` is blocked. Those tools never count toward the allowance, so
-the lookups that start tracked work (`linear` status, `create_issue`, `work_on`, `track`) and
-`clarify` always run. The block message names the exact `work_on` (a title prefix such as
-`QA-10` resolves) / `create_issue` + `start_work` call (the project picks its team), names `take_over` for an issue
-another agent is working on (and says never to stop another agent's task with kanban or host commands), and says that a status question or discussion is answered
-with what the agent has (or `clarify`), since inspection and discussion do not transfer
-execution. A successful `work_on`, `take_over`, `track` or `create_issue` with `start_work` releases the
-turn, as does the turn's end. Each transition logs one `chat.guard` line (`armed`, `blocked`,
-`released`, `skipped`); an exception inside the guard is logged at most hourly and the call
-proceeds.
 
 When work starts, the delegate is queued inside the issue's lock right after admission (which
 writes nothing to Linear), from the issue version read under that lock, so the status writes
@@ -634,8 +579,6 @@ later than before while the loop is idle. `takeover` lists the agents this one m
 [take over from](#take-over-from-another-agent): each entry's `command` is an argv list (no shell)
 that runs that agent's own `hermes` CLI in its own profile, never through `ssh` or `sh -c`;
 invalid entries are dropped and logged.
-`chat_guard` (default `true`) enables the
-[chat guard](#chat-guard-tracked-work-is-started-not-done-inline).
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not

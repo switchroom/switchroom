@@ -808,10 +808,27 @@ class PinReuseTests(unittest.TestCase):
         proof, logs = self.find(tested=self.pin(self.base))
         self.assertEqual(proof, ('https://github.com/x/runs/50', 50, 1), logs)
 
+    def test_earlier_pin_merged_since_the_agent_run_is_still_reused(self):
+        # The previous pin PR merged after the Agent run checked out switchroom: main moved only
+        # in the manifest and an existing UPSTREAM.json, which this pin PR rewrites.
+        self.base = self.pin(self.base, revision='d' * 40)
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--ff-only', self.base)
+        proof, logs = self.find(tested=self.pin(self.base))
+        self.assertEqual(proof, ('https://github.com/x/runs/50', 50, 1), logs)
+
+    def test_earlier_pin_plus_a_runtime_input_runs_everything(self):
+        self.git('checkout', '-q', '--detach', self.base)
+        self.write('release/agent-image-manifest.json', '{"revision": "' + 'd' * 40 + '"}')
+        self.write('plugins/linear/acceptance.py', 'moved\n')
+        base = self.commit('pin plus runtime change')
+        self.git('checkout', '-q', 'main')
+        self.assertIsNone(self.find(base=base, tested=self.pin(base))[0])
+
     def test_stale_switchroom_tree_runs_everything(self):
         for moved in ('plugins/linear/acceptance.py', 'tests/test_linear_x_scenarios.py',
                       'scripts/run-runtime-leg.sh', '.github/workflows/ci.yml', 'scripts/source-ci.py',
-                      'release/agent-image-manifest.json'):
+                      'release/linear-scenario-requirements.txt', 'plugins/new-plugin/UPSTREAM.json'):
             with self.subTest(moved=moved):
                 base = self.advance_main(moved)
                 url, logs = self.find(base=base, tested=self.pin(base))

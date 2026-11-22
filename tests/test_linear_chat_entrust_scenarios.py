@@ -999,30 +999,6 @@ class ChatEntrustScenarios(unittest.TestCase):
         status = self.ask({"action": "status", "issue": ISSUE})
         self.assertTrue(status["native"]["linked"])
 
-    def test_chat_guard_releases_on_the_real_work_on_reply_and_holds_on_a_refusal(self):
-        from hermes_fleet_linear_plugin import guard
-        chat_guard = guard.ChatGuard(reachable=lambda platform: True)
-        ids = {"session_id": "chat-session", "turn_id": "chat-session:task:0001", "task_id": "task"}
-        chat_guard.pre_llm_call(**ids, user_message="Take over OPS-1 and finish it.", platform="telegram",
-                                parent_session_id="")
-        for _ in range(guard.GRACE_TOOL_CALLS):
-            self.assertIsNone(chat_guard.pre_tool_call(tool_name="terminal", args={}, **ids))
-        self.assertIsNotNone(chat_guard.pre_tool_call(tool_name="terminal", args={}, **ids))
-        other = str(uuid.UUID(int=0x99, version=4))
-        self.authority.issues[ISSUE]["delegate"] = {"id": other}
-        self.authority.issues[ISSUE]["updatedAt"] = now_iso()
-        args = {"action": "work_on", "issue": ISSUE}
-        refused = chat.handle(self.bridge, args, self.context)  # the registered handler's actual reply
-        self.assertFalse(json.loads(refused)["ok"])
-        chat_guard.post_tool_call(tool_name="linear", args=args, result=refused, **ids)
-        self.assertIsNotNone(chat_guard.pre_tool_call(tool_name="terminal", args={}, **ids))
-        self.authority.issues[ISSUE]["delegate"] = None
-        self.authority.issues[ISSUE]["updatedAt"] = now_iso()
-        started = chat.handle(self.bridge, args, self.context)
-        self.assertTrue(json.loads(started)["ok"], started)
-        chat_guard.post_tool_call(tool_name="linear", args=args, result=started, **ids)
-        self.assertIsNone(chat_guard.pre_tool_call(tool_name="terminal", args={}, **ids))
-
     def test_work_on_reuses_an_unlinked_task_already_on_the_board(self):
         issue = self.authority.issues[ISSUE]
         existing = self.board.create(title="OPS-1: earlier chat task", created_by="chat",
