@@ -1,0 +1,49 @@
+name: Fleet Image stage prune
+
+# Deletes ghcr.io/switchroom/switchroom versions whose every tag is a PR build-cache
+# ref (fleet-pr-stage-<run>-<attempt>) once they are older than the 7-day staged-record
+# artifact window. Main publish ignores stages older than 72 hours, so nothing can still
+# consume them. Versions with any other tag, and untagged versions (published digests,
+# attestations, referrers), are never selected. See scripts/promote-fleet-image.py prune.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List what would be deleted without deleting
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleet-image-stage-prune
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    if: github.repository == 'switchroom/switchroom'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout prune helper
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Delete expired stage-only versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
+        run: |
+          set -euo pipefail
+          args=(--org switchroom --package switchroom)
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 scripts/promote-fleet-image.py prune "${args[@]}"

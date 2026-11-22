@@ -333,8 +333,14 @@ class FleetImageReleaseTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", text)
         self.assertIn("environment: fleet-image-publish", text)
         self.assertIn("platforms: linux/amd64", text)
-        self.assertIn("packages: read", text.split("\n  publish:\n", 1)[0])
-        self.assertNotIn("packages: write", text.split("\n  publish:\n", 1)[0])
+        # Before publish, only preflight_bake may write packages, and only to its run-unique
+        # fleet-pr-stage-* build-cache ref; it never gets id-token or attestation grants.
+        before_publish = text.split("\n  publish:\n", 1)[0]
+        self.assertEqual(before_publish.count("packages: write"), 1)
+        bake = text.split("\n  preflight_bake:\n", 1)[1].split("\n  preflight:\n", 1)[0]
+        self.assertIn("packages: write # fleet-pr-stage-* build cache only", bake)
+        self.assertNotIn("id-token", before_publish.split("\njobs:\n", 1)[1])
+        self.assertNotIn("attestations", before_publish.split("\njobs:\n", 1)[1])
         self.assertRegex(
             text,
             r"(?s)permissions:\n  contents: read.*?publish:.*?permissions:\n      contents: read\n      actions: read\n      packages: write\n      id-token: write\n      attestations: write",
@@ -471,7 +477,15 @@ class FleetImageReleaseTests(unittest.TestCase):
         publish = text.split("\n  publish:\n", 1)[1]
         self.assertIn("github.event_name == 'workflow_dispatch'", preflight)
         self.assertIn("push: false", preflight)
-        self.assertNotIn("packages: write", preflight)
+        # The only registry write in a bake is the staging push, limited to same-repository PRs.
+        self.assertEqual(preflight.count("docker push"), 0)
+        self.assertEqual(preflight.count("promote-fleet-image.py start-push"), 1)
+        self.assertIn(
+            "github.event_name == 'pull_request' &&\n"
+            "          github.event.pull_request.head.repo.full_name == github.repository",
+            preflight,
+        )
+        self.assertNotIn("imagetools create", preflight)
         self.assertIn("scripts/extract-pushed-image-digest.py", publish)
         self.assertIn("--prefer-index=false", publish)
         self.assertIn("imagetools inspect --format '{{.Manifest.Digest}}'", publish)

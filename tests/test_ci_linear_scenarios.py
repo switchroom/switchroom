@@ -199,6 +199,82 @@ class LinearScenarioLaneTests(unittest.TestCase):
         self.assertIn("scripts/verify-public-tree.py", policy_job)
 
 
+class QuarantineRetryTests(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.tests = self.root / "qtests"
+        self.tests.mkdir()
+        spec = importlib.util.spec_from_file_location("scenario_quarantine_runner", RUNNER)
+        self.runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.runner)
+        self.marker = self.root / "attempted"
+        import uuid
+        self.module = "test_linear_q" + uuid.uuid4().hex[:8] + "_scenarios"
+        self.addCleanup(sys.modules.pop, self.module, None)
+        (self.tests / (self.module + ".py")).write_text(
+            "import pathlib, unittest\n"
+            f"MARKER = pathlib.Path({str(self.marker)!r})\n"
+            "class Q(unittest.TestCase):\n"
+            "    def test_flaky_once(self):\n"
+            "        first = not MARKER.exists()\n"
+            "        MARKER.touch()\n"
+            "        self.assertFalse(first, 'first attempt flakes')\n"
+            "    def test_always_red(self):\n"
+            "        self.fail('real failure')\n"
+            "    def test_green(self):\n"
+            "        pass\n", encoding="utf-8")
+
+    def run_with(self, ids, pattern):
+        import contextlib, io
+        quarantine = self.root / "quarantine.json"
+        quarantine.write_text(json.dumps({"tests": [{"id": i, "tracking": "HF-test"} for i in ids]}), encoding="utf-8")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.runner.run_suite(self.tests, pattern, quarantine=quarantine)
+        return code, out.getvalue()
+
+    def test_quarantined_flake_is_retried_once_with_a_warning(self):
+        from unittest.mock import patch
+        flaky = self.module + ".Q.test_flaky_once"
+        loader = self.runner.unittest.defaultTestLoader
+        real = loader.discover
+        def discover(start_dir, pattern):
+            suite = real(start_dir=start_dir, pattern=pattern)
+            return unittest.TestSuite(t for t in self.runner.flatten(suite) if t.id() != self.module + ".Q.test_always_red")
+        with patch.object(loader, "discover", side_effect=discover):
+            code, out = self.run_with([flaky], self.module + ".py")
+            self.assertEqual(code, 0)
+            self.assertIn("::warning title=Quarantined flake retried::" + flaky, out)
+            self.marker.unlink()
+            code, out = self.run_with([], self.module + ".py")
+            self.assertEqual(code, 1)
+            self.assertNotIn("::warning", out)
+
+    def test_any_unquarantined_or_repeated_failure_stays_red(self):
+        flaky = self.module + ".Q.test_flaky_once"
+        red = self.module + ".Q.test_always_red"
+        code, out = self.run_with([flaky], self.module + ".py")
+        self.assertEqual(code, 1)
+        self.assertNotIn("::warning", out)
+        self.marker.unlink()
+        code, out = self.run_with([flaky, red], self.module + ".py")
+        self.assertEqual(code, 1)
+        self.assertNotIn("::warning", out)
+
+    def test_repository_quarantine_names_existing_tests_with_tracking(self):
+        entries = json.loads((ROOT / "tests/ci-quarantine.json").read_text(encoding="utf-8"))["tests"]
+        self.assertLessEqual(len(entries), 3, "the quarantine is a short-lived list, not a skip file")
+        for entry in entries:
+            module, cls, method = entry["id"].split(".")
+            source = (ROOT / "tests" / (module + ".py")).read_text(encoding="utf-8")
+            self.assertIn(f"class {cls}(", source)
+            self.assertIn(f"def {method}(", source)
+            self.assertTrue(entry["tracking"].strip())
+
+
 class HistoricalCoreQualificationTests(unittest.TestCase):
     def run_skip(self, revision, *, reason=None, identity=None, capability=False):
         import contextlib

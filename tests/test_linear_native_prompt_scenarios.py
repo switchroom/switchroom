@@ -78,12 +78,11 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         self.adapter.set_authorization_check(lambda user_id, *_args, **_kwargs: user_id == native.USER)
         self.messages = []
         async def admit(event):
-            # Core commits the input, then calls the committed-input hook.
+            # Core's producer ingress commits the input and returns its receipt.
             self.messages.append(event)
-            await self.adapter.on_message_admitted(event, SimpleNamespace(control=None,
-                admission_id=event.message_id, sequence=len(self.messages), status="queued"))
+            return {"admission_id": event.message_id, "seq": len(self.messages), "status": "queued"}
         self.adapter.set_message_handler(lambda event: None)
-        self.adapter.handle_message = admit
+        self.adapter._admit = admit
         self.loop = asyncio.get_running_loop()
 
     def delivery(self, identity, body, *, user=native.USER, delivery_id=None):
@@ -721,6 +720,15 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         key = self.session_key(await self.start_turn())
         waiter = asyncio.create_task(asyncio.to_thread(self.request_clarify, key))
         await self.until_posted(1)
+        # The transport sees the card before the outbox records it as sent; withdraw only after
+        # that, so retirement takes its sent-card path rather than the unknown-create readback.
+        def card_sent():
+            with self.bridge.store._tx() as db:
+                return db.execute("SELECT count(*) FROM outbox WHERE state='sent' AND "
+                                  "json_extract(payload,'$.native_prompt.kind')='clarify'").fetchone()[0] == 1
+        async with asyncio.timeout(10):
+            while not card_sent():
+                await asyncio.sleep(0.01)
         self.assertEqual(clarify.clear_session(key), 1)
         self.assertFalse((await self.answer_later(key, waiter, clarify.clear_session))[1])
         await self.until_posted(2)
@@ -1426,7 +1434,7 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
         ordinary = []
         async def receive(event):
             ordinary.append(event)
-        self.adapter.handle_message = receive
+        self.adapter._admit = receive
         await self.deliver("sibling-answer", "approve")
         self.assertIsNone(second.result)
         self.assertEqual([event.message_id for event in ordinary], ["sibling-answer"])
@@ -1505,9 +1513,9 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             result = await self.adapter.send_clarify(native.ISSUE, QUESTION, CHOICES, "new-question", key,
                 metadata={"thread_id": native.SESSION})
         self.assertTrue(result.success, result.error)
-        handle = self.adapter.handle_message
+        handle = self.adapter._admit
         self.adapter = await self.replacement_adapter()
-        self.adapter.handle_message = handle
+        self.adapter._admit = handle
         await self.route(old)
         self.assertEqual(old.acknowledged, 1)
         self.assertEqual(len(self.messages), 2)  # first delivery remains ordinary input
@@ -1581,9 +1589,9 @@ class NativePromptScenarios(unittest.IsolatedAsyncioTestCase):
             db.execute("UPDATE outbox SET payload=? WHERE id=?", (json.dumps(payload), sent.message_id))
         retry = await self.adapter.send_clarify(native.ISSUE, question, pending.choices, pending.clarify_id, key,
             metadata={"thread_id": native.SESSION})
-        handle = self.adapter.handle_message
+        handle = self.adapter._admit
         self.adapter = await self.replacement_adapter()
-        self.adapter.handle_message = handle
+        self.adapter._admit = handle
         await self.deliver("answer-activity", "Yes")
         self.assertIsNone(pending.response, "altered decision content retained consent routing")
         self.assertEqual(len(self.messages), 2)

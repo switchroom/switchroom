@@ -869,8 +869,11 @@ platform_toolsets:
   linear: [linear, kanban]
 ```
 
-This route requires Core support for durable provider input and typed structured
-Stop. Capability checks leave it unavailable on older Core; ordinary plugin reads
+This route uses only upstream Hermes ingress: each provider input is committed as its
+own admission through Core's producer ingress (`admit_producer`, the relay/webhook path),
+and its receipt anchors the input before the provider inbox is acknowledged. It sets no
+durable-input opt-in and uses no committed-input hook. Capability checks leave it unavailable on a Core without the
+shared runtime; ordinary plugin reads
 and native reporting remain separate. No injection flag, shared credentials or
 trusted-inbound authorization bypass is used. Creator-null automatic assignments
 retain their native dispatcher provenance; the recipient app is never invented as
@@ -881,9 +884,16 @@ Specialist reporting and queued content retain that exact Session/Activity pair;
 each effect verifies the current provider actor, app, issue and organization again.
 
 Provider retries preserve original actor, Activity, Agent Session, text and source
-time. Inbox acknowledgment follows committed native acceptance, including exact
-retry reconciliation. Structured Stop reaches native conversation control and the
-linked task; an accepted control receipt does not prove physical cleanup. Replies
+time. Inbox acknowledgment follows the committed admission. A redelivery of an input
+Core already committed resolves to that row, and Activities are never merged. A
+follow-up sent while a turn runs follows Core's `busy_input_mode` for producer input
+(queued as its own turn, or steered into / interrupting the running turn). Input Core
+takes without a row is acknowledged once and recorded, so a repeated webhook for that
+Activity never reaches Core again.
+A provider Stop from a sender on the platform allowlist is Core's own `/stop` for the
+chat, handed over once per Stop Activity (a late redelivery cannot stop newer work),
+then the bridge's Stop of the linked task; the bridge posts the Stop notice, so Core's
+`/stop` reply is not repeated. Neither proves physical cleanup. Replies
 remain queued until the existing scoped sender confirms publication. Linear completes an
 Agent Session on a `response`, so while tracked native work this same session started is
 unfinished, a reply goes out as a `thought` with the same text and the work's own closeout
