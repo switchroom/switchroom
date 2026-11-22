@@ -594,6 +594,7 @@ class IdleTickTests(unittest.TestCase):
     def bridge(self):
         from hermes_fleet_linear_plugin.bridge import Bridge
         bridge = Bridge.__new__(Bridge)
+        bridge.api = SimpleNamespace()  # not a LinearAPI: no request priorities
         bridge.drain_ingress = Mock()
         return bridge
 
@@ -650,6 +651,17 @@ class IdleTickTests(unittest.TestCase):
             return reply
         self.assertEqual(asyncio.run(run()), "reply")
         self.assertEqual(plugin._handled({}, "reply"), "reply")  # before the loop runs: nothing to wake
+
+    def test_a_mid_pass_drain_runs_at_normal_priority_inside_an_optional_pass(self):
+        from hermes_fleet_linear_plugin import bridge as bridge_module
+        bridge = self.bridge()
+        bridge.api = api.LinearAPI(lambda: "synthetic")
+        seen = []
+        bridge.drain_ingress = Mock(side_effect=lambda _path: seen.append(bridge.api._priority.level))
+        bridge._ingress_path, bridge._ingress_seen = self.inbox, ()
+        with patch.object(bridge_module, "INGRESS_CHECK_S", 0), bridge._priority("optional"):
+            bridge._ingress_between()
+        self.assertEqual(seen, ["normal"])
 
     def test_a_tick_that_did_nothing_reports_idle(self):
         from hermes_fleet_linear_plugin import diag

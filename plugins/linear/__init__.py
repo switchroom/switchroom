@@ -652,7 +652,7 @@ def register(ctx: Any) -> None:
                                    **origin.current(context, origin_settings(), api=getattr(running.get("bridge"), "api", None)))
             bridge = running.get("bridge")
             if bridge is not None:
-                return chat.handle(bridge, args, context)
+                return _handled(running, chat.handle(bridge, args, context))
             return transport.chat_request(Path(context.home), args, context)
         except transport.Unavailable as exc:
             return chat._reply(False, str(exc), code="context_or_service_unavailable")

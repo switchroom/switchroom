@@ -5714,7 +5714,8 @@ class Bridge:
             return
         self._ingress_seen = seen
         try:
-            self.drain_ingress(ingress)
+            with self._priority("normal"):  # as in the tick's own drain, even inside an optional recheck pass
+                self.drain_ingress(ingress)
         except (Throttled, RateLimited):
             raise
         except Exception as exc:  # noqa: BLE001 - the tick's own drain retries it; the pass goes on
