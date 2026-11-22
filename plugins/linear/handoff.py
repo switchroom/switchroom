@@ -305,8 +305,8 @@ def _hand_off_locked(state: Path, binding_profile: str, settings: dict, metadata
         adapter = _adapter(home, bound["board"], native_profile)
         if not getattr(adapter, "guarded_controls", False):
             return _refuse("controls_unsupported", owner)
-        from gateway import session_ancillary
-        if getattr(session_ancillary, "process_stop_pending", None) is None:
+        from .origin_state import stop_checkpoint_reader
+        if stop_checkpoint_reader() is None:
             return _refuse("controls_unsupported", owner)
         task = adapter.require_task(bound["task_id"])
         try:

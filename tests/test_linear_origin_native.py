@@ -1345,9 +1345,15 @@ class OriginScenarios(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_unsupported_pending_and_live_admission_are_unknown(self):
         from gateway import session_ancillary
         await self.stopped_issue()
-        with patch.object(session_ancillary, "process_stop_pending", None):
+        with patch.object(session_ancillary, "process_stop_pending", None), \
+                patch.object(session_ancillary, "stop_session_processes", None, create=True):
             result = await self.cleanup_inspected()
         self.assertEqual(result["reason"], "native_stop_checkpoint_unsupported")
+        # A core whose Stop is the native interrupt plus a best-effort kill has no Stop checkpoint at all.
+        with patch.object(session_ancillary, "process_stop_pending", None), \
+                patch.object(session_ancillary, "stop_session_processes", lambda *a, **k: None, create=True):
+            result = await self.cleanup_inspected()
+        self.assertNotIn(result.get("reason"), ("native_stop_checkpoint_unsupported", "native_stop_checkpoint_pending"))
         self.db.set_meta("fixture.pending.stop." + self.sid, "pending")
         result = await self.cleanup_inspected()
         self.assertFalse(result["quiescence_proven"])
