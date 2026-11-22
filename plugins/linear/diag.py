@@ -211,6 +211,7 @@ class _State:
         self.maxima: dict[str, int] = dict.fromkeys(TICK_MAXIMA, 0)
         self.last_summary = None
         self.last_health = None
+        self.activity = 0  # monotonic: counted outcomes plus Linear requests, never reset by summaries
 
 
 _state = _State()
@@ -556,6 +557,14 @@ def webhook(event: Any, delivery: Any, result: Any = None, *, bound: Callable[[s
 def count(name: str, n: int = 1) -> None:
     with _state.lock:
         _state.counters[name] = _state.counters.get(name, 0) + n
+        _state.activity += n
+
+
+def activity() -> int:
+    """Monotonic count of reporting work done (counted outcomes and Linear requests) in this process.
+
+    The reporting loop compares it across a tick: unchanged means the tick found nothing to do."""
+    return _state.activity
 
 
 def native_event(kind: Any, **fields: Any) -> None:
@@ -614,6 +623,8 @@ def api_sent() -> None:
     tick = getattr(_tls, "tick_api", None)
     if tick is not None:
         tick[1] += 1
+    with _state.lock:
+        _state.activity += 1
 
 
 def tick_done(started: float, gauges: Callable[[], dict[str, Any]] | None = None) -> None:

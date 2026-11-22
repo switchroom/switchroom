@@ -924,6 +924,18 @@ def acceptance_expired(url: str, classification: str) -> str:
     reason = _WAITING_REASON.get(classification, _WAITING_REASON["infra"])
     return (f"The work is finished, but its pull request's checks could not be confirmed within 7 days ({url}): "
             f"{reason}. The agent has stopped checking. Confirm the checks, then complete the work again.")
+INGRESS_CHECK_S = 0.25  # between bindings of a pass, look for a newly arrived webhook at most this often
+def file_signature(path: Path | str) -> tuple:
+    """(mtime, size) of a SQLite file and its WAL; any write by another process changes it. Missing is ()."""
+    out = []
+    for name in (str(path), str(path) + "-wal"):
+        try:
+            stat = os.stat(name)
+        except OSError:
+            out.append(None)
+        else:
+            out.append((stat.st_mtime_ns, stat.st_size))
+    return tuple(out)
 def iso_ms(raw: Any) -> float:
     try:
         return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() * 1000
@@ -3375,23 +3387,49 @@ class Bridge:
             same_store = version is not None and memo is not None and memo[:2] == (version, work)
             adapter = memo[2] if same_store else self._binding_adapter(issue_id)
             if adapter.board not in boards:
+                self.__dict__.setdefault("_watched_boards", set()).add(adapter.board)
                 boards[adapter.board] = {}  # An unreadable board skips nothing this tick.
                 boards[adapter.board] = adapter.quiescence_index()
             native = boards[adapter.board].get(row["task_id"], (None, None))
             status, newest = native
-            if status not in ("done", "archived") or type(newest) is not int or newest != row["last_event_id"]:
+            if type(newest) is not int or newest != row["last_event_id"]:
                 return False
+            inputs = (version, work, native, self._session_turn_active(issue_id))  # a turn is in-memory state
+            if status not in ("done", "archived"):
+                return self._pump_unchanged(issue_id, inputs, status)
             if not (same_store and memo[3] == native) and not self.store.quiescent_closeout(
                     issue_id, row["task_id"], archived=status == "archived"):
-                return False
+                return self._pump_unchanged(issue_id, inputs, status)
             if version is not None:
                 known[issue_id] = (version, work, adapter, native)
             return True
         except Exception:  # noqa: BLE001 - the full pump below owns every error report
             return False
+    # A parked or finished binding whose last full pump changed nothing is pumped again only when
+    # the store or its board changes, or after UNCHANGED_REPUMP_S for the time-based steps (waits
+    # rechecked on minute-scale gaps). Running work is always pumped: its live step is polled.
+    UNCHANGED_STATUSES = frozenset({"done", "blocked", "triage"})
+    UNCHANGED_REPUMP_S = 60.0
+    def _pump_unchanged(self, issue_id: str, inputs: tuple, status: Any) -> bool:
+        """True to skip: same inputs as a recent full pump of this binding that did nothing."""
+        pending = self.__dict__.setdefault("_pump_inputs", {})
+        unchanged = self.__dict__.setdefault("_unchanged", {})
+        seen = unchanged.get(issue_id)
+        if (status in self.UNCHANGED_STATUSES and inputs[0] is not None and seen is not None
+                and seen[0] == inputs and self.clock() - seen[1] < self.UNCHANGED_REPUMP_S):
+            return True
+        unchanged.pop(issue_id, None)
+        pending[issue_id] = inputs if status in self.UNCHANGED_STATUSES else None
+        return False
+    def _pumped(self, issue_id: str, idle: bool) -> None:
+        """After a full pump: remember its inputs when it did nothing, so the next tick can skip it."""
+        inputs = self.__dict__.setdefault("_pump_inputs", {}).pop(issue_id, None)
+        if idle and inputs is not None:
+            self.__dict__.setdefault("_unchanged", {})[issue_id] = (inputs, self.clock())
     def pump_kanban(self) -> None:
         boards: dict = {}  # board -> {task id: (status, newest event id)}, read once per tick
         for row in self.store.active("native"):
+            self._ingress_between()
             with self.lock(row["issue_id"]):
                 if not self._pump_authorize(row["issue_id"]):
                     continue
@@ -3401,6 +3439,7 @@ class Bridge:
                 # like decoding its task row. Keep that entire read/capture path
                 # inside this binding's boundary so later work and flush proceed.
                 issue_id, task_id, event_id, caught_up = row["issue_id"], row.get("task_id"), None, False
+                activity, failed = diag.activity(), False
                 try:
                     row, task = self._native_task(row["issue_id"])
                     adapter = self._binding_adapter(row["issue_id"])
@@ -3423,6 +3462,7 @@ class Bridge:
                 except RateLimited:
                     raise
                 except Exception as exc:  # External native data cannot abort other bindings or flush.
+                    failed = True
                     diag.warn("binding.held", "held", diag.exc_reason(exc), kind="pump", iss=issue_id, task=task_id, evt=event_id, exc=type(exc).__name__)
                 # Status first; a delegate failure must never hold the status repair.
                 for step in (self._worker_progress, self._recheck_acceptance, self._resume_pr_park, self._resume_external_wait,
@@ -3441,11 +3481,13 @@ class Bridge:
                     except RateLimited:
                         raise
                     except Exception as exc:
+                        failed = True
                         until = self.store.backoff_fail(backoff, self.clock())
                         diag.warn("binding.held", "held", diag.exc_reason(exc), kind=step.__name__.strip("_"), iss=issue_id, task=task_id,
                                   exc=type(exc).__name__, next_s=until - self.clock())
                     else:
                         self.store.backoff_clear(backoff)
+                self._pumped(issue_id, caught_up and not failed and diag.activity() == activity)
     def _worker_progress(self, row: dict | None, adapter) -> None:
         from .worker_progress import queue
         queue(self, row, adapter)
@@ -4382,6 +4424,7 @@ class Bridge:
         try:
             with self._priority("optional"):
                 for row in rows:
+                    self._ingress_between()
                     self._rechecked_at[row["issue_id"]] = now
                     self._recheck_row(row)
                 self.sweep_unbound()  # paced hourly by itself; optional, so it yields to work when budget is low
@@ -5575,6 +5618,14 @@ class Bridge:
                           (self.ingress_profile, due_at, due_at)).fetchall()
     def drain_ingress(self, database: Path, limit: int = 50, *, retry_now: bool = False) -> None:
         """Consume verified deliveries the host ingress wrote to this profile's inbox."""
+        # A delivery's handler can run a recheck pass, whose mid-pass check (_ingress_between) must
+        # not start a second drain over rows this one has read but not yet marked: that handles them twice.
+        self._draining = getattr(self, "_draining", 0) + 1
+        try:
+            self._drain_ingress(database, limit, retry_now=retry_now)
+        finally:
+            self._draining -= 1
+    def _drain_ingress(self, database: Path, limit: int, *, retry_now: bool) -> None:
         if not Path(database).exists():
             return
         now = math.inf if retry_now else self.clock()
@@ -5627,11 +5678,15 @@ class Bridge:
                             diag.evt("ingress.parked", "failed", "invalid_payload", level=logging.ERROR, evt=delivery)
                 db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
                            "AND delivery_id = ?", (status, agent, delivery))
-    def tick(self, ingress: Path | None = None) -> None:
-        started = time.monotonic()
+    def tick(self, ingress: Path | None = None) -> bool:
+        """One reporting pass. True when it did anything (an outcome or a Linear request), so the
+        service keeps its short tick; False lets it wait longer for the next change."""
+        started, before = time.monotonic(), diag.activity()
         diag.tick_begin()
+        self._ingress_path = ingress
         try:
             if ingress is not None:
+                self._ingress_seen = file_signature(ingress)
                 self.drain_ingress(ingress)
             self._recover_admissions()
             self.pump_kanban()
@@ -5639,5 +5694,38 @@ class Bridge:
         except Throttled:
             # Budget nearly spent: reads wait for the reset, but queued writes still go out.
             diag.evt("api.result", "held", "budget_deferred", kind="tick")
+        finally:
+            self._ingress_path = None
         self.flush()
         diag.tick_done(started, lambda: self.store.diag_counts(self.clock()))
+        return diag.activity() != before
+    def _ingress_between(self) -> None:
+        """Between two bindings of a long pass: take a webhook that arrived meanwhile now, not after the pass.
+
+        One stat of the inbox files per check, at most every INGRESS_CHECK_S; drain only on a change."""
+        ingress = getattr(self, "_ingress_path", None)
+        now = time.monotonic()
+        if (ingress is None or getattr(self, "_draining", 0)
+                or now - getattr(self, "_ingress_checked", -math.inf) < INGRESS_CHECK_S):
+            return
+        self._ingress_checked = now
+        seen = file_signature(ingress)
+        if seen == getattr(self, "_ingress_seen", None):
+            return
+        self._ingress_seen = seen
+        try:
+            with self._priority("normal"):  # as in the tick's own drain, even inside an optional recheck pass
+                self.drain_ingress(ingress)
+        except (Throttled, RateLimited):
+            raise
+        except Exception as exc:  # noqa: BLE001 - the tick's own drain retries it; the pass goes on
+            diag.warn("webhook.delivery", "held", diag.exc_reason(exc), kind="ingress", exc=type(exc).__name__)
+    def watch_paths(self) -> list[Path]:
+        """Native board databases of the bindings pumped so far; a write there can mean new native events."""
+        paths = []
+        for board in sorted(getattr(self, "_watched_boards", ())):
+            try:
+                paths.append(Path(self.kanban.kb.kanban_db_path(board=board)))
+            except Exception:  # noqa: BLE001 - an unreadable board is still polled by the tick itself
+                continue
+        return paths

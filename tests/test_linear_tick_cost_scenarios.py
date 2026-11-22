@@ -207,6 +207,40 @@ class FinishedBindingScenarios(unittest.TestCase):
             db.commit()
         self.assertTrue(self.pump()[0])
 
+    def test_an_unsettled_finished_binding_whose_pump_did_nothing_waits_for_a_change_or_a_minute(self):
+        # F21: a done task whose closeout is not settled (here held; live, an acceptance wait on GitHub)
+        # was pumped in full every 2 s tick. After one pump that changed nothing it is skipped until
+        # the store or its board changes, or UNCHANGED_REPUMP_S passes for the time-based steps.
+        self.pump()
+        with closing(sqlite3.connect(self.reporter.store.path)) as db:
+            db.execute("UPDATE outbox SET hold_reason='operator hold' WHERE kind='status'")
+            db.commit()
+        self.assertTrue(self.pump()[0])  # reacts to the hold
+        self.assertTrue(self.pump()[0])  # finds nothing to do, and is remembered
+        self.assertEqual(self.pump()[0], [])
+        self.clock.now += self.reporter.UNCHANGED_REPUMP_S
+        self.assertTrue(self.pump()[0])
+        self.assertEqual(self.pump()[0], [])
+        with closing(sqlite3.connect(self.reporter.store.path)) as db:
+            db.execute("UPDATE outbox SET attempts=attempts")
+            db.commit()
+        self.assertTrue(self.pump()[0])
+        self.clock.now += 1
+        with self.fixture.board.conn() as conn, patch("hermes_cli.kanban_db.time.time", return_value=self.clock()):
+            native.kb.add_comment(conn, self.task_id, "operator", "A later note on finished work")
+        self.assertTrue(self.pump()[0])
+
+    def test_a_pump_that_did_something_is_not_skipped_next_tick(self):
+        self.pump()
+        with closing(sqlite3.connect(self.reporter.store.path)) as db:
+            db.execute("UPDATE outbox SET hold_reason='operator hold' WHERE kind='status'")
+            db.commit()
+        with patch.object(self.reporter, "_settle_held_delegate",
+                          side_effect=lambda *a: bridge_module.diag.count("delegate_q")) as step:
+            step.__name__ = "_settle_held_delegate"
+            for _ in range(3):
+                self.assertTrue(self.pump()[0])
+
     def test_unreadable_board_skips_nothing(self):
         self.pump()
         with patch.object(Kanban, "quiescence_index", side_effect=sqlite3.OperationalError("locked")):

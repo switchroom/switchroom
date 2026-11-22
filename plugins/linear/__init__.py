@@ -10,10 +10,10 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from . import api as api_module, chat, ops
 from .api import ENDPOINT, LinearAPI, LinearError, RateLimited, backoff_delay
-from .bridge import Bridge, Kanban, validate_activation_cutoff_ms, validate_ingress_profile
+from .bridge import Bridge, Kanban, file_signature, validate_activation_cutoff_ms, validate_ingress_profile
 from .oauth import ReauthorizationRequired, token_provider
 from .store import Store
 from . import diag
@@ -478,6 +478,51 @@ class BoundLinearAPI(LinearAPI):
         left, right = self.issue(issue_id), self.issue(related_issue_id)
         return super().link_issue(left["id"], right["id"], relation)
 
+def _handled(running: dict, reply: Any) -> Any:
+    """A tool call may have queued Linear writes: wake the loop so an idle wait does not delay them."""
+    loop, wake = running.get("loop"), running.get("wake")
+    if loop is not None and wake is not None:
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:
+            pass
+    return reply
+
+
+IDLE_TICK_MAX_S = 15.0  # an idle service ticks at least this often; webhooks and board writes wake it at once
+WATCH_POLL_S = 0.25
+
+
+def idle_wait(tick_s: float, idle: int) -> float:
+    """The wait after a tick: tick_seconds while busy, doubling per idle tick up to IDLE_TICK_MAX_S."""
+    return max(tick_s, min(IDLE_TICK_MAX_S, tick_s * 2 ** min(idle, 8)))
+
+
+async def _wait_for_change(wake: asyncio.Event, timeout: float, watched: Callable[[], tuple | None],
+                           baseline: tuple | None, *, board_gap: float = 0.0) -> None:
+    """Sleep until ``timeout``, a native hint (``wake``) or a write to a watched file.
+
+    ``watched()`` is (webhook inbox signature, board signatures). A webhook ends the wait at once; a
+    board write (a worker's progress) only once ``board_gap`` has passed, so a busy worker never makes
+    the loop tick faster than tick_seconds."""
+    started = time.monotonic()
+    deadline = started + timeout
+    while not wake.is_set():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        try:
+            await asyncio.wait_for(wake.wait(), timeout=min(WATCH_POLL_S, left))
+            return
+        except asyncio.TimeoutError:
+            pass
+        now = None if baseline is None else watched()
+        if now is None or baseline is None:
+            continue
+        if now[0] != baseline[0] or (now[1] != baseline[1] and time.monotonic() - started >= board_gap):
+            return
+
+
 async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event, running: dict) -> None:
     from . import transport
     settings = {key: ctx.get_config(key) for key in SETTINGS if ctx.get_config(key) is not None}
@@ -532,8 +577,7 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
         waiting_since = logged_at = None
         while server is None and not stop_requested.is_set():
             try:
-                server = transport.Server(home, profile_name,
-                                          lambda args, context: chat.handle(bridge, args, context))
+                server = transport.Server(home, profile_name, lambda args, context: _handled(running, chat.handle(bridge, args, context)))
             except transport.Unavailable as exc:
                 if str(exc) != transport.OWNED:
                     raise
@@ -548,22 +592,28 @@ async def _reporting_loop(ctx: Any, home: Path, stop_requested: threading.Event,
         if server is None:
             return
         running.update(bridge=bridge, loop=asyncio.get_running_loop(), wake=asyncio.Event())
-        recovered = False
+        recovered, idle = False, 0
+        tick_s = float(settings.get("tick_seconds", 2))
+        def watched() -> tuple | None:
+            """(webhook inbox, native boards) file signatures."""
+            try:
+                return file_signature(ingress), tuple(file_signature(path) for path in bridge.watch_paths())
+            except Exception:  # noqa: BLE001 - no watch only means the timed tick
+                return None
         while not stop_requested.is_set():
             running["wake"].clear()
+            busy = True
+            baseline = watched()  # before the tick: a change during it wakes the next one at once
             try:
                 if not recovered:
                     await asyncio.to_thread(bridge.recover, ingress)
                     recovered = True
-                await asyncio.to_thread(bridge.tick, ingress)  # tick ends with its own flush
+                busy = await asyncio.to_thread(bridge.tick, ingress) is not False  # tick ends with its own flush
             except Exception as exc:  # one bad remote delivery must not stop native execution
+                baseline = None
                 diag.evt("service.tick", "failed", "tick_exception", level=logging.ERROR, exc_info=True, exc=type(exc).__name__)
-            wake_wait = asyncio.create_task(running["wake"].wait())
-            try:
-                await asyncio.wait({wake_wait}, timeout=float(settings.get("tick_seconds", 2)))
-            finally:
-                wake_wait.cancel()
-                await asyncio.gather(wake_wait, return_exceptions=True)
+            idle = 0 if busy else idle + 1
+            await _wait_for_change(running["wake"], idle_wait(tick_s, idle), watched, baseline, board_gap=tick_s)
     finally:
         running.clear()
         if server is not None:
@@ -602,7 +652,7 @@ def register(ctx: Any) -> None:
                                    **origin.current(context, origin_settings(), api=getattr(running.get("bridge"), "api", None)))
             bridge = running.get("bridge")
             if bridge is not None:
-                return chat.handle(bridge, args, context)
+                return _handled(running, chat.handle(bridge, args, context))
             return transport.chat_request(Path(context.home), args, context)
         except transport.Unavailable as exc:
             return chat._reply(False, str(exc), code="context_or_service_unavailable")
