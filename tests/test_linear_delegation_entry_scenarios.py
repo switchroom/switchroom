@@ -112,10 +112,9 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.turns = []
 
         async def model_turn(event):  # finite endpoint; real-ledger qualification is in worker_questions
-            await self.adapter._admitted(event, {"admission_id": event.message_id,
-                "seq": len(self.turns) + 1, "status": "queued"})
             self.turns.append(event)
-        self.adapter.handle_message = model_turn
+            return {"admission_id": event.message_id, "seq": len(self.turns), "status": "queued"}
+        self.adapter._admit = model_turn
         self.inbox = IngressStore(self.home / "inbox.db")
         self.route = Route("agent", "default", "/unused", self.home / "unused-secret", self.home)
 

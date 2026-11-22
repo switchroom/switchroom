@@ -69,6 +69,7 @@ class NativeRuntimeFixture(unittest.IsolatedAsyncioTestCase):
             _peek_session_state=lambda key: None, _primary_profile_name="default")
         self.allowed = {"fixture-author", "other-author"}
         runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
+        runner._session_key_for_source = lambda source: self.store._generate_session_key(source)
         runner._adapter_flag = lambda *args: False
         runner._adapter_profile_for_source = lambda source: None
         runner._is_user_authorized_for_source = lambda source, **kwargs: source.user_id in self.allowed
@@ -100,6 +101,8 @@ class NativeRuntimeFixture(unittest.IsolatedAsyncioTestCase):
         runner._busy_interrupt_and_ack = ack
         # The authority path admits through the runner's own FIFO step (upstream ``_hm_admit_to_fifo``).
         runner._hm_admit_to_fifo = MethodType(GatewayInboundMixin._hm_admit_to_fifo, runner)
+        # Producer ingress offers a delivery to the chat's live prompt first (upstream).
+        runner._hm_pending_reply_intercepts = MethodType(GatewayInboundMixin._hm_pending_reply_intercepts, runner)
 
         async def no_consume(*args):
             return False, None
