@@ -102,7 +102,7 @@ If you change the Dockerfile or anything it copies, also expect `.github/workflo
 
 - **Plugins** (`plugins/**`) are mounted source, not image content: merge, green main CI, then Plugin pin handoff opens the private pin PR. No image bake; do not touch the Dockerfile for a plugin fix.
 - **Image inputs** (`scripts/fleet-image-change-scope.py`): PR preflight bake, merge, Fleet Image publish (waits on exact-SHA main CI), Release Handoff, private Stage A PR with auto-merge, then the private pipeline and rollout.
-- **Agent pins:** `release/pin-agent-*` PRs are bot-opened and always run the full suite. Never hand-edit `release/agent-image-manifest.json`.
+- **Agent pins:** Bot-opened `release: pin Agent` PRs and always run the full suite. Never hand-edit `release/agent-image-manifest.json`.
 - No step anywhere needs a human approval; nothing here deploys.
 
 ## Pull requests
