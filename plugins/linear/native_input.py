@@ -886,12 +886,6 @@ def _approval_confirmation(choice, count, reason):
     return t(f"gateway.approve.{choice}_{number}", count=count)
 
 
-# Core refusals a redelivery would meet again (upstream relay's permanent set): the
-# provider delivery is not retried. Any other refusal leaves it pending.
-PERMANENT_REFUSALS = frozenset({"permission_denied", "invalid_params", "admission_conflict",
-                                "profile_mismatch", "not_found"})
-
-
 def native_supported():
     """Passive capability check; never bootstrap an owner or discover accounts.
 
@@ -945,6 +939,7 @@ def create_adapter(config, running):
             self._step_paused = set()
             self._observed_approvals = set()
             self._step_session_keys = {}
+            self._admission_locks = {}  # event key -> lock over consumed-check, admit and record
             self._stop_activities = {}  # recent provider Stop activities (ordered); the bridge posts their notice
 
         async def connect(self, *, is_reconnect=False):
@@ -1076,6 +1071,24 @@ def create_adapter(config, running):
             if projected.turn_in_progress:
                 # In Progress while this session's turn runs on the admitted work.
                 bridge.session_turn(projected.issue_id, True)
+            async with self._admission_lock(key):
+                await self._admit_once(bridge, key, event, delivery, projected, original)
+
+        def _admission_lock(self, key):
+            """One admission at a time per Activity: concurrent inbox rows for the same Activity
+            (distinct webhook deliveries) must see each other's consumed record and committed row."""
+            with self._relay_lock:
+                lock = self._admission_locks.get(key)
+                if lock is None:
+                    lock = self._admission_locks[key] = asyncio.Lock()
+                    while len(self._admission_locks) > 1024:
+                        oldest = next(iter(self._admission_locks))
+                        if self._admission_locks[oldest].locked():
+                            break
+                        self._admission_locks.pop(oldest)
+                return lock
+
+        async def _admit_once(self, bridge, key, event, delivery, projected, original):
             consumed_key = f"core-consumed:{projected.issue_id}:{projected.session_id}:{projected.message_id}"
             if await asyncio.to_thread(bridge.store.native_intent, consumed_key) is not None:
                 # Core already took this Activity without a row (a steer, a live prompt answer, a
@@ -1113,18 +1126,19 @@ def create_adapter(config, running):
         async def _admit(self, event):
             """Commit this input as its own row through upstream's producer ingress.
 
-            ``admit_producer`` is the relay/webhook path: every provider delivery commits its
-            own admission before the ACK, a replay of a committed delivery resolves to its row,
-            and nothing steers, merges or answers before that commit. The executor brackets the
-            turn (typing, ``on_processing_start``/``on_processing_complete``).
+            ``admit_producer`` is the relay/webhook path: a provider delivery commits its own
+            admission before the ACK (never merged with another), and a replay of a committed
+            delivery resolves to its row. Core may instead consume it without a row (its
+            busy-input mode, the chat's live prompt, a plugin consumer): ``None``. The executor
+            brackets the turn (typing, ``on_processing_start``/``on_processing_complete``).
             """
             from gateway.platforms.webhook_ingress import admit_producer
             from persistence.core.errors import AuthorityRefusal
             try:
                 receipt = await admit_producer(self, event)
             except AuthorityRefusal as exc:
-                raise LinearError(f"Core refused this Linear input ({exc.reason})",
-                                  retryable=exc.reason not in PERMANENT_REFUSALS) from exc
+                # The delivery stays pending under the inbox's ordinary retry and failure policy.
+                raise LinearError(f"Core refused this Linear input ({exc.reason})") from exc
             if receipt is None:
                 return None
             return {"admission_id": receipt.admission_id, "seq": receipt.sequence, "status": receipt.status}
@@ -1143,6 +1157,15 @@ def create_adapter(config, running):
             Both are idempotent: an unverified bridge Stop leaves the delivery pending, and
             its retry repeats them. The bridge posts the person-facing Stop notice.
             """
+            runner = getattr(self._message_handler, "__self__", None) or self.gateway_runner
+            check = getattr(runner, "_is_user_authorized_for_source", None)
+            source = event.source
+            authorized = (check(source) if callable(check) else self._is_sender_authorized(
+                source.user_id, source.chat_type, source.chat_id, thread_id=source.thread_id))
+            if authorized is not True:
+                # Core's allowlist for this platform (LINEAR_ALLOWED_USERS) gates control, as it
+                # gates every input; a provider Stop from anyone else changes nothing.
+                raise LinearError("Linear Stop sender is not authorized for native control")
             with self._relay_lock:
                 self._stop_activities[projected.message_id] = None
                 while len(self._stop_activities) > 256:

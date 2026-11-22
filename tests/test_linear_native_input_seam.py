@@ -359,6 +359,17 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertIn("expected_event_id", intent["payload"])
         self.assertIsNone(self.provider.sessions[self.SESSION]["creator"])
 
+    async def test_stop_from_a_sender_outside_the_platform_allowlist_changes_nothing(self):
+        task_id = self.fixture_task()
+        self.specialist_bridge(session_requester=True)
+        before = self.board.get(task_id).status
+        self.fixture.allowed.discard(self.USER)
+        await self.deliver_raw("unlisted-stop", self.event("unlisted-stop", "stop", signal="stop"))
+        await self.until(lambda: all(future.done() for future in self.adapter._submitted.values()))
+        self.assertEqual(self.board.get(task_id).status, before)
+        self.assertIsNone(self.bridge.store.native_intent(f"stop:{self.ISSUE}:unlisted-stop"))
+        self.assertEqual(self.inbox_row("unlisted-stop")[2], "pending")
+
     async def test_fresh_authorized_discussion_reads_and_replies_without_thawing_old_effect_fence(self):
         from gateway.session_authority import SessionAuthority
         from gateway.session_results import execution_result
@@ -631,8 +642,14 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         self.runner._is_session_running = lambda key: True
         self.runner._route_plaintext_approval_while_busy = not_an_approval
         self.runner._hm_busy_preempt = steer
-        raw = await self.deliver("steered", "Also check the logs.")
-        await self.until(lambda: self.inbox_row("steered")[2] == "imported")
+        # Two webhook deliveries of one Activity reach the same drain: admitted concurrently.
+        raw = json.dumps(self.event("steered", "Also check the logs."), separators=(",", ":")).encode()
+        with patch("linear_ingress_fixture.time.time", return_value=self.bridge.clock()):
+            self.inbox.enqueue(self.inbox_route, "steered", raw)
+            self.inbox.enqueue(self.inbox_route, "steered-concurrent", raw)
+        await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database)
+        await self.until(lambda: all(self.inbox_row(identity)[2] == "imported"
+                                     for identity in ("steered", "steered-concurrent")))
         await self.deliver_raw("steered-redelivery", json.loads(raw))
         await self.until(lambda: self.inbox_row("steered-redelivery")[2] == "imported")
         self.assertEqual(steered, ["steered"])
