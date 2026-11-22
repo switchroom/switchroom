@@ -439,7 +439,7 @@ class CoreContractScenarios(unittest.TestCase):
                 self.hooks: dict = {}
 
             def get_config(self, key, default=None):
-                return {"enabled": True, "chat_guard": True, "state_database": str(state)}.get(key, default)
+                return {"enabled": True, "state_database": str(state)}.get(key, default)
 
             def register_hook(self, name, callback):
                 self.hooks.setdefault(name, []).append(callback)

@@ -99,7 +99,7 @@ class TaskLinkRegistrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             state = Path(temp) / "state.db"
             Store(state).bind_native("issue-uuid-1", "t_tracked", "alpha", "default", at=100)
-            settings = {"enabled": True, "chat_guard": False, "state_database": str(state)}
+            settings = {"enabled": True, "state_database": str(state)}
             with core_hooks("kanban_task_completed"):
                 older = FakeContext(settings)
                 chat.register_task_link(older, lambda: state)
