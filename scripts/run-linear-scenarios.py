@@ -120,14 +120,21 @@ def quarantined(path: Path = QUARANTINE) -> dict[str, str]:
 def retry_quarantined(result: unittest.TestResult, known: dict[str, str]) -> bool:
     """Re-run, once and visibly, failures that are all quarantined; True if all then pass.
 
-    Any non-quarantined failure, error or unexpected success fails at once. A retried test
-    emits a ::warning:: annotation and a job-summary line, never a silent pass.
+    Any non-quarantined failure, error or unexpected success fails at once. The retries log
+    records every ID in the retry batch. If all retries pass, each ID also gets a warning
+    annotation and a job-summary line.
     """
     ids = [test.id() for test, _ in (*result.failures, *result.errors)]
     if not ids or result.unexpectedSuccesses or any(test_id not in known for test_id in ids):
         return False
     rerun = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromName(test_id) for test_id in ids)
     retried = unittest.TextTestRunner(verbosity=2).run(rerun)
+    if RETRIES_LOG:
+        retry_log = Path(RETRIES_LOG)
+        retry_log.parent.mkdir(parents=True, exist_ok=True)
+        with retry_log.open("a", encoding="utf-8") as stream:
+            for test_id in ids:
+                stream.write(json.dumps({"id": test_id, "tracking": known[test_id]}) + "\n")
     if not retried.wasSuccessful() or retried.skipped:
         return False
     for test_id in ids:
@@ -136,10 +143,6 @@ def retry_quarantined(result: unittest.TestResult, known: dict[str, str]) -> boo
         if SUMMARY:
             with open(SUMMARY, "a", encoding="utf-8") as stream:
                 stream.write(f"- quarantined flake retried: `{test_id}` ({known[test_id]})\n")
-        if RETRIES_LOG:
-            Path(RETRIES_LOG).parent.mkdir(parents=True, exist_ok=True)
-            with open(RETRIES_LOG, "a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"id": test_id, "tracking": known[test_id]}) + "\n")
     return True
 
 

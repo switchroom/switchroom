@@ -277,15 +277,21 @@ class QuarantineRetryTests(unittest.TestCase):
         self.assertIn("if-no-files-found: ignore", workflow)
 
     def test_any_unquarantined_or_repeated_failure_stays_red(self):
+        from unittest.mock import patch
         flaky = self.module + ".Q.test_flaky_once"
         red = self.module + ".Q.test_always_red"
-        code, out = self.run_with([flaky], self.module + ".py")
+        log = self.root / "out" / "retries.jsonl"
+        with patch.object(self.runner, "RETRIES_LOG", str(log)):
+            code, out = self.run_with([flaky], self.module + ".py")
+            self.assertEqual(code, 1)
+            self.assertNotIn("::warning", out)
+            self.assertFalse(log.exists())
+            self.marker.unlink()
+            code, out = self.run_with([flaky, red], self.module + ".py")
         self.assertEqual(code, 1)
         self.assertNotIn("::warning", out)
-        self.marker.unlink()
-        code, out = self.run_with([flaky, red], self.module + ".py")
-        self.assertEqual(code, 1)
-        self.assertNotIn("::warning", out)
+        self.assertCountEqual([json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()],
+                              [{"id": flaky, "tracking": "HF-test"}, {"id": red, "tracking": "HF-test"}])
 
     def test_repository_quarantine_names_existing_tests_with_tracking(self):
         entries = json.loads((ROOT / "tests/ci-quarantine.json").read_text(encoding="utf-8"))["tests"]
