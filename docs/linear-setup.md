@@ -175,8 +175,7 @@ state of the same type. The rest of the settings are in the
 [plugin README](../plugins/linear/README.md#configuration).
 
 The `linear` tool must reach the chat platforms you use: check that each platform's toolsets
-include `linear` (Desktop and the TUI resolve under `cli`). If a platform cannot reach it, the
-plugin logs `chat.guard outcome=skipped reason=linear_unreachable` for that turn.
+include `linear` (Desktop and the TUI resolve under `cli`).
 
 If your overlay renders profile config from `fleet-config/`, add these keys to your own
 `fleet-config/schema.yaml` allowlist first; the sample schema does not list them. *Not yet

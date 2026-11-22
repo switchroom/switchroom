@@ -48,11 +48,11 @@ ACTIONS = frozenset({
     "stop.decision", "native.event", "status.write", "delegate.write", "content.write",
     "outbox.retry", "tool.result", "binding.held", "auth.reauth_required", "scope.fenced",
     "ingress.parked", "api.result", "diag.throttled", "diag.config", "chat.entrust", "chat.record_done",
-    "session.admit", "cleanup.inspect", "chat.guard", "pr_park.resume",
+    "session.admit", "cleanup.inspect", "pr_park.resume",
 })
 OUTCOMES = frozenset({
     "received", "routed", "ignored", "deduped", "stale", "queued", "applied", "refused",
-    "skipped", "retry", "gave_up", "failed", "held", "started", "stopped", "armed", "blocked", "released", "-",
+    "skipped", "retry", "gave_up", "failed", "held", "started", "stopped", "blocked", "released", "-",
 })
 # Closed reason vocabulary. Each code maps to one code branch; see README "Diagnostics".
 REASONS = frozenset({
@@ -88,9 +88,6 @@ REASONS = frozenset({
     "mention_conversation", "delegated_awaiting_session", "session_turn", "same_session",
     "session_adopted", "owner_session_live",
     "finished_work_conversation",
-    # chat guard (guard.py): armed by which matcher rule, blocked after which allowance, released why
-    "track_request", "linear_work_request", "issue_work_request", "grace_calls", "grace_time",
-    "tracked_work_started", "turn_ended", "linear_unreachable",
     # stop
     "unbound_recorded", "not_native", "not_delegate", "stale_order", "no_current_run",
     "already_stopped", "block_failed", "unverified",
@@ -175,9 +172,7 @@ EXTRA_ORDER = tuple(key for key in FIELDS if key not in ORDER)
 _SHORT = {"iss": 8, "sess": 8, "row": 8, "evt": 12}
 REPEATABLE = frozenset({"refused", "skipped", "held", "ignored", "stale", "deduped", "retry"})
 EXEMPT = frozenset({"service.start", "service.stop", "service.health", "reconcile.summary", "diag.throttled",
-                    "diag.config",
-                    # one line per guarded chat turn, never per tool call (guard.py)
-                    "chat.guard"})
+                    "diag.config"})
 CONSEQUENTIAL = frozenset({"claimed", "spawned", "crashed", "gave_up", "timed_out", "reclaimed", "blocked",
                            "block_loop_detected", "unblocked", "completed", "archived", "review_requested"})
 SUMMARY_COUNTERS = ("events", "status_q", "delegate_q", "sent", "refused", "skipped", "retry", "failed", "held",

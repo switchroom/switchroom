@@ -38,7 +38,7 @@ except Exception as exc:
     CORE = str(exc)
 
 plugin = load_plugin()
-from hermes_fleet_linear_plugin import chat, guard, handoff
+from hermes_fleet_linear_plugin import chat, handoff
 from hermes_fleet_linear_plugin.bridge import Bridge, Kanban
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
@@ -883,20 +883,14 @@ class TakeoverScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [])
 
     # -- what the agent is told ---------------------------------------------------------------
-    def test_work_on_refusal_and_guard_point_to_take_over_and_resume_owner(self):
+    def test_work_on_refusal_points_to_take_over_and_resume_owner(self):
         reply = json.loads(chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE}, self.context))
         self.assertFalse(reply["ok"])
         self.assertIn("take_over", reply["message"])
         self.assertIn("was not touched", reply["message"])
-        message = guard.block_message("QA-3", 6, 69)
-        self.assertIn('"action": "take_over", "issue": "QA-3"', message)
-        self.assertIn('"action": "resume_owner", "issue": "QA-3"', message)
-        self.assertIn("Never stop another agent's task yourself", message)
         for action in ("take_over", "resume_owner"):
             self.assertIn(action, chat.SCHEMA["description"])
             self.assertIn(action, chat.SCHEMA["parameters"]["properties"]["action"]["enum"])
-            self.assertTrue(guard._started("linear", {"action": action, "issue": "QA-3"}, json.dumps({"ok": True})))
-            self.assertFalse(guard._started("linear", {"action": action, "issue": "QA-3"}, json.dumps({"ok": False})))
         self.assertIn("never kanban unblock", chat.SCHEMA["description"])
 
 

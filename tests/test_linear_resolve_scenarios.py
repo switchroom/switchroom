@@ -339,14 +339,6 @@ class TitleAliasTests(ResolveBase):
         self.assertEqual(reply["resolved_issue"]["from"], "QA-10")
         self.assertEqual(reply["issue"]["identifier"], "HF-622")
 
-    def test_the_guards_suggested_call_now_works(self) -> None:
-        from hermes_fleet_linear_plugin import guard
-        message = guard.block_message("QA-10", 6, 72)
-        suggested = json.loads(message.split("existing issue call ", 1)[1].split(" (a title", 1)[0])
-        with patch.object(chat, "_entrust", lambda *a: {"native": {"status": "ready", "created_from_chat": True},
-                                                        "routing": "queued"}):
-            self.assertTrue(self.call(**suggested)["ok"])
-
     def test_a_closed_single_match_is_shown_but_never_started(self) -> None:
         self.remote.set_state("issue-622", "Done")
         started = []
