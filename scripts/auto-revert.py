@@ -46,14 +46,18 @@ def push_runs(runs: Sequence[dict[str, Any]], sha: str | None = None) -> list[di
 
 
 def newest_state(runs: Sequence[dict[str, Any]]) -> str:
-    """'green', 'red', 'pending' or 'absent' for the newest push run in `runs`."""
+    """'green', 'red', 'pending', 'unknown' or 'absent' for the newest push run in `runs`.
+
+    Only `failure` is red. A cancelled or skipped run (main pushes share one concurrency group,
+    so a queued run is cancelled by the next push) proves nothing about its commit.
+    """
     ordered = push_runs(runs)
     if not ordered:
         return "absent"
     run = ordered[-1]
     if run.get("status") != "completed":
         return "pending"
-    return "green" if run.get("conclusion") == "success" else "red"
+    return {"success": "green", "failure": "red"}.get(run.get("conclusion"), "unknown")
 
 
 def is_revert(message: str) -> bool:
@@ -125,7 +129,12 @@ def push_plan(parent: str, sha: str) -> dict[str, Any] | None:
 
 
 def red_streak(repository: str, sha: str, state: Callable[[str], str]) -> list[dict[str, Any]] | None:
-    """Commits of the red streak ending at `sha`, oldest first; None if no green parent in reach."""
+    """Commits of the red streak ending at `sha`, oldest first; None if it cannot be proved.
+
+    The walk crosses only failed or absent (same push) commits back to a green parent, and the
+    culprit itself must have its own failed run. A cancelled, skipped or pending run anywhere
+    makes the culprit unknown: report, never revert.
+    """
     first_parent = git("rev-list", "--first-parent", f"--max-count={STREAK_LIMIT + 1}", sha).stdout.split()
     streak = []
     for commit, parent in zip(first_parent, first_parent[1:]):
@@ -136,6 +145,8 @@ def red_streak(repository: str, sha: str, state: Callable[[str], str]) -> list[d
         if parent_state not in ("red", "absent"):
             return None
     else:
+        return None
+    if state(streak[0]) != "red":
         return None
     reverted = git("log", "--format=%B", "origin/main").stdout
     return [{"sha": c, "message": git("log", "-1", "--format=%B", c).stdout,
@@ -154,12 +165,20 @@ def main(argv: Sequence[str] | None = None, *, out: Callable[[str], None] = prin
         raise SystemExit(f"run {args.run_id} has no commit SHA")
     newer = [r for r in push_runs(main_runs(args.repository))
              if str(r.get("created_at", "")) > str(run.get("created_at", ""))]
-    jobs = gh_json(["api", f"repos/{args.repository}/actions/runs/{args.run_id}/jobs?filter=latest&per_page=100"])["jobs"]
-    streak = red_streak(args.repository, sha, lambda c: newest_state(main_runs(args.repository, head_sha=c)))
-    culprit, parent, plan = (streak[0]["sha"], git("rev-parse", streak[0]["sha"] + "^").stdout.strip(), None) \
-        if streak else ("", "", None)
-    if culprit:
+    states = {sha: "red"}
+    def state(commit: str) -> str:
+        if commit not in states:
+            states[commit] = newest_state(main_runs(args.repository, head_sha=commit))
+        return states[commit]
+    streak = red_streak(args.repository, sha, state)
+    culprit, parent, plan, jobs = "", "", None, []
+    if streak:
+        culprit = streak[0]["sha"]
+        parent = git("rev-parse", culprit + "^").stdout.strip()
         plan = push_plan(parent, culprit)
+        # The culprit's own failed run decides test-vs-infrastructure, not the triggering run.
+        own = push_runs(main_runs(args.repository, head_sha=culprit))[-1] if culprit != sha else run
+        jobs = gh_json(["api", f"repos/{args.repository}/actions/runs/{int(own['id'])}/jobs?filter=latest&per_page=100"])["jobs"]
     action, reason = decide(run=run, newer_main_runs=newer, jobs=jobs, streak=streak, plan=plan)
     if action == "revert" and git("ls-remote", "--heads", "origin", f"auto-revert/{culprit[:12]}",
                                   check=False).stdout.strip():

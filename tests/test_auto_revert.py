@@ -81,6 +81,8 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(self.module.newest_state([run(1, conclusion="success"), run(2, created="2026-11-23T00:00:00Z")]), "red")
         self.assertEqual(self.module.newest_state([run(1, conclusion=None, status="queued")]), "pending")
         self.assertEqual(self.module.newest_state([run(1, conclusion="success")]), "green")
+        for conclusion in ("cancelled", "skipped", "timed_out", None):
+            self.assertEqual(self.module.newest_state([run(1, conclusion=conclusion)]), "unknown", conclusion)
 
 
 class RedStreakTests(unittest.TestCase):
@@ -104,8 +106,13 @@ class RedStreakTests(unittest.TestCase):
             self.assertEqual([c["sha"] for c in streak], [shas[1], shas[2]])
             self.assertEqual(streak[0]["message"].strip(), "culprit")
             self.assertFalse(streak[0]["reverted"])
-            states[shas[1]] = "pending"
+            for unproved in ("pending", "unknown"):
+                states[shas[1]] = unproved
+                self.assertIsNone(module.red_streak("x/y", shas[2], states.get), unproved)
+            # A good commit whose run was cancelled by the next push never becomes the culprit.
+            states.update({shas[1]: "absent"})
             self.assertIsNone(module.red_streak("x/y", shas[2], states.get))
+            states[shas[1]] = "red"
             states.update({shas[1]: "red", shas[0]: "red"})
             self.assertIsNone(module.red_streak("x/y", shas[2], states.get))  # no green parent in reach
             states[shas[0]] = "green"
