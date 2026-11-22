@@ -80,22 +80,38 @@ reference/                 ProductOS: vision, principles, invariants, product sp
 
 There is no `sidecars/` copy in the private overlay, and no private compose in this tree.
 
-## Tests you must run
+## What CI runs and how to reproduce it locally
 
-```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
-python3 scripts/verify-public-tree.py
-```
+Required checks: `source-checks` (aggregate of `selection`, `source-tests` and every `runtime (*)` leg), `preflight` (Fleet Image bake, only when image inputs change) and `history-root`. Branch protection is strict.
+
+- **Preview the plan:** `python3 scripts/source-ci.py select --event pull_request --files $(git diff --name-only origin/main...)`. `units_full: true` means an unmapped path (every unit module, no real-Agent legs). `full: true` means a workflow or selector edit, a runtime input (agent manifest, scenario requirements, runners, `tests/` helpers) or an unknown change set: every leg runs. `deferred_on_pr` lists legs a Linear-plugin PR leaves to main push CI (fast lane: only the allowlisted non-authority plugin files in `FAST_LANE_FILES` plus existing tests; everything else in the plugin and any new file stays gated; pass new files with `--added`; a red push is auto-reverted).
+- **Fast local gate** (what `source-tests` runs; use it instead of a whole `discover`, which takes 4 min and skips every real-Agent scenario): `plan=$(python3 scripts/source-ci.py select --event pull_request --files <paths>); python3 scripts/source-ci.py units --plan "$plan"; python3 scripts/verify-public-tree.py`.
+- **Real-Agent legs**, only for the test files you touched (CI shards the rest):
+  - Core at the pinned revision, depth 1, not a full clone: `git init agent-source && git -C agent-source fetch --depth 1 https://github.com/switchroom/hermes-agent "$(jq -r .revision release/agent-image-manifest.json)" && git -C agent-source checkout -q FETCH_HEAD`.
+  - Scenario venv: `python3.14 -m venv .venv && .venv/bin/pip install --require-hashes --only-binary=:all: -r release/linear-scenario-requirements.txt` (add `-r tests/native-input-requirements.txt` for the input seam).
+  - Kanban: `.venv/bin/python scripts/run-linear-scenarios.py --agent-source agent-source --pattern test_<file>.py`. Origin: `scripts/run-linear-origin-scenarios.py --agent-source agent-source --shard 1/3`.
+  - Input seam: `.venv/bin/python -I scripts/run-linear-input-scenarios.py --agent-source agent-source --shard 1/3` (no `--pattern`; about 4 min per shard). Its guard denies reads under your real `$HOME`, so keep `agent-source` and the venv outside it. Leave it to CI unless a seam file changed.
+  - Worker journeys need Core's own environment, not the scenario venv: `(cd agent-source && python -m pm.build_env --source . --out ../journey-env --group dev --group test --extra all --ci)`, then `journey-env/bin/python scripts/run-linear-scenarios.py --agent-source agent-source --pattern test_linear_native_work_journey.py`.
+- **Flakes:** known flaky real-Agent tests live only in `tests/ci-quarantine.json`; the runner retries those once with a `::warning::`. Anything else that fails twice is a bug: fix the test's race with a bounded wait-until on the condition, never product code to suit an old Core.
+- **Workflow shape is tested:** edit `tests/test_source_ci_scope.py`, `tests/test_ci_linear_scenarios.py`, `tests/test_release_handoff_workflow.py` and `tests/test_image_scope_and_scans.py` together with `ci.yml`, `source-ci.py`, the runners or `fleet-image-change-scope.py`.
+- **Main push CI** reuses the PR's green run when the merged tree is identical and the PR was current with main; a nightly run covers everything. Never wait on or poll a pipeline by hand.
 
 If you change the Dockerfile or anything it copies, also expect `.github/workflows/fleet-image.yml` to bake. Keep `scripts/fleet-image-change-scope.py` in sync with every `COPY` source.
 
+## How a change reaches the fleet
+
+- **Plugins** (`plugins/**`) are mounted source, not image content: merge, green main CI, then Plugin pin handoff opens the private pin PR. No image bake; do not touch the Dockerfile for a plugin fix.
+- **Image inputs** (`scripts/fleet-image-change-scope.py`): PR preflight bake, merge, Fleet Image publish (waits on exact-SHA main CI), Release Handoff, private Stage A PR with auto-merge, then the private pipeline and rollout.
+- **Agent pins:** Bot-opened `release: pin Agent` PRs and always run the full suite. Never hand-edit `release/agent-image-manifest.json`.
+- No step anywhere needs a human approval; nothing here deploys.
+
 ## Pull requests
 
-- Small, one topic. Rebase onto current `main`.
+- Small, one topic. Keep the branch current (merge or rebase `main`; pr-auto-update merges `main` into auto-merge PRs). Never force-push a shared branch.
 - Independent cold review before merge, by a fresh session that did not write the change. Reviewers are read-only.
 - Merge only when required CI is green on the exact reviewed head.
 - Before any commit, scan the diff for household names, emails, chat IDs, and profile registries. `python3 scripts/verify-public-tree.py` and `tests/test_public_product.py` catch some of it, not all.
-- Public repo merges with rebase. Do not force-push `main`.
+- PRs land by squash or rebase. Do not force-push `main`.
 - Do not add reviewers, do not merge on failed CI, do not publish from a PR.
 
 ## Image changes
