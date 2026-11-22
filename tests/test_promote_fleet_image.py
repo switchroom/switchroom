@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -188,6 +191,34 @@ class PruneTests(unittest.TestCase):
     @staticmethod
     def version(vid: int, tags: list, updated: str) -> dict:
         return {"id": vid, "updated_at": updated, "metadata": {"container": {"tags": tags}}}
+
+    def test_cli_keeps_string_rows_serialized_through_the_gh_wrapper(self) -> None:
+        old = "2000-01-01T00:00:00Z"
+        rows = [
+            self.version(1, ["fleet-pr-stage-1-1"], old),
+            "malformed\u2028row",
+            json.dumps(self.version(99, ["fleet-pr-stage-99-1"], old)),
+            self.version(2, ["fleet-pr-stage-2-1"], old),
+        ]
+        base = "orgs/switchroom/packages/container/switchroom/versions"
+        delete_paths = []
+
+        def gh(args, **_kwargs):
+            if args[:3] == ["gh", "api", "--paginate"]:
+                self.assertEqual(args, ["gh", "api", "--paginate", f"{base}?per_page=100",
+                                        "--jq", ".[] | @json"])
+                # gh prints each @json string raw, with one newline as the row separator.
+                stdout = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+                return subprocess.CompletedProcess(args, 0, stdout, "")
+            self.assertEqual(args[:4], ["gh", "api", "--method", "DELETE"])
+            delete_paths.append(args[-1])
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        argv = [str(SCRIPT), "prune", "--org", "switchroom", "--package", "switchroom"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(subprocess, "run", side_effect=gh), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(promote.main(), 0)
+        self.assertEqual(delete_paths, [f"{base}/1", f"{base}/2"])
 
     def test_only_expired_stage_only_versions_are_deleted(self) -> None:
         old, new = "2026-11-10T00:00:00Z", "2026-11-20T00:00:00Z"

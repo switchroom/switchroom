@@ -381,6 +381,8 @@ class PushReuseTests(unittest.TestCase):
     SHA, BEFORE, HEAD = 'a' * 40, 'b' * 40, 'c' * 40
     TESTED, TREE = 'd' * 40, 'e' * 40
     REPO = 'switchroom/switchroom'
+    API_REPO = f'https://api.github.com/repos/{REPO}'
+    RUNS = f'repos/{REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={HEAD}&per_page=100'
     JOBS = f'repos/{REPO}/actions/runs/2/attempts/1/jobs?per_page=100'
     NOTES = f'repos/{REPO}/check-runs/202/annotations?per_page=100'
     MERGE = f'repos/{REPO}/git/commits/{TESTED}'
@@ -399,31 +401,37 @@ class PushReuseTests(unittest.TestCase):
                 'message': json.dumps(self.proof(**override))}
 
     def responses(self, **override):
+        repo = {'full_name': self.REPO}
+        run = {'head_branch': 'feature', 'repository': repo, 'head_repository': repo,
+               'head_sha': self.HEAD, 'event': 'pull_request', 'path': '.github/workflows/ci.yml',
+               'status': 'completed', 'pull_requests': [], 'run_attempt': 1}
         r = {
             f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
                 {'number': 7, 'merged_at': '2026-11-22T00:00:00Z', 'merge_commit_sha': self.SHA,
-                 'base': {'ref': 'main'}, 'head': {'sha': self.HEAD, 'ref': 'feature'}}],
+                 'base': {'ref': 'main', 'repo': repo},
+                 'head': {'sha': self.HEAD, 'ref': 'feature', 'repo': repo}}],
             f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100': [{'number': 7}],
             f'repos/{self.REPO}/git/commits/{self.SHA}': {'tree': {'sha': self.TREE}},
             f'repos/{self.REPO}/git/commits/{self.HEAD}': {'tree': {'sha': self.TREE}},
             self.MERGE: {'sha': self.TESTED, 'tree': {'sha': self.TREE},
                          'parents': [{'sha': self.BEFORE}, {'sha': self.HEAD}]},
             f'repos/{self.REPO}/compare/{self.BEFORE}...{self.HEAD}': {'status': 'ahead'},
-            f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100': {
+            self.RUNS: {
                 'total_count': 2,
                 'workflow_runs': [
-                    {'id': 1, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-21T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
-                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'failure', 'pull_requests': [],
-                     'html_url': 'https://x/runs/1'},
-                    {'id': 2, 'head_branch': 'feature', 'head_repository': {'full_name': self.REPO}, 'created_at': '2026-11-22T00:00:00Z', 'head_sha': self.HEAD, 'event': 'pull_request',
-                     'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success', 'pull_requests': [],
-                     'run_attempt': 1, 'html_url': 'https://x/runs/2'}]},
+                    dict(run, id=1, created_at='2026-11-21T00:00:00Z', conclusion='failure',
+                         html_url='https://x/runs/1'),
+                    dict(run, id=2, created_at='2026-11-22T00:00:00Z', conclusion='success',
+                         html_url='https://x/runs/2')]},
             f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-21T12:00:00Z'},
                 {'event': 'labeled', 'created_at': '2026-11-22T00:30:00Z'}],
             self.JOBS: {
                 'total_count': 2,
-                'jobs': [{'id': 202, 'name': 'source-checks', 'status': 'completed', 'conclusion': 'success'},
+                'jobs': [{'id': 202, 'name': 'source-checks', 'status': 'completed', 'conclusion': 'success',
+                          'run_id': 2, 'run_attempt': 1, 'head_sha': self.HEAD,
+                          'run_url': f'{self.API_REPO}/actions/runs/2',
+                          'check_run_url': f'{self.API_REPO}/check-runs/202'},
                          {'name': 'runtime (input 1/3)', 'conclusion': 'success'}]},
             self.NOTES: [{'title': 'unrelated notice'}, self.notice()],
         }
@@ -449,7 +457,7 @@ class PushReuseTests(unittest.TestCase):
 
     def test_any_failed_condition_or_doubt_falls_back(self):
         base = self.responses()
-        runs_key = f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100'
+        runs_key = self.RUNS
         jobs_key = self.JOBS
         branch_prs_key = f'repos/{self.REPO}/pulls?state=all&head=switchroom:feature&per_page=100'
 
@@ -484,6 +492,8 @@ class PushReuseTests(unittest.TestCase):
             # A stacked PR's run against its parent branch, retargeted to main and merged unrun.
             'retargeted after the run': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
                 {'event': 'base_ref_changed', 'created_at': '2026-11-22T00:10:00Z'}]},
+            'retarget has no timestamp': {f'repos/{self.REPO}/issues/7/events?per_page=100': [
+                {'event': 'base_ref_changed'}]},
             'events unreadable in one page': {f'repos/{self.REPO}/issues/7/events?per_page=100':
                 [{'event': 'labeled', 'created_at': '2026-11-20T00:00:00Z'}] * 100},
             'PR merged elsewhere': {f'repos/{self.REPO}/commits/{self.SHA}/pulls?per_page=100': [
@@ -505,6 +515,39 @@ class PushReuseTests(unittest.TestCase):
         self.assertIsNone(self.find(missing)[0])
         self.assertIsNone(self.find(self.responses(), before='0' * 40)[0])
         self.assertIsNone(self.find(self.responses(), before='')[0])
+
+    def test_incomplete_newer_run_cannot_be_discarded(self):
+        base = self.responses()[self.RUNS]['workflow_runs']
+        red = dict(base[-1], id=3, created_at='2026-11-23T00:00:00Z', conclusion='failure')
+        for field in ('repository', 'head_repository', 'head_sha', 'path', 'event', 'head_branch'):
+            with self.subTest(field=field):
+                incomplete = dict(red)
+                del incomplete[field]
+                page = {'total_count': 3, 'workflow_runs': [*base, incomplete]}
+                self.assertIsNone(self.find(self.responses(**{self.RUNS: page}))[0])
+        fork = dict(red, head_repository={'full_name': 'other/fork'})
+        page = {'total_count': 3, 'workflow_runs': [*base, fork]}
+        self.assertEqual(self.find(self.responses(**{self.RUNS: page}))[0], 'https://x/runs/2')
+
+    def test_source_job_identity_must_match_the_selected_run(self):
+        fields = {
+            'id': 303,
+            'run_id': 99,
+            'run_attempt': 2,
+            'head_sha': self.BEFORE,
+            'run_url': f'{self.API_REPO}/actions/runs/99',
+            'check_run_url': 'https://api.github.com/repos/other/repo/check-runs/202',
+        }
+        for field, value in fields.items():
+            for missing in (False, True):
+                with self.subTest(field=field, missing=missing):
+                    responses = self.responses()
+                    job = responses[self.JOBS]['jobs'][0]
+                    if missing:
+                        del job[field]
+                    else:
+                        job[field] = value
+                    self.assertIsNone(self.find(responses)[0])
 
     def test_run_proof_must_cover_this_push(self):
         for proof_change in ({'base': '0' * 40}, {'head': self.BEFORE}, {'tree': self.HEAD}, {'pr': '8'},
@@ -542,8 +585,7 @@ class PushReuseTests(unittest.TestCase):
             with self.subTest(count=len(notes)):
                 self.assertIsNone(self.find(self.responses(**{self.NOTES: notes}))[0])
         responses = self.responses()
-        runs_key = f'repos/{self.REPO}/actions/workflows/ci.yml/runs?event=pull_request&head_sha={self.HEAD}&per_page=100'
-        responses[runs_key]['workflow_runs'][-1]['run_attempt'] = 2
+        responses[self.RUNS]['workflow_runs'][-1]['run_attempt'] = 2
         self.assertIsNone(self.find(responses)[0])  # Attempt 1's success is insufficient.
 
     def test_missing_push_diff_keeps_full_plan_without_reuse(self):
@@ -556,21 +598,29 @@ class PushReuseTests(unittest.TestCase):
         self.assertNotIn('reused_from', plan)
         self.assertNotIn('reuse:', result.stderr)
 
-    def test_selector_reuses_the_covered_push_plan(self):
+    def test_selector_reuses_only_the_covered_push_plan_and_attempt(self):
         import contextlib
         import functools
         import io
         from unittest import mock
 
-        lookup = functools.partial(self.module.find_reuse, api=self.responses().__getitem__)
         argv = [str(SCRIPT), 'select', '--event', 'push', '--base', self.BEFORE, '--head', self.SHA,
                 '--reuse-repository', self.REPO]
-        out = io.StringIO()
-        with mock.patch.object(sys, 'argv', argv), \
-                mock.patch.object(self.module, 'changed_paths', return_value=['tests/test_perplexity_provider.py']), \
-                mock.patch.object(self.module, 'find_reuse', side_effect=lookup), contextlib.redirect_stdout(out):
-            self.assertEqual(self.module.main(), 0)
-        self.assertEqual(json.loads(out.getvalue())['reused_from'], 'https://x/runs/2')
+        for job_attempt in (1, 2):
+            with self.subTest(job_attempt=job_attempt):
+                responses = self.responses()
+                responses[self.JOBS]['jobs'][0]['run_attempt'] = job_attempt
+                lookup = functools.partial(self.module.find_reuse, api=responses.__getitem__)
+                out = io.StringIO()
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(self.module, 'changed_paths', return_value=['tests/test_perplexity_provider.py']), \
+                        mock.patch.object(self.module, 'find_reuse', side_effect=lookup), contextlib.redirect_stdout(out):
+                    self.assertEqual(self.module.main(), 0)
+                plan = json.loads(out.getvalue())
+                if job_attempt == 1:
+                    self.assertEqual(plan['reused_from'], 'https://x/runs/2')
+                else:
+                    self.assertEqual(plan, self.plan)
 
     def test_unexpected_exception_in_lookup_falls_back(self):
         module = load_selector()

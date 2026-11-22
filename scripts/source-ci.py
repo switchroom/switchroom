@@ -234,6 +234,7 @@ PROOF_TITLE = 'source-ci-reuse-proof'
 PROOF_PATH = 'scripts/source-ci.py'
 SHA_RE = r'[0-9a-f]{40}'
 POSITIVE_ID = r'[1-9][0-9]*'
+GITHUB_TIMESTAMP = '%Y-%m-%dT%H:%M:%SZ'
 
 
 def source_proof(plan, *, repository, pr, base, head, tested, tree, run_id, attempt):
@@ -281,7 +282,8 @@ def gh_api(path):
 
 def complete_action_page(response, field):
     items = response[field]
-    if not isinstance(items, list) or len(items) >= 100 or response['total_count'] != len(items):
+    count = response['total_count']
+    if not isinstance(items, list) or len(items) >= 100 or type(count) is not int or count != len(items):
         raise ValueError(f'incomplete GitHub Actions {field} page')
     return items
 
@@ -302,13 +304,15 @@ def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m,
             log(f'reuse: cannot read every PR of {sha} in one page')
             return None
         merged = [pr for pr in candidates
-                  if pr.get('merged_at') and pr.get('merge_commit_sha') == sha
-                  and (pr.get('base') or {}).get('ref') == 'main']
+                  if pr['merged_at'] and pr['merge_commit_sha'] == sha and pr['base']['ref'] == 'main']
         if len(merged) != 1:
             log(f'reuse: {len(merged)} merged PRs for {sha}')
             return None
         pr = merged[0]
-        head = (pr.get('head') or {}).get('sha') or ''
+        if any(pr[side]['repo']['full_name'] != repository for side in ('base', 'head')):
+            log(f'reuse: PR #{pr["number"]} does not have both branches in {repository}')
+            return None
+        head = pr['head']['sha']
         if not re.fullmatch(SHA_RE, head):
             return None
         trees = [api(f'repos/{repository}/git/commits/{c}')['tree']['sha'] for c in (sha, head)]
@@ -324,14 +328,23 @@ def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m,
             return None
         run_page = api(f'repos/{repository}/actions/workflows/ci.yml/runs'
                        f'?event=pull_request&head_sha={head}&per_page=100')
-        runs = [r for r in complete_action_page(run_page, 'workflow_runs')
-                if r.get('head_sha') == head and r.get('path') == WORKFLOW_PATH
-                and r.get('event') == 'pull_request' and branch and r.get('head_branch') == branch
-                and (r.get('head_repository') or {}).get('full_name') == repository]
+        runs = []
+        # A run with missing identity may be newer than the one we would otherwise reuse.
+        for candidate in complete_action_page(run_page, 'workflow_runs'):
+            head_repository = candidate['head_repository']['full_name']
+            if (candidate['repository']['full_name'] != repository
+                    or not re.fullmatch(SHA_RE, candidate['head_sha'])
+                    or not all(isinstance(value, str) and value for value in
+                               (head_repository, candidate['path'], candidate['event'], candidate['head_branch']))):
+                raise ValueError('incomplete GitHub Actions workflow run identity')
+            if (candidate['head_sha'] == head and candidate['path'] == WORKFLOW_PATH
+                    and candidate['event'] == 'pull_request' and candidate['head_branch'] == branch
+                    and head_repository == repository):
+                runs.append(candidate)
         if not runs:
             log(f'reuse: no PR CI run for {head}')
             return None
-        run = max(runs, key=lambda r: (datetime.strptime(r['created_at'], '%Y-%m-%dT%H:%M:%SZ'), int(r['id'])))
+        run = max(runs, key=lambda r: (datetime.strptime(r['created_at'], GITHUB_TIMESTAMP), int(r['id'])))
         if run.get('status') != 'completed' or run.get('conclusion') != 'success':
             log(f'reuse: newest PR CI run {run.get("html_url")} is {run.get("status")}/{run.get("conclusion")}')
             return None
@@ -359,24 +372,32 @@ def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m,
         if not isinstance(events, list) or len(events) >= 100:
             log(f'reuse: cannot read every event of PR #{pr["number"]}')
             return None
-        retargets = [str(e.get('created_at', '')) for e in events if e.get('event') == 'base_ref_changed']
-        if any(when >= str(run.get('created_at', '')) for when in retargets):
+        started_at = datetime.strptime(run['created_at'], GITHUB_TIMESTAMP)
+        if any(datetime.strptime(e['created_at'], GITHUB_TIMESTAMP) >= started_at
+               for e in events if e['event'] == 'base_ref_changed'):
             log(f'reuse: PR #{pr["number"]} was retargeted after {run.get("html_url")} started')
             return None
-        run_id, attempt = str(run['id']), str(run['run_attempt'])
-        if not all(re.fullmatch(POSITIVE_ID, value) for value in (run_id, attempt)):
+        run_id, attempt = run['id'], run['run_attempt']
+        if not all(type(value) is int and value > 0 for value in (run_id, attempt)):
             log('reuse: missing a valid run or attempt ID')
             return None
         job_page = api(f'repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')
         jobs = complete_action_page(job_page, 'jobs')
-        aggregate = [j for j in jobs if j.get('name') == 'source-checks']
+        aggregate = [j for j in jobs if j['name'] == 'source-checks']
         if (len(aggregate) != 1 or aggregate[0].get('status') != 'completed'
                 or aggregate[0].get('conclusion') != 'success'):
             log(f'reuse: source-checks of {run.get("html_url")} is not a single success')
             return None
-        check_id = str(aggregate[0]['id'])
-        if not re.fullmatch(POSITIVE_ID, check_id):
-            log('reuse: missing a valid source-checks check run ID')
+        job = aggregate[0]
+        check_id = job['id']
+        api_repo = f'{os.environ.get("GITHUB_API_URL", "https://api.github.com")}/repos/{repository}'
+        if (type(check_id) is not int or check_id <= 0
+                or type(job['run_id']) is not int or job['run_id'] != run_id
+                or type(job['run_attempt']) is not int or job['run_attempt'] != attempt
+                or job['head_sha'] != head
+                or job['run_url'] != f'{api_repo}/actions/runs/{run_id}'
+                or job['check_run_url'] != f'{api_repo}/check-runs/{check_id}'):
+            log('reuse: source-checks job does not match the PR run and attempt')
             return None
         annotations = api(f'repos/{repository}/check-runs/{check_id}/annotations?per_page=100')
         if not isinstance(annotations, list) or len(annotations) >= 100:
@@ -393,7 +414,7 @@ def find_reuse(repository, sha, before, plan, api=gh_api, log=lambda m: print(m,
         proof = json.loads(message)
         tested = proof['tested']
         expected = source_proof(plan, repository=repository, pr=str(pr['number']), base=before, head=head,
-                                tested=tested, tree=trees[0], run_id=run_id, attempt=attempt)
+                                tested=tested, tree=trees[0], run_id=str(run_id), attempt=str(attempt))
         if not re.fullmatch(SHA_RE, tested) or proof != expected:
             log(f'reuse: source proof does not cover this push in {run.get("html_url")}')
             return None

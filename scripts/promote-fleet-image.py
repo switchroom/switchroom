@@ -375,7 +375,7 @@ def stage_only(version: dict[str, Any]) -> bool:
                                                           for tag in tags)
 
 
-def prunable(versions: list[dict[str, Any]], now: dt.datetime) -> list[dict[str, Any]]:
+def prunable(versions: list[Any], now: dt.datetime) -> list[dict[str, Any]]:
     targets = []
     for version in versions:
         if not isinstance(version, dict) or not stage_only(version):
@@ -395,14 +395,15 @@ def prunable(versions: list[dict[str, Any]], now: dt.datetime) -> list[dict[str,
     return targets
 
 
-def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[dict[str, Any]]] | None = None,
+def prune(args: argparse.Namespace, *, api_lines: Callable[[str], list[Any]] | None = None,
           delete: Callable[[str], None] | None = None, now: dt.datetime | None = None) -> int:
     now = now or dt.datetime.now(dt.timezone.utc)
     base = f"orgs/{args.org}/packages/container/{args.package}/versions"
     if api_lines is None:
-        def api_lines(path: str) -> list[dict[str, Any]]:
-            out = run(["gh", "api", "--paginate", path, "--jq", ".[]"], timeout=300)
-            return [json.loads(line) for line in out.splitlines() if line.strip()]
+        def api_lines(path: str) -> list[Any]:
+            # gh prints jq strings raw. Encode every row as JSON to preserve its type.
+            out = run(["gh", "api", "--paginate", path, "--jq", ".[] | @json"], timeout=300)
+            return [json.loads(line) for line in out.split("\n") if line.strip()]
     if delete is None:
         def delete(path: str) -> None:
             run(["gh", "api", "--method", "DELETE", path])
