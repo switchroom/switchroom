@@ -128,7 +128,6 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.assertEqual((before.status, before.current_run_id, before.claim_lock),
                          (after.status, after.current_run_id, after.claim_lock))
         self.assertEqual(self.store.get(ISSUE)["origin"], "native")
-        self.assertIsNone(self.store.get(ISSUE)["ownership_id"])
         self.assertFalse(hasattr(self.bridge, "inject"))
 
     def test_assignment_lost_create_response_reconciles_without_second_create(self):
@@ -919,7 +918,7 @@ class NativeBridgeScenarios(unittest.TestCase):
                 self.land_reported_task(clock, task_id, "archived")
                 self.assertTrue(reporter.store.finish(ISSUE, [("status", {"issue_id": ISSUE, "task_id": task_id,
                     "state": "blocked", "release": True, "terminal": True, "owner_issue_id": ISSUE,
-                    "source_ms": clock() * 1000})], at=clock(), release=True))
+                    "source_ms": clock() * 1000})], at=clock()))
                 if human_clear:
                     clock.now += 1
                     remote.set_delegate(ISSUE, None)

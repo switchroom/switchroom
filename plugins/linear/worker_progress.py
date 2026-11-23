@@ -85,7 +85,7 @@ def current(adapter, task):
 
 
 def queue(bridge, row, adapter):
-    if not row or not row.get("owner_ref") or row.get("stop_requested_at"):
+    if not row or not row.get("owner_ref"):
         return
     if not bridge.store.backoff_ready(f"_reconcile_status:{row['issue_id']}", bridge.clock()):
         return  # Optional status shares the reporting binding's persisted refusal pause.
@@ -125,7 +125,7 @@ def current_payload(bridge, payload):
         return False
     row = bridge.store.get(payload["issue_id"])
     if (not row or row.get("origin") != "native" or row.get("owner_ref") != payload.get("session_id")
-            or row.get("task_id") != payload.get("task_id") or row.get("stop_requested_at")):
+            or row.get("task_id") != payload.get("task_id")):
         return False
     adapter = bridge._binding_adapter(row["issue_id"])
     task = bridge._native_effect_task(row["issue_id"])

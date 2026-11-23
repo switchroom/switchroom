@@ -2870,7 +2870,7 @@ class Bridge:
         require_task_issue_scope(task, issue if issue is not None else {"id": issue_id})
         return task
 
-    def _capture_native_event(self, issue_id, event_id, writes, *, at, forget=False):
+    def _capture_native_event(self, issue_id, event_id, writes, *, at):
         try:
             task = self._native_effect_task(issue_id)
             writes = [(kind, {**payload, "native_history": True, "native_history_event_id": event_id, "write_started": False})
@@ -2887,7 +2887,7 @@ class Bridge:
         except LinearError as exc:
             diag.warn("binding.held", "held", diag.exc_reason(exc), kind="capture", iss=issue_id, evt=event_id, exc=type(exc).__name__)
             return False
-        return self.store.capture_event(issue_id, event_id, writes, at=at, forget=forget)
+        return self.store.capture_event(issue_id, event_id, writes, at=at)
 
     def _require_outbox_native_scope(self, row, issue_ids=None):
         payload = row["payload"]
@@ -2947,7 +2947,7 @@ class Bridge:
         row = self.store.get(issue_id)
         local = {"profile": getattr(self.kanban, "executor_profile", None),
                  "board": getattr(self.kanban, "board", None) or "default"}
-        retained = {key: row.get(key) for key in ("origin", "task_id", "last_event_id", "stop_requested_at", "release_pending")} if row else {}
+        retained = {key: row.get(key) for key in ("origin", "task_id", "last_event_id")} if row else {}
         try:
             row, task = self._native_task(issue_id)
         except LinearError as exc:
@@ -3799,7 +3799,7 @@ class Bridge:
         writes = [(kind, report) for kind, report in writes if not (report.get("native_progress_states") and
                   self._obsolete_native_progress({"kind": kind, "payload": {**report, "write_started": False}, "attempts": 0}))]
         writes = self._report_writes(row, writes)
-        self._capture_native_event(issue_id, event.id, writes, at=self.clock(), forget=False)
+        self._capture_native_event(issue_id, event.id, writes, at=self.clock())
     @staticmethod
     def _report_writes(row: dict, writes: list) -> list:
         owner = row.get("owner_ref") or ""
@@ -4658,9 +4658,7 @@ class Bridge:
                 self._delegate_preflight(payload)
             elif (payload.get("content_action") or row and row.get("kind") == "description") and not payload.get("unlinked_content"):
                 work = self.store.get(payload.get("issue_id", ""))
-                if (not work or work.get("ownership_id") != payload.get("work_owner") or
-                        work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
-                        work.get("stop_requested_at")):
+                if not work or work.get("owner_ref") != payload.get("session_key"):
                     raise ProjectUpdateDeferred
                 current = self._effect_issue(payload["issue_id"])
                 if ((current.get("delegate") or {}).get("id") != self.api.viewer_id() or
@@ -5281,12 +5279,6 @@ class Bridge:
         elif kind == "comment":
             if payload.get("native_plan_section"):
                 return self._send_plan_section(row)
-            if payload.get("content_action") and payload.get("work_owner") and not payload.get("unlinked_content"):
-                work = self.store.get(payload["issue_id"])
-                if (not work or work.get("ownership_id") != payload.get("work_owner") or
-                        work.get("owner_ref") != payload.get("session_key") or work.get("release_pending") or
-                        work.get("stop_requested_at")):
-                    return diag.because("content_owner_changed")
             closing = bool(payload.get("native_outcome_comment") or payload.get("assessment"))
             verify = getattr(self.api, "verify_completion_comment" if closing else "verify_comment", None)
             if closing and payload.get("write_started") is True and callable(verify) and verify(row["id"], payload["issue_id"], payload["body"]):
@@ -5339,8 +5331,7 @@ class Bridge:
             waiting_lines: set[str] = set()
             for ident, line in sorted(payload["lines"].items()):
                 issue_id = payload.get("line_issues", {}).get(ident) or ident
-                if (self.store.predecessor_transfer_blocks(issue_id, payload) or
-                        self.store.issue_reconciliation_blocked(issue_id)):
+                if self.store.issue_reconciliation_blocked(issue_id):
                     waiting_lines.add(ident)
                     continue
                 try:

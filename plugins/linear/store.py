@@ -1,4 +1,4 @@
-"""Issue/task bindings, preserved legacy records and the durable Linear outbox.
+"""Issue/task bindings and the durable Linear outbox.
 
 The database records reporting and uncertain delivery. It never grants execution.
 """
@@ -27,32 +27,17 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS work (
   issue_id TEXT PRIMARY KEY, origin TEXT NOT NULL, owner_ref TEXT NOT NULL,
   task_id TEXT, project_id TEXT, last_updated_at REAL NOT NULL DEFAULT 0,
-  linear_session_id TEXT, panel_note TEXT, stop_requested_at REAL NOT NULL DEFAULT 0,
-  last_event_id INTEGER NOT NULL DEFAULT 0, resume_fence_at REAL NOT NULL DEFAULT 0,
-  run_generation INTEGER, ownership_id TEXT, pending_resume TEXT, release_pending INTEGER NOT NULL DEFAULT 0);
+  linear_session_id TEXT, last_event_id INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
   hold_reason TEXT);
-CREATE TABLE IF NOT EXISTS chat_stop (
-  id TEXT PRIMARY KEY, profile TEXT NOT NULL, issue_id TEXT NOT NULL,
-  linear_session_id TEXT NOT NULL, source_activity_id TEXT NOT NULL,
-  session_key TEXT NOT NULL, run_generation INTEGER,
-  status TEXT NOT NULL DEFAULT 'requested', worker_completion TEXT NOT NULL DEFAULT 'unknown',
-  completion_activity_id TEXT, uncertainty_activity_id TEXT,
-  UNIQUE(profile, issue_id, linear_session_id, source_activity_id));
-CREATE TABLE IF NOT EXISTS retirement (
-  task_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, snapshot TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS specialist_scope_fence (
   issue_id TEXT PRIMARY KEY, reason TEXT NOT NULL, fenced_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS chat_admissions (
-  request_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL UNIQUE, profile TEXT NOT NULL,
-  home TEXT NOT NULL, parent_session_key TEXT NOT NULL, parent_session_id TEXT NOT NULL,
-  run_generation INTEGER NOT NULL, ownership_id TEXT NOT NULL, task_id TEXT,
-  state TEXT NOT NULL CHECK(state IN ('prepared','claiming','admitted','rejected','ambiguous')),
-  reason_code TEXT, route TEXT);
 """
+# Tables of the retired chat-claim protocol. Opening a store drops each one only while it is empty.
+RETIRED_TABLES = ("retirement", "chat_admissions", "chat_stop")
 # The legacy hold scan is a pure function of outbox rows, work identity and native bindings.
 # SQLite triggers count every change to those inputs, in every writing process, so the scan
 # reruns only after one. Bump HOLD_RULES_VERSION whenever the hold rules change.
@@ -175,21 +160,34 @@ class Store:
             except sqlite3.Error:
                 pass  # Lookups stay correct, only slower, if a retained payload cannot be indexed.
             columns = {row[1] for row in db.execute("PRAGMA table_info(work)")}
-            for name in ("linear_session_id", "panel_note", "pending_resume"):
-                if name not in columns:
-                    db.execute(f"ALTER TABLE work ADD COLUMN {name} TEXT")
-            if "stop_requested_at" not in columns:
-                db.execute("ALTER TABLE work ADD COLUMN stop_requested_at REAL NOT NULL DEFAULT 0")
+            if "linear_session_id" not in columns:
+                db.execute("ALTER TABLE work ADD COLUMN linear_session_id TEXT")
             if "last_event_id" not in columns:
                 db.execute("ALTER TABLE work ADD COLUMN last_event_id INTEGER NOT NULL DEFAULT 0")
-            if "resume_fence_at" not in columns:
-                db.execute("ALTER TABLE work ADD COLUMN resume_fence_at REAL NOT NULL DEFAULT 0")
-            if "run_generation" not in columns:
-                db.execute("ALTER TABLE work ADD COLUMN run_generation INTEGER")
-            if "release_pending" not in columns:
-                db.execute("ALTER TABLE work ADD COLUMN release_pending INTEGER NOT NULL DEFAULT 0")
-            if "ownership_id" not in columns:
-                db.execute("ALTER TABLE work ADD COLUMN ownership_id TEXT")
+            db.commit()
+            self._drop_retired_tables(db)
+    @staticmethod
+    def _drop_retired_tables(db: sqlite3.Connection) -> None:
+        """Drop each retired table that exists and is empty; tables with rows are kept and named on each open."""
+        kept = []
+        for table in RETIRED_TABLES:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                continue
+            db.execute("BEGIN IMMEDIATE")  # existence, emptiness and the drop commit together
+            try:
+                # Another process opening the same store may have dropped it before this lock.
+                if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    pass
+                elif db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    kept.append(table)
+                else:
+                    db.execute(f"DROP TABLE {table}")
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+        if kept:
+            diag.warn("service.start", "held", "retired_table_kept", fields=",".join(kept))
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
         active = getattr(self._local, "db", None)
@@ -629,27 +627,7 @@ class Store:
     @classmethod
     def _effect_admitted(cls, db: sqlite3.Connection, *issue_ids: str, except_id: str = "") -> bool:
         return cls._admitted(db, *issue_ids) and all(
-            not cls._unresolved_terminal(db, ident, except_id=except_id)
-            and not cls._pending_chat_transfer(db, ident) for ident in issue_ids)
-    @staticmethod
-    def _pending_chat_transfer(db: sqlite3.Connection, issue_id: str) -> dict | None:
-        for row in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
-            transfer = json.loads(row[0])
-            if transfer["issue_id"] == issue_id and transfer["state"] in ("prepared", "committed"):
-                return transfer
-        return None
-    @staticmethod
-    def _predecessor_transfer_blocks(db: sqlite3.Connection, issue_id: str, payload: dict) -> bool:
-        for row in db.execute("SELECT value FROM metadata WHERE key LIKE 'chat-transfer:%'"):
-            saved = json.loads(row[0])
-            if saved["issue_id"] == issue_id and (
-                    payload.get("work_owner") == saved["predecessor"]["ownership_id"] or
-                    payload.get("session_key") == saved["predecessor"]["owner_ref"]):
-                return True
-        return False
-    def predecessor_transfer_blocks(self, issue_id: str, payload: dict) -> bool:
-        with self._tx() as db:
-            return self._predecessor_transfer_blocks(db, issue_id, payload)
+            not cls._unresolved_terminal(db, ident, except_id=except_id) for ident in issue_ids)
     def issue_reconciliation_blocked(self, issue_id: str, *, except_id: str = "") -> list[dict[str, str]]:
         """Falsy when the issue is free; otherwise the held writes, so a refusal can name them."""
         with self._tx() as db:
@@ -700,10 +678,6 @@ class Store:
                     return False
             else:
                 if not self._effect_admitted(db, *targets, except_id=row_id):
-                    return False
-                if any(self._predecessor_transfer_blocks(db, target, payload) for target in targets):
-                    return False
-                if payload.get("work_owner") and self.superseded({"id": row_id, "payload": payload}):
                     return False
             native_progress = (row["kind"] in ("comment", "activity") and
                                (payload.get("native_progress") is True or payload.get("native_history") is True)
@@ -813,7 +787,7 @@ class Store:
         with self._tx() as db:
             yield self._admitted(db, issue_id)
     def activation_cutoff_ms(self, configured: int | None = None) -> int | None:
-        """Persist the first fresh-work cutoff; never replace legacy or differently-cut state."""
+        """Persist the first fresh-work cutoff; never replace existing or differently-cut state."""
         with self._tx() as db:
             row = db.execute("SELECT value FROM metadata WHERE key='activation_cutoff_ms'").fetchone()
             if row:
@@ -823,7 +797,7 @@ class Store:
                 return stored
             if configured is None:
                 return None
-            for table in ("work", "outbox", "chat_stop"):
+            for table in ("work", "outbox"):
                 if db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
                     raise ValueError("linear: cannot establish activation_cutoff_ms over existing work state")
             db.execute("INSERT INTO metadata (key, value) VALUES ('activation_cutoff_ms', ?)", (str(configured),))
@@ -872,9 +846,7 @@ class Store:
             prior = db.execute("SELECT value FROM metadata WHERE key=?", (f"native-binding:{issue_id}",)).fetchone()
             if work or prior:
                 return bool(work and work["origin"] == "native" and prior and json.loads(prior[0]) == binding)
-            if (not self._effect_admitted(db, issue_id) or self.retired(issue_id) or
-                    db.execute("SELECT 1 FROM chat_admissions WHERE issue_id=? AND state IN "
-                               "('prepared','claiming','admitted','ambiguous')", (issue_id,)).fetchone()):
+            if not self._effect_admitted(db, issue_id):
                 return False
             db.execute("INSERT INTO work (issue_id,origin,owner_ref,task_id,project_id,last_updated_at,linear_session_id) "
                        "VALUES (?,'native',?,?,?,?,?)", (issue_id,owner_ref,task_id,project_id,at,owner_ref or None))
@@ -937,7 +909,7 @@ class Store:
         """Explicitly replace reporting after caller inspection, never native execution.
 
         Archive the exact prior projection in the existing immutable intent. Uncertain
-        effects, Stop/admission/transfer records and specialist fences remain untouched.
+        effects and specialist fences remain untouched.
         A stale inspection or scope fence returns None; conflicting request reuse fails.
         """
         if any(not isinstance(value, str) or not value.strip() for value in (issue_id, task_id, profile)):
@@ -1156,10 +1128,6 @@ class Store:
             saved.update(updates)
             db.execute("UPDATE metadata SET value=? WHERE key=?", (json.dumps(saved),f"native-intent:{key}"))
             return saved
-    # -- session-free durable chat admission ------------------------------
-    def retired(self, issue_id: str | None = None) -> list[dict]:
-        with self._tx() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM retirement WHERE ? IS NULL OR issue_id=?", (issue_id, issue_id))]
     @staticmethod
     def _report_owner_current(db: sqlite3.Connection, issue_id: str, writes: list) -> bool:
         expected = [payload["native_report_owner"] for _, payload in writes if "native_report_owner" in payload]
@@ -1282,17 +1250,16 @@ class Store:
                     latest = payload
             return bool(latest and (latest.get("content") or {}).get("type") == "response")
     def put(self, issue_id: str, origin: str, owner_ref: str, *, task_id: str | None = None,
-            project_id: str | None = None, last_updated_at: float = 0.0,
-            run_generation: int | None = None) -> bool:
+            project_id: str | None = None, last_updated_at: float = 0.0) -> bool:
         """Import a retained record without adopting/replacing existing work; grants no execution."""
         with self._tx() as db:
-            if not self._effect_admitted(db, issue_id) or self.retired(issue_id):
+            if not self._effect_admitted(db, issue_id):
                 return False
             return bool(db.execute(
-                "INSERT OR IGNORE INTO work (issue_id,origin,owner_ref,task_id,project_id,last_updated_at,run_generation) "
-                "VALUES (?,?,?,?,?,?,?)", (issue_id,origin,owner_ref,task_id,project_id,last_updated_at,run_generation)).rowcount)
+                "INSERT OR IGNORE INTO work (issue_id,origin,owner_ref,task_id,project_id,last_updated_at) "
+                "VALUES (?,?,?,?,?,?)", (issue_id,origin,owner_ref,task_id,project_id,last_updated_at)).rowcount)
     def update(self, issue_id: str, **fields: Any) -> bool:
-        allowed = {"project_id", "last_updated_at", "linear_session_id", "panel_note", "last_event_id"}
+        allowed = {"project_id", "last_updated_at", "linear_session_id", "last_event_id"}
         if not fields or not set(fields) <= allowed:
             raise ValueError("Linear bindings cannot mutate execution ownership or Stop state")
         cols = ", ".join(f"{name} = ?" for name in fields)
@@ -1300,11 +1267,6 @@ class Store:
             if not self._admitted(db, issue_id):
                 return False
             return bool(db.execute(f"UPDATE work SET {cols} WHERE issue_id=?", (*fields.values(), issue_id)).rowcount)
-    def delete(self, issue_id: str) -> bool:
-        with self._tx() as db:
-            if not self._admitted(db, issue_id): return False
-            db.execute("DELETE FROM work WHERE issue_id = ? AND origin != 'native'", (issue_id,))
-            return True
     def retire_untracked(self, issue_id: str, task_id: str | None) -> bool:
         """Stop tracking a record whose native task does not exist; outbox history stays inspectable."""
         with self._tx() as db:
@@ -1324,14 +1286,13 @@ class Store:
             db.execute("INSERT OR IGNORE INTO specialist_scope_fence (issue_id, reason, fenced_at) "
                        "VALUES (?, ?, ?)", (issue_id, reason[:500], at))
     def finish(self, issue_id: str, writes: list[tuple[str, dict[str, Any]]], *, at: float,
-               release: bool = False, status_id: str | None = None) -> bool:
+               status_id: str | None = None) -> bool:
         """Capture terminal Linear writes before forgetting work, in one durable commit."""
         with self._tx() as db:
             self._hold_legacy_outbox(db)
             if not self._effect_admitted(db, issue_id) or not self._report_owner_current(db, issue_id, writes):
                 return False
-            work = db.execute("SELECT ownership_id FROM work WHERE issue_id = ?", (issue_id,)).fetchone()
-            if not work: return False
+            if not db.execute("SELECT 1 FROM work WHERE issue_id = ?", (issue_id,)).fetchone(): return False
             if any(not self._admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
                 if kind == "project_update":
@@ -1344,7 +1305,7 @@ class Store:
                             and not self._admitted(db, *self._targets(json.loads(prior["payload"]))): return False
             status_id = status_id or str(uuid.uuid4())
             for kind, payload in writes:
-                payload = {**payload, "work_owner": work["ownership_id"]}
+                payload = dict(payload)
                 if kind in ("comment", "activity"):
                     payload["write_started"] = False  # Newly captured closeout; persisted before transport.
                 row_id = status_id if kind == "status" else (
@@ -1386,13 +1347,9 @@ class Store:
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                            (row_id, kind, body, at + float(payload.get("quiet", 0))))
             self._sequence_native_history(db, issue_id)
-            if release:
-                db.execute("UPDATE work SET release_pending=1 WHERE issue_id=?", (issue_id,))
-            else:
-                db.execute("DELETE FROM work WHERE issue_id = ? AND origin != 'native'", (issue_id,))
             return True
     def capture_event(self, issue_id: str, event_id: int, writes: list[tuple[str, dict[str, Any]]],
-                      *, at: float, forget: bool = False) -> bool:
+                      *, at: float) -> bool:
         """Advance our Kanban cursor with its Linear writes, independently of core's claim cursor."""
         with self._tx() as db:
             if (not self._admitted(db, issue_id) or (writes and not self._effect_admitted(db, issue_id))
@@ -1413,8 +1370,6 @@ class Store:
                                (str(uuid.uuid4()), kind, json.dumps({**payload, "enqueued_at": at}), at))
             self._sequence_native_history(db, issue_id)
             db.execute("UPDATE work SET last_event_id = ? WHERE issue_id = ?", (event_id, issue_id))
-            if forget:
-                db.execute("DELETE FROM work WHERE issue_id = ? AND origin != 'native'", (issue_id,))
             return True
     @staticmethod
     def _sequence_native_history(db: sqlite3.Connection, issue_id: str) -> None:
@@ -1582,18 +1537,15 @@ class Store:
                 return str(row["id"])
         return None
     def superseded(self, row: dict[str, Any]) -> bool:
-        payload, owner = row["payload"], row["payload"].get("work_owner")
+        """A write for another task than the bound one, or for a retained non-native record."""
+        payload = row["payload"]
         with self._tx() as db:
-            work = db.execute("SELECT origin,task_id,ownership_id FROM work WHERE issue_id=?", (payload["issue_id"],)).fetchone()
-            if work and work["origin"] == "native":
-                return bool(payload.get("task_id") and payload["task_id"] != work["task_id"])
-            if work: return not owner or work["ownership_id"] != owner
-            return bool(db.execute("SELECT 1 FROM outbox WHERE kind='status' AND "
-                                   "rowid>(SELECT rowid FROM outbox WHERE id=?) AND "
-                                   "json_extract(payload, '$.issue_id')=? AND "
-                                   "json_extract(payload, '$.work_owner') IS NOT NULL AND "
-                                   "(? IS NULL OR json_extract(payload, '$.work_owner')!=?) LIMIT 1",
-                                   (row["id"], payload["issue_id"], owner, owner)).fetchone())
+            work = db.execute("SELECT origin,task_id FROM work WHERE issue_id=?", (payload["issue_id"],)).fetchone()
+        if not work:
+            return False
+        if work["origin"] != "native":
+            return True
+        return bool(payload.get("task_id") and payload["task_id"] != work["task_id"])
     def hold_terminal(self, row_id: str) -> None:
         with self._tx() as db:
             db.execute("UPDATE outbox SET attempts=MAX(attempts, 1), "
@@ -1645,8 +1597,8 @@ class Store:
                         "target_delegate_id", "expected_delegate_id", "expected_updated_at",
                         "expected_binding_revision", "native_binding", "task_id", "delegate_routing_version")):
                     raise ValueError("outbox id reused with conflicting delegate routing")
-                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in  # a stamped work_owner is not the caller's
-                        ("issue_id", "body", "expected_description", "id", "session_key", "work_owner") if k in payload or k != "work_owner"):
+                if existing["kind"] == kind and all(saved.get(k) == payload.get(k) for k in
+                        ("issue_id", "body", "expected_description", "id", "session_key")):
                     return row_id
                 raise ValueError("outbox id reused with conflicting content")
             # Foreground chat and its delegated worker share one Linear session.
@@ -1663,17 +1615,13 @@ class Store:
             elif self.reporting_notice(kind, payload):
                 if not self._admitted(db, *targets): return ""
             elif not self._effect_admitted(db, *targets): return ""
-            work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
-            body = json.dumps({**payload, "work_owner": work["ownership_id"] if work and not payload.get("content_action") and not self.reporting_notice(kind, payload) else None,
-                               "enqueued_at": payload.get("enqueued_at", now)})
+            body = json.dumps({**payload, "enqueued_at": payload.get("enqueued_at", now)})
             db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)", (row_id, kind, body, now))
         return row_id
     def enqueue_many(self, writes: list[tuple[str, dict[str, Any]]], *, at: float) -> bool:
         with self._tx() as db:
             if any(not self._effect_admitted(db, *self._targets(payload)) for _, payload in writes): return False
             for kind, payload in writes:
-                work = db.execute("SELECT ownership_id FROM work WHERE issue_id=?", (payload.get("issue_id"),)).fetchone()
-                if work and not self.reporting_notice(kind, payload): payload = {**payload, "work_owner": work["ownership_id"]}
                 db.execute("INSERT INTO outbox (id, kind, payload, next_at) VALUES (?, ?, ?, ?)",
                            (str(uuid.uuid4()), kind, json.dumps({**payload, "enqueued_at": at}), at))
             return True

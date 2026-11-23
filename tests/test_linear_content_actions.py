@@ -79,7 +79,7 @@ class ContentActionTests(unittest.TestCase):
         self.remote.add_issue('issue-1', 'ABC-1', project=None)
         self.remote.set_delegate('issue-1', {'id': SELF})
         self.store = Store(self.path)
-        self.store.put('issue-1', 'chat', 'chat', run_generation=1)
+        self.store.put('issue-1', 'chat', 'chat')
         self.api = LinearAPI(lambda: 'synthetic', endpoint=self.remote.url)
         self.bridge = Bridge(self.store, self.api, SimpleNamespace(), profile='alpha', clock=self.clock)
         self.bridge.profile_home = Path(tmp.name)
@@ -399,9 +399,7 @@ class ContentActionTests(unittest.TestCase):
                 with patch.object(self.api, 'graphql', return_value={'comment': changed}):
                     self.assertFalse(self.api.verify_comment(self.request_id, 'issue-1', BODY))
 
-    def test_legacy_stop_and_other_chat_do_not_gate_content_but_foreign_profile_does(self):
-        with sqlite3.connect(self.path) as db:
-            db.execute("UPDATE work SET stop_requested_at=1, release_pending=1 WHERE issue_id='issue-1'")
+    def test_other_chat_does_not_gate_content_but_foreign_profile_does(self):
         prior = self.store.get('issue-1')
         self.assertTrue(self.invoke(context=replace(self.context, session_key='another-chat'))['ok'])
         self.assertEqual(self.store.get('issue-1'), prior)
@@ -679,7 +677,7 @@ class ContentActionTests(unittest.TestCase):
         self.assertEqual(self.bridge.flush(), 0)
         self.remote.issues['issue-1']['description'] = 'Human edit'
         self.remote.set_delegate('issue-1', OTHER)
-        self.store.put('issue-1', 'chat', 'successor', run_generation=2)
+        self.store.put('issue-1', 'chat', 'successor')
         self.clock.now += 3601
         self.assertEqual(self.bridge.flush(), 0)
         self.assertEqual(self.row()['state'], 'failed')

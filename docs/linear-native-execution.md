@@ -110,10 +110,11 @@ Human issue edits, closure and reassignment are inspected again at remote mutati
 Status intents retain the source event time so delayed catch-up cannot overwrite a later
 human decision. Reporting failures queue in the outbox without controlling native execution.
 
-Legacy chat bindings, admissions, transfers, retirement records, pending Stop requests and
-unknown remote effects stay inspectable. They are not automatically adopted, deleted or
-replayed. Preserve their workspaces, checkpoints, PRs and original effect history. The operator
-view names required reconciliation. Unlinked issue operations retain app/workspace/specialist
+The retired chat-claim tables (admissions, retirement records and chat Stop requests) are
+dropped when a store opens, but only while empty; one with rows is kept, logged on every open
+and otherwise ignored (nothing reads it, and the operator view no longer lists it).
+Unknown remote effects stay inspectable. They are not automatically adopted, deleted or
+replayed. The operator view names required reconciliation. Unlinked issue operations retain app/workspace/specialist
 authorization independently of those old execution claims.
 
 Retained deliveries receive a separate hold reason before delivery or receipt consumption.

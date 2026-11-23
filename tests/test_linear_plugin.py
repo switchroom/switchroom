@@ -280,7 +280,7 @@ class LinearPluginUnitTests(unittest.TestCase):
             self.assertIsNotNone(store.native_binding("i"))
             self.assertEqual(len(store.pending()), 1)
 
-    def test_existing_work_table_adds_chat_panel_and_stop_columns(self) -> None:
+    def test_existing_work_table_adds_reporting_columns_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.db"
             with sqlite3.connect(path) as db:
@@ -289,11 +289,13 @@ class LinearPluginUnitTests(unittest.TestCase):
                            "last_updated_at REAL NOT NULL DEFAULT 0)")
                 db.execute("INSERT INTO work VALUES ('i', 'chat', 'chat-key', NULL, NULL, 0)")
             store = Store(path)
-            self.assertEqual(store.get("i")["stop_requested_at"], 0)
-            store.update("i", panel_note="Need input")
-            with self.assertRaises(ValueError):
-                store.update("i", stop_requested_at=0)
-            self.assertEqual(Store(path).get("i")["panel_note"], "Need input")
+            self.assertEqual(set(store.get("i")) - {"issue_id", "origin", "owner_ref", "task_id", "project_id",
+                                                    "last_updated_at"}, {"linear_session_id", "last_event_id"})
+            store.update("i", linear_session_id="session-1")
+            for retired in ("panel_note", "stop_requested_at"):
+                with self.assertRaises(ValueError):
+                    store.update("i", **{retired: "x"})
+            self.assertEqual(Store(path).get("i")["linear_session_id"], "session-1")
 
 
 

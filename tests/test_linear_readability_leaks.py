@@ -364,7 +364,7 @@ class PostedThroughThePluginTests(unittest.TestCase):
             remote.add_issue("issue-1", "ABC-1", project=None)
             remote.set_delegate("issue-1", {"id": SELF})
             store = Store(Path(directory) / "state.db")
-            store.put("issue-1", "chat", "chat", run_generation=1)
+            store.put("issue-1", "chat", "chat")
             bridge = Bridge(store, LinearAPI(lambda: "synthetic", endpoint=remote.url), SimpleNamespace(),
                             profile="alpha", clock=clock)
             bridge.profile_home = Path(directory)

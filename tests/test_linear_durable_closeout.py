@@ -589,11 +589,7 @@ class DurableCloseoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             authority = Authority()
             store, kanban = Store(Path(directory) / 'state.db'), FakeKanban()
-            store.put(ISSUE, 'chat', 'stopped-legacy-owner', run_generation=7)
-            # Seed the pre-upgrade Stop/owner/effect history that the new plugin must retain.
-            with sqlite3.connect(store.path) as db:
-                db.execute("UPDATE work SET ownership_id='retained-owner',stop_requested_at=25,"
-                           "pending_resume=? WHERE issue_id=?", ('{"effect":"unknown"}', ISSUE))
+            store.put(ISSUE, 'chat', 'stopped-legacy-owner')
             before_work = store.get(ISSUE)
             old = store.enqueue('activity', {'issue_id': ISSUE, 'session_id': SESSION,
                 'session_key': 'stopped-legacy-owner', 'one_try': True,
