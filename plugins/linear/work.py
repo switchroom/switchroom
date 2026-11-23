@@ -59,7 +59,7 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
     """Coordinates come ONLY from the owner's saved policy. No file snapshots or raw DB reads."""
     from . import native_store
     from .native_store import local_receipt, local_identity
-    from .origin_state import current_admission
+    current_admission = origin.current_admission
     from gateway.session_policy import restore_policy
     from hermes_cli.sqlite_safe_read import connect_tracked
     from hermes_cli.profiles import resolve_profile_env
@@ -131,12 +131,11 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
                 or bound.get("claim_lock") != lock or type(bound.get("pid")) is not int or bound["pid"] <= 0
                 or context is not None and bound["pid"] != os.getpid()):
             _refuse()
-        from .origin_state import stop_evidence
         result = {"requester": {"kind": "native_dispatcher", "original_requester": "unknown"},
                   "work": {"board": board, "task_id": tid, "run_id": run, "instruction": instruction},
                   "scope": {"declared": declared, "profile": profile, "workspace": frozen["workspace"],
                             "branch": frozen["branch"], "tenant": frozen["tenant"], "skills": frozen["skills"]},
-                  "stop_evidence": stop_evidence(home, sid), "permission_granted": False}
+                  "permission_granted": False}
         # Claim tokens, DB paths, unrelated worker context and private history never leave this function.
         digest = origin._digest({"policy": frozen, "principal": saved["principal_id"], "admission_header": header,
                                  "task_scope": {key: task[key] for key in ("workspace_kind", "project_id", "completion_contract",
@@ -147,8 +146,7 @@ def _projection(home: Path, profile: str, current: dict, declared: dict,
 
 async def _inspect(home, profile, declared, ref=None, context=None):
     async with origin._client(home) as (client, endpoint):
-        from .origin_state import resolve_reference
-        sid = context.session_id if context else await asyncio.to_thread(resolve_reference, home, ref)
+        sid = context.session_id if context else await asyncio.to_thread(origin.resolve_reference, home, ref)
         snapshot, active = await origin._snapshot(client, home, sid)
         active = {**active, "session_id": snapshot["session_id"]}
         evidence, digest = await asyncio.to_thread(_projection, home, profile, active, declared, context)

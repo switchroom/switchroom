@@ -13,8 +13,6 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator
 
-_CHAIN_CAP = 1000  # the native lineage walk's bound; an exhausted walk is storage_unavailable, never a partial set
-
 
 def refusal(reason: str):
     from persistence.core.errors import AuthorityRefusal
@@ -108,17 +106,6 @@ def get_admission(store, admission_id: str) -> dict | None:
         return rows[0] if rows else None
 
 
-def find_admission(store, *, principal_id: str, session_id: str, request_id: str) -> dict | None:
-    try:
-        return admission_row(store.admissions.find(principal_id=principal_id, session_id=session_id,
-                                                   request_id=request_id))
-    except ValueError as exc:
-        _undecodable(exc)
-        rows = _raw_admissions(store, "principal_id=? AND target_session_id=? AND request_id=?",
-                               (principal_id, session_id, request_id))
-        return rows[0] if rows else None
-
-
 def list_admissions(store, session_id: str, *, pending_only: bool = False) -> list[dict]:
     try:
         return [admission_row(r) for r in store.admissions.list(session_id=session_id, pending_only=pending_only)]
@@ -156,62 +143,3 @@ def canonical_owner(store, session_id: str) -> str:
     """The compression root, then the local reset owner: the session a native admission is held against."""
     lineage = store.lineage.lineage(session_id)
     return str(store.bindings.lineage_owner(lineage[0] if lineage else session_id))
-
-
-def _physical_target(store, session_id: str) -> str:
-    if not store.bindings.binding_marks(session_id).policy:
-        return session_id
-    receipt = store.bindings.receipt(session_id)
-    if receipt.session_id != session_id:
-        raise refusal("storage_unavailable")
-    return str(store.bindings.validate_lineage(receipt))
-
-
-def runtime_lineage(store, session_id: str) -> set[str]:
-    """Every physical session of one logical conversation: its local owner's current transcript, the owner a segment's
-    ``chat_id`` names while that receipt's lineage holds it, closed over compression continuations both ways."""
-    targets = {session_id, _physical_target(store, session_id)}
-    record = store.sessions.get(session_id)
-    chat = getattr(record, "chat_id", None) if record is not None else None
-    if chat and store.bindings.binding_marks(chat).policy and session_id in store.bindings.receipt(chat).lineage:
-        targets.update({chat, _physical_target(store, chat)})
-    frontier = list(targets)
-    for _ in range(_CHAIN_CAP):
-        found: set[str] = set()
-        for sid in frontier:
-            chain = store.lineage.lineage(sid)
-            root = chain[0] if chain else sid
-            found.update(chain)
-            found.update(edge.session_id for edge in store.sessions.descendants(root))
-        frontier = sorted(found - targets)
-        if not frontier:
-            return targets
-        targets.update(frontier)
-    raise refusal("storage_unavailable")
-
-
-def linked_worker_admission(conn, session_id, generation, owner_epoch, statuses):
-    """The one admission of ``(generation, owner_epoch)`` in ``statuses`` held against ``session_id`` or its lineage."""
-    placeholders = ",".join("?" for _ in statuses)
-    rows = conn.execute(f"""SELECT * FROM session_admissions
-        WHERE generation=? AND owner_epoch=? AND status IN ({placeholders})
-          AND (target_session_id=? OR EXISTS (
-              SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
-          )) ORDER BY seq""", (generation, owner_epoch, *statuses, session_id, session_id)).fetchall()
-    if len(rows) > 1:
-        raise refusal("admission_conflict")
-    return rows[0] if rows else None
-
-
-def session_row_raw(conn, session_id):
-    row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-    if row is None:
-        raise refusal("not_found")
-    return row
-
-
-def descendant_range(execution_id):
-    """``(low, high)`` bounds every descendant id of ``execution_id`` on the primary key index
-    (';' sorts right after the separator's ':')."""
-    from persistence.workers.vocabulary import CHILD_SEPARATOR
-    return execution_id + CHILD_SEPARATOR, execution_id + CHILD_SEPARATOR[:-1] + ";"

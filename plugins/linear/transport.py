@@ -253,6 +253,11 @@ class Server:
                 args = payload.get('args')
                 if not isinstance(args, dict):
                     raise ValueError('Linear request args must be an object')
+                if args.get('action') == 'hand_off':
+                    # Its caller context is client-supplied here; hand_off is answered only on an
+                    # in-process A2A turn, whose identity the gateway itself bound.
+                    return json.dumps({'ok': False, 'code': 'handoff_not_allowed', 'message':
+                                       'hand_off is answered only on an A2A request, so nothing was changed.'})
                 return chat(args, context)
             raise ValueError('Unknown Linear transport operation')
         class Handler(socketserver.StreamRequestHandler):
@@ -301,10 +306,9 @@ class Server:
 def chat_request(home: Path, args: dict[str, Any], context: Any) -> str:
     # Only capture_context() at the registered tool boundary produces this snapshot.
     validated = NativeContext.from_wire(context.to_wire(), home, context.profile)
-    # take_over waits for the other agent's run to wind down; its worst case (one owner call with
-    # the capped wait, plus one start here) is worked out in handoff and stays below this.
+    # take_over and resume_owner wait for the other agent's A2A answer (at most its wait_seconds).
     if args.get('action') in ('take_over', 'resume_owner'):
-        from .handoff import CLIENT_TIMEOUT_SECONDS
+        from .takeover import CLIENT_TIMEOUT_SECONDS
         timeout = CLIENT_TIMEOUT_SECONDS
     else:
         timeout = 20.0

@@ -1,15 +1,19 @@
-"""Exact, read-only native request evidence. References confer no control permission."""
+"""Read-only native owner receipts for one current admission. References confer no permission.
+
+Shared by the worker's ``work_reference`` (work.py) and live worker steps (worker_progress.py):
+it discovers the existing gateway owner (never launches one), reads the session's one current
+admission and checks the owner's ``prompt.receipt`` for it.
+"""
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
+import asyncio
 import hashlib
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .transport import NativeContext, Unavailable
+from .transport import Unavailable
 
 VERSION = 1
 REFERENCE_FIELDS = frozenset({"version", "profile", "admission_id",
@@ -66,7 +70,6 @@ async def _client(home: Path):
 
 
 async def _snapshot(client, home: Path, session_id: str) -> tuple[dict, dict]:
-    from .origin_state import read_current
     snapshot, row = await asyncio.to_thread(read_current, home, session_id)
     receipt = await client.rpc("prompt.receipt", session_id=snapshot["session_id"], admission_id=row["admission_id"])
     if (receipt.get("status") != "started" or receipt.get("outcome") is not None
@@ -78,81 +81,60 @@ async def _snapshot(client, home: Path, session_id: str) -> tuple[dict, dict]:
     return snapshot, row
 
 
-async def _projection(home: Path, ref: dict, snapshot: dict, current: dict,
-                      declared_scope: dict, context: NativeContext | None, api) -> dict:
-    from .origin_state import _evidence, stop_evidence
-    evidence = await asyncio.to_thread(_evidence, home, ref,
-        {**current, "session_id": snapshot["session_id"]}, declared_scope, context)
-    if evidence["requester"].get("platform") == "linear":
-        from .origin_provider import verify
-        evidence["provider_verification"] = await asyncio.to_thread(verify, evidence["requester"], declared_scope, api)
-    evidence["stop_evidence"] = await asyncio.to_thread(stop_evidence, home, snapshot["session_id"])
-    return evidence
+def current_admission(row: dict | None) -> dict:
+    """Validate only the selected active row against its native writer/claim contract."""
+    from .native_store import text, json_object
+    if row is None:
+        _refuse()
+    for key in ("admission_id", "request_id", "principal_id", "target_session_id"):
+        text(row[key])
+    json_object(row["payload"])
+    if (row["intent"] not in ("queue", "steer", "redirect")
+            or any(type(row[key]) is not int or row[key] < 1 for key in ("seq", "owner_epoch", "generation"))
+            or row["status"] != "started" or row["outcome"] is not None):
+        _refuse("The current native admission contract is unavailable.")
+    return {key: row[key] for key in ("admission_id", "request_id", "principal_id", "target_session_id",
+                                     "seq", "intent", "owner_epoch", "generation", "status", "outcome")}
 
 
-async def _inspect(home: Path, profile: str, declared_scope: dict, ref: dict | None,
-                   context: NativeContext | None = None, api=None) -> dict:
-    async with _client(home) as (client, endpoint):
-        from .origin_state import resolve_reference
-        sid = context.session_id if context else await asyncio.to_thread(resolve_reference, home, ref)
-        snapshot, current = await _snapshot(client, home, sid)
-        observed = {"version": VERSION, "profile": profile, "admission_id": current["admission_id"],
-                    "instance_id": endpoint.instance_id, "authority_epoch": endpoint.authority_epoch,
-                    "execution_generation": snapshot["execution_generation"], "scope_digest": _digest(declared_scope)}
-        if (observed["authority_epoch"] != snapshot.get("authority_epoch")
-                or observed["authority_epoch"] != current.get("authority_epoch")
-                or ref is not None and observed != ref):
+def resolve_reference(home: Path, ref: dict) -> str:
+    """Resolve private logical coordinates only from this owner's exact native admission."""
+    from . import native_store
+    with native_store.reader(home) as db:
+        row = native_store.get_admission(db, ref["admission_id"])
+        current_admission(row)
+        if (row["owner_epoch"] != ref["authority_epoch"]
+                or row["generation"] != ref["execution_generation"]):
             _refuse()
-        ref = reference(observed)
-        evidence = await _projection(home, ref, snapshot, current, declared_scope, context, api)
-        # Recheck the exact returned projection after owner readback, not just its IDs.
-        # Native workspace/policy or retained requester/text changes invalidate evidence too.
-        after, active = await _snapshot(client, home, snapshot["session_id"])
-        if after != snapshot or active != current:
+        return row["target_session_id"]
+
+
+def read_current(home: Path, session_id: str) -> tuple[dict, dict]:
+    """Only this session's lineage and admission state; no transcript, config or tool inventory."""
+    from . import native_store
+    with native_store.reader(home) as db:
+        # Match the native admission owner: compression root, then local reset owner.
+        canonical = native_store.canonical_owner(db, session_id)
+        session = native_store.session_row(db, canonical)
+        if session is None:
             _refuse()
-        repeated = await _projection(home, ref, after, active, declared_scope, context, api)
-        if repeated != evidence:
+        # Native steering transfers are terminal rows held against the active generation.
+        # The native list API includes them only with pending_only=False. Never return them.
+        rows = native_store.list_admissions(db, canonical, pending_only=False)
+        generation = session.get("runtime_generation")
+        started = [r for r in rows if r["status"] == "started" and r.get("generation") == generation]
+        if type(generation) is not int or generation < 1 or len(started) != 1:
+            _refuse("The originating turn is not current, or has ambiguous steering.")
+        row = started[0]
+        header = current_admission(row)
+        # Authenticate this owner/generation only. Historical uncertainty remains the native
+        # owner's responsibility; it is not a blanket refusal of a newly admitted request.
+        same_claim = [r for r in rows if r.get("generation") == generation and r.get("owner_epoch") == row["owner_epoch"]]
+        if (row["outcome"] is not None or any(r["status"] == "unknown"
+                or r.get("outcome") in {"steering", "steered"} for r in same_claim)):
             _refuse()
-        return repeated
-
-
-def _run(home: Path, profile: str, declared_scope: dict, ref: dict | None,
-         context: NativeContext | None = None, api=None) -> dict:
-    try:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            run = asyncio.run
-        else:
-            # Provider SDKs can call a synchronous tool from their own event loop.
-            # Reuse Core's bounded bridge, which preserves native profile context.
-            from model_tools import _run_async as run
-        return run(_inspect(home, profile, declared_scope, ref, context, api))
-    except Unavailable:
-        raise
-    except (RuntimeError, OSError, ValueError, ImportError, KeyError, TypeError, sqlite3.DatabaseError) as exc:
-        raise Unavailable("Native origin evidence is unavailable; inspect the owning runtime before continuing.") from exc
-
-
-def current(context: NativeContext, settings: dict, *, api=None) -> dict:
-    if context.delegated_child:
-        _refuse("A delegated child cannot supply the originating user's request.")
-    if context.platform == "desktop":
-        # A legacy Desktop host has no native owner receipt; an owner-adopted Desktop chat runs as "local".
-        _refuse("This Desktop chat is not on the agent's native session owner yet, so its request cannot be verified.")
-    if context.platform not in {"local", "api_server", "telegram", "slack", "linear"}:
-        _refuse("This surface cannot supply an ordinary native origin reference.")
-    evidence = _run(Path(context.home), context.profile, scope(settings), None, context, api)
-    return {"reference": evidence["reference"], "permission_granted": False,
-            **({"provider_verification": evidence["provider_verification"]} if "provider_verification" in evidence else {})}
-
-
-def inspect(value: Any, settings: dict, *, api=None) -> dict:
-    """Owner CLI only. Caller supplies a reference, never another home or database path."""
-    from hermes_constants import get_hermes_home
-    from hermes_cli.profiles import get_active_profile_name
-    ref = reference(value)
-    home = Path(get_hermes_home()).resolve(strict=True)
-    if ref["profile"] != get_active_profile_name():
-        _refuse("The reference belongs to another native profile.")
-    return _run(home, ref["profile"], scope(settings), ref, api=api)
+        snapshot = {"session_id": canonical, "authority_epoch": row["owner_epoch"], "execution_generation": generation}
+        current = {"admission_id": row["admission_id"], "input_id": row["request_id"],
+                   "authority_epoch": row["owner_epoch"], "execution_generation": row["generation"],
+                   "text": row["payload"].get("text"), "admission_header": header}
+        return snapshot, current
