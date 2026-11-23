@@ -16,7 +16,7 @@ import test_linear_native_bridge_scenarios as native
 from hermes_fleet_linear_plugin import bridge as bridge_module
 from hermes_fleet_linear_plugin.bridge import Kanban
 
-STEPS = ("_worker_progress", "_recheck_acceptance", "_resume_pr_park", "_reconcile_status", "_recover_binding_delegate")
+STEPS = ("_worker_progress", "_settle_legacy_closeout", "_resume_pr_park", "_reconcile_status", "_recover_binding_delegate")
 
 
 @unittest.skipIf(native.CORE is not None, f"native source unavailable ({native.CORE})")

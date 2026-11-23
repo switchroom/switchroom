@@ -39,10 +39,21 @@ def canonical_uuid4(value) -> bool:
     return parsed.version == 4 and str(parsed) == value
 
 
+def _offline_gh() -> None:
+    """The closing note reads a PR's state through ``gh`` (F28). Tests that do not fake it get a gh with
+    no login, which fails fast and offline (no state line), instead of asking the real GitHub."""
+    import os
+    import tempfile
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+        os.environ.pop(key, None)
+    os.environ["GH_CONFIG_DIR"] = tempfile.mkdtemp(prefix="linear-tests-gh-")
+
+
 def load_plugin():
     name = "hermes_fleet_linear_plugin"
     if name in sys.modules:
         return sys.modules[name]
+    _offline_gh()
     spec = importlib.util.spec_from_file_location(
         name, ROOT / "plugins" / "linear" / "__init__.py", submodule_search_locations=[str(ROOT / "plugins" / "linear")])
     module = importlib.util.module_from_spec(spec)

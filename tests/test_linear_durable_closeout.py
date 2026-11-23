@@ -18,6 +18,7 @@ from unittest.mock import patch
 from linear_fake_api import load_plugin
 load_plugin()
 from hermes_fleet_linear_plugin.bridge import Kanban
+from hermes_fleet_linear_plugin import bridge as bridge_module
 import unittest
 from pathlib import Path
 
@@ -519,8 +520,9 @@ class DurableCloseoutTests(unittest.TestCase):
              'https://example.test/findings'),
             ('url with generic summary', 'Done', 'https://example.test/findings',
              'local-only', True, 'https://example.test/findings'),
+            # F28: a PR contract is reported, not gated: native Done is Linear Done.
             ('strict PR', 'Reviewed rows; found two missing prices.', '',
-             'https://github.com/example/repo/pull/1', False, ''),
+             'https://github.com/example/repo/pull/1', True, 'found two missing prices'),
         )
         for name, result, evidence_text, contract, done, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -534,7 +536,7 @@ class DurableCloseoutTests(unittest.TestCase):
                 bridge.track(ISSUE, task.id, requester_session=SESSION)
                 task.status = 'done'
                 kanban.record_completion(task, 1)
-                with patch.object(bridge, 'accepted_evidence', return_value=contract == 'local-only'):
+                with patch.object(bridge_module, 'pr_state', return_value=None):
                     bridge._finished(store.get(ISSUE), event_id=1)
                 pending = store.pending()  # Project batches use their own queue; inspect all captured components.
                 status = next(row['payload']['state'] for row in pending if row['kind'] == 'status')
