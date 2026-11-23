@@ -35,6 +35,7 @@ plugin = load_plugin()
 from hermes_fleet_linear_plugin import chat, native_input
 from hermes_fleet_linear_plugin.api import LinearError
 from hermes_fleet_linear_plugin.bridge import Bridge, Kanban, _same_work_notice
+from hermes_fleet_linear_plugin.outcome import POINTER_BODY
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
 from test_linear_specialist_authorization import Authority, ISSUE, TEAM, PROJECT, USER, VIEWER, issue_record
@@ -616,11 +617,14 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.bridge.tick()
         self.assertEqual(self.tasks(), [task_id])
         self.assertNotIn("unblocked", self.history(task_id))
-        # FM2: the session Linear opens for it gets the result, not "nothing new was started".
+        # FM2: the session Linear opens for it points at the result, not "nothing new was started".
         reply_bodies = [r["content"].get("body") or "" for r in self.said("echo-session")]
-        self.assertTrue(any("Proxy rolled out and checked live." in body and "https://ci.example/run/42" in body
-                            for body in reply_bodies), reply_bodies)
+        self.assertIn(POINTER_BODY, reply_bodies)
         self.assertFalse(any("nothing new was started" in body for body in reply_bodies), reply_bodies)
+        # HF-809: Linear shows a session response as a thread comment, so the result is said once.
+        visible = self.issue_comments(NEW_ISSUE) + [r["content"].get("body") or "" for r in self.said("echo-session")
+                                                    if r["content"].get("type") == "response"]
+        self.assertEqual(sum("Proxy rolled out and checked live." in body for body in visible), 1, visible)
 
     def test_record_done_refuses_an_issue_with_existing_work(self):
         self.ask({"action": "work_on", "issue": ISSUE})

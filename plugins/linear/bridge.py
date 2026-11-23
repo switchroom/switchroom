@@ -1879,6 +1879,12 @@ class Bridge:
             contract = task.completion_contract or "local-only"
             evidence = [contract] if contract.startswith("https://") else evidence_links(adapter.evidence_text(task))
             summary = _project_summary(adapter.completion_summary(task), 4000)
+            # Linear shows a session response as a thread comment. The closeout already posts (or
+            # will post) the result as this completion's issue comment, so point at it (HF-809).
+            from .outcome import POINTER_BODY, captured_body
+            if (captured_body(self.store, row["issue_id"], self._completion_identity(row["issue_id"], adapter, task))
+                    is not None or self._session_completion_status(row) is None):
+                return POINTER_BODY
         except RateLimited:
             raise
         except Exception:  # noqa: BLE001 - the plain notice still answers the session
@@ -2034,6 +2040,14 @@ class Bridge:
             self._require_completion_report(payload)
         return status
 
+    def _completion_identity(self, issue_id: str, adapter, task) -> dict:
+        """The latest native completion as its outcome comment's identity (outcome.comment_id_for)."""
+        binding = self.store.native_binding(issue_id)
+        completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
+                        key=lambda event: event.id)
+        return {"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
+                "scope": binding["completion_scope"], "event_id": completed.id,
+                "run_id": getattr(completed, "run_id", None)}
     def _session_completion_pending(self, row: dict[str, Any]) -> bool:
         """A captured intent is not completion: its exact status must have been applied."""
         status = self._session_completion_status(row)
@@ -3860,11 +3874,8 @@ class Bridge:
                                   recheck=recheck)
                 return ("failed" if written else None) if recheck is not None else None
         binding = self.store.native_binding(issue_id)
-        completed = max((event for event in adapter.history(task.id, 0) if event.kind == "completed"),
-                        key=lambda event: event.id)
-        completion = {"task_id": task.id, "profile": binding["profile"], "board": binding["board"],
-                      "scope": binding["completion_scope"], "event_id": completed.id,
-                      "run_id": getattr(completed, "run_id", None)}
+        completion = self._completion_identity(issue_id, adapter, task)
+        completed_id = completion["event_id"]
         # The outcome comment's identity is its completion and its exact text: a retry, a repair or an
         # older build's closeout of this completion keeps the text it already has (no new PR read).
         from .outcome import captured_body
@@ -3895,7 +3906,7 @@ class Bridge:
             if not prior_id:
                 comment_id = stable_uuid4("assessment-comment", issue_id,
                     hashlib.sha256(assessment.encode()).hexdigest(),
-                    reconcile_request_id or f"{self._project_batch(binding)}:{completed.id}")
+                    reconcile_request_id or f"{self._project_batch(binding)}:{completed_id}")
                 writes.insert(1, ("comment", {
                     "id": comment_id, "issue_id": issue_id, "body": assessment, "assessment": True,
                     "task_id": row["task_id"], "native_completion": completion,

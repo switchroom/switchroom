@@ -38,6 +38,7 @@ plugin = load_plugin()
 from hermes_fleet_linear_plugin import chat, diag, native_input
 from hermes_fleet_linear_plugin.api import RateLimited
 from hermes_fleet_linear_plugin.bridge import Bridge, Kanban, stable_uuid4
+from hermes_fleet_linear_plugin.outcome import POINTER_BODY
 from hermes_fleet_linear_plugin.store import Store
 from hermes_fleet_linear_plugin.transport import NativeContext
 from linear_ingress_fixture import IngressStore, Route
@@ -370,9 +371,9 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.assert_one_owner(), task_id)
         self.assertEqual(self.board.get(task_id).status, "done")
         self.assertFalse({"claimed", "spawned", "unblocked"} & set(self.history(task_id)))  # never runnable
-        answer = self.said("echo-session")[-1]  # the finished work's result, not a dead end (FM2)
-        self.assertTrue(answer.startswith("Done."), answer)
-        self.assertIn("Counted every directory in the chat.", answer)
+        answer = self.said("echo-session")[-1]  # points at the finished work's result, not a dead end (FM2)
+        self.assertEqual(answer, POINTER_BODY)  # HF-809: the issue comment alone carries the result
+        self.assertFalse(any("Counted every directory in the chat." in body for body in self.said("echo-session")))
         self.reconcile()
         self.assertEqual(self.board.get(task_id).status, "done")
         self.assertFalse({"claimed", "spawned", "unblocked"} & set(self.history(task_id)))
