@@ -100,7 +100,7 @@ REASONS = frozenset({
     "takeover_routing_unfinished", "takeover_local_unknown", "resume_refused", "resume_uncertain",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "socket_owned", "tick_exception", "duplicate_create",
-    "readback_differs", "id_reused", "hourly_cap", "invalid_diagnostics", "internal_wording", "budget_deferred",
+    "readback_differs", "id_reused", "hourly_cap", "internal_wording", "budget_deferred",
     "retired_table_kept",  # store open: a retired legacy table still has rows, so it was not dropped
     # tool replies (chat.py codes)
     "request_refused", "service_unavailable", "context_unavailable", "unsupported_action",
@@ -132,8 +132,8 @@ FIELDS: dict[str, re.Pattern | None] = {  # None means integer
     "state": re.compile(r"[a-z]{1,12}(?:_[a-z]{1,12}){0,2}"),
     "code": re.compile(r"[A-Z0-9_]{1,80}"), "exc": re.compile(r"[A-Z][A-Za-z0-9]{0,63}"),
     "ver": re.compile(r"[0-9]{1,4}(?:\.[0-9A-Za-z-]{1,16}){0,3}"), "sha": re.compile(r"[0-9a-f]{7,40}"),
-    "commit": re.compile(r"[0-9a-f]{7,40}"), "lvl": re.compile(r"detail"),
-    "detail": re.compile(r"on|off"), "suppressed": None, "next_s": None, "tick_s": None,
+    "commit": re.compile(r"[0-9a-f]{7,40}"),
+"suppressed": None, "next_s": None, "tick_s": None,
     "recheck_s": None, "oldest_pending_s": None, "max_tick_ms": None, "waited_s": None,
     # Slowest tick parts (own work, Linear requests, blocked on another holder) and most requests in one tick.
     "max_tick_local_ms": None, "max_tick_api_ms": None, "max_tick_wait_ms": None, "max_tick_api_calls": None,
@@ -182,7 +182,6 @@ class _State:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.agent = self.profile = None
-        self.diagnostics: dict[str, Any] | None = None
         self.limits: dict[tuple, list] = {}       # key -> [last emit time, suppressed]
         self.transitions: dict[tuple, str] = {}
         self.keys: dict[str, str] = {}            # issue UUID -> issue key, filled from issue reads
@@ -206,60 +205,13 @@ def reset() -> None:
     _state = _State()
 
 
-def configure(diagnostics: Any = None, *, agent: str | None = None, profile: str | None = None) -> None:
-    """Set the per-agent context and the optional time-boxed detail setting.
-
-    ``diagnostics: {detail: true, issues: [ABC-1], until: 2026-11-03T00:00Z}`` in the
-    plugin's settings block. ``until`` is required, so a forgotten flag expires.
-    """
+def configure(*, agent: str | None = None, profile: str | None = None) -> None:
+    """Set the per-agent context; a new reporting service starts a fresh limiter."""
     _state.agent, _state.profile = agent, profile
-    _state.diagnostics = None
     # A new reporting service starts a fresh limiter: the first line after a restart is always shown.
     with _state.lock:
         _state.limits.clear()
         _state.transitions.clear()
-    if diagnostics is None:
-        return
-    parsed = _parse_diagnostics(diagnostics)
-    if parsed is None:
-        evt("diag.config", "refused", "invalid_diagnostics", level=logging.WARNING)
-        return
-    _state.diagnostics = parsed
-
-
-def _parse_diagnostics(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or set(value) - {"detail", "issues", "until"}:
-        return None
-    if value.get("detail") is not True:
-        return {"detail": False, "issues": (), "until": 0.0}
-    issues = value.get("issues") or []
-    if not isinstance(issues, list) or any(not isinstance(item, str) or not FIELDS["issue"].fullmatch(item)
-                                           for item in issues):
-        return None
-    until = value.get("until")
-    if isinstance(until, datetime):
-        moment = until
-    elif isinstance(until, str):
-        try:
-            moment = datetime.fromisoformat(until.strip().replace("Z", "+00:00").replace("z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return {"detail": True, "issues": tuple(issues), "until": moment.timestamp()}
-
-
-def detail_active(fields: dict[str, Any] | None = None) -> bool:
-    config = _state.diagnostics
-    if not config or not config["detail"] or _wall() >= config["until"]:
-        return False
-    if not config["issues"]:
-        return True
-    fields = fields or {}
-    key = fields.get("issue") or _state.keys.get(str(fields.get("iss") or ""))
-    return key in config["issues"]
 
 
 def remember(issue: Any) -> Any:
@@ -369,15 +321,8 @@ def warn(action: str, outcome: str, reason: str, **fields: Any) -> bool:
     return evt(action, outcome, reason, level=logging.WARNING, **fields)
 
 
-def detail(action: str, outcome: str, reason: str = "-", **fields: Any) -> bool:
-    """A DEBUG-class line, written at INFO with ``lvl=detail`` only while the diagnostics setting is active."""
-    if not detail_active(fields):
-        return False
-    return evt(action, outcome, reason, lvl="detail", **fields)
-
-
 def transition(action: str, outcome: str, reason: str, *, key: Any, quiet: bool = False, **fields: Any) -> bool:
-    """Emit only when the decision for ``key`` changes. ``quiet`` decisions are detail-only."""
+    """Emit only when the decision for ``key`` changes. ``quiet`` decisions are never written."""
     with _state.lock:
         marker = (action, key)
         if _state.transitions.get(marker) == (outcome, reason):
@@ -385,7 +330,7 @@ def transition(action: str, outcome: str, reason: str, *, key: Any, quiet: bool 
         _state.transitions[marker] = (outcome, reason)
         if len(_state.transitions) > 8192:
             _state.transitions.clear()
-    return (detail if quiet else evt)(action, outcome, reason, **fields)
+    return False if quiet else evt(action, outcome, reason, **fields)
 
 
 # -- reason hand-off --------------------------------------------------------
@@ -466,9 +411,7 @@ def outbox_result(row: dict[str, Any], applied: bool, started: float | None = No
     count("content" if action == "content.write" and outcome != "refused" else
           {"applied": "sent", "refused": "refused", "skipped": "skipped"}[outcome])
     fields = outbox_fields(row, started)
-    if action == "content.write" and outcome != "refused":
-        detail(action, outcome, reason, **fields)  # ~280 comments per 48h would dominate at INFO
-    else:
+    if not (action == "content.write" and outcome != "refused"):  # ~280 comments per 48h: counted only
         evt(action, outcome, reason, **fields)
     return None if outcome == "applied" else reason
 
@@ -480,7 +423,6 @@ def outbox_failure(row: dict[str, Any], exc: BaseException, *, gave_up: bool | N
     fields = {**outbox_fields(row), **exc_fields(exc)}
     if advisory:
         count("failed")
-        detail("content.write", "failed", "advisory_dropped", **fields)
         return "advisory_dropped"
     if gave_up is None:  # non-retryable
         count("failed")
@@ -554,8 +496,6 @@ def native_event(kind: Any, **fields: Any) -> None:
     count("events" if kind in CONSEQUENTIAL else "minor")
     if kind in CONSEQUENTIAL:
         evt("native.event", "queued", f"native_{kind}", kind=kind, **fields)
-    else:
-        detail("native.event", "skipped", "-", kind=kind if isinstance(kind, str) else None, **fields)
 
 
 # -- tick timing ---------------------------------------------------------------
@@ -665,7 +605,6 @@ def service_start(store: Any, tick_s: float, recheck_s: float) -> None:
     except Exception:  # noqa: BLE001 - diagnostics never break reporting
         counts = {}
     evt("service.start", "started", **version(), tick_s=tick_s, recheck_s=recheck_s,
-        detail="on" if detail_active() else "off",
         **{key: counts.get(key) for key in ("n_bindings", "n_pending", "n_held", "n_failed_unreported")})
 
 
@@ -693,9 +632,7 @@ def tool_result(args: Any, reply: str, started: float | None = None) -> str:
     if started is not None:
         fields["ms"] = (_now() - started) * 1000
     code = parsed.get("code") if isinstance(parsed.get("code"), str) else "-"
-    if ok and action in READ_ACTIONS:
-        detail("tool.result", "applied", "-", **fields)
-    else:
+    if not (ok and action in READ_ACTIONS):  # read-only tool calls are not decisions
         evt("tool.result", "applied" if ok else "refused", "-" if ok else code, **fields)
     return reply
 
