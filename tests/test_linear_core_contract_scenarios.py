@@ -1,8 +1,8 @@
 """The Linear plugin's reach into Core, checked against the real pinned Agent source.
 
 The plugin imports Kanban, gateway and tool internals that no published plugin API
-covers (``kanban_db.block_task(..., expected_event_id=)``, ``_owner_process_gone``,
-``kanban_owner_recovery.attempt_instance_replaced`` and so on). Most of those imports
+covers (``kanban_db.block_task(..., expected_event_id=)``, ``kanban_pr_acceptance``,
+``tools.registry.dispatch`` and so on). Most of those imports
 sit inside functions or behind ``except ImportError`` fallbacks, so an upstream sync
 that renames a symbol or a keyword does not fail at import time: Linear reporting
 just degrades. This module derives every such use from the plugin source itself
@@ -366,12 +366,9 @@ class CoreContractScenarios(unittest.TestCase):
         for expected in ("hermes_cli.kanban_db:block_task", "hermes_cli.kanban_db:unblock_task",
                          "hermes_cli.kanban_db:add_comment", "hermes_cli.kanban_db:write_txn",
                          "hermes_cli.kanban_db:_require_task", "hermes_cli.kanban_db:create_task",
-                         "hermes_cli.kanban_db:complete_task", "hermes_cli.kanban_db:BLOCK_RECURRENCE_LIMIT",
-                         "hermes_cli.kanban_db:_pid_alive", "hermes_cli.kanban_db:Run.from_row",
+                         "hermes_cli.kanban_db:complete_task", "hermes_cli.kanban_db:Run.from_row",
                          "hermes_cli.kanban_db_connect:init_db", "hermes_cli.kanban_db_boards:create_board",
-                         "hermes_cli.kanban_db_dispatch:_process_fingerprint",
-                         "hermes_cli.kanban_owner_recovery:attempt_instance_replaced",
-                         "hermes_cli.kanban_owner_recovery:_owner_process_gone"):
+                         "tools.registry:registry.dispatch"):
             self.assertIn(expected, paths)
         # F28: Core's PR acceptance verifier is no longer used; native Done is Linear Done.
         self.assertNotIn("hermes_cli.kanban_pr_acceptance:collect_acceptance", paths)

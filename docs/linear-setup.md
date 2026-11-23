@@ -353,9 +353,11 @@ containers against a live Linear workspace, so the Agent Session panel showing p
 ## Part 3: handoff between two agents
 
 "Take over ABC-123 from Example-A" works without the receiver. Each agent keeps its own OAuth app;
-neither borrows the other's credentials. The taking agent asks the owner, through a command you
-configure, to stop and prove its run ended, then starts the remaining work and replaces the
-delegate. On the taking agent (`Example-B`):
+neither borrows the other's credentials. The taking agent asks the owner over A2A to pause its
+work and stop being the delegate, then starts the work here once Linear shows the owner is no
+longer the delegate. Both agents need core's A2A set up: the taking agent lists the owner under
+`a2a_agents` (its client tools), and the owner runs the A2A platform. On the taking agent
+(`Example-B`):
 
 ```yaml
         takeover:
@@ -363,13 +365,24 @@ delegate. On the taking agent (`Example-B`):
           agents:
             - name: Example-A
               delegate_id: example-a-app-user-id   # Example-A's viewer.id
-              command: [example-host-bridge, profile, example-a, --, hermes, --profile, default]
-              wait_seconds: 90
+              a2a: example-a                       # Example-A's name under a2a_agents
+              wait_seconds: 120
 ```
 
-`command` must run Example-A's own `hermes` CLI in Example-A's profile and pass arguments through
-unchanged (for example `docker exec ...` or a host bridge). Never wrap it in `ssh` or `sh -c`. Give
-every agent a distinct `takeover.name`. Without this block `take_over` refuses and changes nothing.
+On the owner (`Example-A`), list who may take work over from it, by `takeover.name` and the peer
+name its A2A requests authenticate as (its `A2A_PEER_TOKENS` name):
+
+```yaml
+        takeover:
+          name: Example-A
+          allow:
+            - name: Example-B
+              a2a: example-b
+```
+
+Give every agent a distinct `takeover.name`. Without these blocks `take_over` refuses and changes
+nothing. The older `command` key is no longer read; an entry with only `command` is dropped.
+Keep `wait_seconds` above about 90: the owner waits up to 45 seconds for its stopped run to end.
 The full flow and its limits are in
 [Take over from another agent](../plugins/linear/README.md#take-over-from-another-agent).
 

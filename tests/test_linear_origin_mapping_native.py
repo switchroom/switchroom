@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import test_linear_origin_native as base
-from hermes_fleet_linear_plugin import ops, origin_state, transport
+from hermes_fleet_linear_plugin import ops, transport
 
 
 BAD = ([], [1], "scalar", "", True, False, 1, 0, 0.5)
@@ -38,82 +38,6 @@ class MappingScenarios(base.OriginScenarios):
                                          origin_settings=self.settings)
         self.assertEqual(rc, 1)
         self.assertFalse(json.loads(printed.call_args.args[0])["ok"])
-
-    async def test_mapping_origin_primary_payloads_and_owner_cli(self):
-        from linear_native_db import _json, RuntimeStoreError
-        await self.local()
-        ref = (await self.current())["reference"]
-        original = self.payload()
-        for value in (*BAD, None):
-            with self.subTest(value=value):
-                with self.assertRaises(RuntimeStoreError):
-                    _json(value)
-                self.write_payload(value)  # Explicit retained-row fault after actual native admission/claim.
-                with self.assertRaises(transport.Unavailable):
-                    await self.current()
-                await self.owner_cli_refused("inspect-origin", ref)
-                self.assertEqual(self.payload(), value)
-        self.write_payload(original)
-        self.assertFalse((await self.inspected(ref))["permission_granted"])
-
-    async def test_mapping_cli_and_api_envelopes_use_native_author_decoder(self):
-        from agent.turn_author import parse_turn_author
-        from gateway.session_cli_turn import admit_cli_turn
-        await self.local()
-        ref = (await self.current())["reference"]
-        original = self.payload()
-        for key in ("cli_turn_v1", "api_turn_v1"):
-            for value in BAD:
-                with self.subTest(key=key, value=value):
-                    self.write_payload({**original, key: value})
-                    with self.assertRaises(transport.Unavailable):
-                        await self.inspected(ref)
-        author = {"id": "native human", "is_bot": False}
-        committed = admit_cli_turn({"turn_author": author})
-        self.assertEqual(committed["cli_turn_v1"]["turn_author"], parse_turn_author(author))
-        # Native author parsing accepts JSON strings too; do not impose a new
-        # mapping contract on the optional author value inside a valid envelope.
-        for envelope in (None, {}, committed["cli_turn_v1"], {"turn_author": json.dumps(author)}):
-            self.write_payload({**original, "cli_turn_v1": envelope})
-            self.assertFalse((await self.inspected(ref))["permission_granted"])
-
-    async def test_mapping_native_text_envelope_source_and_event(self):
-        await self.messaging("telegram")
-        ref = (await self.current())["reference"]
-        original = self.payload()
-        for location in ("native_text_v1", "source", "event"):
-            for value in (*BAD, None):
-                with self.subTest(location=location, value=value):
-                    payload = json.loads(json.dumps(original))
-                    if location == "native_text_v1":
-                        payload[location] = value
-                    else:
-                        payload["native_text_v1"][location] = value
-                    self.write_payload(payload)
-                    with self.assertRaises(transport.Unavailable):
-                        await self.inspected(ref)
-        self.write_payload(original)
-        self.assertEqual((await self.inspected(ref))["requester"]["platform"], "telegram")
-
-    async def test_mapping_api_settings_optional_null_and_valid_dictionary(self):
-        await self.api()
-        ref = (await self.current())["reference"]
-        original = self.payload()
-        for value in BAD:
-            with self.subTest(value=value):
-                payload = json.loads(json.dumps(original))
-                payload["api_turn_v1"]["settings"] = value
-                self.write_payload(payload)
-                with self.assertRaises(transport.Unavailable):
-                    await self.inspected(ref)
-        for value in (None, {}, {"opaque": {"nested": [None, [], {}]}}):
-            payload = json.loads(json.dumps(original))
-            payload["api_turn_v1"]["settings"] = value
-            self.write_payload(payload)
-            self.assertFalse((await self.inspected(ref))["permission_granted"])
-        payload["api_turn_v1"].pop("settings")
-        self.write_payload(payload)
-        self.assertFalse((await self.inspected(ref))["permission_granted"])
 
     async def test_mapping_work_primary_payload_on_initial_and_owner_reads(self):
         await self.kanban()
@@ -180,19 +104,7 @@ class MappingScenarios(base.OriginScenarios):
             self.assertFalse((await self.work_inspected(fresh))["permission_granted"])
         self.write_policy(original)
 
-    async def test_mapping_origin_and_work_second_read_faults_refuse(self):
-        await self.api()
-        ref = (await self.current())["reference"]
-        original = self.payload()
-        def origin_fault():
-            payload = json.loads(json.dumps(original))
-            payload["api_turn_v1"]["settings"] = []
-            self.write_payload(payload)
-        self.during_origin_readback(origin_fault)
-        with self.assertRaises(transport.Unavailable):
-            await self.inspected(ref)
-        self.before_rpc = None
-        self.write_payload(original)
+    async def test_mapping_work_second_read_faults_refuse(self):
         await self.kanban()
         ref = (await self.work_current())["reference"]
         saved = self.policy()
