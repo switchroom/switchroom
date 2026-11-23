@@ -105,7 +105,8 @@ class CompletionScopeTests(unittest.TestCase):
                 # Even an otherwise accepted replacement contract cannot grant
                 # ownership of the original outcome to a different task scope.
                 from unittest.mock import patch
-                with patch.object(self.bridge, 'accepted_evidence', return_value=True):
+                from hermes_fleet_linear_plugin import bridge as bridge_module
+                with patch.object(bridge_module, 'pr_state', return_value=None):
                     self.complete()
                 self.assert_no_outcome_closeout()
                 self.assertEqual(self.task.status, 'done')
@@ -265,10 +266,11 @@ class CompletionScopeTests(unittest.TestCase):
         def narrow(*args, **kwargs):
             self.task.body = 'Only approve the hold; the human outcome is still incomplete.'
             self.event('specified', {'changed_fields': ['body']})
-            return True
+            return ""
         from hermes_fleet_linear_plugin.api import LinearError
+        from hermes_fleet_linear_plugin import bridge as bridge_module
         from unittest.mock import patch
-        with patch.object(self.bridge, 'accepted_evidence', side_effect=narrow), self.assertRaises(LinearError):
+        with patch.object(bridge_module, '_pr_lines', side_effect=narrow), self.assertRaises(LinearError):
             self.track(replace=True, reconcile_complete=True,
                        expected_revision=self.store.binding_revision(ISSUE), request_id=str(uuid.uuid4()))
         self.assert_no_outcome_closeout()

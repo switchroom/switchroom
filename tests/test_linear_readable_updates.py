@@ -11,8 +11,7 @@ from linear_fake_api import load_plugin
 plugin = load_plugin()
 from hermes_fleet_linear_plugin import bridge as bridge_module
 from hermes_fleet_linear_plugin.bridge import (HELD_NOTICE, TASK_BODY, _block_message, _done_body,
-                                               _followup_notice, _plain_notice, _project_summary,
-                                               acceptance_refusal)
+                                               _followup_notice, _plain_notice, _project_summary)
 
 # Words that belong in native Kanban history and logs, never in a Linear comment.
 INTERNAL = re.compile(r"(?i)\b(?:native|reconcil\w*|admission|admit\w*|executor|binding|completion contract|"
@@ -150,14 +149,6 @@ class PlainNoticeTests(unittest.TestCase):
                 self.assertIsNone(INTERNAL.search(text), text)
                 self.assertTrue(text.endswith("."))
         self.assertIn("passed", _followup_notice({"status": "running", "message": "Instruction saved on the existing native task."}))
-
-    def test_acceptance_refusal_on_linear_is_plain_and_keeps_the_cause(self):
-        for where in ("kanban", "chat"):
-            with self.subTest(where=where):
-                text = acceptance_refusal(["https://github.com/acme/app/pull/7: failure: required job build failed"], where=where)
-                self.assertIn("required job build failed", text)
-                self.assertIsNone(INTERNAL.search(text), text)
-                self.assertIn("open", text)
 
 
 class PlainBlockerTests(unittest.TestCase):
