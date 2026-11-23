@@ -1242,7 +1242,7 @@ def create_adapter(config, running):
                         if projected.source == "delegation":  # its staged task may run now
                             activity = projected.message_id if projected.message_id != projected.session_id else None
                             with bridge.api.requester_session(projected.session_id, activity_id=activity):
-                                bridge.release_staged(projected.issue_id)
+                                bridge.release_parked(projected.issue_id)
                         return anchor
                 anchor = await asyncio.to_thread(remember_input)
                 self._cache_input(projected.issue_id, projected.session_id, anchor)

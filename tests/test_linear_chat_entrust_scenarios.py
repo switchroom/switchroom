@@ -540,14 +540,14 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertTrue(reuse["ok"], reuse)
         self.assertEqual(reuse["native"]["task_id"], first["native"]["task_id"])
         task_id = first["native"]["task_id"]
-        self.assertEqual(self.history(task_id), ["created"])  # created ready: no park-then-activate step
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])  # parked until bound, then plain unblock
         self.assertEqual(self.board.get(task_id).idempotency_key, f"linear:{NEW_ISSUE}")
         self.flush()
         self.echo(NEW_ISSUE)
         self.echo(NEW_ISSUE)
         self.bridge.tick()
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id), ["created"])
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])
         delegates = [query for query in self.authority.mutations if "issueUpdate" in query]
         self.assertTrue(delegates)
         self.assertEqual(len([r for r in self.authority.activity_records if r["agentSessionId"] == "echo-session"]), 1)
@@ -655,7 +655,7 @@ class ChatEntrustScenarios(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.bridge.entrust(ISSUE, route=None)
         task_id = self.bridge.store.get(ISSUE)["task_id"]
-        self.assertEqual(self.board.get(task_id).status, "ready")  # created ready: nothing is left to admit
+        self.assertEqual(self.board.get(task_id).status, "ready")  # released right after binding, before the crash
         self.bridge.tick()
         self.assertEqual(self.bridge.entrust(ISSUE, route=None)["task_id"], task_id)
         self.assertEqual(self.board.get(task_id).status, "ready")

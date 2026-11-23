@@ -62,13 +62,13 @@ class StatusFollowsWorkScenarios(unittest.TestCase):
         return self.fixture.mutations()
 
     def admitted_by_delegation(self, *, turn):
-        """A person delegates the issue: our own admission creates one ready task that awaits its first claim."""
+        """A person delegates the issue: our own admission releases one task that awaits its first claim."""
         if turn:
             self.bridge.session_turn("issue-1", True)  # the Linear session turn starts as work_on routes it
         self.assertTrue(self.bridge.handle_webhook(self.fixture.human_assignment()))
         task = self.bridge.store.native_binding("issue-1")["task_id"]
         self.assertEqual(self.board.get(task).status, "ready")
-        self.assertEqual([e.kind for e in self.board.history(task, 0)], ["created"])
+        self.assertEqual([e.kind for e in self.board.history(task, 0)], ["created", "blocked", "unblocked"])
         return task
 
     def written_states(self):

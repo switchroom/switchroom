@@ -250,6 +250,21 @@ class FakeKanban:
         self.tasks[task_id].status = "ready"
         return True
 
+    def pristine_hold(self, task_id):
+        events = self.histories.get(task_id, [])
+        pristine = (self.tasks[task_id].status == "blocked" and len(events) == 1
+                    and (events[0].payload or {}).get("reason") == "initial_status")
+        return events[0].id if pristine else None
+
+    def resume_wait(self, task_id, expected_event_id):
+        """The bridge's release of its own creation's park (plain unblock of the newest event)."""
+        events = self.histories.setdefault(task_id, [])
+        if not events or events[-1].id != expected_event_id or self.tasks[task_id].status != "blocked":
+            return False
+        events.append(SimpleNamespace(id=expected_event_id + 1, kind="unblocked", created_at=0, payload=None))
+        self.tasks[task_id].status = "ready"
+        return True
+
     def retirement(self, task_id, prior=None):
         return prior or {"workers": [], "pending": [], "missing": False}
     def await_retirement(self, snapshot):

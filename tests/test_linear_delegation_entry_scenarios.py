@@ -261,7 +261,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         task_id = self.work_on()
         delivery = await self.ingest(self.delegation(), "delegated-after-chat")
         self.assertEqual(self.assert_one_owner(), task_id)
-        self.assertEqual(self.history(task_id), ["created"])
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])
         self.assertEqual(self.turns, [])  # answered as the same work; no model turn redoes it
         self.assertEqual(self.inbox_status(delivery), "imported")
         # The session Linear opened now reports the chat-started work: a thought, never a closing response.
