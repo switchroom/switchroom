@@ -505,6 +505,24 @@ class OwnerSafetyScenarios(TwoAgents):
             return json.loads(chat.handle(self.owner, {"action": "hand_off", "issue": "OPS-1", "to": "Nova",
                                                        "id": REQUEST, **args}, context or self.a2a_context))
 
+    def test_a_resume_that_wins_the_issue_lock_closes_a_late_pause_already_in_flight(self):
+        # The late original pause has passed every check that needs no lock when Nova's resume
+        # (same request id) takes the issue lock first and answers "isn't paused". The pause
+        # must then refuse: the closed-id check runs under the same lock as the resume.
+        original = self.owner.lock
+        @contextmanager
+        def resume_wins_first(issue_id):
+            self.owner.store.close_handoff(REQUEST)  # what the resume does under the lock
+            with original(issue_id):
+                yield
+        with patch.object(self.owner, "lock", resume_wins_first):
+            late = self.hand_off()
+        self.assertFalse(late["ok"], late)
+        self.assertIn("already answered", late["message"])
+        self.assertIn(self.owner_status(), RUNNABLE)
+        self.assertEqual(self.delegate(), OWNER)
+        self.assert_exclusive()
+
     def test_only_an_allowed_peer_over_a2a_can_pause_the_owner(self):
         for context, args in ((self.owner_context, {}),  # Atlas's own chat (or a Linear prompt) asking
                               (replace(self.a2a_context, user_id="vega"), {}),  # another A2A peer claiming Nova's name
