@@ -6,8 +6,10 @@ requests and reports native outcomes through a durable outbox. An issue, comment
 or reporting destination never grants execution permission.
 
 Reporting remains compatible with official Hermes `ff294849385e433dd40a993b4f07673abb95c6f5`.
-Automatic assignment admission additionally requires native block/unblock task-event guards
-and guarded-resume event receipts for response-loss reconciliation.
+Assignments, chat starts, Stop and wait resumes use only upstream Kanban calls
+(`create_task(idempotency_key=...)`, `block_task(expected_run_id=...)`, plain `unblock_task`),
+so a pure-upstream core starts work instead of parking it. The fork's guarded unblock is used
+only to lift the fork respawn guard's own PR park, which upstream never writes.
 No fork-specific invocation context, lifecycle controller, approval reservation or chat recovery
 API is required. The plugin is off in the bare image; the starter overlay
 (`examples/overlay-repo/`) turns it on when the agent's Linear token file is set.
@@ -23,7 +25,7 @@ API is required. The plugin is off in the bare image; the starter overlay
 | `followup` with `issue`, `body`, UUIDv4 `id` | Save an operator instruction on existing linked native work. A paused task keeps the note without resuming; completed work refuses delivery. The result says whether the instruction was saved. |
 | `delegate_self` with `issue`, UUIDv4 `id`, `expected_binding_revision`, `expected_delegate_id`, `expected_updated_at` | Route future Linear input to this app after coordinating existing native work. Requires an unfinished native task already linked to this executor. Preserves the human assignee and all native execution state. |
 | `create_issue` with UUIDv4 `id`, `title`, `project` and optional `team` | Create an undelegated issue; optional description/parent. `project` is a project id, exact name (any case) or URL slug; without it the parent's project (and team) is used, else, with `team`, the still-active project this app last filed a new issue into for that team (kept in the plugin store), else the team's only active project; the reply names the project used. A team's key or name passed as `project` is read as that team. Only when no default exists is the call refused as `project_required`. The tool schema states each action's required fields up front, so the first call succeeds. The project picks its team: with `team` omitted, or naming a team that does not own the project, the one active project of that name in any team this app can see is used and the reply says which team (`Project 'Fleet QA' is in team HF, not KEN`). Several matches (for example a same-named project in another team) are refused as `ambiguous_project` with `Team / Project` choices, and the reply tells the agent not to guess but to ask the user by team name with `clarify` (there is no per-agent home team to break the tie); no match is refused as `project_required` with the accessible teams and their projects (bounded); an unknown team key is refused as `unknown_team` with the accessible team keys. `project: "none"` (with a team) is the explicit opt-out. The team/project directory is one cached request (10 minutes; a miss refetches a directory older than a minute once). |
-| `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board through the same guarded admission a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
+| `create_issue` with `start_work: true` | For a longer outcome asked for in chat: also start one native task on this agent's creation board under the same one-owner rule a Linear assignment uses, queue this app as delegate (human assignee unchanged), let Linear status follow the work, and subscribe the asking chat to native notifications for checkpoints and the result. The task's worker does the work. |
 | `work_on` with `issue` | The same for an existing issue. A bound or linked task is reused and its chat subscription added; repeating the request never starts a second task. |
 | `take_over` with `issue`, UUIDv4 `id` | Take over an issue another agent is delegate for, in one step (see [Take over from another agent](#take-over-from-another-agent)). Asks the other agent over A2A to pause its work and stop being the delegate, then continues here as one task with this app as delegate, or changes nothing and says why. `work_on` refuses an issue delegated elsewhere and points here. |
 | `hand_off` with `issue`, `to`, UUIDv4 `id`, optional `resume` | The owner side of a takeover, called when a configured peer asks over A2A: pause this agent's task for the issue and stop being its delegate, or with `resume: true` lift exactly such a pause and become the delegate again. |
@@ -177,10 +179,9 @@ shown as a choice with its state; `status` still reads it) or on a search page t
 `update_description`, `delegate_self`) name the match (`issue_alias`) but need the exact key.
 Specialist scope never title-searches.
 
-On hosts with guarded native admission, a proven pristine create-and-park stage reports
-that preparation is awaiting admission without asking for human input. Reporting does not
-admit the task or promise it will start. Genuine subsequent blocks and unsupported legacy
-hosts retain their existing block/needs-input reporting.
+A proven pristine create-and-park stage (a `record_done` task until it is completed) reports
+without asking for human input. Reporting never starts the task. Genuine subsequent blocks
+retain their existing block/needs-input reporting.
 
 Use existing native Kanban tools, Desktop controls or CLI for task creation, explicit resume,
 cancellation and routing. Questions, short commands and bounded investigations work without
@@ -192,8 +193,8 @@ The agent finalizes the full native task scope before tracking and admitting cha
 work. Link the task that owns the agreed issue outcome with `completion_scope: outcome`
 (the default); use `progress` for preparation, a hold, or another internal stage. The agent
 manages this distinction without asking the user to maintain task IDs or activate reporting.
-A Linear delegation, automatic (creator-null) or made by a person, creates and admits a fully
-populated outcome task through that same guarded admission before any model turn; with no
+A Linear delegation, automatic (creator-null) or made by a person, creates a fully populated
+outcome task, ready, under the same one-owner rule before any model turn; with no
 prompt comment the issue title and description are the request. A person's delegation then
 also opens a native conversation that is told the work is already running as that task. An
 @mention opens only a conversation (see Native Agent Session conversations below).
@@ -298,7 +299,7 @@ can't complete after the owner may have paused, the owner stays paused and the u
 Linear issue are told so plainly; nothing resumes it automatically.
 
 1. The requester checks everything it could refuse later (issue open and fully read, its own
-   authorization, executor, board pin and guarded admission) before the owner is asked. While a
+   authorization, executor and board pin) before the owner is asked. While a
    task for the issue is ready or running here, the owner is never asked: a task from an earlier
    takeover from the same delegate means the takeover already happened, and any other local work
    refuses with the owner untouched. An issue with no agent delegate is not a takeover
@@ -335,10 +336,10 @@ Linear issue are told so plainly; nothing resumes it automatically.
    is refused; only the gateway's own A2A turns reach it.
 4. The requester starts only after the owner confirmed the handover AND a fresh Linear read shows
    the owner is no longer the delegate. It then creates its one native task (whose text says to
-   continue from the owner's progress in the Linear thread), admits it in the same call through
-   the same guarded chat admission as `work_on`, and queues this app as delegate. A person's
-   routing change after the owner was asked holds the start; the owner app's own handover steps
-   (moving the issue to Blocked, removing itself as delegate) do not.
+   continue from the owner's progress in the Linear thread), ready, under the same one-owner rule
+   as `work_on`, and queues this app as delegate. A person's routing change or a Stop after the
+   owner was asked refuses the start before anything is created; the owner app's own handover
+   steps (moving the issue to Blocked, removing itself as delegate) do not.
 5. Anything else once the owner may be paused (no answer in time, an answer that is not the
    tool's strict JSON, an owner that paused but is still the delegate in Linear, a start here that
    failed) leaves nothing running here and answers `takeover_paused`. The same words are posted
@@ -463,14 +464,17 @@ native mutations stay fenced. Restoring data needs no new activation marker or s
 Agents creating issue-related native work should preserve the explicit issue line and use
 the canonical retry key when available; the user does not supply these internal arguments.
 
-When no existing work is found, validated Linear assignments create a blocked native task, link it, then admit it using the
-native event guard. The user does not need a separate activation step. Activation retains
-the original creation token across retries; a newer Stop invalidates it. Native scheduling,
-capacity and dependencies decide when the admitted worker runs. A restart can finish an
-interrupted admission without creating a second task or refreshing a stopped task's token.
+Ownership is one rule keyed on `linear:<issue_id>`, the task's upstream idempotency key
+(`Bridge._one_owner`). When a task is bound for the issue, or an existing task carries that key,
+a new Agent Session (our own creator-less self-delegation echo, a redelivery, a person delegating
+again) is adopted onto it with a compare-and-set on the owner, or answered; it never gets a
+second task or a model turn redoing the work. Otherwise, after the admission checks (delegate,
+open issue, no newer Stop), one task is created ready with that key. The user does not need a
+separate activation step. Native scheduling, capacity and dependencies decide when the worker
+runs. A lost creation reply is reconciled by that key, never by creating again. A Stop recorded
+while the task was being created is applied to it as soon as it is bound.
 
-Older native hosts without those guards keep new assignments blocked and explain the missing
-capability. Previously parked or legacy work is never automatically adopted on upgrade.
+Previously parked or legacy work is never automatically adopted on upgrade.
 Explicit chat work/takeover uses native controls after inspection; linking reporting alone
 never starts, stops or transfers a worker. Use `status`'s verified `native.local.profile` when
 creating local native work rather than guessing from an agent's display name.
@@ -582,8 +586,8 @@ it to `needs_input` with `requested_kind: dependency`) shows as "Waiting for a d
 on LIFE-646" when its reason names Linear issue keys or carries one `Delivery gate: <plugin>/<file>
 contains <text>` line (`waits.py`), never as "Waiting on you". Every five minutes the plugin reads
 the named issues (read-only) and checks the gate against the mounted plugin files; once every issue
-is Done or Canceled and every gate holds it makes one guarded core unblock of exactly that block,
-decided once per block. A newer event on the task, an unreadable issue or a dependency block naming
+is Done or Canceled and every gate holds it makes one plain core unblock while that block is still
+the newest event (a Stop that lands in between is blocked again), decided once per block. A newer event on the task, an unreadable issue or a dependency block naming
 nothing checkable leaves it blocked. A delegate write held as uncertain is settled as applied when a
 fresh read of the issue shows the delegate it intended (the operator's `resolve ... applied`, with
 that readback as evidence).
@@ -594,7 +598,7 @@ shows it In Review, "Waiting for CI on ...". The parked task holds no worker and
 call. Every two minutes the plugin reads the PR head, the exact-head Actions runs and the commit
 statuses over `gh api repos/...` (so per-owner token routing applies), and once all of them have
 finished or the window has passed it writes a native `CI verdict: passed | failed | timed out`
-comment with one line per run, then makes one guarded unblock bound to that comment being the only
+comment with one line per run, then makes one plain unblock while that comment is the only
 event since the block. A Stop or answer that lands first wins, and the comment stays as
 information. A repeated park on the same task lands in triage through core's block-loop breaker;
 it carries the same wait and resumes the same way, up to 20 CI parks per task.
@@ -691,8 +695,8 @@ Explicit native checkpoints have a stable source request ID; their Linear writes
 outbox UUID and reconcile ambiguous delivery by exact readback. Legacy outbox comments remain
 reconcilable without replay. Marker text is provenance, never authorization. Guarded
 native controls reject stale observations. The integration does not interpret arbitrary
-tracker prose as permission to resume stopped work. Linear Stop uses guarded native controls
-when source ordering is verifiable, including initial queued work; conflicting controls remain
+tracker prose as permission to resume stopped work. Linear Stop uses upstream's plain block,
+fenced on the current run, when source ordering is verifiable, including initial queued work; conflicting controls remain
 visible for native reconciliation. A blocked task or Stop acknowledgement is
 not proof that an external process or effect ended; inspect native process/effect state.
 

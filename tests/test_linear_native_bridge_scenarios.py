@@ -79,16 +79,10 @@ class NativeBridgeScenarios(unittest.TestCase):
                 "agentSession": {"id": SESSION, "issue": {"id": ISSUE}, "creatorId": USER},
                 "agentActivity": activity}
 
-    def create(self, *, activate=True):
+    def create(self):
         self.bridge.handle_webhook(self.event())
         task_id = self.store.get(ISSUE)["task_id"]
-        status = self.board.get(task_id).status
-        self.assertEqual(status, "ready" if self.board.guarded_controls else "blocked")
-        if activate and status == "blocked":
-            # Backend fixture uses the actual native operator path. This is not a
-            # fabricated human transport event or an integration execution grant.
-            with self.board.conn() as conn:
-                self.assertTrue(kb.unblock_task(conn, task_id))
+        self.assertEqual(self.board.get(task_id).status, "ready")  # created ready under the one-owner rule
         return task_id
 
     def comments(self, task_id):
@@ -119,7 +113,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         self.bridge.handle_webhook(event)
         task_id = self.store.get(ISSUE)["task_id"]
         before = self.board.get(task_id)
-        self.assertEqual(before.status, "ready" if self.board.guarded_controls else "blocked")
+        self.assertEqual(before.status, "ready")
         self.assertIsNone(before.current_run_id)
         self.bridge.handle_webhook(event)
         self.bridge.track(ISSUE, task_id)
@@ -467,7 +461,7 @@ class NativeBridgeScenarios(unittest.TestCase):
         held = self.store.native_intent(f"unbound-stop:{ISSUE}")
         self.assertEqual(held["state"], "reconcile")
         bodies = [row["payload"].get("content", {}).get("body", "") for row in self.store.pending()]
-        self.assertTrue(any("while the task was being set up" in body for body in bodies))
+        self.assertTrue(any("while the task was still being set up" in body for body in bodies))  # the Stop's notice
         self.assertFalse(any("worker stopped" in body for body in bodies))
 
     def test_native_stop_is_once_and_stale_stop_after_native_resume_is_held(self):

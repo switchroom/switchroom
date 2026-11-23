@@ -68,7 +68,7 @@ def work_on_reply(created: bool = True) -> str:
     from hermes_fleet_linear_plugin import chat
     native = {"status": "ready", "created_from_chat": created, "admitted": True, "task_id": "t_0a1b2c3d"}
     result = {"native": native, "routing": "queued"}
-    return chat._reply(not native.get("not_started_reason"), chat._entrust_message(result),
+    return chat._reply(True, chat._entrust_message(result),
                        issue={"id": "issue-1", "identifier": "QA-9", "url": "https://linear.app/x/issue/QA-9"},
                        **result)
 

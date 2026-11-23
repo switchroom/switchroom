@@ -234,7 +234,7 @@ class DelegateRoutingScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task.id).status, "blocked")
         self.assertEqual(self.bridge.store.native_binding("issue-1"), before_binding)
         self.assertIsNone(self.bridge.store.native_intent("create:issue-1"))
-        self.assertIsNone(self.bridge.store.native_intent("activate:issue-1:" + task.id))
+        self.assertNotIn("unblocked", [event.kind for event in self.board.history(task.id, 0)])
 
     def test_running_native_run_and_claim_survive_then_followup_uses_same_task(self):
         task = self.link(status="running")

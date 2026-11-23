@@ -1,4 +1,8 @@
-"""Real native guarded admission; no fabricated client or approval context."""
+"""Real native admission under the one-owner rule; no fabricated client or approval context.
+
+An assignment creates its one task ready with the ``linear:<issue_id>`` idempotency key after
+the admission checks; Stop is upstream's plain block. Nothing here needs the fork's guarded
+block/unblock controls."""
 from __future__ import annotations
 
 import os
@@ -18,8 +22,6 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.board, self.bridge, self.store = self.fixture.board, self.fixture.bridge, self.fixture.store
-        if not self.board.guarded_controls:
-            self.skipTest("native host predates guarded task controls")
 
     def assign(self):
         self.bridge.handle_webhook(self.fixture.event())
@@ -54,10 +56,8 @@ class GuardedAdmissionScenarios(unittest.TestCase):
     def test_preparation_reporting_does_not_mask_later_operator_stop(self):
         task_id = self.prepared_chat_task()
         self.bridge.pump_kanban()
-        token = self.board.history(task_id, 0)[-1].id
         with self.board.conn() as conn:
-            self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="operator Stop",
-                                                    kind="needs_input", expected_event_id=token))
+            self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="operator Stop", kind="needs_input"))
         self.bridge.pump_kanban()
         self.assertTrue(any(content["type"] == "elicitation" and "operator Stop" in content["body"]
                             for content in self.pending_contents()))
@@ -81,14 +81,28 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertTrue(any(content["type"] == "elicitation" for content in self.pending_contents()))
         self.assertEqual(self.board.get(task.id).status, "blocked")
 
-    def test_legacy_native_host_keeps_parked_block_reporting(self):
-        from unittest.mock import PropertyMock
-        task_id = self.prepared_chat_task()
-        with patch.object(type(self.board), "guarded_controls", new_callable=PropertyMock, return_value=False):
-            self.bridge.pump_kanban()
-        self.assertTrue(any(content["type"] == "elicitation" for content in self.pending_contents()))
+    def test_pure_upstream_controls_start_and_stop_an_assignment(self):
+        """With only upstream's control keywords (no fork event guards), work starts instead of parking."""
+        kb, fork_only = self.board.kb, {"expected_event_id", "request_id", "count_recurrence", "source",
+                                         "notify_target", "transient_hold"}
+        def upstream(name):
+            original = getattr(kb, name)
+            def call(conn, *args, **kwargs):
+                self.assertFalse(fork_only & set(kwargs), (name, kwargs))
+                return original(conn, *args, **kwargs)
+            return patch.object(kb, name, call)
+        stamp = time.time()
+        with upstream("create_task"), upstream("block_task"), upstream("unblock_task"):
+            self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
+            task_id = self.store.get(scenarios.ISSUE)["task_id"]
+            self.assertEqual(self.board.get(task_id).status, "ready")
+            self.assertEqual(self.board.get(task_id).idempotency_key, f"linear:{scenarios.ISSUE}")
+            self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
+            self.assertEqual(len(self.fixture.tasks()), 1)
+            self.assertTrue(self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 0.01)))
+            self.assertEqual(self.board.get(task_id).status, "blocked")
+            self.bridge.tick()
         self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertFalse(any(event.kind == "unblocked" for event in self.board.history(task_id, 0)))
 
     def test_delayed_preparation_event_does_not_replace_actual_running_progress(self):
         task_id = self.prepared_chat_task()
@@ -105,9 +119,9 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task_id).status, "ready")
         self.bridge.handle_webhook(self.fixture.event())
         self.assertEqual(len(self.fixture.tasks()), 1)
-        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 1)
+        self.assertEqual([event.kind for event in self.board.history(task_id, 0)], ["created"])
 
-    def test_assignment_activation_preserves_outcome_snapshot_through_native_completion(self):
+    def test_assignment_creation_preserves_outcome_snapshot_through_native_completion(self):
         import copy
         task_id = self.assign()
         before = self.board.get(task_id)
@@ -115,7 +129,7 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         binding = copy.deepcopy(self.store.native_binding(scenarios.ISSUE))
         self.assertEqual(binding["completion_scope"]["mode"], "outcome")
         self.assertFalse(any(event.kind == "specified" for event in self.board.history(task_id, 0)))
-        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 1)
+        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 0)
         with self.board.conn() as conn:
             self.assertTrue(scenarios.kb.complete_task(conn, task_id,
                 result="Verified the assigned outcome and retained the final deliverable."))
@@ -129,7 +143,7 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertTrue(any(row["kind"] == "project_update" for row in self.store.pending()))
         self.assertEqual(len(self.fixture.tasks()), 1)
 
-    def test_stop_during_creation_invalidates_initial_admission(self):
+    def test_stop_during_creation_is_never_undone(self):
         create = self.board.create
         def stopped(**fields):
             task = create(**fields)
@@ -141,56 +155,59 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.assertFalse(any(event.kind == "unblocked" for event in self.board.history(task_id, 0)))
 
-    def test_stop_between_inspection_and_activation_wins(self):
-        activate = self.board.activate
-        def stopped(task_id, expected_event_id, **kwargs):
-            with self.board.conn() as conn:
-                self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="operator Stop", kind="needs_input",
-                                                        expected_event_id=expected_event_id))
-            return activate(task_id, expected_event_id, **kwargs)
-        with patch.object(self.board, "activate", side_effect=stopped):
-            task_id = self.assign()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.fixture.make_bridge().recover()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-
-    def test_restart_finishes_admission_after_binding_without_second_task(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=ConnectionError("crash after binding")):
-            with self.assertRaises(ConnectionError):
-                self.bridge.handle_webhook(self.fixture.event())
+    def test_linear_stop_recorded_while_the_task_is_created_wins(self):
+        stopper, create, stamp = self.fixture.make_bridge(), self.board.create, time.time()
+        def stopped_meanwhile(**fields):
+            # Another service instance takes the Stop before this binding commits: it is recorded unbound.
+            stopper.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 0.01))
+            return create(**fields)
+        with patch.object(self.board, "create", side_effect=stopped_meanwhile):
+            self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
         task_id = self.store.get(scenarios.ISSUE)["task_id"]
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.fixture.make_bridge().recover()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+        self.assertEqual(len(self.fixture.tasks()), 1)
+
+    def test_crash_after_binding_leaves_one_ready_task(self):
+        with patch.object(self.board, "subscribe", side_effect=ConnectionError("crash after binding")):
+            with self.assertRaises(ConnectionError):
+                self.bridge.handle_webhook(self.fixture.event())
+        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        restarted = self.fixture.make_bridge()
+        restarted.recover()
+        restarted.handle_webhook(self.fixture.event())
         self.assertEqual(self.board.get(task_id).status, "ready")
         self.assertEqual(len(self.fixture.tasks()), 1)
 
-    def test_lost_activation_reply_reconciles_same_cas_without_second_transition(self):
-        activate = self.board.activate
-        def lost(task_id, expected_event_id, **kwargs):
-            self.assertTrue(activate(task_id, expected_event_id, **kwargs))
-            raise ConnectionError("lost native activation reply")
-        with patch.object(self.board, "activate", side_effect=lost):
+    def lost_creation_reply(self):
+        create = self.board.create
+        def lost(**fields):
+            create(**fields)
+            raise ConnectionError("lost native creation reply")
+        with patch.object(self.board, "create", side_effect=lost):
             with self.assertRaises(ConnectionError):
                 self.bridge.handle_webhook(self.fixture.event())
-        task_id = self.store.get(scenarios.ISSUE)["task_id"]
-        self.fixture.make_bridge().recover()
-        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 1)
+        (task_id,) = [row["id"] for row in self.fixture.tasks()]
+        self.assertIsNone(self.store.get(scenarios.ISSUE))
+        return task_id
+
+    def test_lost_creation_reply_is_reconciled_by_its_key_without_a_second_task(self):
+        task_id = self.lost_creation_reply()
+        self.fixture.make_bridge().handle_webhook(self.fixture.event())  # the provider redelivers
+        self.assertEqual(self.store.get(scenarios.ISSUE)["task_id"], task_id)
+        self.assertEqual([event.kind for event in self.board.history(task_id, 0)], ["created"])
         self.assertEqual(len(self.fixture.tasks()), 1)
 
-    def test_newer_stop_after_lost_activation_reply_is_never_refreshed_away(self):
-        activate = self.board.activate
-        def lost(task_id, expected_event_id, **kwargs):
-            self.assertTrue(activate(task_id, expected_event_id, **kwargs))
-            raise ConnectionError("lost native activation reply")
-        with patch.object(self.board, "activate", side_effect=lost):
-            with self.assertRaises(ConnectionError):
-                self.bridge.handle_webhook(self.fixture.event())
-        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+    def test_newer_stop_after_lost_creation_reply_is_never_undone(self):
+        task_id = self.lost_creation_reply()
         with self.board.conn() as conn:
             self.assertTrue(scenarios.kb.block_task(conn, task_id, reason="newer Stop", kind="needs_input"))
+        self.fixture.make_bridge().handle_webhook(self.fixture.event())
         self.fixture.make_bridge().recover()
         self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 1)
+        self.assertEqual(sum(event.kind == "unblocked" for event in self.board.history(task_id, 0)), 0)
 
     def test_linking_existing_parked_task_does_not_activate_it_on_upgrade(self):
         task = self.board.create(title="Previously parked", initial_status="blocked")
@@ -227,7 +244,7 @@ class GuardedAdmissionScenarios(unittest.TestCase):
     def test_no_row_stop_is_carried_into_a_concurrently_committed_native_binding(self):
         stopper = self.fixture.make_bridge()
         saw_none, continue_stop, stop_done = threading.Event(), threading.Event(), threading.Event()
-        get, activate = stopper.store.get, self.board.activate
+        get, subscribe = stopper.store.get, self.board.subscribe
         def snapshot(issue_id):
             row = get(issue_id)
             if threading.current_thread().name.startswith("stop") and not saw_none.is_set():
@@ -235,17 +252,17 @@ class GuardedAdmissionScenarios(unittest.TestCase):
                 saw_none.set()
                 self.assertTrue(continue_stop.wait(5))
             return row
-        def after_stop(task_id, token, **kwargs):
+        def after_stop(*args, **kwargs):  # the binding has committed; the Stop now reads it
             continue_stop.set()
             self.assertTrue(stop_done.wait(5))
-            return activate(task_id, token, **kwargs)
+            return subscribe(*args, **kwargs)
         stamp = time.time()
         def stop():
             try:
                 stopper.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=stamp + 0.01))
             finally:
                 stop_done.set()
-        with patch.object(stopper.store, "get", side_effect=snapshot), patch.object(self.board, "activate", side_effect=after_stop):
+        with patch.object(stopper.store, "get", side_effect=snapshot), patch.object(self.board, "subscribe", side_effect=after_stop):
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stop") as pool:
                 request = pool.submit(stop)
                 self.assertTrue(saw_none.wait(5))
@@ -269,19 +286,19 @@ class GuardedAdmissionScenarios(unittest.TestCase):
             restarted.recover()
             self.assertEqual(pump.call_count, 1)
 
-    def test_lost_activation_receipt_still_accepts_current_same_second_stop(self):
+    def test_lost_creation_reply_still_accepts_current_same_second_stop(self):
         now = int(time.time()) + 0.1
-        activate = self.board.activate
-        def lost(task_id, token, **kwargs):
-            self.assertTrue(activate(task_id, token, **kwargs))
+        create = self.board.create
+        def lost(**fields):
+            create(**fields)
             raise ConnectionError("lost successful native response")
-        with patch("time.time", return_value=now), patch.object(self.board, "activate", side_effect=lost):
+        with patch("time.time", return_value=now), patch.object(self.board, "create", side_effect=lost):
             with self.assertRaises(ConnectionError):
                 self.bridge.handle_webhook(self.fixture.event(stamp=now))
-        task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        (task_id,) = [row["id"] for row in self.fixture.tasks()]
         with patch("time.time", return_value=now):
-            self.fixture.make_bridge().recover()
-            self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=now + 0.1))
+            self.bridge.handle_webhook(self.fixture.event("prompted", signal="stop", stamp=now + 0.1))  # still unbound
+            self.fixture.make_bridge().handle_webhook(self.fixture.event(stamp=now))  # the redelivery binds it
         self.assertEqual(self.board.get(task_id).status, "blocked")
 
     def test_same_second_linear_followup_reaches_existing_native_run(self):
@@ -309,17 +326,18 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertEqual(self.board.get(task_id).status, "ready")
         self.assertEqual(len(self.fixture.tasks()), 1)
 
-    def test_transient_binding_failure_retries_in_existing_service_loop(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=ConnectionError("crash after binding")):
-            with self.assertRaises(ConnectionError):
-                self.bridge.handle_webhook(self.fixture.event())
+    def test_transient_failure_carrying_a_recorded_stop_retries_in_existing_service_loop(self):
+        stamp = time.time()
+        self.bridge.handle_webhook(self.fixture.event(stamp=stamp))
         task_id = self.store.get(scenarios.ISSUE)["task_id"]
+        self.store.record_unbound_stop(scenarios.ISSUE, (stamp + 0.01) * 1000, session_id=scenarios.SESSION,
+                                       activity_id=scenarios.ACTIVITY, actor=scenarios.USER)
         restarted = self.fixture.make_bridge()
-        with patch.object(restarted, "_assignment_activation", side_effect=scenarios.LinearError("temporary read outage")):
+        with patch.object(restarted, "_pending_assignment_stop", side_effect=scenarios.LinearError("temporary read outage")):
             restarted.recover()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        restarted.tick()
         self.assertEqual(self.board.get(task_id).status, "ready")
+        restarted.tick()
+        self.assertEqual(self.board.get(task_id).status, "blocked")
 
     def test_lost_stop_response_cannot_cancel_a_later_native_resume_on_retry(self):
         stamp = time.time()
@@ -420,7 +438,7 @@ class GuardedAdmissionScenarios(unittest.TestCase):
         self.assertTrue(self.fixture.make_bridge().handle_webhook(event))
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.assertTrue(self.fixture.make_bridge().handle_webhook(event))
-        self.assertEqual(sum(event.kind == "blocked" for event in self.board.history(task_id, 0)), 3)
+        self.assertEqual(sum(event.kind == "blocked" for event in self.board.history(task_id, 0)), 2)  # pause, Stop
 
     def test_unverified_stop_recorded_by_input_seam_is_retried(self):
         stamp = int(time.time()) - 20 + 0.1

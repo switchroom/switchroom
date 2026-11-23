@@ -725,9 +725,7 @@ def _entrust(bridge: Any, issue: dict, record: dict | None, context: Any, *, tak
         return _route_to_self(bridge, current, {"status": status}, context, recorded_done=bool(record),
                               replace_delegate=takeover_from)
     native = bridge.entrust(issue["id"], route=None if record else _origin_route(context), record_done=record,
-                            route_delegate=route, **({"takeover_from": takeover_from, "note": note,
-                                                      "handed_over": takeover_from if proven_ms is not None else None,
-                                                      "proven_ms": proven_ms}
+                            route_delegate=route, **({"takeover_from": takeover_from, "note": note, "proven_ms": proven_ms}
                                                      if takeover_from else {}))
     return {"native": native, "routing": native.pop("routing", "held: routing was not checked")}
 
@@ -758,9 +756,6 @@ def _entrust_message(result: dict) -> str:
                 "once its evidence is verified. Nothing was started or re-run.")
     if native["status"] in ("done", "archived"):
         return "This issue's work has already finished, so nothing new was started."
-    if native.get("not_started_reason"):
-        return (f"Not started: {native['not_started_reason']}. The task is linked to the issue but parked, "
-                "and nothing is doing this work yet; an operator should check it before it is retried.")
     if not native.get("created_from_chat"):
         return ("This issue already has work on this agent's board, so nothing new was started; "
                 "its updates now also come back to this chat.")
@@ -805,8 +800,7 @@ def _take_over(bridge: Any, args: dict, context: Any, issue: dict) -> str:
     if owner_id == bridge.api.viewer_id():
         # Already this agent's: exactly work_on, which reuses existing work and never starts a second task.
         result = _entrust(bridge, issue, None, context)
-        return _reply(not result["native"].get("not_started_reason"),
-                      "This agent is already the delegate. " + _entrust_message(result), issue=_issue_ref(issue), **result)
+        return _reply(True, "This agent is already the delegate. " + _entrust_message(result), issue=_issue_ref(issue), **result)
     peer, name = _takeover_peer(bridge, owner_id)
     owner = (peer or {}).get("name") or (issue.get("delegate") or {}).get("name") or "the other agent"
     if peer is None:
@@ -833,9 +827,6 @@ def _take_over_free(bridge: Any, context: Any, issue: dict, key: str, request_id
     issue_id = issue["id"]
     # Everything this side could refuse after the owner pauses is refused before it is asked.
     _entrust_board_pin(bridge, context)
-    if not getattr(bridge.kanban, "guarded_controls", False):
-        return _reply(False, "This agent's version can't start handed-over work safely, so nothing was changed and "
-                      f"{owner} keeps working on it.", code="takeover_refused", issue=_issue_ref(issue))
     verdict, problem = bridge.takeover_preflight(issue_id, takeover_from=owner_id)
     if verdict == "already_here":
         diag.evt("chat.entrust", "skipped", "takeover_already_here", iss=issue_id)
@@ -901,8 +892,7 @@ def _take_over_free(bridge: Any, context: Any, issue: dict, key: str, request_id
             result = _entrust(bridge, fresh, None, context, takeover_from=owner_id,
                               note=TAKEOVER_NOTE.format(owner=owner), proven_ms=asked_ms)
             native = result["native"]
-            failure = native.get("not_started_reason") or ""
-            if not failure and native.get("status") not in ("ready", "running"):
+            if native.get("status") not in ("ready", "running"):
                 failure = _local_work_problem(native.get("status"))
         except (LinearError, transport.Unavailable, ValueError) as exc:
             failure = str(exc).rstrip(".")
@@ -1084,7 +1074,7 @@ def _plan(bridge: Any, args: dict, action: str, context: Any) -> str:
                           code="authorization_unavailable", issue=created)
         # The readback carries no issue version; routing needs the current one.
         result = _entrust(bridge, bridge.api.issue(created["id"]), record, context)
-        return _reply(not result["native"].get("not_started_reason"), note + "Created the issue. " + _entrust_message(result) + _stored_differently(created)
+        return _reply(True, note + "Created the issue. " + _entrust_message(result) + _stored_differently(created)
                       + _formatting_tip(args.get("description")), issue=created, **result)
     if action == "create_project":
         client_id, name, team = _uuid(args.get("id")), _text(args, "name"), _text(args, "team")
@@ -1286,7 +1276,7 @@ def _issue_action(bridge: Any, args: dict[str, Any], action: str, context: Any, 
         if action == "work_on":
             _, record = _entrust_request(args, action, context)
             result = _entrust(bridge, issue, record, context)
-            return _reply(not result["native"].get("not_started_reason"), _entrust_message(result), issue=_issue_ref(issue), **result)
+            return _reply(True, _entrust_message(result), issue=_issue_ref(issue), **result)
         if action == "delegate_self":
             if context.delegated_child:
                 return _reply(False, "Return routing changes to the parent agent.", code="native_scope_refused")

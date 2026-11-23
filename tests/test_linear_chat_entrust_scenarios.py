@@ -121,8 +121,6 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.addCleanup(self.env.stop)
         self.authority = ChatAuthority()
         self.board = Kanban(profile="default", profile_home=self.home)
-        if not self.board.guarded_controls:
-            self.skipTest("native host predates guarded admission")
         self.bridge = Bridge(Store(self.home / "linear.db"), self.authority.api(scope=None), self.board, profile="default")
         self.bridge.profile_home = self.home
         self.context = NativeContext(home=str(self.home), profile="default", platform="telegram", source="telegram",
@@ -542,14 +540,14 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertTrue(reuse["ok"], reuse)
         self.assertEqual(reuse["native"]["task_id"], first["native"]["task_id"])
         task_id = first["native"]["task_id"]
-        events = self.history(task_id)
-        self.assertEqual(events.count("unblocked"), 1)  # one admission
+        self.assertEqual(self.history(task_id), ["created"])  # created ready: no park-then-activate step
+        self.assertEqual(self.board.get(task_id).idempotency_key, f"linear:{NEW_ISSUE}")
         self.flush()
         self.echo(NEW_ISSUE)
         self.echo(NEW_ISSUE)
         self.bridge.tick()
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        self.assertEqual(self.history(task_id), ["created"])
         delegates = [query for query in self.authority.mutations if "issueUpdate" in query]
         self.assertTrue(delegates)
         self.assertEqual(len([r for r in self.authority.activity_records if r["agentSessionId"] == "echo-session"]), 1)
@@ -652,16 +650,16 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertFalse(self.ask({"action": "work_on", "issue": ISSUE}, child)["ok"])
         self.assertEqual(self.tasks(), [])
 
-    def test_crash_after_create_resumes_admission_without_a_second_task(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+    def test_crash_after_create_leaves_one_ready_task_and_a_repeat_reuses_it(self):
+        with patch.object(Kanban, "subscribe", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.bridge.entrust(ISSUE, route=None)
         task_id = self.bridge.store.get(ISSUE)["task_id"]
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.bridge.tick()  # the existing recovery path finishes the chat admission
+        self.assertEqual(self.board.get(task_id).status, "ready")  # created ready: nothing is left to admit
+        self.bridge.tick()
+        self.assertEqual(self.bridge.entrust(ISSUE, route=None)["task_id"], task_id)
         self.assertEqual(self.board.get(task_id).status, "ready")
         self.assertEqual(self.tasks(), [task_id])
-
     def test_record_done_crash_before_completion_never_runs_on_recovery(self):
         record = {"summary": "Proxy rolled out and checked live.", "evidence": ["https://ci.example/run/42"]}
         with patch.object(self.bridge, "_record_done", side_effect=RuntimeError("crash")):
@@ -687,32 +685,27 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertEqual(self.tasks(), [task_id])
 
     def test_record_done_crash_mid_completion_never_runs_on_recovery(self):
-        # The crash lands after creation and binding, inside record_done before the activation fence.
-        original = self.bridge.store.native_intent_prepare
-
-        def crash(key, request):
-            if key.startswith("activate:"):
-                raise RuntimeError("crash")
-            return original(key, request)
-        with patch.object(self.bridge.store, "native_intent_prepare", side_effect=crash):
+        # The crash lands after creation and binding, inside record_done before the completion.
+        with patch.object(Kanban, "complete_recorded", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.bridge.entrust(ISSUE, route=None, record_done={"summary": "Done.", "evidence": []})
         task_id = self.bridge.store.get(ISSUE)["task_id"]
         self.bridge.tick()
         self.assertEqual(self.board.get(task_id).status, "blocked")
         self.assertNotIn("unblocked", self.history(task_id))
-
-    def test_recovery_of_chat_admission_respects_a_later_delegation_elsewhere(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+    def test_crashed_chat_start_respects_a_later_delegation_elsewhere(self):
+        with patch.object(Kanban, "subscribe", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.bridge.entrust(ISSUE, route=None)
         task_id = self.bridge.store.get(ISSUE)["task_id"]
-        self.authority.issues[ISSUE]["delegate"] = {"id": str(uuid.UUID(int=0x99, version=4))}
+        other = {"id": str(uuid.UUID(int=0x99, version=4))}
+        self.authority.issues[ISSUE]["delegate"] = other
         self.authority.issues[ISSUE]["updatedAt"] = now_iso()
-        self.bridge.tick()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertNotIn("unblocked", self.history(task_id))
-
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertEqual(self.authority.issues[ISSUE]["delegate"], other)  # never routed over it
+        self.assertFalse(self.ask({"action": "work_on", "issue": ISSUE})["ok"])
+        self.assertEqual(self.tasks(), [task_id])
     def test_work_on_an_issue_delegated_elsewhere_creates_nothing_and_says_so(self):
         other = str(uuid.UUID(int=0x99, version=4))
         self.authority.issues[ISSUE]["delegate"] = {"id": other}
@@ -734,39 +727,45 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.flush()
         tasks = self.tasks()
         self.assertEqual(len(tasks), 1)
-        self.assertIn("unblocked", self.history(tasks[0]))
+        self.assertEqual(self.board.get(tasks[0]).status, "ready")
         answers = [r["content"].get("body") or "" for r in self.authority.activity_records
                    if r["agentSessionId"] == "later-session"]
         self.assertFalse(any("waiting to start" in body for body in answers), answers)
 
-    def test_superseded_admission_reports_not_started_instead_of_started(self):
-        # A Stop newer than the chat request supersedes admission: the task is parked, not run.
+    def test_a_newer_stop_refuses_the_chat_start_and_creates_nothing(self):
+        # A Stop newer than the chat request refuses the start before anything is created.
         self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
                                               activity_id="stop-1", actor=USER)
         reply = self.ask({"action": "work_on", "issue": ISSUE})
         self.assertFalse(reply["ok"], reply)
-        self.assertTrue(reply["native"]["created_from_chat"])
-        self.assertFalse(reply["native"]["admitted"])
-        self.assertTrue(reply["message"].startswith("Not started:"), reply["message"])
-        self.assertIn("someone stopped it in Linear", reply["message"])
+        self.assertTrue(reply["message"].startswith("Not started: someone stopped it in Linear"), reply["message"])
         self.assertNotIn("Do not also do this work here", reply["message"])
-        task_id = reply["native"]["task_id"]
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertNotIn("unblocked", self.history(task_id))
-        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertEqual(self.tasks(), [])
+        again = self.ask({"action": "work_on", "issue": ISSUE})  # a repeat is refused the same way
         self.assertFalse(again["ok"], again)
-        self.assertTrue(again["message"].startswith("Not started:"), again["message"])
-        self.assertEqual(self.tasks(), [task_id])
-
-    def test_unavailable_guarded_controls_report_not_started(self):
-        with patch.object(Kanban, "guarded_controls", False, create=True):
-            reply = self.ask({"action": "work_on", "issue": ISSUE})
-        self.assertFalse(reply["ok"], reply)
-        self.assertFalse(reply["native"]["admitted"])
-        self.assertIn("can't start work safely", reply["message"])
-        self.assertNotIn("unblocked", self.history(reply["native"]["task_id"]))
-
-    # -- reviewer follow-ups ------------------------------------------------
+        self.assertIn("someone stopped it in Linear", again["message"])
+        self.assertEqual(self.tasks(), [])
+        self.assertIsNone(self.bridge.store.get(ISSUE))
+    def test_pure_upstream_controls_start_chat_work(self):
+        """Without the fork's guarded Kanban keywords, chat work starts ready instead of parking."""
+        fork_only = {"expected_event_id", "request_id", "count_recurrence", "source", "notify_target", "transient_hold"}
+        patches = []
+        for name in ("create_task", "block_task", "unblock_task"):
+            original = getattr(kb, name)
+            def call(conn, *args, _original=original, _name=name, **kwargs):
+                self.assertFalse(fork_only & set(kwargs), (_name, kwargs))
+                return _original(conn, *args, **kwargs)
+            patches.append(patch.object(kb, name, call))
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        reply = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["native"]["admitted"])
+        self.assertEqual(self.board.get(reply["native"]["task_id"]).status, "ready")
+        self.claim(reply["native"]["task_id"])
+        self.assertTrue(self.stop(ISSUE))
+        self.assertEqual(self.board.get(reply["native"]["task_id"]).status, "blocked")
     def test_adopted_board_task_with_a_different_definition_of_done_is_declined(self):
         issue = self.authority.issues[ISSUE]
         self.bridge.contracts = {PROJECT: "https://github.com/example/fleet"}
@@ -910,11 +909,11 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.bridge.tick()
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
 
-    def test_recovered_admission_still_yields_to_a_later_reassignment(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+    def test_crash_before_routing_then_a_reassignment_gets_no_delegate(self):
+        with patch.object(Kanban, "subscribe", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.ask({"action": "work_on", "issue": ISSUE})
-        self.assertEqual(self.delegate_rows(), [])  # routing follows admission
+        self.assertEqual(self.delegate_rows(), [])  # the crash came before routing was queued
         task_id = self.bridge.store.get(ISSUE)["task_id"]
         later = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat()
         self.authority.issues[ISSUE]["updatedAt"] = later
@@ -922,40 +921,34 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.authority.history.setdefault(ISSUE, []).append({
             "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
             "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
-        self.bridge._recover_admissions()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertNotIn("unblocked", self.history(task_id))
-        # The parked task is not shown as worked on: no delegate is queued.
-        self.assertEqual(self.delegate_rows(), [])
         for _ in range(4):
             self.bridge.tick()
+        # The person's change after the request wins routing: no delegate is queued over it.
+        self.assertEqual(self.delegate_rows(), [])
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-
-    def test_superseded_chat_admission_queues_no_delegate_even_when_asked_again(self):
+        self.assertEqual(self.tasks(), [task_id])
+    def test_a_stop_refused_chat_start_queues_no_delegate_even_when_asked_again(self):
         self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
                                               activity_id="stop-1", actor=USER)
         reply = self.ask({"action": "work_on", "issue": ISSUE})
-        self.assertTrue(reply["message"].startswith("Not started:"), reply["message"])
-        self.assertEqual(reply["routing"], "held: not started")
+        self.assertFalse(reply["ok"], reply)
         for _ in range(3):
             self.bridge.tick()
-        again = self.ask({"action": "work_on", "issue": ISSUE})  # after ticks moved the binding revision
-        self.assertEqual(again["routing"], "held: not started")
+        again = self.ask({"action": "work_on", "issue": ISSUE})  # after ticks
+        self.assertFalse(again["ok"], again)
         for _ in range(3):
             self.bridge.tick()
         self.assertEqual(self.delegate_rows(), [])
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
-        self.assertEqual(self.board.get(reply["native"]["task_id"]).status, "blocked")
-
-    def test_work_that_cannot_start_safely_gets_no_delegate(self):
-        with patch.object(Kanban, "guarded_controls", False, create=True):
-            reply = self.ask({"action": "work_on", "issue": ISSUE})
-        self.assertFalse(reply["native"]["admitted"])
+        self.assertEqual(self.tasks(), [])
+    def test_work_that_cannot_be_recorded_safely_gets_no_delegate(self):
+        # Work already finished in chat that changed before it was recorded is refused, not routed.
+        with patch.object(Kanban, "complete_recorded", return_value=False):
+            reply = self.ask({"action": "work_on", "issue": ISSUE, "record_done": True, "summary": "Done in chat."})
+        self.assertFalse(reply["ok"], reply)
         self.bridge.flush()
         self.assertEqual(self.delegate_rows(), [])
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
-
     def test_a_status_only_change_is_not_described_as_reassignment(self):
         self.ask({"action": "work_on", "issue": ISSUE})
         self.bridge.flush()
@@ -975,8 +968,8 @@ class ChatEntrustScenarios(unittest.TestCase):
         reads = self.authority.requests[before:]
         self.assertFalse(any("IssueRoutingHistory" in query for query in reads), reads)
 
-    def test_asking_again_after_a_crash_and_a_reassignment_does_not_start_the_work(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+    def test_asking_again_after_a_crash_and_a_reassignment_reuses_the_task_without_a_delegate(self):
+        with patch.object(Kanban, "subscribe", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.bridge.entrust(ISSUE, route=None)  # crash before routing was queued
         task_id = self.bridge.store.get(ISSUE)["task_id"]
@@ -987,22 +980,19 @@ class ChatEntrustScenarios(unittest.TestCase):
             "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
             "fromAssigneeId": None, "toAssigneeId": USER, "fromDelegate": None, "toDelegate": None})
         again = self.ask({"action": "work_on", "issue": ISSUE})
-        self.assertFalse(again["native"]["admitted"], again)
-        self.assertTrue(again["message"].startswith("Not started:"), again["message"])
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertEqual(again["routing"], "held: not started")
+        self.assertEqual(again["native"]["task_id"], task_id)  # the one task, never a second
+        self.assertIn("changed this issue's status, assignee or delegate", again["message"])
         self.assertEqual(self.delegate_rows(), [])  # no delegate is queued over the person's change
         for _ in range(3):
             self.bridge.tick()
         self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
-
-    def test_parked_chat_work_resumed_later_gets_its_delegate(self):
-        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
-                                              activity_id="stop-1", actor=USER)
+        self.assertEqual(self.tasks(), [task_id])
+    def test_chat_work_stopped_and_resumed_later_keeps_its_delegate(self):
         task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
+        self.claim(task_id)
+        self.assertTrue(self.stop(ISSUE))
         for _ in range(2):
             self.bridge.tick()
-        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # parked: not shown as worked on
         with self.board.conn() as conn:
             kb.unblock_task(conn, task_id)  # someone resumes it on the board
         self.claim(task_id)
@@ -1010,30 +1000,22 @@ class ChatEntrustScenarios(unittest.TestCase):
             self.bridge.tick()
         self.assertEqual(self.board.get(task_id).status, "running")
         self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
-
-    def test_reask_after_resume_keeps_recovery_delegate(self):
-        self.bridge.store.record_unbound_stop(ISSUE, time.time() * 1000 + 60_000, session_id="stop-session",
-                                              activity_id="stop-1", actor=USER)
+    def test_reask_after_resume_keeps_the_delegate(self):
         task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
-        for _ in range(2):
-            self.bridge.tick()
+        self.claim(task_id)
+        self.assertTrue(self.stop(ISSUE))
         with self.board.conn() as conn:
             kb.unblock_task(conn, task_id)
         self.claim(task_id)
         with patch.object(type(self.bridge), "flush", lambda self, **kw: 0):
             for _ in range(4):
                 self.bridge.tick()
-        with self.bridge.store._tx() as db:
-            rows = db.execute("SELECT id,state,json_extract(payload,'$.recovered_binding') FROM outbox WHERE kind='delegate'").fetchall()
-        again = self.ask({"action": "work_on", "issue": ISSUE})
+        self.assertEqual(self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"], task_id)
         for _ in range(6):
             self.bridge.tick()
-        with self.bridge.store._tx() as db:
-            rows = db.execute("SELECT id,state,json_extract(payload,'$.admission_superseded') FROM outbox WHERE kind='delegate'").fetchall()
         self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
-
-    def test_work_parked_by_a_person_and_resumed_later_gets_its_delegate(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+    def test_a_person_moving_crashed_chat_work_keeps_routing_with_people(self):
+        with patch.object(Kanban, "subscribe", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.ask({"action": "work_on", "issue": ISSUE})
         task_id = self.bridge.store.get(ISSUE)["task_id"]
@@ -1042,17 +1024,13 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.authority.history.setdefault(ISSUE, []).append({
             "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-progress",
             "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": None, "toDelegate": None})
-        self.bridge._recover_admissions()
-        self.assertEqual(self.board.get(task_id).status, "blocked")  # the person's change parked it
         time.sleep(2.1)
-        with self.board.conn() as conn:
-            kb.unblock_task(conn, task_id)  # later someone resumes it
-        self.claim(task_id)
+        self.claim(task_id)  # the worker picks it up after the person's change
         for _ in range(4):
             self.bridge.tick()
         self.assertEqual(self.board.get(task_id).status, "running")
-        self.assertEqual(self.authority.issues[ISSUE]["delegate"], {"id": VIEWER})
-
+        # The chat request is the routing authority: a person's change after it wins, even before the claim.
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])
     def test_asking_again_after_ticks_never_re_adds_a_delegate_a_person_removed(self):
         task_id = self.ask({"action": "work_on", "issue": ISSUE})["native"]["task_id"]
         self.bridge.flush()
@@ -1108,8 +1086,8 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.assertFalse(self.stop(ISSUE))
         self.assertEqual(self.board.get(task_id).status, "running")
 
-    def test_recovered_chat_admission_yields_to_a_person_undelegating_it(self):
-        with patch.object(self.bridge, "_assignment_activation", side_effect=RuntimeError("crash")):
+    def test_crashed_chat_start_yields_to_a_person_undelegating_it(self):
+        with patch.object(Kanban, "subscribe", side_effect=RuntimeError("crash")):
             with self.assertRaises(RuntimeError):
                 self.bridge.entrust(ISSUE, route=None)
         task_id = self.bridge.store.get(ISSUE)["task_id"]
@@ -1118,10 +1096,10 @@ class ChatEntrustScenarios(unittest.TestCase):
         self.authority.history.setdefault(ISSUE, []).append({
             "createdAt": later, "actorId": USER, "fromStateId": "state-todo", "toStateId": "state-todo",
             "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": {"id": VIEWER}, "toDelegate": None})
-        self.bridge.tick()
-        self.assertEqual(self.board.get(task_id).status, "blocked")
-        self.assertNotIn("unblocked", self.history(task_id))
-
+        for _ in range(3):
+            self.bridge.tick()
+        self.assertIsNone(self.authority.issues[ISSUE]["delegate"])  # never re-added
+        self.assertEqual(self.tasks(), [task_id])
     def test_another_session_on_assignment_work_gets_a_neutral_notice(self):
         self.assertIn("already working on this", _same_work_notice("running", False))
         for status in ("running", "blocked", "done"):

@@ -666,7 +666,7 @@ class IdleTickTests(unittest.TestCase):
     def test_a_tick_that_did_nothing_reports_idle(self):
         from hermes_fleet_linear_plugin import diag
         bridge = self.bridge()
-        bridge._recover_admissions = bridge.pump_kanban = bridge.recheck = bridge.flush = Mock()
+        bridge._recover_stops = bridge.pump_kanban = bridge.recheck = bridge.flush = Mock()
         bridge.store = Mock()
         self.assertFalse(bridge.tick(self.inbox))
         bridge.pump_kanban = Mock(side_effect=lambda: diag.count("events"))

@@ -29,8 +29,6 @@ class NativeWorkJourneyTests(unittest.TestCase):
                                     cwd=source, env=env, capture_output=True, text=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             receipt = json.loads((root / "state" / "journey-receipt.json").read_text())
-            if not receipt.get("guarded_controls"):
-                self.skipTest("native host predates guarded assignment admission")
             print(json.dumps({"journey": mode, **receipt}, sort_keys=True))
             return receipt
 
@@ -102,10 +100,7 @@ def _child(mode):
     os.environ.update(HERMES_KANBAN_HOME=str(home), HERMES_PROFILE="default",
                       HERMES_KANBAN_CRASH_GRACE_SECONDS="0")
     board = Kanban("owned", profile="default", profile_home=home)
-    receipt = {"guarded_controls": board.guarded_controls}
-    if not board.guarded_controls:
-        (home / "journey-receipt.json").write_text(json.dumps(receipt))
-        return
+    receipt = {}
 
     # Both named agents are authorized for this project workspace, not each
     # other's private Hermes home, memory, session store, or credentials.

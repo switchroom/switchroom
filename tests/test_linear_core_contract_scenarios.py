@@ -374,20 +374,31 @@ class CoreContractScenarios(unittest.TestCase):
         self.assertNotIn("hermes_cli.kanban_pr_acceptance:collect_acceptance", paths)
         keywords = {kw for use in self.uses
                     if canonical(use.path) == "hermes_cli.kanban_db:block_task" for kw in use.keywords}
-        self.assertTrue({"reason", "kind", "expected_run_id", "expected_event_id"} <= keywords, keywords)
+        self.assertTrue({"reason", "kind", "expected_run_id"} <= keywords, keywords)
 
     def test_every_plugin_core_symbol_and_call_binds(self):
         problems = violations(self.uses)
         self.assertEqual(problems, [], "\n" + "\n".join(problems))
 
-    def test_guarded_control_keywords_are_present(self):
-        """bridge.Kanban.guarded_controls refuses activation without these; absence must fail CI, not degrade."""
+    def test_ownership_and_stop_use_only_upstream_control_keywords(self):
+        """Admission, Stop and wait resumes use upstream's Kanban signatures, so a pure-upstream core
+        starts assignments instead of parking them. Only the fork respawn guard's own PR park (which
+        upstream never writes) is lifted with the fork's guarded unblock."""
         from hermes_cli import kanban_db
-        for name, required in (("block_task", {"expected_event_id", "expected_run_id", "kind"}),
-                               ("unblock_task", {"expected_event_id", "request_id"})):
+        for name, required in (("block_task", {"reason", "kind", "expected_run_id"}),
+                               ("create_task", {"idempotency_key", "initial_status"})):
             parameters = set(inspect.signature(getattr(kanban_db, name)).parameters)
-            self.assertTrue(required <= parameters, f"kanban_db.{name} lacks {required - parameters} "
-                            "(plugins/linear/bridge.py Kanban.guarded_controls)")
+            self.assertTrue(required <= parameters, f"kanban_db.{name} lacks {required - parameters}")
+        fork_only = {"expected_event_id", "request_id", "transient_hold", "count_recurrence"}
+        guarded = sorted(use.site for use in self.uses
+                         if canonical(use.path) in ("hermes_cli.kanban_db:block_task", "hermes_cli.kanban_db:unblock_task",
+                                                    "hermes_cli.kanban_db:create_task")
+                         and fork_only & set(use.keywords))
+        park = next(node for node in ast.walk(ast.parse((PLUGIN / "bridge.py").read_text()))
+                    if isinstance(node, ast.FunctionDef) and node.name == "resume_pr_park")
+        self.assertEqual(len(guarded), 1, guarded)
+        self.assertTrue(guarded[0].startswith("plugins/linear/bridge.py:")
+                        and park.lineno <= int(guarded[0].rsplit(":", 1)[1]) <= park.end_lineno, guarded)
 
     def test_respawn_guard_pr_link_matches_core(self):
         """bridge._GUARD_PR_URL copies kanban_db_dispatch._RESPAWN_GUARD_PR_URL_RE (bridge.py newest_pr_url)."""

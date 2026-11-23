@@ -79,10 +79,10 @@ REASONS = frozenset({
     "delivery_failed", "no_issue_destination", "own_echo", "recheck_coalesced",
     # session / claim / handoff
     "existing_binding", "reconciliation_required", "assignment_echo", "native_changed",
-    "admission_superseded", "activation_unverified", "revision_mismatch", "reconcile_complete",
+    "revision_mismatch", "reconcile_complete",
     "closed_or_elsewhere",
     # chat entrust / record_done
-    "record_done_parked", "not_started", "delegated_elsewhere", "contract_mismatch",
+    "record_done_parked", "delegated_elsewhere", "contract_mismatch",
     # delegation admission before the model turn (native_input.admit_delegation)
     "delegation_started", "delegation_linked", "admission_declined", "admission_held", "admission_failed",
     "mention_conversation", "delegated_awaiting_session", "session_turn", "same_session",
@@ -96,7 +96,7 @@ REASONS = frozenset({
     "started_other_tasks",
     "not_bound_here", "task_finished_here", "task_not_handable", "changed_during_handoff",
     "takeover_unavailable", "takeover_refused", "takeover_paused", "takeover_notice_unsent", "not_delegated",
-    "takeover_in_progress", "local_work_not_runnable", "takeover_not_admitted", "takeover_already_here",
+    "takeover_in_progress", "local_work_not_runnable", "takeover_already_here",
     "takeover_routing_unfinished", "takeover_local_unknown", "resume_refused", "resume_uncertain",
     # service / api / config
     "shutdown", "crash", "identity_unavailable", "socket_owned", "tick_exception", "duplicate_create",

@@ -87,8 +87,6 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(diag.reset)
         self.authority = EntryAuthority()
         self.board = Kanban(profile="default", profile_home=self.home)
-        if not self.board.guarded_controls:
-            self.skipTest("native host predates guarded admission")
         self.bridge = Bridge(Store(self.home / "linear.db"), self.authority.api(scope=None), self.board, profile="default")
         self.bridge.profile_home = self.home
         # The production registration: the plugin registers the native Linear platform and its adapter.
@@ -159,6 +157,29 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
     def history(self, task_id):
         return [event.kind for event in self.board.history(task_id, 0)]
 
+    def assert_one_owner(self):
+        """Exactly one task carries this issue's idempotency key, and no two of its runs overlap."""
+        with self.board.conn() as conn:
+            keyed = [row["id"] for row in conn.execute("SELECT id FROM tasks WHERE idempotency_key=?", (f"linear:{ISSUE}",))]
+            self.assertEqual(len(keyed), 1, keyed)
+            runs = [(row["started_at"], row["ended_at"]) for row in conn.execute(
+                "SELECT started_at, ended_at FROM task_runs WHERE task_id=? ORDER BY started_at, id", (keyed[0],))]
+        for (_, ended), (started, _) in zip(runs, runs[1:]):
+            self.assertIsNotNone(ended, runs)
+            self.assertLessEqual(ended, started, runs)
+        self.assertEqual(self.tasks(), keyed)
+        return keyed[0]
+
+    def chat_context(self):
+        return NativeContext(home=str(self.home), profile="default", platform="telegram", source="telegram",
+                             session_key="telegram:chat-1:thread-1", session_id="chat-session", user_id="human-1",
+                             chat_id="chat-1", chat_type="group", thread_id="thread-1", scope_id="workspace-1")
+
+    def work_on(self, **args):
+        reply = json.loads(chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE, **args}, self.chat_context()))
+        self.assertTrue(reply["ok"], reply)
+        return reply["native"]["task_id"]
+
     def reconcile(self):
         for _ in range(2):
             self.bridge.pump_kanban()
@@ -169,16 +190,17 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         await self.ingest(self.delegation())
         self.assertEqual(len(self.tasks()), 1)
         task = self.board.get(self.tasks()[0])
-        self.assertEqual(task.status, "ready")  # admitted; the dispatcher claims it
-        self.assertEqual(self.history(task.id).count("unblocked"), 1)
+        self.assertEqual(task.status, "ready")  # created ready; the dispatcher claims it
+        self.assertEqual(self.history(task.id), ["created"])  # no park-then-activate step
+        self.assertEqual(task.idempotency_key, f"linear:{ISSUE}")
         # No prompt: the issue title is the request the worker receives.
         self.assertIn("Requested outcome (the issue title): Count lines of code per directory", task.body)
         # The model turn runs once, after admission, told the work is already running as that task.
         self.assertEqual(len(self.turns), 1)
         context = self.turns[0].channel_context
-        self.assertIn("Tracked delegated work is staged", context)
+        self.assertIn("Tracked work already started", context)
         self.assertIn(task.id, context)
-        self.assertIn("Do not perform the issue work in this conversation", context)
+        self.assertIn("Do not do the work in this conversation", context)
         self.assertNotIn("@mention", context)
         said = self.said("session-1")
         self.assertIn("Got it. Checking the issue and any existing work now; updates will appear here.", said)
@@ -204,10 +226,11 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         event = self.delegation()
         await self.ingest(event, "first")
         task_id = self.tasks()[0]
+        self.assertEqual(len(self.turns), 1)
         # The same provider input redelivered (a lost ack, a reconnect): the same task, no second admission.
         await self.ingest(event, "redelivered")
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        self.assertEqual(self.history(task_id), ["created"])
         self.assertIn(task_id, self.turns[-1].channel_context)
         turns = len(self.turns)
         # This app's own delegation echo (no creator) keeps the dispatcher path: the same work.
@@ -218,20 +241,19 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inbox_status(second), "imported")
         self.assertEqual(len(self.turns), turns)
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        self.assertEqual(self.history(task_id), ["created"])
         self.assertEqual(self.said("session-2")[-1],
                          "The agent is already working on this, so nothing new was started.")
+        # One owner throughout: the first session still owns it, and only one model turn ran on it.
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "session-1")
+        self.assertEqual({turn.message_id for turn in self.turns}, {self.turns[0].message_id})
+        self.assertEqual(self.assert_one_owner(), task_id)
 
     async def test_chat_started_work_then_human_delegation_is_one_task(self):
-        context = NativeContext(home=str(self.home), profile="default", platform="telegram", source="telegram",
-                                session_key="telegram:chat-1:thread-1", session_id="chat-session", user_id="human-1",
-                                chat_id="chat-1", chat_type="group", thread_id="thread-1", scope_id="workspace-1")
-        reply = json.loads(chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE}, context))
-        self.assertTrue(reply["ok"], reply)
-        task_id = reply["native"]["task_id"]
+        task_id = self.work_on()
         delivery = await self.ingest(self.delegation(), "delegated-after-chat")
-        self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        self.assertEqual(self.assert_one_owner(), task_id)
+        self.assertEqual(self.history(task_id), ["created"])
         self.assertEqual(self.turns, [])  # answered as the same work; no model turn redoes it
         self.assertEqual(self.inbox_status(delivery), "imported")
         # The session Linear opened now reports the chat-started work: a thought, never a closing response.
@@ -241,6 +263,79 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(kinds)
         self.assertEqual(set(kinds), {"thought"})  # admission ACK and adoption both keep it open
         self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "session-1")
+
+    # -- one owner, no double run, through the adapter's ingest -------------------------------
+    async def test_chat_work_then_own_echo_adopts_the_echo_session_through_ingest(self):
+        task_id = self.work_on()
+        # This app delegated the issue to itself from chat; Linear opens a creator-less session for it.
+        echo = await self.ingest(self.session_event("echo-session", creator=None), "own-echo")
+        self.assertEqual(self.inbox_status(echo), "imported")
+        self.assertEqual(self.assert_one_owner(), task_id)
+        self.assertEqual(self.turns, [])  # nothing redoes the work
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "echo-session")
+        said = self.said("echo-session")
+        self.assertIn("Continuing the existing work on this issue, continued from chat", said[-1])
+        self.assertEqual({r["content"]["type"] for r in self.authority.activity_records
+                          if r["agentSessionId"] == "echo-session"}, {"thought"})  # adoption keeps it open
+        # The session reports the work from now on: a worker picking it up shows there.
+        with self.board.conn() as conn:
+            self.assertIsNotNone(kb.claim_task(conn, task_id, claimer="native-test-worker"))
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "spawned", {"pid": 4242})
+        self.reconcile()
+        self.assertIn(("action", "Started"), [(r["content"]["type"], r["content"].get("action"))
+                                              for r in self.authority.activity_records
+                                              if r["agentSessionId"] == "echo-session"])
+        self.assertEqual(self.authority.state(), "In Progress")
+        self.assertEqual(self.assert_one_owner(), task_id)
+
+    async def test_a_second_session_never_takes_over_a_live_adopted_one_through_ingest(self):
+        task_id = self.work_on()
+        await self.ingest(self.session_event("echo-session", creator=None), "own-echo")
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "echo-session")
+        await self.ingest(self.session_event("echo-again", creator=None), "own-echo-again")
+        await self.ingest(self.delegation("person-session"), "person")
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "echo-session")
+        self.assertEqual(self.turns, [])
+        self.assertEqual(self.assert_one_owner(), task_id)
+        for session in ("echo-again", "person-session"):
+            self.assertIn("nothing new was started", self.said(session)[-1])
+            self.assertEqual({r["content"]["type"] for r in self.authority.activity_records
+                              if r["agentSessionId"] == session}, {"thought"})
+
+    async def test_recorded_done_work_then_own_echo_starts_nothing_through_ingest(self):
+        task_id = self.work_on(record_done=True, summary="Counted every directory in the chat.",
+                               evidence=["https://example.invalid/report"])
+        self.assertEqual(self.board.get(task_id).status, "done")
+        echo = await self.ingest(self.session_event("echo-session", creator=None), "own-echo")
+        self.assertEqual(self.inbox_status(echo), "imported")
+        self.assertEqual(self.turns, [])
+        self.assertEqual(self.assert_one_owner(), task_id)
+        self.assertEqual(self.board.get(task_id).status, "done")
+        self.assertFalse({"claimed", "spawned", "unblocked"} & set(self.history(task_id)))  # never runnable
+        answer = self.said("echo-session")[-1]  # the finished work's result, not a dead end (FM2)
+        self.assertTrue(answer.startswith("Done."), answer)
+        self.assertIn("Counted every directory in the chat.", answer)
+        self.reconcile()
+        self.assertEqual(self.board.get(task_id).status, "done")
+        self.assertFalse({"claimed", "spawned", "unblocked"} & set(self.history(task_id)))
+
+    async def test_concurrent_ingests_of_two_sessions_for_one_issue_make_one_task(self):
+        create, entered = self.board.create, asyncio.Event()
+        loop = asyncio.get_running_loop()
+        def slow_create(**fields):  # widen the window: the second ingest arrives while the first creates
+            loop.call_soon_threadsafe(entered.set)
+            time.sleep(0.5)
+            return create(**fields)
+        with patch.object(self.board, "create", side_effect=slow_create):
+            first = asyncio.ensure_future(self.ingest(self.delegation("session-a"), "a"))
+            await asyncio.wait_for(entered.wait(), 10)
+            await asyncio.gather(first, self.ingest(self.session_event("session-b", creator=None), "b"))
+        task_id = self.assert_one_owner()
+        self.assertEqual(self.history(task_id), ["created"])
+        self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "session-a")
+        self.assertEqual(len(self.turns), 1)  # only the session that started it gets a model turn
+        self.assertIn("nothing new was started", self.said("session-b")[-1])
 
     async def test_mention_question_stays_a_conversation_and_starts_nothing(self):
         question = "@agent how many directories does hermes-fleet have?"
@@ -298,7 +393,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Tracked work already started", context)
         self.assertIn("It is history now", context)
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id).count("unblocked"), 1)
+        self.assertEqual(self.history(task_id).count("unblocked"), 0)
         self.assertEqual(self.inbox_status(delivery), "imported")  # the finite endpoint invoked the committed-input hook
 
     async def test_retried_session_linked_to_existing_board_work_answers_once(self):

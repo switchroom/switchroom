@@ -265,12 +265,12 @@ def _admission_note(row, task, started: bool) -> str:
 
 
 def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
-    """Stage a delegated issue before its real native conversation input commits.
+    """Start (or adopt) a delegated issue's one task before its native conversation input commits.
 
-    Uses the same guarded assignment admission as a creator-null delegation (the
-    shared create intent and retry key that work_on and the self-delegation echo
-    use), so a redelivery or echo finds the same task and never starts a second one.
-    With no prompt, the issue title and description are the request.
+    The bridge's one ownership rule (``Bridge._one_owner``, keyed on ``linear:<issue_id>``,
+    shared with work_on and the self-delegation echo) decides, so a redelivery or echo finds
+    the same task and never starts a second one. With no prompt, the issue title and
+    description are the request.
 
     Returns (run_turn, admission_note, started). A turn runs with the note when this
     session now carries the work, or with the plain work facts when the issue's work
@@ -291,7 +291,7 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
                 bridge.session_notices.pop(key, None)
                 diag.evt("session.admit", "skipped", "finished_work_conversation", task=row.get("task_id"), **fields)
                 return True, "", False
-        accepted = bridge.handle_webhook(original, consumer_input_pending=True)
+        accepted = bridge.handle_webhook(original)
     except Exception as error:
         if not bridge.session_notices.pop(key, False):  # a decline already said what is needed
             _wait_notice(bridge, projected, isinstance(error, RateLimited))
@@ -304,27 +304,19 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
         diag.evt("session.admit", "skipped", "admission_declined", task=(row or {}).get("task_id"), **fields)
         return False, "", False
     if row and row.get("origin") == "native" and row.get("owner_ref") == session_id:
-        activation = bridge.store.native_intent(f"activate:{issue_id}:{row['task_id']}")
-        created = bridge.store.native_intent(f"create:{issue_id}") or {}
-        linked = activation is None and created.get("task_id") != row["task_id"]
-        staged = created.get("payload", {}).get("requires_native_input")
-        if staged or linked or (activation or {}).get("accepted"):
-            try:
-                row, task = bridge._native_task(issue_id)
-            except LinearError as error:
-                _wait_notice(bridge, projected, False)
-                diag.warn("session.admit", "held", "admission_failed", exc=type(error).__name__,
-                          task=row.get("task_id"), **fields)
-                raise
-            if staged:
-                return True, (f"Tracked delegated work is staged as task {task.id}. Its initial native activation "
-                    "waits for this input's committed receipt. Do not perform the issue work in this conversation "
-                    "or create another task; its native worker owns execution and the user decision prompts."), True
-            started = not linked
-            diag.evt("session.admit", "applied", "delegation_started" if started else "delegation_linked",
-                     task=task.id, state=task.status, **fields)
-            return True, _admission_note({**row, "board": (bridge.store.native_binding(issue_id) or {}).get("board")},
-                                         task, started), started
+        # This session owns the work: started by it, or linked to work already on the board.
+        started = (bridge.store.native_intent(f"create:{issue_id}") or {}).get("task_id") == row["task_id"]
+        try:
+            row, task = bridge._native_task(issue_id)
+        except LinearError as error:
+            _wait_notice(bridge, projected, False)
+            diag.warn("session.admit", "held", "admission_failed", exc=type(error).__name__,
+                      task=row.get("task_id"), **fields)
+            raise
+        diag.evt("session.admit", "applied", "delegation_started" if started else "delegation_linked",
+                 task=task.id, state=task.status, **fields)
+        return True, _admission_note({**row, "board": (bridge.store.native_binding(issue_id) or {}).get("board")},
+                                     task, started), started
     if bridge.store.scope_fenced(issue_id):
         # Held for an operator; no effect (not even a notice) may reach this issue meanwhile.
         diag.evt("session.admit", "skipped", "scope_fenced", **fields)
@@ -1239,15 +1231,10 @@ def create_adapter(config, running):
                 bridge = running["bridge"]
                 def remember_input():
                     with bridge.lock(projected.issue_id):
-                        anchor = bridge.store.remember_conversation_input(
+                        return bridge.store.remember_conversation_input(
                             projected.issue_id, projected.session_id, projected.message_id,
                             receipt["admission_id"], receipt["seq"], receipt["status"] == "terminal",
                             self._core_session_keys(event.source))
-                        if projected.source == "delegation":
-                            activity = projected.message_id if projected.message_id != projected.session_id else None
-                            with bridge.api.requester_session(projected.session_id, activity_id=activity):
-                                bridge._assignment_activation(bridge.store.get(projected.issue_id))
-                        return anchor
                 anchor = await asyncio.to_thread(remember_input)
                 self._cache_input(projected.issue_id, projected.session_id, anchor)
                 with self._relay_lock:

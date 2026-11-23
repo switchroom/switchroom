@@ -154,8 +154,6 @@ class TwoAgents(unittest.TestCase):
         # Atlas: its own home, board, store and Linear app. It starts the work from its own chat.
         with self.as_owner():
             self.owner_board = Kanban(profile="default", profile_home=self.owner_home)
-            if not self.owner_board.guarded_controls:
-                self.skipTest("native host predates guarded admission")
             self.owner = Bridge(Store(self.owner_home / "linear.db"),
                                 self.owner_linear.api(scope=None, identity={"viewer_id": OWNER, "organization_id": ORG}),
                                 self.owner_board, profile="default",
@@ -191,13 +189,13 @@ class TwoAgents(unittest.TestCase):
                                      session_key="slack:chat-1:thread-1", session_id="chat-session", user_id="human-1",
                                      chat_id="chat-1", chat_type="dm", thread_id="thread-1", scope_id="workspace-1")
         self.a2a_calls = []
-        # Every admission on Nova's board is checked against Atlas's board at that instant.
+        # Every task created (ready) on Nova's board is checked against Atlas's board at that instant.
         board = self.board
-        def checked_activate(*args, **kwargs):
-            accepted = type(board).activate(board, *args, **kwargs)  # whatever a test patched in
+        def checked_create(*args, **kwargs):
+            task = type(board).create(board, *args, **kwargs)  # whatever a test patched in
             self.assert_exclusive()
-            return accepted
-        self.board.activate = checked_activate
+            return task
+        self.board.create = checked_create
 
     def tempdir(self, prefix):
         temp = tempfile.TemporaryDirectory(prefix=prefix)
@@ -254,6 +252,16 @@ class TwoAgents(unittest.TestCase):
                     if event.kind in ("blocked", "block_loop_detected")
                     and (event.payload or {}).get("reason") != "initial_status"]  # not the creation's own parking
 
+    def _flaky_creation(self):
+        """Native creation fails once before anything is committed (the outcome stays uncertain)."""
+        real, failed = Kanban.create, []
+        def flaky(adapter, *a, **k):
+            if not failed:
+                failed.append(True)
+                raise OSError("database is locked")
+            return real(adapter, *a, **k)
+        return patch.object(Kanban, "create", flaky)
+
     def assert_exclusive(self):
         ours = [task["status"] for task in self.tasks()]
         self.assertFalse(self.owner_status() in RUNNABLE and any(status in RUNNABLE for status in ours),
@@ -269,16 +277,18 @@ class TwoAgents(unittest.TestCase):
             self.owner.flush()
         return [body for issue, body in self.linear.comment_bodies if issue == ISSUE and "paused its work" in body]
 
-    def assert_paused_message(self, reply, *, may=False):
+    def assert_paused_message(self, reply, *, may=False, retry=True):
         self.assertFalse(reply["ok"], reply)
         self.assertEqual(reply["code"], "takeover_paused")
         state = "may be paused" if may else "is paused"
         self.assertIn(f"Atlas's work on OPS-1 {state} for a handover to Nova that didn't complete", reply["message"])
-        self.assertIn("Say 'resume OPS-1' to let Atlas continue, or 'take over OPS-1' to try again.", reply["message"])
+        self.assertIn("Say 'resume OPS-1' to let Atlas continue, or 'take over OPS-1' to try again." if retry
+                      else "Say 'resume OPS-1' to let Atlas continue.", reply["message"])
         self.assertNotRegex(reply["message"], r"handoff:|native_|\{")
         self.assertEqual(self.notices(), [
             f"Atlas's work on OPS-1 {state} for a handover to Nova that didn't complete. Nothing resumes it "
-            "automatically. Ask Nova to 'resume OPS-1' to let Atlas continue, or to 'take over OPS-1' to try again."])
+            "automatically. Ask Nova to 'resume OPS-1' to let Atlas continue" +
+            (", or to 'take over OPS-1' to try again." if retry else ".")])
         self.assertFalse(any(task["status"] in RUNNABLE for task in self.tasks()), self.tasks())
         self.assert_exclusive()
 
@@ -620,8 +630,8 @@ class OwnerSafetyScenarios(TwoAgents):
 
 @unittest.skipIf(CORE is not None, f"native upstream source unavailable ({CORE})")
 class TakeoverGuardScenarios(TwoAgents):
-    """The bridge guards this change keeps: admission only by the take_over call that has just seen
-    the handover, a person's routing change winning, and plain replies whatever fails after it."""
+    """The bridge guards this change keeps: a task created only by the take_over call that has just
+    seen the handover, a person's routing change winning, and plain replies whatever fails after it."""
 
     def assert_nothing_runs_here(self):
         self.assertFalse(any(task["status"] in RUNNABLE for task in self.tasks()), self.tasks())
@@ -630,34 +640,24 @@ class TakeoverGuardScenarios(TwoAgents):
     def later_request(self, seconds=5):
         self.bridge.clock = lambda: time.time() + seconds
 
-    def _routing_change_at_create(self, actor, to_state="state-todo", assignee=None):
-        """A routing change by ``actor`` lands right after Nova's task is created, before admission."""
-        real = Kanban.create
-        def create(adapter, *args, **kwargs):
-            task = real(adapter, *args, **kwargs)
+    def _routing_change_before_start(self, actor, to_state="state-todo", assignee=None):
+        """A routing change by ``actor`` lands after the handover, just before Nova's start reads Linear."""
+        real = Bridge.entrust
+        def entrust(bridge, *args, **kwargs):
             issue = self.linear.issues[ISSUE]
             moved = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
             issue["updatedAt"] = moved
             self.linear.history.setdefault(ISSUE, []).append({
                 "createdAt": moved, "actorId": actor, "fromStateId": issue["state"]["id"], "toStateId": to_state,
                 "fromAssigneeId": None, "toAssigneeId": assignee, "fromDelegate": None, "toDelegate": None})
-            return task
-        return patch.object(Kanban, "create", create)
-
-    def _flaky_activation(self):
-        real, failed = Kanban.activate, []
-        def flaky(adapter, *a, **k):
-            if not failed:
-                failed.append(True)
-                raise OSError("database is locked")
-            return real(adapter, *a, **k)
-        return patch.object(Kanban, "activate", flaky)
+            return real(bridge, *args, **kwargs)
+        return patch.object(Bridge, "entrust", entrust)
 
     def _flaky_admission_read(self):
         import traceback
         real, failed = Bridge._effect_issue, []
         def flaky(bridge, issue_id, *a, **k):
-            if not failed and any(frame.name == "_assignment_activation" for frame in traceback.extract_stack()):
+            if not failed and any(frame.name == "entrust" for frame in traceback.extract_stack()):
                 failed.append(True)
                 raise LinearError("Linear is answering too slowly to finish this in time")
             return real(bridge, issue_id, *a, **k)
@@ -673,12 +673,13 @@ class TakeoverGuardScenarios(TwoAgents):
         self.assert_exclusive()
 
     # -- a person's routing change wins; the old delegate's own handover steps do not ------------
-    def test_a_person_moving_the_issue_between_the_handover_and_admission_wins(self):
-        with self._routing_change_at_create(USER):
+    def test_a_person_moving_the_issue_between_the_handover_and_the_start_wins(self):
+        with self._routing_change_before_start(USER):
             reply = self.take_over()
         self.assert_paused_message(reply)
         self.assertIn("a person changed this issue's status, assignee or delegate in Linear", reply["message"])
-        self.bridge._recover_admissions()  # A person's decision stands: never admitted later either.
+        self.bridge.tick()  # A person's decision stands: nothing was created, nothing starts later.
+        self.assertEqual(self.tasks(), [])
         self.assert_nothing_runs_here()
 
     def test_a_person_changing_the_issue_during_the_a2a_wait_wins(self):
@@ -696,81 +697,91 @@ class TakeoverGuardScenarios(TwoAgents):
         self.assertIn("a person changed this issue's status, assignee or delegate", reply["message"])
 
     def test_the_old_delegate_pausing_and_stepping_down_is_not_a_person_moving_it(self):
-        with self._routing_change_at_create(OWNER, "state-blocked"):
+        with self._routing_change_before_start(OWNER, "state-blocked"):
             reply = self.take_over()
         self.assertTrue(reply["ok"], reply)
         self.assertIn(self.tasks()[0]["status"], RUNNABLE)
         self.assertTrue(any(node["actorId"] == OWNER and (node.get("fromDelegate") or {}).get("id") == OWNER
                             and node.get("toDelegate") in (None, {"id": None}) for node in self.linear.history[ISSUE]))
 
-    def test_N1_a_retry_after_a_person_moved_the_issue_starts_the_parked_task(self):
-        with self._routing_change_at_create(USER):
+    def test_N1_a_retry_after_a_person_moved_the_issue_starts_one_task(self):
+        with self._routing_change_before_start(USER):
             self.assert_paused_message(self.take_over())
         self.later_request()
         self.assert_started_once(self.take_over(str(uuid.uuid4())))
 
-    # -- a start that failed after the handover is never admitted later ------------------------
-    def _never_admitted_late(self, patcher):
+    # -- a start that failed after the handover is never started later by itself ----------------
+    def _never_started_late(self, patcher, *, retry=True):
         with patcher:
-            self.assert_paused_message(self.take_over())
-        (task,) = self.tasks()
-        self.assertEqual(task["status"], "blocked")
+            self.assert_paused_message(self.take_over(), retry=retry)
         with self.atlas():
-            self.bridge._recover_admissions()
+            self.bridge._recover_stops()
             self.bridge.tick()
         self.assertEqual(len(self.a2a_calls), 1)  # Nothing here asks Atlas anything by itself.
         self.assert_nothing_runs_here()
         self.assertEqual(len(self.notices()), 1)  # The one paused message, still true.
+
+    def test_M1_admission_read_failing_once_is_never_started_later(self):
+        self._never_started_late(self._flaky_admission_read())
+        self.assertEqual(self.tasks(), [])  # refused before anything was created
         self.later_request()
         self.assert_started_once(self.take_over(str(uuid.uuid4())))
 
-    def test_M1_admission_read_failing_once_is_never_admitted_later(self):
-        self._never_admitted_late(self._flaky_admission_read())
+    def test_X2_native_creation_failing_once_is_never_started_later(self):
+        self._never_started_late(self._flaky_creation(), retry=False)
+        # Its outcome is uncertain, so a new take_over never creates it again: it is held for a check.
+        retry = self.take_over(str(uuid.uuid4()))
+        self.assertEqual(retry["code"], "takeover_refused", retry)
+        self.assertIn("If Atlas is still paused for that earlier handover, say 'resume OPS-1'", retry["message"])
+        self.assertTrue(self.resume_owner()["ok"])
+        self.assert_nothing_runs_here()
 
-    def test_X2_native_activation_failing_once_is_never_admitted_later(self):
-        self._never_admitted_late(self._flaky_activation())
-
-    def test_X3_service_stopping_after_create_is_never_admitted_later(self):
+    def test_X3_service_stopping_after_create_leaves_exactly_one_task_running_here(self):
         class Stopped(BaseException):
             pass
         def stopped(*a, **k):
             raise Stopped()
-        with patch.object(Bridge, "_assignment_activation", stopped), self.assertRaises(Stopped):
+        with patch.object(Kanban, "subscribe", stopped), self.assertRaises(Stopped):
             self.take_over()
         self.bridge.tick()
-        self.assert_nothing_runs_here()
-        self.assert_started_once(self.take_over(str(uuid.uuid4())))
+        (task,) = self.tasks()  # created ready after the proven handover: it carries the work
+        self.assertIn(task["status"], RUNNABLE)
+        self.assertEqual(self.owner_status(), "blocked")
+        self.assert_exclusive()
+        again = self.take_over(str(uuid.uuid4()))
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual(len(self.a2a_calls), 1)  # Atlas is never asked again
+        self.assertEqual(self.resume_owner()["code"], "resume_refused")
 
-    def test_a_landed_admission_whose_reply_was_lost_is_recognised_not_repeated(self):
-        real = Kanban.activate
+    def test_a_landed_creation_whose_reply_was_lost_is_recognised_not_repeated(self):
+        real = Kanban.create
         def lost(adapter, *a, **k):
             real(adapter, *a, **k)
             raise OSError("reply lost")
-        with patch.object(Kanban, "activate", lost):
+        with patch.object(Kanban, "create", lost):
             reply = self.take_over()
         self.assertTrue(reply["ok"], reply)
-        self.bridge._recover_admissions()
         task_id = self.tasks()[0]["id"]
-        self.assertTrue(self.bridge.store.native_intent(f"activate:{ISSUE}:{task_id}")["accepted"])
+        self.assertEqual(self.bridge.store.native_intent(f"create:{ISSUE}")["task_id"], task_id)
         self.bridge.pump_kanban()
         self.bridge.flush()
         self.assertEqual(self.delegate(), VIEWER)
+        self.assertEqual(len(self.tasks()), 1)
         self.assert_exclusive()
 
-    def test_a_parked_takeover_task_is_never_admitted_beside_a_resumed_owner(self):
-        with self._flaky_activation():
-            self.assert_paused_message(self.take_over())
+    def test_a_failed_takeover_start_is_never_started_beside_a_resumed_owner(self):
+        with self._flaky_creation():
+            self.assert_paused_message(self.take_over(), retry=False)
         self.assertTrue(self.resume_owner()["ok"])
         self.assertIn(self.owner_status(), RUNNABLE)
-        self.bridge._recover_admissions()
+        self.bridge._recover_stops()
         self.bridge.tick()
         self.assert_nothing_runs_here()
         self.later_request()
-        reply = self.take_over(str(uuid.uuid4()))  # a new handover; the same task then starts once
-        self.assertTrue(reply["ok"], reply)
-        (task,) = self.tasks()
-        self.assertIn(task["status"], RUNNABLE)
-        self.assert_exclusive()
+        retry = self.take_over(str(uuid.uuid4()))  # its uncertain start is held for a check, never retried
+        self.assertFalse(retry["ok"], retry)
+        self.assert_nothing_runs_here()
 
     # -- routing after the start -------------------------------------------------------------
     def test_held_takeover_routing_is_retried_by_recovery(self):
@@ -816,23 +827,29 @@ class TakeoverGuardScenarios(TwoAgents):
                 self.assertEqual(self.owner_status(), "blocked")
 
     # -- the paused message names only ways on that will work ------------------------------------
-    def _closing_create(self):
-        real = Kanban.create
-        def create(adapter, *args, **kwargs):
-            task = real(adapter, *args, **kwargs)
-            self.linear.issues[ISSUE]["state"] = {"id": "state-done", "name": "Done", "type": "completed"}
-            return task
-        return patch.object(Kanban, "create", create)
+    def _close(self):
+        self.linear.issues[ISSUE]["state"] = {"id": "state-done", "name": "Done", "type": "completed"}
+
+    def _closing_start(self):
+        """The issue closes after the handover, just before Nova's start reads it."""
+        real = Bridge.entrust
+        def entrust(bridge, *args, **kwargs):
+            self._close()
+            return real(bridge, *args, **kwargs)
+        return patch.object(Bridge, "entrust", entrust)
 
     def test_closed_during_the_start_offers_reopening_before_taking_over_again(self):
-        with self._closing_create():
+        with self._closing_start():
             reply = self.take_over()
         self.assertEqual(reply["code"], "takeover_paused", reply)
         self.assertIn("reopen OPS-1, then say 'take over OPS-1' again", reply["message"])
         self.assertNotIn("'take over OPS-1' to try again", reply["message"])
 
     def test_closed_plus_a_start_that_cant_be_retried_offers_only_resume(self):
-        with self._closing_create(), patch.object(Kanban, "initial_activation_event", lambda *a, **k: None):
+        def closing_uncertain_create(*args, **kwargs):
+            self._close()
+            raise OSError("database is locked")  # nothing committed: the start stays uncertain
+        with patch.object(Kanban, "create", closing_uncertain_create):
             reply = self.take_over()
         self.assertEqual(reply["code"], "takeover_paused", reply)
         self.assertIn("OPS-1 is closed.", reply["message"])
@@ -972,8 +989,6 @@ class TakeoverRoundTwoScenarios(TwoAgents):
         self.linear.issues[ISSUE]["state"] = {"id": "state-progress", "name": "In Progress", "type": "started"}
         with self.atlas():
             self.assertFalse(self.ask(context=replace(self.context, delegated_child=True))["ok"])
-        with patch.object(type(self.board), "guarded_controls", property(lambda self: False)):
-            self.assertEqual(self.take_over()["code"], "takeover_refused")
         self.assertEqual((self.a2a_calls, self.tasks()), ([], []))
         self.assertIn(self.owner_status(), RUNNABLE)
 
@@ -983,7 +998,7 @@ class TakeoverRoundTwoScenarios(TwoAgents):
             self.assert_paused_message(self.take_over())
         reply = self.resume_owner(answer=lambda tool_json: "Resumed!")
         self.assertEqual(reply["code"], "resume_uncertain", reply)
-        self.bridge._recover_admissions()
+        self.bridge.tick()
         self.assert_nothing_runs_here()
 
     def test_r3b_several_uncertain_requests_in_a_row_then_one_start(self):
@@ -1000,29 +1015,23 @@ class TakeoverRoundTwoScenarios(TwoAgents):
         self.assert_exclusive()
 
     # -- Linear moves after the handover -------------------------------------------------------
-    def _parked_after_flaky_activation(self):
-        real, failed = Kanban.activate, []
-        def flaky(adapter, *a, **k):
-            if not failed:
-                failed.append(True)
-                raise OSError("database is locked")
-            return real(adapter, *a, **k)
-        with patch.object(Kanban, "activate", flaky):
-            self.assert_paused_message(self.take_over())
+    def _failed_start_after_the_handover(self):
+        with self._flaky_creation():
+            self.assert_paused_message(self.take_over(), retry=False)
 
-    def test_M2_a_team_without_a_blocked_state_never_admits_late(self):
+    def test_M2_a_team_without_a_blocked_state_never_starts_late(self):
         team = self.linear.issues[ISSUE]["team"]
         team["states"] = {"nodes": [node for node in team["states"]["nodes"] if node["name"] != "Blocked"]}
         self.assertIsNone(self.bridge.state_id(self.linear.issues[ISSUE], "blocked"))
-        self._parked_after_flaky_activation()
+        self._failed_start_after_the_handover()
         self.linear.issues[ISSUE]["updatedAt"] = (
             datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
-        self.bridge._recover_admissions()
+        self.bridge._recover_stops()
         self.bridge.tick()
         self.assert_nothing_runs_here()
 
-    def test_the_owner_reporting_a_resume_in_linear_never_leads_to_a_late_admission(self):
-        self._parked_after_flaky_activation()
+    def test_the_owner_reporting_a_resume_in_linear_never_leads_to_a_late_start(self):
+        self._failed_start_after_the_handover()
         issue = self.linear.issues[ISSUE]
         for to_state in ("state-blocked", "state-todo"):  # Atlas's pause report, then its resume report
             moved = (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat().replace("+00:00", "Z")
@@ -1030,7 +1039,7 @@ class TakeoverRoundTwoScenarios(TwoAgents):
                 "createdAt": moved, "actorId": OWNER, "fromStateId": issue["state"]["id"], "toStateId": to_state,
                 "fromAssigneeId": None, "toAssigneeId": None, "fromDelegate": None, "toDelegate": None})
             issue.update(updatedAt=moved, state={"id": to_state, "name": to_state, "type": "started"})
-        self.bridge._recover_admissions()
+        self.bridge._recover_stops()
         self.assert_nothing_runs_here()
 
     def test_a_person_moving_the_issue_after_the_takeover_still_wins_routing(self):
