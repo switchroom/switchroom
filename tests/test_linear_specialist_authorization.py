@@ -250,6 +250,21 @@ class FakeKanban:
         self.tasks[task_id].status = "ready"
         return True
 
+    def pristine_hold(self, task_id):
+        events = self.histories.get(task_id, [])
+        pristine = (self.tasks[task_id].status == "blocked" and len(events) == 1
+                    and (events[0].payload or {}).get("reason") == "initial_status")
+        return events[0].id if pristine else None
+
+    def resume_wait(self, task_id, expected_event_id):
+        """The bridge's release of its own creation's park (plain unblock of the newest event)."""
+        events = self.histories.setdefault(task_id, [])
+        if not events or events[-1].id != expected_event_id or self.tasks[task_id].status != "blocked":
+            return False
+        events.append(SimpleNamespace(id=expected_event_id + 1, kind="unblocked", created_at=0, payload=None))
+        self.tasks[task_id].status = "ready"
+        return True
+
     def retirement(self, task_id, prior=None):
         return prior or {"workers": [], "pending": [], "missing": False}
     def await_retirement(self, snapshot):
@@ -818,7 +833,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
     def test_authorized_created_event_binds_one_native_task_without_claim(self):
         self.bridge.handle_webhook(self.session_event())
         self.assertEqual(len(self.kanban.creates), 1)
-        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")
+        self.assertEqual(self.kanban.tasks["task-1"].status, "ready")  # created ready
         self.assertEqual(self.store.get(ISSUE)["task_id"], "task-1")
         self.assertEqual([row["kind"] for row in self.store.pending(ISSUE)], ["activity"])
 
@@ -840,7 +855,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             return task
         self.kanban.create = fenced_create
         self.bridge.handle_webhook(self.session_event())
-        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")
+        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")  # unbound: held before it can run
         self.assertIsNone(self.store.get(ISSUE))
         self.assertEqual(self.store.pending(), [])
         self.assertEqual(self.kanban.subscriptions, [])
@@ -867,7 +882,7 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
             return enqueue(*args, **kwargs)
         self.store.enqueue = fenced_enqueue
         self.bridge.handle_webhook(self.session_event())
-        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")
+        self.assertEqual(self.kanban.tasks["task-1"].status, "ready")  # created ready
         self.assertIsNotNone(self.store.native_binding(ISSUE, "synthetic", "default"))
         self.assertEqual(self.store.pending(), [])
 
@@ -1482,7 +1497,7 @@ class SessionRequesterTests(unittest.TestCase):
         self.authority.issues[ISSUE]["delegate"] = None
         self.bridge.flush()
         self.assertEqual(self.store.get(ISSUE), before)
-        self.assertEqual(self.kanban.tasks["task-1"].status, "blocked")
+        self.assertEqual(self.kanban.tasks["task-1"].status, "ready")  # created ready
         self.assertFalse(any("issueUpdate" in query for query in self.authority.mutations))
 
 
@@ -1855,7 +1870,9 @@ class SessionRequesterTests(unittest.TestCase):
     def test_stopped_native_task_followup_never_resumes_or_creates_execution(self):
         self.bridge.handle_webhook(self.session_event())
         task = self.kanban.tasks["task-1"]
-        task.status = "blocked"
+        task.status = "blocked"  # a native Stop paused it
+        self.kanban.histories["task-1"] = [SimpleNamespace(id=1, kind="blocked", created_at=0,
+                                                           payload={"reason": "linear: stopped"})]
         before = self.store.get(ISSUE)
         self.bridge.handle_webhook(self.session_event("prompted"))
         self.assertEqual(task.status, "blocked")

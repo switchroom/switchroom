@@ -3,7 +3,7 @@ from contextlib import nullcontext
 import json
 import time
 import unittest
-from unittest.mock import PropertyMock, patch
+from unittest.mock import patch
 
 import test_linear_existing_work_scenarios as existing
 import test_linear_native_bridge_scenarios as native
@@ -25,7 +25,7 @@ class ScopeEffectScenarios(unittest.TestCase):
         with self.board.conn() as conn:
             self.assertTrue(native.kb.edit_task(conn, task_id, body=self.conflicting_body(mixed)))
 
-    def check_stop(self, *, legacy=False, late=False, mixed=False, marker_free=False):
+    def check_stop(self, *, late=False, mixed=False, marker_free=False):
         _, task_id = self.fixture.existing()
         with self.board.conn() as conn:
             native.kb.claim_task(conn, task_id)
@@ -37,8 +37,7 @@ class ScopeEffectScenarios(unittest.TestCase):
                 native.kb.edit_task(conn, task_id, body="Ordinary authorized manual work")
         elif not late:
             self.edit_scope(task_id, mixed=mixed)
-        operation = "block" if legacy else "stop"
-        control = getattr(self.board, operation)
+        control = self.board.stop  # the one Stop path: upstream's plain block
         changed_scope = False
         def changed(*args, **kwargs):
             nonlocal changed_scope
@@ -46,11 +45,9 @@ class ScopeEffectScenarios(unittest.TestCase):
                 self.edit_scope(task_id, mixed=mixed)
                 changed_scope = True
             return control(*args, **kwargs)
-        with patch.object(type(self.board), "guarded_controls", new_callable=PropertyMock,
-                          return_value=not legacy):
-            with patch.object(self.board, operation, side_effect=changed) if late else nullcontext():
-                self.bridge.handle_webhook(self.fixture.fixture.event("prompted", signal="stop",
-                                                                     stamp=time.time() + 5))
+        with patch.object(self.board, "stop", side_effect=changed) if late else nullcontext():
+            self.bridge.handle_webhook(self.fixture.fixture.event("prompted", signal="stop",
+                                                                 stamp=time.time() + 5))
         after = self.board.get(task_id)
         self.assertEqual(after.status, "blocked" if marker_free else before.status)
         if not marker_free:
@@ -65,20 +62,11 @@ class ScopeEffectScenarios(unittest.TestCase):
     def test_mixed_current_scope_holds_guarded_stop(self):
         self.check_stop(mixed=True)
 
-    def test_foreign_current_scope_holds_legacy_run_stop(self):
-        self.check_stop(legacy=True)
-
     def test_final_native_guarded_stop_read_holds_scope_change(self):
         self.check_stop(late=True, mixed=True)
 
-    def test_final_native_legacy_stop_read_holds_scope_change(self):
-        self.check_stop(legacy=True, late=True)
-
     def test_marker_free_authorized_guarded_stop_remains_usable(self):
         self.check_stop(marker_free=True)
-
-    def test_marker_free_authorized_legacy_stop_remains_usable(self):
-        self.check_stop(legacy=True, marker_free=True)
 
     def test_lost_stop_response_and_later_scope_change_never_restop_resumed_work(self):
         _, task_id = self.fixture.existing()

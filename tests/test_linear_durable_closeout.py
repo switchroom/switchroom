@@ -83,7 +83,7 @@ class DurableCloseoutTests(unittest.TestCase):
                 before = store.get(ISSUE)
                 bridge.flush()
                 self.assertEqual(store.get(ISSUE), before)
-                self.assertEqual(kanban.tasks['task-1'].status, 'blocked')
+                self.assertEqual(kanban.tasks['task-1'].status, 'ready')  # created ready, never claimed
                 self.assertEqual(len(kanban.creates), 1)
                 self.assertFalse(any('issueUpdate' in query for query in authority.mutations))
                 self.assertEqual(kanban.comments, [])

@@ -127,10 +127,10 @@ class ExternalWaitScenarios(unittest.TestCase):
         self.pump_after_gap()
         self.assertEqual(self.status(), "ready")
         unblocked = [e for e in self.board.history(self.task_id, 0) if e.kind == "unblocked"]
-        self.assertEqual(len(unblocked), 2)  # admission, then this resume
-        self.assertTrue(unblocked[-1].payload["request_id"].startswith("linear:"))
-        self.assertEqual(unblocked[-1].payload["expected_event_id"], [e for e in self.board.history(self.task_id, 0)
-                                                                      if e.kind == "blocked"][-1].id)
+        self.assertEqual(len(unblocked), 2)  # setup's resume, then this one (upstream's plain unblock)
+        events = self.board.history(self.task_id, 0)
+        self.assertEqual(events[-1].id, unblocked[-1].id)
+        self.assertEqual(events[-2].id, [e for e in events if e.kind == "blocked"][-1].id)  # the wait was newest
         self.reporter.flush()
         self.assertTrue(any("done. The agent continues" in body for body in self.remote.bodies(ISSUE)))
 

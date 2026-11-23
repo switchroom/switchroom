@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
-import inspect
 import logging
 import math
 import os
@@ -676,31 +675,6 @@ def _local_work_problem(status: str | None) -> str:
     return "this agent's earlier work on this issue is waiting on something else, so taking over would start nothing here"
 
 
-def _takeover_readmittable(activation: dict) -> bool:
-    """A takeover admission refused only because a person changed routing, or the issue was
-    closed, before a new take_over's proof: that newer explicit request may admit it (and is
-    checked again from its own proof). A Stop, or an unverified start, is never retried."""
-    return (activation.get("state") == "reconcile" and not activation.get("accepted")
-            and activation.get("superseded_by") in ("person", "closed"))
-
-
-def _not_started_reason(activation: dict) -> str:
-    """Plain words for why a chat-created task was parked instead of admitted."""
-    reason = activation.get("reason") or ""
-    if not activation:
-        return "this agent's board can't start work safely right now"
-    superseded = {"person": "a person changed this issue's status, assignee or delegate in Linear while the task "
-                            "was being set up", "stop": "someone stopped it in Linear while the task was being set up",
-                  "closed": "the issue was closed while the task was being set up"}
-    if activation.get("superseded_by") in superseded:
-        return superseded[activation["superseded_by"]]
-    if reason.startswith("Stop, closure or reassignment"):
-        return "the issue was stopped, closed or reassigned while the task was being set up"
-    if reason.startswith("Native work changed"):
-        return "the task changed right after it was created"
-    return "its start couldn't be confirmed"
-
-
 def _same_work_notice(status: str | None, from_chat: bool, recorded: bool = False) -> str:
     """Another Agent Session on already admitted work, such as our own chat delegation's echo."""
     if not from_chat:
@@ -733,6 +707,37 @@ def _adopted_session_notice(status: str | None, source: str) -> str:
     else:
         state = "It is waiting to start"
     return f"Continuing the existing work on this issue{where}. {state}; progress will appear in this session."
+def _creation_park(events: list) -> int | None:
+    """The id of the initial block a task created parked was born with (whatever came after), else None."""
+    if (len(events) >= 2 and events[0].kind == "created" and (events[0].payload or {}).get("status") == "blocked"
+            and events[1].kind == "blocked" and (events[1].payload or {}).get("reason") == "initial_status"):
+        return events[1].id
+    return None
+def _creation_history(events: list):
+    """(the event the work became runnable at, the events after it) for our own creation: created
+    ready, or created parked and its park lifted by the next event. (None, []) for anything else."""
+    if events and events[0].kind == "created":
+        if (len(events) >= 3 and events[1].kind == "blocked" and events[2].kind == "unblocked"
+                and (events[1].payload or {}).get("reason") == "initial_status"):
+            return events[2], events[3:]
+        if (events[0].payload or {}).get("status") != "blocked":
+            return events[0], events[1:]
+    return None, []
+NOT_STARTED = {
+    "input": "Queued. Work starts as soon as this request is saved; nothing is needed from you.",
+    "stopped": ("This work hasn't started: someone stopped it while it was being set up, so nothing is running. "
+                "It stays stopped until someone resumes it on the agent's board."),
+    "interrupted": ("This work hasn't started yet: its setup was interrupted, so nothing is running. Ask the "
+                    "agent in chat to work on it again, or delegate the issue to the agent again, to start it."),
+}
+def _started_notice(status: str | None) -> str:
+    """The thought on the Agent Session whose delegation just started this work."""
+    if status == "running":
+        return "On it: the agent is working on this now; updates appear here."
+    if status == "ready":
+        return ("On it: this is queued for the next free worker and shows In Progress once one picks it up; "
+                "updates appear here.")
+    return "The task changed right after it was created, so the agent left it as it is and didn't start it."
 STOPPED_NOTICE = "Stopped. The agent won't continue this until someone asks it to resume."
 UNCONFIRMED_STOP = ("The Stop couldn't be confirmed. An operator needs to check the task on the agent's "
                     "board.")
@@ -1060,9 +1065,6 @@ class Kanban:
     def create(self, **fields: Any):
         if self.executor_profile is not None:
             fields["assignee"] = self.executor_profile
-        if (fields.get("initial_status") == "blocked"
-                and "transient_hold" in inspect.signature(self.kb.create_task).parameters):
-            fields["transient_hold"] = True  # Admission lifts this hold within a second: not a block anyone answers.
         with self.conn() as conn:
             task_id = self.kb.create_task(conn, board=self.board, **fields)
         return self.get(task_id)
@@ -1123,9 +1125,9 @@ class Kanban:
         """Native notify subscription for the chat that asked; core's notifier delivers to it."""
         with self.conn() as conn:
             self.kn.add_notify_sub(conn, task_id=task_id, **route)
-    def complete_recorded(self, task_id: str, expected_event_id: int, *, summary: str, evidence: list[str]) -> bool:
+    def complete_recorded(self, task_id: str, *, summary: str, evidence: list[str]) -> bool:
         """Close work already finished in chat: only the pristine parked task, never a runnable one."""
-        if self.initial_activation_event(task_id) != expected_event_id:
+        if self.pristine_hold(task_id) is None:
             return False
         with self.conn() as conn:
             return self.kb.complete_task(conn, task_id, summary=summary,
@@ -1208,22 +1210,15 @@ class Kanban:
         run.metadata = metadata
         return run
     def block(self, task_id: str, reason: str, *, run_id: int | None = None, issue: dict | None = None) -> bool:
+        """Upstream's plain ``block_task``, fenced only on the current run id (no event guard)."""
         with self.conn() as conn:
             if issue is not None:
                 require_task_issue_scope(self.require_task(task_id), issue)
             return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input", expected_run_id=run_id)
 
-    @property
-    def guarded_controls(self) -> bool:
-        """Older native hosts can still report; they must not activate unsafely."""
-        return (all("expected_event_id" in inspect.signature(method).parameters
-                    for method in (self.kb.block_task, self.kb.unblock_task)) and
-                "request_id" in inspect.signature(self.kb.unblock_task).parameters)
-
-    def initial_activation_event(self, task_id: str) -> int | None:
+    def pristine_hold(self, task_id: str) -> int | None:
+        """The initial block of a task created parked (record_done) with nothing since, else None."""
         events = self.history(task_id, 0)
-        # A token read AFTER an operator Stop must never authorize activation.
-        # Only the pristine native create+initial-block pair identifies admission.
         if (len(events) == 2 and events[0].kind == "created" and
                 (events[0].payload or {}).get("status") == "blocked" and
                 events[1].kind == "blocked" and
@@ -1231,12 +1226,40 @@ class Kanban:
             return events[1].id
         return None
 
-    def activate(self, task_id: str, expected_event_id: int, *, issue: dict | None = None) -> bool:
+    def resume_pr_park(self, task_id: str, park_event_id: int) -> bool:
+        """Lift the fork respawn guard's park (fork-only Core writes it), guarded on that park event.
+
+        Pure upstream never writes this park, so this is only reached on the fork."""
         with self.conn() as conn:
-            if issue is not None:
-                require_task_issue_scope(self.require_task(task_id), issue)
-            return self.kb.unblock_task(conn, task_id, expected_event_id=expected_event_id,
-                                       request_id=self.activation_request_id(task_id, expected_event_id))
+            return self.kb.unblock_task(conn, task_id, expected_event_id=park_event_id,
+                                       request_id=self.activation_request_id(task_id, park_event_id))
+
+    def resume_wait(self, task_id: str, expected_event_id: int) -> bool:
+        """Plain upstream unblock of a wait whose newest event is still ``expected_event_id``.
+
+        A Stop that lands between that read and the unblock wins: the task is blocked again with
+        the Stop's own reason. Residual race: in that window a dispatcher tick may claim the task
+        before it is blocked again; the Stop then ends that run (block_task with its run id)."""
+        with self.conn() as conn:
+            newest = conn.execute("SELECT max(id) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
+            if newest != expected_event_id or not self.kb.unblock_task(conn, task_id):
+                return False
+        since = self.history(task_id, expected_event_id)
+        resumed = next((event.id for event in reversed(since) if event.kind == "unblocked"), None)
+        between = [event for event in since if resumed is None or event.id < resumed]
+        reason = next((native_event_payload(event).get("reason") for event in reversed(between)
+                       if event.kind in ("blocked", "block_loop_detected")), None)
+        stamps = {int(event.created_at) for event in between if event.kind == "commented"}
+        if reason is None and stamps:  # A Stop on parked work is its comment (see stop)
+            with self.read_conn() as conn:
+                reason = next((comment.body for comment in sorted(self.comments(conn, task_id), key=lambda c: c.id, reverse=True)
+                               if int(comment.created_at) in stamps and _bridge_comment_author(comment.author)
+                               and (comment.body or "").startswith(OWN)), None)
+        if reason is None:
+            return True
+        with self.conn() as conn:
+            self.kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+        return False
 
     def newest_pr_url(self, task_id: str) -> str | None:
         """The last PR link in the newest comment carrying one, as core's respawn guard reads it."""
@@ -1249,29 +1272,34 @@ class Kanban:
         return None
 
     def activation_request_id(self, task_id: str, expected_event_id: int) -> str:
+        """The label on a PR-park resume (resume_pr_park), so its own unblock is recognisable."""
         value = f"activate:{self.executor_profile}:{self.board or 'default'}:{task_id}:{expected_event_id}"
         return "linear:" + hashlib.sha256(value.encode()).hexdigest()
 
-    def activation_receipt(self, task_id: str, expected_event_id: int, events: list | None = None) -> bool:
-        after = self.history(task_id, expected_event_id) if events is None else events
-        return bool(after and after[0].kind == "unblocked" and
-                    (after[0].payload or {}).get("request_id") == self.activation_request_id(task_id, expected_event_id) and
-                    (after[0].payload or {}).get("expected_event_id") == expected_event_id)
+    def stop(self, task_id: str, reason: str, *, run_id: int | None = None, issue: dict | None = None) -> bool:
+        """A Linear Stop: upstream's plain block, fenced on the current run. Upstream can't block
+        work that is already parked (blocked, no run) again, so there the Stop is a native comment
+        with that reason: a newer event, so no automatic resume of the park follows any more."""
+        if self.block(task_id, reason, run_id=run_id, issue=issue):
+            return True
+        task = self.require_task(task_id)
+        if task.status not in ("blocked", "triage") or task.current_run_id is not None:
+            return False
+        self.comment(task_id, reason, marker=reason)
+        return True
 
-    def stop(self, task_id: str, reason: str, *, expected_event_id: int,
-             run_id: int | None = None, issue: dict | None = None) -> bool:
-        with self.conn() as conn:
-            if issue is not None:
-                require_task_issue_scope(self.require_task(task_id), issue)
-            return self.kb.block_task(conn, task_id, reason=reason, kind="needs_input",
-                                      expected_run_id=run_id, expected_event_id=expected_event_id)
+    def stop_recorded(self, task_id: str, reason: str, events: list) -> bool:
+        """This Stop's own native record is in history: its block, or its comment on parked work."""
+        return (any(event.kind in ("blocked", "block_loop_detected") and (event.payload or {}).get("reason") == reason
+                    for event in events)
+                or (any(event.kind == "commented" for event in events) and bool(self.find_comment(task_id, reason, reason))))
 
     def stop_started(self, task_id: str, reason: str, *, after: float) -> list[str]:
         """Apply the same native Stop to unfinished tasks this task started, transitively.
 
         Native create records ``creator_task_id`` on the task's ``created`` event;
-        Core has no Stop-descendants call, so each one gets the ordinary guarded
-        ``block_task``. Idempotent: a task already carrying this Stop, or one a
+        Core has no Stop-descendants call, so each one gets the ordinary
+        upstream ``block_task``. Idempotent: a task already carrying this Stop, or one a
         human explicitly resumed or finished after ``after``, is left alone.
         Only this board is visible; tasks started on another board are not.
         """
@@ -1298,8 +1326,7 @@ class Kanban:
                         break
                     with self.conn() as conn:
                         if self.kb.block_task(conn, child, reason=reason, kind="needs_input",
-                                              expected_run_id=task.current_run_id if task.status == "running" else None,
-                                              expected_event_id=events[-1].id if events else None):
+                                              expected_run_id=task.current_run_id if task.status == "running" else None):
                             stopped.append(child)
                             break
         return stopped
@@ -1765,20 +1792,20 @@ class Bridge:
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc
         diag.warn("scope.fenced", "refused", "scope_refused", exc=type(exc).__name__)
-    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool | None:
+    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", staged: bool = False) -> bool | None:
         # A person is waiting on Agent Session events (a Stop, a question, a delegation): never deferred for budget.
         with self._priority("essential" if event.get("type") == "AgentSessionEvent" else "normal"):
-            return self._route_webhook(event, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
-    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool | None:
+            return self._route_webhook(event, assignment_prompt=assignment_prompt, staged=staged)
+    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", staged: bool = False) -> bool | None:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             if event.get("type") == "AgentSessionEvent":
                 activity_id = ((event.get("agentActivity") or {}).get("id") if event.get("action") == "prompted" else None)
                 with self.api.requester_session((event.get("agentSession") or {}).get("id"), activity_id=activity_id):
-                    return self._handle_webhook(event, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
+                    return self._handle_webhook(event, assignment_prompt=assignment_prompt, staged=staged)
             if event.get("type") == "Issue" and not self.store.get((event.get("data") or {}).get("id")):
                 return
-        return self._handle_webhook(event, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
-    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool | None:
+        return self._handle_webhook(event, assignment_prompt=assignment_prompt, staged=staged)
+    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", staged: bool = False) -> bool | None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
@@ -1823,7 +1850,7 @@ class Bridge:
             if row and stamp < float(row["last_updated_at"]):
                 return diag.because("superseded", True)  # A newer reporting/admission observation superseded this input.
             if event.get("action") == "created":
-                return self._delegated(event, issue, session_id, row, assignment_prompt=assignment_prompt, consumer_input_pending=consumer_input_pending)
+                return self._one_owner(event, issue, session_id, row, assignment_prompt=assignment_prompt, staged=staged)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
                 if row is None:
                     self.store.record_unbound_stop(issue_id, stamp, session_id=session_id,
@@ -1841,31 +1868,6 @@ class Bridge:
             elif event.get("action") == "prompted":
                 self._prompted(event, issue, session_id, row, activity)
 
-    def _delegated(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None,
-                   *, assignment_prompt: str = "", consumer_input_pending: bool = False) -> bool:
-        if row:
-            if self._assignment_activation(row):
-                if row.get("owner_ref") != session_id:
-                    # Our own chat-started work (or a re-delegation): the same work, never a second session.
-                    task = self.native_status(issue["id"])
-                    created = (self.store.native_intent(f"create:{issue['id']}") or {}).get("payload") or {}
-                    notice = (self._finished_notice(row) if task.get("status") == "done" else None) or \
-                        _same_work_notice(task.get("status"), created.get("origin") == "chat",
-                                          created.get("record_done") is True)
-                    if self._same_work_session(issue["id"], session_id, row, task, notice):
-                        return True
-                return diag.evt("session.reuse", "applied", "assignment_echo", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
-            task = self.native_status(issue["id"])
-            if task.get("reconciliation_required"):
-                self._decline(issue["id"], session_id, task["message"], activity_id=session_id)
-                return diag.decision("session.start", diag.because("reconciliation_required"), iss=issue["id"], sess=session_id, task=row.get("task_id"))
-            if row.get("owner_ref") == session_id:
-                # A redelivery of the session this work is already linked to: it was answered the first time.
-                return diag.evt("session.reuse", "applied", "same_session", iss=issue["id"], sess=session_id, task=row.get("task_id")) or True
-            if self._same_work_session(issue["id"], session_id, row, task, _existing_work_notice(task.get("status"))):
-                return True
-            return diag.decision("session.start", diag.because("existing_binding", True, "refused"), iss=issue["id"], sess=session_id, task=row.get("task_id"))  # The original durable binding was verified; do not resume it.
-        return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}", prompt=assignment_prompt, consumer_input_pending=consumer_input_pending), iss=issue["id"], sess=session_id)
     def _finished_notice(self, row: dict) -> str | None:
         """The result of finished work for a session opened after it finished (FM2: a record_done
         session used to get only "nothing new was started"): the summary and evidence links, as
@@ -1886,29 +1888,58 @@ class Bridge:
         if not body or _INTERNAL_WORDS.search(body):
             return None  # nothing readable to say: the plain notice answers instead
         return body  # deterministic: the reply's stable id is built from it
-    def _same_work_session(self, issue_id: str, session_id: str, row: dict, task: dict, notice: str) -> bool:
-        """Answer a new Agent Session on work this profile already holds; True when it now reports there.
+    def _one_owner(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None,
+                   *, assignment_prompt: str = "", staged: bool = False) -> bool:
+        """The one ownership rule for a new Agent Session, keyed on ``linear:<issue_id>``.
 
-        Linear opens one when this app becomes delegate of work bound with no session (started
-        from chat, take_over or a track link), and a ``response`` would close it at once (HF-630).
-        Live work adopts it instead: progress, heartbeats and the keepalive go to this session as
-        activities and Done is its only response. A session the work already reports to is never
-        taken over while it may still be open, so that case only gets a thought. Finished work,
-        record_done and specialist ``agent_session`` scope (whose owner session authorizes
-        effects) keep the plain response.
+        That key is the task's upstream idempotency key: a task bound here, or one ``_start``
+        finds by that key, keeps its one owner. A new session on it (our own creator-less
+        self-delegation echo, a redelivery or a person delegating again) is adopted onto it with
+        a compare-and-set on the owner (``store.adopt_session``) or answered; it never gets a
+        second task or a model turn redoing the work. Only an issue with no task starts one.
+        ``staged``: this session's native input must commit before the new task may run (see _start).
+
+        Adoption: live work reports to this session from now on (progress, the keepalive, and
+        Done as its only response), because a ``response`` would close it at once (HF-630). A
+        session the work already reports to is never taken over while it may still be open, so
+        that case only gets a thought. Finished work, record_done and specialist
+        ``agent_session`` scope (whose owner session authorizes effects) get the plain answer.
         """
+        if not row:
+            return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}",
+                                                              prompt=assignment_prompt, staged=staged), iss=issue["id"], sess=session_id)
+        issue_id, fields = issue["id"], {"iss": issue["id"], "sess": session_id, "task": row.get("task_id")}
+        task = self.native_status(issue_id)
+        if task.get("reconciliation_required"):
+            self._decline(issue_id, session_id, task["message"], activity_id=session_id)
+            return diag.decision("session.start", diag.because("reconciliation_required"), **fields)
+        if row.get("owner_ref") == session_id:
+            # A redelivery of the session this work is already linked to: it was answered the first time.
+            return diag.evt("session.reuse", "applied", "same_session", **fields) or True
         created = (self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}
+        if ((event.get("agentSession") or {}).get("creatorId") and created.get("origin") == "chat"
+                and not created.get("takeover_from") and not created.get("record_done")
+                and self._not_started(issue_id, row["task_id"]) == "interrupted"):
+            # A person delegating it in Linear is fresh authority for a chat start that never got going.
+            if self.release_parked(issue_id, delegated_ms=event_ms(event), announce=False):
+                task = self.native_status(issue_id)
+        not_started = self._not_started(issue_id, row["task_id"]) if task.get("linked") else None
+        not_started = not_started if not_started in ("stopped", "interrupted") else None  # "input": it starts shortly
+        recorded, status = created.get("record_done") is True, task.get("status")
         # Finished work whose Done closeout is not delivered yet still reports here: the Done is its response.
-        closing = task.get("status") == "done" and self._session_completion_pending(row)
-        live = (task.get("linked") and not task.get("reconciliation_required") and
-                (task.get("status") not in ("done", "archived") or closing) and not created.get("record_done"))
-        if not live or (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
+        closing = status == "done" and self._session_completion_pending(row)
+        notice = (NOT_STARTED[not_started] if not_started else
+                  ((self._finished_notice(row) if status == "done" else None) or
+                   _same_work_notice(status, created.get("origin") == "chat", recorded)) if created
+                  else _existing_work_notice(status))
+        if (not task.get("linked") or (status in ("done", "archived") and not closing) or recorded
+                or (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session"):
             self._decline(issue_id, session_id, notice, activity_id=session_id)
-            return False
+            return diag.evt("session.reuse", "applied", "assignment_echo", **fields) or True
         owner = row.get("owner_ref") or ""
         if not owner or self.store.session_answered(issue_id, owner):
             source = ("takeover" if created.get("takeover_from") else "chat") if created.get("origin") == "chat" else ""
-            body = _adopted_session_notice("finishing" if closing else task.get("status"), source)
+            body = NOT_STARTED[not_started] if not_started else _adopted_session_notice("finishing" if closing else status, source)
             adoption_notice = {"id": stable_uuid4("decline", issue_id, session_id, session_id, body),
                 "issue_id": issue_id, "session_id": session_id, "one_try": True,
                 "requester_sessions": {issue_id: session_id}, "reporting_notice_version": 1,
@@ -1918,11 +1949,9 @@ class Bridge:
                         notice=adoption_notice, at=self.clock())):
                 if (issue_id, session_id) in self.session_notices:
                     self.session_notices[(issue_id, session_id)] = True
-                diag.evt("session.reuse", "applied", "session_adopted", iss=issue_id, sess=session_id, task=row.get("task_id"))
-                return True
+                return diag.evt("session.reuse", "applied", "session_adopted", **fields) or True
         self._decline(issue_id, session_id, notice, activity_id=session_id, kind="thought")
-        diag.evt("session.reuse", "skipped", "owner_session_live", iss=issue_id, sess=session_id, task=row.get("task_id"))
-        return False
+        return diag.evt("session.reuse", "skipped", "owner_session_live", **fields) or True
     def _prompted(self, event, issue, session_id, row, activity) -> None:
         body = str((activity.get("content") or {}).get("body") or activity.get("body") or "").strip()
         if not row:
@@ -2044,7 +2073,11 @@ class Bridge:
         # Archived or cancelled with no outcome: nothing posts; _reconcile_status parks a
         # started state this app set back to Todo (no agent is working on it now).
         self._capture_native_event(issue_id, event_id, [], at=self.clock())
-    def _start(self, event, issue, session_id, stamp, key, prompt: str = "", *, consumer_input_pending: bool = False) -> bool:
+    def _start(self, event, issue, session_id, stamp, key, prompt: str = "", *, staged: bool = False) -> bool:
+        """Start the issue's one task. It is created parked and only becomes runnable once bound
+        (``release_parked``), so a crash between creation and binding never leaves unbound work
+        running. A delegation whose session carries native input (``staged``) stays parked until
+        that input commits too: its worker may ask that session questions."""
         issue_id = issue["id"]
         if self.store.get(issue_id):
             return True
@@ -2058,8 +2091,7 @@ class Bridge:
             return diag.because("closed_or_elsewhere", True, "refused")
         if not getattr(self.kanban, "executor_profile", None):
             raise LinearError("Native executor profile is unverified", retryable=False)
-        # An interrupted creation belongs to its saved request, including its
-        # original activation token. Discovery must not adopt that uncertainty.
+        # An interrupted creation belongs to its saved request. Discovery must not adopt that uncertainty.
         if self.store.native_intent(f"create:{issue_id}") is None:
             try:
                 existing = self.kanban.discover(fresh)
@@ -2123,14 +2155,13 @@ class Bridge:
                    "board": self.kanban.board or "default", "external_key": key,
                    "title": f"{fresh.get('identifier') or issue_id}: {fresh.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=fresh.get("identifier") or issue_id, url=fresh.get("url") or "", context=context),
-                   "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only", "initial_status": "blocked",
-                   "activation": "native-event-guard-v1", "source_ms": stamp,
-                   **({"requires_native_input": True} if consumer_input_pending else {})}
+                   "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
+                   "source_ms": stamp, "parked": True, **({"requires_native_input": True} if staged else {})}
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:
             original = prior["payload"]
-            if original.get("initial_status") != "blocked" or any(original.get(field) != payload[field] for field in ("kind", "issue_id", "profile", "board", "external_key")):
+            if any(original.get(field) != payload[field] for field in ("kind", "issue_id", "profile", "board", "external_key")):
                 raise LinearError("Native creation request scope changed; reconcile it", retryable=False)
             payload = original  # Retry reconciles the original request, not newly edited tracker prose.
         saved, first = self.store.native_intent_prepare(intent_key, payload)
@@ -2145,8 +2176,11 @@ class Bridge:
                 if (current.get("delegate") or {}).get("id") != me or (current.get("state") or {}).get("type") in CLOSED:
                     self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Assignment changed before native request"})
                     return False
+                # Every admission check is done: the task is created with the issue's key, parked
+                # until it is bound.
                 task = self.kanban.create(title=payload["title"], created_by=payload["created_by"],
-                    body=payload["body"], idempotency_key=key, completion_contract=payload["completion_contract"], initial_status="blocked")
+                    body=payload["body"], idempotency_key=key, completion_contract=payload["completion_contract"],
+                    **({"initial_status": "blocked"} if payload.get("parked") else {}))
             except BaseException:
                 # The request might have committed. Preserve intent; never call create again.
                 raise
@@ -2157,154 +2191,119 @@ class Bridge:
                 self._decline(issue_id, session_id, "It isn't clear whether the task was created, so the agent won't try again on its own. An operator needs to check the agent's board.", activity_id=session_id)
                 return False
             task = tasks[0]
-        task = self.kanban.require_task(task.id)
-        if any(getattr(task, field, None) != payload[field] for field in ("title", "body", "created_by", "completion_contract")):
-            self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native task does not match the prepared request"})
-            raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
-        require_task_issue_scope(task, fresh)
-        if not self.store.bind_native(issue_id, task.id, self.kanban.executor_profile, self.kanban.board or "default",
-                                     owner_ref=session_id, project_id=project,
-                                     completion_scope=self._completion_scope(self.kanban, task), at=stamp):
-            self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
+        if not self._bind_created(intent_key, payload, task, fresh, owner_ref=session_id, project_id=project, at=stamp):
             return False
-        self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
+        stopped = self._pending_assignment_stop(self.store.get(issue_id))  # A Stop recorded meanwhile wins (and says so).
+        if payload.get("requires_native_input"):
+            self.kanban.subscribe(task.id, issue_id, issue=fresh)
+            return True  # Parked until this session's input commits; release_parked announces the start.
+        self.release_parked(issue_id, announce=False)
         self.kanban.subscribe(task.id, issue_id, issue=fresh)
-        if self._assignment_activation(self.store.get(issue_id)):
-            return True
-        if payload.get("requires_native_input") and not self.store.conversation_input(issue_id, session_id):
-            return True  # Its actual Core input must commit before the initial guarded activation.
-        unbound_stop = self.store.native_intent(f"unbound-stop:{issue_id}")
-        if unbound_stop and float(unbound_stop.get("source_ms") or 0) >= stamp:
-            self._decline(issue_id, session_id, "Stop arrived while the task was being created, so it was created paused. Nothing runs until someone asks the agent to resume.", activity_id=session_id)
-        else:
-            self.activity(issue_id, session_id, "thought", "Task created but not started yet. It starts once the agent's board activates it; no worker is running.")
+        status = self.kanban.require_task(task.id).status
+        if status in ("ready", "running") or not stopped:
+            self.activity(issue_id, session_id, "thought", _started_notice(status))
         return True
 
-    def _assignment_activation(self, row: dict | None, *, handed_over: str | None = None,
-                               proven_ms: float | None = None) -> bool:
-        """Finish only this version's authorized admission with a native event CAS.
+    def release_parked(self, issue_id: str, *, proven_ms: float | None = None, delegated_ms: float | None = None,
+                       recovery: bool = False, announce: bool = True) -> bool:
+        """Lift the park of the task our own creation made for this issue, once it is bound.
 
-        The existing intent stores delivery progress, not another worker claim.
-        Legacy parked tasks and already settled admissions are never auto-resumed.
-        ``handed_over`` is the old delegate whose run the calling take_over has just proven ended:
-        a takeover's task is admitted only then, never later (see below). ``proven_ms`` is when
-        that proof arrived: a person's routing change after it wins, an earlier one does not.
-        """
-        if not row or row.get("origin") != "native":
+        Only our creation's pristine park (create + initial block, nothing since) is lifted, with
+        upstream's plain unblock; a Stop that lands in between wins (``Kanban.resume_wait``). It is
+        decided once (``release:`` intent). A delegation through native input waits for that input;
+        record_done is never released. A take_over task is released only by the take_over call that
+        has just proven a handover (``proven_ms``), with no person's routing change since. The
+        service loop (``recovery``) finishes only an interrupted Linear delegation. A person's Linear
+        delegation (``delegated_ms``) is fresh authority for a chat start that never got going. Every
+        release re-reads the issue: it must be open, and its delegate this app (a chat start may also
+        be still undelegated; a take_over task may still show the old delegate). True once it may run."""
+        row = self.store.get(issue_id)
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        payload = created.get("payload") or {}
+        if (row and row.get("origin") == "native" and created.get("state") == "attempting" and payload.get("parked")
+                and [task.id for task in self.kanban.find_created(payload["external_key"])] == [row["task_id"]]):
+            # A crash after binding, before the creation receipt: the bound task is the one it made.
+            created = self.store.native_intent_settle(f"create:{issue_id}", {"state": "applied", "task_id": row["task_id"]})
+        if (not row or row.get("origin") != "native" or created.get("state") != "applied"
+                or created.get("task_id") != row["task_id"] or not payload.get("parked") or payload.get("record_done")):
             return False
-        issue_id = row["issue_id"]
-        created = self.store.native_intent(f"create:{issue_id}")
-        payload = (created or {}).get("payload", {})
-        if not created or payload.get("activation") != "native-event-guard-v1":
-            return False
-        if created.get("state") == "attempting":
-            # A crash can occur after binding but before its creation receipt.
-            # Inspect the already committed native request; never call create again.
-            adapter = self._binding_adapter(issue_id)
-            candidates = adapter.find_created(payload["external_key"])
-            if (len(candidates) != 1 or candidates[0].id != row["task_id"] or
-                    any(getattr(candidates[0], field, None) != payload[field]
-                        for field in ("title", "body", "created_by", "completion_contract"))):
-                return False
-            created = self.store.native_intent_settle(f"create:{issue_id}",
-                                                      {"state": "applied", "task_id": row["task_id"]})
-        if created.get("state") != "applied" or created.get("task_id") != row["task_id"]:
+        key = f"release:{issue_id}:{row['task_id']}"
+        if (self.store.native_intent(key) or {}).get("state") == "applied":
+            return True
+        if recovery and payload.get("origin") == "chat":
+            return False  # A chat start is finished by repeating that request, never later on its own.
+        if delegated_ms is not None and (payload.get("origin") != "chat" or payload.get("takeover_from")):
             return False
         if payload.get("requires_native_input") and not self.store.conversation_input(issue_id, row.get("owner_ref")):
             return False
-        if payload.get("record_done"):
-            # Work already finished in chat is never runnable: only _record_done settles it,
-            # even after a crash between creation and completion. Never admitted here.
-            diag.evt("claim.decision", "skipped", "record_done_parked", iss=issue_id, task=row["task_id"])
-            return True
-        # The chat request authorized this creation; Linear routing to this app follows it,
-        # unless someone has since delegated the issue elsewhere.
-        from_chat = payload.get("origin") == "chat"
-        takeover_from = payload.get("takeover_from") if from_chat and not payload.get("record_done") else None
-        key = f"activate:{issue_id}:{row['task_id']}"
-        prior = self.store.native_intent(key)
-        proven = bool(takeover_from) and handed_over == takeover_from
-        # A newer proven take_over may retry an admission only a person's change or a closure refused.
-        readmit = proven and bool(prior) and _takeover_readmittable(prior)
-        if prior and prior.get("state") in ("applied", "reconcile") and not readmit:
-            self._pending_assignment_stop(row)
-            return True
+        if payload.get("takeover_from") and proven_ms is None:
+            return False
         adapter = self._binding_adapter(issue_id)
-        binding = self.store.native_binding(issue_id)
-        if (not binding or binding["task_id"] != row["task_id"] or
-                binding["profile"] != payload["profile"] or binding["board"] != payload["board"]):
+        hold = adapter.pristine_hold(row["task_id"])
+        if hold is None:
             return False
-        if not getattr(adapter, "guarded_controls", False):
-            return False
-        if takeover_from and handed_over != takeover_from:
-            # Never admitted late (by recovery, an assignment echo or work_on): by then the old
-            # delegate may be running again. Only the take_over call that has just proven its run
-            # ended admits this task; a retried take_over proves the same pause again. An admission
-            # that already landed (a lost reply, a crash) is only recognised by its receipt.
-            if prior and adapter.activation_receipt(row["task_id"], prior["payload"]["expected_event_id"]):
-                self.store.native_intent_settle(key, {"state": "applied", "accepted": True, "owned_activation": True})
-                self._pending_assignment_stop(row)
-                return True
-            return False
-        token = prior["payload"]["expected_event_id"] if prior else adapter.initial_activation_event(row["task_id"])
-        request = {"kind": "activate", "issue_id": issue_id, "task_id": row["task_id"],
-                   "profile": adapter.executor_profile, "board": adapter.board or "default",
-                   "expected_event_id": token, "source_ms": payload["source_ms"]}
-        if token is None:
-            self.store.native_intent_prepare(key, request)
-            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Native work changed after creation"})
-            if row["owner_ref"]:
-                self._decline(issue_id, row["owner_ref"], "The task changed right after it was created, so the agent left it as it is and didn't start it.")
-            diag.evt("claim.decision", "skipped", "native_changed", iss=issue_id, task=row["task_id"])
-            return True
-        self.store.native_intent_prepare(key, request)
+        since = float(next(value for value in (proven_ms, delegated_ms, payload["source_ms"]) if value is not None))
         stop = self.store.native_intent(f"unbound-stop:{issue_id}")
-        issue = self._effect_issue(issue_id)
-        delegate_id = (issue.get("delegate") or {}).get("id")
-        # A proven take_over is a new explicit request: only changes after its own proof win.
-        since = float(proven_ms) if proven and proven_ms is not None else float(payload["source_ms"])
-        stopped = bool(stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"]))
-        closed = (issue.get("state") or {}).get("type") in CLOSED
-        if (stopped or closed or
-                (delegate_id != self.api.viewer_id() and not (
-                    (from_chat and delegate_id in (None, takeover_from)
-                     and self._chat_admission_allowed(issue_id, payload, issue, since=since))))):
-            self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop, closure or reassignment superseded admission",
-                                                 "superseded_by": "stop" if stopped else "closed" if closed else "person",
-                                                 **({"chat_superseded": True} if from_chat else {})})
-            if from_chat and self.store.drop_unsent_delegate(issue_id, row["task_id"], at=self.clock()):
-                # Parked chat work is not shown as worked on: its delegate, queued before admission, never goes out.
-                diag.evt("delegate.write", "skipped", "admission_superseded", iss=issue_id, task=row["task_id"])
-            if stop:
-                self._pending_assignment_stop(row)
-            if row["owner_ref"]:
-                self._decline(issue_id, row["owner_ref"], "The assignment changed or a Stop came in while the task was being set up, so it wasn't started. An operator should confirm nothing is already running.")
-            diag.evt("claim.decision", "skipped", "admission_superseded", iss=issue_id, task=row["task_id"])
-            return True
-        require_task_issue_scope(adapter.require_task(row["task_id"]), issue)
-        accepted = adapter.activate(row["task_id"], token, issue=issue)
-        owned_activation = accepted
-        if not accepted:
-            # A lost successful reply or another operator may have transitioned
-            # the task. Never refresh the token to revive a later stopped task.
-            events = adapter.history(row["task_id"], token)
-            accepted = adapter.activation_receipt(row["task_id"], token, events)
-            owned_activation = accepted
-        self.store.native_intent_settle(key, {"state": "applied" if accepted else "reconcile",
-                                             "accepted": accepted, "owned_activation": owned_activation,
-                                             **({"proven_ms": since} if proven else {}),
-                                             **({"superseded_by": None, "chat_superseded": False,
-                                                 "reason": None if accepted else "Native activation unverified"}
-                                                if readmit else {})})
-        diag.evt("claim.decision", "routed" if accepted else "skipped", "-" if accepted else "activation_unverified", iss=issue_id, task=row["task_id"])
-        self._pending_assignment_stop(row)
-        task = adapter.require_task(row["task_id"])
-        if row["owner_ref"]:  # A chat-started task answers in its chat; Linear hears from native events.
-            self.activity(issue_id, row["owner_ref"], "thought",
-                          ("On it: the agent is working on this now; updates appear here." if task.status == "running" else
-                           "On it: this is queued for the next free worker and shows In Progress once one picks it up; "
-                           "updates appear here.") if accepted else
-                          f"Linked to the agent's task, which is currently {task.status}. Nothing new was started.")
+        if stop and float(stop.get("source_ms") or 0) >= since:
+            return False
+        issue, viewer = self._effect_issue(issue_id), self.api.viewer_id()
+        delegate = (issue.get("delegate") or {}).get("id")
+        from_chat = payload.get("origin") == "chat" and delegated_ms is None and not recovery
+        allowed = {viewer, None, payload.get("takeover_from")} if from_chat else {viewer}
+        if (issue.get("state") or {}).get("type") in CLOSED or delegate not in allowed:
+            return False
+        if payload.get("takeover_from") and not self._chat_admission_allowed(issue_id, payload, issue, since=since):
+            return False
+        self.store.native_intent_prepare(key, {"issue_id": issue_id, "task_id": row["task_id"], "park_event_id": hold})
+        released = adapter.resume_wait(row["task_id"], hold)
+        self.store.native_intent_settle(key, {"state": "applied" if released else "reconcile"})
+        diag.evt("claim.decision", "routed" if released else "skipped", "-" if released else "native_changed",
+                 iss=issue_id, task=row["task_id"])
+        if released and announce and row.get("owner_ref"):
+            self.activity(issue_id, row["owner_ref"], "thought", _started_notice(adapter.require_task(row["task_id"]).status))
+        return released
+
+    def _not_started(self, issue_id: str, task_id: str) -> str | None:
+        """Why our own parked creation for this issue has not started: "input" (its delegation's
+        input is still being saved), "stopped" (a Stop holds it) or "interrupted" (its setup didn't
+        finish); None once it was released, or for work that isn't such a creation."""
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        payload = created.get("payload") or {}
+        if (not payload.get("parked") or payload.get("record_done") or created.get("task_id") != task_id
+                or (self.store.native_intent(f"release:{issue_id}:{task_id}") or {}).get("state") == "applied"):
+            return None
+        adapter = self._binding_adapter(issue_id)
+        if adapter.require_task(task_id).status not in ("blocked", "triage"):
+            return None
+        if adapter.pristine_hold(task_id) is None:
+            return "stopped"
+        row = self.store.get(issue_id) or {}
+        if payload.get("requires_native_input") and not self.store.conversation_input(issue_id, row.get("owner_ref")):
+            return "input"
+        return "interrupted"
+
+    def _bind_created(self, intent_key: str, payload: dict, task, issue: dict, **binding) -> bool:
+        """Verify and bind the task this request created. A task that fails these checks (and that
+        nothing else has bound) is held with upstream's plain block, so it is never released."""
+        issue_id, task = payload["issue_id"], self.kanban.require_task(task.id)
+        def hold():
+            if (self.store.get(issue_id) or {}).get("task_id") != task.id:
+                self.kanban.block(task.id, f"{OWN} held before it started: the new task didn't match its request")
+        try:
+            if any(getattr(task, field, None) != payload[field] for field in ("title", "body", "created_by", "completion_contract")):
+                self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native task does not match the prepared request"})
+                raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
+            require_task_issue_scope(task, issue)
+            bound = self.store.bind_native(issue_id, task.id, self.kanban.executor_profile, self.kanban.board or "default",
+                                           completion_scope=self._completion_scope(self.kanban, task), **binding)
+        except LinearError:
+            hold()
+            raise
+        if not bound:
+            self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
+            hold()
+            return False
+        self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
         return True
 
     def _chat_admission_allowed(self, issue_id: str, payload: dict, issue: dict, *, since: float | None = None) -> bool:
@@ -2351,11 +2350,8 @@ class Bridge:
             old = self._takeover_replaces(issue_id, row.get("task_id"))
             if issue.get("delegate") is not None and (old is None or issue["delegate"].get("id") != old):
                 return "unknown"
-            created = self.store.native_intent(f"create:{issue_id}") or {}
-            since = float(created["payload"]["source_ms"])
-            if old is not None:  # Admitted by a later proven take_over: that request is the authority.
-                activation = self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}
-                since = max(since, float(activation.get("proven_ms") or 0))
+            # The request is the authority (for take_over, its proof): a person's change since wins.
+            since = float((self.store.native_intent(f"create:{issue_id}") or {})["payload"]["source_ms"])
             viewer = self.api.viewer_id()
             if iso_ms(issue.get("updatedAt")) <= since:
                 nodes, complete = [], True  # Nothing moved since the request: no history read.
@@ -2383,9 +2379,9 @@ class Bridge:
             return "unknown"
 
     def _takeover_replaces(self, issue_id: str, task_id: str | None) -> str | None:
-        """The old delegate a take_over replaced, when this binding is that takeover's own task and
-        it was admitted after the verified handover; else None. Routing for such a task may replace
-        exactly that delegate, and that delegate app's own writes are not a person's decision."""
+        """The old delegate a take_over replaced, when this binding is that takeover's own task (only
+        created after the verified handover); else None. Routing for such a task may replace exactly
+        that delegate, and that delegate app's own writes are not a person's decision."""
         created = self.store.native_intent(f"create:{issue_id}") or {}
         payload = created.get("payload") or {}
         old = payload.get("takeover_from")
@@ -2393,7 +2389,7 @@ class Bridge:
                 and created.get("task_id") == task_id and payload.get("origin") == "chat"
                 and not payload.get("record_done")):
             return None
-        return old if (self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}).get("accepted") else None
+        return old
 
     def _chat_started(self, row: dict | None) -> bool:
         """This store's bound task was created here from a chat request (the create intent applied to it)."""
@@ -2414,23 +2410,17 @@ class Bridge:
             return self._stop(row, stop.get("session_id") or row["owner_ref"], stop.get("actor") or "Linear user",
                               float(stop["source_ms"]), stop["activity_id"])
 
-    def _instruction_follows_initial_admission(self, issue_id, task_id, adapter, stamp, events) -> bool:
+    def _follows_creation(self, issue_id: str, task_id: str, stamp: float, events: list) -> bool:
+        """This Linear input came after our own creation of the task, with no explicit control since.
+
+        The dispatcher claiming or starting it is not a control, so a same-second native
+        timestamp then cannot put the input before the work it is about."""
         created = self.store.native_intent(f"create:{issue_id}")
-        if (not created or created.get("state") != "applied" or created.get("task_id") != task_id or
-                created["payload"].get("activation") != "native-event-guard-v1" or
-                stamp < float(created["payload"].get("source_ms") or stamp)):
-            return False
-        # Initial create and initial block are native atomic history. An event
-        # receipt labels our guarded unblock even when its response was lost.
-        if (len(events) >= 2 and events[0].kind == "created" and events[1].kind == "blocked" and
-                (events[1].payload or {}).get("reason") == "initial_status"):
-            if len(events) == 2:
-                return True
-            after = events[2:]
-            return (adapter.activation_receipt(task_id, events[1].id, after) and
-                    all(event.kind not in ("unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")
-                        for event in after[1:]))
-        return False
+        start, rest = _creation_history(events)
+        return bool(created and created.get("state") == "applied" and created.get("task_id") == task_id
+                    and stamp >= float(created["payload"].get("source_ms") or stamp) and start is not None
+                    and all(event.kind not in ("unblocked", "blocked", "completed", "archived", "review_requested",
+                                               "changes_requested") for event in rest))
     def track(self, issue_id: str, task_id: str, *, board: str | None = None,
               requester_session: str | None = None, requester_activity: str | None = None, replace: bool = False,
               expected_revision: str | None = None, request_id: str | None = None,
@@ -2486,36 +2476,39 @@ class Bridge:
 
     def entrust(self, issue_id: str, *, route: dict | None = None, record_done: dict | None = None,
                 route_delegate: Callable[[dict, str], str] | None = None, takeover_from: str | None = None,
-                note: str = "", handed_over: str | None = None, proven_ms: float | None = None) -> dict:
-        """Chat-requested work through the same guarded native admission a Linear assignment uses.
+                note: str = "", proven_ms: float | None = None) -> dict:
+        """Chat-requested work under the same ownership rule a Linear assignment uses.
 
         The chat request is the authority, as a delegation is for _start. One native task per
-        issue: a bound or linked task is reused, never duplicated; the create intent and retry
-        key are shared with assignment, so our own delegation echo finds the same work. The
+        issue: a bound or linked task is reused, never duplicated; the create intent and the
+        ``linear:<issue_id>`` idempotency key are shared with assignment, so our own delegation
+        echo finds the same work. After the admission checks the task is created ready. The
         asking chat gets a native notify subscription. With record_done, work already finished
         in chat is created parked and completed with its evidence; it is never runnable.
         route_delegate(issue, task_status) queues Linear routing inside this issue's lock, right
-        after admission (admission writes nothing to Linear), with the issue version read under
-        that lock: no tick write can land between that read and the queued delegate, and the
-        status writes that follow from the work are queued after it. Work that was not admitted
-        gets no delegate. Its result is returned as "routing". takeover_from, note and handed_over
-        are for take_over: the delegate whose work a verified handover ended, a line for the new
-        task saying where to continue from, and (only right after this call's proof) that same
-        delegate again, which alone lets the takeover task be admitted.
+        after creation (which writes nothing to Linear), with the issue version read under that
+        lock: no tick write can land between that read and the queued delegate, and the status
+        writes that follow from the work are queued after it. Its result is returned as
+        "routing". takeover_from, note and proven_ms are for take_over: the delegate whose work a
+        verified handover ended, a line for the new task saying where to continue from, and when
+        that handover was requested. A takeover task is only created with that proof, and a
+        person's routing change or a Stop since the request refuses it.
         """
         with self.lock(issue_id):
             issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
             if row is not None:
-                return self._entrust_bound(row, route, record_done, route_delegate, issue, handed_over=handed_over,
-                                           proven_ms=proven_ms)
+                if not record_done:
+                    self.release_parked(issue_id, proven_ms=proven_ms)  # a repeat finishes an interrupted start
+                return self._entrust_bound(row, route, record_done, route_delegate, issue)
             if self.store.native_intent(f"create:{issue_id}") is None:
                 existing = self.kanban.discover(issue)
                 if existing:
                     return self._entrust_existing(issue, existing, route, record_done, route_delegate)
             return self._entrust_create(issue, route, record_done, route_delegate, note=note, takeover_from=takeover_from,
-                                        handed_over=handed_over, proven_ms=proven_ms)
+                                        proven_ms=proven_ms)
 
-    def entrust_checks(self, issue_id: str, *, takeover_from: str | None = None) -> tuple[dict, dict | None]:
+    def entrust_checks(self, issue_id: str, *, takeover_from: str | None = None,
+                       allow_closed: bool = False) -> tuple[dict, dict | None]:
         """Every refusal entrust can make before it writes anything: (current issue, own binding or None).
 
         take_over runs these before asking the old delegate to stop, so a request this agent would
@@ -2540,53 +2533,44 @@ class Bridge:
             row = self.store.get(issue_id)
             if row is not None and row.get("origin") != "native":
                 raise LinearError("This issue has older work from a previous setup that needs a check first; nothing was started", retryable=False)
-            if row is None and (issue.get("state") or {}).get("type") in CLOSED:
+            if row is None and not allow_closed and (issue.get("state") or {}).get("type") in CLOSED:
                 raise LinearError("This issue is closed; reopen it or create a new issue for more work", retryable=False)
             return issue, row
 
     def takeover_preflight(self, issue_id: str, *, takeover_from: str) -> tuple[str, str | None]:
         """take_over's checks before the old delegate is asked anything: ("ask_owner", None) when,
-        after a verified handover, entrust would leave exactly one task here ready or running;
-        ("already_here", None) when a takeover from that delegate already finished here (this
-        agent's task for it is admitted and ready or running) and only Linear routing may be
-        left; ("refuse_held", plain words) when an earlier takeover from that delegate left
-        something here that a new one can't start (so the delegate may still be paused for it);
-        otherwise ("refuse", plain words). Raises entrust's own refusals (LinearError) as
-        entrust_checks does.
+        after a verified handover, entrust would create exactly one task here; ("already_here",
+        None) when a takeover from that delegate already started its task here (ready or running)
+        and only Linear routing may be left; ("refuse_held", plain words) when an earlier takeover
+        from that delegate left something here that a new one can't start (so the delegate may
+        still be paused for it); otherwise ("refuse", plain words). Raises entrust's own refusals
+        (LinearError) as entrust_checks does, except a closed issue: chat refuses that itself
+        first, and once it is reopened a new take_over can start.
 
-        While a task for this issue is ready or running here, the old delegate is never asked
-        for anything. An existing local task is reused by entrust, never replaced; one that is
-        not open and runnable would leave nobody running the work once the old delegate stops."""
+        While a task for this issue is bound here, the old delegate is never asked for anything:
+        an existing local task is reused by entrust, never replaced."""
         with self.lock(issue_id):
-            issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from)
+            issue, row = self.entrust_checks(issue_id, takeover_from=takeover_from, allow_closed=True)
+            created = self.store.native_intent(f"create:{issue_id}") or {}
+            payload = created.get("payload") or {}
+            ours = payload.get("origin") == "chat" and payload.get("takeover_from") == takeover_from
             if row is not None:
                 task = self._binding_adapter(issue_id).require_task(row["task_id"])
-                created = self.store.native_intent(f"create:{issue_id}") or {}
-                payload = created.get("payload") or {}
-                from_this_takeover = (created.get("state") == "applied" and created.get("task_id") == task.id
-                                      and payload.get("origin") == "chat" and payload.get("takeover_from") == takeover_from
+                from_this_takeover = (ours and created.get("state") == "applied" and created.get("task_id") == task.id
                                       and not payload.get("record_done"))
-                activation = self.store.native_intent(f"activate:{issue_id}:{task.id}")
                 if task.status in ("ready", "running"):
-                    # Admitted (or admitted with its receipt not yet recorded, which entrust settles):
-                    # an admission refused as superseded that someone resumed since is not ours to route.
-                    if from_this_takeover and activation is not None and activation.get("state") != "reconcile":
+                    if from_this_takeover:
                         return "already_here", None
                     return "refuse", ("this agent already has work running on this issue, so the other agent was not "
                                       "asked to stop; a person needs to decide which one continues")
-                if task.status == "blocked" and from_this_takeover:
-                    activation = activation or {}
-                    if activation.get("state") in (None, "attempting") or _takeover_readmittable(activation):
-                        return "ask_owner", None  # This takeover's own parked task: admission follows a new proof.
-                    if activation.get("superseded_by") == "stop":
-                        return "refuse_held", ("someone stopped this agent's earlier takeover of it in Linear, so that "
-                                               "task won't be started here")
-                    return "refuse_held", ("this agent's earlier takeover task for it couldn't be confirmed to start, "
-                                           "so an operator needs to check it before it is started")
-                return "refuse", _local_work_problem(task.status)
-            created = self.store.native_intent(f"create:{issue_id}")
-            if created is not None:
-                return ("refuse_held" if (created.get("payload") or {}).get("takeover_from") == takeover_from else "refuse",
+                if from_this_takeover and self._never_released(issue_id, task.id):
+                    return "ask_owner", None  # Bound but never started: a new proven handover starts it.
+                return ("refuse_held" if from_this_takeover else "refuse"), _local_work_problem(task.status)
+            if created:
+                if created.get("superseded_by") == "stop":
+                    return ("refuse_held" if ours else "refuse"), (
+                        "someone stopped this agent's earlier takeover of it in Linear, so that task won't be started here")
+                return ("refuse_held" if ours else "refuse",
                         "an earlier start of this work here didn't finish setting up and needs a check first")
             existing = self.kanban.discover(issue)
             if not existing:
@@ -2600,30 +2584,39 @@ class Bridge:
                                   "asked to stop; a person needs to decide which one continues")
             return "refuse", _local_work_problem(task.status)
 
+    def _local_task(self, issue_id: str):
+        """This agent's task for the issue: the bound one, else the one an unsettled creation (a lost
+        reply) may have made, found by its key; None when there is none. A legacy binding is False."""
+        row = self.store.get(issue_id)
+        if row is not None:
+            return self._binding_adapter(issue_id).require_task(row["task_id"]) if row.get("origin") == "native" else False
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        found = self.kanban.find_created(created["payload"]["external_key"]) if created.get("state") == "attempting" else []
+        return found[0] if found else None
+
     def takeover_local_status(self, issue_id: str) -> str | None:
-        """The status of this agent's bound task for the issue (None when nothing is bound)."""
+        """The status of this agent's task for the issue (None when there is none)."""
         with self.lock(issue_id):
-            row = self.store.get(issue_id)
-            if row is None or row.get("origin") != "native":
-                return None
-            return self._binding_adapter(issue_id).require_task(row["task_id"]).status
+            return getattr(self._local_task(issue_id), "status", None)
+
+    def _never_released(self, issue_id: str, task_id: str) -> bool:
+        """Our parked creation for this issue that has never run: no release, pristine park."""
+        return (not (self.store.native_intent(f"release:{issue_id}:{task_id}") or {}).get("state")
+                and self._binding_adapter(issue_id).pristine_hold(task_id) is not None)
 
     def takeover_resume_problem(self, issue_id: str) -> str | None:
         """Before a person's resume of the old delegate: plain words for why it must not be resumed
-        (work for the issue runs or ran here), else None. A takeover task here that was never
-        admitted stays parked: only a take_over call that has just proven a handover admits it."""
+        (this agent has a task for the issue: it runs, ran or is linked), else None. A task created
+        here that is still parked and never started is no reason: it starts only after a new proof."""
         with self.lock(issue_id):
-            row = self.store.get(issue_id)
-            if row is not None:
-                task = (self._binding_adapter(issue_id).require_task(row["task_id"])
-                        if row.get("origin") == "native" else None)
-                activation = self.store.native_intent(f"activate:{issue_id}:{row['task_id']}") or {}
-                if task is None or task.status != "blocked" or activation.get("accepted"):
-                    status = getattr(task, "status", None)
-                    return ("this agent is already running it" if status in ("ready", "running") else
-                            "this agent's work on it has already finished" if status in ("done", "archived") else
-                            "this agent already has work linked to it")
-            return None
+            task = self._local_task(issue_id)
+            if task is None or (task and getattr(task, "status", None) == "blocked"
+                                and self._never_released(issue_id, task.id)):
+                return None
+            status = getattr(task, "status", None)
+            return ("this agent is already running it" if status in ("ready", "running") else
+                    "this agent's work on it has already finished" if status in ("done", "archived") else
+                    "this agent already has work linked to it")
 
     def _existing_task(self, issue: dict, existing: list):
         """The one native task already pointing at this issue that entrust may link, or LinearError."""
@@ -2664,9 +2657,10 @@ class Bridge:
         return self._entrust_bound(self.store.get(issue["id"]), route, None, route_delegate, issue)
 
     def _entrust_create(self, issue: dict, route: dict | None, record_done: dict | None, route_delegate=None,
-                        note: str = "", takeover_from: str | None = None, handed_over: str | None = None,
-                        proven_ms: float | None = None) -> dict:
+                        note: str = "", takeover_from: str | None = None, proven_ms: float | None = None) -> dict:
         issue_id, key = issue["id"], f"linear:{issue['id']}"
+        if takeover_from and proven_ms is None:
+            raise LinearError("A takeover task is only created right after the other agent confirmed its pause", retryable=False)
         project = (issue.get("project") or {}).get("id")
         payload = {"kind": "create", "issue_id": issue_id, "profile": self.kanban.executor_profile,
                    "board": self.kanban.board or "default", "external_key": key,
@@ -2674,44 +2668,57 @@ class Bridge:
                    "body": TASK_BODY.format(ident=issue.get("identifier") or issue_id, url=issue.get("url") or "",
                                             context="\n\n".join(part for part in (note, issue.get("description") or "") if part)),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
-                   "initial_status": "blocked", "activation": "native-event-guard-v1",
-                   "source_ms": self.clock() * 1000, "origin": "chat", "record_done": bool(record_done)}
+                   # The request is the authority: for take_over, its proof (a person's change since then wins).
+                   "source_ms": float(proven_ms) if takeover_from else self.clock() * 1000,
+                   "origin": "chat", "record_done": bool(record_done), "parked": True}
         if takeover_from:
-            # The old delegate whose run a verified handover ended: admission may proceed while
-            # Linear still shows exactly that delegate, never anyone else.
+            # The old delegate whose run a verified handover ended: routing may replace exactly
+            # that delegate, never anyone else.
             payload["takeover_from"] = takeover_from
+            if not self._chat_admission_allowed(issue_id, payload, issue):
+                # Nothing is created, so a later take_over (a new request) may start it.
+                raise LinearError("Not started: a person changed this issue's status, assignee or delegate in Linear "
+                                  "while the task was being set up", retryable=False)
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:
             original = prior["payload"]
-            if original.get("initial_status") != "blocked" or any(original.get(field) != payload[field] for field in ("kind", "issue_id", "profile", "board", "external_key")):
+            if any(original.get(field) != payload[field] for field in ("kind", "issue_id", "profile", "board", "external_key")):
                 raise LinearError("Native creation request scope changed; reconcile it", retryable=False)
             payload = original  # A retry reconciles the original request.
-        _, first = self.store.native_intent_prepare(intent_key, payload)
+        saved, first = self.store.native_intent_prepare(intent_key, payload)
+        stopped = "Not started: someone stopped it in Linear while the task was being set up"
+        if saved.get("superseded_by") == "stop":
+            raise LinearError(stopped, retryable=False)  # Decided: a repeat never creates it after that Stop.
         if first:
-            # A lost reply keeps the intent; the retry inspects the retry key, never creates again.
-            task = self.kanban.create(title=payload["title"], created_by=payload["created_by"], body=payload["body"],
-                idempotency_key=key, completion_contract=payload["completion_contract"], initial_status="blocked")
+            stop = self.store.native_intent(f"unbound-stop:{issue_id}")
+            if stop and float(stop.get("source_ms") or 0) >= float(payload["source_ms"]):
+                self.store.native_intent_settle(intent_key, {"state": "reconcile", "superseded_by": "stop",
+                                                             "reason": "A newer Stop preceded native creation"})
+                raise LinearError(stopped, retryable=False)
+            # Created parked: released once bound (never, for work already finished in chat).
+            try:
+                task = self.kanban.create(title=payload["title"], created_by=payload["created_by"], body=payload["body"],
+                    idempotency_key=key, completion_contract=payload["completion_contract"],
+                    **({"initial_status": "blocked"} if payload.get("parked") or payload["record_done"] else {}))
+            except Exception:
+                # A lost reply: the key finds what it committed. Nothing found stays uncertain (the
+                # intent is kept and a retry never creates again).
+                found = self.kanban.find_created(key)
+                if len(found) != 1:
+                    raise
+                task = found[0]
         else:
             tasks = self.kanban.find_created(key)
             if len(tasks) != 1:
                 self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native create outcome is ambiguous"})
                 raise LinearError("It isn't clear whether the task was created, so it won't be created again; check the agent's board", retryable=False)
             task = tasks[0]
-        task = self.kanban.require_task(task.id)
-        if any(getattr(task, field, None) != payload[field] for field in ("title", "body", "created_by", "completion_contract")):
-            self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Native task does not match the prepared request"})
-            raise LinearError("Native task differs from the prepared request; inspect before binding", retryable=False)
-        require_task_issue_scope(task, issue)
-        if not self.store.bind_native(issue_id, task.id, self.kanban.executor_profile, self.kanban.board or "default",
-                                     project_id=project, completion_scope=self._completion_scope(self.kanban, task),
-                                     at=payload["source_ms"]):
-            self.store.native_intent_settle(intent_key, {"state": "reconcile", "task_id": task.id})
+        if not self._bind_created(intent_key, payload, task, issue, project_id=project, at=payload["source_ms"]):
             raise LinearError("Existing or uncertain binding needs reconciliation", retryable=False)
-        self.store.native_intent_settle(intent_key, {"state": "applied", "task_id": task.id})
+        self.release_parked(issue_id, proven_ms=proven_ms)
         self.kanban.subscribe(task.id, issue_id, issue=issue)
-        return self._entrust_bound(self.store.get(issue_id), route, record_done, route_delegate, issue,
-                                   handed_over=handed_over, proven_ms=proven_ms)
+        return self._entrust_bound(self.store.get(issue_id), route, record_done, route_delegate, issue)
 
     def _recorded_done(self, issue_id: str, task_id: str) -> bool:
         created = self.store.native_intent(f"create:{issue_id}") or {}
@@ -2720,9 +2727,8 @@ class Bridge:
                 and payload.get("origin") == "chat" and payload.get("record_done") is True)
 
     def _entrust_bound(self, row: dict, route: dict | None, record_done: dict | None,
-                       route_delegate=None, issue: dict | None = None, handed_over: str | None = None,
-                       proven_ms: float | None = None) -> dict:
-        """Continue the one bound task: admit our own parked creation, or report what exists."""
+                       route_delegate=None, issue: dict | None = None) -> dict:
+        """Continue the one bound task: report what exists, never a second task."""
         issue_id, task_id = row["issue_id"], row["task_id"]
         adapter = self._binding_adapter(issue_id)
         created = self.store.native_intent(f"create:{issue_id}") or {}
@@ -2742,54 +2748,34 @@ class Bridge:
             diag.evt("chat.entrust", "refused", "record_done_parked", iss=issue_id, task=task_id)
             raise LinearError("This issue is being recorded as already done from chat; repeat that request "
                               "to finish it. Nothing was started", retryable=False)
-        if ours:
-            self._assignment_activation(row, handed_over=handed_over, proven_ms=proven_ms)  # Idempotent: never repeated.
-        task = adapter.require_task(task_id)
-        activation = self.store.native_intent(f"activate:{issue_id}:{task_id}") or {}
-        routing = None
-        if route_delegate is not None:
-            if ours and not activation.get("accepted"):
-                # Parked chat work, never admitted, is not shown as worked on: no delegate is queued.
-                # Once resumed and claimed, recovery owns the delegate; never drop its pending row.
-                if task.status != "running" and not any(e.kind == "claimed" for e in adapter.history(task_id, 0)):
-                    self.store.drop_unsent_delegate(issue_id, task_id, at=self.clock())
-                routing = "held: not started"
-            else:
-                routing = route_delegate(issue, task.status)
+        not_started = self._not_started(issue_id, task_id) if ours else None
+        # Linear shows this agent as delegate only once the work really started.
+        routing = ("held: not started" if not_started else
+                   route_delegate(issue, task.status) if route_delegate is not None else None)
         subscribed = bool(route) and task.status not in ("done", "archived")
         if subscribed:
-            # After admission, so the chat hears checkpoints and the result, not our own unblock.
+            # The chat hears checkpoints and the result.
             adapter.subscribe_origin(task_id, route)
-        admitted = bool(activation.get("accepted"))
+        admitted = ours and not not_started
         result = {"issue_id": issue_id, "task_id": task_id, "status": task.status, "created_from_chat": ours,
-                  "admitted": admitted, "chat_subscribed": subscribed}
-        if ours and not admitted and task.status not in ("done", "archived"):
-            result["not_started_reason"] = _not_started_reason(activation)
+                  "admitted": admitted, "chat_subscribed": subscribed,
+                  **({"not_started": not_started} if not_started else {})}
         if routing is not None:
             result["routing"] = routing
-        diag.evt("chat.entrust", "applied" if admitted else "skipped",
-                 "-" if admitted else ("not_started" if ours else "existing_binding"),
+        diag.evt("chat.entrust", "applied" if admitted else "skipped", "-" if admitted else "existing_binding",
                  iss=issue_id, task=task_id)
         return result
 
     def _record_done(self, row: dict, adapter, record_done: dict) -> dict:
         issue_id, task = row["issue_id"], adapter.require_task(row["task_id"])
         if task.status != "done":
-            token = adapter.initial_activation_event(task.id)
+            token = adapter.pristine_hold(task.id)
             if task.status != "blocked" or token is None:
                 raise LinearError("The task changed after it was created, so it was not recorded as done; inspect it", retryable=False)
-            created = self.store.native_intent(f"create:{issue_id}")
-            key = f"activate:{issue_id}:{task.id}"
-            # Settle admission first: no recovery or assignment echo may ever activate this task.
-            self.store.native_intent_prepare(key, {"kind": "activate", "issue_id": issue_id, "task_id": task.id,
-                "profile": adapter.executor_profile, "board": adapter.board or "default",
-                "expected_event_id": token, "source_ms": created["payload"]["source_ms"], "record_done": True})
-            self.store.native_intent_settle(key, {"state": "applied", "accepted": False,
-                                                 "owned_activation": False, "record_done": True})
             if row["last_event_id"] < token:
                 # The parked creation pair is not news; skip its Queued note.
                 self._capture_native_event(issue_id, token, [], at=self.clock())
-            if not adapter.complete_recorded(task.id, token, summary=record_done["summary"],
+            if not adapter.complete_recorded(task.id, summary=record_done["summary"],
                                              evidence=record_done.get("evidence") or []):
                 diag.evt("chat.record_done", "refused", "native_changed", iss=issue_id, task=task.id)
                 raise LinearError("The task changed before it could be recorded as done; inspect it", retryable=False)
@@ -3156,9 +3142,7 @@ class Bridge:
                 events = adapter.history(task.id, 0)
                 controls = [event for event in events
                             if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived")]
-                initial = (getattr(adapter, "guarded_controls", False) and
-                           self._instruction_follows_initial_admission(issue_id, task.id, adapter, source_ms, events))
-                if not initial and any(source_ms // 1000 <= event.created_at for event in controls):
+                if not self._follows_creation(issue_id, task.id, source_ms, events) and any(source_ms // 1000 <= event.created_at for event in controls):
                     return {"saved": False, "task_id": task.id, "status": task.status,
                             "message": "Follow-up ordering is stale or unverifiable. Inspect native task history and send a current native instruction."}
             payload = {"kind": "comment", "issue_id": issue_id, "task_id": task.id, "body": body.strip(),
@@ -3199,43 +3183,7 @@ class Bridge:
         except LinearError as exc:
             self._decline(row["issue_id"], session_id, str(exc), activity_id=activity_id)
             return diag.because("scope_refused")
-        if getattr(adapter, "guarded_controls", False):
-            return self._guarded_stop(row, task, adapter, session_id, who, stamp, activity_id)
-        key = f"stop:{row['issue_id']}:{activity_id}"
-        prior = self.store.native_intent(key)
-        payload = {"kind": "stop", "issue_id": row["issue_id"], "task_id": task.id,
-                   "run_id": task.current_run_id, "stamp": stamp}
-        if prior:
-            payload["run_id"] = prior["payload"].get("run_id")
-        else:
-            controls = [event for event in adapter.history(task.id, 0)
-                        if event.kind in ("claimed", "spawned", "unblocked", "blocked", "completed", "archived", "review_requested", "changes_requested")]
-            if any(stamp // 1000 <= event.created_at for event in controls):
-                self._decline(row["issue_id"], session_id, STALE_STOP, activity_id=activity_id)
-                return diag.because("stale_order", any(stamp / 1000 < event.created_at for event in controls))
-        saved, first = self.store.native_intent_prepare(key, payload)
-        if not first:
-            if saved.get("state") != "applied":
-                self._decline(row["issue_id"], session_id, UNCONFIRMED_STOP, activity_id=activity_id)
-            return diag.because("already_stopped" if saved.get("state") == "applied" else "unverified", saved.get("state") == "applied")
-        if task.status in ("blocked", "triage", "done", "archived"):
-            self.store.native_intent_settle(key, {"state": "applied", "status": task.status})
-            return diag.because("already_stopped", True)
-        if task.status != "running" or task.current_run_id is None:
-            self.store.native_intent_settle(key, {"state": "reconcile", "status": task.status})
-            self._decline(row["issue_id"], session_id, "Nothing was running to stop, so nothing changed. If this work should not start later, an operator needs to pause it on the agent's board.", activity_id=activity_id)
-            return diag.because("no_current_run")
-        try:
-            adapter.block(task.id, f"{OWN} stopped by {who}", run_id=task.current_run_id, issue=issue)
-        except LinearError as exc:
-            self.store.native_intent_settle(key, {"state": "reconcile", "reason": str(exc)})
-            self._decline(row["issue_id"], session_id, str(exc), activity_id=activity_id)
-            return diag.because("block_failed")
-        latest = adapter.require_task(task.id)
-        stopped = latest.status in ("blocked", "triage", "done", "archived")
-        self.store.native_intent_settle(key, {"state": "applied" if stopped else "reconcile", "status": latest.status})
-        self._decline(row["issue_id"], session_id, STOPPED_NOTICE if stopped else UNCONFIRMED_STOP, activity_id=activity_id)
-        return diag.because("-" if stopped else "unverified", stopped)
+        return self._guarded_stop(row, task, adapter, session_id, who, stamp, activity_id)
 
     def _guarded_stop(self, row, task, adapter, session_id, who, stamp, activity_id) -> bool:
         """Apply one Linear Stop to its native task and the tasks that task started.
@@ -3243,7 +3191,9 @@ class Bridge:
         Only an explicit human resume or completion after the click supersedes
         it; the dispatcher claiming or starting the work does not. An unverified
         attempt is retried on redelivery from the latest native event, never
-        frozen: the guarded block still refuses to act on a changed history.
+        frozen. The block is upstream's plain ``block_task`` fenced on the current
+        run. Residual race (no event guard): a person's resume that lands between
+        the ordering read below and that block is overridden by this Stop.
         """
         issue_id = row["issue_id"]
         key = f"stop:{issue_id}:{activity_id}"
@@ -3270,8 +3220,7 @@ class Bridge:
         for _ in range(4):
             events = adapter.history(task.id, 0)
             task = adapter.require_task(task.id)
-            if any(event.kind in ("blocked", "block_loop_detected") and
-                   (event.payload or {}).get("reason") == reason for event in events):
+            if adapter.stop_recorded(task.id, reason, events):
                 # This request's native record is also its response-loss receipt.
                 # A later explicit resume stays authoritative; do not repeat Stop.
                 stopped = True
@@ -3293,8 +3242,8 @@ class Bridge:
             # For initial admission, the signed Stop is causally newer than its
             # assignment even when native second-resolution timestamps coincide.
             # A subsequent explicit native control removes that inference.
-            initial = self._instruction_follows_initial_admission(issue_id, task.id, adapter, stamp, events)
-            if not initial and any(stamp // 1000 <= event.created_at for event in controls):
+            if not self._follows_creation(issue_id, task.id, stamp, events) and any(
+                    stamp // 1000 <= event.created_at for event in controls):
                 superseded = any(stamp / 1000 < event.created_at for event in controls)
                 self.store.native_intent_settle(key, {"state": "reconcile", "reason": "Stop ordering is stale or unverifiable",
                                                      "superseded": superseded})
@@ -3305,10 +3254,8 @@ class Bridge:
             if not events:
                 break
             try:
-                # Guarded by the event just inspected: any later change makes
-                # this a no-op and the loop re-reads it.
-                stopped = adapter.stop(task.id, reason, expected_event_id=events[-1].id,
-                                       run_id=task.current_run_id, issue=self._effect_issue(issue_id))
+                # Fenced on the run just inspected: a new run makes this a no-op and the loop re-reads it.
+                stopped = adapter.stop(task.id, reason, run_id=task.current_run_id, issue=self._effect_issue(issue_id))
             except RateLimited:
                 raise
             except LinearError as exc:
@@ -3491,38 +3438,21 @@ class Bridge:
                 task.id, issue_id=issue_id, state="done")):
             return self._log_delegate(row, "task_finished", quiet=True)  # Archived, or verified finished: nothing waits on the agent any more.
         claim = self._current_claim(adapter, task)
-        superseded = bool((self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}).get("chat_superseded"))
-        if superseded and claim is None and task.status != "running" and not any(
-                event.kind == "claimed" for event in adapter.history(task.id, 0)):
-            # Parked chat work that never ran gets no delegate; once someone resumes it and a worker claims it, it does.
-            return self._log_delegate(row, "admission_superseded", quiet=True)
         if task.status == "running" and claim is None:
             return self._log_delegate(row, "claim_unconsumed")  # Running without a readable claim yet; decide once it is consumed.
-        if claim is None and superseded:
-            claims = [event.created_at for event in adapter.history(task.id, 0) if event.kind == "claimed"]
-            source = max(claims) if claims else getattr(task, "created_at", None)  # Resumed parked work: its latest claim.
-        else:
-            source = claim.created_at if claim is not None else getattr(task, "created_at", None)
+        source = claim.created_at if claim is not None else getattr(task, "created_at", None)
         if source is None:
             return self._log_delegate(row, "no_human_fence")  # No provable fence for a human change: leave routing alone.
         if not self.store.effect_admitted(issue_id):
             return self._log_delegate(row, "effect_unresolved", quiet=True)  # An unresolved write or chat transfer would refuse the row: no Linear read until it clears.
-        created_for = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {})
         old = self._takeover_replaces(issue_id, task.id)
-        if created_for.get("takeover_from") and self._chat_started(row) and old is None:
-            # A takeover's task that was never admitted: routing follows its admission, if any.
-            return self._log_delegate(row, "takeover_not_admitted", quiet=True)
         issue = self._effect_issue(issue_id)
         claim_ms = source * 1000
-        if (retry_chat or self._chat_started(row)) and not superseded:
-            # Routing for chat-started work was requested by that chat: a person's change after
-            # the request wins too, even when the worker's claim came later. Parked work that was
-            # resumed later counts from its claim: the change that parked it came before that.
+        if retry_chat or self._chat_started(row):
+            # Routing for chat-started work was requested by that chat (for take_over, by its proof):
+            # a person's change after the request wins too, even when the worker's claim came later.
             requested = ((self.store.native_intent(f"create:{issue_id}") or {}).get("payload") or {}).get("source_ms")
             claim_ms = min(claim_ms, float(requested if requested is not None else claim_ms))
-            if old is not None:  # Admitted by a later proven take_over: that request is the authority.
-                activation = self.store.native_intent(f"activate:{issue_id}:{task.id}") or {}
-                claim_ms = max(claim_ms, float(activation.get("proven_ms") or 0))
         # A takeover's admitted task replaces exactly the old delegate, whose own pause report is not a person's.
         current = (issue.get("delegate") or {}).get("id")
         replacing = old is not None and current == old
@@ -3623,24 +3553,20 @@ class Bridge:
     # that the dispatcher is not picking it up, and Linear shows the truth again: Todo.
     FIRST_CLAIM_HOLD = 3 * 60  # seconds
     def _awaiting_first_claim(self, row: dict, task, adapter) -> bool:
-        """Ready only because this agent's own admission just unblocked it, never claimed, within the bound.
+        """Ready only because this agent just created it, never claimed or controlled, within the bound.
 
-        Proof is native and durable: this binding's accepted activation intent, whose receipt
-        (the unblock carrying our request id and token) is in history, and no claim or spawn since.
-        A task back in ready after it ran is not this case: it shows Todo as before."""
+        Proof is native and durable: this binding's applied create intent names the task, and its
+        history is only that creation. A task back in ready after it ran is not this case: it
+        shows Todo as before."""
         if task.status != "ready":
             return False
-        activation = self.store.native_intent(f"activate:{row['issue_id']}:{task.id}") or {}
-        token = (activation.get("payload") or {}).get("expected_event_id")
-        if activation.get("state") != "applied" or not activation.get("accepted") or token is None:
+        created = self.store.native_intent(f"create:{row['issue_id']}") or {}
+        if created.get("state") != "applied" or created.get("task_id") != task.id:
             return False
-        events = adapter.history(task.id, 0)
-        after = [event for event in events if event.id > token]
-        if not adapter.activation_receipt(task.id, token, after):
+        start, rest = _creation_history(adapter.history(task.id, 0))
+        if start is None or any(event.kind in ("claimed", "spawned", "blocked", "unblocked") for event in rest):
             return False
-        if any(event.kind in ("claimed", "spawned") for event in events):
-            return False
-        return self.clock() - after[0].created_at < self.FIRST_CLAIM_HOLD
+        return self.clock() - start.created_at < self.FIRST_CLAIM_HOLD
     def _native_state(self, task, adapter, last) -> str | None:
         """The one mapping from a bound task's native status to a Linear state key (running is In Progress)."""
         status, payload = task.status, native_event_payload(last) if last else {}
@@ -3649,9 +3575,9 @@ class Bridge:
         if status in ("blocked", "triage") and (standing_wait(adapter.history(task.id, 0))[1] or {}).get("ci"):
             return "in_review"  # Parked on CI (HF-800): it resumes by itself with the verdict.
         if status in ("blocked", "triage"):
-            # Native creation parks a new task until admission: that is queued, not stopped.
+            # A task created parked with nothing since (record_done until it is completed) is not stopped.
             queued = (getattr(last, "kind", None) == "blocked" and payload.get("reason") == "initial_status"
-                      and getattr(adapter, "guarded_controls", False) and adapter.initial_activation_event(task.id) == last.id)
+                      and adapter.pristine_hold(task.id) == last.id)
             return "todo" if queued else "blocked"
         if status == "review" or (status == "ready" and getattr(last, "kind", None) == "respawn_guarded"
                                   and payload.get("reason") == "active_pr"):
@@ -3709,13 +3635,14 @@ class Bridge:
             # Record the control on the issue too; this does not claim effects have settled.
             writes = [issue_note("Stop requested. This issue remains unfinished.", milestone_states)]
         elif (event.kind == "blocked" and payload.get("reason") == "initial_status"
-              and getattr(self._binding_adapter(issue_id), "guarded_controls", False)
-              and self._binding_adapter(issue_id).initial_activation_event(row["task_id"]) == event.id):
-            # Native creation atomically parks a new task before admission. Only
-            # that pristine create+block pair proves preparation; a later Stop,
-            # even with this same reason, remains a real block. Reporting cannot
-            # admit the task or promise that a parked task will be started.
-            writes = [message("thought", "Queued. Work starts as soon as the agent picks it up; nothing is needed from you.")]
+              and _creation_park(self._binding_adapter(issue_id).history(row["task_id"], 0)) == event.id):
+            # Native creation atomically parked this task (its second event; a later block with this
+            # reason stays a real block). Once lifted it is not news; still parked, it says why plainly.
+            writes = []
+            if self._binding_adapter(issue_id).pristine_hold(row["task_id"]) == event.id:
+                reason = self._not_started(issue_id, row["task_id"])
+                writes = [message("thought", NOT_STARTED[reason] if reason else
+                                  "Queued. Work starts as soon as the agent picks it up; nothing is needed from you.")]
         elif event.kind == "blocked" and payload.get("source") == PR_PARK_SOURCE:
             # Core's open-PR guard parked it after a restart: nothing is asked of anyone.
             writes = [message("thought", pr_park_notice(payload))]
@@ -4026,7 +3953,7 @@ class Bridge:
         PR, a refused or unanswered read, or any change since the read leaves it parked. Core's
         own release (``promoted``) supersedes the park, so nothing follows it.
         """
-        if not row or row.get("origin") != "native" or not getattr(adapter, "guarded_controls", False):
+        if not row or row.get("origin") != "native":
             return
         task = adapter.require_task(row["task_id"])
         if task.status != "blocked":
@@ -4073,7 +4000,7 @@ class Bridge:
             return
         diag.evt("pr_park.resume", "started", "pr_park_resolved", **fields)
         try:
-            accepted = adapter.activate(task.id, park.id)
+            accepted = adapter.resume_pr_park(task.id, park.id)
         except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
             self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
             diag.warn("pr_park.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
@@ -4089,9 +4016,10 @@ class Bridge:
         Only the worker's own block (the newest block-lifecycle event, re-kinded by core for lack of a
         native parent; see waits.py), already reported, with no later event. Local reads until the
         persisted gap has passed; then one read per named issue and one local file check per gate.
-        Satisfied: one guarded core unblock of exactly that block event, decided once per block (a
-        durable marker written before the call, never replayed). Anything unreadable or still open
-        leaves it blocked; a newer Stop or answer changes the newest event, so it is never overridden.
+        Satisfied: one plain core unblock while that block is still the newest event, decided once
+        per block (a durable marker written before the call, never replayed); a Stop that lands in
+        between is blocked again (``Kanban.resume_wait``). Anything unreadable or still open leaves
+        it blocked.
 
         A CI gate (HF-800) is satisfied once CI on its head has finished or its window has passed.
         The verdict is written as a native task comment first and the unblock is guarded on that
@@ -4100,7 +4028,7 @@ class Bridge:
         block-loop breaker into triage; that ``block_loop_detected`` carries the same wait and
         resumes the same way, up to ``waits.CI_MAX_PARKS`` CI parks per task.
         """
-        if not row or row.get("origin") != "native" or not getattr(adapter, "guarded_controls", False):
+        if not row or row.get("origin") != "native":
             return
         task = adapter.require_task(row["task_id"])
         if task.status not in ("blocked", "triage"):
@@ -4162,7 +4090,7 @@ class Bridge:
                     diag.transition("external_wait.resume", "skipped", "wait_changed", key=marker, **fields)
                     return
                 token = since[0].id
-            accepted = adapter.activate(task.id, token)
+            accepted = adapter.resume_wait(task.id, token)
         except Exception as exc:  # Uncertain: the marker stays unsettled and is never replayed.
             self.store.native_intent_settle(marker, {"state": "reconcile", "reason": type(exc).__name__})
             diag.warn("external_wait.resume", "failed", diag.exc_reason(exc), exc=type(exc).__name__, **fields)
@@ -4441,16 +4369,18 @@ class Bridge:
         """Catch up reporting only. Native Hermes owns recovery and execution."""
         if ingress is not None:
             self.drain_ingress(ingress, retry_now=True)
-        self._recover_admissions()
+        self._recover_stops()
         self.pump_kanban()
 
-    def _recover_admissions(self) -> None:
-        """Use the existing service loop; one unavailable binding holds only itself."""
+    def _recover_stops(self) -> None:
+        """Carry a Stop recorded before its binding committed into that work, and lift a staged park
+        left after binding by a crash (the service loop)."""
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
                 try:
                     if self.authorize_specialist_effect(row["issue_id"]):
-                        self._assignment_activation(row)
+                        self._pending_assignment_stop(row)
+                        self.release_parked(row["issue_id"], recovery=True)  # interrupted after binding
                 except RateLimited:
                     raise
                 except Exception as exc:
@@ -5501,7 +5431,7 @@ class Bridge:
             if ingress is not None:
                 self._ingress_seen = file_signature(ingress)
                 self.drain_ingress(ingress)
-            self._recover_admissions()
+            self._recover_stops()
             self.pump_kanban()
             self.recheck()
         except Throttled:

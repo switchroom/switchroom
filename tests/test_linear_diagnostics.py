@@ -340,7 +340,7 @@ class TickTimingTests(DiagCase):
         def pump() -> None:
             self.now[0] += 0.75  # local work
             api.graphql("query Viewer { viewer { id } }")
-        bridge._recover_admissions = lambda: None
+        bridge._recover_stops = lambda: None
         bridge.pump_kanban = pump
         bridge.recheck = lambda: api.graphql("query Viewer { viewer { id } }")
         bridge.flush = lambda: None

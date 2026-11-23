@@ -191,8 +191,7 @@ class CiWaitScenarios(unittest.TestCase):
         resume = events[-1]
         self.assertEqual(resume.kind, "unblocked")
         self.assertEqual(events[-2].kind, "commented")  # the verdict lands before the resume
-        self.assertEqual(resume.payload["expected_event_id"], events[-2].id)
-        self.assertTrue(resume.payload["request_id"].startswith("linear:"))
+        self.assertEqual(events[-3].kind, "blocked")  # the verdict was the only event since the park
         self.pump_after_gap()  # decided once: nothing more happens
         self.assertEqual(self.events()[-1].id, resume.id)
         return verdicts[0]
@@ -264,7 +263,7 @@ class CiWaitScenarios(unittest.TestCase):
         self.park()
         blocked = self.events()[-1]
         self.advance(1)
-        self.assertTrue(self.board.stop(self.task_id, "linear:Stop requested", expected_event_id=blocked.id))
+        self.assertTrue(self.board.stop(self.task_id, "linear:Stop requested"))
         self.github.run(1, "CI")
         self.pump_after_gap()
         self.pump_after_gap()
@@ -280,16 +279,37 @@ class CiWaitScenarios(unittest.TestCase):
         def comment_then_stop(adapter, task_id, body, **kwargs):
             comment_id = original(adapter, task_id, body, **kwargs)
             latest = adapter.history(task_id, 0)[-1]
-            self.assertTrue(adapter.stop(task_id, "linear:Stop requested", expected_event_id=latest.id))
+            self.assertTrue(adapter.stop(task_id, "linear:Stop requested"))
             return comment_id
 
         with patch.object(Kanban, "comment", comment_then_stop):
             self.pump_after_gap()
         self.assertEqual(self.task().status, "blocked")
         self.assertEqual(len(self.verdicts()), 1)  # the verdict is information; the Stop still holds
-        self.assertEqual(self.events()[-1].kind, "blocked")
+        self.assertEqual(self.events()[-1].kind, "commented")  # parked work: the Stop is its newest event
         self.pump_after_gap()
         self.assertEqual(self.task().status, "blocked")
+
+    def test_stop_between_the_read_and_the_plain_unblock_is_blocked_again(self):
+        from hermes_cli import kanban_db
+        self.park()
+        self.github.run(1, "CI")
+        original = kanban_db.unblock_task
+
+        def stop_then_unblock(conn, task_id, *args, **kwargs):
+            # A Linear Stop lands after the resume read the wait as newest, before upstream's plain unblock.
+            self.assertTrue(self.board.stop(task_id, "linear:Stop requested"))
+            return original(conn, task_id, *args, **kwargs)
+
+        with patch.object(kanban_db, "unblock_task", stop_then_unblock):
+            self.pump_after_gap()
+        # Blocked again with the Stop's own reason (core's block-loop breaker may route that to triage).
+        self.assertIn(self.task().status, ("blocked", "triage"))
+        self.assertIn(self.events()[-1].kind, ("blocked", "block_loop_detected"))
+        self.assertEqual(self.events()[-1].payload["reason"], "linear:Stop requested")
+        self.pump_after_gap()
+        self.assertIn(self.task().status, ("blocked", "triage"))
+        self.assertNotEqual(self.events()[-1].kind, "unblocked")  # nothing resumed it again
 
     def test_revoked_scope_leaves_the_wait_for_a_person(self):
         self.park()

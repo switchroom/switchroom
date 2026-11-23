@@ -880,7 +880,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.inbox_row("actorless-lost-response")[2], "pending")
             self.assertEqual(request.call_count, 1)
         self.assertIsNone(self.bridge.store.get(self.ISSUE))
-        self.assertEqual(self.board.get(created[0].id).status, "blocked")
+        self.assertEqual(self.board.get(created[0].id).status, "blocked")  # unbound: parked until the retry binds it
         with patch.object(self.board, "create", side_effect=AssertionError("must reconcile original create")):
             for _ in range(5):
                 await asyncio.to_thread(self.bridge.drain_ingress, self.inbox.database, retry_now=True)
@@ -1167,7 +1167,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.inbox_row("human-delegation-redelivery")[2] == "imported")
         with self.board.conn() as conn:
             self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], tasks)
-        self.assertEqual([e.kind for e in self.board.history(tasks[0], 0)].count("unblocked"), 1)
+        self.assertEqual([e.kind for e in self.board.history(tasks[0], 0)].count("unblocked"), 1)  # its staged park, lifted once
         self.assertEqual(len(seen), 1)  # nor a second model turn
 
     async def test_distinct_provider_inputs_commit_own_ids_bodies_before_own_inbox_ack(self):
