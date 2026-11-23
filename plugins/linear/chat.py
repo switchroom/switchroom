@@ -757,8 +757,12 @@ def _entrust_message(result: dict) -> str:
     if native["status"] in ("done", "archived"):
         return "This issue's work has already finished, so nothing new was started."
     if native.get("created_from_chat") and not native.get("admitted"):
-        return ("Not started: the task was stopped or changed while it was being set up, so nothing is doing "
-                "this work yet. Ask again to start it, or check it on the agent's board.")
+        if native.get("not_started") == "stopped":
+            return ("Not started: someone stopped it while it was being set up, so nothing is doing this work. "
+                    "It stays stopped until someone resumes it on the agent's board; this agent was not added as "
+                    "its Linear delegate.")
+        return ("Not started: its setup didn't finish, so nothing is doing this work yet and this agent was not "
+                "added as its Linear delegate. Ask again to start it, or check it on the agent's board.")
     if not native.get("created_from_chat"):
         return ("This issue already has work on this agent's board, so nothing new was started; "
                 "its updates now also come back to this chat.")

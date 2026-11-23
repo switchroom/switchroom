@@ -315,10 +315,16 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
             raise
         diag.evt("session.admit", "applied", "delegation_started" if started else "delegation_linked",
                  task=task.id, state=task.status, **fields)
-        if started and task.status == "blocked" and not bridge.store.conversation_input(issue_id, session_id):
+        held = bridge._not_started(issue_id, task.id) if started else None
+        if held == "input":
             return True, (f"Tracked delegated work is staged as task {task.id}. It starts once this input is "
                 "committed. Do not perform the issue work in this conversation or create another task; its "
                 "native worker owns execution and the user decision prompts."), True
+        if held:
+            return True, (f"Tracked delegated work is task {task.id}, and it has not started: "
+                + ("a Stop holds it until someone resumes it." if held == "stopped" else "its setup didn't finish.")
+                + " Do not perform the issue work in this conversation or create another task; say plainly that "
+                "nothing is running yet."), True
         return True, _admission_note({**row, "board": (bridge.store.native_binding(issue_id) or {}).get("board")},
                                      task, started), started
     if bridge.store.scope_fenced(issue_id):

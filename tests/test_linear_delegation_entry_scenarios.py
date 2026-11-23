@@ -297,6 +297,55 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.authority.state(), "In Progress")
         self.assertEqual(self.assert_one_owner(), task_id)
 
+    def interrupted_chat_start(self):
+        """work_on crashes after binding, before its task's park is lifted: bound, never started."""
+        with patch.object(Bridge, "release_parked", side_effect=RuntimeError("service stopped")):
+            try:
+                chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE}, self.chat_context())
+            except RuntimeError:
+                pass
+        task_id = self.assert_one_owner()
+        self.assertEqual(self.history(task_id), ["created", "blocked"])
+        self.reconcile()  # the service loop never starts a chat start by itself
+        self.assertEqual(self.history(task_id), ["created", "blocked"])
+        return task_id
+
+    async def test_person_delegation_starts_an_interrupted_chat_start_through_ingest(self):
+        task_id = self.interrupted_chat_start()
+        delivery = await self.ingest(self.delegation(), "delegated-after-crash")
+        self.assertEqual(self.inbox_status(delivery), "imported")
+        self.assertEqual(self.assert_one_owner(), task_id)  # the same task, now released: never a second
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])
+        self.assertEqual(self.board.get(task_id).status, "ready")
+        self.assertEqual(self.turns, [])
+        said = self.said("session-1")
+        self.assertIn("Continuing the existing work on this issue, continued from chat. It is queued", said[-1])
+        self.assertFalse(any("paused" in body or "nothing is needed" in body for body in said), said)
+
+    async def test_own_echo_on_an_interrupted_chat_start_says_plainly_it_has_not_started(self):
+        task_id = self.interrupted_chat_start()
+        await self.ingest(self.session_event("echo-session", creator=None), "own-echo")
+        self.assertEqual(self.history(task_id), ["created", "blocked"])  # an echo is no new authority
+        said = self.said("echo-session")
+        self.assertIn("This work hasn't started yet: its setup was interrupted", said[-1])
+        self.assertFalse(any("paused" in body or "nothing is needed" in body for body in said), said)
+        # Asking again in chat starts the one task, and says so.
+        reply = json.loads(chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE}, self.chat_context()))
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["native"]["admitted"], reply)
+        self.assertEqual(self.assert_one_owner(), task_id)
+        self.assertEqual(self.board.get(task_id).status, "ready")
+
+    async def test_a_repeated_request_on_a_stopped_parked_chat_start_says_the_stop_holds_it(self):
+        task_id = self.interrupted_chat_start()
+        with self.board.conn() as conn:
+            self.assertTrue(kb.block_task(conn, task_id, reason="linear: stopped by a person", kind="needs_input"))
+        reply = json.loads(chat.handle(self.bridge, {"action": "work_on", "issue": ISSUE}, self.chat_context()))
+        self.assertFalse(reply["native"]["admitted"], reply)
+        self.assertIn("Not started: someone stopped it", reply["message"])
+        self.assertEqual(reply["routing"], "held: not started")
+        self.assertEqual(self.board.get(task_id).status, "blocked")
+
     async def test_a_second_session_never_takes_over_a_live_adopted_one_through_ingest(self):
         task_id = self.work_on()
         await self.ingest(self.session_event("echo-session", creator=None), "own-echo")
