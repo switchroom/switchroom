@@ -707,6 +707,16 @@ def _adopted_session_notice(status: str | None, source: str) -> str:
     else:
         state = "It is waiting to start"
     return f"Continuing the existing work on this issue{where}. {state}; progress will appear in this session."
+def _creation_history(events: list):
+    """(the event the work became runnable at, the events after it) for our own creation: created
+    ready, or created parked and its park lifted by the next event. (None, []) for anything else."""
+    if events and events[0].kind == "created":
+        if (len(events) >= 3 and events[1].kind == "blocked" and events[2].kind == "unblocked"
+                and (events[1].payload or {}).get("reason") == "initial_status"):
+            return events[2], events[3:]
+        if (events[0].payload or {}).get("status") != "blocked":
+            return events[0], events[1:]
+    return None, []
 def _started_notice(status: str | None) -> str:
     """The thought on the Agent Session whose delegation just started this work."""
     if status == "running":
@@ -1769,20 +1779,20 @@ class Bridge:
     def _reject_specialist_scope(self, exc: LinearError) -> None:
         if exc.retryable: raise exc
         diag.warn("scope.fenced", "refused", "scope_refused", exc=type(exc).__name__)
-    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+    def handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", staged: bool = False) -> bool | None:
         # A person is waiting on Agent Session events (a Stop, a question, a delegation): never deferred for budget.
         with self._priority("essential" if event.get("type") == "AgentSessionEvent" else "normal"):
-            return self._route_webhook(event, assignment_prompt=assignment_prompt)
-    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+            return self._route_webhook(event, assignment_prompt=assignment_prompt, staged=staged)
+    def _route_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", staged: bool = False) -> bool | None:
         if (getattr(self.api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             if event.get("type") == "AgentSessionEvent":
                 activity_id = ((event.get("agentActivity") or {}).get("id") if event.get("action") == "prompted" else None)
                 with self.api.requester_session((event.get("agentSession") or {}).get("id"), activity_id=activity_id):
-                    return self._handle_webhook(event, assignment_prompt=assignment_prompt)
+                    return self._handle_webhook(event, assignment_prompt=assignment_prompt, staged=staged)
             if event.get("type") == "Issue" and not self.store.get((event.get("data") or {}).get("id")):
                 return
-        return self._handle_webhook(event, assignment_prompt=assignment_prompt)
-    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "") -> bool | None:
+        return self._handle_webhook(event, assignment_prompt=assignment_prompt, staged=staged)
+    def _handle_webhook(self, event: dict[str, Any], *, assignment_prompt: str = "", staged: bool = False) -> bool | None:
         if self.activation_cutoff_ms is not None:
             stamp = activation_event_ms(event)
             if stamp is None or stamp < self.activation_cutoff_ms:
@@ -1827,7 +1837,7 @@ class Bridge:
             if row and stamp < float(row["last_updated_at"]):
                 return diag.because("superseded", True)  # A newer reporting/admission observation superseded this input.
             if event.get("action") == "created":
-                return self._one_owner(event, issue, session_id, row, assignment_prompt=assignment_prompt)
+                return self._one_owner(event, issue, session_id, row, assignment_prompt=assignment_prompt, staged=staged)
             elif event.get("action") == "prompted" and activity.get("signal") == "stop":
                 if row is None:
                     self.store.record_unbound_stop(issue_id, stamp, session_id=session_id,
@@ -1866,7 +1876,7 @@ class Bridge:
             return None  # nothing readable to say: the plain notice answers instead
         return body  # deterministic: the reply's stable id is built from it
     def _one_owner(self, event: dict[str, Any], issue: dict[str, Any], session_id: str, row: dict | None,
-                   *, assignment_prompt: str = "") -> bool:
+                   *, assignment_prompt: str = "", staged: bool = False) -> bool:
         """The one ownership rule for a new Agent Session, keyed on ``linear:<issue_id>``.
 
         That key is the task's upstream idempotency key: a task bound here, or one ``_start``
@@ -1874,6 +1884,7 @@ class Bridge:
         self-delegation echo, a redelivery or a person delegating again) is adopted onto it with
         a compare-and-set on the owner (``store.adopt_session``) or answered; it never gets a
         second task or a model turn redoing the work. Only an issue with no task starts one.
+        ``staged``: this session's native input must commit before the new task may run (see _start).
 
         Adoption: live work reports to this session from now on (progress, the keepalive, and
         Done as its only response), because a ``response`` would close it at once (HF-630). A
@@ -1883,7 +1894,7 @@ class Bridge:
         """
         if not row:
             return diag.decision("session.start", self._start(event, issue, session_id, event_ms(event), f"linear:{issue['id']}",
-                                                              prompt=assignment_prompt), iss=issue["id"], sess=session_id)
+                                                              prompt=assignment_prompt, staged=staged), iss=issue["id"], sess=session_id)
         issue_id, fields = issue["id"], {"iss": issue["id"], "sess": session_id, "task": row.get("task_id")}
         task = self.native_status(issue_id)
         if task.get("reconciliation_required"):
@@ -2040,7 +2051,10 @@ class Bridge:
         # Archived or cancelled with no outcome: nothing posts; _reconcile_status parks a
         # started state this app set back to Todo (no agent is working on it now).
         self._capture_native_event(issue_id, event_id, [], at=self.clock())
-    def _start(self, event, issue, session_id, stamp, key, prompt: str = "") -> bool:
+    def _start(self, event, issue, session_id, stamp, key, prompt: str = "", *, staged: bool = False) -> bool:
+        """Start the issue's one task. A delegation whose session carries native input (``staged``)
+        creates it parked: its worker may ask that session questions, so it must not run before the
+        input commits. ``release_staged`` then lifts that park with a plain unblock."""
         issue_id = issue["id"]
         if self.store.get(issue_id):
             return True
@@ -2119,7 +2133,7 @@ class Bridge:
                    "title": f"{fresh.get('identifier') or issue_id}: {fresh.get('title') or 'Linear issue'}",
                    "body": TASK_BODY.format(ident=fresh.get("identifier") or issue_id, url=fresh.get("url") or "", context=context),
                    "created_by": "linear", "completion_contract": self.contracts.get(project) or "local-only",
-                   "source_ms": stamp}
+                   "source_ms": stamp, **({"requires_native_input": True} if staged else {})}
         intent_key = f"create:{issue_id}"
         prior = self.store.native_intent(intent_key)
         if prior:
@@ -2139,9 +2153,11 @@ class Bridge:
                 if (current.get("delegate") or {}).get("id") != me or (current.get("state") or {}).get("type") in CLOSED:
                     self.store.native_intent_settle(intent_key, {"state": "reconcile", "reason": "Assignment changed before native request"})
                     return False
-                # Every admission check is done: the task is created ready, with the issue's key.
+                # Every admission check is done: the task is created with the issue's key, ready
+                # unless its session input has yet to commit.
                 task = self.kanban.create(title=payload["title"], created_by=payload["created_by"],
-                    body=payload["body"], idempotency_key=key, completion_contract=payload["completion_contract"])
+                    body=payload["body"], idempotency_key=key, completion_contract=payload["completion_contract"],
+                    **({"initial_status": "blocked"} if payload.get("requires_native_input") else {}))
             except BaseException:
                 # The request might have committed. Preserve intent; never call create again.
                 raise
@@ -2156,9 +2172,35 @@ class Bridge:
             return False
         self.kanban.subscribe(task.id, issue_id, issue=fresh)
         stopped = self._pending_assignment_stop(self.store.get(issue_id))  # A Stop recorded meanwhile wins (and says so).
+        if payload.get("requires_native_input"):
+            return True  # Parked until this session's input commits; release_staged announces the start.
         status = self.kanban.require_task(task.id).status
         if status in ("ready", "running") or not stopped:
             self.activity(issue_id, session_id, "thought", _started_notice(status))
+        return True
+
+    def release_staged(self, issue_id: str) -> bool:
+        """Lift the park of a task created for a session whose native input has now committed.
+
+        Only our own creation's pristine park (create + initial block, nothing since) is lifted, with
+        upstream's plain unblock; a Stop that lands in between wins (``Kanban.resume_wait``). Called
+        when the input commits and, after a crash, by the service loop. True once it may run."""
+        row = self.store.get(issue_id)
+        created = self.store.native_intent(f"create:{issue_id}") or {}
+        if (not row or row.get("origin") != "native" or created.get("state") != "applied"
+                or created.get("task_id") != row["task_id"] or not created["payload"].get("requires_native_input")
+                or not self.store.conversation_input(issue_id, row.get("owner_ref"))):
+            return False
+        adapter = self._binding_adapter(issue_id)
+        hold = adapter.pristine_hold(row["task_id"])
+        if hold is None or (self.store.native_intent(f"unbound-stop:{issue_id}") or {}).get("source_ms", 0) >= float(
+                created["payload"]["source_ms"]):
+            return False
+        if not adapter.resume_wait(row["task_id"], hold):
+            return False
+        diag.evt("claim.decision", "routed", iss=issue_id, task=row["task_id"])
+        if row.get("owner_ref"):
+            self.activity(issue_id, row["owner_ref"], "thought", _started_notice(adapter.require_task(row["task_id"]).status))
         return True
 
     def _bind_created(self, intent_key: str, payload: dict, task, issue: dict, **binding) -> bool:
@@ -2296,11 +2338,11 @@ class Bridge:
         The dispatcher claiming or starting it is not a control, so a same-second native
         timestamp then cannot put the input before the work it is about."""
         created = self.store.native_intent(f"create:{issue_id}")
+        start, rest = _creation_history(events)
         return bool(created and created.get("state") == "applied" and created.get("task_id") == task_id
-                    and stamp >= float(created["payload"].get("source_ms") or stamp)
-                    and events and events[0].kind == "created"
+                    and stamp >= float(created["payload"].get("source_ms") or stamp) and start is not None
                     and all(event.kind not in ("unblocked", "blocked", "completed", "archived", "review_requested",
-                                               "changes_requested") for event in events[1:]))
+                                               "changes_requested") for event in rest))
     def track(self, issue_id: str, task_id: str, *, board: str | None = None,
               requester_session: str | None = None, requester_activity: str | None = None, replace: bool = False,
               expected_revision: str | None = None, request_id: str | None = None,
@@ -3426,11 +3468,10 @@ class Bridge:
         created = self.store.native_intent(f"create:{row['issue_id']}") or {}
         if created.get("state") != "applied" or created.get("task_id") != task.id:
             return False
-        events = adapter.history(task.id, 0)
-        if not events or events[0].kind != "created" or any(
-                event.kind in ("claimed", "spawned", "blocked", "unblocked") for event in events):
+        start, rest = _creation_history(adapter.history(task.id, 0))
+        if start is None or any(event.kind in ("claimed", "spawned", "blocked", "unblocked") for event in rest):
             return False
-        return self.clock() - events[0].created_at < self.FIRST_CLAIM_HOLD
+        return self.clock() - start.created_at < self.FIRST_CLAIM_HOLD
     def _native_state(self, task, adapter, last) -> str | None:
         """The one mapping from a bound task's native status to a Linear state key (running is In Progress)."""
         status, payload = task.status, native_event_payload(last) if last else {}
@@ -4233,12 +4274,14 @@ class Bridge:
         self.pump_kanban()
 
     def _recover_stops(self) -> None:
-        """Carry a Stop recorded before its binding committed into that work (the service loop)."""
+        """Carry a Stop recorded before its binding committed into that work, and lift a staged park
+        whose session input committed before a crash (the service loop)."""
         for row in self.store.active("native"):
             with self.lock(row["issue_id"]):
                 try:
                     if self.authorize_specialist_effect(row["issue_id"]):
                         self._pending_assignment_stop(row)
+                        self.release_staged(row["issue_id"])  # an input that committed before a crash
                 except RateLimited:
                     raise
                 except Exception as exc:

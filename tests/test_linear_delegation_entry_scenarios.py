@@ -187,20 +187,28 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
 
     # -- scenarios -------------------------------------------------------
     async def test_delegation_without_prompt_starts_one_tracked_task_before_the_model_turn(self):
-        await self.ingest(self.delegation())
+        remember, parked = self.bridge.store.remember_conversation_input, []
+        def at_commit(*args, **kwargs):  # no worker can start before this session's input commits
+            task_id = self.bridge.store.get(ISSUE)["task_id"]
+            with self.board.conn() as conn:
+                parked.append((self.board.get(task_id).status, kb.claim_task(conn, task_id)))
+            return remember(*args, **kwargs)
+        with patch.object(self.bridge.store, "remember_conversation_input", side_effect=at_commit):
+            await self.ingest(self.delegation())
+        self.assertEqual(parked, [("blocked", None)])
         self.assertEqual(len(self.tasks()), 1)
         task = self.board.get(self.tasks()[0])
-        self.assertEqual(task.status, "ready")  # created ready; the dispatcher claims it
-        self.assertEqual(self.history(task.id), ["created"])  # no park-then-activate step
+        self.assertEqual(task.status, "ready")  # released once the session input committed; the dispatcher claims it
+        self.assertEqual(self.history(task.id), ["created", "blocked", "unblocked"])  # parked until then: plain upstream block/unblock
         self.assertEqual(task.idempotency_key, f"linear:{ISSUE}")
         # No prompt: the issue title is the request the worker receives.
         self.assertIn("Requested outcome (the issue title): Count lines of code per directory", task.body)
         # The model turn runs once, after admission, told the work is already running as that task.
         self.assertEqual(len(self.turns), 1)
         context = self.turns[0].channel_context
-        self.assertIn("Tracked work already started", context)
+        self.assertIn("Tracked delegated work is staged", context)
         self.assertIn(task.id, context)
-        self.assertIn("Do not do the work in this conversation", context)
+        self.assertIn("Do not perform the issue work in this conversation", context)
         self.assertNotIn("@mention", context)
         said = self.said("session-1")
         self.assertIn("Got it. Checking the issue and any existing work now; updates will appear here.", said)
@@ -230,7 +238,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         # The same provider input redelivered (a lost ack, a reconnect): the same task, no second admission.
         await self.ingest(event, "redelivered")
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id), ["created"])
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])
         self.assertIn(task_id, self.turns[-1].channel_context)
         turns = len(self.turns)
         # This app's own delegation echo (no creator) keeps the dispatcher path: the same work.
@@ -241,7 +249,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.inbox_status(second), "imported")
         self.assertEqual(len(self.turns), turns)
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id), ["created"])
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])
         self.assertEqual(self.said("session-2")[-1],
                          "The agent is already working on this, so nothing new was started.")
         # One owner throughout: the first session still owns it, and only one model turn ran on it.
@@ -332,7 +340,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(entered.wait(), 10)
             await asyncio.gather(first, self.ingest(self.session_event("session-b", creator=None), "b"))
         task_id = self.assert_one_owner()
-        self.assertEqual(self.history(task_id), ["created"])
+        self.assertEqual(self.history(task_id), ["created", "blocked", "unblocked"])
         self.assertEqual(self.bridge.store.get(ISSUE)["owner_ref"], "session-a")
         self.assertEqual(len(self.turns), 1)  # only the session that started it gets a model turn
         self.assertIn("nothing new was started", self.said("session-b")[-1])
@@ -393,7 +401,7 @@ class DelegationEntryScenarios(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Tracked work already started", context)
         self.assertIn("It is history now", context)
         self.assertEqual(self.tasks(), [task_id])
-        self.assertEqual(self.history(task_id).count("unblocked"), 0)
+        self.assertEqual(self.history(task_id).count("unblocked"), 1)  # its staged park, lifted once
         self.assertEqual(self.inbox_status(delivery), "imported")  # the finite endpoint invoked the committed-input hook
 
     async def test_retried_session_linked_to_existing_board_work_answers_once(self):

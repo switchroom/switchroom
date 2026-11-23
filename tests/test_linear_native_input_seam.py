@@ -1155,7 +1155,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         text, context, tasks, in_turn = seen[0]
         self.assertIn("was delegated to you", text)
         self.assertEqual(len(tasks), 1)
-        self.assertIn("Tracked work already started", context)
+        self.assertIn("Tracked delegated work is staged", context)
         self.assertIn(tasks[0], context)
         self.assertTrue(in_turn)
         self.assertEqual(self.board.require_task(tasks[0]).status, "ready")
@@ -1167,7 +1167,7 @@ class NativeInputSeamScenarios(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: self.inbox_row("human-delegation-redelivery")[2] == "imported")
         with self.board.conn() as conn:
             self.assertEqual([row[0] for row in conn.execute("SELECT id FROM tasks")], tasks)
-        self.assertEqual([e.kind for e in self.board.history(tasks[0], 0)].count("unblocked"), 0)  # created ready
+        self.assertEqual([e.kind for e in self.board.history(tasks[0], 0)].count("unblocked"), 1)  # its staged park, lifted once
         self.assertEqual(len(seen), 1)  # nor a second model turn
 
     async def test_distinct_provider_inputs_commit_own_ids_bodies_before_own_inbox_ack(self):

@@ -291,7 +291,7 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
                 bridge.session_notices.pop(key, None)
                 diag.evt("session.admit", "skipped", "finished_work_conversation", task=row.get("task_id"), **fields)
                 return True, "", False
-        accepted = bridge.handle_webhook(original)
+        accepted = bridge.handle_webhook(original, staged=True)
     except Exception as error:
         if not bridge.session_notices.pop(key, False):  # a decline already said what is needed
             _wait_notice(bridge, projected, isinstance(error, RateLimited))
@@ -315,6 +315,10 @@ def admit_delegation(bridge, original, projected) -> tuple[bool, str, bool]:
             raise
         diag.evt("session.admit", "applied", "delegation_started" if started else "delegation_linked",
                  task=task.id, state=task.status, **fields)
+        if started and task.status == "blocked" and not bridge.store.conversation_input(issue_id, session_id):
+            return True, (f"Tracked delegated work is staged as task {task.id}. It starts once this input is "
+                "committed. Do not perform the issue work in this conversation or create another task; its "
+                "native worker owns execution and the user decision prompts."), True
         return True, _admission_note({**row, "board": (bridge.store.native_binding(issue_id) or {}).get("board")},
                                      task, started), started
     if bridge.store.scope_fenced(issue_id):
@@ -1231,10 +1235,15 @@ def create_adapter(config, running):
                 bridge = running["bridge"]
                 def remember_input():
                     with bridge.lock(projected.issue_id):
-                        return bridge.store.remember_conversation_input(
+                        anchor = bridge.store.remember_conversation_input(
                             projected.issue_id, projected.session_id, projected.message_id,
                             receipt["admission_id"], receipt["seq"], receipt["status"] == "terminal",
                             self._core_session_keys(event.source))
+                        if projected.source == "delegation":  # its staged task may run now
+                            activity = projected.message_id if projected.message_id != projected.session_id else None
+                            with bridge.api.requester_session(projected.session_id, activity_id=activity):
+                                bridge.release_staged(projected.issue_id)
+                        return anchor
                 anchor = await asyncio.to_thread(remember_input)
                 self._cache_input(projected.issue_id, projected.session_id, anchor)
                 with self._relay_lock:
