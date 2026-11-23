@@ -1,6 +1,7 @@
 """Durable delivery records do not become a second task ownership system."""
 import json
 import sqlite3
+from contextlib import closing
 import tempfile
 import threading
 import unittest
@@ -380,6 +381,26 @@ class NativeStoreTests(unittest.TestCase):
         self.assertTrue(self.store.issue_reconciliation_blocked("unlinked"))
         self.assertEqual(self.store.enqueue("description", {"issue_id": "unlinked", "body": "Retry", "id": "edit-2",
                                                             "content_action": True}, at=102), "")
+
+    def test_a_retired_table_dropped_by_another_opener_first_is_not_an_error(self):
+        # Two processes open the same store after a deploy: the other one drops the empty table
+        # after this one saw it but before this one takes the write lock.
+        with sqlite3.connect(self.path) as db:
+            db.execute("CREATE TABLE retirement (task_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, snapshot TEXT NOT NULL)")
+
+        class Racing(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == "BEGIN IMMEDIATE":
+                    with closing(sqlite3.connect(Racing.path)) as other:
+                        other.execute("DROP TABLE IF EXISTS retirement")
+                        other.commit()
+                return super().execute(sql, *args)
+        Racing.path = self.path
+        with closing(sqlite3.connect(self.path, factory=Racing, isolation_level=None)) as db:
+            Store._drop_retired_tables(db)  # no "no such table"
+        with sqlite3.connect(self.path) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='retirement'").fetchone())
+        Store(self.path)  # and a later open is clean
 
     def test_opening_drops_empty_retired_tables_and_keeps_one_with_rows(self):
         with sqlite3.connect(self.path) as db:

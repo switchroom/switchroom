@@ -168,14 +168,17 @@ class Store:
             self._drop_retired_tables(db)
     @staticmethod
     def _drop_retired_tables(db: sqlite3.Connection) -> None:
-        """Drop each retired table that exists and is empty; tables with rows are kept and named once."""
+        """Drop each retired table that exists and is empty; tables with rows are kept and named on each open."""
         kept = []
         for table in RETIRED_TABLES:
             if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                 continue
-            db.execute("BEGIN IMMEDIATE")  # the emptiness check and the drop commit together
+            db.execute("BEGIN IMMEDIATE")  # existence, emptiness and the drop commit together
             try:
-                if db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                # Another process opening the same store may have dropped it before this lock.
+                if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    pass
+                elif db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
                     kept.append(table)
                 else:
                     db.execute(f"DROP TABLE {table}")
