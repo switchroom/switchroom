@@ -157,6 +157,10 @@ class ReportOnlyDefaultTests(unittest.TestCase):
 
         constants = types.ModuleType("hermes_constants")
         constants.get_hermes_home = lambda: home
+        # Core helpers the upstream plugin imports since Agent 2a1293da.
+        constants.mkdir_under_hermes_home = lambda path: Path(path).mkdir(parents=True, exist_ok=True)
+        constants.named_profile_home = lambda _home: None
+        constants.named_profile_is_live = lambda _home: True
         cli = types.ModuleType("hermes_cli")
         cli.__path__ = []
         config = types.ModuleType("hermes_cli.config")

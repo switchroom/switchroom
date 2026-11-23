@@ -1,9 +1,9 @@
 {
-  "commit": "160740a2de1c3e65960316ef37b97c95e7ca8289",
+  "commit": "2a1293da73bfaed49ff5e03b739dfec7765c044b",
   "files_sha256": {
     "README.md": "54d6ad0f0f10b0efdce5b7e88e1f43f96a2ff2710dbbca919f4a7c0c07cd1d91",
-    "__init__.py": "410d108eb4299270e00a004285f3656439e5b352c498c98b947ac2e93e60ecd7",
-    "disk_cleanup.py": "96a89e5d986e0d5757ba28175b6edbea9a18e5e9a3f1968c82c72f1e8d480dbe",
+    "__init__.py": "6f03d2452d1f831dc19a73b628a96b91b590c117f0a78fcb99fa5c634e900080",
+    "disk_cleanup.py": "a8f2ac22a2214b40df8e3303541e80b8d6ecd3ee8ff85ff84e6e0da9d1f59924",
     "plugin.yaml": "869befdaf179b62ac12c0696d3fed65a96635a2e2ff3fff727dcb073f3c2bd32"
   },
   "license": "MIT",
@@ -21,11 +21,11 @@
   ],
   "path": "plugins/disk-cleanup",
   "repository": "https://github.com/switchroom/hermes-agent.git",
-  "tree": "236d543d80a7e353c051f62342f4a262ba37a15a",
+  "tree": "fb5b9833a850112a02a07a0fed87aec24ee85440",
   "upstream_files_sha256": {
     "README.md": "34d397346b7e4532b307020aa6044954cd21ec95a75b2ae360e8d20dca3531d5",
-    "__init__.py": "fb216416785f30572f728bc744c5b6af9bd4e0524ef10837f0a8c6e516ec2827",
-    "disk_cleanup.py": "96a89e5d986e0d5757ba28175b6edbea9a18e5e9a3f1968c82c72f1e8d480dbe",
+    "__init__.py": "dcc0c2512ed61702c01a0631058e119806c3f133184d39c06e13eac897fd8df7",
+    "disk_cleanup.py": "a8f2ac22a2214b40df8e3303541e80b8d6ecd3ee8ff85ff84e6e0da9d1f59924",
     "plugin.yaml": "869befdaf179b62ac12c0696d3fed65a96635a2e2ff3fff727dcb073f3c2bd32"
   }
 }
