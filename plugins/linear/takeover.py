@@ -262,11 +262,13 @@ def hand_off(bridge, args: dict, context, issue: dict, reply: Callable[..., str]
     if (context.delegated_child or context.platform != "a2a" or peer is None or context.user_id != peer):
         return answer(False, f"{me} hands work over only when {to} itself asks over A2A and is allowed to take "
                       "over from it, so nothing was changed.", "handoff_not_allowed")
-    if not resume and bridge.store.handoff_closed(request_id):
-        return answer(False, f"This handover request for {key} was already answered, so nothing was changed. "
-                      "Ask again with a new request.", "handoff_closed")
     viewer = bridge.api.viewer_id()
     with bridge.lock(issue_id):
+        # Checked under the issue lock, where a resume closes the id: a late pause can never
+        # slip in between this check and a resume that has already answered for the same id.
+        if not resume and bridge.store.handoff_closed(request_id):
+            return answer(False, f"This handover request for {key} was already answered, so nothing was changed. "
+                          "Ask again with a new request.", "handoff_closed")
         row = bridge.store.get(issue_id)
         if not row or row.get("origin") != "native" or not row.get("task_id"):
             return answer(False, f"{me} has no tracked work linked to {key}, so there was nothing to hand over.",
