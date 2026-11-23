@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,8 @@ DOCKERFILE = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github" / "workflows" / "fleet-image.yml").read_text(encoding="utf-8")
 SERVICE = (ROOT / "docker" / "camofox-browser" / "service-run").read_text(encoding="utf-8")
 PATCH = (ROOT / "release" / "camofox-browser" / "official-camoufox.patch").read_text(encoding="utf-8")
+# service-run checks a derived locale and time zone with `node -e` (Intl) before it exports them.
+REAL_NODE = shutil.which("node")
 
 
 class LockTests(unittest.TestCase):
@@ -40,7 +43,9 @@ class LockTests(unittest.TestCase):
         (patch,) = s["patches"]
         self.assertEqual(patch["id"], "official-camoufox")
         self.assertTrue((ROOT / patch["file"]).is_file())
-        self.assertIn("jo-inc/camofox-browser", patch["upstream"])
+        # The same change, offered upstream (docs/camoufox.md): drop the patch once a release has it.
+        self.assertEqual(patch["upstream"], "https://github.com/jo-inc/camofox-browser/pull/15715")
+        self.assertEqual(patch["upstream_issue"], "https://github.com/jo-inc/camofox-browser/issues/15333")
 
     def test_fingerprint_model_is_baked_from_the_fpgen_pin(self):
         m = LOCK["camofox_browser"]["fingerprint_model"]
@@ -175,7 +180,10 @@ class ServiceRunKeyTests(unittest.TestCase):
         (server / "server.js").write_text("")
         bindir = Path(tempfile.mkdtemp(dir=home.parent))
         fake = bindir / "node"
-        fake.write_text(node)
+        # The stand-in server hands service-run's `node -e` Intl check to the real node.
+        shebang, body = node.split("\n", 1)
+        delegate = f'exec "{REAL_NODE}" "$@"' if REAL_NODE else "exit 1"
+        fake.write_text(f'{shebang}\nif [ "$1" = "-e" ]; then {delegate}; fi\n{body}')
         fake.chmod(0o755)
         env = {"PATH": f"{bindir}:/usr/bin:/bin", "HERMES_HOME": str(home), "CAMOFOX_SERVER_DIR": str(server),
                "CAMOFOX_X_SOCKET_TABLE": str(self.table), **extra}
@@ -212,6 +220,67 @@ class ServiceRunKeyTests(unittest.TestCase):
         self.assertEqual(env["CAMOFOX_INTERACTIVE"], "desktop")
         self.assertEqual(self.run_service(self.home)["CAMOFOX_ACCESS_KEY"], env["CAMOFOX_ACCESS_KEY"])
         self.assertEqual(sorted(p.name for p in (self.home / "camofox-browser").glob(".access-key.*")), [])
+
+    def identity(self, **extra: str) -> tuple:
+        """Run the service and return the (CAMOFOX_LOCALE, CAMOFOX_TIMEZONE) it exported (None if unset)."""
+        if not REAL_NODE:
+            self.skipTest("the locale and time-zone check needs node")
+        extra.setdefault("CAMOFOX_TIMEZONE_FILE", str(Path(self.tmp.name) / "no-timezone-file"))
+        env = self.run_service(self.home, **extra)
+        return env.get("CAMOFOX_LOCALE"), env.get("CAMOFOX_TIMEZONE")
+
+    def test_locale_and_time_zone_follow_the_container(self):
+        # camofox-browser (lib/config.js directBrowserIdentity) takes both or neither; with both,
+        # navigator.language matches Intl instead of staying en-US.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="Australia/Sydney"), ("en-AU", "Australia/Sydney"))
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC"), ("en-AU", "UTC"))
+        self.assertEqual(self.identity(LANG="de_DE.UTF-8@euro", TZ=":Europe/Berlin"), ("de-DE", "Europe/Berlin"))
+
+    def test_lc_all_beats_lang(self):
+        self.assertEqual(self.identity(LC_ALL="fr_CA.UTF-8", LANG="en_AU.UTF-8", TZ="UTC"), ("fr-CA", "UTC"))
+
+    def test_time_zone_falls_back_to_the_timezone_file(self):
+        tzfile = Path(self.tmp.name) / "timezone"
+        tzfile.write_text("Europe/Lisbon\n")
+        self.assertEqual(self.identity(LANG="en_GB.UTF-8", CAMOFOX_TIMEZONE_FILE=str(tzfile)),
+                         ("en-GB", "Europe/Lisbon"))
+        self.assertEqual(self.identity(LANG="en_GB.UTF-8", TZ="UTC", CAMOFOX_TIMEZONE_FILE=str(tzfile)),
+                         ("en-GB", "UTC"))
+
+    def test_explicit_values_win_and_pass_through_unpaired(self):
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_LOCALE="en-GB",
+                                       CAMOFOX_TIMEZONE="Europe/London"), ("en-GB", "Europe/London"))
+        # Half a pair is the operator's own: passed through as given, so camofox-browser refuses it.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_LOCALE="en-GB"), ("en-GB", None))
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="UTC", CAMOFOX_TIMEZONE="Europe/London"),
+                         (None, "Europe/London"))
+
+    def test_a_pair_intl_rejects_exports_neither(self):
+        # camofox-browser refuses these at start (Intl.getCanonicalLocales / DateTimeFormat timeZone),
+        # and s6 would restart it in a loop.
+        cases = [("UTF-8", "UTC")] + [("en_AU.UTF-8", tz) for tz in (
+            "Factory", "posixrules", "localtime", "zone.tab", "AEST-10", "Mars/Olympus",
+            "../Etc/UTC", "Europe/../Etc/UTC", "/usr/share/zoneinfo/UTC")]
+        for lang, tz in cases:
+            with self.subTest(lang=lang, tz=tz):
+                self.assertEqual(self.identity(LANG=lang, TZ=tz), (None, None))
+                self.assertIn("is not valid for the browser; leaving both to camofox-browser",
+                              self.stderr.read_text())
+        tzfile = Path(self.tmp.name) / "timezone"
+        tzfile.write_text("AEST-10\n")
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", CAMOFOX_TIMEZONE_FILE=str(tzfile)), (None, None))
+        # A timezone path that is not a file is skipped, not fatal under set -e.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", CAMOFOX_TIMEZONE_FILE=self.tmp.name), (None, None))
+        # A valid pair exports; explicit values are the operator's and are not checked.
+        self.assertEqual(self.identity(LANG="en_AU.UTF-8", TZ="Europe/Lisbon"), ("en-AU", "Europe/Lisbon"))
+        self.assertEqual(self.identity(CAMOFOX_LOCALE="en-AU", CAMOFOX_TIMEZONE="AEST-10"), ("en-AU", "AEST-10"))
+
+    def test_half_a_derived_pair_exports_neither(self):
+        for extra in ({"LANG": "C", "TZ": "UTC"}, {"LANG": "POSIX", "TZ": "UTC"}, {"LANG": "C.UTF-8", "TZ": "UTC"},
+                      {"TZ": "UTC"}, {"LANG": "en_AU.UTF-8"}, {"LANG": "en_AU.UTF-8", "TZ": ""},
+                      {"LANG": "en_AU.UTF-8", "TZ": ":"}, {"LC_ALL": "C", "LANG": "en_AU.UTF-8", "TZ": "UTC"}):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.identity(**extra), (None, None))
 
     def test_an_empty_key_left_by_a_crash_is_replaced(self):
         state = self.home / "camofox-browser"
