@@ -567,7 +567,7 @@ this agent.
 Linear status follows the bound native task: queued (ready, todo, scheduled) shows Todo,
 running shows In Progress, review or a task held by the open-PR guard shows In Review,
 blocked or triage shows the team's Blocked state, and finished work whose outcome is not
-verified shows In Review (it awaits review, CI or merge; never Todo). A task core's open-PR
+verified (a finished progress-scope stage, not the issue's agreed outcome) shows In Review (never Todo). A task core's open-PR
 guard parked after a restart (blocked, its newest block, unblock or release event being the
 guard's own block) also shows In Review, with one plain sentence instead of "Waiting on you".
 Once that PR has merged or closed, the plugin lets the task run with one guarded core unblock
@@ -599,25 +599,7 @@ event since the block. A Stop or answer that lands first wins, and the comment s
 information. A repeated park on the same task lands in triage through core's block-loop breaker;
 it carries the same wait and resumes the same way, up to 20 CI parks per task.
 
-Done comes only from verified completion. A PR named as evidence is verified by core's exact-head required-check
-verifier; when the gateway's GitHub login is refused only at the Checks API (a fine-grained
-token without `checks:read`), the same requirements are proved from exact-head GitHub Actions
-jobs instead (`acceptance.py`: every requirement pinned to the Actions app, trusted runs of the
-PR's own repository, the base branch's own workflow for each required job, latest attempt of every
-counted run passing, a failed or unfinished required job in any Actions run on the head refusing, full pagination, and a final re-read showing the same head;
-merged counts, closed unmerged does not). Where Actions cannot stand in for the checks (they
-are not Actions jobs, the PR is from a fork, or only untrusted runs exist) the answer is final.
-When GitHub cannot be asked (refused, unreachable, or checks not finished, including CI not
-started on an open PR), finished work shows In Review with one plain sentence instead of
-Blocked, and the PR is asked about again on a persisted gap (2 minutes doubling to an hour):
-Done once it passes (a head that moved meanwhile is verified as the new head and said so),
-Blocked once a check fails, and Blocked with one sentence once 7 days have passed since the
-wait began, whatever the answers were. A Done whose send-time re-check finds GitHub not
-answering is retried on the outbox schedule; one that re-check refuses resumes the wait (after
-its gap); one Linear refuses ends it. An older build's Blocked closeout whose own
-message says GitHub refused or did not answer is rechecked the same way. Blocked closeouts written by this build
-are final answers and are never rechecked. A failed check, a PR
-closed without merging or missing evidence stays Blocked and is not rechecked. Work archived or cancelled without a verified outcome posts nothing; a
+A finished native task is Done in Linear (Ken's F28 decision, 23 Nov 2026): its closing response completes the Agent Session and points to the closing issue comment, which carries the worker's summary, its evidence links and, for each PR named as evidence, a `Pull request: <url> (<state>)` line read from GitHub at close (merged, closed without merging, or open with its checks passed, failed or still running; no state when GitHub would not say). PR checks gate nothing and nothing waits on them: there are no In Review acceptance waits, rechecks or "Verifying" keepalives. A run that shows no evidence at all (no link and no meaningful local summary) still goes to Blocked. Closeouts an older build left waiting (its In Review acceptance wait, or its Blocked "pull request could not be verified" closeout) are closed out again once, through the same path, as Done; an older build's queued "Verifying" keepalive is dropped unsent. A session Linear opens after the work already finished (for example `record_done` from chat) gets the result, summary and evidence links, as its reply. Work archived or cancelled without a verified outcome posts nothing; a
 started state this app set (In Progress, Blocked, In Review) becomes Todo, since no agent is
 working on it now, including after an older build's Blocked closeout.
 Backlog, Todo, Done and Canceled stay as they are. A team without a named state uses its first state of

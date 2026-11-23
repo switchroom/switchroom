@@ -4,13 +4,28 @@ import json
 POINTER_BODY = "Completed. The result and checks are in the issue comment."
 
 
-def prepare(writes, *, issue_id, owner, completion, summary, evidence, head_note, assessment_id=None):
-    """One full issue comment per native completion; a session carries only its pointer."""
-    from .bridge import _done_body, stable_uuid4
-    comment_id = assessment_id or stable_uuid4("native-outcome-comment", issue_id,
-        json.dumps(completion, sort_keys=True, separators=(",", ":")))
+def comment_id_for(issue_id, completion):
+    from .bridge import stable_uuid4
+    return stable_uuid4("native-outcome-comment", issue_id, json.dumps(completion, sort_keys=True, separators=(",", ":")))
+
+
+def captured_body(store, issue_id, completion):
+    """The text of this completion's outcome comment when one is already in the outbox, else None."""
+    prior = store.outbox_row(comment_id_for(issue_id, completion))
+    if prior and prior["kind"] == "comment" and prior["payload"].get("native_outcome_comment") is True:
+        body = prior["payload"].get("body")
+        return body if isinstance(body, str) else None
+    return None
+
+
+def prepare(writes, *, issue_id, owner, completion, summary, evidence, head_note, assessment_id=None, body=None):
+    """One full issue comment per native completion; a session carries only its pointer.
+
+    ``body`` is the text this completion's comment already has (outcome.captured_body), kept as is."""
+    from .bridge import _done_body
+    comment_id = assessment_id or comment_id_for(issue_id, completion)
     if not assessment_id:
-        body = _done_body(summary, evidence) + head_note
+        body = body if body is not None else _done_body(summary, evidence) + head_note
         writes.insert(1, ("comment", dict(id=comment_id, issue_id=issue_id, task_id=completion["task_id"],
             body=body, native_completion=completion, native_outcome_comment=True)))
     result = []

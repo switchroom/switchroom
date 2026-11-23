@@ -368,9 +368,10 @@ class CoreContractScenarios(unittest.TestCase):
                          "hermes_cli.kanban_db:_require_task", "hermes_cli.kanban_db:create_task",
                          "hermes_cli.kanban_db:complete_task", "hermes_cli.kanban_db:Run.from_row",
                          "hermes_cli.kanban_db_connect:init_db", "hermes_cli.kanban_db_boards:create_board",
-                         "hermes_cli.kanban_pr_acceptance:collect_acceptance",
                          "tools.registry:registry.dispatch"):
             self.assertIn(expected, paths)
+        # F28: Core's PR acceptance verifier is no longer used; native Done is Linear Done.
+        self.assertNotIn("hermes_cli.kanban_pr_acceptance:collect_acceptance", paths)
         keywords = {kw for use in self.uses
                     if canonical(use.path) == "hermes_cli.kanban_db:block_task" for kw in use.keywords}
         self.assertTrue({"reason", "kind", "expected_run_id", "expected_event_id"} <= keywords, keywords)

@@ -21,6 +21,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from linear_fake_api import canonical_uuid4, load_plugin
 from linear_ingress_fixture import IngressStore, Route
@@ -1244,6 +1245,8 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
 
 
     def test_kanban_closeout_rechecks_scope_after_evidence_verification(self):
+        # The scope moves while the closing note's evidence is read (PR state, F28): still fenced.
+        from hermes_fleet_linear_plugin import bridge as bridge_module
         for accepted in (True, False):
             with self.subTest(evidence_accepted=accepted):
                 issue_id = f"{ISSUE}-{accepted}"
@@ -1254,11 +1257,11 @@ class LinearSpecialistAuthorizationTests(unittest.TestCase):
                 task.status = "done"
                 self.kanban.record_completion(task, 1)
                 before = self.store.get(issue_id)
-                def evidence_checked(_links, _contract, **_ignored):
+                def evidence_checked(_links):
                     self.authority.issues[issue_id] = issue_record(id=issue_id, project={"id": "project-foreign"})
-                    return accepted
-                self.bridge.accepted_evidence = evidence_checked
-                self.bridge._finished(before)
+                    return "\n\nPull request: https://github.com/acme/app/pull/1 (merged)" if accepted else ""
+                with patch.object(bridge_module, "_pr_lines", evidence_checked):
+                    self.bridge._finished(before)
                 self.assertTrue(self.store.scope_fenced(issue_id))
                 self.assertEqual(self.store.get(issue_id), before)
                 self.assertEqual(self.store.pending(issue_id), [])

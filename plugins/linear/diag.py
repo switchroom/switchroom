@@ -106,9 +106,8 @@ REASONS = frozenset({
     "authorization_unavailable", "native_scope_refused", "description_conflict",
     "context_or_service_unavailable", "delivery_uncertain", "project_required", "ambiguous_project",
     "unknown_team", "team_required", "not_found", "ambiguous_issue", "issue_alias", "alias_closed",
-    # finished work whose PR GitHub could not be asked about (In Review, rechecked on a widening gap)
-    "acceptance_unverified", "acceptance_verified", "acceptance_failed", "acceptance_expired",
-    "acceptance_head_moved", "acceptance_merged", "acceptance_issue_closed",
+    # an older build's PR-acceptance closeout closed out again as Done (F28)
+    "legacy_closeout",
     # work core's open-PR guard parked, resumed once that PR merges or closes (_resume_pr_park)
     "pr_park_resolved", "pr_park_resumed", "pr_park_changed", "pr_park_no_pr", "pr_open", "pr_unreadable",
     "external_wait_resumed", "issue_open", "issue_unreadable", "delivery_pending", "ci_pending", "ci_park_limit", "wait_changed", "readback_matches",

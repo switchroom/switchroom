@@ -107,7 +107,7 @@ Switchroom child image  (this repo, switchroom/switchroom)
         |
         +-- profile A container + state volume + workspace + network
         +-- profile B container + state volume + workspace + network
-        +-- independent sidecar images (browser broker, proxies, Kokoro)
+        +-- independent sidecar images (Kokoro)
 ```
 
 Sidecar source lives under `sidecars/`. Each sidecar publishes its own GHCR image through a dedicated workflow.

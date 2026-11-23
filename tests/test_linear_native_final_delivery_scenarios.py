@@ -371,7 +371,8 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         await self.flush(question)
         self.assertEqual(sum(p["id"] == question for p in self.posted), 1)
 
-    async def test_late_interim_cannot_close_while_captured_pr_is_unaccepted(self):
+    async def test_late_interim_never_adds_a_second_response_to_a_pr_closeout(self):
+        # F28: PR checks no longer hold Done at send; the late interim still never closes twice.
         from hermes_cli import kanban_db as kb
         from hermes_fleet_linear_plugin import bridge as bridge_module
         task_id = self.fixture.create()
@@ -384,24 +385,18 @@ class FinalDeliveryScenarios(unittest.IsolatedAsyncioTestCase):
         self.lost.add(interim)
         await self.flush(interim)
         self.assertTrue(self.store.outbox_row(interim)['payload']['write_started'])
-        receipt = {'ok': True, 'classification': 'passed', 'head_sha': 'a' * 40, 'checks': []}
-        with patch.object(bridge_module, 'pr_acceptance', lambda *args: receipt):
+        with patch.object(bridge_module, 'pr_state', lambda *args, **kwargs: 'merged'):
             with self.fixture.board.conn() as conn:
                 kb.complete_task(conn, task_id, summary='Implementation and local checks finished.',
                                  result='https://github.com/example/project/pull/12')
             await asyncio.to_thread(self.bridge.pump_kanban)
             status = self.store.latest_status(native.ISSUE)
             self.assertEqual(status['state'], 'done')
-            receipt.update(ok=False, classification='pending')
-            await self.flush(status['id'])
-            self.assertEqual(self.store.outbox_row(status['id'])['state'], 'pending')
-            self.assertNotEqual(self.authority.issues[native.ISSUE]['state']['type'], 'completed')
+            # The lost interim is retried while the Done closeout is captured but not yet sent.
             self.make_due(interim)
             before = len(self.posted)
             await self.flush(interim)
-            effects = [p['content'] for p in self.posted[before:]]
-            self.assertNotIn('response', [p['type'] for p in effects])
-            receipt.update(ok=True, classification="passed")
+            self.assertNotIn('response', [p['content']['type'] for p in self.posted[before:]])
             self.make_due(status["id"])
             for _ in range(4):
                 await asyncio.to_thread(self.bridge.flush)

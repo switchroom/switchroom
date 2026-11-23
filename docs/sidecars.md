@@ -7,15 +7,12 @@ not baked into the agent child image. Deployments pin an immutable digest.
 
 | Sidecar | Image | Status |
 |---|---|---|
-| REST lock-proxy | `ghcr.io/switchroom/rest-lock-proxy` | publishing |
-| TCP / noVNC proxy | `ghcr.io/switchroom/tcp-proxy` | publishing |
-| Browser broker | `ghcr.io/switchroom/browser-broker` | publishing |
 | Kokoro | `ghcr.io/switchroom/kokoro` | publishing |
 
 Pin form:
 
 ```text
-ghcr.io/switchroom/rest-lock-proxy@sha256:<64 lowercase hex>
+ghcr.io/switchroom/kokoro@sha256:<64 lowercase hex>
 ```
 
 `scripts/sidecar_image_ref.py` rejects tags and unprefixed private names. Digests published before the move under `ghcr.io/mekenthompson/hermes-fleet-<sidecar>` remain accepted, because existing deployments pin them.
@@ -34,10 +31,8 @@ ghcr.io/switchroom/rest-lock-proxy@sha256:<64 lowercase hex>
 ## Starter overlay sidecars
 
 `examples/overlay-repo/compose.sidecars.yaml` runs the sidecars the starter
-defaults use. It lives in the overlay, not next to
-`examples/compose.sidecars.example.yaml`, because it attaches the overlay's own
-`ops` and `worker` agents to sidecar networks; the older example is a
-standalone list of the published sidecars with no agents. Layer it over the overlay
+defaults use. It lives in the overlay because it attaches the overlay's own
+`ops` and `worker` agents to sidecar networks. Layer it over the overlay
 compose file:
 
 ```bash
@@ -152,8 +147,7 @@ under the same isolation rules. Without the fragment nothing changes.
 
 Household compose, identities, secret names, and live digest pins stay in the
 private deployment overlay. This tree ships generic images and synthetic
-examples only. Browser-broker chrome reads `BRAND`, `LOCAL_TZ`, and a required
-matching `PUBLIC_BASE`/`PUBLIC_ORIGIN` from the environment.
+examples only.
 
 The Fleet Kokoro image is a CUDA runtime image for GPU hosts; its model
 weights are not baked in. The starter overlay's CPU voice server is the
@@ -161,4 +155,6 @@ upstream Kokoro-FastAPI CPU build instead.
 
 Camoufox is not a sidecar. It runs inside the Fleet image on each agent's own
 Bot Desktop ([camoufox.md](camoufox.md)). The Camofox sidecar image and its
-browser-handoff recipe were retired; digests already published stay in GHCR.
+browser-handoff recipe were retired, and so were the sidecars that served only that
+handoff: the browser broker, the REST lock proxy and the TCP / noVNC proxy. Digests
+already published under any of those names stay in GHCR.

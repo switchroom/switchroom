@@ -63,7 +63,7 @@ class SourceSelectionTests(unittest.TestCase):
             'plugins/model-providers/claude-acp/client.py': ('tests/test_claude_acp_wire.py', 'acp'),
             'plugins/claude-account-connectors/plugin.py': ('tests/test_claude_acp_connector_hydration.py', 'acp'),
             'plugins/web/perplexity/provider.py': ('tests/test_perplexity_provider.py', None),
-            'sidecars/browser-broker/server.py': ('tests/test_browser_broker_group_admit.py', None),
+            'sidecars/kokoro/server.py': ('tests/test_sidecar_packages.py', None),
             'scripts/tooling-policy-hook': ('tests/test_tooling_policy_hook.py', None),
         }
         for path, (test, lane) in cases.items():
