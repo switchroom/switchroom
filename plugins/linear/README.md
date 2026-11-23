@@ -668,20 +668,6 @@ INFO stops for the rest of the hour at the cap (200 lines per hour in total), an
 `diag.throttled` WARNING records that it happened. `service.start` records the plugin `ver`, its
 source `sha` and, when visible, the git `commit`.
 
-For a short, time-boxed investigation, add the optional `diagnostics` setting to that agent's
-`settings` block. `until` is required, so the setting expires on its own. It is read when the
-gateway restarts:
-
-```yaml
-        diagnostics:
-          detail: true
-          issues: [ABC-123]          # optional; empty means every linked issue
-          until: 2026-11-03T00:00Z
-```
-
-While it is active, extra `lvl=detail` lines are written at INFO, still metadata only: applied
-comments, queued status writes, and read-only tool calls.
-
 ## Migration and delivery limits
 
 Existing chat/manual/old Kanban bindings, stopped work and uncertain deliveries remain visible

@@ -383,25 +383,12 @@ class TickTimingTests(DiagCase):
 
 
 class DetailSettingTests(DiagCase):
-    def test_detail_requires_until_and_expires(self) -> None:
-        diag.configure({"detail": True, "issues": ["ABC-584"]}, agent="a", profile="p")
-        self.assertIn("reason=invalid_diagnostics", self.capture.lines(logging.WARNING)[0])
-        self.assertFalse(diag.detail_active())
-        diag.configure({"detail": True, "issues": ["ABC-584"], "until": "2031-01-01T00:00:00Z"})
-        diag.remember({"id": ISSUE, "identifier": "ABC-584"})
-        self.assertTrue(diag.detail("status.write", "queued", iss=ISSUE, state="blocked"))
-        self.assertFalse(diag.detail("status.write", "queued", iss="ffffffff-0000-4000-8000-000000000000"))
-        self.assertIn("lvl=detail", self.capture.lines(logging.INFO)[-1])
-        self.wall[0] = 1_900_000_000.0 + 86_400 * 365
-        self.assertFalse(diag.detail("status.write", "queued", iss=ISSUE))
-
-    def test_detail_off_by_default(self) -> None:
-        diag.configure(None, agent="a", profile="p")
-        self.assertFalse(diag.detail("tool.result", "applied"))
+    def test_there_is_no_detail_mode_or_diagnostics_setting(self) -> None:
+        # The time-boxed detail mode was unused fleet-wide and is gone (T4, decision 5).
+        self.assertNotIn("diagnostics", plugin.SETTINGS)
+        self.assertFalse(hasattr(diag, "detail"))
+        self.assertFalse(diag.transition("delegate.write", "skipped", "task_finished", key="k", quiet=True))
         self.assertEqual(self.capture.records, [])
-
-    def test_diagnostics_is_an_accepted_plugin_setting(self) -> None:
-        self.assertIn("diagnostics", plugin.SETTINGS)
 
 
 class Kanban:
@@ -465,16 +452,11 @@ class BridgePathTests(DiagCase):
         self.assertNoContent()
         self.assertEqual(store.outbox_row(row_id)["payload"]["failure_reason"], "non_retryable")
 
-    def test_applied_comment_is_detail_only_and_never_logs_its_body(self) -> None:
+    def test_applied_comment_is_counted_not_logged_and_never_logs_its_body(self) -> None:
         bridge, store = self.make(Api())
         store.enqueue("comment", {"issue_id": ISSUE, "body": BODY, "content_action": True, "unlinked_content": True})
         bridge.flush()
         self.assertEqual(self.capture.lines(logging.INFO), [])
-        diag.configure({"detail": True, "until": "2031-01-01T00:00:00Z"})
-        store.enqueue("comment", {"issue_id": ISSUE, "body": BODY + " again", "content_action": True,
-                                  "unlinked_content": True})
-        bridge.flush()
-        self.assertTrue(any("action=content.write outcome=applied" in line for line in self.capture.lines()))
         self.assertNoContent()
 
     def test_refused_status_names_the_fence_and_persists_it(self) -> None:
@@ -634,7 +616,7 @@ class StartupTests(DiagCase):
         self.assertIn(f"ver={version}", line)
         self.assertRegex(line, r" sha=[0-9a-f]{8}")
         self.assertIn("n_bindings=1", line)
-        self.assertIn("detail=off", line)
+        self.assertNotIn("detail=", line)
 
     def test_logger_is_under_the_core_component_prefix(self) -> None:
         # Core routes hermes_plugins.* to gateway.log (about six weeks of history).

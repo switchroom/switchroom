@@ -640,7 +640,6 @@ _INTERNAL_WORDS = re.compile(r"(?i)\b(?:native|reconcil\w*|admission|admit\w*|ex
                              r"effects?|idempoten\w*|retry key|profile)\b")
 def _plain_notice(body: str) -> str:
     if _INTERNAL_WORDS.search(body or ""):
-        diag.detail("content.write", "skipped", "internal_wording")  # never the reply text
         return HELD_NOTICE
     return body
 def _followup_notice(result: dict) -> str:
@@ -1489,7 +1488,7 @@ class Bridge:
         # (issue id, Agent Session id) of a delegation admission in progress -> _decline answered it.
         self.session_notices: dict[tuple[str, str], bool] = {}
         self._session_turns: dict[str, float] = {}  # issue id -> monotonic start of an admitted session turn
-        diag.configure(settings.get("diagnostics"), agent=self.ingress_profile, profile=profile)
+        diag.configure(agent=self.ingress_profile, profile=profile)
         if (getattr(api, "specialist_scope", None) or {}).get("requester_basis") == "agent_session":
             api.requester_session_for_issue = self._requester_session_for_issue
             api.requester_activity_for_issue = self._requester_activity_for_issue
@@ -3544,8 +3543,7 @@ class Bridge:
         queued = self.store.reconcile_status(row["issue_id"], {"issue_id": row["issue_id"], **payload, "write_started": False,
                                                                **self._alert_route(row)}, at=self.clock())
         if queued:
-            diag.count("status_q"); diag.detail("status.write", "queued", "session_turn" if payload.get("session_turn") else "-",
-                                                iss=row["issue_id"], task=row["task_id"], state=payload["state"])
+            diag.count("status_q")
         elif payload["state"] != latest.get("state"):
             raise LinearError("Status reconcile was not queued; retrying later")  # pump backs off
     # A just-admitted task waits at most one dispatcher tick (kanban.dispatch_interval_seconds, 60 s
