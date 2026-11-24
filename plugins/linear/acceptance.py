@@ -12,6 +12,8 @@ import re
 import subprocess
 from typing import Any
 
+from . import diag
+
 
 class Denied(Exception):
     """GitHub refused the read (401/403/404) or gh has no login. ``status`` is the HTTP code, if any."""
@@ -32,8 +34,9 @@ def gh_api(endpoint: str, *, paginate: bool = False) -> Any:
     if paginate:
         command += ["--paginate", "--slurp"]
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=30, check=True)
+        with diag.external_time():  # the reporting tick shows this apart from its own work
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=30, check=True)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr or ""
         if "rate limit" in stderr.lower():

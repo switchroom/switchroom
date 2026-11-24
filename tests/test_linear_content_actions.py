@@ -222,6 +222,50 @@ class ContentActionTests(unittest.TestCase):
         self.assertIn('outcome=refused reason=id_reused', logs.output[-1])
         self.assertEqual(set(self.remote.issues), {'issue-1', self.request_id})
 
+    def test_same_id_replay_expects_this_app_as_delegate_only(self):
+        # The first create's start_work made this app the delegate; replaying that create is not a rewrite.
+        body = 'Visit the board'
+        self.remote.add_issue(self.request_id, 'ABC-2', project=None).update(
+            title='Outcome', description=body, assignee=None, parent=None)
+        original = self.remote._apply
+        def duplicate(query, variables):
+            if 'issueCreate' in query:
+                return 200, {'data': None, 'errors': [{
+                    'message': 'conflict on insert of Issue', 'extensions': {
+                        'code': 'INPUT_ERROR',
+                        'userPresentableMessage': f'Issue {self.request_id} already exists.'}}]}
+            return original(query, variables)
+        self.remote._apply = duplicate
+        self.api._viewer = SELF
+        self.remote.set_delegate(self.request_id, {'id': SELF})
+        replay = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+        self.assertNotIn('readback_differences', replay)
+        # Another delegate on a replay still differs, and so does an unknown viewer.
+        self.remote.set_delegate(self.request_id, {'id': 'someone-else'})
+        with self.assertLogs('hermes_plugins.linear', 'WARNING') as logs:
+            replay = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description=body)
+        self.assertEqual(replay['readback_differences'], ['delegate'])
+        self.assertIn('fields=delegate', logs.output[-1])
+        self.api._viewer = None
+        self.remote.set_delegate(self.request_id, {'id': SELF})
+        self.assertEqual(self.api.create_issue(self.request_id, 'team-1', 'Outcome',
+                                               description=body)['readback_differences'], ['delegate'])
+
+    def test_first_create_found_delegated_still_differs(self):
+        # A create that was not a replay must come back undelegated, even to this app.
+        original = self.remote._apply
+        def delegated(query, variables):
+            status, payload = original(query, variables)
+            if 'issueCreate' in query:
+                self.remote.issues[variables['input']['id']]['delegate'] = {'id': SELF}
+            return status, payload
+        self.remote._apply = delegated
+        self.api._viewer = SELF
+        with self.assertLogs('hermes_plugins.linear', 'WARNING') as logs:
+            created = self.api.create_issue(self.request_id, 'team-1', 'Outcome', description='Body')
+        self.assertEqual(created['readback_differences'], ['delegate'])
+        self.assertIn('fields=delegate', logs.output[-1])
+
     def test_autolink_description_response_loss_restart_settles_without_resend(self):
         body = '### Outcome\n\nVisit example.com'
         original = self.remote._apply

@@ -311,6 +311,7 @@ def markdown_matches(actual: object, expected: str) -> bool:
 _AUTOLINK = re.compile(r'\[([^\[\]\s`]+)\]\((?:<([^\s<>]+)>|([^\s<>()]+))\)')
 _FULL_URL = re.compile(r'https?://[^\s<>]+')
 _HOST_PATH = re.compile(r'(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?:/[^\s<>]*)?')
+_EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}')
 _CODE_SPAN = re.compile(r'(`+)(.+?)(?<!`)\1(?!`)')
 
 def _outside_code(text: str, rewrite: Callable[[str], str | None]) -> str:
@@ -345,16 +346,18 @@ def _code_split(line: str) -> list[tuple[str, bool]] | None:
 
 def _unlink_autolinks(actual: str, expected: str) -> str:
     """Undo Linear's autolink of a token the author wrote bare: ``[T](<T>)`` for a full http(s)
-    URL, ``[T](<http://T>)`` for a bare host or host/path. The label and target must be exactly
+    URL, ``[T](<http://T>)`` for a bare host or host/path, ``[T](<mailto:T>)`` for an email
+    address (seen live on a chat-created issue, 2026-11-21). The label and target must be exactly
     the authored token; any other link (changed target, https for http, added path, query,
-    fragment or port) is kept and still differs."""
+    fragment or port, another address) is kept and still differs."""
     def bare(token: str) -> bool:
         return re.search(r'(?<![\w\[</:.@-])(?<!\]\()' + re.escape(token) + r'(?![\w/?#&=%~+:@-])(?!\.\w)',
                          expected) is not None
     def unlink(match: re.Match) -> str:
         label, target = match.group(1), match.group(2) or match.group(3)
         if ((_FULL_URL.fullmatch(label) and target == label) or
-                (_HOST_PATH.fullmatch(label) and target == 'http://' + label)) and bare(label):
+                (_HOST_PATH.fullmatch(label) and target == 'http://' + label) or
+                (_EMAIL.fullmatch(label) and target == 'mailto:' + label)) and bare(label):
             return label
         return match.group()
     def line_rewrite(line: str) -> str | None:
@@ -432,14 +435,87 @@ def _canonical_bold(text: str) -> str:
         return ''.join(out) + ('**' if open_ else '')
     return _outside_code(text, line_rewrite)
 
+_BLOCK_START = re.compile(r'[ \t]*(?:[-*+]|[0-9]+[.)])(?:[ \t]|$)|[ \t]*(?:#|>|\||<|`{3}|~{3})|[ \t]*[-=*_ \t]+$')
+
+def _list_continuations(text: str) -> str:
+    """Linear re-indents a wrapped line of a list item to the item's text column: authored
+    ``   - x`` then ``   more`` comes back as ``   * x`` then ``     more`` (seen live on a
+    chat-created issue, 2026-11-24). A line directly under a list item that starts no block of
+    its own continues that item's paragraph whatever its indent, so the indent is dropped on both
+    sides. A blank line in between, a new list item, a heading, quote, table, fence, HTML or rule
+    ends the run, and fenced code is never touched."""
+    out, fence, in_item = [], None, False
+    for line in text.split('\n'):
+        marker = re.match(r'^\s*(`{3,}|~{3,})', line)
+        if marker:
+            run = marker.group(1)
+            if fence is None: fence = (run[0], len(run))
+            elif run[0] == fence[0] and len(run) >= fence[1]: fence = None
+            out.append(line)
+            in_item = False
+            continue
+        if fence is not None or not line.strip():
+            out.append(line)
+            in_item = False
+            continue
+        if _LIST_ITEM.match(line):
+            in_item = True
+            out.append(line)
+            continue
+        if in_item and not _BLOCK_START.match(line):
+            out.append(line.lstrip(' \t'))
+            continue
+        in_item = False
+        out.append(line)
+    return '\n'.join(out)
+
+def _unangle_links(text: str) -> str:
+    """``[T](<u>)`` and ``[T](u)`` are the same link when ``u`` needs no brackets. markdown_matches
+    already treats them alike on plain lines; Linear also writes the brackets on a line that holds
+    inline code (seen live, 2026-11-24). Code spans stay exact."""
+    def line_rewrite(line: str) -> str | None:
+        pieces = _code_split(line)
+        if pieces is None:
+            return None
+        return ''.join(piece if code else re.sub(r'\]\(<((?:[^\s<>()]|\([^\s<>()]*\))+)>\)', r'](\1)', piece)
+                       for piece, code in pieces)
+    return _outside_code(text, line_rewrite)
+
+def _unescape_brackets(text: str) -> str:
+    """Linear backslash-escapes square brackets that are plain text, not a link: ``[DONE]`` comes
+    back as ``\\[DONE\\]`` (seen live on chat-created issues, 2026-11-22). Unescaping is the same
+    text only where it cannot become link syntax: the line is left exact when a ``\\]`` is followed
+    by ``(``, ``[`` or ``:``, a ``\\[`` follows ``!``, or unescaping would change the line's
+    bracket-then-``(``/``[``/``:`` runs (a link, reference or definition). Code spans stay exact."""
+    def links(prose: str) -> list[str]:
+        return re.findall(r'(?<!\\)\[[^\[\]]*\](?:\(|\[|:)', prose)
+    def line_rewrite(line: str) -> str | None:
+        pieces = _code_split(line)
+        if pieces is None:
+            return None
+        prose = ''.join(piece for piece, code in pieces if not code)
+        if '\\[' not in prose and '\\]' not in prose:
+            return line
+        if '\\\\' in prose or re.search(r'\\\](?:[(\[:])|!\\\[', prose):
+            return line
+        out = [piece if code else re.sub(r'\\([\[\]])', r'\1', piece) for piece, code in pieces]
+        if links(''.join(piece for piece, (_, code) in zip(out, pieces) if not code)) != links(prose):
+            return line
+        return ''.join(out)
+    return _outside_code(text, line_rewrite)
+
 def created_markdown_matches(actual: object, expected: str) -> bool:
-    """Readback of a just-created description: markdown_matches plus Linear's autolink and bold
-    rewrites. Write settlement keeps the stricter markdown_matches."""
+    """Readback of a just-created description: markdown_matches plus Linear's autolink, bold,
+    list-continuation, link-bracket and bracket-escape rewrites. Write settlement keeps the
+    stricter markdown_matches."""
     if markdown_matches(actual, expected):
         return True
     if not isinstance(actual, str):
         return False
-    return markdown_matches(_canonical_bold(_unlink_autolinks(actual, expected)), _canonical_bold(expected))
+    authored = _list_continuations(expected)
+    def editor(text: str) -> str:
+        return _canonical_bold(_unescape_brackets(_unangle_links(text)))
+    return markdown_matches(editor(_unlink_autolinks(_list_continuations(actual), authored)), editor(authored))
 
 # Fields Linear stores as sent. On a same-id replay a difference here means the id was already used
 # for something else, not that the editor rewrote it.
@@ -1049,11 +1125,18 @@ class LinearAPI:
             "query CreatedIssue($id: String!) { issue(id: $id) { id identifier title description url "
             "team { id key } project { id } parent { id } assignee { id } delegate { id } } }", "issue", client_id)
         team, project, parent = (issue.get(key) or {} for key in ("team", "project", "parent"))
+        delegate = issue.get("delegate")
+        # A same-id replay finds the issue as the first create left it, and that create's own
+        # start_work makes this app the delegate (seen live on a replayed chat create, 2026-11-24).
+        # Only this app as delegate on a replay is expected; on a first create, or any other
+        # delegate, it still differs.
+        own_delegate = (replayed and isinstance(delegate, dict) and self._viewer is not None
+                        and delegate.get("id") == self._viewer)
         return _created(issue, "issue", replayed, {
             "title": issue.get("title") != title,
             "team": team_id not in {team.get("id"), team.get("key")},
             "description": description is not None and not created_markdown_matches(issue.get("description"), description),
-            "assignee": issue.get("assignee") is not None, "delegate": issue.get("delegate") is not None,
+            "assignee": issue.get("assignee") is not None, "delegate": delegate is not None and not own_delegate,
             "project": project_id is not None and project.get("id") != project_id,
             "parent": parent_id is not None and parent.get("id") != parent_id})
     def team_projects(self, team_id: str) -> list[dict[str, str]]:

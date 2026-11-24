@@ -335,6 +335,43 @@ _native_validated: dict[str, tuple[tuple, float]] = {}            # resolved pat
 _native_keys_validated: dict[tuple[str, str], tuple[tuple, float]] = {}  # (path, table) -> (fingerprint, checked)
 _native_snapshots: dict[int, tuple[str, tuple]] = {}               # open read conn -> (path, stable fingerprint)
 
+# The webhook inbox keeps every filed delivery for days, so its table holds thousands of large
+# payloads, and the column the drain filters on is stored after the payload: without an index,
+# every drain reads the whole table twice, and closing a fresh connection after its writes
+# checkpoints the WAL. On a busy agent this was a third of the reporting tick (HF-755). Each
+# thread keeps one connection per inbox file, and the inbox gets an index of pending rows (the
+# receiver creates the table; IF NOT EXISTS keeps both sides compatible). An index that cannot
+# be created (read-only file, busy writer) leaves the scans as they were.
+INGRESS_PENDING_INDEX = ("CREATE INDEX IF NOT EXISTS deliveries_pending_by_profile "
+                         "ON deliveries (profile, received_at, delivery_id) WHERE status = 'pending'")
+_ingress_local = threading.local()
+
+def _ingress_connection(path: Path) -> sqlite3.Connection:
+    """This thread's connection to the inbox at ``path``; a replaced file gets a new one."""
+    stat = path.stat()
+    key = (str(path), stat.st_dev, stat.st_ino)
+    cached = getattr(_ingress_local, "connection", None)
+    if cached is not None:
+        if cached[0] == key:
+            return cached[1]
+        _drop_ingress_connection(cached[1])
+    db = sqlite3.connect(path, timeout=10, isolation_level=None)
+    try:
+        db.execute(INGRESS_PENDING_INDEX)
+    except sqlite3.Error:
+        pass  # still correct, only slower; the next connection tries again
+    _ingress_local.connection = (key, db)
+    return db
+
+def _drop_ingress_connection(db: sqlite3.Connection) -> None:
+    cached = getattr(_ingress_local, "connection", None)
+    if cached is not None and cached[1] is db:
+        _ingress_local.connection = None
+    try:
+        db.close()
+    except sqlite3.Error:
+        pass
+
 def native_file_fingerprint(path: Path) -> tuple | None:
     """Identity of a board file and its WAL; None when it cannot be read (never cached).
 
@@ -5529,57 +5566,63 @@ class Bridge:
         if not Path(database).exists():
             return
         now = math.inf if retry_now else self.clock()
-        with closing(sqlite3.connect(database, timeout=10, isolation_level=None)) as db:
-            owned = {row["issue_id"] for row in self.store.active()}
-            stops = [row[:5] for row in self._stop_deliveries(db, now) if not row[5] or row[5] in owned][:limit]
-            rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at, attempts FROM deliveries "
-                              f"WHERE profile = ? AND status = 'pending' AND {ingress_due(900)} "
-                              "ORDER BY received_at, delivery_id LIMIT ?", (self.ingress_profile, now, limit)).fetchall()
-            selected = {(row[0], row[1]) for row in stops}
-            rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
-            for agent, delivery, payload, received, attempts in rows:
-                status = "imported"
-                try:
-                    event = json.loads(payload)
-                    if self.native_ingress is not None and isinstance(event, dict) and event.get("type") == "AgentSessionEvent":
-                        from .native_input import InboxDelivery
-                        routed = self.native_ingress(InboxDelivery(
-                            Path(database), self.ingress_profile, agent, delivery, payload))
-                        if routed:
-                            if self._first_route(agent, delivery):
-                                diag.webhook(event, delivery, reason="native_routed")
-                            continue  # Only the native committed-input hook may ACK it.
-                    diag.clear()
-                    diag.webhook(event, delivery, self.handle_webhook(event), bound=self.store.get)
-                except (ValueError, TypeError):
-                    status = "invalid"
-                    diag.warn("webhook.delivery", "refused", "invalid_payload", evt=delivery)
-                except Exception as exc:  # noqa: BLE001 - keep the inbox moving; back off for a day, then park it loudly
-                    self.__dict__.get("_routed_deliveries", {}).pop((agent, delivery), None)  # a retry routes it anew
-                    status = "failed" if self.clock() - float(received) > 86_400 else "pending"
-                    if attempts and status == "pending":
-                        diag.warn("webhook.delivery", "retry", "delivery_failed", evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)
-                    else:
-                        diag.evt("webhook.delivery", "failed", "delivery_failed", level=logging.ERROR, evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)
-                        log.debug("linear: delivery failed", exc_info=True)  # message and traceback only at DEBUG
-                    if status == "failed":
-                        try:
-                            event = json.loads(payload)
-                            issue_id = ((event.get("agentSession") or {}).get("issue") or {}).get("id") or \
-                                       (event.get("data") or {}).get("id")
-                            if issue_id:
-                                work = self.store.get(issue_id)
-                                self.store.enqueue_once("comment", {"issue_id": issue_id,
-                                    "body": "An update to this issue could not be processed for 24 hours, so the agent set it "
-                                            "aside. An operator needs to check the agent's Linear inbox and retry it.",
-                                    **self._alert_route(work)}, f"{agent}:{delivery}", at=self.clock())
-                                diag.warn("ingress.parked", "failed", "delivery_failed", iss=issue_id, evt=delivery)
-                            else:
-                                diag.evt("ingress.parked", "failed", "no_issue_destination", level=logging.ERROR, evt=delivery)
-                        except (ValueError, TypeError, AttributeError):
-                            diag.evt("ingress.parked", "failed", "invalid_payload", level=logging.ERROR, evt=delivery)
-                db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
-                           "AND delivery_id = ?", (status, agent, delivery))
+        db = _ingress_connection(Path(database))
+        try:
+            self._drain_rows(db, database, limit, now)
+        except sqlite3.Error:
+            _drop_ingress_connection(db)  # a failed drain reconnects next time, as a fresh connect did
+            raise
+    def _drain_rows(self, db: sqlite3.Connection, database: Path, limit: int, now: float) -> None:
+        owned = {row["issue_id"] for row in self.store.active()}
+        stops = [row[:5] for row in self._stop_deliveries(db, now) if not row[5] or row[5] in owned][:limit]
+        rows = db.execute("SELECT logical_agent, delivery_id, payload, received_at, attempts FROM deliveries "
+                          f"WHERE profile = ? AND status = 'pending' AND {ingress_due(900)} "
+                          "ORDER BY received_at, delivery_id LIMIT ?", (self.ingress_profile, now, limit)).fetchall()
+        selected = {(row[0], row[1]) for row in stops}
+        rows = stops + [row for row in rows if (row[0], row[1]) not in selected]
+        for agent, delivery, payload, received, attempts in rows:
+            status = "imported"
+            try:
+                event = json.loads(payload)
+                if self.native_ingress is not None and isinstance(event, dict) and event.get("type") == "AgentSessionEvent":
+                    from .native_input import InboxDelivery
+                    routed = self.native_ingress(InboxDelivery(
+                        Path(database), self.ingress_profile, agent, delivery, payload))
+                    if routed:
+                        if self._first_route(agent, delivery):
+                            diag.webhook(event, delivery, reason="native_routed")
+                        continue  # Only the native committed-input hook may ACK it.
+                diag.clear()
+                diag.webhook(event, delivery, self.handle_webhook(event), bound=self.store.get)
+            except (ValueError, TypeError):
+                status = "invalid"
+                diag.warn("webhook.delivery", "refused", "invalid_payload", evt=delivery)
+            except Exception as exc:  # noqa: BLE001 - keep the inbox moving; back off for a day, then park it loudly
+                self.__dict__.get("_routed_deliveries", {}).pop((agent, delivery), None)  # a retry routes it anew
+                status = "failed" if self.clock() - float(received) > 86_400 else "pending"
+                if attempts and status == "pending":
+                    diag.warn("webhook.delivery", "retry", "delivery_failed", evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)
+                else:
+                    diag.evt("webhook.delivery", "failed", "delivery_failed", level=logging.ERROR, evt=delivery, attempt=attempts + 1, exc=type(exc).__name__)
+                    log.debug("linear: delivery failed", exc_info=True)  # message and traceback only at DEBUG
+                if status == "failed":
+                    try:
+                        event = json.loads(payload)
+                        issue_id = ((event.get("agentSession") or {}).get("issue") or {}).get("id") or \
+                                   (event.get("data") or {}).get("id")
+                        if issue_id:
+                            work = self.store.get(issue_id)
+                            self.store.enqueue_once("comment", {"issue_id": issue_id,
+                                "body": "An update to this issue could not be processed for 24 hours, so the agent set it "
+                                        "aside. An operator needs to check the agent's Linear inbox and retry it.",
+                                **self._alert_route(work)}, f"{agent}:{delivery}", at=self.clock())
+                            diag.warn("ingress.parked", "failed", "delivery_failed", iss=issue_id, evt=delivery)
+                        else:
+                            diag.evt("ingress.parked", "failed", "no_issue_destination", level=logging.ERROR, evt=delivery)
+                    except (ValueError, TypeError, AttributeError):
+                        diag.evt("ingress.parked", "failed", "invalid_payload", level=logging.ERROR, evt=delivery)
+            db.execute("UPDATE deliveries SET status = ?, attempts = attempts + 1 WHERE logical_agent = ? "
+                       "AND delivery_id = ?", (status, agent, delivery))
     def tick(self, ingress: Path | None = None) -> bool:
         """One reporting pass. True when it did anything (an outcome or a Linear request), so the
         service keeps its short tick; False lets it wait longer for the next change."""
